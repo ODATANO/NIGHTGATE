@@ -16,15 +16,9 @@ const crypto = require('crypto');
 const pluginRoot = __dirname;
 cds.env.roots = [...(cds.env.roots || []), pluginRoot];
 
-// Register midnight service kind
-cds.env.requires ??= {};
-cds.env.requires.kinds ??= {};
-cds.env.requires.kinds.midnight = {
-  impl: path.join(pluginRoot, 'lib', 'types', 'midnight.js')
-};
-
 // Ensure midnight requires entry exists (may already exist from package.json)
-cds.env.requires['midnight'] ??= { kind: 'midnight' };
+cds.env.requires ??= {};
+cds.env.requires['midnight'] ??= {};
 
 // Plugin always contributes models regardless of configuration state
 cds.env.requires['midnight'].model = [
@@ -70,7 +64,7 @@ cds.on('bootstrap', (app) => {
   });
 });
 
-// Lifecycle: Initialize Indexer on server start
+// Lifecycle: Initialize Indexer + Start Crawler on server start
 cds.on('served', async () => {
   const midnightConfig = cds.env.requires?.midnight;
   if (!midnightConfig || midnightConfig.kind === 'midnight' && !midnightConfig.network) {
@@ -111,21 +105,32 @@ cds.on('served', async () => {
 
   console.log(`[odatano-night-indexer] Network: ${midnightConfig.network || network}`);
   console.log(`[odatano-night-indexer] Node: ${nodeUrl}`);
+
+  // Start Crawler
+  const crawlerConfig = midnightConfig.crawler || {};
+  const crawlerNodeUrl = crawlerConfig.nodeUrl || nodeUrl;
+
+  if (crawlerConfig.enabled !== false) {
+    try {
+      const { startCrawler } = require('./srv/crawler/index');
+      await startCrawler({
+        ...crawlerConfig,
+        enabled: true,
+        nodeUrl: crawlerNodeUrl,
+        requestTimeout: crawlerConfig.requestTimeout || 30000
+      });
+    } catch (err) {
+      console.warn(`[odatano-night-indexer] Node not reachable at ${crawlerNodeUrl}: ${err.message || err}`);
+      console.log('[odatano-night-indexer] Running in offline mode — start a Midnight node: docker compose -f docker/docker-compose.yml up -d');
+    }
+  }
 });
 
 // Lifecycle: Cleanup on shutdown
 cds.on('shutdown', async () => {
-  // Stop crawler (it holds WebSocket subscription to the node)
   try {
-    const services = cds.services || {};
-    for (const name of Object.keys(services)) {
-      const srv = services[name];
-      if (srv && typeof srv.stopCrawler === 'function') {
-        await srv.stopCrawler();
-        console.log('[odatano-night-indexer] Crawler stopped');
-        break;
-      }
-    }
+    const { stopCrawler } = require('./srv/crawler/index');
+    await stopCrawler();
   } catch (err) {
     console.warn(`[odatano-night-indexer] Crawler stop error: ${err.message}`);
   }

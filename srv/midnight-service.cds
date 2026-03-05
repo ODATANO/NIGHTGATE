@@ -217,6 +217,6 @@ service MidnightService {
         action connectWallet(viewingKey: String) returns WalletSessions;
 
         // Disconnect session
-        action disconnectWallet();
+        action disconnectWallet(sessionId: UUID);
     };
 }

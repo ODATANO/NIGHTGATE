@@ -15,7 +15,7 @@
 
 import cds from '@sap/cds';
 const { SELECT, INSERT, UPDATE, DELETE } = cds.ql;
-import { MidnightNodeProvider, BlockHeader } from '../../lib/providers/MidnightNodeProvider';
+import { MidnightNodeProvider, BlockHeader } from '../providers/MidnightNodeProvider';
 import { BlockProcessor, ProcessResult } from './BlockProcessor';
 import { isTransientError, calcBackoff } from '../utils/retry';
 

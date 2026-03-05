@@ -1,0 +1,29 @@
+node_modules
+gen/
+@cds-models/
+
+# Database
+db/*.db
+db/*.db-shm
+db/*.db-wal
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test
+coverage/
+
+# Logs
+*.log
+npm-debug.log*
+@cds-models

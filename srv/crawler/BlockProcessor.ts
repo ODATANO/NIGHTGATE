@@ -10,7 +10,7 @@ import cds from '@sap/cds';
 const { SELECT, INSERT, UPDATE } = cds.ql;
 import { blake2b } from '@noble/hashes/blake2b';
 import { bytesToHex } from '@noble/hashes/utils';
-import { MidnightNodeProvider, SignedBlock, BlockHeader } from '../../lib/providers/MidnightNodeProvider';
+import { MidnightNodeProvider, SignedBlock, BlockHeader } from '../providers/MidnightNodeProvider';
 import { parseExtrinsicCallIndices } from '../utils/scale';
 
 /**

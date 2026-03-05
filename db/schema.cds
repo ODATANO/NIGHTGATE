@@ -77,7 +77,7 @@ type TokenCategory : String(25) enum {
  */
 entity Blocks : cuid, managed {
     hash              : HexEncoded not null;
-    height            : Integer not null;
+    height            : Integer64 not null;
     protocolVersion   : Integer not null;
     timestamp         : Integer not null;  // UNIX timestamp
     author            : HexEncoded;
@@ -101,8 +101,8 @@ entity Transactions : cuid, managed {
 
     // Regular Transaction specific fields
     merkleTreeRoot    : HexEncoded;
-    startIndex        : Integer;           // zswap state start index
-    endIndex          : Integer;           // zswap state end index
+    startIndex        : Integer64;         // zswap state start index
+    endIndex          : Integer64;         // zswap state end index
     identifiers       : LargeString;       // JSON array of HexEncoded identifiers
 
     // Classification fields (populated by Crawler / BlockProcessor)
@@ -203,7 +203,7 @@ entity UnshieldedUtxos : cuid, managed {
     registeredForDustGeneration : Boolean default false;
 
     // Associations
-    createdAtTransaction : Association to Transactions;
+    createdAtTransaction : Association to Transactions not null;
     spentAtTransaction   : Association to Transactions;
 }
 
@@ -218,7 +218,7 @@ entity ZswapLedgerEvents : cuid {
     eventId           : Integer not null;
     raw               : LargeBinary;              // hex-encoded serialized event
     maxId             : Integer not null;
-    transaction       : Association to Transactions;
+    transaction       : Association to Transactions not null;
 }
 
 /**
@@ -233,7 +233,7 @@ entity DustLedgerEvents : cuid {
     // For INITIAL_UTXO events
     dustOutputNonce   : HexEncoded;               // 32-byte nonce
 
-    transaction       : Association to Transactions;
+    transaction       : Association to Transactions not null;
 }
 
 // ============================================================================
@@ -401,16 +401,16 @@ entity NightBalances {
  */
 entity DustRegistrations : cuid, managed {
     // Cardano side
-    cardanoStakeKey       : String(66);
-    cardanoTxHash         : HexEncoded;
+    cardanoStakeKey       : String(66) not null;
+    cardanoTxHash         : HexEncoded not null;
 
     // Midnight side
-    dustPublicKey         : HexEncoded;
-    nightAddress          : String(256);
+    dustPublicKey         : HexEncoded not null;
+    nightAddress          : String(256) not null;
 
     // Status
     isActive              : Boolean default true;
-    registeredAt          : Timestamp;
+    registeredAt          : Timestamp not null;
     deregisteredAt        : Timestamp;
 
     // NIGHT amount backing DUST generation

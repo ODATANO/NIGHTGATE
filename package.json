@@ -78,11 +78,7 @@
         "network": "testnet",
         "nodeUrl": "ws://localhost:9944"
       },
-      "kinds": {
-        "midnight": {
-          "impl": "./lib/types/midnight.js"
-        }
-      }
+      "kinds": {}
     },
     "odata": {
       "version": "v4"

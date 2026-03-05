@@ -26,6 +26,7 @@ export function getEncryptionKey(): Buffer {
         return crypto.createHash('sha256').update(envKey).digest();
     }
     // Dev fallback: derive from stable-per-process value
+    console.warn('[crypto] ENCRYPTION_KEY not set — using dev fallback key. Set ENCRYPTION_KEY for production.');
     const fallback = `odatano-night-${process.pid}-${os.hostname()}`;
     return crypto.createHash('sha256').update(fallback).digest();
 }
@@ -55,6 +56,12 @@ export function decrypt(combined: string, key: Buffer): string {
     const iv = Buffer.from(ivB64, 'base64');
     const authTag = Buffer.from(tagB64, 'base64');
     const encrypted = Buffer.from(dataB64, 'base64');
+    if (iv.length !== IV_LENGTH) {
+        throw new Error(`Invalid IV length: expected ${IV_LENGTH} bytes, got ${iv.length}`);
+    }
+    if (authTag.length !== AUTH_TAG_LENGTH) {
+        throw new Error(`Invalid auth tag length: expected ${AUTH_TAG_LENGTH} bytes, got ${authTag.length}`);
+    }
     const decipher = crypto.createDecipheriv(ALGORITHM, key, iv, { authTagLength: AUTH_TAG_LENGTH });
     decipher.setAuthTag(authTag);
     const decrypted = Buffer.concat([decipher.update(encrypted), decipher.final()]);
