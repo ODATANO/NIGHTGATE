@@ -1,0 +1,38 @@
+services:
+  # Midnight Node — Primary data source for the ODATANO-NIGHT indexer
+  # CFG_PRESET=dev → standalone mode (no testnet connection needed for development)
+  # CFG_PRESET=testnet-02 → connects to Midnight testnet (requires bootnodes)
+  node:
+    image: midnightntwrk/midnight-node:0.20.0
+    container_name: odatano-night-node
+    ports:
+      - "9944:9944" # Substrate RPC (used by ODATANO-NIGHT crawler)
+      - "30333:30333" # P2P
+    environment:
+      CFG_PRESET: dev
+      SIDECHAIN_BLOCK_BENEFICIARY: "04bcf7ad3be7a5c790460be82a713af570f22e0f801f6659ab8e84a52be6969e"
+    volumes:
+      - node-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9944/health"]
+      interval: 2s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 4G
+        reservations:
+          cpus: "1.0"
+          memory: 2G
+
+volumes:
+  node-data:
