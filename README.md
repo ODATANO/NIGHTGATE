@@ -9,6 +9,8 @@
 
 `@odatano/nightgate` is a self-contained Midnight blockchain indexer packaged as an SAP CAP plugin. It connects directly to a Midnight node over Substrate JSON-RPC WebSocket, normalizes chain data into CAP entities, and exposes that data through OData V4 services.
 
+Version `0.1.0` is intentionally a read-side first release: indexing, persistence, OData exposure, health/metrics, and wallet-session handling are in scope; transaction build/sign/submit flows are not.
+
 It supports two main modes:
 
 - **Plugin mode** inside another CAP app via `cds.requires.nightgate`
@@ -38,6 +40,8 @@ NightgateService / NightgateIndexerService / Analytics / Admin
 
 If you also need privacy-preserving attestation flows, pair this package with `@odatano/night-attestation`.
 
+For the fastest path from install to first API call, see [docs/quickstart.md](docs/quickstart.md).
+
 ## Highlights
 
 | Capability | Current Behavior |
@@ -51,7 +55,28 @@ If you also need privacy-preserving attestation flows, pair this package with `@
 | Wallet session support | `connectWallet` and `disconnectWallet` actions plus admin invalidation actions |
 | Runtime hardening | CORS, correlation IDs, security headers, offline mode, auto-deploy attempt for missing schema |
 
+See also [CHANGELOG.md](CHANGELOG.md) for the first-release summary.
+
+## Current Capability Matrix
+
+| Area | Status | What works now | Boundaries in `0.1.0` |
+|---|---|---|---|
+| CAP plugin integration | Ready | Registers models from `db/` and `srv/`, wires bootstrap middleware, starts on CAP `served`, stops on CAP `shutdown` | Configure only through `cds.requires.nightgate` |
+| Node connectivity | Ready | Connects to Midnight nodes over `ws://` or `wss://`, validates runtime config, warns on bad URLs | No separate multi-node failover layer yet |
+| Catch-up and live sync | Ready | Replays finalized blocks, subscribes to new heads, retries transient failures | Single active crawler instance per process |
+| Reorg recovery | Ready | Detects chain divergence, finds fork points, rolls back indexed data, records `ReorgLog` | Designed for operational correctness, not deep historical reconciliation jobs |
+| Local persistence | Ready | Persists blocks, transactions, sync state, reorg state, and related read-side entities via CAP DB APIs | SQLite-first default; host app controls broader DB strategy |
+| Core OData reads | Ready | Blocks, transactions, UTXO reads, balance lookups, governance/system-parameter reads, wallet-session actions | Data quality depends on what the current crawler/parser version extracts into the local DB |
+| Indexer operations API | Ready | `getSyncStatus`, `getHealth`, `getReorgHistory`, `getLiveness`, `getReadiness`, `getMetrics` | Focused on one running indexer instance |
+| Wallet sessions | Ready | Connect/disconnect flows, encrypted viewing-key storage, TTL expiry, cleanup job, admin invalidation | Session auth policy is host-app specific |
+| Analytics | Ready | Block count, transaction count, contract count, average transactions per block, CDS aggregate projections | Analytics are read-side aggregates over indexed local data |
+| Midnight domain surface | Partial | Schema and service surface already include contracts, balances, DUST, governance, registrations, token types | Some entity families are ahead of full extractor/populator depth and will mature incrementally |
+| Write-side blockchain workflows | Not included | None | No transaction build, signing, submission, or wallet execution flow in this release |
+| Built-in authorization model | Not included by default | None enforced out of the box | `@requires` examples are commented; the consuming CAP app should decide auth policy |
+
 ## Quick Start
+
+If you want the step-by-step version, use [docs/quickstart.md](docs/quickstart.md). The section below stays as the short form.
 
 ### Run This Repository Locally
 
@@ -389,7 +414,7 @@ npm test
 │   ├── admin-service.ts
 │   ├── analytics-service.cds
 │   ├── analytics-service.ts
-│   ├── midnight-indexer-service.cds
+│   ├── nightgate-indexer-service.cds
 │   ├── nightgate-indexer-service.ts
 │   ├── nightgate-service.cds
 │   ├── nightgate-service.ts
