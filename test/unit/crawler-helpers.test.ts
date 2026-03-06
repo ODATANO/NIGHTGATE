@@ -97,6 +97,29 @@ describe('MidnightCrawler helper paths', () => {
         }
     });
 
+    it('throws after exhausting transient retries', async () => {
+        const crawler = new MidnightCrawler({} as any, {
+            enabled: true,
+            maxRetries: 3,
+            retryDelay: 10
+        });
+        const processor = {
+            processBlockByHeight: jest.fn().mockRejectedValue(new Error('Request timeout'))
+        };
+        const warnSpy = jest.spyOn(console, 'warn').mockImplementation();
+
+        try {
+            (crawler as any).processor = processor;
+            (crawler as any).sleep = jest.fn().mockResolvedValue(undefined);
+
+            await expect((crawler as any).processBlockWithRetry(8)).rejects.toThrow('Request timeout');
+            expect(processor.processBlockByHeight).toHaveBeenCalledTimes(3);
+            expect((crawler as any).sleep).toHaveBeenCalledTimes(2);
+        } finally {
+            warnSpy.mockRestore();
+        }
+    });
+
     it('creates SyncState when it is missing', async () => {
         const crawler = new MidnightCrawler({} as any, { enabled: true });
         const db = {
@@ -120,6 +143,19 @@ describe('MidnightCrawler helper paths', () => {
         }));
     });
 
+    it('does nothing when SyncState already exists', async () => {
+        const crawler = new MidnightCrawler({} as any, { enabled: true });
+        const db = {
+            run: jest.fn().mockResolvedValueOnce({ ID: 'SINGLETON' })
+        };
+
+        (crawler as any).db = db;
+
+        await expect((crawler as any).ensureSyncState()).resolves.toBeUndefined();
+        expect(db.run).toHaveBeenCalledTimes(1);
+        expect(insertEntriesSpy).not.toHaveBeenCalled();
+    });
+
     it('ignores unique-constraint races while creating SyncState', async () => {
         const crawler = new MidnightCrawler({} as any, { enabled: true });
         const db = {
@@ -131,6 +167,19 @@ describe('MidnightCrawler helper paths', () => {
         (crawler as any).db = db;
 
         await expect((crawler as any).ensureSyncState()).resolves.toBeUndefined();
+    });
+
+    it('rethrows unexpected SyncState insert failures', async () => {
+        const crawler = new MidnightCrawler({} as any, { enabled: true });
+        const db = {
+            run: jest.fn()
+                .mockResolvedValueOnce(null)
+                .mockRejectedValueOnce(new Error('database unavailable'))
+        };
+
+        (crawler as any).db = db;
+
+        await expect((crawler as any).ensureSyncState()).rejects.toThrow('database unavailable');
     });
 
     it('records crawler errors without throwing back to the caller', async () => {
@@ -145,5 +194,37 @@ describe('MidnightCrawler helper paths', () => {
 
         await expect((crawler as any).recordError('x'.repeat(600))).resolves.toBeUndefined();
         expect(updateWhereSpy).toHaveBeenCalledWith({ ID: 'SINGLETON' });
+    });
+
+    it('swallows failures while recording crawler errors', async () => {
+        const crawler = new MidnightCrawler({} as any, { enabled: true });
+        const db = {
+            run: jest.fn().mockRejectedValue(new Error('db down'))
+        };
+
+        (crawler as any).db = db;
+
+        await expect((crawler as any).recordError('boom')).resolves.toBeUndefined();
+    });
+
+    it('resolves sleep after the requested delay', async () => {
+        jest.useFakeTimers();
+        const crawler = new MidnightCrawler({} as any, { enabled: true });
+        let resolved = false;
+
+        try {
+            const promise = (crawler as any).sleep(25).then(() => {
+                resolved = true;
+            });
+
+            await jest.advanceTimersByTimeAsync(24);
+            expect(resolved).toBe(false);
+
+            await jest.advanceTimersByTimeAsync(1);
+            await promise;
+            expect(resolved).toBe(true);
+        } finally {
+            jest.useRealTimers();
+        }
     });
 });

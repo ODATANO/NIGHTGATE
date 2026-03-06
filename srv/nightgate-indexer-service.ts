@@ -22,7 +22,7 @@ export default class NightgateIndexerService extends cds.ApplicationService {
                 SELECT.one.from('midnight.SyncState').where({ ID: 'SINGLETON' })
             );
             if (!existing) {
-                const nightgateConfig = (cds.env as any).requires?.nightgate || (cds.env as any).requires?.midnight || {};
+                const nightgateConfig = (cds.env as any).requires?.nightgate || {};
                 await this.db.run(INSERT.into('midnight.SyncState').entries({
                     ID: 'SINGLETON',
                     networkId: nightgateConfig.network || 'testnet',

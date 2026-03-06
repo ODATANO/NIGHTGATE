@@ -22,7 +22,7 @@ let lastStatus: NightgateIndexerStatus = {
 };
 
 function getNightgateConfig(): any {
-    return (cds.env as any).requires?.nightgate || (cds.env as any).requires?.midnight;
+    return (cds.env as any).requires?.nightgate;
 }
 
 function isPluginConfigured(config: any): boolean {
@@ -30,7 +30,7 @@ function isPluginConfigured(config: any): boolean {
         return false;
     }
 
-    return !((config.kind === 'nightgate' || config.kind === 'midnight') && !config.network);
+    return !(config.kind === 'nightgate' && !config.network);
 }
 
 function resolveRuntimeConfig(config: any): {

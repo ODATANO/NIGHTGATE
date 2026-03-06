@@ -13,7 +13,7 @@ jest.mock('@sap/cds', () => {
     const cds: any = {
         env: {
             requires: {
-                midnight: {}
+                nightgate: {}
             }
         },
         ql: {
@@ -45,22 +45,31 @@ jest.mock('@sap/cds', () => {
     return cds;
 });
 
+import cds from '@sap/cds';
+import { RateLimiter } from '../../srv/utils/rate-limiter';
 import { registerWalletSessionHandlers, startSessionCleanup } from '../../srv/sessions/wallet-sessions';
 
-function createMockRequest(data: Record<string, unknown>) {
-    return {
+function createMockRequest(data: Record<string, unknown>, ip: string | null = '127.0.0.1') {
+    const req: any = {
         data,
-        _: {
-            req: {
-                ip: '127.0.0.1'
-            }
-        },
         reject: jest.fn().mockImplementation((code: number, message: string) => ({
             __rejected: true,
             code,
             message
         }))
     };
+
+    if (ip !== null) {
+        req._ = {
+            req: {
+                ip
+            }
+        };
+    } else {
+        req._ = {};
+    }
+
+    return req;
 }
 
 describe('wallet session handlers', () => {
@@ -75,8 +84,33 @@ describe('wallet session handlers', () => {
 
     beforeEach(() => {
         jest.clearAllMocks();
+        mockDbRun.mockReset();
+        selectWhereSpy.mockReset();
+        updateWhereSpy.mockReset();
+        insertEntriesSpy.mockReset();
         Object.keys(registeredHandlers).forEach(k => delete registeredHandlers[k]);
+        (cds.env as any).requires = { nightgate: {} };
         registerWalletSessionHandlers(mockService, { run: mockDbRun });
+    });
+
+    it('connectWallet rejects rate-limited clients before validating or inserting a session', async () => {
+        const checkSpy = jest.spyOn(RateLimiter.prototype, 'check').mockReturnValue({
+            allowed: false,
+            retryAfterMs: 1500
+        });
+
+        try {
+            const handler = registeredHandlers['connectWallet'];
+            const req = createMockRequest({ viewingKey: 'not-even-validated' }, '10.0.0.1');
+
+            await handler(req);
+
+            expect(checkSpy).toHaveBeenCalledWith('10.0.0.1');
+            expect(req.reject).toHaveBeenCalledWith(429, 'Rate limited. Retry after 2s');
+            expect(insertEntriesSpy).not.toHaveBeenCalled();
+        } finally {
+            checkSpy.mockRestore();
+        }
     });
 
     it('connectWallet creates a new active session for valid viewing keys', async () => {
@@ -100,6 +134,51 @@ describe('wallet session handlers', () => {
         }));
     });
 
+    it('connectWallet falls back to the global rate-limit key and default TTL when no config is present', async () => {
+        const checkSpy = jest.spyOn(RateLimiter.prototype, 'check');
+        const nowSpy = jest.spyOn(Date, 'now').mockReturnValue(1_700_000_000_000);
+        (cds.env as any).requires = {};
+        mockDbRun.mockResolvedValueOnce(1);
+
+        try {
+            const handler = registeredHandlers['connectWallet'];
+            const req = createMockRequest({ viewingKey: 'a'.repeat(64) }, null);
+            const result = await handler(req);
+
+            expect(checkSpy).toHaveBeenCalledWith('global');
+            expect(result.expiresAt).toBe(new Date(1_700_086_400_000).toISOString());
+            expect(insertEntriesSpy).toHaveBeenCalledWith(expect.objectContaining({
+                expiresAt: new Date(1_700_086_400_000).toISOString()
+            }));
+        } finally {
+            nowSpy.mockRestore();
+            checkSpy.mockRestore();
+        }
+    });
+
+    it('connectWallet uses the configured session TTL from nightgate config', async () => {
+        const nowSpy = jest.spyOn(Date, 'now').mockReturnValue(1_700_000_000_000);
+        (cds.env as any).requires = {
+            nightgate: {
+                sessionTtlMs: 60_000
+            }
+        };
+        mockDbRun.mockResolvedValueOnce(1);
+
+        try {
+            const handler = registeredHandlers['connectWallet'];
+            const req = createMockRequest({ viewingKey: 'a'.repeat(64) });
+            const result = await handler(req);
+
+            expect(result.expiresAt).toBe(new Date(1_700_000_060_000).toISOString());
+            expect(insertEntriesSpy).toHaveBeenCalledWith(expect.objectContaining({
+                expiresAt: new Date(1_700_000_060_000).toISOString()
+            }));
+        } finally {
+            nowSpy.mockRestore();
+        }
+    });
+
     it('connectWallet rejects invalid viewing keys before inserting a session', async () => {
         const handler = registeredHandlers['connectWallet'];
         const req = createMockRequest({ viewingKey: 'not-hex' });
@@ -108,6 +187,27 @@ describe('wallet session handlers', () => {
 
         expect(req.reject).toHaveBeenCalledWith(400, 'viewingKey must be hex-encoded');
         expect(insertEntriesSpy).not.toHaveBeenCalled();
+    });
+
+    it('disconnectWallet rejects requests without a sessionId', async () => {
+        const handler = registeredHandlers['disconnectWallet'];
+        const req = createMockRequest({});
+
+        await handler(req);
+
+        expect(req.reject).toHaveBeenCalledWith(400, 'sessionId is required');
+        expect(mockDbRun).not.toHaveBeenCalled();
+    });
+
+    it('disconnectWallet rejects unknown sessions', async () => {
+        mockDbRun.mockResolvedValueOnce(null);
+
+        const handler = registeredHandlers['disconnectWallet'];
+        const req = createMockRequest({ sessionId: 'missing-session' });
+        await handler(req);
+
+        expect(selectWhereSpy).toHaveBeenCalledWith({ sessionId: 'missing-session' });
+        expect(req.reject).toHaveBeenCalledWith(404, 'Session not found');
     });
 
     it('disconnectWallet looks sessions up by sessionId', async () => {
@@ -157,6 +257,23 @@ describe('wallet session handlers', () => {
             clearInterval(timer);
         } finally {
             jest.useRealTimers();
+        }
+    });
+
+    it('startSessionCleanup ignores cleanup errors and supports timers without unref', async () => {
+        let callback: (() => Promise<void>) | undefined;
+        const setIntervalSpy = jest.spyOn(global, 'setInterval').mockImplementation(((handler: TimerHandler) => {
+            callback = handler as () => Promise<void>;
+            return {} as ReturnType<typeof setInterval>;
+        }) as any);
+        const db = { run: jest.fn().mockRejectedValue(new Error('cleanup failed')) };
+
+        try {
+            const timer = startSessionCleanup(db);
+            await expect(callback?.()).resolves.toBeUndefined();
+            expect(timer).toEqual({});
+        } finally {
+            setIntervalSpy.mockRestore();
         }
     });
 });

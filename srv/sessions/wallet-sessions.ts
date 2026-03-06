@@ -36,7 +36,7 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
         const encryptedVk = encrypt(viewingKey, encKey);
         const sessionToken = cds.utils.uuid();
 
-        const nightgateConfig = (cds.env as any).requires?.nightgate || (cds.env as any).requires?.midnight || {};
+        const nightgateConfig = (cds.env as any).requires?.nightgate || {};
         const sessionTtlMs = nightgateConfig.sessionTtlMs || 24 * 60 * 60 * 1000;
         const expiresAt = new Date(Date.now() + sessionTtlMs).toISOString();
 

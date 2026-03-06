@@ -22,15 +22,11 @@ function registerModels(): void {
 
     requires.nightgate ??= {};
     requires.nightgate.model = modelPaths;
-
-    if (requires.midnight) {
-        requires.midnight.model = modelPaths;
-    }
 }
 
 function registerSecurityHeaders(): void {
     cds.on('bootstrap', (app: any) => {
-        const nightgateConfig = (cds.env as any).requires?.nightgate || (cds.env as any).requires?.midnight || {};
+        const nightgateConfig = (cds.env as any).requires?.nightgate || {};
         const corsOrigin = nightgateConfig.corsOrigin || '*';
 
         app.use((req: any, res: any, next: () => void) => {

@@ -89,6 +89,14 @@ describe('NightgateAnalyticsService', () => {
             const result = await handler();
             expect(result).toBe(5);
         });
+
+        it('should return 0 when no contract rows exist', async () => {
+            const handler = registeredHandlers['getContractCount'];
+
+            mockDbRun.mockResolvedValueOnce(null);
+            const result = await handler();
+            expect(result).toBe(0);
+        });
     });
 
     describe('getAverageTransactionsPerBlock', () => {
@@ -115,6 +123,16 @@ describe('NightgateAnalyticsService', () => {
             expect(result).toBe(0);
         });
 
+        it('should return 0 when the block count query returns null', async () => {
+            const handler = registeredHandlers['getAverageTransactionsPerBlock'];
+
+            mockDbRun.mockResolvedValueOnce(null);
+            mockDbRun.mockResolvedValueOnce({ count: 12 });
+
+            const result = await handler();
+            expect(result).toBe(0);
+        });
+
         it('should round to 2 decimal places', async () => {
             const handler = registeredHandlers['getAverageTransactionsPerBlock'];
 
@@ -123,6 +141,16 @@ describe('NightgateAnalyticsService', () => {
 
             const result = await handler();
             expect(result).toBe(3.33);
+        });
+
+        it('should treat a null transaction count as zero', async () => {
+            const handler = registeredHandlers['getAverageTransactionsPerBlock'];
+
+            mockDbRun.mockResolvedValueOnce({ count: 4 });
+            mockDbRun.mockResolvedValueOnce(null);
+
+            const result = await handler();
+            expect(result).toBe(0);
         });
     });
 });

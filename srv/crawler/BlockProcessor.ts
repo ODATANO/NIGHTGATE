@@ -48,7 +48,7 @@ function buildPalletMap(): Map<number, PalletMapping> {
     }
 
     // Override with config
-    const nightgateConfig = (cds.env as any).requires?.nightgate || (cds.env as any).requires?.midnight || {};
+    const nightgateConfig = (cds.env as any).requires?.nightgate || {};
     const configMap = nightgateConfig.palletMap;
     if (configMap && typeof configMap === 'object') {
         for (const [idx, entry] of Object.entries(configMap)) {

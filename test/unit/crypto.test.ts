@@ -73,6 +73,20 @@ describe('AES-256-GCM encrypt/decrypt', () => {
         expect(() => decrypt('just-one-part', testKey)).toThrow('Invalid encrypted format');
     });
 
+    it('throws on invalid IV length', () => {
+        const encrypted = encrypt('secret', testKey);
+        const parts = encrypted.split(':');
+        parts[0] = Buffer.alloc(8).toString('base64');
+        expect(() => decrypt(parts.join(':'), testKey)).toThrow('Invalid IV length');
+    });
+
+    it('throws on invalid auth tag length', () => {
+        const encrypted = encrypt('secret', testKey);
+        const parts = encrypted.split(':');
+        parts[1] = Buffer.alloc(8).toString('base64');
+        expect(() => decrypt(parts.join(':'), testKey)).toThrow('Invalid auth tag length');
+    });
+
     it('handles empty string plaintext', () => {
         const encrypted = encrypt('', testKey);
         const decrypted = decrypt(encrypted, testKey);

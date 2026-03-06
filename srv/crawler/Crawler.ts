@@ -500,7 +500,7 @@ export class MidnightCrawler {
 
         if (!existing) {
             try {
-                const nightgateConfig = (cds.env as any).requires?.nightgate || (cds.env as any).requires?.midnight || {};
+                const nightgateConfig = (cds.env as any).requires?.nightgate || {};
                 await this.db.run(INSERT.into('midnight.SyncState').entries({
                     ID: 'SINGLETON',
                     networkId: nightgateConfig.network || 'testnet',

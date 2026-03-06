@@ -18,7 +18,7 @@
 export function decodeCompact(buf: Buffer, offset: number): [number, number] | null {
     if (offset >= buf.length) return null;
 
-    const mode = buf[offset] & 0x03;
+    const mode = (buf[offset] & 0x03) as 0 | 1 | 2 | 3;
 
     switch (mode) {
         case 0b00:
@@ -38,9 +38,6 @@ export function decodeCompact(buf: Buffer, offset: number): [number, number] | n
             const extraBytes = (buf[offset] >> 2) + 4;
             if (offset + extraBytes >= buf.length) return null;
             return [0, 1 + extraBytes]; // value=0 (we only need to skip)
-
-        default:
-            return null;
     }
 }
 

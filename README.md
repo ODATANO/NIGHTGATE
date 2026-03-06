@@ -1,90 +1,93 @@
 # @odatano/nightgate
 
-**CAP Plugin — Midnight Blockchain Indexer with OData V4 API**
+**CAP Plugin - Midnight Blockchain Indexer with OData V4 API**
 
 [![npm](https://img.shields.io/npm/v/@odatano/nightgate)](https://www.npmjs.com/package/@odatano/nightgate)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 
----
+## What It Is
 
-## What is @odatano/nightgate?
+`@odatano/nightgate` is a self-contained Midnight blockchain indexer packaged as an SAP CAP plugin. It connects directly to a Midnight node over Substrate JSON-RPC WebSocket, normalizes chain data into CAP entities, and exposes that data through OData V4 services.
 
-A self-contained **Midnight blockchain indexer** packaged as an SAP CAP plugin. It crawls blocks directly from a Midnight Node via Substrate RPC, stores them in local SQLite, and exposes the data as OData V4 endpoints.
+It supports two main modes:
 
-```
+- **Plugin mode** inside another CAP app via `cds.requires.nightgate`
+- **Standalone repo mode** from this repository via `npm run dev`
+
+If the node is unavailable, the CAP app can still start and the package reports `offline` runtime status instead of crashing the host process.
+
+```text
 Midnight Node (ws://localhost:9944)
-    │  Substrate RPC
-    ▼
-ODATANO-NIGHTGATE Crawler
-    │  Block Processing + Reorg Detection
-    ▼
-SQLite (local)
-    │  CDS Query Layer
-    ▼
-OData V4 API  →  SAP Fiori, Excel, Power BI, REST clients
+    |
+    | Substrate RPC / WebSocket
+    v
+MidnightNodeProvider
+    |
+    | Catch-up, live sync, retry, reorg detection
+    v
+Crawler + BlockProcessor
+    |
+    | Atomic persistence via CAP DB API
+    v
+SQLite / CAP Database
+    |
+    | OData V4
+    v
+NightgateService / NightgateIndexerService / Analytics / Admin
 ```
 
-> **Looking for privacy-preserving attestations via ZK proofs?**
-> Install [`@odatano/night-attestation`](../attestation/) alongside this package.
+If you also need privacy-preserving attestation flows, pair this package with `@odatano/night-attestation`.
 
----
+## Highlights
+
+| Capability | Current Behavior |
+|---|---|
+| Direct node indexing | Connects to a Midnight node over `ws://` or `wss://`; no external indexer required |
+| CAP plugin auto-registration | Registers `db/` and `srv/` models automatically through `cds-plugin.js` |
+| Catch-up plus live sync | Indexes historical finalized blocks, then subscribes to new heads |
+| Reorg handling | Detects parent-hash mismatches, finds fork points, rolls back affected data, records `ReorgLog` |
+| OData API | Exposes blockchain, indexer, analytics, and admin services |
+| Operational endpoints | Health, readiness, liveness, reorg history, and Prometheus-style metrics |
+| Wallet session support | `connectWallet` and `disconnectWallet` actions plus admin invalidation actions |
+| Runtime hardening | CORS, correlation IDs, security headers, offline mode, auto-deploy attempt for missing schema |
 
 ## Quick Start
 
-### 1. Start a Midnight Node
+### Run This Repository Locally
 
 ```bash
+npm ci
 docker compose -f docker/docker-compose.yml up -d
+npm run dev
 ```
 
-This starts a local Midnight Node in dev mode (`CFG_PRESET=dev`). The node produces blocks every ~8 seconds without needing testnet connectivity.
+`npm run dev` starts CAP directly from the TypeScript source tree through `cds watch`. No manual build step is required for local development.
 
-### 2. Install & Run
+Typical startup output looks like this:
 
-```bash
-npm install @odatano/nightgate @cap-js/sqlite
-cds watch
-```
-
-The crawler connects to the node, catches up on historical blocks, and then follows the chain tip in real-time:
-
-```
+```text
 [cds] - serving NightgateService { at: '/api/v1/nightgate' }
 [cds] - serving NightgateIndexerService { at: '/api/v1/indexer' }
 [cds] - serving NightgateAnalyticsService { at: '/api/v1/analytics' }
 [cds] - serving NightgateAdminService { at: '/api/v1/admin' }
 
+[odatano-nightgate] Network: testnet
+[odatano-nightgate] Node: ws://localhost:9944
 [MidnightNode] Connected to ws://localhost:9944
-[Crawler] Catch-up: 0 → 142 (143 blocks, finalized)
-[Crawler] Catch-up complete: 143 blocks in 0.8s
+[Crawler] Catch-up complete: ...
 [Crawler] Live subscription active
 ```
 
-### 3. Query via OData
+### Use It As A CAP Plugin
 
-```bash
-# Latest blocks
-curl http://localhost:4004/api/v1/nightgate/Blocks?\$top=5\&\$orderby=height%20desc
-
-# Block with transactions expanded
-curl http://localhost:4004/api/v1/nightgate/Blocks?\$expand=transactions
-
-# Indexer health
-curl http://localhost:4004/api/v1/indexer/getHealth()
-```
-
----
-
-## Consumer Integration (CAP Plugin)
-
-Install `@odatano/nightgate` into any existing CAP app:
+Install the package into any CAP application:
 
 ```bash
 cd my-cap-app
 npm install @odatano/nightgate @cap-js/sqlite
 ```
 
-Add to `package.json`:
+Add Nightgate configuration to `package.json`:
 
 ```json
 {
@@ -101,110 +104,37 @@ Add to `package.json`:
 }
 ```
 
-Run `cds watch` — all Nightgate services auto-register. The crawler starts indexing from the configured node.
-
-### Local Development (This Repository)
+Then run:
 
 ```bash
-npm ci
-npm run dev
+cds watch
 ```
 
-`npm run dev` is the preferred local entry point. It delegates to `npm run cds:watch`, which starts CAP directly from the TypeScript source tree. No manual build step is required before local development.
+### Query The API
 
-Useful scripts:
+```bash
+# Latest blocks
+curl "http://localhost:4004/api/v1/nightgate/Blocks?$top=5&$orderby=height desc"
 
-| Script | When to use it |
-|---|---|
-| `npm run dev` | Preferred local development command from `.ts` sources with auto-reload |
-| `npm run cds:watch` | Direct CAP watch alias used by `npm run dev` |
-| `npm run build` | Compile `src/` and `srv/` in-place for packaging or a production-style local run |
-| `npm run build:plugin` | Explicit plugin-packaging build alias used by `npm run build` |
-| `npm start` | Build via `prestart`, then launch CAP from the compiled runtime layout |
-| `npm run clean` | Remove generated `.js` and `.d.ts` plugin build artifacts |
+# Block with transactions expanded
+curl "http://localhost:4004/api/v1/nightgate/Blocks?$expand=transactions"
 
----
+# Indexer health
+curl "http://localhost:4004/api/v1/indexer/getHealth()"
 
-## Features
-
-| Feature | Description |
-|---|---|
-| **Self-Contained Indexer** | Crawls blocks directly from a Midnight Node via Substrate RPC. No external indexer dependency. |
-| **OData V4 API** | Full blockchain data exposed as OData V4 — Blocks, Transactions, UTXOs, Contract Actions, and more. |
-| **Real-Time Sync** | Catch-up on historical blocks, then live subscription for new blocks. Reorg detection and recovery. |
-| **Prometheus Metrics** | `getMetrics()` endpoint returns Prometheus-compatible gauges (chain height, lag, throughput, errors). |
-| **K8s Probes** | `getLiveness()` and `getReadiness()` for Kubernetes health checks. |
-| **CORS & Security Headers** | Configurable CORS, CSP, X-Frame-Options, HSTS (production), and more. |
-| **Correlation IDs** | `X-Correlation-ID` header auto-generated or propagated on every request. |
-| **Config Validation** | Network, nodeUrl validated at startup with clear error messages. |
-| **DB Auto-Migration** | Automatically deploys schema on first startup if tables are missing. |
-| **Docker Log Rotation** | `json-file` driver with 50MB / 5 file rotation on all containers. |
-
----
-
-## Services
-
-| Service | Path | Description |
-|---|---|---|
-| **NightgateService** | `/api/v1/nightgate` | Blockchain data — Blocks, Transactions, UTXOs, Contracts, Balances, Governance |
-| **NightgateIndexerService** | `/api/v1/indexer` | Sync status, health, Prometheus metrics, K8s probes, reorg history |
-| **NightgateAnalyticsService** | `/api/v1/analytics` | Aggregated blockchain statistics |
-| **NightgateAdminService** | `/api/v1/admin` | Wallet session management |
-
----
-
-## Architecture: Crawler-First Indexing
-
-@odatano/nightgate **is** the indexer. It connects directly to a Midnight Node via Substrate JSON-RPC 2.0 over WebSocket.
-
-### Data Flow
-
+# Prometheus-style metrics
+curl "http://localhost:4004/api/v1/indexer/getMetrics()"
 ```
-┌──────────────────────────┐
-│  Midnight Node           │
-│  (Docker / Testnet)      │
-│  ws://localhost:9944     │
-└──────────┬───────────────┘
-           │ Substrate RPC
-           │ chain_getBlock, chain_subscribeNewHeads
-           ▼
-┌──────────────────────────┐
-│  MidnightNodeProvider    │  srv/providers/MidnightNodeProvider.ts
-│  JSON-RPC 2.0 Client     │  WebSocket, reconnect, request tracking
-└──────────┬───────────────┘
-           │
-           ▼
-┌──────────────────────────┐
-│  Crawler                 │  srv/crawler/Crawler.ts
-│  Catch-Up + Live Sync    │  Reorg detection, batch processing
-└──────────┬───────────────┘
-           │
-           ▼
-┌──────────────────────────┐
-│  BlockProcessor          │  srv/crawler/BlockProcessor.ts
-│  Parse + Transform       │  Atomic DB writes via db.tx()
-└──────────┬───────────────┘
-           │
-           ▼
-┌──────────────────────────┐
-│  SQLite (local)          │  18 blockchain entities + SyncState, ReorgLog
-└──────────┬───────────────┘
-           │
-           ▼
-┌──────────────────────────┐
-│  OData V4                │  4 CDS services
-│  /api/v1/nightgate       │
-│  /api/v1/indexer         │
-│  /api/v1/analytics       │
-│  /api/v1/admin           │
-└──────────────────────────┘
-```
-
----
 
 ## Configuration
 
-### Minimal (Local Dev)
+Configure the plugin only under `cds.requires.nightgate`.
+
+Important activation rule:
+
+- If the service is configured with `kind: "nightgate"` but no `network`, the plugin stays idle instead of auto-starting the crawler.
+
+### Minimal Configuration
 
 ```json
 {
@@ -219,7 +149,7 @@ Useful scripts:
 }
 ```
 
-### Full Configuration
+### Full Runtime Configuration
 
 ```json
 {
@@ -229,9 +159,14 @@ Useful scripts:
         "kind": "nightgate",
         "network": "testnet",
         "nodeUrl": "ws://localhost:9944",
+        "corsOrigin": "*",
+        "sessionTtlMs": 86400000,
         "crawler": {
           "enabled": true,
+          "nodeUrl": "ws://localhost:9944",
           "batchSize": 10,
+          "maxRetries": 3,
+          "retryDelay": 2000,
           "requestTimeout": 30000
         }
       }
@@ -240,125 +175,245 @@ Useful scripts:
 }
 ```
 
+### Configuration Reference
+
+| Key | Default | Notes |
+|---|---|---|
+| `network` | `testnet` at runtime | Valid values are `testnet` and `mainnet`; invalid values log an error and fall back to `testnet` |
+| `nodeUrl` | `ws://localhost:9944` | Should be a WebSocket endpoint; non-`ws`/`wss` values log a warning |
+| `crawler.enabled` | `true` | When `false`, services still load but active indexing is disabled |
+| `crawler.nodeUrl` | top-level `nodeUrl` | Optional crawler-specific node URL override |
+| `crawler.batchSize` | `10` | Number of blocks per catch-up progress batch |
+| `crawler.maxRetries` | `3` | Maximum retries per block before the crawler records an error |
+| `crawler.retryDelay` | `2000` | Base retry delay in milliseconds; backoff is calculated from this |
+| `crawler.requestTimeout` | `30000` | RPC timeout in milliseconds |
+| `sessionTtlMs` | `86400000` | Wallet session lifetime in milliseconds |
+| `corsOrigin` | `*` | Reflected in `Access-Control-Allow-Origin` |
+
 ### Environment Variables
 
-Node connectivity is configured via `cds.requires.nightgate.nodeUrl`.
-
-| Variable | Description | Default |
+| Variable | Purpose | Default |
 |---|---|---|
-| `ENCRYPTION_KEY` | AES-256 key for viewing key encryption at rest | Process-scoped fallback |
+| `ENCRYPTION_KEY` | AES-256-GCM key material for wallet viewing-key encryption | Process-scoped dev fallback |
+| `NODE_ENV=production` | Enables HSTS response header | Off unless explicitly set |
 
----
+## Runtime Behavior
 
-## Docker
+### Plugin Lifecycle
 
-### Default: Midnight Node Only
+- `cds-plugin.js` loads `src/plugin.ts`
+- model roots are registered from `db/` and `srv/`
+- middleware is attached during CAP bootstrap
+- `initialize()` runs on `cds.on('served')`
+- `shutdown()` runs on `cds.on('shutdown')`
 
-```bash
-docker compose -f docker/docker-compose.yml up -d
-```
+### Startup And Failure Semantics
 
-### Health Checks
+- On first startup, the package checks whether `midnight.Blocks` exists
+- if the schema is missing, it attempts `db.deploy()` automatically
+- if the Midnight node cannot be reached, the package logs a warning and continues in `offline` mode
+- repeated `initialize()` calls are idempotent
 
-```bash
-# Node health
-curl http://localhost:9944/health
+### Security Middleware
 
-# Indexer health
-curl http://localhost:4004/api/v1/indexer/getHealth()
-```
+The bootstrap middleware currently sets:
 
----
-
-## Production & Operations
-
-### Monitoring
-
-```bash
-# Prometheus metrics
-curl http://localhost:4004/api/v1/indexer/getMetrics()
-```
-
-Returns:
-```
-odatano_nightgate_chain_height 12345
-odatano_nightgate_indexed_height 12340
-odatano_nightgate_sync_lag 5
-odatano_nightgate_blocks_per_second 2.50
-odatano_nightgate_consecutive_errors 0
-odatano_nightgate_uptime_seconds 86400
-odatano_nightgate_sync_status 2
-```
-
-### K8s Health Probes
-
-```yaml
-livenessProbe:
-  httpGet:
-    path: /api/v1/indexer/getLiveness()
-    port: 4004
-readinessProbe:
-  httpGet:
-    path: /api/v1/indexer/getReadiness()
-    port: 4004
-```
-
-### Security Headers
-
-All responses include:
+- `X-Correlation-ID`
+- `Access-Control-Allow-Origin`
+- `Access-Control-Allow-Methods`
+- `Access-Control-Allow-Headers`
+- `Access-Control-Max-Age`
 - `X-Content-Type-Options: nosniff`
 - `X-Frame-Options: DENY`
+- `X-XSS-Protection: 0`
 - `Referrer-Policy: strict-origin-when-cross-origin`
-- `Content-Security-Policy: default-src 'self'`
-- `Strict-Transport-Security` (production only)
+- `Content-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'`
+- `Strict-Transport-Security` in production only
 
-### Correlation IDs
+It also short-circuits `OPTIONS` requests with HTTP `204`.
 
-Every request gets an `X-Correlation-ID` header — either propagated from incoming request or auto-generated.
+## Programmatic API
 
-### Testing
+The package exports a small runtime API in addition to CAP plugin behavior:
 
-```bash
-npm test                  # All tests with coverage
-npm run test:unit         # Unit tests only
+```ts
+import {
+  initialize,
+  shutdown,
+  getStatus,
+  NIGHTGATE_DEFAULTS
+} from '@odatano/nightgate';
 ```
 
----
+`getStatus()` returns:
+
+```ts
+{
+  initialized: boolean,
+  crawlerEnabled: boolean,
+  network?: string,
+  nodeUrl?: string,
+  mode: 'idle' | 'active' | 'offline',
+  lastError?: string
+}
+```
+
+## Services And Endpoints
+
+| Service | Path | What it exposes |
+|---|---|---|
+| `NightgateService` | `/api/v1/nightgate` | Core blockchain entities plus wallet connect/disconnect actions |
+| `NightgateIndexerService` | `/api/v1/indexer` | Sync state, health, readiness, liveness, metrics, reorg history |
+| `NightgateAnalyticsService` | `/api/v1/analytics` | Aggregated counts and analytics projections |
+| `NightgateAdminService` | `/api/v1/admin` | Wallet session administration and invalidation |
+
+### NightgateService
+
+Representative entities:
+
+- `Blocks`
+- `Transactions`
+- `TransactionResults`
+- `TransactionSegments`
+- `TransactionFees`
+- `ContractActions`
+- `ContractBalances`
+- `UnshieldedUtxos`
+- `ZswapLedgerEvents`
+- `DustLedgerEvents`
+- `SystemParameters`
+- `DParameterHistory`
+- `TermsAndConditionsHistory`
+- `DustGenerationStatus`
+- `NightBalances`
+- `DustRegistrations`
+- `TokenTypes`
+- `WalletSessions`
+
+Representative actions:
+
+- `Blocks.latest()`
+- `Blocks.byHeight(height)`
+- `Transactions.byHash(hash)`
+- `ContractActions.byAddress(address)`
+- `ContractActions.history(address)`
+- `UnshieldedUtxos.byOwner(owner)`
+- `UnshieldedUtxos.unspent()`
+- `SystemParameters.current()`
+- `DustGenerationStatus.byCardanoAddress(address)`
+- `DustGenerationStatus.byCardanoAddresses(addresses)`
+- `NightBalances.getBalance(address)`
+- `NightBalances.getTopHolders(limit)`
+- `DustRegistrations.byCardanoStakeKey(stakeKey)`
+- `WalletSessions.connectWallet(viewingKey)`
+- `WalletSessions.disconnectWallet(sessionId)`
+
+### NightgateIndexerService
+
+Key functions:
+
+- `getSyncStatus()`
+- `getHealth()`
+- `getReorgHistory(limit)`
+- `getLiveness()`
+- `getReadiness()`
+- `getMetrics()`
+
+Prometheus metric names use the `odatano_nightgate_` prefix.
+
+### NightgateAnalyticsService
+
+Entities and functions:
+
+- `BlockStatistics`
+- `ContractStatistics`
+- `getBlockCount()`
+- `getTransactionCount()`
+- `getContractCount()`
+- `getAverageTransactionsPerBlock()`
+
+### NightgateAdminService
+
+Admin actions:
+
+- `invalidateSession(sessionId)`
+- `invalidateAllSessions()`
+
+The admin projection excludes `encryptedViewingKey` from the OData response surface.
+
+## Development Commands
+
+| Command | Use |
+|---|---|
+| `npm run dev` | Start CAP from TypeScript sources with auto-reload |
+| `npm run cds:watch` | Direct CAP watch command |
+| `npm run build` | Build the plugin in place for packaging/runtime verification |
+| `npm start` | Build first, then run the compiled layout |
+| `npm run clean` | Remove generated `.js` and `.d.ts` build artifacts |
+| `npm run lint` | Run ESLint |
+| `npm run typecheck` | Run TypeScript without emitting output |
+| `npm test` | Full Jest suite with coverage |
+| `npm run test:unit` | Unit tests only |
+
+## Testing
+
+Current verified repository baseline from the latest full run:
+
+- `18` test suites passed
+- `245` tests passed
+- `0` failures
+- coverage: `98.97%` statements, `89.37%` branches, `99.25%` functions, `99.27%` lines
+
+Run the same checks locally:
+
+```bash
+npm run lint
+npm run typecheck
+npm test
+```
 
 ## Project Structure
 
-```
+```text
 .
-├── cds-plugin.js                 # CAP auto-discovery entry point
+├── cds-plugin.js
 ├── db/
-│   └── schema.cds                # 18 blockchain entities + indexer state
-├── srv/
-│   ├── nightgate-service.*       # Blockchain OData V4 API definition + handlers
-│   ├── nightgate-indexer-service.* # Sync status, health, Prometheus metrics
-│   ├── analytics-service.*       # Aggregated statistics
-│   ├── admin-service.*           # Session management
-│   ├── crawler/
-│   │   ├── Crawler.ts            # Catch-up + live sync + reorg detection
-│   │   └── BlockProcessor.ts     # Block parsing + atomic DB writes
-│   ├── providers/
-│   │   └── MidnightNodeProvider.ts # Substrate JSON-RPC 2.0 WebSocket client
-│   ├── sessions/
-│   │   └── wallet-sessions.ts    # Wallet session handlers + cleanup
-│   ├── types/
-│   │   ├── nightgate.ts          # Public configuration types
-│   │   └── index.ts              # Public type entry point
-│   ├── utils/
-│   │   ├── scale.ts              # SCALE codec for Substrate extrinsics
-│   │   ├── crypto.ts             # AES-256-GCM for viewing keys
-│   │   ├── retry.ts              # Transient error detection + backoff
-│   │   └── validation.ts         # Input validation
+│   └── schema.cds
 ├── docker/
-│   └── docker-compose.yml        # Midnight Node (dev mode)
-└── test/
-    └── unit/                     # Unit tests
+│   └── docker-compose.yml
+├── src/
+│   ├── index.ts
+│   └── plugin.ts
+├── srv/
+│   ├── admin-service.cds
+│   ├── admin-service.ts
+│   ├── analytics-service.cds
+│   ├── analytics-service.ts
+│   ├── midnight-indexer-service.cds
+│   ├── nightgate-indexer-service.ts
+│   ├── nightgate-service.cds
+│   ├── nightgate-service.ts
+│   ├── crawler/
+│   │   ├── BlockProcessor.ts
+│   │   ├── Crawler.ts
+│   │   └── index.ts
+│   ├── providers/
+│   │   └── MidnightNodeProvider.ts
+│   ├── sessions/
+│   │   └── wallet-sessions.ts
+│   ├── types/
+│   │   ├── index.ts
+│   │   └── nightgate.ts
+│   └── utils/
+│       ├── crypto.ts
+│       ├── rate-limiter.ts
+│       ├── retry.ts
+│       ├── scale.ts
+│       └── validation.ts
+├── test/
+│   └── unit/
+└── @cds-models/
 ```
-
----
 
 ## License
 
@@ -367,6 +422,6 @@ npm run test:unit         # Unit tests only
 ## Links
 
 - [ODATANO GitHub](https://github.com/ODATANO)
+- [ODATANO NIGHT repo](https://github.com/ODATANO/ODATANO-NIGHT)
 - [Midnight Network](https://midnight.network/)
 - [SAP CAP Documentation](https://cap.cloud.sap/docs/)
-- [`@odatano/night-attestation`](../attestation/) — Privacy-preserving ZK attestations (companion package)

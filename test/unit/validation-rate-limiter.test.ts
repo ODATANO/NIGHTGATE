@@ -75,6 +75,24 @@ describe('RateLimiter', () => {
         expect(limiter.check('client-1')).toEqual({ allowed: false, retryAfterMs: 500 });
     });
 
+    it('sorts multiple in-window timestamps before calculating retryAfter', () => {
+        const limiter = new RateLimiter({ windowMs: 1000, maxRequests: 2 });
+
+        (limiter as any).hits.set('client-1', [1500, 1000]);
+        nowSpy.mockReturnValue(1600);
+        expect(limiter.check('client-1')).toEqual({ allowed: false, retryAfterMs: 400 });
+        expect((limiter as any).hits.get('client-1')).toEqual([1000, 1500]);
+    });
+
+    it('appends a new hit when the window already has room left', () => {
+        const limiter = new RateLimiter({ windowMs: 1000, maxRequests: 3 });
+
+        (limiter as any).hits.set('client-3', [1000, 1500]);
+        nowSpy.mockReturnValue(1700);
+        expect(limiter.check('client-3')).toEqual({ allowed: true, retryAfterMs: 0 });
+        expect((limiter as any).hits.get('client-3')).toEqual([1000, 1500, 1700]);
+    });
+
     it('drops stale hits once the sliding window has moved on', () => {
         const limiter = new RateLimiter({ windowMs: 1000, maxRequests: 1 });
 

@@ -72,6 +72,16 @@ describe('decodeCompact', () => {
         const buf = Buffer.from([0x01]); // mode 0b01, but no second byte
         expect(decodeCompact(buf, 0)).toBeNull();
     });
+
+    it('should return null for truncated four-byte mode', () => {
+        const buf = Buffer.from([0x02, 0x00, 0x00]);
+        expect(decodeCompact(buf, 0)).toBeNull();
+    });
+
+    it('should return null for truncated big-integer mode', () => {
+        const buf = Buffer.from([0x03, 0x00, 0x00, 0x00]);
+        expect(decodeCompact(buf, 0)).toBeNull();
+    });
 });
 
 describe('parseExtrinsicCallIndices', () => {
@@ -129,6 +139,50 @@ describe('parseExtrinsicCallIndices', () => {
         return lenBuf.slice(0, offset).toString('hex');
     }
 
+    function buildCompactLength(length: number): Buffer {
+        if (length <= 63) {
+            return Buffer.from([length << 2]);
+        }
+
+        const buf = Buffer.alloc(2);
+        buf.writeUInt16LE((length << 2) | 0x01, 0);
+        return buf;
+    }
+
+    function buildSignedExtrinsicParts(options: {
+        addressType?: number;
+        signatureType?: number;
+        eraBytes?: number[];
+        nonceBytes?: number[];
+        tipBytes?: number[];
+        callBytes?: number[];
+        truncateAddress?: boolean;
+        truncateSignature?: boolean;
+    } = {}): string {
+        const bytes: number[] = [0x84];
+
+        if (options.addressType !== undefined) {
+            bytes.push(options.addressType);
+            if (!options.truncateAddress) {
+                for (let i = 0; i < 32; i++) bytes.push(0xaa);
+            }
+        }
+
+        if (options.signatureType !== undefined) {
+            bytes.push(options.signatureType);
+            if (!options.truncateSignature) {
+                for (let i = 0; i < 64; i++) bytes.push(0xbb);
+            }
+        }
+
+        if (options.eraBytes) bytes.push(...options.eraBytes);
+        if (options.nonceBytes) bytes.push(...options.nonceBytes);
+        if (options.tipBytes) bytes.push(...options.tipBytes);
+        if (options.callBytes) bytes.push(...options.callBytes);
+
+        return Buffer.concat([buildCompactLength(bytes.length), Buffer.from(bytes)]).toString('hex');
+    }
+
     it('should parse unsigned extrinsic', () => {
         const hex = buildUnsignedExtrinsic(1, 0);
         const result = parseExtrinsicCallIndices(hex);
@@ -173,8 +227,40 @@ describe('parseExtrinsicCallIndices', () => {
         expect(parseExtrinsicCallIndices('0102')).toBeNull();
     });
 
+    it('should return null when a 0x-prefixed payload is too short after stripping the prefix', () => {
+        expect(parseExtrinsicCallIndices('0x0102')).toBeNull();
+    });
+
     it('should return null for invalid hex', () => {
         expect(parseExtrinsicCallIndices('zzzzzzzzzzzzzz')).toBeNull();
+    });
+
+    it('should return null when hex decoding throws', () => {
+        const fromSpy = jest.spyOn(Buffer, 'from').mockImplementationOnce(() => {
+            throw new Error('hex decode failed');
+        });
+
+        try {
+            expect(parseExtrinsicCallIndices('deadbeef')).toBeNull();
+        } finally {
+            fromSpy.mockRestore();
+        }
+    });
+
+    it('should return null when the compact length prefix cannot be decoded', () => {
+        const buf = Buffer.from([0x13, 0x00, 0x00, 0x00]);
+        expect(parseExtrinsicCallIndices(buf.toString('hex'))).toBeNull();
+    });
+
+    it('should return null when the compact length consumes the whole buffer', () => {
+        const buf = Buffer.alloc(4);
+        buf.writeUInt32LE((16384 << 2) | 0x02, 0);
+        expect(parseExtrinsicCallIndices(buf.toString('hex'))).toBeNull();
+    });
+
+    it('should return null for unsigned extrinsics without enough call data', () => {
+        const buf = Buffer.from([0x01, 0x00, 0x04, 0x0a]);
+        expect(parseExtrinsicCallIndices(buf.toString('hex'))).toBeNull();
     });
 
     it('should return null for truncated signed extrinsic', () => {
@@ -183,22 +269,90 @@ describe('parseExtrinsicCallIndices', () => {
         expect(parseExtrinsicCallIndices(buf.toString('hex'))).toBeNull();
     });
 
+    it('should return null when a signed extrinsic stops before the address type byte', () => {
+        const hex = Buffer.concat([buildCompactLength(1), Buffer.from([0x84])]).toString('hex');
+        expect(parseExtrinsicCallIndices(hex)).toBeNull();
+    });
+
     it('should return null for unknown address type in signed extrinsic', () => {
-        // Build a signed-looking extrinsic with unknown address type
-        const buf = Buffer.alloc(200);
-        buf.writeUInt16LE((198 << 2) | 0x01, 0); // compact length (two-byte mode)
-        buf[2] = 0x84; // version: signed
-        buf[3] = 0x05; // unknown address type
-        expect(parseExtrinsicCallIndices(buf.toString('hex'))).toBeNull();
+        const hex = buildSignedExtrinsicParts({ addressType: 0x05 });
+        expect(parseExtrinsicCallIndices(hex)).toBeNull();
+    });
+
+    it('should parse signed extrinsics that use address type 0xff', () => {
+        const hex = buildSignedExtrinsicParts({
+            addressType: 0xff,
+            signatureType: 0x02,
+            eraBytes: [0x00],
+            nonceBytes: [0x00],
+            tipBytes: [0x00],
+            callBytes: [0x0f, 0x03]
+        });
+
+        expect(parseExtrinsicCallIndices(hex)).toEqual({ palletIndex: 15, callIndex: 3 });
     });
 
     it('should return null for unknown signature type in signed extrinsic', () => {
-        const buf = Buffer.alloc(200);
-        buf.writeUInt16LE((198 << 2) | 0x01, 0);
-        buf[2] = 0x84;
-        buf[3] = 0x00; // AccountId32 address type
-        // 32 bytes of address (offset 4-35)
-        buf[36] = 0x05; // unknown sig type
-        expect(parseExtrinsicCallIndices(buf.toString('hex'))).toBeNull();
+        const hex = buildSignedExtrinsicParts({
+            addressType: 0x00,
+            signatureType: 0x05
+        });
+        expect(parseExtrinsicCallIndices(hex)).toBeNull();
+    });
+
+    it('should parse signed extrinsics with Ed25519 signatures and mortal era', () => {
+        const hex = buildSignedExtrinsicParts({
+            addressType: 0x00,
+            signatureType: 0x00,
+            eraBytes: [0x04, 0x00],
+            nonceBytes: [0x00],
+            tipBytes: [0x00],
+            callBytes: [0x04, 0x02]
+        });
+
+        expect(parseExtrinsicCallIndices(hex)).toEqual({ palletIndex: 4, callIndex: 2 });
+    });
+
+    it('should return null when the signed extrinsic stops before the nonce', () => {
+        const hex = buildSignedExtrinsicParts({
+            addressType: 0x00,
+            signatureType: 0x01,
+            eraBytes: [0x00]
+        });
+
+        expect(parseExtrinsicCallIndices(hex)).toBeNull();
+    });
+
+    it('should return null when the signed extrinsic stops before the tip', () => {
+        const hex = buildSignedExtrinsicParts({
+            addressType: 0x00,
+            signatureType: 0x01,
+            eraBytes: [0x00],
+            nonceBytes: [0x00]
+        });
+
+        expect(parseExtrinsicCallIndices(hex)).toBeNull();
+    });
+
+    it('should return null when the signed extrinsic stops before the era byte', () => {
+        const hex = buildSignedExtrinsicParts({
+            addressType: 0x00,
+            signatureType: 0x01
+        });
+
+        expect(parseExtrinsicCallIndices(hex)).toBeNull();
+    });
+
+    it('should return null when the signed extrinsic stops before both call bytes', () => {
+        const hex = buildSignedExtrinsicParts({
+            addressType: 0x00,
+            signatureType: 0x01,
+            eraBytes: [0x00],
+            nonceBytes: [0x00],
+            tipBytes: [0x00],
+            callBytes: [0x04]
+        });
+
+        expect(parseExtrinsicCallIndices(hex)).toBeNull();
     });
 });
