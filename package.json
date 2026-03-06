@@ -23,26 +23,49 @@
     "crawler",
     "substrate"
   ],
-  "main": "cds-plugin.js",
-  "types": "lib/types/index.d.ts",
+  "main": "src/index.js",
+  "types": "src/index.d.ts",
+  "type": "commonjs",
+  "exports": {
+    ".": {
+      "types": "./src/index.d.ts",
+      "default": "./src/index.js"
+    },
+    "./types": {
+      "types": "./srv/types/index.d.ts",
+      "default": "./srv/types/index.js"
+    }
+  },
   "files": [
     "cds-plugin.js",
-    "db/",
-    "srv/",
-    "lib/",
+    "db/schema.cds",
+    "src/**/*.js",
+    "src/**/*.d.ts",
+    "srv/**/*.cds",
+    "srv/**/*.js",
+    "srv/**/*.d.ts",
     "README.md",
     "LICENSE"
   ],
   "scripts": {
-    "start": "cds-serve",
-    "dev": "cds watch",
-    "build": "tsc",
-    "build:types": "cds-typer '*' --outputDirectory @cds-models",
+    "clean": "node scripts/clean-build-artifacts.js",
+    "prestart": "npm run build",
+    "start": "npm run serve",
+    "dev": "npm run cds:watch",
+    "build": "npm run build:plugin",
+    "build:plugin": "npm run cds:types && tsc -p tsconfig.build.json",
+    "serve": "npm run cds:serve",
+    "cds:watch": "cds watch",
+    "cds:serve": "cds-serve",
+    "cds:types": "cds-typer \"*\" --outputDirectory @cds-models",
+    "build:types": "npm run cds:types",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
     "deploy": "cds deploy",
     "test": "jest --coverage",
     "test:unit": "jest --testPathPattern=test/unit",
     "lint": "eslint .",
-    "prepublishOnly": "npm run build && npm test"
+    "prepack": "npm run build:plugin",
+    "prepublishOnly": "npm run typecheck && npm test && npm run build:plugin"
   },
   "dependencies": {
     "@noble/hashes": "^1.8.0",

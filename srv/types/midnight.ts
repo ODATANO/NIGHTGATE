@@ -5,7 +5,6 @@
 export interface MidnightConfig {
   network: 'testnet' | 'mainnet';
   contractAddress?: string;
-  proofServerUrl?: string;
   nodeUrl?: string;
   walletSeed?: string;
   credentials?: {
@@ -17,12 +16,10 @@ export interface MidnightConfig {
 
 export const MIDNIGHT_DEFAULTS = {
   testnet: {
-    nodeUrl: 'ws://localhost:9944',
-    proofServerUrl: 'http://localhost:6300'
+    nodeUrl: 'ws://localhost:9944'
   },
   mainnet: {
-    nodeUrl: 'ws://localhost:9944',
-    proofServerUrl: 'http://localhost:6300'
+    nodeUrl: 'ws://localhost:9944'
   }
 } as const;
 
@@ -48,10 +45,4 @@ export interface MidnightProviders {
 export interface CircuitResult {
   transactionHash: string;
   publicOutput?: Record<string, unknown>;
-}
-
-export interface ProofServerStatus {
-  healthy: boolean;
-  url: string;
-  lastChecked: Date;
 }

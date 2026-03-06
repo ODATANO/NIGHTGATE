@@ -68,7 +68,7 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
         if (!sessionId) return req.reject(400, 'sessionId is required');
 
         const session = await db.run(
-            SELECT.one.from('midnight.WalletSessions').where({ ID: sessionId })
+            SELECT.one.from('midnight.WalletSessions').where({ sessionId })
         );
 
         if (!session) {
@@ -79,7 +79,7 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
             await db.run(
                 UPDATE.entity('midnight.WalletSessions')
                     .set({ isActive: false, encryptedViewingKey: null })
-                    .where({ ID: sessionId })
+                    .where({ sessionId })
             );
             return req.reject(410, 'Session expired');
         }
@@ -91,7 +91,7 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
                     isActive: false,
                     encryptedViewingKey: null
                 })
-                .where({ ID: sessionId })
+                .where({ sessionId })
         );
     });
 }

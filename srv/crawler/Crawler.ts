@@ -141,7 +141,7 @@ export class MidnightCrawler {
         this.isCatchingUp = true;
 
         const syncState = await this.getSyncState();
-        const startHeight = (syncState?.lastIndexedHeight ?? -1) + 1;
+        const startHeight = this.getCatchUpStartHeight(syncState);
 
         // Target finalized head (not chain tip) — avoids ingesting soon-reverted blocks
         const finalizedHash = await this.nodeProvider.getFinalizedHead();
@@ -537,6 +537,17 @@ export class MidnightCrawler {
         } catch {
             // Don't fail on error recording
         }
+    }
+
+    private getCatchUpStartHeight(syncState: {
+        lastIndexedHeight?: number | null;
+        lastIndexedHash?: string | null;
+    } | null | undefined): number {
+        if (!syncState?.lastIndexedHash) {
+            return 0;
+        }
+
+        return (syncState.lastIndexedHeight ?? -1) + 1;
     }
 
     private sleep(ms: number): Promise<void> {

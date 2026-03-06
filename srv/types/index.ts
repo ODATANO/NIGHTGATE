@@ -5,8 +5,7 @@
 export type {
   MidnightConfig,
   MidnightProviders,
-  CircuitResult,
-  ProofServerStatus
+  CircuitResult
 } from './midnight.js';
 
 export { MIDNIGHT_DEFAULTS } from './midnight.js';

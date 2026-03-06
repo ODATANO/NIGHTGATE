@@ -22,7 +22,7 @@ export default class MidnightAdminService extends cds.ApplicationService {
             }
 
             const session = await this.db.run(
-                SELECT.one.from('midnight.WalletSessions').where({ ID: sessionId })
+                SELECT.one.from('midnight.WalletSessions').where({ sessionId })
             );
 
             if (!session) {
@@ -38,7 +38,7 @@ export default class MidnightAdminService extends cds.ApplicationService {
                     isActive: false,
                     disconnectedAt: new Date().toISOString(),
                     encryptedViewingKey: null  // Clear encrypted key
-                }).where({ ID: sessionId })
+                }).where({ sessionId })
             );
         });
 

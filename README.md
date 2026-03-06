@@ -54,10 +54,10 @@ The crawler connects to the node, catches up on historical blocks, and then foll
 [cds] - serving MidnightAnalyticsService { at: '/api/v1/analytics' }
 [cds] - serving MidnightAdminService { at: '/api/v1/admin' }
 
-[MidnightCrawler] Connected to ws://localhost:9944
-[MidnightCrawler] Catch-up: 0 → 142 (142 blocks)
-[MidnightCrawler] Catch-up complete. Processed 142 blocks (178.2 blocks/s)
-[MidnightCrawler] Live: subscribed to new block headers
+[MidnightNode] Connected to ws://localhost:9944
+[Crawler] Catch-up: 0 → 142 (143 blocks, finalized)
+[Crawler] Catch-up complete: 143 blocks in 0.8s
+[Crawler] Live subscription active
 ```
 
 ### 3. Query via OData
@@ -102,6 +102,26 @@ Add to `package.json`:
 ```
 
 Run `cds watch` — all indexer services auto-register. The crawler starts indexing from the configured node.
+
+### Local Development (This Repository)
+
+```bash
+npm ci
+npm run dev
+```
+
+`npm run dev` is the preferred local entry point. It delegates to `npm run cds:watch`, which starts CAP directly from the TypeScript source tree. No manual build step is required before local development.
+
+Useful scripts:
+
+| Script | When to use it |
+|---|---|
+| `npm run dev` | Preferred local development command from `.ts` sources with auto-reload |
+| `npm run cds:watch` | Direct CAP watch alias used by `npm run dev` |
+| `npm run build` | Compile `src/` and `srv/` in-place for packaging or a production-style local run |
+| `npm run build:plugin` | Explicit plugin-packaging build alias used by `npm run build` |
+| `npm start` | Build via `prestart`, then launch CAP from the compiled runtime layout |
+| `npm run clean` | Remove generated `.js` and `.d.ts` plugin build artifacts |
 
 ---
 
@@ -149,7 +169,7 @@ Run `cds watch` — all indexer services auto-register. The crawler starts index
            │ chain_getBlock, chain_subscribeNewHeads
            ▼
 ┌──────────────────────────┐
-│  MidnightNodeProvider    │  lib/providers/MidnightNodeProvider.ts
+│  MidnightNodeProvider    │  srv/providers/MidnightNodeProvider.ts
 │  JSON-RPC 2.0 Client     │  WebSocket, reconnect, request tracking
 └──────────┬───────────────┘
            │
@@ -307,32 +327,30 @@ npm run test:unit         # Unit tests only
 ## Project Structure
 
 ```
-packages/indexer/
+.
 ├── cds-plugin.js                 # CAP auto-discovery entry point
 ├── db/
 │   └── schema.cds                # 18 blockchain entities + indexer state
 ├── srv/
-│   ├── midnight-service.cds      # Blockchain OData V4 API definition
-│   ├── midnight-service.ts       # Service handler + crawler startup
+│   ├── midnight-service.*        # Blockchain OData V4 API definition + handlers
 │   ├── midnight-indexer-service.* # Sync status, health, Prometheus metrics
 │   ├── analytics-service.*       # Aggregated statistics
 │   ├── admin-service.*           # Session management
 │   ├── crawler/
 │   │   ├── Crawler.ts            # Catch-up + live sync + reorg detection
 │   │   └── BlockProcessor.ts     # Block parsing + atomic DB writes
+│   ├── providers/
+│   │   └── MidnightNodeProvider.ts # Substrate JSON-RPC 2.0 WebSocket client
+│   ├── sessions/
+│   │   └── wallet-sessions.ts    # Wallet session handlers + cleanup
+│   ├── types/
+│   │   ├── midnight.ts           # Public configuration types
+│   │   └── index.ts              # Public type entry point
 │   ├── utils/
 │   │   ├── scale.ts              # SCALE codec for Substrate extrinsics
 │   │   ├── crypto.ts             # AES-256-GCM for viewing keys
 │   │   ├── retry.ts              # Transient error detection + backoff
 │   │   └── validation.ts         # Input validation
-│   └── lib/
-│       └── midnight-client.ts    # Blockchain type definitions
-├── lib/
-│   ├── providers/
-│   │   └── MidnightNodeProvider.ts   # Substrate JSON-RPC 2.0 WebSocket client
-│   └── types/
-│       ├── midnight.ts           # SDK config types
-│       └── index.ts              # Public TypeScript API
 ├── docker/
 │   └── docker-compose.yml        # Midnight Node (dev mode)
 └── test/

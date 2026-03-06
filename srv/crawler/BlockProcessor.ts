@@ -27,13 +27,13 @@ export interface PalletMapping {
 
 /** Default Substrate pallet index → type mapping. Override via cds.requires.midnight.palletMap */
 const DEFAULT_PALLET_MAP: Record<number, PalletMapping> = {
-    0:  { name: 'System',       txType: 'system',            isSystem: true },
-    1:  { name: 'Timestamp',    txType: 'timestamp',         isSystem: true },
-    2:  { name: 'Babe',         txType: 'consensus',         isSystem: true },
-    3:  { name: 'Grandpa',      txType: 'consensus',         isSystem: true },
-    4:  { name: 'Balances',     txType: 'transfer' },
-    5:  { name: 'Sudo',         txType: 'sudo',              isSystem: true },
-    10: { name: 'Contracts',    txType: 'contract_call' },
+    0: { name: 'System', txType: 'system', isSystem: true },
+    1: { name: 'Timestamp', txType: 'timestamp', isSystem: true },
+    2: { name: 'Babe', txType: 'consensus', isSystem: true },
+    3: { name: 'Grandpa', txType: 'consensus', isSystem: true },
+    4: { name: 'Balances', txType: 'transfer' },
+    5: { name: 'Sudo', txType: 'sudo', isSystem: true },
+    10: { name: 'Contracts', txType: 'contract_call' },
     // @TODO Midnight-specific pallets — configure actual indices via cds.requires.midnight.palletMap:
     // { "15": { "name": "Zswap", "txType": "shielded_transfer", "isShielded": true } }
     // { "16": { "name": "ContractPallet", "txType": "contract_deploy" } }

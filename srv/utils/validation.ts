@@ -1,5 +1,5 @@
 /**
- * Input Validation Utilities for Midnight Attestation Handlers
+ * Input Validation Utilities for Midnight service handlers
  *
  * Centralizes validation logic across all CDS action handlers.
  * Each function returns an error string on failure, undefined on success.

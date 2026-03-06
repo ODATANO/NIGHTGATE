@@ -59,22 +59,30 @@ export default class MidnightIndexerService extends cds.ApplicationService {
                     status: 'unknown',
                     chainHeight: 0,
                     indexedHeight: 0,
+                    finalizedHeight: 0,
                     lag: 0,
+                    finalizedLag: 0,
                     blocksPerSecond: 0,
                     syncStatus: 'stopped'
                 };
             }
 
-            const lag = (syncState.chainHeight || 0) - (syncState.lastIndexedHeight || 0);
+            const chainHeight = syncState.chainHeight || 0;
+            const indexedHeight = syncState.lastIndexedHeight || 0;
+            const finalizedHeight = syncState.lastFinalizedHeight || 0;
+            const lag = Math.max(chainHeight - indexedHeight, 0);
+            const finalizedLag = Math.max(chainHeight - finalizedHeight, 0);
             let status = 'healthy';
             if (lag > 100) status = 'unhealthy';
             else if (lag > 10) status = 'degraded';
 
             return {
                 status,
-                chainHeight: syncState.chainHeight || 0,
-                indexedHeight: syncState.lastIndexedHeight || 0,
+                chainHeight,
+                indexedHeight,
+                finalizedHeight,
                 lag,
+                finalizedLag,
                 blocksPerSecond: syncState.blocksPerSecond || 0,
                 syncStatus: syncState.syncStatus || 'stopped'
             };
@@ -101,8 +109,7 @@ export default class MidnightIndexerService extends cds.ApplicationService {
             const checks = {
                 database: false,
                 crawler: false,
-                node: false,
-                proofServer: false
+                node: false
             };
 
             try {
@@ -123,13 +130,8 @@ export default class MidnightIndexerService extends cds.ApplicationService {
                 // Database not available
             }
 
-            const midnightClient = (cds as any).midnight;
-            if (midnightClient?.componentStatus) {
-                checks.proofServer = midnightClient.componentStatus.providers || false;
-            }
-
             return {
-                ready: checks.database && checks.crawler,
+                ready: checks.database && checks.crawler && checks.node,
                 checks
             };
         });

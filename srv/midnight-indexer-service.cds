@@ -43,10 +43,9 @@ service MidnightIndexerService {
     function getReadiness() returns {
         ready : Boolean;
         checks : {
-            database    : Boolean;
-            crawler     : Boolean;
-            node        : Boolean;
-            proofServer : Boolean;
+            database : Boolean;
+            crawler  : Boolean;
+            node     : Boolean;
         };
     };
 

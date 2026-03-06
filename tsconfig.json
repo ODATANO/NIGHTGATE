@@ -10,18 +10,21 @@
     "declaration": true,
     "declarationMap": true,
     "sourceMap": true,
-    "outDir": "./gen/srv",
-    "rootDir": ".",
     "resolveJsonModule": true,
     "allowSyntheticDefaultImports": true,
     "paths": {
-      "#cds-models/*": ["./@cds-models/*/index.ts"]
+      "#cds-models/*": [
+        "./@cds-models/*/index.ts"
+      ]
     },
-    "types": ["node", "jest"]
+    "types": [
+      "node",
+      "jest"
+    ]
   },
   "include": [
+    "src/**/*.ts",
     "srv/**/*.ts",
-    "lib/**/*.ts",
     "test/**/*.ts",
     "@cds-models/**/*.ts"
   ],

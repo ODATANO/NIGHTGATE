@@ -7,6 +7,16 @@ db/*.db
 db/*.db-shm
 db/*.db-wal
 
+# In-place TypeScript build output
+src/**/*.js
+src/**/*.d.ts
+src/**/*.js.map
+src/**/*.d.ts.map
+srv/**/*.js
+srv/**/*.d.ts
+srv/**/*.js.map
+srv/**/*.d.ts.map
+
 # Environment
 .env
 .env.local

@@ -6,6 +6,8 @@
 
 const mockDbRun = jest.fn();
 const mockDbConnect = jest.fn().mockResolvedValue({ run: mockDbRun });
+const selectWhereSpy = jest.fn();
+const updateWhereSpy = jest.fn();
 
 const registeredHandlers: Record<string, Function> = {};
 
@@ -16,14 +18,14 @@ jest.mock('@sap/cds', () => {
             SELECT: {
                 one: {
                     from: jest.fn().mockReturnValue({
-                        where: jest.fn()
+                        where: selectWhereSpy
                     })
                 }
             },
             UPDATE: {
                 entity: jest.fn().mockReturnValue({
                     set: jest.fn().mockReturnValue({
-                        where: jest.fn()
+                        where: updateWhereSpy
                     })
                 })
             }
@@ -32,7 +34,7 @@ jest.mock('@sap/cds', () => {
             on(event: string, handler: Function) {
                 registeredHandlers[event] = handler;
             }
-            async init() {}
+            async init() { }
         }
     };
     cds.default = cds;
@@ -67,7 +69,8 @@ describe('MidnightAdminService', () => {
 
             // SELECT returns an active session
             mockDbRun.mockResolvedValueOnce({
-                ID: 'session-123',
+                ID: 'db-session-123',
+                sessionId: 'session-123',
                 isActive: true,
                 viewingKey: 'vk_test'
             });
@@ -79,6 +82,8 @@ describe('MidnightAdminService', () => {
 
             expect(req.reject).not.toHaveBeenCalled();
             expect(mockDbRun).toHaveBeenCalledTimes(2);
+            expect(selectWhereSpy).toHaveBeenCalledWith({ sessionId: 'session-123' });
+            expect(updateWhereSpy).toHaveBeenCalledWith({ sessionId: 'session-123' });
         });
 
         it('should reject when sessionId is missing', async () => {
@@ -105,7 +110,8 @@ describe('MidnightAdminService', () => {
             const handler = registeredHandlers['invalidateSession'];
 
             mockDbRun.mockResolvedValueOnce({
-                ID: 'session-123',
+                ID: 'db-session-123',
+                sessionId: 'session-123',
                 isActive: false
             });
 
