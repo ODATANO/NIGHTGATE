@@ -117,11 +117,11 @@ export default class NightgateService extends cds.ApplicationService {
         });
 
         this.on('READ', 'DParameterHistory', async (req: Request) => {
-            return this.db.run(req.query) || [];
+            return await this.db.run(req.query) || [];
         });
 
         this.on('READ', 'TermsAndConditionsHistory', async (req: Request) => {
-            return this.db.run(req.query) || [];
+            return await this.db.run(req.query) || [];
         });
 
         // ====================================================================

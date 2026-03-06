@@ -31,7 +31,8 @@ export class RateLimiter {
 
         // Clean up stale keys to prevent memory growth
         if (timestamps.length === 0) {
-            this.hits.delete(key);
+            timestamps = [now];
+            this.hits.set(key, timestamps);
             return { allowed: true, retryAfterMs: 0 };
         }
 

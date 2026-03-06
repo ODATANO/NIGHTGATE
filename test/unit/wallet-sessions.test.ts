@@ -7,6 +7,7 @@
 const mockDbRun = jest.fn();
 const selectWhereSpy = jest.fn();
 const updateWhereSpy = jest.fn();
+const insertEntriesSpy = jest.fn();
 
 jest.mock('@sap/cds', () => {
     const cds: any = {
@@ -25,7 +26,7 @@ jest.mock('@sap/cds', () => {
             },
             INSERT: {
                 into: jest.fn().mockReturnValue({
-                    entries: jest.fn()
+                    entries: insertEntriesSpy
                 })
             },
             UPDATE: {
@@ -44,11 +45,16 @@ jest.mock('@sap/cds', () => {
     return cds;
 });
 
-import { registerWalletSessionHandlers } from '../../srv/sessions/wallet-sessions';
+import { registerWalletSessionHandlers, startSessionCleanup } from '../../srv/sessions/wallet-sessions';
 
 function createMockRequest(data: Record<string, unknown>) {
     return {
         data,
+        _: {
+            req: {
+                ip: '127.0.0.1'
+            }
+        },
         reject: jest.fn().mockImplementation((code: number, message: string) => ({
             __rejected: true,
             code,
@@ -71,6 +77,37 @@ describe('wallet session handlers', () => {
         jest.clearAllMocks();
         Object.keys(registeredHandlers).forEach(k => delete registeredHandlers[k]);
         registerWalletSessionHandlers(mockService, { run: mockDbRun });
+    });
+
+    it('connectWallet creates a new active session for valid viewing keys', async () => {
+        mockDbRun.mockResolvedValueOnce(1);
+
+        const handler = registeredHandlers['connectWallet'];
+        const req = createMockRequest({ viewingKey: 'a'.repeat(64) });
+        const result = await handler(req);
+
+        expect(req.reject).not.toHaveBeenCalled();
+        expect(insertEntriesSpy).toHaveBeenCalledWith(expect.objectContaining({
+            viewingKeyHash: expect.any(String),
+            encryptedViewingKey: expect.any(String),
+            sessionToken: 'generated-id',
+            isActive: true
+        }));
+        expect(result).toEqual(expect.objectContaining({
+            sessionId: 'generated-id',
+            sessionToken: 'generated-id',
+            isActive: true
+        }));
+    });
+
+    it('connectWallet rejects invalid viewing keys before inserting a session', async () => {
+        const handler = registeredHandlers['connectWallet'];
+        const req = createMockRequest({ viewingKey: 'not-hex' });
+
+        await handler(req);
+
+        expect(req.reject).toHaveBeenCalledWith(400, 'viewingKey must be hex-encoded');
+        expect(insertEntriesSpy).not.toHaveBeenCalled();
     });
 
     it('disconnectWallet looks sessions up by sessionId', async () => {
@@ -106,5 +143,20 @@ describe('wallet session handlers', () => {
 
         expect(updateWhereSpy).toHaveBeenCalledWith({ sessionId: 'public-session-2' });
         expect(req.reject).toHaveBeenCalledWith(410, 'Session expired');
+    });
+
+    it('startSessionCleanup deactivates expired sessions on the cleanup interval', async () => {
+        jest.useFakeTimers();
+        const db = { run: jest.fn().mockResolvedValue(2) };
+
+        try {
+            const timer = startSessionCleanup(db);
+            await jest.advanceTimersByTimeAsync(15 * 60 * 1000);
+
+            expect(db.run).toHaveBeenCalledTimes(1);
+            clearInterval(timer);
+        } finally {
+            jest.useRealTimers();
+        }
     });
 });

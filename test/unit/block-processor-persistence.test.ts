@@ -1,0 +1,308 @@
+const connectToSpy = jest.fn();
+const uuidSpy = jest.fn();
+
+jest.mock('@sap/cds', () => {
+    const SELECT = {
+        one: {
+            from: jest.fn((entity: string) => ({
+                columns: jest.fn((...columns: string[]) => ({
+                    where: jest.fn((where: Record<string, unknown>) => ({
+                        kind: 'selectOne',
+                        entity,
+                        columns,
+                        where
+                    }))
+                }))
+            }))
+        }
+    };
+
+    const INSERT = {
+        into: jest.fn((entity: string) => ({
+            entries: jest.fn((entry: Record<string, unknown>) => ({
+                kind: 'insert',
+                entity,
+                entry
+            }))
+        }))
+    };
+
+    const UPDATE = {
+        entity: jest.fn((entity: string) => ({
+            set: jest.fn((set: Record<string, unknown>) => ({
+                where: jest.fn((where: Record<string, unknown>) => ({
+                    kind: 'update',
+                    entity,
+                    set,
+                    where
+                }))
+            }))
+        }))
+    };
+
+    const cds: any = {
+        env: {
+            requires: {
+                nightgate: {
+                    palletMap: {
+                        15: { name: 'Zswap', txType: 'shielded_transfer', isShielded: true }
+                    }
+                }
+            }
+        },
+        ql: { SELECT, INSERT, UPDATE },
+        connect: {
+            to: connectToSpy
+        },
+        utils: {
+            uuid: uuidSpy
+        }
+    };
+    cds.default = cds;
+    return cds;
+});
+
+import cds from '@sap/cds';
+import { BlockProcessor } from '../../srv/crawler/BlockProcessor';
+
+function buildUnsignedExtrinsic(palletIndex: number, callIndex: number): string {
+    return '0x' + Buffer.from([0x0c, 0x04, palletIndex, callIndex]).toString('hex');
+}
+
+function buildTimestampHex(seconds: number): string {
+    const buf = Buffer.alloc(8);
+    buf.writeBigUInt64LE(BigInt(seconds) * 1000n);
+    return '0x' + buf.toString('hex');
+}
+
+describe('BlockProcessor persistence paths', () => {
+    beforeEach(() => {
+        jest.clearAllMocks();
+        connectToSpy.mockReset();
+        uuidSpy.mockReset();
+    });
+
+    it('initializes the database connection through cds.connect', async () => {
+        const db = { run: jest.fn(), tx: jest.fn() };
+        connectToSpy.mockResolvedValueOnce(db);
+
+        const processor = new BlockProcessor({} as any);
+
+        await processor.init();
+
+        expect(connectToSpy).toHaveBeenCalledWith('db');
+        expect((processor as any).db).toBe(db);
+    });
+
+    it('returns early for blocks that are already indexed', async () => {
+        const db = {
+            run: jest.fn().mockResolvedValue({ ID: 'existing-block' }),
+            tx: jest.fn()
+        };
+        const provider = {
+            getHeader: jest.fn().mockResolvedValue({ number: '0x2a' }),
+            getBlock: jest.fn()
+        };
+        const processor = new BlockProcessor(provider as any);
+        (processor as any).db = db;
+
+        const nowSpy = jest.spyOn(Date, 'now')
+            .mockReturnValueOnce(1_000)
+            .mockReturnValueOnce(1_012);
+
+        try {
+            await expect(processor.processBlockByHash('0xknown')).resolves.toEqual({
+                blockHeight: 42,
+                blockHash: '0xknown',
+                transactionCount: 0,
+                contractActionCount: 0,
+                processingTimeMs: 12
+            });
+
+            expect(provider.getHeader).toHaveBeenCalledWith('0xknown');
+            expect(provider.getBlock).not.toHaveBeenCalled();
+            expect(db.tx).not.toHaveBeenCalled();
+        } finally {
+            nowSpy.mockRestore();
+        }
+    });
+
+    it('persists a new block, transactions, and sync state in one DB transaction', async () => {
+        const extrinsics = [
+            buildUnsignedExtrinsic(0, 0),
+            buildUnsignedExtrinsic(10, 0),
+            buildUnsignedExtrinsic(10, 1),
+            buildUnsignedExtrinsic(10, 2),
+            buildUnsignedExtrinsic(15, 0)
+        ];
+        const provider = {
+            getBlock: jest.fn().mockResolvedValue({
+                block: {
+                    header: {
+                        parentHash: '0xparent',
+                        number: '0x05',
+                        stateRoot: '0xstate',
+                        digest: {
+                            logs: ['0x0642414245deadbeef']
+                        }
+                    },
+                    extrinsics
+                },
+                justifications: null
+            }),
+            getRuntimeVersion: jest.fn().mockResolvedValue({ specVersion: 77 }),
+            getStorage: jest.fn().mockResolvedValue(buildTimestampHex(1_700_000_000))
+        };
+        const tx = {
+            run: jest.fn(async (query: any) => {
+                if (query?.kind === 'selectOne' && query.entity === 'midnight.Blocks' && query.where?.hash === '0xparent') {
+                    return { ID: 'parent-1' };
+                }
+                return null;
+            })
+        };
+        const db = {
+            run: jest.fn().mockResolvedValue(null),
+            tx: jest.fn(async (callback: (transaction: any) => Promise<void>) => callback(tx))
+        };
+
+        uuidSpy
+            .mockReturnValueOnce('block-1')
+            .mockReturnValueOnce('tx-1')
+            .mockReturnValueOnce('tx-2')
+            .mockReturnValueOnce('tx-3')
+            .mockReturnValueOnce('tx-4')
+            .mockReturnValueOnce('tx-5');
+
+        const processor = new BlockProcessor(provider as any);
+        (processor as any).db = db;
+
+        const result = await processor.processBlockByHash('0xnew');
+        const txQueries = tx.run.mock.calls.map(([query]) => query);
+        const blockInsert = txQueries.find((query) => query?.kind === 'insert' && query.entity === 'midnight.Blocks');
+        const txInserts = txQueries.filter((query) => query?.kind === 'insert' && query.entity === 'midnight.Transactions');
+        const syncUpdate = txQueries.find((query) => query?.kind === 'update' && query.entity === 'midnight.SyncState');
+
+        expect(result).toEqual(expect.objectContaining({
+            blockHeight: 5,
+            blockHash: '0xnew',
+            transactionCount: 5,
+            contractActionCount: 3
+        }));
+        expect(db.run).toHaveBeenCalledWith(expect.objectContaining({
+            kind: 'selectOne',
+            entity: 'midnight.Blocks',
+            where: { hash: '0xnew' }
+        }));
+        expect(db.tx).toHaveBeenCalledTimes(1);
+        expect(blockInsert?.entry).toEqual(expect.objectContaining({
+            ID: 'block-1',
+            hash: '0xnew',
+            height: 5,
+            protocolVersion: 77,
+            timestamp: 1_700_000_000,
+            author: 'BABE:0xdeadbeef',
+            ledgerParameters: '0xstate',
+            parent_ID: 'parent-1'
+        }));
+        expect(txInserts).toHaveLength(5);
+        expect(txInserts.map((query) => query.entry.txType)).toEqual([
+            'system',
+            'contract_call',
+            'contract_deploy',
+            'contract_update',
+            'shielded_transfer'
+        ]);
+        expect(txInserts.map((query) => query.entry.transactionType)).toEqual([
+            'SYSTEM',
+            'REGULAR',
+            'REGULAR',
+            'REGULAR',
+            'REGULAR'
+        ]);
+        expect(txInserts[4].entry.isShielded).toBe(true);
+        expect(txInserts.every((query) => query.entry.block_ID === 'block-1')).toBe(true);
+        expect(txInserts.every((query) => /^0x[0-9a-f]{64}$/.test(query.entry.hash))).toBe(true);
+        expect(syncUpdate).toEqual(expect.objectContaining({
+            kind: 'update',
+            entity: 'midnight.SyncState',
+            set: expect.objectContaining({
+                lastIndexedHeight: 5,
+                lastIndexedHash: '0xnew',
+                lastIndexedAt: expect.any(String),
+                syncStatus: 'syncing'
+            }),
+            where: { ID: 'SINGLETON' }
+        }));
+    });
+
+    it('falls back cleanly when runtime and timestamp metadata are unavailable', async () => {
+        const provider = {
+            getBlock: jest.fn().mockResolvedValue({
+                block: {
+                    header: {
+                        parentHash: '0xmissing-parent',
+                        number: '0x06',
+                        stateRoot: '0xstate-2'
+                    },
+                    extrinsics: ['0x' + 'aa'.repeat(60)]
+                },
+                justifications: null
+            }),
+            getRuntimeVersion: jest.fn().mockRejectedValue(new Error('runtime unavailable')),
+            getStorage: jest.fn().mockResolvedValue(null)
+        };
+        const tx = {
+            run: jest.fn().mockResolvedValue(null)
+        };
+        const db = {
+            run: jest.fn().mockResolvedValue(null),
+            tx: jest.fn(async (callback: (transaction: any) => Promise<void>) => callback(tx))
+        };
+
+        uuidSpy
+            .mockReturnValueOnce('block-2')
+            .mockReturnValueOnce('tx-6');
+
+        const processor = new BlockProcessor(provider as any);
+        (processor as any).db = db;
+
+        const warnSpy = jest.spyOn(console, 'warn').mockImplementation();
+        const nowSpy = jest.spyOn(Date, 'now')
+            .mockReturnValueOnce(2_000)
+            .mockReturnValueOnce(1_700_000_000_000)
+            .mockReturnValueOnce(2_050);
+
+        try {
+            const result = await processor.processBlockByHash('0xfallback');
+            const txQueries = tx.run.mock.calls.map(([query]) => query);
+            const blockInsert = txQueries.find((query) => query?.kind === 'insert' && query.entity === 'midnight.Blocks');
+            const txInsert = txQueries.find((query) => query?.kind === 'insert' && query.entity === 'midnight.Transactions');
+
+            expect(result).toEqual(expect.objectContaining({
+                blockHeight: 6,
+                blockHash: '0xfallback',
+                transactionCount: 1,
+                contractActionCount: 0,
+                processingTimeMs: 50
+            }));
+            expect(blockInsert?.entry).toEqual(expect.objectContaining({
+                protocolVersion: 0,
+                timestamp: 1_700_000_000,
+                author: null,
+                parent_ID: null
+            }));
+            expect(txInsert?.entry).toEqual(expect.objectContaining({
+                txType: 'unknown',
+                transactionType: 'REGULAR',
+                isShielded: false,
+                protocolVersion: 0,
+                block_ID: 'block-2'
+            }));
+            expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('Failed to get runtime version'));
+        } finally {
+            warnSpy.mockRestore();
+            nowSpy.mockRestore();
+        }
+    });
+});
