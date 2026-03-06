@@ -25,7 +25,7 @@ export interface PalletMapping {
     isSystem?: boolean;
 }
 
-/** Default Substrate pallet index → type mapping. Override via cds.requires.midnight.palletMap */
+/** Default Substrate pallet index → type mapping. Override via cds.requires.nightgate.palletMap */
 const DEFAULT_PALLET_MAP: Record<number, PalletMapping> = {
     0: { name: 'System', txType: 'system', isSystem: true },
     1: { name: 'Timestamp', txType: 'timestamp', isSystem: true },
@@ -34,7 +34,7 @@ const DEFAULT_PALLET_MAP: Record<number, PalletMapping> = {
     4: { name: 'Balances', txType: 'transfer' },
     5: { name: 'Sudo', txType: 'sudo', isSystem: true },
     10: { name: 'Contracts', txType: 'contract_call' },
-    // @TODO Midnight-specific pallets — configure actual indices via cds.requires.midnight.palletMap:
+    // @TODO Midnight-specific pallets — configure actual indices via cds.requires.nightgate.palletMap:
     // { "15": { "name": "Zswap", "txType": "shielded_transfer", "isShielded": true } }
     // { "16": { "name": "ContractPallet", "txType": "contract_deploy" } }
 };
@@ -48,8 +48,8 @@ function buildPalletMap(): Map<number, PalletMapping> {
     }
 
     // Override with config
-    const midnightConfig = (cds.env as any).requires?.midnight || {};
-    const configMap = midnightConfig.palletMap;
+    const nightgateConfig = (cds.env as any).requires?.nightgate || (cds.env as any).requires?.midnight || {};
+    const configMap = nightgateConfig.palletMap;
     if (configMap && typeof configMap === 'object') {
         for (const [idx, entry] of Object.entries(configMap)) {
             map.set(Number(idx), entry as PalletMapping);

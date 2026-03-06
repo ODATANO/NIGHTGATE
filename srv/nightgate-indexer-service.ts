@@ -1,5 +1,5 @@
 /**
- * Midnight Indexer Service Implementation
+ * Nightgate Indexer Service Implementation
  *
  * Exposes sync state, health metrics, and reorg history.
  */
@@ -8,8 +8,9 @@ import cds, { Request } from '@sap/cds';
 const { SELECT, INSERT } = cds.ql;
 
 const processStartTime = Date.now();
+const metricPrefix = 'odatano_nightgate';
 
-export default class MidnightIndexerService extends cds.ApplicationService {
+export default class NightgateIndexerService extends cds.ApplicationService {
     private db!: any;
 
     async init(): Promise<void> {
@@ -21,13 +22,13 @@ export default class MidnightIndexerService extends cds.ApplicationService {
                 SELECT.one.from('midnight.SyncState').where({ ID: 'SINGLETON' })
             );
             if (!existing) {
-                const midnightConfig = (cds.env as any).requires?.midnight || {};
+                const nightgateConfig = (cds.env as any).requires?.nightgate || (cds.env as any).requires?.midnight || {};
                 await this.db.run(INSERT.into('midnight.SyncState').entries({
                     ID: 'SINGLETON',
-                    networkId: midnightConfig.network || 'testnet',
+                    networkId: nightgateConfig.network || 'testnet',
                     lastIndexedHeight: 0,
                     syncStatus: 'stopped',
-                    nodeUrl: midnightConfig.nodeUrl || '',
+                    nodeUrl: nightgateConfig.nodeUrl || '',
                     chainHeight: 0,
                     consecutiveErrors: 0
                 }));
@@ -150,34 +151,34 @@ export default class MidnightIndexerService extends cds.ApplicationService {
             const uptimeSec = Math.floor((Date.now() - processStartTime) / 1000);
             const syncStatus = syncState?.syncStatus || 'stopped';
 
-            lines.push('# HELP odatano_night_chain_height Current chain height');
-            lines.push('# TYPE odatano_night_chain_height gauge');
-            lines.push(`odatano_night_chain_height ${chainHeight}`);
+            lines.push(`# HELP ${metricPrefix}_chain_height Current chain height`);
+            lines.push(`# TYPE ${metricPrefix}_chain_height gauge`);
+            lines.push(`${metricPrefix}_chain_height ${chainHeight}`);
 
-            lines.push('# HELP odatano_night_indexed_height Last indexed block height');
-            lines.push('# TYPE odatano_night_indexed_height gauge');
-            lines.push(`odatano_night_indexed_height ${indexedHeight}`);
+            lines.push(`# HELP ${metricPrefix}_indexed_height Last indexed block height`);
+            lines.push(`# TYPE ${metricPrefix}_indexed_height gauge`);
+            lines.push(`${metricPrefix}_indexed_height ${indexedHeight}`);
 
-            lines.push('# HELP odatano_night_sync_lag Blocks behind chain tip');
-            lines.push('# TYPE odatano_night_sync_lag gauge');
-            lines.push(`odatano_night_sync_lag ${lag}`);
+            lines.push(`# HELP ${metricPrefix}_sync_lag Blocks behind chain tip`);
+            lines.push(`# TYPE ${metricPrefix}_sync_lag gauge`);
+            lines.push(`${metricPrefix}_sync_lag ${lag}`);
 
-            lines.push('# HELP odatano_night_blocks_per_second Indexing throughput');
-            lines.push('# TYPE odatano_night_blocks_per_second gauge');
-            lines.push(`odatano_night_blocks_per_second ${bps}`);
+            lines.push(`# HELP ${metricPrefix}_blocks_per_second Indexing throughput`);
+            lines.push(`# TYPE ${metricPrefix}_blocks_per_second gauge`);
+            lines.push(`${metricPrefix}_blocks_per_second ${bps}`);
 
-            lines.push('# HELP odatano_night_consecutive_errors Consecutive indexing errors');
-            lines.push('# TYPE odatano_night_consecutive_errors gauge');
-            lines.push(`odatano_night_consecutive_errors ${errors}`);
+            lines.push(`# HELP ${metricPrefix}_consecutive_errors Consecutive indexing errors`);
+            lines.push(`# TYPE ${metricPrefix}_consecutive_errors gauge`);
+            lines.push(`${metricPrefix}_consecutive_errors ${errors}`);
 
-            lines.push('# HELP odatano_night_uptime_seconds Process uptime in seconds');
-            lines.push('# TYPE odatano_night_uptime_seconds gauge');
-            lines.push(`odatano_night_uptime_seconds ${uptimeSec}`);
+            lines.push(`# HELP ${metricPrefix}_uptime_seconds Process uptime in seconds`);
+            lines.push(`# TYPE ${metricPrefix}_uptime_seconds gauge`);
+            lines.push(`${metricPrefix}_uptime_seconds ${uptimeSec}`);
 
-            lines.push('# HELP odatano_night_sync_status Sync status (0=stopped, 1=syncing, 2=synced, 3=error)');
-            lines.push('# TYPE odatano_night_sync_status gauge');
+            lines.push(`# HELP ${metricPrefix}_sync_status Sync status (0=stopped, 1=syncing, 2=synced, 3=error)`);
+            lines.push(`# TYPE ${metricPrefix}_sync_status gauge`);
             const statusMap: Record<string, number> = { stopped: 0, syncing: 1, synced: 2, error: 3 };
-            lines.push(`odatano_night_sync_status ${statusMap[syncStatus] ?? 0}`);
+            lines.push(`${metricPrefix}_sync_status ${statusMap[syncStatus] ?? 0}`);
 
             return lines.join('\n') + '\n';
         });

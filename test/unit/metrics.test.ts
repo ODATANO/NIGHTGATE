@@ -16,7 +16,7 @@ jest.mock('@sap/cds', () => {
         connect: { to: mockDbConnect },
         env: {
             requires: {
-                midnight: { network: 'testnet', nodeUrl: 'ws://localhost:9944' }
+                nightgate: { network: 'testnet', nodeUrl: 'ws://localhost:9944' }
             }
         },
         ql: {
@@ -49,10 +49,10 @@ jest.mock('@sap/cds', () => {
     return cds;
 });
 
-import MidnightIndexerService from '../../srv/midnight-indexer-service';
+import NightgateIndexerService from '../../srv/nightgate-indexer-service';
 
 describe('Metrics Endpoint', () => {
-    let service: MidnightIndexerService;
+    let service: NightgateIndexerService;
 
     beforeEach(async () => {
         jest.clearAllMocks();
@@ -61,7 +61,7 @@ describe('Metrics Endpoint', () => {
         // Init returns existing SyncState
         mockDbRun.mockResolvedValueOnce({ ID: 'SINGLETON' });
 
-        service = new MidnightIndexerService();
+        service = new NightgateIndexerService();
         await service.init();
     });
 
@@ -80,14 +80,14 @@ describe('Metrics Endpoint', () => {
 
         const result = await handler();
 
-        expect(result).toContain('odatano_night_chain_height 1000');
-        expect(result).toContain('odatano_night_indexed_height 950');
-        expect(result).toContain('odatano_night_sync_lag 50');
-        expect(result).toContain('odatano_night_blocks_per_second 2.5');
-        expect(result).toContain('odatano_night_consecutive_errors 0');
-        expect(result).toContain('odatano_night_sync_status 1'); // syncing = 1
-        expect(result).toContain('# TYPE odatano_night_chain_height gauge');
-        expect(result).toContain('odatano_night_uptime_seconds');
+        expect(result).toContain('odatano_nightgate_chain_height 1000');
+        expect(result).toContain('odatano_nightgate_indexed_height 950');
+        expect(result).toContain('odatano_nightgate_sync_lag 50');
+        expect(result).toContain('odatano_nightgate_blocks_per_second 2.5');
+        expect(result).toContain('odatano_nightgate_consecutive_errors 0');
+        expect(result).toContain('odatano_nightgate_sync_status 1'); // syncing = 1
+        expect(result).toContain('# TYPE odatano_nightgate_chain_height gauge');
+        expect(result).toContain('odatano_nightgate_uptime_seconds');
     });
 
     it('should return defaults when SyncState is null', async () => {
@@ -97,10 +97,10 @@ describe('Metrics Endpoint', () => {
 
         const result = await handler();
 
-        expect(result).toContain('odatano_night_chain_height 0');
-        expect(result).toContain('odatano_night_indexed_height 0');
-        expect(result).toContain('odatano_night_sync_lag 0');
-        expect(result).toContain('odatano_night_sync_status 0'); // stopped = 0
+        expect(result).toContain('odatano_nightgate_chain_height 0');
+        expect(result).toContain('odatano_nightgate_indexed_height 0');
+        expect(result).toContain('odatano_nightgate_sync_lag 0');
+        expect(result).toContain('odatano_nightgate_sync_status 0'); // stopped = 0
     });
 
     it('should include HELP and TYPE annotations', async () => {
@@ -110,10 +110,10 @@ describe('Metrics Endpoint', () => {
 
         const result = await handler();
 
-        expect(result).toContain('# HELP odatano_night_chain_height');
-        expect(result).toContain('# TYPE odatano_night_chain_height gauge');
-        expect(result).toContain('# HELP odatano_night_uptime_seconds');
-        expect(result).toContain('odatano_night_sync_status 2'); // synced = 2
+        expect(result).toContain('# HELP odatano_nightgate_chain_height');
+        expect(result).toContain('# TYPE odatano_nightgate_chain_height gauge');
+        expect(result).toContain('# HELP odatano_nightgate_uptime_seconds');
+        expect(result).toContain('odatano_nightgate_sync_status 2'); // synced = 2
     });
 
     it('should map error status correctly', async () => {
@@ -123,7 +123,7 @@ describe('Metrics Endpoint', () => {
 
         const result = await handler();
 
-        expect(result).toContain('odatano_night_sync_status 3'); // error = 3
-        expect(result).toContain('odatano_night_consecutive_errors 5');
+        expect(result).toContain('odatano_nightgate_sync_status 3'); // error = 3
+        expect(result).toContain('odatano_nightgate_consecutive_errors 5');
     });
 });

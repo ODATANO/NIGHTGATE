@@ -1,5 +1,5 @@
 /**
- * MidnightAdminService — System Administration
+ * NightgateAdminService — System Administration
  *
  * Provides session management for wallet connections.
  * Entity projections (WalletSessions) are handled by CDS automatically.
@@ -8,7 +8,7 @@
 import cds, { Request } from '@sap/cds';
 const { SELECT, UPDATE } = cds.ql;
 
-export default class MidnightAdminService extends cds.ApplicationService {
+export default class NightgateAdminService extends cds.ApplicationService {
     private db!: any;
 
     async init(): Promise<void> {

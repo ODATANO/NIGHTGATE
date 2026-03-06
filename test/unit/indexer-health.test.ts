@@ -12,7 +12,7 @@ jest.mock('@sap/cds', () => {
         connect: { to: mockDbConnect },
         env: {
             requires: {
-                midnight: { network: 'testnet', nodeUrl: 'ws://localhost:9944' }
+                nightgate: { network: 'testnet', nodeUrl: 'ws://localhost:9944' }
             }
         },
         ql: {
@@ -40,17 +40,17 @@ jest.mock('@sap/cds', () => {
     return cds;
 });
 
-import MidnightIndexerService from '../../srv/midnight-indexer-service';
+import NightgateIndexerService from '../../srv/nightgate-indexer-service';
 
-describe('MidnightIndexerService health', () => {
-    let service: MidnightIndexerService;
+describe('NightgateIndexerService health', () => {
+    let service: NightgateIndexerService;
 
     beforeEach(async () => {
         jest.clearAllMocks();
         Object.keys(registeredHandlers).forEach(k => delete registeredHandlers[k]);
         mockDbRun.mockResolvedValueOnce({ ID: 'SINGLETON' });
 
-        service = new MidnightIndexerService();
+        service = new NightgateIndexerService();
         await service.init();
     });
 

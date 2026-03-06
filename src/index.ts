@@ -2,10 +2,10 @@ import cds from '@sap/cds';
 
 import { startCrawler, stopCrawler } from '../srv/crawler/index';
 
-export type { MidnightConfig, MidnightProviders, CircuitResult } from '../srv/types';
-export { MIDNIGHT_DEFAULTS } from '../srv/types';
+export type { NightgateConfig, NightgateProviders, CircuitResult } from '../srv/types';
+export { NIGHTGATE_DEFAULTS } from '../srv/types';
 
-export interface MidnightIndexerStatus {
+export interface NightgateIndexerStatus {
     initialized: boolean;
     crawlerEnabled: boolean;
     network?: string;
@@ -15,14 +15,14 @@ export interface MidnightIndexerStatus {
 }
 
 let initialized = false;
-let lastStatus: MidnightIndexerStatus = {
+let lastStatus: NightgateIndexerStatus = {
     initialized: false,
     crawlerEnabled: false,
     mode: 'idle'
 };
 
-function getMidnightConfig(): any {
-    return (cds.env as any).requires?.midnight;
+function getNightgateConfig(): any {
+    return (cds.env as any).requires?.nightgate || (cds.env as any).requires?.midnight;
 }
 
 function isPluginConfigured(config: any): boolean {
@@ -30,7 +30,7 @@ function isPluginConfigured(config: any): boolean {
         return false;
     }
 
-    return !(config.kind === 'midnight' && !config.network);
+    return !((config.kind === 'nightgate' || config.kind === 'midnight') && !config.network);
 }
 
 function resolveRuntimeConfig(config: any): {
@@ -46,13 +46,13 @@ function resolveRuntimeConfig(config: any): {
 
     const validNetworks = ['testnet', 'mainnet'];
     if (!validNetworks.includes(network)) {
-        console.error(`[odatano-night-indexer] Invalid network "${network}". Must be one of: ${validNetworks.join(', ')}`);
-        console.error('[odatano-night-indexer] Falling back to "testnet"');
+        console.error(`[odatano-nightgate] Invalid network "${network}". Must be one of: ${validNetworks.join(', ')}`);
+        console.error('[odatano-nightgate] Falling back to "testnet"');
         config.network = 'testnet';
     }
 
     if (nodeUrl && !nodeUrl.match(/^wss?:\/\/.+/)) {
-        console.warn(`[odatano-night-indexer] nodeUrl "${nodeUrl}" does not look like a WebSocket URL (expected ws:// or wss://)`);
+        console.warn(`[odatano-nightgate] nodeUrl "${nodeUrl}" does not look like a WebSocket URL (expected ws:// or wss://)`);
     }
 
     return {
@@ -69,24 +69,24 @@ async function ensureSchemaDeployed(): Promise<void> {
         const { SELECT } = cds.ql;
         await db.run(SELECT.one.from('midnight.Blocks'));
     } catch {
-        console.warn('[odatano-night-indexer] DB schema not deployed — running auto-deploy...');
+        console.warn('[odatano-nightgate] DB schema not deployed — running auto-deploy...');
         try {
             const db = cds.db || await cds.connect.to('db');
             if (db.deploy) {
                 await db.deploy();
             }
-            console.log('[odatano-night-indexer] DB schema deployed');
+            console.log('[odatano-nightgate] DB schema deployed');
         } catch (deployErr) {
             const message = deployErr instanceof Error ? deployErr.message : String(deployErr);
-            console.warn(`[odatano-night-indexer] Auto-deploy failed: ${message}`);
-            console.warn('[odatano-night-indexer] Run: cds deploy --to sqlite');
+            console.warn(`[odatano-nightgate] Auto-deploy failed: ${message}`);
+            console.warn('[odatano-nightgate] Run: cds deploy --to sqlite');
         }
     }
 }
 
-export async function initialize(): Promise<MidnightIndexerStatus> {
-    const midnightConfig = getMidnightConfig();
-    if (!isPluginConfigured(midnightConfig)) {
+export async function initialize(): Promise<NightgateIndexerStatus> {
+    const nightgateConfig = getNightgateConfig();
+    if (!isPluginConfigured(nightgateConfig)) {
         lastStatus = {
             initialized: false,
             crawlerEnabled: false,
@@ -99,15 +99,15 @@ export async function initialize(): Promise<MidnightIndexerStatus> {
         return getStatus();
     }
 
-    const { network, nodeUrl, crawlerConfig, crawlerNodeUrl } = resolveRuntimeConfig(midnightConfig);
+    const { network, nodeUrl, crawlerConfig, crawlerNodeUrl } = resolveRuntimeConfig(nightgateConfig);
     const crawlerEnabled = (crawlerConfig as any).enabled !== false;
 
     await ensureSchemaDeployed();
 
-    console.log(`[odatano-night-indexer] Network: ${network}`);
-    console.log(`[odatano-night-indexer] Node: ${nodeUrl}`);
+    console.log(`[odatano-nightgate] Network: ${network}`);
+    console.log(`[odatano-nightgate] Node: ${nodeUrl}`);
 
-    let mode: MidnightIndexerStatus['mode'] = crawlerEnabled ? 'active' : 'idle';
+    let mode: NightgateIndexerStatus['mode'] = crawlerEnabled ? 'active' : 'idle';
     let lastError: string | undefined;
 
     if (crawlerEnabled) {
@@ -121,8 +121,8 @@ export async function initialize(): Promise<MidnightIndexerStatus> {
         } catch (err) {
             lastError = err instanceof Error ? err.message : String(err);
             mode = 'offline';
-            console.warn(`[odatano-night-indexer] Node not reachable at ${crawlerNodeUrl}: ${lastError}`);
-            console.log('[odatano-night-indexer] Running in offline mode — start a Midnight node: docker compose -f docker/docker-compose.yml up -d');
+            console.warn(`[odatano-nightgate] Node not reachable at ${crawlerNodeUrl}: ${lastError}`);
+            console.log('[odatano-nightgate] Running in offline mode — start a Midnight node: docker compose -f docker/docker-compose.yml up -d');
         }
     }
 
@@ -144,7 +144,7 @@ export async function shutdown(): Promise<void> {
         await stopCrawler();
     } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
-        console.warn(`[odatano-night-indexer] Crawler stop error: ${message}`);
+        console.warn(`[odatano-nightgate] Crawler stop error: ${message}`);
         lastStatus = {
             ...lastStatus,
             lastError: message
@@ -159,6 +159,6 @@ export async function shutdown(): Promise<void> {
     }
 }
 
-export function getStatus(): MidnightIndexerStatus {
+export function getStatus(): NightgateIndexerStatus {
     return { ...lastStatus };
 }

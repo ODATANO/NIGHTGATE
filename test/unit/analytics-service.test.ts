@@ -1,5 +1,5 @@
 /**
- * MidnightAnalyticsService Tests
+ * NightgateAnalyticsService Tests
  *
  * Verify aggregation functions return correct counts and averages.
  */
@@ -32,15 +32,15 @@ jest.mock('@sap/cds', () => {
     return cds;
 });
 
-import MidnightAnalyticsService from '../../srv/analytics-service';
+import NightgateAnalyticsService from '../../srv/analytics-service';
 
-describe('MidnightAnalyticsService', () => {
-    let service: MidnightAnalyticsService;
+describe('NightgateAnalyticsService', () => {
+    let service: NightgateAnalyticsService;
 
     beforeEach(async () => {
         jest.clearAllMocks();
         Object.keys(registeredHandlers).forEach(k => delete registeredHandlers[k]);
-        service = new MidnightAnalyticsService();
+        service = new NightgateAnalyticsService();
         await service.init();
     });
 

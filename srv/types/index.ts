@@ -1,11 +1,11 @@
 /**
- * @odatano/night-indexer — Public TypeScript API
+ * @odatano/nightgate — Public TypeScript API
  */
 
 export type {
-  MidnightConfig,
-  MidnightProviders,
+  NightgateConfig,
+  NightgateProviders,
   CircuitResult
-} from './midnight.js';
+} from './nightgate.js';
 
-export { MIDNIGHT_DEFAULTS } from './midnight.js';
+export { NIGHTGATE_DEFAULTS } from './nightgate.js';

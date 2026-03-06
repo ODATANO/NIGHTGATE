@@ -1,12 +1,12 @@
 using { midnight } from '../db/schema';
 
 /**
- * Midnight Indexer Status & Health Service
+ * Nightgate Indexer Status & Health Service
  *
  * Exposes sync state, health metrics, and reorg history for the indexer.
  */
 @path: '/api/v1/indexer'
-service MidnightIndexerService {
+service NightgateIndexerService {
 
     @readonly
     entity SyncState as projection on midnight.SyncState;

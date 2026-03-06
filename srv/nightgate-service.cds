@@ -1,14 +1,14 @@
 using { midnight } from '../db/schema';
 
 /**
- * Midnight Blockchain OData V4 API Service
+ * Nightgate Blockchain OData V4 API Service
  *
- * This service exposes the Midnight blockchain data as an OData V4 compliant API,
+ * This service exposes Midnight blockchain data as a Nightgate OData V4 API,
  * following enterprise architecture patterns.
  */
-@path: '/api/v1/midnight'
+@path: '/api/v1/nightgate'
 // @requires: 'authenticated-user'  // Uncomment for production
-service MidnightService {
+service NightgateService {
 
     // ========================================================================
     // Blockchain Core - Read-Only Access

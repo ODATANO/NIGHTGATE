@@ -5,7 +5,7 @@ using { midnight } from '../db/schema';
  */
 @path: '/api/v1/analytics'
 // @requires: 'authenticated-user'  // Uncomment for production
-service MidnightAnalyticsService {
+service NightgateAnalyticsService {
 
     /**
      * Block statistics view

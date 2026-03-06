@@ -5,7 +5,7 @@ using { midnight } from '../db/schema';
  */
 @path: '/api/v1/admin'
 // @requires: 'admin'  // Uncomment for production
-service MidnightAdminService {
+service NightgateAdminService {
 
     entity WalletSessions as projection on midnight.WalletSessions excluding {
         encryptedViewingKey     // Encrypted key — never exposed via admin API

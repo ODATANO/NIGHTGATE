@@ -15,18 +15,23 @@ function registerModels(): void {
         requires?: Record<string, any>;
     }).requires ??= {});
 
-    requires.midnight ??= {};
-
-    requires.midnight.model = [
+    const modelPaths = [
         path.join(pluginRoot, 'db'),
         path.join(pluginRoot, 'srv')
     ];
+
+    requires.nightgate ??= {};
+    requires.nightgate.model = modelPaths;
+
+    if (requires.midnight) {
+        requires.midnight.model = modelPaths;
+    }
 }
 
 function registerSecurityHeaders(): void {
     cds.on('bootstrap', (app: any) => {
-        const midnightConfig = (cds.env as any).requires?.midnight || {};
-        const corsOrigin = midnightConfig.corsOrigin || '*';
+        const nightgateConfig = (cds.env as any).requires?.nightgate || (cds.env as any).requires?.midnight || {};
+        const corsOrigin = nightgateConfig.corsOrigin || '*';
 
         app.use((req: any, res: any, next: () => void) => {
             const correlationId = req.headers['x-correlation-id'] || crypto.randomUUID();
@@ -78,11 +83,11 @@ if (!registered) {
 const plugin = {
     cds: {
         schema: {
-            'cds.requires.midnight': {
-                description: 'Midnight Network Configuration for @odatano/night-indexer',
+            'cds.requires.nightgate': {
+                description: 'Nightgate configuration for @odatano/nightgate',
                 properties: {
                     network: {
-                        description: 'Midnight network: testnet | mainnet',
+                        description: 'Target Midnight network: testnet | mainnet',
                         type: 'string',
                         enum: ['testnet', 'mainnet']
                     },

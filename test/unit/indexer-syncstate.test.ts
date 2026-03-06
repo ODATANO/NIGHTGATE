@@ -17,7 +17,7 @@ jest.mock('@sap/cds', () => {
         connect: { to: mockDbConnect },
         env: {
             requires: {
-                midnight: { network: 'testnet', nodeUrl: 'ws://localhost:9944' }
+                nightgate: { network: 'testnet', nodeUrl: 'ws://localhost:9944' }
             }
         },
         ql: {
@@ -50,10 +50,10 @@ jest.mock('@sap/cds', () => {
     return cds;
 });
 
-import MidnightIndexerService from '../../srv/midnight-indexer-service';
+import NightgateIndexerService from '../../srv/nightgate-indexer-service';
 
 describe('IndexerService SyncState', () => {
-    let service: MidnightIndexerService;
+    let service: NightgateIndexerService;
 
     beforeEach(async () => {
         jest.clearAllMocks();
@@ -67,7 +67,7 @@ describe('IndexerService SyncState', () => {
             .mockResolvedValueOnce(null)    // SELECT.one → null
             .mockResolvedValueOnce(undefined); // INSERT → ok
 
-        service = new MidnightIndexerService();
+        service = new NightgateIndexerService();
         await service.init();
 
         // First DB call should be the SELECT check
@@ -82,7 +82,7 @@ describe('IndexerService SyncState', () => {
             lastIndexedHeight: 500
         });
 
-        service = new MidnightIndexerService();
+        service = new NightgateIndexerService();
         await service.init();
 
         // Only 1 DB call (the SELECT), no INSERT
@@ -93,7 +93,7 @@ describe('IndexerService SyncState', () => {
         mockDbRun.mockRejectedValueOnce(new Error('table not found'));
         const warnSpy = jest.spyOn(console, 'warn').mockImplementation();
 
-        service = new MidnightIndexerService();
+        service = new NightgateIndexerService();
         await service.init();
 
         expect(warnSpy).toHaveBeenCalledWith(
@@ -106,7 +106,7 @@ describe('IndexerService SyncState', () => {
         // Init with existing SyncState
         mockDbRun.mockResolvedValueOnce({ ID: 'SINGLETON' });
 
-        service = new MidnightIndexerService();
+        service = new NightgateIndexerService();
         await service.init();
 
         // Now call getSyncStatus handler with null DB result

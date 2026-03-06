@@ -1,6 +1,6 @@
 {
-  "name": "@odatano/night-indexer",
-  "version": "1.0.0-beta.1",
+  "name": "@odatano/nightgate",
+  "version": "0.1.0",
   "description": "CAP Plugin — Midnight Blockchain Indexer with OData V4 API",
   "homepage": "https://github.com/ODATANO/ODATANO-NIGHT/tree/main/packages/indexer",
   "repository": {
@@ -97,8 +97,8 @@
           "database": "db/midnight.db"
         }
       },
-      "midnight": {
-        "kind": "midnight",
+      "nightgate": {
+        "kind": "nightgate",
         "network": "testnet",
         "nodeUrl": "ws://localhost:9944"
       },

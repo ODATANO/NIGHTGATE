@@ -1,13 +1,13 @@
-# @odatano/night-indexer
+# @odatano/nightgate
 
 **CAP Plugin — Midnight Blockchain Indexer with OData V4 API**
 
-[![npm](https://img.shields.io/npm/v/@odatano/night-indexer)](https://www.npmjs.com/package/@odatano/night-indexer)
+[![npm](https://img.shields.io/npm/v/@odatano/nightgate)](https://www.npmjs.com/package/@odatano/nightgate)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 
 ---
 
-## What is @odatano/night-indexer?
+## What is @odatano/nightgate?
 
 A self-contained **Midnight blockchain indexer** packaged as an SAP CAP plugin. It crawls blocks directly from a Midnight Node via Substrate RPC, stores them in local SQLite, and exposes the data as OData V4 endpoints.
 
@@ -15,7 +15,7 @@ A self-contained **Midnight blockchain indexer** packaged as an SAP CAP plugin. 
 Midnight Node (ws://localhost:9944)
     │  Substrate RPC
     ▼
-ODATANO-NIGHT Crawler
+ODATANO-NIGHTGATE Crawler
     │  Block Processing + Reorg Detection
     ▼
 SQLite (local)
@@ -42,17 +42,17 @@ This starts a local Midnight Node in dev mode (`CFG_PRESET=dev`). The node produ
 ### 2. Install & Run
 
 ```bash
-npm install @odatano/night-indexer @cap-js/sqlite
+npm install @odatano/nightgate @cap-js/sqlite
 cds watch
 ```
 
 The crawler connects to the node, catches up on historical blocks, and then follows the chain tip in real-time:
 
 ```
-[cds] - serving MidnightService { at: '/api/v1/midnight' }
-[cds] - serving MidnightIndexerService { at: '/api/v1/indexer' }
-[cds] - serving MidnightAnalyticsService { at: '/api/v1/analytics' }
-[cds] - serving MidnightAdminService { at: '/api/v1/admin' }
+[cds] - serving NightgateService { at: '/api/v1/nightgate' }
+[cds] - serving NightgateIndexerService { at: '/api/v1/indexer' }
+[cds] - serving NightgateAnalyticsService { at: '/api/v1/analytics' }
+[cds] - serving NightgateAdminService { at: '/api/v1/admin' }
 
 [MidnightNode] Connected to ws://localhost:9944
 [Crawler] Catch-up: 0 → 142 (143 blocks, finalized)
@@ -64,10 +64,10 @@ The crawler connects to the node, catches up on historical blocks, and then foll
 
 ```bash
 # Latest blocks
-curl http://localhost:4004/api/v1/midnight/Blocks?\$top=5\&\$orderby=height%20desc
+curl http://localhost:4004/api/v1/nightgate/Blocks?\$top=5\&\$orderby=height%20desc
 
 # Block with transactions expanded
-curl http://localhost:4004/api/v1/midnight/Blocks?\$expand=transactions
+curl http://localhost:4004/api/v1/nightgate/Blocks?\$expand=transactions
 
 # Indexer health
 curl http://localhost:4004/api/v1/indexer/getHealth()
@@ -77,11 +77,11 @@ curl http://localhost:4004/api/v1/indexer/getHealth()
 
 ## Consumer Integration (CAP Plugin)
 
-Install `@odatano/night-indexer` into any existing CAP app:
+Install `@odatano/nightgate` into any existing CAP app:
 
 ```bash
 cd my-cap-app
-npm install @odatano/night-indexer @cap-js/sqlite
+npm install @odatano/nightgate @cap-js/sqlite
 ```
 
 Add to `package.json`:
@@ -91,8 +91,8 @@ Add to `package.json`:
   "cds": {
     "requires": {
       "db": { "kind": "sqlite" },
-      "midnight": {
-        "kind": "midnight",
+      "nightgate": {
+        "kind": "nightgate",
         "network": "testnet",
         "nodeUrl": "ws://localhost:9944"
       }
@@ -101,7 +101,7 @@ Add to `package.json`:
 }
 ```
 
-Run `cds watch` — all indexer services auto-register. The crawler starts indexing from the configured node.
+Run `cds watch` — all Nightgate services auto-register. The crawler starts indexing from the configured node.
 
 ### Local Development (This Repository)
 
@@ -146,16 +146,16 @@ Useful scripts:
 
 | Service | Path | Description |
 |---|---|---|
-| **MidnightService** | `/api/v1/midnight` | Blockchain data — Blocks, Transactions, UTXOs, Contracts, Balances, Governance |
-| **MidnightIndexerService** | `/api/v1/indexer` | Sync status, health, Prometheus metrics, K8s probes, reorg history |
-| **MidnightAnalyticsService** | `/api/v1/analytics` | Aggregated blockchain statistics |
-| **MidnightAdminService** | `/api/v1/admin` | Wallet session management |
+| **NightgateService** | `/api/v1/nightgate` | Blockchain data — Blocks, Transactions, UTXOs, Contracts, Balances, Governance |
+| **NightgateIndexerService** | `/api/v1/indexer` | Sync status, health, Prometheus metrics, K8s probes, reorg history |
+| **NightgateAnalyticsService** | `/api/v1/analytics` | Aggregated blockchain statistics |
+| **NightgateAdminService** | `/api/v1/admin` | Wallet session management |
 
 ---
 
 ## Architecture: Crawler-First Indexing
 
-@odatano/night-indexer **is** the indexer. It connects directly to a Midnight Node via Substrate JSON-RPC 2.0 over WebSocket.
+@odatano/nightgate **is** the indexer. It connects directly to a Midnight Node via Substrate JSON-RPC 2.0 over WebSocket.
 
 ### Data Flow
 
@@ -193,7 +193,7 @@ Useful scripts:
            ▼
 ┌──────────────────────────┐
 │  OData V4                │  4 CDS services
-│  /api/v1/midnight        │
+│  /api/v1/nightgate       │
 │  /api/v1/indexer         │
 │  /api/v1/analytics       │
 │  /api/v1/admin           │
@@ -210,8 +210,8 @@ Useful scripts:
 {
   "cds": {
     "requires": {
-      "midnight": {
-        "kind": "midnight",
+      "nightgate": {
+        "kind": "nightgate",
         "network": "testnet"
       }
     }
@@ -225,8 +225,8 @@ Useful scripts:
 {
   "cds": {
     "requires": {
-      "midnight": {
-        "kind": "midnight",
+      "nightgate": {
+        "kind": "nightgate",
         "network": "testnet",
         "nodeUrl": "ws://localhost:9944",
         "crawler": {
@@ -242,9 +242,10 @@ Useful scripts:
 
 ### Environment Variables
 
+Node connectivity is configured via `cds.requires.nightgate.nodeUrl`.
+
 | Variable | Description | Default |
 |---|---|---|
-| `MIDNIGHT_NODE_URL` | Override Midnight node WebSocket URL | `ws://localhost:9944` |
 | `ENCRYPTION_KEY` | AES-256 key for viewing key encryption at rest | Process-scoped fallback |
 
 ---
@@ -280,13 +281,13 @@ curl http://localhost:4004/api/v1/indexer/getMetrics()
 
 Returns:
 ```
-odatano_night_chain_height 12345
-odatano_night_indexed_height 12340
-odatano_night_sync_lag 5
-odatano_night_blocks_per_second 2.50
-odatano_night_consecutive_errors 0
-odatano_night_uptime_seconds 86400
-odatano_night_sync_status 2
+odatano_nightgate_chain_height 12345
+odatano_nightgate_indexed_height 12340
+odatano_nightgate_sync_lag 5
+odatano_nightgate_blocks_per_second 2.50
+odatano_nightgate_consecutive_errors 0
+odatano_nightgate_uptime_seconds 86400
+odatano_nightgate_sync_status 2
 ```
 
 ### K8s Health Probes
@@ -332,8 +333,8 @@ npm run test:unit         # Unit tests only
 ├── db/
 │   └── schema.cds                # 18 blockchain entities + indexer state
 ├── srv/
-│   ├── midnight-service.*        # Blockchain OData V4 API definition + handlers
-│   ├── midnight-indexer-service.* # Sync status, health, Prometheus metrics
+│   ├── nightgate-service.*       # Blockchain OData V4 API definition + handlers
+│   ├── nightgate-indexer-service.* # Sync status, health, Prometheus metrics
 │   ├── analytics-service.*       # Aggregated statistics
 │   ├── admin-service.*           # Session management
 │   ├── crawler/
@@ -344,7 +345,7 @@ npm run test:unit         # Unit tests only
 │   ├── sessions/
 │   │   └── wallet-sessions.ts    # Wallet session handlers + cleanup
 │   ├── types/
-│   │   ├── midnight.ts           # Public configuration types
+│   │   ├── nightgate.ts          # Public configuration types
 │   │   └── index.ts              # Public type entry point
 │   ├── utils/
 │   │   ├── scale.ts              # SCALE codec for Substrate extrinsics

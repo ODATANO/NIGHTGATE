@@ -1,8 +1,8 @@
 /**
- * Midnight SDK type definitions and re-exports.
+ * Nightgate SDK type definitions and re-exports.
  */
 
-export interface MidnightConfig {
+export interface NightgateConfig {
   network: 'testnet' | 'mainnet';
   contractAddress?: string;
   nodeUrl?: string;
@@ -14,7 +14,7 @@ export interface MidnightConfig {
   };
 }
 
-export const MIDNIGHT_DEFAULTS = {
+export const NIGHTGATE_DEFAULTS = {
   testnet: {
     nodeUrl: 'ws://localhost:9944'
   },
@@ -24,7 +24,7 @@ export const MIDNIGHT_DEFAULTS = {
 } as const;
 
 /**
- * Midnight SDK Providers.
+ * Nightgate SDK Providers.
  *
  * The full SDK interface (from @midnight-ntwrk/midnight-js-types) requires:
  *   privateStateProvider, publicDataProvider, zkConfigProvider,
@@ -33,7 +33,7 @@ export const MIDNIGHT_DEFAULTS = {
  * We keep this as a loose record type so the plugin works even when
  * SDK packages aren't fully resolved (offline/dev mode).
  */
-export interface MidnightProviders {
+export interface NightgateProviders {
   proofProvider: unknown;
   publicDataProvider: unknown;
   privateStateProvider: unknown;

@@ -1,7 +1,7 @@
 /**
  * Wallet Session Management — connect, disconnect, cleanup
  *
- * Extracted from MidnightService to separate session concerns
+ * Extracted from NightgateService to separate session concerns
  * from OData read handlers.
  */
 
@@ -36,8 +36,8 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
         const encryptedVk = encrypt(viewingKey, encKey);
         const sessionToken = cds.utils.uuid();
 
-        const midnightConfig = (cds.env as any).requires?.midnight || {};
-        const sessionTtlMs = midnightConfig.sessionTtlMs || 24 * 60 * 60 * 1000;
+        const nightgateConfig = (cds.env as any).requires?.nightgate || (cds.env as any).requires?.midnight || {};
+        const sessionTtlMs = nightgateConfig.sessionTtlMs || 24 * 60 * 60 * 1000;
         const expiresAt = new Date(Date.now() + sessionTtlMs).toISOString();
 
         const session = {

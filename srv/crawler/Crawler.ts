@@ -500,10 +500,10 @@ export class MidnightCrawler {
 
         if (!existing) {
             try {
-                const midnightConfig = (cds.env as any).requires?.midnight || {};
+                const nightgateConfig = (cds.env as any).requires?.nightgate || (cds.env as any).requires?.midnight || {};
                 await this.db.run(INSERT.into('midnight.SyncState').entries({
                     ID: 'SINGLETON',
-                    networkId: midnightConfig.network || 'testnet',
+                    networkId: nightgateConfig.network || 'testnet',
                     lastIndexedHeight: 0,
                     syncStatus: 'stopped',
                     nodeUrl: this.config.nodeUrl,

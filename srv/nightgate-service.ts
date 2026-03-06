@@ -1,17 +1,17 @@
 /**
- * Midnight Service Implementation — OData V4 API
+ * Nightgate Service Implementation — OData V4 API
  *
  * Thin service layer: all data comes from local SQLite (populated by Crawler).
  * OData queries run against the local DB. Wallet sessions are handled separately.
  *
- * Data flow: Midnight Node -> Crawler -> SQLite -> OData V4
+ * Data flow: Midnight Node -> Crawler -> SQLite -> Nightgate OData V4
  */
 
 import cds, { Request } from '@sap/cds';
 
 import { registerWalletSessionHandlers, startSessionCleanup } from './sessions/wallet-sessions';
 
-export default class MidnightService extends cds.ApplicationService {
+export default class NightgateService extends cds.ApplicationService {
     private db!: any;
     private _cleanupTimer?: ReturnType<typeof setInterval>;
 

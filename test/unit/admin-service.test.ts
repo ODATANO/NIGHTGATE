@@ -1,5 +1,5 @@
 /**
- * MidnightAdminService Tests
+ * NightgateAdminService Tests
  *
  * Verify session invalidation actions work correctly.
  */
@@ -41,7 +41,7 @@ jest.mock('@sap/cds', () => {
     return cds;
 });
 
-import MidnightAdminService from '../../srv/admin-service';
+import NightgateAdminService from '../../srv/admin-service';
 
 function createMockRequest(data: Record<string, unknown>) {
     return {
@@ -52,13 +52,13 @@ function createMockRequest(data: Record<string, unknown>) {
     };
 }
 
-describe('MidnightAdminService', () => {
-    let service: MidnightAdminService;
+describe('NightgateAdminService', () => {
+    let service: NightgateAdminService;
 
     beforeEach(async () => {
         jest.clearAllMocks();
         Object.keys(registeredHandlers).forEach(k => delete registeredHandlers[k]);
-        service = new MidnightAdminService();
+        service = new NightgateAdminService();
         await service.init();
     });
 
