@@ -4,8 +4,8 @@
 
 [![npm](https://img.shields.io/npm/v/@odatano/nightgate)](https://www.npmjs.com/package/@odatano/nightgate)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
-[![Tests](https://img.shields.io/github/actions/workflow/status/ODATANO/ODATANO-NIGHT/test.yaml?label=tests)](https://github.com/ODATANO/ODATANO-NIGHT/actions)
-[![Coverage](https://img.shields.io/codecov/c/github/ODATANO/ODATANO-NIGHT)](https://codecov.io/gh/ODATANO/ODATANO-NIGHT)
+[![Tests](https://img.shields.io/github/actions/workflow/status/ODATANO/NIGHTGATE/test.yaml?label=tests)](https://github.com/ODATANO/NIGHTGATE/actions)
+[![Coverage](https://img.shields.io/codecov/c/github/ODATANO/NIGHTGATE)](https://codecov.io/gh/ODATANO/NIGHTGATE)
 
 
 `@odatano/nightgate` is a self-contained Midnight blockchain indexer packaged as an SAP CAP plugin. It connects directly to a Midnight node over Substrate JSON-RPC WebSocket, normalizes chain data into CAP entities, and exposes it through OData V4 services.
