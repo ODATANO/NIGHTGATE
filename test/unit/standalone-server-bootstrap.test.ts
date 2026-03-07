@@ -15,7 +15,7 @@ describe('standalone server bootstrap', () => {
     });
 
     it('loads the Nightgate plugin bootstrap through srv/server.ts', async () => {
-        await import('../../srv/server');
+        await import('../../srv/server.js');
 
         expect(pluginLoadSpy).toHaveBeenCalledTimes(1);
     });
