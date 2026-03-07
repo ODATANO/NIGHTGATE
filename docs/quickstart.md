@@ -57,6 +57,7 @@ Expected service paths:
 Typical startup output:
 
 ```text
+[cds] - bootstrapping from { file: 'srv/server.ts' }
 [cds] - serving NightgateService { at: '/api/v1/nightgate' }
 [cds] - serving NightgateIndexerService { at: '/api/v1/indexer' }
 [cds] - serving NightgateAnalyticsService { at: '/api/v1/analytics' }
@@ -64,9 +65,19 @@ Typical startup output:
 
 [odatano-nightgate] Network: testnet
 [odatano-nightgate] Node: ws://localhost:9944
+[odatano-nightgate] Initializing crawler and starting catch-up...
 [MidnightNode] Connected to ws://localhost:9944
+[odatano-nightgate] Startup state: syncing (crawler started)
 [Crawler] Live subscription active
 ```
+
+In standalone repo mode, CAP bootstraps through `srv/server.ts`, which imports the same Nightgate plugin hooks that `cds-plugin.js` provides in consumer apps.
+
+Nightgate emits one explicit startup-state line:
+
+- `syncing` when the crawler starts normally
+- `stopped` when the plugin is unconfigured or the crawler is disabled
+- `offline` when startup falls back after a node or runtime error
 
 ### 5. Make the first API calls
 

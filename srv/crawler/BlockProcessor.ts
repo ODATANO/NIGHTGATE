@@ -11,6 +11,7 @@ const { SELECT, INSERT, UPDATE } = cds.ql;
 import { blake2b } from '@noble/hashes/blake2b';
 import { bytesToHex } from '@noble/hashes/utils';
 import { MidnightNodeProvider, SignedBlock, BlockHeader } from '../providers/MidnightNodeProvider';
+import { ensureNightgateModelLoaded } from '../utils/cds-model';
 import { parseExtrinsicCallIndices } from '../utils/scale';
 
 /**
@@ -94,6 +95,7 @@ export class BlockProcessor {
     }
 
     async init(): Promise<void> {
+        await ensureNightgateModelLoaded();
         this.db = await cds.connect.to('db');
     }
 

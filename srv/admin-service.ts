@@ -8,10 +8,13 @@
 import cds, { Request } from '@sap/cds';
 const { SELECT, UPDATE } = cds.ql;
 
+import { ensureNightgateModelLoaded } from './utils/cds-model';
+
 export default class NightgateAdminService extends cds.ApplicationService {
     private db!: any;
 
     async init(): Promise<void> {
+        await ensureNightgateModelLoaded();
         this.db = await cds.connect.to('db');
 
         this.on('invalidateSession', async (req: Request) => {

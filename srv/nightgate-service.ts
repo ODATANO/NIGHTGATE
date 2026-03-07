@@ -10,12 +10,14 @@
 import cds, { Request } from '@sap/cds';
 
 import { registerWalletSessionHandlers, startSessionCleanup } from './sessions/wallet-sessions';
+import { ensureNightgateModelLoaded } from './utils/cds-model';
 
 export default class NightgateService extends cds.ApplicationService {
     private db!: any;
     private _cleanupTimer?: ReturnType<typeof setInterval>;
 
     async init(): Promise<void> {
+        await ensureNightgateModelLoaded();
         this.db = await cds.connect.to('db');
 
         // ====================================================================

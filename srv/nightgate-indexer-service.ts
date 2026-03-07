@@ -7,6 +7,8 @@
 import cds, { Request } from '@sap/cds';
 const { SELECT, INSERT } = cds.ql;
 
+import { ensureNightgateModelLoaded } from './utils/cds-model';
+
 const processStartTime = Date.now();
 const metricPrefix = 'odatano_nightgate';
 
@@ -14,6 +16,7 @@ export default class NightgateIndexerService extends cds.ApplicationService {
     private db!: any;
 
     async init(): Promise<void> {
+        await ensureNightgateModelLoaded();
         this.db = await cds.connect.to('db');
 
         // Ensure SyncState row exists (even before crawler starts)

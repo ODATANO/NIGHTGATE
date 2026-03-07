@@ -1,6 +1,7 @@
 import cds from '@sap/cds';
 
 import { startCrawler, stopCrawler } from '../srv/crawler/index';
+import { ensureNightgateModelLoaded } from '../srv/utils/cds-model';
 
 export type { NightgateConfig, NightgateProviders, CircuitResult } from '../srv/types';
 export { NIGHTGATE_DEFAULTS } from '../srv/types';
@@ -63,6 +64,15 @@ function resolveRuntimeConfig(config: any): {
     };
 }
 
+function isLikelyNodeConnectionError(message: string): boolean {
+    return /ECONNREFUSED|ECONNRESET|ENOTFOUND|ETIMEDOUT|socket hang up|WebSocket|Not connected to Midnight Node/i.test(message);
+}
+
+function logStartupState(state: 'stopped' | 'syncing' | 'offline', detail?: string): void {
+    const suffix = detail ? ` (${detail})` : '';
+    console.log(`[odatano-nightgate] Startup state: ${state}${suffix}`);
+}
+
 async function ensureSchemaDeployed(): Promise<void> {
     try {
         const db = await cds.connect.to('db');
@@ -85,6 +95,8 @@ async function ensureSchemaDeployed(): Promise<void> {
 }
 
 export async function initialize(): Promise<NightgateIndexerStatus> {
+    await ensureNightgateModelLoaded();
+
     const nightgateConfig = getNightgateConfig();
     if (!isPluginConfigured(nightgateConfig)) {
         lastStatus = {
@@ -92,6 +104,7 @@ export async function initialize(): Promise<NightgateIndexerStatus> {
             crawlerEnabled: false,
             mode: 'idle'
         };
+        logStartupState('stopped', 'plugin not configured');
         return getStatus();
     }
 
@@ -112,18 +125,29 @@ export async function initialize(): Promise<NightgateIndexerStatus> {
 
     if (crawlerEnabled) {
         try {
+            console.log('[odatano-nightgate] Initializing crawler and starting catch-up...');
             await startCrawler({
                 ...(crawlerConfig as Record<string, unknown>),
                 enabled: true,
                 nodeUrl: crawlerNodeUrl,
                 requestTimeout: (crawlerConfig as any).requestTimeout || 30000
             });
+            logStartupState('syncing', 'crawler started');
         } catch (err) {
             lastError = err instanceof Error ? err.message : String(err);
             mode = 'offline';
-            console.warn(`[odatano-nightgate] Node not reachable at ${crawlerNodeUrl}: ${lastError}`);
-            console.log('[odatano-nightgate] Running in offline mode — start a Midnight node: docker compose -f docker/docker-compose.yml up -d');
+            if (isLikelyNodeConnectionError(lastError)) {
+                console.warn(`[odatano-nightgate] Node not reachable at ${crawlerNodeUrl}: ${lastError}`);
+                logStartupState('offline', 'node unreachable');
+                console.log('[odatano-nightgate] Running in offline mode — start a Midnight node: docker compose -f docker/docker-compose.yml up -d');
+            } else {
+                console.warn(`[odatano-nightgate] Crawler startup failed: ${lastError}`);
+                logStartupState('offline', 'startup error');
+                console.log('[odatano-nightgate] Running in offline mode until the startup error is resolved');
+            }
         }
+    } else {
+        logStartupState('stopped', 'crawler disabled');
     }
 
     initialized = true;

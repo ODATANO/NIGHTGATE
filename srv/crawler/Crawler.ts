@@ -17,6 +17,7 @@ import cds from '@sap/cds';
 const { SELECT, INSERT, UPDATE, DELETE } = cds.ql;
 import { MidnightNodeProvider, BlockHeader } from '../providers/MidnightNodeProvider';
 import { BlockProcessor, ProcessResult } from './BlockProcessor';
+import { ensureNightgateModelLoaded } from '../utils/cds-model';
 import { isTransientError, calcBackoff } from '../utils/retry';
 
 // ============================================================================
@@ -80,6 +81,7 @@ export class MidnightCrawler {
 
         this.isRunning = true;
         this.startTime = Date.now();
+        await ensureNightgateModelLoaded();
         this.db = await cds.connect.to('db');
 
         // Ensure SyncState singleton exists
