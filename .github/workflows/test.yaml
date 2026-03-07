@@ -63,3 +63,11 @@ jobs:
           name: coverage-node-${{ matrix.node-version }}
           path: coverage
           if-no-files-found: error
+
+      - name: Upload coverage to Codecov
+        if: matrix.node-version == '22.x'
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          directory: coverage
+          fail_ci_if_error: false

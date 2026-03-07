@@ -37,3 +37,5 @@ coverage/
 *.log
 npm-debug.log*
 @cds-models
+
+CLAUDE.MD

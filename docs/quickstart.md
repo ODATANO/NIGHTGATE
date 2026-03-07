@@ -223,4 +223,5 @@ Wallet viewing keys are encrypted at rest. For production-like setups, set `ENCR
 ## Related Docs
 
 - [README.md](../README.md)
+- [Reference](reference.md) — configuration, runtime behavior, full API surface
 - [CHANGELOG.md](../CHANGELOG.md)

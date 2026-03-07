@@ -39,7 +39,7 @@ First public Nightgate package cut.
 
 ### Verified Baseline At Release Time
 
-- `18` test suites passed
-- `245` tests passed
+- `21` test suites passed
+- `251` tests passed
 - `0` failures
-- coverage: `98.97%` statements, `89.37%` branches, `99.25%` functions, `99.27%` lines
+- coverage: `98.99%` statements, `90.9%` branches, `99.25%` functions, `99.28%` lines

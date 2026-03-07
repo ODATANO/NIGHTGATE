@@ -98,6 +98,8 @@ const plugin = {
                             enabled: { type: 'boolean', description: 'Enable active crawler (default: true)' },
                             nodeUrl: { type: 'string', description: 'Override node URL for crawler (default: uses top-level nodeUrl)' },
                             batchSize: { type: 'number', description: 'Blocks per batch during catch-up (default: 10)' },
+                            maxRetries: { type: 'number', description: 'Max retries per block before error (default: 3)' },
+                            retryDelay: { type: 'number', description: 'Base retry delay in ms (default: 2000)' },
                             requestTimeout: { type: 'number', description: 'RPC request timeout ms (default: 30000)' }
                         }
                     }
