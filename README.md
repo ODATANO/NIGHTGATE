@@ -108,9 +108,9 @@ curl "http://localhost:4004/api/v1/indexer/getMetrics()"
 
 ## Documentation
 
-- [Quickstart Guide](docs/quickstart.md) — step-by-step from zero to first API call
-- [Reference](docs/reference.md) — configuration, runtime behavior, full API surface, project structure
-- [Changelog](CHANGELOG.md)
+- [Quickstart Guide](docs/quickstart.md): step-by-step from zero to first API call
+- [Reference](docs/reference.md): configuration, runtime behavior, full API surface, project structure
+- [Changelog](CHANGELOG.md): list of notable changes by version
 
 ## Development
 

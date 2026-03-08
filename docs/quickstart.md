@@ -218,7 +218,7 @@ If the DB is empty and the node is healthy, give the crawler a moment to catch u
 
 ### Production encryption key
 
-Wallet viewing keys are encrypted at rest. In production (`NODE_ENV=production`), `ENCRYPTION_KEY` **must** be set — the process will refuse to start without it. In development, a process-scoped fallback is used automatically.
+Wallet viewing keys are encrypted at rest. In production (`NODE_ENV=production`), `ENCRYPTION_KEY` **must** be set: the process will refuse to start without it. In development, a process-scoped fallback is used automatically.
 
 ## Related Docs
 
