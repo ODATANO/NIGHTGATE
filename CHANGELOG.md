@@ -9,12 +9,20 @@
 - MidnightNodeProvider now guards async subscription callback rejections and logs them safely.
 - Security middleware CORS allow-headers now includes `X-Correlation-ID`.
 
+### Service Capability Expansions
+
+- Block ingestion now persists baseline `TransactionResults` and `TransactionFees` for every indexed transaction.
+- Contract-classified transactions now persist `ContractActions` with deterministic address grouping and entry-point hints.
+- Transaction metadata extraction now populates `size`, `hasProof`, `proofHash`, `contractAddress`, and `circuitName` fields.
+- `NightgateIndexerService` now exposes operational actions: `pauseCrawler()`, `resumeCrawler()`, and `reindexFromHeight(height)`.
+- `NightgateService` now exposes query primitives: `Blocks.range(startHeight, endHeight, limit)` and `Transactions.byType(txType, limit)`.
+
 ### Latest Validation Baseline
 
-- `23` test suites passed
-- `257` tests passed
+- `22` test suites passed
+- `267` tests passed
 - `0` failures
-- coverage: `96.16%` statements, `87.79%` branches, `96.5%` functions, `96.57%` lines
+- coverage: `93.09%` statements, `81.77%` branches, `94.3%` functions, `93.62%` lines
 
 ## 0.1.0 - 2026-03-06
 

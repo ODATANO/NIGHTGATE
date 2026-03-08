@@ -61,3 +61,10 @@ export async function stopCrawler(): Promise<void> {
     }
     console.log('[Crawler] Stopped');
 }
+
+/**
+ * True when the crawler lifecycle wrapper currently has an active crawler instance.
+ */
+export function isCrawlerRunning(): boolean {
+    return activeCrawler !== null;
+}

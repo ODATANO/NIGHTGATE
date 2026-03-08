@@ -70,7 +70,7 @@ jest.mock('@sap/cds', () => {
                 registeredBeforeHandlers.push({ events, entities, handler });
             }
 
-            async init() {}
+            async init() { }
         }
     };
     cds.default = cds;
@@ -123,7 +123,9 @@ describe('NightgateService', () => {
         expect(registerWalletSessionHandlers).toHaveBeenCalledWith(service, expect.objectContaining({ run: mockDbRun }));
         expect(startSessionCleanup).toHaveBeenCalledWith(expect.objectContaining({ run: mockDbRun }));
         expect(getHandler('READ', 'Blocks')).toBeDefined();
+        expect(getHandler('range', 'Blocks')).toBeDefined();
         expect(getHandler('READ', 'Transactions')).toBeDefined();
+        expect(getHandler('byType', 'Transactions')).toBeDefined();
         expect(getHandler('READ', 'ContractActions')).toBeDefined();
         expect(getHandler('READ', 'UnshieldedUtxos')).toBeDefined();
         expect(getHandler('READ', 'SystemParameters')).toBeDefined();
@@ -185,6 +187,38 @@ describe('NightgateService', () => {
         expect(builder.where).toHaveBeenCalledWith({ height: 42 });
     });
 
+    it('rejects block range queries without both bounds', async () => {
+        const handler = getHandler('range', 'Blocks');
+        const req = createMockRequest({ startHeight: 1 });
+
+        await handler(req);
+
+        expect(req.reject).toHaveBeenCalledWith(400, 'startHeight and endHeight are required');
+    });
+
+    it('returns blocks within a validated height range', async () => {
+        const handler = getHandler('range', 'Blocks');
+        const req = createMockRequest({ startHeight: 10, endHeight: 20, limit: 50 });
+        mockDbRun.mockResolvedValueOnce([{ ID: 'block-10' }]);
+
+        await expect(handler(req)).resolves.toEqual([{ ID: 'block-10' }]);
+
+        const builder = getLastBuilder();
+        expect(builder.__table).toBe('midnight.Blocks');
+        expect(builder.where).toHaveBeenCalledWith({ height: { '>=': 10, '<=': 20 } });
+        expect(builder.orderBy).toHaveBeenCalledWith('height asc');
+        expect(builder.limit).toHaveBeenCalledWith(50);
+    });
+
+    it('rejects block ranges where endHeight is below startHeight', async () => {
+        const handler = getHandler('range', 'Blocks');
+        const req = createMockRequest({ startHeight: 10, endHeight: 9 });
+
+        await handler(req);
+
+        expect(req.reject).toHaveBeenCalledWith(400, 'endHeight must be greater than or equal to startHeight');
+    });
+
     it('rejects byHash requests without a hash', async () => {
         const handler = getHandler('byHash', 'Transactions');
         const req = createMockRequest();
@@ -204,6 +238,29 @@ describe('NightgateService', () => {
         const builder = getLastBuilder();
         expect(builder.__table).toBe('midnight.Transactions');
         expect(builder.where).toHaveBeenCalledWith({ hash: '0xabc' });
+    });
+
+    it('rejects transaction type queries without txType', async () => {
+        const handler = getHandler('byType', 'Transactions');
+        const req = createMockRequest({});
+
+        await handler(req);
+
+        expect(req.reject).toHaveBeenCalledWith(400, 'txType is required');
+    });
+
+    it('filters transactions by txType with a bounded limit', async () => {
+        const handler = getHandler('byType', 'Transactions');
+        const req = createMockRequest({ txType: 'contract_call', limit: 25 });
+        mockDbRun.mockResolvedValueOnce([{ ID: 'tx-2' }]);
+
+        await expect(handler(req)).resolves.toEqual([{ ID: 'tx-2' }]);
+
+        const builder = getLastBuilder();
+        expect(builder.__table).toBe('midnight.Transactions');
+        expect(builder.where).toHaveBeenCalledWith({ txType: 'contract_call' });
+        expect(builder.orderBy).toHaveBeenCalledWith('createdAt desc');
+        expect(builder.limit).toHaveBeenCalledWith(25);
     });
 
     it('rejects byAddress requests without an address', async () => {

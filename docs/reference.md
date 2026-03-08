@@ -166,7 +166,9 @@ Actions and functions:
 
 - `Blocks.latest()`
 - `Blocks.byHeight(height)`
+- `Blocks.range(startHeight, endHeight, limit)`
 - `Transactions.byHash(hash)`
+- `Transactions.byType(txType, limit)`
 - `ContractActions.byAddress(address)`
 - `ContractActions.history(address)`
 - `UnshieldedUtxos.byOwner(owner)`
@@ -190,6 +192,9 @@ Functions:
 - `getLiveness()`
 - `getReadiness()`
 - `getMetrics()`
+- `pauseCrawler()`
+- `resumeCrawler()`
+- `reindexFromHeight(height)`
 
 Prometheus metric names use the `odatano_nightgate_` prefix.
 
@@ -222,8 +227,8 @@ The admin projection excludes `encryptedViewingKey` from the OData response surf
 | Catch-up and live sync | Ready | Replays finalized blocks, subscribes to new heads, retries transient failures | Single active crawler instance per process |
 | Reorg recovery | Ready | Detects chain divergence, finds fork points, rolls back indexed data, records `ReorgLog` | Designed for operational correctness, not deep historical reconciliation jobs |
 | Local persistence | Ready | Persists blocks, transactions, sync state, reorg state, and related read-side entities via CAP DB APIs | SQLite-first default; host app controls broader DB strategy |
-| Core OData reads | Ready | Blocks, transactions, UTXO reads, balance lookups, governance/system-parameter reads, wallet-session actions | Data quality depends on what the current crawler/parser version extracts into the local DB |
-| Indexer operations API | Ready | `getSyncStatus`, `getHealth`, `getReorgHistory`, `getLiveness`, `getReadiness`, `getMetrics` | Focused on one running indexer instance |
+| Core OData reads | Ready | Blocks, transactions, UTXO reads, balance lookups, governance/system-parameter reads, wallet-session actions, plus range/type query helpers (`Blocks.range`, `Transactions.byType`) | Data quality depends on what the current crawler/parser version extracts into the local DB |
+| Indexer operations API | Ready | `getSyncStatus`, `getHealth`, `getReorgHistory`, `getLiveness`, `getReadiness`, `getMetrics`, `pauseCrawler`, `resumeCrawler`, `reindexFromHeight` | Focused on one running indexer instance |
 | Wallet sessions | Ready | Connect/disconnect flows, encrypted viewing-key storage, TTL expiry, cleanup job, admin invalidation | Sessions track `sessionId` only; token-based validation is not yet implemented |
 | Analytics | Ready | Block count, transaction count, contract count, average transactions per block, CDS aggregate projections | Analytics are read-side aggregates over indexed local data |
 | Midnight domain surface | Partial | Schema and service surface already include contracts, balances, DUST, governance, registrations, token types | Some entity families are ahead of full extractor/populator depth and will mature incrementally |
@@ -249,10 +254,10 @@ The admin projection excludes `encryptedViewingKey` from the OData response surf
 
 Verified repository baseline from the latest full run:
 
-- `23` test suites passed
-- `257` tests passed
+- `22` test suites passed
+- `267` tests passed
 - `0` failures
-- coverage: `96.16%` statements, `87.79%` branches, `96.5%` functions, `96.57%` lines
+- coverage: `93.09%` statements, `81.77%` branches, `94.3%` functions, `93.62%` lines
 
 Run the same checks locally:
 

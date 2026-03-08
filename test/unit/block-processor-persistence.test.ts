@@ -166,13 +166,11 @@ describe('BlockProcessor persistence paths', () => {
             tx: jest.fn(async (callback: (transaction: any) => Promise<void>) => callback(tx))
         };
 
-        uuidSpy
-            .mockReturnValueOnce('block-1')
-            .mockReturnValueOnce('tx-1')
-            .mockReturnValueOnce('tx-2')
-            .mockReturnValueOnce('tx-3')
-            .mockReturnValueOnce('tx-4')
-            .mockReturnValueOnce('tx-5');
+        let uuidIndex = 0;
+        uuidSpy.mockImplementation(() => {
+            uuidIndex += 1;
+            return uuidIndex === 1 ? 'block-1' : `uuid-${uuidIndex}`;
+        });
 
         const processor = new BlockProcessor(provider as any);
         (processor as any).db = db;
@@ -181,6 +179,9 @@ describe('BlockProcessor persistence paths', () => {
         const txQueries = tx.run.mock.calls.map(([query]) => query);
         const blockInsert = txQueries.find((query) => query?.kind === 'insert' && query.entity === 'midnight.Blocks');
         const txInserts = txQueries.filter((query) => query?.kind === 'insert' && query.entity === 'midnight.Transactions');
+        const txResultInserts = txQueries.filter((query) => query?.kind === 'insert' && query.entity === 'midnight.TransactionResults');
+        const txFeeInserts = txQueries.filter((query) => query?.kind === 'insert' && query.entity === 'midnight.TransactionFees');
+        const contractActionInserts = txQueries.filter((query) => query?.kind === 'insert' && query.entity === 'midnight.ContractActions');
         const syncUpdate = txQueries.find((query) => query?.kind === 'update' && query.entity === 'midnight.SyncState');
 
         expect(result).toEqual(expect.objectContaining({
@@ -206,6 +207,9 @@ describe('BlockProcessor persistence paths', () => {
             parent_ID: 'parent-1'
         }));
         expect(txInserts).toHaveLength(5);
+        expect(txResultInserts).toHaveLength(5);
+        expect(txFeeInserts).toHaveLength(5);
+        expect(contractActionInserts).toHaveLength(3);
         expect(txInserts.map((query) => query.entry.txType)).toEqual([
             'system',
             'contract_call',
@@ -221,8 +225,20 @@ describe('BlockProcessor persistence paths', () => {
             'REGULAR'
         ]);
         expect(txInserts[4].entry.isShielded).toBe(true);
+        expect(txInserts.map((query) => query.entry.size)).toEqual([4, 4, 4, 4, 4]);
+        expect(txInserts.map((query) => query.entry.hasProof)).toEqual([false, false, false, false, true]);
+        expect(txInserts.map((query) => query.entry.circuitName)).toEqual(['0:0', '10:0', '10:1', '10:2', '15:0']);
+        expect(txInserts.slice(1, 4).every((query) => /^0x[0-9a-f]{56}$/.test(query.entry.contractAddress))).toBe(true);
+        expect(txInserts[0].entry.contractAddress).toBeNull();
+        expect(txInserts[4].entry.contractAddress).toBeNull();
         expect(txInserts.every((query) => query.entry.block_ID === 'block-1')).toBe(true);
         expect(txInserts.every((query) => /^0x[0-9a-f]{64}$/.test(query.entry.hash))).toBe(true);
+        expect(txResultInserts.every((query) => query.entry.status === 'SUCCESS')).toBe(true);
+        expect(txResultInserts.every((query) => /^uuid-\d+$/.test(query.entry.transaction_ID))).toBe(true);
+        expect(txFeeInserts.every((query) => query.entry.paidFees === '0' && query.entry.estimatedFees === '0')).toBe(true);
+        expect(contractActionInserts.map((query) => query.entry.actionType)).toEqual(['CALL', 'DEPLOY', 'UPDATE']);
+        expect(contractActionInserts.map((query) => query.entry.entryPoint)).toEqual(['10:0', '10:1', '10:2']);
+        expect(contractActionInserts.every((query) => /^0x[0-9a-f]{56}$/.test(query.entry.address))).toBe(true);
         expect(syncUpdate).toEqual(expect.objectContaining({
             kind: 'update',
             entity: 'midnight.SyncState',
@@ -262,7 +278,9 @@ describe('BlockProcessor persistence paths', () => {
 
         uuidSpy
             .mockReturnValueOnce('block-2')
-            .mockReturnValueOnce('tx-6');
+            .mockReturnValueOnce('tx-6')
+            .mockReturnValueOnce('txr-6')
+            .mockReturnValueOnce('txf-6');
 
         const processor = new BlockProcessor(provider as any);
         (processor as any).db = db;
@@ -296,6 +314,8 @@ describe('BlockProcessor persistence paths', () => {
                 txType: 'unknown',
                 transactionType: 'REGULAR',
                 isShielded: false,
+                hasProof: false,
+                size: 60,
                 protocolVersion: 0,
                 block_ID: 'block-2'
             }));

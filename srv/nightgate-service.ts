@@ -42,6 +42,34 @@ export default class NightgateService extends cds.ApplicationService {
             );
         });
 
+        this.on('range', 'Blocks', async (req: Request) => {
+            const { startHeight, endHeight, limit } = req.data as {
+                startHeight?: number;
+                endHeight?: number;
+                limit?: number;
+            };
+
+            if (startHeight == null || endHeight == null) {
+                return req.reject(400, 'startHeight and endHeight are required');
+            }
+
+            if (!Number.isInteger(startHeight) || !Number.isInteger(endHeight) || startHeight < 0 || endHeight < 0) {
+                return req.reject(400, 'startHeight and endHeight must be non-negative integers');
+            }
+
+            if (endHeight < startHeight) {
+                return req.reject(400, 'endHeight must be greater than or equal to startHeight');
+            }
+
+            const effectiveLimit = Math.min(Math.max(limit || 100, 1), 5000);
+            return this.db.run(
+                cds.ql.SELECT.from('midnight.Blocks')
+                    .where({ height: { '>=': startHeight, '<=': endHeight } })
+                    .orderBy('height asc')
+                    .limit(effectiveLimit)
+            );
+        });
+
         // ====================================================================
         // Transaction Handlers
         // ====================================================================
@@ -54,6 +82,19 @@ export default class NightgateService extends cds.ApplicationService {
             const { hash } = req.data as { hash: string };
             if (!hash) return req.reject(400, 'hash is required');
             return this.db.run(cds.ql.SELECT.from('midnight.Transactions').where({ hash }));
+        });
+
+        this.on('byType', 'Transactions', async (req: Request) => {
+            const { txType, limit } = req.data as { txType?: string; limit?: number };
+            if (!txType) return req.reject(400, 'txType is required');
+
+            const effectiveLimit = Math.min(Math.max(limit || 100, 1), 2000);
+            return this.db.run(
+                cds.ql.SELECT.from('midnight.Transactions')
+                    .where({ txType })
+                    .orderBy('createdAt desc')
+                    .limit(effectiveLimit)
+            );
         });
 
         // ====================================================================

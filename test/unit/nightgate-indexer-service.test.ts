@@ -1,6 +1,9 @@
 const mockDbRun = jest.fn();
 const mockDbConnect = jest.fn().mockResolvedValue({ run: mockDbRun });
 const registeredHandlers = new Map<string, Function>();
+const mockStartCrawler = jest.fn();
+const mockStopCrawler = jest.fn();
+const mockIsCrawlerRunning = jest.fn();
 
 const mockEnv: any = {
     requires: {
@@ -33,6 +36,41 @@ function createSelectBuilder(kind: 'one' | 'many', table: string) {
     return builder;
 }
 
+function createDeleteBuilder(table: string) {
+    const builder: any = {
+        __type: 'delete',
+        __table: table
+    };
+    builder.where = jest.fn().mockImplementation((value: unknown) => {
+        builder.__where = value;
+        return builder;
+    });
+    return builder;
+}
+
+function createUpdateBuilder(table: string) {
+    const builder: any = {
+        __type: 'update',
+        __table: table
+    };
+    builder.set = jest.fn().mockImplementation((value: unknown) => {
+        builder.__set = value;
+        return {
+            where: jest.fn().mockImplementation((where: unknown) => ({
+                ...builder,
+                __where: where
+            }))
+        };
+    });
+    return builder;
+}
+
+jest.mock('../../srv/crawler', () => ({
+    startCrawler: (...args: any[]) => mockStartCrawler(...args),
+    stopCrawler: (...args: any[]) => mockStopCrawler(...args),
+    isCrawlerRunning: (...args: any[]) => mockIsCrawlerRunning(...args)
+}));
+
 jest.mock('@sap/cds', () => {
     const cds: any = {
         connect: { to: mockDbConnect },
@@ -52,6 +90,12 @@ jest.mock('@sap/cds', () => {
                         __entries: value
                     }))
                 }))
+            },
+            DELETE: {
+                from: jest.fn().mockImplementation((table: string) => createDeleteBuilder(table))
+            },
+            UPDATE: {
+                entity: jest.fn().mockImplementation((table: string) => createUpdateBuilder(table))
             }
         },
         ApplicationService: class {
@@ -59,7 +103,7 @@ jest.mock('@sap/cds', () => {
                 registeredHandlers.set(event, handler);
             }
 
-            async init() {}
+            async init() { }
         }
     };
     cds.default = cds;
@@ -85,6 +129,10 @@ describe('NightgateIndexerService comprehensive coverage', () => {
     beforeEach(() => {
         jest.clearAllMocks();
         registeredHandlers.clear();
+        mockStartCrawler.mockReset();
+        mockStopCrawler.mockReset();
+        mockIsCrawlerRunning.mockReset();
+        mockIsCrawlerRunning.mockReturnValue(false);
         mockEnv.requires = {
             nightgate: {
                 network: 'testnet',
@@ -451,5 +499,113 @@ describe('NightgateIndexerService comprehensive coverage', () => {
 
         expect(result).toContain('odatano_nightgate_sync_lag -2');
         expect(result).toContain('odatano_nightgate_sync_status 0');
+    });
+
+    it('pauseCrawler returns no-op status when crawler is already paused', async () => {
+        await initService();
+        const handler = getHandler('pauseCrawler');
+
+        mockIsCrawlerRunning.mockReturnValue(false);
+
+        await expect(handler()).resolves.toEqual({
+            status: 'ok',
+            running: false,
+            message: 'Crawler is already paused'
+        });
+        expect(mockStopCrawler).not.toHaveBeenCalled();
+    });
+
+    it('pauseCrawler stops the crawler and marks sync state as stopped', async () => {
+        await initService();
+        const handler = getHandler('pauseCrawler');
+
+        mockIsCrawlerRunning.mockReturnValue(true);
+        mockStopCrawler.mockResolvedValueOnce(undefined);
+        mockDbRun.mockResolvedValueOnce(undefined);
+
+        await expect(handler()).resolves.toEqual({
+            status: 'ok',
+            running: false,
+            message: 'Crawler paused'
+        });
+        expect(mockStopCrawler).toHaveBeenCalledTimes(1);
+        expect(mockDbRun.mock.calls.at(-1)?.[0]).toEqual(expect.objectContaining({
+            __type: 'update',
+            __table: 'midnight.SyncState',
+            __set: expect.objectContaining({ syncStatus: 'stopped' }),
+            __where: { ID: 'SINGLETON' }
+        }));
+    });
+
+    it('resumeCrawler starts crawler with configured runtime values', async () => {
+        await initService();
+        const handler = getHandler('resumeCrawler');
+
+        mockIsCrawlerRunning.mockReturnValue(false);
+        mockStartCrawler.mockResolvedValueOnce(undefined);
+
+        await expect(handler({} as any)).resolves.toEqual({
+            status: 'ok',
+            running: true,
+            message: 'Crawler resumed'
+        });
+        expect(mockStartCrawler).toHaveBeenCalledWith(expect.objectContaining({
+            enabled: true,
+            nodeUrl: 'ws://localhost:9944',
+            requestTimeout: 30000
+        }));
+    });
+
+    it('resumeCrawler rejects when startup fails', async () => {
+        await initService();
+        const handler = getHandler('resumeCrawler');
+        const req: any = {
+            reject: jest.fn((code: number, message: string) => ({ code, message }))
+        };
+
+        mockIsCrawlerRunning.mockReturnValue(false);
+        mockStartCrawler.mockRejectedValueOnce(new Error('node offline'));
+
+        await expect(handler(req)).resolves.toEqual({
+            code: 500,
+            message: 'Failed to resume crawler: node offline'
+        });
+        expect(req.reject).toHaveBeenCalledWith(500, 'Failed to resume crawler: node offline');
+    });
+
+    it('reindexFromHeight rejects invalid heights', async () => {
+        await initService();
+        const handler = getHandler('reindexFromHeight');
+        const req: any = {
+            data: { height: -1 },
+            reject: jest.fn((code: number, message: string) => ({ code, message }))
+        };
+
+        await expect(handler(req)).resolves.toEqual({
+            code: 400,
+            message: 'height must be a non-negative integer'
+        });
+        expect(req.reject).toHaveBeenCalledWith(400, 'height must be a non-negative integer');
+    });
+
+    it('reindexFromHeight reports effective start height when no rollback is required', async () => {
+        await initService();
+        const handler = getHandler('reindexFromHeight');
+
+        mockIsCrawlerRunning.mockReturnValue(false);
+        mockDbRun
+            .mockResolvedValueOnce([])
+            .mockResolvedValueOnce({ height: 9, hash: '0x9' });
+
+        await expect(handler({ data: { height: 10 } } as any)).resolves.toEqual({
+            status: 'ok',
+            message: 'Reindex prepared',
+            requestedHeight: 10,
+            effectiveStartHeight: 10,
+            blocksRolledBack: 0,
+            transactionsRolledBack: 0,
+            crawlerResumed: false
+        });
+        expect(mockStopCrawler).not.toHaveBeenCalled();
     });
 });

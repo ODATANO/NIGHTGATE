@@ -104,6 +104,13 @@
       },
       "kinds": {}
     },
+    "[development]": {
+      "requires": {
+        "auth": {
+          "kind": "dummy"
+        }
+      }
+    },
     "odata": {
       "version": "v4"
     },

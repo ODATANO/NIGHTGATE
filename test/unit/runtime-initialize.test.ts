@@ -1,4 +1,7 @@
 const mockDbRun = jest.fn();
+const mockDbDeploy = jest.fn();
+const mockCdsDeployTo = jest.fn();
+const mockCdsDeploy = jest.fn();
 const mockConnectTo = jest.fn();
 const mockStartCrawler = jest.fn();
 const mockStopCrawler = jest.fn();
@@ -28,7 +31,8 @@ jest.mock('@sap/cds', () => {
                     }))
                 }
             }
-        }
+        },
+        deploy: mockCdsDeploy
     };
     cds.default = cds;
     return cds;
@@ -59,7 +63,10 @@ describe('runtime initialize', () => {
         };
 
         mockDbRun.mockResolvedValue({});
-        mockConnectTo.mockResolvedValue({ run: mockDbRun });
+        mockDbDeploy.mockResolvedValue(undefined);
+        mockCdsDeployTo.mockResolvedValue(undefined);
+        mockCdsDeploy.mockReturnValue({ to: mockCdsDeployTo });
+        mockConnectTo.mockResolvedValue({ run: mockDbRun, deploy: mockDbDeploy });
         mockStartCrawler.mockResolvedValue(undefined);
         mockStopCrawler.mockResolvedValue(undefined);
         mockEnsureNightgateModelLoaded.mockResolvedValue(undefined);
@@ -78,10 +85,16 @@ describe('runtime initialize', () => {
             expect(mockEnsureNightgateModelLoaded.mock.invocationCallOrder[0]).toBeLessThan(mockConnectTo.mock.invocationCallOrder[0]);
             expect(mockConnectTo).toHaveBeenCalledWith('db');
             expect(selectFromSpy).toHaveBeenCalledWith('midnight.Blocks');
-            expect(mockDbRun).toHaveBeenCalledWith(expect.objectContaining({
+            expect(selectFromSpy).toHaveBeenCalledWith('midnight.SyncState');
+            expect(mockDbRun).toHaveBeenNthCalledWith(1, expect.objectContaining({
                 __kind: 'one',
                 __table: 'midnight.Blocks'
             }));
+            expect(mockDbRun).toHaveBeenNthCalledWith(2, expect.objectContaining({
+                __kind: 'one',
+                __table: 'midnight.SyncState'
+            }));
+            expect(mockDbDeploy).not.toHaveBeenCalled();
             expect(mockStartCrawler).toHaveBeenCalledWith(expect.objectContaining({
                 enabled: true,
                 nodeUrl: 'ws://localhost:9944',
@@ -133,6 +146,64 @@ describe('runtime initialize', () => {
                 crawlerEnabled: true,
                 mode: 'offline',
                 lastError: 'ECONNREFUSED: connect'
+            }));
+        } finally {
+            warnSpy.mockRestore();
+            logSpy.mockRestore();
+        }
+    });
+
+    it('auto-deploys when SyncState table is missing but Blocks exists', async () => {
+        const logSpy = jest.spyOn(console, 'log').mockImplementation();
+        const warnSpy = jest.spyOn(console, 'warn').mockImplementation();
+
+        mockDbRun
+            .mockResolvedValueOnce({})
+            .mockRejectedValueOnce(new Error('no such table: midnight_SyncState'))
+            .mockResolvedValueOnce({})
+            .mockResolvedValueOnce({});
+
+        try {
+            const status = await initialize();
+
+            expect(mockDbDeploy).toHaveBeenCalledWith('*');
+            expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('Required DB tables missing/incomplete'));
+            expect(logSpy).toHaveBeenCalledWith('[odatano-nightgate] DB schema deployed');
+            expect(mockStartCrawler).toHaveBeenCalledTimes(1);
+            expect(status).toEqual(expect.objectContaining({
+                initialized: true,
+                crawlerEnabled: true,
+                mode: 'active'
+            }));
+        } finally {
+            warnSpy.mockRestore();
+            logSpy.mockRestore();
+        }
+    });
+
+    it('falls back to cds.deploy(...).to(db) when db.deploy is unavailable', async () => {
+        const logSpy = jest.spyOn(console, 'log').mockImplementation();
+        const warnSpy = jest.spyOn(console, 'warn').mockImplementation();
+        const dbWithoutDeploy = { run: mockDbRun };
+
+        mockConnectTo.mockResolvedValue(dbWithoutDeploy);
+        mockDbRun
+            .mockResolvedValueOnce({})
+            .mockRejectedValueOnce(new Error('no such table: midnight_SyncState'))
+            .mockResolvedValueOnce({})
+            .mockResolvedValueOnce({});
+
+        try {
+            const status = await initialize();
+
+            expect(mockDbDeploy).not.toHaveBeenCalled();
+            expect(mockCdsDeploy).toHaveBeenCalledWith('*');
+            expect(mockCdsDeployTo).toHaveBeenCalledWith(dbWithoutDeploy);
+            expect(logSpy).toHaveBeenCalledWith('[odatano-nightgate] DB schema deployed');
+            expect(status).toEqual(expect.objectContaining({
+                initialized: true,
+                crawlerEnabled: true,
+                mode: 'active'
             }));
         } finally {
             warnSpy.mockRestore();

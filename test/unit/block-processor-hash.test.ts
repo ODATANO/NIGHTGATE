@@ -100,7 +100,7 @@ describe('classifyExtrinsic and mapPalletCall', () => {
     const processor = new BlockProcessor({} as any);
 
     it('classifies too-short extrinsics as system', () => {
-        expect((processor as any).classifyExtrinsic('0x12')).toEqual({
+        expect((processor as any).classifyExtrinsic('0x12')).toMatchObject({
             txType: 'system',
             isShielded: false,
             isSystem: true
@@ -114,10 +114,12 @@ describe('classifyExtrinsic and mapPalletCall', () => {
     });
 
     it('uses pallet overrides from config for classification', () => {
-        expect((processor as any).classifyExtrinsic(buildUnsignedExtrinsic(15, 0))).toEqual({
+        expect((processor as any).classifyExtrinsic(buildUnsignedExtrinsic(15, 0))).toMatchObject({
             txType: 'shielded_transfer',
             isShielded: true,
-            isSystem: false
+            isSystem: false,
+            palletIndex: 15,
+            callIndex: 0
         });
     });
 
@@ -127,6 +129,16 @@ describe('classifyExtrinsic and mapPalletCall', () => {
             isShielded: false,
             isSystem: false
         });
+    });
+
+    it('derives deterministic metadata helpers for contract transactions', () => {
+        const hash = (processor as any).hashExtrinsic(buildUnsignedExtrinsic(10, 2));
+
+        expect((processor as any).toContractActionType('contract_call')).toBe('CALL');
+        expect((processor as any).toContractActionType('night_transfer')).toBeNull();
+        expect((processor as any).deriveContractAddress(hash)).toMatch(/^0x[0-9a-f]{56}$/);
+        expect((processor as any).extrinsicSize('0x0c040a02')).toBe(4);
+        expect((processor as any).buildCircuitName({ palletIndex: 10, callIndex: 2 })).toBe('10:2');
     });
 });
 

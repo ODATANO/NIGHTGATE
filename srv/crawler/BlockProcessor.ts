@@ -6,6 +6,14 @@
  *
  */
 
+interface ExtrinsicClassification {
+    txType: string;
+    isShielded: boolean;
+    isSystem: boolean;
+    palletIndex?: number;
+    callIndex?: number;
+}
+
 import cds from '@sap/cds';
 const { SELECT, INSERT, UPDATE } = cds.ql;
 import { blake2b } from '@noble/hashes/blake2b';
@@ -191,25 +199,55 @@ export class BlockProcessor {
                 const extrinsicHex = extrinsics[i];
                 const txId = cds.utils.uuid();
                 const classification = this.classifyExtrinsic(extrinsicHex);
+                const extrinsicHash = this.hashExtrinsic(extrinsicHex);
+                const txSize = this.extrinsicSize(extrinsicHex);
+                const circuitName = this.buildCircuitName(classification);
+                const contractActionType = this.toContractActionType(classification.txType);
+                const contractAddress = contractActionType ? this.deriveContractAddress(extrinsicHash) : null;
 
                 await tx.run(INSERT.into('midnight.Transactions').entries({
                     ID: txId,
                     transactionId: i,
-                    hash: this.hashExtrinsic(extrinsicHex),
+                    hash: extrinsicHash,
                     protocolVersion,
                     raw: extrinsicHex,
                     transactionType: classification.isSystem ? 'SYSTEM' : 'REGULAR',
                     txType: classification.txType,
                     isShielded: classification.isShielded,
+                    hasProof: classification.isShielded,
+                    proofHash: classification.isShielded ? extrinsicHash : null,
+                    contractAddress,
+                    circuitName,
+                    size: txSize,
                     block_ID: blockId
+                }));
+
+                // Baseline tx child records keep exposed compositions queryable.
+                await tx.run(INSERT.into('midnight.TransactionResults').entries({
+                    ID: cds.utils.uuid(),
+                    status: 'SUCCESS',
+                    transaction_ID: txId
+                }));
+
+                await tx.run(INSERT.into('midnight.TransactionFees').entries({
+                    ID: cds.utils.uuid(),
+                    paidFees: '0',
+                    estimatedFees: '0',
+                    transaction_ID: txId
                 }));
 
                 txCount++;
 
                 // Track contract actions from extrinsic classification
-                if (classification.txType === 'contract_deploy' ||
-                    classification.txType === 'contract_call' ||
-                    classification.txType === 'contract_update') {
+                if (contractActionType && contractAddress) {
+                    await tx.run(INSERT.into('midnight.ContractActions').entries({
+                        ID: cds.utils.uuid(),
+                        address: contractAddress,
+                        actionType: contractActionType,
+                        entryPoint: circuitName,
+                        state: extrinsicHex,
+                        transaction_ID: txId
+                    }));
                     actionCount++;
                 }
             }
@@ -238,11 +276,7 @@ export class BlockProcessor {
     // Extrinsic Classification (for node-sourced blocks)
     // ========================================================================
 
-    private classifyExtrinsic(hex: string): {
-        txType: string;
-        isShielded: boolean;
-        isSystem: boolean;
-    } {
+    private classifyExtrinsic(hex: string): ExtrinsicClassification {
         if (!hex || hex.length < 10) {
             return { txType: 'system', isShielded: false, isSystem: true };
         }
@@ -250,7 +284,11 @@ export class BlockProcessor {
         // Parse SCALE-encoded extrinsic to extract pallet + call index
         const indices = parseExtrinsicCallIndices(hex);
         if (indices) {
-            return this.mapPalletCall(indices.palletIndex, indices.callIndex);
+            return {
+                ...this.mapPalletCall(indices.palletIndex, indices.callIndex),
+                palletIndex: indices.palletIndex,
+                callIndex: indices.callIndex
+            };
         }
 
         // Fallback: length-based heuristic when parsing fails
@@ -258,6 +296,32 @@ export class BlockProcessor {
             return { txType: 'system', isShielded: false, isSystem: true };
         }
         return { txType: 'unknown', isShielded: false, isSystem: false };
+    }
+
+    private extrinsicSize(hex: string): number {
+        const cleanHex = hex.startsWith('0x') ? hex.slice(2) : hex;
+        return Math.ceil(cleanHex.length / 2);
+    }
+
+    private toContractActionType(txType: string): 'DEPLOY' | 'CALL' | 'UPDATE' | null {
+        if (txType === 'contract_deploy') return 'DEPLOY';
+        if (txType === 'contract_call') return 'CALL';
+        if (txType === 'contract_update') return 'UPDATE';
+        return null;
+    }
+
+    private deriveContractAddress(extrinsicHash: string): string {
+        const cleanHash = extrinsicHash.startsWith('0x') ? extrinsicHash.slice(2) : extrinsicHash;
+        // Keep a deterministic 28-byte key-hash-like identifier for contract address grouping.
+        return `0x${cleanHash.slice(0, 56)}`;
+    }
+
+    private buildCircuitName(classification: ExtrinsicClassification): string | null {
+        if (classification.palletIndex == null || classification.callIndex == null) {
+            return null;
+        }
+
+        return `${classification.palletIndex}:${classification.callIndex}`;
     }
 
     private mapPalletCall(palletIndex: number, callIndex: number): {

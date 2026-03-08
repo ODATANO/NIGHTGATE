@@ -28,8 +28,23 @@ function registerSecurityHeaders(): void {
     cds.on('bootstrap', (app: any) => {
         const nightgateConfig = (cds.env as any).requires?.nightgate || {};
         const corsOrigin = nightgateConfig.corsOrigin || '*';
+        const strictCsp = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'";
+        const fioriPreviewCsp = [
+            "default-src 'self' https://sapui5.hana.ondemand.com https://ui5.sap.com",
+            "script-src 'self' 'unsafe-inline' 'unsafe-eval' https://sapui5.hana.ondemand.com https://ui5.sap.com",
+            "style-src 'self' 'unsafe-inline' https://sapui5.hana.ondemand.com https://ui5.sap.com",
+            "img-src 'self' data: blob: https:",
+            "font-src 'self' data: https://sapui5.hana.ondemand.com https://ui5.sap.com",
+            "connect-src 'self' ws: wss: https://sapui5.hana.ondemand.com https://ui5.sap.com http://localhost:*"
+        ].join('; ');
+        const configuredCsp = typeof nightgateConfig.contentSecurityPolicy === 'string'
+            ? nightgateConfig.contentSecurityPolicy
+            : undefined;
+        const cspDisabled = nightgateConfig.contentSecurityPolicy === false || nightgateConfig.contentSecurityPolicy === 'off';
 
         app.use((req: any, res: any, next: () => void) => {
+            const isFioriPreview = typeof req.path === 'string' && req.path.startsWith('/$fiori-preview');
+            const isFioriPreviewJs = isFioriPreview && typeof req.path === 'string' && /\.m?js$/i.test(req.path);
             const correlationId = req.headers['x-correlation-id'] || crypto.randomUUID();
             req.correlationId = correlationId;
             res.setHeader('X-Correlation-ID', correlationId);
@@ -39,11 +54,28 @@ function registerSecurityHeaders(): void {
             res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, Accept, X-Correlation-ID');
             res.setHeader('Access-Control-Max-Age', '86400');
 
-            res.setHeader('X-Content-Type-Options', 'nosniff');
-            res.setHeader('X-Frame-Options', 'DENY');
+            if (!isFioriPreview) {
+                res.setHeader('X-Content-Type-Options', 'nosniff');
+            }
+            res.setHeader('X-Frame-Options', isFioriPreview ? 'SAMEORIGIN' : 'DENY');
             res.setHeader('X-XSS-Protection', '0');
             res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
-            res.setHeader('Content-Security-Policy', "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'");
+
+            // CAP Fiori preview serves Component.js as plain text; force JS MIME for browser loaders.
+            if (isFioriPreviewJs) {
+                res.type('application/javascript; charset=utf-8');
+            }
+
+            // Some UI5 shell startup paths probe a root appconfig URL first.
+            if (req.path === '/appconfig/fioriSandboxConfig.json') {
+                res.redirect(307, '/$fiori-preview/appconfig/fioriSandboxConfig.json');
+                return;
+            }
+
+            // Fiori preview bootstraps UI5 from SAP CDN and uses inline startup scripts.
+            if (!cspDisabled) {
+                res.setHeader('Content-Security-Policy', configuredCsp || (isFioriPreview ? fioriPreviewCsp : strictCsp));
+            }
 
             if (process.env.NODE_ENV === 'production') {
                 res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
@@ -89,6 +121,10 @@ const plugin = {
                     },
                     nodeUrl: {
                         description: 'Midnight Node Substrate RPC endpoint (default: ws://localhost:9944). The indexer crawls blocks directly from the node.',
+                        type: 'string'
+                    },
+                    contentSecurityPolicy: {
+                        description: "Optional custom CSP header value. Use 'off' to disable CSP. Defaults to strict API policy and relaxed UI5 policy for /$fiori-preview/*.",
                         type: 'string'
                     },
                     crawler: {

@@ -74,23 +74,48 @@ function logStartupState(state: 'stopped' | 'syncing' | 'offline', detail?: stri
 }
 
 async function ensureSchemaDeployed(): Promise<void> {
-    try {
-        const db = await cds.connect.to('db');
+    const requiredTables = ['midnight.Blocks', 'midnight.SyncState'];
+
+    const probeRequiredTables = async (db: any): Promise<void> => {
         const { SELECT } = cds.ql;
-        await db.run(SELECT.one.from('midnight.Blocks'));
-    } catch {
-        console.warn('[odatano-nightgate] DB schema not deployed — running auto-deploy...');
-        try {
-            const db = cds.db || await cds.connect.to('db');
-            if (db.deploy) {
-                await db.deploy();
-            }
-            console.log('[odatano-nightgate] DB schema deployed');
-        } catch (deployErr) {
-            const message = deployErr instanceof Error ? deployErr.message : String(deployErr);
-            console.warn(`[odatano-nightgate] Auto-deploy failed: ${message}`);
-            console.warn('[odatano-nightgate] Run: cds deploy --to sqlite');
+        for (const table of requiredTables) {
+            await db.run(SELECT.one.from(table));
         }
+    };
+
+    const db = cds.db || await cds.connect.to('db');
+
+    try {
+        await probeRequiredTables(db);
+        return;
+    } catch (probeErr) {
+        const probeMessage = probeErr instanceof Error ? probeErr.message : String(probeErr);
+        console.warn(`[odatano-nightgate] Required DB tables missing/incomplete: ${probeMessage}`);
+        console.warn('[odatano-nightgate] Running auto-deploy for Nightgate schema...');
+    }
+
+    try {
+        const deployModel = (cds.model as any) || '*';
+        let deployTriggered = false;
+
+        if (typeof db.deploy === 'function') {
+            await db.deploy(deployModel);
+            deployTriggered = true;
+        } else if (typeof (cds as any).deploy === 'function') {
+            await (cds as any).deploy(deployModel).to(db);
+            deployTriggered = true;
+        }
+
+        if (!deployTriggered) {
+            throw new Error('No deploy API available on DB service');
+        }
+
+        await probeRequiredTables(db);
+        console.log('[odatano-nightgate] DB schema deployed');
+    } catch (deployErr) {
+        const message = deployErr instanceof Error ? deployErr.message : String(deployErr);
+        console.warn(`[odatano-nightgate] Auto-deploy failed: ${message}`);
+        console.warn('[odatano-nightgate] Run: cds deploy --to sqlite');
     }
 }
 
