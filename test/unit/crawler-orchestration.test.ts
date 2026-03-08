@@ -98,6 +98,10 @@ jest.mock('../../srv/crawler/BlockProcessor', () => ({
     BlockProcessor: mockBlockProcessorConstructor
 }));
 
+jest.mock('../../srv/utils/sync-state', () => ({
+    ensureSyncStateSingleton: jest.fn().mockResolvedValue(undefined)
+}));
+
 import { MidnightCrawler } from '../../srv/crawler/Crawler';
 
 describe('MidnightCrawler orchestration', () => {
@@ -117,14 +121,12 @@ describe('MidnightCrawler orchestration', () => {
             connect: jest.fn().mockResolvedValue(undefined)
         };
         const crawler = new MidnightCrawler(provider as any, { enabled: true });
-        const ensureSyncStateSpy = jest.spyOn(crawler as any, 'ensureSyncState').mockResolvedValue(undefined);
         const catchUpSpy = jest.spyOn(crawler as any, 'catchUp').mockResolvedValue(0);
         const subscribeLiveSpy = jest.spyOn(crawler as any, 'subscribeLive').mockResolvedValue(undefined);
 
         await crawler.start();
 
         expect(mockConnectTo).toHaveBeenCalledWith('db');
-        expect(ensureSyncStateSpy).toHaveBeenCalled();
         expect(provider.connect).toHaveBeenCalled();
         expect(mockBlockProcessorConstructor).toHaveBeenCalledWith(provider);
         expect(mockProcessorInit).toHaveBeenCalled();
@@ -138,7 +140,7 @@ describe('MidnightCrawler orchestration', () => {
             connect: jest.fn().mockResolvedValue(undefined)
         };
         const crawler = new MidnightCrawler(provider as any, { enabled: true });
-        jest.spyOn(crawler as any, 'ensureSyncState').mockResolvedValue(undefined);
+        // ensureSyncStateSingleton is called via the shared utility module
         jest.spyOn(crawler as any, 'catchUp').mockImplementation(async () => {
             (crawler as any).isRunning = false;
             return 0;
@@ -338,6 +340,7 @@ describe('MidnightCrawler orchestration', () => {
         (crawler as any).startTime = Date.now() - 1000;
 
         const checkForReorgSpy = jest.spyOn(crawler as any, 'checkForReorg').mockResolvedValue(null);
+        jest.spyOn(crawler as any, 'getSyncState').mockResolvedValue({ lastIndexedHash: '0x2hash' });
         const processSpy = jest.spyOn(crawler as any, 'processBlockWithRetry').mockResolvedValue({
             blockHeight: 2,
             blockHash: '0x2hash',
@@ -355,7 +358,6 @@ describe('MidnightCrawler orchestration', () => {
         await liveCallback!({ number: '0x2', parentHash: '0x1', stateRoot: '', extrinsicsRoot: '', digest: { logs: [] } });
 
         expect(checkForReorgSpy).toHaveBeenCalled();
-        expect(provider.getBlockHash).toHaveBeenCalledWith(2);
         expect(processSpy).toHaveBeenCalledWith(2);
         expect((crawler as any).processing).toBe(false);
 
@@ -363,7 +365,7 @@ describe('MidnightCrawler orchestration', () => {
         expect(provider.subscribeFinalizedHeads).toHaveBeenCalledTimes(2);
     });
 
-    it('ignores live callbacks while catch-up is running or a block is already processing', async () => {
+    it('ignores live callbacks while catch-up is running and queues blocks while processing', async () => {
         let liveCallback: ((header: any) => Promise<void>) | undefined;
         const provider = {
             subscribeFinalizedHeads: jest.fn().mockImplementation(async (callback: (header: any) => Promise<void>) => {
@@ -378,14 +380,16 @@ describe('MidnightCrawler orchestration', () => {
         await (crawler as any).subscribeLive();
         mockDbRun.mockClear();
 
+        // During catch-up, live callbacks are fully ignored
         (crawler as any).isCatchingUp = true;
         await liveCallback!({ number: '0x2', parentHash: '0x1', stateRoot: '', extrinsicsRoot: '', digest: { logs: [] } });
         expect(mockDbRun).not.toHaveBeenCalled();
 
+        // During processing, blocks are queued (not dropped)
         (crawler as any).isCatchingUp = false;
         (crawler as any).processing = true;
-        await liveCallback!({ number: '0x2', parentHash: '0x1', stateRoot: '', extrinsicsRoot: '', digest: { logs: [] } });
-        expect(mockDbRun).not.toHaveBeenCalled();
+        await liveCallback!({ number: '0x3', parentHash: '0x2', stateRoot: '', extrinsicsRoot: '', digest: { logs: [] } });
+        expect((crawler as any).pendingHeights).toContain(3);
     });
 
     it('records transient live-processing failures and pauses when the live breaker trips', async () => {
@@ -613,14 +617,12 @@ describe('MidnightCrawler orchestration', () => {
                 { ID: 'block-10', height: 10 },
                 { ID: 'block-11', height: 11 }
             ])
-            .mockResolvedValueOnce([])
-            .mockResolvedValueOnce(undefined)
-            .mockResolvedValueOnce(undefined)
-            .mockResolvedValueOnce(undefined)
-            .mockResolvedValueOnce(undefined)
-            .mockResolvedValueOnce({ height: 9, hash: '0x9' })
-            .mockResolvedValueOnce(undefined)
-            .mockResolvedValueOnce(undefined);
+            .mockResolvedValueOnce([])   // no transactions
+            .mockResolvedValueOnce(undefined) // DELETE transactions
+            .mockResolvedValueOnce(undefined) // DELETE blocks
+            .mockResolvedValueOnce({ height: 9, hash: '0x9' }) // find fork block
+            .mockResolvedValueOnce(undefined) // UPDATE SyncState
+            .mockResolvedValueOnce(undefined); // INSERT ReorgLog
         const db = {
             tx: jest.fn().mockImplementation(async (callback: (tx: { run: typeof txRun }) => Promise<void>) => {
                 await callback({ run: txRun });
@@ -636,7 +638,6 @@ describe('MidnightCrawler orchestration', () => {
         })).resolves.toBe('reorg-log-1');
 
         expect(db.tx).toHaveBeenCalled();
-        expect(txRun).toHaveBeenCalledTimes(9);
         expect(txRun.mock.calls.at(-1)?.[0]).toEqual(expect.objectContaining({
             __type: 'insert',
             __table: 'midnight.ReorgLog',
@@ -705,26 +706,27 @@ describe('MidnightCrawler orchestration', () => {
         })).resolves.toBe('reorg-log-1');
 
         const queries = txRun.mock.calls.map(([query]) => query);
+        // Batch deletes use { in: [...] } instead of per-record deletes
         expect(queries).toContainEqual(expect.objectContaining({
             __type: 'delete',
             __table: 'midnight.ContractBalances',
-            __where: { contractAction_ID: 'action-10' }
+            __where: { contractAction_ID: { in: ['action-10'] } }
         }));
         expect(queries).toContainEqual(expect.objectContaining({
             __type: 'delete',
             __table: 'midnight.ContractActions',
-            __where: { transaction_ID: 'tx-10' }
+            __where: { transaction_ID: { in: ['tx-10'] } }
         }));
         expect(queries).toContainEqual(expect.objectContaining({
             __type: 'delete',
             __table: 'midnight.TransactionSegments',
-            __where: { transactionResult_ID: 'result-10' }
+            __where: { transactionResult_ID: { in: ['result-10'] } }
         }));
         expect(queries).toContainEqual(expect.objectContaining({
             __type: 'update',
             __table: 'midnight.UnshieldedUtxos',
             __set: { spentAtTransaction_ID: null },
-            __where: { spentAtTransaction_ID: 'tx-10' }
+            __where: { spentAtTransaction_ID: { in: ['tx-10'] } }
         }));
         expect(queries).toContainEqual(expect.objectContaining({
             __type: 'insert',

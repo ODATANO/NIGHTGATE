@@ -4,7 +4,7 @@ using { midnight } from '../db/schema';
  * Analytics Service for aggregated blockchain data
  */
 @path: '/api/v1/analytics'
-// @requires: 'authenticated-user'  // Uncomment for production
+@requires: 'authenticated-user'
 service NightgateAnalyticsService {
 
     /**

@@ -25,6 +25,9 @@ export function getEncryptionKey(): Buffer {
     if (envKey) {
         return crypto.createHash('sha256').update(envKey).digest();
     }
+    if (process.env.NODE_ENV === 'production') {
+        throw new Error('[crypto] ENCRYPTION_KEY must be set in production. Refusing to start with fallback key.');
+    }
     // Dev fallback: derive from stable-per-process value
     console.warn('[crypto] ENCRYPTION_KEY not set — using dev fallback key. Set ENCRYPTION_KEY for production.');
     const fallback = `odatano-night-${process.pid}-${os.hostname()}`;

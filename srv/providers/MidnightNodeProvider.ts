@@ -88,6 +88,7 @@ export class MidnightNodeProvider {
     private reconnectAttempts: number = 0;
     private config: Required<NodeProviderConfig>;
     private onReconnectCallback: (() => Promise<void>) | null = null;
+    private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 
     constructor(config: NodeProviderConfig) {
         this.config = {
@@ -130,8 +131,15 @@ export class MidnightNodeProvider {
                     const wasConnected = this.connected;
                     this.connected = false;
                     this.rejectAllPending('Connection closed');
+                    this.subscriptions.clear();
 
-                    if (wasConnected && !this.reconnecting) {
+                    if (!wasConnected) {
+                        // Socket closed before 'open' — reject the connect() promise
+                        reject(new Error(`WebSocket closed before connection established to ${this.config.nodeUrl}`));
+                        return;
+                    }
+
+                    if (!this.reconnecting) {
                         console.warn('[MidnightNode] Connection lost, attempting reconnect...');
                         this.attemptReconnect();
                     }
@@ -144,6 +152,13 @@ export class MidnightNodeProvider {
 
     async disconnect(): Promise<void> {
         this.reconnecting = false;
+
+        // Clear any pending reconnect timer
+        if (this.reconnectTimer) {
+            clearTimeout(this.reconnectTimer);
+            this.reconnectTimer = null;
+        }
+
         this.rejectAllPending('Disconnecting');
 
         if (this.ws) {
@@ -180,7 +195,8 @@ export class MidnightNodeProvider {
         const delay = this.config.reconnectInterval * Math.min(this.reconnectAttempts, 5);
         console.log(`[MidnightNode] Reconnecting in ${delay}ms (attempt ${this.reconnectAttempts})`);
 
-        setTimeout(async () => {
+        this.reconnectTimer = setTimeout(async () => {
+            this.reconnectTimer = null;
             try {
                 await this.connect();
                 console.log('[MidnightNode] Reconnected successfully');
@@ -416,7 +432,11 @@ export class MidnightNodeProvider {
      * Parse a hex-encoded block number to integer
      */
     static parseBlockNumber(hex: string): number {
-        return parseInt(hex, 16);
+        const n = parseInt(hex, 16);
+        if (isNaN(n)) {
+            throw new Error(`Invalid block number hex: "${hex}"`);
+        }
+        return n;
     }
 
     /**

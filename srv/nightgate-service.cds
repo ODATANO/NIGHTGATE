@@ -7,7 +7,7 @@ using { midnight } from '../db/schema';
  * following enterprise architecture patterns.
  */
 @path: '/api/v1/nightgate'
-// @requires: 'authenticated-user'  // Uncomment for production
+@requires: 'authenticated-user'
 service NightgateService {
 
     // ========================================================================

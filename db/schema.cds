@@ -307,7 +307,6 @@ entity DustGenerationStatus : cuid, managed {
 entity WalletSessions : cuid, managed {
     viewingKeyHash      : String(64);       // SHA-256 of viewing key (for lookup/dedup)
     encryptedViewingKey : LargeString;      // AES-256-GCM encrypted viewing key
-    sessionToken        : UUID not null;    // Bearer token returned to client
     sessionId           : UUID not null;
     connectedAt         : Timestamp not null;
     disconnectedAt      : Timestamp;

@@ -19,6 +19,7 @@ import { MidnightNodeProvider, BlockHeader } from '../providers/MidnightNodeProv
 import { BlockProcessor, ProcessResult } from './BlockProcessor';
 import { ensureNightgateModelLoaded } from '../utils/cds-model';
 import { isTransientError, calcBackoff } from '../utils/retry';
+import { ensureSyncStateSingleton } from '../utils/sync-state';
 
 // ============================================================================
 // Types
@@ -47,6 +48,7 @@ export class MidnightCrawler {
     private isRunning: boolean = false;
     private isCatchingUp: boolean = false;
     private processing: boolean = false;  // Mutex: prevent concurrent block processing
+    private pendingHeights: number[] = [];  // Queued live block heights received during processing
     private subscriptionId: string | null = null;
     private db: any;
     private processor!: BlockProcessor;
@@ -81,29 +83,44 @@ export class MidnightCrawler {
 
         this.isRunning = true;
         this.startTime = Date.now();
-        await ensureNightgateModelLoaded();
-        this.db = await cds.connect.to('db');
 
-        // Ensure SyncState singleton exists
-        await this.ensureSyncState();
+        try {
+            await ensureNightgateModelLoaded();
+            this.db = await cds.connect.to('db');
 
-        // Connect to node FIRST
-        if (!this.nodeProvider.isConnected()) {
-            await this.nodeProvider.connect();
-        }
+            // Ensure SyncState singleton exists (shared utility)
+            await ensureSyncStateSingleton(this.db, this.config.nodeUrl);
 
-        // Initialize block processor (after node is connected)
-        this.processor = new BlockProcessor(this.nodeProvider);
-        await this.processor.init();
+            // Connect to node FIRST
+            if (!this.nodeProvider.isConnected()) {
+                await this.nodeProvider.connect();
+            }
 
-        console.log('[Crawler] Starting...');
+            // Initialize block processor (after node is connected)
+            this.processor = new BlockProcessor(this.nodeProvider);
+            await this.processor.init();
 
-        // Phase 1: Catch-up
-        await this.catchUp();
+            console.log('[Crawler] Starting...');
 
-        // Phase 2: Live subscription
-        if (this.isRunning) {
-            await this.subscribeLive();
+            // Phase 1: Catch-up
+            await this.catchUp();
+
+            // Phase 2: Live subscription
+            if (this.isRunning) {
+                await this.subscribeLive();
+            }
+
+            // Phase 3: Second catch-up to cover blocks finalized between
+            // end of Phase 1 and subscription establishment in Phase 2
+            if (this.isRunning) {
+                const gapBlocks = await this.catchUp();
+                if (gapBlocks > 0) {
+                    console.log(`[Crawler] Gap catch-up: ${gapBlocks} blocks indexed`);
+                }
+            }
+        } catch (err) {
+            this.isRunning = false;
+            throw err;
         }
     }
 
@@ -236,69 +253,30 @@ export class MidnightCrawler {
         }
 
         this.subscriptionId = await this.nodeProvider.subscribeFinalizedHeads(async (header: BlockHeader) => {
-            if (!this.isRunning || this.isCatchingUp || this.processing) return;
-            this.processing = true;
+            if (!this.isRunning || this.isCatchingUp) return;
 
             const height = MidnightNodeProvider.parseBlockNumber(header.number);
 
+            // Queue block height if already processing — don't drop it
+            if (this.processing) {
+                this.pendingHeights.push(height);
+                return;
+            }
+
+            this.processing = true;
+
             try {
-                // Update chain height
-                await this.db.run(
-                    UPDATE.entity('midnight.SyncState').set({
-                        chainHeight: height
-                    }).where({ ID: 'SINGLETON' })
-                );
+                await this.processLiveBlock(header, height);
 
-                // Check for reorg
-                const reorg = await this.checkForReorg(header);
-                if (reorg) {
-                    const reorgLogId = await this.handleReorg(reorg);
-                    const reIndexedCount = await this.catchUp();
-                    // Update ReorgLog with actual re-indexed count
-                    await this.db.run(
-                        UPDATE.entity('midnight.ReorgLog').set({
-                            blocksReIndexed: reIndexedCount,
-                            status: 'completed'
-                        }).where({ ID: reorgLogId })
-                    );
-                    return;
-                }
-
-                // Process new block
-                const blockHash = await this.nodeProvider.getBlockHash(height);
-                const result = await this.processBlockWithRetry(height);
-                this.blocksProcessed++;
-
-                // Update sync state to synced (including finality tracking)
-                const elapsed = (Date.now() - this.startTime) / 1000;
-                await this.db.run(
-                    UPDATE.entity('midnight.SyncState').set({
-                        syncStatus: 'synced',
-                        syncProgress: 100,
-                        blocksPerSecond: this.blocksProcessed / elapsed,
-                        consecutiveErrors: 0,
-                        lastFinalizedHeight: height,
-                        lastFinalizedHash: blockHash
-                    }).where({ ID: 'SINGLETON' })
-                );
-
-                console.log(
-                    `[Crawler] Live: block ${height} ` +
-                    `(${result.transactionCount} txs, ${result.processingTimeMs}ms)`
-                );
-            } catch (err) {
-                const error = err as Error;
-                const transient = isTransientError(error);
-                console.error(
-                    `[Crawler] Live: failed to process block ${height} ` +
-                    `(${transient ? 'transient' : 'permanent'}): ${error.message}`
-                );
-                await this.recordError(error.message);
-
-                // Circuit breaker for live subscription
-                const state = await this.getSyncState();
-                if ((state?.consecutiveErrors || 0) > 10) {
-                    console.error('[Crawler] Too many consecutive errors in live mode, pausing...');
+                // Drain queued heights (process highest, then catch-up gaps)
+                while (this.pendingHeights.length > 0 && this.isRunning) {
+                    const maxHeight = Math.max(...this.pendingHeights);
+                    this.pendingHeights = [];
+                    // Catch up any gaps between current tip and maxHeight
+                    const gapBlocks = await this.catchUp();
+                    if (gapBlocks > 0) {
+                        console.log(`[Crawler] Drained ${gapBlocks} queued blocks`);
+                    }
                 }
             } finally {
                 this.processing = false;
@@ -313,6 +291,67 @@ export class MidnightCrawler {
         );
 
         console.log('[Crawler] Live subscription active');
+    }
+
+    private async processLiveBlock(header: BlockHeader, height: number): Promise<void> {
+        try {
+            // Update chain height
+            await this.db.run(
+                UPDATE.entity('midnight.SyncState').set({
+                    chainHeight: height
+                }).where({ ID: 'SINGLETON' })
+            );
+
+            // Check for reorg
+            const reorg = await this.checkForReorg(header);
+            if (reorg) {
+                const reorgLogId = await this.handleReorg(reorg);
+                const reIndexedCount = await this.catchUp();
+                await this.db.run(
+                    UPDATE.entity('midnight.ReorgLog').set({
+                        blocksReIndexed: reIndexedCount,
+                        status: 'completed'
+                    }).where({ ID: reorgLogId })
+                );
+                return;
+            }
+
+            // Process new block (processBlockByHeight already fetches the hash)
+            const result = await this.processBlockWithRetry(height);
+            this.blocksProcessed++;
+
+            // Update sync state to synced
+            const elapsed = (Date.now() - this.startTime) / 1000;
+            const syncState = await this.getSyncState();
+            await this.db.run(
+                UPDATE.entity('midnight.SyncState').set({
+                    syncStatus: 'synced',
+                    syncProgress: 100,
+                    blocksPerSecond: this.blocksProcessed / elapsed,
+                    consecutiveErrors: 0,
+                    lastFinalizedHeight: height,
+                    lastFinalizedHash: syncState?.lastIndexedHash || result.blockHash
+                }).where({ ID: 'SINGLETON' })
+            );
+
+            console.log(
+                `[Crawler] Live: block ${height} ` +
+                `(${result.transactionCount} txs, ${result.processingTimeMs}ms)`
+            );
+        } catch (err) {
+            const error = err as Error;
+            const transient = isTransientError(error);
+            console.error(
+                `[Crawler] Live: failed to process block ${height} ` +
+                `(${transient ? 'transient' : 'permanent'}): ${error.message}`
+            );
+            await this.recordError(error.message);
+
+            const state = await this.getSyncState();
+            if ((state?.consecutiveErrors || 0) > 10) {
+                console.error('[Crawler] Too many consecutive errors in live mode, pausing...');
+            }
+        }
     }
 
     // ========================================================================
@@ -391,44 +430,46 @@ export class MidnightCrawler {
             ) || [];
 
             if (txsToDelete.length > 0) {
+                const txIds = txsToDelete.map((t: any) => t.ID);
+
+                // Batch delete contract balances via action IDs
                 const actionsToDelete: any[] = await tx.run(
                     SELECT.from('midnight.ContractActions').columns('ID')
-                        .where({ transaction_ID: { in: txsToDelete.map((t: any) => t.ID) } })
+                        .where({ transaction_ID: { in: txIds } })
                 ) || [];
-
-                for (const action of actionsToDelete) {
-                    await tx.run(DELETE.from('midnight.ContractBalances').where({ contractAction_ID: action.ID }));
+                if (actionsToDelete.length > 0) {
+                    const actionIds = actionsToDelete.map((a: any) => a.ID);
+                    await tx.run(DELETE.from('midnight.ContractBalances').where({ contractAction_ID: { in: actionIds } }));
                 }
 
-                for (const txRec of txsToDelete) {
-                    await tx.run(DELETE.from('midnight.ContractActions').where({ transaction_ID: txRec.ID }));
-                    await tx.run(DELETE.from('midnight.UnshieldedUtxos').where({ createdAtTransaction_ID: txRec.ID }));
-                    await tx.run(DELETE.from('midnight.ZswapLedgerEvents').where({ transaction_ID: txRec.ID }));
-                    await tx.run(DELETE.from('midnight.DustLedgerEvents').where({ transaction_ID: txRec.ID }));
-                    await tx.run(DELETE.from('midnight.TransactionFees').where({ transaction_ID: txRec.ID }));
+                // Batch delete all tx-child tables
+                await tx.run(DELETE.from('midnight.ContractActions').where({ transaction_ID: { in: txIds } }));
+                await tx.run(DELETE.from('midnight.UnshieldedUtxos').where({ createdAtTransaction_ID: { in: txIds } }));
+                await tx.run(DELETE.from('midnight.ZswapLedgerEvents').where({ transaction_ID: { in: txIds } }));
+                await tx.run(DELETE.from('midnight.DustLedgerEvents').where({ transaction_ID: { in: txIds } }));
+                await tx.run(DELETE.from('midnight.TransactionFees').where({ transaction_ID: { in: txIds } }));
 
-                    const results: any[] = await tx.run(
-                        SELECT.from('midnight.TransactionResults').columns('ID').where({ transaction_ID: txRec.ID })
-                    ) || [];
-                    for (const result of results) {
-                        await tx.run(DELETE.from('midnight.TransactionSegments').where({ transactionResult_ID: result.ID }));
-                    }
-                    await tx.run(DELETE.from('midnight.TransactionResults').where({ transaction_ID: txRec.ID }));
-
-                    await tx.run(
-                        UPDATE.entity('midnight.UnshieldedUtxos')
-                            .set({ spentAtTransaction_ID: null })
-                            .where({ spentAtTransaction_ID: txRec.ID })
-                    );
+                // Batch delete transaction segments via result IDs
+                const resultsToDelete: any[] = await tx.run(
+                    SELECT.from('midnight.TransactionResults').columns('ID').where({ transaction_ID: { in: txIds } })
+                ) || [];
+                if (resultsToDelete.length > 0) {
+                    const resultIds = resultsToDelete.map((r: any) => r.ID);
+                    await tx.run(DELETE.from('midnight.TransactionSegments').where({ transactionResult_ID: { in: resultIds } }));
                 }
+                await tx.run(DELETE.from('midnight.TransactionResults').where({ transaction_ID: { in: txIds } }));
+
+                // Unlink spent UTXOs
+                await tx.run(
+                    UPDATE.entity('midnight.UnshieldedUtxos')
+                        .set({ spentAtTransaction_ID: null })
+                        .where({ spentAtTransaction_ID: { in: txIds } })
+                );
             }
 
-            for (const block of blocksToRollback) {
-                await tx.run(DELETE.from('midnight.Transactions').where({ block_ID: block.ID }));
-            }
-            for (const block of blocksToRollback) {
-                await tx.run(DELETE.from('midnight.Blocks').where({ ID: block.ID }));
-            }
+            // Batch delete transactions and blocks
+            await tx.run(DELETE.from('midnight.Transactions').where({ block_ID: { in: blockIds } }));
+            await tx.run(DELETE.from('midnight.Blocks').where({ ID: { in: blockIds } }));
 
             const forkBlock = await tx.run(
                 SELECT.one.from('midnight.Blocks')
@@ -493,30 +534,6 @@ export class MidnightCrawler {
         }
 
         throw lastError || new Error(`Failed to process block ${height}`);
-    }
-
-    private async ensureSyncState(): Promise<void> {
-        const existing = await this.db.run(
-            SELECT.one.from('midnight.SyncState').where({ ID: 'SINGLETON' })
-        );
-
-        if (!existing) {
-            try {
-                const nightgateConfig = (cds.env as any).requires?.nightgate || {};
-                await this.db.run(INSERT.into('midnight.SyncState').entries({
-                    ID: 'SINGLETON',
-                    networkId: nightgateConfig.network || 'testnet',
-                    lastIndexedHeight: 0,
-                    syncStatus: 'stopped',
-                    nodeUrl: this.config.nodeUrl,
-                    chainHeight: 0,
-                    consecutiveErrors: 0
-                }));
-            } catch (err: any) {
-                // Race condition: another service instance inserted first — safe to ignore
-                if (!err.message?.includes('UNIQUE constraint')) throw err;
-            }
-        }
     }
 
     private async getSyncState(): Promise<any> {

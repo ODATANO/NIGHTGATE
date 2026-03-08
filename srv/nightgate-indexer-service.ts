@@ -5,9 +5,10 @@
  */
 
 import cds, { Request } from '@sap/cds';
-const { SELECT, INSERT } = cds.ql;
+const { SELECT } = cds.ql;
 
 import { ensureNightgateModelLoaded } from './utils/cds-model';
+import { ensureSyncStateSingleton } from './utils/sync-state';
 
 const processStartTime = Date.now();
 const metricPrefix = 'odatano_nightgate';
@@ -21,21 +22,7 @@ export default class NightgateIndexerService extends cds.ApplicationService {
 
         // Ensure SyncState row exists (even before crawler starts)
         try {
-            const existing = await this.db.run(
-                SELECT.one.from('midnight.SyncState').where({ ID: 'SINGLETON' })
-            );
-            if (!existing) {
-                const nightgateConfig = (cds.env as any).requires?.nightgate || {};
-                await this.db.run(INSERT.into('midnight.SyncState').entries({
-                    ID: 'SINGLETON',
-                    networkId: nightgateConfig.network || 'testnet',
-                    lastIndexedHeight: 0,
-                    syncStatus: 'stopped',
-                    nodeUrl: nightgateConfig.nodeUrl || '',
-                    chainHeight: 0,
-                    consecutiveErrors: 0
-                }));
-            }
+            await ensureSyncStateSingleton(this.db);
         } catch (err) {
             console.warn('[IndexerService] SyncState init skipped:', (err as Error).message);
         }
@@ -94,10 +81,11 @@ export default class NightgateIndexerService extends cds.ApplicationService {
 
         this.on('getReorgHistory', async (req: Request) => {
             const { limit } = req.data as { limit?: number };
+            const effectiveLimit = Math.min(Math.max(limit || 10, 1), 100);
             return this.db.run(
                 SELECT.from('midnight.ReorgLog')
                     .orderBy('detectedAt desc')
-                    .limit(limit || 10)
+                    .limit(effectiveLimit)
             );
         });
 

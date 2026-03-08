@@ -124,14 +124,13 @@ describe('wallet session handlers', () => {
         expect(insertEntriesSpy).toHaveBeenCalledWith(expect.objectContaining({
             viewingKeyHash: expect.any(String),
             encryptedViewingKey: expect.any(String),
-            sessionToken: 'generated-id',
             isActive: true
         }));
         expect(result).toEqual(expect.objectContaining({
             sessionId: 'generated-id',
-            sessionToken: 'generated-id',
             isActive: true
         }));
+        expect(result.sessionToken).toBeUndefined();
     });
 
     it('connectWallet falls back to the global rate-limit key and default TTL when no config is present', async () => {

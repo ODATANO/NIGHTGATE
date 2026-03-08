@@ -27,15 +27,22 @@ export interface PalletMapping {
 }
 
 /** Default Substrate pallet index → type mapping. Override via cds.requires.nightgate.palletMap */
+/** Valid TxType values matching the schema enum in db/schema.cds */
+const VALID_TX_TYPES = new Set([
+    'night_transfer', 'shielded_transfer', 'contract_deploy', 'contract_call',
+    'contract_update', 'dust_registration', 'dust_generation', 'governance',
+    'system', 'unknown'
+]);
+
 const DEFAULT_PALLET_MAP: Record<number, PalletMapping> = {
     0: { name: 'System', txType: 'system', isSystem: true },
-    1: { name: 'Timestamp', txType: 'timestamp', isSystem: true },
-    2: { name: 'Babe', txType: 'consensus', isSystem: true },
-    3: { name: 'Grandpa', txType: 'consensus', isSystem: true },
-    4: { name: 'Balances', txType: 'transfer' },
-    5: { name: 'Sudo', txType: 'sudo', isSystem: true },
+    1: { name: 'Timestamp', txType: 'system', isSystem: true },
+    2: { name: 'Babe', txType: 'system', isSystem: true },
+    3: { name: 'Grandpa', txType: 'system', isSystem: true },
+    4: { name: 'Balances', txType: 'night_transfer' },
+    5: { name: 'Sudo', txType: 'system', isSystem: true },
     10: { name: 'Contracts', txType: 'contract_call' },
-    // @TODO Midnight-specific pallets — configure actual indices via cds.requires.nightgate.palletMap:
+    // Midnight-specific pallets — configure actual indices via cds.requires.nightgate.palletMap:
     // { "15": { "name": "Zswap", "txType": "shielded_transfer", "isShielded": true } }
     // { "16": { "name": "ContractPallet", "txType": "contract_deploy" } }
 };
@@ -53,7 +60,12 @@ function buildPalletMap(): Map<number, PalletMapping> {
     const configMap = nightgateConfig.palletMap;
     if (configMap && typeof configMap === 'object') {
         for (const [idx, entry] of Object.entries(configMap)) {
-            map.set(Number(idx), entry as PalletMapping);
+            const mapping = entry as PalletMapping;
+            if (!VALID_TX_TYPES.has(mapping.txType)) {
+                console.warn(`[BlockProcessor] palletMap[${idx}] has invalid txType "${mapping.txType}", falling back to "unknown"`);
+                mapping.txType = 'unknown';
+            }
+            map.set(Number(idx), mapping);
         }
     }
 

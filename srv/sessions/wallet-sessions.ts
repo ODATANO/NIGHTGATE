@@ -34,7 +34,6 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
         const encKey = getEncryptionKey();
         const vkHash = hashViewingKey(viewingKey);
         const encryptedVk = encrypt(viewingKey, encKey);
-        const sessionToken = cds.utils.uuid();
 
         const nightgateConfig = (cds.env as any).requires?.nightgate || {};
         const sessionTtlMs = nightgateConfig.sessionTtlMs || 24 * 60 * 60 * 1000;
@@ -45,7 +44,6 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
             sessionId: cds.utils.uuid(),
             viewingKeyHash: vkHash,
             encryptedViewingKey: encryptedVk,
-            sessionToken,
             connectedAt: new Date().toISOString(),
             expiresAt,
             isActive: true
@@ -56,7 +54,6 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
         return {
             ID: session.ID,
             sessionId: session.sessionId,
-            sessionToken,
             connectedAt: session.connectedAt,
             expiresAt: session.expiresAt,
             isActive: true

@@ -120,17 +120,15 @@ describe('MidnightCrawler helper paths', () => {
         }
     });
 
-    it('creates SyncState when it is missing', async () => {
-        const crawler = new MidnightCrawler({} as any, { enabled: true });
+    it('creates SyncState when it is missing (shared utility)', async () => {
+        const { ensureSyncStateSingleton } = require('../../srv/utils/sync-state');
         const db = {
             run: jest.fn()
                 .mockResolvedValueOnce(null)
                 .mockResolvedValueOnce(undefined)
         };
 
-        (crawler as any).db = db;
-
-        await (crawler as any).ensureSyncState();
+        await ensureSyncStateSingleton(db);
 
         expect(db.run).toHaveBeenCalledTimes(2);
         expect(selectWhereSpy).toHaveBeenCalledWith({ ID: 'SINGLETON' });
@@ -143,43 +141,37 @@ describe('MidnightCrawler helper paths', () => {
         }));
     });
 
-    it('does nothing when SyncState already exists', async () => {
-        const crawler = new MidnightCrawler({} as any, { enabled: true });
+    it('does nothing when SyncState already exists (shared utility)', async () => {
+        const { ensureSyncStateSingleton } = require('../../srv/utils/sync-state');
         const db = {
             run: jest.fn().mockResolvedValueOnce({ ID: 'SINGLETON' })
         };
 
-        (crawler as any).db = db;
-
-        await expect((crawler as any).ensureSyncState()).resolves.toBeUndefined();
+        await expect(ensureSyncStateSingleton(db)).resolves.toBeUndefined();
         expect(db.run).toHaveBeenCalledTimes(1);
         expect(insertEntriesSpy).not.toHaveBeenCalled();
     });
 
-    it('ignores unique-constraint races while creating SyncState', async () => {
-        const crawler = new MidnightCrawler({} as any, { enabled: true });
+    it('ignores unique-constraint races while creating SyncState (shared utility)', async () => {
+        const { ensureSyncStateSingleton } = require('../../srv/utils/sync-state');
         const db = {
             run: jest.fn()
                 .mockResolvedValueOnce(null)
                 .mockRejectedValueOnce(new Error('UNIQUE constraint failed'))
         };
 
-        (crawler as any).db = db;
-
-        await expect((crawler as any).ensureSyncState()).resolves.toBeUndefined();
+        await expect(ensureSyncStateSingleton(db)).resolves.toBeUndefined();
     });
 
-    it('rethrows unexpected SyncState insert failures', async () => {
-        const crawler = new MidnightCrawler({} as any, { enabled: true });
+    it('rethrows unexpected SyncState insert failures (shared utility)', async () => {
+        const { ensureSyncStateSingleton } = require('../../srv/utils/sync-state');
         const db = {
             run: jest.fn()
                 .mockResolvedValueOnce(null)
                 .mockRejectedValueOnce(new Error('database unavailable'))
         };
 
-        (crawler as any).db = db;
-
-        await expect((crawler as any).ensureSyncState()).rejects.toThrow('database unavailable');
+        await expect(ensureSyncStateSingleton(db)).rejects.toThrow('database unavailable');
     });
 
     it('records crawler errors without throwing back to the caller', async () => {

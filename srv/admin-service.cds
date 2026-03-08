@@ -4,7 +4,7 @@ using { midnight } from '../db/schema';
  * Admin Service for system management
  */
 @path: '/api/v1/admin'
-// @requires: 'admin'  // Uncomment for production
+@requires: 'admin'
 service NightgateAdminService {
 
     entity WalletSessions as projection on midnight.WalletSessions excluding {

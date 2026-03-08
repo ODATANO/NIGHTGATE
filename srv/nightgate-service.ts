@@ -146,6 +146,7 @@ export default class NightgateService extends cds.ApplicationService {
         this.on('byCardanoAddresses', 'DustGenerationStatus', async (req: Request) => {
             const { addresses } = req.data as { addresses: string[] };
             if (!addresses?.length) return [];
+            if (addresses.length > 100) return req.reject(400, 'Maximum 100 addresses per request');
             return this.db.run(
                 cds.ql.SELECT.from('midnight.DustGenerationStatus')
                     .where({ cardanoRewardAddress: { in: addresses } })
@@ -196,7 +197,8 @@ export default class NightgateService extends cds.ApplicationService {
         this.before(['CREATE', 'UPDATE', 'DELETE'], [
             'Blocks', 'Transactions', 'ContractActions', 'UnshieldedUtxos',
             'ZswapLedgerEvents', 'DustLedgerEvents', 'SystemParameters',
-            'DParameterHistory', 'TermsAndConditionsHistory', 'DustGenerationStatus'
+            'DParameterHistory', 'TermsAndConditionsHistory', 'DustGenerationStatus',
+            'NightBalances', 'DustRegistrations', 'TokenTypes', 'WalletSessions'
         ], (req: Request) => {
             req.reject?.(405, 'Blockchain data is read-only');
         });
