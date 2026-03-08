@@ -1,69 +1,147 @@
 /**
  * Minimal SCALE codec helpers for Substrate extrinsic parsing.
  *
- * Only implements what's needed to extract pallet_index + call_index
- * from hex-encoded extrinsics. No external dependencies.
+ * Includes:
+ * - compact integer decoding
+ * - pallet/call extraction
+ * - signed participant extraction (sender/receiver/amount for transfer-like calls)
  */
 
+interface ParsedAddress {
+    address: string;
+    nextOffset: number;
+}
+
+interface ParsedExtrinsicCore {
+    buf: Buffer;
+    isSigned: boolean;
+    palletIndex: number;
+    callIndex: number;
+    argsOffset: number;
+    senderAddress?: string;
+}
+
+export interface ExtrinsicParticipantInfo {
+    isSigned: boolean;
+    palletIndex: number;
+    callIndex: number;
+    senderAddress?: string;
+    receiverAddress?: string;
+    amount?: string;
+}
+
 /**
- * Decode a SCALE compact-encoded unsigned integer.
+ * Decode a SCALE compact-encoded unsigned integer as bigint.
  * Returns [value, bytesConsumed] or null if buffer too short.
- *
- * Compact encoding modes (2 LSBs of first byte):
- *   0b00 → single-byte mode:  value = byte >> 2          (0..63)
- *   0b01 → two-byte mode:     value = u16 >> 2           (64..16383)
- *   0b10 → four-byte mode:    value = u32 >> 2           (16384..2^30-1)
- *   0b11 → big-integer mode:  upper 6 bits = extra bytes (not supported here)
  */
-export function decodeCompact(buf: Buffer, offset: number): [number, number] | null {
+export function decodeCompactBigInt(buf: Buffer, offset: number): [bigint, number] | null {
     if (offset >= buf.length) return null;
 
     const mode = (buf[offset] & 0x03) as 0 | 1 | 2 | 3;
 
     switch (mode) {
         case 0b00:
-            return [buf[offset] >> 2, 1];
+            return [BigInt(buf[offset] >> 2), 1];
 
         case 0b01:
             if (offset + 1 >= buf.length) return null;
-            return [buf.readUInt16LE(offset) >> 2, 2];
+            return [BigInt(buf.readUInt16LE(offset) >> 2), 2];
 
         case 0b10:
             if (offset + 3 >= buf.length) return null;
-            return [buf.readUInt32LE(offset) >> 2, 4];
+            return [BigInt(buf.readUInt32LE(offset) >> 2), 4];
 
-        case 0b11:
-            // Big-integer mode: (byte >> 2) + 4 = number of following bytes
-            // We don't need to decode the actual value, just skip it
-            const extraBytes = (buf[offset] >> 2) + 4;
-            if (offset + extraBytes >= buf.length) return null;
-            return [0, 1 + extraBytes]; // value=0 (we only need to skip)
+        case 0b11: {
+            // Big-integer mode: (first_byte >> 2) + 4 bytes, little-endian
+            const byteLength = (buf[offset] >> 2) + 4;
+            if (offset + 1 + byteLength > buf.length) return null;
+
+            let value = 0n;
+            for (let i = 0; i < byteLength; i++) {
+                value += BigInt(buf[offset + 1 + i]) << (8n * BigInt(i));
+            }
+
+            return [value, 1 + byteLength];
+        }
     }
 }
 
 /**
- * Parse a hex-encoded Substrate extrinsic to extract pallet_index and call_index.
- *
- * Extrinsic structure:
- *   [compact_length][version_byte][...payload...]
- *
- * Version byte:
- *   bit 7 = signed flag (0x84 = signed v4, 0x04 = unsigned v4)
- *
- * Unsigned payload:
- *   [pallet_index: u8][call_index: u8][args...]
- *
- * Signed payload:
- *   [address_type: u8][account_id: 32B][sig_type: u8][signature: 64B]
- *   [era: 1-2B][nonce: compact][tip: compact]
- *   [pallet_index: u8][call_index: u8][args...]
- *
- * Returns null on parse failure (safe fallback to existing heuristics).
+ * Compatibility wrapper for existing callers that expect number values.
+ * Values above Number.MAX_SAFE_INTEGER are returned as 0 while preserving bytesConsumed.
  */
-export function parseExtrinsicCallIndices(hex: string): { palletIndex: number; callIndex: number } | null {
+export function decodeCompact(buf: Buffer, offset: number): [number, number] | null {
+    const decoded = decodeCompactBigInt(buf, offset);
+    if (!decoded) return null;
+
+    const [value, consumed] = decoded;
+    if (value > BigInt(Number.MAX_SAFE_INTEGER)) {
+        return [0, consumed];
+    }
+
+    return [Number(value), consumed];
+}
+
+function parseAddress(buf: Buffer, offset: number): ParsedAddress | null {
+    if (offset >= buf.length) return null;
+
+    const type = buf[offset];
+    let cursor = offset + 1;
+
+    // MultiAddress::Id and runtime-specific 0xff 32-byte address variant
+    if (type === 0x00 || type === 0xff || type === 0x03) {
+        if (cursor + 32 > buf.length) return null;
+        const bytes = buf.slice(cursor, cursor + 32);
+        return {
+            address: `0x${bytes.toString('hex')}`,
+            nextOffset: cursor + 32
+        };
+    }
+
+    // MultiAddress::Address20
+    if (type === 0x04) {
+        if (cursor + 20 > buf.length) return null;
+        const bytes = buf.slice(cursor, cursor + 20);
+        return {
+            address: `0x${bytes.toString('hex')}`,
+            nextOffset: cursor + 20
+        };
+    }
+
+    // MultiAddress::Index
+    if (type === 0x01) {
+        const index = decodeCompactBigInt(buf, cursor);
+        if (!index) return null;
+
+        return {
+            address: `index:${index[0].toString()}`,
+            nextOffset: cursor + index[1]
+        };
+    }
+
+    // MultiAddress::Raw(Vec<u8>)
+    if (type === 0x02) {
+        const len = decodeCompactBigInt(buf, cursor);
+        if (!len) return null;
+
+        if (len[0] > BigInt(Number.MAX_SAFE_INTEGER)) return null;
+        const byteLength = Number(len[0]);
+        cursor += len[1];
+
+        if (cursor + byteLength > buf.length) return null;
+        const bytes = buf.slice(cursor, cursor + byteLength);
+        return {
+            address: `0x${bytes.toString('hex')}`,
+            nextOffset: cursor + byteLength
+        };
+    }
+
+    return null;
+}
+
+function parseExtrinsicCore(hex: string): ParsedExtrinsicCore | null {
     if (!hex || hex.length < 8) return null;
 
-    // Remove 0x prefix if present
     const cleanHex = hex.startsWith('0x') ? hex.slice(2) : hex;
     if (cleanHex.length < 8) return null;
 
@@ -76,68 +154,102 @@ export function parseExtrinsicCallIndices(hex: string): { palletIndex: number; c
 
     if (buf.length < 4) return null;
 
-    // 1. Skip compact-encoded length prefix
     const lenResult = decodeCompact(buf, 0);
     if (!lenResult) return null;
+
     let offset = lenResult[1];
 
-    // 2. Read version byte
     if (offset >= buf.length) return null;
     const version = buf[offset];
     offset++;
 
     const isSigned = (version & 0x80) !== 0;
+    let senderAddress: string | undefined;
 
-    if (!isSigned) {
-        // Unsigned extrinsic: next 2 bytes are pallet_index + call_index
-        if (offset + 1 >= buf.length) return null;
-        return { palletIndex: buf[offset], callIndex: buf[offset + 1] };
+    if (isSigned) {
+        const signer = parseAddress(buf, offset);
+        if (!signer) return null;
+        senderAddress = signer.address;
+        offset = signer.nextOffset;
+
+        if (offset >= buf.length) return null;
+        const sigType = buf[offset];
+        offset++;
+        if (sigType !== 0x00 && sigType !== 0x01 && sigType !== 0x02) return null;
+
+        if (offset + 64 > buf.length) return null;
+        offset += 64;
+
+        if (offset >= buf.length) return null;
+        if (buf[offset] === 0x00) {
+            offset += 1;
+        } else {
+            if (offset + 1 >= buf.length) return null;
+            offset += 2;
+        }
+
+        const nonce = decodeCompact(buf, offset);
+        if (!nonce) return null;
+        offset += nonce[1];
+
+        const tip = decodeCompact(buf, offset);
+        if (!tip) return null;
+        offset += tip[1];
     }
 
-    // Signed extrinsic: skip signature fields to reach call data
-
-    // Skip address (MultiAddress::Id = 0x00 + 32 bytes AccountId)
-    if (offset >= buf.length) return null;
-    const addrType = buf[offset];
-    offset++;
-    if (addrType === 0x00) {
-        offset += 32; // AccountId32
-    } else if (addrType === 0xff) {
-        offset += 32; // Also 32-byte address in some runtimes
-    } else {
-        // Unknown address type — can't reliably skip
-        return null;
-    }
-
-    // Skip signature (MultiSignature: type byte + 64 bytes)
-    if (offset >= buf.length) return null;
-    const sigType = buf[offset];
-    offset++;
-    if (sigType === 0x00 || sigType === 0x01 || sigType === 0x02) {
-        offset += 64; // Ed25519, Sr25519, or Ecdsa (all 64 bytes)
-    } else {
-        return null;
-    }
-
-    // Skip era (Immortal = 1 byte 0x00, Mortal = 2 bytes)
-    if (offset >= buf.length) return null;
-    if (buf[offset] === 0x00) {
-        offset += 1; // Immortal
-    } else {
-        offset += 2; // Mortal era (2 bytes)
-    }
-
-    // Skip nonce (compact-encoded)
-    const nonceResult = decodeCompact(buf, offset);
-    if (!nonceResult) return null;
-    offset += nonceResult[1];
-
-    // Skip tip (compact-encoded)
-    const tipResult = decodeCompact(buf, offset);
-    if (!tipResult) return null;
-    offset += tipResult[1];
-
-    // Now we should be at pallet_index + call_index
     if (offset + 1 >= buf.length) return null;
-    return { palletIndex: buf[offset], callIndex: buf[offset + 1] };
+
+    return {
+        buf,
+        isSigned,
+        palletIndex: buf[offset],
+        callIndex: buf[offset + 1],
+        argsOffset: offset + 2,
+        senderAddress
+    };
+}
+
+/**
+ * Parse a hex-encoded Substrate extrinsic to extract pallet_index and call_index.
+ * Returns null on parse failure (safe fallback to existing heuristics).
+ */
+export function parseExtrinsicCallIndices(hex: string): { palletIndex: number; callIndex: number } | null {
+    const core = parseExtrinsicCore(hex);
+    if (!core) return null;
+    return {
+        palletIndex: core.palletIndex,
+        callIndex: core.callIndex
+    };
+}
+
+/**
+ * Extract signed sender + first transfer-style destination/amount, if present.
+ *
+ * This parser is intentionally conservative: receiver/amount are set only when
+ * the first call args decode as MultiAddress + Compact<Balance>.
+ */
+export function parseExtrinsicParticipantInfo(hex: string): ExtrinsicParticipantInfo | null {
+    const core = parseExtrinsicCore(hex);
+    if (!core) return null;
+
+    const result: ExtrinsicParticipantInfo = {
+        isSigned: core.isSigned,
+        palletIndex: core.palletIndex,
+        callIndex: core.callIndex,
+        senderAddress: core.senderAddress
+    };
+
+    const destination = parseAddress(core.buf, core.argsOffset);
+    if (!destination) {
+        return result;
+    }
+
+    const amount = decodeCompactBigInt(core.buf, destination.nextOffset);
+    if (!amount) {
+        return result;
+    }
+
+    result.receiverAddress = destination.address;
+    result.amount = amount[0].toString();
+    return result;
 }

@@ -20,7 +20,7 @@ import { blake2b } from '@noble/hashes/blake2b';
 import { bytesToHex } from '@noble/hashes/utils';
 import { MidnightNodeProvider, SignedBlock, BlockHeader } from '../providers/MidnightNodeProvider';
 import { ensureNightgateModelLoaded } from '../utils/cds-model';
-import { parseExtrinsicCallIndices } from '../utils/scale';
+import { parseExtrinsicCallIndices, parseExtrinsicParticipantInfo } from '../utils/scale';
 
 /**
  * Mapping of pallet index to human-readable name and transaction type.
@@ -54,6 +54,8 @@ const DEFAULT_PALLET_MAP: Record<number, PalletMapping> = {
     // { "15": { "name": "Zswap", "txType": "shielded_transfer", "isShielded": true } }
     // { "16": { "name": "ContractPallet", "txType": "contract_deploy" } }
 };
+
+const NIGHT_TOKEN_TYPE_HEX = '0x4e49474854';
 
 function buildPalletMap(): Map<number, PalletMapping> {
     const map = new Map<number, PalletMapping>();
@@ -199,11 +201,16 @@ export class BlockProcessor {
                 const extrinsicHex = extrinsics[i];
                 const txId = cds.utils.uuid();
                 const classification = this.classifyExtrinsic(extrinsicHex);
+                const participants = parseExtrinsicParticipantInfo(extrinsicHex);
                 const extrinsicHash = this.hashExtrinsic(extrinsicHex);
                 const txSize = this.extrinsicSize(extrinsicHex);
                 const circuitName = this.buildCircuitName(classification);
                 const contractActionType = this.toContractActionType(classification.txType);
                 const contractAddress = contractActionType ? this.deriveContractAddress(extrinsicHash) : null;
+                const senderAddress = participants?.senderAddress || null;
+                const isTransferLike = !!participants?.receiverAddress && !!participants?.amount && !classification.isSystem;
+                const receiverAddress = isTransferLike ? participants!.receiverAddress! : null;
+                const nightAmount = isTransferLike ? participants!.amount! : null;
 
                 await tx.run(INSERT.into('midnight.Transactions').entries({
                     ID: txId,
@@ -214,6 +221,9 @@ export class BlockProcessor {
                     transactionType: classification.isSystem ? 'SYSTEM' : 'REGULAR',
                     txType: classification.txType,
                     isShielded: classification.isShielded,
+                    senderAddress,
+                    receiverAddress,
+                    nightAmount,
                     hasProof: classification.isShielded,
                     proofHash: classification.isShielded ? extrinsicHash : null,
                     contractAddress,
@@ -235,6 +245,19 @@ export class BlockProcessor {
                     estimatedFees: '0',
                     transaction_ID: txId
                 }));
+
+                if (isTransferLike && receiverAddress && nightAmount) {
+                    await this.persistTransferProjections(tx, {
+                        txId,
+                        txHash: extrinsicHash,
+                        blockHeight: height,
+                        blockTimestamp: timestamp,
+                        senderAddress,
+                        receiverAddress,
+                        amount: nightAmount,
+                        outputIndex: i
+                    });
+                }
 
                 txCount++;
 
@@ -347,6 +370,154 @@ export class BlockProcessor {
             isShielded: entry.isShielded || false,
             isSystem: entry.isSystem || false
         };
+    }
+
+    private async persistTransferProjections(tx: any, params: {
+        txId: string;
+        txHash: string;
+        blockHeight: number;
+        blockTimestamp: number;
+        senderAddress: string | null;
+        receiverAddress: string;
+        amount: string;
+        outputIndex: number;
+    }): Promise<void> {
+        const amount = this.toBigInt(params.amount);
+        if (amount <= 0n) return;
+
+        await tx.run(INSERT.into('midnight.UnshieldedUtxos').entries({
+            ID: cds.utils.uuid(),
+            owner: params.receiverAddress,
+            tokenType: NIGHT_TOKEN_TYPE_HEX,
+            value: amount.toString(),
+            intentHash: params.txHash,
+            outputIndex: params.outputIndex,
+            ctime: params.blockTimestamp,
+            initialNonce: params.txHash,
+            registeredForDustGeneration: false,
+            createdAtTransaction_ID: params.txId
+        }));
+
+        await this.upsertNightBalance(tx, {
+            address: params.receiverAddress,
+            blockHeight: params.blockHeight,
+            balanceDelta: amount,
+            utxoCountDelta: 1,
+            txSentDelta: 0,
+            txReceivedDelta: 1,
+            sentAmountDelta: 0n,
+            receivedAmountDelta: amount
+        });
+
+        if (params.senderAddress && params.senderAddress !== params.receiverAddress) {
+            await this.upsertNightBalance(tx, {
+                address: params.senderAddress,
+                blockHeight: params.blockHeight,
+                balanceDelta: 0n,
+                utxoCountDelta: 0,
+                txSentDelta: 1,
+                txReceivedDelta: 0,
+                sentAmountDelta: amount,
+                receivedAmountDelta: 0n
+            });
+        }
+    }
+
+    private async upsertNightBalance(tx: any, params: {
+        address: string;
+        blockHeight: number;
+        balanceDelta: bigint;
+        utxoCountDelta: number;
+        txSentDelta: number;
+        txReceivedDelta: number;
+        sentAmountDelta: bigint;
+        receivedAmountDelta: bigint;
+    }): Promise<void> {
+        const nowIso = new Date().toISOString();
+        const existing = await tx.run(
+            SELECT.one
+                .from('midnight.NightBalances')
+                .columns(
+                    'address',
+                    'balance',
+                    'utxoCount',
+                    'txSentCount',
+                    'txReceivedCount',
+                    'totalSent',
+                    'totalReceived'
+                )
+                .where({ address: params.address })
+        );
+
+        if (!existing) {
+            const initialBalance = params.balanceDelta < 0n ? 0n : params.balanceDelta;
+            await tx.run(INSERT.into('midnight.NightBalances').entries({
+                address: params.address,
+                balance: initialBalance.toString(),
+                utxoCount: Math.max(params.utxoCountDelta, 0),
+                firstSeenHeight: params.blockHeight,
+                firstSeenAt: nowIso,
+                lastActivityHeight: params.blockHeight,
+                lastActivityAt: nowIso,
+                txSentCount: Math.max(params.txSentDelta, 0),
+                txReceivedCount: Math.max(params.txReceivedDelta, 0),
+                totalSent: params.sentAmountDelta.toString(),
+                totalReceived: params.receivedAmountDelta.toString(),
+                lastUpdatedHeight: params.blockHeight,
+                lastUpdatedAt: nowIso
+            }));
+            return;
+        }
+
+        const currentBalance = this.toBigInt(existing.balance);
+        const nextBalanceRaw = currentBalance + params.balanceDelta;
+        const nextBalance = nextBalanceRaw < 0n ? 0n : nextBalanceRaw;
+
+        const currentUtxoCount = this.toInt(existing.utxoCount);
+        const nextUtxoCount = Math.max(currentUtxoCount + params.utxoCountDelta, 0);
+
+        const currentSentCount = this.toInt(existing.txSentCount);
+        const currentReceivedCount = this.toInt(existing.txReceivedCount);
+
+        const currentTotalSent = this.toBigInt(existing.totalSent);
+        const currentTotalReceived = this.toBigInt(existing.totalReceived);
+
+        await tx.run(
+            UPDATE.entity('midnight.NightBalances').set({
+                balance: nextBalance.toString(),
+                utxoCount: nextUtxoCount,
+                txSentCount: currentSentCount + params.txSentDelta,
+                txReceivedCount: currentReceivedCount + params.txReceivedDelta,
+                totalSent: (currentTotalSent + params.sentAmountDelta).toString(),
+                totalReceived: (currentTotalReceived + params.receivedAmountDelta).toString(),
+                lastActivityHeight: params.blockHeight,
+                lastActivityAt: nowIso,
+                lastUpdatedHeight: params.blockHeight,
+                lastUpdatedAt: nowIso
+            }).where({ address: params.address })
+        );
+    }
+
+    private toBigInt(value: unknown): bigint {
+        if (typeof value === 'bigint') return value;
+        if (typeof value === 'number' && Number.isFinite(value)) return BigInt(Math.trunc(value));
+        if (typeof value === 'string' && value.trim() !== '') {
+            try {
+                return BigInt(value);
+            } catch {
+                return 0n;
+            }
+        }
+        return 0n;
+    }
+
+    private toInt(value: unknown): number {
+        if (typeof value === 'number' && Number.isFinite(value)) return Math.trunc(value);
+        if (typeof value === 'string' && value.trim() !== '') {
+            const parsed = Number(value);
+            if (Number.isFinite(parsed)) return Math.trunc(parsed);
+        }
+        return 0;
     }
 
     /**

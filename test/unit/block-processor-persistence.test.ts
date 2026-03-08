@@ -69,6 +69,37 @@ function buildUnsignedExtrinsic(palletIndex: number, callIndex: number): string 
     return '0x' + Buffer.from([0x0c, 0x04, palletIndex, callIndex]).toString('hex');
 }
 
+function encodeCompact(value: number): number[] {
+    if (value <= 63) {
+        return [value << 2];
+    }
+
+    const buf = Buffer.alloc(2);
+    buf.writeUInt16LE((value << 2) | 0x01, 0);
+    return [...buf];
+}
+
+function buildSignedTransferExtrinsic(senderByte: number, receiverByte: number, amount: number): string {
+    const payload: number[] = [
+        0x84, // signed v4
+        0x00, // signer address type: AccountId32
+        ...Array(32).fill(senderByte),
+        0x01, // signature type: Sr25519
+        ...Array(64).fill(0xbb),
+        0x00, // immortal era
+        0x00, // nonce compact(0)
+        0x00, // tip compact(0)
+        0x04, // Balances pallet
+        0x00, // transfer call
+        0x00, // destination address type: AccountId32
+        ...Array(32).fill(receiverByte),
+        ...encodeCompact(amount)
+    ];
+
+    const encodedLength = encodeCompact(payload.length);
+    return `0x${Buffer.from([...encodedLength, ...payload]).toString('hex')}`;
+}
+
 function buildTimestampHex(seconds: number): string {
     const buf = Buffer.alloc(8);
     buf.writeBigUInt64LE(BigInt(seconds) * 1000n);
@@ -324,5 +355,98 @@ describe('BlockProcessor persistence paths', () => {
             warnSpy.mockRestore();
             nowSpy.mockRestore();
         }
+    });
+
+    it('projects signed night transfers into addresses, UTXOs, and NightBalances', async () => {
+        const transferExtrinsic = buildSignedTransferExtrinsic(0x11, 0x22, 100);
+        const provider = {
+            getBlock: jest.fn().mockResolvedValue({
+                block: {
+                    header: {
+                        parentHash: '0xparent-3',
+                        number: '0x09',
+                        stateRoot: '0xstate-3',
+                        digest: { logs: [] }
+                    },
+                    extrinsics: [transferExtrinsic]
+                },
+                justifications: null
+            }),
+            getRuntimeVersion: jest.fn().mockResolvedValue({ specVersion: 88 }),
+            getStorage: jest.fn().mockResolvedValue(buildTimestampHex(1_700_100_000))
+        };
+
+        const tx = {
+            run: jest.fn(async (query: any) => {
+                if (query?.kind === 'selectOne' && query.entity === 'midnight.Blocks' && query.where?.hash === '0xparent-3') {
+                    return { ID: 'parent-3' };
+                }
+
+                return null;
+            })
+        };
+
+        const db = {
+            run: jest.fn().mockResolvedValue(null),
+            tx: jest.fn(async (callback: (transaction: any) => Promise<void>) => callback(tx))
+        };
+
+        let uuidIndex = 0;
+        uuidSpy.mockImplementation(() => {
+            uuidIndex += 1;
+            return `uuid-${uuidIndex}`;
+        });
+
+        const processor = new BlockProcessor(provider as any);
+        (processor as any).db = db;
+
+        await expect(processor.processBlockByHash('0xtransfer')).resolves.toEqual(expect.objectContaining({
+            blockHeight: 9,
+            transactionCount: 1,
+            contractActionCount: 0
+        }));
+
+        const txQueries = tx.run.mock.calls.map(([query]) => query);
+        const txInsert = txQueries.find((query) => query?.kind === 'insert' && query.entity === 'midnight.Transactions');
+        const utxoInsert = txQueries.find((query) => query?.kind === 'insert' && query.entity === 'midnight.UnshieldedUtxos');
+        const nightBalanceInserts = txQueries.filter((query) => query?.kind === 'insert' && query.entity === 'midnight.NightBalances');
+
+        expect(txInsert?.entry).toEqual(expect.objectContaining({
+            txType: 'night_transfer',
+            senderAddress: `0x${'11'.repeat(32)}`,
+            receiverAddress: `0x${'22'.repeat(32)}`,
+            nightAmount: '100'
+        }));
+
+        expect(utxoInsert?.entry).toEqual(expect.objectContaining({
+            owner: `0x${'22'.repeat(32)}`,
+            tokenType: '0x4e49474854',
+            value: '100',
+            intentHash: expect.stringMatching(/^0x[0-9a-f]{64}$/),
+            outputIndex: 0,
+            ctime: 1_700_100_000,
+            createdAtTransaction_ID: txInsert?.entry?.ID
+        }));
+
+        expect(nightBalanceInserts).toHaveLength(2);
+
+        const receiverBalance = nightBalanceInserts.find((query) => query.entry.address === `0x${'22'.repeat(32)}`);
+        expect(receiverBalance?.entry).toEqual(expect.objectContaining({
+            balance: '100',
+            utxoCount: 1,
+            txReceivedCount: 1,
+            totalReceived: '100',
+            txSentCount: 0,
+            totalSent: '0'
+        }));
+
+        const senderBalance = nightBalanceInserts.find((query) => query.entry.address === `0x${'11'.repeat(32)}`);
+        expect(senderBalance?.entry).toEqual(expect.objectContaining({
+            balance: '0',
+            txSentCount: 1,
+            totalSent: '100',
+            txReceivedCount: 0,
+            totalReceived: '0'
+        }));
     });
 });

@@ -4,7 +4,12 @@
  * Tests for decodeCompact() and parseExtrinsicCallIndices() from srv/utils/scale.ts.
  */
 
-import { decodeCompact, parseExtrinsicCallIndices } from '../../srv/utils/scale';
+import {
+    decodeCompact,
+    decodeCompactBigInt,
+    parseExtrinsicCallIndices,
+    parseExtrinsicParticipantInfo
+} from '../../srv/utils/scale';
 
 describe('decodeCompact', () => {
     it('should decode single-byte mode (0b00)', () => {
@@ -81,6 +86,20 @@ describe('decodeCompact', () => {
     it('should return null for truncated big-integer mode', () => {
         const buf = Buffer.from([0x03, 0x00, 0x00, 0x00]);
         expect(decodeCompact(buf, 0)).toBeNull();
+    });
+});
+
+describe('decodeCompactBigInt', () => {
+    it('should decode big-integer mode values', () => {
+        // 2^40 = 0x010000000000 (6 LE bytes)
+        // Mode byte for 6 bytes: ((6-4) << 2) | 0b11 = 0x0b
+        const buf = Buffer.from([0x0b, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01]);
+        expect(decodeCompactBigInt(buf, 0)).toEqual([1099511627776n, 7]);
+    });
+
+    it('should return null for truncated big-integer mode payloads', () => {
+        const buf = Buffer.from([0x0b, 0x00, 0x00, 0x00]);
+        expect(decodeCompactBigInt(buf, 0)).toBeNull();
     });
 });
 
@@ -354,5 +373,48 @@ describe('parseExtrinsicCallIndices', () => {
         });
 
         expect(parseExtrinsicCallIndices(hex)).toBeNull();
+    });
+
+    it('should parse sender + receiver + amount from signed transfer-like calls', () => {
+        const receiver = Array(32).fill(0x22);
+        const amount100 = [0x91, 0x01]; // compact(100)
+
+        const hex = buildSignedExtrinsicParts({
+            addressType: 0x00,
+            signatureType: 0x01,
+            eraBytes: [0x00],
+            nonceBytes: [0x00],
+            tipBytes: [0x00],
+            callBytes: [0x04, 0x00, 0x00, ...receiver, ...amount100]
+        });
+
+        expect(parseExtrinsicParticipantInfo(hex)).toEqual(expect.objectContaining({
+            isSigned: true,
+            palletIndex: 4,
+            callIndex: 0,
+            senderAddress: `0x${'aa'.repeat(32)}`,
+            receiverAddress: `0x${'22'.repeat(32)}`,
+            amount: '100'
+        }));
+    });
+
+    it('should return sender metadata even when receiver/amount args are absent', () => {
+        const hex = buildSignedExtrinsic(10, 1);
+        expect(parseExtrinsicParticipantInfo(hex)).toEqual(expect.objectContaining({
+            isSigned: true,
+            palletIndex: 10,
+            callIndex: 1,
+            senderAddress: `0x${'aa'.repeat(32)}`
+        }));
+    });
+
+    it('should parse unsigned call metadata without sender', () => {
+        const hex = buildUnsignedExtrinsic(4, 0);
+        expect(parseExtrinsicParticipantInfo(hex)).toEqual({
+            isSigned: false,
+            palletIndex: 4,
+            callIndex: 0,
+            senderAddress: undefined
+        });
     });
 });
