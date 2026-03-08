@@ -220,7 +220,7 @@ The admin projection excludes `encryptedViewingKey` from the OData response surf
 
 ## Current Capability Matrix
 
-| Area | Status | What works now | Boundaries in `0.1.0` |
+| Area | Status | What works now | Boundaries in `0.1.1` |
 |---|---|---|---|
 | CAP plugin integration | Ready | Registers models from `db/` and `srv/`, wires bootstrap middleware, starts on CAP `served`, stops on CAP `shutdown` | Configure only through `cds.requires.nightgate` |
 | Node connectivity | Ready | Connects to Midnight nodes over `ws://` or `wss://`, validates runtime config, warns on bad URLs | No separate multi-node failover layer yet |

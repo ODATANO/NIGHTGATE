@@ -1,6 +1,6 @@
 # Quickstart
 
-This guide gets `@odatano/nightgate` from zero to first successful API call with the current `0.1.0` feature set.
+This guide gets `@odatano/nightgate` from zero to first successful API call with the current `0.1.1` feature set.
 
 It covers both supported entry points:
 
@@ -179,7 +179,7 @@ Meaning of the main knobs:
 
 ## What You Can Use Immediately
 
-After startup, these are the most useful entry points in `0.1.0`:
+After startup, these are the most useful entry points in `0.1.1`:
 
 - blockchain reads through `/api/v1/nightgate`
 - sync, health, readiness, liveness, metrics, and reorg history through `/api/v1/indexer`

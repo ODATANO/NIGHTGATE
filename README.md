@@ -46,7 +46,7 @@ NightgateService / NightgateIndexerService / Analytics / Admin
 | Wallet sessions | `connectWallet` / `disconnectWallet` with encrypted viewing-key storage |
 | Offline mode | CAP app starts even if the node is unreachable |
 
-Version `0.1.0` is a read-side first release. Transaction build/sign/submit flows are not yet included.
+Version `0.1.1` is a read-side first release. Transaction build/sign/submit flows are not yet included.
 
 ## Quick Start
 
