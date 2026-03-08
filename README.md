@@ -118,6 +118,7 @@ curl "http://localhost:4004/api/v1/indexer/getMetrics()"
 npm run dev         # Start with auto-reload
 npm run lint        # ESLint
 npm run typecheck   # TypeScript check
+npm run cds:types   # Regenerate @cds-models
 npm test            # Full test suite with coverage
 ```
 

@@ -269,6 +269,23 @@ describe('MidnightCrawler orchestration', () => {
         expect(mockDbRun).not.toHaveBeenCalled();
     });
 
+    it('always clears catch-up mode when finalized head lookup throws', async () => {
+        const provider = {
+            getFinalizedHead: jest.fn().mockRejectedValue(new Error('rpc down')),
+            getHeader: jest.fn()
+        };
+        const crawler = new MidnightCrawler(provider as any, { enabled: true });
+        (crawler as any).db = { run: mockDbRun };
+
+        jest.spyOn(crawler as any, 'getSyncState').mockResolvedValue({
+            lastIndexedHeight: 0,
+            lastIndexedHash: null
+        });
+
+        await expect((crawler as any).catchUp()).rejects.toThrow('rpc down');
+        expect((crawler as any).isCatchingUp).toBe(false);
+    });
+
     it('stops catch-up after repeated block-processing errors exceed the circuit breaker threshold', async () => {
         const provider = {
             getFinalizedHead: jest.fn().mockResolvedValue('0x1'),

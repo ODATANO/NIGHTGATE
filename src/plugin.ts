@@ -36,7 +36,7 @@ function registerSecurityHeaders(): void {
 
             res.setHeader('Access-Control-Allow-Origin', corsOrigin);
             res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS');
-            res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, Accept');
+            res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, Accept, X-Correlation-ID');
             res.setHeader('Access-Control-Max-Age', '86400');
 
             res.setHeader('X-Content-Type-Options', 'nosniff');

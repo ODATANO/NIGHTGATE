@@ -72,7 +72,7 @@ interface PendingRequest {
     timeout: ReturnType<typeof setTimeout>;
 }
 
-type SubscriptionCallback = (result: any) => void;
+type SubscriptionCallback = (result: any) => void | Promise<void>;
 
 // ============================================================================
 // Midnight Node Provider
@@ -259,7 +259,18 @@ export class MidnightNodeProvider {
         if (message.method && message.params?.subscription) {
             const callback = this.subscriptions.get(message.params.subscription);
             if (callback) {
-                callback(message.params.result);
+                try {
+                    const callbackResult = callback(message.params.result);
+                    if (callbackResult && typeof callbackResult.then === 'function') {
+                        void callbackResult.catch((err: unknown) => {
+                            const errMsg = err instanceof Error ? err.message : String(err);
+                            console.error('[MidnightNode] Subscription callback failed:', errMsg);
+                        });
+                    }
+                } catch (err) {
+                    const errMsg = err instanceof Error ? err.message : String(err);
+                    console.error('[MidnightNode] Subscription callback failed:', errMsg);
+                }
             }
             return;
         }

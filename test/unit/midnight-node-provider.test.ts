@@ -330,6 +330,31 @@ describe('MidnightNodeProvider core RPC flow', () => {
         }
     });
 
+    it('logs rejected async subscription callbacks without breaking message handling', async () => {
+        const provider = new MidnightNodeProvider({ nodeUrl: 'ws://localhost:9944' });
+        const callback = jest.fn().mockRejectedValue(new Error('callback failed'));
+        const errorSpy = jest.spyOn(console, 'error').mockImplementation();
+
+        try {
+            (provider as any).subscriptions.set('sub-1', callback);
+            (provider as any).handleMessage(JSON.stringify({
+                jsonrpc: '2.0',
+                method: 'chain_finalizedHead',
+                params: {
+                    subscription: 'sub-1',
+                    result: { number: '0x2a' }
+                }
+            }));
+
+            await Promise.resolve();
+
+            expect(callback).toHaveBeenCalledWith({ number: '0x2a' });
+            expect(errorSpy).toHaveBeenCalledWith('[MidnightNode] Subscription callback failed:', 'callback failed');
+        } finally {
+            errorSpy.mockRestore();
+        }
+    });
+
     it('tracks subscriptions and clears connection state on disconnect', async () => {
         const provider = new MidnightNodeProvider({ nodeUrl: 'ws://localhost:9944' });
         const rpcSpy = jest.spyOn(provider, 'rpc')

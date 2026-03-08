@@ -158,80 +158,81 @@ export class MidnightCrawler {
 
     private async catchUp(): Promise<number> {
         this.isCatchingUp = true;
+        try {
+            const syncState = await this.getSyncState();
+            const startHeight = this.getCatchUpStartHeight(syncState);
 
-        const syncState = await this.getSyncState();
-        const startHeight = this.getCatchUpStartHeight(syncState);
+            // Target finalized head (not chain tip) — avoids ingesting soon-reverted blocks
+            const finalizedHash = await this.nodeProvider.getFinalizedHead();
+            const finalizedHeader = await this.nodeProvider.getHeader(finalizedHash);
+            const tipHeight = MidnightNodeProvider.parseBlockNumber(finalizedHeader.number);
 
-        // Target finalized head (not chain tip) — avoids ingesting soon-reverted blocks
-        const finalizedHash = await this.nodeProvider.getFinalizedHead();
-        const finalizedHeader = await this.nodeProvider.getHeader(finalizedHash);
-        const tipHeight = MidnightNodeProvider.parseBlockNumber(finalizedHeader.number);
+            if (startHeight > tipHeight) {
+                console.log(`[Crawler] Already synced to finalized head (height ${tipHeight})`);
+                return 0;
+            }
 
-        if (startHeight > tipHeight) {
-            console.log(`[Crawler] Already synced to finalized head (height ${tipHeight})`);
-            this.isCatchingUp = false;
-            return 0;
-        }
+            const totalBlocks = tipHeight - startHeight + 1;
+            console.log(`[Crawler] Catch-up: ${startHeight} → ${tipHeight} (${totalBlocks} blocks, finalized)`);
 
-        const totalBlocks = tipHeight - startHeight + 1;
-        console.log(`[Crawler] Catch-up: ${startHeight} → ${tipHeight} (${totalBlocks} blocks, finalized)`);
+            await this.db.run(
+                UPDATE.entity('midnight.SyncState').set({
+                    syncStatus: 'syncing',
+                    chainHeight: tipHeight,
+                    lastFinalizedHeight: tipHeight,
+                    lastFinalizedHash: finalizedHash
+                }).where({ ID: 'SINGLETON' })
+            );
 
-        await this.db.run(
-            UPDATE.entity('midnight.SyncState').set({
-                syncStatus: 'syncing',
-                chainHeight: tipHeight,
-                lastFinalizedHeight: tipHeight,
-                lastFinalizedHash: finalizedHash
-            }).where({ ID: 'SINGLETON' })
-        );
+            let processed = 0;
+            const batchStart = Date.now();
 
-        let processed = 0;
-        const batchStart = Date.now();
+            for (let h = startHeight; h <= tipHeight && this.isRunning; h++) {
+                try {
+                    const result = await this.processBlockWithRetry(h);
+                    processed++;
+                    this.blocksProcessed++;
 
-        for (let h = startHeight; h <= tipHeight && this.isRunning; h++) {
-            try {
-                const result = await this.processBlockWithRetry(h);
-                processed++;
-                this.blocksProcessed++;
+                    // Progress logging
+                    if (processed % this.config.batchSize === 0 || h === tipHeight) {
+                        const elapsed = (Date.now() - batchStart) / 1000;
+                        const bps = elapsed > 0 ? processed / elapsed : 0;
+                        const remaining = tipHeight - h;
+                        const eta = bps > 0 ? remaining / bps : 0;
 
-                // Progress logging
-                if (processed % this.config.batchSize === 0 || h === tipHeight) {
-                    const elapsed = (Date.now() - batchStart) / 1000;
-                    const bps = elapsed > 0 ? processed / elapsed : 0;
-                    const remaining = tipHeight - h;
-                    const eta = bps > 0 ? remaining / bps : 0;
+                        console.log(
+                            `[Crawler] Catch-up: ${h}/${tipHeight} ` +
+                            `(${((h - startHeight + 1) / totalBlocks * 100).toFixed(1)}%) ` +
+                            `${bps.toFixed(1)} blocks/s, ETA: ${Math.ceil(eta)}s`
+                        );
 
-                    console.log(
-                        `[Crawler] Catch-up: ${h}/${tipHeight} ` +
-                        `(${((h - startHeight + 1) / totalBlocks * 100).toFixed(1)}%) ` +
-                        `${bps.toFixed(1)} blocks/s, ETA: ${Math.ceil(eta)}s`
-                    );
+                        // Update SyncState with progress
+                        await this.db.run(
+                            UPDATE.entity('midnight.SyncState').set({
+                                syncProgress: ((h - startHeight + 1) / totalBlocks * 100),
+                                blocksPerSecond: bps,
+                                consecutiveErrors: 0
+                            }).where({ ID: 'SINGLETON' })
+                        );
+                    }
+                } catch (err) {
+                    console.error(`[Crawler] Failed to process block ${h} after ${this.config.maxRetries} retries:`, (err as Error).message);
+                    await this.recordError((err as Error).message);
 
-                    // Update SyncState with progress
-                    await this.db.run(
-                        UPDATE.entity('midnight.SyncState').set({
-                            syncProgress: ((h - startHeight + 1) / totalBlocks * 100),
-                            blocksPerSecond: bps,
-                            consecutiveErrors: 0
-                        }).where({ ID: 'SINGLETON' })
-                    );
-                }
-            } catch (err) {
-                console.error(`[Crawler] Failed to process block ${h} after ${this.config.maxRetries} retries:`, (err as Error).message);
-                await this.recordError((err as Error).message);
-
-                // Check if we should continue
-                const state = await this.getSyncState();
-                if ((state?.consecutiveErrors || 0) > 10) {
-                    console.error('[Crawler] Too many consecutive errors, stopping catch-up');
-                    break;
+                    // Check if we should continue
+                    const state = await this.getSyncState();
+                    if ((state?.consecutiveErrors || 0) > 10) {
+                        console.error('[Crawler] Too many consecutive errors, stopping catch-up');
+                        break;
+                    }
                 }
             }
-        }
 
-        this.isCatchingUp = false;
-        console.log(`[Crawler] Catch-up complete: ${processed} blocks in ${((Date.now() - batchStart) / 1000).toFixed(1)}s`);
-        return processed;
+            console.log(`[Crawler] Catch-up complete: ${processed} blocks in ${((Date.now() - batchStart) / 1000).toFixed(1)}s`);
+            return processed;
+        } finally {
+            this.isCatchingUp = false;
+        }
     }
 
     // ========================================================================

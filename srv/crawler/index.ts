@@ -28,7 +28,17 @@ export async function startCrawler(config: CrawlerConfig & { nodeUrl: string; re
     });
 
     const crawler = new MidnightCrawler(nodeProvider, config);
-    await crawler.start();
+    try {
+        await crawler.start();
+    } catch (err) {
+        // Crawler start can fail after the provider connected; ensure no socket leaks.
+        try {
+            await nodeProvider.disconnect();
+        } catch {
+            // Ignore disconnect errors while handling startup failure.
+        }
+        throw err;
+    }
 
     activeCrawler = crawler;
     activeNodeProvider = nodeProvider;

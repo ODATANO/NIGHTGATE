@@ -95,7 +95,7 @@ The bootstrap middleware sets:
 - `X-Correlation-ID`
 - `Access-Control-Allow-Origin`
 - `Access-Control-Allow-Methods`
-- `Access-Control-Allow-Headers`
+- `Access-Control-Allow-Headers` (includes `X-Correlation-ID`)
 - `Access-Control-Max-Age`
 - `X-Content-Type-Options: nosniff`
 - `X-Frame-Options: DENY`
@@ -239,6 +239,7 @@ The admin projection excludes `encryptedViewingKey` from the OData response surf
 | `npm run build` | Build the plugin in place for packaging/runtime verification |
 | `npm start` | Build first, then run the compiled layout |
 | `npm run clean` | Remove generated `.js` and `.d.ts` build artifacts |
+| `npm run cds:types` | Regenerate `@cds-models` |
 | `npm run lint` | Run ESLint |
 | `npm run typecheck` | Run TypeScript without emitting output |
 | `npm test` | Full Jest suite with coverage |
@@ -248,10 +249,10 @@ The admin projection excludes `encryptedViewingKey` from the OData response surf
 
 Verified repository baseline from the latest full run:
 
-- `21` test suites passed
-- `251` tests passed
+- `23` test suites passed
+- `257` tests passed
 - `0` failures
-- coverage: `98.99%` statements, `90.9%` branches, `99.25%` functions, `99.28%` lines
+- coverage: `96.16%` statements, `87.79%` branches, `96.5%` functions, `96.57%` lines
 
 Run the same checks locally:
 

@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased - 2026-03-08
+
+### Reliability And Tooling
+
+- Crawler startup now disconnects provider on startup failure to avoid leaked sockets.
+- Crawler catch-up now guarantees `isCatchingUp` reset via `finally`.
+- MidnightNodeProvider now guards async subscription callback rejections and logs them safely.
+- Security middleware CORS allow-headers now includes `X-Correlation-ID`.
+
+### Latest Validation Baseline
+
+- `23` test suites passed
+- `257` tests passed
+- `0` failures
+- coverage: `96.16%` statements, `87.79%` branches, `96.5%` functions, `96.57%` lines
+
 ## 0.1.0 - 2026-03-06
 
 First public Nightgate package cut.
