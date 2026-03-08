@@ -29,13 +29,26 @@ First public Nightgate package cut.
 - Transaction signing
 - Transaction submission
 - Wallet execution flows beyond session registration/storage
-- Built-in production authorization policy for the exposed CAP services
+- Built-in production authorization policy beyond CDS `@requires` annotations
 
 ### Notes On Surface Area
 
 - The schema and CDS services already expose a broader Midnight data model than the current extractor depth guarantees for every entity family.
 - The strongest operational path in `0.1.0` is: node connectivity -> block ingest -> transaction ingest -> sync state -> health/metrics -> OData read access.
 - Contract, balance, DUST, governance, and other higher-level projections are part of the public surface and will continue to deepen as extractor coverage expands.
+
+### Security Hardening
+
+- CDS service auth annotations enabled: `@requires: 'authenticated-user'` on NightgateService and AnalyticsService, `@requires: 'admin'` on AdminService
+- `ENCRYPTION_KEY` enforced in production (`NODE_ENV=production`) — startup fails without it
+- Read-only guard covers all entities including NightBalances, DustRegistrations, TokenTypes, WalletSessions
+- Rate limiter hardened with periodic sweep, max key cap, and `destroy()` cleanup
+- Crawler: live blocks queued instead of dropped during catch-up; start failure resets running state; reorg uses batched deletes
+- MidnightNodeProvider: reconnect timer cleanup, subscription cleanup on close, NaN block number rejection
+- BlockProcessor: tx-type validation with allow-list
+- Removed unused `sessionToken` field from WalletSessions
+- SyncState initialization extracted to shared `ensureSyncStateSingleton()` utility
+- `getReorgHistory` limit clamped to max 100; `byCardanoAddresses` array capped at 100
 
 ### Verified Baseline At Release Time
 

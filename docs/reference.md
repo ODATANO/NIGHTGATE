@@ -68,8 +68,8 @@ If the service is configured with `kind: "nightgate"` but no `network`, the plug
 
 | Variable | Purpose | Default |
 |---|---|---|
-| `ENCRYPTION_KEY` | AES-256-GCM key material for wallet viewing-key encryption | Process-scoped dev fallback |
-| `NODE_ENV=production` | Enables HSTS response header | Off unless explicitly set |
+| `ENCRYPTION_KEY` | AES-256-GCM key material for wallet viewing-key encryption | Process-scoped dev fallback; **required** in production (`NODE_ENV=production`) — startup fails without it |
+| `NODE_ENV=production` | Enables HSTS response header; enforces `ENCRYPTION_KEY` presence | Off unless explicitly set |
 
 ## Runtime Behavior
 
@@ -224,11 +224,11 @@ The admin projection excludes `encryptedViewingKey` from the OData response surf
 | Local persistence | Ready | Persists blocks, transactions, sync state, reorg state, and related read-side entities via CAP DB APIs | SQLite-first default; host app controls broader DB strategy |
 | Core OData reads | Ready | Blocks, transactions, UTXO reads, balance lookups, governance/system-parameter reads, wallet-session actions | Data quality depends on what the current crawler/parser version extracts into the local DB |
 | Indexer operations API | Ready | `getSyncStatus`, `getHealth`, `getReorgHistory`, `getLiveness`, `getReadiness`, `getMetrics` | Focused on one running indexer instance |
-| Wallet sessions | Ready | Connect/disconnect flows, encrypted viewing-key storage, TTL expiry, cleanup job, admin invalidation | Session auth policy is host-app specific |
+| Wallet sessions | Ready | Connect/disconnect flows, encrypted viewing-key storage, TTL expiry, cleanup job, admin invalidation | Sessions track `sessionId` only; token-based validation is not yet implemented |
 | Analytics | Ready | Block count, transaction count, contract count, average transactions per block, CDS aggregate projections | Analytics are read-side aggregates over indexed local data |
 | Midnight domain surface | Partial | Schema and service surface already include contracts, balances, DUST, governance, registrations, token types | Some entity families are ahead of full extractor/populator depth and will mature incrementally |
 | Write-side blockchain workflows | Not included | None | No transaction build, signing, submission, or wallet execution flow in this release |
-| Built-in authorization model | Not included by default | None enforced out of the box | `@requires` examples are commented; the consuming CAP app should decide auth policy |
+| Built-in authorization model | Ready | `@requires: 'authenticated-user'` on `NightgateService` and `NightgateAnalyticsService`; `@requires: 'admin'` on `NightgateAdminService` | The consuming CAP app must configure its auth strategy (e.g., mock users for dev, JWT/XSUAA for production) |
 
 ## Development Commands
 
@@ -294,10 +294,12 @@ npm test
 │   │   ├── index.ts
 │   │   └── nightgate.ts
 │   └── utils/
+│       ├── cds-model.ts
 │       ├── crypto.ts
 │       ├── rate-limiter.ts
 │       ├── retry.ts
 │       ├── scale.ts
+│       ├── sync-state.ts
 │       └── validation.ts
 ├── test/
 │   └── unit/
