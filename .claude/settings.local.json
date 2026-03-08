@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(gh api repos/ODATANO/ODATANO/contents/.github/workflows --jq '.[].name')",
+      "WebFetch(domain:raw.githubusercontent.com)"
+    ]
+  }
+}
