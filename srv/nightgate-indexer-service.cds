@@ -52,3 +52,15 @@ service NightgateIndexerService {
     // Prometheus-compatible metrics endpoint
     function getMetrics() returns String;
 }
+
+// ============================================================================
+// Service-Level Annotations
+// ============================================================================
+
+annotate NightgateIndexerService.SyncState with @(Capabilities: {
+    InsertRestrictions: {Insertable: false},
+    DeleteRestrictions: {Deletable: false}
+}) {
+    syncStatus        @title: 'Sync Status';
+    lastIndexedHeight @title: 'Last Indexed Height';
+};

@@ -220,3 +220,36 @@ service NightgateService {
         action disconnectWallet(sessionId: UUID);
     };
 }
+
+// ============================================================================
+// Service-Level Annotations
+// ============================================================================
+
+annotate NightgateService.Blocks with {
+    hash   @title: 'Block Hash';
+    height @title: 'Block Height';
+};
+
+annotate NightgateService.Transactions with {
+    hash @title: 'Transaction Hash';
+};
+
+annotate NightgateService.ContractActions with {
+    address @title: 'Contract Address';
+};
+
+annotate NightgateService.DustGenerationStatus with {
+    cardanoRewardAddress @title: 'Cardano Reward Address';
+    nightBalance         @title: 'NIGHT Balance';
+    generationRate       @title: 'Generation Rate';
+};
+
+annotate NightgateService.NightBalances with {
+    address @title: 'Address';
+    balance @title: 'NIGHT Balance';
+};
+
+annotate NightgateService.TokenTypes with {
+    tokenTypeId @title: 'Token Type ID';
+    tokenName   @title: 'Token Name';
+};
