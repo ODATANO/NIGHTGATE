@@ -2,7 +2,13 @@
 
 ## 0.1 - Midnight Indexer
 
-### 0.1.2 - Unreleased
+### 0.1.2 - 2026-03-08
+
+#### Preprod-First Readiness
+- Added first-class Preprod support to the Nightgate runtime and plugin config.
+- Added `NIGHTGATE_NETWORK`, `NIGHTGATE_NODE_URL`, and `NIGHTGATE_CRAWLER_NODE_URL` environment variable overrides for flexible runtime configuration.
+- Switched repository defaults to the hosted Midnight Preprod RPC at `wss://rpc.preprod.midnight.network/` for a smoother out-of-the-box experience.
+- Updated documentation to reflect the Preprod-first workflow and simplified configuration.
 
 #### Simplified Configuration
 
