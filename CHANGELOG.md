@@ -2,6 +2,14 @@
 
 ## 0.1 - Midnight Indexer
 
+### 0.1.2 - Unreleased
+
+#### Preprod Defaults And Runtime Configuration
+
+- The repository default `cds.requires.nightgate` config now points to Midnight Preprod at `wss://rpc.preprod.midnight.network/`.
+- Runtime `NIGHTGATE_*` and `MIDNIGHT_*` environment overrides now cover the network, node URL, and crawler node URL consistently.
+- The docs now treat Preprod as the primary public runtime path and clarify that the bundled Docker Compose file remains local standalone only.
+
 ### 0.1.1 - 2026-03-08
 
 #### Reliability And Tooling

@@ -4,9 +4,13 @@ Detailed configuration, runtime behavior, API surface, and development guide for
 
 ## Configuration
 
-Configure the plugin only under `cds.requires.nightgate`.
+Configure the plugin under `cds.requires.nightgate`. Runtime environment variables can override the network and node URLs.
 
-If the service is configured with `kind: "nightgate"` but no `network`, the plugin stays idle instead of auto-starting the crawler.
+In this repository, the checked-in [../package.json](../package.json) now ships with Preprod defaults. Use environment overrides if you want to point the app back at a local standalone node.
+
+If the service is configured with `kind: "nightgate"` but no `network`, the plugin stays idle instead of auto-starting the crawler unless `NIGHTGATE_NETWORK` or `MIDNIGHT_NETWORK` is set.
+
+The bundled [docker/docker-compose.yml](../docker/docker-compose.yml) is for local standalone development only. For public Preprod, point Nightgate at the hosted RPC endpoint instead of trying to switch the compose preset.
 
 ### Minimal Configuration
 
@@ -16,7 +20,8 @@ If the service is configured with `kind: "nightgate"` but no `network`, the plug
     "requires": {
       "nightgate": {
         "kind": "nightgate",
-        "network": "testnet"
+        "network": "preprod",
+        "nodeUrl": "wss://rpc.preprod.midnight.network/"
       }
     }
   }
@@ -31,13 +36,13 @@ If the service is configured with `kind: "nightgate"` but no `network`, the plug
     "requires": {
       "nightgate": {
         "kind": "nightgate",
-        "network": "testnet",
-        "nodeUrl": "ws://localhost:9944",
+        "network": "preprod",
+        "nodeUrl": "wss://rpc.preprod.midnight.network/",
         "corsOrigin": "*",
         "sessionTtlMs": 86400000,
         "crawler": {
           "enabled": true,
-          "nodeUrl": "ws://localhost:9944",
+          "nodeUrl": "wss://rpc.preprod.midnight.network/",
           "batchSize": 10,
           "maxRetries": 3,
           "retryDelay": 2000,
@@ -53,8 +58,8 @@ If the service is configured with `kind: "nightgate"` but no `network`, the plug
 
 | Key | Default | Notes |
 |---|---|---|
-| `network` | `testnet` at runtime | Valid values are `testnet` and `mainnet`; invalid values log an error and fall back to `testnet` |
-| `nodeUrl` | `ws://localhost:9944` | Should be a WebSocket endpoint; non-`ws`/`wss` values log a warning |
+| `network` | `testnet` at runtime | Valid values are `testnet`, `preprod`, and `mainnet`; invalid values log an error and fall back to `testnet` |
+| `nodeUrl` | `ws://localhost:9944` | Should be a WebSocket endpoint; non-`ws`/`wss` values log a warning. For hosted Midnight Preprod use `wss://rpc.preprod.midnight.network/` |
 | `crawler.enabled` | `true` | When `false`, services still load but active indexing is disabled |
 | `crawler.nodeUrl` | top-level `nodeUrl` | Optional crawler-specific node URL override |
 | `crawler.batchSize` | `10` | Number of blocks per catch-up progress batch |
@@ -69,7 +74,27 @@ If the service is configured with `kind: "nightgate"` but no `network`, the plug
 | Variable | Purpose | Default |
 |---|---|---|
 | `ENCRYPTION_KEY` | AES-256-GCM key material for wallet viewing-key encryption | Process-scoped dev fallback; **required** in production (`NODE_ENV=production`) — startup fails without it |
+| `NIGHTGATE_NETWORK` / `MIDNIGHT_NETWORK` | Override `cds.requires.nightgate.network` at runtime | Valid values are `testnet`, `preprod`, and `mainnet` |
+| `NIGHTGATE_NODE_URL` / `MIDNIGHT_NODE_URL` | Override `cds.requires.nightgate.nodeUrl` at runtime | Useful for switching node endpoints without editing `package.json` |
+| `NIGHTGATE_CRAWLER_NODE_URL` / `MIDNIGHT_CRAWLER_NODE_URL` | Override `cds.requires.nightgate.crawler.nodeUrl` at runtime | Takes precedence over the top-level node URL for crawler start/resume |
 | `NODE_ENV=production` | Enables HSTS response header; enforces `ENCRYPTION_KEY` presence | Off unless explicitly set |
+
+For local repository startup, putting these values into a repo-root `.env` file works with `npm run dev` / `cds watch`. A tracked template is available in [../.env.example](../.env.example).
+
+### Preprod Runtime Example
+
+Use the hosted Midnight Preprod RPC instead of the bundled Docker Compose node:
+
+```bash
+NIGHTGATE_NETWORK=preprod
+NIGHTGATE_NODE_URL=wss://rpc.preprod.midnight.network/
+```
+
+Optional dedicated crawler endpoint:
+
+```bash
+NIGHTGATE_CRAWLER_NODE_URL=wss://rpc.preprod.midnight.network/
+```
 
 ## Runtime Behavior
 
@@ -87,6 +112,11 @@ If the service is configured with `kind: "nightgate"` but no `network`, the plug
 - if the schema is missing, it attempts `db.deploy()` automatically
 - if the Midnight node cannot be reached, the package logs a warning and continues in `offline` mode
 - repeated `initialize()` calls are idempotent
+- existing SQLite state in `db/midnight.db` is reused across restarts; network switches do not automatically clear prior sync state
+
+### Switching Existing Databases
+
+This repository persists indexed data in [../db/midnight.db](../db/midnight.db). If you switch an existing checkout from local standalone or another network to Preprod, remove [../db/midnight.db](../db/midnight.db), [../db/midnight.db-shm](../db/midnight.db-shm), and [../db/midnight.db-wal](../db/midnight.db-wal) before the first Preprod run.
 
 ### Security Middleware
 
@@ -220,7 +250,7 @@ The admin projection excludes `encryptedViewingKey` from the OData response surf
 
 ## Current Capability Matrix
 
-| Area | Status | What works now | Boundaries in `0.1.1` |
+| Area | Status | What works now | Boundaries in `0.1.2` |
 |---|---|---|---|
 | CAP plugin integration | Ready | Registers models from `db/` and `srv/`, wires bootstrap middleware, starts on CAP `served`, stops on CAP `shutdown` | Configure only through `cds.requires.nightgate` |
 | Node connectivity | Ready | Connects to Midnight nodes over `ws://` or `wss://`, validates runtime config, warns on bad URLs | No separate multi-node failover layer yet |

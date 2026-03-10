@@ -14,7 +14,7 @@ This project integrates with the Midnight Network. For more information about th
 
 
 ```text
-Midnight Node (ws://localhost:9944)
+Midnight Node (local ws://localhost:9944 or remote wss://rpc.preprod.midnight.network/)
     |
     | Substrate RPC / WebSocket
     v
@@ -46,17 +46,42 @@ NightgateService / NightgateIndexerService / Analytics / Admin
 | Wallet sessions | `connectWallet` / `disconnectWallet` with encrypted viewing-key storage |
 | Offline mode | CAP app starts even if the node is unreachable |
 
-Version `0.1.1` is a read-side first release. Transaction build/sign/submit flows are not yet included.
+Version `0.1.2` is a read-side first release. Transaction build/sign/submit flows are not yet included.
 
 ## Quick Start
 
-### Run This Repository
+### Run This Repository Against Preprod
+
+```bash
+npm ci
+npm run dev
+```
+
+The checked-in [package.json](package.json) now points to Preprod by default. A repo-root `.env` is still the clearest way to make the target explicit. A tracked template is available in [.env.example](.env.example):
+
+```env
+NIGHTGATE_NETWORK=preprod
+NIGHTGATE_NODE_URL=wss://rpc.preprod.midnight.network/
+```
+
+Use `wss://`, not `https://`, because Nightgate talks to Midnight over Substrate RPC WebSocket.
+
+### Run This Repository Against Local Standalone
 
 ```bash
 npm ci
 docker compose -f docker/docker-compose.yml up -d
 npm run dev
 ```
+
+To use the local standalone node instead of the repo's Preprod defaults, override the runtime target before starting the app:
+
+```env
+NIGHTGATE_NETWORK=testnet
+NIGHTGATE_NODE_URL=ws://localhost:9944
+```
+
+If this workspace already indexed Preprod, delete [db/midnight.db](db/midnight.db), [db/midnight.db-shm](db/midnight.db-shm), and [db/midnight.db-wal](db/midnight.db-wal) before switching the crawler back to the local node.
 
 ### Use As A CAP Plugin
 
@@ -74,13 +99,19 @@ Add to `package.json`:
       "db": { "kind": "sqlite" },
       "nightgate": {
         "kind": "nightgate",
-        "network": "testnet",
-        "nodeUrl": "ws://localhost:9944"
+        "network": "preprod",
+        "nodeUrl": "wss://rpc.preprod.midnight.network/"
       }
     }
   }
 }
 ```
+
+At runtime, `NIGHTGATE_NETWORK`, `NIGHTGATE_NODE_URL`, and `NIGHTGATE_CRAWLER_NODE_URL` override the matching `cds.requires.nightgate` values. `MIDNIGHT_NETWORK`, `MIDNIGHT_NODE_URL`, and `MIDNIGHT_CRAWLER_NODE_URL` are accepted as aliases.
+
+The bundled [docker/docker-compose.yml](docker/docker-compose.yml) is for local standalone development only. For public Preprod, use `NIGHTGATE_NETWORK=preprod` with `NIGHTGATE_NODE_URL=wss://rpc.preprod.midnight.network/`.
+
+For local repository startup, a root [.env.example](.env.example) can be copied to `.env` and adjusted without touching `package.json`.
 
 Then `cds watch`.
 
@@ -110,6 +141,7 @@ curl "http://localhost:4004/api/v1/indexer/getMetrics()"
 
 - [Quickstart Guide](docs/quickstart.md): step-by-step from zero to first API call
 - [Reference](docs/reference.md): configuration, runtime behavior, full API surface, project structure
+- [Release 0.1.2](docs/release-0.1.2.md): prepared GitHub/npm release notes and publish checklist
 - [Changelog](CHANGELOG.md): list of notable changes by version
 
 ## Development

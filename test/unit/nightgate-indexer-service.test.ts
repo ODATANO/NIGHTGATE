@@ -4,6 +4,15 @@ const registeredHandlers = new Map<string, Function>();
 const mockStartCrawler = jest.fn();
 const mockStopCrawler = jest.fn();
 const mockIsCrawlerRunning = jest.fn();
+const ENV_KEYS = [
+    'NIGHTGATE_NETWORK',
+    'MIDNIGHT_NETWORK',
+    'NIGHTGATE_NODE_URL',
+    'MIDNIGHT_NODE_URL',
+    'NIGHTGATE_CRAWLER_NODE_URL',
+    'MIDNIGHT_CRAWLER_NODE_URL'
+] as const;
+const originalEnv = Object.fromEntries(ENV_KEYS.map((key) => [key, process.env[key]])) as Record<(typeof ENV_KEYS)[number], string | undefined>;
 
 const mockEnv: any = {
     requires: {
@@ -133,12 +142,26 @@ describe('NightgateIndexerService comprehensive coverage', () => {
         mockStopCrawler.mockReset();
         mockIsCrawlerRunning.mockReset();
         mockIsCrawlerRunning.mockReturnValue(false);
+        for (const key of ENV_KEYS) {
+            delete process.env[key];
+        }
         mockEnv.requires = {
             nightgate: {
                 network: 'testnet',
                 nodeUrl: 'ws://localhost:9944'
             }
         };
+    });
+
+    afterAll(() => {
+        for (const key of ENV_KEYS) {
+            const value = originalEnv[key];
+            if (value === undefined) {
+                delete process.env[key];
+            } else {
+                process.env[key] = value;
+            }
+        }
     });
 
     it('creates SyncState at init using the configured nightgate settings', async () => {
@@ -178,6 +201,27 @@ describe('NightgateIndexerService comprehensive coverage', () => {
             __entries: expect.objectContaining({
                 networkId: 'testnet',
                 nodeUrl: ''
+            })
+        }));
+        expect(service).toBeInstanceOf(NightgateIndexerService);
+    });
+
+    it('prefers env overrides when initializing SyncState', async () => {
+        process.env.NIGHTGATE_NETWORK = 'preprod';
+        process.env.NIGHTGATE_NODE_URL = 'wss://node.example.test';
+        mockDbRun
+            .mockResolvedValueOnce(null)
+            .mockResolvedValueOnce(undefined);
+
+        const service = new NightgateIndexerService();
+        await service.init();
+
+        expect(mockDbRun.mock.calls[1][0]).toEqual(expect.objectContaining({
+            __type: 'insert',
+            __table: 'midnight.SyncState',
+            __entries: expect.objectContaining({
+                networkId: 'preprod',
+                nodeUrl: 'wss://node.example.test'
             })
         }));
         expect(service).toBeInstanceOf(NightgateIndexerService);
@@ -552,6 +596,27 @@ describe('NightgateIndexerService comprehensive coverage', () => {
         expect(mockStartCrawler).toHaveBeenCalledWith(expect.objectContaining({
             enabled: true,
             nodeUrl: 'ws://localhost:9944',
+            requestTimeout: 30000
+        }));
+    });
+
+    it('resumeCrawler prefers env overrides for crawler runtime values', async () => {
+        await initService();
+        const handler = getHandler('resumeCrawler');
+        process.env.NIGHTGATE_NODE_URL = 'wss://node.example.test';
+        process.env.NIGHTGATE_CRAWLER_NODE_URL = 'wss://crawler.example.test';
+
+        mockIsCrawlerRunning.mockReturnValue(false);
+        mockStartCrawler.mockResolvedValueOnce(undefined);
+
+        await expect(handler({} as any)).resolves.toEqual({
+            status: 'ok',
+            running: true,
+            message: 'Crawler resumed'
+        });
+        expect(mockStartCrawler).toHaveBeenCalledWith(expect.objectContaining({
+            enabled: true,
+            nodeUrl: 'wss://crawler.example.test',
             requestTimeout: 30000
         }));
     });

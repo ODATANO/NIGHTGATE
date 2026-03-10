@@ -115,12 +115,12 @@ const plugin = {
                 description: 'Nightgate configuration for @odatano/nightgate',
                 properties: {
                     network: {
-                        description: 'Target Midnight network: testnet | mainnet',
+                        description: 'Target Midnight network: testnet | preprod | mainnet. Can also be overridden via NIGHTGATE_NETWORK or MIDNIGHT_NETWORK.',
                         type: 'string',
-                        enum: ['testnet', 'mainnet']
+                        enum: ['testnet', 'preprod', 'mainnet']
                     },
                     nodeUrl: {
-                        description: 'Midnight Node Substrate RPC endpoint (default: ws://localhost:9944). The indexer crawls blocks directly from the node.',
+                        description: 'Midnight Node Substrate RPC endpoint (default: ws://localhost:9944). Can be overridden via NIGHTGATE_NODE_URL or MIDNIGHT_NODE_URL.',
                         type: 'string'
                     },
                     contentSecurityPolicy: {
@@ -132,7 +132,7 @@ const plugin = {
                         type: 'object',
                         properties: {
                             enabled: { type: 'boolean', description: 'Enable active crawler (default: true)' },
-                            nodeUrl: { type: 'string', description: 'Override node URL for crawler (default: uses top-level nodeUrl)' },
+                            nodeUrl: { type: 'string', description: 'Override node URL for crawler (default: uses top-level nodeUrl). Can be overridden via NIGHTGATE_CRAWLER_NODE_URL or MIDNIGHT_CRAWLER_NODE_URL.' },
                             batchSize: { type: 'number', description: 'Blocks per batch during catch-up (default: 10)' },
                             maxRetries: { type: 'number', description: 'Max retries per block before error (default: 3)' },
                             retryDelay: { type: 'number', description: 'Base retry delay in ms (default: 2000)' },

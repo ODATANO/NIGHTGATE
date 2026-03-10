@@ -1,6 +1,6 @@
 # Quickstart
 
-This guide gets `@odatano/nightgate` from zero to first successful API call with the current `0.1.1` feature set.
+This guide gets `@odatano/nightgate` from zero to first successful API call with the current `0.1.2` feature set.
 
 It covers both supported entry points:
 
@@ -13,7 +13,7 @@ It covers both supported entry points:
 - Docker Desktop or a working Docker engine
 - a Midnight node reachable over `ws://` or `wss://`
 
-For local development in this repository, the included Docker Compose file starts a dev-mode Midnight node on `ws://localhost:9944`.
+For local undeployed development in this repository, the included Docker Compose file starts a dev-mode Midnight node on `ws://localhost:9944`. It is standalone-only and is not a Preprod launcher.
 
 ## Option A: Run This Repository Directly
 
@@ -23,13 +23,37 @@ For local development in this repository, the included Docker Compose file start
 npm ci
 ```
 
-### 2. Start the local Midnight node
+### 2. Choose the target environment
+
+#### Recommended: public Preprod
+
+The checked-in [../package.json](../package.json) now points to Preprod by default. A repo-root `.env` file is still recommended so the target stays explicit and easy to switch. A tracked template is available in [../.env.example](../.env.example).
+
+```env
+NIGHTGATE_NETWORK=preprod
+NIGHTGATE_NODE_URL=wss://rpc.preprod.midnight.network/
+# Optional:
+# NIGHTGATE_CRAWLER_NODE_URL=wss://rpc.preprod.midnight.network/
+```
+
+Use `wss://`, not `https://`, because Nightgate connects to Midnight over Substrate RPC WebSocket.
+
+If this checkout already indexed a different network, delete [../db/midnight.db](../db/midnight.db), [../db/midnight.db-shm](../db/midnight.db-shm), and [../db/midnight.db-wal](../db/midnight.db-wal) before the first Preprod run so the crawler starts from a clean sync state.
+
+#### Alternative: local standalone Midnight node
 
 ```bash
 docker compose -f docker/docker-compose.yml up -d
 ```
 
-This starts the node expected by the default config in [package.json](../package.json).
+This starts the local standalone node. To point Nightgate at it instead of the repo's Preprod defaults, use a repo-root `.env` like this:
+
+```env
+NIGHTGATE_NETWORK=testnet
+NIGHTGATE_NODE_URL=ws://localhost:9944
+```
+
+If you leave `.env` or `package.json` on Preprod, starting Docker Compose alone does not switch the crawler to the local node.
 
 ### 3. Start Nightgate
 
@@ -44,6 +68,10 @@ Nightgate starts CAP from the TypeScript source tree and then:
 - connects to the Midnight node
 - runs historical catch-up
 - switches to live indexing
+
+To target a different environment without editing `package.json`, set `NIGHTGATE_NETWORK` and `NIGHTGATE_NODE_URL` before starting the app. `MIDNIGHT_NETWORK` and `MIDNIGHT_NODE_URL` are accepted as aliases.
+
+In this repository, using a root `.env` file is the easiest cross-shell way to switch between Preprod and local standalone.
 
 ### 4. Check that the service is up
 
@@ -69,6 +97,14 @@ Typical startup output:
 [MidnightNode] Connected to ws://localhost:9944
 [odatano-nightgate] Startup state: syncing (crawler started)
 [Crawler] Live subscription active
+```
+
+The output above shows local standalone mode. For Preprod, the key lines should look like this instead:
+
+```text
+[odatano-nightgate] Network: preprod
+[odatano-nightgate] Node: wss://rpc.preprod.midnight.network/
+[MidnightNode] Connected to wss://rpc.preprod.midnight.network/
 ```
 
 In standalone repo mode, CAP bootstraps through `srv/server.ts`, which imports the same Nightgate plugin hooks that `cds-plugin.js` provides in consumer apps.
@@ -112,8 +148,8 @@ Add this to your `package.json`:
       },
       "nightgate": {
         "kind": "nightgate",
-        "network": "testnet",
-        "nodeUrl": "ws://localhost:9944"
+        "network": "preprod",
+        "nodeUrl": "wss://rpc.preprod.midnight.network/"
       }
     }
   }
@@ -121,6 +157,8 @@ Add this to your `package.json`:
 ```
 
 Use only `cds.requires.nightgate`. There is no legacy alias path anymore.
+
+At runtime, `NIGHTGATE_NETWORK`, `NIGHTGATE_NODE_URL`, and `NIGHTGATE_CRAWLER_NODE_URL` override the matching `cds.requires.nightgate` values. `MIDNIGHT_*` aliases are also accepted.
 
 ### 3. Start the CAP app
 
@@ -148,12 +186,13 @@ These are the most relevant runtime settings for first use:
     "requires": {
       "nightgate": {
         "kind": "nightgate",
-        "network": "testnet",
-        "nodeUrl": "ws://localhost:9944",
+        "network": "preprod",
+        "nodeUrl": "wss://rpc.preprod.midnight.network/",
         "corsOrigin": "*",
         "sessionTtlMs": 86400000,
         "crawler": {
           "enabled": true,
+          "nodeUrl": "wss://rpc.preprod.midnight.network/",
           "batchSize": 10,
           "maxRetries": 3,
           "retryDelay": 2000,
@@ -167,8 +206,8 @@ These are the most relevant runtime settings for first use:
 
 Meaning of the main knobs:
 
-- `network`: `testnet` or `mainnet`
-- `nodeUrl`: Midnight node WebSocket endpoint
+- `network`: `testnet`, `preprod`, or `mainnet`
+- `nodeUrl`: Midnight node WebSocket endpoint. For public Preprod use `wss://rpc.preprod.midnight.network/`
 - `crawler.enabled`: disable active indexing but still expose services
 - `crawler.batchSize`: progress batch size during catch-up
 - `crawler.maxRetries`: retries per block before error handling kicks in
@@ -179,7 +218,7 @@ Meaning of the main knobs:
 
 ## What You Can Use Immediately
 
-After startup, these are the most useful entry points in `0.1.1`:
+After startup, these are the most useful entry points in `0.1.2`:
 
 - blockchain reads through `/api/v1/nightgate`
 - sync, health, readiness, liveness, metrics, and reorg history through `/api/v1/indexer`
@@ -216,6 +255,10 @@ curl "http://localhost:4004/api/v1/indexer/getHealth()"
 
 If the DB is empty and the node is healthy, give the crawler a moment to catch up.
 
+### Switching an existing workspace to Preprod
+
+This repository persists indexed data in [../db/midnight.db](../db/midnight.db). If you previously ran against a different network, delete [../db/midnight.db](../db/midnight.db), [../db/midnight.db-shm](../db/midnight.db-shm), and [../db/midnight.db-wal](../db/midnight.db-wal) before the first Preprod run.
+
 ### Production encryption key
 
 Wallet viewing keys are encrypted at rest. In production (`NODE_ENV=production`), `ENCRYPTION_KEY` **must** be set: the process will refuse to start without it. In development, a process-scoped fallback is used automatically.
@@ -224,4 +267,5 @@ Wallet viewing keys are encrypted at rest. In production (`NODE_ENV=production`)
 
 - [README.md](../README.md)
 - [Reference](reference.md) — configuration, runtime behavior, full API surface
+- [Release 0.1.2](release-0.1.2.md) — prepared release notes and publish checklist
 - [CHANGELOG.md](../CHANGELOG.md)

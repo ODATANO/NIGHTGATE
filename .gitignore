@@ -32,6 +32,7 @@ Thumbs.db
 
 # Test
 coverage/
+.claude
 
 # Logs
 *.log

@@ -8,6 +8,7 @@ import cds, { Request } from '@sap/cds';
 const { SELECT, UPDATE, DELETE } = cds.ql;
 
 import { ensureNightgateModelLoaded } from './utils/cds-model';
+import { resolveNightgateRuntimeConfig } from './utils/nightgate-config';
 import { ensureSyncStateSingleton } from './utils/sync-state';
 import { isCrawlerRunning, startCrawler, stopCrawler } from './crawler';
 
@@ -18,13 +19,12 @@ export default class NightgateIndexerService extends cds.ApplicationService {
     private db!: any;
 
     private resolveCrawlerStartConfig(): { enabled: boolean; nodeUrl: string; requestTimeout?: number } {
-        const cfg = (cds.env as any).requires?.nightgate || {};
-        const crawlerCfg = cfg.crawler || {};
+        const { crawlerConfig, crawlerNodeUrl } = resolveNightgateRuntimeConfig((cds.env as any).requires?.nightgate || {});
         return {
-            ...(crawlerCfg as Record<string, unknown>),
+            ...(crawlerConfig as Record<string, unknown>),
             enabled: true,
-            nodeUrl: crawlerCfg.nodeUrl || cfg.nodeUrl || 'ws://localhost:9944',
-            requestTimeout: crawlerCfg.requestTimeout || 30000
+            nodeUrl: crawlerNodeUrl,
+            requestTimeout: (crawlerConfig as any).requestTimeout || 30000
         };
     }
 

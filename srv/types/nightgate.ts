@@ -3,7 +3,7 @@
  */
 
 export interface NightgateConfig {
-  network: 'testnet' | 'mainnet';
+  network: 'testnet' | 'preprod' | 'mainnet';
   contractAddress?: string;
   nodeUrl?: string;
   walletSeed?: string;
@@ -16,6 +16,9 @@ export interface NightgateConfig {
 
 export const NIGHTGATE_DEFAULTS = {
   testnet: {
+    nodeUrl: 'ws://localhost:9944'
+  },
+  preprod: {
     nodeUrl: 'ws://localhost:9944'
   },
   mainnet: {

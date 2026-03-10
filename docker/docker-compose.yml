@@ -1,7 +1,9 @@
 services:
-  # Midnight Node — Primary data source for the ODATANO-NIGHT indexer
-  # CFG_PRESET=dev → standalone mode (no testnet connection needed for development)
-  # CFG_PRESET=testnet-02 → connects to Midnight testnet (requires bootnodes)
+  # Midnight Node — local standalone node for undeployed/local development only.
+  # This compose file does not launch the public Preprod network.
+  # For Preprod, point Nightgate at the hosted RPC instead:
+  #   NIGHTGATE_NETWORK=preprod
+  #   NIGHTGATE_NODE_URL=wss://rpc.preprod.midnight.network/
   node:
     image: midnightntwrk/midnight-node:0.20.0
     container_name: odatano-night-node
@@ -9,6 +11,7 @@ services:
       - "9944:9944" # Substrate RPC (used by ODATANO-NIGHT crawler)
       - "30333:30333" # P2P
     environment:
+      # Local standalone preset; keep this for undeployed/local testing.
       CFG_PRESET: dev
       SIDECHAIN_BLOCK_BENEFICIARY: "04bcf7ad3be7a5c790460be82a713af570f22e0f801f6659ab8e84a52be6969e"
     volumes:

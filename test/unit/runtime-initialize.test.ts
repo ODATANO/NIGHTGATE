@@ -7,6 +7,15 @@ const mockStartCrawler = jest.fn();
 const mockStopCrawler = jest.fn();
 const mockEnsureNightgateModelLoaded = jest.fn();
 const selectFromSpy = jest.fn();
+const ENV_KEYS = [
+    'NIGHTGATE_NETWORK',
+    'MIDNIGHT_NETWORK',
+    'NIGHTGATE_NODE_URL',
+    'MIDNIGHT_NODE_URL',
+    'NIGHTGATE_CRAWLER_NODE_URL',
+    'MIDNIGHT_CRAWLER_NODE_URL'
+] as const;
+const originalEnv = Object.fromEntries(ENV_KEYS.map((key) => [key, process.env[key]])) as Record<(typeof ENV_KEYS)[number], string | undefined>;
 
 jest.mock('@sap/cds', () => {
     const cds: any = {
@@ -54,6 +63,10 @@ describe('runtime initialize', () => {
     beforeEach(async () => {
         jest.clearAllMocks();
 
+        for (const key of ENV_KEYS) {
+            delete process.env[key];
+        }
+
         (cds.env as any).requires = {
             nightgate: {
                 kind: 'nightgate',
@@ -73,6 +86,17 @@ describe('runtime initialize', () => {
 
         await shutdown();
         jest.clearAllMocks();
+    });
+
+    afterAll(() => {
+        for (const key of ENV_KEYS) {
+            const value = originalEnv[key];
+            if (value === undefined) {
+                delete process.env[key];
+            } else {
+                process.env[key] = value;
+            }
+        }
     });
 
     it('loads the model before DB access, starts the crawler, and logs syncing startup state', async () => {
@@ -207,6 +231,35 @@ describe('runtime initialize', () => {
             }));
         } finally {
             warnSpy.mockRestore();
+            logSpy.mockRestore();
+        }
+    });
+
+    it('uses env overrides for preprod startup even when package config has no network', async () => {
+        const logSpy = jest.spyOn(console, 'log').mockImplementation();
+        delete (cds.env as any).requires.nightgate.network;
+        process.env.NIGHTGATE_NETWORK = 'preprod';
+        process.env.NIGHTGATE_NODE_URL = 'wss://node.example.test';
+        process.env.NIGHTGATE_CRAWLER_NODE_URL = 'wss://crawler.example.test';
+
+        try {
+            const status = await initialize();
+
+            expect(mockStartCrawler).toHaveBeenCalledWith(expect.objectContaining({
+                enabled: true,
+                nodeUrl: 'wss://crawler.example.test',
+                requestTimeout: 30000
+            }));
+            expect(logSpy).toHaveBeenCalledWith('[odatano-nightgate] Network: preprod');
+            expect(logSpy).toHaveBeenCalledWith('[odatano-nightgate] Node: wss://node.example.test');
+            expect(status).toEqual(expect.objectContaining({
+                initialized: true,
+                crawlerEnabled: true,
+                network: 'preprod',
+                nodeUrl: 'wss://node.example.test',
+                mode: 'active'
+            }));
+        } finally {
             logSpy.mockRestore();
         }
     });

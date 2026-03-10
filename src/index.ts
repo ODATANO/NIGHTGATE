@@ -2,6 +2,11 @@ import cds from '@sap/cds';
 
 import { startCrawler, stopCrawler } from '../srv/crawler/index';
 import { ensureNightgateModelLoaded } from '../srv/utils/cds-model';
+import {
+    isNightgatePluginConfigured,
+    resolveNightgateRuntimeConfig,
+    VALID_NIGHTGATE_NETWORKS
+} from '../srv/utils/nightgate-config';
 
 export type { NightgateConfig, NightgateProviders, CircuitResult } from '../srv/types';
 export { NIGHTGATE_DEFAULTS } from '../srv/types';
@@ -24,44 +29,6 @@ let lastStatus: NightgateIndexerStatus = {
 
 function getNightgateConfig(): any {
     return (cds.env as any).requires?.nightgate;
-}
-
-function isPluginConfigured(config: any): boolean {
-    if (!config) {
-        return false;
-    }
-
-    return !(config.kind === 'nightgate' && !config.network);
-}
-
-function resolveRuntimeConfig(config: any): {
-    network: string;
-    nodeUrl: string;
-    crawlerConfig: Record<string, unknown>;
-    crawlerNodeUrl: string;
-} {
-    const network = config.network || 'testnet';
-    const nodeUrl = config.nodeUrl || 'ws://localhost:9944';
-    const crawlerConfig = config.crawler || {};
-    const crawlerNodeUrl = (crawlerConfig as any).nodeUrl || nodeUrl;
-
-    const validNetworks = ['testnet', 'mainnet'];
-    if (!validNetworks.includes(network)) {
-        console.error(`[odatano-nightgate] Invalid network "${network}". Must be one of: ${validNetworks.join(', ')}`);
-        console.error('[odatano-nightgate] Falling back to "testnet"');
-        config.network = 'testnet';
-    }
-
-    if (nodeUrl && !nodeUrl.match(/^wss?:\/\/.+/)) {
-        console.warn(`[odatano-nightgate] nodeUrl "${nodeUrl}" does not look like a WebSocket URL (expected ws:// or wss://)`);
-    }
-
-    return {
-        network: config.network || network,
-        nodeUrl,
-        crawlerConfig,
-        crawlerNodeUrl
-    };
 }
 
 function isLikelyNodeConnectionError(message: string): boolean {
@@ -123,7 +90,7 @@ export async function initialize(): Promise<NightgateIndexerStatus> {
     await ensureNightgateModelLoaded();
 
     const nightgateConfig = getNightgateConfig();
-    if (!isPluginConfigured(nightgateConfig)) {
+    if (!isNightgatePluginConfigured(nightgateConfig)) {
         lastStatus = {
             initialized: false,
             crawlerEnabled: false,
@@ -137,8 +104,13 @@ export async function initialize(): Promise<NightgateIndexerStatus> {
         return getStatus();
     }
 
-    const { network, nodeUrl, crawlerConfig, crawlerNodeUrl } = resolveRuntimeConfig(nightgateConfig);
+    const { network, nodeUrl, crawlerConfig, crawlerNodeUrl, invalidNetwork } = resolveNightgateRuntimeConfig(nightgateConfig);
     const crawlerEnabled = (crawlerConfig as any).enabled !== false;
+
+    if (invalidNetwork) {
+        console.error(`[odatano-nightgate] Invalid network "${invalidNetwork}". Must be one of: ${VALID_NIGHTGATE_NETWORKS.join(', ')}`);
+        console.error('[odatano-nightgate] Falling back to "testnet"');
+    }
 
     await ensureSchemaDeployed();
 
