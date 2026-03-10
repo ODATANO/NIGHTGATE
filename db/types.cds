@@ -4,7 +4,6 @@
 
 type HexEncoded              : String(512);
 type UnshieldedAddr          : String(256); // Bech32m-encoded
-type CardanoRewardAddr       : String(256); // Bech32-encoded
 type DustAddr                : String(256); // Bech32m-encoded
 type BigInt                  : String(78); // For u128 values as strings
 
@@ -56,10 +55,3 @@ type SyncStatus              : String(20) enum {
     stopped;
 }
 
-// Enum for Token Category
-type TokenCategory           : String(25) enum {
-    ledger_shielded;
-    ledger_unshielded;
-    contract_shielded;
-    contract_unshielded;
-}

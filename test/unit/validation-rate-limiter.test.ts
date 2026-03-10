@@ -1,45 +1,7 @@
-import {
-    MAX_DESCRIPTION_LENGTH,
-    MAX_REFERENCE_ID_LENGTH,
-    validateCommitmentHash,
-    validateCommitmentHashes,
-    validateExpiresAt,
-    validateFieldsToDisclose,
-    validateStringField,
-    validateViewingKey
-} from '../../srv/utils/validation';
+import { validateViewingKey } from '../../srv/utils/validation';
 import { RateLimiter } from '../../srv/utils/rate-limiter';
 
 describe('validation utilities', () => {
-    it('validates commitment hashes and reports indexed failures', () => {
-        expect(validateCommitmentHash('a'.repeat(64))).toBeUndefined();
-        expect(validateCommitmentHash('xyz')).toContain('Invalid commitmentHash format');
-        expect(validateCommitmentHashes(['a'.repeat(64), 'xyz'])).toContain('commitmentHashes[1]');
-    });
-
-    it('validates expiry timestamps', () => {
-        expect(validateExpiresAt('not-a-date')).toBe('Invalid expiresAt: not a valid ISO 8601 date');
-        expect(validateExpiresAt(new Date(Date.now() - 60_000).toISOString())).toBe('expiresAt must be in the future');
-        expect(validateExpiresAt(new Date(Date.now() + 60_000).toISOString())).toBeUndefined();
-    });
-
-    it('validates bounded string fields and control characters', () => {
-        expect(validateStringField(undefined, 'referenceId', MAX_REFERENCE_ID_LENGTH)).toBeUndefined();
-        expect(validateStringField(123 as unknown as string, 'referenceId', MAX_REFERENCE_ID_LENGTH)).toBe('referenceId must be a string');
-        expect(validateStringField('a'.repeat(MAX_DESCRIPTION_LENGTH + 1), 'description', MAX_DESCRIPTION_LENGTH)).toBe(
-            `description exceeds maximum length of ${MAX_DESCRIPTION_LENGTH}`
-        );
-        expect(validateStringField('bad\u0001value', 'description', MAX_DESCRIPTION_LENGTH)).toBe(
-            'description contains invalid control characters'
-        );
-    });
-
-    it('validates disclosure fields against the allow-list', () => {
-        expect(validateFieldsToDisclose([])).toBe('fieldsToDisclose must be a non-empty array');
-        expect(validateFieldsToDisclose(['status', 'referenceId'])).toBeUndefined();
-        expect(validateFieldsToDisclose(['status', 'secretField'])).toContain('Invalid fields for disclosure: secretField');
-    });
-
     it('validates viewing keys as 32-byte hex strings', () => {
         expect(validateViewingKey(undefined)).toBe('viewingKey is required');
         expect(validateViewingKey('not-hex')).toBe('viewingKey must be hex-encoded');

@@ -8,8 +8,8 @@ import {
     VALID_NIGHTGATE_NETWORKS
 } from '../srv/utils/nightgate-config';
 
-export type { NightgateConfig, NightgateProviders, CircuitResult } from '../srv/types';
-export { NIGHTGATE_DEFAULTS } from '../srv/types';
+export type { NightgateConfig } from '../srv/types';
+export { DEFAULT_NETWORK, DEFAULT_NODE_URL } from '../srv/utils/nightgate-config';
 
 export interface NightgateIndexerStatus {
     initialized: boolean;

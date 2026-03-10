@@ -128,8 +128,6 @@ describe('NightgateService', () => {
         expect(getHandler('byType', 'Transactions')).toBeDefined();
         expect(getHandler('READ', 'ContractActions')).toBeDefined();
         expect(getHandler('READ', 'UnshieldedUtxos')).toBeDefined();
-        expect(getHandler('READ', 'SystemParameters')).toBeDefined();
-        expect(getHandler('READ', 'DustGenerationStatus')).toBeDefined();
         expect(getHandler('getTopHolders', 'NightBalances')).toBeDefined();
         expect(registeredBeforeHandlers).toHaveLength(1);
         expect(shutdownHandlers).toHaveLength(1);
@@ -139,11 +137,7 @@ describe('NightgateService', () => {
         'Blocks',
         'Transactions',
         'ContractActions',
-        'UnshieldedUtxos',
-        'SystemParameters',
-        'DParameterHistory',
-        'TermsAndConditionsHistory',
-        'DustGenerationStatus'
+        'UnshieldedUtxos'
     ])('READ %s', (entity) => {
         it('runs the incoming CDS query and normalizes null results to an empty array', async () => {
             const handler = getHandler('READ', entity);
@@ -339,57 +333,6 @@ describe('NightgateService', () => {
         expect(builder.where).toHaveBeenCalledWith({ spentAtTransaction_ID: null });
     });
 
-    it('returns the current system parameters ordered by validFrom desc', async () => {
-        const handler = getHandler('current', 'SystemParameters');
-        mockDbRun.mockResolvedValueOnce({ ID: 'params-1' });
-
-        await expect(handler()).resolves.toEqual({ ID: 'params-1' });
-
-        const builder = getLastBuilder();
-        expect(builder.__table).toBe('midnight.SystemParameters');
-        expect(builder.orderBy).toHaveBeenCalledWith('validFrom desc');
-    });
-
-    it('rejects byCardanoAddress requests without an address', async () => {
-        const handler = getHandler('byCardanoAddress', 'DustGenerationStatus');
-        const req = createMockRequest();
-
-        await handler(req);
-
-        expect(req.reject).toHaveBeenCalledWith(400, 'address is required');
-    });
-
-    it('looks up DUST generation state by Cardano reward address', async () => {
-        const handler = getHandler('byCardanoAddress', 'DustGenerationStatus');
-        const req = createMockRequest({ address: 'addr_test1...' });
-        mockDbRun.mockResolvedValueOnce({ ID: 'dust-1' });
-
-        await expect(handler(req)).resolves.toEqual({ ID: 'dust-1' });
-
-        const builder = getLastBuilder();
-        expect(builder.__table).toBe('midnight.DustGenerationStatus');
-        expect(builder.where).toHaveBeenCalledWith({ cardanoRewardAddress: 'addr_test1...' });
-    });
-
-    it('returns an empty list when byCardanoAddresses is called without input addresses', async () => {
-        const handler = getHandler('byCardanoAddresses', 'DustGenerationStatus');
-
-        await expect(handler(createMockRequest({ addresses: [] }))).resolves.toEqual([]);
-        expect(mockDbRun).not.toHaveBeenCalled();
-    });
-
-    it('looks up DUST generation state for multiple Cardano reward addresses', async () => {
-        const handler = getHandler('byCardanoAddresses', 'DustGenerationStatus');
-        const addresses = ['addr-1', 'addr-2'];
-        mockDbRun.mockResolvedValueOnce([{ ID: 'dust-1' }]);
-
-        await expect(handler(createMockRequest({ addresses }))).resolves.toEqual([{ ID: 'dust-1' }]);
-
-        const builder = getLastBuilder();
-        expect(builder.__table).toBe('midnight.DustGenerationStatus');
-        expect(builder.where).toHaveBeenCalledWith({ cardanoRewardAddress: { in: addresses } });
-    });
-
     it('rejects getBalance requests without an address', async () => {
         const handler = getHandler('getBalance', 'NightBalances');
         const req = createMockRequest();
@@ -428,27 +371,6 @@ describe('NightgateService', () => {
         expect(builder.__table).toBe('midnight.NightBalances');
         expect(builder.orderBy).toHaveBeenCalledWith('balance desc');
         expect(builder.limit).toHaveBeenCalledWith(10);
-    });
-
-    it('rejects byCardanoStakeKey requests without a stake key', async () => {
-        const handler = getHandler('byCardanoStakeKey', 'DustRegistrations');
-        const req = createMockRequest();
-
-        await handler(req);
-
-        expect(req.reject).toHaveBeenCalledWith(400, 'stakeKey is required');
-    });
-
-    it('looks up DUST registrations by Cardano stake key', async () => {
-        const handler = getHandler('byCardanoStakeKey', 'DustRegistrations');
-        const req = createMockRequest({ stakeKey: 'stake_test1...' });
-        mockDbRun.mockResolvedValueOnce({ ID: 'registration-1' });
-
-        await expect(handler(req)).resolves.toEqual({ ID: 'registration-1' });
-
-        const builder = getLastBuilder();
-        expect(builder.__table).toBe('midnight.DustRegistrations');
-        expect(builder.where).toHaveBeenCalledWith({ cardanoStakeKey: 'stake_test1...' });
     });
 
     it('rejects write attempts through the read-only guard', () => {

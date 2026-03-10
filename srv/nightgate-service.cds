@@ -23,8 +23,7 @@ service NightgateService {
         projection on midnight.Blocks {
             *,
             parent,
-            transactions,
-            systemParameters
+            transactions
         }
         actions {
             // Get latest block
@@ -135,60 +134,6 @@ service NightgateService {
     entity DustLedgerEvents          as projection on midnight.DustLedgerEvents;
 
     // ========================================================================
-    // Governance & System Parameters
-    // ========================================================================
-
-            /**
-             * Current system parameters
-             */
-    @readonly
-    entity SystemParameters          as projection on midnight.SystemParameters
-        actions {
-            // Get current active parameters
-            @cds.odata.bindingparameter.collection
-            function current() returns SystemParameters;
-        };
-
-    /**
-     * D-Parameter change history for governance tracking
-     */
-    @readonly
-    entity DParameterHistory         as
-        projection on midnight.DParameterHistory {
-            *,
-            block
-        };
-
-    /**
-     * Terms and Conditions history
-     */
-    @readonly
-    entity TermsAndConditionsHistory as
-        projection on midnight.TermsAndConditionsHistory {
-            *,
-            block
-        };
-
-    // ========================================================================
-    // DUST Generation
-    // ========================================================================
-
-            /**
-             * DUST generation status for Cardano staking rewards
-             */
-    @readonly
-    entity DustGenerationStatus      as projection on midnight.DustGenerationStatus
-        actions {
-            // Query by Cardano reward address
-            @cds.odata.bindingparameter.collection
-            function byCardanoAddress(address: String)              returns DustGenerationStatus;
-
-            // Batch query for multiple addresses
-            @cds.odata.bindingparameter.collection
-            function byCardanoAddresses(addresses: array of String) returns array of DustGenerationStatus;
-        };
-
-    // ========================================================================
     // Balance & Token Tracking
     // ========================================================================
 
@@ -206,23 +151,6 @@ service NightgateService {
             @cds.odata.bindingparameter.collection
             function getTopHolders(limit: Integer) returns array of NightBalances;
         };
-
-            /**
-             * NIGHT ↔ DUST registration linkage
-             */
-    @readonly
-    entity DustRegistrations         as projection on midnight.DustRegistrations
-        actions {
-            // Get registration by Cardano stake key
-            @cds.odata.bindingparameter.collection
-            function byCardanoStakeKey(stakeKey: String) returns DustRegistrations;
-        };
-
-    /**
-     * Token type registry
-     */
-    @readonly
-    entity TokenTypes                as projection on midnight.TokenTypes;
 
     // ========================================================================
     // Session Management (Wallet Connections)
@@ -263,18 +191,7 @@ annotate NightgateService.ContractActions with {
     address @title: 'Contract Address';
 };
 
-annotate NightgateService.DustGenerationStatus with {
-    cardanoRewardAddress @title: 'Cardano Reward Address';
-    nightBalance         @title: 'NIGHT Balance';
-    generationRate       @title: 'Generation Rate';
-};
-
 annotate NightgateService.NightBalances with {
     address @title: 'Address';
     balance @title: 'NIGHT Balance';
-};
-
-annotate NightgateService.TokenTypes with {
-    tokenTypeId @title: 'Token Type ID';
-    tokenName   @title: 'Token Name';
 };

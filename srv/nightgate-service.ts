@@ -145,56 +145,6 @@ export default class NightgateService extends cds.ApplicationService {
         });
 
         // ====================================================================
-        // Governance Handlers
-        // ====================================================================
-
-        this.on('READ', 'SystemParameters', async (req: Request) => {
-            return await this.db.run(req.query) || [];
-        });
-
-        this.on('current', 'SystemParameters', async () => {
-            return this.db.run(
-                cds.ql.SELECT.one.from('midnight.SystemParameters')
-                    .orderBy('validFrom desc')
-            );
-        });
-
-        this.on('READ', 'DParameterHistory', async (req: Request) => {
-            return await this.db.run(req.query) || [];
-        });
-
-        this.on('READ', 'TermsAndConditionsHistory', async (req: Request) => {
-            return await this.db.run(req.query) || [];
-        });
-
-        // ====================================================================
-        // DUST Generation Handlers
-        // ====================================================================
-
-        this.on('READ', 'DustGenerationStatus', async (req: Request) => {
-            return await this.db.run(req.query) || [];
-        });
-
-        this.on('byCardanoAddress', 'DustGenerationStatus', async (req: Request) => {
-            const { address } = req.data as { address: string };
-            if (!address) return req.reject(400, 'address is required');
-            return this.db.run(
-                cds.ql.SELECT.one.from('midnight.DustGenerationStatus')
-                    .where({ cardanoRewardAddress: address })
-            );
-        });
-
-        this.on('byCardanoAddresses', 'DustGenerationStatus', async (req: Request) => {
-            const { addresses } = req.data as { addresses: string[] };
-            if (!addresses?.length) return [];
-            if (addresses.length > 100) return req.reject(400, 'Maximum 100 addresses per request');
-            return this.db.run(
-                cds.ql.SELECT.from('midnight.DustGenerationStatus')
-                    .where({ cardanoRewardAddress: { in: addresses } })
-            );
-        });
-
-        // ====================================================================
         // Balance & Token Tracking Handlers
         // ====================================================================
 
@@ -216,15 +166,6 @@ export default class NightgateService extends cds.ApplicationService {
             );
         });
 
-        this.on('byCardanoStakeKey', 'DustRegistrations', async (req: Request) => {
-            const { stakeKey } = req.data as { stakeKey: string };
-            if (!stakeKey) return req.reject(400, 'stakeKey is required');
-            return this.db.run(
-                cds.ql.SELECT.one.from('midnight.DustRegistrations')
-                    .where({ cardanoStakeKey: stakeKey })
-            );
-        });
-
         // ====================================================================
         // Wallet Sessions (delegated)
         // ====================================================================
@@ -237,9 +178,8 @@ export default class NightgateService extends cds.ApplicationService {
 
         this.before(['CREATE', 'UPDATE', 'DELETE'], [
             'Blocks', 'Transactions', 'ContractActions', 'UnshieldedUtxos',
-            'ZswapLedgerEvents', 'DustLedgerEvents', 'SystemParameters',
-            'DParameterHistory', 'TermsAndConditionsHistory', 'DustGenerationStatus',
-            'NightBalances', 'DustRegistrations', 'TokenTypes', 'WalletSessions'
+            'ZswapLedgerEvents', 'DustLedgerEvents',
+            'NightBalances', 'WalletSessions'
         ], (req: Request) => {
             req.reject?.(405, 'Blockchain data is read-only');
         });

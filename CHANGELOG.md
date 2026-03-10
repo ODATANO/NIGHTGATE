@@ -4,11 +4,12 @@
 
 ### 0.1.2 - Unreleased
 
-#### Preprod Defaults And Runtime Configuration
+#### Simplified Configuration
 
-- The repository default `cds.requires.nightgate` config now points to Midnight Preprod at `wss://rpc.preprod.midnight.network/`.
-- Runtime `NIGHTGATE_*` and `MIDNIGHT_*` environment overrides now cover the network, node URL, and crawler node URL consistently.
-- The docs now treat Preprod as the primary public runtime path and clarify that the bundled Docker Compose file remains local standalone only.
+- Code defaults to Preprod (`wss://rpc.preprod.midnight.network/`). No config needed for the common case.
+- Removed `MIDNIGHT_*` env var aliases — only `NIGHTGATE_NETWORK`, `NIGHTGATE_NODE_URL`, and `NIGHTGATE_CRAWLER_NODE_URL` are supported.
+- Removed unused `NIGHTGATE_DEFAULTS` export. Replaced by `DEFAULT_NETWORK` and `DEFAULT_NODE_URL`.
+- `package.json` only needs `"nightgate": { "kind": "nightgate" }` — network and URL default in code.
 
 ### 0.1.1 - 2026-03-08
 

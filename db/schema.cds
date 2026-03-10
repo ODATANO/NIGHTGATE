@@ -7,7 +7,6 @@ using {
 using {
     HexEncoded,
     UnshieldedAddr,
-    CardanoRewardAddr,
     DustAddr,
     BigInt,
     TransactionResultStatus,
@@ -15,8 +14,7 @@ using {
     ContractActionType,
     DustLedgerEventType,
     TxType,
-    SyncStatus,
-    TokenCategory
+    SyncStatus
 } from './types.cds';
 
 /**
@@ -34,7 +32,6 @@ entity Blocks : cuid, managed {
     parent           : Association to Blocks;
     transactions     : Composition of many Transactions
                            on transactions.block = $self;
-    systemParameters : Association to SystemParameters;
 }
 
 /**
@@ -194,67 +191,6 @@ entity DustLedgerEvents : cuid {
 }
 
 // ============================================================================
-// System Parameters & Governance
-// ============================================================================
-
-/**
- * System-wide parameters
- */
-entity SystemParameters : cuid, managed {
-    validFrom                 : Timestamp not null;
-    validTo                   : Timestamp;
-
-    // D-Parameter (validator committee composition)
-    numPermissionedCandidates : Integer not null;
-    numRegisteredCandidates   : Integer not null;
-
-    // Terms and Conditions
-    termsHash                 : HexEncoded;
-    termsUrl                  : String(2048);
-}
-
-/**
- * D-Parameter history for governance tracking
- */
-entity DParameterHistory : cuid, managed {
-    effectiveFrom             : Timestamp not null;
-    effectiveTo               : Timestamp;
-    numPermissionedCandidates : Integer not null;
-    numRegisteredCandidates   : Integer not null;
-    block                     : Association to Blocks;
-}
-
-/**
- * Terms and Conditions history
- */
-entity TermsAndConditionsHistory : cuid, managed {
-    effectiveFrom : Timestamp not null;
-    effectiveTo   : Timestamp;
-    hash          : HexEncoded not null;
-    url           : String(2048) not null;
-    block         : Association to Blocks;
-}
-
-// ============================================================================
-// DUST Generation
-// ============================================================================
-
-/**
- * DUST generation status for Cardano reward addresses
- */
-entity DustGenerationStatus : cuid, managed {
-    cardanoRewardAddress : CardanoRewardAddr not null;
-    dustAddress          : DustAddr; // Bech32m-encoded
-    registered           : Boolean default false;
-    nightBalance         : BigInt not null; // NIGHT backing (STAR)
-    generationRate       : BigInt not null; // SPECK per second
-    maxCapacity          : BigInt not null; // maximum SPECK capacity
-    currentCapacity      : BigInt not null; // current SPECK capacity
-    utxoTxHash           : HexEncoded; // Cardano UTXO tx hash
-    utxoOutputIndex      : Integer; // Cardano UTXO output index
-}
-
-// ============================================================================
 // Session Management (for wallet connections)
 // ============================================================================
 
@@ -352,43 +288,4 @@ entity NightBalances {
         lastUpdatedAt      : Timestamp;
 }
 
-/**
- * NIGHT to DUST registration linkage (Cardano staking ↔ Midnight DUST)
- */
-entity DustRegistrations : cuid, managed {
-    // Cardano side
-    cardanoStakeKey : String(66) not null;
-    cardanoTxHash   : HexEncoded not null;
-
-    // Midnight side
-    dustPublicKey   : HexEncoded not null;
-    nightAddress    : String(256) not null;
-
-    // Status
-    isActive        : Boolean default true;
-    registeredAt    : Timestamp not null;
-    deregisteredAt  : Timestamp;
-
-    // NIGHT amount backing DUST generation
-    nightAmount     : Decimal(20, 0);
-}
-
-/**
- * Token type registry — tracks all known token types on the Midnight network
- */
-entity TokenTypes {
-    key tokenTypeId     : HexEncoded;
-        tokenName       : String(100);
-        tokenCategory   : TokenCategory;
-
-        // For contract-created tokens
-        contractAddress : HexEncoded;
-
-        // Metadata
-        decimals        : Integer;
-        totalSupply     : Decimal(30, 0);
-
-        firstSeenHeight : Integer64;
-        firstSeenAt     : Timestamp;
-}
 

@@ -4,13 +4,7 @@ Detailed configuration, runtime behavior, API surface, and development guide for
 
 ## Configuration
 
-Configure the plugin under `cds.requires.nightgate`. Runtime environment variables can override the network and node URLs.
-
-In this repository, the checked-in [../package.json](../package.json) now ships with Preprod defaults. Use environment overrides if you want to point the app back at a local standalone node.
-
-If the service is configured with `kind: "nightgate"` but no `network`, the plugin stays idle instead of auto-starting the crawler unless `NIGHTGATE_NETWORK` or `MIDNIGHT_NETWORK` is set.
-
-The bundled [docker/docker-compose.yml](../docker/docker-compose.yml) is for local standalone development only. For public Preprod, point Nightgate at the hosted RPC endpoint instead of trying to switch the compose preset.
+Configure the plugin under `cds.requires.nightgate`. Env vars override CDS config. Code defaults to Preprod with the public RPC.
 
 ### Minimal Configuration
 
@@ -18,15 +12,13 @@ The bundled [docker/docker-compose.yml](../docker/docker-compose.yml) is for loc
 {
   "cds": {
     "requires": {
-      "nightgate": {
-        "kind": "nightgate",
-        "network": "preprod",
-        "nodeUrl": "wss://rpc.preprod.midnight.network/"
-      }
+      "nightgate": { "kind": "nightgate" }
     }
   }
 }
 ```
+
+This is enough — defaults to `preprod` network and `wss://rpc.preprod.midnight.network/`.
 
 ### Full Runtime Configuration
 
@@ -42,7 +34,6 @@ The bundled [docker/docker-compose.yml](../docker/docker-compose.yml) is for loc
         "sessionTtlMs": 86400000,
         "crawler": {
           "enabled": true,
-          "nodeUrl": "wss://rpc.preprod.midnight.network/",
           "batchSize": 10,
           "maxRetries": 3,
           "retryDelay": 2000,
@@ -58,8 +49,8 @@ The bundled [docker/docker-compose.yml](../docker/docker-compose.yml) is for loc
 
 | Key | Default | Notes |
 |---|---|---|
-| `network` | `testnet` at runtime | Valid values are `testnet`, `preprod`, and `mainnet`; invalid values log an error and fall back to `testnet` |
-| `nodeUrl` | `ws://localhost:9944` | Should be a WebSocket endpoint; non-`ws`/`wss` values log a warning. For hosted Midnight Preprod use `wss://rpc.preprod.midnight.network/` |
+| `network` | `preprod` | Valid values are `testnet`, `preprod`, and `mainnet`; invalid values log an error and fall back to `preprod` |
+| `nodeUrl` | `wss://rpc.preprod.midnight.network/` | WebSocket endpoint (`ws://` or `wss://`). Use `ws://localhost:9944` for local Docker node |
 | `crawler.enabled` | `true` | When `false`, services still load but active indexing is disabled |
 | `crawler.nodeUrl` | top-level `nodeUrl` | Optional crawler-specific node URL override |
 | `crawler.batchSize` | `10` | Number of blocks per catch-up progress batch |
@@ -74,26 +65,20 @@ The bundled [docker/docker-compose.yml](../docker/docker-compose.yml) is for loc
 | Variable | Purpose | Default |
 |---|---|---|
 | `ENCRYPTION_KEY` | AES-256-GCM key material for wallet viewing-key encryption | Process-scoped dev fallback; **required** in production (`NODE_ENV=production`) — startup fails without it |
-| `NIGHTGATE_NETWORK` / `MIDNIGHT_NETWORK` | Override `cds.requires.nightgate.network` at runtime | Valid values are `testnet`, `preprod`, and `mainnet` |
-| `NIGHTGATE_NODE_URL` / `MIDNIGHT_NODE_URL` | Override `cds.requires.nightgate.nodeUrl` at runtime | Useful for switching node endpoints without editing `package.json` |
-| `NIGHTGATE_CRAWLER_NODE_URL` / `MIDNIGHT_CRAWLER_NODE_URL` | Override `cds.requires.nightgate.crawler.nodeUrl` at runtime | Takes precedence over the top-level node URL for crawler start/resume |
+| `NIGHTGATE_NETWORK` | Override `network` | `testnet`, `preprod`, or `mainnet` |
+| `NIGHTGATE_NODE_URL` | Override `nodeUrl` | WebSocket endpoint |
+| `NIGHTGATE_CRAWLER_NODE_URL` | Override `crawler.nodeUrl` | Falls back to `NIGHTGATE_NODE_URL` if not set |
 | `NODE_ENV=production` | Enables HSTS response header; enforces `ENCRYPTION_KEY` presence | Off unless explicitly set |
 
 For local repository startup, putting these values into a repo-root `.env` file works with `npm run dev` / `cds watch`. A tracked template is available in [../.env.example](../.env.example).
 
-### Preprod Runtime Example
+### Example `.env` Files
 
-Use the hosted Midnight Preprod RPC instead of the bundled Docker Compose node:
+Preprod is the default — no `.env` needed. For testnet with local Docker:
 
-```bash
-NIGHTGATE_NETWORK=preprod
-NIGHTGATE_NODE_URL=wss://rpc.preprod.midnight.network/
-```
-
-Optional dedicated crawler endpoint:
-
-```bash
-NIGHTGATE_CRAWLER_NODE_URL=wss://rpc.preprod.midnight.network/
+```env
+NIGHTGATE_NETWORK=testnet
+NIGHTGATE_NODE_URL=ws://localhost:9944
 ```
 
 ## Runtime Behavior
@@ -143,7 +128,8 @@ import {
   initialize,
   shutdown,
   getStatus,
-  NIGHTGATE_DEFAULTS
+  DEFAULT_NETWORK,
+  DEFAULT_NODE_URL
 } from '@odatano/nightgate';
 ```
 

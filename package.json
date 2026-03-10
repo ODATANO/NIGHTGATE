@@ -98,9 +98,7 @@
         }
       },
       "nightgate": {
-        "kind": "nightgate",
-        "network": "preprod",
-        "nodeUrl": "wss://rpc.preprod.midnight.network/"
+        "kind": "nightgate"
       },
       "kinds": {}
     },

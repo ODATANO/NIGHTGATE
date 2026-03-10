@@ -115,13 +115,15 @@ const plugin = {
                 description: 'Nightgate configuration for @odatano/nightgate',
                 properties: {
                     network: {
-                        description: 'Target Midnight network: testnet | preprod | mainnet. Can also be overridden via NIGHTGATE_NETWORK or MIDNIGHT_NETWORK.',
+                        description: 'Target Midnight network: testnet | preprod | mainnet. Override via NIGHTGATE_NETWORK env var.',
                         type: 'string',
-                        enum: ['testnet', 'preprod', 'mainnet']
+                        enum: ['testnet', 'preprod', 'mainnet'],
+                        default: 'preprod'
                     },
                     nodeUrl: {
-                        description: 'Midnight Node Substrate RPC endpoint (default: ws://localhost:9944). Can be overridden via NIGHTGATE_NODE_URL or MIDNIGHT_NODE_URL.',
-                        type: 'string'
+                        description: 'Midnight Node Substrate RPC endpoint. Override via NIGHTGATE_NODE_URL env var.',
+                        type: 'string',
+                        default: 'wss://rpc.preprod.midnight.network/'
                     },
                     contentSecurityPolicy: {
                         description: "Optional custom CSP header value. Use 'off' to disable CSP. Defaults to strict API policy and relaxed UI5 policy for /$fiori-preview/*.",
@@ -132,7 +134,7 @@ const plugin = {
                         type: 'object',
                         properties: {
                             enabled: { type: 'boolean', description: 'Enable active crawler (default: true)' },
-                            nodeUrl: { type: 'string', description: 'Override node URL for crawler (default: uses top-level nodeUrl). Can be overridden via NIGHTGATE_CRAWLER_NODE_URL or MIDNIGHT_CRAWLER_NODE_URL.' },
+                            nodeUrl: { type: 'string', description: 'Override node URL for crawler (default: uses top-level nodeUrl). Override via NIGHTGATE_CRAWLER_NODE_URL env var.' },
                             batchSize: { type: 'number', description: 'Blocks per batch during catch-up (default: 10)' },
                             maxRetries: { type: 'number', description: 'Max retries per block before error (default: 3)' },
                             retryDelay: { type: 'number', description: 'Base retry delay in ms (default: 2000)' },

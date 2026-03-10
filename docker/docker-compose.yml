@@ -1,9 +1,6 @@
 services:
   # Midnight Node — local standalone node for undeployed/local development only.
-  # This compose file does not launch the public Preprod network.
-  # For Preprod, point Nightgate at the hosted RPC instead:
-  #   NIGHTGATE_NETWORK=preprod
-  #   NIGHTGATE_NODE_URL=wss://rpc.preprod.midnight.network/
+  # For local testnet development only. Preprod uses the public RPC (default, no Docker needed).
   node:
     image: midnightntwrk/midnight-node:0.20.0
     container_name: odatano-night-node

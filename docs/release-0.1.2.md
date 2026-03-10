@@ -7,7 +7,7 @@ Prepared release notes and a publish checklist for the `0.1.2` Nightgate release
 `0.1.2` makes `@odatano/nightgate` Preprod-ready for public Midnight usage.
 
 - adds first-class `preprod` network support to the Nightgate runtime and plugin config
-- adds consistent `NIGHTGATE_*` and `MIDNIGHT_*` environment overrides for the network, node URL, and crawler node URL
+- adds `NIGHTGATE_NETWORK`, `NIGHTGATE_NODE_URL`, and `NIGHTGATE_CRAWLER_NODE_URL` environment overrides
 - switches the repository defaults to the hosted Midnight Preprod RPC at `wss://rpc.preprod.midnight.network/`
 - adds `.env.example` for the recommended Preprod startup path
 - clarifies that the bundled Docker Compose file remains local standalone only

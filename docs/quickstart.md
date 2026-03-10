@@ -10,10 +10,7 @@ It covers both supported entry points:
 ## Prerequisites
 
 - Node.js and npm
-- Docker Desktop or a working Docker engine
-- a Midnight node reachable over `ws://` or `wss://`
-
-For local undeployed development in this repository, the included Docker Compose file starts a dev-mode Midnight node on `ws://localhost:9944`. It is standalone-only and is not a Preprod launcher.
+- Docker Desktop (only for local testnet mode)
 
 ## Option A: Run This Repository Directly
 
@@ -25,41 +22,32 @@ npm ci
 
 ### 2. Choose the target environment
 
-#### Recommended: public Preprod
+#### Preprod (default — no Docker needed)
 
-The checked-in [../package.json](../package.json) now points to Preprod by default. A repo-root `.env` file is still recommended so the target stays explicit and easy to switch. A tracked template is available in [../.env.example](../.env.example).
-
-```env
-NIGHTGATE_NETWORK=preprod
-NIGHTGATE_NODE_URL=wss://rpc.preprod.midnight.network/
-# Optional:
-# NIGHTGATE_CRAWLER_NODE_URL=wss://rpc.preprod.midnight.network/
+```bash
+npm run dev
 ```
 
-Use `wss://`, not `https://`, because Nightgate connects to Midnight over Substrate RPC WebSocket.
+Nightgate defaults to Preprod with the public RPC at `wss://rpc.preprod.midnight.network/`. No `.env` or extra config needed.
 
-If this checkout already indexed a different network, delete [../db/midnight.db](../db/midnight.db), [../db/midnight.db-shm](../db/midnight.db-shm), and [../db/midnight.db-wal](../db/midnight.db-wal) before the first Preprod run so the crawler starts from a clean sync state.
-
-#### Alternative: local standalone Midnight node
+#### Testnet with local Docker node
 
 ```bash
 docker compose -f docker/docker-compose.yml up -d
 ```
 
-This starts the local standalone node. To point Nightgate at it instead of the repo's Preprod defaults, use a repo-root `.env` like this:
+Create a `.env` in the repo root:
 
 ```env
 NIGHTGATE_NETWORK=testnet
 NIGHTGATE_NODE_URL=ws://localhost:9944
 ```
 
-If you leave `.env` or `package.json` on Preprod, starting Docker Compose alone does not switch the crawler to the local node.
-
-### 3. Start Nightgate
-
 ```bash
 npm run dev
 ```
+
+If switching from a different network, delete `db/midnight.db*` first.
 
 Nightgate starts CAP from the TypeScript source tree and then:
 
@@ -69,9 +57,7 @@ Nightgate starts CAP from the TypeScript source tree and then:
 - runs historical catch-up
 - switches to live indexing
 
-To target a different environment without editing `package.json`, set `NIGHTGATE_NETWORK` and `NIGHTGATE_NODE_URL` before starting the app. `MIDNIGHT_NETWORK` and `MIDNIGHT_NODE_URL` are accepted as aliases.
-
-In this repository, using a root `.env` file is the easiest cross-shell way to switch between Preprod and local standalone.
+Override the target via `NIGHTGATE_NETWORK` and `NIGHTGATE_NODE_URL` env vars or a repo-root `.env` file.
 
 ### 4. Check that the service is up
 
@@ -143,22 +129,14 @@ Add this to your `package.json`:
 {
   "cds": {
     "requires": {
-      "db": {
-        "kind": "sqlite"
-      },
-      "nightgate": {
-        "kind": "nightgate",
-        "network": "preprod",
-        "nodeUrl": "wss://rpc.preprod.midnight.network/"
-      }
+      "db": { "kind": "sqlite" },
+      "nightgate": { "kind": "nightgate" }
     }
   }
 }
 ```
 
-Use only `cds.requires.nightgate`. There is no legacy alias path anymore.
-
-At runtime, `NIGHTGATE_NETWORK`, `NIGHTGATE_NODE_URL`, and `NIGHTGATE_CRAWLER_NODE_URL` override the matching `cds.requires.nightgate` values. `MIDNIGHT_*` aliases are also accepted.
+Nightgate defaults to Preprod. Override via env vars (`NIGHTGATE_NETWORK`, `NIGHTGATE_NODE_URL`) or CDS config.
 
 ### 3. Start the CAP app
 
@@ -186,13 +164,10 @@ These are the most relevant runtime settings for first use:
     "requires": {
       "nightgate": {
         "kind": "nightgate",
-        "network": "preprod",
-        "nodeUrl": "wss://rpc.preprod.midnight.network/",
         "corsOrigin": "*",
         "sessionTtlMs": 86400000,
         "crawler": {
           "enabled": true,
-          "nodeUrl": "wss://rpc.preprod.midnight.network/",
           "batchSize": 10,
           "maxRetries": 3,
           "retryDelay": 2000,

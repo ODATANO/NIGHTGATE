@@ -6,11 +6,8 @@ const mockStopCrawler = jest.fn();
 const mockIsCrawlerRunning = jest.fn();
 const ENV_KEYS = [
     'NIGHTGATE_NETWORK',
-    'MIDNIGHT_NETWORK',
     'NIGHTGATE_NODE_URL',
-    'MIDNIGHT_NODE_URL',
-    'NIGHTGATE_CRAWLER_NODE_URL',
-    'MIDNIGHT_CRAWLER_NODE_URL'
+    'NIGHTGATE_CRAWLER_NODE_URL'
 ] as const;
 const originalEnv = Object.fromEntries(ENV_KEYS.map((key) => [key, process.env[key]])) as Record<(typeof ENV_KEYS)[number], string | undefined>;
 
@@ -199,7 +196,7 @@ describe('NightgateIndexerService comprehensive coverage', () => {
 
         expect(mockDbRun.mock.calls[1][0]).toEqual(expect.objectContaining({
             __entries: expect.objectContaining({
-                networkId: 'testnet',
+                networkId: 'preprod',
                 nodeUrl: ''
             })
         }));

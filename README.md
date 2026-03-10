@@ -50,40 +50,34 @@ Version `0.1.2` is a read-side first release. Transaction build/sign/submit flow
 
 ## Quick Start
 
-### Run This Repository Against Preprod
+### Preprod (default — no Docker needed)
 
 ```bash
 npm ci
 npm run dev
 ```
 
-The checked-in [package.json](package.json) now points to Preprod by default. A repo-root `.env` is still the clearest way to make the target explicit. A tracked template is available in [.env.example](.env.example):
+Nightgate defaults to Preprod with the public RPC at `wss://rpc.preprod.midnight.network/`. No `.env` or extra config required.
 
-```env
-NIGHTGATE_NETWORK=preprod
-NIGHTGATE_NODE_URL=wss://rpc.preprod.midnight.network/
-```
-
-Use `wss://`, not `https://`, because Nightgate talks to Midnight over Substrate RPC WebSocket.
-
-### Run This Repository Against Local Standalone
+### Testnet with local Docker node
 
 ```bash
 npm ci
 docker compose -f docker/docker-compose.yml up -d
-npm run dev
 ```
 
-To use the local standalone node instead of the repo's Preprod defaults, override the runtime target before starting the app:
+Create a `.env` in the repo root:
 
 ```env
 NIGHTGATE_NETWORK=testnet
 NIGHTGATE_NODE_URL=ws://localhost:9944
 ```
 
-If this workspace already indexed Preprod, delete [db/midnight.db](db/midnight.db), [db/midnight.db-shm](db/midnight.db-shm), and [db/midnight.db-wal](db/midnight.db-wal) before switching the crawler back to the local node.
+```bash
+npm run dev
+```
 
-### Use As A CAP Plugin
+### Use as a CAP plugin
 
 ```bash
 cd my-cap-app
@@ -97,23 +91,21 @@ Add to `package.json`:
   "cds": {
     "requires": {
       "db": { "kind": "sqlite" },
-      "nightgate": {
-        "kind": "nightgate",
-        "network": "preprod",
-        "nodeUrl": "wss://rpc.preprod.midnight.network/"
-      }
+      "nightgate": { "kind": "nightgate" }
     }
   }
 }
 ```
 
-At runtime, `NIGHTGATE_NETWORK`, `NIGHTGATE_NODE_URL`, and `NIGHTGATE_CRAWLER_NODE_URL` override the matching `cds.requires.nightgate` values. `MIDNIGHT_NETWORK`, `MIDNIGHT_NODE_URL`, and `MIDNIGHT_CRAWLER_NODE_URL` are accepted as aliases.
+Then `cds watch`. Defaults to Preprod. Override via env vars or CDS config:
 
-The bundled [docker/docker-compose.yml](docker/docker-compose.yml) is for local standalone development only. For public Preprod, use `NIGHTGATE_NETWORK=preprod` with `NIGHTGATE_NODE_URL=wss://rpc.preprod.midnight.network/`.
+| Env var | CDS config key | Default |
+|---|---|---|
+| `NIGHTGATE_NETWORK` | `network` | `preprod` |
+| `NIGHTGATE_NODE_URL` | `nodeUrl` | `wss://rpc.preprod.midnight.network/` |
+| `NIGHTGATE_CRAWLER_NODE_URL` | `crawler.nodeUrl` | same as `nodeUrl` |
 
-For local repository startup, a root [.env.example](.env.example) can be copied to `.env` and adjusted without touching `package.json`.
-
-Then `cds watch`.
+If switching an existing DB to a different network, delete `db/midnight.db*` first.
 
 ### Query The API
 
