@@ -40,9 +40,37 @@ jest.mock('@sap/cds', () => {
 
 import { MidnightCrawler } from '../../srv/crawler/Crawler';
 
+const NIGHTGATE_ENV_KEYS = [
+    'NIGHTGATE_NETWORK',
+    'NIGHTGATE_NODE_URL',
+    'NIGHTGATE_CRAWLER_NODE_URL',
+    'NIGHTGATE_CRAWLER_ENABLED'
+] as const;
+const originalNightgateEnv = Object.fromEntries(
+    NIGHTGATE_ENV_KEYS.map((key) => [key, process.env[key]])
+) as Record<(typeof NIGHTGATE_ENV_KEYS)[number], string | undefined>;
+
 describe('MidnightCrawler helper paths', () => {
     beforeEach(() => {
         jest.clearAllMocks();
+        // The project's .env sets NIGHTGATE_NETWORK / NODE_URL for live runs;
+        // VS Code's Jest extension propagates those into the test process, where
+        // they'd override the mocked cds.env.requires.nightgate above and break
+        // these assertions. Clear them per-test so the mocked config wins.
+        for (const key of NIGHTGATE_ENV_KEYS) {
+            delete process.env[key];
+        }
+    });
+
+    afterAll(() => {
+        for (const key of NIGHTGATE_ENV_KEYS) {
+            const value = originalNightgateEnv[key];
+            if (value === undefined) {
+                delete process.env[key];
+            } else {
+                process.env[key] = value;
+            }
+        }
     });
 
     it('retries transient block-processing failures before succeeding', async () => {

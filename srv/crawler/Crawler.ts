@@ -1,5 +1,5 @@
 /**
- * MidnightCrawler — Blockchain Crawler Orchestrator
+ * MidnightCrawler, Blockchain Crawler Orchestrator
  *
  * Two-phase operation:
  * 1. Catch-Up: Sync historical blocks from lastIndexedHeight to chain tip
@@ -32,6 +32,20 @@ export interface CrawlerConfig {
     maxRetries?: number;        // max retries per block (default: 3)
     retryDelay?: number;        // ms between retries (default: 2000)
     requestTimeout?: number;    // RPC timeout ms (default: 30000)
+    /**
+     * Number of block-fetch BATCHES kept in flight at once during catch-up.
+     * With rpcBatchSize=32 and concurrency=8, that's 8 in-flight WSS frames
+     * each carrying 32 hash requests + later 64 block/timestamp requests.
+     * Tune down if the upstream rate-limits. (default: 8)
+     */
+    fetchConcurrency?: number;
+    /**
+     * Number of consecutive heights bundled into one JSON-RPC batch frame.
+     * Larger = fewer round-trips, larger response payloads. Some Substrate
+     * nodes cap batch size at 50-100; preprod accepts 32 comfortably.
+     * (default: 32)
+     */
+    rpcBatchSize?: number;
 }
 
 interface ReorgInfo {
@@ -50,7 +64,7 @@ export class MidnightCrawler {
     private processing: boolean = false;  // Mutex: prevent concurrent block processing
     private pendingHeights: number[] = [];  // Queued live block heights received during processing
     private subscriptionId: string | null = null;
-    private db: any;
+    private db!: cds.DatabaseService;
     private processor!: BlockProcessor;
     private startTime: number = 0;
     private blocksProcessed: number = 0;
@@ -67,7 +81,9 @@ export class MidnightCrawler {
             batchSize: config.batchSize || 10,
             maxRetries: config.maxRetries || 3,
             retryDelay: config.retryDelay || 2000,
-            requestTimeout: config.requestTimeout || 30000
+            requestTimeout: config.requestTimeout || 30000,
+            fetchConcurrency: config.fetchConcurrency ?? 8,
+            rpcBatchSize: config.rpcBatchSize ?? 32
         };
     }
 
@@ -102,25 +118,38 @@ export class MidnightCrawler {
 
             console.log('[Crawler] Starting...');
 
-            // Phase 1: Catch-up
-            await this.catchUp();
-
-            // Phase 2: Live subscription
-            if (this.isRunning) {
-                await this.subscribeLive();
-            }
-
-            // Phase 3: Second catch-up to cover blocks finalized between
-            // end of Phase 1 and subscription establishment in Phase 2
-            if (this.isRunning) {
-                const gapBlocks = await this.catchUp();
-                if (gapBlocks > 0) {
-                    console.log(`[Crawler] Gap catch-up: ${gapBlocks} blocks indexed`);
-                }
-            }
+            // Run the catch-up + live-subscription pipeline in the background.
+            // Awaiting it here would block the caller (cds.on('served') callback)
+            // until catch-up completes, which can take hours on a fresh DB. That
+            // prevents CAP's HTTP server from binding to its port. Fire-and-forget
+            // so the OData services come online immediately; the crawler keeps
+            // ingesting in parallel.
+            this.runIngestPipeline().catch(err => {
+                console.error('[Crawler] Ingest pipeline failed:', err);
+                this.isRunning = false;
+            });
         } catch (err) {
             this.isRunning = false;
             throw err;
+        }
+    }
+
+    private async runIngestPipeline(): Promise<void> {
+        // Phase 1: Catch-up
+        await this.catchUp();
+
+        // Phase 2: Live subscription
+        if (this.isRunning) {
+            await this.subscribeLive();
+        }
+
+        // Phase 3: Second catch-up to cover blocks finalized between
+        // end of Phase 1 and subscription establishment in Phase 2
+        if (this.isRunning) {
+            const gapBlocks = await this.catchUp();
+            if (gapBlocks > 0) {
+                console.log(`[Crawler] Gap catch-up: ${gapBlocks} blocks indexed`);
+            }
         }
     }
 
@@ -162,7 +191,7 @@ export class MidnightCrawler {
             const syncState = await this.getSyncState();
             const startHeight = this.getCatchUpStartHeight(syncState);
 
-            // Target finalized head (not chain tip) — avoids ingesting soon-reverted blocks
+            // Target finalized head (not chain tip), avoids ingesting soon-reverted blocks
             const finalizedHash = await this.nodeProvider.getFinalizedHead();
             const finalizedHeader = await this.nodeProvider.getHeader(finalizedHash);
             const tipHeight = MidnightNodeProvider.parseBlockNumber(finalizedHeader.number);
@@ -184,29 +213,114 @@ export class MidnightCrawler {
                 }).where({ ID: 'SINGLETON' })
             );
 
-            let processed = 0;
-            const batchStart = Date.now();
+            const processed = await this.runCatchUpPipeline(startHeight, tipHeight, totalBlocks);
+            return processed;
+        } finally {
+            this.isCatchingUp = false;
+        }
+    }
 
-            for (let h = startHeight; h <= tipHeight && this.isRunning; h++) {
-                try {
-                    const result = await this.processBlockWithRetry(h);
+    /**
+     * Pipelined catch-up with JSON-RPC batching.
+     *
+     * Each in-flight unit is now a BATCH of K consecutive heights. Each batch
+     * does exactly 2 WSS round-trips (one for hashes, one for blocks+timestamps).
+     * `fetchConcurrency` batches stay in flight at once.
+     *
+     * Throughput model: bps ≈ K × concurrency × (1 / (2 × RTT)). For RTT=200ms,
+     * K=32, concurrency=8: 32×8/0.4 = 640 bps theoretical. Real-world ceiling
+     * comes from public-endpoint rate limits.
+     *
+     * Persist is serial in height order (reorg detection requires monotonic
+     * progression). With persist at ~15ms/block we get a write ceiling of
+     * ~65 bps per persister thread. If fetch outpaces persist, `wait=0` in the
+     * diagnostic line and persist becomes the floor.
+     */
+    private async runCatchUpPipeline(
+        startHeight: number,
+        tipHeight: number,
+        totalBlocks: number
+    ): Promise<number> {
+        const concurrency = Math.max(1, this.config.fetchConcurrency);
+        const rpcBatchSize = Math.max(1, this.config.rpcBatchSize ?? 32);
+        const batchStart = Date.now();
+        let processed = 0;
+        let nextHeightToFetch = startHeight;
+        let nextHeightToPersist = startHeight;
+
+        // Diagnostic accumulators (reset per progress log).
+        let acc = { fetchMsTotal: 0, persistMsTotal: 0, waitedForFetchMs: 0, samples: 0 };
+
+        // Queue of in-flight batches; each is a Promise<PreparedBlock[]> covering
+        // a contiguous height range. Drained in submission order.
+        const queue: Array<{ from: number; to: number; data: Promise<any[]> }> = [];
+
+        const pumpFetches = () => {
+            while (
+                queue.length < concurrency &&
+                nextHeightToFetch <= tipHeight &&
+                this.isRunning
+            ) {
+                const from = nextHeightToFetch;
+                const to = Math.min(from + rpcBatchSize - 1, tipHeight);
+                const heights: number[] = [];
+                for (let h = from; h <= to; h++) heights.push(h);
+                queue.push({ from, to, data: this.fetchBlockBatchWithRetry(heights) });
+                nextHeightToFetch = to + 1;
+            }
+        };
+
+        pumpFetches();
+
+        outer:
+        while (nextHeightToPersist <= tipHeight && this.isRunning) {
+            const head = queue.shift();
+            if (!head) break;
+
+            let preps: any[];
+            try {
+                const waitStart = Date.now();
+                preps = await head.data;
+                const waitedForFetchMs = preps[0]?.fetchCompletedAt
+                    ? Math.max(0, Date.now() - preps[0].fetchCompletedAt)
+                    : Math.max(0, Date.now() - waitStart);
+
+                for (const prep of preps) {
+                    if (!this.isRunning) break;
+                    const h = prep.height;
+                    const fetchMs = (prep.fetchCompletedAt ?? Date.now()) - (prep.fetchStartedAt ?? Date.now());
+                    const fetchMsPerBlock = preps.length > 0 ? fetchMs / preps.length : fetchMs;
+
+                    const persistStart = Date.now();
+                    await this.processor.persistPreparedBlock(prep);
+                    const persistMs = Date.now() - persistStart;
+
+                    acc.fetchMsTotal += fetchMsPerBlock;
+                    acc.persistMsTotal += persistMs;
+                    acc.waitedForFetchMs += waitedForFetchMs / preps.length;
+                    acc.samples++;
+
                     processed++;
                     this.blocksProcessed++;
+                    nextHeightToPersist = h + 1;
 
-                    // Progress logging
                     if (processed % this.config.batchSize === 0 || h === tipHeight) {
                         const elapsed = (Date.now() - batchStart) / 1000;
                         const bps = elapsed > 0 ? processed / elapsed : 0;
                         const remaining = tipHeight - h;
                         const eta = bps > 0 ? remaining / bps : 0;
+                        const avgFetch   = acc.samples ? (acc.fetchMsTotal / acc.samples).toFixed(0) : '0';
+                        const avgPersist = acc.samples ? (acc.persistMsTotal / acc.samples).toFixed(0) : '0';
+                        const avgWait    = acc.samples ? (acc.waitedForFetchMs / acc.samples).toFixed(0) : '0';
 
                         console.log(
                             `[Crawler] Catch-up: ${h}/${tipHeight} ` +
                             `(${((h - startHeight + 1) / totalBlocks * 100).toFixed(1)}%) ` +
-                            `${bps.toFixed(1)} blocks/s, ETA: ${Math.ceil(eta)}s`
+                            `${bps.toFixed(1)} bps, ETA: ${Math.ceil(eta)}s ` +
+                            `[fetch=${avgFetch}ms persist=${avgPersist}ms wait=${avgWait}ms batch=${rpcBatchSize}]`
                         );
+                        acc = { fetchMsTotal: 0, persistMsTotal: 0, waitedForFetchMs: 0, samples: 0 };
 
-                        // Update SyncState with progress
                         await this.db.run(
                             UPDATE.entity('midnight.SyncState').set({
                                 syncProgress: ((h - startHeight + 1) / totalBlocks * 100),
@@ -215,24 +329,90 @@ export class MidnightCrawler {
                             }).where({ ID: 'SINGLETON' })
                         );
                     }
-                } catch (err) {
-                    console.error(`[Crawler] Failed to process block ${h} after ${this.config.maxRetries} retries:`, (err as Error).message);
-                    await this.recordError((err as Error).message);
-
-                    // Check if we should continue
-                    const state = await this.getSyncState();
-                    if ((state?.consecutiveErrors || 0) > 10) {
-                        console.error('[Crawler] Too many consecutive errors, stopping catch-up');
-                        break;
-                    }
                 }
+            } catch (err) {
+                console.error(
+                    `[Crawler] Failed to process batch ${head.from}-${head.to}:`,
+                    (err as Error).message
+                );
+                await this.recordError((err as Error).message);
+
+                const state = await this.getSyncState();
+                if ((state?.consecutiveErrors || 0) > 10) {
+                    console.error('[Crawler] Too many consecutive errors, stopping catch-up');
+                    break outer;
+                }
+                nextHeightToPersist = head.to + 1;
             }
 
-            console.log(`[Crawler] Catch-up complete: ${processed} blocks in ${((Date.now() - batchStart) / 1000).toFixed(1)}s`);
-            return processed;
-        } finally {
-            this.isCatchingUp = false;
+            pumpFetches();
         }
+
+        // Drain in-flight prefetches we don't intend to persist (best effort).
+        for (const item of queue) {
+            item.data.catch(() => { /* discard */ });
+        }
+
+        console.log(`[Crawler] Catch-up complete: ${processed} blocks in ${((Date.now() - batchStart) / 1000).toFixed(1)}s`);
+        return processed;
+    }
+
+    /**
+     * Batch fetch with the same transient-error retry policy as
+     * `fetchBlockWithRetry`. On retry, the entire batch is re-fetched.
+     */
+    private async fetchBlockBatchWithRetry(heights: number[]): Promise<any[]> {
+        let lastError: Error | null = null;
+        for (let attempt = 1; attempt <= this.config.maxRetries; attempt++) {
+            try {
+                return await this.processor.fetchBlockBatch(heights);
+            } catch (err) {
+                lastError = err as Error;
+                const transient = isTransientError(lastError);
+                if (!transient) {
+                    console.error(`[Crawler] Batch ${heights[0]}-${heights[heights.length-1]} permanent error: ${lastError.message}`);
+                    break;
+                }
+                if (attempt < this.config.maxRetries) {
+                    const delay = calcBackoff(attempt, this.config.retryDelay);
+                    console.warn(
+                        `[Crawler] Batch ${heights[0]}-${heights[heights.length-1]} attempt ${attempt} failed (transient): ` +
+                        `${lastError.message}, retrying in ${Math.round(delay)}ms`
+                    );
+                    await this.sleep(delay);
+                }
+            }
+        }
+        throw lastError || new Error(`Failed to fetch batch starting at ${heights[0]}`);
+    }
+
+    /**
+     * Fetch a block's data (no DB write) with the same transient-error retry
+     * policy used by the legacy `processBlockWithRetry`.
+     */
+    private async fetchBlockWithRetry(height: number): Promise<any> {
+        let lastError: Error | null = null;
+        for (let attempt = 1; attempt <= this.config.maxRetries; attempt++) {
+            try {
+                return await this.processor.fetchBlockData(height);
+            } catch (err) {
+                lastError = err as Error;
+                const transient = isTransientError(lastError);
+                if (!transient) {
+                    console.error(`[Crawler] Block ${height} permanent error: ${lastError.message}`);
+                    break;
+                }
+                if (attempt < this.config.maxRetries) {
+                    const delay = calcBackoff(attempt, this.config.retryDelay);
+                    console.warn(
+                        `[Crawler] Block ${height} fetch attempt ${attempt} failed (transient): ` +
+                        `${lastError.message}, retrying in ${Math.round(delay)}ms`
+                    );
+                    await this.sleep(delay);
+                }
+            }
+        }
+        throw lastError || new Error(`Failed to fetch block ${height}`);
     }
 
     // ========================================================================
@@ -258,7 +438,7 @@ export class MidnightCrawler {
 
             const height = MidnightNodeProvider.parseBlockNumber(header.number);
 
-            // Queue block height if already processing — don't drop it
+            // Queue block height if already processing, don't drop it
             if (this.processing) {
                 this.pendingHeights.push(height);
                 return;
@@ -518,7 +698,7 @@ export class MidnightCrawler {
                 const transient = isTransientError(lastError);
 
                 if (!transient) {
-                    // Permanent error — don't retry
+                    // Permanent error, don't retry
                     console.error(`[Crawler] Block ${height} permanent error: ${lastError.message}`);
                     break;
                 }

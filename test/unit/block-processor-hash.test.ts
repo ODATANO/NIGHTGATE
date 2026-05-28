@@ -65,7 +65,7 @@ function buildUnsignedExtrinsic(palletIndex: number, callIndex: number): string 
 // 1A: blake2b-256 Extrinsic Hashing
 // ============================================================================
 
-describe('hashExtrinsic — blake2b-256', () => {
+describe('hashExtrinsic: blake2b-256', () => {
     const processor = new BlockProcessor({} as any);
 
     it('produces a deterministic 66-char hex hash (0x + 64)', () => {
@@ -146,7 +146,7 @@ describe('classifyExtrinsic and mapPalletCall', () => {
 // 1B: On-chain Timestamp Parsing
 // ============================================================================
 
-describe('getBlockTimestamp — SCALE u64 LE parsing', () => {
+describe('getBlockTimestamp: SCALE u64 LE parsing', () => {
     const provider = {
         getStorage: jest.fn()
     } as any;
@@ -199,7 +199,7 @@ describe('getBlockTimestamp — SCALE u64 LE parsing', () => {
 // 1C: protocolVersion from RuntimeVersion
 // ============================================================================
 
-describe('getProtocolVersion — RuntimeVersion cache', () => {
+describe('getProtocolVersion: RuntimeVersion cache', () => {
     beforeEach(() => {
         jest.clearAllMocks();
     });
@@ -217,19 +217,34 @@ describe('getProtocolVersion — RuntimeVersion cache', () => {
         expect(provider.getRuntimeVersion).toHaveBeenCalledTimes(1);
     });
 
-    it('falls back to the cached specVersion on runtime version errors', async () => {
+    it('serves subsequent calls from the cache regardless of block hash', async () => {
+        // Once `cachedSpecVersionValid` is true, callers get the cached value
+        // without another RPC, even for a different block hash. This is the
+        // optimisation that saves ~1 RPC per block during catch-up.
+        const provider = {
+            getRuntimeVersion: jest.fn()
+        } as any;
+        const processor = new BlockProcessor(provider);
+        provider.getRuntimeVersion.mockResolvedValueOnce({ specVersion: 42 });
+
+        await expect((processor as any).getProtocolVersion('0xabc')).resolves.toBe(42);
+        await expect((processor as any).getProtocolVersion('0xdef')).resolves.toBe(42);
+        await expect((processor as any).getProtocolVersion('0x999')).resolves.toBe(42);
+        expect(provider.getRuntimeVersion).toHaveBeenCalledTimes(1);
+    });
+
+    it('logs a warning and returns the cached value if the initial fetch fails', async () => {
         const provider = {
             getRuntimeVersion: jest.fn()
         } as any;
         const processor = new BlockProcessor(provider);
         const warnSpy = jest.spyOn(console, 'warn').mockImplementation();
-        provider.getRuntimeVersion
-            .mockResolvedValueOnce({ specVersion: 42 })
-            .mockRejectedValueOnce(new Error('runtime unavailable'));
+        provider.getRuntimeVersion.mockRejectedValueOnce(new Error('runtime unavailable'));
 
         try {
-            await expect((processor as any).getProtocolVersion('0xabc')).resolves.toBe(42);
-            await expect((processor as any).getProtocolVersion('0xdef')).resolves.toBe(42);
+            // Cache uninitialised; on RPC failure we surface 0 (the initial value)
+            // and log the failure so the operator sees it.
+            await expect((processor as any).getProtocolVersion('0xabc')).resolves.toBe(0);
             expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('Failed to get runtime version'));
         } finally {
             warnSpy.mockRestore();
@@ -241,7 +256,7 @@ describe('getProtocolVersion — RuntimeVersion cache', () => {
 // 1D: Structured Author from Digest Logs
 // ============================================================================
 
-describe('extractAuthor — digest log parsing', () => {
+describe('extractAuthor: digest log parsing', () => {
     const processor = new BlockProcessor({} as any);
 
     it('extracts PreRuntime log with BABE engine', () => {

@@ -1,5 +1,5 @@
 /**
- * MidnightNodeProvider — Substrate RPC WebSocket Client
+ * MidnightNodeProvider, Substrate RPC WebSocket Client
  *
  * Connects directly to a Midnight Node via Substrate JSON-RPC 2.0 over WebSocket.
  * Primary data source for the active crawler. Independent of the hosted Midnight Indexer.
@@ -134,7 +134,7 @@ export class MidnightNodeProvider {
                     this.subscriptions.clear();
 
                     if (!wasConnected) {
-                        // Socket closed before 'open' — reject the connect() promise
+                        // Socket closed before 'open', reject the connect() promise
                         reject(new Error(`WebSocket closed before connection established to ${this.config.nodeUrl}`));
                         return;
                     }
@@ -246,15 +246,69 @@ export class MidnightNodeProvider {
         });
     }
 
+    /**
+     * Send multiple RPCs in a single JSON-RPC 2.0 batch request.
+     *
+     * One WSS frame out, one frame in. The server processes the calls in
+     * parallel internally and returns a response array; we resolve each
+     * caller's promise as the matching id arrives in `handleMessage`.
+     *
+     * Returns results in the SAME ORDER as the input requests. Throws if any
+     * single sub-request errors out (matches the rpc() semantics).
+     */
+    async rpcBatch(requests: Array<{ method: string; params?: unknown[] }>): Promise<any[]> {
+        if (!this.ws || !this.connected) {
+            throw new Error('Not connected to Midnight Node');
+        }
+        if (requests.length === 0) return [];
+
+        const ids: number[] = [];
+        const promises: Promise<any>[] = [];
+
+        for (const req of requests) {
+            const id = ++this.requestId;
+            ids.push(id);
+            promises.push(new Promise((resolve, reject) => {
+                const timeout = setTimeout(() => {
+                    this.pendingRequests.delete(id);
+                    reject(new Error(`RPC timeout: ${req.method} (${this.config.requestTimeout}ms)`));
+                }, this.config.requestTimeout);
+                this.pendingRequests.set(id, { resolve, reject, timeout });
+            }));
+        }
+
+        const payload: JsonRpcRequest[] = requests.map((req, i) => ({
+            jsonrpc: '2.0',
+            id: ids[i],
+            method: req.method,
+            params: req.params ?? []
+        }));
+
+        this.ws.send(JSON.stringify(payload));
+        return Promise.all(promises);
+    }
+
     private handleMessage(raw: string): void {
-        let message: JsonRpcResponse;
+        let parsed: unknown;
         try {
-            message = JSON.parse(raw);
+            parsed = JSON.parse(raw);
         } catch {
             console.warn('[MidnightNode] Invalid JSON message received');
             return;
         }
 
+        // JSON-RPC 2.0 batch response: a top-level array of response objects.
+        // Iterate and dispatch each as a normal message.
+        if (Array.isArray(parsed)) {
+            for (const msg of parsed) {
+                this.handleSingleMessage(msg as JsonRpcResponse);
+            }
+            return;
+        }
+        this.handleSingleMessage(parsed as JsonRpcResponse);
+    }
+
+    private handleSingleMessage(message: JsonRpcResponse): void {
         // Subscription notification
         if (message.method && message.params?.subscription) {
             const callback = this.subscriptions.get(message.params.subscription);

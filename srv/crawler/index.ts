@@ -1,5 +1,5 @@
 /**
- * Crawler module — public API and lifecycle management
+ * Crawler module, public API and lifecycle management
  */
 
 import { MidnightNodeProvider } from '../providers/MidnightNodeProvider';
@@ -14,7 +14,7 @@ let activeCrawler: MidnightCrawler | null = null;
 let activeNodeProvider: MidnightNodeProvider | null = null;
 
 /**
- * Start the crawler. Idempotent — calling twice is a no-op.
+ * Start the crawler. Idempotent, calling twice is a no-op.
  */
 export async function startCrawler(config: CrawlerConfig & { nodeUrl: string; requestTimeout?: number }): Promise<void> {
     if (activeCrawler) {

@@ -1,5 +1,5 @@
 /**
- * Retry utilities — transient error detection and exponential backoff.
+ * Retry utilities, transient error detection and exponential backoff.
  */
 
 const TRANSIENT_PATTERNS = [
