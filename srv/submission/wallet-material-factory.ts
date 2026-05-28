@@ -36,6 +36,7 @@ const { SELECT } = cds.ql;
 import crypto from 'crypto';
 import { decrypt, getEncryptionKey } from '../utils/crypto';
 import { loadLedgerV8 } from '../midnight/sdk-loader';
+import { deriveRoleSeeds } from '../utils/wallet-hd';
 import { getOrBuildWalletFacade, type WalletFacadeBuildArgs } from './wallet-facade-builder';
 import type { WalletMaterial, PrivateStateBackend } from '../midnight/providers';
 
@@ -226,15 +227,18 @@ async function createFacadeBackedWalletAdapter(
     seedHex: string,
     facadeConfig: Omit<WalletFacadeBuildArgs, 'seedHex'>
 ): Promise<any> {
-    if (!/^[0-9a-fA-F]{64}$/.test(seedHex)) {
-        throw new Error('Invalid seed: must be 64 hex characters (32 bytes)');
+    if (!/^[0-9a-fA-F]{128}$/.test(seedHex)) {
+        throw new Error('Invalid seed: must be 128 hex characters (64-byte BIP39 seed)');
     }
 
     // Derive pubkeys eagerly so getCoinPublicKey/getEncryptionPublicKey are
-    // synchronous, satisfying the WalletProvider interface contract.
-    const seedBytes = Buffer.from(seedHex, 'hex');
+    // synchronous, satisfying the WalletProvider interface contract. seedHex is
+    // the BIP39 seed; the shielded account comes from the Zswap HD role (see
+    // srv/utils/wallet-hd.ts), not the raw seed.
+    const bip39Seed = new Uint8Array(Buffer.from(seedHex, 'hex'));
+    const roleSeeds = await deriveRoleSeeds(bip39Seed);
     const ledger = await loadLedgerV8();
-    const zswapKeys = ledger.ZswapSecretKeys.fromSeed(new Uint8Array(seedBytes));
+    const zswapKeys = ledger.ZswapSecretKeys.fromSeed(roleSeeds.zswap);
     const coinPublicKey       = zswapKeys.coinPublicKey;
     const encryptionPublicKey = zswapKeys.encryptionPublicKey;
 
@@ -268,17 +272,19 @@ async function createFacadeBackedWalletAdapter(
 }
 
 async function createSigningCapableWalletAdapter(seedHex: string): Promise<any> {
-    if (!/^[0-9a-fA-F]{64}$/.test(seedHex)) {
+    if (!/^[0-9a-fA-F]{128}$/.test(seedHex)) {
         // Defense in depth; connectWalletForSigning already validates this.
-        throw new Error('Invalid seed: must be 64 hex characters (32 bytes)');
+        throw new Error('Invalid seed: must be 128 hex characters (64-byte BIP39 seed)');
     }
 
-    const seedBytes = Buffer.from(seedHex, 'hex');
+    const bip39Seed = new Uint8Array(Buffer.from(seedHex, 'hex'));
+    const roleSeeds = await deriveRoleSeeds(bip39Seed);
     const ledger = await loadLedgerV8();
 
-    // Derive both key sets from the same seed (matches Midnight wallet conventions).
-    const zswapKeys = ledger.ZswapSecretKeys.fromSeed(new Uint8Array(seedBytes));
-    const dustKey   = ledger.DustSecretKey.fromSeed(new Uint8Array(seedBytes));
+    // Each key type comes from its own HD role (Zswap/Dust), matching Lace —
+    // see srv/utils/wallet-hd.ts.
+    const zswapKeys = ledger.ZswapSecretKeys.fromSeed(roleSeeds.zswap);
+    const dustKey   = ledger.DustSecretKey.fromSeed(roleSeeds.dust);
 
     const coinPublicKey       = zswapKeys.coinPublicKey;
     const encryptionPublicKey = zswapKeys.encryptionPublicKey;

@@ -304,8 +304,14 @@ service NightgateService {
 
     /**
      * Upgrade an existing read-only session with signing capability.
-     * Stores the seed key encrypted at rest (AES-256-GCM via ENCRYPTION_KEY).
+     * Stores the BIP39 seed encrypted at rest (AES-256-GCM via ENCRYPTION_KEY).
      * Required before deployContract/submitContractCall flows can balance/submit.
+     *
+     * Provide the wallet's BIP39 `mnemonic` (the Lace recovery phrase) — the
+     * server derives the per-role HD keys exactly as Lace does (see
+     * srv/utils/wallet-hd.ts). `seedHex` is an optional programmatic
+     * alternative: the raw 64-byte BIP39 seed as 128 hex chars (NOT a 32-byte
+     * key). One of `mnemonic` or `seedHex` is required.
      *
      * The session UPDATE happens synchronously — `signingEnabled: true` is
      * returned as soon as the encrypted seed is persisted, so callers can
@@ -320,7 +326,8 @@ service NightgateService {
      */
     action connectWalletForSigning(
         sessionId:      UUID,
-        seedHex:        String,
+        mnemonic:       String,  // BIP39 recovery phrase (preferred)
+        seedHex:        String,  // optional: 64-byte BIP39 seed as 128 hex chars
         idempotencyKey: String   // optional; dedupes retries on a flaky network
     ) returns {
         sessionId:      UUID;

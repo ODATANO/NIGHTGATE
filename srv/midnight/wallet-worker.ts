@@ -32,6 +32,7 @@ import {
     deriveAttestationSecret,
     getContractWitnessFactory
 } from '../submission/contract-witnesses';
+import { deriveRoleSeeds } from '../utils/wallet-hd';
 // Type-only import of the ESM-only address-format package. `import type`
 // is erased at compile time so we don't emit a require() against an ESM-only
 // module; runtime access still goes through dynamic `import()` in
@@ -469,16 +470,20 @@ async function buildFacade(args: InitArgs): Promise<FacadeEntry> {
     const sdk = await loadSdk();
     await ensureNetworkId(args.networkId, sdk);
 
-    const seedBytes = new Uint8Array(Buffer.from(args.seedHex, 'hex'));
-    const zswapKeys = sdk.ledger.ZswapSecretKeys.fromSeed(seedBytes);
-    const dustKey   = sdk.ledger.DustSecretKey.fromSeed(seedBytes);
+    // args.seedHex is the 64-byte BIP39 seed (128 hex). Lace derives each key
+    // type from a DIFFERENT HD role (Zswap/Dust/NightExternal); deriving them
+    // all from one raw seed lands on the wrong account. See srv/utils/wallet-hd.ts.
+    const bip39Seed = new Uint8Array(Buffer.from(args.seedHex, 'hex'));
+    const roleSeeds = await deriveRoleSeeds(bip39Seed);
+    const zswapKeys = sdk.ledger.ZswapSecretKeys.fromSeed(roleSeeds.zswap);
+    const dustKey   = sdk.ledger.DustSecretKey.fromSeed(roleSeeds.dust);
 
     const txHistoryStorage = new sdk.abstractions.InMemoryTransactionHistoryStorage(
         sdk.facade.WalletEntrySchema,
         sdk.facade.mergeWalletEntries
     );
     const { createKeystore, PublicKey } = sdk.unshielded;
-    const unshieldedKeystore = createKeystore(seedBytes, args.networkId);
+    const unshieldedKeystore = createKeystore(roleSeeds.night, args.networkId);
 
     const configuration = {
         networkId: args.networkId,
@@ -521,7 +526,7 @@ async function buildFacade(args: InitArgs): Promise<FacadeEntry> {
         dustKey,
         unshieldedKeystore,
         networkId: args.networkId,
-        attestationSecret: deriveAttestationSecret(seedBytes)
+        attestationSecret: deriveAttestationSecret(roleSeeds.zswap)
     };
 }
 

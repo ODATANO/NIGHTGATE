@@ -13,7 +13,7 @@
 //
 // Required env vars (set in .env):
 //   LACE_VIEWING_KEY            64-char hex
-//   LACE_SEED_HEX               64-char hex
+//   LACE_MNEMONIC               BIP39 recovery phrase (server HD-derives keys)
 // Optional:
 //   NIGHTGATE_URL               default http://localhost:4004
 
@@ -29,17 +29,16 @@ setGlobalDispatcher(new Agent({
 
 const URL_BASE = process.env.NIGHTGATE_URL || 'http://localhost:4004';
 const ENDPOINT = `${URL_BASE}/api/v1/nightgate`;
-const VK   = process.env.LACE_VIEWING_KEY;
-const SEED = process.env.LACE_SEED_HEX;
+const VK       = process.env.LACE_VIEWING_KEY;
+const MNEMONIC = (process.env.LACE_MNEMONIC || '').trim();
 
 function fail(msg) { console.error(`FAIL ${msg}`); process.exit(1); }
 function step(name) { console.log(`\n--- ${name} ---`); }
 function pretty(o) { return JSON.stringify(o, null, 2); }
 
-if (!VK)   fail('LACE_VIEWING_KEY env var is required (set in .env)');
-if (!SEED) fail('LACE_SEED_HEX env var is required (set in .env)');
-if (!/^[0-9a-fA-F]{64}$/.test(VK))   fail('LACE_VIEWING_KEY must be 64 hex chars');
-if (!/^[0-9a-fA-F]{64}$/.test(SEED)) fail('LACE_SEED_HEX must be 64 hex chars');
+if (!VK)       fail('LACE_VIEWING_KEY env var is required (set in .env)');
+if (!MNEMONIC) fail('LACE_MNEMONIC env var is required (set in .env)');
+if (!/^[0-9a-fA-F]{64}$/.test(VK)) fail('LACE_VIEWING_KEY must be 64 hex chars');
 
 async function post(path, body) {
     const r = await fetch(`${ENDPOINT}${path}`, {
@@ -62,7 +61,7 @@ async function post(path, body) {
     console.log(`OK   sessionId = ${sessionId}`);
 
     step('2. connectWalletForSigning → kicks off facade pre-warm');
-    r = await post('/connectWalletForSigning', { sessionId, seedHex: SEED });
+    r = await post('/connectWalletForSigning', { sessionId, mnemonic: MNEMONIC });
     if (r.status !== 200 && r.status !== 201) fail(`HTTP ${r.status}: ${pretty(r.body)}`);
     console.log(`OK   ${pretty(r.body)}`);
 

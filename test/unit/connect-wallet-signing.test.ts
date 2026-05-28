@@ -114,7 +114,7 @@ function whereFromCqn(where: any): any {
     return where;
 }
 
-const VALID_SEED = 'a'.repeat(64);
+const VALID_SEED = 'a'.repeat(128); // 64-byte BIP39 seed (128 hex chars)
 
 function seedSession(db: ReturnType<typeof makeFakeDb>, overrides: any = {}) {
     db.tables['midnight.WalletSessions'].push({

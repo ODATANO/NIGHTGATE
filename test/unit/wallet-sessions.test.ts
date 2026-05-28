@@ -201,7 +201,7 @@ describe('wallet session handlers', () => {
             sessionId: 'sess-1',
             isActive: true,
             encryptedViewingKey: encrypt('a'.repeat(64), encKey),
-            encryptedSeedKey: opts.withSeed === false ? null : encrypt('b'.repeat(64), encKey),
+            encryptedSeedKey: opts.withSeed === false ? null : encrypt('b'.repeat(128), encKey),
             expiresAt: new Date(Date.now() + future).toISOString()
         };
     }
@@ -394,7 +394,7 @@ describe('wallet session handlers', () => {
     // ------------------------------------------------------------------
 
     describe('connectWalletForSigning', () => {
-        const VALID_SEED = 'a'.repeat(64);
+        const VALID_SEED = 'a'.repeat(128); // 64-byte BIP39 seed (128 hex chars)
         const consoleSpies: jest.SpyInstance[] = [];
 
         beforeEach(() => {
@@ -425,11 +425,11 @@ describe('wallet session handlers', () => {
 
             const noSeed = createMockRequest({ sessionId: 's1' });
             await registeredHandlers['connectWalletForSigning'](noSeed);
-            expect(noSeed.reject).toHaveBeenCalledWith(400, 'seedHex is required');
+            expect(noSeed.reject).toHaveBeenCalledWith(400, expect.stringContaining('mnemonic or seedHex'));
 
             const badHex = createMockRequest({ sessionId: 's1', seedHex: 'not-hex' });
             await registeredHandlers['connectWalletForSigning'](badHex);
-            expect(badHex.reject).toHaveBeenCalledWith(400, expect.stringContaining('64 hex characters'));
+            expect(badHex.reject).toHaveBeenCalledWith(400, expect.stringContaining('128 hex characters'));
         });
 
         it('rejects 404 when the session row is missing', async () => {

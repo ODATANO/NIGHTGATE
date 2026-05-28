@@ -42,6 +42,23 @@ jest.mock('../../srv/midnight/sdk-loader', () => {
     };
 });
 
+// Mock the ESM-only HD derivation lib. deriveRoleSeeds is deterministic per
+// input BIP39 seed so determinism / different-seed assertions hold.
+jest.mock('../../srv/utils/wallet-hd', () => {
+    const c = require('crypto');
+    const role = (seed: Uint8Array, label: string) =>
+        new Uint8Array(c.createHash('sha256').update(Buffer.from(seed)).update(label).digest());
+    return {
+        deriveRoleSeeds: jest.fn(async (bip39Seed: Uint8Array) => ({
+            zswap: role(bip39Seed, 'zswap'),
+            dust:  role(bip39Seed, 'dust'),
+            night: role(bip39Seed, 'night')
+        })),
+        mnemonicToBip39SeedHex: jest.fn((m: string) =>
+            c.createHash('sha512').update(m).digest('hex'))
+    };
+});
+
 import {
     buildWalletMaterialForSession,
     deriveAccountId,
@@ -239,7 +256,7 @@ describe('walletAndMidnightProvider adapter (T7, read-only material only)', () =
 // ---- Signing-capable adapter (T7-extended.a) ------------------------------
 
 describe('signing-capable wallet adapter (session with encryptedSeedKey)', () => {
-    const VALID_SEED = 'a'.repeat(64);
+    const VALID_SEED = 'a'.repeat(128); // 64-byte BIP39 seed
 
     test('returns real coinPublicKey and encryptionPublicKey from derived ZswapSecretKeys', async () => {
         const encSeed = encrypt(VALID_SEED, TEST_KEY);
@@ -275,8 +292,8 @@ describe('signing-capable wallet adapter (session with encryptedSeedKey)', () =>
     });
 
     test('different seeds → different public keys', async () => {
-        const seedA = 'a'.repeat(64);
-        const seedB = 'b'.repeat(64);
+        const seedA = 'a'.repeat(128);
+        const seedB = 'b'.repeat(128);
         const dbA = makeDbWithSession(buildEncryptedSession('vk', { encryptedSeedKey: encrypt(seedA, TEST_KEY) }));
         const dbB = makeDbWithSession(buildEncryptedSession('vk', { encryptedSeedKey: encrypt(seedB, TEST_KEY) }));
 

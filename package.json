@@ -101,8 +101,11 @@
     "@midnight-ntwrk/midnight-js-level-private-state-provider": "^4.0.4",
     "@midnight-ntwrk/midnight-js-node-zk-config-provider": "^4.0.4",
     "@midnight-ntwrk/wallet-sdk-facade": "^4.0.0",
+    "@midnight-ntwrk/wallet-sdk-hd": "^3.0.2",
     "@noble/hashes": "^1.8.0",
+    "bip39": "^3.1.0",
     "express": "^4",
+    "undici": "^8.3.0",
     "ws": "^8"
   },
   "peerDependencies": {
@@ -134,14 +137,14 @@
         "kind": "nightgate",
         "contracts": {
           "counter": {
-            "artifactPath":   "contracts/counter/src/managed/counter/contract/index.js",
+            "artifactPath": "contracts/counter/src/managed/counter/contract/index.js",
             "privateStateId": "counterPrivateState",
-            "zkConfigPath":   "contracts/counter/src/managed/counter"
+            "zkConfigPath": "contracts/counter/src/managed/counter"
           },
           "attestation-vault": {
-            "artifactPath":   "contracts/attestation-vault/src/managed/attestation-vault/contract/index.js",
+            "artifactPath": "contracts/attestation-vault/src/managed/attestation-vault/contract/index.js",
             "privateStateId": "attestationVaultPrivateState",
-            "zkConfigPath":   "contracts/attestation-vault/src/managed/attestation-vault"
+            "zkConfigPath": "contracts/attestation-vault/src/managed/attestation-vault"
           }
         }
       },

@@ -26,6 +26,7 @@ import { ensureNetworkId } from '../midnight/providers';
 import { getOrBuildWalletFacade } from '../submission/wallet-facade-builder';
 import { resolveNightgateRuntimeConfig, getNightgatePluginConfig } from '../utils/nightgate-config';
 import { startJob } from '../submission/background-jobs';
+import { mnemonicToBip39SeedHex } from '../utils/wallet-hd';
 
 const walletRateLimiter = new RateLimiter({
     windowMs: 60 * 1000,
@@ -124,7 +125,7 @@ async function loadSigningSessionAccountId(
     return { ok: true, accountId: deriveAccountId(viewingKey) };
 }
 
-const SEED_HEX_LENGTH = 64; // 32 bytes (the ledger-v8 fromSeed requirement)
+const BIP39_SEED_HEX_LENGTH = 128; // 64-byte BIP39 seed; HD-derived per role in srv/utils/wallet-hd.ts
 
 export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: any): void {
     srv.on('connectWallet', async (req: Request) => {
@@ -177,15 +178,32 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
             return req.reject(429, `Rate limited. Retry after ${Math.ceil(rateResult.retryAfterMs / 1000)}s`);
         }
 
-        const { sessionId, seedHex, idempotencyKey } = req.data as {
+        const { sessionId, mnemonic, seedHex, idempotencyKey } = req.data as {
             sessionId: string;
-            seedHex: string;
+            mnemonic?: string;
+            seedHex?: string;
             idempotencyKey?: string;
         };
         if (!sessionId) return req.reject(400, 'sessionId is required');
-        if (!seedHex)   return req.reject(400, 'seedHex is required');
-        if (!/^[0-9a-fA-F]+$/.test(seedHex) || seedHex.length !== SEED_HEX_LENGTH) {
-            return req.reject(400, `seedHex must be ${SEED_HEX_LENGTH} hex characters (32-byte seed)`);
+
+        // Lace gives users a BIP39 mnemonic; that's the preferred input. We
+        // derive (and store) the 64-byte BIP39 seed, and the wallet key types
+        // are HD-derived per role downstream (srv/utils/wallet-hd.ts). A raw
+        // 128-hex BIP39 seed is accepted as a programmatic alternative.
+        let bip39SeedHex: string;
+        if (mnemonic) {
+            try {
+                bip39SeedHex = mnemonicToBip39SeedHex(mnemonic);
+            } catch {
+                return req.reject(400, 'mnemonic is not a valid BIP39 phrase');
+            }
+        } else if (seedHex) {
+            if (!/^[0-9a-fA-F]+$/.test(seedHex) || seedHex.length !== BIP39_SEED_HEX_LENGTH) {
+                return req.reject(400, `seedHex must be ${BIP39_SEED_HEX_LENGTH} hex characters (64-byte BIP39 seed)`);
+            }
+            bip39SeedHex = seedHex.toLowerCase();
+        } else {
+            return req.reject(400, 'either mnemonic or seedHex (64-byte BIP39 seed, 128 hex chars) is required');
         }
 
         const session = await db.run(
@@ -197,7 +215,7 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
         }
 
         const encKey = getEncryptionKey();
-        const encryptedSeedKey = encrypt(seedHex, encKey);
+        const encryptedSeedKey = encrypt(bip39SeedHex, encKey);
 
         await db.run(
             UPDATE.entity('midnight.WalletSessions')
@@ -225,7 +243,7 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
             const { network, nodeUrl, submissionEndpoints } = resolveNightgateRuntimeConfig(nightgateConfig);
 
             const facadeArgs = {
-                seedHex,
+                seedHex: bip39SeedHex,
                 networkId:           network,
                 indexerHttpUrl:      submissionEndpoints.indexerHttpUrl,
                 indexerWsUrl:        submissionEndpoints.indexerWsUrl,

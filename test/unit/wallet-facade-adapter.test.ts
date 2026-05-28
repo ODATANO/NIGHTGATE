@@ -20,7 +20,8 @@ import { buildWalletMaterialForSession } from '../../srv/submission/wallet-mater
 import type { WalletFacadeBuildArgs } from '../../srv/submission/wallet-facade-builder';
 
 const TEST_KEY = crypto.createHash('sha256').update('test-encryption-key').digest();
-const VALID_SEED_HEX = 'a'.repeat(64);
+// 128 hex = 64-byte BIP39 seed (the new connectWalletForSigning storage shape).
+const VALID_SEED_HEX = 'a'.repeat(128);
 const STUB_FACADE = {
     balanceUnboundTransaction: jest.fn(),
     finalizeRecipe: jest.fn(),
@@ -48,6 +49,23 @@ jest.mock('../../srv/midnight/sdk-loader', () => {
                 fromSeed: () => ({ _stub: 'dust' })
             }
         }))
+    };
+});
+
+// Mock the ESM-only HD derivation lib. deriveRoleSeeds is deterministic per
+// input BIP39 seed so pubkey determinism / different-seed assertions hold.
+jest.mock('../../srv/utils/wallet-hd', () => {
+    const c = require('crypto');
+    const role = (seed: Uint8Array, label: string) =>
+        new Uint8Array(c.createHash('sha256').update(Buffer.from(seed)).update(label).digest());
+    return {
+        deriveRoleSeeds: jest.fn(async (bip39Seed: Uint8Array) => ({
+            zswap: role(bip39Seed, 'zswap'),
+            dust:  role(bip39Seed, 'dust'),
+            night: role(bip39Seed, 'night')
+        })),
+        mnemonicToBip39SeedHex: jest.fn((m: string) =>
+            c.createHash('sha512').update(m).digest('hex'))
     };
 });
 

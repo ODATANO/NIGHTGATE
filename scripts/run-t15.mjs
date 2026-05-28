@@ -12,8 +12,8 @@
 // Inputs (env vars):
 //   NIGHTGATE_URL              default http://localhost:4004
 //   LACE_VIEWING_KEY           required, Midnight Preprod viewing key from Lace
-//   LACE_MNEMONIC              BIP39 12/24 words, OR
-//   LACE_SEED_HEX              raw 32-byte seed as 64 hex chars
+//   LACE_MNEMONIC              required, BIP39 recovery phrase (12/24 words);
+//                              the server HD-derives per-role keys from it
 //   T15_DUST_WAIT_SECONDS      default 90, how long to wait after registration
 //   T15_SKIP_DUST_REG          set to 1 if DUST already registered in a prior run
 //   T15_PREWARM_TIMEOUT_MIN    default 240 (4h) — cold sync upper bound
@@ -38,7 +38,6 @@ const URL_BASE = process.env.NIGHTGATE_URL || 'http://localhost:4004';
 const ENDPOINT = `${URL_BASE}/api/v1/nightgate`;
 const VK = process.env.LACE_VIEWING_KEY;
 const MNEMONIC = process.env.LACE_MNEMONIC;
-const SEED_HEX_INPUT = process.env.LACE_SEED_HEX;
 const DUST_WAIT_S = parseInt(process.env.T15_DUST_WAIT_SECONDS || '90', 10);
 const SKIP_DUST = process.env.T15_SKIP_DUST_REG === '1';
 const PREWARM_TIMEOUT_MS = parseInt(process.env.T15_PREWARM_TIMEOUT_MIN || '240', 10) * 60_000;
@@ -50,19 +49,13 @@ function pretty(o) { return JSON.stringify(o, null, 2); }
 
 if (!VK) fail('LACE_VIEWING_KEY env var is required');
 
-let seedHex;
-if (SEED_HEX_INPUT) {
-    if (!/^[0-9a-fA-F]{64}$/.test(SEED_HEX_INPUT)) fail('LACE_SEED_HEX must be 64 hex chars (32 bytes)');
-    seedHex = SEED_HEX_INPUT.toLowerCase();
-} else if (MNEMONIC) {
-    if (!bip39.validateMnemonic(MNEMONIC.trim())) fail('LACE_MNEMONIC is not a valid BIP39 phrase');
-    // Standard BIP39: PBKDF2-HMAC-SHA512(mnemonic, "mnemonic", 2048) -> 64 bytes.
-    // Midnight's ledger-v8 fromSeed expects 32 bytes; take the first half.
-    const fullSeed = bip39.mnemonicToSeedSync(MNEMONIC.trim()); // Buffer(64)
-    seedHex = fullSeed.subarray(0, 32).toString('hex');
-} else {
-    fail('Either LACE_MNEMONIC or LACE_SEED_HEX must be set');
+// The server now performs Midnight's per-role HD derivation from the mnemonic
+// (see srv/utils/wallet-hd.ts), so we pass the BIP39 phrase straight through —
+// no client-side seed truncation. Validate locally for a fast fail.
+if (!MNEMONIC || !bip39.validateMnemonic(MNEMONIC.trim())) {
+    fail('LACE_MNEMONIC (a valid BIP39 phrase) is required');
 }
+const mnemonic = MNEMONIC.trim();
 
 async function post(path, body, timeoutMs = 60 * 60 * 1000) {
     // First-time facade sync on a fresh seed can take MANY minutes (shielded
@@ -145,8 +138,8 @@ async function waitForServer() {
     if (!sessionId) fail(`connectWallet returned no sessionId: ${pretty(r.body)}`);
     console.log(`OK   sessionId = ${sessionId}`);
 
-    step('2. connectWalletForSigning (seed key + kick off facade prewarm)');
-    r = await post('/connectWalletForSigning', { sessionId, seedHex });
+    step('2. connectWalletForSigning (mnemonic + kick off facade prewarm)');
+    r = await post('/connectWalletForSigning', { sessionId, mnemonic });
     if (r.status !== 200 && r.status !== 201) fail(`connectWalletForSigning → HTTP ${r.status}: ${pretty(r.body)}`);
     console.log(`OK   signing enabled: ${pretty(r.body)}`);
 
