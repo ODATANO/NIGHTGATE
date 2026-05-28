@@ -1,5 +1,5 @@
 /**
- * @odatano/nightgate — Public TypeScript API
+ * @odatano/nightgate, Public TypeScript API
  */
 
 export type { NightgateConfig } from './nightgate.js';

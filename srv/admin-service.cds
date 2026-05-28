@@ -8,10 +8,22 @@ using { midnight } from '../db/schema';
 service NightgateAdminService {
 
     entity WalletSessions as projection on midnight.WalletSessions excluding {
-        encryptedViewingKey     // Encrypted key — never exposed via admin API
+        encryptedViewingKey     // Encrypted key, never exposed via admin API
     };
+
+    entity DisclosureRoles as projection on midnight.DisclosureRoles;
 
     // Admin actions
     action invalidateSession(sessionId: UUID);
     action invalidateAllSessions();
+
+    // T14 — grant a disclosure tier to a user. Service-level @requires: 'admin'
+    // gates CAP-auth-side; handler additionally requires the caller's own
+    // disclosureRole = 'authority' (defense in depth).
+    action grantRole(
+        userId:     String,
+        role:       String,
+        scope:      String,
+        validUntil: Timestamp
+    );
 }

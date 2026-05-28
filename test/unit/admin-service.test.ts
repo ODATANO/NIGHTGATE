@@ -7,7 +7,9 @@
 const mockDbRun = jest.fn();
 const mockDbConnect = jest.fn().mockResolvedValue({ run: mockDbRun });
 const selectWhereSpy = jest.fn();
+const selectFromSpy = jest.fn();
 const updateWhereSpy = jest.fn();
+const insertEntriesSpy = jest.fn();
 
 const registeredHandlers: Record<string, Function> = {};
 
@@ -20,6 +22,10 @@ jest.mock('@sap/cds', () => {
                     from: jest.fn().mockReturnValue({
                         where: selectWhereSpy
                     })
+                },
+                from: (entity: string) => {
+                    selectFromSpy(entity);
+                    return { where: selectWhereSpy };
                 }
             },
             UPDATE: {
@@ -27,6 +33,11 @@ jest.mock('@sap/cds', () => {
                     set: jest.fn().mockReturnValue({
                         where: updateWhereSpy
                     })
+                })
+            },
+            INSERT: {
+                into: jest.fn().mockReturnValue({
+                    entries: insertEntriesSpy
                 })
             }
         },
@@ -43,13 +54,15 @@ jest.mock('@sap/cds', () => {
 
 import NightgateAdminService from '../../srv/admin-service';
 
-function createMockRequest(data: Record<string, unknown>) {
-    return {
+function createMockRequest(data: Record<string, unknown>, userId?: string) {
+    const req: any = {
         data,
         reject: jest.fn().mockImplementation((code: number, msg: string) => {
             return { __rejected: true, code, message: msg };
         })
     };
+    if (userId) req.user = { id: userId };
+    return req;
 }
 
 describe('NightgateAdminService', () => {
@@ -140,6 +153,145 @@ describe('NightgateAdminService', () => {
 
             const result = await handler();
             expect(result).toBe(0);
+        });
+    });
+
+    describe('grantRole', () => {
+        // The handler runs attachDisclosureRole(req, this.db) BEFORE the INSERT.
+        // That issues one SELECT to look up the caller's existing disclosure
+        // rows. Tests set up `mockDbRun` to first return that row set, then
+        // (for the success path) the INSERT result.
+        const authorityRowsFor = (userId: string) => ([
+            { userId, role: 'authority', scope: null, validFrom: null, validUntil: null }
+        ]);
+
+        it('rejects when userId is missing', async () => {
+            const handler = registeredHandlers['grantRole'];
+            const req = createMockRequest({ role: 'legitimate_interest' }, 'admin-1');
+            await handler(req);
+            expect(req.reject).toHaveBeenCalledWith(400, 'userId is required');
+            expect(mockDbRun).not.toHaveBeenCalled();
+        });
+
+        it('rejects when role is missing', async () => {
+            const handler = registeredHandlers['grantRole'];
+            const req = createMockRequest({ userId: 'bob' }, 'admin-1');
+            await handler(req);
+            expect(req.reject).toHaveBeenCalledWith(400, 'role is required');
+        });
+
+        it('rejects when role is not a known disclosure tier', async () => {
+            const handler = registeredHandlers['grantRole'];
+            const req = createMockRequest(
+                { userId: 'bob', role: 'public' }, // CDS reserved word; not allowed
+                'admin-1'
+            );
+            await handler(req);
+            expect(req.reject).toHaveBeenCalledWith(
+                400,
+                expect.stringContaining('role must be one of')
+            );
+        });
+
+        it('rejects when caller does not hold the authority disclosure role', async () => {
+            const handler = registeredHandlers['grantRole'];
+            // Caller has only legitimate_interest
+            mockDbRun.mockResolvedValueOnce([
+                { userId: 'admin-1', role: 'legitimate_interest', scope: null, validFrom: null, validUntil: null }
+            ]);
+            const req = createMockRequest(
+                { userId: 'bob', role: 'authority' },
+                'admin-1'
+            );
+            await handler(req);
+            expect(req.reject).toHaveBeenCalledWith(
+                403,
+                expect.stringContaining('authority disclosure role')
+            );
+            // SELECT ran, INSERT did not
+            expect(insertEntriesSpy).not.toHaveBeenCalled();
+        });
+
+        it('rejects when caller has no disclosure grants at all', async () => {
+            const handler = registeredHandlers['grantRole'];
+            mockDbRun.mockResolvedValueOnce([]); // caller falls back to public_only
+            const req = createMockRequest(
+                { userId: 'bob', role: 'authority' },
+                'admin-1'
+            );
+            await handler(req);
+            expect(req.reject).toHaveBeenCalledWith(403, expect.any(String));
+            expect(insertEntriesSpy).not.toHaveBeenCalled();
+        });
+
+        it('inserts the grant when caller is authority', async () => {
+            const handler = registeredHandlers['grantRole'];
+            mockDbRun.mockResolvedValueOnce(authorityRowsFor('admin-1')); // caller lookup
+            mockDbRun.mockResolvedValueOnce(undefined); // INSERT
+
+            const req = createMockRequest(
+                { userId: 'bob', role: 'legitimate_interest' },
+                'admin-1'
+            );
+            await handler(req);
+
+            expect(req.reject).not.toHaveBeenCalled();
+            expect(insertEntriesSpy).toHaveBeenCalledTimes(1);
+            const entries = insertEntriesSpy.mock.calls[0][0];
+            expect(entries).toMatchObject({
+                userId: 'bob',
+                role: 'legitimate_interest',
+                scope: null,
+                grantedBy: 'admin-1'
+            });
+            expect(entries.validFrom).toEqual(expect.any(String));
+        });
+
+        it('passes through scope and validUntil when provided', async () => {
+            const handler = registeredHandlers['grantRole'];
+            mockDbRun.mockResolvedValueOnce(authorityRowsFor('admin-1'));
+            mockDbRun.mockResolvedValueOnce(undefined);
+
+            const future = new Date(Date.now() + 86_400_000).toISOString();
+            const req = createMockRequest(
+                {
+                    userId: 'bob',
+                    role: 'authority',
+                    scope: 'contract-X',
+                    validUntil: future
+                },
+                'admin-1'
+            );
+            await handler(req);
+
+            const entries = insertEntriesSpy.mock.calls[0][0];
+            expect(entries.scope).toBe('contract-X');
+            expect(entries.validUntil).toBe(future);
+        });
+
+        it('treats empty-string scope as null', async () => {
+            const handler = registeredHandlers['grantRole'];
+            mockDbRun.mockResolvedValueOnce(authorityRowsFor('admin-1'));
+            mockDbRun.mockResolvedValueOnce(undefined);
+
+            const req = createMockRequest(
+                { userId: 'bob', role: 'public_only', scope: '', validUntil: '' },
+                'admin-1'
+            );
+            await handler(req);
+
+            const entries = insertEntriesSpy.mock.calls[0][0];
+            expect(entries.scope).toBeNull();
+            expect(entries.validUntil).toBeNull();
+        });
+
+        it('uses "unknown" as grantedBy when req.user is missing', async () => {
+            const handler = registeredHandlers['grantRole'];
+            // No userId on caller → attachDisclosureRole returns public_only
+            // immediately without touching the DB. So the 403 check fires first.
+            const req = createMockRequest({ userId: 'bob', role: 'authority' });
+            await handler(req);
+            expect(req.reject).toHaveBeenCalledWith(403, expect.any(String));
         });
     });
 });

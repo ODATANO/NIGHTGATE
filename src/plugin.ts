@@ -2,7 +2,8 @@ import cds from '@sap/cds';
 import crypto from 'crypto';
 import path from 'path';
 
-import { initialize, shutdown } from './index';
+import { initialize, shutdown, SchemaNotDeployedError } from './index';
+import { getNightgatePluginConfig } from '../srv/utils/nightgate-config';
 
 const pluginRoot = path.resolve(__dirname, '..');
 
@@ -26,7 +27,7 @@ function registerModels(): void {
 
 function registerSecurityHeaders(): void {
     cds.on('bootstrap', (app: any) => {
-        const nightgateConfig = (cds.env as any).requires?.nightgate || {};
+        const nightgateConfig = getNightgatePluginConfig();
         const corsOrigin = nightgateConfig.corsOrigin || '*';
         const strictCsp = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'";
         const fioriPreviewCsp = [
@@ -93,7 +94,33 @@ function registerSecurityHeaders(): void {
 
 function registerLifecycle(): void {
     cds.on('served', async () => {
-        await initialize();
+        try {
+            await initialize();
+        } catch (err) {
+            // SchemaNotDeployedError is the only fatal error initialize() raises.
+            // Print a big, instruction-first block and exit non-zero so the
+            // operator notices, instead of silently half-booting against a stale
+            // schema (the old auto-deploy path would do that on every restart).
+            if (err instanceof SchemaNotDeployedError) {
+                console.error('\n');
+                console.error('================================================================');
+                console.error('  NIGHTGATE: schema not deployed');
+                console.error('================================================================');
+                console.error(`  ${err.message}`);
+                console.error('');
+                console.error('  Run this from the project root:');
+                console.error('');
+                console.error('      npm run deploy');
+                console.error('');
+                console.error('================================================================\n');
+                process.exit(1);
+            }
+            // Anything else: surface but don't kill the server — initialize()
+            // already wraps its own soft failures (sqlite tuning, wallet worker,
+            // crawler) in try/catch internally.
+            const msg = err instanceof Error ? err.message : String(err);
+            console.error(`[odatano-nightgate] initialize() failed: ${msg}`);
+        }
     });
 
     cds.on('shutdown', async () => {
@@ -124,6 +151,45 @@ const plugin = {
                         description: 'Midnight Node Substrate RPC endpoint. Override via NIGHTGATE_NODE_URL env var.',
                         type: 'string',
                         default: 'wss://rpc.preprod.midnight.network/'
+                    },
+                    indexerHttpUrl: {
+                        description: 'Midnight Indexer GraphQL HTTP endpoint (used by the submission path for publicDataProvider). Override via NIGHTGATE_INDEXER_HTTP_URL env var.',
+                        type: 'string',
+                        default: 'https://indexer.preprod.midnight.network/api/v4/graphql'
+                    },
+                    indexerWsUrl: {
+                        description: 'Midnight Indexer GraphQL WebSocket endpoint (used by the submission path for subscriptions). Override via NIGHTGATE_INDEXER_WS_URL env var.',
+                        type: 'string',
+                        default: 'wss://indexer.preprod.midnight.network/api/v4/graphql/ws'
+                    },
+                    proofServerUrl: {
+                        description: 'Proof server URL. Required only for contract deploy/call submission. Override via NIGHTGATE_PROOF_SERVER_URL env var.',
+                        type: 'string',
+                        default: 'http://localhost:6300'
+                    },
+                    zkConfigBasePath: {
+                        description: 'Base directory containing contract managed/ artifacts (keys + zkIR). Resolved per contract by appending the contract name. Override via NIGHTGATE_ZK_CONFIG_BASE env var.',
+                        type: 'string',
+                        default: './contracts'
+                    },
+                    privateStateBackend: {
+                        description: "Backend for the SDK private-state provider. 'cap-db' (default): encrypted CAP-DB-backed provider, persistent, production-grade. 'level': SDK's bundled LevelDB provider (dev-only; the SDK docs explicitly warn against production use). Override via NIGHTGATE_PRIVATE_STATE_BACKEND env var.",
+                        type: 'string',
+                        enum: ['cap-db', 'level'],
+                        default: 'cap-db'
+                    },
+                    contracts: {
+                        description: "Registered Compact contracts. Keys are logical refs used in deployContract/submitContractCall actions. Each entry: { artifactPath, privateStateId, zkConfigPath } (paths absolute or relative to cwd).",
+                        type: 'object',
+                        additionalProperties: {
+                            type: 'object',
+                            properties: {
+                                artifactPath:   { type: 'string', description: 'Path to the Compact-emitted contract module (e.g. contracts/<name>/src/managed/<name>/contract/index.js)' },
+                                privateStateId: { type: 'string', description: 'Logical private-state identifier passed to deployContract' },
+                                zkConfigPath:   { type: 'string', description: 'Path to the managed/<name>/ directory containing keys + zkir' }
+                            },
+                            required: ['artifactPath', 'privateStateId', 'zkConfigPath']
+                        }
                     },
                     contentSecurityPolicy: {
                         description: "Optional custom CSP header value. Use 'off' to disable CSP. Defaults to strict API policy and relaxed UI5 policy for /$fiori-preview/*.",
