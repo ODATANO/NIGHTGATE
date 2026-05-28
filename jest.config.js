@@ -15,6 +15,11 @@ module.exports = {
       tsconfig: 'tsconfig.json',
       useESM: false,
       diagnostics: {
+        // 2307: module not found (CDS-typer generated types under @cds-models)
+        // 2769: cds.ql overload signature mismatches (deep CAP query DSL types)
+        // 151002: ts-jest cache-related advisory
+        // (TS7016 + 2339 used to be here for @sap/cds; resolved by adding @cap-js/cds-types to tsconfig)
+        // (TS18046 used to be here for `unknown` SDK objects; resolved by switching to `any` in providers.ts)
         ignoreCodes: [2307, 2769, 151002]
       }
     }]

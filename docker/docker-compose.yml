@@ -1,5 +1,5 @@
 services:
-  # Midnight Node — local standalone node for undeployed/local development only.
+  # Midnight Node, local standalone node for undeployed/local development only.
   # For local testnet development only. Preprod uses the public RPC (default, no Docker needed).
   node:
     image: midnightntwrk/midnight-node:0.20.0
@@ -34,5 +34,99 @@ services:
           cpus: "1.0"
           memory: 2G
 
+  # Midnight Indexer (standalone), self-hosted alternative to the public
+  # `indexer.preprod.midnight.network` endpoint. The hosted service has been
+  # observed returning 503s during peak hours — running our own keeps the
+  # wallet-SDK's GraphQL subscriptions reliable.
+  #
+  # Standalone mode = single container, embedded SQLite. No Postgres or NATS.
+  # Indexes ON-DEMAND from a Substrate node over WebSocket. We point at the
+  # public preprod RPC (`wss://rpc.preprod.midnight.network/`) so we don't
+  # also need to host a 30-80 GB Substrate full node. If the public RPC ever
+  # gets unreliable, flip APP__INFRA__NODE__URL to a local node container.
+  #
+  # First-time sync from genesis: estimated 1-3 hours for the indexer to walk
+  # the chain at ~830k blocks (Preprod height as of 2026-05-18). SQLite grows
+  # to a few GB. Subsequent restarts are incremental and fast.
+  #
+  # Flipping NIGHTGATE to use it: set NIGHTGATE_INDEXER_HTTP_URL and
+  # NIGHTGATE_INDEXER_WS_URL in your .env to http://localhost:8088 /
+  # ws://localhost:8088/api/v4/graphql/ws. See .env.example.
+  indexer:
+    image: midnightntwrk/indexer-standalone:4.3.2
+    container_name: odatano-night-indexer
+    ports:
+      - "8088:8088"
+    environment:
+      # The wallet-SDK queries via this network ID. Has to match NIGHTGATE's
+      # configured network (cds.requires.nightgate.network).
+      APP__APPLICATION__NETWORK_ID: "${NIGHTGATE_NETWORK:-preprod}"
+      # Upstream Substrate node. Default = hosted preprod RPC. To run fully
+      # autark, change to ws://node:9944 and bring up the `node` service with
+      # CFG_PRESET=preprod (not the current `dev` preset).
+      APP__INFRA__NODE__URL: "${INDEXER_UPSTREAM_NODE_URL:-wss://rpc.preprod.midnight.network/}"
+      APP__INFRA__SPO_NODE__URL: "${INDEXER_UPSTREAM_NODE_URL:-wss://rpc.preprod.midnight.network/}"
+      # Required: hex-encoded 32-byte secret used to encrypt stored data.
+      # Must contain at least one a-f character or the indexer's config parser
+      # mis-types an all-numeric string as an unsigned int and the container
+      # crash-loops with "invalid type: found unsigned int". For local dev a
+      # fixed placeholder is fine; for production set INDEXER_SECRET in your
+      # environment. NEVER commit a real secret.
+      APP__INFRA__SECRET: "${INDEXER_SECRET:-deadbeefcafebabedeadbeefcafebabedeadbeefcafebabedeadbeefcafebabe}"
+      # SPO/Blockfrost integration off for vanilla wallet-SDK usage. Required
+      # placeholder per the indexer's config schema.
+      APP__INFRA__SPO_NODE__BLOCKFROST_ID: "dummy-not-using-spo"
+      RUST_LOG: "indexer_standalone=info,chain_indexer=info,indexer_api=info,wallet_indexer=info,indexer_common=info,info"
+    volumes:
+      - indexer-data:/data
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 4G
+        reservations:
+          cpus: "0.5"
+          memory: 1G
+
+  # Midnight Proof Server, generates ZK proofs for contract calls/deploys.
+  # Required by the submission path (T4). The crawler does NOT need this.
+  #
+  # First run downloads ~500 MB of ZK parameters; subsequent contract compiles
+  # may pull additional circuit params (Circuit 24 ~3 GB has been reported).
+  # Persist the params via the named volume so they survive container restarts.
+  #
+  # Network selection: pass NIGHTGATE_PROOF_NETWORK in your env (defaults to preprod).
+  # Set to testnet for local node; mainnet not recommended until forum issue 1190 resolves.
+  proof-server:
+    image: midnightntwrk/proof-server:8.0.3
+    container_name: odatano-night-proof-server
+    command: ["midnight-proof-server", "--network", "${NIGHTGATE_PROOF_NETWORK:-preprod}"]
+    ports:
+      - "6300:6300"
+    volumes:
+      - proof-server-data:/data
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 4G
+        reservations:
+          cpus: "0.5"
+          memory: 1G
+
 volumes:
   node-data:
+  proof-server-data:
+  indexer-data:
