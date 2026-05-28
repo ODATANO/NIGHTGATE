@@ -1,90 +1,130 @@
 # @odatano/nightgate
 
-**CAP Plugin - Midnight Blockchain Indexer with OData V4 API**
+**SAP CAP plugin: Midnight blockchain indexer + transaction submission, exposed as OData V4.**
 
 [![npm](https://img.shields.io/npm/v/@odatano/nightgate)](https://www.npmjs.com/package/@odatano/nightgate)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 [![Tests](https://img.shields.io/github/actions/workflow/status/ODATANO/NIGHTGATE/test.yaml?label=tests)](https://github.com/ODATANO/NIGHTGATE/actions)
 [![Coverage](https://img.shields.io/codecov/c/github/ODATANO/NIGHTGATE)](https://codecov.io/gh/ODATANO/NIGHTGATE)
 
-
-`@odatano/nightgate` is a self-contained Midnight blockchain indexer packaged as an SAP CAP plugin. It connects directly to a Midnight node over Substrate JSON-RPC WebSocket, normalizes chain data into CAP entities, and exposes it through OData V4 services.
-
-This project integrates with the Midnight Network. For more information about the Midnight Network, please visit their website: [Midnight Network](https://midnight.network/).
-
+`@odatano/nightgate` ties a SAP CAP runtime directly to the [Midnight](https://midnight.network/) blockchain. A built-in crawler indexes blocks from a Substrate RPC node into CAP entities; a worker-thread-isolated wallet stack handles ZK-aware transaction submission (deploy/call Compact contracts, send NIGHT, shield/unshield, dust generation). The whole surface is exposed through standard OData V4 — no GraphQL, no SDK lock-in for consumers.
 
 ```text
-Midnight Node (local ws://localhost:9944 or remote wss://rpc.preprod.midnight.network/)
-    |
-    | Substrate RPC / WebSocket
-    v
-MidnightNodeProvider
-    |
-    | Catch-up, live sync, retry, reorg detection
-    v
-Crawler + BlockProcessor
-    |
-    | Atomic persistence via CAP DB API
-    v
-SQLite / CAP Database
-    |
-    | OData V4
-    v
-NightgateService / NightgateIndexerService / Analytics / Admin
+                            ┌──────────────────────────────────────┐
+                            │      Midnight Preprod / Mainnet      │
+                            │   Substrate Node    GraphQL Indexer  │
+                            └──────────────┬──────────────┬────────┘
+                                           │              │
+                            wss://         │ Substrate    │ GraphQL
+                            JSON-RPC       │ RPC          │ HTTP + WS
+                                           ▼              ▼
+┌───────────────────────────────────────────────────────────────────────────┐
+│  NIGHTGATE  (CAP plugin)                                                  │
+│                                                                           │
+│  Main thread                              Worker thread                   │
+│  ┌──────────────────────┐                 ┌──────────────────────────┐    │
+│  │  Crawler             │                 │  Wallet SDK              │    │
+│  │  - BlockProcessor    │                 │  (Effect.ts fibers)      │    │
+│  │  - reorg detection   │                 │  - facade.start (sync)   │    │
+│  └─────────┬────────────┘                 │  - transferTransaction   │    │
+│            │ atomic writes                │  - initSwap              │    │
+│            ▼                              │  - registerForDustGen    │    │
+│  ┌──────────────────────┐                 │  - deployContract        │    │
+│  │  CAP DB              │◄────state-save──┤  - submitContractCall    │    │
+│  │  (SQLite / HANA)     │   periodic save │                          │    │
+│  └─────────┬────────────┘                 │ - private-state-rpc      │    │
+│            │ OData V4                     └──────────┬───────────────┘    │
+│            ▼                                         │                    │
+│  4 services on /api/v1/{nightgate, indexer, analytics, admin}             │
+└───────────────────────────────────────────────────────────────────────────┘
 ```
+
+The wallet SDK lives in `worker_threads` because Midnight's Effect.ts fiber scheduler saturates the microtask queue during sync; isolating it keeps the main CAP request pipeline responsive.
 
 ## Highlights
 
-| Capability | Details |
+| Capability | Status |
 |---|---|
-| Direct node indexing | Connects over `ws://` or `wss://`; no external indexer required |
-| CAP plugin auto-registration | Registers `db/` and `srv/` models automatically through `cds-plugin.js` |
-| Catch-up plus live sync | Indexes historical finalized blocks, then subscribes to new heads |
-| Reorg handling | Detects parent-hash mismatches, rolls back affected data, records `ReorgLog` |
-| OData API | Blockchain, indexer, analytics, and admin services |
-| Operational endpoints | Health, readiness, liveness, reorg history, Prometheus-style metrics |
-| Wallet sessions | `connectWallet` / `disconnectWallet` with encrypted viewing-key storage |
-| Offline mode | CAP app starts even if the node is unreachable |
+| Block-level indexing | ✅ Live + catch-up + reorg detection (`srv/crawler/`) |
+| Wallet sessions | ✅ Read-only (viewing key) + signing (seed) with AES-256-GCM at rest |
+| Contract deploy / call | ✅ Compact-compiled contracts (`deployContract`, `submitContractCall`) |
+| Token transfer (shielded + unshielded) | ✅ `sendNight` with auto-detected receiver ledger |
+| Cross-ledger shift | ✅ `shieldFunds` / `unshieldFunds` via SDK `initSwap` |
+| Dust generation lifecycle | ✅ `registerForDustGeneration` / `deregisterFromDustGeneration` |
+| Pre-flight diagnostics | ✅ `getWalletBalance`, `estimateSendNightFee`, `estimateShield/UnshieldFee` |
+| Local Midnight indexer | ✅ Optional docker-compose service (`midnightntwrk/indexer-standalone`) |
+| Offline mode | ✅ CAP app starts even if the upstream node is unreachable |
 
-Version `0.1.2` is a read-side first release. Transaction build/sign/submit flows are not yet included.
-
-## Quick Start
-
-### Preprod (default — no Docker needed)
+## Quick start
 
 ```bash
 npm ci
-npm run dev
+npm run dev            # connects to public preprod RPC + hosted indexer
 ```
 
-Nightgate defaults to Preprod with the public RPC at `wss://rpc.preprod.midnight.network/`. No `.env` or extra config required.
-
-### Testnet with local Docker node
+That's it for read-side + base config. For wallet signing + submission:
 
 ```bash
-npm ci
-docker compose -f docker/docker-compose.yml up -d
+docker compose -f docker/docker-compose.yml up -d proof-server
+$env:NODE_OPTIONS="--max-old-space-size=12288"   # PowerShell; wallet SDK needs ~8-12 GB heap
+$env:NIGHTGATE_CRAWLER_ENABLED="false"           # optional; isolate sync workload
+npm run serve:sync
 ```
 
-Create a `.env` in the repo root:
+For the full first-time-sync walkthrough see [docs/quickstart.md](docs/quickstart.md).
 
-```env
-NIGHTGATE_NETWORK=testnet
-NIGHTGATE_NODE_URL=ws://localhost:9944
-```
+## Service surface
 
-```bash
-npm run dev
-```
+| Service | Path | What |
+|---|---|---|
+| `NightgateService` | `/api/v1/nightgate` | Blocks / transactions / wallet sessions / **token ops + contract ops** |
+| `NightgateIndexerService` | `/api/v1/indexer` | Sync state, health, reorg history, Prometheus metrics, crawler control |
+| `NightgateAnalyticsService` | `/api/v1/analytics` | Aggregate counts |
+| `NightgateAdminService` | `/api/v1/admin` | Session invalidation |
 
-### Use as a CAP plugin
+## Write surface (NightgateService)
+
+| Action | Purpose |
+|---|---|
+| `connectWallet(viewingKey)` | Open read-only session |
+| `connectWalletForSigning(sessionId, seedHex)` | Upgrade with seed key; warms wallet SDK in worker |
+| `disconnectWallet(sessionId)` | Close session, evict facade |
+| `sendNight(sessionId, receiverAddress, amount, ttlIso?)` | Transfer NIGHT; ledger auto-detected from receiver address prefix |
+| `shieldFunds(sessionId, amount, ttlIso?)` | Move own NIGHT unshielded → shielded |
+| `unshieldFunds(sessionId, amount, ttlIso?)` | Move own NIGHT shielded → unshielded |
+| `registerForDustGeneration(sessionId, dustReceiverAddress?)` | Register NIGHT UTXOs to start dust accrual |
+| `deregisterFromDustGeneration(sessionId)` | Reverse: free UTXOs back to spendable |
+| `deployContract(compiledArtifactRef, sessionId, initialPrivateState)` | Deploy a registered Compact contract |
+| `submitContractCall(contractAddress, circuit, compiledArtifactRef, sessionId, args)` | Invoke a circuit on a deployed contract |
+
+## Read surface (read-only functions)
+
+| Function | Returns |
+|---|---|
+| `getWalletBalance(sessionId)` | Shielded + unshielded NIGHT balances, current DUST, registered UTXO counts |
+| `estimateSendNightFee(sessionId, receiverAddress, amount, ttlIso?)` | DUST fee estimate for a transfer |
+| `estimateShieldFee(sessionId, amount, ttlIso?)` | DUST fee for unshielded → shielded swap |
+| `estimateUnshieldFee(sessionId, amount, ttlIso?)` | DUST fee for shielded → unshielded swap |
+| `getSyncStatus()` / `getHealth()` / `getMetrics()` | Indexer operational state |
+| Standard OData on `Blocks` / `Transactions` / `ContractActions` / `UnshieldedUtxos` / `NightBalances` | Full query surface with `$filter`, `$orderby`, `$top`, `$skip`, `$expand` |
+
+For exhaustive signatures, error codes, and curl examples: [docs/actions.md](docs/actions.md).
+
+## Documentation
+
+- **[Quickstart](docs/quickstart.md)** — get from zero to first wallet-signed transaction
+- **[Actions reference](docs/actions.md)** — every OData action + function with examples
+- **[Architecture](docs/architecture.md)** — worker-thread design, submission flow, persistence model
+- **[Operations](docs/operations.md)** — running NIGHTGATE day to day, scripts, local indexer, troubleshooting
+- **[Reference](docs/reference.md)** — full configuration matrix + project structure
+- **[Changelog](CHANGELOG.md)** — notable changes by version
+
+## Use as a CAP plugin in another app
 
 ```bash
 cd my-cap-app
 npm install @odatano/nightgate @cap-js/sqlite
 ```
-
-Add to `package.json`:
 
 ```json
 {
@@ -97,53 +137,27 @@ Add to `package.json`:
 }
 ```
 
-Then `cds watch`. Defaults to Preprod. Override via env vars or CDS config:
-
-| Env var | CDS config key | Default |
-|---|---|---|
-| `NIGHTGATE_NETWORK` | `network` | `preprod` |
-| `NIGHTGATE_NODE_URL` | `nodeUrl` | `wss://rpc.preprod.midnight.network/` |
-| `NIGHTGATE_CRAWLER_NODE_URL` | `crawler.nodeUrl` | same as `nodeUrl` |
-
-If switching an existing DB to a different network, delete `db/midnight.db*` first.
-
-### Query The API
-
-```bash
-# Latest blocks
-curl "http://localhost:4004/api/v1/nightgate/Blocks?$top=5&$orderby=height desc"
-
-# Indexer health
-curl "http://localhost:4004/api/v1/indexer/getHealth()"
-
-# Prometheus-style metrics
-curl "http://localhost:4004/api/v1/indexer/getMetrics()"
-```
-
-## Services
-
-| Service | Path |
-|---|---|
-| `NightgateService` | `/api/v1/nightgate` |
-| `NightgateIndexerService` | `/api/v1/indexer` |
-| `NightgateAnalyticsService` | `/api/v1/analytics` |
-| `NightgateAdminService` | `/api/v1/admin` |
-
-## Documentation
-
-- [Quickstart Guide](docs/quickstart.md): step-by-step from zero to first API call
-- [Reference](docs/reference.md): configuration, runtime behavior, full API surface, project structure
-- [Release 0.1.2](docs/release-0.1.2.md): prepared GitHub/npm release notes and publish checklist
-- [Changelog](CHANGELOG.md): list of notable changes by version
+Then `cds watch`. Defaults to Preprod with public RPC + hosted indexer. Override via env vars or CDS config — see [docs/reference.md#configuration](docs/reference.md#configuration).
 
 ## Development
 
 ```bash
-npm run dev         # Start with auto-reload
-npm run lint        # ESLint
-npm run typecheck   # TypeScript check
-npm run cds:types   # Regenerate @cds-models
-npm test            # Full test suite with coverage
+npm run dev                # cds watch with 12 GB heap (scripts/dev.mjs)
+npm run serve:sync         # cds-serve with 12 GB heap — use this for long sync runs
+npm run sync:start         # bootstrap a wallet session against the running server
+npm run sync:probe         # check local Midnight indexer container status
+
+npm run typecheck          # tsc --noEmit
+npm run lint               # ESLint
+npm test                   # Jest with coverage, 33+ suites, 435+ tests
+npm run build              # Compile CDS types + TypeScript to JS
+
+# Integration scripts (real SDK, no chain access required)
+npm run smoke:sdk
+npm run integration:providers
+npm run integration:wallet-keys
+npm run integration:wallet-facade
+npm run integration:contract-registry
 ```
 
 ## License
@@ -152,6 +166,6 @@ npm test            # Full test suite with coverage
 
 ## Links
 
-- [ODATANO GitHub](https://github.com/ODATANO)
+- [ODATANO GitHub org](https://github.com/ODATANO)
 - [Midnight Network](https://midnight.network/)
 - [SAP CAP Documentation](https://cap.cloud.sap/docs/)

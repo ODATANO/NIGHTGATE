@@ -1,12 +1,14 @@
 # Reference
 
-Detailed configuration, runtime behavior, API surface, and development guide for `@odatano/nightgate`.
+Configuration matrix, runtime behavior, schema, and development setup for `@odatano/nightgate`.
+
+For the OData action/function signatures, see [actions.md](actions.md). For design rationale, see [architecture.md](architecture.md). For day-to-day operations, see [operations.md](operations.md).
 
 ## Configuration
 
-Configure the plugin under `cds.requires.nightgate`. Env vars override CDS config. Code defaults to Preprod with the public RPC.
+Configure the plugin under `cds.requires.nightgate`. Environment variables override CDS config. Code defaults to Preprod with the public RPC and the hosted Midnight indexer.
 
-### Minimal Configuration
+### Minimal
 
 ```json
 {
@@ -18,9 +20,9 @@ Configure the plugin under `cds.requires.nightgate`. Env vars override CDS confi
 }
 ```
 
-This is enough — defaults to `preprod` network and `wss://rpc.preprod.midnight.network/`.
+Sufficient for read-side. Defaults to `preprod`, `wss://rpc.preprod.midnight.network/`, the public Midnight indexer, `http://localhost:6300` for the proof server.
 
-### Full Runtime Configuration
+### Full
 
 ```json
 {
@@ -32,6 +34,22 @@ This is enough — defaults to `preprod` network and `wss://rpc.preprod.midnight
         "nodeUrl": "wss://rpc.preprod.midnight.network/",
         "corsOrigin": "*",
         "sessionTtlMs": 86400000,
+
+        "indexerHttpUrl": "https://indexer.preprod.midnight.network/api/v4/graphql",
+        "indexerWsUrl":   "wss://indexer.preprod.midnight.network/api/v4/graphql/ws",
+        "proofServerUrl": "http://localhost:6300",
+        "zkConfigBasePath": "./contracts",
+        "privateStateBackend": "cap-db",
+        "allowMainnetSubmission": false,
+
+        "contracts": {
+          "counter": {
+            "artifactPath":   "contracts/counter/src/managed/counter/contract/index.js",
+            "privateStateId": "counterPrivateState",
+            "zkConfigPath":   "contracts/counter/src/managed/counter"
+          }
+        },
+
         "crawler": {
           "enabled": true,
           "batchSize": 10,
@@ -45,67 +63,119 @@ This is enough — defaults to `preprod` network and `wss://rpc.preprod.midnight
 }
 ```
 
-### Configuration Reference
+### CDS keys
 
 | Key | Default | Notes |
 |---|---|---|
-| `network` | `preprod` | Valid values are `testnet`, `preprod`, and `mainnet`; invalid values log an error and fall back to `preprod` |
-| `nodeUrl` | `wss://rpc.preprod.midnight.network/` | WebSocket endpoint (`ws://` or `wss://`). Use `ws://localhost:9944` for local Docker node |
-| `crawler.enabled` | `true` | When `false`, services still load but active indexing is disabled |
-| `crawler.nodeUrl` | top-level `nodeUrl` | Optional crawler-specific node URL override |
-| `crawler.batchSize` | `10` | Number of blocks per catch-up progress batch |
-| `crawler.maxRetries` | `3` | Maximum retries per block before the crawler records an error |
-| `crawler.retryDelay` | `2000` | Base retry delay in milliseconds; backoff is calculated from this |
-| `crawler.requestTimeout` | `30000` | RPC timeout in milliseconds |
-| `sessionTtlMs` | `86400000` | Wallet session lifetime in milliseconds |
+| `network` | `preprod` | `testnet` / `preprod` / `mainnet`; invalid values fall back to `preprod` with a warning |
+| `nodeUrl` | `wss://rpc.preprod.midnight.network/` | Substrate RPC WebSocket |
+| `indexerHttpUrl` | preprod indexer URL | Wallet SDK's `publicDataProvider` HTTP endpoint; NOT used by the crawler |
+| `indexerWsUrl` | preprod indexer WS URL | Same, for subscriptions |
+| `proofServerUrl` | `http://localhost:6300` | Required for any submission flow (deploy/call/send/shield/unshield/dust-gen) |
+| `zkConfigBasePath` | `./contracts` | Base for resolving relative `contracts.<name>.zkConfigPath` |
+| `privateStateBackend` | `cap-db` | `cap-db` (default, production-grade encrypted CAP-DB tables) or `level` (legacy SDK LevelDB, **dev-only**, blocked on worker-routed submissions) |
+| `contracts` | `{}` | Map of `<ref>` → `{ artifactPath, privateStateId, zkConfigPath }`, loaded into the in-memory registry on plugin startup |
 | `corsOrigin` | `*` | Reflected in `Access-Control-Allow-Origin` |
+| `contentSecurityPolicy` | strict default | Set to `'off'` to disable, or a string to override |
+| `sessionTtlMs` | `86400000` (24 h) | Wallet session lifetime |
+| `crawler.enabled` | `true` | When `false`, services still load but block indexing is disabled |
+| `crawler.nodeUrl` | top-level `nodeUrl` | Optional crawler-specific RPC override |
+| `crawler.batchSize` | `10` | Blocks per catch-up batch |
+| `crawler.fetchConcurrency` | `(default)` | Parallel RPC fetches during catch-up |
+| `crawler.rpcBatchSize` | `(default)` | Substrate JSON-RPC batch size |
+| `crawler.requestTimeout` | `30000` | RPC timeout (ms) |
+| `allowMainnetSubmission` | `false` | Gate for mainnet submission. Stays off until [forum thread 1190](https://forum.midnight.network) (`1016 Immediately Dropped`) is resolved |
 
-### Environment Variables
+### Environment variables
 
-| Variable | Purpose | Default |
-|---|---|---|
-| `ENCRYPTION_KEY` | AES-256-GCM key material for wallet viewing-key encryption | Process-scoped dev fallback; **required** in production (`NODE_ENV=production`) — startup fails without it |
-| `NIGHTGATE_NETWORK` | Override `network` | `testnet`, `preprod`, or `mainnet` |
-| `NIGHTGATE_NODE_URL` | Override `nodeUrl` | WebSocket endpoint |
-| `NIGHTGATE_CRAWLER_NODE_URL` | Override `crawler.nodeUrl` | Falls back to `NIGHTGATE_NODE_URL` if not set |
-| `NODE_ENV=production` | Enables HSTS response header; enforces `ENCRYPTION_KEY` presence | Off unless explicitly set |
+| Variable | Purpose |
+|---|---|
+| `ENCRYPTION_KEY` | AES-256-GCM key (32-byte hex) for at-rest encryption of viewing keys + seed keys. Falls back to a dev key with warning if not set; **required** in production. |
+| `NODE_ENV=production` | Enables HSTS, enforces `ENCRYPTION_KEY` |
+| `NIGHTGATE_NETWORK` | Override `network` |
+| `NIGHTGATE_NODE_URL` | Override `nodeUrl` |
+| `NIGHTGATE_CRAWLER_NODE_URL` | Override `crawler.nodeUrl` |
+| `NIGHTGATE_CRAWLER_ENABLED` | `false` / `0` / `no` / `off` disables the crawler at boot |
+| `NIGHTGATE_FETCH_CONCURRENCY` | Override `crawler.fetchConcurrency` |
+| `NIGHTGATE_RPC_BATCH_SIZE` | Override `crawler.rpcBatchSize` |
+| `NIGHTGATE_INDEXER_HTTP_URL` | Override `indexerHttpUrl` (e.g. point at local indexer container) |
+| `NIGHTGATE_INDEXER_WS_URL` | Override `indexerWsUrl` |
+| `NIGHTGATE_PROOF_SERVER_URL` | Override `proofServerUrl` |
+| `NIGHTGATE_PROOF_NETWORK` | Network passed to the proof-server container; defaults to `preprod` |
+| `NIGHTGATE_ZK_CONFIG_BASE` | Override `zkConfigBasePath` |
+| `NIGHTGATE_PRIVATE_STATE_BACKEND` | Override `privateStateBackend` |
+| `INDEXER_SECRET` | 32-byte hex secret for the indexer container's `APP__INFRA__SECRET` |
+| `INDEXER_UPSTREAM_NODE_URL` | Upstream Substrate RPC for the indexer container (default = hosted preprod) |
+| `LACE_VIEWING_KEY` | Consumed by `scripts/sync-start.mjs` and `scripts/run-t15.mjs` to bootstrap a wallet session |
+| `LACE_SEED_HEX` | Same, the 32-byte BIP39-derived seed |
+| `LACE_MNEMONIC` | Alternative to `LACE_SEED_HEX`; `run-t15.mjs` derives the seed via BIP39 |
+| `T15_DUST_WAIT_SECONDS` | `run-t15.mjs` parameter — how long to wait after dust registration |
+| `T15_SKIP_DUST_REG` | `1` to skip dust registration step in `run-t15.mjs` |
+| `NIGHTGATE_HEAP_MB` | Heap size for `scripts/dev.mjs` / `scripts/serve.mjs` (default `12288`) |
 
-For local repository startup, putting these values into a repo-root `.env` file works with `npm run dev` / `cds watch`. A tracked template is available in [../.env.example](../.env.example).
+For local repository startup, drop these into a repo-root `.env`. The tracked template is at [.env.example](../.env.example).
 
-### Example `.env` Files
+## Runtime behavior
 
-Preprod is the default — no `.env` needed. For testnet with local Docker:
-
-```env
-NIGHTGATE_NETWORK=testnet
-NIGHTGATE_NODE_URL=ws://localhost:9944
-```
-
-## Runtime Behavior
-
-### Plugin Lifecycle
+### Plugin lifecycle
 
 - `cds-plugin.js` loads `src/plugin.ts`
-- model roots are registered from `db/` and `srv/`
-- middleware is attached during CAP bootstrap
-- `initialize()` runs on `cds.on('served')`
-- `shutdown()` runs on `cds.on('shutdown')`
+- Model roots registered from `db/` and `srv/`
+- Security middleware attached during CAP bootstrap
+- `initialize()` runs on `cds.on('served')`:
+  1. Auto-deploys CDS schema if `Blocks` table doesn't exist
+  2. Applies SQLite tuning pragmas (WAL, 64 MB cache, 256 MB mmap)
+  3. Loads `cds.requires.nightgate.contracts` into the contract registry
+  4. Spawns the wallet worker thread (`startWalletWorker()`) and wires the state-save sink
+  5. Starts the crawler if `enabled` (default true)
+- `shutdown()` runs on `cds.on('shutdown')`:
+  1. Stops the crawler
+  2. Stops the wallet worker (sends final state-save for each cached facade)
 
-### Startup And Failure Semantics
+### Two parallel pipelines
 
-- On first startup, the package checks whether `midnight.Blocks` exists
-- if the schema is missing, it attempts `db.deploy()` automatically
-- if the Midnight node cannot be reached, the package logs a warning and continues in `offline` mode
-- repeated `initialize()` calls are idempotent
-- existing SQLite state in `db/midnight.db` is reused across restarts; network switches do not automatically clear prior sync state
+NIGHTGATE runs two independent flows that meet at one reconciliation point. The full diagram lives in [architecture.md#the-two-pipelines](architecture.md#the-two-pipelines).
 
-### Switching Existing Databases
+| Pipeline | Where it runs | What it does |
+|---|---|---|
+| **Block crawler** | Main thread | Catch-up + live block subscription via Substrate RPC; writes Blocks/Tx/Actions/UTXOs/Balances into CAP DB |
+| **Wallet SDK** | `worker_threads` worker | ZK-aware wallet ops: shielded/unshielded/dust sub-wallets, transfer/swap/contract submission via the Midnight indexer + proof server |
 
-This repository persists indexed data in [../db/midnight.db](../db/midnight.db). If you switch an existing checkout from local standalone or another network to Preprod, remove [../db/midnight.db](../db/midnight.db), [../db/midnight.db-shm](../db/midnight.db-shm), and [../db/midnight.db-wal](../db/midnight.db-wal) before the first Preprod run.
+They meet at `reconcilePendingSubmission`: when the crawler indexes a transaction whose hash matches a row in `PendingSubmissions`, the row's status flips to `finalized`.
 
-### Security Middleware
+### Submission lifecycle
 
-The bootstrap middleware sets:
+For every action that produces an on-chain transaction:
+
+1. **Main thread**: validate args, rate-limit check, INSERT `PendingSubmissions` row with status=`pending`
+2. **Main thread**: register a `CapDbPrivateStateProvider` instance under a fresh `proxyId` (only for deploy/call)
+3. **Worker**: receive RPC, build via facade, balance, finalize (ZK proof gen — heavy), submit; return primitives
+4. **Main thread**: UPDATE row with `txHash` + `status=included`; release proxy; classify any error
+5. **Later, async**: crawler indexes the tx → `reconcilePendingSubmission` flips status to `finalized`
+
+The `sessionId` field on `PendingSubmissions` is the OData user-session UUID (audit trail). The worker keys its facade cache on `accountId` (deterministic from viewing key) — they're different identifiers; see [architecture.md#the-sessionid-indirection](architecture.md#the-sessionid-indirection).
+
+### Error classification
+
+See [actions.md#error-model](actions.md#error-model) for the full table of error codes that `classifySubmissionError(err, network)` produces.
+
+### Startup + failure semantics
+
+- On first startup, the package checks whether `midnight.Blocks` exists. If the schema is missing, it attempts `db.deploy()` automatically.
+- If the Midnight node cannot be reached, the package logs a warning and continues in `offline` mode. Read-side requests are still served from cache; submission requests still work (they only need the indexer + proof server, not the node directly).
+- If the wallet worker fails to start, the plugin logs a warning and continues — submission requests will return an error, read-side is unaffected.
+- Repeated `initialize()` calls are idempotent.
+- Contract registry loads from `cds.requires.nightgate.contracts` on every `initialize()`.
+
+### Switching existing databases
+
+`db/midnight.db` persists indexed data plus encrypted wallet state. When switching networks, delete `db/midnight.db*` first.
+
+The `PrivateStates`, `ContractSigningKeys`, and `WalletSyncStates` tables are encrypted with passwords derived from the viewing key (via PBKDF2). Losing the `ENCRYPTION_KEY` env var means stored viewing/seed keys become unreadable — back it up separately. For private state migration, use `exportPrivateStates(password)` to produce a portable encrypted blob.
+
+### Security middleware
+
+The bootstrap middleware sets these headers on every response:
 
 - `X-Correlation-ID`
 - `Access-Control-Allow-Origin`
@@ -119,7 +189,7 @@ The bootstrap middleware sets:
 - `Content-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'`
 - `Strict-Transport-Security` in production only
 
-It also short-circuits `OPTIONS` requests with HTTP `204`.
+It also short-circuits `OPTIONS` requests with HTTP 204.
 
 ## Programmatic API
 
@@ -146,184 +216,155 @@ import {
 }
 ```
 
-## Services And Endpoints
+## Services + entities
 
-| Service | Path | What it exposes |
+| Service | Path | Surface |
 |---|---|---|
-| `NightgateService` | `/api/v1/nightgate` | Core blockchain entities plus wallet connect/disconnect actions |
-| `NightgateIndexerService` | `/api/v1/indexer` | Sync state, health, readiness, liveness, metrics, reorg history |
-| `NightgateAnalyticsService` | `/api/v1/analytics` | Aggregated counts and analytics projections |
-| `NightgateAdminService` | `/api/v1/admin` | Wallet session administration and invalidation |
+| `NightgateService` | `/api/v1/nightgate` | Blockchain entities + wallet sessions + token ops + contract ops |
+| `NightgateIndexerService` | `/api/v1/indexer` | Sync state, health, reorgs, Prometheus metrics, crawler control |
+| `NightgateAnalyticsService` | `/api/v1/analytics` | Aggregate counts |
+| `NightgateAdminService` | `/api/v1/admin` | Session admin |
 
-### NightgateService
+For per-action signatures and curl examples, see [actions.md](actions.md).
 
-Entities:
+### NightgateService entities (all `@readonly` unless noted)
 
-- `Blocks`
-- `Transactions`
-- `TransactionResults`
-- `TransactionSegments`
-- `TransactionFees`
-- `ContractActions`
-- `ContractBalances`
+- `Blocks`, `Transactions`, `TransactionResults`, `TransactionSegments`, `TransactionFees`
+- `ContractActions`, `ContractBalances`
 - `UnshieldedUtxos`
-- `ZswapLedgerEvents`
-- `DustLedgerEvents`
-- `SystemParameters`
-- `DParameterHistory`
-- `TermsAndConditionsHistory`
-- `DustGenerationStatus`
+- `ZswapLedgerEvents`, `DustLedgerEvents`
 - `NightBalances`
-- `DustRegistrations`
-- `TokenTypes`
-- `WalletSessions`
+- `PendingSubmissions` — submission lifecycle audit trail
+- `WalletSessions` — projection excludes `viewingKeyHash` and `encryptedViewingKey`; `encryptedSeedKey` also internal-only
 
-Actions and functions:
+### Schema additions (vs. 0.1.2)
 
-- `Blocks.latest()`
-- `Blocks.byHeight(height)`
-- `Blocks.range(startHeight, endHeight, limit)`
-- `Transactions.byHash(hash)`
-- `Transactions.byType(txType, limit)`
-- `ContractActions.byAddress(address)`
-- `ContractActions.history(address)`
-- `UnshieldedUtxos.byOwner(owner)`
-- `UnshieldedUtxos.unspent()`
-- `SystemParameters.current()`
-- `DustGenerationStatus.byCardanoAddress(address)`
-- `DustGenerationStatus.byCardanoAddresses(addresses)`
-- `NightBalances.getBalance(address)`
-- `NightBalances.getTopHolders(limit)`
-- `DustRegistrations.byCardanoStakeKey(stakeKey)`
-- `WalletSessions.connectWallet(viewingKey)`
-- `WalletSessions.disconnectWallet(sessionId)`
+| Entity / Field | Purpose |
+|---|---|
+| `PendingSubmissions` | Submission lifecycle (`pending` → `included` → `finalized` / `failed`). Written before SDK call, reconciled by crawler. |
+| `PrivateStates` | Encrypted contract private state per `(accountId, contractAddress, privateStateId)`. Replaces the SDK's LevelDB provider. |
+| `ContractSigningKeys` | Encrypted contract signing keys per `(accountId, contractAddress)`. |
+| `WalletSyncStates` | Serialized SDK sub-wallet blobs (shielded/unshielded/dust) per `accountId`. Restart-resilient — restored on next `connectWalletForSigning`. |
+| `WalletSessions.encryptedSeedKey` | Nullable field populated by `connectWalletForSigning`. Sessions without it can still do read-side flows. |
 
-### NightgateIndexerService
+New enums in `db/types.cds`:
 
-Functions:
+- `PendingSubmissionStatus`: `pending` | `included` | `finalized` | `failed`
 
-- `getSyncStatus()`
-- `getHealth()`
-- `getReorgHistory(limit)`
-- `getLiveness()`
-- `getReadiness()`
-- `getMetrics()`
-- `pauseCrawler()`
-- `resumeCrawler()`
-- `reindexFromHeight(height)`
+## Capability matrix
 
-Prometheus metric names use the `odatano_nightgate_` prefix.
+| Area | Status |
+|---|---|
+| CAP plugin integration | ✅ Auto-registers models, security middleware, lifecycle hooks |
+| Node connectivity | ✅ `ws://` / `wss://` connections, config validation, offline fallback |
+| Block catch-up + live sync | ✅ Finalized-block replay, header subscription, transient retry |
+| Reorg recovery | ✅ Parent-hash detection, fork-point search, atomic rollback, `ReorgLog` |
+| CAP-DB private state | ✅ Production-grade encrypted backend (T29) |
+| Wallet sessions | ✅ Read-only + signing-upgraded, TTL cleanup, admin invalidation |
+| Contract deploy / call | ✅ Worker-thread routed (Phase 2b), pending-row tracked, crawler-reconciled |
+| Token ops (transfer, shield/unshield) | ✅ `sendNight`, `shieldFunds`, `unshieldFunds` via worker |
+| Dust generation | ✅ `registerForDustGeneration` + `deregisterFromDustGeneration` |
+| Diagnostics (balance, fee estimates) | ✅ `getWalletBalance`, `estimateSendNightFee`, `estimateShield/UnshieldFee` |
+| Local Midnight indexer (docker) | ✅ Optional `midnightntwrk/indexer-standalone:4.3.2` service |
+| Wallet state persistence | ✅ `WalletSyncStates` — restart resumes in seconds, not hours |
+| Worker-thread architecture | ✅ Wallet SDK isolated from main thread (Phase 1+2a+2b) |
+| Compact contracts | ⚠️ `counter` registered; `AttestationVault` deferred to T10-extended |
+| Live preprod end-to-end (T15) | ⚠️ Blocked on dust accrual (chain economics, not code) |
+| Mainnet submission | ❌ Gated by `allowMainnetSubmission: false` until forum 1190 resolves |
+| Built-in authorization | ✅ `@requires` annotations; consumer app provides auth strategy |
 
-### NightgateAnalyticsService
+## Project structure
 
-Entities and functions:
+See [../CLAUDE.md](../CLAUDE.md) for the full annotated directory tree. Key directories:
 
-- `BlockStatistics`
-- `ContractStatistics`
-- `getBlockCount()`
-- `getTransactionCount()`
-- `getContractCount()`
-- `getAverageTransactionsPerBlock()`
+```
+src/
+  index.ts                          # initialize/shutdown/getStatus + lifecycle
+  plugin.ts                         # cds-plugin.js entry, security middleware
+srv/
+  nightgate-service.{cds,ts}        # main OData service + wallet/token-ops/contract handlers
+  nightgate-indexer-service.{cds,ts}# sync/health/metrics/reorg
+  analytics-service.{cds,ts}
+  admin-service.{cds,ts}
+  crawler/                          # Block crawler (main thread)
+    Crawler.ts
+    BlockProcessor.ts
+  providers/
+    MidnightNodeProvider.ts         # Substrate RPC client
+  midnight/                         # Wallet SDK integration
+    sdk-loader.ts                   # main-thread dynamic-import loader
+    wallet-worker.ts                # worker entry — SDK lives here
+    wallet-worker-client.ts         # main-thread RPC client
+    providers.ts                    # provider bundle assembly (legacy main-thread path; test-only after Phase 2b)
+    CapDbPrivateStateProvider.ts    # T29 — encrypted CAP-DB private state
+  submission/                       # Submission orchestration (main thread)
+    TransactionSubmitter.ts         # deploy/call lifecycle + pending-row mgmt
+    handlers.ts                     # OData action handlers for deploy/call
+    contract-registry.ts            # name → compiled artifact lookup
+    wallet-material-factory.ts      # session → walletMaterial (accountId, password)
+    wallet-facade-builder.ts        # main-thread glue to the worker facade
+    dust-registration.ts            # register/deregister wrappers
+    token-ops.ts                    # send/shield/unshield wrappers + diagnostics
+  sessions/
+    wallet-sessions.ts              # OData handlers for sessions + token ops
+  utils/
+    nightgate-config.ts             # typed config accessor + runtime resolver
+    crypto.ts                       # AES-256-GCM for viewing/seed keys
+    storage-encryption.ts           # SDK-wire-format PBKDF2 + AES-256-GCM
+    format-error.ts                 # shared error → log-string helper
+    sqlite-tuning.ts                # SQLite pragmas
+    ...
+contracts/
+  counter/                          # Compact source + compiled artifact
+docker/
+  docker-compose.yml                # midnight-node, proof-server, indexer (standalone)
+scripts/
+  dev.mjs / serve.mjs               # node-spawn wrappers with 12 GB heap
+  start-wallet-sync.mjs             # connectWallet + connectWalletForSigning
+  probe-indexer.mjs                 # local indexer liveness check
+  run-t15.mjs                       # end-to-end submission test
+  integration-*.mjs                 # real-SDK probes
+```
 
-### NightgateAdminService
+## Integration scripts (no chain needed)
 
-Actions:
+```bash
+npm run smoke:sdk                  # 8 Midnight SDK packages load via dynamic import
+npm run integration:providers      # provider bundle builds against real SDK
+npm run integration:wallet-keys    # ZswapSecretKeys.fromSeed determinism
+npm run integration:wallet-facade  # WalletFacade.init wiring (no chain access)
+npm run integration:contract-registry  # registry resolves the real compiled counter
+```
 
-- `invalidateSession(sessionId)`
-- `invalidateAllSessions()`
-
-The admin projection excludes `encryptedViewingKey` from the OData response surface.
-
-## Current Capability Matrix
-
-| Area | Status | What works now | Boundaries in `0.1.2` |
-|---|---|---|---|
-| CAP plugin integration | Ready | Registers models from `db/` and `srv/`, wires bootstrap middleware, starts on CAP `served`, stops on CAP `shutdown` | Configure only through `cds.requires.nightgate` |
-| Node connectivity | Ready | Connects to Midnight nodes over `ws://` or `wss://`, validates runtime config, warns on bad URLs | No separate multi-node failover layer yet |
-| Catch-up and live sync | Ready | Replays finalized blocks, subscribes to new heads, retries transient failures | Single active crawler instance per process |
-| Reorg recovery | Ready | Detects chain divergence, finds fork points, rolls back indexed data, records `ReorgLog` | Designed for operational correctness, not deep historical reconciliation jobs |
-| Local persistence | Ready | Persists blocks, transactions, sync state, reorg state, and related read-side entities via CAP DB APIs | SQLite-first default; host app controls broader DB strategy |
-| Core OData reads | Ready | Blocks, transactions, UTXO reads, balance lookups, governance/system-parameter reads, wallet-session actions, plus range/type query helpers (`Blocks.range`, `Transactions.byType`) | Data quality depends on what the current crawler/parser version extracts into the local DB |
-| Indexer operations API | Ready | `getSyncStatus`, `getHealth`, `getReorgHistory`, `getLiveness`, `getReadiness`, `getMetrics`, `pauseCrawler`, `resumeCrawler`, `reindexFromHeight` | Focused on one running indexer instance |
-| Wallet sessions | Ready | Connect/disconnect flows, encrypted viewing-key storage, TTL expiry, cleanup job, admin invalidation | Sessions track `sessionId` only; token-based validation is not yet implemented |
-| Analytics | Ready | Block count, transaction count, contract count, average transactions per block, CDS aggregate projections | Analytics are read-side aggregates over indexed local data |
-| Midnight domain surface | Partial | Schema and service surface already include contracts, balances, DUST, governance, registrations, token types | Some entity families are ahead of full extractor/populator depth and will mature incrementally |
-| Write-side blockchain workflows | Not included | None | No transaction build, signing, submission, or wallet execution flow in this release |
-| Built-in authorization model | Ready | `@requires: 'authenticated-user'` on `NightgateService` and `NightgateAnalyticsService`; `@requires: 'admin'` on `NightgateAdminService` | The consuming CAP app must configure its auth strategy (e.g., mock users for dev, JWT/XSUAA for production) |
-
-## Development Commands
+## Development commands
 
 | Command | Use |
 |---|---|
-| `npm run dev` | Start CAP from TypeScript sources with auto-reload |
-| `npm run cds:watch` | Direct CAP watch command |
-| `npm run build` | Build the plugin in place for packaging/runtime verification |
-| `npm start` | Build first, then run the compiled layout |
-| `npm run clean` | Remove generated `.js` and `.d.ts` build artifacts |
-| `npm run cds:types` | Regenerate `@cds-models` |
-| `npm run lint` | Run ESLint |
-| `npm run typecheck` | Run TypeScript without emitting output |
+| `npm run dev` | `cds watch` with 12 GB heap |
+| `npm run serve:sync` | `cds-serve` with 12 GB heap (no watch) |
+| `npm run serve` | Plain `cds-serve` |
+| `npm run sync:start` | Bootstrap a wallet session against the running server |
+| `npm run sync:probe` | Check local indexer container status |
+| `npm run t15` | End-to-end submission flow |
+| `npm run build` | `cds:types` + `tsc -p tsconfig.build.json` (in-place compile) |
+| `npm run typecheck` | `tsc --noEmit` |
+| `npm run lint` | ESLint |
 | `npm test` | Full Jest suite with coverage |
 | `npm run test:unit` | Unit tests only |
+| `npm run clean` | Remove generated `.js` / `.d.ts` artifacts |
+| `npm run cds:types` | Regenerate `@cds-models` |
 
-## Testing
+## Testing baseline
 
-Verified repository baseline from the latest full run:
+- 37 test suites
+- 435+ tests passing
+- 0 failures
+- All 5 integration scripts pass against the real SDK
 
-- `22` test suites passed
-- `267` tests passed
-- `0` failures
-- coverage: `93.09%` statements, `81.77%` branches, `94.3%` functions, `93.62%` lines
-
-Run the same checks locally:
+Run locally:
 
 ```bash
-npm run lint
 npm run typecheck
 npm test
-```
-
-## Project Structure
-
-```text
-.
-├── cds-plugin.js
-├── db/
-│   └── schema.cds
-├── docker/
-│   └── docker-compose.yml
-├── src/
-│   ├── index.ts
-│   └── plugin.ts
-├── srv/
-│   ├── admin-service.cds
-│   ├── admin-service.ts
-│   ├── analytics-service.cds
-│   ├── analytics-service.ts
-│   ├── nightgate-indexer-service.cds
-│   ├── nightgate-indexer-service.ts
-│   ├── nightgate-service.cds
-│   ├── nightgate-service.ts
-│   ├── crawler/
-│   │   ├── BlockProcessor.ts
-│   │   ├── Crawler.ts
-│   │   └── index.ts
-│   ├── providers/
-│   │   └── MidnightNodeProvider.ts
-│   ├── sessions/
-│   │   └── wallet-sessions.ts
-│   ├── types/
-│   │   ├── index.ts
-│   │   └── nightgate.ts
-│   └── utils/
-│       ├── cds-model.ts
-│       ├── crypto.ts
-│       ├── rate-limiter.ts
-│       ├── retry.ts
-│       ├── scale.ts
-│       ├── sync-state.ts
-│       └── validation.ts
-├── test/
-│   └── unit/
-└── @cds-models/
+npm run smoke:sdk
 ```

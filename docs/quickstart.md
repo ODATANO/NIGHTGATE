@@ -1,129 +1,193 @@
 # Quickstart
 
-This guide gets `@odatano/nightgate` from zero to first successful API call with the current `0.1.2` feature set.
+From `npm ci` to a working wallet-signed transaction. This walks through three paths in order of complexity:
 
-It covers both supported entry points:
-
-- run this repository directly
-- use Nightgate as a CAP plugin in another app
+1. **Read-side only** — index Preprod blocks against the hosted RPC. ~2 min setup.
+2. **Wallet sessions + read** — connect a wallet, query its balance. ~5 min.
+3. **Full submission flow** — sign and submit a NIGHT transfer or contract deploy. ~5 min once a synced wallet is available.
 
 ## Prerequisites
 
-- Node.js and npm
-- Docker Desktop (only for local testnet mode)
+- Node.js ≥ 20 (the wallet SDK needs `worker_threads` + `--env-file`)
+- npm
+- Docker Desktop (only if you want the local proof server or the local Midnight indexer)
+- For wallet operations: a Midnight wallet seed (24-word BIP39 mnemonic) and viewing key. Get these from the [Lace wallet](https://www.lace.io/) extension.
 
-## Option A: Run This Repository Directly
-
-### 1. Install dependencies
+## Path 1: Read-side only
 
 ```bash
 npm ci
-```
-
-### 2. Choose the target environment
-
-#### Preprod (default — no Docker needed)
-
-```bash
 npm run dev
 ```
 
-Nightgate defaults to Preprod with the public RPC at `wss://rpc.preprod.midnight.network/`. No `.env` or extra config needed.
+`npm run dev` uses `cds watch` with a 12 GB Node heap (configured in `scripts/dev.mjs`). The plugin defaults to Preprod with the public RPC at `wss://rpc.preprod.midnight.network/`. No `.env` or extra config required.
 
-#### Testnet with local Docker node
+The crawler will catch up from genesis (~100k blocks at first run, faster on subsequent restarts thanks to incremental sync). Watch the log for `[Crawler] Live subscription active`.
 
-```bash
-docker compose -f docker/docker-compose.yml up -d
-```
-
-Create a `.env` in the repo root:
-
-```env
-NIGHTGATE_NETWORK=testnet
-NIGHTGATE_NODE_URL=ws://localhost:9944
-```
-
-```bash
-npm run dev
-```
-
-If switching from a different network, delete `db/midnight.db*` first.
-
-Nightgate starts CAP from the TypeScript source tree and then:
-
-- registers its CAP models
-- attempts schema deployment if the DB is still empty
-- connects to the Midnight node
-- runs historical catch-up
-- switches to live indexing
-
-Override the target via `NIGHTGATE_NETWORK` and `NIGHTGATE_NODE_URL` env vars or a repo-root `.env` file.
-
-### 4. Check that the service is up
-
-Expected service paths:
-
-- `/api/v1/nightgate`
-- `/api/v1/indexer`
-- `/api/v1/analytics`
-- `/api/v1/admin`
-
-Typical startup output:
-
-```text
-[cds] - bootstrapping from { file: 'srv/server.ts' }
-[cds] - serving NightgateService { at: '/api/v1/nightgate' }
-[cds] - serving NightgateIndexerService { at: '/api/v1/indexer' }
-[cds] - serving NightgateAnalyticsService { at: '/api/v1/analytics' }
-[cds] - serving NightgateAdminService { at: '/api/v1/admin' }
-
-[odatano-nightgate] Network: testnet
-[odatano-nightgate] Node: ws://localhost:9944
-[odatano-nightgate] Initializing crawler and starting catch-up...
-[MidnightNode] Connected to ws://localhost:9944
-[odatano-nightgate] Startup state: syncing (crawler started)
-[Crawler] Live subscription active
-```
-
-The output above shows local standalone mode. For Preprod, the key lines should look like this instead:
-
-```text
-[odatano-nightgate] Network: preprod
-[odatano-nightgate] Node: wss://rpc.preprod.midnight.network/
-[MidnightNode] Connected to wss://rpc.preprod.midnight.network/
-```
-
-In standalone repo mode, CAP bootstraps through `srv/server.ts`, which imports the same Nightgate plugin hooks that `cds-plugin.js` provides in consumer apps.
-
-Nightgate emits one explicit startup-state line:
-
-- `syncing` when the crawler starts normally
-- `stopped` when the plugin is unconfigured or the crawler is disabled
-- `offline` when startup falls back after a node or runtime error
-
-### 5. Make the first API calls
-
+Verify:
 ```bash
 curl "http://localhost:4004/api/v1/indexer/getHealth()"
 curl "http://localhost:4004/api/v1/indexer/getSyncStatus()"
-curl "http://localhost:4004/api/v1/nightgate/Blocks?$top=5&$orderby=height desc"
-curl "http://localhost:4004/api/v1/analytics/getBlockCount()"
+curl "http://localhost:4004/api/v1/nightgate/Blocks?\$top=5&\$orderby=height desc"
 ```
 
-If indexing has already started, you should see a non-empty sync state and block data.
+You should see non-zero `chainHeight` and the latest 5 blocks. **Done — read-side works.**
 
-## Option B: Use Nightgate In Another CAP App
+## Path 2: Wallet sessions
 
-### 1. Install the package
+For wallet operations, the SDK runs in a separate worker thread and needs the proof server alongside. Add to `docker/docker-compose.yml` (already present) and start:
+
+```bash
+docker compose -f docker/docker-compose.yml up -d proof-server
+```
+
+The proof server is small (~23 MB image) but downloads ZK parameters on first contract compile (~500 MB to a few GB depending on circuit). Parameters persist in the `proof-server-data` named volume.
+
+### Configure wallet credentials
+
+Edit `.env` in the repo root (gitignored — never commit a real seed):
+
+```env
+NIGHTGATE_NETWORK=preprod
+NIGHTGATE_NODE_URL=wss://rpc.preprod.midnight.network/
+
+# Optional: disable crawler during wallet-only runs to free CPU/RAM for the worker
+NIGHTGATE_CRAWLER_ENABLED=false
+
+# Your wallet's viewing key and seed (BIP39 mnemonic → first 32 bytes of mnemonicToSeed)
+LACE_VIEWING_KEY=a32699a5a29e453f6e92624c2fbefdee173d3f1178e3f9c71bc3edb7d91c1403
+LACE_SEED_HEX=eb20669878df738b682aecb178b24bb0d606d3318500e6f8cdd8ab5a2783e1c1
+```
+
+To derive `LACE_SEED_HEX` from a mnemonic, use the included helper:
+```bash
+node scripts/derive-keys.mjs "word1 word2 word3 ... word24"
+```
+
+### Start the server
+
+Use `serve:sync` for long-running sessions — it's `cds-serve` (no watch) with the 12 GB heap:
+
+```bash
+npm run serve:sync
+```
+
+Expected log:
+```
+[serve.mjs] NODE_OPTIONS = --max-old-space-size=12288
+[cds] - server listening on { url: 'http://localhost:4004' }
+[wallet-worker-client] worker ready
+[odatano-nightgate] Wallet worker thread ready
+[odatano-nightgate] Network: preprod
+[odatano-nightgate] Startup state: stopped (crawler disabled)
+```
+
+### Bootstrap a wallet session
+
+In a second terminal:
+
+```bash
+npm run sync:start
+```
+
+This calls `connectWallet` then `connectWalletForSigning` against `localhost:4004`, reading `LACE_VIEWING_KEY` / `LACE_SEED_HEX` from `.env`. Output:
+
+```
+--- 1. connectWallet ---
+OK   sessionId = c07b1f0a-7251-488d-a64e-1bf69045d7a9
+
+--- 2. connectWalletForSigning ---
+OK   { ..., "signingEnabled": true }
+
+Session to reuse for T15: c07b1f0a-7251-488d-a64e-1bf69045d7a9
+```
+
+The server will start the wallet sync **in the worker thread** in the background. Expected server logs:
+
+```
+[wallet-sessions] facade pre-warm kicked off for d4c0f3cc9d3d285c
+[facade] restored prior state for d4c0f3cc9d3d285c: shielded=true unshielded=true dust=true   (or =false on first run)
+[worker] facade started for d4c0f3cc9d3d285c
+[facade-persist] saved d4c0f3cc9d3d285c sh=4032 un=369 du=487021                              (every ~30 s)
+```
+
+**First run from a fresh seed**: cold sync takes ~5-6 hours wall-clock. The worker pegs ~3.8 GB heap during the shielded chain scan. Subsequent runs use the persisted blob from `WalletSyncStates` and delta-sync in seconds.
+
+### Query the wallet
+
+Once the sync hits tip (you see `[facade-persist] saved` lines with stable shielded/unshielded sizes and only the dust blob growing), query balance:
+
+```bash
+curl "http://localhost:4004/api/v1/nightgate/getWalletBalance(sessionId='c07b1f0a-...')"
+```
+
+Response:
+```json
+{
+  "shieldedNight": "1000000000000",
+  "unshieldedNight": "0",
+  "dustBalance": "2098000",
+  "registeredNightUtxoCount": 1,
+  "totalNightUtxoCount": 1
+}
+```
+
+## Path 3: Send a transaction
+
+With a synced wallet that has some DUST (Lace shows the dust balance refilling), you can submit transactions.
+
+### Pre-flight: estimate the fee
+
+```bash
+curl "http://localhost:4004/api/v1/nightgate/estimateSendNightFee(sessionId='...',receiverAddress='mn_addr_preprod1...',amount='1000000')"
+```
+
+Response: `{"fee":"123456","toLedger":"unshielded"}`. Compare against the wallet's `dustBalance` from `getWalletBalance`.
+
+### Send NIGHT
+
+```bash
+curl -X POST http://localhost:4004/api/v1/nightgate/sendNight \
+  -H "Content-Type: application/json" \
+  -d '{
+    "sessionId": "c07b1f0a-...",
+    "receiverAddress": "mn_addr_preprod1xcmxw094zxek0jp0tdc6e294tgrx0qn0l40ugjqhtqy3w5x7dkusuzphxg",
+    "amount": "1000000"
+  }'
+```
+
+Response: `{"txId":"0xabc...","toLedger":"unshielded","amount":"1000000","receiverAddress":"mn_addr_preprod1..."}`. The transaction is submitted; the crawler will pick it up and flip the matching `PendingSubmissions` row to `finalized` once indexed.
+
+### Deploy a contract
+
+The repo ships with a pre-compiled `counter` contract under `contracts/counter/`. Registration is already in `package.json` under `cds.requires.nightgate.contracts`.
+
+```bash
+curl -X POST http://localhost:4004/api/v1/nightgate/deployContract \
+  -H "Content-Type: application/json" \
+  -d '{
+    "compiledArtifactRef": "counter",
+    "sessionId": "c07b1f0a-...",
+    "initialPrivateState": "{}"
+  }'
+```
+
+Response: `{"submissionId":"...","txHash":"0x...","contractAddress":"0x...","status":"included"}`.
+
+The full T15 test runner does all this in one go (`connect → connectWalletForSigning → registerForDustGeneration → wait 90s → deployContract`):
+
+```bash
+npm run t15
+```
+
+## Use NIGHTGATE in another CAP app
 
 ```bash
 cd my-cap-app
 npm install @odatano/nightgate @cap-js/sqlite
 ```
 
-### 2. Add configuration
-
-Add this to your `package.json`:
+Add to `package.json`:
 
 ```json
 {
@@ -136,111 +200,13 @@ Add this to your `package.json`:
 }
 ```
 
-Nightgate defaults to Preprod. Override via env vars (`NIGHTGATE_NETWORK`, `NIGHTGATE_NODE_URL`) or CDS config.
+Then `cds watch`. Defaults to Preprod with hosted endpoints. Override via env vars or CDS config — see [reference.md#configuration](reference.md#configuration).
 
-### 3. Start the CAP app
+The plugin auto-registers four OData services under `/api/v1/{nightgate,indexer,analytics,admin}`. All actions and functions documented in [actions.md](actions.md) are available immediately.
 
-```bash
-cds watch
-```
+## Common next steps
 
-Nightgate is discovered through [cds-plugin.js](../cds-plugin.js) and registers itself automatically.
-
-### 4. Verify the plugin endpoints
-
-```bash
-curl "http://localhost:4004/api/v1/indexer/getReadiness()"
-curl "http://localhost:4004/api/v1/indexer/getMetrics()"
-curl "http://localhost:4004/api/v1/nightgate/Transactions?$top=5"
-```
-
-## Useful Configuration
-
-These are the most relevant runtime settings for first use:
-
-```json
-{
-  "cds": {
-    "requires": {
-      "nightgate": {
-        "kind": "nightgate",
-        "corsOrigin": "*",
-        "sessionTtlMs": 86400000,
-        "crawler": {
-          "enabled": true,
-          "batchSize": 10,
-          "maxRetries": 3,
-          "retryDelay": 2000,
-          "requestTimeout": 30000
-        }
-      }
-    }
-  }
-}
-```
-
-Meaning of the main knobs:
-
-- `network`: `testnet`, `preprod`, or `mainnet`
-- `nodeUrl`: Midnight node WebSocket endpoint. For public Preprod use `wss://rpc.preprod.midnight.network/`
-- `crawler.enabled`: disable active indexing but still expose services
-- `crawler.batchSize`: progress batch size during catch-up
-- `crawler.maxRetries`: retries per block before error handling kicks in
-- `crawler.retryDelay`: base retry delay in milliseconds
-- `crawler.requestTimeout`: RPC timeout in milliseconds
-- `sessionTtlMs`: wallet session lifetime
-- `corsOrigin`: value returned in `Access-Control-Allow-Origin`
-
-## What You Can Use Immediately
-
-After startup, these are the most useful entry points in `0.1.2`:
-
-- blockchain reads through `/api/v1/nightgate`
-- sync, health, readiness, liveness, metrics, and reorg history through `/api/v1/indexer`
-- aggregate counts through `/api/v1/analytics`
-- wallet session invalidation through `/api/v1/admin`
-
-Current release scope is read-side first:
-
-- indexing and persistence are included
-- OData exposure is included
-- wallet session storage and cleanup are included
-- transaction build, sign, and submit flows are not included yet
-
-## Troubleshooting
-
-### Node unreachable
-
-If the Midnight node cannot be reached, Nightgate does not crash the host app. It logs a warning and continues in offline mode.
-
-Check:
-
-- the node is running
-- the configured `nodeUrl` is correct
-- the endpoint uses `ws://` or `wss://`
-
-### No block data yet
-
-Check the indexer service first:
-
-```bash
-curl "http://localhost:4004/api/v1/indexer/getSyncStatus()"
-curl "http://localhost:4004/api/v1/indexer/getHealth()"
-```
-
-If the DB is empty and the node is healthy, give the crawler a moment to catch up.
-
-### Switching an existing workspace to Preprod
-
-This repository persists indexed data in [../db/midnight.db](../db/midnight.db). If you previously ran against a different network, delete [../db/midnight.db](../db/midnight.db), [../db/midnight.db-shm](../db/midnight.db-shm), and [../db/midnight.db-wal](../db/midnight.db-wal) before the first Preprod run.
-
-### Production encryption key
-
-Wallet viewing keys are encrypted at rest. In production (`NODE_ENV=production`), `ENCRYPTION_KEY` **must** be set: the process will refuse to start without it. In development, a process-scoped fallback is used automatically.
-
-## Related Docs
-
-- [README.md](../README.md)
-- [Reference](reference.md) — configuration, runtime behavior, full API surface
-- [Release 0.1.2](release-0.1.2.md) — prepared release notes and publish checklist
-- [CHANGELOG.md](../CHANGELOG.md)
+- **Action reference** — [actions.md](actions.md) — every OData action + function with curl examples
+- **Operations guide** — [operations.md](operations.md) — scripts, local indexer container, troubleshooting
+- **Architecture** — [architecture.md](architecture.md) — worker-thread design, submission flow, persistence
+- **Full configuration matrix** — [reference.md#configuration](reference.md#configuration)

@@ -1,5 +1,165 @@
 # Changelog
 
+## Unreleased
+
+### 2026-05-19: Diagnostics tier
+
+Read-only pre-flight functions complementing the Token-Ops Core write actions. Same worker-thread pattern, but using CDS `function` (GET) since these don't submit transactions.
+
+- New OData functions on `NightgateService`:
+  - `getWalletBalance(sessionId)` — snapshot of shielded NIGHT, unshielded NIGHT, current DUST, registered and total NIGHT UTXO counts. All amounts as decimal strings to preserve bigint precision.
+  - `estimateSendNightFee(sessionId, receiverAddress, amount, ttlIso?)` — pre-flight DUST fee for `sendNight`. Builds the recipe in the worker (no proof generation, no submit) and calls `facade.estimateTransactionFee`.
+  - `estimateShieldFee(sessionId, amount, ttlIso?)` / `estimateUnshieldFee(sessionId, amount, ttlIso?)` — symmetric pre-flight fees for the ledger-shift operations.
+- New worker RPCs: `walletGetBalance`, `walletEstimateTransferFee`, `walletEstimateSwapFee`.
+- Shared `loadSigningSessionAccountId` helper extracts the duplicated session-lookup + viewing-key-decrypt + accountId-derive block. New handlers use it; older handlers retain inlined logic (cleanup opportunity later).
+- Shared `handleSwapEstimate` factored helper removes duplication between shield/unshield estimate handlers.
+- Diagnostics rate limit: 60/min per client IP — generous since these inform UI and should be pollable.
+
+### 2026-05-19: Token-Ops Core
+
+Four new write actions on `NightgateService` covering the basic Midnight wallet operations beyond contract deploy/call. All follow the established one-shot pattern (build + balance + prove + submit in a single worker RPC; primitives back across the thread boundary).
+
+- `sendNight(sessionId, receiverAddress, amount, ttlIso?)` — transfer NIGHT to any address. Destination ledger auto-detected from the Bech32m HRP prefix (`mn_shield-addr_` → shielded, `mn_addr_` → unshielded). Built via `facade.transferTransaction`.
+- `shieldFunds(sessionId, amount, ttlIso?)` — move the wallet's own NIGHT from unshielded → shielded via `facade.initSwap`. Same NIGHT atom amount appears on both sides (1:1 ledger shift, not value swap).
+- `unshieldFunds(sessionId, amount, ttlIso?)` — symmetric counterpart. Useful in practice for making NIGHT available to `registerForDustGeneration` (only unshielded NIGHT can be registered).
+- `deregisterFromDustGeneration(sessionId)` — symmetric pair to existing `registerForDustGeneration`. Removes ALL the wallet's registered NIGHT UTXOs from dust generation, making them spendable again. Per-UTXO narrowing not yet exposed.
+- New `parseReceiverAddress` helper in the worker handles Bech32m prefix detection.
+- `encodeAddressString` extended with TypeScript overloads for `DustAddress` / `ShieldedAddress` / `UnshieldedAddress` (was DustAddress only). The library's invariant `HasCodec<T>` constraint forced this design.
+- New `srv/submission/token-ops.ts` module collects the wrappers for the three transfer/swap actions. The dust deregister wrapper lives alongside the existing register in `dust-registration.ts`.
+- Rate limits: `sendNight` 10/min, `shieldFunds`/`unshieldFunds` 5 per 5 min (heavier ZK work), `deregisterFromDustGeneration` 10/h.
+- Shared validation helpers: `parseNightAmount` (bigint parse + sanity bound at 10^18 atoms), `validateOptionalTtl` (ISO-8601 future timestamp check).
+
+### 2026-05-17: Phase 2b — `deployContract` / `submitContractCall` moved into the worker thread
+
+Builds on Phase 1 (wallet SDK isolation) and Phase 2a (dust registration in worker). All contract submission paths now run entirely in the worker; no SDK objects cross the thread boundary.
+
+- `TransactionSubmitter.deploy/.call` rewired:
+  - Build a `CapDbPrivateStateProvider` on the main thread (where CAP DB lives), register it under a fresh ephemeral `proxyId`
+  - RPC the worker via new `walletDeployContract` / `walletSubmitContractCall`
+  - Worker re-imports the Compact artifact (cached by name), assembles publicData/zk/proof providers itself, uses the existing facade as walletProvider/midnightProvider
+  - On return, unregister the proxy; classify any errors via existing `classifySubmissionError`
+- New `private-state-rpc` message kind: worker proxies CRUD calls back to the main-side `CapDbPrivateStateProvider`. `setContractAddress` is fire-and-forget (sync per SDK contract; ordering on `parentPort` guarantees subsequent async set/get arrive after).
+- Worker RPC error shape changed: `{ ok: false, error: { name, message } }` (was `{ error: string }`) so the main-thread `classifySubmissionError` sees the original `err.name` (e.g. `TxFailedError`).
+- Old `TransactionSubmitterDeps` test seams `deployContractImpl` / `findDeployedContractImpl` removed; replaced by `walletDeployContractImpl` / `walletSubmitContractCallImpl` (default to the real worker-client exports).
+- `DeployArgs` / `CallArgs` reshape: `{ contractName, registration: { artifactPath, privateStateId, zkConfigPath }, initialPrivateState, sessionId }`. `sessionId` now required (worker keys facade lookup on the derived accountId, but the audit row preserves the OData user-session UUID).
+- `ResolvedContract` gained `artifactPath: string` field so handlers can forward it without re-doing path resolution.
+- Legacy `level` private-state backend rejected on the worker-routed submission path with a clear error message — the SDK's bundled LevelDB provider doesn't cross thread boundaries.
+- `buildFullProviderBundle` / `buildContractProviders` remain exported from `srv/midnight/providers.ts` for `test/unit/midnight-providers.test.ts` only; no longer the production path.
+
+### 2026-05-18: Local Midnight indexer container
+
+The hosted `indexer.preprod.midnight.network` was observed returning 503s. Added a self-hosted alternative.
+
+- New `indexer` service in `docker/docker-compose.yml`: `midnightntwrk/indexer-standalone:4.3.2`, port 8088, named volume `indexer-data` for SQLite persistence.
+- Container talks to the hosted preprod Substrate RPC by default (`wss://rpc.preprod.midnight.network/`) — we self-host the *flaky* GraphQL layer but keep the *reliable* RPC hosted. Switch to a local node via `INDEXER_UPSTREAM_NODE_URL=ws://node:9944`.
+- New `npm run sync:probe` (`scripts/probe-indexer.mjs`) — verifies the container is up and returning data.
+- NIGHTGATE flips to the local indexer via `NIGHTGATE_INDEXER_HTTP_URL` + `NIGHTGATE_INDEXER_WS_URL` env vars (already plumbed in `srv/utils/nightgate-config.ts:resolveNightgateRuntimeConfig`).
+- Initial container catch-up: ~2-3 blocks/sec observed → ~2-3 days for full preprod sync. Don't flip NIGHTGATE to use it until `caught_up: true` shows in the container logs.
+- Documentation: see [docs/operations.md#local-midnight-indexer](docs/operations.md#local-midnight-indexer-optional).
+
+### Code-quality cleanup pass (2026-05-19)
+
+Repo-wide audit found 15 sloppiness items (lazy `as any` casts, silent `catch {}` blocks, duck-typed fallback chains, etc.). All fixable findings cleaned up; one (Tier 3 `typeof timer.unref` guard) was reverted after tests showed it was a load-bearing contract, not laziness.
+
+- `srv/utils/nightgate-config.ts:getNightgatePluginConfig()` — new typed accessor for `cds.requires.nightgate`. Consolidates 9 separate `(cds.env as any).requires?.nightgate || {}` callsites into one with a proper `NightgatePluginConfig` interface.
+- `db` fields on service classes typed as `cds.DatabaseService` (was `any`). 8 sites cleaned.
+- `(this.nodeProvider as any).rpcBatch(...)` → typed `MidnightNodeProvider.rpcBatch()` direct.
+- `(provider as any)[method]` in worker-client → typed switch over the 8 known PrivateStateProvider methods.
+- `signedBlock: null as any` placeholder → discriminated union `PreparedBlockSkipped | PreparedBlockFetched` on `alreadyIndexed`. `persistFromNode` now takes only the fetched variant; TypeScript enforces the contract.
+- `(entry.saveTimer as any).unref?.()` → typed `entry.saveTimer.unref()` (NodeJS.Timeout always has unref).
+- `network as any` casts dropped (narrower union assigns cleanly to wider).
+- Worker `evict()` empty `catch {}` blocks now log via `formatErr()`.
+- New `srv/utils/format-error.ts:formatErr()` — single shared helper for "stringify error for log without producing `[object Object]`". Replaces 5 sites of duplicated `err?.message ?? err` / `err?.message ?? String(err)`.
+- `(cds as any).load` → typed `cds.load() + cds.linked()` (both typed in `@cap-js/cds-types`). Existence guards retained for tests with partial cds mocks.
+- DB query results in `nightgate-indexer-service.ts` typed via small `IdRow` projection interface.
+- Address parse/decode in worker uses proper `MidnightBech32m.parse(s).decode(DustAddress, networkId)` from `@midnight-ntwrk/wallet-sdk-address-format` (the previous code imported from the wrong package — `wallet-sdk-abstractions` — and silently dropped the conversion).
+- Address encode uses proper `MidnightBech32m.encode<T>(networkId, addr).toString()` (was a 5-method-name try/catch fallback chain).
+- Obsolete debug script `scripts/derive-addresses.mjs` deleted.
+- `[deploy-debug]` console.log instrumentation in `srv/submission/handlers.ts` removed.
+
+### 2026-05-17: T30 — wallet state persistence
+
+- New `WalletSyncStates` entity per accountId, holding serialized shielded / unshielded / dust sub-wallet blobs.
+- Periodic state-save (every 30 s) pushed from the worker thread to the main thread via `state-save` message; persisted via standard CAP `db.run`.
+- Restore-first builder: on next `connectWalletForSigning`, the facade-builder loads prior blobs from `WalletSyncStates` and the SDK does a delta-sync from there. Saves ~5-6 h of cold-sync wall-clock on restart.
+- Final state-save fired during `evict()` on session disconnect.
+- Encryption: each blob encrypted with a per-session storage password derived from the viewing key (PBKDF2 + AES-256-GCM, wire-format compatible with the SDK's LevelDB exports).
+- SDK-version gating on restore: the SDK can refuse blobs from incompatible versions; we record the version with each save.
+
+### 2026-05-17: T30 Phase 1 — wallet SDK in a worker thread
+
+The Midnight wallet SDK is built on Effect.ts. Its fiber scheduler monopolises the host's microtask queue during sync, freezing CAP request handlers and `db.run` for tens of seconds at a time. Phase 1 isolates the SDK in a `worker_threads` worker.
+
+- New `srv/midnight/wallet-worker.ts` — worker entry holding the `WalletFacade` and the three sub-wallets.
+- New `srv/midnight/wallet-worker-client.ts` — main-thread RPC client. Per-call `MessageChannel`; push events on `parentPort` for state-save + log forwarding.
+- Original synchronous facade-builder rewritten as a thin glue layer that spawns the worker, wires the state-save sink, and returns stub objects to legacy callers (which throw a Phase-2 migration error if used directly).
+- Diagnostic learnings (don't repeat): `_getActiveHandles()` doesn't count WebSocket subscriptions; `progress.appliedIndex` + `progress.highestRelevantWalletIndex` + `progress.isConnected` are the real fields (not `sourceGap` / `applyGap`); the two `RPC-CORE: subscribeRuntimeVersion ... 1000 Normal Closure` logs at sync start are NOT errors.
+
+### 2026-05-17: T30 Phase 2a — dust registration in the worker
+
+`facade.registerNightUtxosForDustGeneration` flows wholly through the worker. No SDK objects cross the thread boundary; the worker returns only primitives (`txId`, counts, addresses as strings).
+
+- New worker RPC `walletRegisterDustGeneration({ sessionId, dustReceiverAddress?, syncTimeoutMs? })` wraps the entire flow inside the worker: `waitForSyncedState` → filter unregistered NIGHT UTXOs → `registerNightUtxosForDustGeneration` → `finalizeRecipe` → `submitTransaction`.
+- `srv/submission/dust-registration.ts` is now a thin wrapper around the worker RPC.
+- Tests rewritten to mock the worker-client (411 passing post-Phase-2a).
+
+### Pre-Phase-2 baseline — Server-side submission stack (T1–T10, T29)
+
+Tracking T1–T10 (and T29) from `db/enhancements.md`. Code-complete on main as of 2026-05-16; not yet exercised against a live preprod chain (T15).
+
+#### Submission stack
+
+- New `srv/midnight/` module containing the memoized dynamic-import SDK loader (`sdk-loader.ts`), provider bundle assembly (`providers.ts`), and CAP-DB-backed `PrivateStateProvider` (`CapDbPrivateStateProvider.ts`) replacing the SDK's LevelDB provider for production.
+- New `srv/submission/` module containing `TransactionSubmitter` (deploy + call), OData action handlers, contract registry with cross-platform `file://` URL handling for ESM artifacts, wallet-material factory deriving deterministic `accountId` + storage password from viewing key, and `wallet-facade-builder` constructing real `WalletFacade` instances with per-account cache.
+- New OData actions on `NightgateService`: `deployContract(compiledArtifactRef, sessionId, initialPrivateState)`, `submitContractCall(contractAddress, circuit, compiledArtifactRef, sessionId, args)`. Rate-limited per session (5 deploys/hour, 30 calls/min).
+- New `WalletSessions.connectWalletForSigning(sessionId, seedHex)` action. Encrypts a 32-byte seed (via existing `ENCRYPTION_KEY` AES-256-GCM helpers) into `WalletSessions.encryptedSeedKey`. Required before submission flows. Rate-limited 5/hour/IP.
+- `disconnectWallet` now also nukes `encryptedSeedKey` and evicts cached `WalletFacade` instances.
+
+#### Schema
+
+- Added `PendingSubmissions` entity tracking submission lifecycle (`pending` → `included` → `finalized` / `failed`) with `txHash`, `contractAddress`, `circuitName`, `actionType`, `submittedAt`, `finalizedAt`, `finalizedTxData`, `errorCode`, `errorMessage`, `sessionId`.
+- Added `PrivateStates` entity: encrypted SDK private state keyed by `(accountId, contractAddress, privateStateId)`.
+- Added `ContractSigningKeys` entity: encrypted SDK signing keys keyed by `(accountId, contractAddress)`.
+- Added `WalletSessions.encryptedSeedKey` field (nullable). Existing read-only sessions still work.
+- Added `PendingSubmissionStatus` enum to `db/types.cds`.
+
+#### Crawler integration
+
+- `BlockProcessor` now calls `reconcilePendingSubmission(tx, extrinsicHash, snapshot)` immediately after each transaction INSERT, flipping matching `PendingSubmissions` rows to `finalized` with a JSON snapshot of the indexed transaction. Atomic with persistence (runs on the same `tx` handle). No-op for transactions that didn't originate from NIGHTGATE's submission path.
+
+#### Configuration
+
+- New `cds.requires.nightgate` keys: `indexerHttpUrl`, `indexerWsUrl`, `proofServerUrl`, `zkConfigBasePath`, `privateStateBackend` (`'cap-db'` default | `'level'` opt-in), `contracts` (registry map), `allowMainnetSubmission` (default `false`).
+- New env vars: `NIGHTGATE_INDEXER_HTTP_URL`, `NIGHTGATE_INDEXER_WS_URL`, `NIGHTGATE_PROOF_SERVER_URL`, `NIGHTGATE_PROOF_NETWORK`, `NIGHTGATE_ZK_CONFIG_BASE`, `NIGHTGATE_PRIVATE_STATE_BACKEND`.
+- `src/index.ts` calls `loadRegistryFromConfig(nightgateConfig)` on startup and logs registered contract refs.
+
+#### Compact contracts
+
+- Added `contracts/` directory with the bundled `counter` contract (`contracts/counter/`). Source at `src/counter.compact`; compiled `managed/counter/` (contract JS + prover/verifier keys + ZK IR) committed to repo so consumers don't need a Compact toolchain.
+- `cds.requires.nightgate.contracts.counter` registered in `package.json` for in-repo standalone runs.
+- `contracts/README.md` covers Compact toolchain install (`compact-installer.sh`) and recompile instructions (Linux/macOS/WSL only; no native Windows binary as of compactc 0.31.0).
+
+#### Docker
+
+- `docker/docker-compose.yml` adds `proof-server` service (`midnightntwrk/proof-server:8.0.3`, port 6300). Network selectable via `NIGHTGATE_PROOF_NETWORK` (default `preprod`).
+
+#### Dependencies
+
+- Added: `@midnight-ntwrk/midnight-js-contracts@^4.0.4`, `@midnight-ntwrk/midnight-js-indexer-public-data-provider@^4.0.4`, `@midnight-ntwrk/midnight-js-http-client-proof-provider@^4.0.4`, `@midnight-ntwrk/midnight-js-node-zk-config-provider@^4.0.4`, `@midnight-ntwrk/midnight-js-level-private-state-provider@^4.0.4`, `@midnight-ntwrk/compact-runtime@^0.16.0`, `@midnight-ntwrk/ledger-v8@^8.1.0`, `@midnight-ntwrk/wallet-sdk-facade@^4.0.0`. Note: `ledger-v8`, not `ledger-v7`; the package name carries the version suffix.
+
+#### Tooling
+
+- New `srv/utils/storage-encryption.ts`, a PBKDF2-SHA256 (600k iter) + AES-256-GCM helper. SDK-wire-format-compatible (matches `@midnight-ntwrk/midnight-js-level-private-state-provider` export blob format byte-for-byte). Used by `CapDbPrivateStateProvider` for `exportPrivateStates`/`importPrivateStates`/`exportSigningKeys`/`importSigningKeys`.
+- New integration scripts (native-ESM, exercise the real Midnight SDK): `npm run smoke:sdk`, `npm run integration:providers`, `npm run integration:wallet-keys`, `npm run integration:wallet-facade`, `npm run integration:contract-registry`.
+- `jest.config.js` `diagnostics.ignoreCodes` extended with TS 2339 and 7016 (pre-existing CAP type friction, unblocks 16 previously-failing test suites).
+
+#### Verified baseline
+
+- `31` test suites passed
+- `394` tests passed
+- `0` failures
+- All 5 integration scripts pass against the real Midnight SDK
+
 ## 0.1 - Midnight Indexer
 
 ### 0.1.2 - 2026-03-08
@@ -13,9 +173,9 @@
 #### Simplified Configuration
 
 - Code defaults to Preprod (`wss://rpc.preprod.midnight.network/`). No config needed for the common case.
-- Removed `MIDNIGHT_*` env var aliases — only `NIGHTGATE_NETWORK`, `NIGHTGATE_NODE_URL`, and `NIGHTGATE_CRAWLER_NODE_URL` are supported.
+- Removed `MIDNIGHT_*` env var aliases; only `NIGHTGATE_NETWORK`, `NIGHTGATE_NODE_URL`, and `NIGHTGATE_CRAWLER_NODE_URL` are supported.
 - Removed unused `NIGHTGATE_DEFAULTS` export. Replaced by `DEFAULT_NETWORK` and `DEFAULT_NODE_URL`.
-- `package.json` only needs `"nightgate": { "kind": "nightgate" }` — network and URL default in code.
+- `package.json` only needs `"nightgate": { "kind": "nightgate" }`; network and URL default in code.
 
 ### 0.1.1 - 2026-03-08
 
@@ -81,7 +241,7 @@ First public Nightgate package cut.
 #### Security Hardening
 
 - CDS service auth annotations enabled: `@requires: 'authenticated-user'` on NightgateService and AnalyticsService, `@requires: 'admin'` on AdminService
-- `ENCRYPTION_KEY` enforced in production (`NODE_ENV=production`) — startup fails without it
+- `ENCRYPTION_KEY` enforced in production (`NODE_ENV=production`); startup fails without it
 - Read-only guard covers all entities including NightBalances, DustRegistrations, TokenTypes, WalletSessions
 - Rate limiter hardened with periodic sweep, max key cap, and `destroy()` cleanup
 - Crawler: live blocks queued instead of dropped during catch-up; start failure resets running state; reorg uses batched deletes
