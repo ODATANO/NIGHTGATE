@@ -101,7 +101,7 @@ describe('AES-256-GCM encrypt/decrypt', () => {
     });
 });
 
-describe('hashViewingKey — SHA-256', () => {
+describe('hashViewingKey: SHA-256', () => {
     it('produces consistent 64-char hex output', () => {
         const hash = hashViewingKey('a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6');
         expect(hash).toMatch(/^[0-9a-f]{64}$/);
@@ -149,6 +149,19 @@ describe('getEncryptionKey', () => {
             } else {
                 delete process.env.ENCRYPTION_KEY;
             }
+        }
+    });
+
+    it('refuses to start with the dev fallback when NODE_ENV=production', () => {
+        const originalKey = process.env.ENCRYPTION_KEY;
+        const originalEnv = process.env.NODE_ENV;
+        try {
+            delete process.env.ENCRYPTION_KEY;
+            process.env.NODE_ENV = 'production';
+            expect(() => getEncryptionKey()).toThrow(/ENCRYPTION_KEY must be set in production/);
+        } finally {
+            if (originalKey !== undefined) process.env.ENCRYPTION_KEY = originalKey;
+            if (originalEnv !== undefined) process.env.NODE_ENV = originalEnv; else delete process.env.NODE_ENV;
         }
     });
 });

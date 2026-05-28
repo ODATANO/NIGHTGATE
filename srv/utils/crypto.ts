@@ -4,21 +4,21 @@
  * AES-256-GCM encryption for viewing keys at rest.
  * SHA-256 hashing for viewing key lookup/deduplication.
  *
- * Uses Node.js built-in crypto module — zero additional dependencies.
+ * Uses Node.js built-in crypto module, zero additional dependencies.
  */
 
 import crypto from 'crypto';
 import os from 'os';
 
 const ALGORITHM = 'aes-256-gcm';
-const IV_LENGTH = 12;        // 96 bits — recommended for GCM
+const IV_LENGTH = 12;        // 96 bits, recommended for GCM
 const AUTH_TAG_LENGTH = 16;  // 128 bits
 
 /**
  * Derive the 32-byte encryption key from environment or fallback.
  *
  * Production: Set ENCRYPTION_KEY environment variable.
- * Development: Falls back to a process-scoped key (keys lost on restart — acceptable for dev).
+ * Development: Falls back to a process-scoped key (keys lost on restart, acceptable for dev).
  */
 export function getEncryptionKey(): Buffer {
     const envKey = process.env.ENCRYPTION_KEY;
@@ -29,7 +29,7 @@ export function getEncryptionKey(): Buffer {
         throw new Error('[crypto] ENCRYPTION_KEY must be set in production. Refusing to start with fallback key.');
     }
     // Dev fallback: derive from stable-per-process value
-    console.warn('[crypto] ENCRYPTION_KEY not set — using dev fallback key. Set ENCRYPTION_KEY for production.');
+    console.warn('[crypto] ENCRYPTION_KEY not set. Using dev fallback key. Set ENCRYPTION_KEY for production.');
     const fallback = `odatano-night-${process.pid}-${os.hostname()}`;
     return crypto.createHash('sha256').update(fallback).digest();
 }
