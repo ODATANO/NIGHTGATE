@@ -1,0 +1,58 @@
+// AttestationVault — tiered-disclosure attestation contract (T10-extended).
+//
+// On-chain state stores only commitments (hashes/identifiers) — the actual
+// payload and metadata bodies live off-chain in NIGHTGATE's tables. The
+// chain layer guarantees ownership and disclosure-grant integrity; the
+// off-chain layer carries the content.
+//
+//   payload_hash   : blake2b-256 of the private payload (caller-provided)
+//   metadata_hash  : blake2b-256 of the public metadata blob (caller-provided)
+//   attester_id    : persistent_hash(local_secret_key()) — derived in-circuit
+//   grantee        : Bytes<32> identifier for the disclosure recipient
+//   level          : 0=public-only, 1=legitimate-interest, 2=authority
+
+pragma language_version >= 0.20;
+
+import CompactStandardLibrary;
+
+// Public ledger state.
+export ledger public_attestations: Map<Bytes<32>, Bytes<32>>;
+export ledger attestation_owners:  Map<Bytes<32>, Bytes<32>>;
+export ledger disclosures:         Map<Bytes<32>, Map<Bytes<32>, Uint<8>>>;
+
+// Caller's secret, supplied off-chain. Hashed in-circuit to produce a stable
+// attester_id without ever revealing the secret to the chain.
+witness local_secret_key(): Bytes<32>;
+
+// Derive the caller's identity commitment. The hash is one-way, so making it
+// on-chain does not leak the underlying secret.
+circuit caller_id(): Bytes<32> {
+  return persistentHash<Bytes<32>>(local_secret_key());
+}
+
+// Anyone can attest. Locks in attester_id for later grant/revoke checks.
+// All arguments are caller-provided commitments that the caller explicitly
+// wants on-chain — wrap with `disclose(...)` to declare intent.
+export circuit attest(payload_hash: Bytes<32>, metadata_hash: Bytes<32>): [] {
+  public_attestations.insert(disclose(payload_hash), disclose(metadata_hash));
+  attestation_owners.insert(disclose(payload_hash), disclose(caller_id()));
+}
+
+// Only the original attester may grant a disclosure level to a grantee.
+export circuit grantDisclosure(
+  payload_hash: Bytes<32>,
+  grantee:      Bytes<32>,
+  level:        Uint<8>
+): [] {
+  assert(attestation_owners.lookup(disclose(payload_hash)) == caller_id(), "not attester");
+  if (!disclosures.member(disclose(payload_hash))) {
+    disclosures.insert(disclose(payload_hash), default<Map<Bytes<32>, Uint<8>>>);
+  }
+  disclosures.lookup(disclose(payload_hash)).insert(disclose(grantee), disclose(level));
+}
+
+// Only the original attester may revoke a previously granted disclosure.
+export circuit revokeDisclosure(payload_hash: Bytes<32>, grantee: Bytes<32>): [] {
+  assert(attestation_owners.lookup(disclose(payload_hash)) == caller_id(), "not attester");
+  disclosures.lookup(disclose(payload_hash)).remove(disclose(grantee));
+}
