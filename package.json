@@ -79,8 +79,9 @@
     "build:types": "npm run cds:types",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "deploy": "cds deploy --to sqlite:db/midnight.db",
-    "test": "jest --coverage",
-    "test:unit": "jest --testPathPattern=test/unit",
+    "pretest": "npm run build",
+    "test": "jest --coverage --runInBand",
+    "test:unit": "npm run build && jest --testPathPattern=test/unit --runInBand",
     "smoke:sdk": "node scripts/smoke-test-sdk.mjs",
     "integration:providers": "node scripts/integration-test-providers.mjs",
     "integration:wallet-keys": "node scripts/integration-test-wallet-keys.mjs",
@@ -113,6 +114,7 @@
     "@sap/cds": ">=9.0.0"
   },
   "devDependencies": {
+    "@cap-js/cds-test": "^0.4.1",
     "@cap-js/cds-typer": "^0.38.0",
     "@cap-js/sqlite": "^2",
     "@sap/cds": "^9",
@@ -153,6 +155,19 @@
     },
     "[development]": {
       "requires": {
+        "auth": {
+          "kind": "dummy"
+        }
+      }
+    },
+    "[test]": {
+      "requires": {
+        "db": {
+          "kind": "sqlite",
+          "credentials": {
+            "database": ":memory:"
+          }
+        },
         "auth": {
           "kind": "dummy"
         }

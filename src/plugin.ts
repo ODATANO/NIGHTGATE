@@ -94,6 +94,12 @@ function registerSecurityHeaders(): void {
 
 function registerLifecycle(): void {
     cds.on('served', async () => {
+        // Test harness opt-out: cds.test() boots the full server, which would
+        // otherwise start the crawler + wallet worker thread against live
+        // endpoints. Tests set SKIP_AUTO_INIT=true to serve the OData services
+        // against an in-memory DB without the runtime side-effects. No-op in
+        // production (env var unset).
+        if (process.env.SKIP_AUTO_INIT === 'true') return;
         try {
             await initialize();
         } catch (err) {
