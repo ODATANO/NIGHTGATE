@@ -44,3 +44,7 @@ npm-debug.log*
 
 CLAUDE.MD
 AGENTS.md
+
+# Internal planning / feature-request docs — kept local only
+db/enhancements.md
+docs/feature-requests/zk-predicate-attestation.md
