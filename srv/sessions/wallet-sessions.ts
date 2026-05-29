@@ -24,9 +24,18 @@ import {
 } from '../submission/token-ops';
 import { ensureNetworkId } from '../midnight/providers';
 import { getOrBuildWalletFacade } from '../submission/wallet-facade-builder';
+import { walletWaitForSyncedState } from '../midnight/wallet-worker-client';
 import { resolveNightgateRuntimeConfig, getNightgatePluginConfig } from '../utils/nightgate-config';
 import { startJob } from '../submission/background-jobs';
 import { mnemonicToBip39SeedHex } from '../utils/wallet-hd';
+
+// Upper bound for the prewarm sync-to-tip wait. A wallet that is far behind the
+// chain tip (e.g. restored from a stale checkpoint) can take a long time to
+// catch up; bound it so a dropped indexer subscription surfaces as a clear job
+// failure instead of hanging forever. Override via env for slow cold syncs.
+const PREWARM_SYNC_TIMEOUT_MS = Number(
+    process.env.NIGHTGATE_PREWARM_SYNC_TIMEOUT_MS || 3 * 60 * 60 * 1000
+);
 
 const walletRateLimiter = new RateLimiter({
     windowMs: 60 * 1000,
@@ -261,6 +270,16 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
                 work: async () => {
                     await ensureNetworkId(network);
                     await getOrBuildWalletFacade(accountId, facadeArgs);
+                    // CRITICAL: init + facade.start() only KICKS OFF the chain
+                    // sync; it does not wait for it. Without blocking here, the
+                    // facade serves whatever (possibly restored, stale) state it
+                    // has, and the deploy path's balanceTx builds against stale
+                    // dust — the live node then rejects it with
+                    // `1010 Invalid Transaction: Custom error: 170`
+                    // (dust validity window: ctime + grace < tblock). Block the
+                    // prewarm job until the wallet is actually synced to the
+                    // chain tip so the dust state (and its ctime) is current.
+                    await walletWaitForSyncedState(accountId, PREWARM_SYNC_TIMEOUT_MS);
                     return { ready: true };
                 }
             });

@@ -285,6 +285,15 @@ function buildWorkerWalletProvider(entry: FacadeEntry): any {
         getCoinPublicKey(): string       { return entry.zswapKeys.coinPublicKey; },
         getEncryptionPublicKey(): string { return entry.zswapKeys.encryptionPublicKey; },
         async balanceTx(tx: any, ttl?: Date): Promise<any> {
+            // Robustness: block until the wallet is synced to the chain tip
+            // before balancing. The prewarm job (connectWalletForSigning) also
+            // waits, but a caller that submits WITHOUT prewarming — or after the
+            // facade has drifted — would otherwise balance against stale
+            // (restored/partial) dust state, and the node rejects the tx with
+            // `1010 Invalid Transaction: Custom error: 170` (dust validity
+            // window: ctime + grace < tblock). waitForSyncedState is a no-op
+            // once synced, so this is cheap on the common (prewarmed) path.
+            await entry.facade.waitForSyncedState();
             const effectiveTtl = ttl ?? new Date(Date.now() + 60 * 60 * 1000);
             const recipe = await entry.facade.balanceUnboundTransaction(
                 tx,
