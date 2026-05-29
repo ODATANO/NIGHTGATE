@@ -230,7 +230,8 @@ async function getContractScaffold(name: string, registration: ContractRegistrat
 async function getOrCompileContract(
     name: string,
     registration: ContractRegistration,
-    entry: FacadeEntry
+    entry: FacadeEntry,
+    witnessValues?: { attestedValue: string; valueSalt: string }
 ): Promise<any> {
     const { contractClass } = await getContractScaffold(name, registration);
 
@@ -244,7 +245,7 @@ async function getOrCompileContract(
 
     const witnessFactory = getContractWitnessFactory(name);
     const witnessStep = witnessFactory
-        ? CompiledContract.withWitnesses(witnessFactory({ attestationSecret: entry.attestationSecret }))
+        ? CompiledContract.withWitnesses(witnessFactory({ attestationSecret: entry.attestationSecret, witnessValues }))
         : CompiledContract.withVacantWitnesses;
 
     return CompiledContract.make(name, contractClass).pipe(
@@ -280,6 +281,32 @@ async function buildWorkerContractProviders(args: {
  * shape. balanceTx routes through balanceUnboundTransaction → finalizeRecipe
  * (matches the main-thread wallet-material-factory adapter pre-Phase-2b).
  */
+// Upper bound for the pre-balance sync wait. Long enough to absorb a normal
+// tip catch-up between submissions, short enough that a stalled indexer
+// subscription fails the job promptly instead of hanging. Env-overridable.
+const BALANCE_SYNC_TIMEOUT_MS = Number(process.env.NIGHTGATE_BALANCE_SYNC_TIMEOUT_MS || 180_000);
+
+/**
+ * `facade.waitForSyncedState()` raced against a timeout. Resolves as soon as
+ * the wallet is synced (instant on the prewarmed path); rejects with a clear
+ * error if the sync hasn't latched within `timeoutMs` — typically a dropped,
+ * non-retried indexer graphql-ws subscription.
+ */
+async function waitForSyncedStateBounded(facade: any, timeoutMs: number): Promise<void> {
+    let timer: NodeJS.Timeout | undefined;
+    const timeout = new Promise<never>((_, reject) => {
+        timer = setTimeout(
+            () => reject(new Error(`waitForSyncedState timed out after ${timeoutMs}ms (indexer subscription may have stalled)`)),
+            timeoutMs
+        );
+    });
+    try {
+        await Promise.race([facade.waitForSyncedState(), timeout]);
+    } finally {
+        if (timer) clearTimeout(timer);
+    }
+}
+
 function buildWorkerWalletProvider(entry: FacadeEntry): any {
     return {
         getCoinPublicKey(): string       { return entry.zswapKeys.coinPublicKey; },
@@ -293,7 +320,13 @@ function buildWorkerWalletProvider(entry: FacadeEntry): any {
             // `1010 Invalid Transaction: Custom error: 170` (dust validity
             // window: ctime + grace < tblock). waitForSyncedState is a no-op
             // once synced, so this is cheap on the common (prewarmed) path.
-            await entry.facade.waitForSyncedState();
+            //
+            // BOUNDED: the SDK's graphql-ws subscription has no auto-retry
+            // (shouldRetry:()=>false), so a dropped indexer subscription would
+            // make waitForSyncedState hang forever. Race it against a timeout so
+            // a stalled sync surfaces as a clear, classifiable submission error
+            // instead of an indefinite hang.
+            await waitForSyncedStateBounded(entry.facade, BALANCE_SYNC_TIMEOUT_MS);
             const effectiveTtl = ttl ?? new Date(Date.now() + 60 * 60 * 1000);
             const recipe = await entry.facade.balanceUnboundTransaction(
                 tx,
@@ -1238,7 +1271,7 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
         sessionId, proxyId, contractName, registration,
         contractAddress, circuit, args: callArgs,
         indexerHttpUrl, indexerWsUrl, proofServerUrl,
-        networkId
+        networkId, witnessValues
     }: {
         sessionId: string;
         proxyId:   string;
@@ -1251,13 +1284,14 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
         indexerWsUrl:   string;
         proofServerUrl: string;
         networkId: string;
+        witnessValues?: { attestedValue: string; valueSalt: string };
     }) {
         const entry = facades.get(sessionId);
         if (!entry) throw new Error(`No facade for sessionId=${sessionId.slice(0, 16)}`);
         const sdk = await loadSdk();
         await ensureNetworkId(networkId, sdk);
 
-        const compiledContract = await getOrCompileContract(contractName, registration, entry);
+        const compiledContract = await getOrCompileContract(contractName, registration, entry, witnessValues);
         const contractProviders = await buildWorkerContractProviders({
             indexerHttpUrl, indexerWsUrl, proofServerUrl,
             zkConfigPath: registration.zkConfigPath

@@ -20,6 +20,7 @@
 
 import cds, { Request } from '@sap/cds';
 import { sha256 } from '@noble/hashes/sha256';
+import { randomBytes, bytesToHex } from '@noble/hashes/utils';
 import {
     TransactionSubmitter,
     SubmissionError,
@@ -48,6 +49,9 @@ const deployRateLimiter = new RateLimiter({ windowMs: 60 * 60 * 1000, maxRequest
 const callRateLimiter = new RateLimiter({ windowMs: 60 * 1000, maxRequests: 30 });
 // 10 doc anchors / hour / session, contract-call heavyweight + extra DB writes.
 const anchorRateLimiter = new RateLimiter({ windowMs: 60 * 60 * 1000, maxRequests: 10 });
+// 10 predicate proofs / hour / session — each is TWO heavyweight circuit calls
+// (commitValue + provePredicate), so bound it like anchors.
+const predicateRateLimiter = new RateLimiter({ windowMs: 60 * 60 * 1000, maxRequests: 10 });
 
 const SHA256_HEX_RE = /^[0-9a-fA-F]{64}$/;
 const DEFAULT_ATTESTATION_VAULT_REF = 'attestation-vault';
@@ -350,6 +354,197 @@ export function registerSubmissionHandlers(
             anchoredTxHash: doc.anchoredTxHash ?? '',
             anchoredAt:     doc.anchoredAt ?? null,
             originalSha256: doc.sha256 ?? ''
+        };
+    });
+
+    srv.on('issuePredicateAttestation', async (req: Request) => {
+        const data = req.data as {
+            payloadHash?: string;
+            value?: string;
+            salt?: string;
+            predicate?: string;
+            threshold?: number | string;
+            unit?: string;
+            valueCommitment?: string;
+            sessionId?: string;
+            contractAddress?: string;
+            compiledArtifactRef?: string;
+            idempotencyKey?: string;
+        };
+
+        if (!data.payloadHash)                  return req.reject(400, 'payloadHash is required');
+        if (!SHA256_HEX_RE.test(data.payloadHash)) return req.reject(400, 'payloadHash must be 64 hex chars (32 bytes)');
+        if (data.value === undefined || data.value === null || data.value === '') {
+            return req.reject(400, 'value is required');
+        }
+        let valueBig: bigint;
+        try { valueBig = BigInt(data.value); } catch { return req.reject(400, 'value must be an integer (decimal string)'); }
+        if (valueBig < 0n) return req.reject(400, 'value must be a non-negative integer');
+
+        if (data.threshold === undefined || data.threshold === null) return req.reject(400, 'threshold is required');
+        let thresholdBig: bigint;
+        try { thresholdBig = BigInt(data.threshold); } catch { return req.reject(400, 'threshold must be an integer'); }
+        if (thresholdBig < 0n) return req.reject(400, 'threshold must be a non-negative integer');
+
+        let op: number;
+        if (data.predicate === 'lessOrEqual')         op = 0;
+        else if (data.predicate === 'greaterOrEqual') op = 1;
+        else return req.reject(400, "predicate must be 'lessOrEqual' or 'greaterOrEqual'");
+
+        if (!data.sessionId)       return req.reject(400, 'sessionId is required');
+        if (!data.contractAddress) return req.reject(400, 'contractAddress is required');
+
+        let saltHex: string;
+        if (data.salt) {
+            if (!SHA256_HEX_RE.test(data.salt)) return req.reject(400, 'salt must be 64 hex chars (32 bytes)');
+            saltHex = data.salt.toLowerCase();
+        } else {
+            saltHex = bytesToHex(randomBytes(32));
+        }
+        if (data.valueCommitment && !SHA256_HEX_RE.test(data.valueCommitment)) {
+            return req.reject(400, 'valueCommitment must be 64 hex chars (32 bytes)');
+        }
+
+        const compiledRef = data.compiledArtifactRef && data.compiledArtifactRef.length > 0
+            ? data.compiledArtifactRef
+            : DEFAULT_ATTESTATION_VAULT_REF;
+
+        if (!checkRate(predicateRateLimiter, data.sessionId, req)) return;
+
+        const payloadHashBytes = hexToBytes(data.payloadHash);
+        // The hidden value + salt travel ONLY as circuit witnesses — never as a
+        // circuit arg, never persisted. This is what keeps the value private.
+        const witnessValues = { attestedValue: valueBig.toString(), valueSalt: saltHex };
+
+        // Insert the row up-front (mirrors anchorDocument): stable handle the
+        // caller can poll independently of getJobStatus. Note: `value`/`salt`
+        // are intentionally NOT stored.
+        const predicateAttestationId = cds.utils.uuid();
+        const insertedAt = new Date().toISOString();
+        await db.run(INSERT.into('midnight.PredicateAttestations').entries({
+            ID:              predicateAttestationId,
+            payloadHash:     data.payloadHash.toLowerCase(),
+            contractAddress: data.contractAddress,
+            predicate:       data.predicate,
+            op,
+            threshold:       data.threshold,
+            unit:            data.unit ?? null,
+            valueCommitment: data.valueCommitment ? data.valueCommitment.toLowerCase() : null,
+            provenTxHash:    null,
+            provenAt:        null,
+            createdAt:       insertedAt,
+            modifiedAt:      insertedAt
+        }));
+
+        return runSubmission(req, async () => {
+            const facadeCfg = facadeConfigFromEnv();
+            await ensureNetworkId(facadeCfg.networkId);
+            const resolved = await contractResolver(compiledRef);
+            const wallet = await walletFactory({ sessionId: data.sessionId!, db, facadeConfig: facadeCfg });
+            const submitter = submitterFactory(buildSubmitterDeps(db, resolved, wallet));
+            const registration = {
+                artifactPath:   resolved.artifactPath,
+                privateStateId: resolved.privateStateId,
+                zkConfigPath:   resolved.zkConfigPath
+            };
+
+            const job = await startJob({
+                kind:           'issuePredicateAttestation',
+                sessionId:      data.sessionId!,
+                idempotencyKey: data.idempotencyKey,
+                request: {
+                    payloadHash:     data.payloadHash!.toLowerCase(),
+                    contractAddress: data.contractAddress,
+                    predicate:       data.predicate,
+                    threshold:       String(data.threshold),
+                    predicateAttestationId
+                },
+                work: async () => {
+                    // 1. Bind the numeric commitment to the attestation. The
+                    //    commitment is computed in-circuit from the witnesses.
+                    await submitter.call({
+                        contractAddress: data.contractAddress!,
+                        circuit:         'commitValue',
+                        args:            [payloadHashBytes],
+                        contractName:    compiledRef,
+                        registration,
+                        sessionId:       data.sessionId!,
+                        witnessValues
+                    });
+                    // 2. Prove the predicate. The ledger only accepts this tx if
+                    //    the in-circuit asserts (commitment match + predicate)
+                    //    held — so a successful tx IS the verified proof.
+                    const proof = await submitter.call({
+                        contractAddress: data.contractAddress!,
+                        circuit:         'provePredicate',
+                        args:            [payloadHashBytes, thresholdBig, BigInt(op)],
+                        contractName:    compiledRef,
+                        registration,
+                        sessionId:       data.sessionId!,
+                        witnessValues
+                    });
+
+                    const provenAt = new Date().toISOString();
+                    await db.run(UPDATE.entity('midnight.PredicateAttestations')
+                        .set({ provenTxHash: proof.txHash, provenAt, modifiedAt: provenAt })
+                        .where({ ID: predicateAttestationId }));
+
+                    return {
+                        predicateAttestationId,
+                        payloadHash: data.payloadHash!.toLowerCase(),
+                        claim: {
+                            predicate: data.predicate,
+                            threshold: String(data.threshold),
+                            unit:      data.unit ?? null
+                        },
+                        proof: {
+                            system:             'midnight-compact',
+                            circuit:            'provePredicate',
+                            verificationMethod: data.contractAddress,
+                            proofValue:         proof.txHash
+                        }
+                    };
+                }
+            });
+
+            return { jobId: job.jobId, status: job.status, predicateAttestationId };
+        });
+    });
+
+    srv.on('verifyPredicateAttestation', async (req: Request) => {
+        const { predicateAttestationId } = req.data as { predicateAttestationId?: string };
+        if (!predicateAttestationId) return req.reject(400, 'predicateAttestationId is required');
+
+        const row: any = await db.run(
+            SELECT.one.from('midnight.PredicateAttestations').where({ ID: predicateAttestationId })
+        );
+        if (!row) return req.reject(404, `PredicateAttestation ${predicateAttestationId} not found`);
+
+        const provenOk = Boolean(row.provenTxHash);
+        // Same chain-success check as verifyDocument: the proof tx must resolve
+        // to an indexed SUCCESS result. Only then is the on-chain predicate
+        // verification trustworthy.
+        let chainSuccess = false;
+        if (provenOk) {
+            const txRow: any = await db.run(
+                SELECT.one.from('midnight.Transactions').columns('ID', 'hash').where({ hash: row.provenTxHash })
+            );
+            if (txRow?.ID) {
+                const result: any = await db.run(
+                    SELECT.one.from('midnight.TransactionResults').columns('status').where({ transaction_ID: txRow.ID })
+                );
+                chainSuccess = result?.status === 'SUCCESS';
+            }
+        }
+
+        return {
+            verified:        provenOk && chainSuccess,
+            predicate:       row.predicate ?? '',
+            threshold:       row.threshold ?? 0,
+            unit:            row.unit ?? '',
+            valueCommitment: row.valueCommitment ?? '',
+            provenTxHash:    row.provenTxHash ?? '',
+            provenAt:        row.provenAt ?? null
         };
     });
 

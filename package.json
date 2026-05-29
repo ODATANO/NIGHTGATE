@@ -88,6 +88,7 @@
     "integration:contract-registry": "node scripts/integration-test-contract-registry.mjs",
     "integration:attestation-vault": "node scripts/integration-test-attestation-vault.mjs",
     "t15": "node --env-file=.env scripts/run-t15.mjs",
+    "predicate:e2e": "node --env-file=.env scripts/run-predicate-e2e.mjs",
     "lint": "eslint .",
     "prepack": "npm run build:plugin",
     "prepublishOnly": "npm run typecheck && npm test && npm run build:plugin"

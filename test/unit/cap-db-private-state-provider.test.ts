@@ -347,3 +347,42 @@ describe('CapDbPrivateStateProvider: config validation', () => {
         await expect(provider.set('x', { v: 1 })).rejects.toThrow(/at least 16 characters/);
     });
 });
+
+describe('CapDbPrivateStateProvider: cross-instance reads (deploy → call regression)', () => {
+    // Each submission builds its OWN provider instance. A deploy writes private
+    // state with one instance; a later call reads it with a DIFFERENT instance
+    // (same account + password). With a random per-instance salt this failed
+    // with "Salt mismatch: data was encrypted with a different password/salt".
+    // The salt is now deterministic per (account, password), so it round-trips.
+    test('a second provider instance reads what the first wrote', async () => {
+        const sharedDb = makeFakeDb();
+        const writer = new CapDbPrivateStateProvider({ accountId: ACCOUNT, privateStoragePasswordProvider: () => PASSWORD, db: sharedDb });
+        writer.setContractAddress(CONTRACT);
+        await writer.set('demo', { count: 7, nested: { ok: true } });
+
+        const reader = new CapDbPrivateStateProvider({ accountId: ACCOUNT, privateStoragePasswordProvider: () => PASSWORD, db: sharedDb });
+        reader.setContractAddress(CONTRACT);
+        await expect(reader.get('demo')).resolves.toEqual({ count: 7, nested: { ok: true } });
+    });
+
+    test('cross-instance signing-key read round-trips too', async () => {
+        const sharedDb = makeFakeDb();
+        const writer = new CapDbPrivateStateProvider({ accountId: ACCOUNT, privateStoragePasswordProvider: () => PASSWORD, db: sharedDb });
+        await writer.setSigningKey(CONTRACT, 'signing-key-material');
+
+        const reader = new CapDbPrivateStateProvider({ accountId: ACCOUNT, privateStoragePasswordProvider: () => PASSWORD, db: sharedDb });
+        await expect(reader.getSigningKey(CONTRACT)).resolves.toBe('signing-key-material');
+    });
+
+    test('a different account/password still cannot read (integrity preserved)', async () => {
+        const sharedDb = makeFakeDb();
+        const writer = new CapDbPrivateStateProvider({ accountId: ACCOUNT, privateStoragePasswordProvider: () => PASSWORD, db: sharedDb });
+        writer.setContractAddress(CONTRACT);
+        await writer.set('demo', { secret: 1 });
+
+        // Different account → row is account-scoped, so get returns null (no row).
+        const other = new CapDbPrivateStateProvider({ accountId: ACCOUNT_B, privateStoragePasswordProvider: () => PASSWORD, db: sharedDb });
+        other.setContractAddress(CONTRACT);
+        await expect(other.get('demo')).resolves.toBeNull();
+    });
+});

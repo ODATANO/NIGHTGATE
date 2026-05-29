@@ -103,6 +103,13 @@ export interface CallArgs {
     contractName: string;
     registration: ContractRegistrationMeta;
     sessionId: string;
+    /**
+     * Per-call ZK-predicate witnesses (`commitValue`/`provePredicate`): the
+     * hidden value (decimal string) + commitment opening (64-hex salt). Passed
+     * to the worker's witness factory; never sent as a circuit arg. Omit for
+     * circuits that declare no per-call witnesses.
+     */
+    witnessValues?: { attestedValue: string; valueSalt: string };
 }
 
 export interface DeployResult {
@@ -337,7 +344,8 @@ export class TransactionSubmitter {
             indexerHttpUrl:  this.deps.contractProvidersConfig.indexerHttpUrl,
             indexerWsUrl:    this.deps.contractProvidersConfig.indexerWsUrl,
             proofServerUrl:  this.deps.contractProvidersConfig.proofServerUrl,
-            networkId:       this.deps.network
+            networkId:       this.deps.network,
+            witnessValues:   args.witnessValues
         };
     }
 

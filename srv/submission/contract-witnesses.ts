@@ -20,6 +20,28 @@ export interface WitnessFactoryInput {
      * from the seed key. Stable across reconnects for the same viewing key.
      */
     attestationSecret: Uint8Array;
+    /**
+     * Per-CALL witnesses for the ZK-predicate circuits (`commitValue` /
+     * `provePredicate`). Absent for `attest`/`grant`/`revoke`, which don't
+     * invoke `attested_value()`/`value_salt()`. Serialized as primitives so it
+     * survives the worker-thread boundary:
+     *   - `attestedValue`: decimal string of the Uint<64> value being proven.
+     *   - `valueSalt`: 64-char hex of the 32-byte commitment opening.
+     */
+    witnessValues?: {
+        attestedValue: string;
+        valueSalt:     string;
+    };
+}
+
+function hexToBytes32(hex: string): Uint8Array {
+    const clean = hex.startsWith('0x') ? hex.slice(2) : hex;
+    if (!/^[0-9a-fA-F]{64}$/.test(clean)) {
+        throw new Error('valueSalt must be 64 hex chars (32 bytes)');
+    }
+    const out = new Uint8Array(32);
+    for (let i = 0; i < 32; i++) out[i] = parseInt(clean.substr(i * 2, 2), 16);
+    return out;
 }
 
 /**
@@ -47,9 +69,27 @@ export function deriveAttestationSecret(seedBytes: Uint8Array): Uint8Array {
  */
 export function buildAttestationVaultWitnesses(input: WitnessFactoryInput): any {
     const secret = input.attestationSecret;
+    // Decode the per-call predicate witnesses up-front (if present) so a
+    // malformed salt fails fast rather than mid-proof. `attested_value` /
+    // `value_salt` are only invoked by commitValue/provePredicate; for other
+    // circuits they stay unused, so missing values throw only if actually hit.
+    const value = input.witnessValues ? BigInt(input.witnessValues.attestedValue) : undefined;
+    const salt  = input.witnessValues ? hexToBytes32(input.witnessValues.valueSalt) : undefined;
     return {
         local_secret_key(ctx: { privateState: unknown }): [unknown, Uint8Array] {
             return [ctx.privateState, secret];
+        },
+        attested_value(ctx: { privateState: unknown }): [unknown, bigint] {
+            if (value === undefined) {
+                throw new Error('attested_value witness invoked without a per-call value; commitValue/provePredicate require witnessValues');
+            }
+            return [ctx.privateState, value];
+        },
+        value_salt(ctx: { privateState: unknown }): [unknown, Uint8Array] {
+            if (salt === undefined) {
+                throw new Error('value_salt witness invoked without a per-call salt; commitValue/provePredicate require witnessValues');
+            }
+            return [ctx.privateState, salt];
         }
     };
 }

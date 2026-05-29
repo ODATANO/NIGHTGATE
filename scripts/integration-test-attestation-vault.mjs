@@ -42,12 +42,17 @@ ok('artifact: pureCircuits exposed',      mod.pureCircuits !== undefined);
 // We use a stub witness here — the real one is plumbed by the worker.
 const stubSecret = new Uint8Array(32);
 const stubWitnesses = {
-    local_secret_key(ctx) { return [ctx.privateState, stubSecret]; }
+    local_secret_key(ctx) { return [ctx.privateState, stubSecret]; },
+    attested_value(ctx)   { return [ctx.privateState, 0n]; },
+    value_salt(ctx)       { return [ctx.privateState, new Uint8Array(32)]; }
 };
 const instance = new ContractClass(stubWitnesses);
 ok('artifact: attest circuit present',           typeof instance.circuits?.attest           === 'function');
 ok('artifact: grantDisclosure circuit present',  typeof instance.circuits?.grantDisclosure  === 'function');
 ok('artifact: revokeDisclosure circuit present', typeof instance.circuits?.revokeDisclosure === 'function');
+// ZK-predicate circuits (on-chain model).
+ok('artifact: commitValue circuit present',      typeof instance.circuits?.commitValue      === 'function');
+ok('artifact: provePredicate circuit present',   typeof instance.circuits?.provePredicate   === 'function');
 ok('artifact: witness slot wired',                instance.witnesses === stubWitnesses);
 
 // ---- Check 2: CompiledContract composition --------------------------------
@@ -88,6 +93,31 @@ ok('factory: derived secret is 32 bytes', secret.byteLength === 32);
 
 const built = witnesses.buildAttestationVaultWitnesses({ attestationSecret: secret });
 ok('factory: built object has local_secret_key', typeof built.local_secret_key === 'function');
+ok('factory: built object has attested_value',   typeof built.attested_value === 'function');
+ok('factory: built object has value_salt',        typeof built.value_salt === 'function');
+
+// ---- Check 4: per-call predicate witnesses (commitValue/provePredicate) ---
+const predCtx = { privateState: { foo: 'bar' }, ledger: {}, contractAddress: 'addr-stub' };
+const SALT_HEX = 'a'.repeat(64);
+const predBuilt = witnesses.buildAttestationVaultWitnesses({
+    attestationSecret: secret,
+    witnessValues: { attestedValue: '47300', valueSalt: SALT_HEX }
+});
+const [, av] = predBuilt.attested_value(predCtx);
+ok('predicate: attested_value returns the bigint value', av === 47300n, `got ${av}`);
+const [, vs] = predBuilt.value_salt(predCtx);
+ok('predicate: value_salt returns 32 bytes', vs instanceof Uint8Array && vs.byteLength === 32);
+ok('predicate: value_salt round-trips the hex', Buffer.from(vs).toString('hex') === SALT_HEX);
+
+// Witnesses must refuse to fabricate values when none were supplied.
+let threwAV = false;
+try { built.attested_value(predCtx); } catch { threwAV = true; }
+ok('predicate: attested_value throws without witnessValues', threwAV);
+
+// Malformed salt must fail fast at build time.
+let threwSalt = false;
+try { witnesses.buildAttestationVaultWitnesses({ attestationSecret: secret, witnessValues: { attestedValue: '1', valueSalt: 'zz' } }); } catch { threwSalt = true; }
+ok('predicate: malformed salt rejected at build', threwSalt);
 
 const fakeCtx = { privateState: { foo: 'bar' }, ledger: {}, contractAddress: 'addr-stub' };
 const [psOut, secretOut] = built.local_secret_key(fakeCtx);

@@ -511,6 +511,12 @@ export interface WalletSubmitContractCallArgs {
     indexerWsUrl:   string;
     proofServerUrl: string;
     networkId: 'preprod' | 'testnet' | 'mainnet' | 'undeployed' | 'devnet' | 'qanet' | 'preview';
+    /**
+     * Per-call ZK-predicate witnesses for `commitValue`/`provePredicate`
+     * (decimal value + 64-hex salt). Forwarded to the witness factory so the
+     * hidden value never leaves as a circuit arg. Omitted for other circuits.
+     */
+    witnessValues?: { attestedValue: string; valueSalt: string };
 }
 
 /**

@@ -233,6 +233,73 @@ service NightgateService {
         originalSha256: String;
     };
 
+    // ========================================================================
+    // ZK Predicate Attestations (on-chain-verified model)
+    // ========================================================================
+
+    /**
+     * Read-side view of predicate attestations. Rows are inserted by
+     * `issuePredicateAttestation` and gain `provenTxHash`/`provenAt` once the
+     * AttestationVault `provePredicate` call has been included on-chain.
+     */
+    @readonly
+    entity PredicateAttestations     as projection on midnight.PredicateAttestations;
+
+    /**
+     * Prove that a hidden numeric value satisfies a predicate against a public
+     * `threshold`, without revealing the value (on-chain-verified model).
+     *
+     * The job submits two AttestationVault circuit calls: `commitValue` (binds
+     * `persistentCommit(value, salt)` to the attestation) then `provePredicate`
+     * (asserts the commitment matches AND the predicate holds, recording the
+     * result on-chain). `value` is a scaled integer (the caller owns float
+     * scaling, e.g. kg CO2e/kWh × 1000); it is used ONLY as a circuit witness
+     * and is never persisted. `salt` is an optional 64-hex commitment opening
+     * (generated if omitted). `predicate` is 'lessOrEqual' | 'greaterOrEqual'.
+     *
+     * Async: returns `{ jobId, status, predicateAttestationId }` immediately.
+     * `predicateAttestationId` is a stable handle into PredicateAttestations
+     * (row inserted up-front). The job `result` carries the PAC envelope shape
+     * `{ predicateAttestationId, payloadHash, claim, proof }`.
+     */
+    action issuePredicateAttestation(
+        payloadHash:         String,       // attestation payload_hash (64 hex)
+        value:               String,       // scaled integer, decimal string (witness only)
+        salt:                String,       // optional 64-hex commitment opening
+        predicate:           String,       // 'lessOrEqual' | 'greaterOrEqual'
+        threshold:           Integer64,    // scaled integer
+        unit:                String,       // optional, informational (e.g. 'kgCO2e/kWh')
+        valueCommitment:     String,       // optional 64-hex on-chain commitment (for the envelope)
+        sessionId:           UUID,
+        contractAddress:     String,       // AttestationVault deployment
+        compiledArtifactRef: String,       // optional, defaults to 'attestation-vault'
+        idempotencyKey:      String        // optional; dedupes retries
+    )                                returns {
+        jobId:                  UUID;
+        status:                 String;
+        predicateAttestationId: UUID;
+    };
+
+    /**
+     * Verify a predicate attestation under the on-chain-verified model: the
+     * `provePredicate` proof is only accepted by the ledger if the in-circuit
+     * asserts (commitment match + predicate) held, so a successful tx IS the
+     * proof. Confirms the row's `provenTxHash` resolves to a SUCCESS
+     * `Transactions` result. Returns `verified: false` (not an error) for a
+     * known-but-unproven row, mirroring `verifyDocument`.
+     */
+    function verifyPredicateAttestation(
+        predicateAttestationId: UUID
+    )                                returns {
+        verified:        Boolean;
+        predicate:       String;
+        threshold:       Integer64;
+        unit:            String;
+        valueCommitment: String;
+        provenTxHash:    String;
+        provenAt:        Timestamp;
+    };
+
     /**
      * Deploy a registered compiled contract. The contract must be registered
      * via `cds.requires.nightgate.contracts.<ref>` or `registerContract()`.

@@ -61,7 +61,8 @@ const HEAVY_KINDS: ReadonlySet<string> = new Set([
     'unshieldFunds',
     'deployContract',
     'submitContractCall',
-    'anchorDocument'
+    'anchorDocument',
+    'issuePredicateAttestation'
 ]);
 
 class Semaphore {

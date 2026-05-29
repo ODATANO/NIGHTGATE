@@ -20,9 +20,40 @@ export ledger public_attestations: Map<Bytes<32>, Bytes<32>>;
 export ledger attestation_owners:  Map<Bytes<32>, Bytes<32>>;
 export ledger disclosures:         Map<Bytes<32>, Map<Bytes<32>, Uint<8>>>;
 
+// ZK-predicate extension (on-chain-verified model).
+//   value_commitments: payload_hash -> persistentCommit(value, salt). The
+//     attester binds a hidden numeric value to their attestation.
+//   predicate_results: claimKey -> true, where claimKey =
+//     persistentHash(PredicateClaim{payload_hash, threshold, op}). Presence of
+//     a (true) entry means "a proof that the committed value satisfies this
+//     predicate was verified on-chain". Consumers recompute claimKey and look
+//     it up via the indexer to trust the predicate without seeing the value.
+export ledger value_commitments:   Map<Bytes<32>, Bytes<32>>;
+export ledger predicate_results:   Map<Bytes<32>, Boolean>;
+
+// Identifies a concrete predicate claim. Hashed to a stable result key so each
+// distinct (attestation, threshold, op) triple is recorded independently.
+struct PredicateClaim {
+  payload_hash: Bytes<32>,
+  threshold:    Uint<64>,
+  op:           Uint<8>
+}
+
 // Caller's secret, supplied off-chain. Hashed in-circuit to produce a stable
 // attester_id without ever revealing the secret to the chain.
 witness local_secret_key(): Bytes<32>;
+
+// The hidden numeric value and its commitment opening (salt), supplied
+// off-chain. Never revealed to the chain — only proven about.
+witness attested_value(): Uint<64>;
+witness value_salt():     Bytes<32>;
+
+// Numeric commitment binding the hidden value to its 32-byte opening. The same
+// value+salt always reproduce this commitment, so the on-chain stored
+// commitment pins exactly which value later proofs must be about.
+circuit value_commitment(): Bytes<32> {
+  return persistentCommit<Uint<64>>(attested_value(), value_salt());
+}
 
 // Derive the caller's identity commitment. The hash is one-way, so making it
 // on-chain does not leak the underlying secret.
@@ -55,4 +86,34 @@ export circuit grantDisclosure(
 export circuit revokeDisclosure(payload_hash: Bytes<32>, grantee: Bytes<32>): [] {
   assert(attestation_owners.lookup(disclose(payload_hash)) == caller_id(), "not attester");
   disclosures.lookup(disclose(payload_hash)).remove(disclose(grantee));
+}
+
+// Attester attaches a numeric commitment to an existing attestation. The
+// commitment is computed in-circuit from the off-chain value+salt, so the
+// chain only ever sees the commitment, never the value.
+export circuit commitValue(payload_hash: Bytes<32>): [] {
+  assert(attestation_owners.lookup(disclose(payload_hash)) == caller_id(), "not attester");
+  value_commitments.insert(disclose(payload_hash), disclose(value_commitment()));
+}
+
+// Prove the hidden committed value satisfies a predicate against a public
+// threshold, without revealing the value. `op`: 0 = lessOrEqual, 1 =
+// greaterOrEqual. Binds to the on-chain commitment so the proof can't be
+// swapped onto a different value, then records the (true) result keyed by the
+// claim so a consumer can verify it via the indexer.
+export circuit provePredicate(payload_hash: Bytes<32>, threshold: Uint<64>, op: Uint<8>): [] {
+  assert(value_commitments.member(disclose(payload_hash)), "no value commitment");
+  assert(value_commitments.lookup(disclose(payload_hash)) == value_commitment(), "commitment mismatch");
+  const v = attested_value();
+  if (op == 0) {
+    assert(v <= threshold, "predicate false");
+  } else {
+    assert(v >= threshold, "predicate false");
+  }
+  const claimKey = persistentHash<PredicateClaim>(PredicateClaim {
+    payload_hash: payload_hash,
+    threshold:    threshold,
+    op:           op
+  });
+  predicate_results.insert(disclose(claimKey), true);
 }

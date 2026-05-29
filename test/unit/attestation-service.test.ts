@@ -29,7 +29,7 @@ jest.mock('@sap/cds', () => {
     return cds;
 });
 
-import { registerAttestationServiceHandlers } from '../../src/sdk/AttestationService';
+import { registerAttestationServiceHandlers, toPredicateEnvelope } from '../../src/sdk/AttestationService';
 
 interface Handler { event: string; entity?: string; fn: Function; }
 
@@ -169,5 +169,41 @@ describe('registerAttestationServiceHandlers', () => {
             gate(req);
             expect(req.reject).not.toHaveBeenCalled();
         });
+    });
+});
+
+describe('toPredicateEnvelope', () => {
+    const row = {
+        predicate: 'lessOrEqual',
+        threshold: 50000,
+        unit: 'kgCO2e/kWh',
+        valueCommitment: 'c'.repeat(64),
+        contractAddress: '0xVAULT',
+        provenTxHash: '0xprove'
+    };
+
+    test('maps a row to the PAC envelope shape', () => {
+        expect(toPredicateEnvelope(row)).toEqual({
+            digestMultibase: 'c'.repeat(64),
+            claim: { predicate: 'lessOrEqual', threshold: '50000', unit: 'kgCO2e/kWh' },
+            proof: {
+                system: 'midnight-compact',
+                circuit: 'provePredicate',
+                verificationMethod: '0xVAULT',
+                proofValue: '0xprove'
+            }
+        });
+    });
+
+    test('digestMultibase is null when no commitment is known', () => {
+        const env = toPredicateEnvelope({ ...row, valueCommitment: null });
+        expect(env.digestMultibase).toBeNull();
+    });
+
+    test('threshold is always stringified; missing unit/txHash degrade gracefully', () => {
+        const env = toPredicateEnvelope({ predicate: 'greaterOrEqual', threshold: 7, contractAddress: '0xC' });
+        expect(env.claim.threshold).toBe('7');
+        expect(env.claim.unit).toBeNull();
+        expect(env.proof.proofValue).toBe('');
     });
 });

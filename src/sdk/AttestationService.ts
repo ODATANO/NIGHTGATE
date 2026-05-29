@@ -70,3 +70,65 @@ function makeTierGate(tier: AttestationTier) {
         }
     };
 }
+
+// ---------------------------------------------------------------------------
+// ZK predicate attestations — PAC envelope shaping (on-chain-verified model)
+// ---------------------------------------------------------------------------
+
+/**
+ * Portable Attestation Credential (PAC) proof envelope. Field names match the
+ * envelope NIGHTPASS drops into a `PredicateAttestationCredential`, so the
+ * output is consumed unchanged.
+ *
+ * On-chain-verified model: the proof is not standalone-verifiable with just a
+ * VK (Midnight exposes no off-chain verifier). `proofValue` is therefore the
+ * `provePredicate` transaction hash; a verifier confirms it via the Midnight
+ * indexer (the ledger only includes the tx if the in-circuit predicate +
+ * commitment asserts held). `digestMultibase` is the on-chain
+ * `persistentCommit(value, salt)` — it is not recomputable off-chain
+ * (`PureCircuits` is empty), so it is `null` unless the caller supplied or
+ * resolved it from chain.
+ */
+export interface PredicateAttestationEnvelope {
+    digestMultibase: string | null;
+    claim: {
+        predicate: string;            // 'lessOrEqual' | 'greaterOrEqual'
+        threshold: string;            // scaled integer, as a string
+        unit:      string | null;
+    };
+    proof: {
+        system:             'midnight-compact';
+        circuit:            'provePredicate';
+        verificationMethod: string;   // AttestationVault contract address
+        proofValue:         string;   // provePredicate tx hash (verify via indexer)
+    };
+}
+
+/**
+ * Shape a `PredicateAttestations` row (or the `issuePredicateAttestation` job
+ * result) into the PAC proof envelope. Pure/synchronous so consumers can call
+ * it without any NIGHTGATE service context.
+ */
+export function toPredicateEnvelope(row: {
+    predicate:       string;
+    threshold:       number | string;
+    unit?:           string | null;
+    valueCommitment?: string | null;
+    contractAddress: string;
+    provenTxHash?:   string | null;
+}): PredicateAttestationEnvelope {
+    return {
+        digestMultibase: row.valueCommitment ?? null,
+        claim: {
+            predicate: row.predicate,
+            threshold: String(row.threshold),
+            unit:      row.unit ?? null
+        },
+        proof: {
+            system:             'midnight-compact',
+            circuit:            'provePredicate',
+            verificationMethod: row.contractAddress,
+            proofValue:         row.provenTxHash ?? ''
+        }
+    };
+}

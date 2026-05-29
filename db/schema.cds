@@ -456,6 +456,34 @@ entity Documents : cuid, managed {
 }
 
 /**
+ * ZK predicate attestations (on-chain-verified model).
+ *
+ * Inserted by `issuePredicateAttestation`. Records that a proof was submitted
+ * showing a hidden numeric value (committed via the AttestationVault
+ * `commitValue` circuit) satisfies a predicate against `threshold` — WITHOUT
+ * the value ever being stored here (it lives only transiently as a circuit
+ * witness). After the on-chain `provePredicate` call succeeds, `provenTxHash`/
+ * `provenAt` are filled in; `verifyPredicateAttestation` confirms that tx
+ * resolves to a successful `Transactions` result. `valueCommitment` is the
+ * on-chain `persistentCommit(value, salt)` (optional — supplied by the caller
+ * or resolved from chain; not recomputable off-chain).
+ *
+ * `op`: 0 = lessOrEqual, 1 = greaterOrEqual (mirrors the circuit). `predicate`
+ * is the human-readable form for the PAC envelope `claim`.
+ */
+entity PredicateAttestations : cuid, managed {
+    payloadHash     : HexEncoded   not null; // attestation this predicate is about
+    contractAddress : HexEncoded   not null; // AttestationVault deployment
+    predicate       : String(20)   not null; // 'lessOrEqual' | 'greaterOrEqual'
+    op              : Integer       not null; // 0 | 1
+    threshold       : Integer64     not null; // scaled integer
+    unit            : String(50);             // e.g. 'kgCO2e/kWh' (informational)
+    valueCommitment : HexEncoded;             // persistentCommit(value, salt), on-chain
+    provenTxHash    : HexEncoded;             // tx that recorded the on-chain result
+    provenAt        : Timestamp;
+}
+
+/**
  * Disclosure role grants for tiered access (T14).
  *
  * The `attachDisclosureRole` middleware reads from this table on every

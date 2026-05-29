@@ -70,6 +70,61 @@ describe('buildAttestationVaultWitnesses', () => {
     });
 });
 
+describe('buildAttestationVaultWitnesses — predicate witnesses (commitValue/provePredicate)', () => {
+    const secret = new Uint8Array(32).fill(0xab);
+    const SALT_HEX = 'a'.repeat(64);
+
+    test('always exposes attested_value + value_salt (Witnesses<PS> shape is complete)', () => {
+        const w = buildAttestationVaultWitnesses({ attestationSecret: secret });
+        expect(typeof w.attested_value).toBe('function');
+        expect(typeof w.value_salt).toBe('function');
+    });
+
+    test('attested_value returns [privateState, bigint] when witnessValues supplied', () => {
+        const w = buildAttestationVaultWitnesses({
+            attestationSecret: secret,
+            witnessValues: { attestedValue: '47300', valueSalt: SALT_HEX }
+        });
+        const ps = { s: 1 };
+        const [outPs, v] = w.attested_value({ privateState: ps });
+        expect(outPs).toBe(ps);
+        expect(v).toBe(47300n);
+    });
+
+    test('value_salt returns the decoded 32-byte opening', () => {
+        const w = buildAttestationVaultWitnesses({
+            attestationSecret: secret,
+            witnessValues: { attestedValue: '1', valueSalt: SALT_HEX }
+        });
+        const [, salt] = w.value_salt({ privateState: null });
+        expect(salt).toBeInstanceOf(Uint8Array);
+        expect(salt.byteLength).toBe(32);
+        expect(Buffer.from(salt).toString('hex')).toBe(SALT_HEX);
+    });
+
+    test('attested_value / value_salt throw if invoked without witnessValues', () => {
+        const w = buildAttestationVaultWitnesses({ attestationSecret: secret });
+        expect(() => w.attested_value({ privateState: null })).toThrow(/without a per-call value/);
+        expect(() => w.value_salt({ privateState: null })).toThrow(/without a per-call salt/);
+    });
+
+    test('local_secret_key still works alongside predicate witnesses', () => {
+        const w = buildAttestationVaultWitnesses({
+            attestationSecret: secret,
+            witnessValues: { attestedValue: '5', valueSalt: SALT_HEX }
+        });
+        const [, s] = w.local_secret_key({ privateState: null });
+        expect(s).toBe(secret);
+    });
+
+    test('malformed salt fails fast at build time', () => {
+        expect(() => buildAttestationVaultWitnesses({
+            attestationSecret: secret,
+            witnessValues: { attestedValue: '1', valueSalt: 'xyz' }
+        })).toThrow(/64 hex/);
+    });
+});
+
 describe('getContractWitnessFactory', () => {
     test('returns the factory for attestation-vault', () => {
         const factory = getContractWitnessFactory('attestation-vault');

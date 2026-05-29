@@ -17,6 +17,7 @@
  * interface contract.
  */
 
+import crypto from 'crypto';
 import cds from '@sap/cds';
 const { SELECT, INSERT, UPDATE, DELETE } = cds.ql;
 import {
@@ -430,15 +431,37 @@ export class CapDbPrivateStateProvider<PSI extends PrivateStateId = PrivateState
     }
 
     /**
-     * Memoized per-instance StorageEncryption. The same salt is used for all
-     * internal rows belonging to this account+session, avoids 600k PBKDF2
-     * iterations per CRUD call. Export blobs always get their own fresh salt.
+     * Memoized per-instance StorageEncryption.
+     *
+     * The salt is DETERMINISTIC per (account, password) rather than random.
+     * This is essential for cross-instance reads: each submission builds its
+     * own provider instance, so a deploy that writes private state and a later
+     * call that reads it use DIFFERENT instances. With a random per-instance
+     * salt, the reader's `decrypt()` rejected the writer's blob with
+     * "Salt mismatch" (the ledger never even saw it — it failed in our storage
+     * layer). A deterministic salt makes every instance for the same account
+     * derive the same key, so reads succeed across instances while keeping the
+     * one-PBKDF2-per-instance optimization and the integrity salt-check.
+     *
+     * The password is already a high-entropy per-account secret (derived from
+     * the wallet viewing key), so deriving the salt from it does not weaken the
+     * anti-precomputation property. Export blobs still get their own fresh
+     * random salt (see exportPrivateStates/exportSigningKeys).
      */
     private getEncryption(): Promise<StorageEncryption> {
         if (!this.encryptionPromise) {
-            this.encryptionPromise = this.getStoragePassword().then(pw => new StorageEncryption(pw));
+            this.encryptionPromise = this.getStoragePassword().then(pw =>
+                new StorageEncryption(pw, this.deriveStableSalt(pw)));
         }
         return this.encryptionPromise;
+    }
+
+    /** Deterministic 32-byte salt for this account's internal storage. */
+    private deriveStableSalt(password: string): Buffer {
+        return crypto
+            .createHash('sha256')
+            .update(`${password}|${this.config.accountId}|nightgate-private-state-salt-v1`)
+            .digest();
     }
 
     private async upsertPrivateState(contractAddress: string, privateStateId: string, ciphertext: string): Promise<void> {

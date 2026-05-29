@@ -605,3 +605,244 @@ describe('verifyDocument', () => {
         expect(result.verified).toBe(true);
     });
 });
+
+// ---- issuePredicateAttestation (ZK predicate, on-chain model) -------------
+
+describe('issuePredicateAttestation', () => {
+    const VALID_PAYLOAD = 'a'.repeat(64);
+    const VALID_SALT    = 'b'.repeat(64);
+    const VALID_ARGS = () => ({
+        payloadHash:     VALID_PAYLOAD,
+        value:           '47300',
+        salt:            VALID_SALT,
+        predicate:       'lessOrEqual',
+        threshold:       50000,
+        unit:            'kgCO2e/kWh',
+        sessionId:       `pred-${Math.random().toString(36).slice(2)}`,
+        contractAddress: '0xVAULT',
+        compiledArtifactRef: 'attestation-vault'
+    });
+
+    function makeFakeDb() {
+        return { run: jest.fn().mockResolvedValue(undefined) };
+    }
+
+    function setupHandlersWithDb(overrides: any = {}) {
+        const srv = makeFakeService();
+        const db = makeFakeDb();
+        registerSubmissionHandlers(srv as any, db, {
+            resolveContractImpl: jest.fn(async () => ({ ...RESOLVED_CONTRACT_FIXTURE })),
+            walletMaterialFactory: jest.fn(async () => ({
+                accountId: 'a',
+                privateStoragePasswordProvider: () => '0123456789ABCDEFG',
+                walletAndMidnightProvider: {}
+            })),
+            submitterFactory: jest.fn(() => makeSuccessfulSubmitter()),
+            ...overrides
+        });
+        return { srv, db };
+    }
+
+    test('rejects missing payloadHash', async () => {
+        const { srv } = setupHandlersWithDb();
+        const req = makeReq({ ...VALID_ARGS(), payloadHash: undefined });
+        await srv.handlers['issuePredicateAttestation'](req);
+        expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/payloadHash/));
+    });
+
+    test('rejects non-hex payloadHash', async () => {
+        const { srv } = setupHandlersWithDb();
+        const req = makeReq({ ...VALID_ARGS(), payloadHash: 'nope' });
+        await srv.handlers['issuePredicateAttestation'](req);
+        expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/64 hex chars/));
+    });
+
+    test('rejects missing value', async () => {
+        const { srv } = setupHandlersWithDb();
+        const req = makeReq({ ...VALID_ARGS(), value: undefined });
+        await srv.handlers['issuePredicateAttestation'](req);
+        expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/value is required/));
+    });
+
+    test('rejects non-integer value', async () => {
+        const { srv } = setupHandlersWithDb();
+        const req = makeReq({ ...VALID_ARGS(), value: '47.3' });
+        await srv.handlers['issuePredicateAttestation'](req);
+        expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/value must be an integer/));
+    });
+
+    test('rejects unknown predicate', async () => {
+        const { srv } = setupHandlersWithDb();
+        const req = makeReq({ ...VALID_ARGS(), predicate: 'between' });
+        await srv.handlers['issuePredicateAttestation'](req);
+        expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/lessOrEqual.*greaterOrEqual/));
+    });
+
+    test('rejects bad salt', async () => {
+        const { srv } = setupHandlersWithDb();
+        const req = makeReq({ ...VALID_ARGS(), salt: 'short' });
+        await srv.handlers['issuePredicateAttestation'](req);
+        expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/salt must be 64 hex/));
+    });
+
+    test('happy path: INSERT + commitValue + provePredicate + UPDATE; value never leaves as a circuit arg', async () => {
+        const submitter = makeSuccessfulSubmitter();
+        const { srv, db } = setupHandlersWithDb({ submitterFactory: () => submitter });
+        const req = makeReq(VALID_ARGS());
+
+        const result: any = await srv.handlers['issuePredicateAttestation'](req);
+
+        expect(req.reject).not.toHaveBeenCalled();
+        expect(result).toEqual({
+            jobId:  'job-issuePredicateAttestation-test',
+            status: 'pending',
+            predicateAttestationId: expect.any(String)
+        });
+
+        // INSERT (sync) + UPDATE (inside work) = 2 db.run.
+        expect(db.run).toHaveBeenCalledTimes(2);
+
+        // Two circuit calls in order: commitValue then provePredicate.
+        expect(submitter.call).toHaveBeenCalledTimes(2);
+        const c0 = (submitter.call as jest.Mock).mock.calls[0][0];
+        const c1 = (submitter.call as jest.Mock).mock.calls[1][0];
+
+        expect(c0.circuit).toBe('commitValue');
+        expect(c0.args).toHaveLength(1);
+        expect(c0.args[0]).toBeInstanceOf(Uint8Array);
+        expect(c0.args[0]).toHaveLength(32);
+
+        expect(c1.circuit).toBe('provePredicate');
+        expect(c1.args[0]).toBeInstanceOf(Uint8Array);
+        expect(c1.args[1]).toBe(50000n);   // threshold as bigint
+        expect(c1.args[2]).toBe(0n);       // op: lessOrEqual
+
+        // PRIVACY: the hidden value travels only as a witness, never as an arg.
+        for (const call of [c0, c1]) {
+            expect(call.witnessValues).toEqual({ attestedValue: '47300', valueSalt: VALID_SALT });
+            const argsHex = call.args.map((a: any) => a instanceof Uint8Array ? Buffer.from(a).toString('hex') : String(a));
+            expect(argsHex.join(',')).not.toContain('47300');
+        }
+    });
+
+    test('op=greaterOrEqual maps to 1n on provePredicate', async () => {
+        const submitter = makeSuccessfulSubmitter();
+        const { srv } = setupHandlersWithDb({ submitterFactory: () => submitter });
+        await srv.handlers['issuePredicateAttestation'](makeReq({ ...VALID_ARGS(), predicate: 'greaterOrEqual' }));
+        const c1 = (submitter.call as jest.Mock).mock.calls[1][0];
+        expect(c1.args[2]).toBe(1n);
+    });
+
+    test('generates a 32-byte salt when omitted', async () => {
+        const submitter = makeSuccessfulSubmitter();
+        const { srv } = setupHandlersWithDb({ submitterFactory: () => submitter });
+        await srv.handlers['issuePredicateAttestation'](makeReq({ ...VALID_ARGS(), salt: undefined }));
+        const c0 = (submitter.call as jest.Mock).mock.calls[0][0];
+        expect(c0.witnessValues.valueSalt).toMatch(/^[0-9a-f]{64}$/);
+    });
+
+    test('UPDATE is skipped when provePredicate throws inside work', async () => {
+        const subErr = new SubmissionError('sub-z', { code: 'OnChainStatus:Fail', retryable: false, message: 'predicate false' });
+        const { srv, db } = setupHandlersWithDb({
+            submitterFactory: () => ({
+                deploy: jest.fn(),
+                // commitValue succeeds, provePredicate throws.
+                call: jest.fn()
+                    .mockResolvedValueOnce({ txHash: '0xcommit', status: 'included' })
+                    .mockRejectedValueOnce(subErr)
+            }) as unknown as TransactionSubmitter
+        });
+        const req = makeReq(VALID_ARGS());
+        const result: any = await srv.handlers['issuePredicateAttestation'](req);
+        // INSERT only — UPDATE never reached.
+        expect(db.run).toHaveBeenCalledTimes(1);
+        expect(req.reject).not.toHaveBeenCalled();
+        expect(result).toMatchObject({ jobId: expect.any(String), status: 'pending' });
+    });
+
+    test('rate-limited at 10 proofs/hour/session', async () => {
+        const { srv } = setupHandlersWithDb();
+        const sessionId = `pred-rate-${Date.now()}`;
+        for (let i = 0; i < 10; i++) {
+            const req = makeReq({ ...VALID_ARGS(), sessionId });
+            await srv.handlers['issuePredicateAttestation'](req);
+            expect(req.reject).not.toHaveBeenCalled();
+        }
+        const overflow = makeReq({ ...VALID_ARGS(), sessionId });
+        await srv.handlers['issuePredicateAttestation'](overflow);
+        expect(overflow.reject).toHaveBeenCalledWith(429, expect.stringMatching(/Rate limited/));
+    });
+});
+
+// ---- verifyPredicateAttestation (ZK predicate, on-chain model) ------------
+
+describe('verifyPredicateAttestation', () => {
+    const PA_ID   = '00000000-0000-4000-8000-0000000000a1';
+    const TX_ID   = '00000000-0000-4000-8000-0000000000a2';
+    const TX_HASH = '0xprove';
+
+    function makeDbWithSequence(rows: any[]) {
+        const queue = [...rows];
+        return { run: jest.fn().mockImplementation(async () => queue.shift()) };
+    }
+    function setupHandlersWithDb(db: any) {
+        const srv = makeFakeService();
+        registerSubmissionHandlers(srv as any, db, {
+            resolveContractImpl: jest.fn(), walletMaterialFactory: jest.fn(), submitterFactory: jest.fn()
+        });
+        return srv;
+    }
+    const provenRow = () => ({
+        ID: PA_ID, predicate: 'lessOrEqual', threshold: 50000, unit: 'kgCO2e/kWh',
+        valueCommitment: 'c'.repeat(64), provenTxHash: TX_HASH, provenAt: '2026-05-29T10:00:00Z'
+    });
+
+    test('rejects missing predicateAttestationId', async () => {
+        const srv = setupHandlersWithDb(makeDbWithSequence([]));
+        const req = makeReq({});
+        await srv.handlers['verifyPredicateAttestation'](req);
+        expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/predicateAttestationId/));
+    });
+
+    test('404 when row not found', async () => {
+        const srv = setupHandlersWithDb(makeDbWithSequence([undefined]));
+        const req = makeReq({ predicateAttestationId: PA_ID });
+        await srv.handlers['verifyPredicateAttestation'](req);
+        expect(req.reject).toHaveBeenCalledWith(404, expect.stringMatching(/not found/));
+    });
+
+    test('verified: true when proven + tx SUCCESS', async () => {
+        const srv = setupHandlersWithDb(makeDbWithSequence([
+            provenRow(),
+            { ID: TX_ID, hash: TX_HASH },
+            { status: 'SUCCESS' }
+        ]));
+        const req = makeReq({ predicateAttestationId: PA_ID });
+        const result: any = await srv.handlers['verifyPredicateAttestation'](req);
+        expect(req.reject).not.toHaveBeenCalled();
+        expect(result).toMatchObject({
+            verified: true, predicate: 'lessOrEqual', threshold: 50000,
+            unit: 'kgCO2e/kWh', provenTxHash: TX_HASH
+        });
+    });
+
+    test('verified: false when not yet proven (no provenTxHash)', async () => {
+        const srv = setupHandlersWithDb(makeDbWithSequence([
+            { ...provenRow(), provenTxHash: null, provenAt: null }
+        ]));
+        const req = makeReq({ predicateAttestationId: PA_ID });
+        const result: any = await srv.handlers['verifyPredicateAttestation'](req);
+        expect(result.verified).toBe(false);
+    });
+
+    test('verified: false when proof tx is not SUCCESS', async () => {
+        const srv = setupHandlersWithDb(makeDbWithSequence([
+            provenRow(),
+            { ID: TX_ID, hash: TX_HASH },
+            { status: 'FAILURE' }
+        ]));
+        const req = makeReq({ predicateAttestationId: PA_ID });
+        const result: any = await srv.handlers['verifyPredicateAttestation'](req);
+        expect(result.verified).toBe(false);
+    });
+});
