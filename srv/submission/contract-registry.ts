@@ -25,8 +25,29 @@
  *   }
  */
 
+import fs from 'fs';
 import path from 'path';
 import { pathToFileURL } from 'url';
+
+// Package root (…/node_modules/@odatano/nightgate when installed). contract-registry
+// lives at <root>/srv/submission/, so ../.. is the package root.
+const PACKAGE_ROOT = path.resolve(__dirname, '..', '..');
+
+/**
+ * Resolve a configured contract path. Absolute paths pass through. For a
+ * RELATIVE path we prefer the package root when the target exists there — this
+ * is how the BUNDLED contracts (counter, attestation-vault, shipped under the
+ * package's contracts/ dir) resolve correctly in a consumer app, where
+ * process.cwd() is the consumer's project root, not node_modules/@odatano/nightgate.
+ * A consumer's OWN relative path (not present under the package) falls back to
+ * baseDir (cwd), preserving the prior behaviour for consumer-registered contracts.
+ */
+function resolveContractPath(p: string, baseDir: string): string {
+    if (path.isAbsolute(p)) return p;
+    const fromPackage = path.join(PACKAGE_ROOT, p);
+    if (fs.existsSync(fromPackage)) return fromPackage;
+    return path.join(baseDir, p);
+}
 
 export interface ContractRegistration {
     /** Absolute or relative path to the Compact-emitted JS contract module. Dynamic-imported on resolve. */
@@ -83,9 +104,9 @@ export function loadRegistryFromConfig(config?: Record<string, any>, baseDir = p
         const r = reg as ContractRegistration;
         if (!r?.artifactPath || !r?.privateStateId || !r?.zkConfigPath) continue;
         registerContract(name, {
-            artifactPath:   path.isAbsolute(r.artifactPath) ? r.artifactPath : path.join(baseDir, r.artifactPath),
+            artifactPath:   resolveContractPath(r.artifactPath, baseDir),
             privateStateId: r.privateStateId,
-            zkConfigPath:   path.isAbsolute(r.zkConfigPath) ? r.zkConfigPath : path.join(baseDir, r.zkConfigPath)
+            zkConfigPath:   resolveContractPath(r.zkConfigPath, baseDir)
         });
     }
 }

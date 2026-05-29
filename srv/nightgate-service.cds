@@ -349,7 +349,8 @@ service NightgateService {
         projection on midnight.WalletSessions
         excluding {
             viewingKeyHash, // Internal lookup field
-            encryptedViewingKey // Encrypted key, never exposed via OData
+            encryptedViewingKey, // Encrypted viewing key, never exposed via OData
+            encryptedSeedKey // Encrypted signing seed, never exposed via OData
         };
 
     /**
@@ -569,7 +570,7 @@ service NightgateService {
     };
 
     // ========================================================================
-    // Background Jobs (async submission lifecycle, 0.2.0)
+    // Background Jobs (async submission lifecycle, 0.3.0)
     // ========================================================================
 
     /**
@@ -589,7 +590,7 @@ service NightgateService {
      *
      * Declared as `action` (HTTP POST) rather than `function` (HTTP GET) so
      * clients can polling-loop with the same POST + JSON-body pattern they
-     * already use for every other 0.2.0 async action. Side-effect free
+     * already use for every other 0.3.0 async action. Side-effect free
      * despite the verb.
      */
     action getJobStatus(

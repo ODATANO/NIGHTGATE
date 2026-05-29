@@ -42,7 +42,7 @@ coverage/
 npm-debug.log*
 @cds-models
 
-CLAUDE.MD
+CLAUDE.md
 AGENTS.md
 
 # Internal planning / feature-request docs — kept local only

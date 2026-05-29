@@ -73,7 +73,7 @@ type PendingSubmissionStatus : String(20) enum {
 //   succeeded , work resolved; result column carries the JSON of the original return shape
 //   failed    , work threw; errorCode + errorMessage classify it
 //
-// Per the 0.2.0 async-job migration: long-running submission actions
+// Per the 0.3.0 async-job migration: long-running submission actions
 // (registerForDustGeneration, sendNight, deployContract, etc.) return
 // `{ jobId, status }` synchronously and the caller polls `getJobStatus(jobId)`.
 type BackgroundJobStatus     : String(20) enum {

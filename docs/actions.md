@@ -129,17 +129,20 @@ Reverse: deregister ALL the wallet's registered NIGHT UTXOs so they become spend
 
 ## Contract operations
 
-### `deployContract(compiledArtifactRef, sessionId, initialPrivateState) → { submissionId, txHash, contractAddress, status }`
+### `deployContract(compiledArtifactRef, sessionId, initialPrivateState, idempotencyKey?) → { jobId, status }`
 
 Deploy a Compact-compiled contract. The contract must be registered via `cds.requires.nightgate.contracts.<ref>` (or programmatically via `registerContract()`).
+
+**Async** (see [Async job model](#async-job-model-write-actions)): returns `{ jobId, status: "pending" }` immediately; poll `getJobStatus(jobId, sessionId)`. The job result on success is `{ submissionId, txHash, contractAddress, status }` (here `status` is the `PendingSubmissions` lifecycle status — distinct from the job status).
 
 | Field | Type | Notes |
 |---|---|---|
 | `compiledArtifactRef` | String | Logical name from the registry (e.g. `"counter"`) |
 | `sessionId` | UUID | Must have signing enabled |
 | `initialPrivateState` | LargeString | JSON-encoded initial state (e.g. `"{}"`) |
+| `idempotencyKey` | String (optional) | Dedupes retries against the original job; reusing a key returns the existing `jobId` |
 
-A row is inserted into `PendingSubmissions` BEFORE the SDK is invoked (crash-recovery hook). `status` transitions: `pending` → `included` (SDK returned successfully) → `finalized` (crawler indexed the tx).
+A row is inserted into `PendingSubmissions` BEFORE the SDK is invoked (crash-recovery hook). The result `status` transitions: `pending` → `included` (SDK returned successfully) → `finalized` (crawler indexed the tx).
 
 **Rate limit:** 5/hour per session.
 
@@ -148,9 +151,11 @@ A row is inserted into `PendingSubmissions` BEFORE the SDK is invoked (crash-rec
 - 404 — contract not registered
 - 503 — retryable transient (network, 1016 on preprod)
 
-### `submitContractCall(contractAddress, circuit, compiledArtifactRef, sessionId, args) → { submissionId, txHash, contractAddress, status }`
+### `submitContractCall(contractAddress, circuit, compiledArtifactRef, sessionId, args, idempotencyKey?) → { jobId, status }`
 
 Invoke a circuit on a deployed contract.
+
+**Async**: returns `{ jobId, status: "pending" }` immediately; poll `getJobStatus(jobId, sessionId)`. The job result on success is `{ submissionId, txHash, contractAddress, status }` (the lifecycle status, not the job status).
 
 | Field | Type | Notes |
 |---|---|---|
@@ -159,6 +164,7 @@ Invoke a circuit on a deployed contract.
 | `compiledArtifactRef` | String | Logical name from registry |
 | `sessionId` | UUID | Must have signing enabled |
 | `args` | LargeString | JSON-encoded array (use `"[]"` for no args) |
+| `idempotencyKey` | String (optional) | Dedupes retries against the original job; reusing a key returns the existing `jobId` |
 
 **Rate limit:** 30/min per session.
 
@@ -229,9 +235,10 @@ Crawler sync state. **This is the crawler's view, not the wallet's.** During wal
 
 `getMetrics` returns Prometheus text format. Metric prefix: `odatano_nightgate_*`. Includes chain height, indexed height, sync lag, block throughput, error counts, uptime, sync status (mapped: stopped=0, syncing=1, synced=2, error=3).
 
-### `getLiveness() / getReadiness() → { status, ... }`
+### `getLiveness() → { status, timestamp, uptime }`
+### `getReadiness() → { ready, checks: { database, crawler, node } }`
 
-Kubernetes-style probes.
+Kubernetes-style probes. `getReadiness` reports `ready: true` only when all three subsystem checks pass.
 
 ### `getReorgHistory(limit?) → ReorgLog[]`
 
@@ -282,18 +289,22 @@ Error responses follow OData's `{ error: { code, message } }` envelope. For subm
 }
 ```
 
-Classification codes returned by `classifySubmissionError` (`srv/submission/TransactionSubmitter.ts`):
+Codes returned by `classifySubmissionError` (`srv/submission/TransactionSubmitter.ts`):
 
 | Code | Retryable | Trigger |
 |---|---|---|
 | `TxFailed` | no | SDK `TxFailedError` (on-chain status wasn't `SucceedEntirely`) |
-| `1014` | no | Substrate "invalid transaction" |
+| `1014` | no | Substrate "invalid transaction" (matches `1014` or `invalid transaction` in the error message) |
 | `1016` | yes (preprod) / no (mainnet) | "Immediately Dropped" — preprod transient, mainnet has a known deterministic-rejection issue |
-| `170` (Custom error) | no | Dust validity window: the wallet's `ctime` is outside the grace window — usually a lagging indexer or a wallet not synced to tip (`failed assert: predicate false` is the distinct predicate-circuit case) |
-| `NetworkOrTimeout` | yes | `ECONNREFUSED`, `ETIMEDOUT`, `socket hang up`, etc. |
-| `ContractTypeError` etc. | no | SDK contract-config errors |
+| `NetworkOrTimeout` | yes | `ECONNREFUSED`, `ECONNRESET`, `ENOTFOUND`, `ETIMEDOUT`, `socket hang up`, `timeout` |
+| `ContractTypeError` / `IncompleteCallTxPrivateStateConfig` / `IncompleteFindContractPrivateStateConfig` | no | SDK contract-config errors (classified by the thrown error's `name`) |
 | `WalletSigningNotAvailable` | no | Session has no encrypted seed key |
-| `Wallet.InsufficientFunds` | no | Insufficient dust to pay fees, or insufficient NIGHT to satisfy outputs |
-| `MalformedResult` | no | SDK returned without expected fields (likely SDK bug) |
+| `<error name>` (default) | no | Any otherwise-unrecognized error — falls back to the thrown error's `name`, assumed non-retryable |
+
+Other failures surface as the **raw node/SDK error** rather than a `classifySubmissionError` code:
+
+- **Custom error `170` (dust validity window)** — raised by the node when the wallet's dust `ctime` is outside the grace window, usually a lagging indexer or a wallet not synced to tip. (`failed assert: predicate false` is the distinct predicate-circuit rejection.)
+- **`Wallet.InsufficientFunds`** — raised by the wallet SDK when there's insufficient dust to pay fees, or insufficient NIGHT to satisfy outputs.
+- **`MalformedResult`** — thrown by `TransactionSubmitter` when the SDK returns without the expected fields (likely an SDK bug); it is a distinct thrown error, not a `classifySubmissionError` code.
 
 For diagnostic 503s caused by the hosted Midnight indexer, see [docs/operations.md#troubleshooting](operations.md#troubleshooting).

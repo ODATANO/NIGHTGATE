@@ -33,6 +33,13 @@ export interface NightgatePluginConfig {
         privateStateId: string;
         zkConfigPath: string;
     }>;
+    /**
+     * Safety gate for mainnet. Default false: submission actions reject when
+     * `network === 'mainnet'` unless this is explicitly true. Mainnet has known
+     * submission instability (`1016 Immediately Dropped`, forum thread 1190), so
+     * the gate is opt-in. Read-only indexing is unaffected.
+     */
+    allowMainnetSubmission?: boolean;
     // CAP permits additional plugin-specific keys we don't model here.
     [k: string]: unknown;
 }
@@ -199,4 +206,20 @@ export function resolveNightgateRuntimeConfig(config: Record<string, any> = {}):
         submissionEndpoints,
         invalidNetwork
     };
+}
+
+/**
+ * Mainnet submission safety gate. Returns a human-readable rejection reason when
+ * the resolved network is `mainnet` and `allowMainnetSubmission` is not explicitly
+ * true; otherwise null (submission allowed). Used by every on-chain submission
+ * action handler to fail fast before building/submitting a transaction.
+ */
+export function mainnetSubmissionBlockReason(config: NightgatePluginConfig): string | null {
+    const { network } = resolveNightgateRuntimeConfig(config);
+    if (network === 'mainnet' && config.allowMainnetSubmission !== true) {
+        return 'Mainnet submission is disabled. Set cds.requires.nightgate.allowMainnetSubmission=true ' +
+            'to enable it. Mainnet has known submission instability (1016 Immediately Dropped, ' +
+            'forum thread 1190); read-only indexing is unaffected.';
+    }
+    return null;
 }

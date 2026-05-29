@@ -36,6 +36,7 @@ All nine long-running OData actions now return `{ jobId, status }` immediately a
 - New `BackgroundJobs` entity + `BackgroundJobStatus` / `BackgroundJobKind` types; new `srv/submission/background-jobs.ts` (per-kind semaphore — heavy=4, light=16 — plus idempotency and crash recovery that flips interrupted rows to `failed:PROCESS_RESTART` on boot).
 - New `getJobStatus(jobId, sessionId)` action (declared `action`/POST, so clients poll with the same POST+body pattern as everything else).
 - Migrated: `connectWalletForSigning` (returns `prewarmJobId`), `registerForDustGeneration`, `deregisterFromDustGeneration`, `sendNight`, `shieldFunds`, `unshieldFunds`, `deployContract`, `submitContractCall`, `anchorDocument`.
+- Note: `issuePredicateAttestation` (added later with the ZK predicate-attestation feature) also uses the async-job model — it returns `{ jobId, status }` and is polled via `getJobStatus`, making it the tenth async/pollable action in 0.3.0.
 - Auto-deploy removed: `ensureSchemaDeployed` is now probe-only (fail-fast); deploy explicitly with `npm run deploy`.
 - Trip-hazard documented: never hold a CAP transaction open across a worker `await` — `@cap-js/sqlite` pools a single connection, so doing so starves every other query. Work runs via `runWithoutAmbientTx` (clears `cds.context`) with short per-write txs.
 

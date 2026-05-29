@@ -43,6 +43,11 @@ import {
 } from './wallet-sync-state-store';
 import { formatErr } from '../utils/format-error';
 
+// Opt-in facade-restore diagnostics (off by default; enable with
+// NIGHTGATE_DEBUG_WALLET_SYNC=true). Keeps the plugin quiet on a consumer's stdout.
+const DEBUG_SYNC = process.env.NIGHTGATE_DEBUG_WALLET_SYNC === 'true';
+const dbgSync = (msg: string): void => { if (DEBUG_SYNC) console.log(msg); };
+
 export interface WalletFacadeBuildArgs {
     seedHex: string;
     networkId: 'preprod' | 'testnet' | 'mainnet' | 'undeployed' | 'devnet' | 'qanet' | 'preview';
@@ -126,12 +131,12 @@ export async function getOrBuildWalletFacade(
                 unshielded: loaded.unshielded,
                 dust:       loaded.dust
             };
-            console.log(
+            dbgSync(
                 `[facade] restored prior state for ${cacheKey.slice(0, 16)}: ` +
                 `shielded=${!!loaded.shielded} unshielded=${!!loaded.unshielded} dust=${!!loaded.dust}`
             );
         } else {
-            console.log(`[facade] no usable prior state for ${cacheKey.slice(0, 16)} (cold start)`);
+            dbgSync(`[facade] no usable prior state for ${cacheKey.slice(0, 16)} (cold start)`);
         }
     }
 
@@ -147,7 +152,7 @@ export async function getOrBuildWalletFacade(
     };
 
     const result = await walletInit(initArgs);
-    console.log(
+    dbgSync(
         `[facade] worker init ok for ${cacheKey.slice(0, 16)}: ` +
         `alreadyExisted=${result.alreadyExisted} sdk=${result.sdkVersion ?? '?'}`
     );

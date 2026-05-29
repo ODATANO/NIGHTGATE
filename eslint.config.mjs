@@ -17,7 +17,8 @@ export default [
             'srv/**/*.d.ts.map',
             'test/**/*.js',
             'test/**/*.d.ts',
-            'scripts/**'
+            'scripts/**',
+            'contracts/**/managed/**'
         ]
     },
     ...cds.recommended

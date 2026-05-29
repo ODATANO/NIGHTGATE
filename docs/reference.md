@@ -84,6 +84,7 @@ Sufficient for read-side. Defaults to `preprod`, `wss://rpc.preprod.midnight.net
 | `crawler.fetchConcurrency` | `(default)` | Parallel RPC fetches during catch-up |
 | `crawler.rpcBatchSize` | `(default)` | Substrate JSON-RPC batch size |
 | `crawler.requestTimeout` | `30000` | RPC timeout (ms) |
+| `palletMap` | `(built-in)` | Optional override of the Substrate pallet-index → tx-type classification map used by the `BlockProcessor` (`{ "<index>": { name, txType, isShielded?, isSystem? } }`) |
 | `allowMainnetSubmission` | `false` | Gate for mainnet submission. Stays off until [forum thread 1190](https://forum.midnight.network) (`1016 Immediately Dropped`) is resolved |
 
 ### Environment variables
@@ -104,6 +105,10 @@ Sufficient for read-side. Defaults to `preprod`, `wss://rpc.preprod.midnight.net
 | `NIGHTGATE_PROOF_NETWORK` | Network passed to the proof-server container; defaults to `preprod` |
 | `NIGHTGATE_ZK_CONFIG_BASE` | Override `zkConfigBasePath` |
 | `NIGHTGATE_PRIVATE_STATE_BACKEND` | Override `privateStateBackend` |
+| `NIGHTGATE_PREWARM_SYNC_TIMEOUT_MS` | Upper bound for the `connectWalletForSigning` prewarm sync-to-tip wait; default `10800000` (3 h). Raise for slow cold syncs. |
+| `NIGHTGATE_BALANCE_SYNC_TIMEOUT_MS` | Wallet balance sync-to-tip timeout in the worker's `balanceTx` pre-sync; default `180000` (180 s). A stalled sync fails cleanly instead of hanging. |
+| `NIGHTGATE_DEBUG_WALLET_SYNC` | Set `true` to emit per-save wallet-sync timing logs; off by default to keep a consumer's stdout quiet |
+| `SKIP_AUTO_INIT` | Set `true` **only in tests** to skip the plugin's `initialize()` (crawler + wallet worker). Must NOT be set in production. |
 | `INDEXER_SECRET` | 32-byte hex secret for the indexer container's `APP__INFRA__SECRET` |
 | `INDEXER_UPSTREAM_NODE_URL` | Upstream Substrate RPC for the indexer container (default = hosted preprod) |
 | `LACE_VIEWING_KEY` | Consumed by `scripts/start-wallet-sync.mjs` and `scripts/run-t15.mjs` to bootstrap a wallet session |
@@ -123,7 +128,7 @@ For local repository startup, drop these into a repo-root `.env`. The tracked te
 - Model roots registered from `db/` and `srv/`
 - Security middleware attached during CAP bootstrap
 - `initialize()` runs on `cds.on('served')`:
-  1. Auto-deploys CDS schema if `Blocks` table doesn't exist
+  1. Probes the CDS schema (SELECTs each required table). The schema is **not** auto-deployed — on the first missing table the plugin fails fast with `SchemaNotDeployedError` and instructs you to run `npm run deploy`
   2. Applies SQLite tuning pragmas (WAL, 64 MB cache, 256 MB mmap)
   3. Loads `cds.requires.nightgate.contracts` into the contract registry
   4. Spawns the wallet worker thread (`startWalletWorker()`) and wires the state-save sink
@@ -161,7 +166,7 @@ See [actions.md#error-model](actions.md#error-model) for the full table of error
 
 ### Startup + failure semantics
 
-- On first startup, the package checks whether `midnight.Blocks` exists. If the schema is missing, it attempts `db.deploy()` automatically.
+- On first startup, the package probes the schema by SELECTing each required table. The schema is **not** auto-deployed (auto-deploy was removed in 0.2.0): on the first missing table the plugin throws `SchemaNotDeployedError`, prints a "run `npm run deploy`" block, and exits. Deploy the schema explicitly before starting.
 - If the Midnight node cannot be reached, the package logs a warning and continues in `offline` mode. Read-side requests are still served from cache; submission requests still work (they only need the indexer + proof server, not the node directly).
 - If the wallet worker fails to start, the plugin logs a warning and continues — submission requests will return an error, read-side is unaffected.
 - Repeated `initialize()` calls are idempotent.
@@ -171,7 +176,7 @@ See [actions.md#error-model](actions.md#error-model) for the full table of error
 
 `db/midnight.db` persists indexed data plus encrypted wallet state. When switching networks, delete `db/midnight.db*` first.
 
-The `PrivateStates`, `ContractSigningKeys`, and `WalletSyncStates` tables are encrypted with passwords derived from the viewing key (via PBKDF2). Losing the `ENCRYPTION_KEY` env var means stored viewing/seed keys become unreadable — back it up separately. For private state migration, use `exportPrivateStates(password)` to produce a portable encrypted blob.
+The `PrivateStates`, `ContractSigningKeys`, and `WalletSyncStates` tables are encrypted with passwords derived from the viewing key (via PBKDF2). Losing the `ENCRYPTION_KEY` env var means stored viewing/seed keys become unreadable — back it up separately. For private state migration, use `exportPrivateStates({ password })` to produce a portable encrypted blob.
 
 ### Security middleware
 
@@ -273,14 +278,14 @@ New enums in `db/types.cds`:
 | Local Midnight indexer (docker) | ✅ Optional `midnightntwrk/indexer-standalone:4.3.2` service |
 | Wallet state persistence | ✅ `WalletSyncStates` — restart resumes in seconds, not hours |
 | Worker-thread architecture | ✅ Wallet SDK isolated from main thread (Phase 1+2a+2b) |
-| Compact contracts | ⚠️ `counter` registered; `AttestationVault` deferred to T10-extended |
-| Live preprod end-to-end (T15) | ⚠️ Blocked on dust accrual (chain economics, not code) |
+| Compact contracts | ✅ `counter` + `attestation-vault` registered with compiled artifacts shipped (0.3.0) |
+| Live preprod end-to-end (T15) | ✅ Counter deployed live on preprod via the full stack (0.3.0) |
 | Mainnet submission | ❌ Gated by `allowMainnetSubmission: false` until forum 1190 resolves |
 | Built-in authorization | ✅ `@requires` annotations; consumer app provides auth strategy |
 
 ## Project structure
 
-See [../CLAUDE.md](../CLAUDE.md) for the full annotated directory tree. Key directories:
+Key directories:
 
 ```
 src/
@@ -361,8 +366,8 @@ npm run integration:contract-registry  # registry resolves the real compiled cou
 
 ## Testing baseline
 
-- 48 test suites
-- 672 tests passing
+- 49 test suites
+- 688 tests passing
 - 0 failures
 - Integration scripts pass against the real SDK (`smoke:sdk`, `integration:*`)
 

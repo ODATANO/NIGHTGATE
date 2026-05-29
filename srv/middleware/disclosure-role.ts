@@ -69,7 +69,7 @@ export async function attachDisclosureRole(
         return DEFAULT_DISCLOSURE_ROLE;
     }
 
-    const { SELECT } = cds.ql as any;
+    const { SELECT } = cds.ql;
     const rows: DisclosureRoleRow[] =
         (await db.run(SELECT.from(DisclosureRoles).where({ userId }))) || [];
 

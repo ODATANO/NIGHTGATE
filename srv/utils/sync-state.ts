@@ -11,7 +11,7 @@ const { SELECT, INSERT } = cds.ql;
 import { SyncState } from '#cds-models/midnight';
 import { getConfiguredNightgateNodeUrl, resolveNightgateRuntimeConfig, getNightgatePluginConfig } from './nightgate-config';
 
-export async function ensureSyncStateSingleton(db: any, nodeUrl?: string): Promise<void> {
+export async function ensureSyncStateSingleton(db: cds.DatabaseService, nodeUrl?: string): Promise<void> {
     const existing = await db.run(
         SELECT.one.from(SyncState).where({ ID: 'SINGLETON' })
     );

@@ -1,0 +1,7 @@
+# Compiled Compact / ZK artifacts under contracts/**/managed are binary.
+# Git auto-detects them today; declaring it explicitly keeps them byte-intact
+# regardless of a contributor's core.autocrlf setting.
+contracts/**/managed/**/*.prover    binary
+contracts/**/managed/**/*.verifier  binary
+contracts/**/managed/**/*.bzkir     binary
+contracts/**/managed/**/*.zkir      binary

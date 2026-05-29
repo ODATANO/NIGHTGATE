@@ -9,8 +9,8 @@
  *   2. Rate-limit per sessionId (deploys are stricter than calls).
  *   3. Resolve `compiledArtifactRef` → compiled contract + zkConfigPath +
  *      privateStateId via the contract registry.
- *   4. Look up the wallet session and build WalletMaterial (T7 stub today ,
- *      surfaces a clear `WalletMaterialUnavailable` until T7 lands).
+ *   4. Look up the wallet session and build WalletMaterial (real signing-capable
+ *      material when the session has a seed; `WalletMaterialUnavailable` otherwise).
  *   5. Catch SubmissionError / SessionNotFoundError / ContractNotRegisteredError /
  *      WalletMaterialUnavailable and translate to OData status codes.
  *
@@ -36,7 +36,7 @@ import {
     SessionNotFoundError,
     WalletMaterialUnavailable
 } from './wallet-material-factory';
-import { resolveNightgateRuntimeConfig, type NightgateNetwork, getConfiguredPrivateStateBackend, getNightgatePluginConfig } from '../utils/nightgate-config';
+import { resolveNightgateRuntimeConfig, type NightgateNetwork, getConfiguredPrivateStateBackend, getNightgatePluginConfig, mainnetSubmissionBlockReason } from '../utils/nightgate-config';
 import { RateLimiter } from '../utils/rate-limiter';
 import { ensureNetworkId, type ContractProvidersConfig } from '../midnight/providers';
 import { startJob } from './background-jobs';
@@ -69,7 +69,7 @@ function hexToBytes(hex: string): Uint8Array {
  * Optional dependency overrides, primarily for tests.
  */
 export interface SubmissionHandlersOptions {
-    /** Override the wallet-material factory. Defaults to the T7-pending stub. */
+    /** Override the wallet-material factory. Defaults to buildWalletMaterialForSession. */
     walletMaterialFactory?: typeof buildWalletMaterialForSession;
     /** Override contract resolution. Defaults to the static registry. */
     resolveContractImpl?: typeof resolveContract;
@@ -79,6 +79,8 @@ export interface SubmissionHandlersOptions {
 
 export function registerSubmissionHandlers(
     srv: cds.ApplicationService,
+    // `any` (not cds.DatabaseService) on purpose: tests inject a minimal
+    // `{ run }` mock; the handlers only use db.run.
     db: any,
     options: SubmissionHandlersOptions = {}
 ): void {
@@ -97,6 +99,7 @@ export function registerSubmissionHandlers(
         if (!compiledArtifactRef) return req.reject(400, 'compiledArtifactRef is required');
         if (!sessionId)          return req.reject(400, 'sessionId is required');
 
+        if (rejectIfMainnetBlocked(req)) return;
         if (!checkRate(deployRateLimiter, sessionId, req)) return;
 
         let parsedInitialState: unknown = {};
@@ -158,6 +161,7 @@ export function registerSubmissionHandlers(
         if (!compiledArtifactRef) return req.reject(400, 'compiledArtifactRef is required');
         if (!sessionId)           return req.reject(400, 'sessionId is required');
 
+        if (rejectIfMainnetBlocked(req)) return;
         if (!checkRate(callRateLimiter, sessionId, req)) return;
 
         let parsedArgs: unknown[] = [];
@@ -233,6 +237,7 @@ export function registerSubmissionHandlers(
             ? data.compiledArtifactRef
             : DEFAULT_ATTESTATION_VAULT_REF;
 
+        if (rejectIfMainnetBlocked(req)) return;
         if (!checkRate(anchorRateLimiter, data.sessionId, req)) return;
 
         // Compute the on-chain inputs: payload_hash from the caller's sha256
@@ -410,6 +415,7 @@ export function registerSubmissionHandlers(
             ? data.compiledArtifactRef
             : DEFAULT_ATTESTATION_VAULT_REF;
 
+        if (rejectIfMainnetBlocked(req)) return;
         if (!checkRate(predicateRateLimiter, data.sessionId, req)) return;
 
         const payloadHashBytes = hexToBytes(data.payloadHash);
@@ -586,6 +592,20 @@ function facadeConfigFromEnv() {
     };
 }
 
+/**
+ * Mainnet submission gate. Returns true (and rejects with 403) when the resolved
+ * network is mainnet and allowMainnetSubmission is not enabled. Call at the top
+ * of every on-chain submission handler before doing any work.
+ */
+function rejectIfMainnetBlocked(req: Request): boolean {
+    const reason = mainnetSubmissionBlockReason(getNightgatePluginConfig());
+    if (reason) {
+        req.reject?.(403, reason);
+        return true;
+    }
+    return false;
+}
+
 function checkRate(limiter: RateLimiter, sessionId: string, req: Request): boolean {
     const r = limiter.check(sessionId);
     if (!r.allowed) {
@@ -607,7 +627,8 @@ async function runSubmission(req: Request, op: () => Promise<unknown>): Promise<
             return req.reject(401, err.message);
         }
         if (err instanceof WalletMaterialUnavailable) {
-            // 501 = Not Implemented. T7 will replace this with real wallet material.
+            // 501 = the session lacks signing material (no seed). The caller must
+            // run connectWalletForSigning before deploy/call/submit actions.
             return req.reject(501, err.message);
         }
         if (err instanceof SubmissionError) {

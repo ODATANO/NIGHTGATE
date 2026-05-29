@@ -8,7 +8,8 @@ using { midnight } from '../db/schema';
 service NightgateAdminService {
 
     entity WalletSessions as projection on midnight.WalletSessions excluding {
-        encryptedViewingKey     // Encrypted key, never exposed via admin API
+        encryptedViewingKey,    // Encrypted viewing key, never exposed via admin API
+        encryptedSeedKey        // Encrypted signing seed, never exposed via admin API
     };
 
     entity DisclosureRoles as projection on midnight.DisclosureRoles;

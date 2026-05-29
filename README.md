@@ -69,9 +69,8 @@ That's it for read-side + base config. For wallet signing + submission:
 
 ```bash
 docker compose -f docker/docker-compose.yml up -d proof-server
-$env:NODE_OPTIONS="--max-old-space-size=12288"   # PowerShell; wallet SDK needs ~8-12 GB heap
 $env:NIGHTGATE_CRAWLER_ENABLED="false"           # optional; isolate sync workload
-npm run serve:sync
+npm run serve:sync   # scripts/serve.mjs sets the ~12 GB heap (override via NIGHTGATE_HEAP_MB)
 ```
 
 For the full first-time-sync walkthrough see [docs/quickstart.md](docs/quickstart.md).
@@ -154,7 +153,7 @@ npm run sync:probe         # check local Midnight indexer container status
 
 npm run typecheck          # tsc --noEmit
 npm run lint               # ESLint
-npm test                   # Jest with coverage, 48 suites, 672 tests
+npm test                   # Jest with coverage, 49 suites, 688 tests
 npm run build              # Compile CDS types + TypeScript to JS
 
 # Integration scripts (real SDK, no chain access required)

@@ -6,7 +6,8 @@ import {
     isNightgatePluginConfigured,
     resolveNightgateRuntimeConfig,
     VALID_NIGHTGATE_NETWORKS,
-    getNightgatePluginConfig
+    getNightgatePluginConfig,
+    DEFAULT_NETWORK
 } from '../srv/utils/nightgate-config';
 import { loadRegistryFromConfig, listRegisteredContracts } from '../srv/submission/contract-registry';
 import { applySqliteTuning } from '../srv/utils/sqlite-tuning';
@@ -140,7 +141,7 @@ export async function initialize(): Promise<NightgateIndexerStatus> {
 
     if (invalidNetwork) {
         console.error(`[odatano-nightgate] Invalid network "${invalidNetwork}". Must be one of: ${VALID_NIGHTGATE_NETWORKS.join(', ')}`);
-        console.error('[odatano-nightgate] Falling back to "testnet"');
+        console.error(`[odatano-nightgate] Falling back to "${DEFAULT_NETWORK}"`);
     }
 
     await ensureSchemaDeployed();

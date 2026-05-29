@@ -303,7 +303,7 @@ entity PendingSubmissions : cuid, managed {
 }
 
 // ============================================================================
-// Background Jobs (async submission lifecycle, 0.2.0)
+// Background Jobs (async submission lifecycle, 0.3.0)
 // ============================================================================
 
 /**
@@ -321,8 +321,8 @@ entity PendingSubmissions : cuid, managed {
  *      the row through `running` → `succeeded` (with serialized `result`) or
  *      `failed` (with classified `errorCode` + `errorMessage`).
  *
- * Crash recovery: `src/plugin.ts` flips any `pending`/`running` rows to
- * `failed:PROCESS_RESTART` on boot. Idempotent.
+ * Crash recovery: `src/index.ts` (initialize → recoverInterruptedJobs) flips
+ * any `pending`/`running` rows to `failed:PROCESS_RESTART` on boot. Idempotent.
  *
  * Idempotency: optional `idempotencyKey` deduplicates retries; a fresh attempt
  * with the same (sessionId, kind, idempotencyKey) returns the existing row's

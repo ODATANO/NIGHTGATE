@@ -27,6 +27,11 @@ import { WalletSyncStates } from '#cds-models/midnight';
 import { StorageEncryption, decryptWithPassword } from '../utils/storage-encryption';
 import { ensureNightgateModelLoaded } from '../utils/cds-model';
 
+// Opt-in per-save timing diagnostics (off by default so the plugin doesn't
+// spam a consumer's stdout). Enable with NIGHTGATE_DEBUG_WALLET_SYNC=true.
+const DEBUG_SYNC = process.env.NIGHTGATE_DEBUG_WALLET_SYNC === 'true';
+const dbgSync = (msg: string): void => { if (DEBUG_SYNC) console.log(msg); };
+
 /**
  * Wallet sub-state blobs from `serializeState()`. SDK returns strings; pass
  * them back to `restore(...)` unchanged.
@@ -60,9 +65,9 @@ export interface LoadedSyncState {
 // Connect once and reuse — same pattern as `srv/crawler/Crawler.ts`. The
 // handle is async-initialised lazily on first save/load.
 
-let dbPromise: Promise<any> | null = null;
+let dbPromise: Promise<cds.DatabaseService> | null = null;
 
-async function getDb(): Promise<any> {
+async function getDb(): Promise<cds.DatabaseService> {
     if (!dbPromise) {
         dbPromise = (async () => {
             await ensureNightgateModelLoaded();
@@ -93,23 +98,23 @@ export async function saveSyncState(args: SaveSyncStateArgs): Promise<void> {
 
     const previous = saveMutex.get(accountId) ?? Promise.resolve();
     const callId = Math.random().toString(36).slice(2, 8);
-    console.log(`[save-sync-state] ${callId} queued (accountId=${accountId.slice(0, 16)})`);
+    dbgSync(`[save-sync-state] ${callId} queued (accountId=${accountId.slice(0, 16)})`);
     const next = previous.then(async () => {
-        console.log(`[save-sync-state] ${callId} starting StorageEncryption ctor (PBKDF2)`);
+        dbgSync(`[save-sync-state] ${callId} starting StorageEncryption ctor (PBKDF2)`);
         const t0 = Date.now();
         const enc = new StorageEncryption(passphrase);
-        console.log(`[save-sync-state] ${callId} StorageEncryption ctor done in ${Date.now() - t0}ms`);
+        dbgSync(`[save-sync-state] ${callId} StorageEncryption ctor done in ${Date.now() - t0}ms`);
         const shieldedCipher   = states.shielded   ? enc.encrypt(states.shielded)   : null;
         const unshieldedCipher = states.unshielded ? enc.encrypt(states.unshielded) : null;
         const dustCipher       = states.dust       ? enc.encrypt(states.dust)       : null;
-        console.log(`[save-sync-state] ${callId} encrypt done in ${Date.now() - t0}ms`);
+        dbgSync(`[save-sync-state] ${callId} encrypt done in ${Date.now() - t0}ms`);
 
         const now = new Date().toISOString();
         const t1 = Date.now();
         const existing = await db.run(
             SELECT.one.from(WalletSyncStates).where({ accountId })
         );
-        console.log(`[save-sync-state] ${callId} SELECT done in ${Date.now() - t1}ms, existing=${!!existing}`);
+        dbgSync(`[save-sync-state] ${callId} SELECT done in ${Date.now() - t1}ms, existing=${!!existing}`);
 
         if (existing) {
             const t2 = Date.now();
@@ -126,7 +131,7 @@ export async function saveSyncState(args: SaveSyncStateArgs): Promise<void> {
                     })
                     .where({ accountId })
             );
-            console.log(`[save-sync-state] ${callId} UPDATE done in ${Date.now() - t2}ms`);
+            dbgSync(`[save-sync-state] ${callId} UPDATE done in ${Date.now() - t2}ms`);
         } else {
             const t2 = Date.now();
             await db.run(
@@ -140,9 +145,9 @@ export async function saveSyncState(args: SaveSyncStateArgs): Promise<void> {
                     updatedAt:           now
                 })
             );
-            console.log(`[save-sync-state] ${callId} INSERT done in ${Date.now() - t2}ms`);
+            dbgSync(`[save-sync-state] ${callId} INSERT done in ${Date.now() - t2}ms`);
         }
-        console.log(`[save-sync-state] ${callId} chain complete`);
+        dbgSync(`[save-sync-state] ${callId} chain complete`);
     });
 
     // The mutex tracks the rejection-safe chain so the next caller waits even

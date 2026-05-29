@@ -26,7 +26,7 @@ import {
 import { ensureNetworkId } from '../midnight/providers';
 import { getOrBuildWalletFacade } from '../submission/wallet-facade-builder';
 import { walletWaitForSyncedState } from '../midnight/wallet-worker-client';
-import { resolveNightgateRuntimeConfig, getNightgatePluginConfig } from '../utils/nightgate-config';
+import { resolveNightgateRuntimeConfig, getNightgatePluginConfig, mainnetSubmissionBlockReason } from '../utils/nightgate-config';
 import { startJob } from '../submission/background-jobs';
 import { mnemonicToBip39SeedHex } from '../utils/wallet-hd';
 
@@ -78,6 +78,20 @@ const diagnosticsRateLimiter = new RateLimiter({
 });
 
 const MAX_NIGHT_AMOUNT_ATOMS = 10n ** 18n;
+
+/**
+ * Mainnet submission gate (shared with the contract-submission handlers). Rejects
+ * with 403 when network is mainnet and allowMainnetSubmission is not enabled.
+ * Applied to the on-chain token/dust actions; read-only diagnostics are exempt.
+ */
+function rejectIfMainnetBlocked(req: Request): boolean {
+    const reason = mainnetSubmissionBlockReason(getNightgatePluginConfig());
+    if (reason) {
+        req.reject?.(403, reason);
+        return true;
+    }
+    return false;
+}
 
 /**
  * Parse a NIGHT-atom decimal string into a bigint, returning a discriminator
@@ -348,6 +362,7 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
     });
 
     srv.on('registerForDustGeneration', async (req: Request) => {
+        if (rejectIfMainnetBlocked(req)) return;
         const clientKey = (req as any)?._.req?.ip || 'global';
         const rate = dustRegRateLimiter.check(clientKey);
         if (!rate.allowed) {
@@ -421,6 +436,7 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
     });
 
     srv.on('deregisterFromDustGeneration', async (req: Request) => {
+        if (rejectIfMainnetBlocked(req)) return;
         const clientKey = (req as any)?._.req?.ip || 'global';
         const rate = dustRegRateLimiter.check(clientKey);
         if (!rate.allowed) {
@@ -470,6 +486,7 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
     });
 
     srv.on('sendNight', async (req: Request) => {
+        if (rejectIfMainnetBlocked(req)) return;
         const clientKey = (req as any)?._.req?.ip || 'global';
         const rate = sendRateLimiter.check(clientKey);
         if (!rate.allowed) {
@@ -546,6 +563,7 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
     });
 
     srv.on('unshieldFunds', async (req: Request) => {
+        if (rejectIfMainnetBlocked(req)) return;
         const clientKey = (req as any)?._.req?.ip || 'global';
         const rate = swapRateLimiter.check(clientKey);
         if (!rate.allowed) {
@@ -606,6 +624,7 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
     });
 
     srv.on('shieldFunds', async (req: Request) => {
+        if (rejectIfMainnetBlocked(req)) return;
         const clientKey = (req as any)?._.req?.ip || 'global';
         const rate = swapRateLimiter.check(clientKey);
         if (!rate.allowed) {
