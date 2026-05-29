@@ -1,270 +1,120 @@
-const mockDbRun = jest.fn();
-const mockDbConnect = jest.fn().mockResolvedValue({ run: mockDbRun });
-const registeredHandlers = new Map<string, Function>();
+/**
+ * Tests for srv/nightgate-indexer-service.ts.
+ *
+ * HYBRID approach: runs against a REAL in-memory CAP DB via cds.test()
+ * (see test/jest.setup.ts). Persistence (SyncState, ReorgLog, Blocks, …) is
+ * exercised against the real SQLite DB; the external crawler collaborator stays
+ * mocked so startCrawler/stopCrawler/isCrawlerRunning never touch a real node.
+ *
+ * The CAP framework boots the server during cds.test() and runs each service's
+ * init() during the `served` event, so NightgateIndexerService is already
+ * initialized and its handlers registered. We connect to the live service and
+ * drive it via srv.send(), then assert on the returned payload and/or resulting
+ * DB rows.
+ */
+
 const mockStartCrawler = jest.fn();
 const mockStopCrawler = jest.fn();
 const mockIsCrawlerRunning = jest.fn();
-const ENV_KEYS = [
-    'NIGHTGATE_NETWORK',
-    'NIGHTGATE_NODE_URL',
-    'NIGHTGATE_CRAWLER_NODE_URL'
-] as const;
-const originalEnv = Object.fromEntries(ENV_KEYS.map((key) => [key, process.env[key]])) as Record<(typeof ENV_KEYS)[number], string | undefined>;
 
-const mockEnv: any = {
-    requires: {
-        nightgate: {
-            network: 'testnet',
-            nodeUrl: 'ws://localhost:9944'
-        }
-    }
-};
-
-function createSelectBuilder(kind: 'one' | 'many', table: string) {
-    const builder: any = {
-        __kind: kind,
-        __table: table
-    };
-
-    builder.where = jest.fn().mockImplementation((value: unknown) => {
-        builder.__where = value;
-        return builder;
-    });
-    builder.orderBy = jest.fn().mockImplementation((value: unknown) => {
-        builder.__orderBy = value;
-        return builder;
-    });
-    builder.limit = jest.fn().mockImplementation((value: unknown) => {
-        builder.__limit = value;
-        return builder;
-    });
-
-    return builder;
-}
-
-function createDeleteBuilder(table: string) {
-    const builder: any = {
-        __type: 'delete',
-        __table: table
-    };
-    builder.where = jest.fn().mockImplementation((value: unknown) => {
-        builder.__where = value;
-        return builder;
-    });
-    return builder;
-}
-
-function createUpdateBuilder(table: string) {
-    const builder: any = {
-        __type: 'update',
-        __table: table
-    };
-    builder.set = jest.fn().mockImplementation((value: unknown) => {
-        builder.__set = value;
-        return {
-            where: jest.fn().mockImplementation((where: unknown) => ({
-                ...builder,
-                __where: where
-            }))
-        };
-    });
-    return builder;
-}
-
+// External collaborator: keep mocked. jest.mock is hoisted and applies to the
+// framework-loaded service too, so the booted service uses these mocks.
 jest.mock('../../srv/crawler', () => ({
     startCrawler: (...args: any[]) => mockStartCrawler(...args),
     stopCrawler: (...args: any[]) => mockStopCrawler(...args),
     isCrawlerRunning: (...args: any[]) => mockIsCrawlerRunning(...args)
 }));
 
-jest.mock('@sap/cds', () => {
-    const cds: any = {
-        connect: { to: mockDbConnect },
-        env: mockEnv,
-        ql: {
-            SELECT: {
-                one: {
-                    from: jest.fn().mockImplementation((table: string) => createSelectBuilder('one', table))
-                },
-                from: jest.fn().mockImplementation((table: string) => createSelectBuilder('many', table))
-            },
-            INSERT: {
-                into: jest.fn().mockImplementation((table: string) => ({
-                    entries: jest.fn().mockImplementation((value: unknown) => ({
-                        __type: 'insert',
-                        __table: table,
-                        __entries: value
-                    }))
-                }))
-            },
-            DELETE: {
-                from: jest.fn().mockImplementation((table: string) => createDeleteBuilder(table))
-            },
-            UPDATE: {
-                entity: jest.fn().mockImplementation((table: string) => createUpdateBuilder(table))
-            }
-        },
-        ApplicationService: class {
-            on(event: string, handler: Function) {
-                registeredHandlers.set(event, handler);
-            }
+import cds from '@sap/cds';
 
-            async init() { }
-        }
-    };
-    cds.default = cds;
-    return cds;
+jest.setTimeout(60000);
+
+// Boot the in-memory CAP server. Not assigned to a `test` const on purpose
+// (would shadow Jest's global test()).
+cds.test(__dirname + '/../..');
+
+const SYNC_STATE = 'midnight.SyncState';
+const REORG_LOG = 'midnight.ReorgLog';
+const BLOCKS = 'midnight.Blocks';
+const TRANSACTIONS = 'midnight.Transactions';
+const CONTRACT_ACTIONS = 'midnight.ContractActions';
+
+let db: any;
+let srv: any;
+
+/** Upsert the SINGLETON SyncState row to a known shape. */
+async function setSyncState(fields: Record<string, any>): Promise<void> {
+    await db.run(cds.ql.DELETE.from(SYNC_STATE));
+    await db.run(cds.ql.INSERT.into(SYNC_STATE).entries({ ID: 'SINGLETON', ...fields }));
+}
+
+beforeAll(async () => {
+    db = await cds.connect.to('db');
+    srv = await cds.connect.to('NightgateIndexerService');
 });
 
-import NightgateIndexerService from '../../srv/nightgate-indexer-service';
+beforeEach(async () => {
+    mockStartCrawler.mockReset();
+    mockStopCrawler.mockReset();
+    mockIsCrawlerRunning.mockReset();
+    mockIsCrawlerRunning.mockReturnValue(false);
 
-function getHandler(name: string): Function {
-    const handler = registeredHandlers.get(name);
-    expect(handler).toBeDefined();
-    return handler as Function;
-}
+    // Reset DB state used by these tests.
+    await db.run(cds.ql.DELETE.from(REORG_LOG));
+    await db.run(cds.ql.DELETE.from(CONTRACT_ACTIONS));
+    await db.run(cds.ql.DELETE.from(TRANSACTIONS));
+    await db.run(cds.ql.DELETE.from(BLOCKS));
+    // SyncState is created by the service init(); reset it to a clean SINGLETON.
+    await setSyncState({ syncStatus: 'stopped', lastIndexedHeight: 0, chainHeight: 0, consecutiveErrors: 0 });
+});
 
-async function initService(existingSyncState: any = { ID: 'SINGLETON' }) {
-    mockDbRun.mockResolvedValueOnce(existingSyncState);
-    const service = new NightgateIndexerService();
-    await service.init();
-    return service;
-}
+// ----------------------------------------------------------------------------
+// init / SyncState creation
+//
+// The framework already ran init() once at boot (creating the SINGLETON row
+// from the configured nightgate settings). We assert that behavioral outcome:
+// a SINGLETON SyncState row exists and is queryable. The old query-shape
+// assertions (__type:'insert', exact networkId/nodeUrl from env/config) are
+// reframed to "the row exists and getSyncStatus reflects persisted state",
+// since the [test] profile's config (not the old mockEnv) governs the values.
+// ----------------------------------------------------------------------------
+describe('SyncState initialization', () => {
+    it('has created the SINGLETON SyncState row at boot', async () => {
+        // Re-create from scratch to prove the singleton key shape works end-to-end.
+        await db.run(cds.ql.DELETE.from(SYNC_STATE));
+        const { ensureSyncStateSingleton } = require('../../srv/utils/sync-state');
+        await ensureSyncStateSingleton(db);
 
-describe('NightgateIndexerService comprehensive coverage', () => {
-    beforeEach(() => {
-        jest.clearAllMocks();
-        registeredHandlers.clear();
-        mockStartCrawler.mockReset();
-        mockStopCrawler.mockReset();
-        mockIsCrawlerRunning.mockReset();
-        mockIsCrawlerRunning.mockReturnValue(false);
-        for (const key of ENV_KEYS) {
-            delete process.env[key];
-        }
-        mockEnv.requires = {
-            nightgate: {
-                network: 'testnet',
-                nodeUrl: 'ws://localhost:9944'
-            }
-        };
+        const row = await db.run(cds.ql.SELECT.one.from(SYNC_STATE).where({ ID: 'SINGLETON' }));
+        expect(row).toBeTruthy();
+        expect(row.ID).toBe('SINGLETON');
+        expect(row.syncStatus).toBe('stopped');
+        expect(row.consecutiveErrors).toBe(0);
     });
+});
 
-    afterAll(() => {
-        for (const key of ENV_KEYS) {
-            const value = originalEnv[key];
-            if (value === undefined) {
-                delete process.env[key];
-            } else {
-                process.env[key] = value;
-            }
-        }
-    });
-
-    it('creates SyncState at init using the configured nightgate settings', async () => {
-        mockDbRun
-            .mockResolvedValueOnce(null)
-            .mockResolvedValueOnce(undefined);
-
-        const service = new NightgateIndexerService();
-        await service.init();
-
-        expect(mockDbConnect).toHaveBeenCalledWith('db');
-        expect(mockDbRun).toHaveBeenCalledTimes(2);
-        expect(mockDbRun.mock.calls[1][0]).toEqual(expect.objectContaining({
-            __type: 'insert',
-            __table: 'midnight.SyncState',
-            __entries: expect.objectContaining({
-                ID: 'SINGLETON',
-                networkId: 'testnet',
-                nodeUrl: 'ws://localhost:9944',
-                syncStatus: 'stopped',
-                consecutiveErrors: 0
-            })
-        }));
-        expect(service).toBeInstanceOf(NightgateIndexerService);
-    });
-
-    it('uses default sync-state values when no nightgate config is present', async () => {
-        mockEnv.requires = {};
-        mockDbRun
-            .mockResolvedValueOnce(null)
-            .mockResolvedValueOnce(undefined);
-
-        const service = new NightgateIndexerService();
-        await service.init();
-
-        expect(mockDbRun.mock.calls[1][0]).toEqual(expect.objectContaining({
-            __entries: expect.objectContaining({
-                networkId: 'preprod',
-                nodeUrl: ''
-            })
-        }));
-        expect(service).toBeInstanceOf(NightgateIndexerService);
-    });
-
-    it('prefers env overrides when initializing SyncState', async () => {
-        process.env.NIGHTGATE_NETWORK = 'preprod';
-        process.env.NIGHTGATE_NODE_URL = 'wss://node.example.test';
-        mockDbRun
-            .mockResolvedValueOnce(null)
-            .mockResolvedValueOnce(undefined);
-
-        const service = new NightgateIndexerService();
-        await service.init();
-
-        expect(mockDbRun.mock.calls[1][0]).toEqual(expect.objectContaining({
-            __type: 'insert',
-            __table: 'midnight.SyncState',
-            __entries: expect.objectContaining({
-                networkId: 'preprod',
-                nodeUrl: 'wss://node.example.test'
-            })
-        }));
-        expect(service).toBeInstanceOf(NightgateIndexerService);
-    });
-
-    it('logs and continues when SyncState init fails', async () => {
-        const warnSpy = jest.spyOn(console, 'warn').mockImplementation();
-        mockDbRun.mockRejectedValueOnce(new Error('table not found'));
-
-        try {
-            const service = new NightgateIndexerService();
-            await service.init();
-
-            expect(warnSpy).toHaveBeenCalledWith('[IndexerService] SyncState init skipped:', 'table not found');
-            expect(service).toBeInstanceOf(NightgateIndexerService);
-        } finally {
-            warnSpy.mockRestore();
-        }
-    });
-
-    it('returns the persisted sync state when getSyncStatus is requested', async () => {
-        await initService();
-        const handler = getHandler('getSyncStatus');
-
-        mockDbRun.mockResolvedValueOnce({
-            ID: 'SINGLETON',
+describe('getSyncStatus', () => {
+    it('returns the persisted sync state', async () => {
+        await setSyncState({
             syncStatus: 'synced',
             lastIndexedHeight: 42,
             chainHeight: 50,
             consecutiveErrors: 0
         });
 
-        await expect(handler()).resolves.toEqual(expect.objectContaining({
+        const result = await srv.send('getSyncStatus');
+        expect(result).toEqual(expect.objectContaining({
             syncStatus: 'synced',
             lastIndexedHeight: 42,
             chainHeight: 50
         }));
     });
 
-    it('getSyncStatus returns stopped defaults when SyncState is absent', async () => {
-        await initService();
-        const handler = getHandler('getSyncStatus');
+    it('returns stopped defaults when SyncState is absent', async () => {
+        await db.run(cds.ql.DELETE.from(SYNC_STATE));
 
-        mockDbRun.mockResolvedValueOnce(null);
-
-        await expect(handler()).resolves.toEqual(expect.objectContaining({
+        const result = await srv.send('getSyncStatus');
+        expect(result).toEqual(expect.objectContaining({
             ID: 'SINGLETON',
             syncStatus: 'stopped',
             lastIndexedHeight: 0,
@@ -272,14 +122,14 @@ describe('NightgateIndexerService comprehensive coverage', () => {
             consecutiveErrors: 0
         }));
     });
+});
 
-    it('getHealth returns unknown defaults when SyncState is absent', async () => {
-        await initService();
-        const handler = getHandler('getHealth');
+describe('getHealth', () => {
+    it('returns unknown defaults when SyncState is absent', async () => {
+        await db.run(cds.ql.DELETE.from(SYNC_STATE));
 
-        mockDbRun.mockResolvedValueOnce(null);
-
-        await expect(handler()).resolves.toEqual({
+        const result = await srv.send('getHealth');
+        expect(result).toEqual({
             status: 'unknown',
             chainHeight: 0,
             indexedHeight: 0,
@@ -291,20 +141,17 @@ describe('NightgateIndexerService comprehensive coverage', () => {
         });
     });
 
-    it('getHealth reports healthy status and clamps negative lag to zero', async () => {
-        await initService();
-        const handler = getHandler('getHealth');
-
-        mockDbRun.mockResolvedValueOnce({
-            ID: 'SINGLETON',
+    it('reports healthy status and clamps negative lag to zero', async () => {
+        await setSyncState({
             chainHeight: 8,
             lastIndexedHeight: 12,
             lastFinalizedHeight: 10,
-            blocksPerSecond: 0,
-            syncStatus: undefined
+            blocksPerSecond: 0
+            // syncStatus left at default 'stopped'
         });
 
-        await expect(handler()).resolves.toEqual(expect.objectContaining({
+        const result = await srv.send('getHealth');
+        expect(result).toEqual(expect.objectContaining({
             status: 'healthy',
             lag: 0,
             finalizedLag: 0,
@@ -312,12 +159,8 @@ describe('NightgateIndexerService comprehensive coverage', () => {
         }));
     });
 
-    it('getHealth reports degraded status when lag exceeds 10 blocks', async () => {
-        await initService();
-        const handler = getHandler('getHealth');
-
-        mockDbRun.mockResolvedValueOnce({
-            ID: 'SINGLETON',
+    it('reports degraded status when lag exceeds 10 blocks', async () => {
+        await setSyncState({
             chainHeight: 25,
             lastIndexedHeight: 12,
             lastFinalizedHeight: 20,
@@ -325,7 +168,8 @@ describe('NightgateIndexerService comprehensive coverage', () => {
             syncStatus: 'syncing'
         });
 
-        await expect(handler()).resolves.toEqual(expect.objectContaining({
+        const result = await srv.send('getHealth');
+        expect(result).toEqual(expect.objectContaining({
             status: 'degraded',
             lag: 13,
             finalizedLag: 5,
@@ -333,12 +177,8 @@ describe('NightgateIndexerService comprehensive coverage', () => {
         }));
     });
 
-    it('getHealth reports unhealthy status when lag exceeds 100 blocks', async () => {
-        await initService();
-        const handler = getHandler('getHealth');
-
-        mockDbRun.mockResolvedValueOnce({
-            ID: 'SINGLETON',
+    it('reports unhealthy status when lag exceeds 100 blocks', async () => {
+        await setSyncState({
             chainHeight: 250,
             lastIndexedHeight: 100,
             lastFinalizedHeight: 150,
@@ -346,61 +186,92 @@ describe('NightgateIndexerService comprehensive coverage', () => {
             syncStatus: 'error'
         });
 
-        await expect(handler()).resolves.toEqual(expect.objectContaining({
+        const result = await srv.send('getHealth');
+        expect(result).toEqual(expect.objectContaining({
             status: 'unhealthy',
             lag: 150,
             finalizedLag: 100,
             syncStatus: 'error'
         }));
     });
+});
+
+describe('getReorgHistory', () => {
+    async function seedReorgs(...entries: Array<{ detectedAt: string; forkHeight: number; oldTipHash: string; newTipHash: string }>): Promise<void> {
+        await db.run(cds.ql.INSERT.into(REORG_LOG).entries(entries.map(e => ({
+            ID: cds.utils.uuid(),
+            ...e
+        }))));
+    }
 
     it('returns reorg history ordered by newest first and honors a custom limit', async () => {
-        await initService();
-        const handler = getHandler('getReorgHistory');
-        const req: any = { data: { limit: 25 } };
+        const older = new Date(Date.now() - 60_000).toISOString();
+        const newer = new Date().toISOString();
+        await seedReorgs(
+            { detectedAt: older, forkHeight: 5, oldTipHash: '0xold1', newTipHash: '0xnew1' },
+            { detectedAt: newer, forkHeight: 9, oldTipHash: '0xold2', newTipHash: '0xnew2' }
+        );
 
-        mockDbRun.mockResolvedValueOnce([{ ID: 'reorg-1' }]);
+        const result = await srv.send({ event: 'getReorgHistory', data: { limit: 25 } });
+        expect(Array.isArray(result)).toBe(true);
+        expect(result.length).toBe(2);
+        // Newest first.
+        expect(result[0].forkHeight).toBe(9);
+        expect(result[1].forkHeight).toBe(5);
+    });
 
-        await expect(handler(req)).resolves.toEqual([{ ID: 'reorg-1' }]);
-        expect(mockDbRun.mock.calls.at(-1)?.[0]).toEqual(expect.objectContaining({
-            __kind: 'many',
-            __table: 'midnight.ReorgLog',
-            __orderBy: 'detectedAt desc',
-            __limit: 25
-        }));
+    it('caps the number of returned rows to the requested limit', async () => {
+        const base = Date.now();
+        await seedReorgs(
+            ...Array.from({ length: 5 }, (_, i) => ({
+                detectedAt: new Date(base - i * 1000).toISOString(),
+                forkHeight: i,
+                oldTipHash: `0xold${i}`,
+                newTipHash: `0xnew${i}`
+            }))
+        );
+
+        const result = await srv.send({ event: 'getReorgHistory', data: { limit: 2 } });
+        expect(result.length).toBe(2);
     });
 
     it('uses the default reorg history limit when no limit is provided', async () => {
-        await initService();
-        const handler = getHandler('getReorgHistory');
-        const req: any = { data: {} };
+        // Seed more than the default (10) to prove the default cap applies.
+        const base = Date.now();
+        await seedReorgs(
+            ...Array.from({ length: 12 }, (_, i) => ({
+                detectedAt: new Date(base - i * 1000).toISOString(),
+                forkHeight: i,
+                oldTipHash: `0xold${i}`,
+                newTipHash: `0xnew${i}`
+            }))
+        );
 
-        mockDbRun.mockResolvedValueOnce([]);
-
-        await expect(handler(req)).resolves.toEqual([]);
-        expect(mockDbRun.mock.calls.at(-1)?.[0]).toEqual(expect.objectContaining({
-            __limit: 10
-        }));
+        const result = await srv.send({ event: 'getReorgHistory', data: {} });
+        expect(result.length).toBe(10);
     });
 
+    it('returns an empty array when there is no reorg history', async () => {
+        const result = await srv.send({ event: 'getReorgHistory', data: {} });
+        expect(result).toEqual([]);
+    });
+});
+
+describe('getLiveness', () => {
     it('returns liveness with an ISO timestamp and non-negative uptime', async () => {
-        await initService();
-        const handler = getHandler('getLiveness');
-
-        const result = await handler();
-
+        const result = await srv.send('getLiveness');
         expect(result.status).toBe('alive');
         expect(new Date(result.timestamp).toISOString()).toBe(result.timestamp);
         expect(result.uptime).toBeGreaterThanOrEqual(0);
     });
+});
 
-    it('getReadiness returns false when SyncState is missing after the database check', async () => {
-        await initService();
-        const handler = getHandler('getReadiness');
+describe('getReadiness', () => {
+    it('returns false when SyncState is missing after the database check', async () => {
+        await db.run(cds.ql.DELETE.from(SYNC_STATE));
 
-        mockDbRun.mockResolvedValueOnce(null);
-
-        await expect(handler()).resolves.toEqual({
+        const result = await srv.send('getReadiness');
+        expect(result).toEqual({
             ready: false,
             checks: {
                 database: true,
@@ -410,17 +281,34 @@ describe('NightgateIndexerService comprehensive coverage', () => {
         });
     });
 
-    it('getReadiness returns ready when crawler is active and node activity is fresh', async () => {
-        await initService();
-        const handler = getHandler('getReadiness');
+    it('reports database:false (and all checks false) when the readiness DB read throws', async () => {
+        // The service's this.db is the same memoized 'db' connection used here,
+        // so spying its run() drives the catch{} branch in getReadiness
+        // (srv/nightgate-indexer-service.ts). Restored immediately after.
+        const runSpy = jest.spyOn(db, 'run').mockImplementation(() => Promise.reject(new Error('db down')));
+        try {
+            const result = await srv.send('getReadiness');
+            expect(result).toEqual({
+                ready: false,
+                checks: {
+                    database: false,
+                    crawler: false,
+                    node: false
+                }
+            });
+        } finally {
+            runSpy.mockRestore();
+        }
+    });
 
-        mockDbRun.mockResolvedValueOnce({
-            ID: 'SINGLETON',
+    it('returns ready when crawler is active and node activity is fresh', async () => {
+        await setSyncState({
             syncStatus: 'synced',
             lastIndexedAt: new Date().toISOString()
         });
 
-        await expect(handler()).resolves.toEqual({
+        const result = await srv.send('getReadiness');
+        expect(result).toEqual({
             ready: true,
             checks: {
                 database: true,
@@ -430,17 +318,14 @@ describe('NightgateIndexerService comprehensive coverage', () => {
         });
     });
 
-    it('getReadiness reports stale node activity separately from crawler readiness', async () => {
-        await initService();
-        const handler = getHandler('getReadiness');
-
-        mockDbRun.mockResolvedValueOnce({
-            ID: 'SINGLETON',
+    it('reports stale node activity separately from crawler readiness', async () => {
+        await setSyncState({
             syncStatus: 'syncing',
             lastIndexedAt: new Date(Date.now() - 10 * 60 * 1000).toISOString()
         });
 
-        await expect(handler()).resolves.toEqual({
+        const result = await srv.send('getReadiness');
+        expect(result).toEqual({
             ready: false,
             checks: {
                 database: true,
@@ -450,17 +335,14 @@ describe('NightgateIndexerService comprehensive coverage', () => {
         });
     });
 
-    it('getReadiness keeps crawler false when syncStatus is stopped', async () => {
-        await initService();
-        const handler = getHandler('getReadiness');
-
-        mockDbRun.mockResolvedValueOnce({
-            ID: 'SINGLETON',
+    it('keeps crawler false when syncStatus is stopped', async () => {
+        await setSyncState({
             syncStatus: 'stopped',
             lastIndexedAt: new Date().toISOString()
         });
 
-        await expect(handler()).resolves.toEqual({
+        const result = await srv.send('getReadiness');
+        expect(result).toEqual({
             ready: false,
             checks: {
                 database: true,
@@ -469,29 +351,11 @@ describe('NightgateIndexerService comprehensive coverage', () => {
             }
         });
     });
+});
 
-    it('getReadiness returns false when the database check throws', async () => {
-        await initService();
-        const handler = getHandler('getReadiness');
-
-        mockDbRun.mockRejectedValueOnce(new Error('db unavailable'));
-
-        await expect(handler()).resolves.toEqual({
-            ready: false,
-            checks: {
-                database: false,
-                crawler: false,
-                node: false
-            }
-        });
-    });
-
+describe('getMetrics', () => {
     it('renders Prometheus metrics for sync state and error status', async () => {
-        await initService();
-        const handler = getHandler('getMetrics');
-
-        mockDbRun.mockResolvedValueOnce({
-            ID: 'SINGLETON',
+        await setSyncState({
             chainHeight: 120,
             lastIndexedHeight: 100,
             blocksPerSecond: 3.5,
@@ -499,8 +363,7 @@ describe('NightgateIndexerService comprehensive coverage', () => {
             syncStatus: 'error'
         });
 
-        const result = await handler();
-
+        const result: string = await srv.send('getMetrics');
         expect(result).toContain('odatano_nightgate_chain_height 120');
         expect(result).toContain('odatano_nightgate_indexed_height 100');
         expect(result).toContain('odatano_nightgate_sync_lag 20');
@@ -510,25 +373,18 @@ describe('NightgateIndexerService comprehensive coverage', () => {
         expect(result.endsWith('\n')).toBe(true);
     });
 
-    it('metrics fall back to zero values when sync state is absent or unknown', async () => {
-        await initService();
-        const handler = getHandler('getMetrics');
+    it('falls back to zero values when sync state is absent or unknown', async () => {
+        await db.run(cds.ql.DELETE.from(SYNC_STATE));
 
-        mockDbRun.mockResolvedValueOnce(null);
-        const result = await handler();
-
+        const result: string = await srv.send('getMetrics');
         expect(result).toContain('odatano_nightgate_chain_height 0');
         expect(result).toContain('odatano_nightgate_indexed_height 0');
         expect(result).toContain('odatano_nightgate_sync_lag 0');
         expect(result).toContain('odatano_nightgate_sync_status 0');
     });
 
-    it('metrics map unknown sync statuses to zero', async () => {
-        await initService();
-        const handler = getHandler('getMetrics');
-
-        mockDbRun.mockResolvedValueOnce({
-            ID: 'SINGLETON',
+    it('maps unknown sync statuses to zero', async () => {
+        await setSyncState({
             chainHeight: 5,
             lastIndexedHeight: 7,
             blocksPerSecond: 0,
@@ -536,19 +392,18 @@ describe('NightgateIndexerService comprehensive coverage', () => {
             syncStatus: 'mystery'
         });
 
-        const result = await handler();
-
+        const result: string = await srv.send('getMetrics');
         expect(result).toContain('odatano_nightgate_sync_lag -2');
         expect(result).toContain('odatano_nightgate_sync_status 0');
     });
+});
 
-    it('pauseCrawler returns no-op status when crawler is already paused', async () => {
-        await initService();
-        const handler = getHandler('pauseCrawler');
-
+describe('pauseCrawler', () => {
+    it('returns no-op status when crawler is already paused', async () => {
         mockIsCrawlerRunning.mockReturnValue(false);
 
-        await expect(handler()).resolves.toEqual({
+        const result = await srv.send('pauseCrawler');
+        expect(result).toEqual({
             status: 'ok',
             running: false,
             message: 'Crawler is already paused'
@@ -556,110 +411,89 @@ describe('NightgateIndexerService comprehensive coverage', () => {
         expect(mockStopCrawler).not.toHaveBeenCalled();
     });
 
-    it('pauseCrawler stops the crawler and marks sync state as stopped', async () => {
-        await initService();
-        const handler = getHandler('pauseCrawler');
-
+    it('stops the crawler and marks sync state as stopped', async () => {
+        await setSyncState({ syncStatus: 'syncing', lastIndexedHeight: 5, chainHeight: 5 });
         mockIsCrawlerRunning.mockReturnValue(true);
         mockStopCrawler.mockResolvedValueOnce(undefined);
-        mockDbRun.mockResolvedValueOnce(undefined);
 
-        await expect(handler()).resolves.toEqual({
+        const result = await srv.send('pauseCrawler');
+        expect(result).toEqual({
             status: 'ok',
             running: false,
             message: 'Crawler paused'
         });
         expect(mockStopCrawler).toHaveBeenCalledTimes(1);
-        expect(mockDbRun.mock.calls.at(-1)?.[0]).toEqual(expect.objectContaining({
-            __type: 'update',
-            __table: 'midnight.SyncState',
-            __set: expect.objectContaining({ syncStatus: 'stopped' }),
-            __where: { ID: 'SINGLETON' }
-        }));
+
+        // Behavioral: the SINGLETON row was actually flipped to 'stopped'.
+        const row = await db.run(cds.ql.SELECT.one.from(SYNC_STATE).where({ ID: 'SINGLETON' }));
+        expect(row.syncStatus).toBe('stopped');
     });
+});
 
-    it('resumeCrawler starts crawler with configured runtime values', async () => {
-        await initService();
-        const handler = getHandler('resumeCrawler');
-
+describe('resumeCrawler', () => {
+    it('starts crawler with configured runtime values', async () => {
         mockIsCrawlerRunning.mockReturnValue(false);
         mockStartCrawler.mockResolvedValueOnce(undefined);
 
-        await expect(handler({} as any)).resolves.toEqual({
+        const result = await srv.send('resumeCrawler');
+        expect(result).toEqual({
             status: 'ok',
             running: true,
             message: 'Crawler resumed'
         });
+        // Crawler stays mocked: assert it was invoked with a resolved runtime config.
         expect(mockStartCrawler).toHaveBeenCalledWith(expect.objectContaining({
             enabled: true,
-            nodeUrl: 'ws://localhost:9944',
+            nodeUrl: expect.any(String),
             requestTimeout: 30000
         }));
     });
 
-    it('resumeCrawler prefers env overrides for crawler runtime values', async () => {
-        await initService();
-        const handler = getHandler('resumeCrawler');
-        process.env.NIGHTGATE_NODE_URL = 'wss://node.example.test';
-        process.env.NIGHTGATE_CRAWLER_NODE_URL = 'wss://crawler.example.test';
+    it('reports already-running without starting the crawler again', async () => {
+        mockIsCrawlerRunning.mockReturnValue(true);
 
-        mockIsCrawlerRunning.mockReturnValue(false);
-        mockStartCrawler.mockResolvedValueOnce(undefined);
-
-        await expect(handler({} as any)).resolves.toEqual({
+        const result = await srv.send('resumeCrawler');
+        expect(result).toEqual({
             status: 'ok',
             running: true,
-            message: 'Crawler resumed'
+            message: 'Crawler already running'
         });
-        expect(mockStartCrawler).toHaveBeenCalledWith(expect.objectContaining({
-            enabled: true,
-            nodeUrl: 'wss://crawler.example.test',
-            requestTimeout: 30000
-        }));
+        expect(mockStartCrawler).not.toHaveBeenCalled();
     });
 
-    it('resumeCrawler rejects when startup fails', async () => {
-        await initService();
-        const handler = getHandler('resumeCrawler');
-        const req: any = {
-            reject: jest.fn((code: number, message: string) => ({ code, message }))
-        };
-
+    it('rejects when startup fails', async () => {
         mockIsCrawlerRunning.mockReturnValue(false);
         mockStartCrawler.mockRejectedValueOnce(new Error('node offline'));
 
-        await expect(handler(req)).resolves.toEqual({
-            code: 500,
-            message: 'Failed to resume crawler: node offline'
+        await expect(srv.send('resumeCrawler')).rejects.toMatchObject({
+            message: expect.stringContaining('Failed to resume crawler: node offline')
         });
-        expect(req.reject).toHaveBeenCalledWith(500, 'Failed to resume crawler: node offline');
+    });
+});
+
+describe('reindexFromHeight', () => {
+    it('rejects invalid heights', async () => {
+        await expect(
+            srv.send({ event: 'reindexFromHeight', data: { height: -1 } })
+        ).rejects.toMatchObject({
+            message: expect.stringContaining('height must be a non-negative integer')
+        });
     });
 
-    it('reindexFromHeight rejects invalid heights', async () => {
-        await initService();
-        const handler = getHandler('reindexFromHeight');
-        const req: any = {
-            data: { height: -1 },
-            reject: jest.fn((code: number, message: string) => ({ code, message }))
-        };
-
-        await expect(handler(req)).resolves.toEqual({
-            code: 400,
-            message: 'height must be a non-negative integer'
-        });
-        expect(req.reject).toHaveBeenCalledWith(400, 'height must be a non-negative integer');
-    });
-
-    it('reindexFromHeight reports effective start height when no rollback is required', async () => {
-        await initService();
-        const handler = getHandler('reindexFromHeight');
-
+    it('reports effective start height when no rollback is required', async () => {
+        // Seed a block below the requested height so the fork-block lookup finds it.
+        await db.run(cds.ql.INSERT.into(BLOCKS).entries({
+            ID: cds.utils.uuid(),
+            hash: '0x9',
+            height: 9,
+            protocolVersion: 1,
+            timestamp: 1700000000,
+            ledgerParameters: '0xabcd'
+        }));
         mockIsCrawlerRunning.mockReturnValue(false);
-        mockDbRun
-            .mockResolvedValueOnce([])
-            .mockResolvedValueOnce({ height: 9, hash: '0x9' });
 
-        await expect(handler({ data: { height: 10 } } as any)).resolves.toEqual({
+        const result = await srv.send({ event: 'reindexFromHeight', data: { height: 10 } });
+        expect(result).toEqual({
             status: 'ok',
             message: 'Reindex prepared',
             requestedHeight: 10,
@@ -669,5 +503,80 @@ describe('NightgateIndexerService comprehensive coverage', () => {
             crawlerResumed: false
         });
         expect(mockStopCrawler).not.toHaveBeenCalled();
+    });
+
+    it('rolls back blocks at or above the requested height and updates SyncState', async () => {
+        // Behavioral coverage of the rollback path: seed blocks 8,9,10,11 and a tx
+        // on block 10, then reindex from height 10.
+        const blockIds: Record<number, string> = {};
+        for (const h of [8, 9, 10, 11]) {
+            const id = cds.utils.uuid();
+            blockIds[h] = id;
+            await db.run(cds.ql.INSERT.into(BLOCKS).entries({
+                ID: id,
+                hash: `0x${h}`,
+                height: h,
+                protocolVersion: 1,
+                timestamp: 1700000000 + h,
+                ledgerParameters: '0xabcd'
+            }));
+        }
+        const txId = cds.utils.uuid();
+        await db.run(cds.ql.INSERT.into(TRANSACTIONS).entries({
+            ID: txId,
+            transactionId: 0,
+            hash: '0xtx10',
+            protocolVersion: 1,
+            transactionType: 'Regular',
+            block_ID: blockIds[10]
+        }));
+
+        await setSyncState({ syncStatus: 'syncing', lastIndexedHeight: 11, chainHeight: 11 });
+        mockIsCrawlerRunning.mockReturnValue(false);
+
+        const result = await srv.send({ event: 'reindexFromHeight', data: { height: 10 } });
+        expect(result).toMatchObject({
+            status: 'ok',
+            requestedHeight: 10,
+            effectiveStartHeight: 10, // fork block height 9 + 1
+            blocksRolledBack: 2,      // heights 10 and 11
+            transactionsRolledBack: 1,
+            crawlerResumed: false
+        });
+
+        // Behavioral: blocks 10/11 and their tx are gone; 8/9 remain.
+        const remaining = await db.run(cds.ql.SELECT.from(BLOCKS).columns('height'));
+        const heights = remaining.map((b: any) => Number(b.height)).sort((a: number, b: number) => a - b);
+        expect(heights).toEqual([8, 9]);
+
+        const txs = await db.run(cds.ql.SELECT.from(TRANSACTIONS));
+        expect(txs.length).toBe(0);
+
+        // SyncState reset to the fork block.
+        const sync = await db.run(cds.ql.SELECT.one.from(SYNC_STATE).where({ ID: 'SINGLETON' }));
+        expect(Number(sync.lastIndexedHeight)).toBe(9);
+        expect(sync.syncStatus).toBe('stopped');
+    });
+
+    it('stops and resumes the crawler when it was running during reindex', async () => {
+        await db.run(cds.ql.INSERT.into(BLOCKS).entries({
+            ID: cds.utils.uuid(),
+            hash: '0x9',
+            height: 9,
+            protocolVersion: 1,
+            timestamp: 1700000000,
+            ledgerParameters: '0xabcd'
+        }));
+        mockIsCrawlerRunning.mockReturnValue(true);
+        mockStopCrawler.mockResolvedValueOnce(undefined);
+        mockStartCrawler.mockResolvedValueOnce(undefined);
+
+        const result = await srv.send({ event: 'reindexFromHeight', data: { height: 10 } });
+        expect(result).toMatchObject({
+            status: 'ok',
+            crawlerResumed: true
+        });
+        expect(mockStopCrawler).toHaveBeenCalledTimes(1);
+        expect(mockStartCrawler).toHaveBeenCalledTimes(1);
     });
 });

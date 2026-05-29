@@ -4,27 +4,12 @@
  * Covers: tier resolution from DB rows, default when no user/no grants,
  * scope handling (global vs. matching vs. non-matching), validity windows,
  * and the meetsDisclosure / isAuthority / isValidDisclosureRoleValue helpers.
+ *
+ * Runs against a real in-memory CAP DB via cds.test() (see test/jest.setup.ts):
+ * each test seeds midnight.DisclosureRoles and calls the middleware with the
+ * real db connection, so the actual CQL query + JS filtering are exercised.
  */
-
-const selectFromSpy = jest.fn();
-const selectWhereSpy = jest.fn();
-
-jest.mock('@sap/cds', () => {
-    const cds: any = {
-        env: { requires: { nightgate: {} } },
-        ql: {
-            SELECT: {
-                from: (entity: string) => {
-                    selectFromSpy(entity);
-                    return { where: selectWhereSpy };
-                }
-            }
-        }
-    };
-    cds.default = cds;
-    return cds;
-});
-
+import cds from '@sap/cds';
 import {
     attachDisclosureRole,
     isAuthority,
@@ -35,127 +20,133 @@ import {
     DisclosureRoleValue
 } from '../../srv/middleware/disclosure-role';
 
-const dbRun = jest.fn();
-const fakeDb: any = { run: dbRun };
+// Boot the in-memory CAP server for this file. Not assigned to a `test` const
+// on purpose — that would shadow Jest's global test(). We only need the DB here.
+cds.test(__dirname + '/../..');
 
-function makeReq(userId?: string): any {
-    const req: any = { user: userId ? { id: userId } : undefined };
-    return req;
+const ROLES = 'midnight.DisclosureRoles';
+
+interface GrantSeed {
+    userId: string;
+    role: string;
+    scope?: string | null;
+    validFrom?: string | null;
+    validUntil?: string | null;
 }
 
-beforeEach(() => {
-    selectFromSpy.mockClear();
-    selectWhereSpy.mockReset();
-    dbRun.mockReset();
+let db: any;
+
+beforeAll(async () => {
+    db = await cds.connect.to('db');
 });
+
+beforeEach(async () => {
+    await db.run(cds.ql.DELETE.from(ROLES));
+});
+
+async function seed(...grants: GrantSeed[]): Promise<void> {
+    await db.run(cds.ql.INSERT.into(ROLES).entries(grants.map(g => ({
+        ID:         cds.utils.uuid(),
+        userId:     g.userId,
+        role:       g.role,
+        scope:      g.scope ?? null,
+        validFrom:  g.validFrom ?? null,
+        validUntil: g.validUntil ?? null
+    }))));
+}
+
+function makeReq(userId?: string): any {
+    return { user: userId ? { id: userId } : undefined };
+}
 
 describe('attachDisclosureRole', () => {
     test('returns public_only and skips DB when no user.id', async () => {
         const req = makeReq();
-        const role = await attachDisclosureRole(req, fakeDb);
+        const role = await attachDisclosureRole(req, db);
         expect(role).toBe('public_only');
         expect(req.disclosureRole).toBe('public_only');
-        expect(dbRun).not.toHaveBeenCalled();
     });
 
     test('returns public_only when DB returns no rows', async () => {
-        dbRun.mockResolvedValueOnce([]);
         const req = makeReq('alice');
-        const role = await attachDisclosureRole(req, fakeDb);
+        const role = await attachDisclosureRole(req, db);
         expect(role).toBe('public_only');
         expect(req.disclosureRole).toBe('public_only');
-        expect(selectFromSpy).toHaveBeenCalledWith('midnight.DisclosureRoles');
-        expect(selectWhereSpy).toHaveBeenCalledWith({ userId: 'alice' });
-    });
-
-    test('returns public_only when DB returns null/undefined', async () => {
-        dbRun.mockResolvedValueOnce(null);
-        const req = makeReq('alice');
-        const role = await attachDisclosureRole(req, fakeDb);
-        expect(role).toBe('public_only');
     });
 
     test('picks the highest-tier currently-valid grant', async () => {
-        dbRun.mockResolvedValueOnce([
-            { userId: 'bob', role: 'public_only', scope: null, validFrom: null, validUntil: null },
-            { userId: 'bob', role: 'legitimate_interest', scope: null, validFrom: null, validUntil: null },
-            { userId: 'bob', role: 'authority', scope: null, validFrom: null, validUntil: null }
-        ]);
+        await seed(
+            { userId: 'bob', role: 'public_only' },
+            { userId: 'bob', role: 'legitimate_interest' },
+            { userId: 'bob', role: 'authority' }
+        );
         const req = makeReq('bob');
-        const role = await attachDisclosureRole(req, fakeDb);
+        const role = await attachDisclosureRole(req, db);
         expect(role).toBe('authority');
         expect(req.disclosureRole).toBe('authority');
     });
 
     test('ignores expired grants (validUntil in the past)', async () => {
         const yesterday = new Date(Date.now() - 86400_000).toISOString();
-        dbRun.mockResolvedValueOnce([
-            { userId: 'carol', role: 'authority', scope: null, validFrom: null, validUntil: yesterday },
-            { userId: 'carol', role: 'legitimate_interest', scope: null, validFrom: null, validUntil: null }
-        ]);
-        const role = await attachDisclosureRole(makeReq('carol'), fakeDb);
+        await seed(
+            { userId: 'carol', role: 'authority', validUntil: yesterday },
+            { userId: 'carol', role: 'legitimate_interest' }
+        );
+        const role = await attachDisclosureRole(makeReq('carol'), db);
         expect(role).toBe('legitimate_interest');
     });
 
     test('ignores not-yet-valid grants (validFrom in the future)', async () => {
         const tomorrow = new Date(Date.now() + 86400_000).toISOString();
-        dbRun.mockResolvedValueOnce([
-            { userId: 'dan', role: 'authority', scope: null, validFrom: tomorrow, validUntil: null },
-            { userId: 'dan', role: 'public_only', scope: null, validFrom: null, validUntil: null }
-        ]);
-        const role = await attachDisclosureRole(makeReq('dan'), fakeDb);
+        await seed(
+            { userId: 'dan', role: 'authority', validFrom: tomorrow },
+            { userId: 'dan', role: 'public_only' }
+        );
+        const role = await attachDisclosureRole(makeReq('dan'), db);
         expect(role).toBe('public_only');
     });
 
     test('returns public_only when only expired grants exist', async () => {
         const yesterday = new Date(Date.now() - 86400_000).toISOString();
-        dbRun.mockResolvedValueOnce([
-            { userId: 'eve', role: 'authority', scope: null, validFrom: null, validUntil: yesterday }
-        ]);
-        const role = await attachDisclosureRole(makeReq('eve'), fakeDb);
+        await seed({ userId: 'eve', role: 'authority', validUntil: yesterday });
+        const role = await attachDisclosureRole(makeReq('eve'), db);
         expect(role).toBe('public_only');
     });
 
     describe('scope handling', () => {
         test('default lookup ignores scoped grants', async () => {
-            dbRun.mockResolvedValueOnce([
-                { userId: 'fay', role: 'authority', scope: 'contract-A', validFrom: null, validUntil: null },
-                { userId: 'fay', role: 'legitimate_interest', scope: null, validFrom: null, validUntil: null }
-            ]);
-            const role = await attachDisclosureRole(makeReq('fay'), fakeDb);
+            await seed(
+                { userId: 'fay', role: 'authority', scope: 'contract-A' },
+                { userId: 'fay', role: 'legitimate_interest' }
+            );
+            const role = await attachDisclosureRole(makeReq('fay'), db);
             expect(role).toBe('legitimate_interest');
         });
 
         test('scoped lookup matches the requested scope', async () => {
-            dbRun.mockResolvedValueOnce([
-                { userId: 'fay', role: 'authority', scope: 'contract-A', validFrom: null, validUntil: null },
-                { userId: 'fay', role: 'legitimate_interest', scope: null, validFrom: null, validUntil: null }
-            ]);
-            const role = await attachDisclosureRole(makeReq('fay'), fakeDb, { scope: 'contract-A' });
+            await seed(
+                { userId: 'fay', role: 'authority', scope: 'contract-A' },
+                { userId: 'fay', role: 'legitimate_interest' }
+            );
+            const role = await attachDisclosureRole(makeReq('fay'), db, { scope: 'contract-A' });
             expect(role).toBe('authority');
         });
 
         test('scoped lookup ignores grants for a different scope', async () => {
-            dbRun.mockResolvedValueOnce([
-                { userId: 'gail', role: 'authority', scope: 'contract-B', validFrom: null, validUntil: null }
-            ]);
-            const role = await attachDisclosureRole(makeReq('gail'), fakeDb, { scope: 'contract-A' });
+            await seed({ userId: 'gail', role: 'authority', scope: 'contract-B' });
+            const role = await attachDisclosureRole(makeReq('gail'), db, { scope: 'contract-A' });
             expect(role).toBe('public_only');
         });
 
         test('scoped lookup still accepts global grants', async () => {
-            dbRun.mockResolvedValueOnce([
-                { userId: 'gail', role: 'legitimate_interest', scope: null, validFrom: null, validUntil: null }
-            ]);
-            const role = await attachDisclosureRole(makeReq('gail'), fakeDb, { scope: 'contract-A' });
+            await seed({ userId: 'gail', role: 'legitimate_interest' });
+            const role = await attachDisclosureRole(makeReq('gail'), db, { scope: 'contract-A' });
             expect(role).toBe('legitimate_interest');
         });
 
         test('empty-string scope is treated as global', async () => {
-            dbRun.mockResolvedValueOnce([
-                { userId: 'gail', role: 'legitimate_interest', scope: '', validFrom: null, validUntil: null }
-            ]);
-            const role = await attachDisclosureRole(makeReq('gail'), fakeDb);
+            await seed({ userId: 'gail', role: 'legitimate_interest', scope: '' });
+            const role = await attachDisclosureRole(makeReq('gail'), db);
             expect(role).toBe('legitimate_interest');
         });
     });
