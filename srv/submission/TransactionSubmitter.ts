@@ -40,6 +40,7 @@
 
 import cds from '@sap/cds';
 const { INSERT, UPDATE } = cds.ql;
+import { PendingSubmissions } from '#cds-models/midnight';
 import { ensureNightgateModelLoaded } from '../utils/cds-model';
 import {
     type ContractProvidersConfig,
@@ -364,7 +365,7 @@ export class TransactionSubmitter {
     ): Promise<string> {
         const db = await this.getDb();
         const submissionId = cds.utils.uuid();
-        await db.run(INSERT.into('midnight.PendingSubmissions').entries({
+        await db.run(INSERT.into(PendingSubmissions).entries({
             ID: submissionId,
             txHash: null,
             contractAddress,
@@ -380,14 +381,14 @@ export class TransactionSubmitter {
     private async updateAfterSdk(submissionId: string, patch: Record<string, unknown>): Promise<void> {
         const db = await this.getDb();
         await db.run(
-            UPDATE.entity('midnight.PendingSubmissions').set(patch).where({ ID: submissionId })
+            UPDATE.entity(PendingSubmissions).set(patch).where({ ID: submissionId })
         );
     }
 
     private async markFailed(submissionId: string, classification: SubmissionErrorClassification): Promise<void> {
         const db = await this.getDb();
         await db.run(
-            UPDATE.entity('midnight.PendingSubmissions').set({
+            UPDATE.entity(PendingSubmissions).set({
                 status: 'failed',
                 errorCode: classification.code,
                 errorMessage: classification.message.slice(0, 500)
@@ -471,7 +472,7 @@ export async function reconcilePendingSubmission(
 ): Promise<void> {
     if (!txHash) return;
     await db.run(
-        UPDATE.entity('midnight.PendingSubmissions').set({
+        UPDATE.entity(PendingSubmissions).set({
             status: 'finalized',
             finalizedAt: new Date().toISOString(),
             finalizedTxData: JSON.stringify(indexedTxSnapshot)

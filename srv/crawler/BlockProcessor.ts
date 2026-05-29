@@ -23,6 +23,10 @@ import { ensureNightgateModelLoaded } from '../utils/cds-model';
 import { getNightgatePluginConfig } from '../utils/nightgate-config';
 import { parseExtrinsicCallIndices, parseExtrinsicParticipantInfo } from '../utils/scale';
 import { reconcilePendingSubmission } from '../submission/TransactionSubmitter';
+import {
+    Blocks, Transactions, TransactionResults, TransactionFees, ContractActions,
+    UnshieldedUtxos, NightBalances, SyncState
+} from '#cds-models/midnight';
 
 /**
  * Mapping of pallet index to human-readable name and transaction type.
@@ -243,7 +247,7 @@ export class BlockProcessor {
         const truthyHashes = hashes.filter((h): h is string => !!h);
         const existing: Array<{ hash: string }> = truthyHashes.length
             ? (await this.db.run(
-                SELECT.from('midnight.Blocks').columns('hash').where({ hash: { in: truthyHashes } })
+                SELECT.from(Blocks).columns('hash').where({ hash: { in: truthyHashes } })
               ) || [])
             : [];
         const existingSet = new Set(existing.map(r => r.hash));
@@ -345,7 +349,7 @@ export class BlockProcessor {
      */
     async blockExists(hash: string): Promise<boolean> {
         const existing = await this.db.run(
-            SELECT.one.from('midnight.Blocks').columns('ID').where({ hash })
+            SELECT.one.from(Blocks).columns('ID').where({ hash })
         );
         return !!existing;
     }
@@ -400,10 +404,10 @@ export class BlockProcessor {
             // 1. Insert block
             const blockId = cds.utils.uuid();
             const parentBlock = await tx.run(
-                SELECT.one.from('midnight.Blocks').columns('ID').where({ hash: header.parentHash })
+                SELECT.one.from(Blocks).columns('ID').where({ hash: header.parentHash })
             );
 
-            await tx.run(INSERT.into('midnight.Blocks').entries({
+            await tx.run(INSERT.into(Blocks).entries({
                 ID: blockId,
                 hash: blockHash,
                 height: height,
@@ -514,10 +518,10 @@ export class BlockProcessor {
             }
 
             // Bulk inserts: one statement per table regardless of tx count.
-            if (txRows.length)             await tx.run(INSERT.into('midnight.Transactions').entries(txRows));
-            if (txResultRows.length)       await tx.run(INSERT.into('midnight.TransactionResults').entries(txResultRows));
-            if (txFeeRows.length)          await tx.run(INSERT.into('midnight.TransactionFees').entries(txFeeRows));
-            if (contractActionRows.length) await tx.run(INSERT.into('midnight.ContractActions').entries(contractActionRows));
+            if (txRows.length)             await tx.run(INSERT.into(Transactions).entries(txRows));
+            if (txResultRows.length)       await tx.run(INSERT.into(TransactionResults).entries(txResultRows));
+            if (txFeeRows.length)          await tx.run(INSERT.into(TransactionFees).entries(txFeeRows));
+            if (contractActionRows.length) await tx.run(INSERT.into(ContractActions).entries(contractActionRows));
 
             // Cold path: PendingSubmissions updates + balance projections.
             // No-op for most blocks. Kept sequential because the balance
@@ -531,7 +535,7 @@ export class BlockProcessor {
 
             // 3. Update SyncState
             await tx.run(
-                UPDATE.entity('midnight.SyncState').set({
+                UPDATE.entity(SyncState).set({
                     lastIndexedHeight: height,
                     lastIndexedHash: blockHash,
                     lastIndexedAt: new Date().toISOString(),
@@ -639,7 +643,7 @@ export class BlockProcessor {
         const amount = this.toBigInt(params.amount);
         if (amount <= 0n) return;
 
-        await tx.run(INSERT.into('midnight.UnshieldedUtxos').entries({
+        await tx.run(INSERT.into(UnshieldedUtxos).entries({
             ID: cds.utils.uuid(),
             owner: params.receiverAddress,
             tokenType: NIGHT_TOKEN_TYPE_HEX,
@@ -690,7 +694,7 @@ export class BlockProcessor {
         const nowIso = new Date().toISOString();
         const existing = await tx.run(
             SELECT.one
-                .from('midnight.NightBalances')
+                .from(NightBalances)
                 .columns(
                     'address',
                     'balance',
@@ -705,9 +709,13 @@ export class BlockProcessor {
 
         if (!existing) {
             const initialBalance = params.balanceDelta < 0n ? 0n : params.balanceDelta;
-            await tx.run(INSERT.into('midnight.NightBalances').entries({
+            // balance/totalSent/totalReceived are Decimal(20,0) columns holding
+            // u128 amounts as strings to avoid JS number precision loss. The
+            // cds-models generator types Decimal as `number`, so cast the string
+            // values; the DB layer accepts the string at runtime.
+            await tx.run(INSERT.into(NightBalances).entries({
                 address: params.address,
-                balance: initialBalance.toString(),
+                balance: initialBalance.toString() as any,
                 utxoCount: Math.max(params.utxoCountDelta, 0),
                 firstSeenHeight: params.blockHeight,
                 firstSeenAt: nowIso,
@@ -715,8 +723,8 @@ export class BlockProcessor {
                 lastActivityAt: nowIso,
                 txSentCount: Math.max(params.txSentDelta, 0),
                 txReceivedCount: Math.max(params.txReceivedDelta, 0),
-                totalSent: params.sentAmountDelta.toString(),
-                totalReceived: params.receivedAmountDelta.toString(),
+                totalSent: params.sentAmountDelta.toString() as any,
+                totalReceived: params.receivedAmountDelta.toString() as any,
                 lastUpdatedHeight: params.blockHeight,
                 lastUpdatedAt: nowIso
             }));
@@ -737,13 +745,14 @@ export class BlockProcessor {
         const currentTotalReceived = this.toBigInt(existing.totalReceived);
 
         await tx.run(
-            UPDATE.entity('midnight.NightBalances').set({
-                balance: nextBalance.toString(),
+            UPDATE.entity(NightBalances).set({
+                // Decimal(20,0) columns carrying u128 amounts as strings — see INSERT above.
+                balance: nextBalance.toString() as any,
                 utxoCount: nextUtxoCount,
                 txSentCount: currentSentCount + params.txSentDelta,
                 txReceivedCount: currentReceivedCount + params.txReceivedDelta,
-                totalSent: (currentTotalSent + params.sentAmountDelta).toString(),
-                totalReceived: (currentTotalReceived + params.receivedAmountDelta).toString(),
+                totalSent: (currentTotalSent + params.sentAmountDelta).toString() as any,
+                totalReceived: (currentTotalReceived + params.receivedAmountDelta).toString() as any,
                 lastActivityHeight: params.blockHeight,
                 lastActivityAt: nowIso,
                 lastUpdatedHeight: params.blockHeight,

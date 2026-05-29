@@ -20,6 +20,11 @@ import { BlockProcessor, ProcessResult } from './BlockProcessor';
 import { ensureNightgateModelLoaded } from '../utils/cds-model';
 import { isTransientError, calcBackoff } from '../utils/retry';
 import { ensureSyncStateSingleton } from '../utils/sync-state';
+import {
+    SyncState, ReorgLog, Blocks, Transactions, ContractActions, ContractBalances,
+    UnshieldedUtxos, ZswapLedgerEvents, DustLedgerEvents, TransactionFees,
+    TransactionResults, TransactionSegments
+} from '#cds-models/midnight';
 
 // ============================================================================
 // Types
@@ -170,7 +175,7 @@ export class MidnightCrawler {
         // Update sync state
         try {
             await this.db.run(
-                UPDATE.entity('midnight.SyncState').set({
+                UPDATE.entity(SyncState).set({
                     syncStatus: 'stopped'
                 }).where({ ID: 'SINGLETON' })
             );
@@ -205,7 +210,7 @@ export class MidnightCrawler {
             console.log(`[Crawler] Catch-up: ${startHeight} → ${tipHeight} (${totalBlocks} blocks, finalized)`);
 
             await this.db.run(
-                UPDATE.entity('midnight.SyncState').set({
+                UPDATE.entity(SyncState).set({
                     syncStatus: 'syncing',
                     chainHeight: tipHeight,
                     lastFinalizedHeight: tipHeight,
@@ -322,7 +327,7 @@ export class MidnightCrawler {
                         acc = { fetchMsTotal: 0, persistMsTotal: 0, waitedForFetchMs: 0, samples: 0 };
 
                         await this.db.run(
-                            UPDATE.entity('midnight.SyncState').set({
+                            UPDATE.entity(SyncState).set({
                                 syncProgress: ((h - startHeight + 1) / totalBlocks * 100),
                                 blocksPerSecond: bps,
                                 consecutiveErrors: 0
@@ -466,7 +471,7 @@ export class MidnightCrawler {
 
         // Update sync state
         await this.db.run(
-            UPDATE.entity('midnight.SyncState').set({
+            UPDATE.entity(SyncState).set({
                 syncStatus: 'synced'
             }).where({ ID: 'SINGLETON' })
         );
@@ -478,7 +483,7 @@ export class MidnightCrawler {
         try {
             // Update chain height
             await this.db.run(
-                UPDATE.entity('midnight.SyncState').set({
+                UPDATE.entity(SyncState).set({
                     chainHeight: height
                 }).where({ ID: 'SINGLETON' })
             );
@@ -489,7 +494,7 @@ export class MidnightCrawler {
                 const reorgLogId = await this.handleReorg(reorg);
                 const reIndexedCount = await this.catchUp();
                 await this.db.run(
-                    UPDATE.entity('midnight.ReorgLog').set({
+                    UPDATE.entity(ReorgLog).set({
                         blocksReIndexed: reIndexedCount,
                         status: 'completed'
                     }).where({ ID: reorgLogId })
@@ -505,7 +510,7 @@ export class MidnightCrawler {
             const elapsed = (Date.now() - this.startTime) / 1000;
             const syncState = await this.getSyncState();
             await this.db.run(
-                UPDATE.entity('midnight.SyncState').set({
+                UPDATE.entity(SyncState).set({
                     syncStatus: 'synced',
                     syncProgress: 100,
                     blocksPerSecond: this.blocksProcessed / elapsed,
@@ -565,7 +570,7 @@ export class MidnightCrawler {
 
         while (height > 0) {
             const localBlock = await this.db.run(
-                SELECT.one.from('midnight.Blocks').where({ hash: currentHash })
+                SELECT.one.from(Blocks).where({ hash: currentHash })
             );
 
             if (localBlock) {
@@ -597,7 +602,7 @@ export class MidnightCrawler {
 
         await this.db.tx(async (tx: any) => {
             const blocksToRollback: any[] = await tx.run(
-                SELECT.from('midnight.Blocks').columns('ID', 'height')
+                SELECT.from(Blocks).columns('ID', 'height')
                     .where({ height: { '>=': reorg.forkHeight } })
             ) || [];
             const rollbackCount = blocksToRollback.length;
@@ -606,7 +611,7 @@ export class MidnightCrawler {
             if (blockIds.length === 0) return;
 
             const txsToDelete: any[] = await tx.run(
-                SELECT.from('midnight.Transactions').columns('ID')
+                SELECT.from(Transactions).columns('ID')
                     .where({ block_ID: { in: blockIds } })
             ) || [];
 
@@ -615,50 +620,50 @@ export class MidnightCrawler {
 
                 // Batch delete contract balances via action IDs
                 const actionsToDelete: any[] = await tx.run(
-                    SELECT.from('midnight.ContractActions').columns('ID')
+                    SELECT.from(ContractActions).columns('ID')
                         .where({ transaction_ID: { in: txIds } })
                 ) || [];
                 if (actionsToDelete.length > 0) {
                     const actionIds = actionsToDelete.map((a: any) => a.ID);
-                    await tx.run(DELETE.from('midnight.ContractBalances').where({ contractAction_ID: { in: actionIds } }));
+                    await tx.run(DELETE.from(ContractBalances).where({ contractAction_ID: { in: actionIds } }));
                 }
 
                 // Batch delete all tx-child tables
-                await tx.run(DELETE.from('midnight.ContractActions').where({ transaction_ID: { in: txIds } }));
-                await tx.run(DELETE.from('midnight.UnshieldedUtxos').where({ createdAtTransaction_ID: { in: txIds } }));
-                await tx.run(DELETE.from('midnight.ZswapLedgerEvents').where({ transaction_ID: { in: txIds } }));
-                await tx.run(DELETE.from('midnight.DustLedgerEvents').where({ transaction_ID: { in: txIds } }));
-                await tx.run(DELETE.from('midnight.TransactionFees').where({ transaction_ID: { in: txIds } }));
+                await tx.run(DELETE.from(ContractActions).where({ transaction_ID: { in: txIds } }));
+                await tx.run(DELETE.from(UnshieldedUtxos).where({ createdAtTransaction_ID: { in: txIds } }));
+                await tx.run(DELETE.from(ZswapLedgerEvents).where({ transaction_ID: { in: txIds } }));
+                await tx.run(DELETE.from(DustLedgerEvents).where({ transaction_ID: { in: txIds } }));
+                await tx.run(DELETE.from(TransactionFees).where({ transaction_ID: { in: txIds } }));
 
                 // Batch delete transaction segments via result IDs
                 const resultsToDelete: any[] = await tx.run(
-                    SELECT.from('midnight.TransactionResults').columns('ID').where({ transaction_ID: { in: txIds } })
+                    SELECT.from(TransactionResults).columns('ID').where({ transaction_ID: { in: txIds } })
                 ) || [];
                 if (resultsToDelete.length > 0) {
                     const resultIds = resultsToDelete.map((r: any) => r.ID);
-                    await tx.run(DELETE.from('midnight.TransactionSegments').where({ transactionResult_ID: { in: resultIds } }));
+                    await tx.run(DELETE.from(TransactionSegments).where({ transactionResult_ID: { in: resultIds } }));
                 }
-                await tx.run(DELETE.from('midnight.TransactionResults').where({ transaction_ID: { in: txIds } }));
+                await tx.run(DELETE.from(TransactionResults).where({ transaction_ID: { in: txIds } }));
 
                 // Unlink spent UTXOs
                 await tx.run(
-                    UPDATE.entity('midnight.UnshieldedUtxos')
+                    UPDATE.entity(UnshieldedUtxos)
                         .set({ spentAtTransaction_ID: null })
                         .where({ spentAtTransaction_ID: { in: txIds } })
                 );
             }
 
             // Batch delete transactions and blocks
-            await tx.run(DELETE.from('midnight.Transactions').where({ block_ID: { in: blockIds } }));
-            await tx.run(DELETE.from('midnight.Blocks').where({ ID: { in: blockIds } }));
+            await tx.run(DELETE.from(Transactions).where({ block_ID: { in: blockIds } }));
+            await tx.run(DELETE.from(Blocks).where({ ID: { in: blockIds } }));
 
             const forkBlock = await tx.run(
-                SELECT.one.from('midnight.Blocks')
+                SELECT.one.from(Blocks)
                     .where({ height: { '<': reorg.forkHeight } })
                     .orderBy('height desc')
             );
             await tx.run(
-                UPDATE.entity('midnight.SyncState').set({
+                UPDATE.entity(SyncState).set({
                     lastIndexedHeight: forkBlock?.height ?? 0,
                     lastIndexedHash: forkBlock?.hash ?? null,
                     lastIndexedAt: new Date().toISOString(),
@@ -666,7 +671,7 @@ export class MidnightCrawler {
                 }).where({ ID: 'SINGLETON' })
             );
 
-            await tx.run(INSERT.into('midnight.ReorgLog').entries({
+            await tx.run(INSERT.into(ReorgLog).entries({
                 ID: reorgLogId,
                 detectedAt: new Date().toISOString(),
                 forkHeight: reorg.forkHeight,
@@ -719,7 +724,7 @@ export class MidnightCrawler {
 
     private async getSyncState(): Promise<any> {
         return this.db.run(
-            SELECT.one.from('midnight.SyncState').where({ ID: 'SINGLETON' })
+            SELECT.one.from(SyncState).where({ ID: 'SINGLETON' })
         );
     }
 
@@ -727,7 +732,7 @@ export class MidnightCrawler {
         try {
             const state = await this.getSyncState();
             await this.db.run(
-                UPDATE.entity('midnight.SyncState').set({
+                UPDATE.entity(SyncState).set({
                     lastError: message.slice(0, 500),
                     lastErrorAt: new Date().toISOString(),
                     consecutiveErrors: (state?.consecutiveErrors || 0) + 1,

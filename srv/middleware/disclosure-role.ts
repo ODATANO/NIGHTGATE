@@ -13,6 +13,7 @@
  * within a service the caller already reached.
  */
 import cds from '@sap/cds';
+import { DisclosureRoles } from '#cds-models/midnight';
 
 export type DisclosureRoleValue = 'public_only' | 'legitimate_interest' | 'authority';
 
@@ -70,7 +71,7 @@ export async function attachDisclosureRole(
 
     const { SELECT } = cds.ql as any;
     const rows: DisclosureRoleRow[] =
-        (await db.run(SELECT.from('midnight.DisclosureRoles').where({ userId }))) || [];
+        (await db.run(SELECT.from(DisclosureRoles).where({ userId }))) || [];
 
     const now = new Date().toISOString();
     const valid = rows.filter(r => isCurrentlyValidGrant(r, now, options.scope));

@@ -26,6 +26,7 @@ import {
     SALT_LENGTH
 } from '../utils/storage-encryption';
 import { ensureNightgateModelLoaded } from '../utils/cds-model';
+import { PrivateStates, ContractSigningKeys } from '#cds-models/midnight';
 
 const MAX_EXPORT_STATES       = 10_000;
 const MAX_EXPORT_SIGNING_KEYS = 10_000;
@@ -146,7 +147,7 @@ export class CapDbPrivateStateProvider<PSI extends PrivateStateId = PrivateState
         const contractAddress = this.requireContractAddress('get');
         const db = await this.getDb();
         const row = await db.run(
-            SELECT.one.from('midnight.PrivateStates').where({
+            SELECT.one.from(PrivateStates).where({
                 accountId: this.config.accountId,
                 contractAddress,
                 privateStateId
@@ -162,7 +163,7 @@ export class CapDbPrivateStateProvider<PSI extends PrivateStateId = PrivateState
         const contractAddress = this.requireContractAddress('remove');
         const db = await this.getDb();
         await db.run(
-            DELETE.from('midnight.PrivateStates').where({
+            DELETE.from(PrivateStates).where({
                 accountId: this.config.accountId,
                 contractAddress,
                 privateStateId
@@ -173,7 +174,7 @@ export class CapDbPrivateStateProvider<PSI extends PrivateStateId = PrivateState
     async clear(): Promise<void> {
         const db = await this.getDb();
         await db.run(
-            DELETE.from('midnight.PrivateStates').where({ accountId: this.config.accountId })
+            DELETE.from(PrivateStates).where({ accountId: this.config.accountId })
         );
     }
 
@@ -186,7 +187,7 @@ export class CapDbPrivateStateProvider<PSI extends PrivateStateId = PrivateState
     async getSigningKey(address: ContractAddress): Promise<SigningKey | null> {
         const db = await this.getDb();
         const row = await db.run(
-            SELECT.one.from('midnight.ContractSigningKeys').where({
+            SELECT.one.from(ContractSigningKeys).where({
                 accountId: this.config.accountId,
                 contractAddress: address
             })
@@ -199,7 +200,7 @@ export class CapDbPrivateStateProvider<PSI extends PrivateStateId = PrivateState
     async removeSigningKey(address: ContractAddress): Promise<void> {
         const db = await this.getDb();
         await db.run(
-            DELETE.from('midnight.ContractSigningKeys').where({
+            DELETE.from(ContractSigningKeys).where({
                 accountId: this.config.accountId,
                 contractAddress: address
             })
@@ -209,7 +210,7 @@ export class CapDbPrivateStateProvider<PSI extends PrivateStateId = PrivateState
     async clearSigningKeys(): Promise<void> {
         const db = await this.getDb();
         await db.run(
-            DELETE.from('midnight.ContractSigningKeys').where({ accountId: this.config.accountId })
+            DELETE.from(ContractSigningKeys).where({ accountId: this.config.accountId })
         );
     }
 
@@ -221,7 +222,7 @@ export class CapDbPrivateStateProvider<PSI extends PrivateStateId = PrivateState
 
         const db = await this.getDb();
         const rows: Array<{ privateStateId: string; ciphertext: string }> = await db.run(
-            SELECT.from('midnight.PrivateStates')
+            SELECT.from(PrivateStates)
                 .columns('privateStateId', 'ciphertext')
                 .where({ accountId: this.config.accountId, contractAddress })
         ) || [];
@@ -322,7 +323,7 @@ export class CapDbPrivateStateProvider<PSI extends PrivateStateId = PrivateState
         const maxKeys = options?.maxKeys ?? MAX_EXPORT_SIGNING_KEYS;
         const db = await this.getDb();
         const rows: Array<{ contractAddress: string; ciphertext: string }> = await db.run(
-            SELECT.from('midnight.ContractSigningKeys')
+            SELECT.from(ContractSigningKeys)
                 .columns('contractAddress', 'ciphertext')
                 .where({ accountId: this.config.accountId })
         ) || [];
@@ -468,18 +469,18 @@ export class CapDbPrivateStateProvider<PSI extends PrivateStateId = PrivateState
         const db = await this.getDb();
         const now = new Date().toISOString();
         const existing = await db.run(
-            SELECT.one.from('midnight.PrivateStates').where({
+            SELECT.one.from(PrivateStates).where({
                 accountId: this.config.accountId, contractAddress, privateStateId
             })
         );
         if (existing) {
             await db.run(
-                UPDATE.entity('midnight.PrivateStates')
+                UPDATE.entity(PrivateStates)
                     .set({ ciphertext, updatedAt: now })
                     .where({ accountId: this.config.accountId, contractAddress, privateStateId })
             );
         } else {
-            await db.run(INSERT.into('midnight.PrivateStates').entries({
+            await db.run(INSERT.into(PrivateStates).entries({
                 accountId: this.config.accountId, contractAddress, privateStateId,
                 ciphertext, createdAt: now, updatedAt: now
             }));
@@ -490,18 +491,18 @@ export class CapDbPrivateStateProvider<PSI extends PrivateStateId = PrivateState
         const db = await this.getDb();
         const now = new Date().toISOString();
         const existing = await db.run(
-            SELECT.one.from('midnight.ContractSigningKeys').where({
+            SELECT.one.from(ContractSigningKeys).where({
                 accountId: this.config.accountId, contractAddress
             })
         );
         if (existing) {
             await db.run(
-                UPDATE.entity('midnight.ContractSigningKeys')
+                UPDATE.entity(ContractSigningKeys)
                     .set({ ciphertext, updatedAt: now })
                     .where({ accountId: this.config.accountId, contractAddress })
             );
         } else {
-            await db.run(INSERT.into('midnight.ContractSigningKeys').entries({
+            await db.run(INSERT.into(ContractSigningKeys).entries({
                 accountId: this.config.accountId, contractAddress,
                 ciphertext, createdAt: now, updatedAt: now
             }));

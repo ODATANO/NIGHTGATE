@@ -8,11 +8,12 @@
 import cds from '@sap/cds';
 const { SELECT, INSERT } = cds.ql;
 
+import { SyncState } from '#cds-models/midnight';
 import { getConfiguredNightgateNodeUrl, resolveNightgateRuntimeConfig, getNightgatePluginConfig } from './nightgate-config';
 
 export async function ensureSyncStateSingleton(db: any, nodeUrl?: string): Promise<void> {
     const existing = await db.run(
-        SELECT.one.from('midnight.SyncState').where({ ID: 'SINGLETON' })
+        SELECT.one.from(SyncState).where({ ID: 'SINGLETON' })
     );
 
     if (!existing) {
@@ -20,7 +21,7 @@ export async function ensureSyncStateSingleton(db: any, nodeUrl?: string): Promi
             const nightgateConfig = getNightgatePluginConfig();
             const { network } = resolveNightgateRuntimeConfig(nightgateConfig);
             const configuredNodeUrl = getConfiguredNightgateNodeUrl(nightgateConfig);
-            await db.run(INSERT.into('midnight.SyncState').entries({
+            await db.run(INSERT.into(SyncState).entries({
                 ID: 'SINGLETON',
                 networkId: network,
                 lastIndexedHeight: 0,

@@ -7,6 +7,7 @@
 
 import cds, { Request } from '@sap/cds';
 const { SELECT, INSERT, UPDATE } = cds.ql;
+import { WalletSessions } from '#cds-models/midnight';
 import { getEncryptionKey, encrypt, decrypt, hashViewingKey } from '../utils/crypto';
 import { validateViewingKey } from '../utils/validation';
 import { RateLimiter } from '../utils/rate-limiter';
@@ -117,7 +118,7 @@ async function loadSigningSessionAccountId(
     sessionId: string
 ): Promise<{ ok: true; accountId: string } | { ok: false; status: number; msg: string }> {
     const session = await db.run(
-        SELECT.one.from('midnight.WalletSessions').where({ sessionId, isActive: true })
+        SELECT.one.from(WalletSessions).where({ sessionId, isActive: true })
     );
     if (!session)                       return { ok: false, status: 404, msg: 'Session not found or inactive' };
     if (!session.encryptedViewingKey)   return { ok: false, status: 404, msg: 'Session has no viewing key' };
@@ -169,7 +170,7 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
             isActive: true
         };
 
-        await db.run(INSERT.into('midnight.WalletSessions').entries(session));
+        await db.run(INSERT.into(WalletSessions).entries(session));
 
         return {
             ID: session.ID,
@@ -216,7 +217,7 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
         }
 
         const session = await db.run(
-            SELECT.one.from('midnight.WalletSessions').where({ sessionId, isActive: true })
+            SELECT.one.from(WalletSessions).where({ sessionId, isActive: true })
         );
         if (!session) return req.reject(404, 'Session not found or inactive');
         if (session.expiresAt && new Date(session.expiresAt) < new Date()) {
@@ -227,7 +228,7 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
         const encryptedSeedKey = encrypt(bip39SeedHex, encKey);
 
         await db.run(
-            UPDATE.entity('midnight.WalletSessions')
+            UPDATE.entity(WalletSessions)
                 .set({ encryptedSeedKey })
                 .where({ sessionId })
         );
@@ -306,7 +307,7 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
         if (!sessionId) return req.reject(400, 'sessionId is required');
 
         const session = await db.run(
-            SELECT.one.from('midnight.WalletSessions').where({ sessionId })
+            SELECT.one.from(WalletSessions).where({ sessionId })
         );
 
         if (!session) {
@@ -315,7 +316,7 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
 
         if (session.expiresAt && new Date(session.expiresAt) < new Date()) {
             await db.run(
-                UPDATE.entity('midnight.WalletSessions')
+                UPDATE.entity(WalletSessions)
                     .set({ isActive: false, encryptedViewingKey: null, encryptedSeedKey: null })
                     .where({ sessionId })
             );
@@ -335,7 +336,7 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
         }
 
         await db.run(
-            UPDATE.entity('midnight.WalletSessions')
+            UPDATE.entity(WalletSessions)
                 .set({
                     disconnectedAt: new Date().toISOString(),
                     isActive: false,
@@ -361,7 +362,7 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
         if (!sessionId) return req.reject(400, 'sessionId is required');
 
         const session = await db.run(
-            SELECT.one.from('midnight.WalletSessions').where({ sessionId, isActive: true })
+            SELECT.one.from(WalletSessions).where({ sessionId, isActive: true })
         );
         if (!session)                       return req.reject(404, 'Session not found or inactive');
         if (!session.encryptedViewingKey)   return req.reject(404, 'Session has no viewing key');
@@ -433,7 +434,7 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
         if (!sessionId) return req.reject(400, 'sessionId is required');
 
         const session = await db.run(
-            SELECT.one.from('midnight.WalletSessions').where({ sessionId, isActive: true })
+            SELECT.one.from(WalletSessions).where({ sessionId, isActive: true })
         );
         if (!session)                       return req.reject(404, 'Session not found or inactive');
         if (!session.encryptedViewingKey)   return req.reject(404, 'Session has no viewing key');
@@ -503,7 +504,7 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
         if (ttlErr) return req.reject(400, ttlErr);
 
         const session = await db.run(
-            SELECT.one.from('midnight.WalletSessions').where({ sessionId, isActive: true })
+            SELECT.one.from(WalletSessions).where({ sessionId, isActive: true })
         );
         if (!session)                       return req.reject(404, 'Session not found or inactive');
         if (!session.encryptedViewingKey)   return req.reject(404, 'Session has no viewing key');
@@ -565,7 +566,7 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
         if (ttlErr) return req.reject(400, ttlErr);
 
         const session = await db.run(
-            SELECT.one.from('midnight.WalletSessions').where({ sessionId, isActive: true })
+            SELECT.one.from(WalletSessions).where({ sessionId, isActive: true })
         );
         if (!session)                       return req.reject(404, 'Session not found or inactive');
         if (!session.encryptedViewingKey)   return req.reject(404, 'Session has no viewing key');
@@ -625,7 +626,7 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
         if (ttlErr) return req.reject(400, ttlErr);
 
         const session = await db.run(
-            SELECT.one.from('midnight.WalletSessions').where({ sessionId, isActive: true })
+            SELECT.one.from(WalletSessions).where({ sessionId, isActive: true })
         );
         if (!session)                       return req.reject(404, 'Session not found or inactive');
         if (!session.encryptedViewingKey)   return req.reject(404, 'Session has no viewing key');
@@ -675,7 +676,7 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
         if (!sessionId) return req.reject(400, 'sessionId is required');
 
         const session = await db.run(
-            SELECT.one.from('midnight.WalletSessions').where({ sessionId, isActive: true })
+            SELECT.one.from(WalletSessions).where({ sessionId, isActive: true })
         );
         if (!session)                       return req.reject(404, 'Session not found or inactive');
         if (!session.encryptedViewingKey)   return req.reject(404, 'Session has no viewing key');
@@ -728,7 +729,7 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
         if (ttlErr) return req.reject(400, ttlErr);
 
         const session = await db.run(
-            SELECT.one.from('midnight.WalletSessions').where({ sessionId, isActive: true })
+            SELECT.one.from(WalletSessions).where({ sessionId, isActive: true })
         );
         if (!session)                       return req.reject(404, 'Session not found or inactive');
         if (!session.encryptedViewingKey)   return req.reject(404, 'Session has no viewing key');
@@ -805,7 +806,7 @@ export function startSessionCleanup(db: any): ReturnType<typeof setInterval> {
     const timer = setInterval(async () => {
         try {
             await db.run(
-                UPDATE.entity('midnight.WalletSessions')
+                UPDATE.entity(WalletSessions)
                     .set({ isActive: false, encryptedViewingKey: null })
                     .where({ isActive: true, expiresAt: { '<': new Date().toISOString() } })
             );

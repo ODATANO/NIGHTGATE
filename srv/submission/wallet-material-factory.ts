@@ -33,6 +33,7 @@
 
 import cds from '@sap/cds';
 const { SELECT } = cds.ql;
+import { WalletSessions } from '#cds-models/midnight';
 import crypto from 'crypto';
 import { decrypt, getEncryptionKey } from '../utils/crypto';
 import { loadLedgerV8 } from '../midnight/sdk-loader';
@@ -106,7 +107,7 @@ const PRIVATE_STATE_PASSWORD_LABEL = 'nightgate-private-state-password-v1';
 export async function buildWalletMaterialForSession(opts: BuildWalletMaterialOptions): Promise<WalletMaterial> {
     const db = opts.db ?? await cds.connect.to('db');
     const session = await db.run(
-        SELECT.one.from('midnight.WalletSessions').where({ sessionId: opts.sessionId, isActive: true })
+        SELECT.one.from(WalletSessions).where({ sessionId: opts.sessionId, isActive: true })
     );
     if (!session) throw new SessionNotFoundError(opts.sessionId);
     if (session.expiresAt && new Date(session.expiresAt) < new Date()) {

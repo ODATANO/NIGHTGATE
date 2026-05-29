@@ -14,6 +14,9 @@ import { ensureNightgateModelLoaded } from './utils/cds-model';
 import { registerSubmissionHandlers } from './submission/handlers';
 import { getJobById } from './submission/background-jobs';
 
+import { Blocks, Transactions, ContractActions, UnshieldedUtxos, NightBalances } from '#cds-models/midnight';
+
+
 export default class NightgateService extends cds.ApplicationService {
     private db!: cds.DatabaseService;
     private _cleanupTimer?: ReturnType<typeof setInterval>;
@@ -32,7 +35,7 @@ export default class NightgateService extends cds.ApplicationService {
 
         this.on('latest', 'Blocks', async () => {
             return this.db.run(
-                cds.ql.SELECT.one.from('midnight.Blocks').orderBy('height desc')
+                cds.ql.SELECT.one.from(Blocks).orderBy('height desc')
             );
         });
 
@@ -40,7 +43,7 @@ export default class NightgateService extends cds.ApplicationService {
             const { height } = req.data as { height: number };
             if (height == null) return req.reject(400, 'height is required');
             return this.db.run(
-                cds.ql.SELECT.one.from('midnight.Blocks').where({ height })
+                cds.ql.SELECT.one.from(Blocks).where({ height })
             );
         });
 
@@ -64,9 +67,13 @@ export default class NightgateService extends cds.ApplicationService {
             }
 
             const effectiveLimit = Math.min(Math.max(limit || 100, 1), 5000);
+            // Use a tagged-template predicate for the range window. The object form
+            // `{ height: { '>=': s, '<=': e } }` (two operators on one field) produces
+            // CQN without the connective and is silently dropped by @cap-js/sqlite,
+            // so the window would not filter at all.
             return this.db.run(
-                cds.ql.SELECT.from('midnight.Blocks')
-                    .where({ height: { '>=': startHeight, '<=': endHeight } })
+                cds.ql.SELECT.from(Blocks)
+                    .where`height >= ${startHeight} and height <= ${endHeight}`
                     .orderBy('height asc')
                     .limit(effectiveLimit)
             );
@@ -83,7 +90,7 @@ export default class NightgateService extends cds.ApplicationService {
         this.on('byHash', 'Transactions', async (req: Request) => {
             const { hash } = req.data as { hash: string };
             if (!hash) return req.reject(400, 'hash is required');
-            return this.db.run(cds.ql.SELECT.from('midnight.Transactions').where({ hash }));
+            return this.db.run(cds.ql.SELECT.from(Transactions).where({ hash }));
         });
 
         this.on('byType', 'Transactions', async (req: Request) => {
@@ -92,7 +99,7 @@ export default class NightgateService extends cds.ApplicationService {
 
             const effectiveLimit = Math.min(Math.max(limit || 100, 1), 2000);
             return this.db.run(
-                cds.ql.SELECT.from('midnight.Transactions')
+                cds.ql.SELECT.from(Transactions)
                     .where({ txType })
                     .orderBy('createdAt desc')
                     .limit(effectiveLimit)
@@ -111,7 +118,7 @@ export default class NightgateService extends cds.ApplicationService {
             const { address } = req.data as { address: string };
             if (!address) return req.reject(400, 'address is required');
             return this.db.run(
-                cds.ql.SELECT.from('midnight.ContractActions').where({ address })
+                cds.ql.SELECT.from(ContractActions).where({ address })
             );
         });
 
@@ -119,7 +126,7 @@ export default class NightgateService extends cds.ApplicationService {
             const { address } = req.data as { address: string };
             if (!address) return req.reject(400, 'address is required');
             return this.db.run(
-                cds.ql.SELECT.from('midnight.ContractActions')
+                cds.ql.SELECT.from(ContractActions)
                     .where({ address })
                     .orderBy('createdAt desc')
                     .limit(100)
@@ -137,12 +144,12 @@ export default class NightgateService extends cds.ApplicationService {
         this.on('byOwner', 'UnshieldedUtxos', async (req: Request) => {
             const { owner } = req.data as { owner: string };
             if (!owner) return req.reject(400, 'owner is required');
-            return this.db.run(cds.ql.SELECT.from('midnight.UnshieldedUtxos').where({ owner }));
+            return this.db.run(cds.ql.SELECT.from(UnshieldedUtxos).where({ owner }));
         });
 
         this.on('unspent', 'UnshieldedUtxos', async () => {
             return this.db.run(
-                cds.ql.SELECT.from('midnight.UnshieldedUtxos').where({ spentAtTransaction_ID: null })
+                cds.ql.SELECT.from(UnshieldedUtxos).where({ spentAtTransaction_ID: null })
             );
         });
 
@@ -154,7 +161,7 @@ export default class NightgateService extends cds.ApplicationService {
             const { address } = req.data as { address: string };
             if (!address) return req.reject(400, 'address is required');
             return this.db.run(
-                cds.ql.SELECT.one.from('midnight.NightBalances').where({ address })
+                cds.ql.SELECT.one.from(NightBalances).where({ address })
             );
         });
 
@@ -162,7 +169,7 @@ export default class NightgateService extends cds.ApplicationService {
             const { limit } = req.data as { limit?: number };
             const effectiveLimit = Math.min(Math.max(limit || 10, 1), 1000);
             return this.db.run(
-                cds.ql.SELECT.from('midnight.NightBalances')
+                cds.ql.SELECT.from(NightBalances)
                     .orderBy('balance desc')
                     .limit(effectiveLimit)
             );
@@ -190,7 +197,7 @@ export default class NightgateService extends cds.ApplicationService {
 
         this.on('getJobStatus', async (req: Request) => {
             const { jobId, sessionId } = req.data as { jobId?: string; sessionId?: string };
-            if (!jobId)     return req.reject(400, 'jobId is required');
+            if (!jobId) return req.reject(400, 'jobId is required');
             if (!sessionId) return req.reject(400, 'sessionId is required');
 
             const job = await getJobById(jobId);
@@ -202,15 +209,15 @@ export default class NightgateService extends cds.ApplicationService {
             }
 
             return {
-                jobId:        job.ID,
-                kind:         job.kind,
-                status:       job.status,
-                result:       job.result,
-                errorCode:    job.errorCode,
+                jobId: job.ID,
+                kind: job.kind,
+                status: job.status,
+                result: job.result,
+                errorCode: job.errorCode,
                 errorMessage: job.errorMessage,
-                submittedAt:  job.createdAt,
-                startedAt:    job.startedAt,
-                finishedAt:   job.finishedAt
+                submittedAt: job.createdAt,
+                startedAt: job.startedAt,
+                finishedAt: job.finishedAt
             };
         });
 

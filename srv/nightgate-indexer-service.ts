@@ -11,6 +11,11 @@ import { ensureNightgateModelLoaded } from './utils/cds-model';
 import { resolveNightgateRuntimeConfig, getNightgatePluginConfig } from './utils/nightgate-config';
 import { ensureSyncStateSingleton } from './utils/sync-state';
 import { isCrawlerRunning, startCrawler, stopCrawler } from './crawler';
+import {
+    Blocks, Transactions, ContractActions, ContractBalances, UnshieldedUtxos,
+    ZswapLedgerEvents, DustLedgerEvents, TransactionFees, TransactionResults,
+    TransactionSegments, SyncState, ReorgLog
+} from '#cds-models/midnight';
 
 const processStartTime = Date.now();
 const metricPrefix = 'odatano_nightgate';
@@ -38,12 +43,12 @@ export default class NightgateIndexerService extends cds.ApplicationService {
         effectiveStartHeight: number;
     }> {
         const blocksToRollback = await this.db.run(
-            SELECT.from('midnight.Blocks').where({ height: { '>=': fromHeight } })
+            SELECT.from(Blocks).where({ height: { '>=': fromHeight } })
         ) || [];
 
         if (blocksToRollback.length === 0) {
             const forkBlock = await this.db.run(
-                SELECT.one.from('midnight.Blocks')
+                SELECT.one.from(Blocks)
                     .where({ height: { '<': fromHeight } })
                     .orderBy('height desc')
             );
@@ -57,55 +62,55 @@ export default class NightgateIndexerService extends cds.ApplicationService {
 
         const blockIds = (blocksToRollback as IdRow[]).map(b => b.ID).filter(Boolean);
         const txsToDelete: IdRow[] = blockIds.length > 0
-            ? await this.db.run(SELECT.from('midnight.Transactions').columns('ID').where({ block_ID: { in: blockIds } })) || []
+            ? await this.db.run(SELECT.from(Transactions).columns('ID').where({ block_ID: { in: blockIds } })) || []
             : [];
         const txIds = txsToDelete.map(t => t.ID).filter(Boolean);
 
         if (txIds.length > 0) {
             const actionsToDelete: IdRow[] = await this.db.run(
-                SELECT.from('midnight.ContractActions').columns('ID').where({ transaction_ID: { in: txIds } })
+                SELECT.from(ContractActions).columns('ID').where({ transaction_ID: { in: txIds } })
             ) || [];
             const actionIds = actionsToDelete.map(a => a.ID).filter(Boolean);
 
             if (actionIds.length > 0) {
-                await this.db.run(DELETE.from('midnight.ContractBalances').where({ contractAction_ID: { in: actionIds } }));
+                await this.db.run(DELETE.from(ContractBalances).where({ contractAction_ID: { in: actionIds } }));
             }
 
-            await this.db.run(DELETE.from('midnight.ContractActions').where({ transaction_ID: { in: txIds } }));
-            await this.db.run(DELETE.from('midnight.UnshieldedUtxos').where({ createdAtTransaction_ID: { in: txIds } }));
-            await this.db.run(DELETE.from('midnight.ZswapLedgerEvents').where({ transaction_ID: { in: txIds } }));
-            await this.db.run(DELETE.from('midnight.DustLedgerEvents').where({ transaction_ID: { in: txIds } }));
-            await this.db.run(DELETE.from('midnight.TransactionFees').where({ transaction_ID: { in: txIds } }));
+            await this.db.run(DELETE.from(ContractActions).where({ transaction_ID: { in: txIds } }));
+            await this.db.run(DELETE.from(UnshieldedUtxos).where({ createdAtTransaction_ID: { in: txIds } }));
+            await this.db.run(DELETE.from(ZswapLedgerEvents).where({ transaction_ID: { in: txIds } }));
+            await this.db.run(DELETE.from(DustLedgerEvents).where({ transaction_ID: { in: txIds } }));
+            await this.db.run(DELETE.from(TransactionFees).where({ transaction_ID: { in: txIds } }));
 
             const resultsToDelete: IdRow[] = await this.db.run(
-                SELECT.from('midnight.TransactionResults').columns('ID').where({ transaction_ID: { in: txIds } })
+                SELECT.from(TransactionResults).columns('ID').where({ transaction_ID: { in: txIds } })
             ) || [];
             const resultIds = resultsToDelete.map(r => r.ID).filter(Boolean);
             if (resultIds.length > 0) {
-                await this.db.run(DELETE.from('midnight.TransactionSegments').where({ transactionResult_ID: { in: resultIds } }));
+                await this.db.run(DELETE.from(TransactionSegments).where({ transactionResult_ID: { in: resultIds } }));
             }
-            await this.db.run(DELETE.from('midnight.TransactionResults').where({ transaction_ID: { in: txIds } }));
+            await this.db.run(DELETE.from(TransactionResults).where({ transaction_ID: { in: txIds } }));
 
             await this.db.run(
-                UPDATE.entity('midnight.UnshieldedUtxos')
+                UPDATE.entity(UnshieldedUtxos)
                     .set({ spentAtTransaction_ID: null })
                     .where({ spentAtTransaction_ID: { in: txIds } })
             );
 
-            await this.db.run(DELETE.from('midnight.Transactions').where({ ID: { in: txIds } }));
+            await this.db.run(DELETE.from(Transactions).where({ ID: { in: txIds } }));
         }
 
-        await this.db.run(DELETE.from('midnight.Blocks').where({ ID: { in: blockIds } }));
+        await this.db.run(DELETE.from(Blocks).where({ ID: { in: blockIds } }));
 
         const forkBlock = await this.db.run(
-            SELECT.one.from('midnight.Blocks')
+            SELECT.one.from(Blocks)
                 .where({ height: { '<': fromHeight } })
                 .orderBy('height desc')
         );
         const effectiveStartHeight = forkBlock?.height != null ? Number(forkBlock.height) + 1 : 0;
 
         await this.db.run(
-            UPDATE.entity('midnight.SyncState').set({
+            UPDATE.entity(SyncState).set({
                 lastIndexedHeight: forkBlock?.height ?? 0,
                 lastIndexedHash: forkBlock?.hash ?? null,
                 lastIndexedAt: new Date().toISOString(),
@@ -134,7 +139,7 @@ export default class NightgateIndexerService extends cds.ApplicationService {
 
         this.on('getSyncStatus', async () => {
             const syncState = await this.db.run(
-                SELECT.one.from('midnight.SyncState').where({ ID: 'SINGLETON' })
+                SELECT.one.from(SyncState).where({ ID: 'SINGLETON' })
             );
             return syncState || {
                 ID: 'SINGLETON',
@@ -147,7 +152,7 @@ export default class NightgateIndexerService extends cds.ApplicationService {
 
         this.on('getHealth', async () => {
             const syncState = await this.db.run(
-                SELECT.one.from('midnight.SyncState').where({ ID: 'SINGLETON' })
+                SELECT.one.from(SyncState).where({ ID: 'SINGLETON' })
             );
 
             if (!syncState) {
@@ -188,7 +193,7 @@ export default class NightgateIndexerService extends cds.ApplicationService {
             const { limit } = req.data as { limit?: number };
             const effectiveLimit = Math.min(Math.max(limit || 10, 1), 100);
             return this.db.run(
-                SELECT.from('midnight.ReorgLog')
+                SELECT.from(ReorgLog)
                     .orderBy('detectedAt desc')
                     .limit(effectiveLimit)
             );
@@ -211,7 +216,7 @@ export default class NightgateIndexerService extends cds.ApplicationService {
 
             try {
                 const syncState = await this.db.run(
-                    SELECT.one.from('midnight.SyncState').where({ ID: 'SINGLETON' })
+                    SELECT.one.from(SyncState).where({ ID: 'SINGLETON' })
                 );
                 checks.database = true;
 
@@ -235,7 +240,7 @@ export default class NightgateIndexerService extends cds.ApplicationService {
 
         this.on('getMetrics', async () => {
             const syncState = await this.db.run(
-                SELECT.one.from('midnight.SyncState').where({ ID: 'SINGLETON' })
+                SELECT.one.from(SyncState).where({ ID: 'SINGLETON' })
             );
 
             const lines: string[] = [];
@@ -290,7 +295,7 @@ export default class NightgateIndexerService extends cds.ApplicationService {
 
             await stopCrawler();
             await this.db.run(
-                UPDATE.entity('midnight.SyncState').set({
+                UPDATE.entity(SyncState).set({
                     syncStatus: 'stopped'
                 }).where({ ID: 'SINGLETON' })
             );

@@ -16,6 +16,8 @@ import {
     DISCLOSURE_ROLE_VALUES
 } from './middleware/disclosure-role';
 
+import { WalletSessions, DisclosureRoles } from '#cds-models/midnight';
+
 export default class NightgateAdminService extends cds.ApplicationService {
     private db!: cds.DatabaseService;
 
@@ -31,7 +33,7 @@ export default class NightgateAdminService extends cds.ApplicationService {
             }
 
             const session = await this.db.run(
-                SELECT.one.from('midnight.WalletSessions').where({ sessionId })
+                SELECT.one.from(WalletSessions).where({ sessionId })
             );
 
             if (!session) {
@@ -43,7 +45,7 @@ export default class NightgateAdminService extends cds.ApplicationService {
             }
 
             await this.db.run(
-                UPDATE.entity('midnight.WalletSessions').set({
+                UPDATE.entity(WalletSessions).set({
                     isActive: false,
                     disconnectedAt: new Date().toISOString(),
                     encryptedViewingKey: null  // Clear encrypted key
@@ -53,7 +55,7 @@ export default class NightgateAdminService extends cds.ApplicationService {
 
         this.on('invalidateAllSessions', async () => {
             const result = await this.db.run(
-                UPDATE.entity('midnight.WalletSessions').set({
+                UPDATE.entity(WalletSessions).set({
                     isActive: false,
                     disconnectedAt: new Date().toISOString(),
                     encryptedViewingKey: null  // Clear all encrypted keys
@@ -87,12 +89,12 @@ export default class NightgateAdminService extends cds.ApplicationService {
 
             const grantedBy = (req as any).user?.id || 'unknown';
             const now = new Date().toISOString();
-            await this.db.run(INSERT.into('midnight.DisclosureRoles').entries({
+            await this.db.run(INSERT.into(DisclosureRoles).entries({
                 userId,
                 role,
-                scope:      scope && scope.length > 0 ? scope : null,
+                scope: scope && scope.length > 0 ? scope : null,
                 grantedBy,
-                validFrom:  now,
+                validFrom: now,
                 validUntil: validUntil && validUntil.length > 0 ? validUntil : null
             }));
         });

@@ -40,6 +40,7 @@ import { resolveNightgateRuntimeConfig, type NightgateNetwork, getConfiguredPriv
 import { RateLimiter } from '../utils/rate-limiter';
 import { ensureNetworkId, type ContractProvidersConfig } from '../midnight/providers';
 import { startJob } from './background-jobs';
+import { Documents, Transactions, TransactionResults, PredicateAttestations } from '#cds-models/midnight';
 
 const { INSERT, UPDATE, SELECT } = cds.ql;
 
@@ -246,7 +247,7 @@ export function registerSubmissionHandlers(
         // pattern: clients have a handle to retry against without polling.
         const documentId = cds.utils.uuid();
         const insertedAt = new Date().toISOString();
-        await db.run(INSERT.into('midnight.Documents').entries({
+        await db.run(INSERT.into(Documents).entries({
             ID:          documentId,
             sha256:      data.sha256.toLowerCase(),
             contentType: data.contentType ?? null,
@@ -292,7 +293,7 @@ export function registerSubmissionHandlers(
                     });
 
                     const anchoredAt = new Date().toISOString();
-                    await db.run(UPDATE.entity('midnight.Documents')
+                    await db.run(UPDATE.entity(Documents)
                         .set({ anchoredTxHash: result.txHash, anchoredAt, modifiedAt: anchoredAt })
                         .where({ ID: documentId }));
 
@@ -322,7 +323,7 @@ export function registerSubmissionHandlers(
         }
 
         const doc: any = await db.run(
-            SELECT.one.from('midnight.Documents').where({ ID: documentId })
+            SELECT.one.from(Documents).where({ ID: documentId })
         );
         if (!doc) return req.reject(404, `Document ${documentId} not found`);
 
@@ -335,13 +336,13 @@ export function registerSubmissionHandlers(
         let chainSuccess = false;
         if (anchoredOk && hashMatches) {
             const txRow: any = await db.run(
-                SELECT.one.from('midnight.Transactions')
+                SELECT.one.from(Transactions)
                     .columns('ID', 'hash')
                     .where({ hash: doc.anchoredTxHash })
             );
             if (txRow?.ID) {
                 const result: any = await db.run(
-                    SELECT.one.from('midnight.TransactionResults')
+                    SELECT.one.from(TransactionResults)
                         .columns('status')
                         .where({ transaction_ID: txRow.ID })
                 );
@@ -421,13 +422,16 @@ export function registerSubmissionHandlers(
         // are intentionally NOT stored.
         const predicateAttestationId = cds.utils.uuid();
         const insertedAt = new Date().toISOString();
-        await db.run(INSERT.into('midnight.PredicateAttestations').entries({
+        await db.run(INSERT.into(PredicateAttestations).entries({
             ID:              predicateAttestationId,
             payloadHash:     data.payloadHash.toLowerCase(),
             contractAddress: data.contractAddress,
             predicate:       data.predicate,
             op,
-            threshold:       data.threshold,
+            // Integer64 column; caller may pass the scaled integer as a string to
+            // preserve precision past Number.MAX_SAFE_INTEGER. cds-models types it
+            // as `number`, but the DB layer accepts the string at runtime.
+            threshold:       data.threshold as any,
             unit:            data.unit ?? null,
             valueCommitment: data.valueCommitment ? data.valueCommitment.toLowerCase() : null,
             provenTxHash:    null,
@@ -485,7 +489,7 @@ export function registerSubmissionHandlers(
                     });
 
                     const provenAt = new Date().toISOString();
-                    await db.run(UPDATE.entity('midnight.PredicateAttestations')
+                    await db.run(UPDATE.entity(PredicateAttestations)
                         .set({ provenTxHash: proof.txHash, provenAt, modifiedAt: provenAt })
                         .where({ ID: predicateAttestationId }));
 
@@ -516,7 +520,7 @@ export function registerSubmissionHandlers(
         if (!predicateAttestationId) return req.reject(400, 'predicateAttestationId is required');
 
         const row: any = await db.run(
-            SELECT.one.from('midnight.PredicateAttestations').where({ ID: predicateAttestationId })
+            SELECT.one.from(PredicateAttestations).where({ ID: predicateAttestationId })
         );
         if (!row) return req.reject(404, `PredicateAttestation ${predicateAttestationId} not found`);
 
@@ -527,11 +531,11 @@ export function registerSubmissionHandlers(
         let chainSuccess = false;
         if (provenOk) {
             const txRow: any = await db.run(
-                SELECT.one.from('midnight.Transactions').columns('ID', 'hash').where({ hash: row.provenTxHash })
+                SELECT.one.from(Transactions).columns('ID', 'hash').where({ hash: row.provenTxHash })
             );
             if (txRow?.ID) {
                 const result: any = await db.run(
-                    SELECT.one.from('midnight.TransactionResults').columns('status').where({ transaction_ID: txRow.ID })
+                    SELECT.one.from(TransactionResults).columns('status').where({ transaction_ID: txRow.ID })
                 );
                 chainSuccess = result?.status === 'SUCCESS';
             }
