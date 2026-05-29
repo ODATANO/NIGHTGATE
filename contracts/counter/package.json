@@ -1,0 +1,7 @@
+{
+  "name": "@odatano/nightgate-contract-counter",
+  "private": true,
+  "type": "module",
+  "description": "Minimal Compact counter contract (T10), first registered artifact for the NIGHTGATE submission path.",
+  "main": "src/managed/counter/contract/index.js"
+}

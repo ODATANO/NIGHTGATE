@@ -406,4 +406,111 @@ describe('NightgateService', () => {
             clearIntervalSpy.mockRestore();
         }
     });
+
+    // ========================================================================
+    // getJobStatus (0.2.0 async submission lifecycle)
+    // ========================================================================
+
+    describe('getJobStatus', () => {
+        const VALID_JOB_ID    = '11111111-1111-1111-1111-111111111111';
+        const VALID_SESSION   = '22222222-2222-2222-2222-222222222222';
+        const FOREIGN_SESSION = '33333333-3333-3333-3333-333333333333';
+
+        function fakeRow(overrides: Record<string, unknown> = {}) {
+            return {
+                ID:             VALID_JOB_ID,
+                kind:           'sendNight',
+                sessionId:      VALID_SESSION,
+                status:         'succeeded',
+                idempotencyKey: null,
+                request:        '{"foo":"bar"}',
+                result:         '{"txId":"tx-OK"}',
+                errorCode:      null,
+                errorMessage:   null,
+                startedAt:      '2026-05-19T12:00:00.000Z',
+                finishedAt:     '2026-05-19T12:00:05.000Z',
+                createdAt:      '2026-05-19T11:59:55.000Z',
+                modifiedAt:     '2026-05-19T12:00:05.000Z',
+                ...overrides
+            };
+        }
+
+        it('rejects when jobId is missing', async () => {
+            const handler = getHandler('getJobStatus');
+            const req = createMockRequest({ sessionId: VALID_SESSION });
+            await handler(req);
+            expect(req.reject).toHaveBeenCalledWith(400, 'jobId is required');
+        });
+
+        it('rejects when sessionId is missing', async () => {
+            const handler = getHandler('getJobStatus');
+            const req = createMockRequest({ jobId: VALID_JOB_ID });
+            await handler(req);
+            expect(req.reject).toHaveBeenCalledWith(400, 'sessionId is required');
+        });
+
+        it('returns 404 for an unknown jobId', async () => {
+            const handler = getHandler('getJobStatus');
+            mockDbRun.mockResolvedValueOnce(null);
+            const req = createMockRequest({ jobId: VALID_JOB_ID, sessionId: VALID_SESSION });
+            await handler(req);
+            expect(req.reject).toHaveBeenCalledWith(404, 'Job not found');
+        });
+
+        it('returns 404 for a job owned by a different session (no leak)', async () => {
+            const handler = getHandler('getJobStatus');
+            mockDbRun.mockResolvedValueOnce(fakeRow({ sessionId: FOREIGN_SESSION }));
+            const req = createMockRequest({ jobId: VALID_JOB_ID, sessionId: VALID_SESSION });
+            await handler(req);
+            expect(req.reject).toHaveBeenCalledWith(404, 'Job not found');
+        });
+
+        it('returns the full job shape for a matching jobId + sessionId', async () => {
+            const handler = getHandler('getJobStatus');
+            mockDbRun.mockResolvedValueOnce(fakeRow());
+            const req = createMockRequest({ jobId: VALID_JOB_ID, sessionId: VALID_SESSION });
+
+            const out = await handler(req);
+
+            expect(req.reject).not.toHaveBeenCalled();
+            expect(out).toEqual({
+                jobId:        VALID_JOB_ID,
+                kind:         'sendNight',
+                status:       'succeeded',
+                result:       '{"txId":"tx-OK"}',
+                errorCode:    null,
+                errorMessage: null,
+                submittedAt:  '2026-05-19T11:59:55.000Z',
+                startedAt:    '2026-05-19T12:00:00.000Z',
+                finishedAt:   '2026-05-19T12:00:05.000Z'
+            });
+
+            const builder = getLastBuilder();
+            expect(builder.__kind).toBe('one');
+            // __table is the cds-typer entity class — assert by its `name` to
+            // avoid triggering the entity proxy's "runtime not booted" throw
+            // when Jest's matcher tries to introspect the class object.
+            expect(builder.__table?.name).toBe('midnight.BackgroundJobs');
+            expect(builder.__where).toEqual({ ID: VALID_JOB_ID });
+        });
+
+        it('relays failure state (errorCode / errorMessage) for a failed job', async () => {
+            const handler = getHandler('getJobStatus');
+            mockDbRun.mockResolvedValueOnce(fakeRow({
+                status:       'failed',
+                result:       null,
+                errorCode:    '1016',
+                errorMessage: 'Transaction pool full or immediately dropped',
+                finishedAt:   '2026-05-19T12:00:30.000Z'
+            }));
+            const req = createMockRequest({ jobId: VALID_JOB_ID, sessionId: VALID_SESSION });
+
+            const out = await handler(req);
+
+            expect(out.status).toBe('failed');
+            expect(out.errorCode).toBe('1016');
+            expect(out.errorMessage).toMatch(/pool full/);
+            expect(out.result).toBeNull();
+        });
+    });
 });

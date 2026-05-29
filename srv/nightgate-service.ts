@@ -1,5 +1,5 @@
 /**
- * Nightgate Service Implementation — OData V4 API
+ * Nightgate Service Implementation, OData V4 API
  *
  * Thin service layer: all data comes from local SQLite (populated by Crawler).
  * OData queries run against the local DB. Wallet sessions are handled separately.
@@ -11,9 +11,11 @@ import cds, { Request } from '@sap/cds';
 
 import { registerWalletSessionHandlers, startSessionCleanup } from './sessions/wallet-sessions';
 import { ensureNightgateModelLoaded } from './utils/cds-model';
+import { registerSubmissionHandlers } from './submission/handlers';
+import { getJobById } from './submission/background-jobs';
 
 export default class NightgateService extends cds.ApplicationService {
-    private db!: any;
+    private db!: cds.DatabaseService;
     private _cleanupTimer?: ReturnType<typeof setInterval>;
 
     async init(): Promise<void> {
@@ -173,13 +175,53 @@ export default class NightgateService extends cds.ApplicationService {
         registerWalletSessionHandlers(this, this.db);
 
         // ====================================================================
+        // Submission actions (T6), deployContract, submitContractCall
+        // ====================================================================
+
+        this.on('READ', 'PendingSubmissions', async (req: Request) => {
+            return await this.db.run(req.query) || [];
+        });
+
+        registerSubmissionHandlers(this, this.db);
+
+        // ====================================================================
+        // Background Jobs (0.2.0 async submission lifecycle)
+        // ====================================================================
+
+        this.on('getJobStatus', async (req: Request) => {
+            const { jobId, sessionId } = req.data as { jobId?: string; sessionId?: string };
+            if (!jobId)     return req.reject(400, 'jobId is required');
+            if (!sessionId) return req.reject(400, 'sessionId is required');
+
+            const job = await getJobById(jobId);
+            // 404 on foreign sessionId — same shape as not-found so a probe
+            // for someone else's jobId can't distinguish "unknown" from
+            // "exists but not yours".
+            if (!job || job.sessionId !== sessionId) {
+                return req.reject(404, 'Job not found');
+            }
+
+            return {
+                jobId:        job.ID,
+                kind:         job.kind,
+                status:       job.status,
+                result:       job.result,
+                errorCode:    job.errorCode,
+                errorMessage: job.errorMessage,
+                submittedAt:  job.createdAt,
+                startedAt:    job.startedAt,
+                finishedAt:   job.finishedAt
+            };
+        });
+
+        // ====================================================================
         // Read-only Enforcement
         // ====================================================================
 
         this.before(['CREATE', 'UPDATE', 'DELETE'], [
             'Blocks', 'Transactions', 'ContractActions', 'UnshieldedUtxos',
             'ZswapLedgerEvents', 'DustLedgerEvents',
-            'NightBalances', 'WalletSessions'
+            'NightBalances', 'WalletSessions', 'PendingSubmissions'
         ], (req: Request) => {
             req.reject?.(405, 'Blockchain data is read-only');
         });

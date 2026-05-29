@@ -1,5 +1,5 @@
 /**
- * BlockProcessor — Parses and persists Midnight blocks
+ * BlockProcessor, Parses and persists Midnight blocks
  *
  * Processes a single block: parse header, classify transactions,
  * extract inputs/outputs/contract actions, and write to DB
@@ -20,7 +20,9 @@ import { blake2b } from '@noble/hashes/blake2b';
 import { bytesToHex } from '@noble/hashes/utils';
 import { MidnightNodeProvider, SignedBlock, BlockHeader } from '../providers/MidnightNodeProvider';
 import { ensureNightgateModelLoaded } from '../utils/cds-model';
+import { getNightgatePluginConfig } from '../utils/nightgate-config';
 import { parseExtrinsicCallIndices, parseExtrinsicParticipantInfo } from '../utils/scale';
+import { reconcilePendingSubmission } from '../submission/TransactionSubmitter';
 
 /**
  * Mapping of pallet index to human-readable name and transaction type.
@@ -50,7 +52,7 @@ const DEFAULT_PALLET_MAP: Record<number, PalletMapping> = {
     4: { name: 'Balances', txType: 'night_transfer' },
     5: { name: 'Sudo', txType: 'system', isSystem: true },
     10: { name: 'Contracts', txType: 'contract_call' },
-    // Midnight-specific pallets — configure actual indices via cds.requires.nightgate.palletMap:
+    // Midnight-specific pallets, configure actual indices via cds.requires.nightgate.palletMap:
     // { "15": { "name": "Zswap", "txType": "shielded_transfer", "isShielded": true } }
     // { "16": { "name": "ContractPallet", "txType": "contract_deploy" } }
 };
@@ -66,7 +68,7 @@ function buildPalletMap(): Map<number, PalletMapping> {
     }
 
     // Override with config
-    const nightgateConfig = (cds.env as any).requires?.nightgate || {};
+    const nightgateConfig = getNightgatePluginConfig();
     const configMap = nightgateConfig.palletMap;
     if (configMap && typeof configMap === 'object') {
         for (const [idx, entry] of Object.entries(configMap)) {
@@ -94,17 +96,52 @@ export interface ProcessResult {
     processingTimeMs: number;
 }
 
+/**
+ * Per-block data fetched from the node, ready to be persisted. Produced by
+ * `fetchBlockData`, consumed by `persistBlockData`. Decoupling fetch from
+ * persist lets the crawler pipeline RPC fetches in parallel while writing
+ * to SQLite serially.
+ *
+ * Modeled as a discriminated union on `alreadyIndexed`: when we short-circuit
+ * because the block exists in the DB, the heavy RPC fields are absent; when
+ * we fetched fully, they are all present. This replaces the earlier
+ * `signedBlock: null as any` placeholder which bypassed type checking.
+ */
+export type PreparedBlock = PreparedBlockSkipped | PreparedBlockFetched;
+
+export interface PreparedBlockSkipped {
+    blockHash: string;
+    height: number;
+    fetchStartedAt: number;
+    alreadyIndexed: true;
+}
+
+export interface PreparedBlockFetched {
+    blockHash: string;
+    height: number;
+    signedBlock: SignedBlock;
+    protocolVersion: number;
+    timestamp: number;
+    fetchStartedAt: number;
+    /** Set when all RPCs for this block have resolved. Used for fetch-vs-persist timing diagnostics. */
+    fetchCompletedAt?: number;
+    alreadyIndexed: false;
+}
+
 // ============================================================================
 // Block Processor
 // ============================================================================
 
 export class BlockProcessor {
-    private db: any;
+    private db!: cds.DatabaseService;
     private palletMap: Map<number, PalletMapping>;
 
-    // Cache: specVersion rarely changes (only on runtime upgrades)
+    // Cache: specVersion rarely changes (only on runtime upgrades, weeks/months apart).
+    // We cache the value once and trust it for all subsequent blocks. Refreshed
+    // on demand when callers detect a runtime upgrade (currently never -- a
+    // follow-up could probe `system_version` periodically during catch-up).
     private cachedSpecVersion: number = 0;
-    private cachedSpecVersionHash: string | null = null;
+    private cachedSpecVersionValid: boolean = false;
 
     /** Well-known Substrate storage key for Timestamp::Now (twox128("Timestamp") + twox128("Now")) */
     private static readonly TIMESTAMP_STORAGE_KEY =
@@ -122,7 +159,7 @@ export class BlockProcessor {
     }
 
     /**
-     * Process a single block by hash — fetch, parse, and persist atomically
+     * Process a single block by hash, fetch, parse, and persist atomically
      */
     async processBlockByHash(blockHash: string): Promise<ProcessResult> {
         const start = Date.now();
@@ -136,6 +173,171 @@ export class BlockProcessor {
         const hash = await this.nodeProvider.getBlockHash(height);
         if (!hash) throw new Error(`No block at height ${height}`);
         return this.processBlockByHash(hash);
+    }
+
+    /**
+     * Fetch all data for a block in parallel without writing to the DB.
+     * Used by the parallel catch-up pipeline so multiple block fetches can
+     * be in flight while writes to SQLite happen serially in height order.
+     */
+    async fetchBlockData(height: number): Promise<PreparedBlock> {
+        const fetchStartedAt = Date.now();
+        const blockHash = await this.nodeProvider.getBlockHash(height);
+        if (!blockHash) throw new Error(`No block at height ${height}`);
+
+        if (await this.blockExists(blockHash)) {
+            // We still need height; getBlockHash already gave us hash. Skip the
+            // expensive full-block fetch and let persist short-circuit.
+            return {
+                blockHash,
+                height,
+                fetchStartedAt,
+                alreadyIndexed: true
+            };
+        }
+
+        // Three independent RPCs over the same WSS connection. The provider
+        // multiplexes by request id, so these resolve in parallel.
+        const [signedBlock, timestamp, protocolVersion] = await Promise.all([
+            this.nodeProvider.getBlock(blockHash),
+            this.getBlockTimestamp(blockHash),
+            this.getProtocolVersion(blockHash)
+        ]);
+
+        return {
+            blockHash,
+            height,
+            signedBlock,
+            protocolVersion,
+            timestamp,
+            fetchStartedAt,
+            fetchCompletedAt: Date.now(),
+            alreadyIndexed: false
+        };
+    }
+
+    /**
+     * Fetch a contiguous range of blocks in two JSON-RPC batches.
+     *
+     * Round 1: `chain_getBlockHash(h)` for every height → 1 WSS round-trip
+     * Round 2: for every NEW hash, `chain_getBlock(h)` + `state_getStorage(timestamp_key, h)`
+     *           together in one batch frame → 1 WSS round-trip
+     *
+     * Total: 2 RTTs per N blocks instead of 2 RTTs per block. Collapses the
+     * `getBlockHash → getBlock` sequential dep that was the main bottleneck
+     * at ~32 bps on a public WSS endpoint.
+     *
+     * Already-indexed blocks are returned with `alreadyIndexed: true` so the
+     * persist phase no-ops on them.
+     */
+    async fetchBlockBatch(heights: number[]): Promise<PreparedBlock[]> {
+        if (heights.length === 0) return [];
+        const fetchStartedAt = Date.now();
+
+        // Round 1: heights → hashes, one batched RPC frame.
+        const hashes = await this.nodeProvider.rpcBatch(
+            heights.map(h => ({ method: 'chain_getBlockHash', params: [h] }))
+        ) as string[];
+
+        // Bulk SELECT: which of these hashes are already in the DB? One CQN call.
+        const truthyHashes = hashes.filter((h): h is string => !!h);
+        const existing: Array<{ hash: string }> = truthyHashes.length
+            ? (await this.db.run(
+                SELECT.from('midnight.Blocks').columns('hash').where({ hash: { in: truthyHashes } })
+              ) || [])
+            : [];
+        const existingSet = new Set(existing.map(r => r.hash));
+
+        // Collect the indices of NEW blocks we still need to fetch.
+        const newIndices: number[] = [];
+        for (let i = 0; i < heights.length; i++) {
+            if (hashes[i] && !existingSet.has(hashes[i])) newIndices.push(i);
+        }
+
+        // Round 2: getBlock + getStorage(timestamp) for every new hash, one batch.
+        // Order: [block0, ts0, block1, ts1, ...] so we can de-interleave by index.
+        let blockResults: SignedBlock[] = [];
+        let tsResults: (string | null)[] = [];
+        if (newIndices.length > 0) {
+            const requests: Array<{ method: string; params: unknown[] }> = [];
+            for (const i of newIndices) {
+                requests.push({ method: 'chain_getBlock', params: [hashes[i]] });
+                requests.push({ method: 'state_getStorage', params: [BlockProcessor.TIMESTAMP_STORAGE_KEY, hashes[i]] });
+            }
+            const flat = await this.nodeProvider.rpcBatch(requests);
+            blockResults = newIndices.map((_, k) => flat[k * 2]);
+            tsResults    = newIndices.map((_, k) => flat[k * 2 + 1]);
+        }
+
+        // ProtocolVersion is cached after the first hit, so this is a no-op
+        // RPC for the second batch onward. Calling it on the first hash of
+        // the batch is enough to warm the cache.
+        const protocolVersion = heights.length > 0 && hashes[0]
+            ? await this.getProtocolVersion(hashes[0])
+            : this.cachedSpecVersion;
+
+        const fetchCompletedAt = Date.now();
+
+        // Assemble PreparedBlock[] in the same order as input heights.
+        const out: PreparedBlock[] = new Array(heights.length);
+        let newIdx = 0;
+        for (let i = 0; i < heights.length; i++) {
+            const blockHash = hashes[i];
+            if (!blockHash) {
+                throw new Error(`No block at height ${heights[i]}`);
+            }
+            if (existingSet.has(blockHash)) {
+                out[i] = {
+                    blockHash,
+                    height: heights[i],
+                    fetchStartedAt,
+                    alreadyIndexed: true
+                };
+                continue;
+            }
+            const signedBlock = blockResults[newIdx];
+            const timestamp = this.parseTimestampHex(tsResults[newIdx]);
+            newIdx++;
+            out[i] = {
+                blockHash,
+                height: heights[i],
+                signedBlock,
+                protocolVersion,
+                timestamp,
+                fetchStartedAt,
+                fetchCompletedAt,
+                alreadyIndexed: false
+            };
+        }
+        return out;
+    }
+
+    private parseTimestampHex(hex: string | null | undefined): number {
+        if (!hex) return Math.floor(Date.now() / 1000);
+        const clean = hex.startsWith('0x') ? hex.slice(2) : hex;
+        try {
+            return Number(Buffer.from(clean, 'hex').readBigUInt64LE(0) / 1000n);
+        } catch {
+            return Math.floor(Date.now() / 1000);
+        }
+    }
+
+    /**
+     * Persist a prefetched block. Mirror of the persist phase in
+     * `processFromNode`, but skips all RPC calls.
+     */
+    async persistPreparedBlock(prep: PreparedBlock): Promise<ProcessResult> {
+        const start = prep.fetchStartedAt;
+        if (prep.alreadyIndexed) {
+            return {
+                blockHeight: prep.height,
+                blockHash: prep.blockHash,
+                transactionCount: 0,
+                contractActionCount: 0,
+                processingTimeMs: Date.now() - start
+            };
+        }
+        return this.persistFromNode(prep, start);
     }
 
     /**
@@ -165,17 +367,33 @@ export class BlockProcessor {
             };
         }
 
-        const signedBlock = await this.nodeProvider.getBlock(blockHash);
+        // Parallelize the three independent RPC fetches over the same WSS.
+        const [signedBlock, timestamp, protocolVersion] = await Promise.all([
+            this.nodeProvider.getBlock(blockHash),
+            this.getBlockTimestamp(blockHash),
+            this.getProtocolVersion(blockHash)
+        ]);
         const header = signedBlock.block.header;
         const height = MidnightNodeProvider.parseBlockNumber(header.number);
+
+        return this.persistFromNode({
+            blockHash,
+            height,
+            signedBlock,
+            protocolVersion,
+            timestamp,
+            fetchStartedAt: start,
+            alreadyIndexed: false
+        }, start);
+    }
+
+    private async persistFromNode(prep: PreparedBlockFetched, start: number): Promise<ProcessResult> {
+        const { blockHash, height, signedBlock, protocolVersion, timestamp } = prep;
+        const header = signedBlock.block.header;
         const extrinsics = signedBlock.block.extrinsics;
 
         let txCount = 0;
         let actionCount = 0;
-
-        // Fetch canonical metadata from node (outside tx for RPC calls)
-        const protocolVersion = await this.getProtocolVersion(blockHash);
-        const timestamp = await this.getBlockTimestamp(blockHash);
 
         // Atomic DB write
         await this.db.tx(async (tx: any) => {
@@ -196,7 +414,21 @@ export class BlockProcessor {
                 parent_ID: parentBlock?.ID || null
             }));
 
-            // 2. Parse extrinsics as transactions
+            // 2. Parse extrinsics into rows for bulk insert.
+            // Each extrinsic produced 4-6 individual `tx.run(INSERT…)` calls
+            // before; batching cuts that to one INSERT per table regardless of
+            // tx count. CAP rewrites array-entries INSERTs into a single
+            // SQLite VALUES(...) statement, which collapses prepare/run overhead.
+            const txRows: Record<string, unknown>[] = [];
+            const txResultRows: Record<string, unknown>[] = [];
+            const txFeeRows: Record<string, unknown>[] = [];
+            const contractActionRows: Record<string, unknown>[] = [];
+            const pendingReconciles: Array<{ hash: string; ctx: Record<string, unknown> }> = [];
+            const transferProjections: Array<{
+                txId: string; txHash: string; blockHeight: number; blockTimestamp: number;
+                senderAddress: string | null; receiverAddress: string; amount: string; outputIndex: number;
+            }> = [];
+
             for (let i = 0; i < extrinsics.length; i++) {
                 const extrinsicHex = extrinsics[i];
                 const txId = cds.utils.uuid();
@@ -212,7 +444,7 @@ export class BlockProcessor {
                 const receiverAddress = isTransferLike ? participants!.receiverAddress! : null;
                 const nightAmount = isTransferLike ? participants!.amount! : null;
 
-                await tx.run(INSERT.into('midnight.Transactions').entries({
+                txRows.push({
                     ID: txId,
                     transactionId: i,
                     hash: extrinsicHash,
@@ -230,24 +462,31 @@ export class BlockProcessor {
                     circuitName,
                     size: txSize,
                     block_ID: blockId
-                }));
+                });
 
-                // Baseline tx child records keep exposed compositions queryable.
-                await tx.run(INSERT.into('midnight.TransactionResults').entries({
+                txResultRows.push({
                     ID: cds.utils.uuid(),
                     status: 'SUCCESS',
                     transaction_ID: txId
-                }));
+                });
 
-                await tx.run(INSERT.into('midnight.TransactionFees').entries({
+                txFeeRows.push({
                     ID: cds.utils.uuid(),
                     paidFees: '0',
                     estimatedFees: '0',
                     transaction_ID: txId
-                }));
+                });
+
+                pendingReconciles.push({
+                    hash: extrinsicHash,
+                    ctx: {
+                        txId, transactionId: i, txType: classification.txType,
+                        contractAddress, circuitName, blockId, blockHeight: height, timestamp
+                    }
+                });
 
                 if (isTransferLike && receiverAddress && nightAmount) {
-                    await this.persistTransferProjections(tx, {
+                    transferProjections.push({
                         txId,
                         txHash: extrinsicHash,
                         blockHeight: height,
@@ -259,20 +498,35 @@ export class BlockProcessor {
                     });
                 }
 
-                txCount++;
-
-                // Track contract actions from extrinsic classification
                 if (contractActionType && contractAddress) {
-                    await tx.run(INSERT.into('midnight.ContractActions').entries({
+                    contractActionRows.push({
                         ID: cds.utils.uuid(),
                         address: contractAddress,
                         actionType: contractActionType,
                         entryPoint: circuitName,
                         state: extrinsicHex,
                         transaction_ID: txId
-                    }));
+                    });
                     actionCount++;
                 }
+
+                txCount++;
+            }
+
+            // Bulk inserts: one statement per table regardless of tx count.
+            if (txRows.length)             await tx.run(INSERT.into('midnight.Transactions').entries(txRows));
+            if (txResultRows.length)       await tx.run(INSERT.into('midnight.TransactionResults').entries(txResultRows));
+            if (txFeeRows.length)          await tx.run(INSERT.into('midnight.TransactionFees').entries(txFeeRows));
+            if (contractActionRows.length) await tx.run(INSERT.into('midnight.ContractActions').entries(contractActionRows));
+
+            // Cold path: PendingSubmissions updates + balance projections.
+            // No-op for most blocks. Kept sequential because the balance
+            // upsert is read-modify-write and order-dependent within a block.
+            for (const r of pendingReconciles) {
+                await reconcilePendingSubmission(tx, r.hash, r.ctx);
+            }
+            for (const tp of transferProjections) {
+                await this.persistTransferProjections(tx, tp);
             }
 
             // 3. Update SyncState
@@ -555,16 +809,25 @@ export class BlockProcessor {
     }
 
     /**
-     * Get the runtime specVersion at a specific block. Caches since version only changes on upgrades.
+     * Get the runtime specVersion at a specific block.
+     *
+     * Substrate runtime upgrades are rare (weeks/months apart on Midnight).
+     * After the first successful fetch we cache the specVersion for the lifetime
+     * of the process — saves one RPC per block during catch-up. Downside: if a
+     * runtime upgrade lands while NIGHTGATE is running, blocks after the upgrade
+     * will record the pre-upgrade specVersion. Acceptable trade-off; the
+     * crawler can be restarted to pick up the new version. A follow-up could
+     * detect upgrades via the digest-log `RuntimeEnvironmentUpdated` event and
+     * invalidate the cache.
      */
     private async getProtocolVersion(blockHash: string): Promise<number> {
-        if (this.cachedSpecVersionHash === blockHash) {
+        if (this.cachedSpecVersionValid) {
             return this.cachedSpecVersion;
         }
         try {
             const rv = await this.nodeProvider.getRuntimeVersion(blockHash);
             this.cachedSpecVersion = rv.specVersion;
-            this.cachedSpecVersionHash = blockHash;
+            this.cachedSpecVersionValid = true;
             return rv.specVersion;
         } catch (err) {
             console.warn(`[BlockProcessor] Failed to get runtime version for ${blockHash}: ${(err as Error).message}`);

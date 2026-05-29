@@ -1,0 +1,16 @@
+// Minimal Compact contract for NIGHTGATE's first registered artifact.
+// Mirrors example-counter (github.com/midnightntwrk/example-counter) so we
+// inherit a known-good upstream pattern. T10-extended replaces this with the
+// tiered-disclosure AttestationVault once that pattern is designed.
+
+pragma language_version >= 0.20;
+
+import CompactStandardLibrary;
+
+// public state, round number, persisted on-chain
+export ledger round: Counter;
+
+// circuit: increment the counter by 1
+export circuit increment(): [] {
+  round.increment(1);
+}

@@ -8,7 +8,7 @@
 import cds from '@sap/cds';
 const { SELECT, INSERT } = cds.ql;
 
-import { getConfiguredNightgateNodeUrl, resolveNightgateRuntimeConfig } from './nightgate-config';
+import { getConfiguredNightgateNodeUrl, resolveNightgateRuntimeConfig, getNightgatePluginConfig } from './nightgate-config';
 
 export async function ensureSyncStateSingleton(db: any, nodeUrl?: string): Promise<void> {
     const existing = await db.run(
@@ -17,7 +17,7 @@ export async function ensureSyncStateSingleton(db: any, nodeUrl?: string): Promi
 
     if (!existing) {
         try {
-            const nightgateConfig = (cds.env as any).requires?.nightgate || {};
+            const nightgateConfig = getNightgatePluginConfig();
             const { network } = resolveNightgateRuntimeConfig(nightgateConfig);
             const configuredNodeUrl = getConfiguredNightgateNodeUrl(nightgateConfig);
             await db.run(INSERT.into('midnight.SyncState').entries({
@@ -30,7 +30,7 @@ export async function ensureSyncStateSingleton(db: any, nodeUrl?: string): Promi
                 consecutiveErrors: 0
             }));
         } catch (err: any) {
-            // Race condition: another service instance inserted first — safe to ignore
+            // Race condition: another service instance inserted first, safe to ignore
             if (!err.message?.includes('UNIQUE constraint')) throw err;
         }
     }

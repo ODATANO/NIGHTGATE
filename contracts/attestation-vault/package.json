@@ -1,0 +1,7 @@
+{
+  "name": "@odatano/nightgate-contract-attestation-vault",
+  "private": true,
+  "type": "module",
+  "description": "AttestationVault Compact contract (T10-extended). Tiered-disclosure attestations on Midnight, with on-chain attester-only access control for grant/revoke.",
+  "main": "src/managed/attestation-vault/contract/index.js"
+}

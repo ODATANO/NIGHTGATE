@@ -1,7 +1,7 @@
 {
   "name": "@odatano/nightgate",
-  "version": "0.1.2",
-  "description": "CAP Plugin — Midnight Blockchain Indexer with OData V4 API",
+  "version": "0.3.0",
+  "description": "CAP Plugin: Midnight Blockchain Indexer with OData V4 API",
   "homepage": "https://github.com/ODATANO/ODATANO-NIGHT/tree/main/packages/indexer",
   "repository": {
     "type": "git",
@@ -26,6 +26,9 @@
   "main": "src/index.js",
   "types": "src/index.d.ts",
   "type": "commonjs",
+  "imports": {
+    "#cds-models/*": "./@cds-models/*/index.js"
+  },
   "exports": {
     ".": {
       "types": "./src/index.d.ts",
@@ -34,16 +37,27 @@
     "./types": {
       "types": "./srv/types/index.d.ts",
       "default": "./srv/types/index.js"
-    }
+    },
+    "./sdk/AttestationService": {
+      "types": "./src/sdk/AttestationService.d.ts",
+      "default": "./src/sdk/AttestationService.js"
+    },
+    "./sdk/AttestationService.cds": "./src/sdk/AttestationService.cds"
   },
   "files": [
     "cds-plugin.js",
     "db/schema.cds",
+    "db/types.cds",
+    "src/**/*.cds",
     "src/**/*.js",
     "src/**/*.d.ts",
     "srv/**/*.cds",
     "srv/**/*.js",
     "srv/**/*.d.ts",
+    "@cds-models/**/*.js",
+    "@cds-models/**/*.d.ts",
+    "contracts/**/managed/**/*",
+    "contracts/**/package.json",
     "README.md",
     "LICENSE"
   ],
@@ -51,25 +65,48 @@
     "clean": "node scripts/clean-build-artifacts.js",
     "prestart": "npm run build",
     "start": "npm run serve",
-    "dev": "npm run cds:watch",
+    "dev": "node scripts/dev.mjs",
+    "dev:default-heap": "npm run cds:watch",
     "build": "npm run build:plugin",
     "build:plugin": "npm run cds:types && tsc -p tsconfig.build.json",
     "serve": "npm run cds:serve",
+    "serve:sync": "node scripts/serve.mjs",
+    "sync:start": "node --env-file=.env scripts/start-wallet-sync.mjs",
+    "sync:probe": "node scripts/probe-indexer.mjs",
     "cds:watch": "cds watch",
     "cds:serve": "cds-serve",
     "cds:types": "cds-typer \"*\" --outputDirectory @cds-models",
     "build:types": "npm run cds:types",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "deploy": "cds deploy",
+    "deploy": "cds deploy --to sqlite:db/midnight.db",
     "test": "jest --coverage",
     "test:unit": "jest --testPathPattern=test/unit",
+    "smoke:sdk": "node scripts/smoke-test-sdk.mjs",
+    "integration:providers": "node scripts/integration-test-providers.mjs",
+    "integration:wallet-keys": "node scripts/integration-test-wallet-keys.mjs",
+    "integration:wallet-facade": "node scripts/integration-test-wallet-facade.mjs",
+    "integration:contract-registry": "node scripts/integration-test-contract-registry.mjs",
+    "integration:attestation-vault": "node scripts/integration-test-attestation-vault.mjs",
+    "t15": "node --env-file=.env scripts/run-t15.mjs",
+    "predicate:e2e": "node --env-file=.env scripts/run-predicate-e2e.mjs",
     "lint": "eslint .",
     "prepack": "npm run build:plugin",
     "prepublishOnly": "npm run typecheck && npm test && npm run build:plugin"
   },
   "dependencies": {
+    "@midnight-ntwrk/compact-runtime": "^0.16.0",
+    "@midnight-ntwrk/ledger-v8": "^8.1.0",
+    "@midnight-ntwrk/midnight-js-contracts": "^4.0.4",
+    "@midnight-ntwrk/midnight-js-http-client-proof-provider": "^4.0.4",
+    "@midnight-ntwrk/midnight-js-indexer-public-data-provider": "^4.0.4",
+    "@midnight-ntwrk/midnight-js-level-private-state-provider": "^4.0.4",
+    "@midnight-ntwrk/midnight-js-node-zk-config-provider": "^4.0.4",
+    "@midnight-ntwrk/wallet-sdk-facade": "^4.0.0",
+    "@midnight-ntwrk/wallet-sdk-hd": "^3.0.2",
     "@noble/hashes": "^1.8.0",
+    "bip39": "^3.1.0",
     "express": "^4",
+    "undici": "^8.3.0",
     "ws": "^8"
   },
   "peerDependencies": {
@@ -98,7 +135,19 @@
         }
       },
       "nightgate": {
-        "kind": "nightgate"
+        "kind": "nightgate",
+        "contracts": {
+          "counter": {
+            "artifactPath": "contracts/counter/src/managed/counter/contract/index.js",
+            "privateStateId": "counterPrivateState",
+            "zkConfigPath": "contracts/counter/src/managed/counter"
+          },
+          "attestation-vault": {
+            "artifactPath": "contracts/attestation-vault/src/managed/attestation-vault/contract/index.js",
+            "privateStateId": "attestationVaultPrivateState",
+            "zkConfigPath": "contracts/attestation-vault/src/managed/attestation-vault"
+          }
+        }
       },
       "kinds": {}
     },

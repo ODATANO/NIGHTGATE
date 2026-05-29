@@ -32,14 +32,14 @@ service NightgateIndexerService {
     // Get reorg history
     function getReorgHistory(limit: Integer)      returns array of ReorgLog;
 
-    // K8s liveness probe — returns 200 if process is alive
+    // K8s liveness probe, returns 200 if process is alive
     function getLiveness()                        returns {
         status    : String;
         timestamp : Timestamp;
         uptime    : Integer;
     };
 
-    // K8s readiness probe — returns 200 only if subsystems are ready
+    // K8s readiness probe, returns 200 only if subsystems are ready
     function getReadiness()                       returns {
         ready  : Boolean;
         checks : {

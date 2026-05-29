@@ -1,5 +1,5 @@
 /**
- * NightgateAnalyticsService — Aggregated Blockchain Statistics
+ * NightgateAnalyticsService, Aggregated Blockchain Statistics
  *
  * Provides count and average functions over indexed blockchain data.
  * Entity views (BlockStatistics, ContractStatistics) are handled by CDS automatically.
@@ -9,7 +9,7 @@ import cds from '@sap/cds';
 const { SELECT } = cds.ql;
 
 export default class NightgateAnalyticsService extends cds.ApplicationService {
-    private db!: any;
+    private db!: cds.DatabaseService;
 
     async init(): Promise<void> {
         this.db = await cds.connect.to('db');

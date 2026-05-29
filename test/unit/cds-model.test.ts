@@ -1,9 +1,11 @@
 const loadMock = jest.fn();
+const linkedMock = jest.fn();
 
 jest.mock('@sap/cds', () => {
     const cds: any = {
         model: undefined,
-        load: loadMock
+        load: loadMock,
+        linked: linkedMock
     };
     cds.default = cds;
     return cds;
@@ -19,13 +21,16 @@ describe('ensureNightgateModelLoaded', () => {
     });
 
     it('loads and assigns the CDS model when it is missing', async () => {
-        const model = { definitions: { 'midnight.SyncState': {} } };
-        loadMock.mockResolvedValue(model);
+        const csn = { definitions: { 'midnight.SyncState': {} } };
+        const linkedCsn = { definitions: { 'midnight.SyncState': {} }, __linked: true };
+        loadMock.mockResolvedValue(csn);
+        linkedMock.mockReturnValue(linkedCsn);
 
         await ensureNightgateModelLoaded();
 
         expect(loadMock).toHaveBeenCalledWith('*');
-        expect((cds as any).model).toBe(model);
+        expect(linkedMock).toHaveBeenCalledWith(csn);
+        expect((cds as any).model).toBe(linkedCsn);
     });
 
     it('does not reload the CDS model when it already exists', async () => {
@@ -35,6 +40,39 @@ describe('ensureNightgateModelLoaded', () => {
         await ensureNightgateModelLoaded();
 
         expect(loadMock).not.toHaveBeenCalled();
+        expect(linkedMock).not.toHaveBeenCalled();
         expect((cds as any).model).toBe(model);
+    });
+
+    it('returns silently when cds.load is unavailable (partial test mocks)', async () => {
+        const originalLoad = (cds as any).load;
+        (cds as any).load = undefined;
+        try {
+            await ensureNightgateModelLoaded();
+            expect((cds as any).model).toBeUndefined();
+            expect(linkedMock).not.toHaveBeenCalled();
+        } finally {
+            (cds as any).load = originalLoad;
+        }
+    });
+
+    it('returns silently when cds.load resolves to a falsy CSN', async () => {
+        loadMock.mockResolvedValue(undefined);
+        await ensureNightgateModelLoaded();
+        expect(linkedMock).not.toHaveBeenCalled();
+        expect((cds as any).model).toBeUndefined();
+    });
+
+    it('assigns the raw CSN when cds.linked is not a function', async () => {
+        const csn = { definitions: { 'midnight.SyncState': {} }, __raw: true };
+        const originalLinked = (cds as any).linked;
+        loadMock.mockResolvedValue(csn);
+        (cds as any).linked = undefined;
+        try {
+            await ensureNightgateModelLoaded();
+            expect((cds as any).model).toBe(csn);
+        } finally {
+            (cds as any).linked = originalLinked;
+        }
     });
 });

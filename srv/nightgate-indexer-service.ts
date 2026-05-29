@@ -8,18 +8,22 @@ import cds, { Request } from '@sap/cds';
 const { SELECT, UPDATE, DELETE } = cds.ql;
 
 import { ensureNightgateModelLoaded } from './utils/cds-model';
-import { resolveNightgateRuntimeConfig } from './utils/nightgate-config';
+import { resolveNightgateRuntimeConfig, getNightgatePluginConfig } from './utils/nightgate-config';
 import { ensureSyncStateSingleton } from './utils/sync-state';
 import { isCrawlerRunning, startCrawler, stopCrawler } from './crawler';
 
 const processStartTime = Date.now();
 const metricPrefix = 'odatano_nightgate';
 
+/** Shape of an ID-projected query result. Used by the rollback path which
+ *  only needs row IDs for cascading deletes. */
+interface IdRow { ID: string }
+
 export default class NightgateIndexerService extends cds.ApplicationService {
-    private db!: any;
+    private db!: cds.DatabaseService;
 
     private resolveCrawlerStartConfig(): { enabled: boolean; nodeUrl: string; requestTimeout?: number } {
-        const { crawlerConfig, crawlerNodeUrl } = resolveNightgateRuntimeConfig((cds.env as any).requires?.nightgate || {});
+        const { crawlerConfig, crawlerNodeUrl } = resolveNightgateRuntimeConfig(getNightgatePluginConfig());
         return {
             ...(crawlerConfig as Record<string, unknown>),
             enabled: true,
@@ -51,17 +55,17 @@ export default class NightgateIndexerService extends cds.ApplicationService {
             };
         }
 
-        const blockIds = blocksToRollback.map((b: any) => b.ID).filter(Boolean);
-        const txsToDelete = blockIds.length > 0
-            ? await this.db.run(SELECT.from('midnight.Transactions').where({ block_ID: { in: blockIds } })) || []
+        const blockIds = (blocksToRollback as IdRow[]).map(b => b.ID).filter(Boolean);
+        const txsToDelete: IdRow[] = blockIds.length > 0
+            ? await this.db.run(SELECT.from('midnight.Transactions').columns('ID').where({ block_ID: { in: blockIds } })) || []
             : [];
-        const txIds = txsToDelete.map((t: any) => t.ID).filter(Boolean);
+        const txIds = txsToDelete.map(t => t.ID).filter(Boolean);
 
         if (txIds.length > 0) {
-            const actionsToDelete = await this.db.run(
-                SELECT.from('midnight.ContractActions').where({ transaction_ID: { in: txIds } })
+            const actionsToDelete: IdRow[] = await this.db.run(
+                SELECT.from('midnight.ContractActions').columns('ID').where({ transaction_ID: { in: txIds } })
             ) || [];
-            const actionIds = actionsToDelete.map((a: any) => a.ID).filter(Boolean);
+            const actionIds = actionsToDelete.map(a => a.ID).filter(Boolean);
 
             if (actionIds.length > 0) {
                 await this.db.run(DELETE.from('midnight.ContractBalances').where({ contractAction_ID: { in: actionIds } }));
@@ -73,10 +77,10 @@ export default class NightgateIndexerService extends cds.ApplicationService {
             await this.db.run(DELETE.from('midnight.DustLedgerEvents').where({ transaction_ID: { in: txIds } }));
             await this.db.run(DELETE.from('midnight.TransactionFees').where({ transaction_ID: { in: txIds } }));
 
-            const resultsToDelete = await this.db.run(
-                SELECT.from('midnight.TransactionResults').where({ transaction_ID: { in: txIds } })
+            const resultsToDelete: IdRow[] = await this.db.run(
+                SELECT.from('midnight.TransactionResults').columns('ID').where({ transaction_ID: { in: txIds } })
             ) || [];
-            const resultIds = resultsToDelete.map((r: any) => r.ID).filter(Boolean);
+            const resultIds = resultsToDelete.map(r => r.ID).filter(Boolean);
             if (resultIds.length > 0) {
                 await this.db.run(DELETE.from('midnight.TransactionSegments').where({ transactionResult_ID: { in: resultIds } }));
             }

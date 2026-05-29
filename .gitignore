@@ -6,6 +6,9 @@ gen/
 db/*.db
 db/*.db-shm
 db/*.db-wal
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
 
 # In-place TypeScript build output
 src/**/*.js
@@ -41,3 +44,7 @@ npm-debug.log*
 
 CLAUDE.MD
 AGENTS.md
+
+# Internal planning / feature-request docs — kept local only
+db/enhancements.md
+docs/feature-requests/zk-predicate-attestation.md

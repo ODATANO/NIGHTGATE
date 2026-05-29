@@ -89,9 +89,15 @@ jest.mock('@sap/cds', () => {
 
 const mockProcessorInit = jest.fn();
 const mockProcessorProcessBlockByHeight = jest.fn();
+const mockProcessorFetchBlockData = jest.fn();
+const mockProcessorFetchBlockBatch = jest.fn();
+const mockProcessorPersistPreparedBlock = jest.fn();
 const mockBlockProcessorConstructor = jest.fn().mockImplementation(() => ({
     init: mockProcessorInit,
-    processBlockByHeight: mockProcessorProcessBlockByHeight
+    processBlockByHeight: mockProcessorProcessBlockByHeight,
+    fetchBlockData: mockProcessorFetchBlockData,
+    fetchBlockBatch: mockProcessorFetchBlockBatch,
+    persistPreparedBlock: mockProcessorPersistPreparedBlock
 }));
 
 jest.mock('../../srv/crawler/BlockProcessor', () => ({
@@ -112,6 +118,9 @@ describe('MidnightCrawler orchestration', () => {
         mockUuid.mockReset().mockReturnValue('reorg-log-1');
         mockProcessorInit.mockReset().mockResolvedValue(undefined);
         mockProcessorProcessBlockByHeight.mockReset();
+        mockProcessorFetchBlockData.mockReset();
+        mockProcessorFetchBlockBatch.mockReset();
+        mockProcessorPersistPreparedBlock.mockReset();
         mockBlockProcessorConstructor.mockClear();
     });
 
@@ -227,26 +236,47 @@ describe('MidnightCrawler orchestration', () => {
         const crawler = new MidnightCrawler(provider as any, { enabled: true, batchSize: 10 });
         (crawler as any).db = { run: mockDbRun };
         (crawler as any).isRunning = true;
+        (crawler as any).processor = {
+            fetchBlockBatch: mockProcessorFetchBlockBatch,
+            persistPreparedBlock: mockProcessorPersistPreparedBlock
+        };
 
         jest.spyOn(crawler as any, 'getSyncState').mockResolvedValue({
             lastIndexedHeight: 0,
             lastIndexedHash: '0x0'
         });
-        const processSpy = jest.spyOn(crawler as any, 'processBlockWithRetry')
-            .mockResolvedValue({
-                blockHeight: 1,
-                blockHash: '0x1',
-                transactionCount: 1,
-                contractActionCount: 0,
-                processingTimeMs: 5
+        // Pipelined catch-up: fetch a batch of heights, then persist them
+        // serially in height order. Spy on the batch retry shim so we can
+        // assert the height ranges that were requested.
+        const fetchSpy = jest.spyOn(crawler as any, 'fetchBlockBatchWithRetry')
+            .mockImplementation(async (...args: any[]) => {
+                const heights = args[0] as number[];
+                return heights.map(h => ({
+                    blockHash: `0x${h}`,
+                    height: h,
+                    signedBlock: null,
+                    protocolVersion: 1,
+                    timestamp: 0,
+                    fetchStartedAt: Date.now(),
+                    fetchCompletedAt: Date.now(),
+                    alreadyIndexed: false
+                }));
             });
+        mockProcessorPersistPreparedBlock.mockResolvedValue({
+            blockHeight: 1,
+            blockHash: '0x1',
+            transactionCount: 1,
+            contractActionCount: 0,
+            processingTimeMs: 5
+        });
 
         await expect((crawler as any).catchUp()).resolves.toBe(2);
 
         expect(provider.getFinalizedHead).toHaveBeenCalled();
         expect(provider.getHeader).toHaveBeenCalledWith('0x2');
-        expect(processSpy).toHaveBeenNthCalledWith(1, 1);
-        expect(processSpy).toHaveBeenNthCalledWith(2, 2);
+        // First (and likely only) batch should cover heights [1, 2].
+        expect(fetchSpy).toHaveBeenCalledWith([1, 2]);
+        expect(mockProcessorPersistPreparedBlock).toHaveBeenCalledTimes(2);
         expect((crawler as any).isCatchingUp).toBe(false);
         expect(mockDbRun).toHaveBeenCalled();
     });
@@ -299,7 +329,11 @@ describe('MidnightCrawler orchestration', () => {
         getSyncStateSpy
             .mockResolvedValueOnce({ lastIndexedHeight: 0, lastIndexedHash: null })
             .mockResolvedValueOnce({ consecutiveErrors: 11 });
-        jest.spyOn(crawler as any, 'processBlockWithRetry').mockRejectedValue(new Error('Request timeout'));
+        (crawler as any).processor = {
+            fetchBlockBatch: mockProcessorFetchBlockBatch,
+            persistPreparedBlock: mockProcessorPersistPreparedBlock
+        };
+        jest.spyOn(crawler as any, 'fetchBlockBatchWithRetry').mockRejectedValue(new Error('Request timeout'));
         const recordErrorSpy = jest.spyOn(crawler as any, 'recordError').mockResolvedValue(undefined);
         const errorSpy = jest.spyOn(console, 'error').mockImplementation();
 
@@ -325,7 +359,14 @@ describe('MidnightCrawler orchestration', () => {
         getSyncStateSpy
             .mockResolvedValueOnce({ lastIndexedHeight: 0, lastIndexedHash: null })
             .mockResolvedValueOnce({ consecutiveErrors: 2 });
-        jest.spyOn(crawler as any, 'processBlockWithRetry').mockRejectedValueOnce(new Error('Request timeout'));
+        (crawler as any).processor = {
+            fetchBlockBatch: mockProcessorFetchBlockBatch,
+            persistPreparedBlock: mockProcessorPersistPreparedBlock
+        };
+        // All batches in this test fail with the same transient error. The
+        // breaker mock returns consecutiveErrors: 2 (below the threshold of 10)
+        // so the pipeline should record errors and finish without bailing.
+        jest.spyOn(crawler as any, 'fetchBlockBatchWithRetry').mockRejectedValue(new Error('Request timeout'));
         const recordErrorSpy = jest.spyOn(crawler as any, 'recordError').mockResolvedValue(undefined);
         const errorSpy = jest.spyOn(console, 'error').mockImplementation();
 

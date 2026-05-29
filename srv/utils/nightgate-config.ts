@@ -1,12 +1,99 @@
+import cds from '@sap/cds';
+
 export const VALID_NIGHTGATE_NETWORKS = ['testnet', 'preprod', 'mainnet'] as const;
 
 export type NightgateNetwork = (typeof VALID_NIGHTGATE_NETWORKS)[number];
 
+/**
+ * Plugin configuration consumed under `cds.requires.nightgate`. CAP injects
+ * this object via package.json / .cdsrc / env-var merging. Fields are
+ * intentionally optional — defaults come from this module's DEFAULT_* values.
+ */
+export interface NightgatePluginConfig {
+    network?: string;
+    nodeUrl?: string;
+    indexerHttpUrl?: string;
+    indexerWsUrl?: string;
+    proofServerUrl?: string;
+    crawlerNodeUrl?: string;
+    privateStateBackend?: PrivateStateBackend;
+    sessionTtlMs?: number;
+    corsOrigin?: string | string[];
+    contentSecurityPolicy?: string | false | 'off';
+    palletMap?: Record<string, { name: string; txType: string; isShielded?: boolean; isSystem?: boolean }>;
+    crawler?: {
+        enabled?: boolean;
+        nodeUrl?: string;
+        fetchConcurrency?: number;
+        rpcBatchSize?: number;
+        requestTimeout?: number;
+    };
+    contracts?: Record<string, {
+        artifactPath: string;
+        privateStateId: string;
+        zkConfigPath: string;
+    }>;
+    // CAP permits additional plugin-specific keys we don't model here.
+    [k: string]: unknown;
+}
+
+/**
+ * Single-cast accessor for the plugin's CAP config block.
+ *
+ * `cds.env` is typed as a freeform object by CAP (it merges package.json,
+ * .cdsrc, and env vars at runtime, so the shape is genuinely dynamic).
+ * Rather than scattering `(cds.env as any).requires?.nightgate` across every
+ * callsite — which we did before and got rightly called out for — the cast
+ * lives ONCE here and every other site reads a properly typed
+ * `NightgatePluginConfig` via this function.
+ */
+export function getNightgatePluginConfig(): NightgatePluginConfig {
+    const env = cds.env as { requires?: { nightgate?: NightgatePluginConfig } };
+    return env.requires?.nightgate ?? {};
+}
+
 export const DEFAULT_NETWORK: NightgateNetwork = 'preprod';
 export const DEFAULT_NODE_URL = 'wss://rpc.preprod.midnight.network/';
 
+export const DEFAULT_INDEXER_URLS: Record<NightgateNetwork, { http: string; ws: string }> = {
+    preprod: {
+        http: 'https://indexer.preprod.midnight.network/api/v4/graphql',
+        ws:   'wss://indexer.preprod.midnight.network/api/v4/graphql/ws'
+    },
+    testnet: {
+        http: 'http://localhost:8088/api/v4/graphql',
+        ws:   'ws://localhost:8088/api/v4/graphql/ws'
+    },
+    mainnet: {
+        http: 'https://indexer.midnight.network/api/v4/graphql',
+        ws:   'wss://indexer.midnight.network/api/v4/graphql/ws'
+    }
+};
+
+export const DEFAULT_PROOF_SERVER_URL  = 'http://localhost:6300';
+export const DEFAULT_ZK_CONFIG_BASE    = './contracts';
+
+export const VALID_PRIVATE_STATE_BACKENDS = ['cap-db', 'level'] as const;
+export type PrivateStateBackend = (typeof VALID_PRIVATE_STATE_BACKENDS)[number];
+export const DEFAULT_PRIVATE_STATE_BACKEND: PrivateStateBackend = 'cap-db';
+
+export function getConfiguredPrivateStateBackend(config?: Record<string, any>): PrivateStateBackend {
+    const raw = readEnv('NIGHTGATE_PRIVATE_STATE_BACKEND') || config?.privateStateBackend;
+    if (raw && (VALID_PRIVATE_STATE_BACKENDS as readonly string[]).includes(raw)) {
+        return raw as PrivateStateBackend;
+    }
+    return DEFAULT_PRIVATE_STATE_BACKEND;
+}
+
 function readEnv(key: string): string | undefined {
     return process.env[key]?.trim() || undefined;
+}
+
+function parseIntEnv(key: string): number | undefined {
+    const raw = readEnv(key);
+    if (raw == null) return undefined;
+    const n = Number.parseInt(raw, 10);
+    return Number.isFinite(n) && n > 0 ? n : undefined;
 }
 
 export function getConfiguredNightgateNetwork(config?: Record<string, any>): string | undefined {
@@ -52,24 +139,64 @@ export function normalizeNightgateNetwork(network?: string): {
     return { network: DEFAULT_NETWORK };
 }
 
+export interface SubmissionEndpointsConfig {
+    indexerHttpUrl: string;
+    indexerWsUrl: string;
+    proofServerUrl: string;
+    zkConfigBasePath: string;
+}
+
+export function resolveSubmissionEndpoints(
+    network: NightgateNetwork,
+    config?: Record<string, any>
+): SubmissionEndpointsConfig {
+    const defaults = DEFAULT_INDEXER_URLS[network];
+    return {
+        indexerHttpUrl: readEnv('NIGHTGATE_INDEXER_HTTP_URL') || config?.indexerHttpUrl || defaults.http,
+        indexerWsUrl:   readEnv('NIGHTGATE_INDEXER_WS_URL')   || config?.indexerWsUrl   || defaults.ws,
+        proofServerUrl: readEnv('NIGHTGATE_PROOF_SERVER_URL') || config?.proofServerUrl || DEFAULT_PROOF_SERVER_URL,
+        zkConfigBasePath: readEnv('NIGHTGATE_ZK_CONFIG_BASE') || config?.zkConfigBasePath || DEFAULT_ZK_CONFIG_BASE
+    };
+}
+
 export function resolveNightgateRuntimeConfig(config: Record<string, any> = {}): {
     network: NightgateNetwork;
     nodeUrl: string;
     crawlerConfig: Record<string, unknown>;
     crawlerNodeUrl: string;
+    submissionEndpoints: SubmissionEndpointsConfig;
     invalidNetwork?: string;
 } {
-    const crawlerConfig = config.crawler || {};
+    const rawCrawlerConfig = config.crawler || {};
+    // env-var overrides for crawler tuning. Numeric vars are parsed; anything
+    // unparseable falls back to the config value (or built-in default).
+    const fetchConcurrencyEnv = parseIntEnv('NIGHTGATE_FETCH_CONCURRENCY');
+    const rpcBatchSizeEnv = parseIntEnv('NIGHTGATE_RPC_BATCH_SIZE');
+    // NIGHTGATE_CRAWLER_ENABLED=false disables the crawler at boot. Useful for
+    // running submission tests in isolation so the wallet sync isn't competing
+    // with block ingestion for CPU/RAM on the same event loop.
+    const crawlerEnabledEnv = readEnv('NIGHTGATE_CRAWLER_ENABLED');
+    const crawlerEnabledOverride = crawlerEnabledEnv == null
+        ? undefined
+        : !/^(false|0|no|off)$/i.test(crawlerEnabledEnv);
+    const crawlerConfig: Record<string, unknown> = {
+        ...rawCrawlerConfig,
+        ...(fetchConcurrencyEnv != null && { fetchConcurrency: fetchConcurrencyEnv }),
+        ...(rpcBatchSizeEnv != null && { rpcBatchSize: rpcBatchSizeEnv }),
+        ...(crawlerEnabledOverride != null && { enabled: crawlerEnabledOverride })
+    };
     const configuredNetwork = getConfiguredNightgateNetwork(config);
     const { network, invalidNetwork } = normalizeNightgateNetwork(configuredNetwork);
     const nodeUrl = getConfiguredNightgateNodeUrl(config) || DEFAULT_NODE_URL;
     const crawlerNodeUrl = getConfiguredNightgateCrawlerNodeUrl(config) || nodeUrl;
+    const submissionEndpoints = resolveSubmissionEndpoints(network, config);
 
     return {
         network,
         nodeUrl,
         crawlerConfig,
         crawlerNodeUrl,
+        submissionEndpoints,
         invalidNetwork
     };
 }

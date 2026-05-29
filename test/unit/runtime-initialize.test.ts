@@ -10,7 +10,8 @@ const selectFromSpy = jest.fn();
 const ENV_KEYS = [
     'NIGHTGATE_NETWORK',
     'NIGHTGATE_NODE_URL',
-    'NIGHTGATE_CRAWLER_NODE_URL'
+    'NIGHTGATE_CRAWLER_NODE_URL',
+    'NIGHTGATE_CRAWLER_ENABLED'
 ] as const;
 const originalEnv = Object.fromEntries(ENV_KEYS.map((key) => [key, process.env[key]])) as Record<(typeof ENV_KEYS)[number], string | undefined>;
 
@@ -51,6 +52,20 @@ jest.mock('../../srv/crawler/index', () => ({
 
 jest.mock('../../srv/utils/cds-model', () => ({
     ensureNightgateModelLoaded: mockEnsureNightgateModelLoaded
+}));
+
+jest.mock('../../srv/midnight/wallet-worker-client', () => ({
+    startWalletWorker: jest.fn(async () => undefined),
+    stopWalletWorker:  jest.fn(async () => undefined),
+    setStateSaveSink:  jest.fn()
+}));
+
+jest.mock('../../srv/submission/wallet-facade-builder', () => ({
+    wireWorkerStateSaveSink: jest.fn(),
+    getOrBuildWalletFacade:  jest.fn(),
+    evictWalletFacade:       jest.fn(async () => undefined),
+    getCacheSize:            jest.fn(() => 0),
+    clearAllFacades:         jest.fn()
 }));
 
 import cds from '@sap/cds';
@@ -174,62 +189,36 @@ describe('runtime initialize', () => {
         }
     });
 
-    it('auto-deploys when SyncState table is missing but Blocks exists', async () => {
-        const logSpy = jest.spyOn(console, 'log').mockImplementation();
-        const warnSpy = jest.spyOn(console, 'warn').mockImplementation();
+    it('throws SchemaNotDeployedError when a required table is missing (no auto-deploy)', async () => {
+        // eslint-disable-next-line @typescript-eslint/no-require-imports
+        const { SchemaNotDeployedError } = require('../../src/index');
 
+        // Probes: Blocks OK, SyncState missing. initialize() should bail
+        // immediately with SchemaNotDeployedError; no deploy attempt, no
+        // crawler start, nothing.
         mockDbRun
             .mockResolvedValueOnce({})
-            .mockRejectedValueOnce(new Error('no such table: midnight_SyncState'))
-            .mockResolvedValueOnce({})
-            .mockResolvedValueOnce({});
+            .mockRejectedValueOnce(new Error('no such table: midnight_SyncState'));
 
-        try {
-            const status = await initialize();
+        const err = await initialize().catch(e => e);
+        expect(err).toBeInstanceOf(SchemaNotDeployedError);
+        expect(err.missingTable).toBe('midnight.SyncState');
+        expect(err.message).toMatch(/npm run deploy/);
 
-            expect(mockDbDeploy).toHaveBeenCalledWith('*');
-            expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('Required DB tables missing/incomplete'));
-            expect(logSpy).toHaveBeenCalledWith('[odatano-nightgate] DB schema deployed');
-            expect(mockStartCrawler).toHaveBeenCalledTimes(1);
-            expect(status).toEqual(expect.objectContaining({
-                initialized: true,
-                crawlerEnabled: true,
-                mode: 'active'
-            }));
-        } finally {
-            warnSpy.mockRestore();
-            logSpy.mockRestore();
-        }
+        // Crucially: no deploy was attempted, on either path.
+        expect(mockDbDeploy).not.toHaveBeenCalled();
+        expect(mockCdsDeploy).not.toHaveBeenCalled();
+        // Crawler also never started — we fail before any subsequent init step.
+        expect(mockStartCrawler).not.toHaveBeenCalled();
     });
 
-    it('falls back to cds.deploy(...).to(db) when db.deploy is unavailable', async () => {
-        const logSpy = jest.spyOn(console, 'log').mockImplementation();
-        const warnSpy = jest.spyOn(console, 'warn').mockImplementation();
-        const dbWithoutDeploy = { run: mockDbRun };
+    it('includes the resolved DB path in the error message', async () => {
+        (cds.env as any).requires.db = { credentials: { database: 'db/midnight.db' } };
+        mockDbRun.mockRejectedValueOnce(new Error('no such table: midnight_Blocks'));
 
-        mockConnectTo.mockResolvedValue(dbWithoutDeploy);
-        mockDbRun
-            .mockResolvedValueOnce({})
-            .mockRejectedValueOnce(new Error('no such table: midnight_SyncState'))
-            .mockResolvedValueOnce({})
-            .mockResolvedValueOnce({});
-
-        try {
-            const status = await initialize();
-
-            expect(mockDbDeploy).not.toHaveBeenCalled();
-            expect(mockCdsDeploy).toHaveBeenCalledWith('*');
-            expect(mockCdsDeployTo).toHaveBeenCalledWith(dbWithoutDeploy);
-            expect(logSpy).toHaveBeenCalledWith('[odatano-nightgate] DB schema deployed');
-            expect(status).toEqual(expect.objectContaining({
-                initialized: true,
-                crawlerEnabled: true,
-                mode: 'active'
-            }));
-        } finally {
-            warnSpy.mockRestore();
-            logSpy.mockRestore();
-        }
+        await expect(initialize()).rejects.toMatchObject({
+            message: expect.stringContaining('db/midnight.db')
+        });
     });
 
     it('uses env overrides for preprod startup even when package config has no network', async () => {

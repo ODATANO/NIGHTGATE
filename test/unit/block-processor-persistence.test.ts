@@ -65,6 +65,21 @@ jest.mock('@sap/cds', () => {
 import cds from '@sap/cds';
 import { BlockProcessor } from '../../srv/crawler/BlockProcessor';
 
+/**
+ * Flatten captured INSERT calls into per-row entries. After the batching
+ * change a single `tx.run(INSERT.into('X').entries([rows]))` carries N rows;
+ * older tests assert at the per-row level.
+ */
+function extractRows(queries: any[], entity: string): any[] {
+    const out: any[] = [];
+    for (const q of queries) {
+        if (q?.kind !== 'insert' || q.entity !== entity) continue;
+        if (Array.isArray(q.entry)) out.push(...q.entry);
+        else out.push(q.entry);
+    }
+    return out;
+}
+
 function buildUnsignedExtrinsic(palletIndex: number, callIndex: number): string {
     return '0x' + Buffer.from([0x0c, 0x04, palletIndex, callIndex]).toString('hex');
 }
@@ -209,10 +224,11 @@ describe('BlockProcessor persistence paths', () => {
         const result = await processor.processBlockByHash('0xnew');
         const txQueries = tx.run.mock.calls.map(([query]) => query);
         const blockInsert = txQueries.find((query) => query?.kind === 'insert' && query.entity === 'midnight.Blocks');
-        const txInserts = txQueries.filter((query) => query?.kind === 'insert' && query.entity === 'midnight.Transactions');
-        const txResultInserts = txQueries.filter((query) => query?.kind === 'insert' && query.entity === 'midnight.TransactionResults');
-        const txFeeInserts = txQueries.filter((query) => query?.kind === 'insert' && query.entity === 'midnight.TransactionFees');
-        const contractActionInserts = txQueries.filter((query) => query?.kind === 'insert' && query.entity === 'midnight.ContractActions');
+        // Per-row rows from batched bulk inserts.
+        const txInserts = extractRows(txQueries, 'midnight.Transactions').map(entry => ({ entry }));
+        const txResultInserts = extractRows(txQueries, 'midnight.TransactionResults').map(entry => ({ entry }));
+        const txFeeInserts = extractRows(txQueries, 'midnight.TransactionFees').map(entry => ({ entry }));
+        const contractActionInserts = extractRows(txQueries, 'midnight.ContractActions').map(entry => ({ entry }));
         const syncUpdate = txQueries.find((query) => query?.kind === 'update' && query.entity === 'midnight.SyncState');
 
         expect(result).toEqual(expect.objectContaining({
@@ -326,7 +342,8 @@ describe('BlockProcessor persistence paths', () => {
             const result = await processor.processBlockByHash('0xfallback');
             const txQueries = tx.run.mock.calls.map(([query]) => query);
             const blockInsert = txQueries.find((query) => query?.kind === 'insert' && query.entity === 'midnight.Blocks');
-            const txInsert = txQueries.find((query) => query?.kind === 'insert' && query.entity === 'midnight.Transactions');
+            const txRows = extractRows(txQueries, 'midnight.Transactions');
+            const txInsert = txRows.length > 0 ? { entry: txRows[0] } : undefined;
 
             expect(result).toEqual(expect.objectContaining({
                 blockHeight: 6,
@@ -407,9 +424,11 @@ describe('BlockProcessor persistence paths', () => {
         }));
 
         const txQueries = tx.run.mock.calls.map(([query]) => query);
-        const txInsert = txQueries.find((query) => query?.kind === 'insert' && query.entity === 'midnight.Transactions');
+        const txRows = extractRows(txQueries, 'midnight.Transactions');
+        const txInsert = txRows.length > 0 ? { entry: txRows[0] } : undefined;
         const utxoInsert = txQueries.find((query) => query?.kind === 'insert' && query.entity === 'midnight.UnshieldedUtxos');
-        const nightBalanceInserts = txQueries.filter((query) => query?.kind === 'insert' && query.entity === 'midnight.NightBalances');
+        // NightBalances are still per-row (read-modify-write, can't batch).
+        const nightBalanceInserts = extractRows(txQueries, 'midnight.NightBalances').map(entry => ({ entry }));
 
         expect(txInsert?.entry).toEqual(expect.objectContaining({
             txType: 'night_transfer',
