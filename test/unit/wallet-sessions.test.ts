@@ -59,6 +59,11 @@ const mockEstimateSendNightFee = jest.fn();
 const mockEstimateUnshieldFee = jest.fn();
 const mockEstimateShieldFee = jest.fn();
 const mockEnsureNetworkId = jest.fn();
+const mockWalletWaitForSyncedState = jest.fn();
+
+jest.mock('../../srv/midnight/wallet-worker-client', () => ({
+    walletWaitForSyncedState: mockWalletWaitForSyncedState
+}));
 
 jest.mock('../../srv/submission/wallet-facade-builder', () => ({
     evictWalletFacade: mockEvictWalletFacade,
@@ -188,6 +193,7 @@ describe('wallet session handlers', () => {
         mockDeriveStoragePassword.mockReturnValue('storage-pass-derived');
         mockEnsureNetworkId.mockResolvedValue(undefined);
         mockGetOrBuildWalletFacade.mockResolvedValue({ facade: {} });
+        mockWalletWaitForSyncedState.mockResolvedValue({ synced: true });
         mockEvictWalletFacade.mockResolvedValue(undefined);
         registerWalletSessionHandlers(mockService, { run: mockDbRun });
     });
@@ -482,6 +488,9 @@ describe('wallet session handlers', () => {
                 networkId: 'preprod',
                 relayUrl:  'wss://node'
             }));
+            // The prewarm must block on sync-to-tip before returning, so the
+            // deploy path doesn't balance against stale dust (Custom error 170).
+            expect(mockWalletWaitForSyncedState).toHaveBeenCalledWith('acct-derived', expect.any(Number));
         });
 
         it('returns signingEnabled:true with null prewarmJobId if startJob scheduling fails', async () => {
