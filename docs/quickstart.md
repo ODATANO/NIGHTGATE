@@ -54,22 +54,24 @@ NIGHTGATE_NODE_URL=wss://rpc.preprod.midnight.network/
 # Optional: disable crawler during wallet-only runs to free CPU/RAM for the worker
 NIGHTGATE_CRAWLER_ENABLED=false
 
-# Your wallet's viewing key and seed (BIP39 mnemonic → first 32 bytes of mnemonicToSeed)
+# Viewing key (64-hex encryption public key) + BIP39 mnemonic.
+# NIGHTGATE HD-derives the per-role keys server-side, matching Lace — pass the mnemonic, not a raw seed.
 LACE_VIEWING_KEY=a32699a5a29e453f6e92624c2fbefdee173d3f1178e3f9c71bc3edb7d91c1403
-LACE_SEED_HEX=eb20669878df738b682aecb178b24bb0d606d3318500e6f8cdd8ab5a2783e1c1
+LACE_MNEMONIC="word1 word2 word3 ... word24"
 ```
 
-To derive `LACE_SEED_HEX` from a mnemonic, use the included helper:
+If you have only the mnemonic, derive the viewing key with the included helper:
 ```bash
-node scripts/derive-keys.mjs "word1 word2 word3 ... word24"
+LACE_MNEMONIC="word1 word2 ... word24" node scripts/derive-keys.mjs
 ```
 
 ### Start the server
 
-Use `serve:sync` for long-running sessions — it's `cds-serve` (no watch) with the 12 GB heap:
+`serve:sync` runs `cds-serve` (no watch) against the persistent file DB, so deploy the schema once first (auto-deploy was removed — the submission path fails fast if the schema is missing):
 
 ```bash
-npm run serve:sync
+npm run deploy        # cds deploy --to sqlite:db/midnight.db (first run / after schema changes)
+npm run serve:sync    # cds-serve with the 12 GB heap
 ```
 
 Expected log:
@@ -90,7 +92,7 @@ In a second terminal:
 npm run sync:start
 ```
 
-This calls `connectWallet` then `connectWalletForSigning` against `localhost:4004`, reading `LACE_VIEWING_KEY` / `LACE_SEED_HEX` from `.env`. Output:
+This calls `connectWallet` then `connectWalletForSigning` against `localhost:4004`, reading `LACE_VIEWING_KEY` / `LACE_MNEMONIC` from `.env`. Output:
 
 ```
 --- 1. connectWallet ---
@@ -156,7 +158,7 @@ curl -X POST http://localhost:4004/api/v1/nightgate/sendNight \
   }'
 ```
 
-Response: `{"txId":"0xabc...","toLedger":"unshielded","amount":"1000000","receiverAddress":"mn_addr_preprod1..."}`. The transaction is submitted; the crawler will pick it up and flip the matching `PendingSubmissions` row to `finalized` once indexed.
+Response: `{"jobId":"...","status":"pending"}`. Submit actions are async — poll `getJobStatus(jobId, sessionId)` until `succeeded`; its `result` then holds `{"txId":"0x...","toLedger":"unshielded","amount":"1000000",...}`. The crawler later flips the matching `PendingSubmissions` row to `finalized` once the tx is indexed.
 
 ### Deploy a contract
 
@@ -172,9 +174,9 @@ curl -X POST http://localhost:4004/api/v1/nightgate/deployContract \
   }'
 ```
 
-Response: `{"submissionId":"...","txHash":"0x...","contractAddress":"0x...","status":"included"}`.
+Response: `{"jobId":"...","status":"pending"}`. Poll `getJobStatus`; the succeeded `result` is `{"submissionId":"...","txHash":"0x...","contractAddress":"0x...","status":"included"}`.
 
-The full T15 test runner does all this in one go (`connect → connectWalletForSigning → registerForDustGeneration → wait 90s → deployContract`):
+The T15 runner does the whole flow end-to-end (`connectWallet → connectWalletForSigning` → await prewarm sync → `registerForDustGeneration` → `deployContract`, polling each job):
 
 ```bash
 npm run t15

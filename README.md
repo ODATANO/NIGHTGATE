@@ -48,6 +48,9 @@ The wallet SDK lives in `worker_threads` because Midnight's Effect.ts fiber sche
 | Block-level indexing | ✅ Live + catch-up + reorg detection (`srv/crawler/`) |
 | Wallet sessions | ✅ Read-only (viewing key) + signing (seed) with AES-256-GCM at rest |
 | Contract deploy / call | ✅ Compact-compiled contracts (`deployContract`, `submitContractCall`) |
+| Document anchoring | ✅ `anchorDocument` / `verifyDocument` — hash on-chain, caller-managed storage |
+| ZK predicate attestations | ✅ `issuePredicateAttestation` — prove `value ≤/≥ threshold` without revealing the value |
+| Tiered disclosure (RBAC) | ✅ `AttestationService` mixin + `DisclosureRoles` (EU Battery Reg tiers) |
 | Token transfer (shielded + unshielded) | ✅ `sendNight` with auto-detected receiver ledger |
 | Cross-ledger shift | ✅ `shieldFunds` / `unshieldFunds` via SDK `initSwap` |
 | Dust generation lifecycle | ✅ `registerForDustGeneration` / `deregisterFromDustGeneration` |
@@ -84,18 +87,20 @@ For the full first-time-sync walkthrough see [docs/quickstart.md](docs/quickstar
 
 ## Write surface (NightgateService)
 
+Submit actions are **async**: they return `{ jobId, status }`; poll `getJobStatus(jobId, sessionId)` for the result.
+
 | Action | Purpose |
 |---|---|
 | `connectWallet(viewingKey)` | Open read-only session |
-| `connectWalletForSigning(sessionId, seedHex)` | Upgrade with seed key; warms wallet SDK in worker |
+| `connectWalletForSigning(sessionId, mnemonic)` | Upgrade with BIP39 mnemonic; HD-derives keys to match Lace, warms wallet SDK + syncs in worker |
 | `disconnectWallet(sessionId)` | Close session, evict facade |
 | `sendNight(sessionId, receiverAddress, amount, ttlIso?)` | Transfer NIGHT; ledger auto-detected from receiver address prefix |
-| `shieldFunds(sessionId, amount, ttlIso?)` | Move own NIGHT unshielded → shielded |
-| `unshieldFunds(sessionId, amount, ttlIso?)` | Move own NIGHT shielded → unshielded |
-| `registerForDustGeneration(sessionId, dustReceiverAddress?)` | Register NIGHT UTXOs to start dust accrual |
-| `deregisterFromDustGeneration(sessionId)` | Reverse: free UTXOs back to spendable |
+| `shieldFunds` / `unshieldFunds(sessionId, amount, ttlIso?)` | Move own NIGHT between ledgers |
+| `registerForDustGeneration` / `deregisterFromDustGeneration(sessionId, …)` | Start / stop dust accrual on NIGHT UTXOs |
 | `deployContract(compiledArtifactRef, sessionId, initialPrivateState)` | Deploy a registered Compact contract |
 | `submitContractCall(contractAddress, circuit, compiledArtifactRef, sessionId, args)` | Invoke a circuit on a deployed contract |
+| `anchorDocument(sha256, storageRef, sessionId, contractAddress, …)` | Anchor a document hash on-chain (`verifyDocument` to check) |
+| `issuePredicateAttestation(payloadHash, value, predicate, threshold, sessionId, contractAddress, …)` | Prove a hidden value satisfies a predicate (`verifyPredicateAttestation` to check) |
 
 ## Read surface (read-only functions)
 
@@ -149,7 +154,7 @@ npm run sync:probe         # check local Midnight indexer container status
 
 npm run typecheck          # tsc --noEmit
 npm run lint               # ESLint
-npm test                   # Jest with coverage, 33+ suites, 435+ tests
+npm test                   # Jest with coverage, 48 suites, 672 tests
 npm run build              # Compile CDS types + TypeScript to JS
 
 # Integration scripts (real SDK, no chain access required)

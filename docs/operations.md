@@ -14,7 +14,7 @@ Running NIGHTGATE day-to-day. Audience: anyone deploying it, debugging a stuck s
 | `npm run t15` | End-to-end test flow | `sync:start` + `registerForDustGeneration` + 90 s wait + `deployContract(counter)` |
 | `npm run build` | Before publish or after schema change | Generates `@cds-models/` types + compiles TS in-place |
 | `npm run typecheck` | Pre-commit | `tsc --noEmit` |
-| `npm test` | Pre-commit | Jest with coverage (~33 suites, 435+ tests) |
+| `npm test` | Pre-commit | Jest with coverage (48 suites, 672 tests) |
 | Integration scripts | Verifying SDK wiring | `smoke:sdk`, `integration:providers`, `integration:wallet-keys`, `integration:wallet-facade`, `integration:contract-registry` |
 
 ### Why `serve:sync` and not `dev` for long runs
@@ -39,10 +39,11 @@ NIGHTGATE_CRAWLER_ENABLED=false                           # Turn off during wall
 # NIGHTGATE_INDEXER_HTTP_URL=http://localhost:8088/api/v4/graphql
 # NIGHTGATE_INDEXER_WS_URL=ws://localhost:8088/api/v4/graphql/ws
 
-# Wallet credentials for npm scripts (sync:start, t15)
-# .env is gitignored — these stay local. NEVER commit a real seed.
+# Wallet credentials for npm scripts (sync:start, t15). NIGHTGATE HD-derives
+# the per-role keys from the mnemonic, matching Lace — pass the mnemonic.
+# .env is gitignored — these stay local. NEVER commit a real seed/mnemonic.
 LACE_VIEWING_KEY=a32699a5a29e453f6e92624c2fbefdee173d3f1178e3f9c71bc3edb7d91c1403
-LACE_SEED_HEX=eb20669878df738b682aecb178b24bb0d606d3318500e6f8cdd8ab5a2783e1c1
+LACE_MNEMONIC="word1 word2 word3 ... word24"
 
 # Production-only: at-rest encryption key for stored viewing/seed keys
 # ENCRYPTION_KEY=<64-hex-char>
@@ -103,7 +104,7 @@ npm run serve:sync
 npm run sync:start
 ```
 
-`sync:start` does `connectWallet` + `connectWalletForSigning`. The latter fires off a fire-and-forget facade pre-warm in the worker. Expected log progression in the server terminal:
+`sync:start` does `connectWallet` + `connectWalletForSigning`. The latter schedules a tracked pre-warm job that syncs the facade to tip; poll `getJobStatus(prewarmJobId, sessionId)` for completion. Expected log progression in the server terminal:
 
 ```
 [wallet-sessions] facade pre-warm kicked off for d4c0f3cc9d3d285c
@@ -193,6 +194,10 @@ curl -s -o /dev/null -w "HTTP %{http_code}\n" \
 - `HTTP 200` → indexer is fine; might be a transient WS-only issue
 - `HTTP 503` → indexer is down. Restart the wallet sync after it's back, or use the local container
 
+### Submissions stall on the 5th+ call of a long session (public indexer)
+
+The hosted preprod indexer's graphql-ws subscription degrades over a long, multi-call session — early calls succeed but later ones can hang inside the SDK's balance/submit (the proof server goes idle). The pre-balance sync wait is bounded (`NIGHTGATE_BALANCE_SYNC_TIMEOUT_MS`, default 180s) so it fails rather than hangs forever, but the SDK's own balance/submit calls aren't. Mitigations: keep sessions short / run independent flows separately, restart the server for a fresh subscription, or use a **caught-up** local indexer for heavy use.
+
 ### Server is up but OData requests hang
 
 Phase-2a observation: while the wallet worker is mid-sync at full CPU, the main thread's CAP request pipeline can get starved (10 s `getHealth` curls time out while worker `state-save` events fire normally every 30 s). State-save uses `worker.on('message')` callbacks which don't go through the CAP request pipeline; requests do (auth, AsyncLocalStorage, transaction binding).
@@ -236,7 +241,7 @@ Then restart. (Or use `npm run dev` while iterating, accepting the watch-driven 
 ```bash
 # Stop server first
 rm db/midnight.db*
-# Auto-deployed schema on next start; lose all indexed blocks, all wallet sessions, all sync state
+npm run deploy   # re-create the schema (auto-deploy was removed); loses all blocks, sessions, sync state
 ```
 
 ### Crawler-only reset

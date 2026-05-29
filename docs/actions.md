@@ -10,6 +10,14 @@ OData distinguishes between **actions** (POST, may have side effects) and **func
 - `http://localhost:4004/api/v1/analytics/<functionName>()` — analytics service
 - `http://localhost:4004/api/v1/admin/<actionName>` — admin service
 
+## Async job model (write actions)
+
+Every action that submits an on-chain transaction is **asynchronous**: it returns `{ jobId, status: "pending" }` immediately, then you poll `getJobStatus(jobId, sessionId)` until `succeeded` or `failed`. This keeps multi-minute proof/submit work off the HTTP request. Each write action below documents its **job-result** shape (the parsed `result` on success); read-only **functions** return their result directly.
+
+### `getJobStatus(jobId, sessionId) → { status, result, errorCode, errorMessage }`
+
+`status`: `pending | running | succeeded | failed`. On success, `result` is a JSON string of the action's result shape; on failure, `errorCode` + `errorMessage` carry the classified error (see [Error model](#error-model)).
+
 ## Session lifecycle
 
 ### `connectWallet(viewingKey) → { sessionId, ID, connectedAt, expiresAt, isActive }`
@@ -39,18 +47,19 @@ Response:
 }
 ```
 
-### `connectWalletForSigning(sessionId, seedHex) → { sessionId, signingEnabled }`
+### `connectWalletForSigning(sessionId, mnemonic, seedHex?) → { sessionId, signingEnabled, prewarmJobId, prewarmStatus }`
 
-Upgrade an existing read-only session with **signing capability**. Stores the 32-byte BIP39-derived seed encrypted at rest. Triggers a fire-and-forget pre-warm of the wallet SDK in the worker thread — the actual sync happens in the background after this call returns.
+Upgrade a read-only session with **signing capability**, encrypting the BIP39 seed at rest. Keys are HD-derived per Midnight role (zswap / dust / night) to match Lace — see `srv/utils/wallet-hd.ts`. Schedules a tracked pre-warm job that syncs the wallet SDK in the worker; poll `getJobStatus(prewarmJobId, sessionId)` to know when sync-to-tip is done before submitting.
 
 | Field | Type | Constraints |
 |---|---|---|
 | `sessionId` | UUID | Returned by `connectWallet` |
-| `seedHex` | String | 64 hex chars (first 32 bytes of BIP39 mnemonicToSeed) |
+| `mnemonic` | String | BIP39 recovery phrase (preferred) |
+| `seedHex` | String (optional) | Alternative to `mnemonic`: the full 64-byte BIP39 seed as 128 hex chars |
 
 **Rate limit:** 5/hour per client IP.
 
-**Errors:** 404 (no session), 410 (expired), 412 (session was already-signing), 429 (rate-limited).
+**Errors:** 400 (invalid mnemonic/seed), 404 (no session), 410 (expired), 412 (already signing), 429 (rate-limited).
 
 ### `disconnectWallet(sessionId)`
 
@@ -153,6 +162,28 @@ Invoke a circuit on a deployed contract.
 
 **Rate limit:** 30/min per session.
 
+## Document anchoring
+
+### `anchorDocument(sha256, storageRef, sessionId, contractAddress, contentType?, size?, metadata?, compiledArtifactRef?) → { jobId, status, documentId }`
+
+Anchor a document's content hash on-chain via the AttestationVault `attest` circuit. NIGHTGATE stores only the hash + a caller-supplied `storageRef` (`file://` | `s3://` | `ipfs://`) — **never the bytes**. `documentId` is returned synchronously (the `Documents` row is inserted up-front); the job result is `{ documentId, attestationId, txHash, anchoredAt }`. `compiledArtifactRef` defaults to `attestation-vault`. **Rate limit:** 10/hour per session.
+
+### `verifyDocument(documentId, providedSha256) → { verified, anchoredTxHash, anchoredAt, originalSha256 }` (function)
+
+`verified: true` iff the hash matches the stored `sha256`, `anchoredTxHash` is set, and that tx resolves to a `SUCCESS` result. A hash mismatch returns `verified: false` (not an error).
+
+## ZK predicate attestations
+
+Prove a hidden numeric value satisfies a predicate against a public threshold, without revealing the value (on-chain-verified). See [the AttestationVault contract](../contracts/attestation-vault).
+
+### `issuePredicateAttestation(payloadHash, value, predicate, threshold, sessionId, contractAddress, salt?, unit?, valueCommitment?, compiledArtifactRef?) → { jobId, status, predicateAttestationId }`
+
+The payload must already be attested. Submits `commitValue` then `provePredicate`; the ledger only includes the tx if the in-circuit commitment + predicate asserts hold, so a succeeded job IS the verified proof. `value` is a scaled integer (caller owns float scaling); it is used only as a circuit witness and **never persisted**. `predicate`: `lessOrEqual` | `greaterOrEqual`. `salt` (64-hex commitment opening) is generated if omitted. Job result: `{ predicateAttestationId, payloadHash, claim, proof }` (PAC-envelope shape). **Rate limit:** 10/hour per session.
+
+### `verifyPredicateAttestation(predicateAttestationId) → { verified, predicate, threshold, unit, valueCommitment, provenTxHash, provenAt }` (function)
+
+`verified: true` iff `provenTxHash` resolves to a `SUCCESS` result (needs the crawler enabled to index the proof tx).
+
 ## Diagnostics
 
 ### `getWalletBalance(sessionId) → { shieldedNight, unshieldedNight, dustBalance, registeredNightUtxoCount, totalNightUtxoCount }`
@@ -218,6 +249,8 @@ Operator controls. `reindexFromHeight` triggers a rollback to the specified heig
 
 `invalidateSession(sessionId)` / `invalidateAllSessions()` — force-close sessions. Distinct from `disconnectWallet` in that admin can target any session, not just one the caller owns.
 
+`grantRole(userId, role, scope?, validUntil?)` — grant a disclosure tier (`public_only` | `legitimate_interest` | `authority`) read by the `AttestationService` mixin's `attachDisclosureRole` middleware. Caller must already hold `authority`.
+
 ## Standard OData over entities
 
 Every `@readonly` entity supports the full OData V4 query surface. Examples:
@@ -256,6 +289,7 @@ Classification codes returned by `classifySubmissionError` (`srv/submission/Tran
 | `TxFailed` | no | SDK `TxFailedError` (on-chain status wasn't `SucceedEntirely`) |
 | `1014` | no | Substrate "invalid transaction" |
 | `1016` | yes (preprod) / no (mainnet) | "Immediately Dropped" — preprod transient, mainnet has a known deterministic-rejection issue |
+| `170` (Custom error) | no | Dust validity window: the wallet's `ctime` is outside the grace window — usually a lagging indexer or a wallet not synced to tip (`failed assert: predicate false` is the distinct predicate-circuit case) |
 | `NetworkOrTimeout` | yes | `ECONNREFUSED`, `ETIMEDOUT`, `socket hang up`, etc. |
 | `ContractTypeError` etc. | no | SDK contract-config errors |
 | `WalletSigningNotAvailable` | no | Session has no encrypted seed key |

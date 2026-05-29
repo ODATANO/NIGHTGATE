@@ -111,6 +111,8 @@ Main thread (handler)                                        Worker thread
                                                                   status to 'finalized'
 ```
 
+Since the 0.2.0 async-job migration the handler doesn't block on this flow: it wraps steps 5–7 in a background job (`srv/submission/background-jobs.ts`), returns `{ jobId, status }` immediately, and callers poll `getJobStatus`. The worker's pre-balance step also waits for the wallet to be synced to tip (bounded by `NIGHTGATE_BALANCE_SYNC_TIMEOUT_MS`, default 180s) so submissions never balance against stale dust (which the node rejects as `Custom error: 170`).
+
 ### The "sessionId" indirection
 
 The OData layer's `sessionId` is the user-facing UUID stored in `WalletSessions`. But the worker stores facades keyed on `accountId` — a deterministic hash of the viewing key. Multiple OData sessions with the same wallet share the same facade in the worker.

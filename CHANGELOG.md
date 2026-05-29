@@ -2,6 +2,52 @@
 
 ## Unreleased
 
+## 0.3.0 - 2026-05-29
+
+### 2026-05-29: ZK predicate attestations (on-chain-verified)
+
+Extends `AttestationVault` from commitment + disclosure-grant into **proving a predicate** (`value ≤ / ≥ threshold`) over a hidden numeric value, without revealing the value — NIGHTGATE's differentiator for Tractus-X / Battery Passport. Verified live on preprod: `47300 ≤ 50000` accepted on-chain; `51 ≤ 50` rejected by the circuit (`failed assert: predicate false`).
+
+- Compact circuit (`contracts/attestation-vault`): new `commitValue` + `provePredicate` circuits, `value_commitments` / `predicate_results` ledger maps, `attested_value` / `value_salt` witnesses, `persistentCommit`-based numeric commitment. Existing `attest` / `grantDisclosure` / `revokeDisclosure` unchanged; recompiled `managed/` artifacts committed.
+- New OData actions on `NightgateService`: `issuePredicateAttestation` (async job: `commitValue` → `provePredicate`) and `verifyPredicateAttestation` (confirms the proof tx resolves to a SUCCESS result, mirroring `verifyDocument`). New `PredicateAttestations` entity — it never stores the hidden value or salt.
+- Per-call witnesses thread through `submitter.call` → wallet-worker → `withWitnesses`; the hidden value travels only as a circuit witness, never as a circuit arg.
+- PAC envelope helper `toPredicateEnvelope` (`digestMultibase` / `claim` / `proof`) in `src/sdk/AttestationService.ts` for consumer apps.
+- Verification model: Midnight exposes no standalone off-chain proof verifier, so verification is on-chain/indexer-trust — the ledger only includes the tx if the in-circuit predicate + commitment asserts held. VK-only portable verification is deferred.
+
+### 2026-05-29: Private-state + sync robustness fixes
+
+Both exposed by the first live deploy→call sequence (T15 was deploy-only; contract calls had only ever been mocked):
+
+- `CapDbPrivateStateProvider` used a **random per-instance salt**, so a contract CALL could not decrypt private state a prior DEPLOY wrote (`Salt mismatch: data was encrypted with a different password/salt`). Now a **deterministic per-(account, password) salt** — cross-instance reads work while keeping the one-PBKDF2-per-instance optimization and the integrity check. Regression test added.
+- The `balanceTx` pre-sync `waitForSyncedState()` net (added below) was **unbounded** → a dropped, non-retried indexer subscription hung submissions forever. Now bounded via `NIGHTGATE_BALANCE_SYNC_TIMEOUT_MS` (default 180s); a stalled sync fails cleanly instead of hanging.
+
+### 2026-05-29: T15 — first live preprod contract deploy
+
+The submission stack exercised end-to-end against preprod for the first time. Three fixes were required to reach green:
+
+- **Per-role HD key derivation** (`srv/utils/wallet-hd.ts`): keys were derived from the raw BIP39 seed → a different Midnight account than Lace (an empty sibling) → `could not balance dust`. Now derives the zswap / dust / night keys from their respective HD roles (account 0, index 0) via `@midnight-ntwrk/wallet-sdk-hd`, matching Lace. `connectWalletForSigning` now takes the BIP39 mnemonic (or 128-hex seed). New deps: `wallet-sdk-hd`, `bip39`, `undici`.
+- **Prewarm now blocks on `waitForSyncedState`** — it previously only kicked off the chain sync, so the deploy balanced against stale (restored) dust and the node rejected the tx with `1010 Invalid Transaction: Custom error: 170` (dust validity window). A safety `waitForSyncedState` was also added to `balanceTx`.
+- **Indexer endpoint guidance**: the wallet reads block timestamps (the dust `ctime`) from the indexer, so the indexer must be at the chain tip — a lagging indexer reproduces the same error 170. `.env.example` updated accordingly. Known caveat: the public preprod indexer's graphql-ws subscription degrades over long multi-call sessions; use a caught-up local indexer for heavy use.
+
+### 2026-05-20: Async-job migration for long-running actions
+
+All nine long-running OData actions now return `{ jobId, status }` immediately and the caller polls `getJobStatus(jobId, sessionId)`, instead of blocking the HTTP request on multi-minute proof/submit work.
+
+- New `BackgroundJobs` entity + `BackgroundJobStatus` / `BackgroundJobKind` types; new `srv/submission/background-jobs.ts` (per-kind semaphore — heavy=4, light=16 — plus idempotency and crash recovery that flips interrupted rows to `failed:PROCESS_RESTART` on boot).
+- New `getJobStatus(jobId, sessionId)` action (declared `action`/POST, so clients poll with the same POST+body pattern as everything else).
+- Migrated: `connectWalletForSigning` (returns `prewarmJobId`), `registerForDustGeneration`, `deregisterFromDustGeneration`, `sendNight`, `shieldFunds`, `unshieldFunds`, `deployContract`, `submitContractCall`, `anchorDocument`.
+- Auto-deploy removed: `ensureSchemaDeployed` is now probe-only (fail-fast); deploy explicitly with `npm run deploy`.
+- Trip-hazard documented: never hold a CAP transaction open across a worker `await` — `@cap-js/sqlite` pools a single connection, so doing so starves every other query. Work runs via `runWithoutAmbientTx` (clears `cds.context`) with short per-write txs.
+
+### 2026-05-20: Attestation / Documents / Disclosure surface (T11–T14)
+
+The published consumer surface that `@odatano/passport` (and other apps) import on top of the plugin.
+
+- **T11** — abstract `AttestationService` CDS mixin (`src/sdk/AttestationService.cds` / `.ts`) with `Public` / `Disclosed` / `Authority` role-tier projections over `Attestations`, wired by `registerAttestationServiceHandlers`. Exported as `@odatano/nightgate/sdk/AttestationService` (+ `.cds`).
+- **T12** — `Documents` entity + `anchorDocument` action: anchors a content hash on-chain via the `attest` circuit. Caller-managed storage by design — NIGHTGATE stores only the `sha256` + a caller-supplied `storageRef` (`file://` / `s3://` / `ipfs://`), never the document bytes.
+- **T13** — `verifyDocument(documentId, providedSha256)`: confirms the hash matches an anchored tx that resolves to a SUCCESS `TransactionResults` row.
+- **T14** — `DisclosureRoles` entity + `DisclosureRole` enum (`public_only` / `legitimate_interest` / `authority`, mapped to EU Battery Regulation Annex XIII tiers), `attachDisclosureRole` request middleware, and an authority-gated admin `grantRole` action.
+
 ### 2026-05-19: Diagnostics tier
 
 Read-only pre-flight functions complementing the Token-Ops Core write actions. Same worker-thread pattern, but using CDS `function` (GET) since these don't submit transactions.
