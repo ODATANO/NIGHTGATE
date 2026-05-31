@@ -48,3 +48,5 @@ AGENTS.md
 # Internal planning / feature-request docs — kept local only
 db/enhancements.md
 docs/feature-requests/zk-predicate-attestation.md
+docs/release-0.3.0.md
+docs/feature-requests/bug_001.md
