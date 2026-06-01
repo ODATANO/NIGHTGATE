@@ -163,10 +163,51 @@ Invoke a circuit on a deployed contract.
 | `circuit` | String | Circuit name (e.g. `"increment"`) |
 | `compiledArtifactRef` | String | Logical name from registry |
 | `sessionId` | UUID | Must have signing enabled |
-| `args` | LargeString | JSON-encoded array (use `"[]"` for no args) |
+| `args` | LargeString | JSON-encoded array (use `"[]"` for no args). See **Encoding circuit args** below |
 | `idempotencyKey` | String (optional) | Dedupes retries against the original job; reusing a key returns the existing `jobId` |
 
 **Rate limit:** 30/min per session.
+
+#### Encoding circuit args
+
+`args` is a JSON array, but a compiled Compact circuit expects native value types
+that JSON can't carry directly — a `Bytes<N>` parameter must arrive as a real
+`Uint8Array(N)`, and a `Uint<N>` as a `BigInt`. NIGHTGATE coerces each element
+**before** invoking the circuit, driven by the circuit's declared parameter types
+(read from the compiled artifact's `contract-info.json`). Two encodings are
+supported per element:
+
+| Circuit param | Pass in the JSON array as | Coerced to |
+|---|---|---|
+| `Bytes<N>` | hex string (`"ab…"`, optional `0x` prefix), **or** a `number[]` of bytes | `Uint8Array(N)` (length-checked) |
+| `Uint<N>` | a number (`47300`) or a decimal string (`"47300"`) | `BigInt` |
+| `Boolean` | `true` / `false` | boolean |
+| other (`Vector`, struct, …) | the JSON value | passed through unchanged |
+
+For circuits NIGHTGATE can't introspect (no `contract-info.json` found for the
+circuit), use **tagged values**, which are honored regardless of metadata:
+
+- `{ "$bytes": "<hex>" }` → `Uint8Array`
+- `{ "$uint": "<decimal>" }` (or `{ "$uint": 123 }`) → `BigInt`
+
+An **untagged** argument for a circuit whose types can't be introspected is
+rejected with a clear **400** (rather than silently passed through to fail inside
+the circuit) — tag the value, or fix the registered contract's artifact path so
+its `contract-info.json` resolves.
+
+Example — calling `bindPassport(passportId: Bytes<32>, payload_hash: Bytes<32>)`:
+
+```jsonc
+// convention (introspected): each 64-hex string becomes a Uint8Array(32)
+"args": "[\"<64-hex passportId>\", \"<64-hex payload_hash>\"]"
+
+// equivalent, explicit tags:
+"args": "[{\"$bytes\":\"<64-hex passportId>\"}, {\"$bytes\":\"<64-hex payload_hash>\"}]"
+```
+
+Invalid hex, a byte length that doesn't match `Bytes<N>`, or a non-integer/negative
+`Uint` value is rejected with a clear **400** (`args[i]: …`) rather than failing
+deep inside the circuit's type guard.
 
 ## Document anchoring
 

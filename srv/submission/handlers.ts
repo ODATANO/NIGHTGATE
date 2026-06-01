@@ -36,6 +36,11 @@ import {
     SessionNotFoundError,
     WalletMaterialUnavailable
 } from './wallet-material-factory';
+import {
+    coerceCircuitArgs,
+    loadCircuitArgTypes,
+    CoercionError
+} from './arg-coercion';
 import { resolveNightgateRuntimeConfig, type NightgateNetwork, getConfiguredPrivateStateBackend, getNightgatePluginConfig, mainnetSubmissionBlockReason } from '../utils/nightgate-config';
 import { RateLimiter } from '../utils/rate-limiter';
 import { ensureNetworkId, type ContractProvidersConfig } from '../midnight/providers';
@@ -75,6 +80,8 @@ export interface SubmissionHandlersOptions {
     resolveContractImpl?: typeof resolveContract;
     /** Override the submitter constructor. Defaults to the real class. */
     submitterFactory?: (deps: TransactionSubmitterDeps) => TransactionSubmitter;
+    /** Override circuit-arg-type introspection. Defaults to reading contract-info.json. */
+    circuitArgTypesLoader?: typeof loadCircuitArgTypes;
 }
 
 export function registerSubmissionHandlers(
@@ -87,6 +94,7 @@ export function registerSubmissionHandlers(
     const walletFactory = options.walletMaterialFactory ?? buildWalletMaterialForSession;
     const contractResolver = options.resolveContractImpl ?? resolveContract;
     const submitterFactory = options.submitterFactory ?? ((deps: TransactionSubmitterDeps) => new TransactionSubmitter(deps));
+    const argTypesLoader = options.circuitArgTypesLoader ?? loadCircuitArgTypes;
 
     srv.on('deployContract', async (req: Request) => {
         const { compiledArtifactRef, sessionId, initialPrivateState, idempotencyKey } = req.data as {
@@ -179,6 +187,14 @@ export function registerSubmissionHandlers(
             const facadeCfg = facadeConfigFromEnv();
             await ensureNetworkId(facadeCfg.networkId);
             const resolved = await contractResolver(compiledArtifactRef);
+
+            // Coerce JSON-parsed args into the value shapes the compiled circuit
+            // requires (Bytes<N> → Uint8Array, Uint<N> → BigInt) before the
+            // worker spreads them into fn(...callArgs). CoercionError → 400 via
+            // runSubmission. See srv/submission/arg-coercion.ts.
+            const argTypes = argTypesLoader(resolved.zkConfigPath, circuit);
+            const coercedArgs = coerceCircuitArgs(parsedArgs, argTypes);
+
             const wallet = await walletFactory({ sessionId, db, facadeConfig: facadeCfg });
             const submitter = submitterFactory(buildSubmitterDeps(db, resolved, wallet));
 
@@ -186,12 +202,12 @@ export function registerSubmissionHandlers(
                 kind:           'submitContractCall',
                 sessionId,
                 idempotencyKey,
-                request:        { contractAddress, circuit, compiledArtifactRef, sessionId, argCount: parsedArgs.length },
+                request:        { contractAddress, circuit, compiledArtifactRef, sessionId, argCount: coercedArgs.length },
                 work: async () => {
                     const result = await submitter.call({
                         contractAddress,
                         circuit,
-                        args:         parsedArgs,
+                        args:         coercedArgs,
                         contractName: compiledArtifactRef,
                         registration: {
                             artifactPath:   resolved.artifactPath,
@@ -620,6 +636,11 @@ async function runSubmission(req: Request, op: () => Promise<unknown>): Promise<
     try {
         return await op();
     } catch (err) {
+        if (err instanceof CoercionError) {
+            // Bad arg encoding (invalid hex, wrong byte length, non-integer
+            // Uint, …) — a clean 400, not a deep circuit type error.
+            return req.reject(400, err.message);
+        }
         if (err instanceof ContractNotRegisteredError) {
             return req.reject(404, err.message);
         }

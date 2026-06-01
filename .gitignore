@@ -10,6 +10,9 @@ db/*.db-wal
 *.sqlite-shm
 *.sqlite-wal
 
+# Packaging (npm pack / publish output)
+*.tgz
+
 # In-place TypeScript build output
 src/**/*.js
 src/**/*.d.ts
@@ -48,5 +51,6 @@ AGENTS.md
 # Internal planning / feature-request docs — kept local only
 db/enhancements.md
 docs/feature-requests/zk-predicate-attestation.md
+docs/feature-requests/submitcontractcall-bytes-args.md
 docs/release-0.3.0.md
 docs/feature-requests/bug_001.md

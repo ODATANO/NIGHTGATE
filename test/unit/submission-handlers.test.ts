@@ -37,6 +37,14 @@ import {
     SessionNotFoundError,
     WalletMaterialUnavailable
 } from '../../srv/submission/wallet-material-factory';
+import {
+    coerceCircuitArgs,
+    loadCircuitArgTypes,
+    clearArgTypeCache,
+    CoercionError,
+    type CircuitArgType
+} from '../../srv/submission/arg-coercion';
+import path from 'path';
 
 // ---- Fakes ----------------------------------------------------------------
 
@@ -844,5 +852,240 @@ describe('verifyPredicateAttestation', () => {
         const req = makeReq({ predicateAttestationId: PA_ID });
         const result: any = await srv.handlers['verifyPredicateAttestation'](req);
         expect(result.verified).toBe(false);
+    });
+});
+
+// ---- Typed arg coercion for submitContractCall ----------------------------
+// A Bytes<N> circuit arg can't reach the circuit via the JSON `args` surface
+// without coercion. These cover the coercion layer (pure), the
+// contract-info.json introspection (against the real shipped artifact), and the
+// handler wiring + 400s.
+
+describe('arg-coercion: coerceCircuitArgs (pure)', () => {
+    const BYTES32: CircuitArgType = { name: 'h', kind: 'Bytes', length: 32 };
+    const UINT8:   CircuitArgType = { name: 'n', kind: 'Uint', maxval: 255 };
+
+    test('hex string → Uint8Array(32) when param is Bytes<32>', () => {
+        const hex = 'ab'.repeat(32);
+        const [out] = coerceCircuitArgs([hex], [BYTES32]);
+        expect(out).toBeInstanceOf(Uint8Array);
+        expect((out as Uint8Array).length).toBe(32);
+        expect((out as Uint8Array)[0]).toBe(0xab);
+    });
+
+    test('0x-prefixed hex is accepted', () => {
+        const [out] = coerceCircuitArgs(['0x' + 'cd'.repeat(32)], [BYTES32]);
+        expect((out as Uint8Array).length).toBe(32);
+        expect((out as Uint8Array)[0]).toBe(0xcd);
+    });
+
+    test('number[] → Uint8Array when param is Bytes<N>', () => {
+        const arr = Array.from({ length: 32 }, (_, i) => i);
+        const [out] = coerceCircuitArgs([arr], [BYTES32]);
+        expect(out).toBeInstanceOf(Uint8Array);
+        expect(Array.from(out as Uint8Array)).toEqual(arr);
+    });
+
+    test('number → BigInt when param is Uint', () => {
+        const [out] = coerceCircuitArgs([7], [UINT8]);
+        expect(out).toBe(7n);
+    });
+
+    test('decimal string → BigInt when param is Uint', () => {
+        const [out] = coerceCircuitArgs(['200'], [UINT8]);
+        expect(out).toBe(200n);
+    });
+
+    test('tagged { $bytes } → Uint8Array even with no metadata', () => {
+        const [out] = coerceCircuitArgs([{ $bytes: 'ff'.repeat(4) }], undefined);
+        expect(out).toBeInstanceOf(Uint8Array);
+        expect(Array.from(out as Uint8Array)).toEqual([255, 255, 255, 255]);
+    });
+
+    test('tagged { $uint } → BigInt even with no metadata', () => {
+        const [out] = coerceCircuitArgs([{ $uint: '47300' }], undefined);
+        expect(out).toBe(47300n);
+    });
+
+    test('no metadata + untagged → CoercionError (strict, no silent passthrough)', () => {
+        expect(() => coerceCircuitArgs([5], undefined)).toThrow(/could not determine the circuit parameter type/);
+        // …but tagged values and empty arg lists still work without metadata.
+        expect(coerceCircuitArgs([], undefined)).toEqual([]);
+        expect(coerceCircuitArgs([{ $uint: '5' }], undefined)).toEqual([5n]);
+    });
+
+    test('invalid hex → CoercionError with index', () => {
+        expect(() => coerceCircuitArgs(['zz'.repeat(32)], [BYTES32])).toThrow(CoercionError);
+        try { coerceCircuitArgs(['aa'.repeat(32), 'zz'.repeat(32)], [BYTES32, BYTES32]); }
+        catch (e) { expect((e as CoercionError).index).toBe(1); }
+    });
+
+    test('wrong byte length → CoercionError', () => {
+        expect(() => coerceCircuitArgs(['ab'.repeat(16)], [BYTES32]))
+            .toThrow(/expected 32 bytes/);
+    });
+
+    test('Uint over declared maxval → CoercionError', () => {
+        expect(() => coerceCircuitArgs([256], [UINT8])).toThrow(/exceeds maximum 255/);
+    });
+
+    test('negative Uint → CoercionError', () => {
+        expect(() => coerceCircuitArgs([-1], [UINT8])).toThrow(/non-negative/);
+    });
+});
+
+describe('arg-coercion: loadCircuitArgTypes (real attestation-vault artifact)', () => {
+    const VAULT_ZK = path.resolve(
+        __dirname, '..', '..',
+        'contracts', 'attestation-vault', 'src', 'managed', 'attestation-vault'
+    );
+
+    beforeEach(() => clearArgTypeCache());
+
+    test('attest → two Bytes<32> params', () => {
+        const types = loadCircuitArgTypes(VAULT_ZK, 'attest');
+        expect(types).toEqual([
+            { name: 'payload_hash',  kind: 'Bytes', length: 32 },
+            { name: 'metadata_hash', kind: 'Bytes', length: 32 }
+        ]);
+    });
+
+    test('grantDisclosure → Bytes<32>, Bytes<32>, Uint', () => {
+        const types = loadCircuitArgTypes(VAULT_ZK, 'grantDisclosure');
+        expect(types?.map((t) => t.kind)).toEqual(['Bytes', 'Bytes', 'Uint']);
+        expect(types?.[2].maxval).toBe(255);
+    });
+
+    test('unknown circuit → undefined', () => {
+        expect(loadCircuitArgTypes(VAULT_ZK, 'bindPassport')).toBeUndefined();
+    });
+
+    test('missing contract-info.json → undefined (no throw)', () => {
+        expect(loadCircuitArgTypes('/tmp/does-not-exist', 'attest')).toBeUndefined();
+    });
+});
+
+describe('submitContractCall: Bytes/Uint arg coercion reaches the submitter', () => {
+    // A consumer's bindPassport(passportId: Bytes<32>, payload_hash: Bytes<32>).
+    const bindPassportTypes: CircuitArgType[] = [
+        { name: 'passportId',   kind: 'Bytes', length: 32 },
+        { name: 'payload_hash', kind: 'Bytes', length: 32 }
+    ];
+
+    function setup(overrides: any = {}) {
+        const srv = makeFakeService();
+        const submitter = makeSuccessfulSubmitter();
+        registerSubmissionHandlers(srv as any, {}, {
+            resolveContractImpl: jest.fn(async () => ({ ...RESOLVED_CONTRACT_FIXTURE })),
+            walletMaterialFactory: jest.fn(async () => ({
+                accountId: 'a', privateStoragePasswordProvider: () => '0123456789ABCDEFG', walletAndMidnightProvider: {}
+            })),
+            submitterFactory: () => submitter,
+            circuitArgTypesLoader: () => bindPassportTypes,
+            ...overrides
+        });
+        return { srv, submitter };
+    }
+
+    function callArgsOf(submitter: any) {
+        return (submitter.call as jest.Mock).mock.calls[0][0].args as unknown[];
+    }
+
+    test('AC1: Bytes<32> hex args reach the circuit as Uint8Array(32) (bindPassport)', async () => {
+        const { srv, submitter } = setup();
+        const passportId  = '11'.repeat(32);
+        const payloadHash = '22'.repeat(32);
+        const req = makeReq({
+            contractAddress: '0xC', circuit: 'bindPassport', compiledArtifactRef: 'x',
+            sessionId: `bind-${Date.now()}`, args: JSON.stringify([passportId, payloadHash])
+        });
+        await srv.handlers['submitContractCall'](req);
+        expect(req.reject).not.toHaveBeenCalled();
+        const args = callArgsOf(submitter);
+        expect(args[0]).toBeInstanceOf(Uint8Array);
+        expect((args[0] as Uint8Array).length).toBe(32);
+        expect((args[0] as Uint8Array)[0]).toBe(0x11);
+        expect((args[1] as Uint8Array)[0]).toBe(0x22);
+    });
+
+    test('AC2: attest becomes callable generically (real artifact introspection)', async () => {
+        const VAULT_ZK = path.resolve(
+            __dirname, '..', '..',
+            'contracts', 'attestation-vault', 'src', 'managed', 'attestation-vault'
+        );
+        clearArgTypeCache();
+        // Use the REAL loader against the REAL attestation-vault artifact path.
+        const { srv, submitter } = setup({
+            circuitArgTypesLoader: undefined,
+            resolveContractImpl: jest.fn(async () => ({ ...RESOLVED_CONTRACT_FIXTURE, zkConfigPath: VAULT_ZK }))
+        });
+        const req = makeReq({
+            contractAddress: '0xVAULT', circuit: 'attest', compiledArtifactRef: 'attestation-vault',
+            sessionId: `attest-${Date.now()}`, args: JSON.stringify(['aa'.repeat(32), 'bb'.repeat(32)])
+        });
+        await srv.handlers['submitContractCall'](req);
+        expect(req.reject).not.toHaveBeenCalled();
+        const args = callArgsOf(submitter);
+        expect(args[0]).toBeInstanceOf(Uint8Array);
+        expect(args[1]).toBeInstanceOf(Uint8Array);
+        expect((args[0] as Uint8Array).length).toBe(32);
+    });
+
+    test('AC3: Uint arg reaches the circuit as BigInt', async () => {
+        const { srv, submitter } = setup({
+            circuitArgTypesLoader: () => [{ name: 'level', kind: 'Uint', maxval: 255 }] as CircuitArgType[]
+        });
+        const req = makeReq({
+            contractAddress: '0xC', circuit: 'setLevel', compiledArtifactRef: 'x',
+            sessionId: `uint-${Date.now()}`, args: JSON.stringify([2])
+        });
+        await srv.handlers['submitContractCall'](req);
+        expect(req.reject).not.toHaveBeenCalled();
+        expect(callArgsOf(submitter)[0]).toBe(2n);
+    });
+
+    test('AC4: invalid hex → 400, not a deep circuit error', async () => {
+        const { srv } = setup();
+        const req = makeReq({
+            contractAddress: '0xC', circuit: 'bindPassport', compiledArtifactRef: 'x',
+            sessionId: `badhex-${Date.now()}`, args: JSON.stringify(['zz'.repeat(32), '22'.repeat(32)])
+        });
+        await srv.handlers['submitContractCall'](req);
+        expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/args\[0\].*hex/));
+    });
+
+    test('AC4: wrong byte length → 400', async () => {
+        const { srv } = setup();
+        const req = makeReq({
+            contractAddress: '0xC', circuit: 'bindPassport', compiledArtifactRef: 'x',
+            sessionId: `badlen-${Date.now()}`, args: JSON.stringify(['11'.repeat(16), '22'.repeat(32)])
+        });
+        await srv.handlers['submitContractCall'](req);
+        expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/expected 32 bytes/));
+    });
+
+    test('strict: untagged arg with no circuit metadata → 400 (no silent passthrough)', async () => {
+        // Loader returns undefined → no contract-info.json found for the circuit.
+        const { srv } = setup({ circuitArgTypesLoader: () => undefined });
+        const req = makeReq({
+            contractAddress: '0xC', circuit: 'mystery', compiledArtifactRef: 'x',
+            sessionId: `nometa-${Date.now()}`, args: JSON.stringify(['aa'.repeat(32)])
+        });
+        await srv.handlers['submitContractCall'](req);
+        expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/could not determine the circuit parameter type/));
+    });
+
+    test('strict: tagged values still work with no circuit metadata', async () => {
+        const { srv, submitter } = setup({ circuitArgTypesLoader: () => undefined });
+        const req = makeReq({
+            contractAddress: '0xC', circuit: 'mystery', compiledArtifactRef: 'x',
+            sessionId: `tagged-${Date.now()}`,
+            args: JSON.stringify([{ $bytes: 'aa'.repeat(32) }, { $uint: '5' }])
+        });
+        await srv.handlers['submitContractCall'](req);
+        expect(req.reject).not.toHaveBeenCalled();
+        const args = callArgsOf(submitter);
+        expect(args[0]).toBeInstanceOf(Uint8Array);
+        expect(args[1]).toBe(5n);
     });
 });
