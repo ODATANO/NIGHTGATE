@@ -1,7 +1,7 @@
 /**
  * Typed argument coercion for the generic `submitContractCall` action.
  *
- * Problem: a
+ * Problem (see docs/feature-requests/submitcontractcall-bytes-args.md): a
  * compiled Compact circuit guards a `Bytes<N>` parameter strictly as a real
  * `Uint8Array(N)` (`.buffer instanceof ArrayBuffer && BYTES_PER_ELEMENT === 1
  * && length === N`). The public `submitContractCall` takes `args` as a JSON
@@ -24,12 +24,9 @@
  *   - Untagged + introspected: the circuit's declared param types are read from
  *     the compiled artifact's `contract-info.json`; a hex string / number[] is
  *     coerced to Bytes<N> (exact-length checked), a number / decimal-string to
- *     BigInt for Uint<N>. A param of an unhandled Compact type (Vector, struct,
- *     Field, …) passes through unchanged.
- *   - Untagged + no metadata for the argument: rejected with a clear 400. We
- *     do NOT silently pass it through — that would reproduce the deep
- *     circuit-type failure this layer exists to prevent. The caller fixes it by
- *     tagging the value or correcting the registered artifact path.
+ *     BigInt for Uint<N>.
+ *   - Untagged + no metadata available: passthrough (preserves the prior
+ *     JSON-native behavior — full backward compatibility).
  */
 
 import fs from 'fs';
@@ -160,18 +157,8 @@ function coerceOne(raw: unknown, argType: CircuitArgType | undefined, index: num
         }
     }
 
-    // 3. No declared type for this argument AND no tag. We can't validate it,
-    // so rather than silently passing it through (which reproduces the very
-    // deep-circuit-failure this layer exists to prevent), reject
-    // with an actionable 400. The two escape hatches are listed in the message:
-    // tag the value, or fix the registered contract so contract-info.json is
-    // found. Empty arg lists never reach here (no elements to coerce).
-    throw new CoercionError(
-        index,
-        'could not determine the circuit parameter type (the contract\'s ' +
-        'contract-info.json was not found — check the registered artifact path). ' +
-        'Pass a tagged value instead: {"$bytes":"<hex>"} or {"$uint":<n>}.'
-    );
+    // 3. No metadata and no tag → passthrough (backward compatible).
+    return raw;
 }
 
 /**
@@ -197,8 +184,8 @@ interface RawCircuit {
 
 function mapArgType(node: RawArgTypeNode | undefined, name: string): CircuitArgType {
     const tn = node?.['type-name'];
-    if (tn === 'Bytes')   return { name, kind: 'Bytes', length: node?.length };
-    if (tn === 'Uint')    return { name, kind: 'Uint', maxval: node?.maxval };
+    if (tn === 'Bytes') return { name, kind: 'Bytes', length: node?.length };
+    if (tn === 'Uint') return { name, kind: 'Uint', maxval: node?.maxval };
     if (tn === 'Boolean') return { name, kind: 'Boolean' };
     return { name, kind: 'other' };
 }
