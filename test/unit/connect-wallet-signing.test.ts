@@ -1,5 +1,5 @@
 /**
- * Tests for the connectWalletForSigning action (T7-extended.a).
+ * Tests for the connectWalletForSigning action.
  *
  * Drives registerWalletSessionHandlers against a stub service that captures
  * handler registrations. Same pattern as submission-handlers.test.ts.

@@ -1,5 +1,5 @@
 /**
- * OData handlers for NightgateService submission actions (T6).
+ * OData handlers for NightgateService submission actions.
  *
  * - `deployContract`        → TransactionSubmitter.deploy()
  * - `submitContractCall`    → TransactionSubmitter.call()

@@ -18,9 +18,9 @@ service NightgateAdminService {
     action invalidateSession(sessionId: UUID);
     action invalidateAllSessions();
 
-    // T14 — grant a disclosure tier to a user. Service-level @requires: 'admin'
-    // gates CAP-auth-side; handler additionally requires the caller's own
-    // disclosureRole = 'authority' (defense in depth).
+    // Grant a disclosure tier to a user. Service-level @requires: 'admin'
+    // gates the CAP-auth side; the handler additionally requires the caller's
+    // own disclosureRole = 'authority' (defense in depth).
     action grantRole(
         userId:     String,
         role:       String,

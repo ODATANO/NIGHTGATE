@@ -1,4 +1,4 @@
-// T15 end-to-end runner.
+// End-to-end deploy runner.
 //
 // Walks through: connectWallet → connectWalletForSigning → (await prewarm)
 // → registerForDustGeneration (poll) → wait → deployContract (poll) against
@@ -10,17 +10,17 @@
 // `pollJob` below handles that.
 //
 // Inputs (env vars):
-//   NIGHTGATE_URL              default http://localhost:4004
-//   LACE_VIEWING_KEY           required, Midnight Preprod viewing key from Lace
-//   LACE_MNEMONIC              required, BIP39 recovery phrase (12/24 words);
-//                              the server HD-derives per-role keys from it
-//   T15_DUST_WAIT_SECONDS      default 90, how long to wait after registration
-//   T15_SKIP_DUST_REG          set to 1 if DUST already registered in a prior run
-//   T15_PREWARM_TIMEOUT_MIN    default 240 (4h) — cold sync upper bound
-//   T15_JOB_POLL_INTERVAL_MS   default 5000 — getJobStatus poll cadence
+//   NIGHTGATE_URL                  default http://localhost:4004
+//   LACE_VIEWING_KEY               required, Midnight Preprod viewing key from Lace
+//   LACE_MNEMONIC                  required, BIP39 recovery phrase (12/24 words);
+//                                  the server HD-derives per-role keys from it
+//   DEPLOY_E2E_DUST_WAIT_SECONDS   default 90, how long to wait after registration
+//   DEPLOY_E2E_SKIP_DUST_REG       set to 1 if DUST already registered in a prior run
+//   E2E_PREWARM_TIMEOUT_MIN        default 240 (4h) — cold sync upper bound
+//   E2E_JOB_POLL_INTERVAL_MS       default 5000 — getJobStatus poll cadence
 //
 // Run:
-//   LACE_VIEWING_KEY="..." LACE_MNEMONIC="word1 word2 ..." node scripts/run-t15.mjs
+//   LACE_VIEWING_KEY="..." LACE_MNEMONIC="word1 word2 ..." node scripts/run-deploy-e2e.mjs
 
 import bip39 from 'bip39';
 import { Agent, setGlobalDispatcher } from 'undici';
@@ -38,10 +38,10 @@ const URL_BASE = process.env.NIGHTGATE_URL || 'http://localhost:4004';
 const ENDPOINT = `${URL_BASE}/api/v1/nightgate`;
 const VK = process.env.LACE_VIEWING_KEY;
 const MNEMONIC = process.env.LACE_MNEMONIC;
-const DUST_WAIT_S = parseInt(process.env.T15_DUST_WAIT_SECONDS || '90', 10);
-const SKIP_DUST = process.env.T15_SKIP_DUST_REG === '1';
-const PREWARM_TIMEOUT_MS = parseInt(process.env.T15_PREWARM_TIMEOUT_MIN || '240', 10) * 60_000;
-const JOB_POLL_MS = parseInt(process.env.T15_JOB_POLL_INTERVAL_MS || '5000', 10);
+const DUST_WAIT_S = parseInt(process.env.DEPLOY_E2E_DUST_WAIT_SECONDS || '90', 10);
+const SKIP_DUST = process.env.DEPLOY_E2E_SKIP_DUST_REG === '1';
+const PREWARM_TIMEOUT_MS = parseInt(process.env.E2E_PREWARM_TIMEOUT_MIN || '240', 10) * 60_000;
+const JOB_POLL_MS = parseInt(process.env.E2E_JOB_POLL_INTERVAL_MS || '5000', 10);
 
 function fail(msg) { console.error(`FAIL ${msg}`); process.exit(1); }
 function step(name) { console.log(`\n--- ${name} ---`); }
@@ -196,7 +196,7 @@ async function waitForServer() {
     const deployResult = await pollJob(sessionId, deployJobId, 'deploy');
     console.log(`OK   result: ${pretty(deployResult)}`);
 
-    console.log('\nT15 PASSED. Contract deployed.');
+    console.log('\nPASSED. Contract deployed.');
     console.log(`Submission ID:    ${deployResult.submissionId}`);
     console.log(`Tx hash:          ${deployResult.txHash}`);
     console.log(`Contract address: ${deployResult.contractAddress}`);

@@ -153,7 +153,7 @@ service NightgateService {
         };
 
     // ========================================================================
-    // Submission Lifecycle (T4/T5)
+    // Submission Lifecycle
     // ========================================================================
 
     /**
@@ -165,7 +165,7 @@ service NightgateService {
     entity PendingSubmissions        as projection on midnight.PendingSubmissions;
 
     // ========================================================================
-    // Document Anchoring (T12)
+    // Document Anchoring
     // ========================================================================
 
     /**
@@ -211,8 +211,8 @@ service NightgateService {
     };
 
     /**
-     * Verify that a document's content hash matches what was anchored on chain
-     * (T13). Returns a deterministic yes/no answer — invalid inputs reject
+     * Verify that a document's content hash matches what was anchored on chain.
+     * Returns a deterministic yes/no answer — invalid inputs reject
      * with 400/404, but a hash-mismatch on a known doc returns
      * `verified: false` rather than erroring, so calling UIs can render
      * "tampered" without status-code juggling.

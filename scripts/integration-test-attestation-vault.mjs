@@ -1,4 +1,4 @@
-// Drives end-to-end loading of the AttestationVault contract (T10-extended).
+// Drives end-to-end loading of the AttestationVault contract.
 // Verifies:
 //   1. The compiled artifact loads and exposes the three exported circuits
 //      (attest, grantDisclosure, revokeDisclosure) plus the local_secret_key

@@ -1,5 +1,5 @@
 /**
- * DUST registration (T7-extended.c, T30 Phase 2a).
+ * DUST registration.
  *
  * Per docs.midnight.network/guides/generating-dust-programmatically, NIGHT
  * UTXOs must be registered for DUST generation before they start producing

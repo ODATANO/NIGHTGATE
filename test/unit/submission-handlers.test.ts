@@ -1,5 +1,5 @@
 /**
- * Tests for srv/submission/handlers.ts (OData action handlers, T6).
+ * Tests for srv/submission/handlers.ts (OData action handlers).
  *
  * Drives `registerSubmissionHandlers` against a stub service that just
  * captures handler registrations, then invokes them directly with synthetic
@@ -241,13 +241,13 @@ describe('error translation to OData status codes', () => {
         expect(req.reject).toHaveBeenCalledWith(401, expect.stringMatching(/not found/));
     });
 
-    test('WalletMaterialUnavailable → 501 with T7 pointer', async () => {
+    test('WalletMaterialUnavailable → 501', async () => {
         const srv = setupHandlers({
             walletMaterialFactory: jest.fn(async () => { throw new WalletMaterialUnavailable('signing not impl'); })
         });
         const req = makeReq({ ...VALID_DEPLOY_ARGS, sessionId: 'session-501' });
         await srv.handlers['deployContract'](req);
-        expect(req.reject).toHaveBeenCalledWith(501, expect.stringMatching(/T7/));
+        expect(req.reject).toHaveBeenCalledWith(501, expect.stringMatching(/Wallet material unavailable/));
     });
 
     // Phase 3 (0.2.0): SubmissionError no longer surfaces via OData. It now
@@ -315,7 +315,7 @@ describe('rate limiting', () => {
     });
 });
 
-// ---- anchorDocument (T12) -------------------------------------------------
+// ---- anchorDocument -------------------------------------------------------
 
 describe('anchorDocument', () => {
     const VALID_SHA256 = 'a'.repeat(64);
@@ -483,7 +483,7 @@ describe('anchorDocument', () => {
     });
 });
 
-// ---- verifyDocument (T13) -------------------------------------------------
+// ---- verifyDocument -------------------------------------------------------
 
 describe('verifyDocument', () => {
     const VALID_SHA = 'a'.repeat(64);

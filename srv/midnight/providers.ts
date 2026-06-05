@@ -12,11 +12,11 @@
  *
  *  - `buildFullProviderBundle(cfg, walletMaterial)`, augments the above with
  *    `privateStateProvider`, `walletProvider`, `midnightProvider`. Requires a
- *    decrypted session-scoped passwordProvider + accountId (produced by T7).
+ *    decrypted session-scoped passwordProvider + accountId from the wallet
+ *    material factory.
  *
- * The two-stage split lets T4 (deploy/call submission) construct contract
- * providers cheaply and only assemble wallet-bound providers when an active
- * session is present.
+ * The two-stage split lets submission construct contract providers cheaply and
+ * only assemble wallet-bound providers when an active session is present.
  */
 
 import WebSocket from 'ws';
@@ -67,8 +67,8 @@ export interface WalletMaterial {
      */
     privateStoragePasswordProvider: () => Promise<string> | string;
     /**
-     * Wallet+midnight provider produced by T7 from the wallet-sdk-facade.
-     * Same instance is reused for both `walletProvider` and `midnightProvider`
+     * Wallet+midnight provider built from the wallet-sdk-facade. The same
+     * instance is reused for both `walletProvider` and `midnightProvider`
      * slots per the Counter CLI pattern.
      *
      * Typed `any` (not `unknown`) because the underlying SDK interfaces
@@ -79,7 +79,7 @@ export interface WalletMaterial {
     walletAndMidnightProvider: any;
     /**
      * Which backend to use for the SDK's private-state provider.
-     * - 'cap-db' (default): NIGHTGATE's encrypted CAP-DB-backed provider (T29).
+     * - 'cap-db' (default): NIGHTGATE's encrypted CAP-DB-backed provider.
      *   Persistent, multi-user safe, production-grade.
      * - 'level': SDK's bundled LevelDB provider. Dev-only, SDK docs explicitly
      *   warn against use with real assets ("clearing local files permanently

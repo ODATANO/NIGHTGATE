@@ -11,7 +11,7 @@ Running NIGHTGATE day-to-day. Audience: anyone deploying it, debugging a stuck s
 | `npm run serve` | Production-ish | Plain `cds-serve` (no heap pre-config) |
 | `npm run sync:start` | Bootstrap a wallet session | Calls `connectWallet` + `connectWalletForSigning` against `localhost:4004`, reads keys from `.env` |
 | `npm run sync:probe` | Check local indexer container | Verifies `localhost:8088` is up + returning data |
-| `npm run t15` | End-to-end test flow | `sync:start` + `registerForDustGeneration` + 90 s wait + `deployContract(counter)` |
+| `npm run deploy:e2e` | End-to-end deploy flow | `sync:start` + `registerForDustGeneration` + 90 s wait + `deployContract(counter)` |
 | `npm run build` | Before publish or after schema change | Generates `@cds-models/` types + compiles TS in-place |
 | `npm run typecheck` | Pre-commit | `tsc --noEmit` |
 | `npm test` | Pre-commit | Jest with coverage (48 suites, 672 tests) |
@@ -39,7 +39,7 @@ NIGHTGATE_CRAWLER_ENABLED=false                           # Turn off during wall
 # NIGHTGATE_INDEXER_HTTP_URL=http://localhost:8088/api/v4/graphql
 # NIGHTGATE_INDEXER_WS_URL=ws://localhost:8088/api/v4/graphql/ws
 
-# Wallet credentials for npm scripts (sync:start, t15). NIGHTGATE HD-derives
+# Wallet credentials for npm scripts (sync:start, deploy:e2e). NIGHTGATE HD-derives
 # the per-role keys from the mnemonic, matching Lace — pass the mnemonic.
 # .env is gitignored — these stay local. NEVER commit a real seed/mnemonic.
 LACE_VIEWING_KEY=a32699a5a29e453f6e92624c2fbefdee173d3f1178e3f9c71bc3edb7d91c1403

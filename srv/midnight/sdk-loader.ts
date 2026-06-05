@@ -98,7 +98,7 @@ export async function loadLedgerV8(): Promise<LedgerV8> {
     }
 }
 
-// ---- wallet-sdk packages (for WalletFacade construction in T7-extended.b) ----
+// ---- wallet-sdk packages (for WalletFacade construction) ----
 
 export interface WalletSdkBundle {
     shielded:     WalletSdkShielded;

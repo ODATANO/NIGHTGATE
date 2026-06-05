@@ -1,16 +1,15 @@
 /**
  * Compiled-contract registry.
  *
- * The OData submission actions (T6) accept a string `compiledArtifactRef`
+ * The OData submission actions accept a string `compiledArtifactRef`
  * (e.g. "attestation-vault") and resolve it through this registry to:
  *   - the compiled contract module (Compact `compactc` output under
  *     `<base>/<name>/src/managed/<name>/contract/`)
  *   - the contract's `privateStateId`
  *   - the `zkConfigPath` the SDK's NodeZkConfigProvider reads from
  *
- * The registry is in-memory and starts empty. T10 (AttestationVault Compact
- * contract) is the first consumer; until a contract is registered, the
- * OData actions return a clear 404-style error rather than failing somewhere
+ * The registry is in-memory and starts empty. Until a contract is registered,
+ * the OData actions return a clear 404-style error rather than failing somewhere
  * deep in the SDK.
  *
  * Registration shape is loaded from `cds.requires.nightgate.contracts` if

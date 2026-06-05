@@ -1,5 +1,5 @@
 /**
- * Tests for srv/submission/contract-witnesses.ts (T10-extended).
+ * Tests for srv/submission/contract-witnesses.ts.
  *
  * Covers:
  *  - deriveAttestationSecret determinism + non-collision across seeds

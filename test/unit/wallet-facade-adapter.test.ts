@@ -1,5 +1,5 @@
 /**
- * Tests for the facade-backed wallet adapter (T7-extended.b).
+ * Tests for the facade-backed wallet adapter.
  *
  * Mocks:
  *   - sdk-loader.loadLedgerV8: returns a stub ZswapSecretKeys.fromSeed.
@@ -231,10 +231,10 @@ describe('facade-backed wallet adapter: happy path', () => {
 describe('facade-backed wallet adapter: config requirement', () => {
     test('without facadeConfig, balanceTx still throws WalletSigningNotAvailable', async () => {
         const db = makeDbWithSession(buildSession());
-        // No facadeConfig, should fall back to the T7-extended.a adapter
+        // No facadeConfig, should fall back to the seed-only adapter
         const material = await buildWalletMaterialForSession({
             sessionId: 'sess-1', db, encryptionKey: TEST_KEY
         });
-        await expect((material.walletAndMidnightProvider as any).balanceTx({})).rejects.toThrow(/T7-extended\.b/);
+        await expect((material.walletAndMidnightProvider as any).balanceTx({})).rejects.toThrow(/no WalletFacade configured/);
     });
 });

@@ -1,34 +1,15 @@
 /**
- * Wallet material factory (T7).
+ * Wallet material factory.
  *
- * Bridges WalletSessions rows to the WalletMaterial shape that
- * TransactionSubmitter / providers expect.
- *
- * What this DOES today (T7, viewing-key-only sessions):
- *   - Look up the active session row by sessionId.
- *   - Decrypt the stored viewing key via srv/utils/crypto.ts.
- *   - Derive a deterministic `accountId` from the viewing key
- *     (HMAC-SHA256, hex-encoded). Same viewing key → same accountId across
- *     reconnects, so the CAP-DB private-state provider (T29) can decrypt
- *     state stored in prior sessions.
- *   - Derive a deterministic `privateStoragePasswordProvider` similarly
- *     (different domain-separation label, 64-char hex, ≥16 char requirement
- *     trivially satisfied).
- *   - Build a `walletAndMidnightProvider` adapter satisfying the
- *     `WalletProvider & MidnightProvider` interface shape.
- *
- * What this does NOT do (gated on T7-extended):
- *   - Build a real signing-capable wallet. A viewing key is read-only by
- *     design; it cannot derive shielded/dust secret keys, cannot balance a
- *     transaction, cannot sign one. The four "active" wallet methods
- *     (getCoinPublicKey, getEncryptionPublicKey, balanceTx, submitTx) throw
- *     `WalletSigningNotAvailable` with a pointer to the schema change needed
- *     (encryptedSeedKey field, now present but unused).
- *
- * Consequence: deploy/call flows still fail at SDK invocation time, but the
- * failure path is now a proper SubmissionError with our message, not a 501.
- * The submission path can be exercised end-to-end through the wallet-material
- * factory; only the final SDK call requires seed material.
+ * Resolves a WalletSessions row into the WalletMaterial shape that
+ * TransactionSubmitter and the provider bundle consume:
+ *   - looks up the active session and decrypts its viewing key
+ *   - derives a deterministic accountId + private-state storage password from
+ *     the viewing key, so the same key maps to the same encrypted state across
+ *     reconnects
+ *   - builds a wallet adapter sized to what the session carries: a real
+ *     signing-capable adapter when an encryptedSeedKey is present, otherwise a
+ *     read-only adapter whose signing methods throw.
  */
 
 import cds from '@sap/cds';
@@ -52,28 +33,25 @@ export class SessionNotFoundError extends Error {
 
 /**
  * Thrown by the wallet adapter's signing/balancing methods when the session
- * does not carry seed material. NOT thrown by `buildWalletMaterialForSession`
- * itself; that returns successfully and lets the SDK call surface the error
- * with full context via TransactionSubmitter's error classification.
+ * carries a viewing key only. Not thrown by `buildWalletMaterialForSession`
+ * itself, which returns successfully and lets the SDK call surface the error
+ * through TransactionSubmitter's classification.
  */
 export class WalletSigningNotAvailable extends Error {
     constructor(method: string) {
         super(
             `Wallet signing surface not available for ${method}: session carries a viewing key only. ` +
-            `Production signing requires the encryptedSeedKey field on WalletSessions to be populated; ` +
-            `tracked as T7-extended in db/enhancements.md.`
+            `Signing requires the encryptedSeedKey field on WalletSessions to be populated.`
         );
         this.name = 'WalletSigningNotAvailable';
     }
 }
 
-// Retained for back-compat with handlers.ts error mapping (currently mapped to 501).
-// After T7 the factory no longer throws this; handlers.ts can be cleaned up later
-// once the 501 path is fully obsolete. We keep the symbol exported so other
-// modules don't break.
+// Retained for back-compat with the handlers.ts 501 mapping. The factory no
+// longer throws this; the symbol stays exported so dependents don't break.
 export class WalletMaterialUnavailable extends Error {
     constructor(reason: string) {
-        super(`Wallet material unavailable: ${reason}. See T7 in db/enhancements.md.`);
+        super(`Wallet material unavailable: ${reason}.`);
         this.name = 'WalletMaterialUnavailable';
     }
 }
@@ -139,15 +117,14 @@ export async function buildWalletMaterialForSession(opts: BuildWalletMaterialOpt
             throw new SessionNotFoundError(opts.sessionId);
         }
         if (opts.facadeConfig) {
-            // Full T7-extended.b: WalletFacade-backed adapter with working
-            // balanceTx and submitTx.
+            // WalletFacade-backed adapter with working balanceTx and submitTx.
             walletAndMidnightProvider = await createFacadeBackedWalletAdapter(
                 accountId,
                 seedHex,
                 { ...opts.facadeConfig, syncStatePassphrase: password }
             );
         } else {
-            // T7-extended.a: pubkeys real, signing methods throw.
+            // Seed present but no facade configured: pubkeys real, signing throws.
             walletAndMidnightProvider = await createSigningCapableWalletAdapter(seedHex);
         }
     } else {
@@ -185,14 +162,12 @@ export function deriveStoragePassword(viewingKey: string): string {
 // ---- Wallet adapter -------------------------------------------------------
 
 /**
- * Object satisfying the structural shape of WalletProvider & MidnightProvider.
- * Today all four methods throw. T7-extended replaces this with a real adapter
- * that uses an encryptedSeedKey from the session.
+ * Read-only adapter for viewing-key-only sessions. All four wallet methods
+ * throw `WalletSigningNotAvailable`.
  *
- * We use `any` for the secret-key/transaction types because pulling them in
- * would force importing ledger-v8 here, which is ESM-only and unnecessary for
- * an adapter that only throws. Real construction (T7-extended) will dynamic-
- * import them.
+ * Typed `any` for the secret-key/transaction types: importing them would pull
+ * in the ESM-only ledger-v8 package, which an adapter that only throws does
+ * not need.
  */
 function createReadOnlyWalletAdapter(): any {
     return {
@@ -204,24 +179,14 @@ function createReadOnlyWalletAdapter(): any {
 }
 
 /**
- * Adapter for sessions that have seed material. ZswapSecretKeys + DustSecretKey
- * are derived once at construction time and held in closure. Public-key methods
- * return real values; balanceTx/submitTx still throw, with a more specific
- * message pointing at T7-extended.b (WalletFacade orchestration).
- */
-/**
- * Full T7-extended.b adapter: real pubkeys from derived ZswapSecretKeys, and
- * balanceTx/submitTx routed through a cached WalletFacade.
+ * Full signing adapter: real pubkeys from the derived ZswapSecretKeys, with
+ * balanceTx/submitTx routed through a WalletFacade.
  *
- * The facade is built lazily on first balanceTx/submitTx call so the request
- * that triggers it pays the chain-sync cost. Cached per accountId via
- * wallet-facade-builder.
- *
- * The facade's `balanceUnboundTransaction` returns an UnboundTransactionRecipe;
- * we then call `finalizeRecipe` to get a FinalizedTransaction that the SDK's
- * deployContract / callTx flow accepts.
- *
- * Default TTL of 1 hour for balance operations; matches the SDK default.
+ * The facade is built lazily on the first balanceTx/submitTx call so that
+ * request pays the chain-sync cost; it is then cached per accountId.
+ * `balanceUnboundTransaction` yields a recipe that `finalizeRecipe` turns into
+ * a transaction the SDK's deploy/call flow accepts. Balance TTL defaults to 1
+ * hour, matching the SDK default.
  */
 async function createFacadeBackedWalletAdapter(
     accountId: string,
@@ -272,6 +237,11 @@ async function createFacadeBackedWalletAdapter(
     };
 }
 
+/**
+ * Adapter for sessions that have seed material but no configured facade. Public
+ * keys are derived from the seed; balanceTx/submitTx throw until a facade is
+ * wired in.
+ */
 async function createSigningCapableWalletAdapter(seedHex: string): Promise<any> {
     if (!/^[0-9a-fA-F]{128}$/.test(seedHex)) {
         // Defense in depth; connectWalletForSigning already validates this.
@@ -295,16 +265,16 @@ async function createSigningCapableWalletAdapter(seedHex: string): Promise<any> 
         getEncryptionPublicKey(): string   { return encryptionPublicKey; },
         async balanceTx(_tx: any, _ttl?: any): Promise<any> {
             throw new WalletSigningNotAvailable(
-                'balanceTx(): secret keys derived but WalletFacade orchestration pending (T7-extended.b)'
+                'balanceTx(): secret keys derived but no WalletFacade configured for this session'
             );
         },
         async submitTx(_tx: any): Promise<any> {
             throw new WalletSigningNotAvailable(
-                'submitTx(): secret keys derived but WalletFacade orchestration pending (T7-extended.b)'
+                'submitTx(): secret keys derived but no WalletFacade configured for this session'
             );
         },
-        // Internal handles for the upcoming T7-extended.b, exposed so the
-        // WalletFacade adapter can grab them without re-deriving.
+        // Internal handles exposed so a facade-backed adapter can reuse them
+        // without re-deriving.
         _internal: { zswapKeys, dustKey }
     };
 }

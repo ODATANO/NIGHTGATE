@@ -1,6 +1,6 @@
 /**
  * Service-implementation helpers for the abstract `AttestationService` CDS
- * mixin (T11). A consumer service that extends `AttestationService` calls
+ * mixin. A consumer service that extends `AttestationService` calls
  * `registerAttestationServiceHandlers(this, db)` from its own `init()` to
  * wire:
  *
@@ -13,7 +13,7 @@
  * so callers can tell "you can't reach this tier" apart from "this tier is
  * empty for you".
  *
- * Row-level visibility (e.g. "show me only attestations I have an on-chain
+ * TODO: Row-level visibility (e.g. "show me only attestations I have an on-chain
  * disclosure for") is deliberately out of scope for v1 — that requires
  * indexing the AttestationVault `disclosures` Map into NIGHTGATE and
  * joining at query time. Filed as future work.
@@ -28,7 +28,7 @@ import {
 export type AttestationTier = 'Public' | 'Disclosed' | 'Authority';
 
 const REQUIRED: Record<AttestationTier, DisclosureRoleValue> = {
-    Public:    'public_only',
+    Public: 'public_only',
     Disclosed: 'legitimate_interest',
     Authority: 'authority'
 };
@@ -52,10 +52,8 @@ export function registerAttestationServiceHandlers(
     // 2. Gate per-entity reads. Service handlers run AFTER the before('*')
     //    hook so the role is already on req. We use entity-specific before
     //    handlers so the rejection fires before CAP runs the DB query.
-    (srv as any).before('READ', 'Disclosed',  makeTierGate('Disclosed'));
-    (srv as any).before('READ', 'Authority',  makeTierGate('Authority'));
-    // Public is intentionally ungated; the projection itself only exposes
-    // public-safe fields.
+    (srv as any).before('READ', 'Disclosed', makeTierGate('Disclosed'));
+    (srv as any).before('READ', 'Authority', makeTierGate('Authority'));
 }
 
 function makeTierGate(tier: AttestationTier) {
@@ -63,17 +61,10 @@ function makeTierGate(tier: AttestationTier) {
     return (req: cds.Request) => {
         const actual = (req as any).disclosureRole as DisclosureRoleValue | undefined;
         if (!meetsDisclosure(actual, required)) {
-            return req.reject(
-                403,
-                `disclosure tier '${tier}' requires role '${required}'; caller has '${actual ?? 'public_only'}'`
-            );
+            return req.reject(403, `disclosure tier '${tier}' requires role '${required}'; caller has '${actual ?? 'public_only'}'`);
         }
     };
 }
-
-// ---------------------------------------------------------------------------
-// ZK predicate attestations — PAC envelope shaping (on-chain-verified model)
-// ---------------------------------------------------------------------------
 
 /**
  * Portable Attestation Credential (PAC) proof envelope. Field names match the
@@ -81,26 +72,20 @@ function makeTierGate(tier: AttestationTier) {
  * output is consumed unchanged.
  *
  * On-chain-verified model: the proof is not standalone-verifiable with just a
- * VK (Midnight exposes no off-chain verifier). `proofValue` is therefore the
- * `provePredicate` transaction hash; a verifier confirms it via the Midnight
- * indexer (the ledger only includes the tx if the in-circuit predicate +
- * commitment asserts held). `digestMultibase` is the on-chain
- * `persistentCommit(value, salt)` — it is not recomputable off-chain
- * (`PureCircuits` is empty), so it is `null` unless the caller supplied or
- * resolved it from chain.
+ * VK `proofValue` is therefore the `provePredicate` transaction hash
  */
 export interface PredicateAttestationEnvelope {
     digestMultibase: string | null;
     claim: {
         predicate: string;            // 'lessOrEqual' | 'greaterOrEqual'
         threshold: string;            // scaled integer, as a string
-        unit:      string | null;
+        unit: string | null;
     };
     proof: {
-        system:             'midnight-compact';
-        circuit:            'provePredicate';
+        system: 'midnight-compact';
+        circuit: 'provePredicate';
         verificationMethod: string;   // AttestationVault contract address
-        proofValue:         string;   // provePredicate tx hash (verify via indexer)
+        proofValue: string;   // provePredicate tx hash
     };
 }
 
@@ -110,25 +95,25 @@ export interface PredicateAttestationEnvelope {
  * it without any NIGHTGATE service context.
  */
 export function toPredicateEnvelope(row: {
-    predicate:       string;
-    threshold:       number | string;
-    unit?:           string | null;
+    predicate: string;
+    threshold: number | string;
+    unit?: string | null;
     valueCommitment?: string | null;
     contractAddress: string;
-    provenTxHash?:   string | null;
+    provenTxHash?: string | null;
 }): PredicateAttestationEnvelope {
     return {
         digestMultibase: row.valueCommitment ?? null,
         claim: {
             predicate: row.predicate,
             threshold: String(row.threshold),
-            unit:      row.unit ?? null
+            unit: row.unit ?? null
         },
         proof: {
-            system:             'midnight-compact',
-            circuit:            'provePredicate',
+            system: 'midnight-compact',
+            circuit: 'provePredicate',
             verificationMethod: row.contractAddress,
-            proofValue:         row.provenTxHash ?? ''
+            proofValue: row.provenTxHash ?? ''
         }
     };
 }

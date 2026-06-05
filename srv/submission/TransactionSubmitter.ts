@@ -34,8 +34,8 @@
  *        - TIMEOUT/NETWORK transient, caller may retry
  *        - TxFailedError from SDK, the on-chain status was not SucceedEntirely
  *
- * The submitter does not retry on its own. Callers (OData actions in T6)
- * decide retry policy based on the returned error classification.
+ * The submitter does not retry on its own. The OData action callers decide
+ * retry policy based on the returned error classification.
  */
 
 import cds from '@sap/cds';
@@ -404,7 +404,7 @@ const KNOWN_ISSUE_1016_MAINNET =
 
 /**
  * Classifies a thrown error into a stable code + retryability decision.
- * Surface for OData callers in T6; also used internally to populate
+ * Used by the OData callers and internally to populate
  * PendingSubmissions.errorCode/errorMessage.
  */
 export function classifySubmissionError(err: unknown, network: 'preprod' | 'testnet' | 'mainnet'): SubmissionErrorClassification {
@@ -442,13 +442,12 @@ export function classifySubmissionError(err: unknown, network: 'preprod' | 'test
         return { code: name, retryable: false, message };
     }
 
-    // Wallet signing surface is gated on T7-extended (seed key plumbing).
-    // Stable code so API consumers can recognize this state.
+    // Session lacks signing material; stable code so consumers can recognize it.
     if (name === 'WalletSigningNotAvailable' || /WalletSigningNotAvailable/.test(message)) {
         return {
             code: 'WalletSigningNotAvailable',
             retryable: false,
-            message: `${message} (T7-extended pending; session needs encryptedSeedKey to sign/balance transactions)`
+            message: `${message} (session needs encryptedSeedKey to sign/balance transactions)`
         };
     }
 

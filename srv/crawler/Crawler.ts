@@ -5,12 +5,6 @@
  * 1. Catch-Up: Sync historical blocks from lastIndexedHeight to chain tip
  * 2. Live: Subscribe to new block headers and process in real-time
  *
- * Features:
- * - Reorg detection and recovery
- * - Configurable batch size for catch-up
- * - Automatic retry with backoff
- * - SyncState tracking
- * - Graceful shutdown
  */
 
 import cds from '@sap/cds';
@@ -37,20 +31,8 @@ export interface CrawlerConfig {
     maxRetries?: number;        // max retries per block (default: 3)
     retryDelay?: number;        // ms between retries (default: 2000)
     requestTimeout?: number;    // RPC timeout ms (default: 30000)
-    /**
-     * Number of block-fetch BATCHES kept in flight at once during catch-up.
-     * With rpcBatchSize=32 and concurrency=8, that's 8 in-flight WSS frames
-     * each carrying 32 hash requests + later 64 block/timestamp requests.
-     * Tune down if the upstream rate-limits. (default: 8)
-     */
-    fetchConcurrency?: number;
-    /**
-     * Number of consecutive heights bundled into one JSON-RPC batch frame.
-     * Larger = fewer round-trips, larger response payloads. Some Substrate
-     * nodes cap batch size at 50-100; preprod accepts 32 comfortably.
-     * (default: 32)
-     */
-    rpcBatchSize?: number;
+    fetchConcurrency?: number;  // Number of block-fetch BATCHES kept in flight  (default: 8)
+    rpcBatchSize?: number; // Number of consecutive heights bundled into one JSON-RPC batch frame (default: 32)
 }
 
 interface ReorgInfo {
@@ -314,9 +296,9 @@ export class MidnightCrawler {
                         const bps = elapsed > 0 ? processed / elapsed : 0;
                         const remaining = tipHeight - h;
                         const eta = bps > 0 ? remaining / bps : 0;
-                        const avgFetch   = acc.samples ? (acc.fetchMsTotal / acc.samples).toFixed(0) : '0';
+                        const avgFetch = acc.samples ? (acc.fetchMsTotal / acc.samples).toFixed(0) : '0';
                         const avgPersist = acc.samples ? (acc.persistMsTotal / acc.samples).toFixed(0) : '0';
-                        const avgWait    = acc.samples ? (acc.waitedForFetchMs / acc.samples).toFixed(0) : '0';
+                        const avgWait = acc.samples ? (acc.waitedForFetchMs / acc.samples).toFixed(0) : '0';
 
                         console.log(
                             `[Crawler] Catch-up: ${h}/${tipHeight} ` +
@@ -375,13 +357,13 @@ export class MidnightCrawler {
                 lastError = err as Error;
                 const transient = isTransientError(lastError);
                 if (!transient) {
-                    console.error(`[Crawler] Batch ${heights[0]}-${heights[heights.length-1]} permanent error: ${lastError.message}`);
+                    console.error(`[Crawler] Batch ${heights[0]}-${heights[heights.length - 1]} permanent error: ${lastError.message}`);
                     break;
                 }
                 if (attempt < this.config.maxRetries) {
                     const delay = calcBackoff(attempt, this.config.retryDelay);
                     console.warn(
-                        `[Crawler] Batch ${heights[0]}-${heights[heights.length-1]} attempt ${attempt} failed (transient): ` +
+                        `[Crawler] Batch ${heights[0]}-${heights[heights.length - 1]} attempt ${attempt} failed (transient): ` +
                         `${lastError.message}, retrying in ${Math.round(delay)}ms`
                     );
                     await this.sleep(delay);

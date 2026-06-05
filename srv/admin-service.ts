@@ -64,10 +64,10 @@ export default class NightgateAdminService extends cds.ApplicationService {
             return result;
         });
 
-        // T14 — grantRole. Service-level @requires: 'admin' has already gated
-        // the CAP auth side. Belt-and-suspenders: additionally require the
-        // caller to hold the 'authority' disclosure tier, so a sysadmin who
-        // is not also a regulator cannot grant data-tier access.
+        // grantRole. Service-level @requires: 'admin' has already gated the
+        // CAP auth side. Belt-and-suspenders: additionally require the caller
+        // to hold the 'authority' disclosure tier, so a sysadmin who is not
+        // also a regulator cannot grant data-tier access.
         this.on('grantRole', async (req: Request) => {
             const { userId, role, scope, validUntil } = req.data as {
                 userId?: string;

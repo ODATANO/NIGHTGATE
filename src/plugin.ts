@@ -94,11 +94,6 @@ function registerSecurityHeaders(): void {
 
 function registerLifecycle(): void {
     cds.on('served', async () => {
-        // Test harness opt-out: cds.test() boots the full server, which would
-        // otherwise start the crawler + wallet worker thread against live
-        // endpoints. Tests set SKIP_AUTO_INIT=true to serve the OData services
-        // against an in-memory DB without the runtime side-effects. No-op in
-        // production (env var unset).
         if (process.env.SKIP_AUTO_INIT === 'true') return;
         try {
             await initialize();
@@ -121,9 +116,7 @@ function registerLifecycle(): void {
                 console.error('================================================================\n');
                 process.exit(1);
             }
-            // Anything else: surface but don't kill the server — initialize()
-            // already wraps its own soft failures (sqlite tuning, wallet worker,
-            // crawler) in try/catch internally.
+            // Anything else: surface Error but don't kill the server. 
             const msg = err instanceof Error ? err.message : String(err);
             console.error(`[odatano-nightgate] initialize() failed: ${msg}`);
         }
@@ -190,9 +183,9 @@ const plugin = {
                         additionalProperties: {
                             type: 'object',
                             properties: {
-                                artifactPath:   { type: 'string', description: 'Path to the Compact-emitted contract module (e.g. contracts/<name>/src/managed/<name>/contract/index.js)' },
+                                artifactPath: { type: 'string', description: 'Path to the Compact-emitted contract module (e.g. contracts/<name>/src/managed/<name>/contract/index.js)' },
                                 privateStateId: { type: 'string', description: 'Logical private-state identifier passed to deployContract' },
-                                zkConfigPath:   { type: 'string', description: 'Path to the managed/<name>/ directory containing keys + zkir' }
+                                zkConfigPath: { type: 'string', description: 'Path to the managed/<name>/ directory containing keys + zkir' }
                             },
                             required: ['artifactPath', 'privateStateId', 'zkConfigPath']
                         }

@@ -1,10 +1,10 @@
 /**
- * Disclosure-role middleware (T14).
+ * Disclosure-role middleware.
  *
  * Resolves the highest currently-valid `DisclosureRole` grant for the
  * authenticated user and attaches it to the request so downstream handlers
- * and CDS projections (T11 — AttestationService) can gate response width by
- * tier. When no grant applies, the default is `public_only`.
+ * and CDS projections can gate response width by tier.
+ * When no grant applies, the default is `public_only`.
  *
  * The disclosure-role tiers map 1:1 to the EU Battery Regulation Annex XIII /
  * Art. 77 access tiers (general public / legitimate-interest / authority).

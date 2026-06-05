@@ -139,11 +139,6 @@ export interface PreparedBlockFetched {
 export class BlockProcessor {
     private db!: cds.DatabaseService;
     private palletMap: Map<number, PalletMapping>;
-
-    // Cache: specVersion rarely changes (only on runtime upgrades, weeks/months apart).
-    // We cache the value once and trust it for all subsequent blocks. Refreshed
-    // on demand when callers detect a runtime upgrade (currently never -- a
-    // follow-up could probe `system_version` periodically during catch-up).
     private cachedSpecVersion: number = 0;
     private cachedSpecVersionValid: boolean = false;
 
@@ -190,8 +185,6 @@ export class BlockProcessor {
         if (!blockHash) throw new Error(`No block at height ${height}`);
 
         if (await this.blockExists(blockHash)) {
-            // We still need height; getBlockHash already gave us hash. Skip the
-            // expensive full-block fetch and let persist short-circuit.
             return {
                 blockHash,
                 height,
@@ -226,13 +219,6 @@ export class BlockProcessor {
      * Round 1: `chain_getBlockHash(h)` for every height → 1 WSS round-trip
      * Round 2: for every NEW hash, `chain_getBlock(h)` + `state_getStorage(timestamp_key, h)`
      *           together in one batch frame → 1 WSS round-trip
-     *
-     * Total: 2 RTTs per N blocks instead of 2 RTTs per block. Collapses the
-     * `getBlockHash → getBlock` sequential dep that was the main bottleneck
-     * at ~32 bps on a public WSS endpoint.
-     *
-     * Already-indexed blocks are returned with `alreadyIndexed: true` so the
-     * persist phase no-ops on them.
      */
     async fetchBlockBatch(heights: number[]): Promise<PreparedBlock[]> {
         if (heights.length === 0) return [];
@@ -243,16 +229,16 @@ export class BlockProcessor {
             heights.map(h => ({ method: 'chain_getBlockHash', params: [h] }))
         ) as string[];
 
-        // Bulk SELECT: which of these hashes are already in the DB? One CQN call.
+        // Bulk SELECT: which of these hashes are already in the DB
         const truthyHashes = hashes.filter((h): h is string => !!h);
         const existing: Array<{ hash: string }> = truthyHashes.length
             ? (await this.db.run(
                 SELECT.from(Blocks).columns('hash').where({ hash: { in: truthyHashes } })
-              ) || [])
+            ) || [])
             : [];
         const existingSet = new Set(existing.map(r => r.hash));
 
-        // Collect the indices of NEW blocks we still need to fetch.
+        // collect the indices of NEW blocks we still need to fetch.
         const newIndices: number[] = [];
         for (let i = 0; i < heights.length; i++) {
             if (hashes[i] && !existingSet.has(hashes[i])) newIndices.push(i);
@@ -270,7 +256,7 @@ export class BlockProcessor {
             }
             const flat = await this.nodeProvider.rpcBatch(requests);
             blockResults = newIndices.map((_, k) => flat[k * 2]);
-            tsResults    = newIndices.map((_, k) => flat[k * 2 + 1]);
+            tsResults = newIndices.map((_, k) => flat[k * 2 + 1]);
         }
 
         // ProtocolVersion is cached after the first hit, so this is a no-op
@@ -518,9 +504,9 @@ export class BlockProcessor {
             }
 
             // Bulk inserts: one statement per table regardless of tx count.
-            if (txRows.length)             await tx.run(INSERT.into(Transactions).entries(txRows));
-            if (txResultRows.length)       await tx.run(INSERT.into(TransactionResults).entries(txResultRows));
-            if (txFeeRows.length)          await tx.run(INSERT.into(TransactionFees).entries(txFeeRows));
+            if (txRows.length) await tx.run(INSERT.into(Transactions).entries(txRows));
+            if (txResultRows.length) await tx.run(INSERT.into(TransactionResults).entries(txResultRows));
+            if (txFeeRows.length) await tx.run(INSERT.into(TransactionFees).entries(txFeeRows));
             if (contractActionRows.length) await tx.run(INSERT.into(ContractActions).entries(contractActionRows));
 
             // Cold path: PendingSubmissions updates + balance projections.
@@ -552,10 +538,6 @@ export class BlockProcessor {
             processingTimeMs: Date.now() - start
         };
     }
-
-    // ========================================================================
-    // Extrinsic Classification (for node-sourced blocks)
-    // ========================================================================
 
     private classifyExtrinsic(hex: string): ExtrinsicClassification {
         if (!hex || hex.length < 10) {
@@ -818,16 +800,7 @@ export class BlockProcessor {
     }
 
     /**
-     * Get the runtime specVersion at a specific block.
-     *
-     * Substrate runtime upgrades are rare (weeks/months apart on Midnight).
-     * After the first successful fetch we cache the specVersion for the lifetime
-     * of the process — saves one RPC per block during catch-up. Downside: if a
-     * runtime upgrade lands while NIGHTGATE is running, blocks after the upgrade
-     * will record the pre-upgrade specVersion. Acceptable trade-off; the
-     * crawler can be restarted to pick up the new version. A follow-up could
-     * detect upgrades via the digest-log `RuntimeEnvironmentUpdated` event and
-     * invalidate the cache.
+     * Get the runtime specVersion at a specific block
      */
     private async getProtocolVersion(blockHash: string): Promise<number> {
         if (this.cachedSpecVersionValid) {

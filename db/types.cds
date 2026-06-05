@@ -1,5 +1,5 @@
 // ============================================================================
-// Custom Types for Midnight Blockchain
+// Custom Types
 // ============================================================================
 
 type HexEncoded              : String(512);
@@ -56,10 +56,6 @@ type SyncStatus              : String(20) enum {
 }
 
 // Enum for PendingSubmissions lifecycle
-//   pending , row written before SDK call, no txHash yet (or call in flight)
-//   included, SDK returned a finalized result; crawler hasn't seen the block yet
-//   finalized, crawler has indexed the transaction matching the txHash
-//   failed  , SDK threw, or the on-chain status was a non-success (rolled back, dropped)
 type PendingSubmissionStatus : String(20) enum {
     pending;
     included;
@@ -73,9 +69,6 @@ type PendingSubmissionStatus : String(20) enum {
 //   succeeded , work resolved; result column carries the JSON of the original return shape
 //   failed    , work threw; errorCode + errorMessage classify it
 //
-// Per the 0.3.0 async-job migration: long-running submission actions
-// (registerForDustGeneration, sendNight, deployContract, etc.) return
-// `{ jobId, status }` synchronously and the caller polls `getJobStatus(jobId)`.
 type BackgroundJobStatus     : String(20) enum {
     pending;
     running;
@@ -83,21 +76,12 @@ type BackgroundJobStatus     : String(20) enum {
     failed;
 }
 
-// Discriminator across the migrated actions. Kept as String(64) rather than an
-// `enum` so adding new kinds in later releases doesn't require a CDS rebuild
-// for consumers checking historical rows.
+// Discriminator across the migrated actions
 type BackgroundJobKind       : String(64);
 
-// Tiered disclosure roles for the AttestationService (T14).
-// Maps 1:1 to the EU Battery Regulation Annex XIII / Art. 77 access tiers:
-//   public_only         , general public, basic info, NO supplier identities
-//   legitimate_interest , recyclers/repairers/second-life operators
-//   authority           , Commission, notified bodies, market surveillance
-// `public` is avoided as the literal name because it is a reserved word
-// in CDS/TypeScript downstream code.
+// Tiered disclosure roles for the AttestationService
 type DisclosureRole          : String(30) enum {
     public_only;
     legitimate_interest;
     authority;
 }
-

@@ -402,9 +402,9 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
         const syncPass  = deriveStoragePassword(viewingKey);
 
         // Detach the worker round-trip. Without this, `req.tx` stays open for
-        // the entire cold sync (hours on preprod) and blocks unrelated DB ops
-        // — the bug that motivated 0.2.0 in the first place. See
-        // `srv/submission/background-jobs.ts` and `db/enhancements.md`.
+        // the entire cold sync (hours on preprod) and blocks unrelated DB ops,
+        // since @cap-js/sqlite pools a single connection. See
+        // `srv/submission/background-jobs.ts`.
         return startJob({
             kind:           'registerForDustGeneration',
             sessionId,

@@ -72,7 +72,7 @@ export class SchemaNotDeployedError extends Error {
 /**
  * Resolve the database file path the runtime is connected to. Used in the
  * SchemaNotDeployedError message so users see exactly which file is missing
- * the tables — bare `cds deploy` defaults to `db.sqlite` which would silently
+ * the tables bare `cds deploy` defaults to `db.sqlite` which would silently
  * deploy to the wrong file otherwise.
  */
 function resolveDbPath(): string {
@@ -84,14 +84,7 @@ function resolveDbPath(): string {
  * Probe-only schema check. Returns silently when every required table exists;
  * throws `SchemaNotDeployedError` on the first miss so the operator can fix
  * it explicitly via `npm run deploy`.
- *
- * Why probe-only (the auto-deploy was removed in 0.2.0): the runtime
- * `db.deploy(cds.model)` path triggered a `parent_ID` generation conflict in
- * Blocks that the CLI `cds deploy --to sqlite` path doesn't hit. Beyond the
- * specific bug: silent runtime deploys mask schema drift, hide compiler
- * version skew, and pretend prod DBs (HANA) are mutable from the server
- * process. Explicit `npm run deploy` matches how this is actually shipped.
- */
+ **/
 async function ensureSchemaDeployed(): Promise<void> {
     const requiredTables = [
         'midnight.Blocks',
@@ -170,7 +163,7 @@ export async function initialize(): Promise<NightgateIndexerStatus> {
 
 
     // Load any contracts declared under cds.requires.nightgate.contracts into
-    // the in-memory registry (T10 / T6). Safe to call repeatedly, idempotent.
+    // the in-memory registry. Safe to call repeatedly, idempotent.
     try {
         loadRegistryFromConfig(nightgateConfig);
         const refs = listRegisteredContracts();
@@ -182,10 +175,10 @@ export async function initialize(): Promise<NightgateIndexerStatus> {
         console.warn(`[odatano-nightgate] Contract registry load warning: ${msg}`);
     }
 
-    // T30 (Phase 1): spin up the wallet worker thread now so it's ready when
-    // the first connectWalletForSigning request lands. The Midnight wallet
-    // SDK monopolises the microtask queue while syncing — running it in a
-    // worker keeps CAP's `db.run`, OData handlers, and the crawler responsive.
+    // Spin up the wallet worker thread now so it's ready when the first
+    // connectWalletForSigning request lands. The Midnight wallet SDK
+    // monopolises the microtask queue while syncing — running it in a worker
+    // keeps CAP's `db.run`, OData handlers, and the crawler responsive.
     try {
         await startWalletWorker();
         wireWorkerStateSaveSink();

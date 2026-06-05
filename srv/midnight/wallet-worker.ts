@@ -19,9 +19,9 @@
  *     surfaces worker-side console.log/warn lines into the main thread's
  *     unified log stream.
  *
- * Phase 1 surface (this file): init / waitForSyncedState / serializeState /
- * evict. Phase 2 will add balanceUnboundTransaction / submitTransaction /
- * registerNightUtxosForDustGeneration so the full T15 deploy path moves here.
+ * Surface: init / waitForSyncedState / serializeState / evict, plus
+ * balanceUnboundTransaction / submitTransaction /
+ * registerNightUtxosForDustGeneration for the deploy path.
  */
 
 import { parentPort, MessageChannel, type MessagePort } from 'node:worker_threads';

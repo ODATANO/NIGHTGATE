@@ -113,10 +113,6 @@ entity TransactionFees : cuid {
     transaction   : Association to Transactions;
 }
 
-// ============================================================================
-// Contract Entities
-// ============================================================================
-
 /**
  * Contract actions (Deploy, Call, Update)
  */
@@ -143,10 +139,6 @@ entity ContractBalances : cuid {
     contractAction : Association to ContractActions;
 }
 
-// ============================================================================
-// UTXO Entities
-// ============================================================================
-
 /**
  * Unshielded Unspent Transaction Outputs
  */
@@ -164,10 +156,6 @@ entity UnshieldedUtxos : cuid, managed {
     createdAtTransaction        : Association to Transactions not null;
     spentAtTransaction          : Association to Transactions;
 }
-
-// ============================================================================
-// Ledger Events
-// ============================================================================
 
 /**
  * Zswap Ledger Events
@@ -194,35 +182,19 @@ entity DustLedgerEvents : cuid {
     transaction     : Association to Transactions not null;
 }
 
-// ============================================================================
-// Session Management (for wallet connections)
-// ============================================================================
-
 /**
  * Wallet sessions for authenticated access.
- *
- * `encryptedViewingKey` alone supports read-only ledger queries and the
- * deterministic derivation of accountId + private-state storage password
- * (T7). It does NOT support signing or transaction balancing, those need
- * `encryptedSeedKey`, which is nullable today because the existing read-only
- * sessions don't carry it. Submission flows that require signing will fail
- * with a clear error when this field is absent (T7-extended will plumb a
- * `connectWalletForSigning` action that populates it).
  */
 entity WalletSessions : cuid, managed {
     viewingKeyHash      : String(64); // SHA-256 of viewing key (for lookup/dedup)
     encryptedViewingKey : LargeString; // AES-256-GCM encrypted viewing key
-    encryptedSeedKey    : LargeString; // optional: AES-256-GCM encrypted seed/signing key (T7-extended)
+    encryptedSeedKey    : LargeString; // optional: AES-256-GCM encrypted seed/signing key
     sessionId           : UUID not null;
     connectedAt         : Timestamp not null;
     disconnectedAt      : Timestamp;
     expiresAt           : Timestamp; // Session TTL
     isActive            : Boolean default true;
 }
-
-// ============================================================================
-// Indexer State & Sync
-// ============================================================================
 
 /**
  * Indexer sync status, singleton table tracking crawler progress
@@ -268,96 +240,41 @@ entity ReorgLog : cuid, managed {
     status           : String(20); // 'completed', 'failed'
 }
 
-// ============================================================================
-// Balance & Token Tracking
-// ============================================================================
-
-// ============================================================================
-// Pending Submissions (T4/T5, submission lifecycle tracking)
-// ============================================================================
-
 /**
  * Tracks transactions submitted through NIGHTGATE's submission path
- * (`TransactionSubmitter.deploy`/`call`). Lifecycle:
- *
- *   pending  →  included  →  finalized
- *                            (or failed at any step)
- *
- * Rows are written BEFORE invoking the SDK so we can recover if the process
- * crashes mid-submission. After the SDK resolves we attach `txHash` and move
- * to `included`. The crawler's BlockProcessor reconciles to `finalized` once
- * it indexes the matching tx hash.
  */
 entity PendingSubmissions : cuid, managed {
-    txHash          : HexEncoded;              // null until SDK returns
-    contractAddress : HexEncoded;              // null for deploys until SDK returns
-    circuitName     : String(100);             // null for deploys
-    actionType      : ContractActionType not null;  // DEPLOY | CALL | UPDATE
+    txHash          : HexEncoded; // null until SDK returns
+    contractAddress : HexEncoded; // null for deploys until SDK returns
+    circuitName     : String(100); // null for deploys
+    actionType      : ContractActionType not null; // DEPLOY | CALL | UPDATE
     submittedAt     : Timestamp not null;
     status          : PendingSubmissionStatus default 'pending';
     finalizedAt     : Timestamp;
-    finalizedTxData : LargeString;             // JSON snapshot of crawler-indexed tx
-    errorCode       : String(50);              // e.g. '1016', 'TIMEOUT', 'TxFailed'
+    finalizedTxData : LargeString; // JSON snapshot of crawler-indexed tx
+    errorCode       : String(50); // e.g. '1016', 'TIMEOUT', 'TxFailed'
     errorMessage    : String(500);
-    sessionId       : UUID;                    // links to WalletSessions for audit
+    sessionId       : UUID; // links to WalletSessions for audit
 }
 
-// ============================================================================
-// Background Jobs (async submission lifecycle, 0.3.0)
-// ============================================================================
-
 /**
- * Async job rows for long-running submission actions.
- *
- * Migrated actions (registerForDustGeneration, sendNight, shieldFunds,
- * unshieldFunds, deregisterFromDustGeneration, deployContract,
- * submitContractCall, anchorDocument, connectWalletForSigning) no longer await
- * the multi-minute-to-hours work inline. Instead, the handler:
- *
- *   1. Inserts a row here with `status='pending'` on `req.tx` (commits with the
- *      OData response).
- *   2. Returns `{ jobId, status }` to the caller in milliseconds.
- *   3. Detaches the long-running work via `cds.spawn`. The spawn transitions
- *      the row through `running` → `succeeded` (with serialized `result`) or
- *      `failed` (with classified `errorCode` + `errorMessage`).
- *
- * Crash recovery: `src/index.ts` (initialize → recoverInterruptedJobs) flips
- * any `pending`/`running` rows to `failed:PROCESS_RESTART` on boot. Idempotent.
- *
- * Idempotency: optional `idempotencyKey` deduplicates retries; a fresh attempt
- * with the same (sessionId, kind, idempotencyKey) returns the existing row's
- * jobId rather than starting a new job.
- *
- * `request` and `result` are JSON-encoded blobs of the original action's
- * input arguments (minus secrets — viewing keys, seeds, ENCRYPTION_KEY-derived
- * material are NEVER written) and return shape.
+ * Backgroundjobs for diffrent purposes
  */
 entity BackgroundJobs : cuid, managed {
     kind           : BackgroundJobKind not null;
-    sessionId      : String(64);            // owner scope; matches WalletSessions.sessionId
+    sessionId      : String(64); // owner scope; matches WalletSessions.sessionId
     status         : BackgroundJobStatus default 'pending';
-    idempotencyKey : String(128);           // optional, unique per (sessionId, kind)
-    request        : LargeString;           // JSON of inbound args (secrets redacted)
-    result         : LargeString;           // JSON of return value on success
-    errorCode      : String(64);            // classified code on failure
-    errorMessage   : LargeString;           // user-facing failure message
-    startedAt      : Timestamp;             // when the spawn picked it up
-    finishedAt     : Timestamp;             // when it transitioned to succeeded/failed
+    idempotencyKey : String(128); // optional, unique per (sessionId, kind)
+    request        : LargeString; // JSON of inbound args (secrets redacted)
+    result         : LargeString; // JSON of return value on success
+    errorCode      : String(64); // classified code on failure
+    errorMessage   : LargeString; // user-facing failure message
+    startedAt      : Timestamp; // when the spawn picked it up
+    finishedAt     : Timestamp; // when it transitioned to succeeded/failed
 }
-
-// ============================================================================
-// Midnight SDK Private State Storage (T29, production replacement for LevelDB)
-// ============================================================================
 
 /**
  * Encrypted private states held on behalf of authenticated wallet sessions.
- *
- * Wire format of `ciphertext` is the same one the Midnight SDK's LevelDB
- * provider uses for its export blobs: a base64-encoded buffer composed of
- *   [1B version=2][32B salt][12B IV][16B authTag][ciphertext]
- *
- * Key is (accountId, contractAddress, privateStateId). Account isolation is
- * enforced by including accountId in the key.
  */
 entity PrivateStates {
     key accountId       : String(200);
@@ -369,8 +286,7 @@ entity PrivateStates {
 }
 
 /**
- * Encrypted contract signing keys, scoped per (accountId, contractAddress).
- * Same on-disk format as PrivateStates.ciphertext.
+ * Encrypted contract signing keys, scoped per (accountId, contractAddress)
  */
 entity ContractSigningKeys {
     key accountId       : String(200);
@@ -381,20 +297,7 @@ entity ContractSigningKeys {
 }
 
 /**
- * Persisted wallet sub-state, one row per session (accountId).
- *
- * The Midnight wallet SDK exposes `serializeState()` on each sub-wallet
- * (shielded/unshielded/dust) and a corresponding `restore(serialized)` static.
- * We capture all three blobs every ~30 s and on graceful disconnect so that a
- * server restart can skip the full chain scan from genesis (5–6 h on preprod
- * for a fresh seed) and continue from the last persisted index.
- *
- * Each *Blob field is an AES-256-GCM ciphertext produced by storage-encryption.ts
- * (same wire format as PrivateStates.ciphertext), keyed on the per-session
- * storage password derived in T7. `sdkVersion` is the resolved version of
- * `@midnight-ntwrk/wallet-sdk-facade` at save time; on restore we discard the
- * blob if the version no longer matches, to protect against silent state-shape
- * drift across SDK upgrades.
+ * Persisted wallet sub-state, one row per session (accountId)
  */
 entity WalletSyncStates {
     key accountId           : String(200);
@@ -406,45 +309,21 @@ entity WalletSyncStates {
         updatedAt           : Timestamp;
 }
 
-// ============================================================================
-// Attestation / Document Anchoring / Tiered Disclosure (T10-ext, T11, T12, T14)
-// ============================================================================
-
 /**
- * Attestations recorded on-chain via the AttestationVault Compact contract.
- *
- * Rows are created reactively by the crawler when it indexes an `attest`
- * contract action: `attestationId` mirrors the on-chain `payload_hash`
- * (blake2b-256 of the private payload). `publicMetadata` is the JSON written
- * to the contract's public ledger. `payloadCipher` is the optional encrypted
- * off-chain payload that disclosure recipients can decrypt — kept here so
- * Tier 2/3 readers can fetch it without a separate storage round-trip.
- *
- * Read-side surface for T11's AttestationService projections (Public,
- * Disclosed, Authority), gated by the requester's DisclosureRole.
+ * Attestations recorded on-chain via the AttestationVault Compact contract
  */
 entity Attestations : cuid, managed {
-    attestationId    : HexEncoded not null; // payload_hash (blake2b-256)
-    contractAddress  : HexEncoded not null; // AttestationVault deployment
-    attester         : HexEncoded not null; // attester pubkey
-    publicMetadata   : LargeString;         // JSON
-    payloadCipher    : LargeBinary;         // optional off-chain encrypted payload
-    anchoredTxHash   : HexEncoded;
-    anchoredAt       : Timestamp;
+    attestationId   : HexEncoded not null; // payload_hash (blake2b-256)
+    contractAddress : HexEncoded not null; // AttestationVault deployment
+    attester        : HexEncoded not null; // attester pubkey
+    publicMetadata  : LargeString; // JSON
+    payloadCipher   : LargeBinary; // optional off-chain encrypted payload
+    anchoredTxHash  : HexEncoded;
+    anchoredAt      : Timestamp;
 }
 
 /**
- * Document anchoring (T12).
- *
- * Inserted by the `anchorDocument` action. `sha256` is the content hash that
- * gets written on-chain as the AttestationVault `payload_hash`. `storageRef`
- * points at the actual bytes in the configured storage backend
- * (`file://`, `s3://`, `ipfs://`). After the on-chain `attest` lands and the
- * crawler indexes it, `anchoredTxHash`/`anchoredAt` are filled in.
- *
- * `verifyDocument` (T13) selects on `ID`, compares the caller-supplied hash
- * to `sha256`, then checks `anchoredTxHash` against `Transactions` for a
- * successful result.
+ * Document anchoring
  */
 entity Documents : cuid, managed {
     sha256         : HexEncoded not null;
@@ -456,56 +335,31 @@ entity Documents : cuid, managed {
 }
 
 /**
- * ZK predicate attestations (on-chain-verified model).
- *
- * Inserted by `issuePredicateAttestation`. Records that a proof was submitted
- * showing a hidden numeric value (committed via the AttestationVault
- * `commitValue` circuit) satisfies a predicate against `threshold` — WITHOUT
- * the value ever being stored here (it lives only transiently as a circuit
- * witness). After the on-chain `provePredicate` call succeeds, `provenTxHash`/
- * `provenAt` are filled in; `verifyPredicateAttestation` confirms that tx
- * resolves to a successful `Transactions` result. `valueCommitment` is the
- * on-chain `persistentCommit(value, salt)` (optional — supplied by the caller
- * or resolved from chain; not recomputable off-chain).
- *
- * `op`: 0 = lessOrEqual, 1 = greaterOrEqual (mirrors the circuit). `predicate`
- * is the human-readable form for the PAC envelope `claim`.
+ * ZK predicate attestations
  */
 entity PredicateAttestations : cuid, managed {
-    payloadHash     : HexEncoded   not null; // attestation this predicate is about
-    contractAddress : HexEncoded   not null; // AttestationVault deployment
-    predicate       : String(20)   not null; // 'lessOrEqual' | 'greaterOrEqual'
-    op              : Integer       not null; // 0 | 1
-    threshold       : Integer64     not null; // scaled integer
-    unit            : String(50);             // e.g. 'kgCO2e/kWh' (informational)
-    valueCommitment : HexEncoded;             // persistentCommit(value, salt), on-chain
-    provenTxHash    : HexEncoded;             // tx that recorded the on-chain result
+    payloadHash     : HexEncoded not null; // attestation this predicate is about
+    contractAddress : HexEncoded not null; // AttestationVault deployment
+    predicate       : String(20) not null; // 'lessOrEqual' | 'greaterOrEqual'
+    op              : Integer not null; // 0 | 1
+    threshold       : Integer64 not null; // scaled integer
+    unit            : String(50); // e.g. 'kgCO2e/kWh' (informational)
+    valueCommitment : HexEncoded; // persistentCommit(value, salt), on-chain
+    provenTxHash    : HexEncoded; // tx that recorded the on-chain result
     provenAt        : Timestamp;
 }
 
 /**
- * Disclosure role grants for tiered access (T14).
- *
- * The `attachDisclosureRole` middleware reads from this table on every
- * request, picks the highest-tier currently-valid row for the authenticated
- * user, and attaches `req.disclosureRole` for downstream service handlers.
- * Without a matching row the default is `public_only`.
- *
- * `scope` is optional: an empty value applies globally; a contract address
- * scopes the grant to a single AttestationVault deployment; an attestation
- * ID (payload_hash) scopes it to a single record. Grant management
- * (`grantRole` admin action) is gated on the caller already holding
- * `authority` role.
+ * Disclosure role grants for tiered access
  */
 entity DisclosureRoles : cuid, managed {
-    userId     : String(200)    not null; // matches req.user.id from CAP auth
+    userId     : String(200) not null; // matches req.user.id from CAP auth
     role       : DisclosureRole not null;
-    scope      : String(500);             // optional: contract addr or attestation id
+    scope      : String(500); // optional: contract addr or attestation id
     grantedBy  : String(200);
     validFrom  : Timestamp;
     validUntil : Timestamp;
 }
-
 
 /**
  * Unshielded NIGHT token balances per address
@@ -535,5 +389,3 @@ entity NightBalances {
         lastUpdatedHeight  : Integer64;
         lastUpdatedAt      : Timestamp;
 }
-
-

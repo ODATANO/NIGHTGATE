@@ -101,7 +101,7 @@ OK   sessionId = c07b1f0a-7251-488d-a64e-1bf69045d7a9
 --- 2. connectWalletForSigning ---
 OK   { ..., "signingEnabled": true }
 
-Session to reuse for T15: c07b1f0a-7251-488d-a64e-1bf69045d7a9
+Session to reuse: c07b1f0a-7251-488d-a64e-1bf69045d7a9
 ```
 
 The server will start the wallet sync **in the worker thread** in the background. Expected server logs:
@@ -176,10 +176,10 @@ curl -X POST http://localhost:4004/api/v1/nightgate/deployContract \
 
 Response: `{"jobId":"...","status":"pending"}`. Poll `getJobStatus`; the succeeded `result` is `{"submissionId":"...","txHash":"0x...","contractAddress":"0x...","status":"included"}`.
 
-The T15 runner does the whole flow end-to-end (`connectWallet → connectWalletForSigning` → await prewarm sync → `registerForDustGeneration` → `deployContract`, polling each job):
+The deploy-e2e runner does the whole flow end-to-end (`connectWallet → connectWalletForSigning` → await prewarm sync → `registerForDustGeneration` → `deployContract`, polling each job):
 
 ```bash
-npm run t15
+npm run deploy:e2e
 ```
 
 ## Use NIGHTGATE in another CAP app

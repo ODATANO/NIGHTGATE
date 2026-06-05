@@ -1,6 +1,6 @@
 // Runs `cds-serve` with a 12 GB Node heap.
 //
-// Use this for the T15 wallet cold-sync (or any long-running submission flow).
+// Use this for the wallet cold-sync (or any long-running submission flow).
 // Unlike `cds watch` (scripts/dev.mjs), cds-serve does NOT restart when the
 // SQLite DB grows on disk — important once the wallet sync starts writing
 // 100s of MB of shielded-state into midnight.db.

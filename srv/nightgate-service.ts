@@ -182,7 +182,7 @@ export default class NightgateService extends cds.ApplicationService {
         registerWalletSessionHandlers(this, this.db);
 
         // ====================================================================
-        // Submission actions (T6), deployContract, submitContractCall
+        // Submission actions: deployContract, submitContractCall
         // ====================================================================
 
         this.on('READ', 'PendingSubmissions', async (req: Request) => {

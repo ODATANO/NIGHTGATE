@@ -25,8 +25,8 @@ const URL_BASE = process.env.NIGHTGATE_URL || 'http://localhost:4004';
 const ENDPOINT = `${URL_BASE}/api/v1/nightgate`;
 const VK = process.env.LACE_VIEWING_KEY;
 const MNEMONIC = (process.env.LACE_MNEMONIC || '').trim();
-const PREWARM_TIMEOUT_MS = parseInt(process.env.T15_PREWARM_TIMEOUT_MIN || '240', 10) * 60_000;
-const JOB_POLL_MS = parseInt(process.env.T15_JOB_POLL_INTERVAL_MS || '5000', 10);
+const PREWARM_TIMEOUT_MS = parseInt(process.env.E2E_PREWARM_TIMEOUT_MIN || '240', 10) * 60_000;
+const JOB_POLL_MS = parseInt(process.env.E2E_JOB_POLL_INTERVAL_MS || '5000', 10);
 
 function fail(msg) { console.error(`FAIL ${msg}`); process.exit(1); }
 function step(name) { console.log(`\n--- ${name} ---`); }

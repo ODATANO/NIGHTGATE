@@ -1,5 +1,5 @@
 /**
- * Tests for srv/submission/wallet-material-factory.ts (T7).
+ * Tests for srv/submission/wallet-material-factory.ts.
  *
  * Verifies:
  *   - Deterministic accountId + password derivation across reconnects
@@ -204,7 +204,7 @@ describe('buildWalletMaterialForSession', () => {
 
 // ---- Wallet adapter shape -------------------------------------------------
 
-describe('walletAndMidnightProvider adapter (T7, read-only material only)', () => {
+describe('walletAndMidnightProvider adapter (read-only material only)', () => {
     let material: any;
 
     beforeAll(async () => {
@@ -242,18 +242,18 @@ describe('walletAndMidnightProvider adapter (T7, read-only material only)', () =
             .rejects.toBeInstanceOf(WalletSigningNotAvailable);
     });
 
-    test('error message names the failing method and points at T7-extended', () => {
+    test('error message names the failing method and the missing material', () => {
         try { material.walletAndMidnightProvider.getCoinPublicKey(); }
         catch (e) {
             const err = e as WalletSigningNotAvailable;
             expect(err.message).toMatch(/getCoinPublicKey/);
-            expect(err.message).toMatch(/T7-extended/);
+            expect(err.message).toMatch(/viewing key only/);
             expect(err.message).toMatch(/encryptedSeedKey/);
         }
     });
 });
 
-// ---- Signing-capable adapter (T7-extended.a) ------------------------------
+// ---- Signing-capable adapter (seed present, no facade) --------------------
 
 describe('signing-capable wallet adapter (session with encryptedSeedKey)', () => {
     const VALID_SEED = 'a'.repeat(128); // 64-byte BIP39 seed
@@ -304,24 +304,24 @@ describe('signing-capable wallet adapter (session with encryptedSeedKey)', () =>
             .not.toBe(mB.walletAndMidnightProvider.getCoinPublicKey());
     });
 
-    test('balanceTx still throws but with T7-extended.b hint', async () => {
+    test('balanceTx still throws when no facade is configured', async () => {
         const encSeed = encrypt(VALID_SEED, TEST_KEY);
         const db = makeDbWithSession(buildEncryptedSession('vk', { encryptedSeedKey: encSeed }));
         const material = await buildWalletMaterialForSession({
             sessionId: 'sess-1', db, encryptionKey: TEST_KEY
         });
         await expect(material.walletAndMidnightProvider.balanceTx({}, new Date()))
-            .rejects.toThrow(/T7-extended\.b/);
+            .rejects.toThrow(/no WalletFacade configured/);
     });
 
-    test('submitTx still throws but with T7-extended.b hint', async () => {
+    test('submitTx still throws when no facade is configured', async () => {
         const encSeed = encrypt(VALID_SEED, TEST_KEY);
         const db = makeDbWithSession(buildEncryptedSession('vk', { encryptedSeedKey: encSeed }));
         const material = await buildWalletMaterialForSession({
             sessionId: 'sess-1', db, encryptionKey: TEST_KEY
         });
         await expect(material.walletAndMidnightProvider.submitTx({}))
-            .rejects.toThrow(/T7-extended\.b/);
+            .rejects.toThrow(/no WalletFacade configured/);
     });
 
     test('invalid encryptedSeedKey ciphertext is mapped to SessionNotFoundError', async () => {
@@ -335,7 +335,7 @@ describe('signing-capable wallet adapter (session with encryptedSeedKey)', () =>
         })).rejects.toBeInstanceOf(SessionNotFoundError);
     });
 
-    test('exposes _internal handles for T7-extended.b WalletFacade adapter', async () => {
+    test('exposes _internal handles for a facade-backed adapter to reuse', async () => {
         const encSeed = encrypt(VALID_SEED, TEST_KEY);
         const db = makeDbWithSession(buildEncryptedSession('vk', { encryptedSeedKey: encSeed }));
         const material = await buildWalletMaterialForSession({
@@ -353,11 +353,11 @@ describe('signing-capable wallet adapter (session with encryptedSeedKey)', () =>
 describe('classifySubmissionError recognizes WalletSigningNotAvailable', () => {
     const { classifySubmissionError } = require('../../srv/submission/TransactionSubmitter');
 
-    test('maps WalletSigningNotAvailable to stable code with non-retryable + T7 hint', () => {
+    test('maps WalletSigningNotAvailable to stable code, non-retryable, with seed hint', () => {
         const err = new WalletSigningNotAvailable('balanceTx()');
         const c = classifySubmissionError(err, 'preprod');
         expect(c.code).toBe('WalletSigningNotAvailable');
         expect(c.retryable).toBe(false);
-        expect(c.message).toMatch(/T7-extended/);
+        expect(c.message).toMatch(/encryptedSeedKey/);
     });
 });

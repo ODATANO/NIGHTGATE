@@ -1,5 +1,5 @@
 /**
- * Tests for src/sdk/AttestationService.ts (T11).
+ * Tests for src/sdk/AttestationService.ts.
  *
  * HYBRID approach: runs against a REAL in-memory CAP DB via cds.test()
  * (see test/jest.setup.ts). The `@sap/cds` cds.ql mock that the previous

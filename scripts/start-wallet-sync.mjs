@@ -70,5 +70,5 @@ async function post(path, body) {
     console.log('  [facade-persist] saved <sid> sh=N un=N du=N   (every ~30 s)');
     console.log('\nProgress check (separate terminal):');
     console.log('  sqlite3 db/midnight.db "SELECT length(shieldedStateBlob) AS sh, length(dustStateBlob) AS du, updatedAt FROM midnight_WalletSyncStates"');
-    console.log(`\nSession to reuse for T15: ${sessionId}`);
+    console.log(`\nSession to reuse: ${sessionId}`);
 })();

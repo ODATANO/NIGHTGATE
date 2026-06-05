@@ -1,5 +1,5 @@
 /**
- * Tests for srv/middleware/disclosure-role.ts (T14).
+ * Tests for srv/middleware/disclosure-role.ts.
  *
  * Covers: tier resolution from DB rows, default when no user/no grants,
  * scope handling (global vs. matching vs. non-matching), validity windows,

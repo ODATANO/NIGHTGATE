@@ -1,5 +1,5 @@
 /**
- * Per-contract witness factories (T10-extended).
+ * Per-contract witness factories.
  *
  * The Midnight Compact compiler emits a `Witnesses<PS>` type per contract:
  * an object whose keys map to off-chain functions that the SDK invokes during

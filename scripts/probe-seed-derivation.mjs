@@ -17,7 +17,7 @@
 //
 // Run:
 //   LACE_MNEMONIC="word1 word2 ..." node scripts/probe-seed-derivation.mjs
-// Optional (defaults to the address you gave during T15 triage):
+// Optional:
 //   LACE_SHIELD_ADDR="mn_shield-addr_preprod1..."   the target to match
 //   NIGHTGATE_NETWORK=preprod
 

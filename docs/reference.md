@@ -111,11 +111,11 @@ Sufficient for read-side. Defaults to `preprod`, `wss://rpc.preprod.midnight.net
 | `SKIP_AUTO_INIT` | Set `true` **only in tests** to skip the plugin's `initialize()` (crawler + wallet worker). Must NOT be set in production. |
 | `INDEXER_SECRET` | 32-byte hex secret for the indexer container's `APP__INFRA__SECRET` |
 | `INDEXER_UPSTREAM_NODE_URL` | Upstream Substrate RPC for the indexer container (default = hosted preprod) |
-| `LACE_VIEWING_KEY` | Consumed by `scripts/start-wallet-sync.mjs` and `scripts/run-t15.mjs` to bootstrap a wallet session |
+| `LACE_VIEWING_KEY` | Consumed by `scripts/start-wallet-sync.mjs` and `scripts/run-deploy-e2e.mjs` to bootstrap a wallet session |
 | `LACE_MNEMONIC` | BIP39 recovery phrase the scripts pass to `connectWalletForSigning`; NIGHTGATE HD-derives the per-role keys |
 | `LACE_SEED_HEX` | Optional alternative to `LACE_MNEMONIC`: the full 64-byte BIP39 seed as 128 hex chars |
-| `T15_DUST_WAIT_SECONDS` | `run-t15.mjs` parameter — how long to wait after dust registration |
-| `T15_SKIP_DUST_REG` | `1` to skip dust registration step in `run-t15.mjs` |
+| `DEPLOY_E2E_DUST_WAIT_SECONDS` | `run-deploy-e2e.mjs` parameter — how long to wait after dust registration |
+| `DEPLOY_E2E_SKIP_DUST_REG` | `1` to skip dust registration step in `run-deploy-e2e.mjs` |
 | `NIGHTGATE_HEAP_MB` | Heap size for `scripts/dev.mjs` / `scripts/serve.mjs` (default `12288`) |
 
 For local repository startup, drop these into a repo-root `.env`. The tracked template is at [.env.example](../.env.example).
@@ -332,7 +332,7 @@ scripts/
   dev.mjs / serve.mjs               # node-spawn wrappers with 12 GB heap
   start-wallet-sync.mjs             # connectWallet + connectWalletForSigning
   probe-indexer.mjs                 # local indexer liveness check
-  run-t15.mjs                       # end-to-end submission test
+  run-deploy-e2e.mjs                # end-to-end deploy test
   integration-*.mjs                 # real-SDK probes
 ```
 
@@ -355,7 +355,7 @@ npm run integration:contract-registry  # registry resolves the real compiled cou
 | `npm run serve` | Plain `cds-serve` |
 | `npm run sync:start` | Bootstrap a wallet session against the running server |
 | `npm run sync:probe` | Check local indexer container status |
-| `npm run t15` | End-to-end submission flow |
+| `npm run deploy:e2e` | End-to-end deploy flow |
 | `npm run build` | `cds:types` + `tsc -p tsconfig.build.json` (in-place compile) |
 | `npm run typecheck` | `tsc --noEmit` |
 | `npm run lint` | ESLint |
