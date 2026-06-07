@@ -25,6 +25,8 @@ import {
 cds.test(__dirname + '/../..');
 
 const ROLES = 'midnight.DisclosureRoles';
+const GRANTS = 'midnight.DisclosureGrants';
+const IDENTITIES = 'midnight.GranteeIdentities';
 
 interface GrantSeed {
     userId: string;
@@ -42,6 +44,8 @@ beforeAll(async () => {
 
 beforeEach(async () => {
     await db.run(cds.ql.DELETE.from(ROLES));
+    await db.run(cds.ql.DELETE.from(GRANTS));
+    await db.run(cds.ql.DELETE.from(IDENTITIES));
 });
 
 async function seed(...grants: GrantSeed[]): Promise<void> {
@@ -53,6 +57,33 @@ async function seed(...grants: GrantSeed[]): Promise<void> {
         validFrom:  g.validFrom ?? null,
         validUntil: g.validUntil ?? null
     }))));
+}
+
+async function seedIdentity(userId: string, granteeId: string, scope: string | null = null): Promise<void> {
+    await db.run(cds.ql.INSERT.into(IDENTITIES).entries({
+        ID: cds.utils.uuid(), userId, granteeId, bindingKind: 'custom', scope
+    }));
+}
+
+interface GrantRowSeed {
+    payloadHash: string;
+    grantee: string;
+    level: number;
+    contractAddress: string;
+    active?: boolean;
+}
+
+async function seedGrant(g: GrantRowSeed): Promise<void> {
+    await db.run(cds.ql.INSERT.into(GRANTS).entries({
+        ID: cds.utils.uuid(),
+        payloadHash: g.payloadHash,
+        grantee: g.grantee,
+        level: g.level,
+        contractAddress: g.contractAddress,
+        grantedTxHash: null,
+        revokedTxHash: null,
+        active: g.active ?? true
+    }));
 }
 
 function makeReq(userId?: string): any {
@@ -148,6 +179,87 @@ describe('attachDisclosureRole', () => {
             await seed({ userId: 'gail', role: 'legitimate_interest', scope: '' });
             const role = await attachDisclosureRole(makeReq('gail'), db);
             expect(role).toBe('legitimate_interest');
+        });
+    });
+
+    describe('on-chain ACL (contractAddress set)', () => {
+        const VAULT = '0xVAULT';
+        const PH = 'a'.repeat(64);
+        const GID = 'c'.repeat(64);
+
+        test('active level-1 grant → legitimate_interest', async () => {
+            await seedIdentity('han', GID);
+            await seedGrant({ payloadHash: PH, grantee: GID, level: 1, contractAddress: VAULT });
+            const role = await attachDisclosureRole(makeReq('han'), db, { contractAddress: VAULT });
+            expect(role).toBe('legitimate_interest');
+        });
+
+        test('active level-2 grant → authority; level-0 → public_only', async () => {
+            await seedIdentity('han', GID);
+            await seedGrant({ payloadHash: PH, grantee: GID, level: 2, contractAddress: VAULT });
+            expect(await attachDisclosureRole(makeReq('han'), db, { contractAddress: VAULT })).toBe('authority');
+
+            await db.run(cds.ql.DELETE.from(GRANTS));
+            await seedGrant({ payloadHash: PH, grantee: GID, level: 0, contractAddress: VAULT });
+            expect(await attachDisclosureRole(makeReq('han'), db, { contractAddress: VAULT })).toBe('public_only');
+        });
+
+        test('highest active grant wins across multiple', async () => {
+            await seedIdentity('han', GID);
+            await seedGrant({ payloadHash: PH, grantee: GID, level: 1, contractAddress: VAULT });
+            await seedGrant({ payloadHash: 'b'.repeat(64), grantee: GID, level: 2, contractAddress: VAULT });
+            expect(await attachDisclosureRole(makeReq('han'), db, { contractAddress: VAULT })).toBe('authority');
+        });
+
+        test('no registered granteeId → public_only (off-chain table NOT consulted)', async () => {
+            // An off-chain authority grant exists, but with contractAddress set the
+            // on-chain ACL is authoritative and the caller has no granteeId.
+            await seed({ userId: 'han', role: 'authority' });
+            const role = await attachDisclosureRole(makeReq('han'), db, { contractAddress: VAULT });
+            expect(role).toBe('public_only');
+        });
+
+        test('registered granteeId but no active grant → public_only', async () => {
+            await seedIdentity('han', GID);
+            const role = await attachDisclosureRole(makeReq('han'), db, { contractAddress: VAULT });
+            expect(role).toBe('public_only');
+        });
+
+        test('inactive (revoked) grant is ignored → public_only', async () => {
+            await seedIdentity('han', GID);
+            await seedGrant({ payloadHash: PH, grantee: GID, level: 2, contractAddress: VAULT, active: false });
+            const role = await attachDisclosureRole(makeReq('han'), db, { contractAddress: VAULT });
+            expect(role).toBe('public_only');
+        });
+
+        test('grant for a different contract is ignored', async () => {
+            await seedIdentity('han', GID);
+            await seedGrant({ payloadHash: PH, grantee: GID, level: 2, contractAddress: '0xOTHER' });
+            const role = await attachDisclosureRole(makeReq('han'), db, { contractAddress: VAULT });
+            expect(role).toBe('public_only');
+        });
+
+        test('payloadHash narrows the match', async () => {
+            await seedIdentity('han', GID);
+            await seedGrant({ payloadHash: PH, grantee: GID, level: 2, contractAddress: VAULT });
+            // Asking about a different attestation → no match.
+            const other = await attachDisclosureRole(makeReq('han'), db, { contractAddress: VAULT, payloadHash: 'd'.repeat(64) });
+            expect(other).toBe('public_only');
+            // Asking about the granted attestation → match.
+            const match = await attachDisclosureRole(makeReq('han'), db, { contractAddress: VAULT, payloadHash: PH });
+            expect(match).toBe('authority');
+        });
+
+        test('anonymous caller → public_only', async () => {
+            const role = await attachDisclosureRole(makeReq(), db, { contractAddress: VAULT });
+            expect(role).toBe('public_only');
+        });
+
+        test('scoped granteeId (per-contract) resolves and matches', async () => {
+            // identity bound specifically to this contract scope
+            await seedIdentity('han', GID, VAULT);
+            await seedGrant({ payloadHash: PH, grantee: GID, level: 1, contractAddress: VAULT });
+            expect(await attachDisclosureRole(makeReq('han'), db, { contractAddress: VAULT })).toBe('legitimate_interest');
         });
     });
 });

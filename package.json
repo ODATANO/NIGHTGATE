@@ -1,6 +1,6 @@
 {
   "name": "@odatano/nightgate",
-  "version": "0.3.3",
+  "version": "0.3.4",
   "description": "CAP Plugin: Midnight Blockchain Indexer with OData V4 API",
   "homepage": "https://github.com/ODATANO/NIGHTGATE#readme",
   "repository": {
@@ -92,6 +92,7 @@
     "integration:attestation-vault": "node scripts/integration-test-attestation-vault.mjs",
     "deploy:e2e": "node --env-file=.env scripts/run-deploy-e2e.mjs",
     "predicate:e2e": "node --env-file=.env scripts/run-predicate-e2e.mjs",
+    "disclosure:e2e": "node --env-file=.env scripts/run-disclosure-e2e.mjs",
     "lint": "eslint .",
     "prepack": "npm run build:plugin",
     "prepublishOnly": "npm run typecheck && npm test && npm run build:plugin"

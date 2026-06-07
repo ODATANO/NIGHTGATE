@@ -383,6 +383,22 @@ entity DisclosureGrants : cuid, managed {
 }
 
 /**
+ * Binds an authenticated principal (req.user.id) to the `Bytes<32>` grantee id
+ * the AttestationVault circuit checks, so the read gate can resolve
+ * principal → granteeId and match an on-chain DisclosureGrant (Phase 0 of
+ * expose-disclosure-grants). `bindingKind` records how the id was derived
+ * ('wallet' | 'did' | 'custom'); see srv/submission/grantee-identity.ts.
+ * Resolution mirrors DisclosureRoles scope precedence: a scoped row wins,
+ * else a global (null/empty scope) row applies.
+ */
+entity GranteeIdentities : cuid, managed {
+    userId      : String(200) not null; // matches req.user.id from CAP auth
+    granteeId   : HexEncoded not null;  // Bytes<32> grantee id (64 hex)
+    bindingKind : String(20) not null;  // 'wallet' | 'did' | 'custom'
+    scope       : String(500);          // optional: contract addr / attestation id
+}
+
+/**
  * Unshielded NIGHT token balances per address
  */
 entity NightBalances {

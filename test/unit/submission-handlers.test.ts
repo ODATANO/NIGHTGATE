@@ -872,9 +872,11 @@ describe('grantDisclosure', () => {
     function makeFakeDb() {
         return { run: jest.fn().mockResolvedValue(undefined) };
     }
+    let reindexer: jest.Mock;
     function setupHandlersWithDb(overrides: any = {}) {
         const srv = makeFakeService();
         const db = makeFakeDb();
+        reindexer = jest.fn().mockResolvedValue({ indexed: 1, deactivated: 0 });
         registerSubmissionHandlers(srv as any, db, {
             resolveContractImpl: jest.fn(async () => ({ ...RESOLVED_CONTRACT_FIXTURE })),
             walletMaterialFactory: jest.fn(async () => ({
@@ -883,6 +885,7 @@ describe('grantDisclosure', () => {
                 walletAndMidnightProvider: {}
             })),
             submitterFactory: jest.fn(() => makeSuccessfulSubmitter()),
+            disclosureReindexer: reindexer,
             ...overrides
         });
         return { srv, db };
@@ -981,6 +984,26 @@ describe('grantDisclosure', () => {
         expect(resolveContractImpl).toHaveBeenCalledWith('attestation-vault');
     });
 
+    test('reindexes on-chain state after a successful grant', async () => {
+        const { srv } = setupHandlersWithDb();
+        await srv.handlers['grantDisclosure'](makeReq(VALID_ARGS()));
+        expect(reindexer).toHaveBeenCalledTimes(1);
+        expect(reindexer).toHaveBeenCalledWith(expect.objectContaining({
+            contractAddress: '0xVAULT',
+            artifactPath: RESOLVED_CONTRACT_FIXTURE.artifactPath
+        }));
+    });
+
+    test('a reindex failure does not fail the grant', async () => {
+        const { srv } = setupHandlersWithDb({
+            disclosureReindexer: jest.fn().mockRejectedValue(new Error('indexer down'))
+        });
+        const req = makeReq(VALID_ARGS());
+        const result: any = await srv.handlers['grantDisclosure'](req);
+        expect(req.reject).not.toHaveBeenCalled();
+        expect(result).toMatchObject({ jobId: expect.any(String), status: 'pending' });
+    });
+
     test('forwards idempotencyKey to startJob', async () => {
         const { srv } = setupHandlersWithDb();
         await srv.handlers['grantDisclosure'](makeReq({ ...VALID_ARGS(), idempotencyKey: 'idem-1' }));
@@ -1025,6 +1048,7 @@ describe('revokeDisclosure', () => {
                 walletAndMidnightProvider: {}
             })),
             submitterFactory: jest.fn(() => makeSuccessfulSubmitter()),
+            disclosureReindexer: jest.fn().mockResolvedValue({ indexed: 0, deactivated: 1 }),
             ...overrides
         });
         return { srv, db };
@@ -1063,6 +1087,83 @@ describe('revokeDisclosure', () => {
         expect(c0.args).toHaveLength(2);
         expect(c0.args[0]).toBeInstanceOf(Uint8Array);
         expect(c0.args[1]).toBeInstanceOf(Uint8Array);
+    });
+});
+
+// ---- registerGranteeIdentity (Phase 0 grantee binding) --------------------
+
+describe('registerGranteeIdentity', () => {
+    // No nightgate config in tests → binding defaults to 'wallet' (input = hex).
+    const PUBKEY = '11'.repeat(32);
+
+    function setup(dbRun?: jest.Mock) {
+        const srv = makeFakeService();
+        const db = { run: dbRun ?? jest.fn().mockResolvedValue(undefined) };
+        registerSubmissionHandlers(srv as any, db, {
+            resolveContractImpl: jest.fn(), walletMaterialFactory: jest.fn(), submitterFactory: jest.fn()
+        });
+        return { srv, db };
+    }
+    function reqWithUser(userId: string | undefined, data: Record<string, unknown>) {
+        return {
+            data,
+            user: userId ? { id: userId } : undefined,
+            reject: jest.fn((status: number, message: string) => {
+                const err: any = new Error(message); err.status = status; return err;
+            })
+        };
+    }
+
+    test('401 when unauthenticated', async () => {
+        const { srv } = setup();
+        const req = reqWithUser(undefined, { bindingInput: PUBKEY });
+        await srv.handlers['registerGranteeIdentity'](req);
+        expect(req.reject).toHaveBeenCalledWith(401, expect.stringMatching(/authentication/));
+    });
+
+    test('400 when bindingInput missing', async () => {
+        const { srv } = setup();
+        const req = reqWithUser('u1', {});
+        await srv.handlers['registerGranteeIdentity'](req);
+        expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/bindingInput/));
+    });
+
+    test('400 when bindingInput invalid for the binding kind', async () => {
+        const { srv } = setup();
+        const req = reqWithUser('u1', { bindingInput: 'not-hex' });
+        await srv.handlers['registerGranteeIdentity'](req);
+        expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/hex/));
+    });
+
+    test('inserts a new identity and returns the derived granteeId', async () => {
+        // SELECT.one existing → undefined, then INSERT.
+        const run = jest.fn().mockResolvedValueOnce(undefined).mockResolvedValue(undefined);
+        const { srv } = setup(run);
+        const req = reqWithUser('u1', { bindingInput: PUBKEY });
+        const result: any = await srv.handlers['registerGranteeIdentity'](req);
+
+        expect(req.reject).not.toHaveBeenCalled();
+        expect(result.bindingKind).toBe('wallet');
+        expect(result.granteeId).toMatch(/^[0-9a-f]{64}$/);
+        expect(result.ID).toEqual(expect.any(String));
+
+        const insert = run.mock.calls.map(c => c[0]).find(q => q.INSERT);
+        expect(insert.INSERT.entries[0]).toMatchObject({
+            userId: 'u1', granteeId: result.granteeId, bindingKind: 'wallet', scope: null
+        });
+    });
+
+    test('idempotent: updates the existing (userId, scope) row instead of inserting', async () => {
+        // SELECT.one existing → a row, then UPDATE.
+        const run = jest.fn().mockResolvedValueOnce({ ID: 'existing-1' }).mockResolvedValue(undefined);
+        const { srv } = setup(run);
+        const req = reqWithUser('u1', { bindingInput: PUBKEY });
+        const result: any = await srv.handlers['registerGranteeIdentity'](req);
+
+        expect(result.ID).toBe('existing-1');
+        const queries = run.mock.calls.map(c => c[0]);
+        expect(queries.some(q => q.UPDATE)).toBe(true);
+        expect(queries.some(q => q.INSERT)).toBe(false);
     });
 });
 

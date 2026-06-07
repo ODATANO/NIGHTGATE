@@ -40,6 +40,17 @@ export interface NightgatePluginConfig {
      * the gate is opt-in. Read-only indexing is unaffected.
      */
     allowMainnetSubmission?: boolean;
+    /**
+     * How an authenticated principal maps to the AttestationVault circuit's
+     * `Bytes<32>` grantee id used to match on-chain disclosure grants at read
+     * time (Phase 0 of expose-disclosure-grants). Default 'wallet'.
+     *   - 'wallet': granteeId derived from the principal's coin public key.
+     *   - 'did':    granteeId derived from a registered DID string.
+     *   - 'custom': granteeId is an opaque 64-hex the consumer registers.
+     * The SAME derivation must be used by whoever issues the grant — see
+     * srv/submission/grantee-identity.ts.
+     */
+    granteeBinding?: GranteeBinding;
     // CAP permits additional plugin-specific keys we don't model here.
     [k: string]: unknown;
 }
@@ -90,6 +101,18 @@ export function getConfiguredPrivateStateBackend(config?: Record<string, any>): 
         return raw as PrivateStateBackend;
     }
     return DEFAULT_PRIVATE_STATE_BACKEND;
+}
+
+export const VALID_GRANTEE_BINDINGS = ['wallet', 'did', 'custom'] as const;
+export type GranteeBinding = (typeof VALID_GRANTEE_BINDINGS)[number];
+export const DEFAULT_GRANTEE_BINDING: GranteeBinding = 'wallet';
+
+export function getConfiguredGranteeBinding(config?: Record<string, any>): GranteeBinding {
+    const raw = readEnv('NIGHTGATE_GRANTEE_BINDING') || config?.granteeBinding;
+    if (raw && (VALID_GRANTEE_BINDINGS as readonly string[]).includes(raw)) {
+        return raw as GranteeBinding;
+    }
+    return DEFAULT_GRANTEE_BINDING;
 }
 
 function readEnv(key: string): string | undefined {

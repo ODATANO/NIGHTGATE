@@ -356,6 +356,34 @@ service NightgateService {
     };
 
     /**
+     * Grantee identities: binds an authenticated principal to the Bytes<32>
+     * grantee id the AttestationVault checks (read side of the disclosure ACL).
+     */
+    @readonly
+    entity GranteeIdentities         as projection on midnight.GranteeIdentities;
+
+    /**
+     * Bind the authenticated caller (req.user.id) to the `Bytes<32>` grantee id
+     * the AttestationVault checks, so on-chain disclosure grants resolve to this
+     * principal at read time. The binding kind is set per-deployment via
+     * `cds.requires.nightgate.granteeBinding` (default 'wallet'):
+     *   - 'wallet': `bindingInput` = the caller's coin public key (hex)
+     *   - 'did':    `bindingInput` = a DID string
+     *   - 'custom': `bindingInput` = the 64-hex grantee id itself
+     * `scope` optionally restricts the binding to one contract/attestation;
+     * omit for a global binding. Idempotent on (userId, scope) — re-registering
+     * updates the existing row. Requires authentication (401 otherwise).
+     */
+    action registerGranteeIdentity(
+        bindingInput: String,
+        scope:        String   // optional; omit for a global binding
+    )                                returns {
+        ID:          UUID;
+        granteeId:   String;
+        bindingKind: String;
+    };
+
+    /**
      * Deploy a registered compiled contract. The contract must be registered
      * via `cds.requires.nightgate.contracts.<ref>` or `registerContract()`.
      *

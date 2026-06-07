@@ -45,7 +45,10 @@ import { resolveNightgateRuntimeConfig, type NightgateNetwork, getConfiguredPriv
 import { RateLimiter } from '../utils/rate-limiter';
 import { ensureNetworkId, type ContractProvidersConfig } from '../midnight/providers';
 import { startJob } from './background-jobs';
-import { Documents, Transactions, TransactionResults, PredicateAttestations, DisclosureGrants } from '#cds-models/midnight';
+import { reindexDisclosuresForContract } from './disclosure-indexer';
+import { deriveGranteeId } from './grantee-identity';
+import { getConfiguredGranteeBinding } from '../utils/nightgate-config';
+import { Documents, Transactions, TransactionResults, PredicateAttestations, DisclosureGrants, GranteeIdentities } from '#cds-models/midnight';
 
 const { INSERT, UPDATE, SELECT } = cds.ql;
 
@@ -85,6 +88,8 @@ export interface SubmissionHandlersOptions {
     submitterFactory?: (deps: TransactionSubmitterDeps) => TransactionSubmitter;
     /** Override circuit-arg-type introspection. Defaults to reading contract-info.json. */
     circuitArgTypesLoader?: typeof loadCircuitArgTypes;
+    /** Override the post-submit disclosure reindexer. Defaults to the real wrapper. */
+    disclosureReindexer?: typeof reindexDisclosuresForContract;
 }
 
 export function registerSubmissionHandlers(
@@ -98,6 +103,7 @@ export function registerSubmissionHandlers(
     const contractResolver = options.resolveContractImpl ?? resolveContract;
     const submitterFactory = options.submitterFactory ?? ((deps: TransactionSubmitterDeps) => new TransactionSubmitter(deps));
     const argTypesLoader = options.circuitArgTypesLoader ?? loadCircuitArgTypes;
+    const disclosureReindexer = options.disclosureReindexer ?? reindexDisclosuresForContract;
 
     srv.on('deployContract', async (req: Request) => {
         const { compiledArtifactRef, sessionId, initialPrivateState, idempotencyKey } = req.data as {
@@ -672,6 +678,11 @@ export function registerSubmissionHandlers(
                         .set({ grantedTxHash: result.txHash, modifiedAt: grantedAt })
                         .where({ ID: disclosureGrantId }));
 
+                    // Best-effort: pull the grant back out of on-chain state so the
+                    // row's `active` flag becomes chain-confirmed. Never fail the
+                    // submit on an indexing error — the row already records intent.
+                    await reindexAfterSubmit(data.contractAddress!, resolved);
+
                     return {
                         disclosureGrantId,
                         payloadHash: payloadHashLc,
@@ -758,6 +769,10 @@ export function registerSubmissionHandlers(
                             grantee:         granteeLc
                         }));
 
+                    // Best-effort: reconcile against on-chain state (the chain is
+                    // authoritative on `active`). Never fail the submit on error.
+                    await reindexAfterSubmit(data.contractAddress!, resolved);
+
                     return {
                         payloadHash: payloadHashLc,
                         grantee:     granteeLc,
@@ -769,6 +784,61 @@ export function registerSubmissionHandlers(
             return { jobId: job.jobId, status: job.status };
         });
     });
+
+    srv.on('registerGranteeIdentity', async (req: Request) => {
+        const userId = (req as any).user?.id;
+        if (!userId) return req.reject(401, 'authentication required');
+
+        const { bindingInput, scope } = req.data as { bindingInput?: string; scope?: string };
+        if (!bindingInput) return req.reject(400, 'bindingInput is required');
+
+        const bindingKind = getConfiguredGranteeBinding(getNightgatePluginConfig());
+        let granteeId: string;
+        try {
+            granteeId = deriveGranteeId(bindingKind, bindingInput);
+        } catch (err) {
+            return req.reject(400, err instanceof Error ? err.message : String(err));
+        }
+
+        const scopeNorm = scope && scope.length > 0 ? scope : null;
+        const now = new Date().toISOString();
+
+        // Idempotent on (userId, scope): re-registering updates in place.
+        const existing: any = await db.run(
+            SELECT.one.from(GranteeIdentities).where({ userId, scope: scopeNorm })
+        );
+        if (existing) {
+            await db.run(UPDATE.entity(GranteeIdentities)
+                .set({ granteeId, bindingKind, modifiedAt: now })
+                .where({ ID: existing.ID }));
+            return { ID: existing.ID, granteeId, bindingKind };
+        }
+
+        const ID = cds.utils.uuid();
+        await db.run(INSERT.into(GranteeIdentities).entries({
+            ID, userId, granteeId, bindingKind, scope: scopeNorm,
+            createdAt: now, modifiedAt: now
+        }));
+        return { ID, granteeId, bindingKind };
+    });
+
+    /**
+     * Best-effort chain reindex after a disclosure grant/revoke submit. Swallows
+     * all errors: an indexing failure must never fail the submission (the row
+     * already records intent; a later reindex reconciles).
+     */
+    async function reindexAfterSubmit(contractAddress: string, resolved: ResolvedContract): Promise<void> {
+        try {
+            await disclosureReindexer({
+                db,
+                contractAddress,
+                artifactPath: resolved.artifactPath,
+                contractProvidersConfig: contractProvidersConfigFromEnv(resolved.zkConfigPath)
+            });
+        } catch {
+            /* best-effort; intentionally ignored */
+        }
+    }
 
     function buildSubmitterDeps(db: any, resolved: ResolvedContract, wallet: import('../midnight/providers').WalletMaterial): TransactionSubmitterDeps {
         const nightgateConfig = getNightgatePluginConfig();
@@ -801,6 +871,17 @@ function facadeConfigFromEnv() {
         indexerWsUrl:   submissionEndpoints.indexerWsUrl,
         proofServerUrl: submissionEndpoints.proofServerUrl,
         relayUrl:       nodeUrl
+    };
+}
+
+/** Contract-only provider config (no wallet) for read-side reindexing. */
+function contractProvidersConfigFromEnv(zkConfigPath: string): ContractProvidersConfig {
+    const { submissionEndpoints } = resolveNightgateRuntimeConfig(getNightgatePluginConfig());
+    return {
+        indexerHttpUrl: submissionEndpoints.indexerHttpUrl,
+        indexerWsUrl:   submissionEndpoints.indexerWsUrl,
+        proofServerUrl: submissionEndpoints.proofServerUrl,
+        zkConfigPath
     };
 }
 
