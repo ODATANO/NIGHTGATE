@@ -1,8 +1,8 @@
 // AttestationVault — tiered-disclosure attestation contract (T10-extended).
 //
-// On-chain state stores only commitments (hashes/identifiers) — the actual
+// On-chain state stores only commitments (hashes/identifiers) and the actual
 // payload and metadata bodies live off-chain in NIGHTGATE's tables. The
-// chain layer guarantees ownership and disclosure-grant integrity; the
+// chain layer guarantees ownership and disclosure-grant integrity & the
 // off-chain layer carries the content.
 //
 //   payload_hash   : blake2b-256 of the private payload (caller-provided)

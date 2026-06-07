@@ -362,6 +362,27 @@ entity DisclosureRoles : cuid, managed {
 }
 
 /**
+ * On-chain disclosure grants read off the AttestationVault `disclosures`
+ * ledger Map. Distinct from DisclosureRoles (off-chain, operator-configured):
+ * these are CHAIN-DERIVED entitlement records — the contract is the ACL.
+ *
+ * Rows are inserted optimistically (active=false) by `grantDisclosure` and
+ * confirmed/flipped by the chain indexer (Phase 2) once the grant appears in
+ * ledger state. Logical key for cross-contract reuse:
+ * (contractAddress, payloadHash, grantee). `level`: 0=public,
+ * 1=legitimate-interest, 2=authority.
+ */
+entity DisclosureGrants : cuid, managed {
+    payloadHash     : HexEncoded not null; // attestation the grant is scoped to
+    grantee         : HexEncoded not null; // Bytes<32> grantee identifier
+    level           : Integer not null; // 0 | 1 | 2
+    contractAddress : HexEncoded not null; // AttestationVault deployment
+    grantedTxHash   : HexEncoded; // tx that set this grant on-chain
+    revokedTxHash   : HexEncoded; // set when revoked on-chain
+    active          : Boolean default false; // granted and not revoked (chain-confirmed)
+}
+
+/**
  * Unshielded NIGHT token balances per address
  */
 entity NightBalances {

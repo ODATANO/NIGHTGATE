@@ -855,6 +855,217 @@ describe('verifyPredicateAttestation', () => {
     });
 });
 
+// ---- grantDisclosure / revokeDisclosure (on-chain disclosure ACL) ---------
+
+describe('grantDisclosure', () => {
+    const VALID_PAYLOAD = 'a'.repeat(64);
+    const VALID_GRANTEE = 'b'.repeat(64);
+    const VALID_ARGS = () => ({
+        payloadHash:     VALID_PAYLOAD,
+        grantee:         VALID_GRANTEE,
+        level:           1,
+        sessionId:       `disc-${Math.random().toString(36).slice(2)}`,
+        contractAddress: '0xVAULT',
+        compiledArtifactRef: 'attestation-vault'
+    });
+
+    function makeFakeDb() {
+        return { run: jest.fn().mockResolvedValue(undefined) };
+    }
+    function setupHandlersWithDb(overrides: any = {}) {
+        const srv = makeFakeService();
+        const db = makeFakeDb();
+        registerSubmissionHandlers(srv as any, db, {
+            resolveContractImpl: jest.fn(async () => ({ ...RESOLVED_CONTRACT_FIXTURE })),
+            walletMaterialFactory: jest.fn(async () => ({
+                accountId: 'a',
+                privateStoragePasswordProvider: () => '0123456789ABCDEFG',
+                walletAndMidnightProvider: {}
+            })),
+            submitterFactory: jest.fn(() => makeSuccessfulSubmitter()),
+            ...overrides
+        });
+        return { srv, db };
+    }
+
+    test('rejects missing payloadHash', async () => {
+        const { srv } = setupHandlersWithDb();
+        const req = makeReq({ ...VALID_ARGS(), payloadHash: undefined });
+        await srv.handlers['grantDisclosure'](req);
+        expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/payloadHash/));
+    });
+
+    test('rejects non-hex payloadHash', async () => {
+        const { srv } = setupHandlersWithDb();
+        const req = makeReq({ ...VALID_ARGS(), payloadHash: 'nope' });
+        await srv.handlers['grantDisclosure'](req);
+        expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/payloadHash must be 64 hex/));
+    });
+
+    test('rejects missing grantee', async () => {
+        const { srv } = setupHandlersWithDb();
+        const req = makeReq({ ...VALID_ARGS(), grantee: undefined });
+        await srv.handlers['grantDisclosure'](req);
+        expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/grantee is required/));
+    });
+
+    test('rejects non-hex grantee', async () => {
+        const { srv } = setupHandlersWithDb();
+        const req = makeReq({ ...VALID_ARGS(), grantee: 'short' });
+        await srv.handlers['grantDisclosure'](req);
+        expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/grantee must be 64 hex/));
+    });
+
+    test('rejects missing level', async () => {
+        const { srv } = setupHandlersWithDb();
+        const req = makeReq({ ...VALID_ARGS(), level: undefined });
+        await srv.handlers['grantDisclosure'](req);
+        expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/level is required/));
+    });
+
+    test('rejects out-of-range level (3)', async () => {
+        const { srv } = setupHandlersWithDb();
+        const req = makeReq({ ...VALID_ARGS(), level: 3 });
+        await srv.handlers['grantDisclosure'](req);
+        expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/level must be 0/));
+    });
+
+    test('rejects negative level', async () => {
+        const { srv } = setupHandlersWithDb();
+        const req = makeReq({ ...VALID_ARGS(), level: -1 });
+        await srv.handlers['grantDisclosure'](req);
+        expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/level must be 0/));
+    });
+
+    test('rejects missing contractAddress', async () => {
+        const { srv } = setupHandlersWithDb();
+        const req = makeReq({ ...VALID_ARGS(), contractAddress: undefined });
+        await srv.handlers['grantDisclosure'](req);
+        expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/contractAddress is required/));
+    });
+
+    test('happy path: INSERT up-front + single grantDisclosure call + UPDATE grantedTxHash', async () => {
+        const submitter = makeSuccessfulSubmitter();
+        const { srv, db } = setupHandlersWithDb({ submitterFactory: () => submitter });
+        const req = makeReq(VALID_ARGS());
+
+        const result: any = await srv.handlers['grantDisclosure'](req);
+
+        expect(req.reject).not.toHaveBeenCalled();
+        expect(result).toEqual({
+            jobId:  'job-grantDisclosure-test',
+            status: 'pending',
+            disclosureGrantId: expect.any(String)
+        });
+
+        // INSERT (sync) + UPDATE (inside work) = 2 db.run.
+        expect(db.run).toHaveBeenCalledTimes(2);
+
+        // Exactly one circuit call: grantDisclosure(payload, grantee, level).
+        expect(submitter.call).toHaveBeenCalledTimes(1);
+        const c0 = (submitter.call as jest.Mock).mock.calls[0][0];
+        expect(c0.circuit).toBe('grantDisclosure');
+        expect(c0.args).toHaveLength(3);
+        expect(c0.args[0]).toBeInstanceOf(Uint8Array);
+        expect(c0.args[0]).toHaveLength(32);
+        expect(c0.args[1]).toBeInstanceOf(Uint8Array);
+        expect(c0.args[1]).toHaveLength(32);
+        expect(c0.args[2]).toBe(1n);          // level as bigint
+        expect(c0.witnessValues).toBeUndefined(); // no private witnesses
+    });
+
+    test('defaults compiledArtifactRef to attestation-vault', async () => {
+        const resolveContractImpl = jest.fn(async () => ({ ...RESOLVED_CONTRACT_FIXTURE }));
+        const { srv } = setupHandlersWithDb({ resolveContractImpl });
+        await srv.handlers['grantDisclosure'](makeReq({ ...VALID_ARGS(), compiledArtifactRef: undefined }));
+        expect(resolveContractImpl).toHaveBeenCalledWith('attestation-vault');
+    });
+
+    test('forwards idempotencyKey to startJob', async () => {
+        const { srv } = setupHandlersWithDb();
+        await srv.handlers['grantDisclosure'](makeReq({ ...VALID_ARGS(), idempotencyKey: 'idem-1' }));
+        expect(mockStartJob).toHaveBeenCalledWith(expect.objectContaining({
+            kind: 'grantDisclosure', idempotencyKey: 'idem-1'
+        }));
+    });
+
+    test('rate-limited at 30 ops/hour/session', async () => {
+        const { srv } = setupHandlersWithDb();
+        const sessionId = `disc-rate-${Date.now()}`;
+        for (let i = 0; i < 30; i++) {
+            const req = makeReq({ ...VALID_ARGS(), sessionId });
+            await srv.handlers['grantDisclosure'](req);
+            expect(req.reject).not.toHaveBeenCalled();
+        }
+        const overflow = makeReq({ ...VALID_ARGS(), sessionId });
+        await srv.handlers['grantDisclosure'](overflow);
+        expect(overflow.reject).toHaveBeenCalledWith(429, expect.stringMatching(/Rate limited/));
+    });
+});
+
+describe('revokeDisclosure', () => {
+    const VALID_PAYLOAD = 'a'.repeat(64);
+    const VALID_GRANTEE = 'b'.repeat(64);
+    const VALID_ARGS = () => ({
+        payloadHash:     VALID_PAYLOAD,
+        grantee:         VALID_GRANTEE,
+        sessionId:       `revk-${Math.random().toString(36).slice(2)}`,
+        contractAddress: '0xVAULT',
+        compiledArtifactRef: 'attestation-vault'
+    });
+
+    function setupHandlersWithDb(overrides: any = {}) {
+        const srv = makeFakeService();
+        const db = { run: jest.fn().mockResolvedValue(undefined) };
+        registerSubmissionHandlers(srv as any, db, {
+            resolveContractImpl: jest.fn(async () => ({ ...RESOLVED_CONTRACT_FIXTURE })),
+            walletMaterialFactory: jest.fn(async () => ({
+                accountId: 'a',
+                privateStoragePasswordProvider: () => '0123456789ABCDEFG',
+                walletAndMidnightProvider: {}
+            })),
+            submitterFactory: jest.fn(() => makeSuccessfulSubmitter()),
+            ...overrides
+        });
+        return { srv, db };
+    }
+
+    test('rejects non-hex grantee', async () => {
+        const { srv } = setupHandlersWithDb();
+        const req = makeReq({ ...VALID_ARGS(), grantee: 'short' });
+        await srv.handlers['revokeDisclosure'](req);
+        expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/grantee must be 64 hex/));
+    });
+
+    test('rejects missing sessionId', async () => {
+        const { srv } = setupHandlersWithDb();
+        const req = makeReq({ ...VALID_ARGS(), sessionId: undefined });
+        await srv.handlers['revokeDisclosure'](req);
+        expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/sessionId is required/));
+    });
+
+    test('happy path: single revokeDisclosure call + UPDATE active=false; returns { jobId, status }', async () => {
+        const submitter = makeSuccessfulSubmitter();
+        const { srv, db } = setupHandlersWithDb({ submitterFactory: () => submitter });
+        const req = makeReq(VALID_ARGS());
+
+        const result: any = await srv.handlers['revokeDisclosure'](req);
+
+        expect(req.reject).not.toHaveBeenCalled();
+        expect(result).toEqual({ jobId: 'job-revokeDisclosure-test', status: 'pending' });
+
+        // No up-front INSERT; only the UPDATE inside work = 1 db.run.
+        expect(db.run).toHaveBeenCalledTimes(1);
+
+        expect(submitter.call).toHaveBeenCalledTimes(1);
+        const c0 = (submitter.call as jest.Mock).mock.calls[0][0];
+        expect(c0.circuit).toBe('revokeDisclosure');
+        expect(c0.args).toHaveLength(2);
+        expect(c0.args[0]).toBeInstanceOf(Uint8Array);
+        expect(c0.args[1]).toBeInstanceOf(Uint8Array);
+    });
+});
+
 // ---- Typed arg coercion for submitContractCall ----------------------------
 // A Bytes<N> circuit arg can't reach the circuit via the JSON `args` surface
 // without coercion. These cover the coercion layer (pure), the

@@ -45,7 +45,7 @@ import { resolveNightgateRuntimeConfig, type NightgateNetwork, getConfiguredPriv
 import { RateLimiter } from '../utils/rate-limiter';
 import { ensureNetworkId, type ContractProvidersConfig } from '../midnight/providers';
 import { startJob } from './background-jobs';
-import { Documents, Transactions, TransactionResults, PredicateAttestations } from '#cds-models/midnight';
+import { Documents, Transactions, TransactionResults, PredicateAttestations, DisclosureGrants } from '#cds-models/midnight';
 
 const { INSERT, UPDATE, SELECT } = cds.ql;
 
@@ -58,6 +58,9 @@ const anchorRateLimiter = new RateLimiter({ windowMs: 60 * 60 * 1000, maxRequest
 // 10 predicate proofs / hour / session — each is TWO heavyweight circuit calls
 // (commitValue + provePredicate), so bound it like anchors.
 const predicateRateLimiter = new RateLimiter({ windowMs: 60 * 60 * 1000, maxRequests: 10 });
+// 30 disclosure grant/revoke ops / hour / session — single heavyweight circuit
+// call each, attester-gated; looser than predicate but tighter than plain calls.
+const disclosureRateLimiter = new RateLimiter({ windowMs: 60 * 60 * 1000, maxRequests: 30 });
 
 const SHA256_HEX_RE = /^[0-9a-fA-F]{64}$/;
 const DEFAULT_ATTESTATION_VAULT_REF = 'attestation-vault';
@@ -572,6 +575,199 @@ export function registerSubmissionHandlers(
             provenTxHash:    row.provenTxHash ?? '',
             provenAt:        row.provenAt ?? null
         };
+    });
+
+    srv.on('grantDisclosure', async (req: Request) => {
+        const data = req.data as {
+            payloadHash?: string;
+            grantee?: string;
+            level?: number | string;
+            sessionId?: string;
+            contractAddress?: string;
+            compiledArtifactRef?: string;
+            idempotencyKey?: string;
+        };
+
+        if (!data.payloadHash)                     return req.reject(400, 'payloadHash is required');
+        if (!SHA256_HEX_RE.test(data.payloadHash)) return req.reject(400, 'payloadHash must be 64 hex chars (32 bytes)');
+        if (!data.grantee)                         return req.reject(400, 'grantee is required');
+        if (!SHA256_HEX_RE.test(data.grantee))     return req.reject(400, 'grantee must be 64 hex chars (32 bytes)');
+
+        if (data.level === undefined || data.level === null) return req.reject(400, 'level is required');
+        let levelNum: number;
+        try { levelNum = Number(data.level); } catch { return req.reject(400, 'level must be 0, 1, or 2'); }
+        if (!Number.isInteger(levelNum) || levelNum < 0 || levelNum > 2) {
+            return req.reject(400, 'level must be 0 (public), 1 (legitimate-interest), or 2 (authority)');
+        }
+
+        if (!data.sessionId)       return req.reject(400, 'sessionId is required');
+        if (!data.contractAddress) return req.reject(400, 'contractAddress is required');
+
+        const compiledRef = data.compiledArtifactRef && data.compiledArtifactRef.length > 0
+            ? data.compiledArtifactRef
+            : DEFAULT_ATTESTATION_VAULT_REF;
+
+        if (rejectIfMainnetBlocked(req)) return;
+        if (!checkRate(disclosureRateLimiter, data.sessionId, req)) return;
+
+        const payloadHashBytes = hexToBytes(data.payloadHash);
+        const granteeBytes     = hexToBytes(data.grantee);
+        const payloadHashLc    = data.payloadHash.toLowerCase();
+        const granteeLc        = data.grantee.toLowerCase();
+
+        // Insert the row up-front (mirrors anchorDocument / issuePredicateAttestation):
+        // a stable handle the caller can poll. active=false until the chain indexer
+        // (Phase 2) confirms the grant is present in ledger state — the handler insert
+        // is an optimistic placeholder, the chain is the source of truth.
+        const disclosureGrantId = cds.utils.uuid();
+        const insertedAt = new Date().toISOString();
+        await db.run(INSERT.into(DisclosureGrants).entries({
+            ID:              disclosureGrantId,
+            payloadHash:     payloadHashLc,
+            grantee:         granteeLc,
+            level:           levelNum,
+            contractAddress: data.contractAddress,
+            grantedTxHash:   null,
+            revokedTxHash:   null,
+            active:          false,
+            createdAt:       insertedAt,
+            modifiedAt:      insertedAt
+        }));
+
+        return runSubmission(req, async () => {
+            const facadeCfg = facadeConfigFromEnv();
+            await ensureNetworkId(facadeCfg.networkId);
+            const resolved = await contractResolver(compiledRef);
+            const wallet = await walletFactory({ sessionId: data.sessionId!, db, facadeConfig: facadeCfg });
+            const submitter = submitterFactory(buildSubmitterDeps(db, resolved, wallet));
+            const registration = {
+                artifactPath:   resolved.artifactPath,
+                privateStateId: resolved.privateStateId,
+                zkConfigPath:   resolved.zkConfigPath
+            };
+
+            const job = await startJob({
+                kind:           'grantDisclosure',
+                sessionId:      data.sessionId!,
+                idempotencyKey: data.idempotencyKey,
+                request: {
+                    payloadHash:     payloadHashLc,
+                    grantee:         granteeLc,
+                    level:           levelNum,
+                    contractAddress: data.contractAddress,
+                    disclosureGrantId
+                },
+                work: async () => {
+                    const result = await submitter.call({
+                        contractAddress: data.contractAddress!,
+                        circuit:         'grantDisclosure',
+                        args:            [payloadHashBytes, granteeBytes, BigInt(levelNum)],
+                        contractName:    compiledRef,
+                        registration,
+                        sessionId:       data.sessionId!
+                    });
+
+                    const grantedAt = new Date().toISOString();
+                    await db.run(UPDATE.entity(DisclosureGrants)
+                        .set({ grantedTxHash: result.txHash, modifiedAt: grantedAt })
+                        .where({ ID: disclosureGrantId }));
+
+                    return {
+                        disclosureGrantId,
+                        payloadHash: payloadHashLc,
+                        grantee:     granteeLc,
+                        level:       levelNum,
+                        txHash:      result.txHash
+                    };
+                }
+            });
+
+            return { jobId: job.jobId, status: job.status, disclosureGrantId };
+        });
+    });
+
+    srv.on('revokeDisclosure', async (req: Request) => {
+        const data = req.data as {
+            payloadHash?: string;
+            grantee?: string;
+            sessionId?: string;
+            contractAddress?: string;
+            compiledArtifactRef?: string;
+            idempotencyKey?: string;
+        };
+
+        if (!data.payloadHash)                     return req.reject(400, 'payloadHash is required');
+        if (!SHA256_HEX_RE.test(data.payloadHash)) return req.reject(400, 'payloadHash must be 64 hex chars (32 bytes)');
+        if (!data.grantee)                         return req.reject(400, 'grantee is required');
+        if (!SHA256_HEX_RE.test(data.grantee))     return req.reject(400, 'grantee must be 64 hex chars (32 bytes)');
+        if (!data.sessionId)       return req.reject(400, 'sessionId is required');
+        if (!data.contractAddress) return req.reject(400, 'contractAddress is required');
+
+        const compiledRef = data.compiledArtifactRef && data.compiledArtifactRef.length > 0
+            ? data.compiledArtifactRef
+            : DEFAULT_ATTESTATION_VAULT_REF;
+
+        if (rejectIfMainnetBlocked(req)) return;
+        if (!checkRate(disclosureRateLimiter, data.sessionId, req)) return;
+
+        const payloadHashBytes = hexToBytes(data.payloadHash);
+        const granteeBytes     = hexToBytes(data.grantee);
+        const payloadHashLc    = data.payloadHash.toLowerCase();
+        const granteeLc        = data.grantee.toLowerCase();
+
+        return runSubmission(req, async () => {
+            const facadeCfg = facadeConfigFromEnv();
+            await ensureNetworkId(facadeCfg.networkId);
+            const resolved = await contractResolver(compiledRef);
+            const wallet = await walletFactory({ sessionId: data.sessionId!, db, facadeConfig: facadeCfg });
+            const submitter = submitterFactory(buildSubmitterDeps(db, resolved, wallet));
+            const registration = {
+                artifactPath:   resolved.artifactPath,
+                privateStateId: resolved.privateStateId,
+                zkConfigPath:   resolved.zkConfigPath
+            };
+
+            const job = await startJob({
+                kind:           'revokeDisclosure',
+                sessionId:      data.sessionId!,
+                idempotencyKey: data.idempotencyKey,
+                request: {
+                    payloadHash:     payloadHashLc,
+                    grantee:         granteeLc,
+                    contractAddress: data.contractAddress
+                },
+                work: async () => {
+                    const result = await submitter.call({
+                        contractAddress: data.contractAddress!,
+                        circuit:         'revokeDisclosure',
+                        args:            [payloadHashBytes, granteeBytes],
+                        contractName:    compiledRef,
+                        registration,
+                        sessionId:       data.sessionId!
+                    });
+
+                    // Mark any matching optimistic/active grant row as revoked. The
+                    // chain indexer (Phase 2) is authoritative on `active`; this is a
+                    // best-effort flip so the row reflects intent before reindex.
+                    const revokedAt = new Date().toISOString();
+                    await db.run(UPDATE.entity(DisclosureGrants)
+                        .set({ revokedTxHash: result.txHash, active: false, modifiedAt: revokedAt })
+                        .where({
+                            contractAddress: data.contractAddress,
+                            payloadHash:     payloadHashLc,
+                            grantee:         granteeLc
+                        }));
+
+                    return {
+                        payloadHash: payloadHashLc,
+                        grantee:     granteeLc,
+                        txHash:      result.txHash
+                    };
+                }
+            });
+
+            return { jobId: job.jobId, status: job.status };
+        });
     });
 
     function buildSubmitterDeps(db: any, resolved: ResolvedContract, wallet: import('../midnight/providers').WalletMaterial): TransactionSubmitterDeps {

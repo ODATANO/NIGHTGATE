@@ -301,6 +301,61 @@ service NightgateService {
     };
 
     /**
+     * Chain-derived disclosure grants, read off the AttestationVault
+     * `disclosures` ledger Map by the chain indexer. Distinct from the
+     * off-chain `DisclosureRoles` table — these are the tamper-evident,
+     * attester-controlled on-chain ACL. `level`: 0=public, 1=legitimate-
+     * interest, 2=authority. `active` is true while the grant is present
+     * on-chain (granted and not revoked).
+     */
+    @readonly
+    entity DisclosureGrants          as projection on midnight.DisclosureGrants;
+
+    /**
+     * Grant a disclosure tier to a grantee on an existing attestation, via the
+     * AttestationVault `grantDisclosure` circuit. Attester-only (enforced
+     * in-circuit; a non-attester caller's tx is rejected). `level`: 0 = public,
+     * 1 = legitimate-interest, 2 = authority.
+     *
+     * Async: returns `{ jobId, status, disclosureGrantId }` immediately.
+     * `disclosureGrantId` is a stable handle into DisclosureGrants (row inserted
+     * up-front, active=false). The job `result` carries
+     * `{ disclosureGrantId, payloadHash, grantee, level, txHash }`.
+     * `compiledArtifactRef` defaults to 'attestation-vault'.
+     */
+    action grantDisclosure(
+        payloadHash:         String,   // 64 hex — the attestation
+        grantee:             String,   // 64 hex — Bytes<32> grantee identifier
+        level:               Integer,  // 0 | 1 | 2
+        sessionId:           UUID,
+        contractAddress:     String,   // AttestationVault deployment
+        compiledArtifactRef: String,   // optional, defaults to 'attestation-vault'
+        idempotencyKey:      String    // optional; dedupes retries
+    )                                returns {
+        jobId:             UUID;
+        status:            String;
+        disclosureGrantId: UUID;
+    };
+
+    /**
+     * Revoke a previously granted disclosure, via the AttestationVault
+     * `revokeDisclosure` circuit (removes the grantee entry on-chain).
+     * Attester-only. Async: returns `{ jobId, status }`. The job `result`
+     * carries `{ payloadHash, grantee, txHash }`.
+     */
+    action revokeDisclosure(
+        payloadHash:         String,   // 64 hex — the attestation
+        grantee:             String,   // 64 hex — Bytes<32> grantee identifier
+        sessionId:           UUID,
+        contractAddress:     String,   // AttestationVault deployment
+        compiledArtifactRef: String,   // optional, defaults to 'attestation-vault'
+        idempotencyKey:      String    // optional; dedupes retries
+    )                                returns {
+        jobId:  UUID;
+        status: String;
+    };
+
+    /**
      * Deploy a registered compiled contract. The contract must be registered
      * via `cds.requires.nightgate.contracts.<ref>` or `registerContract()`.
      *
