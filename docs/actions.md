@@ -231,6 +231,22 @@ The payload must already be attested. Submits `commitValue` then `provePredicate
 
 `verified: true` iff `provenTxHash` resolves to a `SUCCESS` result (needs the crawler enabled to index the proof tx).
 
+## Disclosure grants
+
+Surface the AttestationVault tiered-disclosure ACL: who is entitled to which tier of an attestation, on-chain. Both write circuits are attester-gated (a non-attester caller's tx is rejected). `level`: `0` = public, `1` = legitimate-interest, `2` = authority (EU Battery Reg Annex XIII tiers). See [the AttestationVault contract](../contracts/attestation-vault). **Note:** delivering tier-specific *cleartext* stays off-chain (consumer `after READ` redaction) — only entitlement is on-chain.
+
+### `grantDisclosure(payloadHash, grantee, level, sessionId, contractAddress, compiledArtifactRef?, idempotencyKey?) → { jobId, status, disclosureGrantId }`
+
+Grant a disclosure tier to a `grantee` (64-hex `Bytes<32>` id) on an existing attestation, via the `grantDisclosure` circuit. The payload must already be attested by the caller. `disclosureGrantId` is returned synchronously (the `DisclosureGrants` row is inserted up-front, `active=false`); it flips to `active=true` once the post-submit chain reindex confirms the grant in ledger state. Job result: `{ disclosureGrantId, payloadHash, grantee, level, txHash }`. `compiledArtifactRef` defaults to `attestation-vault`. **Rate limit:** 30/hour per session.
+
+### `revokeDisclosure(payloadHash, grantee, sessionId, contractAddress, compiledArtifactRef?, idempotencyKey?) → { jobId, status }`
+
+Revoke a previously-granted disclosure (removes the grantee entry on-chain) via the `revokeDisclosure` circuit. Attester-only. The matching `DisclosureGrants` row's `active` flips to `false`. Job result: `{ payloadHash, grantee, txHash }`. **Rate limit:** 30/hour per session.
+
+### `registerGranteeIdentity(bindingInput, scope?) → { ID, granteeId, bindingKind }`
+
+Bind the authenticated caller (`req.user.id`) to the `Bytes<32>` grantee id the AttestationVault checks, so on-chain grants resolve to this principal at read time. The binding kind is set per-deployment via `cds.requires.nightgate.granteeBinding` (default `wallet`): `wallet` → `bindingInput` is the caller's coin public key (hex); `did` → a DID string; `custom` → the 64-hex grantee id itself. `scope` optionally restricts the binding to one contract/attestation (omit for a global binding). Idempotent on `(userId, scope)`. Requires authentication (401 otherwise). The *proofing* of binding ownership is the consumer's policy.
+
 ## Diagnostics
 
 ### `getWalletBalance(sessionId) → { shieldedNight, unshieldedNight, dustBalance, registeredNightUtxoCount, totalNightUtxoCount }`
@@ -297,7 +313,9 @@ Operator controls. `reindexFromHeight` triggers a rollback to the specified heig
 
 `invalidateSession(sessionId)` / `invalidateAllSessions()` — force-close sessions. Distinct from `disconnectWallet` in that admin can target any session, not just one the caller owns.
 
-`grantRole(userId, role, scope?, validUntil?)` — grant a disclosure tier (`public_only` | `legitimate_interest` | `authority`) read by the `AttestationService` mixin's `attachDisclosureRole` middleware. Caller must already hold `authority`.
+`grantRole(userId, role, scope?, validUntil?)` — grant a disclosure tier (`public_only` | `legitimate_interest` | `authority`) read by the `AttestationService` mixin's `attachDisclosureRole` middleware. Caller must already hold `authority`. This is the **off-chain** tier table (`DisclosureRoles`).
+
+> **On-chain alternative.** `attachDisclosureRole(req, db, { contractAddress, payloadHash? })` resolves the tier from the **on-chain** `DisclosureGrants` ACL instead: it maps the caller (via `GranteeIdentities` → `registerGranteeIdentity`) to a `Bytes<32>` grantee and matches active grants for that contract. With a `contractAddress` the on-chain result is authoritative (no off-chain fallback); without one, the off-chain `grantRole` table applies. The gate is a programmatic middleware — the consumer wires it into the reads it wants to gate.
 
 ## Standard OData over entities
 

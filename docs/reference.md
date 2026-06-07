@@ -86,6 +86,7 @@ Sufficient for read-side. Defaults to `preprod`, `wss://rpc.preprod.midnight.net
 | `crawler.requestTimeout` | `30000` | RPC timeout (ms) |
 | `palletMap` | `(built-in)` | Optional override of the Substrate pallet-index → tx-type classification map used by the `BlockProcessor` (`{ "<index>": { name, txType, isShielded?, isSystem? } }`) |
 | `allowMainnetSubmission` | `false` | Gate for mainnet submission. Stays off until [forum thread 1190](https://forum.midnight.network) (`1016 Immediately Dropped`) is resolved |
+| `granteeBinding` | `wallet` | How an authenticated principal maps to the AttestationVault `Bytes<32>` grantee id for on-chain disclosure grants: `wallet` (coin pubkey hash) / `did` (DID string) / `custom` (opaque 64-hex). Used by `registerGranteeIdentity` + the disclosure read gate |
 
 ### Environment variables
 
@@ -105,6 +106,7 @@ Sufficient for read-side. Defaults to `preprod`, `wss://rpc.preprod.midnight.net
 | `NIGHTGATE_PROOF_NETWORK` | Network passed to the proof-server container; defaults to `preprod` |
 | `NIGHTGATE_ZK_CONFIG_BASE` | Override `zkConfigBasePath` |
 | `NIGHTGATE_PRIVATE_STATE_BACKEND` | Override `privateStateBackend` |
+| `NIGHTGATE_GRANTEE_BINDING` | Override `granteeBinding` (`wallet` / `did` / `custom`) |
 | `NIGHTGATE_PREWARM_SYNC_TIMEOUT_MS` | Upper bound for the `connectWalletForSigning` prewarm sync-to-tip wait; default `10800000` (3 h). Raise for slow cold syncs. |
 | `NIGHTGATE_BALANCE_SYNC_TIMEOUT_MS` | Wallet balance sync-to-tip timeout in the worker's `balanceTx` pre-sync; default `180000` (180 s). A stalled sync fails cleanly instead of hanging. |
 | `NIGHTGATE_DEBUG_WALLET_SYNC` | Set `true` to emit per-save wallet-sync timing logs; off by default to keep a consumer's stdout quiet |
@@ -254,7 +256,9 @@ For per-action signatures and curl examples, see [actions.md](actions.md).
 | `BackgroundJobs` | Async-job tracking for long-running actions (deploy, anchor, dust-reg, …). Poll via `getJobStatus(jobId, sessionId)`. |
 | `Attestations` | On-chain attestation index (payload-hash anchor, attester, public metadata, `disclosureLevel`). Backs the `AttestationService` mixin's tiered projections. |
 | `Documents` | Document anchor records. NIGHTGATE stores only the `sha256` commitment + a caller-supplied `storageRef` (`s3://…` \| `ipfs://…` \| `file:///…`) — **it never holds the document bytes**; the consumer owns storage. `anchorDocument` commits the hash on-chain via the `attest` circuit and records `anchoredTxHash`; `verifyDocument` re-checks the hash against the anchored, indexed, `SUCCESS` tx. |
-| `DisclosureRoles` | Per-user disclosure-tier grants (`userId`, `role`, optional `scope`, `validFrom`/`validUntil`). Resolved per-request by `attachDisclosureRole`; granted via the authority-gated admin `grantRole`. |
+| `DisclosureRoles` | Per-user disclosure-tier grants (`userId`, `role`, optional `scope`, `validFrom`/`validUntil`). Off-chain, operator-configured; resolved per-request by `attachDisclosureRole`; granted via the authority-gated admin `grantRole`. |
+| `DisclosureGrants` | **Chain-derived** disclosure ACL, read off the AttestationVault `disclosures` ledger Map (`payloadHash`, `grantee`, `level`, `contractAddress`, `grantedTxHash`/`revokedTxHash`, `active`). Written by `grantDisclosure`/`revokeDisclosure` and reconciled to on-chain state by the post-submit reindexer. Distinct from the off-chain `DisclosureRoles` — this is the tamper-evident, attester-controlled source of truth. |
+| `GranteeIdentities` | Binds `userId` → the `Bytes<32>` `granteeId` the AttestationVault checks (`bindingKind`, optional `scope`). Populated by `registerGranteeIdentity`; read by the disclosure gate to match a caller against on-chain grants. |
 
 New enums in `db/types.cds`:
 
@@ -280,6 +284,7 @@ New enums in `db/types.cds`:
 | Worker-thread architecture | ✅ Wallet SDK isolated from main thread (Phase 1+2a+2b) |
 | Compact contracts | ✅ `counter` + `attestation-vault` registered with compiled artifacts shipped (0.3.0) |
 | Live preprod end-to-end (T15) | ✅ Counter deployed live on preprod via the full stack (0.3.0) |
+| On-chain disclosure grants | ✅ `grantDisclosure`/`revokeDisclosure` + chain-indexed `DisclosureGrants` + `granteeBinding` + on-chain read gate (0.3.4). Live-validated through grant → index → read-back; live revoke pending a healthy preprod indexer |
 | Mainnet submission | ❌ Gated by `allowMainnetSubmission: false` until forum 1190 resolves |
 | Built-in authorization | ✅ `@requires` annotations; consumer app provides auth strategy |
 
