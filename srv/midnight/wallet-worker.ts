@@ -50,7 +50,7 @@ export interface RpcRequest {
 
 export interface RpcErrorPayload { name: string; message: string }
 
-export interface RpcOk  { ok: true;  result: unknown }
+export interface RpcOk { ok: true; result: unknown }
 export interface RpcErr { ok: false; error: RpcErrorPayload }
 
 export interface InitArgs {
@@ -146,13 +146,13 @@ async function loadSdk(): Promise<{
         cachedFacadeSdk = { facade, networkId };
     }
     return {
-        ledger:        cachedLedger,
-        shielded:      cachedWallet.shielded,
-        unshielded:    cachedWallet.unshielded,
-        dust:          cachedWallet.dust,
-        abstractions:  cachedWallet.abstractions,
-        facade:        cachedFacadeSdk.facade,
-        networkId:     cachedFacadeSdk.networkId
+        ledger: cachedLedger,
+        shielded: cachedWallet.shielded,
+        unshielded: cachedWallet.unshielded,
+        dust: cachedWallet.dust,
+        abstractions: cachedWallet.abstractions,
+        facade: cachedFacadeSdk.facade,
+        networkId: cachedFacadeSdk.networkId
     };
 }
 
@@ -170,9 +170,9 @@ async function ensureNetworkId(networkId: string, sdk: any): Promise<void> {
  */
 async function loadContractsSdk(): Promise<{
     contracts: any;
-    indexer:   any;
-    proof:     any;
-    zk:        any;
+    indexer: any;
+    proof: any;
+    zk: any;
     compactJs: any;
 }> {
     if (cachedContractsSdk) return cachedContractsSdk;
@@ -190,9 +190,9 @@ async function loadContractsSdk(): Promise<{
 // ---- Compiled-contract cache (Phase 2b) -----------------------------------
 
 interface ContractRegistration {
-    artifactPath:   string;
+    artifactPath: string;
     privateStateId: string;
-    zkConfigPath:   string;
+    zkConfigPath: string;
 }
 
 // Cache of the heavy bits of contract compilation: imported module + ctor.
@@ -260,9 +260,9 @@ async function getOrCompileContract(
 
 async function buildWorkerContractProviders(args: {
     indexerHttpUrl: string;
-    indexerWsUrl:   string;
+    indexerWsUrl: string;
     proofServerUrl: string;
-    zkConfigPath:   string;
+    zkConfigPath: string;
 }): Promise<{ publicDataProvider: any; zkConfigProvider: any; proofProvider: any }> {
     // `ws` is CJS — Node 22 worker_threads can `require` it freely.
     // eslint-disable-next-line @typescript-eslint/no-var-requires
@@ -354,12 +354,14 @@ async function waitForGenuineSync(facade: any, indexerHttpUrl: string, timeoutMs
     while (Date.now() < deadline) {
         const target = await getIndexerTipHeight(indexerHttpUrl);
         let state: any;
+        let snapshotTimer: ReturnType<typeof setTimeout> | undefined;
         try {
             state = await Promise.race([
                 facade.waitForSyncedState(),
-                new Promise((_, rej) => setTimeout(() => rej(new Error('snapshot timeout')), 30_000))
+                new Promise((_, rej) => { snapshotTimer = setTimeout(() => rej(new Error('snapshot timeout')), 30_000); })
             ]);
         } catch { await wsleep(SYNC_POLL_MS); continue; }
+        finally { if (snapshotTimer) clearTimeout(snapshotTimer); }
         const p: any = state?.dust?.progress;
         const applied = p?.appliedIndex != null ? BigInt(p.appliedIndex) : -1n;
         const connected = p?.isConnected === true;
@@ -382,7 +384,7 @@ async function waitForGenuineSync(facade: any, indexerHttpUrl: string, timeoutMs
 
 function buildWorkerWalletProvider(entry: FacadeEntry): any {
     return {
-        getCoinPublicKey(): string       { return entry.zswapKeys.coinPublicKey; },
+        getCoinPublicKey(): string { return entry.zswapKeys.coinPublicKey; },
         getEncryptionPublicKey(): string { return entry.zswapKeys.encryptionPublicKey; },
         async balanceTx(tx: any, ttl?: Date): Promise<any> {
             // Robustness: block until the wallet is synced to the chain tip
@@ -565,7 +567,7 @@ async function encodeAddressString(addr: any, networkId: string): Promise<string
  * can build the matching `CombinedTokenTransfer` wrapper.
  */
 type ReceiverParsed =
-    | { kind: 'shielded';   addr: AddressFormat.ShieldedAddress }
+    | { kind: 'shielded'; addr: AddressFormat.ShieldedAddress }
     | { kind: 'unshielded'; addr: AddressFormat.UnshieldedAddress };
 
 async function parseReceiverAddress(addr: string, networkId: string): Promise<ReceiverParsed> {
@@ -594,7 +596,7 @@ async function buildFacade(args: InitArgs): Promise<FacadeEntry> {
     const bip39Seed = new Uint8Array(Buffer.from(args.seedHex, 'hex'));
     const roleSeeds = await deriveRoleSeeds(bip39Seed);
     const zswapKeys = sdk.ledger.ZswapSecretKeys.fromSeed(roleSeeds.zswap);
-    const dustKey   = sdk.ledger.DustSecretKey.fromSeed(roleSeeds.dust);
+    const dustKey = sdk.ledger.DustSecretKey.fromSeed(roleSeeds.dust);
 
     const txHistoryStorage = new sdk.abstractions.InMemoryTransactionHistoryStorage(
         sdk.facade.WalletEntrySchema,
@@ -606,24 +608,24 @@ async function buildFacade(args: InitArgs): Promise<FacadeEntry> {
     const configuration = {
         networkId: args.networkId,
         provingServerUrl: new URL(args.proofServerUrl),
-        relayURL:         new URL(args.relayUrl),
+        relayURL: new URL(args.relayUrl),
         indexerClientConnection: {
             indexerHttpUrl: args.indexerHttpUrl,
-            indexerWsUrl:   args.indexerWsUrl
+            indexerWsUrl: args.indexerWsUrl
         },
         txHistoryStorage,
         costParameters: { additionalFeeOverhead: 0n, feeBlocksMargin: 1 }
     };
 
     const dustParameters = sdk.ledger.LedgerParameters.initialParameters().dust;
-    const ShieldedWallet   = sdk.shielded.ShieldedWallet;
+    const ShieldedWallet = sdk.shielded.ShieldedWallet;
     const UnshieldedWallet = sdk.unshielded.UnshieldedWallet;
-    const DustWallet       = sdk.dust.DustWallet;
+    const DustWallet = sdk.dust.DustWallet;
     const restore = args.restoreBlobs;
 
     const facade = await sdk.facade.WalletFacade.init({
         configuration,
-        shielded:   () => restore?.shielded
+        shielded: () => restore?.shielded
             ? ShieldedWallet(configuration).restore(restore.shielded)
             : ShieldedWallet(configuration).startWithSecretKeys(zswapKeys),
         unshielded: () => restore?.unshielded
@@ -674,9 +676,9 @@ function startPeriodicSave(sessionId: string, entry: FacadeEntry): void {
             const blobs = await collectSerializedStates(entry.facade);
             const collectMs = Date.now() - collectStart;
             const shape = [
-                `sh=${blobs.shielded   ? blobs.shielded.length   : '-'}`,
+                `sh=${blobs.shielded ? blobs.shielded.length : '-'}`,
                 `un=${blobs.unshielded ? blobs.unshielded.length : '-'}`,
-                `du=${blobs.dust       ? blobs.dust.length       : '-'}`
+                `du=${blobs.dust ? blobs.dust.length : '-'}`
             ].join(' ');
             log('info', `[worker] save-tick #${tickCount} collect returned in ${collectMs}ms: ${shape}`);
 
@@ -684,9 +686,9 @@ function startPeriodicSave(sessionId: string, entry: FacadeEntry): void {
             // Skip push if nothing changed since last tick — avoids burning
             // CAP write cycles when wallet is fully synced and idle.
             if (
-                blobs.shielded   === lastBlobs.shielded   &&
+                blobs.shielded === lastBlobs.shielded &&
                 blobs.unshielded === lastBlobs.unshielded &&
-                blobs.dust       === lastBlobs.dust
+                blobs.dust === lastBlobs.dust
             ) {
                 log('info', `[worker] save-tick #${tickCount} unchanged, skipping push`);
                 return;
@@ -982,7 +984,7 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
         const ttl = ttlIso ? new Date(ttlIso) : new Date(Date.now() + 10 * 60 * 1000);
 
         const outputs: any[] = receiver.kind === 'shielded'
-            ? [{ type: 'shielded',   outputs: [{ type: nightRawType, receiverAddress: receiver.addr, amount: amountBig }] }]
+            ? [{ type: 'shielded', outputs: [{ type: nightRawType, receiverAddress: receiver.addr, amount: amountBig }] }]
             : [{ type: 'unshielded', outputs: [{ type: nightRawType, receiverAddress: receiver.addr, amount: amountBig }] }];
 
         log('info', `[worker] transfer: ${amount} NIGHT to ${receiver.kind} addr ${receiverAddress.slice(0, 24)}...`);
@@ -998,9 +1000,9 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
         log('info', `[worker] transfer: submitted, txId=${String(txId).slice(0, 16)}...`);
 
         return {
-            txId:            String(txId),
-            toLedger:        receiver.kind,
-            amount:          amount,
+            txId: String(txId),
+            toLedger: receiver.kind,
+            amount: amount,
             receiverAddress: receiverAddress
         };
     },
@@ -1065,9 +1067,9 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
         log('info', `[worker] unshield: submitted, txId=${String(txId).slice(0, 16)}...`);
 
         return {
-            txId:                       String(txId),
-            amount:                     amount,
-            unshieldedReceiverAddress:  ownUnshieldedAddrStr
+            txId: String(txId),
+            amount: amount,
+            unshieldedReceiverAddress: ownUnshieldedAddrStr
         };
     },
 
@@ -1125,9 +1127,9 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
         log('info', `[worker] shield: submitted, txId=${String(txId).slice(0, 16)}...`);
 
         return {
-            txId:                     String(txId),
-            amount:                   amount,
-            shieldedReceiverAddress:  ownShieldedAddrStr
+            txId: String(txId),
+            amount: amount,
+            shieldedReceiverAddress: ownShieldedAddrStr
         };
     },
 
@@ -1163,7 +1165,7 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
         const unshieldedBalances: Record<string, bigint> = synced?.unshielded?.balances ?? {};
         const totalNightCoins: any[] = synced?.unshielded?.totalCoins ?? [];
 
-        const shieldedNight   = shieldedBalances[nightRawType]   ?? 0n;
+        const shieldedNight = shieldedBalances[nightRawType] ?? 0n;
         const unshieldedNight = unshieldedBalances[nightRawType] ?? 0n;
         // dust.balance(time) is synchronous and returns Balance (= bigint). It
         // lives on the DustWalletState carried by the synced FacadeState — NOT
@@ -1179,11 +1181,11 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
         ).length;
 
         return {
-            shieldedNight:           shieldedNight.toString(),
-            unshieldedNight:         unshieldedNight.toString(),
-            dustBalance:             dustBalance.toString(),
+            shieldedNight: shieldedNight.toString(),
+            unshieldedNight: unshieldedNight.toString(),
+            dustBalance: dustBalance.toString(),
             registeredNightUtxoCount: registeredCount,
-            totalNightUtxoCount:      totalNightCoins.length
+            totalNightUtxoCount: totalNightCoins.length
         };
     },
 
@@ -1221,7 +1223,7 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
         const ttl = ttlIso ? new Date(ttlIso) : new Date(Date.now() + 10 * 60 * 1000);
 
         const outputs: any[] = receiver.kind === 'shielded'
-            ? [{ type: 'shielded',   outputs: [{ type: nightRawType, receiverAddress: receiver.addr, amount: amountBig }] }]
+            ? [{ type: 'shielded', outputs: [{ type: nightRawType, receiverAddress: receiver.addr, amount: amountBig }] }]
             : [{ type: 'unshielded', outputs: [{ type: nightRawType, receiverAddress: receiver.addr, amount: amountBig }] }];
 
         const recipe = await entry.facade.transferTransaction(
@@ -1272,11 +1274,11 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
 
         if (direction === 'shield') {
             const ownShieldedAddr: AddressFormat.ShieldedAddress = await entry.facade.shielded.getAddress();
-            desiredInputs  = { unshielded: { [nightRawType]: amountBig } };
+            desiredInputs = { unshielded: { [nightRawType]: amountBig } };
             desiredOutputs = [{ type: 'shielded', outputs: [{ type: nightRawType, receiverAddress: ownShieldedAddr, amount: amountBig }] }];
         } else {
             const ownUnshieldedAddr: AddressFormat.UnshieldedAddress = await entry.facade.unshielded.getAddress();
-            desiredInputs  = { shielded: { [nightRawType]: amountBig } };
+            desiredInputs = { shielded: { [nightRawType]: amountBig } };
             desiredOutputs = [{ type: 'unshielded', outputs: [{ type: nightRawType, receiverAddress: ownUnshieldedAddr, amount: amountBig }] }];
         }
 
@@ -1305,11 +1307,11 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
         networkId, initialPrivateState
     }: {
         sessionId: string;
-        proxyId:   string;
+        proxyId: string;
         contractName: string;
         registration: ContractRegistration;
         indexerHttpUrl: string;
-        indexerWsUrl:   string;
+        indexerWsUrl: string;
         proofServerUrl: string;
         networkId: string;
         initialPrivateState: unknown;
@@ -1343,9 +1345,9 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
         });
         const pub = result?.deployTxData?.public;
         const out = {
-            txHash:          String(pub?.txHash ?? ''),
+            txHash: String(pub?.txHash ?? ''),
             contractAddress: String(pub?.contractAddress ?? ''),
-            onChainStatus:   String(pub?.status ?? '')
+            onChainStatus: String(pub?.status ?? '')
         };
         log('info', `[worker] deployContract: done addr=${out.contractAddress.slice(0, 16)} status=${out.onChainStatus}`);
         return out;
@@ -1363,14 +1365,14 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
         networkId, witnessValues
     }: {
         sessionId: string;
-        proxyId:   string;
+        proxyId: string;
         contractName: string;
         registration: ContractRegistration;
         contractAddress: string;
         circuit: string;
         args: unknown[];
         indexerHttpUrl: string;
-        indexerWsUrl:   string;
+        indexerWsUrl: string;
         proofServerUrl: string;
         networkId: string;
         witnessValues?: { attestedValue: string; valueSalt: string };
@@ -1409,7 +1411,7 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
         const result = await fn(...(callArgs ?? []));
         const pub = result?.public;
         const out = {
-            txHash:        String(pub?.txHash ?? ''),
+            txHash: String(pub?.txHash ?? ''),
             onChainStatus: String(pub?.status ?? '')
         };
         log('info', `[worker] submitContractCall: done txHash=${out.txHash.slice(0, 16)} status=${out.onChainStatus}`);
@@ -1436,7 +1438,7 @@ parentPort.on('message', async (msg: any) => {
         port.postMessage({ ok: true, result } as RpcOk);
     } catch (err: any) {
         const payload: RpcErrorPayload = {
-            name:    err?.name ?? 'Error',
+            name: err?.name ?? 'Error',
             message: formatErr(err)
         };
         port.postMessage({ ok: false, error: payload } as RpcErr);

@@ -1,0 +1,70 @@
+# NIGHTGATE dependency stack for a Contabo (EU) server.
+#
+# Purpose: run the Midnight indexer locally so it catches up to the preprod tip
+# fast (low latency to the AWS-Dublin public RPC + native NVMe disk + 24/7),
+# then NIGHTGATE's wallet syncs from THIS local indexer instead of the slow
+# public one. Plus the proof server for contract submissions (the revoke).
+#
+# This is just the dockerized deps. NIGHTGATE itself runs as a Node process
+# (see README.md). The indexer is the thing that needs to catch up.
+#
+#   docker compose up -d            # indexer + proof-server
+#   docker compose logs -f indexer  # watch catch-up
+#
+# Sized for a server with >= 8 vCPU / 16 GB. Drop the limits if smaller.
+
+services:
+  indexer:
+    image: midnightntwrk/indexer-standalone:4.3.2
+    container_name: nightgate-indexer
+    ports:
+      - "8088:8088"
+    environment:
+      APP__APPLICATION__NETWORK_ID: "${NIGHTGATE_NETWORK:-preprod}"
+      # Public preprod RPC (AWS Dublin). The whole point of running on an EU
+      # server is the low latency to THIS endpoint (~25-40ms vs ~110ms from a
+      # residential line) — the indexer fetches blocks serially, so latency is
+      # the catch-up speed limit.
+      APP__INFRA__NODE__URL: "${INDEXER_UPSTREAM_NODE_URL:-wss://rpc.preprod.midnight.network/}"
+      APP__INFRA__SPO_NODE__URL: "${INDEXER_UPSTREAM_NODE_URL:-wss://rpc.preprod.midnight.network/}"
+      # 32-byte hex secret; MUST contain at least one a-f char. Set a real one
+      # via INDEXER_SECRET in .env for anything non-throwaway.
+      APP__INFRA__SECRET: "${INDEXER_SECRET:-deadbeefcafebabedeadbeefcafebabedeadbeefcafebabedeadbeefcafebabe}"
+      APP__INFRA__SPO_NODE__BLOCKFROST_ID: "dummy-not-using-spo"
+      # Catch-up tuning (marginal on the public RPC, but harmless).
+      APP__APPLICATION__CONCURRENCY_LIMIT: "16"
+      APP__APPLICATION__BLOCKS_BUFFER: "100"
+      APP__APPLICATION__TRANSACTION_BATCH_SIZE: "200"
+      RUST_LOG: "indexer_standalone=info,chain_indexer=info,indexer_api=info,wallet_indexer=info,indexer_common=info,info"
+    volumes:
+      - indexer-data:/data
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+    deploy:
+      resources:
+        limits:
+          cpus: "8.0"
+          memory: 8G
+
+  proof-server:
+    image: midnightntwrk/proof-server:8.0.3
+    container_name: nightgate-proof-server
+    command: ["midnight-proof-server", "--network", "${NIGHTGATE_PROOF_NETWORK:-preprod}"]
+    ports:
+      - "6300:6300"
+    volumes:
+      - proof-server-data:/data
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+volumes:
+  indexer-data:
+  proof-server-data:

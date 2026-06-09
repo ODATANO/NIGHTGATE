@@ -87,6 +87,7 @@ Sufficient for read-side. Defaults to `preprod`, `wss://rpc.preprod.midnight.net
 | `palletMap` | `(built-in)` | Optional override of the Substrate pallet-index → tx-type classification map used by the `BlockProcessor` (`{ "<index>": { name, txType, isShielded?, isSystem? } }`) |
 | `allowMainnetSubmission` | `false` | Gate for mainnet submission. Stays off until [forum thread 1190](https://forum.midnight.network) (`1016 Immediately Dropped`) is resolved |
 | `granteeBinding` | `wallet` | How an authenticated principal maps to the AttestationVault `Bytes<32>` grantee id for on-chain disclosure grants: `wallet` (coin pubkey hash) / `did` (DID string) / `custom` (opaque 64-hex). Used by `registerGranteeIdentity` + the disclosure read gate |
+| `allowSelfServiceGranteeRegistration` | `true` | Whether authenticated callers may register their own grantee identity via `registerGranteeIdentity`. **NIGHTGATE does not verify that the caller owns the binding input it registers** (no wallet-signature / DID-control proof), so under `wallet`/`did` binding an authenticated user could squat another party's grantee id. Set `false` on deployments where identities must come from an operator proofing flow that writes `GranteeIdentities` directly; the action then returns `403`. |
 
 ### Environment variables
 
@@ -107,6 +108,7 @@ Sufficient for read-side. Defaults to `preprod`, `wss://rpc.preprod.midnight.net
 | `NIGHTGATE_ZK_CONFIG_BASE` | Override `zkConfigBasePath` |
 | `NIGHTGATE_PRIVATE_STATE_BACKEND` | Override `privateStateBackend` |
 | `NIGHTGATE_GRANTEE_BINDING` | Override `granteeBinding` (`wallet` / `did` / `custom`) |
+| `NIGHTGATE_ALLOW_SELF_SERVICE_GRANTEE_REGISTRATION` | Override `allowSelfServiceGranteeRegistration` (`false` / `0` / `no` / `off` disables) |
 | `NIGHTGATE_PREWARM_SYNC_TIMEOUT_MS` | Upper bound for the `connectWalletForSigning` prewarm sync-to-tip wait; default `10800000` (3 h). Raise for slow cold syncs. |
 | `NIGHTGATE_BALANCE_SYNC_TIMEOUT_MS` | Wallet balance sync-to-tip timeout in the worker's `balanceTx` pre-sync; default `180000` (180 s). A stalled sync fails cleanly instead of hanging. |
 | `NIGHTGATE_DEBUG_WALLET_SYNC` | Set `true` to emit per-save wallet-sync timing logs; off by default to keep a consumer's stdout quiet |

@@ -15,6 +15,7 @@ import {
     getConfiguredNightgateCrawlerNodeUrl,
     getConfiguredPrivateStateBackend,
     isNightgatePluginConfigured,
+    isSelfServiceGranteeRegistrationAllowed,
     normalizeNightgateNetwork,
     resolveNightgateRuntimeConfig
 } from '../../srv/utils/nightgate-config';
@@ -26,7 +27,8 @@ const ENV_KEYS = [
     'NIGHTGATE_PRIVATE_STATE_BACKEND',
     'NIGHTGATE_FETCH_CONCURRENCY',
     'NIGHTGATE_RPC_BATCH_SIZE',
-    'NIGHTGATE_CRAWLER_ENABLED'
+    'NIGHTGATE_CRAWLER_ENABLED',
+    'NIGHTGATE_ALLOW_SELF_SERVICE_GRANTEE_REGISTRATION'
 ] as const;
 const originalEnv = Object.fromEntries(
     ENV_KEYS.map((k) => [k, process.env[k]])
@@ -125,6 +127,26 @@ describe('getConfiguredPrivateStateBackend', () => {
     it('rejects unknown values and returns the default', () => {
         process.env.NIGHTGATE_PRIVATE_STATE_BACKEND = 'sqlite-of-the-damned';
         expect(getConfiguredPrivateStateBackend()).toBe(DEFAULT_PRIVATE_STATE_BACKEND);
+    });
+});
+
+describe('isSelfServiceGranteeRegistrationAllowed', () => {
+    it('defaults to allowed (shipped 0.3.4 behavior)', () => {
+        expect(isSelfServiceGranteeRegistrationAllowed()).toBe(true);
+        expect(isSelfServiceGranteeRegistrationAllowed({})).toBe(true);
+    });
+
+    it('config false disables it', () => {
+        expect(isSelfServiceGranteeRegistrationAllowed({ allowSelfServiceGranteeRegistration: false })).toBe(false);
+    });
+
+    it('env var overrides config (falsy spellings disable)', () => {
+        for (const v of ['false', '0', 'no', 'off', 'FALSE']) {
+            process.env.NIGHTGATE_ALLOW_SELF_SERVICE_GRANTEE_REGISTRATION = v;
+            expect(isSelfServiceGranteeRegistrationAllowed({ allowSelfServiceGranteeRegistration: true })).toBe(false);
+        }
+        process.env.NIGHTGATE_ALLOW_SELF_SERVICE_GRANTEE_REGISTRATION = 'true';
+        expect(isSelfServiceGranteeRegistrationAllowed({ allowSelfServiceGranteeRegistration: false })).toBe(true);
     });
 });
 

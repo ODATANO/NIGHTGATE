@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.3.6 - 2026-06-09
+
+### Disclosure-grants hardening and cleanup
+
+- **No more orphan optimistic rows**: `grantDisclosure` now reuses an existing `DisclosureGrants` row for the same `(contractAddress, payloadHash, grantee)` (re-affirming `level` and clearing a stale `revokedTxHash`) instead of inserting a duplicate on every retry/re-grant.
+- **Sweep grace window**: the post-submit reindexer no longer deactivates active rows modified within the last 10 minutes (`sweepGraceMs`, injectable). Protects just-submitted grants from being swept when the queried node/indexer view lags the chain; explicit revokes are unaffected (the revoke handler flips its own row directly).
+- **Self-service grantee registration is now gateable**: new `cds.requires.nightgate.allowSelfServiceGranteeRegistration` config (env: `NIGHTGATE_ALLOW_SELF_SERVICE_GRANTEE_REGISTRATION`). Default `true` (shipped 0.3.4 behavior). Set `false` on deployments where identities must come from an operator proofing flow — NIGHTGATE does not verify that a caller *owns* the binding input it registers, so open self-registration allows squatting a grantee id under `wallet`/`did` binding.
+- **`contractAddress` normalized to lowercase** at every write/read boundary (grant/revoke handlers, reindexer, on-chain role gate), so mixed-case caller input can no longer split one logical grant across case-variant rows or miss the lookup.
+- **Cleanups**: removed a dead `try/catch` around `Number(level)`; the wallet-worker sync snapshot timeout timer is now cleared (no stray 30 s timers per poll iteration).
+
 ## 0.3.5 - 2026-06-09
 
 ### Wallet sync robustness 

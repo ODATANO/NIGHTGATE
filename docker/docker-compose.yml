@@ -100,8 +100,9 @@ services:
     deploy:
       resources:
         limits:
-          # Bumped 2->8 CPU / 4->8G to speed up the catch-up sync; the SQLite
-          # layer was disk/cache-bound (multi-second slow-query warnings) at 4G.
+          # 8 CPU / 8G. NOTE: the catch-up bottleneck is NOT cpu/mem/disk; it is
+          # serial latency-bound block fetching from the remote RPC (~132ms RTT,
+          # several calls/block → ~0.5-1 blk/s). These limits don't change that.
           cpus: "8.0"
           memory: 8G
         reservations:

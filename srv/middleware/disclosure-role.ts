@@ -145,8 +145,13 @@ async function resolveOnChainRole(
     if (!granteeId) return DEFAULT_DISCLOSURE_ROLE;
 
     const { SELECT } = cds.ql;
-    const where: Record<string, unknown> = { contractAddress, grantee: granteeId, active: true };
-    if (payloadHash) where.payloadHash = payloadHash;
+    // Grants are stored lowercase (handlers + indexer normalize on write).
+    const where: Record<string, unknown> = {
+        contractAddress: contractAddress.toLowerCase(),
+        grantee: granteeId,
+        active: true
+    };
+    if (payloadHash) where.payloadHash = payloadHash.toLowerCase();
 
     const grants: Array<{ level: number }> =
         (await db.run(SELECT.from(DisclosureGrants).where(where)) as Array<{ level: number }>) || [];

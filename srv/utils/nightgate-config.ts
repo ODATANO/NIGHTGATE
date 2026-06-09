@@ -51,6 +51,16 @@ export interface NightgatePluginConfig {
      * srv/submission/grantee-identity.ts.
      */
     granteeBinding?: GranteeBinding;
+    /**
+     * Whether `registerGranteeIdentity` may be called by any authenticated
+     * principal to bind their own granteeId (default true, the original
+     * behavior). NIGHTGATE does NOT verify ownership of the binding input
+     * (wallet pubkey / DID) — a caller could register someone else's key and
+     * inherit their on-chain grants. Deployments that gate reads on on-chain
+     * grants should set this to false and register identities through their
+     * own proofing flow (direct writes to `GranteeIdentities`).
+     */
+    allowSelfServiceGranteeRegistration?: boolean;
     // CAP permits additional plugin-specific keys we don't model here.
     [k: string]: unknown;
 }
@@ -76,20 +86,20 @@ export const DEFAULT_NODE_URL = 'wss://rpc.preprod.midnight.network/';
 export const DEFAULT_INDEXER_URLS: Record<NightgateNetwork, { http: string; ws: string }> = {
     preprod: {
         http: 'https://indexer.preprod.midnight.network/api/v4/graphql',
-        ws:   'wss://indexer.preprod.midnight.network/api/v4/graphql/ws'
+        ws: 'wss://indexer.preprod.midnight.network/api/v4/graphql/ws'
     },
     testnet: {
         http: 'http://localhost:8088/api/v4/graphql',
-        ws:   'ws://localhost:8088/api/v4/graphql/ws'
+        ws: 'ws://localhost:8088/api/v4/graphql/ws'
     },
     mainnet: {
         http: 'https://indexer.midnight.network/api/v4/graphql',
-        ws:   'wss://indexer.midnight.network/api/v4/graphql/ws'
+        ws: 'wss://indexer.midnight.network/api/v4/graphql/ws'
     }
 };
 
-export const DEFAULT_PROOF_SERVER_URL  = 'http://localhost:6300';
-export const DEFAULT_ZK_CONFIG_BASE    = './contracts';
+export const DEFAULT_PROOF_SERVER_URL = 'http://localhost:6300';
+export const DEFAULT_ZK_CONFIG_BASE = './contracts';
 
 export const VALID_PRIVATE_STATE_BACKENDS = ['cap-db', 'level'] as const;
 export type PrivateStateBackend = (typeof VALID_PRIVATE_STATE_BACKENDS)[number];
@@ -113,6 +123,12 @@ export function getConfiguredGranteeBinding(config?: Record<string, any>): Grant
         return raw as GranteeBinding;
     }
     return DEFAULT_GRANTEE_BINDING;
+}
+
+export function isSelfServiceGranteeRegistrationAllowed(config?: Record<string, any>): boolean {
+    const raw = readEnv('NIGHTGATE_ALLOW_SELF_SERVICE_GRANTEE_REGISTRATION');
+    if (raw != null) return !/^(false|0|no|off)$/i.test(raw);
+    return config?.allowSelfServiceGranteeRegistration !== false;
 }
 
 function readEnv(key: string): string | undefined {
@@ -183,7 +199,7 @@ export function resolveSubmissionEndpoints(
     const defaults = DEFAULT_INDEXER_URLS[network];
     return {
         indexerHttpUrl: readEnv('NIGHTGATE_INDEXER_HTTP_URL') || config?.indexerHttpUrl || defaults.http,
-        indexerWsUrl:   readEnv('NIGHTGATE_INDEXER_WS_URL')   || config?.indexerWsUrl   || defaults.ws,
+        indexerWsUrl: readEnv('NIGHTGATE_INDEXER_WS_URL') || config?.indexerWsUrl || defaults.ws,
         proofServerUrl: readEnv('NIGHTGATE_PROOF_SERVER_URL') || config?.proofServerUrl || DEFAULT_PROOF_SERVER_URL,
         zkConfigBasePath: readEnv('NIGHTGATE_ZK_CONFIG_BASE') || config?.zkConfigBasePath || DEFAULT_ZK_CONFIG_BASE
     };

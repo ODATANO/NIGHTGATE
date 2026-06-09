@@ -87,8 +87,8 @@ const VALID_CALL_ARGS = {
 const RESOLVED_CONTRACT_FIXTURE = {
     compiledContract: {},
     privateStateId: 'demo',
-    zkConfigPath:   '/tmp/managed',
-    artifactPath:   '/tmp/managed/contract/index.js'
+    zkConfigPath: '/tmp/managed',
+    artifactPath: '/tmp/managed/contract/index.js'
 };
 
 function makeSuccessfulSubmitter() {
@@ -183,7 +183,7 @@ describe('error translation to OData status codes', () => {
         const result = await srv.handlers['deployContract'](req);
         expect(req.reject).not.toHaveBeenCalled();
         expect(result).toEqual({
-            jobId:  'job-deployContract-test',
+            jobId: 'job-deployContract-test',
             status: 'pending'
         });
         // The mock startJob invokes work() immediately, so submitter.deploy
@@ -199,7 +199,7 @@ describe('error translation to OData status codes', () => {
         const result = await srv.handlers['submitContractCall'](req);
         expect(req.reject).not.toHaveBeenCalled();
         expect(result).toEqual({
-            jobId:  'job-submitContractCall-test',
+            jobId: 'job-submitContractCall-test',
             status: 'pending'
         });
         expect(submitter.call).toHaveBeenCalledTimes(1);
@@ -214,9 +214,9 @@ describe('error translation to OData status codes', () => {
         expect((submitter.deploy as jest.Mock).mock.calls[0][0]).toMatchObject({
             contractName: 'attestation-vault',
             registration: {
-                artifactPath:   RESOLVED_CONTRACT_FIXTURE.artifactPath,
+                artifactPath: RESOLVED_CONTRACT_FIXTURE.artifactPath,
                 privateStateId: RESOLVED_CONTRACT_FIXTURE.privateStateId,
-                zkConfigPath:   RESOLVED_CONTRACT_FIXTURE.zkConfigPath
+                zkConfigPath: RESOLVED_CONTRACT_FIXTURE.zkConfigPath
             },
             initialPrivateState: { counter: 0 },
             sessionId: 'session-meta'
@@ -263,7 +263,7 @@ describe('error translation to OData status codes', () => {
         const srv = setupHandlers({
             submitterFactory: () => ({
                 deploy: jest.fn(async () => { throw subErr; }),
-                call:   jest.fn(async () => { throw subErr; })
+                call: jest.fn(async () => { throw subErr; })
             }) as unknown as TransactionSubmitter
         });
         const req = makeReq({ ...VALID_DEPLOY_ARGS, sessionId: 'session-async-err' });
@@ -320,12 +320,12 @@ describe('rate limiting', () => {
 describe('anchorDocument', () => {
     const VALID_SHA256 = 'a'.repeat(64);
     const VALID_ANCHOR_ARGS = () => ({
-        sha256:          VALID_SHA256,
-        contentType:     'application/pdf',
-        size:            1024,
-        storageRef:      'file:///tmp/doc.pdf',
-        metadata:        '{"type":"demo"}',
-        sessionId:       `anchor-${Math.random().toString(36).slice(2)}`,
+        sha256: VALID_SHA256,
+        contentType: 'application/pdf',
+        size: 1024,
+        storageRef: 'file:///tmp/doc.pdf',
+        metadata: '{"type":"demo"}',
+        sessionId: `anchor-${Math.random().toString(36).slice(2)}`,
         contractAddress: '0xVAULT',
         compiledArtifactRef: 'attestation-vault'
     });
@@ -404,8 +404,8 @@ describe('anchorDocument', () => {
         // New shape: jobId + status + documentId (the documentId stays sync
         // so callers can poll the Documents row directly).
         expect(result).toEqual({
-            jobId:      'job-anchorDocument-test',
-            status:     'pending',
+            jobId: 'job-anchorDocument-test',
+            status: 'pending',
             documentId: expect.any(String)
         });
         expect(result.documentId.length).toBeGreaterThan(0);
@@ -457,7 +457,7 @@ describe('anchorDocument', () => {
         const { srv, db } = setupHandlersWithDb({
             submitterFactory: () => ({
                 deploy: jest.fn(async () => { throw subErr; }),
-                call:   jest.fn(async () => { throw subErr; })
+                call: jest.fn(async () => { throw subErr; })
             }) as unknown as TransactionSubmitter
         });
         const req = makeReq(VALID_ANCHOR_ARGS());
@@ -487,9 +487,9 @@ describe('anchorDocument', () => {
 
 describe('verifyDocument', () => {
     const VALID_SHA = 'a'.repeat(64);
-    const DOC_ID    = '00000000-0000-4000-8000-000000000001';
-    const TX_ID     = '00000000-0000-4000-8000-000000000002';
-    const TX_HASH   = '0xanchor';
+    const DOC_ID = '00000000-0000-4000-8000-000000000001';
+    const TX_ID = '00000000-0000-4000-8000-000000000002';
+    const TX_HASH = '0xanchor';
 
     function makeDbWithSequence(rows: any[]) {
         // Each db.run consumes the next row from the queue.
@@ -546,9 +546,9 @@ describe('verifyDocument', () => {
         const result: any = await srv.handlers['verifyDocument'](req);
         expect(req.reject).not.toHaveBeenCalled();
         expect(result).toEqual({
-            verified:       true,
+            verified: true,
             anchoredTxHash: TX_HASH,
-            anchoredAt:     '2026-05-19T12:00:00Z',
+            anchoredAt: '2026-05-19T12:00:00Z',
             originalSha256: VALID_SHA
         });
     });
@@ -574,9 +574,9 @@ describe('verifyDocument', () => {
         const req = makeReq({ documentId: DOC_ID, providedSha256: VALID_SHA });
         const result: any = await srv.handlers['verifyDocument'](req);
         expect(result).toEqual({
-            verified:       false,
+            verified: false,
             anchoredTxHash: '',
-            anchoredAt:     null,
+            anchoredAt: null,
             originalSha256: VALID_SHA
         });
     });
@@ -618,15 +618,15 @@ describe('verifyDocument', () => {
 
 describe('issuePredicateAttestation', () => {
     const VALID_PAYLOAD = 'a'.repeat(64);
-    const VALID_SALT    = 'b'.repeat(64);
+    const VALID_SALT = 'b'.repeat(64);
     const VALID_ARGS = () => ({
-        payloadHash:     VALID_PAYLOAD,
-        value:           '47300',
-        salt:            VALID_SALT,
-        predicate:       'lessOrEqual',
-        threshold:       50000,
-        unit:            'kgCO2e/kWh',
-        sessionId:       `pred-${Math.random().toString(36).slice(2)}`,
+        payloadHash: VALID_PAYLOAD,
+        value: '47300',
+        salt: VALID_SALT,
+        predicate: 'lessOrEqual',
+        threshold: 50000,
+        unit: 'kgCO2e/kWh',
+        sessionId: `pred-${Math.random().toString(36).slice(2)}`,
         contractAddress: '0xVAULT',
         compiledArtifactRef: 'attestation-vault'
     });
@@ -702,7 +702,7 @@ describe('issuePredicateAttestation', () => {
 
         expect(req.reject).not.toHaveBeenCalled();
         expect(result).toEqual({
-            jobId:  'job-issuePredicateAttestation-test',
+            jobId: 'job-issuePredicateAttestation-test',
             status: 'pending',
             predicateAttestationId: expect.any(String)
         });
@@ -785,8 +785,8 @@ describe('issuePredicateAttestation', () => {
 // ---- verifyPredicateAttestation (ZK predicate, on-chain model) ------------
 
 describe('verifyPredicateAttestation', () => {
-    const PA_ID   = '00000000-0000-4000-8000-0000000000a1';
-    const TX_ID   = '00000000-0000-4000-8000-0000000000a2';
+    const PA_ID = '00000000-0000-4000-8000-0000000000a1';
+    const TX_ID = '00000000-0000-4000-8000-0000000000a2';
     const TX_HASH = '0xprove';
 
     function makeDbWithSequence(rows: any[]) {
@@ -861,10 +861,10 @@ describe('grantDisclosure', () => {
     const VALID_PAYLOAD = 'a'.repeat(64);
     const VALID_GRANTEE = 'b'.repeat(64);
     const VALID_ARGS = () => ({
-        payloadHash:     VALID_PAYLOAD,
-        grantee:         VALID_GRANTEE,
-        level:           1,
-        sessionId:       `disc-${Math.random().toString(36).slice(2)}`,
+        payloadHash: VALID_PAYLOAD,
+        grantee: VALID_GRANTEE,
+        level: 1,
+        sessionId: `disc-${Math.random().toString(36).slice(2)}`,
         contractAddress: '0xVAULT',
         compiledArtifactRef: 'attestation-vault'
     });
@@ -947,7 +947,7 @@ describe('grantDisclosure', () => {
         expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/contractAddress is required/));
     });
 
-    test('happy path: INSERT up-front + single grantDisclosure call + UPDATE grantedTxHash', async () => {
+    test('happy path: SELECT + INSERT up-front + single grantDisclosure call + UPDATE grantedTxHash', async () => {
         const submitter = makeSuccessfulSubmitter();
         const { srv, db } = setupHandlersWithDb({ submitterFactory: () => submitter });
         const req = makeReq(VALID_ARGS());
@@ -956,13 +956,13 @@ describe('grantDisclosure', () => {
 
         expect(req.reject).not.toHaveBeenCalled();
         expect(result).toEqual({
-            jobId:  'job-grantDisclosure-test',
+            jobId: 'job-grantDisclosure-test',
             status: 'pending',
             disclosureGrantId: expect.any(String)
         });
 
-        // INSERT (sync) + UPDATE (inside work) = 2 db.run.
-        expect(db.run).toHaveBeenCalledTimes(2);
+        // SELECT.one existing (sync) + INSERT (sync) + UPDATE (inside work) = 3 db.run.
+        expect(db.run).toHaveBeenCalledTimes(3);
 
         // Exactly one circuit call: grantDisclosure(payload, grantee, level).
         expect(submitter.call).toHaveBeenCalledTimes(1);
@@ -989,9 +989,44 @@ describe('grantDisclosure', () => {
         await srv.handlers['grantDisclosure'](makeReq(VALID_ARGS()));
         expect(reindexer).toHaveBeenCalledTimes(1);
         expect(reindexer).toHaveBeenCalledWith(expect.objectContaining({
-            contractAddress: '0xVAULT',
+            contractAddress: '0xvault',
             artifactPath: RESOLVED_CONTRACT_FIXTURE.artifactPath
         }));
+    });
+
+    test('reuses an existing grant row instead of inserting a duplicate', async () => {
+        const srv = makeFakeService();
+        // First db.run = SELECT.one existing → return a row; all later calls → undefined.
+        const run = jest.fn()
+            .mockResolvedValueOnce({ ID: 'existing-grant-row' })
+            .mockResolvedValue(undefined);
+        const db = { run };
+        reindexer = jest.fn().mockResolvedValue({ indexed: 1, deactivated: 0 });
+        registerSubmissionHandlers(srv as any, db, {
+            resolveContractImpl: jest.fn(async () => ({ ...RESOLVED_CONTRACT_FIXTURE })),
+            walletMaterialFactory: jest.fn(async () => ({
+                accountId: 'a',
+                privateStoragePasswordProvider: () => '0123456789ABCDEFG',
+                walletAndMidnightProvider: {}
+            })),
+            submitterFactory: jest.fn(() => makeSuccessfulSubmitter()),
+            disclosureReindexer: reindexer
+        });
+
+        const req = makeReq(VALID_ARGS());
+        const result: any = await srv.handlers['grantDisclosure'](req);
+
+        expect(req.reject).not.toHaveBeenCalled();
+        expect(result.disclosureGrantId).toBe('existing-grant-row');
+
+        const queries = run.mock.calls.map(c => c[0]);
+        expect(queries.some(q => q.INSERT)).toBe(false);
+        // Up-front re-grant UPDATE re-affirms level and clears any stale revoke.
+        const updates = queries.filter(q => q.UPDATE);
+        expect(updates.length).toBeGreaterThanOrEqual(1);
+        const upFront = JSON.stringify(updates[0].UPDATE.data ?? updates[0].UPDATE.with);
+        expect(upFront).toContain('"level":1');
+        expect(upFront).toContain('"revokedTxHash":null');
     });
 
     test('a reindex failure does not fail the grant', async () => {
@@ -1030,9 +1065,9 @@ describe('revokeDisclosure', () => {
     const VALID_PAYLOAD = 'a'.repeat(64);
     const VALID_GRANTEE = 'b'.repeat(64);
     const VALID_ARGS = () => ({
-        payloadHash:     VALID_PAYLOAD,
-        grantee:         VALID_GRANTEE,
-        sessionId:       `revk-${Math.random().toString(36).slice(2)}`,
+        payloadHash: VALID_PAYLOAD,
+        grantee: VALID_GRANTEE,
+        sessionId: `revk-${Math.random().toString(36).slice(2)}`,
         contractAddress: '0xVAULT',
         compiledArtifactRef: 'attestation-vault'
     });
@@ -1121,6 +1156,18 @@ describe('registerGranteeIdentity', () => {
         expect(req.reject).toHaveBeenCalledWith(401, expect.stringMatching(/authentication/));
     });
 
+    test('403 when self-service registration is disabled', async () => {
+        process.env.NIGHTGATE_ALLOW_SELF_SERVICE_GRANTEE_REGISTRATION = 'false';
+        try {
+            const { srv } = setup();
+            const req = reqWithUser('u1', { bindingInput: PUBKEY });
+            await srv.handlers['registerGranteeIdentity'](req);
+            expect(req.reject).toHaveBeenCalledWith(403, expect.stringMatching(/disabled/));
+        } finally {
+            delete process.env.NIGHTGATE_ALLOW_SELF_SERVICE_GRANTEE_REGISTRATION;
+        }
+    });
+
     test('400 when bindingInput missing', async () => {
         const { srv } = setup();
         const req = reqWithUser('u1', {});
@@ -1175,7 +1222,7 @@ describe('registerGranteeIdentity', () => {
 
 describe('arg-coercion: coerceCircuitArgs (pure)', () => {
     const BYTES32: CircuitArgType = { name: 'h', kind: 'Bytes', length: 32 };
-    const UINT8:   CircuitArgType = { name: 'n', kind: 'Uint', maxval: 255 };
+    const UINT8: CircuitArgType = { name: 'n', kind: 'Uint', maxval: 255 };
 
     test('hex string → Uint8Array(32) when param is Bytes<32>', () => {
         const hex = 'ab'.repeat(32);
@@ -1257,7 +1304,7 @@ describe('arg-coercion: loadCircuitArgTypes (real attestation-vault artifact)', 
     test('attest → two Bytes<32> params', () => {
         const types = loadCircuitArgTypes(VAULT_ZK, 'attest');
         expect(types).toEqual([
-            { name: 'payload_hash',  kind: 'Bytes', length: 32 },
+            { name: 'payload_hash', kind: 'Bytes', length: 32 },
             { name: 'metadata_hash', kind: 'Bytes', length: 32 }
         ]);
     });
@@ -1280,7 +1327,7 @@ describe('arg-coercion: loadCircuitArgTypes (real attestation-vault artifact)', 
 describe('submitContractCall: Bytes/Uint arg coercion reaches the submitter', () => {
     // A consumer's bindPassport(passportId: Bytes<32>, payload_hash: Bytes<32>).
     const bindPassportTypes: CircuitArgType[] = [
-        { name: 'passportId',   kind: 'Bytes', length: 32 },
+        { name: 'passportId', kind: 'Bytes', length: 32 },
         { name: 'payload_hash', kind: 'Bytes', length: 32 }
     ];
 
@@ -1305,7 +1352,7 @@ describe('submitContractCall: Bytes/Uint arg coercion reaches the submitter', ()
 
     test('AC1: Bytes<32> hex args reach the circuit as Uint8Array(32) (bindPassport)', async () => {
         const { srv, submitter } = setup();
-        const passportId  = '11'.repeat(32);
+        const passportId = '11'.repeat(32);
         const payloadHash = '22'.repeat(32);
         const req = makeReq({
             contractAddress: '0xC', circuit: 'bindPassport', compiledArtifactRef: 'x',

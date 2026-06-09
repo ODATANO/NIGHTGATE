@@ -53,8 +53,8 @@ export function enumerateGrants(led: DisclosureLedger): DisclosureGrantRecord[] 
         for (const [granteeBytes, levelBig] of led.disclosures.lookup(payloadHashBytes)) {
             rows.push({
                 payloadHash: hex(payloadHashBytes),
-                grantee:     hex(granteeBytes),
-                level:       Number(levelBig)
+                grantee: hex(granteeBytes),
+                level: Number(levelBig)
             });
         }
     }
@@ -70,6 +70,14 @@ export interface ReindexDeps {
     ledger: (state: any) => DisclosureLedger;
     /** publicDataProvider.queryContractState — returns ContractState | null. */
     queryContractState: (contractAddress: string) => Promise<any | null>;
+    /**
+     * Sweep grace window in ms (default 10 min). Rows modified within this
+     * window are NOT swept to inactive: the indexer may be reading a node/
+     * indexer view that hasn't caught up to a just-submitted grant, and
+     * sweeping it would deactivate a live grant. Fresh revokes are unaffected
+     * — the revoke handler flips its own row directly.
+     */
+    sweepGraceMs?: number;
 }
 
 export interface ReindexResult {
@@ -79,15 +87,20 @@ export interface ReindexResult {
     deactivated: number;
 }
 
+export const DEFAULT_SWEEP_GRACE_MS = 10 * 60 * 1000;
+
 /**
  * Re-materialize `DisclosureGrants` for one contract from current on-chain
  * state. Idempotent: existing rows are updated in place (preserving the
  * optimistic `grantedTxHash` the handler wrote), new on-chain grants are
  * inserted, and any previously-active row no longer present on-chain is swept
- * to `active=false` (its grantee was revoked).
+ * to `active=false` (its grantee was revoked) — unless it was modified within
+ * the grace window (see `ReindexDeps.sweepGraceMs`).
  */
 export async function reindexDisclosures(deps: ReindexDeps): Promise<ReindexResult> {
-    const { db, contractAddress, ledger, queryContractState } = deps;
+    const { db, ledger, queryContractState } = deps;
+    const contractAddress = deps.contractAddress.toLowerCase();
+    const sweepGraceMs = deps.sweepGraceMs ?? DEFAULT_SWEEP_GRACE_MS;
 
     const state = await queryContractState(contractAddress);
     if (!state) return { indexed: 0, deactivated: 0 };
@@ -113,34 +126,38 @@ export async function reindexDisclosures(deps: ReindexDeps): Promise<ReindexResu
                 .where({ ID: existing.ID }));
         } else {
             await db.run(INSERT.into(DisclosureGrants).entries({
-                ID:              cds.utils.uuid(),
-                payloadHash:     g.payloadHash,
-                grantee:         g.grantee,
-                level:           g.level,
+                ID: cds.utils.uuid(),
+                payloadHash: g.payloadHash,
+                grantee: g.grantee,
+                level: g.level,
                 contractAddress,
-                grantedTxHash:   null,
-                revokedTxHash:   null,
-                active:          true,
-                createdAt:       now,
-                modifiedAt:      now
+                grantedTxHash: null,
+                revokedTxHash: null,
+                active: true,
+                createdAt: now,
+                modifiedAt: now
             }));
         }
     }
 
     // Sweep: an active row for this contract that is no longer on-chain was
-    // revoked. The chain is authoritative, so flip it inactive.
+    // revoked. The chain is authoritative, so flip it inactive — but skip rows
+    // touched within the grace window: the queried state may simply not include
+    // a just-submitted grant yet, and sweeping it would deactivate a live grant.
     const activeRows: any[] = (await db.run(
         SELECT.from(DisclosureGrants).where({ contractAddress, active: true })
     )) || [];
 
+    const cutoff = Date.now() - sweepGraceMs;
     let deactivated = 0;
     for (const r of activeRows) {
-        if (!seen.has(`${r.payloadHash}|${r.grantee}`)) {
-            await db.run(UPDATE.entity(DisclosureGrants)
-                .set({ active: false, modifiedAt: now })
-                .where({ ID: r.ID }));
-            deactivated++;
-        }
+        if (seen.has(`${r.payloadHash}|${r.grantee}`)) continue;
+        const modifiedAtMs = r.modifiedAt ? Date.parse(r.modifiedAt) : NaN;
+        if (Number.isFinite(modifiedAtMs) && modifiedAtMs > cutoff) continue;
+        await db.run(UPDATE.entity(DisclosureGrants)
+            .set({ active: false, modifiedAt: now })
+            .where({ ID: r.ID }));
+        deactivated++;
     }
 
     return { indexed: onChain.length, deactivated };

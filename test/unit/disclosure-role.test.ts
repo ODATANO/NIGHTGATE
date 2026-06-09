@@ -50,11 +50,11 @@ beforeEach(async () => {
 
 async function seed(...grants: GrantSeed[]): Promise<void> {
     await db.run(cds.ql.INSERT.into(ROLES).entries(grants.map(g => ({
-        ID:         cds.utils.uuid(),
-        userId:     g.userId,
-        role:       g.role,
-        scope:      g.scope ?? null,
-        validFrom:  g.validFrom ?? null,
+        ID: cds.utils.uuid(),
+        userId: g.userId,
+        role: g.role,
+        scope: g.scope ?? null,
+        validFrom: g.validFrom ?? null,
         validUntil: g.validUntil ?? null
     }))));
 }
@@ -183,7 +183,8 @@ describe('attachDisclosureRole', () => {
     });
 
     describe('on-chain ACL (contractAddress set)', () => {
-        const VAULT = '0xVAULT';
+        // Rows are stored lowercase (handlers + indexer normalize on write).
+        const VAULT = '0xvault';
         const PH = 'a'.repeat(64);
         const GID = 'c'.repeat(64);
 
@@ -261,6 +262,15 @@ describe('attachDisclosureRole', () => {
             await seedGrant({ payloadHash: PH, grantee: GID, level: 1, contractAddress: VAULT });
             expect(await attachDisclosureRole(makeReq('han'), db, { contractAddress: VAULT })).toBe('legitimate_interest');
         });
+
+        test('mixed-case contractAddress and payloadHash are normalized for the lookup', async () => {
+            await seedIdentity('han', GID);
+            await seedGrant({ payloadHash: PH, grantee: GID, level: 2, contractAddress: VAULT });
+            const role = await attachDisclosureRole(makeReq('han'), db, {
+                contractAddress: '0xVaUlT', payloadHash: PH.toUpperCase()
+            });
+            expect(role).toBe('authority');
+        });
     });
 });
 
@@ -284,17 +294,17 @@ describe('helpers', () => {
 
     test('meetsDisclosure obeys the rank hierarchy', () => {
         const checks: Array<[DisclosureRoleValue | undefined, DisclosureRoleValue, boolean]> = [
-            ['authority',          'public_only',         true],
-            ['authority',          'legitimate_interest', true],
-            ['authority',          'authority',           true],
-            ['legitimate_interest','public_only',         true],
-            ['legitimate_interest','legitimate_interest', true],
-            ['legitimate_interest','authority',           false],
-            ['public_only',        'public_only',         true],
-            ['public_only',        'legitimate_interest', false],
-            ['public_only',        'authority',           false],
-            [undefined,            'public_only',         true],
-            [undefined,            'legitimate_interest', false]
+            ['authority', 'public_only', true],
+            ['authority', 'legitimate_interest', true],
+            ['authority', 'authority', true],
+            ['legitimate_interest', 'public_only', true],
+            ['legitimate_interest', 'legitimate_interest', true],
+            ['legitimate_interest', 'authority', false],
+            ['public_only', 'public_only', true],
+            ['public_only', 'legitimate_interest', false],
+            ['public_only', 'authority', false],
+            [undefined, 'public_only', true],
+            [undefined, 'legitimate_interest', false]
         ];
         for (const [actual, required, expected] of checks) {
             expect(meetsDisclosure(actual, required)).toBe(expected);

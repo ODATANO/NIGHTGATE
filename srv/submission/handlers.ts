@@ -47,7 +47,7 @@ import { ensureNetworkId, type ContractProvidersConfig } from '../midnight/provi
 import { startJob } from './background-jobs';
 import { reindexDisclosuresForContract } from './disclosure-indexer';
 import { deriveGranteeId } from './grantee-identity';
-import { getConfiguredGranteeBinding } from '../utils/nightgate-config';
+import { getConfiguredGranteeBinding, isSelfServiceGranteeRegistrationAllowed } from '../utils/nightgate-config';
 import { Documents, Transactions, TransactionResults, PredicateAttestations, DisclosureGrants, GranteeIdentities } from '#cds-models/midnight';
 
 const { INSERT, UPDATE, SELECT } = cds.ql;
@@ -114,7 +114,7 @@ export function registerSubmissionHandlers(
         };
 
         if (!compiledArtifactRef) return req.reject(400, 'compiledArtifactRef is required');
-        if (!sessionId)          return req.reject(400, 'sessionId is required');
+        if (!sessionId) return req.reject(400, 'sessionId is required');
 
         if (rejectIfMainnetBlocked(req)) return;
         if (!checkRate(deployRateLimiter, sessionId, req)) return;
@@ -137,26 +137,26 @@ export function registerSubmissionHandlers(
             const submitter = submitterFactory(buildSubmitterDeps(db, resolved, wallet));
 
             return startJob({
-                kind:           'deployContract',
+                kind: 'deployContract',
                 sessionId,
                 idempotencyKey,
-                request:        { compiledArtifactRef, sessionId, hasInitialState: !!initialPrivateState },
+                request: { compiledArtifactRef, sessionId, hasInitialState: !!initialPrivateState },
                 work: async () => {
                     const result = await submitter.deploy({
                         contractName: compiledArtifactRef,
                         registration: {
-                            artifactPath:   resolved.artifactPath,
+                            artifactPath: resolved.artifactPath,
                             privateStateId: resolved.privateStateId,
-                            zkConfigPath:   resolved.zkConfigPath
+                            zkConfigPath: resolved.zkConfigPath
                         },
                         initialPrivateState: parsedInitialState,
                         sessionId
                     });
                     return {
-                        submissionId:    result.submissionId,
-                        txHash:          result.txHash,
+                        submissionId: result.submissionId,
+                        txHash: result.txHash,
                         contractAddress: result.contractAddress,
-                        status:          result.status
+                        status: result.status
                     };
                 }
             });
@@ -173,10 +173,10 @@ export function registerSubmissionHandlers(
             idempotencyKey?: string;
         };
 
-        if (!contractAddress)     return req.reject(400, 'contractAddress is required');
-        if (!circuit)             return req.reject(400, 'circuit is required');
+        if (!contractAddress) return req.reject(400, 'contractAddress is required');
+        if (!circuit) return req.reject(400, 'circuit is required');
         if (!compiledArtifactRef) return req.reject(400, 'compiledArtifactRef is required');
-        if (!sessionId)           return req.reject(400, 'sessionId is required');
+        if (!sessionId) return req.reject(400, 'sessionId is required');
 
         if (rejectIfMainnetBlocked(req)) return;
         if (!checkRate(callRateLimiter, sessionId, req)) return;
@@ -208,28 +208,28 @@ export function registerSubmissionHandlers(
             const submitter = submitterFactory(buildSubmitterDeps(db, resolved, wallet));
 
             return startJob({
-                kind:           'submitContractCall',
+                kind: 'submitContractCall',
                 sessionId,
                 idempotencyKey,
-                request:        { contractAddress, circuit, compiledArtifactRef, sessionId, argCount: coercedArgs.length },
+                request: { contractAddress, circuit, compiledArtifactRef, sessionId, argCount: coercedArgs.length },
                 work: async () => {
                     const result = await submitter.call({
                         contractAddress,
                         circuit,
-                        args:         coercedArgs,
+                        args: coercedArgs,
                         contractName: compiledArtifactRef,
                         registration: {
-                            artifactPath:   resolved.artifactPath,
+                            artifactPath: resolved.artifactPath,
                             privateStateId: resolved.privateStateId,
-                            zkConfigPath:   resolved.zkConfigPath
+                            zkConfigPath: resolved.zkConfigPath
                         },
                         sessionId
                     });
                     return {
-                        submissionId:    result.submissionId,
-                        txHash:          result.txHash,
+                        submissionId: result.submissionId,
+                        txHash: result.txHash,
                         contractAddress: result.contractAddress,
-                        status:          result.status
+                        status: result.status
                     };
                 }
             });
@@ -249,16 +249,16 @@ export function registerSubmissionHandlers(
             idempotencyKey?: string;
         };
 
-        if (!data.sha256)          return req.reject(400, 'sha256 is required');
-        if (!data.storageRef)      return req.reject(400, 'storageRef is required');
-        if (!data.sessionId)       return req.reject(400, 'sessionId is required');
+        if (!data.sha256) return req.reject(400, 'sha256 is required');
+        if (!data.storageRef) return req.reject(400, 'storageRef is required');
+        if (!data.sessionId) return req.reject(400, 'sessionId is required');
         if (!data.contractAddress) return req.reject(400, 'contractAddress is required');
         if (!SHA256_HEX_RE.test(data.sha256)) {
             return req.reject(400, 'sha256 must be 64 hex chars (32 bytes)');
         }
 
-        const metadataStr  = data.metadata ?? '';
-        const compiledRef  = data.compiledArtifactRef && data.compiledArtifactRef.length > 0
+        const metadataStr = data.metadata ?? '';
+        const compiledRef = data.compiledArtifactRef && data.compiledArtifactRef.length > 0
             ? data.compiledArtifactRef
             : DEFAULT_ATTESTATION_VAULT_REF;
 
@@ -268,7 +268,7 @@ export function registerSubmissionHandlers(
         // Compute the on-chain inputs: payload_hash from the caller's sha256
         // and metadata_hash from the public metadata blob. Both are 32-byte
         // commitments — the actual bytes live off-chain at `storageRef`.
-        const payloadHashBytes  = hexToBytes(data.sha256);
+        const payloadHashBytes = hexToBytes(data.sha256);
         const metadataHashBytes = sha256(new TextEncoder().encode(metadataStr));
 
         // Insert the Documents row up-front on req.tx so the row ID is stable
@@ -278,15 +278,15 @@ export function registerSubmissionHandlers(
         const documentId = cds.utils.uuid();
         const insertedAt = new Date().toISOString();
         await db.run(INSERT.into(Documents).entries({
-            ID:          documentId,
-            sha256:      data.sha256.toLowerCase(),
+            ID: documentId,
+            sha256: data.sha256.toLowerCase(),
             contentType: data.contentType ?? null,
-            size:        data.size ?? null,
-            storageRef:  data.storageRef,
+            size: data.size ?? null,
+            storageRef: data.storageRef,
             anchoredTxHash: null,
-            anchoredAt:     null,
-            createdAt:   insertedAt,
-            modifiedAt:  insertedAt
+            anchoredAt: null,
+            createdAt: insertedAt,
+            modifiedAt: insertedAt
         }));
 
         // Sync setup (errors here become 404/401/501 via runSubmission); the
@@ -299,25 +299,25 @@ export function registerSubmissionHandlers(
             const submitter = submitterFactory(buildSubmitterDeps(db, resolved, wallet));
 
             const job = await startJob({
-                kind:           'anchorDocument',
-                sessionId:      data.sessionId!,
+                kind: 'anchorDocument',
+                sessionId: data.sessionId!,
                 idempotencyKey: data.idempotencyKey,
                 request: {
-                    sha256:           data.sha256!.toLowerCase(),
-                    contractAddress:  data.contractAddress,
+                    sha256: data.sha256!.toLowerCase(),
+                    contractAddress: data.contractAddress,
                     compiledRef,
                     documentId
                 },
                 work: async () => {
                     const result = await submitter.call({
                         contractAddress: data.contractAddress!,
-                        circuit:         'attest',
-                        args:            [payloadHashBytes, metadataHashBytes],
-                        contractName:    compiledRef,
+                        circuit: 'attest',
+                        args: [payloadHashBytes, metadataHashBytes],
+                        contractName: compiledRef,
                         registration: {
-                            artifactPath:   resolved.artifactPath,
+                            artifactPath: resolved.artifactPath,
                             privateStateId: resolved.privateStateId,
-                            zkConfigPath:   resolved.zkConfigPath
+                            zkConfigPath: resolved.zkConfigPath
                         },
                         sessionId: data.sessionId!
                     });
@@ -330,7 +330,7 @@ export function registerSubmissionHandlers(
                     return {
                         documentId,
                         attestationId: data.sha256!.toLowerCase(),
-                        txHash:        result.txHash,
+                        txHash: result.txHash,
                         anchoredAt
                     };
                 }
@@ -346,7 +346,7 @@ export function registerSubmissionHandlers(
             providedSha256?: string;
         };
 
-        if (!documentId)     return req.reject(400, 'documentId is required');
+        if (!documentId) return req.reject(400, 'documentId is required');
         if (!providedSha256) return req.reject(400, 'providedSha256 is required');
         if (!SHA256_HEX_RE.test(providedSha256)) {
             return req.reject(400, 'providedSha256 must be 64 hex chars (32 bytes)');
@@ -358,7 +358,7 @@ export function registerSubmissionHandlers(
         if (!doc) return req.reject(404, `Document ${documentId} not found`);
 
         const hashMatches = doc.sha256?.toLowerCase() === providedSha256.toLowerCase();
-        const anchoredOk  = Boolean(doc.anchoredTxHash);
+        const anchoredOk = Boolean(doc.anchoredTxHash);
 
         // Only resolve the on-chain status if we have a txHash and the hash
         // matched. Skipping the SELECT in the mismatch path saves one DB
@@ -381,9 +381,9 @@ export function registerSubmissionHandlers(
         }
 
         return {
-            verified:       hashMatches && anchoredOk && chainSuccess,
+            verified: hashMatches && anchoredOk && chainSuccess,
             anchoredTxHash: doc.anchoredTxHash ?? '',
-            anchoredAt:     doc.anchoredAt ?? null,
+            anchoredAt: doc.anchoredAt ?? null,
             originalSha256: doc.sha256 ?? ''
         };
     });
@@ -403,7 +403,7 @@ export function registerSubmissionHandlers(
             idempotencyKey?: string;
         };
 
-        if (!data.payloadHash)                  return req.reject(400, 'payloadHash is required');
+        if (!data.payloadHash) return req.reject(400, 'payloadHash is required');
         if (!SHA256_HEX_RE.test(data.payloadHash)) return req.reject(400, 'payloadHash must be 64 hex chars (32 bytes)');
         if (data.value === undefined || data.value === null || data.value === '') {
             return req.reject(400, 'value is required');
@@ -418,11 +418,11 @@ export function registerSubmissionHandlers(
         if (thresholdBig < 0n) return req.reject(400, 'threshold must be a non-negative integer');
 
         let op: number;
-        if (data.predicate === 'lessOrEqual')         op = 0;
+        if (data.predicate === 'lessOrEqual') op = 0;
         else if (data.predicate === 'greaterOrEqual') op = 1;
         else return req.reject(400, "predicate must be 'lessOrEqual' or 'greaterOrEqual'");
 
-        if (!data.sessionId)       return req.reject(400, 'sessionId is required');
+        if (!data.sessionId) return req.reject(400, 'sessionId is required');
         if (!data.contractAddress) return req.reject(400, 'contractAddress is required');
 
         let saltHex: string;
@@ -454,21 +454,21 @@ export function registerSubmissionHandlers(
         const predicateAttestationId = cds.utils.uuid();
         const insertedAt = new Date().toISOString();
         await db.run(INSERT.into(PredicateAttestations).entries({
-            ID:              predicateAttestationId,
-            payloadHash:     data.payloadHash.toLowerCase(),
+            ID: predicateAttestationId,
+            payloadHash: data.payloadHash.toLowerCase(),
             contractAddress: data.contractAddress,
-            predicate:       data.predicate,
+            predicate: data.predicate,
             op,
             // Integer64 column; caller may pass the scaled integer as a string to
             // preserve precision past Number.MAX_SAFE_INTEGER. cds-models types it
             // as `number`, but the DB layer accepts the string at runtime.
-            threshold:       data.threshold as any,
-            unit:            data.unit ?? null,
+            threshold: data.threshold as any,
+            unit: data.unit ?? null,
             valueCommitment: data.valueCommitment ? data.valueCommitment.toLowerCase() : null,
-            provenTxHash:    null,
-            provenAt:        null,
-            createdAt:       insertedAt,
-            modifiedAt:      insertedAt
+            provenTxHash: null,
+            provenAt: null,
+            createdAt: insertedAt,
+            modifiedAt: insertedAt
         }));
 
         return runSubmission(req, async () => {
@@ -478,20 +478,20 @@ export function registerSubmissionHandlers(
             const wallet = await walletFactory({ sessionId: data.sessionId!, db, facadeConfig: facadeCfg });
             const submitter = submitterFactory(buildSubmitterDeps(db, resolved, wallet));
             const registration = {
-                artifactPath:   resolved.artifactPath,
+                artifactPath: resolved.artifactPath,
                 privateStateId: resolved.privateStateId,
-                zkConfigPath:   resolved.zkConfigPath
+                zkConfigPath: resolved.zkConfigPath
             };
 
             const job = await startJob({
-                kind:           'issuePredicateAttestation',
-                sessionId:      data.sessionId!,
+                kind: 'issuePredicateAttestation',
+                sessionId: data.sessionId!,
                 idempotencyKey: data.idempotencyKey,
                 request: {
-                    payloadHash:     data.payloadHash!.toLowerCase(),
+                    payloadHash: data.payloadHash!.toLowerCase(),
                     contractAddress: data.contractAddress,
-                    predicate:       data.predicate,
-                    threshold:       String(data.threshold),
+                    predicate: data.predicate,
+                    threshold: String(data.threshold),
                     predicateAttestationId
                 },
                 work: async () => {
@@ -499,11 +499,11 @@ export function registerSubmissionHandlers(
                     //    commitment is computed in-circuit from the witnesses.
                     await submitter.call({
                         contractAddress: data.contractAddress!,
-                        circuit:         'commitValue',
-                        args:            [payloadHashBytes],
-                        contractName:    compiledRef,
+                        circuit: 'commitValue',
+                        args: [payloadHashBytes],
+                        contractName: compiledRef,
                         registration,
-                        sessionId:       data.sessionId!,
+                        sessionId: data.sessionId!,
                         witnessValues
                     });
                     // 2. Prove the predicate. The ledger only accepts this tx if
@@ -511,11 +511,11 @@ export function registerSubmissionHandlers(
                     //    held — so a successful tx IS the verified proof.
                     const proof = await submitter.call({
                         contractAddress: data.contractAddress!,
-                        circuit:         'provePredicate',
-                        args:            [payloadHashBytes, thresholdBig, BigInt(op)],
-                        contractName:    compiledRef,
+                        circuit: 'provePredicate',
+                        args: [payloadHashBytes, thresholdBig, BigInt(op)],
+                        contractName: compiledRef,
                         registration,
-                        sessionId:       data.sessionId!,
+                        sessionId: data.sessionId!,
                         witnessValues
                     });
 
@@ -530,13 +530,13 @@ export function registerSubmissionHandlers(
                         claim: {
                             predicate: data.predicate,
                             threshold: String(data.threshold),
-                            unit:      data.unit ?? null
+                            unit: data.unit ?? null
                         },
                         proof: {
-                            system:             'midnight-compact',
-                            circuit:            'provePredicate',
+                            system: 'midnight-compact',
+                            circuit: 'provePredicate',
                             verificationMethod: data.contractAddress,
-                            proofValue:         proof.txHash
+                            proofValue: proof.txHash
                         }
                     };
                 }
@@ -573,13 +573,13 @@ export function registerSubmissionHandlers(
         }
 
         return {
-            verified:        provenOk && chainSuccess,
-            predicate:       row.predicate ?? '',
-            threshold:       row.threshold ?? 0,
-            unit:            row.unit ?? '',
+            verified: provenOk && chainSuccess,
+            predicate: row.predicate ?? '',
+            threshold: row.threshold ?? 0,
+            unit: row.unit ?? '',
             valueCommitment: row.valueCommitment ?? '',
-            provenTxHash:    row.provenTxHash ?? '',
-            provenAt:        row.provenAt ?? null
+            provenTxHash: row.provenTxHash ?? '',
+            provenAt: row.provenAt ?? null
         };
     });
 
@@ -594,19 +594,18 @@ export function registerSubmissionHandlers(
             idempotencyKey?: string;
         };
 
-        if (!data.payloadHash)                     return req.reject(400, 'payloadHash is required');
+        if (!data.payloadHash) return req.reject(400, 'payloadHash is required');
         if (!SHA256_HEX_RE.test(data.payloadHash)) return req.reject(400, 'payloadHash must be 64 hex chars (32 bytes)');
-        if (!data.grantee)                         return req.reject(400, 'grantee is required');
-        if (!SHA256_HEX_RE.test(data.grantee))     return req.reject(400, 'grantee must be 64 hex chars (32 bytes)');
+        if (!data.grantee) return req.reject(400, 'grantee is required');
+        if (!SHA256_HEX_RE.test(data.grantee)) return req.reject(400, 'grantee must be 64 hex chars (32 bytes)');
 
         if (data.level === undefined || data.level === null) return req.reject(400, 'level is required');
-        let levelNum: number;
-        try { levelNum = Number(data.level); } catch { return req.reject(400, 'level must be 0, 1, or 2'); }
+        const levelNum = Number(data.level);
         if (!Number.isInteger(levelNum) || levelNum < 0 || levelNum > 2) {
             return req.reject(400, 'level must be 0 (public), 1 (legitimate-interest), or 2 (authority)');
         }
 
-        if (!data.sessionId)       return req.reject(400, 'sessionId is required');
+        if (!data.sessionId) return req.reject(400, 'sessionId is required');
         if (!data.contractAddress) return req.reject(400, 'contractAddress is required');
 
         const compiledRef = data.compiledArtifactRef && data.compiledArtifactRef.length > 0
@@ -617,28 +616,44 @@ export function registerSubmissionHandlers(
         if (!checkRate(disclosureRateLimiter, data.sessionId, req)) return;
 
         const payloadHashBytes = hexToBytes(data.payloadHash);
-        const granteeBytes     = hexToBytes(data.grantee);
-        const payloadHashLc    = data.payloadHash.toLowerCase();
-        const granteeLc        = data.grantee.toLowerCase();
+        const granteeBytes = hexToBytes(data.grantee);
+        const payloadHashLc = data.payloadHash.toLowerCase();
+        const granteeLc = data.grantee.toLowerCase();
+        const contractAddressLc = data.contractAddress.toLowerCase();
 
         // Insert the row up-front (mirrors anchorDocument / issuePredicateAttestation):
         // a stable handle the caller can poll. active=false until the chain indexer
         // (Phase 2) confirms the grant is present in ledger state — the handler insert
         // is an optimistic placeholder, the chain is the source of truth.
-        const disclosureGrantId = cds.utils.uuid();
+        // Reuse an existing row for the same logical key (contract, payloadHash,
+        // grantee) so retries / re-grants don't accumulate orphan placeholder rows.
         const insertedAt = new Date().toISOString();
-        await db.run(INSERT.into(DisclosureGrants).entries({
-            ID:              disclosureGrantId,
-            payloadHash:     payloadHashLc,
-            grantee:         granteeLc,
-            level:           levelNum,
-            contractAddress: data.contractAddress,
-            grantedTxHash:   null,
-            revokedTxHash:   null,
-            active:          false,
-            createdAt:       insertedAt,
-            modifiedAt:      insertedAt
-        }));
+        const existingGrant: any = await db.run(
+            SELECT.one.from(DisclosureGrants).columns('ID').where({
+                contractAddress: contractAddressLc,
+                payloadHash: payloadHashLc,
+                grantee: granteeLc
+            })
+        );
+        const disclosureGrantId = existingGrant?.ID ?? cds.utils.uuid();
+        if (existingGrant) {
+            await db.run(UPDATE.entity(DisclosureGrants)
+                .set({ level: levelNum, revokedTxHash: null, modifiedAt: insertedAt })
+                .where({ ID: disclosureGrantId }));
+        } else {
+            await db.run(INSERT.into(DisclosureGrants).entries({
+                ID: disclosureGrantId,
+                payloadHash: payloadHashLc,
+                grantee: granteeLc,
+                level: levelNum,
+                contractAddress: contractAddressLc,
+                grantedTxHash: null,
+                revokedTxHash: null,
+                active: false,
+                createdAt: insertedAt,
+                modifiedAt: insertedAt
+            }));
+        }
 
         return runSubmission(req, async () => {
             const facadeCfg = facadeConfigFromEnv();
@@ -647,30 +662,30 @@ export function registerSubmissionHandlers(
             const wallet = await walletFactory({ sessionId: data.sessionId!, db, facadeConfig: facadeCfg });
             const submitter = submitterFactory(buildSubmitterDeps(db, resolved, wallet));
             const registration = {
-                artifactPath:   resolved.artifactPath,
+                artifactPath: resolved.artifactPath,
                 privateStateId: resolved.privateStateId,
-                zkConfigPath:   resolved.zkConfigPath
+                zkConfigPath: resolved.zkConfigPath
             };
 
             const job = await startJob({
-                kind:           'grantDisclosure',
-                sessionId:      data.sessionId!,
+                kind: 'grantDisclosure',
+                sessionId: data.sessionId!,
                 idempotencyKey: data.idempotencyKey,
                 request: {
-                    payloadHash:     payloadHashLc,
-                    grantee:         granteeLc,
-                    level:           levelNum,
-                    contractAddress: data.contractAddress,
+                    payloadHash: payloadHashLc,
+                    grantee: granteeLc,
+                    level: levelNum,
+                    contractAddress: contractAddressLc,
                     disclosureGrantId
                 },
                 work: async () => {
                     const result = await submitter.call({
-                        contractAddress: data.contractAddress!,
-                        circuit:         'grantDisclosure',
-                        args:            [payloadHashBytes, granteeBytes, BigInt(levelNum)],
-                        contractName:    compiledRef,
+                        contractAddress: contractAddressLc,
+                        circuit: 'grantDisclosure',
+                        args: [payloadHashBytes, granteeBytes, BigInt(levelNum)],
+                        contractName: compiledRef,
                         registration,
-                        sessionId:       data.sessionId!
+                        sessionId: data.sessionId!
                     });
 
                     const grantedAt = new Date().toISOString();
@@ -681,14 +696,14 @@ export function registerSubmissionHandlers(
                     // Best-effort: pull the grant back out of on-chain state so the
                     // row's `active` flag becomes chain-confirmed. Never fail the
                     // submit on an indexing error — the row already records intent.
-                    await reindexAfterSubmit(data.contractAddress!, resolved);
+                    await reindexAfterSubmit(contractAddressLc, resolved);
 
                     return {
                         disclosureGrantId,
                         payloadHash: payloadHashLc,
-                        grantee:     granteeLc,
-                        level:       levelNum,
-                        txHash:      result.txHash
+                        grantee: granteeLc,
+                        level: levelNum,
+                        txHash: result.txHash
                     };
                 }
             });
@@ -707,11 +722,11 @@ export function registerSubmissionHandlers(
             idempotencyKey?: string;
         };
 
-        if (!data.payloadHash)                     return req.reject(400, 'payloadHash is required');
+        if (!data.payloadHash) return req.reject(400, 'payloadHash is required');
         if (!SHA256_HEX_RE.test(data.payloadHash)) return req.reject(400, 'payloadHash must be 64 hex chars (32 bytes)');
-        if (!data.grantee)                         return req.reject(400, 'grantee is required');
-        if (!SHA256_HEX_RE.test(data.grantee))     return req.reject(400, 'grantee must be 64 hex chars (32 bytes)');
-        if (!data.sessionId)       return req.reject(400, 'sessionId is required');
+        if (!data.grantee) return req.reject(400, 'grantee is required');
+        if (!SHA256_HEX_RE.test(data.grantee)) return req.reject(400, 'grantee must be 64 hex chars (32 bytes)');
+        if (!data.sessionId) return req.reject(400, 'sessionId is required');
         if (!data.contractAddress) return req.reject(400, 'contractAddress is required');
 
         const compiledRef = data.compiledArtifactRef && data.compiledArtifactRef.length > 0
@@ -722,9 +737,10 @@ export function registerSubmissionHandlers(
         if (!checkRate(disclosureRateLimiter, data.sessionId, req)) return;
 
         const payloadHashBytes = hexToBytes(data.payloadHash);
-        const granteeBytes     = hexToBytes(data.grantee);
-        const payloadHashLc    = data.payloadHash.toLowerCase();
-        const granteeLc        = data.grantee.toLowerCase();
+        const granteeBytes = hexToBytes(data.grantee);
+        const payloadHashLc = data.payloadHash.toLowerCase();
+        const granteeLc = data.grantee.toLowerCase();
+        const contractAddressLc = data.contractAddress.toLowerCase();
 
         return runSubmission(req, async () => {
             const facadeCfg = facadeConfigFromEnv();
@@ -733,28 +749,28 @@ export function registerSubmissionHandlers(
             const wallet = await walletFactory({ sessionId: data.sessionId!, db, facadeConfig: facadeCfg });
             const submitter = submitterFactory(buildSubmitterDeps(db, resolved, wallet));
             const registration = {
-                artifactPath:   resolved.artifactPath,
+                artifactPath: resolved.artifactPath,
                 privateStateId: resolved.privateStateId,
-                zkConfigPath:   resolved.zkConfigPath
+                zkConfigPath: resolved.zkConfigPath
             };
 
             const job = await startJob({
-                kind:           'revokeDisclosure',
-                sessionId:      data.sessionId!,
+                kind: 'revokeDisclosure',
+                sessionId: data.sessionId!,
                 idempotencyKey: data.idempotencyKey,
                 request: {
-                    payloadHash:     payloadHashLc,
-                    grantee:         granteeLc,
-                    contractAddress: data.contractAddress
+                    payloadHash: payloadHashLc,
+                    grantee: granteeLc,
+                    contractAddress: contractAddressLc
                 },
                 work: async () => {
                     const result = await submitter.call({
-                        contractAddress: data.contractAddress!,
-                        circuit:         'revokeDisclosure',
-                        args:            [payloadHashBytes, granteeBytes],
-                        contractName:    compiledRef,
+                        contractAddress: contractAddressLc,
+                        circuit: 'revokeDisclosure',
+                        args: [payloadHashBytes, granteeBytes],
+                        contractName: compiledRef,
                         registration,
-                        sessionId:       data.sessionId!
+                        sessionId: data.sessionId!
                     });
 
                     // Mark any matching optimistic/active grant row as revoked. The
@@ -764,19 +780,19 @@ export function registerSubmissionHandlers(
                     await db.run(UPDATE.entity(DisclosureGrants)
                         .set({ revokedTxHash: result.txHash, active: false, modifiedAt: revokedAt })
                         .where({
-                            contractAddress: data.contractAddress,
-                            payloadHash:     payloadHashLc,
-                            grantee:         granteeLc
+                            contractAddress: contractAddressLc,
+                            payloadHash: payloadHashLc,
+                            grantee: granteeLc
                         }));
 
                     // Best-effort: reconcile against on-chain state (the chain is
                     // authoritative on `active`). Never fail the submit on error.
-                    await reindexAfterSubmit(data.contractAddress!, resolved);
+                    await reindexAfterSubmit(contractAddressLc, resolved);
 
                     return {
                         payloadHash: payloadHashLc,
-                        grantee:     granteeLc,
-                        txHash:      result.txHash
+                        grantee: granteeLc,
+                        txHash: result.txHash
                     };
                 }
             });
@@ -788,6 +804,14 @@ export function registerSubmissionHandlers(
     srv.on('registerGranteeIdentity', async (req: Request) => {
         const userId = (req as any).user?.id;
         if (!userId) return req.reject(401, 'authentication required');
+
+        // NIGHTGATE does not verify ownership of the binding input. Deployments
+        // that gate reads on on-chain grants should disable self-service and
+        // register identities via their own proofing flow.
+        if (!isSelfServiceGranteeRegistrationAllowed(getNightgatePluginConfig())) {
+            return req.reject(403, 'Self-service grantee registration is disabled on this deployment. ' +
+                'Identities are registered through the operator\'s proofing flow.');
+        }
 
         const { bindingInput, scope } = req.data as { bindingInput?: string; scope?: string };
         if (!bindingInput) return req.reject(400, 'bindingInput is required');
@@ -847,9 +871,9 @@ export function registerSubmissionHandlers(
 
         const contractProvidersConfig: ContractProvidersConfig = {
             indexerHttpUrl: submissionEndpoints.indexerHttpUrl,
-            indexerWsUrl:   submissionEndpoints.indexerWsUrl,
+            indexerWsUrl: submissionEndpoints.indexerWsUrl,
             proofServerUrl: submissionEndpoints.proofServerUrl,
-            zkConfigPath:   resolved.zkConfigPath
+            zkConfigPath: resolved.zkConfigPath
         };
 
         return {
@@ -868,9 +892,9 @@ function facadeConfigFromEnv() {
     return {
         networkId: network as 'preprod' | 'testnet' | 'mainnet',
         indexerHttpUrl: submissionEndpoints.indexerHttpUrl,
-        indexerWsUrl:   submissionEndpoints.indexerWsUrl,
+        indexerWsUrl: submissionEndpoints.indexerWsUrl,
         proofServerUrl: submissionEndpoints.proofServerUrl,
-        relayUrl:       nodeUrl
+        relayUrl: nodeUrl
     };
 }
 
@@ -879,7 +903,7 @@ function contractProvidersConfigFromEnv(zkConfigPath: string): ContractProviders
     const { submissionEndpoints } = resolveNightgateRuntimeConfig(getNightgatePluginConfig());
     return {
         indexerHttpUrl: submissionEndpoints.indexerHttpUrl,
-        indexerWsUrl:   submissionEndpoints.indexerWsUrl,
+        indexerWsUrl: submissionEndpoints.indexerWsUrl,
         proofServerUrl: submissionEndpoints.proofServerUrl,
         zkConfigPath
     };

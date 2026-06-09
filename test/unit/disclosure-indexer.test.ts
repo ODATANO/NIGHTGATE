@@ -95,7 +95,7 @@ function seqDb(responses: any[]) {
 }
 
 describe('reindexDisclosures', () => {
-    const CONTRACT = '0xVAULT';
+    const CONTRACT = '0xvault';
 
     test('returns zero and never decodes when contract state is null', async () => {
         const db = seqDb([]);
@@ -180,5 +180,64 @@ describe('reindexDisclosures', () => {
         });
         const activeSelect = db.calls.find(c => classify(c) === 'SELECT');
         expect(JSON.stringify(activeSelect.SELECT.where)).toContain(CONTRACT);
+    });
+
+    test('normalizes contractAddress to lowercase in queries and inserts', async () => {
+        const led = makeLedger({ 0xaa: [[0xcc, 1]] });
+        // order: SELECT.one existing → INSERT → SELECT active rows
+        const db = seqDb([undefined, undefined, []]);
+        await reindexDisclosures({
+            db, contractAddress: '0xVaUlT', ledger: () => led,
+            queryContractState: async () => ({ data: {} })
+        });
+        const insert = db.calls.find(c => classify(c) === 'INSERT');
+        expect(insert.INSERT.entries[0].contractAddress).toBe('0xvault');
+        for (const c of db.calls.filter(x => classify(x) === 'SELECT')) {
+            expect(JSON.stringify(c.SELECT.where)).not.toContain('0xVaUlT');
+        }
+    });
+
+    test('does not sweep a row modified within the grace window (stale-read protection)', async () => {
+        const led = makeLedger({ 0xaa: [] }); // chain view shows no grants
+        const fresh = {
+            ID: 'fresh', payloadHash: hx(b(0xaa)), grantee: hx(b(0xcc)),
+            modifiedAt: new Date().toISOString()
+        };
+        const db = seqDb([[fresh]]);
+        const res = await reindexDisclosures({
+            db, contractAddress: CONTRACT, ledger: () => led,
+            queryContractState: async () => ({ data: {} })
+        });
+        expect(res.deactivated).toBe(0);
+        expect(db.calls.some(c => classify(c) === 'UPDATE')).toBe(false);
+    });
+
+    test('sweeps a row whose modifiedAt is older than the grace window', async () => {
+        const led = makeLedger({ 0xaa: [] });
+        const old = {
+            ID: 'old', payloadHash: hx(b(0xaa)), grantee: hx(b(0xcc)),
+            modifiedAt: new Date(Date.now() - 11 * 60 * 1000).toISOString()
+        };
+        const db = seqDb([[old], undefined]);
+        const res = await reindexDisclosures({
+            db, contractAddress: CONTRACT, ledger: () => led,
+            queryContractState: async () => ({ data: {} })
+        });
+        expect(res.deactivated).toBe(1);
+    });
+
+    test('sweepGraceMs=0 sweeps regardless of modifiedAt', async () => {
+        const led = makeLedger({ 0xaa: [] });
+        const fresh = {
+            ID: 'fresh', payloadHash: hx(b(0xaa)), grantee: hx(b(0xcc)),
+            modifiedAt: new Date().toISOString()
+        };
+        const db = seqDb([[fresh], undefined]);
+        const res = await reindexDisclosures({
+            db, contractAddress: CONTRACT, ledger: () => led,
+            queryContractState: async () => ({ data: {} }),
+            sweepGraceMs: 0
+        });
+        expect(res.deactivated).toBe(1);
     });
 });
