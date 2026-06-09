@@ -1,6 +1,45 @@
 # Changelog
 
-## Unreleased
+## 0.3.5 - 2026-06-09
+
+### Wallet sync robustness 
+
+- **`getWalletBalance` fix**: read the dust balance from the synced `FacadeState`'s `DustWalletState` (`synced.dust.balance(now)`), not `facade.dust` (a `DustWalletAPI` with no `balance()`). The latter threw `dust.balance is not a function` (HTTP 500).
+- **Genuine-sync gate** (`waitForGenuineSync`): the SDK's `isSynced` flag is unreliable: when the wallet never receives a chain tip, `highestIndex` stays `0` and `isSynced` is trivially true (`appliedIndex >= 0`) while the wallet is 100k+ blocks behind. Balancing then spends dust whose merkle roots have pruned out of the node's ~1h `root_history`, so the node rejects the tx with `Custom error 117` (NotNormalized / empty dust actions). The worker now polls the dust `appliedIndex` against the indexer's **real** tip and refuses to submit with a clear `"wallet N blocks behind"` instead of building a doomed stale-dust tx. Wired into the prewarm sync + `balanceTx`. Known limit: the public preprod endpoints stall the dust catch-up, so a far-behind wallet needs a stable local indexer to reach the tip.
+
+## 0.3.4 - 2026-06-07
+
+### 2026-06-07: On-chain disclosure grants (for NIGHTPASS)
+
+Surfaces the existing attester-gated `AttestationVault` tiered-disclosure ACL through the plugin so tier **entitlement** becomes on-chain source of truth. No Compact change: the `grantDisclosure` / `revokeDisclosure` circuits already existed. Live-validated on preprod through grant → chain index → `active=true` read-back (the live revoke is pending, blocked by a preprod indexer / dust-sync limitation, not the feature). FR: `docs/feature-requests/expose-disclosure-grants.md`.
+
+- **Write side**: `grantDisclosure` / `revokeDisclosure` async-job OData actions on `NightgateService`. Attester-only (enforced in-circuit), idempotency-key dedupe, rate-limited, mainnet-gated.
+- **Read side**: `DisclosureGrants` entity, chain-derived from the on-chain `disclosures` ledger Map via the artifact's `ledger()` decoder. The outer map is **not iterable** (member/lookup only), so grants are enumerated via the iterable `attestation_owners` then drilled into the inner per-payload map. Reconciled to on-chain state by a best-effort post-submit reindexer (`srv/submission/disclosure-indexer.ts`).
+- **Grantee binding**: `cds.requires.nightgate.granteeBinding` (`wallet` | `did` | `custom`, default `wallet`) + `GranteeIdentities` entity + `registerGranteeIdentity` action + `deriveGranteeId` / `resolveGranteeId` (`srv/submission/grantee-identity.ts`).
+- **Gate**: `attachDisclosureRole({ contractAddress, payloadHash? })` resolves the tier from the on-chain ACL (level `0/1/2` → `public_only` / `legitimate_interest` / `authority`) when a contract scope is given, and is authoritative there; without a scope it falls back to the off-chain `DisclosureRoles` table (unchanged behavior).
+- **Tooling / migration**: `npm run disclosure:e2e` (live e2e) + `scripts/apply-schema-delta.mjs`, which additively creates the new tables (`DisclosureGrants`, `GranteeIdentities`) on an existing database. `cds-serve` does **not** auto-create them, so **existing consumers must run this (or `cds deploy`) on upgrade** or reads/writes fail with `no such table`. Tests: 767/767.
+
+## 0.3.3 - 2026-06-05
+
+### 2026-06-05: Code-quality cleanup
+
+- Refactor + readability pass across multiple files; no functional or behavioral change.
+- Removed the superseded `db/enhancements.md`, purged internal task references, and renamed the deploy e2e script.
+
+## 0.3.2 - 2026-06-01
+
+### 2026-06-01: Typed argument coercion for `submitContractCall`
+
+The generic `submitContractCall` action can now pass `Bytes<N>` (and other non-JSON-native) circuit arguments. Previously only the built-in `attest` / `commitValue` / `provePredicate` wrappers (which encode internally) worked, so any consumer-registered circuit taking `Bytes<N>` was uncallable via the public OData surface. Reported by NIGHTPASS (T19); unblocks calls like `bindPassport(passportId: Bytes<32>, …)`. FR: `docs/feature-requests/submitcontractcall-bytes-args.md`.
+
+- New `srv/submission/arg-coercion.ts`, wired into the `submitContractCall` handler. Two encodings supported: introspected convention (circuit arg types from the artifact's `contract-info.json`) and explicit tagged values. Invalid hex / wrong byte length / non-integer `Uint` surface as a clean `400`, not a deep circuit type error.
+- Docs: `docs/actions.md` → *Encoding circuit args*. Tests: full suite 709/709 (+18).
+
+## 0.3.1 - 2026-05-31
+
+### 2026-05-31: Packaging, consumer subpath exports
+
+- Added `./cds-plugin`, `./cds-plugin.js`, and `./package.json` subpath exports so consumers and CAP tooling resolve the plugin entry cleanly. `.gitignore` housekeeping. No runtime behavior change.
 
 ## 0.3.0 - 2026-05-29
 

@@ -9,6 +9,11 @@ services:
       - "30333:30333" # P2P
     environment:
       # Local standalone preset; keep this for undeployed/local testing.
+      # NOTE: CFG_PRESET=preprod does NOT work standalone — a preprod node is a
+      # Cardano partner chain and requires a Cardano db-sync + Postgres
+      # (main-chain follower), else it fails config validation
+      # ("db_sync_postgres_connection_string must be defined"). That Cardano
+      # dependency is the heavy part; use the public preprod RPC instead.
       CFG_PRESET: dev
       SIDECHAIN_BLOCK_BENEFICIARY: "04bcf7ad3be7a5c790460be82a713af570f22e0f801f6659ab8e84a52be6969e"
     volumes:
@@ -77,6 +82,13 @@ services:
       # placeholder per the indexer's config schema.
       APP__INFRA__SPO_NODE__BLOCKFROST_ID: "dummy-not-using-spo"
       RUST_LOG: "indexer_standalone=info,chain_indexer=info,indexer_api=info,wallet_indexer=info,indexer_common=info,info"
+      # Catch-up tuning: the default concurrency_limit=1 indexes serially
+      # (~0.4 blk/s, weeks to catch up). Parallelize block fetch/processing and
+      # widen the buffers to speed the historical sync. If the upstream public
+      # RPC rate-limits, dial CONCURRENCY_LIMIT back down.
+      APP__APPLICATION__CONCURRENCY_LIMIT: "16"
+      APP__APPLICATION__BLOCKS_BUFFER: "100"
+      APP__APPLICATION__TRANSACTION_BATCH_SIZE: "200"
     volumes:
       - indexer-data:/data
     restart: unless-stopped
@@ -88,11 +100,13 @@ services:
     deploy:
       resources:
         limits:
+          # Bumped 2->8 CPU / 4->8G to speed up the catch-up sync; the SQLite
+          # layer was disk/cache-bound (multi-second slow-query warnings) at 4G.
+          cpus: "8.0"
+          memory: 8G
+        reservations:
           cpus: "2.0"
           memory: 4G
-        reservations:
-          cpus: "0.5"
-          memory: 1G
 
   # Midnight Proof Server, generates ZK proofs for contract calls/deploys.
   # Required by the submission path (T4). The crawler does NOT need this.

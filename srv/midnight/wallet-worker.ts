@@ -72,6 +72,8 @@ interface FacadeEntry {
     unshieldedKeystore: any;
     saveTimer?: NodeJS.Timeout;
     networkId: string;
+    /** Indexer GraphQL HTTP URL — used to read the genuine sync target (tip). */
+    indexerHttpUrl: string;
     // 32-byte session-stable secret for contracts that use the
     // `local_secret_key()` witness pattern (e.g. AttestationVault). Derived
     // once per facade build via deriveAttestationSecret(seedBytes).
@@ -307,6 +309,77 @@ async function waitForSyncedStateBounded(facade: any, timeoutMs: number): Promis
     }
 }
 
+// How close to the indexer tip counts as "caught up" (blocks). The tip advances
+// ~1 block / 6s, so a few blocks of slack avoids chasing a moving target.
+const SYNC_TIP_GAP = BigInt(process.env.NIGHTGATE_SYNC_TIP_GAP || '8');
+const SYNC_POLL_MS = 3000;
+const wsleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
+
+/** Read the indexer's latest indexed block height — the genuine sync target. */
+async function getIndexerTipHeight(indexerHttpUrl: string): Promise<bigint | null> {
+    try {
+        const r = await fetch(indexerHttpUrl, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ query: '{ block { height } }' }),
+            signal: AbortSignal.timeout(15_000)
+        });
+        const j: any = await r.json();
+        const h = j?.data?.block?.height;
+        return h != null ? BigInt(h) : null;
+    } catch { return null; }
+}
+
+/**
+ * GENUINE sync gate — does NOT trust the SDK's `isSynced` flag.
+ *
+ * When the wallet never receives a chain tip, `highestIndex` stays 0 and
+ * `isSynced` is trivially true (`appliedIndex >= 0`) while the wallet is
+ * actually 100k+ blocks behind. Balancing then spends dust whose merkle roots
+ * have pruned out of the node's ~1h `root_history` → the node rejects the tx as
+ * `Custom error 117` (NotNormalized / empty dust actions). See
+ * docs / project memory for the full diagnosis.
+ *
+ * Instead we poll the dust `progress.appliedIndex` against the indexer's REAL
+ * tip height and return only when it genuinely catches up (within
+ * SYNC_TIP_GAP) with `isConnected`. On timeout we throw a clear
+ * "N blocks behind" error rather than letting a stale-dust tx hit 117.
+ * `waitForSyncedState()` is used only to grab the current FacadeState snapshot
+ * (its premature "synced" is fine — we read the numbers, not the flag).
+ */
+async function waitForGenuineSync(facade: any, indexerHttpUrl: string, timeoutMs: number, label: string): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    let lastLog = 0;
+    let lastApplied = -1n;
+    while (Date.now() < deadline) {
+        const target = await getIndexerTipHeight(indexerHttpUrl);
+        let state: any;
+        try {
+            state = await Promise.race([
+                facade.waitForSyncedState(),
+                new Promise((_, rej) => setTimeout(() => rej(new Error('snapshot timeout')), 30_000))
+            ]);
+        } catch { await wsleep(SYNC_POLL_MS); continue; }
+        const p: any = state?.dust?.progress;
+        const applied = p?.appliedIndex != null ? BigInt(p.appliedIndex) : -1n;
+        const connected = p?.isConnected === true;
+        lastApplied = applied;
+        if (target != null && applied >= 0n && connected && applied >= target - SYNC_TIP_GAP) {
+            log('info', `[worker] genuine-sync [${label}] CAUGHT UP: appliedIndex=${applied} target=${target}`);
+            return;
+        }
+        if (Date.now() - lastLog > 15_000) {
+            const behind = target != null && applied >= 0n ? (target - applied).toString() : '?';
+            log('info', `[worker] genuine-sync [${label}] appliedIndex=${applied} target=${target} behind=${behind} connected=${connected}`);
+            lastLog = Date.now();
+        }
+        await wsleep(SYNC_POLL_MS);
+    }
+    const target = await getIndexerTipHeight(indexerHttpUrl);
+    const behind = target != null && lastApplied >= 0n ? (target - lastApplied).toString() : '?';
+    throw new Error(`wallet not synced to tip after ${timeoutMs}ms: dust appliedIndex=${lastApplied} target=${target} (${behind} blocks behind, isConnected check failed or stalled)`);
+}
+
 function buildWorkerWalletProvider(entry: FacadeEntry): any {
     return {
         getCoinPublicKey(): string       { return entry.zswapKeys.coinPublicKey; },
@@ -326,7 +399,10 @@ function buildWorkerWalletProvider(entry: FacadeEntry): any {
             // make waitForSyncedState hang forever. Race it against a timeout so
             // a stalled sync surfaces as a clear, classifiable submission error
             // instead of an indefinite hang.
-            await waitForSyncedStateBounded(entry.facade, BALANCE_SYNC_TIMEOUT_MS);
+            // GENUINE sync to the indexer tip (not the lying isSynced flag), so
+            // we never balance stale dust → Custom error 117. The prewarm should
+            // have already caught up; this is a fast re-check on the warm path.
+            await waitForGenuineSync(entry.facade, entry.indexerHttpUrl, BALANCE_SYNC_TIMEOUT_MS, 'balance');
             const effectiveTtl = ttl ?? new Date(Date.now() + 60 * 60 * 1000);
             const recipe = await entry.facade.balanceUnboundTransaction(
                 tx,
@@ -553,7 +629,14 @@ async function buildFacade(args: InitArgs): Promise<FacadeEntry> {
         unshielded: () => restore?.unshielded
             ? UnshieldedWallet(configuration).restore(restore.unshielded)
             : UnshieldedWallet(configuration).startWithPublicKey(PublicKey.fromKeyStore(unshieldedKeystore)),
-        dust: () => restore?.dust
+        // NIGHTGATE_DUST_COLD_START=true forces the dust sub-wallet to sync
+        // fresh from chain instead of restoring the persisted blob. Restored
+        // dust state can carry merkle roots that have since been pruned from the
+        // node's ~1h root_history, making the (large) dust balance UNSPENDABLE
+        // and every submission fail with Custom error 117 (NotNormalized: empty
+        // dust actions). Cold-starting dust rebuilds spendable, fresh-rooted
+        // outputs. Experimental flag while we settle on a permanent fix.
+        dust: () => (restore?.dust && process.env.NIGHTGATE_DUST_COLD_START !== 'true')
             ? DustWallet(configuration).restore(restore.dust)
             : DustWallet(configuration).startWithSecretKey(dustKey, dustParameters)
     });
@@ -568,6 +651,7 @@ async function buildFacade(args: InitArgs): Promise<FacadeEntry> {
         dustKey,
         unshieldedKeystore,
         networkId: args.networkId,
+        indexerHttpUrl: args.indexerHttpUrl,
         attestationSecret: deriveAttestationSecret(roleSeeds.zswap)
     };
 }
@@ -661,13 +745,11 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
     async waitForSyncedState({ sessionId, timeoutMs }: { sessionId: string; timeoutMs?: number }) {
         const entry = facades.get(sessionId);
         if (!entry) throw new Error(`No facade for sessionId=${sessionId.slice(0, 16)}`);
-        const deadline = timeoutMs
-            ? new Promise<never>((_, rej) => setTimeout(() => rej(new Error('waitForSyncedState timeout')), timeoutMs))
-            : null;
-        const synced = deadline
-            ? Promise.race([entry.facade.waitForSyncedState(), deadline])
-            : entry.facade.waitForSyncedState();
-        await synced;
+        // GENUINE catch-up to the indexer tip (ignores the unreliable isSynced
+        // flag, which is trivially true when highestIndex=0). This is the
+        // prewarm path → use a long budget so a far-behind wallet can actually
+        // reach the tip before any submission balances dust.
+        await waitForGenuineSync(entry.facade, entry.indexerHttpUrl, timeoutMs ?? 3 * 60 * 60 * 1000, 'prewarm');
         return { synced: true };
     },
 
@@ -1083,8 +1165,15 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
 
         const shieldedNight   = shieldedBalances[nightRawType]   ?? 0n;
         const unshieldedNight = unshieldedBalances[nightRawType] ?? 0n;
-        // dust.balance(time) is synchronous and returns Balance (= bigint).
-        const dustBalance: bigint = entry.facade.dust.balance(new Date());
+        // dust.balance(time) is synchronous and returns Balance (= bigint). It
+        // lives on the DustWalletState carried by the synced FacadeState — NOT
+        // on facade.dust (which is a DustWalletAPI with no balance() method).
+        const dustBalance: bigint = synced?.dust ? synced.dust.balance(new Date()) : 0n;
+        // DIAGNOSTIC: real sync distance to tip + whether 'synced' is genuine.
+        try {
+            const p: any = (synced as any)?.dust?.progress;
+            log('info', `[worker] SYNC-PROGRESS isSynced=${(synced as any)?.isSynced} isConnected=${p?.isConnected} appliedIndex=${p?.appliedIndex} highestIndex=${p?.highestIndex} highestRelevantIndex=${p?.highestRelevantIndex}`);
+        } catch (e: any) { log('info', `[worker] SYNC-PROGRESS read failed: ${e?.message}`); }
         const registeredCount = totalNightCoins.filter(
             (c: any) => c?.meta?.registeredForDustGeneration === true
         ).length;
