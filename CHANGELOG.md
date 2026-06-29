@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.4.0 - 2026-06-29
+
+### Browser / connector surface for wallet-driven AttestationVault calls
+
+Exposes NIGHTGATE building blocks so a browser dApp (NIGHTPASS via the Lace DApp-Connector) can attest / grant / revoke on the AttestationVault without the Compact toolchain or a copy of `managed/`. The headless server-side submission path is unchanged.
+
+- **`@odatano/nightgate/browser` (ESM)**: attester-secret derivation + witnesses, `FetchZkConfigProvider`, `InMemoryPrivateStateProvider`, `createNightgateConnectorProviders`, and `prepareAttest` / `prepareGrantDisclosure` / `prepareRevokeDisclosure` call helpers. New `./browser` and `./browser/attestation-vault` subpath exports; `check:browser` script; optional `@midnight-ntwrk/dapp-connector-api` peer dep.
+- **HTTP routes** (mounted in the security-header bootstrap hook): `GET /zk-config/<contract>/{keys,zkir}/<circuit>` (ETag / 304 / cache) serves a contract's proving artifacts, and `GET /contract-manifest` advertises network, zk-config base URL, and registered contracts. Only registered contracts are servable: `contract-registry.getContractRegistration()` is the security boundary.
+- **Manifest address pinning**: optional `cds.requires.nightgate.contracts.<name>.address` is advertised in the manifest so connector consumers can self-configure.
+- **Wallet sync-gate fix**: `waitForGenuineSync` reads `facade.state()` instead of blocking on `waitForSyncedState()`.
+- **Tooling**: Node `>=22` (`engines`), CI matrix moved to 22.x / 24.x, eslint browser globals for `src/browser/**`.
+
+Live-validated on preprod through prove + balance via Lace; submit is gated only by wallet DUST.
+
 ## 0.3.6 - 2026-06-09
 
 ### Disclosure-grants hardening and cleanup

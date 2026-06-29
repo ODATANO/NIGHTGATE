@@ -51,6 +51,7 @@ The wallet SDK lives in `worker_threads` because Midnight's Effect.ts fiber sche
 | Document anchoring | ✅ `anchorDocument` / `verifyDocument` — hash on-chain, caller-managed storage |
 | ZK predicate attestations | ✅ `issuePredicateAttestation` — prove `value ≤/≥ threshold` without revealing the value |
 | Tiered disclosure (RBAC) | ✅ `AttestationService` mixin + `DisclosureRoles` (EU Battery Reg tiers) |
+| Browser / connector surface | ✅ `@odatano/nightgate/browser` + `/zk-config` + `/contract-manifest` for wallet-driven (Lace) AttestationVault calls |
 | Token transfer (shielded + unshielded) | ✅ `sendNight` with auto-detected receiver ledger |
 | Cross-ledger shift | ✅ `shieldFunds` / `unshieldFunds` via SDK `initSwap` |
 | Dust generation lifecycle | ✅ `registerForDustGeneration` / `deregisterFromDustGeneration` |
@@ -113,6 +114,16 @@ Submit actions are **async**: they return `{ jobId, status }`; poll `getJobStatu
 | Standard OData on `Blocks` / `Transactions` / `ContractActions` / `UnshieldedUtxos` / `NightBalances` | Full query surface with `$filter`, `$orderby`, `$top`, `$skip`, `$expand` |
 
 For exhaustive signatures, error codes, and curl examples: [docs/actions.md](docs/actions.md).
+
+## Browser / connector surface
+
+For the browser human-attester path (a dApp driving AttestationVault calls from a wallet such as Lace, via the Midnight DApp-Connector), NIGHTGATE ships the building blocks so a consumer needs neither the Compact toolchain nor a copy of `managed/`:
+
+- **`@odatano/nightgate/browser`** (ESM): attester-secret derivation + witnesses, `FetchZkConfigProvider`, `InMemoryPrivateStateProvider`, `createNightgateConnectorProviders`, and `prepareAttest` / `prepareGrantDisclosure` / `prepareRevokeDisclosure` call helpers. The compiled contract artifact is importable from `@odatano/nightgate/browser/attestation-vault`.
+- **`GET /zk-config/<contract>/{keys,zkir}/<circuit>`**: serves a registered contract's proving artifacts over HTTP (ETag / 304 / cache). Only registered contracts are servable.
+- **`GET /contract-manifest`**: advertises network, zk-config base URL, and registered contracts (with optional pinned `cds.requires.nightgate.contracts.<name>.address`) so a connector can self-configure.
+
+The flow is: connect wallet, build providers from the manifest, `findDeployedContract`, then `callTx` (prove + balance + submit via the wallet). `@midnight-ntwrk/dapp-connector-api` is an optional peer dependency. The headless server-side submission path is unchanged.
 
 ## Documentation
 
