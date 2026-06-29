@@ -32,6 +32,13 @@ export interface NightgatePluginConfig {
         artifactPath: string;
         privateStateId: string;
         zkConfigPath: string;
+        /**
+         * Optional canonical deployed address(es) for this contract, advertised
+         * in `GET /contract-manifest` so connector consumers can self-configure.
+         * NIGHTGATE does not require it — the deployed address is otherwise
+         * per-deployment and caller-supplied. Accept a single string or a list.
+         */
+        address?: string | string[];
     }>;
     /**
      * Safety gate for mainnet. Default false: submission actions reject when

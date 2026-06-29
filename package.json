@@ -1,6 +1,6 @@
 {
   "name": "@odatano/nightgate",
-  "version": "0.3.6",
+  "version": "0.4.0",
   "description": "CAP Plugin: Midnight Blockchain Indexer with OData V4 API",
   "homepage": "https://github.com/ODATANO/NIGHTGATE#readme",
   "repository": {
@@ -44,7 +44,17 @@
       "types": "./src/sdk/AttestationService.d.ts",
       "default": "./src/sdk/AttestationService.js"
     },
-    "./sdk/AttestationService.cds": "./src/sdk/AttestationService.cds"
+    "./sdk/AttestationService.cds": "./src/sdk/AttestationService.cds",
+    "./browser": {
+      "types": "./src/browser/index.d.ts",
+      "import": "./src/browser/index.mjs",
+      "default": "./src/browser/index.mjs"
+    },
+    "./browser/attestation-vault": {
+      "types": "./contracts/attestation-vault/src/managed/attestation-vault/contract/index.d.ts",
+      "import": "./contracts/attestation-vault/src/managed/attestation-vault/contract/index.js",
+      "default": "./contracts/attestation-vault/src/managed/attestation-vault/contract/index.js"
+    }
   },
   "files": [
     "cds-plugin.js",
@@ -52,6 +62,7 @@
     "db/types.cds",
     "src/**/*.cds",
     "src/**/*.js",
+    "src/**/*.mjs",
     "src/**/*.d.ts",
     "srv/**/*.cds",
     "srv/**/*.js",
@@ -89,6 +100,7 @@
     "integration:wallet-keys": "node scripts/integration-test-wallet-keys.mjs",
     "integration:wallet-facade": "node scripts/integration-test-wallet-facade.mjs",
     "integration:contract-registry": "node scripts/integration-test-contract-registry.mjs",
+    "check:browser": "node scripts/check-browser-bundle.mjs",
     "integration:attestation-vault": "node scripts/integration-test-attestation-vault.mjs",
     "deploy:e2e": "node --env-file=.env scripts/run-deploy-e2e.mjs",
     "predicate:e2e": "node --env-file=.env scripts/run-predicate-e2e.mjs",
@@ -121,7 +133,13 @@
     "ws": "^8"
   },
   "peerDependencies": {
-    "@sap/cds": ">=9.0.0"
+    "@sap/cds": ">=9.0.0",
+    "@midnight-ntwrk/dapp-connector-api": "^4.0.0"
+  },
+  "peerDependenciesMeta": {
+    "@midnight-ntwrk/dapp-connector-api": {
+      "optional": true
+    }
   },
   "devDependencies": {
     "@cap-js/cds-test": "^0.4.1",

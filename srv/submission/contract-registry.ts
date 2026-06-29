@@ -93,6 +93,17 @@ export function listRegisteredContracts(): string[] {
 }
 
 /**
+ * Look up a registered contract's stored registration (absolute paths) without
+ * importing the artifact. Used by the zk-config HTTP route to resolve a
+ * contract's `zkConfigPath` cheaply. Returns undefined for unknown names —
+ * which the route maps to 404 (the registry is the security boundary: only
+ * registered contracts are servable).
+ */
+export function getContractRegistration(name: string): ContractRegistration | undefined {
+    return registry.get(name);
+}
+
+/**
  * Load all contracts declared under `cds.requires.nightgate.contracts`.
  * Idempotent, safe to call multiple times.
  */

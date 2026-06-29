@@ -353,15 +353,23 @@ async function waitForGenuineSync(facade: any, indexerHttpUrl: string, timeoutMs
     let lastApplied = -1n;
     while (Date.now() < deadline) {
         const target = await getIndexerTipHeight(indexerHttpUrl);
+        // [2026-06-28 FIX] Read state via the NON-BLOCKING facade.state() observable.
+        // facade.waitForSyncedState() is Promise.all([... dust.waitForSyncedState() ...])
+        // which only resolves once every sub-wallet isStrictlyComplete() — never true
+        // against an indexer not yet caught_up to chain tip (highestIndex stays 0), so
+        // it timed out every poll and the real (advancing) appliedIndex was never read.
+        // The observable emits the current FacadeState immediately.
         let state: any;
-        let snapshotTimer: ReturnType<typeof setTimeout> | undefined;
         try {
             state = await Promise.race([
-                facade.waitForSyncedState(),
-                new Promise((_, rej) => { snapshotTimer = setTimeout(() => rej(new Error('snapshot timeout')), 30_000); })
+                new Promise<any>((res, rej) => {
+                    let sub: any;
+                    try { sub = facade.state().subscribe({ next: (v: any) => { res(v); try { sub && sub.unsubscribe(); } catch {} }, error: (e: any) => rej(e) }); }
+                    catch (e) { rej(e); }
+                }),
+                new Promise((_, rej) => setTimeout(() => rej(new Error('state peek timeout')), 30_000))
             ]);
         } catch { await wsleep(SYNC_POLL_MS); continue; }
-        finally { if (snapshotTimer) clearTimeout(snapshotTimer); }
         const p: any = state?.dust?.progress;
         const applied = p?.appliedIndex != null ? BigInt(p.appliedIndex) : -1n;
         const connected = p?.isConnected === true;
