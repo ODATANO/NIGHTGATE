@@ -163,7 +163,7 @@ export interface TransactionSubmitterDeps {
     /** Same idea for `walletSubmitContractCall`. */
     walletSubmitContractCallImpl?: typeof walletSubmitContractCall;
     /** Network, used by classifySubmissionError to decide if 1016 is fail-fast. */
-    network: 'preprod' | 'testnet' | 'mainnet';
+    network: 'preprod' | 'testnet' | 'mainnet' | 'undeployed';
 }
 
 export class TransactionSubmitter {
@@ -407,7 +407,7 @@ const KNOWN_ISSUE_1016_MAINNET =
  * Used by the OData callers and internally to populate
  * PendingSubmissions.errorCode/errorMessage.
  */
-export function classifySubmissionError(err: unknown, network: 'preprod' | 'testnet' | 'mainnet'): SubmissionErrorClassification {
+export function classifySubmissionError(err: unknown, network: 'preprod' | 'testnet' | 'mainnet' | 'undeployed'): SubmissionErrorClassification {
     const message = err instanceof Error ? err.message : String(err);
     const name = err instanceof Error ? err.name : 'Error';
 

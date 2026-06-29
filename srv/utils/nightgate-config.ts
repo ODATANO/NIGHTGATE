@@ -1,6 +1,6 @@
 import cds from '@sap/cds';
 
-export const VALID_NIGHTGATE_NETWORKS = ['testnet', 'preprod', 'mainnet'] as const;
+export const VALID_NIGHTGATE_NETWORKS = ['testnet', 'preprod', 'mainnet', 'undeployed'] as const;
 
 export type NightgateNetwork = (typeof VALID_NIGHTGATE_NETWORKS)[number];
 
@@ -90,6 +90,17 @@ export function getNightgatePluginConfig(): NightgatePluginConfig {
 export const DEFAULT_NETWORK: NightgateNetwork = 'preprod';
 export const DEFAULT_NODE_URL = 'wss://rpc.preprod.midnight.network/';
 
+/**
+ * Per-network default Substrate node RPC URL (the crawler WS endpoint, also
+ * passed to the SDK as `relayURL`). `undeployed` is the local standalone stack
+ * from `midnightntwrk/midnight-local-dev` (`standalone.yml`), where the node
+ * listens on :9944. Falls back to DEFAULT_NODE_URL (preprod) for any network
+ * not listed. Overridable via NIGHTGATE_NODE_URL / config.nodeUrl.
+ */
+export const DEFAULT_NODE_URLS: Partial<Record<NightgateNetwork, string>> = {
+    undeployed: 'ws://127.0.0.1:9944'
+};
+
 export const DEFAULT_INDEXER_URLS: Record<NightgateNetwork, { http: string; ws: string }> = {
     preprod: {
         http: 'https://indexer.preprod.midnight.network/api/v4/graphql',
@@ -102,6 +113,16 @@ export const DEFAULT_INDEXER_URLS: Record<NightgateNetwork, { http: string; ws: 
     mainnet: {
         http: 'https://indexer.midnight.network/api/v4/graphql',
         ws: 'wss://indexer.midnight.network/api/v4/graphql/ws'
+    },
+    // Local standalone network (`networkId: undeployed`). Mirrors the existing
+    // `testnet` localhost convention (:8088). Verified against a live
+    // `indexer-standalone:4.3.2`: it serves BOTH `/api/v3/graphql` and
+    // `/api/v4/graphql` (HTTP 200), so v4 here is correct. Older images may
+    // differ — override via NIGHTGATE_INDEXER_HTTP_URL / NIGHTGATE_INDEXER_WS_URL
+    // if your pinned indexer only exposes v3.
+    undeployed: {
+        http: 'http://127.0.0.1:8088/api/v4/graphql',
+        ws: 'ws://127.0.0.1:8088/api/v4/graphql/ws'
     }
 };
 
@@ -240,7 +261,7 @@ export function resolveNightgateRuntimeConfig(config: Record<string, any> = {}):
     };
     const configuredNetwork = getConfiguredNightgateNetwork(config);
     const { network, invalidNetwork } = normalizeNightgateNetwork(configuredNetwork);
-    const nodeUrl = getConfiguredNightgateNodeUrl(config) || DEFAULT_NODE_URL;
+    const nodeUrl = getConfiguredNightgateNodeUrl(config) || DEFAULT_NODE_URLS[network] || DEFAULT_NODE_URL;
     const crawlerNodeUrl = getConfiguredNightgateCrawlerNodeUrl(config) || nodeUrl;
     const submissionEndpoints = resolveSubmissionEndpoints(network, config);
 

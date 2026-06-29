@@ -890,7 +890,7 @@ function facadeConfigFromEnv() {
     const nightgateConfig = getNightgatePluginConfig();
     const { network, nodeUrl, submissionEndpoints } = resolveNightgateRuntimeConfig(nightgateConfig);
     return {
-        networkId: network as 'preprod' | 'testnet' | 'mainnet',
+        networkId: network as 'preprod' | 'testnet' | 'mainnet' | 'undeployed',
         indexerHttpUrl: submissionEndpoints.indexerHttpUrl,
         indexerWsUrl: submissionEndpoints.indexerWsUrl,
         proofServerUrl: submissionEndpoints.proofServerUrl,

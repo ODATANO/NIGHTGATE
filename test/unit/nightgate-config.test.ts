@@ -50,6 +50,7 @@ describe('normalizeNightgateNetwork', () => {
     it('passes valid networks through unchanged', () => {
         expect(normalizeNightgateNetwork('preprod')).toEqual({ network: 'preprod' });
         expect(normalizeNightgateNetwork('testnet')).toEqual({ network: 'testnet' });
+        expect(normalizeNightgateNetwork('undeployed')).toEqual({ network: 'undeployed' });
     });
 
     it('reports invalidNetwork and falls back to DEFAULT_NETWORK for unknown values', () => {
@@ -193,5 +194,20 @@ describe('resolveNightgateRuntimeConfig', () => {
     it('defaults crawlerNodeUrl to nodeUrl when not separately configured', () => {
         const { crawlerNodeUrl } = resolveNightgateRuntimeConfig({ network: 'preprod', nodeUrl: 'wss://shared/' });
         expect(crawlerNodeUrl).toBe('wss://shared/');
+    });
+
+    it('resolves the undeployed local standalone network to localhost endpoints', () => {
+        const resolved = resolveNightgateRuntimeConfig({ network: 'undeployed' });
+        expect(resolved.network).toBe('undeployed');
+        expect(resolved.invalidNetwork).toBeUndefined();
+        // node defaults to the local standalone :9944 (not the preprod relay)
+        expect(resolved.nodeUrl).toBe('ws://127.0.0.1:9944');
+        expect(resolved.submissionEndpoints.indexerHttpUrl).toContain('127.0.0.1:8088');
+        expect(resolved.submissionEndpoints.indexerWsUrl).toContain('127.0.0.1:8088');
+    });
+
+    it('honours an explicit nodeUrl override even on undeployed', () => {
+        const { nodeUrl } = resolveNightgateRuntimeConfig({ network: 'undeployed', nodeUrl: 'ws://host.docker.internal:9944' });
+        expect(nodeUrl).toBe('ws://host.docker.internal:9944');
     });
 });
