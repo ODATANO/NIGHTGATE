@@ -1,6 +1,6 @@
 import cds from '@sap/cds';
 
-export const VALID_NIGHTGATE_NETWORKS = ['testnet', 'preprod', 'mainnet', 'undeployed'] as const;
+export const VALID_NIGHTGATE_NETWORKS = ['preview', 'testnet', 'preprod', 'mainnet', 'undeployed'] as const;
 
 export type NightgateNetwork = (typeof VALID_NIGHTGATE_NETWORKS)[number];
 
@@ -98,10 +98,18 @@ export const DEFAULT_NODE_URL = 'wss://rpc.preprod.midnight.network/';
  * not listed. Overridable via NIGHTGATE_NODE_URL / config.nodeUrl.
  */
 export const DEFAULT_NODE_URLS: Partial<Record<NightgateNetwork, string>> = {
+    preview: 'wss://rpc.preview.midnight.network/',
     undeployed: 'ws://127.0.0.1:9944'
 };
 
 export const DEFAULT_INDEXER_URLS: Record<NightgateNetwork, { http: string; ws: string }> = {
+    // Preview is the active public dev chain (live since 2026-01-07). Public
+    // hosted indexer with permissive CORS — verified live against the connector
+    // demo. This is the network the browser wallet path targets by default.
+    preview: {
+        http: 'https://indexer.preview.midnight.network/api/v4/graphql',
+        ws: 'wss://indexer.preview.midnight.network/api/v4/graphql/ws'
+    },
     preprod: {
         http: 'https://indexer.preprod.midnight.network/api/v4/graphql',
         ws: 'wss://indexer.preprod.midnight.network/api/v4/graphql/ws'

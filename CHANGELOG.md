@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.4.2 - 2026-07-01
+
+### Preview network support
+
+Adds the Midnight **Preview** network (the active public dev chain since 2026-01-07) as a first-class option, so both the server-side submission path and consumers can target it. Previously `network: "preview"` was rejected and silently fell back to preprod.
+
+- **`preview` is now a valid `NightgateNetwork`** (`cds.requires.nightgate.network`), with default endpoints: indexer `https://indexer.preview.midnight.network/api/v4/graphql` (+ WS), node `wss://rpc.preview.midnight.network/`. Proof server via `--network preview` (docker-compose `NIGHTGATE_PROOF_NETWORK`).
+- Replaced two hard-coded network unions in `TransactionSubmitter` (`TransactionSubmitterDeps.network`, `classifySubmissionError`) with the canonical `NightgateNetwork` type so they no longer drift.
+- Live-validated: the browser connector (NIGHTPASS) ran a full deploy + attest + zero-knowledge predicate round-trip on Preview against the public indexer. Tests 779/779, typecheck clean.
+
 ## 0.4.0 - 2026-06-29
 
 ### Browser / connector surface for wallet-driven AttestationVault calls
