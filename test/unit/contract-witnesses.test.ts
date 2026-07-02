@@ -125,6 +125,59 @@ describe('buildAttestationVaultWitnesses — predicate witnesses (commitValue/pr
     });
 });
 
+describe('buildAttestationVaultWitnesses — field-bound proof witnesses (proveFieldPredicate)', () => {
+    const secret = new Uint8Array(32).fill(0xab);
+    const SIB = ['1', '2', '3', '4'].map((n) => n.repeat(64)); // 4 × 64-hex
+    const proof = { fieldValue: '3600', siblings: SIB, dirs: [true, false, true, false] };
+
+    test('always exposes field_value / merkle_siblings / merkle_dirs (Witnesses<PS> shape complete)', () => {
+        const w = buildAttestationVaultWitnesses({ attestationSecret: secret });
+        expect(typeof w.field_value).toBe('function');
+        expect(typeof w.merkle_siblings).toBe('function');
+        expect(typeof w.merkle_dirs).toBe('function');
+    });
+
+    test('field_value returns [privateState, bigint] when merkleProof supplied', () => {
+        const w = buildAttestationVaultWitnesses({ attestationSecret: secret, merkleProof: proof });
+        const ps = { s: 2 };
+        const [outPs, v] = w.field_value({ privateState: ps });
+        expect(outPs).toBe(ps);
+        expect(v).toBe(3600n);
+    });
+
+    test('merkle_siblings returns 4 decoded 32-byte digests', () => {
+        const w = buildAttestationVaultWitnesses({ attestationSecret: secret, merkleProof: proof });
+        const [, sibs] = w.merkle_siblings({ privateState: null });
+        expect(Array.isArray(sibs)).toBe(true);
+        expect(sibs).toHaveLength(4);
+        for (const s of sibs) {
+            expect(s).toBeInstanceOf(Uint8Array);
+            expect(s.byteLength).toBe(32);
+        }
+        expect(Buffer.from(sibs[0]).toString('hex')).toBe('1'.repeat(64));
+    });
+
+    test('merkle_dirs returns the boolean direction vector', () => {
+        const w = buildAttestationVaultWitnesses({ attestationSecret: secret, merkleProof: proof });
+        const [, dirs] = w.merkle_dirs({ privateState: null });
+        expect(dirs).toEqual([true, false, true, false]);
+    });
+
+    test('field witnesses throw if invoked without merkleProof', () => {
+        const w = buildAttestationVaultWitnesses({ attestationSecret: secret });
+        expect(() => w.field_value({ privateState: null })).toThrow(/without a merkleProof/);
+        expect(() => w.merkle_siblings({ privateState: null })).toThrow(/without a merkleProof/);
+        expect(() => w.merkle_dirs({ privateState: null })).toThrow(/without a merkleProof/);
+    });
+
+    test('wrong-length path fails fast at build time', () => {
+        expect(() => buildAttestationVaultWitnesses({
+            attestationSecret: secret,
+            merkleProof: { fieldValue: '1', siblings: SIB.slice(0, 3), dirs: [true, false, true, false] }
+        })).toThrow(/must each have 4 entries/);
+    });
+});
+
 describe('getContractWitnessFactory', () => {
     test('returns the factory for attestation-vault', () => {
         const factory = getContractWitnessFactory('attestation-vault');

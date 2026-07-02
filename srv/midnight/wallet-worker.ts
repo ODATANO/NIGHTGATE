@@ -233,7 +233,8 @@ async function getOrCompileContract(
     name: string,
     registration: ContractRegistration,
     entry: FacadeEntry,
-    witnessValues?: { attestedValue: string; valueSalt: string }
+    witnessValues?: { attestedValue: string; valueSalt: string },
+    merkleProof?: { fieldValue: string; siblings: string[]; dirs: boolean[] }
 ): Promise<any> {
     const { contractClass } = await getContractScaffold(name, registration);
 
@@ -247,7 +248,7 @@ async function getOrCompileContract(
 
     const witnessFactory = getContractWitnessFactory(name);
     const witnessStep = witnessFactory
-        ? CompiledContract.withWitnesses(witnessFactory({ attestationSecret: entry.attestationSecret, witnessValues }))
+        ? CompiledContract.withWitnesses(witnessFactory({ attestationSecret: entry.attestationSecret, witnessValues, merkleProof }))
         : CompiledContract.withVacantWitnesses;
 
     return CompiledContract.make(name, contractClass).pipe(
@@ -1370,7 +1371,7 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
         sessionId, proxyId, contractName, registration,
         contractAddress, circuit, args: callArgs,
         indexerHttpUrl, indexerWsUrl, proofServerUrl,
-        networkId, witnessValues
+        networkId, witnessValues, merkleProof
     }: {
         sessionId: string;
         proxyId: string;
@@ -1384,13 +1385,14 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
         proofServerUrl: string;
         networkId: string;
         witnessValues?: { attestedValue: string; valueSalt: string };
+        merkleProof?: { fieldValue: string; siblings: string[]; dirs: boolean[] };
     }) {
         const entry = facades.get(sessionId);
         if (!entry) throw new Error(`No facade for sessionId=${sessionId.slice(0, 16)}`);
         const sdk = await loadSdk();
         await ensureNetworkId(networkId, sdk);
 
-        const compiledContract = await getOrCompileContract(contractName, registration, entry, witnessValues);
+        const compiledContract = await getOrCompileContract(contractName, registration, entry, witnessValues, merkleProof);
         const contractProviders = await buildWorkerContractProviders({
             indexerHttpUrl, indexerWsUrl, proofServerUrl,
             zkConfigPath: registration.zkConfigPath

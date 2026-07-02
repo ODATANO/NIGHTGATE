@@ -4,6 +4,56 @@
   "runtime-version": "0.16.0",
   "circuits": [
     {
+      "name": "leafHash",
+      "pure": true,
+      "proof": false,
+      "arguments": [
+        {
+          "name": "field_key",
+          "type": {
+            "type-name": "Bytes",
+            "length": 32
+          }
+        },
+        {
+          "name": "value",
+          "type": {
+            "type-name": "Uint",
+            "maxval": 18446744073709551615
+          }
+        }
+      ],
+      "result-type": {
+        "type-name": "Bytes",
+        "length": 32
+      }
+    },
+    {
+      "name": "nodeHash",
+      "pure": true,
+      "proof": false,
+      "arguments": [
+        {
+          "name": "left",
+          "type": {
+            "type-name": "Bytes",
+            "length": 32
+          }
+        },
+        {
+          "name": "right",
+          "type": {
+            "type-name": "Bytes",
+            "length": 32
+          }
+        }
+      ],
+      "result-type": {
+        "type-name": "Bytes",
+        "length": 32
+      }
+    },
+    {
       "name": "attest",
       "pure": false,
       "proof": true,
@@ -139,6 +189,98 @@
         "types": [
         ]
       }
+    },
+    {
+      "name": "bindPassport",
+      "pure": false,
+      "proof": true,
+      "arguments": [
+        {
+          "name": "passportId",
+          "type": {
+            "type-name": "Bytes",
+            "length": 32
+          }
+        },
+        {
+          "name": "payload_hash",
+          "type": {
+            "type-name": "Bytes",
+            "length": 32
+          }
+        }
+      ],
+      "result-type": {
+        "type-name": "Tuple",
+        "types": [
+        ]
+      }
+    },
+    {
+      "name": "anchorContentRoot",
+      "pure": false,
+      "proof": true,
+      "arguments": [
+        {
+          "name": "payload_hash",
+          "type": {
+            "type-name": "Bytes",
+            "length": 32
+          }
+        },
+        {
+          "name": "content_root",
+          "type": {
+            "type-name": "Bytes",
+            "length": 32
+          }
+        }
+      ],
+      "result-type": {
+        "type-name": "Tuple",
+        "types": [
+        ]
+      }
+    },
+    {
+      "name": "proveFieldPredicate",
+      "pure": false,
+      "proof": true,
+      "arguments": [
+        {
+          "name": "payload_hash",
+          "type": {
+            "type-name": "Bytes",
+            "length": 32
+          }
+        },
+        {
+          "name": "field_key",
+          "type": {
+            "type-name": "Bytes",
+            "length": 32
+          }
+        },
+        {
+          "name": "threshold",
+          "type": {
+            "type-name": "Uint",
+            "maxval": 18446744073709551615
+          }
+        },
+        {
+          "name": "op",
+          "type": {
+            "type-name": "Uint",
+            "maxval": 255
+          }
+        }
+      ],
+      "result-type": {
+        "type-name": "Tuple",
+        "types": [
+        ]
+      }
     }
   ],
   "witnesses": [
@@ -167,6 +309,40 @@
       "result type": {
         "type-name": "Bytes",
         "length": 32
+      }
+    },
+    {
+      "name": "field_value",
+      "arguments": [
+      ],
+      "result type": {
+        "type-name": "Uint",
+        "maxval": 18446744073709551615
+      }
+    },
+    {
+      "name": "merkle_siblings",
+      "arguments": [
+      ],
+      "result type": {
+        "type-name": "Vector",
+        "length": 4,
+        "type": {
+          "type-name": "Bytes",
+          "length": 32
+        }
+      }
+    },
+    {
+      "name": "merkle_dirs",
+      "arguments": [
+      ],
+      "result type": {
+        "type-name": "Vector",
+        "length": 4,
+        "type": {
+          "type-name": "Boolean"
+        }
       }
     }
   ],
@@ -239,6 +415,47 @@
     {
       "name": "predicate_results",
       "index": 4,
+      "exported": true,
+      "storage": "Map",
+      "key": {
+        "type-name": "Bytes",
+        "length": 32
+      },
+      "value": {
+        "type-name": "Boolean"
+      }
+    },
+    {
+      "name": "passport_bindings",
+      "index": 5,
+      "exported": true,
+      "storage": "Map",
+      "key": {
+        "type-name": "Bytes",
+        "length": 32
+      },
+      "value": {
+        "type-name": "Bytes",
+        "length": 32
+      }
+    },
+    {
+      "name": "content_roots",
+      "index": 6,
+      "exported": true,
+      "storage": "Map",
+      "key": {
+        "type-name": "Bytes",
+        "length": 32
+      },
+      "value": {
+        "type-name": "Bytes",
+        "length": 32
+      }
+    },
+    {
+      "name": "field_predicate_results",
+      "index": 7,
       "exported": true,
       "storage": "Map",
       "key": {

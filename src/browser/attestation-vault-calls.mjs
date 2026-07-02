@@ -58,3 +58,47 @@ export function prepareAttest({ payloadHash, metadataHash, attestationSecret }) 
         witnesses: buildAttestationVaultWitnesses({ attestationSecret })
     };
 }
+
+/**
+ * Prepare a `bindPassport(passportId, payload_hash)` call (QR resolution binding).
+ */
+export function prepareBindPassport({ passportId, payloadHash, attestationSecret }) {
+    if (!(attestationSecret instanceof Uint8Array)) throw new Error('attestationSecret (Uint8Array) is required');
+    return {
+        circuitId: 'bindPassport',
+        args: [hexTo32(passportId, 'passportId'), hexTo32(payloadHash, 'payloadHash')],
+        witnesses: buildAttestationVaultWitnesses({ attestationSecret })
+    };
+}
+
+/**
+ * Prepare an `anchorContentRoot(payload_hash, content_root)` call. `contentRoot`
+ * is the off-chain Merkle root over the passport's provable fields (built with
+ * the contract's exported pureCircuits so it matches proveFieldPredicate).
+ */
+export function prepareAnchorContentRoot({ payloadHash, contentRoot, attestationSecret }) {
+    if (!(attestationSecret instanceof Uint8Array)) throw new Error('attestationSecret (Uint8Array) is required');
+    return {
+        circuitId: 'anchorContentRoot',
+        args: [hexTo32(payloadHash, 'payloadHash'), hexTo32(contentRoot, 'contentRoot')],
+        witnesses: buildAttestationVaultWitnesses({ attestationSecret })
+    };
+}
+
+/**
+ * Prepare a `proveFieldPredicate(payload_hash, field_key, threshold, op)` call —
+ * the field-bound predicate proof. The witnessed `merkleProof`
+ * ({ fieldValue, siblings[4] hex, dirs[4] }) proves `field_key`'s value is in the
+ * anchored content root; `op`: 0 = value ≤ threshold, 1 = value ≥ threshold.
+ */
+export function prepareProveFieldPredicate({ payloadHash, fieldKey, threshold, op, merkleProof, attestationSecret }) {
+    if (!(attestationSecret instanceof Uint8Array)) throw new Error('attestationSecret (Uint8Array) is required');
+    if (!merkleProof) throw new Error('merkleProof ({ fieldValue, siblings, dirs }) is required');
+    const opNum = BigInt(Number(op));
+    if (opNum !== 0n && opNum !== 1n) throw new Error('op must be 0 (lessOrEqual) or 1 (greaterOrEqual)');
+    return {
+        circuitId: 'proveFieldPredicate',
+        args: [hexTo32(payloadHash, 'payloadHash'), hexTo32(fieldKey, 'fieldKey'), BigInt(threshold), opNum],
+        witnesses: buildAttestationVaultWitnesses({ attestationSecret, merkleProof })
+    };
+}

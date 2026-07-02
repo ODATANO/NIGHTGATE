@@ -32,7 +32,22 @@ export interface WitnessFactoryInput {
         attestedValue: string;
         valueSalt:     string;
     };
+    /**
+     * Per-CALL Merkle inclusion proof for the field-bound predicate circuit
+     * (`proveFieldPredicate`). Absent for every other circuit. Serialized as
+     * primitives so it survives the worker-thread boundary:
+     *   - `fieldValue`: decimal string of the Uint<64> field value being proven.
+     *   - `siblings`: 4 × 64-char hex (the DEPTH=4 inclusion path sibling digests).
+     *   - `dirs`: 4 booleans (true = current node is the LEFT child at that level).
+     */
+    merkleProof?: {
+        fieldValue: string;
+        siblings:   string[];
+        dirs:       boolean[];
+    };
 }
+
+const MERKLE_DEPTH = 4;
 
 function hexToBytes32(hex: string): Uint8Array {
     const clean = hex.startsWith('0x') ? hex.slice(2) : hex;
@@ -75,6 +90,19 @@ export function buildAttestationVaultWitnesses(input: WitnessFactoryInput): any 
     // circuits they stay unused, so missing values throw only if actually hit.
     const value = input.witnessValues ? BigInt(input.witnessValues.attestedValue) : undefined;
     const salt  = input.witnessValues ? hexToBytes32(input.witnessValues.valueSalt) : undefined;
+    // Per-call Merkle proof for proveFieldPredicate (only that circuit invokes
+    // field_value/merkle_siblings/merkle_dirs; others leave them unused).
+    let fieldValue: bigint | undefined;
+    let siblings: Uint8Array[] | undefined;
+    let dirs: boolean[] | undefined;
+    if (input.merkleProof) {
+        fieldValue = BigInt(input.merkleProof.fieldValue);
+        siblings = (input.merkleProof.siblings || []).map(hexToBytes32);
+        dirs = (input.merkleProof.dirs || []).map(Boolean);
+        if (siblings.length !== MERKLE_DEPTH || dirs.length !== MERKLE_DEPTH) {
+            throw new Error(`merkleProof.siblings and .dirs must each have ${MERKLE_DEPTH} entries`);
+        }
+    }
     return {
         local_secret_key(ctx: { privateState: unknown }): [unknown, Uint8Array] {
             return [ctx.privateState, secret];
@@ -90,6 +118,24 @@ export function buildAttestationVaultWitnesses(input: WitnessFactoryInput): any 
                 throw new Error('value_salt witness invoked without a per-call salt; commitValue/provePredicate require witnessValues');
             }
             return [ctx.privateState, salt];
+        },
+        field_value(ctx: { privateState: unknown }): [unknown, bigint] {
+            if (fieldValue === undefined) {
+                throw new Error('field_value witness invoked without a merkleProof; proveFieldPredicate requires merkleProof');
+            }
+            return [ctx.privateState, fieldValue];
+        },
+        merkle_siblings(ctx: { privateState: unknown }): [unknown, Uint8Array[]] {
+            if (siblings === undefined) {
+                throw new Error('merkle_siblings witness invoked without a merkleProof; proveFieldPredicate requires merkleProof');
+            }
+            return [ctx.privateState, siblings];
+        },
+        merkle_dirs(ctx: { privateState: unknown }): [unknown, boolean[]] {
+            if (dirs === undefined) {
+                throw new Error('merkle_dirs witness invoked without a merkleProof; proveFieldPredicate requires merkleProof');
+            }
+            return [ctx.privateState, dirs];
         }
     };
 }

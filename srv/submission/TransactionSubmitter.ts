@@ -112,6 +112,13 @@ export interface CallArgs {
      * circuits that declare no per-call witnesses.
      */
     witnessValues?: { attestedValue: string; valueSalt: string };
+    /**
+     * Per-call Merkle inclusion proof for the field-bound predicate circuit
+     * (`proveFieldPredicate`): the scaled field value + its DEPTH=4 inclusion
+     * path. Passed to the worker's witness factory; never sent as a circuit arg.
+     * Omit for every other circuit.
+     */
+    merkleProof?: { fieldValue: string; siblings: string[]; dirs: boolean[] };
 }
 
 export interface DeployResult {
@@ -347,7 +354,8 @@ export class TransactionSubmitter {
             indexerWsUrl:    this.deps.contractProvidersConfig.indexerWsUrl,
             proofServerUrl:  this.deps.contractProvidersConfig.proofServerUrl,
             networkId:       this.deps.network,
-            witnessValues:   args.witnessValues
+            witnessValues:   args.witnessValues,
+            merkleProof:     args.merkleProof
         };
     }
 

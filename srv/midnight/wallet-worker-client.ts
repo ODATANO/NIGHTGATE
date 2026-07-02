@@ -517,6 +517,12 @@ export interface WalletSubmitContractCallArgs {
      * hidden value never leaves as a circuit arg. Omitted for other circuits.
      */
     witnessValues?: { attestedValue: string; valueSalt: string };
+    /**
+     * Per-call Merkle inclusion proof for `proveFieldPredicate` (scaled field
+     * value + DEPTH=4 sibling path + direction flags). Forwarded to the witness
+     * factory; never a circuit arg. Omitted for other circuits.
+     */
+    merkleProof?: { fieldValue: string; siblings: string[]; dirs: boolean[] };
 }
 
 /**

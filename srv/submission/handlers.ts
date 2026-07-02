@@ -546,6 +546,175 @@ export function registerSubmissionHandlers(
         });
     });
 
+    srv.on('issueFieldPredicateAttestation', async (req: Request) => {
+        const data = req.data as {
+            payloadHash?: string;
+            fieldKey?: string;
+            value?: string;
+            contentRoot?: string;
+            siblingsJson?: string;
+            dirsJson?: string;
+            predicate?: string;
+            threshold?: number | string;
+            unit?: string;
+            sessionId?: string;
+            contractAddress?: string;
+            compiledArtifactRef?: string;
+            idempotencyKey?: string;
+        };
+
+        if (!data.payloadHash) return req.reject(400, 'payloadHash is required');
+        if (!SHA256_HEX_RE.test(data.payloadHash)) return req.reject(400, 'payloadHash must be 64 hex chars (32 bytes)');
+        if (!data.fieldKey) return req.reject(400, 'fieldKey is required');
+        if (!SHA256_HEX_RE.test(data.fieldKey)) return req.reject(400, 'fieldKey must be 64 hex chars (32 bytes)');
+        if (data.value === undefined || data.value === null || data.value === '') {
+            return req.reject(400, 'value is required');
+        }
+        let valueBig: bigint;
+        try { valueBig = BigInt(data.value); } catch { return req.reject(400, 'value must be an integer (decimal string)'); }
+        if (valueBig < 0n) return req.reject(400, 'value must be a non-negative integer');
+
+        if (data.threshold === undefined || data.threshold === null) return req.reject(400, 'threshold is required');
+        let thresholdBig: bigint;
+        try { thresholdBig = BigInt(data.threshold); } catch { return req.reject(400, 'threshold must be an integer'); }
+        if (thresholdBig < 0n) return req.reject(400, 'threshold must be a non-negative integer');
+
+        let op: number;
+        if (data.predicate === 'lessOrEqual') op = 0;
+        else if (data.predicate === 'greaterOrEqual') op = 1;
+        else return req.reject(400, "predicate must be 'lessOrEqual' or 'greaterOrEqual'");
+
+        // Parse + validate the inclusion path (DEPTH=4).
+        let siblings: string[];
+        let dirs: boolean[];
+        try { siblings = JSON.parse(data.siblingsJson ?? '[]'); } catch { return req.reject(400, 'siblingsJson must be a JSON array'); }
+        try { dirs = JSON.parse(data.dirsJson ?? '[]'); } catch { return req.reject(400, 'dirsJson must be a JSON array'); }
+        if (!Array.isArray(siblings) || siblings.length !== 4) return req.reject(400, 'siblingsJson must be a JSON array of 4 hashes');
+        if (!Array.isArray(dirs) || dirs.length !== 4) return req.reject(400, 'dirsJson must be a JSON array of 4 booleans');
+        for (const s of siblings) {
+            if (typeof s !== 'string' || !SHA256_HEX_RE.test(s)) return req.reject(400, 'each sibling must be 64 hex chars (32 bytes)');
+        }
+        const dirsBool = dirs.map(Boolean);
+
+        if (data.contentRoot && !SHA256_HEX_RE.test(data.contentRoot)) {
+            return req.reject(400, 'contentRoot must be 64 hex chars (32 bytes)');
+        }
+        if (!data.sessionId) return req.reject(400, 'sessionId is required');
+        if (!data.contractAddress) return req.reject(400, 'contractAddress is required');
+
+        const compiledRef = data.compiledArtifactRef && data.compiledArtifactRef.length > 0
+            ? data.compiledArtifactRef
+            : DEFAULT_ATTESTATION_VAULT_REF;
+
+        if (rejectIfMainnetBlocked(req)) return;
+        if (!checkRate(predicateRateLimiter, data.sessionId, req)) return;
+
+        const payloadHashBytes = hexToBytes(data.payloadHash);
+        const fieldKeyBytes = hexToBytes(data.fieldKey);
+        const contentRootBytes = data.contentRoot ? hexToBytes(data.contentRoot) : null;
+        // The field value + inclusion path travel ONLY as circuit witnesses,
+        // never as circuit args, never persisted. This keeps the value private
+        // while binding it to the anchored content root.
+        const merkleProof = { fieldValue: valueBig.toString(), siblings: siblings.map(s => s.toLowerCase()), dirs: dirsBool };
+
+        // Row up-front (same shape as issuePredicateAttestation; field-agnostic).
+        const predicateAttestationId = cds.utils.uuid();
+        const insertedAt = new Date().toISOString();
+        await db.run(INSERT.into(PredicateAttestations).entries({
+            ID: predicateAttestationId,
+            payloadHash: data.payloadHash.toLowerCase(),
+            contractAddress: data.contractAddress,
+            predicate: data.predicate,
+            op,
+            threshold: data.threshold as any,
+            unit: data.unit ?? null,
+            valueCommitment: null,
+            provenTxHash: null,
+            provenAt: null,
+            createdAt: insertedAt,
+            modifiedAt: insertedAt
+        }));
+
+        return runSubmission(req, async () => {
+            const facadeCfg = facadeConfigFromEnv();
+            await ensureNetworkId(facadeCfg.networkId);
+            const resolved = await contractResolver(compiledRef);
+            const wallet = await walletFactory({ sessionId: data.sessionId!, db, facadeConfig: facadeCfg });
+            const submitter = submitterFactory(buildSubmitterDeps(db, resolved, wallet));
+            const registration = {
+                artifactPath: resolved.artifactPath,
+                privateStateId: resolved.privateStateId,
+                zkConfigPath: resolved.zkConfigPath
+            };
+
+            const job = await startJob({
+                kind: 'issueFieldPredicateAttestation',
+                sessionId: data.sessionId!,
+                idempotencyKey: data.idempotencyKey,
+                request: {
+                    payloadHash: data.payloadHash!.toLowerCase(),
+                    fieldKey: data.fieldKey!.toLowerCase(),
+                    contractAddress: data.contractAddress,
+                    predicate: data.predicate,
+                    threshold: String(data.threshold),
+                    predicateAttestationId
+                },
+                work: async () => {
+                    // 1. Anchor the content root (idempotent overwrite) if supplied,
+                    //    so proveFieldPredicate has a root to bind against. Uses only
+                    //    the attester-identity witness (no value/proof witnesses).
+                    if (contentRootBytes) {
+                        await submitter.call({
+                            contractAddress: data.contractAddress!,
+                            circuit: 'anchorContentRoot',
+                            args: [payloadHashBytes, contentRootBytes],
+                            contractName: compiledRef,
+                            registration,
+                            sessionId: data.sessionId!
+                        });
+                    }
+                    // 2. Prove the field-bound predicate. The ledger only accepts
+                    //    this tx if the in-circuit asserts (Merkle root match +
+                    //    predicate) held — so a successful tx IS the verified proof
+                    //    that THIS passport field satisfies the predicate.
+                    const proof = await submitter.call({
+                        contractAddress: data.contractAddress!,
+                        circuit: 'proveFieldPredicate',
+                        args: [payloadHashBytes, fieldKeyBytes, thresholdBig, BigInt(op)],
+                        contractName: compiledRef,
+                        registration,
+                        sessionId: data.sessionId!,
+                        merkleProof
+                    });
+
+                    const provenAt = new Date().toISOString();
+                    await db.run(UPDATE.entity(PredicateAttestations)
+                        .set({ provenTxHash: proof.txHash, provenAt, modifiedAt: provenAt })
+                        .where({ ID: predicateAttestationId }));
+
+                    return {
+                        predicateAttestationId,
+                        payloadHash: data.payloadHash!.toLowerCase(),
+                        fieldKey: data.fieldKey!.toLowerCase(),
+                        claim: {
+                            predicate: data.predicate,
+                            threshold: String(data.threshold),
+                            unit: data.unit ?? null
+                        },
+                        proof: {
+                            system: 'midnight-compact',
+                            circuit: 'proveFieldPredicate',
+                            verificationMethod: data.contractAddress,
+                            proofValue: proof.txHash
+                        }
+                    };
+                }
+            });
+
+            return { jobId: job.jobId, status: job.status, predicateAttestationId };
+        });
+    });
+
     srv.on('verifyPredicateAttestation', async (req: Request) => {
         const { predicateAttestationId } = req.data as { predicateAttestationId?: string };
         if (!predicateAttestationId) return req.reject(400, 'predicateAttestationId is required');

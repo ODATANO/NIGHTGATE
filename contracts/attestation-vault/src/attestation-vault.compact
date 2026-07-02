@@ -10,6 +10,12 @@
 //   attester_id    : persistent_hash(local_secret_key()) — derived in-circuit
 //   grantee        : Bytes<32> identifier for the disclosure recipient
 //   level          : 0=public-only, 1=legitimate-interest, 2=authority
+//   passportId     : Bytes<32> battery-passport identifier (caller-provided)
+//
+// This is the single, unified contract: it carries the NIGHTPASS passport
+// extension (bindPassport) and the field-bound predicate hardening
+// (anchorContentRoot / proveFieldPredicate). The old separate
+// `passport-attestation` contract was folded in here and removed.
 
 pragma language_version >= 0.20;
 
@@ -31,10 +37,48 @@ export ledger disclosures:         Map<Bytes<32>, Map<Bytes<32>, Uint<8>>>;
 export ledger value_commitments:   Map<Bytes<32>, Bytes<32>>;
 export ledger predicate_results:   Map<Bytes<32>, Boolean>;
 
+// Passport extension: passportId -> payload_hash (the bound attestation), so a
+// QR-scanned passportId resolves on-chain to its attestation.
+export ledger passport_bindings:   Map<Bytes<32>, Bytes<32>>;
+
+// Field-bound predicate extension.
+//   content_roots: payload_hash -> Merkle root over the passport's provable
+//     fields, each leaf = leafHash(field_key, scaled_value). Anchored by the
+//     attester so later proofs are bound to the passport's ACTUAL field values.
+//   field_predicate_results: claimKey -> true, where claimKey =
+//     persistentHash(FieldPredicateClaim{payload_hash, field_key, threshold,
+//     op}). A (true) entry means the value of `field_key` (proven to be in the
+//     anchored content root) satisfies the predicate — bound to THIS passport
+//     field, not an arbitrary committed number.
+export ledger content_roots:            Map<Bytes<32>, Bytes<32>>;
+export ledger field_predicate_results:  Map<Bytes<32>, Boolean>;
+
 // Identifies a concrete predicate claim. Hashed to a stable result key so each
 // distinct (attestation, threshold, op) triple is recorded independently.
 struct PredicateClaim {
   payload_hash: Bytes<32>,
+  threshold:    Uint<64>,
+  op:           Uint<8>
+}
+
+// A provable passport field: its canonical id and its scaled integer value.
+// Hashed to a Merkle leaf; the off-chain builder uses the exported `leafHash`
+// pure circuit so its tree hashes identically to this one.
+struct FieldLeaf {
+  field_key: Bytes<32>,
+  value:     Uint<64>
+}
+
+// An internal Merkle node (ordered pair of child digests).
+struct MerkleNode {
+  left:  Bytes<32>,
+  right: Bytes<32>
+}
+
+// Identifies a concrete field-bound predicate claim.
+struct FieldPredicateClaim {
+  payload_hash: Bytes<32>,
+  field_key:    Bytes<32>,
   threshold:    Uint<64>,
   op:           Uint<8>
 }
@@ -48,6 +92,14 @@ witness local_secret_key(): Bytes<32>;
 witness attested_value(): Uint<64>;
 witness value_salt():     Bytes<32>;
 
+// Field-bound inclusion proof, supplied off-chain. `field_value` is the scaled
+// integer value of the field being proven; `merkle_siblings` / `merkle_dirs`
+// are its inclusion path in the anchored content root. DEPTH is fixed at 4
+// (=> up to 16 provable fields); the off-chain builder pads to 2^4.
+witness field_value():     Uint<64>;
+witness merkle_siblings(): Vector<4, Bytes<32>>;
+witness merkle_dirs():     Vector<4, Boolean>;   // true => current node is the LEFT child
+
 // Numeric commitment binding the hidden value to its 32-byte opening. The same
 // value+salt always reproduce this commitment, so the on-chain stored
 // commitment pins exactly which value later proofs must be about.
@@ -59,6 +111,25 @@ circuit value_commitment(): Bytes<32> {
 // on-chain does not leak the underlying secret.
 circuit caller_id(): Bytes<32> {
   return persistentHash<Bytes<32>>(local_secret_key());
+}
+
+// Merkle leaf hash — pure, so it is exported into the artifact's `pureCircuits`
+// and the off-chain content-root builder can hash leaves identically.
+export pure circuit leafHash(field_key: Bytes<32>, value: Uint<64>): Bytes<32> {
+  return persistentHash<FieldLeaf>(FieldLeaf { field_key: field_key, value: value });
+}
+
+// Merkle inner-node hash — pure, exported for off-chain parity.
+export pure circuit nodeHash(left: Bytes<32>, right: Bytes<32>): Bytes<32> {
+  return persistentHash<MerkleNode>(MerkleNode { left: left, right: right });
+}
+
+// One Merkle fold step: combine `node` with its `sibling` in the correct order.
+circuit merkleStep(node: Bytes<32>, sibling: Bytes<32>, goesLeft: Boolean): Bytes<32> {
+  if (goesLeft) {
+    return nodeHash(node, sibling);
+  }
+  return nodeHash(sibling, node);
 }
 
 // Anyone can attest. Locks in attester_id for later grant/revoke checks.
@@ -116,4 +187,59 @@ export circuit provePredicate(payload_hash: Bytes<32>, threshold: Uint<64>, op: 
     op:           op
   });
   predicate_results.insert(disclose(claimKey), true);
+}
+
+// Anchor a battery-passport identifier to an existing attestation's
+// payload_hash, so a QR-scanned passportId resolves on-chain to its
+// attestation. Only the attestation's owner may bind it.
+export circuit bindPassport(passportId: Bytes<32>, payload_hash: Bytes<32>): [] {
+  assert(public_attestations.member(disclose(payload_hash)), "no attestation");
+  assert(attestation_owners.lookup(disclose(payload_hash)) == caller_id(), "not attester");
+  passport_bindings.insert(disclose(passportId), disclose(payload_hash));
+}
+
+// Attester anchors the Merkle root over the passport's provable fields. The
+// root is computed off-chain from the SAME canonical content that produced
+// payload_hash, so a later proveFieldPredicate can bind a proven value to an
+// actual passport field. Only the attester may anchor.
+export circuit anchorContentRoot(payload_hash: Bytes<32>, content_root: Bytes<32>): [] {
+  assert(attestation_owners.lookup(disclose(payload_hash)) == caller_id(), "not attester");
+  content_roots.insert(disclose(payload_hash), disclose(content_root));
+}
+
+// Prove that a specific passport field (`field_key`) satisfies a predicate
+// against a public threshold, WITHOUT revealing the value — and bound to the
+// anchored content root so the value provably belongs to THIS passport. The
+// circuit recomputes the field's Merkle leaf and folds the witnessed inclusion
+// path up to a root, asserts it equals the anchored content_root, then checks
+// the predicate. `op`: 0 = lessOrEqual, 1 = greaterOrEqual.
+export circuit proveFieldPredicate(
+  payload_hash: Bytes<32>,
+  field_key:    Bytes<32>,
+  threshold:    Uint<64>,
+  op:           Uint<8>
+): [] {
+  assert(content_roots.member(disclose(payload_hash)), "no content root");
+  const v = field_value();
+  const sibs = merkle_siblings();
+  const dirs = merkle_dirs();
+  // Fold the leaf up to the root — DEPTH (4) unrolled (Compact has no loops).
+  const n0 = leafHash(field_key, v);
+  const n1 = merkleStep(n0, sibs[0], dirs[0]);
+  const n2 = merkleStep(n1, sibs[1], dirs[1]);
+  const n3 = merkleStep(n2, sibs[2], dirs[2]);
+  const root = merkleStep(n3, sibs[3], dirs[3]);
+  assert(root == content_roots.lookup(disclose(payload_hash)), "field not in passport");
+  if (op == 0) {
+    assert(v <= threshold, "predicate false");
+  } else {
+    assert(v >= threshold, "predicate false");
+  }
+  const claimKey = persistentHash<FieldPredicateClaim>(FieldPredicateClaim {
+    payload_hash: payload_hash,
+    field_key:    field_key,
+    threshold:    threshold,
+    op:           op
+  });
+  field_predicate_results.insert(disclose(claimKey), true);
 }

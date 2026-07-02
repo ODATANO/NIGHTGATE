@@ -281,6 +281,43 @@ service NightgateService {
     };
 
     /**
+     * Field-bound predicate proof (hardened model). Like
+     * `issuePredicateAttestation`, but the proven value is cryptographically
+     * bound to a SPECIFIC passport field via Merkle inclusion against an
+     * anchored content root — so a verifier knows the value came from THIS
+     * passport's `field_key`, not an arbitrary committed number.
+     *
+     * The caller (e.g. NIGHTPASS) builds the content root + inclusion path
+     * off-chain with the contract's exported `pureCircuits` so the hashing
+     * matches in-circuit. If `contentRoot` is supplied it is anchored first
+     * (AttestationVault `anchorContentRoot`); then `proveFieldPredicate` runs
+     * with the Merkle witnesses. `value` is the scaled integer field value
+     * (witness only, never persisted). `siblingsJson` / `dirsJson` are JSON
+     * arrays of the DEPTH=4 inclusion path (4 × 64-hex siblings; 4 booleans).
+     *
+     * Async: returns `{ jobId, status, predicateAttestationId }` immediately.
+     */
+    action issueFieldPredicateAttestation(
+        payloadHash:         String,       // attestation payload_hash (64 hex)
+        fieldKey:            String,       // 64 hex — canonical field id (public)
+        value:               String,       // scaled integer, decimal string (witness only)
+        contentRoot:         String,       // optional 64-hex Merkle root to anchor first
+        siblingsJson:        String,       // JSON array of 4 × 64-hex sibling digests
+        dirsJson:            String,       // JSON array of 4 booleans (left-child flags)
+        predicate:           String,       // 'lessOrEqual' | 'greaterOrEqual'
+        threshold:           Integer64,    // scaled integer
+        unit:                String,       // optional, informational
+        sessionId:           UUID,
+        contractAddress:     String,       // AttestationVault deployment
+        compiledArtifactRef: String,       // optional, defaults to 'attestation-vault'
+        idempotencyKey:      String        // optional; dedupes retries
+    )                                returns {
+        jobId:                  UUID;
+        status:                 String;
+        predicateAttestationId: UUID;
+    };
+
+    /**
      * Verify a predicate attestation under the on-chain-verified model: the
      * `provePredicate` proof is only accepted by the ledger if the in-circuit
      * asserts (commitment match + predicate) held, so a successful tx IS the

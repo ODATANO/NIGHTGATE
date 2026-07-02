@@ -1316,7 +1316,7 @@ describe('arg-coercion: loadCircuitArgTypes (real attestation-vault artifact)', 
     });
 
     test('unknown circuit → undefined', () => {
-        expect(loadCircuitArgTypes(VAULT_ZK, 'bindPassport')).toBeUndefined();
+        expect(loadCircuitArgTypes(VAULT_ZK, 'noSuchCircuit')).toBeUndefined();
     });
 
     test('missing contract-info.json → undefined (no throw)', () => {
