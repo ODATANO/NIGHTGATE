@@ -152,6 +152,28 @@ describe('buildWalletMaterialForSession', () => {
         })).rejects.toBeInstanceOf(SessionNotFoundError);
     });
 
+    test('scopes the session load to expectedUserId (review_001 P1)', async () => {
+        // Capture the query so we can confirm the WHERE is user-scoped; return
+        // null so a foreign/absent match surfaces as SessionNotFoundError.
+        let captured: any;
+        const db = { run: jest.fn(async (q: any) => { captured = q; return null; }) };
+        await expect(buildWalletMaterialForSession({
+            sessionId: 's1', expectedUserId: 'owner-1', db, encryptionKey: TEST_KEY
+        })).rejects.toBeInstanceOf(SessionNotFoundError);
+        const serialized = JSON.stringify(captured);
+        expect(serialized).toContain('userId');
+        expect(serialized).toContain('owner-1');
+    });
+
+    test('omits the userId filter when expectedUserId is not provided', async () => {
+        let captured: any;
+        const db = { run: jest.fn(async (q: any) => { captured = q; return null; }) };
+        await expect(buildWalletMaterialForSession({
+            sessionId: 's1', db, encryptionKey: TEST_KEY
+        })).rejects.toBeInstanceOf(SessionNotFoundError);
+        expect(JSON.stringify(captured)).not.toContain('userId');
+    });
+
     test('throws SessionNotFoundError when expiresAt is in the past', async () => {
         const session = buildEncryptedSession('vk', {
             expiresAt: new Date(Date.now() - 60_000).toISOString()

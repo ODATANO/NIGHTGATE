@@ -1131,6 +1131,12 @@ describe('registerGranteeIdentity', () => {
     // No nightgate config in tests → binding defaults to 'wallet' (input = hex).
     const PUBKEY = '11'.repeat(32);
 
+    // Self-service registration now defaults OFF (review_001 P1). Opt in for the
+    // cases that exercise the registration path; the "403 disabled" case sets
+    // 'false' explicitly.
+    beforeEach(() => { process.env.NIGHTGATE_ALLOW_SELF_SERVICE_GRANTEE_REGISTRATION = 'true'; });
+    afterEach(() => { delete process.env.NIGHTGATE_ALLOW_SELF_SERVICE_GRANTEE_REGISTRATION; });
+
     function setup(dbRun?: jest.Mock) {
         const srv = makeFakeService();
         const db = { run: dbRun ?? jest.fn().mockResolvedValue(undefined) };

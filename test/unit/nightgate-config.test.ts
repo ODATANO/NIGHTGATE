@@ -132,16 +132,20 @@ describe('getConfiguredPrivateStateBackend', () => {
 });
 
 describe('isSelfServiceGranteeRegistrationAllowed', () => {
-    it('defaults to allowed (shipped 0.3.4 behavior)', () => {
-        expect(isSelfServiceGranteeRegistrationAllowed()).toBe(true);
-        expect(isSelfServiceGranteeRegistrationAllowed({})).toBe(true);
+    it('defaults to DISABLED (secure default, review_001 P1)', () => {
+        expect(isSelfServiceGranteeRegistrationAllowed()).toBe(false);
+        expect(isSelfServiceGranteeRegistrationAllowed({})).toBe(false);
     });
 
-    it('config false disables it', () => {
+    it('config true opts in explicitly', () => {
+        expect(isSelfServiceGranteeRegistrationAllowed({ allowSelfServiceGranteeRegistration: true })).toBe(true);
+    });
+
+    it('config false stays disabled', () => {
         expect(isSelfServiceGranteeRegistrationAllowed({ allowSelfServiceGranteeRegistration: false })).toBe(false);
     });
 
-    it('env var overrides config (falsy spellings disable)', () => {
+    it('env var overrides config (falsy spellings disable, truthy enables)', () => {
         for (const v of ['false', '0', 'no', 'off', 'FALSE']) {
             process.env.NIGHTGATE_ALLOW_SELF_SERVICE_GRANTEE_REGISTRATION = v;
             expect(isSelfServiceGranteeRegistrationAllowed({ allowSelfServiceGranteeRegistration: true })).toBe(false);

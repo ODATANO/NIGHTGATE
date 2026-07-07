@@ -60,12 +60,13 @@ export interface NightgatePluginConfig {
     granteeBinding?: GranteeBinding;
     /**
      * Whether `registerGranteeIdentity` may be called by any authenticated
-     * principal to bind their own granteeId (default true, the original
-     * behavior). NIGHTGATE does NOT verify ownership of the binding input
-     * (wallet pubkey / DID) — a caller could register someone else's key and
-     * inherit their on-chain grants. Deployments that gate reads on on-chain
-     * grants should set this to false and register identities through their
-     * own proofing flow (direct writes to `GranteeIdentities`).
+     * principal to bind their own granteeId. Default FALSE (secure; review_001
+     * P1): NIGHTGATE does NOT verify ownership of the binding input (wallet
+     * pubkey / DID), so a caller could register someone else's key and inherit
+     * their on-chain grants. Enable ONLY in deployments that do not gate reads
+     * on on-chain grants, or that add their own ownership proof; otherwise
+     * register identities through the operator's proofing flow (direct writes
+     * to `GranteeIdentities`).
      */
     allowSelfServiceGranteeRegistration?: boolean;
     // CAP permits additional plugin-specific keys we don't model here.
@@ -164,7 +165,11 @@ export function getConfiguredGranteeBinding(config?: Record<string, any>): Grant
 export function isSelfServiceGranteeRegistrationAllowed(config?: Record<string, any>): boolean {
     const raw = readEnv('NIGHTGATE_ALLOW_SELF_SERVICE_GRANTEE_REGISTRATION');
     if (raw != null) return !/^(false|0|no|off)$/i.test(raw);
-    return config?.allowSelfServiceGranteeRegistration !== false;
+    // Secure default: OFF (review_001 P1). NIGHTGATE cannot verify ownership of
+    // the binding input, so a caller could register another principal's key and
+    // inherit their on-chain grants. Deployments that want self-service must
+    // opt in explicitly (config flag or NIGHTGATE_ALLOW_SELF_SERVICE_GRANTEE_REGISTRATION).
+    return config?.allowSelfServiceGranteeRegistration === true;
 }
 
 function readEnv(key: string): string | undefined {

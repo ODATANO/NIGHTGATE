@@ -6,6 +6,7 @@
 
 const mockDbRun = jest.fn();
 const selectWhereSpy = jest.fn();
+const selectFromWhereSpy = jest.fn();
 const updateWhereSpy = jest.fn();
 const insertEntriesSpy = jest.fn();
 
@@ -22,7 +23,10 @@ jest.mock('@sap/cds', () => {
                     from: jest.fn().mockReturnValue({
                         where: selectWhereSpy
                     })
-                }
+                },
+                from: jest.fn().mockReturnValue({
+                    columns: jest.fn().mockReturnValue({ where: selectFromWhereSpy })
+                })
             },
             INSERT: {
                 into: jest.fn().mockReturnValue({
@@ -119,9 +123,14 @@ function defaultIp(): string {
     return `192.168.${(__ipCounter >> 8) & 0xff}.${__ipCounter & 0xff}`;
 }
 
+const TEST_USER_ID = 'test-user';
+
 function createMockRequest(data: Record<string, unknown>, ip: string | null | undefined = undefined) {
     const req: any = {
         data,
+        // Sessions are user-bound (review_001 P1); every session action reads
+        // req.user.id. Default to a fixed principal so handlers pass the auth gate.
+        user: { id: TEST_USER_ID },
         reject: jest.fn().mockImplementation((code: number, message: string) => ({
             __rejected: true,
             code,
@@ -324,7 +333,7 @@ describe('wallet session handlers', () => {
         const req = createMockRequest({ sessionId: 'missing-session' });
         await handler(req);
 
-        expect(selectWhereSpy).toHaveBeenCalledWith({ sessionId: 'missing-session' });
+        expect(selectWhereSpy).toHaveBeenCalledWith({ sessionId: 'missing-session', userId: TEST_USER_ID });
         expect(req.reject).toHaveBeenCalledWith(404, 'Session not found');
     });
 
@@ -342,8 +351,8 @@ describe('wallet session handlers', () => {
         await handler(req);
 
         expect(req.reject).not.toHaveBeenCalled();
-        expect(selectWhereSpy).toHaveBeenCalledWith({ sessionId: 'public-session-1' });
-        expect(updateWhereSpy).toHaveBeenCalledWith({ sessionId: 'public-session-1' });
+        expect(selectWhereSpy).toHaveBeenCalledWith({ sessionId: 'public-session-1', userId: TEST_USER_ID });
+        expect(updateWhereSpy).toHaveBeenCalledWith({ sessionId: 'public-session-1', userId: TEST_USER_ID });
     });
 
     it('disconnectWallet marks expired sessions by sessionId before rejecting', async () => {
@@ -359,19 +368,21 @@ describe('wallet session handlers', () => {
         const req = createMockRequest({ sessionId: 'public-session-2' });
         await handler(req);
 
-        expect(updateWhereSpy).toHaveBeenCalledWith({ sessionId: 'public-session-2' });
+        expect(updateWhereSpy).toHaveBeenCalledWith({ sessionId: 'public-session-2', userId: TEST_USER_ID });
         expect(req.reject).toHaveBeenCalledWith(410, 'Session expired');
     });
 
     it('startSessionCleanup deactivates expired sessions on the cleanup interval', async () => {
         jest.useFakeTimers();
-        const db = { run: jest.fn().mockResolvedValue(2) };
+        // Cleanup now SELECTs the expiring rows (to evict cached facades) then
+        // UPDATEs them, nulling BOTH encrypted keys (review_001 P2).
+        const db = { run: jest.fn().mockResolvedValueOnce([]).mockResolvedValueOnce(2) };
 
         try {
             const timer = startSessionCleanup(db);
             await jest.advanceTimersByTimeAsync(15 * 60 * 1000);
 
-            expect(db.run).toHaveBeenCalledTimes(1);
+            expect(db.run).toHaveBeenCalledTimes(2);
             clearInterval(timer);
         } finally {
             jest.useRealTimers();
@@ -461,7 +472,7 @@ describe('wallet session handlers', () => {
             const result = await registeredHandlers['connectWalletForSigning'](req);
 
             expect(req.reject).not.toHaveBeenCalled();
-            expect(updateWhereSpy).toHaveBeenCalledWith({ sessionId: 's1' });
+            expect(updateWhereSpy).toHaveBeenCalledWith({ sessionId: 's1', userId: TEST_USER_ID });
             // The pre-warm call moves into startJob's `work` closure — not
             // called synchronously by the handler.
             expect(mockEnsureNetworkId).not.toHaveBeenCalled();
@@ -509,7 +520,7 @@ describe('wallet session handlers', () => {
                     prewarmStatus:  null
                 });
                 // The session UPDATE still committed — signing is enabled.
-                expect(updateWhereSpy).toHaveBeenCalledWith({ sessionId: 's1' });
+                expect(updateWhereSpy).toHaveBeenCalledWith({ sessionId: 's1', userId: TEST_USER_ID });
             } finally {
                 warn.mockRestore();
             }
@@ -862,7 +873,7 @@ describe('wallet session handlers', () => {
             await registeredHandlers['disconnectWallet'](req);
 
             expect(mockEvictWalletFacade).toHaveBeenCalledWith('acct-derived');
-            expect(updateWhereSpy).toHaveBeenCalledWith({ sessionId: 's1' });
+            expect(updateWhereSpy).toHaveBeenCalledWith({ sessionId: 's1', userId: TEST_USER_ID });
         });
     });
 });

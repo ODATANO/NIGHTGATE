@@ -122,17 +122,33 @@ function validateOptionalTtl(ttlIso: string | undefined): string | null {
 }
 
 /**
+ * The authenticated principal id, or reject 401 and return undefined. Every
+ * session-scoped action must call this and bail on undefined: sessions are
+ * owned by the principal that created them, and a leaked sessionId alone must
+ * not grant any other principal access (review_001 P1). The NightgateService is
+ * `@requires: 'authenticated-user'`, so a genuine caller always has an id.
+ */
+function requireUserId(req: Request): string | undefined {
+    const uid = (req as any).user?.id;
+    if (!uid) { req.reject?.(401, 'authentication required'); return undefined; }
+    return uid as string;
+}
+
+/**
  * Look up an active signing-capable wallet session and derive its accountId.
  * Returns either the resolved accountId, or a `{ rejection }` describing the
  * failure (status + message). Eliminates a ~15-line duplicated block from
- * every wallet-action handler.
+ * every wallet-action handler. Scoped to `userId` so one principal cannot act
+ * on another's session (a foreign session reads back as 404, not leaking that
+ * it exists).
  */
 async function loadSigningSessionAccountId(
     db: any,
-    sessionId: string
+    sessionId: string,
+    userId: string
 ): Promise<{ ok: true; accountId: string } | { ok: false; status: number; msg: string }> {
     const session = await db.run(
-        SELECT.one.from(WalletSessions).where({ sessionId, isActive: true })
+        SELECT.one.from(WalletSessions).where({ sessionId, isActive: true, userId })
     );
     if (!session)                       return { ok: false, status: 404, msg: 'Session not found or inactive' };
     if (!session.encryptedViewingKey)   return { ok: false, status: 404, msg: 'Session has no viewing key' };
@@ -159,6 +175,9 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
             return req.reject(429, `Rate limited. Retry after ${Math.ceil(rateResult.retryAfterMs / 1000)}s`);
         }
 
+        const userId = requireUserId(req);
+        if (!userId) return;
+
         const { viewingKey } = req.data as { viewingKey: string };
 
         const validationError = validateViewingKey(viewingKey);
@@ -176,6 +195,7 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
 
         const session = {
             ID: cds.utils.uuid(),
+            userId,
             sessionId: cds.utils.uuid(),
             viewingKeyHash: vkHash,
             encryptedViewingKey: encryptedVk,
@@ -201,6 +221,9 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
         if (!rateResult.allowed) {
             return req.reject(429, `Rate limited. Retry after ${Math.ceil(rateResult.retryAfterMs / 1000)}s`);
         }
+
+        const userId = requireUserId(req);
+        if (!userId) return;
 
         const { sessionId, mnemonic, seedHex, idempotencyKey } = req.data as {
             sessionId: string;
@@ -231,7 +254,7 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
         }
 
         const session = await db.run(
-            SELECT.one.from(WalletSessions).where({ sessionId, isActive: true })
+            SELECT.one.from(WalletSessions).where({ sessionId, isActive: true, userId })
         );
         if (!session) return req.reject(404, 'Session not found or inactive');
         if (session.expiresAt && new Date(session.expiresAt) < new Date()) {
@@ -244,7 +267,7 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
         await db.run(
             UPDATE.entity(WalletSessions)
                 .set({ encryptedSeedKey })
-                .where({ sessionId })
+                .where({ sessionId, userId })
         );
 
         // Pre-warm the WalletFacade as a tracked background job so callers can
@@ -317,11 +340,14 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
     });
 
     srv.on('disconnectWallet', async (req: Request) => {
+        const userId = requireUserId(req);
+        if (!userId) return;
+
         const { sessionId } = req.data as { sessionId: string };
         if (!sessionId) return req.reject(400, 'sessionId is required');
 
         const session = await db.run(
-            SELECT.one.from(WalletSessions).where({ sessionId })
+            SELECT.one.from(WalletSessions).where({ sessionId, userId })
         );
 
         if (!session) {
@@ -332,7 +358,7 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
             await db.run(
                 UPDATE.entity(WalletSessions)
                     .set({ isActive: false, encryptedViewingKey: null, encryptedSeedKey: null })
-                    .where({ sessionId })
+                    .where({ sessionId, userId })
             );
             return req.reject(410, 'Session expired');
         }
@@ -357,12 +383,14 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
                     encryptedViewingKey: null,
                     encryptedSeedKey: null
                 })
-                .where({ sessionId })
+                .where({ sessionId, userId })
         );
     });
 
     srv.on('registerForDustGeneration', async (req: Request) => {
         if (rejectIfMainnetBlocked(req)) return;
+        const userId = requireUserId(req);
+        if (!userId) return;
         const clientKey = (req as any)?._.req?.ip || 'global';
         const rate = dustRegRateLimiter.check(clientKey);
         if (!rate.allowed) {
@@ -377,7 +405,7 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
         if (!sessionId) return req.reject(400, 'sessionId is required');
 
         const session = await db.run(
-            SELECT.one.from(WalletSessions).where({ sessionId, isActive: true })
+            SELECT.one.from(WalletSessions).where({ sessionId, isActive: true, userId })
         );
         if (!session)                       return req.reject(404, 'Session not found or inactive');
         if (!session.encryptedViewingKey)   return req.reject(404, 'Session has no viewing key');
@@ -437,6 +465,8 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
 
     srv.on('deregisterFromDustGeneration', async (req: Request) => {
         if (rejectIfMainnetBlocked(req)) return;
+        const userId = requireUserId(req);
+        if (!userId) return;
         const clientKey = (req as any)?._.req?.ip || 'global';
         const rate = dustRegRateLimiter.check(clientKey);
         if (!rate.allowed) {
@@ -450,7 +480,7 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
         if (!sessionId) return req.reject(400, 'sessionId is required');
 
         const session = await db.run(
-            SELECT.one.from(WalletSessions).where({ sessionId, isActive: true })
+            SELECT.one.from(WalletSessions).where({ sessionId, isActive: true, userId })
         );
         if (!session)                       return req.reject(404, 'Session not found or inactive');
         if (!session.encryptedViewingKey)   return req.reject(404, 'Session has no viewing key');
@@ -487,6 +517,8 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
 
     srv.on('sendNight', async (req: Request) => {
         if (rejectIfMainnetBlocked(req)) return;
+        const userId = requireUserId(req);
+        if (!userId) return;
         const clientKey = (req as any)?._.req?.ip || 'global';
         const rate = sendRateLimiter.check(clientKey);
         if (!rate.allowed) {
@@ -521,7 +553,7 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
         if (ttlErr) return req.reject(400, ttlErr);
 
         const session = await db.run(
-            SELECT.one.from(WalletSessions).where({ sessionId, isActive: true })
+            SELECT.one.from(WalletSessions).where({ sessionId, isActive: true, userId })
         );
         if (!session)                       return req.reject(404, 'Session not found or inactive');
         if (!session.encryptedViewingKey)   return req.reject(404, 'Session has no viewing key');
@@ -564,6 +596,8 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
 
     srv.on('unshieldFunds', async (req: Request) => {
         if (rejectIfMainnetBlocked(req)) return;
+        const userId = requireUserId(req);
+        if (!userId) return;
         const clientKey = (req as any)?._.req?.ip || 'global';
         const rate = swapRateLimiter.check(clientKey);
         if (!rate.allowed) {
@@ -584,7 +618,7 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
         if (ttlErr) return req.reject(400, ttlErr);
 
         const session = await db.run(
-            SELECT.one.from(WalletSessions).where({ sessionId, isActive: true })
+            SELECT.one.from(WalletSessions).where({ sessionId, isActive: true, userId })
         );
         if (!session)                       return req.reject(404, 'Session not found or inactive');
         if (!session.encryptedViewingKey)   return req.reject(404, 'Session has no viewing key');
@@ -625,6 +659,8 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
 
     srv.on('shieldFunds', async (req: Request) => {
         if (rejectIfMainnetBlocked(req)) return;
+        const userId = requireUserId(req);
+        if (!userId) return;
         const clientKey = (req as any)?._.req?.ip || 'global';
         const rate = swapRateLimiter.check(clientKey);
         if (!rate.allowed) {
@@ -645,7 +681,7 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
         if (ttlErr) return req.reject(400, ttlErr);
 
         const session = await db.run(
-            SELECT.one.from(WalletSessions).where({ sessionId, isActive: true })
+            SELECT.one.from(WalletSessions).where({ sessionId, isActive: true, userId })
         );
         if (!session)                       return req.reject(404, 'Session not found or inactive');
         if (!session.encryptedViewingKey)   return req.reject(404, 'Session has no viewing key');
@@ -685,6 +721,8 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
     });
 
     srv.on('getWalletBalance', async (req: Request) => {
+        const userId = requireUserId(req);
+        if (!userId) return;
         const clientKey = (req as any)?._.req?.ip || 'global';
         const rate = diagnosticsRateLimiter.check(clientKey);
         if (!rate.allowed) {
@@ -695,7 +733,7 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
         if (!sessionId) return req.reject(400, 'sessionId is required');
 
         const session = await db.run(
-            SELECT.one.from(WalletSessions).where({ sessionId, isActive: true })
+            SELECT.one.from(WalletSessions).where({ sessionId, isActive: true, userId })
         );
         if (!session)                       return req.reject(404, 'Session not found or inactive');
         if (!session.encryptedViewingKey)   return req.reject(404, 'Session has no viewing key');
@@ -722,6 +760,8 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
     });
 
     srv.on('estimateSendNightFee', async (req: Request) => {
+        const userId = requireUserId(req);
+        if (!userId) return;
         const clientKey = (req as any)?._.req?.ip || 'global';
         const rate = diagnosticsRateLimiter.check(clientKey);
         if (!rate.allowed) {
@@ -748,7 +788,7 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
         if (ttlErr) return req.reject(400, ttlErr);
 
         const session = await db.run(
-            SELECT.one.from(WalletSessions).where({ sessionId, isActive: true })
+            SELECT.one.from(WalletSessions).where({ sessionId, isActive: true, userId })
         );
         if (!session)                       return req.reject(404, 'Session not found or inactive');
         if (!session.encryptedViewingKey)   return req.reject(404, 'Session has no viewing key');
@@ -794,6 +834,9 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
             return req.reject(429, `Rate limited. Retry after ${Math.ceil(rate.retryAfterMs / 1000)}s`);
         }
 
+        const userId = requireUserId(req);
+        if (!userId) return;
+
         const { sessionId, amount, ttlIso } = req.data as SwapEstimateData;
         if (!sessionId) return req.reject(400, 'sessionId is required');
         const amountCheck = parseNightAmount(amount);
@@ -801,7 +844,7 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
         const ttlErr = validateOptionalTtl(ttlIso);
         if (ttlErr) return req.reject(400, ttlErr);
 
-        const sess = await loadSigningSessionAccountId(db, sessionId);
+        const sess = await loadSigningSessionAccountId(db, sessionId, userId);
         if (!sess.ok) return req.reject(sess.status, sess.msg);
 
         try {
@@ -824,10 +867,27 @@ export function startSessionCleanup(db: any): ReturnType<typeof setInterval> {
     const SESSION_CLEANUP_INTERVAL = 15 * 60 * 1000;
     const timer = setInterval(async () => {
         try {
+            const now = new Date().toISOString();
+            const where = { isActive: true, expiresAt: { '<': now } };
+            // Evict cached facades for the expiring sessions so in-memory secret
+            // keys are dropped, not just the DB copies, and null BOTH encrypted
+            // keys (viewing + signing seed) — a forced expiry must leave no
+            // wallet secret behind (review_001 P2). Mirrors disconnectWallet.
+            const expiring: any[] = (await db.run(
+                SELECT.from(WalletSessions).columns('encryptedViewingKey').where(where)
+            )) || [];
+            for (const s of expiring) {
+                try {
+                    if (s.encryptedViewingKey) {
+                        const vk = decrypt(s.encryptedViewingKey, getEncryptionKey());
+                        await evictWalletFacade(deriveAccountId(vk));
+                    }
+                } catch { /* best-effort eviction */ }
+            }
             await db.run(
                 UPDATE.entity(WalletSessions)
-                    .set({ isActive: false, encryptedViewingKey: null })
-                    .where({ isActive: true, expiresAt: { '<': new Date().toISOString() } })
+                    .set({ isActive: false, encryptedViewingKey: null, encryptedSeedKey: null })
+                    .where(where)
             );
         } catch { /* ignore cleanup errors */ }
     }, SESSION_CLEANUP_INTERVAL);

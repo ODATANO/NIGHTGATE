@@ -186,6 +186,7 @@ entity DustLedgerEvents : cuid {
  * Wallet sessions for authenticated access.
  */
 entity WalletSessions : cuid, managed {
+    userId              : String(200); // owning principal (req.user.id); all session actions are gated on this
     viewingKeyHash      : String(64); // SHA-256 of viewing key (for lookup/dedup)
     encryptedViewingKey : LargeString; // AES-256-GCM encrypted viewing key
     encryptedSeedKey    : LargeString; // optional: AES-256-GCM encrypted seed/signing key
@@ -344,6 +345,7 @@ entity PredicateAttestations : cuid, managed {
     op              : Integer not null; // 0 | 1
     threshold       : Integer64 not null; // scaled integer
     unit            : String(50); // e.g. 'kgCO2e/kWh' (informational)
+    fieldKey        : HexEncoded; // set for field-bound proofs (proveFieldPredicate); null for plain provePredicate
     valueCommitment : HexEncoded; // persistentCommit(value, salt), on-chain
     provenTxHash    : HexEncoded; // tx that recorded the on-chain result
     provenAt        : Timestamp;

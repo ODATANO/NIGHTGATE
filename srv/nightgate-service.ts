@@ -14,7 +14,7 @@ import { ensureNightgateModelLoaded } from './utils/cds-model';
 import { registerSubmissionHandlers } from './submission/handlers';
 import { getJobById } from './submission/background-jobs';
 
-import { Blocks, Transactions, ContractActions, UnshieldedUtxos, NightBalances } from '#cds-models/midnight';
+import { Blocks, Transactions, ContractActions, UnshieldedUtxos, NightBalances, WalletSessions } from '#cds-models/midnight';
 
 
 export default class NightgateService extends cds.ApplicationService {
@@ -205,6 +205,19 @@ export default class NightgateService extends cds.ApplicationService {
             // for someone else's jobId can't distinguish "unknown" from
             // "exists but not yours".
             if (!job || job.sessionId !== sessionId) {
+                return req.reject(404, 'Job not found');
+            }
+
+            // Ownership: the session that owns this job must belong to the
+            // caller. Sessions are user-bound (review_001 P1) and are never
+            // hard-deleted (disconnect/expiry flip isActive but keep the row +
+            // userId), so a persisted mismatch is authoritative. Same 404 shape
+            // to avoid leaking existence.
+            const sess: any = await this.db.run(
+                cds.ql.SELECT.one.from(WalletSessions).columns('userId').where({ sessionId })
+            );
+            const requesterId = (req as any).user?.id;
+            if (sess?.userId && sess.userId !== requesterId) {
                 return req.reject(404, 'Job not found');
             }
 

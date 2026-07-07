@@ -15,8 +15,25 @@ import {
     isValidDisclosureRoleValue,
     DISCLOSURE_ROLE_VALUES
 } from './middleware/disclosure-role';
+import { decrypt, getEncryptionKey } from './utils/crypto';
+import { deriveAccountId } from './submission/wallet-material-factory';
+import { evictWalletFacade } from './submission/wallet-facade-builder';
 
 import { WalletSessions, DisclosureRoles } from '#cds-models/midnight';
+
+/**
+ * Drop the in-memory WalletFacade (live secret keys) cached for a session, so a
+ * forced invalidation removes secrets from RAM, not just the DB (review_001 P2).
+ * Best-effort: eviction failures never block the invalidation.
+ */
+async function evictSessionFacade(session: { encryptedViewingKey?: string | null }): Promise<void> {
+    try {
+        if (session.encryptedViewingKey) {
+            const vk = decrypt(session.encryptedViewingKey, getEncryptionKey());
+            await evictWalletFacade(deriveAccountId(vk));
+        }
+    } catch { /* best-effort */ }
+}
 
 export default class NightgateAdminService extends cds.ApplicationService {
     private db!: cds.DatabaseService;
@@ -44,21 +61,31 @@ export default class NightgateAdminService extends cds.ApplicationService {
                 return req.reject(409, `Session ${sessionId} is already inactive`);
             }
 
+            await evictSessionFacade(session);
             await this.db.run(
                 UPDATE.entity(WalletSessions).set({
                     isActive: false,
                     disconnectedAt: new Date().toISOString(),
-                    encryptedViewingKey: null  // Clear encrypted key
+                    encryptedViewingKey: null,
+                    encryptedSeedKey: null  // Clear BOTH secrets, not just the viewing key
                 }).where({ sessionId })
             );
         });
 
         this.on('invalidateAllSessions', async () => {
+            // Evict cached facades before nulling keys so live signing keys are
+            // dropped from RAM too (review_001 P2).
+            const active: any[] = (await this.db.run(
+                SELECT.from(WalletSessions).columns('encryptedViewingKey').where({ isActive: true })
+            )) || [];
+            for (const s of active) await evictSessionFacade(s);
+
             const result = await this.db.run(
                 UPDATE.entity(WalletSessions).set({
                     isActive: false,
                     disconnectedAt: new Date().toISOString(),
-                    encryptedViewingKey: null  // Clear all encrypted keys
+                    encryptedViewingKey: null,
+                    encryptedSeedKey: null  // Clear BOTH secrets for every session
                 }).where({ isActive: true })
             );
             return result;

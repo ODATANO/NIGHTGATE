@@ -2,6 +2,10 @@
 module.exports = {
   preset: 'ts-jest',
   testEnvironment: 'node',
+  // CAP-bootstrap suites (cds.test()) can exceed Jest's 5s default under
+  // --runInBand + coverage; give every test headroom so the standard run is
+  // not machine-speed-dependent.
+  testTimeout: 60000,
   roots: ['<rootDir>/test'],
   setupFilesAfterEnv: ['<rootDir>/test/jest.setup.ts'],
   moduleFileExtensions: ['ts', 'tsx', 'js', 'jsx', 'json', 'node'],

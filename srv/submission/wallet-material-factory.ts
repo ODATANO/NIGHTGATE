@@ -60,6 +60,13 @@ export class WalletMaterialUnavailable extends Error {
 
 export interface BuildWalletMaterialOptions {
     sessionId: string;
+    /**
+     * Owning principal (req.user.id). When provided, the session load is scoped
+     * to it so one principal cannot build wallet material from another's session
+     * (review_001 P1). Callers in the submission handlers always pass
+     * `req.user.id`; a mismatch reads back as SessionNotFound (non-leaking).
+     */
+    expectedUserId?: string;
     privateStateBackend?: PrivateStateBackend;
     /** Test seam; defaults to cds.connect.to('db'). */
     db?: any;
@@ -84,8 +91,10 @@ const PRIVATE_STATE_PASSWORD_LABEL = 'nightgate-private-state-password-v1';
  */
 export async function buildWalletMaterialForSession(opts: BuildWalletMaterialOptions): Promise<WalletMaterial> {
     const db = opts.db ?? await cds.connect.to('db');
+    const where: Record<string, unknown> = { sessionId: opts.sessionId, isActive: true };
+    if (opts.expectedUserId) where.userId = opts.expectedUserId;
     const session = await db.run(
-        SELECT.one.from(WalletSessions).where({ sessionId: opts.sessionId, isActive: true })
+        SELECT.one.from(WalletSessions).where(where)
     );
     if (!session) throw new SessionNotFoundError(opts.sessionId);
     if (session.expiresAt && new Date(session.expiresAt) < new Date()) {

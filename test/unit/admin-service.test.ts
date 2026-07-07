@@ -9,6 +9,7 @@ const mockDbConnect = jest.fn().mockResolvedValue({ run: mockDbRun });
 const selectWhereSpy = jest.fn();
 const selectFromSpy = jest.fn();
 const updateWhereSpy = jest.fn();
+const updateSetSpy = jest.fn().mockReturnValue({ where: (...a: any[]) => updateWhereSpy(...a) });
 const insertEntriesSpy = jest.fn();
 
 const registeredHandlers: Record<string, Function> = {};
@@ -25,14 +26,15 @@ jest.mock('@sap/cds', () => {
                 },
                 from: (entity: string) => {
                     selectFromSpy(entity);
-                    return { where: selectWhereSpy };
+                    return {
+                        where: selectWhereSpy,
+                        columns: jest.fn().mockReturnValue({ where: selectWhereSpy })
+                    };
                 }
             },
             UPDATE: {
                 entity: jest.fn().mockReturnValue({
-                    set: jest.fn().mockReturnValue({
-                        where: updateWhereSpy
-                    })
+                    set: (...a: any[]) => updateSetSpy(...a)
                 })
             },
             INSERT: {
@@ -97,6 +99,12 @@ describe('NightgateAdminService', () => {
             expect(mockDbRun).toHaveBeenCalledTimes(2);
             expect(selectWhereSpy).toHaveBeenCalledWith({ sessionId: 'session-123' });
             expect(updateWhereSpy).toHaveBeenCalledWith({ sessionId: 'session-123' });
+            // review_001 P2: forced invalidation clears BOTH encrypted secrets.
+            expect(updateSetSpy).toHaveBeenCalledWith(expect.objectContaining({
+                isActive: false,
+                encryptedViewingKey: null,
+                encryptedSeedKey: null
+            }));
         });
 
         it('should reject when sessionId is missing', async () => {
@@ -140,7 +148,9 @@ describe('NightgateAdminService', () => {
             const handler = registeredHandlers['invalidateAllSessions'];
             expect(handler).toBeDefined();
 
-            mockDbRun.mockResolvedValueOnce(5); // 5 sessions updated
+            // Now SELECTs the active rows (to evict cached facades) then UPDATEs.
+            mockDbRun.mockResolvedValueOnce([]); // SELECT expiring rows (none to evict)
+            mockDbRun.mockResolvedValueOnce(5);  // UPDATE: 5 sessions invalidated
 
             const result = await handler();
             expect(result).toBe(5);
@@ -149,7 +159,8 @@ describe('NightgateAdminService', () => {
         it('should return 0 when no active sessions exist', async () => {
             const handler = registeredHandlers['invalidateAllSessions'];
 
-            mockDbRun.mockResolvedValueOnce(0);
+            mockDbRun.mockResolvedValueOnce([]); // SELECT: no active rows
+            mockDbRun.mockResolvedValueOnce(0);  // UPDATE: 0 invalidated
 
             const result = await handler();
             expect(result).toBe(0);

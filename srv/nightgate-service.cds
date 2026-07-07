@@ -222,10 +222,20 @@ service NightgateService {
      *   - `providedSha256` (case-insensitive hex) equals the stored `sha256`
      *   - `anchoredTxHash` is set
      *   - The corresponding Transactions row's transactionResult status is SUCCESS
+     *
+     * Crawler-free fallback: when the local `Transactions` lookup finds nothing
+     * (crawler disabled or lagging) and `contractAddress` is supplied, the
+     * on-chain effect is confirmed directly against live contract state — the
+     * document's `sha256` (its on-chain `payload_hash`) must be present in the
+     * AttestationVault attestation map. The public `verified` contract is
+     * unchanged; only the evidence source is extended. `compiledArtifactRef`
+     * defaults to 'attestation-vault'.
      */
     function verifyDocument(
         documentId:     UUID,
-        providedSha256: String
+        providedSha256: String,
+        contractAddress:     String,   // optional; enables the crawler-free state fallback
+        compiledArtifactRef: String    // optional, defaults to 'attestation-vault'
     )                                returns {
         verified:       Boolean;
         anchoredTxHash: String;
@@ -324,6 +334,15 @@ service NightgateService {
      * proof. Confirms the row's `provenTxHash` resolves to a SUCCESS
      * `Transactions` result. Returns `verified: false` (not an error) for a
      * known-but-unproven row, mirroring `verifyDocument`.
+     *
+     * Crawler-free fallback: when the local `Transactions` lookup finds nothing
+     * (crawler disabled or lagging), the result is confirmed directly against
+     * live contract state — the claim key is recomputed from the row and looked
+     * up in the vault's result map. No txHash and no crawler required. Plain
+     * proofs use `persistentHash(PredicateClaim{payloadHash, threshold, op})`
+     * against `predicate_results`; field-bound rows (with a `fieldKey`) use
+     * `persistentHash(FieldPredicateClaim{payloadHash, fieldKey, threshold, op})`
+     * against `field_predicate_results`.
      */
     function verifyPredicateAttestation(
         predicateAttestationId: UUID
@@ -338,6 +357,30 @@ service NightgateService {
     };
 
     /**
+     * Verify an attestation directly against LIVE contract state
+     * (`queryContractState`), independent of the block crawler and of any
+     * txHash. Confirms `payloadHash` is present in the vault's attestation map
+     * (and, when `contentRoot` is supplied, that it equals the anchored content
+     * root for that payload). Read-only; keyed entirely by the caller-supplied
+     * `payloadHash`, so it needs no crawler and no enumeration.
+     *
+     * Returns `verified: false` (not an error) for an absent attestation, and a
+     * clean negative (not a 5xx) when no live provider is configured — mirroring
+     * `verifyDocument`. `compiledArtifactRef` defaults to 'attestation-vault'.
+     */
+    function verifyAttestationState(
+        contractAddress:     String,
+        payloadHash:         String,   // 64 hex
+        contentRoot:         String,   // optional 64 hex, checked against anchored root
+        compiledArtifactRef: String    // optional, defaults to 'attestation-vault'
+    )                                returns {
+        verified:      Boolean;
+        attested:      Boolean;   // payload_hash present in the attestation map
+        contentRootOk: Boolean;   // anchored content root matches (when contentRoot given)
+        attesterId:    String;    // owner grantee id, if present
+    };
+
+    /**
      * Chain-derived disclosure grants, read off the AttestationVault
      * `disclosures` ledger Map by the chain indexer. Distinct from the
      * off-chain `DisclosureRoles` table — these are the tamper-evident,
@@ -347,6 +390,28 @@ service NightgateService {
      */
     @readonly
     entity DisclosureGrants          as projection on midnight.DisclosureGrants;
+
+    /**
+     * Re-read the AttestationVault `disclosures` ledger Map from LIVE on-chain
+     * state (`queryContractState`) and reconcile `DisclosureGrants`. This is the
+     * same reconciliation the server-signed grant/revoke path runs internally,
+     * exposed on demand: use it after a WALLET-submitted grant/revoke that
+     * bypassed the plugin submission pipeline (browser signs, NIGHTGATE never
+     * saw a jobId). Crawler-independent, idempotent, self-healing.
+     *
+     * `active` is the count of grants present on-chain for the contract after
+     * reconciliation. Returns a clean zero (not a 5xx) when no live provider is
+     * configured. `compiledArtifactRef` defaults to 'attestation-vault'.
+     */
+    action reindexDisclosures(
+        contractAddress:     String,
+        compiledArtifactRef: String    // optional, defaults to 'attestation-vault'
+    )                                returns {
+        contractAddress: String;
+        active:          Integer;
+        deactivated:     Integer;
+        reconciledAt:    Timestamp;
+    };
 
     /**
      * Grant a disclosure tier to a grantee on an existing attestation, via the

@@ -47,12 +47,16 @@ function makeFakeService() {
 }
 
 let __ipCounter = 0;
+const TEST_USER_ID = 'test-user';
+
 function makeReq(data: Record<string, unknown>, ip?: string) {
     // Each request gets a fresh IP unless one is pinned (for the rate-limit test).
     const clientIp = ip ?? `test-ip-${++__ipCounter}`;
     return {
         data,
         _: { req: { ip: clientIp } },
+        // Sessions are user-bound (review_001 P1); handlers read req.user.id.
+        user: { id: TEST_USER_ID },
         reject: jest.fn((status: number, message: string) => {
             const err: any = new Error(message);
             err.status = status;
@@ -120,6 +124,7 @@ function seedSession(db: ReturnType<typeof makeFakeDb>, overrides: any = {}) {
     db.tables['midnight.WalletSessions'].push({
         ID: 'sess-uuid',
         sessionId: 'sess-1',
+        userId: TEST_USER_ID, // must match req.user.id for the user-scoped load
         isActive: true,
         encryptedViewingKey: encrypt('mn_shield-vk_alice', getEncryptionKey()),
         expiresAt: new Date(Date.now() + 60_000).toISOString(),
@@ -253,6 +258,32 @@ describe('connectWalletForSigning: state transitions', () => {
         const req = makeReq({ sessionId: 'sess-1', seedHex: VALID_SEED });
         await srv.handlers['connectWalletForSigning'](req);
         expect(req.reject).toHaveBeenCalledWith(410, expect.stringMatching(/expired/i));
+    });
+
+    test('404 for a foreign principal — sessions are user-bound (review_001 P1)', async () => {
+        const srv = makeFakeService();
+        const db = makeFakeDb();
+        seedSession(db); // owned by TEST_USER_ID
+        registerWalletSessionHandlers(srv as any, db);
+
+        // A different authenticated principal presents the (leaked) sessionId.
+        const req: any = makeReq({ sessionId: 'sess-1', seedHex: VALID_SEED });
+        req.user = { id: 'attacker' };
+        await srv.handlers['connectWalletForSigning'](req);
+        // Non-leaking: reads back as not-found rather than acting on it.
+        expect(req.reject).toHaveBeenCalledWith(404, expect.stringMatching(/not found/i));
+    });
+
+    test('401 for an unauthenticated caller', async () => {
+        const srv = makeFakeService();
+        const db = makeFakeDb();
+        seedSession(db);
+        registerWalletSessionHandlers(srv as any, db);
+
+        const req: any = makeReq({ sessionId: 'sess-1', seedHex: VALID_SEED });
+        req.user = undefined;
+        await srv.handlers['connectWalletForSigning'](req);
+        expect(req.reject).toHaveBeenCalledWith(401, expect.stringMatching(/authentication/i));
     });
 
     test('rate-limited after 5 attempts/hour/ip', async () => {

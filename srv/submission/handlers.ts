@@ -46,6 +46,8 @@ import { RateLimiter } from '../utils/rate-limiter';
 import { ensureNetworkId, type ContractProvidersConfig } from '../midnight/providers';
 import { startJob } from './background-jobs';
 import { reindexDisclosuresForContract } from './disclosure-indexer';
+import { readAttestationStateForContract } from './attestation-state';
+import { readPredicateStateForContract } from './predicate-state';
 import { deriveGranteeId } from './grantee-identity';
 import { getConfiguredGranteeBinding, isSelfServiceGranteeRegistrationAllowed } from '../utils/nightgate-config';
 import { Documents, Transactions, TransactionResults, PredicateAttestations, DisclosureGrants, GranteeIdentities } from '#cds-models/midnight';
@@ -64,6 +66,10 @@ const predicateRateLimiter = new RateLimiter({ windowMs: 60 * 60 * 1000, maxRequ
 // 30 disclosure grant/revoke ops / hour / session — single heavyweight circuit
 // call each, attester-gated; looser than predicate but tighter than plain calls.
 const disclosureRateLimiter = new RateLimiter({ windowMs: 60 * 60 * 1000, maxRequests: 30 });
+// 60 on-demand reindexes / hour / contract — an indexer round-trip + DB writes,
+// keyed by contractAddress (no session). Loose enough for a wallet-flow poll,
+// tight enough not to hammer the indexer.
+const reindexRateLimiter = new RateLimiter({ windowMs: 60 * 60 * 1000, maxRequests: 60 });
 
 const SHA256_HEX_RE = /^[0-9a-fA-F]{64}$/;
 const DEFAULT_ATTESTATION_VAULT_REF = 'attestation-vault';
@@ -90,6 +96,10 @@ export interface SubmissionHandlersOptions {
     circuitArgTypesLoader?: typeof loadCircuitArgTypes;
     /** Override the post-submit disclosure reindexer. Defaults to the real wrapper. */
     disclosureReindexer?: typeof reindexDisclosuresForContract;
+    /** Override the crawler-free attestation-state reader. Defaults to the real wrapper. */
+    attestationStateReader?: typeof readAttestationStateForContract;
+    /** Override the crawler-free predicate-state reader. Defaults to the real wrapper. */
+    predicateStateReader?: typeof readPredicateStateForContract;
 }
 
 export function registerSubmissionHandlers(
@@ -104,6 +114,8 @@ export function registerSubmissionHandlers(
     const submitterFactory = options.submitterFactory ?? ((deps: TransactionSubmitterDeps) => new TransactionSubmitter(deps));
     const argTypesLoader = options.circuitArgTypesLoader ?? loadCircuitArgTypes;
     const disclosureReindexer = options.disclosureReindexer ?? reindexDisclosuresForContract;
+    const attestationStateReader = options.attestationStateReader ?? readAttestationStateForContract;
+    const predicateStateReader = options.predicateStateReader ?? readPredicateStateForContract;
 
     srv.on('deployContract', async (req: Request) => {
         const { compiledArtifactRef, sessionId, initialPrivateState, idempotencyKey } = req.data as {
@@ -133,7 +145,7 @@ export function registerSubmissionHandlers(
             const facadeCfg = facadeConfigFromEnv();
             await ensureNetworkId(facadeCfg.networkId);
             const resolved = await contractResolver(compiledArtifactRef);
-            const wallet = await walletFactory({ sessionId, db, facadeConfig: facadeCfg });
+            const wallet = await walletFactory({ sessionId, db, facadeConfig: facadeCfg, expectedUserId: (req as any).user?.id });
             const submitter = submitterFactory(buildSubmitterDeps(db, resolved, wallet));
 
             return startJob({
@@ -204,7 +216,7 @@ export function registerSubmissionHandlers(
             const argTypes = argTypesLoader(resolved.zkConfigPath, circuit);
             const coercedArgs = coerceCircuitArgs(parsedArgs, argTypes);
 
-            const wallet = await walletFactory({ sessionId, db, facadeConfig: facadeCfg });
+            const wallet = await walletFactory({ sessionId, db, facadeConfig: facadeCfg, expectedUserId: (req as any).user?.id });
             const submitter = submitterFactory(buildSubmitterDeps(db, resolved, wallet));
 
             return startJob({
@@ -295,7 +307,7 @@ export function registerSubmissionHandlers(
             const facadeCfg = facadeConfigFromEnv();
             await ensureNetworkId(facadeCfg.networkId);
             const resolved = await contractResolver(compiledRef);
-            const wallet = await walletFactory({ sessionId: data.sessionId!, db, facadeConfig: facadeCfg });
+            const wallet = await walletFactory({ sessionId: data.sessionId!, db, facadeConfig: facadeCfg, expectedUserId: (req as any).user?.id });
             const submitter = submitterFactory(buildSubmitterDeps(db, resolved, wallet));
 
             const job = await startJob({
@@ -341,9 +353,11 @@ export function registerSubmissionHandlers(
     });
 
     srv.on('verifyDocument', async (req: Request) => {
-        const { documentId, providedSha256 } = req.data as {
+        const { documentId, providedSha256, contractAddress, compiledArtifactRef } = req.data as {
             documentId?: string;
             providedSha256?: string;
+            contractAddress?: string;
+            compiledArtifactRef?: string;
         };
 
         if (!documentId) return req.reject(400, 'documentId is required');
@@ -377,6 +391,13 @@ export function registerSubmissionHandlers(
                         .where({ transaction_ID: txRow.ID })
                 );
                 chainSuccess = result?.status === 'SUCCESS';
+            } else if (contractAddress && liveProviderConfigured()) {
+                // Crawler-free fallback: the anchoring tx is not in the local
+                // Transactions table (crawler off or lagging). Confirm the effect
+                // directly against live contract state — the document's sha256 is
+                // its on-chain payload_hash, so a present attestation IS the proof.
+                chainSuccess = await verifyDocumentViaState(
+                    contractAddress, doc.sha256, compiledArtifactRef);
             }
         }
 
@@ -475,7 +496,7 @@ export function registerSubmissionHandlers(
             const facadeCfg = facadeConfigFromEnv();
             await ensureNetworkId(facadeCfg.networkId);
             const resolved = await contractResolver(compiledRef);
-            const wallet = await walletFactory({ sessionId: data.sessionId!, db, facadeConfig: facadeCfg });
+            const wallet = await walletFactory({ sessionId: data.sessionId!, db, facadeConfig: facadeCfg, expectedUserId: (req as any).user?.id });
             const submitter = submitterFactory(buildSubmitterDeps(db, resolved, wallet));
             const registration = {
                 artifactPath: resolved.artifactPath,
@@ -628,6 +649,9 @@ export function registerSubmissionHandlers(
             op,
             threshold: data.threshold as any,
             unit: data.unit ?? null,
+            // Field-bound proof: record the field key so verifyPredicateAttestation's
+            // crawler-free fallback can recompute the FieldPredicateClaim key.
+            fieldKey: data.fieldKey.toLowerCase(),
             valueCommitment: null,
             provenTxHash: null,
             provenAt: null,
@@ -639,7 +663,7 @@ export function registerSubmissionHandlers(
             const facadeCfg = facadeConfigFromEnv();
             await ensureNetworkId(facadeCfg.networkId);
             const resolved = await contractResolver(compiledRef);
-            const wallet = await walletFactory({ sessionId: data.sessionId!, db, facadeConfig: facadeCfg });
+            const wallet = await walletFactory({ sessionId: data.sessionId!, db, facadeConfig: facadeCfg, expectedUserId: (req as any).user?.id });
             const submitter = submitterFactory(buildSubmitterDeps(db, resolved, wallet));
             const registration = {
                 artifactPath: resolved.artifactPath,
@@ -741,8 +765,16 @@ export function registerSubmissionHandlers(
             }
         }
 
+        // Crawler-free fallback: the proof tx is not indexed locally (crawler off
+        // or lagging). Confirm the outcome directly against live contract state —
+        // recompute the claim key from the row and look it up in predicate_results.
+        // Verifies the effect, not the tx, so it needs no crawler and no txHash.
+        if (!chainSuccess && liveProviderConfigured() && row.contractAddress && row.payloadHash) {
+            chainSuccess = await verifyPredicateViaState(row);
+        }
+
         return {
-            verified: provenOk && chainSuccess,
+            verified: chainSuccess,
             predicate: row.predicate ?? '',
             threshold: row.threshold ?? 0,
             unit: row.unit ?? '',
@@ -828,7 +860,7 @@ export function registerSubmissionHandlers(
             const facadeCfg = facadeConfigFromEnv();
             await ensureNetworkId(facadeCfg.networkId);
             const resolved = await contractResolver(compiledRef);
-            const wallet = await walletFactory({ sessionId: data.sessionId!, db, facadeConfig: facadeCfg });
+            const wallet = await walletFactory({ sessionId: data.sessionId!, db, facadeConfig: facadeCfg, expectedUserId: (req as any).user?.id });
             const submitter = submitterFactory(buildSubmitterDeps(db, resolved, wallet));
             const registration = {
                 artifactPath: resolved.artifactPath,
@@ -915,7 +947,7 @@ export function registerSubmissionHandlers(
             const facadeCfg = facadeConfigFromEnv();
             await ensureNetworkId(facadeCfg.networkId);
             const resolved = await contractResolver(compiledRef);
-            const wallet = await walletFactory({ sessionId: data.sessionId!, db, facadeConfig: facadeCfg });
+            const wallet = await walletFactory({ sessionId: data.sessionId!, db, facadeConfig: facadeCfg, expectedUserId: (req as any).user?.id });
             const submitter = submitterFactory(buildSubmitterDeps(db, resolved, wallet));
             const registration = {
                 artifactPath: resolved.artifactPath,
@@ -970,6 +1002,102 @@ export function registerSubmissionHandlers(
         });
     });
 
+    // ------------------------------------------------------------------
+    // Crawler-free on-chain state verification (onchain-state-verification-
+    // crawlerless FR). Both read LIVE contract state via queryContractState,
+    // so they work with the block crawler disabled and without a local txHash.
+    // ------------------------------------------------------------------
+
+    srv.on('verifyAttestationState', async (req: Request) => {
+        const data = req.data as {
+            contractAddress?: string;
+            payloadHash?: string;
+            contentRoot?: string;
+            compiledArtifactRef?: string;
+        };
+
+        if (!data.contractAddress) return req.reject(400, 'contractAddress is required');
+        if (!data.payloadHash) return req.reject(400, 'payloadHash is required');
+        if (!SHA256_HEX_RE.test(data.payloadHash)) {
+            return req.reject(400, 'payloadHash must be 64 hex chars (32 bytes)');
+        }
+        if (data.contentRoot && !SHA256_HEX_RE.test(data.contentRoot)) {
+            return req.reject(400, 'contentRoot must be 64 hex chars (32 bytes)');
+        }
+
+        const compiledRef = data.compiledArtifactRef && data.compiledArtifactRef.length > 0
+            ? data.compiledArtifactRef
+            : DEFAULT_ATTESTATION_VAULT_REF;
+
+        const NEGATIVE = { verified: false, attested: false, contentRootOk: false, attesterId: '' };
+
+        // No live provider configured → clean negative, not a 5xx (criterion 5).
+        if (!liveProviderConfigured()) return NEGATIVE;
+
+        return runSubmission(req, async () => {
+            const resolved = await contractResolver(compiledRef);
+            const state = await attestationStateReader({
+                contractAddress: data.contractAddress!,
+                payloadHash: data.payloadHash!,
+                contentRoot: data.contentRoot,
+                artifactPath: resolved.artifactPath,
+                contractProvidersConfig: contractProvidersConfigFromEnv(resolved.zkConfigPath)
+            });
+
+            // Unknown contract / no on-chain state → clean negative.
+            if (!state) return NEGATIVE;
+
+            const verified = state.attested && (data.contentRoot ? state.contentRootOk : true);
+            return {
+                verified,
+                attested: state.attested,
+                contentRootOk: state.contentRootOk,
+                attesterId: state.attesterId
+            };
+        });
+    });
+
+    srv.on('reindexDisclosures', async (req: Request) => {
+        const data = req.data as { contractAddress?: string; compiledArtifactRef?: string };
+
+        if (!data.contractAddress) return req.reject(400, 'contractAddress is required');
+
+        const compiledRef = data.compiledArtifactRef && data.compiledArtifactRef.length > 0
+            ? data.compiledArtifactRef
+            : DEFAULT_ATTESTATION_VAULT_REF;
+        const contractAddressLc = data.contractAddress.toLowerCase();
+
+        if (!checkRate(reindexRateLimiter, contractAddressLc, req)) return;
+
+        // No live provider configured → clean zero, not a 5xx (criterion 5).
+        if (!liveProviderConfigured()) {
+            return {
+                contractAddress: contractAddressLc,
+                active: 0,
+                deactivated: 0,
+                reconciledAt: new Date().toISOString()
+            };
+        }
+
+        return runSubmission(req, async () => {
+            const resolved = await contractResolver(compiledRef);
+            const result = await disclosureReindexer({
+                db,
+                contractAddress: contractAddressLc,
+                artifactPath: resolved.artifactPath,
+                contractProvidersConfig: contractProvidersConfigFromEnv(resolved.zkConfigPath)
+            });
+            // `indexed` is the count of grants present on-chain after reconcile —
+            // i.e. the active grants for this contract.
+            return {
+                contractAddress: contractAddressLc,
+                active: result.indexed,
+                deactivated: result.deactivated,
+                reconciledAt: new Date().toISOString()
+            };
+        });
+    });
+
     srv.on('registerGranteeIdentity', async (req: Request) => {
         const userId = (req as any).user?.id;
         if (!userId) return req.reject(401, 'authentication required');
@@ -1014,6 +1142,60 @@ export function registerSubmissionHandlers(
         }));
         return { ID, granteeId, bindingKind };
     });
+
+    /**
+     * Crawler-free evidence for verifyDocument: confirm the document's on-chain
+     * payload_hash (== its sha256) is present in the AttestationVault attestation
+     * map. Best-effort — any resolution/provider error yields `false` (a clean
+     * negative), never a 5xx.
+     */
+    async function verifyDocumentViaState(
+        contractAddress: string,
+        payloadHash: string,
+        compiledArtifactRef?: string
+    ): Promise<boolean> {
+        try {
+            const compiledRef = compiledArtifactRef && compiledArtifactRef.length > 0
+                ? compiledArtifactRef
+                : DEFAULT_ATTESTATION_VAULT_REF;
+            const resolved = await contractResolver(compiledRef);
+            const state = await attestationStateReader({
+                contractAddress,
+                payloadHash,
+                artifactPath: resolved.artifactPath,
+                contractProvidersConfig: contractProvidersConfigFromEnv(resolved.zkConfigPath)
+            });
+            return Boolean(state?.attested);
+        } catch {
+            return false;
+        }
+    }
+
+    /**
+     * Crawler-free evidence for verifyPredicateAttestation: recompute the claim
+     * key from the row and confirm a (true) result is recorded on-chain.
+     * Best-effort — any error yields `false`, never a 5xx. Defaults to the
+     * canonical attestation-vault artifact (the row does not carry a ref).
+     */
+    async function verifyPredicateViaState(row: any): Promise<boolean> {
+        try {
+            const resolved = await contractResolver(DEFAULT_ATTESTATION_VAULT_REF);
+            const proven = await predicateStateReader({
+                contractAddress: row.contractAddress,
+                payloadHash: row.payloadHash,
+                threshold: BigInt(row.threshold),
+                op: Number(row.op),
+                // Field-bound rows carry a fieldKey → verify against
+                // field_predicate_results; plain rows check predicate_results.
+                fieldKey: row.fieldKey || undefined,
+                artifactPath: resolved.artifactPath,
+                contractProvidersConfig: contractProvidersConfigFromEnv(resolved.zkConfigPath)
+            });
+            return proven === true;
+        } catch {
+            return false;
+        }
+    }
 
     /**
      * Best-effort chain reindex after a disclosure grant/revoke submit. Swallows
@@ -1065,6 +1247,16 @@ function facadeConfigFromEnv() {
         proofServerUrl: submissionEndpoints.proofServerUrl,
         relayUrl: nodeUrl
     };
+}
+
+/**
+ * True when a live indexer provider is configured, i.e. crawler-free state
+ * verification can attempt a `queryContractState` round-trip. When false, the
+ * state-verification surfaces return a clean negative instead of a 5xx.
+ */
+function liveProviderConfigured(): boolean {
+    const { submissionEndpoints } = resolveNightgateRuntimeConfig(getNightgatePluginConfig());
+    return Boolean(submissionEndpoints.indexerHttpUrl && submissionEndpoints.indexerWsUrl);
 }
 
 /** Contract-only provider config (no wallet) for read-side reindexing. */
