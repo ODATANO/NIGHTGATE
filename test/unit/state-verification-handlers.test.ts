@@ -160,6 +160,129 @@ describe('verifyAttestationState', () => {
     });
 });
 
+// ---- verifyPredicateState (expose-predicate-state-verify FR) ---------------
+
+describe('verifyPredicateState', () => {
+    const FIELD_KEY = 'e'.repeat(64);
+
+    function setup(opts: any = {}) {
+        const srv = makeFakeService();
+        registerSubmissionHandlers(srv as any, { run: jest.fn() }, {
+            resolveContractImpl: jest.fn(async () => RESOLVED as any),
+            ...opts
+        });
+        return srv;
+    }
+    const VALID = {
+        contractAddress: VAULT, payloadHash: PAYLOAD, fieldKey: '',
+        predicate: 'lessOrEqual', threshold: 1370
+    };
+
+    test('rejects missing contractAddress', async () => {
+        const srv = setup();
+        const req = makeReq({ ...VALID, contractAddress: undefined });
+        await srv.handlers['verifyPredicateState'](req);
+        expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/contractAddress/));
+    });
+
+    test('rejects missing payloadHash', async () => {
+        const srv = setup();
+        const req = makeReq({ ...VALID, payloadHash: undefined });
+        await srv.handlers['verifyPredicateState'](req);
+        expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/payloadHash/));
+    });
+
+    test('rejects non-hex payloadHash', async () => {
+        const srv = setup();
+        const req = makeReq({ ...VALID, payloadHash: 'nope' });
+        await srv.handlers['verifyPredicateState'](req);
+        expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/64 hex/));
+    });
+
+    test('rejects non-hex fieldKey', async () => {
+        const srv = setup();
+        const req = makeReq({ ...VALID, fieldKey: 'nope' });
+        await srv.handlers['verifyPredicateState'](req);
+        expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/fieldKey/));
+    });
+
+    test('rejects unknown predicate string', async () => {
+        const srv = setup();
+        const req = makeReq({ ...VALID, predicate: 'equals' });
+        await srv.handlers['verifyPredicateState'](req);
+        expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/lessOrEqual/));
+    });
+
+    test('rejects missing threshold', async () => {
+        const srv = setup();
+        const req = makeReq({ ...VALID, threshold: undefined });
+        await srv.handlers['verifyPredicateState'](req);
+        expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/threshold/));
+    });
+
+    test('rejects negative threshold', async () => {
+        const srv = setup();
+        const req = makeReq({ ...VALID, threshold: -1 });
+        await srv.handlers['verifyPredicateState'](req);
+        expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/non-negative/));
+    });
+
+    test('plain proven on-chain → verified true; empty fieldKey passed as undefined', async () => {
+        const reader = jest.fn(async () => true);
+        const srv = setup({ predicateStateReader: reader });
+        const req = makeReq({ ...VALID });
+        const r = await srv.handlers['verifyPredicateState'](req);
+        expect(r).toEqual({ verified: true, proven: true });
+        expect(reader).toHaveBeenCalledWith(expect.objectContaining({
+            contractAddress: VAULT, payloadHash: PAYLOAD,
+            fieldKey: undefined, threshold: 1370n, op: 0
+        }));
+    });
+
+    test('greaterOrEqual maps to op 1', async () => {
+        const reader = jest.fn(async () => true);
+        const srv = setup({ predicateStateReader: reader });
+        const req = makeReq({ ...VALID, predicate: 'greaterOrEqual' });
+        await srv.handlers['verifyPredicateState'](req);
+        expect(reader).toHaveBeenCalledWith(expect.objectContaining({ op: 1 }));
+    });
+
+    test('field-bound: fieldKey passed through lowercased', async () => {
+        const reader = jest.fn(async () => true);
+        const srv = setup({ predicateStateReader: reader });
+        const req = makeReq({ ...VALID, fieldKey: FIELD_KEY.toUpperCase() });
+        const r = await srv.handlers['verifyPredicateState'](req);
+        expect(r.verified).toBe(true);
+        expect(reader).toHaveBeenCalledWith(expect.objectContaining({ fieldKey: FIELD_KEY }));
+    });
+
+    test('no true result recorded → verified false, not an error (criterion 3)', async () => {
+        const reader = jest.fn(async () => false);
+        const srv = setup({ predicateStateReader: reader });
+        const req = makeReq({ ...VALID });
+        const r = await srv.handlers['verifyPredicateState'](req);
+        expect(r).toEqual({ verified: false, proven: false });
+    });
+
+    test('reader returns null (unknown contract) → clean negative (criterion 4)', async () => {
+        const reader = jest.fn(async () => null);
+        const srv = setup({ predicateStateReader: reader });
+        const req = makeReq({ ...VALID });
+        const r = await srv.handlers['verifyPredicateState'](req);
+        expect(r).toEqual({ verified: false, proven: false });
+    });
+
+    test('no live provider → clean negative, reader not called (criterion 4)', async () => {
+        mockRuntimeCfg = NO_PROVIDER;
+        const reader = jest.fn(async () => true);
+        const srv = setup({ predicateStateReader: reader });
+        const req = makeReq({ ...VALID });
+        const r = await srv.handlers['verifyPredicateState'](req);
+        expect(r).toEqual({ verified: false, proven: false });
+        expect(reader).not.toHaveBeenCalled();
+    });
+});
+
 // ---- reindexDisclosures ---------------------------------------------------
 
 describe('reindexDisclosures', () => {

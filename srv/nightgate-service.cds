@@ -381,6 +381,37 @@ service NightgateService {
     };
 
     /**
+     * Verify a predicate proof directly against LIVE contract state
+     * (`queryContractState`), independent of the block crawler, of any txHash,
+     * and of any server-side PredicateAttestations row — the id-free counterpart
+     * to `verifyPredicateAttestation` for WALLET-submitted proofs (browser signs,
+     * NIGHTGATE never saw a jobId). Recomputes the on-chain claim key off-chain
+     * from the supplied coordinates and confirms the vault recorded a true
+     * result for it. Supply `fieldKey` for a field-bound proof
+     * (`field_predicate_results`); omit it for a plain one (`predicate_results`).
+     *
+     * `threshold` must be the SAME scaled Uint<64> integer the circuit hashed
+     * into the claim key (e.g. raw value x1000 when the consumer scales by
+     * 1000); a scaling mismatch silently yields `verified: false`.
+     *
+     * Returns `verified: false` (not an error) for an absent result, and a
+     * clean negative (not a 5xx) when no live provider is configured or the
+     * contract is unknown — mirroring `verifyAttestationState`.
+     * `compiledArtifactRef` defaults to 'attestation-vault'.
+     */
+    function verifyPredicateState(
+        contractAddress:     String,
+        payloadHash:         String,   // 64 hex
+        fieldKey:            String,   // optional 64 hex; when set, field-bound
+        predicate:           String,   // 'lessOrEqual' | 'greaterOrEqual'
+        threshold:           Integer64, // scaled circuit integer (see above)
+        compiledArtifactRef: String    // optional, defaults to 'attestation-vault'
+    )                                returns {
+        verified: Boolean;
+        proven:   Boolean;   // a true result is recorded on-chain for the claim key
+    };
+
+    /**
      * Chain-derived disclosure grants, read off the AttestationVault
      * `disclosures` ledger Map by the chain indexer. Distinct from the
      * off-chain `DisclosureRoles` table — these are the tamper-evident,

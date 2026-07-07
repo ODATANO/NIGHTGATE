@@ -1057,6 +1057,63 @@ export function registerSubmissionHandlers(
         });
     });
 
+    srv.on('verifyPredicateState', async (req: Request) => {
+        const data = req.data as {
+            contractAddress?: string;
+            payloadHash?: string;
+            fieldKey?: string;
+            predicate?: string;
+            threshold?: number | string;
+            compiledArtifactRef?: string;
+        };
+
+        if (!data.contractAddress) return req.reject(400, 'contractAddress is required');
+        if (!data.payloadHash) return req.reject(400, 'payloadHash is required');
+        if (!SHA256_HEX_RE.test(data.payloadHash)) {
+            return req.reject(400, 'payloadHash must be 64 hex chars (32 bytes)');
+        }
+        if (data.fieldKey && !SHA256_HEX_RE.test(data.fieldKey)) {
+            return req.reject(400, 'fieldKey must be 64 hex chars (32 bytes)');
+        }
+
+        let op: number;
+        if (data.predicate === 'lessOrEqual') op = 0;
+        else if (data.predicate === 'greaterOrEqual') op = 1;
+        else return req.reject(400, "predicate must be 'lessOrEqual' or 'greaterOrEqual'");
+
+        if (data.threshold === undefined || data.threshold === null) return req.reject(400, 'threshold is required');
+        let thresholdBig: bigint;
+        try { thresholdBig = BigInt(data.threshold); } catch { return req.reject(400, 'threshold must be an integer'); }
+        if (thresholdBig < 0n) return req.reject(400, 'threshold must be a non-negative integer');
+
+        const compiledRef = data.compiledArtifactRef && data.compiledArtifactRef.length > 0
+            ? data.compiledArtifactRef
+            : DEFAULT_ATTESTATION_VAULT_REF;
+
+        const NEGATIVE = { verified: false, proven: false };
+
+        // No live provider configured → clean negative, not a 5xx (criterion 4).
+        if (!liveProviderConfigured()) return NEGATIVE;
+
+        return runSubmission(req, async () => {
+            const resolved = await contractResolver(compiledRef);
+            const proven = await predicateStateReader({
+                contractAddress: data.contractAddress!,
+                payloadHash: data.payloadHash!.toLowerCase(),
+                // Field-bound iff fieldKey supplied; '' means plain.
+                fieldKey: data.fieldKey ? data.fieldKey.toLowerCase() : undefined,
+                threshold: thresholdBig,
+                op,
+                artifactPath: resolved.artifactPath,
+                contractProvidersConfig: contractProvidersConfigFromEnv(resolved.zkConfigPath)
+            });
+
+            // `null` (unknown contract / no on-chain state) and `false` (no true
+            // result for the recomputed claim key) both read as not proven.
+            return { verified: proven === true, proven: proven === true };
+        });
+    });
+
     srv.on('reindexDisclosures', async (req: Request) => {
         const data = req.data as { contractAddress?: string; compiledArtifactRef?: string };
 
