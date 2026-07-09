@@ -1,4 +1,6 @@
-# @odatano/nightgate
+# NIGHTGATE - OData for Midnight @odatano/nightgate
+
+![Header Image](/docs/readme_header.png)
 
 **SAP CAP plugin: Midnight blockchain indexer + transaction submission, exposed as OData V4.**
 
