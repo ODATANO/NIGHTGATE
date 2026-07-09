@@ -37,7 +37,7 @@ import { deriveRoleSeeds } from '../utils/wallet-hd';
 // is erased at compile time so we don't emit a require() against an ESM-only
 // module; runtime access still goes through dynamic `import()` in
 // loadAddressFormat below.
-import type * as AddressFormat from '@midnight-ntwrk/wallet-sdk-address-format';
+import type * as AddressFormat from '@midnightntwrk/wallet-sdk-address-format';
 
 // ---- Message protocol shared with main thread -----------------------------
 
@@ -98,7 +98,7 @@ let cachedAddressFormat: typeof AddressFormat | undefined;
 
 async function loadAddressFormat(): Promise<typeof AddressFormat> {
     if (cachedAddressFormat) return cachedAddressFormat;
-    cachedAddressFormat = await import('@midnight-ntwrk/wallet-sdk-address-format');
+    cachedAddressFormat = await import('@midnightntwrk/wallet-sdk-address-format');
     return cachedAddressFormat;
 }
 
@@ -131,16 +131,16 @@ async function loadSdk(): Promise<{
     }
     if (!cachedWallet) {
         const [shielded, unshielded, dust, abstractions] = await Promise.all([
-            import('@midnight-ntwrk/wallet-sdk-shielded'),
-            import('@midnight-ntwrk/wallet-sdk-unshielded-wallet'),
-            import('@midnight-ntwrk/wallet-sdk-dust-wallet'),
-            import('@midnight-ntwrk/wallet-sdk-abstractions')
+            import('@midnightntwrk/wallet-sdk-shielded'),
+            import('@midnightntwrk/wallet-sdk-unshielded-wallet'),
+            import('@midnightntwrk/wallet-sdk-dust-wallet'),
+            import('@midnightntwrk/wallet-sdk-abstractions')
         ]);
         cachedWallet = { shielded, unshielded, dust, abstractions };
     }
     if (!cachedFacadeSdk) {
         const [facade, networkId] = await Promise.all([
-            import('@midnight-ntwrk/wallet-sdk-facade'),
+            import('@midnightntwrk/wallet-sdk-facade'),
             import('@midnight-ntwrk/midnight-js-network-id')
         ]);
         cachedFacadeSdk = { facade, networkId };
@@ -514,21 +514,14 @@ function getSdkVersion(): string {
         // eslint-disable-next-line @typescript-eslint/no-var-requires
         const path = require('path');
         let pkgPath: string | undefined;
-        // First try: direct subpath resolution. Newer ESM-only packages with
-        // restricted `exports` reject this — that's why we had `@unknown`.
-        try {
-            pkgPath = require.resolve('@midnight-ntwrk/wallet-sdk-facade/package.json');
-        } catch {
-            // Fallback: walk up from the package's main module path until we
-            // find a package.json. Works regardless of exports restrictions.
-            const mainPath = require.resolve('@midnight-ntwrk/wallet-sdk-facade');
-            let dir = path.dirname(mainPath);
-            // Bound the walk to keep it cheap.
-            for (let i = 0; i < 8 && dir && dir !== path.dirname(dir); i++) {
-                const candidate = path.join(dir, 'package.json');
-                if (fs.existsSync(candidate)) { pkgPath = candidate; break; }
-                dir = path.dirname(dir);
-            }
+        // The package's `exports` map exposes neither `./package.json` nor a
+        // `require` condition, so require.resolve() throws for both the
+        // subpath and the bare specifier. Locate the package.json on disk by
+        // walking the module resolution paths instead.
+        const searchDirs = require.resolve.paths('@midnightntwrk/wallet-sdk-facade') ?? [];
+        for (const dir of searchDirs) {
+            const candidate = path.join(dir, '@midnightntwrk', 'wallet-sdk-facade', 'package.json');
+            if (fs.existsSync(candidate)) { pkgPath = candidate; break; }
         }
         if (!pkgPath) throw new Error('package.json not located');
         const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf-8'));
@@ -544,7 +537,7 @@ function getSdkVersion(): string {
  * UnshieldedAddress) into its canonical string form.
  *
  * Uses `MidnightBech32m.encode` (declared in
- * `@midnight-ntwrk/wallet-sdk-address-format/dist/index.d.ts` as
+ * `@midnightntwrk/wallet-sdk-address-format/dist/index.d.ts` as
  * `static encode<T extends HasCodec<T>>(networkId, item): MidnightBech32m`)
  * which reads the `[Bech32mSymbol]` codec attached to each address class.
  * `.toString()` on the result yields the Bech32m string.

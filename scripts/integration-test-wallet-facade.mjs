@@ -10,11 +10,11 @@
 // and only verify the static wiring.
 
 import { randomBytes } from 'node:crypto';
-import { WalletFacade } from '@midnight-ntwrk/wallet-sdk-facade';
-import { ShieldedWallet } from '@midnight-ntwrk/wallet-sdk-shielded';
-import { UnshieldedWallet, PublicKey, createKeystore } from '@midnight-ntwrk/wallet-sdk-unshielded-wallet';
-import { DustWallet } from '@midnight-ntwrk/wallet-sdk-dust-wallet';
-import { InMemoryTransactionHistoryStorage, NetworkId } from '@midnight-ntwrk/wallet-sdk-abstractions';
+import { WalletFacade } from '@midnightntwrk/wallet-sdk-facade';
+import { ShieldedWallet } from '@midnightntwrk/wallet-sdk-shielded';
+import { UnshieldedWallet, PublicKey, createKeystore } from '@midnightntwrk/wallet-sdk-unshielded-wallet';
+import { DustWallet } from '@midnightntwrk/wallet-sdk-dust-wallet';
+import { InMemoryTransactionHistoryStorage, NetworkId } from '@midnightntwrk/wallet-sdk-abstractions';
 import { ZswapSecretKeys, DustSecretKey } from '@midnight-ntwrk/ledger-v8';
 
 const seed = randomBytes(32);

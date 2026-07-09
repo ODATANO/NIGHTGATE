@@ -218,7 +218,7 @@ export async function deleteSyncState(accountId: string): Promise<void> {
 }
 
 /**
- * Resolved SDK version string for the `@midnight-ntwrk/wallet-sdk-facade`
+ * Resolved SDK version string for the `@midnightntwrk/wallet-sdk-facade`
  * package, read from the installed package's package.json. Pinned at first
  * call so a hot-reload of node_modules doesn't change the answer mid-process.
  */
@@ -229,7 +229,19 @@ export function getWalletSdkVersion(): string {
     try {
         // eslint-disable-next-line @typescript-eslint/no-var-requires
         const fs = require('fs');
-        const pkgPath = require.resolve('@midnight-ntwrk/wallet-sdk-facade/package.json');
+        // eslint-disable-next-line @typescript-eslint/no-var-requires
+        const path = require('path');
+        // The package's `exports` map exposes neither `./package.json` nor a
+        // `require` condition, so require.resolve() throws for both the
+        // subpath and the bare specifier. Locate the package.json on disk by
+        // walking the module resolution paths instead.
+        let pkgPath: string | undefined;
+        const searchDirs = require.resolve.paths('@midnightntwrk/wallet-sdk-facade') ?? [];
+        for (const dir of searchDirs) {
+            const candidate = path.join(dir, '@midnightntwrk', 'wallet-sdk-facade', 'package.json');
+            if (fs.existsSync(candidate)) { pkgPath = candidate; break; }
+        }
+        if (!pkgPath) throw new Error('package.json not located');
         const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf-8'));
         resolvedSdkVersion = `wallet-sdk-facade@${pkg.version}`;
     } catch {

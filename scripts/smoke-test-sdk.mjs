@@ -10,7 +10,7 @@ const packages = [
     '@midnight-ntwrk/midnight-js-level-private-state-provider',
     '@midnight-ntwrk/compact-runtime',
     '@midnight-ntwrk/ledger-v8',
-    '@midnight-ntwrk/wallet-sdk-facade'
+    '@midnightntwrk/wallet-sdk-facade'
 ];
 
 let failures = 0;

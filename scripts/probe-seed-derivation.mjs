@@ -28,8 +28,8 @@ import {
     ShieldedCoinPublicKey,
     ShieldedEncryptionPublicKey,
     MidnightBech32m
-} from '@midnight-ntwrk/wallet-sdk-address-format';
-import { HDWallet, Roles } from '@midnight-ntwrk/wallet-sdk-hd';
+} from '@midnightntwrk/wallet-sdk-address-format';
+import { HDWallet, Roles } from '@midnightntwrk/wallet-sdk-hd';
 
 const MNEMONIC = (process.env.LACE_MNEMONIC || '').trim();
 const NETWORK = process.env.NIGHTGATE_NETWORK || 'preprod';

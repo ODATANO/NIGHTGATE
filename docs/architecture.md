@@ -192,8 +192,8 @@ This is a real footgun if you ever want to handle multi-network in one process. 
 
 ## ESM-only SDK in a CommonJS project
 
-All `@midnight-ntwrk/*` packages are ESM-only. NIGHTGATE is `"type": "commonjs"`. The submission code uses dynamic `import()` via `srv/midnight/sdk-loader.ts` (main thread) and `loadSdk()` / `loadContractsSdk()` / `loadAddressFormat()` in the worker.
+All Midnight SDK packages (`@midnight-ntwrk/*` and the wallet-sdk family under `@midnightntwrk/*`) are ESM-only. NIGHTGATE is `"type": "commonjs"`. The submission code uses dynamic `import()` via `srv/midnight/sdk-loader.ts` (main thread) and `loadSdk()` / `loadContractsSdk()` / `loadAddressFormat()` in the worker.
 
-Type-only imports work when the SDK provides clean `.d.ts`: `import type * as AddressFormat from '@midnight-ntwrk/wallet-sdk-address-format'` gives us `AddressFormat.MidnightBech32m`, `AddressFormat.DustAddress`, etc. for type-checking without emitting a `require()`. We use this pattern in the worker for the address-format and ledger-v8 packages.
+Type-only imports work when the SDK provides clean `.d.ts`: `import type * as AddressFormat from '@midnightntwrk/wallet-sdk-address-format'` gives us `AddressFormat.MidnightBech32m`, `AddressFormat.DustAddress`, etc. for type-checking without emitting a `require()`. We use this pattern in the worker for the address-format and ledger-v8 packages.
 
 For SDK packages with messy or absent types, we fall back to `any` and rely on runtime duck-typing — but per the project's no-duck-typing rule, only after verifying the actual `.d.ts` first. We don't write try/catch chains over guessed method names.

@@ -13,12 +13,12 @@ jest.mock('@midnight-ntwrk/midnight-js-indexer-public-data-provider', () => ({ _
 jest.mock('@midnight-ntwrk/midnight-js-http-client-proof-provider', () => ({ __esModule: true, marker: 'proof' }), { virtual: true });
 jest.mock('@midnight-ntwrk/midnight-js-node-zk-config-provider', () => ({ __esModule: true, marker: 'zk' }), { virtual: true });
 jest.mock('@midnight-ntwrk/midnight-js-level-private-state-provider', () => ({ __esModule: true, marker: 'level' }), { virtual: true });
-jest.mock('@midnight-ntwrk/wallet-sdk-facade', () => ({ __esModule: true, marker: 'facade' }), { virtual: true });
+jest.mock('@midnightntwrk/wallet-sdk-facade', () => ({ __esModule: true, marker: 'facade' }), { virtual: true });
 jest.mock('@midnight-ntwrk/ledger-v8', () => ({ __esModule: true, marker: 'ledger-v8' }), { virtual: true });
-jest.mock('@midnight-ntwrk/wallet-sdk-shielded', () => ({ __esModule: true, marker: 'shielded' }), { virtual: true });
-jest.mock('@midnight-ntwrk/wallet-sdk-unshielded-wallet', () => ({ __esModule: true, marker: 'unshielded' }), { virtual: true });
-jest.mock('@midnight-ntwrk/wallet-sdk-dust-wallet', () => ({ __esModule: true, marker: 'dust' }), { virtual: true });
-jest.mock('@midnight-ntwrk/wallet-sdk-abstractions', () => ({ __esModule: true, marker: 'abstractions' }), { virtual: true });
+jest.mock('@midnightntwrk/wallet-sdk-shielded', () => ({ __esModule: true, marker: 'shielded' }), { virtual: true });
+jest.mock('@midnightntwrk/wallet-sdk-unshielded-wallet', () => ({ __esModule: true, marker: 'unshielded' }), { virtual: true });
+jest.mock('@midnightntwrk/wallet-sdk-dust-wallet', () => ({ __esModule: true, marker: 'dust' }), { virtual: true });
+jest.mock('@midnightntwrk/wallet-sdk-abstractions', () => ({ __esModule: true, marker: 'abstractions' }), { virtual: true });
 
 import {
     loadMidnightSdk,

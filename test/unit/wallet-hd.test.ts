@@ -3,7 +3,7 @@
  *
  * Only `mnemonicToBip39SeedHex` is unit-tested here — it's pure bip39 (CJS),
  * loadable in Jest. `deriveRoleSeeds` dynamic-imports the ESM-only
- * `@midnight-ntwrk/wallet-sdk-hd`, which Jest's resolver can't load; its
+ * `@midnightntwrk/wallet-sdk-hd`, which Jest's resolver can't load; its
  * correctness (the per-role HD path that matches Lace) is verified against a
  * live account by scripts/probe-seed-derivation.mjs.
  */

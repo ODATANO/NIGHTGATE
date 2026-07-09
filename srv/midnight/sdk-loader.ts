@@ -54,7 +54,7 @@ export async function loadMidnightSdk(): Promise<MidnightSdkBundle> {
             import('@midnight-ntwrk/midnight-js-http-client-proof-provider'),
             import('@midnight-ntwrk/midnight-js-node-zk-config-provider'),
             import('@midnight-ntwrk/midnight-js-level-private-state-provider'),
-            import('@midnight-ntwrk/wallet-sdk-facade')
+            import('@midnightntwrk/wallet-sdk-facade')
         ]);
         const bundle: MidnightSdkBundle = { contracts, indexer, proof, zk, level, facade };
         cachedBundle = bundle;
@@ -115,10 +115,10 @@ export async function loadWalletSdk(): Promise<WalletSdkBundle> {
     if (inflightWalletSdk) return inflightWalletSdk;
     inflightWalletSdk = (async () => {
         const [shielded, unshielded, dust, abstractions] = await Promise.all([
-            import('@midnight-ntwrk/wallet-sdk-shielded'),
-            import('@midnight-ntwrk/wallet-sdk-unshielded-wallet'),
-            import('@midnight-ntwrk/wallet-sdk-dust-wallet'),
-            import('@midnight-ntwrk/wallet-sdk-abstractions')
+            import('@midnightntwrk/wallet-sdk-shielded'),
+            import('@midnightntwrk/wallet-sdk-unshielded-wallet'),
+            import('@midnightntwrk/wallet-sdk-dust-wallet'),
+            import('@midnightntwrk/wallet-sdk-abstractions')
         ]);
         const bundle: WalletSdkBundle = { shielded, unshielded, dust, abstractions };
         cachedWalletSdk = bundle;

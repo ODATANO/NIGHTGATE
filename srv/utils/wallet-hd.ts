@@ -15,7 +15,7 @@
  * `scripts/probe-seed-derivation.mjs`: role Zswap at account 0 / index 0
  * reproduces the Lace shielded address exactly.
  *
- * `@midnight-ntwrk/wallet-sdk-hd` is ESM-only; loaded via dynamic import from
+ * `@midnightntwrk/wallet-sdk-hd` is ESM-only; loaded via dynamic import from
  * this CommonJS module (same pattern as srv/midnight/sdk-loader.ts).
  */
 // Named imports: bip39's CJS build sets `__esModule` but exposes no default
@@ -37,7 +37,7 @@ export interface RoleSeeds {
 
 let cachedHd: any;
 async function loadWalletHd(): Promise<any> {
-    if (!cachedHd) cachedHd = await import('@midnight-ntwrk/wallet-sdk-hd');
+    if (!cachedHd) cachedHd = await import('@midnightntwrk/wallet-sdk-hd');
     return cachedHd;
 }
 

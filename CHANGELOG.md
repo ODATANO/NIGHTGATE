@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.6.1 - 2026-07-09
+
+### Wallet SDK migrated to the @midnightntwrk scope (fixes the sync stall)
+
+The wallet-sdk family moved upstream from `@midnight-ntwrk/*` (frozen) to `@midnightntwrk/*`; 0.6.0 still resolved the dead scope, whose packages lack the indexer-4.3.x-era fixes (WebSocket subscription leak, `DustGenerationDtimeUpdate` handling in the dust subscription, prover-client compatibility with undici >= 8.2) and starve server-side cold syncs under the indexer 4.3.3 per-connection subscription quotas. FR: `docs/feature-requests/migrate-wallet-sdk-scope.md`.
+
+- **Deps** (pins per the `@midnightntwrk/wallet-sdk@1.2.0` barrel): facade ^4.1.0, shielded ^3.0.2, dust-wallet ^4.2.0, unshielded-wallet ^3.1.0, hd ^3.0.3, address-format ^3.1.2, abstractions ^2.1.0. `ledger-v8`, `compact-js`, `compact-runtime` and all `midnight-js-*` stay in the old scope (not migrated upstream). `npm ls --all` resolves every wallet-sdk package to `@midnightntwrk/*` code, so no dual-scope class-identity mixing.
+- **Phantom-dep shim**: `midnight-js-utils@4.0.4` imports `@midnight-ntwrk/wallet-sdk-address-format` at runtime without declaring it (previously satisfied by our own hoisted old-scope dep). Satisfied via npm alias `"@midnight-ntwrk/wallet-sdk-address-format": "npm:@midnightntwrk/wallet-sdk-address-format@^3.1.2"`, i.e. the new-scope code under the old name; only strings cross that boundary (`parseCoinPublicKeyToHex` and friends). Drop the alias when `midnight-js-*` is bumped to >= 4.1.1, which declares the dep properly.
+- **Import sweep**: `sdk-loader.ts`, `wallet-worker.ts`, `wallet-hd.ts`, integration scripts, test mocks.
+- **`getWalletSdkVersion()`** (and the worker's twin) now locate the facade `package.json` by walking `require.resolve.paths()`, since the package's `exports` map exposes neither `./package.json` nor a `require` condition; the sync-state stamp reports the real version instead of `wallet-sdk-facade@unknown`.
+- **Upgrade note**: persisted wallet sync-state blobs are stamped with the SDK version, so the version change discards pre-migration blobs and forces one cold re-sync per wallet. That is intended: blobs written by the frozen SDK predate the quota-aware subscription handling.
+- Verification: typecheck, lint, 54/54 suites with 863/863 tests, smoke:sdk (8/8 SDK packages), integration:contract-registry, `npm audit` 0 findings.
+
 ## 0.6.0 - 2026-07-09
 
 ### CAP 10 toolchain + Int64/Decimal string coercions
