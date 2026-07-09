@@ -718,14 +718,16 @@ export class MidnightCrawler {
     }
 
     private getCatchUpStartHeight(syncState: {
-        lastIndexedHeight?: number | null;
+        lastIndexedHeight?: number | string | null;
         lastIndexedHash?: string | null;
     } | null | undefined): number {
         if (!syncState?.lastIndexedHash) {
             return 0;
         }
 
-        return (syncState.lastIndexedHeight ?? -1) + 1;
+        // Integer64 columns come back as STRINGS from CAP 10 databases
+        // (ieee754compatible); "0" + 1 would concatenate to "01".
+        return Number(syncState.lastIndexedHeight ?? -1) + 1;
     }
 
     private sleep(ms: number): Promise<void> {

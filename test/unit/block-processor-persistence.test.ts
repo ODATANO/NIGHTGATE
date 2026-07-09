@@ -256,13 +256,14 @@ describe('BlockProcessor persistence paths', () => {
         const blockRow = await db.run(cds.ql.SELECT.one.from(BLOCKS).where({ hash: '0xnew' }));
         expect(blockRow).toEqual(expect.objectContaining({
             hash: '0xnew',
-            height: 5,
             protocolVersion: 77,
             timestamp: 1_700_000_000,
             author: 'BABE:0xdeadbeef',
             ledgerParameters: '0xstate',
             parent_ID: parentId
         }));
+        // Integer64: number on CAP 9, string on CAP 10 (ieee754compatible).
+        expect(Number(blockRow.height)).toBe(5);
         const blockId = blockRow.ID;
 
         // --- Transactions (ordered by index within block) ---

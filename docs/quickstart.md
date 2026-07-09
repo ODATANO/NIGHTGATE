@@ -8,7 +8,7 @@ From `npm ci` to a working wallet-signed transaction. This walks through three p
 
 ## Prerequisites
 
-- Node.js ≥ 20 (the wallet SDK needs `worker_threads` + `--env-file`)
+- Node.js ≥ 22 (CAP 10 minimum; the wallet SDK also needs `worker_threads` + `--env-file`)
 - npm
 - Docker Desktop (only if you want the local proof server or the local Midnight indexer)
 - For wallet operations: a Midnight wallet seed (24-word BIP39 mnemonic) and viewing key. Get these from the [Lace wallet](https://www.lace.io/) extension.

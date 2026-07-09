@@ -103,11 +103,10 @@ describe('getSyncStatus', () => {
         });
 
         const result = await srv.send('getSyncStatus');
-        expect(result).toEqual(expect.objectContaining({
-            syncStatus: 'synced',
-            lastIndexedHeight: 42,
-            chainHeight: 50
-        }));
+        expect(result).toEqual(expect.objectContaining({ syncStatus: 'synced' }));
+        // Integer64: number on CAP 9, string on CAP 10 (ieee754compatible).
+        expect(Number(result.lastIndexedHeight)).toBe(42);
+        expect(Number(result.chainHeight)).toBe(50);
     });
 
     it('returns stopped defaults when SyncState is absent', async () => {
@@ -215,9 +214,9 @@ describe('getReorgHistory', () => {
         const result = await srv.send({ event: 'getReorgHistory', data: { limit: 25 } });
         expect(Array.isArray(result)).toBe(true);
         expect(result.length).toBe(2);
-        // Newest first.
-        expect(result[0].forkHeight).toBe(9);
-        expect(result[1].forkHeight).toBe(5);
+        // Newest first. Integer64: number on CAP 9, string on CAP 10.
+        expect(Number(result[0].forkHeight)).toBe(9);
+        expect(Number(result[1].forkHeight)).toBe(5);
     });
 
     it('caps the number of returned rows to the requested limit', async () => {

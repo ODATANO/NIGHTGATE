@@ -955,13 +955,14 @@ describe('MidnightCrawler orchestration', () => {
             // ReorgLog row recorded with rollback count 2 and status in_progress.
             const log = await db.run(cds.ql.SELECT.one.from(REORG_LOG).where({ ID: reorgLogId }));
             expect(log).toMatchObject({
-                forkHeight: 10,
                 oldTipHash: '0xold',
                 newTipHash: '0xnew',
                 blocksRolledBack: 2,
                 blocksReIndexed: 0,
                 status: 'in_progress'
             });
+            // Integer64: number on CAP 9, string on CAP 10 (ieee754compatible).
+            expect(Number(log.forkHeight)).toBe(10);
         });
 
         it('returns a reorg-log id but writes no log when there are no indexed blocks to roll back', async () => {

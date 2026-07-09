@@ -99,9 +99,12 @@ export default class NightgateIndexerService extends cds.ApplicationService {
                 };
             }
 
-            const chainHeight = syncState.chainHeight || 0;
-            const indexedHeight = syncState.lastIndexedHeight || 0;
-            const finalizedHeight = syncState.lastFinalizedHeight || 0;
+            // Integer64/Decimal columns come back as STRINGS from CAP 10
+            // databases (ieee754compatible); coerce so the health payload
+            // keeps its numeric contract on both CAP 9 and 10.
+            const chainHeight = Number(syncState.chainHeight || 0);
+            const indexedHeight = Number(syncState.lastIndexedHeight || 0);
+            const finalizedHeight = Number(syncState.lastFinalizedHeight || 0);
             const lag = Math.max(chainHeight - indexedHeight, 0);
             const finalizedLag = Math.max(chainHeight - finalizedHeight, 0);
             let status = 'healthy';
@@ -115,7 +118,7 @@ export default class NightgateIndexerService extends cds.ApplicationService {
                 finalizedHeight,
                 lag,
                 finalizedLag,
-                blocksPerSecond: syncState.blocksPerSecond || 0,
+                blocksPerSecond: Number(syncState.blocksPerSecond || 0),
                 syncStatus: syncState.syncStatus || 'stopped'
             };
         });
@@ -175,10 +178,11 @@ export default class NightgateIndexerService extends cds.ApplicationService {
             );
 
             const lines: string[] = [];
-            const chainHeight = syncState?.chainHeight || 0;
-            const indexedHeight = syncState?.lastIndexedHeight || 0;
+            // Number() coercion: Integer64/Decimal read back as strings on CAP 10.
+            const chainHeight = Number(syncState?.chainHeight || 0);
+            const indexedHeight = Number(syncState?.lastIndexedHeight || 0);
             const lag = chainHeight - indexedHeight;
-            const bps = syncState?.blocksPerSecond || 0;
+            const bps = Number(syncState?.blocksPerSecond || 0);
             const errors = syncState?.consecutiveErrors || 0;
             const uptimeSec = Math.floor((Date.now() - processStartTime) / 1000);
             const syncStatus = syncState?.syncStatus || 'stopped';
