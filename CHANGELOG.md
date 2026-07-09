@@ -1,5 +1,64 @@
 # Changelog
 
+## 0.6.0 - 2026-07-09
+
+### CAP 10 toolchain + Int64/Decimal string coercions
+
+Toolchain lifted to `@sap/cds` 10.0.3; code keeps running in both CAP 9 and CAP 10 hosts (peer stays `@sap/cds >=9.0.0`). Full notes: `docs/release-0.6.0.md`.
+
+- **CAP 10 toolchain**: `@sap/cds ^10`, `@sap/cds-dk ^10`, `@cap-js/sqlite ^3` (better-sqlite3 12), `@cap-js/cds-test ^1`, `@cap-js/cds-types ^0.18`, `@cap-js/cds-typer ^0.40`, `eslint ^10`. Node >= 22 is required (CAP 10 minimum; engines field unchanged).
+- **Int64/Decimal coercions**: CAP 10 returns Integer64/Decimal values from the DB as strings. All arithmetic read sites are coerced; this also fixes a catch-up bug that would have surfaced under CAP 10 (`"0" + 1 = "01"` as the start height). `getHealth`/`getMetrics` contractually keep returning numbers.
+- **cds-typer workaround**: `cds:types` runs with `--outputDTsFiles false` because the new default emission (.d.ts + .js) crashes tsc 5.9.
+- **Config**: sqlite credentials are now named `url` instead of the deprecated `database`.
+- **Consumer note**: no schema delta, no API change. In a CAP 10 host, OData serializes Integer64/Decimal fields (heights, balances, amounts) as **strings**; coerce accordingly in client code. CAP 9 hosts are unaffected.
+- Verification: typecheck, lint, 54/54 suites with 863/863 tests, smoke:sdk (8/8 SDK packages), integration:providers, integration:contract-registry, `npm audit` 0 findings.
+
+## 0.5.2 - 2026-07-09
+
+### Code hardening: admin-gated indexer ops, gapless catch-up, reorg-safe NightBalances, scoped reads
+
+- **Admin gating**: `pauseCrawler` / `resumeCrawler` / `reindexFromHeight` now `@requires: 'admin'` (probes/status stay open for K8s/Prometheus).
+- **Gapless catch-up**: a failed batch is re-queued once, then the crawler stops with syncStatus `error` instead of skipping heights; height-sequenced persists refuse orphan blocks (missing parent above genesis throws).
+- **Reorg-safe NightBalances**: shared rollback utility (`srv/crawler/rollback.ts`) for reorg + manual reindex recomputes NightBalances per affected address from the remaining rows, so rollback + re-index can no longer double-count balances. `reindexFromHeight` runs its rollback in an explicit committed tx before the crawler restarts.
+- **Reorg height guard**: replayed finalized heads are ignored, gaps trigger catch-up instead of rollback, genesis replays never roll back.
+- **Scoped reads**: `WalletSessions` / `PendingSubmissions` entity READs are scoped to the requesting user (admins unfiltered); no schema change.
+- `protocolVersion` is queried per batch/block; the cache is only an RPC-error fallback.
+- Deps: `npm audit` clean (prod: path-to-regexp/undici/ws/qs chain; dev: cds-dk 9.9.3, tsx 4.23); package.json ranges unchanged. Tests: 863/863 (25 new).
+
+## 0.5.1 - 2026-07-07
+
+### verifyPredicateState: id-free crawler-free predicate verification
+
+- Exposes `readPredicateStateForContract` as a first-class service function keyed by claim coordinates (`payloadHash`, `fieldKey?`, `predicate`, `threshold`), so wallet-submitted predicate proofs self-confirm without a `PredicateAttestations` row, a txHash, or the block crawler. Mirrors `verifyAttestationState`.
+
+## 0.5.0 - 2026-07-07
+
+### Crawler-free state verification + auth hardening
+
+Adds crawler-independent on-chain state verification and fixes the review_001 P1-P3 security findings. A consumer whose transactions do not flow through NIGHTGATE's own submission pipeline (e.g. a browser wallet signs and submits, handing back only a txHash) can now confirm the on-chain **effect** directly against live contract state. Full notes: `docs/release-0.5.0.md`.
+
+- **Crawler-free verification** (all read live contract state via `indexerPublicDataProvider.queryContractState`; clean negative, not a 5xx, when no live provider is configured):
+  - `verifyAttestationState(contractAddress, payloadHash, contentRoot?)` confirms a payload hash is present in the vault's attestation map (and, when supplied, that the anchored content root matches).
+  - `reindexDisclosures(contractAddress)` reconciles `DisclosureGrants` on demand from live state, for wallet-submitted grant/revoke that bypass the plugin pipeline.
+  - `verifyDocument` / `verifyPredicateAttestation` fall back to live state when the local `Transactions` table has no matching row. `verifyDocument` gains optional `contractAddress` / `compiledArtifactRef` (non-breaking). Predicate claim keys are recomputed off-chain (`persistentHash` of `PredicateClaim` / `FieldPredicateClaim`, byte-exact per `scripts/spike-state-verification.mjs`) and looked up in `predicate_results` / `field_predicate_results`.
+  - New readers `srv/submission/attestation-state.ts` and `predicate-state.ts`; live e2e via `npm run state-verify:e2e`.
+- **Security hardening (review_001)**:
+  - P1: sessions bound to the owning principal via new `WalletSessions.userId`; every session action, `buildWalletMaterialForSession` (`expectedUserId`), and `getJobStatus` scope to `req.user.id`. Foreign sessionId reads back as 404, unauthenticated callers get 401.
+  - P1: **`allowSelfServiceGranteeRegistration` now defaults to `false`** (was `true`); NIGHTGATE cannot verify ownership of the binding input, so the safe default is off.
+  - P2: admin `invalidateSession` / `invalidateAllSessions` and the TTL cleanup now null both encrypted keys and evict the cached `WalletFacade`.
+  - P3: `jest.config.js` `testTimeout: 60000`.
+- **Upgrade**: two new columns, `WalletSessions.userId` and `PredicateAttestations.fieldKey`. Fresh installs get them via `cds deploy`; on an **existing** DB run `scripts/apply-schema-delta.mjs` (now reconciles missing columns via `ALTER TABLE ADD COLUMN`) to avoid a data wipe. Legacy sessions without `userId` read back as 404, so users reconnect once. Tests: 827/827.
+
+## 0.4.3 - 2026-07-02
+
+### Field-bound predicate proofs
+
+Binds a proven predicate value to a **specific passport field** via a Merkle content root, so a verifier knows the value came from *this* attestation, not an arbitrary committed number. Live-verified on Preview.
+
+- **Compact** (`attestation-vault.compact`): new `anchorContentRoot(payload_hash, content_root)` + `proveFieldPredicate(payload_hash, field_key, threshold, op)` circuits. The circuit recomputes the field's Merkle leaf from the witnessed value + inclusion path, folds to a root (depth-4, unrolled), asserts it equals the anchored content root, then checks the predicate. Pure `leafHash` / `nodeHash` exported so the off-chain builder hashes identically.
+- **Consolidation**: `bindPassport` (+ `passport_bindings`) folded in from the former NIGHTPASS passport-attestation contract; one contract now covers the full surface. Recompiled `managed/` (compactc 0.31.0): 8 circuits + prover/verifier keys.
+- **Plugin wiring**: `merkleProof` threaded through both witness builders (browser + server, kept in lockstep) and the full wallet-worker RPC path. New `issueFieldPredicateAttestation` action + handler (anchors the root if needed, then proves); browser prepare helpers.
+
 ## 0.4.2 - 2026-07-01
 
 ### Preview network support
@@ -9,6 +68,15 @@ Adds the Midnight **Preview** network (the active public dev chain since 2026-01
 - **`preview` is now a valid `NightgateNetwork`** (`cds.requires.nightgate.network`), with default endpoints: indexer `https://indexer.preview.midnight.network/api/v4/graphql` (+ WS), node `wss://rpc.preview.midnight.network/`. Proof server via `--network preview` (docker-compose `NIGHTGATE_PROOF_NETWORK`).
 - Replaced two hard-coded network unions in `TransactionSubmitter` (`TransactionSubmitterDeps.network`, `classifySubmissionError`) with the canonical `NightgateNetwork` type so they no longer drift.
 - Live-validated: the browser connector (NIGHTPASS) ran a full deploy + attest + zero-knowledge predicate round-trip on Preview against the public indexer. Tests 779/779, typecheck clean.
+
+## 0.4.1 - 2026-06-29
+
+### Undeployed local network + connector-route tests
+
+- **`networkId: 'undeployed'`** is now a first-class network, so the plugin can run against a local midnight-local-dev stack (node :9944, indexer :8088, proof-server :6300) without Preview funding or tDUST. Verified against a live `indexer-standalone:4.3.2`.
+- `nightgate-config`: `undeployed` added to the valid networks + local node/indexer defaults; network unions widened; config schema enum extended.
+- `/zk-config` + `/contract-manifest` routes extracted into `src/connector-routes.ts` so the real handlers are testable on a bare Express app (no cds lifecycle). Behavior unchanged.
+- New `scripts/integration-test-connector-routes.mjs` (27 assertions: manifest, ETag/304 caching, registry 404 boundary).
 
 ## 0.4.0 - 2026-06-29
 
