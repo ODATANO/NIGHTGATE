@@ -5,24 +5,17 @@
  */
 
 import cds, { Request } from '@sap/cds';
-const { SELECT, UPDATE, DELETE } = cds.ql;
+const { SELECT, UPDATE } = cds.ql;
 
 import { ensureNightgateModelLoaded } from './utils/cds-model';
 import { resolveNightgateRuntimeConfig, getNightgatePluginConfig } from './utils/nightgate-config';
 import { ensureSyncStateSingleton } from './utils/sync-state';
 import { isCrawlerRunning, startCrawler, stopCrawler } from './crawler';
-import {
-    Blocks, Transactions, ContractActions, ContractBalances, UnshieldedUtxos,
-    ZswapLedgerEvents, DustLedgerEvents, TransactionFees, TransactionResults,
-    TransactionSegments, SyncState, ReorgLog
-} from '#cds-models/midnight';
+import { rollbackIndexedDataFromHeight, RollbackResult } from './crawler/rollback';
+import { SyncState, ReorgLog } from '#cds-models/midnight';
 
 const processStartTime = Date.now();
 const metricPrefix = 'odatano_nightgate';
-
-/** Shape of an ID-projected query result. Used by the rollback path which
- *  only needs row IDs for cascading deletes. */
-interface IdRow { ID: string }
 
 export default class NightgateIndexerService extends cds.ApplicationService {
     private db!: cds.DatabaseService;
@@ -42,86 +35,24 @@ export default class NightgateIndexerService extends cds.ApplicationService {
         transactionsRolledBack: number;
         effectiveStartHeight: number;
     }> {
-        const blocksToRollback = await this.db.run(
-            SELECT.from(Blocks).where({ height: { '>=': fromHeight } })
-        ) || [];
-
-        if (blocksToRollback.length === 0) {
-            const forkBlock = await this.db.run(
-                SELECT.one.from(Blocks)
-                    .where({ height: { '<': fromHeight } })
-                    .orderBy('height desc')
-            );
-            const effectiveStartHeight = forkBlock?.height != null ? Number(forkBlock.height) + 1 : 0;
-            return {
-                blocksRolledBack: 0,
-                transactionsRolledBack: 0,
-                effectiveStartHeight
-            };
-        }
-
-        const blockIds = (blocksToRollback as IdRow[]).map(b => b.ID).filter(Boolean);
-        const txsToDelete: IdRow[] = blockIds.length > 0
-            ? await this.db.run(SELECT.from(Transactions).columns('ID').where({ block_ID: { in: blockIds } })) || []
-            : [];
-        const txIds = txsToDelete.map(t => t.ID).filter(Boolean);
-
-        if (txIds.length > 0) {
-            const actionsToDelete: IdRow[] = await this.db.run(
-                SELECT.from(ContractActions).columns('ID').where({ transaction_ID: { in: txIds } })
-            ) || [];
-            const actionIds = actionsToDelete.map(a => a.ID).filter(Boolean);
-
-            if (actionIds.length > 0) {
-                await this.db.run(DELETE.from(ContractBalances).where({ contractAction_ID: { in: actionIds } }));
-            }
-
-            await this.db.run(DELETE.from(ContractActions).where({ transaction_ID: { in: txIds } }));
-            await this.db.run(DELETE.from(UnshieldedUtxos).where({ createdAtTransaction_ID: { in: txIds } }));
-            await this.db.run(DELETE.from(ZswapLedgerEvents).where({ transaction_ID: { in: txIds } }));
-            await this.db.run(DELETE.from(DustLedgerEvents).where({ transaction_ID: { in: txIds } }));
-            await this.db.run(DELETE.from(TransactionFees).where({ transaction_ID: { in: txIds } }));
-
-            const resultsToDelete: IdRow[] = await this.db.run(
-                SELECT.from(TransactionResults).columns('ID').where({ transaction_ID: { in: txIds } })
-            ) || [];
-            const resultIds = resultsToDelete.map(r => r.ID).filter(Boolean);
-            if (resultIds.length > 0) {
-                await this.db.run(DELETE.from(TransactionSegments).where({ transactionResult_ID: { in: resultIds } }));
-            }
-            await this.db.run(DELETE.from(TransactionResults).where({ transaction_ID: { in: txIds } }));
-
-            await this.db.run(
-                UPDATE.entity(UnshieldedUtxos)
-                    .set({ spentAtTransaction_ID: null })
-                    .where({ spentAtTransaction_ID: { in: txIds } })
-            );
-
-            await this.db.run(DELETE.from(Transactions).where({ ID: { in: txIds } }));
-        }
-
-        await this.db.run(DELETE.from(Blocks).where({ ID: { in: blockIds } }));
-
-        const forkBlock = await this.db.run(
-            SELECT.one.from(Blocks)
-                .where({ height: { '<': fromHeight } })
-                .orderBy('height desc')
-        );
-        const effectiveStartHeight = forkBlock?.height != null ? Number(forkBlock.height) + 1 : 0;
-
-        await this.db.run(
-            UPDATE.entity(SyncState).set({
-                lastIndexedHeight: forkBlock?.height ?? 0,
-                lastIndexedHash: forkBlock?.hash ?? null,
-                lastIndexedAt: new Date().toISOString(),
+        // Explicit transaction: the shared cascade (srv/crawler/rollback.ts,
+        // same utility as the reorg path incl. NightBalances repair) commits
+        // atomically BEFORE the caller restarts the crawler, so a resumed
+        // crawler can never read pre-rollback state.
+        const result: RollbackResult = await this.db.tx(async (tx: any) =>
+            rollbackIndexedDataFromHeight(tx, fromHeight, {
                 syncStatus: 'stopped',
-                syncProgress: 0
-            }).where({ ID: 'SINGLETON' })
-        );
+                extraSyncState: { syncProgress: 0 }
+            })
+        ) as RollbackResult;
+
+        const effectiveStartHeight = result.forkBlock?.height != null
+            ? Number(result.forkBlock.height) + 1
+            : 0;
 
         return {
-            blocksRolledBack: blocksToRollback.length,
-            transactionsRolledBack: txIds.length,
+            blocksRolledBack: result.blocksRolledBack,
+            transactionsRolledBack: result.transactionsRolledBack,
             effectiveStartHeight
         };
     }

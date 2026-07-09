@@ -243,8 +243,8 @@ For per-action signatures and curl examples, see [actions.md](actions.md).
 - `UnshieldedUtxos`
 - `ZswapLedgerEvents`, `DustLedgerEvents`
 - `NightBalances`
-- `PendingSubmissions` — submission lifecycle audit trail
-- `WalletSessions` — projection excludes `viewingKeyHash` and `encryptedViewingKey`; `encryptedSeedKey` also internal-only
+- `PendingSubmissions` — submission lifecycle audit trail; READ is scoped to the caller's own sessions since 0.5.2 (admins read unfiltered)
+- `WalletSessions` — projection excludes `viewingKeyHash` and `encryptedViewingKey`; `encryptedSeedKey` also internal-only; READ is scoped to the owning `userId` since 0.5.2 (admins read unfiltered)
 
 ### Schema additions (vs. 0.1.2)
 

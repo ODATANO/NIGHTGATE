@@ -477,3 +477,80 @@ describe('BlockProcessor persistence paths', () => {
         expect(String(senderBalance.totalReceived)).toBe('0');
     });
 });
+
+// ----------------------------------------------------------------------------
+// Parent enforcement on height-sequenced paths
+//
+// persistPreparedBlock (catch-up pipeline) and processBlockByHeight (live)
+// refuse to persist a non-genesis block whose parent is not indexed: that is
+// an index gap and must fail loudly instead of writing parent_ID = null.
+// processBlockByHash (on-demand, hash-addressed) keeps the lenient fallback,
+// covered by the 'missing parent' test above.
+// ----------------------------------------------------------------------------
+describe('parent enforcement (height-sequenced paths)', () => {
+    function preparedBlock(height: number, hash: string, parentHash: string): any {
+        return {
+            blockHash: hash,
+            height,
+            signedBlock: {
+                block: {
+                    header: {
+                        parentHash,
+                        number: `0x${height.toString(16)}`,
+                        stateRoot: '0xstate',
+                        extrinsicsRoot: '0x00',
+                        digest: { logs: [] }
+                    },
+                    extrinsics: []
+                }
+            },
+            protocolVersion: 1,
+            timestamp: 1_700_000_000 + height,
+            fetchStartedAt: Date.now(),
+            fetchCompletedAt: Date.now(),
+            alreadyIndexed: false
+        };
+    }
+
+    it('rejects a pipeline block whose parent is missing and persists nothing', async () => {
+        const processor = makeProcessor({});
+
+        await expect(
+            processor.persistPreparedBlock(preparedBlock(7, '0xorphan', '0xmissing-parent'))
+        ).rejects.toThrow('refusing to persist an orphan');
+
+        // The insert ran inside a tx → rolled back, no partial block row.
+        const rows = await db.run(cds.ql.SELECT.from(BLOCKS).where({ hash: '0xorphan' }));
+        expect(rows.length).toBe(0);
+    });
+
+    it('persists genesis (height 0) without a parent', async () => {
+        const processor = makeProcessor({});
+
+        const result = await processor.persistPreparedBlock(preparedBlock(0, '0xgenesis', '0x' + '00'.repeat(32)));
+        expect(result.blockHeight).toBe(0);
+
+        const row = await db.run(cds.ql.SELECT.one.from(BLOCKS).where({ hash: '0xgenesis' }));
+        expect(row).toBeTruthy();
+        expect(row.parent_ID).toBeNull();
+    });
+
+    it('persists and links a pipeline block whose parent is indexed', async () => {
+        const parentId = cds.utils.uuid();
+        await db.run(cds.ql.INSERT.into(BLOCKS).entries({
+            ID: parentId,
+            hash: '0xparent-6',
+            height: 6,
+            protocolVersion: 1,
+            timestamp: 1_700_000_000,
+            ledgerParameters: '0xstate'
+        }));
+        const processor = makeProcessor({});
+
+        const result = await processor.persistPreparedBlock(preparedBlock(7, '0xchild-7', '0xparent-6'));
+        expect(result.blockHeight).toBe(7);
+
+        const row = await db.run(cds.ql.SELECT.one.from(BLOCKS).where({ hash: '0xchild-7' }));
+        expect(row.parent_ID).toBe(parentId);
+    });
+});

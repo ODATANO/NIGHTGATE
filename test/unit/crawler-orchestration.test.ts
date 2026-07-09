@@ -57,6 +57,7 @@ const TX_SEGMENTS = 'midnight.TransactionSegments';
 const CONTRACT_ACTIONS = 'midnight.ContractActions';
 const CONTRACT_BALANCES = 'midnight.ContractBalances';
 const UNSHIELDED_UTXOS = 'midnight.UnshieldedUtxos';
+const NIGHT_BALANCES = 'midnight.NightBalances';
 
 let db: any;
 
@@ -83,7 +84,12 @@ async function seedBlock(height: number, hash: string): Promise<string> {
     return id;
 }
 
-async function seedTransaction(blockId: string, hash: string, txIndex = 0): Promise<string> {
+async function seedTransaction(
+    blockId: string,
+    hash: string,
+    txIndex = 0,
+    overrides: Record<string, any> = {}
+): Promise<string> {
     const id = cds.utils.uuid();
     await db.run(cds.ql.INSERT.into(TRANSACTIONS).entries({
         ID: id,
@@ -91,7 +97,8 @@ async function seedTransaction(blockId: string, hash: string, txIndex = 0): Prom
         hash,
         protocolVersion: 1,
         transactionType: 'Regular',
-        block_ID: blockId
+        block_ID: blockId,
+        ...overrides
     }));
     return id;
 }
@@ -109,6 +116,7 @@ beforeEach(async () => {
     mockBlockProcessorConstructor.mockClear();
 
     // Reset DB state used by these tests (children before parents).
+    await db.run(cds.ql.DELETE.from(NIGHT_BALANCES));
     await db.run(cds.ql.DELETE.from(CONTRACT_BALANCES));
     await db.run(cds.ql.DELETE.from(CONTRACT_ACTIONS));
     await db.run(cds.ql.DELETE.from(TX_SEGMENTS));
@@ -398,6 +406,119 @@ describe('MidnightCrawler orchestration', () => {
                 errorSpy.mockRestore();
             }
         });
+
+        /** Prepared-block stub matching the pipeline's PreparedBlockFetched shape. */
+        function preparedBlocks(heights: number[]): any[] {
+            return heights.map(h => ({
+                blockHash: `0x${h}`,
+                height: h,
+                signedBlock: null,
+                protocolVersion: 1,
+                timestamp: 0,
+                fetchStartedAt: Date.now(),
+                fetchCompletedAt: Date.now(),
+                alreadyIndexed: false
+            }));
+        }
+
+        it('re-queues a failed batch once and persists every height without gaps', async () => {
+            const provider = {
+                getFinalizedHead: jest.fn().mockResolvedValue('0x3'),
+                getHeader: jest.fn().mockResolvedValue({ number: '0x3' })
+            };
+            // rpcBatchSize 1 → one batch per height; concurrency 1 keeps the
+            // submission order deterministic.
+            const crawler = new MidnightCrawler(provider as any, { enabled: true, rpcBatchSize: 1, fetchConcurrency: 1 });
+            (crawler as any).db = db;
+            (crawler as any).isRunning = true;
+            (crawler as any).processor = {
+                fetchBlockBatch: mockProcessorFetchBlockBatch,
+                persistPreparedBlock: mockProcessorPersistPreparedBlock
+            };
+            await setSyncState({ syncStatus: 'stopped', lastIndexedHeight: 0, lastIndexedHash: '0x0', consecutiveErrors: 0 });
+
+            // Height 2 fails once (transient outage), then succeeds on the re-queue.
+            let failedOnce = false;
+            jest.spyOn(crawler as any, 'fetchBlockBatchWithRetry')
+                .mockImplementation(async (...args: any[]) => {
+                    const heights = args[0] as number[];
+                    if (heights[0] === 2 && !failedOnce) {
+                        failedOnce = true;
+                        throw new Error('Request timeout');
+                    }
+                    return preparedBlocks(heights);
+                });
+            mockProcessorPersistPreparedBlock.mockImplementation(async (prep: any) => ({
+                blockHeight: prep.height,
+                blockHash: prep.blockHash,
+                transactionCount: 0,
+                contractActionCount: 0,
+                processingTimeMs: 1
+            }));
+            const errorSpy = jest.spyOn(console, 'error').mockImplementation();
+            const warnSpy = jest.spyOn(console, 'warn').mockImplementation();
+
+            try {
+                await expect((crawler as any).catchUp()).resolves.toBe(3);
+
+                // All three heights persisted, strictly in order, nothing skipped.
+                const persisted = mockProcessorPersistPreparedBlock.mock.calls.map(c => (c[0] as any).height);
+                expect(persisted).toEqual([1, 2, 3]);
+            } finally {
+                errorSpy.mockRestore();
+                warnSpy.mockRestore();
+            }
+        });
+
+        it('stops catch-up instead of skipping a range when the re-queued batch fails again', async () => {
+            const provider = {
+                getFinalizedHead: jest.fn().mockResolvedValue('0x3'),
+                getHeader: jest.fn().mockResolvedValue({ number: '0x3' })
+            };
+            const crawler = new MidnightCrawler(provider as any, { enabled: true, rpcBatchSize: 1, fetchConcurrency: 1 });
+            (crawler as any).db = db;
+            (crawler as any).isRunning = true;
+            (crawler as any).processor = {
+                fetchBlockBatch: mockProcessorFetchBlockBatch,
+                persistPreparedBlock: mockProcessorPersistPreparedBlock
+            };
+            await setSyncState({ syncStatus: 'stopped', lastIndexedHeight: 0, lastIndexedHash: '0x0', consecutiveErrors: 0 });
+
+            // Height 2 fails on every attempt.
+            jest.spyOn(crawler as any, 'fetchBlockBatchWithRetry')
+                .mockImplementation(async (...args: any[]) => {
+                    const heights = args[0] as number[];
+                    if (heights[0] === 2) throw new Error('Request timeout');
+                    return preparedBlocks(heights);
+                });
+            mockProcessorPersistPreparedBlock.mockImplementation(async (prep: any) => ({
+                blockHeight: prep.height,
+                blockHash: prep.blockHash,
+                transactionCount: 0,
+                contractActionCount: 0,
+                processingTimeMs: 1
+            }));
+            const errorSpy = jest.spyOn(console, 'error').mockImplementation();
+            const warnSpy = jest.spyOn(console, 'warn').mockImplementation();
+
+            try {
+                // Only height 1 makes it; the failed range is NEVER jumped over.
+                await expect((crawler as any).catchUp()).resolves.toBe(1);
+
+                const persisted = mockProcessorPersistPreparedBlock.mock.calls.map(c => (c[0] as any).height);
+                expect(persisted).toEqual([1]);
+                expect(errorSpy).toHaveBeenCalledWith(
+                    '[Crawler] Batch 2-2 failed after retry; stopping catch-up to avoid index gaps'
+                );
+
+                // The run is marked as errored so operators see the stall.
+                const row = await getSyncState();
+                expect(row.syncStatus).toBe('error');
+            } finally {
+                errorSpy.mockRestore();
+                warnSpy.mockRestore();
+            }
+        });
     });
 
     // ========================================================================
@@ -423,7 +544,7 @@ describe('MidnightCrawler orchestration', () => {
             (crawler as any).startTime = Date.now() - 1000;
 
             const checkForReorgSpy = jest.spyOn(crawler as any, 'checkForReorg').mockResolvedValue(null);
-            jest.spyOn(crawler as any, 'getSyncState').mockResolvedValue({ lastIndexedHash: '0x2hash' });
+            jest.spyOn(crawler as any, 'getSyncState').mockResolvedValue({ lastIndexedHash: '0x2hash', lastIndexedHeight: 1 });
             const processSpy = jest.spyOn(crawler as any, 'processBlockWithRetry').mockResolvedValue({
                 blockHeight: 2,
                 blockHash: '0x2hash',
@@ -544,6 +665,28 @@ describe('MidnightCrawler orchestration', () => {
             }
         });
 
+        it('catches up instead of single-block processing when the live head is ahead of the index (gap)', async () => {
+            const crawler = new MidnightCrawler({} as any, { enabled: true });
+            (crawler as any).db = db;
+            (crawler as any).isRunning = true;
+
+            await setSyncState({ syncStatus: 'synced', lastIndexedHeight: 5, lastIndexedHash: '0x5' });
+
+            const catchUpSpy = jest.spyOn(crawler as any, 'catchUp').mockResolvedValue(4);
+            const checkForReorgSpy = jest.spyOn(crawler as any, 'checkForReorg');
+            const processSpy = jest.spyOn(crawler as any, 'processBlockWithRetry');
+
+            // Head 10 while the index sits at 5 → gap, not a fork.
+            await (crawler as any).processLiveBlock(
+                { number: '0xa', parentHash: '0x9', stateRoot: '', extrinsicsRoot: '', digest: { logs: [] } },
+                10
+            );
+
+            expect(catchUpSpy).toHaveBeenCalled();
+            expect(checkForReorgSpy).not.toHaveBeenCalled();
+            expect(processSpy).not.toHaveBeenCalled();
+        });
+
         it('handles reorgs during live processing and updates the reorg log', async () => {
             let liveCallback: ((header: any) => Promise<void>) | undefined;
             const provider = {
@@ -609,9 +752,10 @@ describe('MidnightCrawler orchestration', () => {
     describe('checkForReorg / findForkPoint', () => {
         it('detects reorgs only when the parent hash no longer matches the indexed tip', async () => {
             const crawler = new MidnightCrawler({} as any, { enabled: true });
+            // Header at tip+1 (0x2a = 42, indexed tip 41) with a diverging parent.
             const header = { number: '0x2a', parentHash: '0xold', stateRoot: '', extrinsicsRoot: '', digest: { logs: [] } };
 
-            jest.spyOn(crawler as any, 'getSyncState').mockResolvedValue({ lastIndexedHash: '0xcurrent' });
+            jest.spyOn(crawler as any, 'getSyncState').mockResolvedValue({ lastIndexedHash: '0xcurrent', lastIndexedHeight: 41 });
             const findForkPointSpy = jest.spyOn(crawler as any, 'findForkPoint').mockResolvedValue(40);
 
             await expect((crawler as any).checkForReorg(header)).resolves.toEqual({
@@ -622,9 +766,67 @@ describe('MidnightCrawler orchestration', () => {
             expect(findForkPointSpy).toHaveBeenCalledWith(header);
 
             findForkPointSpy.mockClear();
-            jest.spyOn(crawler as any, 'getSyncState').mockResolvedValueOnce({ lastIndexedHash: '0xold' });
+            jest.spyOn(crawler as any, 'getSyncState').mockResolvedValueOnce({ lastIndexedHash: '0xold', lastIndexedHeight: 41 });
             await expect((crawler as any).checkForReorg(header)).resolves.toBeNull();
             expect(findForkPointSpy).not.toHaveBeenCalled();
+        });
+
+        it('ignores a replayed already-indexed head whose parent matches our chain', async () => {
+            // Subscription start/reconnect re-delivers finalized head 10 while
+            // our index is already at 12. Its parent (block 9) is ours, so
+            // this must NOT be classified as a reorg.
+            const crawler = new MidnightCrawler({} as any, { enabled: true });
+            (crawler as any).db = db;
+            await seedBlock(9, '0x9');
+
+            jest.spyOn(crawler as any, 'getSyncState').mockResolvedValue({ lastIndexedHash: '0x12', lastIndexedHeight: 12 });
+            const findForkPointSpy = jest.spyOn(crawler as any, 'findForkPoint');
+
+            await expect((crawler as any).checkForReorg({
+                number: '0xa', parentHash: '0x9', stateRoot: '', extrinsicsRoot: '', digest: { logs: [] }
+            })).resolves.toBeNull();
+            expect(findForkPointSpy).not.toHaveBeenCalled();
+        });
+
+        it('still detects a real fork below the tip (replayed height, diverging parent)', async () => {
+            const crawler = new MidnightCrawler({} as any, { enabled: true });
+            (crawler as any).db = db;
+            await seedBlock(9, '0x9');
+
+            jest.spyOn(crawler as any, 'getSyncState').mockResolvedValue({ lastIndexedHash: '0x12', lastIndexedHeight: 12 });
+            const findForkPointSpy = jest.spyOn(crawler as any, 'findForkPoint').mockResolvedValue(10);
+
+            await expect((crawler as any).checkForReorg({
+                number: '0xa', parentHash: '0xforeign-9', stateRoot: '', extrinsicsRoot: '', digest: { logs: [] }
+            })).resolves.toEqual({
+                forkHeight: 10,
+                oldTipHash: '0x12',
+                newTipHash: '0xforeign-9'
+            });
+            expect(findForkPointSpy).toHaveBeenCalled();
+        });
+
+        it('treats a head far ahead of the index as a gap, not a reorg', async () => {
+            const crawler = new MidnightCrawler({} as any, { enabled: true });
+
+            jest.spyOn(crawler as any, 'getSyncState').mockResolvedValue({ lastIndexedHash: '0x5', lastIndexedHeight: 5 });
+            const findForkPointSpy = jest.spyOn(crawler as any, 'findForkPoint');
+
+            await expect((crawler as any).checkForReorg({
+                number: '0xa', parentHash: '0x9', stateRoot: '', extrinsicsRoot: '', digest: { logs: [] }
+            })).resolves.toBeNull();
+            expect(findForkPointSpy).not.toHaveBeenCalled();
+        });
+
+        it('never rolls back on a replayed genesis head', async () => {
+            const crawler = new MidnightCrawler({} as any, { enabled: true });
+            (crawler as any).db = db;
+
+            jest.spyOn(crawler as any, 'getSyncState').mockResolvedValue({ lastIndexedHash: '0x5', lastIndexedHeight: 5 });
+
+            await expect((crawler as any).checkForReorg({
+                number: '0x0', parentHash: '0x0000', stateRoot: '', extrinsicsRoot: '', digest: { logs: [] }
+            })).resolves.toBeNull();
         });
 
         it('does not report a reorg before any block has been indexed', async () => {
@@ -876,6 +1078,69 @@ describe('MidnightCrawler orchestration', () => {
             // ReorgLog recorded with one rolled-back block.
             const log = await db.run(cds.ql.SELECT.one.from(REORG_LOG).where({ ID: reorgLogId }));
             expect(log).toMatchObject({ blocksRolledBack: 1, status: 'in_progress' });
+        });
+
+        it('recomputes NightBalances for affected addresses so a re-index cannot double-count', async () => {
+            // addr_b received 50 in block 9 (survives) and 100 in block 10
+            // (rolled back); addr_a only SENT the block-10 transfer.
+            const block9 = await seedBlock(9, '0x9');
+            const block10 = await seedBlock(10, '0x10');
+            const tx9 = await seedTransaction(block9, '0xtx9', 0, {
+                receiverAddress: 'addr_b', nightAmount: '50'
+            });
+            const tx10 = await seedTransaction(block10, '0xtx10', 0, {
+                senderAddress: 'addr_a', receiverAddress: 'addr_b', nightAmount: '100'
+            });
+            for (const [txId, value, nonce] of [[tx9, '50', '0xn9'], [tx10, '100', '0xn10']] as const) {
+                await db.run(cds.ql.INSERT.into(UNSHIELDED_UTXOS).entries({
+                    ID: cds.utils.uuid(),
+                    owner: 'addr_b',
+                    tokenType: '0xtoken',
+                    value,
+                    intentHash: '0xintent',
+                    outputIndex: 0,
+                    initialNonce: nonce,
+                    createdAtTransaction_ID: txId
+                }));
+            }
+            // Balances exactly as the delta-based ingest left them.
+            await db.run(cds.ql.INSERT.into(NIGHT_BALANCES).entries([
+                {
+                    address: 'addr_b', balance: '150', utxoCount: 2,
+                    txSentCount: 0, txReceivedCount: 2, totalSent: '0', totalReceived: '150',
+                    firstSeenHeight: 9, lastActivityHeight: 10
+                },
+                {
+                    address: 'addr_a', balance: '0', utxoCount: 0,
+                    txSentCount: 1, txReceivedCount: 0, totalSent: '100', totalReceived: '0',
+                    firstSeenHeight: 10, lastActivityHeight: 10
+                }
+            ]));
+
+            const crawler = new MidnightCrawler({} as any, { enabled: true });
+            (crawler as any).db = db;
+
+            await (crawler as any).handleReorg({
+                forkHeight: 10,
+                oldTipHash: '0xold',
+                newTipHash: '0xnew'
+            });
+
+            // addr_b is back to its exact pre-block-10 state, so re-indexing
+            // block 10 re-applies its deltas without double-counting.
+            const b = await db.run(cds.ql.SELECT.one.from(NIGHT_BALANCES).where({ address: 'addr_b' }));
+            expect(Number(b.balance)).toBe(50);
+            expect(b.utxoCount).toBe(1);
+            expect(b.txReceivedCount).toBe(1);
+            expect(Number(b.totalReceived)).toBe(50);
+            expect(b.txSentCount).toBe(0);
+            expect(Number(b.totalSent)).toBe(0);
+            expect(Number(b.firstSeenHeight)).toBe(9);
+            expect(Number(b.lastActivityHeight)).toBe(9);
+
+            // addr_a had no surviving activity → its projection row is gone.
+            const a = await db.run(cds.ql.SELECT.one.from(NIGHT_BALANCES).where({ address: 'addr_a' }));
+            expect(a).toBeFalsy();
         });
     });
 });

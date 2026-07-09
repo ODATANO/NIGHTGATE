@@ -644,3 +644,87 @@ describe('getJobStatus', () => {
         expect(out.result).toBeNull();
     });
 });
+
+// ----------------------------------------------------------------------------
+// Owner-scoped entity reads (WalletSessions / PendingSubmissions)
+//
+// The raw entity READ surface is scoped to the requesting principal; admins
+// (and the privileged default test user) read unfiltered. The scoping runs in
+// custom before/on handlers, so it is exercised programmatically with
+// explicit cds.User contexts via cds.tx.
+// ----------------------------------------------------------------------------
+describe('owner-scoped entity reads', () => {
+    const WALLET_SESSIONS = 'midnight.WalletSessions';
+    const PENDING_SUBMISSIONS = 'midnight.PendingSubmissions';
+
+    async function seedSession(userId: string, sessionId: string): Promise<void> {
+        await db.run(cds.ql.INSERT.into(WALLET_SESSIONS).entries({
+            ID: cds.utils.uuid(),
+            userId,
+            sessionId,
+            connectedAt: new Date().toISOString(),
+            isActive: true
+        }));
+    }
+
+    async function seedSubmission(sessionId: string | null, txHash: string): Promise<void> {
+        await db.run(cds.ql.INSERT.into(PENDING_SUBMISSIONS).entries({
+            ID: cds.utils.uuid(),
+            txHash,
+            actionType: 'DEPLOY',
+            submittedAt: new Date().toISOString(),
+            status: 'pending',
+            sessionId
+        }));
+    }
+
+    function readAs(userId: string, roles: string[], entity: string): Promise<any[]> {
+        const user = new (cds as any).User({ id: userId, roles });
+        return cds.tx({ user } as any, () =>
+            srv.run(cds.ql.SELECT.from(`NightgateService.${entity}`))
+        );
+    }
+
+    const ALICE_SESSION = '11111111-1111-4111-8111-111111111111';
+    const BOB_SESSION = '22222222-2222-4222-8222-222222222222';
+
+    beforeEach(async () => {
+        await db.run(cds.ql.DELETE.from(PENDING_SUBMISSIONS));
+        await db.run(cds.ql.DELETE.from(WALLET_SESSIONS));
+        await seedSession('alice', ALICE_SESSION);
+        await seedSession('bob', BOB_SESSION);
+        await seedSubmission(ALICE_SESSION, '0xalice-tx');
+        await seedSubmission(BOB_SESSION, '0xbob-tx');
+        await seedSubmission(null, '0xownerless-tx');
+    });
+
+    afterAll(async () => {
+        await db.run(cds.ql.DELETE.from(PENDING_SUBMISSIONS));
+        await db.run(cds.ql.DELETE.from(WALLET_SESSIONS));
+    });
+
+    it('WalletSessions READ returns only the requesting user\'s sessions', async () => {
+        const rows = await readAs('alice', [], 'WalletSessions');
+        expect(rows.map((r: any) => r.sessionId)).toEqual([ALICE_SESSION]);
+    });
+
+    it('WalletSessions READ returns everything for admins', async () => {
+        const rows = await readAs('ops', ['admin'], 'WalletSessions');
+        expect(rows.map((r: any) => r.sessionId).sort()).toEqual([ALICE_SESSION, BOB_SESSION]);
+    });
+
+    it('PendingSubmissions READ is limited to submissions of the user\'s own sessions', async () => {
+        const rows = await readAs('alice', [], 'PendingSubmissions');
+        expect(rows.map((r: any) => r.txHash)).toEqual(['0xalice-tx']);
+    });
+
+    it('PendingSubmissions READ returns an empty list for a user without sessions', async () => {
+        const rows = await readAs('mallory', [], 'PendingSubmissions');
+        expect(rows).toEqual([]);
+    });
+
+    it('PendingSubmissions READ returns everything for admins (incl. session-less rows)', async () => {
+        const rows = await readAs('ops', ['admin'], 'PendingSubmissions');
+        expect(rows.map((r: any) => r.txHash).sort()).toEqual(['0xalice-tx', '0xbob-tx', '0xownerless-tx']);
+    });
+});

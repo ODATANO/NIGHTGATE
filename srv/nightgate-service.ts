@@ -181,11 +181,38 @@ export default class NightgateService extends cds.ApplicationService {
 
         registerWalletSessionHandlers(this, this.db);
 
+        // Raw entity READ surface is owner-scoped: sessions belong to the
+        // principal that created them (review_001 P1); admins see everything.
+        // The projection already excludes the encrypted keys, but session
+        // metadata (sessionId is a correlation token) must not leak across
+        // users either.
+        this.before('READ', 'WalletSessions', (req: Request) => {
+            const user: any = (req as any).user;
+            if (user?.is?.('admin')) return;
+            const userId = user?.id;
+            if (!userId) return req.reject(401, 'authentication required');
+            (req.query as any).where({ userId });
+        });
+
         // ====================================================================
         // Submission actions: deployContract, submitContractCall
         // ====================================================================
 
+        // Owner-scoped like WalletSessions: submissions carry no userId, so
+        // the caller's sessions are resolved first and the read is limited to
+        // those sessionIds. Admins read unfiltered.
         this.on('READ', 'PendingSubmissions', async (req: Request) => {
+            const user: any = (req as any).user;
+            if (!user?.is?.('admin')) {
+                const userId = user?.id;
+                if (!userId) return req.reject(401, 'authentication required');
+                const sessions: any[] = await this.db.run(
+                    cds.ql.SELECT.from(WalletSessions).columns('sessionId').where({ userId })
+                ) || [];
+                const sessionIds = sessions.map(s => s.sessionId).filter(Boolean);
+                if (sessionIds.length === 0) return [];
+                (req.query as any).where({ sessionId: { in: sessionIds } });
+            }
             return await this.db.run(req.query) || [];
         });
 

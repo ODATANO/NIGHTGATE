@@ -139,8 +139,10 @@ export interface PreparedBlockFetched {
 export class BlockProcessor {
     private db!: cds.DatabaseService;
     private palletMap: Map<number, PalletMapping>;
+    /** Last successfully fetched specVersion. Fallback ONLY when the
+     *  runtime-version RPC fails; never used to skip the query (runtime
+     *  upgrades would otherwise persist blocks with a stale version). */
     private cachedSpecVersion: number = 0;
-    private cachedSpecVersionValid: boolean = false;
 
     /** Well-known Substrate storage key for Timestamp::Now (twox128("Timestamp") + twox128("Now")) */
     private static readonly TIMESTAMP_STORAGE_KEY =
@@ -158,20 +160,24 @@ export class BlockProcessor {
     }
 
     /**
-     * Process a single block by hash, fetch, parse, and persist atomically
+     * Process a single block by hash, fetch, parse, and persist atomically.
+     * Hash-addressed on-demand processing is NOT height-sequenced, so a
+     * missing parent falls back to `parent_ID = null` instead of failing.
      */
     async processBlockByHash(blockHash: string): Promise<ProcessResult> {
         const start = Date.now();
-        return this.processFromNode(blockHash, start);
+        return this.processFromNode(blockHash, start, { requireParent: false });
     }
 
     /**
-     * Process a block by height
+     * Process a block by height. Height-sequenced path (live crawler): a
+     * missing parent means an index gap and must fail loudly instead of
+     * silently persisting an orphan row.
      */
     async processBlockByHeight(height: number): Promise<ProcessResult> {
         const hash = await this.nodeProvider.getBlockHash(height);
         if (!hash) throw new Error(`No block at height ${height}`);
-        return this.processBlockByHash(hash);
+        return this.processFromNode(hash, Date.now(), { requireParent: true });
     }
 
     /**
@@ -259,9 +265,9 @@ export class BlockProcessor {
             tsResults = newIndices.map((_, k) => flat[k * 2 + 1]);
         }
 
-        // ProtocolVersion is cached after the first hit, so this is a no-op
-        // RPC for the second batch onward. Calling it on the first hash of
-        // the batch is enough to warm the cache.
+        // ProtocolVersion is queried once per batch (first hash) so runtime
+        // upgrades land at batch granularity: one extra RPC per batch, and an
+        // upgrade mid-batch is reflected from the next batch onward.
         const protocolVersion = heights.length > 0 && hashes[0]
             ? await this.getProtocolVersion(hashes[0])
             : this.cachedSpecVersion;
@@ -327,7 +333,9 @@ export class BlockProcessor {
                 processingTimeMs: Date.now() - start
             };
         }
-        return this.persistFromNode(prep, start);
+        // Catch-up pipeline persists in strict height order: a missing parent
+        // means an index gap and must fail loudly.
+        return this.persistFromNode(prep, start, { requireParent: true });
     }
 
     /**
@@ -344,7 +352,11 @@ export class BlockProcessor {
     // Node-based Processing (Substrate RPC raw blocks)
     // ========================================================================
 
-    private async processFromNode(blockHash: string, start: number): Promise<ProcessResult> {
+    private async processFromNode(
+        blockHash: string,
+        start: number,
+        opts?: { requireParent?: boolean }
+    ): Promise<ProcessResult> {
         // Skip if already processed
         if (await this.blockExists(blockHash)) {
             const header = await this.nodeProvider.getHeader(blockHash);
@@ -374,10 +386,14 @@ export class BlockProcessor {
             timestamp,
             fetchStartedAt: start,
             alreadyIndexed: false
-        }, start);
+        }, start, opts);
     }
 
-    private async persistFromNode(prep: PreparedBlockFetched, start: number): Promise<ProcessResult> {
+    private async persistFromNode(
+        prep: PreparedBlockFetched,
+        start: number,
+        opts?: { requireParent?: boolean }
+    ): Promise<ProcessResult> {
         const { blockHash, height, signedBlock, protocolVersion, timestamp } = prep;
         const header = signedBlock.block.header;
         const extrinsics = signedBlock.block.extrinsics;
@@ -392,6 +408,16 @@ export class BlockProcessor {
             const parentBlock = await tx.run(
                 SELECT.one.from(Blocks).columns('ID').where({ hash: header.parentHash })
             );
+
+            // Height-sequenced paths refuse to persist an orphan: a missing
+            // parent above genesis means the index has a gap, and silently
+            // writing parent_ID = null would hide it.
+            if (opts?.requireParent && height > 0 && !parentBlock) {
+                throw new Error(
+                    `Parent block ${header.parentHash} of block ${height} is not indexed; ` +
+                    'refusing to persist an orphan (index gap)'
+                );
+            }
 
             await tx.run(INSERT.into(Blocks).entries({
                 ID: blockId,
@@ -800,16 +826,14 @@ export class BlockProcessor {
     }
 
     /**
-     * Get the runtime specVersion at a specific block
+     * Get the runtime specVersion at a specific block. Always queried per
+     * block/batch so runtime upgrades are reflected; the cached value is only
+     * a fallback when the RPC itself fails.
      */
     private async getProtocolVersion(blockHash: string): Promise<number> {
-        if (this.cachedSpecVersionValid) {
-            return this.cachedSpecVersion;
-        }
         try {
             const rv = await this.nodeProvider.getRuntimeVersion(blockHash);
             this.cachedSpecVersion = rv.specVersion;
-            this.cachedSpecVersionValid = true;
             return rv.specVersion;
         } catch (err) {
             console.warn(`[BlockProcessor] Failed to get runtime version for ${blockHash}: ${(err as Error).message}`);

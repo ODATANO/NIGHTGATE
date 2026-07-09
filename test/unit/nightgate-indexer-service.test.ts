@@ -579,4 +579,112 @@ describe('reindexFromHeight', () => {
         expect(mockStopCrawler).toHaveBeenCalledTimes(1);
         expect(mockStartCrawler).toHaveBeenCalledTimes(1);
     });
+
+    it('repairs NightBalances during the rollback (no double-count on re-index)', async () => {
+        const UNSHIELDED_UTXOS = 'midnight.UnshieldedUtxos';
+        const NIGHT_BALANCES = 'midnight.NightBalances';
+        await db.run(cds.ql.DELETE.from(UNSHIELDED_UTXOS));
+        await db.run(cds.ql.DELETE.from(NIGHT_BALANCES));
+
+        // Block 9 (survives) and 10 (rolled back), each with a transfer to addr_b.
+        const blockIds: Record<number, string> = {};
+        for (const h of [9, 10]) {
+            const id = cds.utils.uuid();
+            blockIds[h] = id;
+            await db.run(cds.ql.INSERT.into(BLOCKS).entries({
+                ID: id,
+                hash: `0x${h}`,
+                height: h,
+                protocolVersion: 1,
+                timestamp: 1700000000 + h,
+                ledgerParameters: '0xabcd'
+            }));
+        }
+        const txIds: Record<number, string> = {};
+        for (const [h, fields] of [
+            [9, { receiverAddress: 'addr_b', nightAmount: '50' }],
+            [10, { senderAddress: 'addr_a', receiverAddress: 'addr_b', nightAmount: '100' }]
+        ] as const) {
+            const id = cds.utils.uuid();
+            txIds[h] = id;
+            await db.run(cds.ql.INSERT.into(TRANSACTIONS).entries({
+                ID: id,
+                transactionId: 0,
+                hash: `0xtx${h}`,
+                protocolVersion: 1,
+                transactionType: 'Regular',
+                block_ID: blockIds[h],
+                ...fields
+            }));
+            await db.run(cds.ql.INSERT.into(UNSHIELDED_UTXOS).entries({
+                ID: cds.utils.uuid(),
+                owner: 'addr_b',
+                tokenType: '0xtoken',
+                value: (fields as any).nightAmount,
+                intentHash: '0xintent',
+                outputIndex: 0,
+                initialNonce: `0xn${h}`,
+                createdAtTransaction_ID: id
+            }));
+        }
+        // Balances exactly as the delta-based ingest left them.
+        await db.run(cds.ql.INSERT.into(NIGHT_BALANCES).entries([
+            {
+                address: 'addr_b', balance: '150', utxoCount: 2,
+                txSentCount: 0, txReceivedCount: 2, totalSent: '0', totalReceived: '150',
+                firstSeenHeight: 9, lastActivityHeight: 10
+            },
+            {
+                address: 'addr_a', balance: '0', utxoCount: 0,
+                txSentCount: 1, txReceivedCount: 0, totalSent: '100', totalReceived: '0',
+                firstSeenHeight: 10, lastActivityHeight: 10
+            }
+        ]));
+        mockIsCrawlerRunning.mockReturnValue(false);
+
+        await srv.send({ event: 'reindexFromHeight', data: { height: 10 } });
+
+        // addr_b restored to its pre-block-10 state.
+        const b = await db.run(cds.ql.SELECT.one.from(NIGHT_BALANCES).where({ address: 'addr_b' }));
+        expect(Number(b.balance)).toBe(50);
+        expect(b.utxoCount).toBe(1);
+        expect(b.txReceivedCount).toBe(1);
+        expect(Number(b.totalReceived)).toBe(50);
+        // addr_a had no surviving activity → projection row deleted.
+        const a = await db.run(cds.ql.SELECT.one.from(NIGHT_BALANCES).where({ address: 'addr_a' }));
+        expect(a).toBeFalsy();
+
+        await db.run(cds.ql.DELETE.from(UNSHIELDED_UTXOS));
+        await db.run(cds.ql.DELETE.from(NIGHT_BALANCES));
+    });
+});
+
+// ----------------------------------------------------------------------------
+// Authorization: the mutating operational actions are admin-gated in the
+// model. Enforcement is CAP-generic (@requires); the [test] profile runs with
+// dummy auth (privileged user), so the annotation itself is asserted here.
+// ----------------------------------------------------------------------------
+describe('authorization', () => {
+    function actionDef(name: string): any {
+        const model: any = cds.model;
+        return model.definitions[`NightgateIndexerService.${name}`]
+            ?? model.definitions['NightgateIndexerService']?.actions?.[name];
+    }
+
+    it.each(['pauseCrawler', 'resumeCrawler', 'reindexFromHeight'])(
+        'requires the admin role on %s',
+        (action) => {
+            const def = actionDef(action);
+            expect(def).toBeTruthy();
+            expect(def['@requires']).toBe('admin');
+        }
+    );
+
+    it('leaves read-only probes (liveness/readiness/metrics) unrestricted for K8s and Prometheus', () => {
+        for (const fn of ['getLiveness', 'getReadiness', 'getMetrics', 'getSyncStatus', 'getHealth']) {
+            const def = actionDef(fn);
+            expect(def).toBeTruthy();
+            expect(def['@requires']).toBeUndefined();
+        }
+    });
 });

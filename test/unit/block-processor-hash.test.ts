@@ -199,38 +199,54 @@ describe('getBlockTimestamp: SCALE u64 LE parsing', () => {
 // 1C: protocolVersion from RuntimeVersion
 // ============================================================================
 
-describe('getProtocolVersion: RuntimeVersion cache', () => {
+describe('getProtocolVersion: RuntimeVersion per-block query with error fallback', () => {
     beforeEach(() => {
         jest.clearAllMocks();
     });
 
-    it('extracts and caches specVersion from RuntimeVersion responses', async () => {
+    it('queries the runtime version per block hash (no skip-cache)', async () => {
         const provider = {
             getRuntimeVersion: jest.fn()
         } as any;
         const processor = new BlockProcessor(provider);
 
-        provider.getRuntimeVersion.mockResolvedValueOnce({ specVersion: 42 });
-
-        await expect((processor as any).getProtocolVersion('0xabc')).resolves.toBe(42);
-        await expect((processor as any).getProtocolVersion('0xabc')).resolves.toBe(42);
-        expect(provider.getRuntimeVersion).toHaveBeenCalledTimes(1);
-    });
-
-    it('serves subsequent calls from the cache regardless of block hash', async () => {
-        // Once `cachedSpecVersionValid` is true, callers get the cached value
-        // without another RPC, even for a different block hash. This is the
-        // optimisation that saves ~1 RPC per block during catch-up.
-        const provider = {
-            getRuntimeVersion: jest.fn()
-        } as any;
-        const processor = new BlockProcessor(provider);
-        provider.getRuntimeVersion.mockResolvedValueOnce({ specVersion: 42 });
+        provider.getRuntimeVersion.mockResolvedValue({ specVersion: 42 });
 
         await expect((processor as any).getProtocolVersion('0xabc')).resolves.toBe(42);
         await expect((processor as any).getProtocolVersion('0xdef')).resolves.toBe(42);
-        await expect((processor as any).getProtocolVersion('0x999')).resolves.toBe(42);
-        expect(provider.getRuntimeVersion).toHaveBeenCalledTimes(1);
+        expect(provider.getRuntimeVersion).toHaveBeenCalledTimes(2);
+    });
+
+    it('reflects runtime upgrades on later blocks instead of serving a stale cache', async () => {
+        const provider = {
+            getRuntimeVersion: jest.fn()
+        } as any;
+        const processor = new BlockProcessor(provider);
+        provider.getRuntimeVersion
+            .mockResolvedValueOnce({ specVersion: 5 })
+            .mockResolvedValueOnce({ specVersion: 6 });
+
+        await expect((processor as any).getProtocolVersion('0xpre-upgrade')).resolves.toBe(5);
+        await expect((processor as any).getProtocolVersion('0xpost-upgrade')).resolves.toBe(6);
+    });
+
+    it('falls back to the last successfully fetched value when the RPC fails', async () => {
+        const provider = {
+            getRuntimeVersion: jest.fn()
+        } as any;
+        const processor = new BlockProcessor(provider);
+        const warnSpy = jest.spyOn(console, 'warn').mockImplementation();
+        provider.getRuntimeVersion
+            .mockResolvedValueOnce({ specVersion: 42 })
+            .mockRejectedValueOnce(new Error('runtime unavailable'));
+
+        try {
+            await expect((processor as any).getProtocolVersion('0xabc')).resolves.toBe(42);
+            await expect((processor as any).getProtocolVersion('0xdef')).resolves.toBe(42);
+            expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('Failed to get runtime version'));
+        } finally {
+            warnSpy.mockRestore();
+        }
     });
 
     it('logs a warning and returns the cached value if the initial fetch fails', async () => {
@@ -300,12 +316,12 @@ describe('extractAuthor: digest log parsing', () => {
 });
 
 describe('BlockProcessor public helpers', () => {
-    it('delegates processBlockByHeight to processBlockByHash', async () => {
+    it('resolves the hash and processes the block with parent enforcement (height path)', async () => {
         const provider = {
             getBlockHash: jest.fn().mockResolvedValue('0xblockhash')
         } as any;
         const processor = new BlockProcessor(provider);
-        const processBlockByHashSpy = jest.spyOn(processor, 'processBlockByHash').mockResolvedValue({
+        const processFromNodeSpy = jest.spyOn(processor as any, 'processFromNode').mockResolvedValue({
             blockHeight: 7,
             blockHash: '0xblockhash',
             transactionCount: 0,
@@ -318,7 +334,22 @@ describe('BlockProcessor public helpers', () => {
             blockHash: '0xblockhash'
         }));
         expect(provider.getBlockHash).toHaveBeenCalledWith(7);
-        expect(processBlockByHashSpy).toHaveBeenCalledWith('0xblockhash');
+        // Height-sequenced path: a missing parent is an index gap → strict.
+        expect(processFromNodeSpy).toHaveBeenCalledWith('0xblockhash', expect.any(Number), { requireParent: true });
+    });
+
+    it('processes hash-addressed blocks without parent enforcement (on-demand path)', async () => {
+        const processor = new BlockProcessor({} as any);
+        const processFromNodeSpy = jest.spyOn(processor as any, 'processFromNode').mockResolvedValue({
+            blockHeight: 7,
+            blockHash: '0xblockhash',
+            transactionCount: 0,
+            contractActionCount: 0,
+            processingTimeMs: 1
+        });
+
+        await processor.processBlockByHash('0xblockhash');
+        expect(processFromNodeSpy).toHaveBeenCalledWith('0xblockhash', expect.any(Number), { requireParent: false });
     });
 
     it('throws when no block exists at the requested height', async () => {

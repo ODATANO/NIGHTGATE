@@ -303,7 +303,7 @@ Last `limit` (default 10, max 100) reorg events with depth, detected-at timestam
 
 ### `pauseCrawler() / resumeCrawler() / reindexFromHeight(height)` — actions
 
-Operator controls. `reindexFromHeight` triggers a rollback to the specified height and a fresh catch-up from there.
+Operator controls, `@requires: 'admin'` (since 0.5.2; unauthenticated or non-admin callers get 401/403). `reindexFromHeight` triggers a rollback to the specified height (including a recompute of the `NightBalances` projection for affected addresses) and a fresh catch-up from there. The read-only status/health/metrics functions above stay unrestricted for K8s probes and Prometheus.
 
 ## Analytics
 

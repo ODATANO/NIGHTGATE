@@ -8,17 +8,14 @@
  */
 
 import cds from '@sap/cds';
-const { SELECT, INSERT, UPDATE, DELETE } = cds.ql;
+const { SELECT, INSERT, UPDATE } = cds.ql;
 import { MidnightNodeProvider, BlockHeader } from '../providers/MidnightNodeProvider';
 import { BlockProcessor, ProcessResult } from './BlockProcessor';
 import { ensureNightgateModelLoaded } from '../utils/cds-model';
 import { isTransientError, calcBackoff } from '../utils/retry';
 import { ensureSyncStateSingleton } from '../utils/sync-state';
-import {
-    SyncState, ReorgLog, Blocks, Transactions, ContractActions, ContractBalances,
-    UnshieldedUtxos, ZswapLedgerEvents, DustLedgerEvents, TransactionFees,
-    TransactionResults, TransactionSegments
-} from '#cds-models/midnight';
+import { rollbackIndexedDataFromHeight } from './rollback';
+import { SyncState, ReorgLog, Blocks } from '#cds-models/midnight';
 
 // ============================================================================
 // Types
@@ -239,8 +236,9 @@ export class MidnightCrawler {
         let acc = { fetchMsTotal: 0, persistMsTotal: 0, waitedForFetchMs: 0, samples: 0 };
 
         // Queue of in-flight batches; each is a Promise<PreparedBlock[]> covering
-        // a contiguous height range. Drained in submission order.
-        const queue: Array<{ from: number; to: number; data: Promise<any[]> }> = [];
+        // a contiguous height range. Drained in submission order. `retried`
+        // marks a batch that was re-queued once after a failure.
+        const queue: Array<{ from: number; to: number; data: Promise<any[]>; retried?: boolean }> = [];
 
         const pumpFetches = () => {
             while (
@@ -329,7 +327,32 @@ export class MidnightCrawler {
                     console.error('[Crawler] Too many consecutive errors, stopping catch-up');
                     break outer;
                 }
-                nextHeightToPersist = head.to + 1;
+
+                // A failed range must never be skipped: skipping would leave a
+                // hole in the index while lastIndexedHeight keeps advancing.
+                // Re-queue the batch once at the FRONT (height order stays
+                // monotonic); a second failure aborts this catch-up run so the
+                // next run resumes at lastIndexedHeight + 1.
+                if (!head.retried) {
+                    console.warn(`[Crawler] Re-queueing batch ${head.from}-${head.to} for a final retry`);
+                    const heights: number[] = [];
+                    for (let h = head.from; h <= head.to; h++) heights.push(h);
+                    queue.unshift({
+                        from: head.from,
+                        to: head.to,
+                        retried: true,
+                        data: this.fetchBlockBatchWithRetry(heights)
+                    });
+                } else {
+                    console.error(
+                        `[Crawler] Batch ${head.from}-${head.to} failed after retry; ` +
+                        'stopping catch-up to avoid index gaps'
+                    );
+                    await this.db.run(
+                        UPDATE.entity(SyncState).set({ syncStatus: 'error' }).where({ ID: 'SINGLETON' })
+                    );
+                    break outer;
+                }
             }
 
             pumpFetches();
@@ -470,6 +493,17 @@ export class MidnightCrawler {
                 }).where({ ID: 'SINGLETON' })
             );
 
+            // Gap: the head is more than one block ahead of the index (e.g.
+            // heads buffered during a reconnect). Not a fork; run a normal
+            // catch-up to the finalized tip instead of single-block processing.
+            const tipState = await this.getSyncState();
+            const lastIndexedHeight = Number(tipState?.lastIndexedHeight ?? 0);
+            if (tipState?.lastIndexedHash && height > lastIndexedHeight + 1) {
+                console.log(`[Crawler] Live: gap detected (head ${height}, indexed ${lastIndexedHeight}); catching up`);
+                await this.catchUp();
+                return;
+            }
+
             // Check for reorg
             const reorg = await this.checkForReorg(header);
             if (reorg) {
@@ -530,20 +564,39 @@ export class MidnightCrawler {
         const syncState = await this.getSyncState();
         if (!syncState?.lastIndexedHash) return null;
 
-        // If parent hash doesn't match our tip, we have a reorg
-        if (header.parentHash !== syncState.lastIndexedHash) {
-            const newHeight = MidnightNodeProvider.parseBlockNumber(header.number);
-            console.warn(`[Crawler] Reorg detected at height ${newHeight}: parent ${header.parentHash} != tip ${syncState.lastIndexedHash}`);
+        // Fast path: the head extends our tip.
+        if (header.parentHash === syncState.lastIndexedHash) return null;
 
-            const forkHeight = await this.findForkPoint(header);
-            return {
-                forkHeight,
-                oldTipHash: syncState.lastIndexedHash,
-                newTipHash: header.parentHash
-            };
+        const newHeight = MidnightNodeProvider.parseBlockNumber(header.number);
+        const lastIndexedHeight = Number(syncState.lastIndexedHeight ?? 0);
+
+        // Head is far ahead of the index: that is a gap (e.g. subscription
+        // replay backlog after a reconnect), not a fork. The caller catches
+        // up; rolling back here would destroy valid data.
+        if (newHeight > lastIndexedHeight + 1) return null;
+
+        if (newHeight <= lastIndexedHeight) {
+            // Old or replayed head (subscription start/reconnect re-delivers
+            // already-indexed finalized heads). It sits on our chain iff its
+            // parent is our block at newHeight - 1 → ignore. Only a diverging
+            // parent at that height is a real fork below the tip.
+            if (newHeight === 0) return null; // genesis replay: never roll back
+            const localParent: any = await this.db.run(
+                SELECT.one.from(Blocks).columns('hash').where({ height: newHeight - 1 })
+            );
+            if (localParent?.hash === header.parentHash) {
+                return null;
+            }
         }
 
-        return null;
+        console.warn(`[Crawler] Reorg detected at height ${newHeight}: parent ${header.parentHash} != tip ${syncState.lastIndexedHash}`);
+
+        const forkHeight = await this.findForkPoint(header);
+        return {
+            forkHeight,
+            oldTipHash: syncState.lastIndexedHash,
+            newTipHash: header.parentHash
+        };
     }
 
     private async findForkPoint(header: BlockHeader): Promise<number> {
@@ -583,75 +636,13 @@ export class MidnightCrawler {
         const reorgLogId = cds.utils.uuid();
 
         await this.db.tx(async (tx: any) => {
-            const blocksToRollback: any[] = await tx.run(
-                SELECT.from(Blocks).columns('ID', 'height')
-                    .where({ height: { '>=': reorg.forkHeight } })
-            ) || [];
-            const rollbackCount = blocksToRollback.length;
-            const blockIds = blocksToRollback.map((b: any) => b.ID);
+            // Shared cascade + NightBalances repair (srv/crawler/rollback.ts);
+            // also resets SyncState to the fork block with status 'syncing'.
+            const result = await rollbackIndexedDataFromHeight(tx, reorg.forkHeight, {
+                syncStatus: 'syncing'
+            });
 
-            if (blockIds.length === 0) return;
-
-            const txsToDelete: any[] = await tx.run(
-                SELECT.from(Transactions).columns('ID')
-                    .where({ block_ID: { in: blockIds } })
-            ) || [];
-
-            if (txsToDelete.length > 0) {
-                const txIds = txsToDelete.map((t: any) => t.ID);
-
-                // Batch delete contract balances via action IDs
-                const actionsToDelete: any[] = await tx.run(
-                    SELECT.from(ContractActions).columns('ID')
-                        .where({ transaction_ID: { in: txIds } })
-                ) || [];
-                if (actionsToDelete.length > 0) {
-                    const actionIds = actionsToDelete.map((a: any) => a.ID);
-                    await tx.run(DELETE.from(ContractBalances).where({ contractAction_ID: { in: actionIds } }));
-                }
-
-                // Batch delete all tx-child tables
-                await tx.run(DELETE.from(ContractActions).where({ transaction_ID: { in: txIds } }));
-                await tx.run(DELETE.from(UnshieldedUtxos).where({ createdAtTransaction_ID: { in: txIds } }));
-                await tx.run(DELETE.from(ZswapLedgerEvents).where({ transaction_ID: { in: txIds } }));
-                await tx.run(DELETE.from(DustLedgerEvents).where({ transaction_ID: { in: txIds } }));
-                await tx.run(DELETE.from(TransactionFees).where({ transaction_ID: { in: txIds } }));
-
-                // Batch delete transaction segments via result IDs
-                const resultsToDelete: any[] = await tx.run(
-                    SELECT.from(TransactionResults).columns('ID').where({ transaction_ID: { in: txIds } })
-                ) || [];
-                if (resultsToDelete.length > 0) {
-                    const resultIds = resultsToDelete.map((r: any) => r.ID);
-                    await tx.run(DELETE.from(TransactionSegments).where({ transactionResult_ID: { in: resultIds } }));
-                }
-                await tx.run(DELETE.from(TransactionResults).where({ transaction_ID: { in: txIds } }));
-
-                // Unlink spent UTXOs
-                await tx.run(
-                    UPDATE.entity(UnshieldedUtxos)
-                        .set({ spentAtTransaction_ID: null })
-                        .where({ spentAtTransaction_ID: { in: txIds } })
-                );
-            }
-
-            // Batch delete transactions and blocks
-            await tx.run(DELETE.from(Transactions).where({ block_ID: { in: blockIds } }));
-            await tx.run(DELETE.from(Blocks).where({ ID: { in: blockIds } }));
-
-            const forkBlock = await tx.run(
-                SELECT.one.from(Blocks)
-                    .where({ height: { '<': reorg.forkHeight } })
-                    .orderBy('height desc')
-            );
-            await tx.run(
-                UPDATE.entity(SyncState).set({
-                    lastIndexedHeight: forkBlock?.height ?? 0,
-                    lastIndexedHash: forkBlock?.hash ?? null,
-                    lastIndexedAt: new Date().toISOString(),
-                    syncStatus: 'syncing'
-                }).where({ ID: 'SINGLETON' })
-            );
+            if (result.blocksRolledBack === 0) return;
 
             await tx.run(INSERT.into(ReorgLog).entries({
                 ID: reorgLogId,
@@ -659,7 +650,7 @@ export class MidnightCrawler {
                 forkHeight: reorg.forkHeight,
                 oldTipHash: reorg.oldTipHash,
                 newTipHash: reorg.newTipHash,
-                blocksRolledBack: rollbackCount,
+                blocksRolledBack: result.blocksRolledBack,
                 blocksReIndexed: 0,
                 status: 'in_progress'
             }));

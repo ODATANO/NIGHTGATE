@@ -52,7 +52,10 @@ service NightgateIndexerService {
     // Prometheus-compatible metrics endpoint
     function getMetrics()                         returns String;
 
-    // Pause crawler execution without stopping the service process
+    // Pause crawler execution without stopping the service process.
+    // Operational action: admin only (read-only status/health stays open
+    // for K8s probes and Prometheus scraping).
+    @requires: 'admin'
     action   pauseCrawler()                       returns {
         status  : String;
         running : Boolean;
@@ -60,6 +63,7 @@ service NightgateIndexerService {
     };
 
     // Resume crawler execution using configured node/crawler settings
+    @requires: 'admin'
     action   resumeCrawler()                      returns {
         status  : String;
         running : Boolean;
@@ -67,6 +71,7 @@ service NightgateIndexerService {
     };
 
     // Roll back indexed data from a specific height and optionally resume crawling
+    @requires: 'admin'
     action   reindexFromHeight(height: Integer64) returns {
         status                 : String;
         message                : String;
