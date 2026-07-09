@@ -132,10 +132,15 @@ circuit merkleStep(node: Bytes<32>, sibling: Bytes<32>, goesLeft: Boolean): Byte
   return nodeHash(sibling, node);
 }
 
-// Anyone can attest. Locks in attester_id for later grant/revoke checks.
+// Anyone can attest a NEW payload_hash. Locks in attester_id for later
+// grant/revoke checks. First-come-first-served: re-attesting an existing
+// payload_hash is rejected, because Map.insert overwrites — without the guard
+// anyone could re-attest a known (public) hash, take over attestation_owners,
+// and then pass every owner-gated assert (grant/revoke/commit/bind/anchor).
 // All arguments are caller-provided commitments that the caller explicitly
 // wants on-chain — wrap with `disclose(...)` to declare intent.
 export circuit attest(payload_hash: Bytes<32>, metadata_hash: Bytes<32>): [] {
+  assert(!public_attestations.member(disclose(payload_hash)), "already attested");
   public_attestations.insert(disclose(payload_hash), disclose(metadata_hash));
   attestation_owners.insert(disclose(payload_hash), disclose(caller_id()));
 }

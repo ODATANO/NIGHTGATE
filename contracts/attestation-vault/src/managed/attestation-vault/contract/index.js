@@ -166,21 +166,21 @@ export class Contract {
         if (!(typeof(contextOrig_0) === 'object' && contextOrig_0.currentQueryContext != undefined)) {
           __compactRuntime.typeError('attest',
                                      'argument 1 (as invoked from Typescript)',
-                                     'attestation-vault.compact line 138 char 1',
+                                     'attestation-vault.compact line 142 char 1',
                                      'CircuitContext',
                                      contextOrig_0)
         }
         if (!(payload_hash_0.buffer instanceof ArrayBuffer && payload_hash_0.BYTES_PER_ELEMENT === 1 && payload_hash_0.length === 32)) {
           __compactRuntime.typeError('attest',
                                      'argument 1 (argument 2 as invoked from Typescript)',
-                                     'attestation-vault.compact line 138 char 1',
+                                     'attestation-vault.compact line 142 char 1',
                                      'Bytes<32>',
                                      payload_hash_0)
         }
         if (!(metadata_hash_0.buffer instanceof ArrayBuffer && metadata_hash_0.BYTES_PER_ELEMENT === 1 && metadata_hash_0.length === 32)) {
           __compactRuntime.typeError('attest',
                                      'argument 2 (argument 3 as invoked from Typescript)',
-                                     'attestation-vault.compact line 138 char 1',
+                                     'attestation-vault.compact line 142 char 1',
                                      'Bytes<32>',
                                      metadata_hash_0)
         }
@@ -212,28 +212,28 @@ export class Contract {
         if (!(typeof(contextOrig_0) === 'object' && contextOrig_0.currentQueryContext != undefined)) {
           __compactRuntime.typeError('grantDisclosure',
                                      'argument 1 (as invoked from Typescript)',
-                                     'attestation-vault.compact line 144 char 1',
+                                     'attestation-vault.compact line 149 char 1',
                                      'CircuitContext',
                                      contextOrig_0)
         }
         if (!(payload_hash_0.buffer instanceof ArrayBuffer && payload_hash_0.BYTES_PER_ELEMENT === 1 && payload_hash_0.length === 32)) {
           __compactRuntime.typeError('grantDisclosure',
                                      'argument 1 (argument 2 as invoked from Typescript)',
-                                     'attestation-vault.compact line 144 char 1',
+                                     'attestation-vault.compact line 149 char 1',
                                      'Bytes<32>',
                                      payload_hash_0)
         }
         if (!(grantee_0.buffer instanceof ArrayBuffer && grantee_0.BYTES_PER_ELEMENT === 1 && grantee_0.length === 32)) {
           __compactRuntime.typeError('grantDisclosure',
                                      'argument 2 (argument 3 as invoked from Typescript)',
-                                     'attestation-vault.compact line 144 char 1',
+                                     'attestation-vault.compact line 149 char 1',
                                      'Bytes<32>',
                                      grantee_0)
         }
         if (!(typeof(level_0) === 'bigint' && level_0 >= 0n && level_0 <= 255n)) {
           __compactRuntime.typeError('grantDisclosure',
                                      'argument 3 (argument 4 as invoked from Typescript)',
-                                     'attestation-vault.compact line 144 char 1',
+                                     'attestation-vault.compact line 149 char 1',
                                      'Uint<0..256>',
                                      level_0)
         }
@@ -265,21 +265,21 @@ export class Contract {
         if (!(typeof(contextOrig_0) === 'object' && contextOrig_0.currentQueryContext != undefined)) {
           __compactRuntime.typeError('revokeDisclosure',
                                      'argument 1 (as invoked from Typescript)',
-                                     'attestation-vault.compact line 157 char 1',
+                                     'attestation-vault.compact line 162 char 1',
                                      'CircuitContext',
                                      contextOrig_0)
         }
         if (!(payload_hash_0.buffer instanceof ArrayBuffer && payload_hash_0.BYTES_PER_ELEMENT === 1 && payload_hash_0.length === 32)) {
           __compactRuntime.typeError('revokeDisclosure',
                                      'argument 1 (argument 2 as invoked from Typescript)',
-                                     'attestation-vault.compact line 157 char 1',
+                                     'attestation-vault.compact line 162 char 1',
                                      'Bytes<32>',
                                      payload_hash_0)
         }
         if (!(grantee_0.buffer instanceof ArrayBuffer && grantee_0.BYTES_PER_ELEMENT === 1 && grantee_0.length === 32)) {
           __compactRuntime.typeError('revokeDisclosure',
                                      'argument 2 (argument 3 as invoked from Typescript)',
-                                     'attestation-vault.compact line 157 char 1',
+                                     'attestation-vault.compact line 162 char 1',
                                      'Bytes<32>',
                                      grantee_0)
         }
@@ -309,14 +309,14 @@ export class Contract {
         if (!(typeof(contextOrig_0) === 'object' && contextOrig_0.currentQueryContext != undefined)) {
           __compactRuntime.typeError('commitValue',
                                      'argument 1 (as invoked from Typescript)',
-                                     'attestation-vault.compact line 165 char 1',
+                                     'attestation-vault.compact line 170 char 1',
                                      'CircuitContext',
                                      contextOrig_0)
         }
         if (!(payload_hash_0.buffer instanceof ArrayBuffer && payload_hash_0.BYTES_PER_ELEMENT === 1 && payload_hash_0.length === 32)) {
           __compactRuntime.typeError('commitValue',
                                      'argument 1 (argument 2 as invoked from Typescript)',
-                                     'attestation-vault.compact line 165 char 1',
+                                     'attestation-vault.compact line 170 char 1',
                                      'Bytes<32>',
                                      payload_hash_0)
         }
@@ -347,28 +347,28 @@ export class Contract {
         if (!(typeof(contextOrig_0) === 'object' && contextOrig_0.currentQueryContext != undefined)) {
           __compactRuntime.typeError('provePredicate',
                                      'argument 1 (as invoked from Typescript)',
-                                     'attestation-vault.compact line 175 char 1',
+                                     'attestation-vault.compact line 180 char 1',
                                      'CircuitContext',
                                      contextOrig_0)
         }
         if (!(payload_hash_0.buffer instanceof ArrayBuffer && payload_hash_0.BYTES_PER_ELEMENT === 1 && payload_hash_0.length === 32)) {
           __compactRuntime.typeError('provePredicate',
                                      'argument 1 (argument 2 as invoked from Typescript)',
-                                     'attestation-vault.compact line 175 char 1',
+                                     'attestation-vault.compact line 180 char 1',
                                      'Bytes<32>',
                                      payload_hash_0)
         }
         if (!(typeof(threshold_0) === 'bigint' && threshold_0 >= 0n && threshold_0 <= 18446744073709551615n)) {
           __compactRuntime.typeError('provePredicate',
                                      'argument 2 (argument 3 as invoked from Typescript)',
-                                     'attestation-vault.compact line 175 char 1',
+                                     'attestation-vault.compact line 180 char 1',
                                      'Uint<0..18446744073709551616>',
                                      threshold_0)
         }
         if (!(typeof(op_0) === 'bigint' && op_0 >= 0n && op_0 <= 255n)) {
           __compactRuntime.typeError('provePredicate',
                                      'argument 3 (argument 4 as invoked from Typescript)',
-                                     'attestation-vault.compact line 175 char 1',
+                                     'attestation-vault.compact line 180 char 1',
                                      'Uint<0..256>',
                                      op_0)
         }
@@ -400,21 +400,21 @@ export class Contract {
         if (!(typeof(contextOrig_0) === 'object' && contextOrig_0.currentQueryContext != undefined)) {
           __compactRuntime.typeError('bindPassport',
                                      'argument 1 (as invoked from Typescript)',
-                                     'attestation-vault.compact line 195 char 1',
+                                     'attestation-vault.compact line 200 char 1',
                                      'CircuitContext',
                                      contextOrig_0)
         }
         if (!(passportId_0.buffer instanceof ArrayBuffer && passportId_0.BYTES_PER_ELEMENT === 1 && passportId_0.length === 32)) {
           __compactRuntime.typeError('bindPassport',
                                      'argument 1 (argument 2 as invoked from Typescript)',
-                                     'attestation-vault.compact line 195 char 1',
+                                     'attestation-vault.compact line 200 char 1',
                                      'Bytes<32>',
                                      passportId_0)
         }
         if (!(payload_hash_0.buffer instanceof ArrayBuffer && payload_hash_0.BYTES_PER_ELEMENT === 1 && payload_hash_0.length === 32)) {
           __compactRuntime.typeError('bindPassport',
                                      'argument 2 (argument 3 as invoked from Typescript)',
-                                     'attestation-vault.compact line 195 char 1',
+                                     'attestation-vault.compact line 200 char 1',
                                      'Bytes<32>',
                                      payload_hash_0)
         }
@@ -445,21 +445,21 @@ export class Contract {
         if (!(typeof(contextOrig_0) === 'object' && contextOrig_0.currentQueryContext != undefined)) {
           __compactRuntime.typeError('anchorContentRoot',
                                      'argument 1 (as invoked from Typescript)',
-                                     'attestation-vault.compact line 205 char 1',
+                                     'attestation-vault.compact line 210 char 1',
                                      'CircuitContext',
                                      contextOrig_0)
         }
         if (!(payload_hash_0.buffer instanceof ArrayBuffer && payload_hash_0.BYTES_PER_ELEMENT === 1 && payload_hash_0.length === 32)) {
           __compactRuntime.typeError('anchorContentRoot',
                                      'argument 1 (argument 2 as invoked from Typescript)',
-                                     'attestation-vault.compact line 205 char 1',
+                                     'attestation-vault.compact line 210 char 1',
                                      'Bytes<32>',
                                      payload_hash_0)
         }
         if (!(content_root_0.buffer instanceof ArrayBuffer && content_root_0.BYTES_PER_ELEMENT === 1 && content_root_0.length === 32)) {
           __compactRuntime.typeError('anchorContentRoot',
                                      'argument 2 (argument 3 as invoked from Typescript)',
-                                     'attestation-vault.compact line 205 char 1',
+                                     'attestation-vault.compact line 210 char 1',
                                      'Bytes<32>',
                                      content_root_0)
         }
@@ -492,35 +492,35 @@ export class Contract {
         if (!(typeof(contextOrig_0) === 'object' && contextOrig_0.currentQueryContext != undefined)) {
           __compactRuntime.typeError('proveFieldPredicate',
                                      'argument 1 (as invoked from Typescript)',
-                                     'attestation-vault.compact line 216 char 1',
+                                     'attestation-vault.compact line 221 char 1',
                                      'CircuitContext',
                                      contextOrig_0)
         }
         if (!(payload_hash_0.buffer instanceof ArrayBuffer && payload_hash_0.BYTES_PER_ELEMENT === 1 && payload_hash_0.length === 32)) {
           __compactRuntime.typeError('proveFieldPredicate',
                                      'argument 1 (argument 2 as invoked from Typescript)',
-                                     'attestation-vault.compact line 216 char 1',
+                                     'attestation-vault.compact line 221 char 1',
                                      'Bytes<32>',
                                      payload_hash_0)
         }
         if (!(field_key_0.buffer instanceof ArrayBuffer && field_key_0.BYTES_PER_ELEMENT === 1 && field_key_0.length === 32)) {
           __compactRuntime.typeError('proveFieldPredicate',
                                      'argument 2 (argument 3 as invoked from Typescript)',
-                                     'attestation-vault.compact line 216 char 1',
+                                     'attestation-vault.compact line 221 char 1',
                                      'Bytes<32>',
                                      field_key_0)
         }
         if (!(typeof(threshold_0) === 'bigint' && threshold_0 >= 0n && threshold_0 <= 18446744073709551615n)) {
           __compactRuntime.typeError('proveFieldPredicate',
                                      'argument 3 (argument 4 as invoked from Typescript)',
-                                     'attestation-vault.compact line 216 char 1',
+                                     'attestation-vault.compact line 221 char 1',
                                      'Uint<0..18446744073709551616>',
                                      threshold_0)
         }
         if (!(typeof(op_0) === 'bigint' && op_0 >= 0n && op_0 <= 255n)) {
           __compactRuntime.typeError('proveFieldPredicate',
                                      'argument 4 (argument 5 as invoked from Typescript)',
-                                     'attestation-vault.compact line 216 char 1',
+                                     'attestation-vault.compact line 221 char 1',
                                      'Uint<0..256>',
                                      op_0)
         }
@@ -854,6 +854,23 @@ export class Contract {
     }
   }
   _attest_0(context, partialProofData, payload_hash_0, metadata_hash_0) {
+    __compactRuntime.assert(!_descriptor_1.fromValue(__compactRuntime.queryLedgerState(context,
+                                                                                       partialProofData,
+                                                                                       [
+                                                                                        { dup: { n: 0 } },
+                                                                                        { idx: { cached: false,
+                                                                                                 pushPath: false,
+                                                                                                 path: [
+                                                                                                        { tag: 'value',
+                                                                                                          value: { value: _descriptor_3.toValue(0n),
+                                                                                                                   alignment: _descriptor_3.alignment() } }] } },
+                                                                                        { push: { storage: false,
+                                                                                                  value: __compactRuntime.StateValue.newCell({ value: _descriptor_0.toValue(payload_hash_0),
+                                                                                                                                               alignment: _descriptor_0.alignment() }).encode() } },
+                                                                                        'member',
+                                                                                        { popeq: { cached: true,
+                                                                                                   result: undefined } }]).value),
+                            'already attested');
     __compactRuntime.queryLedgerState(context,
                                       partialProofData,
                                       [

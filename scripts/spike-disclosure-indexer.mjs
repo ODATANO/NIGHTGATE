@@ -39,7 +39,10 @@ const attesterSecret = bytes32(0x11);
 const witnesses = {
     local_secret_key(ctx) { return [ctx.privateState, attesterSecret]; },
     attested_value(ctx)   { return [ctx.privateState, 0n]; },
-    value_salt(ctx)       { return [ctx.privateState, bytes32(0) ]; }
+    value_salt(ctx)       { return [ctx.privateState, bytes32(0) ]; },
+    field_value(ctx)      { return [ctx.privateState, 0n]; },
+    merkle_siblings(ctx)  { return [ctx.privateState, [bytes32(0), bytes32(0), bytes32(0), bytes32(0)]]; },
+    merkle_dirs(ctx)      { return [ctx.privateState, [true, true, true, true]]; }
 };
 
 const instance = new Contract(witnesses);

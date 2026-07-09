@@ -2,6 +2,15 @@
 
 ## 0.6.1 - 2026-07-09
 
+### SECURITY: AttestationVault attest() ownership takeover fixed
+
+`attest()` inserted into `attestation_owners` with no guard, and Compact's `Map.insert` overwrites. `payload_hash` is public on-chain, so anyone could re-attest a known hash, become the recorded owner, and then pass every owner-gated assert (`grantDisclosure` / `revokeDisclosure` / `commitValue` / `bindPassport` / `anchorContentRoot`), e.g. self-grant an authority disclosure or revoke legitimate grants.
+
+- **Fix**: `assert(!public_attestations.member(disclose(payload_hash)), "already attested")` at the top of `attest`; attestations are now first-come-first-served per payload_hash. There is deliberately no update path yet; re-anchoring the same document now fails with `already attested`.
+- Recompiled `managed/` artifact committed (compactc 0.31.0, WSL; 8 circuits, attest prover/verifier keys and zkir changed). **Only newly deployed vaults get the guard**; vaults already on chain keep the vulnerable attest and should be redeployed if takeover matters for them.
+- Regression check added to `scripts/integration-test-attestation-vault.mjs`: drives the real emitted circuits via compact-runtime; re-attest rejected, non-owner still fails owner-gated circuits, prior grants survive, fresh hashes attest. Also repaired the script's (and `spike-disclosure-indexer.mjs`') stale 3-field witness stubs, broken since the 0.4.3 field-predicate witnesses were added.
+- Known remaining overwrite of the same class, NOT changed here: `bindPassport` lets the owner of ANY attestation re-bind an already-bound `passportId` to their own attestation (`passport_bindings.insert` overwrites, no current-binding ownership check).
+
 ### Wallet SDK migrated to the @midnightntwrk scope (fixes the sync stall)
 
 The wallet-sdk family moved upstream from `@midnight-ntwrk/*` (frozen) to `@midnightntwrk/*`; 0.6.0 still resolved the dead scope, whose packages lack the indexer-4.3.x-era fixes (WebSocket subscription leak, `DustGenerationDtimeUpdate` handling in the dust subscription, prover-client compatibility with undici >= 8.2) and starve server-side cold syncs under the indexer 4.3.3 per-connection subscription quotas. FR: `docs/feature-requests/migrate-wallet-sdk-scope.md`.

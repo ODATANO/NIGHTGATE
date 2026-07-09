@@ -41,10 +41,14 @@ ok('artifact: pureCircuits exposed',      mod.pureCircuits !== undefined);
 // Inspect a freshly-constructed Contract for the expected circuit shape.
 // We use a stub witness here — the real one is plumbed by the worker.
 const stubSecret = new Uint8Array(32);
+const zero32 = () => new Uint8Array(32);
 const stubWitnesses = {
     local_secret_key(ctx) { return [ctx.privateState, stubSecret]; },
     attested_value(ctx)   { return [ctx.privateState, 0n]; },
-    value_salt(ctx)       { return [ctx.privateState, new Uint8Array(32)]; }
+    value_salt(ctx)       { return [ctx.privateState, zero32()]; },
+    field_value(ctx)      { return [ctx.privateState, 0n]; },
+    merkle_siblings(ctx)  { return [ctx.privateState, [zero32(), zero32(), zero32(), zero32()]]; },
+    merkle_dirs(ctx)      { return [ctx.privateState, [true, true, true, true]]; }
 };
 const instance = new ContractClass(stubWitnesses);
 ok('artifact: attest circuit present',           typeof instance.circuits?.attest           === 'function');
@@ -133,6 +137,78 @@ const builtAgain = witnesses.buildAttestationVaultWitnesses({
 const [, secretAgain] = builtAgain.local_secret_key(fakeCtx);
 ok('factory: deterministic across rebuilds',
     Buffer.from(secretAgain).toString('hex') === Buffer.from(secret).toString('hex'));
+
+// ---- Check 5: attest ownership-takeover guard ------------------------------
+// Drives the REAL emitted circuits locally (compact-runtime, no chain/proofs).
+// Regression for the Map.insert-overwrite takeover: re-attesting a known
+// payload_hash must throw "already attested" instead of silently replacing
+// attestation_owners (which would let the attacker pass every owner-gated
+// assert: grantDisclosure / revokeDisclosure / commitValue / bindPassport /
+// anchorContentRoot).
+const rt = await import('@midnight-ntwrk/compact-runtime');
+const bytes32 = (fill) => new Uint8Array(32).fill(fill);
+
+const ownerSecret = bytes32(0x11);
+const attackerSecret = bytes32(0x22);
+const makeWitnesses = (secretBytes) => ({
+    local_secret_key(ctx) { return [ctx.privateState, secretBytes]; },
+    attested_value(ctx)   { return [ctx.privateState, 0n]; },
+    value_salt(ctx)       { return [ctx.privateState, bytes32(0)]; },
+    field_value(ctx)      { return [ctx.privateState, 0n]; },
+    merkle_siblings(ctx)  { return [ctx.privateState, [bytes32(0), bytes32(0), bytes32(0), bytes32(0)]]; },
+    merkle_dirs(ctx)      { return [ctx.privateState, [true, true, true, true]]; }
+});
+const ownerContract = new ContractClass(makeWitnesses(ownerSecret));
+const attackerContract = new ContractClass(makeWitnesses(attackerSecret));
+
+const ctorCtx = rt.createConstructorContext({}, '00'.repeat(32));
+const init = ownerContract.initialState(ctorCtx);
+let circuitCtx = rt.createCircuitContext(
+    rt.dummyContractAddress(),
+    ctorCtx.initialZswapLocalState.coinPublicKey,
+    init.currentContractState.data,
+    init.currentPrivateState
+);
+function runCircuit(contract, name, ...args) {
+    const out = contract.impureCircuits[name](circuitCtx, ...args);
+    circuitCtx = out.context; // thread the mutated context forward
+    return out;
+}
+
+const payloadHash = bytes32(0xaa);
+runCircuit(ownerContract, 'attest', payloadHash, bytes32(0xbb));
+runCircuit(ownerContract, 'grantDisclosure', payloadHash, bytes32(0xcc), 2n);
+
+let reAttestError = '';
+try {
+    runCircuit(attackerContract, 'attest', payloadHash, bytes32(0xdd));
+} catch (err) {
+    reAttestError = String(err?.message ?? err);
+}
+ok('guard: re-attest of existing payload_hash rejected',
+    reAttestError.includes('already attested'), reAttestError || 'did NOT throw');
+
+let takeoverError = '';
+try {
+    runCircuit(attackerContract, 'revokeDisclosure', payloadHash, bytes32(0xcc));
+} catch (err) {
+    takeoverError = String(err?.message ?? err);
+}
+ok('guard: non-owner still fails owner-gated circuit',
+    takeoverError.includes('not attester'), takeoverError || 'did NOT throw');
+
+const ownerLedger = mod.ledger(circuitCtx.currentQueryContext.state);
+ok('guard: grant made before the takeover attempt survives',
+    ownerLedger.disclosures.lookup(payloadHash).member(bytes32(0xcc)) === true);
+
+// Fresh hashes still attest normally (incl. a second attester on their own hash).
+let freshError = '';
+try {
+    runCircuit(attackerContract, 'attest', bytes32(0xee), bytes32(0xff));
+} catch (err) {
+    freshError = String(err?.message ?? err);
+}
+ok('guard: fresh payload_hash still attests', freshError === '', freshError);
 
 console.log();
 console.log(failures === 0
