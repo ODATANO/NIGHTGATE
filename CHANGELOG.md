@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.6.1 - 2026-07-09
+## 0.6.2 - 2026-07-09
 
 ### SECURITY: AttestationVault attest() ownership takeover fixed
 
@@ -10,6 +10,8 @@
 - Recompiled `managed/` artifact committed (compactc 0.31.0, WSL; 8 circuits, attest prover/verifier keys and zkir changed). **Only newly deployed vaults get the guard**; vaults already on chain keep the vulnerable attest and should be redeployed if takeover matters for them.
 - Regression check added to `scripts/integration-test-attestation-vault.mjs`: drives the real emitted circuits via compact-runtime; re-attest rejected, non-owner still fails owner-gated circuits, prior grants survive, fresh hashes attest. Also repaired the script's (and `spike-disclosure-indexer.mjs`') stale 3-field witness stubs, broken since the 0.4.3 field-predicate witnesses were added.
 - Known remaining overwrite of the same class, NOT changed here: `bindPassport` lets the owner of ANY attestation re-bind an already-bound `passportId` to their own attestation (`passport_bindings.insert` overwrites, no current-binding ownership check).
+
+## 0.6.1 - 2026-07-09
 
 ### Wallet SDK migrated to the @midnightntwrk scope (fixes the sync stall)
 
