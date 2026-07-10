@@ -58,7 +58,7 @@ services:
   # NIGHTGATE_INDEXER_WS_URL in your .env to http://localhost:8088 /
   # ws://localhost:8088/api/v4/graphql/ws. See .env.example.
   indexer:
-    image: midnightntwrk/indexer-standalone:4.3.2
+    image: midnightntwrk/indexer-standalone:4.3.3
     container_name: odatano-night-indexer
     ports:
       - "8088:8088"
@@ -119,7 +119,7 @@ services:
   # Network selection: pass NIGHTGATE_PROOF_NETWORK in your env (defaults to preprod).
   # Set to testnet for local node; mainnet not recommended until forum issue 1190 resolves.
   proof-server:
-    image: midnightntwrk/proof-server:8.0.3
+    image: midnightntwrk/proof-server:8.1.0
     container_name: odatano-night-proof-server
     command: ["midnight-proof-server", "--network", "${NIGHTGATE_PROOF_NETWORK:-preprod}"]
     ports:

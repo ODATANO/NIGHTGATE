@@ -310,50 +310,129 @@ async function waitForSyncedStateBounded(facade: any, timeoutMs: number): Promis
     }
 }
 
-// How close to the indexer tip counts as "caught up" (blocks). The tip advances
-// ~1 block / 6s, so a few blocks of slack avoids chasing a moving target.
+// How close to the DUST STREAM tip counts as "caught up". Measured in ledger
+// EVENTS, not blocks: the dust sub-wallet consumes dustLedgerEvents whose ids
+// advance independently of (and far slower than) block height. A few events
+// of slack avoids chasing a moving target.
 const SYNC_TIP_GAP = BigInt(process.env.NIGHTGATE_SYNC_TIP_GAP || '8');
+// The indexer's latest block must be at most this old for "caught up" to
+// count. This preserves the guard against a lagging (self-hosted) indexer:
+// the wallet would sync to a STALE tip and later spend dust whose merkle
+// roots have pruned out of the node's root_history (Custom error 117).
+const SYNC_FRESHNESS_MS = Number(process.env.NIGHTGATE_SYNC_FRESHNESS_MS || 300_000);
 const SYNC_POLL_MS = 3000;
 const wsleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
 
-/** Read the indexer's latest indexed block height — the genuine sync target. */
-async function getIndexerTipHeight(indexerHttpUrl: string): Promise<bigint | null> {
+/** The indexer's latest indexed block (height + timestamp, ms epoch). */
+async function getIndexerTip(indexerHttpUrl: string): Promise<{ height: bigint | null; timestampMs: number | null }> {
     try {
         const r = await fetch(indexerHttpUrl, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ query: '{ block { height } }' }),
+            body: JSON.stringify({ query: '{ block { height timestamp } }' }),
             signal: AbortSignal.timeout(15_000)
         });
         const j: any = await r.json();
-        const h = j?.data?.block?.height;
-        return h != null ? BigInt(h) : null;
+        const b = j?.data?.block;
+        return {
+            height: b?.height != null ? BigInt(b.height) : null,
+            timestampMs: b?.timestamp != null ? Number(b.timestamp) : null
+        };
+    } catch { return { height: null, timestampMs: null }; }
+}
+
+// One stream-tip probe per few seconds is plenty for a 3s poll loop.
+let dustTipCache: { tip: bigint; at: number } | null = null;
+
+/**
+ * The dust ledger-event stream's CURRENT tip (max id), read straight from the
+ * indexer via a one-shot graphql-transport-ws subscription: the stream's
+ * first backfill event carries `maxId`. This is the only reliable target for
+ * the dust sub-wallet's `appliedIndex` (live findings, preprod 2026-07-10):
+ *  - `dust.progress.highestIndex` stays 0 against the public indexers, so
+ *    the SDK itself never reports the stream tip;
+ *  - the Block end-indices are DIFFERENT series and do not match the
+ *    dustLedgerEvents ids (measured: dustGenerationEndIndex ~330k,
+ *    dustCommitmentEndIndex ~939k vs stream maxId ~1.262M).
+ * The ws URL is derived from the HTTP URL (.../graphql -> .../graphql/ws).
+ * Returns null on any failure; callers treat that as "tip unknown".
+ */
+async function getDustStreamTip(indexerHttpUrl: string): Promise<bigint | null> {
+    if (dustTipCache && Date.now() - dustTipCache.at < 10_000) return dustTipCache.tip;
+    const wsUrl = indexerHttpUrl.replace(/^http/, 'ws').replace(/\/+$/, '') + '/ws';
+    try {
+        const { default: WebSocket } = await import('ws');
+        const tip = await new Promise<bigint | null>((resolve) => {
+            const sock: any = new (WebSocket as any)(wsUrl, 'graphql-transport-ws');
+            let settled = false;
+            const done = (v: bigint | null) => {
+                if (settled) return;
+                settled = true;
+                clearTimeout(timer);
+                try { sock.close(); } catch { /* already closed */ }
+                resolve(v);
+            };
+            const timer = setTimeout(() => done(null), 10_000);
+            sock.on('open', () => sock.send(JSON.stringify({ type: 'connection_init' })));
+            sock.on('message', (buf: Buffer) => {
+                try {
+                    const m = JSON.parse(buf.toString());
+                    if (m.type === 'connection_ack') {
+                        sock.send(JSON.stringify({
+                            id: '1', type: 'subscribe',
+                            payload: { query: 'subscription { dustLedgerEvents(id: 0) { id maxId } }' }
+                        }));
+                    } else if (m.type === 'next') {
+                        const maxId = m.payload?.data?.dustLedgerEvents?.maxId;
+                        done(maxId != null ? BigInt(maxId) : null);
+                    } else if (m.type === 'error' || m.type === 'complete') {
+                        done(null);
+                    }
+                } catch { done(null); }
+            });
+            sock.on('error', () => done(null));
+            sock.on('close', () => done(null));
+        });
+        if (tip != null) dustTipCache = { tip, at: Date.now() };
+        return tip;
     } catch { return null; }
 }
 
 /**
- * GENUINE sync gate — does NOT trust the SDK's `isSynced` flag.
+ * GENUINE sync gate.
  *
- * When the wallet never receives a chain tip, `highestIndex` stays 0 and
- * `isSynced` is trivially true (`appliedIndex >= 0`) while the wallet is
- * actually 100k+ blocks behind. Balancing then spends dust whose merkle roots
- * have pruned out of the node's ~1h `root_history` → the node rejects the tx as
- * `Custom error 117` (NotNormalized / empty dust actions). See
- * docs / project memory for the full diagnosis.
+ * [2026-07-10 FIX] `dust.progress.appliedIndex` counts LEDGER EVENTS
+ * (the indexer's dustLedgerEvents id series), NOT blocks. The previous
+ * implementation compared it against the indexer's BLOCK height, a target
+ * the event series never reaches (preprod: ~1.26M events vs ~1.59M blocks).
+ * Result: every fully synced wallet looked like a silent "stall" at the
+ * event tip and the prewarm timed out. Root-cause analysis and minimal
+ * repro: docs/feature-requests/wallet-sync-stall-watchdog.md.
  *
- * Instead we poll the dust `progress.appliedIndex` against the indexer's REAL
- * tip height and return only when it genuinely catches up (within
- * SYNC_TIP_GAP) with `isConnected`. On timeout we throw a clear
- * "N blocks behind" error rather than letting a stale-dust tx hit 117.
- * `waitForSyncedState()` is used only to grab the current FacadeState snapshot
- * (its premature "synced" is fine — we read the numbers, not the flag).
+ * [2026-07-10 FIX 2, live-verified] `dust.progress.highestIndex` stays 0
+ * against the public indexers, so the SDK never reports the stream tip
+ * itself. The tip therefore comes from `getDustStreamTip` (a one-shot
+ * dustLedgerEvents probe whose first event carries `maxId`).
+ *
+ * The gate now checks, per poll:
+ *   1. `appliedIndex >= streamTip - SYNC_TIP_GAP` — caught up with the dust
+ *      stream's OWN tip, with `isConnected`.
+ *   2. `streamTip > 0` — guards the historical failure where a wallet that
+ *      never received a tip looked trivially synced.
+ *   3. The indexer's latest block timestamp is fresh (SYNC_FRESHNESS_MS).
+ *      This preserves the original guard motivation: a lagging self-hosted
+ *      indexer must not count as tip, or balancing spends dust whose merkle
+ *      roots pruned out of the node's ~1h root_history (Custom error 117).
+ *
+ * `waitForSyncedState()` is still not trusted; we read the numbers.
  */
 async function waitForGenuineSync(facade: any, indexerHttpUrl: string, timeoutMs: number, label: string): Promise<void> {
     const deadline = Date.now() + timeoutMs;
     let lastLog = 0;
     let lastApplied = -1n;
+    let lastHighest = -1n;
     while (Date.now() < deadline) {
-        const target = await getIndexerTipHeight(indexerHttpUrl);
+        const tip = await getIndexerTip(indexerHttpUrl);
         // [2026-06-28 FIX] Read state via the NON-BLOCKING facade.state() observable.
         // facade.waitForSyncedState() is Promise.all([... dust.waitForSyncedState() ...])
         // which only resolves once every sub-wallet isStrictlyComplete() — never true
@@ -373,22 +452,26 @@ async function waitForGenuineSync(facade: any, indexerHttpUrl: string, timeoutMs
         } catch { await wsleep(SYNC_POLL_MS); continue; }
         const p: any = state?.dust?.progress;
         const applied = p?.appliedIndex != null ? BigInt(p.appliedIndex) : -1n;
+        const streamTip = await getDustStreamTip(indexerHttpUrl);
+        const highest = streamTip ?? -1n;
         const connected = p?.isConnected === true;
+        const fresh = tip.timestampMs != null && Date.now() - tip.timestampMs <= SYNC_FRESHNESS_MS;
         lastApplied = applied;
-        if (target != null && applied >= 0n && connected && applied >= target - SYNC_TIP_GAP) {
-            log('info', `[worker] genuine-sync [${label}] CAUGHT UP: appliedIndex=${applied} target=${target}`);
+        lastHighest = highest;
+        if (connected && highest > 0n && applied >= 0n && applied >= highest - SYNC_TIP_GAP && fresh) {
+            log('info', `[worker] genuine-sync [${label}] CAUGHT UP: appliedIndex=${applied} streamTip=${highest} blockHeight=${tip.height} fresh=${fresh}`);
             return;
         }
         if (Date.now() - lastLog > 15_000) {
-            const behind = target != null && applied >= 0n ? (target - applied).toString() : '?';
-            log('info', `[worker] genuine-sync [${label}] appliedIndex=${applied} target=${target} behind=${behind} connected=${connected}`);
+            const behind = highest >= 0n && applied >= 0n ? (highest - applied).toString() : '?';
+            log('info', `[worker] genuine-sync [${label}] appliedIndex=${applied} streamTip=${highest} behindEvents=${behind} blockHeight=${tip.height} fresh=${fresh} connected=${connected}`);
             lastLog = Date.now();
         }
         await wsleep(SYNC_POLL_MS);
     }
-    const target = await getIndexerTipHeight(indexerHttpUrl);
-    const behind = target != null && lastApplied >= 0n ? (target - lastApplied).toString() : '?';
-    throw new Error(`wallet not synced to tip after ${timeoutMs}ms: dust appliedIndex=${lastApplied} target=${target} (${behind} blocks behind, isConnected check failed or stalled)`);
+    const tip = await getIndexerTip(indexerHttpUrl);
+    const behind = lastHighest >= 0n && lastApplied >= 0n ? (lastHighest - lastApplied).toString() : '?';
+    throw new Error(`wallet not synced to tip after ${timeoutMs}ms: dust appliedIndex=${lastApplied} streamTip=${lastHighest} (${behind} events behind, blockHeight=${tip.height}, isConnected/freshness check failed or stalled)`);
 }
 
 function buildWorkerWalletProvider(entry: FacadeEntry): any {
