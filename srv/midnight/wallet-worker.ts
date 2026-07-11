@@ -474,6 +474,43 @@ async function waitForGenuineSync(facade: any, indexerHttpUrl: string, timeoutMs
     throw new Error(`wallet not synced to tip after ${timeoutMs}ms: dust appliedIndex=${lastApplied} streamTip=${lastHighest} (${behind} events behind, blockHeight=${tip.height}, isConnected/freshness check failed or stalled)`);
 }
 
+/**
+ * Pre-submit diagnostic dump: summarizes every intent's dust section of a
+ * balanced/proven transaction. Node error `1010 Custom error: 117`
+ * (NotNormalized) has exactly one dust-related trigger in the ledger: a
+ * DustActions section whose spends AND registrations are both empty
+ * (midnight-ledger dust.rs "non-canonical dust actions: empty"). This dump
+ * makes the next 117 attributable: either the log shows an empty DustActions
+ * (balancer bug, wallet SDK Transacting.balanceTransactions attaches the
+ * section even for an empty recipe) or the malformation is elsewhere in the
+ * transaction. Never throws: diagnostics must not break the submit path.
+ */
+function describeTxDust(tx: any): { summary: string; emptyDustActions: boolean } {
+    try {
+        const parts: string[] = [];
+        let empty = false;
+        const intents = tx?.intents;
+        if (!intents || typeof intents.entries !== 'function') {
+            return { summary: 'no intents', emptyDustActions: false };
+        }
+        for (const [seg, intent] of intents.entries()) {
+            const da = intent?.dustActions;
+            if (!da) {
+                parts.push(`seg=${seg} dust=none`);
+                continue;
+            }
+            const spends = da.spends?.length ?? 0;
+            const regs = da.registrations?.length ?? 0;
+            const ctime = da.ctime instanceof Date ? da.ctime.toISOString() : String(da.ctime ?? '?');
+            parts.push(`seg=${seg} dust{spends=${spends} regs=${regs} ctime=${ctime}}`);
+            if (spends === 0 && regs === 0) empty = true;
+        }
+        return { summary: parts.join(' | ') || 'no intents', emptyDustActions: empty };
+    } catch (e) {
+        return { summary: `dump failed: ${(e as Error)?.message ?? e}`, emptyDustActions: false };
+    }
+}
+
 function buildWorkerWalletProvider(entry: FacadeEntry): any {
     return {
         getCoinPublicKey(): string { return entry.zswapKeys.coinPublicKey; },
@@ -503,9 +540,28 @@ function buildWorkerWalletProvider(entry: FacadeEntry): any {
                 { shieldedSecretKeys: entry.zswapKeys, dustSecretKey: entry.dustKey },
                 { ttl: effectiveTtl }
             );
-            return entry.facade.finalizeRecipe(recipe);
+            const finalized = await entry.facade.finalizeRecipe(recipe);
+            const dust = describeTxDust(finalized);
+            log('info', `[worker] balanced tx dust sections: ${dust.summary}`);
+            if (dust.emptyDustActions) {
+                // The node would reject this as 1010/117 (NotNormalized). Fail
+                // here instead: saves the proof round and pins the root cause
+                // (balancer emitted an empty DustActions = fee evaluated to 0).
+                throw new Error(
+                    'balanced transaction carries an EMPTY DustActions section ' +
+                    '(node would reject it as 1010 Custom error: 117 NotNormalized). ' +
+                    'The dust balancer produced an empty recipe, i.e. the computed ' +
+                    `fee was 0. Dust sections: ${dust.summary}`
+                );
+            }
+            return finalized;
         },
         async submitTx(tx: any): Promise<any> {
+            const dust = describeTxDust(tx);
+            log('info', `[worker] pre-submit tx dust sections: ${dust.summary}`);
+            if (dust.emptyDustActions) {
+                log('warn', `[worker] pre-submit tx has an EMPTY DustActions section (node rejects as 1010/117 NotNormalized): ${dust.summary}`);
+            }
             return entry.facade.submitTransaction(tx);
         }
     };
@@ -699,7 +755,14 @@ async function buildFacade(args: InitArgs): Promise<FacadeEntry> {
             indexerWsUrl: args.indexerWsUrl
         },
         txHistoryStorage,
-        costParameters: { additionalFeeOverhead: 0n, feeBlocksMargin: 1 }
+        // Fee floor: additionalFeeOverhead >= 1n guarantees the dust balancer
+        // never converges on an EMPTY recipe (fee 0 -> empty DustActions -> node
+        // 1010 Custom error: 117 NotNormalized, the only dust-related
+        // NotNormalized site in midnight-ledger dust.rs). feeBlocksMargin 5
+        // matches the wallet SDK's own e2e configuration; our previous margin 1
+        // sat on the 0/1-atom knife edge on quiet test networks. Overpayment is
+        // bounded by the overhead (1 atom, negligible vs typical balances).
+        costParameters: { additionalFeeOverhead: 1n, feeBlocksMargin: 5 }
     };
 
     const dustParameters = sdk.ledger.LedgerParameters.initialParameters().dust;

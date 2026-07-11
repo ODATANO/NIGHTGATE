@@ -185,84 +185,92 @@ export async function startJob<TIn, TOut>(
 
     const db = await cds.connect.to('db');
 
-    // Everything up to and including the row INSERT runs DETACHED from any
-    // transaction the CALLING action may still hold open (composition case:
-    // a consumer action calls startJob-backed actions internally instead of
-    // over HTTP). If the insert joined that ambient caller tx, three things
-    // break at once: (a) a caller that waits on the job inline starves it,
-    // because the spawned work cannot even markRunning until the caller's
-    // pooled connection frees up (live-diagnosed on preprod 2026-07-10 as
-    // "10-15 minutes per contract call": the job only started once the
-    // caller's own poll timeout rolled the request back); (b) a caller
-    // rollback orphans the spawned work: the job runs but its row is gone, so
-    // pollers 404 forever; (c) getJobStatus pollers on other connections do
-    // not see the row until the caller commits. Detaching makes the job row
-    // durable the moment startJob returns. The dedupe read consequently sees
-    // committed rows only, which is the meaningful scope for retries.
-    return await runWithoutAmbientTx(async () => {
-        if (idempotencyKey) {
-            const existing = await db.run(
-                SELECT.one.from(BackgroundJobs)
-                    .where({ sessionId, kind, idempotencyKey })
-                    .orderBy('createdAt desc')
-            );
-            if (existing && existing.status !== 'failed') {
-                return {
-                    jobId:  existing.ID,
-                    status: existing.status === 'succeeded' ? 'succeeded' : 'pending',
-                    result: existing.status === 'succeeded' && existing.result
-                        ? JSON.parse(existing.result) as TOut
-                        : undefined
-                };
-            }
-        }
-
-        const jobId = crypto.randomUUID();
-        await db.run(
-            INSERT.into(BackgroundJobs).entries({
-                ID:             jobId,
-                kind,
-                sessionId,
-                status:         'pending',
-                idempotencyKey: idempotencyKey || null,
-                request:        safeStringify(request)
-            })
+    // Idempotency dedupe: runs on the caller's tx so this read sees rows
+    // committed by prior requests but not in-flight ones in the same tx.
+    if (idempotencyKey) {
+        const existing = await db.run(
+            SELECT.one.from(BackgroundJobs)
+                .where({ sessionId, kind, idempotencyKey })
+                .orderBy('createdAt desc')
         );
+        if (existing && existing.status !== 'failed') {
+            return {
+                jobId:  existing.ID,
+                status: existing.status === 'succeeded' ? 'succeeded' : 'pending',
+                result: existing.status === 'succeeded' && existing.result
+                    ? JSON.parse(existing.result) as TOut
+                    : undefined
+            };
+        }
+    }
 
-        // Detach. The semaphore caps concurrent jobs of this kind. Each mutation
-        // inside the spawn uses its own short tx (see markRunning/Succeeded/Failed),
-        // so the spawn's top-level tx never acquires a pool connection.
-        const semaphore = getSemaphore(kind);
-        // First arg is an empty options object; `cds.spawn` typings require it,
-        // and the default behaviour (one-shot via setImmediate, no tenant, no
-        // interval) is exactly what we want.
-        cds.spawn({}, async () => {
-            await semaphore.acquire();
-            try {
-                await markRunning(jobId);
-                // CRITICAL: run `work()` with the ambient cds.context CLEARED.
-                //
-                // @cap-js/sqlite uses a single pooled connection (pool.max=1). If
-                // `work()` ran inside the spawn's transaction, the first db.run it
-                // makes (e.g. loadSyncState's SELECT during a facade build) would
-                // open a transaction on that ONE connection and hold it for the
-                // entire multi-minute-to-hours worker round-trip, starving every
-                // other query (periodic wallet-state saves, getJobStatus polls) at
-                // pool.acquire(). Clearing the context makes each db.run inside
-                // `work()` its own short acquire, commit, release cycle, so the
-                // connection stays free during the long awaits.
-                const result = await runWithoutAmbientTx(work);
-                await markSucceeded(jobId, result);
-            } catch (err) {
-                const classification = classifySubmissionError(err, getNetwork());
-                await markFailed(jobId, classification);
-            } finally {
-                semaphore.release();
+    // The INSERT stays on the caller's AMBIENT tx on purpose. CAP wraps every
+    // action handler in its own root tx, and handlers commonly WRITE before
+    // calling startJob (anchorDocument inserts its Documents row first), so
+    // that tx already holds the sqlite write lock. A detached insert here
+    // would wait on that very lock from a second connection while the handler
+    // waits on us: a deterministic self-deadlock, live-hit on 2026-07-10 as
+    // "database is locked" on every anchorDocument call. Instead the row
+    // simply commits together with the handler, and the SPAWN below waits
+    // until it is visible before touching it.
+    const jobId = crypto.randomUUID();
+    await db.run(
+        INSERT.into(BackgroundJobs).entries({
+            ID:             jobId,
+            kind,
+            sessionId,
+            status:         'pending',
+            idempotencyKey: idempotencyKey || null,
+            request:        safeStringify(request)
+        })
+    );
+
+    // Detach. The semaphore caps concurrent jobs of this kind. Each mutation
+    // inside the spawn uses its own short tx (see markRunning/Succeeded/Failed),
+    // so the spawn's top-level tx never acquires a pool connection.
+    const semaphore = getSemaphore(kind);
+    // First arg is an empty options object; `cds.spawn` typings require it,
+    // and the default behaviour (one-shot via setImmediate, no tenant, no
+    // interval) is exactly what we want.
+    cds.spawn({}, async () => {
+        await semaphore.acquire();
+        try {
+            // Wait until the caller's tx committed and the row is VISIBLE
+            // from a fresh connection. This solves the two failure modes a
+            // caller-joined insert would otherwise have: (a) a caller that
+            // holds its tx open while waiting inline no longer starves the
+            // job's first mutation (we wait READING, without holding any
+            // lock); (b) a caller ROLLBACK means the row never appears, and
+            // the work is skipped instead of running as an orphan no poller
+            // can see.
+            const visible = await waitForJobRowVisible(jobId, 10 * 60_000);
+            if (!visible) {
+                cds.log('nightgate').warn(`startJob(${kind}): job row ${jobId} never became visible (caller rolled back or is holding its tx for 10+ min); skipping work`);
+                return;
             }
-        });
-
-        return { jobId, status: 'pending' };
+            await markRunning(jobId);
+            // CRITICAL: run `work()` with the ambient cds.context CLEARED.
+            //
+            // @cap-js/sqlite uses a single pooled connection (pool.max=1). If
+            // `work()` ran inside the spawn's transaction, the first db.run it
+            // makes (e.g. loadSyncState's SELECT during a facade build) would
+            // open a transaction on that ONE connection and hold it for the
+            // entire multi-minute-to-hours worker round-trip, starving every
+            // other query (periodic wallet-state saves, getJobStatus polls) at
+            // pool.acquire(). Clearing the context makes each db.run inside
+            // `work()` its own short acquire, commit, release cycle, so the
+            // connection stays free during the long awaits.
+            const result = await runWithoutAmbientTx(work);
+            await markSucceeded(jobId, result);
+        } catch (err) {
+            const classification = classifySubmissionError(err, getNetwork());
+            await markFailed(jobId, classification);
+        } finally {
+            semaphore.release();
+        }
     });
+
+    return { jobId, status: 'pending' };
 }
 
 /**
@@ -275,6 +283,24 @@ export async function startJob<TIn, TOut>(
  */
 function runWithoutAmbientTx<T>(fn: () => Promise<T>): Promise<T> {
     return (cds as any)._with(undefined, fn);
+}
+
+/**
+ * Poll (from fresh short read txs) until the BackgroundJobs row is visible,
+ * i.e. the caller's transaction committed. Returns false on timeout, which
+ * means the caller rolled back (or holds its tx absurdly long) and the work
+ * must not run.
+ */
+async function waitForJobRowVisible(jobId: string, timeoutMs: number): Promise<boolean> {
+    const deadline = Date.now() + timeoutMs;
+    let delay = 100;
+    while (Date.now() < deadline) {
+        const row = await runWithoutAmbientTx(() => getJobById(jobId));
+        if (row) return true;
+        await new Promise(r => setTimeout(r, delay));
+        delay = Math.min(delay * 2, 2000);
+    }
+    return false;
 }
 
 /**
