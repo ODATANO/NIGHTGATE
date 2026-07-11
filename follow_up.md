@@ -68,3 +68,43 @@ Doable via the `scripts/integration-test-providers.mjs` pattern, but needs the l
 
 - **`npm audit`** shows 8 vulnerabilities (1 critical, 4 high, 3 moderate) in the Midnight SDK transitive tree. Review individually — **do not** blanket `npm audit fix`, as it may break SDK version pins.
 - **Pre-existing `TS7016`** on `@sap/cds` (the package ships no declaration file). Currently suppressed via `jest.config.js` `diagnostics.ignoreCodes` (alongside `TS2339` for CAP's dynamic `this.on()`). There is **no** `@types/sap__cds` package — don't try to install one. A real cleanup would need an ambient `.d.ts` shim. This is a known trip-hazard, not a bug.
+
+---
+
+## 6. Jest "did not exit" root cause (forceExit is a band-aid, 2026-07-11)
+
+`jest.config.js` now sets `forceExit: true` because the test process
+intermittently stayed alive after fully green runs ("Jest did not exit one
+second after the test run has completed"). Shipped this way to unblock the
+0.6.4 release. The current diagnosis is CIRCUMSTANTIAL and should be redone
+properly when there is time:
+
+**What is actually known (measured, 2026-07-11):**
+- All 54 suites / 863 tests pass; the hang is not a test failure.
+- Every SUBSET tried (WASM-loading suites, timer-heavy suites, both halves of
+  a full bisect, the full suite in parallel mode) exited cleanly in
+  isolation. Only full runs hang, and not deterministically: one full
+  `--detectOpenHandles` (runInBand) run hung reproducibly, while a later
+  plain full parallel run exited fine.
+- In the hung run, `--detectOpenHandles` reported NOTHING, i.e. whatever
+  keeps the event loop alive is invisible to Jest's async-hook based
+  detector (candidates: WASM/native threads from `@midnight-ntwrk/ledger-v8`,
+  `worker_threads`, child processes, or a native addon like better-sqlite3).
+- The "ledger WASM threads" explanation is an inference from these
+  observations, NOT a caught thread with a stack. No direct evidence.
+
+**How to nail it properly (next time):**
+1. Reproduce the hang (full `--runInBand` run seems most reliable), then
+   attach: `node --inspect` + CDT, or dump live handles at the end via a
+   `globalTeardown` that prints `process._getActiveHandles()` /
+   `process._getActiveRequests()` and `process.report.getReport()`
+   (`libuv` + thread sections show native threads the detector misses).
+2. Bisect by MODULE not by suite: stub `@midnight-ntwrk/ledger-v8` with a
+   jest moduleNameMapper in a trial run; if the hang disappears across many
+   repetitions, the WASM theory is confirmed; same trick for better-sqlite3.
+3. Check whether the hang correlates with the cap-db suite's runInBand-only
+   CDS boot flakiness (20 tests failed once under runInBand with "cds.entities
+   not yet defined", passed on the next identical run; possibly a shared-
+   process boot-order race that also leaves something alive).
+4. If confirmed upstream: file an FR against the wallet SDK for a WASM/worker
+   shutdown hook, then drop `forceExit`.
