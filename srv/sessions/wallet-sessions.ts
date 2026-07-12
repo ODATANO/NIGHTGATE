@@ -80,8 +80,7 @@ const diagnosticsRateLimiter = new RateLimiter({
 const MAX_NIGHT_AMOUNT_ATOMS = 10n ** 18n;
 
 /**
- * Mainnet submission gate (shared with the contract-submission handlers). Rejects
- * with 403 when network is mainnet and allowMainnetSubmission is not enabled.
+ * Mainnet submission gate. Rejects with 403 when network is mainnet and allowMainnetSubmission is not enabled.
  * Applied to the on-chain token/dust actions; read-only diagnostics are exempt.
  */
 function rejectIfMainnetBlocked(req: Request): boolean {
@@ -110,14 +109,13 @@ function parseNightAmount(raw: string | undefined): { ok: true; value: bigint } 
 }
 
 /**
- * Validate an optional ISO-8601 TTL string. Returns null on success
- * (including when omitted) or a user-facing error message.
+ * Validate an optional ISO-8601 TTL string. Returns null on success or a user-facing error message.
  */
 function validateOptionalTtl(ttlIso: string | undefined): string | null {
     if (!ttlIso) return null;
     const t = new Date(ttlIso);
     if (Number.isNaN(t.getTime())) return 'ttlIso must be a valid ISO-8601 timestamp';
-    if (t.getTime() <= Date.now())  return 'ttlIso must be in the future';
+    if (t.getTime() <= Date.now()) return 'ttlIso must be in the future';
     return null;
 }
 
@@ -150,9 +148,9 @@ async function loadSigningSessionAccountId(
     const session = await db.run(
         SELECT.one.from(WalletSessions).where({ sessionId, isActive: true, userId })
     );
-    if (!session)                       return { ok: false, status: 404, msg: 'Session not found or inactive' };
-    if (!session.encryptedViewingKey)   return { ok: false, status: 404, msg: 'Session has no viewing key' };
-    if (!session.encryptedSeedKey)      return { ok: false, status: 412, msg: 'Session has no signing key. Call connectWalletForSigning first.' };
+    if (!session) return { ok: false, status: 404, msg: 'Session not found or inactive' };
+    if (!session.encryptedViewingKey) return { ok: false, status: 404, msg: 'Session has no viewing key' };
+    if (!session.encryptedSeedKey) return { ok: false, status: 412, msg: 'Session has no signing key. Call connectWalletForSigning first.' };
     if (session.expiresAt && new Date(session.expiresAt) < new Date()) {
         return { ok: false, status: 410, msg: 'Session expired' };
     }
@@ -285,26 +283,26 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
         try {
             const viewingKey = decrypt(session.encryptedViewingKey, encKey);
             const accountId = deriveAccountId(viewingKey);
-            const syncPass  = deriveStoragePassword(viewingKey);
+            const syncPass = deriveStoragePassword(viewingKey);
             const nightgateConfig = getNightgatePluginConfig();
             const { network, nodeUrl, submissionEndpoints } = resolveNightgateRuntimeConfig(nightgateConfig);
 
             const facadeArgs = {
                 seedHex: bip39SeedHex,
-                networkId:           network,
-                indexerHttpUrl:      submissionEndpoints.indexerHttpUrl,
-                indexerWsUrl:        submissionEndpoints.indexerWsUrl,
-                proofServerUrl:      submissionEndpoints.proofServerUrl,
-                relayUrl:            nodeUrl,
+                networkId: network,
+                indexerHttpUrl: submissionEndpoints.indexerHttpUrl,
+                indexerWsUrl: submissionEndpoints.indexerWsUrl,
+                proofServerUrl: submissionEndpoints.proofServerUrl,
+                relayUrl: nodeUrl,
                 syncStatePassphrase: syncPass
             };
 
             const job = await startJob({
-                kind:           'connectWalletForSigning',
+                kind: 'connectWalletForSigning',
                 sessionId,
                 idempotencyKey,
                 // Strip the seed — request snapshots must never carry secrets.
-                request:        { sessionId, accountIdPrefix: accountId.slice(0, 16) },
+                request: { sessionId, accountIdPrefix: accountId.slice(0, 16) },
                 work: async () => {
                     await ensureNetworkId(network);
                     await getOrBuildWalletFacade(accountId, facadeArgs);
@@ -326,8 +324,8 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
             return {
                 sessionId,
                 signingEnabled: true,
-                prewarmJobId:   job.jobId,
-                prewarmStatus:  job.status
+                prewarmJobId: job.jobId,
+                prewarmStatus: job.status
             };
         } catch (err: any) {
             // The session UPDATE already committed (sync work above succeeded),
@@ -407,9 +405,9 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
         const session = await db.run(
             SELECT.one.from(WalletSessions).where({ sessionId, isActive: true, userId })
         );
-        if (!session)                       return req.reject(404, 'Session not found or inactive');
-        if (!session.encryptedViewingKey)   return req.reject(404, 'Session has no viewing key');
-        if (!session.encryptedSeedKey)      return req.reject(412, 'Session has no signing key. Call connectWalletForSigning first.');
+        if (!session) return req.reject(404, 'Session not found or inactive');
+        if (!session.encryptedViewingKey) return req.reject(404, 'Session has no viewing key');
+        if (!session.encryptedSeedKey) return req.reject(412, 'Session has no signing key. Call connectWalletForSigning first.');
         if (session.expiresAt && new Date(session.expiresAt) < new Date()) {
             return req.reject(410, 'Session expired');
         }
@@ -419,7 +417,7 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
         let seedHex: string;
         try {
             viewingKey = decrypt(session.encryptedViewingKey, encKey);
-            seedHex    = decrypt(session.encryptedSeedKey, encKey);
+            seedHex = decrypt(session.encryptedSeedKey, encKey);
         } catch {
             return req.reject(500, 'Failed to decrypt session keys (ENCRYPTION_KEY mismatch?)');
         }
@@ -427,36 +425,36 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
         const nightgateConfig = getNightgatePluginConfig();
         const { network, nodeUrl, submissionEndpoints } = resolveNightgateRuntimeConfig(nightgateConfig);
         const accountId = deriveAccountId(viewingKey);
-        const syncPass  = deriveStoragePassword(viewingKey);
+        const syncPass = deriveStoragePassword(viewingKey);
 
         // Detach the worker round-trip. Without this, `req.tx` stays open for
         // the entire cold sync (hours on preprod) and blocks unrelated DB ops,
         // since @cap-js/sqlite pools a single connection. See
         // `srv/submission/background-jobs.ts`.
         return startJob({
-            kind:           'registerForDustGeneration',
+            kind: 'registerForDustGeneration',
             sessionId,
             idempotencyKey,
-            request:        { sessionId, dustReceiverAddress: dustReceiverAddress || null },
+            request: { sessionId, dustReceiverAddress: dustReceiverAddress || null },
             work: async () => {
                 await ensureNetworkId(network);
                 const result = await registerNightUtxosForDust({
                     cacheKey: accountId,
                     seedHex,
                     facadeConfig: {
-                        networkId:           network,
-                        indexerHttpUrl:      submissionEndpoints.indexerHttpUrl,
-                        indexerWsUrl:        submissionEndpoints.indexerWsUrl,
-                        proofServerUrl:      submissionEndpoints.proofServerUrl,
-                        relayUrl:            nodeUrl,
+                        networkId: network,
+                        indexerHttpUrl: submissionEndpoints.indexerHttpUrl,
+                        indexerWsUrl: submissionEndpoints.indexerWsUrl,
+                        proofServerUrl: submissionEndpoints.proofServerUrl,
+                        relayUrl: nodeUrl,
                         syncStatePassphrase: syncPass
                     },
                     dustReceiverAddress: dustReceiverAddress || undefined
                 });
                 return {
-                    txId:                result.txId ?? '',
-                    registeredCount:     result.registeredCount,
-                    totalNightUtxos:     result.totalNightUtxos,
+                    txId: result.txId ?? '',
+                    registeredCount: result.registeredCount,
+                    totalNightUtxos: result.totalNightUtxos,
                     dustReceiverAddress: result.dustReceiverAddress
                 };
             }
@@ -482,9 +480,9 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
         const session = await db.run(
             SELECT.one.from(WalletSessions).where({ sessionId, isActive: true, userId })
         );
-        if (!session)                       return req.reject(404, 'Session not found or inactive');
-        if (!session.encryptedViewingKey)   return req.reject(404, 'Session has no viewing key');
-        if (!session.encryptedSeedKey)      return req.reject(412, 'Session has no signing key. Call connectWalletForSigning first.');
+        if (!session) return req.reject(404, 'Session not found or inactive');
+        if (!session.encryptedViewingKey) return req.reject(404, 'Session has no viewing key');
+        if (!session.encryptedSeedKey) return req.reject(412, 'Session has no signing key. Call connectWalletForSigning first.');
         if (session.expiresAt && new Date(session.expiresAt) < new Date()) {
             return req.reject(410, 'Session expired');
         }
@@ -500,16 +498,16 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
         const accountId = deriveAccountId(viewingKey);
 
         return startJob({
-            kind:           'deregisterFromDustGeneration',
+            kind: 'deregisterFromDustGeneration',
             sessionId,
             idempotencyKey,
-            request:        { sessionId },
+            request: { sessionId },
             work: async () => {
                 const result = await deregisterNightUtxosFromDust({ cacheKey: accountId });
                 return {
-                    txId:              result.txId ?? '',
+                    txId: result.txId ?? '',
                     deregisteredCount: result.deregisteredCount,
-                    totalNightUtxos:   result.totalNightUtxos
+                    totalNightUtxos: result.totalNightUtxos
                 };
             }
         });
@@ -533,9 +531,9 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
             idempotencyKey?: string;
         };
 
-        if (!sessionId)        return req.reject(400, 'sessionId is required');
-        if (!receiverAddress)  return req.reject(400, 'receiverAddress is required');
-        if (!amount)           return req.reject(400, 'amount is required');
+        if (!sessionId) return req.reject(400, 'sessionId is required');
+        if (!receiverAddress) return req.reject(400, 'receiverAddress is required');
+        if (!amount) return req.reject(400, 'amount is required');
 
         const hrpOK = receiverAddress.startsWith('mn_shield-addr_') || receiverAddress.startsWith('mn_addr_');
         if (!hrpOK) {
@@ -555,9 +553,9 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
         const session = await db.run(
             SELECT.one.from(WalletSessions).where({ sessionId, isActive: true, userId })
         );
-        if (!session)                       return req.reject(404, 'Session not found or inactive');
-        if (!session.encryptedViewingKey)   return req.reject(404, 'Session has no viewing key');
-        if (!session.encryptedSeedKey)      return req.reject(412, 'Session has no signing key. Call connectWalletForSigning first.');
+        if (!session) return req.reject(404, 'Session not found or inactive');
+        if (!session.encryptedViewingKey) return req.reject(404, 'Session has no viewing key');
+        if (!session.encryptedSeedKey) return req.reject(412, 'Session has no signing key. Call connectWalletForSigning first.');
         if (session.expiresAt && new Date(session.expiresAt) < new Date()) {
             return req.reject(410, 'Session expired');
         }
@@ -573,21 +571,21 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
         const accountId = deriveAccountId(viewingKey);
 
         return startJob({
-            kind:           'sendNight',
+            kind: 'sendNight',
             sessionId,
             idempotencyKey,
-            request:        { sessionId, receiverAddress, amount, ttlIso: ttlIso || null },
+            request: { sessionId, receiverAddress, amount, ttlIso: ttlIso || null },
             work: async () => {
                 const result = await sendNight({
-                    cacheKey:        accountId,
+                    cacheKey: accountId,
                     receiverAddress,
                     amount,
                     ttlIso
                 });
                 return {
-                    txId:            result.txId,
-                    toLedger:        result.toLedger,
-                    amount:          result.amount,
+                    txId: result.txId,
+                    toLedger: result.toLedger,
+                    amount: result.amount,
                     receiverAddress: result.receiverAddress
                 };
             }
@@ -620,9 +618,9 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
         const session = await db.run(
             SELECT.one.from(WalletSessions).where({ sessionId, isActive: true, userId })
         );
-        if (!session)                       return req.reject(404, 'Session not found or inactive');
-        if (!session.encryptedViewingKey)   return req.reject(404, 'Session has no viewing key');
-        if (!session.encryptedSeedKey)      return req.reject(412, 'Session has no signing key. Call connectWalletForSigning first.');
+        if (!session) return req.reject(404, 'Session not found or inactive');
+        if (!session.encryptedViewingKey) return req.reject(404, 'Session has no viewing key');
+        if (!session.encryptedSeedKey) return req.reject(412, 'Session has no signing key. Call connectWalletForSigning first.');
         if (session.expiresAt && new Date(session.expiresAt) < new Date()) {
             return req.reject(410, 'Session expired');
         }
@@ -638,10 +636,10 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
         const accountId = deriveAccountId(viewingKey);
 
         return startJob({
-            kind:           'unshieldFunds',
+            kind: 'unshieldFunds',
             sessionId,
             idempotencyKey,
-            request:        { sessionId, amount, ttlIso: ttlIso || null },
+            request: { sessionId, amount, ttlIso: ttlIso || null },
             work: async () => {
                 const result = await unshieldFunds({
                     cacheKey: accountId,
@@ -649,8 +647,8 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
                     ttlIso
                 });
                 return {
-                    txId:                      result.txId,
-                    amount:                    result.amount,
+                    txId: result.txId,
+                    amount: result.amount,
                     unshieldedReceiverAddress: result.unshieldedReceiverAddress
                 };
             }
@@ -683,9 +681,9 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
         const session = await db.run(
             SELECT.one.from(WalletSessions).where({ sessionId, isActive: true, userId })
         );
-        if (!session)                       return req.reject(404, 'Session not found or inactive');
-        if (!session.encryptedViewingKey)   return req.reject(404, 'Session has no viewing key');
-        if (!session.encryptedSeedKey)      return req.reject(412, 'Session has no signing key. Call connectWalletForSigning first.');
+        if (!session) return req.reject(404, 'Session not found or inactive');
+        if (!session.encryptedViewingKey) return req.reject(404, 'Session has no viewing key');
+        if (!session.encryptedSeedKey) return req.reject(412, 'Session has no signing key. Call connectWalletForSigning first.');
         if (session.expiresAt && new Date(session.expiresAt) < new Date()) {
             return req.reject(410, 'Session expired');
         }
@@ -701,10 +699,10 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
         const accountId = deriveAccountId(viewingKey);
 
         return startJob({
-            kind:           'shieldFunds',
+            kind: 'shieldFunds',
             sessionId,
             idempotencyKey,
-            request:        { sessionId, amount, ttlIso: ttlIso || null },
+            request: { sessionId, amount, ttlIso: ttlIso || null },
             work: async () => {
                 const result = await shieldFunds({
                     cacheKey: accountId,
@@ -712,8 +710,8 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
                     ttlIso
                 });
                 return {
-                    txId:                    result.txId,
-                    amount:                  result.amount,
+                    txId: result.txId,
+                    amount: result.amount,
                     shieldedReceiverAddress: result.shieldedReceiverAddress
                 };
             }
@@ -735,9 +733,9 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
         const session = await db.run(
             SELECT.one.from(WalletSessions).where({ sessionId, isActive: true, userId })
         );
-        if (!session)                       return req.reject(404, 'Session not found or inactive');
-        if (!session.encryptedViewingKey)   return req.reject(404, 'Session has no viewing key');
-        if (!session.encryptedSeedKey)      return req.reject(412, 'Session has no signing key. Call connectWalletForSigning first.');
+        if (!session) return req.reject(404, 'Session not found or inactive');
+        if (!session.encryptedViewingKey) return req.reject(404, 'Session has no viewing key');
+        if (!session.encryptedSeedKey) return req.reject(412, 'Session has no signing key. Call connectWalletForSigning first.');
         if (session.expiresAt && new Date(session.expiresAt) < new Date()) {
             return req.reject(410, 'Session expired');
         }
@@ -775,8 +773,8 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
             ttlIso?: string;
         };
 
-        if (!sessionId)        return req.reject(400, 'sessionId is required');
-        if (!receiverAddress)  return req.reject(400, 'receiverAddress is required');
+        if (!sessionId) return req.reject(400, 'sessionId is required');
+        if (!receiverAddress) return req.reject(400, 'receiverAddress is required');
         const hrpOK = receiverAddress.startsWith('mn_shield-addr_') || receiverAddress.startsWith('mn_addr_');
         if (!hrpOK) {
             return req.reject(400,
@@ -790,9 +788,9 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
         const session = await db.run(
             SELECT.one.from(WalletSessions).where({ sessionId, isActive: true, userId })
         );
-        if (!session)                       return req.reject(404, 'Session not found or inactive');
-        if (!session.encryptedViewingKey)   return req.reject(404, 'Session has no viewing key');
-        if (!session.encryptedSeedKey)      return req.reject(412, 'Session has no signing key. Call connectWalletForSigning first.');
+        if (!session) return req.reject(404, 'Session not found or inactive');
+        if (!session.encryptedViewingKey) return req.reject(404, 'Session has no viewing key');
+        if (!session.encryptedSeedKey) return req.reject(412, 'Session has no signing key. Call connectWalletForSigning first.');
         if (session.expiresAt && new Date(session.expiresAt) < new Date()) {
             return req.reject(410, 'Session expired');
         }
@@ -856,7 +854,7 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
     }
 
     srv.on('estimateUnshieldFee', req => handleSwapEstimate(req, 'unshield', estimateUnshieldFee));
-    srv.on('estimateShieldFee',   req => handleSwapEstimate(req, 'shield',   estimateShieldFee));
+    srv.on('estimateShieldFee', req => handleSwapEstimate(req, 'shield', estimateShieldFee));
 }
 
 /**

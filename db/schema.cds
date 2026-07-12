@@ -48,13 +48,13 @@ entity Transactions : cuid, managed {
     raw                      : LargeBinary; // hex-encoded serialized content
     transactionType          : TransactionType not null;
 
-    // Regular Transaction specific fields
+    // regular transaction specific fields
     merkleTreeRoot           : HexEncoded;
     startIndex               : Integer64; // zswap state start index
     endIndex                 : Integer64; // zswap state end index
     identifiers              : LargeString; // JSON array of HexEncoded identifiers
 
-    // Classification fields (populated by Crawler / BlockProcessor)
+    // classification fields
     txType                   : TxType;
     isShielded               : Boolean default false;
     senderAddress            : String(256); // For unshielded TXs
@@ -67,7 +67,7 @@ entity Transactions : cuid, managed {
     circuitName              : String(100); // Entry point / circuit name for contract calls
     size                     : Integer; // TX size in bytes
 
-    // Associations
+    // tx associations
     block                    : Association to Blocks not null;
     transactionResult        : Composition of one TransactionResults
                                    on transactionResult.transaction = $self;
@@ -306,6 +306,8 @@ entity WalletSyncStates {
         unshieldedStateBlob : LargeString;
         dustStateBlob       : LargeString;
         sdkVersion          : String(64) not null;
+        networkId           : String(32);
+        seedFingerprint     : String(64);
         createdAt           : Timestamp;
         updatedAt           : Timestamp;
 }
@@ -395,9 +397,9 @@ entity DisclosureGrants : cuid, managed {
  */
 entity GranteeIdentities : cuid, managed {
     userId      : String(200) not null; // matches req.user.id from CAP auth
-    granteeId   : HexEncoded not null;  // Bytes<32> grantee id (64 hex)
-    bindingKind : String(20) not null;  // 'wallet' | 'did' | 'custom'
-    scope       : String(500);          // optional: contract addr / attestation id
+    granteeId   : HexEncoded not null; // Bytes<32> grantee id (64 hex)
+    bindingKind : String(20) not null; // 'wallet' | 'did' | 'custom'
+    scope       : String(500); // optional: contract addr / attestation id
 }
 
 /**

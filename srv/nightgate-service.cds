@@ -561,6 +561,7 @@ service NightgateService {
     /**
      * Wallet session management
      */
+    @readonly
     entity WalletSessions            as
         projection on midnight.WalletSessions
         excluding {

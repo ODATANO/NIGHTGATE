@@ -42,6 +42,7 @@ import {
     getWalletSdkVersion
 } from './wallet-sync-state-store';
 import { formatErr } from '../utils/format-error';
+import nodeCrypto from 'node:crypto';
 
 // Opt-in facade-restore diagnostics (off by default; enable with
 // NIGHTGATE_DEBUG_WALLET_SYNC=true). Keeps the plugin quiet on a consumer's stdout.
@@ -99,6 +100,22 @@ interface SessionRecord {
     passphrase: string;
     /** AccountId (same as cacheKey) used as DB key. */
     accountId: string;
+    /** Network the facade was built for; persisted with every save so a
+     *  restore on a different network cold-starts instead of poisoning. */
+    networkId: string;
+    /** HMAC fingerprint of the signing seed; persisted with every save so a
+     *  restore with a DIFFERENT seed (blobs of wallet A into a facade running
+     *  wallet B's keys) cold-starts instead of corrupting. */
+    seedFingerprint: string;
+}
+
+const SEED_FINGERPRINT_LABEL = 'nightgate-seed-fingerprint-v1';
+
+/** Stable, non-reversible fingerprint of the bip39 seed hex. */
+export function seedFingerprintOf(seedHex: string): string {
+    return nodeCrypto.createHmac('sha256', SEED_FINGERPRINT_LABEL)
+        .update(Buffer.from(seedHex, 'hex'))
+        .digest('hex');
 }
 
 const sessionRegistry = new Map<string, SessionRecord>();
@@ -119,11 +136,14 @@ export async function getOrBuildWalletFacade(
     // Attempt to restore from CAP-persisted state. Main thread is no longer
     // blocked by the SDK, so this is a plain `db.run(SELECT)` call.
     let restoreBlobs: { shielded?: string; unshielded?: string; dust?: string } | undefined;
+    const seedFingerprint = seedFingerprintOf(args.seedHex);
     if (args.syncStatePassphrase) {
         const loaded = await loadSyncState({
             accountId:          cacheKey,
             passphrase:         args.syncStatePassphrase,
-            expectedSdkVersion: getWalletSdkVersion()
+            expectedSdkVersion: getWalletSdkVersion(),
+            expectedNetworkId:  args.networkId,
+            expectedSeedFingerprint: seedFingerprint
         });
         if (loaded) {
             restoreBlobs = {
@@ -159,8 +179,10 @@ export async function getOrBuildWalletFacade(
 
     if (args.syncStatePassphrase) {
         sessionRegistry.set(cacheKey, {
-            passphrase: args.syncStatePassphrase,
-            accountId:  cacheKey
+            passphrase:      args.syncStatePassphrase,
+            accountId:       cacheKey,
+            networkId:       args.networkId,
+            seedFingerprint
         });
     }
 
@@ -176,11 +198,17 @@ export async function getOrBuildWalletFacade(
  * Tell the worker to drop and final-save the facade for this cacheKey.
  */
 export async function evictWalletFacade(cacheKey: string): Promise<void> {
-    sessionRegistry.delete(cacheKey);
+    // Evict FIRST, delete the registry entry AFTER: the worker's final
+    // `state-save` push arrives while the evict RPC is in flight, and the
+    // save sink drops events whose session is no longer registered. Deleting
+    // up front made the final save deterministically lost (v0.6.5 and
+    // earlier); this order lets it persist.
     try {
         await walletEvict(cacheKey);
     } catch (err) {
         console.warn(`[facade] evict failed for ${cacheKey.slice(0, 16)}:`, formatErr(err));
+    } finally {
+        sessionRegistry.delete(cacheKey);
     }
 }
 
@@ -208,15 +236,19 @@ export function wireWorkerStateSaveSink(): void {
                 `[facade-persist] DROPPED save for ${event.sessionId.slice(0, 16)}: ` +
                 `no session in registry (known: [${Array.from(sessionRegistry.keys()).map(k => k.slice(0, 16)).join(',')}])`
             );
-            return;
+            // Throw so the drop is NOT acked: the worker keeps the blobs
+            // marked unsaved and retries on a later tick.
+            throw new Error('state-save dropped: session not registered');
         }
         console.log(`[facade-persist] received save for ${event.sessionId.slice(0, 16)}, persisting...`);
         try {
             await saveSyncState({
-                accountId:  session.accountId,
-                passphrase: session.passphrase,
-                sdkVersion: event.sdkVersion,
-                states:     event.blobs
+                accountId:       session.accountId,
+                passphrase:      session.passphrase,
+                sdkVersion:      event.sdkVersion,
+                states:          event.blobs,
+                networkId:       session.networkId,
+                seedFingerprint: session.seedFingerprint
             });
             const sizes = [
                 event.blobs.shielded   ? `sh=${event.blobs.shielded.length}`   : 'sh=-',
@@ -226,6 +258,9 @@ export function wireWorkerStateSaveSink(): void {
             console.log(`[facade-persist] saved ${event.sessionId.slice(0, 16)} ${sizes}`);
         } catch (err) {
             console.warn(`[facade-persist] save failed for ${event.sessionId.slice(0, 16)}:`, formatErr(err));
+            // Rethrow so the worker-client does NOT ack this save; the worker
+            // keeps its lastSavedBlobs stale and re-pushes on the next tick.
+            throw err;
         }
     });
 }

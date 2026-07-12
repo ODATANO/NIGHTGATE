@@ -71,6 +71,13 @@ interface FacadeEntry {
     dustKey: any;
     unshieldedKeystore: any;
     saveTimer?: NodeJS.Timeout;
+    /** Blobs of the last save the MAIN THREAD CONFIRMED it persisted. The
+     *  unchanged-skip in the save tick compares against this, so a failed or
+     *  dropped persist is re-pushed on the next tick instead of being
+     *  stranded until the state happens to change again (v0.6.6). */
+    lastSavedBlobs?: { shielded?: string; unshielded?: string; dust?: string };
+    /** In-flight saves by sequence number, resolved by `state-save-ack`. */
+    pendingSaves?: Map<number, { shielded?: string; unshielded?: string; dust?: string }>;
     networkId: string;
     /** Indexer GraphQL HTTP URL — used to read the genuine sync target (tip). */
     indexerHttpUrl: string;
@@ -808,9 +815,36 @@ async function buildFacade(args: InitArgs): Promise<FacadeEntry> {
 
 // ---- Periodic state save (pushed to main thread) -------------------------
 
+let saveSeqCounter = 0;
+
+/**
+ * Push a state-save to the main thread. `lastSavedBlobs` is only advanced by
+ * the corresponding `state-save-ack` (see the parentPort dispatcher), so a
+ * failed or dropped persist keeps the blobs "unsaved" and they are re-pushed
+ * on the next tick.
+ */
+function pushStateSave(sessionId: string, entry: FacadeEntry, blobs: { shielded?: string; unshielded?: string; dust?: string }): number {
+    const seq = ++saveSeqCounter;
+    entry.pendingSaves ??= new Map();
+    entry.pendingSaves.set(seq, blobs);
+    // Bound the in-flight map: acks normally clear entries; if main never
+    // acks (persist layer down), keep only the most recent few.
+    if (entry.pendingSaves.size > 4) {
+        const oldest = Math.min(...entry.pendingSaves.keys());
+        entry.pendingSaves.delete(oldest);
+    }
+    parentPort?.postMessage({
+        kind: 'state-save',
+        sessionId,
+        sdkVersion: entry.sdkVersion,
+        seq,
+        blobs
+    });
+    return seq;
+}
+
 function startPeriodicSave(sessionId: string, entry: FacadeEntry): void {
     if (entry.saveTimer) return;
-    let lastBlobs: { shielded?: string; unshielded?: string; dust?: string } = {};
     let tickCount = 0;
     log('info', `[worker] periodic-save interval armed for ${sessionId.slice(0, 16)}`);
     entry.saveTimer = setInterval(async () => {
@@ -831,24 +865,20 @@ function startPeriodicSave(sessionId: string, entry: FacadeEntry): void {
             log('info', `[worker] save-tick #${tickCount} collect returned in ${collectMs}ms: ${shape}`);
 
             if (!hasAnyBlob(blobs)) return;
-            // Skip push if nothing changed since last tick — avoids burning
-            // CAP write cycles when wallet is fully synced and idle.
+            // Skip push only if the CONFIRMED-saved blobs are identical —
+            // avoids burning CAP write cycles when the wallet is synced and
+            // idle, without stranding a save whose persist failed.
+            const saved = entry.lastSavedBlobs ?? {};
             if (
-                blobs.shielded === lastBlobs.shielded &&
-                blobs.unshielded === lastBlobs.unshielded &&
-                blobs.dust === lastBlobs.dust
+                blobs.shielded === saved.shielded &&
+                blobs.unshielded === saved.unshielded &&
+                blobs.dust === saved.dust
             ) {
                 log('info', `[worker] save-tick #${tickCount} unchanged, skipping push`);
                 return;
             }
-            lastBlobs = blobs;
-            parentPort?.postMessage({
-                kind: 'state-save',
-                sessionId,
-                sdkVersion: entry.sdkVersion,
-                blobs
-            });
-            log('info', `[worker] save-tick #${tickCount} pushed (total ${Date.now() - tickStart}ms)`);
+            const seq = pushStateSave(sessionId, entry, blobs);
+            log('info', `[worker] save-tick #${tickCount} pushed seq=${seq} (total ${Date.now() - tickStart}ms)`);
         } catch (err: any) {
             log('warn', `[worker] periodic save failed: ${formatErr(err)}`);
         }
@@ -920,12 +950,7 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
         try {
             const blobs = await collectSerializedStates(entry.facade);
             if (hasAnyBlob(blobs)) {
-                parentPort?.postMessage({
-                    kind: 'state-save',
-                    sessionId,
-                    sdkVersion: entry.sdkVersion,
-                    blobs
-                });
+                pushStateSave(sessionId, entry, blobs);
             }
         } catch (err) {
             log('warn', `[worker] evict final-save failed for ${sessionId.slice(0, 16)}: ${formatErr(err)}`);
@@ -1575,6 +1600,18 @@ if (!parentPort) {
 }
 
 parentPort.on('message', async (msg: any) => {
+    if (msg?.kind === 'state-save-ack') {
+        // Main thread confirmed it persisted save `seq`: advance the
+        // confirmed-saved blobs so the tick's unchanged-skip applies. An
+        // entry evicted in the meantime is simply ignored.
+        const entry = facades.get(String(msg.sessionId ?? ''));
+        const blobs = entry?.pendingSaves?.get(msg.seq);
+        if (entry && blobs) {
+            entry.lastSavedBlobs = blobs;
+            entry.pendingSaves!.delete(msg.seq);
+        }
+        return;
+    }
     if (msg?.kind !== 'rpc' || !msg.port) {
         log('warn', `[worker] unexpected message: ${JSON.stringify(msg).slice(0, 80)}`);
         return;

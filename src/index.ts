@@ -111,6 +111,11 @@ async function ensureSchemaDeployed(): Promise<void> {
     }
 }
 
+/**
+ * Initialize the Nightgate indexer. Idempotent; safe to call repeatedly.
+ * Returns the current status, which may be "offline" if the crawler failed to
+ * start (e.g. node unreachable) or "idle" if the crawler is disabled in config.
+ */
 export async function initialize(): Promise<NightgateIndexerStatus> {
     await ensureNightgateModelLoaded();
 
@@ -235,6 +240,10 @@ export async function initialize(): Promise<NightgateIndexerStatus> {
     return getStatus();
 }
 
+/**
+ * Shut down the Nightgate indexer. Idempotent; safe to call repeatedly.
+ * Returns the current status, which will be "idle" after shutdown.
+ */
 export async function shutdown(): Promise<void> {
     try {
         await stopCrawler();
@@ -260,6 +269,9 @@ export async function shutdown(): Promise<void> {
     };
 }
 
+/**
+    * Return the last known status of the Nightgate indexer
+ */
 export function getStatus(): NightgateIndexerStatus {
     return { ...lastStatus };
 }

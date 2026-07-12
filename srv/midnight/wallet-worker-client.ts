@@ -40,6 +40,9 @@ export interface SerializedBlobs {
 export type StateSaveSink = (event: {
     sessionId: string;
     sdkVersion: string;
+    /** Save sequence number; echoed back to the worker as `state-save-ack`
+     *  when (and only when) the sink persisted successfully. */
+    seq?: number;
     blobs: SerializedBlobs;
 }) => void | Promise<void>;
 
@@ -136,7 +139,15 @@ export async function startWalletWorker(): Promise<void> {
     // ports allocated per call.
     worker.on('message', (msg: any) => {
         if (msg?.kind === 'state-save') {
-            client?.stateSaveSink?.(msg);
+            // Ack ONLY when the sink persisted successfully: the worker
+            // advances its confirmed-saved blobs on ack, so a failed persist
+            // is re-pushed on the next save tick instead of being stranded.
+            Promise.resolve()
+                .then(() => client?.stateSaveSink?.(msg))
+                .then(() => {
+                    if (msg.seq != null) worker.postMessage({ kind: 'state-save-ack', sessionId: msg.sessionId, seq: msg.seq });
+                })
+                .catch(() => { /* no ack; sink already logged the failure */ });
         } else if (msg?.kind === 'log') {
             if (msg.level === 'warn') console.warn(msg.message);
             else                       console.log(msg.message);

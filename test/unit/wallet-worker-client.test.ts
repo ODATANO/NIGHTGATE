@@ -236,14 +236,31 @@ describe('wallet-worker-client', () => {
     });
 
     describe('push-event dispatch', () => {
-        it('forwards state-save events to the registered sink', async () => {
+        it('forwards state-save events to the registered sink and acks on success', async () => {
             await startWalletWorker();
             const w = latestWorker!;
-            const sink = jest.fn();
+            const sink = jest.fn().mockResolvedValue(undefined);
             setStateSaveSink(sink);
+            const pmSpy = jest.spyOn(w, 'postMessage');
 
-            w.emit('message', { kind: 'state-save', sessionId: 's1', sdkVersion: 'v', blobs: {} });
-            expect(sink).toHaveBeenCalledWith(expect.objectContaining({ sessionId: 's1' }));
+            w.emit('message', { kind: 'state-save', sessionId: 's1', sdkVersion: 'v', seq: 7, blobs: {} });
+            // v0.6.6: the sink runs on a microtask (its result gates the ack).
+            await new Promise(r => setImmediate(r));
+            expect(sink).toHaveBeenCalledWith(expect.objectContaining({ sessionId: 's1', seq: 7 }));
+            expect(pmSpy).toHaveBeenCalledWith({ kind: 'state-save-ack', sessionId: 's1', seq: 7 });
+        });
+
+        it('does NOT ack a state-save whose sink rejects', async () => {
+            await startWalletWorker();
+            const w = latestWorker!;
+            const sink = jest.fn().mockRejectedValue(new Error('persist down'));
+            setStateSaveSink(sink);
+            const pmSpy = jest.spyOn(w, 'postMessage');
+
+            w.emit('message', { kind: 'state-save', sessionId: 's2', sdkVersion: 'v', seq: 8, blobs: {} });
+            await new Promise(r => setImmediate(r));
+            expect(sink).toHaveBeenCalled();
+            expect(pmSpy).not.toHaveBeenCalledWith(expect.objectContaining({ kind: 'state-save-ack', seq: 8 }));
         });
 
         it('relays "log" messages to console.log / console.warn by level', async () => {

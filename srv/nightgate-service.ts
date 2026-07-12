@@ -25,10 +25,7 @@ export default class NightgateService extends cds.ApplicationService {
         await ensureNightgateModelLoaded();
         this.db = await cds.connect.to('db');
 
-        // ====================================================================
-        // Block Handlers
-        // ====================================================================
-
+        // Blocks
         this.on('READ', 'Blocks', async (req: Request) => {
             return await this.db.run(req.query) || [];
         });
@@ -79,9 +76,7 @@ export default class NightgateService extends cds.ApplicationService {
             );
         });
 
-        // ====================================================================
-        // Transaction Handlers
-        // ====================================================================
+        // Transactions
 
         this.on('READ', 'Transactions', async (req: Request) => {
             return await this.db.run(req.query) || [];
@@ -106,10 +101,7 @@ export default class NightgateService extends cds.ApplicationService {
             );
         });
 
-        // ====================================================================
-        // Contract Handlers
-        // ====================================================================
-
+        // Contracts
         this.on('READ', 'ContractActions', async (req: Request) => {
             return await this.db.run(req.query) || [];
         });
@@ -133,10 +125,7 @@ export default class NightgateService extends cds.ApplicationService {
             );
         });
 
-        // ====================================================================
-        // UTXO Handlers
-        // ====================================================================
-
+        // UTXOs
         this.on('READ', 'UnshieldedUtxos', async (req: Request) => {
             return await this.db.run(req.query) || [];
         });
@@ -153,9 +142,7 @@ export default class NightgateService extends cds.ApplicationService {
             );
         });
 
-        // ====================================================================
-        // Balance & Token Tracking Handlers
-        // ====================================================================
+        // Balance & Token Tracking
 
         this.on('getBalance', 'NightBalances', async (req: Request) => {
             const { address } = req.data as { address: string };
@@ -175,17 +162,10 @@ export default class NightgateService extends cds.ApplicationService {
             );
         });
 
-        // ====================================================================
         // Wallet Sessions (delegated)
-        // ====================================================================
 
         registerWalletSessionHandlers(this, this.db);
 
-        // Raw entity READ surface is owner-scoped: sessions belong to the
-        // principal that created them (review_001 P1); admins see everything.
-        // The projection already excludes the encrypted keys, but session
-        // metadata (sessionId is a correlation token) must not leak across
-        // users either.
         this.before('READ', 'WalletSessions', (req: Request) => {
             const user: any = (req as any).user;
             if (user?.is?.('admin')) return;
@@ -194,9 +174,7 @@ export default class NightgateService extends cds.ApplicationService {
             (req.query as any).where({ userId });
         });
 
-        // ====================================================================
         // Submission actions: deployContract, submitContractCall
-        // ====================================================================
 
         // Owner-scoped like WalletSessions: submissions carry no userId, so
         // the caller's sessions are resolved first and the read is limited to
@@ -218,9 +196,7 @@ export default class NightgateService extends cds.ApplicationService {
 
         registerSubmissionHandlers(this, this.db);
 
-        // ====================================================================
-        // Background Jobs (0.2.0 async submission lifecycle)
-        // ====================================================================
+        // Background Jobs
 
         this.on('getJobStatus', async (req: Request) => {
             const { jobId, sessionId } = req.data as { jobId?: string; sessionId?: string };
@@ -228,18 +204,13 @@ export default class NightgateService extends cds.ApplicationService {
             if (!sessionId) return req.reject(400, 'sessionId is required');
 
             const job = await getJobById(jobId);
-            // 404 on foreign sessionId — same shape as not-found so a probe
-            // for someone else's jobId can't distinguish "unknown" from
-            // "exists but not yours".
+            // 404 on foreign sessionId: same shape as not-found so a probe
+            // cannot leak existence of a job owned by another session.
             if (!job || job.sessionId !== sessionId) {
                 return req.reject(404, 'Job not found');
             }
 
-            // Ownership: the session that owns this job must belong to the
-            // caller. Sessions are user-bound (review_001 P1) and are never
-            // hard-deleted (disconnect/expiry flip isActive but keep the row +
-            // userId), so a persisted mismatch is authoritative. Same 404 shape
-            // to avoid leaking existence.
+            // The session that owns this job must belong to the caller.
             const sess: any = await this.db.run(
                 cds.ql.SELECT.one.from(WalletSessions).columns('userId').where({ sessionId })
             );
@@ -259,18 +230,6 @@ export default class NightgateService extends cds.ApplicationService {
                 startedAt: job.startedAt,
                 finishedAt: job.finishedAt
             };
-        });
-
-        // ====================================================================
-        // Read-only Enforcement
-        // ====================================================================
-
-        this.before(['CREATE', 'UPDATE', 'DELETE'], [
-            'Blocks', 'Transactions', 'ContractActions', 'UnshieldedUtxos',
-            'ZswapLedgerEvents', 'DustLedgerEvents',
-            'NightBalances', 'WalletSessions', 'PendingSubmissions'
-        ], (req: Request) => {
-            req.reject?.(405, 'Blockchain data is read-only');
         });
 
         // Session cleanup timer

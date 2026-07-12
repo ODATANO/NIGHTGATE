@@ -47,12 +47,22 @@ export interface SaveSyncStateArgs {
     passphrase:  string;
     sdkVersion:  string;
     states:      SerializedWalletStates;
+    /** Network the state belongs to (guards cross-network restore). */
+    networkId?:  string;
+    /** Fingerprint of the signing seed (guards cross-wallet restore). */
+    seedFingerprint?: string;
 }
 
 export interface LoadSyncStateArgs {
     accountId:        string;
     passphrase:       string;
     expectedSdkVersion: string;
+    /** When set and the stored row carries a DIFFERENT networkId, the load
+     *  returns null (cold start) instead of restoring cross-network state. */
+    expectedNetworkId?: string;
+    /** When set and the stored row carries a DIFFERENT seed fingerprint, the
+     *  load returns null instead of restoring another wallet's state. */
+    expectedSeedFingerprint?: string;
 }
 
 export interface LoadedSyncState {
@@ -89,7 +99,7 @@ const saveMutex = new Map<string, Promise<void>>();
  * later writes always win.
  */
 export async function saveSyncState(args: SaveSyncStateArgs): Promise<void> {
-    const { accountId, passphrase, sdkVersion, states } = args;
+    const { accountId, passphrase, sdkVersion, states, networkId, seedFingerprint } = args;
     if (!accountId)   throw new Error('saveSyncState: accountId is required');
     if (!passphrase)  throw new Error('saveSyncState: passphrase is required');
     if (!sdkVersion)  throw new Error('saveSyncState: sdkVersion is required');
@@ -127,6 +137,8 @@ export async function saveSyncState(args: SaveSyncStateArgs): Promise<void> {
                         unshieldedStateBlob: unshieldedCipher ?? existing.unshieldedStateBlob,
                         dustStateBlob:       dustCipher       ?? existing.dustStateBlob,
                         sdkVersion,
+                        networkId:           networkId       ?? existing.networkId,
+                        seedFingerprint:     seedFingerprint ?? existing.seedFingerprint,
                         updatedAt:           now
                     })
                     .where({ accountId })
@@ -141,6 +153,8 @@ export async function saveSyncState(args: SaveSyncStateArgs): Promise<void> {
                     unshieldedStateBlob: unshieldedCipher,
                     dustStateBlob:       dustCipher,
                     sdkVersion,
+                    networkId:           networkId ?? null,
+                    seedFingerprint:     seedFingerprint ?? null,
                     createdAt:           now,
                     updatedAt:           now
                 })
@@ -176,7 +190,7 @@ export async function saveSyncState(args: SaveSyncStateArgs): Promise<void> {
  * sync from genesis.
  */
 export async function loadSyncState(args: LoadSyncStateArgs): Promise<LoadedSyncState | null> {
-    const { accountId, passphrase, expectedSdkVersion } = args;
+    const { accountId, passphrase, expectedSdkVersion, expectedNetworkId, expectedSeedFingerprint } = args;
     if (!accountId)         throw new Error('loadSyncState: accountId is required');
     if (!passphrase)        throw new Error('loadSyncState: passphrase is required');
     if (!expectedSdkVersion) throw new Error('loadSyncState: expectedSdkVersion is required');
@@ -188,6 +202,23 @@ export async function loadSyncState(args: LoadSyncStateArgs): Promise<LoadedSync
     if (!row) return null;
 
     if (row.sdkVersion !== expectedSdkVersion) {
+        return null;
+    }
+    // Guard rails: a stored row from a different network or a different seed
+    // must NEVER be restored (cross-network/cross-wallet state poisons the
+    // facade). Rows written before these columns existed have null and pass.
+    if (expectedNetworkId && row.networkId && row.networkId !== expectedNetworkId) {
+        console.warn(
+            `[load-sync-state] refusing restore for ${accountId.slice(0, 16)}: ` +
+            `stored networkId '${row.networkId}' != expected '${expectedNetworkId}' (cold start)`
+        );
+        return null;
+    }
+    if (expectedSeedFingerprint && row.seedFingerprint && row.seedFingerprint !== expectedSeedFingerprint) {
+        console.warn(
+            `[load-sync-state] refusing restore for ${accountId.slice(0, 16)}: ` +
+            `stored seed fingerprint does not match the session's seed (cold start)`
+        );
         return null;
     }
 

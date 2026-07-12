@@ -199,15 +199,17 @@ describe('wallet-facade-builder', () => {
             }
         });
 
-        it('skips persistence when the session was evicted before the event arrived', async () => {
+        it('rejects (no ack) when the session was evicted before the event arrived', async () => {
             wireWorkerStateSaveSink();
             const sink = mockSetStateSaveSink.mock.calls[0][0];
 
-            await sink({
+            // v0.6.6: a dropped save THROWS so the worker-client does not ack
+            // it and the worker re-pushes the blobs on a later tick.
+            await expect(sink({
                 sessionId: 'unknown-session',
                 sdkVersion: 'sdk-test',
                 blobs: {}
-            });
+            })).rejects.toThrow('session not registered');
 
             expect(mockSaveSyncState).not.toHaveBeenCalled();
         });
@@ -221,11 +223,13 @@ describe('wallet-facade-builder', () => {
                 wireWorkerStateSaveSink();
                 const sink = mockSetStateSaveSink.mock.calls[0][0];
 
-                await sink({
+                // v0.6.6: the failure is logged AND rethrown so the
+                // worker-client does not ack the save.
+                await expect(sink({
                     sessionId: 'warn-key',
                     sdkVersion: 'sdk-test',
                     blobs: { shielded: 'sh' }
-                });
+                })).rejects.toThrow('db down');
 
                 expect(warnSpy).toHaveBeenCalledWith(
                     expect.stringContaining('save failed'),

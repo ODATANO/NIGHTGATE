@@ -1,5 +1,48 @@
 # Changelog
 
+## 0.6.6 - 2026-07-12
+
+### Wallet persistence hardening (latent bugs from the error-117 review)
+
+Four defects found during the Custom-error-117 investigation, none the cause
+of that incident but each real. Two further review findings were verified and
+closed as not-bugs: the missing save-after-submit (wallet state is provably
+reconstructable from the public event stream, a lost 30s window only costs
+seconds of replay) and the missing per-account submit mutex (the SDK's
+`SubscriptionRef.modifyEffect` serializes concurrent balancing under a
+semaphore, so parallel spends cannot double-select dust notes).
+
+- **Evict final-save no longer dropped**: `evictWalletFacade` deleted the
+  session registry entry BEFORE awaiting the worker evict, so the worker's
+  final `state-save` push always arrived with no registered session and was
+  discarded (every disconnect/expiry lost up to 30s of state). Order swapped;
+  the registry entry now outlives the evict RPC.
+- **Failed persists are retried**: the worker marked blobs as saved when it
+  PUSHED them, not when the main thread persisted them; one transient
+  "database is locked" during a save tick stranded the persisted row until
+  the wallet state next changed. New `state-save-ack` protocol: the main
+  thread acks a save only after `saveSyncState` succeeded (drops and failures
+  do not ack), and the worker re-pushes unacked blobs on the next tick.
+- **Cross-network restore guard**: `WalletSyncStates` gains a nullable
+  `networkId` column, written with every save; `loadSyncState` refuses a row
+  whose stored network differs from the running one (cold start instead of
+  restoring another network's state). The accountId is network-agnostic, so
+  this trap previously relied on operators wiping the table manually.
+- **Cross-wallet restore guard**: `WalletSyncStates` gains a nullable
+  `seedFingerprint` column (HMAC of the bip39 seed); `loadSyncState` refuses
+  a row written by a different seed, so wallet A's blobs can no longer be
+  restored into a facade running wallet B's keys via a shared viewing key.
+  (A direct viewing-key-from-seed assertion is not implementable: the Lace
+  viewing key is not derivable from the seed via the SDK's key derivation,
+  verified empirically against a live wallet.)
+
+**Consumer upgrade note**: the two new columns are ADDITIVE. Do not
+`cds.deploy` over a live database (drop+create); run
+`ALTER TABLE midnight_WalletSyncStates ADD COLUMN networkId TEXT;` and
+`ALTER TABLE midnight_WalletSyncStates ADD COLUMN seedFingerprint TEXT;`
+instead. Pre-existing rows have NULL in both and keep restoring as before;
+the guards engage as soon as the first post-upgrade save stamps them.
+
 ## 0.6.2 - 2026-07-09
 
 ### SECURITY: AttestationVault attest() ownership takeover fixed

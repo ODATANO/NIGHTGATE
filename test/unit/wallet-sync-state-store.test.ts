@@ -143,6 +143,47 @@ describe('saveSyncState / loadSyncState round-trip', () => {
         expect(loaded).toBeNull();
     });
 
+    test('refuses restore when the stored networkId differs (cold start)', async () => {
+        await saveSyncState({
+            accountId: 'acct-net', passphrase: PASS, sdkVersion: SDK,
+            states: { dust: 'du-1' }, networkId: 'preview'
+        });
+        expect(await loadSyncState({
+            accountId: 'acct-net', passphrase: PASS, expectedSdkVersion: SDK,
+            expectedNetworkId: 'preprod'
+        })).toBeNull();
+        expect(await loadSyncState({
+            accountId: 'acct-net', passphrase: PASS, expectedSdkVersion: SDK,
+            expectedNetworkId: 'preview'
+        })).not.toBeNull();
+    });
+
+    test('refuses restore when the stored seedFingerprint differs', async () => {
+        await saveSyncState({
+            accountId: 'acct-seed', passphrase: PASS, sdkVersion: SDK,
+            states: { dust: 'du-2' }, seedFingerprint: 'fp-wallet-A'
+        });
+        expect(await loadSyncState({
+            accountId: 'acct-seed', passphrase: PASS, expectedSdkVersion: SDK,
+            expectedSeedFingerprint: 'fp-wallet-B'
+        })).toBeNull();
+        expect(await loadSyncState({
+            accountId: 'acct-seed', passphrase: PASS, expectedSdkVersion: SDK,
+            expectedSeedFingerprint: 'fp-wallet-A'
+        })).not.toBeNull();
+    });
+
+    test('pre-0.6.6 rows (no networkId/seedFingerprint) still restore with guards requested', async () => {
+        await saveSyncState({
+            accountId: 'acct-legacy', passphrase: PASS, sdkVersion: SDK,
+            states: { dust: 'du-3' }
+        });
+        expect(await loadSyncState({
+            accountId: 'acct-legacy', passphrase: PASS, expectedSdkVersion: SDK,
+            expectedNetworkId: 'preview', expectedSeedFingerprint: 'fp-any'
+        })).not.toBeNull();
+    });
+
     test('returns null when passphrase is wrong (decrypt failure)', async () => {
         await saveSyncState({
             accountId: 'acct-C',
