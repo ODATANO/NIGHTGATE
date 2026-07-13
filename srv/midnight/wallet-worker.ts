@@ -1552,7 +1552,7 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
         sessionId, proxyId, contractName, registration,
         contractAddress, circuit, args: callArgs,
         indexerHttpUrl, indexerWsUrl, proofServerUrl,
-        networkId, witnessValues, merkleProof
+        networkId, witnessValues, merkleProof, initialPrivateState
     }: {
         sessionId: string;
         proxyId: string;
@@ -1567,6 +1567,9 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
         networkId: string;
         witnessValues?: { attestedValue: string; valueSalt: string };
         merkleProof?: { fieldValue: string; siblings: string[]; dirs: boolean[] };
+        /** Seeded on this wallet's FIRST call to the contract (see below).
+         *  Defaults to `{}`, which is what a stateless contract deploys with. */
+        initialPrivateState?: unknown;
     }) {
         const entry = facades.get(sessionId);
         if (!entry) throw new Error(`No facade for sessionId=${sessionId.slice(0, 16)}`);
@@ -1590,10 +1593,33 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
 
         const { contracts } = await loadContractsSdk();
         log('info', `[worker] submitContractCall: ${contractName}.${circuit}@${contractAddress.slice(0, 12)}`);
+
+        // A wallet that did not DEPLOY this contract has no entry at its
+        // privateStateId, and `findDeployedContract` then throws "No private
+        // state found at private state ID '<id>'". That blocks the entire
+        // multi-caller case (several wallets acting on one shared contract,
+        // e.g. N producers anchoring in the same attestation vault).
+        //
+        // Seed the private state on first contact for this wallet, and ONLY
+        // then: the initialPrivateState variant of findDeployedContract
+        // OVERWRITES whatever is stored, so an existing state (the deployer's,
+        // or one a previous call evolved) must never be handed to it.
+        // The store scopes reads by contract address (`findDeployedContract`
+        // sets it internally); this probe runs BEFORE that, so set it here or
+        // the provider rejects the read with "Contract address not set".
+        privateStateProvider.setContractAddress(contractAddress);
+        const existingPrivateState = await privateStateProvider.get(registration.privateStateId);
+        const seed = existingPrivateState === undefined || existingPrivateState === null;
+        if (seed) {
+            log('info',
+                `[worker] submitContractCall: no private state at '${registration.privateStateId}' for this wallet, ` +
+                `seeding the contract's initial private state`);
+        }
         const found = await contracts.findDeployedContract(providers, {
             contractAddress,
             compiledContract,
-            privateStateId: registration.privateStateId
+            privateStateId: registration.privateStateId,
+            ...(seed ? { initialPrivateState: initialPrivateState ?? {} } : {})
         });
         const fn = found?.callTx?.[circuit];
         if (typeof fn !== 'function') {

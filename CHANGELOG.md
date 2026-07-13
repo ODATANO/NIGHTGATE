@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.6.9 - 2026-07-13
+
+### Fix: only the deploying wallet could call a contract
+
+`submitContractCall` passed `findDeployedContract` a `privateStateId` but never
+an `initialPrivateState`. The private-state store is per wallet and only
+`deployContract` seeds it, so any OTHER wallet calling an existing contract
+failed with `No private state found at private state ID '<id>'`. That blocked
+the entire multi-caller case: several wallets acting on one shared contract
+(N producers anchoring in one AttestationVault, N agents on one counter).
+
+`submitContractCall` now scopes the store to the contract
+(`setContractAddress`, required before the read or the store rejects it),
+checks whether this wallet has a private state for the contract, and seeds one
+ONLY when it is absent (default `{}`, what a stateless contract deploys with).
+An existing private state is never handed to the SDK's `initialPrivateState`
+variant, which would overwrite it. New optional `initialPrivateState` (JSON) on
+the action for contracts whose private state is not empty.
+
+Found and live-verified by NIGHTPASS: a programmatically created producer
+wallet anchoring in the vault deployed by another wallet
+(`docs/feature-requests/contract-call-private-state-seeding.md`).
+
 ## 0.6.8 - 2026-07-13
 
 ### Fix: unshielded token ops rejected with `1010 Custom error: 192`

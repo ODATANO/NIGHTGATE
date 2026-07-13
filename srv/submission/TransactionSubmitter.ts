@@ -119,6 +119,12 @@ export interface CallArgs {
      * Omit for every other circuit.
      */
     merkleProof?: { fieldValue: string; siblings: string[]; dirs: boolean[] };
+    /**
+     * Private state to seed when the CALLING wallet has none for this contract
+     * yet (it did not deploy it). Defaults to `{}` in the worker. Enables the
+     * multi-caller case: several wallets acting on one shared contract.
+     */
+    initialPrivateState?: unknown;
 }
 
 export interface DeployResult {
@@ -355,7 +361,8 @@ export class TransactionSubmitter {
             proofServerUrl:  this.deps.contractProvidersConfig.proofServerUrl,
             networkId:       this.deps.network,
             witnessValues:   args.witnessValues,
-            merkleProof:     args.merkleProof
+            merkleProof:     args.merkleProof,
+            initialPrivateState: args.initialPrivateState
         };
     }
 

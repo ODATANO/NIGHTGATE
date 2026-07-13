@@ -176,13 +176,14 @@ export function registerSubmissionHandlers(
     });
 
     srv.on('submitContractCall', async (req: Request) => {
-        const { contractAddress, circuit, compiledArtifactRef, sessionId, args, idempotencyKey } = req.data as {
+        const { contractAddress, circuit, compiledArtifactRef, sessionId, args, idempotencyKey, initialPrivateState } = req.data as {
             contractAddress?: string;
             circuit?: string;
             compiledArtifactRef?: string;
             sessionId?: string;
             args?: string;
             idempotencyKey?: string;
+            initialPrivateState?: string;
         };
 
         if (!contractAddress) return req.reject(400, 'contractAddress is required');
@@ -202,6 +203,14 @@ export function registerSubmissionHandlers(
             } catch {
                 return req.reject(400, 'args must be valid JSON');
             }
+        }
+
+        // Seeded only when the calling wallet has NO private state for this
+        // contract yet (it did not deploy it). Defaults to `{}` downstream.
+        let parsedInitialPrivateState: unknown;
+        if (initialPrivateState) {
+            try { parsedInitialPrivateState = JSON.parse(initialPrivateState); }
+            catch { return req.reject(400, 'initialPrivateState must be valid JSON'); }
         }
 
         return runSubmission(req, async () => {
@@ -235,7 +244,8 @@ export function registerSubmissionHandlers(
                             privateStateId: resolved.privateStateId,
                             zkConfigPath: resolved.zkConfigPath
                         },
-                        sessionId
+                        sessionId,
+                        initialPrivateState: parsedInitialPrivateState
                     });
                     return {
                         submissionId: result.submissionId,

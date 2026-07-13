@@ -541,6 +541,12 @@ service NightgateService {
      *
      * Async: returns `{ jobId, status }`. Polled via `getJobStatus`; the
      * `result` carries `{ submissionId, txHash, contractAddress, status }`.
+     *
+     * A wallet that did NOT deploy the contract has no private state for it.
+     * The call seeds one on first contact (default `{}`, i.e. what a stateless
+     * contract deploys with), so several wallets can act on one shared
+     * contract; an existing private state is never overwritten. Pass
+     * `initialPrivateState` for a contract whose private state is not empty.
      */
     action submitContractCall(
         contractAddress:     String,
@@ -548,7 +554,8 @@ service NightgateService {
         compiledArtifactRef: String,
         sessionId:           UUID,
         args:                LargeString, // JSON-encoded array, may be '[]'
-        idempotencyKey:      String       // optional; dedupes retries
+        idempotencyKey:      String,      // optional; dedupes retries
+        initialPrivateState: LargeString  // optional JSON; seeded on this wallet's first call
     )                                returns {
         jobId:  UUID;
         status: String;  // 'pending' | 'succeeded' (idempotent retry)

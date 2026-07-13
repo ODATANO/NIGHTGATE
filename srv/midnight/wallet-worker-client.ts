@@ -534,6 +534,13 @@ export interface WalletSubmitContractCallArgs {
      * factory; never a circuit arg. Omitted for other circuits.
      */
     merkleProof?: { fieldValue: string; siblings: string[]; dirs: boolean[] };
+    /**
+     * Private state to seed when THIS wallet has none for the contract yet (a
+     * wallet that did not deploy it: the multi-caller case, e.g. several
+     * producers anchoring in one shared vault). Defaults to `{}`. Never
+     * overwrites an existing private state.
+     */
+    initialPrivateState?: unknown;
 }
 
 /**
