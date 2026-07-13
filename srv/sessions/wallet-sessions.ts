@@ -26,9 +26,13 @@ import {
 import { ensureNetworkId } from '../midnight/providers';
 import { getOrBuildWalletFacade } from '../submission/wallet-facade-builder';
 import { walletWaitForSyncedState } from '../midnight/wallet-worker-client';
-import { resolveNightgateRuntimeConfig, getNightgatePluginConfig, mainnetSubmissionBlockReason } from '../utils/nightgate-config';
+import {
+    resolveNightgateRuntimeConfig, getNightgatePluginConfig, mainnetSubmissionBlockReason,
+    getConfiguredNightgateNetwork, normalizeNightgateNetwork
+} from '../utils/nightgate-config';
 import { startJob } from '../submission/background-jobs';
 import { mnemonicToBip39SeedHex } from '../utils/wallet-hd';
+import { deriveWalletInfo, resolveBip39SeedHex } from '../utils/wallet-info';
 
 // Upper bound for the prewarm sync-to-tip wait. A wallet that is far behind the
 // chain tip (e.g. restored from a stale checkpoint) can take a long time to
@@ -211,6 +215,51 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
             expiresAt: session.expiresAt,
             isActive: true
         };
+    });
+
+    // Pure derivation, no session, nothing persisted (FR derive-wallet-info).
+    // Rate-limited like connectWalletForSigning: the request carries secret
+    // material. The secret is validated and consumed in-memory only; error
+    // paths never echo the input.
+    srv.on('deriveWalletInfo', async (req: Request) => {
+        const clientKey = (req as any)?._.req?.ip || 'global';
+        const rateResult = signingKeyRateLimiter.check(clientKey);
+        if (!rateResult.allowed) {
+            return req.reject(429, `Rate limited. Retry after ${Math.ceil(rateResult.retryAfterMs / 1000)}s`);
+        }
+
+        const userId = requireUserId(req);
+        if (!userId) return;
+
+        const { mnemonic, seedHex, accountIndex } = req.data as {
+            mnemonic?: string;
+            seedHex?: string;
+            accountIndex?: number;
+        };
+
+        // Input validation up front so bad requests are clean 400s (the same
+        // checks run again inside deriveWalletInfo, defense in depth).
+        try {
+            resolveBip39SeedHex({ mnemonic, seedHex });
+        } catch (e: any) {
+            return req.reject(400, e?.message || 'invalid wallet secret');
+        }
+        const account = accountIndex ?? 0;
+        if (!Number.isInteger(account) || account < 0) {
+            return req.reject(400, 'accountIndex must be a non-negative integer');
+        }
+
+        const { network } = normalizeNightgateNetwork(
+            getConfiguredNightgateNetwork(getNightgatePluginConfig())
+        );
+        try {
+            return await deriveWalletInfo({ mnemonic, seedHex, accountIndex: account, network });
+        } catch (e: any) {
+            // SDK/derivation failure. Generic message on purpose: never let an
+            // error path reflect secret material back to the caller or logs.
+            cds.log('nightgate').error('deriveWalletInfo failed:', e?.message ?? 'unknown');
+            return req.reject(500, 'wallet derivation failed');
+        }
     });
 
     srv.on('connectWalletForSigning', async (req: Request) => {

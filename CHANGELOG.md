@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.6.7 - 2026-07-13
+
+### deriveWalletInfo: programmatic wallet creation without Lace
+
+Implements FR `docs/feature-requests/derive-wallet-info.md` (requested by
+NIGHTPASS for its one-instance-per-producer topology and by EQUINOX).
+
+- **New action `deriveWalletInfo(mnemonic|seedHex, accountIndex?)`**: derives a
+  wallet's connectable identity (`viewingKey`, `shieldedAddress`,
+  `nightAddress`) as a pure function of the secret. No session, nothing
+  persisted, the secret never logged; role seeds are zeroed and zswap secret
+  keys cleared after use. Rate-limited like `connectWalletForSigning` (the
+  request carries secret material). Derivation is identical to the signing
+  path (per-role HD seeds, Lace-exact), so the derived identity IS the account
+  `connectWalletForSigning` signs with for the same secret. Generating the
+  mnemonic itself stays consumer-side by design (`bip39.generateMnemonic`);
+  the service never returns private key material.
+- **`deriveRoleSeeds` gains an optional `accountIndex`** (default 0,
+  bit-identical to before): one phrase can host multiple independent wallet
+  accounts (e.g. one per producer).
+- New integration check `npm run integration:derive-wallet-info` verifies the
+  derived shielded address against the live Lace reference account, the
+  seedHex/mnemonic equivalence, account-index independence and per-network
+  encoding. Validation paths are unit-tested (`test/unit/wallet-info.test.ts`).
+
 ## 0.6.6 - 2026-07-12
 
 ### Wallet persistence hardening (latent bugs from the error-117 review)

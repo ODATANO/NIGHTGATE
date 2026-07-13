@@ -53,8 +53,16 @@ export function mnemonicToBip39SeedHex(mnemonic: string): string {
 /**
  * Derive the per-role 32-byte seeds from a 64-byte BIP39 seed, matching Lace.
  * Each result is fed to the SDK's fromSeed/createKeystore for its key type.
+ *
+ * `accountIndex` selects the BIP32 account level (default 0 = the account
+ * every existing caller used implicitly, bit-identical to before). Non-zero
+ * indices give multiple independent wallet accounts from one phrase
+ * (FR derive-wallet-info).
  */
-export async function deriveRoleSeeds(bip39Seed: Uint8Array): Promise<RoleSeeds> {
+export async function deriveRoleSeeds(bip39Seed: Uint8Array, accountIndex: number = ACCOUNT): Promise<RoleSeeds> {
+    if (!Number.isInteger(accountIndex) || accountIndex < 0) {
+        throw new Error('accountIndex must be a non-negative integer');
+    }
     const { HDWallet, Roles } = await loadWalletHd();
     const res = HDWallet.fromSeed(bip39Seed);
     if (res?.type !== 'seedOk') {
@@ -63,17 +71,17 @@ export async function deriveRoleSeeds(bip39Seed: Uint8Array): Promise<RoleSeeds>
     const hd = res.hdWallet;
     try {
         return {
-            zswap: deriveOne(hd, Roles.Zswap),
-            dust:  deriveOne(hd, Roles.Dust),
-            night: deriveOne(hd, Roles.NightExternal)
+            zswap: deriveOne(hd, Roles.Zswap, accountIndex),
+            dust:  deriveOne(hd, Roles.Dust, accountIndex),
+            night: deriveOne(hd, Roles.NightExternal, accountIndex)
         };
     } finally {
         hd.clear?.();
     }
 }
 
-function deriveOne(hd: any, role: number): Uint8Array {
-    const d = hd.selectAccount(ACCOUNT).selectRole(role).deriveKeyAt(KEY_INDEX);
+function deriveOne(hd: any, role: number, accountIndex: number): Uint8Array {
+    const d = hd.selectAccount(accountIndex).selectRole(role).deriveKeyAt(KEY_INDEX);
     if (d?.type !== 'keyDerived' || d.key?.length !== 32) {
         throw new Error(`HD key derivation failed for role ${role}: ${d?.type ?? 'no result'}`);
     }

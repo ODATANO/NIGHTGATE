@@ -622,6 +622,34 @@ service NightgateService {
     };
 
     /**
+     * Derive a wallet's connectable identity from its secret, WITHOUT creating
+     * a session or persisting anything (FR derive-wallet-info). Pure function
+     * of the input; the mnemonic/seed is never stored or logged.
+     *
+     * Removes the last Lace dependency from programmatic wallet creation:
+     * generate a BIP39 phrase consumer-side, call this to learn the
+     * `viewingKey` (input to `connectWallet`), the `nightAddress` (faucet
+     * funding target) and the `shieldedAddress`. Derivation is identical to
+     * the signing path (per-role HD seeds, Lace-exact; srv/utils/wallet-hd.ts),
+     * so the derived identity IS the account `connectWalletForSigning` will
+     * sign with for the same secret.
+     *
+     * `accountIndex` (default 0) selects the BIP32 account level, so one
+     * phrase can host multiple independent accounts (e.g. one per producer).
+     */
+    action deriveWalletInfo(
+        mnemonic:     String,   // BIP39 recovery phrase; one of mnemonic|seedHex required
+        seedHex:      String,   // optional: 64-byte BIP39 seed as 128 hex chars
+        accountIndex: Integer   // optional, default 0
+    ) returns {
+        viewingKey:      String;  // 64-hex zswap encryption public key (connectWallet input)
+        shieldedAddress: String;  // mn_shield-addr_... (receives shielded assets)
+        nightAddress:    String;  // mn_addr_... unshielded NIGHT address (faucet target)
+        accountIndex:    Integer;
+        network:         String;  // encoding network (the configured NIGHTGATE network)
+    };
+
+    /**
      * Register the session's NIGHT UTXOs for DUST generation. DUST is the fee
      * token on Midnight; without it, deployContract/submitContractCall cannot
      * pay fees. Initial DUST accrual takes 1-2 minutes after the on-chain
