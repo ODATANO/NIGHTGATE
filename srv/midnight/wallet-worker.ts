@@ -1167,7 +1167,15 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
             { shieldedSecretKeys: entry.zswapKeys, dustSecretKey: entry.dustKey },
             { ttl }
         );
-        const finalized = await entry.facade.finalizeRecipe(recipe);
+        // UNSHIELDED inputs are signature-authorized (not proof-authorized like
+        // zswap): the recipe must pass through signRecipe with the keystore's
+        // sign function, or the intent ships inputs with an empty signature
+        // list and the node rejects it at the mempool with
+        // `1010 Custom error: 192` (MalformedError::InputsSignaturesLengthMismatch).
+        // No-op when the balancer selected no unshielded inputs.
+        const signFn = (payload: Uint8Array) => entry.unshieldedKeystore.signData(payload);
+        const signed = await entry.facade.signRecipe(recipe, signFn);
+        const finalized = await entry.facade.finalizeRecipe(signed);
         const txId = await entry.facade.submitTransaction(finalized);
 
         log('info', `[worker] transfer: submitted, txId=${String(txId).slice(0, 16)}...`);
@@ -1234,7 +1242,12 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
             { shieldedSecretKeys: entry.zswapKeys, dustSecretKey: entry.dustKey },
             { ttl, payFees: true }
         );
-        const finalized = await entry.facade.finalizeRecipe(recipe);
+        // Sign unshielded inputs (see transferNight; error 192 otherwise).
+        // The unshield direction has shielded inputs only, but the balancer may
+        // still pull unshielded UTXOs for fees; signRecipe is a no-op if not.
+        const signFn = (payload: Uint8Array) => entry.unshieldedKeystore.signData(payload);
+        const signed = await entry.facade.signRecipe(recipe, signFn);
+        const finalized = await entry.facade.finalizeRecipe(signed);
         const txId = await entry.facade.submitTransaction(finalized);
 
         log('info', `[worker] unshield: submitted, txId=${String(txId).slice(0, 16)}...`);
@@ -1294,7 +1307,11 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
             { shieldedSecretKeys: entry.zswapKeys, dustSecretKey: entry.dustKey },
             { ttl, payFees: true }
         );
-        const finalized = await entry.facade.finalizeRecipe(recipe);
+        // Sign unshielded inputs (see transferNight; error 192 otherwise). The
+        // shield direction spends unshielded UTXOs, so this is REQUIRED here.
+        const signFn = (payload: Uint8Array) => entry.unshieldedKeystore.signData(payload);
+        const signed = await entry.facade.signRecipe(recipe, signFn);
+        const finalized = await entry.facade.finalizeRecipe(signed);
         const txId = await entry.facade.submitTransaction(finalized);
 
         log('info', `[worker] shield: submitted, txId=${String(txId).slice(0, 16)}...`);

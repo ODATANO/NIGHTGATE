@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.6.8 - 2026-07-13
+
+### Fix: unshielded token ops rejected with `1010 Custom error: 192`
+
+`sendNight` (and the `shieldFunds` / `unshieldFunds` swap paths) built
+transactions whose UNSHIELDED inputs carried no signatures: the facade's
+`transferTransaction` / `initSwap` recipes must pass through
+`facade.signRecipe(recipe, signFn)` before `finalizeRecipe`, since unshielded
+inputs are signature-authorized (unlike proof-authorized zswap inputs). The
+node rejected every such submission at the mempool with
+`1010 Custom error: 192`, decoded from midnight-node source as
+`MalformedError::InputsSignaturesLengthMismatch`. Register/deregister were
+unaffected (their facade APIs take the sign function directly). All three ops
+now sign the recipe with the session's unshielded keystore; a recipe without
+unshielded inputs signs as a no-op. Found live while funding fresh producer
+wallets from an existing preview wallet.
+
 ## 0.6.7 - 2026-07-13
 
 ### deriveWalletInfo: programmatic wallet creation without Lace
