@@ -42,7 +42,7 @@ function matchesWhere(row: any, where: Record<string, unknown>): boolean {
     return true;
 }
 
-const runMock = jest.fn(async (q: any) => {
+const runMock = vi.hoisted(() => (vi.fn(async (q: any) => {
     if (!q || typeof q !== 'object') return undefined;
     if (q.kind === 'selectOne') {
         const found = [...rows.values()].filter(r => matchesWhere(r, q.where));
@@ -86,37 +86,37 @@ const runMock = jest.fn(async (q: any) => {
         return undefined;
     }
     return undefined;
-});
+})));
 
 // ---- cds mock --------------------------------------------------------------
 
-jest.mock('@sap/cds', () => {
+vi.mock('@sap/cds', () => {
     const SELECT: any = {
-        from: jest.fn((entity: any) => {
+        from: vi.fn((entity: any) => {
             const obj: any = { kind: 'select', entity, columns: undefined, where: {}, orderBy: undefined };
-            obj.columns  = jest.fn((...cols: string[]) => { obj.columns = cols.flat(); return obj; });
-            obj.where    = jest.fn((where: Record<string, unknown>) => { obj.where = where; return obj; });
-            obj.orderBy  = jest.fn((ob: string) => { obj.orderBy = ob; return obj; });
+            obj.columns  = vi.fn((...cols: string[]) => { obj.columns = cols.flat(); return obj; });
+            obj.where    = vi.fn((where: Record<string, unknown>) => { obj.where = where; return obj; });
+            obj.orderBy  = vi.fn((ob: string) => { obj.orderBy = ob; return obj; });
             return obj;
         }),
         one: {
-            from: jest.fn((entity: any) => {
+            from: vi.fn((entity: any) => {
                 const obj: any = { kind: 'selectOne', entity, where: {}, orderBy: undefined };
-                obj.where   = jest.fn((where: Record<string, unknown>) => { obj.where = where; return obj; });
-                obj.orderBy = jest.fn((ob: string) => { obj.orderBy = ob; return obj; });
+                obj.where   = vi.fn((where: Record<string, unknown>) => { obj.where = where; return obj; });
+                obj.orderBy = vi.fn((ob: string) => { obj.orderBy = ob; return obj; });
                 return obj;
             })
         }
     };
     const INSERT = {
-        into: jest.fn((entity: any) => ({
-            entries: jest.fn((entry: Record<string, unknown>) => ({ kind: 'insert', entity, entry }))
+        into: vi.fn((entity: any) => ({
+            entries: vi.fn((entry: Record<string, unknown>) => ({ kind: 'insert', entity, entry }))
         }))
     };
     const UPDATE = {
-        entity: jest.fn((entity: any) => ({
-            set: jest.fn((set: Record<string, unknown>) => ({
-                where: jest.fn((where: Record<string, unknown>) => ({ kind: 'update', entity, set, where }))
+        entity: vi.fn((entity: any) => ({
+            set: vi.fn((set: Record<string, unknown>) => ({
+                where: vi.fn((where: Record<string, unknown>) => ({ kind: 'update', entity, set, where }))
             }))
         }))
     };
@@ -131,24 +131,24 @@ jest.mock('@sap/cds', () => {
 
     const cds: any = {
         ql: { SELECT, INSERT, UPDATE },
-        connect: { to: jest.fn(async () => dbHandle) },
+        connect: { to: vi.fn(async () => dbHandle) },
         env: { requires: {} },
         // Passthrough — the real cds._with runs fn under a cleared
         // AsyncLocalStorage store; for the mock we just invoke it.
         _with: (_ctx: any, fn: any) => fn(),
-        spawn: jest.fn((_opts: any, fn: any) => {
+        spawn: vi.fn((_opts: any, fn: any) => {
             const cb = typeof _opts === 'function' ? _opts : fn;
             setImmediate(() => { cb().catch(() => undefined); });
-            return { on: jest.fn() };
+            return { on: vi.fn() };
         })
     };
     cds.default = cds;
     return cds;
 });
 
-jest.mock('../../srv/utils/nightgate-config', () => ({
-    resolveNightgateRuntimeConfig: jest.fn(() => ({ network: 'preprod' })),
-    getNightgatePluginConfig:      jest.fn(() => ({}))
+vi.mock('../../srv/utils/nightgate-config', () => ({
+    resolveNightgateRuntimeConfig: vi.fn(() => ({ network: 'preprod' })),
+    getNightgatePluginConfig:      vi.fn(() => ({}))
 }));
 
 // classifySubmissionError is the real implementation — it doesn't touch
@@ -178,7 +178,7 @@ beforeEach(() => {
 
 describe('startJob — insert row + return jobId', () => {
     test('returns { jobId, status: "pending" } and inserts a row before spawn runs', async () => {
-        const work = jest.fn(async () => ({ txId: 'tx-123' }));
+        const work = vi.fn(async () => ({ txId: 'tx-123' }));
 
         const ret = await startJob({
             kind:      'sendNight',
@@ -200,7 +200,7 @@ describe('startJob — insert row + return jobId', () => {
     });
 
     test('transitions pending → running → succeeded after spawn completes', async () => {
-        const work = jest.fn(async () => ({ ok: true, value: 42 }));
+        const work = vi.fn(async () => ({ ok: true, value: 42 }));
 
         const ret = await startJob({
             kind:      'sendNight',
@@ -221,7 +221,7 @@ describe('startJob — insert row + return jobId', () => {
 
     test('failure path: row transitions to failed with classified errorCode', async () => {
         const err: any = new Error('Transaction pool full: 1016 Immediately Dropped');
-        const work = jest.fn(async () => { throw err; });
+        const work = vi.fn(async () => { throw err; });
 
         const ret = await startJob({
             kind:      'sendNight',
@@ -240,7 +240,7 @@ describe('startJob — insert row + return jobId', () => {
     });
 
     test('unknown errors get a non-retryable default classification', async () => {
-        const work = jest.fn(async () => { throw new Error('something exotic'); });
+        const work = vi.fn(async () => { throw new Error('something exotic'); });
 
         const ret = await startJob({
             kind:      'sendNight',
@@ -258,7 +258,7 @@ describe('startJob — insert row + return jobId', () => {
     });
 
     test('BigInt return values serialize cleanly into result', async () => {
-        const work = jest.fn(async () => ({ amount: 12345678901234567890n }));
+        const work = vi.fn(async () => ({ amount: 12345678901234567890n }));
 
         const ret = await startJob({
             kind:      'sendNight',
@@ -285,7 +285,7 @@ describe('startJob — insert row + return jobId', () => {
 
 describe('startJob — idempotency', () => {
     test('reusing an idempotencyKey on a succeeded job returns the same jobId + result', async () => {
-        const work1 = jest.fn(async () => ({ txId: 'tx-AAA' }));
+        const work1 = vi.fn(async () => ({ txId: 'tx-AAA' }));
         const first = await startJob({
             kind:           'sendNight',
             sessionId:      'sess-1',
@@ -295,7 +295,7 @@ describe('startJob — idempotency', () => {
         });
         await flushSpawn();
 
-        const work2 = jest.fn(async () => ({ txId: 'tx-BBB-should-not-be-called' }));
+        const work2 = vi.fn(async () => ({ txId: 'tx-BBB-should-not-be-called' }));
         const second = await startJob({
             kind:           'sendNight',
             sessionId:      'sess-1',
@@ -313,7 +313,7 @@ describe('startJob — idempotency', () => {
 
     test('reusing an idempotencyKey on a pending/running job returns the same jobId without spawning again', async () => {
         let resolveWork!: (v: any) => void;
-        const work1 = jest.fn(() => new Promise<any>(r => { resolveWork = r; }));
+        const work1 = vi.fn(() => new Promise<any>(r => { resolveWork = r; }));
         const first = await startJob({
             kind:           'sendNight',
             sessionId:      'sess-1',
@@ -325,7 +325,7 @@ describe('startJob — idempotency', () => {
         // work1 has started but not resolved — row should be 'running'
         expect(rows.get(first.jobId)?.status).toBe('running');
 
-        const work2 = jest.fn(async () => ({ should: 'not be called' }));
+        const work2 = vi.fn(async () => ({ should: 'not be called' }));
         const second = await startJob({
             kind:           'sendNight',
             sessionId:      'sess-1',
@@ -343,7 +343,7 @@ describe('startJob — idempotency', () => {
     });
 
     test('a previously failed job does NOT block a retry with the same key', async () => {
-        const work1 = jest.fn(async () => { throw new Error('boom'); });
+        const work1 = vi.fn(async () => { throw new Error('boom'); });
         const first = await startJob({
             kind:           'sendNight',
             sessionId:      'sess-1',
@@ -354,7 +354,7 @@ describe('startJob — idempotency', () => {
         await flushSpawn();
         expect(rows.get(first.jobId)?.status).toBe('failed');
 
-        const work2 = jest.fn(async () => ({ ok: true }));
+        const work2 = vi.fn(async () => ({ ok: true }));
         const second = await startJob({
             kind:           'sendNight',
             sessionId:      'sess-1',
@@ -393,7 +393,7 @@ describe('startJob — per-kind semaphore', () => {
         const releaseGates: Array<() => void> = [];
         const inFlight = { count: 0, peak: 0 };
 
-        const makeWork = () => jest.fn(async () => {
+        const makeWork = () => vi.fn(async () => {
             inFlight.count++;
             inFlight.peak = Math.max(inFlight.peak, inFlight.count);
             await new Promise<void>(r => releaseGates.push(r));
@@ -438,7 +438,7 @@ describe('startJob — per-kind semaphore', () => {
     test('light kind defaults to cap of 16', async () => {
         const releaseGates: Array<() => void> = [];
         const inFlight = { count: 0, peak: 0 };
-        const makeWork = () => jest.fn(async () => {
+        const makeWork = () => vi.fn(async () => {
             inFlight.count++;
             inFlight.peak = Math.max(inFlight.peak, inFlight.count);
             await new Promise<void>(r => releaseGates.push(r));

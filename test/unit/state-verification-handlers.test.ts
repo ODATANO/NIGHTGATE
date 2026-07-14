@@ -11,11 +11,11 @@
  * criterion 5: clean negative when no live provider).
  */
 
-// Toggle the runtime config the handlers see. `mock`-prefixed so jest allows it
+// Toggle the runtime config the handlers see. `mock`-prefixed so the mock factory may reference it
 // inside the (hoisted) factory. Set in beforeEach.
 let mockRuntimeCfg: any;
-jest.mock('../../srv/utils/nightgate-config', () => {
-    const actual = jest.requireActual('../../srv/utils/nightgate-config');
+vi.mock('../../srv/utils/nightgate-config', async () => {
+    const actual = await vi.importActual('../../srv/utils/nightgate-config');
     return {
         ...actual,
         getNightgatePluginConfig: () => ({}),
@@ -24,8 +24,8 @@ jest.mock('../../srv/utils/nightgate-config', () => {
 });
 
 // startJob is not exercised by these read handlers, but handlers.ts imports it.
-jest.mock('../../srv/submission/background-jobs', () => ({
-    startJob: jest.fn(async (args: any) => ({ jobId: 'job-test', status: 'pending' }))
+vi.mock('../../srv/submission/background-jobs', async () => ({
+    startJob: vi.fn(async (args: any) => ({ jobId: 'job-test', status: 'pending' }))
 }));
 
 import { registerSubmissionHandlers } from '../../srv/submission/handlers';
@@ -50,19 +50,19 @@ const ROOT = 'd'.repeat(64);
 
 function makeFakeService() {
     const handlers: Record<string, (req: any) => Promise<any>> = {};
-    return { handlers, on: jest.fn((a: string, fn: any) => { handlers[a] = fn; }) };
+    return { handlers, on: vi.fn((a: string, fn: any) => { handlers[a] = fn; }) };
 }
 function makeReq(data: Record<string, unknown>) {
     return {
         data,
-        reject: jest.fn((status: number, message: string) => {
+        reject: vi.fn((status: number, message: string) => {
             const err: any = new Error(message); err.status = status; return err;
         })
     };
 }
 function makeDbWithSequence(rows: any[]) {
     const queue = [...rows];
-    return { run: jest.fn().mockImplementation(async () => queue.shift()) };
+    return { run: vi.fn().mockImplementation(async () => queue.shift()) };
 }
 
 beforeEach(() => { mockRuntimeCfg = WITH_PROVIDER; });
@@ -70,10 +70,10 @@ beforeEach(() => { mockRuntimeCfg = WITH_PROVIDER; });
 // ---- verifyAttestationState ----------------------------------------------
 
 describe('verifyAttestationState', () => {
-    function setup(opts: any = {}, db: any = { run: jest.fn() }) {
+    function setup(opts: any = {}, db: any = { run: vi.fn() }) {
         const srv = makeFakeService();
         registerSubmissionHandlers(srv as any, db, {
-            resolveContractImpl: jest.fn(async () => RESOLVED as any),
+            resolveContractImpl: vi.fn(async () => RESOLVED as any),
             ...opts
         });
         return srv;
@@ -108,7 +108,7 @@ describe('verifyAttestationState', () => {
     });
 
     test('attested, no contentRoot → verified true', async () => {
-        const reader = jest.fn(async () => ({ attested: true, contentRootOk: false, attesterId: 'abc' }));
+        const reader = vi.fn(async () => ({ attested: true, contentRootOk: false, attesterId: 'abc' }));
         const srv = setup({ attestationStateReader: reader });
         const req = makeReq({ contractAddress: VAULT, payloadHash: PAYLOAD });
         const r = await srv.handlers['verifyAttestationState'](req);
@@ -116,7 +116,7 @@ describe('verifyAttestationState', () => {
     });
 
     test('not attested → verified false', async () => {
-        const reader = jest.fn(async () => ({ attested: false, contentRootOk: false, attesterId: '' }));
+        const reader = vi.fn(async () => ({ attested: false, contentRootOk: false, attesterId: '' }));
         const srv = setup({ attestationStateReader: reader });
         const req = makeReq({ contractAddress: VAULT, payloadHash: PAYLOAD });
         const r = await srv.handlers['verifyAttestationState'](req);
@@ -125,7 +125,7 @@ describe('verifyAttestationState', () => {
     });
 
     test('contentRoot supplied and matches → verified true', async () => {
-        const reader = jest.fn(async () => ({ attested: true, contentRootOk: true, attesterId: 'abc' }));
+        const reader = vi.fn(async () => ({ attested: true, contentRootOk: true, attesterId: 'abc' }));
         const srv = setup({ attestationStateReader: reader });
         const req = makeReq({ contractAddress: VAULT, payloadHash: PAYLOAD, contentRoot: ROOT });
         const r = await srv.handlers['verifyAttestationState'](req);
@@ -133,7 +133,7 @@ describe('verifyAttestationState', () => {
     });
 
     test('contentRoot supplied but mismatch → verified false even though attested', async () => {
-        const reader = jest.fn(async () => ({ attested: true, contentRootOk: false, attesterId: 'abc' }));
+        const reader = vi.fn(async () => ({ attested: true, contentRootOk: false, attesterId: 'abc' }));
         const srv = setup({ attestationStateReader: reader });
         const req = makeReq({ contractAddress: VAULT, payloadHash: PAYLOAD, contentRoot: ROOT });
         const r = await srv.handlers['verifyAttestationState'](req);
@@ -142,7 +142,7 @@ describe('verifyAttestationState', () => {
     });
 
     test('reader returns null (unknown contract) → clean negative', async () => {
-        const reader = jest.fn(async () => null);
+        const reader = vi.fn(async () => null);
         const srv = setup({ attestationStateReader: reader });
         const req = makeReq({ contractAddress: VAULT, payloadHash: PAYLOAD });
         const r = await srv.handlers['verifyAttestationState'](req);
@@ -151,7 +151,7 @@ describe('verifyAttestationState', () => {
 
     test('no live provider → clean negative, reader not called (criterion 5)', async () => {
         mockRuntimeCfg = NO_PROVIDER;
-        const reader = jest.fn(async () => ({ attested: true, contentRootOk: true, attesterId: 'x' }));
+        const reader = vi.fn(async () => ({ attested: true, contentRootOk: true, attesterId: 'x' }));
         const srv = setup({ attestationStateReader: reader });
         const req = makeReq({ contractAddress: VAULT, payloadHash: PAYLOAD });
         const r = await srv.handlers['verifyAttestationState'](req);
@@ -167,8 +167,8 @@ describe('verifyPredicateState', () => {
 
     function setup(opts: any = {}) {
         const srv = makeFakeService();
-        registerSubmissionHandlers(srv as any, { run: jest.fn() }, {
-            resolveContractImpl: jest.fn(async () => RESOLVED as any),
+        registerSubmissionHandlers(srv as any, { run: vi.fn() }, {
+            resolveContractImpl: vi.fn(async () => RESOLVED as any),
             ...opts
         });
         return srv;
@@ -228,7 +228,7 @@ describe('verifyPredicateState', () => {
     });
 
     test('plain proven on-chain → verified true; empty fieldKey passed as undefined', async () => {
-        const reader = jest.fn(async () => true);
+        const reader = vi.fn(async () => true);
         const srv = setup({ predicateStateReader: reader });
         const req = makeReq({ ...VALID });
         const r = await srv.handlers['verifyPredicateState'](req);
@@ -240,7 +240,7 @@ describe('verifyPredicateState', () => {
     });
 
     test('greaterOrEqual maps to op 1', async () => {
-        const reader = jest.fn(async () => true);
+        const reader = vi.fn(async () => true);
         const srv = setup({ predicateStateReader: reader });
         const req = makeReq({ ...VALID, predicate: 'greaterOrEqual' });
         await srv.handlers['verifyPredicateState'](req);
@@ -248,7 +248,7 @@ describe('verifyPredicateState', () => {
     });
 
     test('field-bound: fieldKey passed through lowercased', async () => {
-        const reader = jest.fn(async () => true);
+        const reader = vi.fn(async () => true);
         const srv = setup({ predicateStateReader: reader });
         const req = makeReq({ ...VALID, fieldKey: FIELD_KEY.toUpperCase() });
         const r = await srv.handlers['verifyPredicateState'](req);
@@ -257,7 +257,7 @@ describe('verifyPredicateState', () => {
     });
 
     test('no true result recorded → verified false, not an error (criterion 3)', async () => {
-        const reader = jest.fn(async () => false);
+        const reader = vi.fn(async () => false);
         const srv = setup({ predicateStateReader: reader });
         const req = makeReq({ ...VALID });
         const r = await srv.handlers['verifyPredicateState'](req);
@@ -265,7 +265,7 @@ describe('verifyPredicateState', () => {
     });
 
     test('reader returns null (unknown contract) → clean negative (criterion 4)', async () => {
-        const reader = jest.fn(async () => null);
+        const reader = vi.fn(async () => null);
         const srv = setup({ predicateStateReader: reader });
         const req = makeReq({ ...VALID });
         const r = await srv.handlers['verifyPredicateState'](req);
@@ -274,7 +274,7 @@ describe('verifyPredicateState', () => {
 
     test('no live provider → clean negative, reader not called (criterion 4)', async () => {
         mockRuntimeCfg = NO_PROVIDER;
-        const reader = jest.fn(async () => true);
+        const reader = vi.fn(async () => true);
         const srv = setup({ predicateStateReader: reader });
         const req = makeReq({ ...VALID });
         const r = await srv.handlers['verifyPredicateState'](req);
@@ -288,8 +288,8 @@ describe('verifyPredicateState', () => {
 describe('reindexDisclosures', () => {
     function setup(opts: any = {}) {
         const srv = makeFakeService();
-        registerSubmissionHandlers(srv as any, { run: jest.fn() }, {
-            resolveContractImpl: jest.fn(async () => RESOLVED as any),
+        registerSubmissionHandlers(srv as any, { run: vi.fn() }, {
+            resolveContractImpl: vi.fn(async () => RESOLVED as any),
             ...opts
         });
         return srv;
@@ -303,7 +303,7 @@ describe('reindexDisclosures', () => {
     });
 
     test('reconciles and reports active/deactivated counts, lowercased address', async () => {
-        const reindexer = jest.fn(async () => ({ indexed: 3, deactivated: 1 }));
+        const reindexer = vi.fn(async () => ({ indexed: 3, deactivated: 1 }));
         const srv = setup({ disclosureReindexer: reindexer });
         const req = makeReq({ contractAddress: '0xMixedCaseVault' });
         const r = await srv.handlers['reindexDisclosures'](req);
@@ -314,7 +314,7 @@ describe('reindexDisclosures', () => {
 
     test('no live provider → clean zero, reindexer not called (criterion 5)', async () => {
         mockRuntimeCfg = NO_PROVIDER;
-        const reindexer = jest.fn(async () => ({ indexed: 3, deactivated: 0 }));
+        const reindexer = vi.fn(async () => ({ indexed: 3, deactivated: 0 }));
         const srv = setup({ disclosureReindexer: reindexer });
         const req = makeReq({ contractAddress: '0xzz' });
         const r = await srv.handlers['reindexDisclosures'](req);
@@ -333,16 +333,16 @@ describe('verifyDocument crawler-free fallback', () => {
     function setup(db: any, opts: any = {}) {
         const srv = makeFakeService();
         registerSubmissionHandlers(srv as any, db, {
-            resolveContractImpl: jest.fn(async () => RESOLVED as any),
-            walletMaterialFactory: jest.fn(),
-            submitterFactory: jest.fn(),
+            resolveContractImpl: vi.fn(async () => RESOLVED as any),
+            walletMaterialFactory: vi.fn(),
+            submitterFactory: vi.fn(),
             ...opts
         });
         return srv;
     }
 
     test('tx not indexed + contractAddress + attested on-chain → verified true', async () => {
-        const reader = jest.fn(async () => ({ attested: true, contentRootOk: false, attesterId: 'x' }));
+        const reader = vi.fn(async () => ({ attested: true, contentRootOk: false, attesterId: 'x' }));
         const db = makeDbWithSequence([
             { ID: DOC_ID, sha256: SHA, anchoredTxHash: TX_HASH, anchoredAt: '2026-07-06T00:00:00Z' },
             undefined // Transactions lookup: not indexed (crawler off/lag)
@@ -355,7 +355,7 @@ describe('verifyDocument crawler-free fallback', () => {
     });
 
     test('tx not indexed + contractAddress + NOT attested on-chain → verified false', async () => {
-        const reader = jest.fn(async () => ({ attested: false, contentRootOk: false, attesterId: '' }));
+        const reader = vi.fn(async () => ({ attested: false, contentRootOk: false, attesterId: '' }));
         const db = makeDbWithSequence([
             { ID: DOC_ID, sha256: SHA, anchoredTxHash: TX_HASH, anchoredAt: null },
             undefined
@@ -366,8 +366,21 @@ describe('verifyDocument crawler-free fallback', () => {
         expect(r.verified).toBe(false);
     });
 
+    test('reader failure is best-effort → verified false, never a 5xx', async () => {
+        const reader = vi.fn(async () => { throw new Error('indexer unreachable'); });
+        const db = makeDbWithSequence([
+            { ID: DOC_ID, sha256: SHA, anchoredTxHash: TX_HASH, anchoredAt: null },
+            undefined
+        ]);
+        const srv = setup(db, { attestationStateReader: reader });
+        const req = makeReq({ documentId: DOC_ID, providedSha256: SHA, contractAddress: VAULT });
+        const r = await srv.handlers['verifyDocument'](req);
+        expect(r.verified).toBe(false);
+        expect(req.reject).not.toHaveBeenCalled();
+    });
+
     test('tx not indexed + NO contractAddress → fallback skipped, verified false', async () => {
-        const reader = jest.fn(async () => ({ attested: true, contentRootOk: false, attesterId: 'x' }));
+        const reader = vi.fn(async () => ({ attested: true, contentRootOk: false, attesterId: 'x' }));
         const db = makeDbWithSequence([
             { ID: DOC_ID, sha256: SHA, anchoredTxHash: TX_HASH, anchoredAt: null },
             undefined
@@ -381,7 +394,7 @@ describe('verifyDocument crawler-free fallback', () => {
 
     test('no live provider → fallback skipped even with contractAddress', async () => {
         mockRuntimeCfg = NO_PROVIDER;
-        const reader = jest.fn(async () => ({ attested: true, contentRootOk: false, attesterId: 'x' }));
+        const reader = vi.fn(async () => ({ attested: true, contentRootOk: false, attesterId: 'x' }));
         const db = makeDbWithSequence([
             { ID: DOC_ID, sha256: SHA, anchoredTxHash: TX_HASH, anchoredAt: null },
             undefined
@@ -407,16 +420,16 @@ describe('verifyPredicateAttestation crawler-free fallback', () => {
     function setup(db: any, opts: any = {}) {
         const srv = makeFakeService();
         registerSubmissionHandlers(srv as any, db, {
-            resolveContractImpl: jest.fn(async () => RESOLVED as any),
-            walletMaterialFactory: jest.fn(),
-            submitterFactory: jest.fn(),
+            resolveContractImpl: vi.fn(async () => RESOLVED as any),
+            walletMaterialFactory: vi.fn(),
+            submitterFactory: vi.fn(),
             ...opts
         });
         return srv;
     }
 
     test('proof tx not indexed + on-chain result true → verified true', async () => {
-        const reader = jest.fn(async () => true);
+        const reader = vi.fn(async () => true);
         const db = makeDbWithSequence([ROW, undefined /* Transactions: not indexed */]);
         const srv = setup(db, { predicateStateReader: reader });
         const req = makeReq({ predicateAttestationId: PA_ID });
@@ -428,7 +441,7 @@ describe('verifyPredicateAttestation crawler-free fallback', () => {
     });
 
     test('proof tx not indexed + on-chain result absent → verified false', async () => {
-        const reader = jest.fn(async () => false);
+        const reader = vi.fn(async () => false);
         const db = makeDbWithSequence([ROW, undefined]);
         const srv = setup(db, { predicateStateReader: reader });
         const req = makeReq({ predicateAttestationId: PA_ID });
@@ -436,9 +449,19 @@ describe('verifyPredicateAttestation crawler-free fallback', () => {
         expect(r.verified).toBe(false);
     });
 
+    test('reader failure is best-effort → verified false, never a 5xx', async () => {
+        const reader = vi.fn(async () => { throw new Error('indexer unreachable'); });
+        const db = makeDbWithSequence([ROW, undefined]);
+        const srv = setup(db, { predicateStateReader: reader });
+        const req = makeReq({ predicateAttestationId: PA_ID });
+        const r = await srv.handlers['verifyPredicateAttestation'](req);
+        expect(r.verified).toBe(false);
+        expect(req.reject).not.toHaveBeenCalled();
+    });
+
     test('no live provider → fallback skipped, verified false', async () => {
         mockRuntimeCfg = NO_PROVIDER;
-        const reader = jest.fn(async () => true);
+        const reader = vi.fn(async () => true);
         const db = makeDbWithSequence([ROW, undefined]);
         const srv = setup(db, { predicateStateReader: reader });
         const req = makeReq({ predicateAttestationId: PA_ID });
@@ -449,7 +472,7 @@ describe('verifyPredicateAttestation crawler-free fallback', () => {
 
     test('field-bound row passes its fieldKey through to the reader', async () => {
         const FIELD_KEY = 'e'.repeat(64);
-        const reader = jest.fn(async () => true);
+        const reader = vi.fn(async () => true);
         const fieldRow = { ...ROW, fieldKey: FIELD_KEY };
         const db = makeDbWithSequence([fieldRow, undefined]);
         const srv = setup(db, { predicateStateReader: reader });
@@ -460,7 +483,7 @@ describe('verifyPredicateAttestation crawler-free fallback', () => {
     });
 
     test('plain row passes fieldKey undefined (not empty string)', async () => {
-        const reader = jest.fn(async () => true);
+        const reader = vi.fn(async () => true);
         const db = makeDbWithSequence([{ ...ROW, fieldKey: null }, undefined]);
         const srv = setup(db, { predicateStateReader: reader });
         const req = makeReq({ predicateAttestationId: PA_ID });

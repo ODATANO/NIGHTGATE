@@ -3,22 +3,22 @@
  *
  * The Midnight SDK packages are ESM-only. ts-jest compiles `import('foo')`
  * inside sdk-loader.ts to `Promise.resolve().then(() => require('foo'))`,
- * which means jest.mock() captures the same path. We provide tiny stubs so
+ * which means vi.mock() captures the same path. We provide tiny stubs so
  * the loader exercises its caching + in-flight dedup logic without ever
  * touching the real SDK.
  */
 
-jest.mock('@midnight-ntwrk/midnight-js-contracts', () => ({ __esModule: true, marker: 'contracts' }), { virtual: true });
-jest.mock('@midnight-ntwrk/midnight-js-indexer-public-data-provider', () => ({ __esModule: true, marker: 'indexer' }), { virtual: true });
-jest.mock('@midnight-ntwrk/midnight-js-http-client-proof-provider', () => ({ __esModule: true, marker: 'proof' }), { virtual: true });
-jest.mock('@midnight-ntwrk/midnight-js-node-zk-config-provider', () => ({ __esModule: true, marker: 'zk' }), { virtual: true });
-jest.mock('@midnight-ntwrk/midnight-js-level-private-state-provider', () => ({ __esModule: true, marker: 'level' }), { virtual: true });
-jest.mock('@midnightntwrk/wallet-sdk-facade', () => ({ __esModule: true, marker: 'facade' }), { virtual: true });
-jest.mock('@midnight-ntwrk/ledger-v8', () => ({ __esModule: true, marker: 'ledger-v8' }), { virtual: true });
-jest.mock('@midnightntwrk/wallet-sdk-shielded', () => ({ __esModule: true, marker: 'shielded' }), { virtual: true });
-jest.mock('@midnightntwrk/wallet-sdk-unshielded-wallet', () => ({ __esModule: true, marker: 'unshielded' }), { virtual: true });
-jest.mock('@midnightntwrk/wallet-sdk-dust-wallet', () => ({ __esModule: true, marker: 'dust' }), { virtual: true });
-jest.mock('@midnightntwrk/wallet-sdk-abstractions', () => ({ __esModule: true, marker: 'abstractions' }), { virtual: true });
+vi.mock('@midnight-ntwrk/midnight-js-contracts', () => ({ __esModule: true, marker: 'contracts' }));
+vi.mock('@midnight-ntwrk/midnight-js-indexer-public-data-provider', () => ({ __esModule: true, marker: 'indexer' }));
+vi.mock('@midnight-ntwrk/midnight-js-http-client-proof-provider', () => ({ __esModule: true, marker: 'proof' }));
+vi.mock('@midnight-ntwrk/midnight-js-node-zk-config-provider', () => ({ __esModule: true, marker: 'zk' }));
+vi.mock('@midnight-ntwrk/midnight-js-level-private-state-provider', () => ({ __esModule: true, marker: 'level' }));
+vi.mock('@midnightntwrk/wallet-sdk-facade', () => ({ __esModule: true, marker: 'facade' }));
+vi.mock('@midnight-ntwrk/ledger-v8', () => ({ __esModule: true, marker: 'ledger-v8' }));
+vi.mock('@midnightntwrk/wallet-sdk-shielded', () => ({ __esModule: true, marker: 'shielded' }));
+vi.mock('@midnightntwrk/wallet-sdk-unshielded-wallet', () => ({ __esModule: true, marker: 'unshielded' }));
+vi.mock('@midnightntwrk/wallet-sdk-dust-wallet', () => ({ __esModule: true, marker: 'dust' }));
+vi.mock('@midnightntwrk/wallet-sdk-abstractions', () => ({ __esModule: true, marker: 'abstractions' }));
 
 import {
     loadMidnightSdk,

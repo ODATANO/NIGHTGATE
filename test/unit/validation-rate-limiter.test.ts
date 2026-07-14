@@ -1,3 +1,4 @@
+import type { MockInstance } from 'vitest';
 import { validateViewingKey } from '../../srv/utils/validation';
 import { RateLimiter } from '../../srv/utils/rate-limiter';
 
@@ -11,10 +12,10 @@ describe('validation utilities', () => {
 });
 
 describe('RateLimiter', () => {
-    let nowSpy: jest.SpyInstance<number, []>;
+    let nowSpy: MockInstance<() => number>;
 
     beforeEach(() => {
-        nowSpy = jest.spyOn(Date, 'now');
+        nowSpy = vi.spyOn(Date, 'now');
     });
 
     afterEach(() => {
@@ -63,5 +64,44 @@ describe('RateLimiter', () => {
 
         nowSpy.mockReturnValue(2200);
         expect(limiter.check('client-2')).toEqual({ allowed: true, retryAfterMs: 0 });
+    });
+});
+
+describe('RateLimiter capacity + sweep + destroy', () => {
+    it('rejects NEW keys once the key map is at capacity (memory DoS guard)', () => {
+        const limiter = new RateLimiter({ windowMs: 60_000, maxRequests: 5, maxKeys: 2 });
+        try {
+            expect(limiter.check('a').allowed).toBe(true);
+            expect(limiter.check('b').allowed).toBe(true);
+            // Third DISTINCT key is rejected; existing keys keep working.
+            const overflow = limiter.check('c');
+            expect(overflow.allowed).toBe(false);
+            expect(overflow.retryAfterMs).toBe(60_000);
+            expect(limiter.check('a').allowed).toBe(true);
+        } finally {
+            limiter.destroy();
+        }
+    });
+
+    it('sweeps stale keys on the interval and destroy() stops the timer', () => {
+        vi.useFakeTimers();
+        const limiter = new RateLimiter({ windowMs: 1000, maxRequests: 5, sweepIntervalMs: 500 });
+        try {
+            limiter.check('stale-key');
+            expect((limiter as any).hits.size).toBe(1);
+
+            // Past the window: the next sweep tick drops the key.
+            vi.advanceTimersByTime(1600);
+            expect((limiter as any).hits.size).toBe(0);
+
+            // After destroy() the sweep no longer runs.
+            limiter.check('after-destroy');
+            limiter.destroy();
+            vi.advanceTimersByTime(10_000);
+            expect((limiter as any).hits.size).toBe(1);
+        } finally {
+            limiter.destroy();
+            vi.useRealTimers();
+        }
     });
 });

@@ -7,6 +7,7 @@
  * are all verifiable without touching the real SDK.
  */
 
+import type { Mock } from 'vitest';
 import {
     buildContractProviders,
     buildFullProviderBundle,
@@ -16,18 +17,18 @@ import {
 import { loadMidnightSdk, resetMidnightSdkCache } from '../../srv/midnight/sdk-loader';
 
 // Replace loadMidnightSdk with a hand-built fake.
-jest.mock('../../srv/midnight/sdk-loader', () => {
+vi.mock('../../srv/midnight/sdk-loader', () => {
     const fake = {
         contracts: {},
-        indexer:  { indexerPublicDataProvider: jest.fn((http: string, ws: string, wsImpl?: unknown) => ({ tag: 'publicData', http, ws, wsImpl: !!wsImpl })) },
-        proof:    { httpClientProofProvider: jest.fn((url: string, zk: unknown) => ({ tag: 'proof', url, zkRef: zk })) },
-        zk:       { NodeZkConfigProvider: jest.fn().mockImplementation((dir: string) => ({ tag: 'zkConfig', directory: dir })) },
-        level:    { levelPrivateStateProvider: jest.fn((cfg: any) => ({ tag: 'privateState', accountId: cfg.accountId, hasPasswordFn: typeof cfg.privateStoragePasswordProvider === 'function' })) },
+        indexer:  { indexerPublicDataProvider: vi.fn((http: string, ws: string, wsImpl?: unknown) => ({ tag: 'publicData', http, ws, wsImpl: !!wsImpl })) },
+        proof:    { httpClientProofProvider: vi.fn((url: string, zk: unknown) => ({ tag: 'proof', url, zkRef: zk })) },
+        zk:       { NodeZkConfigProvider: vi.fn().mockImplementation(function (dir: string) { return { tag: 'zkConfig', directory: dir }; } as any) },
+        level:    { levelPrivateStateProvider: vi.fn((cfg: any) => ({ tag: 'privateState', accountId: cfg.accountId, hasPasswordFn: typeof cfg.privateStoragePasswordProvider === 'function' })) },
         facade:   {}
     };
     return {
-        loadMidnightSdk: jest.fn(async () => fake),
-        resetMidnightSdkCache: jest.fn()
+        loadMidnightSdk: vi.fn(async () => fake),
+        resetMidnightSdkCache: vi.fn()
     };
 });
 
@@ -134,7 +135,7 @@ describe('buildFullProviderBundle', () => {
         });
         // For the level backend, the password validation is wrapped in providers.ts.
         const { level } = await loadMidnightSdk();
-        const lastCallCfg = (level.levelPrivateStateProvider as jest.Mock).mock.calls.slice(-1)[0][0];
+        const lastCallCfg = (level.levelPrivateStateProvider as Mock).mock.calls.slice(-1)[0][0];
         await expect(lastCallCfg.privateStoragePasswordProvider()).rejects.toThrow(/at least 16 characters/);
         expect(bundle.privateStateProvider).toBeDefined();
     });

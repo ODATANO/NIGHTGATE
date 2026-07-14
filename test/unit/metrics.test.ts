@@ -4,14 +4,14 @@
  * Verify that getMetrics returns Prometheus-compatible text format.
  */
 
-const mockDbRun = jest.fn();
-const mockSuperInit = jest.fn().mockResolvedValue(undefined);
-const mockDbConnect = jest.fn().mockResolvedValue({ run: mockDbRun });
+const mockDbRun = vi.hoisted(() => (vi.fn()));
+const mockSuperInit = vi.fn().mockResolvedValue(undefined);
+const mockDbConnect = vi.hoisted(() => (vi.fn().mockResolvedValue({ run: mockDbRun })));
 
 // Track registered handlers
-const registeredHandlers: Record<string, Function> = {};
+const registeredHandlers: Record<string, Function> = vi.hoisted(() => ({}));
 
-jest.mock('@sap/cds', () => {
+vi.mock('@sap/cds', () => {
     const cds: any = {
         connect: { to: mockDbConnect },
         env: {
@@ -22,19 +22,19 @@ jest.mock('@sap/cds', () => {
         ql: {
             SELECT: {
                 one: {
-                    from: jest.fn().mockReturnValue({
-                        where: jest.fn()
+                    from: vi.fn().mockReturnValue({
+                        where: vi.fn()
                     })
                 },
-                from: jest.fn().mockReturnValue({
-                    orderBy: jest.fn().mockReturnValue({
-                        limit: jest.fn()
+                from: vi.fn().mockReturnValue({
+                    orderBy: vi.fn().mockReturnValue({
+                        limit: vi.fn()
                     })
                 })
             },
             INSERT: {
-                into: jest.fn().mockReturnValue({
-                    entries: jest.fn()
+                into: vi.fn().mockReturnValue({
+                    entries: vi.fn()
                 })
             }
         },
@@ -55,7 +55,7 @@ describe('Metrics Endpoint', () => {
     let service: NightgateIndexerService;
 
     beforeEach(async () => {
-        jest.clearAllMocks();
+        vi.clearAllMocks();
         Object.keys(registeredHandlers).forEach(k => delete registeredHandlers[k]);
 
         // Init returns existing SyncState

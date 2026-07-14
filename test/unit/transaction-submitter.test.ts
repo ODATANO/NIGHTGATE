@@ -11,12 +11,12 @@
  * row transitions are exercised end-to-end.
  */
 
-const walletDeployContract     = jest.fn();
-const walletSubmitContractCall = jest.fn();
-const registerPrivateStateProvider   = jest.fn();
-const unregisterPrivateStateProvider = jest.fn();
+const walletDeployContract     = vi.hoisted(() => (vi.fn()));
+const walletSubmitContractCall = vi.hoisted(() => (vi.fn()));
+const registerPrivateStateProvider   = vi.hoisted(() => (vi.fn()));
+const unregisterPrivateStateProvider = vi.hoisted(() => (vi.fn()));
 
-jest.mock('../../srv/midnight/wallet-worker-client', () => ({
+vi.mock('../../srv/midnight/wallet-worker-client', () => ({
     walletDeployContract:           (...args: unknown[]) => walletDeployContract(...args),
     walletSubmitContractCall:       (...args: unknown[]) => walletSubmitContractCall(...args),
     registerPrivateStateProvider:   (...args: unknown[]) => registerPrivateStateProvider(...args),
@@ -39,7 +39,7 @@ function makeFakeDb() {
     const tables: Record<string, Row[]> = { 'midnight.PendingSubmissions': [] };
     return {
         tables,
-        run: jest.fn(async (q: any) => {
+        run: vi.fn(async (q: any) => {
             const cqn = q.cqn || q;
             if (cqn.SELECT) {
                 const entity = cqn.SELECT.from.ref?.[0] || cqn.SELECT.from;
@@ -112,12 +112,12 @@ const cfg: ContractProvidersConfig = {
     zkConfigPath:   '/tmp/managed/test'
 };
 
-const wallet: WalletMaterial = {
+const wallet: WalletMaterial = vi.hoisted(() => ({
     accountId: 'addr_test1q...wallet',
     privateStoragePasswordProvider: () => 'a-test-passphrase-of-sufficient-length',
     walletAndMidnightProvider: { stub: true },
     privateStateBackend: 'cap-db'
-};
+}));
 
 const REGISTRATION = {
     artifactPath:   '/tmp/managed/test/contract/index.js',

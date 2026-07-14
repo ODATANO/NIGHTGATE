@@ -3,9 +3,9 @@
  * shielded ledger-shift wrapper. Symmetric to token-ops-unshield.test.ts.
  */
 
-const walletShieldNight = jest.fn();
+const walletShieldNight = vi.hoisted(() => (vi.fn()));
 
-jest.mock('../../srv/midnight/wallet-worker-client', () => ({
+vi.mock('../../srv/midnight/wallet-worker-client', () => ({
     walletShieldNight: (...args: unknown[]) => walletShieldNight(...args)
 }));
 

@@ -2,7 +2,7 @@
  * Tests for srv/nightgate-indexer-service.ts.
  *
  * HYBRID approach: runs against a REAL in-memory CAP DB via cds.test()
- * (see test/jest.setup.ts). Persistence (SyncState, ReorgLog, Blocks, …) is
+ * (see test/vitest.setup.ts). Persistence (SyncState, ReorgLog, Blocks, …) is
  * exercised against the real SQLite DB; the external crawler collaborator stays
  * mocked so startCrawler/stopCrawler/isCrawlerRunning never touch a real node.
  *
@@ -13,21 +13,23 @@
  * DB rows.
  */
 
-const mockStartCrawler = jest.fn();
-const mockStopCrawler = jest.fn();
-const mockIsCrawlerRunning = jest.fn();
-
-// External collaborator: keep mocked. jest.mock is hoisted and applies to the
-// framework-loaded service too, so the booted service uses these mocks.
-jest.mock('../../srv/crawler', () => ({
-    startCrawler: (...args: any[]) => mockStartCrawler(...args),
-    stopCrawler: (...args: any[]) => mockStopCrawler(...args),
-    isCrawlerRunning: (...args: any[]) => mockIsCrawlerRunning(...args)
-}));
+// The CAP server boots the compiled srv/*.js through Node's own require —
+// OUTSIDE vitest's module graph — so vi.mock would only patch this file's
+// imports, never the crawler calls inside the booted service (under jest the
+// runtime intercepted every require, so vi.mock's jest equivalent worked).
+// Instead, load the SAME native module instance the booted service uses and
+// stub its exports: the compiled service reads them as namespace properties at
+// call time, so the stubs land.
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const crawlerNative = require('../../srv/crawler');
+const mockStartCrawler = vi.fn();
+const mockStopCrawler = vi.fn();
+const mockIsCrawlerRunning = vi.fn();
+vi.spyOn(crawlerNative, 'startCrawler').mockImplementation(mockStartCrawler);
+vi.spyOn(crawlerNative, 'stopCrawler').mockImplementation(mockStopCrawler);
+vi.spyOn(crawlerNative, 'isCrawlerRunning').mockImplementation(mockIsCrawlerRunning);
 
 import cds from '@sap/cds';
-
-jest.setTimeout(60000);
 
 // Boot the in-memory CAP server. Not assigned to a `test` const on purpose
 // (would shadow Jest's global test()).
@@ -82,7 +84,7 @@ describe('SyncState initialization', () => {
     it('has created the SINGLETON SyncState row at boot', async () => {
         // Re-create from scratch to prove the singleton key shape works end-to-end.
         await db.run(cds.ql.DELETE.from(SYNC_STATE));
-        const { ensureSyncStateSingleton } = require('../../srv/utils/sync-state');
+        const { ensureSyncStateSingleton } = await import('../../srv/utils/sync-state.js');
         await ensureSyncStateSingleton(db);
 
         const row = await db.run(cds.ql.SELECT.one.from(SYNC_STATE).where({ ID: 'SINGLETON' }));
@@ -284,7 +286,7 @@ describe('getReadiness', () => {
         // The service's this.db is the same memoized 'db' connection used here,
         // so spying its run() drives the catch{} branch in getReadiness
         // (srv/nightgate-indexer-service.ts). Restored immediately after.
-        const runSpy = jest.spyOn(db, 'run').mockImplementation(() => Promise.reject(new Error('db down')));
+        const runSpy = vi.spyOn(db, 'run').mockImplementation(() => Promise.reject(new Error('db down')));
         try {
             const result = await srv.send('getReadiness');
             expect(result).toEqual({

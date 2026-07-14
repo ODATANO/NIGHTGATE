@@ -2,21 +2,21 @@
  * Tests for srv/crawler/BlockProcessor.ts persistence paths.
  *
  * HYBRID approach: runs against a REAL in-memory CAP DB via cds.test()
- * (see test/jest.setup.ts). The whole point of this suite is persistence, so
+ * (see test/vitest.setup.ts). The whole point of this suite is persistence, so
  * we give the BlockProcessor the REAL db, run the persist path, then SELECT the
  * actual rows and assert their persisted field values (block, transactions,
  * tx-results, tx-fees, contract actions, unshielded UTXOs, NightBalances, and
  * the SyncState advance).
  *
  * The old test captured `INSERT.into(...).entries(...)` / `UPDATE` query objects
- * via a hand-rolled jest.mock('@sap/cds') cds.ql mock and asserted their shapes
+ * via a hand-rolled vi.mock('@sap/cds') cds.ql mock and asserted their shapes
  * with an `extractRows(queries, 'midnight.X')` helper. That mock is removed; the
  * processor now writes through the framework's real cds.ql into SQLite, and the
  * query-shape assertions are reframed to row-state assertions.
  *
  * External collaborators stay MOCKED:
  *  - MidnightNodeProvider          → per-test inline fake objects (no real RPC)
- *  - reconcilePendingSubmission    → jest.mock (no-op; PendingSubmissions is
+ *  - reconcilePendingSubmission    → vi.mock (no-op; PendingSubmissions is
  *    empty in these tests, so reconciliation is a no-op anyway — mocking keeps
  *    the persist path decoupled from the submission module).
  *
@@ -28,19 +28,17 @@
  * Balances=4) come from the source's DEFAULT_PALLET_MAP.
  */
 
-// External collaborator: keep mocked. jest.mock is hoisted; only override
+// External collaborator: keep mocked. vi.mock is hoisted; only override
 // reconcilePendingSubmission, preserve every other real export so the
 // framework-booted submission handlers still load normally.
-const mockReconcile = jest.fn().mockResolvedValue(undefined);
-jest.mock('../../srv/submission/TransactionSubmitter', () => ({
-    ...jest.requireActual('../../srv/submission/TransactionSubmitter'),
+const mockReconcile = vi.hoisted(() => (vi.fn().mockResolvedValue(undefined)));
+vi.mock('../../srv/submission/TransactionSubmitter', async () => ({
+    ...await vi.importActual('../../srv/submission/TransactionSubmitter'),
     reconcilePendingSubmission: (...args: any[]) => mockReconcile(...args)
 }));
 
 import cds from '@sap/cds';
 import { BlockProcessor } from '../../srv/crawler/BlockProcessor';
-
-jest.setTimeout(60000);
 
 // Boot the in-memory CAP server. Not assigned to a `test` const on purpose
 // (would shadow Jest's global test()).
@@ -133,7 +131,7 @@ beforeAll(async () => {
 });
 
 beforeEach(async () => {
-    jest.clearAllMocks();
+    vi.clearAllMocks();
     mockReconcile.mockResolvedValue(undefined);
 
     // Reset DB state used by these tests (children before parents).
@@ -176,8 +174,8 @@ describe('BlockProcessor persistence paths', () => {
         }));
 
         const provider = {
-            getHeader: jest.fn().mockResolvedValue({ number: '0x2a' }),
-            getBlock: jest.fn()
+            getHeader: vi.fn().mockResolvedValue({ number: '0x2a' }),
+            getBlock: vi.fn()
         };
         const processor = makeProcessor(provider);
 
@@ -223,7 +221,7 @@ describe('BlockProcessor persistence paths', () => {
             buildUnsignedExtrinsic(15, 0)   // Zswap → shielded_transfer (from injected palletMap)
         ];
         const provider = {
-            getBlock: jest.fn().mockResolvedValue({
+            getBlock: vi.fn().mockResolvedValue({
                 block: {
                     header: {
                         parentHash: '0xparent',
@@ -237,8 +235,8 @@ describe('BlockProcessor persistence paths', () => {
                 },
                 justifications: null
             }),
-            getRuntimeVersion: jest.fn().mockResolvedValue({ specVersion: 77 }),
-            getStorage: jest.fn().mockResolvedValue(buildTimestampHex(1_700_000_000))
+            getRuntimeVersion: vi.fn().mockResolvedValue({ specVersion: 77 }),
+            getStorage: vi.fn().mockResolvedValue(buildTimestampHex(1_700_000_000))
         };
 
         const processor = makeProcessor(provider);
@@ -327,7 +325,7 @@ describe('BlockProcessor persistence paths', () => {
     // ------------------------------------------------------------------------
     it('falls back cleanly when runtime and timestamp metadata are unavailable', async () => {
         const provider = {
-            getBlock: jest.fn().mockResolvedValue({
+            getBlock: vi.fn().mockResolvedValue({
                 block: {
                     header: {
                         parentHash: '0xmissing-parent',
@@ -338,16 +336,16 @@ describe('BlockProcessor persistence paths', () => {
                 },
                 justifications: null
             }),
-            getRuntimeVersion: jest.fn().mockRejectedValue(new Error('runtime unavailable')),
-            getStorage: jest.fn().mockResolvedValue(null)
+            getRuntimeVersion: vi.fn().mockRejectedValue(new Error('runtime unavailable')),
+            getStorage: vi.fn().mockResolvedValue(null)
         };
 
         const processor = makeProcessor(provider);
 
-        const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+        const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
         // getBlockTimestamp falls back to Math.floor(Date.now()/1000) when storage
         // is null; pin Date.now so the persisted timestamp is deterministic.
-        const nowSpy = jest.spyOn(Date, 'now').mockReturnValue(1_700_000_000_000);
+        const nowSpy = vi.spyOn(Date, 'now').mockReturnValue(1_700_000_000_000);
 
         try {
             const result = await processor.processBlockByHash('0xfallback');
@@ -408,7 +406,7 @@ describe('BlockProcessor persistence paths', () => {
 
         const transferExtrinsic = buildSignedTransferExtrinsic(0x11, 0x22, 100);
         const provider = {
-            getBlock: jest.fn().mockResolvedValue({
+            getBlock: vi.fn().mockResolvedValue({
                 block: {
                     header: {
                         parentHash: '0xparent-3',
@@ -420,8 +418,8 @@ describe('BlockProcessor persistence paths', () => {
                 },
                 justifications: null
             }),
-            getRuntimeVersion: jest.fn().mockResolvedValue({ specVersion: 88 }),
-            getStorage: jest.fn().mockResolvedValue(buildTimestampHex(1_700_100_000))
+            getRuntimeVersion: vi.fn().mockResolvedValue({ specVersion: 88 }),
+            getStorage: vi.fn().mockResolvedValue(buildTimestampHex(1_700_100_000))
         };
 
         const processor = makeProcessor(provider);

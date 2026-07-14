@@ -90,7 +90,7 @@ const classify = (q: any) => q?.INSERT ? 'INSERT' : q?.UPDATE ? 'UPDATE' : q?.SE
 function seqDb(responses: any[]) {
     const calls: any[] = [];
     const queue = [...responses];
-    const run = jest.fn(async (q: any) => { calls.push(q); return queue.shift(); });
+    const run = vi.fn(async (q: any) => { calls.push(q); return queue.shift(); });
     return { run, calls };
 }
 
@@ -99,7 +99,7 @@ describe('reindexDisclosures', () => {
 
     test('returns zero and never decodes when contract state is null', async () => {
         const db = seqDb([]);
-        const ledger = jest.fn(() => { throw new Error('should not decode'); });
+        const ledger = vi.fn(() => { throw new Error('should not decode'); });
         const res = await reindexDisclosures({
             db, contractAddress: CONTRACT, ledger, queryContractState: async () => null
         });

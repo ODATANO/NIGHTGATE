@@ -1,7 +1,7 @@
 /**
  * Harness smoke test: proves cds.test() boots the NIGHTGATE plugin against an
  * in-memory SQLite DB, deploys the schema, and serves the OData services —
- * with the crawler + wallet worker skipped via SKIP_AUTO_INIT (jest.setup.ts).
+ * with the crawler + wallet worker skipped via SKIP_AUTO_INIT (vitest.setup.ts).
  *
  * If this is green, the real-DB integration style (this whole directory) is
  * viable and the service suites can be migrated onto it.

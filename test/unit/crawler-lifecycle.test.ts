@@ -1,21 +1,22 @@
-const mockDisconnect = jest.fn();
-const mockStart = jest.fn();
-const mockStop = jest.fn();
+const mockDisconnect = vi.fn();
+const mockStart = vi.fn();
+const mockStop = vi.fn();
 
-const mockNodeProviderConstructor = jest.fn().mockImplementation(() => ({
-    disconnect: mockDisconnect
-}));
+// Regular `function` impls: the sources construct these with `new`, and only
+// constructable (non-arrow) implementations survive that under vitest.
+const mockNodeProviderConstructor = vi.hoisted(() => (vi.fn().mockImplementation(function () {
+    return { disconnect: mockDisconnect };
+} as any)));
 
-const mockCrawlerConstructor = jest.fn().mockImplementation(() => ({
-    start: mockStart,
-    stop: mockStop
-}));
+const mockCrawlerConstructor = vi.hoisted(() => (vi.fn().mockImplementation(function () {
+    return { start: mockStart, stop: mockStop };
+} as any)));
 
-jest.mock('../../srv/providers/MidnightNodeProvider', () => ({
+vi.mock('../../srv/providers/MidnightNodeProvider', () => ({
     MidnightNodeProvider: mockNodeProviderConstructor
 }));
 
-jest.mock('../../srv/crawler/Crawler', () => ({
+vi.mock('../../srv/crawler/Crawler', () => ({
     MidnightCrawler: mockCrawlerConstructor
 }));
 
@@ -23,7 +24,7 @@ import { startCrawler, stopCrawler } from '../../srv/crawler/index';
 
 describe('crawler lifecycle wrapper', () => {
     beforeEach(async () => {
-        jest.clearAllMocks();
+        vi.clearAllMocks();
         await stopCrawler();
     });
 

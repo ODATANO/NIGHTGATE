@@ -120,3 +120,35 @@ describe('loadRegistryFromConfig', () => {
         expect(listRegisteredContracts()).toEqual([]);
     });
 });
+
+describe('getContractRegistration + loadRegistryFromConfig guards', () => {
+    it('getContractRegistration returns the stored registration or undefined', async () => {
+        const { getContractRegistration } = await import('../../srv/submission/contract-registry.js');
+        registerContract('reg-probe', { artifactPath: '/a.js', privateStateId: 'p', zkConfigPath: '/z' });
+        expect(getContractRegistration('reg-probe')).toMatchObject({ privateStateId: 'p' });
+        expect(getContractRegistration('nope')).toBeUndefined();
+    });
+
+    it('loadRegistryFromConfig ignores missing/non-object contracts config', async () => {
+        const { loadRegistryFromConfig, listRegisteredContracts } = await import('../../srv/submission/contract-registry.js');
+        loadRegistryFromConfig(undefined);
+        loadRegistryFromConfig({});
+        loadRegistryFromConfig({ contracts: 'not-an-object' });
+        expect(listRegisteredContracts()).toEqual([]);
+    });
+
+    it('loadRegistryFromConfig skips incomplete entries and resolves relative paths', async () => {
+        const { loadRegistryFromConfig, getContractRegistration, listRegisteredContracts } =
+            await import('../../srv/submission/contract-registry.js');
+        loadRegistryFromConfig({
+            contracts: {
+                incomplete: { artifactPath: 'only/this.js' },
+                complete: { artifactPath: 'rel/artifact.js', privateStateId: 'ps', zkConfigPath: 'rel/zk' }
+            }
+        }, '/base');
+        expect(listRegisteredContracts()).toEqual(['complete']);
+        const reg = getContractRegistration('complete')!;
+        // Relative paths are resolved against baseDir.
+        expect(reg.artifactPath.split(path.sep).join('/')).toContain('/base/rel/artifact.js');
+    });
+});

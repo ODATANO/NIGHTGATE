@@ -1,5 +1,5 @@
 /**
- * Jest global setup (runs before every test file).
+ * Vitest global setup (runs before every test file).
  *
  * Mirrors the ODATANO core harness:
  *  - NO_TELEMETRY: stop the telemetry cds-plugin from loading.

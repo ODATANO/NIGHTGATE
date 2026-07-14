@@ -11,7 +11,7 @@ import { CURRENT_ENCRYPTION_VERSION } from '../../srv/utils/storage-encryption';
 
 const store = new Map<string, any>();
 
-const runMock = jest.fn(async (q: any) => {
+const runMock = vi.hoisted(() => (vi.fn(async (q: any) => {
     if (!q || typeof q !== 'object') return undefined;
     if (q.kind === 'selectOne') {
         return store.get(q.where.accountId) ?? null;
@@ -31,52 +31,52 @@ const runMock = jest.fn(async (q: any) => {
         return undefined;
     }
     return undefined;
-});
+})));
 
-jest.mock('@sap/cds', () => {
+vi.mock('@sap/cds', () => {
     const SELECT = {
         one: {
-            from: jest.fn((entity: string) => ({
-                where: jest.fn((where: Record<string, unknown>) => ({
+            from: vi.fn((entity: string) => ({
+                where: vi.fn((where: Record<string, unknown>) => ({
                     kind: 'selectOne', entity, where
                 }))
             }))
         }
     };
     const INSERT = {
-        into: jest.fn((entity: string) => ({
-            entries: jest.fn((entry: Record<string, unknown>) => ({
+        into: vi.fn((entity: string) => ({
+            entries: vi.fn((entry: Record<string, unknown>) => ({
                 kind: 'insert', entity, entry
             }))
         }))
     };
     const UPDATE = {
-        entity: jest.fn((entity: string) => ({
-            set: jest.fn((set: Record<string, unknown>) => ({
-                where: jest.fn((where: Record<string, unknown>) => ({
+        entity: vi.fn((entity: string) => ({
+            set: vi.fn((set: Record<string, unknown>) => ({
+                where: vi.fn((where: Record<string, unknown>) => ({
                     kind: 'update', entity, set, where
                 }))
             }))
         }))
     };
     const DELETE = {
-        from: jest.fn((entity: string) => ({
-            where: jest.fn((where: Record<string, unknown>) => ({
+        from: vi.fn((entity: string) => ({
+            where: vi.fn((where: Record<string, unknown>) => ({
                 kind: 'delete', entity, where
             }))
         }))
     };
     const cds: any = {
         ql: { SELECT, INSERT, UPDATE, DELETE },
-        connect: { to: jest.fn(async () => ({ run: runMock })) },
+        connect: { to: vi.fn(async () => ({ run: runMock })) },
         env: { requires: {} }
     };
     cds.default = cds;
     return cds;
 });
 
-jest.mock('../../srv/utils/cds-model', () => ({
-    ensureNightgateModelLoaded: jest.fn(async () => undefined)
+vi.mock('../../srv/utils/cds-model', () => ({
+    ensureNightgateModelLoaded: vi.fn(async () => undefined)
 }));
 
 import {

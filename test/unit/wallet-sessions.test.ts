@@ -4,13 +4,14 @@
  * Verify disconnect flow consistently uses the public sessionId field.
  */
 
-const mockDbRun = jest.fn();
-const selectWhereSpy = jest.fn();
-const selectFromWhereSpy = jest.fn();
-const updateWhereSpy = jest.fn();
-const insertEntriesSpy = jest.fn();
+import type { MockInstance } from 'vitest';
+const mockDbRun = vi.fn();
+const selectWhereSpy = vi.hoisted(() => (vi.fn()));
+const selectFromWhereSpy = vi.hoisted(() => (vi.fn()));
+const updateWhereSpy = vi.hoisted(() => (vi.fn()));
+const insertEntriesSpy = vi.hoisted(() => (vi.fn()));
 
-jest.mock('@sap/cds', () => {
+vi.mock('@sap/cds', () => {
     const cds: any = {
         env: {
             requires: {
@@ -20,71 +21,71 @@ jest.mock('@sap/cds', () => {
         ql: {
             SELECT: {
                 one: {
-                    from: jest.fn().mockReturnValue({
+                    from: vi.fn().mockReturnValue({
                         where: selectWhereSpy
                     })
                 },
-                from: jest.fn().mockReturnValue({
-                    columns: jest.fn().mockReturnValue({ where: selectFromWhereSpy })
+                from: vi.fn().mockReturnValue({
+                    columns: vi.fn().mockReturnValue({ where: selectFromWhereSpy })
                 })
             },
             INSERT: {
-                into: jest.fn().mockReturnValue({
+                into: vi.fn().mockReturnValue({
                     entries: insertEntriesSpy
                 })
             },
             UPDATE: {
-                entity: jest.fn().mockReturnValue({
-                    set: jest.fn().mockReturnValue({
+                entity: vi.fn().mockReturnValue({
+                    set: vi.fn().mockReturnValue({
                         where: updateWhereSpy
                     })
                 })
             }
         },
         utils: {
-            uuid: jest.fn(() => 'generated-id')
+            uuid: vi.fn(() => 'generated-id')
         }
     };
     cds.default = cds;
     return cds;
 });
 
-const mockEvictWalletFacade = jest.fn();
-const mockGetOrBuildWalletFacade = jest.fn();
-const mockDeriveAccountId = jest.fn();
-const mockDeriveStoragePassword = jest.fn();
-const mockRegisterNightUtxosForDust = jest.fn();
-const mockDeregisterNightUtxosFromDust = jest.fn();
-const mockSendNight = jest.fn();
-const mockUnshieldFunds = jest.fn();
-const mockShieldFunds = jest.fn();
-const mockGetWalletBalance = jest.fn();
-const mockEstimateSendNightFee = jest.fn();
-const mockEstimateUnshieldFee = jest.fn();
-const mockEstimateShieldFee = jest.fn();
-const mockEnsureNetworkId = jest.fn();
-const mockWalletWaitForSyncedState = jest.fn();
+const mockEvictWalletFacade = vi.hoisted(() => (vi.fn()));
+const mockGetOrBuildWalletFacade = vi.hoisted(() => (vi.fn()));
+const mockDeriveAccountId = vi.hoisted(() => (vi.fn()));
+const mockDeriveStoragePassword = vi.hoisted(() => (vi.fn()));
+const mockRegisterNightUtxosForDust = vi.hoisted(() => (vi.fn()));
+const mockDeregisterNightUtxosFromDust = vi.hoisted(() => (vi.fn()));
+const mockSendNight = vi.hoisted(() => (vi.fn()));
+const mockUnshieldFunds = vi.hoisted(() => (vi.fn()));
+const mockShieldFunds = vi.hoisted(() => (vi.fn()));
+const mockGetWalletBalance = vi.hoisted(() => (vi.fn()));
+const mockEstimateSendNightFee = vi.hoisted(() => (vi.fn()));
+const mockEstimateUnshieldFee = vi.hoisted(() => (vi.fn()));
+const mockEstimateShieldFee = vi.hoisted(() => (vi.fn()));
+const mockEnsureNetworkId = vi.hoisted(() => (vi.fn()));
+const mockWalletWaitForSyncedState = vi.hoisted(() => (vi.fn()));
 
-jest.mock('../../srv/midnight/wallet-worker-client', () => ({
+vi.mock('../../srv/midnight/wallet-worker-client', () => ({
     walletWaitForSyncedState: mockWalletWaitForSyncedState
 }));
 
-jest.mock('../../srv/submission/wallet-facade-builder', () => ({
+vi.mock('../../srv/submission/wallet-facade-builder', () => ({
     evictWalletFacade: mockEvictWalletFacade,
     getOrBuildWalletFacade: mockGetOrBuildWalletFacade
 }));
 
-jest.mock('../../srv/submission/wallet-material-factory', () => ({
+vi.mock('../../srv/submission/wallet-material-factory', () => ({
     deriveAccountId: mockDeriveAccountId,
     deriveStoragePassword: mockDeriveStoragePassword
 }));
 
-jest.mock('../../srv/submission/dust-registration', () => ({
+vi.mock('../../srv/submission/dust-registration', () => ({
     registerNightUtxosForDust: mockRegisterNightUtxosForDust,
     deregisterNightUtxosFromDust: mockDeregisterNightUtxosFromDust
 }));
 
-jest.mock('../../srv/submission/token-ops', () => ({
+vi.mock('../../srv/submission/token-ops', () => ({
     sendNight: mockSendNight,
     unshieldFunds: mockUnshieldFunds,
     shieldFunds: mockShieldFunds,
@@ -94,7 +95,7 @@ jest.mock('../../srv/submission/token-ops', () => ({
     estimateShieldFee: mockEstimateShieldFee
 }));
 
-jest.mock('../../srv/midnight/providers', () => ({
+vi.mock('../../srv/midnight/providers', () => ({
     ensureNetworkId: mockEnsureNetworkId
 }));
 
@@ -102,8 +103,8 @@ jest.mock('../../srv/midnight/providers', () => ({
 // and return { jobId, status }. The stub here returns a predictable jobId so
 // handler-level assertions can be deterministic; the work fn is captured for
 // the few cases that drive it explicitly (idempotency, failure classification).
-const mockStartJob = jest.fn(async (args: any) => ({ jobId: `job-${args.kind}-test`, status: 'pending' as const }));
-jest.mock('../../srv/submission/background-jobs', () => ({
+const mockStartJob = vi.hoisted(() => (vi.fn(async (args: any) => ({ jobId: `job-${args.kind}-test`, status: 'pending' as const }))));
+vi.mock('../../srv/submission/background-jobs', () => ({
     startJob: (...args: unknown[]) => (mockStartJob as any)(...args)
 }));
 
@@ -131,7 +132,7 @@ function createMockRequest(data: Record<string, unknown>, ip: string | null | un
         // Sessions are user-bound (review_001 P1); every session action reads
         // req.user.id. Default to a fixed principal so handlers pass the auth gate.
         user: { id: TEST_USER_ID },
-        reject: jest.fn().mockImplementation((code: number, message: string) => ({
+        reject: vi.fn().mockImplementation((code: number, message: string) => ({
             __rejected: true,
             code,
             message
@@ -190,7 +191,7 @@ describe('wallet session handlers', () => {
     });
 
     beforeEach(() => {
-        jest.clearAllMocks();
+        vi.clearAllMocks();
         for (const key of NIGHTGATE_ENV_KEYS) delete process.env[key];
         mockDbRun.mockReset();
         selectWhereSpy.mockReset();
@@ -222,7 +223,7 @@ describe('wallet session handlers', () => {
     }
 
     it('connectWallet rejects rate-limited clients before validating or inserting a session', async () => {
-        const checkSpy = jest.spyOn(RateLimiter.prototype, 'check').mockReturnValue({
+        const checkSpy = vi.spyOn(RateLimiter.prototype, 'check').mockReturnValue({
             allowed: false,
             retryAfterMs: 1500
         });
@@ -262,8 +263,8 @@ describe('wallet session handlers', () => {
     });
 
     it('connectWallet falls back to the global rate-limit key and default TTL when no config is present', async () => {
-        const checkSpy = jest.spyOn(RateLimiter.prototype, 'check');
-        const nowSpy = jest.spyOn(Date, 'now').mockReturnValue(1_700_000_000_000);
+        const checkSpy = vi.spyOn(RateLimiter.prototype, 'check');
+        const nowSpy = vi.spyOn(Date, 'now').mockReturnValue(1_700_000_000_000);
         (cds.env as any).requires = {};
         mockDbRun.mockResolvedValueOnce(1);
 
@@ -284,7 +285,7 @@ describe('wallet session handlers', () => {
     });
 
     it('connectWallet uses the configured session TTL from nightgate config', async () => {
-        const nowSpy = jest.spyOn(Date, 'now').mockReturnValue(1_700_000_000_000);
+        const nowSpy = vi.spyOn(Date, 'now').mockReturnValue(1_700_000_000_000);
         (cds.env as any).requires = {
             nightgate: {
                 sessionTtlMs: 60_000
@@ -373,29 +374,29 @@ describe('wallet session handlers', () => {
     });
 
     it('startSessionCleanup deactivates expired sessions on the cleanup interval', async () => {
-        jest.useFakeTimers();
+        vi.useFakeTimers();
         // Cleanup now SELECTs the expiring rows (to evict cached facades) then
         // UPDATEs them, nulling BOTH encrypted keys (review_001 P2).
-        const db = { run: jest.fn().mockResolvedValueOnce([]).mockResolvedValueOnce(2) };
+        const db = { run: vi.fn().mockResolvedValueOnce([]).mockResolvedValueOnce(2) };
 
         try {
             const timer = startSessionCleanup(db);
-            await jest.advanceTimersByTimeAsync(15 * 60 * 1000);
+            await vi.advanceTimersByTimeAsync(15 * 60 * 1000);
 
             expect(db.run).toHaveBeenCalledTimes(2);
             clearInterval(timer);
         } finally {
-            jest.useRealTimers();
+            vi.useRealTimers();
         }
     });
 
     it('startSessionCleanup ignores cleanup errors and supports timers without unref', async () => {
         let callback: (() => Promise<void>) | undefined;
-        const setIntervalSpy = jest.spyOn(global, 'setInterval').mockImplementation(((handler: TimerHandler) => {
+        const setIntervalSpy = vi.spyOn(global, 'setInterval').mockImplementation(((handler: TimerHandler) => {
             callback = handler as () => Promise<void>;
             return {} as ReturnType<typeof setInterval>;
         }) as any);
-        const db = { run: jest.fn().mockRejectedValue(new Error('cleanup failed')) };
+        const db = { run: vi.fn().mockRejectedValue(new Error('cleanup failed')) };
 
         try {
             const timer = startSessionCleanup(db);
@@ -412,12 +413,12 @@ describe('wallet session handlers', () => {
 
     describe('connectWalletForSigning', () => {
         const VALID_SEED = 'a'.repeat(128); // 64-byte BIP39 seed (128 hex chars)
-        const consoleSpies: jest.SpyInstance[] = [];
+        const consoleSpies: MockInstance[] = [];
 
         beforeEach(() => {
-            consoleSpies.push(jest.spyOn(console, 'log').mockImplementation());
-            consoleSpies.push(jest.spyOn(console, 'warn').mockImplementation());
-            consoleSpies.push(jest.spyOn(console, 'error').mockImplementation());
+            consoleSpies.push(vi.spyOn(console, 'log').mockImplementation(() => {}));
+            consoleSpies.push(vi.spyOn(console, 'warn').mockImplementation(() => {}));
+            consoleSpies.push(vi.spyOn(console, 'error').mockImplementation(() => {}));
         });
 
         afterEach(() => {
@@ -425,7 +426,7 @@ describe('wallet session handlers', () => {
         });
 
         it('rejects rate-limited clients', async () => {
-            const checkSpy = jest.spyOn(RateLimiter.prototype, 'check').mockReturnValue({ allowed: false, retryAfterMs: 1000 });
+            const checkSpy = vi.spyOn(RateLimiter.prototype, 'check').mockReturnValue({ allowed: false, retryAfterMs: 1000 });
             try {
                 const req = createMockRequest({ sessionId: 's1', seedHex: VALID_SEED });
                 await registeredHandlers['connectWalletForSigning'](req);
@@ -509,7 +510,7 @@ describe('wallet session handlers', () => {
             mockDbRun.mockResolvedValueOnce(session).mockResolvedValueOnce(1);
             mockStartJob.mockRejectedValueOnce(new Error('worker offline'));
 
-            const warn = jest.spyOn(console, 'warn').mockImplementation();
+            const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
             try {
                 const req = createMockRequest({ sessionId: 's1', seedHex: VALID_SEED });
                 const result = await registeredHandlers['connectWalletForSigning'](req);
@@ -532,11 +533,11 @@ describe('wallet session handlers', () => {
     // ------------------------------------------------------------------
 
     describe('dust-registration handlers', () => {
-        const logSpies: jest.SpyInstance[] = [];
+        const logSpies: MockInstance[] = [];
 
         beforeEach(() => {
-            logSpies.push(jest.spyOn(console, 'log').mockImplementation());
-            logSpies.push(jest.spyOn(console, 'warn').mockImplementation());
+            logSpies.push(vi.spyOn(console, 'log').mockImplementation(() => {}));
+            logSpies.push(vi.spyOn(console, 'warn').mockImplementation(() => {}));
         });
 
         afterEach(() => {
@@ -602,7 +603,7 @@ describe('wallet session handlers', () => {
         });
 
         it('rejects 429 when rate-limited', async () => {
-            const checkSpy = jest.spyOn(RateLimiter.prototype, 'check').mockReturnValue({ allowed: false, retryAfterMs: 1000 });
+            const checkSpy = vi.spyOn(RateLimiter.prototype, 'check').mockReturnValue({ allowed: false, retryAfterMs: 1000 });
             try {
                 const req = createMockRequest({ sessionId: 's1' });
                 await registeredHandlers['registerForDustGeneration'](req);
@@ -651,12 +652,12 @@ describe('wallet session handlers', () => {
 
     describe('sendNight', () => {
         beforeEach(() => {
-            jest.spyOn(console, 'log').mockImplementation();
-            jest.spyOn(console, 'warn').mockImplementation();
+            vi.spyOn(console, 'log').mockImplementation(() => {});
+            vi.spyOn(console, 'warn').mockImplementation(() => {});
         });
 
         afterEach(() => {
-            jest.restoreAllMocks();
+            vi.restoreAllMocks();
         });
 
         it('rejects 400 for missing or malformed inputs', async () => {
@@ -733,10 +734,10 @@ describe('wallet session handlers', () => {
 
     describe('swap handlers', () => {
         beforeEach(() => {
-            jest.spyOn(console, 'log').mockImplementation();
+            vi.spyOn(console, 'log').mockImplementation(() => {});
         });
         afterEach(() => {
-            jest.restoreAllMocks();
+            vi.restoreAllMocks();
         });
 
         it('unshieldFunds returns { jobId, status } and defers the inner call to startJob', async () => {
@@ -784,10 +785,10 @@ describe('wallet session handlers', () => {
 
     describe('diagnostics handlers', () => {
         beforeEach(() => {
-            jest.spyOn(console, 'log').mockImplementation();
+            vi.spyOn(console, 'log').mockImplementation(() => {});
         });
         afterEach(() => {
-            jest.restoreAllMocks();
+            vi.restoreAllMocks();
         });
 
         it('getWalletBalance returns the inner helper result', async () => {
@@ -859,10 +860,10 @@ describe('wallet session handlers', () => {
 
     describe('disconnectWallet (facade eviction)', () => {
         beforeEach(() => {
-            jest.spyOn(console, 'log').mockImplementation();
+            vi.spyOn(console, 'log').mockImplementation(() => {});
         });
         afterEach(() => {
-            jest.restoreAllMocks();
+            vi.restoreAllMocks();
         });
 
         it('evicts the cached facade for the account before deactivating the session', async () => {

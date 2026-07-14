@@ -2,7 +2,10 @@
     "extends": "./tsconfig.json",
     "compilerOptions": {
         "outDir": ".",
-        "sourceMap": false,
+        // Sourcemaps stay ON so vitest's v8 coverage can remap the natively
+        // required (CAP-booted) .js twins back onto the .ts sources. Not
+        // published: package.json "files" whitelists only .js/.d.ts.
+        "sourceMap": true,
         "declarationMap": false,
         "types": [
             "node",

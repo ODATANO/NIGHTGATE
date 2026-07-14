@@ -2,7 +2,7 @@
  * Tests for srv/nightgate-service.ts.
  *
  * HYBRID approach: runs against a REAL in-memory CAP DB via cds.test()
- * (see test/jest.setup.ts). Persistence (Blocks, Transactions, ContractActions,
+ * (see test/vitest.setup.ts). Persistence (Blocks, Transactions, ContractActions,
  * UnshieldedUtxos, NightBalances, BackgroundJobs) is exercised against the real
  * SQLite DB — we seed rows, invoke the service action / OData endpoint, then
  * assert on the returned data. The old query-shape assertions (builder.__table /
@@ -17,19 +17,17 @@
  * the real getJobById, so we seed a row rather than mock the lookup.
  */
 
-const mockRegisterWalletSessionHandlers = jest.fn();
-const mockStartSessionCleanup = jest.fn((..._args: any[]) => ({ unref: jest.fn() }));
+const mockRegisterWalletSessionHandlers = vi.hoisted(() => (vi.fn()));
+const mockStartSessionCleanup = vi.hoisted(() => (vi.fn((..._args: any[]) => ({ unref: vi.fn() }))));
 
-// External collaborator: keep mocked. jest.mock is hoisted and applies to the
+// External collaborator: keep mocked. vi.mock is hoisted and applies to the
 // framework-loaded service too, so the booted service uses these mocks.
-jest.mock('../../srv/sessions/wallet-sessions', () => ({
+vi.mock('../../srv/sessions/wallet-sessions', () => ({
     registerWalletSessionHandlers: (...args: any[]) => mockRegisterWalletSessionHandlers(...args),
     startSessionCleanup: (...args: any[]) => mockStartSessionCleanup(...args)
 }));
 
 import cds from '@sap/cds';
-
-jest.setTimeout(60000);
 
 // Boot the in-memory CAP server. Not assigned to a `test` const on purpose
 // (would shadow Jest's global test()). We use the HTTP client `cap` for the
@@ -146,7 +144,7 @@ async function seedBalance(address: string, balance: number, overrides: Record<s
 // ----------------------------------------------------------------------------
 describe('init', () => {
     it('delegates wallet-session handling + cleanup with the live db connection', async () => {
-        const ServiceCtor = require('../../srv/nightgate-service').default;
+        const ServiceCtor: any = (await import('../../srv/nightgate-service.js')).default;
         const instance = new ServiceCtor(undefined, srv.model, {} as any);
         await instance.init();
 
@@ -169,11 +167,11 @@ describe('init', () => {
 // ----------------------------------------------------------------------------
 describe('shutdown hook', () => {
     async function initAndCaptureShutdown(timer: any): Promise<Function> {
-        const ServiceCtor = require('../../srv/nightgate-service').default;
+        const ServiceCtor: any = (await import('../../srv/nightgate-service.js')).default;
         mockStartSessionCleanup.mockReturnValueOnce(timer);
 
         let shutdownHandler: Function | undefined;
-        const onSpy = jest.spyOn(cds as any, 'on').mockImplementation(((event: string, cb: Function) => {
+        const onSpy = vi.spyOn(cds as any, 'on').mockImplementation(((event: string, cb: Function) => {
             if (event === 'shutdown') shutdownHandler = cb;
             return cds;
         }) as any);
@@ -188,10 +186,10 @@ describe('shutdown hook', () => {
     }
 
     it('clears the session cleanup timer on shutdown', async () => {
-        const fakeTimer = { unref: jest.fn() } as unknown as ReturnType<typeof setInterval>;
+        const fakeTimer = { unref: vi.fn() } as unknown as ReturnType<typeof setInterval>;
         const handler = await initAndCaptureShutdown(fakeTimer);
 
-        const clearSpy = jest.spyOn(global, 'clearInterval').mockImplementation(() => {});
+        const clearSpy = vi.spyOn(global, 'clearInterval').mockImplementation(() => {});
         try {
             handler();
             expect(clearSpy).toHaveBeenCalledWith(fakeTimer);
@@ -203,7 +201,7 @@ describe('shutdown hook', () => {
     it('skips clearInterval when no cleanup timer is active', async () => {
         const handler = await initAndCaptureShutdown(undefined);
 
-        const clearSpy = jest.spyOn(global, 'clearInterval').mockImplementation(() => {});
+        const clearSpy = vi.spyOn(global, 'clearInterval').mockImplementation(() => {});
         try {
             handler();
             expect(clearSpy).not.toHaveBeenCalled();

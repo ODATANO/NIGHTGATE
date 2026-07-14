@@ -8,9 +8,9 @@
  * (srv/sessions/wallet-sessions.ts) and on the worker; not exercised here.
  */
 
-const walletTransferNight = jest.fn();
+const walletTransferNight = vi.hoisted(() => (vi.fn()));
 
-jest.mock('../../srv/midnight/wallet-worker-client', () => ({
+vi.mock('../../srv/midnight/wallet-worker-client', () => ({
     walletTransferNight: (...args: unknown[]) => walletTransferNight(...args)
 }));
 

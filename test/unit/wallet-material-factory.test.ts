@@ -14,11 +14,11 @@ import crypto from 'crypto';
 // Mock loadLedgerV8, ledger-v8 is ESM-only and cannot be loaded from this
 // Jest CommonJS runtime. Tests verify wiring/shape; real crypto derivation is
 // exercised by scripts/integration-test-wallet-keys.mjs.
-jest.mock('../../srv/midnight/sdk-loader', () => {
-    const actual = jest.requireActual('../../srv/midnight/sdk-loader');
+vi.mock('../../srv/midnight/sdk-loader', async () => {
+    const actual = await vi.importActual('../../srv/midnight/sdk-loader');
     return {
         ...actual,
-        loadLedgerV8: jest.fn(async () => ({
+        loadLedgerV8: vi.fn(async () => ({
             ZswapSecretKeys: {
                 fromSeed: (seed: Uint8Array) => {
                     // Deterministic stub: hash the seed to produce stable pubkeys.
@@ -44,17 +44,17 @@ jest.mock('../../srv/midnight/sdk-loader', () => {
 
 // Mock the ESM-only HD derivation lib. deriveRoleSeeds is deterministic per
 // input BIP39 seed so determinism / different-seed assertions hold.
-jest.mock('../../srv/utils/wallet-hd', () => {
+vi.mock('../../srv/utils/wallet-hd', async () => {
     const c = require('crypto');
     const role = (seed: Uint8Array, label: string) =>
         new Uint8Array(c.createHash('sha256').update(Buffer.from(seed)).update(label).digest());
     return {
-        deriveRoleSeeds: jest.fn(async (bip39Seed: Uint8Array) => ({
+        deriveRoleSeeds: vi.fn(async (bip39Seed: Uint8Array) => ({
             zswap: role(bip39Seed, 'zswap'),
             dust:  role(bip39Seed, 'dust'),
             night: role(bip39Seed, 'night')
         })),
-        mnemonicToBip39SeedHex: jest.fn((m: string) =>
+        mnemonicToBip39SeedHex: vi.fn((m: string) =>
             c.createHash('sha512').update(m).digest('hex'))
     };
 });
@@ -72,7 +72,7 @@ import { encrypt, getEncryptionKey } from '../../srv/utils/crypto';
 
 function makeDbWithSession(row: Record<string, any> | null) {
     return {
-        run: jest.fn(async (_q: any) => row)
+        run: vi.fn(async (_q: any) => row)
     };
 }
 
@@ -156,7 +156,7 @@ describe('buildWalletMaterialForSession', () => {
         // Capture the query so we can confirm the WHERE is user-scoped; return
         // null so a foreign/absent match surfaces as SessionNotFoundError.
         let captured: any;
-        const db = { run: jest.fn(async (q: any) => { captured = q; return null; }) };
+        const db = { run: vi.fn(async (q: any) => { captured = q; return null; }) };
         await expect(buildWalletMaterialForSession({
             sessionId: 's1', expectedUserId: 'owner-1', db, encryptionKey: TEST_KEY
         })).rejects.toBeInstanceOf(SessionNotFoundError);
@@ -167,7 +167,7 @@ describe('buildWalletMaterialForSession', () => {
 
     test('omits the userId filter when expectedUserId is not provided', async () => {
         let captured: any;
-        const db = { run: jest.fn(async (q: any) => { captured = q; return null; }) };
+        const db = { run: vi.fn(async (q: any) => { captured = q; return null; }) };
         await expect(buildWalletMaterialForSession({
             sessionId: 's1', db, encryptionKey: TEST_KEY
         })).rejects.toBeInstanceOf(SessionNotFoundError);
@@ -373,9 +373,8 @@ describe('signing-capable wallet adapter (session with encryptedSeedKey)', () =>
 // ---- Classifier integration -----------------------------------------------
 
 describe('classifySubmissionError recognizes WalletSigningNotAvailable', () => {
-    const { classifySubmissionError } = require('../../srv/submission/TransactionSubmitter');
-
-    test('maps WalletSigningNotAvailable to stable code, non-retryable, with seed hint', () => {
+    test('maps WalletSigningNotAvailable to stable code, non-retryable, with seed hint', async () => {
+        const { classifySubmissionError } = await import('../../srv/submission/TransactionSubmitter.js');
         const err = new WalletSigningNotAvailable('balanceTx()');
         const c = classifySubmissionError(err, 'preprod');
         expect(c.code).toBe('WalletSigningNotAvailable');

@@ -6,9 +6,9 @@
  * - Structured author extraction from digest logs
  */
 
-const selectColumnsWhereSpy = jest.fn();
+const selectColumnsWhereSpy = vi.hoisted(() => (vi.fn()));
 
-jest.mock('@sap/cds', () => {
+vi.mock('@sap/cds', () => {
     const cds: any = {
         env: {
             requires: {
@@ -22,31 +22,31 @@ jest.mock('@sap/cds', () => {
         ql: {
             SELECT: {
                 one: {
-                    from: jest.fn().mockReturnValue({
-                        columns: jest.fn().mockReturnValue({
+                    from: vi.fn().mockReturnValue({
+                        columns: vi.fn().mockReturnValue({
                             where: selectColumnsWhereSpy
                         })
                     })
                 }
             },
             INSERT: {
-                into: jest.fn().mockReturnValue({
-                    entries: jest.fn()
+                into: vi.fn().mockReturnValue({
+                    entries: vi.fn()
                 })
             },
             UPDATE: {
-                entity: jest.fn().mockReturnValue({
-                    set: jest.fn().mockReturnValue({
-                        where: jest.fn()
+                entity: vi.fn().mockReturnValue({
+                    set: vi.fn().mockReturnValue({
+                        where: vi.fn()
                     })
                 })
             }
         },
         connect: {
-            to: jest.fn()
+            to: vi.fn()
         },
         utils: {
-            uuid: jest.fn(() => 'uuid-1')
+            uuid: vi.fn(() => 'uuid-1')
         }
     };
     cds.default = cds;
@@ -148,12 +148,12 @@ describe('classifyExtrinsic and mapPalletCall', () => {
 
 describe('getBlockTimestamp: SCALE u64 LE parsing', () => {
     const provider = {
-        getStorage: jest.fn()
+        getStorage: vi.fn()
     } as any;
     const processor = new BlockProcessor(provider);
 
     beforeEach(() => {
-        jest.clearAllMocks();
+        vi.clearAllMocks();
     });
 
     it('parses a known SCALE u64 LE timestamp correctly', async () => {
@@ -181,8 +181,8 @@ describe('getBlockTimestamp: SCALE u64 LE parsing', () => {
     });
 
     it('falls back to wall clock time when storage lookup fails', async () => {
-        const nowSpy = jest.spyOn(Date, 'now').mockReturnValue(1_700_000_000_000);
-        const warnSpy = jest.spyOn(console, 'warn').mockImplementation();
+        const nowSpy = vi.spyOn(Date, 'now').mockReturnValue(1_700_000_000_000);
+        const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
         provider.getStorage.mockRejectedValueOnce(new Error('storage unavailable'));
 
         try {
@@ -201,12 +201,12 @@ describe('getBlockTimestamp: SCALE u64 LE parsing', () => {
 
 describe('getProtocolVersion: RuntimeVersion per-block query with error fallback', () => {
     beforeEach(() => {
-        jest.clearAllMocks();
+        vi.clearAllMocks();
     });
 
     it('queries the runtime version per block hash (no skip-cache)', async () => {
         const provider = {
-            getRuntimeVersion: jest.fn()
+            getRuntimeVersion: vi.fn()
         } as any;
         const processor = new BlockProcessor(provider);
 
@@ -219,7 +219,7 @@ describe('getProtocolVersion: RuntimeVersion per-block query with error fallback
 
     it('reflects runtime upgrades on later blocks instead of serving a stale cache', async () => {
         const provider = {
-            getRuntimeVersion: jest.fn()
+            getRuntimeVersion: vi.fn()
         } as any;
         const processor = new BlockProcessor(provider);
         provider.getRuntimeVersion
@@ -232,10 +232,10 @@ describe('getProtocolVersion: RuntimeVersion per-block query with error fallback
 
     it('falls back to the last successfully fetched value when the RPC fails', async () => {
         const provider = {
-            getRuntimeVersion: jest.fn()
+            getRuntimeVersion: vi.fn()
         } as any;
         const processor = new BlockProcessor(provider);
-        const warnSpy = jest.spyOn(console, 'warn').mockImplementation();
+        const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
         provider.getRuntimeVersion
             .mockResolvedValueOnce({ specVersion: 42 })
             .mockRejectedValueOnce(new Error('runtime unavailable'));
@@ -251,10 +251,10 @@ describe('getProtocolVersion: RuntimeVersion per-block query with error fallback
 
     it('logs a warning and returns the cached value if the initial fetch fails', async () => {
         const provider = {
-            getRuntimeVersion: jest.fn()
+            getRuntimeVersion: vi.fn()
         } as any;
         const processor = new BlockProcessor(provider);
-        const warnSpy = jest.spyOn(console, 'warn').mockImplementation();
+        const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
         provider.getRuntimeVersion.mockRejectedValueOnce(new Error('runtime unavailable'));
 
         try {
@@ -318,10 +318,10 @@ describe('extractAuthor: digest log parsing', () => {
 describe('BlockProcessor public helpers', () => {
     it('resolves the hash and processes the block with parent enforcement (height path)', async () => {
         const provider = {
-            getBlockHash: jest.fn().mockResolvedValue('0xblockhash')
+            getBlockHash: vi.fn().mockResolvedValue('0xblockhash')
         } as any;
         const processor = new BlockProcessor(provider);
-        const processFromNodeSpy = jest.spyOn(processor as any, 'processFromNode').mockResolvedValue({
+        const processFromNodeSpy = vi.spyOn(processor as any, 'processFromNode').mockResolvedValue({
             blockHeight: 7,
             blockHash: '0xblockhash',
             transactionCount: 0,
@@ -340,7 +340,7 @@ describe('BlockProcessor public helpers', () => {
 
     it('processes hash-addressed blocks without parent enforcement (on-demand path)', async () => {
         const processor = new BlockProcessor({} as any);
-        const processFromNodeSpy = jest.spyOn(processor as any, 'processFromNode').mockResolvedValue({
+        const processFromNodeSpy = vi.spyOn(processor as any, 'processFromNode').mockResolvedValue({
             blockHeight: 7,
             blockHash: '0xblockhash',
             transactionCount: 0,
@@ -354,7 +354,7 @@ describe('BlockProcessor public helpers', () => {
 
     it('throws when no block exists at the requested height', async () => {
         const provider = {
-            getBlockHash: jest.fn().mockResolvedValue(null)
+            getBlockHash: vi.fn().mockResolvedValue(null)
         } as any;
         const processor = new BlockProcessor(provider);
 
@@ -364,7 +364,7 @@ describe('BlockProcessor public helpers', () => {
     it('checks block existence from the local DB', async () => {
         const processor = new BlockProcessor({} as any);
         (processor as any).db = {
-            run: jest.fn()
+            run: vi.fn()
                 .mockResolvedValueOnce({ ID: 'block-1' })
                 .mockResolvedValueOnce(null)
         };

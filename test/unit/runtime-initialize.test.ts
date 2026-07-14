@@ -1,12 +1,12 @@
-const mockDbRun = jest.fn();
-const mockDbDeploy = jest.fn();
-const mockCdsDeployTo = jest.fn();
-const mockCdsDeploy = jest.fn();
-const mockConnectTo = jest.fn();
-const mockStartCrawler = jest.fn();
-const mockStopCrawler = jest.fn();
-const mockEnsureNightgateModelLoaded = jest.fn();
-const selectFromSpy = jest.fn();
+const mockDbRun = vi.fn();
+const mockDbDeploy = vi.fn();
+const mockCdsDeployTo = vi.fn();
+const mockCdsDeploy = vi.hoisted(() => (vi.fn()));
+const mockConnectTo = vi.hoisted(() => (vi.fn()));
+const mockStartCrawler = vi.hoisted(() => (vi.fn()));
+const mockStopCrawler = vi.hoisted(() => (vi.fn()));
+const mockEnsureNightgateModelLoaded = vi.hoisted(() => (vi.fn()));
+const selectFromSpy = vi.hoisted(() => (vi.fn()));
 const ENV_KEYS = [
     'NIGHTGATE_NETWORK',
     'NIGHTGATE_NODE_URL',
@@ -15,7 +15,7 @@ const ENV_KEYS = [
 ] as const;
 const originalEnv = Object.fromEntries(ENV_KEYS.map((key) => [key, process.env[key]])) as Record<(typeof ENV_KEYS)[number], string | undefined>;
 
-jest.mock('@sap/cds', () => {
+vi.mock('@sap/cds', () => {
     const cds: any = {
         env: {
             requires: {
@@ -45,27 +45,27 @@ jest.mock('@sap/cds', () => {
     return cds;
 });
 
-jest.mock('../../srv/crawler/index', () => ({
+vi.mock('../../srv/crawler/index', () => ({
     startCrawler: mockStartCrawler,
     stopCrawler: mockStopCrawler
 }));
 
-jest.mock('../../srv/utils/cds-model', () => ({
+vi.mock('../../srv/utils/cds-model', () => ({
     ensureNightgateModelLoaded: mockEnsureNightgateModelLoaded
 }));
 
-jest.mock('../../srv/midnight/wallet-worker-client', () => ({
-    startWalletWorker: jest.fn(async () => undefined),
-    stopWalletWorker:  jest.fn(async () => undefined),
-    setStateSaveSink:  jest.fn()
+vi.mock('../../srv/midnight/wallet-worker-client', () => ({
+    startWalletWorker: vi.fn(async () => undefined),
+    stopWalletWorker:  vi.fn(async () => undefined),
+    setStateSaveSink:  vi.fn()
 }));
 
-jest.mock('../../srv/submission/wallet-facade-builder', () => ({
-    wireWorkerStateSaveSink: jest.fn(),
-    getOrBuildWalletFacade:  jest.fn(),
-    evictWalletFacade:       jest.fn(async () => undefined),
-    getCacheSize:            jest.fn(() => 0),
-    clearAllFacades:         jest.fn()
+vi.mock('../../srv/submission/wallet-facade-builder', () => ({
+    wireWorkerStateSaveSink: vi.fn(),
+    getOrBuildWalletFacade:  vi.fn(),
+    evictWalletFacade:       vi.fn(async () => undefined),
+    getCacheSize:            vi.fn(() => 0),
+    clearAllFacades:         vi.fn()
 }));
 
 import cds from '@sap/cds';
@@ -73,7 +73,7 @@ import { initialize, shutdown } from '../../src/index';
 
 describe('runtime initialize', () => {
     beforeEach(async () => {
-        jest.clearAllMocks();
+        vi.clearAllMocks();
 
         for (const key of ENV_KEYS) {
             delete process.env[key];
@@ -97,7 +97,7 @@ describe('runtime initialize', () => {
         mockEnsureNightgateModelLoaded.mockResolvedValue(undefined);
 
         await shutdown();
-        jest.clearAllMocks();
+        vi.clearAllMocks();
     });
 
     afterAll(() => {
@@ -112,7 +112,7 @@ describe('runtime initialize', () => {
     });
 
     it('loads the model before DB access, starts the crawler, and logs syncing startup state', async () => {
-        const logSpy = jest.spyOn(console, 'log').mockImplementation();
+        const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
 
         try {
             const status = await initialize();
@@ -149,7 +149,7 @@ describe('runtime initialize', () => {
     });
 
     it('returns idle mode and logs a stopped startup state when the crawler is disabled', async () => {
-        const logSpy = jest.spyOn(console, 'log').mockImplementation();
+        const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
         (cds.env as any).requires.nightgate.crawler = { enabled: false };
 
         try {
@@ -168,8 +168,8 @@ describe('runtime initialize', () => {
     });
 
     it('logs an offline startup state when crawler startup fails with a node error', async () => {
-        const logSpy = jest.spyOn(console, 'log').mockImplementation();
-        const warnSpy = jest.spyOn(console, 'warn').mockImplementation();
+        const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+        const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
         mockStartCrawler.mockRejectedValue(new Error('ECONNREFUSED: connect'));
 
         try {
@@ -190,8 +190,9 @@ describe('runtime initialize', () => {
     });
 
     it('throws SchemaNotDeployedError when a required table is missing (no auto-deploy)', async () => {
-        // eslint-disable-next-line @typescript-eslint/no-require-imports
-        const { SchemaNotDeployedError } = require('../../src/index');
+        // Same module graph as the initialize() under test — a native
+        // require() would yield a different class identity for instanceof.
+        const { SchemaNotDeployedError } = await import('../../src/index.js');
 
         // Probes: Blocks OK, SyncState missing. initialize() should bail
         // immediately with SchemaNotDeployedError; no deploy attempt, no
@@ -222,7 +223,7 @@ describe('runtime initialize', () => {
     });
 
     it('uses env overrides for preprod startup even when package config has no network', async () => {
-        const logSpy = jest.spyOn(console, 'log').mockImplementation();
+        const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
         delete (cds.env as any).requires.nightgate.network;
         process.env.NIGHTGATE_NETWORK = 'preprod';
         process.env.NIGHTGATE_NODE_URL = 'wss://node.example.test';

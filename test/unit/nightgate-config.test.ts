@@ -17,7 +17,9 @@ import {
     isNightgatePluginConfigured,
     isSelfServiceGranteeRegistrationAllowed,
     normalizeNightgateNetwork,
-    resolveNightgateRuntimeConfig
+    resolveNightgateRuntimeConfig,
+    resolveOverrideIndexerEndpoints,
+    DEFAULT_INDEXER_URLS
 } from '../../srv/utils/nightgate-config';
 
 const ENV_KEYS = [
@@ -28,7 +30,14 @@ const ENV_KEYS = [
     'NIGHTGATE_FETCH_CONCURRENCY',
     'NIGHTGATE_RPC_BATCH_SIZE',
     'NIGHTGATE_CRAWLER_ENABLED',
-    'NIGHTGATE_ALLOW_SELF_SERVICE_GRANTEE_REGISTRATION'
+    'NIGHTGATE_ALLOW_SELF_SERVICE_GRANTEE_REGISTRATION',
+    // Submission endpoints: a developer .env for live runs (or the IDE test
+    // extension propagating it) would otherwise win over the config-based
+    // expectations in these tests — same scrub wallet-sessions.test.ts does.
+    'NIGHTGATE_INDEXER_HTTP_URL',
+    'NIGHTGATE_INDEXER_WS_URL',
+    'NIGHTGATE_PROOF_SERVER_URL',
+    'NIGHTGATE_ZK_CONFIG_BASE'
 ] as const;
 const originalEnv = Object.fromEntries(
     ENV_KEYS.map((k) => [k, process.env[k]])
@@ -213,5 +222,42 @@ describe('resolveNightgateRuntimeConfig', () => {
     it('honours an explicit nodeUrl override even on undeployed', () => {
         const { nodeUrl } = resolveNightgateRuntimeConfig({ network: 'undeployed', nodeUrl: 'ws://host.docker.internal:9944' });
         expect(nodeUrl).toBe('ws://host.docker.internal:9944');
+    });
+});
+
+describe('resolveOverrideIndexerEndpoints (verify-state-network-override FR)', () => {
+    it('falls back to the built-in public defaults for the override network', () => {
+        const eps = resolveOverrideIndexerEndpoints('preview', {});
+        expect(eps.indexerHttpUrl).toBe(DEFAULT_INDEXER_URLS.preview.http);
+        expect(eps.indexerWsUrl).toBe(DEFAULT_INDEXER_URLS.preview.ws);
+    });
+
+    it('prefers cds.requires.nightgate.networks[<network>] over defaults', () => {
+        const eps = resolveOverrideIndexerEndpoints('preprod', {
+            networks: { preprod: { indexerHttpUrl: 'http://my-idx', indexerWsUrl: 'ws://my-idx' } }
+        });
+        expect(eps.indexerHttpUrl).toBe('http://my-idx');
+        expect(eps.indexerWsUrl).toBe('ws://my-idx');
+    });
+
+    it('fills only the endpoint fields the networks entry sets', () => {
+        const eps = resolveOverrideIndexerEndpoints('preprod', {
+            networks: { preprod: { indexerHttpUrl: 'http://my-idx' } }
+        });
+        expect(eps.indexerHttpUrl).toBe('http://my-idx');
+        expect(eps.indexerWsUrl).toBe(DEFAULT_INDEXER_URLS.preprod.ws);
+    });
+
+    it('ignores top-level indexer config and NIGHTGATE_INDEXER_* env vars — they belong to the configured network', () => {
+        process.env.NIGHTGATE_INDEXER_HTTP_URL = 'http://configured-net-only';
+        process.env.NIGHTGATE_INDEXER_WS_URL = 'ws://configured-net-only';
+        const eps = resolveOverrideIndexerEndpoints('mainnet', {
+            indexerHttpUrl: 'http://also-configured-net-only',
+            indexerWsUrl: 'ws://also-configured-net-only'
+        });
+        delete process.env.NIGHTGATE_INDEXER_HTTP_URL;
+        delete process.env.NIGHTGATE_INDEXER_WS_URL;
+        expect(eps.indexerHttpUrl).toBe(DEFAULT_INDEXER_URLS.mainnet.http);
+        expect(eps.indexerWsUrl).toBe(DEFAULT_INDEXER_URLS.mainnet.ws);
     });
 });

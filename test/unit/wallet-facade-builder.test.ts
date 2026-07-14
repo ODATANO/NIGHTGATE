@@ -7,20 +7,20 @@
  * state-save sink without touching the real SDK or DB.
  */
 
-const mockWalletInit = jest.fn();
-const mockWalletEvict = jest.fn();
-const mockSetStateSaveSink = jest.fn();
-const mockLoadSyncState = jest.fn();
-const mockSaveSyncState = jest.fn();
-const mockGetWalletSdkVersion = jest.fn(() => 'sdk-test');
+const mockWalletInit = vi.hoisted(() => (vi.fn()));
+const mockWalletEvict = vi.hoisted(() => (vi.fn()));
+const mockSetStateSaveSink = vi.hoisted(() => (vi.fn()));
+const mockLoadSyncState = vi.hoisted(() => (vi.fn()));
+const mockSaveSyncState = vi.hoisted(() => (vi.fn()));
+const mockGetWalletSdkVersion = vi.hoisted(() => (vi.fn(() => 'sdk-test')));
 
-jest.mock('../../srv/midnight/wallet-worker-client', () => ({
+vi.mock('../../srv/midnight/wallet-worker-client', () => ({
     walletInit: mockWalletInit,
     walletEvict: mockWalletEvict,
     setStateSaveSink: mockSetStateSaveSink
 }));
 
-jest.mock('../../srv/submission/wallet-sync-state-store', () => ({
+vi.mock('../../srv/submission/wallet-sync-state-store', () => ({
     loadSyncState: mockLoadSyncState,
     saveSyncState: mockSaveSyncState,
     getWalletSdkVersion: mockGetWalletSdkVersion
@@ -47,7 +47,7 @@ const baseArgs: WalletFacadeBuildArgs = {
 
 describe('wallet-facade-builder', () => {
     beforeEach(() => {
-        jest.clearAllMocks();
+        vi.clearAllMocks();
         clearAllFacades();
         mockWalletInit.mockResolvedValue({ facadeReady: true, alreadyExisted: false, sdkVersion: 'sdk-test' });
         mockWalletEvict.mockResolvedValue({ evicted: true });
@@ -57,7 +57,7 @@ describe('wallet-facade-builder', () => {
 
     describe('getOrBuildWalletFacade', () => {
         it('forwards args to walletInit and registers the session for state-save persistence', async () => {
-            const logSpy = jest.spyOn(console, 'log').mockImplementation();
+            const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
             try {
                 const result = await getOrBuildWalletFacade('cache-key-aaaaaaaaaa', baseArgs);
 
@@ -83,7 +83,7 @@ describe('wallet-facade-builder', () => {
         });
 
         it('passes the restored blobs into walletInit when loadSyncState returns a snapshot', async () => {
-            const logSpy = jest.spyOn(console, 'log').mockImplementation();
+            const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
             mockLoadSyncState.mockResolvedValue({
                 shielded: 'sh-blob',
                 unshielded: 'un-blob',
@@ -101,7 +101,7 @@ describe('wallet-facade-builder', () => {
         });
 
         it('skips persistence wiring when no syncStatePassphrase is provided', async () => {
-            const logSpy = jest.spyOn(console, 'log').mockImplementation();
+            const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
             const { syncStatePassphrase: _drop, ...argsWithoutPass } = baseArgs;
             try {
                 await getOrBuildWalletFacade('no-pass-key', argsWithoutPass as WalletFacadeBuildArgs);
@@ -117,7 +117,7 @@ describe('wallet-facade-builder', () => {
         });
 
         it('returns phase-2 stubs that throw when their methods are called', async () => {
-            const logSpy = jest.spyOn(console, 'log').mockImplementation();
+            const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
             try {
                 const result = await getOrBuildWalletFacade('cache-key', baseArgs);
                 expect(() => result.facade.submitTransaction()).toThrow(/phase-1 worker migration/);
@@ -130,7 +130,7 @@ describe('wallet-facade-builder', () => {
 
     describe('evictWalletFacade', () => {
         it('forwards eviction to the worker and clears the registry entry', async () => {
-            const logSpy = jest.spyOn(console, 'log').mockImplementation();
+            const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
             try {
                 await getOrBuildWalletFacade('evict-me', baseArgs);
                 expect(getCacheSize()).toBe(1);
@@ -146,7 +146,7 @@ describe('wallet-facade-builder', () => {
 
         it('swallows errors from the worker and logs a warning', async () => {
             mockWalletEvict.mockRejectedValueOnce(new Error('worker gone'));
-            const warnSpy = jest.spyOn(console, 'warn').mockImplementation();
+            const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
             try {
                 await expect(evictWalletFacade('any-key')).resolves.toBeUndefined();
                 expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('evict failed'), expect.stringContaining('worker gone'));
@@ -158,7 +158,7 @@ describe('wallet-facade-builder', () => {
 
     describe('clearAllFacades / getCacheSize', () => {
         it('drops every registry entry when cleared', async () => {
-            const logSpy = jest.spyOn(console, 'log').mockImplementation();
+            const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
             try {
                 await getOrBuildWalletFacade('k1', baseArgs);
                 await getOrBuildWalletFacade('k2', baseArgs);
@@ -174,7 +174,7 @@ describe('wallet-facade-builder', () => {
 
     describe('wireWorkerStateSaveSink', () => {
         it('saves blobs via the sync-state store when a state-save event arrives', async () => {
-            const logSpy = jest.spyOn(console, 'log').mockImplementation();
+            const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
             try {
                 await getOrBuildWalletFacade('save-key', baseArgs);
 
@@ -215,8 +215,8 @@ describe('wallet-facade-builder', () => {
         });
 
         it('logs a warning when saveSyncState throws', async () => {
-            const logSpy = jest.spyOn(console, 'log').mockImplementation();
-            const warnSpy = jest.spyOn(console, 'warn').mockImplementation();
+            const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+            const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
             mockSaveSyncState.mockRejectedValueOnce(new Error('db down'));
             try {
                 await getOrBuildWalletFacade('warn-key', baseArgs);

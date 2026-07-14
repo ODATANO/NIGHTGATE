@@ -4,19 +4,19 @@
  * Verify aggregation functions return correct counts and averages.
  */
 
-const mockDbRun = jest.fn();
-const mockDbConnect = jest.fn().mockResolvedValue({ run: mockDbRun });
+const mockDbRun = vi.hoisted(() => (vi.fn()));
+const mockDbConnect = vi.hoisted(() => (vi.fn().mockResolvedValue({ run: mockDbRun })));
 
-const registeredHandlers: Record<string, Function> = {};
+const registeredHandlers: Record<string, Function> = vi.hoisted(() => ({}));
 
-jest.mock('@sap/cds', () => {
+vi.mock('@sap/cds', () => {
     const cds: any = {
         connect: { to: mockDbConnect },
         ql: {
             SELECT: {
                 one: {
-                    from: jest.fn().mockReturnValue({
-                        columns: jest.fn()
+                    from: vi.fn().mockReturnValue({
+                        columns: vi.fn()
                     })
                 }
             }
@@ -38,7 +38,7 @@ describe('NightgateAnalyticsService', () => {
     let service: NightgateAnalyticsService;
 
     beforeEach(async () => {
-        jest.clearAllMocks();
+        vi.clearAllMocks();
         Object.keys(registeredHandlers).forEach(k => delete registeredHandlers[k]);
         service = new NightgateAnalyticsService();
         await service.init();

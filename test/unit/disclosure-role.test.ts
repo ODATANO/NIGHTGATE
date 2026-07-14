@@ -5,7 +5,7 @@
  * scope handling (global vs. matching vs. non-matching), validity windows,
  * and the meetsDisclosure / isAuthority / isValidDisclosureRoleValue helpers.
  *
- * Runs against a real in-memory CAP DB via cds.test() (see test/jest.setup.ts):
+ * Runs against a real in-memory CAP DB via cds.test() (see test/vitest.setup.ts):
  * each test seeds midnight.DisclosureRoles and calls the middleware with the
  * real db connection, so the actual CQL query + JS filtering are exercised.
  */

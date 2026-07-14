@@ -14,6 +14,7 @@
  *   - Secret keys are passed correctly to balanceUnboundTransaction.
  */
 
+import type { Mock } from 'vitest';
 import crypto from 'crypto';
 import { encrypt, getEncryptionKey } from '../../srv/utils/crypto';
 import { buildWalletMaterialForSession } from '../../srv/submission/wallet-material-factory';
@@ -22,19 +23,19 @@ import type { WalletFacadeBuildArgs } from '../../srv/submission/wallet-facade-b
 const TEST_KEY = crypto.createHash('sha256').update('test-encryption-key').digest();
 // 128 hex = 64-byte BIP39 seed (the new connectWalletForSigning storage shape).
 const VALID_SEED_HEX = 'a'.repeat(128);
-const STUB_FACADE = {
-    balanceUnboundTransaction: jest.fn(),
-    finalizeRecipe: jest.fn(),
-    submitTransaction: jest.fn()
-};
-const STUB_KEYS = { zswapKeys: { _stub: 'zswap' }, dustKey: { _stub: 'dust' } };
+const STUB_FACADE = vi.hoisted(() => ({
+    balanceUnboundTransaction: vi.fn(),
+    finalizeRecipe: vi.fn(),
+    submitTransaction: vi.fn()
+}));
+const STUB_KEYS = vi.hoisted(() => ({ zswapKeys: { _stub: 'zswap' }, dustKey: { _stub: 'dust' } }));
 
 // Mock the ESM-loaded ledger before any test file imports the factory.
-jest.mock('../../srv/midnight/sdk-loader', () => {
-    const actual = jest.requireActual('../../srv/midnight/sdk-loader');
+vi.mock('../../srv/midnight/sdk-loader', async () => {
+    const actual = await vi.importActual('../../srv/midnight/sdk-loader');
     return {
         ...actual,
-        loadLedgerV8: jest.fn(async () => ({
+        loadLedgerV8: vi.fn(async () => ({
             ZswapSecretKeys: {
                 fromSeed: (seed: Uint8Array) => {
                     const h = crypto.createHash('sha256').update(Buffer.from(seed)).digest('hex');
@@ -54,36 +55,36 @@ jest.mock('../../srv/midnight/sdk-loader', () => {
 
 // Mock the ESM-only HD derivation lib. deriveRoleSeeds is deterministic per
 // input BIP39 seed so pubkey determinism / different-seed assertions hold.
-jest.mock('../../srv/utils/wallet-hd', () => {
+vi.mock('../../srv/utils/wallet-hd', async () => {
     const c = require('crypto');
     const role = (seed: Uint8Array, label: string) =>
         new Uint8Array(c.createHash('sha256').update(Buffer.from(seed)).update(label).digest());
     return {
-        deriveRoleSeeds: jest.fn(async (bip39Seed: Uint8Array) => ({
+        deriveRoleSeeds: vi.fn(async (bip39Seed: Uint8Array) => ({
             zswap: role(bip39Seed, 'zswap'),
             dust:  role(bip39Seed, 'dust'),
             night: role(bip39Seed, 'night')
         })),
-        mnemonicToBip39SeedHex: jest.fn((m: string) =>
+        mnemonicToBip39SeedHex: vi.fn((m: string) =>
             c.createHash('sha512').update(m).digest('hex'))
     };
 });
 
 // Mock the facade builder, we don't want real WalletFacade.init in unit tests.
-jest.mock('../../srv/submission/wallet-facade-builder', () => ({
-    getOrBuildWalletFacade: jest.fn(async () => ({
+vi.mock('../../srv/submission/wallet-facade-builder', async () => ({
+    getOrBuildWalletFacade: vi.fn(async () => ({
         facade: STUB_FACADE,
         ...STUB_KEYS
     })),
-    evictWalletFacade: jest.fn(async () => {}),
-    clearAllFacades: jest.fn(),
-    getCacheSize: jest.fn(() => 0)
+    evictWalletFacade: vi.fn(async () => {}),
+    clearAllFacades: vi.fn(),
+    getCacheSize: vi.fn(() => 0)
 }));
 
-const { getOrBuildWalletFacade } = require('../../srv/submission/wallet-facade-builder');
+import { getOrBuildWalletFacade } from '../../srv/submission/wallet-facade-builder';
 
 function makeDbWithSession(row: any) {
-    return { run: jest.fn(async () => row) };
+    return { run: vi.fn(async () => row) };
 }
 
 function buildSession() {
@@ -106,10 +107,10 @@ const FACADE_CONFIG: Omit<WalletFacadeBuildArgs, 'seedHex'> = {
 };
 
 beforeEach(() => {
-    (STUB_FACADE.balanceUnboundTransaction as jest.Mock).mockReset();
-    (STUB_FACADE.finalizeRecipe as jest.Mock).mockReset();
-    (STUB_FACADE.submitTransaction as jest.Mock).mockReset();
-    (getOrBuildWalletFacade as jest.Mock).mockClear();
+    (STUB_FACADE.balanceUnboundTransaction as Mock).mockReset();
+    (STUB_FACADE.finalizeRecipe as Mock).mockReset();
+    (STUB_FACADE.submitTransaction as Mock).mockReset();
+    (getOrBuildWalletFacade as Mock).mockClear();
 });
 
 describe('facade-backed wallet adapter: happy path', () => {
@@ -220,7 +221,7 @@ describe('facade-backed wallet adapter: happy path', () => {
         STUB_FACADE.submitTransaction.mockResolvedValue('id');
         await (material.walletAndMidnightProvider as any).submitTx({});
 
-        const [cacheKey, _args] = (getOrBuildWalletFacade as jest.Mock).mock.calls[0];
+        const [cacheKey, _args] = (getOrBuildWalletFacade as Mock).mock.calls[0];
         // accountId is HMAC-SHA256(viewingKey, label).hex, 64-char hex
         expect(typeof cacheKey).toBe('string');
         expect(cacheKey).toMatch(/^[0-9a-f]{64}$/);

@@ -5,11 +5,11 @@
  * shape + result pass-through.
  */
 
-const walletGetBalance         = jest.fn();
-const walletEstimateTransferFee = jest.fn();
-const walletEstimateSwapFee    = jest.fn();
+const walletGetBalance         = vi.hoisted(() => (vi.fn()));
+const walletEstimateTransferFee = vi.hoisted(() => (vi.fn()));
+const walletEstimateSwapFee    = vi.hoisted(() => (vi.fn()));
 
-jest.mock('../../srv/midnight/wallet-worker-client', () => ({
+vi.mock('../../srv/midnight/wallet-worker-client', () => ({
     walletGetBalance:           (...args: unknown[]) => walletGetBalance(...args),
     walletEstimateTransferFee:  (...args: unknown[]) => walletEstimateTransferFee(...args),
     walletEstimateSwapFee:      (...args: unknown[]) => walletEstimateSwapFee(...args)

@@ -2,12 +2,12 @@
  * Indexer health and readiness tests
  */
 
-const mockDbRun = jest.fn();
-const mockDbConnect = jest.fn().mockResolvedValue({ run: mockDbRun });
+const mockDbRun = vi.hoisted(() => (vi.fn()));
+const mockDbConnect = vi.hoisted(() => (vi.fn().mockResolvedValue({ run: mockDbRun })));
 
-const registeredHandlers: Record<string, Function> = {};
+const registeredHandlers: Record<string, Function> = vi.hoisted(() => ({}));
 
-jest.mock('@sap/cds', () => {
+vi.mock('@sap/cds', () => {
     const cds: any = {
         connect: { to: mockDbConnect },
         env: {
@@ -18,14 +18,14 @@ jest.mock('@sap/cds', () => {
         ql: {
             SELECT: {
                 one: {
-                    from: jest.fn().mockReturnValue({
-                        where: jest.fn()
+                    from: vi.fn().mockReturnValue({
+                        where: vi.fn()
                     })
                 }
             },
             INSERT: {
-                into: jest.fn().mockReturnValue({
-                    entries: jest.fn()
+                into: vi.fn().mockReturnValue({
+                    entries: vi.fn()
                 })
             }
         },
@@ -46,7 +46,7 @@ describe('NightgateIndexerService health', () => {
     let service: NightgateIndexerService;
 
     beforeEach(async () => {
-        jest.clearAllMocks();
+        vi.clearAllMocks();
         Object.keys(registeredHandlers).forEach(k => delete registeredHandlers[k]);
         mockDbRun.mockResolvedValueOnce({ ID: 'SINGLETON' });
 

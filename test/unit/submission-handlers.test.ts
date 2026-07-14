@@ -11,19 +11,20 @@
  * seam — handlers don't know about the worker at all.
  */
 
+import type { Mock } from 'vitest';
 // Phase 3 (0.2.0 async-job migration): handlers now wrap the submitter call
 // in startJob and return `{ jobId, status }` instead of awaiting the SDK
 // round-trip directly. The stub here invokes `work` synchronously so the
 // existing assertions about `submitter.deploy` / `submitter.call` argument
 // shape still hold; tests that need to assert sync return shape have been
 // updated to expect the new { jobId, status, … } payload.
-const mockStartJob = jest.fn(async (args: any) => {
+const mockStartJob = vi.hoisted(() => (vi.fn(async (args: any) => {
     // Drive the work fn immediately so submitter.deploy/.call is exercised
     // — keeps the per-call args + registration meta assertions meaningful.
     try { await args.work(); } catch { /* failures are absorbed into the job row in prod; tests assert via mock call inspection */ }
     return { jobId: `job-${args.kind}-test`, status: 'pending' as const };
-});
-jest.mock('../../srv/submission/background-jobs', () => ({
+})));
+vi.mock('../../srv/submission/background-jobs', () => ({
     startJob: (...args: unknown[]) => (mockStartJob as any)(...args)
 }));
 
@@ -54,14 +55,14 @@ function makeFakeService() {
     const handlers: Record<string, Handler> = {};
     return {
         handlers,
-        on: jest.fn((action: string, fn: Handler) => { handlers[action] = fn; })
+        on: vi.fn((action: string, fn: Handler) => { handlers[action] = fn; })
     };
 }
 
 function makeReq(data: Record<string, unknown>) {
     return {
         data,
-        reject: jest.fn((status: number, message: string) => {
+        reject: vi.fn((status: number, message: string) => {
             const err: any = new Error(message);
             err.status = status;
             err.message = message;
@@ -93,11 +94,11 @@ const RESOLVED_CONTRACT_FIXTURE = {
 
 function makeSuccessfulSubmitter() {
     return {
-        deploy: jest.fn(async () => ({
+        deploy: vi.fn(async () => ({
             submissionId: 'sub-1', txHash: '0xdeadbeef',
             contractAddress: '0xCONTRACT', status: 'included' as const
         })),
-        call: jest.fn(async () => ({
+        call: vi.fn(async () => ({
             submissionId: 'sub-2', txHash: '0xcafe',
             contractAddress: '0xCONTRACT', status: 'included' as const
         }))
@@ -157,6 +158,11 @@ describe('submitContractCall: argument validation', () => {
         const req = await setupAndCallSubmit({ ...VALID_CALL_ARGS, args: 'not-json' });
         expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/JSON/));
     });
+
+    test('rejects non-JSON initialPrivateState (v0.6.9 multi-caller seeding)', async () => {
+        const req = await setupAndCallSubmit({ ...VALID_CALL_ARGS, initialPrivateState: '{broken' });
+        expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/initialPrivateState must be valid JSON/));
+    });
 });
 
 // ---- Error translation ----------------------------------------------------
@@ -166,11 +172,11 @@ describe('error translation to OData status codes', () => {
         const srv = makeFakeService();
         registerSubmissionHandlers(srv as any, {}, {
             // Successful happy path by default
-            resolveContractImpl: jest.fn(async (_name: string) => ({ ...RESOLVED_CONTRACT_FIXTURE })),
-            walletMaterialFactory: jest.fn(async () => ({
+            resolveContractImpl: vi.fn(async (_name: string) => ({ ...RESOLVED_CONTRACT_FIXTURE })),
+            walletMaterialFactory: vi.fn(async () => ({
                 accountId: 'acc', privateStoragePasswordProvider: () => '0123456789ABCDEFG', walletAndMidnightProvider: {}
             })),
-            submitterFactory: jest.fn(() => makeSuccessfulSubmitter()),
+            submitterFactory: vi.fn(() => makeSuccessfulSubmitter()),
             ...overrides
         });
         return srv;
@@ -211,7 +217,7 @@ describe('error translation to OData status codes', () => {
         const req = makeReq({ ...VALID_DEPLOY_ARGS, sessionId: 'session-meta' });
         await srv.handlers['deployContract'](req);
         expect(submitter.deploy).toHaveBeenCalledTimes(1);
-        expect((submitter.deploy as jest.Mock).mock.calls[0][0]).toMatchObject({
+        expect((submitter.deploy as Mock).mock.calls[0][0]).toMatchObject({
             contractName: 'attestation-vault',
             registration: {
                 artifactPath: RESOLVED_CONTRACT_FIXTURE.artifactPath,
@@ -225,7 +231,7 @@ describe('error translation to OData status codes', () => {
 
     test('ContractNotRegisteredError → 404', async () => {
         const srv = setupHandlers({
-            resolveContractImpl: jest.fn(async () => { throw new ContractNotRegisteredError('unknown', []); })
+            resolveContractImpl: vi.fn(async () => { throw new ContractNotRegisteredError('unknown', []); })
         });
         const req = makeReq({ ...VALID_DEPLOY_ARGS, sessionId: 'session-404' });
         await srv.handlers['deployContract'](req);
@@ -234,7 +240,7 @@ describe('error translation to OData status codes', () => {
 
     test('SessionNotFoundError → 401', async () => {
         const srv = setupHandlers({
-            walletMaterialFactory: jest.fn(async () => { throw new SessionNotFoundError('s'); })
+            walletMaterialFactory: vi.fn(async () => { throw new SessionNotFoundError('s'); })
         });
         const req = makeReq({ ...VALID_DEPLOY_ARGS, sessionId: 'session-401' });
         await srv.handlers['deployContract'](req);
@@ -243,7 +249,7 @@ describe('error translation to OData status codes', () => {
 
     test('WalletMaterialUnavailable → 501', async () => {
         const srv = setupHandlers({
-            walletMaterialFactory: jest.fn(async () => { throw new WalletMaterialUnavailable('signing not impl'); })
+            walletMaterialFactory: vi.fn(async () => { throw new WalletMaterialUnavailable('signing not impl'); })
         });
         const req = makeReq({ ...VALID_DEPLOY_ARGS, sessionId: 'session-501' });
         await srv.handlers['deployContract'](req);
@@ -262,8 +268,8 @@ describe('error translation to OData status codes', () => {
         const subErr = new SubmissionError('sub-x', { code: '1016', retryable: true, message: 'pool full' });
         const srv = setupHandlers({
             submitterFactory: () => ({
-                deploy: jest.fn(async () => { throw subErr; }),
-                call: jest.fn(async () => { throw subErr; })
+                deploy: vi.fn(async () => { throw subErr; }),
+                call: vi.fn(async () => { throw subErr; })
             }) as unknown as TransactionSubmitter
         });
         const req = makeReq({ ...VALID_DEPLOY_ARGS, sessionId: 'session-async-err' });
@@ -279,8 +285,8 @@ describe('rate limiting', () => {
     test('deployContract: 5 deploys/hour/session, 6th gets 429', async () => {
         const srv = makeFakeService();
         registerSubmissionHandlers(srv as any, {}, {
-            resolveContractImpl: jest.fn(async () => ({ ...RESOLVED_CONTRACT_FIXTURE })),
-            walletMaterialFactory: jest.fn(async () => ({ accountId: 'a', privateStoragePasswordProvider: () => '0123456789ABCDEFG', walletAndMidnightProvider: {} })),
+            resolveContractImpl: vi.fn(async () => ({ ...RESOLVED_CONTRACT_FIXTURE })),
+            walletMaterialFactory: vi.fn(async () => ({ accountId: 'a', privateStoragePasswordProvider: () => '0123456789ABCDEFG', walletAndMidnightProvider: {} })),
             submitterFactory: () => makeSuccessfulSubmitter()
         });
 
@@ -298,8 +304,8 @@ describe('rate limiting', () => {
     test('submitContractCall: 30 calls/min/session, 31st gets 429', async () => {
         const srv = makeFakeService();
         registerSubmissionHandlers(srv as any, {}, {
-            resolveContractImpl: jest.fn(async () => ({ ...RESOLVED_CONTRACT_FIXTURE })),
-            walletMaterialFactory: jest.fn(async () => ({ accountId: 'a', privateStoragePasswordProvider: () => '0123456789ABCDEFG', walletAndMidnightProvider: {} })),
+            resolveContractImpl: vi.fn(async () => ({ ...RESOLVED_CONTRACT_FIXTURE })),
+            walletMaterialFactory: vi.fn(async () => ({ accountId: 'a', privateStoragePasswordProvider: () => '0123456789ABCDEFG', walletAndMidnightProvider: {} })),
             submitterFactory: () => makeSuccessfulSubmitter()
         });
 
@@ -331,7 +337,7 @@ describe('anchorDocument', () => {
     });
 
     function makeFakeDb() {
-        const run = jest.fn().mockResolvedValue(undefined);
+        const run = vi.fn().mockResolvedValue(undefined);
         return { run };
     }
 
@@ -339,13 +345,13 @@ describe('anchorDocument', () => {
         const srv = makeFakeService();
         const db = makeFakeDb();
         registerSubmissionHandlers(srv as any, db, {
-            resolveContractImpl: jest.fn(async () => ({ ...RESOLVED_CONTRACT_FIXTURE })),
-            walletMaterialFactory: jest.fn(async () => ({
+            resolveContractImpl: vi.fn(async () => ({ ...RESOLVED_CONTRACT_FIXTURE })),
+            walletMaterialFactory: vi.fn(async () => ({
                 accountId: 'a',
                 privateStoragePasswordProvider: () => '0123456789ABCDEFG',
                 walletAndMidnightProvider: {}
             })),
-            submitterFactory: jest.fn(() => makeSuccessfulSubmitter()),
+            submitterFactory: vi.fn(() => makeSuccessfulSubmitter()),
             ...overrides
         });
         return { srv, db };
@@ -416,7 +422,7 @@ describe('anchorDocument', () => {
 
         // submitter.call was invoked with circuit='attest' and Uint8Array args
         expect(submitter.call).toHaveBeenCalledTimes(1);
-        const callArgs = (submitter.call as jest.Mock).mock.calls[0][0];
+        const callArgs = (submitter.call as Mock).mock.calls[0][0];
         expect(callArgs.circuit).toBe('attest');
         expect(callArgs.contractAddress).toBe('0xVAULT');
         expect(callArgs.contractName).toBe('attestation-vault');
@@ -433,7 +439,7 @@ describe('anchorDocument', () => {
         const req = makeReq({ ...VALID_ANCHOR_ARGS(), compiledArtifactRef: undefined });
         await srv.handlers['anchorDocument'](req);
         expect(req.reject).not.toHaveBeenCalled();
-        const callArgs = (submitter.call as jest.Mock).mock.calls[0][0];
+        const callArgs = (submitter.call as Mock).mock.calls[0][0];
         expect(callArgs.contractName).toBe('attestation-vault');
     });
 
@@ -447,8 +453,8 @@ describe('anchorDocument', () => {
         await srv.handlers['anchorDocument'](makeReq(a));
         await srv.handlers['anchorDocument'](makeReq(b));
 
-        const hashA = (submitter.call as jest.Mock).mock.calls[0][0].args[1];
-        const hashB = (submitter.call as jest.Mock).mock.calls[1][0].args[1];
+        const hashA = (submitter.call as Mock).mock.calls[0][0].args[1];
+        const hashB = (submitter.call as Mock).mock.calls[1][0].args[1];
         expect(Buffer.from(hashA).toString('hex')).not.toBe(Buffer.from(hashB).toString('hex'));
     });
 
@@ -456,8 +462,8 @@ describe('anchorDocument', () => {
         const subErr = new SubmissionError('sub-z', { code: '1014', retryable: false, message: 'invalid' });
         const { srv, db } = setupHandlersWithDb({
             submitterFactory: () => ({
-                deploy: jest.fn(async () => { throw subErr; }),
-                call: jest.fn(async () => { throw subErr; })
+                deploy: vi.fn(async () => { throw subErr; }),
+                call: vi.fn(async () => { throw subErr; })
             }) as unknown as TransactionSubmitter
         });
         const req = makeReq(VALID_ANCHOR_ARGS());
@@ -494,16 +500,16 @@ describe('verifyDocument', () => {
     function makeDbWithSequence(rows: any[]) {
         // Each db.run consumes the next row from the queue.
         const queue = [...rows];
-        const run = jest.fn().mockImplementation(async () => queue.shift());
+        const run = vi.fn().mockImplementation(async () => queue.shift());
         return { run };
     }
 
     function setupHandlersWithDb(db: any) {
         const srv = makeFakeService();
         registerSubmissionHandlers(srv as any, db, {
-            resolveContractImpl: jest.fn(),
-            walletMaterialFactory: jest.fn(),
-            submitterFactory: jest.fn()
+            resolveContractImpl: vi.fn(),
+            walletMaterialFactory: vi.fn(),
+            submitterFactory: vi.fn()
         });
         return srv;
     }
@@ -632,20 +638,20 @@ describe('issuePredicateAttestation', () => {
     });
 
     function makeFakeDb() {
-        return { run: jest.fn().mockResolvedValue(undefined) };
+        return { run: vi.fn().mockResolvedValue(undefined) };
     }
 
     function setupHandlersWithDb(overrides: any = {}) {
         const srv = makeFakeService();
         const db = makeFakeDb();
         registerSubmissionHandlers(srv as any, db, {
-            resolveContractImpl: jest.fn(async () => ({ ...RESOLVED_CONTRACT_FIXTURE })),
-            walletMaterialFactory: jest.fn(async () => ({
+            resolveContractImpl: vi.fn(async () => ({ ...RESOLVED_CONTRACT_FIXTURE })),
+            walletMaterialFactory: vi.fn(async () => ({
                 accountId: 'a',
                 privateStoragePasswordProvider: () => '0123456789ABCDEFG',
                 walletAndMidnightProvider: {}
             })),
-            submitterFactory: jest.fn(() => makeSuccessfulSubmitter()),
+            submitterFactory: vi.fn(() => makeSuccessfulSubmitter()),
             ...overrides
         });
         return { srv, db };
@@ -712,8 +718,8 @@ describe('issuePredicateAttestation', () => {
 
         // Two circuit calls in order: commitValue then provePredicate.
         expect(submitter.call).toHaveBeenCalledTimes(2);
-        const c0 = (submitter.call as jest.Mock).mock.calls[0][0];
-        const c1 = (submitter.call as jest.Mock).mock.calls[1][0];
+        const c0 = (submitter.call as Mock).mock.calls[0][0];
+        const c1 = (submitter.call as Mock).mock.calls[1][0];
 
         expect(c0.circuit).toBe('commitValue');
         expect(c0.args).toHaveLength(1);
@@ -737,7 +743,7 @@ describe('issuePredicateAttestation', () => {
         const submitter = makeSuccessfulSubmitter();
         const { srv } = setupHandlersWithDb({ submitterFactory: () => submitter });
         await srv.handlers['issuePredicateAttestation'](makeReq({ ...VALID_ARGS(), predicate: 'greaterOrEqual' }));
-        const c1 = (submitter.call as jest.Mock).mock.calls[1][0];
+        const c1 = (submitter.call as Mock).mock.calls[1][0];
         expect(c1.args[2]).toBe(1n);
     });
 
@@ -745,7 +751,7 @@ describe('issuePredicateAttestation', () => {
         const submitter = makeSuccessfulSubmitter();
         const { srv } = setupHandlersWithDb({ submitterFactory: () => submitter });
         await srv.handlers['issuePredicateAttestation'](makeReq({ ...VALID_ARGS(), salt: undefined }));
-        const c0 = (submitter.call as jest.Mock).mock.calls[0][0];
+        const c0 = (submitter.call as Mock).mock.calls[0][0];
         expect(c0.witnessValues.valueSalt).toMatch(/^[0-9a-f]{64}$/);
     });
 
@@ -753,9 +759,9 @@ describe('issuePredicateAttestation', () => {
         const subErr = new SubmissionError('sub-z', { code: 'OnChainStatus:Fail', retryable: false, message: 'predicate false' });
         const { srv, db } = setupHandlersWithDb({
             submitterFactory: () => ({
-                deploy: jest.fn(),
+                deploy: vi.fn(),
                 // commitValue succeeds, provePredicate throws.
-                call: jest.fn()
+                call: vi.fn()
                     .mockResolvedValueOnce({ txHash: '0xcommit', status: 'included' })
                     .mockRejectedValueOnce(subErr)
             }) as unknown as TransactionSubmitter
@@ -791,12 +797,12 @@ describe('verifyPredicateAttestation', () => {
 
     function makeDbWithSequence(rows: any[]) {
         const queue = [...rows];
-        return { run: jest.fn().mockImplementation(async () => queue.shift()) };
+        return { run: vi.fn().mockImplementation(async () => queue.shift()) };
     }
     function setupHandlersWithDb(db: any) {
         const srv = makeFakeService();
         registerSubmissionHandlers(srv as any, db, {
-            resolveContractImpl: jest.fn(), walletMaterialFactory: jest.fn(), submitterFactory: jest.fn()
+            resolveContractImpl: vi.fn(), walletMaterialFactory: vi.fn(), submitterFactory: vi.fn()
         });
         return srv;
     }
@@ -870,21 +876,21 @@ describe('grantDisclosure', () => {
     });
 
     function makeFakeDb() {
-        return { run: jest.fn().mockResolvedValue(undefined) };
+        return { run: vi.fn().mockResolvedValue(undefined) };
     }
-    let reindexer: jest.Mock;
+    let reindexer: Mock;
     function setupHandlersWithDb(overrides: any = {}) {
         const srv = makeFakeService();
         const db = makeFakeDb();
-        reindexer = jest.fn().mockResolvedValue({ indexed: 1, deactivated: 0 });
+        reindexer = vi.fn().mockResolvedValue({ indexed: 1, deactivated: 0 });
         registerSubmissionHandlers(srv as any, db, {
-            resolveContractImpl: jest.fn(async () => ({ ...RESOLVED_CONTRACT_FIXTURE })),
-            walletMaterialFactory: jest.fn(async () => ({
+            resolveContractImpl: vi.fn(async () => ({ ...RESOLVED_CONTRACT_FIXTURE })),
+            walletMaterialFactory: vi.fn(async () => ({
                 accountId: 'a',
                 privateStoragePasswordProvider: () => '0123456789ABCDEFG',
                 walletAndMidnightProvider: {}
             })),
-            submitterFactory: jest.fn(() => makeSuccessfulSubmitter()),
+            submitterFactory: vi.fn(() => makeSuccessfulSubmitter()),
             disclosureReindexer: reindexer,
             ...overrides
         });
@@ -966,7 +972,7 @@ describe('grantDisclosure', () => {
 
         // Exactly one circuit call: grantDisclosure(payload, grantee, level).
         expect(submitter.call).toHaveBeenCalledTimes(1);
-        const c0 = (submitter.call as jest.Mock).mock.calls[0][0];
+        const c0 = (submitter.call as Mock).mock.calls[0][0];
         expect(c0.circuit).toBe('grantDisclosure');
         expect(c0.args).toHaveLength(3);
         expect(c0.args[0]).toBeInstanceOf(Uint8Array);
@@ -978,7 +984,7 @@ describe('grantDisclosure', () => {
     });
 
     test('defaults compiledArtifactRef to attestation-vault', async () => {
-        const resolveContractImpl = jest.fn(async () => ({ ...RESOLVED_CONTRACT_FIXTURE }));
+        const resolveContractImpl = vi.fn(async () => ({ ...RESOLVED_CONTRACT_FIXTURE }));
         const { srv } = setupHandlersWithDb({ resolveContractImpl });
         await srv.handlers['grantDisclosure'](makeReq({ ...VALID_ARGS(), compiledArtifactRef: undefined }));
         expect(resolveContractImpl).toHaveBeenCalledWith('attestation-vault');
@@ -997,19 +1003,19 @@ describe('grantDisclosure', () => {
     test('reuses an existing grant row instead of inserting a duplicate', async () => {
         const srv = makeFakeService();
         // First db.run = SELECT.one existing → return a row; all later calls → undefined.
-        const run = jest.fn()
+        const run = vi.fn()
             .mockResolvedValueOnce({ ID: 'existing-grant-row' })
             .mockResolvedValue(undefined);
         const db = { run };
-        reindexer = jest.fn().mockResolvedValue({ indexed: 1, deactivated: 0 });
+        reindexer = vi.fn().mockResolvedValue({ indexed: 1, deactivated: 0 });
         registerSubmissionHandlers(srv as any, db, {
-            resolveContractImpl: jest.fn(async () => ({ ...RESOLVED_CONTRACT_FIXTURE })),
-            walletMaterialFactory: jest.fn(async () => ({
+            resolveContractImpl: vi.fn(async () => ({ ...RESOLVED_CONTRACT_FIXTURE })),
+            walletMaterialFactory: vi.fn(async () => ({
                 accountId: 'a',
                 privateStoragePasswordProvider: () => '0123456789ABCDEFG',
                 walletAndMidnightProvider: {}
             })),
-            submitterFactory: jest.fn(() => makeSuccessfulSubmitter()),
+            submitterFactory: vi.fn(() => makeSuccessfulSubmitter()),
             disclosureReindexer: reindexer
         });
 
@@ -1031,7 +1037,7 @@ describe('grantDisclosure', () => {
 
     test('a reindex failure does not fail the grant', async () => {
         const { srv } = setupHandlersWithDb({
-            disclosureReindexer: jest.fn().mockRejectedValue(new Error('indexer down'))
+            disclosureReindexer: vi.fn().mockRejectedValue(new Error('indexer down'))
         });
         const req = makeReq(VALID_ARGS());
         const result: any = await srv.handlers['grantDisclosure'](req);
@@ -1074,16 +1080,16 @@ describe('revokeDisclosure', () => {
 
     function setupHandlersWithDb(overrides: any = {}) {
         const srv = makeFakeService();
-        const db = { run: jest.fn().mockResolvedValue(undefined) };
+        const db = { run: vi.fn().mockResolvedValue(undefined) };
         registerSubmissionHandlers(srv as any, db, {
-            resolveContractImpl: jest.fn(async () => ({ ...RESOLVED_CONTRACT_FIXTURE })),
-            walletMaterialFactory: jest.fn(async () => ({
+            resolveContractImpl: vi.fn(async () => ({ ...RESOLVED_CONTRACT_FIXTURE })),
+            walletMaterialFactory: vi.fn(async () => ({
                 accountId: 'a',
                 privateStoragePasswordProvider: () => '0123456789ABCDEFG',
                 walletAndMidnightProvider: {}
             })),
-            submitterFactory: jest.fn(() => makeSuccessfulSubmitter()),
-            disclosureReindexer: jest.fn().mockResolvedValue({ indexed: 0, deactivated: 1 }),
+            submitterFactory: vi.fn(() => makeSuccessfulSubmitter()),
+            disclosureReindexer: vi.fn().mockResolvedValue({ indexed: 0, deactivated: 1 }),
             ...overrides
         });
         return { srv, db };
@@ -1117,7 +1123,7 @@ describe('revokeDisclosure', () => {
         expect(db.run).toHaveBeenCalledTimes(1);
 
         expect(submitter.call).toHaveBeenCalledTimes(1);
-        const c0 = (submitter.call as jest.Mock).mock.calls[0][0];
+        const c0 = (submitter.call as Mock).mock.calls[0][0];
         expect(c0.circuit).toBe('revokeDisclosure');
         expect(c0.args).toHaveLength(2);
         expect(c0.args[0]).toBeInstanceOf(Uint8Array);
@@ -1137,11 +1143,11 @@ describe('registerGranteeIdentity', () => {
     beforeEach(() => { process.env.NIGHTGATE_ALLOW_SELF_SERVICE_GRANTEE_REGISTRATION = 'true'; });
     afterEach(() => { delete process.env.NIGHTGATE_ALLOW_SELF_SERVICE_GRANTEE_REGISTRATION; });
 
-    function setup(dbRun?: jest.Mock) {
+    function setup(dbRun?: Mock) {
         const srv = makeFakeService();
-        const db = { run: dbRun ?? jest.fn().mockResolvedValue(undefined) };
+        const db = { run: dbRun ?? vi.fn().mockResolvedValue(undefined) };
         registerSubmissionHandlers(srv as any, db, {
-            resolveContractImpl: jest.fn(), walletMaterialFactory: jest.fn(), submitterFactory: jest.fn()
+            resolveContractImpl: vi.fn(), walletMaterialFactory: vi.fn(), submitterFactory: vi.fn()
         });
         return { srv, db };
     }
@@ -1149,7 +1155,7 @@ describe('registerGranteeIdentity', () => {
         return {
             data,
             user: userId ? { id: userId } : undefined,
-            reject: jest.fn((status: number, message: string) => {
+            reject: vi.fn((status: number, message: string) => {
                 const err: any = new Error(message); err.status = status; return err;
             })
         };
@@ -1190,7 +1196,7 @@ describe('registerGranteeIdentity', () => {
 
     test('inserts a new identity and returns the derived granteeId', async () => {
         // SELECT.one existing → undefined, then INSERT.
-        const run = jest.fn().mockResolvedValueOnce(undefined).mockResolvedValue(undefined);
+        const run = vi.fn().mockResolvedValueOnce(undefined).mockResolvedValue(undefined);
         const { srv } = setup(run);
         const req = reqWithUser('u1', { bindingInput: PUBKEY });
         const result: any = await srv.handlers['registerGranteeIdentity'](req);
@@ -1208,7 +1214,7 @@ describe('registerGranteeIdentity', () => {
 
     test('idempotent: updates the existing (userId, scope) row instead of inserting', async () => {
         // SELECT.one existing → a row, then UPDATE.
-        const run = jest.fn().mockResolvedValueOnce({ ID: 'existing-1' }).mockResolvedValue(undefined);
+        const run = vi.fn().mockResolvedValueOnce({ ID: 'existing-1' }).mockResolvedValue(undefined);
         const { srv } = setup(run);
         const req = reqWithUser('u1', { bindingInput: PUBKEY });
         const result: any = await srv.handlers['registerGranteeIdentity'](req);
@@ -1341,8 +1347,8 @@ describe('submitContractCall: Bytes/Uint arg coercion reaches the submitter', ()
         const srv = makeFakeService();
         const submitter = makeSuccessfulSubmitter();
         registerSubmissionHandlers(srv as any, {}, {
-            resolveContractImpl: jest.fn(async () => ({ ...RESOLVED_CONTRACT_FIXTURE })),
-            walletMaterialFactory: jest.fn(async () => ({
+            resolveContractImpl: vi.fn(async () => ({ ...RESOLVED_CONTRACT_FIXTURE })),
+            walletMaterialFactory: vi.fn(async () => ({
                 accountId: 'a', privateStoragePasswordProvider: () => '0123456789ABCDEFG', walletAndMidnightProvider: {}
             })),
             submitterFactory: () => submitter,
@@ -1353,7 +1359,7 @@ describe('submitContractCall: Bytes/Uint arg coercion reaches the submitter', ()
     }
 
     function callArgsOf(submitter: any) {
-        return (submitter.call as jest.Mock).mock.calls[0][0].args as unknown[];
+        return (submitter.call as Mock).mock.calls[0][0].args as unknown[];
     }
 
     test('AC1: Bytes<32> hex args reach the circuit as Uint8Array(32) (bindPassport)', async () => {
@@ -1382,7 +1388,7 @@ describe('submitContractCall: Bytes/Uint arg coercion reaches the submitter', ()
         // Use the REAL loader against the REAL attestation-vault artifact path.
         const { srv, submitter } = setup({
             circuitArgTypesLoader: undefined,
-            resolveContractImpl: jest.fn(async () => ({ ...RESOLVED_CONTRACT_FIXTURE, zkConfigPath: VAULT_ZK }))
+            resolveContractImpl: vi.fn(async () => ({ ...RESOLVED_CONTRACT_FIXTURE, zkConfigPath: VAULT_ZK }))
         });
         const req = makeReq({
             contractAddress: '0xVAULT', circuit: 'attest', compiledArtifactRef: 'attestation-vault',
@@ -1452,5 +1458,144 @@ describe('submitContractCall: Bytes/Uint arg coercion reaches the submitter', ()
         const args = callArgsOf(submitter);
         expect(args[0]).toBeInstanceOf(Uint8Array);
         expect(args[1]).toBe(5n);
+    });
+});
+
+// ---- issueFieldPredicateAttestation (field-bound ZK predicate, 0.4.3) ------
+
+describe('issueFieldPredicateAttestation', () => {
+    const VALID_PAYLOAD = 'a'.repeat(64);
+    const VALID_FIELD_KEY = 'f'.repeat(64);
+    const VALID_ROOT = 'd'.repeat(64);
+    const SIBLINGS = ['1'.repeat(64), '2'.repeat(64), '3'.repeat(64), '4'.repeat(64)];
+    const VALID_ARGS = () => ({
+        payloadHash: VALID_PAYLOAD,
+        fieldKey: VALID_FIELD_KEY,
+        value: '47300',
+        contentRoot: VALID_ROOT,
+        siblingsJson: JSON.stringify(SIBLINGS),
+        dirsJson: JSON.stringify([true, false, true, false]),
+        predicate: 'lessOrEqual',
+        threshold: 50000,
+        unit: 'kgCO2e/kWh',
+        sessionId: `fieldpred-${Math.random().toString(36).slice(2)}`,
+        contractAddress: '0xVAULT',
+        compiledArtifactRef: 'attestation-vault'
+    });
+
+    function setupHandlersWithDb(overrides: any = {}) {
+        const srv = makeFakeService();
+        const db = { run: vi.fn().mockResolvedValue(undefined) };
+        registerSubmissionHandlers(srv as any, db, {
+            resolveContractImpl: vi.fn(async () => ({ ...RESOLVED_CONTRACT_FIXTURE })),
+            walletMaterialFactory: vi.fn(async () => ({
+                accountId: 'a',
+                privateStoragePasswordProvider: () => '0123456789ABCDEFG',
+                walletAndMidnightProvider: {}
+            })),
+            submitterFactory: vi.fn(() => makeSuccessfulSubmitter()),
+            ...overrides
+        });
+        return { srv, db };
+    }
+
+    test.each([
+        [{ payloadHash: undefined }, /payloadHash is required/],
+        [{ payloadHash: 'nope' }, /payloadHash must be 64 hex/],
+        [{ fieldKey: undefined }, /fieldKey is required/],
+        [{ fieldKey: 'zz' }, /fieldKey must be 64 hex/],
+        [{ value: undefined }, /value is required/],
+        [{ value: '' }, /value is required/],
+        [{ value: '47.3' }, /value must be an integer/],
+        [{ value: '-5' }, /value must be a non-negative integer/],
+        [{ threshold: undefined }, /threshold is required/],
+        [{ threshold: 'abc' }, /threshold must be an integer/],
+        [{ predicate: 'between' }, /lessOrEqual.*greaterOrEqual/],
+        [{ siblingsJson: 'not-json' }, /siblingsJson must be a JSON array/],
+        [{ dirsJson: 'not-json' }, /dirsJson must be a JSON array/],
+        [{ siblingsJson: JSON.stringify(SIBLINGS.slice(0, 2)) }, /array of 4 hashes/],
+        [{ dirsJson: JSON.stringify([true]) }, /array of 4 booleans/],
+        [{ siblingsJson: JSON.stringify([...SIBLINGS.slice(0, 3), 'short']) }, /each sibling must be 64 hex/],
+        [{ contentRoot: 'oops' }, /contentRoot must be 64 hex/],
+        [{ sessionId: undefined }, /sessionId is required/],
+        [{ contractAddress: undefined }, /contractAddress is required/]
+    ])('rejects %o', async (patch, msg) => {
+        const { srv } = setupHandlersWithDb();
+        const req = makeReq({ ...VALID_ARGS(), ...patch });
+        await srv.handlers['issueFieldPredicateAttestation'](req);
+        expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(msg));
+    });
+
+    test('is blocked on mainnet by default (403)', async () => {
+        const prev = process.env.NIGHTGATE_NETWORK;
+        process.env.NIGHTGATE_NETWORK = 'mainnet';
+        try {
+            const { srv } = setupHandlersWithDb();
+            const req = makeReq(VALID_ARGS());
+            await srv.handlers['issueFieldPredicateAttestation'](req);
+            expect(req.reject).toHaveBeenCalledWith(403, expect.stringMatching(/mainnet/i));
+        } finally {
+            if (prev === undefined) delete process.env.NIGHTGATE_NETWORK;
+            else process.env.NIGHTGATE_NETWORK = prev;
+        }
+    });
+
+    test('happy path with contentRoot: INSERT + anchorContentRoot + proveFieldPredicate + UPDATE; value travels only as witness', async () => {
+        const submitter = makeSuccessfulSubmitter();
+        const { srv, db } = setupHandlersWithDb({ submitterFactory: () => submitter });
+        const req = makeReq(VALID_ARGS());
+
+        const result: any = await srv.handlers['issueFieldPredicateAttestation'](req);
+        expect(req.reject).not.toHaveBeenCalled();
+        expect(result).toEqual({
+            jobId: 'job-issueFieldPredicateAttestation-test',
+            status: 'pending',
+            predicateAttestationId: expect.any(String)
+        });
+
+        // INSERT (row up-front) + UPDATE (inside work) = 2 db.run.
+        expect(db.run).toHaveBeenCalledTimes(2);
+
+        expect(submitter.call).toHaveBeenCalledTimes(2);
+        const anchor = (submitter.call as Mock).mock.calls[0][0];
+        const prove = (submitter.call as Mock).mock.calls[1][0];
+
+        expect(anchor.circuit).toBe('anchorContentRoot');
+        expect(anchor.args).toHaveLength(2); // payloadHash + contentRoot bytes
+        expect(anchor.merkleProof).toBeUndefined();
+
+        expect(prove.circuit).toBe('proveFieldPredicate');
+        // args: payloadHash, fieldKey, threshold, op — NEVER the field value.
+        expect(prove.args).toHaveLength(4);
+        expect(prove.args[2]).toBe(50000n);
+        expect(prove.args[3]).toBe(0n);
+        // The value + inclusion path travel as witnesses only.
+        expect(prove.merkleProof).toEqual({
+            fieldValue: '47300',
+            siblings: SIBLINGS,
+            dirs: [true, false, true, false]
+        });
+        const flatArgs = JSON.stringify(prove.args, (_k, v) => typeof v === 'bigint' ? v.toString() : v);
+        expect(flatArgs).not.toContain('47300');
+    });
+
+    test('without contentRoot only proveFieldPredicate is submitted', async () => {
+        const submitter = makeSuccessfulSubmitter();
+        const { srv } = setupHandlersWithDb({ submitterFactory: () => submitter });
+        const req = makeReq({ ...VALID_ARGS(), contentRoot: undefined });
+
+        await srv.handlers['issueFieldPredicateAttestation'](req);
+        expect(req.reject).not.toHaveBeenCalled();
+        expect(submitter.call).toHaveBeenCalledTimes(1);
+        expect((submitter.call as Mock).mock.calls[0][0].circuit).toBe('proveFieldPredicate');
+    });
+
+    test('persists the fieldKey (lowercased) so the crawler-free fallback can recompute the claim key', async () => {
+        const { srv, db } = setupHandlersWithDb();
+        const req = makeReq({ ...VALID_ARGS(), fieldKey: VALID_FIELD_KEY.toUpperCase() });
+        await srv.handlers['issueFieldPredicateAttestation'](req);
+        expect(req.reject).not.toHaveBeenCalled();
+        const inserted = (db.run as Mock).mock.calls[0][0];
+        expect(JSON.stringify(inserted)).toContain(VALID_FIELD_KEY);
     });
 });

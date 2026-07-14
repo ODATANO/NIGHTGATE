@@ -11,21 +11,21 @@
  * failed to exit gracefully" warnings on Jest's worker pool teardown.
  */
 
-jest.mock('../../srv/submission/wallet-facade-builder', () => ({
-    getOrBuildWalletFacade: jest.fn(async () => ({ facade: {} })),
-    evictWalletFacade: jest.fn(async () => undefined)
+vi.mock('../../srv/submission/wallet-facade-builder', () => ({
+    getOrBuildWalletFacade: vi.fn(async () => ({ facade: {} })),
+    evictWalletFacade: vi.fn(async () => undefined)
 }));
 
-jest.mock('../../srv/midnight/providers', () => ({
-    ensureNetworkId: jest.fn(async () => undefined)
+vi.mock('../../srv/midnight/providers', () => ({
+    ensureNetworkId: vi.fn(async () => undefined)
 }));
 
 // startJob is exercised in its own suite; here it's collapsed to a stub that
 // returns a predictable jobId so connectWalletForSigning's return-shape
 // assertions can be deterministic. The stub also records the work fn so a
 // test can drive it explicitly if needed.
-const mockStartJob = jest.fn(async (args: any) => ({ jobId: 'job-prewarm-test', status: 'pending' as const }));
-jest.mock('../../srv/submission/background-jobs', () => ({
+const mockStartJob = vi.hoisted(() => (vi.fn(async (args: any) => ({ jobId: 'job-prewarm-test', status: 'pending' as const }))));
+vi.mock('../../srv/submission/background-jobs', () => ({
     startJob: (...args: unknown[]) => (mockStartJob as any)(...args)
 }));
 
@@ -38,7 +38,7 @@ function makeFakeService() {
     const handlers: Record<string, Handler> = {};
     return {
         handlers,
-        on: jest.fn((arg1: any, arg2: any, arg3?: any) => {
+        on: vi.fn((arg1: any, arg2: any, arg3?: any) => {
             // wallet-sessions.ts calls `srv.on(name, fn)` AND `srv.on(name, entity, fn)`.
             if (typeof arg2 === 'function') handlers[arg1] = arg2;
             else if (typeof arg3 === 'function') handlers[arg1] = arg3;
@@ -57,7 +57,7 @@ function makeReq(data: Record<string, unknown>, ip?: string) {
         _: { req: { ip: clientIp } },
         // Sessions are user-bound (review_001 P1); handlers read req.user.id.
         user: { id: TEST_USER_ID },
-        reject: jest.fn((status: number, message: string) => {
+        reject: vi.fn((status: number, message: string) => {
             const err: any = new Error(message);
             err.status = status;
             return err;
@@ -70,7 +70,7 @@ function makeFakeDb() {
     const tables: Record<string, any[]> = { 'midnight.WalletSessions': [] };
     return {
         tables,
-        run: jest.fn(async (q: any) => {
+        run: vi.fn(async (q: any) => {
             const cqn = q.cqn || q;
             if (cqn.SELECT) {
                 const entity = cqn.SELECT.from.ref?.[0] || cqn.SELECT.from;
@@ -224,7 +224,7 @@ describe('connectWalletForSigning: state transitions', () => {
         mockStartJob.mockRejectedValueOnce(new Error('worker offline'));
         registerWalletSessionHandlers(srv as any, db);
 
-        const warn = jest.spyOn(console, 'warn').mockImplementation();
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
         try {
             const req = makeReq({ sessionId: 'sess-1', seedHex: VALID_SEED });
             const result = await srv.handlers['connectWalletForSigning'](req);

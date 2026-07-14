@@ -2,7 +2,7 @@
  * Crawler catch-up start height tests
  */
 
-jest.mock('@sap/cds', () => {
+vi.mock('@sap/cds', () => {
     const cds: any = {
         env: { requires: {} },
         ql: {

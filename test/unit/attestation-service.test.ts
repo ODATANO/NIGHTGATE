@@ -2,7 +2,7 @@
  * Tests for src/sdk/AttestationService.ts.
  *
  * HYBRID approach: runs against a REAL in-memory CAP DB via cds.test()
- * (see test/jest.setup.ts). The `@sap/cds` cds.ql mock that the previous
+ * (see test/vitest.setup.ts). The `@sap/cds` cds.ql mock that the previous
  * version of this suite used has been removed — the disclosure-role lookup
  * the `before('*')` hook performs now hits the real `midnight.DisclosureRoles`
  * table, seeded per-test, and the tier gates run the real `meetsDisclosure`
@@ -27,8 +27,6 @@
  */
 import cds from '@sap/cds';
 import { registerAttestationServiceHandlers, toPredicateEnvelope } from '../../src/sdk/AttestationService';
-
-jest.setTimeout(60000);
 
 // Boot the in-memory CAP server. Not assigned to a `test` const on purpose
 // (would shadow Jest's global test()).
@@ -60,7 +58,7 @@ function makeRecordingService() {
 function makeReq(userId?: string): any {
     const req: any = {
         user: userId ? { id: userId } : undefined,
-        reject: jest.fn().mockImplementation((code: number, message: string) => {
+        reject: vi.fn().mockImplementation((code: number, message: string) => {
             req.__rejected = { code, message };
         })
     };

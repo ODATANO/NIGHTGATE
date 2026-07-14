@@ -8,6 +8,7 @@
  * private-state-rpc), and the typed wrappers.
  */
 
+import type { Mock, MockInstance } from 'vitest';
 import { EventEmitter } from 'node:events';
 
 type SentMessage = {
@@ -50,14 +51,19 @@ class FakeWorker extends EventEmitter {
 
 let latestWorker: FakeWorker | undefined;
 
-jest.mock('node:worker_threads', () => {
-    const actual = jest.requireActual('node:worker_threads');
+vi.mock('node:worker_threads', async () => {
+    const actual = await vi.importActual('node:worker_threads');
     return {
         ...actual,
-        Worker: jest.fn().mockImplementation((entry: string, opts?: unknown) => {
-            latestWorker = new FakeWorker(entry, opts);
-            return latestWorker;
-        })
+        // Must be constructable (`new Worker(...)` in the client); a
+        // constructor returning an object substitutes it for `this`.
+        Worker: class {
+            constructor(entry: string, opts?: unknown) {
+                latestWorker = new FakeWorker(entry, opts);
+                // eslint-disable-next-line no-constructor-return
+                return latestWorker as any;
+            }
+        }
     };
 });
 
@@ -93,12 +99,12 @@ async function startWithResponder(responder: (msg: any) => any | undefined): Pro
 }
 
 describe('wallet-worker-client', () => {
-    let logSpy: jest.SpyInstance;
-    let warnSpy: jest.SpyInstance;
+    let logSpy: MockInstance;
+    let warnSpy: MockInstance;
 
     beforeEach(() => {
-        logSpy = jest.spyOn(console, 'log').mockImplementation();
-        warnSpy = jest.spyOn(console, 'warn').mockImplementation();
+        logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+        warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
         __resetWalletWorkerForTests();
         latestWorker = undefined;
     });
@@ -239,9 +245,9 @@ describe('wallet-worker-client', () => {
         it('forwards state-save events to the registered sink and acks on success', async () => {
             await startWalletWorker();
             const w = latestWorker!;
-            const sink = jest.fn().mockResolvedValue(undefined);
+            const sink = vi.fn().mockResolvedValue(undefined);
             setStateSaveSink(sink);
-            const pmSpy = jest.spyOn(w, 'postMessage');
+            const pmSpy = vi.spyOn(w, 'postMessage');
 
             w.emit('message', { kind: 'state-save', sessionId: 's1', sdkVersion: 'v', seq: 7, blobs: {} });
             // v0.6.6: the sink runs on a microtask (its result gates the ack).
@@ -253,9 +259,9 @@ describe('wallet-worker-client', () => {
         it('does NOT ack a state-save whose sink rejects', async () => {
             await startWalletWorker();
             const w = latestWorker!;
-            const sink = jest.fn().mockRejectedValue(new Error('persist down'));
+            const sink = vi.fn().mockRejectedValue(new Error('persist down'));
             setStateSaveSink(sink);
-            const pmSpy = jest.spyOn(w, 'postMessage');
+            const pmSpy = vi.spyOn(w, 'postMessage');
 
             w.emit('message', { kind: 'state-save', sessionId: 's2', sdkVersion: 'v', seq: 8, blobs: {} });
             await new Promise(r => setImmediate(r));
@@ -276,19 +282,19 @@ describe('wallet-worker-client', () => {
 
         describe('private-state-rpc dispatch', () => {
             const fakeProvider: any = {
-                setContractAddress: jest.fn(),
-                set: jest.fn(async (k: string, v: any) => ({ k, v })),
-                get: jest.fn(async (k: string) => ({ k })),
-                remove: jest.fn(async () => undefined),
-                clear: jest.fn(async () => undefined),
-                setSigningKey: jest.fn(async () => undefined),
-                getSigningKey: jest.fn(async () => 'key'),
-                removeSigningKey: jest.fn(async () => undefined),
-                clearSigningKeys: jest.fn(async () => undefined)
+                setContractAddress: vi.fn(),
+                set: vi.fn(async (k: string, v: any) => ({ k, v })),
+                get: vi.fn(async (k: string) => ({ k })),
+                remove: vi.fn(async () => undefined),
+                clear: vi.fn(async () => undefined),
+                setSigningKey: vi.fn(async () => undefined),
+                getSigningKey: vi.fn(async () => 'key'),
+                removeSigningKey: vi.fn(async () => undefined),
+                clearSigningKeys: vi.fn(async () => undefined)
             };
 
             beforeEach(async () => {
-                for (const fn of Object.values(fakeProvider) as jest.Mock[]) fn.mockClear?.();
+                for (const fn of Object.values(fakeProvider) as Mock[]) fn.mockClear?.();
                 registerPrivateStateProvider('proxy-1', fakeProvider);
                 await startWalletWorker();
             });
@@ -306,8 +312,17 @@ describe('wallet-worker-client', () => {
             // and cause Jest's worker pool to force-exit the worker.
             const trackedPorts: any[] = [];
 
+            // worker_threads is mocked above; the RPC plumbing needs the REAL
+            // MessageChannel, fetched once via importActual (async, so cached
+            // here instead of inside the sync emitRpc helper).
+            let RealMessageChannel: any;
+            beforeAll(async () => {
+                ({ MessageChannel: RealMessageChannel } =
+                    await vi.importActual<any>('node:worker_threads'));
+            });
+
             function emitRpc(method: string, args: unknown[], opts: { withPort?: boolean; proxyId?: string } = {}) {
-                const { port1, port2 } = new (jest.requireActual('node:worker_threads').MessageChannel)();
+                const { port1, port2 } = new RealMessageChannel();
                 trackedPorts.push(port2);
                 const proxyId = opts.proxyId ?? 'proxy-1';
                 latestWorker!.emit('message', {

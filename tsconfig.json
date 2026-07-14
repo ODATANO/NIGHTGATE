@@ -19,7 +19,7 @@
     },
     "types": [
       "node",
-      "jest",
+      "vitest/globals",
       "@cap-js/cds-types"
     ]
   },

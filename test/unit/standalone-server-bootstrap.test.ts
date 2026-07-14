@@ -1,6 +1,6 @@
-const pluginLoadSpy = jest.fn();
+const pluginLoadSpy = vi.hoisted(() => (vi.fn()));
 
-jest.mock('../../src/plugin', () => {
+vi.mock('../../src/plugin', () => {
     pluginLoadSpy();
     return {
         __esModule: true,
@@ -10,7 +10,7 @@ jest.mock('../../src/plugin', () => {
 
 describe('standalone server bootstrap', () => {
     beforeEach(() => {
-        jest.resetModules();
+        vi.resetModules();
         pluginLoadSpy.mockClear();
     });
 

@@ -2,13 +2,13 @@ import { applySqliteTuning } from '../../srv/utils/sqlite-tuning';
 
 describe('applySqliteTuning', () => {
     it('is a no-op when the db service has no .pragma function (HANA / mocked db)', async () => {
-        await expect(applySqliteTuning({ run: jest.fn() } as any)).resolves.toBeUndefined();
+        await expect(applySqliteTuning({ run: vi.fn() } as any)).resolves.toBeUndefined();
         await expect(applySqliteTuning(undefined as any)).resolves.toBeUndefined();
     });
 
     it('applies every tuning pragma and logs the resulting journal/sync mode', async () => {
-        const logSpy = jest.spyOn(console, 'log').mockImplementation();
-        const pragma = jest.fn()
+        const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+        const pragma = vi.fn()
             .mockResolvedValueOnce(undefined)  // synchronous = NORMAL
             .mockResolvedValueOnce(undefined)  // cache_size
             .mockResolvedValueOnce(undefined)  // temp_store
@@ -32,9 +32,9 @@ describe('applySqliteTuning', () => {
     });
 
     it('warns but continues when an individual pragma fails', async () => {
-        const warnSpy = jest.spyOn(console, 'warn').mockImplementation();
-        const logSpy = jest.spyOn(console, 'log').mockImplementation();
-        const pragma = jest.fn()
+        const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+        const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+        const pragma = vi.fn()
             .mockRejectedValueOnce(new Error('synchronous not supported'))
             .mockResolvedValue(undefined);
 
@@ -51,8 +51,8 @@ describe('applySqliteTuning', () => {
     });
 
     it('silently skips the diagnostic log when pragma reads are not supported', async () => {
-        const logSpy = jest.spyOn(console, 'log').mockImplementation();
-        const pragma = jest.fn().mockImplementation((arg: string) => {
+        const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+        const pragma = vi.fn().mockImplementation((arg: string) => {
             if (arg === 'journal_mode' || arg === 'synchronous') {
                 throw new Error('pragma read not supported');
             }

@@ -2,47 +2,49 @@
  * Tests for srv/crawler/Crawler.ts (MidnightCrawler orchestration).
  *
  * HYBRID approach: runs against a REAL in-memory CAP DB via cds.test()
- * (see test/jest.setup.ts). Persistence (SyncState, ReorgLog, Blocks,
+ * (see test/vitest.setup.ts). Persistence (SyncState, ReorgLog, Blocks,
  * Transactions, ContractActions, …) is exercised against the real SQLite DB,
  * so reorg rollback / catch-up progress / stop are asserted BEHAVIORALLY by
  * seeding rows, running the crawler method, and SELECTing the resulting state.
  *
  * External collaborators stay MOCKED:
  *  - MidnightNodeProvider  → per-test inline fake objects (no real RPC)
- *  - BlockProcessor        → jest.mock (heavy block parsing/persistence)
- *  - ensureSyncStateSingleton → jest.mock (the real SINGLETON row is seeded
+ *  - BlockProcessor        → vi.mock (heavy block parsing/persistence)
+ *  - ensureSyncStateSingleton → vi.mock (the real SINGLETON row is seeded
  *    directly via the DB in beforeEach)
  *
- * Only the hand-rolled jest.mock('@sap/cds') cds.ql mock was removed; the
+ * Only the hand-rolled vi.mock('@sap/cds') cds.ql mock was removed; the
  * crawler now uses the framework's real cds.ql against the in-memory DB.
  */
 
-// --- External collaborators: keep mocked. jest.mock is hoisted. ---
-const mockProcessorInit = jest.fn();
-const mockProcessorProcessBlockByHeight = jest.fn();
-const mockProcessorFetchBlockData = jest.fn();
-const mockProcessorFetchBlockBatch = jest.fn();
-const mockProcessorPersistPreparedBlock = jest.fn();
-const mockBlockProcessorConstructor = jest.fn().mockImplementation(() => ({
-    init: mockProcessorInit,
-    processBlockByHeight: mockProcessorProcessBlockByHeight,
-    fetchBlockData: mockProcessorFetchBlockData,
-    fetchBlockBatch: mockProcessorFetchBlockBatch,
-    persistPreparedBlock: mockProcessorPersistPreparedBlock
-}));
+// --- External collaborators: keep mocked. vi.mock is hoisted. ---
+const mockProcessorInit = vi.fn();
+const mockProcessorProcessBlockByHeight = vi.fn();
+const mockProcessorFetchBlockData = vi.fn();
+const mockProcessorFetchBlockBatch = vi.fn();
+const mockProcessorPersistPreparedBlock = vi.fn();
+// Regular `function` impl: BlockProcessor is constructed with `new`, and only
+// constructable (non-arrow) implementations survive that under vitest.
+const mockBlockProcessorConstructor = vi.hoisted(() => (vi.fn().mockImplementation(function () {
+    return {
+        init: mockProcessorInit,
+        processBlockByHeight: mockProcessorProcessBlockByHeight,
+        fetchBlockData: mockProcessorFetchBlockData,
+        fetchBlockBatch: mockProcessorFetchBlockBatch,
+        persistPreparedBlock: mockProcessorPersistPreparedBlock
+    };
+} as any)));
 
-jest.mock('../../srv/crawler/BlockProcessor', () => ({
+vi.mock('../../srv/crawler/BlockProcessor', () => ({
     BlockProcessor: mockBlockProcessorConstructor
 }));
 
-jest.mock('../../srv/utils/sync-state', () => ({
-    ensureSyncStateSingleton: jest.fn().mockResolvedValue(undefined)
+vi.mock('../../srv/utils/sync-state', () => ({
+    ensureSyncStateSingleton: vi.fn().mockResolvedValue(undefined)
 }));
 
 import cds from '@sap/cds';
 import { MidnightCrawler } from '../../srv/crawler/Crawler';
-
-jest.setTimeout(60000);
 
 // Boot the in-memory CAP server. Not assigned to a `test` const on purpose
 // (would shadow Jest's global test()).
@@ -135,12 +137,12 @@ describe('MidnightCrawler orchestration', () => {
     describe('start', () => {
         it('connects the DB and node, initializes the processor, and enters both phases', async () => {
             const provider = {
-                isConnected: jest.fn().mockReturnValue(false),
-                connect: jest.fn().mockResolvedValue(undefined)
+                isConnected: vi.fn().mockReturnValue(false),
+                connect: vi.fn().mockResolvedValue(undefined)
             };
             const crawler = new MidnightCrawler(provider as any, { enabled: true });
-            const catchUpSpy = jest.spyOn(crawler as any, 'catchUp').mockResolvedValue(0);
-            const subscribeLiveSpy = jest.spyOn(crawler as any, 'subscribeLive').mockResolvedValue(undefined);
+            const catchUpSpy = vi.spyOn(crawler as any, 'catchUp').mockResolvedValue(0);
+            const subscribeLiveSpy = vi.spyOn(crawler as any, 'subscribeLive').mockResolvedValue(undefined);
 
             await crawler.start();
             // start() fires the ingest pipeline as fire-and-forget; let microtasks flush.
@@ -159,15 +161,15 @@ describe('MidnightCrawler orchestration', () => {
 
         it('skips reconnecting an already-connected node and does not subscribe live after shutdown during catch-up', async () => {
             const provider = {
-                isConnected: jest.fn().mockReturnValue(true),
-                connect: jest.fn().mockResolvedValue(undefined)
+                isConnected: vi.fn().mockReturnValue(true),
+                connect: vi.fn().mockResolvedValue(undefined)
             };
             const crawler = new MidnightCrawler(provider as any, { enabled: true });
-            jest.spyOn(crawler as any, 'catchUp').mockImplementation(async () => {
+            vi.spyOn(crawler as any, 'catchUp').mockImplementation(async () => {
                 (crawler as any).isRunning = false;
                 return 0;
             });
-            const subscribeLiveSpy = jest.spyOn(crawler as any, 'subscribeLive').mockResolvedValue(undefined);
+            const subscribeLiveSpy = vi.spyOn(crawler as any, 'subscribeLive').mockResolvedValue(undefined);
 
             await crawler.start();
             await new Promise(resolve => setImmediate(resolve));
@@ -178,11 +180,11 @@ describe('MidnightCrawler orchestration', () => {
 
         it('does nothing when start is called while the crawler is already running', async () => {
             const provider = {
-                isConnected: jest.fn(),
-                connect: jest.fn()
+                isConnected: vi.fn(),
+                connect: vi.fn()
             };
             const crawler = new MidnightCrawler(provider as any, { enabled: true });
-            const warnSpy = jest.spyOn(console, 'warn').mockImplementation();
+            const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
 
             try {
                 (crawler as any).isRunning = true;
@@ -204,7 +206,7 @@ describe('MidnightCrawler orchestration', () => {
         it('unsubscribes and marks sync state as stopped', async () => {
             await setSyncState({ syncStatus: 'synced', lastIndexedHeight: 5 });
             const provider = {
-                unsubscribeFinalizedHeads: jest.fn().mockResolvedValue(true)
+                unsubscribeFinalizedHeads: vi.fn().mockResolvedValue(true)
             };
             const crawler = new MidnightCrawler(provider as any, { enabled: true });
             (crawler as any).db = db;
@@ -223,7 +225,7 @@ describe('MidnightCrawler orchestration', () => {
         it('stops cleanly even when no live subscription exists', async () => {
             await setSyncState({ syncStatus: 'synced' });
             const provider = {
-                unsubscribeFinalizedHeads: jest.fn()
+                unsubscribeFinalizedHeads: vi.fn()
             };
             const crawler = new MidnightCrawler(provider as any, { enabled: true });
             (crawler as any).db = db;
@@ -237,11 +239,11 @@ describe('MidnightCrawler orchestration', () => {
 
         it('swallows unsubscribe and DB errors during stop', async () => {
             const provider = {
-                unsubscribeFinalizedHeads: jest.fn().mockRejectedValue(new Error('unsubscribe failed'))
+                unsubscribeFinalizedHeads: vi.fn().mockRejectedValue(new Error('unsubscribe failed'))
             };
             const crawler = new MidnightCrawler(provider as any, { enabled: true });
             // db.run rejects (simulates a closed DB) — stop() must swallow it.
-            (crawler as any).db = { run: jest.fn().mockRejectedValue(new Error('db closed')) };
+            (crawler as any).db = { run: vi.fn().mockRejectedValue(new Error('db closed')) };
             (crawler as any).subscriptionId = 'sub-1';
 
             await expect(crawler.stop()).resolves.toBeUndefined();
@@ -255,8 +257,8 @@ describe('MidnightCrawler orchestration', () => {
     describe('catchUp', () => {
         it('catches up over finalized blocks and updates progress in SyncState', async () => {
             const provider = {
-                getFinalizedHead: jest.fn().mockResolvedValue('0x2'),
-                getHeader: jest.fn().mockResolvedValue({ number: '0x2' })
+                getFinalizedHead: vi.fn().mockResolvedValue('0x2'),
+                getHeader: vi.fn().mockResolvedValue({ number: '0x2' })
             };
             const crawler = new MidnightCrawler(provider as any, { enabled: true, batchSize: 10 });
             (crawler as any).db = db;
@@ -270,7 +272,7 @@ describe('MidnightCrawler orchestration', () => {
             await setSyncState({ syncStatus: 'stopped', lastIndexedHeight: 0, lastIndexedHash: '0x0' });
 
             // Spy the batch retry shim so we can assert the height ranges requested.
-            const fetchSpy = jest.spyOn(crawler as any, 'fetchBlockBatchWithRetry')
+            const fetchSpy = vi.spyOn(crawler as any, 'fetchBlockBatchWithRetry')
                 .mockImplementation(async (...args: any[]) => {
                     const heights = args[0] as number[];
                     return heights.map(h => ({
@@ -311,8 +313,8 @@ describe('MidnightCrawler orchestration', () => {
 
         it('returns early from catch-up when already synced past the finalized head', async () => {
             const provider = {
-                getFinalizedHead: jest.fn().mockResolvedValue('0x2'),
-                getHeader: jest.fn().mockResolvedValue({ number: '0x2' })
+                getFinalizedHead: vi.fn().mockResolvedValue('0x2'),
+                getHeader: vi.fn().mockResolvedValue({ number: '0x2' })
             };
             const crawler = new MidnightCrawler(provider as any, { enabled: true });
             (crawler as any).db = db;
@@ -331,8 +333,8 @@ describe('MidnightCrawler orchestration', () => {
 
         it('always clears catch-up mode when finalized head lookup throws', async () => {
             const provider = {
-                getFinalizedHead: jest.fn().mockRejectedValue(new Error('rpc down')),
-                getHeader: jest.fn()
+                getFinalizedHead: vi.fn().mockRejectedValue(new Error('rpc down')),
+                getHeader: vi.fn()
             };
             const crawler = new MidnightCrawler(provider as any, { enabled: true });
             (crawler as any).db = db;
@@ -344,8 +346,8 @@ describe('MidnightCrawler orchestration', () => {
 
         it('stops catch-up after repeated block-processing errors exceed the circuit breaker threshold', async () => {
             const provider = {
-                getFinalizedHead: jest.fn().mockResolvedValue('0x1'),
-                getHeader: jest.fn().mockResolvedValue({ number: '0x1' })
+                getFinalizedHead: vi.fn().mockResolvedValue('0x1'),
+                getHeader: vi.fn().mockResolvedValue({ number: '0x1' })
             };
             const crawler = new MidnightCrawler(provider as any, { enabled: true });
             (crawler as any).db = db;
@@ -359,13 +361,13 @@ describe('MidnightCrawler orchestration', () => {
             // getSyncState is consulted after recordError; force it over-threshold.
             // recordError stays real but the breaker check reads consecutiveErrors,
             // so we drive it via a spy returning 11.
-            const getSyncStateSpy = jest.spyOn(crawler as any, 'getSyncState');
+            const getSyncStateSpy = vi.spyOn(crawler as any, 'getSyncState');
             getSyncStateSpy
                 .mockResolvedValueOnce({ lastIndexedHeight: 0, lastIndexedHash: null })
                 .mockResolvedValueOnce({ consecutiveErrors: 11 });
-            jest.spyOn(crawler as any, 'fetchBlockBatchWithRetry').mockRejectedValue(new Error('Request timeout'));
-            const recordErrorSpy = jest.spyOn(crawler as any, 'recordError').mockResolvedValue(undefined);
-            const errorSpy = jest.spyOn(console, 'error').mockImplementation();
+            vi.spyOn(crawler as any, 'fetchBlockBatchWithRetry').mockRejectedValue(new Error('Request timeout'));
+            const recordErrorSpy = vi.spyOn(crawler as any, 'recordError').mockResolvedValue(undefined);
+            const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
 
             try {
                 await expect((crawler as any).catchUp()).resolves.toBe(0);
@@ -378,8 +380,8 @@ describe('MidnightCrawler orchestration', () => {
 
         it('continues catch-up after a recoverable block-processing failure below the breaker threshold', async () => {
             const provider = {
-                getFinalizedHead: jest.fn().mockResolvedValue('0x1'),
-                getHeader: jest.fn().mockResolvedValue({ number: '0x1' })
+                getFinalizedHead: vi.fn().mockResolvedValue('0x1'),
+                getHeader: vi.fn().mockResolvedValue({ number: '0x1' })
             };
             const crawler = new MidnightCrawler(provider as any, { enabled: true });
             (crawler as any).db = db;
@@ -390,13 +392,13 @@ describe('MidnightCrawler orchestration', () => {
             };
             await setSyncState({ syncStatus: 'stopped', lastIndexedHeight: 0, lastIndexedHash: null });
 
-            const getSyncStateSpy = jest.spyOn(crawler as any, 'getSyncState');
+            const getSyncStateSpy = vi.spyOn(crawler as any, 'getSyncState');
             getSyncStateSpy
                 .mockResolvedValueOnce({ lastIndexedHeight: 0, lastIndexedHash: null })
                 .mockResolvedValueOnce({ consecutiveErrors: 2 });
-            jest.spyOn(crawler as any, 'fetchBlockBatchWithRetry').mockRejectedValue(new Error('Request timeout'));
-            const recordErrorSpy = jest.spyOn(crawler as any, 'recordError').mockResolvedValue(undefined);
-            const errorSpy = jest.spyOn(console, 'error').mockImplementation();
+            vi.spyOn(crawler as any, 'fetchBlockBatchWithRetry').mockRejectedValue(new Error('Request timeout'));
+            const recordErrorSpy = vi.spyOn(crawler as any, 'recordError').mockResolvedValue(undefined);
+            const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
 
             try {
                 await expect((crawler as any).catchUp()).resolves.toBe(0);
@@ -423,8 +425,8 @@ describe('MidnightCrawler orchestration', () => {
 
         it('re-queues a failed batch once and persists every height without gaps', async () => {
             const provider = {
-                getFinalizedHead: jest.fn().mockResolvedValue('0x3'),
-                getHeader: jest.fn().mockResolvedValue({ number: '0x3' })
+                getFinalizedHead: vi.fn().mockResolvedValue('0x3'),
+                getHeader: vi.fn().mockResolvedValue({ number: '0x3' })
             };
             // rpcBatchSize 1 → one batch per height; concurrency 1 keeps the
             // submission order deterministic.
@@ -439,7 +441,7 @@ describe('MidnightCrawler orchestration', () => {
 
             // Height 2 fails once (transient outage), then succeeds on the re-queue.
             let failedOnce = false;
-            jest.spyOn(crawler as any, 'fetchBlockBatchWithRetry')
+            vi.spyOn(crawler as any, 'fetchBlockBatchWithRetry')
                 .mockImplementation(async (...args: any[]) => {
                     const heights = args[0] as number[];
                     if (heights[0] === 2 && !failedOnce) {
@@ -455,8 +457,8 @@ describe('MidnightCrawler orchestration', () => {
                 contractActionCount: 0,
                 processingTimeMs: 1
             }));
-            const errorSpy = jest.spyOn(console, 'error').mockImplementation();
-            const warnSpy = jest.spyOn(console, 'warn').mockImplementation();
+            const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+            const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
 
             try {
                 await expect((crawler as any).catchUp()).resolves.toBe(3);
@@ -472,8 +474,8 @@ describe('MidnightCrawler orchestration', () => {
 
         it('stops catch-up instead of skipping a range when the re-queued batch fails again', async () => {
             const provider = {
-                getFinalizedHead: jest.fn().mockResolvedValue('0x3'),
-                getHeader: jest.fn().mockResolvedValue({ number: '0x3' })
+                getFinalizedHead: vi.fn().mockResolvedValue('0x3'),
+                getHeader: vi.fn().mockResolvedValue({ number: '0x3' })
             };
             const crawler = new MidnightCrawler(provider as any, { enabled: true, rpcBatchSize: 1, fetchConcurrency: 1 });
             (crawler as any).db = db;
@@ -485,7 +487,7 @@ describe('MidnightCrawler orchestration', () => {
             await setSyncState({ syncStatus: 'stopped', lastIndexedHeight: 0, lastIndexedHash: '0x0', consecutiveErrors: 0 });
 
             // Height 2 fails on every attempt.
-            jest.spyOn(crawler as any, 'fetchBlockBatchWithRetry')
+            vi.spyOn(crawler as any, 'fetchBlockBatchWithRetry')
                 .mockImplementation(async (...args: any[]) => {
                     const heights = args[0] as number[];
                     if (heights[0] === 2) throw new Error('Request timeout');
@@ -498,8 +500,8 @@ describe('MidnightCrawler orchestration', () => {
                 contractActionCount: 0,
                 processingTimeMs: 1
             }));
-            const errorSpy = jest.spyOn(console, 'error').mockImplementation();
-            const warnSpy = jest.spyOn(console, 'warn').mockImplementation();
+            const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+            const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
 
             try {
                 // Only height 1 makes it; the failed range is NEVER jumped over.
@@ -529,23 +531,23 @@ describe('MidnightCrawler orchestration', () => {
             let liveCallback: ((header: any) => Promise<void>) | undefined;
             let reconnectCallback: (() => Promise<void>) | undefined;
             const provider = {
-                setOnReconnect: jest.fn().mockImplementation((callback: () => Promise<void>) => {
+                setOnReconnect: vi.fn().mockImplementation((callback: () => Promise<void>) => {
                     reconnectCallback = callback;
                 }),
-                subscribeFinalizedHeads: jest.fn().mockImplementation(async (callback: (header: any) => Promise<void>) => {
+                subscribeFinalizedHeads: vi.fn().mockImplementation(async (callback: (header: any) => Promise<void>) => {
                     liveCallback = callback;
                     return 'sub-1';
                 }),
-                getBlockHash: jest.fn().mockResolvedValue('0x2hash')
+                getBlockHash: vi.fn().mockResolvedValue('0x2hash')
             };
             const crawler = new MidnightCrawler(provider as any, { enabled: true });
             (crawler as any).db = db;
             (crawler as any).isRunning = true;
             (crawler as any).startTime = Date.now() - 1000;
 
-            const checkForReorgSpy = jest.spyOn(crawler as any, 'checkForReorg').mockResolvedValue(null);
-            jest.spyOn(crawler as any, 'getSyncState').mockResolvedValue({ lastIndexedHash: '0x2hash', lastIndexedHeight: 1 });
-            const processSpy = jest.spyOn(crawler as any, 'processBlockWithRetry').mockResolvedValue({
+            const checkForReorgSpy = vi.spyOn(crawler as any, 'checkForReorg').mockResolvedValue(null);
+            vi.spyOn(crawler as any, 'getSyncState').mockResolvedValue({ lastIndexedHash: '0x2hash', lastIndexedHeight: 1 });
+            const processSpy = vi.spyOn(crawler as any, 'processBlockWithRetry').mockResolvedValue({
                 blockHeight: 2,
                 blockHash: '0x2hash',
                 transactionCount: 3,
@@ -574,7 +576,7 @@ describe('MidnightCrawler orchestration', () => {
         it('ignores live callbacks while catch-up is running and queues blocks while processing', async () => {
             let liveCallback: ((header: any) => Promise<void>) | undefined;
             const provider = {
-                subscribeFinalizedHeads: jest.fn().mockImplementation(async (callback: (header: any) => Promise<void>) => {
+                subscribeFinalizedHeads: vi.fn().mockImplementation(async (callback: (header: any) => Promise<void>) => {
                     liveCallback = callback;
                     return 'sub-1';
                 })
@@ -584,7 +586,7 @@ describe('MidnightCrawler orchestration', () => {
             (crawler as any).isRunning = true;
 
             // Spy processLiveBlock so we can prove it's NOT called while catching up.
-            const processLiveSpy = jest.spyOn(crawler as any, 'processLiveBlock').mockResolvedValue(undefined);
+            const processLiveSpy = vi.spyOn(crawler as any, 'processLiveBlock').mockResolvedValue(undefined);
 
             await (crawler as any).subscribeLive();
 
@@ -603,21 +605,21 @@ describe('MidnightCrawler orchestration', () => {
         it('records transient live-processing failures and pauses when the live breaker trips', async () => {
             let liveCallback: ((header: any) => Promise<void>) | undefined;
             const provider = {
-                subscribeFinalizedHeads: jest.fn().mockImplementation(async (callback: (header: any) => Promise<void>) => {
+                subscribeFinalizedHeads: vi.fn().mockImplementation(async (callback: (header: any) => Promise<void>) => {
                     liveCallback = callback;
                     return 'sub-1';
                 }),
-                getBlockHash: jest.fn().mockResolvedValue('0x2hash')
+                getBlockHash: vi.fn().mockResolvedValue('0x2hash')
             };
             const crawler = new MidnightCrawler(provider as any, { enabled: true });
             (crawler as any).db = db;
             (crawler as any).isRunning = true;
 
-            jest.spyOn(crawler as any, 'checkForReorg').mockResolvedValue(null);
-            jest.spyOn(crawler as any, 'processBlockWithRetry').mockRejectedValue(new Error('Request timeout'));
-            const recordErrorSpy = jest.spyOn(crawler as any, 'recordError').mockResolvedValue(undefined);
-            jest.spyOn(crawler as any, 'getSyncState').mockResolvedValue({ consecutiveErrors: 11 });
-            const errorSpy = jest.spyOn(console, 'error').mockImplementation();
+            vi.spyOn(crawler as any, 'checkForReorg').mockResolvedValue(null);
+            vi.spyOn(crawler as any, 'processBlockWithRetry').mockRejectedValue(new Error('Request timeout'));
+            const recordErrorSpy = vi.spyOn(crawler as any, 'recordError').mockResolvedValue(undefined);
+            vi.spyOn(crawler as any, 'getSyncState').mockResolvedValue({ consecutiveErrors: 11 });
+            const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
 
             try {
                 await (crawler as any).subscribeLive();
@@ -636,21 +638,21 @@ describe('MidnightCrawler orchestration', () => {
         it('records permanent live-processing failures without tripping the breaker', async () => {
             let liveCallback: ((header: any) => Promise<void>) | undefined;
             const provider = {
-                subscribeFinalizedHeads: jest.fn().mockImplementation(async (callback: (header: any) => Promise<void>) => {
+                subscribeFinalizedHeads: vi.fn().mockImplementation(async (callback: (header: any) => Promise<void>) => {
                     liveCallback = callback;
                     return 'sub-1';
                 }),
-                getBlockHash: jest.fn().mockResolvedValue('0x2hash')
+                getBlockHash: vi.fn().mockResolvedValue('0x2hash')
             };
             const crawler = new MidnightCrawler(provider as any, { enabled: true });
             (crawler as any).db = db;
             (crawler as any).isRunning = true;
 
-            jest.spyOn(crawler as any, 'checkForReorg').mockResolvedValue(null);
-            jest.spyOn(crawler as any, 'processBlockWithRetry').mockRejectedValue(new Error('Invalid block data'));
-            const recordErrorSpy = jest.spyOn(crawler as any, 'recordError').mockResolvedValue(undefined);
-            jest.spyOn(crawler as any, 'getSyncState').mockResolvedValue({ consecutiveErrors: 1 });
-            const errorSpy = jest.spyOn(console, 'error').mockImplementation();
+            vi.spyOn(crawler as any, 'checkForReorg').mockResolvedValue(null);
+            vi.spyOn(crawler as any, 'processBlockWithRetry').mockRejectedValue(new Error('Invalid block data'));
+            const recordErrorSpy = vi.spyOn(crawler as any, 'recordError').mockResolvedValue(undefined);
+            vi.spyOn(crawler as any, 'getSyncState').mockResolvedValue({ consecutiveErrors: 1 });
+            const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
 
             try {
                 await (crawler as any).subscribeLive();
@@ -672,9 +674,9 @@ describe('MidnightCrawler orchestration', () => {
 
             await setSyncState({ syncStatus: 'synced', lastIndexedHeight: 5, lastIndexedHash: '0x5' });
 
-            const catchUpSpy = jest.spyOn(crawler as any, 'catchUp').mockResolvedValue(4);
-            const checkForReorgSpy = jest.spyOn(crawler as any, 'checkForReorg');
-            const processSpy = jest.spyOn(crawler as any, 'processBlockWithRetry');
+            const catchUpSpy = vi.spyOn(crawler as any, 'catchUp').mockResolvedValue(4);
+            const checkForReorgSpy = vi.spyOn(crawler as any, 'checkForReorg');
+            const processSpy = vi.spyOn(crawler as any, 'processBlockWithRetry');
 
             // Head 10 while the index sits at 5 → gap, not a fork.
             await (crawler as any).processLiveBlock(
@@ -690,12 +692,12 @@ describe('MidnightCrawler orchestration', () => {
         it('handles reorgs during live processing and updates the reorg log', async () => {
             let liveCallback: ((header: any) => Promise<void>) | undefined;
             const provider = {
-                setOnReconnect: jest.fn(),
-                subscribeFinalizedHeads: jest.fn().mockImplementation(async (callback: (header: any) => Promise<void>) => {
+                setOnReconnect: vi.fn(),
+                subscribeFinalizedHeads: vi.fn().mockImplementation(async (callback: (header: any) => Promise<void>) => {
                     liveCallback = callback;
                     return 'sub-1';
                 }),
-                getBlockHash: jest.fn()
+                getBlockHash: vi.fn()
             };
             const crawler = new MidnightCrawler(provider as any, { enabled: true });
             (crawler as any).db = db;
@@ -715,14 +717,14 @@ describe('MidnightCrawler orchestration', () => {
                 status: 'in_progress'
             }));
 
-            jest.spyOn(crawler as any, 'checkForReorg').mockResolvedValue({
+            vi.spyOn(crawler as any, 'checkForReorg').mockResolvedValue({
                 forkHeight: 9,
                 oldTipHash: '0xold',
                 newTipHash: '0xnew'
             });
-            const handleReorgSpy = jest.spyOn(crawler as any, 'handleReorg').mockResolvedValue(reorgLogId);
-            const catchUpSpy = jest.spyOn(crawler as any, 'catchUp').mockResolvedValue(4);
-            const processSpy = jest.spyOn(crawler as any, 'processBlockWithRetry').mockResolvedValue({
+            const handleReorgSpy = vi.spyOn(crawler as any, 'handleReorg').mockResolvedValue(reorgLogId);
+            const catchUpSpy = vi.spyOn(crawler as any, 'catchUp').mockResolvedValue(4);
+            const processSpy = vi.spyOn(crawler as any, 'processBlockWithRetry').mockResolvedValue({
                 blockHeight: 10,
                 blockHash: '0x10',
                 transactionCount: 0,
@@ -755,8 +757,8 @@ describe('MidnightCrawler orchestration', () => {
             // Header at tip+1 (0x2a = 42, indexed tip 41) with a diverging parent.
             const header = { number: '0x2a', parentHash: '0xold', stateRoot: '', extrinsicsRoot: '', digest: { logs: [] } };
 
-            jest.spyOn(crawler as any, 'getSyncState').mockResolvedValue({ lastIndexedHash: '0xcurrent', lastIndexedHeight: 41 });
-            const findForkPointSpy = jest.spyOn(crawler as any, 'findForkPoint').mockResolvedValue(40);
+            vi.spyOn(crawler as any, 'getSyncState').mockResolvedValue({ lastIndexedHash: '0xcurrent', lastIndexedHeight: 41 });
+            const findForkPointSpy = vi.spyOn(crawler as any, 'findForkPoint').mockResolvedValue(40);
 
             await expect((crawler as any).checkForReorg(header)).resolves.toEqual({
                 forkHeight: 40,
@@ -766,7 +768,7 @@ describe('MidnightCrawler orchestration', () => {
             expect(findForkPointSpy).toHaveBeenCalledWith(header);
 
             findForkPointSpy.mockClear();
-            jest.spyOn(crawler as any, 'getSyncState').mockResolvedValueOnce({ lastIndexedHash: '0xold', lastIndexedHeight: 41 });
+            vi.spyOn(crawler as any, 'getSyncState').mockResolvedValueOnce({ lastIndexedHash: '0xold', lastIndexedHeight: 41 });
             await expect((crawler as any).checkForReorg(header)).resolves.toBeNull();
             expect(findForkPointSpy).not.toHaveBeenCalled();
         });
@@ -779,8 +781,8 @@ describe('MidnightCrawler orchestration', () => {
             (crawler as any).db = db;
             await seedBlock(9, '0x9');
 
-            jest.spyOn(crawler as any, 'getSyncState').mockResolvedValue({ lastIndexedHash: '0x12', lastIndexedHeight: 12 });
-            const findForkPointSpy = jest.spyOn(crawler as any, 'findForkPoint');
+            vi.spyOn(crawler as any, 'getSyncState').mockResolvedValue({ lastIndexedHash: '0x12', lastIndexedHeight: 12 });
+            const findForkPointSpy = vi.spyOn(crawler as any, 'findForkPoint');
 
             await expect((crawler as any).checkForReorg({
                 number: '0xa', parentHash: '0x9', stateRoot: '', extrinsicsRoot: '', digest: { logs: [] }
@@ -793,8 +795,8 @@ describe('MidnightCrawler orchestration', () => {
             (crawler as any).db = db;
             await seedBlock(9, '0x9');
 
-            jest.spyOn(crawler as any, 'getSyncState').mockResolvedValue({ lastIndexedHash: '0x12', lastIndexedHeight: 12 });
-            const findForkPointSpy = jest.spyOn(crawler as any, 'findForkPoint').mockResolvedValue(10);
+            vi.spyOn(crawler as any, 'getSyncState').mockResolvedValue({ lastIndexedHash: '0x12', lastIndexedHeight: 12 });
+            const findForkPointSpy = vi.spyOn(crawler as any, 'findForkPoint').mockResolvedValue(10);
 
             await expect((crawler as any).checkForReorg({
                 number: '0xa', parentHash: '0xforeign-9', stateRoot: '', extrinsicsRoot: '', digest: { logs: [] }
@@ -809,8 +811,8 @@ describe('MidnightCrawler orchestration', () => {
         it('treats a head far ahead of the index as a gap, not a reorg', async () => {
             const crawler = new MidnightCrawler({} as any, { enabled: true });
 
-            jest.spyOn(crawler as any, 'getSyncState').mockResolvedValue({ lastIndexedHash: '0x5', lastIndexedHeight: 5 });
-            const findForkPointSpy = jest.spyOn(crawler as any, 'findForkPoint');
+            vi.spyOn(crawler as any, 'getSyncState').mockResolvedValue({ lastIndexedHash: '0x5', lastIndexedHeight: 5 });
+            const findForkPointSpy = vi.spyOn(crawler as any, 'findForkPoint');
 
             await expect((crawler as any).checkForReorg({
                 number: '0xa', parentHash: '0x9', stateRoot: '', extrinsicsRoot: '', digest: { logs: [] }
@@ -822,7 +824,7 @@ describe('MidnightCrawler orchestration', () => {
             const crawler = new MidnightCrawler({} as any, { enabled: true });
             (crawler as any).db = db;
 
-            jest.spyOn(crawler as any, 'getSyncState').mockResolvedValue({ lastIndexedHash: '0x5', lastIndexedHeight: 5 });
+            vi.spyOn(crawler as any, 'getSyncState').mockResolvedValue({ lastIndexedHash: '0x5', lastIndexedHeight: 5 });
 
             await expect((crawler as any).checkForReorg({
                 number: '0x0', parentHash: '0x0000', stateRoot: '', extrinsicsRoot: '', digest: { logs: [] }
@@ -831,7 +833,7 @@ describe('MidnightCrawler orchestration', () => {
 
         it('does not report a reorg before any block has been indexed', async () => {
             const crawler = new MidnightCrawler({} as any, { enabled: true });
-            jest.spyOn(crawler as any, 'getSyncState').mockResolvedValue({ lastIndexedHash: null });
+            vi.spyOn(crawler as any, 'getSyncState').mockResolvedValue({ lastIndexedHash: null });
 
             await expect((crawler as any).checkForReorg({
                 number: '0x2a',
@@ -844,7 +846,7 @@ describe('MidnightCrawler orchestration', () => {
 
         it('finds fork points from local blocks and falls back when the node lookup fails', async () => {
             const provider = {
-                getHeader: jest.fn().mockRejectedValue(new Error('header unavailable'))
+                getHeader: vi.fn().mockRejectedValue(new Error('header unavailable'))
             };
             const crawler = new MidnightCrawler(provider as any, { enabled: true });
             (crawler as any).db = db;
@@ -874,7 +876,7 @@ describe('MidnightCrawler orchestration', () => {
 
         it('walks backward through remote headers until it finds the local fork point', async () => {
             const provider = {
-                getHeader: jest.fn().mockResolvedValue({ parentHash: '0x5' })
+                getHeader: vi.fn().mockResolvedValue({ parentHash: '0x5' })
             };
             const crawler = new MidnightCrawler(provider as any, { enabled: true });
             (crawler as any).db = db;
@@ -894,12 +896,12 @@ describe('MidnightCrawler orchestration', () => {
 
         it('stops fork-point search when the reorg depth exceeds 100 blocks', async () => {
             const provider = {
-                getHeader: jest.fn().mockResolvedValue({ parentHash: '0xloop' })
+                getHeader: vi.fn().mockResolvedValue({ parentHash: '0xloop' })
             };
             const crawler = new MidnightCrawler(provider as any, { enabled: true });
             // No local block ever matches, so it walks back until depth > 100.
             (crawler as any).db = db;
-            const errorSpy = jest.spyOn(console, 'error').mockImplementation();
+            const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
 
             try {
                 await expect((crawler as any).findForkPoint({

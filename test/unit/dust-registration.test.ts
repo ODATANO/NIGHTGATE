@@ -8,10 +8,10 @@
  * Tests here just verify the argument mapping + result pass-through.
  */
 
-const walletRegisterDustGeneration = jest.fn();
-const walletDeregisterDustGeneration = jest.fn();
+const walletRegisterDustGeneration = vi.hoisted(() => (vi.fn()));
+const walletDeregisterDustGeneration = vi.hoisted(() => (vi.fn()));
 
-jest.mock('../../srv/midnight/wallet-worker-client', () => ({
+vi.mock('../../srv/midnight/wallet-worker-client', () => ({
     walletRegisterDustGeneration:   (...args: unknown[]) => walletRegisterDustGeneration(...args),
     walletDeregisterDustGeneration: (...args: unknown[]) => walletDeregisterDustGeneration(...args)
 }));

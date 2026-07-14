@@ -1,7 +1,7 @@
-const loadMock = jest.fn();
-const linkedMock = jest.fn();
+const loadMock = vi.hoisted(() => (vi.fn()));
+const linkedMock = vi.hoisted(() => (vi.fn()));
 
-jest.mock('@sap/cds', () => {
+vi.mock('@sap/cds', () => {
     const cds: any = {
         model: undefined,
         load: loadMock,
@@ -16,7 +16,7 @@ import { ensureNightgateModelLoaded } from '../../srv/utils/cds-model';
 
 describe('ensureNightgateModelLoaded', () => {
     beforeEach(() => {
-        jest.clearAllMocks();
+        vi.clearAllMocks();
         (cds as any).model = undefined;
     });
 

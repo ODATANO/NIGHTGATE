@@ -30,7 +30,7 @@ function makeFakeDb() {
 
     return {
         tables,
-        run: jest.fn(async (q: any) => {
+        run: vi.fn(async (q: any) => {
             // CQN-ish shape from cds.ql operators; we read it through duck typing.
             const cqn = q.cqn || q;
 

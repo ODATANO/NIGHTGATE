@@ -50,7 +50,7 @@ describe('deriveGranteeId', () => {
 describe('resolveGranteeId', () => {
     const ID_GLOBAL = 'a'.repeat(64);
     const ID_SCOPED = 'b'.repeat(64);
-    const dbWith = (rows: any[]) => ({ run: jest.fn().mockResolvedValue(rows) });
+    const dbWith = (rows: any[]) => ({ run: vi.fn().mockResolvedValue(rows) });
     const reqFor = (id?: string) => ({ user: id ? { id } : undefined } as any);
 
     test('null for anonymous principal (no db hit)', async () => {

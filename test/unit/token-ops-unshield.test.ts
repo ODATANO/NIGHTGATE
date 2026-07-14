@@ -4,9 +4,9 @@
  * token-ops tests.
  */
 
-const walletUnshieldNight = jest.fn();
+const walletUnshieldNight = vi.hoisted(() => (vi.fn()));
 
-jest.mock('../../srv/midnight/wallet-worker-client', () => ({
+vi.mock('../../srv/midnight/wallet-worker-client', () => ({
     walletUnshieldNight: (...args: unknown[]) => walletUnshieldNight(...args)
 }));
 

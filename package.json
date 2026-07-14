@@ -1,6 +1,6 @@
 {
   "name": "@odatano/nightgate",
-  "version": "0.6.9",
+  "version": "0.6.10",
   "description": "CAP Plugin: Midnight Blockchain Indexer with OData V4 API",
   "homepage": "https://github.com/ODATANO/NIGHTGATE#readme",
   "repository": {
@@ -96,8 +96,8 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "deploy": "cds deploy --to sqlite:db/midnight.db",
     "pretest": "npm run build",
-    "test": "jest --coverage --runInBand",
-    "test:unit": "npm run build && jest --testPathPattern=test/unit --runInBand",
+    "test": "vitest run --coverage",
+    "test:unit": "npm run build && vitest run test/unit",
     "smoke:sdk": "node scripts/smoke-test-sdk.mjs",
     "integration:providers": "node scripts/integration-test-providers.mjs",
     "integration:wallet-keys": "node scripts/integration-test-wallet-keys.mjs",
@@ -140,8 +140,8 @@
     "ws": "^8"
   },
   "peerDependencies": {
-    "@sap/cds": ">=9.0.0",
-    "@midnight-ntwrk/dapp-connector-api": "^4.0.0"
+    "@midnight-ntwrk/dapp-connector-api": "^4.0.0",
+    "@sap/cds": ">=9.0.0"
   },
   "peerDependenciesMeta": {
     "@midnight-ntwrk/dapp-connector-api": {
@@ -155,15 +155,14 @@
     "@cap-js/sqlite": "^3",
     "@sap/cds": "^10",
     "@sap/cds-dk": "^10",
-    "@types/jest": "^29",
     "@types/node": "^22",
     "@types/ws": "^8",
+    "@vitest/coverage-v8": "^4.1.10",
     "eslint": "^10",
     "globals": "^14.0.0",
-    "jest": "^29",
-    "ts-jest": "^29",
     "tsx": "^4",
-    "typescript": "^5"
+    "typescript": "^5",
+    "vitest": "^4.1.10"
   },
   "cds": {
     "requires": {

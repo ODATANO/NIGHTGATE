@@ -4,23 +4,23 @@
  * Verify session invalidation actions work correctly.
  */
 
-const mockDbRun = jest.fn();
-const mockDbConnect = jest.fn().mockResolvedValue({ run: mockDbRun });
-const selectWhereSpy = jest.fn();
-const selectFromSpy = jest.fn();
-const updateWhereSpy = jest.fn();
-const updateSetSpy = jest.fn().mockReturnValue({ where: (...a: any[]) => updateWhereSpy(...a) });
-const insertEntriesSpy = jest.fn();
+const mockDbRun = vi.hoisted(() => (vi.fn()));
+const mockDbConnect = vi.hoisted(() => (vi.fn().mockResolvedValue({ run: mockDbRun })));
+const selectWhereSpy = vi.hoisted(() => (vi.fn()));
+const selectFromSpy = vi.hoisted(() => (vi.fn()));
+const updateWhereSpy = vi.fn();
+const updateSetSpy = vi.hoisted(() => (vi.fn().mockReturnValue({ where: (...a: any[]) => updateWhereSpy(...a) })));
+const insertEntriesSpy = vi.hoisted(() => (vi.fn()));
 
-const registeredHandlers: Record<string, Function> = {};
+const registeredHandlers: Record<string, Function> = vi.hoisted(() => ({}));
 
-jest.mock('@sap/cds', () => {
+vi.mock('@sap/cds', () => {
     const cds: any = {
         connect: { to: mockDbConnect },
         ql: {
             SELECT: {
                 one: {
-                    from: jest.fn().mockReturnValue({
+                    from: vi.fn().mockReturnValue({
                         where: selectWhereSpy
                     })
                 },
@@ -28,17 +28,17 @@ jest.mock('@sap/cds', () => {
                     selectFromSpy(entity);
                     return {
                         where: selectWhereSpy,
-                        columns: jest.fn().mockReturnValue({ where: selectWhereSpy })
+                        columns: vi.fn().mockReturnValue({ where: selectWhereSpy })
                     };
                 }
             },
             UPDATE: {
-                entity: jest.fn().mockReturnValue({
+                entity: vi.fn().mockReturnValue({
                     set: (...a: any[]) => updateSetSpy(...a)
                 })
             },
             INSERT: {
-                into: jest.fn().mockReturnValue({
+                into: vi.fn().mockReturnValue({
                     entries: insertEntriesSpy
                 })
             }
@@ -59,7 +59,7 @@ import NightgateAdminService from '../../srv/admin-service';
 function createMockRequest(data: Record<string, unknown>, userId?: string) {
     const req: any = {
         data,
-        reject: jest.fn().mockImplementation((code: number, msg: string) => {
+        reject: vi.fn().mockImplementation((code: number, msg: string) => {
             return { __rejected: true, code, message: msg };
         })
     };
@@ -71,7 +71,7 @@ describe('NightgateAdminService', () => {
     let service: NightgateAdminService;
 
     beforeEach(async () => {
-        jest.clearAllMocks();
+        vi.clearAllMocks();
         Object.keys(registeredHandlers).forEach(k => delete registeredHandlers[k]);
         service = new NightgateAdminService();
         await service.init();
