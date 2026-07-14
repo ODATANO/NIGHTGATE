@@ -287,7 +287,7 @@ New enums in `db/types.cds`:
 | Compact contracts | ✅ `counter` + `attestation-vault` registered with compiled artifacts shipped (0.3.0) |
 | Live preprod end-to-end (T15) | ✅ Counter deployed live on preprod via the full stack (0.3.0) |
 | On-chain disclosure grants | ✅ `grantDisclosure`/`revokeDisclosure` + chain-indexed `DisclosureGrants` + `granteeBinding` + on-chain read gate (0.3.4). Live-validated through grant → index → read-back; live revoke pending a healthy preprod indexer |
-| Crawler-free state verification | ✅ `verifyAttestationState` / `verifyPredicateState` / `reindexDisclosures` read LIVE contract state (0.5.0); optional per-call `network` override reads another network's public indexer (0.6.10) |
+| Crawler-free state verification | ✅ `verifyAttestationState` / `verifyPredicateState` / `reindexDisclosures` read LIVE contract state (0.5.0); optional per-call `network` override reads another network's public indexer (0.7.0) |
 | Mainnet submission | ❌ Gated by `allowMainnetSubmission: false` until forum 1190 resolves |
 | Built-in authorization | ✅ `@requires` annotations; consumer app provides auth strategy |
 
@@ -374,7 +374,7 @@ npm run integration:contract-registry  # registry resolves the real compiled cou
 
 ## Testing baseline
 
-- 63 test suites (Vitest; migrated from Jest in 0.6.10 after CAP 10 deprecated the Jest harness)
+- 63 test suites (Vitest; migrated from Jest in 0.7.0 after CAP 10 deprecated the Jest harness)
 - 1097 tests passing
 - 0 failures
 - Integration scripts pass against the real SDK (`smoke:sdk`, `integration:*`)

@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.6.10 - 2026-07-14
+## 0.7.0 - 2026-07-14
 
 ### Feature: optional `network` override on the crawler-free verify surface
 
