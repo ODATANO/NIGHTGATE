@@ -14,13 +14,13 @@ Configure the plugin under `cds.requires.nightgate`. Environment variables overr
 {
   "cds": {
     "requires": {
-      "nightgate": { "kind": "nightgate" }
+      "nightgate": { "network": "preprod" }
     }
   }
 }
 ```
 
-Sufficient for read-side. Defaults to `preprod`, `wss://rpc.preprod.midnight.network/`, the public Midnight indexer, `http://localhost:6300` for the proof server.
+Sufficient for read-side. `network` is the only required key — without it the plugin serves its OData surface but stays idle (no crawler, no submission), so a bare install never auto-crawls a chain nobody chose. Everything else defaults: `wss://rpc.preprod.midnight.network/`, the public Midnight indexer, `http://localhost:6300` for the proof server. A legacy `"kind": "nightgate"` in existing configs is inert and ignored.
 
 ### Full
 
@@ -29,7 +29,6 @@ Sufficient for read-side. Defaults to `preprod`, `wss://rpc.preprod.midnight.net
   "cds": {
     "requires": {
       "nightgate": {
-        "kind": "nightgate",
         "network": "preprod",
         "nodeUrl": "wss://rpc.preprod.midnight.network/",
         "corsOrigin": "*",

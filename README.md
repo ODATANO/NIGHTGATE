@@ -8,6 +8,7 @@
 [![Coverage](https://img.shields.io/codecov/c/github/ODATANO/NIGHTGATE)](https://codecov.io/gh/ODATANO/NIGHTGATE)
 [![npm](https://img.shields.io/npm/v/@odatano/nightgate)](https://www.npmjs.com/package/@odatano/nightgate)
 [![npm downloads](https://img.shields.io/npm/dt/@odatano/nightgate?logo=npm&label=downloads&color=blue)](https://www.npmjs.com/package/@odatano/nightgate)
+[![SAP CAP](https://img.shields.io/badge/SAP%20CAP-%40sap%2Fcds%20%5E10-0faaff?logo=sap)](https://cap.cloud.sap/)
 [![License](https://img.shields.io/badge/license-Apache--2.0-yellow)](LICENSE)
 
 `@odatano/nightgate` ties a SAP CAP runtime directly to the [Midnight](https://midnight.network/) blockchain. A built-in crawler indexes blocks from a Substrate RPC node into CAP entities; a worker-thread-isolated wallet stack handles ZK-aware transaction submission (deploy/call Compact contracts, send NIGHT, shield/unshield, dust generation). The whole surface is exposed through standard OData V4 — no GraphQL, no SDK lock-in for consumers.
@@ -149,13 +150,13 @@ npm install @odatano/nightgate @cap-js/sqlite
   "cds": {
     "requires": {
       "db": { "kind": "sqlite" },
-      "nightgate": { "kind": "nightgate" }
+      "nightgate": { "network": "preprod" }
     }
   }
 }
 ```
 
-Then `cds watch`. Defaults to Preprod with public RPC + hosted indexer. Override via env vars or CDS config — see [docs/reference.md#configuration](docs/reference.md#configuration).
+Then `cds watch`. `network` is the only required key; everything else defaults to Preprod's public RPC + hosted indexer. Override via env vars or CDS config — see [docs/reference.md#configuration](docs/reference.md#configuration).
 
 ## Development
 

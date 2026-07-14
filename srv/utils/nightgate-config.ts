@@ -207,17 +207,15 @@ export function getConfiguredNightgateCrawlerNodeUrl(config?: Record<string, any
     return readEnv('NIGHTGATE_CRAWLER_NODE_URL') || config?.crawler?.nodeUrl;
 }
 
+/**
+ * The plugin counts as configured iff a network is selected (config or
+ * NIGHTGATE_NETWORK) — without one, initialize() stays idle so we never
+ * auto-crawl a chain nobody chose. The legacy `kind: 'nightgate'` marker some
+ * consumer configs carry is inert and simply ignored (it never enabled
+ * anything: the old check reduced to exactly this predicate).
+ */
 export function isNightgatePluginConfigured(config?: Record<string, any>): boolean {
-    if (!config) {
-        return false;
-    }
-
-    const configuredNetwork = getConfiguredNightgateNetwork(config);
-    if (config.kind === 'nightgate' && !configuredNetwork) {
-        return false;
-    }
-
-    return Boolean(config.kind === 'nightgate' || configuredNetwork);
+    return Boolean(config && getConfiguredNightgateNetwork(config));
 }
 
 export function normalizeNightgateNetwork(network?: string): {

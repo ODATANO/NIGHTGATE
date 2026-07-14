@@ -196,13 +196,13 @@ Add to `package.json`:
   "cds": {
     "requires": {
       "db": { "kind": "sqlite" },
-      "nightgate": { "kind": "nightgate" }
+      "nightgate": { "network": "preprod" }
     }
   }
 }
 ```
 
-Then `cds watch`. Defaults to Preprod with hosted endpoints. Override via env vars or CDS config — see [reference.md#configuration](reference.md#configuration).
+Then `cds watch`. `network` is the only required key (without it the plugin stays idle — it never auto-crawls a chain nobody chose); everything else defaults to the public Preprod endpoints. Override via env vars or CDS config — see [reference.md#configuration](reference.md#configuration). (A legacy `"kind": "nightgate"` in existing configs is harmless and ignored.)
 
 The plugin auto-registers four OData services under `/api/v1/{nightgate,indexer,analytics,admin}`. All actions and functions documented in [actions.md](actions.md) are available immediately.
 

@@ -173,7 +173,6 @@
         }
       },
       "nightgate": {
-        "kind": "nightgate",
         "contracts": {
           "counter": {
             "artifactPath": "contracts/counter/src/managed/counter/contract/index.js",
@@ -186,8 +185,7 @@
             "zkConfigPath": "contracts/attestation-vault/src/managed/attestation-vault"
           }
         }
-      },
-      "kinds": {}
+      }
     },
     "[development]": {
       "requires": {

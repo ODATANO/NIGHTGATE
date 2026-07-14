@@ -78,11 +78,11 @@ describe('isNightgatePluginConfigured', () => {
         expect(isNightgatePluginConfigured(undefined)).toBe(false);
     });
 
-    it('returns false when kind="nightgate" but no network is configured', () => {
+    it('ignores the legacy kind marker: kind alone (no network) is NOT configured', () => {
         expect(isNightgatePluginConfigured({ kind: 'nightgate' })).toBe(false);
     });
 
-    it('returns true when kind="nightgate" with a network', () => {
+    it('accepts configs that still carry the legacy kind marker alongside a network', () => {
         expect(isNightgatePluginConfigured({ kind: 'nightgate', network: 'preprod' })).toBe(true);
     });
 

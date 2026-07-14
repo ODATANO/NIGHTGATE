@@ -27,6 +27,24 @@ Requested by NIGHTPASS (Passport Explorer, cross-network verification);
 replaces the per-network peer-instance workaround
 (`docs/feature-requests/verify-state-network-override.md`).
 
+### Config: `kind: "nightgate"` retired from the documented consumer config
+
+The `kind` marker never did anything: NIGHTGATE registers no CAP kind preset,
+and the configured-check always reduced to "is a network selected". Worse, the
+docs' minimal config (`{ "kind": "nightgate" }` alone, "defaults to preprod")
+did NOT actually start the crawler — without a `network` the plugin stays
+idle by design (never auto-crawl a chain nobody chose). The documented minimal
+consumer config is now the one that works:
+
+```json
+"nightgate": { "network": "preprod" }
+```
+
+Existing configs that still carry `"kind": "nightgate"` keep working — the
+marker is inert and ignored. `isNightgatePluginConfigured` is simplified to
+exactly that predicate, and the dead `kind`/empty-`kinds` entries are removed
+from the plugin's own package.json.
+
 ### Internal: test suite migrated from Jest to Vitest
 
 CAP 10 deprecated the Jest harness (Vitest is the successor), so the full
