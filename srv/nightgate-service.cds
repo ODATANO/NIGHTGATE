@@ -367,12 +367,21 @@ service NightgateService {
      * Returns `verified: false` (not an error) for an absent attestation, and a
      * clean negative (not a 5xx) when no live provider is configured — mirroring
      * `verifyDocument`. `compiledArtifactRef` defaults to 'attestation-vault'.
+     *
+     * `network` (optional) reads the state from ANOTHER network's public
+     * indexer instead of the configured one — the read is stateless and
+     * wallet-free, so a preview-configured server can verify a preprod anchor.
+     * Omitted or equal to the configured network keeps today's behavior
+     * exactly (env/config endpoint overrides win); an unknown value is a 400.
+     * Per-network endpoints are overridable via
+     * `cds.requires.nightgate.networks.<network>.indexerHttpUrl/indexerWsUrl`.
      */
     function verifyAttestationState(
         contractAddress:     String,
         payloadHash:         String,   // 64 hex
         contentRoot:         String,   // optional 64 hex, checked against anchored root
-        compiledArtifactRef: String    // optional, defaults to 'attestation-vault'
+        compiledArtifactRef: String,   // optional, defaults to 'attestation-vault'
+        network:             String    // optional network override, e.g. 'preview' | 'preprod' | 'mainnet'
     )                                returns {
         verified:      Boolean;
         attested:      Boolean;   // payload_hash present in the attestation map
@@ -398,6 +407,9 @@ service NightgateService {
      * clean negative (not a 5xx) when no live provider is configured or the
      * contract is unknown — mirroring `verifyAttestationState`.
      * `compiledArtifactRef` defaults to 'attestation-vault'.
+     *
+     * `network` (optional) behaves exactly as on `verifyAttestationState`:
+     * read from another network's public indexer, 400 on unknown values.
      */
     function verifyPredicateState(
         contractAddress:     String,
@@ -405,7 +417,8 @@ service NightgateService {
         fieldKey:            String,   // optional 64 hex; when set, field-bound
         predicate:           String,   // 'lessOrEqual' | 'greaterOrEqual'
         threshold:           Integer64, // scaled circuit integer (see above)
-        compiledArtifactRef: String    // optional, defaults to 'attestation-vault'
+        compiledArtifactRef: String,   // optional, defaults to 'attestation-vault'
+        network:             String    // optional network override, e.g. 'preview' | 'preprod' | 'mainnet'
     )                                returns {
         verified: Boolean;
         proven:   Boolean;   // a true result is recorded on-chain for the claim key

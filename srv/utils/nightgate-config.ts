@@ -69,6 +69,18 @@ export interface NightgatePluginConfig {
      * to `GranteeIdentities`).
      */
     allowSelfServiceGranteeRegistration?: boolean;
+    /**
+     * Per-network indexer endpoint overrides for the crawler-free state-verify
+     * surface's optional `network` parameter (verify-state-network-override FR).
+     * Only consulted when a verify call overrides to a network OTHER than the
+     * configured one; the configured network keeps using the top-level
+     * `indexerHttpUrl`/`indexerWsUrl` + env vars. Networks not listed here fall
+     * back to the built-in public defaults (`DEFAULT_INDEXER_URLS`).
+     */
+    networks?: Partial<Record<NightgateNetwork, {
+        indexerHttpUrl?: string;
+        indexerWsUrl?: string;
+    }>>;
     // CAP permits additional plugin-specific keys we don't model here.
     [k: string]: unknown;
 }
@@ -243,6 +255,26 @@ export function resolveSubmissionEndpoints(
         indexerWsUrl: readEnv('NIGHTGATE_INDEXER_WS_URL') || config?.indexerWsUrl || defaults.ws,
         proofServerUrl: readEnv('NIGHTGATE_PROOF_SERVER_URL') || config?.proofServerUrl || DEFAULT_PROOF_SERVER_URL,
         zkConfigBasePath: readEnv('NIGHTGATE_ZK_CONFIG_BASE') || config?.zkConfigBasePath || DEFAULT_ZK_CONFIG_BASE
+    };
+}
+
+/**
+ * Indexer endpoints for a state-verify `network` override that differs from the
+ * configured network (verify-state-network-override FR). Pure per-network
+ * resolution: `config.networks[<network>]` wins over the built-in public
+ * defaults. Top-level config and `NIGHTGATE_INDEXER_*` env vars deliberately do
+ * NOT apply here — they describe the CONFIGURED network only; applying them to
+ * an override would silently point a preprod verify at a preview indexer.
+ */
+export function resolveOverrideIndexerEndpoints(
+    network: NightgateNetwork,
+    config?: Record<string, any>
+): { indexerHttpUrl: string; indexerWsUrl: string } {
+    const defaults = DEFAULT_INDEXER_URLS[network];
+    const perNetwork = config?.networks?.[network] ?? {};
+    return {
+        indexerHttpUrl: perNetwork.indexerHttpUrl || defaults.http,
+        indexerWsUrl: perNetwork.indexerWsUrl || defaults.ws
     };
 }
 

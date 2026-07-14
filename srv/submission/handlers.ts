@@ -41,7 +41,7 @@ import {
     loadCircuitArgTypes,
     CoercionError
 } from './arg-coercion';
-import { resolveNightgateRuntimeConfig, type NightgateNetwork, getConfiguredPrivateStateBackend, getNightgatePluginConfig, mainnetSubmissionBlockReason } from '../utils/nightgate-config';
+import { resolveNightgateRuntimeConfig, type NightgateNetwork, VALID_NIGHTGATE_NETWORKS, resolveOverrideIndexerEndpoints, getConfiguredPrivateStateBackend, getNightgatePluginConfig, mainnetSubmissionBlockReason } from '../utils/nightgate-config';
 import { RateLimiter } from '../utils/rate-limiter';
 import { ensureNetworkId, type ContractProvidersConfig } from '../midnight/providers';
 import { startJob } from './background-jobs';
@@ -1024,6 +1024,7 @@ export function registerSubmissionHandlers(
             payloadHash?: string;
             contentRoot?: string;
             compiledArtifactRef?: string;
+            network?: string;
         };
 
         if (!data.contractAddress) return req.reject(400, 'contractAddress is required');
@@ -1034,6 +1035,8 @@ export function registerSubmissionHandlers(
         if (data.contentRoot && !SHA256_HEX_RE.test(data.contentRoot)) {
             return req.reject(400, 'contentRoot must be 64 hex chars (32 bytes)');
         }
+        const netParsed = parseVerifyNetworkOverride(data.network, req);
+        if (!netParsed.ok) return;
 
         const compiledRef = data.compiledArtifactRef && data.compiledArtifactRef.length > 0
             ? data.compiledArtifactRef
@@ -1042,7 +1045,7 @@ export function registerSubmissionHandlers(
         const NEGATIVE = { verified: false, attested: false, contentRootOk: false, attesterId: '' };
 
         // No live provider configured → clean negative, not a 5xx (criterion 5).
-        if (!liveProviderConfigured()) return NEGATIVE;
+        if (!liveProviderConfigured(netParsed.network)) return NEGATIVE;
 
         return runSubmission(req, async () => {
             const resolved = await contractResolver(compiledRef);
@@ -1051,7 +1054,7 @@ export function registerSubmissionHandlers(
                 payloadHash: data.payloadHash!,
                 contentRoot: data.contentRoot,
                 artifactPath: resolved.artifactPath,
-                contractProvidersConfig: contractProvidersConfigFromEnv(resolved.zkConfigPath)
+                contractProvidersConfig: contractProvidersConfigForNetwork(resolved.zkConfigPath, netParsed.network)
             });
 
             // Unknown contract / no on-chain state → clean negative.
@@ -1075,6 +1078,7 @@ export function registerSubmissionHandlers(
             predicate?: string;
             threshold?: number | string;
             compiledArtifactRef?: string;
+            network?: string;
         };
 
         if (!data.contractAddress) return req.reject(400, 'contractAddress is required');
@@ -1096,6 +1100,9 @@ export function registerSubmissionHandlers(
         try { thresholdBig = BigInt(data.threshold); } catch { return req.reject(400, 'threshold must be an integer'); }
         if (thresholdBig < 0n) return req.reject(400, 'threshold must be a non-negative integer');
 
+        const netParsed = parseVerifyNetworkOverride(data.network, req);
+        if (!netParsed.ok) return;
+
         const compiledRef = data.compiledArtifactRef && data.compiledArtifactRef.length > 0
             ? data.compiledArtifactRef
             : DEFAULT_ATTESTATION_VAULT_REF;
@@ -1103,7 +1110,7 @@ export function registerSubmissionHandlers(
         const NEGATIVE = { verified: false, proven: false };
 
         // No live provider configured → clean negative, not a 5xx (criterion 4).
-        if (!liveProviderConfigured()) return NEGATIVE;
+        if (!liveProviderConfigured(netParsed.network)) return NEGATIVE;
 
         return runSubmission(req, async () => {
             const resolved = await contractResolver(compiledRef);
@@ -1115,7 +1122,7 @@ export function registerSubmissionHandlers(
                 threshold: thresholdBig,
                 op,
                 artifactPath: resolved.artifactPath,
-                contractProvidersConfig: contractProvidersConfigFromEnv(resolved.zkConfigPath)
+                contractProvidersConfig: contractProvidersConfigForNetwork(resolved.zkConfigPath, netParsed.network)
             });
 
             // `null` (unknown contract / no on-chain state) and `false` (no true
@@ -1320,9 +1327,17 @@ function facadeConfigFromEnv() {
  * True when a live indexer provider is configured, i.e. crawler-free state
  * verification can attempt a `queryContractState` round-trip. When false, the
  * state-verification surfaces return a clean negative instead of a 5xx.
+ *
+ * With a `network` override to a DIFFERENT network than the configured one, the
+ * override endpoints are what matter (they resolve from `config.networks` or
+ * the built-in public defaults, so they always exist for a valid network).
  */
-function liveProviderConfigured(): boolean {
-    const { submissionEndpoints } = resolveNightgateRuntimeConfig(getNightgatePluginConfig());
+function liveProviderConfigured(networkOverride?: NightgateNetwork): boolean {
+    const { network, submissionEndpoints } = resolveNightgateRuntimeConfig(getNightgatePluginConfig());
+    if (networkOverride && networkOverride !== network) {
+        const eps = resolveOverrideIndexerEndpoints(networkOverride, getNightgatePluginConfig());
+        return Boolean(eps.indexerHttpUrl && eps.indexerWsUrl);
+    }
     return Boolean(submissionEndpoints.indexerHttpUrl && submissionEndpoints.indexerWsUrl);
 }
 
@@ -1335,6 +1350,44 @@ function contractProvidersConfigFromEnv(zkConfigPath: string): ContractProviders
         proofServerUrl: submissionEndpoints.proofServerUrl,
         zkConfigPath
     };
+}
+
+/**
+ * Contract-only provider config honouring the optional per-call `network`
+ * override on the crawler-free verify surface (verify-state-network-override
+ * FR). Omitted or equal to the configured network → EXACTLY
+ * `contractProvidersConfigFromEnv` (env / top-level config keep winning). A
+ * different valid network swaps only the indexer endpoints; proof server and
+ * zkConfig stay as configured — compiled artifacts are network-agnostic and
+ * the read path never proves.
+ */
+function contractProvidersConfigForNetwork(
+    zkConfigPath: string,
+    networkOverride?: NightgateNetwork
+): ContractProvidersConfig {
+    const base = contractProvidersConfigFromEnv(zkConfigPath);
+    if (!networkOverride) return base;
+    const { network } = resolveNightgateRuntimeConfig(getNightgatePluginConfig());
+    if (networkOverride === network) return base;
+    const eps = resolveOverrideIndexerEndpoints(networkOverride, getNightgatePluginConfig());
+    return { ...base, indexerHttpUrl: eps.indexerHttpUrl, indexerWsUrl: eps.indexerWsUrl };
+}
+
+/**
+ * Validates the optional `network` param of the state-verify functions.
+ * Returns `{ ok: false }` after rejecting with 400 for an unknown value
+ * (criterion 3: explicit 400, never a silent fallback).
+ */
+function parseVerifyNetworkOverride(
+    raw: string | undefined,
+    req: Request
+): { ok: boolean; network?: NightgateNetwork } {
+    if (!raw) return { ok: true };
+    if (!(VALID_NIGHTGATE_NETWORKS as readonly string[]).includes(raw)) {
+        req.reject(400, `network must be one of: ${VALID_NIGHTGATE_NETWORKS.join(', ')}`);
+        return { ok: false };
+    }
+    return { ok: true, network: raw as NightgateNetwork };
 }
 
 /**
