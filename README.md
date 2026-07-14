@@ -4,10 +4,11 @@
 
 **SAP CAP plugin: Midnight blockchain indexer + transaction submission, exposed as OData V4.**
 
-[![npm](https://img.shields.io/npm/v/@odatano/nightgate)](https://www.npmjs.com/package/@odatano/nightgate)
-[![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
-[![Tests](https://img.shields.io/github/actions/workflow/status/ODATANO/NIGHTGATE/test.yaml?label=tests)](https://github.com/ODATANO/NIGHTGATE/actions)
+[![Tests](https://github.com/ODATANO/NIGHTGATE/actions/workflows/test.yaml/badge.svg)](https://github.com/ODATANO/NIGHTGATE/actions/workflows/test.yaml)
 [![Coverage](https://img.shields.io/codecov/c/github/ODATANO/NIGHTGATE)](https://codecov.io/gh/ODATANO/NIGHTGATE)
+[![npm](https://img.shields.io/npm/v/@odatano/nightgate)](https://www.npmjs.com/package/@odatano/nightgate)
+[![npm downloads](https://img.shields.io/npm/dt/@odatano/nightgate?logo=npm&label=downloads&color=blue)](https://www.npmjs.com/package/@odatano/nightgate)
+[![License](https://img.shields.io/badge/license-Apache--2.0-yellow)](LICENSE)
 
 `@odatano/nightgate` ties a SAP CAP runtime directly to the [Midnight](https://midnight.network/) blockchain. A built-in crawler indexes blocks from a Substrate RPC node into CAP entities; a worker-thread-isolated wallet stack handles ZK-aware transaction submission (deploy/call Compact contracts, send NIGHT, shield/unshield, dust generation). The whole surface is exposed through standard OData V4 — no GraphQL, no SDK lock-in for consumers.
 
