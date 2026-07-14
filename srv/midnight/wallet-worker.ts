@@ -492,7 +492,7 @@ async function waitForGenuineSync(facade: any, indexerHttpUrl: string, timeoutMs
  * section even for an empty recipe) or the malformation is elsewhere in the
  * transaction. Never throws: diagnostics must not break the submit path.
  */
-function describeTxDust(tx: any): { summary: string; emptyDustActions: boolean } {
+export function describeTxDust(tx: any): { summary: string; emptyDustActions: boolean } {
     try {
         const parts: string[] = [];
         let empty = false;
@@ -518,7 +518,9 @@ function describeTxDust(tx: any): { summary: string; emptyDustActions: boolean }
     }
 }
 
-function buildWorkerWalletProvider(entry: FacadeEntry): any {
+// Exported for the in-thread unit tests (wallet-worker-dispatch.test.ts):
+// the 117-guard around balanceTx/submitTx is OUR logic, not SDK choreography.
+export function buildWorkerWalletProvider(entry: FacadeEntry): any {
     return {
         getCoinPublicKey(): string { return entry.zswapKeys.coinPublicKey; },
         getEncryptionPublicKey(): string { return entry.zswapKeys.encryptionPublicKey; },

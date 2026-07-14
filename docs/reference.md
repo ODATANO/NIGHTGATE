@@ -87,7 +87,8 @@ Sufficient for read-side. Defaults to `preprod`, `wss://rpc.preprod.midnight.net
 | `palletMap` | `(built-in)` | Optional override of the Substrate pallet-index → tx-type classification map used by the `BlockProcessor` (`{ "<index>": { name, txType, isShielded?, isSystem? } }`) |
 | `allowMainnetSubmission` | `false` | Gate for mainnet submission. Stays off until [forum thread 1190](https://forum.midnight.network) (`1016 Immediately Dropped`) is resolved |
 | `granteeBinding` | `wallet` | How an authenticated principal maps to the AttestationVault `Bytes<32>` grantee id for on-chain disclosure grants: `wallet` (coin pubkey hash) / `did` (DID string) / `custom` (opaque 64-hex). Used by `registerGranteeIdentity` + the disclosure read gate |
-| `allowSelfServiceGranteeRegistration` | `true` | Whether authenticated callers may register their own grantee identity via `registerGranteeIdentity`. **NIGHTGATE does not verify that the caller owns the binding input it registers** (no wallet-signature / DID-control proof), so under `wallet`/`did` binding an authenticated user could squat another party's grantee id. Set `false` on deployments where identities must come from an operator proofing flow that writes `GranteeIdentities` directly; the action then returns `403`. |
+| `allowSelfServiceGranteeRegistration` | `false` | Whether authenticated callers may register their own grantee identity via `registerGranteeIdentity`. **NIGHTGATE does not verify that the caller owns the binding input it registers** (no wallet-signature / DID-control proof), so under `wallet`/`did` binding an authenticated user could squat another party's grantee id. Off by default since 0.5.0 (review_001 P1); the action returns `403` unless explicitly enabled. Identities can always be registered through an operator proofing flow that writes `GranteeIdentities` directly. |
+| `networks` | `{}` | Per-network indexer endpoints for the `network` override on `verifyAttestationState` / `verifyPredicateState`: `{ "<network>": { indexerHttpUrl, indexerWsUrl } }`. Only consulted when a verify call overrides to a network other than the configured one; unlisted networks use the built-in public indexer defaults. Top-level `indexerHttpUrl`/`indexerWsUrl` and `NIGHTGATE_INDEXER_*` env vars apply to the CONFIGURED network only. |
 
 ### Environment variables
 
@@ -287,6 +288,7 @@ New enums in `db/types.cds`:
 | Compact contracts | ✅ `counter` + `attestation-vault` registered with compiled artifacts shipped (0.3.0) |
 | Live preprod end-to-end (T15) | ✅ Counter deployed live on preprod via the full stack (0.3.0) |
 | On-chain disclosure grants | ✅ `grantDisclosure`/`revokeDisclosure` + chain-indexed `DisclosureGrants` + `granteeBinding` + on-chain read gate (0.3.4). Live-validated through grant → index → read-back; live revoke pending a healthy preprod indexer |
+| Crawler-free state verification | ✅ `verifyAttestationState` / `verifyPredicateState` / `reindexDisclosures` read LIVE contract state (0.5.0); optional per-call `network` override reads another network's public indexer (0.6.10) |
 | Mainnet submission | ❌ Gated by `allowMainnetSubmission: false` until forum 1190 resolves |
 | Built-in authorization | ✅ `@requires` annotations; consumer app provides auth strategy |
 
@@ -366,17 +368,19 @@ npm run integration:contract-registry  # registry resolves the real compiled cou
 | `npm run build` | `cds:types` + `tsc -p tsconfig.build.json` (in-place compile) |
 | `npm run typecheck` | `tsc --noEmit` |
 | `npm run lint` | ESLint |
-| `npm test` | Full Jest suite with coverage |
+| `npm test` | Full Vitest suite with coverage |
 | `npm run test:unit` | Unit tests only |
 | `npm run clean` | Remove generated `.js` / `.d.ts` artifacts |
 | `npm run cds:types` | Regenerate `@cds-models` |
 
 ## Testing baseline
 
-- 49 test suites
-- 688 tests passing
+- 63 test suites (Vitest; migrated from Jest in 0.6.10 after CAP 10 deprecated the Jest harness)
+- 1097 tests passing
 - 0 failures
 - Integration scripts pass against the real SDK (`smoke:sdk`, `integration:*`)
+- Known coverage gap by design: the facade OPERATION bodies in `srv/midnight/wallet-worker.ts` (transfer/shield/unshield/dust/deploy) run the real SDK and are exercised by the live e2e scripts; the worker's RPC dispatch, facade lifecycle, genuine-sync gate and save/ack protocol are unit-tested in-thread (`wallet-worker-dispatch.test.ts`)
+- Coverage measurement note: the CAP-booted services execute the compiled `srv/*.js` (native require, outside vitest's module graph). The build emits sourcemaps and `vitest.config.ts` includes `srv/**/*.js` so this execution is remapped onto the `.ts` sources — don't remove either half, or every handler tested through the booted server reads as uncovered
 
 Run locally:
 

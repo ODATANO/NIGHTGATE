@@ -1,5 +1,90 @@
 # Changelog
 
+## 0.6.10 - 2026-07-14
+
+### Feature: optional `network` override on the crawler-free verify surface
+
+`verifyAttestationState` and `verifyPredicateState` accept a new optional
+`network` parameter (`preview` | `testnet` | `preprod` | `mainnet` |
+`undeployed`). The live-state read is stateless and wallet-free, so a server
+configured for one network can now verify an anchor on another network's
+public indexer without a second NIGHTGATE process. Omitting the parameter, or
+passing the configured network, keeps today's behavior bit-for-bit (top-level
+config and `NIGHTGATE_INDEXER_*` env overrides keep winning for the configured
+network); an unknown value is a 400, never a silent fallback. A different
+valid network swaps ONLY the indexer endpoints: built-in public defaults, or
+`cds.requires.nightgate.networks.<network>.indexerHttpUrl/indexerWsUrl` for
+non-default indexers. Proof server, zkConfig and the compiled artifact stay as
+configured (artifacts are network-agnostic; the read path never proves).
+
+Deliberately NOT on `reindexDisclosures` (it writes `DisclosureGrants` rows
+the read gate consumes; mixing networks there needs its own design), nor on
+the DB-backed fallbacks of `verifyDocument` / `verifyPredicateAttestation`
+(the local `Transactions` table is by definition the configured network), nor
+on any submission path (wallet sessions are network-bound).
+
+Requested by NIGHTPASS (Passport Explorer, cross-network verification);
+replaces the per-network peer-instance workaround
+(`docs/feature-requests/verify-state-network-override.md`).
+
+### Internal: test suite migrated from Jest to Vitest
+
+CAP 10 deprecated the Jest harness (Vitest is the successor), so the full
+suite now runs under Vitest 4; jest/ts-jest/@types/jest are removed. No
+runtime code changed. Full run drops from ~60s to ~14s (test files now run in
+parallel fork processes; each fork has its own env, in-memory DB and ports).
+
+A coverage review after the migration closed the largest unit-test gaps
+(63 suites / 1097 tests total): the deriveWalletInfo handler + the
+rejection ladders of every token-op/diagnostics action and the TTL-cleanup
+facade eviction (wallet-sessions 77→92%), the parallel catch-up fetch
+pipeline incl. batch de-interleaving (BlockProcessor 70→97%), every
+CoercionError branch (arg-coercion 100%), and — newly possible because
+Vitest imports the ESM SDK — the off-chain claim-key recomputation pinned
+byte-exact against the spike-verified encoding with the REAL compact-runtime,
+plus both crawler-free state-reader production wrappers (predicate-state
+32→100%, attestation-state 100%). The wallet worker itself is now driven
+in-thread with a mocked parentPort + stubbed SDK seam
+(wallet-worker-dispatch.test.ts): RPC dispatch and error protocol, boot
+guard, facade lifecycle incl. restore-vs-fresh and the dust cold-start
+flag, the genuine-sync gate (dust stream tip vs appliedIndex, freshness),
+and the periodic-save push/ack/unchanged-skip protocol (0→37%); the facade
+OPERATION bodies (transfer/shield/unshield/dust/deploy) intentionally stay
+covered by the live e2e scripts.
+
+A follow-up sweep covered the remaining substantive gaps: the FULL
+issueFieldPredicateAttestation handler (0.4.3's field-bound predicate —
+validation ladder, witness-only value transport, optional content-root
+anchoring), REAL-SDK HD-derivation regression tests pinning the live-verified
+Lace per-role derivation byte-exact (wallet-hd 26→97%, wallet-info 41→100% —
+the exact site of the 2026-05 wrong-account bug), the crawler's batch-retry
+policy, MidnightNodeProvider's rpcBatch protocol (order-by-id, batch errors,
+timeouts) and connect/subscription edges, plus rate-limiter capacity/sweep,
+SCALE MultiAddress variants and contract-registry guards
+(handlers.ts 81→96%; overall statements 87%, lines 89%). The worker's
+Custom-error-117 guards are unit-tested too: `describeTxDust` (the intent
+dust dump that makes a 117 attributable) and `buildWorkerWalletProvider`'s
+balanceTx fail-fast on an empty DustActions section + submitTx pre-submit
+warn (wallet-worker 0→51% overall; the remaining half is the SDK
+choreography of the token/deploy op bodies, live-e2e territory).
+
+Coverage attribution fix: cds.test() boots the services from the compiled
+`srv/*.js` via native require, OUTSIDE vitest's module graph — handlers
+exercised through the booted server were counted as uncovered on the `.ts`
+sources (jest intercepted every require, so its numbers never showed this).
+The in-place build now emits sourcemaps (`tsconfig.build.json`
+`sourceMap: true`; maps are not published and `npm run clean` removes them)
+and the coverage include also lists `srv/**/*.js`, so the v8 provider remaps
+booted-server execution back onto the `.ts` sources
+(nightgate-service.ts 26→98%, nightgate-indexer-service.ts 64→97%). Overall
+statement coverage lands at 83% (lines 85%); statement/line are the robust
+metrics — the function metric gets noisier through the merged maps.
+Two behavioral notes for test authors, also recorded in CLAUDE.md: vi.mock
+factories cannot read non-hoisted top-level variables (use `vi.hoisted`), and
+mocks do NOT reach the CAP-booted service (cds.test() loads compiled `srv/*.js`
+via native require; stub such collaborators with `vi.spyOn` on the natively
+required module instead).
+
 ## 0.6.9 - 2026-07-13
 
 ### Fix: only the deploying wallet could call a contract
