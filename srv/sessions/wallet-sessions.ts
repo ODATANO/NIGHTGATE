@@ -130,7 +130,7 @@ function validateOptionalTtl(ttlIso: string | undefined): string | null {
  * The authenticated principal id, or reject 401 and return undefined. Every
  * session-scoped action must call this and bail on undefined: sessions are
  * owned by the principal that created them, and a leaked sessionId alone must
- * not grant any other principal access (review_001 P1). The NightgateService is
+ * not grant any other principal access. The NightgateService is
  * `@requires: 'authenticated-user'`, so a genuine caller always has an id.
  */
 function requireUserId(req: Request): string | undefined {
@@ -220,7 +220,7 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
         };
     });
 
-    // Pure derivation, no session, nothing persisted (FR derive-wallet-info).
+    // Pure derivation, no session, nothing persisted.
     // Rate-limited like connectWalletForSigning: the request carries secret
     // material. The secret is validated and consumed in-memory only; error
     // paths never echo the input.
@@ -325,7 +325,7 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
         // this was fire-and-forget; the job-tracked variant lets clients know
         // when the cold sync (~5-6h on a fresh preprod seed) is done before
         // they fire deployContract / submitContractCall. Failure to wait is
-        // still safe — subsequent submission actions will block on the same
+        // still safe; subsequent submission actions will block on the same
         // sync internally.
         //
         // Pre-warm setup that depends on session state (viewing-key decrypt,
@@ -353,7 +353,7 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
                 kind: 'connectWalletForSigning',
                 sessionId,
                 idempotencyKey,
-                // Strip the seed — request snapshots must never carry secrets.
+                // Strip the seed; request snapshots must never carry secrets.
                 request: { sessionId, accountIdPrefix: accountId.slice(0, 16) },
                 work: async () => {
                     await ensureNetworkId(network);
@@ -362,7 +362,7 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
                     // sync; it does not wait for it. Without blocking here, the
                     // facade serves whatever (possibly restored, stale) state it
                     // has, and the deploy path's balanceTx builds against stale
-                    // dust — the live node then rejects it with
+                    // dust; the live node then rejects it with
                     // `1010 Invalid Transaction: Custom error: 170`
                     // (dust validity window: ctime + grace < tblock). Block the
                     // prewarm job until the wallet is actually synced to the
@@ -381,7 +381,7 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
             };
         } catch (err: any) {
             // The session UPDATE already committed (sync work above succeeded),
-            // so signing IS enabled — just the pre-warm couldn't be scheduled.
+            // so signing IS enabled; just the pre-warm couldn't be scheduled.
             // Surface that as a non-fatal warning + null jobId; callers can
             // still proceed and the cold-sync cost moves to their first action.
             console.warn('[wallet-sessions] pre-warm scheduling failed:', err?.message || err);
@@ -921,8 +921,8 @@ export function startSessionCleanup(db: any): ReturnType<typeof setInterval> {
             const where = { isActive: true, expiresAt: { '<': now } };
             // Evict cached facades for the expiring sessions so in-memory secret
             // keys are dropped, not just the DB copies, and null BOTH encrypted
-            // keys (viewing + signing seed) — a forced expiry must leave no
-            // wallet secret behind (review_001 P2). Mirrors disconnectWallet.
+            // keys (viewing + signing seed): a forced expiry must leave no
+            // wallet secret behind. Mirrors disconnectWallet.
             const expiring: any[] = (await db.run(
                 SELECT.from(WalletSessions).columns('encryptedViewingKey').where(where)
             )) || [];

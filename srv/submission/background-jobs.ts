@@ -1,5 +1,5 @@
 /**
- * Async job runner for long-running submission actions (0.2.0).
+ * Async job runner for long-running submission actions.
  *
  * Why this exists: the previous synchronous handlers (`registerForDustGeneration`,
  * `sendNight`, `deployContract`, ...) awaited multi-minute-to-hours work
@@ -13,7 +13,7 @@
  * Tx isolation: each row mutation inside the spawn uses an explicit
  * `db.tx(async tx => tx.run(...))` short transaction, so the spawn's
  * top-level tx never acquires a connection. Net effect: the spawn callback
- * holds no pool resources while the long work is in flight — only the
+ * holds no pool resources while the long work is in flight; only the
  * per-mutation short txs (milliseconds each) consume connections.
  *
  * Concurrency: a per-`kind` in-process semaphore caps how many jobs of a
@@ -24,7 +24,7 @@
  * Idempotency: an optional `idempotencyKey` lets the caller dedupe retries.
  * If a non-failed row exists for the same `(sessionId, kind, idempotencyKey)`,
  * `startJob` returns that row's jobId and result (if any) without starting a
- * new spawn. Failed rows do NOT block a retry — that's the intended path for
+ * new spawn. Failed rows do NOT block a retry: that's the intended path for
  * flaky-network recovery.
  *
  * Error classification: failures are run through `classifySubmissionError`
@@ -50,7 +50,7 @@ const DEFAULT_CONCURRENCY = { heavy: 4, light: 16 } as const;
  * server. 4 concurrent jobs is enough to saturate one proof-server instance;
  * going wider just queues inside the proof server anyway.
  *
- * "light" kinds (anything not in this set) are sync-bound — they wait on the
+ * "light" kinds (anything not in this set) are sync-bound: they wait on the
  * wallet's `waitForSyncedState` but don't drive heavy compute on this server.
  */
 const HEAVY_KINDS: ReadonlySet<string> = new Set([
@@ -139,7 +139,7 @@ export interface StartJobArgs<TIn, TOut> {
     sessionId:       string;
     /** Optional dedupe key; see module docs for semantics. */
     idempotencyKey?: string | null;
-    /** Inbound action args — JSON-stringified into `request`. Strip secrets first. */
+    /** Inbound action args, JSON-stringified into `request`. Strip secrets first. */
     request:         TIn;
     /** The actual long-running work. Should NOT touch the CAP DB on the main thread. */
     work:            () => Promise<TOut>;
@@ -209,7 +209,7 @@ export async function startJob<TIn, TOut>(
     // calling startJob (anchorDocument inserts its Documents row first), so
     // that tx already holds the sqlite write lock. A detached insert here
     // would wait on that very lock from a second connection while the handler
-    // waits on us: a deterministic self-deadlock, live-hit on 2026-07-10 as
+    // waits on us: a deterministic self-deadlock, observed as
     // "database is locked" on every anchorDocument call. Instead the row
     // simply commits together with the handler, and the SPAWN below waits
     // until it is visible before touching it.

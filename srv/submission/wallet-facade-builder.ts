@@ -1,5 +1,5 @@
 /**
- * WalletFacade orchestration — main-thread side (Phase 1: worker-thread aware).
+ * WalletFacade orchestration, main-thread side (Phase 1: worker-thread aware).
  *
  * The real `WalletFacade` lives in a `worker_threads` worker (see
  * `srv/midnight/wallet-worker.ts`). The wallet SDK's Effect.ts Fiber scheduler
@@ -16,9 +16,9 @@
  *   `db.run(UPDATE/INSERT)`. Wiring lives in `wireWorkerStateSaveSink()`
  *   below, called once by the plugin lifecycle.
  *
- * Phase 1 surface — what callers still get from this module:
+ * Phase 1 surface (what callers still get from this module):
  *   - `getOrBuildWalletFacade(cacheKey, args)`  initialises the worker-side
- *     facade and resolves once it's ready. The returned object is a stub —
+ *     facade and resolves once it's ready. The returned object is a stub;
  *     properties (.facade, .keys) exist only to keep the OLD callers from
  *     blowing up at import time. Their methods will throw `Error("phase-2:
  *     migrate to wallet-worker-client")` if called.
@@ -201,8 +201,8 @@ export async function evictWalletFacade(cacheKey: string): Promise<void> {
     // Evict FIRST, delete the registry entry AFTER: the worker's final
     // `state-save` push arrives while the evict RPC is in flight, and the
     // save sink drops events whose session is no longer registered. Deleting
-    // up front made the final save deterministically lost (v0.6.5 and
-    // earlier); this order lets it persist.
+    // up front made the final save deterministically lost; this order lets
+    // it persist.
     try {
         await walletEvict(cacheKey);
     } catch (err) {
@@ -229,7 +229,7 @@ export function wireWorkerStateSaveSink(): void {
     setStateSaveSink(async event => {
         const session = sessionRegistry.get(event.sessionId);
         if (!session) {
-            // The session was evicted between save scheduling and arrival —
+            // The session was evicted between save scheduling and arrival,
             // OR it was never registered (e.g. caller didn't pass
             // syncStatePassphrase to getOrBuildWalletFacade).
             console.warn(

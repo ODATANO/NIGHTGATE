@@ -1,7 +1,7 @@
 // Typed call-input helpers for the AttestationVault contract (browser path).
 //
-// These prepare the inputs a contract call needs — circuit id, the Uint8Array
-// arguments, and the witness object (attester secret + optional value/salt) —
+// These prepare the inputs a contract call needs (circuit id, the Uint8Array
+// arguments, and the witness object with attester secret + optional value/salt)
 // so a consumer can pass them straight to midnight-js's findDeployedContract()
 // .callTx.<circuit>(...) (with the witnesses bound) or createUnprovenCallTx.
 //
@@ -86,7 +86,7 @@ export function prepareAnchorContentRoot({ payloadHash, contentRoot, attestation
 }
 
 /**
- * Prepare a `proveFieldPredicate(payload_hash, field_key, threshold, op)` call —
+ * Prepare a `proveFieldPredicate(payload_hash, field_key, threshold, op)` call,
  * the field-bound predicate proof. The witnessed `merkleProof`
  * ({ fieldValue, siblings[4] hex, dirs[4] }) proves `field_key`'s value is in the
  * anchored content root; `op`: 0 = value ≤ threshold, 1 = value ≥ threshold.

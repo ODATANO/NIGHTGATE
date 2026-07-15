@@ -1,5 +1,4 @@
-// Crawler-free state-verification end-to-end (onchain-state-verification-
-// crawlerless FR, acceptance criterion 6).
+// Crawler-free state-verification end-to-end.
 //
 // Proves every crawler-free surface confirms the on-chain EFFECT of a
 // wallet-style direct submit, WITHOUT relying on the block crawler:
@@ -13,8 +12,8 @@
 //   grantDisclosure → reindexDisclosures (#1) → GET DisclosureGrants active=true →
 //   revokeDisclosure → reindexDisclosures (#1) → GET DisclosureGrants active=false
 //
-// To be a TRUE criterion-6 check, run the server with the crawler disabled
-// (cds.requires.nightgate.crawler.enabled: false) — then the ONLY thing that can
+// To truly prove crawler-independence, run the server with the crawler disabled
+// (cds.requires.nightgate.crawler.enabled: false); then the ONLY thing that can
 // promote these reads to verified/active is queryContractState against live
 // contract state. The script still passes with the crawler on (the state path is
 // independent), but the point is that it needs no crawler and no local txHash.

@@ -1,11 +1,11 @@
 /**
- * Crawler-free predicate-result reader (onchain-state-verification-crawlerless FR,
- * proposal #3). The AttestationVault records a proven predicate as a (true) entry
+ * Crawler-free predicate-result reader. The AttestationVault records a
+ * proven predicate as a (true) entry
  * in the `predicate_results` ledger Map, keyed by
  *   claimKey = persistentHash<PredicateClaim>{payload_hash, threshold, op}.
  * A consumer that knows (payload_hash, threshold, op) can recompute claimKey
  * off-chain and confirm the proof landed WITHOUT the proof tx being indexed
- * locally — no crawler, no txHash.
+ * locally: no crawler, no txHash.
  *
  * The claim key recompute uses `@midnight-ntwrk/compact-runtime`'s exported
  * `persistentHash` + CompactType constructors, reproducing the exact bytes the
@@ -40,7 +40,7 @@ export interface ReadPredicateResultDeps {
     field?: boolean;
     /** Decoder from the compiled artifact (`ledger`). */
     ledger: (state: any) => PredicateLedger;
-    /** publicDataProvider.queryContractState — returns ContractState | null. */
+    /** publicDataProvider.queryContractState; returns ContractState | null. */
     queryContractState: (contractAddress: string) => Promise<any | null>;
 }
 

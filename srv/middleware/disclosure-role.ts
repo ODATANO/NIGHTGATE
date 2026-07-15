@@ -8,8 +8,8 @@
  *
  * The disclosure-role tiers map 1:1 to the EU Battery Regulation Annex XIII /
  * Art. 77 access tiers (general public / legitimate-interest / authority).
- * The middleware is intentionally orthogonal to CAP's `@requires` auth roles
- * — that gates access to *services*, this gates the *shape* of responses
+ * The middleware is intentionally orthogonal to CAP's `@requires` auth roles:
+ * that gates access to *services*, this gates the *shape* of responses
  * within a service the caller already reached.
  */
 import cds from '@sap/cds';
@@ -60,11 +60,11 @@ export interface AttachDisclosureRoleOptions {
     scope?: string;
     /**
      * AttestationVault deployment address. When supplied, the tier is resolved
-     * from the ON-CHAIN `DisclosureGrants` (the tamper-evident ACL) — the
+     * from the ON-CHAIN `DisclosureGrants` (the tamper-evident ACL): the
      * caller's granteeId is matched against active grants for this contract,
      * and that result is AUTHORITATIVE (no fall-back to the off-chain
      * `DisclosureRoles` table). Omit to use the off-chain table (the original
-     * behavior). See docs/feature-requests/expose-disclosure-grants.md §3.
+     * behavior).
      */
     contractAddress?: string;
     /**
@@ -82,7 +82,7 @@ export interface AttachDisclosureRoleOptions {
  *
  * Two sources, selected by `options.contractAddress`:
  *   - on-chain (contractAddress set): the indexed `DisclosureGrants` ACL is
- *     authoritative — the caller's granteeId is matched against active grants.
+ *     authoritative; the caller's granteeId is matched against active grants.
  *   - off-chain (no contractAddress): the operator-configured `DisclosureRoles`
  *     table (original behavior).
  *

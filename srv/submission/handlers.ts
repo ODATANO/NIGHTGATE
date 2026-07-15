@@ -60,13 +60,13 @@ const deployRateLimiter = new RateLimiter({ windowMs: 60 * 60 * 1000, maxRequest
 const callRateLimiter = new RateLimiter({ windowMs: 60 * 1000, maxRequests: 30 });
 // 10 doc anchors / hour / session, contract-call heavyweight + extra DB writes.
 const anchorRateLimiter = new RateLimiter({ windowMs: 60 * 60 * 1000, maxRequests: 10 });
-// 10 predicate proofs / hour / session — each is TWO heavyweight circuit calls
+// 10 predicate proofs / hour / session; each is TWO heavyweight circuit calls
 // (commitValue + provePredicate), so bound it like anchors.
 const predicateRateLimiter = new RateLimiter({ windowMs: 60 * 60 * 1000, maxRequests: 10 });
-// 30 disclosure grant/revoke ops / hour / session — single heavyweight circuit
+// 30 disclosure grant/revoke ops / hour / session; single heavyweight circuit
 // call each, attester-gated; looser than predicate but tighter than plain calls.
 const disclosureRateLimiter = new RateLimiter({ windowMs: 60 * 60 * 1000, maxRequests: 30 });
-// 60 on-demand reindexes / hour / contract — an indexer round-trip + DB writes,
+// 60 on-demand reindexes / hour / contract; an indexer round-trip + DB writes,
 // keyed by contractAddress (no session). Loose enough for a wallet-flow poll,
 // tight enough not to hammer the indexer.
 const reindexRateLimiter = new RateLimiter({ windowMs: 60 * 60 * 1000, maxRequests: 60 });
@@ -289,7 +289,7 @@ export function registerSubmissionHandlers(
 
         // Compute the on-chain inputs: payload_hash from the caller's sha256
         // and metadata_hash from the public metadata blob. Both are 32-byte
-        // commitments — the actual bytes live off-chain at `storageRef`.
+        // commitments; the actual bytes live off-chain at `storageRef`.
         const payloadHashBytes = hexToBytes(data.sha256);
         const metadataHashBytes = sha256(new TextEncoder().encode(metadataStr));
 
@@ -404,7 +404,7 @@ export function registerSubmissionHandlers(
             } else if (contractAddress && liveProviderConfigured()) {
                 // Crawler-free fallback: the anchoring tx is not in the local
                 // Transactions table (crawler off or lagging). Confirm the effect
-                // directly against live contract state — the document's sha256 is
+                // directly against live contract state; the document's sha256 is
                 // its on-chain payload_hash, so a present attestation IS the proof.
                 chainSuccess = await verifyDocumentViaState(
                     contractAddress, doc.sha256, compiledArtifactRef);
@@ -475,7 +475,7 @@ export function registerSubmissionHandlers(
         if (!checkRate(predicateRateLimiter, data.sessionId, req)) return;
 
         const payloadHashBytes = hexToBytes(data.payloadHash);
-        // The hidden value + salt travel ONLY as circuit witnesses — never as a
+        // The hidden value + salt travel ONLY as circuit witnesses, never as a
         // circuit arg, never persisted. This is what keeps the value private.
         const witnessValues = { attestedValue: valueBig.toString(), valueSalt: saltHex };
 
@@ -539,7 +539,7 @@ export function registerSubmissionHandlers(
                     });
                     // 2. Prove the predicate. The ledger only accepts this tx if
                     //    the in-circuit asserts (commitment match + predicate)
-                    //    held — so a successful tx IS the verified proof.
+                    //    held, so a successful tx IS the verified proof.
                     const proof = await submitter.call({
                         contractAddress: data.contractAddress!,
                         circuit: 'provePredicate',
@@ -709,7 +709,7 @@ export function registerSubmissionHandlers(
                     }
                     // 2. Prove the field-bound predicate. The ledger only accepts
                     //    this tx if the in-circuit asserts (Merkle root match +
-                    //    predicate) held — so a successful tx IS the verified proof
+                    //    predicate) held, so a successful tx IS the verified proof
                     //    that THIS passport field satisfies the predicate.
                     const proof = await submitter.call({
                         contractAddress: data.contractAddress!,
@@ -776,7 +776,7 @@ export function registerSubmissionHandlers(
         }
 
         // Crawler-free fallback: the proof tx is not indexed locally (crawler off
-        // or lagging). Confirm the outcome directly against live contract state —
+        // or lagging). Confirm the outcome directly against live contract state:
         // recompute the claim key from the row and look it up in predicate_results.
         // Verifies the effect, not the tx, so it needs no crawler and no txHash.
         if (!chainSuccess && liveProviderConfigured() && row.contractAddress && row.payloadHash) {
@@ -834,7 +834,7 @@ export function registerSubmissionHandlers(
 
         // Insert the row up-front (mirrors anchorDocument / issuePredicateAttestation):
         // a stable handle the caller can poll. active=false until the chain indexer
-        // (Phase 2) confirms the grant is present in ledger state — the handler insert
+        // confirms the grant is present in ledger state; the handler insert
         // is an optimistic placeholder, the chain is the source of truth.
         // Reuse an existing row for the same logical key (contract, payloadHash,
         // grantee) so retries / re-grants don't accumulate orphan placeholder rows.
@@ -906,7 +906,7 @@ export function registerSubmissionHandlers(
 
                     // Best-effort: pull the grant back out of on-chain state so the
                     // row's `active` flag becomes chain-confirmed. Never fail the
-                    // submit on an indexing error — the row already records intent.
+                    // submit on an indexing error; the row already records intent.
                     await reindexAfterSubmit(contractAddressLc, resolved);
 
                     return {
@@ -985,7 +985,7 @@ export function registerSubmissionHandlers(
                     });
 
                     // Mark any matching optimistic/active grant row as revoked. The
-                    // chain indexer (Phase 2) is authoritative on `active`; this is a
+                    // chain indexer is authoritative on `active`; this is a
                     // best-effort flip so the row reflects intent before reindex.
                     const revokedAt = new Date().toISOString();
                     await db.run(UPDATE.entity(DisclosureGrants)
@@ -1013,8 +1013,8 @@ export function registerSubmissionHandlers(
     });
 
     // ------------------------------------------------------------------
-    // Crawler-free on-chain state verification (onchain-state-verification-
-    // crawlerless FR). Both read LIVE contract state via queryContractState,
+    // Crawler-free on-chain state verification.
+    // Both read LIVE contract state via queryContractState,
     // so they work with the block crawler disabled and without a local txHash.
     // ------------------------------------------------------------------
 
@@ -1161,7 +1161,7 @@ export function registerSubmissionHandlers(
                 artifactPath: resolved.artifactPath,
                 contractProvidersConfig: contractProvidersConfigFromEnv(resolved.zkConfigPath)
             });
-            // `indexed` is the count of grants present on-chain after reconcile —
+            // `indexed` is the count of grants present on-chain after reconcile,
             // i.e. the active grants for this contract.
             return {
                 contractAddress: contractAddressLc,
@@ -1220,7 +1220,7 @@ export function registerSubmissionHandlers(
     /**
      * Crawler-free evidence for verifyDocument: confirm the document's on-chain
      * payload_hash (== its sha256) is present in the AttestationVault attestation
-     * map. Best-effort — any resolution/provider error yields `false` (a clean
+     * map. Best-effort: any resolution/provider error yields `false` (a clean
      * negative), never a 5xx.
      */
     async function verifyDocumentViaState(
@@ -1248,7 +1248,7 @@ export function registerSubmissionHandlers(
     /**
      * Crawler-free evidence for verifyPredicateAttestation: recompute the claim
      * key from the row and confirm a (true) result is recorded on-chain.
-     * Best-effort — any error yields `false`, never a 5xx. Defaults to the
+     * Best-effort: any error yields `false`, never a 5xx. Defaults to the
      * canonical attestation-vault artifact (the row does not carry a ref).
      */
     async function verifyPredicateViaState(row: any): Promise<boolean> {
@@ -1354,12 +1354,12 @@ function contractProvidersConfigFromEnv(zkConfigPath: string): ContractProviders
 
 /**
  * Contract-only provider config honouring the optional per-call `network`
- * override on the crawler-free verify surface (verify-state-network-override
- * FR). Omitted or equal to the configured network → EXACTLY
+ * override on the crawler-free verify surface.
+ * Omitted or equal to the configured network → EXACTLY
  * `contractProvidersConfigFromEnv` (env / top-level config keep winning). A
  * different valid network swaps only the indexer endpoints; proof server and
- * zkConfig stay as configured — compiled artifacts are network-agnostic and
- * the read path never proves.
+ * zkConfig stay as configured, since compiled artifacts are network-agnostic
+ * and the read path never proves.
  */
 function contractProvidersConfigForNetwork(
     zkConfigPath: string,
@@ -1420,7 +1420,7 @@ async function runSubmission(req: Request, op: () => Promise<unknown>): Promise<
     } catch (err) {
         if (err instanceof CoercionError) {
             // Bad arg encoding (invalid hex, wrong byte length, non-integer
-            // Uint, …) — a clean 400, not a deep circuit type error.
+            // Uint, …): a clean 400, not a deep circuit type error.
             return req.reject(400, err.message);
         }
         if (err instanceof ContractNotRegisteredError) {

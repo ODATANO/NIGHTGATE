@@ -1,4 +1,4 @@
-// Step 0 diagnostic: which WS connection drops/stalls — the NODE RPC or the
+// Diagnostic: which WS connection drops/stalls, the NODE RPC or the
 // INDEXER subscription? Opens BOTH simultaneously and logs every update + any
 // close/error, so we can tell which one is the unstable link behind the wallet
 // sync stalls (Custom error 117 chase).

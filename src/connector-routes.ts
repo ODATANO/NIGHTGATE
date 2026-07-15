@@ -5,9 +5,9 @@ import fs from 'fs';
 import { getNightgatePluginConfig, getConfiguredNightgateNetwork, DEFAULT_NETWORK } from '../srv/utils/nightgate-config';
 import { getContractRegistration, listRegisteredContracts } from '../srv/submission/contract-registry';
 
-// Browser DApp-connector HTTP surface (shipped 0.4.0). Two routes:
-//   GET /zk-config/<contract>/<dir>/<file>  — serve proving artifacts
-//   GET /contract-manifest                  — self-configuration manifest
+// Browser DApp-connector HTTP surface. Two routes:
+//   GET /zk-config/<contract>/<dir>/<file>  -> serve proving artifacts
+//   GET /contract-manifest                  -> self-configuration manifest
 //
 // Extracted from plugin.ts so the handlers can be mounted on a bare Express
 // app for testing (scripts/integration-test-connector-routes.mjs) without
@@ -21,7 +21,7 @@ import { getContractRegistration, listRegisteredContracts } from '../srv/submiss
 // the on-disk one the server-side NodeZkConfigProvider reads, so a fetch
 // provider pointed at `<server>/zk-config/<contract>` resolves
 // `keys/<circuit>.{prover,verifier}` and `zkir/<circuit>.{zkir,bzkir}` directly.
-// Only REGISTERED contracts are servable — the registry is the security
+// Only REGISTERED contracts are servable; the registry is the security
 // boundary.
 const ZK_FILE_RE = /^[A-Za-z0-9_]+\.(prover|verifier|zkir|bzkir)$/;
 const zkEtagCache = new Map<string, { mtimeMs: number; etag: string }>();
@@ -76,7 +76,7 @@ function listContractCircuits(zkConfigPath: string): string[] {
 }
 
 // Self-configuration endpoint: lets a connector consumer discover the network,
-// the zk-config base URL, and per-contract artifact ref / circuits / hash —
+// the zk-config base URL, and per-contract artifact ref / circuits / hash,
 // without hard-coding any of it. Only REGISTERED contracts are listed.
 // `address(es)` is advertised only when an operator pins it in config; the
 // deployed address is otherwise per-deployment and caller-supplied.

@@ -1,8 +1,8 @@
-// Browser provider assembly for the wallet-connector path (Phase 4).
+// Browser provider assembly for the wallet-connector path.
 //
 // Assembles the midnight-js provider pieces a consumer needs to build + prove a
 // contract call from the browser, wired to NIGHTGATE's /contract-manifest +
-// /zk-config (Phases 2-3) and a DApp-Connector wallet. The SDK packages are
+// /zk-config routes and a DApp-Connector wallet. The SDK packages are
 // imported LAZILY so importing `@odatano/nightgate/browser` stays light.
 //
 // SCOPE / HONESTY: the four providers below (publicData, zkConfig, proof,
@@ -13,8 +13,7 @@
 // midnight-js's WalletProvider works in typed ledger objects, and the correct
 // architecture (midnight-js-native WalletProvider adapter vs connector-native
 // build→prove→serialize→balance→submit) must be chosen and VERIFIED against a
-// real Lace + chain. That lives in the consumer (NIGHTPASS) / Phase 5. See
-// docs/feature-requests/wallet-connector-integration-plan.md Phase 4.
+// real Lace + chain. That live-integration step lives in the consumer (NIGHTPASS).
 
 import { FetchZkConfigProvider } from './zk-config.mjs';
 import { InMemoryPrivateStateProvider } from './private-state.mjs';

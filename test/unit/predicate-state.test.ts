@@ -1,9 +1,9 @@
 /**
  * Tests for srv/submission/predicate-state.ts (crawler-free predicate-result
- * reader, onchain-state-verification-crawlerless FR proposal #3).
+ * reader).
  *
  * Exercises readPredicateResult against a FAKE `ledger()`-shaped object and a
- * fake queryContractState — no SDK, no chain. The claim-key recompute
+ * fake queryContractState: no SDK, no chain. The claim-key recompute
  * (computePredicateClaimKey) needs the ESM compact-runtime and is covered by
  * scripts/spike-state-verification.mjs (byte-exact match to a live-emitted key).
  */

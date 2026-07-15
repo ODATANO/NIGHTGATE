@@ -1,5 +1,5 @@
 /**
- * Tests for srv/submission/token-ops.ts::shieldFunds — the unshielded→
+ * Tests for srv/submission/token-ops.ts::shieldFunds, the unshielded→
  * shielded ledger-shift wrapper. Symmetric to token-ops-unshield.test.ts.
  */
 

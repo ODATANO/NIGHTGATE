@@ -93,7 +93,7 @@ function registerSecurityHeaders(): void {
 
         // ZK-config HTTP route + contract-manifest, mounted in the SAME bootstrap
         // hook (one bootstrap listener total). Under SKIP_AUTO_INIT the registry
-        // is empty so they return 404 / an empty contracts list — registration
+        // is empty so they return 404 / an empty contracts list; registration
         // itself is cheap.
         mountZkConfigRoute(app);
         mountContractManifestRoute(app);

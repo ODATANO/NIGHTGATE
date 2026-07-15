@@ -180,7 +180,7 @@ describe('TransactionSubmitter.deploy', () => {
         // Worker was invoked exactly once with the right shape.
         // sessionId on the RPC = walletMaterial.accountId (deterministic key
         // the worker uses to look up the facade), NOT the OData user-session
-        // UUID — that one is preserved on the PendingSubmissions row only.
+        // UUID; that one is preserved on the PendingSubmissions row only.
         expect(walletDeployContract).toHaveBeenCalledTimes(1);
         const sentArgs = walletDeployContract.mock.calls[0][0];
         expect(sentArgs).toMatchObject({

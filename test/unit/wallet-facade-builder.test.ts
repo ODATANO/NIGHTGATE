@@ -203,7 +203,7 @@ describe('wallet-facade-builder', () => {
             wireWorkerStateSaveSink();
             const sink = mockSetStateSaveSink.mock.calls[0][0];
 
-            // v0.6.6: a dropped save THROWS so the worker-client does not ack
+            // A dropped save THROWS so the worker-client does not ack
             // it and the worker re-pushes the blobs on a later tick.
             await expect(sink({
                 sessionId: 'unknown-session',
@@ -223,7 +223,7 @@ describe('wallet-facade-builder', () => {
                 wireWorkerStateSaveSink();
                 const sink = mockSetStateSaveSink.mock.calls[0][0];
 
-                // v0.6.6: the failure is logged AND rethrown so the
+                // The failure is logged AND rethrown so the
                 // worker-client does not ack the save.
                 await expect(sink({
                     sessionId: 'warn-key',

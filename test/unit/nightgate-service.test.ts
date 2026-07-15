@@ -4,14 +4,14 @@
  * HYBRID approach: runs against a REAL in-memory CAP DB via cds.test()
  * (see test/vitest.setup.ts). Persistence (Blocks, Transactions, ContractActions,
  * UnshieldedUtxos, NightBalances, BackgroundJobs) is exercised against the real
- * SQLite DB — we seed rows, invoke the service action / OData endpoint, then
+ * SQLite DB: we seed rows, invoke the service action / OData endpoint, then
  * assert on the returned data. The old query-shape assertions (builder.__table /
  * __where / __orderBy / __limit) are reframed as behavioral: seed specific rows
  * and prove the right rows come back in the right order/limit.
  *
  * External collaborators stay mocked: srv/sessions/wallet-sessions so the
  * wallet-session handler registration + cleanup timer don't run a real session
- * worker. The submission handlers (srv/submission/handlers) are left real —
+ * worker. The submission handlers (srv/submission/handlers) are left real;
  * they only register action handlers during init() and none of the submission
  * actions are invoked here. getJobStatus reads a real BackgroundJobs row via
  * the real getJobById, so we seed a row rather than mock the lookup.
@@ -64,7 +64,7 @@ beforeEach(async () => {
 });
 
 // ----------------------------------------------------------------------------
-// Seed helpers — insert real rows that satisfy the schema's not-null fields.
+// Seed helpers: insert real rows that satisfy the schema's not-null fields.
 // ----------------------------------------------------------------------------
 
 async function seedBlock(height: number, overrides: Record<string, any> = {}): Promise<string> {
@@ -132,7 +132,7 @@ async function seedBalance(address: string, balance: number, overrides: Record<s
 }
 
 // ----------------------------------------------------------------------------
-// init() — delegated registration
+// init(): delegated registration
 //
 // The framework ran init() once at boot, which calls our mocked
 // registerWalletSessionHandlers + startSessionCleanup. We re-run init() on a
@@ -159,7 +159,7 @@ describe('init', () => {
 });
 
 // ----------------------------------------------------------------------------
-// shutdown hook — srv/nightgate-service.ts registers cds.on('shutdown', ...) to
+// shutdown hook: srv/nightgate-service.ts registers cds.on('shutdown', ...) to
 // clear the session-cleanup interval. We capture the handler registered during
 // init() by spying cds.on (so we do NOT emit a real global 'shutdown' that would
 // tear down the booted cds.test server), then invoke it directly and assert the
@@ -252,8 +252,8 @@ describe('Blocks', () => {
     it('range() filters to the [startHeight, endHeight] window, ascending, capped at the effective limit', async () => {
         // Seed rows both inside and OUTSIDE the requested window so the test
         // actually proves the height filter (not just ordering/limit). The
-        // handler uses .where({height:{'>=':s}}).and({height:{'<=':e}}) — two
-        // single-operator objects — because the combined-operator object form
+        // handler uses .where({height:{'>=':s}}).and({height:{'<=':e}}), two
+        // single-operator objects, because the combined-operator object form
         // is silently dropped by @cap-js/sqlite.
         for (const h of [13, 8, 11, 9, 12, 10]) await seedBlock(h);
 
@@ -553,7 +553,7 @@ describe('read-only enforcement', () => {
 });
 
 // ----------------------------------------------------------------------------
-// getJobStatus (0.2.0 async submission lifecycle)
+// getJobStatus (async submission lifecycle)
 //
 // getJobStatus is an UNBOUND service action that reads a real BackgroundJobs
 // row via getJobById. We seed the row and assert the projected shape. The old

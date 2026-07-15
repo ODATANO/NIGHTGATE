@@ -1,5 +1,5 @@
 /**
- * Token operations — thin wrappers around the wallet-worker RPCs that
+ * Token operations: thin wrappers around the wallet-worker RPCs that
  * implement the OData `sendNight` / `shieldFunds` / `unshieldFunds`
  * actions. Each wrapper translates between the OData/user-facing shape
  * and the worker's primitive RPC contract.

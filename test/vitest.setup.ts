@@ -9,7 +9,7 @@
  *  - cds.User.default = Privileged: service-level @requires (e.g. 'admin') pass
  *    without supplying auth headers on every request.
  *
- * Unit suites that mock '@sap/cds' are unaffected — they replace the module
+ * Unit suites that mock '@sap/cds' are unaffected: they replace the module
  * wholesale, so the cds.User assignment below simply no-ops for them.
  */
 process.env.NO_TELEMETRY = 'true';

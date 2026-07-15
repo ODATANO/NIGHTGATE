@@ -190,7 +190,7 @@ describe('runtime initialize', () => {
     });
 
     it('throws SchemaNotDeployedError when a required table is missing (no auto-deploy)', async () => {
-        // Same module graph as the initialize() under test — a native
+        // Same module graph as the initialize() under test: a native
         // require() would yield a different class identity for instanceof.
         const { SchemaNotDeployedError } = await import('../../src/index.js');
 
@@ -209,7 +209,7 @@ describe('runtime initialize', () => {
         // Crucially: no deploy was attempted, on either path.
         expect(mockDbDeploy).not.toHaveBeenCalled();
         expect(mockCdsDeploy).not.toHaveBeenCalled();
-        // Crawler also never started — we fail before any subsequent init step.
+        // Crawler also never started; we fail before any subsequent init step.
         expect(mockStartCrawler).not.toHaveBeenCalled();
     });
 

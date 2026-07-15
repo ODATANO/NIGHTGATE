@@ -13,7 +13,7 @@
 // is what belongs in .env as LACE_SEED_HEX (the factory already does
 // fromSeed(seedHex), so no code change is needed once the seed is right).
 //
-// The mnemonic never leaves your machine — it's read from env only.
+// The mnemonic never leaves your machine; it's read from env only.
 //
 // Run:
 //   LACE_MNEMONIC="word1 word2 ..." node scripts/probe-seed-derivation.mjs

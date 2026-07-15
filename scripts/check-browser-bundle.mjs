@@ -1,4 +1,4 @@
-// Guards the `@odatano/nightgate/browser` surface (Phase 1).
+// Guards the `@odatano/nightgate/browser` surface.
 //
 // 1. Static check: no Node-only / server imports in src/browser/*.mjs.
 // 2. Smoke import: the ESM entry loads in Node and its exports work.

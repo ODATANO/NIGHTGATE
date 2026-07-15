@@ -3,7 +3,7 @@
  *
  * HYBRID approach: runs against a REAL in-memory CAP DB via cds.test()
  * (see test/vitest.setup.ts). The `@sap/cds` cds.ql mock that the previous
- * version of this suite used has been removed — the disclosure-role lookup
+ * version of this suite used has been removed: the disclosure-role lookup
  * the `before('*')` hook performs now hits the real `midnight.DisclosureRoles`
  * table, seeded per-test, and the tier gates run the real `meetsDisclosure`
  * logic against the role the real hook attached.
@@ -11,7 +11,7 @@
  * Why a recording service shim (not a served service): `AttestationService`
  * is an `@abstract` CAP service living under `src/sdk/`. It is NOT part of the
  * served model (only `srv/*.cds` + `db/*.cds` are auto-loaded), and abstract
- * services are never served on their own — a consumer app extends it. So there
+ * services are never served on their own (a consumer app extends it). So there
  * is no live endpoint to drive. We instead register the real handlers via the
  * real `registerAttestationServiceHandlers` onto a shim that records them
  * (proving the wiring), then exercise each recorded handler:
@@ -262,7 +262,7 @@ describe('registerAttestationServiceHandlers', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Field-width tiering — behavioural check against real seeded Attestations.
+// Field-width tiering: behavioural check against real seeded Attestations.
 //
 // AttestationService.cds declares progressively wider column projections:
 //   Public    → ID, attestationId, anchoredTxHash, anchoredAt
@@ -315,7 +315,7 @@ describe('tier field-width projections (real DB rows)', () => {
 
     test('Authority tier exposes the full row including the off-chain cipher', async () => {
         // The Authority projection is `projection on midnight.Attestations` with
-        // no column list — i.e. every field, including the LargeBinary cipher.
+        // no column list, i.e. every field, including the LargeBinary cipher.
         // CAP omits LargeBinary from a default SELECT *, so the cipher is
         // requested explicitly here to prove the Authority tier can surface it
         // (it is the only tier whose column set includes payloadCipher).

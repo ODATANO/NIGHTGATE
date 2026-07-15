@@ -2,8 +2,8 @@
  * Wallet worker thread entry.
  *
  * Lives in its OWN Node `worker_threads` worker so the Midnight wallet SDK's
- * Effect.ts Fiber scheduler — which monopolises the microtask queue while a
- * chain sync is running — only blocks THIS thread's event loop. The main
+ * Effect.ts Fiber scheduler (which monopolises the microtask queue while a
+ * chain sync is running) only blocks THIS thread's event loop. The main
  * cds-serve thread stays responsive for OData requests and CAP DB writes.
  *
  * Communication: per-call `MessageChannel`. Main thread posts
@@ -75,12 +75,12 @@ interface FacadeEntry {
     /** Blobs of the last save the MAIN THREAD CONFIRMED it persisted. The
      *  unchanged-skip in the save tick compares against this, so a failed or
      *  dropped persist is re-pushed on the next tick instead of being
-     *  stranded until the state happens to change again (v0.6.6). */
+     *  stranded until the state happens to change again. */
     lastSavedBlobs?: { shielded?: string; unshielded?: string; dust?: string };
     /** In-flight saves by sequence number, resolved by `state-save-ack`. */
     pendingSaves?: Map<number, { shielded?: string; unshielded?: string; dust?: string }>;
     networkId: string;
-    /** Indexer GraphQL HTTP URL — used to read the genuine sync target (tip). */
+    /** Indexer GraphQL HTTP URL, used to read the genuine sync target (tip). */
     indexerHttpUrl: string;
     // 32-byte session-stable secret for contracts that use the
     // `local_secret_key()` witness pattern (e.g. AttestationVault). Derived
@@ -234,7 +234,7 @@ async function getContractScaffold(name: string, registration: ContractRegistrat
  * attestationSecret (AttestationVault).
  *
  * Witnesses bind to a Compact Contract instance for the lifetime of its use,
- * so we must build them fresh per call — different sessions yield different
+ * so we must build them fresh per call; different sessions yield different
  * attester ids.
  */
 async function getOrCompileContract(
@@ -273,7 +273,7 @@ async function buildWorkerContractProviders(args: {
     proofServerUrl: string;
     zkConfigPath: string;
 }): Promise<{ publicDataProvider: any; zkConfigProvider: any; proofProvider: any }> {
-    // `ws` is CJS — Node 22 worker_threads can `require` it freely.
+    // `ws` is CJS; Node 22 worker_threads can `require` it freely.
     // eslint-disable-next-line @typescript-eslint/no-var-requires
     const WebSocket = require('ws');
     const { indexer, proof, zk } = await loadContractsSdk();
@@ -300,7 +300,7 @@ const BALANCE_SYNC_TIMEOUT_MS = Number(process.env.NIGHTGATE_BALANCE_SYNC_TIMEOU
 /**
  * `facade.waitForSyncedState()` raced against a timeout. Resolves as soon as
  * the wallet is synced (instant on the prewarmed path); rejects with a clear
- * error if the sync hasn't latched within `timeoutMs` — typically a dropped,
+ * error if the sync hasn't latched within `timeoutMs`, typically a dropped,
  * non-retried indexer graphql-ws subscription.
  */
 async function waitForSyncedStateBounded(facade: any, timeoutMs: number): Promise<void> {
@@ -356,7 +356,7 @@ let dustTipCache: { tip: bigint; at: number } | null = null;
  * The dust ledger-event stream's CURRENT tip (max id), read straight from the
  * indexer via a one-shot graphql-transport-ws subscription: the stream's
  * first backfill event carries `maxId`. This is the only reliable target for
- * the dust sub-wallet's `appliedIndex` (live findings, preprod 2026-07-10):
+ * the dust sub-wallet's `appliedIndex`:
  *  - `dust.progress.highestIndex` stays 0 against the public indexers, so
  *    the SDK itself never reports the stream tip;
  *  - the Block end-indices are DIFFERENT series and do not match the
@@ -409,23 +409,22 @@ async function getDustStreamTip(indexerHttpUrl: string): Promise<bigint | null> 
 /**
  * GENUINE sync gate.
  *
- * [2026-07-10 FIX] `dust.progress.appliedIndex` counts LEDGER EVENTS
- * (the indexer's dustLedgerEvents id series), NOT blocks. The previous
- * implementation compared it against the indexer's BLOCK height, a target
- * the event series never reaches (preprod: ~1.26M events vs ~1.59M blocks).
- * Result: every fully synced wallet looked like a silent "stall" at the
- * event tip and the prewarm timed out. Root-cause analysis and minimal
- * repro: docs/feature-requests/wallet-sync-stall-watchdog.md.
+ * `dust.progress.appliedIndex` counts LEDGER EVENTS (the indexer's
+ * dustLedgerEvents id series), NOT blocks. Comparing it against the indexer's
+ * BLOCK height is wrong: the event series never reaches block height
+ * (preprod: ~1.26M events vs ~1.59M blocks), so every fully synced wallet
+ * would look like a silent "stall" at the event tip and the prewarm would
+ * time out.
  *
- * [2026-07-10 FIX 2, live-verified] `dust.progress.highestIndex` stays 0
- * against the public indexers, so the SDK never reports the stream tip
- * itself. The tip therefore comes from `getDustStreamTip` (a one-shot
- * dustLedgerEvents probe whose first event carries `maxId`).
+ * `dust.progress.highestIndex` stays 0 against the public indexers, so the
+ * SDK never reports the stream tip itself. The tip therefore comes from
+ * `getDustStreamTip` (a one-shot dustLedgerEvents probe whose first event
+ * carries `maxId`).
  *
- * The gate now checks, per poll:
- *   1. `appliedIndex >= streamTip - SYNC_TIP_GAP` — caught up with the dust
+ * The gate checks, per poll:
+ *   1. `appliedIndex >= streamTip - SYNC_TIP_GAP`: caught up with the dust
  *      stream's OWN tip, with `isConnected`.
- *   2. `streamTip > 0` — guards the historical failure where a wallet that
+ *   2. `streamTip > 0`: guards the historical failure where a wallet that
  *      never received a tip looked trivially synced.
  *   3. The indexer's latest block timestamp is fresh (SYNC_FRESHNESS_MS).
  *      This preserves the original guard motivation: a lagging self-hosted
@@ -441,12 +440,12 @@ async function waitForGenuineSync(facade: any, indexerHttpUrl: string, timeoutMs
     let lastHighest = -1n;
     while (Date.now() < deadline) {
         const tip = await getIndexerTip(indexerHttpUrl);
-        // [2026-06-28 FIX] Read state via the NON-BLOCKING facade.state() observable.
+        // Read state via the NON-BLOCKING facade.state() observable.
         // facade.waitForSyncedState() is Promise.all([... dust.waitForSyncedState() ...])
-        // which only resolves once every sub-wallet isStrictlyComplete() — never true
-        // against an indexer not yet caught_up to chain tip (highestIndex stays 0), so
-        // it timed out every poll and the real (advancing) appliedIndex was never read.
-        // The observable emits the current FacadeState immediately.
+        // which only resolves once every sub-wallet isStrictlyComplete(). That is never
+        // true against an indexer not yet caught_up to chain tip (highestIndex stays 0),
+        // so it would time out every poll and the real (advancing) appliedIndex would
+        // never be read. The observable emits the current FacadeState immediately.
         let state: any;
         try {
             state = await Promise.race([
@@ -528,8 +527,8 @@ export function buildWorkerWalletProvider(entry: FacadeEntry): any {
         async balanceTx(tx: any, ttl?: Date): Promise<any> {
             // Robustness: block until the wallet is synced to the chain tip
             // before balancing. The prewarm job (connectWalletForSigning) also
-            // waits, but a caller that submits WITHOUT prewarming — or after the
-            // facade has drifted — would otherwise balance against stale
+            // waits, but a caller that submits WITHOUT prewarming (or after the
+            // facade has drifted) would otherwise balance against stale
             // (restored/partial) dust state, and the node rejects the tx with
             // `1010 Invalid Transaction: Custom error: 170` (dust validity
             // window: ctime + grace < tblock). waitForSyncedState is a no-op
@@ -868,7 +867,7 @@ function startPeriodicSave(sessionId: string, entry: FacadeEntry): void {
             log('info', `[worker] save-tick #${tickCount} collect returned in ${collectMs}ms: ${shape}`);
 
             if (!hasAnyBlob(blobs)) return;
-            // Skip push only if the CONFIRMED-saved blobs are identical —
+            // Skip push only if the CONFIRMED-saved blobs are identical. This
             // avoids burning CAP write cycles when the wallet is synced and
             // idle, without stranding a save whose persist failed.
             const saved = entry.lastSavedBlobs ?? {};
@@ -949,7 +948,7 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
         facades.delete(sessionId);
         if (entry.saveTimer) clearInterval(entry.saveTimer);
         // Best-effort final save push. Cleanup-path errors don't block
-        // eviction but are logged — silent swallowing would hide leaks.
+        // eviction but are logged; silent swallowing would hide leaks.
         try {
             const blobs = await collectSerializedStates(entry.facade);
             if (hasAnyBlob(blobs)) {
@@ -1064,7 +1063,7 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
      *
      * The SDK's `synced.unshielded.availableCoins` only lists *unregistered*
      * UTXOs, so we read registered ones from the full set the wallet tracks.
-     * For Phase 1 of this action we deregister ALL registered UTXOs; per-UTXO
+     * This action deregisters ALL registered UTXOs; per-UTXO
      * narrowing is a follow-up once we have a stable UTXO-id surface.
      */
     async deregisterDustGeneration({ sessionId, syncTimeoutMs }: {
@@ -1085,7 +1084,7 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
 
         // The SDK exposes `availableCoins` (unregistered-only) AND `allCoins`
         // (full set) on the synced unshielded state. The full set is where
-        // registered UTXOs live — they're committed to dust gen so the SDK
+        // registered UTXOs live; they're committed to dust gen so the SDK
         // hides them from "available" but we still need them to deregister.
         const allCoins: any[] = synced?.unshielded?.allCoins ?? synced?.unshielded?.coins ?? [];
         const registered = allCoins.filter(
@@ -1129,7 +1128,7 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
      * cross-ledger funding is not attempted here (use shield/unshieldFunds).
      *
      * Build + balance + prove + submit all in-worker via `facade.transferTransaction`.
-     * Returns primitives only — no SDK objects cross the thread boundary.
+     * Returns primitives only; no SDK objects cross the thread boundary.
      */
     async transferNight({ sessionId, receiverAddress, amount, ttlIso, syncTimeoutMs }: {
         sessionId: string;
@@ -1194,7 +1193,7 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
     /**
      * Move NIGHT from shielded → unshielded ledger (own funds only).
      *
-     * Built via `facade.initSwap` — the SDK's primitive for explicit
+     * Built via `facade.initSwap`, the SDK's primitive for explicit
      * cross-ledger conversion. `desiredInputs` names the source ledger
      * + token + amount; `desiredOutputs` names the destination ledger
      * with the wallet's own unshielded address as receiver.
@@ -1361,7 +1360,7 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
         const shieldedNight = shieldedBalances[nightRawType] ?? 0n;
         const unshieldedNight = unshieldedBalances[nightRawType] ?? 0n;
         // dust.balance(time) is synchronous and returns Balance (= bigint). It
-        // lives on the DustWalletState carried by the synced FacadeState — NOT
+        // lives on the DustWalletState carried by the synced FacadeState, NOT
         // on facade.dust (which is a DustWalletAPI with no balance() method).
         const dustBalance: bigint = synced?.dust ? synced.dust.balance(new Date()) : 0n;
         // DIAGNOSTIC: real sync distance to tip + whether 'synced' is genuine.
@@ -1384,8 +1383,8 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
 
     /**
      * Pre-flight fee estimate for a NIGHT transfer. Builds the
-     * `transferTransaction` recipe in the worker — which runs balancing
-     * (lightweight) but NOT proof generation (heavy) — then calls
+     * `transferTransaction` recipe in the worker (which runs balancing
+     * (lightweight) but NOT proof generation (heavy)), then calls
      * `estimateTransactionFee` to compute total fee including any
      * balancing tx. No submit. The recipe is discarded.
      */
@@ -1487,7 +1486,7 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
 
     /**
      * Deploy a Compact-emitted contract via the SDK, entirely in the worker.
-     * Inputs are primitives + the registration meta — the contract artifact is
+     * Inputs are primitives + the registration meta; the contract artifact is
      * dynamic-imported and `CompiledContract.make`'d inside the worker, cached
      * by name. The private-state provider is a proxy that round-trips to main
      * (where the real CapDbPrivateStateProvider lives, keyed by proxyId).

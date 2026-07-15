@@ -1,6 +1,6 @@
 /**
  * Tests for the optional `network` override on the crawler-free state-verify
- * surface (verify-state-network-override FR):
+ * surface:
  *   - verifyAttestationState(..., network)
  *   - verifyPredicateState(..., network)
  *
@@ -8,7 +8,7 @@
  *   1. Override to another network reads via that network's indexer endpoints
  *      without touching the configured submission/wallet state.
  *   2. Omitted (or equal to the configured network) keeps today's behavior
- *      bit-for-bit — env/config overrides for the configured network win.
+ *      bit-for-bit; env/config overrides for the configured network win.
  *   3. Invalid network → 400, never a silent fallback.
  *   4. Same for verifyPredicateState.
  *   5. No wallet / proof-server / crawler involvement on the override path

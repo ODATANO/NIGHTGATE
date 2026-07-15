@@ -35,7 +35,7 @@ const ENV_KEYS = [
     'NIGHTGATE_ALLOW_SELF_SERVICE_GRANTEE_REGISTRATION',
     // Submission endpoints: a developer .env for live runs (or the IDE test
     // extension propagating it) would otherwise win over the config-based
-    // expectations in these tests — same scrub wallet-sessions.test.ts does.
+    // expectations in these tests; same scrub wallet-sessions.test.ts does.
     'NIGHTGATE_INDEXER_HTTP_URL',
     'NIGHTGATE_INDEXER_WS_URL',
     'NIGHTGATE_PROOF_SERVER_URL',
@@ -143,7 +143,7 @@ describe('getConfiguredPrivateStateBackend', () => {
 });
 
 describe('isSelfServiceGranteeRegistrationAllowed', () => {
-    it('defaults to DISABLED (secure default, review_001 P1)', () => {
+    it('defaults to DISABLED (secure default)', () => {
         expect(isSelfServiceGranteeRegistrationAllowed()).toBe(false);
         expect(isSelfServiceGranteeRegistrationAllowed({})).toBe(false);
     });
@@ -275,7 +275,7 @@ describe('resolveSubmissionEndpoints indexer ws derivation', () => {
     });
 });
 
-describe('resolveOverrideIndexerEndpoints (verify-state-network-override FR)', () => {
+describe('resolveOverrideIndexerEndpoints (cross-network verify indexer endpoints)', () => {
     it('falls back to the built-in public defaults for the override network', () => {
         const eps = resolveOverrideIndexerEndpoints('preview', {});
         expect(eps.indexerHttpUrl).toBe(DEFAULT_INDEXER_URLS.preview.http);
@@ -298,7 +298,7 @@ describe('resolveOverrideIndexerEndpoints (verify-state-network-override FR)', (
         expect(eps.indexerWsUrl).toBe('ws://my-idx/ws');
     });
 
-    it('ignores top-level indexer config and NIGHTGATE_INDEXER_* env vars — they belong to the configured network', () => {
+    it('ignores top-level indexer config and NIGHTGATE_INDEXER_* env vars (they belong to the configured network)', () => {
         process.env.NIGHTGATE_INDEXER_HTTP_URL = 'http://configured-net-only';
         process.env.NIGHTGATE_INDEXER_WS_URL = 'ws://configured-net-only';
         const eps = resolveOverrideIndexerEndpoints('mainnet', {

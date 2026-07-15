@@ -58,7 +58,7 @@ describe('sdk-loader', () => {
             const first = await loadMidnightSdk();
             resetMidnightSdkCache();
             const second = await loadMidnightSdk();
-            // Different bundle object after reset — Jest's module cache survives,
+            // Different bundle object after reset: the module cache survives,
             // but the loader's in-memory pointer was nulled, so we get a fresh
             // bundle composition.
             expect(second).not.toBe(first);

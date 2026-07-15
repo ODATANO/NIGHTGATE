@@ -439,7 +439,7 @@ export class CapDbPrivateStateProvider<PSI extends PrivateStateId = PrivateState
      * own provider instance, so a deploy that writes private state and a later
      * call that reads it use DIFFERENT instances. With a random per-instance
      * salt, the reader's `decrypt()` rejected the writer's blob with
-     * "Salt mismatch" (the ledger never even saw it — it failed in our storage
+     * "Salt mismatch" (the ledger never even saw it; it failed in our storage
      * layer). A deterministic salt makes every instance for the same account
      * derive the same key, so reads succeed across instances while keeping the
      * one-PBKDF2-per-instance optimization and the integrity salt-check.

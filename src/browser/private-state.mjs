@@ -1,8 +1,8 @@
 // In-memory PrivateStateProvider for the browser/connector path.
 //
-// Phase 0 established the AttestationVault has NO contract private state (all
+// The AttestationVault has NO contract private state (all
 // ledger is public; witnesses pass ctx.privateState through unchanged). So a
-// trivial in-memory provider is sufficient — nothing is persisted server-side
+// trivial in-memory provider is sufficient: nothing is persisted server-side
 // and there is no secret to seed. It implements the full midnight-js
 // PrivateStateProvider surface so findDeployedContract/callTx is satisfied.
 //

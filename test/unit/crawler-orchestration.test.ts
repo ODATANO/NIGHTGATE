@@ -242,7 +242,7 @@ describe('MidnightCrawler orchestration', () => {
                 unsubscribeFinalizedHeads: vi.fn().mockRejectedValue(new Error('unsubscribe failed'))
             };
             const crawler = new MidnightCrawler(provider as any, { enabled: true });
-            // db.run rejects (simulates a closed DB) — stop() must swallow it.
+            // db.run rejects (simulates a closed DB); stop() must swallow it.
             (crawler as any).db = { run: vi.fn().mockRejectedValue(new Error('db closed')) };
             (crawler as any).subscriptionId = 'sub-1';
 
@@ -919,7 +919,7 @@ describe('MidnightCrawler orchestration', () => {
     });
 
     // ========================================================================
-    // Reorg rollback (handleReorg) — behavioral against the real DB
+    // Reorg rollback (handleReorg): behavioral against the real DB
     // ========================================================================
     describe('handleReorg', () => {
         it('rolls back indexed blocks and records a reorg transactionally', async () => {

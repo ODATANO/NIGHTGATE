@@ -2,20 +2,20 @@
  * REAL-SDK regression tests for srv/utils/wallet-hd.ts + srv/utils/wallet-info.ts.
  *
  * The per-role HD derivation is the exact spot of the production bug where a
- * raw-seed derivation landed on the wrong (unfunded) Lace account — the fix
- * was live-verified on 2026-05-29. These tests import the ACTUAL ESM SDKs
- * (wallet-sdk-hd, ledger-v8, address-format, unshielded-wallet — all offline,
+ * raw-seed derivation landed on the wrong (unfunded) Lace account; the fix
+ * was verified against a live account. These tests import the ACTUAL ESM SDKs
+ * (wallet-sdk-hd, ledger-v8, address-format, unshielded-wallet; all offline,
  * no chain) and pin the derivation of the standard BIP39 test mnemonic, so any
  * drift in our role/account/index path or an SDK upgrade that changes key
  * material fails loudly instead of silently switching accounts.
  *
- * (Under jest none of this was testable — the SDKs are ESM-only. wallet-info's
+ * (Under jest none of this was testable: the SDKs are ESM-only. wallet-info's
  * pre-SDK validation lives in wallet-info.test.ts; this file is the SDK path.)
  */
 import { deriveRoleSeeds, mnemonicToBip39SeedHex } from '../../srv/utils/wallet-hd';
 import { deriveWalletInfo } from '../../srv/utils/wallet-info';
 
-// The BIP39 spec test vector phrase — publicly known, never funded on purpose.
+// The BIP39 spec test vector phrase: publicly known, never funded on purpose.
 const MNEMONIC = 'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about';
 
 // Pinned outputs of the live-verified derivation path

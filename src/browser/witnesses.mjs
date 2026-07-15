@@ -6,12 +6,11 @@
 // in lockstep on:
 //   - the domain-separation label   'nightgate/attestation-vault/v1'
 //   - the witness object shape       { local_secret_key, attested_value, value_salt }
-// Only @noble/hashes (pure JS) is used — no Node built-ins.
+// Only @noble/hashes (pure JS) is used; no Node built-ins.
 //
-// See docs/feature-requests/wallet-connector-integration-plan.md Phase 0 for the
-// design (no contract private state; attester identity = HMAC over secret
-// material; the connector cannot expose the seed, so material comes from
-// `signData` per Phase 0).
+// Design: the vault has no contract private state; attester identity = HMAC
+// over secret material; the connector cannot expose the seed, so material
+// comes from `signData`.
 
 import { hmac } from '@noble/hashes/hmac';
 import { sha256 } from '@noble/hashes/sha256';
@@ -41,8 +40,8 @@ function hexToBytes(hex) {
 /**
  * Derive the 32-byte AttestationVault secret from arbitrary key material.
  *
- * SAME primitive as the server's `deriveAttestationSecret(seedBytes)` — same
- * HMAC-SHA256 + domain label — so that, IF the same material is supplied to both
+ * SAME primitive as the server's `deriveAttestationSecret(seedBytes)` (same
+ * HMAC-SHA256 + domain label), so that, IF the same material is supplied to both
  * paths, the on-chain `attester_id = persistentHash(local_secret_key())`
  * matches. The server feeds the wallet seed; the browser cannot get the seed and
  * feeds connector-derived material instead (see `deriveAttestationSecretFromSignature`).
@@ -58,8 +57,7 @@ export function deriveAttestationSecret(material) {
  * `signature` is the hex `Signature.signature` returned by
  * `connector.signData(FIXED_MESSAGE, { encoding:'text', keyType:'unshielded' })`.
  * Stable across sessions ONLY if the wallet's unshielded signature is
- * deterministic — otherwise derive once and persist the result client-side.
- * See plan Phase 0 "determinism" caveat.
+ * deterministic; otherwise derive once and persist the result client-side.
  */
 export function deriveAttestationSecretFromSignature(signatureHex) {
     return deriveAttestationSecret(hexToBytes(signatureHex));
@@ -75,7 +73,7 @@ export function deriveAttestationSecretFromSignature(signatureHex) {
  *   field_value(ctx):      [PS, bigint]
  *   merkle_siblings(ctx):  [PS, Uint8Array[]]   (DEPTH=4 × Bytes<32>)
  *   merkle_dirs(ctx):      [PS, boolean[]]      (DEPTH=4)
- * `ctx.privateState` is passed through unchanged — the vault has no private state.
+ * `ctx.privateState` is passed through unchanged; the vault has no private state.
  *
  * `merkleProof` (for proveFieldPredicate): { fieldValue, siblings: string[4] hex,
  * dirs: boolean[4] }. Unused witnesses simply are never invoked for other

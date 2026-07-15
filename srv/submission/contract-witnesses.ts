@@ -7,8 +7,8 @@
  * witness object built from the caller's wallet session, or fall back to
  * vacant witnesses (only valid for contracts that declare none).
  *
- * The witness factory receives a primitive snapshot of the FacadeEntry —
- * just the bits the witness needs — so we don't smuggle SDK-shaped objects
+ * The witness factory receives a primitive snapshot of the FacadeEntry
+ * (just the bits the witness needs) so we don't smuggle SDK-shaped objects
  * across the worker boundary or test seams.
  */
 import { hmac } from '@noble/hashes/hmac';
@@ -74,7 +74,7 @@ export function deriveAttestationSecret(seedBytes: Uint8Array): Uint8Array {
  * Builds the AttestationVault witness object.
  *
  * `local_secret_key()` returns the same 32-byte secret on every call for a
- * given session — that determinism is what `persistentHash(local_secret_key())`
+ * given session; that determinism is what `persistentHash(local_secret_key())`
  * inside the circuit relies on to produce a stable `attester_id`.
  *
  * The witness signature matches the generated `Witnesses<PS>` type:
@@ -145,7 +145,7 @@ export type WitnessFactory = (input: WitnessFactoryInput) => any;
 /**
  * Registry of contract-name → witness-builder. Contracts not in this map
  * fall back to `withVacantWitnesses` (i.e. the Compact source declared no
- * witnesses — only valid for those). Counter is one such case.
+ * witnesses; only valid for those). Counter is one such case.
  */
 const FACTORIES: Record<string, WitnessFactory> = {
     'attestation-vault': buildAttestationVaultWitnesses

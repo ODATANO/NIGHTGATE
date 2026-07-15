@@ -53,7 +53,7 @@ ok('registry: resolveContract returns object', resolved);
 ok('registry: privateStateId preserved',       resolved.privateStateId === 'counterPrivateState');
 ok('registry: zkConfigPath preserved',         resolved.zkConfigPath === zkConfigPath);
 ok('registry: artifactPath surfaced',          resolved.artifactPath === artifactAbsPath);
-// Since Phase 2b, resolveContract returns a CompiledContract wrapper (object
+// resolveContract returns a CompiledContract wrapper (object
 // with the `@midnight-ntwrk/compact-js` shape), not the raw Contract class.
 ok('registry: compiledContract resolves to a wrapper object',
     resolved.compiledContract && typeof resolved.compiledContract === 'object');

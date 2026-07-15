@@ -62,8 +62,8 @@ export interface BuildWalletMaterialOptions {
     sessionId: string;
     /**
      * Owning principal (req.user.id). When provided, the session load is scoped
-     * to it so one principal cannot build wallet material from another's session
-     * (review_001 P1). Callers in the submission handlers always pass
+     * to it so one principal cannot build wallet material from another's session.
+     * Callers in the submission handlers always pass
      * `req.user.id`; a mismatch reads back as SessionNotFound (non-leaking).
      */
     expectedUserId?: string;
@@ -261,7 +261,7 @@ async function createSigningCapableWalletAdapter(seedHex: string): Promise<any> 
     const roleSeeds = await deriveRoleSeeds(bip39Seed);
     const ledger = await loadLedgerV8();
 
-    // Each key type comes from its own HD role (Zswap/Dust), matching Lace —
+    // Each key type comes from its own HD role (Zswap/Dust), matching Lace;
     // see srv/utils/wallet-hd.ts.
     const zswapKeys = ledger.ZswapSecretKeys.fromSeed(roleSeeds.zswap);
     const dustKey   = ledger.DustSecretKey.fromSeed(roleSeeds.dust);

@@ -1,5 +1,5 @@
 /**
- * Tests for srv/submission/token-ops.ts — the thin wrapper layer that
+ * Tests for srv/submission/token-ops.ts, the thin wrapper layer that
  * orchestrates `sendNight` (and later shield/unshield) through the worker
  * RPC. Same mock pattern as dust-registration.test.ts: stub the
  * wallet-worker-client export, assert argument shape + result pass-through.

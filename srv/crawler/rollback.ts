@@ -255,7 +255,7 @@ async function recomputeNightBalance(tx: any, address: string): Promise<void> {
 
     const nowIso = new Date().toISOString();
     const computed = {
-        // Decimal(20,0) columns carrying u128 amounts as strings — same
+        // Decimal(20,0) columns carrying u128 amounts as strings, same
         // convention as the ingest (see BlockProcessor.upsertNightBalance).
         balance: balance.toString() as any,
         utxoCount,

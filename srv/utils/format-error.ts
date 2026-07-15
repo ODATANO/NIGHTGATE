@@ -4,7 +4,7 @@
  *
  * The `err?.message ?? String(err)` idiom that used to appear in several
  * places quietly degrades to `[object Object]` when `err` is a plain object
- * without a `.message` property — which Effect.ts and some SDK errors are.
+ * without a `.message` property, which Effect.ts and some SDK errors are.
  * `formatErr` falls back to `JSON.stringify` so log output always carries
  * the actual payload.
  */

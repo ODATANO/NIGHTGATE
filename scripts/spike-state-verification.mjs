@@ -1,12 +1,12 @@
-// SPIKE (OQ1 of onchain-state-verification-crawlerless): confirm the crawler-free
-// state model can back the two new verify surfaces the FR proposes, by driving the
+// SPIKE: confirm the crawler-free state model can back the two verify
+// surfaces below, by driving the
 // REAL Compact-emitted AttestationVault circuits locally (no chain / no proof server):
 //
-//   #2 verifyAttestationState  — attest -> anchorContentRoot, then read
+//   #2 verifyAttestationState: attest -> anchorContentRoot, then read
 //        public_attestations / content_roots / attestation_owners by the KNOWN
 //        payload_hash. All flat maps -> member/lookup, no enumeration, no helper.
 //
-//   #3 verifyPredicateAttestation (state fallback) — commitValue -> provePredicate,
+//   #3 verifyPredicateAttestation (state fallback): commitValue -> provePredicate,
 //        then read predicate_results. This map is keyed by
 //        claimKey = persistentHash<PredicateClaim>{payload_hash, threshold, op},
 //        which the consumer does NOT hold. Question: can we recompute claimKey
@@ -80,7 +80,7 @@ const threshold    = 100n;
 const OP_LE = 0n; // lessOrEqual: 42 <= 100 -> true
 
 // ============================================================================
-// PROPOSAL #2 — verifyAttestationState primitives (attestation + content root)
+// PROPOSAL #2: verifyAttestationState primitives (attestation + content root)
 // ============================================================================
 runCircuit('attest', payloadHash, metadataHash);
 runCircuit('anchorContentRoot', payloadHash, contentRoot);
@@ -100,7 +100,7 @@ ok('#2 contentRoot mismatch detectable',
 // All of #2 is keyed by the KNOWN payloadHash -> pure member/lookup, no enumeration.
 
 // ============================================================================
-// PROPOSAL #3 — predicate result read + claimKey recomputation question
+// PROPOSAL #3: predicate result read + claimKey recomputation question
 // ============================================================================
 runCircuit('commitValue', payloadHash);
 const ledC = ledger(circuitCtx.currentQueryContext.state);
@@ -137,7 +137,7 @@ console.log(`     compact-runtime hash-ish exports: ${rtHashNames.join(', ') || 
 // constructors (the compiled artifact builds the identical _descriptor_7 this
 // way: Bytes<32> ++ Uint<64> ++ Uint<8>) and recompute the claimKey off-chain.
 // If this equals onChainClaimKey, proposal #3 needs NO Compact change and NO
-// schema column — the handler recomputes the key from the stored
+// schema column: the handler recomputes the key from the stored
 // (payloadHash, threshold, op) and does predicate_results.member(claimKey).
 let recomputed = null;
 try {
@@ -168,7 +168,7 @@ ok('#3 pureCircuits.leafHash exported (field-root parity)',
     typeof mod.pureCircuits?.leafHash === 'function');
 
 // ============================================================================
-// PROPOSAL #3 (field-bound) — proveFieldPredicate result + claimKey recompute
+// PROPOSAL #3 (field-bound): proveFieldPredicate result + claimKey recompute
 // ============================================================================
 // Build a real DEPTH=4 Merkle proof off-chain using the exported pureCircuits,
 // anchor the resulting root, then prove a field predicate against it. The
@@ -203,8 +203,8 @@ ok('#3f recorded field result is true', fieldKeys[0]?.val === true);
 const onChainFieldClaimKey = fieldKeys[0]?.key;
 console.log(`     on-chain fieldClaimKey = ${onChainFieldClaimKey}`);
 
-// Recompute FieldPredicateClaim { payload_hash, field_key, threshold, op } —
-// artifact's _descriptor_6: Bytes<32> ++ Bytes<32> ++ Uint<64> ++ Uint<8>.
+// Recompute FieldPredicateClaim { payload_hash, field_key, threshold, op },
+// the artifact's _descriptor_6: Bytes<32> ++ Bytes<32> ++ Uint<64> ++ Uint<8>.
 let recomputedField = null;
 try {
     const d_bytes32 = new rt.CompactTypeBytes(32);

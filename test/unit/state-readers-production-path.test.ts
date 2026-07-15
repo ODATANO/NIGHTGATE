@@ -3,7 +3,7 @@
  *
  *  - computePredicateClaimKey / computeFieldPredicateClaimKey against the REAL
  *    @midnight-ntwrk/compact-runtime (vitest can import the ESM SDK, jest never
- *    could). The expected hex fixtures pin the persistentHash encoding —
+ *    could). The expected hex fixtures pin the persistentHash encoding;
  *    byte-exactness against a LIVE vault was proven in
  *    scripts/spike-state-verification.mjs; these tests keep the encoding from
  *    drifting (refactors, compact-runtime upgrades) without a chain.

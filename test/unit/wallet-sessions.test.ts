@@ -118,7 +118,7 @@ import { registerWalletSessionHandlers, startSessionCleanup } from '../../srv/se
 // the first few cases). Tests that need a specific IP pass one explicitly.
 let __ipCounter = 0;
 function defaultIp(): string {
-    // 192.168.x.x range — kept distinct from explicit IPs like 10.0.0.1 used
+    // 192.168.x.x range, kept distinct from explicit IPs like 10.0.0.1 used
     // by rate-limit-specific tests so the two buckets can't collide.
     __ipCounter += 1;
     return `192.168.${(__ipCounter >> 8) & 0xff}.${__ipCounter & 0xff}`;
@@ -129,7 +129,7 @@ const TEST_USER_ID = 'test-user';
 function createMockRequest(data: Record<string, unknown>, ip: string | null | undefined = undefined) {
     const req: any = {
         data,
-        // Sessions are user-bound (review_001 P1); every session action reads
+        // Sessions are user-bound; every session action reads
         // req.user.id. Default to a fixed principal so handlers pass the auth gate.
         user: { id: TEST_USER_ID },
         reject: vi.fn().mockImplementation((code: number, message: string) => ({
@@ -376,7 +376,7 @@ describe('wallet session handlers', () => {
     it('startSessionCleanup deactivates expired sessions on the cleanup interval', async () => {
         vi.useFakeTimers();
         // Cleanup now SELECTs the expiring rows (to evict cached facades) then
-        // UPDATEs them, nulling BOTH encrypted keys (review_001 P2).
+        // UPDATEs them, nulling BOTH encrypted keys.
         const db = { run: vi.fn().mockResolvedValueOnce([]).mockResolvedValueOnce(2) };
 
         try {
@@ -474,7 +474,7 @@ describe('wallet session handlers', () => {
 
             expect(req.reject).not.toHaveBeenCalled();
             expect(updateWhereSpy).toHaveBeenCalledWith({ sessionId: 's1', userId: TEST_USER_ID });
-            // The pre-warm call moves into startJob's `work` closure — not
+            // The pre-warm call moves into startJob's `work` closure, not
             // called synchronously by the handler.
             expect(mockEnsureNetworkId).not.toHaveBeenCalled();
             expect(mockGetOrBuildWalletFacade).not.toHaveBeenCalled();
@@ -520,7 +520,7 @@ describe('wallet session handlers', () => {
                     prewarmJobId:   null,
                     prewarmStatus:  null
                 });
-                // The session UPDATE still committed — signing is enabled.
+                // The session UPDATE still committed; signing is enabled.
                 expect(updateWhereSpy).toHaveBeenCalledWith({ sessionId: 's1', userId: TEST_USER_ID });
             } finally {
                 warn.mockRestore();
@@ -566,7 +566,7 @@ describe('wallet session handlers', () => {
                 jobId:  'job-registerForDustGeneration-test',
                 status: 'pending'
             });
-            // The inner worker call should NOT have happened synchronously —
+            // The inner worker call should NOT have happened synchronously;
             // it lives inside startJob's `work` closure now.
             expect(mockRegisterNightUtxosForDust).not.toHaveBeenCalled();
 
@@ -595,7 +595,7 @@ describe('wallet session handlers', () => {
         });
 
         it('synchronous setup errors (before startJob) still surface as 500', async () => {
-            // Force the session SELECT to throw — this happens before the
+            // Force the session SELECT to throw; this happens before the
             // handler hands off to startJob, so the request rejects directly.
             mockDbRun.mockRejectedValueOnce(new Error('db unreachable'));
             const req = createMockRequest({ sessionId: 's1' });

@@ -72,7 +72,7 @@ export class SchemaNotDeployedError extends Error {
 /**
  * Resolve the database file path the runtime is connected to. Used in the
  * SchemaNotDeployedError message so users see exactly which file is missing
- * the tables bare `cds deploy` defaults to `db.sqlite` which would silently
+ * the tables; bare `cds deploy` defaults to `db.sqlite`, which would silently
  * deploy to the wrong file otherwise.
  */
 function resolveDbPath(): string {
@@ -182,7 +182,7 @@ export async function initialize(): Promise<NightgateIndexerStatus> {
 
     // Spin up the wallet worker thread now so it's ready when the first
     // connectWalletForSigning request lands. The Midnight wallet SDK
-    // monopolises the microtask queue while syncing — running it in a worker
+    // monopolises the microtask queue while syncing; running it in a worker
     // keeps CAP's `db.run`, OData handlers, and the crawler responsive.
     try {
         await startWalletWorker();

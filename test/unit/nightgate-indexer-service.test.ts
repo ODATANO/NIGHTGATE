@@ -13,8 +13,8 @@
  * DB rows.
  */
 
-// The CAP server boots the compiled srv/*.js through Node's own require —
-// OUTSIDE vitest's module graph — so vi.mock would only patch this file's
+// The CAP server boots the compiled srv/*.js through Node's own require
+// (OUTSIDE vitest's module graph), so vi.mock would only patch this file's
 // imports, never the crawler calls inside the booted service (under jest the
 // runtime intercepted every require, so vi.mock's jest equivalent worked).
 // Instead, load the SAME native module instance the booted service uses and

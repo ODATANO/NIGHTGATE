@@ -17,7 +17,7 @@
  * External collaborators stay MOCKED:
  *  - MidnightNodeProvider          → per-test inline fake objects (no real RPC)
  *  - reconcilePendingSubmission    → vi.mock (no-op; PendingSubmissions is
- *    empty in these tests, so reconciliation is a no-op anyway — mocking keeps
+ *    empty in these tests, so reconciliation is a no-op anyway; mocking keeps
  *    the persist path decoupled from the submission module).
  *
  * Note on the pallet map: the processor's constructor builds its pallet map from
@@ -56,7 +56,7 @@ const SYNC_STATE = 'midnight.SyncState';
 let db: any;
 
 // ---------------------------------------------------------------------------
-// Block-input builders (reused verbatim from the original suite — only the
+// Block-input builders (reused verbatim from the original suite; only the
 // assertion/persistence layer changes).
 // ---------------------------------------------------------------------------
 
@@ -147,7 +147,7 @@ beforeEach(async () => {
 
 describe('BlockProcessor persistence paths', () => {
     // ------------------------------------------------------------------------
-    // init() — connects the real db. (Was asserted against a fake cds.connect.)
+    // init() connects the real db. (Was asserted against a fake cds.connect.)
     // ------------------------------------------------------------------------
     it('initializes the database connection through cds.connect', async () => {
         const processor = new BlockProcessor({} as any);

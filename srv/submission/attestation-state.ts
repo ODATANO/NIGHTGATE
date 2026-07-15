@@ -1,14 +1,13 @@
 /**
- * Crawler-free attestation state reader (onchain-state-verification-crawlerless FR,
- * proposal #2). Reads the AttestationVault attestation/content-root ledger Maps
- * back out of LIVE on-chain state via the contract's `ledger()` decoder, keyed by
- * a KNOWN payload_hash — so verification does not depend on the block crawler or
- * on any locally-indexed txHash.
+ * Crawler-free attestation state reader. Reads the AttestationVault
+ * attestation/content-root ledger Maps back out of LIVE on-chain state via the
+ * contract's `ledger()` decoder, keyed by a KNOWN payload_hash, so verification
+ * does not depend on the block crawler or on any locally-indexed txHash.
  *
  * Unlike the disclosure indexer (which must enumerate a nested, non-iterable outer
  * Map via `attestation_owners`), everything here is a direct member/lookup on flat
  * `Map<Bytes<32>, Bytes<32>>` maps by the caller-supplied payload_hash. No
- * enumeration, no read-helper, no Compact change — validated in
+ * enumeration, no read-helper, no Compact change; validated in
  * scripts/spike-state-verification.mjs.
  *
  * The decode/read logic is dependency-injected (`ledger`, `queryContractState`) so
@@ -51,7 +50,7 @@ export interface ReadAttestationStateDeps {
     contentRoot?: string;
     /** Decoder from the compiled artifact (`ledger`). */
     ledger: (state: any) => AttestationLedger;
-    /** publicDataProvider.queryContractState — returns ContractState | null. */
+    /** publicDataProvider.queryContractState; returns ContractState | null. */
     queryContractState: (contractAddress: string) => Promise<any | null>;
 }
 

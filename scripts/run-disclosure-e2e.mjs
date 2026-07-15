@@ -1,15 +1,15 @@
-// Disclosure-grants end-to-end (expose-disclosure-grants, Phase 4).
+// Disclosure-grants end-to-end.
 //
 // Walks the full on-chain entitlement lifecycle against a LIVE deployed
-// AttestationVault, exercising every surface added by the FR:
+// AttestationVault, exercising every disclosure-grants surface:
 //   connectWallet → connectWalletForSigning (await prewarm) →
 //   deployContract(attestation-vault) →
-//   registerGranteeIdentity        (Phase 0: principal → granteeId) →
+//   registerGranteeIdentity        (principal → granteeId) →
 //   anchorDocument (attest a payload so it has an on-chain owner) →
-//   grantDisclosure(level=1)       (Phase 1 write) →
-//   GET DisclosureGrants           (Phase 2 read: poll until active=true) →
-//   revokeDisclosure               (Phase 1 write) →
-//   GET DisclosureGrants           (Phase 2 read: poll until active=false)
+//   grantDisclosure(level=1)       (write) →
+//   GET DisclosureGrants           (read: poll until active=true) →
+//   revokeDisclosure               (write) →
+//   GET DisclosureGrants           (read: poll until active=false)
 //
 // Why this is the meaningful live check: the gate itself (attachDisclosureRole
 // with contractAddress) is what a CONSUMER wires into a specific read, so the

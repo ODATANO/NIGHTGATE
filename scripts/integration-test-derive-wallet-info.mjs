@@ -1,5 +1,5 @@
-// Native-ESM integration check for srv/utils/wallet-info.ts (FR
-// derive-wallet-info): derives the connectable identity of a wallet from a
+// Native-ESM integration check for srv/utils/wallet-info.ts
+// (deriveWalletInfo): derives the connectable identity of a wallet from a
 // mnemonic and verifies it against the KNOWN Lace account.
 //
 // The decisive assertion: at accountIndex 0 / network preprod, the derived

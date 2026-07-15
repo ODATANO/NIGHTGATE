@@ -5,7 +5,7 @@
  * compiled Compact circuit guards a `Bytes<N>` parameter strictly as a real
  * `Uint8Array(N)` (`.buffer instanceof ArrayBuffer && BYTES_PER_ELEMENT === 1
  * && length === N`). The public `submitContractCall` takes `args` as a JSON
- * string, and JSON cannot carry a `Uint8Array` — so a hex string or a
+ * string, and JSON cannot carry a `Uint8Array`, so a hex string or a
  * `number[]` both fail the guard, and the only circuits callable generically
  * were the JSON-native ones (numbers/bools). The built-in actions
  * (`anchorDocument` etc.) dodged this by hex-decoding internally before the
@@ -27,7 +27,7 @@
  *     BigInt for Uint<N>. A param of an unhandled Compact type (Vector, struct,
  *     Field, …) passes through unchanged.
  *   - Untagged + no metadata for the argument: rejected with a clear 400. We
- *     do NOT silently pass it through — that would reproduce the deep
+ *     do NOT silently pass it through: that would reproduce the deep
  *     circuit-type failure this layer exists to prevent. The caller fixes it by
  *     tagging the value or correcting the registered artifact path.
  */
@@ -110,7 +110,7 @@ function toBigInt(value: unknown, index: number, maxval?: number): bigint {
         throw new CoercionError(index, `Uint value must be non-negative (got ${v})`);
     }
     // Only enforce the upper bound when the compiler's maxval is within JS
-    // safe-integer range — for u64 etc. the value loses precision through
+    // safe-integer range; for u64 etc. the value loses precision through
     // JSON.parse, so a check there would be unreliable. Lower bound is enough
     // to catch the common mistakes; the circuit enforces the true bound.
     if (maxval !== undefined && maxval <= Number.MAX_SAFE_INTEGER && v > BigInt(maxval)) {
@@ -125,7 +125,7 @@ function isPlainObject(v: unknown): v is Record<string, unknown> {
 
 /** Coerce one argument. Tag wins; otherwise the declared circuit type drives it; with no type info, reject. */
 function coerceOne(raw: unknown, argType: CircuitArgType | undefined, index: number): unknown {
-    // 1. Tagged values — honored regardless of whether we have circuit metadata.
+    // 1. Tagged values: honored regardless of whether we have circuit metadata.
     if (isPlainObject(raw)) {
         if (Object.prototype.hasOwnProperty.call(raw, '$bytes')) {
             const hex = raw['$bytes'];
@@ -176,7 +176,7 @@ function coerceOne(raw: unknown, argType: CircuitArgType | undefined, index: num
 
 /**
  * Coerce a parsed `args` array against the circuit's declared parameter types.
- * `argTypes` may be undefined (no introspection) — tagged values still work and
+ * `argTypes` may be undefined (no introspection); tagged values still work and
  * everything else passes through unchanged.
  */
 export function coerceCircuitArgs(rawArgs: unknown[], argTypes?: CircuitArgType[]): unknown[] {
@@ -203,7 +203,7 @@ function mapArgType(node: RawArgTypeNode | undefined, name: string): CircuitArgT
     return { name, kind: 'other' };
 }
 
-// Cache parsed circuit-arg maps per artifact directory — contract-info.json is
+// Cache parsed circuit-arg maps per artifact directory; contract-info.json is
 // immutable for a compiled artifact, so parse it once per zkConfigPath.
 const argTypeCache = new Map<string, Map<string, CircuitArgType[]> | null>();
 
@@ -231,7 +231,7 @@ function loadContractInfo(zkConfigPath: string): Map<string, CircuitArgType[]> |
 /**
  * Resolve the declared parameter types for `circuit` from the compiled
  * artifact at `zkConfigPath` (reads `<zkConfigPath>/compiler/contract-info.json`).
- * Returns undefined when the metadata or the circuit entry is unavailable —
+ * Returns undefined when the metadata or the circuit entry is unavailable;
  * coercion then falls back to tagged-values-only / passthrough.
  */
 export function loadCircuitArgTypes(zkConfigPath: string, circuit: string): CircuitArgType[] | undefined {

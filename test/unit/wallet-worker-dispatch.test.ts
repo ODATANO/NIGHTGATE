@@ -1,9 +1,9 @@
 /**
- * In-thread tests for srv/midnight/wallet-worker.ts — the worker entry that
+ * In-thread tests for srv/midnight/wallet-worker.ts, the worker entry that
  * was 0% covered because every other suite mocks the whole Worker away.
  *
  * Harness: worker_threads is mocked so `parentPort` is a hand-rolled emitter
- * (MessageChannel stays REAL — the per-call RPC reply plumbing runs for real),
+ * (MessageChannel stays REAL, so the per-call RPC reply plumbing runs for real),
  * and the wallet SDK packages are stubbed at the import seam, so `init` builds
  * a fake facade through the REAL buildFacade wiring (role-seed derivation,
  * restore-vs-fresh selection, dust cold-start flag, facade start).
@@ -357,7 +357,7 @@ describe('periodic save + ack protocol', () => {
             expect(saves[0].sessionId).toBe(SESSION);
             expect(saves[0].blobs.shielded).toBe('BLOB-SH');
 
-            // Tick 2 WITHOUT ack: still unconfirmed → re-pushed (v0.6.6 fix).
+            // Tick 2 WITHOUT ack: still unconfirmed → re-pushed.
             await vi.advanceTimersByTimeAsync(30_000);
             expect(stateSaves().length).toBe(2);
 
@@ -393,7 +393,7 @@ describe('describeTxDust', () => {
         const tx = {
             intents: new Map<any, any>([
                 [0, { dustActions: dust(2, 1) }],
-                [1, {}], // no dust section at all — legal
+                [1, {}], // no dust section at all: legal
                 [2, { dustActions: dust(0, 0) }] // the 117 trigger
             ])
         };

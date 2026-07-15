@@ -21,7 +21,7 @@ import {
 } from '../../srv/middleware/disclosure-role';
 
 // Boot the in-memory CAP server for this file. Not assigned to a `test` const
-// on purpose — that would shadow Jest's global test(). We only need the DB here.
+// on purpose: that would shadow the global test(). We only need the DB here.
 cds.test(__dirname + '/../..');
 
 const ROLES = 'midnight.DisclosureRoles';

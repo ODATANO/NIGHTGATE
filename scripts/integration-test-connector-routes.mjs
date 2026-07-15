@@ -1,8 +1,8 @@
-// Drives the 0.4.0 browser DApp-connector HTTP surface against the REAL route
-// handlers (src/connector-routes.js) mounted on a bare Express app — no cds
+// Drives the browser DApp-connector HTTP surface against the REAL route
+// handlers (src/connector-routes.js) mounted on a bare Express app: no cds
 // lifecycle, no node, no chain. Exercises:
-//   GET /contract-manifest                  — self-configuration manifest
-//   GET /zk-config/<contract>/<dir>/<file>  — proving-artifact serving + ETag/304
+//   GET /contract-manifest                  -> self-configuration manifest
+//   GET /zk-config/<contract>/<dir>/<file>  -> proving-artifact serving + ETag/304
 // plus the security boundary (unknown contract / bad dir / bad filename -> 404)
 // and the pinned-address + network passthrough (network reflects config).
 //
@@ -29,7 +29,7 @@ const PINNED_ADDRESS = '0200deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdead
 // getNightgatePluginConfig() reads cds.env.requires.nightgate; the manifest
 // route reads network + per-contract pinned address from it. Set it up so the
 // manifest reflects an `undeployed` network and a pinned attestation-vault
-// address — proving both passthroughs end-to-end.
+// address, proving both passthroughs end-to-end.
 const cds = (await import('@sap/cds')).default;
 cds.env.requires ??= {};
 cds.env.requires.nightgate = {

@@ -1,9 +1,8 @@
 /**
- * Tests for srv/submission/attestation-state.ts (crawler-free attestation reader,
- * onchain-state-verification-crawlerless FR proposal #2).
+ * Tests for srv/submission/attestation-state.ts (crawler-free attestation reader).
  *
  * Exercises readAttestationState against a FAKE `ledger()`-shaped object and a
- * fake queryContractState — no SDK, no chain. The flat maps here mirror the real
+ * fake queryContractState: no SDK, no chain. The flat maps here mirror the real
  * compiled artifact's public_attestations / attestation_owners / content_roots
  * (all keyed by the known payload_hash; member/lookup only).
  */

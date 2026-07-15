@@ -1,5 +1,5 @@
 /**
- * Tests for srv/submission/token-ops.ts::unshieldFunds — the shielded→
+ * Tests for srv/submission/token-ops.ts::unshieldFunds, the shielded→
  * unshielded ledger-shift wrapper. Same mock pattern as the other
  * token-ops tests.
  */

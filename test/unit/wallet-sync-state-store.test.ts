@@ -4,7 +4,7 @@
  * The store goes through standard CAP `cds.connect.to('db').run(...)` again
  * (after Phase 1 of the worker migration, the wallet SDK no longer blocks
  * the main-thread microtask queue). Tests use a hand-rolled in-memory `cds`
- * mock — same pattern as `block-processor-persistence.test.ts`.
+ * mock, same pattern as `block-processor-persistence.test.ts`.
  */
 
 import { CURRENT_ENCRYPTION_VERSION } from '../../srv/utils/storage-encryption';
@@ -173,7 +173,7 @@ describe('saveSyncState / loadSyncState round-trip', () => {
         })).not.toBeNull();
     });
 
-    test('pre-0.6.6 rows (no networkId/seedFingerprint) still restore with guards requested', async () => {
+    test('legacy rows (no networkId/seedFingerprint) still restore with guards requested', async () => {
         await saveSyncState({
             accountId: 'acct-legacy', passphrase: PASS, sdkVersion: SDK,
             states: { dust: 'du-3' }

@@ -1,4 +1,4 @@
-// SPIKE (Phase 2 of expose-disclosure-grants): prove we can read the on-chain
+// SPIKE: prove we can read the on-chain
 // `disclosures` ledger Map back out via the compiled artifact's `ledger()`
 // decoder, AND that the enumeration strategy works given the central
 // constraint: the OUTER `disclosures` map is NOT iterable (member/lookup only),

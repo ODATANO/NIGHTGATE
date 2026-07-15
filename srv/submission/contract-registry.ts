@@ -34,7 +34,7 @@ const PACKAGE_ROOT = path.resolve(__dirname, '..', '..');
 
 /**
  * Resolve a configured contract path. Absolute paths pass through. For a
- * RELATIVE path we prefer the package root when the target exists there — this
+ * RELATIVE path we prefer the package root when the target exists there; this
  * is how the BUNDLED contracts (counter, attestation-vault, shipped under the
  * package's contracts/ dir) resolve correctly in a consumer app, where
  * process.cwd() is the consumer's project root, not node_modules/@odatano/nightgate.
@@ -65,7 +65,7 @@ export interface ResolvedContract {
      * Absolute path (or file:// URL on Windows) the worker uses to dynamic-
      * import the Compact-emitted contract module. Same value the registry
      * stored at registerContract() time, already normalised to absolute.
-     * Surfaced so Phase 2b's wallet-worker handler can re-import inside the
+     * Surfaced so the wallet-worker handler can re-import inside the
      * worker thread (compiledContract itself doesn't survive a thread boundary).
      */
     artifactPath: string;
@@ -95,7 +95,7 @@ export function listRegisteredContracts(): string[] {
 /**
  * Look up a registered contract's stored registration (absolute paths) without
  * importing the artifact. Used by the zk-config HTTP route to resolve a
- * contract's `zkConfigPath` cheaply. Returns undefined for unknown names —
+ * contract's `zkConfigPath` cheaply. Returns undefined for unknown names,
  * which the route maps to 404 (the registry is the security boundary: only
  * registered contracts are servable).
  */
@@ -143,7 +143,7 @@ export async function resolveContract(name: string): Promise<ResolvedContract> {
     //     .pipe(withVacantWitnesses, withCompiledFileAssets(zkConfigPath))
     const compactJs: any = await import('@midnight-ntwrk/compact-js');
     // CompiledContract namespace lives under `effect/CompiledContract` in the
-    // compact-js package — re-exported at the top level.
+    // compact-js package, re-exported at the top level.
     const CompiledContract = compactJs.CompiledContract ?? compactJs.effect?.CompiledContract;
     if (!CompiledContract?.make) {
         throw new Error(`CompiledContract.make not found in @midnight-ntwrk/compact-js exports; got keys: ${Object.keys(compactJs).join(',')}`);

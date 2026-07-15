@@ -9,7 +9,7 @@
  * port: port1 }` (transferring port1's MessagePort to the worker), then await
  * a single message on `port2` carrying `{ ok, result | error }`.
  *
- * Push events from the worker — `state-save` and `log` — are handled by
+ * Push events from the worker (`state-save` and `log`) are handled by
  * listeners registered via `setStateSaveSink(...)` and the default log relay.
  * The save sink is where we wire CAP `db.run` from the main thread (which is
  * NOT blocked by the wallet SDK because the SDK now lives in the worker).
@@ -59,7 +59,7 @@ let client: ClientState | null = null;
  *
  * The wallet worker invokes the SDK's `deployContract` / `findDeployedContract`
  * inside the worker. The SDK's PrivateStateProvider hook is proxied from the
- * worker back to the main thread via `private-state-rpc` messages — that's
+ * worker back to the main thread via `private-state-rpc` messages; that's
  * where the real CapDbPrivateStateProvider (with CAP DB access + encryption)
  * lives. Each in-flight submission registers its provider here under a fresh
  * `proxyId` so concurrent deploy/call invocations don't collide on a shared
@@ -135,7 +135,7 @@ export async function startWalletWorker(): Promise<void> {
     client = { worker, readyPromise };
 
     // Push events from worker (state-save, log, private-state-rpc). These are
-    // NOT replies to main-initiated RPC calls — those go via MessageChannel
+    // NOT replies to main-initiated RPC calls; those go via MessageChannel
     // ports allocated per call.
     worker.on('message', (msg: any) => {
         if (msg?.kind === 'state-save') {
@@ -203,7 +203,7 @@ export function setStateSaveSink(sink: StateSaveSink | undefined): void {
  * with port1 transferred to the worker, awaits the single reply on port2.
  *
  * Error shape: worker posts `{ ok: false, error: { name, message } }` so we
- * can rehydrate `err.name` here — TransactionSubmitter's classifySubmissionError
+ * can rehydrate `err.name` here; TransactionSubmitter's classifySubmissionError
  * branches on `err.name === 'TxFailedError'` etc. Falls back to a plain
  * string for older message shapes (none currently, but cheap defensive).
  */
@@ -252,7 +252,7 @@ function dispatchPrivateStateRpc(msg: any): void {
     const provider = privateStateProviders.get(proxyId);
 
     if (method === 'setContractAddress') {
-        // No port — set synchronously, log on error.
+        // No port: set synchronously, log on error.
         if (!provider) {
             console.warn(`[wallet-worker-client] setContractAddress: unknown proxyId=${String(proxyId).slice(0, 16)}`);
             return;
@@ -391,7 +391,7 @@ export function walletDeregisterDustGeneration(args: {
  * Send NIGHT to any Midnight address. Ledger is auto-detected from the
  * receiver's Bech32m prefix (mn_shield-addr_ vs mn_addr_).
  *
- * Amount is a decimal string parseable as bigint (NIGHT atoms) — strings
+ * Amount is a decimal string parseable as bigint (NIGHT atoms); strings
  * avoid the precision pitfalls of JS Number when atom counts exceed 2^53.
  */
 export function walletTransferNight(args: {
@@ -442,7 +442,7 @@ export function walletShieldNight(args: {
 }
 
 /**
- * Snapshot of the wallet's balances. Read-only — no transaction is
+ * Snapshot of the wallet's balances. Read-only: no transaction is
  * built or submitted. All amounts are decimal-string bigint to avoid
  * Number precision loss.
  */

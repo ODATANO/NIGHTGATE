@@ -7,8 +7,8 @@
 //      cleanly with a real witness built from a 32-byte session secret.
 //   3. The witness factory returns deterministic [privateState, secret] tuples.
 //
-// This is the integration-side mirror of test/unit/contract-witnesses.test.ts
-// — same shape of checks, but against the real Compact-emitted JS instead of
+// This is the integration-side mirror of test/unit/contract-witnesses.test.ts:
+// same shape of checks, but against the real Compact-emitted JS instead of
 // a hand-rolled stub. Run: node scripts/integration-test-attestation-vault.mjs
 
 import path from 'node:path';
@@ -39,7 +39,7 @@ ok('artifact: ledger fn exposed',         typeof mod.ledger === 'function');
 ok('artifact: pureCircuits exposed',      mod.pureCircuits !== undefined);
 
 // Inspect a freshly-constructed Contract for the expected circuit shape.
-// We use a stub witness here — the real one is plumbed by the worker.
+// We use a stub witness here; the real one is plumbed by the worker.
 const stubSecret = new Uint8Array(32);
 const zero32 = () => new Uint8Array(32);
 const stubWitnesses = {

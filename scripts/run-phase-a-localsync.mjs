@@ -1,8 +1,8 @@
-// Phase A of the hybrid-sync experiment (2026-06-28).
+// Phase A of the hybrid-sync experiment.
 //
 // Goal: sync the wallet FULLY against the LOCAL docker indexer (clean stream,
 // no 8469 gap) up to the local indexer's head, and let NIGHTGATE persist the
-// serialized wallet state to WalletSyncStates. NO revoke here — the local
+// serialized wallet state to WalletSyncStates. NO revoke here: the local
 // indexer is not at chain tip, so a submit would fail dust-validity (170).
 //
 // Phase B (separate run): point NIGHTGATE_INDEXER_* at the PUBLIC indexer

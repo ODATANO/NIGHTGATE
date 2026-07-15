@@ -368,10 +368,10 @@ entity DisclosureRoles : cuid, managed {
 /**
  * On-chain disclosure grants read off the AttestationVault `disclosures`
  * ledger Map. Distinct from DisclosureRoles (off-chain, operator-configured):
- * these are CHAIN-DERIVED entitlement records — the contract is the ACL.
+ * these are CHAIN-DERIVED entitlement records; the contract is the ACL.
  *
  * Rows are inserted optimistically (active=false) by `grantDisclosure` and
- * confirmed/flipped by the chain indexer (Phase 2) once the grant appears in
+ * confirmed/flipped by the chain indexer once the grant appears in
  * ledger state. Logical key for cross-contract reuse:
  * (contractAddress, payloadHash, grantee). `level`: 0=public,
  * 1=legitimate-interest, 2=authority.
@@ -389,8 +389,8 @@ entity DisclosureGrants : cuid, managed {
 /**
  * Binds an authenticated principal (req.user.id) to the `Bytes<32>` grantee id
  * the AttestationVault circuit checks, so the read gate can resolve
- * principal → granteeId and match an on-chain DisclosureGrant (Phase 0 of
- * expose-disclosure-grants). `bindingKind` records how the id was derived
+ * principal → granteeId and match an on-chain DisclosureGrant.
+ * `bindingKind` records how the id was derived
  * ('wallet' | 'did' | 'custom'); see srv/submission/grantee-identity.ts.
  * Resolution mirrors DisclosureRoles scope precedence: a scoped row wins,
  * else a global (null/empty scope) row applies.

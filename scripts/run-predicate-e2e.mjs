@@ -1,4 +1,4 @@
-// ZK predicate attestation end-to-end (on-chain-verified model, Phase C).
+// ZK predicate attestation end-to-end (on-chain-verified model).
 //
 // Walks: connectWallet → connectWalletForSigning (await prewarm sync) →
 // deployContract(attestation-vault) → anchorDocument (attest a payload so it
@@ -120,7 +120,7 @@ async function waitForServer() {
     console.log('OK   payload attested');
 
     // MODE: 'full' (default) runs positive then negative. 'negative' skips the
-    // positive so the negative provePredicate lands as an EARLY call — the
+    // positive so the negative provePredicate lands as an EARLY call: the
     // public indexer's graphql-ws subscription degrades over a long session,
     // and later calls can hang in the SDK's balance/submit; keeping the
     // negative early dodges that so it reaches the predicate assert.
@@ -151,7 +151,7 @@ async function waitForServer() {
     const negMsg = `${negRes.errorCode ?? ''} ${negRes.errorMessage ?? ''}`.trim();
     if (/timed out|stalled|sync/i.test(negMsg)) {
         // A dropped indexer subscription failed the job before it could reach
-        // the predicate assert — that's infra flakiness, NOT a demonstration of
+        // the predicate assert. That's infra flakiness, NOT a demonstration of
         // predicate enforcement. Don't count it as a pass.
         fail(`negative case failed on a SYNC issue, not a predicate rejection: ${negMsg} — re-run when the public indexer is healthy`);
     }

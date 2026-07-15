@@ -99,7 +99,7 @@ describe('NightgateAdminService', () => {
             expect(mockDbRun).toHaveBeenCalledTimes(2);
             expect(selectWhereSpy).toHaveBeenCalledWith({ sessionId: 'session-123' });
             expect(updateWhereSpy).toHaveBeenCalledWith({ sessionId: 'session-123' });
-            // review_001 P2: forced invalidation clears BOTH encrypted secrets.
+            // Forced invalidation clears BOTH encrypted secrets.
             expect(updateSetSpy).toHaveBeenCalledWith(expect.objectContaining({
                 isActive: false,
                 encryptedViewingKey: null,

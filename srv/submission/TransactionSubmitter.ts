@@ -2,9 +2,9 @@
  * TransactionSubmitter, server-side submission orchestrator for the
  * Midnight contract path (deploy + call).
  *
- * Phase 2b: the SDK invocation moved into a `worker_threads` worker (see
+ * The SDK invocation runs in a `worker_threads` worker (see
  * `srv/midnight/wallet-worker.ts`) so the SDK's Effect.ts microtask saturation
- * stays off the main thread. This class is now an orchestrator:
+ * stays off the main thread. This class is an orchestrator:
  *
  *   1. Insert a `pending` row into PendingSubmissions BEFORE invoking the
  *      worker. The row carries our internal UUID; txHash + contractAddress
@@ -19,7 +19,7 @@
  *   3. Invoke the worker (`walletDeployContract` / `walletSubmitContractCall`).
  *      The worker owns the SDK, the compiled contract artifact (cached by
  *      name), and the wallet facade. It returns only primitives
- *      (`txHash`, `contractAddress`, `onChainStatus`) — no SDK object crosses
+ *      (`txHash`, `contractAddress`, `onChainStatus`); no SDK object crosses
  *      the thread boundary.
  *
  *   4. On success → UPDATE row with `{ txHash, contractAddress, status }`.
@@ -29,7 +29,7 @@
  *   5. On failure → UPDATE row with `{ status='failed', errorCode, errorMessage }`.
  *      Errors are classified (see classifySubmissionError):
  *        - 1014  permanent (invalid tx), no retry
- *        - 1016  on mainnet: deterministic per forum thread 1190 (early May 2026);
+ *        - 1016  on mainnet: deterministic per forum thread 1190;
  *                fail fast with a known-issue reference. On preprod: retryable.
  *        - TIMEOUT/NETWORK transient, caller may retry
  *        - TxFailedError from SDK, the on-chain status was not SucceedEntirely
@@ -295,7 +295,7 @@ export class TransactionSubmitter {
      * resolves or rejects.
      *
      * Throws if the configured private-state backend is anything other than
-     * 'cap-db' — the legacy LevelDB path is incompatible with worker-routed
+     * 'cap-db': the legacy LevelDB path is incompatible with worker-routed
      * submissions (the SDK's LevelDB provider doesn't survive a thread
      * boundary, and its on-disk format is dev-only per the SDK docs).
      */
@@ -329,7 +329,7 @@ export class TransactionSubmitter {
     /**
      * The worker stores facades keyed on `accountId` (deterministic per
      * viewing key), set by the pre-warm in connectWalletForSigning. We must
-     * use the same key when looking up the facade for deploy/call — the OData
+     * use the same key when looking up the facade for deploy/call; the OData
      * user-session UUID would miss. `args.sessionId` is preserved on the
      * PendingSubmissions row for audit.
      */

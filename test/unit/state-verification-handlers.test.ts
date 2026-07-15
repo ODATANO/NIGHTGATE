@@ -1,9 +1,9 @@
 /**
  * Tests for the crawler-free state-verification handlers in
- * srv/submission/handlers.ts (onchain-state-verification-crawlerless FR):
- *   - verifyAttestationState (proposal #2)
- *   - reindexDisclosures     (proposal #1)
- *   - verifyDocument / verifyPredicateAttestation state fallbacks (proposal #3)
+ * srv/submission/handlers.ts:
+ *   - verifyAttestationState
+ *   - reindexDisclosures
+ *   - verifyDocument / verifyPredicateAttestation state fallbacks
  *
  * Drives registerSubmissionHandlers against a stub service, injecting the state
  * readers via options so no SDK/chain is touched. nightgate-config is mocked so
@@ -160,7 +160,7 @@ describe('verifyAttestationState', () => {
     });
 });
 
-// ---- verifyPredicateState (expose-predicate-state-verify FR) ---------------
+// ---- verifyPredicateState --------------------------------------------------
 
 describe('verifyPredicateState', () => {
     const FIELD_KEY = 'e'.repeat(64);

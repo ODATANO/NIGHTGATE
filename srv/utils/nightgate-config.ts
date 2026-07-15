@@ -10,7 +10,7 @@ export type NightgateNetwork = (typeof VALID_NIGHTGATE_NETWORKS)[number];
 /**
  * Plugin configuration consumed under `cds.requires.nightgate`. CAP injects
  * this object via package.json / .cdsrc / env-var merging. Fields are
- * intentionally optional — defaults come from this module's DEFAULT_* values.
+ * intentionally optional; defaults come from this module's DEFAULT_* values.
  */
 export interface NightgatePluginConfig {
     network?: string;
@@ -38,7 +38,7 @@ export interface NightgatePluginConfig {
         /**
          * Optional canonical deployed address(es) for this contract, advertised
          * in `GET /contract-manifest` so connector consumers can self-configure.
-         * NIGHTGATE does not require it — the deployed address is otherwise
+         * NIGHTGATE does not require it; the deployed address is otherwise
          * per-deployment and caller-supplied. Accept a single string or a list.
          */
         address?: string | string[];
@@ -53,18 +53,18 @@ export interface NightgatePluginConfig {
     /**
      * How an authenticated principal maps to the AttestationVault circuit's
      * `Bytes<32>` grantee id used to match on-chain disclosure grants at read
-     * time (Phase 0 of expose-disclosure-grants). Default 'wallet'.
+     * time. Default 'wallet'.
      *   - 'wallet': granteeId derived from the principal's coin public key.
      *   - 'did':    granteeId derived from a registered DID string.
      *   - 'custom': granteeId is an opaque 64-hex the consumer registers.
-     * The SAME derivation must be used by whoever issues the grant — see
+     * The SAME derivation must be used by whoever issues the grant; see
      * srv/submission/grantee-identity.ts.
      */
     granteeBinding?: GranteeBinding;
     /**
      * Whether `registerGranteeIdentity` may be called by any authenticated
-     * principal to bind their own granteeId. Default FALSE (secure; review_001
-     * P1): NIGHTGATE does NOT verify ownership of the binding input (wallet
+     * principal to bind their own granteeId. Default FALSE, the secure
+     * choice: NIGHTGATE does NOT verify ownership of the binding input (wallet
      * pubkey / DID), so a caller could register someone else's key and inherit
      * their on-chain grants. Enable ONLY in deployments that do not gate reads
      * on on-chain grants, or that add their own ownership proof; otherwise
@@ -74,7 +74,7 @@ export interface NightgatePluginConfig {
     allowSelfServiceGranteeRegistration?: boolean;
     /**
      * Per-network indexer endpoint overrides for the crawler-free state-verify
-     * surface's optional `network` parameter (verify-state-network-override FR).
+     * surface's optional `network` parameter.
      * Only consulted when a verify call overrides to a network OTHER than the
      * configured one; the configured network keeps using the top-level
      * `indexerHttpUrl`/`indexerWsUrl` + env vars. Networks not listed here fall
@@ -94,9 +94,8 @@ export interface NightgatePluginConfig {
  * `cds.env` is typed as a freeform object by CAP (it merges package.json,
  * .cdsrc, and env vars at runtime, so the shape is genuinely dynamic).
  * Rather than scattering `(cds.env as any).requires?.nightgate` across every
- * callsite — which we did before and got rightly called out for — the cast
- * lives ONCE here and every other site reads a properly typed
- * `NightgatePluginConfig` via this function.
+ * callsite, the cast lives ONCE here and every other site reads a properly
+ * typed `NightgatePluginConfig` via this function.
  */
 export function getNightgatePluginConfig(): NightgatePluginConfig {
     const env = cds.env as { requires?: { nightgate?: NightgatePluginConfig } };
@@ -119,9 +118,9 @@ export const DEFAULT_NODE_URLS: Partial<Record<NightgateNetwork, string>> = {
 };
 
 export const DEFAULT_INDEXER_URLS: Record<NightgateNetwork, { http: string; ws: string }> = {
-    // Preview is the active public dev chain (live since 2026-01-07). Public
-    // hosted indexer with permissive CORS — verified live against the connector
-    // demo. This is the network the browser wallet path targets by default.
+    // Preview is the active public dev chain. Public hosted indexer with
+    // permissive CORS. This is the network the browser wallet path targets
+    // by default.
     preview: {
         http: 'https://indexer.preview.midnight.network/api/v4/graphql',
         ws: 'wss://indexer.preview.midnight.network/api/v4/graphql/ws'
@@ -142,7 +141,7 @@ export const DEFAULT_INDEXER_URLS: Record<NightgateNetwork, { http: string; ws: 
     // `testnet` localhost convention (:8088). Verified against a live
     // `indexer-standalone:4.3.2`: it serves BOTH `/api/v3/graphql` and
     // `/api/v4/graphql` (HTTP 200), so v4 here is correct. Older images may
-    // differ — override via NIGHTGATE_INDEXER_HTTP_URL / NIGHTGATE_INDEXER_WS_URL
+    // differ; override via NIGHTGATE_INDEXER_HTTP_URL / NIGHTGATE_INDEXER_WS_URL
     // if your pinned indexer only exposes v3.
     undeployed: {
         http: 'http://127.0.0.1:8088/api/v4/graphql',
@@ -180,7 +179,7 @@ export function getConfiguredGranteeBinding(config?: Record<string, any>): Grant
 export function isSelfServiceGranteeRegistrationAllowed(config?: Record<string, any>): boolean {
     const raw = readEnv('NIGHTGATE_ALLOW_SELF_SERVICE_GRANTEE_REGISTRATION');
     if (raw != null) return !/^(false|0|no|off)$/i.test(raw);
-    // Secure default: OFF (review_001 P1). NIGHTGATE cannot verify ownership of
+    // Secure default: OFF. NIGHTGATE cannot verify ownership of
     // the binding input, so a caller could register another principal's key and
     // inherit their on-chain grants. Deployments that want self-service must
     // opt in explicitly (config flag or NIGHTGATE_ALLOW_SELF_SERVICE_GRANTEE_REGISTRATION).
@@ -212,7 +211,7 @@ export function getConfiguredNightgateCrawlerNodeUrl(config?: Record<string, any
 
 /**
  * The plugin counts as configured iff a network is selected (config or
- * NIGHTGATE_NETWORK) — without one, initialize() stays idle so we never
+ * NIGHTGATE_NETWORK); without one, initialize() stays idle so we never
  * auto-crawl a chain nobody chose. The legacy `kind: 'nightgate'` marker some
  * consumer configs carry is inert and simply ignored (it never enabled
  * anything: the old check reduced to exactly this predicate).
@@ -263,11 +262,11 @@ export function resolveSubmissionEndpoints(
 
 /**
  * Indexer endpoints for a state-verify `network` override that differs from the
- * configured network (verify-state-network-override FR). Pure per-network
+ * configured network. Pure per-network
  * resolution: `config.networks[<network>]` wins over the built-in public
  * defaults. Top-level config and `NIGHTGATE_INDEXER_*` env vars deliberately do
- * NOT apply here — they describe the CONFIGURED network only; applying them to
- * an override would silently point a preprod verify at a preview indexer.
+ * NOT apply here: they describe the CONFIGURED network only, and applying them
+ * to an override would silently point a preprod verify at a preview indexer.
  */
 export function resolveOverrideIndexerEndpoints(
     network: NightgateNetwork,

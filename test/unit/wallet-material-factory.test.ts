@@ -152,7 +152,7 @@ describe('buildWalletMaterialForSession', () => {
         })).rejects.toBeInstanceOf(SessionNotFoundError);
     });
 
-    test('scopes the session load to expectedUserId (review_001 P1)', async () => {
+    test('scopes the session load to expectedUserId', async () => {
         // Capture the query so we can confirm the WHERE is user-scoped; return
         // null so a foreign/absent match surfaces as SessionNotFoundError.
         let captured: any;

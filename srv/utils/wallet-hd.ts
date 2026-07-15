@@ -2,7 +2,7 @@
  * Midnight HD key derivation (matches Lace / the Midnight reference wallet).
  *
  * Lace derives each wallet key type from a SEPARATE BIP32 role of the BIP39
- * seed — NOT from the raw seed. Feeding the raw 32-byte seed into
+ * seed, NOT from the raw seed. Feeding the raw 32-byte seed into
  * `ZswapSecretKeys.fromSeed` lands on a different account than the user's Lace
  * wallet, so the facade sees an empty wallet and deploys fail with "could not
  * balance dust". This module reproduces Lace's derivation:
@@ -56,8 +56,7 @@ export function mnemonicToBip39SeedHex(mnemonic: string): string {
  *
  * `accountIndex` selects the BIP32 account level (default 0 = the account
  * every existing caller used implicitly, bit-identical to before). Non-zero
- * indices give multiple independent wallet accounts from one phrase
- * (FR derive-wallet-info).
+ * indices give multiple independent wallet accounts from one phrase.
  */
 export async function deriveRoleSeeds(bip39Seed: Uint8Array, accountIndex: number = ACCOUNT): Promise<RoleSeeds> {
     if (!Number.isInteger(accountIndex) || accountIndex < 0) {

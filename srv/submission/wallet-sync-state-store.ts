@@ -8,7 +8,7 @@
  *
  * Format: each blob is the SDK's `serializeState()` output, a JSON-ish text
  * string, encrypted via storage-encryption.ts (AES-256-GCM, same wire format
- * as PrivateStates.ciphertext). Strings stay as strings end-to-end — feeding
+ * as PrivateStates.ciphertext). Strings stay as strings end-to-end: feeding
  * a Uint8Array back into `restore(...)` makes the SDK's Effect/Either
  * deserializer fail with `Either.getOrThrow called on a Left`.
  *
@@ -72,7 +72,7 @@ export interface LoadedSyncState {
 }
 
 // ---- DB handle cache ------------------------------------------------------
-// Connect once and reuse — same pattern as `srv/crawler/Crawler.ts`. The
+// Connect once and reuse, same pattern as `srv/crawler/Crawler.ts`. The
 // handle is async-initialised lazily on first save/load.
 
 let dbPromise: Promise<cds.DatabaseService> | null = null;

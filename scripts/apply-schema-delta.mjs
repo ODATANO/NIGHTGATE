@@ -1,6 +1,6 @@
 // Additive schema migration for an EXISTING db/midnight.db.
 //
-// `cds deploy` recreates (drops) all tables — destructive, would wipe the
+// `cds deploy` recreates (drops) all tables: destructive, would wipe the
 // synced wallet/block state and force a multi-hour cold re-sync. This instead:
 //   - CREATE TABLE only when the table is ABSENT (existing data untouched)
 //   - ALTER TABLE ADD COLUMN for columns missing from an EXISTING table
@@ -52,7 +52,7 @@ function parseColumns(createStmt) {
     const cols = [];
     for (const raw of parts) {
         const p = raw.trim();
-        // Skip table-level constraints — only real columns can be ADD COLUMN'd.
+        // Skip table-level constraints; only real columns can be ADD COLUMN'd.
         if (/^(PRIMARY|FOREIGN|UNIQUE|CHECK|CONSTRAINT)\b/i.test(p)) continue;
         const m = p.match(/^("?)(\w+)\1\s+/);
         if (m) cols.push({ name: m[2], def: p });

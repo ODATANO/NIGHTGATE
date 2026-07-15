@@ -1,20 +1,20 @@
 /**
- * Grantee-identity binding (Phase 0 of expose-disclosure-grants).
+ * Grantee-identity binding.
  *
  * The AttestationVault circuit keys disclosure grants by a 32-byte `grantee`.
  * To gate reads on an on-chain grant, NIGHTGATE must turn the authenticated
  * principal (`req.user.id`) into that same 32 bytes. This module owns:
  *
- *   1. `deriveGranteeId(kind, input)` — the canonical derivation. THE SAME
+ *   1. `deriveGranteeId(kind, input)`: the canonical derivation. THE SAME
  *      function (or its documented scheme) must be used by whoever issues the
  *      grant, or the write-side id and the read-side id won't match.
- *   2. `resolveGranteeId(req, db, opts)` — look up the principal's registered
+ *   2. `resolveGranteeId(req, db, opts)`: look up the principal's registered
  *      granteeId from the `GranteeIdentities` table (scope precedence mirrors
  *      the disclosure-role middleware: a scoped row wins over a global one).
  *
  * Binding kind is per-deployment (`cds.requires.nightgate.granteeBinding`,
  * default 'wallet'). The principal→grantee *policy* (proving DID/wallet
- * ownership before a row is written) is the consumer's to own — NIGHTGATE
+ * ownership before a row is written) is the consumer's to own; NIGHTGATE
  * provides the table, derivation, and resolver, not the proofing.
  */
 import cds from '@sap/cds';
@@ -29,7 +29,7 @@ const HEX64_RE = /^[0-9a-fA-F]{64}$/;
 
 /**
  * Canonical derivation of a 64-hex grantee id from a binding input.
- *   - 'custom': `input` IS the 64-hex id (validated, lower-cased) — passthrough.
+ *   - 'custom': `input` IS the 64-hex id (validated, lower-cased); passthrough.
  *   - 'wallet': `input` is the coin public key hex; id = sha256(pubkey bytes).
  *   - 'did':    `input` is the DID string; id = sha256(utf8(did)).
  * sha256 is used (already a dependency) purely as a stable 32-byte digest; the

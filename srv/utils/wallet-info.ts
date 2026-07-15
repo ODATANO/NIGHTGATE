@@ -1,5 +1,5 @@
 /**
- * Programmatic wallet identity derivation (FR derive-wallet-info).
+ * Programmatic wallet identity derivation.
  *
  * Pure function of the secret input: derives the connectable identity of a
  * wallet WITHOUT creating a session or persisting anything. Consumers use the

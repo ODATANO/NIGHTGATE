@@ -14,9 +14,9 @@
  * empty for you".
  *
  * TODO: Row-level visibility (e.g. "show me only attestations I have an on-chain
- * disclosure for") is deliberately out of scope for v1 — that requires
+ * disclosure for") is deliberately out of scope here: that requires
  * indexing the AttestationVault `disclosures` Map into NIGHTGATE and
- * joining at query time. Filed as future work.
+ * joining at query time.
  */
 import type cds from '@sap/cds';
 import {
@@ -72,7 +72,7 @@ function makeTierGate(tier: AttestationTier) {
  * output is consumed unchanged.
  *
  * On-chain-verified model: the proof is not standalone-verifiable with just a
- * VK `proofValue` is therefore the `provePredicate` transaction hash
+ * VK. `proofValue` is therefore the `provePredicate` transaction hash.
  */
 export interface PredicateAttestationEnvelope {
     digestMultibase: string | null;

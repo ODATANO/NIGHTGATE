@@ -2,7 +2,7 @@
 //
 // Use this for the wallet cold-sync (or any long-running submission flow).
 // Unlike `cds watch` (scripts/dev.mjs), cds-serve does NOT restart when the
-// SQLite DB grows on disk — important once the wallet sync starts writing
+// SQLite DB grows on disk, which matters once the wallet sync starts writing
 // 100s of MB of shielded-state into midnight.db.
 //
 // NODE_OPTIONS has to be set before Node starts; .env can't do this because

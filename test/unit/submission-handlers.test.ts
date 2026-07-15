@@ -8,19 +8,19 @@
  *
  * Phase 2b: the submitter dispatches deploy/call via the wallet worker. These
  * tests still use a fake `TransactionSubmitter` via the `submitterFactory`
- * seam — handlers don't know about the worker at all.
+ * seam; handlers don't know about the worker at all.
  */
 
 import type { Mock } from 'vitest';
-// Phase 3 (0.2.0 async-job migration): handlers now wrap the submitter call
+// Async-job migration: handlers now wrap the submitter call
 // in startJob and return `{ jobId, status }` instead of awaiting the SDK
 // round-trip directly. The stub here invokes `work` synchronously so the
 // existing assertions about `submitter.deploy` / `submitter.call` argument
 // shape still hold; tests that need to assert sync return shape have been
 // updated to expect the new { jobId, status, … } payload.
 const mockStartJob = vi.hoisted(() => (vi.fn(async (args: any) => {
-    // Drive the work fn immediately so submitter.deploy/.call is exercised
-    // — keeps the per-call args + registration meta assertions meaningful.
+    // Drive the work fn immediately so submitter.deploy/.call is exercised;
+    // keeps the per-call args + registration meta assertions meaningful.
     try { await args.work(); } catch { /* failures are absorbed into the job row in prod; tests assert via mock call inspection */ }
     return { jobId: `job-${args.kind}-test`, status: 'pending' as const };
 })));
@@ -159,7 +159,7 @@ describe('submitContractCall: argument validation', () => {
         expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/JSON/));
     });
 
-    test('rejects non-JSON initialPrivateState (v0.6.9 multi-caller seeding)', async () => {
+    test('rejects non-JSON initialPrivateState (multi-caller seeding)', async () => {
         const req = await setupAndCallSubmit({ ...VALID_CALL_ARGS, initialPrivateState: '{broken' });
         expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/initialPrivateState must be valid JSON/));
     });
@@ -193,7 +193,7 @@ describe('error translation to OData status codes', () => {
             status: 'pending'
         });
         // The mock startJob invokes work() immediately, so submitter.deploy
-        // has been called by the time we get here — keeps the existing
+        // has been called by the time we get here; keeps the existing
         // "deploy forwards registration meta" assertions valid.
         expect(submitter.deploy).toHaveBeenCalledTimes(1);
     });
@@ -256,7 +256,7 @@ describe('error translation to OData status codes', () => {
         expect(req.reject).toHaveBeenCalledWith(501, expect.stringMatching(/Wallet material unavailable/));
     });
 
-    // Phase 3 (0.2.0): SubmissionError no longer surfaces via OData. It now
+    // SubmissionError no longer surfaces via OData. It now
     // lives inside the work fn, which startJob captures into
     // BackgroundJobs.{errorCode,errorMessage} for the caller to retrieve via
     // getJobStatus. The OData response for the action is still
@@ -416,7 +416,7 @@ describe('anchorDocument', () => {
         });
         expect(result.documentId.length).toBeGreaterThan(0);
 
-        // INSERT (sync, on req.tx) + UPDATE (inside work fn — exercised by
+        // INSERT (sync, on req.tx) + UPDATE (inside work fn, exercised by
         // the startJob mock invoking work eagerly) = 2 db.run calls.
         expect(db.run).toHaveBeenCalledTimes(2);
 
@@ -470,7 +470,7 @@ describe('anchorDocument', () => {
         const result: any = await srv.handlers['anchorDocument'](req);
         // INSERT ran (1), UPDATE did NOT (work threw before reaching it)
         expect(db.run).toHaveBeenCalledTimes(1);
-        // The handler still returns successfully — failure is in the job row.
+        // The handler still returns successfully; failure is in the job row.
         expect(req.reject).not.toHaveBeenCalled();
         expect(result).toMatchObject({ jobId: expect.any(String), status: 'pending' });
     });
@@ -568,7 +568,7 @@ describe('verifyDocument', () => {
         const result: any = await srv.handlers['verifyDocument'](req);
         expect(result.verified).toBe(false);
         expect(result.originalSha256).toBe(VALID_SHA);
-        // Skips the tx lookup when hash mismatched — only 1 db.run, not 3.
+        // Skips the tx lookup when hash mismatched: only 1 db.run, not 3.
         // (We can't easily assert call count without exposing the db here,
         //  but the result coming back is enough proof the short-circuit fired.)
     });
@@ -768,7 +768,7 @@ describe('issuePredicateAttestation', () => {
         });
         const req = makeReq(VALID_ARGS());
         const result: any = await srv.handlers['issuePredicateAttestation'](req);
-        // INSERT only — UPDATE never reached.
+        // INSERT only; UPDATE never reached.
         expect(db.run).toHaveBeenCalledTimes(1);
         expect(req.reject).not.toHaveBeenCalled();
         expect(result).toMatchObject({ jobId: expect.any(String), status: 'pending' });
@@ -1137,7 +1137,7 @@ describe('registerGranteeIdentity', () => {
     // No nightgate config in tests → binding defaults to 'wallet' (input = hex).
     const PUBKEY = '11'.repeat(32);
 
-    // Self-service registration now defaults OFF (review_001 P1). Opt in for the
+    // Self-service registration defaults OFF (secure default). Opt in for the
     // cases that exercise the registration path; the "403 disabled" case sets
     // 'false' explicitly.
     beforeEach(() => { process.env.NIGHTGATE_ALLOW_SELF_SERVICE_GRANTEE_REGISTRATION = 'true'; });
@@ -1461,7 +1461,7 @@ describe('submitContractCall: Bytes/Uint arg coercion reaches the submitter', ()
     });
 });
 
-// ---- issueFieldPredicateAttestation (field-bound ZK predicate, 0.4.3) ------
+// ---- issueFieldPredicateAttestation (field-bound ZK predicate) -------------
 
 describe('issueFieldPredicateAttestation', () => {
     const VALID_PAYLOAD = 'a'.repeat(64);
@@ -1565,7 +1565,7 @@ describe('issueFieldPredicateAttestation', () => {
         expect(anchor.merkleProof).toBeUndefined();
 
         expect(prove.circuit).toBe('proveFieldPredicate');
-        // args: payloadHash, fieldKey, threshold, op — NEVER the field value.
+        // args: payloadHash, fieldKey, threshold, op. NEVER the field value.
         expect(prove.args).toHaveLength(4);
         expect(prove.args[2]).toBe(50000n);
         expect(prove.args[3]).toBe(0n);

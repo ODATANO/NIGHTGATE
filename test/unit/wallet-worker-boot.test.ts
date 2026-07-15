@@ -1,7 +1,7 @@
 /**
  * Boot guard of srv/midnight/wallet-worker.ts: the module must refuse to load
  * outside a worker_threads worker (no parentPort). Lives in its own file
- * because the guard throws during module evaluation — the dispatch suite
+ * because the guard throws during module evaluation, and the dispatch suite
  * (wallet-worker-dispatch.test.ts) needs the module to LOAD.
  */
 

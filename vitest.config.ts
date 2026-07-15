@@ -38,7 +38,7 @@ export default defineConfig({
             reportsDirectory: 'coverage',
             // BOTH the .ts sources (vitest-graph imports) AND the in-place
             // compiled .js twins: cds.test() boots the services through Node's
-            // native require, so their execution is only visible on the .js —
+            // native require, so their execution is only visible on the .js;
             // the v8 provider remaps it onto the .ts via the build sourcemaps.
             // Without the .js entries every handler exercised through the
             // booted server counts as uncovered (the numbers drop ~6 points).

@@ -31,7 +31,7 @@ export async function applySqliteTuning(db: any): Promise<void> {
     for (const [name, value] of pragmas) {
         try {
             // CAP's db.pragma() may be sync (raw better-sqlite3) or async
-            // (CAP-wrapped). `await` works on both — promise resolves; raw
+            // (CAP-wrapped). `await` works on both: a promise resolves; a raw
             // value is awaited harmlessly.
             await db.pragma(`${name} = ${value}`);
         } catch (err) {

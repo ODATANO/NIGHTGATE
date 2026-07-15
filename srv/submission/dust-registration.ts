@@ -8,7 +8,7 @@
  *
  * Implementation: a single RPC to the wallet worker (`walletRegisterDustGeneration`).
  * The worker owns the wallet SDK and runs the entire flow in its own event
- * loop — waitForSyncedState → filter unregistered NIGHT UTXOs → build the
+ * loop: waitForSyncedState → filter unregistered NIGHT UTXOs → build the
  * registration recipe → finalizeRecipe (ZK proof via proof-server) → submit.
  * No SDK objects ever cross the thread boundary.
  *
@@ -69,7 +69,7 @@ export interface DeregisterDustGenerationArgs {
     cacheKey: string;
     /**
      * Max wait for sync. Default: undefined (wait indefinitely). Production
-     * callers should pass a positive bound — pre-warm runs separately, the
+     * callers should pass a positive bound; pre-warm runs separately, the
      * deregister handler should not block longer than a few seconds once the
      * facade is healthy.
      */

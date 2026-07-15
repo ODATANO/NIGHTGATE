@@ -121,7 +121,7 @@ vi.mock('@sap/cds', () => {
         }))
     };
 
-    // db.tx(fn) → just call fn with db (fresh "transaction" semantics — for the
+    // db.tx(fn) → just call fn with db (fresh "transaction" semantics; for the
     // helper, the tx wrapper is purely a context-isolation device, so the mock
     // can collapse it to a passthrough).
     const dbHandle: any = {
@@ -133,7 +133,7 @@ vi.mock('@sap/cds', () => {
         ql: { SELECT, INSERT, UPDATE },
         connect: { to: vi.fn(async () => dbHandle) },
         env: { requires: {} },
-        // Passthrough — the real cds._with runs fn under a cleared
+        // Passthrough: the real cds._with runs fn under a cleared
         // AsyncLocalStorage store; for the mock we just invoke it.
         _with: (_ctx: any, fn: any) => fn(),
         spawn: vi.fn((_opts: any, fn: any) => {
@@ -151,7 +151,7 @@ vi.mock('../../srv/utils/nightgate-config', () => ({
     getNightgatePluginConfig:      vi.fn(() => ({}))
 }));
 
-// classifySubmissionError is the real implementation — it doesn't touch
+// classifySubmissionError is the real implementation; it doesn't touch
 // modules we'd need to stub. Verified by importing it without further mocks.
 
 import {
@@ -176,7 +176,7 @@ beforeEach(() => {
 
 // ---- startJob: insert + spawn + transitions --------------------------------
 
-describe('startJob — insert row + return jobId', () => {
+describe('startJob: insert row + return jobId', () => {
     test('returns { jobId, status: "pending" } and inserts a row before spawn runs', async () => {
         const work = vi.fn(async () => ({ txId: 'tx-123' }));
 
@@ -195,7 +195,7 @@ describe('startJob — insert row + return jobId', () => {
         expect(row.kind).toBe('sendNight');
         expect(row.sessionId).toBe('sess-1');
         expect(row.request).toBe(JSON.stringify({ receiverAddress: 'addr', amount: '100' }));
-        // Work has NOT started yet — spawn dispatches via setImmediate.
+        // Work has NOT started yet; spawn dispatches via setImmediate.
         expect(work).not.toHaveBeenCalled();
     });
 
@@ -283,7 +283,7 @@ describe('startJob — insert row + return jobId', () => {
 
 // ---- Idempotency -----------------------------------------------------------
 
-describe('startJob — idempotency', () => {
+describe('startJob: idempotency', () => {
     test('reusing an idempotencyKey on a succeeded job returns the same jobId + result', async () => {
         const work1 = vi.fn(async () => ({ txId: 'tx-AAA' }));
         const first = await startJob({
@@ -322,7 +322,7 @@ describe('startJob — idempotency', () => {
             work:           work1
         });
         await flushSpawn();
-        // work1 has started but not resolved — row should be 'running'
+        // work1 has started but not resolved, so the row should be 'running'
         expect(rows.get(first.jobId)?.status).toBe('running');
 
         const work2 = vi.fn(async () => ({ should: 'not be called' }));
@@ -388,7 +388,7 @@ describe('startJob — idempotency', () => {
 
 // ---- Concurrency / semaphore ----------------------------------------------
 
-describe('startJob — per-kind semaphore', () => {
+describe('startJob: per-kind semaphore', () => {
     test('heavy kind: jobs beyond the cap of 4 are queued, not run in parallel', async () => {
         const releaseGates: Array<() => void> = [];
         const inFlight = { count: 0, peak: 0 };

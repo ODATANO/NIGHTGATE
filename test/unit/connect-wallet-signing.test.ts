@@ -6,8 +6,8 @@
  *
  * The handler kicks off `getOrBuildWalletFacade(...)` as a fire-and-forget
  * Promise to pre-warm the wallet. We mock that here so the unawaited chain
- * resolves synchronously instead of touching the worker RPC + CAP model load
- * — those held handles open past test completion and triggered "worker
+ * resolves synchronously instead of touching the worker RPC + CAP model load.
+ * Those held handles open past test completion and triggered "worker
  * failed to exit gracefully" warnings on Jest's worker pool teardown.
  */
 
@@ -55,7 +55,7 @@ function makeReq(data: Record<string, unknown>, ip?: string) {
     return {
         data,
         _: { req: { ip: clientIp } },
-        // Sessions are user-bound (review_001 P1); handlers read req.user.id.
+        // Sessions are user-bound; handlers read req.user.id.
         user: { id: TEST_USER_ID },
         reject: vi.fn((status: number, message: string) => {
             const err: any = new Error(message);
@@ -260,7 +260,7 @@ describe('connectWalletForSigning: state transitions', () => {
         expect(req.reject).toHaveBeenCalledWith(410, expect.stringMatching(/expired/i));
     });
 
-    test('404 for a foreign principal — sessions are user-bound (review_001 P1)', async () => {
+    test('404 for a foreign principal: sessions are user-bound', async () => {
         const srv = makeFakeService();
         const db = makeFakeDb();
         seedSession(db); // owned by TEST_USER_ID

@@ -4,13 +4,13 @@
  * wallet-sessions.test.ts covers the happy paths; this file covers the
  * rejection ladders that were uncovered until the coverage review:
  *   - the deriveWalletInfo HANDLER (rate limit, auth, validation, and the
- *     "error paths never echo the secret" guarantee — the util itself is
+ *     "error paths never echo the secret" guarantee; the util itself is
  *     covered in wallet-info.test.ts)
  *   - the shared per-action guards on sendNight / unshieldFunds / shieldFunds
  *     (mainnet gate, 401/429, sessionId+amount+ttl validation, session ladder
  *     404/404/412/410, decrypt failure 500)
  *   - the diagnostics handlers' guards + 500 wrapping
- *   - the TTL-cleanup facade-eviction loop (review_001 P2)
+ *   - the TTL-cleanup facade-eviction loop
  *
  * Same stub-service scaffold as wallet-sessions.test.ts.
  */
@@ -391,7 +391,7 @@ describe('wallet session guard branches', () => {
     });
 
     // ------------------------------------------------------------------
-    // TTL cleanup: forced expiry must evict cached facades (review_001 P2)
+    // TTL cleanup: forced expiry must evict cached facades
     // ------------------------------------------------------------------
 
     describe('startSessionCleanup facade eviction', () => {
@@ -400,7 +400,7 @@ describe('wallet session guard branches', () => {
             const encKey = getEncryptionKey();
             const db = {
                 run: vi.fn()
-                    // 1st call: SELECT expiring rows — one decryptable, one
+                    // 1st call: SELECT expiring rows; one decryptable, one
                     // undecryptable (best-effort: must not abort the sweep),
                     // one already-nulled key.
                     .mockResolvedValueOnce([

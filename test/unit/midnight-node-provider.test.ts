@@ -430,7 +430,7 @@ describe('MidnightNodeProvider rpcBatch', () => {
         expect(frame).toHaveLength(2);
         expect(frame[0]).toMatchObject({ jsonrpc: '2.0', method: 'chain_getBlockHash', params: [10] });
 
-        // Reply as a JSON-RPC 2.0 BATCH response, deliberately out of order —
+        // Reply as a JSON-RPC 2.0 BATCH response, deliberately out of order;
         // results must still come back in request order (matched by id).
         socket.emit('message', JSON.stringify([
             { jsonrpc: '2.0', id: frame[1].id, result: '0xhash11' },

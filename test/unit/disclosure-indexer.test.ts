@@ -2,7 +2,7 @@
  * Tests for srv/submission/disclosure-indexer.ts.
  *
  * Exercises the decode/enumerate logic and the reindex upsert+sweep against a
- * FAKE `ledger()`-shaped object — crucially one whose outer `disclosures` map
+ * FAKE `ledger()`-shaped object, crucially one whose outer `disclosures` map
  * is NOT iterable (only member/lookup), mirroring the real compiled artifact
  * (proven in scripts/spike-disclosure-indexer.mjs). No SDK, no chain.
  */
@@ -39,7 +39,7 @@ function makeLedger(
                 ownerKeys.map(f => [b(f), b(0)] as [Uint8Array, Uint8Array])[Symbol.iterator]()
         },
         disclosures: {
-            // NO Symbol.iterator on purpose — matches the real artifact.
+            // NO Symbol.iterator on purpose; matches the real artifact.
             member: (k: Uint8Array) => (grants[ownerKeys.find(f => hx(b(f)) === hx(k))!] ?? []).length >= 0
                 && ownerKeys.some(f => hx(b(f)) === hx(k) && (grants[f]?.length ?? 0) > 0),
             lookup: (k: Uint8Array) => {

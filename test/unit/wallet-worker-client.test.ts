@@ -250,7 +250,7 @@ describe('wallet-worker-client', () => {
             const pmSpy = vi.spyOn(w, 'postMessage');
 
             w.emit('message', { kind: 'state-save', sessionId: 's1', sdkVersion: 'v', seq: 7, blobs: {} });
-            // v0.6.6: the sink runs on a microtask (its result gates the ack).
+            // The sink runs on a microtask (its result gates the ack).
             await new Promise(r => setImmediate(r));
             expect(sink).toHaveBeenCalledWith(expect.objectContaining({ sessionId: 's1', seq: 7 }));
             expect(pmSpy).toHaveBeenCalledWith({ kind: 'state-save-ack', sessionId: 's1', seq: 7 });

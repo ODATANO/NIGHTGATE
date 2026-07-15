@@ -754,7 +754,7 @@ export class BlockProcessor {
 
         await tx.run(
             UPDATE.entity(NightBalances).set({
-                // Decimal(20,0) columns carrying u128 amounts as strings — see INSERT above.
+                // Decimal(20,0) columns carrying u128 amounts as strings, see INSERT above.
                 balance: nextBalance.toString() as any,
                 utxoCount: nextUtxoCount,
                 txSentCount: currentSentCount + params.txSentDelta,

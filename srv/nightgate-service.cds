@@ -179,7 +179,7 @@ service NightgateService {
     /**
      * Anchor a document's content hash on-chain via the AttestationVault
      * `attest` circuit. The caller is responsible for placing the actual
-     * bytes at `storageRef` (e.g. file://, s3://, ipfs://) — this action
+     * bytes at `storageRef` (e.g. file://, s3://, ipfs://); this action
      * commits only the hash + public metadata to the chain.
      *
      * `sha256` is a 64-char hex string of the file content (becomes
@@ -212,7 +212,7 @@ service NightgateService {
 
     /**
      * Verify that a document's content hash matches what was anchored on chain.
-     * Returns a deterministic yes/no answer — invalid inputs reject
+     * Returns a deterministic yes/no answer: invalid inputs reject
      * with 400/404, but a hash-mismatch on a known doc returns
      * `verified: false` rather than erroring, so calling UIs can render
      * "tampered" without status-code juggling.
@@ -225,7 +225,7 @@ service NightgateService {
      *
      * Crawler-free fallback: when the local `Transactions` lookup finds nothing
      * (crawler disabled or lagging) and `contractAddress` is supplied, the
-     * on-chain effect is confirmed directly against live contract state — the
+     * on-chain effect is confirmed directly against live contract state; the
      * document's `sha256` (its on-chain `payload_hash`) must be present in the
      * AttestationVault attestation map. The public `verified` contract is
      * unchanged; only the evidence source is extended. `compiledArtifactRef`
@@ -294,7 +294,7 @@ service NightgateService {
      * Field-bound predicate proof (hardened model). Like
      * `issuePredicateAttestation`, but the proven value is cryptographically
      * bound to a SPECIFIC passport field via Merkle inclusion against an
-     * anchored content root — so a verifier knows the value came from THIS
+     * anchored content root, so a verifier knows the value came from THIS
      * passport's `field_key`, not an arbitrary committed number.
      *
      * The caller (e.g. NIGHTPASS) builds the content root + inclusion path
@@ -309,7 +309,7 @@ service NightgateService {
      */
     action issueFieldPredicateAttestation(
         payloadHash:         String,       // attestation payload_hash (64 hex)
-        fieldKey:            String,       // 64 hex — canonical field id (public)
+        fieldKey:            String,       // 64 hex canonical field id (public)
         value:               String,       // scaled integer, decimal string (witness only)
         contentRoot:         String,       // optional 64-hex Merkle root to anchor first
         siblingsJson:        String,       // JSON array of 4 × 64-hex sibling digests
@@ -337,7 +337,7 @@ service NightgateService {
      *
      * Crawler-free fallback: when the local `Transactions` lookup finds nothing
      * (crawler disabled or lagging), the result is confirmed directly against
-     * live contract state — the claim key is recomputed from the row and looked
+     * live contract state; the claim key is recomputed from the row and looked
      * up in the vault's result map. No txHash and no crawler required. Plain
      * proofs use `persistentHash(PredicateClaim{payloadHash, threshold, op})`
      * against `predicate_results`; field-bound rows (with a `fieldKey`) use
@@ -365,11 +365,11 @@ service NightgateService {
      * `payloadHash`, so it needs no crawler and no enumeration.
      *
      * Returns `verified: false` (not an error) for an absent attestation, and a
-     * clean negative (not a 5xx) when no live provider is configured — mirroring
+     * clean negative (not a 5xx) when no live provider is configured, mirroring
      * `verifyDocument`. `compiledArtifactRef` defaults to 'attestation-vault'.
      *
      * `network` (optional) reads the state from ANOTHER network's public
-     * indexer instead of the configured one — the read is stateless and
+     * indexer instead of the configured one; the read is stateless and
      * wallet-free, so a preview-configured server can verify a preprod anchor.
      * Omitted or equal to the configured network keeps today's behavior
      * exactly (env/config endpoint overrides win); an unknown value is a 400.
@@ -392,7 +392,7 @@ service NightgateService {
     /**
      * Verify a predicate proof directly against LIVE contract state
      * (`queryContractState`), independent of the block crawler, of any txHash,
-     * and of any server-side PredicateAttestations row — the id-free counterpart
+     * and of any server-side PredicateAttestations row: the id-free counterpart
      * to `verifyPredicateAttestation` for WALLET-submitted proofs (browser signs,
      * NIGHTGATE never saw a jobId). Recomputes the on-chain claim key off-chain
      * from the supplied coordinates and confirms the vault recorded a true
@@ -405,7 +405,7 @@ service NightgateService {
      *
      * Returns `verified: false` (not an error) for an absent result, and a
      * clean negative (not a 5xx) when no live provider is configured or the
-     * contract is unknown — mirroring `verifyAttestationState`.
+     * contract is unknown, mirroring `verifyAttestationState`.
      * `compiledArtifactRef` defaults to 'attestation-vault'.
      *
      * `network` (optional) behaves exactly as on `verifyAttestationState`:
@@ -427,7 +427,7 @@ service NightgateService {
     /**
      * Chain-derived disclosure grants, read off the AttestationVault
      * `disclosures` ledger Map by the chain indexer. Distinct from the
-     * off-chain `DisclosureRoles` table — these are the tamper-evident,
+     * off-chain `DisclosureRoles` table; these are the tamper-evident,
      * attester-controlled on-chain ACL. `level`: 0=public, 1=legitimate-
      * interest, 2=authority. `active` is true while the grant is present
      * on-chain (granted and not revoked).
@@ -470,8 +470,8 @@ service NightgateService {
      * `compiledArtifactRef` defaults to 'attestation-vault'.
      */
     action grantDisclosure(
-        payloadHash:         String,   // 64 hex — the attestation
-        grantee:             String,   // 64 hex — Bytes<32> grantee identifier
+        payloadHash:         String,   // 64 hex, the attestation
+        grantee:             String,   // 64 hex Bytes<32> grantee identifier
         level:               Integer,  // 0 | 1 | 2
         sessionId:           UUID,
         contractAddress:     String,   // AttestationVault deployment
@@ -490,8 +490,8 @@ service NightgateService {
      * carries `{ payloadHash, grantee, txHash }`.
      */
     action revokeDisclosure(
-        payloadHash:         String,   // 64 hex — the attestation
-        grantee:             String,   // 64 hex — Bytes<32> grantee identifier
+        payloadHash:         String,   // 64 hex, the attestation
+        grantee:             String,   // 64 hex Bytes<32> grantee identifier
         sessionId:           UUID,
         contractAddress:     String,   // AttestationVault deployment
         compiledArtifactRef: String,   // optional, defaults to 'attestation-vault'
@@ -517,7 +517,7 @@ service NightgateService {
      *   - 'did':    `bindingInput` = a DID string
      *   - 'custom': `bindingInput` = the 64-hex grantee id itself
      * `scope` optionally restricts the binding to one contract/attestation;
-     * omit for a global binding. Idempotent on (userId, scope) — re-registering
+     * omit for a global binding. Idempotent on (userId, scope); re-registering
      * updates the existing row. Requires authentication (401 otherwise).
      */
     action registerGranteeIdentity(
@@ -536,8 +536,8 @@ service NightgateService {
      * Async: returns `{ jobId, status }` immediately. Poll
      * `getJobStatus(jobId, sessionId)`; on success the `result` field carries
      * the original return shape `{ submissionId, txHash, contractAddress,
-     * status }` (status here is the PendingSubmissions lifecycle status —
-     * `included` / `finalized` / `failed` — distinct from the job status).
+     * status }` (status here is the PendingSubmissions lifecycle status,
+     * `included` / `finalized` / `failed`, distinct from the job status).
      */
     action deployContract(
         compiledArtifactRef: String,
@@ -612,13 +612,13 @@ service NightgateService {
      * Stores the BIP39 seed encrypted at rest (AES-256-GCM via ENCRYPTION_KEY).
      * Required before deployContract/submitContractCall flows can balance/submit.
      *
-     * Provide the wallet's BIP39 `mnemonic` (the Lace recovery phrase) — the
+     * Provide the wallet's BIP39 `mnemonic` (the Lace recovery phrase); the
      * server derives the per-role HD keys exactly as Lace does (see
      * srv/utils/wallet-hd.ts). `seedHex` is an optional programmatic
      * alternative: the raw 64-byte BIP39 seed as 128 hex chars (NOT a 32-byte
      * key). One of `mnemonic` or `seedHex` is required.
      *
-     * The session UPDATE happens synchronously — `signingEnabled: true` is
+     * The session UPDATE happens synchronously; `signingEnabled: true` is
      * returned as soon as the encrypted seed is persisted, so callers can
      * proceed to other signing-capable actions immediately.
      *
@@ -626,7 +626,7 @@ service NightgateService {
      * deployContract / submitContractCall after a fresh seed pays a multi-
      * hour cold-sync cost unless this pre-warm has finished. Poll
      * `getJobStatus(prewarmJobId, sessionId)` to know when the wallet is
-     * ready. Failing to wait is fine — subsequent actions just block on the
+     * ready. Failing to wait is fine; subsequent actions just block on the
      * same sync internally.
      */
     action connectWalletForSigning(
@@ -643,7 +643,7 @@ service NightgateService {
 
     /**
      * Derive a wallet's connectable identity from its secret, WITHOUT creating
-     * a session or persisting anything (FR derive-wallet-info). Pure function
+     * a session or persisting anything. Pure function
      * of the input; the mnemonic/seed is never stored or logged.
      *
      * Removes the last Lace dependency from programmatic wallet creation:
@@ -677,8 +677,8 @@ service NightgateService {
      *
      * Async: returns `{ jobId, status }` immediately. Poll
      * `getJobStatus(jobId, sessionId)` for the final result, which (on
-     * success) carries the original shape — `{ txId, registeredCount,
-     * totalNightUtxos, dustReceiverAddress }` — as JSON in `result`.
+     * success) carries the original shape `{ txId, registeredCount,
+     * totalNightUtxos, dustReceiverAddress }` as JSON in `result`.
      *
      * `idempotencyKey` (optional) lets retries on a flaky network dedupe
      * against the original job; reusing a key returns the existing jobId.
@@ -697,7 +697,7 @@ service NightgateService {
      * registered NIGHT UTXOs from dust generation, making them spendable
      * again. Per-UTXO narrowing is not exposed yet.
      *
-     * Async — same `{ jobId, status }` contract as `registerForDustGeneration`.
+     * Async: same `{ jobId, status }` contract as `registerForDustGeneration`.
      * On success the `result` field of `getJobStatus` carries
      * `{ txId, deregisteredCount, totalNightUtxos }`.
      */
@@ -740,7 +740,7 @@ service NightgateService {
      * Cross-ledger conversion is via the SDK's `initSwap` primitive: same
      * NIGHT amount appears on both sides, just shifts ledgers.
      *
-     * Async — `{ jobId, status }`. `result` carries
+     * Async: `{ jobId, status }`. `result` carries
      * `{ txId, amount, unshieldedReceiverAddress }`.
      */
     action unshieldFunds(
@@ -757,7 +757,7 @@ service NightgateService {
      * Symmetric counterpart to `unshieldFunds`. Move the wallet's own NIGHT
      * from unshielded → shielded ledger via `initSwap`.
      *
-     * Async — `{ jobId, status }`. `result` carries
+     * Async: `{ jobId, status }`. `result` carries
      * `{ txId, amount, shieldedReceiverAddress }`.
      */
     action shieldFunds(
@@ -771,7 +771,7 @@ service NightgateService {
     };
 
     // ========================================================================
-    // Diagnostics — read-only pre-flight UX
+    // Diagnostics: read-only pre-flight UX
     // ========================================================================
 
     /**
@@ -835,12 +835,12 @@ service NightgateService {
     };
 
     // ========================================================================
-    // Background Jobs (async submission lifecycle, 0.3.0)
+    // Background Jobs (async submission lifecycle)
     // ========================================================================
 
     /**
      * Look up the status and result of a job submitted via one of the
-     * async-migrated actions (`registerForDustGeneration`, `sendNight`,
+     * async actions (`registerForDustGeneration`, `sendNight`,
      * `deployContract`, ...). Callers poll this until `status` reaches
      * `'succeeded'` or `'failed'`.
      *
@@ -855,7 +855,7 @@ service NightgateService {
      *
      * Declared as `action` (HTTP POST) rather than `function` (HTTP GET) so
      * clients can polling-loop with the same POST + JSON-body pattern they
-     * already use for every other 0.3.0 async action. Side-effect free
+     * already use for every other async action. Side-effect free
      * despite the verb.
      */
     action getJobStatus(

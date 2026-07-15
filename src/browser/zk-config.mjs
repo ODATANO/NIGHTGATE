@@ -1,5 +1,5 @@
 // Browser ZK-config provider that fetches prover/verifier keys + zkir over HTTP
-// from NIGHTGATE's `/zk-config/<contract>` route (Phase 2). Mirrors the layout
+// from NIGHTGATE's `/zk-config/<contract>` route. Mirrors the layout
 // the server-side NodeZkConfigProvider reads:
 //   keys/<circuitId>.prover, keys/<circuitId>.verifier, zkir/<circuitId>.bzkir
 //

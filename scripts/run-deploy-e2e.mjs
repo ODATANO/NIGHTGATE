@@ -4,7 +4,7 @@
 // → registerForDustGeneration (poll) → wait → deployContract (poll) against
 // a running NIGHTGATE instance.
 //
-// 0.2.0 async-job migration: registerForDustGeneration and deployContract now
+// Async-job model: registerForDustGeneration and deployContract
 // return `{ jobId, status }` immediately. The actual result (txHash,
 // registeredCount, contractAddress, ...) is fetched via getJobStatus polling.
 // `pollJob` below handles that.
@@ -16,8 +16,8 @@
 //                                  the server HD-derives per-role keys from it
 //   DEPLOY_E2E_DUST_WAIT_SECONDS   default 90, how long to wait after registration
 //   DEPLOY_E2E_SKIP_DUST_REG       set to 1 if DUST already registered in a prior run
-//   E2E_PREWARM_TIMEOUT_MIN        default 240 (4h) — cold sync upper bound
-//   E2E_JOB_POLL_INTERVAL_MS       default 5000 — getJobStatus poll cadence
+//   E2E_PREWARM_TIMEOUT_MIN        default 240 (4h), cold sync upper bound
+//   E2E_JOB_POLL_INTERVAL_MS       default 5000, getJobStatus poll cadence
 //
 // Run:
 //   LACE_VIEWING_KEY="..." LACE_MNEMONIC="word1 word2 ..." node scripts/run-deploy-e2e.mjs
@@ -50,7 +50,7 @@ function pretty(o) { return JSON.stringify(o, null, 2); }
 if (!VK) fail('LACE_VIEWING_KEY env var is required');
 
 // The server now performs Midnight's per-role HD derivation from the mnemonic
-// (see srv/utils/wallet-hd.ts), so we pass the BIP39 phrase straight through —
+// (see srv/utils/wallet-hd.ts), so we pass the BIP39 phrase straight through,
 // no client-side seed truncation. Validate locally for a fast fail.
 if (!MNEMONIC || !bip39.validateMnemonic(MNEMONIC.trim())) {
     fail('LACE_MNEMONIC (a valid BIP39 phrase) is required');

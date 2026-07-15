@@ -70,7 +70,7 @@ describe('buildAttestationVaultWitnesses', () => {
     });
 });
 
-describe('buildAttestationVaultWitnesses — predicate witnesses (commitValue/provePredicate)', () => {
+describe('buildAttestationVaultWitnesses: predicate witnesses (commitValue/provePredicate)', () => {
     const secret = new Uint8Array(32).fill(0xab);
     const SALT_HEX = 'a'.repeat(64);
 
@@ -125,7 +125,7 @@ describe('buildAttestationVaultWitnesses — predicate witnesses (commitValue/pr
     });
 });
 
-describe('buildAttestationVaultWitnesses — field-bound proof witnesses (proveFieldPredicate)', () => {
+describe('buildAttestationVaultWitnesses: field-bound proof witnesses (proveFieldPredicate)', () => {
     const secret = new Uint8Array(32).fill(0xab);
     const SIB = ['1', '2', '3', '4'].map((n) => n.repeat(64)); // 4 × 64-hex
     const proof = { fieldValue: '3600', siblings: SIB, dirs: [true, false, true, false] };
