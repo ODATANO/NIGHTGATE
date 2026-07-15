@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.7.1 - 2026-07-15
+
+### Config: one indexer URL is enough (ws endpoint derived)
+
+`NIGHTGATE_INDEXER_WS_URL` / `indexerWsUrl` is now optional: when only the
+HTTP URL is overridden (env, config, or a `networks.<network>` entry of the
+verify `network` override), the GraphQL subscription endpoint is derived from
+it (`http -> ws` scheme plus `/ws` suffix, the pattern every known indexer
+deployment follows, hosted and indexer-standalone alike). Previously,
+overriding only the HTTP URL silently paired it with the built-in default WS
+endpoint of the configured network: a mixed pair pointing at two different
+indexers. An explicit WS URL still wins for setups that serve subscriptions
+somewhere non-standard; configs that set both are unchanged. The wallet
+worker's dust-stream probe reuses the same shared helper
+(`srv/utils/indexer-url.ts`, cds-free so the worker thread does not pull in
+`@sap/cds`).
+
+### Docs: README consolidated
+
+Highlights + service/write/read/browser surface merged into one "Services &
+capabilities" table, a key-env-vars block added to the quick start,
+`.env.example`s and `docs/reference.md` updated to the single-URL indexer
+setup, stale test-runner facts refreshed (Vitest, 63 suites / 1104 tests).
+
 ## 0.7.0 - 2026-07-14
 
 ### Feature: optional `network` override on the crawler-free verify surface
