@@ -19,6 +19,8 @@ import {
     normalizeNightgateNetwork,
     resolveNightgateRuntimeConfig,
     resolveOverrideIndexerEndpoints,
+    resolveSubmissionEndpoints,
+    deriveIndexerWsUrl,
     DEFAULT_INDEXER_URLS
 } from '../../srv/utils/nightgate-config';
 
@@ -225,6 +227,54 @@ describe('resolveNightgateRuntimeConfig', () => {
     });
 });
 
+describe('deriveIndexerWsUrl', () => {
+    it('maps http(s) to ws(s) and appends /ws', () => {
+        expect(deriveIndexerWsUrl('https://indexer.preprod.midnight.network/api/v4/graphql'))
+            .toBe('wss://indexer.preprod.midnight.network/api/v4/graphql/ws');
+        expect(deriveIndexerWsUrl('http://localhost:8088/api/v4/graphql'))
+            .toBe('ws://localhost:8088/api/v4/graphql/ws');
+    });
+
+    it('tolerates trailing slashes', () => {
+        expect(deriveIndexerWsUrl('http://my-idx/graphql///')).toBe('ws://my-idx/graphql/ws');
+    });
+
+    it('reproduces every built-in default pairing', () => {
+        for (const { http, ws } of Object.values(DEFAULT_INDEXER_URLS)) {
+            expect(deriveIndexerWsUrl(http)).toBe(ws);
+        }
+    });
+});
+
+describe('resolveSubmissionEndpoints indexer ws derivation', () => {
+    it('derives the ws url when only the http url is overridden (env)', () => {
+        process.env.NIGHTGATE_INDEXER_HTTP_URL = 'http://local-idx:8088/api/v4/graphql';
+        const eps = resolveSubmissionEndpoints('preprod', {});
+        delete process.env.NIGHTGATE_INDEXER_HTTP_URL;
+        expect(eps.indexerHttpUrl).toBe('http://local-idx:8088/api/v4/graphql');
+        expect(eps.indexerWsUrl).toBe('ws://local-idx:8088/api/v4/graphql/ws');
+    });
+
+    it('derives the ws url when only the http url is overridden (config)', () => {
+        const eps = resolveSubmissionEndpoints('preprod', { indexerHttpUrl: 'https://my-idx/graphql' });
+        expect(eps.indexerWsUrl).toBe('wss://my-idx/graphql/ws');
+    });
+
+    it('an explicit ws override still wins over derivation', () => {
+        const eps = resolveSubmissionEndpoints('preprod', {
+            indexerHttpUrl: 'https://my-idx/graphql',
+            indexerWsUrl: 'wss://elsewhere/subscriptions'
+        });
+        expect(eps.indexerWsUrl).toBe('wss://elsewhere/subscriptions');
+    });
+
+    it('keeps the per-network default pair when nothing is overridden', () => {
+        const eps = resolveSubmissionEndpoints('preprod', {});
+        expect(eps.indexerHttpUrl).toBe(DEFAULT_INDEXER_URLS.preprod.http);
+        expect(eps.indexerWsUrl).toBe(DEFAULT_INDEXER_URLS.preprod.ws);
+    });
+});
+
 describe('resolveOverrideIndexerEndpoints (verify-state-network-override FR)', () => {
     it('falls back to the built-in public defaults for the override network', () => {
         const eps = resolveOverrideIndexerEndpoints('preview', {});
@@ -240,12 +290,12 @@ describe('resolveOverrideIndexerEndpoints (verify-state-network-override FR)', (
         expect(eps.indexerWsUrl).toBe('ws://my-idx');
     });
 
-    it('fills only the endpoint fields the networks entry sets', () => {
+    it('derives the ws endpoint when the networks entry sets only the http url', () => {
         const eps = resolveOverrideIndexerEndpoints('preprod', {
             networks: { preprod: { indexerHttpUrl: 'http://my-idx' } }
         });
         expect(eps.indexerHttpUrl).toBe('http://my-idx');
-        expect(eps.indexerWsUrl).toBe(DEFAULT_INDEXER_URLS.preprod.ws);
+        expect(eps.indexerWsUrl).toBe('ws://my-idx/ws');
     });
 
     it('ignores top-level indexer config and NIGHTGATE_INDEXER_* env vars — they belong to the configured network', () => {

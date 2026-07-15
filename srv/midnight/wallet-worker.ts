@@ -28,6 +28,7 @@ import { parentPort, MessageChannel, type MessagePort } from 'node:worker_thread
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { formatErr } from '../utils/format-error';
+import { deriveIndexerWsUrl } from '../utils/indexer-url';
 import {
     deriveAttestationSecret,
     getContractWitnessFactory
@@ -366,7 +367,7 @@ let dustTipCache: { tip: bigint; at: number } | null = null;
  */
 async function getDustStreamTip(indexerHttpUrl: string): Promise<bigint | null> {
     if (dustTipCache && Date.now() - dustTipCache.at < 10_000) return dustTipCache.tip;
-    const wsUrl = indexerHttpUrl.replace(/^http/, 'ws').replace(/\/+$/, '') + '/ws';
+    const wsUrl = deriveIndexerWsUrl(indexerHttpUrl);
     try {
         const { default: WebSocket } = await import('ws');
         const tip = await new Promise<bigint | null>((resolve) => {

@@ -69,7 +69,7 @@ Sufficient for read-side. `network` is the only required key — without it the 
 | `network` | `preprod` | `testnet` / `preprod` / `mainnet`; invalid values fall back to `preprod` with a warning |
 | `nodeUrl` | `wss://rpc.preprod.midnight.network/` | Substrate RPC WebSocket |
 | `indexerHttpUrl` | preprod indexer URL | Wallet SDK's `publicDataProvider` HTTP endpoint; NOT used by the crawler |
-| `indexerWsUrl` | preprod indexer WS URL | Same, for subscriptions |
+| `indexerWsUrl` | derived from `indexerHttpUrl` (`http -> ws` + `/ws`) | Same, for subscriptions; set only if your indexer serves subscriptions somewhere non-standard |
 | `proofServerUrl` | `http://localhost:6300` | Required for any submission flow (deploy/call/send/shield/unshield/dust-gen) |
 | `zkConfigBasePath` | `./contracts` | Base for resolving relative `contracts.<name>.zkConfigPath` |
 | `privateStateBackend` | `cap-db` | `cap-db` (default, production-grade encrypted CAP-DB tables) or `level` (legacy SDK LevelDB, **dev-only**, blocked on worker-routed submissions) |
@@ -102,7 +102,7 @@ Sufficient for read-side. `network` is the only required key — without it the 
 | `NIGHTGATE_FETCH_CONCURRENCY` | Override `crawler.fetchConcurrency` |
 | `NIGHTGATE_RPC_BATCH_SIZE` | Override `crawler.rpcBatchSize` |
 | `NIGHTGATE_INDEXER_HTTP_URL` | Override `indexerHttpUrl` (e.g. point at local indexer container) |
-| `NIGHTGATE_INDEXER_WS_URL` | Override `indexerWsUrl` |
+| `NIGHTGATE_INDEXER_WS_URL` | Override `indexerWsUrl`; optional, derived from the HTTP URL when unset |
 | `NIGHTGATE_PROOF_SERVER_URL` | Override `proofServerUrl` |
 | `NIGHTGATE_PROOF_NETWORK` | Network passed to the proof-server container; defaults to `preprod` |
 | `NIGHTGATE_ZK_CONFIG_BASE` | Override `zkConfigBasePath` |

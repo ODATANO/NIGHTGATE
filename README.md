@@ -15,7 +15,7 @@
 
 ```text
                             ┌──────────────────────────────────────┐
-                            │      Midnight Preprod / Mainnet      │
+                            │      Midnight Preview / Preprod      │
                             │   Substrate Node    GraphQL Indexer  │
                             └──────────────┬──────────────┬────────┘
                                            │              │
@@ -23,12 +23,12 @@
                             JSON-RPC       │ RPC          │ HTTP + WS
                                            ▼              ▼
 ┌───────────────────────────────────────────────────────────────────────────┐
-│  NIGHTGATE  (CAP plugin)                                                  │
+│  NIGHTGATE                                                                │
 │                                                                           │
 │  Main thread                              Worker thread                   │
 │  ┌──────────────────────┐                 ┌──────────────────────────┐    │
 │  │  Crawler             │                 │  Wallet SDK              │    │
-│  │  - BlockProcessor    │                 │  (Effect.ts fibers)      │    │
+│  │  - BlockProcessor    │                 │                          │    │
 │  │  - reorg detection   │                 │  - facade.start (sync)   │    │
 │  └─────────┬────────────┘                 │  - transferTransaction   │    │
 │            │ atomic writes                │  - initSwap              │    │
@@ -45,29 +45,11 @@
 
 The wallet SDK lives in `worker_threads` because Midnight's Effect.ts fiber scheduler saturates the microtask queue during sync; isolating it keeps the main CAP request pipeline responsive.
 
-## Highlights
-
-| Capability | Status |
-|---|---|
-| Block-level indexing | ✅ Live + catch-up + reorg detection (`srv/crawler/`) |
-| Wallet sessions | ✅ Read-only (viewing key) + signing (seed) with AES-256-GCM at rest |
-| Contract deploy / call | ✅ Compact-compiled contracts (`deployContract`, `submitContractCall`) |
-| Document anchoring | ✅ `anchorDocument` / `verifyDocument` — hash on-chain, caller-managed storage |
-| ZK predicate attestations | ✅ `issuePredicateAttestation` — prove `value ≤/≥ threshold` without revealing the value |
-| Tiered disclosure (RBAC) | ✅ `AttestationService` mixin + `DisclosureRoles` (EU Battery Reg tiers) |
-| Browser / connector surface | ✅ `@odatano/nightgate/browser` + `/zk-config` + `/contract-manifest` for wallet-driven (Lace) AttestationVault calls |
-| Token transfer (shielded + unshielded) | ✅ `sendNight` with auto-detected receiver ledger |
-| Cross-ledger shift | ✅ `shieldFunds` / `unshieldFunds` via SDK `initSwap` |
-| Dust generation lifecycle | ✅ `registerForDustGeneration` / `deregisterFromDustGeneration` |
-| Pre-flight diagnostics | ✅ `getWalletBalance`, `estimateSendNightFee`, `estimateShield/UnshieldFee` |
-| Local Midnight indexer | ✅ Optional docker-compose service (`midnightntwrk/indexer-standalone`) |
-| Offline mode | ✅ CAP app starts even if the upstream node is unreachable |
-
 ## Quick start
 
 ```bash
 npm ci
-npm run dev            # connects to public preprod RPC + hosted indexer
+npm run dev           
 ```
 
 That's it for read-side + base config. For wallet signing + submission:
@@ -78,56 +60,39 @@ $env:NIGHTGATE_CRAWLER_ENABLED="false"           # optional; isolate sync worklo
 npm run serve:sync   # scripts/serve.mjs sets the ~12 GB heap (override via NIGHTGATE_HEAP_MB)
 ```
 
+The env variables you are most likely to touch (all have preprod defaults; full matrix in [docs/reference.md#configuration](docs/reference.md#configuration)):
+
+```bash
+NIGHTGATE_NETWORK=preprod                        # target network
+NIGHTGATE_NODE_URL=wss://rpc.preprod.midnight.network/   # Substrate RPC node
+NIGHTGATE_INDEXER_HTTP_URL=                      # Midnight GraphQL indexer (default: hosted); ws endpoint derived automatically
+NIGHTGATE_PROOF_SERVER_URL=http://localhost:6300 # proof server for submission
+NIGHTGATE_CRAWLER_ENABLED=true                   # set false to run submission-only
+ENCRYPTION_KEY=<random secret>                   # wallet secrets at rest; required in production
+NIGHTGATE_HEAP_MB=12288                          # heap used by dev / serve:sync scripts
+```
+
 For the full first-time-sync walkthrough see [docs/quickstart.md](docs/quickstart.md).
 
-## Service surface
+## Services & capabilities
 
-| Service | Path | What |
-|---|---|---|
-| `NightgateService` | `/api/v1/nightgate` | Blocks / transactions / wallet sessions / **token ops + contract ops** |
-| `NightgateIndexerService` | `/api/v1/indexer` | Sync state, health, reorg history, Prometheus metrics, crawler control |
-| `NightgateAnalyticsService` | `/api/v1/analytics` | Aggregate counts |
-| `NightgateAdminService` | `/api/v1/admin` | Session invalidation |
+Four OData V4 services: **`NightgateService`** (`/api/v1/nightgate`: chain data, wallet sessions, all token / contract / attestation actions), **`NightgateIndexerService`** (`/api/v1/indexer`: sync state, health, metrics, crawler control), **`NightgateAnalyticsService`** (`/api/v1/analytics`: aggregate counts), **`NightgateAdminService`** (`/api/v1/admin`: session administration).
 
-## Write surface (NightgateService)
+Submit actions are **async**: they return `{ jobId, status }`; poll `getJobStatus(jobId, sessionId)` for the result. Exhaustive signatures, error codes, and curl examples: [docs/actions.md](docs/actions.md).
 
-Submit actions are **async**: they return `{ jobId, status }`; poll `getJobStatus(jobId, sessionId)` for the result.
-
-| Action | Purpose |
+| Capability | Surface |
 |---|---|
-| `connectWallet(viewingKey)` | Open read-only session |
-| `connectWalletForSigning(sessionId, mnemonic)` | Upgrade with BIP39 mnemonic; HD-derives keys to match Lace, warms wallet SDK + syncs in worker |
-| `disconnectWallet(sessionId)` | Close session, evict facade |
-| `sendNight(sessionId, receiverAddress, amount, ttlIso?)` | Transfer NIGHT; ledger auto-detected from receiver address prefix |
-| `shieldFunds` / `unshieldFunds(sessionId, amount, ttlIso?)` | Move own NIGHT between ledgers |
-| `registerForDustGeneration` / `deregisterFromDustGeneration(sessionId, …)` | Start / stop dust accrual on NIGHT UTXOs |
-| `deployContract(compiledArtifactRef, sessionId, initialPrivateState)` | Deploy a registered Compact contract |
-| `submitContractCall(contractAddress, circuit, compiledArtifactRef, sessionId, args)` | Invoke a circuit on a deployed contract |
-| `anchorDocument(sha256, storageRef, sessionId, contractAddress, …)` | Anchor a document hash on-chain (`verifyDocument` to check) |
-| `issuePredicateAttestation(payloadHash, value, predicate, threshold, sessionId, contractAddress, …)` | Prove a hidden value satisfies a predicate (`verifyPredicateAttestation` to check) |
-
-## Read surface (read-only functions)
-
-| Function | Returns |
-|---|---|
-| `getWalletBalance(sessionId)` | Shielded + unshielded NIGHT balances, current DUST, registered UTXO counts |
-| `estimateSendNightFee(sessionId, receiverAddress, amount, ttlIso?)` | DUST fee estimate for a transfer |
-| `estimateShieldFee(sessionId, amount, ttlIso?)` | DUST fee for unshielded → shielded swap |
-| `estimateUnshieldFee(sessionId, amount, ttlIso?)` | DUST fee for shielded → unshielded swap |
-| `getSyncStatus()` / `getHealth()` / `getMetrics()` | Indexer operational state |
-| Standard OData on `Blocks` / `Transactions` / `ContractActions` / `UnshieldedUtxos` / `NightBalances` | Full query surface with `$filter`, `$orderby`, `$top`, `$skip`, `$expand` |
-
-For exhaustive signatures, error codes, and curl examples: [docs/actions.md](docs/actions.md).
-
-## Browser / connector surface
-
-For the browser human-attester path (a dApp driving AttestationVault calls from a wallet such as Lace, via the Midnight DApp-Connector), NIGHTGATE ships the building blocks so a consumer needs neither the Compact toolchain nor a copy of `managed/`:
-
-- **`@odatano/nightgate/browser`** (ESM): attester-secret derivation + witnesses, `FetchZkConfigProvider`, `InMemoryPrivateStateProvider`, `createNightgateConnectorProviders`, and `prepareAttest` / `prepareGrantDisclosure` / `prepareRevokeDisclosure` call helpers. The compiled contract artifact is importable from `@odatano/nightgate/browser/attestation-vault`.
-- **`GET /zk-config/<contract>/{keys,zkir}/<circuit>`**: serves a registered contract's proving artifacts over HTTP (ETag / 304 / cache). Only registered contracts are servable.
-- **`GET /contract-manifest`**: advertises network, zk-config base URL, and registered contracts (with optional pinned `cds.requires.nightgate.contracts.<name>.address`) so a connector can self-configure.
-
-The flow is: connect wallet, build providers from the manifest, `findDeployedContract`, then `callTx` (prove + balance + submit via the wallet). `@midnight-ntwrk/dapp-connector-api` is an optional peer dependency. The headless server-side submission path is unchanged.
+| Block indexing | Live + catch-up crawler with reorg detection (`srv/crawler/`); standard OData (`$filter`, `$orderby`, `$top`, `$expand`) on `Blocks`, `Transactions`, `ContractActions`, `UnshieldedUtxos`, `NightBalances` |
+| Wallet sessions | `connectWallet` (viewing key, read-only) upgraded via `connectWalletForSigning` (BIP39 mnemonic, HD-derived to match Lace); AES-256-GCM at rest, sessions bound to the requesting user |
+| Token ops | `sendNight` (receiver ledger auto-detected), `shieldFunds` / `unshieldFunds`, `registerForDustGeneration` / `deregisterFromDustGeneration` |
+| Pre-flight | `getWalletBalance`, `estimateSendNightFee`, `estimateShieldFee` / `estimateUnshieldFee`, `deriveWalletInfo` |
+| Compact contracts | `deployContract` / `submitContractCall` on registered compiled artifacts |
+| Document anchoring | `anchorDocument` / `verifyDocument`: sha256 hash on-chain, storage stays with the caller |
+| ZK predicate attestations | `issuePredicateAttestation` / `issueFieldPredicateAttestation` (field-bound via content root): prove `value ≤/≥ threshold` without revealing the value; `verifyPredicateAttestation` to check |
+| Crawler-free verification | `verifyAttestationState` / `verifyPredicateState` / `reindexDisclosures` read live contract state from the public indexer (per-call `network` override, no wallet, no local index) |
+| Tiered disclosure (RBAC) | `grantDisclosure` / `revokeDisclosure` (+ `registerGranteeIdentity`), on-chain `DisclosureGrants` index, `AttestationService` mixin with EU Battery Reg tiers |
+| Browser / connector | `@odatano/nightgate/browser` (providers, witnesses, `prepareAttest` / `prepareGrantDisclosure` / `prepareRevokeDisclosure`) + `GET /zk-config/<contract>/…` + `GET /contract-manifest`: a wallet-driven dApp (Lace) needs neither the Compact toolchain nor `managed/` artifacts |
+| Operations | Health / liveness / readiness, Prometheus metrics, `pauseCrawler` / `resumeCrawler` / `reindexFromHeight`, offline start (boots without upstream node), optional local indexer via docker-compose |
 
 ## Documentation
 
@@ -168,15 +133,16 @@ npm run sync:probe         # check local Midnight indexer container status
 
 npm run typecheck          # tsc --noEmit
 npm run lint               # ESLint
-npm test                   # Jest with coverage, 49 suites, 688 tests
+npm test                   # Vitest with coverage, 63 suites, 1104 tests
 npm run build              # Compile CDS types + TypeScript to JS
 
 # Integration scripts (real SDK, no chain access required)
-npm run smoke:sdk
-npm run integration:providers
-npm run integration:wallet-keys
-npm run integration:wallet-facade
-npm run integration:contract-registry
+npm run smoke:sdk          # all SDK packages load
+npm run integration:providers            # + wallet-keys, wallet-facade, contract-registry,
+                                         #   connector-routes, attestation-vault, derive-wallet-info
+
+# Live e2e against preprod (funded wallet required)
+npm run deploy:e2e         # + predicate:e2e, disclosure:e2e, state-verify:e2e
 ```
 
 ## License

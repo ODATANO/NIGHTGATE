@@ -1,4 +1,7 @@
 import cds from '@sap/cds';
+import { deriveIndexerWsUrl } from './indexer-url';
+
+export { deriveIndexerWsUrl };
 
 export const VALID_NIGHTGATE_NETWORKS = ['preview', 'testnet', 'preprod', 'mainnet', 'undeployed'] as const;
 
@@ -248,9 +251,11 @@ export function resolveSubmissionEndpoints(
     config?: Record<string, any>
 ): SubmissionEndpointsConfig {
     const defaults = DEFAULT_INDEXER_URLS[network];
+    const httpOverride = readEnv('NIGHTGATE_INDEXER_HTTP_URL') || config?.indexerHttpUrl;
+    const wsOverride = readEnv('NIGHTGATE_INDEXER_WS_URL') || config?.indexerWsUrl;
     return {
-        indexerHttpUrl: readEnv('NIGHTGATE_INDEXER_HTTP_URL') || config?.indexerHttpUrl || defaults.http,
-        indexerWsUrl: readEnv('NIGHTGATE_INDEXER_WS_URL') || config?.indexerWsUrl || defaults.ws,
+        indexerHttpUrl: httpOverride || defaults.http,
+        indexerWsUrl: wsOverride || (httpOverride ? deriveIndexerWsUrl(httpOverride) : defaults.ws),
         proofServerUrl: readEnv('NIGHTGATE_PROOF_SERVER_URL') || config?.proofServerUrl || DEFAULT_PROOF_SERVER_URL,
         zkConfigBasePath: readEnv('NIGHTGATE_ZK_CONFIG_BASE') || config?.zkConfigBasePath || DEFAULT_ZK_CONFIG_BASE
     };
@@ -270,9 +275,10 @@ export function resolveOverrideIndexerEndpoints(
 ): { indexerHttpUrl: string; indexerWsUrl: string } {
     const defaults = DEFAULT_INDEXER_URLS[network];
     const perNetwork = config?.networks?.[network] ?? {};
+    const http = perNetwork.indexerHttpUrl;
     return {
-        indexerHttpUrl: perNetwork.indexerHttpUrl || defaults.http,
-        indexerWsUrl: perNetwork.indexerWsUrl || defaults.ws
+        indexerHttpUrl: http || defaults.http,
+        indexerWsUrl: perNetwork.indexerWsUrl || (http ? deriveIndexerWsUrl(http) : defaults.ws)
     };
 }
 
