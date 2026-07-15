@@ -286,22 +286,22 @@ describe('connectWalletForSigning: state transitions', () => {
         expect(req.reject).toHaveBeenCalledWith(401, expect.stringMatching(/authentication/i));
     });
 
-    test('rate-limited after 5 attempts/hour/ip', async () => {
+    test('rate-limited after 10 attempts/hour/ip (default)', async () => {
         const srv = makeFakeService();
         const db = makeFakeDb();
         seedSession(db);
         registerWalletSessionHandlers(srv as any, db);
 
-        // Pin a single IP so the rate limit applies to all six requests.
+        // Pin a single IP so the rate limit applies to all eleven requests.
         const PINNED_IP = `rate-test-${Date.now()}`;
-        for (let i = 0; i < 5; i++) {
+        for (let i = 0; i < 10; i++) {
             const req = makeReq({ sessionId: 'sess-1', seedHex: VALID_SEED }, PINNED_IP);
             await srv.handlers['connectWalletForSigning'](req);
             expect(req.reject).not.toHaveBeenCalled();
         }
-        const sixth = makeReq({ sessionId: 'sess-1', seedHex: VALID_SEED }, PINNED_IP);
-        await srv.handlers['connectWalletForSigning'](sixth);
-        expect(sixth.reject).toHaveBeenCalledWith(429, expect.stringMatching(/Rate limited/));
+        const eleventh = makeReq({ sessionId: 'sess-1', seedHex: VALID_SEED }, PINNED_IP);
+        await srv.handlers['connectWalletForSigning'](eleventh);
+        expect(eleventh.reject).toHaveBeenCalledWith(429, expect.stringMatching(/Rate limited/));
     });
 });
 

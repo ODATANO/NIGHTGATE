@@ -57,7 +57,7 @@ Upgrade a read-only session with **signing capability**, encrypting the BIP39 se
 | `mnemonic` | String | BIP39 recovery phrase (preferred) |
 | `seedHex` | String (optional) | Alternative to `mnemonic`: the full 64-byte BIP39 seed as 128 hex chars |
 
-**Rate limit:** 5/hour per client IP.
+**Rate limit:** 10/hour per client IP (default; override via `NIGHTGATE_SIGNING_KEY_RATE_LIMIT`). Shared with `deriveWalletInfo`.
 
 **Errors:** 400 (invalid mnemonic/seed), 404 (no session), 410 (expired), 412 (already signing), 429 (rate-limited).
 

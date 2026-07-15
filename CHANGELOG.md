@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.7.2 - 2026-07-15
+
+### Config: signing-key rate limit raised to 10/hour and made tunable
+
+The limiter shared by `connectWalletForSigning` and `deriveWalletInfo` now
+defaults to 10 requests/hour/IP (was 5) and can be overridden via
+`NIGHTGATE_SIGNING_KEY_RATE_LIMIT`. Motivation: multi-wallet consumers that
+prewarm every configured server wallet at login (one `connectWalletForSigning`
+per wallet per server run) exhausted the old budget during demos. The bound
+stays tight; the other limiters are unchanged.
+
 ## 0.7.1 - 2026-07-15
 
 ### Config: one indexer URL is enough (ws endpoint derived)

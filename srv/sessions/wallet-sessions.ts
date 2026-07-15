@@ -48,9 +48,12 @@ const walletRateLimiter = new RateLimiter({
 });
 
 const signingKeyRateLimiter = new RateLimiter({
-    // Adding a signing key is a one-time-per-session operation. Bound tightly.
+    // Adding a signing key is a one-time-per-session operation, so the bound
+    // stays tight. 10/h leaves room for multi-wallet consumers that prewarm
+    // several server wallets at login (shared with deriveWalletInfo).
+    // Override via env when a deployment needs a different budget.
     windowMs: 60 * 60 * 1000,
-    maxRequests: 5
+    maxRequests: Number(process.env.NIGHTGATE_SIGNING_KEY_RATE_LIMIT || 10)
 });
 
 const dustRegRateLimiter = new RateLimiter({
