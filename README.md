@@ -52,24 +52,19 @@ npm ci
 npm run dev           
 ```
 
-That's it for read-side + base config. For wallet signing + submission:
+Configure the `.env` file (see `.env.example`) to point to a Substrate RPC node and a GraphQL indexer.
 
 ```bash
-docker compose -f docker/docker-compose.yml up -d proof-server
-$env:NIGHTGATE_CRAWLER_ENABLED="false"           # optional; isolate sync workload
-npm run serve:sync   # scripts/serve.mjs sets the ~12 GB heap (override via NIGHTGATE_HEAP_MB)
-```
-
-The env variables you are most likely to touch (all have preprod defaults; full matrix in [docs/reference.md#configuration](docs/reference.md#configuration)):
-
-```bash
-NIGHTGATE_NETWORK=preprod                        # target network
-NIGHTGATE_NODE_URL=wss://rpc.preprod.midnight.network/   # Substrate RPC node
-NIGHTGATE_INDEXER_HTTP_URL=                      # Midnight GraphQL indexer (default: hosted); ws endpoint derived automatically
-NIGHTGATE_PROOF_SERVER_URL=http://localhost:6300 # proof server for submission
-NIGHTGATE_CRAWLER_ENABLED=true                   # set false to run submission-only
-ENCRYPTION_KEY=<random secret>                   # wallet secrets at rest; required in production
-NIGHTGATE_HEAP_MB=12288                          # heap used by dev / serve:sync scripts
+# target network
+NIGHTGATE_NETWORK=preprod
+ # Substrate RPC node                                                              
+NIGHTGATE_NODE_URL=wss://rpc.preprod.midnight.network/
+#  GraphQL indexer (HTTP only; WS derived from it)                                 
+NIGHTGATE_INDEXER_HTTP_URL = "https://indexer.preview.midnight.network/api/v4/graphql"
+# local proof server & wallets for submission (compose: midnightntwrk/proof-server on :6300)
+NIGHTGATE_PROOF_SERVER_URL=http://localhost:6300                                     
+NIGHTGATE_CRAWLER_ENABLED=false                   
+ENCRYPTION_KEY=<random secret>                   
 ```
 
 For the full first-time-sync walkthrough see [docs/quickstart.md](docs/quickstart.md).
