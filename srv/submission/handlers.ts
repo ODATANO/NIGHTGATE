@@ -37,6 +37,12 @@ import {
     WalletMaterialUnavailable
 } from './wallet-material-factory';
 import {
+    resolveFeeSponsor,
+    ensureFeeSponsorFacade,
+    FeeSponsorError,
+    type ResolvedFeeSponsor
+} from './fee-sponsor';
+import {
     coerceCircuitArgs,
     loadCircuitArgTypes,
     CoercionError
@@ -118,11 +124,12 @@ export function registerSubmissionHandlers(
     const predicateStateReader = options.predicateStateReader ?? readPredicateStateForContract;
 
     srv.on('deployContract', async (req: Request) => {
-        const { compiledArtifactRef, sessionId, initialPrivateState, idempotencyKey } = req.data as {
+        const { compiledArtifactRef, sessionId, initialPrivateState, idempotencyKey, sponsorSessionId } = req.data as {
             compiledArtifactRef?: string;
             sessionId?: string;
             initialPrivateState?: string;
             idempotencyKey?: string;
+            sponsorSessionId?: string;
         };
 
         if (!compiledArtifactRef) return req.reject(400, 'compiledArtifactRef is required');
@@ -146,14 +153,16 @@ export function registerSubmissionHandlers(
             await ensureNetworkId(facadeCfg.networkId);
             const resolved = await contractResolver(compiledArtifactRef);
             const wallet = await walletFactory({ sessionId, db, facadeConfig: facadeCfg, expectedUserId: (req as any).user?.id });
-            const submitter = submitterFactory(buildSubmitterDeps(db, resolved, wallet));
+            const sponsor = await resolveSponsorForRequest(req, sponsorSessionId);
+            const submitter = submitterFactory(buildSubmitterDeps(db, resolved, wallet, sponsor?.accountId));
 
             return startJob({
                 kind: 'deployContract',
                 sessionId,
                 idempotencyKey,
-                request: { compiledArtifactRef, sessionId, hasInitialState: !!initialPrivateState },
+                request: { compiledArtifactRef, sessionId, hasInitialState: !!initialPrivateState, feeSponsor: sponsor?.sponsorSessionId ?? null },
                 work: async () => {
+                    if (sponsor) await ensureFeeSponsorFacade(sponsor, facadeCfg);
                     const result = await submitter.deploy({
                         contractName: compiledArtifactRef,
                         registration: {
@@ -168,7 +177,8 @@ export function registerSubmissionHandlers(
                         submissionId: result.submissionId,
                         txHash: result.txHash,
                         contractAddress: result.contractAddress,
-                        status: result.status
+                        status: result.status,
+                        ...(sponsor ? { feeSponsor: sponsor.sponsorSessionId } : {})
                     };
                 }
             });
@@ -176,7 +186,7 @@ export function registerSubmissionHandlers(
     });
 
     srv.on('submitContractCall', async (req: Request) => {
-        const { contractAddress, circuit, compiledArtifactRef, sessionId, args, idempotencyKey, initialPrivateState } = req.data as {
+        const { contractAddress, circuit, compiledArtifactRef, sessionId, args, idempotencyKey, initialPrivateState, sponsorSessionId } = req.data as {
             contractAddress?: string;
             circuit?: string;
             compiledArtifactRef?: string;
@@ -184,6 +194,7 @@ export function registerSubmissionHandlers(
             args?: string;
             idempotencyKey?: string;
             initialPrivateState?: string;
+            sponsorSessionId?: string;
         };
 
         if (!contractAddress) return req.reject(400, 'contractAddress is required');
@@ -226,14 +237,16 @@ export function registerSubmissionHandlers(
             const coercedArgs = coerceCircuitArgs(parsedArgs, argTypes);
 
             const wallet = await walletFactory({ sessionId, db, facadeConfig: facadeCfg, expectedUserId: (req as any).user?.id });
-            const submitter = submitterFactory(buildSubmitterDeps(db, resolved, wallet));
+            const sponsor = await resolveSponsorForRequest(req, sponsorSessionId);
+            const submitter = submitterFactory(buildSubmitterDeps(db, resolved, wallet, sponsor?.accountId));
 
             return startJob({
                 kind: 'submitContractCall',
                 sessionId,
                 idempotencyKey,
-                request: { contractAddress, circuit, compiledArtifactRef, sessionId, argCount: coercedArgs.length },
+                request: { contractAddress, circuit, compiledArtifactRef, sessionId, argCount: coercedArgs.length, feeSponsor: sponsor?.sponsorSessionId ?? null },
                 work: async () => {
+                    if (sponsor) await ensureFeeSponsorFacade(sponsor, facadeCfg);
                     const result = await submitter.call({
                         contractAddress,
                         circuit,
@@ -251,7 +264,8 @@ export function registerSubmissionHandlers(
                         submissionId: result.submissionId,
                         txHash: result.txHash,
                         contractAddress: result.contractAddress,
-                        status: result.status
+                        status: result.status,
+                        ...(sponsor ? { feeSponsor: sponsor.sponsorSessionId } : {})
                     };
                 }
             });
@@ -269,6 +283,7 @@ export function registerSubmissionHandlers(
             contractAddress?: string;
             compiledArtifactRef?: string;
             idempotencyKey?: string;
+            sponsorSessionId?: string;
         };
 
         if (!data.sha256) return req.reject(400, 'sha256 is required');
@@ -318,7 +333,8 @@ export function registerSubmissionHandlers(
             await ensureNetworkId(facadeCfg.networkId);
             const resolved = await contractResolver(compiledRef);
             const wallet = await walletFactory({ sessionId: data.sessionId!, db, facadeConfig: facadeCfg, expectedUserId: (req as any).user?.id });
-            const submitter = submitterFactory(buildSubmitterDeps(db, resolved, wallet));
+            const sponsor = await resolveSponsorForRequest(req, data.sponsorSessionId);
+            const submitter = submitterFactory(buildSubmitterDeps(db, resolved, wallet, sponsor?.accountId));
 
             const job = await startJob({
                 kind: 'anchorDocument',
@@ -328,9 +344,11 @@ export function registerSubmissionHandlers(
                     sha256: data.sha256!.toLowerCase(),
                     contractAddress: data.contractAddress,
                     compiledRef,
-                    documentId
+                    documentId,
+                    feeSponsor: sponsor?.sponsorSessionId ?? null
                 },
                 work: async () => {
+                    if (sponsor) await ensureFeeSponsorFacade(sponsor, facadeCfg);
                     const result = await submitter.call({
                         contractAddress: data.contractAddress!,
                         circuit: 'attest',
@@ -353,7 +371,8 @@ export function registerSubmissionHandlers(
                         documentId,
                         attestationId: data.sha256!.toLowerCase(),
                         txHash: result.txHash,
-                        anchoredAt
+                        anchoredAt,
+                        ...(sponsor ? { feeSponsor: sponsor.sponsorSessionId } : {})
                     };
                 }
             });
@@ -432,6 +451,7 @@ export function registerSubmissionHandlers(
             contractAddress?: string;
             compiledArtifactRef?: string;
             idempotencyKey?: string;
+            sponsorSessionId?: string;
         };
 
         if (!data.payloadHash) return req.reject(400, 'payloadHash is required');
@@ -507,7 +527,8 @@ export function registerSubmissionHandlers(
             await ensureNetworkId(facadeCfg.networkId);
             const resolved = await contractResolver(compiledRef);
             const wallet = await walletFactory({ sessionId: data.sessionId!, db, facadeConfig: facadeCfg, expectedUserId: (req as any).user?.id });
-            const submitter = submitterFactory(buildSubmitterDeps(db, resolved, wallet));
+            const sponsor = await resolveSponsorForRequest(req, data.sponsorSessionId);
+            const submitter = submitterFactory(buildSubmitterDeps(db, resolved, wallet, sponsor?.accountId));
             const registration = {
                 artifactPath: resolved.artifactPath,
                 privateStateId: resolved.privateStateId,
@@ -523,9 +544,11 @@ export function registerSubmissionHandlers(
                     contractAddress: data.contractAddress,
                     predicate: data.predicate,
                     threshold: String(data.threshold),
-                    predicateAttestationId
+                    predicateAttestationId,
+                    feeSponsor: sponsor?.sponsorSessionId ?? null
                 },
                 work: async () => {
+                    if (sponsor) await ensureFeeSponsorFacade(sponsor, facadeCfg);
                     // 1. Bind the numeric commitment to the attestation. The
                     //    commitment is computed in-circuit from the witnesses.
                     await submitter.call({
@@ -568,7 +591,8 @@ export function registerSubmissionHandlers(
                             circuit: 'provePredicate',
                             verificationMethod: data.contractAddress,
                             proofValue: proof.txHash
-                        }
+                        },
+                        ...(sponsor ? { feeSponsor: sponsor.sponsorSessionId } : {})
                     };
                 }
             });
@@ -592,6 +616,7 @@ export function registerSubmissionHandlers(
             contractAddress?: string;
             compiledArtifactRef?: string;
             idempotencyKey?: string;
+            sponsorSessionId?: string;
         };
 
         if (!data.payloadHash) return req.reject(400, 'payloadHash is required');
@@ -674,7 +699,8 @@ export function registerSubmissionHandlers(
             await ensureNetworkId(facadeCfg.networkId);
             const resolved = await contractResolver(compiledRef);
             const wallet = await walletFactory({ sessionId: data.sessionId!, db, facadeConfig: facadeCfg, expectedUserId: (req as any).user?.id });
-            const submitter = submitterFactory(buildSubmitterDeps(db, resolved, wallet));
+            const sponsor = await resolveSponsorForRequest(req, data.sponsorSessionId);
+            const submitter = submitterFactory(buildSubmitterDeps(db, resolved, wallet, sponsor?.accountId));
             const registration = {
                 artifactPath: resolved.artifactPath,
                 privateStateId: resolved.privateStateId,
@@ -691,9 +717,11 @@ export function registerSubmissionHandlers(
                     contractAddress: data.contractAddress,
                     predicate: data.predicate,
                     threshold: String(data.threshold),
-                    predicateAttestationId
+                    predicateAttestationId,
+                    feeSponsor: sponsor?.sponsorSessionId ?? null
                 },
                 work: async () => {
+                    if (sponsor) await ensureFeeSponsorFacade(sponsor, facadeCfg);
                     // 1. Anchor the content root (idempotent overwrite) if supplied,
                     //    so proveFieldPredicate has a root to bind against. Uses only
                     //    the attester-identity witness (no value/proof witnesses).
@@ -740,7 +768,8 @@ export function registerSubmissionHandlers(
                             circuit: 'proveFieldPredicate',
                             verificationMethod: data.contractAddress,
                             proofValue: proof.txHash
-                        }
+                        },
+                        ...(sponsor ? { feeSponsor: sponsor.sponsorSessionId } : {})
                     };
                 }
             });
@@ -803,6 +832,7 @@ export function registerSubmissionHandlers(
             contractAddress?: string;
             compiledArtifactRef?: string;
             idempotencyKey?: string;
+            sponsorSessionId?: string;
         };
 
         if (!data.payloadHash) return req.reject(400, 'payloadHash is required');
@@ -871,7 +901,8 @@ export function registerSubmissionHandlers(
             await ensureNetworkId(facadeCfg.networkId);
             const resolved = await contractResolver(compiledRef);
             const wallet = await walletFactory({ sessionId: data.sessionId!, db, facadeConfig: facadeCfg, expectedUserId: (req as any).user?.id });
-            const submitter = submitterFactory(buildSubmitterDeps(db, resolved, wallet));
+            const sponsor = await resolveSponsorForRequest(req, data.sponsorSessionId);
+            const submitter = submitterFactory(buildSubmitterDeps(db, resolved, wallet, sponsor?.accountId));
             const registration = {
                 artifactPath: resolved.artifactPath,
                 privateStateId: resolved.privateStateId,
@@ -887,9 +918,11 @@ export function registerSubmissionHandlers(
                     grantee: granteeLc,
                     level: levelNum,
                     contractAddress: contractAddressLc,
-                    disclosureGrantId
+                    disclosureGrantId,
+                    feeSponsor: sponsor?.sponsorSessionId ?? null
                 },
                 work: async () => {
+                    if (sponsor) await ensureFeeSponsorFacade(sponsor, facadeCfg);
                     const result = await submitter.call({
                         contractAddress: contractAddressLc,
                         circuit: 'grantDisclosure',
@@ -931,6 +964,7 @@ export function registerSubmissionHandlers(
             contractAddress?: string;
             compiledArtifactRef?: string;
             idempotencyKey?: string;
+            sponsorSessionId?: string;
         };
 
         if (!data.payloadHash) return req.reject(400, 'payloadHash is required');
@@ -958,7 +992,8 @@ export function registerSubmissionHandlers(
             await ensureNetworkId(facadeCfg.networkId);
             const resolved = await contractResolver(compiledRef);
             const wallet = await walletFactory({ sessionId: data.sessionId!, db, facadeConfig: facadeCfg, expectedUserId: (req as any).user?.id });
-            const submitter = submitterFactory(buildSubmitterDeps(db, resolved, wallet));
+            const sponsor = await resolveSponsorForRequest(req, data.sponsorSessionId);
+            const submitter = submitterFactory(buildSubmitterDeps(db, resolved, wallet, sponsor?.accountId));
             const registration = {
                 artifactPath: resolved.artifactPath,
                 privateStateId: resolved.privateStateId,
@@ -972,9 +1007,11 @@ export function registerSubmissionHandlers(
                 request: {
                     payloadHash: payloadHashLc,
                     grantee: granteeLc,
-                    contractAddress: contractAddressLc
+                    contractAddress: contractAddressLc,
+                    feeSponsor: sponsor?.sponsorSessionId ?? null
                 },
                 work: async () => {
+                    if (sponsor) await ensureFeeSponsorFacade(sponsor, facadeCfg);
                     const result = await submitter.call({
                         contractAddress: contractAddressLc,
                         circuit: 'revokeDisclosure',
@@ -1289,7 +1326,12 @@ export function registerSubmissionHandlers(
         }
     }
 
-    function buildSubmitterDeps(db: any, resolved: ResolvedContract, wallet: import('../midnight/providers').WalletMaterial): TransactionSubmitterDeps {
+    function buildSubmitterDeps(
+        db: any,
+        resolved: ResolvedContract,
+        wallet: import('../midnight/providers').WalletMaterial,
+        sponsorAccountId?: string
+    ): TransactionSubmitterDeps {
         const nightgateConfig = getNightgatePluginConfig();
         const { network, submissionEndpoints } = resolveNightgateRuntimeConfig(nightgateConfig);
         const privateStateBackend = getConfiguredPrivateStateBackend(nightgateConfig);
@@ -1305,8 +1347,28 @@ export function registerSubmissionHandlers(
             contractProvidersConfig,
             walletMaterial: { ...wallet, privateStateBackend: wallet.privateStateBackend ?? privateStateBackend },
             db,
-            network: network as NightgateNetwork
+            network: network as NightgateNetwork,
+            sponsorAccountId
         };
+    }
+
+    /**
+     * Resolves the optional per-tx fee sponsor of a submission action.
+     * Returns null when the caller did not request sponsoring. Throws
+     * FeeSponsorError (mapped by runSubmission) when the sponsor session is
+     * unusable or not authorised for this caller.
+     */
+    async function resolveSponsorForRequest(
+        req: Request,
+        sponsorSessionId: string | undefined
+    ): Promise<ResolvedFeeSponsor | null> {
+        if (!sponsorSessionId) return null;
+        return resolveFeeSponsor({
+            db,
+            sponsorSessionId,
+            requestingUserId: (req as any).user?.id,
+            config: getNightgatePluginConfig()
+        });
     }
 }
 
@@ -1428,6 +1490,9 @@ async function runSubmission(req: Request, op: () => Promise<unknown>): Promise<
         }
         if (err instanceof SessionNotFoundError) {
             return req.reject(401, err.message);
+        }
+        if (err instanceof FeeSponsorError) {
+            return req.reject(err.httpStatus, err.message);
         }
         if (err instanceof WalletMaterialUnavailable) {
             // 501 = the session lacks signing material (no seed). The caller must

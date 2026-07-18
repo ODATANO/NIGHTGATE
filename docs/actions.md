@@ -165,8 +165,27 @@ Invoke a circuit on a deployed contract.
 | `sessionId` | UUID | Must have signing enabled |
 | `args` | LargeString | JSON-encoded array (use `"[]"` for no args). See **Encoding circuit args** below |
 | `idempotencyKey` | String (optional) | Dedupes retries against the original job; reusing a key returns the existing `jobId` |
+| `sponsorSessionId` | UUID (optional) | Second session that pays the dust fee. See **Per-tx fee sponsoring** below |
 
 **Rate limit:** 30/min per session.
+
+#### Per-tx fee sponsoring (`sponsorSessionId`)
+
+Every submit action (`deployContract`, `submitContractCall`, `anchorDocument`,
+`issuePredicateAttestation`, `issueFieldPredicateAttestation`,
+`grantDisclosure`, `revokeDisclosure`, `deregisterFromDustGeneration`) accepts
+an optional `sponsorSessionId`. When set, the calling session builds and signs
+the transaction (balancing shielded/unshielded only) and the sponsor session
+balances ONLY the dust fee and submits; the caller needs neither NIGHT nor
+dust. The sponsor session must be signing-capable
+(`connectWalletForSigning`).
+
+Authorization: a caller may use its OWN sessions freely; cross-user
+sponsoring (the platform-sponsor model) requires the operator to list the
+sponsor session id(s) in `NIGHTGATE_FEE_SPONSOR_SESSION` (comma separated) or
+cds config `feeSponsorSessions`. A foreign, non-listed id is rejected with
+404; a viewing-key-only sponsor with 412. The job request and result carry
+`feeSponsor` for audit.
 
 #### Encoding circuit args
 

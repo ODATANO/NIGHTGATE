@@ -203,7 +203,8 @@ service NightgateService {
         sessionId:           UUID,
         contractAddress:     String,       // AttestationVault deployment to anchor into
         compiledArtifactRef: String,       // optional, defaults to 'attestation-vault'
-        idempotencyKey:      String        // optional; dedupes retries
+        idempotencyKey:      String,       // optional; dedupes retries
+        sponsorSessionId:    UUID          // optional; second session pays the dust fee (see submitContractCall)
     )                                returns {
         jobId:      UUID;
         status:     String;  // 'pending' | 'succeeded' (idempotent retry)
@@ -283,7 +284,8 @@ service NightgateService {
         sessionId:           UUID,
         contractAddress:     String,       // AttestationVault deployment
         compiledArtifactRef: String,       // optional, defaults to 'attestation-vault'
-        idempotencyKey:      String        // optional; dedupes retries
+        idempotencyKey:      String,       // optional; dedupes retries
+        sponsorSessionId:    UUID          // optional; second session pays the dust fee (see submitContractCall)
     )                                returns {
         jobId:                  UUID;
         status:                 String;
@@ -320,7 +322,8 @@ service NightgateService {
         sessionId:           UUID,
         contractAddress:     String,       // AttestationVault deployment
         compiledArtifactRef: String,       // optional, defaults to 'attestation-vault'
-        idempotencyKey:      String        // optional; dedupes retries
+        idempotencyKey:      String,       // optional; dedupes retries
+        sponsorSessionId:    UUID          // optional; second session pays the dust fee (see submitContractCall)
     )                                returns {
         jobId:                  UUID;
         status:                 String;
@@ -476,7 +479,8 @@ service NightgateService {
         sessionId:           UUID,
         contractAddress:     String,   // AttestationVault deployment
         compiledArtifactRef: String,   // optional, defaults to 'attestation-vault'
-        idempotencyKey:      String    // optional; dedupes retries
+        idempotencyKey:      String,   // optional; dedupes retries
+        sponsorSessionId:    UUID      // optional; second session pays the dust fee (see submitContractCall)
     )                                returns {
         jobId:             UUID;
         status:            String;
@@ -495,7 +499,8 @@ service NightgateService {
         sessionId:           UUID,
         contractAddress:     String,   // AttestationVault deployment
         compiledArtifactRef: String,   // optional, defaults to 'attestation-vault'
-        idempotencyKey:      String    // optional; dedupes retries
+        idempotencyKey:      String,   // optional; dedupes retries
+        sponsorSessionId:    UUID      // optional; second session pays the dust fee (see submitContractCall)
     )                                returns {
         jobId:  UUID;
         status: String;
@@ -543,7 +548,8 @@ service NightgateService {
         compiledArtifactRef: String,
         sessionId:           UUID,
         initialPrivateState: LargeString, // JSON-encoded
-        idempotencyKey:      String       // optional; dedupes retries
+        idempotencyKey:      String,      // optional; dedupes retries
+        sponsorSessionId:    UUID         // optional; second session pays the dust fee (see submitContractCall)
     )                                returns {
         jobId:  UUID;
         status: String;  // 'pending' | 'succeeded' (idempotent retry)
@@ -560,6 +566,15 @@ service NightgateService {
      * contract deploys with), so several wallets can act on one shared
      * contract; an existing private state is never overwritten. Pass
      * `initialPrivateState` for a contract whose private state is not empty.
+     *
+     * Per-tx fee sponsoring: pass `sponsorSessionId` to have a SECOND wallet
+     * session pay the dust fee. The calling session builds and signs the
+     * transaction (balancing shielded/unshielded only); the sponsor session
+     * balances ONLY the dust fee and submits. The sponsor session must be
+     * signing-capable (connectWalletForSigning) and either belong to the same
+     * user or be listed by the operator in NIGHTGATE_FEE_SPONSOR_SESSION /
+     * cds config `feeSponsorSessions` (platform sponsor). Job request and
+     * result carry `feeSponsor` for audit.
      */
     action submitContractCall(
         contractAddress:     String,
@@ -568,7 +583,8 @@ service NightgateService {
         sessionId:           UUID,
         args:                LargeString, // JSON-encoded array, may be '[]'
         idempotencyKey:      String,      // optional; dedupes retries
-        initialPrivateState: LargeString  // optional JSON; seeded on this wallet's first call
+        initialPrivateState: LargeString, // optional JSON; seeded on this wallet's first call
+        sponsorSessionId:    UUID         // optional; second session pays the dust fee (see above)
     )                                returns {
         jobId:  UUID;
         status: String;  // 'pending' | 'succeeded' (idempotent retry)
@@ -704,8 +720,11 @@ service NightgateService {
      * `{ txId, deregisteredCount, totalNightUtxos }`.
      */
     action deregisterFromDustGeneration(
-        sessionId:      UUID,
-        idempotencyKey: String   // optional
+        sessionId:        UUID,
+        idempotencyKey:   String, // optional
+        sponsorSessionId: UUID    // optional; second session pays the dust fee (a fully
+                                  // delegated wallet has dust 0 and cannot pay its own
+                                  // deregistration; see submitContractCall for the rules)
     ) returns {
         jobId:  UUID;
         status: String;  // 'pending' | 'succeeded' (idempotent retry)

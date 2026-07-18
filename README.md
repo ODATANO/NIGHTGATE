@@ -80,6 +80,7 @@ Submit actions are **async**: they return `{ jobId, status }`; poll `getJobStatu
 | Block indexing | Live + catch-up crawler with reorg detection (`srv/crawler/`); standard OData (`$filter`, `$orderby`, `$top`, `$expand`) on `Blocks`, `Transactions`, `ContractActions`, `UnshieldedUtxos`, `NightBalances` |
 | Wallet sessions | `connectWallet` (viewing key, read-only) upgraded via `connectWalletForSigning` (BIP39 mnemonic, HD-derived to match Lace); AES-256-GCM at rest, sessions bound to the requesting user |
 | Token ops | `sendNight` (receiver ledger auto-detected), `shieldFunds` / `unshieldFunds`, `registerForDustGeneration` / `deregisterFromDustGeneration` |
+| Fee sponsoring | Generation delegation (`registerForDustGeneration` with a foreign `dustReceiverAddress`, own dust address via `deriveWalletInfo`) and per-tx sponsorship (optional `sponsorSessionId` on all submit actions: a second session pays the dust fee; cross-user use gated via `NIGHTGATE_FEE_SPONSOR_SESSION`) |
 | Pre-flight | `getWalletBalance`, `estimateSendNightFee`, `estimateShieldFee` / `estimateUnshieldFee`, `deriveWalletInfo` |
 | Compact contracts | `deployContract` / `submitContractCall` on registered compiled artifacts |
 | Document anchoring | `anchorDocument` / `verifyDocument`: sha256 hash on-chain, storage stays with the caller |

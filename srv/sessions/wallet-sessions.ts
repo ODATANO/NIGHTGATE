@@ -33,6 +33,7 @@ import {
 import { startJob } from '../submission/background-jobs';
 import { mnemonicToBip39SeedHex } from '../utils/wallet-hd';
 import { deriveWalletInfo, resolveBip39SeedHex } from '../utils/wallet-info';
+import { resolveFeeSponsor, ensureFeeSponsorFacade, FeeSponsorError } from '../submission/fee-sponsor';
 
 // Upper bound for the prewarm sync-to-tip wait. A wallet that is far behind the
 // chain tip (e.g. restored from a stale checkpoint) can take a long time to
@@ -523,9 +524,10 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
             return req.reject(429, `Rate limited. Retry after ${Math.ceil(rate.retryAfterMs / 1000)}s`);
         }
 
-        const { sessionId, idempotencyKey } = req.data as {
+        const { sessionId, idempotencyKey, sponsorSessionId } = req.data as {
             sessionId: string;
             idempotencyKey?: string;
+            sponsorSessionId?: string;
         };
         if (!sessionId) return req.reject(400, 'sessionId is required');
 
@@ -549,17 +551,52 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
 
         const accountId = deriveAccountId(viewingKey);
 
+        // Optional per-tx fee sponsor: the sponsor's dust pays the
+        // deregistration fee. This unblocks a wallet whose whole generation is
+        // delegated away (own dust stays 0 and cannot fund the deregistration).
+        let sponsor: Awaited<ReturnType<typeof resolveFeeSponsor>> | null = null;
+        if (sponsorSessionId) {
+            try {
+                sponsor = await resolveFeeSponsor({
+                    db,
+                    sponsorSessionId,
+                    requestingUserId: userId,
+                    config: getNightgatePluginConfig()
+                });
+            } catch (err) {
+                if (err instanceof FeeSponsorError) return req.reject(err.httpStatus, err.message);
+                throw err;
+            }
+        }
+
+        const nightgateConfig = getNightgatePluginConfig();
+        const { network, nodeUrl, submissionEndpoints } = resolveNightgateRuntimeConfig(nightgateConfig);
+
         return startJob({
             kind: 'deregisterFromDustGeneration',
             sessionId,
             idempotencyKey,
-            request: { sessionId },
+            request: { sessionId, feeSponsor: sponsor?.sponsorSessionId ?? null },
             work: async () => {
-                const result = await deregisterNightUtxosFromDust({ cacheKey: accountId });
+                if (sponsor) {
+                    await ensureNetworkId(network);
+                    await ensureFeeSponsorFacade(sponsor, {
+                        networkId: network,
+                        indexerHttpUrl: submissionEndpoints.indexerHttpUrl,
+                        indexerWsUrl: submissionEndpoints.indexerWsUrl,
+                        proofServerUrl: submissionEndpoints.proofServerUrl,
+                        relayUrl: nodeUrl
+                    });
+                }
+                const result = await deregisterNightUtxosFromDust({
+                    cacheKey: accountId,
+                    sponsorCacheKey: sponsor?.accountId
+                });
                 return {
                     txId: result.txId ?? '',
                     deregisteredCount: result.deregisteredCount,
-                    totalNightUtxos: result.totalNightUtxos
+                    totalNightUtxos: result.totalNightUtxos,
+                    ...(sponsor ? { feeSponsor: sponsor.sponsorSessionId } : {})
                 };
             }
         });

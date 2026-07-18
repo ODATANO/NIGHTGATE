@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.8.0 - 2026-07-18
+
+### Feature: per-transaction fee sponsoring (`sponsorSessionId`)
+
+A new optional `sponsorSessionId` parameter on the submission
+actions lets a SECOND wallet session pay the dust fee for a transaction the
+calling session builds and signs. The calling wallet needs neither NIGHT nor
+dust, ever.
+
+Actions: `deployContract`, `submitContractCall`, `anchorDocument`,
+`issuePredicateAttestation`, `issueFieldPredicateAttestation`,
+`grantDisclosure`, `revokeDisclosure`, and `deregisterFromDustGeneration`
+
+Mechanics (wallet worker, two-phase balancing per the SDK contract):
+
+1. Caller facade: `balanceUnboundTransaction` with `tokenKindsToBalance:
+   ['shielded','unshielded']`, `signRecipe` for any unshielded inputs,
+   `finalizeRecipe`. Result: a fully signed, fee-unpaid transaction.
+2. Sponsor facade: `balanceFinalizedTransaction` with `tokenKindsToBalance:
+   ['dust']` ONLY (re-balancing the caller's kinds would double-spend),
+   `finalizeRecipe`, and the SPONSOR submits. Both phases share one TTL.
+   The sponsor wallet is genuine-synced before balancing dust (117 guard).
+
+Authorization guard: a caller may sponsor from its OWN sessions; cross-user
+sponsoring requires the operator to list the sponsor session id(s) in
+`NIGHTGATE_FEE_SPONSOR_SESSION` (comma separated) or cds config
+`feeSponsorSessions`. Foreign non-listed session ids read back as 404.
+The sponsor session must be signing-capable (`connectWalletForSigning`).
+Job request and result carry `feeSponsor` for audit; worker logs name the
+sponsor on every sponsored dispatch.
+
 ## 0.7.3 - 2026-07-18
 
 ### Feature: `deriveWalletInfo` returns the wallet's DUST address

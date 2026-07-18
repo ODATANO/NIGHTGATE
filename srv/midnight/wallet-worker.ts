@@ -576,6 +576,96 @@ export function buildWorkerWalletProvider(entry: FacadeEntry): any {
     };
 }
 
+/**
+ * Two-phase sponsored wallet provider: the CALLER builds and signs the
+ * transaction, the SPONSOR pays the dust fee and submits.
+ *
+ * Phase 1 (caller facade): balanceUnboundTransaction with
+ * tokenKindsToBalance ['shielded','unshielded'], signRecipe for any
+ * unshielded inputs the balancer selected (no-op otherwise), finalizeRecipe.
+ * The result is a fully signed, fee-unpaid FinalizedTransaction.
+ *
+ * Phase 2 (sponsor facade): balanceFinalizedTransaction with
+ * tokenKindsToBalance ['dust'] ONLY. Re-balancing token kinds the caller
+ * already balanced would double-spend; never widen this list. finalizeRecipe
+ * proves the sponsor's dust spends; submitTx routes through the sponsor
+ * facade (only the sponsor submits; its state anticipates the dust spends).
+ *
+ * Both phases share one explicit TTL so a stalled phase 2 cannot submit
+ * against an expired phase 1.
+ *
+ * Exported for the in-thread unit tests, like buildWorkerWalletProvider.
+ */
+export function buildSponsoredWalletProvider(caller: FacadeEntry, sponsor: FacadeEntry): any {
+    return {
+        getCoinPublicKey(): string { return caller.zswapKeys.coinPublicKey; },
+        getEncryptionPublicKey(): string { return caller.zswapKeys.encryptionPublicKey; },
+        async balanceTx(tx: any, ttl?: Date): Promise<any> {
+            // The SPONSOR spends the dust, so ITS wallet must be genuinely
+            // synced (stale dust merkle roots are the Custom error 117 site).
+            // The caller only balances shielded/unshielded, but sync it too so
+            // stale coin state cannot double-select inputs.
+            await waitForGenuineSync(caller.facade, caller.indexerHttpUrl, BALANCE_SYNC_TIMEOUT_MS, 'sponsored-balance caller');
+            await waitForGenuineSync(sponsor.facade, sponsor.indexerHttpUrl, BALANCE_SYNC_TIMEOUT_MS, 'sponsored-balance sponsor');
+            const effectiveTtl = ttl ?? new Date(Date.now() + 30 * 60 * 1000);
+
+            const recipe = await caller.facade.balanceUnboundTransaction(
+                tx,
+                { shieldedSecretKeys: caller.zswapKeys, dustSecretKey: caller.dustKey },
+                { ttl: effectiveTtl, tokenKindsToBalance: ['shielded', 'unshielded'] }
+            );
+            const callerSign = (payload: Uint8Array) => caller.unshieldedKeystore.signData(payload);
+            const signed = await caller.facade.signRecipe(recipe, callerSign);
+            const callerFinalized = await caller.facade.finalizeRecipe(signed);
+
+            const sponsorRecipe = await sponsor.facade.balanceFinalizedTransaction(
+                callerFinalized,
+                { shieldedSecretKeys: sponsor.zswapKeys, dustSecretKey: sponsor.dustKey },
+                { ttl: effectiveTtl, tokenKindsToBalance: ['dust'] }
+            );
+            const finalized = await sponsor.facade.finalizeRecipe(sponsorRecipe);
+
+            const dust = describeTxDust(finalized);
+            log('info', `[worker] sponsored balanced tx dust sections: ${dust.summary}`);
+            if (dust.emptyDustActions) {
+                throw new Error(
+                    'sponsored balanced transaction carries an EMPTY DustActions section ' +
+                    '(node would reject it as 1010 Custom error: 117 NotNormalized). ' +
+                    `The sponsor's dust balancer produced an empty recipe, i.e. the computed ` +
+                    `fee was 0. Dust sections: ${dust.summary}`
+                );
+            }
+            return finalized;
+        },
+        async submitTx(tx: any): Promise<any> {
+            const dust = describeTxDust(tx);
+            log('info', `[worker] pre-submit (sponsored) tx dust sections: ${dust.summary}`);
+            if (dust.emptyDustActions) {
+                log('warn', `[worker] pre-submit sponsored tx has an EMPTY DustActions section (node rejects as 1010/117 NotNormalized): ${dust.summary}`);
+            }
+            return sponsor.facade.submitTransaction(tx);
+        }
+    };
+}
+
+/**
+ * Resolves the optional fee-sponsor facade. Throws a clear error when a
+ * sponsor was requested but its facade is not initialised in this worker;
+ * the main thread ensures the sponsor facade exists before dispatching, so
+ * hitting this means the ensure step was skipped or the facade was evicted.
+ */
+function resolveSponsorEntry(sponsorSessionId?: string): FacadeEntry | undefined {
+    if (!sponsorSessionId) return undefined;
+    const sponsor = facades.get(sponsorSessionId);
+    if (!sponsor) {
+        throw new Error(
+            `No facade for sponsorSessionId=${sponsorSessionId.slice(0, 16)} ` +
+            `(the sponsor session must be connected for signing and its facade initialised)`
+        );
+    }
+    return sponsor;
+}
+
 // ---- Private-state proxy (worker → main RPC) ------------------------------
 
 /**
@@ -1066,12 +1156,20 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
      * This action deregisters ALL registered UTXOs; per-UTXO
      * narrowing is a follow-up once we have a stable UTXO-id surface.
      */
-    async deregisterDustGeneration({ sessionId, syncTimeoutMs }: {
+    async deregisterDustGeneration({ sessionId, syncTimeoutMs, sponsorSessionId }: {
         sessionId: string;
         syncTimeoutMs?: number;
+        /**
+         * Optional fee sponsor: that facade balances the deregistration fee
+         * from ITS dust and submits. This is the escape hatch for a wallet
+         * whose entire generation is delegated away (dust balance 0 forever),
+         * which otherwise cannot pay its own deregistration.
+         */
+        sponsorSessionId?: string;
     }) {
         const entry = facades.get(sessionId);
         if (!entry) throw new Error(`No facade for sessionId=${sessionId.slice(0, 16)}`);
+        const sponsorEntry = resolveSponsorEntry(sponsorSessionId);
 
         log('info', `[worker] dust-deregister: waiting for synced state...`);
         const synced = syncTimeoutMs
@@ -1116,16 +1214,24 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
         // Without it the node rejects 1010/138 BalanceCheckOverspend. The tx
         // is already fully signed by the facade; an extra signRecipe pass
         // DUPLICATES the offer signatures (1010/192). So: balance, then
-        // finalize, no re-signing. Consequence: deregistration needs dust in
-        // THIS wallet; a sponsor whose entire generation is delegated away
-        // cannot deregister until some dust accrues for itself.
-        const balanced = await entry.facade.balanceUnprovenTransaction(
+        // finalize, no re-signing.
+        //
+        // With a sponsor, the SPONSOR's facade balances the fee from ITS dust
+        // and submits. The dust spender must be genuinely synced first (stale
+        // dust merkle roots are the Custom error 117 site); the unsponsored
+        // path gets that freshness from the caller's own sync above.
+        const payer = sponsorEntry ?? entry;
+        if (sponsorEntry) {
+            log('info', `[worker] dust-deregister: fee sponsored by ${sponsorEntry === entry ? 'self' : String(sponsorSessionId).slice(0, 16)}`);
+            await waitForGenuineSync(sponsorEntry.facade, sponsorEntry.indexerHttpUrl, BALANCE_SYNC_TIMEOUT_MS, 'deregister sponsor');
+        }
+        const balanced = await payer.facade.balanceUnprovenTransaction(
             recipe.transaction,
-            { shieldedSecretKeys: entry.zswapKeys, dustSecretKey: entry.dustKey },
+            { shieldedSecretKeys: payer.zswapKeys, dustSecretKey: payer.dustKey },
             { ttl: new Date(Date.now() + 10 * 60000), tokenKindsToBalance: ['dust'] }
         );
-        const finalized = await entry.facade.finalizeRecipe(balanced);
-        const txId = await entry.facade.submitTransaction(finalized);
+        const finalized = await payer.facade.finalizeRecipe(balanced);
+        const txId = await payer.facade.submitTransaction(finalized);
 
         log('info', `[worker] dust-deregister: submitted ${registered.length} UTXO(s), txId=${String(txId).slice(0, 16)}...`);
 
@@ -1512,7 +1618,7 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
     async deployContract({
         sessionId, proxyId, contractName, registration,
         indexerHttpUrl, indexerWsUrl, proofServerUrl,
-        networkId, initialPrivateState
+        networkId, initialPrivateState, sponsorSessionId
     }: {
         sessionId: string;
         proxyId: string;
@@ -1523,9 +1629,12 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
         proofServerUrl: string;
         networkId: string;
         initialPrivateState: unknown;
+        /** Optional fee sponsor: this facade balances ['dust'] and submits. */
+        sponsorSessionId?: string;
     }) {
         const entry = facades.get(sessionId);
         if (!entry) throw new Error(`No facade for sessionId=${sessionId.slice(0, 16)}`);
+        const sponsorEntry = resolveSponsorEntry(sponsorSessionId);
         const sdk = await loadSdk();
         await ensureNetworkId(networkId, sdk);
 
@@ -1535,7 +1644,9 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
             zkConfigPath: registration.zkConfigPath
         });
         const privateStateProvider = createPrivateStateProxy(proxyId);
-        const walletProvider = buildWorkerWalletProvider(entry);
+        const walletProvider = sponsorEntry
+            ? buildSponsoredWalletProvider(entry, sponsorEntry)
+            : buildWorkerWalletProvider(entry);
 
         const providers = {
             ...contractProviders,
@@ -1545,7 +1656,8 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
         };
 
         const { contracts } = await loadContractsSdk();
-        log('info', `[worker] deployContract: starting ${contractName} sess=${sessionId.slice(0, 16)}`);
+        log('info', `[worker] deployContract: starting ${contractName} sess=${sessionId.slice(0, 16)}` +
+            (sponsorEntry ? ` (fee sponsored by ${String(sponsorSessionId).slice(0, 16)})` : ''));
         const result = await contracts.deployContract(providers, {
             compiledContract,
             privateStateId: registration.privateStateId,
@@ -1570,7 +1682,8 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
         sessionId, proxyId, contractName, registration,
         contractAddress, circuit, args: callArgs,
         indexerHttpUrl, indexerWsUrl, proofServerUrl,
-        networkId, witnessValues, merkleProof, initialPrivateState
+        networkId, witnessValues, merkleProof, initialPrivateState,
+        sponsorSessionId
     }: {
         sessionId: string;
         proxyId: string;
@@ -1588,9 +1701,12 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
         /** Seeded on this wallet's FIRST call to the contract (see below).
          *  Defaults to `{}`, which is what a stateless contract deploys with. */
         initialPrivateState?: unknown;
+        /** Optional fee sponsor: this facade balances ['dust'] and submits. */
+        sponsorSessionId?: string;
     }) {
         const entry = facades.get(sessionId);
         if (!entry) throw new Error(`No facade for sessionId=${sessionId.slice(0, 16)}`);
+        const sponsorEntry = resolveSponsorEntry(sponsorSessionId);
         const sdk = await loadSdk();
         await ensureNetworkId(networkId, sdk);
 
@@ -1600,7 +1716,9 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
             zkConfigPath: registration.zkConfigPath
         });
         const privateStateProvider = createPrivateStateProxy(proxyId);
-        const walletProvider = buildWorkerWalletProvider(entry);
+        const walletProvider = sponsorEntry
+            ? buildSponsoredWalletProvider(entry, sponsorEntry)
+            : buildWorkerWalletProvider(entry);
 
         const providers = {
             ...contractProviders,
@@ -1610,7 +1728,8 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
         };
 
         const { contracts } = await loadContractsSdk();
-        log('info', `[worker] submitContractCall: ${contractName}.${circuit}@${contractAddress.slice(0, 12)}`);
+        log('info', `[worker] submitContractCall: ${contractName}.${circuit}@${contractAddress.slice(0, 12)}` +
+            (sponsorEntry ? ` (fee sponsored by ${String(sponsorSessionId).slice(0, 16)})` : ''));
 
         // A wallet that did not DEPLOY this contract has no entry at its
         // privateStateId, and `findDeployedContract` then throws "No private

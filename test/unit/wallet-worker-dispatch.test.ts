@@ -523,3 +523,170 @@ describe('buildWorkerWalletProvider', () => {
         expect(warns.length).toBe(1);
     });
 });
+
+// ---- buildSponsoredWalletProvider: two-phase fee sponsoring ----------------
+
+describe('buildSponsoredWalletProvider', () => {
+    const DUST_OK = { spends: [{}], registrations: [], ctime: new Date() };
+    const DUST_EMPTY = { spends: [], registrations: [], ctime: new Date() };
+
+    /**
+     * Caller facade: balances non-dust kinds, signs, finalizes into a
+     * fee-unpaid tx. Sponsor facade: balances dust onto it and finalizes into
+     * the submit candidate. Distinct sentinels per stage make ordering and
+     * facade attribution assertable.
+     */
+    function makePair(sponsorFinalDust: any = DUST_OK) {
+        const callerFinalized = { stage: 'caller-finalized', intents: new Map<any, any>([[0, {}]]) };
+        const sponsorFinalized = { stage: 'sponsor-finalized', intents: new Map<any, any>([[0, { dustActions: sponsorFinalDust }]]) };
+
+        const callerSigned = { stage: 'caller-signed' };
+        const callerFacade = makeFakeFacade();
+        callerFacade.balanceUnboundTransaction = vi.fn(async () => ({ stage: 'caller-recipe' }));
+        callerFacade.signRecipe = vi.fn(async () => callerSigned);
+        callerFacade.finalizeRecipe = vi.fn(async () => callerFinalized);
+        callerFacade.submitTransaction = vi.fn(async () => { throw new Error('caller must never submit a sponsored tx'); });
+
+        const sponsorFacade = makeFakeFacade();
+        sponsorFacade.balanceFinalizedTransaction = vi.fn(async () => ({ stage: 'sponsor-recipe' }));
+        sponsorFacade.finalizeRecipe = vi.fn(async () => sponsorFinalized);
+        sponsorFacade.submitTransaction = vi.fn(async () => ({ txId: '0xsponsored' }));
+
+        const caller = {
+            facade: callerFacade,
+            sdkVersion: 'test',
+            zswapKeys: { coinPublicKey: 'caller-cpk', encryptionPublicKey: 'caller-epk' },
+            dustKey: { caller: true },
+            unshieldedKeystore: { signData: vi.fn(() => 'caller-sig') },
+            networkId: 'preprod',
+            indexerHttpUrl: 'http://indexer.test/api/v4/graphql',
+            attestationSecret: new Uint8Array(32)
+        };
+        const sponsor = {
+            facade: sponsorFacade,
+            sdkVersion: 'test',
+            zswapKeys: { coinPublicKey: 'sponsor-cpk', encryptionPublicKey: 'sponsor-epk' },
+            dustKey: { sponsor: true },
+            unshieldedKeystore: { signData: vi.fn(() => 'sponsor-sig') },
+            networkId: 'preprod',
+            indexerHttpUrl: 'http://indexer.test/api/v4/graphql',
+            attestationSecret: new Uint8Array(32)
+        };
+        return { caller, sponsor, callerFacade, sponsorFacade, callerFinalized, sponsorFinalized, callerSigned };
+    }
+
+    function withSyncedIndexer() {
+        vi.stubGlobal('fetch', vi.fn(async () => ({
+            json: async () => ({ data: { block: { height: '500', timestamp: Date.now() } } })
+        })));
+        facadeState.current = { dust: { progress: { appliedIndex: '100', isConnected: true } } };
+        wsTip.maxId = '100';
+    }
+
+    it('exposes the CALLER identity (the sponsor only pays, it does not own the tx)', () => {
+        const { caller, sponsor } = makePair();
+        const provider = workerExports.buildSponsoredWalletProvider(caller, sponsor);
+        expect(provider.getCoinPublicKey()).toBe('caller-cpk');
+        expect(provider.getEncryptionPublicKey()).toBe('caller-epk');
+    });
+
+    it('balanceTx runs the two-phase choreography with a shared TTL', async () => {
+        withSyncedIndexer();
+        try {
+            const { caller, sponsor, callerFacade, sponsorFacade, callerFinalized, sponsorFinalized, callerSigned } = makePair();
+            const provider = workerExports.buildSponsoredWalletProvider(caller, sponsor);
+            const tx = { unbound: true };
+
+            const result = await provider.balanceTx(tx);
+            expect(result).toBe(sponsorFinalized);
+
+            // Phase 1: caller balances ONLY shielded/unshielded with its keys.
+            expect(callerFacade.balanceUnboundTransaction).toHaveBeenCalledWith(
+                tx,
+                { shieldedSecretKeys: caller.zswapKeys, dustSecretKey: caller.dustKey },
+                { ttl: expect.any(Date), tokenKindsToBalance: ['shielded', 'unshielded'] }
+            );
+            expect(callerFacade.signRecipe).toHaveBeenCalledWith({ stage: 'caller-recipe' }, expect.any(Function));
+            expect(callerFacade.finalizeRecipe).toHaveBeenCalledWith(callerSigned);
+
+            // Phase 2: sponsor balances ONLY dust on the caller-finalized tx.
+            expect(sponsorFacade.balanceFinalizedTransaction).toHaveBeenCalledWith(
+                callerFinalized,
+                { shieldedSecretKeys: sponsor.zswapKeys, dustSecretKey: sponsor.dustKey },
+                { ttl: expect.any(Date), tokenKindsToBalance: ['dust'] }
+            );
+
+            // Both phases share ONE ttl instance.
+            const callerTtl = (callerFacade.balanceUnboundTransaction as any).mock.calls[0][2].ttl;
+            const sponsorTtl = (sponsorFacade.balanceFinalizedTransaction as any).mock.calls[0][2].ttl;
+            expect(sponsorTtl).toBe(callerTtl);
+
+            // The sponsor never re-signs; only its own dust balancing is proven.
+            expect(sponsorFacade.finalizeRecipe).toHaveBeenCalledWith({ stage: 'sponsor-recipe' });
+        } finally {
+            vi.unstubAllGlobals();
+        }
+    });
+
+    it('balanceTx honours an explicit ttl in both phases', async () => {
+        withSyncedIndexer();
+        try {
+            const { caller, sponsor, callerFacade, sponsorFacade } = makePair();
+            const provider = workerExports.buildSponsoredWalletProvider(caller, sponsor);
+            const ttl = new Date(Date.now() + 5 * 60 * 1000);
+            await provider.balanceTx({}, ttl);
+            expect((callerFacade.balanceUnboundTransaction as any).mock.calls[0][2].ttl).toBe(ttl);
+            expect((sponsorFacade.balanceFinalizedTransaction as any).mock.calls[0][2].ttl).toBe(ttl);
+        } finally {
+            vi.unstubAllGlobals();
+        }
+    });
+
+    it('balanceTx FAILS FAST when the sponsored tx still has an empty DustActions section', async () => {
+        withSyncedIndexer();
+        try {
+            const { caller, sponsor } = makePair(DUST_EMPTY);
+            const provider = workerExports.buildSponsoredWalletProvider(caller, sponsor);
+            await expect(provider.balanceTx({})).rejects.toThrow(/EMPTY DustActions section.*117 NotNormalized/s);
+        } finally {
+            vi.unstubAllGlobals();
+        }
+    });
+
+    it('submitTx routes through the SPONSOR facade only', async () => {
+        const { caller, sponsor, callerFacade, sponsorFacade, sponsorFinalized } = makePair();
+        const provider = workerExports.buildSponsoredWalletProvider(caller, sponsor);
+        const result = await provider.submitTx(sponsorFinalized);
+        expect(result).toEqual({ txId: '0xsponsored' });
+        expect(sponsorFacade.submitTransaction).toHaveBeenCalledWith(sponsorFinalized);
+        expect(callerFacade.submitTransaction).not.toHaveBeenCalled();
+    });
+});
+
+describe('sponsored dispatch guards', () => {
+    it('submitContractCall rejects when the sponsor facade is not initialised', async () => {
+        const reply = await rpc('submitContractCall', {
+            sessionId: INIT_ARGS.sessionId,
+            sponsorSessionId: 'ghost-sponsor-xxxxxxxxxxxxxx',
+            proxyId: 'p1',
+            contractName: 'c',
+            registration: { artifactPath: 'a', privateStateId: 'ps', zkConfigPath: 'zk' },
+            contractAddress: '00'.repeat(32),
+            circuit: 'attest',
+            args: [],
+            indexerHttpUrl: 'http://i', indexerWsUrl: 'ws://i', proofServerUrl: 'http://p',
+            networkId: 'preprod'
+        });
+        expect(reply.ok).toBe(false);
+        expect(reply.error.message).toMatch(/No facade for sponsorSessionId=ghost-sponsor-xx/);
+    });
+
+    it('deregisterDustGeneration rejects when the sponsor facade is not initialised', async () => {
+        const reply = await rpc('deregisterDustGeneration', {
+            sessionId: INIT_ARGS.sessionId,
+            sponsorSessionId: 'ghost-sponsor-xxxxxxxxxxxxxx'
+        });
+        expect(reply.ok).toBe(false);
+        expect(reply.error.message).toMatch(/No facade for sponsorSessionId=ghost-sponsor-xx/);
+    });
+});

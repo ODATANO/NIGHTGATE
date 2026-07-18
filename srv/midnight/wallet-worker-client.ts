@@ -379,6 +379,12 @@ export function walletRegisterDustGeneration(args: {
 export function walletDeregisterDustGeneration(args: {
     sessionId: string;
     syncTimeoutMs?: number;
+    /**
+     * Optional fee sponsor (facade key, i.e. accountId): that facade balances
+     * the deregistration fee from ITS dust and submits. Escape hatch for a
+     * wallet whose whole generation is delegated away (own dust stays 0).
+     */
+    sponsorSessionId?: string;
 }): Promise<{
     txId: string | null;
     deregisteredCount: number;
@@ -508,6 +514,12 @@ export interface WalletDeployContractArgs {
     networkId: 'preprod' | 'testnet' | 'mainnet' | 'undeployed' | 'devnet' | 'qanet' | 'preview';
     /** User-supplied private state for the new contract. Plain JSON-able value. */
     initialPrivateState: unknown;
+    /**
+     * Optional fee sponsor (facade key, i.e. accountId). The worker splits
+     * balancing: the calling facade balances shielded/unshielded and signs,
+     * the sponsor facade balances ONLY ['dust'] and submits.
+     */
+    sponsorSessionId?: string;
 }
 
 export interface WalletSubmitContractCallArgs {
@@ -541,6 +553,12 @@ export interface WalletSubmitContractCallArgs {
      * overwrites an existing private state.
      */
     initialPrivateState?: unknown;
+    /**
+     * Optional fee sponsor (facade key, i.e. accountId). The worker splits
+     * balancing: the calling facade balances shielded/unshielded and signs,
+     * the sponsor facade balances ONLY ['dust'] and submits.
+     */
+    sponsorSessionId?: string;
 }
 
 /**

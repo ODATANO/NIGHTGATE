@@ -178,6 +178,14 @@ export interface TransactionSubmitterDeps {
     walletSubmitContractCallImpl?: typeof walletSubmitContractCall;
     /** Network, used by classifySubmissionError to decide if 1016 is fail-fast. */
     network: NightgateNetwork;
+    /**
+     * Optional fee sponsor: the ACCOUNT ID (worker facade key) of a second
+     * wallet session that pays the dust fee. The worker then splits balancing
+     * into two phases (caller: shielded/unshielded; sponsor: dust only) and
+     * the sponsor submits. Resolved and authorised by the OData handler
+     * (see srv/submission/fee-sponsor.ts) before it reaches this class.
+     */
+    sponsorAccountId?: string;
 }
 
 export class TransactionSubmitter {
@@ -343,7 +351,8 @@ export class TransactionSubmitter {
             indexerWsUrl:   this.deps.contractProvidersConfig.indexerWsUrl,
             proofServerUrl: this.deps.contractProvidersConfig.proofServerUrl,
             networkId:      this.deps.network,
-            initialPrivateState: args.initialPrivateState
+            initialPrivateState: args.initialPrivateState,
+            sponsorSessionId: this.deps.sponsorAccountId
         };
     }
 
@@ -362,7 +371,8 @@ export class TransactionSubmitter {
             networkId:       this.deps.network,
             witnessValues:   args.witnessValues,
             merkleProof:     args.merkleProof,
-            initialPrivateState: args.initialPrivateState
+            initialPrivateState: args.initialPrivateState,
+            sponsorSessionId: this.deps.sponsorAccountId
         };
     }
 

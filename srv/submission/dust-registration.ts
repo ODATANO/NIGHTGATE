@@ -74,6 +74,12 @@ export interface DeregisterDustGenerationArgs {
      * facade is healthy.
      */
     syncTimeoutMs?: number;
+    /**
+     * Optional fee sponsor (facade key, i.e. accountId): the sponsor facade
+     * balances the deregistration fee from ITS dust and submits. Escape hatch
+     * for a wallet whose whole generation is delegated away (own dust 0).
+     */
+    sponsorCacheKey?: string;
 }
 
 export interface DeregisterDustGenerationResult {
@@ -89,7 +95,8 @@ export async function deregisterNightUtxosFromDust(
     args: DeregisterDustGenerationArgs
 ): Promise<DeregisterDustGenerationResult> {
     return walletDeregisterDustGeneration({
-        sessionId:     args.cacheKey,
-        syncTimeoutMs: args.syncTimeoutMs
+        sessionId:        args.cacheKey,
+        syncTimeoutMs:    args.syncTimeoutMs,
+        sponsorSessionId: args.sponsorCacheKey
     });
 }
