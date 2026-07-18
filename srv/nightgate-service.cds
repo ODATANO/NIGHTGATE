@@ -665,6 +665,8 @@ service NightgateService {
         viewingKey:      String;  // 64-hex zswap encryption public key (connectWallet input)
         shieldedAddress: String;  // mn_shield-addr_... (receives shielded assets)
         nightAddress:    String;  // mn_addr_... unshielded NIGHT address (faucet target)
+        dustAddress:     String;  // mn_dust_... DUST address; pass as dustReceiverAddress
+                                  // to registerForDustGeneration for sponsored dust generation
         accountIndex:    Integer;
         network:         String;  // encoding network (the configured NIGHTGATE network)
     };

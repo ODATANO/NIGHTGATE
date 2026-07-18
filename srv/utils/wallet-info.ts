@@ -26,6 +26,7 @@ export interface WalletInfo {
     viewingKey: string;      // 64-hex zswap encryption public key (connectWallet input)
     shieldedAddress: string; // mn_shield-addr_... (receives shielded assets)
     nightAddress: string;    // mn_addr_... unshielded NIGHT address (faucet target)
+    dustAddress: string;     // mn_dust_... DUST address (dust-generation receiver)
     accountIndex: number;
     network: string;
 }
@@ -101,7 +102,18 @@ export async function deriveWalletInfo(opts: DeriveWalletInfoOptions): Promise<W
         const keystore = unshielded.createKeystore(roleSeeds.night, opts.network);
         const nightAddress: string = unshielded.PublicKey.fromKeyStore(keystore).address;
 
-        return { viewingKey, shieldedAddress, nightAddress, accountIndex, network: opts.network };
+        // DUST address: where dust generation accrues for this wallet. Needed
+        // as the `dustReceiverAddress` input of registerForDustGeneration when
+        // ANOTHER (funded) wallet sponsors this wallet's dust generation.
+        const dustKey = ledger.DustSecretKey.fromSeed(roleSeeds.dust);
+        let dustAddress: string;
+        try {
+            dustAddress = af.DustAddress.encodePublicKey(opts.network, dustKey.publicKey);
+        } finally {
+            dustKey.clear?.();
+        }
+
+        return { viewingKey, shieldedAddress, nightAddress, dustAddress, accountIndex, network: opts.network };
     } finally {
         bip39Seed.fill(0);
         roleSeeds.zswap.fill(0);

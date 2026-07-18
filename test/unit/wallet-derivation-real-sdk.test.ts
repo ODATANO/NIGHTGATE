@@ -30,7 +30,10 @@ const PIN = {
     shieldedAddressPreview: 'mn_shield-addr_preview1ywxc2p9986usecc9xert79afzq4m9x35u62sx0a4e2tc5w6mta5ulwhc432vhrlpnvygfep3pxcdt8tgzfstesrm6tf7hjc5jgpl20g2dm5vg',
     nightAddressPreview: 'mn_addr_preview1dwv2rta0a2skyhrvukaw2q9r2sq6yc4jhj63rf7afxpkrrv6g35q4y8xms',
     nightAddressPreviewAccount1: 'mn_addr_preview1kpq4jf9d35tjnw0jtx7vaexaavq7xyj0x497pcqzwqetuyrc7nrq37rt92',
-    nightAddressPreprod: 'mn_addr_preprod1dwv2rta0a2skyhrvukaw2q9r2sq6yc4jhj63rf7afxpkrrv6g35q49ekgd'
+    nightAddressPreprod: 'mn_addr_preprod1dwv2rta0a2skyhrvukaw2q9r2sq6yc4jhj63rf7afxpkrrv6g35q49ekgd',
+    dustAddressPreview: 'mn_dust_preview1wwcff2ckd4n5hfj43055td8glwtzkhhf6z88xwf0rpftvgstr7zpx50t9vq',
+    dustAddressPreviewAccount1: 'mn_dust_preview1wvw8w50c8fecwav6fnn0cltnpeuwnq2ngnfvrty7k2uqkjczw2ws7zaffu6',
+    dustAddressPreprod: 'mn_dust_preprod1wwcff2ckd4n5hfj43055td8glwtzkhhf6z88xwf0rpftvgstr7zpx43mk3q'
 };
 
 const hex = (u8: Uint8Array) => Buffer.from(u8).toString('hex');
@@ -87,6 +90,7 @@ describe('deriveWalletInfo (real ledger + address-format + unshielded SDKs)', ()
             viewingKey: PIN.viewingKey,
             shieldedAddress: PIN.shieldedAddressPreview,
             nightAddress: PIN.nightAddressPreview,
+            dustAddress: PIN.dustAddressPreview,
             accountIndex: 0,
             network: 'preview'
         });
@@ -96,12 +100,15 @@ describe('deriveWalletInfo (real ledger + address-format + unshielded SDKs)', ()
         const info = await deriveWalletInfo({ mnemonic: MNEMONIC, network: 'preprod' });
         expect(info.nightAddress).toBe(PIN.nightAddressPreprod);
         expect(info.nightAddress.startsWith('mn_addr_preprod1')).toBe(true);
+        expect(info.dustAddress).toBe(PIN.dustAddressPreprod);
+        expect(info.dustAddress.startsWith('mn_dust_preprod1')).toBe(true);
     });
 
     it('accountIndex 1 lands on the pinned second account', async () => {
         const info = await deriveWalletInfo({ mnemonic: MNEMONIC, network: 'preview', accountIndex: 1 });
         expect(info.nightAddress).toBe(PIN.nightAddressPreviewAccount1);
         expect(info.accountIndex).toBe(1);
+        expect(info.dustAddress).toBe(PIN.dustAddressPreviewAccount1);
     });
 
     it('accepts a raw 128-hex BIP39 seed and matches the mnemonic-derived result', async () => {

@@ -1082,11 +1082,12 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
             : await entry.facade.waitForSyncedState();
         log('info', `[worker] dust-deregister: synced.`);
 
-        // The SDK exposes `availableCoins` (unregistered-only) AND `allCoins`
-        // (full set) on the synced unshielded state. The full set is where
-        // registered UTXOs live; they're committed to dust gen so the SDK
-        // hides them from "available" but we still need them to deregister.
-        const allCoins: any[] = synced?.unshielded?.allCoins ?? synced?.unshielded?.coins ?? [];
+        // The full coin set is `totalCoins` on the current SDK's unshielded
+        // state (UnshieldedWalletState). Older SDKs called it `allCoins` /
+        // `coins`; keep those as fallbacks. Registered UTXOs only surface in
+        // the full set, and deregistration needs exactly those.
+        const allCoins: any[] = synced?.unshielded?.totalCoins
+            ?? synced?.unshielded?.allCoins ?? synced?.unshielded?.coins ?? [];
         const registered = allCoins.filter(
             (c: any) => c?.meta?.registeredForDustGeneration === true
         );
@@ -1108,7 +1109,22 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
             verifyingKey,
             signFn
         );
-        const finalized = await entry.facade.finalizeRecipe(recipe);
+        // The deregistration recipe is fee-less by design (allowFeePayment 0,
+        // no dust spends): the SDK expects THE CALLER to balance the fee via
+        // balanceUnprovenTransaction with tokenKindsToBalance ['dust'] (stated
+        // in the facade's createDustActionTransaction step-4 comment).
+        // Without it the node rejects 1010/138 BalanceCheckOverspend. The tx
+        // is already fully signed by the facade; an extra signRecipe pass
+        // DUPLICATES the offer signatures (1010/192). So: balance, then
+        // finalize, no re-signing. Consequence: deregistration needs dust in
+        // THIS wallet; a sponsor whose entire generation is delegated away
+        // cannot deregister until some dust accrues for itself.
+        const balanced = await entry.facade.balanceUnprovenTransaction(
+            recipe.transaction,
+            { shieldedSecretKeys: entry.zswapKeys, dustSecretKey: entry.dustKey },
+            { ttl: new Date(Date.now() + 10 * 60000), tokenKindsToBalance: ['dust'] }
+        );
+        const finalized = await entry.facade.finalizeRecipe(balanced);
         const txId = await entry.facade.submitTransaction(finalized);
 
         log('info', `[worker] dust-deregister: submitted ${registered.length} UTXO(s), txId=${String(txId).slice(0, 16)}...`);

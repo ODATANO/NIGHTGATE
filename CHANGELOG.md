@@ -1,5 +1,40 @@
 # Changelog
 
+## 0.7.3 - 2026-07-18
+
+### Feature: `deriveWalletInfo` returns the wallet's DUST address
+
+New `dustAddress` field (`mn_dust_<network>...`) on the derivation result,
+computed facade-free from the dust role seed
+(`DustSecretKey.fromSeed(...).publicKey` + `DustAddress.encodePublicKey`).
+This is the missing input for dust GENERATION DELEGATION (fee sponsoring):
+register a funded wallet's NIGHT with another wallet's `dustAddress` as
+`dustReceiverAddress` on `registerForDustGeneration`, and that wallet accrues
+the dust and pays its own fees while holding zero NIGHT. Proven live on
+preview: a zero-NIGHT wallet anchored a full attestation flow from sponsored
+dust.
+
+### Fix: `deregisterFromDustGeneration` works again (two bugs)
+
+1. The worker read the full coin set from `synced.unshielded.allCoins`, which
+   the current wallet SDK renamed to `totalCoins`; deregistration silently
+   reported 0/0 with registered UTXOs present. Now
+   `totalCoins ?? allCoins ?? coins`.
+2. The SDK's deregistration recipe is fee-less by design (`allowFeePayment`
+   0, no dust spends) and expects the CALLER to balance the fee via
+   `balanceUnprovenTransaction(tx, keys, { ttl, tokenKindsToBalance:
+   ['dust'] })`; submitting unbalanced is rejected by the node with
+   `1010 Custom error: 138` (BalanceCheckOverspend). The worker now balances
+   before finalizing. Note: the recipe is already fully signed; re-signing
+   after balancing duplicates the offer signatures (`1010/192`), so it is
+   balance -> finalize -> submit.
+
+Receiver rotation (deregister, then register with a new
+`dustReceiverAddress`) is thereby possible and live-verified. Inherent limit:
+a wallet whose entire generation is delegated away has no dust to pay its own
+deregistration fee.
+
+
 ## 0.7.2 - 2026-07-15
 
 ### Config: signing-key rate limit raised to 10/hour and made tunable
