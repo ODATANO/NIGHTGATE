@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.8.3 - 2026-07-19
+
+### Fix: background-job status writes retried under write contention
+
+The tiny `mark*` status UPDATEs in the job runner had no protection against
+SQLite write-lock loss. Observed live under two parallel sponsored runs: a
+job's failure write AND its `markFailed` fallback both hit 'database is
+locked', the row stayed non-terminal, and the consumer's poller only gave up
+at its own watchdog timeout ten minutes later. Now:
+
+1. `markRunning` / `markSucceeded` / `markFailed` and the
+   `recoverInterruptedJobs` sweep retry bounded (3 attempts, backoff) on
+   `database is locked` / SQLITE_BUSY. Only the status write is retried,
+   never the job work itself (no double-submit risk).
+2. If `markSucceeded` still cannot land, the job is closed as
+   `failed:RESULT_PERSIST_FAILED` with an explicit "on-chain effects may
+   exist" message instead of stranding pollers on a forever-'running' row.
+3. If even `markFailed` exhausts its retries, it logs the unpersisted
+   classification at error level (jobId + code + message) and returns; the
+   row is swept by restart recovery.
+
 ## 0.8.2 - 2026-07-19
 
 ### Fix: wallet-state persist sink hardened against write contention

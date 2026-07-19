@@ -261,7 +261,24 @@ export async function startJob<TIn, TOut>(
             // `work()` its own short acquire, commit, release cycle, so the
             // connection stays free during the long awaits.
             const result = await runWithoutAmbientTx(work);
-            await markSucceeded(jobId, result);
+            try {
+                await markSucceeded(jobId, result);
+            } catch (persistErr) {
+                // The work itself completed; only the status write kept losing
+                // the SQLite lock. Leaving the row 'running' would strand every
+                // poller until its own watchdog timeout, so give them an
+                // immediate, honest terminal state that warns about possible
+                // on-chain effects.
+                cds.log('nightgate').error(
+                    `markSucceeded(${jobId}): could not persist the result after ${STATUS_WRITE_ATTEMPTS} attempts; marking failed:RESULT_PERSIST_FAILED`,
+                    persistErr
+                );
+                await markFailed(jobId, {
+                    code:      'RESULT_PERSIST_FAILED',
+                    retryable: false,
+                    message:   'The job work completed but its result could not be persisted under database lock contention. On-chain effects may exist; verify chain state before retrying.'
+                });
+            }
         } catch (err) {
             const classification = classifySubmissionError(err, getNetwork());
             await markFailed(jobId, classification);
@@ -329,65 +346,126 @@ export async function recoverInterruptedJobs(): Promise<number> {
     );
     const count = Array.isArray(stuck) ? stuck.length : 0;
     if (count === 0) return 0;
-    await db.run(
-        UPDATE.entity(BackgroundJobs)
-            .set({
-                status:       'failed',
-                errorCode:    'PROCESS_RESTART',
-                errorMessage: 'Job was interrupted by a server restart.',
-                finishedAt:   new Date().toISOString()
-            })
-            .where({ status: { in: ['pending', 'running'] } })
-    );
+    await withStatusWriteRetry('recoverInterruptedJobs', async () => {
+        await db.run(
+            UPDATE.entity(BackgroundJobs)
+                .set({
+                    status:       'failed',
+                    errorCode:    'PROCESS_RESTART',
+                    errorMessage: 'Job was interrupted by a server restart.',
+                    finishedAt:   new Date().toISOString()
+                })
+                .where({ status: { in: ['pending', 'running'] } })
+        );
+    });
     return count;
 }
 
 // ---- Internal --------------------------------------------------------------
 
+// Status-write hardening. The mark* writes below are tiny single-row UPDATEs,
+// but under parallel runs they can lose the SQLite write lock to a long-held
+// foreign commit (for example a multi-MB wallet facade save that outlives
+// busy_timeout). A lost write leaves the job row non-terminal forever, and
+// pollers then die on their own watchdog timeout even when the work itself
+// finished. The writes are idempotent, so a bounded in-place retry is
+// unconditionally safe. Only the STATUS write is ever retried, never the job
+// work itself (that would risk a double submit).
+
+const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
+
+const STATUS_WRITE_ATTEMPTS = 3;
+const DEFAULT_STATUS_WRITE_BACKOFF_MS: readonly number[] = [0, 1500, 4000];
+let statusWriteBackoffMs: readonly number[] = DEFAULT_STATUS_WRITE_BACKOFF_MS;
+
+function isLockContention(err: unknown): boolean {
+    return /database is locked|SQLITE_BUSY/i.test(String((err as Error)?.message ?? err));
+}
+
+async function withStatusWriteRetry(label: string, write: () => Promise<void>): Promise<void> {
+    let lastErr: unknown;
+    for (let attempt = 0; attempt < STATUS_WRITE_ATTEMPTS; attempt++) {
+        if (statusWriteBackoffMs[attempt]) await sleep(statusWriteBackoffMs[attempt]);
+        try {
+            await write();
+            return;
+        } catch (err) {
+            if (!isLockContention(err)) throw err;
+            lastErr = err;
+            cds.log('nightgate').warn(`${label}: status write lost the SQLite lock (attempt ${attempt + 1}/${STATUS_WRITE_ATTEMPTS})`);
+        }
+    }
+    throw lastErr;
+}
+
 async function markRunning(jobId: string): Promise<void> {
     const db = await cds.connect.to('db');
-    await (db as any).tx(async (tx: any) => {
-        await tx.run(
-            UPDATE.entity(BackgroundJobs)
-                .set({ status: 'running', startedAt: new Date().toISOString() })
-                .where({ ID: jobId })
-        );
+    await withStatusWriteRetry(`markRunning(${jobId})`, async () => {
+        await (db as any).tx(async (tx: any) => {
+            await tx.run(
+                UPDATE.entity(BackgroundJobs)
+                    .set({ status: 'running', startedAt: new Date().toISOString() })
+                    .where({ ID: jobId })
+            );
+        });
     });
 }
 
 async function markSucceeded(jobId: string, result: unknown): Promise<void> {
     const db = await cds.connect.to('db');
-    await (db as any).tx(async (tx: any) => {
-        await tx.run(
-            UPDATE.entity(BackgroundJobs)
-                .set({
-                    status:     'succeeded',
-                    result:     safeStringify(result),
-                    finishedAt: new Date().toISOString()
-                })
-                .where({ ID: jobId })
-        );
+    await withStatusWriteRetry(`markSucceeded(${jobId})`, async () => {
+        await (db as any).tx(async (tx: any) => {
+            await tx.run(
+                UPDATE.entity(BackgroundJobs)
+                    .set({
+                        status:     'succeeded',
+                        result:     safeStringify(result),
+                        finishedAt: new Date().toISOString()
+                    })
+                    .where({ ID: jobId })
+            );
+        });
     });
 }
 
 async function markFailed(jobId: string, classification: SubmissionErrorClassification): Promise<void> {
     const db = await cds.connect.to('db');
-    await (db as any).tx(async (tx: any) => {
-        await tx.run(
-            UPDATE.entity(BackgroundJobs)
-                .set({
-                    status:       'failed',
-                    errorCode:    classification.code.slice(0, 64),
-                    errorMessage: classification.message.slice(0, 4000),
-                    finishedAt:   new Date().toISOString()
-                })
-                .where({ ID: jobId })
+    try {
+        await withStatusWriteRetry(`markFailed(${jobId})`, async () => {
+            await (db as any).tx(async (tx: any) => {
+                await tx.run(
+                    UPDATE.entity(BackgroundJobs)
+                        .set({
+                            status:       'failed',
+                            errorCode:    classification.code.slice(0, 64),
+                            errorMessage: classification.message.slice(0, 4000),
+                            finishedAt:   new Date().toISOString()
+                        })
+                        .where({ ID: jobId })
+                );
+            });
+        });
+    } catch (err) {
+        // Last line of defense. Nothing upstream can act on this failure, but
+        // the operator needs the real classification in the log to correlate
+        // a later poller timeout with what actually happened. The row stays
+        // non-terminal until restart recovery sweeps it.
+        cds.log('nightgate').error(
+            `markFailed(${jobId}): could not persist the failure status after ${STATUS_WRITE_ATTEMPTS} attempts; ` +
+            `job row stays non-terminal until restart recovery. Unpersisted error: ${classification.code}: ${classification.message}`,
+            err
         );
-    });
+    }
 }
 
 /** Test-only reset of the in-memory caches. */
 export function __resetForTests(): void {
     semaphores.clear();
     cachedNetwork = undefined;
+    statusWriteBackoffMs = DEFAULT_STATUS_WRITE_BACKOFF_MS;
+}
+
+/** Test-only override of the status-write retry backoff schedule. */
+export function __setStatusWriteBackoffForTests(ms: readonly number[]): void {
+    statusWriteBackoffMs = ms;
 }

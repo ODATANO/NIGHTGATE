@@ -42,6 +42,11 @@ function matchesWhere(row: any, where: Record<string, unknown>): boolean {
     return true;
 }
 
+// Injects "database is locked" failures into UPDATE queries, optionally only
+// for updates that set a specific target status. Simulates the SQLite write
+// lock being held by a foreign long commit.
+const lockInjector = vi.hoisted(() => ({ failUpdates: 0, matchStatus: null as string | null }));
+
 const runMock = vi.hoisted(() => (vi.fn(async (q: any) => {
     if (!q || typeof q !== 'object') return undefined;
     if (q.kind === 'selectOne') {
@@ -80,6 +85,10 @@ const runMock = vi.hoisted(() => (vi.fn(async (q: any) => {
         return undefined;
     }
     if (q.kind === 'update') {
+        if (lockInjector.failUpdates > 0 && (!lockInjector.matchStatus || q.set?.status === lockInjector.matchStatus)) {
+            lockInjector.failUpdates--;
+            throw new Error('database is locked');
+        }
         for (const row of rows.values()) {
             if (matchesWhere(row, q.where)) Object.assign(row, q.set, { modifiedAt: new Date().toISOString() });
         }
@@ -129,9 +138,11 @@ vi.mock('@sap/cds', () => {
         tx:  async (fn: any) => fn(dbHandle)
     };
 
+    const logHandle = { warn: vi.fn(), error: vi.fn(), info: vi.fn(), debug: vi.fn() };
     const cds: any = {
         ql: { SELECT, INSERT, UPDATE },
         connect: { to: vi.fn(async () => dbHandle) },
+        log: vi.fn(() => logHandle),
         env: { requires: {} },
         // Passthrough: the real cds._with runs fn under a cleared
         // AsyncLocalStorage store; for the mock we just invoke it.
@@ -158,7 +169,8 @@ import {
     startJob,
     getJobById,
     recoverInterruptedJobs,
-    __resetForTests
+    __resetForTests,
+    __setStatusWriteBackoffForTests
 } from '../../srv/submission/background-jobs';
 
 async function flushSpawn(): Promise<void> {
@@ -171,6 +183,8 @@ async function flushSpawn(): Promise<void> {
 beforeEach(() => {
     rows.clear();
     runMock.mockClear();
+    lockInjector.failUpdates = 0;
+    lockInjector.matchStatus = null;
     __resetForTests();
 });
 
@@ -513,5 +527,140 @@ describe('recoverInterruptedJobs', () => {
 
     test('returns 0 and is a no-op when no rows are in flight', async () => {
         expect(await recoverInterruptedJobs()).toBe(0);
+    });
+
+    test('survives transient lock contention on the recovery UPDATE', async () => {
+        __setStatusWriteBackoffForTests([0, 0, 0]);
+        const now = new Date().toISOString();
+        rows.set('p1', { ID: 'p1', kind: 'sendNight', sessionId: 's', status: 'pending', idempotencyKey: null, request: null, result: null, errorCode: null, errorMessage: null, startedAt: null, finishedAt: null, createdAt: now, modifiedAt: now });
+
+        lockInjector.failUpdates = 2;
+        lockInjector.matchStatus = 'failed';
+
+        const count = await recoverInterruptedJobs();
+        expect(count).toBe(1);
+        expect(rows.get('p1')!.status).toBe('failed');
+        expect(rows.get('p1')!.errorCode).toBe('PROCESS_RESTART');
+    });
+});
+
+// ---- Status-write contention hardening ---------------------------------------
+//
+// Simulates the live incident of 2026-07-19: a foreign long commit (multi-MB
+// facade save) holds the SQLite write lock past busy_timeout, so the tiny
+// mark* status UPDATEs throw "database is locked". Without retries, the job
+// row is stranded in a non-terminal state and pollers die on their own
+// watchdog timeout.
+
+describe('status-write contention hardening', () => {
+    beforeEach(() => {
+        // Backoff without waiting; the schedule only skips zero entries.
+        __setStatusWriteBackoffForTests([0, 0, 0]);
+    });
+
+    test('markSucceeded survives transient lock contention (2 lost races)', async () => {
+        lockInjector.failUpdates = 2;
+        lockInjector.matchStatus = 'succeeded';
+
+        const ret = await startJob({
+            kind:      'sendNight',
+            sessionId: 'sess-1',
+            request:   {},
+            work:      async () => ({ txId: 'tx-locked-then-fine' })
+        });
+        await flushSpawn();
+
+        const row = rows.get(ret.jobId)!;
+        expect(row.status).toBe('succeeded');
+        expect(JSON.parse(row.result!)).toEqual({ txId: 'tx-locked-then-fine' });
+        expect(lockInjector.failUpdates).toBe(0);
+    });
+
+    test('markFailed survives transient lock contention and persists the real classification', async () => {
+        lockInjector.failUpdates = 2;
+        lockInjector.matchStatus = 'failed';
+
+        const ret = await startJob({
+            kind:      'sendNight',
+            sessionId: 'sess-1',
+            request:   {},
+            work:      async () => { throw new Error('Transaction pool full: 1016 Immediately Dropped'); }
+        });
+        await flushSpawn();
+
+        const row = rows.get(ret.jobId)!;
+        expect(row.status).toBe('failed');
+        expect(row.errorCode).toBe('1016');
+    });
+
+    test('markSucceeded exhausted: job ends failed:RESULT_PERSIST_FAILED instead of stranded running', async () => {
+        // 3 lost races exhaust the succeeded write; the fallback markFailed
+        // write (status 'failed') must go through.
+        lockInjector.failUpdates = 3;
+        lockInjector.matchStatus = 'succeeded';
+
+        const ret = await startJob({
+            kind:      'sendNight',
+            sessionId: 'sess-1',
+            request:   {},
+            work:      async () => ({ txId: 'tx-landed-on-chain' })
+        });
+        await flushSpawn();
+
+        const row = rows.get(ret.jobId)!;
+        expect(row.status).toBe('failed');
+        expect(row.errorCode).toBe('RESULT_PERSIST_FAILED');
+        expect(row.errorMessage).toMatch(/On-chain effects may exist/);
+    });
+
+    test('markFailed exhausted: logs and returns without throwing; row stays non-terminal', async () => {
+        // All 'failed' writes lose the lock, including the fallback. The
+        // function must swallow the failure (nothing upstream can act on it);
+        // the row remains 'running' until restart recovery sweeps it.
+        lockInjector.failUpdates = 99;
+        lockInjector.matchStatus = 'failed';
+
+        const ret = await startJob({
+            kind:      'sendNight',
+            sessionId: 'sess-1',
+            request:   {},
+            work:      async () => { throw new Error('boom'); }
+        });
+        await flushSpawn();
+
+        const row = rows.get(ret.jobId)!;
+        expect(row.status).toBe('running');
+        expect(row.finishedAt).toBeNull();
+    });
+
+    test('non-lock errors in a status write are NOT retried', async () => {
+        // A genuine defect must surface immediately instead of burning the
+        // retry budget. Inject a non-lock failure into the succeeded write.
+        let updateCalls = 0;
+        const original = runMock.getMockImplementation()!;
+        runMock.mockImplementation(async (q: any) => {
+            if (q?.kind === 'update' && q.set?.status === 'succeeded') {
+                updateCalls++;
+                throw new Error('no such column: bogus');
+            }
+            return original(q);
+        });
+
+        const ret = await startJob({
+            kind:      'sendNight',
+            sessionId: 'sess-1',
+            request:   {},
+            work:      async () => ({ ok: true })
+        });
+        await flushSpawn();
+
+        // The write was attempted exactly once, and the RESULT_PERSIST_FAILED
+        // fallback still turned the row terminal.
+        expect(updateCalls).toBe(1);
+        const row = rows.get(ret.jobId)!;
+        expect(row.status).toBe('failed');
+        expect(row.errorCode).toBe('RESULT_PERSIST_FAILED');
+
+        runMock.mockImplementation(original);
     });
 });
