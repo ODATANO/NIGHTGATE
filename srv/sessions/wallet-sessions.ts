@@ -276,11 +276,12 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
         const userId = requireUserId(req);
         if (!userId) return;
 
-        const { sessionId, mnemonic, seedHex, idempotencyKey } = req.data as {
+        const { sessionId, mnemonic, seedHex, idempotencyKey, prewarm } = req.data as {
             sessionId: string;
             mnemonic?: string;
             seedHex?: string;
             idempotencyKey?: string;
+            prewarm?: boolean;
         };
         if (!sessionId) return req.reject(400, 'sessionId is required');
 
@@ -320,6 +321,16 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
                 .set({ encryptedSeedKey })
                 .where({ sessionId, userId })
         );
+
+        // prewarm:false skips scheduling the sync-to-tip job entirely. For
+        // sponsored callers that hold nothing (0.8.1, paired with
+        // NIGHTGATE_SPONSORED_CALLER_SYNC=skip) the prewarm buys nothing and
+        // its background sync would race the submission's on-demand facade
+        // init on the same accountId. Submissions ensure the facade
+        // themselves, so signing still works without it.
+        if (prewarm === false) {
+            return { sessionId, signingEnabled: true, prewarmJobId: null, prewarmStatus: null };
+        }
 
         // Pre-warm the WalletFacade as a tracked background job so callers can
         // poll its status via getJobStatus(prewarmJobId, sessionId). Previously

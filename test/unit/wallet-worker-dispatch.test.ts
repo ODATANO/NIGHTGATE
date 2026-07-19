@@ -642,6 +642,27 @@ describe('buildSponsoredWalletProvider', () => {
         }
     });
 
+    it('NIGHTGATE_SPONSORED_CALLER_SYNC=skip bypasses the CALLER sync only', async () => {
+        withSyncedIndexer();
+        process.env.NIGHTGATE_SPONSORED_CALLER_SYNC = 'skip';
+        try {
+            const { caller, sponsor, sponsorFacade } = makePair();
+            // waitForGenuineSync reads state via facade.state(); spy on both.
+            const callerState = vi.fn(caller.facade.state);
+            const sponsorState = vi.fn(sponsor.facade.state);
+            caller.facade.state = callerState;
+            sponsor.facade.state = sponsorState;
+
+            await workerExports.buildSponsoredWalletProvider(caller, sponsor).balanceTx({});
+            expect(callerState).not.toHaveBeenCalled();       // caller sync skipped
+            expect(sponsorState).toHaveBeenCalled();          // sponsor sync stays mandatory
+            expect(sponsorFacade.balanceFinalizedTransaction).toHaveBeenCalled();
+        } finally {
+            delete process.env.NIGHTGATE_SPONSORED_CALLER_SYNC;
+            vi.unstubAllGlobals();
+        }
+    });
+
     it('balanceTx FAILS FAST when the sponsored tx still has an empty DustActions section', async () => {
         withSyncedIndexer();
         try {

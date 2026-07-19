@@ -203,6 +203,28 @@ describe('connectWalletForSigning: state transitions', () => {
         expect(typeof startArgs.work).toBe('function');
     });
 
+    test('prewarm:false skips the prewarm job but still enables signing', async () => {
+        const srv = makeFakeService();
+        const db = makeFakeDb();
+        seedSession(db);
+        mockStartJob.mockClear();
+        registerWalletSessionHandlers(srv as any, db);
+
+        const req = makeReq({ sessionId: 'sess-1', seedHex: VALID_SEED, prewarm: false });
+        const result = await srv.handlers['connectWalletForSigning'](req);
+
+        expect(result).toEqual({
+            sessionId:      'sess-1',
+            signingEnabled: true,
+            prewarmJobId:   null,
+            prewarmStatus:  null
+        });
+        // Seed still encrypted + persisted; only the sync job was skipped.
+        const row = db.tables['midnight.WalletSessions'][0];
+        expect(decrypt(row.encryptedSeedKey, getEncryptionKey())).toBe(VALID_SEED);
+        expect(mockStartJob).not.toHaveBeenCalled();
+    });
+
     test('forwards idempotencyKey to startJob when provided', async () => {
         const srv = makeFakeService();
         const db = makeFakeDb();

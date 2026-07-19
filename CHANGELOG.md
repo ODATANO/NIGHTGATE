@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.8.1 - 2026-07-19
+
+### Sponsored submissions: instant callers
+
+Two changes that let a sponsored caller wallet submit within seconds instead
+of waiting out a full chain sync:
+
+1. **`NIGHTGATE_SPONSORED_CALLER_SYNC=skip`** bypasses the CALLER's
+   genuine-sync wait in the two-phase sponsored balancing. The caller only
+   balances shielded/unshielded; a wallet that provably holds nothing (e.g. a
+   public demo minting fresh identity wallets) has nothing to select, so the
+   wait buys nothing. Default stays `genuine` (safe for callers that hold
+   coins). The SPONSOR's sync is unconditional: it spends the dust.
+2. **Submission jobs ensure the caller facade on demand.** WalletMaterial
+   gains `ensureFacade()` (idempotent worker init, same call the
+   connectWalletForSigning prewarm makes); every submission handler invokes
+   it before dispatching. A session that was never prewarmed, or whose
+   facade was evicted, no longer fails with "No facade for sessionId".
+3. **`connectWalletForSigning(prewarm: false)`** skips scheduling the
+   sync-to-tip prewarm job entirely. Pair it with the env skip above:
+   without it, the background prewarm sync races the submission's on-demand
+   facade init on the same account (observed live as an SQLITE_BUSY storm).
+
 ## 0.8.0 - 2026-07-18
 
 ### Feature: per-transaction fee sponsoring (`sponsorSessionId`)

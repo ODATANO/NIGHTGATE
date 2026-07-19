@@ -86,6 +86,14 @@ export interface WalletMaterial {
      *   destroys the private state").
      */
     privateStateBackend?: PrivateStateBackend;
+    /**
+     * Idempotently initialises this wallet's facade in the worker (same call
+     * the connectWalletForSigning prewarm makes). Present when the session
+     * carries signing material and a facade config. Submission jobs call it
+     * before dispatching so a session that was never prewarmed (or whose
+     * facade was evicted) does not fail with "No facade for sessionId".
+     */
+    ensureFacade?: () => Promise<void>;
 }
 
 /**

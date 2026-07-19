@@ -603,9 +603,17 @@ export function buildSponsoredWalletProvider(caller: FacadeEntry, sponsor: Facad
         async balanceTx(tx: any, ttl?: Date): Promise<any> {
             // The SPONSOR spends the dust, so ITS wallet must be genuinely
             // synced (stale dust merkle roots are the Custom error 117 site).
-            // The caller only balances shielded/unshielded, but sync it too so
-            // stale coin state cannot double-select inputs.
-            await waitForGenuineSync(caller.facade, caller.indexerHttpUrl, BALANCE_SYNC_TIMEOUT_MS, 'sponsored-balance caller');
+            // The caller only balances shielded/unshielded; by default sync it
+            // too so stale coin state cannot double-select inputs. Deployments
+            // whose sponsored callers are known to hold nothing (e.g. a public
+            // demo minting fresh identity wallets) can skip the caller wait
+            // with NIGHTGATE_SPONSORED_CALLER_SYNC=skip: with no coins there
+            // is nothing to select, and the fee side is the sponsor's alone.
+            if (process.env.NIGHTGATE_SPONSORED_CALLER_SYNC === 'skip') {
+                log('info', '[worker] sponsored-balance: caller sync SKIPPED (NIGHTGATE_SPONSORED_CALLER_SYNC=skip)');
+            } else {
+                await waitForGenuineSync(caller.facade, caller.indexerHttpUrl, BALANCE_SYNC_TIMEOUT_MS, 'sponsored-balance caller');
+            }
             await waitForGenuineSync(sponsor.facade, sponsor.indexerHttpUrl, BALANCE_SYNC_TIMEOUT_MS, 'sponsored-balance sponsor');
             const effectiveTtl = ttl ?? new Date(Date.now() + 30 * 60 * 1000);
 

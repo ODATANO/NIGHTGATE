@@ -162,6 +162,7 @@ export function registerSubmissionHandlers(
                 idempotencyKey,
                 request: { compiledArtifactRef, sessionId, hasInitialState: !!initialPrivateState, feeSponsor: sponsor?.sponsorSessionId ?? null },
                 work: async () => {
+                    await wallet.ensureFacade?.();
                     if (sponsor) await ensureFeeSponsorFacade(sponsor, facadeCfg);
                     const result = await submitter.deploy({
                         contractName: compiledArtifactRef,
@@ -246,6 +247,7 @@ export function registerSubmissionHandlers(
                 idempotencyKey,
                 request: { contractAddress, circuit, compiledArtifactRef, sessionId, argCount: coercedArgs.length, feeSponsor: sponsor?.sponsorSessionId ?? null },
                 work: async () => {
+                    await wallet.ensureFacade?.();
                     if (sponsor) await ensureFeeSponsorFacade(sponsor, facadeCfg);
                     const result = await submitter.call({
                         contractAddress,
@@ -348,6 +350,7 @@ export function registerSubmissionHandlers(
                     feeSponsor: sponsor?.sponsorSessionId ?? null
                 },
                 work: async () => {
+                    await wallet.ensureFacade?.();
                     if (sponsor) await ensureFeeSponsorFacade(sponsor, facadeCfg);
                     const result = await submitter.call({
                         contractAddress: data.contractAddress!,
@@ -548,6 +551,7 @@ export function registerSubmissionHandlers(
                     feeSponsor: sponsor?.sponsorSessionId ?? null
                 },
                 work: async () => {
+                    await wallet.ensureFacade?.();
                     if (sponsor) await ensureFeeSponsorFacade(sponsor, facadeCfg);
                     // 1. Bind the numeric commitment to the attestation. The
                     //    commitment is computed in-circuit from the witnesses.
@@ -721,6 +725,7 @@ export function registerSubmissionHandlers(
                     feeSponsor: sponsor?.sponsorSessionId ?? null
                 },
                 work: async () => {
+                    await wallet.ensureFacade?.();
                     if (sponsor) await ensureFeeSponsorFacade(sponsor, facadeCfg);
                     // 1. Anchor the content root (idempotent overwrite) if supplied,
                     //    so proveFieldPredicate has a root to bind against. Uses only
@@ -922,6 +927,7 @@ export function registerSubmissionHandlers(
                     feeSponsor: sponsor?.sponsorSessionId ?? null
                 },
                 work: async () => {
+                    await wallet.ensureFacade?.();
                     if (sponsor) await ensureFeeSponsorFacade(sponsor, facadeCfg);
                     const result = await submitter.call({
                         contractAddress: contractAddressLc,
@@ -1011,6 +1017,7 @@ export function registerSubmissionHandlers(
                     feeSponsor: sponsor?.sponsorSessionId ?? null
                 },
                 work: async () => {
+                    await wallet.ensureFacade?.();
                     if (sponsor) await ensureFeeSponsorFacade(sponsor, facadeCfg);
                     const result = await submitter.call({
                         contractAddress: contractAddressLc,

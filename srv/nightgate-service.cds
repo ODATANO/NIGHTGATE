@@ -649,7 +649,10 @@ service NightgateService {
         sessionId:      UUID,
         mnemonic:       String,  // BIP39 recovery phrase (preferred)
         seedHex:        String,  // optional: 64-byte BIP39 seed as 128 hex chars
-        idempotencyKey: String   // optional; dedupes retries on a flaky network
+        idempotencyKey: String,  // optional; dedupes retries on a flaky network
+        prewarm:        Boolean  // optional; false skips the sync-to-tip prewarm job
+                                 // (for sponsored callers that hold nothing; submissions
+                                 // ensure the facade on demand since 0.8.1)
     ) returns {
         sessionId:      UUID;
         signingEnabled: Boolean;

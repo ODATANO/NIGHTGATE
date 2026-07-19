@@ -117,6 +117,7 @@ export async function buildWalletMaterialForSession(opts: BuildWalletMaterialOpt
     const password  = deriveStoragePassword(viewingKey);
 
     let walletAndMidnightProvider: any;
+    let ensureFacade: (() => Promise<void>) | undefined;
     if (session.encryptedSeedKey) {
         // Real signing material is present.
         let seedHex: string;
@@ -132,6 +133,12 @@ export async function buildWalletMaterialForSession(opts: BuildWalletMaterialOpt
                 seedHex,
                 { ...opts.facadeConfig, syncStatePassphrase: password }
             );
+            // Worker-routed submissions look the facade up by accountId; make
+            // it creatable on demand so a never-prewarmed (or evicted) session
+            // does not die with "No facade for sessionId". Idempotent: a
+            // prewarmed facade is a worker-side cache hit.
+            const facadeArgs = { ...opts.facadeConfig, seedHex, syncStatePassphrase: password };
+            ensureFacade = async () => { await getOrBuildWalletFacade(accountId, facadeArgs); };
         } else {
             // Seed present but no facade configured: pubkeys real, signing throws.
             walletAndMidnightProvider = await createSigningCapableWalletAdapter(seedHex);
@@ -144,7 +151,8 @@ export async function buildWalletMaterialForSession(opts: BuildWalletMaterialOpt
         accountId,
         privateStoragePasswordProvider: () => password,
         walletAndMidnightProvider,
-        privateStateBackend: opts.privateStateBackend
+        privateStateBackend: opts.privateStateBackend,
+        ensureFacade
     };
 }
 

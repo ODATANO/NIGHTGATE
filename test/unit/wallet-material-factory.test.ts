@@ -59,6 +59,11 @@ vi.mock('../../srv/utils/wallet-hd', async () => {
     };
 });
 
+const getOrBuildWalletFacadeMock = vi.hoisted(() => vi.fn(async () => ({ facade: {} })));
+vi.mock('../../srv/submission/wallet-facade-builder', () => ({
+    getOrBuildWalletFacade: getOrBuildWalletFacadeMock
+}));
+
 import {
     buildWalletMaterialForSession,
     deriveAccountId,
@@ -143,6 +148,51 @@ describe('buildWalletMaterialForSession', () => {
         expect(pw).toBe(deriveStoragePassword(viewingKey));
         expect(pw.length).toBeGreaterThanOrEqual(16);
         expect(material.walletAndMidnightProvider).toBeDefined();
+    });
+
+    test('exposes ensureFacade for seed+facadeConfig sessions and inits the worker facade', async () => {
+        const viewingKey = 'mn_shield-vk_ensure';
+        const seedHex = 'ab'.repeat(64);
+        const db = makeDbWithSession(buildEncryptedSession(viewingKey, {
+            encryptedSeedKey: encrypt(seedHex, TEST_KEY)
+        }));
+        const facadeConfig = {
+            networkId: 'preview' as const,
+            indexerHttpUrl: 'http://i', indexerWsUrl: 'ws://i',
+            proofServerUrl: 'http://p', relayUrl: 'ws://r'
+        };
+        const material = await buildWalletMaterialForSession({
+            sessionId: 'sess-1', db, encryptionKey: TEST_KEY, facadeConfig
+        });
+        expect(typeof material.ensureFacade).toBe('function');
+        getOrBuildWalletFacadeMock.mockClear();
+        await material.ensureFacade!();
+        expect(getOrBuildWalletFacadeMock).toHaveBeenCalledWith(
+            deriveAccountId(viewingKey),
+            expect.objectContaining({
+                seedHex,
+                syncStatePassphrase: deriveStoragePassword(viewingKey),
+                networkId: 'preview'
+            })
+        );
+    });
+
+    test('ensureFacade is absent without signing material or without a facade config', async () => {
+        const viewingKey = 'mn_shield-vk_noensure';
+        // Viewing-key-only session.
+        const dbViewOnly = makeDbWithSession(buildEncryptedSession(viewingKey));
+        const viewOnly = await buildWalletMaterialForSession({
+            sessionId: 'sess-1', db: dbViewOnly, encryptionKey: TEST_KEY
+        });
+        expect(viewOnly.ensureFacade).toBeUndefined();
+        // Seed present but no facadeConfig.
+        const dbSeed = makeDbWithSession(buildEncryptedSession(viewingKey, {
+            encryptedSeedKey: encrypt('cd'.repeat(64), TEST_KEY)
+        }));
+        const seedNoCfg = await buildWalletMaterialForSession({
+            sessionId: 'sess-1', db: dbSeed, encryptionKey: TEST_KEY
+        });
+        expect(seedNoCfg.ensureFacade).toBeUndefined();
     });
 
     test('throws SessionNotFoundError when session is missing', async () => {
