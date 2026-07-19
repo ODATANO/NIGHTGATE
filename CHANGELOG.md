@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.8.2 - 2026-07-19
+
+### Fix: wallet-state persist sink hardened against write contention
+
+With many concurrently active facades (sponsor pools, parallel consumer
+runs) the periodic state saves kept losing the SQLite write lock to foreign
+commit traffic and failed on every tick ('database is locked' storms, up to
+pool starvation). `saveSyncState` now serializes ALL persists through one
+global in-process chain (across accounts; the CPU-heavy PBKDF2/AES stays
+outside it) and retries the short DB section bounded (3 attempts, backoff)
+on write contention. Measured with a consumer's 3-way parallel sponsored
+runs: zero persist failures, all runs green.
+
 ## 0.8.1 - 2026-07-19
 
 ### Sponsored submissions: instant callers

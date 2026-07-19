@@ -17,8 +17,14 @@
  * `worker_threads` worker, so CAP's Promise machinery resolves normally.
  * See `srv/midnight/wallet-worker.ts` and `wallet-worker-client.ts`.
  *
- * Concurrency: a per-accountId in-process mutex serializes saves so two
- * overlapping ticks can't race the upsert.
+ * Concurrency: ONE global in-process chain serializes all persists (across
+ * accounts, which implies per-account), and the DB section retries bounded
+ * on write contention. Measured under parallel consumer runs (NIGHTPASS demo
+ * pool): with 6+ active facades and concurrent foreign commits, interleaved
+ * per-account saves kept losing the SQLite write lock ('database is locked'
+ * on every tick) and the re-push turned into a standing retry storm. The
+ * CPU-heavy part (PBKDF2 + AES) stays OUTSIDE the chain so only the short
+ * DB writes are serialized.
  */
 
 import cds from '@sap/cds';
@@ -87,16 +93,24 @@ async function getDb(): Promise<cds.DatabaseService> {
     return dbPromise;
 }
 
-// ---- Per-accountId save mutex --------------------------------------------
+// ---- Global persist chain -------------------------------------------------
 
-const saveMutex = new Map<string, Promise<void>>();
+/** All persists queue here, across accounts (see the module docstring). */
+let saveChain: Promise<void> = Promise.resolve();
+
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+/** Bounded retry for the persist's DB section: write contention with foreign
+ *  commit traffic (job rows, consumer writes) is transient and the payload
+ *  is idempotent, so retrying in place beats waiting for the next 30s tick. */
+const SAVE_ATTEMPTS = 3;
+const SAVE_BACKOFF_MS = [0, 1500, 4000];
 
 /**
  * Encrypts (if non-null) and persists the wallet sub-states.
  *
- * Idempotent per (accountId): a row is upserted by primary key. Concurrent
- * saves for the same accountId are serialised via the in-process mutex so
- * later writes always win.
+ * Idempotent per (accountId): a row is upserted by primary key. All persists
+ * are serialized through one global chain and retried on write contention.
  */
 export async function saveSyncState(args: SaveSyncStateArgs): Promise<void> {
     const { accountId, passphrase, sdkVersion, states, networkId, seedFingerprint } = args;
@@ -106,19 +120,18 @@ export async function saveSyncState(args: SaveSyncStateArgs): Promise<void> {
 
     const db = await getDb();
 
-    const previous = saveMutex.get(accountId) ?? Promise.resolve();
     const callId = Math.random().toString(36).slice(2, 8);
-    dbgSync(`[save-sync-state] ${callId} queued (accountId=${accountId.slice(0, 16)})`);
-    const next = previous.then(async () => {
-        dbgSync(`[save-sync-state] ${callId} starting StorageEncryption ctor (PBKDF2)`);
-        const t0 = Date.now();
-        const enc = new StorageEncryption(passphrase);
-        dbgSync(`[save-sync-state] ${callId} StorageEncryption ctor done in ${Date.now() - t0}ms`);
-        const shieldedCipher   = states.shielded   ? enc.encrypt(states.shielded)   : null;
-        const unshieldedCipher = states.unshielded ? enc.encrypt(states.unshielded) : null;
-        const dustCipher       = states.dust       ? enc.encrypt(states.dust)       : null;
-        dbgSync(`[save-sync-state] ${callId} encrypt done in ${Date.now() - t0}ms`);
+    // CPU-heavy crypto OUTSIDE the chain: PBKDF2 + AES of multi-MB blobs may
+    // take real milliseconds and needs no serialization.
+    dbgSync(`[save-sync-state] ${callId} starting StorageEncryption ctor (PBKDF2)`);
+    const t0 = Date.now();
+    const enc = new StorageEncryption(passphrase);
+    const shieldedCipher   = states.shielded   ? enc.encrypt(states.shielded)   : null;
+    const unshieldedCipher = states.unshielded ? enc.encrypt(states.unshielded) : null;
+    const dustCipher       = states.dust       ? enc.encrypt(states.dust)       : null;
+    dbgSync(`[save-sync-state] ${callId} encrypt done in ${Date.now() - t0}ms`);
 
+    const persistOnce = async (): Promise<void> => {
         const now = new Date().toISOString();
         const t1 = Date.now();
         const existing = await db.run(
@@ -127,7 +140,6 @@ export async function saveSyncState(args: SaveSyncStateArgs): Promise<void> {
         dbgSync(`[save-sync-state] ${callId} SELECT done in ${Date.now() - t1}ms, existing=${!!existing}`);
 
         if (existing) {
-            const t2 = Date.now();
             // Preserve previously-stored blobs when this save passes null for
             // a sub-wallet (caller might serialize only what's changed).
             await db.run(
@@ -143,9 +155,7 @@ export async function saveSyncState(args: SaveSyncStateArgs): Promise<void> {
                     })
                     .where({ accountId })
             );
-            dbgSync(`[save-sync-state] ${callId} UPDATE done in ${Date.now() - t2}ms`);
         } else {
-            const t2 = Date.now();
             await db.run(
                 INSERT.into(WalletSyncStates).entries({
                     accountId,
@@ -159,23 +169,32 @@ export async function saveSyncState(args: SaveSyncStateArgs): Promise<void> {
                     updatedAt:           now
                 })
             );
-            dbgSync(`[save-sync-state] ${callId} INSERT done in ${Date.now() - t2}ms`);
         }
-        dbgSync(`[save-sync-state] ${callId} chain complete`);
-    });
+    };
 
-    // The mutex tracks the rejection-safe chain so the next caller waits even
-    // if this save throws; the actual `await next` below propagates the throw
-    // to the caller.
-    const tracked = next.catch(() => undefined);
-    saveMutex.set(accountId, tracked);
-    try {
-        await next;
-    } finally {
-        if (saveMutex.get(accountId) === tracked) {
-            saveMutex.delete(accountId);
+    const work = async (): Promise<void> => {
+        let lastErr: unknown;
+        for (let attempt = 0; attempt < SAVE_ATTEMPTS; attempt++) {
+            if (SAVE_BACKOFF_MS[attempt]) await sleep(SAVE_BACKOFF_MS[attempt]);
+            try {
+                await persistOnce();
+                dbgSync(`[save-sync-state] ${callId} chain complete (attempt ${attempt + 1})`);
+                return;
+            } catch (e) {
+                lastErr = e;
+                const msg = String((e as Error)?.message ?? e);
+                if (!/database is locked|SQLITE_BUSY/i.test(msg)) throw e;
+                dbgSync(`[save-sync-state] ${callId} write contention (attempt ${attempt + 1}): ${msg.slice(0, 60)}`);
+            }
         }
-    }
+        throw lastErr;
+    };
+
+    dbgSync(`[save-sync-state] ${callId} queued (accountId=${accountId.slice(0, 16)})`);
+    const next = saveChain.then(work, work);
+    // Keep the chain rejection-safe so one failed save never wedges the rest.
+    saveChain = next.catch(() => undefined);
+    await next;
 }
 
 /**
