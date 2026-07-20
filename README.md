@@ -92,12 +92,12 @@ Submit actions are **async**: they return `{ jobId, status }`; poll `getJobStatu
 
 ## Documentation
 
-- **[Quickstart](docs/quickstart.md)** — get from zero to first wallet-signed transaction
-- **[Actions reference](docs/actions.md)** — every OData action + function with examples
-- **[Architecture](docs/architecture.md)** — worker-thread design, submission flow, persistence model
-- **[Operations](docs/operations.md)** — running NIGHTGATE day to day, scripts, local indexer, troubleshooting
-- **[Reference](docs/reference.md)** — full configuration matrix + project structure
-- **[Changelog](CHANGELOG.md)** — notable changes by version
+- **[Quickstart:](docs/quickstart.md)** get from zero to first wallet-signed transaction
+- **[Actions reference:](docs/actions.md)** every OData action + function with examples
+- **[Architecture:](docs/architecture.md)** worker-thread design, submission flow, persistence model
+- **[Operations:](docs/operations.md)** running NIGHTGATE day to day, scripts, local indexer, troubleshooting
+- **[Reference:](docs/reference.md)** full configuration matrix + project structure
+- **[Changelog:](CHANGELOG.md)** notable changes by version
 
 ## Use as a CAP plugin in another app
 
@@ -149,4 +149,5 @@ npm run deploy:e2e         # + predicate:e2e, disclosure:e2e, state-verify:e2e
 
 - [ODATANO GitHub org](https://github.com/ODATANO)
 - [Midnight Network](https://midnight.network/)
+- [Consumer App Implementation](https://github.com/ODATANO/NIGHTPASS)
 - [SAP CAP Documentation](https://cap.cloud.sap/docs/)
