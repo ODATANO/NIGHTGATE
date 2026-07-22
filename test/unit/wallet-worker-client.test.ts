@@ -9,6 +9,7 @@
  */
 
 import type { Mock, MockInstance } from 'vitest';
+import cds from '@sap/cds';
 import { EventEmitter } from 'node:events';
 
 type SentMessage = {
@@ -103,8 +104,8 @@ describe('wallet-worker-client', () => {
     let warnSpy: MockInstance;
 
     beforeEach(() => {
-        logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
-        warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+        logSpy = vi.spyOn(cds.log('nightgate:worker-client'), 'info').mockImplementation(() => {});
+        warnSpy = vi.spyOn(cds.log('nightgate:worker-client'), 'warn').mockImplementation(() => {});
         __resetWalletWorkerForTests();
         latestWorker = undefined;
     });
@@ -269,15 +270,19 @@ describe('wallet-worker-client', () => {
             expect(pmSpy).not.toHaveBeenCalledWith(expect.objectContaining({ kind: 'state-save-ack', seq: 8 }));
         });
 
-        it('relays "log" messages to console.log / console.warn by level', async () => {
+        it('relays "log" messages through the nightgate:worker CAP channel by level', async () => {
             await startWalletWorker();
             const w = latestWorker!;
+            const infoSpy = vi.spyOn(cds.log('nightgate:worker'), 'info').mockImplementation(() => {});
+            const wSpy = vi.spyOn(cds.log('nightgate:worker'), 'warn').mockImplementation(() => {});
 
             w.emit('message', { kind: 'log', level: 'info', message: 'hello' });
             w.emit('message', { kind: 'log', level: 'warn', message: 'careful' });
 
-            expect(logSpy).toHaveBeenCalledWith('hello');
-            expect(warnSpy).toHaveBeenCalledWith('careful');
+            expect(infoSpy).toHaveBeenCalledWith('hello');
+            expect(wSpy).toHaveBeenCalledWith('careful');
+            infoSpy.mockRestore();
+            wSpy.mockRestore();
         });
 
         describe('private-state-rpc dispatch', () => {

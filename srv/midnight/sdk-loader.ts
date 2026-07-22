@@ -1,43 +1,31 @@
 /**
  * Memoized dynamic-import loader for the Midnight JS SDK.
  *
- * Background: every Midnight SDK dependency tree terminates at
- * `@midnight-ntwrk/compact-runtime`, which is pure ESM and ships no CJS export.
- * NIGHTGATE itself is CommonJS (`"type": "commonjs"`). Top-level `import` from
- * TypeScript would compile to `require()`, which fails on the SDK at runtime.
- *
- * Solution: load the SDK once via dynamic `import()`, cache the namespace
- * objects, and reuse. Call sites that need SDK exports await `loadMidnightSdk()`.
- *
- * The SDK is async to load (Promise<NamespaceObject>) but each call after the
- * first resolves synchronously from the cache.
+ * The SDK is pure ESM (terminates at `@midnight-ntwrk/compact-runtime`, no CJS
+ * export); NIGHTGATE is CommonJS, so a top-level `import` compiles to `require()`
+ * and fails at runtime. Load once via dynamic `import()`, cache the namespaces,
+ * reuse. Call sites await `loadMidnightSdk()`; only the first call is async.
  */
 
-// Type aliases here are deliberately `any`, not `typeof import(...)`. The SDK
-// packages are ESM-only and consumed via dynamic `import()` from this
-// CommonJS code. With `moduleResolution: NodeNext` TypeScript treats the same
-// module under two identities (CJS vs ESM `resolution-mode: "import"`), which
-// produces unrelated nominal types and breaks assignment. Since the SDK is
-// duck-typed at runtime anyway, `any` here is the honest annotation.
-type MidnightSdkContracts        = any;
-type MidnightSdkIndexerProvider  = any;
-type MidnightSdkProofProvider    = any;
-type MidnightSdkZkConfig         = any;
-type MidnightSdkLevelState       = any;
-type MidnightSdkWalletFacade     = any;
-type LedgerV8                    = any;
-type WalletSdkShielded           = any;
-type WalletSdkUnshielded         = any;
-type WalletSdkDust               = any;
-type WalletSdkAbstractions       = any;
+type MidnightSdkContracts = any;
+type MidnightSdkIndexerProvider = any;
+type MidnightSdkProofProvider = any;
+type MidnightSdkZkConfig = any;
+type MidnightSdkLevelState = any;
+type MidnightSdkWalletFacade = any;
+type LedgerV8 = any;
+type WalletSdkShielded = any;
+type WalletSdkUnshielded = any;
+type WalletSdkDust = any;
+type WalletSdkAbstractions = any;
 
 export interface MidnightSdkBundle {
     contracts: MidnightSdkContracts;
-    indexer:   MidnightSdkIndexerProvider;
-    proof:     MidnightSdkProofProvider;
-    zk:        MidnightSdkZkConfig;
-    level:     MidnightSdkLevelState;
-    facade:    MidnightSdkWalletFacade;
+    indexer: MidnightSdkIndexerProvider;
+    proof: MidnightSdkProofProvider;
+    zk: MidnightSdkZkConfig;
+    level: MidnightSdkLevelState;
+    facade: MidnightSdkWalletFacade;
 }
 
 let cachedBundle: MidnightSdkBundle | undefined;
@@ -101,9 +89,9 @@ export async function loadLedgerV8(): Promise<LedgerV8> {
 // ---- wallet-sdk packages (for WalletFacade construction) ----
 
 export interface WalletSdkBundle {
-    shielded:     WalletSdkShielded;
-    unshielded:   WalletSdkUnshielded;
-    dust:         WalletSdkDust;
+    shielded: WalletSdkShielded;
+    unshielded: WalletSdkUnshielded;
+    dust: WalletSdkDust;
     abstractions: WalletSdkAbstractions;
 }
 

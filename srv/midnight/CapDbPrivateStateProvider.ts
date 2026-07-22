@@ -28,20 +28,18 @@ import {
 import { ensureNightgateModelLoaded } from '../utils/cds-model';
 import { PrivateStates, ContractSigningKeys } from '#cds-models/midnight';
 
-const MAX_EXPORT_STATES       = 10_000;
+const MAX_EXPORT_STATES = 10_000;
 const MAX_EXPORT_SIGNING_KEYS = 10_000;
 const PRIVATE_STATE_EXPORT_FORMAT = 'midnight-private-state-export';
-const SIGNING_KEY_EXPORT_FORMAT   = 'midnight-signing-key-export';
-const CURRENT_EXPORT_VERSION  = 1;
+const SIGNING_KEY_EXPORT_FORMAT = 'midnight-signing-key-export';
+const CURRENT_EXPORT_VERSION = 1;
 const SUPPORTED_EXPORT_VERSIONS = [1];
 
-// ---- Interface mirror types (decoupled from SDK imports, SDK is ESM-only) -
-// We model the structural shape we implement; the SDK is duck-typed so it
-// accepts an object that matches PrivateStateProvider<PSI, PS>.
+// Interface mirror types (decoupled from SDK imports, SDK is ESM-only)
 
 type ContractAddress = string;
-type PrivateStateId  = string;
-type SigningKey      = string;
+type PrivateStateId = string;
+type SigningKey = string;
 
 interface PrivateStateExport {
     readonly format: 'midnight-private-state-export';
@@ -89,7 +87,7 @@ interface ImportSigningKeysResult {
     readonly overwritten: number;
 }
 
-// ---- Errors (names match SDK convention) -----------------------------------
+// Errors (names match SDK convention)
 
 export class ExportDecryptionError extends Error {
     constructor() { super('Failed to decrypt export'); this.name = 'ExportDecryptionError'; }
@@ -104,19 +102,14 @@ export class ImportConflictError extends Error {
     }
 }
 
-// ---- Config -----------------------------------------------------------------
-
+//  Config
 export interface CapDbPrivateStateProviderConfig {
     accountId: string;
     privateStoragePasswordProvider: () => Promise<string> | string;
-    /**
-     * Optional db handle. Defaults to `cds.connect.to('db')` on first use.
-     * Injecting a handle is useful for tests.
-     */
     db?: any;
 }
 
-// ---- Provider ---------------------------------------------------------------
+//  Provider
 
 export class CapDbPrivateStateProvider<PSI extends PrivateStateId = PrivateStateId, PS = any> {
     private currentContractAddress: ContractAddress | null = null;
@@ -124,12 +117,12 @@ export class CapDbPrivateStateProvider<PSI extends PrivateStateId = PrivateState
     private encryptionPromise: Promise<StorageEncryption> | undefined;
 
     constructor(private readonly config: CapDbPrivateStateProviderConfig) {
-        if (!config.accountId)                     throw new Error('accountId is required');
+        if (!config.accountId) throw new Error('accountId is required');
         if (!config.privateStoragePasswordProvider) throw new Error('privateStoragePasswordProvider is required');
         if (config.db) this.db = config.db;
     }
 
-    // -- Interface implementation --------------------------------------------
+    // Interface implementation
 
     setContractAddress(address: ContractAddress): void {
         if (!address) throw new Error('Contract address must not be empty');
@@ -214,8 +207,7 @@ export class CapDbPrivateStateProvider<PSI extends PrivateStateId = PrivateState
         );
     }
 
-    // -- Export / Import (SDK wire-format compatible) ------------------------
-
+    // Export / Import (SDK wire-format compatible)
     async exportPrivateStates(options?: ExportPrivateStatesOptions): Promise<PrivateStateExport> {
         const contractAddress = this.requireContractAddress('exportPrivateStates');
         const maxStates = options?.maxStates ?? MAX_EXPORT_STATES;
@@ -407,7 +399,7 @@ export class CapDbPrivateStateProvider<PSI extends PrivateStateId = PrivateState
         return { imported, skipped, overwritten };
     }
 
-    // -- Internals -----------------------------------------------------------
+    // Internals
 
     private requireContractAddress(op: string): ContractAddress {
         if (this.currentContractAddress === null) {
@@ -434,20 +426,17 @@ export class CapDbPrivateStateProvider<PSI extends PrivateStateId = PrivateState
     /**
      * Memoized per-instance StorageEncryption.
      *
-     * The salt is DETERMINISTIC per (account, password) rather than random.
-     * This is essential for cross-instance reads: each submission builds its
-     * own provider instance, so a deploy that writes private state and a later
-     * call that reads it use DIFFERENT instances. With a random per-instance
-     * salt, the reader's `decrypt()` rejected the writer's blob with
-     * "Salt mismatch" (the ledger never even saw it; it failed in our storage
-     * layer). A deterministic salt makes every instance for the same account
-     * derive the same key, so reads succeed across instances while keeping the
-     * one-PBKDF2-per-instance optimization and the integrity salt-check.
+     * The salt is DETERMINISTIC per (account, password), not random. Essential
+     * for cross-instance reads: each submission builds its own provider, so a
+     * deploy that writes state and a later call that reads it use DIFFERENT
+     * instances. A random per-instance salt made the reader's `decrypt()` reject
+     * the writer's blob with "Salt mismatch". A deterministic salt derives the
+     * same key for every instance of an account, so reads succeed across
+     * instances while keeping one-PBKDF2-per-instance and the integrity check.
      *
-     * The password is already a high-entropy per-account secret (derived from
-     * the wallet viewing key), so deriving the salt from it does not weaken the
-     * anti-precomputation property. Export blobs still get their own fresh
-     * random salt (see exportPrivateStates/exportSigningKeys).
+     * The password is already a high-entropy per-account secret (from the wallet
+     * viewing key), so salting from it doesn't weaken anti-precomputation. Export
+     * blobs still get a fresh random salt (see exportPrivateStates).
      */
     private getEncryption(): Promise<StorageEncryption> {
         if (!this.encryptionPromise) {
@@ -510,7 +499,7 @@ export class CapDbPrivateStateProvider<PSI extends PrivateStateId = PrivateState
     }
 }
 
-// ---- Helpers --------------------------------------------------------------
+// Helpers
 
 function validateExportPassword(password: string): void {
     if (typeof password !== 'string' || password.length < 16) {

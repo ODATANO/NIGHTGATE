@@ -34,13 +34,9 @@ import {
     getContractWitnessFactory
 } from '../submission/contract-witnesses';
 import { deriveRoleSeeds } from '../utils/wallet-hd';
-// Type-only import of the ESM-only address-format package. `import type`
-// is erased at compile time so we don't emit a require() against an ESM-only
-// module; runtime access still goes through dynamic `import()` in
-// loadAddressFormat below.
 import type * as AddressFormat from '@midnightntwrk/wallet-sdk-address-format';
 
-// ---- Message protocol shared with main thread -----------------------------
+// Message protocol shared with main thread
 
 export interface RpcRequest {
     kind: 'rpc';
@@ -50,7 +46,6 @@ export interface RpcRequest {
 }
 
 export interface RpcErrorPayload { name: string; message: string }
-
 export interface RpcOk { ok: true; result: unknown }
 export interface RpcErr { ok: false; error: RpcErrorPayload }
 
@@ -72,13 +67,8 @@ interface FacadeEntry {
     dustKey: any;
     unshieldedKeystore: any;
     saveTimer?: NodeJS.Timeout;
-    /** Blobs of the last save the MAIN THREAD CONFIRMED it persisted. The
-     *  unchanged-skip in the save tick compares against this, so a failed or
-     *  dropped persist is re-pushed on the next tick instead of being
-     *  stranded until the state happens to change again. */
-    lastSavedBlobs?: { shielded?: string; unshielded?: string; dust?: string };
-    /** In-flight saves by sequence number, resolved by `state-save-ack`. */
-    pendingSaves?: Map<number, { shielded?: string; unshielded?: string; dust?: string }>;
+    lastSavedBlobs?: { shielded?: string; unshielded?: string; dust?: string }; // Blobs of the last save the MAIN THREAD CONFIRMED it persisted
+    pendingSaves?: Map<number, { shielded?: string; unshielded?: string; dust?: string }>; // In-flight saves by sequence number, resolved by `state-save-ack
     networkId: string;
     /** Indexer GraphQL HTTP URL, used to read the genuine sync target (tip). */
     indexerHttpUrl: string;
@@ -92,7 +82,7 @@ const facades = new Map<string, FacadeEntry>();
 
 // ---- Logging back to main thread ------------------------------------------
 
-function log(level: 'info' | 'warn', message: string): void {
+function log(level: 'info' | 'warn' | 'debug' | 'error', message: string): void {
     parentPort?.postMessage({ kind: 'log', level, message });
 }
 
@@ -109,21 +99,6 @@ async function loadAddressFormat(): Promise<typeof AddressFormat> {
     cachedAddressFormat = await import('@midnightntwrk/wallet-sdk-address-format');
     return cachedAddressFormat;
 }
-
-/**
- * Union of SDK address types this worker may need to encode/decode. Each
- * has the `[Bech32mSymbol]` codec attached (see the package's index.d.ts).
- *
- * Note on the type-only use of this union: `MidnightBech32m.encode<T>` has
- * an invariant `T extends HasCodec<T>` constraint, so passing a bare union
- * fails type-checking even though the runtime call works. We narrow per
- * concrete address at the call site (currently only DustAddress is used);
- * add overloads of `encodeAddressString` when the other variants are needed.
- */
-type MidnightAddress =
-    | AddressFormat.DustAddress
-    | AddressFormat.ShieldedAddress
-    | AddressFormat.UnshieldedAddress;
 
 async function loadSdk(): Promise<{
     ledger: any;
@@ -267,24 +242,40 @@ async function getOrCompileContract(
 
 // ---- Worker-side provider construction (Phase 2b) -------------------------
 
-async function buildWorkerContractProviders(args: {
+// One long-lived provider bundle per (indexer + proof + zkConfig) tuple. The
+// indexerPublicDataProvider opens a graphql-ws connection; building a fresh one
+// on every deploy/call leaked a socket per submission. Reusing a bundle keeps a
+// single connection, the way a normal dapp wires providers once at startup. The
+// PROMISE is cached (set synchronously before the first await) so concurrent
+// first callers can't both build one.
+const contractProvidersCache = new Map<string, Promise<{ publicDataProvider: any; zkConfigProvider: any; proofProvider: any }>>();
+
+function buildWorkerContractProviders(args: {
     indexerHttpUrl: string;
     indexerWsUrl: string;
     proofServerUrl: string;
     zkConfigPath: string;
 }): Promise<{ publicDataProvider: any; zkConfigProvider: any; proofProvider: any }> {
-    // `ws` is CJS; Node 22 worker_threads can `require` it freely.
-    // eslint-disable-next-line @typescript-eslint/no-var-requires
-    const WebSocket = require('ws');
-    const { indexer, proof, zk } = await loadContractsSdk();
-    const zkConfigProvider = new zk.NodeZkConfigProvider(args.zkConfigPath);
-    const publicDataProvider = indexer.indexerPublicDataProvider(
-        args.indexerHttpUrl,
-        args.indexerWsUrl,
-        WebSocket
-    );
-    const proofProvider = proof.httpClientProofProvider(args.proofServerUrl, zkConfigProvider);
-    return { publicDataProvider, zkConfigProvider, proofProvider };
+    const cacheKey = `${args.indexerHttpUrl}|${args.indexerWsUrl}|${args.proofServerUrl}|${args.zkConfigPath}`;
+    let bundleP = contractProvidersCache.get(cacheKey);
+    if (!bundleP) {
+        bundleP = (async () => {
+            // `ws` is CJS; Node 22 worker_threads can `require` it freely.
+            // eslint-disable-next-line @typescript-eslint/no-var-requires
+            const WebSocket = require('ws');
+            const { indexer, proof, zk } = await loadContractsSdk();
+            const zkConfigProvider = new zk.NodeZkConfigProvider(args.zkConfigPath);
+            const publicDataProvider = indexer.indexerPublicDataProvider(
+                args.indexerHttpUrl,
+                args.indexerWsUrl,
+                WebSocket
+            );
+            const proofProvider = proof.httpClientProofProvider(args.proofServerUrl, zkConfigProvider);
+            return { publicDataProvider, zkConfigProvider, proofProvider };
+        })();
+        contractProvidersCache.set(cacheKey, bundleP);
+    }
+    return bundleP;
 }
 
 /**
@@ -296,27 +287,6 @@ async function buildWorkerContractProviders(args: {
 // tip catch-up between submissions, short enough that a stalled indexer
 // subscription fails the job promptly instead of hanging. Env-overridable.
 const BALANCE_SYNC_TIMEOUT_MS = Number(process.env.NIGHTGATE_BALANCE_SYNC_TIMEOUT_MS || 180_000);
-
-/**
- * `facade.waitForSyncedState()` raced against a timeout. Resolves as soon as
- * the wallet is synced (instant on the prewarmed path); rejects with a clear
- * error if the sync hasn't latched within `timeoutMs`, typically a dropped,
- * non-retried indexer graphql-ws subscription.
- */
-async function waitForSyncedStateBounded(facade: any, timeoutMs: number): Promise<void> {
-    let timer: NodeJS.Timeout | undefined;
-    const timeout = new Promise<never>((_, reject) => {
-        timer = setTimeout(
-            () => reject(new Error(`waitForSyncedState timed out after ${timeoutMs}ms (indexer subscription may have stalled)`)),
-            timeoutMs
-        );
-    });
-    try {
-        await Promise.race([facade.waitForSyncedState(), timeout]);
-    } finally {
-        if (timer) clearTimeout(timer);
-    }
-}
 
 // How close to the DUST STREAM tip counts as "caught up". Measured in ledger
 // EVENTS, not blocks: the dust sub-wallet consumes dustLedgerEvents whose ids
@@ -447,16 +417,28 @@ async function waitForGenuineSync(facade: any, indexerHttpUrl: string, timeoutMs
         // so it would time out every poll and the real (advancing) appliedIndex would
         // never be read. The observable emits the current FacadeState immediately.
         let state: any;
+        let sub: any;
+        let peekTimer: NodeJS.Timeout | undefined;
+        let peekFailed = false;
         try {
             state = await Promise.race([
                 new Promise<any>((res, rej) => {
-                    let sub: any;
-                    try { sub = facade.state().subscribe({ next: (v: any) => { res(v); try { sub && sub.unsubscribe(); } catch {} }, error: (e: any) => rej(e) }); }
+                    try { sub = facade.state().subscribe({ next: (v: any) => res(v), error: (e: any) => rej(e) }); }
                     catch (e) { rej(e); }
                 }),
-                new Promise((_, rej) => setTimeout(() => rej(new Error('state peek timeout')), 30_000))
+                new Promise((_, rej) => { peekTimer = setTimeout(() => rej(new Error('state peek timeout')), 30_000); })
             ]);
-        } catch { await wsleep(SYNC_POLL_MS); continue; }
+        } catch {
+            peekFailed = true;
+        } finally {
+            // Always release the subscription and timer, whether `next` fired or
+            // the timeout won the race. On a stalled indexer the timeout wins
+            // every poll, so leaking here would accumulate one live subscription
+            // per cycle exactly on the pathological path.
+            try { sub && sub.unsubscribe(); } catch { }
+            if (peekTimer) clearTimeout(peekTimer);
+        }
+        if (peekFailed) { await wsleep(SYNC_POLL_MS); continue; }
         const p: any = state?.dust?.progress;
         const applied = p?.appliedIndex != null ? BigInt(p.appliedIndex) : -1n;
         const streamTip = await getDustStreamTip(indexerHttpUrl);
@@ -466,12 +448,12 @@ async function waitForGenuineSync(facade: any, indexerHttpUrl: string, timeoutMs
         lastApplied = applied;
         lastHighest = highest;
         if (connected && highest > 0n && applied >= 0n && applied >= highest - SYNC_TIP_GAP && fresh) {
-            log('info', `[worker] genuine-sync [${label}] CAUGHT UP: appliedIndex=${applied} streamTip=${highest} blockHeight=${tip.height} fresh=${fresh}`);
+            log('info', `genuine-sync [${label}] CAUGHT UP: appliedIndex=${applied} streamTip=${highest} blockHeight=${tip.height} fresh=${fresh}`);
             return;
         }
         if (Date.now() - lastLog > 15_000) {
             const behind = highest >= 0n && applied >= 0n ? (highest - applied).toString() : '?';
-            log('info', `[worker] genuine-sync [${label}] appliedIndex=${applied} streamTip=${highest} behindEvents=${behind} blockHeight=${tip.height} fresh=${fresh} connected=${connected}`);
+            log('debug', `genuine-sync [${label}] appliedIndex=${applied} streamTip=${highest} behindEvents=${behind} blockHeight=${tip.height} fresh=${fresh} connected=${connected}`);
             lastLog = Date.now();
         }
         await wsleep(SYNC_POLL_MS);
@@ -525,23 +507,13 @@ export function buildWorkerWalletProvider(entry: FacadeEntry): any {
         getCoinPublicKey(): string { return entry.zswapKeys.coinPublicKey; },
         getEncryptionPublicKey(): string { return entry.zswapKeys.encryptionPublicKey; },
         async balanceTx(tx: any, ttl?: Date): Promise<any> {
-            // Robustness: block until the wallet is synced to the chain tip
-            // before balancing. The prewarm job (connectWalletForSigning) also
-            // waits, but a caller that submits WITHOUT prewarming (or after the
-            // facade has drifted) would otherwise balance against stale
-            // (restored/partial) dust state, and the node rejects the tx with
-            // `1010 Invalid Transaction: Custom error: 170` (dust validity
-            // window: ctime + grace < tblock). waitForSyncedState is a no-op
-            // once synced, so this is cheap on the common (prewarmed) path.
-            //
-            // BOUNDED: the SDK's graphql-ws subscription has no auto-retry
-            // (shouldRetry:()=>false), so a dropped indexer subscription would
-            // make waitForSyncedState hang forever. Race it against a timeout so
-            // a stalled sync surfaces as a clear, classifiable submission error
-            // instead of an indefinite hang.
-            // GENUINE sync to the indexer tip (not the lying isSynced flag), so
-            // we never balance stale dust → Custom error 117. The prewarm should
-            // have already caught up; this is a fast re-check on the warm path.
+            // Block until GENUINELY synced to the indexer tip before balancing
+            // (not the lying isSynced flag). Balancing stale (restored/partial)
+            // dust makes the node reject the tx: `1010 Custom error: 170` (dust
+            // validity window ctime+grace < tblock) or `117` (pruned dust merkle
+            // roots). The prewarm job usually caught up already, so this is a
+            // cheap re-check on the warm path; waitForGenuineSync is bounded so a
+            // stalled indexer subscription fails fast instead of hanging.
             await waitForGenuineSync(entry.facade, entry.indexerHttpUrl, BALANCE_SYNC_TIMEOUT_MS, 'balance');
             const effectiveTtl = ttl ?? new Date(Date.now() + 60 * 60 * 1000);
             const recipe = await entry.facade.balanceUnboundTransaction(
@@ -551,7 +523,7 @@ export function buildWorkerWalletProvider(entry: FacadeEntry): any {
             );
             const finalized = await entry.facade.finalizeRecipe(recipe);
             const dust = describeTxDust(finalized);
-            log('info', `[worker] balanced tx dust sections: ${dust.summary}`);
+            log('info', `balanced tx dust sections: ${dust.summary}`);
             if (dust.emptyDustActions) {
                 // The node would reject this as 1010/117 (NotNormalized). Fail
                 // here instead: saves the proof round and pins the root cause
@@ -567,9 +539,9 @@ export function buildWorkerWalletProvider(entry: FacadeEntry): any {
         },
         async submitTx(tx: any): Promise<any> {
             const dust = describeTxDust(tx);
-            log('info', `[worker] pre-submit tx dust sections: ${dust.summary}`);
+            log('info', `pre-submit tx dust sections: ${dust.summary}`);
             if (dust.emptyDustActions) {
-                log('warn', `[worker] pre-submit tx has an EMPTY DustActions section (node rejects as 1010/117 NotNormalized): ${dust.summary}`);
+                log('warn', `pre-submit tx has an EMPTY DustActions section (node rejects as 1010/117 NotNormalized): ${dust.summary}`);
             }
             return entry.facade.submitTransaction(tx);
         }
@@ -610,7 +582,7 @@ export function buildSponsoredWalletProvider(caller: FacadeEntry, sponsor: Facad
             // with NIGHTGATE_SPONSORED_CALLER_SYNC=skip: with no coins there
             // is nothing to select, and the fee side is the sponsor's alone.
             if (process.env.NIGHTGATE_SPONSORED_CALLER_SYNC === 'skip') {
-                log('info', '[worker] sponsored-balance: caller sync SKIPPED (NIGHTGATE_SPONSORED_CALLER_SYNC=skip)');
+                log('info', 'sponsored-balance: caller sync SKIPPED (NIGHTGATE_SPONSORED_CALLER_SYNC=skip)');
             } else {
                 await waitForGenuineSync(caller.facade, caller.indexerHttpUrl, BALANCE_SYNC_TIMEOUT_MS, 'sponsored-balance caller');
             }
@@ -634,7 +606,7 @@ export function buildSponsoredWalletProvider(caller: FacadeEntry, sponsor: Facad
             const finalized = await sponsor.facade.finalizeRecipe(sponsorRecipe);
 
             const dust = describeTxDust(finalized);
-            log('info', `[worker] sponsored balanced tx dust sections: ${dust.summary}`);
+            log('info', `sponsored balanced tx dust sections: ${dust.summary}`);
             if (dust.emptyDustActions) {
                 throw new Error(
                     'sponsored balanced transaction carries an EMPTY DustActions section ' +
@@ -647,9 +619,9 @@ export function buildSponsoredWalletProvider(caller: FacadeEntry, sponsor: Facad
         },
         async submitTx(tx: any): Promise<any> {
             const dust = describeTxDust(tx);
-            log('info', `[worker] pre-submit (sponsored) tx dust sections: ${dust.summary}`);
+            log('info', `pre-submit (sponsored) tx dust sections: ${dust.summary}`);
             if (dust.emptyDustActions) {
-                log('warn', `[worker] pre-submit sponsored tx has an EMPTY DustActions section (node rejects as 1010/117 NotNormalized): ${dust.summary}`);
+                log('warn', `pre-submit sponsored tx has an EMPTY DustActions section (node rejects as 1010/117 NotNormalized): ${dust.summary}`);
             }
             return sponsor.facade.submitTransaction(tx);
         }
@@ -779,16 +751,10 @@ function getSdkVersion(): string {
 }
 
 /**
- * Bech32m-encodes a Midnight address object (DustAddress / ShieldedAddress /
- * UnshieldedAddress) into its canonical string form.
- *
- * Uses `MidnightBech32m.encode` (declared in
- * `@midnightntwrk/wallet-sdk-address-format/dist/index.d.ts` as
- * `static encode<T extends HasCodec<T>>(networkId, item): MidnightBech32m`)
- * which reads the `[Bech32mSymbol]` codec attached to each address class.
- * `.toString()` on the result yields the Bech32m string.
- *
- * Pre-encoded strings pass through untouched.
+ * Bech32m-encodes a Midnight address object (Dust/Shielded/Unshielded) to its
+ * canonical string via `MidnightBech32m.encode`, which reads the
+ * `[Bech32mSymbol]` codec on each address class. Pre-encoded strings pass
+ * through untouched.
  */
 async function encodeAddressString(
     addr: AddressFormat.DustAddress | string | null | undefined,
@@ -899,7 +865,7 @@ async function buildFacade(args: InitArgs): Promise<FacadeEntry> {
     });
 
     await facade.start(zswapKeys, dustKey);
-    log('info', `[worker] facade started for ${args.sessionId.slice(0, 16)} (restored=${!!restore})`);
+    log('info', `facade started for ${args.sessionId.slice(0, 16)} (restored=${!!restore})`);
 
     return {
         facade,
@@ -946,13 +912,13 @@ function pushStateSave(sessionId: string, entry: FacadeEntry, blobs: { shielded?
 function startPeriodicSave(sessionId: string, entry: FacadeEntry): void {
     if (entry.saveTimer) return;
     let tickCount = 0;
-    log('info', `[worker] periodic-save interval armed for ${sessionId.slice(0, 16)}`);
+    log('info', `periodic-save interval armed for ${sessionId.slice(0, 16)}`);
     entry.saveTimer = setInterval(async () => {
         tickCount++;
         const tickStart = Date.now();
         // Log BEFORE the first await so we know the timer fired even if
         // serializeState() hangs on the rx Observable.
-        log('info', `[worker] save-tick #${tickCount} fired, calling collectSerializedStates...`);
+        log('debug', `save-tick #${tickCount} fired, calling collectSerializedStates...`);
         try {
             const collectStart = Date.now();
             const blobs = await collectSerializedStates(entry.facade);
@@ -962,7 +928,7 @@ function startPeriodicSave(sessionId: string, entry: FacadeEntry): void {
                 `un=${blobs.unshielded ? blobs.unshielded.length : '-'}`,
                 `du=${blobs.dust ? blobs.dust.length : '-'}`
             ].join(' ');
-            log('info', `[worker] save-tick #${tickCount} collect returned in ${collectMs}ms: ${shape}`);
+            log('debug', `save-tick #${tickCount} collect returned in ${collectMs}ms: ${shape}`);
 
             if (!hasAnyBlob(blobs)) return;
             // Skip push only if the CONFIRMED-saved blobs are identical. This
@@ -974,13 +940,13 @@ function startPeriodicSave(sessionId: string, entry: FacadeEntry): void {
                 blobs.unshielded === saved.unshielded &&
                 blobs.dust === saved.dust
             ) {
-                log('info', `[worker] save-tick #${tickCount} unchanged, skipping push`);
+                log('debug', `save-tick #${tickCount} unchanged, skipping push`);
                 return;
             }
             const seq = pushStateSave(sessionId, entry, blobs);
-            log('info', `[worker] save-tick #${tickCount} pushed seq=${seq} (total ${Date.now() - tickStart}ms)`);
+            log('debug', `save-tick #${tickCount} pushed seq=${seq} (total ${Date.now() - tickStart}ms)`);
         } catch (err: any) {
-            log('warn', `[worker] periodic save failed: ${formatErr(err)}`);
+            log('warn', `periodic save failed: ${formatErr(err)}`);
         }
     }, 30_000);
     entry.saveTimer.unref();
@@ -1013,7 +979,7 @@ function hasAnyBlob(b: { shielded?: string; unshielded?: string; dust?: string }
 const handlers: Record<string, (args: any) => Promise<unknown>> = {
     async init(args: InitArgs) {
         if (facades.has(args.sessionId)) {
-            log('info', `[worker] init: cache hit ${args.sessionId.slice(0, 16)}`);
+            log('debug', `init: cache hit ${args.sessionId.slice(0, 16)}`);
             return { facadeReady: true, alreadyExisted: true };
         }
         const entry = await buildFacade(args);
@@ -1043,24 +1009,38 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
     async evict({ sessionId }: { sessionId: string }) {
         const entry = facades.get(sessionId);
         if (!entry) return { evicted: false };
+        // Remove from the map first so no NEW submit can resolve this facade.
         facades.delete(sessionId);
         if (entry.saveTimer) clearInterval(entry.saveTimer);
-        // Best-effort final save push. Cleanup-path errors don't block
-        // eviction but are logged; silent swallowing would hide leaks.
-        try {
-            const blobs = await collectSerializedStates(entry.facade);
-            if (hasAnyBlob(blobs)) {
-                pushStateSave(sessionId, entry, blobs);
+        // Teardown (final save + zeroing secrets + stopping the facade) runs under
+        // the per-session submit lock so it can't yank key material from a submit
+        // still in flight for this session (it holds `entry` mid-SDK-call). New
+        // submits already fail the `facades.get` above, so never contend this lock.
+        await withSessionLocks([sessionId], async () => {
+            // Best-effort final save push. Cleanup-path errors don't block
+            // eviction but are logged; silent swallowing would hide leaks.
+            try {
+                const blobs = await collectSerializedStates(entry.facade);
+                if (hasAnyBlob(blobs)) {
+                    pushStateSave(sessionId, entry, blobs);
+                }
+            } catch (err) {
+                log('warn', `evict final-save failed for ${sessionId.slice(0, 16)}: ${formatErr(err)}`);
             }
-        } catch (err) {
-            log('warn', `[worker] evict final-save failed for ${sessionId.slice(0, 16)}: ${formatErr(err)}`);
-        }
-        try {
-            entry.zswapKeys?.clear?.();
-            await entry.facade?.stop?.();
-        } catch (err) {
-            log('warn', `[worker] evict cleanup failed for ${sessionId.slice(0, 16)}: ${formatErr(err)}`);
-        }
+            try {
+                // Zero every secret held by the entry, not just the zswap keys, so
+                // nothing sensitive lingers in the orphaned entry until GC.
+                entry.zswapKeys?.clear?.();
+                entry.dustKey?.clear?.();
+                entry.unshieldedKeystore?.clear?.();
+                try { entry.attestationSecret?.fill?.(0); } catch { }
+                await entry.facade?.stop?.();
+            } catch (err) {
+                log('warn', `evict cleanup failed for ${sessionId.slice(0, 16)}: ${formatErr(err)}`);
+            }
+        });
+        // Drop the now-idle lock chain (the gate withSessionLocks left behind).
+        sessionChains.delete(sessionId);
         return { evicted: true };
     },
 
@@ -1082,14 +1062,14 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
         if (!entry) throw new Error(`No facade for sessionId=${sessionId.slice(0, 16)}`);
 
         // 1. Block until the wallet is synced enough to see its NIGHT UTXOs.
-        log('info', `[worker] dust-register: waiting for synced state...`);
+        log('info', `dust-register: waiting for synced state...`);
         const synced = syncTimeoutMs
             ? await Promise.race([
                 entry.facade.waitForSyncedState(),
                 new Promise<never>((_, rej) => setTimeout(() => rej(new Error('dust-register: sync timeout')), syncTimeoutMs))
             ])
             : await entry.facade.waitForSyncedState();
-        log('info', `[worker] dust-register: synced.`);
+        log('info', `dust-register: synced.`);
 
         const availableCoins: any[] = synced?.unshielded?.availableCoins ?? [];
         const unregistered = availableCoins.filter(
@@ -1105,13 +1085,13 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
             // for the caller via the log so triage is faster.
             if (availableCoins.length === 0) {
                 log('info',
-                    `[worker] dust-register: no unshielded NIGHT UTXOs visible to this wallet. ` +
+                    `dust-register: no unshielded NIGHT UTXOs visible to this wallet. ` +
                     `Either all your NIGHT is held shielded (unshield via Lace to enable dust-gen), ` +
                     `or your unshielded UTXOs are already committed to dust generation and no longer ` +
                     `surface in synced.unshielded.availableCoins (the SDK's "available" excludes ` +
                     `registered UTXOs). Check Lace's "Refilling NhNNmin" indicator for the latter.`);
             } else {
-                log('info', `[worker] dust-register: ${availableCoins.length} NIGHT UTXO(s) are already registered for dust-gen.`);
+                log('info', `dust-register: ${availableCoins.length} NIGHT UTXO(s) are already registered for dust-gen.`);
             }
             return {
                 txId: null,
@@ -1144,7 +1124,7 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
         const finalized = await entry.facade.finalizeRecipe(recipe);
         const txId = await entry.facade.submitTransaction(finalized);
 
-        log('info', `[worker] dust-register: submitted ${unregistered.length} UTXO(s), txId=${String(txId).slice(0, 16)}...`);
+        log('info', `dust-register: submitted ${unregistered.length} UTXO(s), txId=${String(txId).slice(0, 16)}...`);
 
         return {
             txId: String(txId),
@@ -1179,14 +1159,14 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
         if (!entry) throw new Error(`No facade for sessionId=${sessionId.slice(0, 16)}`);
         const sponsorEntry = resolveSponsorEntry(sponsorSessionId);
 
-        log('info', `[worker] dust-deregister: waiting for synced state...`);
+        log('info', `dust-deregister: waiting for synced state...`);
         const synced = syncTimeoutMs
             ? await Promise.race([
                 entry.facade.waitForSyncedState(),
                 new Promise<never>((_, rej) => setTimeout(() => rej(new Error('dust-deregister: sync timeout')), syncTimeoutMs))
             ])
             : await entry.facade.waitForSyncedState();
-        log('info', `[worker] dust-deregister: synced.`);
+        log('info', `dust-deregister: synced.`);
 
         // The full coin set is `totalCoins` on the current SDK's unshielded
         // state (UnshieldedWalletState). Older SDKs called it `allCoins` /
@@ -1199,7 +1179,7 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
         );
 
         if (registered.length === 0) {
-            log('info', `[worker] dust-deregister: no registered NIGHT UTXOs to deregister.`);
+            log('info', `dust-deregister: no registered NIGHT UTXOs to deregister.`);
             return {
                 txId: null,
                 deregisteredCount: 0,
@@ -1230,7 +1210,7 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
         // path gets that freshness from the caller's own sync above.
         const payer = sponsorEntry ?? entry;
         if (sponsorEntry) {
-            log('info', `[worker] dust-deregister: fee sponsored by ${sponsorEntry === entry ? 'self' : String(sponsorSessionId).slice(0, 16)}`);
+            log('info', `dust-deregister: fee sponsored by ${sponsorEntry === entry ? 'self' : String(sponsorSessionId).slice(0, 16)}`);
             await waitForGenuineSync(sponsorEntry.facade, sponsorEntry.indexerHttpUrl, BALANCE_SYNC_TIMEOUT_MS, 'deregister sponsor');
         }
         const balanced = await payer.facade.balanceUnprovenTransaction(
@@ -1241,7 +1221,7 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
         const finalized = await payer.facade.finalizeRecipe(balanced);
         const txId = await payer.facade.submitTransaction(finalized);
 
-        log('info', `[worker] dust-deregister: submitted ${registered.length} UTXO(s), txId=${String(txId).slice(0, 16)}...`);
+        log('info', `dust-deregister: submitted ${registered.length} UTXO(s), txId=${String(txId).slice(0, 16)}...`);
 
         return {
             txId: String(txId),
@@ -1272,7 +1252,7 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
         const sdk = await loadSdk();
         await ensureNetworkId(entry.networkId, sdk);
 
-        log('info', `[worker] transfer: waiting for synced state...`);
+        log('info', `transfer: waiting for synced state...`);
         if (syncTimeoutMs) {
             await Promise.race([
                 entry.facade.waitForSyncedState(),
@@ -1281,7 +1261,7 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
         } else {
             await entry.facade.waitForSyncedState();
         }
-        log('info', `[worker] transfer: synced.`);
+        log('info', `transfer: synced.`);
 
         const receiver = await parseReceiverAddress(receiverAddress, entry.networkId);
         const amountBig = BigInt(amount);
@@ -1292,7 +1272,7 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
             ? [{ type: 'shielded', outputs: [{ type: nightRawType, receiverAddress: receiver.addr, amount: amountBig }] }]
             : [{ type: 'unshielded', outputs: [{ type: nightRawType, receiverAddress: receiver.addr, amount: amountBig }] }];
 
-        log('info', `[worker] transfer: ${amount} NIGHT to ${receiver.kind} addr ${receiverAddress.slice(0, 24)}...`);
+        log('info', `transfer: ${amount} NIGHT to ${receiver.kind} addr ${receiverAddress.slice(0, 24)}...`);
 
         const recipe = await entry.facade.transferTransaction(
             outputs,
@@ -1310,7 +1290,7 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
         const finalized = await entry.facade.finalizeRecipe(signed);
         const txId = await entry.facade.submitTransaction(finalized);
 
-        log('info', `[worker] transfer: submitted, txId=${String(txId).slice(0, 16)}...`);
+        log('info', `transfer: submitted, txId=${String(txId).slice(0, 16)}...`);
 
         return {
             txId: String(txId),
@@ -1342,7 +1322,7 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
         const sdk = await loadSdk();
         await ensureNetworkId(entry.networkId, sdk);
 
-        log('info', `[worker] unshield: waiting for synced state...`);
+        log('info', `unshield: waiting for synced state...`);
         if (syncTimeoutMs) {
             await Promise.race([
                 entry.facade.waitForSyncedState(),
@@ -1351,7 +1331,7 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
         } else {
             await entry.facade.waitForSyncedState();
         }
-        log('info', `[worker] unshield: synced.`);
+        log('info', `unshield: synced.`);
 
         const ownUnshieldedAddr: AddressFormat.UnshieldedAddress = await entry.facade.unshielded.getAddress();
         const ownUnshieldedAddrStr = await encodeAddressString(ownUnshieldedAddr, entry.networkId);
@@ -1366,7 +1346,7 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
             { type: 'unshielded', outputs: [{ type: nightRawType, receiverAddress: ownUnshieldedAddr, amount: amountBig }] }
         ];
 
-        log('info', `[worker] unshield: ${amount} NIGHT → own unshielded addr ${ownUnshieldedAddrStr.slice(0, 24)}...`);
+        log('info', `unshield: ${amount} NIGHT → own unshielded addr ${ownUnshieldedAddrStr.slice(0, 24)}...`);
 
         const recipe = await entry.facade.initSwap(
             desiredInputs,
@@ -1382,7 +1362,7 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
         const finalized = await entry.facade.finalizeRecipe(signed);
         const txId = await entry.facade.submitTransaction(finalized);
 
-        log('info', `[worker] unshield: submitted, txId=${String(txId).slice(0, 16)}...`);
+        log('info', `unshield: submitted, txId=${String(txId).slice(0, 16)}...`);
 
         return {
             txId: String(txId),
@@ -1407,7 +1387,7 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
         const sdk = await loadSdk();
         await ensureNetworkId(entry.networkId, sdk);
 
-        log('info', `[worker] shield: waiting for synced state...`);
+        log('info', `shield: waiting for synced state...`);
         if (syncTimeoutMs) {
             await Promise.race([
                 entry.facade.waitForSyncedState(),
@@ -1416,7 +1396,7 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
         } else {
             await entry.facade.waitForSyncedState();
         }
-        log('info', `[worker] shield: synced.`);
+        log('info', `shield: synced.`);
 
         const ownShieldedAddr: AddressFormat.ShieldedAddress = await entry.facade.shielded.getAddress();
         const ownShieldedAddrStr = await encodeAddressString(ownShieldedAddr, entry.networkId);
@@ -1431,7 +1411,7 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
             { type: 'shielded', outputs: [{ type: nightRawType, receiverAddress: ownShieldedAddr, amount: amountBig }] }
         ];
 
-        log('info', `[worker] shield: ${amount} NIGHT → own shielded addr ${ownShieldedAddrStr.slice(0, 24)}...`);
+        log('info', `shield: ${amount} NIGHT → own shielded addr ${ownShieldedAddrStr.slice(0, 24)}...`);
 
         const recipe = await entry.facade.initSwap(
             desiredInputs,
@@ -1446,7 +1426,7 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
         const finalized = await entry.facade.finalizeRecipe(signed);
         const txId = await entry.facade.submitTransaction(finalized);
 
-        log('info', `[worker] shield: submitted, txId=${String(txId).slice(0, 16)}...`);
+        log('info', `shield: submitted, txId=${String(txId).slice(0, 16)}...`);
 
         return {
             txId: String(txId),
@@ -1496,8 +1476,8 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
         // DIAGNOSTIC: real sync distance to tip + whether 'synced' is genuine.
         try {
             const p: any = (synced as any)?.dust?.progress;
-            log('info', `[worker] SYNC-PROGRESS isSynced=${(synced as any)?.isSynced} isConnected=${p?.isConnected} appliedIndex=${p?.appliedIndex} highestIndex=${p?.highestIndex} highestRelevantIndex=${p?.highestRelevantIndex}`);
-        } catch (e: any) { log('info', `[worker] SYNC-PROGRESS read failed: ${e?.message}`); }
+            log('debug', `SYNC-PROGRESS isSynced=${(synced as any)?.isSynced} isConnected=${p?.isConnected} appliedIndex=${p?.appliedIndex} highestIndex=${p?.highestIndex} highestRelevantIndex=${p?.highestRelevantIndex}`);
+        } catch (e: any) { log('debug', `SYNC-PROGRESS read failed: ${e?.message}`); }
         const registeredCount = totalNightCoins.filter(
             (c: any) => c?.meta?.registeredForDustGeneration === true
         ).length;
@@ -1664,7 +1644,7 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
         };
 
         const { contracts } = await loadContractsSdk();
-        log('info', `[worker] deployContract: starting ${contractName} sess=${sessionId.slice(0, 16)}` +
+        log('info', `deployContract: starting ${contractName} sess=${sessionId.slice(0, 16)}` +
             (sponsorEntry ? ` (fee sponsored by ${String(sponsorSessionId).slice(0, 16)})` : ''));
         const result = await contracts.deployContract(providers, {
             compiledContract,
@@ -1677,7 +1657,7 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
             contractAddress: String(pub?.contractAddress ?? ''),
             onChainStatus: String(pub?.status ?? '')
         };
-        log('info', `[worker] deployContract: done addr=${out.contractAddress.slice(0, 16)} status=${out.onChainStatus}`);
+        log('info', `deployContract: done addr=${out.contractAddress.slice(0, 16)} status=${out.onChainStatus}`);
         return out;
     },
 
@@ -1736,7 +1716,7 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
         };
 
         const { contracts } = await loadContractsSdk();
-        log('info', `[worker] submitContractCall: ${contractName}.${circuit}@${contractAddress.slice(0, 12)}` +
+        log('info', `submitContractCall: ${contractName}.${circuit}@${contractAddress.slice(0, 12)}` +
             (sponsorEntry ? ` (fee sponsored by ${String(sponsorSessionId).slice(0, 16)})` : ''));
 
         // A wallet that did not DEPLOY this contract has no entry at its
@@ -1757,7 +1737,7 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
         const seed = existingPrivateState === undefined || existingPrivateState === null;
         if (seed) {
             log('info',
-                `[worker] submitContractCall: no private state at '${registration.privateStateId}' for this wallet, ` +
+                `submitContractCall: no private state at '${registration.privateStateId}' for this wallet, ` +
                 `seeding the contract's initial private state`);
         }
         const found = await contracts.findDeployedContract(providers, {
@@ -1776,10 +1756,49 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
             txHash: String(pub?.txHash ?? ''),
             onChainStatus: String(pub?.status ?? '')
         };
-        log('info', `[worker] submitContractCall: done txHash=${out.txHash.slice(0, 16)} status=${out.onChainStatus}`);
+        log('info', `submitContractCall: done txHash=${out.txHash.slice(0, 16)} status=${out.onChainStatus}`);
         return out;
     }
 };
+
+// ---- Per-facade serialization ---------------------------------------------
+
+// Submitting handlers serialize per facade: two concurrent balance+submit calls
+// on the SAME wallet would select overlapping UTXO/dust inputs and the node
+// rejects the second (double-select). A sponsored submit also balances the
+// sponsor's facade, so it locks both keys. Read-only handlers stay concurrent.
+const SUBMIT_METHODS = new Set([
+    'deployContract', 'submitContractCall',
+    'registerDustGeneration', 'deregisterDustGeneration',
+    'transferNight', 'unshieldNight', 'shieldNight'
+]);
+
+const sessionChains = new Map<string, Promise<unknown>>();
+
+function submitLockKeys(args: any): string[] {
+    return [args?.sessionId, args?.sponsorSessionId]
+        .filter((k): k is string => typeof k === 'string' && k.length > 0);
+}
+
+/**
+ * Run `fn` with an exclusive slot on every key in `keys`. Keys are deduped and
+ * sorted, and we never hold one slot while waiting for another (we wait for all
+ * prior holders to settle, THEN run), so multi-key acquisition can't deadlock.
+ */
+async function withSessionLocks<T>(keys: string[], fn: () => Promise<T>): Promise<T> {
+    const ordered = [...new Set(keys)].sort();
+    if (ordered.length === 0) return fn();
+    const prevs = ordered.map((k) => sessionChains.get(k) ?? Promise.resolve());
+    let release!: () => void;
+    const gate = new Promise<void>((r) => { release = r; });
+    for (const k of ordered) sessionChains.set(k, gate);
+    await Promise.allSettled(prevs);
+    try {
+        return await fn();
+    } finally {
+        release();
+    }
+}
 
 // ---- Dispatcher -----------------------------------------------------------
 
@@ -1801,14 +1820,16 @@ parentPort.on('message', async (msg: any) => {
         return;
     }
     if (msg?.kind !== 'rpc' || !msg.port) {
-        log('warn', `[worker] unexpected message: ${JSON.stringify(msg).slice(0, 80)}`);
+        log('warn', `unexpected message: ${JSON.stringify(msg).slice(0, 80)}`);
         return;
     }
     const { method, args, port } = msg as RpcRequest;
     try {
         const fn = handlers[method];
         if (!fn) throw new Error(`Unknown method: ${method}`);
-        const result = await fn(args);
+        const result = SUBMIT_METHODS.has(method)
+            ? await withSessionLocks(submitLockKeys(args), () => fn(args))
+            : await fn(args);
         port.postMessage({ ok: true, result } as RpcOk);
     } catch (err: any) {
         const payload: RpcErrorPayload = {
@@ -1822,4 +1843,4 @@ parentPort.on('message', async (msg: any) => {
 });
 
 parentPort.postMessage({ kind: 'ready' });
-log('info', '[worker] ready');
+log('info', 'ready');

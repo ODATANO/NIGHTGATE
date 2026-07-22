@@ -15,10 +15,13 @@
  * NOT blocked by the wallet SDK because the SDK now lives in the worker).
  */
 
-import { Worker, MessageChannel, type MessagePort } from 'node:worker_threads';
+import cds from '@sap/cds';
+import { Worker, MessageChannel } from 'node:worker_threads';
 import path from 'node:path';
 import type { CapDbPrivateStateProvider } from './CapDbPrivateStateProvider';
 import { formatErr } from '../utils/format-error';
+
+const log = cds.log('nightgate:worker-client');
 
 export interface WalletInitArgs {
     sessionId: string;
@@ -49,21 +52,43 @@ export type StateSaveSink = (event: {
 interface ClientState {
     worker: Worker;
     readyPromise: Promise<void>;
-    stateSaveSink?: StateSaveSink;
 }
 
 let client: ClientState | null = null;
 
+// True once the worker has been started at least once. Lets rpc() distinguish
+// "never started" (reject: caller must startWalletWorker() first) from "crashed
+// after a successful start" (respawn). Cleared on explicit stop/reset.
+let everStarted = false;
+
+// Kept at module scope (not on ClientState) so it survives a worker respawn:
+// the sink is wired once at startup and must keep persisting state-save events
+// even from a freshly respawned worker.
+let stateSaveSink: StateSaveSink | undefined;
+
+// In-flight rpc rejectors, so a worker crash/exit rejects every pending call
+// instead of leaving it to hang forever on a port that will never reply.
+interface PendingRpc { reject: (e: Error) => void; }
+const pendingRpcs = new Set<PendingRpc>();
+
+function rejectAllPendingRpcs(reason: string): void {
+    for (const p of [...pendingRpcs]) {
+        try { p.reject(new Error(reason)); } catch { /* already settled */ }
+    }
+    pendingRpcs.clear();
+}
+
+// Backstop timeout for a single worker RPC.
+const RPC_TIMEOUT_MS = Number(process.env.NIGHTGATE_WORKER_RPC_TIMEOUT_MS || 30 * 60 * 1000);
+
 /**
  * Per-submission private-state provider registry (Phase 2b).
  *
- * The wallet worker invokes the SDK's `deployContract` / `findDeployedContract`
- * inside the worker. The SDK's PrivateStateProvider hook is proxied from the
- * worker back to the main thread via `private-state-rpc` messages; that's
- * where the real CapDbPrivateStateProvider (with CAP DB access + encryption)
- * lives. Each in-flight submission registers its provider here under a fresh
- * `proxyId` so concurrent deploy/call invocations don't collide on a shared
- * `currentContractAddress`.
+ * The worker proxies the SDK's PrivateStateProvider hook back to the main
+ * thread via `private-state-rpc` messages, where the real
+ * CapDbPrivateStateProvider (CAP DB + encryption) lives. Each in-flight
+ * submission registers under a fresh `proxyId` so concurrent deploy/call
+ * invocations don't collide on a shared `currentContractAddress`.
  */
 const privateStateProviders = new Map<string, CapDbPrivateStateProvider>();
 
@@ -76,15 +101,11 @@ export function unregisterPrivateStateProvider(proxyId: string): void {
 }
 
 /**
- * Locate the compiled worker entry. tsc emits the worker .js next to its .ts
- * source under `srv/midnight/`, the same place this client sits at runtime.
+ * Locate the compiled worker entry: tsc emits `wallet-worker.js` next to this
+ * compiled client (build:plugin writes JS in-place, so it's there in dev too).
+ * Use __dirname so we don't depend on cwd.
  */
 function resolveWorkerEntry(): string {
-    // After tsc-build the runtime file is `srv/midnight/wallet-worker.js`
-    // sitting next to this compiled client. In dev (`cds watch` with TS) the
-    // compiled file is still available alongside the .ts source because the
-    // build:plugin step writes JS in-place. Use __dirname so we don't depend
-    // on cwd.
     return path.join(__dirname, 'wallet-worker.js');
 }
 
@@ -98,20 +119,12 @@ export async function startWalletWorker(): Promise<void> {
         return;
     }
 
+    everStarted = true;
     const entry = resolveWorkerEntry();
     const worker = new Worker(entry, {
-        // The `web-worker` npm polyfill (used by wallet-sdk-prover-client for
-        // the WASM prover) checks `worker_threads.isMainThread` at import
-        // time. In a Node worker that's false, so it falls into its
-        // `workerThread()` branch which destructures `threads.workerData`.
-        // If we pass nothing, workerData is null and the destructure throws.
-        // Passing `{}` makes web-worker's `if (!workerData.mod)` succeed and
-        // redirect to its `mainThread()` code path, which is the one that
-        // actually exports the Worker constructor that the SDK expects.
+
         workerData: {},
-        // Inherit NODE_OPTIONS so the wallet SDK gets the 12 GB heap the user
-        // sets for `npm run dev`. Without this the worker would default to
-        // 4 GB and OOM during the shielded chain scan.
+        // resourceLimits undefined: inherit NODE_OPTIONS (wallet SDK heap).
         resourceLimits: undefined,
         // stdout/stderr from the worker should surface to the main process.
         stderr: false,
@@ -134,38 +147,43 @@ export async function startWalletWorker(): Promise<void> {
 
     client = { worker, readyPromise };
 
-    // Push events from worker (state-save, log, private-state-rpc). These are
-    // NOT replies to main-initiated RPC calls; those go via MessageChannel
-    // ports allocated per call.
+    // Push events from worker (state-save, log, private-state-rpc)
     worker.on('message', (msg: any) => {
         if (msg?.kind === 'state-save') {
-            // Ack ONLY when the sink persisted successfully: the worker
-            // advances its confirmed-saved blobs on ack, so a failed persist
-            // is re-pushed on the next save tick instead of being stranded.
+            // Ack ONLY when the sink persisted successfully
             Promise.resolve()
-                .then(() => client?.stateSaveSink?.(msg))
+                .then(() => stateSaveSink?.(msg))
                 .then(() => {
                     if (msg.seq != null) worker.postMessage({ kind: 'state-save-ack', sessionId: msg.sessionId, seq: msg.seq });
                 })
                 .catch(() => { /* no ack; sink already logged the failure */ });
         } else if (msg?.kind === 'log') {
-            if (msg.level === 'warn') console.warn(msg.message);
-            else                       console.log(msg.message);
+            // Worker runs in a worker_thread without CAP; surface its log lines
+            // through a CAP channel so consumers control verbosity
+            const level = msg.level === 'warn' ? 'warn'
+                : msg.level === 'error' ? 'error'
+                    : msg.level === 'debug' ? 'debug'
+                        : 'info';
+            (cds.log('nightgate:worker') as any)[level](msg.message);
         } else if (msg?.kind === 'private-state-rpc') {
             dispatchPrivateStateRpc(msg);
         }
     });
 
     worker.on('error', err => {
-        console.error('[wallet-worker-client] worker error:', err);
+        log.error('worker error:', err);
+        rejectAllPendingRpcs(`wallet-worker crashed: ${err instanceof Error ? err.message : String(err)}`);
     });
     worker.on('exit', code => {
-        console.warn(`[wallet-worker-client] worker exited code=${code}`);
+        log.warn(`worker exited code=${code}`);
         client = null;
+        // Fail every in-flight call now; their reply ports are dead and would
+        // otherwise never settle. The next rpc() lazily respawns the worker.
+        rejectAllPendingRpcs(`wallet-worker exited (code=${code}) with in-flight calls`);
     });
 
     await readyPromise;
-    console.log('[wallet-worker-client] worker ready');
+    log.info('worker ready');
 }
 
 /**
@@ -176,6 +194,8 @@ export async function stopWalletWorker(timeoutMs = 5000): Promise<void> {
     if (!client) return;
     const w = client.worker;
     client = null;
+    // Intentional teardown: do NOT let a later rpc respawn the worker.
+    everStarted = false;
     try {
         await Promise.race([
             new Promise<void>(resolve => w.once('exit', () => resolve())),
@@ -183,7 +203,7 @@ export async function stopWalletWorker(timeoutMs = 5000): Promise<void> {
         ]);
     } finally {
         // Force-terminate if still alive.
-        try { await w.terminate(); } catch {}
+        try { await w.terminate(); } catch { }
     }
 }
 
@@ -195,26 +215,46 @@ export function setStateSaveSink(sink: StateSaveSink | undefined): void {
     if (!client) {
         throw new Error('wallet-worker not started; call startWalletWorker() first');
     }
-    client.stateSaveSink = sink;
+    stateSaveSink = sink;
 }
 
 /**
  * Generic RPC helper. Allocates a MessageChannel per call, posts the request
  * with port1 transferred to the worker, awaits the single reply on port2.
- *
- * Error shape: worker posts `{ ok: false, error: { name, message } }` so we
- * can rehydrate `err.name` here; TransactionSubmitter's classifySubmissionError
- * branches on `err.name === 'TxFailedError'` etc. Falls back to a plain
- * string for older message shapes (none currently, but cheap defensive).
  */
-function rpc<T>(method: string, args: unknown): Promise<T> {
+async function rpc<T>(method: string, args: unknown, timeoutMs: number = RPC_TIMEOUT_MS): Promise<T> {
     if (!client) {
-        return Promise.reject(new Error('wallet-worker not started'));
+
+        if (!everStarted) {
+            throw new Error('wallet-worker not started');
+        }
+        await startWalletWorker();
     }
+    const worker = client!.worker;
     return new Promise<T>((resolve, reject) => {
         const { port1, port2 } = new MessageChannel();
-        port2.once('message', (msg: any) => {
+        let settled = false;
+        let pending: PendingRpc;
+        let timer: ReturnType<typeof setTimeout>;
+        const settle = (): void => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            pendingRpcs.delete(pending);
             port2.close();
+        };
+        // Stored reject is the guarded one, so a worker-exit sweep and the
+        // timeout can't double-settle or leak the port/timer.
+        pending = { reject: (e: Error) => { if (!settled) { settle(); reject(e); } } };
+        pendingRpcs.add(pending);
+        timer = setTimeout(
+            () => pending.reject(new Error(`wallet-worker rpc '${method}' timed out after ${timeoutMs}ms`)),
+            timeoutMs
+        );
+
+        port2.once('message', (msg: any) => {
+            if (settled) return;
+            settle();
             if (msg?.ok) {
                 resolve(msg.result as T);
                 return;
@@ -229,10 +269,11 @@ function rpc<T>(method: string, args: unknown): Promise<T> {
             }
         });
         port2.once('messageerror', err => {
-            port2.close();
-            reject(err);
+            if (settled) return;
+            settle();
+            reject(err as Error);
         });
-        client!.worker.postMessage(
+        worker.postMessage(
             { kind: 'rpc', method, args, port: port1 },
             [port1] // transfer ownership of port1
         );
@@ -254,19 +295,19 @@ function dispatchPrivateStateRpc(msg: any): void {
     if (method === 'setContractAddress') {
         // No port: set synchronously, log on error.
         if (!provider) {
-            console.warn(`[wallet-worker-client] setContractAddress: unknown proxyId=${String(proxyId).slice(0, 16)}`);
+            log.warn(`setContractAddress: unknown proxyId=${String(proxyId).slice(0, 16)}`);
             return;
         }
         try {
             provider.setContractAddress(...(args as [string]));
         } catch (err) {
-            console.warn('[wallet-worker-client] setContractAddress failed:', formatErr(err));
+            log.warn('setContractAddress failed:', formatErr(err));
         }
         return;
     }
 
     if (!port) {
-        console.warn(`[wallet-worker-client] private-state-rpc missing port for method=${method}`);
+        log.warn(`private-state-rpc missing port for method=${method}`);
         return;
     }
 
@@ -287,7 +328,7 @@ function dispatchPrivateStateRpc(msg: any): void {
             port.postMessage({
                 ok: false,
                 error: {
-                    name:    err?.name ?? 'Error',
+                    name: err?.name ?? 'Error',
                     message: formatErr(err)
                 }
             });
@@ -310,14 +351,14 @@ async function dispatchPrivateStateMethod(
     args: unknown[]
 ): Promise<unknown> {
     switch (method) {
-        case 'set':                return provider.set(args[0] as string, args[1]);
-        case 'get':                return provider.get(args[0] as string);
-        case 'remove':             return provider.remove(args[0] as string);
-        case 'clear':              return provider.clear();
-        case 'setSigningKey':      return provider.setSigningKey(args[0] as string, args[1] as string);
-        case 'getSigningKey':      return provider.getSigningKey(args[0] as string);
-        case 'removeSigningKey':   return provider.removeSigningKey(args[0] as string);
-        case 'clearSigningKeys':   return provider.clearSigningKeys();
+        case 'set': return provider.set(args[0] as string, args[1]);
+        case 'get': return provider.get(args[0] as string);
+        case 'remove': return provider.remove(args[0] as string);
+        case 'clear': return provider.clear();
+        case 'setSigningKey': return provider.setSigningKey(args[0] as string, args[1] as string);
+        case 'getSigningKey': return provider.getSigningKey(args[0] as string);
+        case 'removeSigningKey': return provider.removeSigningKey(args[0] as string);
+        case 'clearSigningKeys': return provider.clearSigningKeys();
         default:
             throw new Error(`Unsupported private-state RPC method: '${method}'`);
     }
@@ -334,7 +375,8 @@ export function walletInit(args: WalletInitArgs): Promise<{
 }
 
 export function walletWaitForSyncedState(sessionId: string, timeoutMs?: number): Promise<{ synced: true }> {
-    return rpc('waitForSyncedState', { sessionId, timeoutMs });
+    const workerBudgetMs = timeoutMs ?? 3 * 60 * 60 * 1000;
+    return rpc('waitForSyncedState', { sessionId, timeoutMs }, workerBudgetMs + 5 * 60 * 1000);
 }
 
 export function walletSerializeState(sessionId: string): Promise<{
@@ -497,67 +539,40 @@ export function walletEstimateSwapFee(args: {
 // ---- Phase 2b: contract deploy / call -------------------------------------
 
 export interface WorkerContractRegistration {
-    artifactPath:   string;
+    artifactPath: string;
     privateStateId: string;
-    zkConfigPath:   string;
+    zkConfigPath: string;
 }
 
 export interface WalletDeployContractArgs {
     sessionId: string;
-    /** Ephemeral key tying the worker-side PS proxy back to a main-side provider. */
-    proxyId:   string;
+    proxyId: string;
     contractName: string;
     registration: WorkerContractRegistration;
     indexerHttpUrl: string;
-    indexerWsUrl:   string;
+    indexerWsUrl: string;
     proofServerUrl: string;
     networkId: 'preprod' | 'testnet' | 'mainnet' | 'undeployed' | 'devnet' | 'qanet' | 'preview';
     /** User-supplied private state for the new contract. Plain JSON-able value. */
     initialPrivateState: unknown;
-    /**
-     * Optional fee sponsor (facade key, i.e. accountId). The worker splits
-     * balancing: the calling facade balances shielded/unshielded and signs,
-     * the sponsor facade balances ONLY ['dust'] and submits.
-     */
     sponsorSessionId?: string;
 }
 
 export interface WalletSubmitContractCallArgs {
     sessionId: string;
-    proxyId:   string;
+    proxyId: string;
     contractName: string;
     registration: WorkerContractRegistration;
     contractAddress: string;
     circuit: string;
     args: unknown[];
     indexerHttpUrl: string;
-    indexerWsUrl:   string;
+    indexerWsUrl: string;
     proofServerUrl: string;
     networkId: 'preprod' | 'testnet' | 'mainnet' | 'undeployed' | 'devnet' | 'qanet' | 'preview';
-    /**
-     * Per-call ZK-predicate witnesses for `commitValue`/`provePredicate`
-     * (decimal value + 64-hex salt). Forwarded to the witness factory so the
-     * hidden value never leaves as a circuit arg. Omitted for other circuits.
-     */
     witnessValues?: { attestedValue: string; valueSalt: string };
-    /**
-     * Per-call Merkle inclusion proof for `proveFieldPredicate` (scaled field
-     * value + DEPTH=4 sibling path + direction flags). Forwarded to the witness
-     * factory; never a circuit arg. Omitted for other circuits.
-     */
     merkleProof?: { fieldValue: string; siblings: string[]; dirs: boolean[] };
-    /**
-     * Private state to seed when THIS wallet has none for the contract yet (a
-     * wallet that did not deploy it: the multi-caller case, e.g. several
-     * producers anchoring in one shared vault). Defaults to `{}`. Never
-     * overwrites an existing private state.
-     */
     initialPrivateState?: unknown;
-    /**
-     * Optional fee sponsor (facade key, i.e. accountId). The worker splits
-     * balancing: the calling facade balances shielded/unshielded and signs,
-     * the sponsor facade balances ONLY ['dust'] and submits.
-     */
     sponsorSessionId?: string;
 }
 
@@ -565,8 +580,6 @@ export interface WalletSubmitContractCallArgs {
  * Deploy a Compact-emitted contract through the wallet worker. The worker
  * owns the SDK and the wallet facade; private-state CRUD round-trips back to
  * the main-side provider registered under `proxyId`.
- *
- * Returns primitives only (no SDK objects cross the thread boundary).
  */
 export function walletDeployContract(args: WalletDeployContractArgs): Promise<{
     txHash: string;
@@ -590,5 +603,8 @@ export function walletSubmitContractCall(args: WalletSubmitContractCallArgs): Pr
 /** Test-only: reset the singleton so subsequent calls re-spawn. */
 export function __resetWalletWorkerForTests(): void {
     client = null;
+    everStarted = false;
+    stateSaveSink = undefined;
+    pendingRpcs.clear();
     privateStateProviders.clear();
 }

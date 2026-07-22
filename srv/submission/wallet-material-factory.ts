@@ -1,15 +1,11 @@
 /**
- * Wallet material factory.
- *
- * Resolves a WalletSessions row into the WalletMaterial shape that
- * TransactionSubmitter and the provider bundle consume:
- *   - looks up the active session and decrypts its viewing key
- *   - derives a deterministic accountId + private-state storage password from
- *     the viewing key, so the same key maps to the same encrypted state across
- *     reconnects
- *   - builds a wallet adapter sized to what the session carries: a real
- *     signing-capable adapter when an encryptedSeedKey is present, otherwise a
- *     read-only adapter whose signing methods throw.
+ * Wallet material factory. Resolves a WalletSessions row into the WalletMaterial
+ * that TransactionSubmitter and the provider bundle consume:
+ *   - decrypts the active session's viewing key
+ *   - derives a deterministic accountId + private-state storage password from it
+ *     (same key → same encrypted state across reconnects)
+ *   - builds a wallet adapter sized to the session: signing-capable when an
+ *     encryptedSeedKey is present, else read-only (signing methods throw).
  */
 
 import cds from '@sap/cds';
@@ -47,8 +43,8 @@ export class WalletSigningNotAvailable extends Error {
     }
 }
 
-// Retained for back-compat with the handlers.ts 501 mapping. The factory no
-// longer throws this; the symbol stays exported so dependents don't break.
+// Back-compat with the handlers.ts 501 mapping. No longer thrown by the factory;
+// the symbol stays exported so dependents don't break.
 export class WalletMaterialUnavailable extends Error {
     constructor(reason: string) {
         super(`Wallet material unavailable: ${reason}.`);
@@ -84,11 +80,7 @@ export interface BuildWalletMaterialOptions {
 const ACCOUNT_ID_LABEL = 'nightgate-account-id-v1';
 const PRIVATE_STATE_PASSWORD_LABEL = 'nightgate-private-state-password-v1';
 
-/**
- * Returns a fully-typed `WalletMaterial`. The wallet adapter's signing
- * methods throw `WalletSigningNotAvailable`; deterministic identifiers
- * (accountId) and the storage password work.
- */
+/** Resolves a session into a `WalletMaterial` (adapter shape depends on whether the session carries a seed). */
 export async function buildWalletMaterialForSession(opts: BuildWalletMaterialOptions): Promise<WalletMaterial> {
     const db = opts.db ?? await cds.connect.to('db');
     const where: Record<string, unknown> = { sessionId: opts.sessionId, isActive: true };
@@ -133,10 +125,9 @@ export async function buildWalletMaterialForSession(opts: BuildWalletMaterialOpt
                 seedHex,
                 { ...opts.facadeConfig, syncStatePassphrase: password }
             );
-            // Worker-routed submissions look the facade up by accountId; make
-            // it creatable on demand so a never-prewarmed (or evicted) session
-            // does not die with "No facade for sessionId". Idempotent: a
-            // prewarmed facade is a worker-side cache hit.
+            // Worker-routed submissions look the facade up by accountId; make it
+            // creatable on demand so a never-prewarmed (or evicted) session does
+            // not die with "No facade for sessionId". Idempotent.
             const facadeArgs = { ...opts.facadeConfig, seedHex, syncStatePassphrase: password };
             ensureFacade = async () => { await getOrBuildWalletFacade(accountId, facadeArgs); };
         } else {
@@ -159,18 +150,16 @@ export async function buildWalletMaterialForSession(opts: BuildWalletMaterialOpt
 // ---- Determinism helpers --------------------------------------------------
 
 /**
- * `accountId` is opaque storage scope; it just needs to be deterministic per
- * viewing key. We use HMAC-SHA256 with a domain-separation label and hex-encode.
- * 64 chars is well within the 200-char DB column.
+ * `accountId` is an opaque storage scope, deterministic per viewing key:
+ * HMAC-SHA256 with a domain-separation label, hex-encoded (64 chars).
  */
 export function deriveAccountId(viewingKey: string): string {
     return crypto.createHmac('sha256', ACCOUNT_ID_LABEL).update(viewingKey).digest('hex');
 }
 
 /**
- * Storage password for the CAP-DB private state provider. 64-char hex
- * (= 256 bits of entropy), well over the 16-char minimum. Distinct
- * domain-separation label from the accountId so the two values cannot collide.
+ * Storage password for the CAP-DB private state provider. 64-char hex (256 bits).
+ * Distinct domain-separation label from accountId so the two cannot collide.
  */
 export function deriveStoragePassword(viewingKey: string): string {
     return crypto.createHmac('sha256', PRIVATE_STATE_PASSWORD_LABEL).update(viewingKey).digest('hex');
@@ -179,12 +168,9 @@ export function deriveStoragePassword(viewingKey: string): string {
 // ---- Wallet adapter -------------------------------------------------------
 
 /**
- * Read-only adapter for viewing-key-only sessions. All four wallet methods
- * throw `WalletSigningNotAvailable`.
- *
- * Typed `any` for the secret-key/transaction types: importing them would pull
- * in the ESM-only ledger-v8 package, which an adapter that only throws does
- * not need.
+ * Read-only adapter for viewing-key-only sessions: all four wallet methods throw
+ * `WalletSigningNotAvailable`. Typed `any` to avoid pulling in the ESM-only
+ * ledger-v8 types for an adapter that only throws.
  */
 function createReadOnlyWalletAdapter(): any {
     return {
@@ -197,13 +183,9 @@ function createReadOnlyWalletAdapter(): any {
 
 /**
  * Full signing adapter: real pubkeys from the derived ZswapSecretKeys, with
- * balanceTx/submitTx routed through a WalletFacade.
- *
- * The facade is built lazily on the first balanceTx/submitTx call so that
- * request pays the chain-sync cost; it is then cached per accountId.
- * `balanceUnboundTransaction` yields a recipe that `finalizeRecipe` turns into
- * a transaction the SDK's deploy/call flow accepts. Balance TTL defaults to 1
- * hour, matching the SDK default.
+ * balanceTx/submitTx routed through a WalletFacade. The facade is built lazily on
+ * the first balanceTx/submitTx (that request pays the chain-sync cost) and cached
+ * per accountId. Balance TTL defaults to 1 hour (SDK default).
  */
 async function createFacadeBackedWalletAdapter(
     accountId: string,

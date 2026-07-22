@@ -1,33 +1,23 @@
 /**
- * WalletFacade orchestration, main-thread side (Phase 1: worker-thread aware).
+ * WalletFacade orchestration, main-thread side.
  *
  * The real `WalletFacade` lives in a `worker_threads` worker (see
- * `srv/midnight/wallet-worker.ts`). The wallet SDK's Effect.ts Fiber scheduler
- * monopolises Node's microtask queue while a chain sync is running, so we keep
- * it off the main thread. This builder is now a thin glue layer:
+ * `srv/midnight/wallet-worker.ts`): the wallet SDK's Effect.ts Fiber scheduler
+ * monopolises Node's microtask queue during a chain sync, so it stays off the
+ * main thread. This builder is a thin glue layer:
  *
- *   1. Load any persisted sub-state blobs from `midnight.WalletSyncStates`
- *      (standard CAP `db.run`, the main thread is free).
+ *   1. Load persisted sub-state blobs from `midnight.WalletSyncStates`.
  *   2. Tell the worker to `init(sessionId, seedHex, ..., restoreBlobs?)`.
- *   3. Cache the fact that this session has an active facade in the worker.
+ *   3. Record that this session has an active facade in the worker.
  *
- *   Periodic state-save: worker pushes `{state-save, sessionId, blobs}`
- *   events on `parentPort`. The client receives them and writes via CAP
- *   `db.run(UPDATE/INSERT)`. Wiring lives in `wireWorkerStateSaveSink()`
- *   below, called once by the plugin lifecycle.
+ * Periodic state-save: the worker pushes `{state-save, sessionId, blobs}` events
+ * on `parentPort`; `wireWorkerStateSaveSink()` (below, called once by the plugin
+ * lifecycle) persists them via CAP `db.run`.
  *
- * Phase 1 surface (what callers still get from this module):
- *   - `getOrBuildWalletFacade(cacheKey, args)`  initialises the worker-side
- *     facade and resolves once it's ready. The returned object is a stub;
- *     properties (.facade, .keys) exist only to keep the OLD callers from
- *     blowing up at import time. Their methods will throw `Error("phase-2:
- *     migrate to wallet-worker-client")` if called.
- *   - `evictWalletFacade(cacheKey)`  tells the worker to drop and final-save.
- *
- * Phase 2 will rewire `dust-registration.ts` and
- * `wallet-material-factory.ts:createFacadeBackedWalletAdapter` to call the
- * worker-client RPC API directly for `balanceTx` / `submitTx` /
- * `registerNightUtxosForDustGeneration`, removing the stub.
+ * `getOrBuildWalletFacade` returns a stub object whose `.facade`/`.keys` methods
+ * throw if called; real balanceTx/submitTx/dust-registration go through the
+ * worker-client RPC API directly. `evictWalletFacade` tells the worker to drop
+ * and final-save.
  */
 
 import {
@@ -42,12 +32,14 @@ import {
     getWalletSdkVersion
 } from './wallet-sync-state-store';
 import { formatErr } from '../utils/format-error';
+import cds from '@sap/cds';
+const log = cds.log('nightgate:facade');
 import nodeCrypto from 'node:crypto';
 
 // Opt-in facade-restore diagnostics (off by default; enable with
 // NIGHTGATE_DEBUG_WALLET_SYNC=true). Keeps the plugin quiet on a consumer's stdout.
 const DEBUG_SYNC = process.env.NIGHTGATE_DEBUG_WALLET_SYNC === 'true';
-const dbgSync = (msg: string): void => { if (DEBUG_SYNC) console.log(msg); };
+const dbgSync = (msg: string): void => { if (DEBUG_SYNC) log.debug(msg); };
 
 export interface WalletFacadeBuildArgs {
     seedHex: string;
@@ -65,7 +57,7 @@ export interface WalletFacadeBuildArgs {
     syncStatePassphrase?: string;
 }
 
-/** Phase 1 stub returned to callers that still expect a `facade` object. */
+/** Stub returned to callers that still expect a `facade` object; throws if a method is actually called. */
 const phase2Stub = (op: string) => () => {
     throw new Error(
         `[phase-1 worker migration] ${op} is not yet wired through wallet-worker-client. ` +
@@ -121,20 +113,15 @@ export function seedFingerprintOf(seedHex: string): string {
 const sessionRegistry = new Map<string, SessionRecord>();
 
 /**
- * Initialise a wallet for the given cacheKey via the worker. Idempotent:
- * subsequent calls for the same cacheKey hit the worker's cache.
- *
- * Returns a placeholder shape compatible with the pre-worker callers; methods
- * on `.facade` and `.keys.*` throw with a Phase 2 migration error if hit, so
- * code paths that haven't been migrated yet fail loudly instead of silently
- * regressing.
+ * Initialise a wallet for `cacheKey` via the worker. Idempotent: subsequent calls
+ * for the same cacheKey hit the worker's cache. Returns a placeholder shape whose
+ * `.facade`/`.keys.*` methods throw if hit (unmigrated paths fail loudly).
  */
 export async function getOrBuildWalletFacade(
     cacheKey: string,
     args: WalletFacadeBuildArgs
 ): Promise<{ facade: any; zswapKeys: any; dustKey: any; unshieldedKeystore: any }> {
-    // Attempt to restore from CAP-persisted state. Main thread is no longer
-    // blocked by the SDK, so this is a plain `db.run(SELECT)` call.
+    // Attempt to restore from CAP-persisted state (plain `db.run(SELECT)`).
     let restoreBlobs: { shielded?: string; unshielded?: string; dust?: string } | undefined;
     const seedFingerprint = seedFingerprintOf(args.seedHex);
     if (args.syncStatePassphrase) {
@@ -152,11 +139,11 @@ export async function getOrBuildWalletFacade(
                 dust:       loaded.dust
             };
             dbgSync(
-                `[facade] restored prior state for ${cacheKey.slice(0, 16)}: ` +
+                `restored prior state for ${cacheKey.slice(0, 16)}: ` +
                 `shielded=${!!loaded.shielded} unshielded=${!!loaded.unshielded} dust=${!!loaded.dust}`
             );
         } else {
-            dbgSync(`[facade] no usable prior state for ${cacheKey.slice(0, 16)} (cold start)`);
+            dbgSync(`no usable prior state for ${cacheKey.slice(0, 16)} (cold start)`);
         }
     }
 
@@ -173,7 +160,7 @@ export async function getOrBuildWalletFacade(
 
     const result = await walletInit(initArgs);
     dbgSync(
-        `[facade] worker init ok for ${cacheKey.slice(0, 16)}: ` +
+        `worker init ok for ${cacheKey.slice(0, 16)}: ` +
         `alreadyExisted=${result.alreadyExisted} sdk=${result.sdkVersion ?? '?'}`
     );
 
@@ -206,7 +193,7 @@ export async function evictWalletFacade(cacheKey: string): Promise<void> {
     try {
         await walletEvict(cacheKey);
     } catch (err) {
-        console.warn(`[facade] evict failed for ${cacheKey.slice(0, 16)}:`, formatErr(err));
+        log.warn(`evict failed for ${cacheKey.slice(0, 16)}:`, formatErr(err));
     } finally {
         sessionRegistry.delete(cacheKey);
     }
@@ -232,15 +219,15 @@ export function wireWorkerStateSaveSink(): void {
             // The session was evicted between save scheduling and arrival,
             // OR it was never registered (e.g. caller didn't pass
             // syncStatePassphrase to getOrBuildWalletFacade).
-            console.warn(
-                `[facade-persist] DROPPED save for ${event.sessionId.slice(0, 16)}: ` +
+            log.warn(
+                `DROPPED save for ${event.sessionId.slice(0, 16)}: ` +
                 `no session in registry (known: [${Array.from(sessionRegistry.keys()).map(k => k.slice(0, 16)).join(',')}])`
             );
             // Throw so the drop is NOT acked: the worker keeps the blobs
             // marked unsaved and retries on a later tick.
             throw new Error('state-save dropped: session not registered');
         }
-        console.log(`[facade-persist] received save for ${event.sessionId.slice(0, 16)}, persisting...`);
+        log.debug(`received save for ${event.sessionId.slice(0, 16)}, persisting...`);
         try {
             await saveSyncState({
                 accountId:       session.accountId,
@@ -255,9 +242,9 @@ export function wireWorkerStateSaveSink(): void {
                 event.blobs.unshielded ? `un=${event.blobs.unshielded.length}` : 'un=-',
                 event.blobs.dust       ? `du=${event.blobs.dust.length}`       : 'du=-'
             ].join(' ');
-            console.log(`[facade-persist] saved ${event.sessionId.slice(0, 16)} ${sizes}`);
+            log.debug(`saved ${event.sessionId.slice(0, 16)} ${sizes}`);
         } catch (err) {
-            console.warn(`[facade-persist] save failed for ${event.sessionId.slice(0, 16)}:`, formatErr(err));
+            log.warn(`save failed for ${event.sessionId.slice(0, 16)}:`, formatErr(err));
             // Rethrow so the worker-client does NOT ack this save; the worker
             // keeps its lastSavedBlobs stale and re-pushes on the next tick.
             throw err;
