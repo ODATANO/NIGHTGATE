@@ -65,13 +65,19 @@ type PendingSubmissionStatus : String(20) enum {
 
 // Background job lifecycle for long-running submission actions.
 //   pending   , row written by the OData handler; work is queued but not yet running
-//   running   , spawn picked up the work and is executing it
+//   running   , the worker owns the job and is still before the external-effect boundary
+//   external_execution , an SDK operation that may create a chain effect is in progress
+//   submitted , the SDK returned a transaction hash; finality is pending
+//   reconciliation_required , execution was interrupted after it may have produced an external effect
 //   succeeded , work resolved; result column carries the JSON of the original return shape
 //   failed    , work threw; errorCode + errorMessage classify it
 //
-type BackgroundJobStatus     : String(20) enum {
+type BackgroundJobStatus     : String(32) enum {
     pending;
     running;
+    external_execution;
+    submitted;
+    reconciliation_required;
     succeeded;
     failed;
 }

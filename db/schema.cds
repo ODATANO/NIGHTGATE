@@ -24,6 +24,7 @@ using {
 /**
  * Represents a block in the Midnight blockchain
  */
+@assert.unique.hash: [hash]
 entity Blocks : cuid, managed {
     hash             : HexEncoded not null;
     height           : Integer64 not null;
@@ -41,6 +42,9 @@ entity Blocks : cuid, managed {
 /**
  * Represents a transaction in the Midnight blockchain
  */
+// The extrinsic hash is not globally unique: identical encoded extrinsics can
+// occur in different blocks. Its canonical position inside a block is unique.
+@assert.unique.blockPosition: [block, transactionId]
 entity Transactions : cuid, managed {
     transactionId            : Integer not null; // index within block
     hash                     : HexEncoded not null;
@@ -90,6 +94,7 @@ entity Transactions : cuid, managed {
  */
 entity TransactionResults : cuid {
     status      : TransactionResultStatus not null;
+    outcomeSource : String(40); // substrate-system-events; null marks legacy/unverified rows
     transaction : Association to Transactions;
     segments    : Composition of many TransactionSegments
                       on segments.transactionResult = $self;
@@ -142,6 +147,7 @@ entity ContractBalances : cuid {
 /**
  * Unshielded Unspent Transaction Outputs
  */
+@assert.unique.createdOutput: [createdAtTransaction, outputIndex]
 entity UnshieldedUtxos : cuid, managed {
     owner                       : UnshieldedAddr not null; // Bech32m-encoded
     tokenType                   : HexEncoded not null;
@@ -185,6 +191,7 @@ entity DustLedgerEvents : cuid {
 /**
  * Wallet sessions for authenticated access.
  */
+@assert.unique.sessionId: [sessionId]
 entity WalletSessions : cuid, managed {
     userId              : String(200); // owning principal (req.user.id); all session actions are gated on this
     viewingKeyHash      : String(64); // SHA-256 of viewing key (for lookup/dedup)
@@ -261,17 +268,37 @@ entity PendingSubmissions : cuid, managed {
 /**
  * Backgroundjobs for diffrent purposes
  */
+@assert.unique.idempotency: [sessionId, kind, idempotencyKey]
 entity BackgroundJobs : cuid, managed {
     kind           : BackgroundJobKind not null;
     sessionId      : String(64); // owner scope; matches WalletSessions.sessionId
     status         : BackgroundJobStatus default 'pending';
     idempotencyKey : String(128); // optional, unique per (sessionId, kind)
     request        : LargeString; // JSON of inbound args (secrets redacted)
+    payloadFingerprint : String(64); // SHA-256 of kind/session/request; rejects idempotency-key drift
+    commandVersion : Integer; // non-null only for commands reconstructable after restart
+    command        : LargeString; // versioned executable payload; never contains wallet seed material
+    commandEncoding: String(20); // json-v1 | aes-gcm-v1
+    requestedBy    : String(200); // authenticated principal captured at command admission
+    parentJobId    : UUID; // internal workflow parent; null for public/root jobs
+    workflowStep   : String(64); // deterministic child step name
     result         : LargeString; // JSON of return value on success
     errorCode      : String(64); // classified code on failure
     errorMessage   : LargeString; // user-facing failure message
     startedAt      : Timestamp; // when the spawn picked it up
+    queuedAt       : Timestamp; // explicit queue admission timestamp
+    externalExecutionAt : Timestamp; // entered a combined proof/broadcast SDK call
+    submittedAt    : Timestamp; // txHash became available
     finishedAt     : Timestamp; // when it transitioned to succeeded/failed
+    attempt        : Integer default 0;
+    maxAttempts    : Integer default 1; // on-chain work is never retried blindly
+    leaseOwner     : String(200);
+    leaseExpiresAt : Timestamp;
+    heartbeatAt    : Timestamp;
+    submissionId   : UUID; // PendingSubmissions.ID once known
+    txHash         : HexEncoded; // external transaction id once known
+    chainStatus    : String(20); // pending | success | failure; null = no chain outcome yet/not applicable
+    chainFinalizedAt : Timestamp; // when a canonical System.Events outcome was observed
 }
 
 /**
@@ -376,6 +403,7 @@ entity DisclosureRoles : cuid, managed {
  * (contractAddress, payloadHash, grantee). `level`: 0=public,
  * 1=legitimate-interest, 2=authority.
  */
+@assert.unique.logicalGrant: [contractAddress, payloadHash, grantee]
 entity DisclosureGrants : cuid, managed {
     payloadHash     : HexEncoded not null; // attestation the grant is scoped to
     grantee         : HexEncoded not null; // Bytes<32> grantee identifier
