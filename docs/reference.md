@@ -31,7 +31,6 @@ Sufficient for read-side. `network` is the only required key — without it the 
       "nightgate": {
         "network": "preprod",
         "nodeUrl": "wss://rpc.preprod.midnight.network/",
-        "corsOrigin": "*",
         "sessionTtlMs": 86400000,
 
         "indexerHttpUrl": "https://indexer.preprod.midnight.network/api/v4/graphql",
@@ -40,6 +39,9 @@ Sufficient for read-side. `network` is the only required key — without it the 
         "zkConfigBasePath": "./contracts",
         "privateStateBackend": "cap-db",
         "allowMainnetSubmission": false,
+        "runtimeMode": "single-instance",
+        "replicaCount": 1,
+        "allowProductionSqlite": false,
 
         "contracts": {
           "counter": {
@@ -66,7 +68,7 @@ Sufficient for read-side. `network` is the only required key — without it the 
 
 | Key | Default | Notes |
 |---|---|---|
-| `network` | `preprod` | `testnet` / `preprod` / `mainnet`; invalid values fall back to `preprod` with a warning |
+| `network` | `preprod` | `testnet` / `preprod` / `preview` / `mainnet`; invalid values fall back to `preprod` with a warning |
 | `nodeUrl` | `wss://rpc.preprod.midnight.network/` | Substrate RPC WebSocket |
 | `indexerHttpUrl` | preprod indexer URL | Wallet SDK's `publicDataProvider` HTTP endpoint; NOT used by the crawler |
 | `indexerWsUrl` | derived from `indexerHttpUrl` (`http -> ws` + `/ws`) | Same, for subscriptions; set only if your indexer serves subscriptions somewhere non-standard |
@@ -74,9 +76,10 @@ Sufficient for read-side. `network` is the only required key — without it the 
 | `zkConfigBasePath` | `./contracts` | Base for resolving relative `contracts.<name>.zkConfigPath` |
 | `privateStateBackend` | `cap-db` | `cap-db` (default, production-grade encrypted CAP-DB tables) or `level` (legacy SDK LevelDB, **dev-only**, blocked on worker-routed submissions) |
 | `contracts` | `{}` | Map of `<ref>` → `{ artifactPath, privateStateId, zkConfigPath }`, loaded into the in-memory registry on plugin startup |
-| `corsOrigin` | `*` | Reflected in `Access-Control-Allow-Origin` |
-| `contentSecurityPolicy` | strict default | Set to `'off'` to disable, or a string to override |
 | `sessionTtlMs` | `86400000` (24 h) | Wallet session lifetime |
+| `runtimeMode` | `single-instance` | Current safety contract. Other modes fail closed. |
+| `replicaCount` | `1` | Declared process/replica count. Values above 1 fail closed until distributed crawler/job leases exist. |
+| `allowProductionSqlite` | `false` | Emergency-only escape hatch. Production startup with SQLite otherwise fails closed. |
 | `crawler.enabled` | `true` | When `false`, services still load but block indexing is disabled |
 | `crawler.nodeUrl` | top-level `nodeUrl` | Optional crawler-specific RPC override |
 | `crawler.batchSize` | `10` | Blocks per catch-up batch |
@@ -94,7 +97,12 @@ Sufficient for read-side. `network` is the only required key — without it the 
 | Variable | Purpose |
 |---|---|
 | `ENCRYPTION_KEY` | AES-256-GCM key (32-byte hex) for at-rest encryption of viewing keys + seed keys. Falls back to a dev key with warning if not set; **required** in production. |
-| `NODE_ENV=production` | Enables HSTS, enforces `ENCRYPTION_KEY` |
+| `NODE_ENV=production` | Enforces `ENCRYPTION_KEY` and rejects SQLite unless the emergency override is active |
+| `NIGHTGATE_INSTANCE_ID` | Stable operator-provided instance identifier; otherwise CF instance GUID, hostname, or a generated UUID |
+| `NIGHTGATE_REPLICA_COUNT` | Actual process/replica count. Must be `1`; takes precedence over CDS `replicaCount` |
+| `CF_INSTANCE_INDEX` | Read-only, injected by Cloud Foundry (0-based). Any value `> 0` fails closed: only instance `0` may run the crawler, wallet cache and job scheduler. Not consulted off Cloud Foundry |
+| `NIGHTGATE_ALLOW_PRODUCTION_SQLITE` | `true` temporarily permits production SQLite with a high-severity warning; intended only for a migration window |
+| `NIGHTGATE_CHILD_JOB_WAIT_TIMEOUT_MS` | Parent-workflow watchdog; defaults to the worker RPC timeout plus 5 minutes. Timeout is fail-closed while the child may continue. |
 | `NIGHTGATE_NETWORK` | Override `network` |
 | `NIGHTGATE_NODE_URL` | Override `nodeUrl` |
 | `NIGHTGATE_CRAWLER_NODE_URL` | Override `crawler.nodeUrl` |
@@ -130,13 +138,12 @@ For local repository startup, drop these into a repo-root `.env`. The tracked te
 
 - `cds-plugin.js` loads `src/plugin.ts`
 - Model roots registered from `db/` and `srv/`
-- Security middleware attached during CAP bootstrap
+- Connector routes (`/zk-config`, `/contract-manifest`) attached during CAP bootstrap; HTTP security remains host-owned
 - `initialize()` runs on `cds.on('served')`:
   1. Probes the CDS schema (SELECTs each required table). The schema is **not** auto-deployed — on the first missing table the plugin fails fast with `SchemaNotDeployedError` and instructs you to run `npm run deploy`
-  2. Applies SQLite tuning pragmas (WAL, 64 MB cache, 256 MB mmap)
-  3. Loads `cds.requires.nightgate.contracts` into the contract registry
-  4. Spawns the wallet worker thread (`startWalletWorker()`) and wires the state-save sink
-  5. Starts the crawler if `enabled` (default true)
+  2. Loads `cds.requires.nightgate.contracts` into the contract registry
+  3. Spawns the wallet worker thread (`startWalletWorker()`) and wires the state-save sink
+  4. Starts the crawler if `enabled` (default true)
 - `shutdown()` runs on `cds.on('shutdown')`:
   1. Stops the crawler
   2. Stops the wallet worker (sends final state-save for each cached facade)
@@ -151,6 +158,19 @@ NIGHTGATE runs two independent flows that meet at one reconciliation point. The 
 | **Wallet SDK** | `worker_threads` worker | ZK-aware wallet ops: shielded/unshielded/dust sub-wallets, transfer/swap/contract submission via the Midnight indexer + proof server |
 
 They meet at `reconcilePendingSubmission`: when the crawler indexes a transaction whose hash matches a row in `PendingSubmissions`, the row's status flips to `finalized`.
+
+For each fetched block the crawler also reads Substrate `System.Events` at that
+exact block hash. Runtime metadata is cached by `specVersion` and used to map
+`system.ExtrinsicSuccess` / `system.ExtrinsicFailed` to the event's
+`applyExtrinsic` index. Only these canonical events create a
+`TransactionResults` row, tagged `outcomeSource=substrate-system-events`.
+Missing storage, metadata/decode errors, or a missing outcome remain unknown;
+they are never converted to success. Rows created by older NIGHTGATE versions
+have no `outcomeSource` and are deliberately ignored by `verifyDocument` and
+`verifyPredicateAttestation`. Startup removes those known-invalid placeholder
+rows after the upgraded schema has been deployed. Re-crawl historical blocks
+to backfill verified outcomes; until then those historical outcomes correctly
+remain unknown.
 
 ### Submission lifecycle
 
@@ -170,35 +190,217 @@ See [actions.md#error-model](actions.md#error-model) for the full table of error
 
 ### Startup + failure semantics
 
-- On first startup, the package probes the schema by SELECTing each required table. The schema is **not** auto-deployed (auto-deploy was removed in 0.2.0): on the first missing table the plugin throws `SchemaNotDeployedError`, prints a "run `npm run deploy`" block, and exits. Deploy the schema explicitly before starting.
+- On first startup, the package probes the schema by SELECTing each required table. The schema is **not** auto-deployed: on the first missing table Nightgate remains offline and logs a "run `npm run deploy`" error. It never terminates the consuming CAP host process.
 - If the Midnight node cannot be reached, the package logs a warning and continues in `offline` mode. Read-side requests are still served from cache; submission requests still work (they only need the indexer + proof server, not the node directly).
 - If the wallet worker fails to start, the plugin logs a warning and continues — submission requests will return an error, read-side is unaffected.
 - Repeated `initialize()` calls are idempotent.
 - Contract registry loads from `cds.requires.nightgate.contracts` on every `initialize()`.
 
-### Switching existing databases
+### Runtime topology contract
+
+NIGHTGATE currently supports exactly one process/replica and one CAP tenant.
+The crawler, wallet facade cache, job semaphore and cleanup scheduler are
+process-local. Startup therefore fails closed before schema, worker or crawler
+initialization when a replica count above one is declared or CAP multitenancy
+is enabled. Declare the real count through `NIGHTGATE_REPLICA_COUNT` (preferred
+for deployments) or `cds.requires.nightgate.replicaCount`.
+
+Replica detection is declarative: it reads `NIGHTGATE_REPLICA_COUNT`,
+`CF_INSTANCE_COUNT`, `KUBERNETES_REPLICA_COUNT` or the CDS `replicaCount`, none
+of which a platform injects on its own. `WEB_CONCURRENCY` is deliberately
+ignored: it counts HTTP worker processes within one instance, not replicas of
+this stateful service. On Cloud Foundry there is one automatic backstop:
+`CF_INSTANCE_INDEX` is injected per instance (0-based), so an accidental
+scale-out where the operator forgot to declare the count still fails closed on
+every instance except `0`. There is no equivalent auto-injected signal on
+Kubernetes or bare processes, so declare the real count there.
+
+`getHealth`, `getReadiness`, `getLiveness` and Prometheus metrics expose the
+instance id and runtime topology state. This guard prevents accidental unsafe
+operation; it is not a distributed lock or leader election. Deployment
+descriptors must still ensure only one instance is started.
+
+Production SQLite is rejected by the same preflight guard. Install and bind
+`@cap-js/postgres` (or `@cap-js/hana`) in the consuming CAP application. A
+legacy deployment can set `NIGHTGATE_ALLOW_PRODUCTION_SQLITE=true` only as a
+temporary escape hatch; this does not make SQLite production-safe.
+
+### Database profiles and migration
+
+CAP recommends SQLite for development and PostgreSQL or SAP HANA for
+production. The consuming application owns that choice; NIGHTGATE remains
+database-agnostic and does not embed credentials. A typical host configuration
+uses profile-specific database kinds:
+
+```json
+{
+  "cds": { "requires": { "db": {
+    "[development]": { "kind": "sqlite", "credentials": { "url": "db/local.db" } },
+    "[production]":  { "kind": "postgres", "credentials": { "url": null } }
+  } } }
+}
+```
+
+Install `@cap-js/postgres` in the host. Inject production credentials through a
+CAP service binding or `cds_requires_db_credentials_*`; never commit passwords.
+Run `cds deploy --profile production` before starting a new database. CAP's
+automatic schema evolution is non-destructive but cannot perform lossy key or
+type changes; inspect generated deltas and back up before every deployment.
+
+SQLite-to-PostgreSQL is a data migration, not an in-place schema evolution:
+deploy the CDS model to an empty PostgreSQL database, stop all writers, export
+and import the business/NIGHTGATE rows with a verified ETL, compare row counts
+and `SyncState`, then switch the binding. Keep the SQLite file read-only until
+the PostgreSQL backup and application smoke test succeed.
 
 `db/midnight.db` persists indexed data plus encrypted wallet state. When switching networks, delete `db/midnight.db*` first.
+
+### Background-job durability and restart safety
+
+`BackgroundJobs` is the durable execution ledger for long-running wallet and
+contract operations. Each row records a request fingerprint, attempt budget,
+worker lease, heartbeat and (as soon as `TransactionSubmitter` creates it) the
+`PendingSubmissions.ID` and transaction hash. A database constraint permanently
+binds `(sessionId, kind, idempotencyKey)` to one job. This includes failed jobs:
+an intentional new attempt must use a new key. Reusing a key with a different
+request is rejected, while concurrent identical requests cannot create two job
+rows.
+
+Before upgrading an existing database, run `npm run check:job-idempotency`
+against its binding. It is read-only and reports historical duplicate tuples.
+Resolve those explicitly before `cds deploy`; the tool never guesses which
+possibly-on-chain job should be retained.
+
+The lifecycle is `pending -> running -> external_execution -> submitted ->
+succeeded|failed`. `external_execution` begins immediately before the Midnight
+SDK call that currently combines proof generation, balancing and broadcast.
+`submitted` begins only when a transaction hash is available. A
+process restart is deliberately fail-safe rather than an automatic blockchain
+retry:
+
+- `pending` or pre-effect `running` becomes `failed /
+  PROCESS_RESTART_BEFORE_EXECUTION`;
+- `external_execution` or `submitted` becomes `reconciliation_required /
+  PROCESS_RESTART_RECONCILE`;
+- a job in `reconciliation_required` must be checked against
+  `PendingSubmissions`, its persisted `txHash`, or live contract state before a
+caller creates a retry.
+
+`BackgroundJobs.status` and `chainStatus` answer different questions. A job is
+`succeeded` when NIGHTGATE's command/submission workflow returned successfully;
+this does not assert that the finalized extrinsic executed successfully.
+`chainStatus` is null for non-chain jobs, `pending` after a tx hash is reported,
+and later `success` or `failure` only after the crawler correlates the finalized
+transaction with a canonical `System.Events` outcome. `chainFinalizedAt` records
+when that evidence became available. Predicate workflow parents aggregate their
+children: any failed child means `failure`, all successful children mean
+`success`, otherwise the parent remains `pending`.
+
+The same rule applies without a process restart: if work throws after reaching
+`external_execution` or `submitted`, the job becomes
+`reconciliation_required / EXTERNAL_EXECUTION_FAILED`, because broadcast may
+already have happened. Only failures proven to occur before that boundary are
+ordinary `failed` jobs.
+
+The command poller also performs conservative automatic reconciliation. It
+requires the exact job `txHash` (or the hash on its linked
+`PendingSubmissions` row), that submission in `finalized`, and a matching
+crawler-indexed `Transactions` row. This completes the submission job with a
+minimal `{ reconciled, submissionId, txHash, contractAddress, status }` result.
+A hash alone, an `included` submission, or a live-state effect without a
+transaction identity remains `reconciliation_required`. This proves the same
+submission/finalization contract as the normal path; it does not claim business
+execution success, because the crawler does not yet derive real execution
+outcomes from chain events.
+
+Leaf commands with local projections register an idempotent reconciliation
+finalizer. `anchorDocument` restores `Documents.anchoredTxHash/anchoredAt`;
+`grantDisclosure` restores `grantedTxHash`; `revokeDisclosure` immediately sets
+`active=false` and stores `revokedTxHash`. Disclosure finalizers also trigger
+the normal state reindex. These finalizers never call the wallet or submit a
+transaction. The job remains `reconciliation_required` if a finalizer throws,
+and may safely retry its projection writes on the next poll. Their result uses
+the normal action-specific fields plus `reconciled: true`; only leaf kinds
+without a registered finalizer use the minimal generic result.
+
+When every child of a predicate workflow has been reconciled successfully, its
+parent is moved back to `pending`. The normal versioned processor then resolves
+the same deterministic children and rebuilds the full typed parent result; it
+does not submit them again. Partially resolved workflows remain visible for
+operator action.
+
+This avoids duplicate on-chain effects. Wallet pre-warm, NIGHT transfer,
+shield/unshield and dust jobs use versioned persisted commands. Their command
+payload contains no seed material: the processor reloads encrypted signing
+material from the user-owned `WalletSessions` row, verifies `requestedBy`, and
+rebuilds the wallet facade. After a restart, a replayable job interrupted in
+pre-effect `running` is returned to `pending` and claimed again. External-effect
+states are never replayed.
+
+Contract deploy and generic contract-call jobs also use versioned commands.
+Their complete circuit arguments and initial private state are stored only as
+AES-256-GCM ciphertext (`commandEncoding = aes-gcm-v1`) under `ENCRYPTION_KEY`;
+the public `request` column remains redacted. The processor re-resolves the
+registered artifact, revalidates wallet and sponsor ownership, coerces circuit
+arguments again, and only then executes.
+
+Document anchoring and disclosure grant/revoke jobs also use encrypted,
+versioned commands and are replayable before their external-effect boundary.
+Predicate issuance is represented as a durable parent workflow with one
+deterministic child job per chain call. `parentJobId` and `workflowStep` make
+those checkpoints explicit, while the child idempotency key
+`workflow:<parent ID>:<step>` ensures a restarted parent resolves the same step
+instead of submitting it again. Each child may cross the external-effect
+boundary at most once.
+
+The parent itself performs no chain submission. If an earlier child succeeded
+but a later child fails or becomes ambiguous, the parent becomes
+`reconciliation_required` rather than ordinary `failed`: retrying the complete
+workflow under a new parent could otherwise duplicate the already completed
+chain effect. A field predicate without the optional content-root anchoring has
+only one chain step and can still fail normally before that step's external
+boundary. Private predicate witnesses and Merkle paths are encrypted at rest in
+the child command and never copied into the public request snapshot.
+
+Prometheus exposes queued, running, reconciliation-required and oldest-queued
+job gauges. The current single-instance topology remains enforced; leases make
+ownership and stale execution observable but are not yet multi-replica leader
+election.
+
+**Reconciliation caveats (operational).** Automatic reconciliation is conservative
+and fails safe, with two boundaries to monitor rather than treat as fully
+self-healing:
+
+- A leaf job whose transaction is finalized but whose `System.Events` never decode
+  (a persistent runtime-metadata gap at that block) has no canonical outcome, so it
+  stays `reconciliation_required` **indefinitely** instead of being resolved. This
+  never produces a false success, but there is no timeout — alert on a non-zero
+  `odatano_nightgate_jobs_reconciliation_required` gauge that does not drain, and
+  reconcile such jobs manually against chain state.
+- A job already resolved to `succeeded` / `failed` is not reverted if a later chain
+  reorg removes its block and the cascaded `TransactionResults`. This is low risk
+  because reconciliation only fires after `PendingSubmissions.status = finalized`
+  (past confirmation depth), but it is not actively defended.
+
+The single-instance poller scans only `pending` rows with a registered
+`(kind, commandVersion)` processor. Commit visibility is awaited before
+acquiring the per-kind semaphore. The
+atomic `pending -> running` claim must affect exactly one row; otherwise no work
+executes. Completion/failure writes are fenced by `leaseOwner` and the active
+status, preventing a stale worker from overwriting a newer owner. Heartbeats do
+not cancel or reclaim a hung live SDK promise because the old call may still
+cross the external boundary later. Command replay is crash recovery, not an
+unsafe concurrent takeover of a live process.
 
 The `PrivateStates`, `ContractSigningKeys`, and `WalletSyncStates` tables are encrypted with passwords derived from the viewing key (via PBKDF2). Losing the `ENCRYPTION_KEY` env var means stored viewing/seed keys become unreadable — back it up separately. For private state migration, use `exportPrivateStates({ password })` to produce a portable encrypted blob.
 
 ### Security middleware
 
-The bootstrap middleware sets these headers on every response:
-
-- `X-Correlation-ID`
-- `Access-Control-Allow-Origin`
-- `Access-Control-Allow-Methods`
-- `Access-Control-Allow-Headers` (includes `X-Correlation-ID`)
-- `Access-Control-Max-Age`
-- `X-Content-Type-Options: nosniff`
-- `X-Frame-Options: DENY`
-- `X-XSS-Protection: 0`
-- `Referrer-Policy: strict-origin-when-cross-origin`
-- `Content-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'`
-- `Strict-Transport-Security` in production only
-
-It also short-circuits `OPTIONS` requests with HTTP 204.
+NIGHTGATE installs no global HTTP middleware. CORS, CSP, HSTS, correlation
+headers and preflight handling are policies of the consuming CAP host. This is
+intentional: a plugin must not alter unrelated services or static applications.
+Hosts exposing `/zk-config/...` or `/contract-manifest` cross-origin must add
+those paths to their own explicit CORS allow-list.
 
 ## Programmatic API
 
@@ -265,13 +467,14 @@ For per-action signatures and curl examples, see [actions.md](actions.md).
 New enums in `db/types.cds`:
 
 - `PendingSubmissionStatus`: `pending` | `included` | `finalized` | `failed`
+- `BackgroundJobStatus`: `pending` | `running` | `external_execution` | `submitted` | `reconciliation_required` | `succeeded` | `failed` (durable job lifecycle; `reconciliation_required` is terminal until chain evidence resolves it)
 - `DisclosureRole`: `public_only` | `legitimate_interest` | `authority` (EU Battery Reg Annex XIII tiers)
 
 ## Capability matrix
 
 | Area | Status |
 |---|---|
-| CAP plugin integration | ✅ Auto-registers models, security middleware, lifecycle hooks |
+| CAP plugin integration | ✅ Auto-registers models, connector routes and lifecycle hooks |
 | Node connectivity | ✅ `ws://` / `wss://` connections, config validation, offline fallback |
 | Block catch-up + live sync | ✅ Finalized-block replay, header subscription, transient retry |
 | Reorg recovery | ✅ Parent-hash detection, fork-point search, atomic rollback, `ReorgLog` |
@@ -298,7 +501,7 @@ Key directories:
 ```
 src/
   index.ts                          # initialize/shutdown/getStatus + lifecycle
-  plugin.ts                         # cds-plugin.js entry, security middleware
+  plugin.ts                         # cds-plugin.js entry, connector routes, lifecycle
 srv/
   nightgate-service.{cds,ts}        # main OData service + wallet/token-ops/contract handlers
   nightgate-indexer-service.{cds,ts}# sync/health/metrics/reorg
@@ -374,8 +577,8 @@ npm run integration:contract-registry  # registry resolves the real compiled cou
 
 ## Testing baseline
 
-- 63 test suites (Vitest; migrated from Jest in 0.7.0 after CAP 10 deprecated the Jest harness)
-- 1097 tests passing
+- 64 test suites (Vitest; migrated from Jest in 0.7.0 after CAP 10 deprecated the Jest harness)
+- 1163 tests passing
 - 0 failures
 - Integration scripts pass against the real SDK (`smoke:sdk`, `integration:*`)
 - Known coverage gap by design: the facade OPERATION bodies in `srv/midnight/wallet-worker.ts` (transfer/shield/unshield/dust/deploy) run the real SDK and are exercised by the live e2e scripts; the worker's RPC dispatch, facade lifecycle, genuine-sync gate and save/ack protocol are unit-tested in-thread (`wallet-worker-dispatch.test.ts`)

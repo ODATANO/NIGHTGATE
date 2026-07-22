@@ -14,9 +14,13 @@ OData distinguishes between **actions** (POST, may have side effects) and **func
 
 Every action that submits an on-chain transaction is **asynchronous**: it returns `{ jobId, status: "pending" }` immediately, then you poll `getJobStatus(jobId, sessionId)` until `succeeded` or `failed`. This keeps multi-minute proof/submit work off the HTTP request. Each write action below documents its **job-result** shape (the parsed `result` on success); read-only **functions** return their result directly.
 
-### `getJobStatus(jobId, sessionId) → { status, result, errorCode, errorMessage }`
+### `getJobStatus(jobId, sessionId) → { status, chainStatus, result, errorCode, errorMessage, submissionId, txHash, chainFinalizedAt, … }`
 
-`status`: `pending | running | succeeded | failed`. On success, `result` is a JSON string of the action's result shape; on failure, `errorCode` + `errorMessage` carry the classified error (see [Error model](#error-model)).
+`status` (server-side workflow lifecycle): `pending | running | external_execution | submitted | reconciliation_required | succeeded | failed`. On success, `result` is a JSON string of the action's result shape; on failure, `errorCode` + `errorMessage` carry the classified error (see [Error model](#error-model)).
+
+`reconciliation_required` is an explicit **terminal** state: execution was interrupted after an external effect may have occurred. The caller must NOT auto-retry — a fresh attempt needs a new `idempotencyKey`. The single-instance reconciler resolves such jobs automatically from durable chain evidence (a finalized `PendingSubmission` plus a `System.Events` outcome) once it becomes available.
+
+`chainStatus` (`null | pending | success | failure`) is the on-chain execution outcome, **independent of `status`**, populated later from `System.Events`: `status: succeeded` means the submission workflow completed, while `chainStatus: success` confirms the transaction was finalized and executed successfully on-chain. A `chainStatus: failure` on a `succeeded` job means the tx finalized but the contract call reverted. The response also carries `submissionId`, `txHash`, `chainFinalizedAt`, and lease/attempt/timestamp bookkeeping fields.
 
 ## Session lifecycle
 
@@ -129,7 +133,7 @@ Reverse: deregister ALL the wallet's registered NIGHT UTXOs so they become spend
 
 ## Contract operations
 
-### `deployContract(compiledArtifactRef, sessionId, initialPrivateState, idempotencyKey?) → { jobId, status }`
+### `deployContract(compiledArtifactRef, sessionId, initialPrivateState, idempotencyKey?, sponsorSessionId?) → { jobId, status }`
 
 Deploy a Compact-compiled contract. The contract must be registered via `cds.requires.nightgate.contracts.<ref>` (or programmatically via `registerContract()`).
 
@@ -236,7 +240,7 @@ Anchor a document's content hash on-chain via the AttestationVault `attest` circ
 
 ### `verifyDocument(documentId, providedSha256) → { verified, anchoredTxHash, anchoredAt, originalSha256 }` (function)
 
-`verified: true` iff the hash matches the stored `sha256`, `anchoredTxHash` is set, and that tx resolves to a `SUCCESS` result. A hash mismatch returns `verified: false` (not an error).
+`verified: true` iff the hash matches the stored `sha256`, `anchoredTxHash` is set, and that tx resolves to a `SUCCESS` result — or, when the crawler is disabled/lagging, confirmed directly against live contract state via the optional `contractAddress`. A hash mismatch returns `verified: false` (not an error).
 
 ## ZK predicate attestations
 
@@ -244,11 +248,11 @@ Prove a hidden numeric value satisfies a predicate against a public threshold, w
 
 ### `issuePredicateAttestation(payloadHash, value, predicate, threshold, sessionId, contractAddress, salt?, unit?, valueCommitment?, compiledArtifactRef?) → { jobId, status, predicateAttestationId }`
 
-The payload must already be attested. Submits `commitValue` then `provePredicate`; the ledger only includes the tx if the in-circuit commitment + predicate asserts hold, so a succeeded job IS the verified proof. `value` is a scaled integer (caller owns float scaling); it is used only as a circuit witness and **never persisted**. `predicate`: `lessOrEqual` | `greaterOrEqual`. `salt` (64-hex commitment opening) is generated if omitted. Job result: `{ predicateAttestationId, payloadHash, claim, proof }` (PAC-envelope shape). **Rate limit:** 10/hour per session.
+The payload must already be attested. Submits `commitValue` then `provePredicate`. A job with `status=succeeded` means the server-side submission workflow completed; inspect `getJobStatus.chainStatus` or call `verifyPredicateAttestation` for the later canonical chain outcome. `value` is a scaled integer (caller owns float scaling); it is used only as a circuit witness and **never persisted**. `predicate`: `lessOrEqual` | `greaterOrEqual`. `salt` (64-hex commitment opening) is generated if omitted. Job result: `{ predicateAttestationId, payloadHash, claim, proof }` (PAC-envelope shape). **Rate limit:** 10/hour per session.
 
 ### `verifyPredicateAttestation(predicateAttestationId) → { verified, predicate, threshold, unit, valueCommitment, provenTxHash, provenAt }` (function)
 
-`verified: true` iff `provenTxHash` resolves to a `SUCCESS` result (needs the crawler enabled to index the proof tx).
+`verified: true` iff `provenTxHash` resolves to a `SUCCESS` result, or confirmed directly against live contract state when the crawler is disabled/lagging.
 
 ## Disclosure grants
 
@@ -309,7 +313,7 @@ Crawler sync state. **This is the crawler's view, not the wallet's.** During wal
 ### `getSyncStatus() → SyncState`
 ### `getMetrics() → String`
 
-`getMetrics` returns Prometheus text format. Metric prefix: `odatano_nightgate_*`. Includes chain height, indexed height, sync lag, block throughput, error counts, uptime, sync status (mapped: stopped=0, syncing=1, synced=2, error=3).
+`getMetrics` returns Prometheus text format. Metric prefix: `odatano_nightgate_*`. Includes chain height, indexed height, sync lag, block throughput, error counts, uptime, sync status (mapped: stopped=0, syncing=1, synced=2, error=3), runtime-topology gauges (`_runtime_topology_valid`, `_runtime_replicas`, `_runtime_database_info`), and background-job gauges (`_jobs_queued`, `_jobs_running`, `_jobs_reconciliation_required`, `_jobs_oldest_queued_seconds`).
 
 ### `getLiveness() → { status, timestamp, uptime }`
 ### `getReadiness() → { ready, checks: { database, crawler, node } }`

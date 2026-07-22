@@ -39,7 +39,7 @@ NIGHTGATE has two parallel data flows that share a single reconciliation point:
 
 Crawler indexes chain history from the Substrate node. The wallet SDK runs ZK transaction operations through the GraphQL indexer and submits via the Substrate node. Both write to the same CAP DB. They meet at `reconcilePendingSubmission`: when the crawler persists a transaction whose hash matches a row in `PendingSubmissions`, the row's status flips from `included` to `finalized`.
 
-The two pipelines could theoretically share data (the indexer's GraphQL view duplicates a lot of what the crawler indexes), but they have different consumers (enterprise OData consumers vs. the wallet SDK's specific subscription shape) and the duplication is the simplest design.
+The two pipelines could share data (the indexer's GraphQL view duplicates much of what the crawler indexes), but they serve different consumers (enterprise OData vs. the wallet SDK's specific subscription shape), so the duplication is the simplest design.
 
 ## Why a worker thread
 
@@ -54,7 +54,7 @@ The fix is structural: run the wallet SDK in its own `worker_threads` worker. Ea
 - Push events on `parentPort` (no per-call port): `state-save`, `log`, `private-state-rpc`.
 - Persistence: every 30 s the worker pushes a `state-save` event with serialized sub-wallet blobs. The main thread writes them via standard CAP `db.run`.
 
-Verification proof: in a Phase-1 test run, the main thread's `setInterval` callbacks fired regularly throughout a 75-second wallet sync — they had been frozen entirely before.
+Verification: in a Phase-1 test run, the main thread's `setInterval` callbacks fired regularly throughout a 75-second wallet sync, having been frozen entirely before.
 
 ### Phase 2a — dust registration in the worker (2026-05-17)
 
@@ -126,7 +126,7 @@ This was a bug in the first Phase 2b draft (worker passed the OData UUID as look
 ODATANO's Cardano transaction surface returns unsigned CBOR for external signing. The wallet's seed key never touches the server. Midnight doesn't support this pattern cleanly:
 
 - `facade.finalizeRecipe()` triggers **ZK proof generation**. The proof requires witness data derived from the wallet's secret keys.
-- The proof generation runs against a proof server (which the SDK calls over HTTP) but feeds it the proving witnesses, which come from the secret keys.
+- The proof runs against a proof server the SDK calls over HTTP, fed the proving witnesses.
 - The result is a `FinalizedTransaction` that bundles proofs + signatures + binding into one opaque object.
 
 The `wallet-sdk-facade` doesn't expose a serialization of `FinalizedTransaction` for "build now, submit later" workflows. The low-level `ledger-v8.Transaction.serialize()` exists, but the facade doesn't surface it as part of its API contract.

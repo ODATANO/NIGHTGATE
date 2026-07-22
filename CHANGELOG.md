@@ -1,5 +1,198 @@
 # Changelog
 
+## 0.9.0 - 2026-07-22
+
+### Hardening pass: submission recovery, crawler resilience, DB indexes, leveled logging
+
+A broad, review-driven cleanup across the submission, crawler and provider
+layers, plus a move to CAP-native leveled logging.
+
+**Submission / wallet worker**
+
+1. Worker crash recovery. A wallet-worker that exits after a successful start
+   is now respawned on the next RPC instead of permanently rejecting every
+   deploy/call. In-flight RPCs are rejected on worker exit/error (no more calls
+   hanging forever on a dead reply port), and every RPC has a backstop timeout
+   (`NIGHTGATE_WORKER_RPC_TIMEOUT_MS`, default 30 min). Long sync waits
+   (`waitForSyncedState`) use a larger per-call timeout matching the worker's own
+   sync budget, so a legitimately long cold sync (fresh seed, full shielded scan)
+   is not killed mid-flight. "Never started" still rejects; only a genuine crash
+   respawns.
+2. Per-facade serialization. Concurrent balance+submit calls on the same wallet
+   (and on a shared fee sponsor) are serialized through a deadlock-free
+   multi-key lock, so two submissions cannot select overlapping UTXO/dust
+   inputs and get the second rejected as a double-select.
+3. Indexer providers are built once per (indexer + proof + zkConfig) and reused
+   instead of opening a fresh graphql-ws connection on every submission (socket
+   leak under load).
+4. Session eviction now zeroes ALL secrets (dust key, unshielded keystore,
+   attestation secret), not just the zswap keys.
+5. `markFailed`'s status write can no longer mask the classified
+   `SubmissionError` under write contention, and a sync-state subscription no
+   longer leaks on the stalled-indexer poll path.
+
+**Background jobs: persistent, restart-safe state machine**
+
+The async runner behind the long-running submission actions (`deployContract`,
+`submitContractCall`, `anchorDocument`, `sendNight`, `shield`/`unshieldFunds`,
+dust register/deregister, predicate attestations) is now a durable state
+machine instead of a fire-and-forget spawn.
+
+1. Explicit lifecycle `pending -> running -> external_execution -> submitted ->
+   succeeded | failed`, plus the terminal `reconciliation_required`. The
+   `external_execution` boundary is crossed immediately BEFORE any SDK call that
+   can create a chain effect; `submitted` is set only once a real `txHash`
+   exists. `queuedAt`, `externalExecutionAt` and `submittedAt` each carry a
+   distinct, well-defined meaning.
+2. Crash-safe recovery on boot, never a blind second submit: `pending`/`running`
+   rows (provably before the external-effect boundary) become
+   `failed:PROCESS_RESTART_BEFORE_EXECUTION` (a new key may retry);
+   `external_execution`/`submitted` rows become
+   `reconciliation_required:PROCESS_RESTART_RECONCILE` (verify chain state first).
+3. No `cds.spawn` and no private `cds._with`: work runs outside the request /
+   transaction context through a module-level Node `AsyncResource`. Each row
+   mutation uses its own short tx, so a job holds no pool connection while its
+   multi-minute work is in flight.
+4. Persisted worker lease (`leaseOwner`, `leaseExpiresAt`, `heartbeatAt`) and
+   `attempt`/`maxAttempts`. The `pending -> running` claim must update exactly
+   one row or the job does not execute; every heartbeat, completion and failure
+   write is fenced on `leaseOwner` + status, so a superseded worker cannot
+   overwrite a newly owned state.
+5. Idempotency is enforced by a database unique constraint on
+   `(sessionId, kind, idempotencyKey)`. A key stays permanently bound to its
+   first job (including `failed`/reconciliation states); a conscious retry needs
+   a new key. A reused key with a changed payload is rejected via a SHA-256
+   payload fingerprint. `idempotencyPayload` lets a caller dedupe on a stable
+   semantic input even when the request carries freshly generated resource IDs,
+   so deduplicated documents/predicate attestations return the ORIGINAL IDs and
+   leave no orphan rows. Two truly-concurrent requests with the same key are
+   resolved to the single winning job (the loser's INSERT collision rolls back
+   through a savepoint and returns the winner), never a raw error. Invariant: a
+   job performs at most one external submission.
+6. `getJobStatus` surfaces lease, attempt, `submissionId`, `txHash` and the
+   three lifecycle timestamps. New Prometheus gauges: `*_jobs_queued`,
+   `*_jobs_running`, `*_jobs_reconciliation_required`,
+   `*_jobs_oldest_queued_seconds`. Consumers (NIGHTPASS) treat
+   `reconciliation_required` as an explicit terminal state.
+7. Long-running wallet, contract, document and disclosure operations now use
+   encrypted, versioned commands claimed by a replay poller. Multi-submit
+   predicate operations are durable parent/child workflows: every chain call
+   has a deterministic child idempotency key and may cross the external-effect
+   boundary at most once. A partial workflow or any live failure after that
+   boundary becomes `reconciliation_required`, never an automatically
+   retryable failure.
+8. The replay poller conservatively auto-reconciles jobs when their exact
+   `PendingSubmission` is finalized and the crawler has indexed the same
+   transaction. Incomplete evidence remains untouched; submission reconciliation
+   is intentionally separate from contract execution verification.
+   Idempotent leaf finalizers restore document/disclosure projections (including
+   fail-closed `active=false` on revoke) and return the normal typed result
+   shape before the job becomes succeeded. Fully successful child sets requeue
+   their workflow parent so it can rebuild its typed result without another
+   chain submission.
+9. Job workflow completion and chain execution are now separate signals.
+   `status=succeeded` means the server-side submission workflow completed;
+   `chainStatus=pending|success|failure` and `chainFinalizedAt` are populated
+   later from verified System.Events outcomes. Predicate parents aggregate the
+   chain outcomes of their deterministic children. Reconciliation, direct
+   outcome refresh and parent aggregation use bounded keyset scans with
+   wraparound, so unresolved rows cannot pin a fixed 100-row window and starve
+   later jobs.
+
+Upgrade gotcha (consumers): `BackgroundJobs` gains the unique constraint plus
+new columns (`payloadFingerprint`, `commandVersion`, `command`,
+`commandEncoding`, `requestedBy`, `parentJobId`, `workflowStep`, `queuedAt`,
+`externalExecutionAt`, `submittedAt`, `attempt`, `maxAttempts`, `leaseOwner`,
+`leaseExpiresAt`, `heartbeatAt`, `submissionId`, `txHash`, `chainStatus`,
+`chainFinalizedAt`; `TransactionResults` gains `outcomeSource`). A `cds deploy` /
+`scripts/apply-schema-delta.mjs` adds them; `npm run check:job-idempotency`
+preflights an existing database for rows that would violate the new constraint.
+
+**Crawler / node provider**
+
+1. Transaction outcomes are no longer fabricated as `SUCCESS`. The fetch batch
+   reads historical `System.Events`, decodes them with runtime metadata cached
+   by `specVersion`, and maps `system.ExtrinsicSuccess` / `ExtrinsicFailed` by
+   `applyExtrinsic` index. Unknown or undecodable outcomes produce no result
+   row. New rows carry `outcomeSource=substrate-system-events`; legacy rows with
+   no source are never trusted by document/predicate verification.
+2. Reconnect handling is registered BEFORE the initial catch-up, so a socket
+   drop during the (possibly hours-long) first sync resumes ingestion instead
+   of silently bricking the crawler. A connection-loss error is treated as
+   transient (awaits reconnect) rather than fatal.
+2. When node reconnection is permanently abandoned (max attempts), the crawler
+   flips `SyncState` to `error` instead of going idle while still reporting
+   healthy.
+3. The first finalized head Substrate replays on (re)subscribe is buffered and
+   no longer dropped by a registration race.
+4. A pruned/racing node returning a null block body is now a retried transient
+   error instead of a `TypeError` that aborted catch-up. `chainHeight` only
+   advances, so a replayed old head no longer skews lag/health metrics.
+5. Extrinsic classification uses the REAL Midnight pallet-index map (read from
+   the runtime metadata, specVersion 1000000) instead of the generic Substrate
+   defaults, which were wrong for Midnight (e.g. index 5 is `Midnight`, not
+   `Sudo`; there is no `Balances`/`Contracts` pallet). System/inherent/governance
+   txs now classify correctly instead of falling to `unknown`. The map is
+   hardcoded (re-verify on Midnight runtime upgrades; `cds.requires.nightgate.
+   palletMap` remains an override). Note: Midnight wraps all user operations in
+   one call (`Midnight.send_mn_transaction`), so deploy/call/shielded cannot be
+   distinguished at the pallet level.
+
+**Schema / config / packaging**
+
+1. Unique index on `Blocks.hash` (via `@assert.unique`) for the crawler's
+   hottest parent-linkage lookup. Upgrade gotcha: on an existing DB the
+   constraint is added by `cds deploy` / `scripts/apply-schema-delta.mjs`, not
+   automatically. (`Transactions.hash` is intentionally NOT unique: on-chain,
+   inherent/system extrinsics in early blocks share identical hashes.)
+2. `corsOrigin` arrays now work (reflect the request Origin plus `Vary: Origin`)
+   instead of emitting a comma-joined header every browser rejects.
+3. `network` config enum includes `preview`; `@sap/cds` peer range tightened to
+   `>=10 <11`.
+4. Removed dead code (the unused single-block `fetchBlockWithRetry` /
+   `fetchBlockData` path) and its tests. Also removed the SQLite tuning pragmas
+   (`srv/utils/sqlite-tuning.ts`): they were non-functional (`db.pragma` is not
+   available on the pooled connection), WAL is already set by `@cap-js/sqlite`,
+   and production SQLite is now rejected outright, so no dev-only pragma tuning
+   is applied at startup.
+5. `@midnight-ntwrk/compact-js` pinned to `2.5.0` (was `2.5.1`) to match the
+   exact version `midnight-js-contracts` / `midnight-js-types` require. The skew
+   left two compact-js copies with distinct `TypeId` symbols, so a worker-built
+   `CompiledContract` was unrecognised by the SDK's deploy path and contract
+   deploys failed with `Cannot read properties of undefined (reading 'ctor')`.
+   Now deduped to a single 2.5.0.
+
+**Runtime safety / topology**
+
+1. Fail-closed single-instance guard. Startup now rejects unsupported runtime
+   topologies before any schema, worker or crawler work, because the crawler,
+   wallet-facade cache, job semaphore and cleanup scheduler are process-local:
+   more than one declared replica, CAP multitenancy, or (on Cloud Foundry)
+   `CF_INSTANCE_INDEX > 0`. Rejection takes Nightgate offline and surfaces via
+   `getHealth`/`getReadiness`/`getLiveness` + Prometheus; the CAP host process is
+   never terminated. Replica detection is declarative (`NIGHTGATE_REPLICA_COUNT`,
+   `CF_INSTANCE_COUNT`, `KUBERNETES_REPLICA_COUNT`, CDS `replicaCount`);
+   `WEB_CONCURRENCY` is ignored (it counts in-instance HTTP workers, not
+   replicas). This is a safety backstop, not a distributed lock or leader
+   election, so deployment descriptors must still start a single instance.
+2. Production SQLite is rejected by the same preflight (configure PostgreSQL or
+   SAP HANA). `NIGHTGATE_ALLOW_PRODUCTION_SQLITE=true` is a temporary,
+   migration-window-only escape hatch that downgrades the rejection to a
+   high-severity warning.
+
+**Logging**
+
+Operational logging moved from raw `console.*` to CAP's leveled logger, one
+named channel per subsystem (`nightgate:crawler`, `nightgate:node`,
+`nightgate:submit`, `nightgate:facade`, `nightgate:sessions`,
+`nightgate:indexer`, `nightgate:sync`, `nightgate:crypto`,
+`nightgate:worker-client`, and `nightgate:worker` for the worker thread's
+relayed lines). Chatty per-tick/per-block diagnostics are now `debug` (silent
+by default, enable per subsystem via CAP log config), so consumers control
+verbosity instead of getting raw stdout. The only remaining direct
+`console.error` is the deliberate "schema not deployed" operator banner in the
+plugin bootstrap, which must print unprefixed before the process exits.
+
 ## 0.8.3 - 2026-07-19
 
 ### Fix: background-job status writes retried under write contention

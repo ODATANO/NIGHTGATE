@@ -60,7 +60,7 @@ NIGHTGATE_NETWORK=preprod
  # Substrate RPC node                                                              
 NIGHTGATE_NODE_URL=wss://rpc.preprod.midnight.network/
 #  GraphQL indexer (HTTP only; WS derived from it)                                 
-NIGHTGATE_INDEXER_HTTP_URL = "https://indexer.preview.midnight.network/api/v4/graphql"
+NIGHTGATE_INDEXER_HTTP_URL=https://indexer.preprod.midnight.network/api/v4/graphql
 # local proof server & wallets for submission (compose: midnightntwrk/proof-server on :6300)
 NIGHTGATE_PROOF_SERVER_URL=http://localhost:6300                                     
 NIGHTGATE_CRAWLER_ENABLED=false                   
@@ -129,7 +129,7 @@ npm run sync:probe         # check local Midnight indexer container status
 
 npm run typecheck          # tsc --noEmit
 npm run lint               # ESLint
-npm test                   # Vitest with coverage, 63 suites, 1104 tests
+npm test                   # Vitest with coverage, 64 suites, 1163 tests
 npm run build              # Compile CDS types + TypeScript to JS
 
 # Integration scripts (real SDK, no chain access required)

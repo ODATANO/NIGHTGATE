@@ -14,12 +14,12 @@ Running NIGHTGATE day-to-day. Audience: anyone deploying it, debugging a stuck s
 | `npm run deploy:e2e` | End-to-end deploy flow | `sync:start` + `registerForDustGeneration` + 90 s wait + `deployContract(counter)` |
 | `npm run build` | Before publish or after schema change | Generates `@cds-models/` types + compiles TS in-place |
 | `npm run typecheck` | Pre-commit | `tsc --noEmit` |
-| `npm test` | Pre-commit | Jest with coverage (48 suites, 672 tests) |
+| `npm test` | Pre-commit | Vitest with coverage (64 suites, 1163 tests) |
 | Integration scripts | Verifying SDK wiring | `smoke:sdk`, `integration:providers`, `integration:wallet-keys`, `integration:wallet-facade`, `integration:contract-registry` |
 
 ### Why `serve:sync` and not `dev` for long runs
 
-`cds watch` triggers a restart whenever a file in the watched paths changes. Once the wallet SDK is syncing, the SQLite DB grows past 100 MB and gets touched frequently. Watch ends up restarting the server every few minutes, killing the sync mid-flight. Use `serve:sync` (no watch, 12 GB heap pre-applied) for any session you want to leave running for hours.
+`cds watch` restarts on any change in the watched paths. Once the wallet SDK is syncing, the SQLite DB grows past 100 MB and gets touched frequently, so watch restarts the server every few minutes and kills the sync mid-flight. Use `serve:sync` (no watch, 12 GB heap pre-applied) for sessions you want to leave running for hours.
 
 ## Environment configuration
 
@@ -261,7 +261,8 @@ Next `connectWalletForSigning` will start a fresh ~5-6 h cold sync.
 ## Production checklist (before deploying)
 
 - [ ] `ENCRYPTION_KEY` set to a real 32-byte hex secret (not the dev fallback)
-- [ ] CDS database is HANA, not SQLite
+- [ ] CDS database is PostgreSQL or HANA, not SQLite. Production SQLite is now **rejected at startup** (fail closed); `NIGHTGATE_ALLOW_PRODUCTION_SQLITE=true` is a temporary migration-only escape hatch
+- [ ] Exactly one replica declared (`NIGHTGATE_REPLICA_COUNT=1`); more than one replica, CAP multitenancy, or (on Cloud Foundry) `CF_INSTANCE_INDEX > 0` fails startup closed
 - [ ] `NIGHTGATE_CRAWLER_ENABLED` is true (or unset — the crawler defaults to on)
 - [ ] CAP auth is configured (the default `dummy` strategy passes everyone)
 - [ ] Rate limiters reviewed for production load (they're tuned for dev/demo)

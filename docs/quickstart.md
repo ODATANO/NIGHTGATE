@@ -22,7 +22,7 @@ npm run dev
 
 `npm run dev` uses `cds watch` with a 12 GB Node heap (configured in `scripts/dev.mjs`). The plugin defaults to Preprod with the public RPC at `wss://rpc.preprod.midnight.network/`. No `.env` or extra config required.
 
-The crawler will catch up from genesis (~100k blocks at first run, faster on subsequent restarts thanks to incremental sync). Watch the log for `[Crawler] Live subscription active`.
+The crawler catches up from genesis (~100k blocks at first run; subsequent restarts are faster thanks to incremental sync). Watch the log for `[Crawler] Live subscription active`.
 
 Verify:
 ```bash
