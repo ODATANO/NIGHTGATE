@@ -10,10 +10,17 @@ const selectColumnsWhereSpy = vi.hoisted(() => (vi.fn()));
 
 vi.mock('@sap/cds', () => {
     const cds: any = {
+        log: (() => {
+            const _c: Record<string, any> = {};
+            return (name: string) => (_c[name] ??= {
+                info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn(), trace: vi.fn()
+            });
+        })(),
         env: {
             requires: {
                 nightgate: {
                     palletMap: {
+                        10: { name: 'Contracts', txType: 'contract_call' },
                         15: { name: 'Zswap', txType: 'shielded_transfer', isShielded: true }
                     }
                 }
@@ -53,6 +60,7 @@ vi.mock('@sap/cds', () => {
     return cds;
 });
 
+import cds from '@sap/cds';
 import { blake2b } from '@noble/hashes/blake2b';
 import { bytesToHex } from '@noble/hashes/utils';
 import { BlockProcessor } from '../../srv/crawler/BlockProcessor';
@@ -146,6 +154,35 @@ describe('classifyExtrinsic and mapPalletCall', () => {
 // 1B: On-chain Timestamp Parsing
 // ============================================================================
 
+describe('System.Events outcome decoding', () => {
+    test('maps canonical success/failure events by applyExtrinsic index and leaves missing outcomes unknown', () => {
+        const processor = new BlockProcessor({} as any);
+        const record = (index: number, method: string, section = 'system') => ({
+            phase: { isApplyExtrinsic: true, asApplyExtrinsic: { toNumber: () => index } },
+            event: { section, method }
+        });
+        const registry = {
+            createType: vi.fn(() => [
+                record(0, 'ExtrinsicSuccess'),
+                record(1, 'SomethingElse', 'midnight'),
+                record(2, 'ExtrinsicSuccess'),
+                record(2, 'ExtrinsicFailed')
+            ])
+        };
+
+        const outcomes = (processor as any).decodeExtrinsicOutcomes('0xevents', registry);
+        expect([...outcomes.entries()]).toEqual([[0, 'SUCCESS'], [2, 'FAILURE']]);
+        expect(outcomes.has(1)).toBe(false);
+    });
+
+    test('returns no outcomes when storage or metadata decoding is unavailable', () => {
+        const processor = new BlockProcessor({} as any);
+        expect((processor as any).decodeExtrinsicOutcomes(null, {})).toEqual(new Map());
+        const broken = { createType: () => { throw new Error('bad metadata'); } };
+        expect((processor as any).decodeExtrinsicOutcomes('0xbad', broken)).toEqual(new Map());
+    });
+});
+
 describe('getBlockTimestamp: SCALE u64 LE parsing', () => {
     const provider = {
         getStorage: vi.fn()
@@ -182,7 +219,7 @@ describe('getBlockTimestamp: SCALE u64 LE parsing', () => {
 
     it('falls back to wall clock time when storage lookup fails', async () => {
         const nowSpy = vi.spyOn(Date, 'now').mockReturnValue(1_700_000_000_000);
-        const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+        const warnSpy = vi.spyOn(cds.log('nightgate:crawler'), 'warn').mockImplementation(() => {});
         provider.getStorage.mockRejectedValueOnce(new Error('storage unavailable'));
 
         try {
@@ -235,7 +272,7 @@ describe('getProtocolVersion: RuntimeVersion per-block query with error fallback
             getRuntimeVersion: vi.fn()
         } as any;
         const processor = new BlockProcessor(provider);
-        const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+        const warnSpy = vi.spyOn(cds.log('nightgate:crawler'), 'warn').mockImplementation(() => {});
         provider.getRuntimeVersion
             .mockResolvedValueOnce({ specVersion: 42 })
             .mockRejectedValueOnce(new Error('runtime unavailable'));
@@ -254,7 +291,7 @@ describe('getProtocolVersion: RuntimeVersion per-block query with error fallback
             getRuntimeVersion: vi.fn()
         } as any;
         const processor = new BlockProcessor(provider);
-        const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+        const warnSpy = vi.spyOn(cds.log('nightgate:crawler'), 'warn').mockImplementation(() => {});
         provider.getRuntimeVersion.mockRejectedValueOnce(new Error('runtime unavailable'));
 
         try {

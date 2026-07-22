@@ -9,6 +9,8 @@
  */
 
 import WebSocket from 'ws';
+import cds from '@sap/cds';
+const log = cds.log('nightgate:node');
 
 // ============================================================================
 // Type Definitions
@@ -88,7 +90,9 @@ export class MidnightNodeProvider {
     private reconnectAttempts: number = 0;
     private config: Required<NodeProviderConfig>;
     private onReconnectCallback: (() => Promise<void>) | null = null;
+    private onReconnectFailedCallback: (() => void) | null = null;
     private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+    private orphanNotifications: Map<string, any[]> = new Map();
 
     constructor(config: NodeProviderConfig) {
         this.config = {
@@ -112,7 +116,7 @@ export class MidnightNodeProvider {
                     this.connected = true;
                     this.reconnecting = false;
                     this.reconnectAttempts = 0;
-                    console.log(`[MidnightNode] Connected to ${this.config.nodeUrl}`);
+                    log.info(`Connected to ${this.config.nodeUrl}`);
                     resolve();
                 });
 
@@ -121,7 +125,7 @@ export class MidnightNodeProvider {
                 });
 
                 this.ws.on('error', (error: Error) => {
-                    console.error('[MidnightNode] WebSocket error:', error.message);
+                    log.error('WebSocket error:', error.message);
                     if (!this.connected) {
                         reject(error);
                     }
@@ -132,6 +136,7 @@ export class MidnightNodeProvider {
                     this.connected = false;
                     this.rejectAllPending('Connection closed');
                     this.subscriptions.clear();
+                    this.orphanNotifications.clear();
 
                     if (!wasConnected) {
                         // Socket closed before 'open', reject the connect() promise
@@ -140,7 +145,7 @@ export class MidnightNodeProvider {
                     }
 
                     if (!this.reconnecting) {
-                        console.warn('[MidnightNode] Connection lost, attempting reconnect...');
+                        log.warn('Connection lost, attempting reconnect...');
                         this.attemptReconnect();
                     }
                 });
@@ -167,7 +172,8 @@ export class MidnightNodeProvider {
         }
         this.connected = false;
         this.subscriptions.clear();
-        console.log('[MidnightNode] Disconnected');
+        this.orphanNotifications.clear();
+        log.info('Disconnected');
     }
 
     isConnected(): boolean {
@@ -176,16 +182,25 @@ export class MidnightNodeProvider {
 
     /**
      * Register a callback to invoke after successful reconnect.
-     * Used by the Crawler to re-establish subscriptions.
      */
     setOnReconnect(callback: () => Promise<void>): void {
         this.onReconnectCallback = callback;
     }
 
+    /**
+     * Register a callback invoked when reconnection is permanently abandoned
+     */
+    setOnReconnectFailed(callback: () => void): void {
+        this.onReconnectFailedCallback = callback;
+    }
+
     private attemptReconnect(): void {
         if (this.reconnecting) return;
         if (this.reconnectAttempts >= this.config.maxReconnectAttempts) {
-            console.error(`[MidnightNode] Max reconnect attempts (${this.config.maxReconnectAttempts}) reached`);
+            log.error(`Max reconnect attempts (${this.config.maxReconnectAttempts}) reached`);
+            if (this.onReconnectFailedCallback) {
+                try { this.onReconnectFailedCallback(); } catch { /* best-effort signal */ }
+            }
             return;
         }
 
@@ -193,23 +208,23 @@ export class MidnightNodeProvider {
         this.reconnectAttempts++;
 
         const delay = this.config.reconnectInterval * Math.min(this.reconnectAttempts, 5);
-        console.log(`[MidnightNode] Reconnecting in ${delay}ms (attempt ${this.reconnectAttempts})`);
+        log.info(`Reconnecting in ${delay}ms (attempt ${this.reconnectAttempts})`);
 
         this.reconnectTimer = setTimeout(async () => {
             this.reconnectTimer = null;
             try {
                 await this.connect();
-                console.log('[MidnightNode] Reconnected successfully');
+                log.info('Reconnected successfully');
                 // Notify crawler to re-establish subscriptions
                 if (this.onReconnectCallback) {
                     try {
                         await this.onReconnectCallback();
                     } catch (cbErr) {
-                        console.error('[MidnightNode] Reconnect callback failed:', (cbErr as Error).message);
+                        log.error('Reconnect callback failed:', (cbErr as Error).message);
                     }
                 }
             } catch (err) {
-                console.error('[MidnightNode] Reconnect failed:', (err as Error).message);
+                log.error('Reconnect failed:', (err as Error).message);
                 this.reconnecting = false;
                 this.attemptReconnect();
             }
@@ -293,7 +308,7 @@ export class MidnightNodeProvider {
         try {
             parsed = JSON.parse(raw);
         } catch {
-            console.warn('[MidnightNode] Invalid JSON message received');
+            log.warn('Invalid JSON message received');
             return;
         }
 
@@ -313,18 +328,15 @@ export class MidnightNodeProvider {
         if (message.method && message.params?.subscription) {
             const callback = this.subscriptions.get(message.params.subscription);
             if (callback) {
-                try {
-                    const callbackResult = callback(message.params.result);
-                    if (callbackResult && typeof callbackResult.then === 'function') {
-                        void callbackResult.catch((err: unknown) => {
-                            const errMsg = err instanceof Error ? err.message : String(err);
-                            console.error('[MidnightNode] Subscription callback failed:', errMsg);
-                        });
-                    }
-                } catch (err) {
-                    const errMsg = err instanceof Error ? err.message : String(err);
-                    console.error('[MidnightNode] Subscription callback failed:', errMsg);
-                }
+                this.invokeSubscriptionCallback(callback, message.params.result);
+            } else {
+                // The notification arrived before subscribe*() registered its
+                // callback (Substrate replays the current head immediately on
+                // subscribe). Buffer it; registerSubscription drains it right
+                // after the callback is set, so the first head is not dropped.
+                const buf = this.orphanNotifications.get(message.params.subscription) ?? [];
+                buf.push(message.params.result);
+                this.orphanNotifications.set(message.params.subscription, buf);
             }
             return;
         }
@@ -348,7 +360,7 @@ export class MidnightNodeProvider {
     }
 
     private rejectAllPending(reason: string): void {
-        for (const [id, pending] of this.pendingRequests) {
+        for (const [, pending] of this.pendingRequests) {
             clearTimeout(pending.timeout);
             pending.reject(new Error(reason));
         }
@@ -455,12 +467,41 @@ export class MidnightNodeProvider {
     // Subscriptions
     // ========================================================================
 
+    private invokeSubscriptionCallback(callback: SubscriptionCallback, result: any): void {
+        try {
+            const r = callback(result);
+            if (r && typeof (r as any).then === 'function') {
+                void (r as Promise<any>).catch((err: unknown) => {
+                    const errMsg = err instanceof Error ? err.message : String(err);
+                    log.error('Subscription callback failed:', errMsg);
+                });
+            }
+        } catch (err) {
+            const errMsg = err instanceof Error ? err.message : String(err);
+            log.error('Subscription callback failed:', errMsg);
+        }
+    }
+
+    /**
+     * Register a subscription callback and immediately drain any notifications
+     * that arrived before the id was known (see orphanNotifications), so the
+     * head Substrate replays on subscribe is never lost to a timing race.
+     */
+    private registerSubscription(subscriptionId: string, callback: SubscriptionCallback): void {
+        this.subscriptions.set(subscriptionId, callback);
+        const buffered = this.orphanNotifications.get(subscriptionId);
+        if (buffered) {
+            this.orphanNotifications.delete(subscriptionId);
+            for (const result of buffered) this.invokeSubscriptionCallback(callback, result);
+        }
+    }
+
     /**
      * Subscribe to new block headers (finalized)
      */
     async subscribeNewHeads(callback: (header: BlockHeader) => void): Promise<string> {
         const subscriptionId = await this.rpc('chain_subscribeNewHeads', []);
-        this.subscriptions.set(subscriptionId, callback);
+        this.registerSubscription(subscriptionId, callback);
         return subscriptionId;
     }
 
@@ -469,7 +510,7 @@ export class MidnightNodeProvider {
      */
     async subscribeFinalizedHeads(callback: (header: BlockHeader) => void): Promise<string> {
         const subscriptionId = await this.rpc('chain_subscribeFinalizedHeads', []);
-        this.subscriptions.set(subscriptionId, callback);
+        this.registerSubscription(subscriptionId, callback);
         return subscriptionId;
     }
 

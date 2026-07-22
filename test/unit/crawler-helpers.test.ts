@@ -32,12 +32,19 @@ vi.mock('@sap/cds', () => {
                 })
             },
             DELETE: {}
-        }
+        },
+        log: (() => {
+            const channels: Record<string, any> = {};
+            return (name: string) => (channels[name] ??= {
+                info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn(), trace: vi.fn()
+            });
+        })()
     };
     cds.default = cds;
     return cds;
 });
 
+import cds from '@sap/cds';
 import { MidnightCrawler } from '../../srv/crawler/Crawler';
 
 const NIGHTGATE_ENV_KEYS = [
@@ -111,7 +118,7 @@ describe('MidnightCrawler helper paths', () => {
         const processor = {
             processBlockByHeight: vi.fn().mockRejectedValue(new Error('Invalid block data at height 7'))
         };
-        const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+        const errorSpy = vi.spyOn(cds.log('nightgate:crawler'), 'error').mockImplementation(() => {});
 
         try {
             (crawler as any).processor = processor;
@@ -134,7 +141,7 @@ describe('MidnightCrawler helper paths', () => {
         const processor = {
             processBlockByHeight: vi.fn().mockRejectedValue(new Error('Request timeout'))
         };
-        const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+        const warnSpy = vi.spyOn(cds.log('nightgate:crawler'), 'warn').mockImplementation(() => {});
 
         try {
             (crawler as any).processor = processor;
@@ -267,7 +274,7 @@ describe('fetch retry wrappers (parallel catch-up pipeline)', () => {
                 .mockRejectedValueOnce(new Error('Request timeout'))
                 .mockResolvedValueOnce(batch)
         };
-        const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+        const warnSpy = vi.spyOn(cds.log('nightgate:crawler'), 'warn').mockImplementation(() => {});
         try {
             const crawler = makeCrawler(processor);
             await expect(crawler.fetchBlockBatchWithRetry([10])).resolves.toBe(batch);
@@ -283,7 +290,7 @@ describe('fetch retry wrappers (parallel catch-up pipeline)', () => {
         const processor = {
             fetchBlockBatch: vi.fn().mockRejectedValue(new Error('No block at height 11'))
         };
-        const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+        const errorSpy = vi.spyOn(cds.log('nightgate:crawler'), 'error').mockImplementation(() => {});
         try {
             const crawler = makeCrawler(processor);
             await expect(crawler.fetchBlockBatchWithRetry([10, 11])).rejects.toThrow('No block at height 11');
@@ -299,7 +306,7 @@ describe('fetch retry wrappers (parallel catch-up pipeline)', () => {
         const processor = {
             fetchBlockBatch: vi.fn().mockRejectedValue(new Error('ECONNRESET: connection reset by peer'))
         };
-        const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+        const warnSpy = vi.spyOn(cds.log('nightgate:crawler'), 'warn').mockImplementation(() => {});
         try {
             const crawler = makeCrawler(processor);
             await expect(crawler.fetchBlockBatchWithRetry([10])).rejects.toThrow('connection reset');
@@ -310,20 +317,4 @@ describe('fetch retry wrappers (parallel catch-up pipeline)', () => {
         }
     });
 
-    it('fetchBlockWithRetry mirrors the same policy for single blocks', async () => {
-        const prepared = { blockHash: '0xb', height: 12, alreadyIndexed: false };
-        const processor = {
-            fetchBlockData: vi.fn()
-                .mockRejectedValueOnce(new Error('Request timeout'))
-                .mockResolvedValueOnce(prepared)
-        };
-        const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
-        try {
-            const crawler = makeCrawler(processor);
-            await expect(crawler.fetchBlockWithRetry(12)).resolves.toBe(prepared);
-            expect(processor.fetchBlockData).toHaveBeenCalledTimes(2);
-        } finally {
-            warnSpy.mockRestore();
-        }
-    });
 });

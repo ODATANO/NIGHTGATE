@@ -126,6 +126,8 @@ beforeAll(async () => {
     env.requires.nightgate = env.requires.nightgate || {};
     env.requires.nightgate.palletMap = {
         ...(env.requires.nightgate.palletMap || {}),
+        4: { name: 'Balances', txType: 'night_transfer' },
+        10: { name: 'Contracts', txType: 'contract_call' },
         15: { name: 'Zswap', txType: 'shielded_transfer', isShielded: true }
     };
 });
@@ -240,6 +242,10 @@ describe('BlockProcessor persistence paths', () => {
         };
 
         const processor = makeProcessor(provider);
+        vi.spyOn(processor as any, 'getEventRegistry').mockResolvedValue({});
+        vi.spyOn(processor as any, 'decodeExtrinsicOutcomes').mockReturnValue(
+            new Map(extrinsics.map((_, index) => [index, 'SUCCESS']))
+        );
 
         const result = await processor.processBlockByHash('0xnew');
 
@@ -291,6 +297,7 @@ describe('BlockProcessor persistence paths', () => {
         const resultRows = await db.run(cds.ql.SELECT.from(TX_RESULTS));
         expect(resultRows).toHaveLength(5);
         expect(resultRows.every((r: any) => r.status === 'SUCCESS')).toBe(true);
+        expect(resultRows.every((r: any) => r.outcomeSource === 'substrate-system-events')).toBe(true);
         expect(resultRows.every((r: any) => txIds.has(r.transaction_ID))).toBe(true);
 
         // --- Transaction fees: one zero-fee row per tx ---
@@ -342,7 +349,7 @@ describe('BlockProcessor persistence paths', () => {
 
         const processor = makeProcessor(provider);
 
-        const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+        const warnSpy = vi.spyOn(cds.log('nightgate:crawler'), 'warn').mockImplementation(() => {});
         // getBlockTimestamp falls back to Math.floor(Date.now()/1000) when storage
         // is null; pin Date.now so the persisted timestamp is deterministic.
         const nowSpy = vi.spyOn(Date, 'now').mockReturnValue(1_700_000_000_000);

@@ -4,6 +4,8 @@
 
 import { MidnightNodeProvider } from '../providers/MidnightNodeProvider';
 import { MidnightCrawler, CrawlerConfig } from './Crawler';
+import cds from '@sap/cds';
+const log = cds.log('nightgate:crawler');
 
 export { BlockProcessor } from './BlockProcessor';
 export type { ProcessResult } from './BlockProcessor';
@@ -18,7 +20,7 @@ let activeNodeProvider: MidnightNodeProvider | null = null;
  */
 export async function startCrawler(config: CrawlerConfig & { nodeUrl: string; requestTimeout?: number }): Promise<void> {
     if (activeCrawler) {
-        console.warn('[Crawler] Already running');
+        log.warn('Already running');
         return;
     }
 
@@ -42,7 +44,7 @@ export async function startCrawler(config: CrawlerConfig & { nodeUrl: string; re
 
     activeCrawler = crawler;
     activeNodeProvider = nodeProvider;
-    console.log('[Crawler] Started');
+    log.info('Started');
 }
 
 /**
@@ -59,7 +61,7 @@ export async function stopCrawler(): Promise<void> {
         } catch { /* ignore disconnect errors */ }
         activeNodeProvider = null;
     }
-    console.log('[Crawler] Stopped');
+    log.info('Stopped');
 }
 
 /**

@@ -1,15 +1,13 @@
 /**
- * Shared rollback for indexed chain data.
+ * Shared rollback for indexed chain data. Used by both rollback paths (reorg
+ * recovery in `Crawler.handleReorg` and manual `reindexFromHeight` in
+ * `NightgateIndexerService`) so the delete cascade and projection repair can't
+ * drift apart.
  *
- * Used by both rollback paths (reorg recovery in `Crawler.handleReorg` and
- * the manual `reindexFromHeight` in `NightgateIndexerService`) so the delete
- * cascade and the projection repair cannot drift apart.
- *
- * Beyond the raw delete cascade this also repairs `NightBalances`: the ingest
- * maintains that projection with DELTAS (`upsertNightBalance`), so simply
- * deleting blocks/transactions and re-indexing them would apply every delta a
- * second time. After the cascade, every affected address is recomputed from
- * the REMAINING rows, which makes rollback + re-index idempotent.
+ * Also repairs `NightBalances`: ingest maintains it with DELTAS
+ * (`upsertNightBalance`), so delete + re-index would double-apply every delta.
+ * After the cascade each affected address is recomputed from the REMAINING
+ * rows, making rollback + re-index idempotent.
  */
 
 import cds from '@sap/cds';
@@ -37,10 +35,7 @@ export interface RollbackOptions {
 }
 
 /**
- * Delete all indexed data at/above `fromHeight` and repair derived
- * projections. Must run inside an open transaction (`tx`); the caller owns
- * commit/rollback. When nothing is at/above `fromHeight`, SyncState is left
- * untouched (mirrors the previous behavior of both call sites).
+ * Delete all indexed data at/above `fromHeight` and repair derived projections.
  */
 export async function rollbackIndexedDataFromHeight(
     tx: any,
@@ -68,9 +63,7 @@ export async function rollbackIndexedDataFromHeight(
     ) || [];
     const txIds = txsToDelete.map((t: any) => t.ID).filter(Boolean);
 
-    // Collect affected addresses BEFORE deleting anything: senders/receivers
-    // of the deleted transactions plus owners of UTXOs those transactions
-    // created or spent.
+    // Collect affected addresses BEFORE deleting anything
     const affected = new Set<string>();
     for (const t of txsToDelete) {
         if (t.senderAddress) affected.add(t.senderAddress);
@@ -173,9 +166,6 @@ async function selectForkBlock(
  *  - the sender is counted only when set, different from the receiver, and
  *    the amount is positive,
  *  - balance is the sum of the owner's unspent UTXO values.
- * A row with no remaining activity is deleted, unless it carries DUST
- * linkage (dustAddress / isDustRegistered), which is not derivable from
- * chain rows and must survive.
  */
 async function recomputeNightBalance(tx: any, address: string): Promise<void> {
     const utxos: any[] = await tx.run(
@@ -255,8 +245,6 @@ async function recomputeNightBalance(tx: any, address: string): Promise<void> {
 
     const nowIso = new Date().toISOString();
     const computed = {
-        // Decimal(20,0) columns carrying u128 amounts as strings, same
-        // convention as the ingest (see BlockProcessor.upsertNightBalance).
         balance: balance.toString() as any,
         utxoCount,
         txSentCount: sentTxs.length,

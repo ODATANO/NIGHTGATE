@@ -20,7 +20,6 @@
 // --- External collaborators: keep mocked. vi.mock is hoisted. ---
 const mockProcessorInit = vi.fn();
 const mockProcessorProcessBlockByHeight = vi.fn();
-const mockProcessorFetchBlockData = vi.fn();
 const mockProcessorFetchBlockBatch = vi.fn();
 const mockProcessorPersistPreparedBlock = vi.fn();
 // Regular `function` impl: BlockProcessor is constructed with `new`, and only
@@ -29,7 +28,6 @@ const mockBlockProcessorConstructor = vi.hoisted(() => (vi.fn().mockImplementati
     return {
         init: mockProcessorInit,
         processBlockByHeight: mockProcessorProcessBlockByHeight,
-        fetchBlockData: mockProcessorFetchBlockData,
         fetchBlockBatch: mockProcessorFetchBlockBatch,
         persistPreparedBlock: mockProcessorPersistPreparedBlock
     };
@@ -112,7 +110,6 @@ beforeAll(async () => {
 beforeEach(async () => {
     mockProcessorInit.mockReset().mockResolvedValue(undefined);
     mockProcessorProcessBlockByHeight.mockReset();
-    mockProcessorFetchBlockData.mockReset();
     mockProcessorFetchBlockBatch.mockReset();
     mockProcessorPersistPreparedBlock.mockReset();
     mockBlockProcessorConstructor.mockClear();
@@ -184,7 +181,7 @@ describe('MidnightCrawler orchestration', () => {
                 connect: vi.fn()
             };
             const crawler = new MidnightCrawler(provider as any, { enabled: true });
-            const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+            const warnSpy = vi.spyOn(cds.log('nightgate:crawler'), 'warn').mockImplementation(() => {});
 
             try {
                 (crawler as any).isRunning = true;
@@ -192,7 +189,7 @@ describe('MidnightCrawler orchestration', () => {
 
                 expect(provider.connect).not.toHaveBeenCalled();
                 expect(mockBlockProcessorConstructor).not.toHaveBeenCalled();
-                expect(warnSpy).toHaveBeenCalledWith('[Crawler] Already running');
+                expect(warnSpy).toHaveBeenCalledWith('Already running');
             } finally {
                 warnSpy.mockRestore();
             }
@@ -367,12 +364,12 @@ describe('MidnightCrawler orchestration', () => {
                 .mockResolvedValueOnce({ consecutiveErrors: 11 });
             vi.spyOn(crawler as any, 'fetchBlockBatchWithRetry').mockRejectedValue(new Error('Request timeout'));
             const recordErrorSpy = vi.spyOn(crawler as any, 'recordError').mockResolvedValue(undefined);
-            const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+            const errorSpy = vi.spyOn(cds.log('nightgate:crawler'), 'error').mockImplementation(() => {});
 
             try {
                 await expect((crawler as any).catchUp()).resolves.toBe(0);
                 expect(recordErrorSpy).toHaveBeenCalledWith('Request timeout');
-                expect(errorSpy).toHaveBeenCalledWith('[Crawler] Too many consecutive errors, stopping catch-up');
+                expect(errorSpy).toHaveBeenCalledWith('Too many consecutive errors, stopping catch-up');
             } finally {
                 errorSpy.mockRestore();
             }
@@ -398,12 +395,12 @@ describe('MidnightCrawler orchestration', () => {
                 .mockResolvedValueOnce({ consecutiveErrors: 2 });
             vi.spyOn(crawler as any, 'fetchBlockBatchWithRetry').mockRejectedValue(new Error('Request timeout'));
             const recordErrorSpy = vi.spyOn(crawler as any, 'recordError').mockResolvedValue(undefined);
-            const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+            const errorSpy = vi.spyOn(cds.log('nightgate:crawler'), 'error').mockImplementation(() => {});
 
             try {
                 await expect((crawler as any).catchUp()).resolves.toBe(0);
                 expect(recordErrorSpy).toHaveBeenCalledWith('Request timeout');
-                expect(errorSpy).not.toHaveBeenCalledWith('[Crawler] Too many consecutive errors, stopping catch-up');
+                expect(errorSpy).not.toHaveBeenCalledWith('Too many consecutive errors, stopping catch-up');
             } finally {
                 errorSpy.mockRestore();
             }
@@ -457,8 +454,8 @@ describe('MidnightCrawler orchestration', () => {
                 contractActionCount: 0,
                 processingTimeMs: 1
             }));
-            const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
-            const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+            const errorSpy = vi.spyOn(cds.log('nightgate:crawler'), 'error').mockImplementation(() => {});
+            const warnSpy = vi.spyOn(cds.log('nightgate:crawler'), 'warn').mockImplementation(() => {});
 
             try {
                 await expect((crawler as any).catchUp()).resolves.toBe(3);
@@ -500,8 +497,8 @@ describe('MidnightCrawler orchestration', () => {
                 contractActionCount: 0,
                 processingTimeMs: 1
             }));
-            const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
-            const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+            const errorSpy = vi.spyOn(cds.log('nightgate:crawler'), 'error').mockImplementation(() => {});
+            const warnSpy = vi.spyOn(cds.log('nightgate:crawler'), 'warn').mockImplementation(() => {});
 
             try {
                 // Only height 1 makes it; the failed range is NEVER jumped over.
@@ -510,7 +507,7 @@ describe('MidnightCrawler orchestration', () => {
                 const persisted = mockProcessorPersistPreparedBlock.mock.calls.map(c => (c[0] as any).height);
                 expect(persisted).toEqual([1]);
                 expect(errorSpy).toHaveBeenCalledWith(
-                    '[Crawler] Batch 2-2 failed after retry; stopping catch-up to avoid index gaps'
+                    'Batch 2-2 failed after retry; stopping catch-up to avoid index gaps'
                 );
 
                 // The run is marked as errored so operators see the stall.
@@ -527,13 +524,9 @@ describe('MidnightCrawler orchestration', () => {
     // Phase 2: Live Subscription
     // ========================================================================
     describe('subscribeLive', () => {
-        it('subscribes live, re-subscribes after reconnect, and processes live blocks', async () => {
+        it('subscribes live and processes live blocks', async () => {
             let liveCallback: ((header: any) => Promise<void>) | undefined;
-            let reconnectCallback: (() => Promise<void>) | undefined;
             const provider = {
-                setOnReconnect: vi.fn().mockImplementation((callback: () => Promise<void>) => {
-                    reconnectCallback = callback;
-                }),
                 subscribeFinalizedHeads: vi.fn().mockImplementation(async (callback: (header: any) => Promise<void>) => {
                     liveCallback = callback;
                     return 'sub-1';
@@ -558,7 +551,6 @@ describe('MidnightCrawler orchestration', () => {
             await (crawler as any).subscribeLive();
             expect(provider.subscribeFinalizedHeads).toHaveBeenCalledTimes(1);
             expect((crawler as any).subscriptionId).toBe('sub-1');
-            expect(reconnectCallback).toBeDefined();
 
             // subscribeLive set syncStatus='synced' on the real DB.
             expect((await getSyncState()).syncStatus).toBe('synced');
@@ -568,9 +560,68 @@ describe('MidnightCrawler orchestration', () => {
             expect(checkForReorgSpy).toHaveBeenCalled();
             expect(processSpy).toHaveBeenCalledWith(2);
             expect((crawler as any).processing).toBe(false);
+        });
 
+        it('start() registers a reconnect handler that re-drives ingestion', async () => {
+            // Reconnect handling now lives in start() (registered before the
+            // pipeline is driven) so a drop during the initial catch-up recovers.
+            let reconnectCallback: (() => Promise<void>) | undefined;
+            const provider = {
+                isConnected: vi.fn().mockReturnValue(true),
+                setOnReconnect: vi.fn().mockImplementation((cb: () => Promise<void>) => { reconnectCallback = cb; }),
+                setOnReconnectFailed: vi.fn()
+            };
+            const crawler = new MidnightCrawler(provider as any, { enabled: true });
+            // Stub the pipeline driver so start() wires the handlers without
+            // running the real (mocked) crawl.
+            const driveSpy = vi.spyOn(crawler as any, 'driveIngest').mockImplementation(() => {});
+
+            await crawler.start();
+            expect(provider.setOnReconnect).toHaveBeenCalledTimes(1);
+            expect(provider.setOnReconnectFailed).toHaveBeenCalledTimes(1);
+            expect(reconnectCallback).toBeDefined();
+            expect(driveSpy).toHaveBeenCalledTimes(1); // initial drive
+
+            // A reconnect re-drives ingestion (which re-runs catch-up + subscribe).
+            driveSpy.mockClear();
             await reconnectCallback!();
-            expect(provider.subscribeFinalizedHeads).toHaveBeenCalledTimes(2);
+            expect(driveSpy).toHaveBeenCalledTimes(1);
+        });
+
+        it('coalesces a reconnect that fires during an active pipeline into a re-drive (no silent stall)', async () => {
+            let reconnectCallback: (() => Promise<void>) | undefined;
+            const provider = {
+                isConnected: vi.fn().mockReturnValue(true),
+                setOnReconnect: vi.fn().mockImplementation((cb: () => Promise<void>) => { reconnectCallback = cb; }),
+                setOnReconnectFailed: vi.fn()
+            };
+            const crawler = new MidnightCrawler(provider as any, { enabled: true });
+
+            // First pipeline stays in-flight until we reject it; the coalesced
+            // re-drive resolves. Spy the driver, not driveIngest, so the real
+            // ingestActive/pendingRedrive coalescing runs.
+            let rejectPipeline1: (err: Error) => void = () => {};
+            const pipeline1 = new Promise<void>((_, reject) => { rejectPipeline1 = reject; });
+            const pipelineSpy = vi.spyOn(crawler as any, 'runIngestPipeline')
+                .mockReturnValueOnce(pipeline1)
+                .mockResolvedValue(undefined);
+
+            await crawler.start();
+            expect(pipelineSpy).toHaveBeenCalledTimes(1); // initial drive, ingestActive=true
+
+            // Reconnect fires WHILE the first pipeline is still unwinding -> coalesced.
+            await reconnectCallback!();
+            expect(pipelineSpy).toHaveBeenCalledTimes(1);
+
+            // The interrupted pipeline ends with a connection-loss error; isRunning
+            // stays true and the coalesced re-drive must now fire, so the crawler
+            // does not sit connected-but-idle.
+            rejectPipeline1(new Error('websocket closed'));
+            await new Promise(r => setImmediate(r));
+            await new Promise(r => setImmediate(r));
+            expect(pipelineSpy).toHaveBeenCalledTimes(2);
+
+            await crawler.stop();
         });
 
         it('ignores live callbacks while catch-up is running and queues blocks while processing', async () => {
@@ -619,7 +670,7 @@ describe('MidnightCrawler orchestration', () => {
             vi.spyOn(crawler as any, 'processBlockWithRetry').mockRejectedValue(new Error('Request timeout'));
             const recordErrorSpy = vi.spyOn(crawler as any, 'recordError').mockResolvedValue(undefined);
             vi.spyOn(crawler as any, 'getSyncState').mockResolvedValue({ consecutiveErrors: 11 });
-            const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+            const errorSpy = vi.spyOn(cds.log('nightgate:crawler'), 'error').mockImplementation(() => {});
 
             try {
                 await (crawler as any).subscribeLive();
@@ -627,8 +678,8 @@ describe('MidnightCrawler orchestration', () => {
                 await liveCallback!({ number: '0x2', parentHash: '0x1', stateRoot: '', extrinsicsRoot: '', digest: { logs: [] } });
 
                 expect(recordErrorSpy).toHaveBeenCalledWith('Request timeout');
-                expect(errorSpy).toHaveBeenCalledWith('[Crawler] Live: failed to process block 2 (transient): Request timeout');
-                expect(errorSpy).toHaveBeenCalledWith('[Crawler] Too many consecutive errors in live mode, pausing...');
+                expect(errorSpy).toHaveBeenCalledWith('Live: failed to process block 2 (transient): Request timeout');
+                expect(errorSpy).toHaveBeenCalledWith('Too many consecutive errors in live mode, pausing...');
                 expect((crawler as any).processing).toBe(false);
             } finally {
                 errorSpy.mockRestore();
@@ -652,7 +703,7 @@ describe('MidnightCrawler orchestration', () => {
             vi.spyOn(crawler as any, 'processBlockWithRetry').mockRejectedValue(new Error('Invalid block data'));
             const recordErrorSpy = vi.spyOn(crawler as any, 'recordError').mockResolvedValue(undefined);
             vi.spyOn(crawler as any, 'getSyncState').mockResolvedValue({ consecutiveErrors: 1 });
-            const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+            const errorSpy = vi.spyOn(cds.log('nightgate:crawler'), 'error').mockImplementation(() => {});
 
             try {
                 await (crawler as any).subscribeLive();
@@ -660,8 +711,8 @@ describe('MidnightCrawler orchestration', () => {
                 await liveCallback!({ number: '0x2', parentHash: '0x1', stateRoot: '', extrinsicsRoot: '', digest: { logs: [] } });
 
                 expect(recordErrorSpy).toHaveBeenCalledWith('Invalid block data');
-                expect(errorSpy).toHaveBeenCalledWith('[Crawler] Live: failed to process block 2 (permanent): Invalid block data');
-                expect(errorSpy).not.toHaveBeenCalledWith('[Crawler] Too many consecutive errors in live mode, pausing...');
+                expect(errorSpy).toHaveBeenCalledWith('Live: failed to process block 2 (permanent): Invalid block data');
+                expect(errorSpy).not.toHaveBeenCalledWith('Too many consecutive errors in live mode, pausing...');
             } finally {
                 errorSpy.mockRestore();
             }
@@ -901,7 +952,7 @@ describe('MidnightCrawler orchestration', () => {
             const crawler = new MidnightCrawler(provider as any, { enabled: true });
             // No local block ever matches, so it walks back until depth > 100.
             (crawler as any).db = db;
-            const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+            const errorSpy = vi.spyOn(cds.log('nightgate:crawler'), 'error').mockImplementation(() => {});
 
             try {
                 await expect((crawler as any).findForkPoint({
@@ -911,7 +962,7 @@ describe('MidnightCrawler orchestration', () => {
                     extrinsicsRoot: '',
                     digest: { logs: [] }
                 })).resolves.toBe(1);
-                expect(errorSpy).toHaveBeenCalledWith('[Crawler] Reorg depth > 100 blocks, stopping search');
+                expect(errorSpy).toHaveBeenCalledWith('Reorg depth > 100 blocks, stopping search');
             } finally {
                 errorSpy.mockRestore();
             }

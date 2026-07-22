@@ -1,6 +1,6 @@
 /**
  * Tests for the parallel catch-up FETCH pipeline of srv/crawler/BlockProcessor.ts:
- * fetchBlockData / fetchBlockBatch (batched RPC, DB dedupe, response
+ * fetchBlockBatch (batched RPC, DB dedupe, response
  * de-interleaving, per-batch protocol version) plus the small parsing helpers
  * (parseTimestampHex, toInt, toBigInt). The persist side is covered by
  * block-processor-persistence.test.ts; this file only exercises the read path,
@@ -33,6 +33,7 @@ function fakeProvider() {
         getBlockHash: vi.fn(),
         getBlock: vi.fn(),
         getStorage: vi.fn(),
+        getMetadata: vi.fn().mockRejectedValue(new Error('metadata unavailable in fetch fixture')),
         getRuntimeVersion: vi.fn(async () => ({ specVersion: 7 })),
         rpcBatch: vi.fn()
     };
@@ -65,40 +66,6 @@ beforeEach(async () => {
     await db.run(cds.ql.DELETE.from(BLOCKS));
 });
 
-describe('fetchBlockData', () => {
-    it('throws when the node has no block at the height', async () => {
-        const provider = fakeProvider();
-        provider.getBlockHash.mockResolvedValue(null);
-        const p = await makeProcessor(provider);
-        await expect(p.fetchBlockData(123)).rejects.toThrow('No block at height 123');
-    });
-
-    it('short-circuits with alreadyIndexed for a hash that is already persisted', async () => {
-        const provider = fakeProvider();
-        provider.getBlockHash.mockResolvedValue('0xseen');
-        await seedBlock(5, '0xseen');
-        const p = await makeProcessor(provider);
-
-        const prep = await p.fetchBlockData(5);
-        expect(prep).toMatchObject({ blockHash: '0xseen', height: 5, alreadyIndexed: true });
-        expect(provider.getBlock).not.toHaveBeenCalled();
-    });
-
-    it('fetches block, timestamp and protocol version for a new hash', async () => {
-        const provider = fakeProvider();
-        const signed = { block: { header: { number: '0x6' } } };
-        provider.getBlockHash.mockResolvedValue('0xnew');
-        provider.getBlock.mockResolvedValue(signed);
-        provider.getStorage.mockResolvedValue(timestampHex(1_700_000_042_000n));
-        const p = await makeProcessor(provider);
-
-        const prep = asFetched(await p.fetchBlockData(6));
-        expect(prep.signedBlock).toBe(signed);
-        expect(prep.protocolVersion).toBe(7);
-        expect(prep.timestamp).toBe(1_700_000_042);
-    });
-});
-
 describe('fetchBlockBatch', () => {
     it('returns [] for an empty height list without any RPC', async () => {
         const provider = fakeProvider();
@@ -115,10 +82,10 @@ describe('fetchBlockBatch', () => {
         provider.rpcBatch
             // Round 1: heights → hashes
             .mockResolvedValueOnce(['0xh10', '0xh11', '0xh12'])
-            // Round 2: interleaved [block10, ts10, block12, ts12]
+            // Round 2: interleaved [block10, ts10, events10, block12, ts12, events12]
             .mockResolvedValueOnce([
-                blockA, timestampHex(1_700_000_010_000n),
-                blockB, timestampHex(1_700_000_012_000n)
+                blockA, timestampHex(1_700_000_010_000n), null,
+                blockB, timestampHex(1_700_000_012_000n), null
             ]);
         const p = await makeProcessor(provider);
 
@@ -127,10 +94,11 @@ describe('fetchBlockBatch', () => {
         // Round 2 must only request the two NEW hashes, block+timestamp interleaved.
         const round2 = provider.rpcBatch.mock.calls[1][0];
         expect(round2.map((r: any) => r.method)).toEqual([
-            'chain_getBlock', 'state_getStorage', 'chain_getBlock', 'state_getStorage'
+            'chain_getBlock', 'state_getStorage', 'state_getStorage',
+            'chain_getBlock', 'state_getStorage', 'state_getStorage'
         ]);
         expect(round2[0].params).toEqual(['0xh10']);
-        expect(round2[2].params).toEqual(['0xh12']);
+        expect(round2[3].params).toEqual(['0xh12']);
 
         expect(out[0]).toMatchObject({
             height: 10, blockHash: '0xh10', alreadyIndexed: false,
@@ -168,7 +136,7 @@ describe('fetchBlockBatch', () => {
 
     it('queries the protocol version once per batch and falls back to the cached one on failure', async () => {
         const provider = fakeProvider();
-        const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+        const warnSpy = vi.spyOn(cds.log('nightgate:crawler'), 'warn').mockImplementation(() => {});
         try {
             provider.getRuntimeVersion
                 .mockResolvedValueOnce({ specVersion: 9 })

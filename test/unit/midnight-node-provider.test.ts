@@ -1,4 +1,5 @@
 import type { Mock } from 'vitest';
+import cds from '@sap/cds';
 type MockWebSocketHandler = (...args: any[]) => void;
 
 const mockWebSocketInstances: Array<{
@@ -75,7 +76,7 @@ describe('MidnightNodeProvider connection management', () => {
 
     it('rejects the initial connection when the websocket errors before opening', async () => {
         const provider = new MidnightNodeProvider({ nodeUrl: 'ws://localhost:9944' });
-        const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+        const errorSpy = vi.spyOn(cds.log('nightgate:node'), 'error').mockImplementation(() => {});
 
         try {
             const connectPromise = provider.connect();
@@ -84,7 +85,7 @@ describe('MidnightNodeProvider connection management', () => {
 
             await expect(connectPromise).rejects.toThrow('socket failed');
             expect(provider.isConnected()).toBe(false);
-            expect(errorSpy).toHaveBeenCalledWith('[MidnightNode] WebSocket error:', 'socket failed');
+            expect(errorSpy).toHaveBeenCalledWith('WebSocket error:', 'socket failed');
         } finally {
             errorSpy.mockRestore();
         }
@@ -147,7 +148,7 @@ describe('MidnightNodeProvider connection management', () => {
             reconnectInterval: 100,
             maxReconnectAttempts: 2
         });
-        const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+        const errorSpy = vi.spyOn(cds.log('nightgate:node'), 'error').mockImplementation(() => {});
         provider.setOnReconnect(vi.fn().mockRejectedValue(new Error('callback failed')));
 
         try {
@@ -166,7 +167,7 @@ describe('MidnightNodeProvider connection management', () => {
             await Promise.resolve();
             await Promise.resolve();
 
-            expect(errorSpy).toHaveBeenCalledWith('[MidnightNode] Reconnect callback failed:', 'callback failed');
+            expect(errorSpy).toHaveBeenCalledWith('Reconnect callback failed:', 'callback failed');
             expect(provider.isConnected()).toBe(true);
         } finally {
             errorSpy.mockRestore();
@@ -178,13 +179,13 @@ describe('MidnightNodeProvider connection management', () => {
             nodeUrl: 'ws://localhost:9944',
             maxReconnectAttempts: 2
         });
-        const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+        const errorSpy = vi.spyOn(cds.log('nightgate:node'), 'error').mockImplementation(() => {});
 
         try {
             (provider as any).reconnectAttempts = 2;
             (provider as any).attemptReconnect();
 
-            expect(errorSpy).toHaveBeenCalledWith('[MidnightNode] Max reconnect attempts (2) reached');
+            expect(errorSpy).toHaveBeenCalledWith('Max reconnect attempts (2) reached');
         } finally {
             errorSpy.mockRestore();
         }
@@ -200,7 +201,7 @@ describe('MidnightNodeProvider connection management', () => {
         const connectSpy = vi.spyOn(provider, 'connect')
             .mockRejectedValueOnce(new Error('reconnect failed'))
             .mockResolvedValueOnce(undefined);
-        const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+        const errorSpy = vi.spyOn(cds.log('nightgate:node'), 'error').mockImplementation(() => {});
 
         provider.setOnReconnect(callback);
         (provider as any).attemptReconnect();
@@ -212,7 +213,7 @@ describe('MidnightNodeProvider connection management', () => {
 
         expect(connectSpy).toHaveBeenCalledTimes(2);
         expect(callback).toHaveBeenCalledTimes(1);
-        expect(errorSpy).toHaveBeenCalledWith('[MidnightNode] Reconnect failed:', 'reconnect failed');
+        expect(errorSpy).toHaveBeenCalledWith('Reconnect failed:', 'reconnect failed');
 
         errorSpy.mockRestore();
         connectSpy.mockRestore();
@@ -310,7 +311,7 @@ describe('MidnightNodeProvider core RPC flow', () => {
     it('dispatches subscription notifications and ignores invalid JSON', () => {
         const provider = new MidnightNodeProvider({ nodeUrl: 'ws://localhost:9944' });
         const callback = vi.fn();
-        const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+        const warnSpy = vi.spyOn(cds.log('nightgate:node'), 'warn').mockImplementation(() => {});
 
         try {
             (provider as any).subscriptions.set('sub-1', callback);
@@ -324,7 +325,7 @@ describe('MidnightNodeProvider core RPC flow', () => {
                 }
             }));
 
-            expect(warnSpy).toHaveBeenCalledWith('[MidnightNode] Invalid JSON message received');
+            expect(warnSpy).toHaveBeenCalledWith('Invalid JSON message received');
             expect(callback).toHaveBeenCalledWith({ number: '0x2a' });
         } finally {
             warnSpy.mockRestore();
@@ -334,7 +335,7 @@ describe('MidnightNodeProvider core RPC flow', () => {
     it('logs rejected async subscription callbacks without breaking message handling', async () => {
         const provider = new MidnightNodeProvider({ nodeUrl: 'ws://localhost:9944' });
         const callback = vi.fn().mockRejectedValue(new Error('callback failed'));
-        const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+        const errorSpy = vi.spyOn(cds.log('nightgate:node'), 'error').mockImplementation(() => {});
 
         try {
             (provider as any).subscriptions.set('sub-1', callback);
@@ -350,7 +351,7 @@ describe('MidnightNodeProvider core RPC flow', () => {
             await Promise.resolve();
 
             expect(callback).toHaveBeenCalledWith({ number: '0x2a' });
-            expect(errorSpy).toHaveBeenCalledWith('[MidnightNode] Subscription callback failed:', 'callback failed');
+            expect(errorSpy).toHaveBeenCalledWith('Subscription callback failed:', 'callback failed');
         } finally {
             errorSpy.mockRestore();
         }
@@ -485,7 +486,7 @@ describe('MidnightNodeProvider lifecycle edges', () => {
     });
 
     it('rejects connect() when the socket errors before opening', async () => {
-        const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+        const errorSpy = vi.spyOn(cds.log('nightgate:node'), 'error').mockImplementation(() => {});
         try {
             const provider = new MidnightNodeProvider({ nodeUrl: 'ws://localhost:9944' });
             const connectPromise = provider.connect();
@@ -506,7 +507,7 @@ describe('MidnightNodeProvider lifecycle edges', () => {
     });
 
     it('logs and survives a rejected async subscription callback', async () => {
-        const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+        const errorSpy = vi.spyOn(cds.log('nightgate:node'), 'error').mockImplementation(() => {});
         try {
             const provider = new MidnightNodeProvider({ nodeUrl: 'ws://localhost:9944' });
             const connectPromise = provider.connect();
@@ -524,7 +525,7 @@ describe('MidnightNodeProvider lifecycle edges', () => {
             // The rejection is handled on a microtask; flush it.
             await new Promise(r => setImmediate(r));
             expect(errorSpy).toHaveBeenCalledWith(
-                '[MidnightNode] Subscription callback failed:', 'async subscriber exploded');
+                'Subscription callback failed:', 'async subscriber exploded');
         } finally {
             errorSpy.mockRestore();
         }

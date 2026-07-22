@@ -1,24 +1,15 @@
 /**
- * BlockProcessor, Parses and persists Midnight blocks
- *
- * Processes a single block: parse header, classify transactions,
- * extract inputs/outputs/contract actions, and write to DB
- *
+ * BlockProcessor: parses and persists Midnight blocks.
+ * Parse header, classify transactions, extract inputs/outputs/contract
+ * actions, write to DB.
  */
 
-interface ExtrinsicClassification {
-    txType: string;
-    isShielded: boolean;
-    isSystem: boolean;
-    palletIndex?: number;
-    callIndex?: number;
-}
-
 import cds from '@sap/cds';
-const { SELECT, INSERT, UPDATE } = cds.ql;
-import { blake2b } from '@noble/hashes/blake2b';
+import { blake2b } from '@noble/hashes/blake2';
 import { bytesToHex } from '@noble/hashes/utils';
-import { MidnightNodeProvider, SignedBlock, BlockHeader } from '../providers/MidnightNodeProvider';
+import { TypeRegistry } from '@polkadot/types/create';
+import { Metadata } from '@polkadot/types/metadata';
+import { MidnightNodeProvider, SignedBlock } from '../providers/MidnightNodeProvider';
 import { ensureNightgateModelLoaded } from '../utils/cds-model';
 import { getNightgatePluginConfig } from '../utils/nightgate-config';
 import { parseExtrinsicCallIndices, parseExtrinsicParticipantInfo } from '../utils/scale';
@@ -28,11 +19,18 @@ import {
     UnshieldedUtxos, NightBalances, SyncState
 } from '#cds-models/midnight';
 
-/**
- * Mapping of pallet index to human-readable name and transaction type.
- * Used for classifying extrinsics into transaction types (e.g. transfer, contract_call).
- */
+const { SELECT, INSERT, UPDATE } = cds.ql;
+const log = cds.log('nightgate:crawler');
 
+interface ExtrinsicClassification {
+    txType: string;
+    isShielded: boolean;
+    isSystem: boolean;
+    palletIndex?: number;
+    callIndex?: number;
+}
+
+/** Pallet index → name + transaction type, for classifying extrinsics. */
 export interface PalletMapping {
     name: string;
     txType: string;
@@ -40,7 +38,6 @@ export interface PalletMapping {
     isSystem?: boolean;
 }
 
-/** Default Substrate pallet index → type mapping. Override via cds.requires.nightgate.palletMap */
 /** Valid TxType values matching the schema enum in db/schema.cds */
 const VALID_TX_TYPES = new Set([
     'night_transfer', 'shielded_transfer', 'contract_deploy', 'contract_call',
@@ -48,17 +45,51 @@ const VALID_TX_TYPES = new Set([
     'system', 'unknown'
 ]);
 
+/**
+ * Midnight runtime pallet index → classification.
+ *
+ * HARDCODED from runtime metadata (specName 'midnight', specVersion 1000000;
+ * read from preprod via state_getMetadata 2026-07-22). Pallet indices are fixed
+ * by `construct_runtime!` and identical across nodes of the same runtime
+ * version, NOT a per-deployment choice. They CAN shift on a Midnight RUNTIME
+ * UPGRADE: re-verify against chain metadata when Midnight bumps its runtime. The
+ * `cds.requires.nightgate.palletMap` override is a hotfix escape hatch.
+ *
+ * NOTE: Midnight wraps ALL user operations (contract deploy/call, shielded
+ * transfer, unshield, NIGHT transfer) in ONE call, `Midnight.send_mn_transaction`
+ * (pallet 5, call 0). The operation type lives in the ledger payload, not the
+ * pallet/call index, so it can't be distinguished here; pallet 5 is bucketed as
+ * `contract_call`. Finer classification needs decoding the ledger tx payload.
+ */
 const DEFAULT_PALLET_MAP: Record<number, PalletMapping> = {
-    0: { name: 'System', txType: 'system', isSystem: true },
-    1: { name: 'Timestamp', txType: 'system', isSystem: true },
-    2: { name: 'Babe', txType: 'system', isSystem: true },
-    3: { name: 'Grandpa', txType: 'system', isSystem: true },
-    4: { name: 'Balances', txType: 'night_transfer' },
-    5: { name: 'Sudo', txType: 'system', isSystem: true },
-    10: { name: 'Contracts', txType: 'contract_call' },
-    // Midnight-specific pallets, configure actual indices via cds.requires.nightgate.palletMap:
-    // { "15": { "name": "Zswap", "txType": "shielded_transfer", "isShielded": true } }
-    // { "16": { "name": "ContractPallet", "txType": "contract_deploy" } }
+    0:  { name: 'System', txType: 'system', isSystem: true },
+    1:  { name: 'Timestamp', txType: 'system', isSystem: true },
+    2:  { name: 'Aura', txType: 'system', isSystem: true },
+    3:  { name: 'Grandpa', txType: 'system', isSystem: true },
+    4:  { name: 'Sidechain', txType: 'system', isSystem: true },
+    5:  { name: 'Midnight', txType: 'contract_call' }, // send_mn_transaction: all ledger txs
+    6:  { name: 'MidnightSystem', txType: 'system', isSystem: true },
+    8:  { name: 'SessionCommitteeManagement', txType: 'system', isSystem: true },
+    11: { name: 'NodeVersion', txType: 'system', isSystem: true },
+    13: { name: 'CNightObservation', txType: 'system', isSystem: true }, // per-block inherent
+    15: { name: 'Preimage', txType: 'system', isSystem: true },
+    16: { name: 'MultiBlockMigrations', txType: 'system', isSystem: true },
+    17: { name: 'PalletSession', txType: 'system', isSystem: true },
+    18: { name: 'Scheduler', txType: 'system', isSystem: true },
+    19: { name: 'TxPause', txType: 'system', isSystem: true },
+    21: { name: 'Beefy', txType: 'system', isSystem: true },
+    22: { name: 'Mmr', txType: 'system', isSystem: true },
+    23: { name: 'BeefyMmrLeaf', txType: 'system', isSystem: true },
+    30: { name: 'Session', txType: 'system', isSystem: true },
+    32: { name: 'Bridge', txType: 'night_transfer' }, // handle_transfers: cross-chain NIGHT
+    40: { name: 'Council', txType: 'governance' },
+    41: { name: 'CouncilMembership', txType: 'governance' },
+    42: { name: 'TechnicalCommittee', txType: 'governance' },
+    43: { name: 'TechnicalCommitteeMembership', txType: 'governance' },
+    44: { name: 'FederatedAuthority', txType: 'governance' },
+    45: { name: 'FederatedAuthorityObservation', txType: 'system', isSystem: true }, // per-block inherent
+    50: { name: 'SystemParameters', txType: 'system', isSystem: true },
+    51: { name: 'Throttle', txType: 'system', isSystem: true }
 };
 
 const NIGHT_TOKEN_TYPE_HEX = '0x4e49474854';
@@ -78,7 +109,7 @@ function buildPalletMap(): Map<number, PalletMapping> {
         for (const [idx, entry] of Object.entries(configMap)) {
             const mapping = entry as PalletMapping;
             if (!VALID_TX_TYPES.has(mapping.txType)) {
-                console.warn(`[BlockProcessor] palletMap[${idx}] has invalid txType "${mapping.txType}", falling back to "unknown"`);
+                log.warn(`palletMap[${idx}] has invalid txType "${mapping.txType}", falling back to "unknown"`);
                 mapping.txType = 'unknown';
             }
             map.set(Number(idx), mapping);
@@ -101,15 +132,13 @@ export interface ProcessResult {
 }
 
 /**
- * Per-block data fetched from the node, ready to be persisted. Produced by
- * `fetchBlockData`, consumed by `persistBlockData`. Decoupling fetch from
- * persist lets the crawler pipeline RPC fetches in parallel while writing
- * to SQLite serially.
+ * Per-block data fetched from the node, ready to persist. Produced by
+ * `fetchBlockBatch`, consumed by `persistBlockData`. Decoupling fetch from
+ * persist lets the crawler pipeline RPC fetches in parallel while writing to
+ * SQLite serially.
  *
- * Modeled as a discriminated union on `alreadyIndexed`: when we short-circuit
- * because the block exists in the DB, the heavy RPC fields are absent; when
- * we fetched fully, they are all present. This replaces the earlier
- * `signedBlock: null as any` placeholder which bypassed type checking.
+ * Discriminated union on `alreadyIndexed`: a DB short-circuit omits the heavy
+ * RPC fields; a full fetch has them all.
  */
 export type PreparedBlock = PreparedBlockSkipped | PreparedBlockFetched;
 
@@ -126,6 +155,7 @@ export interface PreparedBlockFetched {
     signedBlock: SignedBlock;
     protocolVersion: number;
     timestamp: number;
+    extrinsicOutcomes: Map<number, 'SUCCESS' | 'FAILURE'>;
     fetchStartedAt: number;
     /** Set when all RPCs for this block have resolved. Used for fetch-vs-persist timing diagnostics. */
     fetchCompletedAt?: number;
@@ -143,10 +173,14 @@ export class BlockProcessor {
      *  runtime-version RPC fails; never used to skip the query (runtime
      *  upgrades would otherwise persist blocks with a stale version). */
     private cachedSpecVersion: number = 0;
+    private eventRegistries = new Map<number, TypeRegistry>();
 
     /** Well-known Substrate storage key for Timestamp::Now (twox128("Timestamp") + twox128("Now")) */
     private static readonly TIMESTAMP_STORAGE_KEY =
         '0xf0c365c3cf59d671eb72da0e7a4113c4e2c375c859d5adb749f1454ac11356be';
+    /** System::Events = twox128("System") + twox128("Events"). */
+    private static readonly SYSTEM_EVENTS_STORAGE_KEY =
+        '0x26aa394eea5630e07c48ae0c9558cef780d41e5e16056765bc8461851072c9d7';
 
     constructor(
         private nodeProvider: MidnightNodeProvider
@@ -181,45 +215,6 @@ export class BlockProcessor {
     }
 
     /**
-     * Fetch all data for a block in parallel without writing to the DB.
-     * Used by the parallel catch-up pipeline so multiple block fetches can
-     * be in flight while writes to SQLite happen serially in height order.
-     */
-    async fetchBlockData(height: number): Promise<PreparedBlock> {
-        const fetchStartedAt = Date.now();
-        const blockHash = await this.nodeProvider.getBlockHash(height);
-        if (!blockHash) throw new Error(`No block at height ${height}`);
-
-        if (await this.blockExists(blockHash)) {
-            return {
-                blockHash,
-                height,
-                fetchStartedAt,
-                alreadyIndexed: true
-            };
-        }
-
-        // Three independent RPCs over the same WSS connection. The provider
-        // multiplexes by request id, so these resolve in parallel.
-        const [signedBlock, timestamp, protocolVersion] = await Promise.all([
-            this.nodeProvider.getBlock(blockHash),
-            this.getBlockTimestamp(blockHash),
-            this.getProtocolVersion(blockHash)
-        ]);
-
-        return {
-            blockHash,
-            height,
-            signedBlock,
-            protocolVersion,
-            timestamp,
-            fetchStartedAt,
-            fetchCompletedAt: Date.now(),
-            alreadyIndexed: false
-        };
-    }
-
-    /**
      * Fetch a contiguous range of blocks in two JSON-RPC batches.
      *
      * Round 1: `chain_getBlockHash(h)` for every height → 1 WSS round-trip
@@ -250,19 +245,21 @@ export class BlockProcessor {
             if (hashes[i] && !existingSet.has(hashes[i])) newIndices.push(i);
         }
 
-        // Round 2: getBlock + getStorage(timestamp) for every new hash, one batch.
-        // Order: [block0, ts0, block1, ts1, ...] so we can de-interleave by index.
+        // Round 2: block + timestamp + System.Events for every new hash.
         let blockResults: SignedBlock[] = [];
         let tsResults: (string | null)[] = [];
+        let eventResults: (string | null)[] = [];
         if (newIndices.length > 0) {
             const requests: Array<{ method: string; params: unknown[] }> = [];
             for (const i of newIndices) {
                 requests.push({ method: 'chain_getBlock', params: [hashes[i]] });
                 requests.push({ method: 'state_getStorage', params: [BlockProcessor.TIMESTAMP_STORAGE_KEY, hashes[i]] });
+                requests.push({ method: 'state_getStorage', params: [BlockProcessor.SYSTEM_EVENTS_STORAGE_KEY, hashes[i]] });
             }
             const flat = await this.nodeProvider.rpcBatch(requests);
-            blockResults = newIndices.map((_, k) => flat[k * 2]);
-            tsResults = newIndices.map((_, k) => flat[k * 2 + 1]);
+            blockResults = newIndices.map((_, k) => flat[k * 3]);
+            tsResults = newIndices.map((_, k) => flat[k * 3 + 1]);
+            eventResults = newIndices.map((_, k) => flat[k * 3 + 2]);
         }
 
         // ProtocolVersion is queried once per batch (first hash) so runtime
@@ -271,6 +268,9 @@ export class BlockProcessor {
         const protocolVersion = heights.length > 0 && hashes[0]
             ? await this.getProtocolVersion(hashes[0])
             : this.cachedSpecVersion;
+        const eventRegistry = newIndices.length > 0 && hashes[0]
+            ? await this.getEventRegistry(hashes[0], protocolVersion)
+            : undefined;
 
         const fetchCompletedAt = Date.now();
 
@@ -292,7 +292,12 @@ export class BlockProcessor {
                 continue;
             }
             const signedBlock = blockResults[newIdx];
+
+            if (!signedBlock?.block) {
+                throw new Error(`No block body returned for height ${heights[i]} (pruned or racing node)`);
+            }
             const timestamp = this.parseTimestampHex(tsResults[newIdx]);
+            const extrinsicOutcomes = this.decodeExtrinsicOutcomes(eventResults[newIdx], eventRegistry);
             newIdx++;
             out[i] = {
                 blockHash,
@@ -300,6 +305,7 @@ export class BlockProcessor {
                 signedBlock,
                 protocolVersion,
                 timestamp,
+                extrinsicOutcomes,
                 fetchStartedAt,
                 fetchCompletedAt,
                 alreadyIndexed: false
@@ -370,13 +376,18 @@ export class BlockProcessor {
         }
 
         // Parallelize the three independent RPC fetches over the same WSS.
-        const [signedBlock, timestamp, protocolVersion] = await Promise.all([
+        const [signedBlock, timestamp, protocolVersion, rawEvents] = await Promise.all([
             this.nodeProvider.getBlock(blockHash),
             this.getBlockTimestamp(blockHash),
-            this.getProtocolVersion(blockHash)
+            this.getProtocolVersion(blockHash),
+            this.nodeProvider.getStorage(BlockProcessor.SYSTEM_EVENTS_STORAGE_KEY, blockHash)
         ]);
+        if (!signedBlock?.block) {
+            throw new Error(`No block body returned for ${blockHash} (pruned or racing node)`);
+        }
         const header = signedBlock.block.header;
         const height = MidnightNodeProvider.parseBlockNumber(header.number);
+        const eventRegistry = await this.getEventRegistry(blockHash, protocolVersion);
 
         return this.persistFromNode({
             blockHash,
@@ -384,6 +395,7 @@ export class BlockProcessor {
             signedBlock,
             protocolVersion,
             timestamp,
+            extrinsicOutcomes: this.decodeExtrinsicOutcomes(rawEvents, eventRegistry),
             fetchStartedAt: start,
             alreadyIndexed: false
         }, start, opts);
@@ -394,7 +406,7 @@ export class BlockProcessor {
         start: number,
         opts?: { requireParent?: boolean }
     ): Promise<ProcessResult> {
-        const { blockHash, height, signedBlock, protocolVersion, timestamp } = prep;
+        const { blockHash, height, signedBlock, protocolVersion, timestamp, extrinsicOutcomes } = prep;
         const header = signedBlock.block.header;
         const extrinsics = signedBlock.block.extrinsics;
 
@@ -409,9 +421,6 @@ export class BlockProcessor {
                 SELECT.one.from(Blocks).columns('ID').where({ hash: header.parentHash })
             );
 
-            // Height-sequenced paths refuse to persist an orphan: a missing
-            // parent above genesis means the index has a gap, and silently
-            // writing parent_ID = null would hide it.
             if (opts?.requireParent && height > 0 && !parentBlock) {
                 throw new Error(
                     `Parent block ${header.parentHash} of block ${height} is not indexed; ` +
@@ -430,11 +439,7 @@ export class BlockProcessor {
                 parent_ID: parentBlock?.ID || null
             }));
 
-            // 2. Parse extrinsics into rows for bulk insert.
-            // Each extrinsic produced 4-6 individual `tx.run(INSERT…)` calls
-            // before; batching cuts that to one INSERT per table regardless of
-            // tx count. CAP rewrites array-entries INSERTs into a single
-            // SQLite VALUES(...) statement, which collapses prepare/run overhead.
+            // 2. Parse extrinsics into rows for bulk insert
             const txRows: Record<string, unknown>[] = [];
             const txResultRows: Record<string, unknown>[] = [];
             const txFeeRows: Record<string, unknown>[] = [];
@@ -480,11 +485,15 @@ export class BlockProcessor {
                     block_ID: blockId
                 });
 
-                txResultRows.push({
-                    ID: cds.utils.uuid(),
-                    status: 'SUCCESS',
-                    transaction_ID: txId
-                });
+                const outcome = extrinsicOutcomes.get(i);
+                if (outcome) {
+                    txResultRows.push({
+                        ID: cds.utils.uuid(),
+                        status: outcome,
+                        outcomeSource: 'substrate-system-events',
+                        transaction_ID: txId
+                    });
+                }
 
                 txFeeRows.push({
                     ID: cds.utils.uuid(),
@@ -535,9 +544,7 @@ export class BlockProcessor {
             if (txFeeRows.length) await tx.run(INSERT.into(TransactionFees).entries(txFeeRows));
             if (contractActionRows.length) await tx.run(INSERT.into(ContractActions).entries(contractActionRows));
 
-            // Cold path: PendingSubmissions updates + balance projections.
-            // No-op for most blocks. Kept sequential because the balance
-            // upsert is read-modify-write and order-dependent within a block.
+            // Cold path
             for (const r of pendingReconciles) {
                 await reconcilePendingSubmission(tx, r.hash, r.ctx);
             }
@@ -717,10 +724,7 @@ export class BlockProcessor {
 
         if (!existing) {
             const initialBalance = params.balanceDelta < 0n ? 0n : params.balanceDelta;
-            // balance/totalSent/totalReceived are Decimal(20,0) columns holding
-            // u128 amounts as strings to avoid JS number precision loss. The
-            // cds-models generator types Decimal as `number`, so cast the string
-            // values; the DB layer accepts the string at runtime.
+
             await tx.run(INSERT.into(NightBalances).entries({
                 address: params.address,
                 balance: initialBalance.toString() as any,
@@ -792,14 +796,54 @@ export class BlockProcessor {
     }
 
     /**
-     * Compute blake2b-256 hash of the raw SCALE-encoded extrinsic bytes.
-     * Produces the canonical extrinsic hash matching block explorers and other indexers.
+     * blake2b-256 of the raw SCALE-encoded extrinsic bytes: the canonical
+     * extrinsic hash matching block explorers and other indexers.
      */
     private hashExtrinsic(hex: string): string {
         const cleanHex = hex.startsWith('0x') ? hex.slice(2) : hex;
         const bytes = Buffer.from(cleanHex, 'hex');
         const hash = blake2b(bytes, { dkLen: 32 });
         return '0x' + bytesToHex(hash);
+    }
+
+    private async getEventRegistry(blockHash: string, specVersion: number): Promise<TypeRegistry | undefined> {
+        if (!specVersion) return undefined;
+        const cached = this.eventRegistries.get(specVersion);
+        if (cached) return cached;
+        try {
+            const metadataHex = await this.nodeProvider.getMetadata(blockHash);
+            const registry = new TypeRegistry();
+            registry.setMetadata(new Metadata(registry, metadataHex as `0x${string}`));
+            this.eventRegistries.set(specVersion, registry);
+            return registry;
+        } catch (err) {
+            log.warn(`Failed to load runtime metadata for System.Events at ${blockHash}: ${(err as Error).message}`);
+            return undefined;
+        }
+    }
+
+    /** Decode only the canonical System outcome event for each extrinsic. */
+    private decodeExtrinsicOutcomes(
+        rawEvents: string | null | undefined,
+        registry: TypeRegistry | undefined
+    ): Map<number, 'SUCCESS' | 'FAILURE'> {
+        const outcomes = new Map<number, 'SUCCESS' | 'FAILURE'>();
+        if (!rawEvents || !registry) return outcomes;
+        try {
+            const records: any = registry.createType('Vec<EventRecord>', rawEvents);
+            for (const record of records as any) {
+                if (!record.phase?.isApplyExtrinsic) continue;
+                const index = record.phase.asApplyExtrinsic.toNumber();
+                const section = String(record.event?.section ?? '').toLowerCase();
+                const method = String(record.event?.method ?? '');
+                if (section !== 'system') continue;
+                if (method === 'ExtrinsicFailed') outcomes.set(index, 'FAILURE');
+                else if (method === 'ExtrinsicSuccess' && outcomes.get(index) !== 'FAILURE') outcomes.set(index, 'SUCCESS');
+            }
+        } catch (err) {
+            log.warn(`Failed to decode System.Events; transaction outcomes remain unknown: ${(err as Error).message}`);
+        }
+        return outcomes;
     }
 
     /**
@@ -820,7 +864,7 @@ export class BlockProcessor {
                 return Number(msTimestamp / 1000n);
             }
         } catch (err) {
-            console.warn(`[BlockProcessor] Failed to read on-chain timestamp for ${blockHash}: ${(err as Error).message}`);
+            log.warn(`Failed to read on-chain timestamp for ${blockHash}: ${(err as Error).message}`);
         }
         return Math.floor(Date.now() / 1000);
     }
@@ -836,7 +880,7 @@ export class BlockProcessor {
             this.cachedSpecVersion = rv.specVersion;
             return rv.specVersion;
         } catch (err) {
-            console.warn(`[BlockProcessor] Failed to get runtime version for ${blockHash}: ${(err as Error).message}`);
+            log.warn(`Failed to get runtime version for ${blockHash}: ${(err as Error).message}`);
             return this.cachedSpecVersion;
         }
     }
