@@ -1,14 +1,13 @@
 /**
- * Cryptographic Utilities for Wallet Session Security
- *
- * AES-256-GCM encryption for viewing keys at rest.
- * SHA-256 hashing for viewing key lookup/deduplication.
- *
- * Uses Node.js built-in crypto module, zero additional dependencies.
+ * Wallet-session crypto: AES-256-GCM encryption for viewing keys at rest,
+ * SHA-256 hashing for viewing-key lookup/dedup.
  */
 
 import crypto from 'crypto';
 import os from 'os';
+import cds from '@sap/cds';
+
+const log = cds.log('nightgate:crypto');
 
 const ALGORITHM = 'aes-256-gcm';
 const IV_LENGTH = 12;        // 96 bits, recommended for GCM
@@ -23,13 +22,21 @@ const AUTH_TAG_LENGTH = 16;  // 128 bits
 export function getEncryptionKey(): Buffer {
     const envKey = process.env.ENCRYPTION_KEY;
     if (envKey) {
+        // The value is folded to 32 bytes with SHA-256, which provides no
+        // stretching. A short human passphrase therefore has weak effective
+        // entropy: warn so operators supply a high-entropy secret (hex/base64
+        // of >= 32 bytes). Derivation itself is unchanged to keep existing
+        // ciphertext decryptable.
+        if (envKey.length < 32) {
+            log.warn('ENCRYPTION_KEY is shorter than 32 characters. Use a high-entropy 32+ byte secret (hex or base64); the value is SHA-256-folded and short passphrases are not stretched.');
+        }
         return crypto.createHash('sha256').update(envKey).digest();
     }
     if (process.env.NODE_ENV === 'production') {
-        throw new Error('[crypto] ENCRYPTION_KEY must be set in production. Refusing to start with fallback key.');
+        throw new Error('ENCRYPTION_KEY must be set in production. Refusing to start with fallback key.');
     }
     // Dev fallback: derive from stable-per-process value
-    console.warn('[crypto] ENCRYPTION_KEY not set. Using dev fallback key. Set ENCRYPTION_KEY for production.');
+    log.warn('ENCRYPTION_KEY not set. Using dev fallback key. Set ENCRYPTION_KEY for production.');
     const fallback = `odatano-night-${process.pid}-${os.hostname()}`;
     return crypto.createHash('sha256').update(fallback).digest();
 }

@@ -1,8 +1,5 @@
 /**
- * NightgateAdminService, System Administration
- *
- * Provides session management for wallet connections.
- * Entity projections (WalletSessions) are handled by CDS automatically.
+ * NightgateAdminService: wallet-session management + role grants.
  */
 
 import cds, { Request } from '@sap/cds';
@@ -91,10 +88,9 @@ export default class NightgateAdminService extends cds.ApplicationService {
             return result;
         });
 
-        // grantRole. Service-level @requires: 'admin' has already gated the
-        // CAP auth side. Belt-and-suspenders: additionally require the caller
-        // to hold the 'authority' disclosure tier, so a sysadmin who is not
-        // also a regulator cannot grant data-tier access.
+        // @requires:'admin' gates CAP auth; additionally require the caller to
+        // hold the 'authority' disclosure tier so a sysadmin who is not a
+        // regulator cannot grant data-tier access.
         this.on('grantRole', async (req: Request) => {
             const { userId, role, scope, validUntil } = req.data as {
                 userId?: string;

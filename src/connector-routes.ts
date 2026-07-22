@@ -12,8 +12,8 @@ import { getContractRegistration, listRegisteredContracts } from '../srv/submiss
 // Extracted from plugin.ts so the handlers can be mounted on a bare Express
 // app for testing (scripts/integration-test-connector-routes.mjs) without
 // pulling in the plugin's cds lifecycle hooks. plugin.ts mounts both inside
-// its single `cds.on('bootstrap')` listener, after the security-header
-// middleware (which supplies CORS + CSP + nosniff).
+// its single `cds.on('bootstrap')` listener. HTTP security and CORS policy are
+// deliberately owned by the consuming CAP host, not this plugin.
 
 // Serves a registered contract's ZK config (prover/verifier keys + zkir) over
 // HTTP so browser consumers can use a FetchZkConfigProvider, and the wallet

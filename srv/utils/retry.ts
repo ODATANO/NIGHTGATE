@@ -6,7 +6,8 @@ const TRANSIENT_PATTERNS = [
   'timeout', 'econnreset', 'econnrefused', 'enotfound',
   'connection closed', 'connection lost', 'not connected',
   'websocket', 'rpc timeout', 'socket hang up',
-  'network', 'epipe', 'ehostunreach'
+  'network', 'epipe', 'ehostunreach',
+  'no block body'  // pruned/racing node returned null for a finalized hash
 ];
 
 /**

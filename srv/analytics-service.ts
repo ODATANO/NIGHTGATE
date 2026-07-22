@@ -1,8 +1,5 @@
 /**
- * NightgateAnalyticsService, Aggregated Blockchain Statistics
- *
- * Provides count and average functions over indexed blockchain data.
- * Entity views (BlockStatistics, ContractStatistics) are handled by CDS automatically.
+ * NightgateAnalyticsService: count/average aggregates over indexed data.
  */
 
 import cds from '@sap/cds';

@@ -71,7 +71,7 @@ function makeTierGate(tier: AttestationTier) {
  * envelope NIGHTPASS drops into a `PredicateAttestationCredential`, so the
  * output is consumed unchanged.
  *
- * On-chain-verified model: the proof is not standalone-verifiable with just a
+ * The proof is not standalone-verifiable with just a
  * VK. `proofValue` is therefore the `provePredicate` transaction hash.
  */
 export interface PredicateAttestationEnvelope {

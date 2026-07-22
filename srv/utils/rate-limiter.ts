@@ -46,7 +46,6 @@ export class RateLimiter {
         let timestamps = this.hits.get(key) || [];
         timestamps = timestamps.filter(t => t > windowStart);
 
-        // Clean up stale keys to prevent memory growth
         if (timestamps.length === 0) {
             timestamps = [now];
             this.hits.set(key, timestamps);

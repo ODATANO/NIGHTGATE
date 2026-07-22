@@ -3,6 +3,12 @@ const linkedMock = vi.hoisted(() => (vi.fn()));
 
 vi.mock('@sap/cds', () => {
     const cds: any = {
+        log: (() => {
+            const _c: Record<string, any> = {};
+            return (name: string) => (_c[name] ??= {
+                info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn(), trace: vi.fn()
+            });
+        })(),
         model: undefined,
         load: loadMock,
         linked: linkedMock
