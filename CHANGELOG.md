@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.9.1 - 2026-07-22
+
+### Fix: pin the Midnight SDK to 4.0.x so a fresh install keeps a single compact-js copy
+
+0.9.0 pinned `@midnight-ntwrk/compact-js` to exactly `2.5.0` (the version the
+tested SDK `midnight-js-contracts@4.0.4` requires) but allowed the SDK as a
+range (`^4.0.4`). Since then `midnight-js-contracts@4.1.0` shipped, which pulls
+`compact-js@2.5.1`, so a FRESH consumer install resolved BOTH `2.5.0` (our pin,
+nested) and `2.5.1` (the newer SDK, hoisted). Two copies reintroduce the
+distinct-`TypeId` skew that breaks contract deploys (`Cannot read properties of
+undefined (reading 'ctor')`). Our own repo was unaffected only because the
+committed lockfile pins the SDK to 4.0.4; lockfiles are not published, so
+consumers re-resolved to 4.1.0.
+
+Fix: the six direct `@midnight-ntwrk/midnight-js-*` dependencies are now
+`~4.0.4` (`>=4.0.4 <4.1.0`) instead of `^4.0.4`. The SDK stays on 4.0.x, which
+requires `compact-js@2.5.0`, matching our pin, so a fresh install dedupes to a
+single `2.5.0`. No code change; moving to the 4.1.x SDK (and `compact-js@2.5.1`)
+is a deliberate future bump.
+
 ## 0.9.0 - 2026-07-22
 
 ### Hardening pass: submission recovery, crawler resilience, DB indexes, leveled logging
