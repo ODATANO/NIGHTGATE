@@ -130,7 +130,7 @@ describe('getHealth', () => {
         await db.run(cds.ql.DELETE.from(SYNC_STATE));
 
         const result = await srv.send('getHealth');
-        expect(result).toEqual({
+        expect(result).toEqual(expect.objectContaining({
             status: 'unknown',
             chainHeight: 0,
             indexedHeight: 0,
@@ -138,8 +138,11 @@ describe('getHealth', () => {
             lag: 0,
             finalizedLag: 0,
             blocksPerSecond: 0,
-            syncStatus: 'stopped'
-        });
+            syncStatus: 'stopped',
+            runtimeMode: 'single-instance',
+            replicaCount: 1,
+            topologyValid: true
+        }));
     });
 
     it('reports healthy status and clamps negative lag to zero', async () => {
@@ -272,14 +275,15 @@ describe('getReadiness', () => {
         await db.run(cds.ql.DELETE.from(SYNC_STATE));
 
         const result = await srv.send('getReadiness');
-        expect(result).toEqual({
+        expect(result).toEqual(expect.objectContaining({
             ready: false,
             checks: {
                 database: true,
                 crawler: false,
-                node: false
+                node: false,
+                runtime: true
             }
-        });
+        }));
     });
 
     it('reports database:false (and all checks false) when the readiness DB read throws', async () => {
@@ -289,14 +293,15 @@ describe('getReadiness', () => {
         const runSpy = vi.spyOn(db, 'run').mockImplementation(() => Promise.reject(new Error('db down')));
         try {
             const result = await srv.send('getReadiness');
-            expect(result).toEqual({
+            expect(result).toEqual(expect.objectContaining({
                 ready: false,
                 checks: {
                     database: false,
                     crawler: false,
-                    node: false
+                    node: false,
+                    runtime: true
                 }
-            });
+            }));
         } finally {
             runSpy.mockRestore();
         }
@@ -309,14 +314,15 @@ describe('getReadiness', () => {
         });
 
         const result = await srv.send('getReadiness');
-        expect(result).toEqual({
+        expect(result).toEqual(expect.objectContaining({
             ready: true,
             checks: {
                 database: true,
                 crawler: true,
-                node: true
+                node: true,
+                runtime: true
             }
-        });
+        }));
     });
 
     it('reports stale node activity separately from crawler readiness', async () => {
@@ -326,14 +332,15 @@ describe('getReadiness', () => {
         });
 
         const result = await srv.send('getReadiness');
-        expect(result).toEqual({
+        expect(result).toEqual(expect.objectContaining({
             ready: false,
             checks: {
                 database: true,
                 crawler: true,
-                node: false
+                node: false,
+                runtime: true
             }
-        });
+        }));
     });
 
     it('keeps crawler false when syncStatus is stopped', async () => {
@@ -343,14 +350,15 @@ describe('getReadiness', () => {
         });
 
         const result = await srv.send('getReadiness');
-        expect(result).toEqual({
+        expect(result).toEqual(expect.objectContaining({
             ready: false,
             checks: {
                 database: true,
                 crawler: false,
-                node: true
+                node: true,
+                runtime: true
             }
-        });
+        }));
     });
 });
 

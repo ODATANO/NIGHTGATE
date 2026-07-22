@@ -21,8 +21,12 @@ export interface NightgatePluginConfig {
     crawlerNodeUrl?: string;
     privateStateBackend?: PrivateStateBackend;
     sessionTtlMs?: number;
-    corsOrigin?: string | string[];
-    contentSecurityPolicy?: string | false | 'off';
+    /** Current execution guarantee: one process, one tenant. */
+    runtimeMode?: 'single-instance';
+    /** Declared process/replica count. Values other than 1 fail closed. */
+    replicaCount?: number;
+    /** Emergency-only override for legacy production deployments on SQLite. */
+    allowProductionSqlite?: boolean;
     palletMap?: Record<string, { name: string; txType: string; isShielded?: boolean; isSystem?: boolean }>;
     crawler?: {
         enabled?: boolean;

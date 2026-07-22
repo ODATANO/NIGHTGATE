@@ -9,6 +9,12 @@ const registeredHandlers: Record<string, Function> = vi.hoisted(() => ({}));
 
 vi.mock('@sap/cds', () => {
     const cds: any = {
+        log: (() => {
+            const _c: Record<string, any> = {};
+            return (name: string) => (_c[name] ??= {
+                info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn(), trace: vi.fn()
+            });
+        })(),
         connect: { to: mockDbConnect },
         env: {
             requires: {
@@ -89,14 +95,15 @@ describe('NightgateIndexerService health', () => {
 
         const result = await handler();
 
-        expect(result).toEqual({
+        expect(result).toEqual(expect.objectContaining({
             ready: true,
             checks: {
                 database: true,
                 crawler: true,
-                node: true
+                node: true,
+                runtime: true
             }
-        });
+        }));
     });
 
     it('getReadiness is false when node activity is stale', async () => {
@@ -110,13 +117,14 @@ describe('NightgateIndexerService health', () => {
 
         const result = await handler();
 
-        expect(result).toEqual({
+        expect(result).toEqual(expect.objectContaining({
             ready: false,
             checks: {
                 database: true,
                 crawler: true,
-                node: false
+                node: false,
+                runtime: true
             }
-        });
+        }));
     });
 });

@@ -1,9 +1,8 @@
 import cds from '@sap/cds';
-import crypto from 'crypto';
 import path from 'path';
 
 import { initialize, shutdown, SchemaNotDeployedError } from './index';
-import { getNightgatePluginConfig } from '../srv/utils/nightgate-config';
+const log = cds.log('nightgate');
 import { mountZkConfigRoute, mountContractManifestRoute } from './connector-routes';
 
 const pluginRoot = path.resolve(__dirname, '..');
@@ -26,75 +25,10 @@ function registerModels(): void {
     requires.nightgate.model = modelPaths;
 }
 
-function registerSecurityHeaders(): void {
+function registerConnectorRoutes(): void {
     cds.on('bootstrap', (app: any) => {
-        const nightgateConfig = getNightgatePluginConfig();
-        const corsOrigin = nightgateConfig.corsOrigin || '*';
-        const strictCsp = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'";
-        const fioriPreviewCsp = [
-            "default-src 'self' https://sapui5.hana.ondemand.com https://ui5.sap.com",
-            "script-src 'self' 'unsafe-inline' 'unsafe-eval' https://sapui5.hana.ondemand.com https://ui5.sap.com",
-            "style-src 'self' 'unsafe-inline' https://sapui5.hana.ondemand.com https://ui5.sap.com",
-            "img-src 'self' data: blob: https:",
-            "font-src 'self' data: https://sapui5.hana.ondemand.com https://ui5.sap.com",
-            "connect-src 'self' ws: wss: https://sapui5.hana.ondemand.com https://ui5.sap.com http://localhost:*"
-        ].join('; ');
-        const configuredCsp = typeof nightgateConfig.contentSecurityPolicy === 'string'
-            ? nightgateConfig.contentSecurityPolicy
-            : undefined;
-        const cspDisabled = nightgateConfig.contentSecurityPolicy === false || nightgateConfig.contentSecurityPolicy === 'off';
-
-        app.use((req: any, res: any, next: () => void) => {
-            const isFioriPreview = typeof req.path === 'string' && req.path.startsWith('/$fiori-preview');
-            const isFioriPreviewJs = isFioriPreview && typeof req.path === 'string' && /\.m?js$/i.test(req.path);
-            const correlationId = req.headers['x-correlation-id'] || crypto.randomUUID();
-            req.correlationId = correlationId;
-            res.setHeader('X-Correlation-ID', correlationId);
-
-            res.setHeader('Access-Control-Allow-Origin', corsOrigin);
-            res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS');
-            res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, Accept, X-Correlation-ID');
-            res.setHeader('Access-Control-Max-Age', '86400');
-
-            if (!isFioriPreview) {
-                res.setHeader('X-Content-Type-Options', 'nosniff');
-            }
-            res.setHeader('X-Frame-Options', isFioriPreview ? 'SAMEORIGIN' : 'DENY');
-            res.setHeader('X-XSS-Protection', '0');
-            res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
-
-            // CAP Fiori preview serves Component.js as plain text; force JS MIME for browser loaders.
-            if (isFioriPreviewJs) {
-                res.type('application/javascript; charset=utf-8');
-            }
-
-            // Some UI5 shell startup paths probe a root appconfig URL first.
-            if (req.path === '/appconfig/fioriSandboxConfig.json') {
-                res.redirect(307, '/$fiori-preview/appconfig/fioriSandboxConfig.json');
-                return;
-            }
-
-            // Fiori preview bootstraps UI5 from SAP CDN and uses inline startup scripts.
-            if (!cspDisabled) {
-                res.setHeader('Content-Security-Policy', configuredCsp || (isFioriPreview ? fioriPreviewCsp : strictCsp));
-            }
-
-            if (process.env.NODE_ENV === 'production') {
-                res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
-            }
-
-            if (req.method === 'OPTIONS') {
-                res.status(204).end();
-                return;
-            }
-
-            next();
-        });
-
-        // ZK-config HTTP route + contract-manifest, mounted in the SAME bootstrap
-        // hook (one bootstrap listener total). Under SKIP_AUTO_INIT the registry
-        // is empty so they return 404 / an empty contracts list; registration
-        // itself is cheap.
+        // HTTP policy belongs to the consuming CAP host. NIGHTGATE only owns
+        // these connector endpoints and does not install global middleware.
         mountZkConfigRoute(app);
         mountContractManifestRoute(app);
     });
@@ -106,27 +40,19 @@ function registerLifecycle(): void {
         try {
             await initialize();
         } catch (err) {
-            // SchemaNotDeployedError is the only fatal error initialize() raises.
-            // Print a big, instruction-first block and exit non-zero so the
-            // operator notices, instead of silently half-booting against a stale
-            // schema (the old auto-deploy path would do that on every restart).
+            // A plugin must not terminate the CAP host process. Keep Nightgate
+            // offline (initialize() records the error state) and let the host's
+            // readiness/deployment policy decide whether the process is viable.
             if (err instanceof SchemaNotDeployedError) {
-                console.error('\n');
-                console.error('================================================================');
-                console.error('  NIGHTGATE: schema not deployed');
-                console.error('================================================================');
-                console.error(`  ${err.message}`);
-                console.error('');
-                console.error('  Run this from the project root:');
-                console.error('');
-                console.error('      npm run deploy');
-                console.error('');
-                console.error('================================================================\n');
-                process.exit(1);
+                log.error(
+                    `Nightgate remains offline because its schema is not deployed. ` +
+                    `${err.message}`
+                );
+                return;
             }
-            // Anything else: surface Error but don't kill the server. 
+            // Anything else: surface Error but don't kill the server.
             const msg = err instanceof Error ? err.message : String(err);
-            console.error(`[odatano-nightgate] initialize() failed: ${msg}`);
+            log.error(`initialize() failed: ${msg}`);
         }
     });
 
@@ -137,7 +63,7 @@ function registerLifecycle(): void {
 
 if (!registered) {
     registerModels();
-    registerSecurityHeaders();
+    registerConnectorRoutes();
     registerLifecycle();
     registered = true;
 }
@@ -149,9 +75,9 @@ const plugin = {
                 description: 'Nightgate configuration for @odatano/nightgate',
                 properties: {
                     network: {
-                        description: 'Target Midnight network: testnet | preprod | mainnet | undeployed. "undeployed" is a local standalone stack (midnight-local-dev). Override via NIGHTGATE_NETWORK env var.',
+                        description: 'Target Midnight network: testnet | preview | preprod | mainnet | undeployed. "undeployed" is a local standalone stack (midnight-local-dev). Override via NIGHTGATE_NETWORK env var.',
                         type: 'string',
-                        enum: ['testnet', 'preprod', 'mainnet', 'undeployed'],
+                        enum: ['testnet', 'preview', 'preprod', 'mainnet', 'undeployed'],
                         default: 'preprod'
                     },
                     nodeUrl: {
@@ -203,17 +129,26 @@ const plugin = {
                         type: 'boolean',
                         default: false
                     },
-                    contentSecurityPolicy: {
-                        description: "Optional custom CSP header value. Use 'off' to disable CSP. Defaults to strict API policy and relaxed UI5 policy for /$fiori-preview/*.",
-                        type: 'string'
-                    },
-                    corsOrigin: {
-                        description: "Access-Control-Allow-Origin value for the security-header middleware. Accepts a string or array of origins. Defaults to '*'.",
-                        type: ['string', 'array']
-                    },
                     sessionTtlMs: {
                         description: 'Wallet-session time-to-live in milliseconds before a connected session is treated as expired by the cleanup sweep.',
                         type: 'number'
+                    },
+                    runtimeMode: {
+                        description: "Runtime safety contract. Only 'single-instance' is currently supported.",
+                        type: 'string',
+                        enum: ['single-instance'],
+                        default: 'single-instance'
+                    },
+                    replicaCount: {
+                        description: 'Declared Nightgate process/replica count. Must be exactly 1 until distributed leases are implemented.',
+                        type: 'number',
+                        minimum: 1,
+                        default: 1
+                    },
+                    allowProductionSqlite: {
+                        description: 'Emergency-only compatibility override for production SQLite. Defaults to false; prefer PostgreSQL or SAP HANA.',
+                        type: 'boolean',
+                        default: false
                     },
                     crawler: {
                         description: 'Crawler settings (default: enabled, crawls from Midnight node)',

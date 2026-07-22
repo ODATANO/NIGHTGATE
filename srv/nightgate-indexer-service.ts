@@ -12,8 +12,10 @@ import { resolveNightgateRuntimeConfig, getNightgatePluginConfig } from './utils
 import { ensureSyncStateSingleton } from './utils/sync-state';
 import { isCrawlerRunning, startCrawler, stopCrawler } from './crawler';
 import { rollbackIndexedDataFromHeight, RollbackResult } from './crawler/rollback';
-import { SyncState, ReorgLog } from '#cds-models/midnight';
+import { SyncState, ReorgLog, BackgroundJobs } from '#cds-models/midnight';
+import { getRuntimeTopology } from './utils/runtime-topology';
 
+const log = cds.log('nightgate:indexer');
 const processStartTime = Date.now();
 const metricPrefix = 'odatano_nightgate';
 
@@ -65,7 +67,7 @@ export default class NightgateIndexerService extends cds.ApplicationService {
         try {
             await ensureSyncStateSingleton(this.db);
         } catch (err) {
-            console.warn('[IndexerService] SyncState init skipped:', (err as Error).message);
+            log.warn('SyncState init skipped:', (err as Error).message);
         }
 
         this.on('getSyncStatus', async () => {
@@ -82,6 +84,7 @@ export default class NightgateIndexerService extends cds.ApplicationService {
         });
 
         this.on('getHealth', async () => {
+            const topology = getRuntimeTopology(getNightgatePluginConfig());
             const syncState = await this.db.run(
                 SELECT.one.from(SyncState).where({ ID: 'SINGLETON' })
             );
@@ -95,7 +98,13 @@ export default class NightgateIndexerService extends cds.ApplicationService {
                     lag: 0,
                     finalizedLag: 0,
                     blocksPerSecond: 0,
-                    syncStatus: 'stopped'
+                    syncStatus: 'stopped',
+                    instanceId: topology.instanceId,
+                    runtimeMode: topology.runtimeMode,
+                    replicaCount: topology.replicaCount,
+                    databaseKind: topology.databaseKind,
+                    topologyValid: topology.valid,
+                    runtimeWarnings: [...topology.errors, ...topology.warnings]
                 };
             }
 
@@ -119,7 +128,13 @@ export default class NightgateIndexerService extends cds.ApplicationService {
                 lag,
                 finalizedLag,
                 blocksPerSecond: Number(syncState.blocksPerSecond || 0),
-                syncStatus: syncState.syncStatus || 'stopped'
+                syncStatus: syncState.syncStatus || 'stopped',
+                instanceId: topology.instanceId,
+                runtimeMode: topology.runtimeMode,
+                replicaCount: topology.replicaCount,
+                databaseKind: topology.databaseKind,
+                topologyValid: topology.valid,
+                runtimeWarnings: [...topology.errors, ...topology.warnings]
             };
         });
 
@@ -134,18 +149,22 @@ export default class NightgateIndexerService extends cds.ApplicationService {
         });
 
         this.on('getLiveness', async () => {
+            const topology = getRuntimeTopology(getNightgatePluginConfig());
             return {
                 status: 'alive',
                 timestamp: new Date().toISOString(),
-                uptime: Math.floor((Date.now() - processStartTime) / 1000)
+                uptime: Math.floor((Date.now() - processStartTime) / 1000),
+                instanceId: topology.instanceId
             };
         });
 
         this.on('getReadiness', async () => {
+            const topology = getRuntimeTopology(getNightgatePluginConfig());
             const checks = {
                 database: false,
                 crawler: false,
-                node: false
+                node: false,
+                runtime: topology.valid
             };
 
             try {
@@ -167,8 +186,13 @@ export default class NightgateIndexerService extends cds.ApplicationService {
             }
 
             return {
-                ready: checks.database && checks.crawler && checks.node,
-                checks
+                ready: checks.database && checks.crawler && checks.node && checks.runtime,
+                checks,
+                instanceId: topology.instanceId,
+                runtimeMode: topology.runtimeMode,
+                replicaCount: topology.replicaCount,
+                databaseKind: topology.databaseKind,
+                runtimeWarnings: [...topology.errors, ...topology.warnings]
             };
         });
 
@@ -186,6 +210,22 @@ export default class NightgateIndexerService extends cds.ApplicationService {
             const errors = syncState?.consecutiveErrors || 0;
             const uptimeSec = Math.floor((Date.now() - processStartTime) / 1000);
             const syncStatus = syncState?.syncStatus || 'stopped';
+            const topology = getRuntimeTopology(getNightgatePluginConfig());
+            let jobRows: Array<{ status?: string; createdAt?: string }> = [];
+            try {
+                jobRows = await this.db.run(
+                    SELECT.from(BackgroundJobs).columns('status', 'createdAt')
+                        .where({ status: { in: ['pending', 'running', 'external_execution', 'submitted', 'reconciliation_required'] } })
+                ) || [];
+            } catch {
+                // Metrics must stay available during schema rollout/degraded DB states.
+            }
+            const queuedJobs = jobRows.filter(job => job.status === 'pending');
+            const runningJobs = jobRows.filter(job => ['running', 'external_execution', 'submitted'].includes(job.status || ''));
+            const reconciliationJobs = jobRows.filter(job => job.status === 'reconciliation_required');
+            const oldestQueuedSeconds = queuedJobs.length
+                ? Math.max(0, (Date.now() - Math.min(...queuedJobs.map(job => new Date(job.createdAt || Date.now()).getTime()))) / 1000)
+                : 0;
 
             lines.push(`# HELP ${metricPrefix}_chain_height Current chain height`);
             lines.push(`# TYPE ${metricPrefix}_chain_height gauge`);
@@ -215,6 +255,27 @@ export default class NightgateIndexerService extends cds.ApplicationService {
             lines.push(`# TYPE ${metricPrefix}_sync_status gauge`);
             const statusMap: Record<string, number> = { stopped: 0, syncing: 1, synced: 2, error: 3 };
             lines.push(`${metricPrefix}_sync_status ${statusMap[syncStatus] ?? 0}`);
+
+            lines.push(`# HELP ${metricPrefix}_runtime_topology_valid Runtime topology support (1=supported, 0=unsupported)`);
+            lines.push(`# TYPE ${metricPrefix}_runtime_topology_valid gauge`);
+            lines.push(`${metricPrefix}_runtime_topology_valid ${topology.valid ? 1 : 0}`);
+
+            lines.push(`# HELP ${metricPrefix}_runtime_replicas Declared Nightgate process/replica count`);
+            lines.push(`# TYPE ${metricPrefix}_runtime_replicas gauge`);
+            lines.push(`${metricPrefix}_runtime_replicas ${topology.replicaCount}`);
+            lines.push(`${metricPrefix}_runtime_database_info{kind="${topology.databaseKind}"} 1`);
+            lines.push(`# HELP ${metricPrefix}_jobs_queued Background jobs waiting to execute`);
+            lines.push(`# TYPE ${metricPrefix}_jobs_queued gauge`);
+            lines.push(`${metricPrefix}_jobs_queued ${queuedJobs.length}`);
+            lines.push(`# HELP ${metricPrefix}_jobs_running Background jobs currently executing or submitted`);
+            lines.push(`# TYPE ${metricPrefix}_jobs_running gauge`);
+            lines.push(`${metricPrefix}_jobs_running ${runningJobs.length}`);
+            lines.push(`# HELP ${metricPrefix}_jobs_reconciliation_required Jobs requiring external-state reconciliation`);
+            lines.push(`# TYPE ${metricPrefix}_jobs_reconciliation_required gauge`);
+            lines.push(`${metricPrefix}_jobs_reconciliation_required ${reconciliationJobs.length}`);
+            lines.push(`# HELP ${metricPrefix}_jobs_oldest_queued_seconds Age of the oldest queued job`);
+            lines.push(`# TYPE ${metricPrefix}_jobs_oldest_queued_seconds gauge`);
+            lines.push(`${metricPrefix}_jobs_oldest_queued_seconds ${oldestQueuedSeconds}`);
 
             return lines.join('\n') + '\n';
         });
@@ -287,7 +348,7 @@ export default class NightgateIndexerService extends cds.ApplicationService {
                     crawlerResumed = true;
                 } catch (err) {
                     resumeError = err instanceof Error ? err.message : String(err);
-                    console.error('[IndexerService] Failed to resume crawler after reindex:', resumeError);
+                    log.error('Failed to resume crawler after reindex:', resumeError);
                 }
             }
 

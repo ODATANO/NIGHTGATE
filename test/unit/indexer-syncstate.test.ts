@@ -14,6 +14,12 @@ const registeredHandlers: Record<string, Function> = vi.hoisted(() => ({}));
 
 vi.mock('@sap/cds', () => {
     const cds: any = {
+        log: (() => {
+            const _c: Record<string, any> = {};
+            return (name: string) => (_c[name] ??= {
+                info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn(), trace: vi.fn()
+            });
+        })(),
         connect: { to: mockDbConnect },
         env: {
             requires: {
@@ -50,6 +56,7 @@ vi.mock('@sap/cds', () => {
     return cds;
 });
 
+import cds from '@sap/cds';
 import NightgateIndexerService from '../../srv/nightgate-indexer-service';
 
 describe('IndexerService SyncState', () => {
@@ -91,7 +98,7 @@ describe('IndexerService SyncState', () => {
 
     it('should handle DB error during SyncState init gracefully', async () => {
         mockDbRun.mockRejectedValueOnce(new Error('table not found'));
-        const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+        const warnSpy = vi.spyOn(cds.log('nightgate:indexer'), 'warn').mockImplementation(() => {});
 
         service = new NightgateIndexerService();
         await service.init();

@@ -11,7 +11,8 @@ const ENV_KEYS = [
     'NIGHTGATE_NETWORK',
     'NIGHTGATE_NODE_URL',
     'NIGHTGATE_CRAWLER_NODE_URL',
-    'NIGHTGATE_CRAWLER_ENABLED'
+    'NIGHTGATE_CRAWLER_ENABLED',
+    'NIGHTGATE_REPLICA_COUNT'
 ] as const;
 const originalEnv = Object.fromEntries(ENV_KEYS.map((key) => [key, process.env[key]])) as Record<(typeof ENV_KEYS)[number], string | undefined>;
 
@@ -37,9 +38,20 @@ vi.mock('@sap/cds', () => {
                         __table: table
                     }))
                 }
+            },
+            DELETE: {
+                from: vi.fn((table: unknown) => ({
+                    where: vi.fn((where: unknown) => ({ __kind: 'delete', __table: table, where }))
+                }))
             }
         },
-        deploy: mockCdsDeploy
+        deploy: mockCdsDeploy,
+        log: (() => {
+            const channels: Record<string, any> = {};
+            return (name: string) => (channels[name] ??= {
+                info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn(), trace: vi.fn()
+            });
+        })()
     };
     cds.default = cds;
     return cds;
@@ -69,7 +81,7 @@ vi.mock('../../srv/submission/wallet-facade-builder', () => ({
 }));
 
 import cds from '@sap/cds';
-import { initialize, shutdown } from '../../src/index';
+import { getStatus, initialize, shutdown } from '../../src/index';
 
 describe('runtime initialize', () => {
     beforeEach(async () => {
@@ -112,7 +124,7 @@ describe('runtime initialize', () => {
     });
 
     it('loads the model before DB access, starts the crawler, and logs syncing startup state', async () => {
-        const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+        const logSpy = vi.spyOn(cds.log('nightgate'), 'info').mockImplementation(() => {});
 
         try {
             const status = await initialize();
@@ -130,14 +142,18 @@ describe('runtime initialize', () => {
                 __kind: 'one',
                 __table: 'midnight.SyncState'
             }));
+            expect(mockDbRun).toHaveBeenCalledWith(expect.objectContaining({
+                __kind: 'delete',
+                where: { outcomeSource: null }
+            }));
             expect(mockDbDeploy).not.toHaveBeenCalled();
             expect(mockStartCrawler).toHaveBeenCalledWith(expect.objectContaining({
                 enabled: true,
                 nodeUrl: 'ws://localhost:9944',
                 requestTimeout: 30000
             }));
-            expect(logSpy).toHaveBeenCalledWith('[odatano-nightgate] Initializing crawler and starting catch-up...');
-            expect(logSpy).toHaveBeenCalledWith('[odatano-nightgate] Startup state: syncing (crawler started)');
+            expect(logSpy).toHaveBeenCalledWith('Initializing crawler and starting catch-up...');
+            expect(logSpy).toHaveBeenCalledWith('Startup state: syncing (crawler started)');
             expect(status).toEqual(expect.objectContaining({
                 initialized: true,
                 crawlerEnabled: true,
@@ -149,14 +165,14 @@ describe('runtime initialize', () => {
     });
 
     it('returns idle mode and logs a stopped startup state when the crawler is disabled', async () => {
-        const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+        const logSpy = vi.spyOn(cds.log('nightgate'), 'info').mockImplementation(() => {});
         (cds.env as any).requires.nightgate.crawler = { enabled: false };
 
         try {
             const status = await initialize();
 
             expect(mockStartCrawler).not.toHaveBeenCalled();
-            expect(logSpy).toHaveBeenCalledWith('[odatano-nightgate] Startup state: stopped (crawler disabled)');
+            expect(logSpy).toHaveBeenCalledWith('Startup state: stopped (crawler disabled)');
             expect(status).toEqual(expect.objectContaining({
                 initialized: true,
                 crawlerEnabled: false,
@@ -168,15 +184,15 @@ describe('runtime initialize', () => {
     });
 
     it('logs an offline startup state when crawler startup fails with a node error', async () => {
-        const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
-        const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+        const logSpy = vi.spyOn(cds.log('nightgate'), 'info').mockImplementation(() => {});
+        const warnSpy = vi.spyOn(cds.log('nightgate'), 'warn').mockImplementation(() => {});
         mockStartCrawler.mockRejectedValue(new Error('ECONNREFUSED: connect'));
 
         try {
             const status = await initialize();
 
-            expect(warnSpy).toHaveBeenCalledWith('[odatano-nightgate] Node not reachable at ws://localhost:9944: ECONNREFUSED: connect');
-            expect(logSpy).toHaveBeenCalledWith('[odatano-nightgate] Startup state: offline (node unreachable)');
+            expect(warnSpy).toHaveBeenCalledWith('Node not reachable at ws://localhost:9944: ECONNREFUSED: connect');
+            expect(logSpy).toHaveBeenCalledWith('Startup state: offline (node unreachable)');
             expect(status).toEqual(expect.objectContaining({
                 initialized: true,
                 crawlerEnabled: true,
@@ -205,12 +221,38 @@ describe('runtime initialize', () => {
         expect(err).toBeInstanceOf(SchemaNotDeployedError);
         expect(err.missingTable).toBe('midnight.SyncState');
         expect(err.message).toMatch(/npm run deploy/);
+        expect(getStatus()).toEqual(expect.objectContaining({
+            initialized: false,
+            crawlerEnabled: true,
+            network: 'testnet',
+            nodeUrl: 'ws://localhost:9944',
+            mode: 'offline',
+            lastError: expect.stringContaining('midnight.SyncState')
+        }));
 
         // Crucially: no deploy was attempted, on either path.
         expect(mockDbDeploy).not.toHaveBeenCalled();
         expect(mockCdsDeploy).not.toHaveBeenCalled();
         // Crawler also never started; we fail before any subsequent init step.
         expect(mockStartCrawler).not.toHaveBeenCalled();
+    });
+
+    it('fails closed before schema or worker startup when multiple replicas are declared', async () => {
+        process.env.NIGHTGATE_REPLICA_COUNT = '2';
+
+        const err = await initialize().catch(e => e);
+
+        expect(err.name).toBe('UnsupportedRuntimeTopologyError');
+        expect(err.message).toMatch(/replicaCount is 2/);
+        expect(mockDbRun).not.toHaveBeenCalled();
+        expect(mockStartCrawler).not.toHaveBeenCalled();
+        expect(getStatus()).toEqual(expect.objectContaining({
+            initialized: false,
+            mode: 'offline',
+            runtimeMode: 'single-instance',
+            replicaCount: 2,
+            lastError: expect.stringContaining('replicaCount is 2')
+        }));
     });
 
     it('includes the resolved DB path in the error message', async () => {
@@ -223,7 +265,7 @@ describe('runtime initialize', () => {
     });
 
     it('uses env overrides for preprod startup even when package config has no network', async () => {
-        const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+        const logSpy = vi.spyOn(cds.log('nightgate'), 'info').mockImplementation(() => {});
         delete (cds.env as any).requires.nightgate.network;
         process.env.NIGHTGATE_NETWORK = 'preprod';
         process.env.NIGHTGATE_NODE_URL = 'wss://node.example.test';
@@ -237,8 +279,8 @@ describe('runtime initialize', () => {
                 nodeUrl: 'wss://crawler.example.test',
                 requestTimeout: 30000
             }));
-            expect(logSpy).toHaveBeenCalledWith('[odatano-nightgate] Network: preprod');
-            expect(logSpy).toHaveBeenCalledWith('[odatano-nightgate] Node: wss://node.example.test');
+            expect(logSpy).toHaveBeenCalledWith('Network: preprod');
+            expect(logSpy).toHaveBeenCalledWith('Node: wss://node.example.test');
             expect(status).toEqual(expect.objectContaining({
                 initialized: true,
                 crawlerEnabled: true,

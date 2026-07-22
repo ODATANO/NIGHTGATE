@@ -10,10 +10,15 @@ import {
     DEFAULT_NETWORK
 } from '../srv/utils/nightgate-config';
 import { loadRegistryFromConfig, listRegisteredContracts } from '../srv/submission/contract-registry';
-import { applySqliteTuning } from '../srv/utils/sqlite-tuning';
+const log = cds.log('nightgate');
 import { startWalletWorker, stopWalletWorker } from '../srv/midnight/wallet-worker-client';
 import { wireWorkerStateSaveSink } from '../srv/submission/wallet-facade-builder';
-import { recoverInterruptedJobs } from '../srv/submission/background-jobs';
+import { recoverInterruptedJobs, startBackgroundJobProcessor, stopBackgroundJobProcessor } from '../srv/submission/background-jobs';
+import { TransactionResults } from '#cds-models/midnight';
+import {
+    assertSupportedRuntimeTopology,
+    UnsupportedRuntimeTopologyError
+} from '../srv/utils/runtime-topology';
 
 export type { NightgateConfig } from '../srv/types';
 export { DEFAULT_NETWORK, DEFAULT_NODE_URL } from '../srv/utils/nightgate-config';
@@ -25,6 +30,11 @@ export interface NightgateIndexerStatus {
     nodeUrl?: string;
     mode: 'idle' | 'active' | 'offline';
     lastError?: string;
+    instanceId?: string;
+    runtimeMode?: 'single-instance';
+    replicaCount?: number;
+    databaseKind?: string;
+    runtimeWarnings?: string[];
 }
 
 let initialized = false;
@@ -40,7 +50,7 @@ function isLikelyNodeConnectionError(message: string): boolean {
 
 function logStartupState(state: 'stopped' | 'syncing' | 'offline', detail?: string): void {
     const suffix = detail ? ` (${detail})` : '';
-    console.log(`[odatano-nightgate] Startup state: ${state}${suffix}`);
+    log.info(`Startup state: ${state}${suffix}`);
 }
 
 /**
@@ -49,8 +59,8 @@ function logStartupState(state: 'stopped' | 'syncing' | 'offline', detail?: stri
  * resolved DB URL so the surfaced message is actionable without guessing.
  *
  * Production behaviour (in `src/plugin.ts::registerLifecycle`): this error is
- * caught, logged with a "RUN THIS" block, and the process exits non-zero so
- * the operator notices instead of half-booting against a stale schema.
+ * caught and logged, while Nightgate remains explicitly offline. The plugin
+ * never terminates its CAP host process.
  */
 export class SchemaNotDeployedError extends Error {
     constructor(
@@ -90,6 +100,7 @@ async function ensureSchemaDeployed(): Promise<void> {
         'midnight.Blocks',
         'midnight.SyncState',
         'midnight.PendingSubmissions',
+        'midnight.TransactionResults',
         'midnight.PrivateStates',
         'midnight.ContractSigningKeys',
         'midnight.WalletSyncStates',
@@ -109,6 +120,15 @@ async function ensureSchemaDeployed(): Promise<void> {
             throw new SchemaNotDeployedError(table, resolveDbPath(), probeErr);
         }
     }
+
+    // Pre-0.9 rows were unconditional SUCCESS placeholders. Keeping them would
+    // continue exposing a known-false execution claim through OData. The new
+    // outcomeSource column distinguishes canonical System.Events evidence.
+    const removed = await db.run(
+        cds.ql.DELETE.from(TransactionResults).where({ outcomeSource: null })
+    );
+    const removedCount = typeof removed === 'number' ? removed : Number((removed as any)?.changes ?? 0);
+    if (removedCount > 0) log.warn(`Removed ${removedCount} legacy unverified TransactionResults row(s); re-crawl historical blocks to backfill canonical outcomes`);
 }
 
 /**
@@ -138,32 +158,73 @@ export async function initialize(): Promise<NightgateIndexerStatus> {
     const crawlerEnabled = (crawlerConfig as any).enabled !== false;
 
     if (invalidNetwork) {
-        console.error(`[odatano-nightgate] Invalid network "${invalidNetwork}". Must be one of: ${VALID_NIGHTGATE_NETWORKS.join(', ')}`);
-        console.error(`[odatano-nightgate] Falling back to "${DEFAULT_NETWORK}"`);
+        log.warn(`Invalid network "${invalidNetwork}". Must be one of: ${VALID_NIGHTGATE_NETWORKS.join(', ')}`);
+        log.warn(`Falling back to "${DEFAULT_NETWORK}"`);
     }
 
-    await ensureSchemaDeployed();
-
-    // Tune SQLite for catch-up write throughput. No-op on HANA.
+    let runtimeTopology;
     try {
-        const db = cds.db || await cds.connect.to('db');
-        await applySqliteTuning(db);
+        runtimeTopology = assertSupportedRuntimeTopology(nightgateConfig);
     } catch (err) {
-        console.warn(`[odatano-nightgate] SQLite tuning skipped: ${(err as Error).message}`);
+        const message = err instanceof Error ? err.message : String(err);
+        const rejected = err instanceof UnsupportedRuntimeTopologyError ? err.topology : undefined;
+        initialized = false;
+        lastStatus = {
+            initialized: false,
+            crawlerEnabled,
+            network,
+            nodeUrl,
+            mode: 'offline',
+            lastError: message,
+            instanceId: rejected?.instanceId,
+            runtimeMode: rejected?.runtimeMode,
+            replicaCount: rejected?.replicaCount,
+            databaseKind: rejected?.databaseKind,
+            runtimeWarnings: rejected?.warnings
+        };
+        logStartupState('offline', 'unsupported runtime topology');
+        throw err;
+    }
+    log.info(
+        `Runtime topology accepted: instanceId=${runtimeTopology.instanceId}, ` +
+        `mode=${runtimeTopology.runtimeMode}, replicas=${runtimeTopology.replicaCount}, database=${runtimeTopology.databaseKind}`
+    );
+    for (const warning of runtimeTopology.warnings) log.warn(warning);
+
+    try {
+        await ensureSchemaDeployed();
+    } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        initialized = false;
+        lastStatus = {
+            initialized: false,
+            crawlerEnabled,
+            network,
+            nodeUrl,
+            mode: 'offline',
+            lastError: message,
+            instanceId: runtimeTopology.instanceId,
+            runtimeMode: runtimeTopology.runtimeMode,
+            replicaCount: runtimeTopology.replicaCount,
+            databaseKind: runtimeTopology.databaseKind,
+            runtimeWarnings: runtimeTopology.warnings
+        };
+        logStartupState('offline', 'schema unavailable');
+        throw err;
     }
 
-    // Crash recovery: any BackgroundJobs row that was pending/running when the
-    // previous process exited becomes a ghost forever otherwise. Flip them to
-    // failed:PROCESS_RESTART so callers polling getJobStatus see a definitive
-    // terminal state. Idempotent; safe to run on every boot.
+    // Crash recovery is deliberately asymmetric: versioned commands interrupted
+    // before the external boundary return to the queue; legacy closures become
+    // terminal because they cannot be reconstructed. External execution is
+    // always moved to reconciliation_required and never blindly resubmitted.
     try {
         const recovered = await recoverInterruptedJobs();
         if (recovered > 0) {
-            console.log(`[odatano-nightgate] Recovered ${recovered} interrupted background job(s) as failed:PROCESS_RESTART`);
+            log.info(`Classified ${recovered} interrupted background job(s) for safe restart recovery/reconciliation`);
         }
     } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
-        console.warn(`[odatano-nightgate] Background-job recovery skipped: ${msg}`);
+        log.warn(`Background-job recovery skipped: ${msg}`);
     }
 
 
@@ -173,11 +234,11 @@ export async function initialize(): Promise<NightgateIndexerStatus> {
         loadRegistryFromConfig(nightgateConfig);
         const refs = listRegisteredContracts();
         if (refs.length) {
-            console.log(`[odatano-nightgate] Registered contracts: ${refs.join(', ')}`);
+            log.info(`Registered contracts: ${refs.join(', ')}`);
         }
     } catch (regErr) {
         const msg = regErr instanceof Error ? regErr.message : String(regErr);
-        console.warn(`[odatano-nightgate] Contract registry load warning: ${msg}`);
+        log.warn(`Contract registry load warning: ${msg}`);
     }
 
     // Spin up the wallet worker thread now so it's ready when the first
@@ -187,22 +248,23 @@ export async function initialize(): Promise<NightgateIndexerStatus> {
     try {
         await startWalletWorker();
         wireWorkerStateSaveSink();
-        console.log('[odatano-nightgate] Wallet worker thread ready');
+        await startBackgroundJobProcessor();
+        log.info('Wallet worker thread ready');
     } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
-        console.warn(`[odatano-nightgate] Wallet worker startup failed: ${msg}`);
-        console.warn('[odatano-nightgate] Signing-related operations will fail until restart');
+        log.warn(`Wallet worker startup failed: ${msg}`);
+        log.warn('Signing-related operations will fail until restart');
     }
 
-    console.log(`[odatano-nightgate] Network: ${network}`);
-    console.log(`[odatano-nightgate] Node: ${nodeUrl}`);
+    log.info(`Network: ${network}`);
+    log.info(`Node: ${nodeUrl}`);
 
     let mode: NightgateIndexerStatus['mode'] = crawlerEnabled ? 'active' : 'idle';
     let lastError: string | undefined;
 
     if (crawlerEnabled) {
         try {
-            console.log('[odatano-nightgate] Initializing crawler and starting catch-up...');
+            log.info('Initializing crawler and starting catch-up...');
             await startCrawler({
                 ...(crawlerConfig as Record<string, unknown>),
                 enabled: true,
@@ -214,13 +276,13 @@ export async function initialize(): Promise<NightgateIndexerStatus> {
             lastError = err instanceof Error ? err.message : String(err);
             mode = 'offline';
             if (isLikelyNodeConnectionError(lastError)) {
-                console.warn(`[odatano-nightgate] Node not reachable at ${crawlerNodeUrl}: ${lastError}`);
+                log.warn(`Node not reachable at ${crawlerNodeUrl}: ${lastError}`);
                 logStartupState('offline', 'node unreachable');
-                console.log('[odatano-nightgate] Running in offline mode. Start a Midnight node: docker compose -f docker/docker-compose.yml up -d');
+                log.info('Running in offline mode. Start a Midnight node: docker compose -f docker/docker-compose.yml up -d');
             } else {
-                console.warn(`[odatano-nightgate] Crawler startup failed: ${lastError}`);
+                log.warn(`Crawler startup failed: ${lastError}`);
                 logStartupState('offline', 'startup error');
-                console.log('[odatano-nightgate] Running in offline mode until the startup error is resolved');
+                log.info('Running in offline mode until the startup error is resolved');
             }
         }
     } else {
@@ -234,7 +296,12 @@ export async function initialize(): Promise<NightgateIndexerStatus> {
         network,
         nodeUrl,
         mode,
-        lastError
+        lastError,
+        instanceId: runtimeTopology.instanceId,
+        runtimeMode: runtimeTopology.runtimeMode,
+        replicaCount: runtimeTopology.replicaCount,
+        databaseKind: runtimeTopology.databaseKind,
+        runtimeWarnings: runtimeTopology.warnings
     };
 
     return getStatus();
@@ -245,11 +312,12 @@ export async function initialize(): Promise<NightgateIndexerStatus> {
  * Returns the current status, which will be "idle" after shutdown.
  */
 export async function shutdown(): Promise<void> {
+    stopBackgroundJobProcessor();
     try {
         await stopCrawler();
     } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
-        console.warn(`[odatano-nightgate] Crawler stop error: ${message}`);
+        log.warn(`Crawler stop error: ${message}`);
         lastStatus = {
             ...lastStatus,
             lastError: message
@@ -259,7 +327,7 @@ export async function shutdown(): Promise<void> {
         await stopWalletWorker();
     } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
-        console.warn(`[odatano-nightgate] Wallet worker stop error: ${message}`);
+        log.warn(`Wallet worker stop error: ${message}`);
     }
     initialized = false;
     lastStatus = {
@@ -269,9 +337,7 @@ export async function shutdown(): Promise<void> {
     };
 }
 
-/**
-    * Return the last known status of the Nightgate indexer
- */
+/** Return the last known indexer status. */
 export function getStatus(): NightgateIndexerStatus {
     return { ...lastStatus };
 }

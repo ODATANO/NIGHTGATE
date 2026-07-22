@@ -27,6 +27,12 @@ service NightgateIndexerService {
         finalizedLag    : Integer64;
         blocksPerSecond : Decimal(10, 2);
         syncStatus      : String;
+        instanceId      : String;
+        runtimeMode     : String;
+        replicaCount    : Integer;
+        databaseKind    : String;
+        topologyValid   : Boolean;
+        runtimeWarnings : array of String;
     };
 
     // Get reorg history
@@ -37,6 +43,7 @@ service NightgateIndexerService {
         status    : String;
         timestamp : Timestamp;
         uptime    : Integer;
+        instanceId : String;
     };
 
     // K8s readiness probe, returns 200 only if subsystems are ready
@@ -46,7 +53,13 @@ service NightgateIndexerService {
             database : Boolean;
             crawler  : Boolean;
             node     : Boolean;
+            runtime  : Boolean;
         };
+        instanceId      : String;
+        runtimeMode     : String;
+        replicaCount    : Integer;
+        databaseKind    : String;
+        runtimeWarnings : array of String;
     };
 
     // Prometheus-compatible metrics endpoint
