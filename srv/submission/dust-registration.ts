@@ -1,20 +1,15 @@
 /**
  * DUST registration.
  *
- * Per docs.midnight.network/guides/generating-dust-programmatically, NIGHT
- * UTXOs must be registered for DUST generation before they start producing
- * the fee-token DUST over time. On preprod the initial DUST accrual takes
- * 1-2 minutes after a successful registration tx.
+ * NIGHT UTXOs must be registered for DUST generation before they produce the
+ * fee-token DUST (docs.midnight.network/guides/generating-dust-programmatically).
+ * On preprod the initial accrual takes 1-2 minutes after the registration tx.
  *
- * Implementation: a single RPC to the wallet worker (`walletRegisterDustGeneration`).
- * The worker owns the wallet SDK and runs the entire flow in its own event
- * loop: waitForSyncedState → filter unregistered NIGHT UTXOs → build the
- * registration recipe → finalizeRecipe (ZK proof via proof-server) → submit.
- * No SDK objects ever cross the thread boundary.
- *
- * The caller (`srv/sessions/wallet-sessions.ts::registerForDustGeneration`)
- * ensures the worker has been initialised for `cacheKey` via
- * `getOrBuildWalletFacade(...)` before invoking this function.
+ * A single RPC to the wallet worker (`walletRegisterDustGeneration`) runs the
+ * whole flow in the worker's own event loop (sync → filter → build recipe →
+ * finalizeRecipe → submit); no SDK objects cross the thread boundary. The caller
+ * (`wallet-sessions.ts::registerForDustGeneration`) must have initialised the
+ * worker for `cacheKey` via `getOrBuildWalletFacade(...)` first.
  */
 
 import { walletRegisterDustGeneration, walletDeregisterDustGeneration } from '../midnight/wallet-worker-client';
@@ -53,9 +48,8 @@ export interface RegisterDustGenerationResult {
 export async function registerNightUtxosForDust(
     args: RegisterDustGenerationArgs
 ): Promise<RegisterDustGenerationResult> {
-    // The worker holds the facade (initialised by getOrBuildWalletFacade in
-    // the caller). We delegate the whole flow via one RPC; the worker returns
-    // primitive values that survive the thread boundary cleanly.
+    // Delegate the whole flow via one RPC; the worker returns primitives that
+    // survive the thread boundary.
     return walletRegisterDustGeneration({
         sessionId:           args.cacheKey,
         dustReceiverAddress: args.dustReceiverAddress,

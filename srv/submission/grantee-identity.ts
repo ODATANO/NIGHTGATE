@@ -1,21 +1,21 @@
 /**
  * Grantee-identity binding.
  *
- * The AttestationVault circuit keys disclosure grants by a 32-byte `grantee`.
- * To gate reads on an on-chain grant, NIGHTGATE must turn the authenticated
- * principal (`req.user.id`) into that same 32 bytes. This module owns:
+ * The AttestationVault circuit keys disclosure grants by a 32-byte `grantee`;
+ * gating reads on an on-chain grant means turning the authenticated principal
+ * (`req.user.id`) into that same 32 bytes. This module owns:
  *
- *   1. `deriveGranteeId(kind, input)`: the canonical derivation. THE SAME
- *      function (or its documented scheme) must be used by whoever issues the
- *      grant, or the write-side id and the read-side id won't match.
+ *   1. `deriveGranteeId(kind, input)`: the canonical derivation. The SAME
+ *      function (or its scheme) must be used by whoever issues the grant, or the
+ *      write-side and read-side ids won't match.
  *   2. `resolveGranteeId(req, db, opts)`: look up the principal's registered
- *      granteeId from the `GranteeIdentities` table (scope precedence mirrors
- *      the disclosure-role middleware: a scoped row wins over a global one).
+ *      granteeId from `GranteeIdentities` (a scoped row wins over a global one,
+ *      mirroring the disclosure-role middleware).
  *
  * Binding kind is per-deployment (`cds.requires.nightgate.granteeBinding`,
- * default 'wallet'). The principal→grantee *policy* (proving DID/wallet
- * ownership before a row is written) is the consumer's to own; NIGHTGATE
- * provides the table, derivation, and resolver, not the proofing.
+ * default 'wallet'). The principal→grantee policy (proving DID/wallet ownership
+ * before a row is written) is the consumer's; NIGHTGATE provides the table,
+ * derivation, and resolver, not the proofing.
  */
 import cds from '@sap/cds';
 import { sha256 } from '@noble/hashes/sha256';

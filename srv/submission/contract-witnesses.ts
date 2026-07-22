@@ -1,15 +1,13 @@
 /**
  * Per-contract witness factories.
  *
- * The Midnight Compact compiler emits a `Witnesses<PS>` type per contract:
- * an object whose keys map to off-chain functions that the SDK invokes during
- * circuit execution. For each registered contract we either supply a real
- * witness object built from the caller's wallet session, or fall back to
+ * The Compact compiler emits a `Witnesses<PS>` type per contract: off-chain
+ * functions the SDK invokes during circuit execution. Each registered contract
+ * gets either a real witness object built from the caller's wallet session, or
  * vacant witnesses (only valid for contracts that declare none).
  *
- * The witness factory receives a primitive snapshot of the FacadeEntry
- * (just the bits the witness needs) so we don't smuggle SDK-shaped objects
- * across the worker boundary or test seams.
+ * The factory receives a primitive snapshot (just the bits the witness needs) so
+ * we don't smuggle SDK-shaped objects across the worker boundary or test seams.
  */
 import { hmac } from '@noble/hashes/hmac';
 import { sha256 } from '@noble/hashes/sha256';
@@ -60,11 +58,9 @@ function hexToBytes32(hex: string): Uint8Array {
 }
 
 /**
- * Derives the per-session AttestationVault secret from the wallet seed.
- *
- * Output: 32 raw bytes, fed directly to the `local_secret_key()` witness.
- * Domain-separated by a v1 label so future contracts that need their own
- * secret can derive a fresh one without colliding.
+ * Derives the per-session AttestationVault secret (32 raw bytes) from the wallet
+ * seed, fed directly to the `local_secret_key()` witness. Domain-separated by a
+ * v1 label so future contracts can derive their own without colliding.
  */
 export function deriveAttestationSecret(seedBytes: Uint8Array): Uint8Array {
     return hmac(sha256, seedBytes, new TextEncoder().encode('nightgate/attestation-vault/v1'));
@@ -73,14 +69,10 @@ export function deriveAttestationSecret(seedBytes: Uint8Array): Uint8Array {
 /**
  * Builds the AttestationVault witness object.
  *
- * `local_secret_key()` returns the same 32-byte secret on every call for a
- * given session; that determinism is what `persistentHash(local_secret_key())`
- * inside the circuit relies on to produce a stable `attester_id`.
- *
- * The witness signature matches the generated `Witnesses<PS>` type:
- *   local_secret_key(ctx): [PS, Uint8Array]
- * We pass `ctx.privateState` through unchanged because this witness reads
- * but does not mutate the private state slot.
+ * `local_secret_key()` returns the same 32-byte secret on every call for a given
+ * session; that determinism is what the circuit's
+ * `persistentHash(local_secret_key())` relies on for a stable `attester_id`.
+ * `ctx.privateState` passes through unchanged (this witness reads, never mutates).
  */
 export function buildAttestationVaultWitnesses(input: WitnessFactoryInput): any {
     const secret = input.attestationSecret;

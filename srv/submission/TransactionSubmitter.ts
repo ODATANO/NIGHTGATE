@@ -1,47 +1,31 @@
 /**
- * TransactionSubmitter, server-side submission orchestrator for the
- * Midnight contract path (deploy + call).
- *
- * The SDK invocation runs in a `worker_threads` worker (see
+ * TransactionSubmitter, server-side orchestrator for the Midnight contract path
+ * (deploy + call). The SDK invocation runs in a `worker_threads` worker (see
  * `srv/midnight/wallet-worker.ts`) so the SDK's Effect.ts microtask saturation
- * stays off the main thread. This class is an orchestrator:
+ * stays off the main thread.
  *
- *   1. Insert a `pending` row into PendingSubmissions BEFORE invoking the
- *      worker. The row carries our internal UUID; txHash + contractAddress
- *      are filled in once the worker returns. This is the recovery hook for
- *      the "process crashed mid-submission" case.
- *
+ *   1. Insert a `pending` PendingSubmissions row BEFORE invoking the worker
+ *      (crash-recovery hook); txHash + contractAddress fill in on return.
  *   2. Build a CapDbPrivateStateProvider on the main thread (where the CAP DB
- *      lives) and register it under an ephemeral `proxyId` with the worker
- *      client. The worker creates a thin proxy that round-trips PS CRUD back
- *      to this provider via `private-state-rpc` messages.
+ *      lives) and register it under an ephemeral `proxyId`; the worker's proxy
+ *      round-trips PS CRUD back via `private-state-rpc` messages.
+ *   3. Invoke the worker, which owns the SDK, the cached artifact, and the wallet
+ *      facade, and returns only primitives (no SDK object crosses the boundary).
+ *   4. On success → UPDATE row; the crawler's BlockProcessor later flips it to
+ *      'finalized'.
+ *   5. On failure → mark 'failed' with a classified error (see
+ *      classifySubmissionError).
  *
- *   3. Invoke the worker (`walletDeployContract` / `walletSubmitContractCall`).
- *      The worker owns the SDK, the compiled contract artifact (cached by
- *      name), and the wallet facade. It returns only primitives
- *      (`txHash`, `contractAddress`, `onChainStatus`); no SDK object crosses
- *      the thread boundary.
- *
- *   4. On success → UPDATE row with `{ txHash, contractAddress, status }`.
- *      The crawler's BlockProcessor flips it to 'finalized' once the tx hash
- *      appears in a block.
- *
- *   5. On failure → UPDATE row with `{ status='failed', errorCode, errorMessage }`.
- *      Errors are classified (see classifySubmissionError):
- *        - 1014  permanent (invalid tx), no retry
- *        - 1016  on mainnet: deterministic per forum thread 1190;
- *                fail fast with a known-issue reference. On preprod: retryable.
- *        - TIMEOUT/NETWORK transient, caller may retry
- *        - TxFailedError from SDK, the on-chain status was not SucceedEntirely
- *
- * The submitter does not retry on its own. The OData action callers decide
- * retry policy based on the returned error classification.
+ * The submitter never retries; the OData callers decide retry policy from the
+ * returned classification.
  */
 
 import cds from '@sap/cds';
+import { reportExternalExecution, reportExternalSubmission } from './job-execution-context';
 const { INSERT, UPDATE } = cds.ql;
 import { PendingSubmissions } from '#cds-models/midnight';
 import { ensureNightgateModelLoaded } from '../utils/cds-model';
+const log = cds.log('nightgate:submit');
 import {
     type ContractProvidersConfig,
     type WalletMaterial
@@ -204,6 +188,7 @@ export class TransactionSubmitter {
         try {
             const proxy = await this.registerPrivateStateProxy();
             release = proxy.release;
+            await reportExternalExecution({ submissionId });
             workerResult = await deployFn(this.makeDeployRpcArgs(args, proxy.proxyId));
         } catch (err) {
             release?.();
@@ -223,6 +208,7 @@ export class TransactionSubmitter {
             await this.markFailed(submissionId, classification);
             throw new SubmissionError(submissionId, classification);
         }
+        await reportExternalSubmission({ submissionId, txHash });
 
         const newStatus: SubmissionStatus = onChainStatus === 'SucceedEntirely' ? 'included' : 'failed';
         await this.updateAfterSdk(submissionId, {
@@ -253,6 +239,7 @@ export class TransactionSubmitter {
         try {
             const proxy = await this.registerPrivateStateProxy();
             release = proxy.release;
+            await reportExternalExecution({ submissionId });
             workerResult = await callFn(this.makeCallRpcArgs(args, proxy.proxyId));
         } catch (err) {
             release?.();
@@ -272,6 +259,7 @@ export class TransactionSubmitter {
             await this.markFailed(submissionId, classification);
             throw new SubmissionError(submissionId, classification);
         }
+        await reportExternalSubmission({ submissionId, txHash });
 
         const newStatus: SubmissionStatus = onChainStatus === 'SucceedEntirely' ? 'included' : 'failed';
         await this.updateAfterSdk(submissionId, {
@@ -296,16 +284,12 @@ export class TransactionSubmitter {
     // -- Internals -----------------------------------------------------------
 
     /**
-     * Build a CapDbPrivateStateProvider for this submission and register it
-     * under a fresh `proxyId`. The worker's PS proxy will round-trip CRUD
-     * calls back to the matching main-side instance. `release()` unregisters
-     * the provider; it's safe to call exactly once after the worker RPC
-     * resolves or rejects.
+     * Build a CapDbPrivateStateProvider for this submission and register it under
+     * a fresh `proxyId`; the worker's PS proxy round-trips CRUD back to it.
+     * `release()` unregisters it (call once after the worker RPC settles).
      *
-     * Throws if the configured private-state backend is anything other than
-     * 'cap-db': the legacy LevelDB path is incompatible with worker-routed
-     * submissions (the SDK's LevelDB provider doesn't survive a thread
-     * boundary, and its on-disk format is dev-only per the SDK docs).
+     * Throws for any backend other than 'cap-db': the legacy LevelDB provider
+     * doesn't survive a thread boundary and its on-disk format is dev-only.
      */
     private async registerPrivateStateProxy(): Promise<{ proxyId: string; release: () => void }> {
         const backend = this.deps.walletMaterial.privateStateBackend ?? 'cap-db';
@@ -335,10 +319,9 @@ export class TransactionSubmitter {
     }
 
     /**
-     * The worker stores facades keyed on `accountId` (deterministic per
-     * viewing key), set by the pre-warm in connectWalletForSigning. We must
-     * use the same key when looking up the facade for deploy/call; the OData
-     * user-session UUID would miss. `args.sessionId` is preserved on the
+     * The worker keys facades on `accountId` (deterministic per viewing key, set
+     * by the connectWalletForSigning pre-warm), so deploy/call must look up by
+     * accountId, not the OData session UUID. `args.sessionId` stays on the
      * PendingSubmissions row for audit.
      */
     private makeDeployRpcArgs<PS>(args: DeployArgs<PS>, proxyId: string): WalletDeployContractArgs {
@@ -412,21 +395,29 @@ export class TransactionSubmitter {
     }
 
     private async markFailed(submissionId: string, classification: SubmissionErrorClassification): Promise<void> {
-        const db = await this.getDb();
-        await db.run(
-            UPDATE.entity(PendingSubmissions).set({
-                status: 'failed',
-                errorCode: classification.code,
-                errorMessage: classification.message.slice(0, 500)
-            }).where({ ID: submissionId })
-        );
+        // Best-effort: runs in the error path before the caller throws the
+        // classified SubmissionError, so a write failure here must NOT propagate
+        // and mask the real classification. Swallow and log.
+        try {
+            const db = await this.getDb();
+            await db.run(
+                UPDATE.entity(PendingSubmissions).set({
+                    status: 'failed',
+                    errorCode: classification.code,
+                    errorMessage: classification.message.slice(0, 500)
+                }).where({ ID: submissionId })
+            );
+        } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            log.warn(`markFailed persist failed for ${submissionId}: ${msg}`);
+        }
     }
 }
 
 // ---- Error classification --------------------------------------------------
 
 const KNOWN_ISSUE_1016_MAINNET =
-    'https://forum.midnight.network/t/.../1190 (mainnet 1016 Immediately Dropped deterministic rejection, early May 2026)';
+    'https://forum.midnight.network/t/1190 (mainnet 1016 Immediately Dropped: deterministic rejection, early May 2026)';
 
 /**
  * Classifies a thrown error into a stable code + retryability decision.
@@ -484,11 +475,9 @@ export function classifySubmissionError(err: unknown, network: NightgateNetwork)
 // ---- Reconciliation helper (called by crawler's BlockProcessor) ------------
 
 /**
- * Called by BlockProcessor when a transaction is persisted. If a
- * PendingSubmissions row exists with the same txHash, mark it 'finalized'
- * and attach a JSON snapshot of the indexed tx.
- *
- * No-op if no pending row matches (most txs are not ours).
+ * Called by BlockProcessor when a transaction is persisted. Marks a matching
+ * PendingSubmissions row 'finalized' with a JSON snapshot of the indexed tx.
+ * No-op if none matches (most txs are not ours).
  */
 export async function reconcilePendingSubmission(
     db: any,

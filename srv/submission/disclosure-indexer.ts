@@ -1,21 +1,18 @@
 /**
- * Disclosure-grant chain indexer.
+ * Disclosure-grant chain indexer. Reads the AttestationVault `disclosures`
+ * ledger Map from on-chain state into the `DisclosureGrants` entity, so tier
+ * entitlement is a queryable, chain-derived source of truth (the contract is the
+ * ACL).
  *
- * Reads the AttestationVault `disclosures` ledger Map back out of on-chain
- * state and materializes it into the `DisclosureGrants` entity, so tier
- * entitlement becomes a queryable, chain-derived source of truth (the contract
- * is the ACL).
+ * CENTRAL CONSTRAINT (validated in scripts/spike-disclosure-indexer.mjs): the
+ * OUTER `disclosures` map is NOT iterable (only `member`/`lookup`); the inner
+ * per-payload map and the sibling `attestation_owners` map ARE. So we enumerate
+ * payload hashes via `attestation_owners` (every disclosure is scoped to an
+ * attested payload), then drill into `disclosures.lookup(payloadHash)`.
  *
- * CENTRAL CONSTRAINT (validated in scripts/spike-disclosure-indexer.mjs):
- * the OUTER `disclosures` map exposes only `member`/`lookup`; it is NOT
- * iterable. The inner per-payload map and the sibling `attestation_owners`
- * map ARE iterable. So we enumerate payload hashes via `attestation_owners`
- * (every disclosure is scoped to an attested payload), then drill into
- * `disclosures.lookup(payloadHash)` for the grantee→level entries.
- *
- * The decode + enumerate logic is dependency-injected (`ledger`,
- * `queryContractState`) so it unit-tests without the ESM-only SDK. The thin
- * `reindexDisclosuresForContract` wrapper wires the real providers + artifact.
+ * Decode + enumerate logic is dependency-injected (`ledger`, `queryContractState`)
+ * to unit-test without the ESM-only SDK; `reindexDisclosuresForContract` wires the
+ * real providers + artifact.
  */
 import cds from '@sap/cds';
 import { pathToFileURL } from 'node:url';
@@ -140,10 +137,9 @@ export async function reindexDisclosures(deps: ReindexDeps): Promise<ReindexResu
         }
     }
 
-    // Sweep: an active row for this contract that is no longer on-chain was
-    // revoked. The chain is authoritative, so flip it inactive, but skip rows
-    // touched within the grace window: the queried state may simply not include
-    // a just-submitted grant yet, and sweeping it would deactivate a live grant.
+    // Sweep: an active row no longer on-chain was revoked; flip it inactive. Skip
+    // rows touched within the grace window (queried state may not yet include a
+    // just-submitted grant, and sweeping it would deactivate a live grant).
     const activeRows: any[] = (await db.run(
         SELECT.from(DisclosureGrants).where({ contractAddress, active: true })
     )) || [];

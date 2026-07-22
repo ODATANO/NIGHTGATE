@@ -50,7 +50,7 @@ import {
 import { resolveNightgateRuntimeConfig, type NightgateNetwork, VALID_NIGHTGATE_NETWORKS, resolveOverrideIndexerEndpoints, getConfiguredPrivateStateBackend, getNightgatePluginConfig, mainnetSubmissionBlockReason } from '../utils/nightgate-config';
 import { RateLimiter } from '../utils/rate-limiter';
 import { ensureNetworkId, type ContractProvidersConfig } from '../midnight/providers';
-import { startJob } from './background-jobs';
+import { startJob, runChildCommand, registerBackgroundJobProcessor, registerBackgroundJobReconciliationFinalizer, type BackgroundJobRow, type ReconciliationEvidence } from './background-jobs';
 import { reindexDisclosuresForContract } from './disclosure-indexer';
 import { readAttestationStateForContract } from './attestation-state';
 import { readPredicateStateForContract } from './predicate-state';
@@ -58,7 +58,7 @@ import { deriveGranteeId } from './grantee-identity';
 import { getConfiguredGranteeBinding, isSelfServiceGranteeRegistrationAllowed } from '../utils/nightgate-config';
 import { Documents, Transactions, TransactionResults, PredicateAttestations, DisclosureGrants, GranteeIdentities } from '#cds-models/midnight';
 
-const { INSERT, UPDATE, SELECT } = cds.ql;
+const { INSERT, UPDATE, SELECT, DELETE } = cds.ql;
 
 // 5 deploys / hour / session, deploys are heavyweight; tight bound.
 const deployRateLimiter = new RateLimiter({ windowMs: 60 * 60 * 1000, maxRequests: 5 });
@@ -79,6 +79,15 @@ const reindexRateLimiter = new RateLimiter({ windowMs: 60 * 60 * 1000, maxReques
 
 const SHA256_HEX_RE = /^[0-9a-fA-F]{64}$/;
 const DEFAULT_ATTESTATION_VAULT_REF = 'attestation-vault';
+
+type ContractCommandV1 =
+    | { op: 'deploy'; compiledArtifactRef: string; initialPrivateState: unknown; sponsorSessionId?: string }
+    | { op: 'call'; contractAddress: string; circuit: string; compiledArtifactRef: string; args: unknown[]; initialPrivateState?: unknown; sponsorSessionId?: string; witnessValues?: { attestedValue: string; valueSalt: string }; merkleProof?: { fieldValue: string; siblings: string[]; dirs: boolean[] } }
+    | { op: 'predicateWorkflow'; predicateAttestationId: string; payloadHash: string; contractAddress: string; compiledArtifactRef: string; predicate: string; threshold: string; opCode: number; unit?: string; value: string; salt: string; sponsorSessionId?: string }
+    | { op: 'fieldPredicateWorkflow'; predicateAttestationId: string; payloadHash: string; fieldKey: string; contractAddress: string; compiledArtifactRef: string; predicate: string; threshold: string; opCode: number; unit?: string; value: string; siblings: string[]; dirs: boolean[]; contentRoot?: string; sponsorSessionId?: string }
+    | { op: 'anchorDocument'; documentId: string; payloadHash: string; metadataHash: string; contractAddress: string; compiledArtifactRef: string; sponsorSessionId?: string }
+    | { op: 'grantDisclosure'; disclosureGrantId: string; payloadHash: string; grantee: string; level: number; contractAddress: string; compiledArtifactRef: string; sponsorSessionId?: string }
+    | { op: 'revokeDisclosure'; payloadHash: string; grantee: string; contractAddress: string; compiledArtifactRef: string; sponsorSessionId?: string };
 
 function hexToBytes(hex: string): Uint8Array {
     const out = new Uint8Array(hex.length / 2);
@@ -123,6 +132,212 @@ export function registerSubmissionHandlers(
     const attestationStateReader = options.attestationStateReader ?? readAttestationStateForContract;
     const predicateStateReader = options.predicateStateReader ?? readPredicateStateForContract;
 
+    const executeContractCommand = async (raw: unknown, job: BackgroundJobRow): Promise<unknown> => {
+        const command = raw as ContractCommandV1;
+        if (!command || job.commandVersion !== 1 || !job.sessionId || !job.requestedBy) {
+            throw new Error(`Invalid persisted contract command for job ${job.ID}`);
+        }
+        const callKinds = new Set(['submitContractCall', 'predicateCommitValue', 'predicateProof', 'fieldAnchorRoot', 'fieldPredicateProof']);
+        if ((job.kind === 'deployContract' && command.op !== 'deploy')
+            || (callKinds.has(job.kind) && command.op !== 'call')
+            || (job.kind === 'issuePredicateAttestation' && command.op !== 'predicateWorkflow')
+            || (job.kind === 'issueFieldPredicateAttestation' && command.op !== 'fieldPredicateWorkflow')
+            || (job.kind === 'anchorDocument' && command.op !== 'anchorDocument')
+            || (job.kind === 'grantDisclosure' && command.op !== 'grantDisclosure')
+            || (job.kind === 'revokeDisclosure' && command.op !== 'revokeDisclosure')) {
+            throw new Error(`Persisted command operation '${command.op}' is incompatible with ${job.kind}`);
+        }
+
+        if (command.op === 'predicateWorkflow') {
+            const witnessValues = { attestedValue: command.value, valueSalt: command.salt };
+            await runChildCommand({
+                parent: job, kind: 'predicateCommitValue', step: 'commitValue', commandVersion: 1,
+                request: { circuit: 'commitValue', payloadHash: command.payloadHash },
+                command: { op: 'call', contractAddress: command.contractAddress, circuit: 'commitValue', compiledArtifactRef: command.compiledArtifactRef, args: [command.payloadHash], witnessValues, sponsorSessionId: command.sponsorSessionId }
+            });
+            // Let it propagate: ambiguous child -> ChildReconciliationRequiredError (parent reconciles); definitive rejection -> plain error (parent fails cleanly).
+            const proof: any = await runChildCommand<any>({
+                parent: job, kind: 'predicateProof', step: 'provePredicate', commandVersion: 1,
+                request: { circuit: 'provePredicate', payloadHash: command.payloadHash },
+                command: { op: 'call', contractAddress: command.contractAddress, circuit: 'provePredicate', compiledArtifactRef: command.compiledArtifactRef, args: [command.payloadHash, command.threshold, String(command.opCode)], witnessValues, sponsorSessionId: command.sponsorSessionId }
+            });
+            const provenAt = new Date().toISOString();
+            await db.run(UPDATE.entity(PredicateAttestations).set({ provenTxHash: proof.txHash, provenAt, modifiedAt: provenAt }).where({ ID: command.predicateAttestationId }));
+            return {
+                predicateAttestationId: command.predicateAttestationId, payloadHash: command.payloadHash,
+                claim: { predicate: command.predicate, threshold: command.threshold, unit: command.unit ?? null },
+                proof: { system: 'midnight-compact', circuit: 'provePredicate', verificationMethod: command.contractAddress, proofValue: proof.txHash },
+                ...(command.sponsorSessionId ? { feeSponsor: command.sponsorSessionId } : {})
+            };
+        }
+
+        if (command.op === 'fieldPredicateWorkflow') {
+            if (command.contentRoot) {
+                await runChildCommand({
+                    parent: job, kind: 'fieldAnchorRoot', step: 'anchorContentRoot', commandVersion: 1,
+                    request: { circuit: 'anchorContentRoot', payloadHash: command.payloadHash },
+                    command: { op: 'call', contractAddress: command.contractAddress, circuit: 'anchorContentRoot', compiledArtifactRef: command.compiledArtifactRef, args: [command.payloadHash, command.contentRoot], sponsorSessionId: command.sponsorSessionId }
+                });
+            }
+            const proof: any = await runChildCommand<any>({
+                parent: job, kind: 'fieldPredicateProof', step: 'proveFieldPredicate', commandVersion: 1,
+                request: { circuit: 'proveFieldPredicate', payloadHash: command.payloadHash, fieldKey: command.fieldKey },
+                command: {
+                    op: 'call', contractAddress: command.contractAddress, circuit: 'proveFieldPredicate', compiledArtifactRef: command.compiledArtifactRef,
+                    args: [command.payloadHash, command.fieldKey, command.threshold, String(command.opCode)],
+                    merkleProof: { fieldValue: command.value, siblings: command.siblings, dirs: command.dirs }, sponsorSessionId: command.sponsorSessionId
+                }
+            });
+            const provenAt = new Date().toISOString();
+            await db.run(UPDATE.entity(PredicateAttestations).set({ provenTxHash: proof.txHash, provenAt, modifiedAt: provenAt }).where({ ID: command.predicateAttestationId }));
+            return {
+                predicateAttestationId: command.predicateAttestationId, payloadHash: command.payloadHash, fieldKey: command.fieldKey,
+                claim: { predicate: command.predicate, threshold: command.threshold, unit: command.unit ?? null },
+                proof: { system: 'midnight-compact', circuit: 'proveFieldPredicate', verificationMethod: command.contractAddress, proofValue: proof.txHash },
+                ...(command.sponsorSessionId ? { feeSponsor: command.sponsorSessionId } : {})
+            };
+        }
+        const facadeCfg = facadeConfigFromEnv();
+        await ensureNetworkId(facadeCfg.networkId);
+        const resolved = await contractResolver(command.compiledArtifactRef);
+        const wallet = await walletFactory({
+            sessionId: job.sessionId, db, facadeConfig: facadeCfg, expectedUserId: job.requestedBy
+        });
+        const sponsor = command.sponsorSessionId
+            ? await resolveFeeSponsor({ db, sponsorSessionId: command.sponsorSessionId, requestingUserId: job.requestedBy, config: getNightgatePluginConfig() })
+            : null;
+        await wallet.ensureFacade?.();
+        if (sponsor) await ensureFeeSponsorFacade(sponsor, facadeCfg);
+        const submitter = submitterFactory(buildSubmitterDeps(db, resolved, wallet, sponsor?.accountId));
+
+        if (command.op === 'deploy') {
+            const result = await submitter.deploy({
+                contractName: command.compiledArtifactRef,
+                registration: { artifactPath: resolved.artifactPath, privateStateId: resolved.privateStateId, zkConfigPath: resolved.zkConfigPath },
+                initialPrivateState: command.initialPrivateState,
+                sessionId: job.sessionId
+            });
+            return { submissionId: result.submissionId, txHash: result.txHash, contractAddress: result.contractAddress, status: result.status, ...(sponsor ? { feeSponsor: sponsor.sponsorSessionId } : {}) };
+        }
+
+        if (command.op === 'anchorDocument') {
+            const result = await submitter.call({
+                contractAddress: command.contractAddress, circuit: 'attest',
+                args: [hexToBytes(command.payloadHash), hexToBytes(command.metadataHash)],
+                contractName: command.compiledArtifactRef,
+                registration: { artifactPath: resolved.artifactPath, privateStateId: resolved.privateStateId, zkConfigPath: resolved.zkConfigPath },
+                sessionId: job.sessionId
+            });
+            const anchoredAt = new Date().toISOString();
+            await db.run(UPDATE.entity(Documents).set({ anchoredTxHash: result.txHash, anchoredAt, modifiedAt: anchoredAt }).where({ ID: command.documentId }));
+            return { documentId: command.documentId, attestationId: command.payloadHash, txHash: result.txHash, anchoredAt, ...(sponsor ? { feeSponsor: sponsor.sponsorSessionId } : {}) };
+        }
+
+        if (command.op === 'grantDisclosure' || command.op === 'revokeDisclosure') {
+            const isGrant = command.op === 'grantDisclosure';
+            const result = await submitter.call({
+                contractAddress: command.contractAddress,
+                circuit: isGrant ? 'grantDisclosure' : 'revokeDisclosure',
+                args: isGrant
+                    ? [hexToBytes(command.payloadHash), hexToBytes(command.grantee), BigInt(command.level)]
+                    : [hexToBytes(command.payloadHash), hexToBytes(command.grantee)],
+                contractName: command.compiledArtifactRef,
+                registration: { artifactPath: resolved.artifactPath, privateStateId: resolved.privateStateId, zkConfigPath: resolved.zkConfigPath },
+                sessionId: job.sessionId
+            });
+            const changedAt = new Date().toISOString();
+            if (isGrant) {
+                await db.run(UPDATE.entity(DisclosureGrants).set({ grantedTxHash: result.txHash, modifiedAt: changedAt }).where({ ID: command.disclosureGrantId }));
+            } else {
+                await db.run(UPDATE.entity(DisclosureGrants).set({ revokedTxHash: result.txHash, active: false, modifiedAt: changedAt }).where({ contractAddress: command.contractAddress, payloadHash: command.payloadHash, grantee: command.grantee }));
+            }
+            await reindexAfterSubmit(command.contractAddress, resolved);
+            return { ...(isGrant ? { disclosureGrantId: command.disclosureGrantId, level: command.level } : {}), payloadHash: command.payloadHash, grantee: command.grantee, txHash: result.txHash };
+        }
+
+        let coercedArgs: unknown[];
+        if (job.kind === 'predicateCommitValue') {
+            coercedArgs = [hexToBytes(String(command.args[0]))];
+        } else if (job.kind === 'predicateProof') {
+            coercedArgs = [hexToBytes(String(command.args[0])), BigInt(String(command.args[1])), BigInt(String(command.args[2]))];
+        } else if (job.kind === 'fieldAnchorRoot') {
+            coercedArgs = [hexToBytes(String(command.args[0])), hexToBytes(String(command.args[1]))];
+        } else if (job.kind === 'fieldPredicateProof') {
+            coercedArgs = [hexToBytes(String(command.args[0])), hexToBytes(String(command.args[1])), BigInt(String(command.args[2])), BigInt(String(command.args[3]))];
+        } else {
+            const argTypes = argTypesLoader(resolved.zkConfigPath, command.circuit);
+            coercedArgs = coerceCircuitArgs(command.args, argTypes);
+        }
+        const result = await submitter.call({
+            contractAddress: command.contractAddress,
+            circuit: command.circuit,
+            args: coercedArgs,
+            contractName: command.compiledArtifactRef,
+            initialPrivateState: command.initialPrivateState,
+            witnessValues: command.witnessValues,
+            merkleProof: command.merkleProof,
+            registration: { artifactPath: resolved.artifactPath, privateStateId: resolved.privateStateId, zkConfigPath: resolved.zkConfigPath },
+            sessionId: job.sessionId
+        });
+        return { submissionId: result.submissionId, txHash: result.txHash, contractAddress: result.contractAddress, status: result.status, ...(sponsor ? { feeSponsor: sponsor.sponsorSessionId } : {}) };
+    };
+    registerBackgroundJobProcessor('deployContract', 1, executeContractCommand);
+    registerBackgroundJobProcessor('submitContractCall', 1, executeContractCommand);
+    registerBackgroundJobProcessor('issuePredicateAttestation', 1, executeContractCommand);
+    registerBackgroundJobProcessor('issueFieldPredicateAttestation', 1, executeContractCommand);
+    registerBackgroundJobProcessor('anchorDocument', 1, executeContractCommand);
+    registerBackgroundJobProcessor('grantDisclosure', 1, executeContractCommand);
+    registerBackgroundJobProcessor('revokeDisclosure', 1, executeContractCommand);
+    for (const childKind of ['predicateCommitValue', 'predicateProof', 'fieldAnchorRoot', 'fieldPredicateProof']) {
+        registerBackgroundJobProcessor(childKind, 1, executeContractCommand);
+    }
+
+    const finalizeContractProjection = async (
+        raw: unknown,
+        _job: BackgroundJobRow,
+        evidence: ReconciliationEvidence
+    ): Promise<unknown> => {
+        const command = raw as ContractCommandV1;
+        const changedAt = evidence.finalizedAt ?? new Date().toISOString();
+        if (command.op === 'anchorDocument') {
+            await db.run(UPDATE.entity(Documents).set({
+                anchoredTxHash: evidence.txHash, anchoredAt: changedAt, modifiedAt: changedAt
+            }).where({ ID: command.documentId }));
+            return {
+                reconciled: true, documentId: command.documentId,
+                attestationId: command.payloadHash, txHash: evidence.txHash, anchoredAt: changedAt,
+                ...(command.sponsorSessionId ? { feeSponsor: command.sponsorSessionId } : {})
+            };
+        }
+        if (command.op === 'grantDisclosure' || command.op === 'revokeDisclosure') {
+            const isGrant = command.op === 'grantDisclosure';
+            if (isGrant) {
+                await db.run(UPDATE.entity(DisclosureGrants).set({
+                    grantedTxHash: evidence.txHash, modifiedAt: changedAt
+                }).where({ ID: command.disclosureGrantId }));
+            } else {
+                await db.run(UPDATE.entity(DisclosureGrants).set({
+                    revokedTxHash: evidence.txHash, active: false, modifiedAt: changedAt
+                }).where({
+                    contractAddress: command.contractAddress,
+                    payloadHash: command.payloadHash,
+                    grantee: command.grantee
+                }));
+            }
+            const resolved = await contractResolver(command.compiledArtifactRef);
+            await reindexAfterSubmit(command.contractAddress, resolved);
+            return {
+                reconciled: true,
+                ...(isGrant ? { disclosureGrantId: command.disclosureGrantId, level: command.level } : {}),
+                payloadHash: command.payloadHash, grantee: command.grantee, txHash: evidence.txHash
+            };
+        }
+        throw new Error(`Unsupported projection finalizer operation '${(command as any)?.op}'`);
+    };
+    registerBackgroundJobReconciliationFinalizer('anchorDocument', 1, finalizeContractProjection);
+    registerBackgroundJobReconciliationFinalizer('grantDisclosure', 1, finalizeContractProjection);
+    registerBackgroundJobReconciliationFinalizer('revokeDisclosure', 1, finalizeContractProjection);
+
     srv.on('deployContract', async (req: Request) => {
         const { compiledArtifactRef, sessionId, initialPrivateState, idempotencyKey, sponsorSessionId } = req.data as {
             compiledArtifactRef?: string;
@@ -144,44 +359,29 @@ export function registerSubmissionHandlers(
             catch { return req.reject(400, 'initialPrivateState must be valid JSON'); }
         }
 
-        // Sync setup phase (on req.tx, translates the well-known setup errors
-        // 404/401/501 into status codes via runSubmission). The actual SDK
-        // round-trip is deferred to startJob's `work` and surfaces failures
-        // via BackgroundJobs.errorCode/errorMessage instead of OData status.
+        // Sync setup phase: setup errors become 404/401/501 via runSubmission.
+        // The SDK round-trip is deferred to the background job and surfaces
+        // failures via BackgroundJobs.errorCode/errorMessage, not OData status.
         return runSubmission(req, async () => {
             const facadeCfg = facadeConfigFromEnv();
             await ensureNetworkId(facadeCfg.networkId);
-            const resolved = await contractResolver(compiledArtifactRef);
-            const wallet = await walletFactory({ sessionId, db, facadeConfig: facadeCfg, expectedUserId: (req as any).user?.id });
+            await contractResolver(compiledArtifactRef);
+            await walletFactory({ sessionId, db, facadeConfig: facadeCfg, expectedUserId: (req as any).user?.id });
             const sponsor = await resolveSponsorForRequest(req, sponsorSessionId);
-            const submitter = submitterFactory(buildSubmitterDeps(db, resolved, wallet, sponsor?.accountId));
 
             return startJob({
                 kind: 'deployContract',
                 sessionId,
                 idempotencyKey,
                 request: { compiledArtifactRef, sessionId, hasInitialState: !!initialPrivateState, feeSponsor: sponsor?.sponsorSessionId ?? null },
-                work: async () => {
-                    await wallet.ensureFacade?.();
-                    if (sponsor) await ensureFeeSponsorFacade(sponsor, facadeCfg);
-                    const result = await submitter.deploy({
-                        contractName: compiledArtifactRef,
-                        registration: {
-                            artifactPath: resolved.artifactPath,
-                            privateStateId: resolved.privateStateId,
-                            zkConfigPath: resolved.zkConfigPath
-                        },
-                        initialPrivateState: parsedInitialState,
-                        sessionId
-                    });
-                    return {
-                        submissionId: result.submissionId,
-                        txHash: result.txHash,
-                        contractAddress: result.contractAddress,
-                        status: result.status,
-                        ...(sponsor ? { feeSponsor: sponsor.sponsorSessionId } : {})
-                    };
-                }
+                idempotencyPayload: {
+                    compiledArtifactRef, sessionId, initialPrivateState: parsedInitialState,
+                    feeSponsor: sponsor?.sponsorSessionId ?? null
+                },
+                requestedBy: (req as any).user?.id,
+                commandVersion: 1,
+                encryptCommand: true,
+                command: { op: 'deploy', compiledArtifactRef, initialPrivateState: parsedInitialState, sponsorSessionId: sponsor?.sponsorSessionId }
             });
         });
     });
@@ -230,46 +430,29 @@ export function registerSubmissionHandlers(
             await ensureNetworkId(facadeCfg.networkId);
             const resolved = await contractResolver(compiledArtifactRef);
 
-            // Coerce JSON-parsed args into the value shapes the compiled circuit
-            // requires (Bytes<N> → Uint8Array, Uint<N> → BigInt) before the
-            // worker spreads them into fn(...callArgs). CoercionError → 400 via
-            // runSubmission. See srv/submission/arg-coercion.ts.
+            // Coerce args into the shapes the circuit requires (Bytes<N> →
+            // Uint8Array, Uint<N> → BigInt) before the worker spreads them.
+            // CoercionError → 400 via runSubmission. See arg-coercion.ts.
             const argTypes = argTypesLoader(resolved.zkConfigPath, circuit);
             const coercedArgs = coerceCircuitArgs(parsedArgs, argTypes);
 
-            const wallet = await walletFactory({ sessionId, db, facadeConfig: facadeCfg, expectedUserId: (req as any).user?.id });
+            await walletFactory({ sessionId, db, facadeConfig: facadeCfg, expectedUserId: (req as any).user?.id });
             const sponsor = await resolveSponsorForRequest(req, sponsorSessionId);
-            const submitter = submitterFactory(buildSubmitterDeps(db, resolved, wallet, sponsor?.accountId));
 
             return startJob({
                 kind: 'submitContractCall',
                 sessionId,
                 idempotencyKey,
                 request: { contractAddress, circuit, compiledArtifactRef, sessionId, argCount: coercedArgs.length, feeSponsor: sponsor?.sponsorSessionId ?? null },
-                work: async () => {
-                    await wallet.ensureFacade?.();
-                    if (sponsor) await ensureFeeSponsorFacade(sponsor, facadeCfg);
-                    const result = await submitter.call({
-                        contractAddress,
-                        circuit,
-                        args: coercedArgs,
-                        contractName: compiledArtifactRef,
-                        registration: {
-                            artifactPath: resolved.artifactPath,
-                            privateStateId: resolved.privateStateId,
-                            zkConfigPath: resolved.zkConfigPath
-                        },
-                        sessionId,
-                        initialPrivateState: parsedInitialPrivateState
-                    });
-                    return {
-                        submissionId: result.submissionId,
-                        txHash: result.txHash,
-                        contractAddress: result.contractAddress,
-                        status: result.status,
-                        ...(sponsor ? { feeSponsor: sponsor.sponsorSessionId } : {})
-                    };
-                }
+                idempotencyPayload: {
+                    contractAddress, circuit, compiledArtifactRef, sessionId,
+                    args: parsedArgs, initialPrivateState: parsedInitialPrivateState,
+                    feeSponsor: sponsor?.sponsorSessionId ?? null
+                },
+                requestedBy: (req as any).user?.id,
+                commandVersion: 1,
+                encryptCommand: true,
+                command: { op: 'call', contractAddress, circuit, compiledArtifactRef, args: parsedArgs, initialPrivateState: parsedInitialPrivateState, sponsorSessionId: sponsor?.sponsorSessionId }
             });
         });
     });
@@ -304,16 +487,14 @@ export function registerSubmissionHandlers(
         if (rejectIfMainnetBlocked(req)) return;
         if (!checkRate(anchorRateLimiter, data.sessionId, req)) return;
 
-        // Compute the on-chain inputs: payload_hash from the caller's sha256
-        // and metadata_hash from the public metadata blob. Both are 32-byte
-        // commitments; the actual bytes live off-chain at `storageRef`.
-        const payloadHashBytes = hexToBytes(data.sha256);
+        // On-chain inputs: payload_hash (caller's sha256) + metadata_hash (of the
+        // public metadata blob). Both 32-byte commitments; bytes live off-chain
+        // at `storageRef`.
         const metadataHashBytes = sha256(new TextEncoder().encode(metadataStr));
 
-        // Insert the Documents row up-front on req.tx so the row ID is stable
-        // and immediately queryable, even though the on-chain anchoring is
-        // deferred to the background job. Mirrors the PendingSubmissions
-        // pattern: clients have a handle to retry against without polling.
+        // Insert the Documents row up-front so its ID is stable and queryable
+        // while the on-chain anchoring is deferred to the background job. Gives
+        // clients a stable handle without polling.
         const documentId = cds.utils.uuid();
         const insertedAt = new Date().toISOString();
         await db.run(INSERT.into(Documents).entries({
@@ -328,15 +509,14 @@ export function registerSubmissionHandlers(
             modifiedAt: insertedAt
         }));
 
-        // Sync setup (errors here become 404/401/501 via runSubmission); the
-        // SDK round-trip + Documents UPDATE move into the background job.
+        // Sync setup (errors → 404/401/501 via runSubmission); SDK round-trip +
+        // Documents UPDATE run in the background job.
         return runSubmission(req, async () => {
             const facadeCfg = facadeConfigFromEnv();
             await ensureNetworkId(facadeCfg.networkId);
-            const resolved = await contractResolver(compiledRef);
-            const wallet = await walletFactory({ sessionId: data.sessionId!, db, facadeConfig: facadeCfg, expectedUserId: (req as any).user?.id });
+            await contractResolver(compiledRef);
+            await walletFactory({ sessionId: data.sessionId!, db, facadeConfig: facadeCfg, expectedUserId: (req as any).user?.id });
             const sponsor = await resolveSponsorForRequest(req, data.sponsorSessionId);
-            const submitter = submitterFactory(buildSubmitterDeps(db, resolved, wallet, sponsor?.accountId));
 
             const job = await startJob({
                 kind: 'anchorDocument',
@@ -349,38 +529,23 @@ export function registerSubmissionHandlers(
                     documentId,
                     feeSponsor: sponsor?.sponsorSessionId ?? null
                 },
-                work: async () => {
-                    await wallet.ensureFacade?.();
-                    if (sponsor) await ensureFeeSponsorFacade(sponsor, facadeCfg);
-                    const result = await submitter.call({
-                        contractAddress: data.contractAddress!,
-                        circuit: 'attest',
-                        args: [payloadHashBytes, metadataHashBytes],
-                        contractName: compiledRef,
-                        registration: {
-                            artifactPath: resolved.artifactPath,
-                            privateStateId: resolved.privateStateId,
-                            zkConfigPath: resolved.zkConfigPath
-                        },
-                        sessionId: data.sessionId!
-                    });
-
-                    const anchoredAt = new Date().toISOString();
-                    await db.run(UPDATE.entity(Documents)
-                        .set({ anchoredTxHash: result.txHash, anchoredAt, modifiedAt: anchoredAt })
-                        .where({ ID: documentId }));
-
-                    return {
-                        documentId,
-                        attestationId: data.sha256!.toLowerCase(),
-                        txHash: result.txHash,
-                        anchoredAt,
-                        ...(sponsor ? { feeSponsor: sponsor.sponsorSessionId } : {})
-                    };
+                idempotencyPayload: {
+                    sha256: data.sha256!.toLowerCase(), contractAddress: data.contractAddress,
+                    compiledRef, metadata: metadataStr, feeSponsor: sponsor?.sponsorSessionId ?? null
+                },
+                requestedBy: (req as any).user?.id,
+                commandVersion: 1,
+                encryptCommand: true,
+                command: {
+                    op: 'anchorDocument', documentId, payloadHash: data.sha256!.toLowerCase(),
+                    metadataHash: bytesToHex(metadataHashBytes), contractAddress: data.contractAddress!,
+                    compiledArtifactRef: compiledRef, sponsorSessionId: sponsor?.sponsorSessionId
                 }
             });
 
-            return { jobId: job.jobId, status: job.status, documentId };
+            if (job.deduplicated) await db.run(DELETE.from(Documents).where({ ID: documentId }));
+            const stableDocumentId = (job.originalRequest as any)?.documentId ?? documentId;
+            return { jobId: job.jobId, status: job.status, documentId: stableDocumentId };
         });
     });
 
@@ -419,15 +584,15 @@ export function registerSubmissionHandlers(
             if (txRow?.ID) {
                 const result: any = await db.run(
                     SELECT.one.from(TransactionResults)
-                        .columns('status')
+                        .columns('status', 'outcomeSource')
                         .where({ transaction_ID: txRow.ID })
                 );
-                chainSuccess = result?.status === 'SUCCESS';
+                chainSuccess = result?.status === 'SUCCESS'
+                    && result?.outcomeSource === 'substrate-system-events';
             } else if (contractAddress && liveProviderConfigured()) {
-                // Crawler-free fallback: the anchoring tx is not in the local
-                // Transactions table (crawler off or lagging). Confirm the effect
-                // directly against live contract state; the document's sha256 is
-                // its on-chain payload_hash, so a present attestation IS the proof.
+                // Crawler-free fallback (anchoring tx not indexed locally): confirm
+                // the effect against live state. The document's sha256 is its
+                // on-chain payload_hash, so a present attestation IS the proof.
                 chainSuccess = await verifyDocumentViaState(
                     contractAddress, doc.sha256, compiledArtifactRef);
             }
@@ -497,14 +662,8 @@ export function registerSubmissionHandlers(
         if (rejectIfMainnetBlocked(req)) return;
         if (!checkRate(predicateRateLimiter, data.sessionId, req)) return;
 
-        const payloadHashBytes = hexToBytes(data.payloadHash);
-        // The hidden value + salt travel ONLY as circuit witnesses, never as a
-        // circuit arg, never persisted. This is what keeps the value private.
-        const witnessValues = { attestedValue: valueBig.toString(), valueSalt: saltHex };
-
-        // Insert the row up-front (mirrors anchorDocument): stable handle the
-        // caller can poll independently of getJobStatus. Note: `value`/`salt`
-        // are intentionally NOT stored.
+        // Row up-front (mirrors anchorDocument): a stable pollable handle.
+        // `value`/`salt` are intentionally NOT stored.
         const predicateAttestationId = cds.utils.uuid();
         const insertedAt = new Date().toISOString();
         await db.run(INSERT.into(PredicateAttestations).entries({
@@ -528,15 +687,9 @@ export function registerSubmissionHandlers(
         return runSubmission(req, async () => {
             const facadeCfg = facadeConfigFromEnv();
             await ensureNetworkId(facadeCfg.networkId);
-            const resolved = await contractResolver(compiledRef);
-            const wallet = await walletFactory({ sessionId: data.sessionId!, db, facadeConfig: facadeCfg, expectedUserId: (req as any).user?.id });
+            await contractResolver(compiledRef);
+            await walletFactory({ sessionId: data.sessionId!, db, facadeConfig: facadeCfg, expectedUserId: (req as any).user?.id });
             const sponsor = await resolveSponsorForRequest(req, data.sponsorSessionId);
-            const submitter = submitterFactory(buildSubmitterDeps(db, resolved, wallet, sponsor?.accountId));
-            const registration = {
-                artifactPath: resolved.artifactPath,
-                privateStateId: resolved.privateStateId,
-                zkConfigPath: resolved.zkConfigPath
-            };
 
             const job = await startJob({
                 kind: 'issuePredicateAttestation',
@@ -550,58 +703,27 @@ export function registerSubmissionHandlers(
                     predicateAttestationId,
                     feeSponsor: sponsor?.sponsorSessionId ?? null
                 },
-                work: async () => {
-                    await wallet.ensureFacade?.();
-                    if (sponsor) await ensureFeeSponsorFacade(sponsor, facadeCfg);
-                    // 1. Bind the numeric commitment to the attestation. The
-                    //    commitment is computed in-circuit from the witnesses.
-                    await submitter.call({
-                        contractAddress: data.contractAddress!,
-                        circuit: 'commitValue',
-                        args: [payloadHashBytes],
-                        contractName: compiledRef,
-                        registration,
-                        sessionId: data.sessionId!,
-                        witnessValues
-                    });
-                    // 2. Prove the predicate. The ledger only accepts this tx if
-                    //    the in-circuit asserts (commitment match + predicate)
-                    //    held, so a successful tx IS the verified proof.
-                    const proof = await submitter.call({
-                        contractAddress: data.contractAddress!,
-                        circuit: 'provePredicate',
-                        args: [payloadHashBytes, thresholdBig, BigInt(op)],
-                        contractName: compiledRef,
-                        registration,
-                        sessionId: data.sessionId!,
-                        witnessValues
-                    });
-
-                    const provenAt = new Date().toISOString();
-                    await db.run(UPDATE.entity(PredicateAttestations)
-                        .set({ provenTxHash: proof.txHash, provenAt, modifiedAt: provenAt })
-                        .where({ ID: predicateAttestationId }));
-
-                    return {
-                        predicateAttestationId,
-                        payloadHash: data.payloadHash!.toLowerCase(),
-                        claim: {
-                            predicate: data.predicate,
-                            threshold: String(data.threshold),
-                            unit: data.unit ?? null
-                        },
-                        proof: {
-                            system: 'midnight-compact',
-                            circuit: 'provePredicate',
-                            verificationMethod: data.contractAddress,
-                            proofValue: proof.txHash
-                        },
-                        ...(sponsor ? { feeSponsor: sponsor.sponsorSessionId } : {})
-                    };
+                idempotencyPayload: {
+                    payloadHash: data.payloadHash!.toLowerCase(), contractAddress: data.contractAddress,
+                    predicate: data.predicate, threshold: String(data.threshold),
+                    value: data.value, salt: data.salt, valueCommitment: data.valueCommitment,
+                    feeSponsor: sponsor?.sponsorSessionId ?? null
+                },
+                requestedBy: (req as any).user?.id,
+                commandVersion: 1,
+                encryptCommand: true,
+                command: {
+                    op: 'predicateWorkflow', predicateAttestationId,
+                    payloadHash: data.payloadHash!.toLowerCase(), contractAddress: data.contractAddress!,
+                    compiledArtifactRef: compiledRef, predicate: data.predicate!, threshold: thresholdBig.toString(),
+                    opCode: op, unit: data.unit, value: valueBig.toString(), salt: saltHex,
+                    sponsorSessionId: sponsor?.sponsorSessionId
                 }
             });
 
-            return { jobId: job.jobId, status: job.status, predicateAttestationId };
+            if (job.deduplicated) await db.run(DELETE.from(PredicateAttestations).where({ ID: predicateAttestationId }));
+            const stablePredicateId = (job.originalRequest as any)?.predicateAttestationId ?? predicateAttestationId;
+            return { jobId: job.jobId, status: job.status, predicateAttestationId: stablePredicateId };
         });
     });
 
@@ -669,14 +791,6 @@ export function registerSubmissionHandlers(
         if (rejectIfMainnetBlocked(req)) return;
         if (!checkRate(predicateRateLimiter, data.sessionId, req)) return;
 
-        const payloadHashBytes = hexToBytes(data.payloadHash);
-        const fieldKeyBytes = hexToBytes(data.fieldKey);
-        const contentRootBytes = data.contentRoot ? hexToBytes(data.contentRoot) : null;
-        // The field value + inclusion path travel ONLY as circuit witnesses,
-        // never as circuit args, never persisted. This keeps the value private
-        // while binding it to the anchored content root.
-        const merkleProof = { fieldValue: valueBig.toString(), siblings: siblings.map(s => s.toLowerCase()), dirs: dirsBool };
-
         // Row up-front (same shape as issuePredicateAttestation; field-agnostic).
         const predicateAttestationId = cds.utils.uuid();
         const insertedAt = new Date().toISOString();
@@ -701,15 +815,9 @@ export function registerSubmissionHandlers(
         return runSubmission(req, async () => {
             const facadeCfg = facadeConfigFromEnv();
             await ensureNetworkId(facadeCfg.networkId);
-            const resolved = await contractResolver(compiledRef);
-            const wallet = await walletFactory({ sessionId: data.sessionId!, db, facadeConfig: facadeCfg, expectedUserId: (req as any).user?.id });
+            await contractResolver(compiledRef);
+            await walletFactory({ sessionId: data.sessionId!, db, facadeConfig: facadeCfg, expectedUserId: (req as any).user?.id });
             const sponsor = await resolveSponsorForRequest(req, data.sponsorSessionId);
-            const submitter = submitterFactory(buildSubmitterDeps(db, resolved, wallet, sponsor?.accountId));
-            const registration = {
-                artifactPath: resolved.artifactPath,
-                privateStateId: resolved.privateStateId,
-                zkConfigPath: resolved.zkConfigPath
-            };
 
             const job = await startJob({
                 kind: 'issueFieldPredicateAttestation',
@@ -724,62 +832,30 @@ export function registerSubmissionHandlers(
                     predicateAttestationId,
                     feeSponsor: sponsor?.sponsorSessionId ?? null
                 },
-                work: async () => {
-                    await wallet.ensureFacade?.();
-                    if (sponsor) await ensureFeeSponsorFacade(sponsor, facadeCfg);
-                    // 1. Anchor the content root (idempotent overwrite) if supplied,
-                    //    so proveFieldPredicate has a root to bind against. Uses only
-                    //    the attester-identity witness (no value/proof witnesses).
-                    if (contentRootBytes) {
-                        await submitter.call({
-                            contractAddress: data.contractAddress!,
-                            circuit: 'anchorContentRoot',
-                            args: [payloadHashBytes, contentRootBytes],
-                            contractName: compiledRef,
-                            registration,
-                            sessionId: data.sessionId!
-                        });
-                    }
-                    // 2. Prove the field-bound predicate. The ledger only accepts
-                    //    this tx if the in-circuit asserts (Merkle root match +
-                    //    predicate) held, so a successful tx IS the verified proof
-                    //    that THIS passport field satisfies the predicate.
-                    const proof = await submitter.call({
-                        contractAddress: data.contractAddress!,
-                        circuit: 'proveFieldPredicate',
-                        args: [payloadHashBytes, fieldKeyBytes, thresholdBig, BigInt(op)],
-                        contractName: compiledRef,
-                        registration,
-                        sessionId: data.sessionId!,
-                        merkleProof
-                    });
-
-                    const provenAt = new Date().toISOString();
-                    await db.run(UPDATE.entity(PredicateAttestations)
-                        .set({ provenTxHash: proof.txHash, provenAt, modifiedAt: provenAt })
-                        .where({ ID: predicateAttestationId }));
-
-                    return {
-                        predicateAttestationId,
-                        payloadHash: data.payloadHash!.toLowerCase(),
-                        fieldKey: data.fieldKey!.toLowerCase(),
-                        claim: {
-                            predicate: data.predicate,
-                            threshold: String(data.threshold),
-                            unit: data.unit ?? null
-                        },
-                        proof: {
-                            system: 'midnight-compact',
-                            circuit: 'proveFieldPredicate',
-                            verificationMethod: data.contractAddress,
-                            proofValue: proof.txHash
-                        },
-                        ...(sponsor ? { feeSponsor: sponsor.sponsorSessionId } : {})
-                    };
+                idempotencyPayload: {
+                    payloadHash: data.payloadHash!.toLowerCase(), fieldKey: data.fieldKey!.toLowerCase(),
+                    contractAddress: data.contractAddress, predicate: data.predicate,
+                    threshold: String(data.threshold), value: data.value,
+                    contentRoot: data.contentRoot, siblingsJson: data.siblingsJson, dirsJson: data.dirsJson,
+                    feeSponsor: sponsor?.sponsorSessionId ?? null
+                },
+                requestedBy: (req as any).user?.id,
+                commandVersion: 1,
+                encryptCommand: true,
+                command: {
+                    op: 'fieldPredicateWorkflow', predicateAttestationId,
+                    payloadHash: data.payloadHash!.toLowerCase(), fieldKey: data.fieldKey!.toLowerCase(),
+                    contractAddress: data.contractAddress!, compiledArtifactRef: compiledRef,
+                    predicate: data.predicate!, threshold: thresholdBig.toString(), opCode: op,
+                    unit: data.unit, value: valueBig.toString(), siblings: siblings.map(s => s.toLowerCase()),
+                    dirs: dirsBool, contentRoot: data.contentRoot?.toLowerCase(),
+                    sponsorSessionId: sponsor?.sponsorSessionId
                 }
             });
 
-            return { jobId: job.jobId, status: job.status, predicateAttestationId };
+            if (job.deduplicated) await db.run(DELETE.from(PredicateAttestations).where({ ID: predicateAttestationId }));
+            const stablePredicateId = (job.originalRequest as any)?.predicateAttestationId ?? predicateAttestationId;
+            return { jobId: job.jobId, status: job.status, predicateAttestationId: stablePredicateId };
         });
     });
 
@@ -793,9 +869,8 @@ export function registerSubmissionHandlers(
         if (!row) return req.reject(404, `PredicateAttestation ${predicateAttestationId} not found`);
 
         const provenOk = Boolean(row.provenTxHash);
-        // Same chain-success check as verifyDocument: the proof tx must resolve
-        // to an indexed SUCCESS result. Only then is the on-chain predicate
-        // verification trustworthy.
+        // Same check as verifyDocument: the proof tx must resolve to an indexed
+        // SUCCESS result before the predicate verification is trustworthy.
         let chainSuccess = false;
         if (provenOk) {
             const txRow: any = await db.run(
@@ -803,16 +878,16 @@ export function registerSubmissionHandlers(
             );
             if (txRow?.ID) {
                 const result: any = await db.run(
-                    SELECT.one.from(TransactionResults).columns('status').where({ transaction_ID: txRow.ID })
+                    SELECT.one.from(TransactionResults).columns('status', 'outcomeSource').where({ transaction_ID: txRow.ID })
                 );
-                chainSuccess = result?.status === 'SUCCESS';
+                chainSuccess = result?.status === 'SUCCESS'
+                    && result?.outcomeSource === 'substrate-system-events';
             }
         }
 
-        // Crawler-free fallback: the proof tx is not indexed locally (crawler off
-        // or lagging). Confirm the outcome directly against live contract state:
-        // recompute the claim key from the row and look it up in predicate_results.
-        // Verifies the effect, not the tx, so it needs no crawler and no txHash.
+        // Crawler-free fallback (proof tx not indexed locally): recompute the
+        // claim key from the row and look it up in predicate_results against live
+        // state. Verifies the effect, not the tx, so no crawler/txHash needed.
         if (!chainSuccess && liveProviderConfigured() && row.contractAddress && row.payloadHash) {
             chainSuccess = await verifyPredicateViaState(row);
         }
@@ -861,18 +936,14 @@ export function registerSubmissionHandlers(
         if (rejectIfMainnetBlocked(req)) return;
         if (!checkRate(disclosureRateLimiter, data.sessionId, req)) return;
 
-        const payloadHashBytes = hexToBytes(data.payloadHash);
-        const granteeBytes = hexToBytes(data.grantee);
         const payloadHashLc = data.payloadHash.toLowerCase();
         const granteeLc = data.grantee.toLowerCase();
         const contractAddressLc = data.contractAddress.toLowerCase();
 
-        // Insert the row up-front (mirrors anchorDocument / issuePredicateAttestation):
-        // a stable handle the caller can poll. active=false until the chain indexer
-        // confirms the grant is present in ledger state; the handler insert
-        // is an optimistic placeholder, the chain is the source of truth.
-        // Reuse an existing row for the same logical key (contract, payloadHash,
-        // grantee) so retries / re-grants don't accumulate orphan placeholder rows.
+        // Row up-front: a stable pollable handle. active=false (optimistic
+        // placeholder) until the chain indexer confirms the grant in ledger
+        // state; the chain is the source of truth. Reuse an existing row for the
+        // same (contract, payloadHash, grantee) so retries don't orphan rows.
         const insertedAt = new Date().toISOString();
         const existingGrant: any = await db.run(
             SELECT.one.from(DisclosureGrants).columns('ID').where({
@@ -904,15 +975,9 @@ export function registerSubmissionHandlers(
         return runSubmission(req, async () => {
             const facadeCfg = facadeConfigFromEnv();
             await ensureNetworkId(facadeCfg.networkId);
-            const resolved = await contractResolver(compiledRef);
-            const wallet = await walletFactory({ sessionId: data.sessionId!, db, facadeConfig: facadeCfg, expectedUserId: (req as any).user?.id });
+            await contractResolver(compiledRef);
+            await walletFactory({ sessionId: data.sessionId!, db, facadeConfig: facadeCfg, expectedUserId: (req as any).user?.id });
             const sponsor = await resolveSponsorForRequest(req, data.sponsorSessionId);
-            const submitter = submitterFactory(buildSubmitterDeps(db, resolved, wallet, sponsor?.accountId));
-            const registration = {
-                artifactPath: resolved.artifactPath,
-                privateStateId: resolved.privateStateId,
-                zkConfigPath: resolved.zkConfigPath
-            };
 
             const job = await startJob({
                 kind: 'grantDisclosure',
@@ -926,35 +991,13 @@ export function registerSubmissionHandlers(
                     disclosureGrantId,
                     feeSponsor: sponsor?.sponsorSessionId ?? null
                 },
-                work: async () => {
-                    await wallet.ensureFacade?.();
-                    if (sponsor) await ensureFeeSponsorFacade(sponsor, facadeCfg);
-                    const result = await submitter.call({
-                        contractAddress: contractAddressLc,
-                        circuit: 'grantDisclosure',
-                        args: [payloadHashBytes, granteeBytes, BigInt(levelNum)],
-                        contractName: compiledRef,
-                        registration,
-                        sessionId: data.sessionId!
-                    });
-
-                    const grantedAt = new Date().toISOString();
-                    await db.run(UPDATE.entity(DisclosureGrants)
-                        .set({ grantedTxHash: result.txHash, modifiedAt: grantedAt })
-                        .where({ ID: disclosureGrantId }));
-
-                    // Best-effort: pull the grant back out of on-chain state so the
-                    // row's `active` flag becomes chain-confirmed. Never fail the
-                    // submit on an indexing error; the row already records intent.
-                    await reindexAfterSubmit(contractAddressLc, resolved);
-
-                    return {
-                        disclosureGrantId,
-                        payloadHash: payloadHashLc,
-                        grantee: granteeLc,
-                        level: levelNum,
-                        txHash: result.txHash
-                    };
+                requestedBy: (req as any).user?.id,
+                commandVersion: 1,
+                encryptCommand: true,
+                command: {
+                    op: 'grantDisclosure', disclosureGrantId, payloadHash: payloadHashLc,
+                    grantee: granteeLc, level: levelNum, contractAddress: contractAddressLc,
+                    compiledArtifactRef: compiledRef, sponsorSessionId: sponsor?.sponsorSessionId
                 }
             });
 
@@ -987,8 +1030,6 @@ export function registerSubmissionHandlers(
         if (rejectIfMainnetBlocked(req)) return;
         if (!checkRate(disclosureRateLimiter, data.sessionId, req)) return;
 
-        const payloadHashBytes = hexToBytes(data.payloadHash);
-        const granteeBytes = hexToBytes(data.grantee);
         const payloadHashLc = data.payloadHash.toLowerCase();
         const granteeLc = data.grantee.toLowerCase();
         const contractAddressLc = data.contractAddress.toLowerCase();
@@ -996,15 +1037,9 @@ export function registerSubmissionHandlers(
         return runSubmission(req, async () => {
             const facadeCfg = facadeConfigFromEnv();
             await ensureNetworkId(facadeCfg.networkId);
-            const resolved = await contractResolver(compiledRef);
-            const wallet = await walletFactory({ sessionId: data.sessionId!, db, facadeConfig: facadeCfg, expectedUserId: (req as any).user?.id });
+            await contractResolver(compiledRef);
+            await walletFactory({ sessionId: data.sessionId!, db, facadeConfig: facadeCfg, expectedUserId: (req as any).user?.id });
             const sponsor = await resolveSponsorForRequest(req, data.sponsorSessionId);
-            const submitter = submitterFactory(buildSubmitterDeps(db, resolved, wallet, sponsor?.accountId));
-            const registration = {
-                artifactPath: resolved.artifactPath,
-                privateStateId: resolved.privateStateId,
-                zkConfigPath: resolved.zkConfigPath
-            };
 
             const job = await startJob({
                 kind: 'revokeDisclosure',
@@ -1016,39 +1051,13 @@ export function registerSubmissionHandlers(
                     contractAddress: contractAddressLc,
                     feeSponsor: sponsor?.sponsorSessionId ?? null
                 },
-                work: async () => {
-                    await wallet.ensureFacade?.();
-                    if (sponsor) await ensureFeeSponsorFacade(sponsor, facadeCfg);
-                    const result = await submitter.call({
-                        contractAddress: contractAddressLc,
-                        circuit: 'revokeDisclosure',
-                        args: [payloadHashBytes, granteeBytes],
-                        contractName: compiledRef,
-                        registration,
-                        sessionId: data.sessionId!
-                    });
-
-                    // Mark any matching optimistic/active grant row as revoked. The
-                    // chain indexer is authoritative on `active`; this is a
-                    // best-effort flip so the row reflects intent before reindex.
-                    const revokedAt = new Date().toISOString();
-                    await db.run(UPDATE.entity(DisclosureGrants)
-                        .set({ revokedTxHash: result.txHash, active: false, modifiedAt: revokedAt })
-                        .where({
-                            contractAddress: contractAddressLc,
-                            payloadHash: payloadHashLc,
-                            grantee: granteeLc
-                        }));
-
-                    // Best-effort: reconcile against on-chain state (the chain is
-                    // authoritative on `active`). Never fail the submit on error.
-                    await reindexAfterSubmit(contractAddressLc, resolved);
-
-                    return {
-                        payloadHash: payloadHashLc,
-                        grantee: granteeLc,
-                        txHash: result.txHash
-                    };
+                requestedBy: (req as any).user?.id,
+                commandVersion: 1,
+                encryptCommand: true,
+                command: {
+                    op: 'revokeDisclosure', payloadHash: payloadHashLc, grantee: granteeLc,
+                    contractAddress: contractAddressLc, compiledArtifactRef: compiledRef,
+                    sponsorSessionId: sponsor?.sponsorSessionId
                 }
             });
 

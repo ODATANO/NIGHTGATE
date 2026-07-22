@@ -1,18 +1,16 @@
 /**
- * Crawler-free attestation state reader. Reads the AttestationVault
- * attestation/content-root ledger Maps back out of LIVE on-chain state via the
- * contract's `ledger()` decoder, keyed by a KNOWN payload_hash, so verification
- * does not depend on the block crawler or on any locally-indexed txHash.
+ * Crawler-free attestation state reader: reads the AttestationVault
+ * attestation/content-root ledger Maps from LIVE on-chain state via the
+ * contract's `ledger()` decoder, keyed by a known payload_hash. No crawler, no
+ * locally-indexed txHash.
  *
- * Unlike the disclosure indexer (which must enumerate a nested, non-iterable outer
- * Map via `attestation_owners`), everything here is a direct member/lookup on flat
- * `Map<Bytes<32>, Bytes<32>>` maps by the caller-supplied payload_hash. No
- * enumeration, no read-helper, no Compact change; validated in
+ * All lookups are direct member/lookup on flat `Map<Bytes<32>, Bytes<32>>` (no
+ * enumeration, unlike the disclosure indexer). Validated in
  * scripts/spike-state-verification.mjs.
  *
- * The decode/read logic is dependency-injected (`ledger`, `queryContractState`) so
- * it unit-tests without the ESM-only SDK. The `readAttestationStateForContract`
- * wrapper wires the real contract-only provider bundle + artifact.
+ * Decode/read logic is dependency-injected (`ledger`, `queryContractState`) to
+ * unit-test without the ESM-only SDK; `readAttestationStateForContract` wires the
+ * real provider bundle + artifact.
  */
 import { pathToFileURL } from 'node:url';
 
@@ -67,8 +65,7 @@ export async function readAttestationState(
     if (!state) return null;
 
     // ContractState carries the ledger in `.data` (a ChargedState); `ledger()`
-    // also accepts a bare StateValue, so fall back to the state itself. Mirrors
-    // disclosure-indexer.ts.
+    // also accepts a bare StateValue, so fall back to the state itself.
     const led = deps.ledger(state.data ?? state);
     const ph = hexToBytes(deps.payloadHash);
 
@@ -100,7 +97,7 @@ export interface ReadAttestationStateForContractArgs {
 /**
  * Production wrapper: build a contract-only provider bundle, load the artifact's
  * `ledger`, and read attestation state. Dynamic import keeps the ESM-only SDK out
- * of CJS load, exactly as `reindexDisclosuresForContract` does.
+ * of CJS load.
  */
 export async function readAttestationStateForContract(
     args: ReadAttestationStateForContractArgs

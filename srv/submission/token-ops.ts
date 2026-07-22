@@ -1,12 +1,8 @@
 /**
- * Token operations: thin wrappers around the wallet-worker RPCs that
- * implement the OData `sendNight` / `shieldFunds` / `unshieldFunds`
- * actions. Each wrapper translates between the OData/user-facing shape
- * and the worker's primitive RPC contract.
- *
- * Pattern mirrors `srv/submission/dust-registration.ts`. The worker owns
- * the wallet facade; main thread just orchestrates and persists the
- * audit record.
+ * Token operations: thin wrappers around the wallet-worker RPCs backing the
+ * OData `sendNight` / `shieldFunds` / `unshieldFunds` actions, translating the
+ * user-facing shape to the worker's primitive RPC contract. The worker owns the
+ * wallet facade; the main thread only orchestrates.
  */
 
 import {

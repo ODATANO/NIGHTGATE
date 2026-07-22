@@ -45,6 +45,8 @@ const API = '/api/v1/nightgate';
 
 let db: any;
 let srv: any;
+let nextTransactionPosition = 0;
+const nextOutputPosition = new Map<string, number>();
 
 beforeAll(async () => {
     db = await cds.connect.to('db');
@@ -54,6 +56,8 @@ beforeAll(async () => {
 beforeEach(async () => {
     mockRegisterWalletSessionHandlers.mockClear();
     mockStartSessionCleanup.mockClear();
+    nextTransactionPosition = 0;
+    nextOutputPosition.clear();
 
     await db.run(cds.ql.DELETE.from(UNSHIELDED_UTXOS));
     await db.run(cds.ql.DELETE.from(CONTRACT_ACTIONS));
@@ -85,7 +89,7 @@ async function seedTransaction(blockId: string, overrides: Record<string, any> =
     const id = cds.utils.uuid();
     await db.run(cds.ql.INSERT.into(TRANSACTIONS).entries({
         ID: id,
-        transactionId: 0,
+        transactionId: nextTransactionPosition++,
         hash: `0xtx-${id.slice(0, 8)}`,
         protocolVersion: 1,
         transactionType: 'REGULAR',
@@ -109,13 +113,15 @@ async function seedContractAction(txId: string, overrides: Record<string, any> =
 
 async function seedUtxo(txId: string, overrides: Record<string, any> = {}): Promise<string> {
     const id = cds.utils.uuid();
+    const outputIndex = nextOutputPosition.get(txId) ?? 0;
+    nextOutputPosition.set(txId, outputIndex + 1);
     await db.run(cds.ql.INSERT.into(UNSHIELDED_UTXOS).entries({
         ID: id,
         owner: 'mn_addr_owner',
         tokenType: '0xtoken',
         value: 1000,
         intentHash: '0xintent',
-        outputIndex: 0,
+        outputIndex,
         initialNonce: '0xnonce',
         createdAtTransaction_ID: txId,
         ...overrides
@@ -329,6 +335,19 @@ describe('Transactions', () => {
         const res = await srv.send({ event: 'byHash', entity: 'Transactions', data: { hash: '0xabc' } });
         expect(res.length).toBe(1);
         expect(res[0].hash).toBe('0xabc');
+    });
+
+    it('allows the same extrinsic hash in different blocks', async () => {
+        const firstBlock = await seedBlock(1);
+        const secondBlock = await seedBlock(2);
+        await seedTransaction(firstBlock, { transactionId: 0, hash: '0xreplayed' });
+        await seedTransaction(secondBlock, { transactionId: 0, hash: '0xreplayed' });
+
+        const res = await srv.send({
+            event: 'byHash', entity: 'Transactions', data: { hash: '0xreplayed' }
+        });
+        expect(res).toHaveLength(2);
+        expect(new Set(res.map((tx: any) => tx.block_ID))).toEqual(new Set([firstBlock, secondBlock]));
     });
 
     it('byHash() rejects when hash is missing', async () => {
@@ -560,6 +579,74 @@ describe('read-only enforcement', () => {
 // query-shape assertion (builder.__where == { ID }) is reframed: the right row
 // (and only the caller's own row) is returned.
 // ----------------------------------------------------------------------------
+describe('BackgroundJobs idempotency constraint', () => {
+    it('rejects two rows with the same session, kind and idempotency key', async () => {
+        const base = {
+            kind: 'sendNight',
+            sessionId: 'idem-session',
+            status: 'pending',
+            idempotencyKey: 'same-command'
+        };
+        await db.run(cds.ql.INSERT.into(BACKGROUND_JOBS).entries({ ID: cds.utils.uuid(), ...base }));
+        await expect(
+            db.run(cds.ql.INSERT.into(BACKGROUND_JOBS).entries({ ID: cds.utils.uuid(), ...base, status: 'failed' }))
+        ).rejects.toBeTruthy();
+    });
+
+    it('still permits multiple jobs without an idempotency key', async () => {
+        const base = { kind: 'sendNight', sessionId: 'no-key-session', status: 'pending', idempotencyKey: null };
+        await db.run(cds.ql.INSERT.into(BACKGROUND_JOBS).entries({ ID: cds.utils.uuid(), ...base }));
+        await db.run(cds.ql.INSERT.into(BACKGROUND_JOBS).entries({ ID: cds.utils.uuid(), ...base }));
+        const rows = await db.run(cds.ql.SELECT.from(BACKGROUND_JOBS).where({ sessionId: 'no-key-session' }));
+        expect(rows).toHaveLength(2);
+    });
+
+    // Exercises the exact mechanism startJob uses for a concurrent-insert loser:
+    // on the pinned runner (db.tx(cds.context), the same connection backing the
+    // handler's writes) a colliding INSERT raises the unique violation INSIDE a
+    // savepoint, ROLLBACK TO undoes only that insert, and the surrounding tx
+    // stays usable — it can still read the winner and commit a further write.
+    // (The two-concurrent-transaction / Postgres "transaction aborted" variant
+    // lives in scripts/test-postgres-idempotency.mjs; SQLite does not abort a tx
+    // on a constraint error, so only Postgres proves the savepoint is required.)
+    it('isolates a unique violation inside the pinned savepoint and keeps the tx usable', async () => {
+        const key = 'pin-collision';
+        const winnerId = cds.utils.uuid();
+        // Winner committed by a prior transaction.
+        await db.run(cds.ql.INSERT.into(BACKGROUND_JOBS).entries({
+            ID: winnerId, kind: 'sendNight', sessionId: 'pin-session', status: 'pending', idempotencyKey: key
+        }));
+
+        await cds.tx(async () => {
+            const runner: any = (db as any).tx(cds.context);
+            await runner.run(`SAVEPOINT nightgate_job_insert`);
+            let violated = false;
+            try {
+                await runner.run(cds.ql.INSERT.into(BACKGROUND_JOBS).entries({
+                    ID: cds.utils.uuid(), kind: 'sendNight', sessionId: 'pin-session', status: 'pending', idempotencyKey: key
+                }));
+            } catch (e: any) {
+                violated = true;
+                expect(String(e?.message ?? e)).toMatch(/unique/i);
+            }
+            expect(violated).toBe(true);
+            await runner.run(`ROLLBACK TO SAVEPOINT nightgate_job_insert`);
+            await runner.run(`RELEASE SAVEPOINT nightgate_job_insert`);
+
+            // The outer tx is still usable: it reads the winner and commits a write.
+            const winner = await runner.run(
+                cds.ql.SELECT.one.from(BACKGROUND_JOBS).where({ sessionId: 'pin-session', idempotencyKey: key })
+            );
+            expect(winner?.ID).toBe(winnerId);
+            await runner.run(cds.ql.UPDATE.entity(BACKGROUND_JOBS).set({ status: 'running' }).where({ ID: winnerId }));
+        });
+
+        const rows = await db.run(cds.ql.SELECT.from(BACKGROUND_JOBS).where({ sessionId: 'pin-session' }));
+        expect(rows).toHaveLength(1);            // loser's insert rolled back; only the winner remains
+        expect(rows[0].status).toBe('running');  // the post-rollback write committed
+    });
+});
+
 describe('getJobStatus', () => {
     const VALID_JOB_ID = '11111111-1111-1111-1111-111111111111';
     const VALID_SESSION = '22222222-2222-2222-2222-222222222222';
@@ -576,8 +663,13 @@ describe('getJobStatus', () => {
             result: '{"txId":"tx-OK"}',
             errorCode: null,
             errorMessage: null,
+            queuedAt: '2026-05-19T11:59:59.000Z',
+            externalExecutionAt: '2026-05-19T12:00:01.000Z',
+            submittedAt: '2026-05-19T12:00:03.000Z',
             startedAt: '2026-05-19T12:00:00.000Z',
             finishedAt: '2026-05-19T12:00:05.000Z',
+            chainStatus: 'success',
+            chainFinalizedAt: '2026-05-19T12:00:10.000Z',
             ...overrides
         }));
     }
@@ -619,11 +711,14 @@ describe('getJobStatus', () => {
             result: '{"txId":"tx-OK"}',
             errorCode: null,
             errorMessage: null,
+            queuedAt: '2026-05-19T11:59:59.000Z',
+            externalExecutionAt: '2026-05-19T12:00:01.000Z',
+            submittedAt: '2026-05-19T12:00:03.000Z',
             startedAt: '2026-05-19T12:00:00.000Z',
-            finishedAt: '2026-05-19T12:00:05.000Z'
+            finishedAt: '2026-05-19T12:00:05.000Z',
+            chainStatus: 'success',
+            chainFinalizedAt: '2026-05-19T12:00:10.000Z'
         }));
-        // submittedAt mirrors the row's createdAt (set by @cds.on.insert managed).
-        expect(out.submittedAt).toBeTruthy();
     });
 
     it('relays failure state (errorCode / errorMessage) for a failed job', async () => {

@@ -1,8 +1,5 @@
 /**
- * Nightgate Service Implementation, OData V4 API
- *
- * Thin service layer: all data comes from local SQLite (populated by Crawler).
- * OData queries run against the local DB. Wallet sessions are handled separately.
+ * Nightgate Service: OData V4 read API over local SQLite (populated by Crawler).
  *
  * Data flow: Midnight Node -> Crawler -> SQLite -> Nightgate OData V4
  */
@@ -226,7 +223,18 @@ export default class NightgateService extends cds.ApplicationService {
                 result: job.result,
                 errorCode: job.errorCode,
                 errorMessage: job.errorMessage,
-                submittedAt: job.createdAt,
+                attempt: job.attempt,
+                maxAttempts: job.maxAttempts,
+                submissionId: job.submissionId,
+                txHash: job.txHash,
+                chainStatus: job.chainStatus,
+                chainFinalizedAt: job.chainFinalizedAt,
+                leaseOwner: job.leaseOwner,
+                leaseExpiresAt: job.leaseExpiresAt,
+                heartbeatAt: job.heartbeatAt,
+                queuedAt: job.queuedAt ?? job.createdAt,
+                externalExecutionAt: job.externalExecutionAt,
+                submittedAt: job.submittedAt,
                 startedAt: job.startedAt,
                 finishedAt: job.finishedAt
             };

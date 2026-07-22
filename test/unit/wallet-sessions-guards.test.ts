@@ -83,7 +83,8 @@ vi.mock('../../srv/midnight/providers', () => ({
     ensureNetworkId: vi.fn(async () => undefined)
 }));
 vi.mock('../../srv/submission/background-jobs', () => ({
-    startJob: vi.fn(async (args: any) => ({ jobId: `job-${args.kind}`, status: 'pending' }))
+    startJob: vi.fn(async (args: any) => ({ jobId: `job-${args.kind}`, status: 'pending' })),
+    registerBackgroundJobProcessor: vi.fn()
 }));
 vi.mock('../../srv/utils/wallet-info', () => ({
     deriveWalletInfo: mockDeriveWalletInfoUtil,
@@ -309,11 +310,12 @@ describe('wallet session guard branches', () => {
             expect(req.reject).toHaveBeenCalledWith(410, 'Session expired');
         });
 
-        it('maps an undecryptable viewing key to 500', async () => {
+        it('queues the job even with an undecryptable key — decrypt is deferred to the processor, not a request-path 500', async () => {
             mockDbRun.mockResolvedValue(signingSessionRow({ encryptedViewingKey: 'deadbeef' }));
             const req = makeReq(base);
-            await handlers[op](req);
-            expect(req.reject).toHaveBeenCalledWith(500, 'Failed to decrypt session keys (ENCRYPTION_KEY mismatch?)');
+            const result = await handlers[op](req);
+            expect(req.reject).not.toHaveBeenCalledWith(500, expect.anything());
+            expect(result).toMatchObject({ status: 'pending' });
         });
     });
 

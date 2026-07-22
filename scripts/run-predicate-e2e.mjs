@@ -69,6 +69,11 @@ async function pollJob(sessionId, jobId, label, { expect = 'succeed', timeoutMs 
             if (expect === 'fail') { console.log(`     [${label}] failed as expected: ${errorCode} — ${errorMessage}`); return { failed: true, errorCode, errorMessage }; }
             fail(`[${label}] job failed: ${errorCode} — ${errorMessage}`);
         }
+        if (status === 'reconciliation_required') {
+            process.stdout.write('\n');
+            if (expect === 'fail') { console.log(`     [${label}] reconciliation_required (terminal) — accepted as non-success: ${errorCode} — ${errorMessage}`); return { failed: true, reconciliation: true, errorCode, errorMessage }; }
+            fail(`[${label}] job entered reconciliation_required: ${errorCode} — ${errorMessage}`);
+        }
         await new Promise(res => setTimeout(res, intervalMs));
     }
     fail(`[${label}] job ${jobId} did not finish within ${timeoutMs / 1000}s`);

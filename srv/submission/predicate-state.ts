@@ -1,20 +1,19 @@
 /**
- * Crawler-free predicate-result reader. The AttestationVault records a
- * proven predicate as a (true) entry
- * in the `predicate_results` ledger Map, keyed by
+ * Crawler-free predicate-result reader. The AttestationVault records a proven
+ * predicate as a (true) entry in the `predicate_results` ledger Map, keyed by
  *   claimKey = persistentHash<PredicateClaim>{payload_hash, threshold, op}.
- * A consumer that knows (payload_hash, threshold, op) can recompute claimKey
- * off-chain and confirm the proof landed WITHOUT the proof tx being indexed
- * locally: no crawler, no txHash.
+ * Knowing (payload_hash, threshold, op) lets a consumer recompute claimKey
+ * off-chain and confirm the proof landed without the proof tx being indexed
+ * locally (no crawler, no txHash).
  *
- * The claim key recompute uses `@midnight-ntwrk/compact-runtime`'s exported
- * `persistentHash` + CompactType constructors, reproducing the exact bytes the
- * compiled circuit emits (the artifact builds `_descriptor_7` the same way).
- * Validated against a live-emitted key in scripts/spike-state-verification.mjs.
+ * The recompute uses `@midnight-ntwrk/compact-runtime`'s `persistentHash` +
+ * CompactType constructors to reproduce the exact bytes the compiled circuit
+ * emits. Validated against a live-emitted key in
+ * scripts/spike-state-verification.mjs.
  *
  * Read/decode logic is dependency-injected (`ledger`, `queryContractState`,
- * `computeClaimKey`) so it unit-tests without the ESM-only SDK. The
- * `readPredicateStateForContract` wrapper wires the real runtime + providers.
+ * `computeClaimKey`) to unit-test without the ESM-only SDK;
+ * `readPredicateStateForContract` wires the real runtime + providers.
  */
 import { pathToFileURL } from 'node:url';
 
@@ -65,8 +64,7 @@ export async function readPredicateResult(
 
 /**
  * Recompute the on-chain `PredicateClaim` claim key off-chain, byte-for-byte
- * identical to the compiled circuit. ESM-only: dynamic-imports compact-runtime.
- * Injectable so the reader unit-tests without the SDK.
+ * identical to the compiled circuit. Dynamic-imports the ESM-only compact-runtime.
  */
 export async function computePredicateClaimKey(
     payloadHash: string,
@@ -96,10 +94,8 @@ export async function computePredicateClaimKey(
 }
 
 /**
- * Field-bound counterpart: recompute the on-chain `FieldPredicateClaim` key
+ * Field-bound counterpart: recompute the `FieldPredicateClaim` key
  * (artifact `_descriptor_6`): Bytes<32> ++ Bytes<32> ++ Uint<64> ++ Uint<8>.
- * Verified byte-exact against a live-emitted key in
- * scripts/spike-state-verification.mjs.
  */
 export async function computeFieldPredicateClaimKey(
     payloadHash: string,
@@ -150,10 +146,9 @@ export interface ReadPredicateStateForContractArgs {
 
 /**
  * Production wrapper: recompute the claim key, build a contract-only provider
- * bundle, load the artifact's `ledger`, and read the predicate result. When
- * `fieldKey` is set it verifies the field-bound proof against
- * `field_predicate_results`; otherwise the plain `predicate_results`. Dynamic
- * import keeps the ESM-only SDK out of CJS load.
+ * bundle, load the artifact's `ledger`, and read the predicate result. `fieldKey`
+ * set → verify against `field_predicate_results`, else `predicate_results`.
+ * Dynamic import keeps the ESM-only SDK out of CJS load.
  */
 export async function readPredicateStateForContract(
     args: ReadPredicateStateForContractArgs

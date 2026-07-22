@@ -1,34 +1,23 @@
 /**
  * Typed argument coercion for the generic `submitContractCall` action.
  *
- * Problem: a
- * compiled Compact circuit guards a `Bytes<N>` parameter strictly as a real
- * `Uint8Array(N)` (`.buffer instanceof ArrayBuffer && BYTES_PER_ELEMENT === 1
- * && length === N`). The public `submitContractCall` takes `args` as a JSON
- * string, and JSON cannot carry a `Uint8Array`, so a hex string or a
- * `number[]` both fail the guard, and the only circuits callable generically
- * were the JSON-native ones (numbers/bools). The built-in actions
- * (`anchorDocument` etc.) dodged this by hex-decoding internally before the
- * submitter; that conversion was unreachable through the generic action.
+ * A compiled Compact circuit guards a `Bytes<N>` parameter strictly as a real
+ * `Uint8Array(N)`. `submitContractCall` takes `args` as a JSON string, and JSON
+ * can't carry a Uint8Array, so a hex string / number[] both fail the guard;
+ * only JSON-native circuits (numbers/bools) were callable generically. This
+ * module coerces each arg (between `JSON.parse(args)` and the worker's
+ * `fn(...callArgs)`) to the shape the circuit expects. Coerced Uint8Array /
+ * BigInt survive the worker's structured-clone boundary (postMessage, not JSON).
  *
- * This module bridges the gap: between `JSON.parse(args)` in the handler and
- * the worker's `fn(...callArgs)`, each arg is coerced to the value shape the
- * circuit actually expects. Coerced `Uint8Array` / `BigInt` values survive the
- * worker's structured-clone boundary (postMessage, NOT JSON), so the submitter
- * and worker need no changes.
- *
- * Two encodings are supported, tag-wins-then-introspect:
- *   - Tagged (always honored, no metadata needed):
- *       { "$bytes": "<hex>" }  → Uint8Array
- *       { "$uint":  "<dec>" | 123 } → BigInt
- *   - Untagged + introspected: the circuit's declared param types are read from
- *     the compiled artifact's `contract-info.json`; a hex string / number[] is
- *     coerced to Bytes<N> (exact-length checked), a number / decimal-string to
- *     BigInt for Uint<N>. A param of an unhandled Compact type (Vector, struct,
- *     Field, …) passes through unchanged.
- *   - Untagged + no metadata for the argument: rejected with a clear 400. We
- *     do NOT silently pass it through: that would reproduce the deep
- *     circuit-type failure this layer exists to prevent. The caller fixes it by
+ * Encodings, tag-wins-then-introspect:
+ *   - Tagged (always honored): { "$bytes": "<hex>" } → Uint8Array;
+ *     { "$uint": "<dec>" | 123 } → BigInt.
+ *   - Untagged + introspected from the artifact's `contract-info.json`: hex /
+ *     number[] → Bytes<N> (exact-length checked), number / decimal-string →
+ *     BigInt for Uint<N>. Unhandled Compact types (Vector, struct, Field, …)
+ *     pass through unchanged.
+ *   - Untagged + no metadata: rejected with a 400 (silent passthrough would
+ *     reproduce the deep circuit-type failure this layer prevents). Fix by
  *     tagging the value or correcting the registered artifact path.
  */
 
@@ -109,10 +98,9 @@ function toBigInt(value: unknown, index: number, maxval?: number): bigint {
     if (v < 0n) {
         throw new CoercionError(index, `Uint value must be non-negative (got ${v})`);
     }
-    // Only enforce the upper bound when the compiler's maxval is within JS
-    // safe-integer range; for u64 etc. the value loses precision through
-    // JSON.parse, so a check there would be unreliable. Lower bound is enough
-    // to catch the common mistakes; the circuit enforces the true bound.
+    // Enforce the upper bound only when maxval is within JS safe-integer range;
+    // for u64 etc. it loses precision through JSON.parse, so the check would be
+    // unreliable (the circuit enforces the true bound anyway).
     if (maxval !== undefined && maxval <= Number.MAX_SAFE_INTEGER && v > BigInt(maxval)) {
         throw new CoercionError(index, `Uint value ${v} exceeds maximum ${maxval}`);
     }
@@ -160,12 +148,9 @@ function coerceOne(raw: unknown, argType: CircuitArgType | undefined, index: num
         }
     }
 
-    // 3. No declared type for this argument AND no tag. We can't validate it,
-    // so rather than silently passing it through (which reproduces the very
-    // deep-circuit-failure this layer exists to prevent), reject with an
-    // actionable 400. The two escape hatches are listed in the message: tag the
-    // value, or fix the registered contract so contract-info.json is found.
-    // Empty arg lists never reach here (no elements to coerce).
+    // 3. No declared type AND no tag: can't validate, so reject with an
+    // actionable 400 rather than a silent passthrough (which would reproduce the
+    // deep circuit failure this layer prevents). Escape hatches are in the message.
     throw new CoercionError(
         index,
         'could not determine the circuit parameter type (the contract\'s ' +

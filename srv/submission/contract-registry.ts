@@ -1,27 +1,14 @@
 /**
  * Compiled-contract registry.
  *
- * The OData submission actions accept a string `compiledArtifactRef`
- * (e.g. "attestation-vault") and resolve it through this registry to:
- *   - the compiled contract module (Compact `compactc` output under
- *     `<base>/<name>/src/managed/<name>/contract/`)
- *   - the contract's `privateStateId`
- *   - the `zkConfigPath` the SDK's NodeZkConfigProvider reads from
+ * The OData submission actions pass a string `compiledArtifactRef`
+ * (e.g. "attestation-vault"), resolved here to the compiled contract module, its
+ * `privateStateId`, and the `zkConfigPath` the SDK's NodeZkConfigProvider reads.
  *
- * The registry is in-memory and starts empty. Until a contract is registered,
- * the OData actions return a clear 404-style error rather than failing somewhere
- * deep in the SDK.
- *
- * Registration shape is loaded from `cds.requires.nightgate.contracts` if
- * present:
- *
- *   contracts: {
- *     "attestation-vault": {
- *       artifactPath:   "<repo>/contracts/attestation-vault/src/managed/attestation-vault/contract/index.js",
- *       privateStateId: "attestationVaultPrivateState",
- *       zkConfigPath:   "<repo>/contracts/attestation-vault/src/managed/attestation-vault"
- *     }
- *   }
+ * In-memory, starts empty; until a contract is registered the OData actions
+ * return a clear 404-style error rather than failing deep in the SDK.
+ * Registrations load from `cds.requires.nightgate.contracts`
+ * ({ artifactPath, privateStateId, zkConfigPath } per name).
  */
 
 import fs from 'fs';
@@ -33,13 +20,12 @@ import { pathToFileURL } from 'url';
 const PACKAGE_ROOT = path.resolve(__dirname, '..', '..');
 
 /**
- * Resolve a configured contract path. Absolute paths pass through. For a
- * RELATIVE path we prefer the package root when the target exists there; this
- * is how the BUNDLED contracts (counter, attestation-vault, shipped under the
- * package's contracts/ dir) resolve correctly in a consumer app, where
- * process.cwd() is the consumer's project root, not node_modules/@odatano/nightgate.
- * A consumer's OWN relative path (not present under the package) falls back to
- * baseDir (cwd), preserving the prior behaviour for consumer-registered contracts.
+ * Resolve a configured contract path. Absolute paths pass through. A relative
+ * path prefers the package root when the target exists there, so the BUNDLED
+ * contracts (counter, attestation-vault under the package's contracts/) resolve
+ * in a consumer app where process.cwd() is the consumer's root, not
+ * node_modules/@odatano/nightgate. A consumer's own relative path (not under the
+ * package) falls back to baseDir (cwd).
  */
 function resolveContractPath(p: string, baseDir: string): string {
     if (path.isAbsolute(p)) return p;
@@ -62,11 +48,9 @@ export interface ResolvedContract {
     privateStateId: string;
     zkConfigPath: string;
     /**
-     * Absolute path (or file:// URL on Windows) the worker uses to dynamic-
-     * import the Compact-emitted contract module. Same value the registry
-     * stored at registerContract() time, already normalised to absolute.
-     * Surfaced so the wallet-worker handler can re-import inside the
-     * worker thread (compiledContract itself doesn't survive a thread boundary).
+     * Absolute path the worker uses to re-import the Compact-emitted contract
+     * module inside the worker thread (compiledContract itself doesn't survive a
+     * thread boundary). Same value stored at registerContract() time.
      */
     artifactPath: string;
 }
@@ -135,15 +119,14 @@ export async function resolveContract(name: string): Promise<ResolvedContract> {
     const mod: any = await import(importSpec);
     const ContractClass = mod.Contract ?? mod.default ?? mod;
 
-    // The midnight-js-contracts SDK expects a `CompiledContract` wrapper around
-    // the raw Compact-emitted `Contract` class, not the class itself. The wrapper
-    // attaches witnesses + ZK asset paths (keys/, zkir/) and adds the Symbol-keyed
-    // CompactContext that `deployContract` reads. Pattern from example-counter:
+    // midnight-js-contracts expects a `CompiledContract` wrapper around the raw
+    // Compact-emitted `Contract` class, not the class itself: it attaches
+    // witnesses + ZK asset paths (keys/, zkir/) and the Symbol-keyed CompactContext
+    // that `deployContract` reads. Pattern from example-counter:
     //   CompiledContract.make(name, Contract)
     //     .pipe(withVacantWitnesses, withCompiledFileAssets(zkConfigPath))
     const compactJs: any = await import('@midnight-ntwrk/compact-js');
-    // CompiledContract namespace lives under `effect/CompiledContract` in the
-    // compact-js package, re-exported at the top level.
+    // CompiledContract is re-exported at top level from `effect/CompiledContract`.
     const CompiledContract = compactJs.CompiledContract ?? compactJs.effect?.CompiledContract;
     if (!CompiledContract?.make) {
         throw new Error(`CompiledContract.make not found in @midnight-ntwrk/compact-js exports; got keys: ${Object.keys(compactJs).join(',')}`);

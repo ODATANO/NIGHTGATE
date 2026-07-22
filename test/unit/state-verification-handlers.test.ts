@@ -25,7 +25,9 @@ vi.mock('../../srv/utils/nightgate-config', async () => {
 
 // startJob is not exercised by these read handlers, but handlers.ts imports it.
 vi.mock('../../srv/submission/background-jobs', async () => ({
-    startJob: vi.fn(async (args: any) => ({ jobId: 'job-test', status: 'pending' }))
+    startJob: vi.fn(async (args: any) => ({ jobId: 'job-test', status: 'pending' })),
+    registerBackgroundJobProcessor: vi.fn(),
+    registerBackgroundJobReconciliationFinalizer: vi.fn()
 }));
 
 import { registerSubmissionHandlers } from '../../srv/submission/handlers';

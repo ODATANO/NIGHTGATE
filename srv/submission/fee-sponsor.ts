@@ -1,26 +1,21 @@
 /**
  * Per-transaction fee sponsoring (dust sponsorship), main-thread side.
  *
- * An optional `sponsorSessionId` on the submission actions lets a SECOND
- * wallet session pay the dust fee for a transaction the calling session
- * builds and signs. The wallet worker splits balancing into two phases:
- * the caller balances shielded/unshielded and signs, the sponsor balances
- * ONLY ['dust'] and submits (see buildSponsoredWalletProvider in
- * srv/midnight/wallet-worker.ts).
+ * An optional `sponsorSessionId` lets a SECOND wallet session pay the dust fee
+ * for a tx the calling session builds and signs. The worker splits balancing:
+ * caller balances shielded/unshielded and signs, sponsor balances only ['dust']
+ * and submits (see buildSponsoredWalletProvider in srv/midnight/wallet-worker.ts).
  *
  * This module resolves and GUARDS the sponsor session:
+ *   - Same-user sponsoring is always allowed (both sessions are the caller's).
+ *   - Cross-user sponsoring (one funded platform wallet paying for many tenants)
+ *     must be explicitly enabled by listing the sponsor session id(s) in
+ *     NIGHTGATE_FEE_SPONSOR_SESSION (comma separated) or cds config
+ *     `feeSponsorSessions`. Without this guard any caller could drain an
+ *     arbitrary wallet's dust with a guessed/leaked session id.
  *
- *   - A caller may always sponsor from a session that belongs to the SAME
- *     authenticated user (both sessions are theirs).
- *   - Cross-user sponsoring (the platform-sponsor model: one funded wallet
- *     pays for many tenants) must be explicitly enabled by the operator by
- *     listing the sponsor session id(s) in NIGHTGATE_FEE_SPONSOR_SESSION
- *     (comma separated) or cds config `feeSponsorSessions`. Without this
- *     guard any caller could drain an arbitrary wallet's dust by guessing
- *     or leaking its session id.
- *
- * The sponsor session must be signing-capable (encryptedSeedKey present):
- * paying dust requires the sponsor's dust secret key in the worker facade.
+ * The sponsor session must be signing-capable (encryptedSeedKey present): paying
+ * dust needs the sponsor's dust secret key in the worker facade.
  */
 
 import cds from '@sap/cds';

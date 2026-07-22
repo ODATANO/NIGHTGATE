@@ -1,8 +1,6 @@
 /**
- * Wallet Session Management, connect, disconnect, cleanup
- *
- * Extracted from NightgateService to separate session concerns
- * from OData read handlers.
+ * Wallet session management: connect, disconnect, cleanup. Extracted from
+ * NightgateService to keep session concerns off the OData read handlers.
  */
 
 import cds, { Request } from '@sap/cds';
@@ -14,6 +12,7 @@ import { RateLimiter } from '../utils/rate-limiter';
 import { evictWalletFacade } from '../submission/wallet-facade-builder';
 import { deriveAccountId, deriveStoragePassword } from '../submission/wallet-material-factory';
 import { registerNightUtxosForDust, deregisterNightUtxosFromDust } from '../submission/dust-registration';
+const log = cds.log('nightgate:sessions');
 import {
     sendNight,
     unshieldFunds,
@@ -30,15 +29,13 @@ import {
     resolveNightgateRuntimeConfig, getNightgatePluginConfig, mainnetSubmissionBlockReason,
     getConfiguredNightgateNetwork, normalizeNightgateNetwork
 } from '../utils/nightgate-config';
-import { startJob } from '../submission/background-jobs';
+import { startJob, registerBackgroundJobProcessor, type BackgroundJobRow } from '../submission/background-jobs';
+import { reportExternalExecution } from '../submission/job-execution-context';
 import { mnemonicToBip39SeedHex } from '../utils/wallet-hd';
 import { deriveWalletInfo, resolveBip39SeedHex } from '../utils/wallet-info';
 import { resolveFeeSponsor, ensureFeeSponsorFacade, FeeSponsorError } from '../submission/fee-sponsor';
 
-// Upper bound for the prewarm sync-to-tip wait. A wallet that is far behind the
-// chain tip (e.g. restored from a stale checkpoint) can take a long time to
-// catch up; bound it so a dropped indexer subscription surfaces as a clear job
-// failure instead of hanging forever. Override via env for slow cold syncs.
+// Upper bound for the prewarm sync-to-tip wait
 const PREWARM_SYNC_TIMEOUT_MS = Number(
     process.env.NIGHTGATE_PREWARM_SYNC_TIMEOUT_MS || 3 * 60 * 60 * 1000
 );
@@ -86,6 +83,98 @@ const diagnosticsRateLimiter = new RateLimiter({
 });
 
 const MAX_NIGHT_AMOUNT_ATOMS = 10n ** 18n;
+
+type WalletCommand =
+    | { op: 'prewarm' }
+    | { op: 'registerDust'; dustReceiverAddress?: string }
+    | { op: 'deregisterDust'; sponsorSessionId?: string }
+    | { op: 'sendNight'; receiverAddress: string; amount: string; ttlIso?: string }
+    | { op: 'unshield'; amount: string; ttlIso?: string }
+    | { op: 'shield'; amount: string; ttlIso?: string };
+
+const WALLET_COMMAND_KINDS = [
+    'connectWalletForSigning', 'registerForDustGeneration', 'deregisterFromDustGeneration',
+    'sendNight', 'unshieldFunds', 'shieldFunds'
+] as const;
+const EXPECTED_WALLET_OP: Record<string, WalletCommand['op']> = {
+    connectWalletForSigning: 'prewarm',
+    registerForDustGeneration: 'registerDust',
+    deregisterFromDustGeneration: 'deregisterDust',
+    sendNight: 'sendNight',
+    unshieldFunds: 'unshield',
+    shieldFunds: 'shield'
+};
+
+async function executeWalletCommand(raw: unknown, job: BackgroundJobRow, db: any): Promise<unknown> {
+    const command = raw as WalletCommand;
+    if (!command || typeof command.op !== 'string' || !job.sessionId || !job.requestedBy) {
+        throw new Error(`Invalid persisted wallet command for job ${job.ID}`);
+    }
+    if (job.commandVersion !== 1 || EXPECTED_WALLET_OP[job.kind] !== command.op) {
+        throw new Error(`Persisted command ${job.kind} v${job.commandVersion} has incompatible operation '${command.op}'`);
+    }
+    const session = await db.run(
+        SELECT.one.from(WalletSessions).where({ sessionId: job.sessionId, isActive: true, userId: job.requestedBy })
+    );
+    if (!session) throw new Error('Session not found, inactive, or no longer owned by the requesting principal');
+    if (session.expiresAt && new Date(session.expiresAt) < new Date()) throw new Error('Session expired');
+    if (!session.encryptedViewingKey || !session.encryptedSeedKey) throw new Error('Session no longer has signing material');
+
+    const encKey = getEncryptionKey();
+    const viewingKey = decrypt(session.encryptedViewingKey, encKey);
+    const seedHex = decrypt(session.encryptedSeedKey, encKey);
+    const accountId = deriveAccountId(viewingKey);
+    const syncPass = deriveStoragePassword(viewingKey);
+    const { network, nodeUrl, submissionEndpoints } = resolveNightgateRuntimeConfig(getNightgatePluginConfig());
+    const facadeConfig = {
+        networkId: network,
+        indexerHttpUrl: submissionEndpoints.indexerHttpUrl,
+        indexerWsUrl: submissionEndpoints.indexerWsUrl,
+        proofServerUrl: submissionEndpoints.proofServerUrl,
+        relayUrl: nodeUrl,
+        syncStatePassphrase: syncPass
+    };
+    await ensureNetworkId(network);
+    await getOrBuildWalletFacade(accountId, { seedHex, ...facadeConfig });
+
+    if (command.op === 'prewarm') {
+        await walletWaitForSyncedState(accountId, PREWARM_SYNC_TIMEOUT_MS);
+        return { ready: true };
+    }
+    if (command.op === 'registerDust') {
+        await reportExternalExecution({});
+        const result = await registerNightUtxosForDust({
+            cacheKey: accountId, seedHex, facadeConfig,
+            dustReceiverAddress: command.dustReceiverAddress || undefined
+        });
+        return { txId: result.txId ?? '', registeredCount: result.registeredCount, totalNightUtxos: result.totalNightUtxos, dustReceiverAddress: result.dustReceiverAddress };
+    }
+    if (command.op === 'deregisterDust') {
+        const sponsor = command.sponsorSessionId
+            ? await resolveFeeSponsor({ db, sponsorSessionId: command.sponsorSessionId, requestingUserId: job.requestedBy, config: getNightgatePluginConfig() })
+            : null;
+        if (sponsor) await ensureFeeSponsorFacade(sponsor, facadeConfig);
+        await reportExternalExecution({});
+        const result = await deregisterNightUtxosFromDust({ cacheKey: accountId, sponsorCacheKey: sponsor?.accountId });
+        return { txId: result.txId ?? '', deregisteredCount: result.deregisteredCount, totalNightUtxos: result.totalNightUtxos, ...(sponsor ? { feeSponsor: sponsor.sponsorSessionId } : {}) };
+    }
+    if (command.op === 'sendNight') {
+        await reportExternalExecution({});
+        const result = await sendNight({ cacheKey: accountId, receiverAddress: command.receiverAddress, amount: command.amount, ttlIso: command.ttlIso });
+        return { txId: result.txId, toLedger: result.toLedger, amount: result.amount, receiverAddress: result.receiverAddress };
+    }
+    if (command.op === 'unshield') {
+        await reportExternalExecution({});
+        const result = await unshieldFunds({ cacheKey: accountId, amount: command.amount, ttlIso: command.ttlIso });
+        return { txId: result.txId, amount: result.amount, unshieldedReceiverAddress: result.unshieldedReceiverAddress };
+    }
+    if (command.op === 'shield') {
+        await reportExternalExecution({});
+        const result = await shieldFunds({ cacheKey: accountId, amount: command.amount, ttlIso: command.ttlIso });
+        return { txId: result.txId, amount: result.amount, shieldedReceiverAddress: result.shieldedReceiverAddress };
+    }
+    throw new Error(`Unsupported wallet command operation: ${(command as any).op}`);
+}
 
 /**
  * Mainnet submission gate. Rejects with 403 when network is mainnet and allowMainnetSubmission is not enabled.
@@ -141,12 +230,9 @@ function requireUserId(req: Request): string | undefined {
 }
 
 /**
- * Look up an active signing-capable wallet session and derive its accountId.
- * Returns either the resolved accountId, or a `{ rejection }` describing the
- * failure (status + message). Eliminates a ~15-line duplicated block from
- * every wallet-action handler. Scoped to `userId` so one principal cannot act
- * on another's session (a foreign session reads back as 404, not leaking that
- * it exists).
+ * Look up an active signing-capable session and derive its accountId, or return
+ * a `{ ok: false, status, msg }` failure. Scoped to `userId` so one principal
+ * cannot act on another's session (a foreign session reads back as 404, non-leaking).
  */
 async function loadSigningSessionAccountId(
     db: any,
@@ -174,6 +260,9 @@ async function loadSigningSessionAccountId(
 const BIP39_SEED_HEX_LENGTH = 128; // 64-byte BIP39 seed; HD-derived per role in srv/utils/wallet-hd.ts
 
 export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: any): void {
+    for (const kind of WALLET_COMMAND_KINDS) {
+        registerBackgroundJobProcessor(kind, 1, (command, row) => executeWalletCommand(command, row, db));
+    }
     srv.on('connectWallet', async (req: Request) => {
         const clientKey = (req as any)?._.req?.ip || 'global';
         const rateResult = walletRateLimiter.check(clientKey);
@@ -221,10 +310,7 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
         };
     });
 
-    // Pure derivation, no session, nothing persisted.
-    // Rate-limited like connectWalletForSigning: the request carries secret
-    // material. The secret is validated and consumed in-memory only; error
-    // paths never echo the input.
+    // Pure derivation
     srv.on('deriveWalletInfo', async (req: Request) => {
         const clientKey = (req as any)?._.req?.ip || 'global';
         const rateResult = signingKeyRateLimiter.check(clientKey);
@@ -285,10 +371,6 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
         };
         if (!sessionId) return req.reject(400, 'sessionId is required');
 
-        // Lace gives users a BIP39 mnemonic; that's the preferred input. We
-        // derive (and store) the 64-byte BIP39 seed, and the wallet key types
-        // are HD-derived per role downstream (srv/utils/wallet-hd.ts). A raw
-        // 128-hex BIP39 seed is accepted as a programmatic alternative.
         let bip39SeedHex: string;
         if (mnemonic) {
             try {
@@ -322,44 +404,16 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
                 .where({ sessionId, userId })
         );
 
-        // prewarm:false skips scheduling the sync-to-tip job entirely. For
-        // sponsored callers that hold nothing (0.8.1, paired with
-        // NIGHTGATE_SPONSORED_CALLER_SYNC=skip) the prewarm buys nothing and
-        // its background sync would race the submission's on-demand facade
-        // init on the same accountId. Submissions ensure the facade
-        // themselves, so signing still works without it.
+        // skips scheduling the sync-to-tip job entirely
         if (prewarm === false) {
             return { sessionId, signingEnabled: true, prewarmJobId: null, prewarmStatus: null };
         }
 
-        // Pre-warm the WalletFacade as a tracked background job so callers can
-        // poll its status via getJobStatus(prewarmJobId, sessionId). Previously
-        // this was fire-and-forget; the job-tracked variant lets clients know
-        // when the cold sync (~5-6h on a fresh preprod seed) is done before
-        // they fire deployContract / submitContractCall. Failure to wait is
-        // still safe; subsequent submission actions will block on the same
-        // sync internally.
-        //
-        // Pre-warm setup that depends on session state (viewing-key decrypt,
-        // accountId derivation, config resolution) happens inline; only the
-        // actual `ensureNetworkId` + `getOrBuildWalletFacade` round-trip moves
-        // into the job's `work` closure.
+        // Pre-warm the WalletFacade as a tracked background job, pollable via
+        // getJobStatus(prewarmJobId, sessionId).
         try {
             const viewingKey = decrypt(session.encryptedViewingKey, encKey);
             const accountId = deriveAccountId(viewingKey);
-            const syncPass = deriveStoragePassword(viewingKey);
-            const nightgateConfig = getNightgatePluginConfig();
-            const { network, nodeUrl, submissionEndpoints } = resolveNightgateRuntimeConfig(nightgateConfig);
-
-            const facadeArgs = {
-                seedHex: bip39SeedHex,
-                networkId: network,
-                indexerHttpUrl: submissionEndpoints.indexerHttpUrl,
-                indexerWsUrl: submissionEndpoints.indexerWsUrl,
-                proofServerUrl: submissionEndpoints.proofServerUrl,
-                relayUrl: nodeUrl,
-                syncStatePassphrase: syncPass
-            };
 
             const job = await startJob({
                 kind: 'connectWalletForSigning',
@@ -367,23 +421,11 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
                 idempotencyKey,
                 // Strip the seed; request snapshots must never carry secrets.
                 request: { sessionId, accountIdPrefix: accountId.slice(0, 16) },
-                work: async () => {
-                    await ensureNetworkId(network);
-                    await getOrBuildWalletFacade(accountId, facadeArgs);
-                    // CRITICAL: init + facade.start() only KICKS OFF the chain
-                    // sync; it does not wait for it. Without blocking here, the
-                    // facade serves whatever (possibly restored, stale) state it
-                    // has, and the deploy path's balanceTx builds against stale
-                    // dust; the live node then rejects it with
-                    // `1010 Invalid Transaction: Custom error: 170`
-                    // (dust validity window: ctime + grace < tblock). Block the
-                    // prewarm job until the wallet is actually synced to the
-                    // chain tip so the dust state (and its ctime) is current.
-                    await walletWaitForSyncedState(accountId, PREWARM_SYNC_TIMEOUT_MS);
-                    return { ready: true };
-                }
+                requestedBy: userId,
+                commandVersion: 1,
+                command: { op: 'prewarm' }
             });
-            console.log('[wallet-sessions] facade pre-warm job', job.jobId.slice(0, 8), 'started for', accountId.slice(0, 16));
+            log.info('facade pre-warm job', job.jobId.slice(0, 8), 'started for', accountId.slice(0, 16));
 
             return {
                 sessionId,
@@ -392,11 +434,7 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
                 prewarmStatus: job.status
             };
         } catch (err: any) {
-            // The session UPDATE already committed (sync work above succeeded),
-            // so signing IS enabled; just the pre-warm couldn't be scheduled.
-            // Surface that as a non-fatal warning + null jobId; callers can
-            // still proceed and the cold-sync cost moves to their first action.
-            console.warn('[wallet-sessions] pre-warm scheduling failed:', err?.message || err);
+            log.warn('pre-warm scheduling failed:', err?.message || err);
             return { sessionId, signingEnabled: true, prewarmJobId: null, prewarmStatus: null };
         }
     });
@@ -425,8 +463,7 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
             return req.reject(410, 'Session expired');
         }
 
-        // Evict any cached WalletFacade keyed on this session's accountId so
-        // the in-memory secret keys are dropped.
+        // Evict the cached WalletFacade so in-memory secret keys are dropped.
         try {
             if (session.encryptedViewingKey) {
                 const viewingKey = decrypt(session.encryptedViewingKey, getEncryptionKey());
@@ -476,52 +513,16 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
             return req.reject(410, 'Session expired');
         }
 
-        const encKey = getEncryptionKey();
-        let viewingKey: string;
-        let seedHex: string;
-        try {
-            viewingKey = decrypt(session.encryptedViewingKey, encKey);
-            seedHex = decrypt(session.encryptedSeedKey, encKey);
-        } catch {
-            return req.reject(500, 'Failed to decrypt session keys (ENCRYPTION_KEY mismatch?)');
-        }
-
-        const nightgateConfig = getNightgatePluginConfig();
-        const { network, nodeUrl, submissionEndpoints } = resolveNightgateRuntimeConfig(nightgateConfig);
-        const accountId = deriveAccountId(viewingKey);
-        const syncPass = deriveStoragePassword(viewingKey);
-
-        // Detach the worker round-trip. Without this, `req.tx` stays open for
-        // the entire cold sync (hours on preprod) and blocks unrelated DB ops,
-        // since @cap-js/sqlite pools a single connection. See
-        // `srv/submission/background-jobs.ts`.
+        // Detach the worker round-trip so the client polls job status instead of
+        // waiting for the whole registration.
         return startJob({
             kind: 'registerForDustGeneration',
             sessionId,
             idempotencyKey,
             request: { sessionId, dustReceiverAddress: dustReceiverAddress || null },
-            work: async () => {
-                await ensureNetworkId(network);
-                const result = await registerNightUtxosForDust({
-                    cacheKey: accountId,
-                    seedHex,
-                    facadeConfig: {
-                        networkId: network,
-                        indexerHttpUrl: submissionEndpoints.indexerHttpUrl,
-                        indexerWsUrl: submissionEndpoints.indexerWsUrl,
-                        proofServerUrl: submissionEndpoints.proofServerUrl,
-                        relayUrl: nodeUrl,
-                        syncStatePassphrase: syncPass
-                    },
-                    dustReceiverAddress: dustReceiverAddress || undefined
-                });
-                return {
-                    txId: result.txId ?? '',
-                    registeredCount: result.registeredCount,
-                    totalNightUtxos: result.totalNightUtxos,
-                    dustReceiverAddress: result.dustReceiverAddress
-                };
-            }
+            requestedBy: userId,
+            commandVersion: 1,
+            command: { op: 'registerDust', dustReceiverAddress: dustReceiverAddress || undefined }
         });
     });
 
@@ -552,19 +553,7 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
             return req.reject(410, 'Session expired');
         }
 
-        const encKey = getEncryptionKey();
-        let viewingKey: string;
-        try {
-            viewingKey = decrypt(session.encryptedViewingKey, encKey);
-        } catch {
-            return req.reject(500, 'Failed to decrypt session keys (ENCRYPTION_KEY mismatch?)');
-        }
-
-        const accountId = deriveAccountId(viewingKey);
-
-        // Optional per-tx fee sponsor: the sponsor's dust pays the
-        // deregistration fee. This unblocks a wallet whose whole generation is
-        // delegated away (own dust stays 0 and cannot fund the deregistration).
+        // optional per-tx fee sponsor
         let sponsor: Awaited<ReturnType<typeof resolveFeeSponsor>> | null = null;
         if (sponsorSessionId) {
             try {
@@ -580,36 +569,14 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
             }
         }
 
-        const nightgateConfig = getNightgatePluginConfig();
-        const { network, nodeUrl, submissionEndpoints } = resolveNightgateRuntimeConfig(nightgateConfig);
-
         return startJob({
             kind: 'deregisterFromDustGeneration',
             sessionId,
             idempotencyKey,
             request: { sessionId, feeSponsor: sponsor?.sponsorSessionId ?? null },
-            work: async () => {
-                if (sponsor) {
-                    await ensureNetworkId(network);
-                    await ensureFeeSponsorFacade(sponsor, {
-                        networkId: network,
-                        indexerHttpUrl: submissionEndpoints.indexerHttpUrl,
-                        indexerWsUrl: submissionEndpoints.indexerWsUrl,
-                        proofServerUrl: submissionEndpoints.proofServerUrl,
-                        relayUrl: nodeUrl
-                    });
-                }
-                const result = await deregisterNightUtxosFromDust({
-                    cacheKey: accountId,
-                    sponsorCacheKey: sponsor?.accountId
-                });
-                return {
-                    txId: result.txId ?? '',
-                    deregisteredCount: result.deregisteredCount,
-                    totalNightUtxos: result.totalNightUtxos,
-                    ...(sponsor ? { feeSponsor: sponsor.sponsorSessionId } : {})
-                };
-            }
+            requestedBy: userId,
+            commandVersion: 1,
+            command: { op: 'deregisterDust', sponsorSessionId: sponsor?.sponsorSessionId }
         });
     });
 
@@ -660,35 +627,14 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
             return req.reject(410, 'Session expired');
         }
 
-        const encKey = getEncryptionKey();
-        let viewingKey: string;
-        try {
-            viewingKey = decrypt(session.encryptedViewingKey, encKey);
-        } catch {
-            return req.reject(500, 'Failed to decrypt session keys (ENCRYPTION_KEY mismatch?)');
-        }
-
-        const accountId = deriveAccountId(viewingKey);
-
         return startJob({
             kind: 'sendNight',
             sessionId,
             idempotencyKey,
             request: { sessionId, receiverAddress, amount, ttlIso: ttlIso || null },
-            work: async () => {
-                const result = await sendNight({
-                    cacheKey: accountId,
-                    receiverAddress,
-                    amount,
-                    ttlIso
-                });
-                return {
-                    txId: result.txId,
-                    toLedger: result.toLedger,
-                    amount: result.amount,
-                    receiverAddress: result.receiverAddress
-                };
-            }
+            requestedBy: userId,
+            commandVersion: 1,
+            command: { op: 'sendNight', receiverAddress, amount, ttlIso }
         });
     });
 
@@ -725,33 +671,14 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
             return req.reject(410, 'Session expired');
         }
 
-        const encKey = getEncryptionKey();
-        let viewingKey: string;
-        try {
-            viewingKey = decrypt(session.encryptedViewingKey, encKey);
-        } catch {
-            return req.reject(500, 'Failed to decrypt session keys (ENCRYPTION_KEY mismatch?)');
-        }
-
-        const accountId = deriveAccountId(viewingKey);
-
         return startJob({
             kind: 'unshieldFunds',
             sessionId,
             idempotencyKey,
             request: { sessionId, amount, ttlIso: ttlIso || null },
-            work: async () => {
-                const result = await unshieldFunds({
-                    cacheKey: accountId,
-                    amount,
-                    ttlIso
-                });
-                return {
-                    txId: result.txId,
-                    amount: result.amount,
-                    unshieldedReceiverAddress: result.unshieldedReceiverAddress
-                };
-            }
+            requestedBy: userId,
+            commandVersion: 1,
+            command: { op: 'unshield', amount, ttlIso }
         });
     });
 
@@ -788,33 +715,14 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
             return req.reject(410, 'Session expired');
         }
 
-        const encKey = getEncryptionKey();
-        let viewingKey: string;
-        try {
-            viewingKey = decrypt(session.encryptedViewingKey, encKey);
-        } catch {
-            return req.reject(500, 'Failed to decrypt session keys (ENCRYPTION_KEY mismatch?)');
-        }
-
-        const accountId = deriveAccountId(viewingKey);
-
         return startJob({
             kind: 'shieldFunds',
             sessionId,
             idempotencyKey,
             request: { sessionId, amount, ttlIso: ttlIso || null },
-            work: async () => {
-                const result = await shieldFunds({
-                    cacheKey: accountId,
-                    amount,
-                    ttlIso
-                });
-                return {
-                    txId: result.txId,
-                    amount: result.amount,
-                    shieldedReceiverAddress: result.shieldedReceiverAddress
-                };
-            }
+            requestedBy: userId,
+            commandVersion: 1,
+            command: { op: 'shield', amount, ttlIso }
         });
     });
 
@@ -968,9 +876,7 @@ export function startSessionCleanup(db: any): ReturnType<typeof setInterval> {
             const now = new Date().toISOString();
             const where = { isActive: true, expiresAt: { '<': now } };
             // Evict cached facades for the expiring sessions so in-memory secret
-            // keys are dropped, not just the DB copies, and null BOTH encrypted
-            // keys (viewing + signing seed): a forced expiry must leave no
-            // wallet secret behind. Mirrors disconnectWallet.
+            // keys are dropped
             const expiring: any[] = (await db.run(
                 SELECT.from(WalletSessions).columns('encryptedViewingKey').where(where)
             )) || [];

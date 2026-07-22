@@ -44,7 +44,13 @@ vi.mock('@sap/cds', () => {
         },
         utils: {
             uuid: vi.fn(() => 'generated-id')
-        }
+        },
+        log: (() => {
+            const channels: Record<string, any> = {};
+            return (name: string) => (channels[name] ??= {
+                info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn(), trace: vi.fn()
+            });
+        })()
     };
     cds.default = cds;
     return cds;
@@ -104,14 +110,33 @@ vi.mock('../../srv/midnight/providers', () => ({
 // handler-level assertions can be deterministic; the work fn is captured for
 // the few cases that drive it explicitly (idempotency, failure classification).
 const mockStartJob = vi.hoisted(() => (vi.fn(async (args: any) => ({ jobId: `job-${args.kind}-test`, status: 'pending' as const }))));
+const registeredProcessors = vi.hoisted(() => new Map<string, (command: unknown, row: any) => Promise<unknown>>());
 vi.mock('../../srv/submission/background-jobs', () => ({
-    startJob: (...args: unknown[]) => (mockStartJob as any)(...args)
+    startJob: (...args: unknown[]) => (mockStartJob as any)(...args),
+    registerBackgroundJobProcessor: (kind: string, _version: number, processor: (command: unknown, row: any) => Promise<unknown>) => registeredProcessors.set(kind, processor)
 }));
 
 import cds from '@sap/cds';
 import { encrypt, getEncryptionKey } from '../../srv/utils/crypto';
 import { RateLimiter } from '../../srv/utils/rate-limiter';
 import { registerWalletSessionHandlers, startSessionCleanup } from '../../srv/sessions/wallet-sessions';
+
+async function runPersistedCommand(args: any): Promise<unknown> {
+    const processor = registeredProcessors.get(args.kind);
+    if (!processor) throw new Error(`No test processor registered for ${args.kind}`);
+    const encKey = getEncryptionKey();
+    mockDbRun.mockResolvedValueOnce({
+        ID: 'row-command', sessionId: args.sessionId, isActive: true,
+        encryptedViewingKey: encrypt('a'.repeat(64), encKey),
+        encryptedSeedKey: encrypt('a'.repeat(128), encKey),
+        expiresAt: new Date(Date.now() + 60_000).toISOString()
+    });
+    return processor(args.command, {
+        ID: 'job-test', kind: args.kind, sessionId: args.sessionId,
+        requestedBy: args.requestedBy, commandVersion: args.commandVersion,
+        command: JSON.stringify(args.command)
+    });
+}
 
 // Unique IP per call so rate-limit buckets never collide across tests within
 // a file (the per-IP "5 per hour" buckets would otherwise be exhausted by
@@ -416,9 +441,9 @@ describe('wallet session handlers', () => {
         const consoleSpies: MockInstance[] = [];
 
         beforeEach(() => {
-            consoleSpies.push(vi.spyOn(console, 'log').mockImplementation(() => {}));
-            consoleSpies.push(vi.spyOn(console, 'warn').mockImplementation(() => {}));
-            consoleSpies.push(vi.spyOn(console, 'error').mockImplementation(() => {}));
+            consoleSpies.push(vi.spyOn(cds.log('nightgate:sessions'), 'info').mockImplementation(() => {}));
+            consoleSpies.push(vi.spyOn(cds.log('nightgate:sessions'), 'warn').mockImplementation(() => {}));
+            consoleSpies.push(vi.spyOn(cds.log('nightgate:sessions'), 'error').mockImplementation(() => {}));
         });
 
         afterEach(() => {
@@ -493,7 +518,7 @@ describe('wallet session handlers', () => {
             expect(args.request).not.toHaveProperty('seedHex');
 
             // Drive work() to confirm it dispatches the actual pre-warm call.
-            await args.work();
+            await runPersistedCommand(args);
             expect(mockEnsureNetworkId).toHaveBeenCalledWith('preprod');
             expect(mockGetOrBuildWalletFacade).toHaveBeenCalledWith('acct-derived', expect.objectContaining({
                 seedHex:   VALID_SEED,
@@ -510,7 +535,7 @@ describe('wallet session handlers', () => {
             mockDbRun.mockResolvedValueOnce(session).mockResolvedValueOnce(1);
             mockStartJob.mockRejectedValueOnce(new Error('worker offline'));
 
-            const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+            const warn = vi.spyOn(cds.log('nightgate:sessions'), 'warn').mockImplementation(() => {});
             try {
                 const req = createMockRequest({ sessionId: 's1', seedHex: VALID_SEED });
                 const result = await registeredHandlers['connectWalletForSigning'](req);
@@ -536,8 +561,8 @@ describe('wallet session handlers', () => {
         const logSpies: MockInstance[] = [];
 
         beforeEach(() => {
-            logSpies.push(vi.spyOn(console, 'log').mockImplementation(() => {}));
-            logSpies.push(vi.spyOn(console, 'warn').mockImplementation(() => {}));
+            logSpies.push(vi.spyOn(cds.log('nightgate:sessions'), 'info').mockImplementation(() => {}));
+            logSpies.push(vi.spyOn(cds.log('nightgate:sessions'), 'warn').mockImplementation(() => {}));
         });
 
         afterEach(() => {
@@ -576,11 +601,11 @@ describe('wallet session handlers', () => {
             expect(args.kind).toBe('registerForDustGeneration');
             expect(args.sessionId).toBe('s1');
             expect(args.request).toEqual({ sessionId: 's1', dustReceiverAddress: 'mn_addr_x' });
-            expect(typeof args.work).toBe('function');
+            expect(args).toMatchObject({ commandVersion: 1, command: { op: 'registerDust' } });
 
             // Drive `work` directly and confirm it forwards cacheKey +
             // dustReceiverAddress through to the underlying call.
-            await args.work();
+            await runPersistedCommand(args);
             expect(mockRegisterNightUtxosForDust).toHaveBeenCalledWith(expect.objectContaining({
                 cacheKey:            'acct-derived',
                 dustReceiverAddress: 'mn_addr_x'
@@ -634,7 +659,7 @@ describe('wallet session handlers', () => {
             const args = mockStartJob.mock.calls[0][0];
             expect(args.kind).toBe('deregisterFromDustGeneration');
             expect(args.sessionId).toBe('s1');
-            await args.work();
+            await runPersistedCommand(args);
             expect(mockDeregisterNightUtxosFromDust).toHaveBeenCalledWith({ cacheKey: 'acct-derived' });
         });
 
@@ -652,8 +677,8 @@ describe('wallet session handlers', () => {
 
     describe('sendNight', () => {
         beforeEach(() => {
-            vi.spyOn(console, 'log').mockImplementation(() => {});
-            vi.spyOn(console, 'warn').mockImplementation(() => {});
+            vi.spyOn(cds.log('nightgate:sessions'), 'info').mockImplementation(() => {});
+            vi.spyOn(cds.log('nightgate:sessions'), 'warn').mockImplementation(() => {});
         });
 
         afterEach(() => {
@@ -707,7 +732,7 @@ describe('wallet session handlers', () => {
             mockSendNight.mockResolvedValueOnce({
                 txId: 'tx-send', toLedger: 'shielded', amount: '1', receiverAddress: 'mn_shield-addr_x'
             });
-            const workResult = await args.work();
+            const workResult = await runPersistedCommand(args);
             expect(mockSendNight).toHaveBeenCalledWith(expect.objectContaining({
                 cacheKey: 'acct-derived',
                 amount: '1'
@@ -734,7 +759,7 @@ describe('wallet session handlers', () => {
 
     describe('swap handlers', () => {
         beforeEach(() => {
-            vi.spyOn(console, 'log').mockImplementation(() => {});
+            vi.spyOn(cds.log('nightgate:sessions'), 'info').mockImplementation(() => {});
         });
         afterEach(() => {
             vi.restoreAllMocks();
@@ -751,7 +776,7 @@ describe('wallet session handlers', () => {
             const args = mockStartJob.mock.calls[0][0];
             expect(args.kind).toBe('unshieldFunds');
             mockUnshieldFunds.mockResolvedValueOnce({ txId: 'tx', amount: '5', unshieldedReceiverAddress: 'mn_addr_x' });
-            const workResult = await args.work();
+            const workResult = await runPersistedCommand(args);
             expect(mockUnshieldFunds).toHaveBeenCalledWith(expect.objectContaining({ cacheKey: 'acct-derived', amount: '5' }));
             expect(workResult).toMatchObject({ txId: 'tx', unshieldedReceiverAddress: 'mn_addr_x' });
         });
@@ -773,7 +798,7 @@ describe('wallet session handlers', () => {
             const args = mockStartJob.mock.calls[0][0];
             expect(args.kind).toBe('shieldFunds');
             mockShieldFunds.mockResolvedValueOnce({ txId: 'tx', amount: '5', shieldedReceiverAddress: 'mn_shield-addr_x' });
-            const workResult = await args.work();
+            const workResult = await runPersistedCommand(args);
             expect(mockShieldFunds).toHaveBeenCalledWith(expect.objectContaining({ cacheKey: 'acct-derived', amount: '5' }));
             expect(workResult).toMatchObject({ txId: 'tx', shieldedReceiverAddress: 'mn_shield-addr_x' });
         });
@@ -785,7 +810,7 @@ describe('wallet session handlers', () => {
 
     describe('diagnostics handlers', () => {
         beforeEach(() => {
-            vi.spyOn(console, 'log').mockImplementation(() => {});
+            vi.spyOn(cds.log('nightgate:sessions'), 'info').mockImplementation(() => {});
         });
         afterEach(() => {
             vi.restoreAllMocks();
@@ -860,7 +885,7 @@ describe('wallet session handlers', () => {
 
     describe('disconnectWallet (facade eviction)', () => {
         beforeEach(() => {
-            vi.spyOn(console, 'log').mockImplementation(() => {});
+            vi.spyOn(cds.log('nightgate:sessions'), 'info').mockImplementation(() => {});
         });
         afterEach(() => {
             vi.restoreAllMocks();

@@ -26,7 +26,8 @@ vi.mock('../../srv/midnight/providers', () => ({
 // test can drive it explicitly if needed.
 const mockStartJob = vi.hoisted(() => (vi.fn(async (args: any) => ({ jobId: 'job-prewarm-test', status: 'pending' as const }))));
 vi.mock('../../srv/submission/background-jobs', () => ({
-    startJob: (...args: unknown[]) => (mockStartJob as any)(...args)
+    startJob: (...args: unknown[]) => (mockStartJob as any)(...args),
+    registerBackgroundJobProcessor: vi.fn()
 }));
 
 import { registerWalletSessionHandlers } from '../../srv/sessions/wallet-sessions';
@@ -200,7 +201,8 @@ describe('connectWalletForSigning: state transitions', () => {
         expect(startArgs.kind).toBe('connectWalletForSigning');
         expect(startArgs.sessionId).toBe('sess-1');
         expect(startArgs.request).not.toHaveProperty('seedHex');
-        expect(typeof startArgs.work).toBe('function');
+        expect(startArgs).toMatchObject({ requestedBy: 'test-user', commandVersion: 1, command: { op: 'prewarm' } });
+        expect(startArgs.work).toBeUndefined();
     });
 
     test('prewarm:false skips the prewarm job but still enables signing', async () => {

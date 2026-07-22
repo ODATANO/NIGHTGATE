@@ -52,27 +52,10 @@ interface DisclosureRoleRow {
 }
 
 export interface AttachDisclosureRoleOptions {
-    /**
-     * If supplied, restricts the lookup to grants whose `scope` matches this
-     * value AND globally-scoped grants (NULL/empty scope). If omitted, only
-     * globally-scoped grants apply.
-     */
+
     scope?: string;
-    /**
-     * AttestationVault deployment address. When supplied, the tier is resolved
-     * from the ON-CHAIN `DisclosureGrants` (the tamper-evident ACL): the
-     * caller's granteeId is matched against active grants for this contract,
-     * and that result is AUTHORITATIVE (no fall-back to the off-chain
-     * `DisclosureRoles` table). Omit to use the off-chain table (the original
-     * behavior).
-     */
-    contractAddress?: string;
-    /**
-     * Optional attestation payload hash. When supplied alongside
-     * `contractAddress`, the on-chain match is narrowed to grants for this
-     * specific attestation; otherwise any active grant on the contract counts.
-     */
-    payloadHash?: string;
+    contractAddress?: string; // AttestationVault deployment address
+    payloadHash?: string; // Optional attestation payload hash
 }
 
 /**

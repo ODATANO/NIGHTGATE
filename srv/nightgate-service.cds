@@ -14,12 +14,12 @@ service NightgateService {
     // Blockchain Core - Read-Only Access
     // ========================================================================
 
-            /**
-             * Blocks endpoint with full navigation capabilities
-             * Supports: $filter, $orderby, $expand, $select, $top, $skip
-             */
+    /**
+     * Blocks endpoint with full navigation capabilities
+     * Supports: $filter, $orderby, $expand, $select, $top, $skip
+     */
     @readonly
-    entity Blocks                    as
+    entity Blocks                as
         projection on midnight.Blocks {
             *,
             parent,
@@ -38,11 +38,11 @@ service NightgateService {
             function range(startHeight: Integer64, endHeight: Integer64, limit: Integer) returns array of Blocks;
         };
 
-            /**
-             * Transactions with expanded relationships
-             */
+    /**
+     * Transactions with expanded relationships
+     */
     @readonly
-    entity Transactions              as
+    entity Transactions          as
         projection on midnight.Transactions {
             *,
             block,
@@ -64,23 +64,23 @@ service NightgateService {
         };
 
     @readonly
-    entity TransactionResults        as projection on midnight.TransactionResults;
+    entity TransactionResults    as projection on midnight.TransactionResults;
 
     @readonly
-    entity TransactionSegments       as projection on midnight.TransactionSegments;
+    entity TransactionSegments   as projection on midnight.TransactionSegments;
 
     @readonly
-    entity TransactionFees           as projection on midnight.TransactionFees;
+    entity TransactionFees       as projection on midnight.TransactionFees;
 
     // ========================================================================
     // Smart Contracts
     // ========================================================================
 
-            /**
-             * Contract actions with deployment, call, and update tracking
-             */
+    /**
+     * Contract actions with deployment, call, and update tracking
+     */
     @readonly
-    entity ContractActions           as
+    entity ContractActions       as
         projection on midnight.ContractActions {
             *,
             transaction,
@@ -97,17 +97,17 @@ service NightgateService {
         };
 
     @readonly
-    entity ContractBalances          as projection on midnight.ContractBalances;
+    entity ContractBalances      as projection on midnight.ContractBalances;
 
     // ========================================================================
     // UTXOs
     // ========================================================================
 
-            /**
-             * Unshielded UTXOs for transparent transactions
-             */
+    /**
+     * Unshielded UTXOs for transparent transactions
+     */
     @readonly
-    entity UnshieldedUtxos           as
+    entity UnshieldedUtxos       as
         projection on midnight.UnshieldedUtxos {
             *,
             createdAtTransaction,
@@ -128,20 +128,20 @@ service NightgateService {
     // ========================================================================
 
     @readonly
-    entity ZswapLedgerEvents         as projection on midnight.ZswapLedgerEvents;
+    entity ZswapLedgerEvents     as projection on midnight.ZswapLedgerEvents;
 
     @readonly
-    entity DustLedgerEvents          as projection on midnight.DustLedgerEvents;
+    entity DustLedgerEvents      as projection on midnight.DustLedgerEvents;
 
     // ========================================================================
     // Balance & Token Tracking
     // ========================================================================
 
-            /**
-             * Unshielded NIGHT token balances per address
-             */
+    /**
+     * Unshielded NIGHT token balances per address
+     */
     @readonly
-    entity NightBalances             as projection on midnight.NightBalances
+    entity NightBalances         as projection on midnight.NightBalances
         actions {
             // Get balance for a specific address
             @cds.odata.bindingparameter.collection
@@ -162,7 +162,7 @@ service NightgateService {
      * `finalized` by the crawler when the matching tx is indexed.
      */
     @readonly
-    entity PendingSubmissions        as projection on midnight.PendingSubmissions;
+    entity PendingSubmissions    as projection on midnight.PendingSubmissions;
 
     // ========================================================================
     // Document Anchoring
@@ -174,7 +174,7 @@ service NightgateService {
      * AttestationVault `attest` call has been submitted.
      */
     @readonly
-    entity Documents                 as projection on midnight.Documents;
+    entity Documents             as projection on midnight.Documents;
 
     /**
      * Anchor a document's content hash on-chain via the AttestationVault
@@ -182,33 +182,26 @@ service NightgateService {
      * bytes at `storageRef` (e.g. file://, s3://, ipfs://); this action
      * commits only the hash + public metadata to the chain.
      *
-     * `sha256` is a 64-char hex string of the file content (becomes
-     * `payload_hash` on chain). `metadata` is a JSON-encoded public blob;
-     * its blake2b/sha256 commitment is what `attest` stores as
-     * `metadata_hash`. `sessionId` provides the wallet that signs and pays
-     * DUST fees. `compiledArtifactRef` defaults to 'attestation-vault'.
-     *
      * Async: returns `{ jobId, status, documentId }` immediately. The
      * `documentId` is a stable handle into the Documents entity (the row is
      * inserted synchronously up-front), so callers can poll the row for
      * `anchoredTxHash` independently of `getJobStatus`. The job's `result`
      * on success carries `{ documentId, attestationId, txHash, anchoredAt }`.
      */
-    action anchorDocument(
-        sha256:              String,
-        contentType:         String,
-        size:                Integer64,
-        storageRef:          String,
-        metadata:            LargeString,  // JSON
-        sessionId:           UUID,
-        contractAddress:     String,       // AttestationVault deployment to anchor into
-        compiledArtifactRef: String,       // optional, defaults to 'attestation-vault'
-        idempotencyKey:      String,       // optional; dedupes retries
-        sponsorSessionId:    UUID          // optional; second session pays the dust fee (see submitContractCall)
-    )                                returns {
-        jobId:      UUID;
-        status:     String;  // 'pending' | 'succeeded' (idempotent retry)
-        documentId: UUID;    // stable handle for Documents row polling
+    action   anchorDocument(sha256: String,
+                            contentType: String,
+                            size: Integer64,
+                            storageRef: String,
+                            metadata: LargeString, // JSON
+                            sessionId: UUID,
+                            contractAddress: String, // AttestationVault deployment to anchor into
+                            compiledArtifactRef: String, // optional, defaults to 'attestation-vault'
+                            idempotencyKey: String, // optional; dedupes retries
+                            sponsorSessionId: UUID // optional; second session pays the dust fee (see submitContractCall)
+    )                                                                 returns {
+        jobId      : UUID;
+        status     : String; // 'pending' | 'succeeded' (idempotent retry)
+        documentId : UUID; // stable handle for Documents row polling
     };
 
     /**
@@ -232,16 +225,15 @@ service NightgateService {
      * unchanged; only the evidence source is extended. `compiledArtifactRef`
      * defaults to 'attestation-vault'.
      */
-    function verifyDocument(
-        documentId:     UUID,
-        providedSha256: String,
-        contractAddress:     String,   // optional; enables the crawler-free state fallback
-        compiledArtifactRef: String    // optional, defaults to 'attestation-vault'
-    )                                returns {
-        verified:       Boolean;
-        anchoredTxHash: String;
-        anchoredAt:     Timestamp;
-        originalSha256: String;
+    function verifyDocument(documentId: UUID,
+                            providedSha256: String,
+                            contractAddress: String, // optional; enables the crawler-free state fallback
+                            compiledArtifactRef: String // optional, defaults to 'attestation-vault'
+    )                                                                 returns {
+        verified       : Boolean;
+        anchoredTxHash : String;
+        anchoredAt     : Timestamp;
+        originalSha256 : String;
     };
 
     // ========================================================================
@@ -254,7 +246,7 @@ service NightgateService {
      * AttestationVault `provePredicate` call has been included on-chain.
      */
     @readonly
-    entity PredicateAttestations     as projection on midnight.PredicateAttestations;
+    entity PredicateAttestations as projection on midnight.PredicateAttestations;
 
     /**
      * Prove that a hidden numeric value satisfies a predicate against a public
@@ -273,23 +265,22 @@ service NightgateService {
      * (row inserted up-front). The job `result` carries the PAC envelope shape
      * `{ predicateAttestationId, payloadHash, claim, proof }`.
      */
-    action issuePredicateAttestation(
-        payloadHash:         String,       // attestation payload_hash (64 hex)
-        value:               String,       // scaled integer, decimal string (witness only)
-        salt:                String,       // optional 64-hex commitment opening
-        predicate:           String,       // 'lessOrEqual' | 'greaterOrEqual'
-        threshold:           Integer64,    // scaled integer
-        unit:                String,       // optional, informational (e.g. 'kgCO2e/kWh')
-        valueCommitment:     String,       // optional 64-hex on-chain commitment (for the envelope)
-        sessionId:           UUID,
-        contractAddress:     String,       // AttestationVault deployment
-        compiledArtifactRef: String,       // optional, defaults to 'attestation-vault'
-        idempotencyKey:      String,       // optional; dedupes retries
-        sponsorSessionId:    UUID          // optional; second session pays the dust fee (see submitContractCall)
-    )                                returns {
-        jobId:                  UUID;
-        status:                 String;
-        predicateAttestationId: UUID;
+    action   issuePredicateAttestation(payloadHash: String, // attestation payload_hash (64 hex)
+                                       value: String, // scaled integer, decimal string (witness only)
+                                       salt: String, // optional 64-hex commitment opening
+                                       predicate: String, // 'lessOrEqual' | 'greaterOrEqual'
+                                       threshold: Integer64, // scaled integer
+                                       unit: String, // optional, informational (e.g. 'kgCO2e/kWh')
+                                       valueCommitment: String, // optional 64-hex on-chain commitment (for the envelope)
+                                       sessionId: UUID,
+                                       contractAddress: String, // AttestationVault deployment
+                                       compiledArtifactRef: String, // optional, defaults to 'attestation-vault'
+                                       idempotencyKey: String, // optional; dedupes retries
+                                       sponsorSessionId: UUID // optional; second session pays the dust fee (see submitContractCall)
+    )                                                                 returns {
+        jobId                  : UUID;
+        status                 : String;
+        predicateAttestationId : UUID;
     };
 
     /**
@@ -309,25 +300,24 @@ service NightgateService {
      *
      * Async: returns `{ jobId, status, predicateAttestationId }` immediately.
      */
-    action issueFieldPredicateAttestation(
-        payloadHash:         String,       // attestation payload_hash (64 hex)
-        fieldKey:            String,       // 64 hex canonical field id (public)
-        value:               String,       // scaled integer, decimal string (witness only)
-        contentRoot:         String,       // optional 64-hex Merkle root to anchor first
-        siblingsJson:        String,       // JSON array of 4 × 64-hex sibling digests
-        dirsJson:            String,       // JSON array of 4 booleans (left-child flags)
-        predicate:           String,       // 'lessOrEqual' | 'greaterOrEqual'
-        threshold:           Integer64,    // scaled integer
-        unit:                String,       // optional, informational
-        sessionId:           UUID,
-        contractAddress:     String,       // AttestationVault deployment
-        compiledArtifactRef: String,       // optional, defaults to 'attestation-vault'
-        idempotencyKey:      String,       // optional; dedupes retries
-        sponsorSessionId:    UUID          // optional; second session pays the dust fee (see submitContractCall)
-    )                                returns {
-        jobId:                  UUID;
-        status:                 String;
-        predicateAttestationId: UUID;
+    action   issueFieldPredicateAttestation(payloadHash: String, // attestation payload_hash (64 hex)
+                                            fieldKey: String, // 64 hex canonical field id (public)
+                                            value: String, // scaled integer, decimal string (witness only)
+                                            contentRoot: String, // optional 64-hex Merkle root to anchor first
+                                            siblingsJson: String, // JSON array of 4 × 64-hex sibling digests
+                                            dirsJson: String, // JSON array of 4 booleans (left-child flags)
+                                            predicate: String, // 'lessOrEqual' | 'greaterOrEqual'
+                                            threshold: Integer64, // scaled integer
+                                            unit: String, // optional, informational
+                                            sessionId: UUID,
+                                            contractAddress: String, // AttestationVault deployment
+                                            compiledArtifactRef: String, // optional, defaults to 'attestation-vault'
+                                            idempotencyKey: String, // optional; dedupes retries
+                                            sponsorSessionId: UUID // optional; second session pays the dust fee (see submitContractCall)
+    )                                                                 returns {
+        jobId                  : UUID;
+        status                 : String;
+        predicateAttestationId : UUID;
     };
 
     /**
@@ -347,16 +337,14 @@ service NightgateService {
      * `persistentHash(FieldPredicateClaim{payloadHash, fieldKey, threshold, op})`
      * against `field_predicate_results`.
      */
-    function verifyPredicateAttestation(
-        predicateAttestationId: UUID
-    )                                returns {
-        verified:        Boolean;
-        predicate:       String;
-        threshold:       Integer64;
-        unit:            String;
-        valueCommitment: String;
-        provenTxHash:    String;
-        provenAt:        Timestamp;
+    function verifyPredicateAttestation(predicateAttestationId: UUID) returns {
+        verified        : Boolean;
+        predicate       : String;
+        threshold       : Integer64;
+        unit            : String;
+        valueCommitment : String;
+        provenTxHash    : String;
+        provenAt        : Timestamp;
     };
 
     /**
@@ -379,17 +367,16 @@ service NightgateService {
      * Per-network endpoints are overridable via
      * `cds.requires.nightgate.networks.<network>.indexerHttpUrl/indexerWsUrl`.
      */
-    function verifyAttestationState(
-        contractAddress:     String,
-        payloadHash:         String,   // 64 hex
-        contentRoot:         String,   // optional 64 hex, checked against anchored root
-        compiledArtifactRef: String,   // optional, defaults to 'attestation-vault'
-        network:             String    // optional network override, e.g. 'preview' | 'preprod' | 'mainnet'
-    )                                returns {
-        verified:      Boolean;
-        attested:      Boolean;   // payload_hash present in the attestation map
-        contentRootOk: Boolean;   // anchored content root matches (when contentRoot given)
-        attesterId:    String;    // owner grantee id, if present
+    function verifyAttestationState(contractAddress: String,
+                                    payloadHash: String, // 64 hex
+                                    contentRoot: String, // optional 64 hex, checked against anchored root
+                                    compiledArtifactRef: String, // optional, defaults to 'attestation-vault'
+                                    network: String // optional network override, e.g. 'preview' | 'preprod' | 'mainnet'
+    )                                                                 returns {
+        verified      : Boolean;
+        attested      : Boolean; // payload_hash present in the attestation map
+        contentRootOk : Boolean; // anchored content root matches (when contentRoot given)
+        attesterId    : String; // owner grantee id, if present
     };
 
     /**
@@ -414,17 +401,16 @@ service NightgateService {
      * `network` (optional) behaves exactly as on `verifyAttestationState`:
      * read from another network's public indexer, 400 on unknown values.
      */
-    function verifyPredicateState(
-        contractAddress:     String,
-        payloadHash:         String,   // 64 hex
-        fieldKey:            String,   // optional 64 hex; when set, field-bound
-        predicate:           String,   // 'lessOrEqual' | 'greaterOrEqual'
-        threshold:           Integer64, // scaled circuit integer (see above)
-        compiledArtifactRef: String,   // optional, defaults to 'attestation-vault'
-        network:             String    // optional network override, e.g. 'preview' | 'preprod' | 'mainnet'
-    )                                returns {
-        verified: Boolean;
-        proven:   Boolean;   // a true result is recorded on-chain for the claim key
+    function verifyPredicateState(contractAddress: String,
+                                  payloadHash: String, // 64 hex
+                                  fieldKey: String, // optional 64 hex; when set, field-bound
+                                  predicate: String, // 'lessOrEqual' | 'greaterOrEqual'
+                                  threshold: Integer64, // scaled circuit integer (see above)
+                                  compiledArtifactRef: String, // optional, defaults to 'attestation-vault'
+                                  network: String // optional network override, e.g. 'preview' | 'preprod' | 'mainnet'
+    )                                                                 returns {
+        verified : Boolean;
+        proven   : Boolean; // a true result is recorded on-chain for the claim key
     };
 
     /**
@@ -436,7 +422,7 @@ service NightgateService {
      * on-chain (granted and not revoked).
      */
     @readonly
-    entity DisclosureGrants          as projection on midnight.DisclosureGrants;
+    entity DisclosureGrants      as projection on midnight.DisclosureGrants;
 
     /**
      * Re-read the AttestationVault `disclosures` ledger Map from LIVE on-chain
@@ -450,14 +436,13 @@ service NightgateService {
      * reconciliation. Returns a clean zero (not a 5xx) when no live provider is
      * configured. `compiledArtifactRef` defaults to 'attestation-vault'.
      */
-    action reindexDisclosures(
-        contractAddress:     String,
-        compiledArtifactRef: String    // optional, defaults to 'attestation-vault'
-    )                                returns {
-        contractAddress: String;
-        active:          Integer;
-        deactivated:     Integer;
-        reconciledAt:    Timestamp;
+    action   reindexDisclosures(contractAddress: String,
+                                compiledArtifactRef: String // optional, defaults to 'attestation-vault'
+    )                                                                 returns {
+        contractAddress : String;
+        active          : Integer;
+        deactivated     : Integer;
+        reconciledAt    : Timestamp;
     };
 
     /**
@@ -472,19 +457,18 @@ service NightgateService {
      * `{ disclosureGrantId, payloadHash, grantee, level, txHash }`.
      * `compiledArtifactRef` defaults to 'attestation-vault'.
      */
-    action grantDisclosure(
-        payloadHash:         String,   // 64 hex, the attestation
-        grantee:             String,   // 64 hex Bytes<32> grantee identifier
-        level:               Integer,  // 0 | 1 | 2
-        sessionId:           UUID,
-        contractAddress:     String,   // AttestationVault deployment
-        compiledArtifactRef: String,   // optional, defaults to 'attestation-vault'
-        idempotencyKey:      String,   // optional; dedupes retries
-        sponsorSessionId:    UUID      // optional; second session pays the dust fee (see submitContractCall)
-    )                                returns {
-        jobId:             UUID;
-        status:            String;
-        disclosureGrantId: UUID;
+    action   grantDisclosure(payloadHash: String, // 64 hex, the attestation
+                             grantee: String, // 64 hex Bytes<32> grantee identifier
+                             level: Integer, // 0 | 1 | 2
+                             sessionId: UUID,
+                             contractAddress: String, // AttestationVault deployment
+                             compiledArtifactRef: String, // optional, defaults to 'attestation-vault'
+                             idempotencyKey: String, // optional; dedupes retries
+                             sponsorSessionId: UUID // optional; second session pays the dust fee (see submitContractCall)
+    )                                                                 returns {
+        jobId             : UUID;
+        status            : String;
+        disclosureGrantId : UUID;
     };
 
     /**
@@ -493,17 +477,16 @@ service NightgateService {
      * Attester-only. Async: returns `{ jobId, status }`. The job `result`
      * carries `{ payloadHash, grantee, txHash }`.
      */
-    action revokeDisclosure(
-        payloadHash:         String,   // 64 hex, the attestation
-        grantee:             String,   // 64 hex Bytes<32> grantee identifier
-        sessionId:           UUID,
-        contractAddress:     String,   // AttestationVault deployment
-        compiledArtifactRef: String,   // optional, defaults to 'attestation-vault'
-        idempotencyKey:      String,   // optional; dedupes retries
-        sponsorSessionId:    UUID      // optional; second session pays the dust fee (see submitContractCall)
-    )                                returns {
-        jobId:  UUID;
-        status: String;
+    action   revokeDisclosure(payloadHash: String, // 64 hex, the attestation
+                              grantee: String, // 64 hex Bytes<32> grantee identifier
+                              sessionId: UUID,
+                              contractAddress: String, // AttestationVault deployment
+                              compiledArtifactRef: String, // optional, defaults to 'attestation-vault'
+                              idempotencyKey: String, // optional; dedupes retries
+                              sponsorSessionId: UUID // optional; second session pays the dust fee (see submitContractCall)
+    )                                                                 returns {
+        jobId  : UUID;
+        status : String;
     };
 
     /**
@@ -511,7 +494,7 @@ service NightgateService {
      * grantee id the AttestationVault checks (read side of the disclosure ACL).
      */
     @readonly
-    entity GranteeIdentities         as projection on midnight.GranteeIdentities;
+    entity GranteeIdentities     as projection on midnight.GranteeIdentities;
 
     /**
      * Bind the authenticated caller (req.user.id) to the `Bytes<32>` grantee id
@@ -525,13 +508,12 @@ service NightgateService {
      * omit for a global binding. Idempotent on (userId, scope); re-registering
      * updates the existing row. Requires authentication (401 otherwise).
      */
-    action registerGranteeIdentity(
-        bindingInput: String,
-        scope:        String   // optional; omit for a global binding
-    )                                returns {
-        ID:          UUID;
-        granteeId:   String;
-        bindingKind: String;
+    action   registerGranteeIdentity(bindingInput: String,
+                                     scope: String // optional; omit for a global binding
+    )                                                                 returns {
+        ID          : UUID;
+        granteeId   : String;
+        bindingKind : String;
     };
 
     /**
@@ -544,15 +526,14 @@ service NightgateService {
      * status }` (status here is the PendingSubmissions lifecycle status,
      * `included` / `finalized` / `failed`, distinct from the job status).
      */
-    action deployContract(
-        compiledArtifactRef: String,
-        sessionId:           UUID,
-        initialPrivateState: LargeString, // JSON-encoded
-        idempotencyKey:      String,      // optional; dedupes retries
-        sponsorSessionId:    UUID         // optional; second session pays the dust fee (see submitContractCall)
-    )                                returns {
-        jobId:  UUID;
-        status: String;  // 'pending' | 'succeeded' (idempotent retry)
+    action   deployContract(compiledArtifactRef: String,
+                            sessionId: UUID,
+                            initialPrivateState: LargeString, // JSON-encoded
+                            idempotencyKey: String, // optional; dedupes retries
+                            sponsorSessionId: UUID // optional; second session pays the dust fee (see submitContractCall)
+    )                                                                 returns {
+        jobId  : UUID;
+        status : String; // 'pending' | 'succeeded' (idempotent retry)
     };
 
     /**
@@ -576,18 +557,17 @@ service NightgateService {
      * cds config `feeSponsorSessions` (platform sponsor). Job request and
      * result carry `feeSponsor` for audit.
      */
-    action submitContractCall(
-        contractAddress:     String,
-        circuit:             String,
-        compiledArtifactRef: String,
-        sessionId:           UUID,
-        args:                LargeString, // JSON-encoded array, may be '[]'
-        idempotencyKey:      String,      // optional; dedupes retries
-        initialPrivateState: LargeString, // optional JSON; seeded on this wallet's first call
-        sponsorSessionId:    UUID         // optional; second session pays the dust fee (see above)
-    )                                returns {
-        jobId:  UUID;
-        status: String;  // 'pending' | 'succeeded' (idempotent retry)
+    action   submitContractCall(contractAddress: String,
+                                circuit: String,
+                                compiledArtifactRef: String,
+                                sessionId: UUID,
+                                args: LargeString, // JSON-encoded array, may be '[]'
+                                idempotencyKey: String, // optional; dedupes retries
+                                initialPrivateState: LargeString, // optional JSON; seeded on this wallet's first call
+                                sponsorSessionId: UUID // optional; second session pays the dust fee (see above)
+    )                                                                 returns {
+        jobId  : UUID;
+        status : String; // 'pending' | 'succeeded' (idempotent retry)
     };
 
     // ========================================================================
@@ -598,7 +578,7 @@ service NightgateService {
      * Wallet session management
      */
     @readonly
-    entity WalletSessions            as
+    entity WalletSessions        as
         projection on midnight.WalletSessions
         excluding {
             viewingKeyHash, // Internal lookup field
@@ -610,18 +590,18 @@ service NightgateService {
      * Create a read-only session by storing the viewing key encrypted at rest.
      * Returns the new session's UUID and metadata.
      */
-    action connectWallet(viewingKey: String) returns {
-        ID: UUID;
-        sessionId: UUID;
-        connectedAt: Timestamp;
-        expiresAt: Timestamp;
-        isActive: Boolean;
+    action   connectWallet(viewingKey: String)                        returns {
+        ID          : UUID;
+        sessionId   : UUID;
+        connectedAt : Timestamp;
+        expiresAt   : Timestamp;
+        isActive    : Boolean;
     };
 
     /**
      * Disconnect an active session, nulling out encrypted keys.
      */
-    action disconnectWallet(sessionId: UUID);
+    action   disconnectWallet(sessionId: UUID);
 
     /**
      * Upgrade an existing read-only session with signing capability.
@@ -645,19 +625,18 @@ service NightgateService {
      * ready. Failing to wait is fine; subsequent actions just block on the
      * same sync internally.
      */
-    action connectWalletForSigning(
-        sessionId:      UUID,
-        mnemonic:       String,  // BIP39 recovery phrase (preferred)
-        seedHex:        String,  // optional: 64-byte BIP39 seed as 128 hex chars
-        idempotencyKey: String,  // optional; dedupes retries on a flaky network
-        prewarm:        Boolean  // optional; false skips the sync-to-tip prewarm job
-                                 // (for sponsored callers that hold nothing; submissions
-                                 // ensure the facade on demand since 0.8.1)
-    ) returns {
-        sessionId:      UUID;
-        signingEnabled: Boolean;
-        prewarmJobId:   UUID;
-        prewarmStatus:  String;  // 'pending' | 'succeeded' (idempotent retry)
+    action   connectWalletForSigning(sessionId: UUID,
+                                     mnemonic: String, // BIP39 recovery phrase (preferred)
+                                     seedHex: String, // optional: 64-byte BIP39 seed as 128 hex chars
+                                     idempotencyKey: String, // optional; dedupes retries on a flaky network
+                                     prewarm: Boolean // optional; false skips the sync-to-tip prewarm job
+    // (for sponsored callers that hold nothing; submissions
+    // ensure the facade on demand since 0.8.1)
+    )                                                                 returns {
+        sessionId      : UUID;
+        signingEnabled : Boolean;
+        prewarmJobId   : UUID;
+        prewarmStatus  : String; // 'pending' | 'succeeded' (idempotent retry)
     };
 
     /**
@@ -676,18 +655,17 @@ service NightgateService {
      * `accountIndex` (default 0) selects the BIP32 account level, so one
      * phrase can host multiple independent accounts (e.g. one per producer).
      */
-    action deriveWalletInfo(
-        mnemonic:     String,   // BIP39 recovery phrase; one of mnemonic|seedHex required
-        seedHex:      String,   // optional: 64-byte BIP39 seed as 128 hex chars
-        accountIndex: Integer   // optional, default 0
-    ) returns {
-        viewingKey:      String;  // 64-hex zswap encryption public key (connectWallet input)
-        shieldedAddress: String;  // mn_shield-addr_... (receives shielded assets)
-        nightAddress:    String;  // mn_addr_... unshielded NIGHT address (faucet target)
-        dustAddress:     String;  // mn_dust_... DUST address; pass as dustReceiverAddress
-                                  // to registerForDustGeneration for sponsored dust generation
-        accountIndex:    Integer;
-        network:         String;  // encoding network (the configured NIGHTGATE network)
+    action   deriveWalletInfo(mnemonic: String, // BIP39 recovery phrase; one of mnemonic|seedHex required
+                              seedHex: String, // optional: 64-byte BIP39 seed as 128 hex chars
+                              accountIndex: Integer // optional, default 0
+    )                                                                 returns {
+        viewingKey      : String; // 64-hex zswap encryption public key (connectWallet input)
+        shieldedAddress : String; // mn_shield-addr_... (receives shielded assets)
+        nightAddress    : String; // mn_addr_... unshielded NIGHT address (faucet target)
+        dustAddress     : String; // mn_dust_... DUST address; pass as dustReceiverAddress
+        // to registerForDustGeneration for sponsored dust generation
+        accountIndex    : Integer;
+        network         : String; // encoding network (the configured NIGHTGATE network)
     };
 
     /**
@@ -704,13 +682,12 @@ service NightgateService {
      * `idempotencyKey` (optional) lets retries on a flaky network dedupe
      * against the original job; reusing a key returns the existing jobId.
      */
-    action registerForDustGeneration(
-        sessionId:           UUID,
-        dustReceiverAddress: String,  // optional; defaults to the wallet's own DUST address
-        idempotencyKey:      String   // optional; dedupes retries
-    ) returns {
-        jobId:  UUID;
-        status: String;  // 'pending' | 'succeeded' (idempotent retry)
+    action   registerForDustGeneration(sessionId: UUID,
+                                       dustReceiverAddress: String, // optional; defaults to the wallet's own DUST address
+                                       idempotencyKey: String // optional; dedupes retries
+    )                                                                 returns {
+        jobId  : UUID;
+        status : String; // 'pending' | 'succeeded' (idempotent retry)
     };
 
     /**
@@ -722,15 +699,14 @@ service NightgateService {
      * On success the `result` field of `getJobStatus` carries
      * `{ txId, deregisteredCount, totalNightUtxos }`.
      */
-    action deregisterFromDustGeneration(
-        sessionId:        UUID,
-        idempotencyKey:   String, // optional
-        sponsorSessionId: UUID    // optional; second session pays the dust fee (a fully
-                                  // delegated wallet has dust 0 and cannot pay its own
-                                  // deregistration; see submitContractCall for the rules)
-    ) returns {
-        jobId:  UUID;
-        status: String;  // 'pending' | 'succeeded' (idempotent retry)
+    action   deregisterFromDustGeneration(sessionId: UUID,
+                                          idempotencyKey: String, // optional
+                                          sponsorSessionId: UUID // optional; second session pays the dust fee (a fully
+    // delegated wallet has dust 0 and cannot pay its own
+    // deregistration; see submitContractCall for the rules)
+    )                                                                 returns {
+        jobId  : UUID;
+        status : String; // 'pending' | 'succeeded' (idempotent retry)
     };
 
     /**
@@ -745,15 +721,14 @@ service NightgateService {
      * Async: returns `{ jobId, status }`. Polled via `getJobStatus`; on
      * success the `result` carries `{ txId, toLedger, amount, receiverAddress }`.
      */
-    action sendNight(
-        sessionId:       UUID,
-        receiverAddress: String,
-        amount:          String,
-        ttlIso:          String,  // optional ISO-8601; defaults to +10min
-        idempotencyKey:  String   // optional; dedupes retries
-    ) returns {
-        jobId:  UUID;
-        status: String;  // 'pending' | 'succeeded' (idempotent retry)
+    action   sendNight(sessionId: UUID,
+                       receiverAddress: String,
+                       amount: String,
+                       ttlIso: String, // optional ISO-8601; defaults to +10min
+                       idempotencyKey: String // optional; dedupes retries
+    )                                                                 returns {
+        jobId  : UUID;
+        status : String; // 'pending' | 'succeeded' (idempotent retry)
     };
 
     /**
@@ -767,14 +742,13 @@ service NightgateService {
      * Async: `{ jobId, status }`. `result` carries
      * `{ txId, amount, unshieldedReceiverAddress }`.
      */
-    action unshieldFunds(
-        sessionId:      UUID,
-        amount:         String,
-        ttlIso:         String,  // optional
-        idempotencyKey: String   // optional
-    ) returns {
-        jobId:  UUID;
-        status: String;
+    action   unshieldFunds(sessionId: UUID,
+                           amount: String,
+                           ttlIso: String, // optional
+                           idempotencyKey: String // optional
+    )                                                                 returns {
+        jobId  : UUID;
+        status : String;
     };
 
     /**
@@ -784,14 +758,13 @@ service NightgateService {
      * Async: `{ jobId, status }`. `result` carries
      * `{ txId, amount, shieldedReceiverAddress }`.
      */
-    action shieldFunds(
-        sessionId:      UUID,
-        amount:         String,
-        ttlIso:         String,  // optional
-        idempotencyKey: String   // optional
-    ) returns {
-        jobId:  UUID;
-        status: String;
+    action   shieldFunds(sessionId: UUID,
+                         amount: String,
+                         ttlIso: String, // optional
+                         idempotencyKey: String // optional
+    )                                                                 returns {
+        jobId  : UUID;
+        status : String;
     };
 
     // ========================================================================
@@ -807,12 +780,12 @@ service NightgateService {
      * separated by shielded vs unshielded ledger, plus current DUST and the
      * count of NIGHT UTXOs currently committed to dust generation.
      */
-    function getWalletBalance(sessionId: UUID) returns {
-        shieldedNight: String;
-        unshieldedNight: String;
-        dustBalance: String;
-        registeredNightUtxoCount: Integer;
-        totalNightUtxoCount: Integer;
+    function getWalletBalance(sessionId: UUID)                        returns {
+        shieldedNight            : String;
+        unshieldedNight          : String;
+        dustBalance              : String;
+        registeredNightUtxoCount : Integer;
+        totalNightUtxoCount      : Integer;
     };
 
     /**
@@ -824,14 +797,13 @@ service NightgateService {
      * Use this to gate `sendNight` on whether the wallet has enough DUST
      * to pay the fee.
      */
-    function estimateSendNightFee(
-        sessionId:       UUID,
-        receiverAddress: String,
-        amount:          String,
-        ttlIso:          String   // optional
-    ) returns {
-        fee: String;
-        toLedger: String;
+    function estimateSendNightFee(sessionId: UUID,
+                                  receiverAddress: String,
+                                  amount: String,
+                                  ttlIso: String // optional
+    )                                                                 returns {
+        fee      : String;
+        toLedger : String;
     };
 
     /**
@@ -839,23 +811,21 @@ service NightgateService {
      * Builds the `initSwap` recipe without finalizing, returns fee in
      * DUST atoms (decimal string).
      */
-    function estimateUnshieldFee(
-        sessionId: UUID,
-        amount:    String,
-        ttlIso:    String   // optional
-    ) returns {
-        fee: String;
-        direction: String;   // 'unshield'
+    function estimateUnshieldFee(sessionId: UUID,
+                                 amount: String,
+                                 ttlIso: String // optional
+    )                                                                 returns {
+        fee       : String;
+        direction : String; // 'unshield'
     };
 
     /** Symmetric counterpart: estimate DUST fee for a `shieldFunds` shift. */
-    function estimateShieldFee(
-        sessionId: UUID,
-        amount:    String,
-        ttlIso:    String   // optional
-    ) returns {
-        fee: String;
-        direction: String;   // 'shield'
+    function estimateShieldFee(sessionId: UUID,
+                               amount: String,
+                               ttlIso: String // optional
+    )                                                                 returns {
+        fee       : String;
+        direction : String; // 'shield'
     };
 
     // ========================================================================
@@ -878,23 +848,34 @@ service NightgateService {
      * than leaking existence.
      *
      * Declared as `action` (HTTP POST) rather than `function` (HTTP GET) so
-     * clients can polling-loop with the same POST + JSON-body pattern they
+     * `status` describes server-side workflow completion. `chainStatus` is
+     * independently populated later from canonical System.Events evidence.
+     * Clients can polling-loop with the same POST + JSON-body pattern they
      * already use for every other async action. Side-effect free
      * despite the verb.
      */
-    action getJobStatus(
-        jobId:     UUID,
-        sessionId: UUID
-    ) returns {
-        jobId:        UUID;
-        kind:         String;
-        status:       String;   // 'pending' | 'running' | 'succeeded' | 'failed'
-        result:       LargeString;
-        errorCode:    String;
-        errorMessage: LargeString;
-        submittedAt:  Timestamp;
-        startedAt:    Timestamp;
-        finishedAt:   Timestamp;
+    action   getJobStatus(jobId: UUID,
+                          sessionId: UUID)                            returns {
+        jobId        : UUID;
+        kind         : String;
+        status       : String; // pending | running | external_execution | submitted | reconciliation_required | succeeded | failed
+        result       : LargeString;
+        errorCode    : String;
+        errorMessage : LargeString;
+        attempt      : Integer;
+        maxAttempts  : Integer;
+        submissionId : UUID;
+        txHash        : String;
+        chainStatus   : String; // null | pending | success | failure; independent of job status
+        chainFinalizedAt : Timestamp;
+        leaseOwner    : String;
+        leaseExpiresAt: Timestamp;
+        heartbeatAt   : Timestamp;
+        queuedAt      : Timestamp;
+        externalExecutionAt : Timestamp;
+        submittedAt  : Timestamp;
+        startedAt    : Timestamp;
+        finishedAt   : Timestamp;
     };
 }
 

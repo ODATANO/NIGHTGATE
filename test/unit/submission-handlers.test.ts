@@ -21,11 +21,35 @@ import type { Mock } from 'vitest';
 const mockStartJob = vi.hoisted(() => (vi.fn(async (args: any) => {
     // Drive the work fn immediately so submitter.deploy/.call is exercised;
     // keeps the per-call args + registration meta assertions meaningful.
-    try { await args.work(); } catch { /* failures are absorbed into the job row in prod; tests assert via mock call inspection */ }
+    try {
+        if (args.command) {
+            const processor = registeredProcessors.get(`${args.kind}\0${args.commandVersion}`);
+            await processor?.(args.command, {
+                ID: 'job-test', kind: args.kind, sessionId: args.sessionId,
+                requestedBy: args.requestedBy, commandVersion: args.commandVersion,
+                command: JSON.stringify(args.command)
+            });
+        } else {
+            await args.work();
+        }
+    } catch { /* failures are absorbed into the job row in prod; tests assert via mock call inspection */ }
     return { jobId: `job-${args.kind}-test`, status: 'pending' as const };
 })));
+const registeredProcessors = vi.hoisted(() => new Map<string, (command: unknown, row: any) => Promise<unknown>>());
+const registeredFinalizers = vi.hoisted(() => new Map<string, (command: unknown, row: any, evidence: any) => Promise<unknown>>());
 vi.mock('../../srv/submission/background-jobs', () => ({
-    startJob: (...args: unknown[]) => (mockStartJob as any)(...args)
+    startJob: (...args: unknown[]) => (mockStartJob as any)(...args),
+    runChildCommand: async (args: any) => {
+        const processor = registeredProcessors.get(`${args.kind}\0${args.commandVersion}`);
+        if (!processor) throw new Error(`missing child processor ${args.kind}`);
+        return processor(args.command, {
+            ID: `child-${args.step}`, kind: args.kind, sessionId: args.parent.sessionId,
+            requestedBy: args.parent.requestedBy, commandVersion: args.commandVersion,
+            command: JSON.stringify(args.command), parentJobId: args.parent.ID, workflowStep: args.step
+        });
+    },
+    registerBackgroundJobProcessor: (kind: string, version: number, processor: (command: unknown, row: any) => Promise<unknown>) => registeredProcessors.set(`${kind}\0${version}`, processor),
+    registerBackgroundJobReconciliationFinalizer: (kind: string, version: number, finalizer: (command: unknown, row: any, evidence: any) => Promise<unknown>) => registeredFinalizers.set(`${kind}\0${version}`, finalizer)
 }));
 
 import { registerSubmissionHandlers } from '../../srv/submission/handlers';
@@ -62,6 +86,7 @@ function makeFakeService() {
 function makeReq(data: Record<string, unknown>) {
     return {
         data,
+        user: { id: 'test-user' },
         reject: vi.fn((status: number, message: string) => {
             const err: any = new Error(message);
             err.status = status;
@@ -196,6 +221,10 @@ describe('error translation to OData status codes', () => {
         // has been called by the time we get here; keeps the existing
         // "deploy forwards registration meta" assertions valid.
         expect(submitter.deploy).toHaveBeenCalledTimes(1);
+        expect(mockStartJob.mock.calls.at(-1)?.[0]).toMatchObject({
+            requestedBy: 'test-user', commandVersion: 1, encryptCommand: true,
+            command: { op: 'deploy', initialPrivateState: { counter: 0 } }
+        });
     });
 
     test('happy path: submitContractCall returns { jobId, status } and submitter.call is invoked', async () => {
@@ -209,6 +238,10 @@ describe('error translation to OData status codes', () => {
             status: 'pending'
         });
         expect(submitter.call).toHaveBeenCalledTimes(1);
+        expect(mockStartJob.mock.calls.at(-1)?.[0]).toMatchObject({
+            requestedBy: 'test-user', commandVersion: 1, encryptCommand: true,
+            command: { op: 'call', contractAddress: VALID_CALL_ARGS.contractAddress }
+        });
     });
 
     test('deploy forwards registration meta (artifactPath/privateStateId/zkConfigPath) to submitter', async () => {
@@ -433,6 +466,20 @@ describe('anchorDocument', () => {
         expect(callArgs.args[1]).toHaveLength(32);
     });
 
+    test('reconciliation finalizer restores the document projection and typed result without submitting', async () => {
+        const { db } = setupHandlersWithDb();
+        db.run.mockClear();
+        const finalizer = registeredFinalizers.get('anchorDocument\0' + '1')!;
+        const result = await finalizer({
+            op: 'anchorDocument', documentId: 'doc-reconciled', payloadHash: VALID_SHA256,
+            metadataHash: 'b'.repeat(64), contractAddress: '0xVAULT', compiledArtifactRef: 'attestation-vault'
+        }, {}, { txHash: '0xanchor', finalizedAt: '2026-07-22T10:00:00Z' });
+
+        expect(JSON.stringify(db.run.mock.calls[0][0])).toContain('doc-reconciled');
+        expect(JSON.stringify(db.run.mock.calls[0][0])).toContain('0xanchor');
+        expect(result).toMatchObject({ reconciled: true, documentId: 'doc-reconciled', txHash: '0xanchor' });
+    });
+
     test('defaults compiledArtifactRef to attestation-vault when omitted', async () => {
         const submitter = makeSuccessfulSubmitter();
         const { srv } = setupHandlersWithDb({ submitterFactory: () => submitter });
@@ -546,7 +593,7 @@ describe('verifyDocument', () => {
         const srv = setupHandlersWithDb(makeDbWithSequence([
             { ID: DOC_ID, sha256: VALID_SHA, anchoredTxHash: TX_HASH, anchoredAt: '2026-05-19T12:00:00Z' },
             { ID: TX_ID, hash: TX_HASH },
-            { status: 'SUCCESS' }
+            { status: 'SUCCESS', outcomeSource: 'substrate-system-events' }
         ]));
         const req = makeReq({ documentId: DOC_ID, providedSha256: VALID_SHA });
         const result: any = await srv.handlers['verifyDocument'](req);
@@ -612,7 +659,7 @@ describe('verifyDocument', () => {
         const srv = setupHandlersWithDb(makeDbWithSequence([
             { ID: DOC_ID, sha256: VALID_SHA.toLowerCase(), anchoredTxHash: TX_HASH, anchoredAt: '2026-05-19T12:00:00Z' },
             { ID: TX_ID, hash: TX_HASH },
-            { status: 'SUCCESS' }
+            { status: 'SUCCESS', outcomeSource: 'substrate-system-events' }
         ]));
         const req = makeReq({ documentId: DOC_ID, providedSha256: VALID_SHA.toUpperCase() });
         const result: any = await srv.handlers['verifyDocument'](req);
@@ -757,19 +804,20 @@ describe('issuePredicateAttestation', () => {
 
     test('UPDATE is skipped when provePredicate throws inside work', async () => {
         const subErr = new SubmissionError('sub-z', { code: 'OnChainStatus:Fail', retryable: false, message: 'predicate false' });
-        const { srv, db } = setupHandlersWithDb({
-            submitterFactory: () => ({
-                deploy: vi.fn(),
-                // commitValue succeeds, provePredicate throws.
-                call: vi.fn()
-                    .mockResolvedValueOnce({ txHash: '0xcommit', status: 'included' })
-                    .mockRejectedValueOnce(subErr)
-            }) as unknown as TransactionSubmitter
-        });
+        const failingSubmitter = {
+            deploy: vi.fn(),
+            // commitValue succeeds, provePredicate throws.
+            call: vi.fn()
+                .mockResolvedValueOnce({ txHash: '0xcommit', status: 'included' })
+                .mockRejectedValueOnce(subErr)
+        } as unknown as TransactionSubmitter;
+        const { srv, db } = setupHandlersWithDb({ submitterFactory: () => failingSubmitter });
         const req = makeReq(VALID_ARGS());
         const result: any = await srv.handlers['issuePredicateAttestation'](req);
-        // INSERT only; UPDATE never reached.
-        expect(db.run).toHaveBeenCalledTimes(1);
+        // The parent workflow must not persist a proof result when the proof
+        // child failed (processor revalidation may perform additional DB I/O).
+        expect((db.run as Mock).mock.calls.some(([q]) => Boolean(q?.UPDATE)
+            && JSON.stringify(q).includes('provenTxHash'))).toBe(false);
         expect(req.reject).not.toHaveBeenCalled();
         expect(result).toMatchObject({ jobId: expect.any(String), status: 'pending' });
     });
@@ -829,7 +877,7 @@ describe('verifyPredicateAttestation', () => {
         const srv = setupHandlersWithDb(makeDbWithSequence([
             provenRow(),
             { ID: TX_ID, hash: TX_HASH },
-            { status: 'SUCCESS' }
+            { status: 'SUCCESS', outcomeSource: 'substrate-system-events' }
         ]));
         const req = makeReq({ predicateAttestationId: PA_ID });
         const result: any = await srv.handlers['verifyPredicateAttestation'](req);
@@ -1000,6 +1048,20 @@ describe('grantDisclosure', () => {
         }));
     });
 
+    test('reconciliation finalizer restores grantedTxHash, reindexes and returns normal grant fields', async () => {
+        const { db } = setupHandlersWithDb();
+        db.run.mockClear();
+        reindexer.mockClear();
+        const result = await registeredFinalizers.get('grantDisclosure\0' + '1')!({
+            op: 'grantDisclosure', disclosureGrantId: 'grant-reconciled', payloadHash: VALID_PAYLOAD,
+            grantee: VALID_GRANTEE, level: 2, contractAddress: '0xVAULT', compiledArtifactRef: 'attestation-vault'
+        }, {}, { txHash: '0xgrant', finalizedAt: null });
+
+        expect(JSON.stringify(db.run.mock.calls[0][0])).toContain('0xgrant');
+        expect(reindexer).toHaveBeenCalledTimes(1);
+        expect(result).toMatchObject({ reconciled: true, disclosureGrantId: 'grant-reconciled', level: 2, txHash: '0xgrant' });
+    });
+
     test('reuses an existing grant row instead of inserting a duplicate', async () => {
         const srv = makeFakeService();
         // First db.run = SELECT.one existing → return a row; all later calls → undefined.
@@ -1094,6 +1156,22 @@ describe('revokeDisclosure', () => {
         });
         return { srv, db };
     }
+
+    test('reconciliation finalizer fail-closes the local grant and reindexes', async () => {
+        const reindexer = vi.fn().mockResolvedValue({ indexed: 0, deactivated: 1 });
+        const { db } = setupHandlersWithDb({ disclosureReindexer: reindexer });
+        db.run.mockClear();
+        const result = await registeredFinalizers.get('revokeDisclosure\0' + '1')!({
+            op: 'revokeDisclosure', payloadHash: VALID_PAYLOAD, grantee: VALID_GRANTEE,
+            contractAddress: '0xVAULT', compiledArtifactRef: 'attestation-vault'
+        }, {}, { txHash: '0xrevoke', finalizedAt: null });
+
+        const update = JSON.stringify(db.run.mock.calls[0][0]);
+        expect(update).toContain('0xrevoke');
+        expect(update).toContain('false');
+        expect(reindexer).toHaveBeenCalledTimes(1);
+        expect(result).toMatchObject({ reconciled: true, payloadHash: VALID_PAYLOAD, grantee: VALID_GRANTEE, txHash: '0xrevoke' });
+    });
 
     test('rejects non-hex grantee', async () => {
         const { srv } = setupHandlersWithDb();
