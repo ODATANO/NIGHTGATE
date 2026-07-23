@@ -285,6 +285,35 @@ export function resolveOverrideIndexerEndpoints(
     };
 }
 
+/**
+ * Whether the crawler-free chain-outcome confirmer runs. The crawler is the sole
+ * source of truth for `chainStatus`, so with it enabled the confirmer NEVER runs
+ * (running both risks divergent verdicts overwriting each other). With the
+ * crawler off it defaults on; `NIGHTGATE_CRAWLERLESS_CHAIN_CONFIRM=false` /
+ * `config.crawlerlessChainConfirm: false` opts out.
+ */
+export function resolveCrawlerlessChainConfirmEnabled(
+    crawlerEnabled: boolean,
+    config?: Record<string, any>
+): boolean {
+    if (crawlerEnabled) return false;
+    const env = readEnv('NIGHTGATE_CRAWLERLESS_CHAIN_CONFIRM');
+    if (env != null) return !/^(false|0|no|off)$/i.test(env);
+    if (typeof config?.crawlerlessChainConfirm === 'boolean') return config.crawlerlessChainConfirm;
+    return true;
+}
+
+/**
+ * Whether the confirmer was explicitly requested on (env/config), independent of
+ * the crawler gate. Lets the caller warn when an opt-in is ignored because the
+ * crawler is active, instead of silently dropping it.
+ */
+export function isCrawlerlessChainConfirmExplicitlyEnabled(config?: Record<string, any>): boolean {
+    const env = readEnv('NIGHTGATE_CRAWLERLESS_CHAIN_CONFIRM');
+    if (env != null) return !/^(false|0|no|off)$/i.test(env);
+    return config?.crawlerlessChainConfirm === true;
+}
+
 export function resolveNightgateRuntimeConfig(config: Record<string, any> = {}): {
     network: NightgateNetwork;
     nodeUrl: string;

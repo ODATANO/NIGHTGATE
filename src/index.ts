@@ -5,6 +5,8 @@ import { ensureNightgateModelLoaded } from '../srv/utils/cds-model';
 import {
     isNightgatePluginConfigured,
     resolveNightgateRuntimeConfig,
+    resolveCrawlerlessChainConfirmEnabled,
+    isCrawlerlessChainConfirmExplicitlyEnabled,
     VALID_NIGHTGATE_NETWORKS,
     getNightgatePluginConfig,
     DEFAULT_NETWORK
@@ -13,7 +15,8 @@ import { loadRegistryFromConfig, listRegisteredContracts } from '../srv/submissi
 const log = cds.log('nightgate');
 import { startWalletWorker, stopWalletWorker } from '../srv/midnight/wallet-worker-client';
 import { wireWorkerStateSaveSink } from '../srv/submission/wallet-facade-builder';
-import { recoverInterruptedJobs, startBackgroundJobProcessor, stopBackgroundJobProcessor } from '../srv/submission/background-jobs';
+import { recoverInterruptedJobs, startBackgroundJobProcessor, stopBackgroundJobProcessor, registerChainOutcomeConfirmer } from '../srv/submission/background-jobs';
+import { buildIndexerTxConfirmer } from '../srv/submission/chain-outcome-confirmer';
 import { TransactionResults } from '#cds-models/midnight';
 import {
     assertSupportedRuntimeTopology,
@@ -154,7 +157,7 @@ export async function initialize(): Promise<NightgateIndexerStatus> {
         return getStatus();
     }
 
-    const { network, nodeUrl, crawlerConfig, crawlerNodeUrl, invalidNetwork } = resolveNightgateRuntimeConfig(nightgateConfig);
+    const { network, nodeUrl, crawlerConfig, crawlerNodeUrl, submissionEndpoints, invalidNetwork } = resolveNightgateRuntimeConfig(nightgateConfig);
     const crawlerEnabled = (crawlerConfig as any).enabled !== false;
 
     if (invalidNetwork) {
@@ -249,6 +252,18 @@ export async function initialize(): Promise<NightgateIndexerStatus> {
         await startWalletWorker();
         wireWorkerStateSaveSink();
         await startBackgroundJobProcessor();
+        // Crawler-free chain-outcome confirmation: advance chainStatus by a
+        // per-tx Indexer lookup so `requireChainSuccess` is reachable without
+        // block ingestion. Registered only when the crawler is off (or opted in);
+        // with the crawler running it stays the source of truth.
+        if (resolveCrawlerlessChainConfirmEnabled(crawlerEnabled, nightgateConfig)) {
+            registerChainOutcomeConfirmer(buildIndexerTxConfirmer({
+                indexerHttpUrl: submissionEndpoints.indexerHttpUrl
+            }));
+            log.info('Crawler-free chain-outcome confirmation enabled');
+        } else if (crawlerEnabled && isCrawlerlessChainConfirmExplicitlyEnabled(nightgateConfig)) {
+            log.warn('crawlerlessChainConfirm opt-in ignored: the crawler is enabled and is the sole source of truth for chainStatus');
+        }
         log.info('Wallet worker thread ready');
     } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
@@ -313,6 +328,7 @@ export async function initialize(): Promise<NightgateIndexerStatus> {
  */
 export async function shutdown(): Promise<void> {
     stopBackgroundJobProcessor();
+    registerChainOutcomeConfirmer(null);
     try {
         await stopCrawler();
     } catch (err) {

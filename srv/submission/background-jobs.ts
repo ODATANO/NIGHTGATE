@@ -657,6 +657,36 @@ let chainPendingCursor: string | undefined;
 let chainLegacyCursor: string | undefined;
 let parentPendingCursor: string | undefined;
 let parentLegacyCursor: string | undefined;
+let confirmerPendingCursor: string | undefined;
+let confirmerLegacyCursor: string | undefined;
+
+// Crawler-free chain-outcome confirmer, injected at startup only when the
+// crawler is disabled (or explicitly opted in). Null keeps the pass a no-op, so
+// crawler deployments see no behavior change.
+type ChainOutcomeConfirmer = (txHash: string) => Promise<{ status: 'success' | 'failure' } | null>;
+let chainOutcomeConfirmer: ChainOutcomeConfirmer | null = null;
+let chainConfirmActive = false;
+const CHAIN_CONFIRM_CONCURRENCY = 8;
+
+/** Register (or clear, with null) the crawler-free tx-outcome confirmer. */
+export function registerChainOutcomeConfirmer(confirmer: ChainOutcomeConfirmer | null): void {
+    chainOutcomeConfirmer = confirmer;
+}
+
+/**
+ * Kick a confirm pass without blocking the caller. Decoupled from the command
+ * poller: the pass runs to completion in the background and a single-flight
+ * guard drops overlapping kicks, so slow Indexer lookups never stall command
+ * polling or reconciliation.
+ */
+function triggerChainConfirmPass(): void {
+    if (!chainOutcomeConfirmer || chainConfirmActive) return;
+    chainConfirmActive = true;
+    void confirmChainOutcomesViaIndexer()
+        .catch(err => cds.log('nightgate').warn(
+            `Chain-outcome confirm pass failed: ${String((err as Error)?.message ?? err)}`))
+        .finally(() => { chainConfirmActive = false; });
+}
 
 /**
  * Read one bounded, deterministic page, advancing past every inspected row
@@ -694,6 +724,7 @@ export async function startBackgroundJobProcessor(): Promise<void> {
     await pollPersistedCommands();
     await reconcileBackgroundJobs();
     await refreshSucceededChainOutcomes();
+    triggerChainConfirmPass();
     commandPollTimer = setInterval(() => void pollPersistedCommands().catch(err => {
         cds.log('nightgate').warn(`Background-job poll failed: ${String((err as Error)?.message ?? err)}`);
     }), 2000);
@@ -721,6 +752,7 @@ async function pollPersistedCommands(): Promise<void> {
         }
         await reconcileBackgroundJobs(db);
         await refreshSucceededChainOutcomes(db);
+        triggerChainConfirmPass();
     } finally {
         commandPollActive = false;
     }
@@ -887,6 +919,63 @@ export async function refreshSucceededChainOutcomes(existingDb?: any): Promise<n
     return updated;
 }
 
+/**
+ * Crawler-free twin of `refreshSucceededChainOutcomes`' leaf pass: advance a
+ * succeeded leaf job's `chainStatus` by a per-tx Indexer lookup instead of the
+ * crawler-populated `Transactions`/`TransactionResults`. No-op unless a confirmer
+ * is registered (crawler on -> not registered). Workflow parents are skipped;
+ * their `chainStatus` is aggregated from children by `refreshSucceededChainOutcomes`.
+ */
+export async function confirmChainOutcomesViaIndexer(existingDb?: any): Promise<number> {
+    const confirmer = chainOutcomeConfirmer;
+    if (!confirmer) return 0;
+    const db = existingDb ?? await cds.connect.to('db');
+    const pendingPage = await scanBackgroundJobPage(db, {
+        status: 'succeeded', txHash: { '!=': null }, chainStatus: 'pending'
+    }, confirmerPendingCursor);
+    confirmerPendingCursor = pendingPage.cursor;
+    const legacyPage = await scanBackgroundJobPage(db, {
+        status: 'succeeded', txHash: { '!=': null }, chainStatus: null
+    }, confirmerLegacyCursor);
+    confirmerLegacyCursor = legacyPage.cursor;
+    const jobs = [...pendingPage.rows, ...legacyPage.rows].filter(job => !WORKFLOW_PARENT_KINDS.has(job.kind));
+    let updated = 0;
+    let lookupErrors = 0;
+    let writeErrors = 0;
+    // Bounded parallelism: each lookup is one short Indexer query. Serial would
+    // let a full page stack per-lookup latency; unbounded would hammer the Indexer.
+    await mapWithConcurrency(jobs, CHAIN_CONFIRM_CONCURRENCY, async job => {
+        let outcome: { status: 'success' | 'failure' } | null;
+        try {
+            outcome = await confirmer(job.txHash!);
+        } catch {
+            lookupErrors++;
+            return;
+        }
+        if (!outcome) return; // not yet indexed -> retry next tick
+        // CAS on the exact chainStatus we read (compiles to `= 'pending'` or,
+        // for legacy rows, `IS NULL` - not `IN (...)`, which never matches NULL in
+        // SQL). Keeps the write a safe no-op if the value changed since the scan.
+        try {
+            const affected = await withStatusWriteRetry(`confirmChainOutcome(${job.ID})`, () => db.run(
+                UPDATE.entity(BackgroundJobs).set({
+                    chainStatus: outcome!.status,
+                    chainFinalizedAt: new Date().toISOString()
+                }).where({ ID: job.ID, status: 'succeeded', chainStatus: job.chainStatus ?? null })
+            ));
+            updated += affectedRows(affected);
+        } catch {
+            writeErrors++;
+        }
+    });
+    if (lookupErrors > 0 || writeErrors > 0) {
+        cds.log('nightgate').warn(
+            `Crawler-free chain confirm: ${lookupErrors} lookup / ${writeErrors} write error(s) of ${jobs.length} this pass`
+        );
+    }
+    return updated;
+}
+
 // ---- Internal --------------------------------------------------------------
 
 // Status-write hardening. The mark* writes are tiny single-row UPDATEs, but under
@@ -896,6 +985,23 @@ export async function refreshSucceededChainOutcomes(existingDb?: any): Promise<n
 // retry is safe. Only the STATUS write is retried, never the job work (double-submit risk).
 
 const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
+
+/**
+ * Run `fn` over `items` with at most `limit` in flight, awaiting ALL workers to
+ * completion. A throwing `fn` is swallowed per-item so one failure never abandons
+ * siblings or resolves the whole early (the caller relies on this to keep its
+ * single-flight guard held until the pass truly finishes). `fn` should handle its
+ * own errors; this is only a backstop.
+ */
+async function mapWithConcurrency<T>(items: T[], limit: number, fn: (item: T) => Promise<void>): Promise<void> {
+    let next = 0;
+    const worker = async (): Promise<void> => {
+        while (next < items.length) {
+            try { await fn(items[next++]); } catch { /* per-item backstop; fn owns its errors */ }
+        }
+    };
+    await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+}
 
 const STATUS_WRITE_ATTEMPTS = 3;
 const DEFAULT_STATUS_WRITE_BACKOFF_MS: readonly number[] = [0, 1500, 4000];
@@ -1152,6 +1258,10 @@ export function __resetForTests(): void {
     chainLegacyCursor = undefined;
     parentPendingCursor = undefined;
     parentLegacyCursor = undefined;
+    confirmerPendingCursor = undefined;
+    confirmerLegacyCursor = undefined;
+    chainOutcomeConfirmer = null;
+    chainConfirmActive = false;
     statusWriteBackoffMs = DEFAULT_STATUS_WRITE_BACKOFF_MS;
 }
 

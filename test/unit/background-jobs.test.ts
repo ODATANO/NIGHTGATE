@@ -243,6 +243,8 @@ import {
     recoverInterruptedJobs,
     reconcileBackgroundJobs,
     refreshSucceededChainOutcomes,
+    confirmChainOutcomesViaIndexer,
+    registerChainOutcomeConfirmer,
     __resetForTests,
     __setStatusWriteBackoffForTests
 } from '../../srv/submission/background-jobs';
@@ -709,6 +711,74 @@ describe('bounded background scans remain fair beyond one page', () => {
         expect(await refreshSucceededChainOutcomes()).toBe(0);
         expect(await refreshSucceededChainOutcomes()).toBe(1);
         expect(rows.get('parent-100')).toMatchObject({ chainStatus: 'success' });
+    });
+});
+
+// ---- Crawler-free chain-outcome confirmation -------------------------------
+
+describe('confirmChainOutcomesViaIndexer: crawler-free chainStatus advance', () => {
+    const putSucceeded = (ID: string, patch: Partial<Row>): Row => {
+        const now = new Date().toISOString();
+        const row = {
+            ID, kind: 'submitContractCall', sessionId: 'sess-1', status: 'succeeded',
+            idempotencyKey: null, request: '{}', result: '{}', errorCode: null,
+            errorMessage: null, startedAt: now, finishedAt: now, createdAt: now,
+            modifiedAt: now, chainStatus: 'pending', ...patch
+        } as Row;
+        rows.set(ID, row);
+        return row;
+    };
+
+    afterEach(() => registerChainOutcomeConfirmer(null));
+
+    test('is a no-op when no confirmer is registered', async () => {
+        putSucceeded('job-noconfirmer', { txHash: '0xaaa' });
+        expect(await confirmChainOutcomesViaIndexer()).toBe(0);
+        expect(rows.get('job-noconfirmer')?.chainStatus).toBe('pending');
+    });
+
+    test('advances a pending leaf to success without the crawler tables', async () => {
+        registerChainOutcomeConfirmer(async () => ({ status: 'success' }));
+        putSucceeded('job-ok', { txHash: '0xok' });
+        // evidenceTables intentionally empty: no PendingSubmissions / Transactions needed.
+        expect(await confirmChainOutcomesViaIndexer()).toBe(1);
+        expect(rows.get('job-ok')).toMatchObject({ status: 'succeeded', chainStatus: 'success' });
+        expect(rows.get('job-ok')?.chainFinalizedAt).toBeTruthy();
+    });
+
+    test('advances a legacy (null chainStatus) leaf to failure, keeping status succeeded', async () => {
+        registerChainOutcomeConfirmer(async () => ({ status: 'failure' }));
+        putSucceeded('job-legacy', { txHash: '0xfail', chainStatus: null });
+        expect(await confirmChainOutcomesViaIndexer()).toBe(1);
+        expect(rows.get('job-legacy')).toMatchObject({ status: 'succeeded', chainStatus: 'failure' });
+    });
+
+    test('leaves the job pending when the tx is not yet finalized (null outcome)', async () => {
+        registerChainOutcomeConfirmer(async () => null);
+        putSucceeded('job-pending', { txHash: '0xnotyet' });
+        expect(await confirmChainOutcomesViaIndexer()).toBe(0);
+        expect(rows.get('job-pending')?.chainStatus).toBe('pending');
+    });
+
+    test('skips workflow parents (chainStatus is aggregated from children)', async () => {
+        const confirmer = vi.fn(async () => ({ status: 'success' as const }));
+        registerChainOutcomeConfirmer(confirmer);
+        putSucceeded('parent-job', { kind: 'issuePredicateAttestation', txHash: '0xparent' });
+        expect(await confirmChainOutcomesViaIndexer()).toBe(0);
+        expect(confirmer).not.toHaveBeenCalled();
+        expect(rows.get('parent-job')?.chainStatus).toBe('pending');
+    });
+
+    test('continues past a throwing confirmer without failing the whole pass', async () => {
+        registerChainOutcomeConfirmer(async (txHash) => {
+            if (txHash === '0xthrow') throw new Error('lookup blew up');
+            return { status: 'success' };
+        });
+        putSucceeded('job-throw', { txHash: '0xthrow' });
+        putSucceeded('job-after', { txHash: '0xafter' });
+        expect(await confirmChainOutcomesViaIndexer()).toBe(1);
+        expect(rows.get('job-throw')?.chainStatus).toBe('pending');
+        expect(rows.get('job-after')?.chainStatus).toBe('success');
     });
 });
 

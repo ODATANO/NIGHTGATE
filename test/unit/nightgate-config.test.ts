@@ -19,6 +19,8 @@ import {
     normalizeNightgateNetwork,
     resolveNightgateRuntimeConfig,
     resolveOverrideIndexerEndpoints,
+    resolveCrawlerlessChainConfirmEnabled,
+    isCrawlerlessChainConfirmExplicitlyEnabled,
     resolveSubmissionEndpoints,
     deriveIndexerWsUrl,
     DEFAULT_INDEXER_URLS
@@ -32,6 +34,7 @@ const ENV_KEYS = [
     'NIGHTGATE_FETCH_CONCURRENCY',
     'NIGHTGATE_RPC_BATCH_SIZE',
     'NIGHTGATE_CRAWLER_ENABLED',
+    'NIGHTGATE_CRAWLERLESS_CHAIN_CONFIRM',
     'NIGHTGATE_ALLOW_SELF_SERVICE_GRANTEE_REGISTRATION',
     // Submission endpoints: a developer .env for live runs (or the IDE test
     // extension propagating it) would otherwise win over the config-based
@@ -163,6 +166,42 @@ describe('isSelfServiceGranteeRegistrationAllowed', () => {
         }
         process.env.NIGHTGATE_ALLOW_SELF_SERVICE_GRANTEE_REGISTRATION = 'true';
         expect(isSelfServiceGranteeRegistrationAllowed({ allowSelfServiceGranteeRegistration: false })).toBe(true);
+    });
+});
+
+describe('resolveCrawlerlessChainConfirmEnabled', () => {
+    it('never enables while the crawler is active, regardless of opt-in', () => {
+        expect(resolveCrawlerlessChainConfirmEnabled(true)).toBe(false);
+        expect(resolveCrawlerlessChainConfirmEnabled(true, { crawlerlessChainConfirm: true })).toBe(false);
+        process.env.NIGHTGATE_CRAWLERLESS_CHAIN_CONFIRM = 'true';
+        expect(resolveCrawlerlessChainConfirmEnabled(true)).toBe(false);
+    });
+
+    it('defaults on when the crawler is disabled', () => {
+        expect(resolveCrawlerlessChainConfirmEnabled(false)).toBe(true);
+    });
+
+    it('config/env false opts out even with the crawler off', () => {
+        expect(resolveCrawlerlessChainConfirmEnabled(false, { crawlerlessChainConfirm: false })).toBe(false);
+        for (const v of ['false', '0', 'no', 'off', 'FALSE']) {
+            process.env.NIGHTGATE_CRAWLERLESS_CHAIN_CONFIRM = v;
+            expect(resolveCrawlerlessChainConfirmEnabled(false, { crawlerlessChainConfirm: true })).toBe(false);
+        }
+    });
+});
+
+describe('isCrawlerlessChainConfirmExplicitlyEnabled', () => {
+    it('is false by default and for a config opt-out', () => {
+        expect(isCrawlerlessChainConfirmExplicitlyEnabled()).toBe(false);
+        expect(isCrawlerlessChainConfirmExplicitlyEnabled({ crawlerlessChainConfirm: false })).toBe(false);
+    });
+
+    it('is true for a config or env opt-in (used to warn on an ignored opt-in)', () => {
+        expect(isCrawlerlessChainConfirmExplicitlyEnabled({ crawlerlessChainConfirm: true })).toBe(true);
+        process.env.NIGHTGATE_CRAWLERLESS_CHAIN_CONFIRM = 'true';
+        expect(isCrawlerlessChainConfirmExplicitlyEnabled()).toBe(true);
+        process.env.NIGHTGATE_CRAWLERLESS_CHAIN_CONFIRM = 'off';
+        expect(isCrawlerlessChainConfirmExplicitlyEnabled({ crawlerlessChainConfirm: true })).toBe(false);
     });
 });
 

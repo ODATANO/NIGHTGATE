@@ -86,6 +86,7 @@ Sufficient for read-side. `network` is the only required key — without it the 
 | `crawler.fetchConcurrency` | `(default)` | Parallel RPC fetches during catch-up |
 | `crawler.rpcBatchSize` | `(default)` | Substrate JSON-RPC batch size |
 | `crawler.requestTimeout` | `30000` | RPC timeout (ms) |
+| `crawlerlessChainConfirm` | `!crawler.enabled` | Advance a submitted job's `chainStatus` by a single per-tx Indexer query (`transactions(offset:{hash})`) instead of the crawler's `Transactions`/`TransactionResults`, so `requireChainSuccess` is reachable crawler-free. Only runs when the crawler is disabled (where it defaults on); `false` opts out. With the crawler enabled it never runs (the crawler is the sole source of truth), and an explicit opt-in is ignored with a warning |
 | `palletMap` | `(built-in)` | Optional override of the Substrate pallet-index → tx-type classification map used by the `BlockProcessor` (`{ "<index>": { name, txType, isShielded?, isSystem? } }`) |
 | `allowMainnetSubmission` | `false` | Gate for mainnet submission. Stays off until [forum thread 1190](https://forum.midnight.network) (`1016 Immediately Dropped`) is resolved |
 | `granteeBinding` | `wallet` | How an authenticated principal maps to the AttestationVault `Bytes<32>` grantee id for on-chain disclosure grants: `wallet` (coin pubkey hash) / `did` (DID string) / `custom` (opaque 64-hex). Used by `registerGranteeIdentity` + the disclosure read gate |
@@ -107,6 +108,7 @@ Sufficient for read-side. `network` is the only required key — without it the 
 | `NIGHTGATE_NODE_URL` | Override `nodeUrl` |
 | `NIGHTGATE_CRAWLER_NODE_URL` | Override `crawler.nodeUrl` |
 | `NIGHTGATE_CRAWLER_ENABLED` | `false` / `0` / `no` / `off` disables the crawler at boot |
+| `NIGHTGATE_CRAWLERLESS_CHAIN_CONFIRM` | Override `crawlerlessChainConfirm` (only effective with the crawler disabled); `false`/`0`/`no`/`off` opts out. Unset defaults to on when the crawler is disabled |
 | `NIGHTGATE_FETCH_CONCURRENCY` | Override `crawler.fetchConcurrency` |
 | `NIGHTGATE_RPC_BATCH_SIZE` | Override `crawler.rpcBatchSize` |
 | `NIGHTGATE_INDEXER_HTTP_URL` | Override `indexerHttpUrl` (e.g. point at local indexer container) |

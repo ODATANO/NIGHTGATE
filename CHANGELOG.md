@@ -1,5 +1,41 @@
 # Changelog
 
+## 0.9.2 - 2026-07-23
+
+### Feature: crawler-free chain-outcome confirmation
+
+With the crawler disabled (the recommended mode for submission-focused
+deployments, and what the NIGHTPASS demo runs), `chainStatus` could never leave
+`pending`: the only path advancing it (`refreshSucceededChainOutcomes`) needs the
+crawler-populated `Transactions`/`TransactionResults` tables. Any consumer gating
+on `chainStatus === 'success'` (`requireChainSuccess`) then waited to the poll
+timeout even though the tx had landed on chain.
+
+A second, crawler-free path now advances `chainStatus` with a single Indexer
+GraphQL query per submitted tx (`transactions(offset:{hash})`), mapping the
+result status to `success`/`failure`. It is scoped to our own jobs (they carry
+the tx hash), one point lookup per pending job, never a scan. Workflow parents
+are unchanged; they keep aggregating from children.
+
+- One-shot HTTP by design, not `publicDataProvider.watchForTxData`: that looks up
+  by `identifier` (our jobs persist the `hash`, so it would never match) and is
+  an Apollo poll that would leak on every tick for a not-yet-final or dropped tx.
+  The query runs under an `AbortSignal` deadline, so a stuck lookup cancels and
+  just retries next tick.
+- Decoupled from the command poller: the pass runs in the background under a
+  single-flight guard with bounded lookup concurrency, so a slow Indexer never
+  stalls command polling or reconciliation.
+- Status mapping: `SUCCESS` -> `success`, `FAILURE`/`PARTIAL_SUCCESS` -> `failure`;
+  an unknown/future status is left unconfirmed (retry) rather than a wrong verdict.
+- Gating: `NIGHTGATE_CRAWLERLESS_CHAIN_CONFIRM` (env) / `crawlerlessChainConfirm`
+  (config). Runs ONLY when the crawler is disabled (where it defaults on; `false`
+  opts out). With the crawler enabled it never runs, so the crawler stays the
+  sole `chainStatus` writer and the two paths can never race; an explicit opt-in
+  is ignored with a warning.
+- The existing crawler path (`refreshSucceededChainOutcomes`) is untouched. No
+  schema change. New: `srv/submission/chain-outcome-confirmer.ts`,
+  `config.resolveCrawlerlessChainConfirmEnabled`.
+
 ## 0.9.1 - 2026-07-22
 
 ### Fix: pin the Midnight SDK to 4.0.x so a fresh install keeps a single compact-js copy
