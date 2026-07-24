@@ -490,6 +490,30 @@ service NightgateService {
     };
 
     /**
+     * Pre-register (or re-register) passport ownership, via the
+     * AttestationVault `registerPassport` circuit. Registrar-only (the vault
+     * DEPLOYER's attester identity, enforced in-circuit): assigns the
+     * passportId to an attester id, so only that attester may bind or re-bind
+     * it via `bindPassport` (first-bind-squatting protection; re-registering
+     * an id is the ownership-transfer and squatter-recovery path).
+     *
+     * Async: returns `{ jobId, status }`. The job `result` carries
+     * `{ passportId, ownerId, contractAddress, txHash }`.
+     * `compiledArtifactRef` defaults to 'attestation-vault'.
+     */
+    action   registerPassport(passportId: String, // 64 hex Bytes<32> passport identifier
+                              ownerId: String, // 64 hex Bytes<32> attester id that may bind the passport
+                              sessionId: UUID, // must be the vault deployer (registrar)
+                              contractAddress: String, // AttestationVault deployment
+                              compiledArtifactRef: String, // optional, defaults to 'attestation-vault'
+                              idempotencyKey: String, // optional; dedupes retries
+                              sponsorSessionId: UUID // optional; second session pays the dust fee (see submitContractCall)
+    )                                                                 returns {
+        jobId  : UUID;
+        status : String;
+    };
+
+    /**
      * Grantee identities: binds an authenticated principal to the Bytes<32>
      * grantee id the AttestationVault checks (read side of the disclosure ACL).
      */
@@ -575,8 +599,11 @@ service NightgateService {
      * transaction. `calls` is a JSON array of `{ circuit, args }` executed
      * inside one transaction scope (SDK withContractScopedTransaction); the
      * batch is balanced, signed and submitted ONCE. At most 8 calls per batch.
-     * Calls must be order-independent: the SDK applies merged intents in
-     * unspecified order, so dependent calls belong in separate transactions.
+     * The on-chain apply order is deterministic and equals the call order
+     * (segment ids are rewritten before proving, see batch-segment-order.ts),
+     * so DEPENDENT calls may be batched. Exception: duplicate circuit names
+     * keep a random relative order among themselves; batch distinct circuits
+     * when that matters.
      *
      * Failure semantics: an error BEFORE submission (bad circuit, throwing
      * call, proving/balancing) discards the scope and nothing is submitted.

@@ -191,6 +191,32 @@
       }
     },
     {
+      "name": "registerPassport",
+      "pure": false,
+      "proof": true,
+      "arguments": [
+        {
+          "name": "passportId",
+          "type": {
+            "type-name": "Bytes",
+            "length": 32
+          }
+        },
+        {
+          "name": "owner_id",
+          "type": {
+            "type-name": "Bytes",
+            "length": 32
+          }
+        }
+      ],
+      "result-type": {
+        "type-name": "Tuple",
+        "types": [
+        ]
+      }
+    },
+    {
       "name": "bindPassport",
       "pure": false,
       "proof": true,
@@ -440,8 +466,32 @@
       }
     },
     {
-      "name": "content_roots",
+      "name": "registrar",
       "index": 6,
+      "exported": true,
+      "storage": "Cell",
+      "type": {
+        "type-name": "Bytes",
+        "length": 32
+      }
+    },
+    {
+      "name": "passport_owners",
+      "index": 7,
+      "exported": true,
+      "storage": "Map",
+      "key": {
+        "type-name": "Bytes",
+        "length": 32
+      },
+      "value": {
+        "type-name": "Bytes",
+        "length": 32
+      }
+    },
+    {
+      "name": "content_roots",
+      "index": 8,
       "exported": true,
       "storage": "Map",
       "key": {
@@ -455,7 +505,7 @@
     },
     {
       "name": "field_predicate_results",
-      "index": 7,
+      "index": 9,
       "exported": true,
       "storage": "Map",
       "key": {

@@ -102,4 +102,39 @@ describe('runBatchInScope', () => {
         const out = await runBatchInScope(contracts, PROVIDERS, found, [{ circuit: 'attest', args: [] }], ADDR);
         expect(out).toEqual({ txHash: '', onChainStatus: '', circuits: ['attest'] });
     });
+
+    test('wraps the proof provider so batch segments prove in call order', async () => {
+        const attest = { actions: [{ entryPoint: 'attest' }] };
+        const bind = { actions: [{ entryPoint: 'bindPassport' }] };
+        const tx: any = { intents: new Map<number, any>([[9, bind], [4, attest]]) };
+        const proveTx = vi.fn(async () => 'proven');
+        const providers = { proofProvider: { proveTx }, other: 'stuff' };
+        let scopeProviders: any;
+        const contracts = {
+            withContractScopedTransaction: vi.fn(async (p: any, fn: (ctx: unknown) => Promise<void>) => {
+                scopeProviders = p;
+                await fn({});
+                return { public: { txHash: '0x1', status: 'SucceedEntirely' } };
+            })
+        };
+        const found = { callTx: { attest: vi.fn(async () => { }), bindPassport: vi.fn(async () => { }) } };
+
+        await runBatchInScope(contracts, providers, found, [
+            { circuit: 'attest', args: [] },
+            { circuit: 'bindPassport', args: [] }
+        ], ADDR);
+
+        // The scope got a shallow copy with a wrapped proof provider; the rest
+        // of the bundle is untouched.
+        expect(scopeProviders).not.toBe(providers);
+        expect(scopeProviders.other).toBe('stuff');
+        expect(scopeProviders.proofProvider).not.toBe(providers.proofProvider);
+
+        // Proving through the wrapper reorders the segment ids into call order
+        // (attest gets the smaller id), then delegates to the real provider.
+        await expect(scopeProviders.proofProvider.proveTx(tx)).resolves.toBe('proven');
+        expect(proveTx).toHaveBeenCalledWith(tx);
+        expect(tx.intents.get(4)).toBe(attest);
+        expect(tx.intents.get(9)).toBe(bind);
+    });
 });

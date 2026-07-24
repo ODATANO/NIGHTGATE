@@ -41,6 +41,15 @@ export ledger predicate_results:   Map<Bytes<32>, Boolean>;
 // QR-scanned passportId resolves on-chain to its attestation.
 export ledger passport_bindings:   Map<Bytes<32>, Bytes<32>>;
 
+// Passport-ownership pre-registration. The registrar (the vault's deployer,
+// locked in at deploy time) can pre-assign a passportId to a specific
+// attester_id. bindPassport then only accepts that attester for the id,
+// closing first-bind squatting for registered ids and recovering already-
+// squatted ones (the registered owner may rebind over a foreign binding).
+// Unregistered ids keep the open first-come-first-served semantics.
+export ledger registrar:           Bytes<32>;
+export ledger passport_owners:     Map<Bytes<32>, Bytes<32>>;
+
 // Field-bound predicate extension.
 //   content_roots: payload_hash -> Merkle root over the passport's provable
 //     fields, each leaf = leafHash(field_key, scaled_value). Anchored by the
@@ -111,6 +120,13 @@ circuit value_commitment(): Bytes<32> {
 // on-chain does not leak the underlying secret.
 circuit caller_id(): Bytes<32> {
   return persistentHash<Bytes<32>>(local_secret_key());
+}
+
+// Deploy locks in the registrar: the deployer's attester identity, derived
+// from the same local_secret_key witness the circuits use. The session that
+// deploys the vault is the only one that can pre-register passport ownership.
+constructor() {
+  registrar = disclose(caller_id());
 }
 
 // Merkle leaf hash — pure, so it is exported into the artifact's `pureCircuits`
@@ -194,12 +210,44 @@ export circuit provePredicate(payload_hash: Bytes<32>, threshold: Uint<64>, op: 
   predicate_results.insert(disclose(claimKey), true);
 }
 
+// Registrar-only: pre-assign (or re-assign) a passportId to an attester
+// identity. Overwrite is deliberate: it is the ownership-transfer and
+// squatter-recovery path (the registrar re-points the id, the new owner
+// rebinds via bindPassport).
+export circuit registerPassport(passportId: Bytes<32>, owner_id: Bytes<32>): [] {
+  assert(caller_id() == registrar, "not registrar");
+  passport_owners.insert(disclose(passportId), disclose(owner_id));
+}
+
 // Anchor a battery-passport identifier to an existing attestation's
 // payload_hash, so a QR-scanned passportId resolves on-chain to its
-// attestation. Only the attestation's owner may bind it.
+// attestation. Only the attestation's owner may bind it. Authority over the
+// passportId itself is two-tier:
+//   1. REGISTERED ids (passport_owners): only the registered attester may
+//      bind or re-bind, regardless of any existing binding. Registration
+//      both prevents first-bind squatting and recovers an already-squatted
+//      id (registrar re-points it, the owner rebinds over the squatter).
+//   2. UNREGISTERED ids: first-come-first-served, and an existing binding
+//      may only be re-bound by the owner of its currently bound attestation
+//      (Map.insert overwrites; without the guard any attester could hijack
+//      a known passportId onto their own attestation, the same takeover
+//      class the attest() guard closes for attestation_owners). Same-owner
+//      rebinding stays allowed (e.g. a newer attestation version).
+// Unregistered FIRST binds remain squattable by design (open, permissionless
+// mode); use registerPassport where that risk matters.
 export circuit bindPassport(passportId: Bytes<32>, payload_hash: Bytes<32>): [] {
   assert(public_attestations.member(disclose(payload_hash)), "no attestation");
   assert(attestation_owners.lookup(disclose(payload_hash)) == caller_id(), "not attester");
+  if (passport_owners.member(disclose(passportId))) {
+    assert(passport_owners.lookup(disclose(passportId)) == caller_id(), "not passport owner");
+  } else {
+    if (passport_bindings.member(disclose(passportId))) {
+      assert(
+        attestation_owners.lookup(passport_bindings.lookup(disclose(passportId))) == caller_id(),
+        "passport bound by another attester"
+      );
+    }
+  }
   passport_bindings.insert(disclose(passportId), disclose(payload_hash));
 }
 

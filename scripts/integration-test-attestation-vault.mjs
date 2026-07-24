@@ -210,6 +210,113 @@ try {
 }
 ok('guard: fresh payload_hash still attests', freshError === '', freshError);
 
+// ---- Check 6: bindPassport rebind-takeover guard ---------------------------
+// Sibling of check 5 on passport_bindings: without the guard, ANY attester
+// (the attacker owns 0xee from check 5) could re-bind an already-bound
+// passportId onto their own attestation, hijacking the QR resolution.
+// Same-owner rebinding must stay allowed.
+const passportId = bytes32(0x77);
+const sameBytes = (a, b) => a.length === b.length && a.every((v, i) => v === b[i]);
+
+let bindError = '';
+try {
+    runCircuit(ownerContract, 'bindPassport', passportId, payloadHash);
+} catch (err) {
+    bindError = String(err?.message ?? err);
+}
+ok('bind guard: first bind by attestation owner succeeds', bindError === '', bindError);
+
+let hijackError = '';
+try {
+    runCircuit(attackerContract, 'bindPassport', passportId, bytes32(0xee));
+} catch (err) {
+    hijackError = String(err?.message ?? err);
+}
+ok('bind guard: foreign re-bind of a bound passportId rejected',
+    hijackError.includes('passport bound by another attester'), hijackError || 'did NOT throw');
+
+const boundLedger = mod.ledger(circuitCtx.currentQueryContext.state);
+ok('bind guard: binding still points at the owner attestation',
+    sameBytes(boundLedger.passport_bindings.lookup(passportId), payloadHash));
+
+// Same owner may re-bind the passport to a NEWER attestation of their own.
+const newPayloadHash = bytes32(0xab);
+let rebindError = '';
+try {
+    runCircuit(ownerContract, 'attest', newPayloadHash, bytes32(0xbc));
+    runCircuit(ownerContract, 'bindPassport', passportId, newPayloadHash);
+} catch (err) {
+    rebindError = String(err?.message ?? err);
+}
+ok('bind guard: same-owner rebind still allowed', rebindError === '', rebindError);
+
+const rebindLedger = mod.ledger(circuitCtx.currentQueryContext.state);
+ok('bind guard: rebind updated the binding',
+    sameBytes(rebindLedger.passport_bindings.lookup(passportId), newPayloadHash));
+
+// An unbound passportId binds normally for any attester on their OWN hash.
+let attackerOwnBindError = '';
+try {
+    runCircuit(attackerContract, 'bindPassport', bytes32(0x78), bytes32(0xee));
+} catch (err) {
+    attackerOwnBindError = String(err?.message ?? err);
+}
+ok('bind guard: unbound passportId still binds', attackerOwnBindError === '', attackerOwnBindError);
+
+// ---- Check 7: registrar-gated passport pre-registration --------------------
+// registerPassport is registrar-only (the deployer identity, locked in by the
+// constructor). A registered passportId may only be bound by its registered
+// owner: blocks a foreign FIRST bind (squatting) and recovers an already-
+// squatted id by rebinding over the foreign binding.
+const regLedger = mod.ledger(circuitCtx.currentQueryContext.state);
+const ownerId = regLedger.attestation_owners.lookup(payloadHash);
+ok('registrar: constructor locked deployer as registrar',
+    sameBytes(regLedger.registrar, ownerId));
+
+let notRegistrarError = '';
+try {
+    runCircuit(attackerContract, 'registerPassport', bytes32(0x79), bytes32(0x01));
+} catch (err) {
+    notRegistrarError = String(err?.message ?? err);
+}
+ok('registrar: non-registrar registerPassport rejected',
+    notRegistrarError.includes('not registrar'), notRegistrarError || 'did NOT throw');
+
+// Pre-registration blocks a foreign FIRST bind of a still-unbound id.
+runCircuit(ownerContract, 'registerPassport', bytes32(0x79), ownerId);
+let preRegError = '';
+try {
+    runCircuit(attackerContract, 'bindPassport', bytes32(0x79), bytes32(0xee));
+} catch (err) {
+    preRegError = String(err?.message ?? err);
+}
+ok('registrar: foreign first bind of a registered id rejected',
+    preRegError.includes('not passport owner'), preRegError || 'did NOT throw');
+
+let regBindError = '';
+try {
+    runCircuit(ownerContract, 'bindPassport', bytes32(0x79), newPayloadHash);
+} catch (err) {
+    regBindError = String(err?.message ?? err);
+}
+ok('registrar: registered owner binds their id', regBindError === '', regBindError);
+
+// Squatter recovery: 0x78 was squatted (unregistered) by the attacker in
+// check 6. Registering it to the owner lets the owner rebind OVER the
+// attacker's binding, which the unregistered rebind guard alone forbids.
+runCircuit(ownerContract, 'registerPassport', bytes32(0x78), ownerId);
+let recoveryError = '';
+try {
+    runCircuit(ownerContract, 'bindPassport', bytes32(0x78), newPayloadHash);
+} catch (err) {
+    recoveryError = String(err?.message ?? err);
+}
+ok('registrar: registered owner rebinds over a squatted binding',
+    recoveryError === '', recoveryError);
+const recoveredLedger = mod.ledger(circuitCtx.currentQueryContext.state);
+ok('registrar: recovery updated the binding',
+    sameBytes(recoveredLedger.passport_bindings.lookup(bytes32(0x78)), newPayloadHash));
+
 console.log();
 console.log(failures === 0
     ? 'AttestationVault artifact + witness factory wire end-to-end.'

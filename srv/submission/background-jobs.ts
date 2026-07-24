@@ -68,7 +68,10 @@ const HEAVY_KINDS: ReadonlySet<string> = new Set([
     'predicateCommitValue',
     'predicateProof',
     'fieldAnchorRoot',
-    'fieldPredicateProof'
+    'fieldPredicateProof',
+    'grantDisclosure',
+    'revokeDisclosure',
+    'registerPassport'
 ]);
 const WORKFLOW_PARENT_KINDS: ReadonlySet<string> = new Set([
     'issuePredicateAttestation',

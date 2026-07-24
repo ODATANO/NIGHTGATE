@@ -24,6 +24,7 @@ export {
     prepareRevokeDisclosure,
     prepareGrantDisclosure,
     prepareAttest,
+    prepareRegisterPassport,
     prepareBindPassport,
     prepareAnchorContentRoot,
     prepareProveFieldPredicate
@@ -38,9 +39,9 @@ export const CONTRACTS = {
     'attestation-vault': {
         name: 'attestation-vault',
         artifactSubpath: '@odatano/nightgate/browser/attestation-vault',
-        circuits: ['attest', 'grantDisclosure', 'revokeDisclosure', 'commitValue', 'provePredicate', 'bindPassport', 'anchorContentRoot', 'proveFieldPredicate'],
+        circuits: ['attest', 'grantDisclosure', 'revokeDisclosure', 'commitValue', 'provePredicate', 'registerPassport', 'bindPassport', 'anchorContentRoot', 'proveFieldPredicate'],
         // Circuits that need the attester-identity witness (local_secret_key).
-        attesterGated: ['attest', 'grantDisclosure', 'revokeDisclosure', 'commitValue', 'bindPassport', 'anchorContentRoot', 'proveFieldPredicate'],
+        attesterGated: ['attest', 'grantDisclosure', 'revokeDisclosure', 'commitValue', 'registerPassport', 'bindPassport', 'anchorContentRoot', 'proveFieldPredicate'],
         // Circuits that need per-call value/salt witnesses.
         valueWitnessed: ['commitValue', 'provePredicate'],
         // Circuits that need the per-call Merkle inclusion proof witnesses.

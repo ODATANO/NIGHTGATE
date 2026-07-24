@@ -319,11 +319,13 @@ Leaf commands with local projections register an idempotent reconciliation
 finalizer. `anchorDocument` restores `Documents.anchoredTxHash/anchoredAt`;
 `grantDisclosure` restores `grantedTxHash`; `revokeDisclosure` immediately sets
 `active=false` and stores `revokedTxHash`. Disclosure finalizers also trigger
-the normal state reindex. These finalizers never call the wallet or submit a
-transaction. The job remains `reconciliation_required` if a finalizer throws,
-and may safely retry its projection writes on the next poll. Their result uses
-the normal action-specific fields plus `reconciled: true`; only leaf kinds
-without a registered finalizer use the minimal generic result.
+the normal state reindex. `submitContractCallBatch` and `registerPassport`
+register projection-free finalizers that only rebuild their documented result
+shape from the persisted command + evidence. These finalizers never call the
+wallet or submit a transaction. The job remains `reconciliation_required` if a
+finalizer throws, and may safely retry its projection writes on the next poll.
+Their result uses the normal action-specific fields plus `reconciled: true`;
+only leaf kinds without a registered finalizer use the minimal generic result.
 
 When every child of a predicate workflow has been reconciled successfully, its
 parent is moved back to `pending`. The normal versioned processor then resolves
@@ -493,6 +495,7 @@ New enums in `db/types.cds`:
 | Live preprod end-to-end (T15) | ✅ Counter deployed live on preprod via the full stack (0.3.0) |
 | On-chain disclosure grants | ✅ `grantDisclosure`/`revokeDisclosure` + chain-indexed `DisclosureGrants` + `granteeBinding` + on-chain read gate (0.3.4). Live-validated through grant → index → read-back; live revoke pending a healthy preprod indexer |
 | Crawler-free state verification | ✅ `verifyAttestationState` / `verifyPredicateState` / `reindexDisclosures` read LIVE contract state (0.5.0); optional per-call `network` override reads another network's public indexer (0.7.0) |
+| Passport-binding hardening | ✅ `bindPassport` rebind guard + registrar-gated `registerPassport` pre-registration (0.10.0). Registered ids bind only for their registered attester; deployed vaults need a redeploy |
 | Mainnet submission | ❌ Gated by `allowMainnetSubmission: false` until forum 1190 resolves |
 | Built-in authorization | ✅ `@requires` annotations; consumer app provides auth strategy |
 

@@ -72,6 +72,9 @@ const predicateRateLimiter = new RateLimiter({ windowMs: 60 * 60 * 1000, maxRequ
 // 30 disclosure grant/revoke ops / hour / session; single heavyweight circuit
 // call each, attester-gated; looser than predicate but tighter than plain calls.
 const disclosureRateLimiter = new RateLimiter({ windowMs: 60 * 60 * 1000, maxRequests: 30 });
+// 30 passport registrations / hour / session; registrar-gated single circuit
+// call, same weight class as the disclosure ops.
+const registrarRateLimiter = new RateLimiter({ windowMs: 60 * 60 * 1000, maxRequests: 30 });
 // 60 on-demand reindexes / hour / contract; an indexer round-trip + DB writes,
 // keyed by contractAddress (no session). Loose enough for a wallet-flow poll,
 // tight enough not to hammer the indexer.
@@ -88,7 +91,8 @@ type ContractCommandV1 =
     | { op: 'fieldPredicateWorkflow'; predicateAttestationId: string; payloadHash: string; fieldKey: string; contractAddress: string; compiledArtifactRef: string; predicate: string; threshold: string; opCode: number; unit?: string; value: string; siblings: string[]; dirs: boolean[]; contentRoot?: string; sponsorSessionId?: string }
     | { op: 'anchorDocument'; documentId: string; payloadHash: string; metadataHash: string; contractAddress: string; compiledArtifactRef: string; sponsorSessionId?: string }
     | { op: 'grantDisclosure'; disclosureGrantId: string; payloadHash: string; grantee: string; level: number; contractAddress: string; compiledArtifactRef: string; sponsorSessionId?: string }
-    | { op: 'revokeDisclosure'; payloadHash: string; grantee: string; contractAddress: string; compiledArtifactRef: string; sponsorSessionId?: string };
+    | { op: 'revokeDisclosure'; payloadHash: string; grantee: string; contractAddress: string; compiledArtifactRef: string; sponsorSessionId?: string }
+    | { op: 'registerPassport'; passportId: string; ownerId: string; contractAddress: string; compiledArtifactRef: string; sponsorSessionId?: string };
 
 function hexToBytes(hex: string): Uint8Array {
     const out = new Uint8Array(hex.length / 2);
@@ -146,7 +150,8 @@ export function registerSubmissionHandlers(
             || (job.kind === 'issueFieldPredicateAttestation' && command.op !== 'fieldPredicateWorkflow')
             || (job.kind === 'anchorDocument' && command.op !== 'anchorDocument')
             || (job.kind === 'grantDisclosure' && command.op !== 'grantDisclosure')
-            || (job.kind === 'revokeDisclosure' && command.op !== 'revokeDisclosure')) {
+            || (job.kind === 'revokeDisclosure' && command.op !== 'revokeDisclosure')
+            || (job.kind === 'registerPassport' && command.op !== 'registerPassport')) {
             throw new Error(`Persisted command operation '${command.op}' is incompatible with ${job.kind}`);
         }
 
@@ -257,6 +262,18 @@ export function registerSubmissionHandlers(
             return { ...(isGrant ? { disclosureGrantId: command.disclosureGrantId, level: command.level } : {}), payloadHash: command.payloadHash, grantee: command.grantee, txHash: result.txHash };
         }
 
+        if (command.op === 'registerPassport') {
+            const result = await submitter.call({
+                contractAddress: command.contractAddress,
+                circuit: 'registerPassport',
+                args: [hexToBytes(command.passportId), hexToBytes(command.ownerId)],
+                contractName: command.compiledArtifactRef,
+                registration: { artifactPath: resolved.artifactPath, privateStateId: resolved.privateStateId, zkConfigPath: resolved.zkConfigPath },
+                sessionId: job.sessionId
+            });
+            return { passportId: command.passportId, ownerId: command.ownerId, contractAddress: command.contractAddress, txHash: result.txHash, ...(sponsor ? { feeSponsor: sponsor.sponsorSessionId } : {}) };
+        }
+
         if (command.op === 'callBatch') {
             // Same per-circuit coercion as the single-call tail below, applied
             // to each entry of the batch (raw JSON args were persisted).
@@ -311,6 +328,7 @@ export function registerSubmissionHandlers(
     registerBackgroundJobProcessor('anchorDocument', 1, executeContractCommand);
     registerBackgroundJobProcessor('grantDisclosure', 1, executeContractCommand);
     registerBackgroundJobProcessor('revokeDisclosure', 1, executeContractCommand);
+    registerBackgroundJobProcessor('registerPassport', 1, executeContractCommand);
     for (const childKind of ['predicateCommitValue', 'predicateProof', 'fieldAnchorRoot', 'fieldPredicateProof']) {
         registerBackgroundJobProcessor(childKind, 1, executeContractCommand);
     }
@@ -355,6 +373,13 @@ export function registerSubmissionHandlers(
                 payloadHash: command.payloadHash, grantee: command.grantee, txHash: evidence.txHash
             };
         }
+        if (command.op === 'registerPassport') {
+            return {
+                reconciled: true, passportId: command.passportId, ownerId: command.ownerId,
+                contractAddress: command.contractAddress, txHash: evidence.txHash,
+                ...(command.sponsorSessionId ? { feeSponsor: command.sponsorSessionId } : {})
+            };
+        }
         if (command.op === 'callBatch') {
             // Rebuild the documented batch result from the encrypted command
             // (the ordered circuits) + the durable evidence. Without this the
@@ -374,6 +399,7 @@ export function registerSubmissionHandlers(
     registerBackgroundJobReconciliationFinalizer('anchorDocument', 1, finalizeContractProjection);
     registerBackgroundJobReconciliationFinalizer('grantDisclosure', 1, finalizeContractProjection);
     registerBackgroundJobReconciliationFinalizer('revokeDisclosure', 1, finalizeContractProjection);
+    registerBackgroundJobReconciliationFinalizer('registerPassport', 1, finalizeContractProjection);
     registerBackgroundJobReconciliationFinalizer('submitContractCallBatch', 1, finalizeContractProjection);
 
     srv.on('deployContract', async (req: Request) => {
@@ -1176,6 +1202,66 @@ export function registerSubmissionHandlers(
                 encryptCommand: true,
                 command: {
                     op: 'revokeDisclosure', payloadHash: payloadHashLc, grantee: granteeLc,
+                    contractAddress: contractAddressLc, compiledArtifactRef: compiledRef,
+                    sponsorSessionId: sponsor?.sponsorSessionId
+                }
+            });
+
+            return { jobId: job.jobId, status: job.status };
+        });
+    });
+
+    srv.on('registerPassport', async (req: Request) => {
+        const data = req.data as {
+            passportId?: string;
+            ownerId?: string;
+            sessionId?: string;
+            contractAddress?: string;
+            compiledArtifactRef?: string;
+            idempotencyKey?: string;
+            sponsorSessionId?: string;
+        };
+
+        if (!data.passportId) return req.reject(400, 'passportId is required');
+        if (!SHA256_HEX_RE.test(data.passportId)) return req.reject(400, 'passportId must be 64 hex chars (32 bytes)');
+        if (!data.ownerId) return req.reject(400, 'ownerId is required');
+        if (!SHA256_HEX_RE.test(data.ownerId)) return req.reject(400, 'ownerId must be 64 hex chars (32 bytes)');
+        if (!data.sessionId) return req.reject(400, 'sessionId is required');
+        if (!data.contractAddress) return req.reject(400, 'contractAddress is required');
+
+        const compiledRef = data.compiledArtifactRef && data.compiledArtifactRef.length > 0
+            ? data.compiledArtifactRef
+            : DEFAULT_ATTESTATION_VAULT_REF;
+
+        if (rejectIfMainnetBlocked(req)) return;
+        if (!checkRate(registrarRateLimiter, data.sessionId, req)) return;
+
+        const passportIdLc = data.passportId.toLowerCase();
+        const ownerIdLc = data.ownerId.toLowerCase();
+        const contractAddressLc = data.contractAddress.toLowerCase();
+
+        return runSubmission(req, async () => {
+            const facadeCfg = facadeConfigFromEnv();
+            await ensureNetworkId(facadeCfg.networkId);
+            await contractResolver(compiledRef);
+            await walletFactory({ sessionId: data.sessionId!, db, facadeConfig: facadeCfg, expectedUserId: (req as any).user?.id });
+            const sponsor = await resolveSponsorForRequest(req, data.sponsorSessionId);
+
+            const job = await startJob({
+                kind: 'registerPassport',
+                sessionId: data.sessionId!,
+                idempotencyKey: data.idempotencyKey,
+                request: {
+                    passportId: passportIdLc,
+                    ownerId: ownerIdLc,
+                    contractAddress: contractAddressLc,
+                    feeSponsor: sponsor?.sponsorSessionId ?? null
+                },
+                requestedBy: (req as any).user?.id,
+                commandVersion: 1,
+                encryptCommand: true,
+                command: {
+                    op: 'registerPassport', passportId: passportIdLc, ownerId: ownerIdLc,
                     contractAddress: contractAddressLc, compiledArtifactRef: compiledRef,
                     sponsorSessionId: sponsor?.sponsorSessionId
                 }

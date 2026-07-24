@@ -1341,6 +1341,91 @@ describe('revokeDisclosure', () => {
     });
 });
 
+// ---- registerPassport (registrar passport pre-registration) ---------------
+
+describe('registerPassport', () => {
+    const VALID_PASSPORT = 'c'.repeat(64);
+    const VALID_OWNER = 'd'.repeat(64);
+    const VALID_ARGS = () => ({
+        passportId: VALID_PASSPORT,
+        ownerId: VALID_OWNER,
+        sessionId: `regp-${Math.random().toString(36).slice(2)}`,
+        contractAddress: '0xVAULT',
+        compiledArtifactRef: 'attestation-vault'
+    });
+
+    function setupHandlersWithDb(overrides: any = {}) {
+        const srv = makeFakeService();
+        const db = { run: vi.fn().mockResolvedValue(undefined) };
+        registerSubmissionHandlers(srv as any, db, {
+            resolveContractImpl: vi.fn(async () => ({ ...RESOLVED_CONTRACT_FIXTURE })),
+            walletMaterialFactory: vi.fn(async () => ({
+                accountId: 'a',
+                privateStoragePasswordProvider: () => '0123456789ABCDEFG',
+                walletAndMidnightProvider: {}
+            })),
+            submitterFactory: vi.fn(() => makeSuccessfulSubmitter()),
+            ...overrides
+        });
+        return { srv, db };
+    }
+
+    test('rejects non-hex passportId', async () => {
+        const { srv } = setupHandlersWithDb();
+        const req = makeReq({ ...VALID_ARGS(), passportId: 'short' });
+        await srv.handlers['registerPassport'](req);
+        expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/passportId must be 64 hex/));
+    });
+
+    test('rejects missing ownerId', async () => {
+        const { srv } = setupHandlersWithDb();
+        const req = makeReq({ ...VALID_ARGS(), ownerId: undefined });
+        await srv.handlers['registerPassport'](req);
+        expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/ownerId is required/));
+    });
+
+    test('rejects missing sessionId', async () => {
+        const { srv } = setupHandlersWithDb();
+        const req = makeReq({ ...VALID_ARGS(), sessionId: undefined });
+        await srv.handlers['registerPassport'](req);
+        expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/sessionId is required/));
+    });
+
+    test('happy path: single registerPassport call, no projection writes; returns { jobId, status }', async () => {
+        const submitter = makeSuccessfulSubmitter();
+        const { srv, db } = setupHandlersWithDb({ submitterFactory: () => submitter });
+        const req = makeReq(VALID_ARGS());
+
+        const result: any = await srv.handlers['registerPassport'](req);
+
+        expect(req.reject).not.toHaveBeenCalled();
+        expect(result).toEqual({ jobId: 'job-registerPassport-test', status: 'pending' });
+
+        // No DB projection for passport ownership; the chain is the source of truth.
+        expect(db.run).not.toHaveBeenCalled();
+
+        expect(submitter.call).toHaveBeenCalledTimes(1);
+        const c0 = (submitter.call as Mock).mock.calls[0][0];
+        expect(c0.circuit).toBe('registerPassport');
+        expect(c0.args).toHaveLength(2);
+        expect(c0.args[0]).toBeInstanceOf(Uint8Array);
+        expect(c0.args[1]).toBeInstanceOf(Uint8Array);
+    });
+
+    test('reconciliation finalizer rebuilds the documented result from evidence', async () => {
+        setupHandlersWithDb();
+        const result = await registeredFinalizers.get('registerPassport\0' + '1')!({
+            op: 'registerPassport', passportId: VALID_PASSPORT, ownerId: VALID_OWNER,
+            contractAddress: '0xVAULT', compiledArtifactRef: 'attestation-vault'
+        }, {}, { txHash: '0xregister', finalizedAt: null });
+
+        expect(result).toEqual({
+            reconciled: true, passportId: VALID_PASSPORT, ownerId: VALID_OWNER,
+            contractAddress: '0xVAULT', txHash: '0xregister'
+        });
+    });
+});
+
 // ---- registerGranteeIdentity (Phase 0 grantee binding) --------------------
 
 describe('registerGranteeIdentity', () => {

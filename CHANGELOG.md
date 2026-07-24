@@ -1,5 +1,57 @@
 # Changelog
 
+## 0.10.0 - 2026-07-24
+
+### AttestationVault passport hardening (contract change) + deterministic batch apply order
+
+**Fix: `bindPassport` rebind-takeover guard.** `passport_bindings.insert`
+overwrites and only `payload_hash` ownership was checked, so any attester
+could re-bind an already-bound passportId onto their own attestation and
+hijack the QR resolution (same takeover class as the 0.6.1 attest() fix). An
+already-bound, unregistered id can now only be re-bound by the owner of its
+currently bound attestation; same-owner rebinding stays allowed.
+
+**Feature: registrar-gated passport pre-registration.** New contract
+constructor locks the DEPLOYER's attester identity as `registrar`; a new
+registrar-only circuit `registerPassport(passportId, owner_id)` fills
+`passport_owners`. Registered ids bind/re-bind ONLY for their registered
+attester (blocks first-bind squatting, and recovers a squatted id: registrar
+re-points it, the owner rebinds over the foreign binding). Unregistered ids
+stay first-come-first-served (squattable by design); register where that
+risk matters. New OData action `registerPassport(...)` (async job like
+grant/revokeDisclosure, 30/h per session) + browser helper
+`prepareRegisterPassport`.
+
+**Feature: deterministic batch apply order** (lifts the 0.9.3
+order-independence restriction). The SDK randomizes each call's segment id
+and the ledger applies merged intents in ascending segment order, so a
+dependent batch only landed by luck (~1/3). The batch path now wraps the
+proof provider and rewrites the batch's EXISTING segment ids into call order
+before proving (`ledger-v8` recomputes binding); dependent flows like
+attest -> bindPassport -> anchorContentRoot run as ONE tx. Fail-closed: if
+the ordering cannot be established for a multi-call batch, the submission
+aborts BEFORE proving (nothing submitted) instead of silently proving in
+randomized order. Limitation: duplicate circuit names keep a random relative
+order among themselves. New `srv/midnight/batch-segment-order.ts`.
+
+Notes:
+
+- Recompiled `managed/` artifact (compactc 0.31.0), now 9 circuits. No CDS
+  schema change. The deploying session's secret defines the registrar:
+  deploy from the session that should manage passport ownership.
+- **Redeploy required for the guard + registrar, and a redeployed vault
+  starts with an EMPTY ledger:** switch the contract address AND re-create
+  needed state (attest, bindPassport, anchorContentRoot, grants), otherwise
+  QR resolution appears lost.
+- Job-pool fix: `grantDisclosure`/`revokeDisclosure`/`registerPassport` now
+  run in the HEAVY pool (full ZK proof generation; light since 0.9.0 was an
+  oversight that could over-saturate the proof server).
+- Verified: contract regression checks in
+  `scripts/integration-test-attestation-vault.mjs`, and two full live rounds
+  on preprod (fresh vault deploy, first-try dependent 3-call batch with
+  on-chain SUCCESS, registerPassport, bind on the registered id). The
+  statistical forced-order stress proof (6/6 vs 0/6) runs consumer-side.
+
 ## 0.9.3 - 2026-07-24
 
 ### Feature: batched contract calls in one transaction (`submitContractCallBatch`)
@@ -11,7 +63,8 @@ inside a single transaction scope (SDK `withContractScopedTransaction`) and are
 balanced, signed and submitted ONCE. Calls in one batch must be
 order-independent: the SDK applies merged intents in unspecified order, so
 dependent calls belong in separate transactions (proven pattern: `attest`
-single, then `bindPassport` + `anchorContentRoot` as a batch). A failure before
+single, then `bindPassport` + `anchorContentRoot` as a batch). [Lifted in
+0.10.0 by deterministic batch apply order.] A failure before
 submission discards the scope (nothing submitted);
 after submission the ledger's fallible phase can still finalize the tx as
 PARTIAL_SUCCESS (on chain, subset of calls applied), which fails the job with

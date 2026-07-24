@@ -60,6 +60,21 @@ export function prepareAttest({ payloadHash, metadataHash, attestationSecret }) 
 }
 
 /**
+ * Prepare a `registerPassport(passportId, owner_id)` call. Registrar-only
+ * (the vault's deployer identity): pre-assigns the passportId to an attester
+ * id so only that attester may bind or re-bind it (first-bind-squatting
+ * protection and squatter recovery).
+ */
+export function prepareRegisterPassport({ passportId, ownerId, attestationSecret }) {
+    if (!(attestationSecret instanceof Uint8Array)) throw new Error('attestationSecret (Uint8Array) is required');
+    return {
+        circuitId: 'registerPassport',
+        args: [hexTo32(passportId, 'passportId'), hexTo32(ownerId, 'ownerId')],
+        witnesses: buildAttestationVaultWitnesses({ attestationSecret })
+    };
+}
+
+/**
  * Prepare a `bindPassport(passportId, payload_hash)` call (QR resolution binding).
  */
 export function prepareBindPassport({ passportId, payloadHash, attestationSecret }) {

@@ -69,6 +69,10 @@ Upgrade a read-only session with **signing capability**, encrypting the BIP39 se
 
 Close a session: nullifies stored encrypted keys, evicts the cached wallet facade in the worker, persists a final state-save blob.
 
+### `deriveWalletInfo(mnemonic | seedHex, accountIndex?) → { viewingKey, shieldedAddress, nightAddress, dustAddress, accountIndex, network }`
+
+Derive a wallet's connectable identity from its secret WITHOUT creating a session or persisting anything (the mnemonic/seed is never stored or logged). Removes the last Lace dependency from programmatic wallet creation: generate a BIP39 phrase consumer-side, call this to learn the `viewingKey` (input to `connectWallet`), the `nightAddress` (faucet funding target), the `shieldedAddress` and the `dustAddress` (pass as `dustReceiverAddress` to `registerForDustGeneration`). Derivation is identical to the signing path (per-role HD seeds, Lace-exact), so the derived identity IS the account `connectWalletForSigning` will sign with for the same secret. `accountIndex` (default 0) selects the BIP32 account level. **Rate limit:** 10/hour per client IP (shared with `connectWalletForSigning`).
+
 ## Token operations
 
 ### `sendNight(sessionId, receiverAddress, amount, ttlIso?) → { txId, toLedger, amount, receiverAddress }`
@@ -178,9 +182,28 @@ Invoke a circuit on a deployed contract.
 Invoke SEVERAL circuits on ONE deployed contract as a SINGLE transaction. The
 calls execute inside one transaction scope (SDK
 `withContractScopedTransaction`) and the batch is balanced, signed and
-submitted ONCE. At most 8 calls per batch. Calls in one batch must be
-order-independent: the SDK applies merged intents in unspecified order, so
-dependent calls belong in separate transactions.
+submitted ONCE. At most 8 calls per batch. Since 0.10.0 the on-chain apply
+order is deterministic and equals the call order, so DEPENDENT calls may be
+batched (e.g. `attest` -> `bindPassport` -> `anchorContentRoot` as one
+transaction). Exception: duplicate circuit names in one batch keep a random
+relative order among themselves (see below); batch distinct circuits when
+that matters.
+
+How the ordering works: build-side state threading was never the problem
+(inside the scope the SDK already feeds each call's `nextContractState` into
+the next call; verified in `midnight-js-contracts` 4.0.x). But each call's
+intent got a RANDOM segment id (`Transaction.fromPartsRandomized`) and the
+ledger applies merged intents in ascending segment order, so a dependent
+batch only landed when the dice fell in call order. NIGHTGATE now wraps the
+proof provider and, before proving (the transaction is still unbound and
+unproven, where `ledger-v8` allows rewriting `Transaction.intents` and
+recomputes binding), reassigns the batch's existing segment ids ascending in
+call order. Only the batch's own intents are permuted; fee/dust segments are
+never touched. FAIL-CLOSED: for a multi-call batch the ordering must succeed,
+otherwise the submission aborts BEFORE proving (an error before submission,
+nothing reaches the chain), never silently proving in randomized order.
+Duplicate circuit names do not fail the ordering, but their relative order
+among themselves is not guaranteed (indistinguishable by `entryPoint`).
 
 **Failure semantics** distinguish two phases. An error BEFORE submission (bad
 circuit name, a throwing call, proving/balancing) discards the scope; nothing
@@ -199,7 +222,7 @@ order.
 | Field | Type | Notes |
 |---|---|---|
 | `contractAddress` | String | From a prior `deployContract` |
-| `calls` | LargeString | JSON array of `{ circuit, args }`; must be order-independent (see above). Per-call `args` follow **Encoding circuit args** below |
+| `calls` | LargeString | JSON array of `{ circuit, args }`, applied in order (duplicate circuit names lose their relative order, see above). Per-call `args` follow **Encoding circuit args** below |
 | `compiledArtifactRef` | String | Logical name from registry |
 | `sessionId` | UUID | Must have signing enabled |
 | `idempotencyKey` | String (optional) | Dedupes retries |
@@ -208,16 +231,18 @@ order.
 
 **Rate limit:** 30/min per session (shared with `submitContractCall`).
 
-**When to use:** several independent calls to the same contract that don't
-depend on each other's effects (proven pattern: `attest` as a single call
-first, then `bindPassport` + `anchorContentRoot` as a batch). The batch removes
-the per-call sponsor re-sync and block-inclusion wait.
+**When to use:** several sequential calls to the same contract, including
+dependent flows (since 0.10.0: `attest` -> `bindPassport` ->
+`anchorContentRoot` as ONE batch). The batch removes the per-call sponsor
+re-sync and block-inclusion wait, roughly a 3x latency win for the anchor
+flow.
 
 #### Per-tx fee sponsoring (`sponsorSessionId`)
 
-Every submit action (`deployContract`, `submitContractCall`, `anchorDocument`,
-`issuePredicateAttestation`, `issueFieldPredicateAttestation`,
-`grantDisclosure`, `revokeDisclosure`, `deregisterFromDustGeneration`) accepts
+Every submit action (`deployContract`, `submitContractCall`,
+`submitContractCallBatch`, `anchorDocument`, `issuePredicateAttestation`,
+`issueFieldPredicateAttestation`, `grantDisclosure`, `revokeDisclosure`,
+`registerPassport`, `deregisterFromDustGeneration`) accepts
 an optional `sponsorSessionId`. When set, the calling session builds and signs
 the transaction (balancing shielded/unshielded only) and the sponsor session
 balances ONLY the dust fee and submits; the caller needs neither NIGHT nor
@@ -290,21 +315,45 @@ Prove a hidden numeric value satisfies a predicate against a public threshold, w
 
 The payload must already be attested. Submits `commitValue` then `provePredicate`. A job with `status=succeeded` means the server-side submission workflow completed; inspect `getJobStatus.chainStatus` or call `verifyPredicateAttestation` for the later canonical chain outcome. `value` is a scaled integer (caller owns float scaling); it is used only as a circuit witness and **never persisted**. `predicate`: `lessOrEqual` | `greaterOrEqual`. `salt` (64-hex commitment opening) is generated if omitted. Job result: `{ predicateAttestationId, payloadHash, claim, proof }` (PAC-envelope shape). **Rate limit:** 10/hour per session.
 
+### `issueFieldPredicateAttestation(payloadHash, fieldKey, value, predicate, threshold, sessionId, contractAddress, contentRoot?, siblingsJson?, dirsJson?, unit?, compiledArtifactRef?, idempotencyKey?, sponsorSessionId?) → { jobId, status, predicateAttestationId }`
+
+Field-bound predicate proof (hardened model). Like `issuePredicateAttestation`, but the proven value is cryptographically bound to a SPECIFIC passport field via Merkle inclusion against an anchored content root, so a verifier knows the value came from THIS passport's `fieldKey`, not an arbitrary committed number. The caller builds the content root + inclusion path off-chain with the contract's exported `pureCircuits` (hashing matches in-circuit). If `contentRoot` is supplied it is anchored first (`anchorContentRoot`), then `proveFieldPredicate` runs with the Merkle witnesses. `value` is the scaled integer field value (witness only, never persisted). `siblingsJson`/`dirsJson`: JSON arrays of the DEPTH=4 inclusion path (4 × 64-hex siblings; 4 booleans). **Rate limit:** 10/hour per session (shared with `issuePredicateAttestation`).
+
 ### `verifyPredicateAttestation(predicateAttestationId) → { verified, predicate, threshold, unit, valueCommitment, provenTxHash, provenAt }` (function)
 
-`verified: true` iff `provenTxHash` resolves to a `SUCCESS` result, or confirmed directly against live contract state when the crawler is disabled/lagging.
+`verified: true` iff `provenTxHash` resolves to a `SUCCESS` result, or confirmed directly against live contract state when the crawler is disabled/lagging (the claim key is recomputed from the row; field-bound rows check `field_predicate_results`).
+
+## Crawler-free state verification
+
+Read LIVE contract state via `queryContractState`: no block crawler, no local txHash, no server-side row required. Made for wallet-submitted transactions NIGHTGATE never saw (browser signs, no jobId). Both return clean negatives (`verified: false`, not a 5xx) when the state is absent or no live provider is configured. `network` (optional, e.g. `preview` | `preprod`) reads ANOTHER network's public indexer instead of the configured one (stateless, wallet-free; unknown values are a 400; per-network endpoints via `cds.requires.nightgate.networks.<network>.*`).
+
+### `verifyAttestationState(contractAddress, payloadHash, contentRoot?, compiledArtifactRef?, network?) → { verified, attested, contentRootOk, attesterId }` (function)
+
+Confirms `payloadHash` is present in the vault's attestation map (and, when `contentRoot` is supplied, that it equals the anchored content root for that payload). Keyed entirely by the caller-supplied `payloadHash`: no enumeration.
+
+### `verifyPredicateState(contractAddress, payloadHash, predicate, threshold, fieldKey?, compiledArtifactRef?, network?) → { verified, proven }` (function)
+
+The id-free counterpart to `verifyPredicateAttestation`: recomputes the on-chain claim key off-chain from the supplied coordinates and confirms the vault recorded a true result for it. Supply `fieldKey` for a field-bound proof (`field_predicate_results`); omit it for a plain one (`predicate_results`). `threshold` must be the SAME scaled integer the circuit hashed into the claim key; a scaling mismatch silently yields `verified: false`.
 
 ## Disclosure grants
 
-Surface the AttestationVault tiered-disclosure ACL: who is entitled to which tier of an attestation, on-chain. Both write circuits are attester-gated (a non-attester caller's tx is rejected). `level`: `0` = public, `1` = legitimate-interest, `2` = authority (EU Battery Reg Annex XIII tiers). See [the AttestationVault contract](../contracts/attestation-vault). **Note:** delivering tier-specific *cleartext* stays off-chain (consumer `after READ` redaction) — only entitlement is on-chain.
+Surface the AttestationVault tiered-disclosure ACL (who is entitled to which tier of an attestation, on-chain) plus the passport-ownership registry. The grant/revoke circuits are attester-gated, `registerPassport` is registrar-gated (each enforced in-circuit; an unauthorized caller's tx is rejected). `level`: `0` = public, `1` = legitimate-interest, `2` = authority (EU Battery Reg Annex XIII tiers). See [the AttestationVault contract](../contracts/attestation-vault). **Note:** delivering tier-specific *cleartext* stays off-chain (consumer `after READ` redaction) — only entitlement is on-chain.
 
-### `grantDisclosure(payloadHash, grantee, level, sessionId, contractAddress, compiledArtifactRef?, idempotencyKey?) → { jobId, status, disclosureGrantId }`
+### `grantDisclosure(payloadHash, grantee, level, sessionId, contractAddress, compiledArtifactRef?, idempotencyKey?, sponsorSessionId?) → { jobId, status, disclosureGrantId }`
 
 Grant a disclosure tier to a `grantee` (64-hex `Bytes<32>` id) on an existing attestation, via the `grantDisclosure` circuit. The payload must already be attested by the caller. `disclosureGrantId` is returned synchronously (the `DisclosureGrants` row is inserted up-front, `active=false`); it flips to `active=true` once the post-submit chain reindex confirms the grant in ledger state. Job result: `{ disclosureGrantId, payloadHash, grantee, level, txHash }`. `compiledArtifactRef` defaults to `attestation-vault`. **Rate limit:** 30/hour per session.
 
-### `revokeDisclosure(payloadHash, grantee, sessionId, contractAddress, compiledArtifactRef?, idempotencyKey?) → { jobId, status }`
+### `revokeDisclosure(payloadHash, grantee, sessionId, contractAddress, compiledArtifactRef?, idempotencyKey?, sponsorSessionId?) → { jobId, status }`
 
 Revoke a previously-granted disclosure (removes the grantee entry on-chain) via the `revokeDisclosure` circuit. Attester-only. The matching `DisclosureGrants` row's `active` flips to `false`. Job result: `{ payloadHash, grantee, txHash }`. **Rate limit:** 30/hour per session.
+
+### `reindexDisclosures(contractAddress, compiledArtifactRef?) → { contractAddress, active, deactivated, reconciledAt }`
+
+Re-read the AttestationVault `disclosures` ledger Map from LIVE on-chain state and reconcile `DisclosureGrants`: the same reconciliation the server-signed grant/revoke path runs internally, exposed on demand. Use it after a WALLET-submitted grant/revoke that bypassed the plugin submission pipeline (browser signs, NIGHTGATE never saw a jobId). Crawler-independent, idempotent, self-healing. `active` is the count of grants present on-chain after reconciliation; returns a clean zero (not a 5xx) when no live provider is configured. **Rate limit:** 60/hour per contract.
+
+### `registerPassport(passportId, ownerId, sessionId, contractAddress, compiledArtifactRef?, idempotencyKey?, sponsorSessionId?) → { jobId, status }`
+
+Pre-register (or re-register) passport ownership via the `registerPassport` circuit. Registrar-only: the calling session must be the vault's DEPLOYER (its attester identity is locked in as `registrar` at deploy time; a non-registrar caller's tx is rejected in-circuit). Assigns the `passportId` (64-hex `Bytes<32>`) to an attester id (`ownerId`), so only that attester may bind or re-bind it via `bindPassport`. This blocks first-bind squatting for registered ids; re-registering an id is the ownership-transfer and squatter-recovery path (registrar re-points the id, the new owner rebinds). Unregistered ids stay open first-come-first-served. Job result: `{ passportId, ownerId, contractAddress, txHash }`. `compiledArtifactRef` defaults to `attestation-vault`. **Rate limit:** 30/hour per session.
 
 ### `registerGranteeIdentity(bindingInput, scope?) → { ID, granteeId, bindingKind }`
 

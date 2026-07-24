@@ -11,6 +11,8 @@
 //
 // Inputs (env vars):
 //   NIGHTGATE_URL                  default http://localhost:4004
+//   DEPLOY_E2E_ARTIFACT            default 'counter'; e.g. 'attestation-vault'
+//                                  to exercise the 0.10.0 constructor (registrar)
 //   LACE_VIEWING_KEY               required, Midnight Preprod viewing key from Lace
 //   LACE_MNEMONIC                  required, BIP39 recovery phrase (12/24 words);
 //                                  the server HD-derives per-role keys from it
@@ -179,9 +181,10 @@ async function waitForServer() {
         }
     }
 
-    step('5. deployContract(counter) (async job)');
+    const artifact = process.env.DEPLOY_E2E_ARTIFACT || 'counter';
+    step(`5. deployContract(${artifact}) (async job)`);
     r = await post('/deployContract', {
-        compiledArtifactRef: 'counter',
+        compiledArtifactRef: artifact,
         sessionId,
         initialPrivateState: '{}'
     });

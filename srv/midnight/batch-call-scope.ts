@@ -8,6 +8,8 @@
  * assembly and delegates the scope mechanics here.
  */
 
+import { withOrderedBatchSegments } from './batch-segment-order';
+
 export interface BatchCall {
     circuit: string;
     args: unknown[];
@@ -22,9 +24,13 @@ export interface BatchScopeResult {
 /**
  * Execute `calls` inside a single `withContractScopedTransaction` scope on
  * `found` (a findDeployedContract result). Calls are invoked in array order,
- * but the SDK applies the merged intents in unspecified order, so callers must
- * only batch order-independent calls. Validates every circuit BEFORE opening
- * the scope, so a bad name is a clean error rather than a half-built
+ * and the wrapped proof provider rewrites the merged intents' segment ids
+ * into call order before proving (batch-segment-order.ts), so the ledger
+ * also APPLIES them in call order — dependent calls may be batched. With
+ * duplicate circuit names in one batch the relative order among same-named
+ * calls is not guaranteed (intents are indistinguishable by entryPoint);
+ * batch distinct circuits when that matters. Validates every circuit BEFORE
+ * opening the scope, so a bad name is a clean error rather than a half-built
  * transaction context. Uses the circuit-call interface's `(txCtx, ...args)`
  * overload; the SDK batches the calls and submits ONCE.
  */
@@ -51,8 +57,15 @@ export async function runBatchInScope(
     }
 
     const circuits = calls.map(c => c.circuit);
+    // Deterministic apply order: wrap the proof provider so segment ids are
+    // rewritten into call order before proving (see batch-segment-order.ts).
+    // Skipped when the bundle has no proveTx-capable proof provider (tests).
+    const providersAny = providers as any;
+    const scopedProviders = typeof providersAny?.proofProvider?.proveTx === 'function'
+        ? { ...providersAny, proofProvider: withOrderedBatchSegments(providersAny.proofProvider, circuits) }
+        : providers;
     const finalized = await contracts.withContractScopedTransaction(
-        providers,
+        scopedProviders,
         async (txCtx: unknown) => {
             for (const c of calls) {
                 await found.callTx[c.circuit](txCtx, ...(c.args ?? []));

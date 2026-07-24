@@ -26,6 +26,9 @@ export type ImpureCircuits<PS> = {
                  payload_hash_0: Uint8Array,
                  threshold_0: bigint,
                  op_0: bigint): __compactRuntime.CircuitResults<PS, []>;
+  registerPassport(context: __compactRuntime.CircuitContext<PS>,
+                   passportId_0: Uint8Array,
+                   owner_id_0: Uint8Array): __compactRuntime.CircuitResults<PS, []>;
   bindPassport(context: __compactRuntime.CircuitContext<PS>,
                passportId_0: Uint8Array,
                payload_hash_0: Uint8Array): __compactRuntime.CircuitResults<PS, []>;
@@ -56,6 +59,9 @@ export type ProvableCircuits<PS> = {
                  payload_hash_0: Uint8Array,
                  threshold_0: bigint,
                  op_0: bigint): __compactRuntime.CircuitResults<PS, []>;
+  registerPassport(context: __compactRuntime.CircuitContext<PS>,
+                   passportId_0: Uint8Array,
+                   owner_id_0: Uint8Array): __compactRuntime.CircuitResults<PS, []>;
   bindPassport(context: __compactRuntime.CircuitContext<PS>,
                passportId_0: Uint8Array,
                payload_hash_0: Uint8Array): __compactRuntime.CircuitResults<PS, []>;
@@ -97,6 +103,9 @@ export type Circuits<PS> = {
                  payload_hash_0: Uint8Array,
                  threshold_0: bigint,
                  op_0: bigint): __compactRuntime.CircuitResults<PS, []>;
+  registerPassport(context: __compactRuntime.CircuitContext<PS>,
+                   passportId_0: Uint8Array,
+                   owner_id_0: Uint8Array): __compactRuntime.CircuitResults<PS, []>;
   bindPassport(context: __compactRuntime.CircuitContext<PS>,
                passportId_0: Uint8Array,
                payload_hash_0: Uint8Array): __compactRuntime.CircuitResults<PS, []>;
@@ -152,6 +161,14 @@ export type Ledger = {
     [Symbol.iterator](): Iterator<[Uint8Array, boolean]>
   };
   passport_bindings: {
+    isEmpty(): boolean;
+    size(): bigint;
+    member(key_0: Uint8Array): boolean;
+    lookup(key_0: Uint8Array): Uint8Array;
+    [Symbol.iterator](): Iterator<[Uint8Array, Uint8Array]>
+  };
+  readonly registrar: Uint8Array;
+  passport_owners: {
     isEmpty(): boolean;
     size(): bigint;
     member(key_0: Uint8Array): boolean;
