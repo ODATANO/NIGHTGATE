@@ -600,6 +600,24 @@ export function walletSubmitContractCall(args: WalletSubmitContractCallArgs): Pr
     return rpc('submitContractCall', args);
 }
 
+export interface WalletSubmitContractCallBatchArgs extends Omit<WalletSubmitContractCallArgs, 'circuit' | 'args'> {
+    /** Ordered circuit calls, all executed inside ONE transaction scope. */
+    calls: Array<{ circuit: string; args: unknown[] }>;
+}
+
+/**
+ * Invoke SEVERAL circuits on one deployed contract as a SINGLE transaction
+ * (the worker batches them via the SDK's withContractScopedTransaction).
+ * Returns the one submission txHash + on-chain status for the whole batch.
+ */
+export function walletSubmitContractCallBatch(args: WalletSubmitContractCallBatchArgs): Promise<{
+    txHash: string;
+    onChainStatus: string;
+    circuits: string[];
+}> {
+    return rpc('submitContractCallBatch', args);
+}
+
 /** Test-only: reset the singleton so subsequent calls re-spawn. */
 export function __resetWalletWorkerForTests(): void {
     client = null;

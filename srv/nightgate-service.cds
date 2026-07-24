@@ -570,6 +570,41 @@ service NightgateService {
         status : String; // 'pending' | 'succeeded' (idempotent retry)
     };
 
+    /**
+     * Submit SEVERAL circuit calls against ONE deployed contract as a SINGLE
+     * transaction. `calls` is a JSON array of `{ circuit, args }` executed in
+     * order inside one transaction scope (SDK withContractScopedTransaction):
+     * the contract's running state threads across the calls, then the batch is
+     * balanced, signed and submitted ONCE. At most 8 calls per batch.
+     *
+     * Failure semantics: an error BEFORE submission (bad circuit, throwing
+     * call, proving/balancing) discards the scope and nothing is submitted.
+     * AFTER submission the ledger's fallible phase still applies: the tx can
+     * finalize as PARTIAL_SUCCESS (on chain, a subset of calls applied); the
+     * job then fails with OnChainStatus:... and callers must verify effect
+     * state (e.g. verifyAttestationState) rather than assume all-or-nothing.
+     *
+     * With `sponsorSessionId`, the two-phase dust balancing also runs once for
+     * the whole batch (one sponsor sync + one dust spend instead of one per
+     * call), which is the main latency win over N sequential submitContractCall
+     * jobs. Same seeding, sponsoring and auth rules as submitContractCall.
+     *
+     * Async: returns `{ jobId, status }`; the job `result` carries
+     * `{ submissionId, txHash, contractAddress, circuits, status }` (ONE
+     * txHash for the whole batch).
+     */
+    action   submitContractCallBatch(contractAddress: String,
+                                     calls: LargeString, // JSON array of { circuit, args }
+                                     compiledArtifactRef: String,
+                                     sessionId: UUID,
+                                     idempotencyKey: String, // optional; dedupes retries
+                                     initialPrivateState: LargeString, // optional JSON; seeded on this wallet's first call
+                                     sponsorSessionId: UUID // optional; second session pays the dust fee (see submitContractCall)
+    )                                                                 returns {
+        jobId  : UUID;
+        status : String; // 'pending' | 'succeeded' (idempotent retry)
+    };
+
     // ========================================================================
     // Session Management (Wallet Connections)
     // ========================================================================

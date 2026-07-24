@@ -173,6 +173,45 @@ Invoke a circuit on a deployed contract.
 
 **Rate limit:** 30/min per session.
 
+### `submitContractCallBatch(contractAddress, calls, compiledArtifactRef, sessionId, idempotencyKey?, initialPrivateState?, sponsorSessionId?) → { jobId, status }`
+
+Invoke SEVERAL circuits on ONE deployed contract as a SINGLE transaction. The
+calls run in order inside one transaction scope (SDK
+`withContractScopedTransaction`): the contract's running state threads across
+the calls, then the batch is balanced, signed and submitted ONCE. At most 8
+calls per batch.
+
+**Failure semantics** distinguish two phases. An error BEFORE submission (bad
+circuit name, a throwing call, proving/balancing) discards the scope; nothing
+is submitted. AFTER submission the ledger's fallible phase still applies: the
+transaction can finalize as `PARTIAL_SUCCESS`, meaning it IS on chain and a
+subset of the batched calls may have been applied. The job then fails with
+`OnChainStatus:...` (and the crawler-free confirmer maps `PARTIAL_SUCCESS` to
+`chainStatus: failure`); callers must verify effect state (e.g.
+`verifyAttestationState`) rather than assume all-or-nothing.
+
+**Async**: returns `{ jobId, status: "pending" }`; poll `getJobStatus`. The job
+result on success is `{ submissionId, txHash, contractAddress, circuits, status }`
+with ONE `txHash` for the whole batch; `circuits` echoes the included calls in
+order.
+
+| Field | Type | Notes |
+|---|---|---|
+| `contractAddress` | String | From a prior `deployContract` |
+| `calls` | LargeString | JSON array of `{ circuit, args }`, executed in order. Per-call `args` follow **Encoding circuit args** below |
+| `compiledArtifactRef` | String | Logical name from registry |
+| `sessionId` | UUID | Must have signing enabled |
+| `idempotencyKey` | String (optional) | Dedupes retries |
+| `initialPrivateState` | LargeString (optional) | Seeded on this wallet's first contact with the contract, as in `submitContractCall` |
+| `sponsorSessionId` | UUID (optional) | Second session pays the dust fee, ONCE for the whole batch (one sponsor sync + one dust spend instead of one per call). See **Per-tx fee sponsoring** |
+
+**Rate limit:** 30/min per session (shared with `submitContractCall`).
+
+**When to use:** several sequential calls to the same contract whose only
+dependency is each other's state (e.g. an anchor flow `attest` →
+`bindPassport` → `anchorContentRoot`). The batch removes the per-call sponsor
+re-sync and block-inclusion wait, roughly halving multi-step flows.
+
 #### Per-tx fee sponsoring (`sponsorSessionId`)
 
 Every submit action (`deployContract`, `submitContractCall`, `anchorDocument`,

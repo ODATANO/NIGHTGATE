@@ -29,6 +29,7 @@ import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { formatErr } from '../utils/format-error';
 import { deriveIndexerWsUrl } from '../utils/indexer-url';
+import { runBatchInScope } from './batch-call-scope';
 import {
     deriveAttestationSecret,
     getContractWitnessFactory
@@ -1758,6 +1759,109 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
         };
         log('info', `submitContractCall: done txHash=${out.txHash.slice(0, 16)} status=${out.onChainStatus}`);
         return out;
+    },
+
+    /**
+     * Submit SEVERAL circuit calls against ONE deployed contract as a SINGLE
+     * transaction, via the SDK's `withContractScopedTransaction`. Each call is
+     * added to the shared TransactionContext (the circuit-call interface's
+     * `(txCtx, ...args)` overload); the SDK threads the contract's running
+     * state across the calls, then balances, signs and submits ONCE at scope
+     * end. With a sponsor, the two-phase dust balancing therefore also runs
+     * once for the whole batch instead of once per call.
+     *
+     * Failure semantics, two distinct phases:
+     * - BEFORE submission (a bad circuit, a throwing call, proving/balancing
+     *   errors): the scope discards all unsubmitted calls and nothing is
+     *   submitted.
+     * - AFTER submission the ledger's fallible phase still applies: the
+     *   transaction can finalize as PARTIAL_SUCCESS, i.e. it IS on chain and a
+     *   subset of the batched calls may have been applied. The submitter then
+     *   marks the submission failed (OnChainStatus:...), so callers must check
+     *   effect state (e.g. verifyAttestationState) rather than assume
+     *   all-or-nothing.
+     */
+    async submitContractCallBatch({
+        sessionId, proxyId, contractName, registration,
+        contractAddress, calls,
+        indexerHttpUrl, indexerWsUrl, proofServerUrl,
+        networkId, witnessValues, merkleProof, initialPrivateState,
+        sponsorSessionId
+    }: {
+        sessionId: string;
+        proxyId: string;
+        contractName: string;
+        registration: ContractRegistration;
+        contractAddress: string;
+        /** Ordered circuit calls; all execute inside one transaction scope. */
+        calls: Array<{ circuit: string; args: unknown[] }>;
+        indexerHttpUrl: string;
+        indexerWsUrl: string;
+        proofServerUrl: string;
+        networkId: string;
+        /** Batch-level witnesses: bound once to the compiled contract instance
+         *  shared by every call in the scope (same semantics as a single call). */
+        witnessValues?: { attestedValue: string; valueSalt: string };
+        merkleProof?: { fieldValue: string; siblings: string[]; dirs: boolean[] };
+        initialPrivateState?: unknown;
+        /** Optional fee sponsor: this facade balances ['dust'] and submits. */
+        sponsorSessionId?: string;
+    }) {
+        if (!Array.isArray(calls) || calls.length === 0) {
+            throw new Error('submitContractCallBatch: calls must be a non-empty array');
+        }
+        const entry = facades.get(sessionId);
+        if (!entry) throw new Error(`No facade for sessionId=${sessionId.slice(0, 16)}`);
+        const sponsorEntry = resolveSponsorEntry(sponsorSessionId);
+        const sdk = await loadSdk();
+        await ensureNetworkId(networkId, sdk);
+
+        const compiledContract = await getOrCompileContract(contractName, registration, entry, witnessValues, merkleProof);
+        const contractProviders = await buildWorkerContractProviders({
+            indexerHttpUrl, indexerWsUrl, proofServerUrl,
+            zkConfigPath: registration.zkConfigPath
+        });
+        const privateStateProvider = createPrivateStateProxy(proxyId);
+        const walletProvider = sponsorEntry
+            ? buildSponsoredWalletProvider(entry, sponsorEntry)
+            : buildWorkerWalletProvider(entry);
+
+        const providers = {
+            ...contractProviders,
+            privateStateProvider,
+            walletProvider,
+            midnightProvider: walletProvider
+        };
+
+        const { contracts } = await loadContractsSdk();
+        const circuits = calls.map(c => c.circuit);
+        log('info', `submitContractCallBatch: ${contractName}.[${circuits.join('+')}]@${contractAddress.slice(0, 12)}` +
+            (sponsorEntry ? ` (fee sponsored by ${String(sponsorSessionId).slice(0, 16)})` : ''));
+
+        // Same first-contact private-state seeding as submitContractCall: a
+        // wallet that did not deploy this contract has no entry at its
+        // privateStateId, and findDeployedContract would throw. Never
+        // overwrite an existing state.
+        privateStateProvider.setContractAddress(contractAddress);
+        const existingPrivateState = await privateStateProvider.get(registration.privateStateId);
+        const seed = existingPrivateState === undefined || existingPrivateState === null;
+        if (seed) {
+            log('info',
+                `submitContractCallBatch: no private state at '${registration.privateStateId}' for this wallet, ` +
+                `seeding the contract's initial private state`);
+        }
+        const found = await contracts.findDeployedContract(providers, {
+            contractAddress,
+            compiledContract,
+            privateStateId: registration.privateStateId,
+            ...(seed ? { initialPrivateState: initialPrivateState ?? {} } : {})
+        });
+        // Scope mechanics (circuit validation, ordered (txCtx, ...args) calls,
+        // result mapping) live in batch-call-scope.ts so they are unit-testable
+        // outside the worker-thread guard.
+        const out = await runBatchInScope(contracts, providers, found, calls, contractAddress);
+        log('info', `submitContractCallBatch: done txHash=${out.txHash.slice(0, 16)} status=${out.onChainStatus} calls=${out.circuits.length}`);
+        return out;
     }
 };
 
@@ -1768,7 +1872,7 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
 // rejects the second (double-select). A sponsored submit also balances the
 // sponsor's facade, so it locks both keys. Read-only handlers stay concurrent.
 const SUBMIT_METHODS = new Set([
-    'deployContract', 'submitContractCall',
+    'deployContract', 'submitContractCall', 'submitContractCallBatch',
     'registerDustGeneration', 'deregisterDustGeneration',
     'transferNight', 'unshieldNight', 'shieldNight'
 ]);

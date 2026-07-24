@@ -13,12 +13,14 @@
 
 const walletDeployContract     = vi.hoisted(() => (vi.fn()));
 const walletSubmitContractCall = vi.hoisted(() => (vi.fn()));
+const walletSubmitContractCallBatch = vi.hoisted(() => (vi.fn()));
 const registerPrivateStateProvider   = vi.hoisted(() => (vi.fn()));
 const unregisterPrivateStateProvider = vi.hoisted(() => (vi.fn()));
 
 vi.mock('../../srv/midnight/wallet-worker-client', () => ({
     walletDeployContract:           (...args: unknown[]) => walletDeployContract(...args),
     walletSubmitContractCall:       (...args: unknown[]) => walletSubmitContractCall(...args),
+    walletSubmitContractCallBatch:  (...args: unknown[]) => walletSubmitContractCallBatch(...args),
     registerPrivateStateProvider:   (...args: unknown[]) => registerPrivateStateProvider(...args),
     unregisterPrivateStateProvider: (...args: unknown[]) => unregisterPrivateStateProvider(...args)
 }));
@@ -140,6 +142,7 @@ function newSubmitter(opts: Partial<TransactionSubmitterDeps> = {}) {
 beforeEach(() => {
     walletDeployContract.mockReset();
     walletSubmitContractCall.mockReset();
+    walletSubmitContractCallBatch.mockReset();
     registerPrivateStateProvider.mockReset();
     unregisterPrivateStateProvider.mockReset();
 });
@@ -324,6 +327,123 @@ describe('TransactionSubmitter.call', () => {
             sessionId: 'session-1'
         })).rejects.toBeInstanceOf(SubmissionError);
         expect(db.tables['midnight.PendingSubmissions'][0].status).toBe('failed');
+    });
+});
+
+describe('TransactionSubmitter.callBatch', () => {
+    const CALLS = [
+        { circuit: 'attest', args: ['0xPH', '0xMH'] },
+        { circuit: 'bindPassport', args: ['0xID', '0xPH'] },
+        { circuit: 'anchorContentRoot', args: ['0xPH', '0xROOT'] }
+    ];
+
+    test('one pending row for the whole batch; ONE worker RPC; result carries circuits', async () => {
+        walletSubmitContractCallBatch.mockResolvedValueOnce({
+            txHash: '0xbatch', onChainStatus: 'SucceedEntirely',
+            circuits: ['attest', 'bindPassport', 'anchorContentRoot']
+        });
+        const { submitter, db } = newSubmitter();
+
+        const result = await submitter.callBatch({
+            contractAddress: '0xCONTRACT',
+            calls: CALLS,
+            contractName: 'attestation-vault',
+            registration: REGISTRATION,
+            sessionId: 'session-1'
+        });
+
+        expect(result).toMatchObject({
+            txHash: '0xbatch', contractAddress: '0xCONTRACT', status: 'included',
+            circuits: ['attest', 'bindPassport', 'anchorContentRoot']
+        });
+        const rows = db.tables['midnight.PendingSubmissions'];
+        expect(rows).toHaveLength(1); // one row for the batch, not one per call
+        expect(rows[0]).toMatchObject({
+            actionType: 'CALL',
+            circuitName: 'attest+bindPassport+anchorContentRoot',
+            txHash: '0xbatch',
+            status: 'included'
+        });
+        expect(walletSubmitContractCallBatch).toHaveBeenCalledTimes(1);
+        expect(walletSubmitContractCall).not.toHaveBeenCalled();
+        const sentArgs = walletSubmitContractCallBatch.mock.calls[0][0];
+        expect(sentArgs).toMatchObject({
+            sessionId: wallet.accountId,
+            contractAddress: '0xCONTRACT',
+            calls: CALLS,
+            contractName: 'attestation-vault',
+            registration: REGISTRATION
+        });
+    });
+
+    test('worker error marks the single batch row failed (one row, no partial rows)', async () => {
+        walletSubmitContractCallBatch.mockRejectedValueOnce(
+            new Error("Circuit 'nope' not found on contract at 0xCONTRACT")
+        );
+        const { submitter, db } = newSubmitter();
+
+        await expect(submitter.callBatch({
+            contractAddress: '0xCONTRACT',
+            calls: [{ circuit: 'nope', args: [] }],
+            contractName: 'attestation-vault',
+            registration: REGISTRATION,
+            sessionId: 'session-1'
+        })).rejects.toBeInstanceOf(SubmissionError);
+        expect(db.tables['midnight.PendingSubmissions']).toHaveLength(1);
+        expect(db.tables['midnight.PendingSubmissions'][0].status).toBe('failed');
+    });
+
+    test('missing txHash from the worker is a MalformedResult failure', async () => {
+        walletSubmitContractCallBatch.mockResolvedValueOnce({
+            txHash: '', onChainStatus: 'SucceedEntirely', circuits: ['attest']
+        });
+        const { submitter, db } = newSubmitter();
+
+        await expect(submitter.callBatch({
+            contractAddress: '0xCONTRACT',
+            calls: [{ circuit: 'attest', args: [] }],
+            contractName: 'attestation-vault',
+            registration: REGISTRATION,
+            sessionId: 'session-1'
+        })).rejects.toBeInstanceOf(SubmissionError);
+        expect(db.tables['midnight.PendingSubmissions'][0]).toMatchObject({
+            status: 'failed', errorCode: 'MalformedResult'
+        });
+    });
+
+    test('non-SucceedEntirely on-chain status fails the batch row', async () => {
+        walletSubmitContractCallBatch.mockResolvedValueOnce({
+            txHash: '0xdead', onChainStatus: 'FailEntirely', circuits: ['attest']
+        });
+        const { submitter, db } = newSubmitter();
+
+        await expect(submitter.callBatch({
+            contractAddress: '0xCONTRACT',
+            calls: [{ circuit: 'attest', args: [] }],
+            contractName: 'attestation-vault',
+            registration: REGISTRATION,
+            sessionId: 'session-1'
+        })).rejects.toBeInstanceOf(SubmissionError);
+        expect(db.tables['midnight.PendingSubmissions'][0]).toMatchObject({
+            status: 'failed', txHash: '0xdead', errorCode: 'OnChainStatus:FailEntirely'
+        });
+    });
+
+    test('circuitName is truncated to the 100-char column', async () => {
+        walletSubmitContractCallBatch.mockResolvedValueOnce({
+            txHash: '0xlong', onChainStatus: 'SucceedEntirely', circuits: []
+        });
+        const { submitter, db } = newSubmitter();
+        const longCalls = Array.from({ length: 8 }, (_, i) => ({ circuit: `veryLongCircuitName_${i}_${'x'.repeat(20)}`, args: [] }));
+
+        await submitter.callBatch({
+            contractAddress: '0xCONTRACT',
+            calls: longCalls,
+            contractName: 'attestation-vault',
+            registration: REGISTRATION,
+            sessionId: 'session-1'
+        });
+        expect(db.tables['midnight.PendingSubmissions'][0].circuitName.length).toBeLessThanOrEqual(100);
     });
 });
 

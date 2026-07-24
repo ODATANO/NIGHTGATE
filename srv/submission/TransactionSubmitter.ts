@@ -35,10 +35,12 @@ import { CapDbPrivateStateProvider } from '../midnight/CapDbPrivateStateProvider
 import {
     walletDeployContract,
     walletSubmitContractCall,
+    walletSubmitContractCallBatch,
     registerPrivateStateProvider,
     unregisterPrivateStateProvider,
     type WalletDeployContractArgs,
-    type WalletSubmitContractCallArgs
+    type WalletSubmitContractCallArgs,
+    type WalletSubmitContractCallBatchArgs
 } from '../midnight/wallet-worker-client';
 
 // ---- Types ----------------------------------------------------------------
@@ -125,6 +127,25 @@ export interface CallResult {
     status: SubmissionStatus;
 }
 
+export interface CallBatchArgs {
+    contractAddress: string;
+    /** Ordered circuit calls; all execute inside ONE transaction. */
+    calls: Array<{ circuit: string; args: unknown[] }>;
+    contractName: string;
+    registration: ContractRegistrationMeta;
+    sessionId: string;
+    /** Batch-level witnesses, bound once to the shared compiled contract
+     *  instance (same semantics as the single-call fields on CallArgs). */
+    witnessValues?: { attestedValue: string; valueSalt: string };
+    merkleProof?: { fieldValue: string; siblings: string[]; dirs: boolean[] };
+    initialPrivateState?: unknown;
+}
+
+export interface CallBatchResult extends CallResult {
+    /** Circuits included in the one submitted transaction, in call order. */
+    circuits: string[];
+}
+
 export interface SubmissionErrorClassification {
     code: string;
     retryable: boolean;
@@ -160,6 +181,8 @@ export interface TransactionSubmitterDeps {
     walletDeployContractImpl?: typeof walletDeployContract;
     /** Same idea for `walletSubmitContractCall`. */
     walletSubmitContractCallImpl?: typeof walletSubmitContractCall;
+    /** Same idea for `walletSubmitContractCallBatch`. */
+    walletSubmitContractCallBatchImpl?: typeof walletSubmitContractCallBatch;
     /** Network, used by classifySubmissionError to decide if 1016 is fail-fast. */
     network: NightgateNetwork;
     /**
@@ -281,6 +304,70 @@ export class TransactionSubmitter {
         return { submissionId, txHash, contractAddress: args.contractAddress, status: newStatus };
     }
 
+    /**
+     * Submit SEVERAL circuit calls against one contract as a SINGLE
+     * transaction (worker: withContractScopedTransaction). One
+     * PendingSubmissions row tracks the whole batch; its circuitName is the
+     * ordered `+`-joined circuit list. A pre-submission failure discards the
+     * scope (nothing submitted); post-submission the ledger's fallible phase
+     * can still finalize the tx as PARTIAL_SUCCESS (on chain, subset applied),
+     * which fails the row with OnChainStatus:... and the caller must verify
+     * effect state.
+     */
+    async callBatch(args: CallBatchArgs): Promise<CallBatchResult> {
+        const circuits = args.calls.map(c => c.circuit);
+        // circuitName is String(100); the join is informational, so truncate.
+        const circuitLabel = circuits.join('+').slice(0, 100);
+        const submissionId = await this.insertPending('CALL', args.contractAddress, circuitLabel, args.sessionId);
+
+        const batchFn = this.deps.walletSubmitContractCallBatchImpl ?? walletSubmitContractCallBatch;
+        let release: (() => void) | null = null;
+        let workerResult: { txHash: string; onChainStatus: string; circuits: string[] };
+        try {
+            const proxy = await this.registerPrivateStateProxy();
+            release = proxy.release;
+            await reportExternalExecution({ submissionId });
+            workerResult = await batchFn(this.makeCallBatchRpcArgs(args, proxy.proxyId));
+        } catch (err) {
+            release?.();
+            const classification = classifySubmissionError(err, this.deps.network);
+            await this.markFailed(submissionId, classification);
+            throw new SubmissionError(submissionId, classification, err);
+        }
+        release?.();
+
+        const { txHash, onChainStatus } = workerResult;
+        if (!txHash) {
+            const classification: SubmissionErrorClassification = {
+                code: 'MalformedResult',
+                retryable: false,
+                message: 'Worker submitContractCallBatch returned without txHash'
+            };
+            await this.markFailed(submissionId, classification);
+            throw new SubmissionError(submissionId, classification);
+        }
+        await reportExternalSubmission({ submissionId, txHash });
+
+        const newStatus: SubmissionStatus = onChainStatus === 'SucceedEntirely' ? 'included' : 'failed';
+        await this.updateAfterSdk(submissionId, {
+            txHash,
+            contractAddress: args.contractAddress,
+            status: newStatus,
+            errorCode:    newStatus === 'failed' ? `OnChainStatus:${onChainStatus}` : undefined,
+            errorMessage: newStatus === 'failed' ? `On-chain status was ${onChainStatus}, expected SucceedEntirely` : undefined
+        });
+
+        if (newStatus === 'failed') {
+            throw new SubmissionError(submissionId, {
+                code: `OnChainStatus:${onChainStatus}`,
+                retryable: false,
+                message: `Batched call on-chain status ${onChainStatus}`
+            });
+        }
+
+        return { submissionId, txHash, contractAddress: args.contractAddress, status: newStatus, circuits };
+    }
+
     // -- Internals -----------------------------------------------------------
 
     /**
@@ -348,6 +435,25 @@ export class TransactionSubmitter {
             contractAddress: args.contractAddress,
             circuit:         args.circuit,
             args:            args.args,
+            indexerHttpUrl:  this.deps.contractProvidersConfig.indexerHttpUrl,
+            indexerWsUrl:    this.deps.contractProvidersConfig.indexerWsUrl,
+            proofServerUrl:  this.deps.contractProvidersConfig.proofServerUrl,
+            networkId:       this.deps.network,
+            witnessValues:   args.witnessValues,
+            merkleProof:     args.merkleProof,
+            initialPrivateState: args.initialPrivateState,
+            sponsorSessionId: this.deps.sponsorAccountId
+        };
+    }
+
+    private makeCallBatchRpcArgs(args: CallBatchArgs, proxyId: string): WalletSubmitContractCallBatchArgs {
+        return {
+            sessionId:    this.deps.walletMaterial.accountId,
+            proxyId,
+            contractName: args.contractName,
+            registration: args.registration,
+            contractAddress: args.contractAddress,
+            calls:           args.calls,
             indexerHttpUrl:  this.deps.contractProvidersConfig.indexerHttpUrl,
             indexerWsUrl:    this.deps.contractProvidersConfig.indexerWsUrl,
             proofServerUrl:  this.deps.contractProvidersConfig.proofServerUrl,

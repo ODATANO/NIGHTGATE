@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.9.3 - 2026-07-24
+
+### Feature: batched contract calls in one transaction (`submitContractCallBatch`)
+
+New submission action `submitContractCallBatch(contractAddress, calls,
+compiledArtifactRef, sessionId, idempotencyKey?, initialPrivateState?,
+sponsorSessionId?)`: several circuit calls against ONE deployed contract execute
+inside a single transaction scope (SDK `withContractScopedTransaction`) and are
+balanced, signed and submitted ONCE. The contract's running state threads across
+the calls. A failure before submission discards the scope (nothing submitted);
+after submission the ledger's fallible phase can still finalize the tx as
+PARTIAL_SUCCESS (on chain, subset of calls applied), which fails the job with
+`OnChainStatus:...`. At most 8 calls per batch. With `sponsorSessionId`, the
+two-phase dust balancing runs once for the whole batch.
+
+- Job kind `submitContractCallBatch` (heavy pool), command op `callBatch`,
+  encrypted at rest like single calls; idempotencyKey dedupes retries.
+- One `PendingSubmissions` row tracks the batch; `circuitName` is the ordered
+  `+`-joined circuit list (truncated to the column).
+- Job result: `{ submissionId, txHash, contractAddress, circuits, status }`,
+  with one txHash for the whole batch.
+- Same first-contact private-state seeding, arg coercion (per call), mainnet
+  gate, rate limit (shared with `submitContractCall`) and sponsor authorization
+  rules as `submitContractCall`. No Compact contract change.
+
 ## 0.9.2 - 2026-07-23
 
 ### Feature: crawler-free chain-outcome confirmation

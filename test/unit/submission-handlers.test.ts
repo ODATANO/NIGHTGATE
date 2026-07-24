@@ -126,6 +126,11 @@ function makeSuccessfulSubmitter() {
         call: vi.fn(async () => ({
             submissionId: 'sub-2', txHash: '0xcafe',
             contractAddress: '0xCONTRACT', status: 'included' as const
+        })),
+        callBatch: vi.fn(async (args: any) => ({
+            submissionId: 'sub-3', txHash: '0xbatch',
+            contractAddress: '0xCONTRACT', status: 'included' as const,
+            circuits: (args?.calls ?? []).map((c: any) => c.circuit)
         }))
     } as unknown as TransactionSubmitter;
 }
@@ -190,6 +195,63 @@ describe('submitContractCall: argument validation', () => {
     });
 });
 
+describe('submitContractCallBatch: argument validation', () => {
+    const VALID_BATCH_ARGS = {
+        contractAddress: '0xCONTRACT',
+        calls: JSON.stringify([{ circuit: 'attest', args: [] }, { circuit: 'bindPassport', args: [] }]),
+        compiledArtifactRef: 'attestation-vault',
+        sessionId: 'session-batch-validation'
+    };
+
+    function setupAndCallBatch(data: Record<string, unknown>) {
+        const srv = makeFakeService();
+        registerSubmissionHandlers(srv as any, {});
+        const req = makeReq(data);
+        return srv.handlers['submitContractCallBatch'](req).then(() => req);
+    }
+
+    test('rejects missing contractAddress', async () => {
+        const req = await setupAndCallBatch({ ...VALID_BATCH_ARGS, contractAddress: undefined });
+        expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/contractAddress/));
+    });
+
+    test('rejects missing calls', async () => {
+        const req = await setupAndCallBatch({ ...VALID_BATCH_ARGS, calls: undefined });
+        expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/calls/));
+    });
+
+    test('rejects non-array calls', async () => {
+        const req = await setupAndCallBatch({ ...VALID_BATCH_ARGS, calls: '{"notArray":true}' });
+        expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/non-empty JSON array/));
+    });
+
+    test('rejects empty calls array', async () => {
+        const req = await setupAndCallBatch({ ...VALID_BATCH_ARGS, calls: '[]' });
+        expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/non-empty/));
+    });
+
+    test('rejects more than 8 calls', async () => {
+        const nine = JSON.stringify(Array.from({ length: 9 }, () => ({ circuit: 'attest', args: [] })));
+        const req = await setupAndCallBatch({ ...VALID_BATCH_ARGS, calls: nine });
+        expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/at most 8/));
+    });
+
+    test('rejects an entry without circuit', async () => {
+        const req = await setupAndCallBatch({ ...VALID_BATCH_ARGS, calls: '[{"args":[]}]' });
+        expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/calls\[0\]\.circuit/));
+    });
+
+    test('rejects an entry with non-array args', async () => {
+        const req = await setupAndCallBatch({ ...VALID_BATCH_ARGS, calls: '[{"circuit":"attest","args":{"x":1}}]' });
+        expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/calls\[0\]\.args must be an array/));
+    });
+
+    test('rejects non-JSON initialPrivateState', async () => {
+        const req = await setupAndCallBatch({ ...VALID_BATCH_ARGS, initialPrivateState: '{broken' });
+        expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/initialPrivateState must be valid JSON/));
+    });
+});
+
 // ---- Error translation ----------------------------------------------------
 
 describe('error translation to OData status codes', () => {
@@ -242,6 +304,76 @@ describe('error translation to OData status codes', () => {
             requestedBy: 'test-user', commandVersion: 1, encryptCommand: true,
             command: { op: 'call', contractAddress: VALID_CALL_ARGS.contractAddress }
         });
+    });
+
+    test('happy path: submitContractCallBatch enqueues op callBatch and submitter.callBatch gets the ordered calls', async () => {
+        const submitter = makeSuccessfulSubmitter();
+        const srv = setupHandlers({ submitterFactory: () => submitter });
+        const calls = [
+            { circuit: 'attest', args: [] },
+            { circuit: 'bindPassport', args: [] },
+            { circuit: 'anchorContentRoot', args: [] }
+        ];
+        const req = makeReq({
+            contractAddress: '0xCONTRACT',
+            calls: JSON.stringify(calls),
+            compiledArtifactRef: 'attestation-vault',
+            sessionId: 'session-happy-batch'
+        });
+        const result = await srv.handlers['submitContractCallBatch'](req);
+        expect(req.reject).not.toHaveBeenCalled();
+        expect(result).toEqual({
+            jobId: 'job-submitContractCallBatch-test',
+            status: 'pending'
+        });
+        expect((submitter as any).callBatch).toHaveBeenCalledTimes(1);
+        expect((submitter as any).call).not.toHaveBeenCalled();
+        const batchArgs = ((submitter as any).callBatch as Mock).mock.calls[0][0];
+        expect(batchArgs).toMatchObject({
+            contractAddress: '0xCONTRACT',
+            contractName: 'attestation-vault',
+            sessionId: 'session-happy-batch'
+        });
+        expect(batchArgs.calls.map((c: any) => c.circuit)).toEqual(['attest', 'bindPassport', 'anchorContentRoot']);
+        expect(mockStartJob.mock.calls.at(-1)?.[0]).toMatchObject({
+            kind: 'submitContractCallBatch',
+            requestedBy: 'test-user', commandVersion: 1, encryptCommand: true,
+            command: { op: 'callBatch', contractAddress: '0xCONTRACT' }
+        });
+    });
+
+    test('reconciliation finalizer rebuilds the batch result incl. circuits from command + evidence', async () => {
+        setupHandlers({});
+        const finalizer = registeredFinalizers.get(`submitContractCallBatch\0${1}`);
+        expect(finalizer).toBeDefined();
+        const result: any = await finalizer!(
+            {
+                op: 'callBatch', contractAddress: '0xCONTRACT', compiledArtifactRef: 'attestation-vault',
+                calls: [{ circuit: 'attest', args: [] }, { circuit: 'bindPassport', args: [] }],
+                sponsorSessionId: 'sponsor-1'
+            },
+            { ID: 'job-r', kind: 'submitContractCallBatch', sessionId: 's', requestedBy: 'u', commandVersion: 1 },
+            { submissionId: 'sub-9', txHash: '0xrecovered', contractAddress: '0xCONTRACT', finalizedAt: '2026-07-23T00:00:00Z' }
+        );
+        expect(result).toEqual({
+            reconciled: true,
+            submissionId: 'sub-9',
+            txHash: '0xrecovered',
+            contractAddress: '0xCONTRACT',
+            circuits: ['attest', 'bindPassport'],
+            status: 'finalized',
+            feeSponsor: 'sponsor-1'
+        });
+    });
+
+    test('executor guard: a submitContractCallBatch job rejects a persisted op=call command', async () => {
+        setupHandlers({});
+        const processor = registeredProcessors.get(`submitContractCallBatch\0${1}`);
+        expect(processor).toBeDefined();
+        await expect(processor!(
+            { op: 'call', contractAddress: '0xC', circuit: 'attest', compiledArtifactRef: 'attestation-vault', args: [] },
+            { ID: 'job-x', kind: 'submitContractCallBatch', sessionId: 's', requestedBy: 'u', commandVersion: 1 }
+        )).rejects.toThrow(/incompatible with submitContractCallBatch/);
     });
 
     test('deploy forwards registration meta (artifactPath/privateStateId/zkConfigPath) to submitter', async () => {

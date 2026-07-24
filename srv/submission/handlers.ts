@@ -83,6 +83,7 @@ const DEFAULT_ATTESTATION_VAULT_REF = 'attestation-vault';
 type ContractCommandV1 =
     | { op: 'deploy'; compiledArtifactRef: string; initialPrivateState: unknown; sponsorSessionId?: string }
     | { op: 'call'; contractAddress: string; circuit: string; compiledArtifactRef: string; args: unknown[]; initialPrivateState?: unknown; sponsorSessionId?: string; witnessValues?: { attestedValue: string; valueSalt: string }; merkleProof?: { fieldValue: string; siblings: string[]; dirs: boolean[] } }
+    | { op: 'callBatch'; contractAddress: string; calls: Array<{ circuit: string; args: unknown[] }>; compiledArtifactRef: string; initialPrivateState?: unknown; sponsorSessionId?: string; witnessValues?: { attestedValue: string; valueSalt: string }; merkleProof?: { fieldValue: string; siblings: string[]; dirs: boolean[] } }
     | { op: 'predicateWorkflow'; predicateAttestationId: string; payloadHash: string; contractAddress: string; compiledArtifactRef: string; predicate: string; threshold: string; opCode: number; unit?: string; value: string; salt: string; sponsorSessionId?: string }
     | { op: 'fieldPredicateWorkflow'; predicateAttestationId: string; payloadHash: string; fieldKey: string; contractAddress: string; compiledArtifactRef: string; predicate: string; threshold: string; opCode: number; unit?: string; value: string; siblings: string[]; dirs: boolean[]; contentRoot?: string; sponsorSessionId?: string }
     | { op: 'anchorDocument'; documentId: string; payloadHash: string; metadataHash: string; contractAddress: string; compiledArtifactRef: string; sponsorSessionId?: string }
@@ -140,6 +141,7 @@ export function registerSubmissionHandlers(
         const callKinds = new Set(['submitContractCall', 'predicateCommitValue', 'predicateProof', 'fieldAnchorRoot', 'fieldPredicateProof']);
         if ((job.kind === 'deployContract' && command.op !== 'deploy')
             || (callKinds.has(job.kind) && command.op !== 'call')
+            || (job.kind === 'submitContractCallBatch' && command.op !== 'callBatch')
             || (job.kind === 'issuePredicateAttestation' && command.op !== 'predicateWorkflow')
             || (job.kind === 'issueFieldPredicateAttestation' && command.op !== 'fieldPredicateWorkflow')
             || (job.kind === 'anchorDocument' && command.op !== 'anchorDocument')
@@ -255,6 +257,26 @@ export function registerSubmissionHandlers(
             return { ...(isGrant ? { disclosureGrantId: command.disclosureGrantId, level: command.level } : {}), payloadHash: command.payloadHash, grantee: command.grantee, txHash: result.txHash };
         }
 
+        if (command.op === 'callBatch') {
+            // Same per-circuit coercion as the single-call tail below, applied
+            // to each entry of the batch (raw JSON args were persisted).
+            const coercedCalls = command.calls.map(c => {
+                const argTypes = argTypesLoader(resolved.zkConfigPath, c.circuit);
+                return { circuit: c.circuit, args: coerceCircuitArgs(c.args, argTypes) };
+            });
+            const result = await submitter.callBatch({
+                contractAddress: command.contractAddress,
+                calls: coercedCalls,
+                contractName: command.compiledArtifactRef,
+                initialPrivateState: command.initialPrivateState,
+                witnessValues: command.witnessValues,
+                merkleProof: command.merkleProof,
+                registration: { artifactPath: resolved.artifactPath, privateStateId: resolved.privateStateId, zkConfigPath: resolved.zkConfigPath },
+                sessionId: job.sessionId
+            });
+            return { submissionId: result.submissionId, txHash: result.txHash, contractAddress: result.contractAddress, circuits: result.circuits, status: result.status, ...(sponsor ? { feeSponsor: sponsor.sponsorSessionId } : {}) };
+        }
+
         let coercedArgs: unknown[];
         if (job.kind === 'predicateCommitValue') {
             coercedArgs = [hexToBytes(String(command.args[0]))];
@@ -283,6 +305,7 @@ export function registerSubmissionHandlers(
     };
     registerBackgroundJobProcessor('deployContract', 1, executeContractCommand);
     registerBackgroundJobProcessor('submitContractCall', 1, executeContractCommand);
+    registerBackgroundJobProcessor('submitContractCallBatch', 1, executeContractCommand);
     registerBackgroundJobProcessor('issuePredicateAttestation', 1, executeContractCommand);
     registerBackgroundJobProcessor('issueFieldPredicateAttestation', 1, executeContractCommand);
     registerBackgroundJobProcessor('anchorDocument', 1, executeContractCommand);
@@ -332,11 +355,26 @@ export function registerSubmissionHandlers(
                 payloadHash: command.payloadHash, grantee: command.grantee, txHash: evidence.txHash
             };
         }
+        if (command.op === 'callBatch') {
+            // Rebuild the documented batch result from the encrypted command
+            // (the ordered circuits) + the durable evidence. Without this the
+            // generic recovery result would miss `circuits`.
+            return {
+                reconciled: true,
+                submissionId: evidence.submissionId,
+                txHash: evidence.txHash,
+                contractAddress: evidence.contractAddress ?? command.contractAddress,
+                circuits: command.calls.map(c => c.circuit),
+                status: 'finalized',
+                ...(command.sponsorSessionId ? { feeSponsor: command.sponsorSessionId } : {})
+            };
+        }
         throw new Error(`Unsupported projection finalizer operation '${(command as any)?.op}'`);
     };
     registerBackgroundJobReconciliationFinalizer('anchorDocument', 1, finalizeContractProjection);
     registerBackgroundJobReconciliationFinalizer('grantDisclosure', 1, finalizeContractProjection);
     registerBackgroundJobReconciliationFinalizer('revokeDisclosure', 1, finalizeContractProjection);
+    registerBackgroundJobReconciliationFinalizer('submitContractCallBatch', 1, finalizeContractProjection);
 
     srv.on('deployContract', async (req: Request) => {
         const { compiledArtifactRef, sessionId, initialPrivateState, idempotencyKey, sponsorSessionId } = req.data as {
@@ -453,6 +491,88 @@ export function registerSubmissionHandlers(
                 commandVersion: 1,
                 encryptCommand: true,
                 command: { op: 'call', contractAddress, circuit, compiledArtifactRef, args: parsedArgs, initialPrivateState: parsedInitialPrivateState, sponsorSessionId: sponsor?.sponsorSessionId }
+            });
+        });
+    });
+
+    srv.on('submitContractCallBatch', async (req: Request) => {
+        const { contractAddress, calls, compiledArtifactRef, sessionId, idempotencyKey, initialPrivateState, sponsorSessionId } = req.data as {
+            contractAddress?: string;
+            calls?: string;
+            compiledArtifactRef?: string;
+            sessionId?: string;
+            idempotencyKey?: string;
+            initialPrivateState?: string;
+            sponsorSessionId?: string;
+        };
+
+        if (!contractAddress) return req.reject(400, 'contractAddress is required');
+        if (!compiledArtifactRef) return req.reject(400, 'compiledArtifactRef is required');
+        if (!sessionId) return req.reject(400, 'sessionId is required');
+        if (!calls) return req.reject(400, 'calls is required');
+
+        if (rejectIfMainnetBlocked(req)) return;
+        if (!checkRate(callRateLimiter, sessionId, req)) return;
+
+        // `calls` is a JSON array of { circuit, args } executed IN ORDER inside
+        // one transaction. Bounded: each call carries a ZK proof, so a huge
+        // scope is slow to prove, and a single rejected call discards the
+        // whole scope pre-submission (post-submission the fallible phase can
+        // still finalize PARTIAL_SUCCESS; see the action doc).
+        let parsedCalls: Array<{ circuit: string; args: unknown[] }>;
+        try {
+            const v = JSON.parse(calls);
+            if (!Array.isArray(v) || v.length === 0) return req.reject(400, 'calls must be a non-empty JSON array');
+            if (v.length > 8) return req.reject(400, 'calls supports at most 8 entries per batch');
+            parsedCalls = v.map((entry: any, i: number) => {
+                if (!entry || typeof entry.circuit !== 'string' || !entry.circuit) {
+                    throw new Error(`calls[${i}].circuit is required`);
+                }
+                if (entry.args !== undefined && !Array.isArray(entry.args)) {
+                    throw new Error(`calls[${i}].args must be an array`);
+                }
+                return { circuit: entry.circuit, args: entry.args ?? [] };
+            });
+        } catch (e: any) {
+            return req.reject(400, /^calls\[/.test(String(e?.message)) ? String(e.message) : 'calls must be valid JSON');
+        }
+
+        let parsedInitialPrivateState: unknown;
+        if (initialPrivateState) {
+            try { parsedInitialPrivateState = JSON.parse(initialPrivateState); }
+            catch { return req.reject(400, 'initialPrivateState must be valid JSON'); }
+        }
+
+        return runSubmission(req, async () => {
+            const facadeCfg = facadeConfigFromEnv();
+            await ensureNetworkId(facadeCfg.networkId);
+            const resolved = await contractResolver(compiledArtifactRef);
+
+            // Validate-coerce every call now so a bad arg is a 400 here, not a
+            // failed job later. Raw args are persisted; the executor re-coerces.
+            for (const c of parsedCalls) {
+                const argTypes = argTypesLoader(resolved.zkConfigPath, c.circuit);
+                coerceCircuitArgs(c.args, argTypes);
+            }
+
+            await walletFactory({ sessionId, db, facadeConfig: facadeCfg, expectedUserId: (req as any).user?.id });
+            const sponsor = await resolveSponsorForRequest(req, sponsorSessionId);
+
+            const circuits = parsedCalls.map(c => c.circuit);
+            return startJob({
+                kind: 'submitContractCallBatch',
+                sessionId,
+                idempotencyKey,
+                request: { contractAddress, circuits, compiledArtifactRef, sessionId, callCount: parsedCalls.length, feeSponsor: sponsor?.sponsorSessionId ?? null },
+                idempotencyPayload: {
+                    contractAddress, circuits, compiledArtifactRef, sessionId,
+                    calls: parsedCalls, initialPrivateState: parsedInitialPrivateState,
+                    feeSponsor: sponsor?.sponsorSessionId ?? null
+                },
+                requestedBy: (req as any).user?.id,
+                commandVersion: 1,
+                encryptCommand: true,
+                command: { op: 'callBatch', contractAddress, calls: parsedCalls, compiledArtifactRef, initialPrivateState: parsedInitialPrivateState, sponsorSessionId: sponsor?.sponsorSessionId }
             });
         });
     });

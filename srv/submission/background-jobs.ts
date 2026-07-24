@@ -60,6 +60,7 @@ const HEAVY_KINDS: ReadonlySet<string> = new Set([
     'shieldFunds',
     'unshieldFunds',
     'deployContract',
+    'submitContractCallBatch',
     'submitContractCall',
     'anchorDocument',
     'issuePredicateAttestation',
