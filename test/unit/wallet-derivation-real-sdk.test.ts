@@ -13,7 +13,7 @@
  * pre-SDK validation lives in wallet-info.test.ts; this file is the SDK path.)
  */
 import { deriveRoleSeeds, mnemonicToBip39SeedHex } from '../../srv/utils/wallet-hd';
-import { deriveWalletInfo } from '../../srv/utils/wallet-info';
+import { deriveWalletInfo, deriveViewingKeyForAccount } from '../../srv/utils/wallet-info';
 
 // The BIP39 spec test vector phrase: publicly known, never funded on purpose.
 const MNEMONIC = 'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about';
@@ -32,6 +32,8 @@ const PIN = {
     nightAddressPreviewAccount1: 'mn_addr_preview1kpq4jf9d35tjnw0jtx7vaexaavq7xyj0x497pcqzwqetuyrc7nrq37rt92',
     nightAddressPreprod: 'mn_addr_preprod1dwv2rta0a2skyhrvukaw2q9r2sq6yc4jhj63rf7afxpkrrv6g35q49ekgd',
     dustAddressPreview: 'mn_dust_preview1wwcff2ckd4n5hfj43055td8glwtzkhhf6z88xwf0rpftvgstr7zpx50t9vq',
+    attesterId: 'c3ea5802644f99be2bcd7728b1c9577393bbc86b9295575de4e2b2d907de7770',
+    attesterIdAccount1: '1c69fa210fd8e4a5393c5d3462fe97e56f9e35eb5d2e1ebcaebb9603115310e3',
     dustAddressPreviewAccount1: 'mn_dust_preview1wvw8w50c8fecwav6fnn0cltnpeuwnq2ngnfvrty7k2uqkjczw2ws7zaffu6',
     dustAddressPreprod: 'mn_dust_preprod1wwcff2ckd4n5hfj43055td8glwtzkhhf6z88xwf0rpftvgstr7zpx43mk3q'
 };
@@ -91,6 +93,7 @@ describe('deriveWalletInfo (real ledger + address-format + unshielded SDKs)', ()
             shieldedAddress: PIN.shieldedAddressPreview,
             nightAddress: PIN.nightAddressPreview,
             dustAddress: PIN.dustAddressPreview,
+            attesterId: PIN.attesterId,
             accountIndex: 0,
             network: 'preview'
         });
@@ -102,6 +105,8 @@ describe('deriveWalletInfo (real ledger + address-format + unshielded SDKs)', ()
         expect(info.nightAddress.startsWith('mn_addr_preprod1')).toBe(true);
         expect(info.dustAddress).toBe(PIN.dustAddressPreprod);
         expect(info.dustAddress.startsWith('mn_dust_preprod1')).toBe(true);
+        // attesterId is a pure function of the seed: same value on every network
+        expect(info.attesterId).toBe(PIN.attesterId);
     });
 
     it('accountIndex 1 lands on the pinned second account', async () => {
@@ -109,6 +114,8 @@ describe('deriveWalletInfo (real ledger + address-format + unshielded SDKs)', ()
         expect(info.nightAddress).toBe(PIN.nightAddressPreviewAccount1);
         expect(info.accountIndex).toBe(1);
         expect(info.dustAddress).toBe(PIN.dustAddressPreviewAccount1);
+        expect(info.attesterId).toBe(PIN.attesterIdAccount1);
+        expect(info.attesterId).not.toBe(PIN.attesterId);
     });
 
     it('accepts a raw 128-hex BIP39 seed and matches the mnemonic-derived result', async () => {
@@ -122,5 +129,17 @@ describe('deriveWalletInfo (real ledger + address-format + unshielded SDKs)', ()
         const a = await deriveWalletInfo({ mnemonic: MNEMONIC, network: 'preview' });
         const b = await deriveWalletInfo({ mnemonic: MNEMONIC, network: 'preview' });
         expect(a).toEqual(b);
+    });
+});
+
+describe('deriveViewingKeyForAccount (connectWalletForSigning consistency check)', () => {
+    it('matches deriveWalletInfo for account 0 (pinned) and differs for account 1', async () => {
+        const seedHex = mnemonicToBip39SeedHex(MNEMONIC);
+        expect(await deriveViewingKeyForAccount(seedHex, 0)).toBe(PIN.viewingKey);
+        const account1 = await deriveViewingKeyForAccount(seedHex, 1);
+        expect(account1).not.toBe(PIN.viewingKey);
+        // The check accepts exactly what deriveWalletInfo told the consumer.
+        const info1 = await deriveWalletInfo({ seedHex, network: 'preview', accountIndex: 1 });
+        expect(account1).toBe(info1.viewingKey);
     });
 });

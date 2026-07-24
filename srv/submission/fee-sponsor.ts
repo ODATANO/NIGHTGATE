@@ -45,6 +45,8 @@ export interface ResolvedFeeSponsor {
     seedHex: string;
     /** Sync-state passphrase derived from the sponsor's viewing key. */
     syncStatePassphrase: string;
+    /** BIP32 account level the sponsor seed signs with (WalletSessions.accountIndex). */
+    accountIndex: number;
 }
 
 /**
@@ -124,7 +126,8 @@ export async function resolveFeeSponsor(opts: ResolveFeeSponsorOptions): Promise
         sponsorSessionId: opts.sponsorSessionId,
         accountId: deriveAccountId(viewingKey),
         seedHex,
-        syncStatePassphrase: deriveStoragePassword(viewingKey)
+        syncStatePassphrase: deriveStoragePassword(viewingKey),
+        accountIndex: session.accountIndex ?? 0
     };
 }
 
@@ -137,9 +140,12 @@ export async function ensureFeeSponsorFacade(
     sponsor: ResolvedFeeSponsor,
     facadeConfig: Omit<WalletFacadeBuildArgs, 'seedHex' | 'syncStatePassphrase'>
 ): Promise<void> {
+    // accountIndex AFTER the spread: facadeConfig may carry the CALLING
+    // session's account; the sponsor facade must derive the sponsor's own.
     await getOrBuildWalletFacade(sponsor.accountId, {
         ...facadeConfig,
         seedHex: sponsor.seedHex,
-        syncStatePassphrase: sponsor.syncStatePassphrase
+        syncStatePassphrase: sponsor.syncStatePassphrase,
+        accountIndex: sponsor.accountIndex
     });
 }

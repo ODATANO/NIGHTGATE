@@ -677,6 +677,13 @@ service NightgateService {
      * alternative: the raw 64-byte BIP39 seed as 128 hex chars (NOT a 32-byte
      * key). One of `mnemonic` or `seedHex` is required.
      *
+     * `accountIndex` (default 0) selects the BIP32 account level and must be
+     * the SAME value the session's viewing key was derived for (i.e. what was
+     * passed to `deriveWalletInfo`). The action verifies, fail-closed, that
+     * the seed at this accountIndex derives the session's viewing key and
+     * rejects with 400 otherwise; all signing and the on-chain attester
+     * identity then use this account.
+     *
      * The session UPDATE happens synchronously; `signingEnabled: true` is
      * returned as soon as the encrypted seed is persisted, so callers can
      * proceed to other signing-capable actions immediately.
@@ -691,6 +698,7 @@ service NightgateService {
     action   connectWalletForSigning(sessionId: UUID,
                                      mnemonic: String, // BIP39 recovery phrase (preferred)
                                      seedHex: String, // optional: 64-byte BIP39 seed as 128 hex chars
+                                     accountIndex: Integer, // optional, default 0; must match the session's viewing-key account
                                      idempotencyKey: String, // optional; dedupes retries on a flaky network
                                      prewarm: Boolean // optional; false skips the sync-to-tip prewarm job
     // (for sponsored callers that hold nothing; submissions
@@ -713,7 +721,8 @@ service NightgateService {
      * funding target) and the `shieldedAddress`. Derivation is identical to
      * the signing path (per-role HD seeds, Lace-exact; srv/utils/wallet-hd.ts),
      * so the derived identity IS the account `connectWalletForSigning` will
-     * sign with for the same secret.
+     * sign with for the same secret AND the same `accountIndex` (pass the
+     * value used here to `connectWalletForSigning` too).
      *
      * `accountIndex` (default 0) selects the BIP32 account level, so one
      * phrase can host multiple independent accounts (e.g. one per producer).
@@ -727,6 +736,9 @@ service NightgateService {
         nightAddress    : String; // mn_addr_... unshielded NIGHT address (faucet target)
         dustAddress     : String; // mn_dust_... DUST address; pass as dustReceiverAddress
         // to registerForDustGeneration for sponsored dust generation
+        attesterId      : String; // 64-hex AttestationVault attester identity (the circuits'
+        // caller_id); pass as registerPassport's ownerId to pre-register a passport
+        // for a wallet BEFORE its first on-chain call
         accountIndex    : Integer;
         network         : String; // encoding network (the configured NIGHTGATE network)
     };

@@ -55,6 +55,12 @@ export interface WalletFacadeBuildArgs {
      * persistence to function; if omitted, restore/save are skipped.
      */
     syncStatePassphrase?: string;
+    /**
+     * BIP32 account level the seed signs with (default 0). Must match the
+     * account the session's viewing key was derived for; sourced from
+     * `WalletSessions.accountIndex`, never from ad-hoc caller input.
+     */
+    accountIndex?: number;
 }
 
 /** Stub returned to callers that still expect a `facade` object; throws if a method is actually called. */
@@ -150,6 +156,7 @@ export async function getOrBuildWalletFacade(
     const initArgs: WalletInitArgs = {
         sessionId:      cacheKey,
         seedHex:        args.seedHex,
+        accountIndex:   args.accountIndex,
         networkId:      args.networkId,
         indexerHttpUrl: args.indexerHttpUrl,
         indexerWsUrl:   args.indexerWsUrl,

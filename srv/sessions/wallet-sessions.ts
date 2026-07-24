@@ -32,7 +32,7 @@ import {
 import { startJob, registerBackgroundJobProcessor, type BackgroundJobRow } from '../submission/background-jobs';
 import { reportExternalExecution } from '../submission/job-execution-context';
 import { mnemonicToBip39SeedHex } from '../utils/wallet-hd';
-import { deriveWalletInfo, resolveBip39SeedHex } from '../utils/wallet-info';
+import { deriveWalletInfo, resolveBip39SeedHex, deriveViewingKeyForAccount } from '../utils/wallet-info';
 import { resolveFeeSponsor, ensureFeeSponsorFacade, FeeSponsorError } from '../submission/fee-sponsor';
 
 // Upper bound for the prewarm sync-to-tip wait
@@ -132,7 +132,8 @@ async function executeWalletCommand(raw: unknown, job: BackgroundJobRow, db: any
         indexerWsUrl: submissionEndpoints.indexerWsUrl,
         proofServerUrl: submissionEndpoints.proofServerUrl,
         relayUrl: nodeUrl,
-        syncStatePassphrase: syncPass
+        syncStatePassphrase: syncPass,
+        accountIndex: session.accountIndex ?? 0
     };
     await ensureNetworkId(network);
     await getOrBuildWalletFacade(accountId, { seedHex, ...facadeConfig });
@@ -362,14 +363,19 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
         const userId = requireUserId(req);
         if (!userId) return;
 
-        const { sessionId, mnemonic, seedHex, idempotencyKey, prewarm } = req.data as {
+        const { sessionId, mnemonic, seedHex, accountIndex, idempotencyKey, prewarm } = req.data as {
             sessionId: string;
             mnemonic?: string;
             seedHex?: string;
+            accountIndex?: number;
             idempotencyKey?: string;
             prewarm?: boolean;
         };
         if (!sessionId) return req.reject(400, 'sessionId is required');
+        const account = accountIndex ?? 0;
+        if (!Number.isInteger(account) || account < 0) {
+            return req.reject(400, 'accountIndex must be a non-negative integer');
+        }
 
         let bip39SeedHex: string;
         if (mnemonic) {
@@ -396,11 +402,37 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
         }
 
         const encKey = getEncryptionKey();
+
+        // Fail-closed seed/session consistency check: the seed at this
+        // accountIndex must derive the session's viewing key. Without it a
+        // wrong account (or wrong mnemonic) silently signs with keys that
+        // belong to nobody the session knows: unfunded signer, and an on-chain
+        // caller_id that never matches the attesterId deriveWalletInfo
+        // reported for the connected account.
+        let sessionViewingKey: string;
+        try {
+            sessionViewingKey = decrypt(session.encryptedViewingKey, encKey);
+        } catch {
+            return req.reject(500, 'Failed to decrypt session viewing key (ENCRYPTION_KEY mismatch?)');
+        }
+        let derivedViewingKey: string;
+        try {
+            derivedViewingKey = await deriveViewingKeyForAccount(bip39SeedHex, account);
+        } catch (e: any) {
+            log.error('viewing-key derivation failed:', e?.message ?? 'unknown');
+            return req.reject(500, 'wallet derivation failed');
+        }
+        if (derivedViewingKey.toLowerCase() !== sessionViewingKey.toLowerCase()) {
+            return req.reject(400,
+                `Seed does not derive this session's viewing key at accountIndex ${account}. ` +
+                `Connect the session with the viewingKey deriveWalletInfo returns for the same secret and accountIndex.`);
+        }
+
         const encryptedSeedKey = encrypt(bip39SeedHex, encKey);
 
         await db.run(
             UPDATE.entity(WalletSessions)
-                .set({ encryptedSeedKey })
+                .set({ encryptedSeedKey, accountIndex: account })
                 .where({ sessionId, userId })
         );
 
@@ -412,8 +444,7 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
         // Pre-warm the WalletFacade as a tracked background job, pollable via
         // getJobStatus(prewarmJobId, sessionId).
         try {
-            const viewingKey = decrypt(session.encryptedViewingKey, encKey);
-            const accountId = deriveAccountId(viewingKey);
+            const accountId = deriveAccountId(sessionViewingKey);
 
             const job = await startJob({
                 kind: 'connectWalletForSigning',

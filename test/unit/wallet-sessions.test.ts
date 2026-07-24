@@ -105,6 +105,18 @@ vi.mock('../../srv/midnight/providers', () => ({
     ensureNetworkId: mockEnsureNetworkId
 }));
 
+// connectWalletForSigning's fail-closed check derives the seed's viewing key
+// via the real ESM SDK; stub it to activeSessionRow()'s viewing key so the
+// happy paths pass. Real derivation: wallet-derivation-real-sdk.test.ts.
+const mockDeriveViewingKeyForAccount = vi.hoisted(() => (vi.fn(async () => 'a'.repeat(64))));
+vi.mock('../../srv/utils/wallet-info', async () => {
+    const actual: any = await vi.importActual('../../srv/utils/wallet-info');
+    return {
+        ...actual,
+        deriveViewingKeyForAccount: (...args: unknown[]) => (mockDeriveViewingKeyForAccount as any)(...args)
+    };
+});
+
 // Phase 2: dust handlers + connectWalletForSigning hand long work to startJob
 // and return { jobId, status }. The stub here returns a predictable jobId so
 // handler-level assertions can be deterministic; the work fn is captured for

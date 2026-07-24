@@ -107,6 +107,10 @@ export async function buildWalletMaterialForSession(opts: BuildWalletMaterialOpt
 
     const accountId = deriveAccountId(viewingKey);
     const password  = deriveStoragePassword(viewingKey);
+    // BIP32 account the seed signs with, persisted by connectWalletForSigning.
+    // Sourced from the session row (not caller-supplied) so signing derivation
+    // always matches the account the session's viewing key belongs to.
+    const accountIndex = session.accountIndex ?? 0;
 
     let walletAndMidnightProvider: any;
     let ensureFacade: (() => Promise<void>) | undefined;
@@ -123,16 +127,16 @@ export async function buildWalletMaterialForSession(opts: BuildWalletMaterialOpt
             walletAndMidnightProvider = await createFacadeBackedWalletAdapter(
                 accountId,
                 seedHex,
-                { ...opts.facadeConfig, syncStatePassphrase: password }
+                { ...opts.facadeConfig, syncStatePassphrase: password, accountIndex }
             );
             // Worker-routed submissions look the facade up by accountId; make it
             // creatable on demand so a never-prewarmed (or evicted) session does
             // not die with "No facade for sessionId". Idempotent.
-            const facadeArgs = { ...opts.facadeConfig, seedHex, syncStatePassphrase: password };
+            const facadeArgs = { ...opts.facadeConfig, seedHex, syncStatePassphrase: password, accountIndex };
             ensureFacade = async () => { await getOrBuildWalletFacade(accountId, facadeArgs); };
         } else {
             // Seed present but no facade configured: pubkeys real, signing throws.
-            walletAndMidnightProvider = await createSigningCapableWalletAdapter(seedHex);
+            walletAndMidnightProvider = await createSigningCapableWalletAdapter(seedHex, accountIndex);
         }
     } else {
         walletAndMidnightProvider = createReadOnlyWalletAdapter();
@@ -201,7 +205,7 @@ async function createFacadeBackedWalletAdapter(
     // the BIP39 seed; the shielded account comes from the Zswap HD role (see
     // srv/utils/wallet-hd.ts), not the raw seed.
     const bip39Seed = new Uint8Array(Buffer.from(seedHex, 'hex'));
-    const roleSeeds = await deriveRoleSeeds(bip39Seed);
+    const roleSeeds = await deriveRoleSeeds(bip39Seed, facadeConfig.accountIndex ?? 0);
     const ledger = await loadLedgerV8();
     const zswapKeys = ledger.ZswapSecretKeys.fromSeed(roleSeeds.zswap);
     const coinPublicKey       = zswapKeys.coinPublicKey;
@@ -241,14 +245,14 @@ async function createFacadeBackedWalletAdapter(
  * keys are derived from the seed; balanceTx/submitTx throw until a facade is
  * wired in.
  */
-async function createSigningCapableWalletAdapter(seedHex: string): Promise<any> {
+async function createSigningCapableWalletAdapter(seedHex: string, accountIndex: number = 0): Promise<any> {
     if (!/^[0-9a-fA-F]{128}$/.test(seedHex)) {
         // Defense in depth; connectWalletForSigning already validates this.
         throw new Error('Invalid seed: must be 128 hex characters (64-byte BIP39 seed)');
     }
 
     const bip39Seed = new Uint8Array(Buffer.from(seedHex, 'hex'));
-    const roleSeeds = await deriveRoleSeeds(bip39Seed);
+    const roleSeeds = await deriveRoleSeeds(bip39Seed, accountIndex);
     const ledger = await loadLedgerV8();
 
     // Each key type comes from its own HD role (Zswap/Dust), matching Lace;

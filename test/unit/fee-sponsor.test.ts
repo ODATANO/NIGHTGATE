@@ -184,20 +184,24 @@ describe('ensureFeeSponsorFacade', () => {
             sponsorSessionId: 's-1',
             accountId: 'acct-1',
             seedHex: SEED_HEX,
-            syncStatePassphrase: 'pass-1'
+            syncStatePassphrase: 'pass-1',
+            accountIndex: 3
         };
         const cfg = {
             networkId: 'preview' as const,
             indexerHttpUrl: 'http://i',
             indexerWsUrl: 'ws://i',
             proofServerUrl: 'http://p',
-            relayUrl: 'ws://r'
+            relayUrl: 'ws://r',
+            // The calling session's account; the sponsor's own must win.
+            accountIndex: 1
         };
         await ensureFeeSponsorFacade(sponsor, cfg);
         expect(getOrBuildWalletFacadeMock).toHaveBeenCalledWith('acct-1', {
             ...cfg,
             seedHex: SEED_HEX,
-            syncStatePassphrase: 'pass-1'
+            syncStatePassphrase: 'pass-1',
+            accountIndex: 3
         });
     });
 });

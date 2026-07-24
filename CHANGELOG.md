@@ -1,5 +1,42 @@
 # Changelog
 
+## 0.10.1 - 2026-07-24
+
+### `deriveWalletInfo` exposes the AttestationVault attester identity
+
+`deriveWalletInfo` returns a new field `attesterId` (64-hex): the value the
+vault circuits compute as `caller_id()`, derived offline as
+`persistentHash<Bytes<32>>(deriveAttestationSecret(zswapRoleSeed))`.
+Network-independent. Pass it as `registerPassport`'s `ownerId` to pre-register
+a passportId for a wallet before that wallet's first on-chain call. Consumers
+obtain the value via the `deriveWalletInfo` action; the computation lives in
+the internal helper `deriveAttesterId(zswapSeed)` in `srv/utils/wallet-info.ts`
+(not part of the package's public exports).
+
+### Fix: signing honors the session's `accountIndex` (was silently account 0)
+
+`deriveWalletInfo` supported `accountIndex`, but `connectWalletForSigning` did
+not: the signing path (facade build, adapter pubkeys, and the AttestationVault
+witness secret) always derived account 0. For a wallet connected with a
+non-zero account, viewing key, attester id and the actual signer belonged to
+DIFFERENT accounts, with no error.
+
+- `connectWalletForSigning` takes an optional `accountIndex` (default 0),
+  persisted as new column `WalletSessions.accountIndex` and threaded through
+  every seed-consuming site (wallet adapters, worker facade init, witness
+  secret, fee-sponsor facade).
+- **Fail-closed consistency check:** the action now derives the seed's viewing
+  key at the requested `accountIndex` and rejects with 400 when it does not
+  match the session's viewing key, so a wrong account or wrong mnemonic fails
+  loudly at connect time instead of silently signing with foreign keys.
+
+**Upgrade note (consumers):** new column `WalletSessions.accountIndex`; a
+normal `cds deploy` adds it, an existing DB gets it without a wipe via
+`scripts/apply-schema-delta.mjs`. Rows without the column sign with account 0,
+exactly as before. Behavioral change: `connectWalletForSigning` calls whose
+seed does not derive the session's viewing key (previously accepted and
+mis-signing) now return 400.
+
 ## 0.10.0 - 2026-07-24
 
 ### AttestationVault passport hardening (contract change) + deterministic batch apply order

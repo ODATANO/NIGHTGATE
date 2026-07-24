@@ -53,6 +53,8 @@ export interface RpcErr { ok: false; error: RpcErrorPayload }
 export interface InitArgs {
     sessionId: string;
     seedHex: string;
+    /** BIP32 account level the seed signs with (default 0). */
+    accountIndex?: number;
     networkId: 'preprod' | 'testnet' | 'mainnet' | 'undeployed' | 'devnet' | 'qanet' | 'preview';
     indexerHttpUrl: string;
     indexerWsUrl: string;
@@ -808,8 +810,10 @@ async function buildFacade(args: InitArgs): Promise<FacadeEntry> {
     // args.seedHex is the 64-byte BIP39 seed (128 hex). Lace derives each key
     // type from a DIFFERENT HD role (Zswap/Dust/NightExternal); deriving them
     // all from one raw seed lands on the wrong account. See srv/utils/wallet-hd.ts.
+    // args.accountIndex selects the BIP32 account level; it must match the
+    // account the session was connected for (WalletSessions.accountIndex).
     const bip39Seed = new Uint8Array(Buffer.from(args.seedHex, 'hex'));
-    const roleSeeds = await deriveRoleSeeds(bip39Seed);
+    const roleSeeds = await deriveRoleSeeds(bip39Seed, args.accountIndex ?? 0);
     const zswapKeys = sdk.ledger.ZswapSecretKeys.fromSeed(roleSeeds.zswap);
     const dustKey = sdk.ledger.DustSecretKey.fromSeed(roleSeeds.dust);
 

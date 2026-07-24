@@ -197,6 +197,7 @@ entity WalletSessions : cuid, managed {
     viewingKeyHash      : String(64); // SHA-256 of viewing key (for lookup/dedup)
     encryptedViewingKey : LargeString; // AES-256-GCM encrypted viewing key
     encryptedSeedKey    : LargeString; // optional: AES-256-GCM encrypted seed/signing key
+    accountIndex        : Integer; // BIP32 account level the seed signs with; set by connectWalletForSigning (null = 0)
     sessionId           : UUID not null;
     connectedAt         : Timestamp not null;
     disconnectedAt      : Timestamp;

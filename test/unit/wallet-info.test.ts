@@ -8,7 +8,9 @@
  * scripts/integration-test-derive-wallet-info.mjs.
  */
 
-import { resolveBip39SeedHex, deriveWalletInfo } from '../../srv/utils/wallet-info';
+import { resolveBip39SeedHex, deriveWalletInfo, deriveAttesterId } from '../../srv/utils/wallet-info';
+import { deriveAttestationSecret } from '../../srv/submission/contract-witnesses';
+import { persistentHash, CompactTypeBytes } from '@midnight-ntwrk/compact-runtime';
 import { mnemonicToSeedSync } from 'bip39';
 
 const VALID = 'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about';
@@ -38,6 +40,37 @@ describe('resolveBip39SeedHex', () => {
 
     test('rejects missing input', () => {
         expect(() => resolveBip39SeedHex({})).toThrow(/either mnemonic or seedHex/);
+    });
+});
+
+describe('deriveAttesterId', () => {
+    const zswapSeed = () => Uint8Array.from(Array(32).fill(1));
+
+    test('pins the golden vector (formula stability across releases)', () => {
+        // caller_id() = persistentHash<Bytes<32>>(local_secret_key()), with the
+        // secret from deriveAttestationSecret. Live-verified on preprod: the
+        // vault's attestation_owners entry for a Main-attested payload equals
+        // this derivation of Main's zswap seed (vault da9b0bcf…, 2026-07-24).
+        expect(deriveAttesterId(zswapSeed()))
+            .toBe('7961a1e00d6341753fb38beb513ea72ea5e3cd990df81fb1435b1df9445814fe');
+    });
+
+    test('equals persistentHash(Bytes<32>) of the witness secret', () => {
+        const secret = deriveAttestationSecret(zswapSeed());
+        const expected = Buffer.from(persistentHash(new CompactTypeBytes(32), secret)).toString('hex');
+        expect(deriveAttesterId(zswapSeed())).toBe(expected);
+    });
+
+    test('does not mutate the caller-owned seed', () => {
+        const seed = zswapSeed();
+        deriveAttesterId(seed);
+        expect(Array.from(seed)).toEqual(Array(32).fill(1));
+    });
+
+    test('is deterministic and seed-sensitive', () => {
+        expect(deriveAttesterId(zswapSeed())).toBe(deriveAttesterId(zswapSeed()));
+        const other = Uint8Array.from(Array(32).fill(2));
+        expect(deriveAttesterId(other)).not.toBe(deriveAttesterId(zswapSeed()));
     });
 });
 

@@ -51,7 +51,7 @@ Response:
 }
 ```
 
-### `connectWalletForSigning(sessionId, mnemonic, seedHex?) → { sessionId, signingEnabled, prewarmJobId, prewarmStatus }`
+### `connectWalletForSigning(sessionId, mnemonic, seedHex?, accountIndex?) → { sessionId, signingEnabled, prewarmJobId, prewarmStatus }`
 
 Upgrade a read-only session with **signing capability**, encrypting the BIP39 seed at rest. Keys are HD-derived per Midnight role (zswap / dust / night) to match Lace — see `srv/utils/wallet-hd.ts`. Schedules a tracked pre-warm job that syncs the wallet SDK in the worker; poll `getJobStatus(prewarmJobId, sessionId)` to know when sync-to-tip is done before submitting.
 
@@ -60,18 +60,23 @@ Upgrade a read-only session with **signing capability**, encrypting the BIP39 se
 | `sessionId` | UUID | Returned by `connectWallet` |
 | `mnemonic` | String | BIP39 recovery phrase (preferred) |
 | `seedHex` | String (optional) | Alternative to `mnemonic`: the full 64-byte BIP39 seed as 128 hex chars |
+| `accountIndex` | Integer (optional, default 0) | BIP32 account level; pass the SAME value used with `deriveWalletInfo` for this wallet |
+
+**Seed/session consistency check (0.10.1, fail-closed):** the action derives the seed's viewing key at `accountIndex` and rejects with 400 unless it equals the session's viewing key. This guarantees the signer, the session identity, and the on-chain attester id (`caller_id()`) all belong to the same account; previously a non-zero account silently signed with account-0 keys.
 
 **Rate limit:** 10/hour per client IP (default; override via `NIGHTGATE_SIGNING_KEY_RATE_LIMIT`). Shared with `deriveWalletInfo`.
 
-**Errors:** 400 (invalid mnemonic/seed), 404 (no session), 410 (expired), 412 (already signing), 429 (rate-limited).
+**Errors:** 400 (invalid mnemonic/seed/accountIndex, or seed does not derive the session's viewing key), 404 (no session), 410 (expired), 412 (already signing), 429 (rate-limited).
 
 ### `disconnectWallet(sessionId)`
 
 Close a session: nullifies stored encrypted keys, evicts the cached wallet facade in the worker, persists a final state-save blob.
 
-### `deriveWalletInfo(mnemonic | seedHex, accountIndex?) → { viewingKey, shieldedAddress, nightAddress, dustAddress, accountIndex, network }`
+### `deriveWalletInfo(mnemonic | seedHex, accountIndex?) → { viewingKey, shieldedAddress, nightAddress, dustAddress, attesterId, accountIndex, network }`
 
-Derive a wallet's connectable identity from its secret WITHOUT creating a session or persisting anything (the mnemonic/seed is never stored or logged). Removes the last Lace dependency from programmatic wallet creation: generate a BIP39 phrase consumer-side, call this to learn the `viewingKey` (input to `connectWallet`), the `nightAddress` (faucet funding target), the `shieldedAddress` and the `dustAddress` (pass as `dustReceiverAddress` to `registerForDustGeneration`). Derivation is identical to the signing path (per-role HD seeds, Lace-exact), so the derived identity IS the account `connectWalletForSigning` will sign with for the same secret. `accountIndex` (default 0) selects the BIP32 account level. **Rate limit:** 10/hour per client IP (shared with `connectWalletForSigning`).
+Derive a wallet's connectable identity from its secret WITHOUT creating a session or persisting anything (the mnemonic/seed is never stored or logged). Removes the last Lace dependency from programmatic wallet creation: generate a BIP39 phrase consumer-side, call this to learn the `viewingKey` (input to `connectWallet`), the `nightAddress` (faucet funding target), the `shieldedAddress` and the `dustAddress` (pass as `dustReceiverAddress` to `registerForDustGeneration`). Derivation is identical to the signing path (per-role HD seeds, Lace-exact), so the derived identity IS the account `connectWalletForSigning` will sign with for the same secret and the same `accountIndex`. `accountIndex` (default 0) selects the BIP32 account level; pass the same value to `connectWalletForSigning` when upgrading the session. **Rate limit:** 10/hour per client IP (shared with `connectWalletForSigning`).
+
+`attesterId` (0.10.1) is the wallet's AttestationVault attester identity, the value the vault circuits compute as `caller_id()`. It is network-independent and matches what `attestation_owners` will store once the wallet attests. Pass it as `registerPassport`'s `ownerId` to pre-register a passportId for a wallet that has never touched the chain (first-bind squatting protection from the very first bind).
 
 ## Token operations
 

@@ -26,6 +26,8 @@ const log = cds.log('nightgate:worker-client');
 export interface WalletInitArgs {
     sessionId: string;
     seedHex: string;
+    /** BIP32 account level the seed signs with (default 0). */
+    accountIndex?: number;
     networkId: 'preprod' | 'testnet' | 'mainnet' | 'undeployed' | 'devnet' | 'qanet' | 'preview';
     indexerHttpUrl: string;
     indexerWsUrl: string;

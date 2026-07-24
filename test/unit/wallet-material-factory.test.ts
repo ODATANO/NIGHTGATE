@@ -420,6 +420,57 @@ describe('signing-capable wallet adapter (session with encryptedSeedKey)', () =>
     });
 });
 
+// ---- accountIndex threading (session row → HD derivation → facade) --------
+
+describe('accountIndex threading', () => {
+    const VALID_SEED = 'a'.repeat(128);
+    const FACADE_CONFIG = {
+        networkId: 'preview' as const,
+        indexerHttpUrl: 'http://i', indexerWsUrl: 'ws://i',
+        proofServerUrl: 'http://p', relayUrl: 'ws://r'
+    };
+
+    test('session accountIndex reaches deriveRoleSeeds (signing-capable adapter)', async () => {
+        const { deriveRoleSeeds } = await import('../../srv/utils/wallet-hd.js');
+        vi.mocked(deriveRoleSeeds).mockClear();
+        const db = makeDbWithSession(buildEncryptedSession('vk-acct1', {
+            encryptedSeedKey: encrypt(VALID_SEED, TEST_KEY),
+            accountIndex: 1
+        }));
+        await buildWalletMaterialForSession({ sessionId: 'sess-1', db, encryptionKey: TEST_KEY });
+        expect(vi.mocked(deriveRoleSeeds)).toHaveBeenCalledWith(expect.any(Uint8Array), 1);
+    });
+
+    test('missing accountIndex column (pre-upgrade row) falls back to account 0', async () => {
+        const { deriveRoleSeeds } = await import('../../srv/utils/wallet-hd.js');
+        vi.mocked(deriveRoleSeeds).mockClear();
+        const db = makeDbWithSession(buildEncryptedSession('vk-legacy', {
+            encryptedSeedKey: encrypt(VALID_SEED, TEST_KEY)
+        }));
+        await buildWalletMaterialForSession({ sessionId: 'sess-1', db, encryptionKey: TEST_KEY });
+        expect(vi.mocked(deriveRoleSeeds)).toHaveBeenCalledWith(expect.any(Uint8Array), 0);
+    });
+
+    test('facade-backed adapter derives with the session accountIndex and forwards it to the worker init', async () => {
+        const { deriveRoleSeeds } = await import('../../srv/utils/wallet-hd.js');
+        vi.mocked(deriveRoleSeeds).mockClear();
+        getOrBuildWalletFacadeMock.mockClear();
+        const db = makeDbWithSession(buildEncryptedSession('vk-facade-acct2', {
+            encryptedSeedKey: encrypt(VALID_SEED, TEST_KEY),
+            accountIndex: 2
+        }));
+        const material = await buildWalletMaterialForSession({
+            sessionId: 'sess-1', db, encryptionKey: TEST_KEY, facadeConfig: FACADE_CONFIG
+        });
+        expect(vi.mocked(deriveRoleSeeds)).toHaveBeenCalledWith(expect.any(Uint8Array), 2);
+        await material.ensureFacade!();
+        expect(getOrBuildWalletFacadeMock).toHaveBeenCalledWith(
+            expect.any(String),
+            expect.objectContaining({ accountIndex: 2 })
+        );
+    });
+});
+
 // ---- Classifier integration -----------------------------------------------
 
 describe('classifySubmissionError recognizes WalletSigningNotAvailable', () => {

@@ -30,6 +30,19 @@ vi.mock('../../srv/submission/background-jobs', () => ({
     registerBackgroundJobProcessor: vi.fn()
 }));
 
+// The fail-closed seed/session consistency check derives the viewing key via
+// the real ESM SDK; stub it to the fixture session's viewing key by default so
+// the happy paths pass, and per-test to something else for the mismatch cases.
+// (The real derivation is pinned in wallet-derivation-real-sdk.test.ts.)
+const mockDeriveViewingKey = vi.hoisted(() => (vi.fn(async () => 'mn_shield-vk_alice')));
+vi.mock('../../srv/utils/wallet-info', async () => {
+    const actual: any = await vi.importActual('../../srv/utils/wallet-info');
+    return {
+        ...actual,
+        deriveViewingKeyForAccount: (...args: unknown[]) => (mockDeriveViewingKey as any)(...args)
+    };
+});
+
 import { registerWalletSessionHandlers } from '../../srv/sessions/wallet-sessions';
 import { encrypt, decrypt, getEncryptionKey } from '../../srv/utils/crypto';
 
@@ -168,6 +181,83 @@ describe('connectWalletForSigning: argument validation', () => {
         const req = makeReq({ sessionId: 'sess-1', seedHex: 'ab' });
         await srv.handlers['connectWalletForSigning'](req);
         expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/hex/));
+    });
+
+    test('rejects negative and non-integer accountIndex', async () => {
+        const { srv } = setup();
+        const negative = makeReq({ sessionId: 'sess-1', seedHex: VALID_SEED, accountIndex: -1 });
+        await srv.handlers['connectWalletForSigning'](negative);
+        expect(negative.reject).toHaveBeenCalledWith(400, expect.stringMatching(/accountIndex/));
+
+        const fractional = makeReq({ sessionId: 'sess-1', seedHex: VALID_SEED, accountIndex: 1.5 });
+        await srv.handlers['connectWalletForSigning'](fractional);
+        expect(fractional.reject).toHaveBeenCalledWith(400, expect.stringMatching(/accountIndex/));
+    });
+});
+
+describe('connectWalletForSigning: seed/session consistency (fail-closed)', () => {
+    function setup() {
+        const srv = makeFakeService();
+        const db = makeFakeDb();
+        seedSession(db);
+        mockStartJob.mockClear();
+        mockDeriveViewingKey.mockClear();
+        registerWalletSessionHandlers(srv as any, db);
+        return { srv, db };
+    }
+
+    test('derives the viewing key for the REQUESTED accountIndex and persists it', async () => {
+        const { srv, db } = setup();
+        const req = makeReq({ sessionId: 'sess-1', seedHex: VALID_SEED, accountIndex: 1 });
+        const result = await srv.handlers['connectWalletForSigning'](req);
+
+        expect(req.reject).not.toHaveBeenCalled();
+        expect(result.signingEnabled).toBe(true);
+        expect(mockDeriveViewingKey).toHaveBeenCalledWith(VALID_SEED, 1);
+        const row = db.tables['midnight.WalletSessions'][0];
+        expect(row.accountIndex).toBe(1);
+    });
+
+    test('accountIndex defaults to 0 and is persisted as 0', async () => {
+        const { srv, db } = setup();
+        const req = makeReq({ sessionId: 'sess-1', seedHex: VALID_SEED });
+        await srv.handlers['connectWalletForSigning'](req);
+
+        expect(mockDeriveViewingKey).toHaveBeenCalledWith(VALID_SEED, 0);
+        expect(db.tables['midnight.WalletSessions'][0].accountIndex).toBe(0);
+    });
+
+    test('400 when the seed does not derive the session viewing key; nothing persisted, no prewarm', async () => {
+        const { srv, db } = setup();
+        // The account-0 bug shape: session connected for account 1, seed
+        // derives a DIFFERENT viewing key at the requested account.
+        mockDeriveViewingKey.mockResolvedValueOnce('mn_shield-vk_other-account');
+
+        const req = makeReq({ sessionId: 'sess-1', seedHex: VALID_SEED, accountIndex: 1 });
+        await srv.handlers['connectWalletForSigning'](req);
+
+        expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/viewing key.*accountIndex 1/i));
+        const row = db.tables['midnight.WalletSessions'][0];
+        expect(row.encryptedSeedKey).toBeUndefined();
+        expect(row.accountIndex).toBeUndefined();
+        expect(mockStartJob).not.toHaveBeenCalled();
+    });
+
+    test('viewing-key comparison is case-insensitive', async () => {
+        const { srv } = setup();
+        mockDeriveViewingKey.mockResolvedValueOnce('MN_SHIELD-VK_ALICE');
+        const req = makeReq({ sessionId: 'sess-1', seedHex: VALID_SEED });
+        await srv.handlers['connectWalletForSigning'](req);
+        expect(req.reject).not.toHaveBeenCalled();
+    });
+
+    test('500 when the derivation itself fails (SDK error), without leaking details', async () => {
+        const { srv, db } = setup();
+        mockDeriveViewingKey.mockRejectedValueOnce(new Error('HDWallet.fromSeed failed: secret stuff'));
+        const req = makeReq({ sessionId: 'sess-1', seedHex: VALID_SEED });
+        await srv.handlers['connectWalletForSigning'](req);
+        expect(req.reject).toHaveBeenCalledWith(500, 'wallet derivation failed');
+        expect(db.tables['midnight.WalletSessions'][0].encryptedSeedKey).toBeUndefined();
     });
 });
 
