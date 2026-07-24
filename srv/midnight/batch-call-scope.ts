@@ -20,11 +20,13 @@ export interface BatchScopeResult {
 }
 
 /**
- * Execute `calls` in order inside a single `withContractScopedTransaction`
- * scope on `found` (a findDeployedContract result). Validates every circuit
- * BEFORE opening the scope, so a bad name is a clean error rather than a
- * half-built transaction context. Uses the circuit-call interface's
- * `(txCtx, ...args)` overload; the SDK batches the calls and submits ONCE.
+ * Execute `calls` inside a single `withContractScopedTransaction` scope on
+ * `found` (a findDeployedContract result). Calls are invoked in array order,
+ * but the SDK applies the merged intents in unspecified order, so callers must
+ * only batch order-independent calls. Validates every circuit BEFORE opening
+ * the scope, so a bad name is a clean error rather than a half-built
+ * transaction context. Uses the circuit-call interface's `(txCtx, ...args)`
+ * overload; the SDK batches the calls and submits ONCE.
  */
 export async function runBatchInScope(
     contracts: any,

@@ -8,8 +8,11 @@ New submission action `submitContractCallBatch(contractAddress, calls,
 compiledArtifactRef, sessionId, idempotencyKey?, initialPrivateState?,
 sponsorSessionId?)`: several circuit calls against ONE deployed contract execute
 inside a single transaction scope (SDK `withContractScopedTransaction`) and are
-balanced, signed and submitted ONCE. The contract's running state threads across
-the calls. A failure before submission discards the scope (nothing submitted);
+balanced, signed and submitted ONCE. Calls in one batch must be
+order-independent: the SDK applies merged intents in unspecified order, so
+dependent calls belong in separate transactions (proven pattern: `attest`
+single, then `bindPassport` + `anchorContentRoot` as a batch). A failure before
+submission discards the scope (nothing submitted);
 after submission the ledger's fallible phase can still finalize the tx as
 PARTIAL_SUCCESS (on chain, subset of calls applied), which fails the job with
 `OnChainStatus:...`. At most 8 calls per batch. With `sponsorSessionId`, the

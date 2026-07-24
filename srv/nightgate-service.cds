@@ -572,10 +572,11 @@ service NightgateService {
 
     /**
      * Submit SEVERAL circuit calls against ONE deployed contract as a SINGLE
-     * transaction. `calls` is a JSON array of `{ circuit, args }` executed in
-     * order inside one transaction scope (SDK withContractScopedTransaction):
-     * the contract's running state threads across the calls, then the batch is
-     * balanced, signed and submitted ONCE. At most 8 calls per batch.
+     * transaction. `calls` is a JSON array of `{ circuit, args }` executed
+     * inside one transaction scope (SDK withContractScopedTransaction); the
+     * batch is balanced, signed and submitted ONCE. At most 8 calls per batch.
+     * Calls must be order-independent: the SDK applies merged intents in
+     * unspecified order, so dependent calls belong in separate transactions.
      *
      * Failure semantics: an error BEFORE submission (bad circuit, throwing
      * call, proving/balancing) discards the scope and nothing is submitted.
