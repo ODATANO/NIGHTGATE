@@ -84,7 +84,9 @@ vi.mock('../../srv/midnight/providers', () => ({
 }));
 vi.mock('../../srv/submission/background-jobs', () => ({
     startJob: vi.fn(async (args: any) => ({ jobId: `job-${args.kind}`, status: 'pending' })),
-    registerBackgroundJobProcessor: vi.fn()
+    registerBackgroundJobProcessor: vi.fn(),
+    runWithoutAmbientTx: (fn: () => Promise<unknown>) => fn(),
+    supersedeQueuedJobs: vi.fn(async () => 0)
 }));
 vi.mock('../../srv/utils/wallet-info', () => ({
     deriveWalletInfo: mockDeriveWalletInfoUtil,

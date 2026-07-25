@@ -121,6 +121,7 @@ Sufficient for read-side. `network` is the only required key — without it the 
 | `NIGHTGATE_ALLOW_SELF_SERVICE_GRANTEE_REGISTRATION` | Override `allowSelfServiceGranteeRegistration` (`false` / `0` / `no` / `off` disables) |
 | `NIGHTGATE_PREWARM_SYNC_TIMEOUT_MS` | Upper bound for the `connectWalletForSigning` prewarm sync-to-tip wait; default `10800000` (3 h). Raise for slow cold syncs. |
 | `NIGHTGATE_BALANCE_SYNC_TIMEOUT_MS` | Wallet balance sync-to-tip timeout in the worker's `balanceTx` pre-sync; default `180000` (180 s). A stalled sync fails cleanly instead of hanging. |
+| `NIGHTGATE_WALLET_READ_SYNC_TIMEOUT_MS` | Bounded sync gate for the facade-backed read actions (`getWalletBalance`, `estimateSendNightFee`, `estimateShieldFee`, `estimateUnshieldFee`); default `10000` (10 s). A facade still syncing answers `503` with code `WALLET_SYNCING` instead of blocking the request; `0` or negative disables the gate (wait indefinitely). |
 | `NIGHTGATE_DEBUG_WALLET_SYNC` | Set `true` to emit per-save wallet-sync timing logs; off by default to keep a consumer's stdout quiet |
 | `SKIP_AUTO_INIT` | Set `true` **only in tests** to skip the plugin's `initialize()` (crawler + wallet worker). Must NOT be set in production. |
 | `INDEXER_SECRET` | 32-byte hex secret for the indexer container's `APP__INFRA__SECRET` |
@@ -287,6 +288,20 @@ retry:
 - a job in `reconciliation_required` must be checked against
   `PendingSubmissions`, its persisted `txHash`, or live contract state before a
 caller creates a retry.
+
+One more terminal code exists for prewarm hygiene: a fresh
+`connectWalletForSigning` marks every older queued or running prewarm job of
+the same session as `failed / SUPERSEDED` — queued orphans never start, and
+an orphan already mid-run is terminally marked (its wait continues, see
+below). `SUPERSEDED` is expected and needs no operator action; the successor
+job carries the live prewarm status.
+
+Superseding is status hygiene, not cancellation: a superseded PENDING job
+never starts, but one caught mid-run keeps its in-flight worker wait until
+that resolves on its own (its late completion is then discarded quietly). In
+practice those waits coalesce — every prewarm of the same account blocks on
+the same facade sync — but rapid-fire fresh prewarms during a long cold sync
+still each add one real wait until the shared sync finishes.
 
 `BackgroundJobs.status` and `chainStatus` answer different questions. A job is
 `succeeded` when NIGHTGATE's command/submission workflow returned successfully;

@@ -23,10 +23,11 @@ srv/**/*.d.ts
 srv/**/*.js.map
 srv/**/*.d.ts.map
 
-# Environment
+# Environment (backups from rekeying carry live secrets — never commit)
 .env
 .env.local
 .env.*.local
+.env.backup*
 
 # IDE
 .vscode/

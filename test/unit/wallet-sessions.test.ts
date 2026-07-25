@@ -123,9 +123,16 @@ vi.mock('../../srv/utils/wallet-info', async () => {
 // the few cases that drive it explicitly (idempotency, failure classification).
 const mockStartJob = vi.hoisted(() => (vi.fn(async (args: any) => ({ jobId: `job-${args.kind}-test`, status: 'pending' as const }))));
 const registeredProcessors = vi.hoisted(() => new Map<string, (command: unknown, row: any) => Promise<unknown>>());
+// Pass-through spy: the ambient-tx detach is an integration concern; handler
+// logic under test must behave identically inside and outside the scope, but
+// tests assert the read handlers actually route their session reads through it.
+const mockRunWithoutAmbientTx = vi.hoisted(() => (vi.fn((fn: () => Promise<unknown>) => fn())));
+const mockSupersedeQueuedJobs = vi.hoisted(() => (vi.fn(async () => 0)));
 vi.mock('../../srv/submission/background-jobs', () => ({
     startJob: (...args: unknown[]) => (mockStartJob as any)(...args),
-    registerBackgroundJobProcessor: (kind: string, _version: number, processor: (command: unknown, row: any) => Promise<unknown>) => registeredProcessors.set(kind, processor)
+    registerBackgroundJobProcessor: (kind: string, _version: number, processor: (command: unknown, row: any) => Promise<unknown>) => registeredProcessors.set(kind, processor),
+    runWithoutAmbientTx: (fn: () => Promise<unknown>) => (mockRunWithoutAmbientTx as any)(fn),
+    supersedeQueuedJobs: (...args: unknown[]) => (mockSupersedeQueuedJobs as any)(...args)
 }));
 
 import cds from '@sap/cds';
@@ -542,6 +549,28 @@ describe('wallet session handlers', () => {
             expect(mockWalletWaitForSyncedState).toHaveBeenCalledWith('acct-derived', expect.any(Number));
         });
 
+        it('supersedes older prewarm jobs of the session, excluding the fresh one', async () => {
+            mockSupersedeQueuedJobs.mockClear();
+            mockDbRun.mockResolvedValueOnce(activeSessionRow()).mockResolvedValueOnce(1);
+            const req = createMockRequest({ sessionId: 's1', seedHex: VALID_SEED });
+            await registeredHandlers['connectWalletForSigning'](req);
+            expect(mockSupersedeQueuedJobs).toHaveBeenCalledWith(
+                'connectWalletForSigning', 's1', 'job-connectWalletForSigning-test'
+            );
+        });
+
+        it('a failed supersede sweep does not fail the connect', async () => {
+            mockSupersedeQueuedJobs.mockRejectedValueOnce(new Error('db busy'));
+            mockDbRun.mockResolvedValueOnce(activeSessionRow()).mockResolvedValueOnce(1);
+            const req = createMockRequest({ sessionId: 's1', seedHex: VALID_SEED });
+            const result = await registeredHandlers['connectWalletForSigning'](req);
+            expect(req.reject).not.toHaveBeenCalled();
+            expect(result).toMatchObject({
+                signingEnabled: true,
+                prewarmJobId: 'job-connectWalletForSigning-test'
+            });
+        });
+
         it('returns signingEnabled:true with null prewarmJobId if startJob scheduling fails', async () => {
             const session = activeSessionRow();
             mockDbRun.mockResolvedValueOnce(session).mockResolvedValueOnce(1);
@@ -889,6 +918,56 @@ describe('wallet session handlers', () => {
             await registeredHandlers['estimateShieldFee'](req);
             expect(req.reject).toHaveBeenCalledWith(500, expect.stringContaining('estimateShieldFee failed'));
         });
+
+        // 0.10.2 pool-starvation fix (worker-calls-outside-request-tx FR):
+        // session reads detach from the request tx, worker waits are bounded.
+
+        it('getWalletBalance resolves the session read outside the ambient request tx', async () => {
+            mockRunWithoutAmbientTx.mockClear();
+            mockDbRun.mockResolvedValueOnce(activeSessionRow());
+            mockGetWalletBalance.mockResolvedValueOnce({
+                shieldedNight: '1', unshieldedNight: '2', dustBalance: '0',
+                registeredNightUtxoCount: 0, totalNightUtxoCount: 0
+            });
+            const req = createMockRequest({ sessionId: 's1' });
+            await registeredHandlers['getWalletBalance'](req);
+            expect(mockRunWithoutAmbientTx).toHaveBeenCalled();
+        });
+
+        it('getWalletBalance forwards the bounded sync gate to the worker call', async () => {
+            mockDbRun.mockResolvedValueOnce(activeSessionRow());
+            mockGetWalletBalance.mockResolvedValueOnce({
+                shieldedNight: '1', unshieldedNight: '2', dustBalance: '0',
+                registeredNightUtxoCount: 0, totalNightUtxoCount: 0
+            });
+            const req = createMockRequest({ sessionId: 's1' });
+            await registeredHandlers['getWalletBalance'](req);
+            expect(mockGetWalletBalance).toHaveBeenCalledWith(
+                expect.objectContaining({ syncTimeoutMs: 10_000 })
+            );
+        });
+
+        it('getWalletBalance maps a sync-gate timeout to 503 WALLET_SYNCING', async () => {
+            mockDbRun.mockResolvedValueOnce(activeSessionRow());
+            mockGetWalletBalance.mockRejectedValueOnce(new Error('getBalance: sync timeout'));
+            const req = createMockRequest({ sessionId: 's1' });
+            await registeredHandlers['getWalletBalance'](req);
+            expect(req.reject).toHaveBeenCalledWith(expect.objectContaining({
+                code: 'WALLET_SYNCING',
+                status: 503
+            }));
+        });
+
+        it('swap-estimate helper maps a sync-gate timeout to 503 WALLET_SYNCING', async () => {
+            mockDbRun.mockResolvedValueOnce(activeSessionRow());
+            mockEstimateShieldFee.mockRejectedValueOnce(new Error('estimateSwapFee: sync timeout'));
+            const req = createMockRequest({ sessionId: 's1', amount: '5' });
+            await registeredHandlers['estimateShieldFee'](req);
+            expect(req.reject).toHaveBeenCalledWith(expect.objectContaining({
+                code: 'WALLET_SYNCING',
+                status: 503
+            }));
+        });
     });
 
     // ------------------------------------------------------------------
@@ -912,6 +991,18 @@ describe('wallet session handlers', () => {
 
             expect(mockEvictWalletFacade).toHaveBeenCalledWith('acct-derived');
             expect(updateWhereSpy).toHaveBeenCalledWith({ sessionId: 's1', userId: TEST_USER_ID });
+        });
+
+        it('runs its DB work detached so the evict await never holds a request tx', async () => {
+            mockRunWithoutAmbientTx.mockClear();
+            mockDbRun.mockResolvedValueOnce(activeSessionRow());
+            mockDbRun.mockResolvedValueOnce(1);
+
+            const req = createMockRequest({ sessionId: 's1' });
+            await registeredHandlers['disconnectWallet'](req);
+
+            // Session SELECT + final deactivating UPDATE both detach.
+            expect(mockRunWithoutAmbientTx).toHaveBeenCalledTimes(2);
         });
     });
 });

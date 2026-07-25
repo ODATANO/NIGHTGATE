@@ -60,7 +60,8 @@ function matchesWhere(row: any, where: Record<string, unknown>): boolean {
             const arr = (v as any).in as unknown[];
             if (!arr.includes(row[k])) return false;
         } else if (v && typeof v === 'object' && '!=' in (v as any)) {
-            if ((v as any)['!='] === null && row[k] == null) return false;
+            const excluded = (v as any)['!='];
+            if (excluded === null ? row[k] == null : row[k] === excluded) return false;
         } else if (v && typeof v === 'object' && '>' in (v as any)) {
             if (!(row[k] > (v as any)['>'])) return false;
         } else if (v === null ? row[k] != null : row[k] !== v) {
@@ -74,6 +75,10 @@ function matchesWhere(row: any, where: Record<string, unknown>): boolean {
 // for updates that set a specific target status. Simulates the SQLite write
 // lock being held by a foreign long commit.
 const lockInjector = vi.hoisted(() => ({ failUpdates: 0, matchStatus: null as string | null }));
+
+// Records db.tx(...) invocations so tests can assert whether a write joined
+// the ambient request tx (tx(context) → pinned runner) or ran autocommit.
+const txSpy = vi.hoisted(() => (vi.fn()));
 
 const runMock = vi.hoisted(() => (vi.fn(async (q: any) => {
     if (!q || typeof q !== 'object') return undefined;
@@ -203,10 +208,14 @@ vi.mock('@sap/cds', () => {
 
     // db.tx(fn) → just call fn with db (fresh "transaction" semantics; for the
     // helper, the tx wrapper is purely a context-isolation device, so the mock
-    // can collapse it to a passthrough).
+    // can collapse it to a passthrough). db.tx(context) → the pinned runner
+    // handle CAP returns for an ambient request tx.
     const dbHandle: any = {
         run: runMock,
-        tx:  async (fn: any) => fn(dbHandle)
+        tx: (arg: any) => {
+            txSpy(arg);
+            return typeof arg === 'function' ? Promise.resolve(arg(dbHandle)) : dbHandle;
+        }
     };
 
     const logHandle = { warn: vi.fn(), error: vi.fn(), info: vi.fn(), debug: vi.fn() };
@@ -241,6 +250,7 @@ import {
     WorkflowReconciliationRequiredError,
     getJobById,
     recoverInterruptedJobs,
+    supersedeQueuedJobs,
     reconcileBackgroundJobs,
     refreshSucceededChainOutcomes,
     confirmChainOutcomesViaIndexer,
@@ -1062,6 +1072,137 @@ describe('getJobById', () => {
 });
 
 // ---- recoverInterruptedJobs ------------------------------------------------
+
+describe('supersedeQueuedJobs (prewarm boot hygiene)', () => {
+    const seed = (id: string, over: Partial<Row>) => rows.set(id, {
+        ID: id, kind: 'connectWalletForSigning', sessionId: 'sess-1', status: 'pending',
+        idempotencyKey: null, request: null, result: null, errorCode: null, errorMessage: null,
+        startedAt: null, finishedAt: null,
+        createdAt: new Date().toISOString(), modifiedAt: new Date().toISOString(),
+        ...over
+    } as Row);
+
+    test('marks pending + running predecessors SUPERSEDED; successor, terminal rows, other kinds/sessions untouched', async () => {
+        seed('old-pending', { status: 'pending' });
+        seed('old-running', { status: 'running', leaseOwner: 'other-instance' });
+        seed('done', { status: 'succeeded' });
+        seed('other-kind', { kind: 'sendNight', status: 'pending' });
+        seed('other-session', { sessionId: 'sess-2', status: 'pending' });
+        seed('successor', { status: 'pending' });
+
+        const count = await supersedeQueuedJobs('connectWalletForSigning', 'sess-1', 'successor');
+
+        expect(count).toBe(2);
+        expect(rows.get('old-pending')).toMatchObject({ status: 'failed', errorCode: 'SUPERSEDED' });
+        expect(rows.get('old-running')).toMatchObject({
+            status: 'failed', errorCode: 'SUPERSEDED', leaseOwner: null, heartbeatAt: null
+        });
+        expect(rows.get('old-pending')!.finishedAt).toBeTruthy();
+        expect(rows.get('successor')!.status).toBe('pending');
+        expect(rows.get('done')!.status).toBe('succeeded');
+        expect(rows.get('other-kind')!.status).toBe('pending');
+        expect(rows.get('other-session')!.status).toBe('pending');
+    });
+
+    test('inside an ambient request tx, the sweep joins that tx instead of acquiring a second connection', async () => {
+        const cdsMock: any = ((await import('@sap/cds')) as any).default;
+        seed('old-pending', { status: 'pending' });
+        txSpy.mockClear();
+        cdsMock.context = { id: 'req-1' };
+        try {
+            const count = await supersedeQueuedJobs('connectWalletForSigning', 'sess-1');
+            expect(count).toBe(1);
+            // The UPDATE must run on db.tx(cds.context) — a detached write
+            // would wait for a second pool connection while the request tx
+            // pins one (deadlock at pool.max=1).
+            expect(txSpy).toHaveBeenCalledWith(cdsMock.context);
+        } finally {
+            cdsMock.context = undefined;
+        }
+        expect(rows.get('old-pending')).toMatchObject({ status: 'failed', errorCode: 'SUPERSEDED' });
+    });
+
+    test('a failed ambient-tx sweep rolls back to its savepoint and rethrows (request tx stays usable)', async () => {
+        const cdsMock: any = ((await import('@sap/cds')) as any).default;
+        seed('old-pending', { status: 'pending' });
+        cdsMock.context = { id: 'req-2' };
+        lockInjector.failUpdates = 1;
+        lockInjector.matchStatus = 'failed';
+        try {
+            await expect(supersedeQueuedJobs('connectWalletForSigning', 'sess-1'))
+                .rejects.toThrow('database is locked');
+        } finally {
+            cdsMock.context = undefined;
+        }
+        // Without ROLLBACK TO SAVEPOINT a failed statement leaves a PostgreSQL
+        // tx aborted and the caller's best-effort catch would mask a connect
+        // whose seed write and job insert can no longer commit.
+        const rawStatements = runMock.mock.calls.map(c => c[0]).filter((q: any) => typeof q === 'string');
+        expect(rawStatements).toContain('SAVEPOINT nightgate_supersede_sweep');
+        expect(rawStatements).toContain('ROLLBACK TO SAVEPOINT nightgate_supersede_sweep');
+        expect(rawStatements).toContain('RELEASE SAVEPOINT nightgate_supersede_sweep');
+        expect(rows.get('old-pending')!.status).toBe('pending');
+    });
+
+    test('a job superseded while still pending is never claimed (clean skip, no work run)', async () => {
+        const processor = vi.fn(async () => ({ ready: true }));
+        registerBackgroundJobProcessor('prewarmSkipTest', 1, processor);
+
+        const ret = await startJob({
+            kind: 'prewarmSkipTest', sessionId: 'sess-1', requestedBy: 'alice',
+            request: {}, commandVersion: 1, command: { op: 'prewarm' }
+        });
+        // Supersede BEFORE the detached dispatch runs: markRunning's
+        // pending-only claim then finds a failed row and skips the work.
+        await supersedeQueuedJobs('prewarmSkipTest', 'sess-1');
+        await flushSpawn();
+
+        expect(processor).not.toHaveBeenCalled();
+        expect(rows.get(ret.jobId)).toMatchObject({ status: 'failed', errorCode: 'SUPERSEDED' });
+    });
+
+    test('a job superseded mid-run stays SUPERSEDED; its late completion is discarded quietly', async () => {
+        let release!: () => void;
+        const gate = new Promise<void>(resolve => { release = resolve; });
+        registerBackgroundJobProcessor('prewarmMidRunTest', 1, async () => { await gate; return { ready: true }; });
+
+        const ret = await startJob({
+            kind: 'prewarmMidRunTest', sessionId: 'sess-1', requestedBy: 'alice',
+            request: {}, commandVersion: 1, command: { op: 'prewarm' }
+        });
+        await flushSpawn();
+        expect(rows.get(ret.jobId)!.status).toBe('running');
+
+        expect(await supersedeQueuedJobs('prewarmMidRunTest', 'sess-1')).toBe(1);
+        release();
+        await flushSpawn();
+
+        // No RESULT_PERSIST_FAILED, no resurrection: the row stays SUPERSEDED
+        // and the late result is dropped.
+        expect(rows.get(ret.jobId)).toMatchObject({
+            status: 'failed', errorCode: 'SUPERSEDED', result: null
+        });
+    });
+
+    test('a job that ERRORS after being superseded mid-run also stays SUPERSEDED', async () => {
+        let releaseWithError!: () => void;
+        const gate = new Promise<void>((_, reject) => { releaseWithError = () => reject(new Error('sync gate timed out')); });
+        registerBackgroundJobProcessor('prewarmMidRunErrTest', 1, async () => { await gate; });
+
+        const ret = await startJob({
+            kind: 'prewarmMidRunErrTest', sessionId: 'sess-1', requestedBy: 'alice',
+            request: {}, commandVersion: 1, command: { op: 'prewarm' }
+        });
+        await flushSpawn();
+        expect(rows.get(ret.jobId)!.status).toBe('running');
+
+        expect(await supersedeQueuedJobs('prewarmMidRunErrTest', 'sess-1')).toBe(1);
+        releaseWithError();
+        await flushSpawn();
+
+        expect(rows.get(ret.jobId)).toMatchObject({ status: 'failed', errorCode: 'SUPERSEDED' });
+    });
+});
 
 describe('recoverInterruptedJobs', () => {
     test('fails pre-effect work but sends external execution to reconciliation after restart', async () => {

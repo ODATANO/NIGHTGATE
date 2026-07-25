@@ -27,7 +27,9 @@ vi.mock('../../srv/midnight/providers', () => ({
 const mockStartJob = vi.hoisted(() => (vi.fn(async (args: any) => ({ jobId: 'job-prewarm-test', status: 'pending' as const }))));
 vi.mock('../../srv/submission/background-jobs', () => ({
     startJob: (...args: unknown[]) => (mockStartJob as any)(...args),
-    registerBackgroundJobProcessor: vi.fn()
+    registerBackgroundJobProcessor: vi.fn(),
+    runWithoutAmbientTx: (fn: () => Promise<unknown>) => fn(),
+    supersedeQueuedJobs: vi.fn(async () => 0)
 }));
 
 // The fail-closed seed/session consistency check derives the viewing key via

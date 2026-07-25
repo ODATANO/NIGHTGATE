@@ -29,7 +29,7 @@ import {
     resolveNightgateRuntimeConfig, getNightgatePluginConfig, mainnetSubmissionBlockReason,
     getConfiguredNightgateNetwork, normalizeNightgateNetwork
 } from '../utils/nightgate-config';
-import { startJob, registerBackgroundJobProcessor, type BackgroundJobRow } from '../submission/background-jobs';
+import { startJob, registerBackgroundJobProcessor, runWithoutAmbientTx, supersedeQueuedJobs, type BackgroundJobRow } from '../submission/background-jobs';
 import { reportExternalExecution } from '../submission/job-execution-context';
 import { mnemonicToBip39SeedHex } from '../utils/wallet-hd';
 import { deriveWalletInfo, resolveBip39SeedHex, deriveViewingKeyForAccount } from '../utils/wallet-info';
@@ -39,6 +39,33 @@ import { resolveFeeSponsor, ensureFeeSponsorFacade, FeeSponsorError } from '../s
 const PREWARM_SYNC_TIMEOUT_MS = Number(
     process.env.NIGHTGATE_PREWARM_SYNC_TIMEOUT_MS || 3 * 60 * 60 * 1000
 );
+
+// Bounded sync gate for facade-backed READ actions (getWalletBalance and the
+// fee estimates): a facade still catching up must not park the request for
+// minutes; the caller gets 503 WALLET_SYNCING and polls again. <= 0 disables
+// the gate (wait indefinitely, the pre-0.10.2 behavior).
+const WALLET_READ_SYNC_TIMEOUT_MS = Number(
+    process.env.NIGHTGATE_WALLET_READ_SYNC_TIMEOUT_MS ?? 10_000
+);
+const readSyncTimeoutMs = (): number | undefined =>
+    WALLET_READ_SYNC_TIMEOUT_MS > 0 ? WALLET_READ_SYNC_TIMEOUT_MS : undefined;
+
+/**
+ * Map a wallet-worker read failure onto the OData response: a sync-gate
+ * timeout is a retryable 503 with a stable code (`WALLET_SYNCING`), everything
+ * else stays a 500 with the worker's message.
+ */
+function rejectWorkerReadError(req: Request, action: string, err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (/sync timeout/i.test(msg)) {
+        return req.reject({
+            code: 'WALLET_SYNCING',
+            status: 503,
+            message: `${action}: wallet is still syncing to the indexer tip; retry shortly`
+        } as any);
+    }
+    return req.reject(500, `${action} failed: ${msg}`);
+}
 
 const walletRateLimiter = new RateLimiter({
     windowMs: 60 * 1000,
@@ -234,15 +261,21 @@ function requireUserId(req: Request): string | undefined {
  * Look up an active signing-capable session and derive its accountId, or return
  * a `{ ok: false, status, msg }` failure. Scoped to `userId` so one principal
  * cannot act on another's session (a foreign session reads back as 404, non-leaking).
+ *
+ * The SELECT runs OUTSIDE the ambient request tx (autocommit) on purpose: the
+ * callers await the wallet worker right after this lookup, and an open request
+ * tx would pin one pool connection for the whole worker wait (observed live as
+ * `idle in transaction` pool starvation on PostgreSQL). Callers must therefore
+ * not rely on read-your-own-write semantics for this lookup.
  */
 async function loadSigningSessionAccountId(
     db: any,
     sessionId: string,
     userId: string
 ): Promise<{ ok: true; accountId: string } | { ok: false; status: number; msg: string }> {
-    const session = await db.run(
+    const session: any = await runWithoutAmbientTx(() => db.run(
         SELECT.one.from(WalletSessions).where({ sessionId, isActive: true, userId })
-    );
+    ));
     if (!session) return { ok: false, status: 404, msg: 'Session not found or inactive' };
     if (!session.encryptedViewingKey) return { ok: false, status: 404, msg: 'Session has no viewing key' };
     if (!session.encryptedSeedKey) return { ok: false, status: 412, msg: 'Session has no signing key. Call connectWalletForSigning first.' };
@@ -393,9 +426,14 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
             return req.reject(400, 'either mnemonic or seedHex (64-byte BIP39 seed, 128 hex chars) is required');
         }
 
-        const session = await db.run(
+        // Detached read: the viewing-key derivation below loads the ESM SDK
+        // (slow on first use), and the request tx should not sit open (pinning
+        // a pool connection) while that runs. The UPDATE + startJob further
+        // down still use the ambient tx so job insert and key write commit
+        // together.
+        const session: any = await runWithoutAmbientTx(() => db.run(
             SELECT.one.from(WalletSessions).where({ sessionId, isActive: true, userId })
-        );
+        ));
         if (!session) return req.reject(404, 'Session not found or inactive');
         if (session.expiresAt && new Date(session.expiresAt) < new Date()) {
             return req.reject(410, 'Session expired');
@@ -458,6 +496,22 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
             });
             log.info('facade pre-warm job', job.jobId.slice(0, 8), 'started for', accountId.slice(0, 16));
 
+            // Boot hygiene (worker-calls-outside-request-tx FR item 4): this
+            // prewarm supersedes every older queued/running prewarm of the
+            // session — queued orphans never start, one already mid-run keeps
+            // its current worker wait but stays terminally SUPERSEDED. The
+            // sweep joins THIS handler's ambient tx (atomic with the job
+            // insert above; a detached write here would request a second pool
+            // connection while the request tx pins one — deadlock at
+            // pool.max=1). Best-effort: a failed sweep must not fail the
+            // connect — safe because the sweep savepoints its UPDATE, so a
+            // failure cannot leave the PostgreSQL tx aborted.
+            try {
+                await supersedeQueuedJobs('connectWalletForSigning', sessionId, job.jobId);
+            } catch (err: any) {
+                log.warn('prewarm supersede sweep failed:', err?.message || err);
+            }
+
             return {
                 sessionId,
                 signingEnabled: true,
@@ -477,20 +531,23 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
         const { sessionId } = req.data as { sessionId: string };
         if (!sessionId) return req.reject(400, 'sessionId is required');
 
-        const session = await db.run(
+        // All DB work in this handler runs detached (autocommit): the facade
+        // evict below awaits the worker's final multi-MB state save, and an
+        // open request tx would pin a pool connection for that whole wait.
+        const session: any = await runWithoutAmbientTx(() => db.run(
             SELECT.one.from(WalletSessions).where({ sessionId, userId })
-        );
+        ));
 
         if (!session) {
             return req.reject(404, 'Session not found');
         }
 
         if (session.expiresAt && new Date(session.expiresAt) < new Date()) {
-            await db.run(
+            await runWithoutAmbientTx(() => db.run(
                 UPDATE.entity(WalletSessions)
                     .set({ isActive: false, encryptedViewingKey: null, encryptedSeedKey: null })
                     .where({ sessionId, userId })
-            );
+            ));
             return req.reject(410, 'Session expired');
         }
 
@@ -505,7 +562,7 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
             // Best-effort eviction.
         }
 
-        await db.run(
+        await runWithoutAmbientTx(() => db.run(
             UPDATE.entity(WalletSessions)
                 .set({
                     disconnectedAt: new Date().toISOString(),
@@ -514,7 +571,7 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
                     encryptedSeedKey: null
                 })
                 .where({ sessionId, userId })
-        );
+        ));
     });
 
     srv.on('registerForDustGeneration', async (req: Request) => {
@@ -769,30 +826,13 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
         const { sessionId } = req.data as { sessionId: string };
         if (!sessionId) return req.reject(400, 'sessionId is required');
 
-        const session = await db.run(
-            SELECT.one.from(WalletSessions).where({ sessionId, isActive: true, userId })
-        );
-        if (!session) return req.reject(404, 'Session not found or inactive');
-        if (!session.encryptedViewingKey) return req.reject(404, 'Session has no viewing key');
-        if (!session.encryptedSeedKey) return req.reject(412, 'Session has no signing key. Call connectWalletForSigning first.');
-        if (session.expiresAt && new Date(session.expiresAt) < new Date()) {
-            return req.reject(410, 'Session expired');
-        }
-
-        const encKey = getEncryptionKey();
-        let viewingKey: string;
-        try {
-            viewingKey = decrypt(session.encryptedViewingKey, encKey);
-        } catch {
-            return req.reject(500, 'Failed to decrypt session keys (ENCRYPTION_KEY mismatch?)');
-        }
-        const accountId = deriveAccountId(viewingKey);
+        const sess = await loadSigningSessionAccountId(db, sessionId, userId);
+        if (!sess.ok) return req.reject(sess.status, sess.msg);
 
         try {
-            return await getWalletBalance({ cacheKey: accountId });
+            return await getWalletBalance({ cacheKey: sess.accountId, syncTimeoutMs: readSyncTimeoutMs() });
         } catch (err) {
-            const msg = err instanceof Error ? err.message : String(err);
-            return req.reject(500, `getWalletBalance failed: ${msg}`);
+            return rejectWorkerReadError(req, 'getWalletBalance', err);
         }
     });
 
@@ -824,35 +864,19 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
         const ttlErr = validateOptionalTtl(ttlIso);
         if (ttlErr) return req.reject(400, ttlErr);
 
-        const session = await db.run(
-            SELECT.one.from(WalletSessions).where({ sessionId, isActive: true, userId })
-        );
-        if (!session) return req.reject(404, 'Session not found or inactive');
-        if (!session.encryptedViewingKey) return req.reject(404, 'Session has no viewing key');
-        if (!session.encryptedSeedKey) return req.reject(412, 'Session has no signing key. Call connectWalletForSigning first.');
-        if (session.expiresAt && new Date(session.expiresAt) < new Date()) {
-            return req.reject(410, 'Session expired');
-        }
-
-        const encKey = getEncryptionKey();
-        let viewingKey: string;
-        try {
-            viewingKey = decrypt(session.encryptedViewingKey, encKey);
-        } catch {
-            return req.reject(500, 'Failed to decrypt session keys (ENCRYPTION_KEY mismatch?)');
-        }
-        const accountId = deriveAccountId(viewingKey);
+        const sess = await loadSigningSessionAccountId(db, sessionId, userId);
+        if (!sess.ok) return req.reject(sess.status, sess.msg);
 
         try {
             return await estimateSendNightFee({
-                cacheKey: accountId,
+                cacheKey: sess.accountId,
                 receiverAddress,
                 amount,
-                ttlIso
+                ttlIso,
+                syncTimeoutMs: readSyncTimeoutMs()
             });
         } catch (err) {
-            const msg = err instanceof Error ? err.message : String(err);
-            return req.reject(500, `estimateSendNightFee failed: ${msg}`);
+            return rejectWorkerReadError(req, 'estimateSendNightFee', err);
         }
     });
 
@@ -863,7 +887,7 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
     async function handleSwapEstimate(
         req: Request,
         direction: 'shield' | 'unshield',
-        invoke: (args: { cacheKey: string; amount: string; ttlIso?: string }) => Promise<{ fee: string; direction: 'shield' | 'unshield' }>
+        invoke: (args: { cacheKey: string; amount: string; ttlIso?: string; syncTimeoutMs?: number }) => Promise<{ fee: string; direction: 'shield' | 'unshield' }>
     ) {
         const clientKey = (req as any)?._.req?.ip || 'global';
         const rate = diagnosticsRateLimiter.check(clientKey);
@@ -885,10 +909,9 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
         if (!sess.ok) return req.reject(sess.status, sess.msg);
 
         try {
-            return await invoke({ cacheKey: sess.accountId, amount, ttlIso });
+            return await invoke({ cacheKey: sess.accountId, amount, ttlIso, syncTimeoutMs: readSyncTimeoutMs() });
         } catch (err) {
-            const msg = err instanceof Error ? err.message : String(err);
-            return req.reject(500, `estimate${direction === 'shield' ? 'Shield' : 'Unshield'}Fee failed: ${msg}`);
+            return rejectWorkerReadError(req, `estimate${direction === 'shield' ? 'Shield' : 'Unshield'}Fee`, err);
         }
     }
 

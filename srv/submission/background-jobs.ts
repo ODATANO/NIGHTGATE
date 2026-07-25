@@ -398,16 +398,23 @@ function scheduleJob(jobId: string, kind: string, legacyWork?: () => Promise<unk
                 try {
                     await markSucceeded(jobId, result);
                 } catch (persistErr) {
-                    // The work itself completed; only the status write kept losing
-                    cds.log('nightgate').error(
-                        `markSucceeded(${jobId}): could not persist the result after ${STATUS_WRITE_ATTEMPTS} attempts; marking failed:RESULT_PERSIST_FAILED`,
-                        persistErr
-                    );
-                    await markFailed(jobId, {
-                        code: 'RESULT_PERSIST_FAILED',
-                        retryable: false,
-                        message: 'The job work completed but its result could not be persisted (database lock contention or a lost worker lease). On-chain effects may exist; verify chain state before retrying.'
-                    });
+                    const current = await getJobById(jobId);
+                    if (current?.status === 'failed' && current.errorCode === 'SUPERSEDED') {
+                        // Expected refusal: a newer job of the same kind took
+                        // over this session while the work was in flight.
+                        cds.log('nightgate').info(`markSucceeded(${jobId}): job was superseded mid-run; discarding its result`);
+                    } else {
+                        // The work itself completed; only the status write kept losing
+                        cds.log('nightgate').error(
+                            `markSucceeded(${jobId}): could not persist the result after ${STATUS_WRITE_ATTEMPTS} attempts; marking failed:RESULT_PERSIST_FAILED`,
+                            persistErr
+                        );
+                        await markFailed(jobId, {
+                            code: 'RESULT_PERSIST_FAILED',
+                            retryable: false,
+                            message: 'The job work completed but its result could not be persisted (database lock contention or a lost worker lease). On-chain effects may exist; verify chain state before retrying.'
+                        });
+                    }
                 }
             } finally {
                 stopHeartbeat();
@@ -429,7 +436,11 @@ function scheduleJob(jobId: string, kind: string, legacyWork?: () => Promise<unk
                 // predicate) must not demand operator reconciliation. Crash
                 // recovery still fail-closes `external_execution` rows, which
                 // is the genuinely ambiguous case.
-                if (current?.txHash) {
+                if (current?.status === 'failed' && current.errorCode === 'SUPERSEDED') {
+                    cds.log('nightgate').info(
+                        `Job ${jobId} errored after being superseded mid-run; keeping SUPERSEDED (dropped: ${classification.code})`
+                    );
+                } else if (current?.txHash) {
                     await markReconciliationRequired(jobId, {
                         code: 'EXTERNAL_EXECUTION_FAILED',
                         message: `Execution failed after broadcasting ${current.txHash}; verify chain state before retrying. ${classification.message}`
@@ -529,8 +540,15 @@ export async function runChildCommand<T>(args: {
  * short-lived tx instead of joining a long-lived ambient one (matters at
  * pool.max=1). The module-level AsyncResource has no CAP transaction, and Node
  * propagates that empty scope through `fn`'s promise chain.
+ *
+ * Exported for request handlers that must not hold their CAP request tx (and
+ * with it a pinned pool connection) across a slow await: DB reads routed
+ * through here autocommit on a pooled connection that is returned immediately,
+ * so a subsequent multi-minute wallet-worker wait pins nothing. Trade-off: the
+ * read cannot see uncommitted writes of the ambient request tx, so only route
+ * reads through here BEFORE the handler writes anything.
  */
-function runWithoutAmbientTx<T>(fn: () => Promise<T>): Promise<T> {
+export function runWithoutAmbientTx<T>(fn: () => Promise<T>): Promise<T> {
     return detachedJobScope.runInAsyncScope(fn);
 }
 
@@ -650,6 +668,76 @@ export async function recoverInterruptedJobs(): Promise<number> {
                 .where({ status: { in: ['external_execution', 'submitted'] } })
         );
     });
+    return count;
+}
+
+/**
+ * Terminally mark every queued or running job of `kind` for `sessionId` as
+ * failed with errorCode 'SUPERSEDED', excluding `excludeJobId` (the successor).
+ *
+ * Boot hygiene for prewarm jobs (worker-calls-outside-request-tx FR item 4):
+ * restart recovery re-queues an orphaned `connectWalletForSigning` while the
+ * consumer's boot prewarm starts a fresh one, so every hard restart multiplied
+ * the concurrent worker waits against the same account. Superseded pending
+ * rows never start (the pending-only claim guard skips them); a row superseded
+ * mid-run keeps executing but its completion write is discarded quietly and it
+ * stays terminally SUPERSEDED for status readers. This is STATUS hygiene, not
+ * cancellation: an in-flight worker wait runs until it resolves on its own.
+ *
+ * Runs on the caller's ambient request tx when present: the sweep is then
+ * atomic with the successor insert (which is visible there — excludeJobId
+ * guards it), and no second pool connection is requested while the request tx
+ * still pins one (that second acquire deadlocks at pool.max=1 and collides
+ * with the open writer on SQLite). On the ambient tx the UPDATE is wrapped in
+ * a SAVEPOINT: a failed sweep must stay best-effort for the caller, and
+ * without ROLLBACK TO SAVEPOINT a failed statement leaves a PostgreSQL tx
+ * aborted — the caller's catch would then mask a connect whose seed write and
+ * job insert can no longer commit. Outside a request tx it autocommits.
+ */
+export async function supersedeQueuedJobs(kind: string, sessionId: string, excludeJobId?: string): Promise<number> {
+    const db = await cds.connect.to('db');
+    const where: Record<string, unknown> = { kind, sessionId, status: { in: ['pending', 'running'] } };
+    if (excludeJobId) where.ID = { '!=': excludeJobId };
+    const buildUpdate = () => UPDATE.entity(BackgroundJobs)
+        .set({
+            status: 'failed',
+            errorCode: 'SUPERSEDED',
+            errorMessage: 'Superseded by a newer job of the same kind for this session; the successor job carries the live status.',
+            finishedAt: new Date().toISOString(),
+            leaseOwner: null,
+            leaseExpiresAt: null,
+            heartbeatAt: null
+        })
+        .where(where);
+
+    let affected: unknown;
+    if (cds.context) {
+        const runner: { run: (q: any) => Promise<any> } = (db as any).tx(cds.context);
+        // No lock-contention retry here: on SQLite the ambient tx already
+        // holds the writer, and on PostgreSQL lock waits block instead of
+        // erroring, so a retry loop inside the tx buys nothing.
+        const sp = 'nightgate_supersede_sweep';
+        await runner.run(`SAVEPOINT ${sp}`);
+        try {
+            affected = await runner.run(buildUpdate());
+        } catch (sweepErr) {
+            await runner.run(`ROLLBACK TO SAVEPOINT ${sp}`);
+            await runner.run(`RELEASE SAVEPOINT ${sp}`);
+            throw sweepErr;
+        }
+        await runner.run(`RELEASE SAVEPOINT ${sp}`);
+    } else {
+        affected = await withStatusWriteRetry(
+            `supersedeQueuedJobs(${kind})`,
+            () => db.run(buildUpdate())
+        );
+    }
+    const count = affectedRows(affected);
+    if (count > 0) {
+        cds.log('nightgate').info(
+            `supersedeQueuedJobs(${kind}): marked ${count} predecessor job(s) SUPERSEDED for session ${sessionId.slice(0, 8)}`
+        );
+    }
     return count;
 }
 

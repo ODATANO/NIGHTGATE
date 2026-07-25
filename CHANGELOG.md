@@ -1,5 +1,56 @@
 # Changelog
 
+## 0.10.2 - 2026-07-25
+
+### Fix: wallet-worker waits no longer hold an open request transaction (PostgreSQL pool starvation)
+
+Found live 2026-07-24: `getWalletBalance` awaited the wallet worker INSIDE the
+CAP-managed request transaction. On a facade still syncing to the indexer tip
+that wait blocks for minutes, and the open transaction pins one database
+connection the whole time (`idle in transaction`). A consumer polling balances
+of warming wallets drained the entire PostgreSQL pool; SQLite's single-writer
+model had hidden the pattern. FR:
+`docs/feature-requests/worker-calls-outside-request-tx.md` (all four items).
+
+- **Session reads detach from the request tx.** `runWithoutAmbientTx` is now
+  exported from `srv/submission/background-jobs.ts`; the facade-backed read
+  handlers (`getWalletBalance`, `estimateSendNightFee`, `estimateShieldFee`,
+  `estimateUnshieldFee`) resolve their `WalletSessions` lookup on a
+  short-lived autocommit connection, so the subsequent worker await pins
+  nothing. `connectWalletForSigning` does the same for its session read (the
+  in-handler viewing-key derivation loads the ESM SDK, slow on first use);
+  its key write + job insert stay on the ambient tx and commit together.
+- **Bounded sync gate for worker reads.** The four read actions wait at most
+  `NIGHTGATE_WALLET_READ_SYNC_TIMEOUT_MS` (default 10 s, `<= 0` disables) for
+  genuine sync, then answer **503 with error code `WALLET_SYNCING`** instead
+  of blocking. Status surfaces can poll cheaply; caller-side timeouts are no
+  longer needed (and never helped, since the server kept waiting).
+- **`disconnectWallet` evicts outside any transaction.** The facade evict
+  (which awaits the worker's final state save) now runs with no open request
+  tx; all DB work in the handler autocommits.
+- Duplicated session-lookup blocks in `getWalletBalance` /
+  `estimateSendNightFee` replaced with the shared
+  `loadSigningSessionAccountId` helper (behavior-identical status codes).
+- **Boot hygiene: a fresh prewarm supersedes orphaned predecessors.** Restart
+  recovery re-queues an interrupted `connectWalletForSigning` while the
+  consumer's boot prewarm starts a fresh one; every hard restart multiplied
+  the blocked worker waits (observed: 16+ heartbeating jobs). A fresh
+  `connectWalletForSigning` now marks every older queued or running prewarm
+  job of the same session as `failed / SUPERSEDED` (new internal helper
+  `supersedeQueuedJobs` in `srv/submission/background-jobs.ts`, not part of
+  the package's public exports). Superseded pending jobs never start; a job
+  superseded mid-run keeps its terminal `SUPERSEDED` status and its late
+  result is discarded quietly (no `RESULT_PERSIST_FAILED` noise). Status
+  readers should treat `SUPERSEDED` as expected and follow the successor job.
+  Design limit: this is status hygiene, not cancellation — an already-running
+  worker wait continues until it resolves on its own (all prewarms of one
+  account coalesce on the same facade sync). The sweep joins the handler's
+  request tx, so it never requests a second pool connection.
+
+**Consumer note (NIGHTPASS):** treat `503 WALLET_SYNCING` from
+`getWalletBalance` and the fee estimates as retryable; poll again once the
+prewarm job reports ready. No schema change in this release.
+
 ## 0.10.1 - 2026-07-24
 
 ### `deriveWalletInfo` exposes the AttestationVault attester identity
