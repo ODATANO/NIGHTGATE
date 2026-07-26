@@ -27,7 +27,11 @@ async function evictSessionFacade(session: { encryptedViewingKey?: string | null
     try {
         if (session.encryptedViewingKey) {
             const vk = decrypt(session.encryptedViewingKey, getEncryptionKey());
-            await evictWalletFacade(deriveAccountId(vk));
+            const accountId = deriveAccountId(vk);
+            // Deliberately account-wide (operator tool: forced invalidation
+            // must drop secrets even if other sessions share the wallet).
+            cds.log('nightgate:admin').info('force-evicting facade', accountId.slice(0, 16));
+            await evictWalletFacade(accountId);
         }
     } catch { /* best-effort */ }
 }

@@ -10,6 +10,7 @@ import { getEncryptionKey, encrypt, decrypt, hashViewingKey } from '../utils/cry
 import { validateViewingKey } from '../utils/validation';
 import { RateLimiter } from '../utils/rate-limiter';
 import { evictWalletFacade } from '../submission/wallet-facade-builder';
+import { withKeyedLock } from '../utils/keyed-lock';
 import { deriveAccountId, deriveStoragePassword } from '../submission/wallet-material-factory';
 import { registerNightUtxosForDust, deregisterNightUtxosFromDust } from '../submission/dust-registration';
 const log = cds.log('nightgate:sessions');
@@ -291,6 +292,66 @@ async function loadSigningSessionAccountId(
     return { ok: true, accountId: deriveAccountId(viewingKey) };
 }
 
+/**
+ * True when any active, non-expired session row references the wallet with
+ * this viewingKeyHash. Uses the persisted hash, so no decryption is needed;
+ * reads detached so no request tx is held across the lookup. Callers MUST
+ * deactivate their own row(s) first, so "any live row" means "any OTHER
+ * live owner".
+ */
+async function hasLiveSessionForWallet(
+    db: any,
+    viewingKeyHash: string | null | undefined
+): Promise<boolean> {
+    if (!viewingKeyHash) return false;
+    const now = new Date().toISOString();
+    const rows: any = await runWithoutAmbientTx(() => db.run(
+        SELECT.from(WalletSessions)
+            .columns('sessionId')
+            .where({ viewingKeyHash, isActive: true, expiresAt: { '>': now } })
+    ));
+    return Array.isArray(rows) && rows.length > 0;
+}
+
+/**
+ * Shared-session-aware facade eviction (session-sweep-evicts-live-facade FR):
+ * the facade cache is keyed by accountId while sessions are per-connect rows
+ * with a TTL, so expiry or disconnect of ONE row must not evict a facade a
+ * sibling session still uses (live incident 2026-07-26: the 15-min sweep
+ * silently killed the demo's sponsor facades whenever a day-old leftover row
+ * expired).
+ *
+ * Contract: call AFTER the owning row(s) have been deactivated. Checking
+ * before deactivation is a TOCTOU race: two concurrent disconnects of the
+ * same wallet would each see the other still active and both skip. With
+ * deactivate-first, every caller re-checks after its own deactivation
+ * committed, so at least one observes zero live references and evicts.
+ * The per-account lock serializes the check+evict against a concurrent
+ * facade (re)build (`getOrBuildWalletFacade` takes the same lock), so a
+ * freshly built facade cannot be torn down by a stale decision.
+ * Best-effort: never throws. Legacy rows without a viewingKeyHash always
+ * evict (secure default).
+ */
+async function evictFacadeUnlessShared(
+    db: any,
+    session: { encryptedViewingKey?: string | null; viewingKeyHash?: string | null },
+    context: string
+): Promise<void> {
+    try {
+        if (!session.encryptedViewingKey) return;
+        const viewingKey = decrypt(session.encryptedViewingKey, getEncryptionKey());
+        const accountId = deriveAccountId(viewingKey);
+        await withKeyedLock(accountId, async () => {
+            if (session.viewingKeyHash && await hasLiveSessionForWallet(db, session.viewingKeyHash)) {
+                log.info(`${context}: keeping facade ${accountId.slice(0, 16)} (another active session uses this wallet)`);
+                return;
+            }
+            log.info(`${context}: evicting facade ${accountId.slice(0, 16)}`);
+            await evictWalletFacade(accountId);
+        });
+    } catch { /* best-effort eviction */ }
+}
+
 const BIP39_SEED_HEX_LENGTH = 128; // 64-byte BIP39 seed; HD-derived per role in srv/utils/wallet-hd.ts
 
 export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: any): void {
@@ -548,20 +609,18 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
                     .set({ isActive: false, encryptedViewingKey: null, encryptedSeedKey: null })
                     .where({ sessionId, userId })
             ));
+            // Same shared-session-aware eviction as a live disconnect: the
+            // sweep only selects ACTIVE rows, so skipping this here would
+            // leave a sole session's in-memory keys cached forever. The
+            // in-memory `session` still carries the key material the row
+            // just lost.
+            await evictFacadeUnlessShared(db, session, 'disconnectWallet(expired)');
             return req.reject(410, 'Session expired');
         }
 
-        // Evict the cached WalletFacade so in-memory secret keys are dropped.
-        try {
-            if (session.encryptedViewingKey) {
-                const viewingKey = decrypt(session.encryptedViewingKey, getEncryptionKey());
-                const accountId = deriveAccountId(viewingKey);
-                await evictWalletFacade(accountId);
-            }
-        } catch {
-            // Best-effort eviction.
-        }
-
+        // Deactivate FIRST, then decide about the facade (see the
+        // evictFacadeUnlessShared contract: check-before-deactivate is a
+        // TOCTOU race between two concurrent disconnects of the same wallet).
         await runWithoutAmbientTx(() => db.run(
             UPDATE.entity(WalletSessions)
                 .set({
@@ -572,6 +631,11 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
                 })
                 .where({ sessionId, userId })
         ));
+
+        // Evict the cached WalletFacade so in-memory secret keys are dropped,
+        // unless another active session still uses this wallet (that session
+        // legitimately needs the facade and its keys).
+        await evictFacadeUnlessShared(db, session, 'disconnectWallet');
     });
 
     srv.on('registerForDustGeneration', async (req: Request) => {
@@ -928,25 +992,36 @@ export function startSessionCleanup(db: any): ReturnType<typeof setInterval> {
     const timer = setInterval(async () => {
         try {
             const now = new Date().toISOString();
-            const where = { isActive: true, expiresAt: { '<': now } };
-            // Evict cached facades for the expiring sessions so in-memory secret
-            // keys are dropped
             const expiring: any[] = (await db.run(
-                SELECT.from(WalletSessions).columns('encryptedViewingKey').where(where)
+                SELECT.from(WalletSessions)
+                    .columns('sessionId', 'viewingKeyHash', 'encryptedViewingKey')
+                    .where({ isActive: true, expiresAt: { '<': now } })
             )) || [];
-            for (const s of expiring) {
-                try {
-                    if (s.encryptedViewingKey) {
-                        const vk = decrypt(s.encryptedViewingKey, getEncryptionKey());
-                        await evictWalletFacade(deriveAccountId(vk));
-                    }
-                } catch { /* best-effort eviction */ }
-            }
+            if (expiring.length === 0) return;
+            // Deactivate FIRST, scoped to the selected rows: a row expiring
+            // between SELECT and UPDATE must not be deactivated unseen (its
+            // facade decision would be skipped forever, since the sweep only
+            // selects active rows). The eviction decision then runs per
+            // wallet with the shared-session guard (see
+            // evictFacadeUnlessShared: keyed with the facade cache's
+            // accountId while sessions are per-connect rows).
             await db.run(
                 UPDATE.entity(WalletSessions)
                     .set({ isActive: false, encryptedViewingKey: null, encryptedSeedKey: null })
-                    .where(where)
+                    .where({ sessionId: { in: expiring.map(s => s.sessionId) } })
             );
+            const decidedHashes = new Set<string>();
+            for (const s of expiring) {
+                if (!s.encryptedViewingKey) continue;
+                if (s.viewingKeyHash) {
+                    // One decision per wallet, not per row.
+                    if (decidedHashes.has(s.viewingKeyHash)) continue;
+                    decidedHashes.add(s.viewingKeyHash);
+                }
+                await evictFacadeUnlessShared(
+                    db, s, `session cleanup (expired session ${String(s.sessionId).slice(0, 8)})`
+                );
+            }
         } catch { /* ignore cleanup errors */ }
     }, SESSION_CLEANUP_INTERVAL);
 

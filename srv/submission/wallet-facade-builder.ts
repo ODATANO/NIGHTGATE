@@ -32,6 +32,7 @@ import {
     getWalletSdkVersion
 } from './wallet-sync-state-store';
 import { formatErr } from '../utils/format-error';
+import { withKeyedLock } from '../utils/keyed-lock';
 import cds from '@sap/cds';
 const log = cds.log('nightgate:facade');
 import nodeCrypto from 'node:crypto';
@@ -122,8 +123,20 @@ const sessionRegistry = new Map<string, SessionRecord>();
  * Initialise a wallet for `cacheKey` via the worker. Idempotent: subsequent calls
  * for the same cacheKey hit the worker's cache. Returns a placeholder shape whose
  * `.facade`/`.keys.*` methods throw if hit (unmigrated paths fail loudly).
+ *
+ * Runs under the per-account keyed lock so a build cannot interleave with a
+ * shared-session eviction decision for the same account (the session sweep /
+ * disconnect check "is anyone still using this facade?" and must not tear
+ * down a facade that is being (re)built concurrently).
  */
-export async function getOrBuildWalletFacade(
+export function getOrBuildWalletFacade(
+    cacheKey: string,
+    args: WalletFacadeBuildArgs
+): Promise<{ facade: any; zswapKeys: any; dustKey: any; unshieldedKeystore: any }> {
+    return withKeyedLock(cacheKey, () => buildWalletFacadeLocked(cacheKey, args));
+}
+
+async function buildWalletFacadeLocked(
     cacheKey: string,
     args: WalletFacadeBuildArgs
 ): Promise<{ facade: any; zswapKeys: any; dustKey: any; unshieldedKeystore: any }> {

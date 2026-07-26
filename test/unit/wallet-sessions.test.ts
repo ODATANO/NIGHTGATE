@@ -417,20 +417,95 @@ describe('wallet session handlers', () => {
         expect(req.reject).toHaveBeenCalledWith(410, 'Session expired');
     });
 
-    it('startSessionCleanup deactivates expired sessions on the cleanup interval', async () => {
+    it('startSessionCleanup is a no-op when nothing is expiring', async () => {
         vi.useFakeTimers();
-        // Cleanup now SELECTs the expiring rows (to evict cached facades) then
-        // UPDATEs them, nulling BOTH encrypted keys.
-        const db = { run: vi.fn().mockResolvedValueOnce([]).mockResolvedValueOnce(2) };
+        // Cleanup SELECTs the expiring rows first; with none, it neither
+        // UPDATEs nor evicts.
+        const db = { run: vi.fn().mockResolvedValueOnce([]) };
 
         try {
             const timer = startSessionCleanup(db);
             await vi.advanceTimersByTimeAsync(15 * 60 * 1000);
 
-            expect(db.run).toHaveBeenCalledTimes(2);
+            expect(db.run).toHaveBeenCalledTimes(1);
+            expect(mockEvictWalletFacade).not.toHaveBeenCalled();
             clearInterval(timer);
         } finally {
             vi.useRealTimers();
+        }
+    });
+
+    // session-sweep-evicts-live-facade FR: the sweep must not evict a facade
+    // that another active session of the same wallet still uses.
+
+    it('session cleanup keeps the facade when another active session uses the same wallet', async () => {
+        let callback: (() => Promise<void>) | undefined;
+        const setIntervalSpy = vi.spyOn(global, 'setInterval').mockImplementation(((handler: TimerHandler) => {
+            callback = handler as () => Promise<void>;
+            return {} as ReturnType<typeof setInterval>;
+        }) as any);
+        const encKey = getEncryptionKey();
+        const db = {
+            run: vi.fn()
+                .mockResolvedValueOnce([{ sessionId: 'old-1', viewingKeyHash: 'hash-a', encryptedViewingKey: encrypt('a'.repeat(64), encKey) }])
+                .mockResolvedValueOnce(1)                          // deactivate UPDATE (runs FIRST)
+                .mockResolvedValueOnce([{ sessionId: 'live-1' }]) // guard: live sibling remains
+        };
+        try {
+            startSessionCleanup(db);
+            await callback?.();
+            expect(mockEvictWalletFacade).not.toHaveBeenCalled();
+            expect(db.run).toHaveBeenCalledTimes(3);
+        } finally {
+            setIntervalSpy.mockRestore();
+        }
+    });
+
+    it('session cleanup evicts once per wallet when only expiring rows reference it', async () => {
+        let callback: (() => Promise<void>) | undefined;
+        const setIntervalSpy = vi.spyOn(global, 'setInterval').mockImplementation(((handler: TimerHandler) => {
+            callback = handler as () => Promise<void>;
+            return {} as ReturnType<typeof setInterval>;
+        }) as any);
+        const encKey = getEncryptionKey();
+        const expiringRow = (id: string) => ({ sessionId: id, viewingKeyHash: 'hash-a', encryptedViewingKey: encrypt('a'.repeat(64), encKey) });
+        const db = {
+            run: vi.fn()
+                .mockResolvedValueOnce([expiringRow('old-1'), expiringRow('old-2')])
+                .mockResolvedValueOnce(2)   // deactivate UPDATE first (both rows)
+                .mockResolvedValueOnce([])  // guard: no live session left for this wallet
+        };
+        try {
+            startSessionCleanup(db);
+            await callback?.();
+            // One wallet -> one guard lookup -> one eviction, despite two rows.
+            expect(mockEvictWalletFacade).toHaveBeenCalledTimes(1);
+            expect(mockEvictWalletFacade).toHaveBeenCalledWith('acct-derived');
+            expect(db.run).toHaveBeenCalledTimes(3);
+        } finally {
+            setIntervalSpy.mockRestore();
+        }
+    });
+
+    it('session cleanup still evicts legacy rows without a viewingKeyHash (secure default)', async () => {
+        let callback: (() => Promise<void>) | undefined;
+        const setIntervalSpy = vi.spyOn(global, 'setInterval').mockImplementation(((handler: TimerHandler) => {
+            callback = handler as () => Promise<void>;
+            return {} as ReturnType<typeof setInterval>;
+        }) as any);
+        const encKey = getEncryptionKey();
+        const db = {
+            run: vi.fn()
+                .mockResolvedValueOnce([{ sessionId: 'old-legacy', encryptedViewingKey: encrypt('a'.repeat(64), encKey) }])
+                .mockResolvedValueOnce(1)   // deactivate UPDATE
+        };
+        try {
+            startSessionCleanup(db);
+            await callback?.();
+            expect(mockEvictWalletFacade).toHaveBeenCalledWith('acct-derived');
+            expect(db.run).toHaveBeenCalledTimes(2); // no guard SELECT without a hash
+        } finally {
+            setIntervalSpy.mockRestore();
         }
     });
 
@@ -982,7 +1057,7 @@ describe('wallet session handlers', () => {
             vi.restoreAllMocks();
         });
 
-        it('evicts the cached facade for the account before deactivating the session', async () => {
+        it('deactivates the session and then evicts the cached facade for the account', async () => {
             mockDbRun.mockResolvedValueOnce(activeSessionRow());
             mockDbRun.mockResolvedValueOnce(1);
 
@@ -1003,6 +1078,61 @@ describe('wallet session handlers', () => {
 
             // Session SELECT + final deactivating UPDATE both detach.
             expect(mockRunWithoutAmbientTx).toHaveBeenCalledTimes(2);
+        });
+
+        // session-sweep-evicts-live-facade FR: logout of one session must not
+        // evict the facade a sibling active session still uses.
+
+        it('keeps the facade when another active session still uses the wallet', async () => {
+            mockDbRun.mockResolvedValueOnce({ ...activeSessionRow(), viewingKeyHash: 'hash-a' });
+            mockDbRun.mockResolvedValueOnce(1);                             // deactivate UPDATE (runs first)
+            mockDbRun.mockResolvedValueOnce([{ sessionId: 'other-live' }]); // guard: live sibling
+
+            const req = createMockRequest({ sessionId: 's1' });
+            await registeredHandlers['disconnectWallet'](req);
+
+            expect(mockEvictWalletFacade).not.toHaveBeenCalled();
+            // The disconnecting row itself is still deactivated.
+            expect(updateWhereSpy).toHaveBeenCalledWith({ sessionId: 's1', userId: TEST_USER_ID });
+        });
+
+        it('evicts when the disconnecting session was the only live reference', async () => {
+            mockDbRun.mockResolvedValueOnce({ ...activeSessionRow(), viewingKeyHash: 'hash-a' });
+            mockDbRun.mockResolvedValueOnce(1);  // deactivate UPDATE (runs first)
+            mockDbRun.mockResolvedValueOnce([]); // guard: own row already inactive, nobody else
+
+            const req = createMockRequest({ sessionId: 's1' });
+            await registeredHandlers['disconnectWallet'](req);
+
+            expect(mockEvictWalletFacade).toHaveBeenCalledWith('acct-derived');
+        });
+
+        // session-sweep FR review P1: the expired-disconnect path must run the
+        // same shared-session-aware eviction, or a sole session's in-memory
+        // keys outlive the row forever (the sweep only selects active rows).
+
+        it('expired disconnect evicts the facade when it was the only live reference', async () => {
+            mockDbRun.mockResolvedValueOnce({ ...activeSessionRow({ expiresInMs: -1000 }), viewingKeyHash: 'hash-a' });
+            mockDbRun.mockResolvedValueOnce(1);  // deactivate UPDATE
+            mockDbRun.mockResolvedValueOnce([]); // guard: no live session left
+
+            const req = createMockRequest({ sessionId: 's1' });
+            await registeredHandlers['disconnectWallet'](req);
+
+            expect(mockEvictWalletFacade).toHaveBeenCalledWith('acct-derived');
+            expect(req.reject).toHaveBeenCalledWith(410, 'Session expired');
+        });
+
+        it('expired disconnect keeps the facade when another active session uses the wallet', async () => {
+            mockDbRun.mockResolvedValueOnce({ ...activeSessionRow({ expiresInMs: -1000 }), viewingKeyHash: 'hash-a' });
+            mockDbRun.mockResolvedValueOnce(1);                             // deactivate UPDATE
+            mockDbRun.mockResolvedValueOnce([{ sessionId: 'other-live' }]); // guard: live sibling
+
+            const req = createMockRequest({ sessionId: 's1' });
+            await registeredHandlers['disconnectWallet'](req);
+
+            expect(mockEvictWalletFacade).not.toHaveBeenCalled();
+            expect(req.reject).toHaveBeenCalledWith(410, 'Session expired');
         });
     });
 });

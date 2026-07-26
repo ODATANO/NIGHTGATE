@@ -1,5 +1,53 @@
 # Changelog
 
+## 0.10.3 - 2026-07-26
+
+### Fix: session-expiry sweep no longer evicts the live facade of a shared wallet
+
+Found live on the NIGHTPASS demo (FR
+`docs/feature-requests/session-sweep-evicts-live-facade.md`): the facade
+cache is keyed by accountId while sessions are per-connect rows with a 24h
+TTL. A consumer that reconnects the same wallet on every boot accumulates
+several active rows for the same account; when any OLD row expired, the
+15-minute cleanup sweep silently evicted the facade the CURRENT session was
+actively using (`getWalletBalance failed: No facade for sessionId=...`
+roughly 24h after the row that created it). `disconnectWallet` had the same
+collision.
+
+- New guard: before evicting, the sweep and `disconnectWallet` check whether
+  ANOTHER active, non-expired session row references the same wallet (via
+  the persisted `viewingKeyHash`, no decryption needed). If so, only the
+  expiring/disconnecting row is deactivated and the facade stays.
+- The sweep now decides once per wallet instead of once per row, and logs
+  every eviction and every skip at info level (the old eviction was silent,
+  which is why the incident took hours to diagnose).
+- Legacy rows without a `viewingKeyHash` keep the old behavior (evict), as
+  the secure default.
+- Admin `invalidateSession`/`invalidateAllSessions` force-evict stays
+  deliberately account-wide (operator tool) and now logs the eviction.
+- **Deactivate-first ordering (review fix).** Both the sweep and
+  `disconnectWallet` deactivate the owning row(s) BEFORE deciding about the
+  facade. Checking first was a TOCTOU race: two concurrent disconnects of
+  the same wallet would each see the other still active and both skip the
+  eviction, leaving the in-memory keys cached with no live session. With
+  deactivate-first, at least one caller observes zero live references. The
+  sweep's deactivation is scoped to the selected rows so nothing expires
+  unseen between SELECT and UPDATE.
+- **Expired disconnect evicts too (review fix).** The `disconnectWallet`
+  410 path (already-expired session) now runs the same shared-session-aware
+  eviction; previously it only deactivated the row, and since the sweep
+  selects only ACTIVE rows, a sole session's in-memory keys would have
+  stayed cached forever.
+- **Per-account lock.** New `srv/utils/keyed-lock.ts` (in-process mutex,
+  sound because the runtime topology is enforced single-instance):
+  `getOrBuildWalletFacade` and the check+evict decision take the same
+  account lock, so a facade being (re)built concurrently cannot be torn
+  down by a stale eviction decision.
+
+No schema change, no API change. Consumers that self-heal on
+`No facade for sessionId` (reconnect + reindex) can keep that logic as a
+safety net; it should no longer trigger.
+
 ## 0.10.2 - 2026-07-25
 
 ### Fix: wallet-worker waits no longer hold an open request transaction (PostgreSQL pool starvation)
