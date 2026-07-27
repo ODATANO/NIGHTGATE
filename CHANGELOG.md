@@ -1,5 +1,39 @@
 # Changelog
 
+## 0.10.4 - 2026-07-27
+
+### Fix: discarded/failed wallet recipes no longer leak coins into pendingUtxos; loop-free fee estimates
+
+Root-caused live in the sibling browser-wallet project on preview (bug report:
+`docs/feature-requests/bug_002-recipe-pending-utxo-leak-and-estimatefee-hang.md`,
+verified claim-by-claim against the vendored SDK): recipe builders move the
+selected coins into the sub-wallets' `pendingUtxos` at BUILD time, and a
+recipe that is discarded (fee estimate) is never reverted. The phantom spend
+is persisted by the periodic state save, so one estimate call could brick a
+session wallet ("Insufficient funds" on a funded wallet) across restarts.
+Separately, `estimateTransactionFee` re-runs the dust balancer's uncapped
+synchronous convergence loop and can pin the worker's event loop.
+
+All in `srv/midnight/wallet-worker.ts`:
+
+- `estimateTransferFee` / `estimateSwapFee` now price the balanced recipe via
+  the loop-free `calculateTransactionFee` and ALWAYS revert the recipe in a
+  `finally` (new helpers `revertRecipeBestEffort` / `feeOfDiscardedRecipe`).
+- Contract-call path: the recipe is reverted when `finalizeRecipe` fails (the
+  SDK only reverts the balancing tx of an unbound recipe, stranding the base
+  tx's in-place unshielded spends) and when the empty-DustActions 117 guard
+  aborts after a successful finalize.
+- Sponsored path: caller-side sign/finalize failures revert the caller
+  recipe; sponsor-phase failures revert on BOTH facades, including the
+  stranded caller-finalized tx. A SUBMIT failure also reverts the caller
+  facade (the SDK's error path only reverts the sponsor it ran on).
+
+The UNPROVEN submit flows (transferNight, shield/unshield, dust
+registration) are unchanged: the vendored facade already reverts prove and
+submit failures itself. No schema change, no API change; estimate fee
+results now come from `calculateFee` (same figure on a balanced recipe, min
+1 atom).
+
 ## 0.10.3 - 2026-07-26
 
 ### Fix: session-expiry sweep no longer evicts the live facade of a shared wallet

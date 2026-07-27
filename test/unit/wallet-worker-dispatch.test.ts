@@ -132,7 +132,8 @@ function makeFakeFacade() {
         state: () => ({
             subscribe(obs: any) { obs.next(facadeState.current); return { unsubscribe() { /* noop */ } }; }
         }),
-        waitForSyncedState: vi.fn(async () => undefined)
+        waitForSyncedState: vi.fn(async () => undefined),
+        revert: vi.fn(async () => undefined)
     };
     return facade;
 }
@@ -419,6 +420,53 @@ describe('describeTxDust', () => {
     });
 });
 
+// ---- revertRecipeBestEffort / feeOfDiscardedRecipe: the bug_002 guards -----
+
+describe('revertRecipeBestEffort / feeOfDiscardedRecipe', () => {
+    function warns(): string[] {
+        return fakeParentPort.postMessage.mock.calls
+            .map(c => c[0])
+            .filter((m: any) => m.kind === 'log' && m.level === 'warn')
+            .map((m: any) => m.message);
+    }
+
+    it('feeOfDiscardedRecipe prices via calculateTransactionFee (NOT the hang-prone estimateTransactionFee) and ALWAYS reverts', async () => {
+        const facade = makeFakeFacade();
+        facade.calculateTransactionFee = vi.fn(async () => 42n);
+        facade.estimateTransactionFee = vi.fn(async () => { throw new Error('must not be called: uncapped runSync loop'); });
+        const recipe = { type: 'UNPROVEN_TRANSACTION', transaction: { tx: true } };
+
+        const fee = await workerExports.feeOfDiscardedRecipe(facade, recipe, 'test-site');
+        expect(fee).toBe(42n);
+        expect(facade.calculateTransactionFee).toHaveBeenCalledWith(recipe.transaction);
+        expect(facade.estimateTransactionFee).not.toHaveBeenCalled();
+        expect(facade.revert).toHaveBeenCalledWith(recipe);
+    });
+
+    it('feeOfDiscardedRecipe reverts the recipe even when the fee computation fails', async () => {
+        const facade = makeFakeFacade();
+        facade.calculateTransactionFee = vi.fn(async () => { throw new Error('fee boom'); });
+        const recipe = { type: 'UNPROVEN_TRANSACTION', transaction: {} };
+
+        await expect(workerExports.feeOfDiscardedRecipe(facade, recipe, 'test-site')).rejects.toThrow('fee boom');
+        expect(facade.revert).toHaveBeenCalledWith(recipe);
+    });
+
+    it('revertRecipeBestEffort swallows revert failures with a warn (revert must never mask the original error)', async () => {
+        const facade = makeFakeFacade();
+        facade.revert = vi.fn(async () => { throw new Error('revert boom'); });
+
+        await expect(workerExports.revertRecipeBestEffort(facade, { recipe: true }, 'test-site')).resolves.toBeUndefined();
+        expect(warns().some(m => /test-site: recipe revert failed.*revert boom/.test(m))).toBe(true);
+    });
+
+    it('revertRecipeBestEffort no-ops on a missing recipe', async () => {
+        const facade = makeFakeFacade();
+        await workerExports.revertRecipeBestEffort(facade, undefined, 'test-site');
+        expect(facade.revert).not.toHaveBeenCalled();
+    });
+});
+
 // ---- buildWorkerWalletProvider: the 117 guard around balance/submit --------
 
 describe('buildWorkerWalletProvider', () => {
@@ -497,12 +545,26 @@ describe('buildWorkerWalletProvider', () => {
         }
     });
 
-    it('balanceTx FAILS FAST on an empty DustActions section instead of submitting a 117 candidate', async () => {
+    it('balanceTx FAILS FAST on an empty DustActions section instead of submitting a 117 candidate, and reverts the dead finalized tx', async () => {
         withSyncedIndexer();
         try {
-            const { entry } = makeEntry(DUST_EMPTY);
+            const { entry, facade, finalized } = makeEntry(DUST_EMPTY);
             const provider = workerExports.buildWorkerWalletProvider(entry);
             await expect(provider.balanceTx({})).rejects.toThrow(/EMPTY DustActions section.*117 NotNormalized/s);
+            expect(facade.revert).toHaveBeenCalledWith(finalized);
+        } finally {
+            vi.unstubAllGlobals();
+        }
+    });
+
+    it('balanceTx reverts the recipe when finalizeRecipe fails (base-tx coins would stay pending otherwise)', async () => {
+        withSyncedIndexer();
+        try {
+            const { entry, facade } = makeEntry(DUST_OK);
+            facade.finalizeRecipe = vi.fn(async () => { throw new Error('prove boom'); });
+            const provider = workerExports.buildWorkerWalletProvider(entry);
+            await expect(provider.balanceTx({})).rejects.toThrow('prove boom');
+            expect(facade.revert).toHaveBeenCalledWith({ recipe: true });
         } finally {
             vi.unstubAllGlobals();
         }
@@ -663,12 +725,43 @@ describe('buildSponsoredWalletProvider', () => {
         }
     });
 
-    it('balanceTx FAILS FAST when the sponsored tx still has an empty DustActions section', async () => {
+    it('balanceTx FAILS FAST when the sponsored tx still has an empty DustActions section, reverting BOTH facades', async () => {
         withSyncedIndexer();
         try {
-            const { caller, sponsor } = makePair(DUST_EMPTY);
+            const { caller, sponsor, callerFacade, sponsorFacade, callerFinalized, sponsorFinalized } = makePair(DUST_EMPTY);
             const provider = workerExports.buildSponsoredWalletProvider(caller, sponsor);
             await expect(provider.balanceTx({})).rejects.toThrow(/EMPTY DustActions section.*117 NotNormalized/s);
+            expect(sponsorFacade.revert).toHaveBeenCalledWith(sponsorFinalized);
+            expect(callerFacade.revert).toHaveBeenCalledWith(callerFinalized);
+        } finally {
+            vi.unstubAllGlobals();
+        }
+    });
+
+    it('balanceTx reverts the caller recipe when the caller-side sign/finalize fails and never reaches the sponsor', async () => {
+        withSyncedIndexer();
+        try {
+            const { caller, sponsor, callerFacade, sponsorFacade } = makePair();
+            callerFacade.finalizeRecipe = vi.fn(async () => { throw new Error('caller prove boom'); });
+            const provider = workerExports.buildSponsoredWalletProvider(caller, sponsor);
+            await expect(provider.balanceTx({})).rejects.toThrow('caller prove boom');
+            expect(callerFacade.revert).toHaveBeenCalledWith({ stage: 'caller-recipe' });
+            expect(sponsorFacade.balanceFinalizedTransaction).not.toHaveBeenCalled();
+            expect(sponsorFacade.revert).not.toHaveBeenCalled();
+        } finally {
+            vi.unstubAllGlobals();
+        }
+    });
+
+    it('balanceTx reverts the sponsor recipe AND the stranded caller-finalized tx when the sponsor-side finalize fails', async () => {
+        withSyncedIndexer();
+        try {
+            const { caller, sponsor, callerFacade, sponsorFacade, callerFinalized } = makePair();
+            sponsorFacade.finalizeRecipe = vi.fn(async () => { throw new Error('sponsor prove boom'); });
+            const provider = workerExports.buildSponsoredWalletProvider(caller, sponsor);
+            await expect(provider.balanceTx({})).rejects.toThrow('sponsor prove boom');
+            expect(sponsorFacade.revert).toHaveBeenCalledWith({ stage: 'sponsor-recipe' });
+            expect(callerFacade.revert).toHaveBeenCalledWith(callerFinalized);
         } finally {
             vi.unstubAllGlobals();
         }
@@ -681,6 +774,31 @@ describe('buildSponsoredWalletProvider', () => {
         expect(result).toEqual({ txId: '0xsponsored' });
         expect(sponsorFacade.submitTransaction).toHaveBeenCalledWith(sponsorFinalized);
         expect(callerFacade.submitTransaction).not.toHaveBeenCalled();
+        expect(callerFacade.revert).not.toHaveBeenCalled();
+    });
+
+    it('submitTx failure reverts the CALLER-finalized tx from the preceding balanceTx (SDK only reverts the sponsor facade)', async () => {
+        withSyncedIndexer();
+        try {
+            const { caller, sponsor, callerFacade, sponsorFacade, callerFinalized, sponsorFinalized } = makePair();
+            sponsorFacade.submitTransaction = vi.fn(async () => { throw new Error('relay boom'); });
+            const provider = workerExports.buildSponsoredWalletProvider(caller, sponsor);
+
+            await provider.balanceTx({});
+            await expect(provider.submitTx(sponsorFinalized)).rejects.toThrow('relay boom');
+            expect(callerFacade.revert).toHaveBeenCalledWith(callerFinalized);
+        } finally {
+            vi.unstubAllGlobals();
+        }
+    });
+
+    it('submitTx failure without a preceding balanceTx falls back to reverting the submitted tx on the caller facade', async () => {
+        const { caller, sponsor, callerFacade, sponsorFacade, sponsorFinalized } = makePair();
+        sponsorFacade.submitTransaction = vi.fn(async () => { throw new Error('relay boom'); });
+        const provider = workerExports.buildSponsoredWalletProvider(caller, sponsor);
+
+        await expect(provider.submitTx(sponsorFinalized)).rejects.toThrow('relay boom');
+        expect(callerFacade.revert).toHaveBeenCalledWith(sponsorFinalized);
     });
 });
 

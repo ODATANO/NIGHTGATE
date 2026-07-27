@@ -503,6 +503,45 @@ export function describeTxDust(tx: any): { summary: string; emptyDustActions: bo
     }
 }
 
+/**
+ * Best-effort revert of a built-but-never-submitted recipe (or finalized tx).
+ *
+ * SDK builds move the selected coins into the sub-wallets' `pendingUtxos` at
+ * BUILD time. A recipe that is discarded (fee estimate) or dies before a
+ * successful submit must be reverted, or those coins stay pending forever:
+ * there is no TTL reclaim for untracked builds, and the periodic state save
+ * persists the phantom spend across restarts (bug_002 Bug A). The facade's
+ * public `revert(txOrRecipe)` runs the same sequence as its internal error
+ * paths; sub-wallet rollbacks are keyed no-ops on absent entries, so
+ * overlapping with the SDK's own reverts (finalize/submit catch) is safe.
+ */
+export async function revertRecipeBestEffort(facade: any, txOrRecipe: any, site: string): Promise<void> {
+    if (!txOrRecipe) return;
+    try {
+        await facade.revert(txOrRecipe);
+    } catch (e) {
+        log('warn', `${site}: recipe revert failed (coins may stay pending until a fresh resync): ${formatErr(e)}`);
+    }
+}
+
+/**
+ * Fee of a recipe that exists only to be priced: computes the fee, then
+ * ALWAYS reverts the recipe (success and failure alike).
+ *
+ * Uses `calculateTransactionFee`, not `estimateTransactionFee`: the estimate
+ * variant re-runs the dust balancer's convergence loop (uncapped
+ * `Effect.iterate` under `Effect.runSync`) over the already fee-balanced tx
+ * and can pin the worker's event loop (bug_002 Bug B). On a balanced recipe
+ * `calculateFee` yields the fee that recipe actually pays, loop-free.
+ */
+export async function feeOfDiscardedRecipe(facade: any, recipe: any, site: string): Promise<bigint> {
+    try {
+        return await facade.calculateTransactionFee(recipe.transaction);
+    } finally {
+        await revertRecipeBestEffort(facade, recipe, site);
+    }
+}
+
 // Exported for the in-thread unit tests (wallet-worker-dispatch.test.ts):
 // the 117-guard around balanceTx/submitTx is OUR logic, not SDK choreography.
 export function buildWorkerWalletProvider(entry: FacadeEntry): any {
@@ -524,13 +563,25 @@ export function buildWorkerWalletProvider(entry: FacadeEntry): any {
                 { shieldedSecretKeys: entry.zswapKeys, dustSecretKey: entry.dustKey },
                 { ttl: effectiveTtl }
             );
-            const finalized = await entry.facade.finalizeRecipe(recipe);
+            let finalized: any;
+            try {
+                finalized = await entry.facade.finalizeRecipe(recipe);
+            } catch (e) {
+                // On prove failure the SDK reverts only the BALANCING tx of an
+                // UNBOUND recipe; the base tx's in-place unshielded spends
+                // would stay pending without this (bug_002 Bug A).
+                await revertRecipeBestEffort(entry.facade, recipe, 'balance');
+                throw e;
+            }
             const dust = describeTxDust(finalized);
             log('info', `balanced tx dust sections: ${dust.summary}`);
             if (dust.emptyDustActions) {
                 // The node would reject this as 1010/117 (NotNormalized). Fail
                 // here instead: saves the proof round and pins the root cause
                 // (balancer emitted an empty DustActions = fee evaluated to 0).
+                // The tx is finalized but will never be submitted: free its
+                // coins now instead of waiting for the pending-tx TTL reclaim.
+                await revertRecipeBestEffort(entry.facade, finalized, 'balance');
                 throw new Error(
                     'balanced transaction carries an EMPTY DustActions section ' +
                     '(node would reject it as 1010 Custom error: 117 NotNormalized). ' +
@@ -572,6 +623,13 @@ export function buildWorkerWalletProvider(entry: FacadeEntry): any {
  * Exported for the in-thread unit tests, like buildWorkerWalletProvider.
  */
 export function buildSponsoredWalletProvider(caller: FacadeEntry, sponsor: FacadeEntry): any {
+    // The caller-side finalized tx of the LAST successful balanceTx. Kept so
+    // a submit failure can revert the CALLER facade too: the SDK's
+    // submitTransaction error path reverts only the facade it ran on (the
+    // sponsor), while the caller's spends were pended by phase 1 (bug_002).
+    // One slot is enough: providers are built per submission and submits
+    // serialize per facade.
+    let lastCallerFinalized: any;
     return {
         getCoinPublicKey(): string { return caller.zswapKeys.coinPublicKey; },
         getEncryptionPublicKey(): string { return caller.zswapKeys.encryptionPublicKey; },
@@ -598,27 +656,52 @@ export function buildSponsoredWalletProvider(caller: FacadeEntry, sponsor: Facad
                 { ttl: effectiveTtl, tokenKindsToBalance: ['shielded', 'unshielded'] }
             );
             const callerSign = (payload: Uint8Array) => caller.unshieldedKeystore.signData(payload);
-            const signed = await caller.facade.signRecipe(recipe, callerSign);
-            const callerFinalized = await caller.facade.finalizeRecipe(signed);
-
-            const sponsorRecipe = await sponsor.facade.balanceFinalizedTransaction(
-                callerFinalized,
-                { shieldedSecretKeys: sponsor.zswapKeys, dustSecretKey: sponsor.dustKey },
-                { ttl: effectiveTtl, tokenKindsToBalance: ['dust'] }
-            );
-            const finalized = await sponsor.facade.finalizeRecipe(sponsorRecipe);
-
-            const dust = describeTxDust(finalized);
-            log('info', `sponsored balanced tx dust sections: ${dust.summary}`);
-            if (dust.emptyDustActions) {
-                throw new Error(
-                    'sponsored balanced transaction carries an EMPTY DustActions section ' +
-                    '(node would reject it as 1010 Custom error: 117 NotNormalized). ' +
-                    `The sponsor's dust balancer produced an empty recipe, i.e. the computed ` +
-                    `fee was 0. Dust sections: ${dust.summary}`
-                );
+            let callerFinalized: any;
+            try {
+                const signed = await caller.facade.signRecipe(recipe, callerSign);
+                callerFinalized = await caller.facade.finalizeRecipe(signed);
+            } catch (e) {
+                // Sign failures are not covered by any SDK revert, and prove
+                // failures revert only the balancing part of an UNBOUND recipe
+                // (bug_002 Bug A). Reverting the unsigned recipe is fine: the
+                // rollback matches by UTxO, not object identity.
+                await revertRecipeBestEffort(caller.facade, recipe, 'sponsored-balance caller');
+                throw e;
             }
-            return finalized;
+
+            try {
+                const sponsorRecipe = await sponsor.facade.balanceFinalizedTransaction(
+                    callerFinalized,
+                    { shieldedSecretKeys: sponsor.zswapKeys, dustSecretKey: sponsor.dustKey },
+                    { ttl: effectiveTtl, tokenKindsToBalance: ['dust'] }
+                );
+                let finalized: any;
+                try {
+                    finalized = await sponsor.facade.finalizeRecipe(sponsorRecipe);
+                } catch (e) {
+                    await revertRecipeBestEffort(sponsor.facade, sponsorRecipe, 'sponsored-balance sponsor');
+                    throw e;
+                }
+
+                const dust = describeTxDust(finalized);
+                log('info', `sponsored balanced tx dust sections: ${dust.summary}`);
+                if (dust.emptyDustActions) {
+                    await revertRecipeBestEffort(sponsor.facade, finalized, 'sponsored-balance sponsor');
+                    throw new Error(
+                        'sponsored balanced transaction carries an EMPTY DustActions section ' +
+                        '(node would reject it as 1010 Custom error: 117 NotNormalized). ' +
+                        `The sponsor's dust balancer produced an empty recipe, i.e. the computed ` +
+                        `fee was 0. Dust sections: ${dust.summary}`
+                    );
+                }
+                lastCallerFinalized = callerFinalized;
+                return finalized;
+            } catch (e) {
+                // The caller-side finalized tx will never be submitted; free
+                // its coins now instead of waiting for the TTL reclaim.
+                await revertRecipeBestEffort(caller.facade, callerFinalized, 'sponsored-balance caller');
+                throw e;
+            }
         },
         async submitTx(tx: any): Promise<any> {
             const dust = describeTxDust(tx);
@@ -626,7 +709,19 @@ export function buildSponsoredWalletProvider(caller: FacadeEntry, sponsor: Facad
             if (dust.emptyDustActions) {
                 log('warn', `pre-submit sponsored tx has an EMPTY DustActions section (node rejects as 1010/117 NotNormalized): ${dust.summary}`);
             }
-            return sponsor.facade.submitTransaction(tx);
+            try {
+                const result = await sponsor.facade.submitTransaction(tx);
+                lastCallerFinalized = undefined;
+                return result;
+            } catch (e) {
+                // The SDK reverted the SPONSOR facade; the caller's phase-1
+                // spends stay pending without this (bug_002). Safe either
+                // way: if the tx did land, sync reconciles and a retry is
+                // rejected by the node; if it did not, the retry works.
+                await revertRecipeBestEffort(caller.facade, lastCallerFinalized ?? tx, 'sponsored-submit caller');
+                lastCallerFinalized = undefined;
+                throw e;
+            }
         }
     };
 }
@@ -1499,9 +1594,10 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
     /**
      * Pre-flight fee estimate for a NIGHT transfer. Builds the
      * `transferTransaction` recipe in the worker (which runs balancing
-     * (lightweight) but NOT proof generation (heavy)), then calls
-     * `estimateTransactionFee` to compute total fee including any
-     * balancing tx. No submit. The recipe is discarded.
+     * (lightweight) but NOT proof generation (heavy)), then prices the
+     * balanced recipe via `calculateTransactionFee`. No submit. The recipe
+     * is discarded AND reverted, so the coins the build moved into
+     * `pendingUtxos` become spendable again (bug_002).
      */
     async estimateTransferFee({ sessionId, receiverAddress, amount, ttlIso, syncTimeoutMs }: {
         sessionId: string;
@@ -1539,14 +1635,14 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
             { ttl }
         );
         // recipe is UnprovenTransactionRecipe: { type: 'UNPROVEN_TRANSACTION', transaction }
-        const fee: bigint = await entry.facade.estimateTransactionFee(recipe.transaction, entry.dustKey, { ttl });
+        const fee = await feeOfDiscardedRecipe(entry.facade, recipe, 'estimateTransferFee');
         return { fee: fee.toString(), toLedger: receiver.kind };
     },
 
     /**
      * Pre-flight fee estimate for a shield/unshield ledger shift. Same
      * approach as `estimateTransferFee`: build the `initSwap` recipe,
-     * estimate, discard.
+     * price it, revert it.
      *
      * `direction`: 'shield' means unshielded → shielded; 'unshield' means
      * shielded → unshielded. Always operates on the wallet's own NIGHT.
@@ -1595,7 +1691,7 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
             { shieldedSecretKeys: entry.zswapKeys, dustSecretKey: entry.dustKey },
             { ttl, payFees: true }
         );
-        const fee: bigint = await entry.facade.estimateTransactionFee(recipe.transaction, entry.dustKey, { ttl });
+        const fee = await feeOfDiscardedRecipe(entry.facade, recipe, 'estimateSwapFee');
         return { fee: fee.toString(), direction };
     },
 
