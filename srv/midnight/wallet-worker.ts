@@ -1335,7 +1335,8 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
      * decides the destination ledger (`mn_shield-addr_` → shielded,
      * `mn_addr_` → unshielded). Source funds are selected by the SDK's
      * balancer from the wallet's available UTXOs on the target ledger;
-     * cross-ledger funding is not attempted here (use shield/unshieldFunds).
+     * cross-ledger funding is not attempted (NIGHT is unshielded-only,
+     * there is no shield/unshield conversion in the protocol).
      *
      * Build + balance + prove + submit all in-worker via `facade.transferTransaction`.
      * Returns primitives only; no SDK objects cross the thread boundary.
@@ -1397,141 +1398,6 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
             toLedger: receiver.kind,
             amount: amount,
             receiverAddress: receiverAddress
-        };
-    },
-
-    /**
-     * Move NIGHT from shielded → unshielded ledger (own funds only).
-     *
-     * Built via `facade.initSwap`, the SDK's primitive for explicit
-     * cross-ledger conversion. `desiredInputs` names the source ledger
-     * + token + amount; `desiredOutputs` names the destination ledger
-     * with the wallet's own unshielded address as receiver.
-     *
-     * For 1:1 self-swaps (no value change, just ledger shift), the same
-     * NIGHT raw type and amount appear on both sides.
-     */
-    async unshieldNight({ sessionId, amount, ttlIso, syncTimeoutMs }: {
-        sessionId: string;
-        amount: string;
-        ttlIso?: string;
-        syncTimeoutMs?: number;
-    }) {
-        const entry = facades.get(sessionId);
-        if (!entry) throw new Error(`No facade for sessionId=${sessionId.slice(0, 16)}`);
-        const sdk = await loadSdk();
-        await ensureNetworkId(entry.networkId, sdk);
-
-        log('info', `unshield: waiting for synced state...`);
-        if (syncTimeoutMs) {
-            await Promise.race([
-                entry.facade.waitForSyncedState(),
-                new Promise<never>((_, rej) => setTimeout(() => rej(new Error('unshield: sync timeout')), syncTimeoutMs))
-            ]);
-        } else {
-            await entry.facade.waitForSyncedState();
-        }
-        log('info', `unshield: synced.`);
-
-        const ownUnshieldedAddr: AddressFormat.UnshieldedAddress = await entry.facade.unshielded.getAddress();
-        const ownUnshieldedAddrStr = await encodeAddressString(ownUnshieldedAddr, entry.networkId);
-        const amountBig = BigInt(amount);
-        const nightRawType: string = sdk.ledger.nativeToken().raw;
-        const ttl = ttlIso ? new Date(ttlIso) : new Date(Date.now() + 10 * 60 * 1000);
-
-        const desiredInputs: { shielded: Record<string, bigint> } = {
-            shielded: { [nightRawType]: amountBig }
-        };
-        const desiredOutputs: any[] = [
-            { type: 'unshielded', outputs: [{ type: nightRawType, receiverAddress: ownUnshieldedAddr, amount: amountBig }] }
-        ];
-
-        log('info', `unshield: ${amount} NIGHT → own unshielded addr ${ownUnshieldedAddrStr.slice(0, 24)}...`);
-
-        const recipe = await entry.facade.initSwap(
-            desiredInputs,
-            desiredOutputs,
-            { shieldedSecretKeys: entry.zswapKeys, dustSecretKey: entry.dustKey },
-            { ttl, payFees: true }
-        );
-        // Sign unshielded inputs (see transferNight; error 192 otherwise).
-        // The unshield direction has shielded inputs only, but the balancer may
-        // still pull unshielded UTXOs for fees; signRecipe is a no-op if not.
-        const signFn = (payload: Uint8Array) => entry.unshieldedKeystore.signData(payload);
-        const signed = await entry.facade.signRecipe(recipe, signFn);
-        const finalized = await entry.facade.finalizeRecipe(signed);
-        const txId = await entry.facade.submitTransaction(finalized);
-
-        log('info', `unshield: submitted, txId=${String(txId).slice(0, 16)}...`);
-
-        return {
-            txId: String(txId),
-            amount: amount,
-            unshieldedReceiverAddress: ownUnshieldedAddrStr
-        };
-    },
-
-    /**
-     * Move NIGHT from unshielded → shielded ledger (own funds only).
-     * Symmetric counterpart to `unshieldNight`. Same `initSwap` mechanism,
-     * source/destination flipped.
-     */
-    async shieldNight({ sessionId, amount, ttlIso, syncTimeoutMs }: {
-        sessionId: string;
-        amount: string;
-        ttlIso?: string;
-        syncTimeoutMs?: number;
-    }) {
-        const entry = facades.get(sessionId);
-        if (!entry) throw new Error(`No facade for sessionId=${sessionId.slice(0, 16)}`);
-        const sdk = await loadSdk();
-        await ensureNetworkId(entry.networkId, sdk);
-
-        log('info', `shield: waiting for synced state...`);
-        if (syncTimeoutMs) {
-            await Promise.race([
-                entry.facade.waitForSyncedState(),
-                new Promise<never>((_, rej) => setTimeout(() => rej(new Error('shield: sync timeout')), syncTimeoutMs))
-            ]);
-        } else {
-            await entry.facade.waitForSyncedState();
-        }
-        log('info', `shield: synced.`);
-
-        const ownShieldedAddr: AddressFormat.ShieldedAddress = await entry.facade.shielded.getAddress();
-        const ownShieldedAddrStr = await encodeAddressString(ownShieldedAddr, entry.networkId);
-        const amountBig = BigInt(amount);
-        const nightRawType: string = sdk.ledger.nativeToken().raw;
-        const ttl = ttlIso ? new Date(ttlIso) : new Date(Date.now() + 10 * 60 * 1000);
-
-        const desiredInputs: { unshielded: Record<string, bigint> } = {
-            unshielded: { [nightRawType]: amountBig }
-        };
-        const desiredOutputs: any[] = [
-            { type: 'shielded', outputs: [{ type: nightRawType, receiverAddress: ownShieldedAddr, amount: amountBig }] }
-        ];
-
-        log('info', `shield: ${amount} NIGHT → own shielded addr ${ownShieldedAddrStr.slice(0, 24)}...`);
-
-        const recipe = await entry.facade.initSwap(
-            desiredInputs,
-            desiredOutputs,
-            { shieldedSecretKeys: entry.zswapKeys, dustSecretKey: entry.dustKey },
-            { ttl, payFees: true }
-        );
-        // Sign unshielded inputs (see transferNight; error 192 otherwise). The
-        // shield direction spends unshielded UTXOs, so this is REQUIRED here.
-        const signFn = (payload: Uint8Array) => entry.unshieldedKeystore.signData(payload);
-        const signed = await entry.facade.signRecipe(recipe, signFn);
-        const finalized = await entry.facade.finalizeRecipe(signed);
-        const txId = await entry.facade.submitTransaction(finalized);
-
-        log('info', `shield: submitted, txId=${String(txId).slice(0, 16)}...`);
-
-        return {
-            txId: String(txId),
-            amount: amount,
-            shieldedReceiverAddress: ownShieldedAddrStr
         };
     },
 
@@ -1637,62 +1503,6 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
         // recipe is UnprovenTransactionRecipe: { type: 'UNPROVEN_TRANSACTION', transaction }
         const fee = await feeOfDiscardedRecipe(entry.facade, recipe, 'estimateTransferFee');
         return { fee: fee.toString(), toLedger: receiver.kind };
-    },
-
-    /**
-     * Pre-flight fee estimate for a shield/unshield ledger shift. Same
-     * approach as `estimateTransferFee`: build the `initSwap` recipe,
-     * price it, revert it.
-     *
-     * `direction`: 'shield' means unshielded → shielded; 'unshield' means
-     * shielded → unshielded. Always operates on the wallet's own NIGHT.
-     */
-    async estimateSwapFee({ sessionId, direction, amount, ttlIso, syncTimeoutMs }: {
-        sessionId: string;
-        direction: 'shield' | 'unshield';
-        amount: string;
-        ttlIso?: string;
-        syncTimeoutMs?: number;
-    }) {
-        const entry = facades.get(sessionId);
-        if (!entry) throw new Error(`No facade for sessionId=${sessionId.slice(0, 16)}`);
-        const sdk = await loadSdk();
-        await ensureNetworkId(entry.networkId, sdk);
-
-        if (syncTimeoutMs) {
-            await Promise.race([
-                entry.facade.waitForSyncedState(),
-                new Promise<never>((_, rej) => setTimeout(() => rej(new Error('estimateSwapFee: sync timeout')), syncTimeoutMs))
-            ]);
-        } else {
-            await entry.facade.waitForSyncedState();
-        }
-
-        const amountBig = BigInt(amount);
-        const nightRawType: string = sdk.ledger.nativeToken().raw;
-        const ttl = ttlIso ? new Date(ttlIso) : new Date(Date.now() + 10 * 60 * 1000);
-
-        let desiredInputs: { shielded?: Record<string, bigint>; unshielded?: Record<string, bigint> };
-        let desiredOutputs: any[];
-
-        if (direction === 'shield') {
-            const ownShieldedAddr: AddressFormat.ShieldedAddress = await entry.facade.shielded.getAddress();
-            desiredInputs = { unshielded: { [nightRawType]: amountBig } };
-            desiredOutputs = [{ type: 'shielded', outputs: [{ type: nightRawType, receiverAddress: ownShieldedAddr, amount: amountBig }] }];
-        } else {
-            const ownUnshieldedAddr: AddressFormat.UnshieldedAddress = await entry.facade.unshielded.getAddress();
-            desiredInputs = { shielded: { [nightRawType]: amountBig } };
-            desiredOutputs = [{ type: 'unshielded', outputs: [{ type: nightRawType, receiverAddress: ownUnshieldedAddr, amount: amountBig }] }];
-        }
-
-        const recipe = await entry.facade.initSwap(
-            desiredInputs,
-            desiredOutputs,
-            { shieldedSecretKeys: entry.zswapKeys, dustSecretKey: entry.dustKey },
-            { ttl, payFees: true }
-        );
-        const fee = await feeOfDiscardedRecipe(entry.facade, recipe, 'estimateSwapFee');
-        return { fee: fee.toString(), direction };
     },
 
     /**
@@ -1974,7 +1784,7 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
 const SUBMIT_METHODS = new Set([
     'deployContract', 'submitContractCall', 'submitContractCallBatch',
     'registerDustGeneration', 'deregisterDustGeneration',
-    'transferNight', 'unshieldNight', 'shieldNight'
+    'transferNight'
 ]);
 
 const sessionChains = new Map<string, Promise<unknown>>();

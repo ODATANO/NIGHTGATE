@@ -16,12 +16,8 @@ import { registerNightUtxosForDust, deregisterNightUtxosFromDust } from '../subm
 const log = cds.log('nightgate:sessions');
 import {
     sendNight,
-    unshieldFunds,
-    shieldFunds,
     getWalletBalance,
-    estimateSendNightFee,
-    estimateUnshieldFee,
-    estimateShieldFee
+    estimateSendNightFee
 } from '../submission/token-ops';
 import { ensureNetworkId } from '../midnight/providers';
 import { getOrBuildWalletFacade } from '../submission/wallet-facade-builder';
@@ -96,13 +92,6 @@ const sendRateLimiter = new RateLimiter({
     maxRequests: 10
 });
 
-const swapRateLimiter = new RateLimiter({
-    // Cross-ledger shield/unshield is heavier (more ZK work) so a tighter
-    // bound than ordinary transfers.
-    windowMs: 5 * 60 * 1000,
-    maxRequests: 5
-});
-
 const diagnosticsRateLimiter = new RateLimiter({
     // Read-only ops; generous limit since these inform UI and should be
     // pollable. Still bounded to prevent abuse.
@@ -116,21 +105,17 @@ type WalletCommand =
     | { op: 'prewarm' }
     | { op: 'registerDust'; dustReceiverAddress?: string }
     | { op: 'deregisterDust'; sponsorSessionId?: string }
-    | { op: 'sendNight'; receiverAddress: string; amount: string; ttlIso?: string }
-    | { op: 'unshield'; amount: string; ttlIso?: string }
-    | { op: 'shield'; amount: string; ttlIso?: string };
+    | { op: 'sendNight'; receiverAddress: string; amount: string; ttlIso?: string };
 
 const WALLET_COMMAND_KINDS = [
     'connectWalletForSigning', 'registerForDustGeneration', 'deregisterFromDustGeneration',
-    'sendNight', 'unshieldFunds', 'shieldFunds'
+    'sendNight'
 ] as const;
 const EXPECTED_WALLET_OP: Record<string, WalletCommand['op']> = {
     connectWalletForSigning: 'prewarm',
     registerForDustGeneration: 'registerDust',
     deregisterFromDustGeneration: 'deregisterDust',
-    sendNight: 'sendNight',
-    unshieldFunds: 'unshield',
-    shieldFunds: 'shield'
+    sendNight: 'sendNight'
 };
 
 async function executeWalletCommand(raw: unknown, job: BackgroundJobRow, db: any): Promise<unknown> {
@@ -192,16 +177,6 @@ async function executeWalletCommand(raw: unknown, job: BackgroundJobRow, db: any
         const result = await sendNight({ cacheKey: accountId, receiverAddress: command.receiverAddress, amount: command.amount, ttlIso: command.ttlIso });
         return { txId: result.txId, toLedger: result.toLedger, amount: result.amount, receiverAddress: result.receiverAddress };
     }
-    if (command.op === 'unshield') {
-        await reportExternalExecution({});
-        const result = await unshieldFunds({ cacheKey: accountId, amount: command.amount, ttlIso: command.ttlIso });
-        return { txId: result.txId, amount: result.amount, unshieldedReceiverAddress: result.unshieldedReceiverAddress };
-    }
-    if (command.op === 'shield') {
-        await reportExternalExecution({});
-        const result = await shieldFunds({ cacheKey: accountId, amount: command.amount, ttlIso: command.ttlIso });
-        return { txId: result.txId, amount: result.amount, shieldedReceiverAddress: result.shieldedReceiverAddress };
-    }
     throw new Error(`Unsupported wallet command operation: ${(command as any).op}`);
 }
 
@@ -222,7 +197,7 @@ function rejectIfMainnetBlocked(req: Request): boolean {
  * Parse a NIGHT-atom decimal string into a bigint, returning a discriminator
  * either `{ ok: true, value }` for the parsed value or `{ ok: false, msg }`
  * with a user-facing error message. Encapsulates the validation rules
- * shared between sendNight / shieldFunds / unshieldFunds handlers.
+ * for the sendNight handler.
  */
 function parseNightAmount(raw: string | undefined): { ok: true; value: bigint } | { ok: false; msg: string } {
     if (!raw) return { ok: false, msg: 'amount is required' };
@@ -790,94 +765,6 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
         });
     });
 
-    srv.on('unshieldFunds', async (req: Request) => {
-        if (rejectIfMainnetBlocked(req)) return;
-        const userId = requireUserId(req);
-        if (!userId) return;
-        const clientKey = (req as any)?._.req?.ip || 'global';
-        const rate = swapRateLimiter.check(clientKey);
-        if (!rate.allowed) {
-            return req.reject(429, `Rate limited. Retry after ${Math.ceil(rate.retryAfterMs / 1000)}s`);
-        }
-
-        const { sessionId, amount, ttlIso, idempotencyKey } = req.data as {
-            sessionId: string;
-            amount: string;
-            ttlIso?: string;
-            idempotencyKey?: string;
-        };
-
-        if (!sessionId) return req.reject(400, 'sessionId is required');
-        const amountCheck = parseNightAmount(amount);
-        if (!amountCheck.ok) return req.reject(400, amountCheck.msg);
-        const ttlErr = validateOptionalTtl(ttlIso);
-        if (ttlErr) return req.reject(400, ttlErr);
-
-        const session = await db.run(
-            SELECT.one.from(WalletSessions).where({ sessionId, isActive: true, userId })
-        );
-        if (!session) return req.reject(404, 'Session not found or inactive');
-        if (!session.encryptedViewingKey) return req.reject(404, 'Session has no viewing key');
-        if (!session.encryptedSeedKey) return req.reject(412, 'Session has no signing key. Call connectWalletForSigning first.');
-        if (session.expiresAt && new Date(session.expiresAt) < new Date()) {
-            return req.reject(410, 'Session expired');
-        }
-
-        return startJob({
-            kind: 'unshieldFunds',
-            sessionId,
-            idempotencyKey,
-            request: { sessionId, amount, ttlIso: ttlIso || null },
-            requestedBy: userId,
-            commandVersion: 1,
-            command: { op: 'unshield', amount, ttlIso }
-        });
-    });
-
-    srv.on('shieldFunds', async (req: Request) => {
-        if (rejectIfMainnetBlocked(req)) return;
-        const userId = requireUserId(req);
-        if (!userId) return;
-        const clientKey = (req as any)?._.req?.ip || 'global';
-        const rate = swapRateLimiter.check(clientKey);
-        if (!rate.allowed) {
-            return req.reject(429, `Rate limited. Retry after ${Math.ceil(rate.retryAfterMs / 1000)}s`);
-        }
-
-        const { sessionId, amount, ttlIso, idempotencyKey } = req.data as {
-            sessionId: string;
-            amount: string;
-            ttlIso?: string;
-            idempotencyKey?: string;
-        };
-
-        if (!sessionId) return req.reject(400, 'sessionId is required');
-        const amountCheck = parseNightAmount(amount);
-        if (!amountCheck.ok) return req.reject(400, amountCheck.msg);
-        const ttlErr = validateOptionalTtl(ttlIso);
-        if (ttlErr) return req.reject(400, ttlErr);
-
-        const session = await db.run(
-            SELECT.one.from(WalletSessions).where({ sessionId, isActive: true, userId })
-        );
-        if (!session) return req.reject(404, 'Session not found or inactive');
-        if (!session.encryptedViewingKey) return req.reject(404, 'Session has no viewing key');
-        if (!session.encryptedSeedKey) return req.reject(412, 'Session has no signing key. Call connectWalletForSigning first.');
-        if (session.expiresAt && new Date(session.expiresAt) < new Date()) {
-            return req.reject(410, 'Session expired');
-        }
-
-        return startJob({
-            kind: 'shieldFunds',
-            sessionId,
-            idempotencyKey,
-            request: { sessionId, amount, ttlIso: ttlIso || null },
-            requestedBy: userId,
-            commandVersion: 1,
-            command: { op: 'shield', amount, ttlIso }
-        });
-    });
-
     srv.on('getWalletBalance', async (req: Request) => {
         const userId = requireUserId(req);
         if (!userId) return;
@@ -944,43 +831,6 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
         }
     });
 
-    // ---- estimateUnshieldFee + estimateShieldFee (symmetric swap pre-flight)
-
-    type SwapEstimateData = { sessionId: string; amount: string; ttlIso?: string };
-
-    async function handleSwapEstimate(
-        req: Request,
-        direction: 'shield' | 'unshield',
-        invoke: (args: { cacheKey: string; amount: string; ttlIso?: string; syncTimeoutMs?: number }) => Promise<{ fee: string; direction: 'shield' | 'unshield' }>
-    ) {
-        const clientKey = (req as any)?._.req?.ip || 'global';
-        const rate = diagnosticsRateLimiter.check(clientKey);
-        if (!rate.allowed) {
-            return req.reject(429, `Rate limited. Retry after ${Math.ceil(rate.retryAfterMs / 1000)}s`);
-        }
-
-        const userId = requireUserId(req);
-        if (!userId) return;
-
-        const { sessionId, amount, ttlIso } = req.data as SwapEstimateData;
-        if (!sessionId) return req.reject(400, 'sessionId is required');
-        const amountCheck = parseNightAmount(amount);
-        if (!amountCheck.ok) return req.reject(400, amountCheck.msg);
-        const ttlErr = validateOptionalTtl(ttlIso);
-        if (ttlErr) return req.reject(400, ttlErr);
-
-        const sess = await loadSigningSessionAccountId(db, sessionId, userId);
-        if (!sess.ok) return req.reject(sess.status, sess.msg);
-
-        try {
-            return await invoke({ cacheKey: sess.accountId, amount, ttlIso, syncTimeoutMs: readSyncTimeoutMs() });
-        } catch (err) {
-            return rejectWorkerReadError(req, `estimate${direction === 'shield' ? 'Shield' : 'Unshield'}Fee`, err);
-        }
-    }
-
-    srv.on('estimateUnshieldFee', req => handleSwapEstimate(req, 'unshield', estimateUnshieldFee));
-    srv.on('estimateShieldFee', req => handleSwapEstimate(req, 'shield', estimateShieldFee));
 }
 
 /**

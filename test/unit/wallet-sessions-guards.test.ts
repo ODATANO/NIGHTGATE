@@ -6,7 +6,7 @@
  *   - the deriveWalletInfo HANDLER (rate limit, auth, validation, and the
  *     "error paths never echo the secret" guarantee; the util itself is
  *     covered in wallet-info.test.ts)
- *   - the shared per-action guards on sendNight / unshieldFunds / shieldFunds
+ *   - the shared per-action guards on sendNight
  *     (mainnet gate, 401/429, sessionId+amount+ttl validation, session ladder
  *     404/404/412/410, decrypt failure 500)
  *   - the diagnostics handlers' guards + 500 wrapping
@@ -50,8 +50,6 @@ const mockGetOrBuildWalletFacade = vi.hoisted(() => (vi.fn()));
 const mockDeriveAccountId = vi.hoisted(() => (vi.fn()));
 const mockGetWalletBalance = vi.hoisted(() => (vi.fn()));
 const mockEstimateSendNightFee = vi.hoisted(() => (vi.fn()));
-const mockEstimateUnshieldFee = vi.hoisted(() => (vi.fn()));
-const mockEstimateShieldFee = vi.hoisted(() => (vi.fn()));
 const mockDeriveWalletInfoUtil = vi.hoisted(() => (vi.fn()));
 const mockResolveBip39SeedHex = vi.hoisted(() => (vi.fn()));
 
@@ -72,12 +70,8 @@ vi.mock('../../srv/submission/dust-registration', () => ({
 }));
 vi.mock('../../srv/submission/token-ops', () => ({
     sendNight: vi.fn(),
-    unshieldFunds: vi.fn(),
-    shieldFunds: vi.fn(),
     getWalletBalance: mockGetWalletBalance,
-    estimateSendNightFee: mockEstimateSendNightFee,
-    estimateUnshieldFee: mockEstimateUnshieldFee,
-    estimateShieldFee: mockEstimateShieldFee
+    estimateSendNightFee: mockEstimateSendNightFee
 }));
 vi.mock('../../srv/midnight/providers', () => ({
     ensureNetworkId: vi.fn(async () => undefined)
@@ -225,13 +219,11 @@ describe('wallet session guard branches', () => {
     });
 
     // ------------------------------------------------------------------
-    // Token-op rejection ladder (sendNight / unshieldFunds / shieldFunds)
+    // Token-op rejection ladder (sendNight)
     // ------------------------------------------------------------------
 
     const OPS: Array<{ op: string; base: Record<string, unknown> }> = [
-        { op: 'sendNight', base: { sessionId: 'sess-1', receiverAddress: 'mn_addr_' + 'x'.repeat(60), amount: '1000' } },
-        { op: 'unshieldFunds', base: { sessionId: 'sess-1', amount: '1000' } },
-        { op: 'shieldFunds', base: { sessionId: 'sess-1', amount: '1000' } }
+        { op: 'sendNight', base: { sessionId: 'sess-1', receiverAddress: 'mn_addr_' + 'x'.repeat(60), amount: '1000' } }
     ];
 
     describe.each(OPS)('$op guards', ({ op, base }) => {
@@ -350,9 +342,7 @@ describe('wallet session guard branches', () => {
 
     const DIAG: Array<{ op: string; base: Record<string, unknown>; util: () => any }> = [
         { op: 'getWalletBalance', base: { sessionId: 'sess-1' }, util: () => mockGetWalletBalance },
-        { op: 'estimateSendNightFee', base: { sessionId: 'sess-1', receiverAddress: 'mn_shield-addr_' + 'x'.repeat(60), amount: '5' }, util: () => mockEstimateSendNightFee },
-        { op: 'estimateUnshieldFee', base: { sessionId: 'sess-1', amount: '5' }, util: () => mockEstimateUnshieldFee },
-        { op: 'estimateShieldFee', base: { sessionId: 'sess-1', amount: '5' }, util: () => mockEstimateShieldFee }
+        { op: 'estimateSendNightFee', base: { sessionId: 'sess-1', receiverAddress: 'mn_shield-addr_' + 'x'.repeat(60), amount: '5' }, util: () => mockEstimateSendNightFee }
     ];
 
     describe.each(DIAG)('$op guards', ({ op, base, util }) => {

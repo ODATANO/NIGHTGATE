@@ -1,17 +1,14 @@
 /**
  * Token operations: thin wrappers around the wallet-worker RPCs backing the
- * OData `sendNight` / `shieldFunds` / `unshieldFunds` actions, translating the
+ * OData `sendNight` action and wallet diagnostics, translating the
  * user-facing shape to the worker's primitive RPC contract. The worker owns the
  * wallet facade; the main thread only orchestrates.
  */
 
 import {
     walletTransferNight,
-    walletUnshieldNight,
-    walletShieldNight,
     walletGetBalance,
-    walletEstimateTransferFee,
-    walletEstimateSwapFee
+    walletEstimateTransferFee
 } from '../midnight/wallet-worker-client';
 
 // ---- sendNight ------------------------------------------------------------
@@ -43,56 +40,6 @@ export async function sendNight(args: SendNightArgs): Promise<SendNightResult> {
         amount:          args.amount,
         ttlIso:          args.ttlIso,
         syncTimeoutMs:   args.syncTimeoutMs
-    });
-}
-
-// ---- unshieldFunds --------------------------------------------------------
-
-export interface UnshieldFundsArgs {
-    cacheKey: string;
-    amount: string;
-    ttlIso?: string;
-    syncTimeoutMs?: number;
-}
-
-export interface UnshieldFundsResult {
-    txId: string;
-    amount: string;
-    /** The wallet's own unshielded address (Bech32m) where the funds landed. */
-    unshieldedReceiverAddress: string;
-}
-
-export async function unshieldFunds(args: UnshieldFundsArgs): Promise<UnshieldFundsResult> {
-    return walletUnshieldNight({
-        sessionId:     args.cacheKey,
-        amount:        args.amount,
-        ttlIso:        args.ttlIso,
-        syncTimeoutMs: args.syncTimeoutMs
-    });
-}
-
-// ---- shieldFunds (symmetric counterpart) ----------------------------------
-
-export interface ShieldFundsArgs {
-    cacheKey: string;
-    amount: string;
-    ttlIso?: string;
-    syncTimeoutMs?: number;
-}
-
-export interface ShieldFundsResult {
-    txId: string;
-    amount: string;
-    /** The wallet's own shielded address (Bech32m) where the funds landed. */
-    shieldedReceiverAddress: string;
-}
-
-export async function shieldFunds(args: ShieldFundsArgs): Promise<ShieldFundsResult> {
-    return walletShieldNight({
-        sessionId:     args.cacheKey,
-        amount:        args.amount,
-        ttlIso:        args.ttlIso,
-        syncTimeoutMs: args.syncTimeoutMs
     });
 }
 
@@ -147,38 +94,5 @@ export async function estimateSendNightFee(args: EstimateSendNightFeeArgs): Prom
         amount:          args.amount,
         ttlIso:          args.ttlIso,
         syncTimeoutMs:   args.syncTimeoutMs
-    });
-}
-
-export interface EstimateSwapFeeArgs {
-    cacheKey: string;
-    amount: string;
-    ttlIso?: string;
-    syncTimeoutMs?: number;
-}
-
-export interface EstimateSwapFeeResult {
-    /** Dust atoms as decimal string. */
-    fee: string;
-    direction: 'shield' | 'unshield';
-}
-
-export async function estimateUnshieldFee(args: EstimateSwapFeeArgs): Promise<EstimateSwapFeeResult> {
-    return walletEstimateSwapFee({
-        sessionId:     args.cacheKey,
-        direction:     'unshield',
-        amount:        args.amount,
-        ttlIso:        args.ttlIso,
-        syncTimeoutMs: args.syncTimeoutMs
-    });
-}
-
-export async function estimateShieldFee(args: EstimateSwapFeeArgs): Promise<EstimateSwapFeeResult> {
-    return walletEstimateSwapFee({
-        sessionId:     args.cacheKey,
-        direction:     'shield',
-        amount:        args.amount,
-        ttlIso:        args.ttlIso,
-        syncTimeoutMs: args.syncTimeoutMs
     });
 }

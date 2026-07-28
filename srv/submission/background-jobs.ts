@@ -57,8 +57,6 @@ const HEAVY_KINDS: ReadonlySet<string> = new Set([
     'registerForDustGeneration',
     'deregisterFromDustGeneration',
     'sendNight',
-    'shieldFunds',
-    'unshieldFunds',
     'deployContract',
     'submitContractCallBatch',
     'submitContractCall',

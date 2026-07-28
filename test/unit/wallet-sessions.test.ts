@@ -63,12 +63,8 @@ const mockDeriveStoragePassword = vi.hoisted(() => (vi.fn()));
 const mockRegisterNightUtxosForDust = vi.hoisted(() => (vi.fn()));
 const mockDeregisterNightUtxosFromDust = vi.hoisted(() => (vi.fn()));
 const mockSendNight = vi.hoisted(() => (vi.fn()));
-const mockUnshieldFunds = vi.hoisted(() => (vi.fn()));
-const mockShieldFunds = vi.hoisted(() => (vi.fn()));
 const mockGetWalletBalance = vi.hoisted(() => (vi.fn()));
 const mockEstimateSendNightFee = vi.hoisted(() => (vi.fn()));
-const mockEstimateUnshieldFee = vi.hoisted(() => (vi.fn()));
-const mockEstimateShieldFee = vi.hoisted(() => (vi.fn()));
 const mockEnsureNetworkId = vi.hoisted(() => (vi.fn()));
 const mockWalletWaitForSyncedState = vi.hoisted(() => (vi.fn()));
 
@@ -93,12 +89,8 @@ vi.mock('../../srv/submission/dust-registration', () => ({
 
 vi.mock('../../srv/submission/token-ops', () => ({
     sendNight: mockSendNight,
-    unshieldFunds: mockUnshieldFunds,
-    shieldFunds: mockShieldFunds,
     getWalletBalance: mockGetWalletBalance,
-    estimateSendNightFee: mockEstimateSendNightFee,
-    estimateUnshieldFee: mockEstimateUnshieldFee,
-    estimateShieldFee: mockEstimateShieldFee
+    estimateSendNightFee: mockEstimateSendNightFee
 }));
 
 vi.mock('../../srv/midnight/providers', () => ({
@@ -870,58 +862,7 @@ describe('wallet session handlers', () => {
     });
 
     // ------------------------------------------------------------------
-    // unshieldFunds / shieldFunds
-    // ------------------------------------------------------------------
-
-    describe('swap handlers', () => {
-        beforeEach(() => {
-            vi.spyOn(cds.log('nightgate:sessions'), 'info').mockImplementation(() => {});
-        });
-        afterEach(() => {
-            vi.restoreAllMocks();
-        });
-
-        it('unshieldFunds returns { jobId, status } and defers the inner call to startJob', async () => {
-            mockDbRun.mockResolvedValueOnce(activeSessionRow());
-            const req = createMockRequest({ sessionId: 's1', amount: '5' });
-            const result = await registeredHandlers['unshieldFunds'](req);
-
-            expect(result).toEqual({ jobId: 'job-unshieldFunds-test', status: 'pending' });
-            expect(mockUnshieldFunds).not.toHaveBeenCalled();
-
-            const args = mockStartJob.mock.calls[0][0];
-            expect(args.kind).toBe('unshieldFunds');
-            mockUnshieldFunds.mockResolvedValueOnce({ txId: 'tx', amount: '5', unshieldedReceiverAddress: 'mn_addr_x' });
-            const workResult = await runPersistedCommand(args);
-            expect(mockUnshieldFunds).toHaveBeenCalledWith(expect.objectContaining({ cacheKey: 'acct-derived', amount: '5' }));
-            expect(workResult).toMatchObject({ txId: 'tx', unshieldedReceiverAddress: 'mn_addr_x' });
-        });
-
-        it('shieldFunds rejects amount=0', async () => {
-            const req = createMockRequest({ sessionId: 's1', amount: '0' });
-            await registeredHandlers['shieldFunds'](req);
-            expect(req.reject).toHaveBeenCalledWith(400, 'amount must be > 0');
-        });
-
-        it('shieldFunds returns { jobId, status } and defers the inner call to startJob', async () => {
-            mockDbRun.mockResolvedValueOnce(activeSessionRow());
-            const req = createMockRequest({ sessionId: 's1', amount: '5' });
-            const result = await registeredHandlers['shieldFunds'](req);
-
-            expect(result).toEqual({ jobId: 'job-shieldFunds-test', status: 'pending' });
-            expect(mockShieldFunds).not.toHaveBeenCalled();
-
-            const args = mockStartJob.mock.calls[0][0];
-            expect(args.kind).toBe('shieldFunds');
-            mockShieldFunds.mockResolvedValueOnce({ txId: 'tx', amount: '5', shieldedReceiverAddress: 'mn_shield-addr_x' });
-            const workResult = await runPersistedCommand(args);
-            expect(mockShieldFunds).toHaveBeenCalledWith(expect.objectContaining({ cacheKey: 'acct-derived', amount: '5' }));
-            expect(workResult).toMatchObject({ txId: 'tx', shieldedReceiverAddress: 'mn_shield-addr_x' });
-        });
-    });
-
-    // ------------------------------------------------------------------
-    // getWalletBalance + estimateSendNightFee + estimate(Shield/Unshield)Fee
+    // getWalletBalance + estimateSendNightFee
     // ------------------------------------------------------------------
 
     describe('diagnostics handlers', () => {
@@ -974,26 +915,6 @@ describe('wallet session handlers', () => {
             expect(mockEstimateSendNightFee).not.toHaveBeenCalled();
         });
 
-        it('estimateUnshieldFee + estimateShieldFee route through the swap-estimate helper', async () => {
-            mockDbRun.mockResolvedValueOnce(activeSessionRow());
-            mockEstimateUnshieldFee.mockResolvedValueOnce({ fee: '7', direction: 'unshield' });
-            const u = createMockRequest({ sessionId: 's1', amount: '5' });
-            expect(await registeredHandlers['estimateUnshieldFee'](u)).toEqual({ fee: '7', direction: 'unshield' });
-
-            mockDbRun.mockResolvedValueOnce(activeSessionRow());
-            mockEstimateShieldFee.mockResolvedValueOnce({ fee: '9', direction: 'shield' });
-            const s = createMockRequest({ sessionId: 's1', amount: '5' });
-            expect(await registeredHandlers['estimateShieldFee'](s)).toEqual({ fee: '9', direction: 'shield' });
-        });
-
-        it('swap-estimate helper maps inner errors to 500 with the matching action name', async () => {
-            mockDbRun.mockResolvedValueOnce(activeSessionRow());
-            mockEstimateShieldFee.mockRejectedValueOnce(new Error('build failed'));
-            const req = createMockRequest({ sessionId: 's1', amount: '5' });
-            await registeredHandlers['estimateShieldFee'](req);
-            expect(req.reject).toHaveBeenCalledWith(500, expect.stringContaining('estimateShieldFee failed'));
-        });
-
         // 0.10.2 pool-starvation fix (worker-calls-outside-request-tx FR):
         // session reads detach from the request tx, worker waits are bounded.
 
@@ -1027,17 +948,6 @@ describe('wallet session handlers', () => {
             mockGetWalletBalance.mockRejectedValueOnce(new Error('getBalance: sync timeout'));
             const req = createMockRequest({ sessionId: 's1' });
             await registeredHandlers['getWalletBalance'](req);
-            expect(req.reject).toHaveBeenCalledWith(expect.objectContaining({
-                code: 'WALLET_SYNCING',
-                status: 503
-            }));
-        });
-
-        it('swap-estimate helper maps a sync-gate timeout to 503 WALLET_SYNCING', async () => {
-            mockDbRun.mockResolvedValueOnce(activeSessionRow());
-            mockEstimateShieldFee.mockRejectedValueOnce(new Error('estimateSwapFee: sync timeout'));
-            const req = createMockRequest({ sessionId: 's1', amount: '5' });
-            await registeredHandlers['estimateShieldFee'](req);
             expect(req.reject).toHaveBeenCalledWith(expect.objectContaining({
                 code: 'WALLET_SYNCING',
                 status: 503

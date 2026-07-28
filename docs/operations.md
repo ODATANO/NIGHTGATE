@@ -173,12 +173,11 @@ The wallet has less DUST than the operation's fee. Mostly hits on `deployContrac
 
 **Diagnosis path:**
 1. `getWalletBalance(sessionId)` — what's the actual dust balance?
-2. `estimateSendNightFee(...)` or `estimateShield/UnshieldFee(...)` — pre-flight fee for what you're trying to do
+2. `estimateSendNightFee(...)` — pre-flight fee for what you're trying to do
 3. Compare. If fee > balance, wait for more dust to accrue or register more NIGHT UTXOs to raise the cap.
 
 **Causes:**
 - Wallet has no unshielded NIGHT registered for dust gen (no accrual). Run `registerForDustGeneration` first, wait ~1-2 min for first dust.
-- Wallet has shielded NIGHT only. Use `unshieldFunds(amount)` to move some unshielded, then `registerForDustGeneration`.
 - Wallet is at dust cap (~5 tDUST on preprod default) and you need more. Wait for refill (~100 h to full from empty) or increase NIGHT holding.
 
 ### "Wallet.Sync: [object ErrorEvent]" spamming the log

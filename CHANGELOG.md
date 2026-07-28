@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.10.5 - 2026-07-28
+
+### Removed: `shieldFunds` / `unshieldFunds` / `estimateShieldFee` / `estimateUnshieldFee` (BREAKING)
+
+NIGHT is an unshielded-only token; a shield/unshield conversion does not exist
+in the Midnight protocol (bug report:
+`docs/feature-requests/bug_003-initswap-drops-destination-half-fund-loss.md`).
+The four actions implemented an operation that can never produce a valid
+transaction: shielded and unshielded NIGHT are distinct ledger token types
+that never balance against each other, and the one-sided `initSwap` operand
+shape additionally made the SDK facade silently drop the destination half.
+Verified live on preview (node rejects with `1010 Custom error: 138`,
+BalanceCheckOverspend).
+
+Removed end-to-end: OData actions, session handlers + swap rate limiter,
+`token-ops` wrappers, worker-client RPCs (`walletShieldNight` /
+`walletUnshieldNight` / `walletEstimateSwapFee`), and the worker handlers
+(`shieldNight` / `unshieldNight` / `estimateSwapFee`). `sendNight`, dust
+registration, and all other wallet actions are unchanged. No schema change.
+
 ## 0.10.4 - 2026-07-27
 
 ### Fix: discarded/failed wallet recipes no longer leak coins into pendingUtxos; loop-free fee estimates

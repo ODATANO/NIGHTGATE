@@ -1,31 +1,26 @@
 /**
  * Tests for the diagnostics wrappers in srv/submission/token-ops.ts:
- * getWalletBalance, estimateSendNightFee, estimateShieldFee, estimateUnshieldFee.
+ * getWalletBalance, estimateSendNightFee.
  * Same mock pattern: stub wallet-worker-client exports, assert argument
  * shape + result pass-through.
  */
 
 const walletGetBalance         = vi.hoisted(() => (vi.fn()));
 const walletEstimateTransferFee = vi.hoisted(() => (vi.fn()));
-const walletEstimateSwapFee    = vi.hoisted(() => (vi.fn()));
 
 vi.mock('../../srv/midnight/wallet-worker-client', () => ({
     walletGetBalance:           (...args: unknown[]) => walletGetBalance(...args),
-    walletEstimateTransferFee:  (...args: unknown[]) => walletEstimateTransferFee(...args),
-    walletEstimateSwapFee:      (...args: unknown[]) => walletEstimateSwapFee(...args)
+    walletEstimateTransferFee:  (...args: unknown[]) => walletEstimateTransferFee(...args)
 }));
 
 import {
     getWalletBalance,
-    estimateSendNightFee,
-    estimateShieldFee,
-    estimateUnshieldFee
+    estimateSendNightFee
 } from '../../srv/submission/token-ops';
 
 beforeEach(() => {
     walletGetBalance.mockReset();
     walletEstimateTransferFee.mockReset();
-    walletEstimateSwapFee.mockReset();
 });
 
 describe('getWalletBalance', () => {
@@ -92,48 +87,5 @@ describe('estimateSendNightFee', () => {
             amount:          '100'
         });
         expect(result.toLedger).toBe('shielded');
-    });
-});
-
-describe('estimateUnshieldFee / estimateShieldFee', () => {
-    test('estimateUnshieldFee forwards direction="unshield"', async () => {
-        walletEstimateSwapFee.mockResolvedValueOnce({ fee: '7777', direction: 'unshield' });
-
-        const result = await estimateUnshieldFee({ cacheKey: 'acc-est-u', amount: '50000' });
-
-        expect(walletEstimateSwapFee).toHaveBeenCalledWith({
-            sessionId:     'acc-est-u',
-            direction:     'unshield',
-            amount:        '50000',
-            ttlIso:        undefined,
-            syncTimeoutMs: undefined
-        });
-        expect(result).toEqual({ fee: '7777', direction: 'unshield' });
-    });
-
-    test('estimateShieldFee forwards direction="shield"', async () => {
-        walletEstimateSwapFee.mockResolvedValueOnce({ fee: '8888', direction: 'shield' });
-
-        const result = await estimateShieldFee({
-            cacheKey:      'acc-est-s',
-            amount:        '50000',
-            ttlIso:        '2026-12-31T00:00:00Z',
-            syncTimeoutMs: 30000
-        });
-
-        expect(walletEstimateSwapFee).toHaveBeenCalledWith({
-            sessionId:     'acc-est-s',
-            direction:     'shield',
-            amount:        '50000',
-            ttlIso:        '2026-12-31T00:00:00Z',
-            syncTimeoutMs: 30000
-        });
-        expect(result.direction).toBe('shield');
-    });
-
-    test('propagates worker errors (InsufficientFunds, etc.)', async () => {
-        walletEstimateSwapFee.mockRejectedValueOnce(new Error('Wallet.InsufficientFunds'));
-        await expect(estimateUnshieldFee({ cacheKey: 'acc-fail', amount: '999999999999' }))
-            .rejects.toThrow('Wallet.InsufficientFunds');
     });
 });

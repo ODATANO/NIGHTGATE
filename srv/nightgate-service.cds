@@ -787,8 +787,8 @@ service NightgateService {
     /**
      * Transfer NIGHT to any Midnight address. Receiver ledger is auto-detected
      * from the Bech32m prefix: `mn_shield-addr_...` → shielded, `mn_addr_...`
-     * → unshielded. Source funds come from the same ledger as the receiver;
-     * use `shieldFunds` / `unshieldFunds` for cross-ledger conversion.
+     * → unshielded. Source funds come from the same ledger as the receiver.
+     * (NIGHT is an unshielded-only token; there is no cross-ledger conversion.)
      *
      * `amount` is a decimal string of NIGHT atoms (parsed as bigint server-side
      * to avoid precision loss for values beyond Number.MAX_SAFE_INTEGER).
@@ -806,42 +806,6 @@ service NightgateService {
         status : String; // 'pending' | 'succeeded' (idempotent retry)
     };
 
-    /**
-     * Move the wallet's own NIGHT from shielded → unshielded ledger. Useful
-     * for making NIGHT available to `registerForDustGeneration` (only
-     * unshielded NIGHT UTXOs can be registered for dust accrual).
-     *
-     * Cross-ledger conversion is via the SDK's `initSwap` primitive: same
-     * NIGHT amount appears on both sides, just shifts ledgers.
-     *
-     * Async: `{ jobId, status }`. `result` carries
-     * `{ txId, amount, unshieldedReceiverAddress }`.
-     */
-    action   unshieldFunds(sessionId: UUID,
-                           amount: String,
-                           ttlIso: String, // optional
-                           idempotencyKey: String // optional
-    )                                                                 returns {
-        jobId  : UUID;
-        status : String;
-    };
-
-    /**
-     * Symmetric counterpart to `unshieldFunds`. Move the wallet's own NIGHT
-     * from unshielded → shielded ledger via `initSwap`.
-     *
-     * Async: `{ jobId, status }`. `result` carries
-     * `{ txId, amount, shieldedReceiverAddress }`.
-     */
-    action   shieldFunds(sessionId: UUID,
-                         amount: String,
-                         ttlIso: String, // optional
-                         idempotencyKey: String // optional
-    )                                                                 returns {
-        jobId  : UUID;
-        status : String;
-    };
-
     // ========================================================================
     // Diagnostics: read-only pre-flight UX
     // ========================================================================
@@ -849,7 +813,7 @@ service NightgateService {
     /**
      * Snapshot of the wallet's current balances. Read-only; does not build
      * or submit any transaction. Useful as a pre-flight check before
-     * `sendNight` / `shieldFunds` / `unshieldFunds` / `deployContract`.
+     * `sendNight` / `deployContract`.
      *
      * Returns NIGHT atoms (decimal strings to preserve bigint precision)
      * separated by shielded vs unshielded ledger, plus current DUST and the
@@ -879,28 +843,6 @@ service NightgateService {
     )                                                                 returns {
         fee      : String;
         toLedger : String;
-    };
-
-    /**
-     * Pre-flight DUST fee estimate for an `unshieldFunds` ledger-shift.
-     * Builds the `initSwap` recipe without finalizing, returns fee in
-     * DUST atoms (decimal string).
-     */
-    function estimateUnshieldFee(sessionId: UUID,
-                                 amount: String,
-                                 ttlIso: String // optional
-    )                                                                 returns {
-        fee       : String;
-        direction : String; // 'unshield'
-    };
-
-    /** Symmetric counterpart: estimate DUST fee for a `shieldFunds` shift. */
-    function estimateShieldFee(sessionId: UUID,
-                               amount: String,
-                               ttlIso: String // optional
-    )                                                                 returns {
-        fee       : String;
-        direction : String; // 'shield'
     };
 
     // ========================================================================

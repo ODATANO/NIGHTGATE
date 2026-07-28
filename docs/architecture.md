@@ -73,10 +73,11 @@ Verification: in a Phase-1 test run, the main thread's `setInterval` callbacks f
 The same worker pattern, extended to expose:
 
 - `walletTransferNight` (build + balance + finalize + submit a NIGHT transfer)
-- `walletShieldNight` / `walletUnshieldNight` (cross-ledger via `facade.initSwap`)
 - `walletDeregisterDustGeneration` (symmetric to register)
 - `walletGetBalance` (read-only snapshot of all three sub-wallet balances)
-- `walletEstimateTransferFee` / `walletEstimateSwapFee` (build the recipe in the worker, call `facade.estimateTransactionFee`, discard the recipe — no proof generation, no submit)
+- `walletEstimateTransferFee` (build the recipe in the worker, call `facade.estimateTransactionFee`, discard the recipe — no proof generation, no submit)
+
+(Phase 2b also shipped `walletShieldNight` / `walletUnshieldNight` / `walletEstimateSwapFee`; removed in 0.10.5: NIGHT is unshielded-only, so a cross-ledger shift is not a legal operation. See `docs/feature-requests/bug_003-initswap-drops-destination-half-fund-loss.md`.)
 
 ## Submission flow
 
@@ -95,7 +96,7 @@ Main thread (handler)                                        Worker thread
                                                                 ├─ ensureNetworkId
                                                                 ├─ facade lookup by accountId
                                                                 ├─ build via facade.transferTransaction
-                                                                │  / initSwap / deployContract / ...
+                                                                │  / deployContract / ...
                                                                 ├─ balance (lightweight)
                                                                 ├─ finalizeRecipe (HEAVY: ZK proof)
                                                                 ├─ submitTransaction

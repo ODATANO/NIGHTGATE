@@ -87,7 +87,7 @@ Transfer NIGHT to any Midnight address. The destination ledger is auto-detected 
 - `mn_shield-addr_*` → shielded transfer
 - `mn_addr_*` → unshielded transfer
 
-Source funds come from the same ledger as the receiver. Use `shieldFunds` / `unshieldFunds` for cross-ledger conversion.
+Source funds come from the same ledger as the receiver. There is no cross-ledger conversion: NIGHT is an unshielded-only token.
 
 | Field | Type | Notes |
 |---|---|---|
@@ -114,16 +114,6 @@ curl -X POST http://localhost:4004/api/v1/nightgate/sendNight \
     "amount": "1000000"
   }'
 ```
-
-### `shieldFunds(sessionId, amount, ttlIso?) → { txId, amount, shieldedReceiverAddress }`
-
-Move the wallet's own NIGHT from unshielded → shielded ledger. Uses the SDK's `initSwap` primitive. Same NIGHT atom amount appears on both sides — it's a ledger-shift, not a value exchange.
-
-### `unshieldFunds(sessionId, amount, ttlIso?) → { txId, amount, unshieldedReceiverAddress }`
-
-Symmetric: shielded → unshielded. **Practical use case**: only unshielded NIGHT can be registered for dust generation. Move shielded NIGHT here first to enable dust accrual.
-
-For both: rate limit 5 per 5 min (heavier ZK work). Same error model as `sendNight`.
 
 ### `registerForDustGeneration(sessionId, dustReceiverAddress?) → { txId, registeredCount, totalNightUtxos, dustReceiverAddress }`
 
@@ -387,18 +377,13 @@ Response:
 }
 ```
 
-**Wallet still syncing:** the read waits at most `NIGHTGATE_WALLET_READ_SYNC_TIMEOUT_MS` (default 10 s) for the facade to reach the indexer tip, then answers `503` with error code `WALLET_SYNCING`. Treat it as retryable: poll again once the prewarm job reports ready. The same gate applies to the three fee estimates below.
+**Wallet still syncing:** the read waits at most `NIGHTGATE_WALLET_READ_SYNC_TIMEOUT_MS` (default 10 s) for the facade to reach the indexer tip, then answers `503` with error code `WALLET_SYNCING`. Treat it as retryable: poll again once the prewarm job reports ready. The same gate applies to the fee estimate below.
 
 ### `estimateSendNightFee(sessionId, receiverAddress, amount, ttlIso?) → { fee, toLedger }`
 
 Pre-flight DUST fee for a `sendNight` call. Builds the recipe in the worker (lightweight; no ZK proof generation, no submit), discards it after fee calc. Useful to gate the user on whether dust balance is sufficient before triggering the actual send.
 
 `fee` is DUST atoms as decimal string.
-
-### `estimateShieldFee(sessionId, amount, ttlIso?) → { fee, direction: "shield" }`
-### `estimateUnshieldFee(sessionId, amount, ttlIso?) → { fee, direction: "unshield" }`
-
-Symmetric pre-flight estimates for the ledger-shift operations.
 
 ## Indexer / health / metrics
 

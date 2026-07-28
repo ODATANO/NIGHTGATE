@@ -8,7 +8,7 @@
  * a fake facade through the REAL buildFacade wiring (role-seed derivation,
  * restore-vs-fresh selection, dust cold-start flag, facade start).
  *
- * The facade OPERATION bodies (transferNight, shieldNight, deploys, …) stay
+ * The facade OPERATION bodies (transferNight, deploys, …) stay
  * deliberately uncovered here: they are exercised by the live e2e scripts
  * (docs/reference.md "Testing baseline").
  */

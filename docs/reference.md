@@ -121,7 +121,7 @@ Sufficient for read-side. `network` is the only required key — without it the 
 | `NIGHTGATE_ALLOW_SELF_SERVICE_GRANTEE_REGISTRATION` | Override `allowSelfServiceGranteeRegistration` (`false` / `0` / `no` / `off` disables) |
 | `NIGHTGATE_PREWARM_SYNC_TIMEOUT_MS` | Upper bound for the `connectWalletForSigning` prewarm sync-to-tip wait; default `10800000` (3 h). Raise for slow cold syncs. |
 | `NIGHTGATE_BALANCE_SYNC_TIMEOUT_MS` | Wallet balance sync-to-tip timeout in the worker's `balanceTx` pre-sync; default `180000` (180 s). A stalled sync fails cleanly instead of hanging. |
-| `NIGHTGATE_WALLET_READ_SYNC_TIMEOUT_MS` | Bounded sync gate for the facade-backed read actions (`getWalletBalance`, `estimateSendNightFee`, `estimateShieldFee`, `estimateUnshieldFee`); default `10000` (10 s). A facade still syncing answers `503` with code `WALLET_SYNCING` instead of blocking the request; `0` or negative disables the gate (wait indefinitely). |
+| `NIGHTGATE_WALLET_READ_SYNC_TIMEOUT_MS` | Bounded sync gate for the facade-backed read actions (`getWalletBalance`, `estimateSendNightFee`); default `10000` (10 s). A facade still syncing answers `503` with code `WALLET_SYNCING` instead of blocking the request; `0` or negative disables the gate (wait indefinitely). |
 | `NIGHTGATE_DEBUG_WALLET_SYNC` | Set `true` to emit per-save wallet-sync timing logs; off by default to keep a consumer's stdout quiet |
 | `SKIP_AUTO_INIT` | Set `true` **only in tests** to skip the plugin's `initialize()` (crawler + wallet worker). Must NOT be set in production. |
 | `INDEXER_SECRET` | 32-byte hex secret for the indexer container's `APP__INFRA__SECRET` |
@@ -500,9 +500,9 @@ New enums in `db/types.cds`:
 | CAP-DB private state | ✅ Production-grade encrypted backend (T29) |
 | Wallet sessions | ✅ Read-only + signing-upgraded, TTL cleanup, admin invalidation |
 | Contract deploy / call | ✅ Worker-thread routed (Phase 2b), pending-row tracked, crawler-reconciled |
-| Token ops (transfer, shield/unshield) | ✅ `sendNight`, `shieldFunds`, `unshieldFunds` via worker |
+| Token ops (transfer) | ✅ `sendNight` via worker (NIGHT is unshielded-only; no shield/unshield conversion exists) |
 | Dust generation | ✅ `registerForDustGeneration` + `deregisterFromDustGeneration` |
-| Diagnostics (balance, fee estimates) | ✅ `getWalletBalance`, `estimateSendNightFee`, `estimateShield/UnshieldFee` |
+| Diagnostics (balance, fee estimates) | ✅ `getWalletBalance`, `estimateSendNightFee` |
 | Local Midnight indexer (docker) | ✅ Optional `midnightntwrk/indexer-standalone:4.3.2` service |
 | Wallet state persistence | ✅ `WalletSyncStates` — restart resumes in seconds, not hours |
 | Worker-thread architecture | ✅ Wallet SDK isolated from main thread (Phase 1+2a+2b) |

@@ -460,38 +460,6 @@ export function walletTransferNight(args: {
 }
 
 /**
- * Move NIGHT from shielded → unshielded ledger. Always targets the
- * wallet's own unshielded address (no third-party recipient parameter
- * for this primitive).
- */
-export function walletUnshieldNight(args: {
-    sessionId: string;
-    amount: string;
-    ttlIso?: string;
-    syncTimeoutMs?: number;
-}): Promise<{
-    txId: string;
-    amount: string;
-    unshieldedReceiverAddress: string;
-}> {
-    return rpc('unshieldNight', args);
-}
-
-/** Symmetric counterpart: unshielded → shielded for own funds. */
-export function walletShieldNight(args: {
-    sessionId: string;
-    amount: string;
-    ttlIso?: string;
-    syncTimeoutMs?: number;
-}): Promise<{
-    txId: string;
-    amount: string;
-    shieldedReceiverAddress: string;
-}> {
-    return rpc('shieldNight', args);
-}
-
-/**
  * Snapshot of the wallet's balances. Read-only: no transaction is
  * built or submitted. All amounts are decimal-string bigint to avoid
  * Number precision loss.
@@ -522,20 +490,6 @@ export function walletEstimateTransferFee(args: {
     syncTimeoutMs?: number;
 }): Promise<{ fee: string; toLedger: 'shielded' | 'unshielded' }> {
     return rpc('estimateTransferFee', args);
-}
-
-/**
- * Pre-flight fee estimate for shield/unshield ledger shifts. Builds the
- * `initSwap` recipe without finalizing. `direction` selects which way.
- */
-export function walletEstimateSwapFee(args: {
-    sessionId: string;
-    direction: 'shield' | 'unshield';
-    amount: string;
-    ttlIso?: string;
-    syncTimeoutMs?: number;
-}): Promise<{ fee: string; direction: 'shield' | 'unshield' }> {
-    return rpc('estimateSwapFee', args);
 }
 
 // ---- Phase 2b: contract deploy / call -------------------------------------
