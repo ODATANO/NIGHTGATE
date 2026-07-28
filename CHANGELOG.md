@@ -1,5 +1,84 @@
 # Changelog
 
+## 0.11.0 - 2026-07-28
+
+### Feature: `NIGHTGATE_PROVING_MODE=wasm` proves everything in-process (no Docker proof server for dev/test/CI)
+
+FR: `docs/feature-requests/wasm-proving-without-docker.md`. New env var
+`NIGHTGATE_PROVING_MODE`: `server` (default, unchanged behavior) proxies
+proving to the proof-server container; `wasm` proves fully in-process, so no
+proof server needs to run at all. Wallet transactions go through the SDK's
+`makeWasmProvingService()` passed to `WalletFacade.init`; contract deploy/call
+circuits go through the new `srv/midnight/wasm-proof-provider.ts`, which
+replaces midnight-js's `httpClientProofProvider` under wasm mode (zkir-v2
+computes locally what the proof server computes remotely; contract keys from
+the contract's `managed/` zkConfig, standard keys + BLS params from the SDK's
+S3 provider). `@midnight-ntwrk/zkir-v2` and `@midnight-ntwrk/midnight-js-types`
+promoted to direct dependencies. Default resolution makes zero-config fully
+public: `wasm` unless a proof server is EXPLICITLY configured (env var or cds
+config), which selects `server`; `NIGHTGATE_PROVING_MODE` overrides either
+way, and existing deployments with a configured proof server keep their
+behavior unchanged. Caveats (documented in `docs/reference.md`): proving keys
+download from Midnight's S3 at runtime with an in-memory-only cache, proving
+costs seconds of CPU per transaction, production should run a proof server.
+
+Verified live on preprod with a dead proof-server URL
+(`NIGHTGATE_PROOF_SERVER_URL=http://127.0.0.1:9999`, nothing reachable):
+NIGHT self-transfer `00474d79de7e5f52...` (send job 55.9 s wall-clock
+including the first-run proving-key download), counter deploy `37bb15aa...`
+(79.3 s) + increment `d58e4420...` (76.3 s), and mint on the compact-0.31
+shielded-token artifact `56892f3e...` (~170 s), so both compiler generations
+prove through the local zkir. New harnesses
+`scripts/run-wasm-proving-e2e.mjs` / `run-wasm-contract-e2e.mjs`
+(`npm run wasm-proving:e2e` / `wasm-contract:e2e`).
+
+A repo-wide multi-agent review (36 confirmed findings) was applied in the
+same release:
+
+- Dependency truthfulness: `@midnightntwrk/wallet-sdk-capabilities` and
+  `@midnightntwrk/wallet-sdk-prover-client` (directly imported by the wasm
+  proving path) promoted to direct dependencies; `express` and `undici`
+  (script-only) moved to devDependencies.
+- `tokenTypeHex` is lowercased server-side (the SDK matches token types by
+  exact lowercase string) and the 10^18 NIGHT sanity bound no longer rejects
+  valid custom-token amounts (Uint<128> bound applies instead).
+- wasm proving hardening: missing key material now fails with an error naming
+  the keyLocation and the underlying zkConfig failure instead of dying deep in
+  the WASM; rejected loads are no longer memoized forever; wallet and contract
+  proving share ONE per-worker S3 key cache instead of one per session.
+- Wallet-session job commands (`sendNight`, dust register/deregister,
+  prewarm) are now persisted AES-GCM-encrypted like contract-call commands
+  (tamper protection for the replay path; existing plaintext rows keep
+  decoding via their `json-v1` marker).
+- Dead code removed: unused `loadWalletSdk` bundle (the main thread no longer
+  imports the contracts/facade packages it never used), unused
+  `walletPing`/`walletSerializeState` RPC pair, unused `deleteSyncState` and
+  `hasContractWitnessFactory`; deliberate test hooks renamed to the
+  `__...ForTests` convention; the public `NightgateConfig` type now re-exports
+  the real plugin config instead of a stale copy.
+- Test additions: worker transfer (incl. `tokenTypeHex` consumption + ledger
+  routing), balance/fee reads, dust register/deregister filter and no-op
+  branches, contract-call private-state seeding guard, proving-mode routing,
+  external-effect-boundary invariants, `resolveContract` artifact wrapping.
+- Docs reconciled against the code (removed-feature mentions, env-var matrix,
+  network list, entity list, action parameter tables); CLAUDE.md rewritten
+  against the 0.11.0 tree.
+
+Also in this release, built to measure the zswap circuits in-process (NIGHT
+alone cannot exercise them, it is unshielded-only):
+
+- New contract `contracts/shielded-token`: `mint()` mints 100000000 atoms of
+  the contract's own shielded token to the caller's zswap public key
+  (registered as third compiled artifact).
+- `sendNight` gained an optional `tokenTypeHex` parameter (64 hex raw token
+  type) to transfer a custom token instead of NIGHT; validation, job
+  plumbing, and worker transfer support included. Default behavior unchanged.
+- `scripts/run-wasm-zswap-e2e.mjs` (`npm run wasm-zswap:e2e`): deploy →
+  mint → shielded self-transfer. Live on preprod: contract `2bf41737...`,
+  transfer tx `00e9065c...`, send job 176.1 s wall-clock including the
+  first-run download of the zswap prover keys (11 MB spend + 5.7 MB output),
+  zswap spend/output proved in-process by the WASM prover.
+
 ## 0.10.5 - 2026-07-28
 
 ### Removed: `shieldFunds` / `unshieldFunds` / `estimateShieldFee` / `estimateUnshieldFee` (BREAKING)

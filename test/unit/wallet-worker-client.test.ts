@@ -74,10 +74,8 @@ import {
     setStateSaveSink,
     registerPrivateStateProvider,
     unregisterPrivateStateProvider,
-    walletPing,
     walletInit,
     walletEvict,
-    walletSerializeState,
     walletGetBalance,
     walletTransferNight,
     walletEstimateTransferFee,
@@ -115,7 +113,7 @@ describe('wallet-worker-client', () => {
 
     describe('lifecycle', () => {
         it('rpc rejects before startWalletWorker has been called', async () => {
-            await expect(walletPing()).rejects.toThrow(/wallet-worker not started/);
+            await expect(walletEvict('s1')).rejects.toThrow(/wallet-worker not started/);
         });
 
         it('setStateSaveSink throws before startWalletWorker', () => {
@@ -143,23 +141,23 @@ describe('wallet-worker-client', () => {
 
     describe('rpc helper', () => {
         it('resolves with msg.result on a successful reply', async () => {
-            await startWithResponder(() => ({ ok: true, result: { ok: true, ts: 42 } }));
-            await expect(walletPing()).resolves.toEqual({ ok: true, ts: 42 });
+            await startWithResponder(() => ({ ok: true, result: { evicted: false } }));
+            await expect(walletEvict('s1')).resolves.toEqual({ evicted: false });
         });
 
         it('rejects with the named Error from a structured failure payload', async () => {
             await startWithResponder(() => ({ ok: false, error: { name: 'TxFailedError', message: 'reverted' } }));
-            await expect(walletPing()).rejects.toMatchObject({ name: 'TxFailedError', message: 'reverted' });
+            await expect(walletEvict('s1')).rejects.toMatchObject({ name: 'TxFailedError', message: 'reverted' });
         });
 
         it('rejects with a plain Error when the failure payload is a bare string', async () => {
             await startWithResponder(() => ({ ok: false, error: 'badness' }));
-            await expect(walletPing()).rejects.toThrow('badness');
+            await expect(walletEvict('s1')).rejects.toThrow('badness');
         });
 
         it('falls back to "worker rpc failed" for an unrecognised payload shape', async () => {
             await startWithResponder(() => ({ ok: false }));
-            await expect(walletPing()).rejects.toThrow('worker rpc failed');
+            await expect(walletEvict('s1')).rejects.toThrow('worker rpc failed');
         });
     });
 
@@ -193,7 +191,6 @@ describe('wallet-worker-client', () => {
 
         it.each([
             ['evict',          () => walletEvict('s1'),                                                'evict'],
-            ['serializeState', () => walletSerializeState('s1'),                                       'serializeState'],
             ['getBalance',     () => walletGetBalance({ sessionId: 's1' }),                            'getBalance'],
             ['transferNight',  () => walletTransferNight({ sessionId: 's1', receiverAddress: 'r', amount: '1' }), 'transferNight'],
             ['estimateTransferFee', () => walletEstimateTransferFee({ sessionId: 's1', receiverAddress: 'r', amount: '1' }), 'estimateTransferFee'],

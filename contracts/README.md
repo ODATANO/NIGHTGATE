@@ -5,6 +5,17 @@ This directory holds Compact contracts that NIGHTGATE registers via
 its compiled artifacts (under `src/managed/<name>/`) are committed to the repo
 so consumers don't need a Compact toolchain to run NIGHTGATE.
 
+Registered contracts:
+
+- **`counter`**: minimal increment-only contract; first registered artifact
+  and the deploy/call smoke-test target.
+- **`attestation-vault`**: the tiered-disclosure attestation contract behind
+  the attestation / predicate / disclosure actions.
+- **`shielded-token`**: test token whose `mint()` sends the contract's own
+  shielded token to the caller's zswap key; exists to exercise the zswap
+  circuits (NIGHT is unshielded-only and can never touch them). Used by
+  `npm run wasm-zswap:e2e`.
+
 ## Layout
 
 ```

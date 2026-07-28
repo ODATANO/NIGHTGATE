@@ -1,0 +1,7 @@
+{
+  "name": "@odatano/nightgate-contract-shielded-token",
+  "private": true,
+  "type": "module",
+  "description": "Shielded test token used to exercise the zswap circuits under the in-process WASM prover (wasm-proving FR live measurement).",
+  "main": "src/managed/shielded-token/contract/index.js"
+}

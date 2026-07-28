@@ -152,3 +152,45 @@ describe('getContractRegistration + loadRegistryFromConfig guards', () => {
         expect(reg.artifactPath.split(path.sep).join('/')).toContain('/base/rel/artifact.js');
     });
 });
+
+// ---- resolveContract: artifact import + CompiledContract wrapping -----------
+// The absolute Windows path below MUST round-trip through pathToFileURL, the
+// exact ESM trip-hazard the implementation comments call out.
+
+vi.mock('@midnight-ntwrk/compact-js', () => ({
+    CompiledContract: {
+        make: vi.fn((name: string, cls: any) => ({
+            pipe: vi.fn((...steps: unknown[]) => ({ compiled: true, name, cls, steps: steps.length }))
+        })),
+        withVacantWitnesses: vi.fn(),
+        withCompiledFileAssets: vi.fn((zkPath: string) => ({ assetsFor: zkPath }))
+    }
+}));
+
+describe('resolveContract', () => {
+    const FIXTURE = path.resolve(process.cwd(), 'test/fixtures/fake-contract-artifact.mjs');
+
+    it('imports an ABSOLUTE artifact path via file:// URL and wraps it in CompiledContract', async () => {
+        registerContract('fixture', {
+            artifactPath: FIXTURE,
+            privateStateId: 'fixturePS',
+            zkConfigPath: '/zk/fixture'
+        });
+        const resolved = await resolveContract('fixture');
+
+        expect(resolved.privateStateId).toBe('fixturePS');
+        expect(resolved.zkConfigPath).toBe('/zk/fixture');
+        expect(resolved.compiledContract).toMatchObject({ compiled: true, name: 'fixture', steps: 2 });
+        // The Contract export of the artifact must be what gets wrapped.
+        expect((resolved.compiledContract as any).cls?.name).toBe('Contract');
+
+        const compactJs: any = await import('@midnight-ntwrk/compact-js');
+        expect(compactJs.CompiledContract.withCompiledFileAssets).toHaveBeenCalledWith('/zk/fixture');
+    });
+
+    it('throws ContractNotRegisteredError with the available names for an unknown ref', async () => {
+        registerContract('known', { artifactPath: FIXTURE, privateStateId: 'p', zkConfigPath: 'z' });
+        await expect(resolveContract('nope')).rejects.toThrow(ContractNotRegisteredError);
+        await expect(resolveContract('nope')).rejects.toThrow(/known/);
+    });
+});

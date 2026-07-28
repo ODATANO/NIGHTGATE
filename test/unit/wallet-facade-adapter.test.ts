@@ -77,8 +77,8 @@ vi.mock('../../srv/submission/wallet-facade-builder', async () => ({
         ...STUB_KEYS
     })),
     evictWalletFacade: vi.fn(async () => {}),
-    clearAllFacades: vi.fn(),
-    getCacheSize: vi.fn(() => 0)
+    __clearAllFacadesForTests: vi.fn(),
+    __getCacheSizeForTests: vi.fn(() => 0)
 }));
 
 import { getOrBuildWalletFacade } from '../../srv/submission/wallet-facade-builder';

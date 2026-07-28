@@ -225,6 +225,6 @@ export function loadCircuitArgTypes(zkConfigPath: string, circuit: string): Circ
 }
 
 /** Test-only: clear the contract-info parse cache. */
-export function clearArgTypeCache(): void {
+export function __clearArgTypeCacheForTests(): void {
     argTypeCache.clear();
 }

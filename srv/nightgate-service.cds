@@ -800,7 +800,12 @@ service NightgateService {
                        receiverAddress: String,
                        amount: String,
                        ttlIso: String, // optional ISO-8601; defaults to +10min
-                       idempotencyKey: String // optional; dedupes retries
+                       idempotencyKey: String, // optional; dedupes retries
+                       tokenTypeHex: String // optional; raw token type (64 hex) to send instead of
+    // NIGHT. Ledger-agnostic: the receiver address prefix decides
+    // whether shielded or unshielded holdings of that token are
+    // spent (e.g. a contract-minted shielded token to a
+    // mn_shield-addr_, an unshielded custom token to a mn_addr_).
     )                                                                 returns {
         jobId  : UUID;
         status : String; // 'pending' | 'succeeded' (idempotent retry)

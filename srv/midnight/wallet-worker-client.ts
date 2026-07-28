@@ -381,19 +381,8 @@ export function walletWaitForSyncedState(sessionId: string, timeoutMs?: number):
     return rpc('waitForSyncedState', { sessionId, timeoutMs }, workerBudgetMs + 5 * 60 * 1000);
 }
 
-export function walletSerializeState(sessionId: string): Promise<{
-    sdkVersion: string;
-    blobs: SerializedBlobs;
-}> {
-    return rpc('serializeState', { sessionId });
-}
-
 export function walletEvict(sessionId: string): Promise<{ evicted: boolean }> {
     return rpc('evict', { sessionId });
-}
-
-export function walletPing(): Promise<{ ok: true; ts: number }> {
-    return rpc('ping', {});
 }
 
 /**
@@ -450,6 +439,8 @@ export function walletTransferNight(args: {
     amount: string;
     ttlIso?: string;
     syncTimeoutMs?: number;
+    /** Raw token type (64 hex) to send instead of NIGHT. */
+    tokenTypeHex?: string;
 }): Promise<{
     txId: string;
     toLedger: 'shielded' | 'unshielded';

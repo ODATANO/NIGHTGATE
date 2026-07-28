@@ -68,11 +68,11 @@ Sufficient for read-side. `network` is the only required key — without it the 
 
 | Key | Default | Notes |
 |---|---|---|
-| `network` | `preprod` | `testnet` / `preprod` / `preview` / `mainnet`; invalid values fall back to `preprod` with a warning |
+| `network` | `preprod` | `testnet` / `preprod` / `preview` / `mainnet` / `undeployed` (local midnight-local-dev standalone stack: node `ws://127.0.0.1:9944`, indexer `127.0.0.1:8088`); invalid values fall back to `preprod` with a warning |
 | `nodeUrl` | `wss://rpc.preprod.midnight.network/` | Substrate RPC WebSocket |
 | `indexerHttpUrl` | preprod indexer URL | Wallet SDK's `publicDataProvider` HTTP endpoint; NOT used by the crawler |
 | `indexerWsUrl` | derived from `indexerHttpUrl` (`http -> ws` + `/ws`) | Same, for subscriptions; set only if your indexer serves subscriptions somewhere non-standard |
-| `proofServerUrl` | `http://localhost:6300` | Required for any submission flow (deploy/call/send/shield/unshield/dust-gen) |
+| `proofServerUrl` | `http://localhost:6300` (only used in server proving mode) | Proof server for all submission flows (deploy/call/send/dust-gen). Explicitly configuring it selects server proving; leaving it unset selects in-process wasm proving. |
 | `zkConfigBasePath` | `./contracts` | Base for resolving relative `contracts.<name>.zkConfigPath` |
 | `privateStateBackend` | `cap-db` | `cap-db` (default, production-grade encrypted CAP-DB tables) or `level` (legacy SDK LevelDB, **dev-only**, blocked on worker-routed submissions) |
 | `contracts` | `{}` | Map of `<ref>` → `{ artifactPath, privateStateId, zkConfigPath }`, loaded into the in-memory registry on plugin startup |
@@ -122,7 +122,16 @@ Sufficient for read-side. `network` is the only required key — without it the 
 | `NIGHTGATE_PREWARM_SYNC_TIMEOUT_MS` | Upper bound for the `connectWalletForSigning` prewarm sync-to-tip wait; default `10800000` (3 h). Raise for slow cold syncs. |
 | `NIGHTGATE_BALANCE_SYNC_TIMEOUT_MS` | Wallet balance sync-to-tip timeout in the worker's `balanceTx` pre-sync; default `180000` (180 s). A stalled sync fails cleanly instead of hanging. |
 | `NIGHTGATE_WALLET_READ_SYNC_TIMEOUT_MS` | Bounded sync gate for the facade-backed read actions (`getWalletBalance`, `estimateSendNightFee`); default `10000` (10 s). A facade still syncing answers `503` with code `WALLET_SYNCING` instead of blocking the request; `0` or negative disables the gate (wait indefinitely). |
+| `NIGHTGATE_PROVING_MODE` | How transactions are proved: `server` proxies to the proof-server container at `proofServerUrl`; `wasm` proves in-process, so no Docker proof server is needed. Default: `server` when a proof server is explicitly configured (env var or cds config), otherwise `wasm` (fully public zero-config). Wallet transactions go through the SDK's WASM prover; contract deploy/call circuits go through NIGHTGATE's own in-process provider (`srv/midnight/wasm-proof-provider.ts`, zkir over the contract's local key material). WASM caveats: standard-circuit proving keys download from Midnight's S3 bucket at runtime (hard-coded host inside the SDK, NO integrity verification of the fetched material, one in-memory cache per process start) and each proof costs seconds of CPU in the worker thread. Accepted risk for the dev/test scope of this mode; production stays on `server`. |
 | `NIGHTGATE_DEBUG_WALLET_SYNC` | Set `true` to emit per-save wallet-sync timing logs; off by default to keep a consumer's stdout quiet |
+| `NIGHTGATE_WORKER_RPC_TIMEOUT_MS` | Upper bound for a single worker RPC (build+prove+submit); default `1800000` (30 min). The child-job wait timeout derives from it (+5 min) unless `NIGHTGATE_CHILD_JOB_WAIT_TIMEOUT_MS` overrides it explicitly. |
+| `NIGHTGATE_SYNC_TIP_GAP` | Max allowed gap (dust-event indices) between wallet state and indexer tip for the genuine-sync gate to latch; default `8` |
+| `NIGHTGATE_SYNC_FRESHNESS_MS` | Max age of the indexer's latest block for the sync gate to accept it as "fresh"; default `300000` (5 min) |
+| `NIGHTGATE_DUST_COLD_START` | Set `true` to ignore the persisted dust state blob and rebuild the dust sub-wallet from chain (escape hatch for pruned merkle roots / error 117) |
+| `NIGHTGATE_SPONSORED_CALLER_SYNC` | Set `skip` to skip the caller-facade sync wait in sponsored contract calls (advanced; default is to wait) |
+| `NIGHTGATE_FEE_SPONSOR_SESSION` | Operator-designated sponsor sessionId allowed to pay fees across users (security-relevant; unset = same-user sponsoring only) |
+| `NIGHTGATE_SIGNING_KEY_RATE_LIMIT` | Max `connectWalletForSigning` requests per client per hour; default `10` |
+| `NIGHTGATE_ZK_CONFIG_PUBLIC_URL` | Public base URL advertised by `/contract-manifest` for the `/zk-config/...` routes (behind a reverse proxy); default = request host |
 | `SKIP_AUTO_INIT` | Set `true` **only in tests** to skip the plugin's `initialize()` (crawler + wallet worker). Must NOT be set in production. |
 | `INDEXER_SECRET` | 32-byte hex secret for the indexer container's `APP__INFRA__SECRET` |
 | `INDEXER_UPSTREAM_NODE_URL` | Upstream Substrate RPC for the indexer container (default = hosted preprod) |
@@ -158,7 +167,7 @@ NIGHTGATE runs two independent flows that meet at one reconciliation point. The 
 | Pipeline | Where it runs | What it does |
 |---|---|---|
 | **Block crawler** | Main thread | Catch-up + live block subscription via Substrate RPC; writes Blocks/Tx/Actions/UTXOs/Balances into CAP DB |
-| **Wallet SDK** | `worker_threads` worker | ZK-aware wallet ops: shielded/unshielded/dust sub-wallets, transfer/swap/contract submission via the Midnight indexer + proof server |
+| **Wallet SDK** | `worker_threads` worker | ZK-aware wallet ops: shielded/unshielded/dust sub-wallets, transfer/contract submission via the Midnight indexer + prover (proof server or in-process wasm) |
 
 They meet at `reconcilePendingSubmission`: when the crawler indexes a transaction whose hash matches a row in `PendingSubmissions`, the row's status flips to `finalized`.
 
@@ -348,8 +357,8 @@ the same deterministic children and rebuilds the full typed parent result; it
 does not submit them again. Partially resolved workflows remain visible for
 operator action.
 
-This avoids duplicate on-chain effects. Wallet pre-warm, NIGHT transfer,
-shield/unshield and dust jobs use versioned persisted commands. Their command
+This avoids duplicate on-chain effects. Wallet pre-warm, NIGHT transfer and
+dust jobs use versioned persisted commands. Their command
 payload contains no seed material: the processor reloads encrypted signing
 material from the user-owned `WalletSessions` row, verifies `requestedBy`, and
 rebuilds the wallet facade. After a restart, a replayable job interrupted in
@@ -464,6 +473,10 @@ For per-action signatures and curl examples, see [actions.md](actions.md).
 - `UnshieldedUtxos`
 - `ZswapLedgerEvents`, `DustLedgerEvents`
 - `NightBalances`
+- `Documents`: anchored document hashes (`anchorDocument`)
+- `PredicateAttestations`: issued ZK predicate attestations
+- `DisclosureGrants`: on-chain disclosure ACL index
+- `GranteeIdentities`: registered grantee bindings
 - `PendingSubmissions` — submission lifecycle audit trail; READ is scoped to the caller's own sessions since 0.5.2 (admins read unfiltered)
 - `WalletSessions` — projection excludes `viewingKeyHash` and `encryptedViewingKey`; `encryptedSeedKey` also internal-only; READ is scoped to the owning `userId` since 0.5.2 (admins read unfiltered)
 
@@ -506,7 +519,7 @@ New enums in `db/types.cds`:
 | Local Midnight indexer (docker) | ✅ Optional `midnightntwrk/indexer-standalone:4.3.2` service |
 | Wallet state persistence | ✅ `WalletSyncStates` — restart resumes in seconds, not hours |
 | Worker-thread architecture | ✅ Wallet SDK isolated from main thread (Phase 1+2a+2b) |
-| Compact contracts | ✅ `counter` + `attestation-vault` registered with compiled artifacts shipped (0.3.0) |
+| Compact contracts | ✅ `counter` + `attestation-vault` + `shielded-token` registered with compiled artifacts shipped |
 | Live preprod end-to-end (T15) | ✅ Counter deployed live on preprod via the full stack (0.3.0) |
 | On-chain disclosure grants | ✅ `grantDisclosure`/`revokeDisclosure` + chain-indexed `DisclosureGrants` + `granteeBinding` + on-chain read gate (0.3.4). Live-validated through grant → index → read-back; live revoke pending a healthy preprod indexer |
 | Crawler-free state verification | ✅ `verifyAttestationState` / `verifyPredicateState` / `reindexDisclosures` read LIVE contract state (0.5.0); optional per-call `network` override reads another network's public indexer (0.7.0) |
@@ -545,7 +558,7 @@ srv/
     wallet-material-factory.ts      # session → walletMaterial (accountId, password)
     wallet-facade-builder.ts        # main-thread glue to the worker facade
     dust-registration.ts            # register/deregister wrappers
-    token-ops.ts                    # send/shield/unshield wrappers + diagnostics
+    token-ops.ts                    # sendNight wrapper + balance/fee diagnostics
   sessions/
     wallet-sessions.ts              # OData handlers for sessions + token ops
   utils/
@@ -597,11 +610,9 @@ npm run integration:contract-registry  # registry resolves the real compiled cou
 
 ## Testing baseline
 
-- 64 test suites (Vitest; migrated from Jest in 0.7.0 after CAP 10 deprecated the Jest harness)
-- 1163 tests passing
-- 0 failures
+- 68 test suites, 1248 tests, 0 failures (Vitest; migrated from Jest in 0.7.0 after CAP 10 deprecated the Jest harness; counts as of 0.11.0)
 - Integration scripts pass against the real SDK (`smoke:sdk`, `integration:*`)
-- Known coverage gap by design: the facade OPERATION bodies in `srv/midnight/wallet-worker.ts` (transfer/shield/unshield/dust/deploy) run the real SDK and are exercised by the live e2e scripts; the worker's RPC dispatch, facade lifecycle, genuine-sync gate and save/ack protocol are unit-tested in-thread (`wallet-worker-dispatch.test.ts`)
+- The worker's RPC dispatch, facade lifecycle, genuine-sync gate, save/ack protocol AND the facade operation bodies (transfer incl. `tokenTypeHex`, balance/fee reads, dust register/deregister, contract-call private-state seeding) are unit-tested in-thread against a fake facade (`wallet-worker-dispatch.test.ts`); real-SDK behavior is exercised by the live e2e scripts (`wasm-proving:e2e`, `wasm-contract:e2e`, `wasm-zswap:e2e`, `deploy:e2e`)
 - Coverage measurement note: the CAP-booted services execute the compiled `srv/*.js` (native require, outside vitest's module graph). The build emits sourcemaps and `vitest.config.ts` includes `srv/**/*.js` so this execution is remapped onto the `.ts` sources — don't remove either half, or every handler tested through the booted server reads as uncovered
 
 Run locally:

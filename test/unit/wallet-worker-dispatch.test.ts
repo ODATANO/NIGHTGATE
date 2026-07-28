@@ -13,12 +13,31 @@
  * (docs/reference.md "Testing baseline").
  */
 
+// In-memory private-state store answering the worker's private-state-rpc
+// messages (normally served by the main thread's CapDbPrivateStateProvider).
+const privateState = vi.hoisted(() => ({
+    store: {} as Record<string, unknown>,
+    calls: [] as Array<{ method: string; args: unknown[] }>
+}));
+
 const fakeParentPort = vi.hoisted(() => {
     const handlers: Record<string, Array<(...a: any[]) => void>> = {};
     return {
         on(ev: string, fn: (...a: any[]) => void) { (handlers[ev] ??= []).push(fn); return this; },
         emit(ev: string, ...args: any[]) { for (const fn of handlers[ev] ?? []) fn(...args); },
-        postMessage: vi.fn()
+        postMessage: vi.fn((msg: any) => {
+            if (msg?.kind !== 'private-state-rpc') return;
+            privateState.calls.push({ method: msg.method, args: msg.args });
+            if (!msg.port) return; // fire-and-forget (setContractAddress)
+            if (msg.method === 'get') {
+                msg.port.postMessage({ ok: true, result: privateState.store[String(msg.args[0])] });
+            } else if (msg.method === 'set') {
+                privateState.store[String(msg.args[0])] = msg.args[1];
+                msg.port.postMessage({ ok: true, result: undefined });
+            } else {
+                msg.port.postMessage({ ok: true, result: undefined });
+            }
+        })
     };
 });
 
@@ -48,7 +67,40 @@ vi.mock('@midnight-ntwrk/ledger-v8', () => ({
         fromSeed: vi.fn(() => ({ coinPublicKey: 'cpk', encryptionPublicKey: 'epk', clear: zswapClear }))
     },
     DustSecretKey: { fromSeed: vi.fn(() => ({ dustKey: true })) },
-    LedgerParameters: { initialParameters: vi.fn(() => ({ dust: { dustParams: true } })) }
+    LedgerParameters: { initialParameters: vi.fn(() => ({ dust: { dustParams: true } })) },
+    nativeToken: vi.fn(() => ({ raw: 'night-raw-type' }))
+}));
+
+// Receiver-address parsing + address encoding go through the real
+// parseReceiverAddress/encodeAddressString; only the SDK codec is stubbed.
+vi.mock('@midnightntwrk/wallet-sdk-address-format', () => ({
+    MidnightBech32m: {
+        parse: vi.fn((s: string) => ({ decode: vi.fn(() => ({ decoded: s })) })),
+        encode: vi.fn((_net: string, addr: any) => ({ toString: () => `enc:${JSON.stringify(addr)}` }))
+    },
+    ShieldedAddress: class {},
+    UnshieldedAddress: class {},
+    DustAddress: class {}
+}));
+
+// Contract-path SDK seams (loadContractsSdk + buildWorkerContractProviders).
+const findDeployedContract = vi.hoisted(() => (vi.fn()));
+vi.mock('@midnight-ntwrk/midnight-js-contracts', () => ({ findDeployedContract }));
+vi.mock('@midnight-ntwrk/midnight-js-indexer-public-data-provider', () => ({
+    indexerPublicDataProvider: vi.fn(() => ({ tag: 'publicData' }))
+}));
+const httpClientProofProvider = vi.hoisted(() => (vi.fn(() => ({ tag: 'http-proof' }))));
+vi.mock('@midnight-ntwrk/midnight-js-http-client-proof-provider', () => ({ httpClientProofProvider }));
+vi.mock('@midnight-ntwrk/midnight-js-node-zk-config-provider', () => ({
+    NodeZkConfigProvider: vi.fn().mockImplementation(function (dir: string) { return { tag: 'zkConfig', directory: dir }; } as any)
+}));
+vi.mock('@midnight-ntwrk/compact-js', () => ({
+    CompiledContract: {
+        make: vi.fn(() => ({ pipe: vi.fn(() => ({ compiled: true })) })),
+        withVacantWitnesses: vi.fn(),
+        withWitnesses: vi.fn(() => vi.fn()),
+        withCompiledFileAssets: vi.fn(() => vi.fn())
+    }
 }));
 
 const shieldedStart = vi.hoisted(() => (vi.fn(() => 'sh-fresh')));
@@ -61,7 +113,11 @@ const unshieldedStart = vi.hoisted(() => (vi.fn(() => 'un-fresh')));
 const unshieldedRestore = vi.hoisted(() => (vi.fn(() => 'un-restored')));
 vi.mock('@midnightntwrk/wallet-sdk-unshielded-wallet', () => ({
     UnshieldedWallet: vi.fn(() => ({ startWithPublicKey: unshieldedStart, restore: unshieldedRestore })),
-    createKeystore: vi.fn(() => ({ keystore: true })),
+    createKeystore: vi.fn(() => ({
+        keystore: true,
+        signData: vi.fn(() => 'night-signature'),
+        getPublicKey: vi.fn(() => 'night-verifying-key')
+    })),
     PublicKey: { fromKeyStore: vi.fn(() => 'night-pub') }
 }));
 
@@ -73,6 +129,20 @@ vi.mock('@midnightntwrk/wallet-sdk-dust-wallet', () => ({
 
 vi.mock('@midnightntwrk/wallet-sdk-abstractions', () => ({
     InMemoryTransactionHistoryStorage: class { constructor(..._a: any[]) { /* stub */ } }
+}));
+
+const makeWasmProvingService = vi.hoisted(() => (vi.fn((..._args: any[]) => ({ wasmProver: true }))));
+vi.mock('@midnightntwrk/wallet-sdk-capabilities/proving', () => ({
+    makeWasmProvingService
+}));
+
+// wasm mode shares one key-material provider via wasm-proof-provider's
+// loadDeps; stub its ESM imports so no real SDK loads in unit tests.
+vi.mock('@midnight-ntwrk/zkir-v2', () => ({ provingProvider: vi.fn(() => ({})) }));
+vi.mock('@midnight-ntwrk/midnight-js-types', () => ({ zkConfigToProvingKeyMaterial: vi.fn() }));
+const sharedKeyProvider = vi.hoisted(() => ({ lookupKey: vi.fn(), getParams: vi.fn() }));
+vi.mock('@midnightntwrk/wallet-sdk-prover-client/effect', () => ({
+    WasmProver: { makeDefaultKeyMaterialProvider: () => sharedKeyProvider }
 }));
 
 // The facade mock invokes the shielded/unshielded/dust factory closures like
@@ -121,6 +191,7 @@ vi.mock('ws', () => {
 });
 
 import { MessageChannel } from 'node:worker_threads';
+import path from 'node:path';
 
 function makeFakeFacade() {
     const facade: any = {
@@ -128,13 +199,29 @@ function makeFakeFacade() {
         stop: vi.fn(async () => undefined),
         shielded: { serializeState: vi.fn(async () => 'BLOB-SH') },
         unshielded: { serializeState: vi.fn(async () => 'BLOB-UN') },
-        dust: { serializeState: vi.fn(async () => 'BLOB-DU') },
+        dust: { serializeState: vi.fn(async () => 'BLOB-DU'), getAddress: vi.fn(async () => 'mn_dust_own_address') },
         state: () => ({
             subscribe(obs: any) { obs.next(facadeState.current); return { unsubscribe() { /* noop */ } }; }
         }),
         waitForSyncedState: vi.fn(async () => undefined),
-        revert: vi.fn(async () => undefined)
+        revert: vi.fn(async () => undefined),
+        transferTransaction: vi.fn(async () => ({ type: 'UNPROVEN_TRANSACTION', transaction: { unproven: true } })),
+        signRecipe: vi.fn(async (r: any) => r),
+        finalizeRecipe: vi.fn(async () => ({ finalized: true })),
+        submitTransaction: vi.fn(async () => 'tx-hash-fixture'),
+        calculateTransactionFee: vi.fn(async () => 42n),
+        registerNightUtxosForDustGeneration: vi.fn(async () => ({ type: 'RECIPE', transaction: { reg: true } })),
+        deregisterFromDustGeneration: vi.fn(async () => ({ transaction: { dereg: true } })),
+        balanceUnprovenTransaction: vi.fn(async () => ({ balanced: true }))
     };
+    return facade;
+}
+
+/** Init a fresh session and hand back its fake facade for stubbing. */
+async function initSession(sessionId: string) {
+    const reply = await rpc('init', { ...INIT_ARGS, sessionId });
+    expect(reply.ok).toBe(true);
+    const facade = await facadeInit.mock.results.at(-1)!.value;
     return facade;
 }
 
@@ -186,17 +273,16 @@ describe('boot handshake', () => {
     it('announced readiness on load', () => {
         // postMessage was cleared in beforeEach, so assert on the recorded
         // module-load behavior instead: the dispatcher is registered and a
-        // ping round-trips.
-        return expect(rpc('ping', {})).resolves.toMatchObject({ ok: true });
+        // cheap RPC (evict of an unknown session) round-trips.
+        return expect(rpc('evict', { sessionId: 'ghost-boot-check' })).resolves.toMatchObject({ ok: true });
     });
 });
 
 describe('dispatcher', () => {
     it('replies ok with the handler result and closes the port', async () => {
-        const reply = await rpc('ping', {});
+        const reply = await rpc('evict', { sessionId: 'ghost-dispatcher-check' });
         expect(reply.ok).toBe(true);
-        expect(reply.result.ok).toBe(true);
-        expect(typeof reply.result.ts).toBe('number');
+        expect(reply.result.evicted).toBe(false);
     });
 
     it('replies with a structured error for an unknown method', async () => {
@@ -269,21 +355,50 @@ describe('init', () => {
             delete process.env.NIGHTGATE_DUST_COLD_START;
         }
     });
+
+    it('passes no provingService by default (facade uses its server prover)', async () => {
+        facadeInit.mockClear();
+        const reply = await rpc('init', { ...INIT_ARGS, sessionId: 'session-provedefault-dddddd' });
+        expect(reply.ok).toBe(true);
+        expect(facadeInit.mock.calls[0][0].provingService).toBeUndefined();
+    });
+
+    it('NIGHTGATE_PROVING_MODE=wasm passes a provingService that builds the WASM prover with the SHARED key provider', async () => {
+        process.env.NIGHTGATE_PROVING_MODE = 'wasm';
+        try {
+            facadeInit.mockClear();
+            makeWasmProvingService.mockClear();
+            const reply = await rpc('init', { ...INIT_ARGS, sessionId: 'session-provewasm-eeeeeeee' });
+            expect(reply.ok).toBe(true);
+            const provingService = facadeInit.mock.calls[0][0].provingService;
+            expect(typeof provingService).toBe('function');
+            expect(provingService()).toEqual({ wasmProver: true });
+            // The per-worker shared key provider must be passed, otherwise the
+            // SDK builds a fresh S3 cache per session.
+            expect(makeWasmProvingService).toHaveBeenCalledWith({ keyMaterialProvider: sharedKeyProvider });
+        } finally {
+            delete process.env.NIGHTGATE_PROVING_MODE;
+        }
+    });
+
+    it('an unknown NIGHTGATE_PROVING_MODE falls back to server and warns', async () => {
+        process.env.NIGHTGATE_PROVING_MODE = 'gpu';
+        try {
+            facadeInit.mockClear();
+            const reply = await rpc('init', { ...INIT_ARGS, sessionId: 'session-provebogus-ffffff' });
+            expect(reply.ok).toBe(true);
+            expect(facadeInit.mock.calls[0][0].provingService).toBeUndefined();
+            const warns = fakeParentPort.postMessage.mock.calls
+                .map(c => c[0])
+                .filter((m: any) => m.kind === 'log' && m.level === 'warn' && /NIGHTGATE_PROVING_MODE 'gpu'/.test(m.message));
+            expect(warns.length).toBe(1);
+        } finally {
+            delete process.env.NIGHTGATE_PROVING_MODE;
+        }
+    });
 });
 
-describe('serializeState / evict', () => {
-    it('serializeState returns the sub-wallet blobs', async () => {
-        const reply = await rpc('serializeState', { sessionId: INIT_ARGS.sessionId });
-        expect(reply.ok).toBe(true);
-        expect(reply.result.blobs).toEqual({ shielded: 'BLOB-SH', unshielded: 'BLOB-UN', dust: 'BLOB-DU' });
-    });
-
-    it('serializeState fails cleanly for an unknown session', async () => {
-        const reply = await rpc('serializeState', { sessionId: 'ghost-session-xxxxxxxxxxxxx' });
-        expect(reply.ok).toBe(false);
-        expect(reply.error.message).toMatch(/No facade for sessionId/);
-    });
-
+describe('evict', () => {
     it('evict pushes a final save, clears the keys, stops the facade', async () => {
         const reply = await rpc('evict', { sessionId: 'session-restore-bbbbbbbbbbbb' });
         expect(reply.ok).toBe(true);
@@ -827,5 +942,238 @@ describe('sponsored dispatch guards', () => {
         });
         expect(reply.ok).toBe(false);
         expect(reply.error.message).toMatch(/No facade for sponsorSessionId=ghost-sponsor-xx/);
+    });
+});
+
+// ---- transferNight (token-type selection + ledger routing) -----------------
+
+describe('transferNight', () => {
+    it('defaults to NIGHT and routes an mn_addr_ receiver to the unshielded ledger', async () => {
+        const facade = await initSession('session-transfer-night-aaaa');
+        const reply = await rpc('transferNight', {
+            sessionId: 'session-transfer-night-aaaa',
+            receiverAddress: 'mn_addr_preprod1' + 'x'.repeat(48),
+            amount: '1234'
+        });
+        expect(reply.ok).toBe(true);
+        expect(reply.result.txId).toBe('tx-hash-fixture');
+        expect(reply.result.toLedger).toBe('unshielded');
+
+        const outputs = facade.transferTransaction.mock.calls[0][0];
+        expect(outputs[0].type).toBe('unshielded');
+        expect(outputs[0].outputs[0].type).toBe('night-raw-type');
+        expect(outputs[0].outputs[0].amount).toBe(1234n);
+        // Unshielded spends are signature-authorized: signRecipe must run.
+        expect(facade.signRecipe).toHaveBeenCalled();
+        expect(facade.finalizeRecipe).toHaveBeenCalled();
+        expect(facade.submitTransaction).toHaveBeenCalled();
+    });
+
+    it('tokenTypeHex overrides the NIGHT raw type', async () => {
+        const facade = await initSession('session-transfer-token-bbbb');
+        const custom = 'ab'.repeat(32);
+        const reply = await rpc('transferNight', {
+            sessionId: 'session-transfer-token-bbbb',
+            receiverAddress: 'mn_shield-addr_preprod1' + 'x'.repeat(40),
+            amount: '5',
+            tokenTypeHex: custom
+        });
+        expect(reply.ok).toBe(true);
+        const outputs = facade.transferTransaction.mock.calls[0][0];
+        expect(outputs[0].type).toBe('shielded');
+        expect(outputs[0].outputs[0].type).toBe(custom);
+    });
+
+    it('rejects a receiver with a foreign prefix', async () => {
+        await initSession('session-transfer-badaddr-cc');
+        const reply = await rpc('transferNight', {
+            sessionId: 'session-transfer-badaddr-cc',
+            receiverAddress: 'addr_test1qq' + 'x'.repeat(50),
+            amount: '1'
+        });
+        expect(reply.ok).toBe(false);
+        expect(reply.error.message).toMatch(/Unsupported receiver address prefix/);
+    });
+});
+
+// ---- getBalance + estimateTransferFee --------------------------------------
+
+describe('getBalance / estimateTransferFee', () => {
+    it('getBalance maps NIGHT balances, dust balance and UTXO counts from the synced state', async () => {
+        const facade = await initSession('session-balance-dddddddddd');
+        facade.waitForSyncedState.mockResolvedValue({
+            shielded: { balances: { 'night-raw-type': 111n } },
+            unshielded: {
+                balances: { 'night-raw-type': 222n },
+                totalCoins: [
+                    { meta: { registeredForDustGeneration: true } },
+                    { meta: { registeredForDustGeneration: false } },
+                    {}
+                ]
+            },
+            // dust.balance lives on the SYNCED FacadeState, not facade.dust:
+            // exactly the wrong-object trap the implementation comment warns
+            // about, so the fixture models the correct location.
+            dust: { balance: vi.fn(() => 333n), progress: {} }
+        });
+        const reply = await rpc('getBalance', { sessionId: 'session-balance-dddddddddd' });
+        expect(reply.ok).toBe(true);
+        expect(reply.result).toEqual({
+            shieldedNight: '111',
+            unshieldedNight: '222',
+            dustBalance: '333',
+            registeredNightUtxoCount: 1,
+            totalNightUtxoCount: 3
+        });
+    });
+
+    it('estimateTransferFee prices via calculateTransactionFee and ALWAYS reverts the recipe (bug_002)', async () => {
+        const facade = await initSession('session-estimate-eeeeeeee');
+        const reply = await rpc('estimateTransferFee', {
+            sessionId: 'session-estimate-eeeeeeee',
+            receiverAddress: 'mn_addr_preprod1' + 'x'.repeat(48),
+            amount: '10'
+        });
+        expect(reply.ok).toBe(true);
+        expect(reply.result).toEqual({ fee: '42', toLedger: 'unshielded' });
+        expect(facade.calculateTransactionFee).toHaveBeenCalled();
+        expect(facade.revert).toHaveBeenCalled();
+        expect(facade.submitTransaction).not.toHaveBeenCalled();
+    });
+});
+
+// ---- dust register / deregister --------------------------------------------
+
+describe('registerDustGeneration / deregisterDustGeneration', () => {
+    it('registers exactly the UNREGISTERED subset of available coins', async () => {
+        const facade = await initSession('session-dustreg-ffffffff');
+        const unreg1 = { id: 'c1', meta: { registeredForDustGeneration: false } };
+        const unreg2 = { id: 'c2' };
+        const reg = { id: 'c3', meta: { registeredForDustGeneration: true } };
+        facade.waitForSyncedState.mockResolvedValue({
+            unshielded: { availableCoins: [reg, unreg1, unreg2] }
+        });
+        const reply = await rpc('registerDustGeneration', { sessionId: 'session-dustreg-ffffffff' });
+        expect(reply.ok).toBe(true);
+        expect(reply.result.registeredCount).toBe(2);
+        expect(reply.result.totalNightUtxos).toBe(3);
+        expect(reply.result.txId).toBe('tx-hash-fixture');
+        const [coins] = facade.registerNightUtxosForDustGeneration.mock.calls[0];
+        expect(coins).toEqual([unreg1, unreg2]);
+    });
+
+    it('returns a no-op result when every coin is already registered', async () => {
+        const facade = await initSession('session-dustreg-noop-gggg');
+        facade.waitForSyncedState.mockResolvedValue({
+            unshielded: { availableCoins: [{ meta: { registeredForDustGeneration: true } }] }
+        });
+        const reply = await rpc('registerDustGeneration', { sessionId: 'session-dustreg-noop-gggg' });
+        expect(reply.ok).toBe(true);
+        expect(reply.result).toMatchObject({ txId: null, registeredCount: 0, totalNightUtxos: 1 });
+        expect(facade.registerNightUtxosForDustGeneration).not.toHaveBeenCalled();
+    });
+
+    it('deregisters the REGISTERED subset of totalCoins and balances the fee-less recipe with dust', async () => {
+        const facade = await initSession('session-dustdereg-hhhhhh');
+        const reg1 = { id: 'r1', meta: { registeredForDustGeneration: true } };
+        const unreg = { id: 'r2', meta: { registeredForDustGeneration: false } };
+        facade.waitForSyncedState.mockResolvedValue({
+            unshielded: { totalCoins: [reg1, unreg] }
+        });
+        const reply = await rpc('deregisterDustGeneration', { sessionId: 'session-dustdereg-hhhhhh' });
+        expect(reply.ok).toBe(true);
+        expect(reply.result).toMatchObject({ deregisteredCount: 1, totalNightUtxos: 2, txId: 'tx-hash-fixture' });
+        const [coins] = facade.deregisterFromDustGeneration.mock.calls[0];
+        expect(coins).toEqual([reg1]);
+        // The recipe is fee-less by design; the caller must balance ['dust']
+        // (otherwise node error 138) and must NOT re-sign (error 192).
+        const balanceOpts = facade.balanceUnprovenTransaction.mock.calls[0][2];
+        expect(balanceOpts.tokenKindsToBalance).toEqual(['dust']);
+        expect(facade.signRecipe).not.toHaveBeenCalled();
+    });
+
+    it('deregister falls back across the SDK naming generations (allCoins) and no-ops when none registered', async () => {
+        const facade = await initSession('session-dustdereg-noop-ii');
+        facade.waitForSyncedState.mockResolvedValue({
+            unshielded: { allCoins: [{ meta: { registeredForDustGeneration: false } }] }
+        });
+        const reply = await rpc('deregisterDustGeneration', { sessionId: 'session-dustdereg-noop-ii' });
+        expect(reply.ok).toBe(true);
+        expect(reply.result).toMatchObject({ txId: null, deregisteredCount: 0, totalNightUtxos: 1 });
+        expect(facade.deregisterFromDustGeneration).not.toHaveBeenCalled();
+    });
+});
+
+// ---- submitContractCall: first-contact private-state seeding guard ----------
+
+describe('submitContractCall private-state seeding', () => {
+    const REGISTRATION = {
+        artifactPath: path.resolve(process.cwd(), 'test/fixtures/fake-contract-artifact.mjs'),
+        privateStateId: 'fakePrivateState',
+        zkConfigPath: path.resolve(process.cwd(), 'test/fixtures')
+    };
+
+    function callArgs(sessionId: string) {
+        return {
+            sessionId,
+            proxyId: 'proxy-seed-test',
+            contractName: 'fake-artifact',
+            registration: REGISTRATION,
+            contractAddress: 'ab'.repeat(32),
+            circuit: 'increment',
+            args: [],
+            indexerHttpUrl: 'http://indexer.seed-test/api/v4/graphql',
+            indexerWsUrl: 'ws://indexer.seed-test/api/v4/graphql/ws',
+            proofServerUrl: 'http://proof.seed-test:6300',
+            networkId: 'preprod'
+        };
+    }
+
+    beforeEach(() => {
+        privateState.store = {};
+        privateState.calls = [];
+        findDeployedContract.mockReset();
+        findDeployedContract.mockResolvedValue({
+            callTx: { increment: vi.fn(async () => ({ public: { txHash: 'tx-cc-fixture', status: 'SUCCESS' } })) }
+        });
+    });
+
+    it('seeds initialPrivateState ONLY when this wallet has no stored state', async () => {
+        await initSession('session-seed-fresh-jjjjjj');
+        const reply = await rpc('submitContractCall', {
+            ...callArgs('session-seed-fresh-jjjjjj'),
+            initialPrivateState: { seeded: true }
+        });
+        expect(reply.ok).toBe(true);
+        expect(reply.result).toEqual({ txHash: 'tx-cc-fixture', onChainStatus: 'SUCCESS' });
+
+        const opts = findDeployedContract.mock.calls[0][1];
+        expect(opts.initialPrivateState).toEqual({ seeded: true });
+
+        // The probe must set the contract address BEFORE reading the state,
+        // or the provider rejects with "Contract address not set".
+        const methods = privateState.calls.map(c => c.method);
+        expect(methods.indexOf('setContractAddress')).toBeGreaterThanOrEqual(0);
+        expect(methods.indexOf('setContractAddress')).toBeLessThan(methods.indexOf('get'));
+    });
+
+    it('NEVER passes initialPrivateState when state already exists (it would overwrite it)', async () => {
+        privateState.store['fakePrivateState'] = { existing: 'state' };
+        await initSession('session-seed-existing-kkkk');
+        const reply = await rpc('submitContractCall', {
+            ...callArgs('session-seed-existing-kkkk'),
+            initialPrivateState: { seeded: true }
+        });
+        expect(reply.ok).toBe(true);
+        const opts = findDeployedContract.mock.calls[0][1];
+        expect('initialPrivateState' in opts).toBe(false);
+    });
+
+    it('fails cleanly when the circuit does not exist on the deployed contract', async () => {
+        await initSession('session-seed-nocircuit-ll');
+        findDeployedContract.mockResolvedValue({ callTx: {} });
+        const reply = await rpc('submitContractCall', callArgs('session-seed-nocircuit-ll'));
+        expect(reply.ok).toBe(false);
+        expect(reply.error.message).toMatch(/Circuit 'increment' not found/);
     });
 });

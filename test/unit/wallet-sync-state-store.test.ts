@@ -88,7 +88,6 @@ vi.mock('../../srv/utils/cds-model', () => ({
 import {
     saveSyncState,
     loadSyncState,
-    deleteSyncState,
     getWalletSdkVersion,
     __resetDbHandleForTests
 } from '../../srv/submission/wallet-sync-state-store';
@@ -227,24 +226,6 @@ describe('saveSyncState / loadSyncState round-trip', () => {
         expect(loaded!.shielded).toBe('sh-second');
         expect(loaded!.dust).toBe('du-9');
         expect(loaded!.unshielded).toBeUndefined();
-    });
-});
-
-describe('deleteSyncState', () => {
-    test('removes the row so subsequent load returns null', async () => {
-        await saveSyncState({
-            accountId: 'acct-E',
-            passphrase: PASS,
-            sdkVersion: SDK,
-            states: { dust: 'du-7' }
-        });
-        await deleteSyncState('acct-E');
-        const loaded = await loadSyncState({
-            accountId: 'acct-E',
-            passphrase: PASS,
-            expectedSdkVersion: SDK
-        });
-        expect(loaded).toBeNull();
     });
 });
 

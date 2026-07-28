@@ -1,0 +1,23 @@
+// Shielded test token for the zswap in-process proving measurement
+// (docs/feature-requests/wasm-proving-without-docker.md). mint() mints a
+// fixed amount of this contract's shielded token to the CALLER's zswap
+// public key. The wallet then holds shielded coins it can self-transfer,
+// which is the only way to exercise the zswap prover circuits: NIGHT is
+// unshielded-only, so no NIGHT flow ever touches them.
+
+pragma language_version >= 0.20;
+
+import CompactStandardLibrary;
+
+// mint round; feeds evolveNonce so every minted coin gets a fresh nonce
+export ledger round: Counter;
+
+export circuit mint(): [] {
+  round.increment(1);
+  mintShieldedToken(
+    pad(32, "nightgate:zswap-e2e"),
+    100000000,
+    evolveNonce(round.read() as Uint<128>, pad(32, "nightgate:zswap-e2e")),
+    left<ZswapCoinPublicKey, ContractAddress>(ownPublicKey())
+  );
+}

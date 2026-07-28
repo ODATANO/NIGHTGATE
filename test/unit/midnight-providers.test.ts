@@ -16,15 +16,21 @@ import {
 } from '../../srv/midnight/providers';
 import { loadMidnightSdk, resetMidnightSdkCache } from '../../srv/midnight/sdk-loader';
 
+// Proving-mode seam: default server mode; individual tests flip to wasm.
+const provingMode = vi.hoisted(() => ({ wasm: false }));
+const buildWasmProofProvider = vi.hoisted(() => (vi.fn(async (zk: any) => ({ tag: 'wasm-proof', zkRef: zk }))));
+vi.mock('../../srv/midnight/wasm-proof-provider', () => ({
+    isWasmProvingMode: vi.fn(() => provingMode.wasm),
+    buildWasmProofProvider
+}));
+
 // Replace loadMidnightSdk with a hand-built fake.
 vi.mock('../../srv/midnight/sdk-loader', () => {
     const fake = {
-        contracts: {},
         indexer:  { indexerPublicDataProvider: vi.fn((http: string, ws: string, wsImpl?: unknown) => ({ tag: 'publicData', http, ws, wsImpl: !!wsImpl })) },
         proof:    { httpClientProofProvider: vi.fn((url: string, zk: unknown) => ({ tag: 'proof', url, zkRef: zk })) },
         zk:       { NodeZkConfigProvider: vi.fn().mockImplementation(function (dir: string) { return { tag: 'zkConfig', directory: dir }; } as any) },
-        level:    { levelPrivateStateProvider: vi.fn((cfg: any) => ({ tag: 'privateState', accountId: cfg.accountId, hasPasswordFn: typeof cfg.privateStoragePasswordProvider === 'function' })) },
-        facade:   {}
+        level:    { levelPrivateStateProvider: vi.fn((cfg: any) => ({ tag: 'privateState', accountId: cfg.accountId, hasPasswordFn: typeof cfg.privateStoragePasswordProvider === 'function' })) }
     };
     return {
         loadMidnightSdk: vi.fn(async () => fake),
@@ -55,6 +61,17 @@ describe('buildContractProviders', () => {
             url: validCfg.proofServerUrl,
             zkRef: bundle.zkConfigProvider
         });
+    });
+
+    test('NIGHTGATE_PROVING_MODE=wasm routes contract proving to the in-process provider', async () => {
+        provingMode.wasm = true;
+        try {
+            const bundle = await buildContractProviders(validCfg);
+            expect(bundle.proofProvider).toMatchObject({ tag: 'wasm-proof' });
+            expect(buildWasmProofProvider).toHaveBeenCalledWith(bundle.zkConfigProvider);
+        } finally {
+            provingMode.wasm = false;
+        }
     });
 
     test.each([

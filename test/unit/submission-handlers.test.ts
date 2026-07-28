@@ -65,7 +65,7 @@ import {
 import {
     coerceCircuitArgs,
     loadCircuitArgTypes,
-    clearArgTypeCache,
+    __clearArgTypeCacheForTests,
     CoercionError,
     type CircuitArgType
 } from '../../srv/submission/arg-coercion';
@@ -1606,7 +1606,7 @@ describe('arg-coercion: loadCircuitArgTypes (real attestation-vault artifact)', 
         'contracts', 'attestation-vault', 'src', 'managed', 'attestation-vault'
     );
 
-    beforeEach(() => clearArgTypeCache());
+    beforeEach(() => __clearArgTypeCacheForTests());
 
     test('attest → two Bytes<32> params', () => {
         const types = loadCircuitArgTypes(VAULT_ZK, 'attest');
@@ -1679,7 +1679,7 @@ describe('submitContractCall: Bytes/Uint arg coercion reaches the submitter', ()
             __dirname, '..', '..',
             'contracts', 'attestation-vault', 'src', 'managed', 'attestation-vault'
         );
-        clearArgTypeCache();
+        __clearArgTypeCacheForTests();
         // Use the REAL loader against the REAL attestation-vault artifact path.
         const { srv, submitter } = setup({
             circuitArgTypesLoader: undefined,

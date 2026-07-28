@@ -249,6 +249,23 @@ export interface SubmissionEndpointsConfig {
     zkConfigBasePath: string;
 }
 
+/**
+ * Effective proving mode for this process. Precedence:
+ *   1. NIGHTGATE_PROVING_MODE (`server` | `wasm`) when set explicitly,
+ *   2. `server` when a proof server was EXPLICITLY configured (env var or
+ *      cds config): existing deployments keep their container untouched,
+ *   3. `wasm` otherwise: the zero-config default runs against purely public
+ *      endpoints with no local Docker (in-process proving).
+ * `initialize()` pins the result into NIGHTGATE_PROVING_MODE before the
+ * wallet worker spawns, so worker and provider sites can keep reading the
+ * env var directly.
+ */
+export function resolveEffectiveProvingMode(config?: Record<string, any> | null): 'server' | 'wasm' {
+    const explicit = (readEnv('NIGHTGATE_PROVING_MODE') || '').trim().toLowerCase();
+    if (explicit === 'server' || explicit === 'wasm') return explicit;
+    return (readEnv('NIGHTGATE_PROOF_SERVER_URL') || config?.proofServerUrl) ? 'server' : 'wasm';
+}
+
 export function resolveSubmissionEndpoints(
     network: NightgateNetwork,
     config?: Record<string, any>

@@ -1,0 +1,8 @@
+{
+  "version": 3,
+  "file": "index.js",
+  "sourceRoot": "../../../../",
+  "sources": ["src/shielded-token.compact", "compiler/standard-library.compact"],
+  "names": [],
+  "mappings": ";;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;EAOA;;;;;;;;;;MAOA,AAAA,IAQC;;;;;;;;;;;;;;;;;;;;;;OAAA;;;;GACA;EAhBD;;;;;;;;;;;;;;;;;;;;;;;;;;IAKA;;;;;;;;;yEAA6B;;;;;;;GAW5B;ECcD,AAAA,QAA0B;kCACkB;;EAkF5C,AAAA,aAAyB,cAAuB;qCACC,cAAY;;;EAG7D,AAAA;;uBACE;uBACA;uBACA;uBACA;;UAEM,kBAAiC;;yCAAwB;iEAAY;;;;;;;;;;;;4BAAuB;IAClG;;;;;;;;;;;2HAAoB;;;;;;2HAAY;;;;;;;;;;;;;yDACd,QAAM;UAClB,8BAAoB,QAAM;IAChC;;;;;;;;;;;2HAA2B;;;;;;SAEtB;;sBAAqB;8CAAyB;;;;;;;;;;;;;MACjD;;;;;;;;;;;6HAA6B;;;;;;;WAExB;;EAGT,AAAA,eAA2B,SAAkB;;;;+DAGzC;0FACmB;;EAyGvB,AAAA,kBACE,QACA;;;0CAKU;8CACI;;sCACJ;sCAAoB;sCAAuB;;EApQvD,AAAA,iBAAA;oEAAA;;;EAAA,AAAA,kBAAA;qEAAA;;;EAAA,AAAA,oBAAA,SAAA;;uDAAA;uDAAA;;;EAAA,AAAA,sBAAA;yDAAA;;;EAAA,AAAA,wBAAA;2DAAA;;;EAAA,AAAA;;;;;;;;EAAA,AAAA,gDAAA,QAAA;;wDAAA;wDAAA;;;;;;;EDcA,AAAA,OAQC;UAPC,KAAK;IAAL;;;;;;;;;;6FAAA,KAAK;;;;wEAAA;;;;;0EAIS;;;;;;;;;;;+IAAK;;;;;GAGpB;;;;;;;;;;;;;;;;;;;;IAVD;qCAAA;;;;;;;;;;;0GAA6B;KAAA;;;;;;;;;;"
+}

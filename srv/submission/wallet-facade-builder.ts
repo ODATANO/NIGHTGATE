@@ -219,11 +219,13 @@ export async function evictWalletFacade(cacheKey: string): Promise<void> {
     }
 }
 
-export function getCacheSize(): number {
+/** Test-only: registry size probe (no production caller). */
+export function __getCacheSizeForTests(): number {
     return sessionRegistry.size;
 }
 
-export function clearAllFacades(): void {
+/** Test-only: reset the registry between tests (no production caller). */
+export function __clearAllFacadesForTests(): void {
     sessionRegistry.clear();
 }
 

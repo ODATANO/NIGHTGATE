@@ -12,9 +12,12 @@ Running NIGHTGATE day-to-day. Audience: anyone deploying it, debugging a stuck s
 | `npm run sync:start` | Bootstrap a wallet session | Calls `connectWallet` + `connectWalletForSigning` against `localhost:4004`, reads keys from `.env` |
 | `npm run sync:probe` | Check local indexer container | Verifies `localhost:8088` is up + returning data |
 | `npm run deploy:e2e` | End-to-end deploy flow | `sync:start` + `registerForDustGeneration` + 90 s wait + `deployContract(counter)` |
+| `npm run wasm-proving:e2e` | Verify in-process proving (server on `NIGHTGATE_PROVING_MODE=wasm`) | NIGHT self-transfer proved without a proof server; strongest with a dead `NIGHTGATE_PROOF_SERVER_URL` |
+| `npm run wasm-contract:e2e` | Verify contract flow under wasm mode | `deployContract(counter)` + `increment()`; in wasm mode both prove in-process |
+| `npm run wasm-zswap:e2e` | Measure zswap circuits in-process | Deploys `shielded-token`, mints, shielded self-transfer via `sendNight` `tokenTypeHex` |
 | `npm run build` | Before publish or after schema change | Generates `@cds-models/` types + compiles TS in-place |
 | `npm run typecheck` | Pre-commit | `tsc --noEmit` |
-| `npm test` | Pre-commit | Vitest with coverage (64 suites, 1163 tests) |
+| `npm test` | Pre-commit | Full Vitest suite with coverage |
 | Integration scripts | Verifying SDK wiring | `smoke:sdk`, `integration:providers`, `integration:wallet-keys`, `integration:wallet-facade`, `integration:contract-registry` |
 
 ### Why `serve:sync` and not `dev` for long runs
@@ -29,7 +32,7 @@ Two layers: `.env` (read by both CDS and our scripts) and CDS config under `cds.
 
 ```env
 # Network selection
-NIGHTGATE_NETWORK=preprod                                 # preprod | testnet | mainnet
+NIGHTGATE_NETWORK=preprod                                 # preview | testnet | preprod | mainnet | undeployed
 NIGHTGATE_NODE_URL=wss://rpc.preprod.midnight.network/    # Substrate RPC
 
 # Crawler control

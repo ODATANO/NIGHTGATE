@@ -31,8 +31,8 @@ vi.mock('../../srv/submission/wallet-sync-state-store', () => ({
 import {
     getOrBuildWalletFacade,
     evictWalletFacade,
-    getCacheSize,
-    clearAllFacades,
+    __getCacheSizeForTests,
+    __clearAllFacadesForTests,
     wireWorkerStateSaveSink,
     type WalletFacadeBuildArgs
 } from '../../srv/submission/wallet-facade-builder';
@@ -50,7 +50,7 @@ const baseArgs: WalletFacadeBuildArgs = {
 describe('wallet-facade-builder', () => {
     beforeEach(() => {
         vi.clearAllMocks();
-        clearAllFacades();
+        __clearAllFacadesForTests();
         mockWalletInit.mockResolvedValue({ facadeReady: true, alreadyExisted: false, sdkVersion: 'sdk-test' });
         mockWalletEvict.mockResolvedValue({ evicted: true });
         mockLoadSyncState.mockResolvedValue(undefined);
@@ -78,7 +78,7 @@ describe('wallet-facade-builder', () => {
                     relayUrl: baseArgs.relayUrl
                 }));
                 expect(result.facade).toBeDefined();
-                expect(getCacheSize()).toBe(1);
+                expect(__getCacheSizeForTests()).toBe(1);
             } finally {
                 logSpy.mockRestore();
             }
@@ -112,7 +112,7 @@ describe('wallet-facade-builder', () => {
                 expect(mockWalletInit).toHaveBeenCalledWith(expect.objectContaining({
                     restoreBlobs: undefined
                 }));
-                expect(getCacheSize()).toBe(0);
+                expect(__getCacheSizeForTests()).toBe(0);
             } finally {
                 logSpy.mockRestore();
             }
@@ -135,12 +135,12 @@ describe('wallet-facade-builder', () => {
             const logSpy = vi.spyOn(cds.log('nightgate:facade'), 'info').mockImplementation(() => {});
             try {
                 await getOrBuildWalletFacade('evict-me', baseArgs);
-                expect(getCacheSize()).toBe(1);
+                expect(__getCacheSizeForTests()).toBe(1);
 
                 await evictWalletFacade('evict-me');
 
                 expect(mockWalletEvict).toHaveBeenCalledWith('evict-me');
-                expect(getCacheSize()).toBe(0);
+                expect(__getCacheSizeForTests()).toBe(0);
             } finally {
                 logSpy.mockRestore();
             }
@@ -158,16 +158,16 @@ describe('wallet-facade-builder', () => {
         });
     });
 
-    describe('clearAllFacades / getCacheSize', () => {
+    describe('__clearAllFacadesForTests / __getCacheSizeForTests', () => {
         it('drops every registry entry when cleared', async () => {
             const logSpy = vi.spyOn(cds.log('nightgate:facade'), 'info').mockImplementation(() => {});
             try {
                 await getOrBuildWalletFacade('k1', baseArgs);
                 await getOrBuildWalletFacade('k2', baseArgs);
-                expect(getCacheSize()).toBe(2);
+                expect(__getCacheSizeForTests()).toBe(2);
 
-                clearAllFacades();
-                expect(getCacheSize()).toBe(0);
+                __clearAllFacadesForTests();
+                expect(__getCacheSizeForTests()).toBe(0);
             } finally {
                 logSpy.mockRestore();
             }

@@ -24,6 +24,8 @@ export interface SendNightArgs {
     ttlIso?: string;
     /** Max wait for wallet sync before send. Undefined = wait indefinitely. */
     syncTimeoutMs?: number;
+    /** Raw token type (64 hex) to send instead of NIGHT; e.g. a contract-minted shielded token. */
+    tokenTypeHex?: string;
 }
 
 export interface SendNightResult {
@@ -39,7 +41,8 @@ export async function sendNight(args: SendNightArgs): Promise<SendNightResult> {
         receiverAddress: args.receiverAddress,
         amount:          args.amount,
         ttlIso:          args.ttlIso,
-        syncTimeoutMs:   args.syncTimeoutMs
+        syncTimeoutMs:   args.syncTimeoutMs,
+        tokenTypeHex:    args.tokenTypeHex
     });
 }
 

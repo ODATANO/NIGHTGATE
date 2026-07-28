@@ -10,8 +10,7 @@
 import {
     buildAttestationVaultWitnesses,
     deriveAttestationSecret,
-    getContractWitnessFactory,
-    hasContractWitnessFactory
+    getContractWitnessFactory
 } from '../../srv/submission/contract-witnesses';
 
 describe('deriveAttestationSecret', () => {
@@ -188,11 +187,5 @@ describe('getContractWitnessFactory', () => {
         expect(getContractWitnessFactory('counter')).toBeUndefined();
         expect(getContractWitnessFactory('does-not-exist')).toBeUndefined();
         expect(getContractWitnessFactory('')).toBeUndefined();
-    });
-
-    test('hasContractWitnessFactory matches getContractWitnessFactory', () => {
-        expect(hasContractWitnessFactory('attestation-vault')).toBe(true);
-        expect(hasContractWitnessFactory('counter')).toBe(false);
-        expect(hasContractWitnessFactory('unknown')).toBe(false);
     });
 });

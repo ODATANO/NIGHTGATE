@@ -1,8 +1,8 @@
 /**
  * Tests for srv/submission/token-ops.ts, the thin wrapper layer that
- * orchestrates `sendNight` (and later shield/unshield) through the worker
- * RPC. Same mock pattern as dust-registration.test.ts: stub the
- * wallet-worker-client export, assert argument shape + result pass-through.
+ * orchestrates `sendNight` through the worker RPC. Same mock pattern as
+ * dust-registration.test.ts: stub the wallet-worker-client export, assert
+ * argument shape + result pass-through.
  *
  * Address-parsing + amount-validation live in the handler
  * (srv/sessions/wallet-sessions.ts) and on the worker; not exercised here.
@@ -50,6 +50,24 @@ describe('sendNight', () => {
             amount: '1000000',
             receiverAddress: 'mn_addr_preprod1xyz'
         });
+    });
+
+    test('forwards tokenTypeHex for custom-token sends', async () => {
+        walletTransferNight.mockResolvedValueOnce({
+            txId: 'tx-tok',
+            toLedger: 'shielded',
+            amount: '7',
+            receiverAddress: 'mn_shield-addr_preprod1abc'
+        });
+
+        await sendNight({
+            cacheKey:        'acc-T',
+            receiverAddress: 'mn_shield-addr_preprod1abc',
+            amount:          '7',
+            tokenTypeHex:    'ab'.repeat(32)
+        });
+
+        expect(walletTransferNight.mock.calls[0][0].tokenTypeHex).toBe('ab'.repeat(32));
     });
 
     test('omits ttlIso and syncTimeoutMs when not supplied', async () => {

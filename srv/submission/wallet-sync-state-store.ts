@@ -19,7 +19,7 @@
  */
 
 import cds from '@sap/cds';
-const { SELECT, INSERT, UPDATE, DELETE } = cds.ql;
+const { SELECT, INSERT, UPDATE } = cds.ql;
 import { WalletSyncStates } from '#cds-models/midnight';
 import { StorageEncryption, decryptWithPassword } from '../utils/storage-encryption';
 import { ensureNightgateModelLoaded } from '../utils/cds-model';
@@ -232,15 +232,6 @@ export async function loadSyncState(args: LoadSyncStateArgs): Promise<LoadedSync
     } catch {
         return null;
     }
-}
-
-/** Removes any persisted state for an account (e.g. on disconnectWallet). */
-export async function deleteSyncState(accountId: string): Promise<void> {
-    if (!accountId) return;
-    const db = await getDb();
-    await db.run(
-        DELETE.from(WalletSyncStates).where({ accountId })
-    );
 }
 
 /**

@@ -95,6 +95,8 @@ Source funds come from the same ledger as the receiver. There is no cross-ledger
 | `receiverAddress` | String | Bech32m, ≥ 50 chars |
 | `amount` | String | Decimal NIGHT atoms (parsed as `bigint` server-side; avoids Number precision loss). Sanity-bounded to `10^18`. |
 | `ttlIso` | String (optional) | ISO-8601 future timestamp; default = now+10min |
+| `tokenTypeHex` | String (optional) | Raw token type (64 hex, lowercased server-side) to send instead of NIGHT. Works on BOTH ledgers: the receiver address prefix decides whether the transfer spends shielded or unshielded holdings of that token. Shielded custom-token transfers are live-verified (see `contracts/shielded-token`); unshielded custom tokens go through the identical path but have not been exercised live yet. |
+| `idempotencyKey` | String (optional) | Dedupes retries against the original job |
 
 **Rate limit:** 10/min per client IP.
 
@@ -123,6 +125,7 @@ Register the wallet's **unregistered unshielded NIGHT UTXOs** for dust generatio
 |---|---|---|
 | `sessionId` | UUID | Must have signing enabled |
 | `dustReceiverAddress` | String (optional) | Bech32m DUST address (`mn_dust_*`); default = wallet's own dust address |
+| `idempotencyKey` | String (optional) | Dedupes retries against the original job |
 
 Initial DUST accrual takes ~1-2 minutes after the tx finalizes. Refill rate is ~5 tDUST per 100 hours (preprod parameters).
 
@@ -154,7 +157,7 @@ A row is inserted into `PendingSubmissions` BEFORE the SDK is invoked (crash-rec
 - 404 — contract not registered
 - 503 — retryable transient (network, 1016 on preprod)
 
-### `submitContractCall(contractAddress, circuit, compiledArtifactRef, sessionId, args, idempotencyKey?) → { jobId, status }`
+### `submitContractCall(contractAddress, circuit, compiledArtifactRef, sessionId, args, idempotencyKey?, initialPrivateState?, sponsorSessionId?) → { jobId, status }`
 
 Invoke a circuit on a deployed contract.
 
@@ -168,6 +171,7 @@ Invoke a circuit on a deployed contract.
 | `sessionId` | UUID | Must have signing enabled |
 | `args` | LargeString | JSON-encoded array (use `"[]"` for no args). See **Encoding circuit args** below |
 | `idempotencyKey` | String (optional) | Dedupes retries against the original job; reusing a key returns the existing `jobId` |
+| `initialPrivateState` | LargeString (optional) | JSON; seeded on this wallet's FIRST contact with the contract only (lets a non-deployer wallet act on a shared contract). Never overwrites existing private state. |
 | `sponsorSessionId` | UUID (optional) | Second session that pays the dust fee. See **Per-tx fee sponsoring** below |
 
 **Rate limit:** 30/min per session.

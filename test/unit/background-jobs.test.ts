@@ -469,6 +469,46 @@ describe('startJob: insert row + return jobId', () => {
         expect(rows.get(ret.jobId)?.status).toBe('succeeded');
     });
 
+    test('a SECOND reportExternalExecution in one job hits the one-external-submission invariant, not "Lease lost"', async () => {
+        let secondCallError: unknown;
+        const ret = await startJob({
+            kind: 'deployContract', sessionId: 'sess-1', request: {},
+            work: async () => {
+                await reportExternalExecution({ submissionId: 'sub-first' });
+                try {
+                    await reportExternalExecution({ submissionId: 'sub-second' });
+                } catch (err) {
+                    secondCallError = err;
+                    throw err;
+                }
+                return { ok: true };
+            }
+        });
+        await flushSpawn();
+        expect(String((secondCallError as Error)?.message)).toMatch(/at most one external submission/);
+        expect(String((secondCallError as Error)?.message)).not.toMatch(/Lease lost/);
+    });
+
+    test('a genuinely lost lease at the external-effect boundary reports "Lease lost"', async () => {
+        let boundaryError: unknown;
+        const ret = await startJob({
+            kind: 'deployContract', sessionId: 'sess-1', request: {},
+            work: async () => {
+                // Simulate another worker taking over before the boundary.
+                rows.get(ret.jobId)!.leaseOwner = 'some-other-worker';
+                try {
+                    await reportExternalExecution({ submissionId: 'sub-stolen' });
+                } catch (err) {
+                    boundaryError = err;
+                    throw err;
+                }
+                return { ok: true };
+            }
+        });
+        await flushSpawn();
+        expect(String((boundaryError as Error)?.message)).toMatch(/Lease lost before markJobExternalExecution/);
+    });
+
     test('routes a pre-broadcast live failure (no txHash) to failed, not reconciliation', async () => {
         const ret = await startJob({
             kind: 'deployContract', sessionId: 'sess-1', request: {},

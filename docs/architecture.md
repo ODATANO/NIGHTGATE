@@ -127,7 +127,7 @@ This was a bug in the first Phase 2b draft (worker passed the OData UUID as look
 ODATANO's Cardano transaction surface returns unsigned CBOR for external signing. The wallet's seed key never touches the server. Midnight doesn't support this pattern cleanly:
 
 - `facade.finalizeRecipe()` triggers **ZK proof generation**. The proof requires witness data derived from the wallet's secret keys.
-- The proof runs against a proof server the SDK calls over HTTP, fed the proving witnesses.
+- The proof runs against a proof server the SDK calls over HTTP, or fully in-process when `NIGHTGATE_PROVING_MODE=wasm` (SDK WASM prover for wallet circuits, `srv/midnight/wasm-proof-provider.ts` for contract circuits).
 - The result is a `FinalizedTransaction` that bundles proofs + signatures + binding into one opaque object.
 
 The `wallet-sdk-facade` doesn't expose a serialization of `FinalizedTransaction` for "build now, submit later" workflows. The low-level `ledger-v8.Transaction.serialize()` exists, but the facade doesn't surface it as part of its API contract.
@@ -178,7 +178,7 @@ For each contract deploy/call, the worker assembles a 6-provider bundle the SDK 
 |---|---|---|
 | `publicDataProvider` | `indexer-public-data-provider` package | GraphQL queries + WS subscriptions to the indexer |
 | `zkConfigProvider` | `node-zk-config-provider` package | Reads `keys/` and `zkir/` from the contract's `managed/` directory |
-| `proofProvider` | `http-client-proof-provider` package | HTTP to the proof server for ZK proof generation |
+| `proofProvider` | `http-client-proof-provider` package, or `srv/midnight/wasm-proof-provider.ts` when `NIGHTGATE_PROVING_MODE=wasm` | ZK proof generation for contract circuits: HTTP to the proof server, or in-process via zkir over the contract's local key material |
 | `privateStateProvider` | Proxy back to main thread's `CapDbPrivateStateProvider` | per-(accountId, contractAddress, privateStateId) CRUD |
 | `walletProvider` | Built from the worker's facade | `getCoinPublicKey`, `balanceTx`, `submitTx` |
 | `midnightProvider` | same object as `walletProvider` | per Counter CLI convention |

@@ -35,13 +35,17 @@ You should see non-zero `chainHeight` and the latest 5 blocks. **Done — read-s
 
 ## Path 2: Wallet sessions
 
-For wallet operations, the SDK runs in a separate worker thread and needs the proof server alongside. Add to `docker/docker-compose.yml` (already present) and start:
+For wallet operations, the SDK runs in a separate worker thread and needs a prover. Two options:
+
+**Default: no Docker at all.** With nothing configured, both wallet and contract circuits prove in-process (wasm mode); proving keys are fetched from Midnight's S3 on first use and cached in memory. A fresh install therefore works against purely public endpoints. Trade-off: each proof costs seconds of CPU in the worker thread.
+
+**Production: proof-server container.** Add to `docker/docker-compose.yml` (already present) and start:
 
 ```bash
 docker compose -f docker/docker-compose.yml up -d proof-server
 ```
 
-The proof server is small (~23 MB image) but downloads ZK parameters on first contract compile (~500 MB to a few GB depending on circuit). Parameters persist in the `proof-server-data` named volume.
+Configuring `NIGHTGATE_PROOF_SERVER_URL` (or `proofServerUrl` in cds config) selects server proving automatically; `NIGHTGATE_PROVING_MODE` overrides either way. The proof server is small (~23 MB image) but downloads ZK parameters on first contract compile (~500 MB to a few GB depending on circuit). Parameters persist in the `proof-server-data` named volume.
 
 ### Configure wallet credentials
 

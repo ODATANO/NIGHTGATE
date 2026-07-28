@@ -814,6 +814,20 @@ describe('wallet session handlers', () => {
             }
         });
 
+        it('lowercases tokenTypeHex before persisting the command (SDK matches exact lowercase)', async () => {
+            mockDbRun.mockResolvedValueOnce(activeSessionRow());
+            const req = createMockRequest({
+                sessionId: 's1',
+                receiverAddress: 'mn_shield-addr_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+                amount: '1',
+                tokenTypeHex: 'AB'.repeat(32)
+            });
+            await registeredHandlers['sendNight'](req);
+            const args = mockStartJob.mock.calls[0][0];
+            expect(args.command.tokenTypeHex).toBe('ab'.repeat(32));
+            expect(args.request.tokenTypeHex).toBe('ab'.repeat(32));
+        });
+
         it('returns { jobId, status } and defers sendNight to the job runner', async () => {
             mockDbRun.mockResolvedValueOnce(activeSessionRow());
             const req = createMockRequest({
@@ -825,6 +839,8 @@ describe('wallet session handlers', () => {
 
             expect(result).toEqual({ jobId: 'job-sendNight-test', status: 'pending' });
             expect(mockSendNight).not.toHaveBeenCalled();
+            // Funds-moving command: must persist encrypted (review_002 P-low).
+            expect(mockStartJob.mock.calls[0][0].encryptCommand).toBe(true);
 
             // Drive the captured work fn and confirm it dispatches with the
             // session's derived accountId + caller args.
@@ -835,7 +851,8 @@ describe('wallet session handlers', () => {
                 sessionId: 's1',
                 receiverAddress: 'mn_shield-addr_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
                 amount: '1',
-                ttlIso: null
+                ttlIso: null,
+                tokenTypeHex: null
             });
             mockSendNight.mockResolvedValueOnce({
                 txId: 'tx-send', toLedger: 'shielded', amount: '1', receiverAddress: 'mn_shield-addr_x'

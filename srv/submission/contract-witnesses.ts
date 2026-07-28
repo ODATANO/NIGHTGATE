@@ -146,7 +146,3 @@ const FACTORIES: Record<string, WitnessFactory> = {
 export function getContractWitnessFactory(contractName: string): WitnessFactory | undefined {
     return FACTORIES[contractName];
 }
-
-export function hasContractWitnessFactory(contractName: string): boolean {
-    return Object.prototype.hasOwnProperty.call(FACTORIES, contractName);
-}

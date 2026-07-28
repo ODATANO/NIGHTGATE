@@ -325,6 +325,20 @@ describe('wallet session guard branches', () => {
         expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/too short/));
     });
 
+    it('sendNight rejects a malformed tokenTypeHex (400) and accepts a valid one', async () => {
+        const base = { sessionId: 'sess-1', receiverAddress: 'mn_addr_' + 'x'.repeat(60), amount: '10' };
+
+        const bad = makeReq({ ...base, tokenTypeHex: 'not-hex' });
+        await handlers['sendNight'](bad);
+        expect(bad.reject).toHaveBeenCalledWith(400, expect.stringMatching(/tokenTypeHex/));
+
+        mockDbRun.mockResolvedValue(signingSessionRow());
+        const good = makeReq({ ...base, tokenTypeHex: 'ab'.repeat(32) });
+        const result = await handlers['sendNight'](good);
+        expect(good.reject).not.toHaveBeenCalled();
+        expect(result).toMatchObject({ status: 'pending' });
+    });
+
     it('sendNight rejects amount 0 and an amount above the sanity bound (400)', async () => {
         const base = { sessionId: 'sess-1', receiverAddress: 'mn_addr_' + 'x'.repeat(60) };
         const zero = makeReq({ ...base, amount: '0' });

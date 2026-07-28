@@ -22,6 +22,7 @@ import {
     resolveCrawlerlessChainConfirmEnabled,
     isCrawlerlessChainConfirmExplicitlyEnabled,
     resolveSubmissionEndpoints,
+    resolveEffectiveProvingMode,
     deriveIndexerWsUrl,
     DEFAULT_INDEXER_URLS
 } from '../../srv/utils/nightgate-config';
@@ -348,5 +349,37 @@ describe('resolveOverrideIndexerEndpoints (cross-network verify indexer endpoint
         delete process.env.NIGHTGATE_INDEXER_WS_URL;
         expect(eps.indexerHttpUrl).toBe(DEFAULT_INDEXER_URLS.mainnet.http);
         expect(eps.indexerWsUrl).toBe(DEFAULT_INDEXER_URLS.mainnet.ws);
+    });
+});
+
+describe('resolveEffectiveProvingMode', () => {
+    afterEach(() => {
+        delete process.env.NIGHTGATE_PROVING_MODE;
+        delete process.env.NIGHTGATE_PROOF_SERVER_URL;
+    });
+
+    test('defaults to wasm when nothing is configured (fully public zero-config)', () => {
+        expect(resolveEffectiveProvingMode(undefined)).toBe('wasm');
+        expect(resolveEffectiveProvingMode({})).toBe('wasm');
+    });
+
+    test('an explicitly configured proof server selects server mode', () => {
+        expect(resolveEffectiveProvingMode({ proofServerUrl: 'http://proof:6300' })).toBe('server');
+        process.env.NIGHTGATE_PROOF_SERVER_URL = 'http://proof-env:6300';
+        expect(resolveEffectiveProvingMode({})).toBe('server');
+    });
+
+    test('NIGHTGATE_PROVING_MODE wins over the proof-server heuristic, case-insensitively', () => {
+        process.env.NIGHTGATE_PROOF_SERVER_URL = 'http://proof-env:6300';
+        process.env.NIGHTGATE_PROVING_MODE = ' WASM ';
+        expect(resolveEffectiveProvingMode({})).toBe('wasm');
+        process.env.NIGHTGATE_PROVING_MODE = 'server';
+        expect(resolveEffectiveProvingMode(undefined)).toBe('server');
+    });
+
+    test('an unknown mode value falls through to the proof-server heuristic', () => {
+        process.env.NIGHTGATE_PROVING_MODE = 'gpu';
+        expect(resolveEffectiveProvingMode({})).toBe('wasm');
+        expect(resolveEffectiveProvingMode({ proofServerUrl: 'http://proof:6300' })).toBe('server');
     });
 });

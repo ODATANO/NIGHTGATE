@@ -1,18 +1,19 @@
 /**
- * OData handlers for NightgateService submission actions.
- *
- * - `deployContract`        → TransactionSubmitter.deploy()
- * - `submitContractCall`    → TransactionSubmitter.call()
+ * OData handlers for the NightgateService submission action families:
+ * contract submit (deploy / call / callBatch), document anchor + verify,
+ * predicate issue + verify (incl. field-bound), disclosure grant / revoke,
+ * passport registration, grantee registration, and the crawler-free
+ * state-verification reads.
  *
  * Responsibilities here (the submitter itself does NOT do any of these):
- *   1. Parse the JSON-encoded `args` / `initialPrivateState` payloads.
+ *   1. Parse and validate the JSON-encoded payloads (`args`,
+ *      `initialPrivateState`, ...).
  *   2. Rate-limit per sessionId (deploys are stricter than calls).
  *   3. Resolve `compiledArtifactRef` → compiled contract + zkConfigPath +
  *      privateStateId via the contract registry.
- *   4. Look up the wallet session and build WalletMaterial (real signing-capable
- *      material when the session has a seed; `WalletMaterialUnavailable` otherwise).
- *   5. Catch SubmissionError / SessionNotFoundError / ContractNotRegisteredError /
- *      WalletMaterialUnavailable and translate to OData status codes.
+ *   4. Look up the wallet session (signing key required: 412 without one).
+ *   5. Catch SubmissionError / SessionNotFoundError / ContractNotRegisteredError
+ *      and translate to OData status codes.
  *
  * The submitter (`srv/submission/TransactionSubmitter.ts`) handles the actual
  * SDK call, error classification, and PendingSubmissions row lifecycle.

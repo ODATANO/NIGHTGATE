@@ -12,7 +12,7 @@ import path from 'node:path';
 import {
     coerceCircuitArgs,
     loadCircuitArgTypes,
-    clearArgTypeCache,
+    __clearArgTypeCacheForTests,
     CoercionError,
     type CircuitArgType
 } from '../../srv/submission/arg-coercion';
@@ -160,12 +160,12 @@ describe('contract-info.json introspection', () => {
 
     beforeEach(() => {
         dir = fs.mkdtempSync(path.join(os.tmpdir(), 'nightgate-arginfo-'));
-        clearArgTypeCache();
+        __clearArgTypeCacheForTests();
     });
 
     afterEach(() => {
         fs.rmSync(dir, { recursive: true, force: true });
-        clearArgTypeCache();
+        __clearArgTypeCacheForTests();
     });
 
     function writeInfo(json: unknown): void {
@@ -205,7 +205,7 @@ describe('contract-info.json introspection', () => {
     it('returns undefined (not a throw) when contract-info.json is missing or unreadable', () => {
         expect(loadCircuitArgTypes(dir, 'any')).toBeUndefined();
         writeInfo('not json {{{');
-        clearArgTypeCache();
+        __clearArgTypeCacheForTests();
         fs.writeFileSync(path.join(dir, 'compiler', 'contract-info.json'), 'not json {{{');
         expect(loadCircuitArgTypes(dir, 'any')).toBeUndefined();
     });

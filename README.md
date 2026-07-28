@@ -11,7 +11,7 @@
 [![SAP CAP](https://img.shields.io/badge/SAP%20CAP-%40sap%2Fcds%20%5E10-0faaff?logo=sap)](https://cap.cloud.sap/)
 [![License](https://img.shields.io/badge/license-Apache--2.0-yellow)](LICENSE)
 
-`@odatano/nightgate` ties a SAP CAP runtime directly to the [Midnight](https://midnight.network/) blockchain. A built-in crawler indexes blocks from a Substrate RPC node into CAP entities; a worker-thread-isolated wallet stack handles ZK-aware transaction submission (deploy/call Compact contracts, send NIGHT, shield/unshield, dust generation). The whole surface is exposed through standard OData V4 — no GraphQL, no SDK lock-in for consumers.
+`@odatano/nightgate` ties a SAP CAP runtime directly to the [Midnight](https://midnight.network/) blockchain. A built-in crawler indexes blocks from a Substrate RPC node into CAP entities; a worker-thread-isolated wallet stack handles ZK-aware transaction submission (deploy/call Compact contracts, send NIGHT or custom tokens on both the shielded and the unshielded ledger, dust generation, fee sponsoring). The whole surface is exposed through standard OData V4.
 
 ```text
                             ┌──────────────────────────────────────┐
@@ -31,7 +31,7 @@
 │  │  - BlockProcessor    │                 │                          │    │
 │  │  - reorg detection   │                 │  - facade.start (sync)   │    │
 │  └─────────┬────────────┘                 │  - transferTransaction   │    │
-│            │ atomic writes                │  - initSwap              │    │
+│            │ atomic writes                │  - finalize (ZK prove)   │    │
 │            ▼                              │  - registerForDustGen    │    │
 │  ┌──────────────────────┐                 │  - deployContract        │    │
 │  │  CAP DB              │◄────state-save──┤  - submitContractCall    │    │
@@ -61,8 +61,11 @@ NIGHTGATE_NETWORK=preprod
 NIGHTGATE_NODE_URL=wss://rpc.preprod.midnight.network/
 #  GraphQL indexer (HTTP only; WS derived from it)                                 
 NIGHTGATE_INDEXER_HTTP_URL=https://indexer.preprod.midnight.network/api/v4/graphql
-# local proof server & wallets for submission (compose: midnightntwrk/proof-server on :6300)
-NIGHTGATE_PROOF_SERVER_URL=http://localhost:6300                                     
+# Proving defaults to fully in-process (wasm): no proof server needed.
+# For production, run the proof-server container (compose:
+# midnightntwrk/proof-server on :6300) and point at it; configuring the URL
+# selects server proving automatically.
+# NIGHTGATE_PROOF_SERVER_URL=http://localhost:6300
 NIGHTGATE_CRAWLER_ENABLED=false                   
 ENCRYPTION_KEY=<random secret>                   
 ```
@@ -79,10 +82,11 @@ Submit actions are **async**: they return `{ jobId, status }`; poll `getJobStatu
 |---|---|
 | Block indexing | Live + catch-up crawler with reorg detection (`srv/crawler/`); standard OData (`$filter`, `$orderby`, `$top`, `$expand`) on `Blocks`, `Transactions`, `ContractActions`, `UnshieldedUtxos`, `NightBalances` |
 | Wallet sessions | `connectWallet` (viewing key, read-only) upgraded via `connectWalletForSigning` (BIP39 mnemonic, HD-derived to match Lace); AES-256-GCM at rest, sessions bound to the requesting user |
-| Token ops | `sendNight` (receiver ledger auto-detected), `registerForDustGeneration` / `deregisterFromDustGeneration` |
+| Token ops | `sendNight` (receiver ledger auto-detected; optional `tokenTypeHex` sends any custom token instead of NIGHT, shielded or unshielded depending on the receiver address), `registerForDustGeneration` / `deregisterFromDustGeneration` |
 | Fee sponsoring | Generation delegation (`registerForDustGeneration` with a foreign `dustReceiverAddress`, own dust address via `deriveWalletInfo`) and per-tx sponsorship (optional `sponsorSessionId` on all submit actions: a second session pays the dust fee; cross-user use gated via `NIGHTGATE_FEE_SPONSOR_SESSION`) |
 | Pre-flight | `getWalletBalance`, `estimateSendNightFee`, `deriveWalletInfo` |
 | Compact contracts | `deployContract` / `submitContractCall` on registered compiled artifacts |
+| Proving modes | `wasm` (default when no proof server is configured: fully in-process for wallet AND contract circuits, no Docker needed) or `server` (proof-server container, selected automatically by configuring `proofServerUrl`; recommended for production). Explicit override via `NIGHTGATE_PROVING_MODE`. |
 | Document anchoring | `anchorDocument` / `verifyDocument`: sha256 hash on-chain, storage stays with the caller |
 | ZK predicate attestations | `issuePredicateAttestation` / `issueFieldPredicateAttestation` (field-bound via content root): prove `value ≤/≥ threshold` without revealing the value; `verifyPredicateAttestation` to check |
 | Crawler-free verification | `verifyAttestationState` / `verifyPredicateState` / `reindexDisclosures` read live contract state from the public indexer (per-call `network` override, no wallet, no local index) |
@@ -117,19 +121,18 @@ npm install @odatano/nightgate @cap-js/sqlite
 }
 ```
 
-Then `cds watch`. `network` is the only required key; everything else defaults to Preprod's public RPC + hosted indexer. Override via env vars or CDS config — see [docs/reference.md#configuration](docs/reference.md#configuration).
+Then `cds watch`. `network` is the only required key; everything else defaults to fully public endpoints: Preprod's public RPC, the hosted indexer, and in-process (wasm) proving, so no local container is required. Configure a proof-server URL to switch to server proving (recommended for production). Override via env vars or CDS config, see [docs/reference.md#configuration](docs/reference.md#configuration).
 
 ## Development
 
 ```bash
 npm run dev                # cds watch with 12 GB heap (scripts/dev.mjs)
-npm run serve:sync         # cds-serve with 12 GB heap — use this for long sync runs
+npm run serve:sync         # cds-serve with 12 GB heap, use this for long sync runs
 npm run sync:start         # bootstrap a wallet session against the running server
-npm run sync:probe         # check local Midnight indexer container status
 
 npm run typecheck          # tsc --noEmit
 npm run lint               # ESLint
-npm test                   # Vitest with coverage, 64 suites, 1163 tests
+npm test                   # full Vitest suite with coverage
 npm run build              # Compile CDS types + TypeScript to JS
 
 # Integration scripts (real SDK, no chain access required)
@@ -138,7 +141,8 @@ npm run integration:providers            # + wallet-keys, wallet-facade, contrac
                                          #   connector-routes, attestation-vault, derive-wallet-info
 
 # Live e2e against preprod (funded wallet required)
-npm run deploy:e2e         # + predicate:e2e, disclosure:e2e, state-verify:e2e
+npm run deploy:e2e         # + predicate:e2e, disclosure:e2e, state-verify:e2e,
+                           #   wasm-proving:e2e, wasm-contract:e2e, wasm-zswap:e2e
 ```
 
 ## License

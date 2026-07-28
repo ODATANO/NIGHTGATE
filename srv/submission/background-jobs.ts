@@ -48,10 +48,12 @@ const detachedJobScope = new AsyncResource('nightgate.detached-job-work');
 const DEFAULT_CONCURRENCY = { heavy: 4, light: 16 } as const;
 
 /**
- * Kinds where each job runs full ZK proof generation through the proof server.
- * 4 concurrent is enough to saturate one proof-server instance; wider just queues
- * inside it. "light" kinds (not in this set) are sync-bound (wait on
- * `waitForSyncedState`, no heavy compute here).
+ * Kinds where each job runs full ZK proof generation (proof server in the
+ * default `server` proving mode; in-process WASM proving under
+ * NIGHTGATE_PROVING_MODE=wasm, where proofs additionally serialize on the
+ * single worker thread). 4 concurrent saturates one proof-server instance;
+ * wider just queues inside it. "light" kinds (not in this set) are sync-bound
+ * (wait on `waitForSyncedState`, no heavy compute here).
  */
 const HEAVY_KINDS: ReadonlySet<string> = new Set([
     'registerForDustGeneration',

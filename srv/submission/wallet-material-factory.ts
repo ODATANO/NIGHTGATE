@@ -123,7 +123,8 @@ export async function buildWalletMaterialForSession(opts: BuildWalletMaterialOpt
             throw new SessionNotFoundError(opts.sessionId);
         }
         if (opts.facadeConfig) {
-            // WalletFacade-backed adapter with working balanceTx and submitTx.
+            // Adapter with real pubkeys; balanceTx/submitTx run in the worker,
+            // not through this main-thread object (see adapter doc below).
             walletAndMidnightProvider = await createFacadeBackedWalletAdapter(
                 accountId,
                 seedHex,
@@ -186,10 +187,12 @@ function createReadOnlyWalletAdapter(): any {
 }
 
 /**
- * Full signing adapter: real pubkeys from the derived ZswapSecretKeys, with
- * balanceTx/submitTx routed through a WalletFacade. The facade is built lazily on
- * the first balanceTx/submitTx (that request pays the chain-sync cost) and cached
- * per accountId. Balance TTL defaults to 1 hour (SDK default).
+ * Signing-capable adapter: real pubkeys from the derived ZswapSecretKeys.
+ * balanceTx/submitTx on THIS object still hit the phase-2 stub and throw;
+ * production balancing/submission runs inside the wallet worker
+ * (buildWorkerContractProviders + the worker facade), which looks the facade
+ * up by accountId. This adapter's job is to carry correct public keys into
+ * the provider bundle.
  */
 async function createFacadeBackedWalletAdapter(
     accountId: string,

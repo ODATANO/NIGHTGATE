@@ -76,8 +76,8 @@ vi.mock('../../srv/submission/wallet-facade-builder', () => ({
     wireWorkerStateSaveSink: vi.fn(),
     getOrBuildWalletFacade:  vi.fn(),
     evictWalletFacade:       vi.fn(async () => undefined),
-    getCacheSize:            vi.fn(() => 0),
-    clearAllFacades:         vi.fn()
+    __getCacheSizeForTests:            vi.fn(() => 0),
+    __clearAllFacadesForTests:         vi.fn()
 }));
 
 import cds from '@sap/cds';

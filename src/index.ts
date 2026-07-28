@@ -7,6 +7,7 @@ import {
     resolveNightgateRuntimeConfig,
     resolveCrawlerlessChainConfirmEnabled,
     isCrawlerlessChainConfirmExplicitlyEnabled,
+    resolveEffectiveProvingMode,
     VALID_NIGHTGATE_NETWORKS,
     getNightgatePluginConfig,
     DEFAULT_NETWORK
@@ -243,6 +244,16 @@ export async function initialize(): Promise<NightgateIndexerStatus> {
         const msg = regErr instanceof Error ? regErr.message : String(regErr);
         log.warn(`Contract registry load warning: ${msg}`);
     }
+
+    // Pin the effective proving mode into the env BEFORE the worker spawns
+    // (worker + provider sites read NIGHTGATE_PROVING_MODE directly). Default
+    // is fully public: in-process wasm proving unless a proof server was
+    // explicitly configured or the mode was set.
+    const provingMode = resolveEffectiveProvingMode(nightgateConfig);
+    process.env.NIGHTGATE_PROVING_MODE = provingMode;
+    log.info(`Proving mode: ${provingMode}` + (provingMode === 'wasm'
+        ? ' (in-process; set NIGHTGATE_PROOF_SERVER_URL or NIGHTGATE_PROVING_MODE=server for a proof server)'
+        : ` (proof server at ${submissionEndpoints.proofServerUrl})`));
 
     // Spin up the wallet worker thread now so it's ready when the first
     // connectWalletForSigning request lands. The Midnight wallet SDK

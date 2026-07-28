@@ -19,9 +19,10 @@
  *     surfaces worker-side console.log/warn lines into the main thread's
  *     unified log stream.
  *
- * Surface: init / waitForSyncedState / serializeState / evict, plus
- * balanceUnboundTransaction / submitTransaction /
- * registerNightUtxosForDustGeneration for the deploy path.
+ * Surface: the RPC handler map (`const handlers` below) is the authoritative
+ * method list; core ops are init / waitForSyncedState / evict, token + dust
+ * ops (transferNight, getBalance, estimate fees, register/deregister dust),
+ * and the contract path (deployContract, submitContractCall(+Batch)).
  */
 
 import { parentPort, MessageChannel, type MessagePort } from 'node:worker_threads';
@@ -30,6 +31,7 @@ import { pathToFileURL } from 'node:url';
 import { formatErr } from '../utils/format-error';
 import { deriveIndexerWsUrl } from '../utils/indexer-url';
 import { runBatchInScope } from './batch-call-scope';
+import { buildWasmProofProvider, getSharedKeyMaterialProvider } from './wasm-proof-provider';
 import {
     deriveAttestationSecret,
     getContractWitnessFactory
@@ -95,12 +97,43 @@ let cachedLedger: any;
 let cachedWallet: any;
 let cachedFacadeSdk: any;
 let cachedContractsSdk: any;
+let cachedProving: any;
 let cachedAddressFormat: typeof AddressFormat | undefined;
 
 async function loadAddressFormat(): Promise<typeof AddressFormat> {
     if (cachedAddressFormat) return cachedAddressFormat;
     cachedAddressFormat = await import('@midnightntwrk/wallet-sdk-address-format');
     return cachedAddressFormat;
+}
+
+// Loaded only when NIGHTGATE_PROVING_MODE=wasm; the default server path
+// never touches the WASM prover module.
+async function loadProvingSdk(): Promise<any> {
+    if (!cachedProving) {
+        cachedProving = await import('@midnightntwrk/wallet-sdk-capabilities/proving');
+    }
+    return cachedProving;
+}
+
+type ProvingMode = 'server' | 'wasm';
+
+/**
+ * NIGHTGATE_PROVING_MODE selects how transactions are proved: 'server'
+ * (default) proxies to the proof-server container at proofServerUrl; 'wasm'
+ * proves in-process, with no proof server needed. Wallet proving goes through
+ * the SDK's WASM prover; contract circuits go through our own
+ * wasm-proof-provider (zkir over the contract's local key material). Proving
+ * keys for the standard circuits are fetched from Midnight's S3 bucket into
+ * ONE shared in-memory cache per worker (getSharedKeyMaterialProvider), so
+ * they download once per process, not once per session.
+ */
+function resolveProvingMode(): ProvingMode {
+    const raw = (process.env.NIGHTGATE_PROVING_MODE || 'server').trim().toLowerCase();
+    if (raw === 'wasm') return 'wasm';
+    if (raw !== 'server') {
+        log('warn', `NIGHTGATE_PROVING_MODE '${raw}' is not 'server' or 'wasm'; using 'server'`);
+    }
+    return 'server';
 }
 
 async function loadSdk(): Promise<{
@@ -273,9 +306,18 @@ function buildWorkerContractProviders(args: {
                 args.indexerWsUrl,
                 WebSocket
             );
-            const proofProvider = proof.httpClientProofProvider(args.proofServerUrl, zkConfigProvider);
+            let proofProvider;
+            if (resolveProvingMode() === 'wasm') {
+                proofProvider = await buildWasmProofProvider(zkConfigProvider);
+                log('info', 'contract proving: in-process (wasm), proof server not used');
+            } else {
+                proofProvider = proof.httpClientProofProvider(args.proofServerUrl, zkConfigProvider);
+            }
             return { publicDataProvider, zkConfigProvider, proofProvider };
         })();
+        // A failed build (e.g. transient import error) must not stick: evict
+        // the rejected promise so the next deploy/call retries.
+        bundleP.catch(() => { contractProvidersCache.delete(cacheKey); });
         contractProvidersCache.set(cacheKey, bundleP);
     }
     return bundleP;
@@ -944,8 +986,20 @@ async function buildFacade(args: InitArgs): Promise<FacadeEntry> {
     const DustWallet = sdk.dust.DustWallet;
     const restore = args.restoreBlobs;
 
+    const provingMode = resolveProvingMode();
+    const proving = provingMode === 'wasm' ? await loadProvingSdk() : undefined;
+    // One shared provider per worker: makeWasmProvingService() would otherwise
+    // create a fresh in-memory key cache per session and re-download from S3.
+    const sharedKeys = provingMode === 'wasm' ? await getSharedKeyMaterialProvider() : undefined;
+    if (provingMode === 'wasm') {
+        log('info', 'proving mode: wasm (in-process prover; proof server not used for wallet proving)');
+    }
+
     const facade = await sdk.facade.WalletFacade.init({
         configuration,
+        // Without provingService the facade defaults to the SERVER prover at
+        // configuration.provingServerUrl (and throws if that is unset).
+        ...(proving ? { provingService: () => proving.makeWasmProvingService({ keyMaterialProvider: sharedKeys }) } : {}),
         shielded: () => restore?.shielded
             ? ShieldedWallet(configuration).restore(restore.shielded)
             : ShieldedWallet(configuration).startWithSecretKeys(zswapKeys),
@@ -1099,13 +1153,6 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
         return { synced: true };
     },
 
-    async serializeState({ sessionId }: { sessionId: string }) {
-        const entry = facades.get(sessionId);
-        if (!entry) throw new Error(`No facade for sessionId=${sessionId.slice(0, 16)}`);
-        const blobs = await collectSerializedStates(entry.facade);
-        return { sdkVersion: entry.sdkVersion, blobs };
-    },
-
     async evict({ sessionId }: { sessionId: string }) {
         const entry = facades.get(sessionId);
         if (!entry) return { evicted: false };
@@ -1142,10 +1189,6 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
         // Drop the now-idle lock chain (the gate withSessionLocks left behind).
         sessionChains.delete(sessionId);
         return { evicted: true };
-    },
-
-    async ping() {
-        return { ok: true, ts: Date.now() };
     },
 
     /**
@@ -1341,12 +1384,14 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
      * Build + balance + prove + submit all in-worker via `facade.transferTransaction`.
      * Returns primitives only; no SDK objects cross the thread boundary.
      */
-    async transferNight({ sessionId, receiverAddress, amount, ttlIso, syncTimeoutMs }: {
+    async transferNight({ sessionId, receiverAddress, amount, ttlIso, syncTimeoutMs, tokenTypeHex }: {
         sessionId: string;
         receiverAddress: string;
         amount: string;          // bigint atoms as decimal string
         ttlIso?: string;          // ISO-8601 future timestamp; defaults to +10min
         syncTimeoutMs?: number;
+        /** Raw token type (64 hex) to send instead of NIGHT; e.g. a contract-minted shielded token. */
+        tokenTypeHex?: string;
     }) {
         const entry = facades.get(sessionId);
         if (!entry) throw new Error(`No facade for sessionId=${sessionId.slice(0, 16)}`);
@@ -1366,14 +1411,14 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
 
         const receiver = await parseReceiverAddress(receiverAddress, entry.networkId);
         const amountBig = BigInt(amount);
-        const nightRawType = sdk.ledger.nativeToken().raw;
+        const rawType = tokenTypeHex || sdk.ledger.nativeToken().raw;
         const ttl = ttlIso ? new Date(ttlIso) : new Date(Date.now() + 10 * 60 * 1000);
 
         const outputs: any[] = receiver.kind === 'shielded'
-            ? [{ type: 'shielded', outputs: [{ type: nightRawType, receiverAddress: receiver.addr, amount: amountBig }] }]
-            : [{ type: 'unshielded', outputs: [{ type: nightRawType, receiverAddress: receiver.addr, amount: amountBig }] }];
+            ? [{ type: 'shielded', outputs: [{ type: rawType, receiverAddress: receiver.addr, amount: amountBig }] }]
+            : [{ type: 'unshielded', outputs: [{ type: rawType, receiverAddress: receiver.addr, amount: amountBig }] }];
 
-        log('info', `transfer: ${amount} NIGHT to ${receiver.kind} addr ${receiverAddress.slice(0, 24)}...`);
+        log('info', `transfer: ${amount} ${tokenTypeHex ? `token ${tokenTypeHex.slice(0, 12)}...` : 'NIGHT'} to ${receiver.kind} addr ${receiverAddress.slice(0, 24)}...`);
 
         const recipe = await entry.facade.transferTransaction(
             outputs,

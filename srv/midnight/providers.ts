@@ -13,6 +13,7 @@
 import WebSocket from 'ws';
 import { loadMidnightSdk } from './sdk-loader';
 import { CapDbPrivateStateProvider } from './CapDbPrivateStateProvider';
+import { isWasmProvingMode, buildWasmProofProvider } from './wasm-proof-provider';
 
 /**
  * The Midnight SDK keeps the active network as process-global state (see
@@ -74,7 +75,9 @@ export async function buildContractProviders(cfg: ContractProvidersConfig): Prom
         // Node has no built-in WebSocket; pass `ws` explicitly.
         WebSocket as unknown as typeof import('isomorphic-ws').WebSocket
     );
-    const proofProvider = sdk.proof.httpClientProofProvider(cfg.proofServerUrl, zkConfigProvider as any);
+    const proofProvider = isWasmProvingMode()
+        ? await buildWasmProofProvider(zkConfigProvider)
+        : sdk.proof.httpClientProofProvider(cfg.proofServerUrl, zkConfigProvider as any);
 
     return { publicDataProvider, zkConfigProvider, proofProvider };
 }

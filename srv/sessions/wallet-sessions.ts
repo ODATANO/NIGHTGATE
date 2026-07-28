@@ -100,12 +100,14 @@ const diagnosticsRateLimiter = new RateLimiter({
 });
 
 const MAX_NIGHT_AMOUNT_ATOMS = 10n ** 18n;
+// Custom tokens are Uint<128> on-chain; the NIGHT supply bound does not apply.
+const MAX_CUSTOM_TOKEN_ATOMS = 2n ** 128n - 1n;
 
 type WalletCommand =
     | { op: 'prewarm' }
     | { op: 'registerDust'; dustReceiverAddress?: string }
     | { op: 'deregisterDust'; sponsorSessionId?: string }
-    | { op: 'sendNight'; receiverAddress: string; amount: string; ttlIso?: string };
+    | { op: 'sendNight'; receiverAddress: string; amount: string; ttlIso?: string; tokenTypeHex?: string };
 
 const WALLET_COMMAND_KINDS = [
     'connectWalletForSigning', 'registerForDustGeneration', 'deregisterFromDustGeneration',
@@ -174,7 +176,7 @@ async function executeWalletCommand(raw: unknown, job: BackgroundJobRow, db: any
     }
     if (command.op === 'sendNight') {
         await reportExternalExecution({});
-        const result = await sendNight({ cacheKey: accountId, receiverAddress: command.receiverAddress, amount: command.amount, ttlIso: command.ttlIso });
+        const result = await sendNight({ cacheKey: accountId, receiverAddress: command.receiverAddress, amount: command.amount, ttlIso: command.ttlIso, tokenTypeHex: command.tokenTypeHex });
         return { txId: result.txId, toLedger: result.toLedger, amount: result.amount, receiverAddress: result.receiverAddress };
     }
     throw new Error(`Unsupported wallet command operation: ${(command as any).op}`);
@@ -199,13 +201,16 @@ function rejectIfMainnetBlocked(req: Request): boolean {
  * with a user-facing error message. Encapsulates the validation rules
  * for the sendNight handler.
  */
-function parseNightAmount(raw: string | undefined): { ok: true; value: bigint } | { ok: false; msg: string } {
+function parseNightAmount(raw: string | undefined, customToken = false): { ok: true; value: bigint } | { ok: false; msg: string } {
     if (!raw) return { ok: false, msg: 'amount is required' };
     let value: bigint;
     try { value = BigInt(raw); }
     catch { return { ok: false, msg: `amount must be a decimal integer (NIGHT atoms), got '${raw}'` }; }
     if (value <= 0n) return { ok: false, msg: 'amount must be > 0' };
-    if (value > MAX_NIGHT_AMOUNT_ATOMS) return { ok: false, msg: 'amount exceeds sanity bound of 10^18 atoms' };
+    const bound = customToken ? MAX_CUSTOM_TOKEN_ATOMS : MAX_NIGHT_AMOUNT_ATOMS;
+    if (value > bound) {
+        return { ok: false, msg: customToken ? 'amount exceeds Uint<128> bound' : 'amount exceeds sanity bound of 10^18 atoms' };
+    }
     return { ok: true, value };
 }
 
@@ -528,6 +533,9 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
                 request: { sessionId, accountIdPrefix: accountId.slice(0, 16) },
                 requestedBy: userId,
                 commandVersion: 1,
+                // Tamper protection at rest (AES-GCM), same as contract-call
+                // commands: a DB writer must not be able to redirect a replay.
+                encryptCommand: true,
                 command: { op: 'prewarm' }
             });
             log.info('facade pre-warm job', job.jobId.slice(0, 8), 'started for', accountId.slice(0, 16));
@@ -649,6 +657,7 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
             request: { sessionId, dustReceiverAddress: dustReceiverAddress || null },
             requestedBy: userId,
             commandVersion: 1,
+            encryptCommand: true,
             command: { op: 'registerDust', dustReceiverAddress: dustReceiverAddress || undefined }
         });
     });
@@ -703,6 +712,7 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
             request: { sessionId, feeSponsor: sponsor?.sponsorSessionId ?? null },
             requestedBy: userId,
             commandVersion: 1,
+            encryptCommand: true,
             command: { op: 'deregisterDust', sponsorSessionId: sponsor?.sponsorSessionId }
         });
     });
@@ -717,17 +727,24 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
             return req.reject(429, `Rate limited. Retry after ${Math.ceil(rate.retryAfterMs / 1000)}s`);
         }
 
-        const { sessionId, receiverAddress, amount, ttlIso, idempotencyKey } = req.data as {
+        const { sessionId, receiverAddress, amount, ttlIso, idempotencyKey, tokenTypeHex } = req.data as {
             sessionId: string;
             receiverAddress: string;
             amount: string;
             ttlIso?: string;
             idempotencyKey?: string;
+            tokenTypeHex?: string;
         };
 
         if (!sessionId) return req.reject(400, 'sessionId is required');
         if (!receiverAddress) return req.reject(400, 'receiverAddress is required');
         if (!amount) return req.reject(400, 'amount is required');
+        if (tokenTypeHex && !/^[0-9a-fA-F]{64}$/.test(tokenTypeHex)) {
+            return req.reject(400, 'tokenTypeHex must be 64 hex chars (a raw token type)');
+        }
+        // The SDK matches token types by exact string; canonical raw types are
+        // lowercase, so normalize before the value reaches worker or job store.
+        const tokenType = tokenTypeHex ? tokenTypeHex.toLowerCase() : undefined;
 
         const hrpOK = receiverAddress.startsWith('mn_shield-addr_') || receiverAddress.startsWith('mn_addr_');
         if (!hrpOK) {
@@ -738,7 +755,7 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
             return req.reject(400, `receiverAddress too short (${receiverAddress.length} chars; expected Bech32m of >= 50)`);
         }
 
-        const amountCheck = parseNightAmount(amount);
+        const amountCheck = parseNightAmount(amount, !!tokenType);
         if (!amountCheck.ok) return req.reject(400, amountCheck.msg);
 
         const ttlErr = validateOptionalTtl(ttlIso);
@@ -758,10 +775,13 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
             kind: 'sendNight',
             sessionId,
             idempotencyKey,
-            request: { sessionId, receiverAddress, amount, ttlIso: ttlIso || null },
+            request: { sessionId, receiverAddress, amount, ttlIso: ttlIso || null, tokenTypeHex: tokenType || null },
             requestedBy: userId,
             commandVersion: 1,
-            command: { op: 'sendNight', receiverAddress, amount, ttlIso }
+            // Funds-moving command: encrypt at rest like contract-call commands
+            // (AES-GCM confidentiality + tamper detection for the replay path).
+            encryptCommand: true,
+            command: { op: 'sendNight', receiverAddress, amount, ttlIso, tokenTypeHex: tokenType }
         });
     });
 

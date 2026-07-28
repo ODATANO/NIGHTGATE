@@ -1,6 +1,6 @@
 {
   "name": "@odatano/nightgate",
-  "version": "0.10.5",
+  "version": "0.11.0",
   "description": "CAP Plugin: Midnight Blockchain Indexer with OData V4 API",
   "homepage": "https://github.com/ODATANO/NIGHTGATE#readme",
   "repository": {
@@ -111,6 +111,9 @@
     "predicate:e2e": "node --env-file=.env scripts/run-predicate-e2e.mjs",
     "disclosure:e2e": "node --env-file=.env scripts/run-disclosure-e2e.mjs",
     "state-verify:e2e": "node --env-file=.env scripts/run-state-verification-e2e.mjs",
+    "wasm-proving:e2e": "node --env-file=.env scripts/run-wasm-proving-e2e.mjs",
+    "wasm-contract:e2e": "node --env-file=.env scripts/run-wasm-contract-e2e.mjs",
+    "wasm-zswap:e2e": "node --env-file=.env scripts/run-wasm-zswap-e2e.mjs",
     "test:pg-idempotency": "node scripts/test-postgres-idempotency.mjs",
     "lint": "eslint .",
     "prepack": "npm run build:plugin",
@@ -127,19 +130,21 @@
     "@midnight-ntwrk/midnight-js-level-private-state-provider": "~4.0.4",
     "@midnight-ntwrk/midnight-js-network-id": "~4.0.4",
     "@midnight-ntwrk/midnight-js-node-zk-config-provider": "~4.0.4",
+    "@midnight-ntwrk/midnight-js-types": "4.0.4",
     "@midnight-ntwrk/wallet-sdk-address-format": "npm:@midnightntwrk/wallet-sdk-address-format@^3.1.2",
+    "@midnight-ntwrk/zkir-v2": "2.1.0",
     "@midnightntwrk/wallet-sdk-abstractions": "^2.1.0",
     "@midnightntwrk/wallet-sdk-address-format": "^3.1.2",
+    "@midnightntwrk/wallet-sdk-capabilities": "3.3.1",
     "@midnightntwrk/wallet-sdk-dust-wallet": "^4.2.0",
     "@midnightntwrk/wallet-sdk-facade": "^4.1.0",
     "@midnightntwrk/wallet-sdk-hd": "^3.0.3",
+    "@midnightntwrk/wallet-sdk-prover-client": "1.2.3",
     "@midnightntwrk/wallet-sdk-shielded": "^3.0.2",
     "@midnightntwrk/wallet-sdk-unshielded-wallet": "^3.1.0",
     "@noble/hashes": "^1.8.0",
     "@polkadot/types": "^16.5.6",
     "bip39": "^3.1.0",
-    "express": "^4",
-    "undici": "^8.3.0",
     "ws": "^8"
   },
   "peerDependencies": {
@@ -163,9 +168,11 @@
     "@types/ws": "^8",
     "@vitest/coverage-v8": "^4.1.10",
     "eslint": "^10",
+    "express": "^4.22.2",
     "globals": "^14.0.0",
     "tsx": "^4",
     "typescript": "^5",
+    "undici": "^8.9.0",
     "vitest": "^4.1.10"
   },
   "cds": {
@@ -187,6 +194,11 @@
             "artifactPath": "contracts/attestation-vault/src/managed/attestation-vault/contract/index.js",
             "privateStateId": "attestationVaultPrivateState",
             "zkConfigPath": "contracts/attestation-vault/src/managed/attestation-vault"
+          },
+          "shielded-token": {
+            "artifactPath": "contracts/shielded-token/src/managed/shielded-token/contract/index.js",
+            "privateStateId": "shieldedTokenPrivateState",
+            "zkConfigPath": "contracts/shielded-token/src/managed/shielded-token"
           }
         }
       }
@@ -217,5 +229,12 @@
     "typer": {
       "outputDirectory": "@cds-models"
     }
+  },
+  "directories": {
+    "doc": "docs",
+    "test": "test"
+  },
+  "bugs": {
+    "url": "https://github.com/ODATANO/NIGHTGATE/issues"
   }
 }
