@@ -80,6 +80,11 @@ vi.mock('../../srv/submission/wallet-facade-builder', () => ({
     __clearAllFacadesForTests:         vi.fn()
 }));
 
+const mockClearAllEncryptionKeys = vi.hoisted(() => (vi.fn(async () => undefined)));
+vi.mock('../../srv/submission/wallet-sync-state-store', () => ({
+    clearAllEncryptionKeys: mockClearAllEncryptionKeys
+}));
+
 import cds from '@sap/cds';
 import { getStatus, initialize, shutdown } from '../../src/index';
 
@@ -159,6 +164,17 @@ describe('runtime initialize', () => {
                 crawlerEnabled: true,
                 mode: 'active'
             }));
+        } finally {
+            logSpy.mockRestore();
+        }
+    });
+
+    it('shutdown zeroes all memoized wallet-storage keys after stopping the worker', async () => {
+        const logSpy = vi.spyOn(cds.log('nightgate'), 'info').mockImplementation(() => {});
+        try {
+            await initialize();
+            await shutdown();
+            expect(mockClearAllEncryptionKeys).toHaveBeenCalledTimes(1);
         } finally {
             logSpy.mockRestore();
         }

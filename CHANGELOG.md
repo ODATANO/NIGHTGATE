@@ -1,5 +1,47 @@
 # Changelog
 
+## 0.11.1 - 2026-07-29
+
+### Perf: wallet-save pipeline CPU + findDeployedContract query cache
+
+FR: `docs/feature-requests/wallet-save-pipeline-cpu-efficiency.md`. Live
+profiling on the NIGHTPASS demo VPS showed the node process pinned at
+100-240% of a core for entire runs and ~74% of a core at idle, driven by the
+wallet-state save pipeline; plus a fixed multi-second pre-proof setup on
+every contract call. Fixes:
+
+- **One PBKDF2 per session instead of per save**: `saveSyncState` derives the
+  storage key once per (accountId, passphrase) using a deterministic salt
+  (same pattern as `CapDbPrivateStateProvider`); blob wire format unchanged.
+  Memoized keys are scoped to the wallet's connected lifetime, not the
+  process: `evictWalletFacade` zeroes and drops the account's key after the
+  final save (waiting out in-flight saves so no blob is garbled mid-encrypt),
+  plugin shutdown zeroes all of them (`StorageEncryption.clear()`).
+- **Key derivation off the main thread**: the remaining per-session PBKDF2
+  runs through async `crypto.pbkdf2` on the libuv threadpool, so saves no
+  longer stall HTTP responses.
+- **Changed-only sub-blob pushes**: the worker's 30 s tick and the evict
+  final-save push only sub-blobs that differ from the last acked save
+  (typically just the churning dust blob, not all three).
+- **findDeployedContract query cache**: the two IMMUTABLE indexer queries the
+  SDK re-runs on every contract call (deploy tx data, deploy-time contract
+  state) are cached per (indexer, contract address) in the worker; part of
+  the 8.4 s measured per predicate call on the grown vault state. Current-
+  state queries stay uncached: the verifier-key check must see maintenance
+  transactions from other clients, and call transcripts must build against
+  fresh state.
+- **Phase timing instrumentation** (debug level): one
+  `submitContractCall(-Batch) timing:` line per submission with the
+  wall-clock phase breakdown (init/compile/findContract/prove/balance/
+  submit/...), also on failure.
+
+Measured on the same box after items 1-3: idle CPU ~74% -> ~5% of a core
+(postgres ~27% -> ~1.4%), predicate-call pre-proof setup 68 s -> ~10 s,
+visitor run 3.9 -> 3.0 min, zero dropped saves. The query cache was then
+verified live on a full visitor run: findContract on the predicate call
+8.4 s -> 1.1 s (batch 3.3 -> 1.8 s); the remaining second is the
+deliberately uncached verifier-key check.
+
 ## 0.11.0 - 2026-07-28
 
 ### Feature: `NIGHTGATE_PROVING_MODE=wasm` proves everything in-process (no Docker proof server for dev/test/CI)

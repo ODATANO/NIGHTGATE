@@ -12,6 +12,7 @@ import {
     decryptWithPassword,
     extractEncryptedComponents,
     deriveKey,
+    deriveKeyAsync,
     SALT_LENGTH,
     IV_LENGTH,
     AUTH_TAG_LENGTH,
@@ -39,6 +40,19 @@ describe('StorageEncryption', () => {
         expect(components.authTag.length).toBe(AUTH_TAG_LENGTH);
         expect(components.encrypted.length).toBeGreaterThan(0);
         expect(components.salt.equals(enc.salt)).toBe(true);
+    });
+
+    test('clear() zeroes the key: encrypt/decrypt throw, prior blobs stay decryptable by password', () => {
+        const enc = new StorageEncryption(PASSWORD);
+        const blob = enc.encrypt(PLAINTEXT);
+
+        enc.clear();
+        expect(() => enc.encrypt(PLAINTEXT)).toThrow(/key has been cleared/);
+        expect(() => enc.decrypt(blob)).toThrow(/key has been cleared/);
+
+        // Zeroing the in-memory key must not affect persisted data: the blob
+        // carries its salt, so re-derivation from the password still works.
+        expect(decryptWithPassword(blob, PASSWORD)).toBe(PLAINTEXT);
     });
 
     test('decrypt rejects payloads encrypted with a different password (salt mismatch)', () => {
@@ -82,6 +96,20 @@ describe('StorageEncryption', () => {
         const k2 = deriveKey(PASSWORD, salt);
         expect(k1.equals(k2)).toBe(true);
         expect(k1.length).toBe(32);
+    });
+
+    test('deriveKeyAsync derives the same key as deriveKey', async () => {
+        const salt = Buffer.alloc(SALT_LENGTH, 0xCD);
+        const asyncKey = await deriveKeyAsync(PASSWORD, salt);
+        expect(asyncKey.equals(deriveKey(PASSWORD, salt))).toBe(true);
+    });
+
+    test('createAsync instance interoperates with a sync instance on the same salt', async () => {
+        const salt = Buffer.alloc(SALT_LENGTH, 0xEF);
+        const asyncEnc = await StorageEncryption.createAsync(PASSWORD, salt);
+        const syncEnc = new StorageEncryption(PASSWORD, salt);
+        expect(asyncEnc.decrypt(syncEnc.encrypt(PLAINTEXT))).toBe(PLAINTEXT);
+        expect(syncEnc.decrypt(asyncEnc.encrypt(PLAINTEXT))).toBe(PLAINTEXT);
     });
 
     test('extractEncryptedComponents rejects payloads shorter than the header', () => {

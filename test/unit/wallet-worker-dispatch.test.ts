@@ -86,10 +86,19 @@ vi.mock('@midnightntwrk/wallet-sdk-address-format', () => ({
 // Contract-path SDK seams (loadContractsSdk + buildWorkerContractProviders).
 const findDeployedContract = vi.hoisted(() => (vi.fn()));
 vi.mock('@midnight-ntwrk/midnight-js-contracts', () => ({ findDeployedContract }));
-vi.mock('@midnight-ntwrk/midnight-js-indexer-public-data-provider', () => ({
-    indexerPublicDataProvider: vi.fn(() => ({ tag: 'publicData' }))
+// Query methods findDeployedContract hits per call; tracked so the
+// withFindContractQueryCache tests can count underlying indexer fetches.
+const publicDataMethods = vi.hoisted(() => ({
+    watchForDeployTxData: vi.fn(async () => ({ deployTxData: true })),
+    queryDeployContractState: vi.fn(async () => ({ deployState: true })),
+    queryContractState: vi.fn(async () => ({ currentState: true })),
+    queryZSwapAndContractState: vi.fn(async () => ({ zswapAndState: true }))
 }));
-const httpClientProofProvider = vi.hoisted(() => (vi.fn(() => ({ tag: 'http-proof' }))));
+vi.mock('@midnight-ntwrk/midnight-js-indexer-public-data-provider', () => ({
+    indexerPublicDataProvider: vi.fn(() => ({ tag: 'publicData', ...publicDataMethods }))
+}));
+const proveTxMock = vi.hoisted(() => (vi.fn(async () => ({ proven: true }))));
+const httpClientProofProvider = vi.hoisted(() => (vi.fn(() => ({ tag: 'http-proof', proveTx: proveTxMock }))));
 vi.mock('@midnight-ntwrk/midnight-js-http-client-proof-provider', () => ({ httpClientProofProvider }));
 vi.mock('@midnight-ntwrk/midnight-js-node-zk-config-provider', () => ({
     NodeZkConfigProvider: vi.fn().mockImplementation(function (dir: string) { return { tag: 'zkConfig', directory: dir }; } as any)
@@ -486,6 +495,69 @@ describe('periodic save + ack protocol', () => {
             expect(stateSaves().length).toBe(2);
         } finally {
             await rpc('evict', { sessionId: SESSION });
+            vi.useRealTimers();
+        }
+    });
+
+    it('pushes only changed sub-blobs and merges partial acks into the confirmed state', async () => {
+        vi.useFakeTimers();
+        const SESSION = 'session-partial-eeeeeeeeee';
+        try {
+            const facade = await initSession(SESSION);
+            fakeParentPort.postMessage.mockClear();
+
+            // Tick 1: nothing confirmed yet → the full triple goes out. Ack it.
+            await vi.advanceTimersByTimeAsync(30_000);
+            expect(stateSaves().length).toBe(1);
+            expect(stateSaves()[0].blobs).toEqual({
+                shielded: 'BLOB-SH', unshielded: 'BLOB-UN', dust: 'BLOB-DU'
+            });
+            fakeParentPort.emit('message', {
+                kind: 'state-save-ack', sessionId: SESSION, seq: stateSaves()[0].seq
+            });
+
+            // Only dust changes (the steady-state case) → the push must carry
+            // dust alone, shielded/unshielded stay preserved server-side.
+            facade.dust.serializeState.mockResolvedValue('BLOB-DU-2');
+            await vi.advanceTimersByTimeAsync(30_000);
+            expect(stateSaves().length).toBe(2);
+            expect(stateSaves()[1].blobs).toEqual({ dust: 'BLOB-DU-2' });
+
+            // Ack the dust-only push: the merge must keep shielded/unshielded
+            // confirmed, so the next unchanged tick pushes NOTHING.
+            fakeParentPort.emit('message', {
+                kind: 'state-save-ack', sessionId: SESSION, seq: stateSaves()[1].seq
+            });
+            await vi.advanceTimersByTimeAsync(30_000);
+            expect(stateSaves().length).toBe(2);
+        } finally {
+            await rpc('evict', { sessionId: SESSION });
+            vi.useRealTimers();
+        }
+    });
+
+    it('evict pushes only sub-blobs not yet confirmed saved', async () => {
+        vi.useFakeTimers();
+        const SESSION = 'session-evictdiff-ffffffff';
+        try {
+            const facade = await initSession(SESSION);
+            fakeParentPort.postMessage.mockClear();
+
+            // Confirm the full triple, then let only dust move on.
+            await vi.advanceTimersByTimeAsync(30_000);
+            fakeParentPort.emit('message', {
+                kind: 'state-save-ack', sessionId: SESSION, seq: stateSaves()[0].seq
+            });
+            facade.dust.serializeState.mockResolvedValue('BLOB-DU-FINAL');
+            const before = stateSaves().length;
+
+            const reply = await rpc('evict', { sessionId: SESSION });
+            expect(reply.ok).toBe(true);
+            expect(reply.result.evicted).toBe(true);
+            const finalSave = stateSaves().at(-1);
+            expect(stateSaves().length).toBe(before + 1);
+            expect(finalSave.blobs).toEqual({ dust: 'BLOB-DU-FINAL' });
+        } finally {
             vi.useRealTimers();
         }
     });
@@ -1175,5 +1247,150 @@ describe('submitContractCall private-state seeding', () => {
         const reply = await rpc('submitContractCall', callArgs('session-seed-nocircuit-ll'));
         expect(reply.ok).toBe(false);
         expect(reply.error.message).toMatch(/Circuit 'increment' not found/);
+    });
+
+    function timingLogs(): string[] {
+        return fakeParentPort.postMessage.mock.calls
+            .map(c => c[0])
+            .filter((m: any) => m.kind === 'log' && /submitContractCall timing:/.test(m.message))
+            .map((m: any) => m.message);
+    }
+
+    it('logs a phase-timing breakdown incl. circuitToProve/prove when the call proves', async () => {
+        await initSession('session-timing-mmmmmm');
+        // The circuit call routes a proof request through the (wrapped)
+        // proofProvider handed to findDeployedContract, like the real SDK.
+        findDeployedContract.mockImplementation(async (providers: any) => ({
+            callTx: {
+                increment: vi.fn(async () => {
+                    await providers.proofProvider.proveTx({ unproven: true });
+                    return { public: { txHash: 'tx-timing', status: 'SUCCESS' } };
+                })
+            }
+        }));
+        fakeParentPort.postMessage.mockClear();
+        proveTxMock.mockClear();
+        const reply = await rpc('submitContractCall', callArgs('session-timing-mmmmmm'));
+        expect(reply.ok).toBe(true);
+        expect(proveTxMock).toHaveBeenCalledWith({ unproven: true });
+
+        const lines = timingLogs();
+        expect(lines.length).toBe(1);
+        for (const phase of ['init', 'compile', 'providers', 'stateProbe', 'findContract',
+            'circuitToProve', 'prove', 'callTotal', 'total']) {
+            expect(lines[0]).toMatch(new RegExp(`${phase}=\\d+ms`));
+        }
+        expect(lines[0]).toContain('fake-artifact.increment');
+    });
+
+    it('logs the partial phase breakdown when a phase throws', async () => {
+        await initSession('session-timing-fail-nnnn');
+        findDeployedContract.mockRejectedValue(new Error('indexer unreachable'));
+        fakeParentPort.postMessage.mockClear();
+        const reply = await rpc('submitContractCall', callArgs('session-timing-fail-nnnn'));
+        expect(reply.ok).toBe(false);
+
+        const lines = timingLogs();
+        expect(lines.length).toBe(1);
+        // Phases up to the probe completed; the failed find and the call
+        // never produced entries.
+        expect(lines[0]).toMatch(/stateProbe=\d+ms/);
+        expect(lines[0]).not.toMatch(/findContract=/);
+        expect(lines[0]).not.toMatch(/callTotal=/);
+    });
+});
+
+// ---- submitContractCall: findDeployedContract query caching ------------------
+
+describe('withFindContractQueryCache', () => {
+    const REGISTRATION = {
+        artifactPath: path.resolve(process.cwd(), 'test/fixtures/fake-contract-artifact.mjs'),
+        privateStateId: 'fakePrivateState',
+        zkConfigPath: path.resolve(process.cwd(), 'test/fixtures')
+    };
+
+    function callArgs(sessionId: string, contractAddress: string) {
+        return {
+            sessionId,
+            proxyId: 'proxy-cache-test',
+            contractName: 'fake-artifact',
+            registration: REGISTRATION,
+            contractAddress,
+            circuit: 'increment',
+            args: [],
+            indexerHttpUrl: 'http://indexer.seed-test/api/v4/graphql',
+            indexerWsUrl: 'ws://indexer.seed-test/api/v4/graphql/ws',
+            proofServerUrl: 'http://proof.seed-test:6300',
+            networkId: 'preprod'
+        };
+    }
+
+    beforeEach(() => {
+        privateState.store = { fakePrivateState: { existing: true } };
+        privateState.calls = [];
+        for (const fn of Object.values(publicDataMethods)) fn.mockClear();
+        findDeployedContract.mockReset();
+        // Exercise the wrapped provider the way the real SDK does: the find
+        // performs the three per-address queries, the circuit call reads the
+        // fresh state through queryZSwapAndContractState.
+        findDeployedContract.mockImplementation(async (providers: any, opts: any) => {
+            await providers.publicDataProvider.watchForDeployTxData(opts.contractAddress);
+            await providers.publicDataProvider.queryDeployContractState(opts.contractAddress);
+            await providers.publicDataProvider.queryContractState(opts.contractAddress);
+            return {
+                callTx: {
+                    increment: vi.fn(async () => {
+                        await providers.publicDataProvider.queryZSwapAndContractState(opts.contractAddress);
+                        return { public: { txHash: 'tx-cache-fixture', status: 'SUCCESS' } };
+                    })
+                }
+            };
+        });
+    });
+
+    it('serves the immutable deploy queries from cache; current-state queries stay fresh', async () => {
+        const addr = 'ca'.repeat(32);
+        await initSession('session-qcache-hit-aaaa');
+        expect((await rpc('submitContractCall', callArgs('session-qcache-hit-aaaa', addr))).ok).toBe(true);
+        expect((await rpc('submitContractCall', callArgs('session-qcache-hit-aaaa', addr))).ok).toBe(true);
+
+        expect(publicDataMethods.watchForDeployTxData).toHaveBeenCalledTimes(1);
+        expect(publicDataMethods.queryDeployContractState).toHaveBeenCalledTimes(1);
+        // The verifier-key check must see maintenance transactions from other
+        // clients, and transcripts build against current state: NEVER cached.
+        expect(publicDataMethods.queryContractState).toHaveBeenCalledTimes(2);
+        expect(publicDataMethods.queryZSwapAndContractState).toHaveBeenCalledTimes(2);
+    });
+
+    it('caches per contract address', async () => {
+        await initSession('session-qcache-addr-bbbb');
+        expect((await rpc('submitContractCall', callArgs('session-qcache-addr-bbbb', 'cb'.repeat(32)))).ok).toBe(true);
+        expect((await rpc('submitContractCall', callArgs('session-qcache-addr-bbbb', 'cc'.repeat(32)))).ok).toBe(true);
+        expect(publicDataMethods.queryDeployContractState).toHaveBeenCalledTimes(2);
+    });
+
+    it('does not stick a transient indexer failure', async () => {
+        const addr = 'cd'.repeat(32);
+        await initSession('session-qcache-fail-cccc');
+        publicDataMethods.watchForDeployTxData.mockRejectedValueOnce(new Error('indexer unreachable'));
+        const failed = await rpc('submitContractCall', callArgs('session-qcache-fail-cccc', addr));
+        expect(failed.ok).toBe(false);
+        expect(failed.error.message).toMatch(/indexer unreachable/);
+
+        const retried = await rpc('submitContractCall', callArgs('session-qcache-fail-cccc', addr));
+        expect(retried.ok).toBe(true);
+        expect(publicDataMethods.watchForDeployTxData).toHaveBeenCalledTimes(2);
+    });
+
+    it('passes non-plain query variants through uncached', async () => {
+        const addr = 'ce'.repeat(32);
+        await initSession('session-qcache-args-dddd');
+        findDeployedContract.mockImplementation(async (providers: any, opts: any) => {
+            await providers.publicDataProvider.queryDeployContractState(opts.contractAddress, { variant: 'nonPlain' });
+            return { callTx: { increment: vi.fn(async () => ({ public: { txHash: 'tx', status: 'SUCCESS' } })) } };
+        });
+        expect((await rpc('submitContractCall', callArgs('session-qcache-args-dddd', addr))).ok).toBe(true);
+        expect((await rpc('submitContractCall', callArgs('session-qcache-args-dddd', addr))).ok).toBe(true);
+        expect(publicDataMethods.queryDeployContractState).toHaveBeenCalledTimes(2);
     });
 });

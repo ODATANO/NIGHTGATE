@@ -89,8 +89,13 @@ import {
     saveSyncState,
     loadSyncState,
     getWalletSdkVersion,
-    __resetDbHandleForTests
+    evictEncryptionKey,
+    clearAllEncryptionKeys,
+    __resetDbHandleForTests,
+    __resetEncryptionCacheForTests,
+    __getEncryptionCacheSizeForTests
 } from '../../srv/submission/wallet-sync-state-store';
+import { extractEncryptedComponents } from '../../srv/utils/storage-encryption';
 
 const PASS = 'a-deterministic-passphrase-32-bytes-or-more-please';
 const SDK  = 'wallet-sdk-facade@1.2.3';
@@ -99,6 +104,7 @@ beforeEach(() => {
     store.clear();
     runMock.mockClear();
     __resetDbHandleForTests();
+    __resetEncryptionCacheForTests();
 });
 
 describe('saveSyncState / loadSyncState round-trip', () => {
@@ -272,6 +278,101 @@ describe('encryption format', () => {
         expect(row).toBeDefined();
         const raw = Buffer.from(row.shieldedStateBlob, 'base64');
         expect(raw[0]).toBe(CURRENT_ENCRYPTION_VERSION);
+    });
+});
+
+describe('memoized key derivation', () => {
+    const saltOf = (blobB64: string) =>
+        extractEncryptedComponents(Buffer.from(blobB64, 'base64')).salt;
+
+    test('repeated saves for the same account reuse the derived key (stable salt)', async () => {
+        await saveSyncState({
+            accountId: 'acct-memo', passphrase: PASS, sdkVersion: SDK,
+            states: { dust: 'du-1' }
+        });
+        const salt1 = saltOf(store.get('acct-memo').dustStateBlob);
+        await saveSyncState({
+            accountId: 'acct-memo', passphrase: PASS, sdkVersion: SDK,
+            states: { dust: 'du-2' }
+        });
+        const salt2 = saltOf(store.get('acct-memo').dustStateBlob);
+        expect(salt1.equals(salt2)).toBe(true);
+        // And the blob still loads through the salt-in-header path.
+        const loaded = await loadSyncState({
+            accountId: 'acct-memo', passphrase: PASS, expectedSdkVersion: SDK
+        });
+        expect(loaded!.dust).toBe('du-2');
+    });
+
+    test('different accounts derive different salts (and keys) from the same passphrase', async () => {
+        await saveSyncState({
+            accountId: 'acct-memo-A', passphrase: PASS, sdkVersion: SDK,
+            states: { dust: 'du-A' }
+        });
+        await saveSyncState({
+            accountId: 'acct-memo-B', passphrase: PASS, sdkVersion: SDK,
+            states: { dust: 'du-B' }
+        });
+        const saltA = saltOf(store.get('acct-memo-A').dustStateBlob);
+        const saltB = saltOf(store.get('acct-memo-B').dustStateBlob);
+        expect(saltA.equals(saltB)).toBe(false);
+    });
+});
+
+describe('key eviction', () => {
+    test('evictEncryptionKey drops the memoized key; the next save re-derives and round-trips', async () => {
+        await saveSyncState({
+            accountId: 'acct-evict', passphrase: PASS, sdkVersion: SDK,
+            states: { dust: 'du-before' }
+        });
+        expect(__getEncryptionCacheSizeForTests()).toBe(1);
+
+        await evictEncryptionKey('acct-evict');
+        expect(__getEncryptionCacheSizeForTests()).toBe(0);
+
+        await saveSyncState({
+            accountId: 'acct-evict', passphrase: PASS, sdkVersion: SDK,
+            states: { dust: 'du-after' }
+        });
+        const loaded = await loadSyncState({
+            accountId: 'acct-evict', passphrase: PASS, expectedSdkVersion: SDK
+        });
+        expect(loaded!.dust).toBe('du-after');
+    });
+
+    test('evictEncryptionKey waits for the in-flight save (no blob garbled mid-encrypt)', async () => {
+        // Kick off the save and evict IMMEDIATELY: the save is still deriving
+        // its key. Eviction must wait, or the zeroed key would encrypt the
+        // blob into garbage that silently cold-starts the next restore.
+        const inFlight = saveSyncState({
+            accountId: 'acct-evict-race', passphrase: PASS, sdkVersion: SDK,
+            states: { dust: 'du-racing' }
+        });
+        await evictEncryptionKey('acct-evict-race');
+        await inFlight;
+
+        const loaded = await loadSyncState({
+            accountId: 'acct-evict-race', passphrase: PASS, expectedSdkVersion: SDK
+        });
+        expect(loaded).not.toBeNull();
+        expect(loaded!.dust).toBe('du-racing');
+    });
+
+    test('evictEncryptionKey is a no-op for unknown accounts', async () => {
+        await expect(evictEncryptionKey('never-connected')).resolves.toBeUndefined();
+    });
+
+    test('clearAllEncryptionKeys empties the cache across accounts', async () => {
+        await saveSyncState({
+            accountId: 'acct-all-1', passphrase: PASS, sdkVersion: SDK, states: { dust: 'd1' }
+        });
+        await saveSyncState({
+            accountId: 'acct-all-2', passphrase: PASS, sdkVersion: SDK, states: { dust: 'd2' }
+        });
+        expect(__getEncryptionCacheSizeForTests()).toBe(2);
+
+        await clearAllEncryptionKeys();
+        expect(__getEncryptionCacheSizeForTests()).toBe(0);
     });
 });
 

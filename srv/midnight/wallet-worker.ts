@@ -323,6 +323,49 @@ function buildWorkerContractProviders(args: {
     return bundleP;
 }
 
+// ---- findDeployedContract query caching -----------------------------------
+// (FR wallet-save-pipeline-cpu-efficiency, remaining item)
+
+// findDeployedContract re-runs the same indexer queries on EVERY call. Two of
+// them are immutable per address: the deploy tx data and the DEPLOY-TIME
+// contract state. On a grown ledger state (the vault grows with every anchored
+// passport) these cost seconds per call (part of findContract=8.4s observed
+// live on the predicate call), so serve them from a per-worker cache after
+// first contact. Deliberately NOT cached:
+// - queryContractState (the CURRENT state): findDeployedContract verifies the
+//   local verifier keys against it, and VKs can be rotated/removed by
+//   circuit-maintenance transactions from OTHER clients at any time; caching
+//   would bypass that SDK safety check with a stale state for the rest of the
+//   worker's life.
+// - queryZSwapAndContractState: the state the circuit call builds transcripts
+//   against; calls must always execute on fresh state.
+const FIND_CONTRACT_CACHED_METHODS = new Set(['watchForDeployTxData', 'queryDeployContractState']);
+const findContractQueryCache = new Map<string, Promise<unknown>>();
+
+function withFindContractQueryCache(publicDataProvider: any, indexerHttpUrl: string): any {
+    return new Proxy(publicDataProvider, {
+        get(target, prop) {
+            const v = target[prop];
+            if (typeof v !== 'function') return v;
+            if (typeof prop !== 'string' || !FIND_CONTRACT_CACHED_METHODS.has(prop)) return v.bind(target);
+            return (contractAddress: string, ...rest: unknown[]) => {
+                // Extra args (e.g. a block-offset config) select non-latest
+                // variants; only the plain per-address form is cacheable.
+                if (rest.length > 0) return v.call(target, contractAddress, ...rest);
+                const cacheKey = `${prop}|${indexerHttpUrl}|${contractAddress}`;
+                let p = findContractQueryCache.get(cacheKey);
+                if (!p) {
+                    p = v.call(target, contractAddress);
+                    // Transient indexer failures must not stick.
+                    p!.catch(() => { findContractQueryCache.delete(cacheKey); });
+                    findContractQueryCache.set(cacheKey, p!);
+                }
+                return p;
+            };
+        }
+    });
+}
+
 /**
  * Adapts a worker-side facade into the SDK's WalletProvider & MidnightProvider
  * shape. balanceTx routes through balanceUnboundTransaction → finalizeRecipe
@@ -1085,19 +1128,19 @@ function startPeriodicSave(sessionId: string, entry: FacadeEntry): void {
             log('debug', `save-tick #${tickCount} collect returned in ${collectMs}ms: ${shape}`);
 
             if (!hasAnyBlob(blobs)) return;
-            // Skip push only if the CONFIRMED-saved blobs are identical. This
-            // avoids burning CAP write cycles when the wallet is synced and
-            // idle, without stranding a save whose persist failed.
-            const saved = entry.lastSavedBlobs ?? {};
-            if (
-                blobs.shielded === saved.shielded &&
-                blobs.unshielded === saved.unshielded &&
-                blobs.dust === saved.dust
-            ) {
+            // Push only sub-blobs that differ from the last CONFIRMED-saved
+            // state (saveSyncState preserves stored blobs for keys sent as
+            // null/absent). Dust churns with practically every block while
+            // shielded/unshielded mostly don't; sending only what changed
+            // avoids cloning + re-encrypting multi-MB blobs 2x/min per facade.
+            // Diffing against CONFIRMED blobs (advanced only by the ack) keeps
+            // a save whose persist failed marked unsaved for re-push.
+            const changed = diffAgainstConfirmed(entry, blobs);
+            if (!hasAnyBlob(changed)) {
                 log('debug', `save-tick #${tickCount} unchanged, skipping push`);
                 return;
             }
-            const seq = pushStateSave(sessionId, entry, blobs);
+            const seq = pushStateSave(sessionId, entry, changed);
             log('debug', `save-tick #${tickCount} pushed seq=${seq} (total ${Date.now() - tickStart}ms)`);
         } catch (err: any) {
             log('warn', `periodic save failed: ${formatErr(err)}`);
@@ -1126,6 +1169,94 @@ async function collectSerializedStates(facade: any): Promise<{ shielded?: string
 
 function hasAnyBlob(b: { shielded?: string; unshielded?: string; dust?: string }): boolean {
     return !!(b.shielded || b.unshielded || b.dust);
+}
+
+/** Sub-blobs that differ from the last save the main thread acked. */
+function diffAgainstConfirmed(
+    entry: FacadeEntry,
+    blobs: { shielded?: string; unshielded?: string; dust?: string }
+): { shielded?: string; unshielded?: string; dust?: string } {
+    const saved = entry.lastSavedBlobs ?? {};
+    const changed: { shielded?: string; unshielded?: string; dust?: string } = {};
+    if (blobs.shielded && blobs.shielded !== saved.shielded) changed.shielded = blobs.shielded;
+    if (blobs.unshielded && blobs.unshielded !== saved.unshielded) changed.unshielded = blobs.unshielded;
+    if (blobs.dust && blobs.dust !== saved.dust) changed.dust = blobs.dust;
+    return changed;
+}
+
+// ---- Contract-call phase timing -------------------------------------------
+// (FR wallet-save-pipeline-cpu-efficiency, item 4)
+
+/**
+ * Wall-clock attribution for the contract-call phases (compile,
+ * findDeployedContract's ledger-state fetch + deserialize, local circuit
+ * execution, proving, balancing, submission). Logged as ONE debug line per
+ * submission, also when a phase throws (the partial breakdown identifies the
+ * phase that timed out). The hot pre-proof phase this was built to find
+ * (findContract, 8.4 s live) is fixed by withFindContractQueryCache.
+ */
+class PhaseTimer {
+    private readonly t0 = Date.now();
+    private tPhase = this.t0;
+    private readonly phases: Array<[string, number]> = [];
+
+    /** Close the phase that ran since the previous mark (or construction). */
+    mark(name: string): void {
+        const now = Date.now();
+        this.phases.push([name, now - this.tPhase]);
+        this.tPhase = now;
+    }
+
+    /** Record an externally measured duration (does not advance the cursor). */
+    add(name: string, ms: number): void {
+        this.phases.push([name, ms]);
+    }
+
+    summary(): string {
+        return this.phases.map(([n, ms]) => `${n}=${ms}ms`).join(' ') +
+            ` total=${Date.now() - this.t0}ms`;
+    }
+}
+
+/**
+ * Wraps the per-call provider bundle so proving/balancing/submission report
+ * their spans into the timer. `callRegion.start` is stamped right before the
+ * SDK's circuit call; the FIRST proveTx invocation then yields
+ * `circuitToProve` (callTx start -> first proof request), i.e. the local
+ * circuit-execution + transcript span, the FR's prime suspect besides
+ * findDeployedContract. Wallet-side proving inside balanceTx goes through the
+ * facade's own proving service, so `prove` counts contract proofs only.
+ */
+function wrapProvidersForTiming(providers: any, timer: PhaseTimer, callRegion: { start: number }): any {
+    const timed = async <T>(label: string, run: () => Promise<T>): Promise<T> => {
+        const t = Date.now();
+        try { return await run(); } finally { timer.add(label, Date.now() - t); }
+    };
+
+    let proveCalls = 0;
+    const proofProvider = typeof providers.proofProvider?.proveTx === 'function'
+        ? {
+            ...providers.proofProvider,
+            proveTx: (...pArgs: any[]) => {
+                const n = ++proveCalls;
+                if (n === 1 && callRegion.start > 0) {
+                    timer.add('circuitToProve', Date.now() - callRegion.start);
+                }
+                return timed(n === 1 ? 'prove' : `prove#${n}`, () => providers.proofProvider.proveTx(...pArgs));
+            }
+        }
+        : providers.proofProvider;
+
+    const wp = providers.walletProvider;
+    const walletProvider = {
+        ...wp,
+        ...(typeof wp?.balanceTx === 'function'
+            ? { balanceTx: (...a: any[]) => timed('balance', () => wp.balanceTx(...a)) } : {}),
+        ...(typeof wp?.submitTx === 'function'
+            ? { submitTx: (...a: any[]) => timed('submit', () => wp.submitTx(...a)) } : {})
+    };
+
+    return { ...providers, proofProvider, walletProvider, midnightProvider: walletProvider };
 }
 
 // ---- RPC method handlers --------------------------------------------------
@@ -1168,8 +1299,11 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
             // eviction but are logged; silent swallowing would hide leaks.
             try {
                 const blobs = await collectSerializedStates(entry.facade);
-                if (hasAnyBlob(blobs)) {
-                    pushStateSave(sessionId, entry, blobs);
+                // Changed-only, same as the tick: blobs already confirmed
+                // persisted don't need a goodbye re-encrypt.
+                const changed = diffAgainstConfirmed(entry, blobs);
+                if (hasAnyBlob(changed)) {
+                    pushStateSave(sessionId, entry, changed);
                 }
             } catch (err) {
                 log('warn', `evict final-save failed for ${sessionId.slice(0, 16)}: ${formatErr(err)}`);
@@ -1651,69 +1785,83 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
         const entry = facades.get(sessionId);
         if (!entry) throw new Error(`No facade for sessionId=${sessionId.slice(0, 16)}`);
         const sponsorEntry = resolveSponsorEntry(sponsorSessionId);
-        const sdk = await loadSdk();
-        await ensureNetworkId(networkId, sdk);
+        const timer = new PhaseTimer();
+        const callRegion = { start: 0 };
+        try {
+            const sdk = await loadSdk();
+            await ensureNetworkId(networkId, sdk);
+            timer.mark('init');
 
-        const compiledContract = await getOrCompileContract(contractName, registration, entry, witnessValues, merkleProof);
-        const contractProviders = await buildWorkerContractProviders({
-            indexerHttpUrl, indexerWsUrl, proofServerUrl,
-            zkConfigPath: registration.zkConfigPath
-        });
-        const privateStateProvider = createPrivateStateProxy(proxyId);
-        const walletProvider = sponsorEntry
-            ? buildSponsoredWalletProvider(entry, sponsorEntry)
-            : buildWorkerWalletProvider(entry);
+            const compiledContract = await getOrCompileContract(contractName, registration, entry, witnessValues, merkleProof);
+            timer.mark('compile');
+            const contractProviders = await buildWorkerContractProviders({
+                indexerHttpUrl, indexerWsUrl, proofServerUrl,
+                zkConfigPath: registration.zkConfigPath
+            });
+            timer.mark('providers');
+            const privateStateProvider = createPrivateStateProxy(proxyId);
+            const walletProvider = sponsorEntry
+                ? buildSponsoredWalletProvider(entry, sponsorEntry)
+                : buildWorkerWalletProvider(entry);
 
-        const providers = {
-            ...contractProviders,
-            privateStateProvider,
-            walletProvider,
-            midnightProvider: walletProvider
-        };
+            const providers = wrapProvidersForTiming({
+                ...contractProviders,
+                publicDataProvider: withFindContractQueryCache(contractProviders.publicDataProvider, indexerHttpUrl),
+                privateStateProvider,
+                walletProvider,
+                midnightProvider: walletProvider
+            }, timer, callRegion);
 
-        const { contracts } = await loadContractsSdk();
-        log('info', `submitContractCall: ${contractName}.${circuit}@${contractAddress.slice(0, 12)}` +
-            (sponsorEntry ? ` (fee sponsored by ${String(sponsorSessionId).slice(0, 16)})` : ''));
+            const { contracts } = await loadContractsSdk();
+            log('info', `submitContractCall: ${contractName}.${circuit}@${contractAddress.slice(0, 12)}` +
+                (sponsorEntry ? ` (fee sponsored by ${String(sponsorSessionId).slice(0, 16)})` : ''));
 
-        // A wallet that did not DEPLOY this contract has no entry at its
-        // privateStateId, and `findDeployedContract` then throws "No private
-        // state found at private state ID '<id>'". That blocks the entire
-        // multi-caller case (several wallets acting on one shared contract,
-        // e.g. N producers anchoring in the same attestation vault).
-        //
-        // Seed the private state on first contact for this wallet, and ONLY
-        // then: the initialPrivateState variant of findDeployedContract
-        // OVERWRITES whatever is stored, so an existing state (the deployer's,
-        // or one a previous call evolved) must never be handed to it.
-        // The store scopes reads by contract address (`findDeployedContract`
-        // sets it internally); this probe runs BEFORE that, so set it here or
-        // the provider rejects the read with "Contract address not set".
-        privateStateProvider.setContractAddress(contractAddress);
-        const existingPrivateState = await privateStateProvider.get(registration.privateStateId);
-        const seed = existingPrivateState === undefined || existingPrivateState === null;
-        if (seed) {
-            log('info',
-                `submitContractCall: no private state at '${registration.privateStateId}' for this wallet, ` +
-                `seeding the contract's initial private state`);
+            // A wallet that did not DEPLOY this contract has no entry at its
+            // privateStateId, and `findDeployedContract` then throws "No private
+            // state found at private state ID '<id>'". That blocks the entire
+            // multi-caller case (several wallets acting on one shared contract,
+            // e.g. N producers anchoring in the same attestation vault).
+            //
+            // Seed the private state on first contact for this wallet, and ONLY
+            // then: the initialPrivateState variant of findDeployedContract
+            // OVERWRITES whatever is stored, so an existing state (the deployer's,
+            // or one a previous call evolved) must never be handed to it.
+            // The store scopes reads by contract address (`findDeployedContract`
+            // sets it internally); this probe runs BEFORE that, so set it here or
+            // the provider rejects the read with "Contract address not set".
+            privateStateProvider.setContractAddress(contractAddress);
+            const existingPrivateState = await privateStateProvider.get(registration.privateStateId);
+            const seed = existingPrivateState === undefined || existingPrivateState === null;
+            if (seed) {
+                log('info',
+                    `submitContractCall: no private state at '${registration.privateStateId}' for this wallet, ` +
+                    `seeding the contract's initial private state`);
+            }
+            timer.mark('stateProbe');
+            const found = await contracts.findDeployedContract(providers, {
+                contractAddress,
+                compiledContract,
+                privateStateId: registration.privateStateId,
+                ...(seed ? { initialPrivateState: initialPrivateState ?? {} } : {})
+            });
+            timer.mark('findContract');
+            const fn = found?.callTx?.[circuit];
+            if (typeof fn !== 'function') {
+                throw new Error(`Circuit '${circuit}' not found on contract at ${contractAddress}`);
+            }
+            callRegion.start = Date.now();
+            const result = await fn(...(callArgs ?? []));
+            timer.add('callTotal', Date.now() - callRegion.start);
+            const pub = result?.public;
+            const out = {
+                txHash: String(pub?.txHash ?? ''),
+                onChainStatus: String(pub?.status ?? '')
+            };
+            log('info', `submitContractCall: done txHash=${out.txHash.slice(0, 16)} status=${out.onChainStatus}`);
+            return out;
+        } finally {
+            log('debug', `submitContractCall timing: ${contractName}.${circuit} ${timer.summary()}`);
         }
-        const found = await contracts.findDeployedContract(providers, {
-            contractAddress,
-            compiledContract,
-            privateStateId: registration.privateStateId,
-            ...(seed ? { initialPrivateState: initialPrivateState ?? {} } : {})
-        });
-        const fn = found?.callTx?.[circuit];
-        if (typeof fn !== 'function') {
-            throw new Error(`Circuit '${circuit}' not found on contract at ${contractAddress}`);
-        }
-        const result = await fn(...(callArgs ?? []));
-        const pub = result?.public;
-        const out = {
-            txHash: String(pub?.txHash ?? ''),
-            onChainStatus: String(pub?.status ?? '')
-        };
-        log('info', `submitContractCall: done txHash=${out.txHash.slice(0, 16)} status=${out.onChainStatus}`);
-        return out;
     },
 
     /**
@@ -1768,55 +1916,69 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
         const entry = facades.get(sessionId);
         if (!entry) throw new Error(`No facade for sessionId=${sessionId.slice(0, 16)}`);
         const sponsorEntry = resolveSponsorEntry(sponsorSessionId);
-        const sdk = await loadSdk();
-        await ensureNetworkId(networkId, sdk);
-
-        const compiledContract = await getOrCompileContract(contractName, registration, entry, witnessValues, merkleProof);
-        const contractProviders = await buildWorkerContractProviders({
-            indexerHttpUrl, indexerWsUrl, proofServerUrl,
-            zkConfigPath: registration.zkConfigPath
-        });
-        const privateStateProvider = createPrivateStateProxy(proxyId);
-        const walletProvider = sponsorEntry
-            ? buildSponsoredWalletProvider(entry, sponsorEntry)
-            : buildWorkerWalletProvider(entry);
-
-        const providers = {
-            ...contractProviders,
-            privateStateProvider,
-            walletProvider,
-            midnightProvider: walletProvider
-        };
-
-        const { contracts } = await loadContractsSdk();
+        const timer = new PhaseTimer();
+        const callRegion = { start: 0 };
         const circuits = calls.map(c => c.circuit);
-        log('info', `submitContractCallBatch: ${contractName}.[${circuits.join('+')}]@${contractAddress.slice(0, 12)}` +
-            (sponsorEntry ? ` (fee sponsored by ${String(sponsorSessionId).slice(0, 16)})` : ''));
+        try {
+            const sdk = await loadSdk();
+            await ensureNetworkId(networkId, sdk);
+            timer.mark('init');
 
-        // Same first-contact private-state seeding as submitContractCall: a
-        // wallet that did not deploy this contract has no entry at its
-        // privateStateId, and findDeployedContract would throw. Never
-        // overwrite an existing state.
-        privateStateProvider.setContractAddress(contractAddress);
-        const existingPrivateState = await privateStateProvider.get(registration.privateStateId);
-        const seed = existingPrivateState === undefined || existingPrivateState === null;
-        if (seed) {
-            log('info',
-                `submitContractCallBatch: no private state at '${registration.privateStateId}' for this wallet, ` +
-                `seeding the contract's initial private state`);
+            const compiledContract = await getOrCompileContract(contractName, registration, entry, witnessValues, merkleProof);
+            timer.mark('compile');
+            const contractProviders = await buildWorkerContractProviders({
+                indexerHttpUrl, indexerWsUrl, proofServerUrl,
+                zkConfigPath: registration.zkConfigPath
+            });
+            timer.mark('providers');
+            const privateStateProvider = createPrivateStateProxy(proxyId);
+            const walletProvider = sponsorEntry
+                ? buildSponsoredWalletProvider(entry, sponsorEntry)
+                : buildWorkerWalletProvider(entry);
+
+            const providers = wrapProvidersForTiming({
+                ...contractProviders,
+                publicDataProvider: withFindContractQueryCache(contractProviders.publicDataProvider, indexerHttpUrl),
+                privateStateProvider,
+                walletProvider,
+                midnightProvider: walletProvider
+            }, timer, callRegion);
+
+            const { contracts } = await loadContractsSdk();
+            log('info', `submitContractCallBatch: ${contractName}.[${circuits.join('+')}]@${contractAddress.slice(0, 12)}` +
+                (sponsorEntry ? ` (fee sponsored by ${String(sponsorSessionId).slice(0, 16)})` : ''));
+
+            // Same first-contact private-state seeding as submitContractCall: a
+            // wallet that did not deploy this contract has no entry at its
+            // privateStateId, and findDeployedContract would throw. Never
+            // overwrite an existing state.
+            privateStateProvider.setContractAddress(contractAddress);
+            const existingPrivateState = await privateStateProvider.get(registration.privateStateId);
+            const seed = existingPrivateState === undefined || existingPrivateState === null;
+            if (seed) {
+                log('info',
+                    `submitContractCallBatch: no private state at '${registration.privateStateId}' for this wallet, ` +
+                    `seeding the contract's initial private state`);
+            }
+            timer.mark('stateProbe');
+            const found = await contracts.findDeployedContract(providers, {
+                contractAddress,
+                compiledContract,
+                privateStateId: registration.privateStateId,
+                ...(seed ? { initialPrivateState: initialPrivateState ?? {} } : {})
+            });
+            timer.mark('findContract');
+            // Scope mechanics (circuit validation, ordered (txCtx, ...args) calls,
+            // result mapping) live in batch-call-scope.ts so they are unit-testable
+            // outside the worker-thread guard.
+            callRegion.start = Date.now();
+            const out = await runBatchInScope(contracts, providers, found, calls, contractAddress);
+            timer.add('callTotal', Date.now() - callRegion.start);
+            log('info', `submitContractCallBatch: done txHash=${out.txHash.slice(0, 16)} status=${out.onChainStatus} calls=${out.circuits.length}`);
+            return out;
+        } finally {
+            log('debug', `submitContractCallBatch timing: ${contractName}.[${circuits.join('+')}] ${timer.summary()}`);
         }
-        const found = await contracts.findDeployedContract(providers, {
-            contractAddress,
-            compiledContract,
-            privateStateId: registration.privateStateId,
-            ...(seed ? { initialPrivateState: initialPrivateState ?? {} } : {})
-        });
-        // Scope mechanics (circuit validation, ordered (txCtx, ...args) calls,
-        // result mapping) live in batch-call-scope.ts so they are unit-testable
-        // outside the worker-thread guard.
-        const out = await runBatchInScope(contracts, providers, found, calls, contractAddress);
-        log('info', `submitContractCallBatch: done txHash=${out.txHash.slice(0, 16)} status=${out.onChainStatus} calls=${out.circuits.length}`);
-        return out;
     }
 };
 
@@ -1873,7 +2035,10 @@ parentPort.on('message', async (msg: any) => {
         const entry = facades.get(String(msg.sessionId ?? ''));
         const blobs = entry?.pendingSaves?.get(msg.seq);
         if (entry && blobs) {
-            entry.lastSavedBlobs = blobs;
+            // Pushes carry only CHANGED sub-blobs: merge instead of replace,
+            // otherwise a dust-only ack would mark shielded/unshielded as
+            // never-saved and re-push them forever.
+            entry.lastSavedBlobs = { ...entry.lastSavedBlobs, ...blobs };
             entry.pendingSaves!.delete(msg.seq);
         }
         return;

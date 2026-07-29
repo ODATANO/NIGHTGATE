@@ -14,10 +14,15 @@
  * accounts), and the DB section retries bounded on write contention. Under
  * parallel consumer runs (6+ active facades + foreign commits) interleaved
  * per-account saves kept losing the SQLite write lock into a retry storm. The
- * CPU-heavy PBKDF2 + AES stays OUTSIDE the chain; only the short DB writes are
+ * AES encryption stays OUTSIDE the chain; only the short DB writes are
  * serialized.
+ *
+ * Key derivation: PBKDF2 runs ONCE per (accountId, passphrase) per process
+ * (memoized, async on the libuv threadpool), not once per save. See
+ * `getEncryption` below.
  */
 
+import crypto from 'crypto';
 import cds from '@sap/cds';
 const { SELECT, INSERT, UPDATE } = cds.ql;
 import { WalletSyncStates } from '#cds-models/midnight';
@@ -74,6 +79,105 @@ async function getDb(): Promise<cds.DatabaseService> {
     return dbPromise;
 }
 
+// ---- Memoized per-account encryption --------------------------------------
+
+/**
+ * One PBKDF2 (600k iterations) per (accountId, passphrase) per process
+ * instead of one per save. Same pattern and security rationale as
+ * `CapDbPrivateStateProvider.getEncryption()`: the salt is DETERMINISTIC per
+ * (accountId, passphrase), so every save reuses the derived key. The
+ * passphrase is a high-entropy per-account secret, so a passphrase-derived
+ * salt doesn't weaken anti-precomputation. Every blob still carries its salt
+ * in the wire header, so `loadSyncState`/`decryptWithPassword` and SDK
+ * cross-compat are untouched. Derivation runs async on the libuv threadpool,
+ * so even the one-time cost never blocks the event loop.
+ *
+ * Lifetime: memoized keys are NOT process-lifetime. `evictEncryptionKey`
+ * (called from `evictWalletFacade` after the final save) zeroes and drops an
+ * account's key on wallet disconnect; `clearAllEncryptionKeys` does the same
+ * for every account on plugin shutdown. One entry per accountId, so the cache
+ * is bounded by the number of CONNECTED wallets, not ever-connected ones.
+ */
+interface EncryptionCacheEntry {
+    /** Hash of (accountId, passphrase) so a changed passphrase re-derives. */
+    passHash: string;
+    pending: Promise<StorageEncryption>;
+}
+
+const encryptionCache = new Map<string, EncryptionCacheEntry>();
+
+function deriveStableSalt(accountId: string, passphrase: string): Buffer {
+    return crypto
+        .createHash('sha256')
+        .update(`${passphrase}|${accountId}|nightgate-wallet-sync-salt-v1`)
+        .digest();
+}
+
+function getEncryption(accountId: string, passphrase: string): Promise<StorageEncryption> {
+    const passHash = crypto
+        .createHash('sha256')
+        .update(`${accountId}|${passphrase}`)
+        .digest('hex');
+    const hit = encryptionCache.get(accountId);
+    if (hit && hit.passHash === passHash) return hit.pending;
+    if (hit) {
+        // Same account, different passphrase: replace, zeroing the old key.
+        void hit.pending.then(e => e.clear()).catch(() => undefined);
+    }
+    const pending = StorageEncryption.createAsync(passphrase, deriveStableSalt(accountId, passphrase));
+    encryptionCache.set(accountId, { passHash, pending });
+    // A failed derivation must not poison the cache.
+    pending.catch(() => {
+        if (encryptionCache.get(accountId)?.pending === pending) encryptionCache.delete(accountId);
+    });
+    return pending;
+}
+
+// In-flight saves per account: key eviction must wait for them, or zeroing
+// the key mid-encrypt would persist undecryptable blobs (silent cold start
+// on the next restore).
+const inFlightSaves = new Map<string, Set<Promise<void>>>();
+
+function trackInFlightSave(accountId: string, p: Promise<void>): void {
+    let set = inFlightSaves.get(accountId);
+    if (!set) {
+        set = new Set();
+        inFlightSaves.set(accountId, set);
+    }
+    const tracked = set;
+    tracked.add(p);
+    const untrack = (): void => {
+        tracked.delete(p);
+        if (tracked.size === 0 && inFlightSaves.get(accountId) === tracked) {
+            inFlightSaves.delete(accountId);
+        }
+    };
+    p.then(untrack, untrack);
+}
+
+/**
+ * Zeroes and drops the memoized storage key for an account. Awaits the
+ * account's in-flight saves first (the disconnect final-save may still be
+ * encrypting). The next save for this account, if any, re-derives.
+ */
+export async function evictEncryptionKey(accountId: string): Promise<void> {
+    const pending = inFlightSaves.get(accountId);
+    if (pending && pending.size > 0) await Promise.allSettled([...pending]);
+    const hit = encryptionCache.get(accountId);
+    if (!hit) return;
+    encryptionCache.delete(accountId);
+    try {
+        (await hit.pending).clear();
+    } catch {
+        // Derivation failed; there is no key to zero.
+    }
+}
+
+/** Zeroes and drops ALL memoized storage keys (plugin shutdown). */
+export async function clearAllEncryptionKeys(): Promise<void> {
+    await Promise.allSettled([...encryptionCache.keys()].map(evictEncryptionKey));
+}
+
 // ---- Global persist chain -------------------------------------------------
 
 /** All persists queue here, across accounts (see the module docstring). */
@@ -93,7 +197,13 @@ const SAVE_BACKOFF_MS = [0, 1500, 4000];
  * Idempotent per (accountId): a row is upserted by primary key. All persists
  * are serialized through one global chain and retried on write contention.
  */
-export async function saveSyncState(args: SaveSyncStateArgs): Promise<void> {
+export function saveSyncState(args: SaveSyncStateArgs): Promise<void> {
+    const p = saveSyncStateInner(args);
+    if (args.accountId) trackInFlightSave(args.accountId, p);
+    return p;
+}
+
+async function saveSyncStateInner(args: SaveSyncStateArgs): Promise<void> {
     const { accountId, passphrase, sdkVersion, states, networkId, seedFingerprint } = args;
     if (!accountId) throw new Error('saveSyncState: accountId is required');
     if (!passphrase) throw new Error('saveSyncState: passphrase is required');
@@ -102,10 +212,11 @@ export async function saveSyncState(args: SaveSyncStateArgs): Promise<void> {
     const db = await getDb();
 
     const callId = Math.random().toString(36).slice(2, 8);
-    // CPU-heavy crypto (PBKDF2 + AES of multi-MB blobs) stays OUTSIDE the chain.
-    dbgSync(`${callId} starting StorageEncryption ctor (PBKDF2)`);
+    // AES of multi-MB blobs stays OUTSIDE the chain; the key is memoized
+    // (one async PBKDF2 per account per process, see getEncryption).
+    dbgSync(`${callId} resolving encryption key`);
     const t0 = Date.now();
-    const enc = new StorageEncryption(passphrase);
+    const enc = await getEncryption(accountId, passphrase);
     const shieldedCipher = states.shielded ? enc.encrypt(states.shielded) : null;
     const unshieldedCipher = states.unshielded ? enc.encrypt(states.unshielded) : null;
     const dustCipher = states.dust ? enc.encrypt(states.dust) : null;
@@ -270,4 +381,17 @@ export function getWalletSdkVersion(): string {
 /** Test-only: reset the cached db promise so each test gets a fresh handle. */
 export function __resetDbHandleForTests(): void {
     dbPromise = null;
+}
+
+/** Test-only: synchronously drop all memoized derived keys (zeroing async). */
+export function __resetEncryptionCacheForTests(): void {
+    for (const { pending } of encryptionCache.values()) {
+        void pending.then(e => e.clear()).catch(() => undefined);
+    }
+    encryptionCache.clear();
+}
+
+/** Test-only: number of memoized derived keys. */
+export function __getEncryptionCacheSizeForTests(): number {
+    return encryptionCache.size;
 }

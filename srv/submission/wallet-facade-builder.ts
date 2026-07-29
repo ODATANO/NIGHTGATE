@@ -29,7 +29,8 @@ import {
 import {
     saveSyncState,
     loadSyncState,
-    getWalletSdkVersion
+    getWalletSdkVersion,
+    evictEncryptionKey
 } from './wallet-sync-state-store';
 import { formatErr } from '../utils/format-error';
 import { withKeyedLock } from '../utils/keyed-lock';
@@ -216,6 +217,15 @@ export async function evictWalletFacade(cacheKey: string): Promise<void> {
         log.warn(`evict failed for ${cacheKey.slice(0, 16)}:`, formatErr(err));
     } finally {
         sessionRegistry.delete(cacheKey);
+        // Registry entry is gone, so the save sink drops any NEW save for this
+        // account; now the memoized storage key can go. evictEncryptionKey
+        // awaits the account's in-flight saves (the final save above may still
+        // be encrypting) before zeroing, so no blob is garbled mid-encrypt.
+        try {
+            await evictEncryptionKey(cacheKey);
+        } catch (err) {
+            log.warn(`key evict failed for ${cacheKey.slice(0, 16)}:`, formatErr(err));
+        }
     }
 }
 

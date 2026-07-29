@@ -15,6 +15,7 @@ const mockSetStateSaveSink = vi.hoisted(() => (vi.fn()));
 const mockLoadSyncState = vi.hoisted(() => (vi.fn()));
 const mockSaveSyncState = vi.hoisted(() => (vi.fn()));
 const mockGetWalletSdkVersion = vi.hoisted(() => (vi.fn(() => 'sdk-test')));
+const mockEvictEncryptionKey = vi.hoisted(() => (vi.fn(async () => undefined)));
 
 vi.mock('../../srv/midnight/wallet-worker-client', () => ({
     walletInit: mockWalletInit,
@@ -25,7 +26,8 @@ vi.mock('../../srv/midnight/wallet-worker-client', () => ({
 vi.mock('../../srv/submission/wallet-sync-state-store', () => ({
     loadSyncState: mockLoadSyncState,
     saveSyncState: mockSaveSyncState,
-    getWalletSdkVersion: mockGetWalletSdkVersion
+    getWalletSdkVersion: mockGetWalletSdkVersion,
+    evictEncryptionKey: mockEvictEncryptionKey
 }));
 
 import {
@@ -141,6 +143,9 @@ describe('wallet-facade-builder', () => {
 
                 expect(mockWalletEvict).toHaveBeenCalledWith('evict-me');
                 expect(__getCacheSizeForTests()).toBe(0);
+                // The memoized storage key goes with the facade, so key
+                // material of disconnected wallets doesn't linger.
+                expect(mockEvictEncryptionKey).toHaveBeenCalledWith('evict-me');
             } finally {
                 logSpy.mockRestore();
             }
@@ -152,6 +157,19 @@ describe('wallet-facade-builder', () => {
             try {
                 await expect(evictWalletFacade('any-key')).resolves.toBeUndefined();
                 expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('evict failed'), expect.stringContaining('worker gone'));
+                // Key eviction still runs when the worker RPC fails.
+                expect(mockEvictEncryptionKey).toHaveBeenCalledWith('any-key');
+            } finally {
+                warnSpy.mockRestore();
+            }
+        });
+
+        it('evicts the storage key even when key eviction itself rejects (logged, not thrown)', async () => {
+            mockEvictEncryptionKey.mockRejectedValueOnce(new Error('zeroize boom'));
+            const warnSpy = vi.spyOn(cds.log('nightgate:facade'), 'warn').mockImplementation(() => {});
+            try {
+                await expect(evictWalletFacade('any-key')).resolves.toBeUndefined();
+                expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('key evict failed'), expect.stringContaining('zeroize boom'));
             } finally {
                 warnSpy.mockRestore();
             }

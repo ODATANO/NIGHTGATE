@@ -16,6 +16,7 @@ import { loadRegistryFromConfig, listRegisteredContracts } from '../srv/submissi
 const log = cds.log('nightgate');
 import { startWalletWorker, stopWalletWorker } from '../srv/midnight/wallet-worker-client';
 import { wireWorkerStateSaveSink } from '../srv/submission/wallet-facade-builder';
+import { clearAllEncryptionKeys } from '../srv/submission/wallet-sync-state-store';
 import { recoverInterruptedJobs, startBackgroundJobProcessor, stopBackgroundJobProcessor, registerChainOutcomeConfirmer } from '../srv/submission/background-jobs';
 import { buildIndexerTxConfirmer } from '../srv/submission/chain-outcome-confirmer';
 import { TransactionResults } from '#cds-models/midnight';
@@ -355,6 +356,14 @@ export async function shutdown(): Promise<void> {
     } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         log.warn(`Wallet worker stop error: ${message}`);
+    }
+    try {
+        // Worker is stopped, no more saves can arrive: zero every memoized
+        // wallet-storage key so no key material outlives the plugin.
+        await clearAllEncryptionKeys();
+    } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        log.warn(`Encryption key cleanup error: ${message}`);
     }
     initialized = false;
     lastStatus = {

@@ -42,14 +42,41 @@ const HEADER_LENGTH         = VERSION_PREFIX_LENGTH + SALT_LENGTH + IV_LENGTH + 
 export class StorageEncryption {
     readonly salt: Buffer;
     private readonly encryptionKey: Buffer;
+    private cleared = false;
 
-    constructor(password: string, existingSalt?: Buffer) {
+    constructor(password: string, existingSalt?: Buffer, precomputedKey?: Buffer) {
         this.salt          = existingSalt ?? crypto.randomBytes(SALT_LENGTH);
-        this.encryptionKey = deriveKey(password, this.salt);
+        this.encryptionKey = precomputedKey ?? deriveKey(password, this.salt);
+    }
+
+    /**
+     * Zeroes the derived key in memory; the instance is unusable afterwards
+     * (encrypt/decrypt throw instead of emitting garbage ciphertext). Called
+     * when a memoized instance is evicted, so key material of disconnected
+     * wallets doesn't linger in the process until GC.
+     */
+    clear(): void {
+        this.encryptionKey.fill(0);
+        this.cleared = true;
+    }
+
+    private assertUsable(): void {
+        if (this.cleared) throw new Error('StorageEncryption: key has been cleared');
+    }
+
+    /**
+     * Async construction: PBKDF2 runs on the libuv threadpool instead of
+     * blocking the event loop. Use for the memoized long-lived instances;
+     * `precomputedKey` MUST come from `deriveKeyAsync(password, salt)`.
+     */
+    static async createAsync(password: string, salt: Buffer): Promise<StorageEncryption> {
+        const key = await deriveKeyAsync(password, salt);
+        return new StorageEncryption(password, salt, key);
     }
 
     /** Encrypts `data` (UTF-8 string) and returns base64-encoded SDK wire format. */
     encrypt(data: string): string {
+        this.assertUsable();
         const plaintext = Buffer.from(data, 'utf-8');
         const iv        = crypto.randomBytes(IV_LENGTH);
         const cipher    = crypto.createCipheriv(ALGORITHM, this.encryptionKey, iv);
@@ -64,6 +91,7 @@ export class StorageEncryption {
      * this instance's salt (i.e. the same password was used).
      */
     decrypt(encryptedData: string): string {
+        this.assertUsable();
         const data = Buffer.from(encryptedData, 'base64');
         const { version, salt, iv, authTag, encrypted } = extractEncryptedComponents(data);
         if (version !== CURRENT_ENCRYPTION_VERSION) {
@@ -81,6 +109,14 @@ export class StorageEncryption {
 
 export function deriveKey(password: string, salt: Buffer): Buffer {
     return crypto.pbkdf2Sync(password, salt, PBKDF2_ITERATIONS_V2, KEY_LENGTH, 'sha256');
+}
+
+/** Same derivation as `deriveKey`, on the libuv threadpool (non-blocking). */
+export function deriveKeyAsync(password: string, salt: Buffer): Promise<Buffer> {
+    return new Promise((resolve, reject) => {
+        crypto.pbkdf2(password, salt, PBKDF2_ITERATIONS_V2, KEY_LENGTH, 'sha256',
+            (err, key) => (err ? reject(err) : resolve(key)));
+    });
 }
 
 export interface EncryptedComponents {

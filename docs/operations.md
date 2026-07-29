@@ -200,6 +200,19 @@ curl -s -o /dev/null -w "HTTP %{http_code}\n" \
 
 The hosted preprod indexer's graphql-ws subscription degrades over a long, multi-call session — early calls succeed but later ones can hang inside the SDK's balance/submit (the proof server goes idle). The pre-balance sync wait is bounded (`NIGHTGATE_BALANCE_SYNC_TIMEOUT_MS`, default 180s) so it fails rather than hangs forever, but the SDK's own balance/submit calls aren't. Mitigations: keep sessions short / run independent flows separately, restart the server for a fresh subscription, or use a **caught-up** local indexer for heavy use.
 
+### Contract calls feel slow: read the phase timing
+
+Every `submitContractCall` / `submitContractCallBatch` logs ONE debug line
+with a wall-clock phase breakdown (`submitContractCall timing: <contract>.<circuit>
+init=..ms compile=..ms findContract=..ms circuitToProve=..ms prove=..ms
+balance=..ms submit=..ms total=..ms`), also when a phase throws, so a timeout
+attributes itself to its phase. Enable the channel with `DEBUG=nightgate:worker`.
+Expected shape on preprod: `prove` (proof server or in-process wasm) and
+`submit` (chain inclusion) dominate; `findContract` is ~1 s warm (the two
+immutable deploy queries are cached per contract address, the verifier-key
+check stays live). A large `circuitToProve` points at local circuit
+execution, a large `balance` at wallet sync lag.
+
 ### Server is up but OData requests hang
 
 Phase-2a observation: while the wallet worker is mid-sync at full CPU, the main thread's CAP request pipeline can get starved (10 s `getHealth` curls time out while worker `state-save` events fire normally every 30 s). State-save uses `worker.on('message')` callbacks which don't go through the CAP request pipeline; requests do (auth, AsyncLocalStorage, transaction binding).
