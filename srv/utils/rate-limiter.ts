@@ -35,6 +35,16 @@ export class RateLimiter {
     }
 
     check(key: string): RateCheckResult {
+        return this.checkMany(key, 1);
+    }
+
+    /**
+     * Consume `count` slots atomically: either ALL fit into the window and
+     * are recorded, or NONE are (a rejected caller has consumed nothing).
+     * Made for batch actions that count as N requests.
+     */
+    checkMany(key: string, count: number): RateCheckResult {
+        if (count <= 0) return { allowed: true, retryAfterMs: 0 };
         const now = Date.now();
         const windowStart = now - this.windowMs;
 
@@ -46,21 +56,19 @@ export class RateLimiter {
         let timestamps = this.hits.get(key) || [];
         timestamps = timestamps.filter(t => t > windowStart);
 
-        if (timestamps.length === 0) {
-            timestamps = [now];
-            this.hits.set(key, timestamps);
-            return { allowed: true, retryAfterMs: 0 };
-        }
-
-        if (timestamps.length >= this.maxRequests) {
+        if (timestamps.length + count > this.maxRequests) {
             timestamps.sort((a, b) => a - b);
             const oldestInWindow = timestamps[0];
-            const retryAfterMs = oldestInWindow + this.windowMs - now;
+            // A count larger than the whole budget can never succeed; report
+            // a full window rather than 0.
+            const retryAfterMs = oldestInWindow === undefined
+                ? this.windowMs
+                : oldestInWindow + this.windowMs - now;
             this.hits.set(key, timestamps);
             return { allowed: false, retryAfterMs: Math.max(retryAfterMs, 0) };
         }
 
-        timestamps.push(now);
+        for (let i = 0; i < count; i++) timestamps.push(now);
         this.hits.set(key, timestamps);
         return { allowed: true, retryAfterMs: 0 };
     }

@@ -240,7 +240,8 @@ flow.
 
 Every submit action (`deployContract`, `submitContractCall`,
 `submitContractCallBatch`, `anchorDocument`, `issuePredicateAttestation`,
-`issueFieldPredicateAttestation`, `grantDisclosure`, `revokeDisclosure`,
+`issueFieldPredicateAttestation`, `issueFieldPredicateAttestationBatch`,
+`grantDisclosure`, `revokeDisclosure`,
 `registerPassport`, `deregisterFromDustGeneration`) accepts
 an optional `sponsorSessionId`. When set, the calling session builds and signs
 the transaction (balancing shielded/unshielded only) and the sponsor session
@@ -317,6 +318,10 @@ The payload must already be attested. Submits `commitValue` then `provePredicate
 ### `issueFieldPredicateAttestation(payloadHash, fieldKey, value, predicate, threshold, sessionId, contractAddress, contentRoot?, siblingsJson?, dirsJson?, unit?, compiledArtifactRef?, idempotencyKey?, sponsorSessionId?) → { jobId, status, predicateAttestationId }`
 
 Field-bound predicate proof (hardened model). Like `issuePredicateAttestation`, but the proven value is cryptographically bound to a SPECIFIC passport field via Merkle inclusion against an anchored content root, so a verifier knows the value came from THIS passport's `fieldKey`, not an arbitrary committed number. The caller builds the content root + inclusion path off-chain with the contract's exported `pureCircuits` (hashing matches in-circuit). If `contentRoot` is supplied it is anchored first (`anchorContentRoot`), then `proveFieldPredicate` runs with the Merkle witnesses. `value` is the scaled integer field value (witness only, never persisted). `siblingsJson`/`dirsJson`: JSON arrays of the DEPTH=4 inclusion path (4 × 64-hex siblings; 4 booleans). **Rate limit:** 10/hour per session (shared with `issuePredicateAttestation`).
+
+### `issueFieldPredicateAttestationBatch(payloadHash, claimsJson, sessionId, contractAddress, contentRoot?, compiledArtifactRef?, idempotencyKey?, sponsorSessionId?) → { jobId, status, claims, droppedDuplicates }`
+
+Batch pendant to `issueFieldPredicateAttestation`: prove up to 8 field-bound predicates on ONE passport in ONE transaction (one balancing round, one submit, one confirmation wait, one fee event; with `sponsorSessionId` one dust spend for the whole batch). `claimsJson` is a JSON array of `{ fieldKey, value, siblings, dirs, predicate, threshold, unit? }`, each entry validated like the single action. If `contentRoot` is supplied it is anchored as the FIRST call of the SAME batch (segment ordering pins the anchor ahead of the proofs) and occupies one of the 8 call slots (max 7 claims with anchor). Exact duplicate claim tuples are dropped server-side (`droppedDuplicates`); claim keys are idempotent on-chain, so this is only a proving-time optimization. One `PredicateAttestations` row per claim, all sharing one `provenTxHash` on success; `claims` in the response is a JSON array of `{ predicateAttestationId, fieldKey, predicate, threshold, unit }`. Proving work stays additive (N proofs = N provings, sequential). Failure: a false predicate fails at LOCAL proving time (nothing submitted, no row proven); after submission the ledger's fallible phase can finalize PARTIAL_SUCCESS, in which case the job fails with `OnChainStatus:...` and callers verify per claim via `verifyPredicateAttestation` (crawler-free, no txHash needed). **Rate limit:** counts N claims against the shared 10/hour predicate budget, not one call.
 
 ### `verifyPredicateAttestation(predicateAttestationId) → { verified, predicate, threshold, unit, valueCommitment, provenTxHash, provenAt }` (function)
 

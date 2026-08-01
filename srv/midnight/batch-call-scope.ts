@@ -13,6 +13,13 @@ import { withOrderedBatchSegments } from './batch-segment-order';
 export interface BatchCall {
     circuit: string;
     args: unknown[];
+    /**
+     * Invoked immediately before this entry's `callTx`. Calls run
+     * sequentially inside the scope, so the hook may rebind per-call state
+     * (e.g. swap a witness holder's current Merkle proof) deterministically.
+     * Entries without a hook behave exactly as before.
+     */
+    before?: () => void;
 }
 
 export interface BatchScopeResult {
@@ -68,6 +75,7 @@ export async function runBatchInScope(
         scopedProviders,
         async (txCtx: unknown) => {
             for (const c of calls) {
+                c.before?.();
                 await found.callTx[c.circuit](txCtx, ...(c.args ?? []));
             }
         },

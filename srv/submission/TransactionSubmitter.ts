@@ -129,8 +129,11 @@ export interface CallResult {
 
 export interface CallBatchArgs {
     contractAddress: string;
-    /** Ordered circuit calls; all execute inside ONE transaction. */
-    calls: Array<{ circuit: string; args: unknown[] }>;
+    /** Ordered circuit calls; all execute inside ONE transaction. A call may
+     *  carry its own `merkleProof` (per-call witness binding for
+     *  proveFieldPredicate); mutually exclusive with the batch-level
+     *  `merkleProof` below. */
+    calls: Array<{ circuit: string; args: unknown[]; merkleProof?: { fieldValue: string; siblings: string[]; dirs: boolean[] } }>;
     contractName: string;
     registration: ContractRegistrationMeta;
     sessionId: string;

@@ -250,6 +250,23 @@ describe('submitContractCallBatch: argument validation', () => {
         const req = await setupAndCallBatch({ ...VALID_BATCH_ARGS, initialPrivateState: '{broken' });
         expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/initialPrivateState must be valid JSON/));
     });
+
+    const SIBS4 = ['1'.repeat(64), '2'.repeat(64), '3'.repeat(64), '4'.repeat(64)];
+    test.each([
+        [{ merkleProof: 'nope' }, /calls\[0\]\.merkleProof must be an object/],
+        [{ merkleProof: { fieldValue: '4.2', siblings: SIBS4, dirs: [true, false, true, false] } }, /merkleProof\.fieldValue must be an integer/],
+        [{ merkleProof: { fieldValue: '-1', siblings: SIBS4, dirs: [true, false, true, false] } }, /merkleProof\.fieldValue must be a non-negative integer/],
+        [{ merkleProof: { fieldValue: '1', siblings: SIBS4.slice(0, 2), dirs: [true, false, true, false] } }, /merkleProof\.siblings must be a JSON array of 4 hashes/],
+        [{ merkleProof: { fieldValue: '1', siblings: [...SIBS4.slice(0, 3), 'short'], dirs: [true, false, true, false] } }, /merkleProof\.siblings entries must be 64 hex/],
+        [{ merkleProof: { fieldValue: '1', siblings: SIBS4, dirs: [true] } }, /merkleProof\.dirs must be a JSON array of 4 booleans/],
+        [{ merkleProof: { fieldValue: '1', siblings: SIBS4, dirs: [true, false, 'false', true] } }, /merkleProof\.dirs entries must be booleans/]
+    ])('rejects a malformed per-call merkleProof %o', async (patch, msg) => {
+        const req = await setupAndCallBatch({
+            ...VALID_BATCH_ARGS,
+            calls: JSON.stringify([{ circuit: 'proveFieldPredicate', args: [], ...patch }])
+        });
+        expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(msg));
+    });
 });
 
 // ---- Error translation ----------------------------------------------------
@@ -340,6 +357,32 @@ describe('error translation to OData status codes', () => {
             requestedBy: 'test-user', commandVersion: 1, encryptCommand: true,
             command: { op: 'callBatch', contractAddress: '0xCONTRACT' }
         });
+    });
+
+    test('submitContractCallBatch forwards a per-call merkleProof to the submitter and the persisted command', async () => {
+        const submitter = makeSuccessfulSubmitter();
+        const srv = setupHandlers({ submitterFactory: () => submitter });
+        const SIBS4 = ['1'.repeat(64), '2'.repeat(64), '3'.repeat(64), '4'.repeat(64)];
+        const proof = { fieldValue: '3600', siblings: SIBS4, dirs: [true, false, true, false] };
+        const req = makeReq({
+            contractAddress: '0xCONTRACT',
+            calls: JSON.stringify([
+                { circuit: 'anchorContentRoot', args: [] },
+                { circuit: 'proveFieldPredicate', args: [], merkleProof: proof }
+            ]),
+            compiledArtifactRef: 'attestation-vault',
+            sessionId: 'session-happy-batch-proof'
+        });
+        await srv.handlers['submitContractCallBatch'](req);
+        expect(req.reject).not.toHaveBeenCalled();
+
+        const batchArgs = ((submitter as any).callBatch as Mock).mock.calls[0][0];
+        expect(batchArgs.calls[0].merkleProof).toBeUndefined();
+        expect(batchArgs.calls[1].merkleProof).toEqual(proof);
+
+        const command = mockStartJob.mock.calls.at(-1)?.[0]?.command;
+        expect(command.calls[0].merkleProof).toBeUndefined();
+        expect(command.calls[1].merkleProof).toEqual(proof);
     });
 
     test('reconciliation finalizer rebuilds the batch result incl. circuits from command + evidence', async () => {
@@ -1811,6 +1854,7 @@ describe('issueFieldPredicateAttestation', () => {
         [{ siblingsJson: JSON.stringify(SIBLINGS.slice(0, 2)) }, /array of 4 hashes/],
         [{ dirsJson: JSON.stringify([true]) }, /array of 4 booleans/],
         [{ siblingsJson: JSON.stringify([...SIBLINGS.slice(0, 3), 'short']) }, /each sibling must be 64 hex/],
+        [{ dirsJson: JSON.stringify([true, false, 'false', true]) }, /dirsJson entries must be booleans/],
         [{ contentRoot: 'oops' }, /contentRoot must be 64 hex/],
         [{ sessionId: undefined }, /sessionId is required/],
         [{ contractAddress: undefined }, /contractAddress is required/]
@@ -1892,5 +1936,213 @@ describe('issueFieldPredicateAttestation', () => {
         expect(req.reject).not.toHaveBeenCalled();
         const inserted = (db.run as Mock).mock.calls[0][0];
         expect(JSON.stringify(inserted)).toContain(VALID_FIELD_KEY);
+    });
+});
+
+// ---- issueFieldPredicateAttestationBatch (N proofs, ONE transaction) -------
+
+describe('issueFieldPredicateAttestationBatch', () => {
+    const VALID_PAYLOAD = 'a'.repeat(64);
+    const VALID_ROOT = 'd'.repeat(64);
+    const SIBLINGS = ['1'.repeat(64), '2'.repeat(64), '3'.repeat(64), '4'.repeat(64)];
+    const makeClaim = (n: number, patch: any = {}) => ({
+        fieldKey: String(n).repeat(64).slice(0, 64),
+        value: `${1000 + n}`,
+        siblings: SIBLINGS,
+        dirs: [true, false, true, false],
+        predicate: 'lessOrEqual',
+        threshold: `${50000 + n}`,
+        unit: 'kgCO2e/kWh',
+        ...patch
+    });
+    const VALID_ARGS = (patch: any = {}) => ({
+        payloadHash: VALID_PAYLOAD,
+        contentRoot: VALID_ROOT,
+        claimsJson: JSON.stringify([makeClaim(1), makeClaim(2)]),
+        sessionId: `fieldpredbatch-${Math.random().toString(36).slice(2)}`,
+        contractAddress: '0xVAULT',
+        compiledArtifactRef: 'attestation-vault',
+        ...patch
+    });
+
+    function setupHandlersWithDb(overrides: any = {}) {
+        const srv = makeFakeService();
+        const db = { run: vi.fn().mockResolvedValue(undefined) };
+        registerSubmissionHandlers(srv as any, db, {
+            resolveContractImpl: vi.fn(async () => ({ ...RESOLVED_CONTRACT_FIXTURE })),
+            walletMaterialFactory: vi.fn(async () => ({
+                accountId: 'a',
+                privateStoragePasswordProvider: () => '0123456789ABCDEFG',
+                walletAndMidnightProvider: {}
+            })),
+            submitterFactory: vi.fn(() => makeSuccessfulSubmitter()),
+            ...overrides
+        });
+        return { srv, db };
+    }
+
+    test.each([
+        [{ payloadHash: undefined }, /payloadHash is required/],
+        [{ payloadHash: 'nope' }, /payloadHash must be 64 hex/],
+        [{ contentRoot: 'oops' }, /contentRoot must be 64 hex/],
+        [{ sessionId: undefined }, /sessionId is required/],
+        [{ contractAddress: undefined }, /contractAddress is required/],
+        [{ claimsJson: undefined }, /claimsJson is required/],
+        [{ claimsJson: 'not-json' }, /claimsJson must be valid JSON/],
+        [{ claimsJson: '[]' }, /non-empty JSON array/],
+        [{ claimsJson: JSON.stringify([makeClaim(1, { fieldKey: 'zz' })]) }, /claims\[0\].fieldKey must be 64 hex/],
+        [{ claimsJson: JSON.stringify([makeClaim(1), makeClaim(2, { value: '' })]) }, /claims\[1\].value is required/],
+        [{ claimsJson: JSON.stringify([makeClaim(1, { value: '47.3' })]) }, /claims\[0\].value must be an integer/],
+        [{ claimsJson: JSON.stringify([makeClaim(1, { value: '-5' })]) }, /claims\[0\].value must be a non-negative integer/],
+        [{ claimsJson: JSON.stringify([makeClaim(1, { threshold: 'abc' })]) }, /claims\[0\].threshold must be an integer/],
+        [{ claimsJson: JSON.stringify([makeClaim(1, { predicate: 'between' })]) }, /claims\[0\].predicate must be 'lessOrEqual' or 'greaterOrEqual'/],
+        [{ claimsJson: JSON.stringify([makeClaim(1, { siblings: SIBLINGS.slice(0, 2) })]) }, /claims\[0\].siblings must be a JSON array of 4 hashes/],
+        [{ claimsJson: JSON.stringify([makeClaim(1, { siblings: [...SIBLINGS.slice(0, 3), 'short'] })]) }, /claims\[0\].siblings entries must be 64 hex/],
+        [{ claimsJson: JSON.stringify([makeClaim(1, { dirs: [true] })]) }, /claims\[0\].dirs must be a JSON array of 4 booleans/],
+        [{ claimsJson: JSON.stringify([makeClaim(1, { dirs: [true, false, 'false', true] })]) }, /claims\[0\].dirs entries must be booleans/]
+    ])('rejects %o', async (patch, msg) => {
+        const { srv } = setupHandlersWithDb();
+        const req = makeReq(VALID_ARGS(patch));
+        await srv.handlers['issueFieldPredicateAttestationBatch'](req);
+        expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(msg));
+    });
+
+    test('caps at 8 claims without anchor and 7 with an in-batch contentRoot anchor', async () => {
+        const { srv } = setupHandlersWithDb();
+        const nine = JSON.stringify(Array.from({ length: 9 }, (_, i) => makeClaim(i + 1)));
+        const eight = JSON.stringify(Array.from({ length: 8 }, (_, i) => makeClaim(i + 1)));
+
+        const reqNine = makeReq(VALID_ARGS({ contentRoot: undefined, claimsJson: nine }));
+        await srv.handlers['issueFieldPredicateAttestationBatch'](reqNine);
+        expect(reqNine.reject).toHaveBeenCalledWith(400, expect.stringMatching(/at most 8 entries/));
+
+        const reqEightWithAnchor = makeReq(VALID_ARGS({ claimsJson: eight }));
+        await srv.handlers['issueFieldPredicateAttestationBatch'](reqEightWithAnchor);
+        expect(reqEightWithAnchor.reject).toHaveBeenCalledWith(400, expect.stringMatching(/at most 7 entries.*anchor/));
+    });
+
+    test('is blocked on mainnet by default (403)', async () => {
+        const prev = process.env.NIGHTGATE_NETWORK;
+        process.env.NIGHTGATE_NETWORK = 'mainnet';
+        try {
+            const { srv } = setupHandlersWithDb();
+            const req = makeReq(VALID_ARGS());
+            await srv.handlers['issueFieldPredicateAttestationBatch'](req);
+            expect(req.reject).toHaveBeenCalledWith(403, expect.stringMatching(/mainnet/i));
+        } finally {
+            if (prev === undefined) delete process.env.NIGHTGATE_NETWORK;
+            else process.env.NIGHTGATE_NETWORK = prev;
+        }
+    });
+
+    test('happy path: ONE callBatch with in-batch anchor first, per-call merkleProof on every proof, N row updates', async () => {
+        const submitter = makeSuccessfulSubmitter();
+        const { srv, db } = setupHandlersWithDb({ submitterFactory: () => submitter });
+        const req = makeReq(VALID_ARGS());
+
+        const result: any = await srv.handlers['issueFieldPredicateAttestationBatch'](req);
+        expect(req.reject).not.toHaveBeenCalled();
+        expect(result).toEqual({
+            jobId: 'job-issueFieldPredicateAttestationBatch-test',
+            status: 'pending',
+            claims: expect.any(String),
+            droppedDuplicates: 0
+        });
+        const claims = JSON.parse(result.claims);
+        expect(claims).toHaveLength(2);
+        for (const c of claims) {
+            expect(c).toEqual({
+                predicateAttestationId: expect.any(String),
+                fieldKey: expect.stringMatching(/^[0-9a-f]{64}$/),
+                predicate: 'lessOrEqual',
+                threshold: expect.any(String),
+                unit: 'kgCO2e/kWh'
+            });
+        }
+
+        // Exactly ONE batch submission, never N single calls.
+        expect(submitter.callBatch).toHaveBeenCalledTimes(1);
+        expect((submitter as any).call).not.toHaveBeenCalled();
+        const batchArgs = (submitter.callBatch as Mock).mock.calls[0][0];
+        expect(batchArgs.calls).toHaveLength(3);
+
+        // Anchor first (distinct entryPoint; segment ordering pins it ahead),
+        // no witness proof on it.
+        expect(batchArgs.calls[0].circuit).toBe('anchorContentRoot');
+        expect(batchArgs.calls[0].args).toHaveLength(2);
+        expect(batchArgs.calls[0].merkleProof).toBeUndefined();
+
+        // Every proof call carries ITS OWN merkleProof; the value travels as
+        // witness only, never as a circuit arg.
+        for (const [i, call] of [batchArgs.calls[1], batchArgs.calls[2]].entries()) {
+            expect(call.circuit).toBe('proveFieldPredicate');
+            expect(call.args).toHaveLength(4);
+            expect(call.args[2]).toBe(BigInt(50000 + i + 1));
+            expect(call.args[3]).toBe(0n);
+            expect(call.merkleProof).toEqual({
+                fieldValue: `${1000 + i + 1}`,
+                siblings: SIBLINGS,
+                dirs: [true, false, true, false]
+            });
+            const flatArgs = JSON.stringify(call.args, (_k, v) => typeof v === 'bigint' ? v.toString() : v);
+            expect(flatArgs).not.toContain(`${1000 + i + 1}`);
+        }
+
+        // 1 up-front INSERT (both rows) + ONE bulk provenTxHash UPDATE (atomic
+        // projection: partial proven-marking must be impossible).
+        expect(db.run).toHaveBeenCalledTimes(2);
+        const inserted = (db.run as Mock).mock.calls[0][0];
+        expect(JSON.stringify(inserted)).toContain(VALID_PAYLOAD);
+        const update = JSON.stringify((db.run as Mock).mock.calls[1][0]);
+        for (const c of claims) expect(update).toContain(c.predicateAttestationId);
+    });
+
+    test('without contentRoot the batch contains only the proof calls', async () => {
+        const submitter = makeSuccessfulSubmitter();
+        const { srv } = setupHandlersWithDb({ submitterFactory: () => submitter });
+        const req = makeReq(VALID_ARGS({ contentRoot: undefined }));
+
+        await srv.handlers['issueFieldPredicateAttestationBatch'](req);
+        expect(req.reject).not.toHaveBeenCalled();
+        const batchArgs = (submitter.callBatch as Mock).mock.calls[0][0];
+        expect(batchArgs.calls.map((c: any) => c.circuit)).toEqual(['proveFieldPredicate', 'proveFieldPredicate']);
+    });
+
+    test('drops exact duplicate claim tuples and reports the count (idempotent on-chain inserts)', async () => {
+        const submitter = makeSuccessfulSubmitter();
+        const { srv, db } = setupHandlersWithDb({ submitterFactory: () => submitter });
+        const dupe = makeClaim(1);
+        const req = makeReq(VALID_ARGS({ claimsJson: JSON.stringify([dupe, makeClaim(2), { ...dupe }]) }));
+
+        const result: any = await srv.handlers['issueFieldPredicateAttestationBatch'](req);
+        expect(req.reject).not.toHaveBeenCalled();
+        expect(result.droppedDuplicates).toBe(1);
+        expect(JSON.parse(result.claims)).toHaveLength(2);
+        const batchArgs = (submitter.callBatch as Mock).mock.calls[0][0];
+        // anchor + 2 unique proofs; the duplicate proved nothing extra.
+        expect(batchArgs.calls).toHaveLength(3);
+        const insertedEntries = JSON.stringify((db.run as Mock).mock.calls[0][0]);
+        expect(insertedEntries.match(new RegExp(dupe.fieldKey, 'g'))).toHaveLength(1);
+    });
+
+    test('counts N claims against the predicate rate limiter, not one action call', async () => {
+        const { srv } = setupHandlersWithDb();
+        const sessionId = `fieldpredbatch-rate-${Math.random().toString(36).slice(2)}`;
+        const eight = JSON.stringify(Array.from({ length: 8 }, (_, i) => makeClaim(i + 1)));
+
+        const first = makeReq(VALID_ARGS({ contentRoot: undefined, claimsJson: eight, sessionId }));
+        await srv.handlers['issueFieldPredicateAttestationBatch'](first);
+        expect(first.reject).not.toHaveBeenCalled();
+
+        // 8 of the 10/hour budget consumed; a 3-claim follow-up must trip 429.
+        const second = makeReq(VALID_ARGS({ contentRoot: undefined, claimsJson: JSON.stringify([makeClaim(11), makeClaim(12), makeClaim(13)]), sessionId }));
+        await srv.handlers['issueFieldPredicateAttestationBatch'](second);
+        expect(second.reject).toHaveBeenCalledWith(429, expect.stringMatching(/Rate limited/));
+
+        // All-or-nothing: the rejected batch consumed NOTHING, so the 2
+        // remaining slots are still available.
+        const third = makeReq(VALID_ARGS({ contentRoot: undefined, claimsJson: JSON.stringify([makeClaim(14), makeClaim(15)]), sessionId }));
+        await srv.handlers['issueFieldPredicateAttestationBatch'](third);
+        expect(third.reject).not.toHaveBeenCalled();
     });
 });

@@ -87,9 +87,10 @@ const DEFAULT_ATTESTATION_VAULT_REF = 'attestation-vault';
 type ContractCommandV1 =
     | { op: 'deploy'; compiledArtifactRef: string; initialPrivateState: unknown; sponsorSessionId?: string }
     | { op: 'call'; contractAddress: string; circuit: string; compiledArtifactRef: string; args: unknown[]; initialPrivateState?: unknown; sponsorSessionId?: string; witnessValues?: { attestedValue: string; valueSalt: string }; merkleProof?: { fieldValue: string; siblings: string[]; dirs: boolean[] } }
-    | { op: 'callBatch'; contractAddress: string; calls: Array<{ circuit: string; args: unknown[] }>; compiledArtifactRef: string; initialPrivateState?: unknown; sponsorSessionId?: string; witnessValues?: { attestedValue: string; valueSalt: string }; merkleProof?: { fieldValue: string; siblings: string[]; dirs: boolean[] } }
+    | { op: 'callBatch'; contractAddress: string; calls: Array<{ circuit: string; args: unknown[]; merkleProof?: { fieldValue: string; siblings: string[]; dirs: boolean[] } }>; compiledArtifactRef: string; initialPrivateState?: unknown; sponsorSessionId?: string; witnessValues?: { attestedValue: string; valueSalt: string }; merkleProof?: { fieldValue: string; siblings: string[]; dirs: boolean[] } }
     | { op: 'predicateWorkflow'; predicateAttestationId: string; payloadHash: string; contractAddress: string; compiledArtifactRef: string; predicate: string; threshold: string; opCode: number; unit?: string; value: string; salt: string; sponsorSessionId?: string }
     | { op: 'fieldPredicateWorkflow'; predicateAttestationId: string; payloadHash: string; fieldKey: string; contractAddress: string; compiledArtifactRef: string; predicate: string; threshold: string; opCode: number; unit?: string; value: string; siblings: string[]; dirs: boolean[]; contentRoot?: string; sponsorSessionId?: string }
+    | { op: 'fieldPredicateBatchWorkflow'; payloadHash: string; contractAddress: string; compiledArtifactRef: string; contentRoot?: string; claims: Array<{ predicateAttestationId: string; fieldKey: string; predicate: string; threshold: string; opCode: number; unit?: string; value: string; siblings: string[]; dirs: boolean[] }>; sponsorSessionId?: string }
     | { op: 'anchorDocument'; documentId: string; payloadHash: string; metadataHash: string; contractAddress: string; compiledArtifactRef: string; sponsorSessionId?: string }
     | { op: 'grantDisclosure'; disclosureGrantId: string; payloadHash: string; grantee: string; level: number; contractAddress: string; compiledArtifactRef: string; sponsorSessionId?: string }
     | { op: 'revokeDisclosure'; payloadHash: string; grantee: string; contractAddress: string; compiledArtifactRef: string; sponsorSessionId?: string }
@@ -147,8 +148,10 @@ export function registerSubmissionHandlers(
         if ((job.kind === 'deployContract' && command.op !== 'deploy')
             || (callKinds.has(job.kind) && command.op !== 'call')
             || (job.kind === 'submitContractCallBatch' && command.op !== 'callBatch')
+            || (job.kind === 'fieldPredicateBatchProof' && command.op !== 'callBatch')
             || (job.kind === 'issuePredicateAttestation' && command.op !== 'predicateWorkflow')
             || (job.kind === 'issueFieldPredicateAttestation' && command.op !== 'fieldPredicateWorkflow')
+            || (job.kind === 'issueFieldPredicateAttestationBatch' && command.op !== 'fieldPredicateBatchWorkflow')
             || (job.kind === 'anchorDocument' && command.op !== 'anchorDocument')
             || (job.kind === 'grantDisclosure' && command.op !== 'grantDisclosure')
             || (job.kind === 'revokeDisclosure' && command.op !== 'revokeDisclosure')
@@ -201,6 +204,46 @@ export function registerSubmissionHandlers(
             return {
                 predicateAttestationId: command.predicateAttestationId, payloadHash: command.payloadHash, fieldKey: command.fieldKey,
                 claim: { predicate: command.predicate, threshold: command.threshold, unit: command.unit ?? null },
+                proof: { system: 'midnight-compact', circuit: 'proveFieldPredicate', verificationMethod: command.contractAddress, proofValue: proof.txHash },
+                ...(command.sponsorSessionId ? { feeSponsor: command.sponsorSessionId } : {})
+            };
+        }
+
+        if (command.op === 'fieldPredicateBatchWorkflow') {
+            // ONE transaction for the whole cart: optional anchorContentRoot
+            // first (distinct entryPoint, so segment ordering pins it ahead of
+            // the proofs), then N proveFieldPredicate calls, each carrying its
+            // OWN Merkle proof (per-call witness binding via the batch holder).
+            // A false predicate fails at local proving, before submission.
+            const calls: Array<{ circuit: string; args: unknown[]; merkleProof?: { fieldValue: string; siblings: string[]; dirs: boolean[] } }> = [];
+            if (command.contentRoot) {
+                calls.push({ circuit: 'anchorContentRoot', args: [command.payloadHash, command.contentRoot] });
+            }
+            for (const claim of command.claims) {
+                calls.push({
+                    circuit: 'proveFieldPredicate',
+                    args: [command.payloadHash, claim.fieldKey, claim.threshold, String(claim.opCode)],
+                    merkleProof: { fieldValue: claim.value, siblings: claim.siblings, dirs: claim.dirs }
+                });
+            }
+            // Let it propagate: ambiguous child -> ChildReconciliationRequiredError (parent reconciles); definitive rejection -> plain error (parent fails cleanly).
+            const proof: any = await runChildCommand<any>({
+                parent: job, kind: 'fieldPredicateBatchProof', step: 'proveFieldPredicateBatch', commandVersion: 1,
+                request: { circuits: calls.map(c => c.circuit), payloadHash: command.payloadHash, claimCount: command.claims.length },
+                command: { op: 'callBatch', contractAddress: command.contractAddress, calls, compiledArtifactRef: command.compiledArtifactRef, sponsorSessionId: command.sponsorSessionId }
+            });
+            // ONE statement for all rows: the tx is already on chain here, so a
+            // partial projection (some rows proven, some not) must be impossible.
+            const provenAtBatch = new Date().toISOString();
+            await db.run(UPDATE.entity(PredicateAttestations)
+                .set({ provenTxHash: proof.txHash, provenAt: provenAtBatch, modifiedAt: provenAtBatch })
+                .where({ ID: { in: command.claims.map(c => c.predicateAttestationId) } }));
+            return {
+                payloadHash: command.payloadHash,
+                claims: command.claims.map(c => ({
+                    predicateAttestationId: c.predicateAttestationId, fieldKey: c.fieldKey,
+                    claim: { predicate: c.predicate, threshold: c.threshold, unit: c.unit ?? null }
+                })),
                 proof: { system: 'midnight-compact', circuit: 'proveFieldPredicate', verificationMethod: command.contractAddress, proofValue: proof.txHash },
                 ...(command.sponsorSessionId ? { feeSponsor: command.sponsorSessionId } : {})
             };
@@ -277,10 +320,18 @@ export function registerSubmissionHandlers(
 
         if (command.op === 'callBatch') {
             // Same per-circuit coercion as the single-call tail below, applied
-            // to each entry of the batch (raw JSON args were persisted).
+            // to each entry of the batch (raw JSON args were persisted). The
+            // field-predicate batch child coerces like its single-call kinds
+            // (fieldAnchorRoot / fieldPredicateProof): hex Bytes<32> + Uint<64>.
             const coercedCalls = command.calls.map(c => {
+                if (job.kind === 'fieldPredicateBatchProof') {
+                    const args = c.circuit === 'anchorContentRoot'
+                        ? [hexToBytes(String(c.args[0])), hexToBytes(String(c.args[1]))]
+                        : [hexToBytes(String(c.args[0])), hexToBytes(String(c.args[1])), BigInt(String(c.args[2])), BigInt(String(c.args[3]))];
+                    return { circuit: c.circuit, args, merkleProof: c.merkleProof };
+                }
                 const argTypes = argTypesLoader(resolved.zkConfigPath, c.circuit);
-                return { circuit: c.circuit, args: coerceCircuitArgs(c.args, argTypes) };
+                return { circuit: c.circuit, args: coerceCircuitArgs(c.args, argTypes), merkleProof: c.merkleProof };
             });
             const result = await submitter.callBatch({
                 contractAddress: command.contractAddress,
@@ -326,11 +377,12 @@ export function registerSubmissionHandlers(
     registerBackgroundJobProcessor('submitContractCallBatch', 1, executeContractCommand);
     registerBackgroundJobProcessor('issuePredicateAttestation', 1, executeContractCommand);
     registerBackgroundJobProcessor('issueFieldPredicateAttestation', 1, executeContractCommand);
+    registerBackgroundJobProcessor('issueFieldPredicateAttestationBatch', 1, executeContractCommand);
     registerBackgroundJobProcessor('anchorDocument', 1, executeContractCommand);
     registerBackgroundJobProcessor('grantDisclosure', 1, executeContractCommand);
     registerBackgroundJobProcessor('revokeDisclosure', 1, executeContractCommand);
     registerBackgroundJobProcessor('registerPassport', 1, executeContractCommand);
-    for (const childKind of ['predicateCommitValue', 'predicateProof', 'fieldAnchorRoot', 'fieldPredicateProof']) {
+    for (const childKind of ['predicateCommitValue', 'predicateProof', 'fieldAnchorRoot', 'fieldPredicateProof', 'fieldPredicateBatchProof']) {
         registerBackgroundJobProcessor(childKind, 1, executeContractCommand);
     }
 
@@ -402,6 +454,7 @@ export function registerSubmissionHandlers(
     registerBackgroundJobReconciliationFinalizer('revokeDisclosure', 1, finalizeContractProjection);
     registerBackgroundJobReconciliationFinalizer('registerPassport', 1, finalizeContractProjection);
     registerBackgroundJobReconciliationFinalizer('submitContractCallBatch', 1, finalizeContractProjection);
+    registerBackgroundJobReconciliationFinalizer('fieldPredicateBatchProof', 1, finalizeContractProjection);
 
     srv.on('deployContract', async (req: Request) => {
         const { compiledArtifactRef, sessionId, initialPrivateState, idempotencyKey, sponsorSessionId } = req.data as {
@@ -546,7 +599,7 @@ export function registerSubmissionHandlers(
         // scope is slow to prove, and a single rejected call discards the
         // whole scope pre-submission (post-submission the fallible phase can
         // still finalize PARTIAL_SUCCESS; see the action doc).
-        let parsedCalls: Array<{ circuit: string; args: unknown[] }>;
+        let parsedCalls: Array<{ circuit: string; args: unknown[]; merkleProof?: { fieldValue: string; siblings: string[]; dirs: boolean[] } }>;
         try {
             const v = JSON.parse(calls);
             if (!Array.isArray(v) || v.length === 0) return req.reject(400, 'calls must be a non-empty JSON array');
@@ -558,7 +611,35 @@ export function registerSubmissionHandlers(
                 if (entry.args !== undefined && !Array.isArray(entry.args)) {
                     throw new Error(`calls[${i}].args must be an array`);
                 }
-                return { circuit: entry.circuit, args: entry.args ?? [] };
+                // Optional per-call witness proof (proveFieldPredicate-style
+                // circuits). Validated here so a malformed proof is a 400,
+                // not a failed job at witness-invocation time.
+                let merkleProof: { fieldValue: string; siblings: string[]; dirs: boolean[] } | undefined;
+                if (entry.merkleProof !== undefined) {
+                    const mp = entry.merkleProof;
+                    if (!mp || typeof mp !== 'object') throw new Error(`calls[${i}].merkleProof must be an object`);
+                    let fieldValueBig: bigint;
+                    try { fieldValueBig = BigInt(mp.fieldValue); } catch { throw new Error(`calls[${i}].merkleProof.fieldValue must be an integer (decimal string)`); }
+                    if (fieldValueBig < 0n) throw new Error(`calls[${i}].merkleProof.fieldValue must be a non-negative integer`);
+                    if (!Array.isArray(mp.siblings) || mp.siblings.length !== 4) {
+                        throw new Error(`calls[${i}].merkleProof.siblings must be a JSON array of 4 hashes`);
+                    }
+                    for (const s of mp.siblings) {
+                        if (typeof s !== 'string' || !SHA256_HEX_RE.test(s)) throw new Error(`calls[${i}].merkleProof.siblings entries must be 64 hex chars (32 bytes)`);
+                    }
+                    if (!Array.isArray(mp.dirs) || mp.dirs.length !== 4) {
+                        throw new Error(`calls[${i}].merkleProof.dirs must be a JSON array of 4 booleans`);
+                    }
+                    for (const d of mp.dirs) {
+                        if (typeof d !== 'boolean') throw new Error(`calls[${i}].merkleProof.dirs entries must be booleans`);
+                    }
+                    merkleProof = {
+                        fieldValue: fieldValueBig.toString(),
+                        siblings: mp.siblings.map((s: string) => s.toLowerCase()),
+                        dirs: mp.dirs as boolean[]
+                    };
+                }
+                return { circuit: entry.circuit, args: entry.args ?? [], ...(merkleProof ? { merkleProof } : {}) };
             });
         } catch (e: any) {
             return req.reject(400, /^calls\[/.test(String(e?.message)) ? String(e.message) : 'calls must be valid JSON');
@@ -923,7 +1004,12 @@ export function registerSubmissionHandlers(
         for (const s of siblings) {
             if (typeof s !== 'string' || !SHA256_HEX_RE.test(s)) return req.reject(400, 'each sibling must be 64 hex chars (32 bytes)');
         }
-        const dirsBool = dirs.map(Boolean);
+        for (const d of dirs) {
+            // Strict booleans: map(Boolean) would turn "false" into true and
+            // silently corrupt the Merkle path.
+            if (typeof d !== 'boolean') return req.reject(400, 'dirsJson entries must be booleans');
+        }
+        const dirsBool = dirs as boolean[];
 
         if (data.contentRoot && !SHA256_HEX_RE.test(data.contentRoot)) {
             return req.reject(400, 'contentRoot must be 64 hex chars (32 bytes)');
@@ -1003,6 +1089,199 @@ export function registerSubmissionHandlers(
             if (job.deduplicated) await db.run(DELETE.from(PredicateAttestations).where({ ID: predicateAttestationId }));
             const stablePredicateId = (job.originalRequest as any)?.predicateAttestationId ?? predicateAttestationId;
             return { jobId: job.jobId, status: job.status, predicateAttestationId: stablePredicateId };
+        });
+    });
+
+    srv.on('issueFieldPredicateAttestationBatch', async (req: Request) => {
+        const data = req.data as {
+            payloadHash?: string;
+            contentRoot?: string;
+            claimsJson?: string;
+            sessionId?: string;
+            contractAddress?: string;
+            compiledArtifactRef?: string;
+            idempotencyKey?: string;
+            sponsorSessionId?: string;
+        };
+
+        if (!data.payloadHash) return req.reject(400, 'payloadHash is required');
+        if (!SHA256_HEX_RE.test(data.payloadHash)) return req.reject(400, 'payloadHash must be 64 hex chars (32 bytes)');
+        if (data.contentRoot && !SHA256_HEX_RE.test(data.contentRoot)) {
+            return req.reject(400, 'contentRoot must be 64 hex chars (32 bytes)');
+        }
+        if (!data.sessionId) return req.reject(400, 'sessionId is required');
+        if (!data.contractAddress) return req.reject(400, 'contractAddress is required');
+        if (!data.claimsJson) return req.reject(400, 'claimsJson is required');
+
+        // 8 calls per transaction is the batch cap; an in-batch anchor
+        // occupies one slot.
+        const maxClaims = data.contentRoot ? 7 : 8;
+        interface BatchClaim {
+            fieldKey: string; value: string; siblings: string[]; dirs: boolean[];
+            predicate: string; threshold: string; opCode: number; unit?: string;
+        }
+        let claims: BatchClaim[];
+        try {
+            const v = JSON.parse(data.claimsJson);
+            if (!Array.isArray(v) || v.length === 0) return req.reject(400, 'claimsJson must be a non-empty JSON array');
+            if (v.length > maxClaims) {
+                return req.reject(400, `claimsJson supports at most ${maxClaims} entries per batch` + (data.contentRoot ? ' (the contentRoot anchor occupies one of the 8 call slots)' : ''));
+            }
+            claims = v.map((entry: any, i: number): BatchClaim => {
+                if (!entry || typeof entry !== 'object') throw new Error(`claims[${i}] must be an object`);
+                if (typeof entry.fieldKey !== 'string' || !SHA256_HEX_RE.test(entry.fieldKey)) {
+                    throw new Error(`claims[${i}].fieldKey must be 64 hex chars (32 bytes)`);
+                }
+                if (entry.value === undefined || entry.value === null || entry.value === '') {
+                    throw new Error(`claims[${i}].value is required`);
+                }
+                let valueBig: bigint;
+                try { valueBig = BigInt(entry.value); } catch { throw new Error(`claims[${i}].value must be an integer (decimal string)`); }
+                if (valueBig < 0n) throw new Error(`claims[${i}].value must be a non-negative integer`);
+                if (entry.threshold === undefined || entry.threshold === null) throw new Error(`claims[${i}].threshold is required`);
+                let thresholdBig: bigint;
+                try { thresholdBig = BigInt(entry.threshold); } catch { throw new Error(`claims[${i}].threshold must be an integer`); }
+                if (thresholdBig < 0n) throw new Error(`claims[${i}].threshold must be a non-negative integer`);
+                let opCode: number;
+                if (entry.predicate === 'lessOrEqual') opCode = 0;
+                else if (entry.predicate === 'greaterOrEqual') opCode = 1;
+                else throw new Error(`claims[${i}].predicate must be 'lessOrEqual' or 'greaterOrEqual'`);
+                if (!Array.isArray(entry.siblings) || entry.siblings.length !== 4) {
+                    throw new Error(`claims[${i}].siblings must be a JSON array of 4 hashes`);
+                }
+                for (const s of entry.siblings) {
+                    if (typeof s !== 'string' || !SHA256_HEX_RE.test(s)) throw new Error(`claims[${i}].siblings entries must be 64 hex chars (32 bytes)`);
+                }
+                if (!Array.isArray(entry.dirs) || entry.dirs.length !== 4) {
+                    throw new Error(`claims[${i}].dirs must be a JSON array of 4 booleans`);
+                }
+                for (const d of entry.dirs) {
+                    // Strict booleans: map(Boolean) would turn "false" into
+                    // true and silently corrupt the Merkle path.
+                    if (typeof d !== 'boolean') throw new Error(`claims[${i}].dirs entries must be booleans`);
+                }
+                return {
+                    fieldKey: entry.fieldKey.toLowerCase(),
+                    value: valueBig.toString(),
+                    siblings: entry.siblings.map((s: string) => s.toLowerCase()),
+                    dirs: entry.dirs as boolean[],
+                    predicate: entry.predicate,
+                    threshold: thresholdBig.toString(),
+                    opCode,
+                    unit: typeof entry.unit === 'string' && entry.unit.length > 0 ? entry.unit : undefined
+                };
+            });
+        } catch (e: any) {
+            return req.reject(400, /^claims\[/.test(String(e?.message)) ? String(e.message) : 'claimsJson must be valid JSON');
+        }
+
+        // Drop exact duplicate claim tuples: claim keys are idempotent on-chain
+        // (insert overwrites true with true), so duplicates only waste proving
+        // time. First occurrence wins; the response reports the drop count.
+        const seenTuples = new Set<string>();
+        const uniqueClaims: BatchClaim[] = [];
+        for (const c of claims) {
+            const tuple = `${c.fieldKey}|${c.threshold}|${c.opCode}`;
+            if (seenTuples.has(tuple)) continue;
+            seenTuples.add(tuple);
+            uniqueClaims.push(c);
+        }
+        const droppedDuplicates = claims.length - uniqueClaims.length;
+
+        const compiledRef = data.compiledArtifactRef && data.compiledArtifactRef.length > 0
+            ? data.compiledArtifactRef
+            : DEFAULT_ATTESTATION_VAULT_REF;
+
+        if (rejectIfMainnetBlocked(req)) return;
+        // The batch counts as N claims against the limiter, not one action
+        // call, so batching is not a rate-limit bypass. All-or-nothing: a
+        // rejected batch consumes no budget.
+        if (!checkRate(predicateRateLimiter, data.sessionId, req, uniqueClaims.length)) return;
+
+        // One row per claim up-front, same shape as the single action; on
+        // success every row gets the SAME provenTxHash.
+        const insertedAt = new Date().toISOString();
+        const rowedClaims = uniqueClaims.map(c => ({ ...c, predicateAttestationId: cds.utils.uuid() }));
+        await db.run(INSERT.into(PredicateAttestations).entries(rowedClaims.map(c => ({
+            ID: c.predicateAttestationId,
+            payloadHash: data.payloadHash!.toLowerCase(),
+            contractAddress: data.contractAddress,
+            predicate: c.predicate,
+            op: c.opCode,
+            threshold: c.threshold as any,
+            unit: c.unit ?? null,
+            fieldKey: c.fieldKey,
+            valueCommitment: null,
+            provenTxHash: null,
+            provenAt: null,
+            createdAt: insertedAt,
+            modifiedAt: insertedAt
+        }))));
+
+        return runSubmission(req, async () => {
+            const facadeCfg = facadeConfigFromEnv();
+            await ensureNetworkId(facadeCfg.networkId);
+            await contractResolver(compiledRef);
+            await walletFactory({ sessionId: data.sessionId!, db, facadeConfig: facadeCfg, expectedUserId: (req as any).user?.id });
+            const sponsor = await resolveSponsorForRequest(req, data.sponsorSessionId);
+
+            const publicClaims = rowedClaims.map(c => ({
+                predicateAttestationId: c.predicateAttestationId, fieldKey: c.fieldKey,
+                predicate: c.predicate, threshold: c.threshold, unit: c.unit ?? null
+            }));
+            const job = await startJob({
+                kind: 'issueFieldPredicateAttestationBatch',
+                sessionId: data.sessionId!,
+                idempotencyKey: data.idempotencyKey,
+                request: {
+                    payloadHash: data.payloadHash!.toLowerCase(),
+                    contractAddress: data.contractAddress,
+                    claimCount: rowedClaims.length,
+                    claims: publicClaims,
+                    feeSponsor: sponsor?.sponsorSessionId ?? null
+                },
+                idempotencyPayload: {
+                    payloadHash: data.payloadHash!.toLowerCase(),
+                    contractAddress: data.contractAddress,
+                    contentRoot: data.contentRoot?.toLowerCase() ?? null,
+                    claims: uniqueClaims.map(c => ({
+                        fieldKey: c.fieldKey, predicate: c.predicate, threshold: c.threshold,
+                        value: c.value, siblings: c.siblings, dirs: c.dirs
+                    })),
+                    feeSponsor: sponsor?.sponsorSessionId ?? null
+                },
+                requestedBy: (req as any).user?.id,
+                commandVersion: 1,
+                encryptCommand: true,
+                command: {
+                    op: 'fieldPredicateBatchWorkflow',
+                    payloadHash: data.payloadHash!.toLowerCase(),
+                    contractAddress: data.contractAddress!,
+                    compiledArtifactRef: compiledRef,
+                    contentRoot: data.contentRoot?.toLowerCase(),
+                    claims: rowedClaims.map(c => ({
+                        predicateAttestationId: c.predicateAttestationId,
+                        fieldKey: c.fieldKey, predicate: c.predicate, threshold: c.threshold,
+                        opCode: c.opCode, unit: c.unit, value: c.value,
+                        siblings: c.siblings, dirs: c.dirs
+                    })),
+                    sponsorSessionId: sponsor?.sponsorSessionId
+                }
+            });
+
+            // Idempotent retry: the rows created for THIS request are orphans;
+            // the original request's rows (and IDs) are authoritative.
+            if (job.deduplicated) {
+                await db.run(DELETE.from(PredicateAttestations).where({ ID: { in: rowedClaims.map(c => c.predicateAttestationId) } }));
+            }
+            const stableClaims = job.deduplicated
+                ? ((job.originalRequest as any)?.claims ?? publicClaims)
+                : publicClaims;
+            return {
+                jobId: job.jobId, status: job.status,
+                claims: JSON.stringify(stableClaims),
+                droppedDuplicates
+            };
         });
     });
 
@@ -1689,8 +1968,9 @@ function rejectIfMainnetBlocked(req: Request): boolean {
     return false;
 }
 
-function checkRate(limiter: RateLimiter, sessionId: string, req: Request): boolean {
-    const r = limiter.check(sessionId);
+function checkRate(limiter: RateLimiter, sessionId: string, req: Request, count = 1): boolean {
+    // checkMany is all-or-nothing: a rejected batch consumes NO budget.
+    const r = limiter.checkMany(sessionId, count);
     if (!r.allowed) {
         req.reject?.(429, `Rate limited. Retry after ${Math.ceil(r.retryAfterMs / 1000)}s`);
         return false;

@@ -103,6 +103,51 @@ describe('runBatchInScope', () => {
         expect(out).toEqual({ txHash: '', onChainStatus: '', circuits: ['attest'] });
     });
 
+    test('invokes a call entry\'s before() hook immediately before ITS callTx, in call order', async () => {
+        const { found, contracts } = makeFakes();
+        const sequence: string[] = [];
+        (found.callTx.attest as any).mockImplementation(async () => { sequence.push('call:attest'); });
+        (found.callTx.bindPassport as any).mockImplementation(async () => { sequence.push('call:bindPassport'); });
+        (found.callTx.anchorContentRoot as any).mockImplementation(async () => { sequence.push('call:anchorContentRoot'); });
+
+        await runBatchInScope(contracts, PROVIDERS, found, [
+            { circuit: 'attest', args: [], before: () => sequence.push('before:attest') },
+            { circuit: 'bindPassport', args: [] }, // no hook: untouched
+            { circuit: 'anchorContentRoot', args: [], before: () => sequence.push('before:anchorContentRoot') }
+        ], ADDR);
+
+        expect(sequence).toEqual([
+            'before:attest', 'call:attest',
+            'call:bindPassport',
+            'before:anchorContentRoot', 'call:anchorContentRoot'
+        ]);
+    });
+
+    test('before() hooks drive a mutable witness holder deterministically (batch proof rebinding)', async () => {
+        const { found, contracts } = makeFakes();
+        const holder: { current?: string } = {};
+        const seenAtCallTime: Array<string | undefined> = [];
+        (found.callTx.attest as any).mockImplementation(async () => { seenAtCallTime.push(holder.current); });
+
+        await runBatchInScope(contracts, PROVIDERS, found, [
+            { circuit: 'attest', args: [], before: () => { holder.current = 'proof-A'; } },
+            { circuit: 'attest', args: [], before: () => { holder.current = 'proof-B'; } },
+            { circuit: 'attest', args: [], before: () => { holder.current = undefined; } }
+        ], ADDR);
+
+        expect(seenAtCallTime).toEqual(['proof-A', 'proof-B', undefined]);
+    });
+
+    test('a throwing before() hook aborts inside the scope before its callTx runs', async () => {
+        const { found, contracts } = makeFakes();
+        await expect(runBatchInScope(contracts, PROVIDERS, found, [
+            { circuit: 'attest', args: [] },
+            { circuit: 'bindPassport', args: [], before: () => { throw new Error('bad proof holder'); } }
+        ], ADDR)).rejects.toThrow(/bad proof holder/);
+        expect(found.callTx.attest).toHaveBeenCalledTimes(1);
+        expect(found.callTx.bindPassport).not.toHaveBeenCalled();
+    });
+
     test('wraps the proof provider so batch segments prove in call order', async () => {
         const attest = { actions: [{ entryPoint: 'attest' }] };
         const bind = { actions: [{ entryPoint: 'bindPassport' }] };

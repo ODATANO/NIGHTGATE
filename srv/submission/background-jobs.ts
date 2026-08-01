@@ -65,17 +65,20 @@ const HEAVY_KINDS: ReadonlySet<string> = new Set([
     'anchorDocument',
     'issuePredicateAttestation',
     'issueFieldPredicateAttestation',
+    'issueFieldPredicateAttestationBatch',
     'predicateCommitValue',
     'predicateProof',
     'fieldAnchorRoot',
     'fieldPredicateProof',
+    'fieldPredicateBatchProof',
     'grantDisclosure',
     'revokeDisclosure',
     'registerPassport'
 ]);
 const WORKFLOW_PARENT_KINDS: ReadonlySet<string> = new Set([
     'issuePredicateAttestation',
-    'issueFieldPredicateAttestation'
+    'issueFieldPredicateAttestation',
+    'issueFieldPredicateAttestationBatch'
 ]);
 
 class Semaphore {

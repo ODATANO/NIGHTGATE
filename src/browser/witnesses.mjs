@@ -78,25 +78,49 @@ export function deriveAttestationSecretFromSignature(signatureHex) {
  * `merkleProof` (for proveFieldPredicate): { fieldValue, siblings: string[4] hex,
  * dirs: boolean[4] }. Unused witnesses simply are never invoked for other
  * circuits, so a proof-less call (attest/grant/commitValue/…) is unaffected.
+ *
+ * `merkleProofHolder` (batch mode, mutually exclusive with `merkleProof`):
+ * { current?: { fieldValue, siblings, dirs } }. Resolved at witness
+ * INVOCATION time; the batch loop swaps `holder.current` immediately before
+ * each call, so one witness object serves N proveFieldPredicate calls inside
+ * one transaction scope. Mirrors the server's `WitnessFactoryInput`.
  */
 const MERKLE_DEPTH = 4;
 
-export function buildAttestationVaultWitnesses({ attestationSecret, witnessValues, merkleProof } = {}) {
+function decodeMerkleProof(proof) {
+    const fieldValue = BigInt(proof.fieldValue);
+    const siblings = (proof.siblings || []).map(hexToBytes32);
+    const dirs = (proof.dirs || []).map(Boolean);
+    if (siblings.length !== MERKLE_DEPTH || dirs.length !== MERKLE_DEPTH) {
+        throw new Error(`merkleProof.siblings and .dirs must each have ${MERKLE_DEPTH} entries`);
+    }
+    return { fieldValue, siblings, dirs };
+}
+
+export function buildAttestationVaultWitnesses({ attestationSecret, witnessValues, merkleProof, merkleProofHolder } = {}) {
     if (!(attestationSecret instanceof Uint8Array) || attestationSecret.length !== 32) {
         throw new Error('attestationSecret must be a 32-byte Uint8Array');
     }
     const value = witnessValues ? BigInt(witnessValues.attestedValue) : undefined;
     const salt = witnessValues ? hexToBytes32(witnessValues.valueSalt) : undefined;
 
-    let fieldValue, siblings, dirs;
-    if (merkleProof) {
-        fieldValue = BigInt(merkleProof.fieldValue);
-        siblings = (merkleProof.siblings || []).map(hexToBytes32);
-        dirs = (merkleProof.dirs || []).map(Boolean);
-        if (siblings.length !== MERKLE_DEPTH || dirs.length !== MERKLE_DEPTH) {
-            throw new Error(`merkleProof.siblings and .dirs must each have ${MERKLE_DEPTH} entries`);
-        }
+    if (merkleProof && merkleProofHolder) {
+        throw new Error('merkleProof and merkleProofHolder are mutually exclusive');
     }
+    const staticProof = merkleProof ? decodeMerkleProof(merkleProof) : undefined;
+    const holder = merkleProofHolder;
+    const currentProof = (witnessName) => {
+        if (holder) {
+            if (!holder.current) {
+                throw new Error(`${witnessName} witness invoked with an empty batch proof holder; set holder.current before the call`);
+            }
+            return decodeMerkleProof(holder.current);
+        }
+        if (staticProof === undefined) {
+            throw new Error(`${witnessName} witness invoked without a merkleProof; proveFieldPredicate requires merkleProof`);
+        }
+        return staticProof;
+    };
 
     return {
         local_secret_key(ctx) {
@@ -115,22 +139,13 @@ export function buildAttestationVaultWitnesses({ attestationSecret, witnessValue
             return [ctx.privateState, salt];
         },
         field_value(ctx) {
-            if (fieldValue === undefined) {
-                throw new Error('field_value witness invoked without a merkleProof; proveFieldPredicate requires merkleProof');
-            }
-            return [ctx.privateState, fieldValue];
+            return [ctx.privateState, currentProof('field_value').fieldValue];
         },
         merkle_siblings(ctx) {
-            if (siblings === undefined) {
-                throw new Error('merkle_siblings witness invoked without a merkleProof; proveFieldPredicate requires merkleProof');
-            }
-            return [ctx.privateState, siblings];
+            return [ctx.privateState, currentProof('merkle_siblings').siblings];
         },
         merkle_dirs(ctx) {
-            if (dirs === undefined) {
-                throw new Error('merkle_dirs witness invoked without a merkleProof; proveFieldPredicate requires merkleProof');
-            }
-            return [ctx.privateState, dirs];
+            return [ctx.privateState, currentProof('merkle_dirs').dirs];
         }
     };
 }

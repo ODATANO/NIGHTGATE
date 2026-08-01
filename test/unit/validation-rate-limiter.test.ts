@@ -67,6 +67,63 @@ describe('RateLimiter', () => {
     });
 });
 
+describe('RateLimiter.checkMany (all-or-nothing batch consume)', () => {
+    let nowSpy: MockInstance<() => number>;
+
+    beforeEach(() => {
+        nowSpy = vi.spyOn(Date, 'now');
+    });
+
+    afterEach(() => {
+        nowSpy.mockRestore();
+    });
+
+    it('consumes N slots atomically when they fit', () => {
+        const limiter = new RateLimiter({ windowMs: 1000, maxRequests: 10 });
+        nowSpy.mockReturnValue(1000);
+        expect(limiter.checkMany('k', 8)).toEqual({ allowed: true, retryAfterMs: 0 });
+        expect((limiter as any).hits.get('k')).toHaveLength(8);
+    });
+
+    it('rejects WITHOUT consuming when N does not fit (follow-up within budget still passes)', () => {
+        const limiter = new RateLimiter({ windowMs: 1000, maxRequests: 10 });
+        nowSpy.mockReturnValue(1000);
+        expect(limiter.checkMany('k', 8).allowed).toBe(true);
+
+        // 3 > 2 remaining: rejected, and the 8 recorded hits stay 8.
+        const rejected = limiter.checkMany('k', 3);
+        expect(rejected.allowed).toBe(false);
+        expect(rejected.retryAfterMs).toBe(1000);
+        expect((limiter as any).hits.get('k')).toHaveLength(8);
+
+        // The 2 remaining slots were NOT eaten by the rejected batch.
+        expect(limiter.checkMany('k', 2).allowed).toBe(true);
+        expect((limiter as any).hits.get('k')).toHaveLength(10);
+    });
+
+    it('a count larger than the whole budget reports a full window, never 0', () => {
+        const limiter = new RateLimiter({ windowMs: 1000, maxRequests: 5 });
+        nowSpy.mockReturnValue(1000);
+        const r = limiter.checkMany('fresh', 6);
+        expect(r.allowed).toBe(false);
+        expect(r.retryAfterMs).toBe(1000);
+    });
+
+    it('count <= 0 is a no-op success', () => {
+        const limiter = new RateLimiter({ windowMs: 1000, maxRequests: 1 });
+        expect(limiter.checkMany('k', 0)).toEqual({ allowed: true, retryAfterMs: 0 });
+        expect((limiter as any).hits.get('k')).toBeUndefined();
+    });
+
+    it('check() delegates to checkMany(key, 1) with identical single-slot semantics', () => {
+        const limiter = new RateLimiter({ windowMs: 1000, maxRequests: 1 });
+        nowSpy.mockReturnValue(1000);
+        expect(limiter.check('k')).toEqual({ allowed: true, retryAfterMs: 0 });
+        nowSpy.mockReturnValue(1500);
+        expect(limiter.check('k')).toEqual({ allowed: false, retryAfterMs: 500 });
+    });
+});
+
 describe('RateLimiter capacity + sweep + destroy', () => {
     it('rejects NEW keys once the key map is at capacity (memory DoS guard)', () => {
         const limiter = new RateLimiter({ windowMs: 60_000, maxRequests: 5, maxKeys: 2 });

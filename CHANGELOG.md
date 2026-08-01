@@ -1,5 +1,42 @@
 # Changelog
 
+## 0.12.0 - 2026-08-01
+
+### Feature: `issueFieldPredicateAttestationBatch` proves N field predicates in ONE transaction
+
+FR: `docs/feature-requests/batched-field-predicate-attestations.md` (the
+server lane of NIGHTPASS's ZK proof cart). New action: up to 8
+`proveFieldPredicate` claims on one passport in a single transaction; an
+optional `contentRoot` is anchored as the FIRST call of the SAME batch
+(0.10.0 segment ordering pins it ahead of the proofs) and occupies one call
+slot. One balancing/submit/confirmation round and one fee event for the
+whole cart; with `sponsorSessionId` one dust spend total. Proving stays
+additive (N proofs = N provings).
+
+Mechanics: witness factories accept a `merkleProofHolder` resolved at
+invocation time (server `contract-witnesses.ts` + browser `witnesses.mjs`
+in lockstep); `BatchCall` entries take an optional `before()` hook that
+`runBatchInScope` invokes right before each `callTx`, so the worker swaps
+the holder's current proof per call inside one scope. The generic
+`submitContractCallBatch` surface gained per-call `merkleProof` entries on
+the wire (worker, client, submitter); hook-less batches are byte-identical
+to before. Exact duplicate claim tuples are dropped server-side
+(`droppedDuplicates`; claim keys are idempotent on-chain), the predicate
+rate limiter counts N claims per batch, command payloads stay encrypted.
+Failure semantics: a false predicate fails at LOCAL proving (nothing
+submitted, no row proven); post-submission PARTIAL_SUCCESS fails the job
+with `OnChainStatus:...` and callers verify per claim via
+`verifyPredicateAttestation`.
+
+Review hardening (pre-release): `dirs` entries are validated as strict
+booleans on both predicate actions (`map(Boolean)` would have turned
+`"false"` into `true` and corrupted the Merkle path); the post-success
+projection marks ALL claim rows proven in ONE `UPDATE ... where ID in`
+(no partial proven-marking after an on-chain success); the generic
+`submitContractCallBatch` action now validates and forwards per-call
+`merkleProof` entries instead of dropping them; `RateLimiter.checkMany`
+consumes N slots all-or-nothing (a 429'd batch eats no budget).
+
 ## 0.11.1 - 2026-07-29
 
 ### Perf: wallet-save pipeline CPU + findDeployedContract query cache

@@ -177,6 +177,59 @@ describe('buildAttestationVaultWitnesses: field-bound proof witnesses (proveFiel
     });
 });
 
+describe('buildAttestationVaultWitnesses: batch proof holder (per-call rebinding)', () => {
+    const secret = new Uint8Array(32).fill(0xab);
+    const SIB_A = ['1', '2', '3', '4'].map((n) => n.repeat(64));
+    const SIB_B = ['5', '6', '7', '8'].map((n) => n.repeat(64));
+    const proofA = { fieldValue: '100', siblings: SIB_A, dirs: [true, false, false, false] };
+    const proofB = { fieldValue: '200', siblings: SIB_B, dirs: [false, true, true, true] };
+
+    test('resolves the CURRENT proof at invocation time; swapping rebinds all three witnesses', () => {
+        const holder: { current?: typeof proofA } = { current: proofA };
+        const w = buildAttestationVaultWitnesses({ attestationSecret: secret, merkleProofHolder: holder });
+
+        expect(w.field_value({ privateState: null })[1]).toBe(100n);
+        expect(Buffer.from(w.merkle_siblings({ privateState: null })[1][0]).toString('hex')).toBe('1'.repeat(64));
+        expect(w.merkle_dirs({ privateState: null })[1]).toEqual([true, false, false, false]);
+
+        holder.current = proofB;
+        expect(w.field_value({ privateState: null })[1]).toBe(200n);
+        expect(Buffer.from(w.merkle_siblings({ privateState: null })[1][0]).toString('hex')).toBe('5'.repeat(64));
+        expect(w.merkle_dirs({ privateState: null })[1]).toEqual([false, true, true, true]);
+    });
+
+    test('empty holder throws (a call without its own proof must not inherit one)', () => {
+        const holder: { current?: typeof proofA } = {};
+        const w = buildAttestationVaultWitnesses({ attestationSecret: secret, merkleProofHolder: holder });
+        expect(() => w.field_value({ privateState: null })).toThrow(/empty batch proof holder/);
+        holder.current = proofA;
+        expect(w.field_value({ privateState: null })[1]).toBe(100n);
+        holder.current = undefined;
+        expect(() => w.merkle_siblings({ privateState: null })).toThrow(/empty batch proof holder/);
+    });
+
+    test('malformed current proof fails the invoking call, not the build', () => {
+        const holder: { current?: any } = { current: { fieldValue: '1', siblings: SIB_A.slice(0, 3), dirs: [true, false, true, false] } };
+        const w = buildAttestationVaultWitnesses({ attestationSecret: secret, merkleProofHolder: holder });
+        expect(() => w.field_value({ privateState: null })).toThrow(/must each have 4 entries/);
+    });
+
+    test('merkleProof and merkleProofHolder together are rejected at build time', () => {
+        expect(() => buildAttestationVaultWitnesses({
+            attestationSecret: secret,
+            merkleProof: proofA,
+            merkleProofHolder: { current: proofB }
+        })).toThrow(/mutually exclusive/);
+    });
+
+    test('static merkleProof path is unchanged by the holder feature', () => {
+        const w = buildAttestationVaultWitnesses({ attestationSecret: secret, merkleProof: proofA });
+        expect(w.field_value({ privateState: null })[1]).toBe(100n);
+        expect(() => buildAttestationVaultWitnesses({ attestationSecret: secret }).field_value({ privateState: null }))
+            .toThrow(/without a merkleProof/);
+    });
+});
+
 describe('getContractWitnessFactory', () => {
     test('returns the factory for attestation-vault', () => {
         const factory = getContractWitnessFactory('attestation-vault');

@@ -253,7 +253,8 @@ async function getOrCompileContract(
     registration: ContractRegistration,
     entry: FacadeEntry,
     witnessValues?: { attestedValue: string; valueSalt: string },
-    merkleProof?: { fieldValue: string; siblings: string[]; dirs: boolean[] }
+    merkleProof?: { fieldValue: string; siblings: string[]; dirs: boolean[] },
+    merkleProofHolder?: { current?: { fieldValue: string; siblings: string[]; dirs: boolean[] } }
 ): Promise<any> {
     const { contractClass } = await getContractScaffold(name, registration);
 
@@ -267,7 +268,7 @@ async function getOrCompileContract(
 
     const witnessFactory = getContractWitnessFactory(name);
     const witnessStep = witnessFactory
-        ? CompiledContract.withWitnesses(witnessFactory({ attestationSecret: entry.attestationSecret, witnessValues, merkleProof }))
+        ? CompiledContract.withWitnesses(witnessFactory({ attestationSecret: entry.attestationSecret, witnessValues, merkleProof, merkleProofHolder }))
         : CompiledContract.withVacantWitnesses;
 
     return CompiledContract.make(name, contractClass).pipe(
@@ -1896,8 +1897,13 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
         contractName: string;
         registration: ContractRegistration;
         contractAddress: string;
-        /** Ordered circuit calls; all execute inside one transaction scope. */
-        calls: Array<{ circuit: string; args: unknown[] }>;
+        /** Ordered circuit calls; all execute inside one transaction scope.
+         *  A call may carry its OWN `merkleProof` (per-call witness binding
+         *  for proveFieldPredicate); any per-call proof switches the whole
+         *  batch to holder mode, where the loop swaps the current proof
+         *  before each call. Mutually exclusive with the batch-level
+         *  `merkleProof` below. */
+        calls: Array<{ circuit: string; args: unknown[]; merkleProof?: { fieldValue: string; siblings: string[]; dirs: boolean[] } }>;
         indexerHttpUrl: string;
         indexerWsUrl: string;
         proofServerUrl: string;
@@ -1924,7 +1930,24 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
             await ensureNetworkId(networkId, sdk);
             timer.mark('init');
 
-            const compiledContract = await getOrCompileContract(contractName, registration, entry, witnessValues, merkleProof);
+            // Per-call witness binding: any call-level merkleProof switches the
+            // batch to holder mode. EVERY call then gets a hook, so a call
+            // without its own proof clears the holder rather than inheriting
+            // its predecessor's.
+            const holderMode = calls.some(c => c.merkleProof);
+            if (holderMode && merkleProof) {
+                throw new Error('submitContractCallBatch: per-call merkleProof and batch-level merkleProof are mutually exclusive');
+            }
+            const holder: { current?: { fieldValue: string; siblings: string[]; dirs: boolean[] } } = {};
+            const scopeCalls = holderMode
+                ? calls.map(c => ({ circuit: c.circuit, args: c.args, before: () => { holder.current = c.merkleProof; } }))
+                : calls;
+
+            const compiledContract = await getOrCompileContract(
+                contractName, registration, entry, witnessValues,
+                holderMode ? undefined : merkleProof,
+                holderMode ? holder : undefined
+            );
             timer.mark('compile');
             const contractProviders = await buildWorkerContractProviders({
                 indexerHttpUrl, indexerWsUrl, proofServerUrl,
@@ -1972,7 +1995,7 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
             // result mapping) live in batch-call-scope.ts so they are unit-testable
             // outside the worker-thread guard.
             callRegion.start = Date.now();
-            const out = await runBatchInScope(contracts, providers, found, calls, contractAddress);
+            const out = await runBatchInScope(contracts, providers, found, scopeCalls, contractAddress);
             timer.add('callTotal', Date.now() - callRegion.start);
             log('info', `submitContractCallBatch: done txHash=${out.txHash.slice(0, 16)} status=${out.onChainStatus} calls=${out.circuits.length}`);
             return out;

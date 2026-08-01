@@ -43,9 +43,36 @@ export interface WitnessFactoryInput {
         siblings:   string[];
         dirs:       boolean[];
     };
+    /**
+     * Batch mode: a mutable holder whose `current` proof the batch loop swaps
+     * immediately before each call (wallet-worker builds `before` hooks for
+     * batch-call-scope.ts). Resolved at witness INVOCATION time, so ONE
+     * compiled contract instance serves N `proveFieldPredicate` calls with N
+     * different inclusion proofs inside one transaction scope. Mutually
+     * exclusive with `merkleProof`. Same primitive serialization rules.
+     */
+    merkleProofHolder?: {
+        current?: { fieldValue: string; siblings: string[]; dirs: boolean[] };
+    };
 }
 
 const MERKLE_DEPTH = 4;
+
+interface DecodedMerkleProof {
+    fieldValue: bigint;
+    siblings:   Uint8Array[];
+    dirs:       boolean[];
+}
+
+function decodeMerkleProof(proof: { fieldValue: string; siblings: string[]; dirs: boolean[] }): DecodedMerkleProof {
+    const fieldValue = BigInt(proof.fieldValue);
+    const siblings = (proof.siblings || []).map(hexToBytes32);
+    const dirs = (proof.dirs || []).map(Boolean);
+    if (siblings.length !== MERKLE_DEPTH || dirs.length !== MERKLE_DEPTH) {
+        throw new Error(`merkleProof.siblings and .dirs must each have ${MERKLE_DEPTH} entries`);
+    }
+    return { fieldValue, siblings, dirs };
+}
 
 function hexToBytes32(hex: string): Uint8Array {
     const clean = hex.startsWith('0x') ? hex.slice(2) : hex;
@@ -84,17 +111,26 @@ export function buildAttestationVaultWitnesses(input: WitnessFactoryInput): any 
     const salt  = input.witnessValues ? hexToBytes32(input.witnessValues.valueSalt) : undefined;
     // Per-call Merkle proof for proveFieldPredicate (only that circuit invokes
     // field_value/merkle_siblings/merkle_dirs; others leave them unused).
-    let fieldValue: bigint | undefined;
-    let siblings: Uint8Array[] | undefined;
-    let dirs: boolean[] | undefined;
-    if (input.merkleProof) {
-        fieldValue = BigInt(input.merkleProof.fieldValue);
-        siblings = (input.merkleProof.siblings || []).map(hexToBytes32);
-        dirs = (input.merkleProof.dirs || []).map(Boolean);
-        if (siblings.length !== MERKLE_DEPTH || dirs.length !== MERKLE_DEPTH) {
-            throw new Error(`merkleProof.siblings and .dirs must each have ${MERKLE_DEPTH} entries`);
-        }
+    // Static mode decodes up-front (fail fast); holder mode re-resolves at
+    // every witness invocation so the batch loop can swap `holder.current`
+    // between calls of one transaction scope.
+    if (input.merkleProof && input.merkleProofHolder) {
+        throw new Error('merkleProof and merkleProofHolder are mutually exclusive');
     }
+    const staticProof = input.merkleProof ? decodeMerkleProof(input.merkleProof) : undefined;
+    const holder = input.merkleProofHolder;
+    const currentProof = (witnessName: string): DecodedMerkleProof => {
+        if (holder) {
+            if (!holder.current) {
+                throw new Error(`${witnessName} witness invoked with an empty batch proof holder; set holder.current before the call`);
+            }
+            return decodeMerkleProof(holder.current);
+        }
+        if (staticProof === undefined) {
+            throw new Error(`${witnessName} witness invoked without a merkleProof; proveFieldPredicate requires merkleProof`);
+        }
+        return staticProof;
+    };
     return {
         local_secret_key(ctx: { privateState: unknown }): [unknown, Uint8Array] {
             return [ctx.privateState, secret];
@@ -112,22 +148,13 @@ export function buildAttestationVaultWitnesses(input: WitnessFactoryInput): any 
             return [ctx.privateState, salt];
         },
         field_value(ctx: { privateState: unknown }): [unknown, bigint] {
-            if (fieldValue === undefined) {
-                throw new Error('field_value witness invoked without a merkleProof; proveFieldPredicate requires merkleProof');
-            }
-            return [ctx.privateState, fieldValue];
+            return [ctx.privateState, currentProof('field_value').fieldValue];
         },
         merkle_siblings(ctx: { privateState: unknown }): [unknown, Uint8Array[]] {
-            if (siblings === undefined) {
-                throw new Error('merkle_siblings witness invoked without a merkleProof; proveFieldPredicate requires merkleProof');
-            }
-            return [ctx.privateState, siblings];
+            return [ctx.privateState, currentProof('merkle_siblings').siblings];
         },
         merkle_dirs(ctx: { privateState: unknown }): [unknown, boolean[]] {
-            if (dirs === undefined) {
-                throw new Error('merkle_dirs witness invoked without a merkleProof; proveFieldPredicate requires merkleProof');
-            }
-            return [ctx.privateState, dirs];
+            return [ctx.privateState, currentProof('merkle_dirs').dirs];
         }
     };
 }

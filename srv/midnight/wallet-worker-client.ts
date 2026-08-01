@@ -548,8 +548,11 @@ export function walletSubmitContractCall(args: WalletSubmitContractCallArgs): Pr
 }
 
 export interface WalletSubmitContractCallBatchArgs extends Omit<WalletSubmitContractCallArgs, 'circuit' | 'args'> {
-    /** Ordered circuit calls, all executed inside ONE transaction scope. */
-    calls: Array<{ circuit: string; args: unknown[] }>;
+    /** Ordered circuit calls, all executed inside ONE transaction scope. A
+     *  call may carry its own `merkleProof` (per-call witness binding for
+     *  proveFieldPredicate); mutually exclusive with the batch-level
+     *  `merkleProof` inherited from WalletSubmitContractCallArgs. */
+    calls: Array<{ circuit: string; args: unknown[]; merkleProof?: { fieldValue: string; siblings: string[]; dirs: boolean[] } }>;
 }
 
 /**

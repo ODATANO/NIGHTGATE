@@ -321,6 +321,56 @@ service NightgateService {
     };
 
     /**
+     * Batch pendant to `issueFieldPredicateAttestation`: prove N field-bound
+     * predicates on ONE passport in ONE transaction. If `contentRoot` is
+     * supplied it is anchored as the FIRST call of the SAME batch (the 0.10.0
+     * segment ordering pins the anchor ahead of the proofs, so the in-circuit
+     * root-exists assert holds); it then occupies one of the 8 call slots
+     * (max 7 claims with anchor, 8 without).
+     *
+     * `claimsJson` is a JSON array of
+     * `{ fieldKey, value, siblings, dirs, predicate, threshold, unit? }`,
+     * each entry validated exactly like the single action (64-hex keys,
+     * DEPTH=4 inclusion path, scaled integer value/threshold; value stays a
+     * witness, never persisted). Exact duplicate claim tuples
+     * (fieldKey, threshold, predicate) are dropped server-side and reported
+     * via `droppedDuplicates`; claim keys are idempotent on-chain, so this is
+     * a proving-time optimization only.
+     *
+     * One PredicateAttestations row per claim; on success ALL rows share one
+     * `provenTxHash`. Failure semantics: a false predicate fails at LOCAL
+     * proving time, so nothing is submitted and no row is marked proven.
+     * AFTER submission the ledger's fallible phase can finalize
+     * PARTIAL_SUCCESS (subset applied); the job then fails with
+     * OnChainStatus:... and callers must verify per claim via
+     * `verifyPredicateAttestation` (crawler-free, no txHash needed) rather
+     * than assume all-or-nothing.
+     *
+     * Proving work stays additive (N proofs = N provings); the batch saves
+     * N-1 balancing/submit rounds, confirmation waits and fee events. With
+     * `sponsorSessionId` the two-phase dust balancing runs ONCE for the
+     * whole batch. Rate limiting counts N claims, not one call.
+     *
+     * Async: returns `{ jobId, status, claims, droppedDuplicates }`; `claims`
+     * is a JSON array of `{ predicateAttestationId, fieldKey, predicate,
+     * threshold, unit }` in submission order.
+     */
+    action   issueFieldPredicateAttestationBatch(payloadHash: String, // shared attestation payload_hash (64 hex)
+                                                 contentRoot: String, // optional 64-hex Merkle root, anchored in-batch first
+                                                 claimsJson: LargeString, // JSON array of claims (see above)
+                                                 sessionId: UUID,
+                                                 contractAddress: String, // AttestationVault deployment
+                                                 compiledArtifactRef: String, // optional, defaults to 'attestation-vault'
+                                                 idempotencyKey: String, // optional; dedupes retries
+                                                 sponsorSessionId: UUID // optional; second session pays the dust fee (see submitContractCall)
+    )                                                                 returns {
+        jobId             : UUID;
+        status            : String;
+        claims            : LargeString; // JSON array of { predicateAttestationId, fieldKey, predicate, threshold, unit }
+        droppedDuplicates : Integer;
+    };
+
+    /**
      * Verify a predicate attestation under the on-chain-verified model: the
      * `provePredicate` proof is only accepted by the ledger if the in-circuit
      * asserts (commitment match + predicate) held, so a successful tx IS the
