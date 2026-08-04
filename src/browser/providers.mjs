@@ -25,10 +25,11 @@ import { InMemoryPrivateStateProvider } from './private-state.mjs';
  * @param {string}   opts.contract   contract name, e.g. 'attestation-vault'
  * @param {typeof fetch} [opts.fetchFn]    injectable fetch (defaults to global)
  * @param {any}      [opts.webSocket]      WebSocket impl (defaults to global)
+ * @param {'server'|'wallet'|'auto'} [opts.proving='server']  proving modality, see below
  * @returns assembled providers + prefetched wallet keys + the connector
  */
 export async function createNightgateConnectorProviders(opts = {}) {
-    const { connector, manifest, contract, fetchFn, webSocket } = opts;
+    const { connector, manifest, contract, fetchFn, webSocket, proving = 'server' } = opts;
     if (!connector) throw new Error('createNightgateConnectorProviders: connector is required');
     if (!contract) throw new Error('createNightgateConnectorProviders: contract is required');
 
@@ -47,11 +48,13 @@ export async function createNightgateConnectorProviders(opts = {}) {
 
     const zkConfigProvider = new FetchZkConfigProvider(entry.zkConfigBaseUrl, fetchFn);
     const publicDataProvider = indexerMod.indexerPublicDataProvider(cfg.indexerUri, cfg.indexerWsUri, WS);
-    // Self-prove modality: needs a reachable proof server URI. The wallet-delegated
-    // modality instead uses connector.getProvingProvider(zkConfigProvider.asKeyMaterialProvider()).
-    const proofProvider = cfg.proverServerUri
-        ? proofMod.httpClientProofProvider(cfg.proverServerUri, zkConfigProvider)
-        : undefined;
+    const { proofProvider, provingModality } = await buildProofProvider({
+        proving,
+        connector,
+        zkConfigProvider,
+        proverServerUri: cfg.proverServerUri,
+        proofMod
+    });
     const privateStateProvider = new InMemoryPrivateStateProvider();
 
     // Prefetch wallet keys (connector getters are async; midnight-js WalletProvider
@@ -62,6 +65,13 @@ export async function createNightgateConnectorProviders(opts = {}) {
         publicDataProvider,
         zkConfigProvider,
         proofProvider,
+        /**
+         * Which proving modality was actually assembled: 'server', 'wallet' or 'none'.
+         * Returned deliberately so a consumer can LOG and display it — a silent fall from wallet
+         * proving to a remote proof server changes where the transaction preimage goes, and that
+         * must never be invisible.
+         */
+        provingModality,
         privateStateProvider,
         connector,
         config: cfg,
@@ -77,4 +87,60 @@ export async function createNightgateConnectorProviders(opts = {}) {
          */
         keyMaterialProvider: () => zkConfigProvider.asKeyMaterialProvider()
     };
+}
+
+/**
+ * Assemble the proof provider for the requested modality.
+ *
+ *   'server' — midnight-js's httpClientProofProvider against `proverServerUri` (today's default,
+ *              and what production uses). Needs a reachable, CORS-clean proof server.
+ *   'wallet' — DELEGATE contract proving to the connected wallet's own prover
+ *              (`connector.getProvingProvider`). No proof server, no CORS wall, and the
+ *              transaction preimage never leaves the user's machine. Fails LOUDLY when the
+ *              connector cannot do it: a silent fall back to a remote server would move the
+ *              preimage somewhere the caller did not ask for.
+ *   'auto'   — wallet when the connector offers it, else server.
+ *
+ * The wallet path mirrors the server-side twin (`srv/midnight/wasm-proof-provider.ts`): the
+ * `{ proveTx }` contract is a thin transport, and `unprovenTx.prove(...)` runs the ledger's own
+ * prove loop whose per-circuit callbacks now cross into the wallet. Only the CONTRACT's circuits
+ * are answered from `zkConfigProvider`; standard circuits (zswap/dust) and the BLS ceremony
+ * parameters are the wallet's own business, so a miss on our side is expected, not an error.
+ *
+ * Kept as a separate export so it is unit-testable without assembling every other provider.
+ */
+export async function buildProofProvider({ proving = 'server', connector, zkConfigProvider, proverServerUri, proofMod }) {
+    if (proving !== 'server' && proving !== 'wallet' && proving !== 'auto') {
+        throw new Error(`createNightgateConnectorProviders: unknown proving modality '${proving}'`);
+    }
+
+    const connectorCanProve = typeof connector?.getProvingProvider === 'function';
+    if (proving === 'wallet' && !connectorCanProve) {
+        throw new Error(
+            "createNightgateConnectorProviders: proving:'wallet' was requested but this wallet does not " +
+            'implement getProvingProvider(). Use proving:\'auto\' to fall back to a proof server.'
+        );
+    }
+
+    if (connectorCanProve && (proving === 'wallet' || proving === 'auto')) {
+        // Lazy, like every other heavy import here: server-only consumers must not pay for the ledger.
+        const ledger = await import('@midnight-ntwrk/ledger-v8');
+        const walletProver = await connector.getProvingProvider(zkConfigProvider.asKeyMaterialProvider());
+        return {
+            provingModality: 'wallet',
+            proofProvider: {
+                proveTx: (unprovenTx) => unprovenTx.prove(walletProver, ledger.CostModel.initialCostModel())
+            }
+        };
+    }
+
+    if (proverServerUri) {
+        return {
+            provingModality: 'server',
+            proofProvider: proofMod.httpClientProofProvider(proverServerUri, zkConfigProvider)
+        };
+    }
+    // No modality available. Undefined rather than a throw: a consumer may only need the read
+    // providers, and the caller that actually proves gets a clear failure from midnight-js instead.
+    return { provingModality: 'none', proofProvider: undefined };
 }

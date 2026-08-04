@@ -1,6 +1,6 @@
 {
   "name": "@odatano/nightgate",
-  "version": "0.12.0",
+  "version": "0.12.1",
   "description": "CAP Plugin: Midnight Blockchain Indexer with OData V4 API",
   "homepage": "https://github.com/ODATANO/NIGHTGATE#readme",
   "repository": {
@@ -53,6 +53,11 @@
       "import": "./src/browser/index.mjs",
       "default": "./src/browser/index.mjs"
     },
+    "./browser/providers.mjs": {
+      "types": "./src/browser/providers.d.mts",
+      "import": "./src/browser/providers.mjs",
+      "default": "./src/browser/providers.mjs"
+    },
     "./browser/attestation-vault": {
       "types": "./contracts/attestation-vault/src/managed/attestation-vault/contract/index.d.ts",
       "import": "./contracts/attestation-vault/src/managed/attestation-vault/contract/index.js",
@@ -67,6 +72,7 @@
     "src/**/*.js",
     "src/**/*.mjs",
     "src/**/*.d.ts",
+    "src/**/*.d.mts",
     "srv/**/*.cds",
     "srv/**/*.js",
     "srv/**/*.d.ts",
@@ -105,6 +111,8 @@
     "integration:contract-registry": "node scripts/integration-test-contract-registry.mjs",
     "integration:connector-routes": "node scripts/integration-test-connector-routes.mjs",
     "check:browser": "node scripts/check-browser-bundle.mjs",
+    "check:exports": "node scripts/check-package-exports.mjs",
+    "check:browser-types": "node scripts/check-browser-types.mjs",
     "check:job-idempotency": "node scripts/check-job-idempotency.mjs",
     "integration:attestation-vault": "node scripts/integration-test-attestation-vault.mjs",
     "deploy:e2e": "node --env-file=.env scripts/run-deploy-e2e.mjs",
@@ -118,7 +126,7 @@
     "test:pg-idempotency": "node scripts/test-postgres-idempotency.mjs",
     "lint": "eslint .",
     "prepack": "npm run build:plugin",
-    "prepublishOnly": "npm run typecheck && npm test && npm run build:plugin",
+    "prepublishOnly": "npm run typecheck && npm test && npm run check:exports && npm run check:browser-types && npm run build:plugin",
     "integration:derive-wallet-info": "node --env-file=.env scripts/integration-test-derive-wallet-info.mjs"
   },
   "dependencies": {

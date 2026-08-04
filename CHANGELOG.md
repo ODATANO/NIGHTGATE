@@ -1,5 +1,82 @@
 # Changelog
 
+## 0.12.1 - 2026-08-03
+
+### Feature: wallet-delegated proving modality in `@odatano/nightgate/browser`
+
+FR: `docs/feature-requests/browser-wallet-delegated-proving.md`.
+`createNightgateConnectorProviders` gained a `proving` option
+(`'server' | 'wallet' | 'auto'`, default `'server'`) and now assembles the
+proof provider itself instead of leaving it to the consumer. With
+`'wallet'` the contract circuits are proved INSIDE the connected
+DApp-Connector wallet via `connector.getProvingProvider(...)`: no Docker
+proof server, no CORS wall, and the transaction preimage never leaves the
+user's machine. The browser counterpart of `srv/midnight/wasm-proof-provider.ts`.
+
+Only the CONTRACT's circuits are answered from our `zkConfigProvider`;
+standard circuits (zswap/dust) and the BLS ceremony parameters are the
+wallet's own business, so a miss on our side is expected rather than an
+error.
+
+`proving: 'wallet'` THROWS when the connected wallet has no
+`getProvingProvider` — it never silently falls back to a remote proof
+server, because that would move the preimage somewhere the caller did not
+ask for. `'auto'` is the forgiving variant (wallet when available, else
+server). The assembled modality is returned as `provingModality`
+(`'server' | 'wallet' | 'none'`) so consumers can log and display where
+proving actually happens.
+
+Also: `buildProofProvider` is exported separately (for consumers that
+assemble the other providers themselves), typed in `src/browser/index.d.ts`
+plus a new `src/browser/providers.d.mts` so the deep `.mjs` path is typed
+too.
+
+### Browser typing fixes (consumer-visible, repo-invisible)
+
+- `BuildWitnessesInput` now declares `merkleProofHolder` (plus the exported
+  `MerkleProofHolder` type). The 0.12.0 batch mode has been supported at
+  runtime since that release but was undeclared, so TypeScript consumers
+  could not use the public batch surface in a typed way.
+- `index.d.ts` imports `AttestationVaultWitnesses` locally: `export { … }
+  from` re-exports a name without binding it, and `PreparedCall.witnesses`
+  references it, so the declaration failed with TS2304 for any consumer.
+- New `npm run check:browser-types` (`scripts/check-browser-types.mjs`)
+  typechecks a probe against the browser entry with **skipLibCheck OFF** and
+  package-name resolution — i.e. the way a consumer does. The repo's own
+  typecheck has skipLibCheck on and therefore checks no declaration contents
+  at all, which is how both bugs above (and the `zk-config` import in
+  `providers.d.mts`) stayed invisible here while breaking installs. Wired
+  into `prepublishOnly`; verified to fail when either fix is reverted.
+
+### Packaging fixes found while releasing this
+
+- `./browser/providers.mjs` is now a declared subpath in `exports` (with
+  `types`), and `src/**/*.d.mts` is in `files`. Without both, the deep import
+  the new declaration describes would have failed at a consumer's install with
+  `ERR_PACKAGE_PATH_NOT_EXPORTED`, and the declaration would not have shipped.
+- **`src/browser/*.d.ts` was never tracked in git.** The `src/**/*.d.ts`
+  ignore treats declarations as in-place build output, but src/browser ships
+  hand-written `.mjs` with hand-written declarations and has no `.ts` to
+  generate them from — so a fresh clone published
+  `@odatano/nightgate/browser` with NO types at all. The ignore now has a
+  negation and `index.d.ts` / `witnesses.d.ts` are tracked. Pre-existing, not
+  introduced by this release.
+- `providers.d.mts` describes its zk-config dependency structurally instead of
+  importing from the declaration-less `./zk-config.mjs`; the import made the
+  file error for any consumer with `skipLibCheck: false` (the repo's own
+  typecheck hides this — only an installed-package typecheck catches it).
+- New `npm run check:exports` (`scripts/check-package-exports.mjs`) verifies
+  every `exports` target — including every `types` condition — exists on disk
+  AND is inside the real `npm pack` tarball. Wired into `prepublishOnly`.
+  Verified against an actual pack → install → deep-import → consumer-typecheck
+  round trip, and confirmed to fail when either half of the fix is reverted.
+
+Default behavior is byte-for-byte unchanged; with `proving` unset the
+server path is exactly what 0.12.0 did. Verified: 69 suites / 1323 tests,
+typecheck + `check:browser` clean. The live acceptance run (a vault call
+proved through bob-the-mooonlighter with the proof server STOPPED) is
+pending and tracked in the FR.
+
 ## 0.12.0 - 2026-08-01
 
 ### Feature: `issueFieldPredicateAttestationBatch` proves N field predicates in ONE transaction

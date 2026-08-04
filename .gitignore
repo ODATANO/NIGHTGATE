@@ -18,6 +18,12 @@ src/**/*.js
 src/**/*.d.ts
 src/**/*.js.map
 src/**/*.d.ts.map
+# ...except the browser entry's declarations, which are SOURCE: src/browser ships hand-written
+# .mjs with hand-written .d.ts/.d.mts siblings and has no .ts to generate them from. The glob
+# above treated them as build output, so they were never tracked — a fresh clone would publish
+# @odatano/nightgate/browser with no types at all (scripts/check-package-exports.mjs now fails
+# on exactly that).
+!src/browser/*.d.ts
 srv/**/*.js
 srv/**/*.d.ts
 srv/**/*.js.map
@@ -55,3 +61,4 @@ docs/feature-requests/
 docs/release-*.md
 docs/code-review-*.md
 docs/cap10-upgrade-assessment.md
+.ng-types-probe/
