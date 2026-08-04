@@ -21,7 +21,7 @@ import {
 } from '../submission/token-ops';
 import { ensureNetworkId } from '../midnight/providers';
 import { getOrBuildWalletFacade } from '../submission/wallet-facade-builder';
-import { walletWaitForSyncedState } from '../midnight/wallet-worker-client';
+import { walletWaitForSyncedState, walletGetSyncProgress } from '../midnight/wallet-worker-client';
 import {
     resolveNightgateRuntimeConfig, getNightgatePluginConfig, mainnetSubmissionBlockReason,
     getConfiguredNightgateNetwork, normalizeNightgateNetwork
@@ -30,7 +30,7 @@ import { startJob, registerBackgroundJobProcessor, runWithoutAmbientTx, supersed
 import { reportExternalExecution } from '../submission/job-execution-context';
 import { mnemonicToBip39SeedHex } from '../utils/wallet-hd';
 import { deriveWalletInfo, resolveBip39SeedHex, deriveViewingKeyForAccount } from '../utils/wallet-info';
-import { resolveFeeSponsor, ensureFeeSponsorFacade, FeeSponsorError } from '../submission/fee-sponsor';
+import { resolveFeeSponsor, ensureFeeSponsorFacade, FeeSponsorError, getConfiguredFeeSponsorSessions } from '../submission/fee-sponsor';
 
 // Upper bound for the prewarm sync-to-tip wait
 const PREWARM_SYNC_TIMEOUT_MS = Number(
@@ -807,6 +807,50 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
         }
     });
 
+    srv.on('getWalletSyncProgress', async (req: Request) => {
+        const userId = requireUserId(req);
+        if (!userId) return;
+        const clientKey = (req as any)?._.req?.ip || 'global';
+        const rate = diagnosticsRateLimiter.check(clientKey);
+        if (!rate.allowed) {
+            return req.reject(429, `Rate limited. Retry after ${Math.ceil(rate.retryAfterMs / 1000)}s`);
+        }
+
+        const { sessionId } = req.data as { sessionId: string };
+        if (!sessionId) return req.reject(400, 'sessionId is required');
+
+        const sess = await loadSigningSessionAccountId(db, sessionId, userId);
+        if (!sess.ok) return req.reject(sess.status, sess.msg);
+
+        // Main-thread cache read: no worker round trip, so a saturated worker
+        // cannot make its own progress unreadable.
+        const p = walletGetSyncProgress(sess.accountId);
+        if (!p) {
+            return {
+                known: false, caughtUp: false,
+                appliedIndex: null, streamTip: null, behindEvents: null,
+                eventsPerSecond: null, etaSeconds: null, blockHeight: null,
+                isConnected: false, indexerFresh: false,
+                elapsedMs: null, phase: null, updatedAt: null
+            };
+        }
+        return {
+            known: true,
+            caughtUp: p.caughtUp,
+            appliedIndex: p.appliedIndex,
+            streamTip: p.streamTip,
+            behindEvents: p.behindEvents,
+            eventsPerSecond: p.eventsPerSecond,
+            etaSeconds: p.etaSeconds,
+            blockHeight: p.blockHeight,
+            isConnected: p.isConnected,
+            indexerFresh: p.indexerFresh,
+            elapsedMs: p.elapsedMs,
+            phase: p.label,
+            updatedAt: p.updatedAt
+        };
+    });
+
     srv.on('estimateSendNightFee', async (req: Request) => {
         const userId = requireUserId(req);
         if (!userId) return;
@@ -851,6 +895,66 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
         }
     });
 
+}
+
+/** Rows per UPDATE, so a database with thousands of leftovers stays within
+ *  the driver's parameter limit. */
+const SESSION_CLOSE_CHUNK = 200;
+
+/**
+ * Close the wallet sessions left behind by the PREVIOUS process. Called once at
+ * plugin init, before any request can arrive. Returns the closed session ids so
+ * the caller can also drop the queued jobs that signed with them
+ * (`dropPendingJobsForClosedSessions`); a replay of those jobs would only die
+ * later in `executeWalletCommand` with a misleading "Session not found".
+ *
+ * A session is a per-connect handle owned by a caller in a specific process, not
+ * a property of the wallet: `connectWallet` inserts a row per call and only
+ * `disconnectWallet` closes one, so every ungraceful stop leaks its handles for
+ * the full 24h TTL. Live-observed: 12 simultaneously active rows for a single
+ * wallet. The facade is unaffected either way (it is cached per accountId, one
+ * per wallet, and a fresh process has none), so the leak costs two things: the
+ * shared-session guard in `evictFacadeUnlessShared` counts those dead rows as
+ * live users and therefore keeps a wallet's in-memory keys after a legitimate
+ * `disconnectWallet`, and each row keeps encrypted seed material at rest a day
+ * past the death of the process that authorised it. Both are closed here.
+ *
+ * `runtimeMode` requires exactly one replica (`runtime-topology.ts`), so "left
+ * over from a previous process" really does mean dead, not "belongs to a
+ * sibling instance". Do NOT extend this to a multi-replica deployment without
+ * an instance-scoped owner column.
+ *
+ * CONFIGURED FEE-SPONSOR SESSIONS ARE EXEMPT. Their ids are pinned in the
+ * deployment config and usable by any authenticated caller
+ * (`resolveFeeSponsor`), i.e. they are deliberately long-lived and process
+ * independent. Closing them would break sponsored submissions after every
+ * restart until an operator pinned a fresh id.
+ *
+ * No facade eviction here (a fresh process has no facades) and no key material
+ * survives: the same columns `disconnectWallet` clears are cleared.
+ */
+export async function closeSessionsFromPreviousProcess(db: any, config?: Record<string, any>): Promise<string[]> {
+    const exempt = new Set(getConfiguredFeeSponsorSessions(config));
+    const active: any[] = (await db.run(
+        SELECT.from(WalletSessions).columns('sessionId').where({ isActive: true })
+    )) || [];
+    const stale = active.map(r => r.sessionId).filter((id: string) => id && !exempt.has(id));
+    if (stale.length === 0) return [];
+
+    const now = new Date().toISOString();
+    for (let i = 0; i < stale.length; i += SESSION_CLOSE_CHUNK) {
+        await db.run(
+            UPDATE.entity(WalletSessions)
+                .set({
+                    isActive: false,
+                    disconnectedAt: now,
+                    encryptedViewingKey: null,
+                    encryptedSeedKey: null
+                })
+                .where({ sessionId: { in: stale.slice(i, i + SESSION_CLOSE_CHUNK) } })
+        );
+    }
+    return stale;
 }
 
 /**

@@ -883,6 +883,39 @@ service NightgateService {
     };
 
     /**
+     * How far the wallet's catch-up has got, and how fast it is moving.
+     * Read-only and cheap: answers from a snapshot the wallet worker pushes
+     * every ~15s, so it stays responsive while that worker is CPU-saturated
+     * syncing (which is exactly when this matters).
+     *
+     * Poll this instead of guessing from elapsed time. A catch-up is slow but
+     * healthy while `appliedIndex` climbs and `eventsPerSecond` stays above
+     * zero; the same wallet is genuinely stuck when `appliedIndex` stops moving
+     * across polls or `isConnected` is false.
+     *
+     * `known` is false before the first sync wait has reported anything, e.g.
+     * the facade is still being built. `appliedIndex`, `streamTip` and
+     * `behindEvents` count dust LEDGER EVENTS (not blocks) and are decimal
+     * strings to preserve bigint precision. `etaSeconds` is derived from the
+     * current rate, so it moves around; treat it as an order of magnitude.
+     */
+    function getWalletSyncProgress(sessionId: UUID)                   returns {
+        known           : Boolean;
+        caughtUp        : Boolean;
+        appliedIndex    : String;  // dust ledger-event id applied so far
+        streamTip       : String;  // current tip of that event stream
+        behindEvents    : String;  // streamTip - appliedIndex
+        eventsPerSecond : Decimal; // current rate, null until measurable
+        etaSeconds      : Integer; // at the current rate, null if not derivable
+        blockHeight     : String;  // indexer block height, for chain correlation
+        isConnected     : Boolean;
+        indexerFresh    : Boolean; // indexer tip recent enough to count as tip
+        elapsedMs       : Integer; // how long this sync wait has been running
+        phase           : String;  // 'prewarm' | 'balance' | ...
+        updatedAt       : Timestamp; // when the worker last reported
+    };
+
+    /**
      * Pre-flight DUST fee estimate for a `sendNight` transfer. Builds the
      * recipe in the worker (lightweight; no ZK proof generation, no submit),
      * returns the estimated fee in DUST atoms (decimal string). The recipe

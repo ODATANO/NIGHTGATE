@@ -250,6 +250,7 @@ import {
     WorkflowReconciliationRequiredError,
     getJobById,
     recoverInterruptedJobs,
+    dropPendingJobsForClosedSessions,
     supersedeQueuedJobs,
     reconcileBackgroundJobs,
     refreshSucceededChainOutcomes,
@@ -1072,7 +1073,7 @@ describe('startJob: per-kind semaphore', () => {
 
         for (let i = 0; i < 20; i++) {
             await startJob({
-                kind:      'connectWalletForSigning',   // not in HEAVY_KINDS → light
+                kind:      'lightKindTest',   // in neither HEAVY_KINDS nor SERIAL_KINDS
                 sessionId: `sess-${i}`,
                 request:   {},
                 work:      makeWork()
@@ -1082,6 +1083,43 @@ describe('startJob: per-kind semaphore', () => {
 
         expect(inFlight.peak).toBeLessThanOrEqual(16);
         expect(inFlight.count).toBe(16);
+        releaseGates.forEach(r => r());
+        await flushSpawn();
+        await flushSpawn();
+    });
+
+    // Every wallet facade lives in the ONE worker thread and catch-up is
+    // CPU-bound single-threaded work, so concurrent prewarms do not finish
+    // sooner, they each finish N times later. Serialized, the caller's first
+    // wallet becomes usable after its own catch-up instead of all of them.
+    test('prewarm is capped at ONE concurrent job', async () => {
+        const releaseGates: Array<() => void> = [];
+        const inFlight = { count: 0, peak: 0 };
+        const makeWork = () => vi.fn(async () => {
+            inFlight.count++;
+            inFlight.peak = Math.max(inFlight.peak, inFlight.count);
+            await new Promise<void>(r => releaseGates.push(r));
+            inFlight.count--;
+        });
+
+        for (let i = 0; i < 4; i++) {
+            await startJob({
+                kind:      'connectWalletForSigning',
+                sessionId: `prewarm-sess-${i}`,
+                request:   {},
+                work:      makeWork()
+            });
+        }
+        await flushSpawn();
+
+        expect(inFlight.peak).toBe(1);
+        expect(inFlight.count).toBe(1);
+
+        // Releasing the running one admits exactly the next, never a burst.
+        releaseGates.shift()!();
+        await flushSpawn();
+        expect(inFlight.peak).toBe(1);
+
         releaseGates.forEach(r => r());
         await flushSpawn();
         await flushSpawn();
@@ -1274,6 +1312,69 @@ describe('recoverInterruptedJobs', () => {
 
     test('returns 0 and is a no-op when no rows are in flight', async () => {
         expect(await recoverInterruptedJobs()).toBe(0);
+    });
+
+    // Live regression (2026-08-04): every ungraceful stop left one more
+    // `connectWalletForSigning` in `running`, and each boot replayed them all.
+    // Since all wallet facades share the ONE worker thread, those unrequested
+    // catch-ups time-shared a core with the wallet the host actually wanted.
+    test('drops session-bound prewarm jobs terminally instead of re-queuing them', async () => {
+        const now = new Date().toISOString();
+        const base = {
+            sessionId: 's', idempotencyKey: null, request: null, result: null,
+            errorCode: null, errorMessage: null, finishedAt: null,
+            createdAt: now, modifiedAt: now, requestedBy: 'alice'
+        };
+        rows.set('c1', { ID: 'c1', kind: 'connectWalletForSigning', status: 'running', commandVersion: 1, command: '{"op":"prewarm"}', startedAt: now, leaseOwner: 'inst-1', ...base } as any);
+        rows.set('c2', { ID: 'c2', kind: 'connectWalletForSigning', status: 'pending', commandVersion: 1, command: '{"op":"prewarm"}', startedAt: null, ...base } as any);
+        // A funds-moving command with the same shape still returns to the queue.
+        rows.set('d1', { ID: 'd1', kind: 'sendNight', status: 'running', commandVersion: 1, command: '{"op":"sendNight"}', startedAt: now, ...base } as any);
+
+        expect(await recoverInterruptedJobs()).toBe(3);
+
+        for (const id of ['c1', 'c2']) {
+            expect(rows.get(id)).toMatchObject({
+                status: 'failed',
+                errorCode: 'PROCESS_RESTART_SESSION_JOB_DROPPED',
+                leaseOwner: null
+            });
+            expect(rows.get(id)!.finishedAt).toBeTruthy();
+        }
+        expect(rows.get('d1')).toMatchObject({ status: 'pending', errorCode: null });
+    });
+
+    // Companion to closeSessionsFromPreviousProcess: a re-queued job whose
+    // signing session was closed at boot could only die later in
+    // executeWalletCommand with a misleading "Session not found". Failing it
+    // up front gives it a restart-shaped code instead.
+    test('dropPendingJobsForClosedSessions fails pending jobs of closed sessions only', async () => {
+        const now = new Date().toISOString();
+        const base = {
+            idempotencyKey: null, request: null, result: null,
+            errorCode: null, errorMessage: null, startedAt: null, finishedAt: null,
+            createdAt: now, modifiedAt: now, requestedBy: 'alice',
+            commandVersion: 1, command: '{"op":"sendNight"}'
+        };
+        rows.set('p1', { ID: 'p1', kind: 'sendNight', status: 'pending', sessionId: 'dead-1', leaseOwner: 'inst-0', ...base } as any);
+        rows.set('p2', { ID: 'p2', kind: 'registerForDustGeneration', status: 'pending', sessionId: 'dead-2', ...base } as any);
+        // Exempt (fee-sponsor) session id is not passed in: replay stays queued.
+        rows.set('p3', { ID: 'p3', kind: 'sendNight', status: 'pending', sessionId: 'sponsor-1', ...base } as any);
+        // Post-effect states resolve from chain evidence, never from the session.
+        rows.set('p4', { ID: 'p4', kind: 'sendNight', status: 'reconciliation_required', sessionId: 'dead-1', ...base } as any);
+
+        expect(await dropPendingJobsForClosedSessions(['dead-1', 'dead-2'])).toBe(2);
+
+        for (const id of ['p1', 'p2']) {
+            expect(rows.get(id)).toMatchObject({
+                status: 'failed',
+                errorCode: 'PROCESS_RESTART_SESSION_CLOSED',
+                leaseOwner: null
+            });
+            expect(rows.get(id)!.finishedAt).toBeTruthy();
+        }
+        expect(rows.get('p3')).toMatchObject({ status: 'pending', errorCode: null });
+        expect(rows.get('p4')).toMatchObject({ status: 'reconciliation_required' });
+        expect(await dropPendingJobsForClosedSessions([])).toBe(0);
     });
 
     test('survives transient lock contention on the recovery UPDATE', async () => {

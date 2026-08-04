@@ -45,7 +45,29 @@ const detachedJobScope = new AsyncResource('nightgate.detached-job-work');
 
 // ---- Concurrency caps ------------------------------------------------------
 
-const DEFAULT_CONCURRENCY = { heavy: 4, light: 16 } as const;
+const DEFAULT_CONCURRENCY = { heavy: 4, light: 16, serial: 1 } as const;
+
+/**
+ * Kinds capped at ONE concurrent job because the work they wait on already
+ * serializes downstream, so running them in parallel does not finish anything
+ * sooner; it only makes every one of them slower.
+ *
+ * `connectWalletForSigning` warms a wallet facade. Every facade lives in the
+ * ONE singleton worker thread (`startWalletWorker`), and SDK catch-up is
+ * CPU-bound single-threaded work, so N simultaneous prewarms each run at
+ * roughly 1/N speed and the host's FIRST wallet becomes usable N times later
+ * than it needs to. Serialized, wallet A finishes in its own time, then B,
+ * then C: same total, but the caller can start working after the first one.
+ * Live case: three wallets, none caught up after 80 minutes together, 19
+ * minutes for one alone.
+ *
+ * This is why the kind is not merely "light". The `HEAVY_KINDS` split is about
+ * proving capacity in THIS process; the constraint here is one thread further
+ * out, and from the job runner's side a prewarm does look idle while it waits.
+ */
+const SERIAL_KINDS: ReadonlySet<string> = new Set([
+    'connectWalletForSigning'
+]);
 
 /**
  * Kinds where each job runs full ZK proof generation (proof server in the
@@ -110,10 +132,12 @@ const semaphores: Map<string, Semaphore> = new Map();
 function getSemaphore(kind: string): Semaphore {
     const cached = semaphores.get(kind);
     if (cached) return cached;
-    const userCaps = ((cds.env as any).requires?.nightgate?.jobs?.concurrency || {}) as { heavy?: number; light?: number };
-    const max = HEAVY_KINDS.has(kind)
-        ? (typeof userCaps.heavy === 'number' ? userCaps.heavy : DEFAULT_CONCURRENCY.heavy)
-        : (typeof userCaps.light === 'number' ? userCaps.light : DEFAULT_CONCURRENCY.light);
+    const userCaps = ((cds.env as any).requires?.nightgate?.jobs?.concurrency || {}) as { heavy?: number; light?: number; serial?: number };
+    const max = SERIAL_KINDS.has(kind)
+        ? (typeof userCaps.serial === 'number' ? userCaps.serial : DEFAULT_CONCURRENCY.serial)
+        : HEAVY_KINDS.has(kind)
+            ? (typeof userCaps.heavy === 'number' ? userCaps.heavy : DEFAULT_CONCURRENCY.heavy)
+            : (typeof userCaps.light === 'number' ? userCaps.light : DEFAULT_CONCURRENCY.light);
     const sem = new Semaphore(max);
     semaphores.set(kind, sem);
     return sem;
@@ -614,8 +638,28 @@ async function dedupExisting<TIn, TOut>(
 }
 
 /**
+ * Job kinds whose ONLY product is in-process state (a warm wallet facade for a
+ * caller that holds the session id). They carry a `commandVersion` because the
+ * command shape is persisted, but replaying them after a restart is pure cost:
+ * the caller that wanted the warm facade died with the old process, and there
+ * is no external effect left to complete.
+ *
+ * Replaying them is also actively harmful. Every wallet facade lives in the ONE
+ * singleton worker thread (`startWalletWorker`), and SDK catch-up is CPU-bound
+ * single-threaded work, so each unrequested facade time-shares the same core
+ * with the one the host actually asked for. Since each ungraceful stop leaves
+ * one more such row behind, boot cost grew with the number of previous crashes
+ * (observed live: 7 stuck rows, 3 unrequested facades, >70 min catch-up).
+ *
+ * Criterion for adding a kind here: interrupting it can leave nothing behind
+ * that a later caller could observe or would have to reconcile.
+ */
+const SESSION_BOUND_JOB_KINDS = ['connectWalletForSigning'];
+
+/**
  * Resolve jobs left behind by a process restart without risking a duplicate
- * external effect. Versioned commands stay queued or reset from pre-effect
+ * external effect. Session-bound kinds become terminal (their product died with
+ * the process); other versioned commands stay queued or reset from pre-effect
  * `running` to `pending`; legacy closures become terminal (can't be
  * reconstructed); external-effect states require reconciliation before retry.
  * Called once at plugin init (`cds.on('served')`); idempotent. Returns the count
@@ -631,6 +675,23 @@ export async function recoverInterruptedJobs(): Promise<number> {
     const count = Array.isArray(stuck) ? stuck.length : 0;
     if (count === 0) return 0;
     await withStatusWriteRetry('recoverInterruptedJobs', async () => {
+        // FIRST, so the generic re-queue below cannot claim these rows: a
+        // session-bound job has no external effect and no surviving caller.
+        // Terminal, with its own code so an operator can tell a dropped
+        // prewarm apart from a genuinely failed one.
+        await db.run(
+            UPDATE.entity(BackgroundJobs)
+                .set({
+                    status: 'failed',
+                    errorCode: 'PROCESS_RESTART_SESSION_JOB_DROPPED',
+                    errorMessage: 'Dropped on restart: this job only warms in-process session state, and the caller that requested it did not survive the restart. Call the action again if a warm session is still wanted.',
+                    finishedAt: new Date().toISOString(),
+                    leaseOwner: null,
+                    leaseExpiresAt: null,
+                    heartbeatAt: null
+                })
+                .where({ status: { in: ['pending', 'running'] }, kind: { in: SESSION_BOUND_JOB_KINDS } })
+        );
         // Replayable commands are safe to put back in the queue only while
         // still before the persisted external-effect boundary.
         await db.run(
@@ -672,6 +733,47 @@ export async function recoverInterruptedJobs(): Promise<number> {
         );
     });
     return count;
+}
+
+/**
+ * Terminally fail every still-pending job whose signing session was closed by
+ * the restart cleanup (`closeSessionsFromPreviousProcess`). Runs at plugin init
+ * between that cleanup and `startBackgroundJobProcessor`, so the poller never
+ * schedules them: their replay reloads signing material from the session row
+ * (`executeWalletCommand` / the contract processors' walletFactory), and that
+ * row's keys are gone, so every one of them would die later with a misleading
+ * "Session not found" instead of a restart-shaped error code.
+ *
+ * Only `pending` rows are touched. `reconciliation_required` resolves from
+ * chain evidence and needs no session; exempt fee-sponsor sessions are never
+ * passed in, so jobs signed by them keep their replay guarantee.
+ */
+export async function dropPendingJobsForClosedSessions(sessionIds: string[]): Promise<number> {
+    if (sessionIds.length === 0) return 0;
+    const db = await cds.connect.to('db');
+    let dropped = 0;
+    await withStatusWriteRetry('dropPendingJobsForClosedSessions', async () => {
+        dropped = 0;
+        // Same chunking rationale as the session close itself: stay within the
+        // driver's parameter limit on a large backlog.
+        for (let i = 0; i < sessionIds.length; i += 200) {
+            const affected = await db.run(
+                UPDATE.entity(BackgroundJobs)
+                    .set({
+                        status: 'failed',
+                        errorCode: 'PROCESS_RESTART_SESSION_CLOSED',
+                        errorMessage: 'Dropped on restart: the wallet session this job signs with was closed by the restart cleanup, so a replay could no longer decrypt its signing material. Reconnect and submit the action again if it is still wanted.',
+                        finishedAt: new Date().toISOString(),
+                        leaseOwner: null,
+                        leaseExpiresAt: null,
+                        heartbeatAt: null
+                    })
+                    .where({ status: 'pending', sessionId: { in: sessionIds.slice(i, i + 200) } })
+            );
+            dropped += affectedRows(affected);
+        }
+    });
+    return dropped;
 }
 
 /**

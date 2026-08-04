@@ -77,6 +77,11 @@ export interface NightgatePluginConfig {
      */
     allowSelfServiceGranteeRegistration?: boolean;
     /**
+     * Close wallet sessions left behind by the previous process at startup.
+     * Default true. See `isCloseSessionsOnRestartEnabled`.
+     */
+    closeSessionsOnRestart?: boolean;
+    /**
      * Per-network indexer endpoint overrides for the crawler-free state-verify
      * surface's optional `network` parameter.
      * Only consulted when a verify call overrides to a network OTHER than the
@@ -188,6 +193,30 @@ export function isSelfServiceGranteeRegistrationAllowed(config?: Record<string, 
     // inherit their on-chain grants. Deployments that want self-service must
     // opt in explicitly (config flag or NIGHTGATE_ALLOW_SELF_SERVICE_GRANTEE_REGISTRATION).
     return config?.allowSelfServiceGranteeRegistration === true;
+}
+
+/**
+ * Whether a restart closes the wallet sessions left behind by the previous
+ * process. Default ON.
+ *
+ * A session is a handle owned by a caller in a specific process, not a property
+ * of the wallet: `connectWallet` mints a row per call and only
+ * `disconnectWallet` closes one, so an ungraceful stop leaks its handles until
+ * the 24h TTL. Live-observed consequence: 12 simultaneously active rows for one
+ * wallet, whose only remaining effect was to keep `disconnectWallet` from
+ * dropping that wallet's in-memory keys (the shared-session guard counts them
+ * as live users) and to keep seed material at rest for a day after the process
+ * that authorised it died.
+ *
+ * Opt out with `NIGHTGATE_CLOSE_SESSIONS_ON_RESTART=false` or
+ * `config.closeSessionsOnRestart: false` when consumers hold session ids across
+ * restarts and expect them to keep working.
+ */
+export function isCloseSessionsOnRestartEnabled(config?: Record<string, any>): boolean {
+    const env = readEnv('NIGHTGATE_CLOSE_SESSIONS_ON_RESTART');
+    if (env != null) return !/^(false|0|no|off)$/i.test(env);
+    if (typeof config?.closeSessionsOnRestart === 'boolean') return config.closeSessionsOnRestart;
+    return true;
 }
 
 function readEnv(key: string): string | undefined {

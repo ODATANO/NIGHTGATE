@@ -170,6 +170,30 @@ Worker doesn't have a facade for the supplied session. Either:
 
 For (2): call `connectWalletForSigning` again with the same seed; the facade will rebuild from persisted blobs.
 
+From 0.13.0 the session id itself is also gone after a restart: startup closes the sessions the previous process left behind, since nobody holds their ids any more and each one kept seed material at rest for a day. Reconnect with `connectWallet` and then `connectWalletForSigning`, which is what a consumer does at boot anyway. Configured `NIGHTGATE_FEE_SPONSOR_SESSION` ids are exempt and keep working. Queued jobs that signed with one of the closed sessions are failed at the same time with `PROCESS_RESTART_SESSION_CLOSED` (their replay could no longer decrypt signing material); re-submit the action from the fresh session if it is still wanted. Opt out entirely with `NIGHTGATE_CLOSE_SESSIONS_ON_RESTART=false`.
+
+### A wallet takes forever to reach `CAUGHT UP`
+
+First establish whether it is slow or stuck, which used to be indistinguishable from outside:
+
+```bash
+curl "http://localhost:4004/api/v1/nightgate/getWalletSyncProgress(sessionId='...')"
+```
+
+`appliedIndex` climbing with `eventsPerSecond` above zero means it is working, just far behind; `etaSeconds` gives the order of magnitude. The same line is in the log at INFO (`genuine-sync [prewarm] ... rate=... eta=...`). An `appliedIndex` that does not move while `elapsedMs` grows, or `isConnected: false`, is a real stall: check the indexer as described below.
+
+If it is merely slow, count how many facades are syncing at once. **Every wallet facade lives in the same worker thread**, and catch-up is CPU-bound single-threaded work, so N concurrent catch-ups each run at roughly 1/N speed. Look for `facade started for ...` lines: one per facade the process has warmed.
+
+Before 0.13.0 the usual cause of unexpected extra facades was restart recovery replaying `connectWalletForSigning`, one per previous ungraceful stop. Those jobs are now dropped on restart (`PROCESS_RESTART_SESSION_JOB_DROPPED`). On an older build, or to clear rows left by one, stop the server and run:
+
+```sql
+UPDATE midnight_BackgroundJobs
+   SET status = 'failed', errorCode = 'MANUAL_DROP', finishedAt = datetime('now')
+ WHERE kind = 'connectWalletForSigning' AND status IN ('pending', 'running');
+```
+
+Leave `midnight_WalletSyncStates` alone: that is the expensive warm state, and deleting it forces a full resync.
+
 ### "Wallet.InsufficientFunds: could not balance dust"
 
 The wallet has less DUST than the operation's fee. Mostly hits on `deployContract` since contract deploys are dust-heavy.

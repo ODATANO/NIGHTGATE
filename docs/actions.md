@@ -388,6 +388,41 @@ Response:
 
 **Wallet still syncing:** the read waits at most `NIGHTGATE_WALLET_READ_SYNC_TIMEOUT_MS` (default 10 s) for the facade to reach the indexer tip, then answers `503` with error code `WALLET_SYNCING`. Treat it as retryable: poll again once the prewarm job reports ready. The same gate applies to the fee estimate below.
 
+### `getWalletSyncProgress(sessionId) → { known, caughtUp, appliedIndex, streamTip, behindEvents, eventsPerSecond, etaSeconds, blockHeight, isConnected, indexerFresh, elapsedMs, phase, updatedAt }`
+
+How far the wallet's catch-up has got and how fast it is moving. Poll this instead of guessing from elapsed time: a wallet that has been idle for a day needs a long catch-up, and without these numbers a slow sync and a hung one look identical.
+
+`appliedIndex`, `streamTip` and `behindEvents` count dust LEDGER EVENTS, not blocks, and are decimal strings (`bigint` precision). `etaSeconds` is derived from the current rate and moves around; treat it as an order of magnitude. `known` is `false` until the first sync wait has reported anything, e.g. while the facade is still being built.
+
+**Reading it:** slow but healthy is `appliedIndex` climbing with `eventsPerSecond` above zero. Genuinely stuck is `appliedIndex` unchanged across polls while `elapsedMs` grows, or `isConnected: false`. `indexerFresh: false` means the indexer itself is lagging, so its tip does not count as chain tip.
+
+Cheap and safe to poll during a sync: the answer comes from a snapshot the wallet worker pushes to the main thread about every 15s, so no request reaches the CPU-saturated worker. `updatedAt` says how fresh the snapshot is. The same numbers appear in the server log at INFO under `nightgate:worker` (`genuine-sync [prewarm] ... rate=... eta=...`).
+
+**Rate limit:** 60/min per client IP.
+
+```bash
+curl "http://localhost:4004/api/v1/nightgate/getWalletSyncProgress(sessionId='c07b1f0a-...')"
+```
+
+Response:
+```json
+{
+  "known": true,
+  "caughtUp": false,
+  "appliedIndex": "1241903",
+  "streamTip": "1262517",
+  "behindEvents": "20614",
+  "eventsPerSecond": 12.5,
+  "etaSeconds": 1649,
+  "blockHeight": "1951462",
+  "isConnected": true,
+  "indexerFresh": true,
+  "elapsedMs": 245000,
+  "phase": "prewarm",
+  "updatedAt": "2026-08-04T09:00:00.000Z"
+}
+```
+
 ### `estimateSendNightFee(sessionId, receiverAddress, amount, ttlIso?) → { fee, toLedger }`
 
 Pre-flight DUST fee for a `sendNight` call. Builds the recipe in the worker (lightweight; no ZK proof generation, no submit), discards it after fee calc. Useful to gate the user on whether dust balance is sufficient before triggering the actual send.

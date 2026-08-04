@@ -21,6 +21,7 @@ import {
     resolveOverrideIndexerEndpoints,
     resolveCrawlerlessChainConfirmEnabled,
     isCrawlerlessChainConfirmExplicitlyEnabled,
+    isCloseSessionsOnRestartEnabled,
     resolveSubmissionEndpoints,
     resolveEffectiveProvingMode,
     deriveIndexerWsUrl,
@@ -37,6 +38,7 @@ const ENV_KEYS = [
     'NIGHTGATE_CRAWLER_ENABLED',
     'NIGHTGATE_CRAWLERLESS_CHAIN_CONFIRM',
     'NIGHTGATE_ALLOW_SELF_SERVICE_GRANTEE_REGISTRATION',
+    'NIGHTGATE_CLOSE_SESSIONS_ON_RESTART',
     // Submission endpoints: a developer .env for live runs (or the IDE test
     // extension propagating it) would otherwise win over the config-based
     // expectations in these tests; same scrub wallet-sessions.test.ts does.
@@ -167,6 +169,26 @@ describe('isSelfServiceGranteeRegistrationAllowed', () => {
         }
         process.env.NIGHTGATE_ALLOW_SELF_SERVICE_GRANTEE_REGISTRATION = 'true';
         expect(isSelfServiceGranteeRegistrationAllowed({ allowSelfServiceGranteeRegistration: false })).toBe(true);
+    });
+});
+
+describe('isCloseSessionsOnRestartEnabled', () => {
+    it('defaults ON: leaked handles from a dead process are the common case', () => {
+        expect(isCloseSessionsOnRestartEnabled()).toBe(true);
+        expect(isCloseSessionsOnRestartEnabled({})).toBe(true);
+    });
+
+    it('config false opts out for consumers holding session ids across restarts', () => {
+        expect(isCloseSessionsOnRestartEnabled({ closeSessionsOnRestart: false })).toBe(false);
+    });
+
+    it('env var overrides config in both directions', () => {
+        for (const v of ['false', '0', 'no', 'off', 'FALSE']) {
+            process.env.NIGHTGATE_CLOSE_SESSIONS_ON_RESTART = v;
+            expect(isCloseSessionsOnRestartEnabled({ closeSessionsOnRestart: true })).toBe(false);
+        }
+        process.env.NIGHTGATE_CLOSE_SESSIONS_ON_RESTART = 'true';
+        expect(isCloseSessionsOnRestartEnabled({ closeSessionsOnRestart: false })).toBe(true);
     });
 });
 

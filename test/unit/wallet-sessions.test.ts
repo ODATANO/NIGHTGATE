@@ -9,6 +9,7 @@ const mockDbRun = vi.fn();
 const selectWhereSpy = vi.hoisted(() => (vi.fn()));
 const selectFromWhereSpy = vi.hoisted(() => (vi.fn()));
 const updateWhereSpy = vi.hoisted(() => (vi.fn()));
+const updateSetSpy = vi.hoisted(() => (vi.fn()));
 const insertEntriesSpy = vi.hoisted(() => (vi.fn()));
 
 vi.mock('@sap/cds', () => {
@@ -36,7 +37,7 @@ vi.mock('@sap/cds', () => {
             },
             UPDATE: {
                 entity: vi.fn().mockReturnValue({
-                    set: vi.fn().mockReturnValue({
+                    set: updateSetSpy.mockReturnValue({
                         where: updateWhereSpy
                     })
                 })
@@ -67,9 +68,11 @@ const mockGetWalletBalance = vi.hoisted(() => (vi.fn()));
 const mockEstimateSendNightFee = vi.hoisted(() => (vi.fn()));
 const mockEnsureNetworkId = vi.hoisted(() => (vi.fn()));
 const mockWalletWaitForSyncedState = vi.hoisted(() => (vi.fn()));
+const mockWalletGetSyncProgress = vi.hoisted(() => (vi.fn()));
 
 vi.mock('../../srv/midnight/wallet-worker-client', () => ({
-    walletWaitForSyncedState: mockWalletWaitForSyncedState
+    walletWaitForSyncedState: mockWalletWaitForSyncedState,
+    walletGetSyncProgress: mockWalletGetSyncProgress
 }));
 
 vi.mock('../../srv/submission/wallet-facade-builder', () => ({
@@ -130,7 +133,7 @@ vi.mock('../../srv/submission/background-jobs', () => ({
 import cds from '@sap/cds';
 import { encrypt, getEncryptionKey } from '../../srv/utils/crypto';
 import { RateLimiter } from '../../srv/utils/rate-limiter';
-import { registerWalletSessionHandlers, startSessionCleanup } from '../../srv/sessions/wallet-sessions';
+import { registerWalletSessionHandlers, startSessionCleanup, closeSessionsFromPreviousProcess } from '../../srv/sessions/wallet-sessions';
 
 async function runPersistedCommand(args: any): Promise<unknown> {
     const processor = registeredProcessors.get(args.kind);
@@ -232,6 +235,7 @@ describe('wallet session handlers', () => {
         mockDbRun.mockReset();
         selectWhereSpy.mockReset();
         updateWhereSpy.mockReset();
+        updateSetSpy.mockClear();
         insertEntriesSpy.mockReset();
         Object.keys(registeredHandlers).forEach(k => delete registeredHandlers[k]);
         (cds.env as any).requires = { nightgate: {} };
@@ -407,6 +411,67 @@ describe('wallet session handlers', () => {
 
         expect(updateWhereSpy).toHaveBeenCalledWith({ sessionId: 'public-session-2', userId: TEST_USER_ID });
         expect(req.reject).toHaveBeenCalledWith(410, 'Session expired');
+    });
+
+    // Boot hygiene: a session is a per-connect handle owned by a caller in a
+    // specific process, so an ungraceful stop leaks it for the full 24h TTL.
+    // Live-observed: 12 simultaneously active rows for one wallet.
+    describe('closeSessionsFromPreviousProcess', () => {
+        const previousSponsorEnv = process.env.NIGHTGATE_FEE_SPONSOR_SESSION;
+        afterEach(() => {
+            if (previousSponsorEnv == null) delete process.env.NIGHTGATE_FEE_SPONSOR_SESSION;
+            else process.env.NIGHTGATE_FEE_SPONSOR_SESSION = previousSponsorEnv;
+        });
+
+        it('closes every active session and clears its key material', async () => {
+            delete process.env.NIGHTGATE_FEE_SPONSOR_SESSION;
+            const db = {
+                run: vi.fn()
+                    .mockResolvedValueOnce([{ sessionId: 'a' }, { sessionId: 'b' }])
+                    .mockResolvedValueOnce(2)
+            };
+
+            expect(await closeSessionsFromPreviousProcess(db)).toEqual(['a', 'b']);
+            expect(updateSetSpy).toHaveBeenCalledWith(expect.objectContaining({
+                isActive: false,
+                encryptedViewingKey: null,
+                encryptedSeedKey: null
+            }));
+            expect(updateWhereSpy).toHaveBeenCalledWith({ sessionId: { in: ['a', 'b'] } });
+        });
+
+        // Their ids are pinned in the deployment config and usable by ANY
+        // caller, so they are deliberately process-independent. Closing one
+        // would break sponsored submissions until an operator pinned a new id.
+        it('exempts configured fee-sponsor sessions', async () => {
+            process.env.NIGHTGATE_FEE_SPONSOR_SESSION = 'sponsor-1';
+            const db = {
+                run: vi.fn()
+                    .mockResolvedValueOnce([{ sessionId: 'a' }, { sessionId: 'sponsor-1' }])
+                    .mockResolvedValueOnce(1)
+            };
+
+            expect(await closeSessionsFromPreviousProcess(db)).toEqual(['a']);
+            expect(updateWhereSpy).toHaveBeenCalledWith({ sessionId: { in: ['a'] } });
+        });
+
+        it('does not write when only exempt sessions are active', async () => {
+            process.env.NIGHTGATE_FEE_SPONSOR_SESSION = 'sponsor-1';
+            const db = { run: vi.fn().mockResolvedValueOnce([{ sessionId: 'sponsor-1' }]) };
+
+            expect(await closeSessionsFromPreviousProcess(db)).toEqual([]);
+            expect(db.run).toHaveBeenCalledTimes(1);
+        });
+
+        it('chunks the UPDATE so a large backlog stays within driver limits', async () => {
+            delete process.env.NIGHTGATE_FEE_SPONSOR_SESSION;
+            const many = Array.from({ length: 450 }, (_, i) => ({ sessionId: `s${i}` }));
+            const db = { run: vi.fn().mockResolvedValueOnce(many).mockResolvedValue(200) };
+
+            expect(await closeSessionsFromPreviousProcess(db)).toHaveLength(450);
+            // 1 SELECT + 3 UPDATEs (200 + 200 + 50).
+            expect(db.run).toHaveBeenCalledTimes(4);
+        });
     });
 
     it('startSessionCleanup is a no-op when nothing is expiring', async () => {
@@ -899,6 +964,37 @@ describe('wallet session handlers', () => {
             const req = createMockRequest({ sessionId: 's1' });
             const result = await registeredHandlers['getWalletBalance'](req);
             expect(result.shieldedNight).toBe('1');
+        });
+
+        it('getWalletSyncProgress reports the worker snapshot without calling the worker', async () => {
+            mockDbRun.mockResolvedValueOnce(activeSessionRow());
+            mockWalletGetSyncProgress.mockReturnValueOnce({
+                sessionId: 'acct-1', appliedIndex: '1200', streamTip: '1500',
+                behindEvents: '300', eventsPerSecond: 12.5, etaSeconds: 24,
+                blockHeight: '1951462', isConnected: true, indexerFresh: true,
+                caughtUp: false, elapsedMs: 45_000, label: 'prewarm',
+                updatedAt: '2026-08-04T09:00:00.000Z'
+            });
+            const req = createMockRequest({ sessionId: 's1' });
+            const result = await registeredHandlers['getWalletSyncProgress'](req);
+
+            expect(result).toMatchObject({
+                known: true, caughtUp: false, appliedIndex: '1200',
+                behindEvents: '300', eventsPerSecond: 12.5, etaSeconds: 24,
+                phase: 'prewarm'
+            });
+            expect(req.reject).not.toHaveBeenCalled();
+        });
+
+        it('getWalletSyncProgress reports known=false when no snapshot exists yet', async () => {
+            mockDbRun.mockResolvedValueOnce(activeSessionRow());
+            mockWalletGetSyncProgress.mockReturnValueOnce(null);
+            const req = createMockRequest({ sessionId: 's1' });
+            const result = await registeredHandlers['getWalletSyncProgress'](req);
+
+            expect(result.known).toBe(false);
+            expect(result.appliedIndex).toBeNull();
+            expect(req.reject).not.toHaveBeenCalled();
         });
 
         it('getWalletBalance maps inner errors to 500', async () => {

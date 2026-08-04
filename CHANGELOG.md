@@ -1,5 +1,60 @@
 # Changelog
 
+## 0.13.0 - 2026-08-04
+
+Minor rather than patch: session ids no longer survive a process restart by
+default (details below).
+
+### Behaviour change: a restart closes the previous process's wallet sessions
+
+`connectWallet` inserts a row per call and only `disconnectWallet` closes one,
+so every ungraceful stop leaked its handles for the full 24h TTL (observed: 12
+simultaneously active rows for one wallet). Those leftovers kept a wallet's
+in-memory keys alive past a legitimate `disconnectWallet` (the shared-session
+guard counted them as live users) and kept encrypted seed material at rest for
+a day after the owning process died.
+
+Plugin init now closes them and clears the same key columns `disconnectWallet`
+clears. Configured fee-sponsor sessions are exempt (pinned ids, deliberately
+long-lived); this is safe because `runtimeMode` already enforces a single
+replica. Opt out with `NIGHTGATE_CLOSE_SESSIONS_ON_RESTART=false` or
+`cds.requires.nightgate.closeSessionsOnRestart: false`.
+
+Queued jobs that signed with a closed session are failed in the same startup
+step with `PROCESS_RESTART_SESSION_CLOSED`: their replay reloads signing
+material from the session row the cleanup just cleared, so claiming them could
+only die later with a misleading "Session not found". Jobs of exempt sessions,
+and all jobs when the cleanup is opted out, replay as before.
+
+### Fix: restart recovery no longer replays prewarm jobs
+
+Recovery re-queued every interrupted `connectWalletForSigning`, warming wallets
+nobody had asked for; each crash left one more behind, and since all facades
+share the ONE worker thread, the unrequested catch-ups starved the wallet the
+host actually wanted (live: not synced after 80 minutes with two unrequested
+facades alongside). These jobs are now terminal on restart
+(`PROCESS_RESTART_SESSION_JOB_DROPPED`); their only product was in-process
+state for a caller that did not survive.
+
+### Fix: wallet prewarms run one at a time
+
+Prewarms were a "light" job kind (cap 16), but catch-up is CPU-bound
+single-threaded work in that one worker thread: N concurrent prewarms each ran
+at roughly 1/N speed and the first wallet became usable last.
+`connectWalletForSigning` is now capped at one concurrent job
+(`jobs.concurrency.serial`, default 1). Total time to warm N wallets is
+unchanged; time to the FIRST usable wallet drops by about a factor of N. A job
+waiting on the cap stays `pending` and holds no lease.
+
+### Feature: catch-up progress is visible
+
+Between "facade started" and "CAUGHT UP" nothing was logged above debug level,
+so a slow sync and a hung one looked identical from outside. The sync wait now
+logs INFO every 15s (applied index, stream tip, events behind, current rate,
+ETA), and the new OData function `getWalletSyncProgress(sessionId)` returns the
+same numbers. It reads a snapshot the worker pushes to the main thread instead
+of issuing an RPC, so it stays responsive exactly when the worker is saturated.
+
 ## 0.12.1 - 2026-08-03
 
 ### Feature: wallet-delegated proving modality in `@odatano/nightgate/browser`

@@ -10,14 +10,16 @@ import {
     resolveEffectiveProvingMode,
     VALID_NIGHTGATE_NETWORKS,
     getNightgatePluginConfig,
+    isCloseSessionsOnRestartEnabled,
     DEFAULT_NETWORK
 } from '../srv/utils/nightgate-config';
 import { loadRegistryFromConfig, listRegisteredContracts } from '../srv/submission/contract-registry';
+import { closeSessionsFromPreviousProcess } from '../srv/sessions/wallet-sessions';
 const log = cds.log('nightgate');
 import { startWalletWorker, stopWalletWorker } from '../srv/midnight/wallet-worker-client';
 import { wireWorkerStateSaveSink } from '../srv/submission/wallet-facade-builder';
 import { clearAllEncryptionKeys } from '../srv/submission/wallet-sync-state-store';
-import { recoverInterruptedJobs, startBackgroundJobProcessor, stopBackgroundJobProcessor, registerChainOutcomeConfirmer } from '../srv/submission/background-jobs';
+import { recoverInterruptedJobs, dropPendingJobsForClosedSessions, startBackgroundJobProcessor, stopBackgroundJobProcessor, registerChainOutcomeConfirmer } from '../srv/submission/background-jobs';
 import { buildIndexerTxConfirmer } from '../srv/submission/chain-outcome-confirmer';
 import { TransactionResults } from '#cds-models/midnight';
 import {
@@ -230,6 +232,32 @@ export async function initialize(): Promise<NightgateIndexerStatus> {
     } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         log.warn(`Background-job recovery skipped: ${msg}`);
+    }
+
+    // Sessions are per-connect handles owned by a caller in a specific process;
+    // an ungraceful stop leaks them for the full TTL. Close them here so a
+    // later `disconnectWallet` can actually drop the wallet's keys, and so no
+    // seed material outlives the process that authorised it. Configured
+    // fee-sponsor sessions are exempt (pinned ids, deliberately long-lived).
+    if (isCloseSessionsOnRestartEnabled(nightgateConfig)) {
+        try {
+            const db = await cds.connect.to('db');
+            const closed = await closeSessionsFromPreviousProcess(db, nightgateConfig);
+            if (closed.length > 0) {
+                log.info(`Closed ${closed.length} wallet session(s) left by the previous process; callers reconnect with connectWallet`);
+                // The recovery above re-queued pre-effect jobs; the ones that
+                // sign with a session closed just now can only fail (their key
+                // material is gone). Fail them here with a restart-shaped code,
+                // BEFORE the job poller starts.
+                const dropped = await dropPendingJobsForClosedSessions(closed);
+                if (dropped > 0) {
+                    log.info(`Dropped ${dropped} queued job(s) whose signing session was closed on restart (PROCESS_RESTART_SESSION_CLOSED)`);
+                }
+            }
+        } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            log.warn(`Wallet-session restart cleanup skipped: ${msg}`);
+        }
     }
 
 

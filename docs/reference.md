@@ -77,6 +77,10 @@ Sufficient for read-side. `network` is the only required key — without it the 
 | `privateStateBackend` | `cap-db` | `cap-db` (default, production-grade encrypted CAP-DB tables) or `level` (legacy SDK LevelDB, **dev-only**, blocked on worker-routed submissions) |
 | `contracts` | `{}` | Map of `<ref>` → `{ artifactPath, privateStateId, zkConfigPath }`, loaded into the in-memory registry on plugin startup |
 | `sessionTtlMs` | `86400000` (24 h) | Wallet session lifetime |
+| `closeSessionsOnRestart` | `true` | Close the wallet sessions the previous process left behind at startup. Configured `feeSponsorSessions` are exempt. `false` keeps them, for consumers that hold session ids across restarts |
+| `jobs.concurrency.heavy` | `4` | Concurrent jobs per proof-generating kind (deploy, call, send, attestations). 4 saturates one proof server |
+| `jobs.concurrency.light` | `16` | Concurrent jobs per remaining kind |
+| `jobs.concurrency.serial` | `1` | Concurrent jobs for `connectWalletForSigning`. Wallet catch-up is CPU-bound work in a single shared worker thread, so parallel prewarms all crawl instead of the first one finishing; serialized, each wallet becomes usable after its own catch-up. Raise only if you would rather have every wallet warm late than one warm early |
 | `runtimeMode` | `single-instance` | Current safety contract. Other modes fail closed. |
 | `replicaCount` | `1` | Declared process/replica count. Values above 1 fail closed until distributed crawler/job leases exist. |
 | `allowProductionSqlite` | `false` | Emergency-only escape hatch. Production startup with SQLite otherwise fails closed. |
@@ -129,7 +133,8 @@ Sufficient for read-side. `network` is the only required key — without it the 
 | `NIGHTGATE_SYNC_FRESHNESS_MS` | Max age of the indexer's latest block for the sync gate to accept it as "fresh"; default `300000` (5 min) |
 | `NIGHTGATE_DUST_COLD_START` | Set `true` to ignore the persisted dust state blob and rebuild the dust sub-wallet from chain (escape hatch for pruned merkle roots / error 117) |
 | `NIGHTGATE_SPONSORED_CALLER_SYNC` | Set `skip` to skip the caller-facade sync wait in sponsored contract calls (advanced; default is to wait) |
-| `NIGHTGATE_FEE_SPONSOR_SESSION` | Operator-designated sponsor sessionId allowed to pay fees across users (security-relevant; unset = same-user sponsoring only) |
+| `NIGHTGATE_FEE_SPONSOR_SESSION` | Operator-designated sponsor sessionId allowed to pay fees across users (security-relevant; unset = same-user sponsoring only). Exempt from the restart cleanup below, so a pinned id survives restarts |
+| `NIGHTGATE_CLOSE_SESSIONS_ON_RESTART` | Close the wallet sessions left by the previous process at startup; default `true` (`false` / `0` / `no` / `off` opts out). Sessions are per-connect handles owned by a caller in a process, so an ungraceful stop otherwise leaks them for the full TTL. Set `false` only if consumers hold session ids across restarts and expect them to keep working |
 | `NIGHTGATE_SIGNING_KEY_RATE_LIMIT` | Max `connectWalletForSigning` requests per client per hour; default `10` |
 | `NIGHTGATE_ZK_CONFIG_PUBLIC_URL` | Public base URL advertised by `/contract-manifest` for the `/zk-config/...` routes (behind a reverse proxy); default = request host |
 | `SKIP_AUTO_INIT` | Set `true` **only in tests** to skip the plugin's `initialize()` (crawler + wallet worker). Must NOT be set in production. |
@@ -290,8 +295,11 @@ SDK call that currently combines proof generation, balancing and broadcast.
 process restart is deliberately fail-safe rather than an automatic blockchain
 retry:
 
-- `pending` or pre-effect `running` becomes `failed /
-  PROCESS_RESTART_BEFORE_EXECUTION`;
+- legacy `pending` or pre-effect `running` rows without a persisted command
+  become `failed / PROCESS_RESTART_BEFORE_EXECUTION`; versioned commands
+  return to the queue, unless the session they sign with was closed by the
+  restart cleanup (`failed / PROCESS_RESTART_SESSION_CLOSED`, see the
+  wallet-session section);
 - `external_execution` or `submitted` becomes `reconciliation_required /
   PROCESS_RESTART_RECONCILE`;
 - a job in `reconciliation_required` must be checked against
@@ -362,8 +370,13 @@ dust jobs use versioned persisted commands. Their command
 payload contains no seed material: the processor reloads encrypted signing
 material from the user-owned `WalletSessions` row, verifies `requestedBy`, and
 rebuilds the wallet facade. After a restart, a replayable job interrupted in
-pre-effect `running` is returned to `pending` and claimed again. External-effect
-states are never replayed.
+pre-effect `running` is returned to `pending`, but it is claimed again only if
+its session survived the restart: by default startup closes the previous
+process's sessions (0.13.0), so jobs that signed with one of them are failed up
+front with `PROCESS_RESTART_SESSION_CLOSED` instead of dying later on a
+missing session. Jobs signed by exempt fee-sponsor sessions, and all jobs when
+`closeSessionsOnRestart: false`, replay as before. External-effect states are
+never replayed.
 
 Contract deploy and generic contract-call jobs also use versioned commands.
 Their complete circuit arguments and initial private state are stored only as
@@ -515,7 +528,7 @@ New enums in `db/types.cds`:
 | Contract deploy / call | ✅ Worker-thread routed (Phase 2b), pending-row tracked, crawler-reconciled |
 | Token ops (transfer) | ✅ `sendNight` via worker (NIGHT is unshielded-only; no shield/unshield conversion exists) |
 | Dust generation | ✅ `registerForDustGeneration` + `deregisterFromDustGeneration` |
-| Diagnostics (balance, fee estimates) | ✅ `getWalletBalance`, `estimateSendNightFee` |
+| Diagnostics (balance, fee estimates) | ✅ `getWalletBalance`, `estimateSendNightFee`, `getWalletSyncProgress` (catch-up rate + ETA, 0.13.0) |
 | Local Midnight indexer (docker) | ✅ Optional `midnightntwrk/indexer-standalone:4.3.2` service |
 | Wallet state persistence | ✅ `WalletSyncStates` — restart resumes in seconds, not hours |
 | Worker-thread architecture | ✅ Wallet SDK isolated from main thread (Phase 1+2a+2b) |

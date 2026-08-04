@@ -51,6 +51,36 @@ export type StateSaveSink = (event: {
     blobs: SerializedBlobs;
 }) => void | Promise<void>;
 
+/**
+ * A catch-up progress snapshot as the worker reports it. Mirrors
+ * `SyncProgressSnapshot` in wallet-worker.ts; declared here rather than
+ * imported so the main thread does not pull in the worker module (which loads
+ * the ESM SDK on import).
+ */
+export interface WalletSyncProgress {
+    sessionId: string;
+    /** Ledger events applied by the dust sub-wallet. Decimal string (bigint). */
+    appliedIndex: string;
+    /** Tip of the dust ledger-event stream. Decimal string; '-1' if unknown. */
+    streamTip: string;
+    behindEvents: string | null;
+    eventsPerSecond: number | null;
+    etaSeconds: number | null;
+    blockHeight: string | null;
+    isConnected: boolean;
+    indexerFresh: boolean;
+    caughtUp: boolean;
+    elapsedMs: number;
+    label: string;
+    updatedAt: string;
+}
+
+// Latest pushed snapshot per facade. Module scope (not ClientState) because
+// its lifecycle is per-facade, not per-worker-start: entries are replaced by
+// the next push, dropped on evict, and cleared wholesale on worker exit (no
+// facade survives one).
+const syncProgressCache = new Map<string, WalletSyncProgress>();
+
 interface ClientState {
     worker: Worker;
     readyPromise: Promise<void>;
@@ -167,6 +197,10 @@ export async function startWalletWorker(): Promise<void> {
                     : msg.level === 'debug' ? 'debug'
                         : 'info';
             (cds.log('nightgate:worker') as any)[level](msg.message);
+        } else if (msg?.kind === 'sync-progress') {
+            if (msg.sessionId && msg.snapshot) {
+                syncProgressCache.set(msg.sessionId, msg.snapshot as WalletSyncProgress);
+            }
         } else if (msg?.kind === 'private-state-rpc') {
             dispatchPrivateStateRpc(msg);
         }
@@ -179,6 +213,9 @@ export async function startWalletWorker(): Promise<void> {
     worker.on('exit', code => {
         log.warn(`worker exited code=${code}`);
         client = null;
+        // No facade survived the exit, so no snapshot describes anything that
+        // is still running. Keeping them would report phantom catch-ups.
+        syncProgressCache.clear();
         // Fail every in-flight call now; their reply ports are dead and would
         // otherwise never settle. The next rpc() lazily respawns the worker.
         rejectAllPendingRpcs(`wallet-worker exited (code=${code}) with in-flight calls`);
@@ -381,8 +418,28 @@ export function walletWaitForSyncedState(sessionId: string, timeoutMs?: number):
     return rpc('waitForSyncedState', { sessionId, timeoutMs }, workerBudgetMs + 5 * 60 * 1000);
 }
 
-export function walletEvict(sessionId: string): Promise<{ evicted: boolean }> {
-    return rpc('evict', { sessionId });
+export async function walletEvict(sessionId: string): Promise<{ evicted: boolean }> {
+    try {
+        return await rpc('evict', { sessionId });
+    } finally {
+        // The facade is gone either way; a surviving snapshot would report a
+        // catch-up that nothing is running any more.
+        syncProgressCache.delete(sessionId);
+    }
+}
+
+/**
+ * Last catch-up progress the worker reported for a facade, or null when it has
+ * never reported one (no sync wait ran yet, or the worker restarted).
+ *
+ * Synchronous main-thread cache read, deliberately: the worker pushes these
+ * snapshots because it is CPU-saturated during exactly the catch-up a caller
+ * wants to observe, so asking it would be slow or time out. `updatedAt` says
+ * how fresh the answer is; a snapshot that stops advancing while `elapsedMs`
+ * grows is the signature of a genuine stall.
+ */
+export function walletGetSyncProgress(sessionId: string): WalletSyncProgress | null {
+    return syncProgressCache.get(sessionId) ?? null;
 }
 
 /**

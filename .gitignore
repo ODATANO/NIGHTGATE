@@ -58,6 +58,7 @@ AGENTS.md
 # Internal planning / feature-request docs — kept local only
 db/enhancements.md
 docs/feature-requests/
+scripts/probe-dust-sync-rate.mjs
 docs/release-*.md
 docs/code-review-*.md
 docs/cap10-upgrade-assessment.md

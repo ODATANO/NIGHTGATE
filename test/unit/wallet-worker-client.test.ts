@@ -84,6 +84,7 @@ import {
     walletDeployContract,
     walletSubmitContractCall,
     walletWaitForSyncedState,
+    walletGetSyncProgress,
     __resetWalletWorkerForTests
 } from '../../srv/midnight/wallet-worker-client';
 
@@ -259,6 +260,54 @@ describe('wallet-worker-client', () => {
             await new Promise(r => setImmediate(r));
             expect(sink).toHaveBeenCalled();
             expect(pmSpy).not.toHaveBeenCalledWith(expect.objectContaining({ kind: 'state-save-ack', seq: 8 }));
+        });
+
+        it('caches pushed sync-progress snapshots for synchronous reads', async () => {
+            await startWalletWorker();
+            const w = latestWorker!;
+            const snapshot = {
+                sessionId: 'acct-1', appliedIndex: '1200', streamTip: '1500',
+                behindEvents: '300', eventsPerSecond: 12.5, etaSeconds: 24,
+                blockHeight: '1951462', isConnected: true, indexerFresh: true,
+                caughtUp: false, elapsedMs: 45_000, label: 'prewarm',
+                updatedAt: '2026-08-04T09:00:00.000Z'
+            };
+
+            expect(walletGetSyncProgress('acct-1')).toBeNull();
+            w.emit('message', { kind: 'sync-progress', sessionId: 'acct-1', snapshot });
+            // No await: the whole point is that a saturated worker is not asked.
+            expect(walletGetSyncProgress('acct-1')).toEqual(snapshot);
+
+            w.emit('message', {
+                kind: 'sync-progress', sessionId: 'acct-1',
+                snapshot: { ...snapshot, appliedIndex: '1490', behindEvents: '10' }
+            });
+            expect(walletGetSyncProgress('acct-1')!.appliedIndex).toBe('1490');
+        });
+
+        it('drops the cached snapshot when the facade is evicted', async () => {
+            const w = await startWithResponder(() => ({ ok: true, result: { evicted: true } }));
+            w.emit('message', {
+                kind: 'sync-progress', sessionId: 'acct-2',
+                snapshot: { sessionId: 'acct-2', appliedIndex: '5', caughtUp: true }
+            });
+            expect(walletGetSyncProgress('acct-2')).not.toBeNull();
+
+            await walletEvict('acct-2');
+            expect(walletGetSyncProgress('acct-2')).toBeNull();
+        });
+
+        it('clears every snapshot when the worker exits', async () => {
+            await startWalletWorker();
+            const w = latestWorker!;
+            w.emit('message', {
+                kind: 'sync-progress', sessionId: 'acct-3',
+                snapshot: { sessionId: 'acct-3', appliedIndex: '9', caughtUp: false }
+            });
+            expect(walletGetSyncProgress('acct-3')).not.toBeNull();
+
+            w.emit('exit', 1);
+            expect(walletGetSyncProgress('acct-3')).toBeNull();
         });
 
         it('relays "log" messages through the nightgate:worker CAP channel by level', async () => {

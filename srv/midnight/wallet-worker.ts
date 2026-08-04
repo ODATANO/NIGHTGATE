@@ -66,6 +66,8 @@ export interface InitArgs {
 }
 
 interface FacadeEntry {
+    /** The `facades` map key this entry is stored under (the caller's accountId). */
+    sessionId: string;
     facade: any;
     sdkVersion: string;
     zswapKeys: any;
@@ -388,7 +390,62 @@ const SYNC_TIP_GAP = BigInt(process.env.NIGHTGATE_SYNC_TIP_GAP || '8');
 // roots have pruned out of the node's root_history (Custom error 117).
 const SYNC_FRESHNESS_MS = Number(process.env.NIGHTGATE_SYNC_FRESHNESS_MS || 300_000);
 const SYNC_POLL_MS = 3000;
+// How often the catch-up loop reports progress (log line + snapshot refresh).
+const SYNC_PROGRESS_LOG_MS = 15_000;
+// Rate is measured against an anchor no older than this, so a long catch-up
+// reports its CURRENT throughput rather than an average diluted by the start.
+const SYNC_RATE_WINDOW_MS = 60_000;
 const wsleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
+
+/**
+ * Last observed catch-up progress for one facade, refreshed by
+ * `waitForGenuineSync` on every poll and PUSHED to the main thread (which caches
+ * it) at the progress-log cadence.
+ *
+ * This exists because a catch-up used to be completely opaque: between "facade
+ * started" and "CAUGHT UP" the worker emitted nothing above debug level, so a
+ * stalled sync and a working one were indistinguishable from outside and the
+ * only way to tell them apart was sampling the OS process CPU counter.
+ *
+ * Push, not an RPC the main thread issues: a catch-up is CPU-bound work on THIS
+ * single thread, so a request/response round trip would be answered slowly or
+ * time out exactly in the situation the numbers are wanted for. Pushing means
+ * the main thread always has an answer, timestamped so a reader can tell how
+ * stale it is. Numbers are decimal strings: appliedIndex and streamTip are
+ * ledger-event ids (bigint) and must not lose precision crossing the thread
+ * boundary or OData.
+ */
+export interface SyncProgressSnapshot {
+    /** The facade key this snapshot belongs to (the caller's accountId). */
+    sessionId: string;
+    /** Ledger events applied by the dust sub-wallet so far. '-1' when unknown. */
+    appliedIndex: string;
+    /** Current tip of the dust ledger-event stream. '-1' when the probe failed. */
+    streamTip: string;
+    /** streamTip - appliedIndex, or null when either side is unknown. */
+    behindEvents: string | null;
+    /** Applied events per second over the last ~minute; null until measurable. */
+    eventsPerSecond: number | null;
+    /** Seconds to reach the tip at the current rate; null when not derivable. */
+    etaSeconds: number | null;
+    /** Indexer block height, for correlating with the chain. */
+    blockHeight: string | null;
+    isConnected: boolean;
+    /** The indexer's latest block is recent enough to count as tip. */
+    indexerFresh: boolean;
+    caughtUp: boolean;
+    /** Milliseconds this wait has been running. */
+    elapsedMs: number;
+    /** The wait that produced this snapshot ('prewarm', 'balance', ...). */
+    label: string;
+    updatedAt: string;
+}
+
+const syncProgress = new Map<string, SyncProgressSnapshot>();
+
+function pushSyncProgress(snapshot: SyncProgressSnapshot): void {
+    parentPort?.postMessage({ kind: 'sync-progress', sessionId: snapshot.sessionId, snapshot });
+}
 
 /** The indexer's latest indexed block (height + timestamp, ms epoch). */
 async function getIndexerTip(indexerHttpUrl: string): Promise<{ height: bigint | null; timestampMs: number | null }> {
@@ -491,12 +548,63 @@ async function getDustStreamTip(indexerHttpUrl: string): Promise<bigint | null> 
  *      roots pruned out of the node's ~1h root_history (Custom error 117).
  *
  * `waitForSyncedState()` is still not trusted; we read the numbers.
+ *
+ * Every poll refreshes `syncProgress[entry.sessionId]` and, every
+ * SYNC_PROGRESS_LOG_MS, emits an INFO line. Both carry the applied index, the
+ * stream tip, the current rate and an ETA, so a slow catch-up is legible from
+ * the log and from `getSyncProgress` instead of looking identical to a hang.
  */
-async function waitForGenuineSync(facade: any, indexerHttpUrl: string, timeoutMs: number, label: string): Promise<void> {
-    const deadline = Date.now() + timeoutMs;
+async function waitForGenuineSync(entry: FacadeEntry, timeoutMs: number, label: string): Promise<void> {
+    const { facade, indexerHttpUrl, sessionId } = entry;
+    const startedAt = Date.now();
+    const deadline = startedAt + timeoutMs;
     let lastLog = 0;
     let lastApplied = -1n;
     let lastHighest = -1n;
+    // Sliding anchor for the rate: refreshed once it ages past the window, so
+    // the reported throughput tracks the present, not the whole wait.
+    let anchor: { applied: bigint; at: number } | null = null;
+
+    const publish = (
+        applied: bigint, highest: bigint, blockHeight: bigint | null,
+        connected: boolean, fresh: boolean, caughtUp: boolean
+    ): SyncProgressSnapshot => {
+        const now = Date.now();
+        let eventsPerSecond: number | null = null;
+        if (applied >= 0n) {
+            if (!anchor) {
+                anchor = { applied, at: now };
+            } else if (now - anchor.at >= SYNC_POLL_MS) {
+                const seconds = (now - anchor.at) / 1000;
+                const delta = Number(applied - anchor.applied);
+                // A restored facade can report a LOWER index right after start;
+                // a negative rate is noise, not information.
+                if (delta >= 0) eventsPerSecond = delta / seconds;
+                if (now - anchor.at >= SYNC_RATE_WINDOW_MS) anchor = { applied, at: now };
+            }
+        }
+        const behind = highest >= 0n && applied >= 0n ? highest - applied : null;
+        const snapshot: SyncProgressSnapshot = {
+            sessionId,
+            appliedIndex: applied.toString(),
+            streamTip: highest.toString(),
+            behindEvents: behind != null ? behind.toString() : null,
+            eventsPerSecond,
+            etaSeconds: behind != null && behind > 0n && eventsPerSecond != null && eventsPerSecond > 0
+                ? Math.round(Number(behind) / eventsPerSecond)
+                : (behind === 0n ? 0 : null),
+            blockHeight: blockHeight != null ? blockHeight.toString() : null,
+            isConnected: connected,
+            indexerFresh: fresh,
+            caughtUp,
+            elapsedMs: now - startedAt,
+            label,
+            updatedAt: new Date(now).toISOString()
+        };
+        syncProgress.set(sessionId, snapshot);
+        return snapshot;
+    };
+
     while (Date.now() < deadline) {
         const tip = await getIndexerTip(indexerHttpUrl);
         // Read state via the NON-BLOCKING facade.state() observable.
@@ -536,20 +644,32 @@ async function waitForGenuineSync(facade: any, indexerHttpUrl: string, timeoutMs
         const fresh = tip.timestampMs != null && Date.now() - tip.timestampMs <= SYNC_FRESHNESS_MS;
         lastApplied = applied;
         lastHighest = highest;
-        if (connected && highest > 0n && applied >= 0n && applied >= highest - SYNC_TIP_GAP && fresh) {
-            log('info', `genuine-sync [${label}] CAUGHT UP: appliedIndex=${applied} streamTip=${highest} blockHeight=${tip.height} fresh=${fresh}`);
+        const caughtUp = connected && highest > 0n && applied >= 0n && applied >= highest - SYNC_TIP_GAP && fresh;
+        const snapshot = publish(applied, highest, tip.height, connected, fresh, caughtUp);
+        if (caughtUp) {
+            pushSyncProgress(snapshot);
+            log('info', `genuine-sync [${label}] CAUGHT UP: appliedIndex=${applied} streamTip=${highest} blockHeight=${tip.height} fresh=${fresh} after=${Math.round(snapshot.elapsedMs / 1000)}s`);
             return;
         }
-        if (Date.now() - lastLog > 15_000) {
-            const behind = highest >= 0n && applied >= 0n ? (highest - applied).toString() : '?';
-            log('debug', `genuine-sync [${label}] appliedIndex=${applied} streamTip=${highest} behindEvents=${behind} blockHeight=${tip.height} fresh=${fresh} connected=${connected}`);
+        // INFO, not debug: without this line a multi-hour catch-up is
+        // indistinguishable from a hang for anyone outside this thread. The
+        // push shares the cadence so the readable snapshot and the log agree.
+        if (Date.now() - lastLog > SYNC_PROGRESS_LOG_MS) {
+            pushSyncProgress(snapshot);
+            const rate = snapshot.eventsPerSecond != null ? snapshot.eventsPerSecond.toFixed(1) : '?';
+            const eta = snapshot.etaSeconds != null ? `${Math.round(snapshot.etaSeconds / 60)}min` : '?';
+            log('info', `genuine-sync [${label}] ${sessionId.slice(0, 16)} appliedIndex=${applied} streamTip=${highest} behindEvents=${snapshot.behindEvents ?? '?'} rate=${rate}/s eta=${eta} elapsed=${Math.round(snapshot.elapsedMs / 1000)}s blockHeight=${tip.height} fresh=${fresh} connected=${connected}`);
             lastLog = Date.now();
         }
         await wsleep(SYNC_POLL_MS);
     }
     const tip = await getIndexerTip(indexerHttpUrl);
     const behind = lastHighest >= 0n && lastApplied >= 0n ? (lastHighest - lastApplied).toString() : '?';
-    throw new Error(`wallet not synced to tip after ${timeoutMs}ms: dust appliedIndex=${lastApplied} streamTip=${lastHighest} (${behind} events behind, blockHeight=${tip.height}, isConnected/freshness check failed or stalled)`);
+    // The last snapshot stays in `syncProgress` on purpose: a caller that saw
+    // the timeout can still read how far the wallet got and how fast it was
+    // moving, which is what separates "too slow" from "stalled".
+    const rate = syncProgress.get(sessionId)?.eventsPerSecond;
+    throw new Error(`wallet not synced to tip after ${timeoutMs}ms: dust appliedIndex=${lastApplied} streamTip=${lastHighest} (${behind} events behind at ${rate != null ? rate.toFixed(1) : '?'} events/s, blockHeight=${tip.height}, isConnected/freshness check failed or stalled)`);
 }
 
 /**
@@ -642,7 +762,7 @@ export function buildWorkerWalletProvider(entry: FacadeEntry): any {
             // roots). The prewarm job usually caught up already, so this is a
             // cheap re-check on the warm path; waitForGenuineSync is bounded so a
             // stalled indexer subscription fails fast instead of hanging.
-            await waitForGenuineSync(entry.facade, entry.indexerHttpUrl, BALANCE_SYNC_TIMEOUT_MS, 'balance');
+            await waitForGenuineSync(entry, BALANCE_SYNC_TIMEOUT_MS, 'balance');
             const effectiveTtl = ttl ?? new Date(Date.now() + 60 * 60 * 1000);
             const recipe = await entry.facade.balanceUnboundTransaction(
                 tx,
@@ -731,9 +851,9 @@ export function buildSponsoredWalletProvider(caller: FacadeEntry, sponsor: Facad
             if (process.env.NIGHTGATE_SPONSORED_CALLER_SYNC === 'skip') {
                 log('info', 'sponsored-balance: caller sync SKIPPED (NIGHTGATE_SPONSORED_CALLER_SYNC=skip)');
             } else {
-                await waitForGenuineSync(caller.facade, caller.indexerHttpUrl, BALANCE_SYNC_TIMEOUT_MS, 'sponsored-balance caller');
+                await waitForGenuineSync(caller, BALANCE_SYNC_TIMEOUT_MS, 'sponsored-balance caller');
             }
-            await waitForGenuineSync(sponsor.facade, sponsor.indexerHttpUrl, BALANCE_SYNC_TIMEOUT_MS, 'sponsored-balance sponsor');
+            await waitForGenuineSync(sponsor, BALANCE_SYNC_TIMEOUT_MS, 'sponsored-balance sponsor');
             const effectiveTtl = ttl ?? new Date(Date.now() + 30 * 60 * 1000);
 
             const recipe = await caller.facade.balanceUnboundTransaction(
@@ -1066,6 +1186,7 @@ async function buildFacade(args: InitArgs): Promise<FacadeEntry> {
     log('info', `facade started for ${args.sessionId.slice(0, 16)} (restored=${!!restore})`);
 
     return {
+        sessionId: args.sessionId,
         facade,
         sdkVersion: getSdkVersion(),
         zswapKeys,
@@ -1281,7 +1402,7 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
         // flag, which is trivially true when highestIndex=0). This is the
         // prewarm path → use a long budget so a far-behind wallet can actually
         // reach the tip before any submission balances dust.
-        await waitForGenuineSync(entry.facade, entry.indexerHttpUrl, timeoutMs ?? 3 * 60 * 60 * 1000, 'prewarm');
+        await waitForGenuineSync(entry, timeoutMs ?? 3 * 60 * 60 * 1000, 'prewarm');
         return { synced: true };
     },
 
@@ -1290,6 +1411,7 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
         if (!entry) return { evicted: false };
         // Remove from the map first so no NEW submit can resolve this facade.
         facades.delete(sessionId);
+        syncProgress.delete(sessionId);
         if (entry.saveTimer) clearInterval(entry.saveTimer);
         // Teardown (final save + zeroing secrets + stopping the facade) runs under
         // the per-session submit lock so it can't yank key material from a submit
@@ -1489,7 +1611,7 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
         const payer = sponsorEntry ?? entry;
         if (sponsorEntry) {
             log('info', `dust-deregister: fee sponsored by ${sponsorEntry === entry ? 'self' : String(sponsorSessionId).slice(0, 16)}`);
-            await waitForGenuineSync(sponsorEntry.facade, sponsorEntry.indexerHttpUrl, BALANCE_SYNC_TIMEOUT_MS, 'deregister sponsor');
+            await waitForGenuineSync(sponsorEntry, BALANCE_SYNC_TIMEOUT_MS, 'deregister sponsor');
         }
         const balanced = await payer.facade.balanceUnprovenTransaction(
             recipe.transaction,
