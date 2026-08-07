@@ -1,5 +1,96 @@
 # Changelog
 
+## 0.14.0 - 2026-08-07
+
+Live-proven end-to-end on preprod (`npm run agent-layer:e2e`): grant-token
+lane incl. 403 negatives, agent-anchored document, content root + 2 field
+predicates in one tx (`d9ce36dc…`), crawler-free per-claim verification,
+provenance envelope anchored and third-party verified, budget 429,
+post-revoke 401.
+
+### Agent grants: scoped bearer capabilities for AI agents
+
+New `AgentGrants` surface so an operator can hand an autonomous agent a
+restricted capability over one wallet session instead of the session itself:
+
+- `createAgentGrant(sessionId, allowedActions, maxJobsPerDay?, sponsorSessionId?, validUntil?, agentLabel?)`
+  returns an opaque bearer token ONCE; only its SHA-256 is stored (same
+  discipline as `viewingKeyHash`). `revokeAgentGrant(grantId)` kills it
+  immediately; the owner-scoped read-only `AgentGrants` entity never exposes
+  the hash.
+- A request carrying the token in the `x-agent-token` header runs as the
+  grant's operator (the effective `req.user`, so every existing `userId`
+  gate applies unchanged) but is restricted by a `before('*')` enforcement
+  hook: the read-only verify surface and `getJobStatus` are always
+  available; write actions only when allow-listed. READs of session-scoped
+  entities are additionally narrowed to the grant (WalletSessions and
+  PendingSubmissions to the grant's session, AgentGrants to the grant
+  itself), so a one-session agent cannot enumerate its operator's other
+  sessions or grants; chain-derived entities stay readable. Grantable actions are
+  the attestation/predicate/disclosure set; wallet lifecycle, sends,
+  deploys, passport/identity registration and grant administration are
+  never grantable (403).
+- Requests are pinned to the grant's `sessionId` and, when set, its
+  `sponsorSessionId` (mismatch 403, absent values injected), so a
+  sponsor-bound agent always runs sponsored and fundless.
+- `maxJobsPerDay` meters allow-listed write actions per UTC day via atomic
+  conditional UPDATEs on the grant row (429 when exhausted). Durable in the
+  DB, unlike the in-memory rate limiters, which stay in place as burst
+  protection. Budget spend is detached from the request transaction, so a
+  failed request still counts (over-counting beats a retry loophole).
+
+Transport authentication remains the host app's concern; the token
+authorizes and scopes within the service. On-chain authority is unchanged:
+proofs still sign with the session wallet.
+
+### Document ingestion: prepareDocumentProof
+
+Bridges "here is a document as structured fields" to the field-predicate
+proof surface. Canonical JSON (recursively key-sorted) -> blake2b-256
+`payloadHash`, plus a depth-4 Merkle `contentRoot` over an ORDERED list of
+up to 16 proof fields with per-field inclusion paths, ready for
+`issueFieldPredicateAttestation[Batch]`. Field paths are dot-separated and
+descend into nested objects/arrays (a literal top-level key containing dots
+wins); a path landing on an object is a 400. Field keys are
+`blake2b256(fieldPath)`, values scale x1000 by default (per-field override),
+absent values occupy a fixed empty leaf. Leaf/node hashing goes through the
+contract artifact's exported pure circuits, so the off-chain root is
+byte-identical to the in-circuit fold (same scheme the NIGHTPASS
+content-root builder established). Compute-only and synchronous: nothing
+persisted, no job; the response carries witness material (scaled values)
+and is never logged.
+
+### Standalone Docker image
+
+The repo is itself a complete CAP app; the new `Dockerfile` packages it so
+one container yields a working attestation server (all four OData services,
+submission pipeline, agent grants, in-process wasm proving; no host app
+required). `docker/docker-compose.yml` gains a `nightgate` service:
+
+```
+ENCRYPTION_KEY=$(openssl rand -hex 32) NIGHTGATE_HTTP_PASSWORD=change-me \
+docker compose -f docker/docker-compose.yml up -d nightgate
+```
+
+The entrypoint fails closed without `ENCRYPTION_KEY`, wires SQLite
+(`/data` volume) + HTTP basic auth via `CDS_CONFIG`, and deploys the schema
+on first boot only (`cds deploy` recreates tables; upgrades are manual, see
+`docs/docker.md`). Proving defaults to in-process wasm; set
+`NIGHTGATE_PROOF_SERVER_URL` to offload to the proof-server service. The
+npm package is unaffected (`files` whitelist).
+
+### Agent-output provenance: attestAgentOutput
+
+Anchors "agent X produced output O from input I at time T (model M, policy
+P)" via the existing `anchorDocument` pipeline. The canonical v1 envelope
+(`{ v, agentId, inputHash, outputHash, producedAt, modelId?, policyHash? }`)
+is built and hashed server-side and rides as the anchor's public metadata
+blob, so the on-chain metadata hash commits to the envelope itself. Third
+parties verify by re-hashing the returned `envelopeJson` and calling
+`verifyAttestationState`: no trust in the server required. Grantable to
+agents; `prepareDocumentProof` is always available to valid agent tokens
+(compute-only).
+
 ## 0.13.0 - 2026-08-04
 
 Minor rather than patch: session ids no longer survive a process restart by

@@ -938,6 +938,134 @@ service NightgateService {
     // ========================================================================
 
     /**
+     * Turn a structured document into everything the field-predicate proof
+     * surface needs: canonical JSON -> `payloadHash` (blake2b-256, the value
+     * `anchorDocument` anchors), plus a depth-4 Merkle `contentRoot` over the
+     * ORDERED `proofFieldsJson` list (leaf index = list position; keep the
+     * order stable across anchor and proof) with per-field inclusion paths
+     * ready for `issueFieldPredicateAttestation[Batch]`.
+     *
+     * `documentJson` is a JSON object (the full document; all of it goes into
+     * `payloadHash`). `proofFieldsJson` is an ordered JSON array of up to 16
+     * `{ field, scale? }` entries (scale defaults to 1000, milli-units).
+     * `field` is a dot-separated path into the document (`invoice.total`;
+     * numeric segments index arrays); a literal top-level key containing
+     * dots wins over path descent. Values must resolve to non-negative
+     * scalars (a path landing on an object/array is a 400); absent values
+     * occupy a fixed empty leaf and are reported in `emptyFields`. Leaf/node hashing uses
+     * the contract artifact's exported pure circuits, so the root is
+     * byte-identical to the in-circuit fold.
+     *
+     * Compute-only and synchronous: nothing is persisted, no job started.
+     * The response's `fields` carry WITNESS material (scaled values); handle
+     * like the inputs of the predicate actions. `canonicalDocument` is the
+     * exact byte form behind `payloadHash`; store it at your `storageRef`,
+     * a re-serialization with different key order will not re-hash equal.
+     */
+    action   prepareDocumentProof(documentJson: LargeString, // JSON object: the full document
+                                  proofFieldsJson: LargeString, // ordered JSON array of { field, scale? }, max 16
+                                  compiledArtifactRef: String // optional, defaults to 'attestation-vault'
+    )                                                                 returns {
+        payloadHash       : String; // blake2b-256 of canonicalDocument (64 hex)
+        canonicalDocument : LargeString; // the exact hashed byte form
+        contentRoot       : String; // 64-hex Merkle root over the proof fields
+        fields            : LargeString; // JSON array of { field, fieldKey, value, siblings, dirs }
+        emptyFields       : LargeString; // JSON array of fields without a value (empty leaf)
+    };
+
+    /**
+     * Anchor an agent-output provenance envelope on-chain: "agent X produced
+     * output O from input I at time T (optionally: with model M under policy
+     * P)". Builds the canonical v1 envelope `{ v, agentId, inputHash,
+     * outputHash, producedAt, modelId?, policyHash? }` server-side, hashes it
+     * (blake2b-256) and anchors via the `anchorDocument` pipeline; the
+     * canonical envelope rides as the anchor's public metadata blob, so the
+     * on-chain metadata hash commits to the envelope itself.
+     *
+     * Verification needs no NIGHTGATE trust: a third party re-hashes the
+     * returned `envelopeJson` and calls `verifyAttestationState` with the
+     * result. The attestation owner is the session wallet (the operator);
+     * the agent identity lives inside the envelope, ideally a registered
+     * grantee id (`registerGranteeIdentity`).
+     *
+     * Async: returns `{ jobId, status, documentId }` like `anchorDocument`,
+     * plus `payloadHash` and the canonical `envelopeJson`.
+     */
+    action   attestAgentOutput(agentId: String, // agent identity (<= 200 chars), ideally a registered grantee id
+                               inputHash: String, // 64 hex commitment to the agent's input
+                               outputHash: String, // 64 hex commitment to the produced output
+                               modelId: String, // optional model identifier (<= 200 chars)
+                               policyHash: String, // optional 64 hex commitment to the governing policy
+                               producedAt: Timestamp, // optional; defaults to now (server time)
+                               storageRef: String, // optional; where output/envelope live, defaults to agent-output://<agentId>
+                               sessionId: UUID,
+                               contractAddress: String, // AttestationVault deployment
+                               compiledArtifactRef: String, // optional, defaults to 'attestation-vault'
+                               idempotencyKey: String, // optional; dedupes retries
+                               sponsorSessionId: UUID // optional; second session pays the dust fee
+    )                                                                 returns {
+        jobId        : UUID;
+        status       : String;
+        documentId   : UUID; // Documents row handle (verify_document works on it)
+        payloadHash  : String; // blake2b-256 of envelopeJson, the anchored value
+        envelopeJson : LargeString; // canonical envelope; re-hash to verify
+    };
+
+    /**
+     * Owner-scoped view of agent grants (tokenHash excluded: the token is
+     * shown once at creation and its hash never leaves the server).
+     */
+    @readonly
+    entity AgentGrants           as
+        projection on midnight.AgentGrants
+        excluding {
+            tokenHash
+        };
+
+    /**
+     * Create an agent grant: a scoped, revocable bearer capability derived
+     * from one of the caller's wallet sessions. The returned `token` is shown
+     * ONCE and never stored (only its SHA-256). A request carrying the token
+     * in the `x-agent-token` header runs as the grant's operator but is
+     * restricted to `allowedActions` (plus the read-only verify surface and
+     * `getJobStatus`), bound to the grant's `sessionId`, limited to
+     * `maxJobsPerDay` write jobs per UTC day, and pinned to
+     * `sponsorSessionId` when set (the request may not override it, so a
+     * fundless agent stays fundless).
+     *
+     * `allowedActions` entries must come from the allow-listable set
+     * (attestation/predicate/disclosure actions); wallet lifecycle, sends,
+     * deploys and grant administration are never grantable.
+     *
+     * `sponsorSessionId` is validated at creation with the same resolution
+     * every sponsored write runs (platform-listed or caller-owned, active,
+     * signing-capable), so a dead sponsor fails here with a 4xx instead of
+     * producing a grant that burns budget on unusable writes. The sponsor is
+     * still re-resolved on every use; this check cannot guarantee the
+     * sponsor session outlives the grant.
+     */
+    action   createAgentGrant(sessionId: UUID,
+                              allowedActions: array of String,
+                              maxJobsPerDay: Integer, // optional; null = unlimited
+                              sponsorSessionId: UUID, // optional; fixed fee-sponsor binding
+                              validUntil: Timestamp, // optional; null = no expiry
+                              agentLabel: String // optional, informational
+    )                                                                 returns {
+        grantId        : UUID;
+        token          : String; // shown once, never stored
+        allowedActions : array of String;
+        validUntil     : Timestamp;
+    };
+
+    /**
+     * Revoke an agent grant immediately. Owner-scoped: a foreign grantId
+     * returns 404 rather than leaking existence.
+     */
+    action   revokeAgentGrant(grantId: UUID)                          returns {
+        revoked : Boolean;
+    };
+
+    /**
      * Look up the status and result of a job submitted via one of the
      * async actions (`registerForDustGeneration`, `sendNight`,
      * `deployContract`, ...). Callers poll this until `status` reaches

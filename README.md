@@ -52,6 +52,18 @@ npm ci
 npm run dev           
 ```
 
+Or standalone with Docker, no Node installation and no host app required
+(published on every release, see [docs/docker.md](docs/docker.md)):
+
+```bash
+docker pull ghcr.io/odatano/nightgate:latest
+docker run -d -p 4004:4004 \
+  -e ENCRYPTION_KEY=$(openssl rand -hex 32) \
+  -e NIGHTGATE_HTTP_PASSWORD=change-me \
+  -v nightgate-data:/data \
+  ghcr.io/odatano/nightgate:latest
+```
+
 Configure the `.env` file (see `.env.example`) to point to a Substrate RPC node and a GraphQL indexer.
 
 ```bash
@@ -88,6 +100,8 @@ Submit actions are **async**: they return `{ jobId, status }`; poll `getJobStatu
 | Compact contracts | `deployContract` / `submitContractCall` on registered compiled artifacts |
 | Proving modes | `wasm` (default when no proof server is configured: fully in-process for wallet AND contract circuits, no Docker needed) or `server` (proof-server container, selected automatically by configuring `proofServerUrl`; recommended for production). Explicit override via `NIGHTGATE_PROVING_MODE`. |
 | Document anchoring | `anchorDocument` / `verifyDocument`: sha256 hash on-chain, storage stays with the caller |
+| Document ingestion | `prepareDocumentProof`: canonical JSON -> `payloadHash` + depth-4 Merkle content root with per-field inclusion paths, ready for the field-predicate actions (compute-only, nothing persisted) |
+| AI-agent access | `createAgentGrant` / `revokeAgentGrant`: scoped bearer tokens (`x-agent-token`) with action allowlist, daily job budget and pinned session/sponsor (fundless agents); `attestAgentOutput` anchors third-party-verifiable agent-output provenance. MCP companion: [`@odatano/nightgate-mcp`](https://github.com/ODATANO/NIGHTGATE-MCP) |
 | ZK predicate attestations | `issuePredicateAttestation` / `issueFieldPredicateAttestation` (field-bound via content root) / `issueFieldPredicateAttestationBatch` (up to 8 field proofs in ONE tx): prove `value ≤/≥ threshold` without revealing the value; `verifyPredicateAttestation` to check |
 | Crawler-free verification | `verifyAttestationState` / `verifyPredicateState` / `reindexDisclosures` read live contract state from the public indexer (per-call `network` override, no wallet, no local index) |
 | Tiered disclosure (RBAC) | `grantDisclosure` / `revokeDisclosure` (+ `registerGranteeIdentity`), on-chain `DisclosureGrants` index, `AttestationService` mixin with EU Battery Reg tiers |
@@ -100,6 +114,7 @@ Submit actions are **async**: they return `{ jobId, status }`; poll `getJobStatu
 - **[Actions reference:](docs/actions.md)** every OData action + function with examples
 - **[Architecture:](docs/architecture.md)** worker-thread design, submission flow, persistence model
 - **[Operations:](docs/operations.md)** running NIGHTGATE day to day, scripts, local indexer, troubleshooting
+- **[Docker:](docs/docker.md)** standalone container (`ghcr.io/odatano/nightgate`), configuration, schema upgrades
 - **[Reference:](docs/reference.md)** full configuration matrix + project structure
 - **[Changelog:](CHANGELOG.md)** notable changes by version
 

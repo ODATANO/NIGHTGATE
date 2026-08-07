@@ -1,0 +1,12 @@
+.git
+node_modules
+db/*.db
+db/*.db-*
+.env
+.env.*
+coverage
+docs
+test
+@cds-models
+*.log
+npm-debug.log*

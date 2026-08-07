@@ -1,4 +1,61 @@
 services:
+  # NIGHTGATE itself, standalone: pull (or build) the image, set two secrets,
+  # and the full attestation server (four OData services, submission pipeline,
+  # in-process wasm proving) runs on :4004. No other service below is
+  # required: proving defaults to in-process wasm and the public preprod
+  # endpoints serve node/indexer. Bring up proof-server and point
+  # NIGHTGATE_PROOF_SERVER_URL at it to offload proving.
+  #
+  # Quickstart (from the repo root):
+  #   ENCRYPTION_KEY=$(openssl rand -hex 32) \
+  #   NIGHTGATE_HTTP_PASSWORD=change-me \
+  #   docker compose -f docker/docker-compose.yml up -d nightgate
+  # See docs/docker.md for schema-upgrade and proving-mode notes.
+  nightgate:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    # Published by .github/workflows/release.yml on every v* tag; compose
+    # pulls this and only builds locally when the image is unavailable.
+    image: ghcr.io/odatano/nightgate:0.14.0
+    container_name: odatano-nightgate
+    ports:
+      - "4004:4004"
+    environment:
+      # Required: encrypts wallet viewing/seed keys at rest (openssl rand -hex 32).
+      ENCRYPTION_KEY: "${ENCRYPTION_KEY:?set ENCRYPTION_KEY (openssl rand -hex 32)}"
+      # Basic-auth credentials for the OData services (NIGHTGATE_AUTH=dummy
+      # serves unauthenticated, local testing only).
+      NIGHTGATE_HTTP_USER: "${NIGHTGATE_HTTP_USER:-nightgate}"
+      NIGHTGATE_HTTP_PASSWORD: "${NIGHTGATE_HTTP_PASSWORD:?set NIGHTGATE_HTTP_PASSWORD}"
+      NIGHTGATE_NETWORK: "${NIGHTGATE_NETWORK:-preprod}"
+      NIGHTGATE_CRAWLER_ENABLED: "${NIGHTGATE_CRAWLER_ENABLED:-false}"
+      # Optional overrides (empty = built-in per-network defaults):
+      NIGHTGATE_NODE_URL: "${NIGHTGATE_NODE_URL:-}"
+      NIGHTGATE_INDEXER_HTTP_URL: "${NIGHTGATE_INDEXER_HTTP_URL:-}"
+      NIGHTGATE_INDEXER_WS_URL: "${NIGHTGATE_INDEXER_WS_URL:-}"
+      # Optional: switches proving from in-process wasm to a proof server,
+      # e.g. http://proof-server:6300 with the service below.
+      NIGHTGATE_PROOF_SERVER_URL: "${NIGHTGATE_PROOF_SERVER_URL:-}"
+    volumes:
+      - nightgate-data:/data
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+    deploy:
+      resources:
+        limits:
+          # wasm proving + wallet catch-up are memory-hungry; the image's
+          # default heap is 8 GB (NODE_OPTIONS), keep the limit above it.
+          cpus: "4.0"
+          memory: 10G
+        reservations:
+          cpus: "1.0"
+          memory: 2G
+
   # Midnight Node, local standalone node for undeployed/local development only.
   # For local testnet development only. Preprod uses the public RPC (default, no Docker needed).
   node:
@@ -142,6 +199,7 @@ services:
           memory: 1G
 
 volumes:
+  nightgate-data:
   node-data:
   proof-server-data:
   indexer-data:

@@ -206,6 +206,30 @@ entity WalletSessions : cuid, managed {
 }
 
 /**
+ * Agent grants: scoped, revocable, budgeted machine capabilities derived from
+ * a wallet session (agent-access-layer, model A). The bearer token is returned
+ * ONCE at creation and only its SHA-256 lands here, mirroring viewingKeyHash.
+ * On-chain authority stays the session wallet; a grant only RESTRICTS what a
+ * token-authenticated request may do (action allowlist, daily job budget,
+ * fixed sponsor binding). Enforcement lives in srv/sessions/agent-grants.ts.
+ */
+@assert.unique.tokenHash: [tokenHash]
+entity AgentGrants : cuid, managed {
+    userId           : String(200) not null; // operator (owning principal); becomes the effective req.user for token requests
+    agentLabel       : String(100); // human-readable agent name, informational
+    sessionId        : UUID not null; // the wallet session all grant requests are bound to
+    tokenHash        : String(64) not null; // SHA-256 of the bearer token (token itself is never stored)
+    allowedActions   : LargeString not null; // JSON array of allow-listed write-action names
+    maxJobsPerDay    : Integer; // null = unlimited; counts allowlisted write actions per UTC day
+    jobsUsedToday    : Integer default 0; // consumed budget inside budgetWindow
+    budgetWindow     : String(10); // UTC day 'YYYY-MM-DD' the counter belongs to
+    sponsorSessionId : UUID; // fixed fee-sponsor binding; requests may not override it
+    validUntil       : Timestamp; // null = no expiry
+    isActive         : Boolean default true;
+    revokedAt        : Timestamp;
+}
+
+/**
  * Indexer sync status, singleton table tracking crawler progress
  */
 entity SyncState {

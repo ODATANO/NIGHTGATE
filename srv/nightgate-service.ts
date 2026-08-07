@@ -7,8 +7,10 @@
 import cds, { Request } from '@sap/cds';
 
 import { registerWalletSessionHandlers, startSessionCleanup } from './sessions/wallet-sessions';
+import { attachAgentGrantEnforcement, registerAgentGrantHandlers } from './sessions/agent-grants';
 import { ensureNightgateModelLoaded } from './utils/cds-model';
 import { registerSubmissionHandlers } from './submission/handlers';
+import { registerDocumentProofHandlers } from './submission/document-proof';
 import { getJobById } from './submission/background-jobs';
 
 import { Blocks, Transactions, ContractActions, UnshieldedUtxos, NightBalances, WalletSessions } from '#cds-models/midnight';
@@ -21,6 +23,10 @@ export default class NightgateService extends cds.ApplicationService {
     async init(): Promise<void> {
         await ensureNightgateModelLoaded();
         this.db = await cds.connect.to('db');
+
+        // Agent-token enforcement MUST be the first before-hook: it swaps the
+        // effective principal, and every owner-scoping hook below reads it.
+        attachAgentGrantEnforcement(this, this.db);
 
         // Blocks
         this.on('READ', 'Blocks', async (req: Request) => {
@@ -171,6 +177,18 @@ export default class NightgateService extends cds.ApplicationService {
             (req.query as any).where({ userId });
         });
 
+        // Agent grants (delegated); owner-scoped read like WalletSessions
+
+        registerAgentGrantHandlers(this, this.db);
+
+        this.before('READ', 'AgentGrants', (req: Request) => {
+            const user: any = (req as any).user;
+            if (user?.is?.('admin')) return;
+            const userId = user?.id;
+            if (!userId) return req.reject(401, 'authentication required');
+            (req.query as any).where({ userId });
+        });
+
         // Submission actions: deployContract, submitContractCall
 
         // Owner-scoped like WalletSessions: submissions carry no userId, so
@@ -192,6 +210,7 @@ export default class NightgateService extends cds.ApplicationService {
         });
 
         registerSubmissionHandlers(this, this.db);
+        registerDocumentProofHandlers(this);
 
         // Background Jobs
 

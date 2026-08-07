@@ -5,3 +5,7 @@ contracts/**/managed/**/*.prover    binary
 contracts/**/managed/**/*.verifier  binary
 contracts/**/managed/**/*.bzkir     binary
 contracts/**/managed/**/*.zkir      binary
+
+# The container entrypoint runs inside a Linux image; a CRLF checkout on
+# Windows would break bash ("\r: command not found").
+docker/entrypoint.sh                eol=lf
