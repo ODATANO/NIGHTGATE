@@ -7,6 +7,9 @@ export type Witnesses<PS> = {
   field_value(context: __compactRuntime.WitnessContext<Ledger, PS>): [PS, bigint];
   merkle_siblings(context: __compactRuntime.WitnessContext<Ledger, PS>): [PS, Uint8Array[]];
   merkle_dirs(context: __compactRuntime.WitnessContext<Ledger, PS>): [PS, boolean[]];
+  field_digest(context: __compactRuntime.WitnessContext<Ledger, PS>): [PS, Uint8Array];
+  set_siblings(context: __compactRuntime.WitnessContext<Ledger, PS>): [PS, Uint8Array[]];
+  set_dirs(context: __compactRuntime.WitnessContext<Ledger, PS>): [PS, boolean[]];
 }
 
 export type ImpureCircuits<PS> = {
@@ -40,6 +43,14 @@ export type ImpureCircuits<PS> = {
                       field_key_0: Uint8Array,
                       threshold_0: bigint,
                       op_0: bigint): __compactRuntime.CircuitResults<PS, []>;
+  proveFieldEquality(context: __compactRuntime.CircuitContext<PS>,
+                     payload_hash_0: Uint8Array,
+                     field_key_0: Uint8Array,
+                     expected_digest_0: Uint8Array): __compactRuntime.CircuitResults<PS, []>;
+  proveFieldMembership(context: __compactRuntime.CircuitContext<PS>,
+                       payload_hash_0: Uint8Array,
+                       field_key_0: Uint8Array,
+                       set_root_0: Uint8Array): __compactRuntime.CircuitResults<PS, []>;
 }
 
 export type ProvableCircuits<PS> = {
@@ -73,11 +84,21 @@ export type ProvableCircuits<PS> = {
                       field_key_0: Uint8Array,
                       threshold_0: bigint,
                       op_0: bigint): __compactRuntime.CircuitResults<PS, []>;
+  proveFieldEquality(context: __compactRuntime.CircuitContext<PS>,
+                     payload_hash_0: Uint8Array,
+                     field_key_0: Uint8Array,
+                     expected_digest_0: Uint8Array): __compactRuntime.CircuitResults<PS, []>;
+  proveFieldMembership(context: __compactRuntime.CircuitContext<PS>,
+                       payload_hash_0: Uint8Array,
+                       field_key_0: Uint8Array,
+                       set_root_0: Uint8Array): __compactRuntime.CircuitResults<PS, []>;
 }
 
 export type PureCircuits = {
   leafHash(field_key_0: Uint8Array, value_0: bigint): Uint8Array;
   nodeHash(left_0: Uint8Array, right_0: Uint8Array): Uint8Array;
+  bytesLeafHash(field_key_0: Uint8Array, value_digest_0: Uint8Array): Uint8Array;
+  setLeafHash(value_digest_0: Uint8Array): Uint8Array;
 }
 
 export type Circuits<PS> = {
@@ -87,6 +108,11 @@ export type Circuits<PS> = {
   nodeHash(context: __compactRuntime.CircuitContext<PS>,
            left_0: Uint8Array,
            right_0: Uint8Array): __compactRuntime.CircuitResults<PS, Uint8Array>;
+  bytesLeafHash(context: __compactRuntime.CircuitContext<PS>,
+                field_key_0: Uint8Array,
+                value_digest_0: Uint8Array): __compactRuntime.CircuitResults<PS, Uint8Array>;
+  setLeafHash(context: __compactRuntime.CircuitContext<PS>,
+              value_digest_0: Uint8Array): __compactRuntime.CircuitResults<PS, Uint8Array>;
   attest(context: __compactRuntime.CircuitContext<PS>,
          payload_hash_0: Uint8Array,
          metadata_hash_0: Uint8Array): __compactRuntime.CircuitResults<PS, []>;
@@ -117,6 +143,14 @@ export type Circuits<PS> = {
                       field_key_0: Uint8Array,
                       threshold_0: bigint,
                       op_0: bigint): __compactRuntime.CircuitResults<PS, []>;
+  proveFieldEquality(context: __compactRuntime.CircuitContext<PS>,
+                     payload_hash_0: Uint8Array,
+                     field_key_0: Uint8Array,
+                     expected_digest_0: Uint8Array): __compactRuntime.CircuitResults<PS, []>;
+  proveFieldMembership(context: __compactRuntime.CircuitContext<PS>,
+                       payload_hash_0: Uint8Array,
+                       field_key_0: Uint8Array,
+                       set_root_0: Uint8Array): __compactRuntime.CircuitResults<PS, []>;
 }
 
 export type Ledger = {
@@ -183,6 +217,20 @@ export type Ledger = {
     [Symbol.iterator](): Iterator<[Uint8Array, Uint8Array]>
   };
   field_predicate_results: {
+    isEmpty(): boolean;
+    size(): bigint;
+    member(key_0: Uint8Array): boolean;
+    lookup(key_0: Uint8Array): boolean;
+    [Symbol.iterator](): Iterator<[Uint8Array, boolean]>
+  };
+  field_equality_results: {
+    isEmpty(): boolean;
+    size(): bigint;
+    member(key_0: Uint8Array): boolean;
+    lookup(key_0: Uint8Array): boolean;
+    [Symbol.iterator](): Iterator<[Uint8Array, boolean]>
+  };
+  field_membership_results: {
     isEmpty(): boolean;
     size(): bigint;
     member(key_0: Uint8Array): boolean;

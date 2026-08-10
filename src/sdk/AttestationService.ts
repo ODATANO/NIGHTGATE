@@ -77,9 +77,11 @@ function makeTierGate(tier: AttestationTier) {
 export interface PredicateAttestationEnvelope {
     digestMultibase: string | null;
     claim: {
-        predicate: string;            // 'lessOrEqual' | 'greaterOrEqual'
-        threshold: string;            // scaled integer, as a string
+        predicate: string;            // 'lessOrEqual' | 'greaterOrEqual' | 'bytesEquality' | 'setMembership'
+        threshold: string | null;     // scaled integer as a string; null for the bytes kinds
         unit: string | null;
+        expectedDigest?: string;      // bytesEquality: public expected value digest
+        setRoot?: string;             // setMembership: canonical allow-list set root
     };
     proof: {
         system: 'midnight-compact';
@@ -96,8 +98,10 @@ export interface PredicateAttestationEnvelope {
  */
 export function toPredicateEnvelope(row: {
     predicate: string;
-    threshold: number | string;
+    threshold?: number | string | null;
     unit?: string | null;
+    expectedDigest?: string | null;
+    setRoot?: string | null;
     valueCommitment?: string | null;
     contractAddress: string;
     provenTxHash?: string | null;
@@ -106,8 +110,10 @@ export function toPredicateEnvelope(row: {
         digestMultibase: row.valueCommitment ?? null,
         claim: {
             predicate: row.predicate,
-            threshold: String(row.threshold),
-            unit: row.unit ?? null
+            threshold: row.threshold === null || row.threshold === undefined ? null : String(row.threshold),
+            unit: row.unit ?? null,
+            ...(row.expectedDigest ? { expectedDigest: row.expectedDigest } : {}),
+            ...(row.setRoot ? { setRoot: row.setRoot } : {})
         },
         proof: {
             system: 'midnight-compact',

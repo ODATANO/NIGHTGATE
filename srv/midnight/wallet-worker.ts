@@ -34,7 +34,8 @@ import { runBatchInScope } from './batch-call-scope';
 import { buildWasmProofProvider, getSharedKeyMaterialProvider } from './wasm-proof-provider';
 import {
     deriveAttestationSecret,
-    getContractWitnessFactory
+    getContractWitnessFactory,
+    type MerkleProofBundle
 } from '../submission/contract-witnesses';
 import { deriveRoleSeeds } from '../utils/wallet-hd';
 import type * as AddressFormat from '@midnightntwrk/wallet-sdk-address-format';
@@ -255,8 +256,8 @@ async function getOrCompileContract(
     registration: ContractRegistration,
     entry: FacadeEntry,
     witnessValues?: { attestedValue: string; valueSalt: string },
-    merkleProof?: { fieldValue: string; siblings: string[]; dirs: boolean[] },
-    merkleProofHolder?: { current?: { fieldValue: string; siblings: string[]; dirs: boolean[] } }
+    merkleProof?: MerkleProofBundle,
+    merkleProofHolder?: { current?: MerkleProofBundle }
 ): Promise<any> {
     const { contractClass } = await getContractScaffold(name, registration);
 
@@ -1898,7 +1899,7 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
         proofServerUrl: string;
         networkId: string;
         witnessValues?: { attestedValue: string; valueSalt: string };
-        merkleProof?: { fieldValue: string; siblings: string[]; dirs: boolean[] };
+        merkleProof?: MerkleProofBundle;
         /** Seeded on this wallet's FIRST call to the contract (see below).
          *  Defaults to `{}`, which is what a stateless contract deploys with. */
         initialPrivateState?: unknown;
@@ -2025,7 +2026,7 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
          *  batch to holder mode, where the loop swaps the current proof
          *  before each call. Mutually exclusive with the batch-level
          *  `merkleProof` below. */
-        calls: Array<{ circuit: string; args: unknown[]; merkleProof?: { fieldValue: string; siblings: string[]; dirs: boolean[] } }>;
+        calls: Array<{ circuit: string; args: unknown[]; merkleProof?: MerkleProofBundle }>;
         indexerHttpUrl: string;
         indexerWsUrl: string;
         proofServerUrl: string;
@@ -2033,7 +2034,7 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
         /** Batch-level witnesses: bound once to the compiled contract instance
          *  shared by every call in the scope (same semantics as a single call). */
         witnessValues?: { attestedValue: string; valueSalt: string };
-        merkleProof?: { fieldValue: string; siblings: string[]; dirs: boolean[] };
+        merkleProof?: MerkleProofBundle;
         initialPrivateState?: unknown;
         /** Optional fee sponsor: this facade balances ['dust'] and submits. */
         sponsorSessionId?: string;
@@ -2060,7 +2061,7 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
             if (holderMode && merkleProof) {
                 throw new Error('submitContractCallBatch: per-call merkleProof and batch-level merkleProof are mutually exclusive');
             }
-            const holder: { current?: { fieldValue: string; siblings: string[]; dirs: boolean[] } } = {};
+            const holder: { current?: MerkleProofBundle } = {};
             const scopeCalls = holderMode
                 ? calls.map(c => ({ circuit: c.circuit, args: c.args, before: () => { holder.current = c.merkleProof; } }))
                 : calls;

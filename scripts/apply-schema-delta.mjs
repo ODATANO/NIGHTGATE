@@ -60,13 +60,71 @@ function parseColumns(createStmt) {
     return cols;
 }
 
+let rebuiltTables = 0;
+
+/**
+ * Columns whose NOT NULL was RELAXED in the target schema (e.g.
+ * PredicateAttestations.op/threshold in 0.15.0). SQLite cannot ALTER a
+ * constraint, so the table is rebuilt: create the target shape under a temp
+ * name, copy the shared columns (data untouched), drop the old table, rename.
+ */
+function relaxedColumns(name, createStmt) {
+    const info = new Map(
+        db.prepare(`PRAGMA table_info("${name}")`).all().map(r => [r.name, r])
+    );
+    const relaxed = [];
+    for (const col of parseColumns(createStmt)) {
+        const cur = info.get(col.name);
+        if (!cur) continue;
+        const targetNotNull = /\bNOT\s+NULL\b/i.test(col.def);
+        if (cur.notnull === 1 && !targetNotNull && cur.pk === 0) relaxed.push(col.name);
+    }
+    return relaxed;
+}
+
+function rebuildTable(name, createStmt) {
+    const have = new Set(db.prepare(`PRAGMA table_info("${name}")`).all().map(r => r.name));
+    const shared = parseColumns(createStmt).map(c => c.name).filter(n => have.has(n));
+    const colList = shared.map(n => `"${n}"`).join(', ');
+    const tmp = `__delta_new_${name}`;
+    const tmpStmt = createStmt.replace(/^CREATE TABLE\s+("?)(\w+)\1/i, `CREATE TABLE "${tmp}"`);
+    db.exec(`DROP TABLE IF EXISTS "${tmp}";`);
+    db.exec(tmpStmt + ';');
+    db.exec(`INSERT INTO "${tmp}" (${colList}) SELECT ${colList} FROM "${name}";`);
+    db.exec(`DROP TABLE "${name}";`);
+    db.exec(`ALTER TABLE "${tmp}" RENAME TO "${name}";`);
+}
+
+let restoredViews = 0;
+
 const tx = db.transaction(() => {
+    // Drop ALL views up front: they are stateless and may reference tables
+    // that get rebuilt below (DROP TABLE fails on dependent views otherwise).
+    // Views managed by the DDL are recreated in this same transaction; any
+    // OTHER view (consumer-added, manual) is snapshotted here and restored
+    // from its original SQL afterwards, so the migration never silently
+    // deletes a view it does not own.
+    const preViews = db.prepare("SELECT name, sql FROM sqlite_master WHERE type='view'").all();
+    for (const v of preViews) {
+        db.exec(`DROP VIEW IF EXISTS "${v.name}";`);
+    }
+    const recreatedViews = new Set();
     for (const stmt of statements) {
         const tableMatch = stmt.match(/^CREATE TABLE\s+("?)(\w+)\1/i);
         const viewMatch = stmt.match(/^CREATE VIEW\s+("?)(\w+)\1/i);
         if (tableMatch) {
             const name = tableMatch[2];
             if (existingTables.has(name)) {
+                // Constraint relaxation (NOT NULL dropped in the target) needs
+                // a rebuild; the rebuild also carries any new columns.
+                const relaxed = relaxedColumns(name, stmt);
+                if (relaxed.length > 0) {
+                    rebuildTable(name, stmt);
+                    console.log(`[delta] ~ rebuilt ${name} (relaxed NOT NULL: ${relaxed.join(', ')})`);
+                    rebuiltTables++;
+                    skipped++;
+                    continue;
+                }
                 // Table exists → reconcile columns (additive only).
                 const have = new Set(
                     db.prepare(`PRAGMA table_info("${name}")`).all().map(r => r.name)
@@ -94,11 +152,31 @@ const tx = db.transaction(() => {
             const name = viewMatch[2];
             db.exec(`DROP VIEW IF EXISTS "${name}";`);
             db.exec(stmt + ';');
+            recreatedViews.add(name);
             refreshedViews++;
+        }
+    }
+    // Restore views the target DDL does not manage from their snapshotted SQL.
+    for (const v of preViews) {
+        if (recreatedViews.has(v.name) || !v.sql) continue;
+        try {
+            db.exec(v.sql + ';');
+            console.log(`[delta] = restored unmanaged view ${v.name}`);
+            restoredViews++;
+        } catch (err) {
+            // A custom view may reference something this migration changed.
+            // Rethrow so the WHOLE transaction rolls back: the database stays
+            // exactly as it was (view included) and the operator resolves the
+            // conflict first, instead of the migration committing with the
+            // view deleted.
+            console.error(`[delta] ! could not restore unmanaged view ${v.name}: ${err.message}`);
+            console.error(`[delta] ! original SQL was:\n${v.sql}`);
+            console.error('[delta] ! aborting: the migration rolls back, nothing was changed.');
+            throw err;
         }
     }
 });
 tx();
 db.close();
 
-console.log(`[delta] done: +${createdTables} tables, +${addedColumns} columns, ${refreshedViews} views refreshed, ${skipped} existing tables reconciled.`);
+console.log(`[delta] done: +${createdTables} tables, +${addedColumns} columns, ${rebuiltTables} rebuilt, ${refreshedViews} views refreshed, ${restoredViews} unmanaged views restored, ${skipped} existing tables reconciled.`);

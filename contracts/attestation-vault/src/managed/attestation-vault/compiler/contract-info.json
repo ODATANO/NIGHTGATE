@@ -54,6 +54,49 @@
       }
     },
     {
+      "name": "bytesLeafHash",
+      "pure": true,
+      "proof": false,
+      "arguments": [
+        {
+          "name": "field_key",
+          "type": {
+            "type-name": "Bytes",
+            "length": 32
+          }
+        },
+        {
+          "name": "value_digest",
+          "type": {
+            "type-name": "Bytes",
+            "length": 32
+          }
+        }
+      ],
+      "result-type": {
+        "type-name": "Bytes",
+        "length": 32
+      }
+    },
+    {
+      "name": "setLeafHash",
+      "pure": true,
+      "proof": false,
+      "arguments": [
+        {
+          "name": "value_digest",
+          "type": {
+            "type-name": "Bytes",
+            "length": 32
+          }
+        }
+      ],
+      "result-type": {
+        "type-name": "Bytes",
+        "length": 32
+      }
+    },
+    {
       "name": "attest",
       "pure": false,
       "proof": true,
@@ -307,6 +350,72 @@
         "types": [
         ]
       }
+    },
+    {
+      "name": "proveFieldEquality",
+      "pure": false,
+      "proof": true,
+      "arguments": [
+        {
+          "name": "payload_hash",
+          "type": {
+            "type-name": "Bytes",
+            "length": 32
+          }
+        },
+        {
+          "name": "field_key",
+          "type": {
+            "type-name": "Bytes",
+            "length": 32
+          }
+        },
+        {
+          "name": "expected_digest",
+          "type": {
+            "type-name": "Bytes",
+            "length": 32
+          }
+        }
+      ],
+      "result-type": {
+        "type-name": "Tuple",
+        "types": [
+        ]
+      }
+    },
+    {
+      "name": "proveFieldMembership",
+      "pure": false,
+      "proof": true,
+      "arguments": [
+        {
+          "name": "payload_hash",
+          "type": {
+            "type-name": "Bytes",
+            "length": 32
+          }
+        },
+        {
+          "name": "field_key",
+          "type": {
+            "type-name": "Bytes",
+            "length": 32
+          }
+        },
+        {
+          "name": "set_root",
+          "type": {
+            "type-name": "Bytes",
+            "length": 32
+          }
+        }
+      ],
+      "result-type": {
+        "type-name": "Tuple",
+        "types": [
+        ]
+      }
     }
   ],
   "witnesses": [
@@ -366,6 +475,40 @@
       "result type": {
         "type-name": "Vector",
         "length": 4,
+        "type": {
+          "type-name": "Boolean"
+        }
+      }
+    },
+    {
+      "name": "field_digest",
+      "arguments": [
+      ],
+      "result type": {
+        "type-name": "Bytes",
+        "length": 32
+      }
+    },
+    {
+      "name": "set_siblings",
+      "arguments": [
+      ],
+      "result type": {
+        "type-name": "Vector",
+        "length": 6,
+        "type": {
+          "type-name": "Bytes",
+          "length": 32
+        }
+      }
+    },
+    {
+      "name": "set_dirs",
+      "arguments": [
+      ],
+      "result type": {
+        "type-name": "Vector",
+        "length": 6,
         "type": {
           "type-name": "Boolean"
         }
@@ -506,6 +649,32 @@
     {
       "name": "field_predicate_results",
       "index": 9,
+      "exported": true,
+      "storage": "Map",
+      "key": {
+        "type-name": "Bytes",
+        "length": 32
+      },
+      "value": {
+        "type-name": "Boolean"
+      }
+    },
+    {
+      "name": "field_equality_results",
+      "index": 10,
+      "exported": true,
+      "storage": "Map",
+      "key": {
+        "type-name": "Bytes",
+        "length": 32
+      },
+      "value": {
+        "type-name": "Boolean"
+      }
+    },
+    {
+      "name": "field_membership_results",
+      "index": 11,
       "exported": true,
       "storage": "Map",
       "key": {

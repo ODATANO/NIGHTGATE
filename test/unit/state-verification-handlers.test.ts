@@ -283,6 +283,55 @@ describe('verifyPredicateState', () => {
         expect(r).toEqual({ verified: false, proven: false });
         expect(reader).not.toHaveBeenCalled();
     });
+
+    describe('bytes claim kinds (0.15.0)', () => {
+        const EXPECTED = 'c'.repeat(64);
+        const SET_ROOT = 'd'.repeat(64);
+
+        test.each([
+            [{ predicate: 'bytesEquality', fieldKey: '', expectedDigest: EXPECTED }, /fieldKey is required for predicate 'bytesEquality'/],
+            [{ predicate: 'bytesEquality', fieldKey: FIELD_KEY }, /expectedDigest .*required/],
+            [{ predicate: 'bytesEquality', fieldKey: FIELD_KEY, expectedDigest: 'zz' }, /expectedDigest/],
+            [{ predicate: 'setMembership', fieldKey: '', setRoot: SET_ROOT }, /fieldKey is required for predicate 'setMembership'/],
+            [{ predicate: 'setMembership', fieldKey: FIELD_KEY }, /setRoot .*required/],
+            [{ predicate: 'setMembership', fieldKey: FIELD_KEY, setRoot: 'zz' }, /setRoot/]
+        ])('rejects %o', async (patch, msg) => {
+            const srv = setup();
+            const req = makeReq({ contractAddress: VAULT, payloadHash: PAYLOAD, ...patch });
+            await srv.handlers['verifyPredicateState'](req);
+            expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(msg));
+        });
+
+        test('bytesEquality: no threshold needed; expectedDigest lowercased into the reader', async () => {
+            const reader = vi.fn(async () => true);
+            const srv = setup({ predicateStateReader: reader });
+            const req = makeReq({
+                contractAddress: VAULT, payloadHash: PAYLOAD, fieldKey: FIELD_KEY,
+                predicate: 'bytesEquality', expectedDigest: EXPECTED.toUpperCase()
+            });
+            const r = await srv.handlers['verifyPredicateState'](req);
+            expect(r).toEqual({ verified: true, proven: true });
+            expect(reader).toHaveBeenCalledWith(expect.objectContaining({
+                fieldKey: FIELD_KEY, expectedDigest: EXPECTED,
+                setRoot: undefined, threshold: undefined, op: undefined
+            }));
+        });
+
+        test('setMembership: setRoot passed through, no numeric coordinates', async () => {
+            const reader = vi.fn(async () => true);
+            const srv = setup({ predicateStateReader: reader });
+            const req = makeReq({
+                contractAddress: VAULT, payloadHash: PAYLOAD, fieldKey: FIELD_KEY,
+                predicate: 'setMembership', setRoot: SET_ROOT
+            });
+            const r = await srv.handlers['verifyPredicateState'](req);
+            expect(r).toEqual({ verified: true, proven: true });
+            expect(reader).toHaveBeenCalledWith(expect.objectContaining({
+                fieldKey: FIELD_KEY, setRoot: SET_ROOT,
+                expectedDigest: undefined, threshold: undefined, op: undefined
+            }));
+        });
+    });
 });
 
 // ---- reindexDisclosures ---------------------------------------------------
@@ -491,5 +540,45 @@ describe('verifyPredicateAttestation crawler-free fallback', () => {
         const req = makeReq({ predicateAttestationId: PA_ID });
         await srv.handlers['verifyPredicateAttestation'](req);
         expect(reader).toHaveBeenCalledWith(expect.objectContaining({ fieldKey: undefined }));
+    });
+
+    test('bytesEquality row passes expectedDigest, no numeric coordinates', async () => {
+        const FIELD_KEY = 'e'.repeat(64);
+        const EXPECTED = 'c'.repeat(64);
+        const reader = vi.fn(async () => true);
+        const row = {
+            ...ROW, predicate: 'bytesEquality', op: null, threshold: null,
+            fieldKey: FIELD_KEY, expectedDigest: EXPECTED, setRoot: null
+        };
+        const db = makeDbWithSequence([row, undefined]);
+        const srv = setup(db, { predicateStateReader: reader });
+        const req = makeReq({ predicateAttestationId: PA_ID });
+        const r = await srv.handlers['verifyPredicateAttestation'](req);
+        expect(r.verified).toBe(true);
+        expect(r.expectedDigest).toBe(EXPECTED);
+        expect(reader).toHaveBeenCalledWith(expect.objectContaining({
+            fieldKey: FIELD_KEY, expectedDigest: EXPECTED,
+            setRoot: undefined, threshold: undefined, op: undefined
+        }));
+    });
+
+    test('setMembership row passes setRoot, no numeric coordinates', async () => {
+        const FIELD_KEY = 'e'.repeat(64);
+        const SET_ROOT = 'd'.repeat(64);
+        const reader = vi.fn(async () => true);
+        const row = {
+            ...ROW, predicate: 'setMembership', op: null, threshold: null,
+            fieldKey: FIELD_KEY, setRoot: SET_ROOT, expectedDigest: null
+        };
+        const db = makeDbWithSequence([row, undefined]);
+        const srv = setup(db, { predicateStateReader: reader });
+        const req = makeReq({ predicateAttestationId: PA_ID });
+        const r = await srv.handlers['verifyPredicateAttestation'](req);
+        expect(r.verified).toBe(true);
+        expect(r.setRoot).toBe(SET_ROOT);
+        expect(reader).toHaveBeenCalledWith(expect.objectContaining({
+            fieldKey: FIELD_KEY, setRoot: SET_ROOT,
+            expectedDigest: undefined, threshold: undefined, op: undefined
+        }));
     });
 });

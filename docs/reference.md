@@ -536,6 +536,7 @@ New enums in `db/types.cds`:
 | Live preprod end-to-end (T15) | ✅ Counter deployed live on preprod via the full stack (0.3.0) |
 | On-chain disclosure grants | ✅ `grantDisclosure`/`revokeDisclosure` + chain-indexed `DisclosureGrants` + `granteeBinding` + on-chain read gate (0.3.4). Live-validated through grant → index → read-back; live revoke pending a healthy preprod indexer |
 | Crawler-free state verification | ✅ `verifyAttestationState` / `verifyPredicateState` / `reindexDisclosures` read LIVE contract state (0.5.0); optional per-call `network` override reads another network's public indexer (0.7.0) |
+| Bytes equality + set membership proofs | ✅ `issueFieldEqualityAttestation` / `issueFieldMembershipAttestation` + mixed-kind batch + `prepareMembershipSet`; string fields via `prepareDocumentProof` `kind: 'bytes'` (0.15.0) |
 | Passport-binding hardening | ✅ `bindPassport` rebind guard + registrar-gated `registerPassport` pre-registration (0.10.0). Registered ids bind only for their registered attester; deployed vaults need a redeploy |
 | Mainnet submission | ❌ Gated by `allowMainnetSubmission: false` until forum 1190 resolves |
 | Built-in authorization | ✅ `@requires` annotations; consumer app provides auth strategy |

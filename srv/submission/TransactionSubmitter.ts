@@ -32,6 +32,7 @@ import {
 } from '../midnight/providers';
 import { type NightgateNetwork } from '../utils/nightgate-config';
 import { CapDbPrivateStateProvider } from '../midnight/CapDbPrivateStateProvider';
+import type { MerkleProofBundle } from './contract-witnesses';
 import {
     walletDeployContract,
     walletSubmitContractCall,
@@ -99,12 +100,13 @@ export interface CallArgs {
      */
     witnessValues?: { attestedValue: string; valueSalt: string };
     /**
-     * Per-call Merkle inclusion proof for the field-bound predicate circuit
-     * (`proveFieldPredicate`): the scaled field value + its DEPTH=4 inclusion
-     * path. Passed to the worker's witness factory; never sent as a circuit arg.
-     * Omit for every other circuit.
+     * Per-call proof bundle for the field-bound proof circuits
+     * (`proveFieldPredicate` / `proveFieldEquality` / `proveFieldMembership`):
+     * scaled field value OR value digest + the DEPTH=4 content path, plus the
+     * DEPTH=6 set path for membership. Passed to the worker's witness factory;
+     * never sent as a circuit arg. Omit for every other circuit.
      */
-    merkleProof?: { fieldValue: string; siblings: string[]; dirs: boolean[] };
+    merkleProof?: MerkleProofBundle;
     /**
      * Private state to seed when the CALLING wallet has none for this contract
      * yet (it did not deploy it). Defaults to `{}` in the worker. Enables the
@@ -133,14 +135,14 @@ export interface CallBatchArgs {
      *  carry its own `merkleProof` (per-call witness binding for
      *  proveFieldPredicate); mutually exclusive with the batch-level
      *  `merkleProof` below. */
-    calls: Array<{ circuit: string; args: unknown[]; merkleProof?: { fieldValue: string; siblings: string[]; dirs: boolean[] } }>;
+    calls: Array<{ circuit: string; args: unknown[]; merkleProof?: MerkleProofBundle }>;
     contractName: string;
     registration: ContractRegistrationMeta;
     sessionId: string;
     /** Batch-level witnesses, bound once to the shared compiled contract
      *  instance (same semantics as the single-call fields on CallArgs). */
     witnessValues?: { attestedValue: string; valueSalt: string };
-    merkleProof?: { fieldValue: string; siblings: string[]; dirs: boolean[] };
+    merkleProof?: MerkleProofBundle;
     initialPrivateState?: unknown;
 }
 

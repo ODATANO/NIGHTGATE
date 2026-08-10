@@ -27,7 +27,9 @@ export {
     prepareRegisterPassport,
     prepareBindPassport,
     prepareAnchorContentRoot,
-    prepareProveFieldPredicate
+    prepareProveFieldPredicate,
+    prepareProveFieldEquality,
+    prepareProveFieldMembership
 } from './attestation-vault-calls.mjs';
 
 /**
@@ -39,13 +41,14 @@ export const CONTRACTS = {
     'attestation-vault': {
         name: 'attestation-vault',
         artifactSubpath: '@odatano/nightgate/browser/attestation-vault',
-        circuits: ['attest', 'grantDisclosure', 'revokeDisclosure', 'commitValue', 'provePredicate', 'registerPassport', 'bindPassport', 'anchorContentRoot', 'proveFieldPredicate'],
+        circuits: ['attest', 'grantDisclosure', 'revokeDisclosure', 'commitValue', 'provePredicate', 'registerPassport', 'bindPassport', 'anchorContentRoot', 'proveFieldPredicate', 'proveFieldEquality', 'proveFieldMembership'],
         // Circuits that need the attester-identity witness (local_secret_key).
         attesterGated: ['attest', 'grantDisclosure', 'revokeDisclosure', 'commitValue', 'registerPassport', 'bindPassport', 'anchorContentRoot', 'proveFieldPredicate'],
         // Circuits that need per-call value/salt witnesses.
         valueWitnessed: ['commitValue', 'provePredicate'],
-        // Circuits that need the per-call Merkle inclusion proof witnesses.
-        merkleWitnessed: ['proveFieldPredicate'],
+        // Circuits that need the per-call proof bundle witnesses
+        // (proveFieldEquality: path only; proveFieldMembership: digest + set path).
+        merkleWitnessed: ['proveFieldPredicate', 'proveFieldEquality', 'proveFieldMembership'],
         hasPrivateState: false
     }
 };

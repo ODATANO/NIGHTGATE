@@ -1995,7 +1995,7 @@ describe('issueFieldPredicateAttestationBatch', () => {
         [{ claimsJson: JSON.stringify([makeClaim(1, { value: '47.3' })]) }, /claims\[0\].value must be an integer/],
         [{ claimsJson: JSON.stringify([makeClaim(1, { value: '-5' })]) }, /claims\[0\].value must be a non-negative integer/],
         [{ claimsJson: JSON.stringify([makeClaim(1, { threshold: 'abc' })]) }, /claims\[0\].threshold must be an integer/],
-        [{ claimsJson: JSON.stringify([makeClaim(1, { predicate: 'between' })]) }, /claims\[0\].predicate must be 'lessOrEqual' or 'greaterOrEqual'/],
+        [{ claimsJson: JSON.stringify([makeClaim(1, { predicate: 'between' })]) }, /claims\[0\].predicate must be 'lessOrEqual', 'greaterOrEqual', 'bytesEquality' or 'setMembership'/],
         [{ claimsJson: JSON.stringify([makeClaim(1, { siblings: SIBLINGS.slice(0, 2) })]) }, /claims\[0\].siblings must be a JSON array of 4 hashes/],
         [{ claimsJson: JSON.stringify([makeClaim(1, { siblings: [...SIBLINGS.slice(0, 3), 'short'] })]) }, /claims\[0\].siblings entries must be 64 hex/],
         [{ claimsJson: JSON.stringify([makeClaim(1, { dirs: [true] })]) }, /claims\[0\].dirs must be a JSON array of 4 booleans/],
@@ -2144,5 +2144,390 @@ describe('issueFieldPredicateAttestationBatch', () => {
         const third = makeReq(VALID_ARGS({ contentRoot: undefined, claimsJson: JSON.stringify([makeClaim(14), makeClaim(15)]), sessionId }));
         await srv.handlers['issueFieldPredicateAttestationBatch'](third);
         expect(third.reject).not.toHaveBeenCalled();
+    });
+});
+
+// ---- issueFieldEqualityAttestation (bytes equality, 0.15.0) ----------------
+
+describe('issueFieldEqualityAttestation', () => {
+    const VALID_PAYLOAD = 'a'.repeat(64);
+    const VALID_FIELD_KEY = 'f'.repeat(64);
+    const VALID_ROOT = 'd'.repeat(64);
+    const SIBLINGS = ['1'.repeat(64), '2'.repeat(64), '3'.repeat(64), '4'.repeat(64)];
+    const EXPECTED = 'c'.repeat(64);
+    const VALID_ARGS = () => ({
+        payloadHash: VALID_PAYLOAD,
+        fieldKey: VALID_FIELD_KEY,
+        expectedDigest: EXPECTED,
+        contentRoot: VALID_ROOT,
+        siblingsJson: JSON.stringify(SIBLINGS),
+        dirsJson: JSON.stringify([true, false, true, false]),
+        sessionId: `fieldeq-${Math.random().toString(36).slice(2)}`,
+        contractAddress: '0xVAULT',
+        compiledArtifactRef: 'attestation-vault'
+    });
+
+    function setupHandlersWithDb(overrides: any = {}) {
+        const srv = makeFakeService();
+        const db = { run: vi.fn().mockResolvedValue(undefined) };
+        registerSubmissionHandlers(srv as any, db, {
+            resolveContractImpl: vi.fn(async () => ({ ...RESOLVED_CONTRACT_FIXTURE })),
+            walletMaterialFactory: vi.fn(async () => ({
+                accountId: 'a',
+                privateStoragePasswordProvider: () => '0123456789ABCDEFG',
+                walletAndMidnightProvider: {}
+            })),
+            submitterFactory: vi.fn(() => makeSuccessfulSubmitter()),
+            ...overrides
+        });
+        return { srv, db };
+    }
+
+    test.each([
+        [{ payloadHash: undefined }, /payloadHash is required/],
+        [{ fieldKey: 'zz' }, /fieldKey must be 64 hex/],
+        [{ expectedDigest: undefined }, /exactly one of expectedValue \/ expectedDigest/],
+        [{ expectedValue: 'NMC811' }, /exactly one of expectedValue \/ expectedDigest/],
+        [{ expectedDigest: 'zz' }, /expectedDigest must be 64 hex/],
+        [{ siblingsJson: JSON.stringify(SIBLINGS.slice(0, 2)) }, /array of 4 hashes/],
+        [{ dirsJson: JSON.stringify([true, false, 'false', true]) }, /entries must be booleans/],
+        [{ contentRoot: 'oops' }, /contentRoot must be 64 hex/],
+        [{ sessionId: undefined }, /sessionId is required/],
+        [{ contractAddress: undefined }, /contractAddress is required/]
+    ])('rejects %o', async (patch, msg) => {
+        const { srv } = setupHandlersWithDb();
+        const req = makeReq({ ...VALID_ARGS(), ...patch });
+        await srv.handlers['issueFieldEqualityAttestation'](req);
+        expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(msg));
+    });
+
+    test('is blocked on mainnet by default (403)', async () => {
+        const prev = process.env.NIGHTGATE_NETWORK;
+        process.env.NIGHTGATE_NETWORK = 'mainnet';
+        try {
+            const { srv } = setupHandlersWithDb();
+            const req = makeReq(VALID_ARGS());
+            await srv.handlers['issueFieldEqualityAttestation'](req);
+            expect(req.reject).toHaveBeenCalledWith(403, expect.stringMatching(/mainnet/i));
+        } finally {
+            if (prev === undefined) delete process.env.NIGHTGATE_NETWORK;
+            else process.env.NIGHTGATE_NETWORK = prev;
+        }
+    });
+
+    test('happy path: anchor + proveFieldEquality with the digest as a PUBLIC arg and a path-only bundle', async () => {
+        const submitter = makeSuccessfulSubmitter();
+        const { srv, db } = setupHandlersWithDb({ submitterFactory: () => submitter });
+        const req = makeReq(VALID_ARGS());
+
+        const result: any = await srv.handlers['issueFieldEqualityAttestation'](req);
+        expect(req.reject).not.toHaveBeenCalled();
+        expect(result).toEqual({
+            jobId: 'job-issueFieldEqualityAttestation-test',
+            status: 'pending',
+            predicateAttestationId: expect.any(String)
+        });
+
+        expect(db.run).toHaveBeenCalledTimes(2); // INSERT + UPDATE
+        const inserted = JSON.stringify((db.run as Mock).mock.calls[0][0]);
+        expect(inserted).toContain('bytesEquality');
+        expect(inserted).toContain(EXPECTED);
+
+        expect(submitter.call).toHaveBeenCalledTimes(2);
+        const prove = (submitter.call as Mock).mock.calls[1][0];
+        expect(prove.circuit).toBe('proveFieldEquality');
+        // args: payloadHash, fieldKey, expectedDigest (all public Bytes<32>).
+        expect(prove.args).toHaveLength(3);
+        expect(Buffer.from(prove.args[2]).toString('hex')).toBe(EXPECTED);
+        // Path-only bundle: no fieldValue, no fieldDigest, no setProof.
+        expect(prove.merkleProof).toEqual({ siblings: SIBLINGS, dirs: [true, false, true, false] });
+    });
+
+    test('digests a raw expectedValue server-side (exact string, no trimming)', async () => {
+        const submitter = makeSuccessfulSubmitter();
+        const { srv, db } = setupHandlersWithDb({ submitterFactory: () => submitter });
+        const req = makeReq({ ...VALID_ARGS(), expectedDigest: undefined, expectedValue: ' NMC811 ' });
+
+        await srv.handlers['issueFieldEqualityAttestation'](req);
+        expect(req.reject).not.toHaveBeenCalled();
+        const { blake2b256Hex } = await import('../../srv/submission/document-proof.js');
+        const digest = blake2b256Hex(' NMC811 ');
+        const prove = (submitter.call as Mock).mock.calls[1][0];
+        expect(Buffer.from(prove.args[2]).toString('hex')).toBe(digest);
+        expect(JSON.stringify((db.run as Mock).mock.calls[0][0])).toContain(digest);
+    });
+});
+
+// ---- issueFieldMembershipAttestation (set membership, 0.15.0) --------------
+
+describe('issueFieldMembershipAttestation', () => {
+    const VALID_PAYLOAD = 'a'.repeat(64);
+    const VALID_FIELD_KEY = 'f'.repeat(64);
+    const SIBLINGS = ['1'.repeat(64), '2'.repeat(64), '3'.repeat(64), '4'.repeat(64)];
+    const SET_SIBLINGS = ['5'.repeat(64), '6'.repeat(64), '7'.repeat(64), '8'.repeat(64), '9'.repeat(64), 'a'.repeat(64)];
+    const SET_ROOT = 'e'.repeat(64);
+    const DIGEST = 'c'.repeat(64);
+    const VALID_ARGS = () => ({
+        payloadHash: VALID_PAYLOAD,
+        fieldKey: VALID_FIELD_KEY,
+        valueDigest: DIGEST,
+        setRoot: SET_ROOT,
+        setSiblingsJson: JSON.stringify(SET_SIBLINGS),
+        setDirsJson: JSON.stringify([true, false, true, false, true, false]),
+        siblingsJson: JSON.stringify(SIBLINGS),
+        dirsJson: JSON.stringify([true, false, true, false]),
+        sessionId: `fieldmem-${Math.random().toString(36).slice(2)}`,
+        contractAddress: '0xVAULT',
+        compiledArtifactRef: 'attestation-vault'
+    });
+
+    /** Fake pure circuits for the allowedValuesJson lane (set-root builder). */
+    const fakeSetPure = {
+        leafHash: vi.fn(), nodeHash: (l: Uint8Array, r: Uint8Array) => {
+            const out = new Uint8Array(32);
+            for (let i = 0; i < 32; i++) out[i] = (l[i] ^ r[i]) ^ 0x5a;
+            return out;
+        },
+        bytesLeafHash: vi.fn(),
+        setLeafHash: (d: Uint8Array) => {
+            const out = new Uint8Array(32);
+            for (let i = 0; i < 32; i++) out[i] = d[i] ^ 0xa5;
+            return out;
+        }
+    } as any;
+
+    function setupHandlersWithDb(overrides: any = {}) {
+        const srv = makeFakeService();
+        const db = { run: vi.fn().mockResolvedValue(undefined) };
+        registerSubmissionHandlers(srv as any, db, {
+            resolveContractImpl: vi.fn(async () => ({ ...RESOLVED_CONTRACT_FIXTURE })),
+            walletMaterialFactory: vi.fn(async () => ({
+                accountId: 'a',
+                privateStoragePasswordProvider: () => '0123456789ABCDEFG',
+                walletAndMidnightProvider: {}
+            })),
+            submitterFactory: vi.fn(() => makeSuccessfulSubmitter()),
+            pureCircuitsLoader: vi.fn(async () => fakeSetPure),
+            ...overrides
+        });
+        return { srv, db };
+    }
+
+    test.each([
+        [{ payloadHash: 'zz' }, /payloadHash must be 64 hex/],
+        [{ fieldKey: undefined }, /fieldKey is required/],
+        [{ valueDigest: undefined }, /exactly one of value \/ valueDigest/],
+        [{ value: 'EEA' }, /exactly one of value \/ valueDigest/],
+        [{ valueDigest: 'zz' }, /valueDigest must be 64 hex/],
+        [{ allowedValuesJson: '["EEA"]' }, /not both/],
+        [{ setRoot: undefined, setSiblingsJson: undefined, setDirsJson: undefined }, /allowedValuesJson or setRoot \+ setSiblingsJson \+ setDirsJson is required/],
+        [{ setRoot: 'zz' }, /setRoot must be 64 hex/],
+        [{ setSiblingsJson: JSON.stringify(SET_SIBLINGS.slice(0, 3)) }, /setSiblingsJson must be a JSON array of 6 hashes/],
+        [{ setDirsJson: JSON.stringify([true, false, 'false', true, false, true]) }, /setDirsJson entries must be booleans/],
+        [{ siblingsJson: JSON.stringify(SIBLINGS.slice(0, 2)) }, /array of 4 hashes/],
+        [{ sessionId: undefined }, /sessionId is required/],
+        [{ contractAddress: undefined }, /contractAddress is required/]
+    ])('rejects %o', async (patch, msg) => {
+        const { srv } = setupHandlersWithDb();
+        const req = makeReq({ ...VALID_ARGS(), ...patch });
+        await srv.handlers['issueFieldMembershipAttestation'](req);
+        expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(msg));
+    });
+
+    test('happy path (precomputed set lane): proveFieldMembership with digest + both paths as witnesses only', async () => {
+        const submitter = makeSuccessfulSubmitter();
+        const { srv, db } = setupHandlersWithDb({ submitterFactory: () => submitter });
+        const req = makeReq(VALID_ARGS());
+
+        const result: any = await srv.handlers['issueFieldMembershipAttestation'](req);
+        expect(req.reject).not.toHaveBeenCalled();
+        expect(result).toEqual({
+            jobId: 'job-issueFieldMembershipAttestation-test',
+            status: 'pending',
+            predicateAttestationId: expect.any(String)
+        });
+
+        const inserted = JSON.stringify((db.run as Mock).mock.calls[0][0]);
+        expect(inserted).toContain('setMembership');
+        expect(inserted).toContain(SET_ROOT);
+        // The hidden digest is never persisted in the row.
+        expect(inserted).not.toContain(DIGEST);
+
+        expect(submitter.call).toHaveBeenCalledTimes(1); // no contentRoot -> proof only
+        const prove = (submitter.call as Mock).mock.calls[0][0];
+        expect(prove.circuit).toBe('proveFieldMembership');
+        // args: payloadHash, fieldKey, setRoot. NEVER the value digest.
+        expect(prove.args).toHaveLength(3);
+        expect(Buffer.from(prove.args[2]).toString('hex')).toBe(SET_ROOT);
+        const flatArgs = JSON.stringify(prove.args, (_k, v) => typeof v === 'bigint' ? v.toString() : v);
+        expect(flatArgs).not.toContain(DIGEST);
+        expect(prove.merkleProof).toEqual({
+            fieldDigest: DIGEST,
+            siblings: SIBLINGS,
+            dirs: [true, false, true, false],
+            setProof: { siblings: SET_SIBLINGS, dirs: [true, false, true, false, true, false] }
+        });
+    });
+
+    test('allowedValuesJson lane: builds the canonical set, rejects non-members BEFORE any job', async () => {
+        const submitter = makeSuccessfulSubmitter();
+        const { srv, db } = setupHandlersWithDb({ submitterFactory: () => submitter });
+        const { blake2b256Hex } = await import('../../srv/submission/document-proof.js');
+        const { buildMembershipSet, membershipPathFor } = await import('../../srv/submission/set-root.js');
+
+        const list = ['EEA', 'CH', 'NO'];
+        const expected = membershipPathFor(list, blake2b256Hex('CH'), fakeSetPure)!;
+
+        const ok = makeReq({
+            ...VALID_ARGS(), valueDigest: undefined, value: 'CH',
+            setRoot: undefined, setSiblingsJson: undefined, setDirsJson: undefined,
+            allowedValuesJson: JSON.stringify(list)
+        });
+        await srv.handlers['issueFieldMembershipAttestation'](ok);
+        expect(ok.reject).not.toHaveBeenCalled();
+        const prove = (submitter.call as Mock).mock.calls[0][0];
+        expect(Buffer.from(prove.args[2]).toString('hex')).toBe(buildMembershipSet(list, fakeSetPure).setRoot);
+        expect(prove.merkleProof.setProof).toEqual({ siblings: expected.setSiblings, dirs: expected.setDirs });
+
+        (db.run as Mock).mockClear();
+        const notInList = makeReq({
+            ...VALID_ARGS(), valueDigest: undefined, value: 'DE',
+            setRoot: undefined, setSiblingsJson: undefined, setDirsJson: undefined,
+            allowedValuesJson: JSON.stringify(list)
+        });
+        await srv.handlers['issueFieldMembershipAttestation'](notInList);
+        expect(notInList.reject).toHaveBeenCalledWith(400, expect.stringMatching(/not in the allowed list/));
+        expect(db.run).not.toHaveBeenCalled(); // no row, no job, no budget spent
+    });
+});
+
+// ---- Mixed batch (numeric + equality + membership in ONE tx, 0.15.0) -------
+
+describe('issueFieldPredicateAttestationBatch: mixed claim kinds', () => {
+    const VALID_PAYLOAD = 'a'.repeat(64);
+    const VALID_ROOT = 'd'.repeat(64);
+    const SIBLINGS = ['1'.repeat(64), '2'.repeat(64), '3'.repeat(64), '4'.repeat(64)];
+    const SET_SIBLINGS = ['5'.repeat(64), '6'.repeat(64), '7'.repeat(64), '8'.repeat(64), '9'.repeat(64), 'a'.repeat(64)];
+    const SET_ROOT = 'e'.repeat(64);
+    const DIGEST = 'c'.repeat(64);
+    const EXPECTED = 'b'.repeat(64);
+
+    const numericClaim = {
+        fieldKey: '1'.repeat(64), value: '1001', siblings: SIBLINGS, dirs: [true, false, true, false],
+        predicate: 'lessOrEqual', threshold: '50001', unit: 'kg'
+    };
+    const equalityClaim = {
+        fieldKey: '2'.repeat(64), expectedDigest: EXPECTED, siblings: SIBLINGS, dirs: [true, false, true, false],
+        predicate: 'bytesEquality'
+    };
+    const membershipClaim = {
+        fieldKey: '3'.repeat(64), valueDigest: DIGEST,
+        setRoot: SET_ROOT, setSiblings: SET_SIBLINGS, setDirs: [true, false, true, false, true, false],
+        siblings: SIBLINGS, dirs: [true, false, true, false],
+        predicate: 'setMembership'
+    };
+
+    const VALID_ARGS = (patch: any = {}) => ({
+        payloadHash: VALID_PAYLOAD,
+        contentRoot: VALID_ROOT,
+        claimsJson: JSON.stringify([numericClaim, equalityClaim, membershipClaim]),
+        sessionId: `mixedbatch-${Math.random().toString(36).slice(2)}`,
+        contractAddress: '0xVAULT',
+        compiledArtifactRef: 'attestation-vault',
+        ...patch
+    });
+
+    function setupHandlersWithDb(overrides: any = {}) {
+        const srv = makeFakeService();
+        const db = { run: vi.fn().mockResolvedValue(undefined) };
+        registerSubmissionHandlers(srv as any, db, {
+            resolveContractImpl: vi.fn(async () => ({ ...RESOLVED_CONTRACT_FIXTURE })),
+            walletMaterialFactory: vi.fn(async () => ({
+                accountId: 'a',
+                privateStoragePasswordProvider: () => '0123456789ABCDEFG',
+                walletAndMidnightProvider: {}
+            })),
+            submitterFactory: vi.fn(() => makeSuccessfulSubmitter()),
+            ...overrides
+        });
+        return { srv, db };
+    }
+
+    test.each([
+        [{ claimsJson: JSON.stringify([{ ...equalityClaim, expectedDigest: undefined }]) }, /claims\[0\]: pass exactly one of expectedValue \/ expectedDigest/],
+        [{ claimsJson: JSON.stringify([{ ...membershipClaim, valueDigest: undefined }]) }, /claims\[0\]: pass exactly one of value \/ valueDigest/],
+        [{ claimsJson: JSON.stringify([{ ...membershipClaim, setRoot: undefined }]) }, /claims\[0\]: allowedValues or setRoot \+ setSiblings \+ setDirs is required/],
+        [{ claimsJson: JSON.stringify([{ ...membershipClaim, allowedValues: ['x'] }]) }, /claims\[0\]: pass either allowedValues or setRoot/],
+        [{ claimsJson: JSON.stringify([{ ...membershipClaim, setSiblings: SET_SIBLINGS.slice(0, 3) }]) }, /claims\[0\].setSiblings must be a JSON array of 6 hashes/],
+        [{ claimsJson: JSON.stringify([{ ...numericClaim, predicate: 'between' }]) }, /claims\[0\].predicate must be 'lessOrEqual', 'greaterOrEqual', 'bytesEquality' or 'setMembership'/]
+    ])('rejects %o', async (patch, msg) => {
+        const { srv } = setupHandlersWithDb();
+        const req = makeReq(VALID_ARGS(patch));
+        await srv.handlers['issueFieldPredicateAttestationBatch'](req);
+        expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(msg));
+    });
+
+    test('one callBatch carries anchor + all three claim kinds with per-kind args and bundles', async () => {
+        const submitter = makeSuccessfulSubmitter();
+        const { srv, db } = setupHandlersWithDb({ submitterFactory: () => submitter });
+        const req = makeReq(VALID_ARGS());
+
+        const result: any = await srv.handlers['issueFieldPredicateAttestationBatch'](req);
+        expect(req.reject).not.toHaveBeenCalled();
+        expect(result.droppedDuplicates).toBe(0);
+        const claims = JSON.parse(result.claims);
+        expect(claims.map((c: any) => c.predicate)).toEqual(['lessOrEqual', 'bytesEquality', 'setMembership']);
+        expect(claims[1].expectedDigest).toBe(EXPECTED);
+        expect(claims[2].setRoot).toBe(SET_ROOT);
+
+        expect(submitter.callBatch).toHaveBeenCalledTimes(1);
+        const batchArgs = (submitter.callBatch as Mock).mock.calls[0][0];
+        expect(batchArgs.calls.map((c: any) => c.circuit)).toEqual([
+            'anchorContentRoot', 'proveFieldPredicate', 'proveFieldEquality', 'proveFieldMembership'
+        ]);
+
+        const [, numeric, equality, membership] = batchArgs.calls;
+        expect(numeric.args).toHaveLength(4);
+        expect(numeric.merkleProof.fieldValue).toBe('1001');
+        expect(equality.args).toHaveLength(3);
+        expect(Buffer.from(equality.args[2]).toString('hex')).toBe(EXPECTED);
+        expect(equality.merkleProof).toEqual({ siblings: SIBLINGS, dirs: [true, false, true, false] });
+        expect(membership.args).toHaveLength(3);
+        expect(Buffer.from(membership.args[2]).toString('hex')).toBe(SET_ROOT);
+        expect(membership.merkleProof).toEqual({
+            fieldDigest: DIGEST, siblings: SIBLINGS, dirs: [true, false, true, false],
+            setProof: { siblings: SET_SIBLINGS, dirs: [true, false, true, false, true, false] }
+        });
+        // The membership digest never appears as a circuit arg anywhere.
+        const allArgs = JSON.stringify(batchArgs.calls.map((c: any) => c.args), (_k, v) => typeof v === 'bigint' ? v.toString() : v);
+        expect(allArgs).not.toContain(DIGEST);
+
+        // 1 bulk INSERT + 1 bulk UPDATE, rows carry per-kind statement columns.
+        expect(db.run).toHaveBeenCalledTimes(2);
+        const inserted = JSON.stringify((db.run as Mock).mock.calls[0][0]);
+        expect(inserted).toContain('bytesEquality');
+        expect(inserted).toContain('setMembership');
+        expect(inserted).toContain(EXPECTED);
+        expect(inserted).toContain(SET_ROOT);
+        expect(inserted).not.toContain(DIGEST);
+    });
+
+    test('per-kind dedup tuples: equality dupes by expectedDigest, membership dupes by setRoot', async () => {
+        const submitter = makeSuccessfulSubmitter();
+        const { srv } = setupHandlersWithDb({ submitterFactory: () => submitter });
+        const req = makeReq(VALID_ARGS({
+            claimsJson: JSON.stringify([
+                equalityClaim, { ...equalityClaim }, // exact dupe -> dropped
+                membershipClaim, { ...membershipClaim, valueDigest: 'd'.repeat(64) } // same (fieldKey, setRoot) -> dropped
+            ])
+        }));
+
+        const result: any = await srv.handlers['issueFieldPredicateAttestationBatch'](req);
+        expect(req.reject).not.toHaveBeenCalled();
+        expect(result.droppedDuplicates).toBe(2);
+        const batchArgs = (submitter.callBatch as Mock).mock.calls[0][0];
+        expect(batchArgs.calls.map((c: any) => c.circuit)).toEqual([
+            'anchorContentRoot', 'proveFieldEquality', 'proveFieldMembership'
+        ]);
     });
 });

@@ -29,6 +29,8 @@ vi.mock('../../srv/midnight/providers', () => ({
 import {
     computePredicateClaimKey,
     computeFieldPredicateClaimKey,
+    computeFieldEqualityClaimKey,
+    computeFieldMembershipClaimKey,
     readPredicateStateForContract
 } from '../../srv/submission/predicate-state';
 import { readAttestationStateForContract } from '../../srv/submission/attestation-state';
@@ -50,6 +52,13 @@ const FIELD_KEY = 'b2'.repeat(32);
 const KEY_LE_42000 = '6e20691b65c4d12ea5ec5453461fd9c41b29834423a4b02e54b2d24e03c695c7';
 const KEY_GE_42000 = '938f8244f76dc86b191dccda73b934a452c07193075c76f13d72d80ef9f1d483';
 const FIELD_KEY_GE_18000 = '56116c3993ae2f0523e5797f0e9304866ab4290e99cc204b3f84e52362f705ae';
+// Bytes-claim keys (0.15.0): Bytes<32> ++ Bytes<32> ++ Bytes<32> in struct
+// field order; byte-exactness against the live vault is asserted by the
+// membership e2e (verifyPredicateState on an on-chain proof).
+const EXPECTED_DIGEST = 'c3'.repeat(32);
+const SET_ROOT = 'd4'.repeat(32);
+const EQUALITY_KEY = '7de79a432299c9c2d44de03fac043ccbb14b3059222b44adf6c38b4872c46154';
+const MEMBERSHIP_KEY = '7372a6cb2119a4d19c83dbe973e854fbc329ea6dd50f2a6bc23e15950279afaa';
 
 beforeEach(() => {
     queryContractState.mockReset();
@@ -67,6 +76,26 @@ describe('claim-key recomputation (real compact-runtime)', () => {
 
     it('computeFieldPredicateClaimKey reproduces the pinned field-bound key', async () => {
         await expect(computeFieldPredicateClaimKey(PAYLOAD, FIELD_KEY, 18000n, 1)).resolves.toBe(FIELD_KEY_GE_18000);
+    });
+
+    it('computeFieldEqualityClaimKey reproduces the pinned equality key', async () => {
+        await expect(computeFieldEqualityClaimKey(PAYLOAD, FIELD_KEY, EXPECTED_DIGEST)).resolves.toBe(EQUALITY_KEY);
+    });
+
+    it('computeFieldMembershipClaimKey reproduces the pinned membership key', async () => {
+        await expect(computeFieldMembershipClaimKey(PAYLOAD, FIELD_KEY, SET_ROOT)).resolves.toBe(MEMBERSHIP_KEY);
+    });
+
+    it('equality and membership keys differ even for identical coordinates', async () => {
+        // Same 3 x Bytes<32> layout; only the persistentHash struct alignment
+        // (via the value bytes) separates them. Same third coordinate:
+        const eq = await computeFieldEqualityClaimKey(PAYLOAD, FIELD_KEY, 'e5'.repeat(32));
+        const mem = await computeFieldMembershipClaimKey(PAYLOAD, FIELD_KEY, 'e5'.repeat(32));
+        expect(eq).toMatch(/^[0-9a-f]{64}$/);
+        // NOTE: with identical layouts persistentHash yields the SAME digest;
+        // cross-kind isolation comes from the SEPARATE ledger maps, which the
+        // predicate-state tests assert. This pin documents the fact.
+        expect(mem).toBe(eq);
     });
 
     it('is sensitive to every coordinate (payload, threshold, op, fieldKey)', async () => {

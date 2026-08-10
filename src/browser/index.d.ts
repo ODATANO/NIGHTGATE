@@ -108,6 +108,8 @@ export function prepareRegisterPassport(input: { passportId: string; ownerId: st
 export function prepareBindPassport(input: { passportId: string; payloadHash: string; attestationSecret: Uint8Array }): PreparedCall;
 export function prepareAnchorContentRoot(input: { payloadHash: string; contentRoot: string; attestationSecret: Uint8Array }): PreparedCall;
 export function prepareProveFieldPredicate(input: { payloadHash: string; fieldKey: string; threshold: number | bigint; op: number | bigint; merkleProof: import('./witnesses.js').MerkleProof; attestationSecret: Uint8Array }): PreparedCall;
+export function prepareProveFieldEquality(input: { payloadHash: string; fieldKey: string; expectedDigest: string; merkleProof: import('./witnesses.js').MerkleProof; attestationSecret: Uint8Array }): PreparedCall;
+export function prepareProveFieldMembership(input: { payloadHash: string; fieldKey: string; setRoot: string; merkleProof: import('./witnesses.js').MerkleProof; attestationSecret: Uint8Array }): PreparedCall;
 
 export interface ContractBrowserMeta {
     name: string;

@@ -31,47 +31,71 @@ export interface WitnessFactoryInput {
         valueSalt:     string;
     };
     /**
-     * Per-CALL Merkle inclusion proof for the field-bound predicate circuit
-     * (`proveFieldPredicate`). Absent for every other circuit. Serialized as
-     * primitives so it survives the worker-thread boundary:
-     *   - `fieldValue`: decimal string of the Uint<64> field value being proven.
-     *   - `siblings`: 4 × 64-char hex (the DEPTH=4 inclusion path sibling digests).
+     * Per-CALL proof bundle for the field-bound proof circuits. Absent for
+     * every other circuit. Serialized as primitives so it survives the
+     * worker-thread boundary:
+     *   - `fieldValue`: decimal string of the Uint<64> field value
+     *     (`proveFieldPredicate` only).
+     *   - `fieldDigest`: 64-char hex digest of the field's value bytes
+     *     (`proveFieldMembership` only; `proveFieldEquality` needs neither,
+     *     its expected digest is a public circuit arg).
+     *   - `siblings`: 4 × 64-char hex (the DEPTH=4 content-root path).
      *   - `dirs`: 4 booleans (true = current node is the LEFT child at that level).
+     *   - `setProof`: DEPTH=6 membership-set path (`proveFieldMembership` only),
+     *     6 × 64-char hex siblings + 6 booleans.
      */
-    merkleProof?: {
-        fieldValue: string;
-        siblings:   string[];
-        dirs:       boolean[];
-    };
+    merkleProof?: MerkleProofBundle;
     /**
      * Batch mode: a mutable holder whose `current` proof the batch loop swaps
      * immediately before each call (wallet-worker builds `before` hooks for
      * batch-call-scope.ts). Resolved at witness INVOCATION time, so ONE
-     * compiled contract instance serves N `proveFieldPredicate` calls with N
-     * different inclusion proofs inside one transaction scope. Mutually
-     * exclusive with `merkleProof`. Same primitive serialization rules.
+     * compiled contract instance serves N proof calls with N different
+     * bundles inside one transaction scope. Mutually exclusive with
+     * `merkleProof`. Same primitive serialization rules.
      */
     merkleProofHolder?: {
-        current?: { fieldValue: string; siblings: string[]; dirs: boolean[] };
+        current?: MerkleProofBundle;
     };
 }
 
-const MERKLE_DEPTH = 4;
-
-interface DecodedMerkleProof {
-    fieldValue: bigint;
-    siblings:   Uint8Array[];
-    dirs:       boolean[];
+export interface MerkleProofBundle {
+    fieldValue?:  string;
+    fieldDigest?: string;
+    siblings:     string[];
+    dirs:         boolean[];
+    setProof?:    { siblings: string[]; dirs: boolean[] };
 }
 
-function decodeMerkleProof(proof: { fieldValue: string; siblings: string[]; dirs: boolean[] }): DecodedMerkleProof {
-    const fieldValue = BigInt(proof.fieldValue);
+const MERKLE_DEPTH = 4;
+const SET_DEPTH = 6;
+
+interface DecodedMerkleProof {
+    fieldValue?:  bigint;
+    fieldDigest?: Uint8Array;
+    siblings:     Uint8Array[];
+    dirs:         boolean[];
+    setSiblings?: Uint8Array[];
+    setDirs?:     boolean[];
+}
+
+function decodeMerkleProof(proof: MerkleProofBundle): DecodedMerkleProof {
+    const fieldValue = proof.fieldValue !== undefined ? BigInt(proof.fieldValue) : undefined;
+    const fieldDigest = proof.fieldDigest !== undefined ? hexToBytes32(proof.fieldDigest) : undefined;
     const siblings = (proof.siblings || []).map(hexToBytes32);
     const dirs = (proof.dirs || []).map(Boolean);
     if (siblings.length !== MERKLE_DEPTH || dirs.length !== MERKLE_DEPTH) {
         throw new Error(`merkleProof.siblings and .dirs must each have ${MERKLE_DEPTH} entries`);
     }
-    return { fieldValue, siblings, dirs };
+    let setSiblings: Uint8Array[] | undefined;
+    let setDirs: boolean[] | undefined;
+    if (proof.setProof) {
+        setSiblings = (proof.setProof.siblings || []).map(hexToBytes32);
+        setDirs = (proof.setProof.dirs || []).map(Boolean);
+        if (setSiblings.length !== SET_DEPTH || setDirs.length !== SET_DEPTH) {
+            throw new Error(`merkleProof.setProof.siblings and .dirs must each have ${SET_DEPTH} entries`);
+        }
+    }
+    return { fieldValue, fieldDigest, siblings, dirs, setSiblings, setDirs };
 }
 
 function hexToBytes32(hex: string): Uint8Array {
@@ -127,7 +151,7 @@ export function buildAttestationVaultWitnesses(input: WitnessFactoryInput): any 
             return decodeMerkleProof(holder.current);
         }
         if (staticProof === undefined) {
-            throw new Error(`${witnessName} witness invoked without a merkleProof; proveFieldPredicate requires merkleProof`);
+            throw new Error(`${witnessName} witness invoked without a merkleProof; the field-bound proof circuits require a proof bundle`);
         }
         return staticProof;
     };
@@ -148,13 +172,38 @@ export function buildAttestationVaultWitnesses(input: WitnessFactoryInput): any 
             return [ctx.privateState, salt];
         },
         field_value(ctx: { privateState: unknown }): [unknown, bigint] {
-            return [ctx.privateState, currentProof('field_value').fieldValue];
+            const p = currentProof('field_value');
+            if (p.fieldValue === undefined) {
+                throw new Error('field_value witness invoked without a fieldValue; proveFieldPredicate requires a numeric proof bundle');
+            }
+            return [ctx.privateState, p.fieldValue];
         },
         merkle_siblings(ctx: { privateState: unknown }): [unknown, Uint8Array[]] {
             return [ctx.privateState, currentProof('merkle_siblings').siblings];
         },
         merkle_dirs(ctx: { privateState: unknown }): [unknown, boolean[]] {
             return [ctx.privateState, currentProof('merkle_dirs').dirs];
+        },
+        field_digest(ctx: { privateState: unknown }): [unknown, Uint8Array] {
+            const p = currentProof('field_digest');
+            if (p.fieldDigest === undefined) {
+                throw new Error('field_digest witness invoked without a fieldDigest; proveFieldMembership requires a bytes proof bundle');
+            }
+            return [ctx.privateState, p.fieldDigest];
+        },
+        set_siblings(ctx: { privateState: unknown }): [unknown, Uint8Array[]] {
+            const p = currentProof('set_siblings');
+            if (p.setSiblings === undefined) {
+                throw new Error('set_siblings witness invoked without a setProof; proveFieldMembership requires the membership-set path');
+            }
+            return [ctx.privateState, p.setSiblings];
+        },
+        set_dirs(ctx: { privateState: unknown }): [unknown, boolean[]] {
+            const p = currentProof('set_dirs');
+            if (p.setDirs === undefined) {
+                throw new Error('set_dirs witness invoked without a setProof; proveFieldMembership requires the membership-set path');
+            }
+            return [ctx.privateState, p.setDirs];
         }
     };
 }

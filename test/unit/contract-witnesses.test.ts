@@ -230,6 +230,74 @@ describe('buildAttestationVaultWitnesses: batch proof holder (per-call rebinding
     });
 });
 
+describe('buildAttestationVaultWitnesses: bytes proof witnesses (proveFieldEquality/proveFieldMembership)', () => {
+    const secret = new Uint8Array(32).fill(0xab);
+    const SIB = ['1', '2', '3', '4'].map((n) => n.repeat(64));
+    const SET_SIB = ['a', 'b', 'c', 'd', 'e', 'f'].map((n) => n.repeat(64));
+    const DIGEST = '9'.repeat(64);
+    const membershipProof = {
+        fieldDigest: DIGEST, siblings: SIB, dirs: [true, false, true, false],
+        setProof: { siblings: SET_SIB, dirs: [false, true, false, true, false, true] }
+    };
+
+    test('always exposes field_digest / set_siblings / set_dirs (Witnesses<PS> shape complete)', () => {
+        const w = buildAttestationVaultWitnesses({ attestationSecret: secret });
+        expect(typeof w.field_digest).toBe('function');
+        expect(typeof w.set_siblings).toBe('function');
+        expect(typeof w.set_dirs).toBe('function');
+    });
+
+    test('membership bundle serves digest, content path and set path', () => {
+        const w = buildAttestationVaultWitnesses({ attestationSecret: secret, merkleProof: membershipProof });
+        const [, digest] = w.field_digest({ privateState: null });
+        expect(Buffer.from(digest).toString('hex')).toBe(DIGEST);
+        const [, setSibs] = w.set_siblings({ privateState: null });
+        expect(setSibs).toHaveLength(6);
+        expect(Buffer.from(setSibs[0]).toString('hex')).toBe('a'.repeat(64));
+        expect(w.set_dirs({ privateState: null })[1]).toEqual([false, true, false, true, false, true]);
+        // The content-path witnesses serve the same bundle.
+        expect(w.merkle_siblings({ privateState: null })[1]).toHaveLength(4);
+    });
+
+    test('equality bundle (path only) serves the content path but throws for the membership witnesses', () => {
+        const w = buildAttestationVaultWitnesses({
+            attestationSecret: secret,
+            merkleProof: { siblings: SIB, dirs: [true, false, true, false] }
+        });
+        expect(w.merkle_siblings({ privateState: null })[1]).toHaveLength(4);
+        expect(() => w.field_value({ privateState: null })).toThrow(/numeric proof bundle/);
+        expect(() => w.field_digest({ privateState: null })).toThrow(/bytes proof bundle/);
+        expect(() => w.set_siblings({ privateState: null })).toThrow(/membership-set path/);
+        expect(() => w.set_dirs({ privateState: null })).toThrow(/membership-set path/);
+    });
+
+    test('wrong-length set path fails fast at build time', () => {
+        expect(() => buildAttestationVaultWitnesses({
+            attestationSecret: secret,
+            merkleProof: { ...membershipProof, setProof: { siblings: SET_SIB.slice(0, 5), dirs: [true, true, true, true, true, true] } }
+        })).toThrow(/must each have 6 entries/);
+    });
+
+    test('holder mode rebinds across MIXED bundles (numeric -> membership -> equality)', () => {
+        const numeric = { fieldValue: '100', siblings: SIB, dirs: [true, false, false, false] };
+        const equality = { siblings: SIB, dirs: [false, false, false, true] };
+        const holder: { current?: any } = { current: numeric };
+        const w = buildAttestationVaultWitnesses({ attestationSecret: secret, merkleProofHolder: holder });
+
+        expect(w.field_value({ privateState: null })[1]).toBe(100n);
+        expect(() => w.field_digest({ privateState: null })).toThrow(/bytes proof bundle/);
+
+        holder.current = membershipProof;
+        expect(Buffer.from(w.field_digest({ privateState: null })[1]).toString('hex')).toBe(DIGEST);
+        expect(w.set_dirs({ privateState: null })[1]).toEqual([false, true, false, true, false, true]);
+        expect(() => w.field_value({ privateState: null })).toThrow(/numeric proof bundle/);
+
+        holder.current = equality;
+        expect(w.merkle_dirs({ privateState: null })[1]).toEqual([false, false, false, true]);
+        expect(() => w.set_siblings({ privateState: null })).toThrow(/membership-set path/);
+    });
+});
+
 describe('getContractWitnessFactory', () => {
     test('returns the factory for attestation-vault', () => {
         const factory = getContractWitnessFactory('attestation-vault');

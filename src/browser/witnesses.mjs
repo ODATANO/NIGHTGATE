@@ -75,26 +75,41 @@ export function deriveAttestationSecretFromSignature(signatureHex) {
  *   merkle_dirs(ctx):      [PS, boolean[]]      (DEPTH=4)
  * `ctx.privateState` is passed through unchanged; the vault has no private state.
  *
- * `merkleProof` (for proveFieldPredicate): { fieldValue, siblings: string[4] hex,
- * dirs: boolean[4] }. Unused witnesses simply are never invoked for other
- * circuits, so a proof-less call (attest/grant/commitValue/…) is unaffected.
+ * `merkleProof` is a per-call proof BUNDLE for the field-bound proof circuits:
+ * { fieldValue?, fieldDigest?, siblings: string[4] hex, dirs: boolean[4],
+ *   setProof?: { siblings: string[6] hex, dirs: boolean[6] } }.
+ * `fieldValue` feeds proveFieldPredicate, `fieldDigest` + `setProof` feed
+ * proveFieldMembership; proveFieldEquality needs only siblings/dirs. Unused
+ * witnesses simply are never invoked for other circuits, so a proof-less call
+ * (attest/grant/commitValue/…) is unaffected.
  *
  * `merkleProofHolder` (batch mode, mutually exclusive with `merkleProof`):
- * { current?: { fieldValue, siblings, dirs } }. Resolved at witness
- * INVOCATION time; the batch loop swaps `holder.current` immediately before
- * each call, so one witness object serves N proveFieldPredicate calls inside
- * one transaction scope. Mirrors the server's `WitnessFactoryInput`.
+ * { current?: <bundle> }. Resolved at witness INVOCATION time; the batch loop
+ * swaps `holder.current` immediately before each call, so one witness object
+ * serves N proof calls inside one transaction scope. Mirrors the server's
+ * `WitnessFactoryInput`.
  */
 const MERKLE_DEPTH = 4;
+const SET_DEPTH = 6;
 
 function decodeMerkleProof(proof) {
-    const fieldValue = BigInt(proof.fieldValue);
+    const fieldValue = proof.fieldValue !== undefined ? BigInt(proof.fieldValue) : undefined;
+    const fieldDigest = proof.fieldDigest !== undefined ? hexToBytes32(proof.fieldDigest) : undefined;
     const siblings = (proof.siblings || []).map(hexToBytes32);
     const dirs = (proof.dirs || []).map(Boolean);
     if (siblings.length !== MERKLE_DEPTH || dirs.length !== MERKLE_DEPTH) {
         throw new Error(`merkleProof.siblings and .dirs must each have ${MERKLE_DEPTH} entries`);
     }
-    return { fieldValue, siblings, dirs };
+    let setSiblings;
+    let setDirs;
+    if (proof.setProof) {
+        setSiblings = (proof.setProof.siblings || []).map(hexToBytes32);
+        setDirs = (proof.setProof.dirs || []).map(Boolean);
+        if (setSiblings.length !== SET_DEPTH || setDirs.length !== SET_DEPTH) {
+            throw new Error(`merkleProof.setProof.siblings and .dirs must each have ${SET_DEPTH} entries`);
+        }
+    }
+    return { fieldValue, fieldDigest, siblings, dirs, setSiblings, setDirs };
 }
 
 export function buildAttestationVaultWitnesses({ attestationSecret, witnessValues, merkleProof, merkleProofHolder } = {}) {
@@ -117,7 +132,7 @@ export function buildAttestationVaultWitnesses({ attestationSecret, witnessValue
             return decodeMerkleProof(holder.current);
         }
         if (staticProof === undefined) {
-            throw new Error(`${witnessName} witness invoked without a merkleProof; proveFieldPredicate requires merkleProof`);
+            throw new Error(`${witnessName} witness invoked without a merkleProof; the field-bound proof circuits require a proof bundle`);
         }
         return staticProof;
     };
@@ -139,13 +154,38 @@ export function buildAttestationVaultWitnesses({ attestationSecret, witnessValue
             return [ctx.privateState, salt];
         },
         field_value(ctx) {
-            return [ctx.privateState, currentProof('field_value').fieldValue];
+            const p = currentProof('field_value');
+            if (p.fieldValue === undefined) {
+                throw new Error('field_value witness invoked without a fieldValue; proveFieldPredicate requires a numeric proof bundle');
+            }
+            return [ctx.privateState, p.fieldValue];
         },
         merkle_siblings(ctx) {
             return [ctx.privateState, currentProof('merkle_siblings').siblings];
         },
         merkle_dirs(ctx) {
             return [ctx.privateState, currentProof('merkle_dirs').dirs];
+        },
+        field_digest(ctx) {
+            const p = currentProof('field_digest');
+            if (p.fieldDigest === undefined) {
+                throw new Error('field_digest witness invoked without a fieldDigest; proveFieldMembership requires a bytes proof bundle');
+            }
+            return [ctx.privateState, p.fieldDigest];
+        },
+        set_siblings(ctx) {
+            const p = currentProof('set_siblings');
+            if (p.setSiblings === undefined) {
+                throw new Error('set_siblings witness invoked without a setProof; proveFieldMembership requires the membership-set path');
+            }
+            return [ctx.privateState, p.setSiblings];
+        },
+        set_dirs(ctx) {
+            const p = currentProof('set_dirs');
+            if (p.setDirs === undefined) {
+                throw new Error('set_dirs witness invoked without a setProof; proveFieldMembership requires the membership-set path');
+            }
+            return [ctx.privateState, p.setDirs];
         }
     };
 }

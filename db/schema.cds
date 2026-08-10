@@ -395,11 +395,13 @@ entity Documents : cuid, managed {
 entity PredicateAttestations : cuid, managed {
     payloadHash     : HexEncoded not null; // attestation this predicate is about
     contractAddress : HexEncoded not null; // AttestationVault deployment
-    predicate       : String(20) not null; // 'lessOrEqual' | 'greaterOrEqual'
-    op              : Integer not null; // 0 | 1
-    threshold       : Integer64 not null; // scaled integer
+    predicate       : String(20) not null; // 'lessOrEqual' | 'greaterOrEqual' | 'bytesEquality' | 'setMembership'
+    op              : Integer; // 0 | 1 for the numeric predicates; null for the bytes kinds
+    threshold       : Integer64; // scaled integer (numeric predicates only)
     unit            : String(50); // e.g. 'kgCO2e/kWh' (informational)
     fieldKey        : HexEncoded; // set for field-bound proofs (proveFieldPredicate); null for plain provePredicate
+    expectedDigest  : HexEncoded; // bytesEquality: public expected value digest
+    setRoot         : HexEncoded; // setMembership: canonical allow-list set root
     valueCommitment : HexEncoded; // persistentCommit(value, salt), on-chain
     provenTxHash    : HexEncoded; // tx that recorded the on-chain result
     provenAt        : Timestamp;

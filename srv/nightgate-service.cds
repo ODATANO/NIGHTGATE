@@ -328,14 +328,21 @@ service NightgateService {
      * root-exists assert holds); it then occupies one of the 8 call slots
      * (max 7 claims with anchor, 8 without).
      *
-     * `claimsJson` is a JSON array of
-     * `{ fieldKey, value, siblings, dirs, predicate, threshold, unit? }`,
-     * each entry validated exactly like the single action (64-hex keys,
-     * DEPTH=4 inclusion path, scaled integer value/threshold; value stays a
-     * witness, never persisted). Exact duplicate claim tuples
-     * (fieldKey, threshold, predicate) are dropped server-side and reported
-     * via `droppedDuplicates`; claim keys are idempotent on-chain, so this is
-     * a proving-time optimization only.
+     * `claimsJson` is a JSON array; entries may mix three claim kinds,
+     * discriminated by `predicate`:
+     *   - numeric: `{ fieldKey, value, siblings, dirs, predicate:
+     *     'lessOrEqual'|'greaterOrEqual', threshold, unit? }`
+     *   - equality: `{ fieldKey, expectedValue|expectedDigest, siblings,
+     *     dirs, predicate: 'bytesEquality' }`
+     *   - membership: `{ fieldKey, value|valueDigest, allowedValues |
+     *     setRoot+setSiblings+setDirs, siblings, dirs, predicate:
+     *     'setMembership' }`
+     * each entry validated exactly like its single action (64-hex keys,
+     * DEPTH=4 inclusion path; witness material never persisted). Exact
+     * duplicate claim tuples (numeric: fieldKey+threshold+predicate,
+     * equality: fieldKey+expectedDigest, membership: fieldKey+setRoot) are
+     * dropped server-side and reported via `droppedDuplicates`; claim keys
+     * are idempotent on-chain, so this is a proving-time optimization only.
      *
      * One PredicateAttestations row per claim; on success ALL rows share one
      * `provenTxHash`. Failure semantics: a false predicate fails at LOCAL
@@ -371,6 +378,84 @@ service NightgateService {
     };
 
     /**
+     * Field-bound EQUALITY proof for a bytes-valued (string) passport field:
+     * prove the anchored content root carries, at `fieldKey`, exactly the
+     * value whose blake2b-256 digest is `expectedDigest` (AttestationVault
+     * `proveFieldEquality`). The expected digest is PUBLIC (it is the
+     * statement), so this is an authenticity/binding proof, not a
+     * confidentiality feature: for low-entropy values the digest is
+     * dictionary-guessable.
+     *
+     * Pass exactly one of `expectedValue` (raw string; the server digests
+     * the exact string, no trimming) or `expectedDigest` (64 hex). The field
+     * must have entered the content root as a bytes leaf
+     * (`prepareDocumentProof` with `kind: 'bytes'`); `siblingsJson` /
+     * `dirsJson` are the DEPTH=4 inclusion path exactly as for
+     * `issueFieldPredicateAttestation`. If `contentRoot` is supplied it is
+     * anchored first.
+     *
+     * Async: returns `{ jobId, status, predicateAttestationId }` immediately.
+     */
+    action   issueFieldEqualityAttestation(payloadHash: String, // attestation payload_hash (64 hex)
+                                           fieldKey: String, // 64 hex canonical field id (public)
+                                           expectedValue: String, // raw string; server digests (pass this OR expectedDigest)
+                                           expectedDigest: String, // 64-hex blake2b-256 of the exact value string
+                                           contentRoot: String, // optional 64-hex Merkle root to anchor first
+                                           siblingsJson: String, // JSON array of 4 × 64-hex sibling digests
+                                           dirsJson: String, // JSON array of 4 booleans (left-child flags)
+                                           sessionId: UUID,
+                                           contractAddress: String, // AttestationVault deployment
+                                           compiledArtifactRef: String, // optional, defaults to 'attestation-vault'
+                                           idempotencyKey: String, // optional; dedupes retries
+                                           sponsorSessionId: UUID // optional; second session pays the dust fee
+    )                                                                 returns {
+        jobId                  : UUID;
+        status                 : String;
+        predicateAttestationId : UUID;
+    };
+
+    /**
+     * Field-bound SET-MEMBERSHIP proof for a bytes-valued (string) passport
+     * field: prove the field's HIDDEN value is one of a public allow-list,
+     * without revealing which one (AttestationVault `proveFieldMembership`).
+     * Two Merkle folds over the same witnessed digest: the DEPTH=4 content
+     * fold binds it to `fieldKey` of THIS passport, the DEPTH=6 set fold
+     * proves it is a leaf of the canonical membership-set tree (up to 64
+     * distinct values; rule: digest each value, dedupe, sort ascending, pad
+     * by repeating the last member digest; see `prepareMembershipSet`).
+     *
+     * Pass exactly one of `value` (raw string) or `valueDigest` (64 hex);
+     * both stay witness material, never persisted, never logged. Supply the
+     * allow-list as `allowedValuesJson` (JSON array of strings; the server
+     * builds the set root and inclusion path, rejecting 400 when the value
+     * is not in the list, BEFORE any proving) or precomputed as `setRoot` +
+     * `setSiblingsJson` + `setDirsJson`.
+     *
+     * Async: returns `{ jobId, status, predicateAttestationId }` immediately.
+     */
+    action   issueFieldMembershipAttestation(payloadHash: String, // attestation payload_hash (64 hex)
+                                             fieldKey: String, // 64 hex canonical field id (public)
+                                             value: String, // raw string value (witness only; pass this OR valueDigest)
+                                             valueDigest: String, // 64-hex blake2b-256 of the exact value string (witness only)
+                                             allowedValuesJson: LargeString, // JSON array of allowed strings (pass this OR setRoot+path)
+                                             setRoot: String, // 64-hex canonical set root
+                                             setSiblingsJson: String, // JSON array of 6 × 64-hex sibling digests
+                                             setDirsJson: String, // JSON array of 6 booleans (left-child flags)
+                                             contentRoot: String, // optional 64-hex Merkle root to anchor first
+                                             siblingsJson: String, // JSON array of 4 × 64-hex sibling digests
+                                             dirsJson: String, // JSON array of 4 booleans (left-child flags)
+                                             sessionId: UUID,
+                                             contractAddress: String, // AttestationVault deployment
+                                             compiledArtifactRef: String, // optional, defaults to 'attestation-vault'
+                                             idempotencyKey: String, // optional; dedupes retries
+                                             sponsorSessionId: UUID // optional; second session pays the dust fee
+    )                                                                 returns {
+        jobId                  : UUID;
+        status                 : String;
+        predicateAttestationId : UUID;
+    };
+
+    /**
      * Verify a predicate attestation under the on-chain-verified model: the
      * `provePredicate` proof is only accepted by the ledger if the in-circuit
      * asserts (commitment match + predicate) held, so a successful tx IS the
@@ -385,13 +470,18 @@ service NightgateService {
      * proofs use `persistentHash(PredicateClaim{payloadHash, threshold, op})`
      * against `predicate_results`; field-bound rows (with a `fieldKey`) use
      * `persistentHash(FieldPredicateClaim{payloadHash, fieldKey, threshold, op})`
-     * against `field_predicate_results`.
+     * against `field_predicate_results`. Bytes rows use
+     * `FieldEqualityClaim{payloadHash, fieldKey, expectedDigest}` against
+     * `field_equality_results` and `FieldMembershipClaim{payloadHash,
+     * fieldKey, setRoot}` against `field_membership_results`.
      */
     function verifyPredicateAttestation(predicateAttestationId: UUID) returns {
         verified        : Boolean;
         predicate       : String;
         threshold       : Integer64;
         unit            : String;
+        expectedDigest  : String; // bytesEquality rows: the public expected digest
+        setRoot         : String; // setMembership rows: the canonical set root
         valueCommitment : String;
         provenTxHash    : String;
         provenAt        : Timestamp;
@@ -438,6 +528,10 @@ service NightgateService {
      * from the supplied coordinates and confirms the vault recorded a true
      * result for it. Supply `fieldKey` for a field-bound proof
      * (`field_predicate_results`); omit it for a plain one (`predicate_results`).
+     * For the bytes claim kinds pass `predicate: 'bytesEquality'` +
+     * `expectedDigest` (`field_equality_results`) or `predicate:
+     * 'setMembership'` + `setRoot` (`field_membership_results`); `threshold`
+     * is ignored for both.
      *
      * `threshold` must be the SAME scaled Uint<64> integer the circuit hashed
      * into the claim key (e.g. raw value x1000 when the consumer scales by
@@ -454,8 +548,10 @@ service NightgateService {
     function verifyPredicateState(contractAddress: String,
                                   payloadHash: String, // 64 hex
                                   fieldKey: String, // optional 64 hex; when set, field-bound
-                                  predicate: String, // 'lessOrEqual' | 'greaterOrEqual'
-                                  threshold: Integer64, // scaled circuit integer (see above)
+                                  predicate: String, // 'lessOrEqual' | 'greaterOrEqual' | 'bytesEquality' | 'setMembership'
+                                  threshold: Integer64, // scaled circuit integer (numeric predicates only)
+                                  expectedDigest: String, // 64 hex, required for 'bytesEquality'
+                                  setRoot: String, // 64 hex canonical set root, required for 'setMembership'
                                   compiledArtifactRef: String, // optional, defaults to 'attestation-vault'
                                   network: String // optional network override, e.g. 'preview' | 'preprod' | 'mainnet'
     )                                                                 returns {
@@ -947,11 +1043,15 @@ service NightgateService {
      *
      * `documentJson` is a JSON object (the full document; all of it goes into
      * `payloadHash`). `proofFieldsJson` is an ordered JSON array of up to 16
-     * `{ field, scale? }` entries (scale defaults to 1000, milli-units).
-     * `field` is a dot-separated path into the document (`invoice.total`;
-     * numeric segments index arrays); a literal top-level key containing
-     * dots wins over path descent. Values must resolve to non-negative
-     * scalars (a path landing on an object/array is a 400); absent values
+     * `{ field, kind?, scale? }` entries. `kind` is 'uint' (default; numeric
+     * value scaled by `scale`, default 1000 milli-units) or 'bytes' (string
+     * value, entered as the blake2b-256 digest of the EXACT string; feeds
+     * `issueFieldEqualityAttestation` / `issueFieldMembershipAttestation`;
+     * `scale` not allowed). `field` is a dot-separated path into the document
+     * (`invoice.total`; numeric segments index arrays); a literal top-level
+     * key containing dots wins over path descent. Values must resolve to
+     * scalars (a path landing on an object/array is a 400; 'uint' requires
+     * non-negative numerics, 'bytes' requires strings); absent values
      * occupy a fixed empty leaf and are reported in `emptyFields`. Leaf/node hashing uses
      * the contract artifact's exported pure circuits, so the root is
      * byte-identical to the in-circuit fold.
@@ -963,14 +1063,41 @@ service NightgateService {
      * a re-serialization with different key order will not re-hash equal.
      */
     action   prepareDocumentProof(documentJson: LargeString, // JSON object: the full document
-                                  proofFieldsJson: LargeString, // ordered JSON array of { field, scale? }, max 16
+                                  proofFieldsJson: LargeString, // ordered JSON array of { field, kind?, scale? }, max 16
                                   compiledArtifactRef: String // optional, defaults to 'attestation-vault'
     )                                                                 returns {
         payloadHash       : String; // blake2b-256 of canonicalDocument (64 hex)
         canonicalDocument : LargeString; // the exact hashed byte form
         contentRoot       : String; // 64-hex Merkle root over the proof fields
-        fields            : LargeString; // JSON array of { field, fieldKey, value, siblings, dirs }
+        fields            : LargeString; // JSON array of { field, fieldKey, kind, value?, valueDigest?, siblings, dirs }
         emptyFields       : LargeString; // JSON array of fields without a value (empty leaf)
+    };
+
+    /**
+     * Canonical membership-set helper for `issueFieldMembershipAttestation`
+     * and `verifyPredicateState`. Builds the deterministic depth-6 set tree
+     * over an allow-list (digest each value with blake2b-256 of the exact
+     * string, dedupe, sort ascending, pad to 64 slots by repeating the last
+     * member digest) so any party can recompute the same `setRoot` from the
+     * published list alone. Padding repeats a REAL member on purpose: every
+     * leaf must be a member digest, or the padding constant itself would be
+     * provable as a member of any non-full list.
+     *
+     * Without `value`/`valueDigest`: returns just `{ setRoot, memberCount }`
+     * (the verifier lane). With one of them: additionally returns the
+     * member's inclusion path (`setSiblingsJson`/`setDirsJson`, WITNESS
+     * material: which slot matched narrows the hidden value); 400 when the
+     * value is not in the list. Compute-only and synchronous.
+     */
+    action   prepareMembershipSet(allowedValuesJson: LargeString, // JSON array of allowed strings (<= 64 distinct)
+                                  value: String, // optional raw member string (pass this OR valueDigest)
+                                  valueDigest: String, // optional 64-hex digest of the member value
+                                  compiledArtifactRef: String // optional, defaults to 'attestation-vault'
+    )                                                                 returns {
+        setRoot         : String; // 64-hex canonical set root
+        memberCount     : Integer; // distinct values in the set
+        setSiblingsJson : String; // JSON array of 6 × 64-hex siblings (only with value/valueDigest)
+        setDirsJson     : String; // JSON array of 6 booleans (only with value/valueDigest)
     };
 
     /**

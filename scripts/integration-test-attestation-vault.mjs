@@ -48,7 +48,10 @@ const stubWitnesses = {
     value_salt(ctx)       { return [ctx.privateState, zero32()]; },
     field_value(ctx)      { return [ctx.privateState, 0n]; },
     merkle_siblings(ctx)  { return [ctx.privateState, [zero32(), zero32(), zero32(), zero32()]]; },
-    merkle_dirs(ctx)      { return [ctx.privateState, [true, true, true, true]]; }
+    merkle_dirs(ctx)      { return [ctx.privateState, [true, true, true, true]]; },
+    field_digest(ctx)     { return [ctx.privateState, zero32()]; },
+    set_siblings(ctx)     { return [ctx.privateState, [zero32(), zero32(), zero32(), zero32(), zero32(), zero32()]]; },
+    set_dirs(ctx)         { return [ctx.privateState, [true, true, true, true, true, true]]; }
 };
 const instance = new ContractClass(stubWitnesses);
 ok('artifact: attest circuit present',           typeof instance.circuits?.attest           === 'function');
@@ -57,6 +60,11 @@ ok('artifact: revokeDisclosure circuit present', typeof instance.circuits?.revok
 // ZK-predicate circuits (on-chain model).
 ok('artifact: commitValue circuit present',      typeof instance.circuits?.commitValue      === 'function');
 ok('artifact: provePredicate circuit present',   typeof instance.circuits?.provePredicate   === 'function');
+// Bytes claim circuits (0.15.0) + their pure leaf hashers.
+ok('artifact: proveFieldEquality circuit present',   typeof instance.circuits?.proveFieldEquality   === 'function');
+ok('artifact: proveFieldMembership circuit present', typeof instance.circuits?.proveFieldMembership === 'function');
+ok('artifact: bytesLeafHash pure circuit exposed',   typeof mod.pureCircuits?.bytesLeafHash === 'function');
+ok('artifact: setLeafHash pure circuit exposed',     typeof mod.pureCircuits?.setLeafHash === 'function');
 ok('artifact: witness slot wired',                instance.witnesses === stubWitnesses);
 
 // ---- Check 2: CompiledContract composition --------------------------------
@@ -156,7 +164,10 @@ const makeWitnesses = (secretBytes) => ({
     value_salt(ctx)       { return [ctx.privateState, bytes32(0)]; },
     field_value(ctx)      { return [ctx.privateState, 0n]; },
     merkle_siblings(ctx)  { return [ctx.privateState, [bytes32(0), bytes32(0), bytes32(0), bytes32(0)]]; },
-    merkle_dirs(ctx)      { return [ctx.privateState, [true, true, true, true]]; }
+    merkle_dirs(ctx)      { return [ctx.privateState, [true, true, true, true]]; },
+    field_digest(ctx)     { return [ctx.privateState, bytes32(0)]; },
+    set_siblings(ctx)     { return [ctx.privateState, [bytes32(0), bytes32(0), bytes32(0), bytes32(0), bytes32(0), bytes32(0)]]; },
+    set_dirs(ctx)         { return [ctx.privateState, [true, true, true, true, true, true]]; }
 });
 const ownerContract = new ContractClass(makeWitnesses(ownerSecret));
 const attackerContract = new ContractClass(makeWitnesses(attackerSecret));
@@ -316,6 +327,147 @@ ok('registrar: registered owner rebinds over a squatted binding',
 const recoveredLedger = mod.ledger(circuitCtx.currentQueryContext.state);
 ok('registrar: recovery updated the binding',
     sameBytes(recoveredLedger.passport_bindings.lookup(bytes32(0x78)), newPayloadHash));
+
+// ---- Check 8: bytes equality + set membership against REAL circuits --------
+// Drives proveFieldEquality / proveFieldMembership locally over a content root
+// and set root built by the PRODUCTION builders (document-proof.js + set-root.js)
+// with the artifact's real pure circuits, then asserts the recorded claim keys
+// byte-match the hand-built descriptors in predicate-state.js. This closes the
+// off-chain/in-circuit parity loop without a chain.
+const dp = await import(pathToFileURL(path.join(repoRoot, 'srv/submission/document-proof.js')).href);
+const sr = await import(pathToFileURL(path.join(repoRoot, 'srv/submission/set-root.js')).href);
+const ps = await import(pathToFileURL(path.join(repoRoot, 'srv/submission/predicate-state.js')).href);
+const hexToBytes = (h) => Uint8Array.from(Buffer.from(h, 'hex'));
+
+const document = {
+    chemistry: 'NMC811', origin: 'EEA', capacity: 42,
+    // Adversarial fixture: the PRE-FIX padding label as a real field value.
+    sneaky: 'nightgate/set-root/empty/v1'
+};
+const built8 = dp.buildDocumentContentRoot(document, [
+    { field: 'chemistry', kind: 'bytes' },
+    { field: 'origin', kind: 'bytes' },
+    { field: 'capacity' },
+    { field: 'sneaky', kind: 'bytes' }
+], mod.pureCircuits);
+const chem = built8.fields.find((f) => f.field === 'chemistry');
+const origin = built8.fields.find((f) => f.field === 'origin');
+ok('bytes: builder emitted digests for bytes fields', !!chem?.valueDigest && !!origin?.valueDigest);
+
+const bytesPayload = bytes32(0xcd);
+const bytesPayloadHex = Buffer.from(bytesPayload).toString('hex');
+runCircuit(ownerContract, 'attest', bytesPayload, bytes32(0xce));
+runCircuit(ownerContract, 'anchorContentRoot', bytesPayload, hexToBytes(built8.contentRoot));
+
+// Equality: prove chemistry == digest('NMC811') via a bundle-built witness set.
+const eqContract = new ContractClass(witnesses.buildAttestationVaultWitnesses({
+    attestationSecret: ownerSecret,
+    merkleProof: { siblings: chem.siblings, dirs: chem.dirs }
+}));
+let eqError = '';
+try {
+    runCircuit(eqContract, 'proveFieldEquality',
+        bytesPayload, hexToBytes(chem.fieldKey), hexToBytes(chem.valueDigest));
+} catch (err) {
+    eqError = String(err?.message ?? err);
+}
+ok('bytes: proveFieldEquality accepts the anchored digest', eqError === '', eqError);
+
+let eqWrongError = '';
+try {
+    runCircuit(eqContract, 'proveFieldEquality',
+        bytesPayload, hexToBytes(chem.fieldKey), bytes32(0x01));
+} catch (err) {
+    eqWrongError = String(err?.message ?? err);
+}
+ok('bytes: proveFieldEquality rejects a wrong expected digest',
+    eqWrongError.includes('field not in passport'), eqWrongError || 'did NOT throw');
+
+// Membership: origin ('EEA') is in the allow-list; wrong set root rejected.
+const allowList = ['EEA', 'CH', 'NO'];
+const memberPath = sr.membershipPathFor(allowList, origin.valueDigest, mod.pureCircuits);
+ok('bytes: membershipPathFor finds the member', memberPath !== null);
+const memContract = new ContractClass(witnesses.buildAttestationVaultWitnesses({
+    attestationSecret: ownerSecret,
+    merkleProof: {
+        fieldDigest: origin.valueDigest,
+        siblings: origin.siblings, dirs: origin.dirs,
+        setProof: { siblings: memberPath.setSiblings, dirs: memberPath.setDirs }
+    }
+}));
+let memError = '';
+try {
+    runCircuit(memContract, 'proveFieldMembership',
+        bytesPayload, hexToBytes(origin.fieldKey), hexToBytes(memberPath.setRoot));
+} catch (err) {
+    memError = String(err?.message ?? err);
+}
+ok('bytes: proveFieldMembership accepts a member with the canonical set root', memError === '', memError);
+
+let memWrongError = '';
+try {
+    runCircuit(memContract, 'proveFieldMembership',
+        bytesPayload, hexToBytes(origin.fieldKey), bytes32(0x02));
+} catch (err) {
+    memWrongError = String(err?.message ?? err);
+}
+ok('bytes: proveFieldMembership rejects a wrong set root',
+    memWrongError.includes('value not in set'), memWrongError || 'did NOT throw');
+
+// ADVERSARIAL: the pre-fix padding label, anchored as a REAL field value,
+// must NOT be provable as a member via a padding-slot path. Rebuild the
+// canonical tree levels, extract the first padding slot's path, and drive
+// the real circuit with the label's digest: the set fold must fail.
+const sneaky = built8.fields.find((f) => f.field === 'sneaky');
+const setDigests = sr.canonicalSetDigests(allowList);
+const padLeaves = [];
+for (let i = 0; i < sr.MAX_SET_VALUES; i++) {
+    padLeaves.push(mod.pureCircuits.setLeafHash(hexToBytes(setDigests[i] ?? setDigests[setDigests.length - 1])));
+}
+const padLevels = [padLeaves];
+for (let d = 0; d < sr.SET_DEPTH; d++) {
+    const prev = padLevels[d];
+    const next = [];
+    for (let i = 0; i < prev.length; i += 2) next.push(mod.pureCircuits.nodeHash(prev[i], prev[i + 1]));
+    padLevels.push(next);
+}
+const padSlotPath = { siblings: [], dirs: [] };
+let padNode = setDigests.length; // first padding slot
+for (let d = 0; d < sr.SET_DEPTH; d++) {
+    const isLeft = padNode % 2 === 0;
+    padSlotPath.siblings.push(Buffer.from(padLevels[d][isLeft ? padNode + 1 : padNode - 1]).toString('hex'));
+    padSlotPath.dirs.push(isLeft);
+    padNode = Math.floor(padNode / 2);
+}
+const attackContract = new ContractClass(witnesses.buildAttestationVaultWitnesses({
+    attestationSecret: ownerSecret,
+    merkleProof: {
+        fieldDigest: sneaky.valueDigest, // digest of the old padding label
+        siblings: sneaky.siblings, dirs: sneaky.dirs,
+        setProof: { siblings: padSlotPath.siblings, dirs: padSlotPath.dirs }
+    }
+}));
+let padAttackError = '';
+try {
+    runCircuit(attackContract, 'proveFieldMembership',
+        bytesPayload, hexToBytes(sneaky.fieldKey), hexToBytes(memberPath.setRoot));
+} catch (err) {
+    padAttackError = String(err?.message ?? err);
+}
+ok('bytes: ADVERSARIAL padding-label digest rejected via padding-slot path',
+    padAttackError.includes('value not in set'), padAttackError || 'did NOT throw');
+
+// Claim-key parity: the ledger entries must sit exactly where the hand-built
+// descriptor recompute (crawler-free verification) expects them.
+const bytesLedger = mod.ledger(circuitCtx.currentQueryContext.state);
+const eqKey = await ps.computeFieldEqualityClaimKey(bytesPayloadHex, chem.fieldKey, chem.valueDigest);
+ok('bytes: equality claim key recompute matches the circuit',
+    bytesLedger.field_equality_results.member(hexToBytes(eqKey)) === true
+    && bytesLedger.field_equality_results.lookup(hexToBytes(eqKey)) === true);
+const memKey = await ps.computeFieldMembershipClaimKey(bytesPayloadHex, origin.fieldKey, memberPath.setRoot);
+ok('bytes: membership claim key recompute matches the circuit',
+    bytesLedger.field_membership_results.member(hexToBytes(memKey)) === true
+    && bytesLedger.field_membership_results.lookup(hexToBytes(memKey)) === true);
 
 console.log();
 console.log(failures === 0

@@ -62,6 +62,21 @@ export ledger passport_owners:     Map<Bytes<32>, Bytes<32>>;
 export ledger content_roots:            Map<Bytes<32>, Bytes<32>>;
 export ledger field_predicate_results:  Map<Bytes<32>, Boolean>;
 
+// Bytes-valued field extension. Non-numeric fields (strings) enter the content
+// root as bytesLeafHash(field_key, value_digest) leaves, where value_digest is
+// the off-chain blake2b-256 of the canonical value bytes. Two claim families:
+//   field_equality_results: claimKey -> true, claimKey =
+//     persistentHash(FieldEqualityClaim{payload_hash, field_key, expected}).
+//     Means "field_key of THIS passport carries exactly the value whose digest
+//     is `expected`". Authenticity/binding, NOT confidentiality: the digest of
+//     a low-entropy value is dictionary-guessable.
+//   field_membership_results: claimKey -> true, claimKey =
+//     persistentHash(FieldMembershipClaim{payload_hash, field_key, set_root}).
+//     Means "field_key's hidden value is ONE OF the public allow-list whose
+//     canonical set root is `set_root`", without revealing which one.
+export ledger field_equality_results:   Map<Bytes<32>, Boolean>;
+export ledger field_membership_results: Map<Bytes<32>, Boolean>;
+
 // Identifies a concrete predicate claim. Hashed to a stable result key so each
 // distinct (attestation, threshold, op) triple is recorded independently.
 struct PredicateClaim {
@@ -92,6 +107,36 @@ struct FieldPredicateClaim {
   op:           Uint<8>
 }
 
+// A provable bytes-valued passport field: its canonical id and the blake2b-256
+// digest of its canonical value bytes. Distinct struct from FieldLeaf so the
+// two leaf families can never collide (persistentHash is domain-separated by
+// struct type).
+struct BytesLeaf {
+  field_key:    Bytes<32>,
+  value_digest: Bytes<32>
+}
+
+// A membership-set leaf: one allowed value's digest. Wrapped in its own struct
+// so set-tree leaves are domain-separated from content-tree leaves and inner
+// nodes.
+struct SetLeaf {
+  value_digest: Bytes<32>
+}
+
+// Identifies a concrete field-bound equality claim.
+struct FieldEqualityClaim {
+  payload_hash: Bytes<32>,
+  field_key:    Bytes<32>,
+  expected:     Bytes<32>
+}
+
+// Identifies a concrete field-bound set-membership claim.
+struct FieldMembershipClaim {
+  payload_hash: Bytes<32>,
+  field_key:    Bytes<32>,
+  set_root:     Bytes<32>
+}
+
 // Caller's secret, supplied off-chain. Hashed in-circuit to produce a stable
 // attester_id without ever revealing the secret to the chain.
 witness local_secret_key(): Bytes<32>;
@@ -108,6 +153,15 @@ witness value_salt():     Bytes<32>;
 witness field_value():     Uint<64>;
 witness merkle_siblings(): Vector<4, Bytes<32>>;
 witness merkle_dirs():     Vector<4, Boolean>;   // true => current node is the LEFT child
+
+// Bytes-valued field proof material, supplied off-chain. `field_digest` is the
+// blake2b-256 of the field's canonical value bytes (the hidden value for
+// membership proofs); `set_siblings` / `set_dirs` are its inclusion path in the
+// public membership-set tree. SET_DEPTH is fixed at 6 (=> up to 64 allowed
+// values); the off-chain builder dedupes, sorts and pads to 2^6.
+witness field_digest():    Bytes<32>;
+witness set_siblings():    Vector<6, Bytes<32>>;
+witness set_dirs():        Vector<6, Boolean>;   // true => current node is the LEFT child
 
 // Numeric commitment binding the hidden value to its 32-byte opening. The same
 // value+salt always reproduce this commitment, so the on-chain stored
@@ -138,6 +192,18 @@ export pure circuit leafHash(field_key: Bytes<32>, value: Uint<64>): Bytes<32> {
 // Merkle inner-node hash — pure, exported for off-chain parity.
 export pure circuit nodeHash(left: Bytes<32>, right: Bytes<32>): Bytes<32> {
   return persistentHash<MerkleNode>(MerkleNode { left: left, right: right });
+}
+
+// Bytes-valued Merkle leaf hash: pure, exported so the off-chain content-root
+// builder hashes string-field leaves identically.
+export pure circuit bytesLeafHash(field_key: Bytes<32>, value_digest: Bytes<32>): Bytes<32> {
+  return persistentHash<BytesLeaf>(BytesLeaf { field_key: field_key, value_digest: value_digest });
+}
+
+// Membership-set leaf hash: pure, exported so the off-chain set builder hashes
+// allowed-value leaves identically.
+export pure circuit setLeafHash(value_digest: Bytes<32>): Bytes<32> {
+  return persistentHash<SetLeaf>(SetLeaf { value_digest: value_digest });
 }
 
 // One Merkle fold step: combine `node` with its `sibling` in the correct order.
@@ -295,4 +361,76 @@ export circuit proveFieldPredicate(
     op:           op
   });
   field_predicate_results.insert(disclose(claimKey), true);
+}
+
+// Prove that a specific bytes-valued passport field (`field_key`) carries
+// exactly the value whose canonical digest is `expected_digest`, bound to the
+// anchored content root. The expected digest is PUBLIC (it is the statement),
+// so no value witness is needed: the circuit recomputes the bytes leaf from the
+// public inputs and proves its inclusion path folds to the anchored root. This
+// is an authenticity/binding proof, not a confidentiality feature: for
+// low-entropy values the digest is dictionary-guessable.
+export circuit proveFieldEquality(
+  payload_hash:    Bytes<32>,
+  field_key:       Bytes<32>,
+  expected_digest: Bytes<32>
+): [] {
+  assert(content_roots.member(disclose(payload_hash)), "no content root");
+  const sibs = merkle_siblings();
+  const dirs = merkle_dirs();
+  // Fold the bytes leaf up to the root, DEPTH (4) unrolled (Compact has no loops).
+  const n0 = bytesLeafHash(field_key, expected_digest);
+  const n1 = merkleStep(n0, sibs[0], dirs[0]);
+  const n2 = merkleStep(n1, sibs[1], dirs[1]);
+  const n3 = merkleStep(n2, sibs[2], dirs[2]);
+  const root = merkleStep(n3, sibs[3], dirs[3]);
+  assert(root == content_roots.lookup(disclose(payload_hash)), "field not in passport");
+  const claimKey = persistentHash<FieldEqualityClaim>(FieldEqualityClaim {
+    payload_hash: payload_hash,
+    field_key:    field_key,
+    expected:     expected_digest
+  });
+  field_equality_results.insert(disclose(claimKey), true);
+}
+
+// Prove that a specific bytes-valued passport field's HIDDEN value is one of a
+// public allow-list, without revealing which one. Two folds over the same
+// witnessed digest: (1) the content fold binds the digest to `field_key` of
+// THIS passport's anchored root; (2) the set fold proves the digest is a leaf
+// of the public membership-set tree (`set_root`, SET_DEPTH 6, up to 64 values,
+// canonical off-chain rule: dedupe, sort digests ascending, pad). The digest
+// itself travels only as a witness.
+export circuit proveFieldMembership(
+  payload_hash: Bytes<32>,
+  field_key:    Bytes<32>,
+  set_root:     Bytes<32>
+): [] {
+  assert(content_roots.member(disclose(payload_hash)), "no content root");
+  const d = field_digest();
+  const sibs = merkle_siblings();
+  const dirs = merkle_dirs();
+  // Content fold: the hidden digest is field_key's value in THIS passport.
+  const n0 = bytesLeafHash(field_key, d);
+  const n1 = merkleStep(n0, sibs[0], dirs[0]);
+  const n2 = merkleStep(n1, sibs[1], dirs[1]);
+  const n3 = merkleStep(n2, sibs[2], dirs[2]);
+  const root = merkleStep(n3, sibs[3], dirs[3]);
+  assert(root == content_roots.lookup(disclose(payload_hash)), "field not in passport");
+  // Set fold: the same hidden digest is a member of the public allow-list.
+  const ssibs = set_siblings();
+  const sdirs = set_dirs();
+  const s0 = setLeafHash(d);
+  const s1 = merkleStep(s0, ssibs[0], sdirs[0]);
+  const s2 = merkleStep(s1, ssibs[1], sdirs[1]);
+  const s3 = merkleStep(s2, ssibs[2], sdirs[2]);
+  const s4 = merkleStep(s3, ssibs[3], sdirs[3]);
+  const s5 = merkleStep(s4, ssibs[4], sdirs[4]);
+  const sroot = merkleStep(s5, ssibs[5], sdirs[5]);
+  assert(sroot == set_root, "value not in set");
+  const claimKey = persistentHash<FieldMembershipClaim>(FieldMembershipClaim {
+    payload_hash: payload_hash,
+    field_key:    field_key,
+    set_root:     set_root
+  });
+  field_membership_results.insert(disclose(claimKey), true);
 }

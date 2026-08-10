@@ -117,3 +117,39 @@ export function prepareProveFieldPredicate({ payloadHash, fieldKey, threshold, o
         witnesses: buildAttestationVaultWitnesses({ attestationSecret, merkleProof })
     };
 }
+
+/**
+ * Prepare a `proveFieldEquality(payload_hash, field_key, expected_digest)`
+ * call: prove the anchored content root carries, at `field_key`, exactly the
+ * value whose digest is `expectedDigest` (public statement; authenticity, not
+ * confidentiality). `merkleProof` needs only { siblings[4] hex, dirs[4] }.
+ */
+export function prepareProveFieldEquality({ payloadHash, fieldKey, expectedDigest, merkleProof, attestationSecret }) {
+    if (!(attestationSecret instanceof Uint8Array)) throw new Error('attestationSecret (Uint8Array) is required');
+    if (!merkleProof) throw new Error('merkleProof ({ siblings, dirs }) is required');
+    return {
+        circuitId: 'proveFieldEquality',
+        args: [hexTo32(payloadHash, 'payloadHash'), hexTo32(fieldKey, 'fieldKey'), hexTo32(expectedDigest, 'expectedDigest')],
+        witnesses: buildAttestationVaultWitnesses({ attestationSecret, merkleProof })
+    };
+}
+
+/**
+ * Prepare a `proveFieldMembership(payload_hash, field_key, set_root)` call:
+ * prove the field's HIDDEN value digest is one of a public allow-list without
+ * revealing which. `merkleProof` is the full bundle: { fieldDigest,
+ * siblings[4] hex, dirs[4], setProof: { siblings[6] hex, dirs[6] } }; the
+ * server's `prepareMembershipSet` (or an equivalent canonical builder:
+ * digest, dedupe, sort ascending, pad to 64) yields setRoot + setProof.
+ */
+export function prepareProveFieldMembership({ payloadHash, fieldKey, setRoot, merkleProof, attestationSecret }) {
+    if (!(attestationSecret instanceof Uint8Array)) throw new Error('attestationSecret (Uint8Array) is required');
+    if (!merkleProof || !merkleProof.fieldDigest || !merkleProof.setProof) {
+        throw new Error('merkleProof ({ fieldDigest, siblings, dirs, setProof }) is required');
+    }
+    return {
+        circuitId: 'proveFieldMembership',
+        args: [hexTo32(payloadHash, 'payloadHash'), hexTo32(fieldKey, 'fieldKey'), hexTo32(setRoot, 'setRoot')],
+        witnesses: buildAttestationVaultWitnesses({ attestationSecret, merkleProof })
+    };
+}

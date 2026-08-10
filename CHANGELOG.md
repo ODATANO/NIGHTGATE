@@ -1,5 +1,97 @@
 # Changelog
 
+## 0.15.0 - 2026-08-10
+
+ZK proofs for STRING fields: bytes equality and set membership, batchable
+alongside the numeric predicates. Live-proven end-to-end on preprod
+(`npm run membership:e2e`): equality proof (tx `8df02e14…`), mixed batch with
+numeric + membership + dropped duplicate in ONE tx (`c4c56387…`), all three
+claim kinds verified crawler-free, non-member 400 before proving, wrong-set
+batch aborted at local proving with nothing on-chain. Unit suite green
+(72 files, 1462 tests); `npm run integration:attestation-vault` additionally
+drives both circuits through compact-runtime locally incl. byte-exact
+claim-key parity and an adversarial padding-slot rejection.
+
+### Two new AttestationVault circuits (redeploy required)
+
+- `proveFieldEquality(payload_hash, field_key, expected_digest)`: the anchored
+  content root carries, at `field_key`, exactly the value whose blake2b-256
+  digest is the PUBLIC `expected_digest`. No value witness at all; the circuit
+  rebuilds the bytes leaf from public inputs and folds the DEPTH=4 path.
+  Authenticity/binding, NOT confidentiality (a low-entropy value's digest is
+  dictionary-guessable, documented as such). Claim recorded in the new
+  `field_equality_results` map.
+- `proveFieldMembership(payload_hash, field_key, set_root)`: the field's
+  HIDDEN value is one of a public allow-list (up to 64 distinct values)
+  without revealing which. Two folds over the same witnessed digest: the
+  DEPTH=4 content fold binds it to THIS passport's field, the new DEPTH=6 set
+  fold proves membership in the canonical set tree. Claim recorded in
+  `field_membership_results`.
+- String fields enter the content root as `bytesLeafHash(field_key,
+  value_digest)` leaves (new exported pure circuit, plus `setLeafHash` for
+  the set tree). Numeric-only documents produce byte-identical roots to
+  0.14.0.
+- Canonical set rule (any verifier recomputes the root from the published
+  list alone): digest each value (exact string, blake2b-256), dedupe, sort
+  ascending, pad to 64 slots by repeating the last member digest. The
+  padding deliberately repeats a REAL member so every tree leaf is a member
+  digest; a designated empty-leaf constant would itself be provable as a
+  member of any non-full list.
+- CONSUMER ACTION: adding circuits changes the verifier-key set, so deployed
+  vaults need a REDEPLOY, and a redeployed vault starts with an EMPTY ledger
+  (registrar = the deploying session): switch the contract address and
+  re-create needed state (attest, anchorContentRoot, bindPassport, grants,
+  registrations). Same procedure as the 0.10.0 upgrade.
+
+### New actions
+
+- `issueFieldEqualityAttestation(payloadHash, fieldKey, expectedValue |
+  expectedDigest, ...)` and `issueFieldMembershipAttestation(payloadHash,
+  fieldKey, value | valueDigest, allowedValuesJson | setRoot + path, ...)`,
+  both with optional in-flow content-root anchoring, fee sponsoring and
+  idempotency like the numeric action. A membership value not in the list is
+  a 400 BEFORE any job or rate-limit spend.
+- `issueFieldPredicateAttestationBatch` accepts MIXED claim kinds (numeric +
+  equality + membership in ONE transaction), discriminated per claim by
+  `predicate`; per-kind dedup tuples; the per-call witness holder carries a
+  proof bundle now. Distinct circuit names make batch segment ordering fully
+  deterministic for mixed batches.
+- `prepareDocumentProof` field specs gained `kind: 'uint' | 'bytes'`
+  (bytes: string value entered as the digest of the EXACT string, no
+  trimming; `scale` not allowed). Response fields carry `kind` and
+  `valueDigest` for bytes leaves.
+- `prepareMembershipSet(allowedValuesJson, value?, valueDigest?)`
+  (compute-only): canonical set root, member count and, for a member, the
+  inclusion path (witness material, never logged).
+- `verifyPredicateState` verifies the new kinds crawler-free via
+  `predicate: 'bytesEquality'` + `expectedDigest` or `predicate:
+  'setMembership'` + `setRoot`; `verifyPredicateAttestation` falls back to
+  live state for the new rows too and returns their statement columns.
+
+### Schema and internals
+
+- `PredicateAttestations`: `op`/`threshold` are now nullable (the bytes kinds
+  carry neither), new `expectedDigest` and `setRoot` columns. Operators:
+  `cds deploy` or `scripts/apply-schema-delta.mjs` on existing databases.
+- `apply-schema-delta.mjs` learned constraint RELAXATION: when a column's
+  NOT NULL was dropped in the target schema, the table is rebuilt in place
+  (create target shape, copy rows, swap; views dropped up front and
+  recreated), still inside one transaction. Additive-only migrations could
+  not express the op/threshold change. Views the DDL does not manage
+  (consumer-added) are snapshotted and restored, never silently deleted; if
+  one cannot be restored, the migration reports it with its original SQL and
+  ABORTS, rolling the whole transaction back (database unchanged, view
+  included).
+- One predicate-literal parser replaces the four duplicated validation
+  chains (an unknown literal can no longer mint a wrong op code).
+- Witness layer: new `field_digest`/`set_siblings`/`set_dirs` witnesses; the
+  per-call `merkleProof` became a bundle `{ fieldValue?, fieldDigest?,
+  siblings, dirs, setProof? }` end-to-end (handlers, submitter, worker,
+  browser mirror). The browser export ships `prepareProveFieldEquality` /
+  `prepareProveFieldMembership` and the extended witness typings.
+- Committed artifact grows by the two prover keys (~19.5 MB equality,
+  ~38.5 MB membership, two Merkle folds).
+
 ## 0.14.0 - 2026-08-07
 
 Live-proven end-to-end on preprod (`npm run agent-layer:e2e`): grant-token

@@ -8,18 +8,27 @@ export interface WitnessValues {
     valueSalt: string;
 }
 
-/** Per-call Merkle inclusion proof for proveFieldPredicate (DEPTH=4). */
+/**
+ * Per-call proof bundle for the field-bound proof circuits (DEPTH=4 content
+ * path; DEPTH=6 set path for membership). `fieldValue` feeds
+ * proveFieldPredicate, `fieldDigest` + `setProof` feed proveFieldMembership;
+ * proveFieldEquality needs only siblings/dirs.
+ */
 export interface MerkleProof {
-    /** Decimal string of the scaled Uint<64> field value being proven. */
-    fieldValue: string;
-    /** 4 × 64-char hex sibling digests along the inclusion path. */
+    /** Decimal string of the scaled Uint<64> field value (proveFieldPredicate). */
+    fieldValue?: string;
+    /** 64-char hex digest of the field's value bytes (proveFieldMembership). */
+    fieldDigest?: string;
+    /** 4 × 64-char hex sibling digests along the content-root path. */
     siblings: string[];
-    /** 4 booleans — true = current node is the LEFT child at that level. */
+    /** 4 booleans, true = current node is the LEFT child at that level. */
     dirs: boolean[];
+    /** Membership-set path (proveFieldMembership): 6 siblings + 6 booleans. */
+    setProof?: { siblings: string[]; dirs: boolean[] };
 }
 
 /**
- * Batch mode for proveFieldPredicate (0.12.0): one witness object serving N calls in ONE
+ * Batch mode (0.12.0): one witness object serving N proof calls in ONE
  * transaction scope. The proof is read at witness INVOCATION time, so the batch loop swaps
  * `current` immediately before each `callTx`. Mirrors the server's `WitnessFactoryInput`.
  */
@@ -33,9 +42,9 @@ export interface BuildWitnessesInput {
     attestationSecret: Uint8Array;
     /** Required only for commitValue / provePredicate. */
     witnessValues?: WitnessValues;
-    /** Single-call proveFieldPredicate. Mutually exclusive with `merkleProofHolder`. */
+    /** Single-call field-bound proof. Mutually exclusive with `merkleProofHolder`. */
     merkleProof?: MerkleProof;
-    /** Batch proveFieldPredicate. Mutually exclusive with `merkleProof` (the builder throws). */
+    /** Batch field-bound proofs. Mutually exclusive with `merkleProof` (the builder throws). */
     merkleProofHolder?: MerkleProofHolder;
 }
 
@@ -47,6 +56,9 @@ export interface AttestationVaultWitnesses<PS = unknown> {
     field_value(ctx: { privateState: PS }): [PS, bigint];
     merkle_siblings(ctx: { privateState: PS }): [PS, Uint8Array[]];
     merkle_dirs(ctx: { privateState: PS }): [PS, boolean[]];
+    field_digest(ctx: { privateState: PS }): [PS, Uint8Array];
+    set_siblings(ctx: { privateState: PS }): [PS, Uint8Array[]];
+    set_dirs(ctx: { privateState: PS }): [PS, boolean[]];
 }
 
 /** HMAC-SHA256(material, 'nightgate/attestation-vault/v1') → 32 bytes. */

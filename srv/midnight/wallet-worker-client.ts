@@ -19,6 +19,7 @@ import cds from '@sap/cds';
 import { Worker, MessageChannel } from 'node:worker_threads';
 import path from 'node:path';
 import type { CapDbPrivateStateProvider } from './CapDbPrivateStateProvider';
+import type { MerkleProofBundle } from '../submission/contract-witnesses';
 import { formatErr } from '../utils/format-error';
 
 const log = cds.log('nightgate:worker-client');
@@ -575,7 +576,7 @@ export interface WalletSubmitContractCallArgs {
     proofServerUrl: string;
     networkId: 'preprod' | 'testnet' | 'mainnet' | 'undeployed' | 'devnet' | 'qanet' | 'preview';
     witnessValues?: { attestedValue: string; valueSalt: string };
-    merkleProof?: { fieldValue: string; siblings: string[]; dirs: boolean[] };
+    merkleProof?: MerkleProofBundle;
     initialPrivateState?: unknown;
     sponsorSessionId?: string;
 }
@@ -609,7 +610,7 @@ export interface WalletSubmitContractCallBatchArgs extends Omit<WalletSubmitCont
      *  call may carry its own `merkleProof` (per-call witness binding for
      *  proveFieldPredicate); mutually exclusive with the batch-level
      *  `merkleProof` inherited from WalletSubmitContractCallArgs. */
-    calls: Array<{ circuit: string; args: unknown[]; merkleProof?: { fieldValue: string; siblings: string[]; dirs: boolean[] } }>;
+    calls: Array<{ circuit: string; args: unknown[]; merkleProof?: MerkleProofBundle }>;
 }
 
 /**

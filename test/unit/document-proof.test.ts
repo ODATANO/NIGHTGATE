@@ -41,7 +41,9 @@ import {
 /** Deterministic fake pure circuits: tagged sha256 concatenations. */
 const fakePure: PureCircuits = {
     leafHash: (k, v) => sha256(Buffer.concat([Buffer.from('leaf'), Buffer.from(k), Buffer.from(v.toString())])),
-    nodeHash: (l, r) => sha256(Buffer.concat([Buffer.from('node'), Buffer.from(l), Buffer.from(r)]))
+    nodeHash: (l, r) => sha256(Buffer.concat([Buffer.from('node'), Buffer.from(l), Buffer.from(r)])),
+    bytesLeafHash: (k, d) => sha256(Buffer.concat([Buffer.from('bytesleaf'), Buffer.from(k), Buffer.from(d)])),
+    setLeafHash: (d) => sha256(Buffer.concat([Buffer.from('setleaf'), Buffer.from(d)]))
 };
 
 function refold(leafHex: string, siblings: string[], dirs: boolean[]): string {
@@ -130,12 +132,55 @@ describe('buildDocumentContentRoot', () => {
         expect(a.fields[1]).toMatchObject({ field: 'days', value: '30' });
         for (const f of a.fields) {
             const leaf = Buffer.from(
-                fakePure.leafHash(Buffer.from(f.fieldKey, 'hex'), BigInt(f.value))
+                fakePure.leafHash(Buffer.from(f.fieldKey, 'hex'), BigInt(f.value!))
             ).toString('hex');
             expect(refold(leaf, f.siblings, f.dirs)).toBe(a.contentRoot);
             expect(f.siblings).toHaveLength(4);
             expect(f.dirs).toHaveLength(4);
         }
+    });
+
+    it('mixes uint and bytes leaves in one refoldable tree', () => {
+        const mixed = { chemistry: 'NMC811', capacity: 4200 };
+        const result = buildDocumentContentRoot(mixed, [
+            { field: 'chemistry', kind: 'bytes' }, { field: 'capacity' }
+        ], fakePure);
+        expect(result.fields).toHaveLength(2);
+        const [chem, cap] = result.fields;
+        expect(chem).toMatchObject({ field: 'chemistry', kind: 'bytes', valueDigest: blake2b256Hex('NMC811') });
+        expect(chem.value).toBeUndefined();
+        expect(cap).toMatchObject({ field: 'capacity', kind: 'uint', value: '4200000' });
+        expect(cap.valueDigest).toBeUndefined();
+        const chemLeaf = Buffer.from(fakePure.bytesLeafHash(
+            Buffer.from(chem.fieldKey, 'hex'), Buffer.from(chem.valueDigest!, 'hex')
+        )).toString('hex');
+        expect(refold(chemLeaf, chem.siblings, chem.dirs)).toBe(result.contentRoot);
+        const capLeaf = Buffer.from(fakePure.leafHash(
+            Buffer.from(cap.fieldKey, 'hex'), BigInt(cap.value!)
+        )).toString('hex');
+        expect(refold(capLeaf, cap.siblings, cap.dirs)).toBe(result.contentRoot);
+    });
+
+    it('digests the EXACT string for bytes fields (no trimming)', () => {
+        const padded = buildDocumentContentRoot({ s: ' x ' }, [{ field: 's', kind: 'bytes' }], fakePure);
+        expect(padded.fields[0].valueDigest).toBe(blake2b256Hex(' x '));
+        expect(padded.fields[0].valueDigest).not.toBe(blake2b256Hex('x'));
+    });
+
+    it('rejects non-string values for bytes fields; blanks stay empty leaves', () => {
+        expect(() => buildDocumentContentRoot({ n: 42 }, [{ field: 'n', kind: 'bytes' }], fakePure))
+            .toThrow(/requires a string/);
+        const blank = buildDocumentContentRoot({ s: '   ' }, [{ field: 's', kind: 'bytes' }], fakePure);
+        expect(blank.fields).toEqual([]);
+        expect(blank.emptyFields).toEqual(['s']);
+    });
+
+    it('keeps numeric-only roots identical whether kind is omitted or explicit', () => {
+        const implicit = buildDocumentContentRoot(doc, specs, fakePure);
+        const explicit = buildDocumentContentRoot(doc, [
+            { field: 'price', kind: 'uint' }, { field: 'days', kind: 'uint', scale: 1 }
+        ], fakePure);
+        expect(explicit.contentRoot).toBe(implicit.contentRoot);
     });
 
     it('is order-sensitive: the field list order is part of the tree identity', () => {
@@ -208,6 +253,9 @@ describe('prepareDocumentProof handler', () => {
             [{ documentJson: '{}', proofFieldsJson: '[]' }, 'non-empty'],
             [{ documentJson: '{}', proofFieldsJson: JSON.stringify([{ field: 'a' }, { field: 'a' }]) }, 'duplicate'],
             [{ documentJson: '{}', proofFieldsJson: JSON.stringify([{ field: 'a', scale: 0 }]) }, 'scale'],
+            [{ documentJson: '{}', proofFieldsJson: JSON.stringify([{ field: 'a', kind: 'hex' }]) }, "kind must be 'uint' or 'bytes'"],
+            [{ documentJson: '{}', proofFieldsJson: JSON.stringify([{ field: 'a', kind: 'bytes', scale: 100 }]) }, "not applicable to kind 'bytes'"],
+            [{ documentJson: '{"a":7}', proofFieldsJson: JSON.stringify([{ field: 'a', kind: 'bytes' }]) }, 'requires a string'],
             [{ documentJson: '{"a":-1}', proofFieldsJson: JSON.stringify([{ field: 'a' }]) }, 'non-negative']
         ] as const) {
             const req = makeReq(data as any);
@@ -241,6 +289,78 @@ describe('prepareDocumentProof handler', () => {
         expect(fields.map((f: any) => f.field)).toEqual(['price', 'days']);
         expect(JSON.parse(result.emptyFields)).toEqual([]);
         expect(loadPure).toHaveBeenCalledWith('attestation-vault');
+    });
+});
+
+describe('prepareMembershipSet handler', () => {
+    const handlers: Record<string, Function> = {};
+    const srv = {
+        on(event: string, h: Function) { handlers[event] = h; },
+        send: vi.fn()
+    } as any;
+    const loadPure = vi.fn(async () => fakePure);
+
+    beforeEach(() => {
+        vi.clearAllMocks();
+        Object.keys(handlers).forEach(k => delete handlers[k]);
+        registerDocumentProofHandlers(srv, { loadPure });
+    });
+
+    const LIST = JSON.stringify(['EEA', 'CH', 'NO']);
+
+    it('rejects 400 on malformed inputs', async () => {
+        for (const [data, msg] of [
+            [{}, 'allowedValuesJson'],
+            [{ allowedValuesJson: '{]' }, 'valid JSON'],
+            [{ allowedValuesJson: '[]' }, 'non-empty'],
+            [{ allowedValuesJson: '[1]' }, 'non-empty strings'],
+            [{ allowedValuesJson: LIST, value: 'EEA', valueDigest: 'a'.repeat(64) }, 'at most one'],
+            [{ allowedValuesJson: LIST, valueDigest: 'zz' }, '64 hex'],
+            [{ allowedValuesJson: LIST, value: 'DE' }, 'not in the allowed list'],
+            [{ allowedValuesJson: JSON.stringify(Array.from({ length: 65 }, (_, i) => `v${i}`)) }, 'at most 64']
+        ] as const) {
+            const req = makeReq(data as any);
+            await handlers.prepareMembershipSet(req);
+            expect(req.reject).toHaveBeenCalledWith(expect.any(Number), expect.stringContaining(msg));
+            expect(req.reject.mock.calls[0][0]).toBe(400);
+        }
+    });
+
+    it('returns just the canonical root without a member (verifier lane)', async () => {
+        const req = makeReq({ allowedValuesJson: LIST });
+        const result = await handlers.prepareMembershipSet(req);
+        expect(req.reject).not.toHaveBeenCalled();
+        expect(result.setRoot).toMatch(/^[0-9a-f]{64}$/);
+        expect(result.memberCount).toBe(3);
+        expect(result.setSiblingsJson).toBeUndefined();
+    });
+
+    it('the root is canonical: order and duplicates of the list do not matter', async () => {
+        const a = await handlers.prepareMembershipSet(makeReq({ allowedValuesJson: LIST }));
+        const b = await handlers.prepareMembershipSet(makeReq({ allowedValuesJson: JSON.stringify(['NO', 'EEA', 'CH', 'EEA']) }));
+        expect(b.setRoot).toBe(a.setRoot);
+        expect(b.memberCount).toBe(3);
+    });
+
+    it('returns a refoldable inclusion path for a member (by value and by digest)', async () => {
+        const byValue = await handlers.prepareMembershipSet(makeReq({ allowedValuesJson: LIST, value: 'CH' }));
+        const byDigest = await handlers.prepareMembershipSet(makeReq({ allowedValuesJson: LIST, valueDigest: blake2b256Hex('CH') }));
+        for (const result of [byValue, byDigest]) {
+            const siblings = JSON.parse(result.setSiblingsJson);
+            const dirs = JSON.parse(result.setDirsJson);
+            expect(siblings).toHaveLength(6);
+            expect(dirs).toHaveLength(6);
+            const leaf = Buffer.from(fakePure.setLeafHash(Buffer.from(blake2b256Hex('CH'), 'hex'))).toString('hex');
+            expect(refold(leaf, siblings, dirs)).toBe(result.setRoot);
+        }
+        expect(byDigest.setRoot).toBe(byValue.setRoot);
+    });
+
+    it('rejects 404 when the artifact is unavailable', async () => {
+        loadPure.mockRejectedValueOnce(new PureCircuitsUnavailableError("contract 'nope' is not registered"));
+        const req = makeReq({ allowedValuesJson: LIST, compiledArtifactRef: 'nope' });
+        await handlers.prepareMembershipSet(req);
+        expect(req.reject).toHaveBeenCalledWith(404, expect.stringContaining('nope'));
     });
 });
 

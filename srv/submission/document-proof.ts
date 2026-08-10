@@ -34,6 +34,7 @@ import { pathToFileURL } from 'node:url';
 import path from 'node:path';
 import { RateLimiter } from '../utils/rate-limiter';
 import { getContractRegistration } from './contract-registry';
+import { buildMembershipSet, membershipPathFor, canonicalSetDigests } from './set-root';
 
 const log = cds.log('nightgate:document-proof');
 
@@ -127,12 +128,22 @@ export function scaleFieldValue(raw: number | string, scale: number, label: stri
 export interface PureCircuits {
     leafHash(fieldKey: Uint8Array, value: bigint): Uint8Array;
     nodeHash(left: Uint8Array, right: Uint8Array): Uint8Array;
+    /** Bytes-valued leaf: persistentHash(BytesLeaf{field_key, value_digest}). */
+    bytesLeafHash(fieldKey: Uint8Array, valueDigest: Uint8Array): Uint8Array;
+    /** Membership-set leaf: persistentHash(SetLeaf{value_digest}). */
+    setLeafHash(valueDigest: Uint8Array): Uint8Array;
 }
 
 export interface ProofFieldSpec {
     /** Field path in the document (also the public label the fieldKey hashes). */
     field: string;
-    /** Value scale (default 1000, milli-units). */
+    /**
+     * Leaf kind. 'uint' (default): numeric value, scaled to Uint<64>.
+     * 'bytes': string value, entered as blake2b-256 digest of the exact
+     * string (no trimming; the raw document is the canonical form).
+     */
+    kind?: 'uint' | 'bytes';
+    /** Value scale (default 1000, milli-units). Only valid for kind 'uint'. */
     scale?: number;
 }
 
@@ -154,10 +165,14 @@ export function resolveFieldValue(document: Record<string, unknown>, fieldPath: 
 
 export interface PreparedField {
     field: string;
-    fieldKey: string;    // 64 hex
-    value: string;       // scaled Uint<64>, decimal string (witness material)
-    siblings: string[];  // MERKLE_DEPTH x 64 hex
-    dirs: boolean[];     // MERKLE_DEPTH booleans (true = node is LEFT child)
+    fieldKey: string;     // 64 hex
+    kind: 'uint' | 'bytes';
+    /** kind 'uint' only: scaled Uint<64>, decimal string (witness material). */
+    value?: string;
+    /** kind 'bytes' only: blake2b-256 of the exact string value, 64 hex. */
+    valueDigest?: string;
+    siblings: string[];   // MERKLE_DEPTH x 64 hex
+    dirs: boolean[];      // MERKLE_DEPTH booleans (true = node is LEFT child)
 }
 
 /**
@@ -174,8 +189,9 @@ export function buildDocumentContentRoot(
 ): { contentRoot: string; fields: PreparedField[]; emptyFields: string[] } {
     const emptyLeaf = pure.leafHash(fromHex32(fieldKeyHex(EMPTY_LEAF_KEY)), 0n);
 
+    type LeafValue = { kind: 'uint'; scaled: bigint } | { kind: 'bytes'; digest: string } | null;
     const leaves: Uint8Array[] = [];
-    const scaledValues: (bigint | null)[] = [];
+    const leafValues: LeafValue[] = [];
     for (let i = 0; i < MAX_PROOF_FIELDS; i++) {
         const spec = specs[i];
         const raw = spec ? (resolveFieldValue(document, spec.field) as number | string | null | undefined) : undefined;
@@ -186,11 +202,23 @@ export function buildDocumentContentRoot(
         const isBlank = raw === null || raw === undefined
             || (typeof raw === 'string' && raw.trim() === '');
         if (spec && !isBlank) {
-            const scaled = scaleFieldValue(raw, spec.scale ?? DEFAULT_VALUE_SCALE, `proofFields[${i}] (${spec.field})`);
-            scaledValues.push(scaled);
-            leaves.push(pure.leafHash(fromHex32(fieldKeyHex(spec.field)), scaled));
+            if (spec.kind === 'bytes') {
+                // The digest covers the EXACT string as it appears in the
+                // document (no trimming): a verifier recomputing from the raw
+                // document must land on the same digest.
+                if (typeof raw !== 'string') {
+                    throw new Error(`proofFields[${i}] (${spec.field}): kind 'bytes' requires a string value`);
+                }
+                const digest = blake2b256Hex(raw);
+                leafValues.push({ kind: 'bytes', digest });
+                leaves.push(pure.bytesLeafHash(fromHex32(fieldKeyHex(spec.field)), fromHex32(digest)));
+            } else {
+                const scaled = scaleFieldValue(raw, spec.scale ?? DEFAULT_VALUE_SCALE, `proofFields[${i}] (${spec.field})`);
+                leafValues.push({ kind: 'uint', scaled });
+                leaves.push(pure.leafHash(fromHex32(fieldKeyHex(spec.field)), scaled));
+            }
         } else {
-            scaledValues.push(null);
+            leafValues.push(null);
             leaves.push(emptyLeaf);
         }
     }
@@ -207,8 +235,8 @@ export function buildDocumentContentRoot(
     const fields: PreparedField[] = [];
     const emptyFields: string[] = [];
     specs.forEach((spec, idx) => {
-        const scaled = scaledValues[idx];
-        if (scaled === null) { emptyFields.push(spec.field); return; }
+        const leafValue = leafValues[idx];
+        if (leafValue === null) { emptyFields.push(spec.field); return; }
         const siblings: string[] = [];
         const dirs: boolean[] = [];
         let node = idx;
@@ -218,7 +246,10 @@ export function buildDocumentContentRoot(
             dirs.push(isLeft);
             node = Math.floor(node / 2);
         }
-        fields.push({ field: spec.field, fieldKey: fieldKeyHex(spec.field), value: scaled.toString(), siblings, dirs });
+        const base = { field: spec.field, fieldKey: fieldKeyHex(spec.field), siblings, dirs };
+        fields.push(leafValue.kind === 'bytes'
+            ? { ...base, kind: 'bytes', valueDigest: leafValue.digest }
+            : { ...base, kind: 'uint', value: leafValue.scaled.toString() });
     });
 
     return { contentRoot, fields, emptyFields };
@@ -226,7 +257,7 @@ export function buildDocumentContentRoot(
 
 // ---- Pure-circuit loading -------------------------------------------------
 
-async function loadPureCircuitsFromRegistry(compiledRef: string): Promise<PureCircuits> {
+export async function loadPureCircuitsFromRegistry(compiledRef: string): Promise<PureCircuits> {
     const reg = getContractRegistration(compiledRef);
     if (!reg) throw new PureCircuitsUnavailableError(`contract '${compiledRef}' is not registered`);
     const importSpec = path.isAbsolute(reg.artifactPath)
@@ -234,9 +265,9 @@ async function loadPureCircuitsFromRegistry(compiledRef: string): Promise<PureCi
         : reg.artifactPath;
     const mod: any = await import(importSpec);
     const pure = mod.pureCircuits ?? mod.default?.pureCircuits;
-    if (!pure?.leafHash || !pure?.nodeHash) {
+    if (!pure?.leafHash || !pure?.nodeHash || !pure?.bytesLeafHash || !pure?.setLeafHash) {
         throw new PureCircuitsUnavailableError(
-            `artifact '${compiledRef}' exports no leafHash/nodeHash pure circuits`);
+            `artifact '${compiledRef}' exports no leafHash/nodeHash/bytesLeafHash/setLeafHash pure circuits`);
     }
     return pure as PureCircuits;
 }
@@ -292,6 +323,12 @@ export function registerDocumentProofHandlers(srv: any, deps: DocumentProofHandl
             }
             if (seenFields.has(s.field)) return req.reject(400, `proofFields[${i}]: duplicate field '${s.field}'`);
             seenFields.add(s.field);
+            if (s.kind !== undefined && s.kind !== 'uint' && s.kind !== 'bytes') {
+                return req.reject(400, `proofFields[${i}].kind must be 'uint' or 'bytes'`);
+            }
+            if (s.kind === 'bytes' && s.scale !== undefined) {
+                return req.reject(400, `proofFields[${i}].scale is not applicable to kind 'bytes'`);
+            }
             if (s.scale !== undefined && (!Number.isInteger(s.scale) || s.scale < 1 || s.scale > 1_000_000_000)) {
                 return req.reject(400, `proofFields[${i}].scale must be a positive integer <= 10^9`);
             }
@@ -324,6 +361,61 @@ export function registerDocumentProofHandlers(srv: any, deps: DocumentProofHandl
             fields: JSON.stringify(built.fields),
             emptyFields: JSON.stringify(built.emptyFields)
         };
+    });
+
+    srv.on('prepareMembershipSet', async (req: Request) => {
+        const clientKey = (req as any)?._?.req?.ip || 'global';
+        const rate = prepareRateLimiter.check(clientKey);
+        if (!rate.allowed) {
+            return req.reject(429, `Rate limited. Retry after ${Math.ceil(rate.retryAfterMs / 1000)}s`);
+        }
+
+        const data = req.data as {
+            allowedValuesJson?: string; value?: string; valueDigest?: string; compiledArtifactRef?: string;
+        };
+        if (!data.allowedValuesJson) return req.reject(400, 'allowedValuesJson is required');
+        let allowed: unknown;
+        try {
+            allowed = JSON.parse(data.allowedValuesJson);
+        } catch { return req.reject(400, 'allowedValuesJson must be valid JSON'); }
+        if (!Array.isArray(allowed) || allowed.length === 0 || allowed.some(v => typeof v !== 'string' || v.length === 0)) {
+            return req.reject(400, 'allowedValuesJson must be a non-empty JSON array of non-empty strings');
+        }
+        if (data.value !== undefined && data.valueDigest !== undefined) {
+            return req.reject(400, 'pass at most one of value / valueDigest');
+        }
+        if (data.valueDigest !== undefined && !HEX64_RE.test(data.valueDigest)) {
+            return req.reject(400, 'valueDigest must be 64 hex chars (32 bytes)');
+        }
+
+        const compiledRef = data.compiledArtifactRef?.length ? data.compiledArtifactRef : DEFAULT_ATTESTATION_VAULT_REF;
+        let pure: PureCircuits;
+        try {
+            pure = await loadPure(compiledRef);
+        } catch (err) {
+            if (err instanceof PureCircuitsUnavailableError) return req.reject(404, err.message);
+            throw err;
+        }
+
+        try {
+            const values = allowed as string[];
+            if (data.value === undefined && data.valueDigest === undefined) {
+                const { setRoot, digests } = buildMembershipSet(values, pure);
+                return { setRoot, memberCount: digests.length };
+            }
+            const memberDigest = data.valueDigest ?? blake2b256Hex(data.value!);
+            const path = membershipPathFor(values, memberDigest, pure);
+            if (!path) return req.reject(400, 'value is not in the allowed list');
+            // Never log the path: which slot matched narrows the hidden value.
+            return {
+                setRoot: path.setRoot,
+                memberCount: canonicalSetDigests(values).length,
+                setSiblingsJson: JSON.stringify(path.setSiblings),
+                setDirsJson: JSON.stringify(path.setDirs)
+            };
+        } catch (err) {
+            return req.reject(400, (err as Error).message);
+        }
     });
 
     srv.on('attestAgentOutput', async (req: Request) => {

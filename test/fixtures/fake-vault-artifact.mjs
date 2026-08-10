@@ -27,6 +27,8 @@ export function ledger(state) {
         attestation_owners: mapView(state.attestation_owners),
         content_roots: mapView(state.content_roots),
         predicate_results: mapView(state.predicate_results),
-        field_predicate_results: mapView(state.field_predicate_results)
+        field_predicate_results: mapView(state.field_predicate_results),
+        field_equality_results: mapView(state.field_equality_results),
+        field_membership_results: mapView(state.field_membership_results)
     };
 }
