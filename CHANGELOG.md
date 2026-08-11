@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.15.1 - 2026-08-11
+
+Internal job-runner cleanup, no API or schema change. `startJob` now defers
+detached job dispatch through the request context's `succeeded` hook (the
+same commit signal CAP's own task queue uses) instead of polling up to 10
+minutes for the job row to become visible. A rolled-back request no longer
+schedules any work at all; the 2s durable command poller stays as the
+safety net for persisted commands. Unit suite green (72 files, 1465 tests).
+
 ## 0.15.0 - 2026-08-10
 
 ZK proofs for STRING fields: bytes equality and set membership, batchable

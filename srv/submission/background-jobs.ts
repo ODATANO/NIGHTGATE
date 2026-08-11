@@ -389,16 +389,41 @@ export function registerBackgroundJobReconciliationFinalizer(
     reconciliationFinalizers.set(processorKey(kind, version), finalizer);
 }
 
+/**
+ * Defer job dispatch until the row is committed. The ambient-tx detection is
+ * deliberately the SAME truthy `cds.context` check the insert in startJob
+ * uses: whenever the insert rode the caller's tx, the row exists only once
+ * that tx commits, and CAP's context 'succeeded' hook fires exactly then (on
+ * rollback it never fires and no phantom work runs). Without an ambient
+ * context (durable poller, boot recovery) the insert autocommitted and the
+ * row is already visible, so dispatch directly. Should a 'succeeded' hook
+ * ever be lost (process death between commit and dispatch), the 2s command
+ * poller re-schedules the persisted command.
+ */
 function scheduleJob(jobId: string, kind: string, legacyWork?: () => Promise<unknown>): void {
+    const ctx = cds.context as { on?: (event: string, handler: () => void) => void } | undefined;
+    if (!ctx) return dispatchJob(jobId, kind, legacyWork);
+    if (typeof ctx.on === 'function') {
+        ctx.on('succeeded', () => dispatchJob(jobId, kind, legacyWork));
+        return;
+    }
+    // Ambient context without lifecycle events: the insert detection says the
+    // row may ride an uncommitted tx, but there is no commit signal to wait
+    // for. Real CAP contexts always expose `.on`; this shape only appears
+    // with hand-rolled mock contexts whose db writes autocommit, so dispatch
+    // now but say so. If the write really was deferred, the pending-only
+    // claim finds no row and the durable poller re-schedules the persisted
+    // command after commit; only a legacy in-memory `work` closure (no
+    // production caller passes one) would stay pending until then.
+    cds.log('nightgate').warn(
+        `startJob(${kind}): ambient context without lifecycle events; dispatching job ${jobId} immediately (its row may not be committed yet)`
+    );
+    dispatchJob(jobId, kind, legacyWork);
+}
+
+function dispatchJob(jobId: string, kind: string, legacyWork?: () => Promise<unknown>): void {
     const semaphore = getSemaphore(kind);
     setImmediate(() => void runWithoutAmbientTx(async () => {
-        // Commit visibility does not consume scarce proof/submission capacity.
-        const visible = await waitForJobRowVisible(jobId, 10 * 60_000);
-        if (!visible) {
-            cds.log('nightgate').warn(`startJob(${kind}): job row ${jobId} never became visible (caller rolled back or is holding its tx for 10+ min); skipping work`);
-            return;
-        }
-
         await semaphore.acquire();
         try {
             const claimed = await markRunning(jobId);
@@ -577,24 +602,6 @@ export async function runChildCommand<T>(args: {
  */
 export function runWithoutAmbientTx<T>(fn: () => Promise<T>): Promise<T> {
     return detachedJobScope.runInAsyncScope(fn);
-}
-
-/**
- * Poll (from fresh short read txs) until the BackgroundJobs row is visible,
- * i.e. the caller's transaction committed. Returns false on timeout, which
- * means the caller rolled back (or holds its tx absurdly long) and the work
- * must not run.
- */
-async function waitForJobRowVisible(jobId: string, timeoutMs: number): Promise<boolean> {
-    const deadline = Date.now() + timeoutMs;
-    let delay = 100;
-    while (Date.now() < deadline) {
-        const row = await runWithoutAmbientTx(() => getJobById(jobId));
-        if (row) return true;
-        await new Promise(r => setTimeout(r, delay));
-        delay = Math.min(delay * 2, 2000);
-    }
-    return false;
 }
 
 export async function getJobById(jobId: string): Promise<BackgroundJobRow | null> {

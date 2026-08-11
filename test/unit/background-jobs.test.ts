@@ -1149,6 +1149,82 @@ describe('getJobById', () => {
     });
 });
 
+// ---- deferred dispatch on the ambient request tx ---------------------------
+
+describe('scheduleJob commit hook (ambient request context)', () => {
+    test('defers the work until the context fires succeeded, then runs it', async () => {
+        const processor = vi.fn(async () => ({ ok: true }));
+        registerBackgroundJobProcessor('deferredDispatchTest', 1, processor);
+        const cdsMock: any = ((await import('@sap/cds')) as any).default;
+        const hooks: Record<string, () => void> = {};
+        cdsMock.context = { id: 'req-hook', on: vi.fn((ev: string, cb: () => void) => { hooks[ev] = cb; }) };
+        let jobId: string;
+        try {
+            const ret = await startJob({
+                kind: 'deferredDispatchTest', sessionId: 'sess-1', requestedBy: 'alice',
+                request: {}, commandVersion: 1, command: { op: 'noop' }
+            });
+            jobId = ret.jobId;
+            await flushSpawn();
+            // Row inserted, but the request tx has not committed yet: the work
+            // must not have started.
+            expect(rows.get(jobId)!.status).toBe('pending');
+            expect(processor).not.toHaveBeenCalled();
+            expect(cdsMock.context.on).toHaveBeenCalledWith('succeeded', expect.any(Function));
+        } finally {
+            cdsMock.context = undefined;
+        }
+
+        hooks['succeeded']!();
+        await flushSpawn();
+        expect(processor).toHaveBeenCalledTimes(1);
+        expect(rows.get(jobId!)!.status).toBe('succeeded');
+    });
+
+    test('a truthy context without on() dispatches immediately and warns (mock-context shape)', async () => {
+        const processor = vi.fn(async () => ({ ok: true }));
+        registerBackgroundJobProcessor('bareContextDispatchTest', 1, processor);
+        const cdsMock: any = ((await import('@sap/cds')) as any).default;
+        const log = cdsMock.log();
+        log.warn.mockClear();
+        cdsMock.context = { id: 'req-bare' };
+        try {
+            const ret = await startJob({
+                kind: 'bareContextDispatchTest', sessionId: 'sess-1', requestedBy: 'alice',
+                request: {}, commandVersion: 1, command: { op: 'noop' }
+            });
+            await flushSpawn();
+            // Mock contexts autocommit their writes, so immediate dispatch is
+            // correct here; the warn documents that the commit signal is missing.
+            expect(processor).toHaveBeenCalledTimes(1);
+            expect(rows.get(ret.jobId)!.status).toBe('succeeded');
+            expect(log.warn).toHaveBeenCalledWith(expect.stringContaining('ambient context without lifecycle events'));
+        } finally {
+            cdsMock.context = undefined;
+        }
+    });
+
+    test('a rolled-back request never runs the work (succeeded hook never fires)', async () => {
+        const processor = vi.fn(async () => ({ ok: true }));
+        registerBackgroundJobProcessor('rolledBackDispatchTest', 1, processor);
+        const cdsMock: any = ((await import('@sap/cds')) as any).default;
+        cdsMock.context = { id: 'req-rollback', on: vi.fn() };
+        try {
+            const ret = await startJob({
+                kind: 'rolledBackDispatchTest', sessionId: 'sess-1', requestedBy: 'alice',
+                request: {}, commandVersion: 1, command: { op: 'noop' }
+            });
+            // Simulate the rollback: the row vanishes with the tx and the
+            // succeeded hook never fires.
+            rows.delete(ret.jobId);
+            await flushSpawn();
+            expect(processor).not.toHaveBeenCalled();
+        } finally {
+            cdsMock.context = undefined;
+        }
+    });
+});
+
 // ---- recoverInterruptedJobs ------------------------------------------------
 
 describe('supersedeQueuedJobs (prewarm boot hygiene)', () => {
