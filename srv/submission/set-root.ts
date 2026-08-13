@@ -25,7 +25,8 @@
  * More than 64 DISTINCT values is an error, not a truncation.
  */
 
-import { blake2b256Hex } from './document-proof';
+import { bytesToHex } from '@noble/hashes/utils';
+import { blake2b256Hex, fromHex32 } from './hashing';
 
 export const SET_DEPTH = 6;
 export const MAX_SET_VALUES = 1 << SET_DEPTH; // 64
@@ -40,12 +41,6 @@ export interface MembershipPath {
     setRoot: string;        // 64 hex
     setSiblings: string[];  // SET_DEPTH x 64 hex
     setDirs: boolean[];     // SET_DEPTH booleans (true = node is LEFT child)
-}
-
-function fromHex32(hex: string): Uint8Array {
-    const out = new Uint8Array(32);
-    for (let i = 0; i < 32; i++) out[i] = parseInt(hex.substr(i * 2, 2), 16);
-    return out;
 }
 
 /**
@@ -83,7 +78,7 @@ function buildLevels(digests: string[], pure: SetPureCircuits): Uint8Array[][] {
 export function buildMembershipSet(values: string[], pure: SetPureCircuits): { setRoot: string; digests: string[] } {
     const digests = canonicalSetDigests(values);
     const levels = buildLevels(digests, pure);
-    return { setRoot: Buffer.from(levels[SET_DEPTH][0]).toString('hex'), digests };
+    return { setRoot: bytesToHex(levels[SET_DEPTH][0]), digests };
 }
 
 /**
@@ -105,9 +100,9 @@ export function membershipPathFor(
     let node = idx;
     for (let d = 0; d < SET_DEPTH; d++) {
         const isLeft = node % 2 === 0;
-        setSiblings.push(Buffer.from(levels[d][isLeft ? node + 1 : node - 1]).toString('hex'));
+        setSiblings.push(bytesToHex(levels[d][isLeft ? node + 1 : node - 1]));
         setDirs.push(isLeft);
         node = Math.floor(node / 2);
     }
-    return { setRoot: Buffer.from(levels[SET_DEPTH][0]).toString('hex'), setSiblings, setDirs };
+    return { setRoot: bytesToHex(levels[SET_DEPTH][0]), setSiblings, setDirs };
 }

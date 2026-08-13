@@ -1,6 +1,6 @@
 {
   "name": "@odatano/nightgate",
-  "version": "0.15.1",
+  "version": "0.15.2",
   "description": "CAP Plugin: Midnight Blockchain Indexer with OData V4 API",
   "homepage": "https://github.com/ODATANO/NIGHTGATE#readme",
   "repository": {
@@ -45,6 +45,10 @@
     "./types": {
       "types": "./srv/types/index.d.ts",
       "default": "./srv/types/index.js"
+    },
+    "./set-root": {
+      "types": "./srv/submission/set-root.d.ts",
+      "default": "./srv/submission/set-root.js"
     },
     "./sdk/AttestationService": {
       "types": "./src/sdk/AttestationService.d.ts",
@@ -122,6 +126,7 @@
     "predicate:e2e": "node --env-file=.env scripts/run-predicate-e2e.mjs",
     "field-predicate-batch:e2e": "node --env-file=.env scripts/run-field-predicate-batch-e2e.mjs",
     "membership:e2e": "node --env-file=.env scripts/run-membership-e2e.mjs",
+    "dust-wedge:e2e": "node --env-file=.env scripts/run-dust-wedge-e2e.mjs",
     "agent-layer:e2e": "node --env-file=.env scripts/run-agent-layer-e2e.mjs",
     "disclosure:e2e": "node --env-file=.env scripts/run-disclosure-e2e.mjs",
     "state-verify:e2e": "node --env-file=.env scripts/run-state-verification-e2e.mjs",

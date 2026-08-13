@@ -248,6 +248,22 @@ function stateSaves(): any[] {
     return fakeParentPort.postMessage.mock.calls.map(c => c[0]).filter((m: any) => m.kind === 'state-save');
 }
 
+/**
+ * The dust-restore path awaits the main thread's state-save ack. Emit that
+ * ack synchronously for dust-bearing pushes (like a healthy persist layer
+ * would, just faster); returns an undo function.
+ */
+function autoAckDustSaves(): () => void {
+    const base = fakeParentPort.postMessage.getMockImplementation()!;
+    fakeParentPort.postMessage.mockImplementation((m: any) => {
+        base(m);
+        if (m?.kind === 'state-save' && m.blobs?.dust) {
+            fakeParentPort.emit('message', { kind: 'state-save-ack', sessionId: m.sessionId, seq: m.seq });
+        }
+    });
+    return () => fakeParentPort.postMessage.mockImplementation(base);
+}
+
 const INIT_ARGS = {
     sessionId: 'session-aaaaaaaaaaaaaaaaaaaaaaaa',
     seedHex: 'ab'.repeat(64),
@@ -668,6 +684,7 @@ describe('buildWorkerWalletProvider', () => {
         facade.submitTransaction = vi.fn(async () => ({ txId: '0xsubmitted' }));
         return {
             entry: {
+                sessionId: 'session-provider-test-aaaaaa',
                 facade,
                 sdkVersion: 'test',
                 zswapKeys: { coinPublicKey: 'cpk', encryptionPublicKey: 'epk' },
@@ -770,6 +787,253 @@ describe('buildWorkerWalletProvider', () => {
             .map(c => c[0])
             .filter((m: any) => m.kind === 'log' && m.level === 'warn' && /EMPTY DustActions/.test(m.message));
         expect(warns.length).toBe(1);
+    });
+
+    // ---- dust wedge protection (dust-pending-note-leak FR) -----------------
+
+    it('balanceTx arms the pre-build dust snapshot; a successful submit disarms it', async () => {
+        withSyncedIndexer();
+        try {
+            const { entry, finalized } = makeEntry(DUST_OK);
+            const provider = workerExports.buildWorkerWalletProvider(entry);
+            await provider.balanceTx({});
+            expect((entry as any).preSubmitDustSnapshot).toBe('BLOB-DU');
+            await provider.submitTx(finalized);
+            expect((entry as any).preSubmitDustSnapshot).toBeUndefined();
+        } finally {
+            vi.unstubAllGlobals();
+        }
+    });
+
+    it('submitTx swaps in a dust wallet restored from the pre-build snapshot on a pre-mempool reject', async () => {
+        withSyncedIndexer();
+        const undoAck = autoAckDustSaves();
+        try {
+            const { entry, facade, finalized } = makeEntry(DUST_OK);
+            const oldDust = facade.dust;
+            oldDust.stop = vi.fn(async () => undefined);
+            const freshDust = { start: vi.fn(async () => undefined), stop: vi.fn() };
+            dustRestore.mockReturnValueOnce(freshDust as any);
+            facade.submitTransaction = vi.fn(async () => { throw new Error('1014: Priority is too low'); });
+
+            const provider = workerExports.buildWorkerWalletProvider(entry);
+            await provider.balanceTx({});
+            await expect(provider.submitTx(finalized)).rejects.toThrow('1014');
+
+            expect(dustRestore).toHaveBeenCalledWith('BLOB-DU');
+            expect(freshDust.start).toHaveBeenCalledWith(entry.dustKey);
+            expect(facade.dust).toBe(freshDust);
+            expect(oldDust.stop).toHaveBeenCalled();
+            expect((entry as any).preSubmitDustSnapshot).toBeUndefined();
+
+            // The clean snapshot is persisted IMMEDIATELY (a crash before the
+            // next periodic tick must not warm-restore the wedged state), the
+            // push is tagged with the bumped dust epoch, and the acked persist
+            // counts as a durable restore.
+            const restorePush = stateSaves().at(-1);
+            expect(restorePush.sessionId).toBe((entry as any).sessionId);
+            expect(restorePush.blobs).toEqual({ dust: 'BLOB-DU' });
+            expect((entry as any).dustEpoch).toBe(1);
+            expect((entry as any).dustRestoresPersisted).toBe(1);
+        } finally {
+            undoAck();
+            vi.unstubAllGlobals();
+        }
+    });
+
+    it('a restore whose persist is never acked completes (in-memory protection) but does NOT count as durable', async () => {
+        withSyncedIndexer();
+        process.env.NIGHTGATE_RESTORE_SAVE_ACK_TIMEOUT_MS = '50';
+        try {
+            const { entry, facade, finalized } = makeEntry(DUST_OK);
+            facade.dust.stop = vi.fn(async () => undefined);
+            const freshDust = { start: vi.fn(async () => undefined), stop: vi.fn() };
+            dustRestore.mockReturnValueOnce(freshDust as any);
+            facade.submitTransaction = vi.fn(async () => { throw new Error('1014: Priority is too low'); });
+
+            const provider = workerExports.buildWorkerWalletProvider(entry);
+            await provider.balanceTx({});
+            await expect(provider.submitTx(finalized)).rejects.toThrow('1014');
+
+            // In-memory swap happened, but with no ack the durable counter
+            // must NOT move and the timeout must be logged.
+            expect(facade.dust).toBe(freshDust);
+            expect((entry as any).dustRestoresPersisted ?? 0).toBe(0);
+            const warns = fakeParentPort.postMessage.mock.calls
+                .map(c => c[0])
+                .filter((m: any) => m.kind === 'log' && m.level === 'warn' && /persist NOT confirmed/.test(m.message));
+            expect(warns.length).toBe(1);
+        } finally {
+            delete process.env.NIGHTGATE_RESTORE_SAVE_ACK_TIMEOUT_MS;
+            vi.unstubAllGlobals();
+        }
+    });
+
+    it('a DELAYED persist ack is awaited: the durable counter moves only once the ack lands', async () => {
+        withSyncedIndexer();
+        try {
+            const { entry, facade, finalized } = makeEntry(DUST_OK);
+            facade.dust.stop = vi.fn(async () => undefined);
+            const freshDust = { start: vi.fn(async () => undefined), stop: vi.fn() };
+            dustRestore.mockReturnValueOnce(freshDust as any);
+            facade.submitTransaction = vi.fn(async () => { throw new Error('1014: Priority is too low'); });
+
+            const provider = workerExports.buildWorkerWalletProvider(entry);
+            await provider.balanceTx({});
+            const pendingSubmit = provider.submitTx(finalized);
+            pendingSubmit.catch(() => { /* asserted below */ });
+
+            // Restore is waiting on the ack: swap done, counter still 0.
+            await new Promise(r => setTimeout(r, 20));
+            expect(facade.dust).toBe(freshDust);
+            expect((entry as any).dustRestoresPersisted ?? 0).toBe(0);
+
+            const restorePush = stateSaves().at(-1);
+            fakeParentPort.emit('message', { kind: 'state-save-ack', sessionId: restorePush.sessionId, seq: restorePush.seq });
+            await expect(pendingSubmit).rejects.toThrow('1014');
+            expect((entry as any).dustRestoresPersisted).toBe(1);
+        } finally {
+            vi.unstubAllGlobals();
+        }
+    });
+
+    it('submitTx does NOT restore dust on a failure that may have reached the mempool', async () => {
+        withSyncedIndexer();
+        try {
+            const { entry, facade, finalized } = makeEntry(DUST_OK);
+            const oldDust = facade.dust;
+            dustRestore.mockClear();
+            facade.submitTransaction = vi.fn(async () => { throw new Error('TxFailedError: status was not success'); });
+
+            const provider = workerExports.buildWorkerWalletProvider(entry);
+            await provider.balanceTx({});
+            await expect(provider.submitTx(finalized)).rejects.toThrow('TxFailedError');
+
+            expect(dustRestore).not.toHaveBeenCalled();
+            expect(facade.dust).toBe(oldDust);
+            expect((entry as any).preSubmitDustSnapshot).toBeUndefined();
+        } finally {
+            vi.unstubAllGlobals();
+        }
+    });
+
+    it('a failed pre-build snapshot only disarms the protection, the build proceeds', async () => {
+        withSyncedIndexer();
+        try {
+            const { entry, facade, finalized } = makeEntry(DUST_OK);
+            facade.dust.serializeState = vi.fn(async () => { throw new Error('serialize boom'); });
+            const provider = workerExports.buildWorkerWalletProvider(entry);
+            const result = await provider.balanceTx({});
+            expect(result).toBe(finalized);
+            expect((entry as any).preSubmitDustSnapshot).toBeUndefined();
+        } finally {
+            vi.unstubAllGlobals();
+        }
+    });
+});
+
+// ---- dust save epoch guard (dust-pending-note-leak FR, review P1) ----------
+//
+// After a dust snapshot restore, neither a save tick that already serialized
+// the pre-restore (poisoned) wallet nor a late ack of an older dust push may
+// win over the restored baseline.
+
+describe('dust save epoch guard', () => {
+    it('applySaveAck drops a dust blob acked under a stale epoch but merges the rest', () => {
+        const entry: any = {
+            pendingSaves: new Map([[7, { shielded: 'SH-7', dust: 'POISON' }]]),
+            dustSaveEpochs: new Map([[7, 0]]),
+            dustEpoch: 1,
+            lastSavedBlobs: { unshielded: 'UN-0' }
+        };
+        workerExports.applySaveAck(entry, 7);
+        expect(entry.lastSavedBlobs).toEqual({ unshielded: 'UN-0', shielded: 'SH-7' });
+        expect(entry.pendingSaves.size).toBe(0);
+        expect(entry.dustSaveEpochs.size).toBe(0);
+    });
+
+    it('applySaveAck merges a dust blob acked under the current epoch', () => {
+        const entry: any = {
+            pendingSaves: new Map([[8, { dust: 'CLEAN' }]]),
+            dustSaveEpochs: new Map([[8, 1]]),
+            dustEpoch: 1
+        };
+        workerExports.applySaveAck(entry, 8);
+        expect(entry.lastSavedBlobs).toEqual({ dust: 'CLEAN' });
+    });
+
+    it('tick collects poisoned -> restore pushes clean -> the late tick push carries no dust', async () => {
+        vi.useFakeTimers();
+        const SESSION = 'session-epochrace-gggggggg';
+        const undoAck = autoAckDustSaves();
+        try {
+            const facade = await initSession(SESSION);
+            fakeParentPort.postMessage.mockClear();
+
+            // The 30s tick starts collecting while the dust serialize hangs:
+            // this is the in-flight save of the soon-poisoned state.
+            let releaseCollect!: (v: string) => void;
+            facade.dust.serializeState.mockImplementationOnce(
+                () => new Promise<string>(res => { releaseCollect = res; })
+            );
+            await vi.advanceTimersByTimeAsync(30_000);
+
+            // Meanwhile a submission arms the clean pre-build snapshot and
+            // dies pre-mempool: the restore swaps the dust wallet, bumps the
+            // epoch and pushes the snapshot.
+            const freshDust = { start: vi.fn(async () => undefined), stop: vi.fn(), serializeState: vi.fn(async () => 'BLOB-DU') };
+            dustRestore.mockReturnValueOnce(freshDust as any);
+            facade.submitTransaction = vi.fn(async () => { throw new Error('1014: Priority is too low'); });
+            const reply = await rpc('transferNight', {
+                sessionId: SESSION,
+                receiverAddress: 'mn_addr_preprod1' + 'x'.repeat(48),
+                amount: '10'
+            });
+            expect(reply.ok).toBe(false);
+            const restorePush = stateSaves().at(-1);
+            expect(restorePush.blobs).toEqual({ dust: 'BLOB-DU' });
+
+            // The stale collect finally returns the poisoned blob: the tick
+            // detects the epoch change and pushes WITHOUT the dust part.
+            releaseCollect('POISONED');
+            await vi.advanceTimersByTimeAsync(0);
+            const lateSaves = stateSaves().filter(s => s.seq > restorePush.seq);
+            expect(lateSaves.length).toBeGreaterThan(0);
+            for (const s of lateSaves) expect(s.blobs.dust).toBeUndefined();
+        } finally {
+            await rpc('evict', { sessionId: SESSION });
+            undoAck();
+            vi.useRealTimers();
+        }
+    });
+});
+
+describe('isPreMempoolReject', () => {
+    it.each([
+        ['1010: Invalid Transaction', true],
+        ['1013: Transaction Already Imported', false],
+        ['Error: 1014: Priority is too low', true],
+        ['1016 Immediately Dropped', true],
+        ['transaction is invalid transaction with bad proof', true],
+        ['TxFailedError: on-chain status was not success', false],
+        ['ECONNRESET while submitting', false],
+        ['some 21014 lookalike', false]
+    ])('%s -> %s', (message, expected) => {
+        expect(workerExports.isPreMempoolReject(new Error(message))).toBe(expected);
+    });
+
+    it('finds the node reject buried in the SDK error wrappers (live shape: FiberFailure > SubmissionError > cause)', () => {
+        // Mirrors the live-observed structure: generic outer message, the
+        // Substrate code only in the nested cause.
+        const rpcErr = new Error('1010: Invalid Transaction: Custom error: 182');
+        const submissionErr: any = new Error('Transaction submission error');
+        submissionErr._tag = 'SubmissionError';
+        submissionErr.cause = rpcErr;
+        expect(workerExports.isPreMempoolReject(submissionErr)).toBe(true);
+
+        const benign: any = new Error('Transaction submission error');
+        benign.cause = new Error('socket hang up');
+        expect(workerExports.isPreMempoolReject(benign)).toBe(false);
     });
 });
 
@@ -1086,7 +1350,12 @@ describe('getBalance / estimateTransferFee', () => {
             // dust.balance lives on the SYNCED FacadeState, not facade.dust:
             // exactly the wrong-object trap the implementation comment warns
             // about, so the fixture models the correct location.
-            dust: { balance: vi.fn(() => 333n), progress: {} }
+            dust: {
+                balance: vi.fn(() => 333n),
+                progress: {},
+                totalCoins: [{ generatedNow: 300n }, { generatedNow: 33n }],
+                pendingCoins: [{ generatedNow: 44n }, { noGeneratedNowField: true }]
+            }
         });
         const reply = await rpc('getBalance', { sessionId: 'session-balance-dddddddddd' });
         expect(reply.ok).toBe(true);
@@ -1095,7 +1364,11 @@ describe('getBalance / estimateTransferFee', () => {
             unshieldedNight: '222',
             dustBalance: '333',
             registeredNightUtxoCount: 1,
-            totalNightUtxoCount: 3
+            totalNightUtxoCount: 3,
+            dustUtxoCount: 2,
+            dustPendingCount: 2,
+            dustPendingValue: '44',
+            dustRestoreCount: 0
         });
     });
 

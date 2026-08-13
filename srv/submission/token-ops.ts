@@ -64,6 +64,14 @@ export interface WalletBalanceSnapshot {
     registeredNightUtxoCount: number;
     /** Total NIGHT UTXOs the wallet tracks (registered + unregistered). */
     totalNightUtxoCount: number;
+    /** DUST UTXOs the local state currently tracks as spendable-or-growing. */
+    dustUtxoCount: number;
+    /** DUST spends currently marked in-flight (pending confirmation). */
+    dustPendingCount: number;
+    /** Current DUST atoms locked by in-flight spends, decimal string. */
+    dustPendingValue: string;
+    /** Times the dust wedge protection restored this facade's dust sub-wallet from a pre-build snapshot (process-lifetime). */
+    dustRestoreCount: number;
 }
 
 export async function getWalletBalance(args: GetWalletBalanceArgs): Promise<WalletBalanceSnapshot> {

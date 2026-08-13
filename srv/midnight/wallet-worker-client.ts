@@ -99,6 +99,10 @@ let everStarted = false;
 // even from a freshly respawned worker.
 let stateSaveSink: StateSaveSink | undefined;
 
+// Serializes state-save persists in arrival order (each handler settles, so
+// the chain never rejects and a failed persist doesn't block later ones).
+let stateSaveChain: Promise<void> = Promise.resolve();
+
 // In-flight rpc rejectors, so a worker crash/exit rejects every pending call
 // instead of leaving it to hang forever on a port that will never reply.
 interface PendingRpc { reject: (e: Error) => void; }
@@ -183,8 +187,12 @@ export async function startWalletWorker(): Promise<void> {
     // Push events from worker (state-save, log, private-state-rpc)
     worker.on('message', (msg: any) => {
         if (msg?.kind === 'state-save') {
-            // Ack ONLY when the sink persisted successfully
-            Promise.resolve()
+            // Ack ONLY when the sink persisted successfully. Persists are
+            // CHAINED so they commit in arrival order: the sink is async, and
+            // two in-flight saves for the same session could otherwise land
+            // out of order in the DB. The dust-restore push (wallet-worker's
+            // dust wedge protection) relies on last-sent-wins.
+            stateSaveChain = stateSaveChain
                 .then(() => stateSaveSink?.(msg))
                 .then(() => {
                     if (msg.seq != null) worker.postMessage({ kind: 'state-save-ack', sessionId: msg.sessionId, seq: msg.seq });
@@ -522,6 +530,10 @@ export function walletGetBalance(args: {
     dustBalance: string;
     registeredNightUtxoCount: number;
     totalNightUtxoCount: number;
+    dustUtxoCount: number;
+    dustPendingCount: number;
+    dustPendingValue: string;
+    dustRestoreCount: number;
 }> {
     return rpc('getBalance', args);
 }

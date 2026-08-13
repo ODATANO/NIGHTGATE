@@ -319,6 +319,8 @@ Canonical JSON (recursively key-sorted) → blake2b-256 `payloadHash` (the value
 
 Canonical membership-set helper for `issueFieldMembershipAttestation` and `verifyPredicateState`. Builds the deterministic depth-6 set tree over an allow-list, so any party recomputes the same `setRoot` from the published list alone. Canonical rule: blake2b-256 each value (exact string), dedupe, sort ascending, pad to 64 slots by repeating the last member digest, leaf-wrap with the contract's `setLeafHash` pure circuit. Padding repeats a REAL member on purpose: every leaf must be a member digest, or the padding constant itself would be provable as a member of any non-full list. More than 64 DISTINCT values is a 400. Without `value`/`valueDigest`: returns `{ setRoot, memberCount }` (the verifier lane). With one of them: additionally the member's inclusion path (`setSiblingsJson`/`setDirsJson`; witness material, the matched slot narrows the hidden value); 400 when the value is not in the list. **Rate limit:** 120/hour per client (shared with `prepareDocumentProof`).
 
+Consumers who need the canonical rule OUTSIDE a server context (anonymous read-side verifiers, browser bundles, unit tests pinning a claim catalog) should import the session-free `@odatano/nightgate/set-root` subpath instead of re-implementing it: `import { buildMembershipSet, membershipPathFor, canonicalSetDigests, SET_DEPTH, MAX_SET_VALUES } from '@odatano/nightgate/set-root'`. It is dependency-clean (no CAP, no Node builtins; loads in Node CJS/ESM and browser bundlers), takes the artifact's `setLeafHash`/`nodeHash` pure circuits as a parameter, and produces byte-identical roots to this action.
+
 ## ZK predicate attestations
 
 Prove statements about anchored field values without revealing them (on-chain-verified): numeric predicates against a public threshold, bytes equality against a public digest, and set membership in a public allow-list. See [the AttestationVault contract](../contracts/attestation-vault).
@@ -385,9 +387,9 @@ Bind the authenticated caller (`req.user.id`) to the `Bytes<32>` grantee id the 
 
 ## Diagnostics
 
-### `getWalletBalance(sessionId) → { shieldedNight, unshieldedNight, dustBalance, registeredNightUtxoCount, totalNightUtxoCount }`
+### `getWalletBalance(sessionId) → { shieldedNight, unshieldedNight, dustBalance, registeredNightUtxoCount, totalNightUtxoCount, dustUtxoCount, dustPendingCount, dustPendingValue, dustRestoreCount }`
 
-Read-only snapshot. All balances as decimal NIGHT atoms (or DUST atoms) — strings to preserve `bigint` precision.
+Read-only snapshot. All balances as decimal NIGHT atoms (or DUST atoms) — strings to preserve `bigint` precision. The dust diagnostics fields (0.15.2) expose the dust sub-wallet's local UTXO view: `dustUtxoCount` is the number of DUST notes the wallet tracks, `dustPendingCount`/`dustPendingValue` are in-flight dust spends awaiting confirmation, and `dustRestoreCount` counts the dust wedge protection's snapshot restores whose re-persist the database CONFIRMED (process-lifetime; a restore that could not be durably persisted is logged but not counted, and the live e2e gates on this counter). A wallet showing `registeredNightUtxoCount > 0` but `dustUtxoCount == 0` and `dustPendingCount == 0` while fee payments keep failing is dust-wedged (leaked in-flight spend) rather than genuinely empty; see the operations guide.
 
 **Rate limit:** 60/min per client IP.
 
@@ -402,7 +404,11 @@ Response:
   "unshieldedNight": "0",
   "dustBalance": "2098000",
   "registeredNightUtxoCount": 1,
-  "totalNightUtxoCount": 1
+  "totalNightUtxoCount": 1,
+  "dustUtxoCount": 1,
+  "dustPendingCount": 0,
+  "dustPendingValue": "0",
+  "dustRestoreCount": 0
 }
 ```
 

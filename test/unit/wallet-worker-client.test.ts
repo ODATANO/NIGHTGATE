@@ -262,6 +262,37 @@ describe('wallet-worker-client', () => {
             expect(pmSpy).not.toHaveBeenCalledWith(expect.objectContaining({ kind: 'state-save-ack', seq: 8 }));
         });
 
+        it('serializes state-save persists in arrival order (dust-restore push relies on last-sent-wins)', async () => {
+            await startWalletWorker();
+            const w = latestWorker!;
+            const order: string[] = [];
+            let releaseFirst!: () => void;
+            const sink = vi.fn(async (ev: any) => {
+                order.push(`start:${ev.seq}`);
+                if (ev.seq === 10) await new Promise<void>(res => { releaseFirst = res; });
+                order.push(`done:${ev.seq}`);
+            });
+            setStateSaveSink(sink);
+            const pmSpy = vi.spyOn(w, 'postMessage');
+
+            // Two saves in flight: the first (poisoned) hangs in the DB layer
+            // while the second (the restore's clean snapshot) arrives.
+            w.emit('message', { kind: 'state-save', sessionId: 's3', sdkVersion: 'v', seq: 10, blobs: { dust: 'POISON' } });
+            w.emit('message', { kind: 'state-save', sessionId: 's3', sdkVersion: 'v', seq: 11, blobs: { dust: 'CLEAN' } });
+            await new Promise(r => setImmediate(r));
+
+            // The second persist must NOT start (and must not be acked) while
+            // the first is still in flight, or it could commit before it.
+            expect(order).toEqual(['start:10']);
+            expect(pmSpy).not.toHaveBeenCalledWith(expect.objectContaining({ kind: 'state-save-ack', seq: 11 }));
+
+            releaseFirst();
+            await new Promise(r => setImmediate(r));
+            expect(order).toEqual(['start:10', 'done:10', 'start:11', 'done:11']);
+            expect(pmSpy).toHaveBeenCalledWith({ kind: 'state-save-ack', sessionId: 's3', seq: 10 });
+            expect(pmSpy).toHaveBeenCalledWith({ kind: 'state-save-ack', sessionId: 's3', seq: 11 });
+        });
+
         it('caches pushed sync-progress snapshots for synchronous reads', async () => {
             await startWalletWorker();
             const w = latestWorker!;

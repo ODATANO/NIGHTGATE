@@ -28,13 +28,16 @@
  */
 
 import cds, { Request } from '@sap/cds';
-import { blake2b } from '@noble/hashes/blake2b';
-import { bytesToHex } from '@noble/hashes/utils';
 import { pathToFileURL } from 'node:url';
 import path from 'node:path';
 import { RateLimiter } from '../utils/rate-limiter';
 import { getContractRegistration } from './contract-registry';
+import { blake2b256Hex, fromHex32 } from './hashing';
 import { buildMembershipSet, membershipPathFor, canonicalSetDigests } from './set-root';
+
+// Re-exported so existing consumers of this module keep their import site;
+// the definition moved to the dependency-clean ./hashing (set-root subpath).
+export { blake2b256Hex } from './hashing';
 
 const log = cds.log('nightgate:document-proof');
 
@@ -70,20 +73,9 @@ export function canonicalize(value: unknown): string {
     return JSON.stringify(sortKeys(value));
 }
 
-/** blake2b-256 hex of a UTF-8 string (the on-chain hashing scheme). */
-export function blake2b256Hex(input: string): string {
-    return bytesToHex(blake2b(Buffer.from(input, 'utf8'), { dkLen: 32 }));
-}
-
 /** Canonical 32-byte field id for a field path (public label hash). */
 export function fieldKeyHex(fieldPath: string): string {
     return blake2b256Hex(fieldPath);
-}
-
-function fromHex32(hex: string): Uint8Array {
-    const out = new Uint8Array(32);
-    for (let i = 0; i < 32; i++) out[i] = parseInt(hex.substr(i * 2, 2), 16);
-    return out;
 }
 
 // ---- Value scaling --------------------------------------------------------

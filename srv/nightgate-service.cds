@@ -976,6 +976,10 @@ service NightgateService {
         dustBalance              : String;
         registeredNightUtxoCount : Integer;
         totalNightUtxoCount      : Integer;
+        dustUtxoCount            : Integer;
+        dustPendingCount         : Integer;
+        dustPendingValue         : String;
+        dustRestoreCount         : Integer;
     };
 
     /**

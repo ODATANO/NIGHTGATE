@@ -5,15 +5,6 @@
  * document-proof.test.ts; real-artifact parity is the live e2e's job.
  */
 
-vi.mock('@sap/cds', () => {
-    const cds: any = {
-        env: { requires: { nightgate: {} } },
-        log: vi.fn(() => ({ error: vi.fn(), warn: vi.fn(), info: vi.fn(), debug: vi.fn() }))
-    };
-    cds.default = cds;
-    return cds;
-});
-
 import { sha256 } from '@noble/hashes/sha256';
 import {
     canonicalSetDigests,
@@ -23,7 +14,7 @@ import {
     MAX_SET_VALUES,
     type SetPureCircuits
 } from '../../srv/submission/set-root';
-import { blake2b256Hex } from '../../srv/submission/document-proof';
+import { blake2b256Hex } from '../../srv/submission/hashing';
 
 const fakePure: SetPureCircuits = {
     setLeafHash: (d) => sha256(Buffer.concat([Buffer.from('setleaf'), Buffer.from(d)])),

@@ -28,6 +28,7 @@
 import { parentPort, MessageChannel, type MessagePort } from 'node:worker_threads';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { inspect } from 'node:util';
 import { formatErr } from '../utils/format-error';
 import { deriveIndexerWsUrl } from '../utils/indexer-url';
 import { runBatchInScope } from './batch-call-scope';
@@ -80,6 +81,21 @@ interface FacadeEntry {
     networkId: string;
     /** Indexer GraphQL HTTP URL, used to read the genuine sync target (tip). */
     indexerHttpUrl: string;
+    /** The wallet configuration the facade's sub-wallets were built with; kept for dust snapshot restores. */
+    walletConfiguration: any;
+    /**
+     * Dust sub-wallet state serialized BEFORE the current submission's build
+     * (the build books the dust spend, so a pre-submit snapshot would already
+     * carry the in-flight marker). Used to swap in a clean dust wallet after
+     * a pre-mempool reject; see dust-pending-note-leak FR.
+     */
+    preSubmitDustSnapshot?: string;
+    /** Bumped on every dust snapshot restore; lets the save tick drop a dust blob serialized from the pre-restore wallet. */
+    dustEpoch?: number;
+    /** Dust epoch each in-flight save's dust blob was serialized under (by seq); acks with a stale epoch must not advance the dust baseline. */
+    dustSaveEpochs?: Map<number, number>;
+    /** Snapshot restores whose re-persist the main thread CONFIRMED (state-save-ack). What getWalletBalance reports as dustRestoreCount. */
+    dustRestoresPersisted?: number;
     // 32-byte session-stable secret for contracts that use the
     // `local_secret_key()` witness pattern (e.g. AttestationVault). Derived
     // once per facade build via deriveAttestationSecret(seedBytes).
@@ -749,6 +765,124 @@ export async function feeOfDiscardedRecipe(facade: any, recipe: any, site: strin
     }
 }
 
+// ---- Dust wedge protection (dust-pending-note-leak FR) --------------------
+//
+// A submission that provably never reached the mempool leaves the dust note
+// it spent marked in-flight FOREVER: the facade's submit-error revert does
+// call dust.revertTransaction, but CoreWallet.applyFailed drops the
+// pendingDust marker while the ledger-side reclaim
+// (processTtls(ctime + grace)) no-ops, so the note stays spent in
+// DustLocalState and no later sweep can find it. A single-note wallet (the
+// common self-generation case) is then wedged: every build fails with
+// `could not balance dust` until a cold re-sync. Until that is fixed
+// upstream, we snapshot the dust sub-wallet BEFORE each build (the build is
+// what books the spend) and, when the submit dies pre-mempool, swap in a
+// fresh dust wallet restored from that snapshot. Nothing reached the chain,
+// so the snapshot is by definition still valid; sync resumes from the
+// snapshot's own progress index, exactly like a restart warm-restore.
+
+/**
+ * Substrate rejects that provably never entered the mempool: 1010 (invalid),
+ * 1014 (priority too low; the pool kept the EARLIER tx, this one never
+ * entered) and 1016 (immediately dropped). Deliberately NOT 1013 (already
+ * imported: the tx IS in the pool, its spends must stay marked in-flight).
+ *
+ * The SDK buries the node's reject under generic wrappers (live-verified:
+ * the thrown error is `(FiberFailure) SubmissionError: Transaction
+ * submission error`, while `1010: Invalid Transaction: Custom error: 182`
+ * only exists in the nested `cause`), so this matches against a bounded
+ * deep inspection of the whole error structure, not just `message`.
+ */
+export function isPreMempoolReject(err: unknown): boolean {
+    const haystack = inspect(err, { depth: 8, maxStringLength: 2048, breakLength: Infinity });
+    return /\b101[046]\b|priority is too low|immediately dropped|invalid transaction/i.test(haystack);
+}
+
+/**
+ * Arm the wedge protection for the submission that is about to build.
+ * Best-effort: a failed snapshot only disarms the protection for this tx.
+ */
+async function captureDustSnapshot(entry: FacadeEntry, site: string): Promise<void> {
+    try {
+        entry.preSubmitDustSnapshot = await entry.facade.dust.serializeState();
+    } catch (e) {
+        entry.preSubmitDustSnapshot = undefined;
+        log('warn', `${site}: dust pre-build snapshot failed (wedge protection disarmed for this tx): ${formatErr(e)}`);
+    }
+}
+
+/**
+ * Replace the facade's dust sub-wallet with one restored from the armed
+ * pre-build snapshot. The swap is safe mid-life: facade methods and our
+ * periodic save / sync probes all reach the sub-wallet through `facade.dust`
+ * at call time, and submits serialize per facade so no build is in flight.
+ * The old wallet is stopped only after the restored one started; if the
+ * restore fails the old (wedged) wallet stays, which is no worse than today.
+ */
+async function restoreDustFromSnapshot(entry: FacadeEntry, site: string): Promise<void> {
+    const snapshot = entry.preSubmitDustSnapshot;
+    entry.preSubmitDustSnapshot = undefined;
+    if (!snapshot) return;
+    try {
+        const sdk = await loadSdk();
+        const fresh = sdk.dust.DustWallet(entry.walletConfiguration).restore(snapshot);
+        await fresh.start(entry.dustKey);
+        const old = entry.facade.dust;
+        entry.facade.dust = fresh;
+        try { await old.stop(); } catch { /* already dead is fine */ }
+        // The periodic save may have persisted the poisoned in-flight state
+        // while the tx was proving; a crash before the next tick would then
+        // warm-restore the wedge. Persist the clean snapshot NOW, under a
+        // bumped dust epoch: a save tick that already serialized the
+        // pre-restore wallet drops its dust blob (epoch check in the tick),
+        // and acks of dust pushed under an older epoch are ignored by
+        // applySaveAck, so neither late pushes nor out-of-order acks can
+        // win over the restored baseline.
+        entry.dustEpoch = (entry.dustEpoch ?? 0) + 1;
+        log('info', `${site}: dust sub-wallet restored from pre-build snapshot after pre-mempool reject (leaked in-flight spend discarded, snapshot re-persisted)`);
+        // The push alone is fire-and-forget; a crash or persist failure
+        // between push and ack would keep the poisoned DB state. WAIT for
+        // the main thread's ack (bounded) and count the restore as durable
+        // only then: dustRestoreCount reports persist-CONFIRMED restores,
+        // so the live e2e gate also proves durability.
+        try {
+            await pushStateSaveAcked(entry.sessionId, entry, { dust: snapshot }, restoreSaveAckTimeoutMs());
+            entry.dustRestoresPersisted = (entry.dustRestoresPersisted ?? 0) + 1;
+            log('info', `${site}: restored dust snapshot persist CONFIRMED (state-save ack)`);
+        } catch (e) {
+            log('warn', `${site}: restored dust snapshot persist NOT confirmed (${formatErr(e)}); the DB may hold the pre-restore state until the next periodic save lands`);
+        }
+    } catch (e) {
+        log('warn', `${site}: dust snapshot restore failed; wallet may be dust-wedged until a cold re-sync: ${formatErr(e)}`);
+    }
+}
+
+/**
+ * facade.submitTransaction with the dust-wedge protection applied: a
+ * pre-mempool reject restores the pre-build dust snapshot, every other
+ * outcome (success, or a failure where the tx may have reached the pool)
+ * just disarms it. Never restore for post-mempool failures: a tx that
+ * landed and failed on-chain HAS consumed its guaranteed-section dust fee.
+ */
+async function submitWithDustGuard(entry: FacadeEntry, tx: any, site: string): Promise<any> {
+    try {
+        const txId = await entry.facade.submitTransaction(tx);
+        entry.preSubmitDustSnapshot = undefined;
+        return txId;
+    } catch (e) {
+        if (isPreMempoolReject(e)) {
+            await restoreDustFromSnapshot(entry, site);
+        } else {
+            // Deliberate: a tx that may have reached the pool keeps its
+            // booked spends. Log the inspected head so a mis-classified
+            // reject is diagnosable from the field.
+            log('info', `${site}: submit failed, NOT classified pre-mempool (dust guard disarmed): ${inspect(e, { depth: 8, maxStringLength: 512, breakLength: Infinity }).slice(0, 600)}`);
+            entry.preSubmitDustSnapshot = undefined;
+        }
+        throw e;
+    }
+}
+
 // Exported for the in-thread unit tests (wallet-worker-dispatch.test.ts):
 // the 117-guard around balanceTx/submitTx is OUR logic, not SDK choreography.
 export function buildWorkerWalletProvider(entry: FacadeEntry): any {
@@ -764,6 +898,8 @@ export function buildWorkerWalletProvider(entry: FacadeEntry): any {
             // cheap re-check on the warm path; waitForGenuineSync is bounded so a
             // stalled indexer subscription fails fast instead of hanging.
             await waitForGenuineSync(entry, BALANCE_SYNC_TIMEOUT_MS, 'balance');
+            // Arm the dust-wedge protection BEFORE the build books the spend.
+            await captureDustSnapshot(entry, 'balance');
             const effectiveTtl = ttl ?? new Date(Date.now() + 60 * 60 * 1000);
             const recipe = await entry.facade.balanceUnboundTransaction(
                 tx,
@@ -804,7 +940,7 @@ export function buildWorkerWalletProvider(entry: FacadeEntry): any {
             if (dust.emptyDustActions) {
                 log('warn', `pre-submit tx has an EMPTY DustActions section (node rejects as 1010/117 NotNormalized): ${dust.summary}`);
             }
-            return entry.facade.submitTransaction(tx);
+            return submitWithDustGuard(entry, tx, 'submit');
         }
     };
 }
@@ -877,6 +1013,9 @@ export function buildSponsoredWalletProvider(caller: FacadeEntry, sponsor: Facad
             }
 
             try {
+                // Phase 2 books the SPONSOR's dust spend: arm its wedge
+                // protection before the build.
+                await captureDustSnapshot(sponsor, 'sponsored-balance sponsor');
                 const sponsorRecipe = await sponsor.facade.balanceFinalizedTransaction(
                     callerFinalized,
                     { shieldedSecretKeys: sponsor.zswapKeys, dustSecretKey: sponsor.dustKey },
@@ -917,14 +1056,15 @@ export function buildSponsoredWalletProvider(caller: FacadeEntry, sponsor: Facad
                 log('warn', `pre-submit sponsored tx has an EMPTY DustActions section (node rejects as 1010/117 NotNormalized): ${dust.summary}`);
             }
             try {
-                const result = await sponsor.facade.submitTransaction(tx);
+                const result = await submitWithDustGuard(sponsor, tx, 'sponsored-submit sponsor');
                 lastCallerFinalized = undefined;
                 return result;
             } catch (e) {
-                // The SDK reverted the SPONSOR facade; the caller's phase-1
-                // spends stay pending without this (bug_002). Safe either
-                // way: if the tx did land, sync reconciles and a retry is
-                // rejected by the node; if it did not, the retry works.
+                // The SDK reverted the SPONSOR facade (plus our dust guard
+                // above); the caller's phase-1 spends stay pending without
+                // this (bug_002). Safe either way: if the tx did land, sync
+                // reconciles and a retry is rejected by the node; if it did
+                // not, the retry works.
                 await revertRecipeBestEffort(caller.facade, lastCallerFinalized ?? tx, 'sponsored-submit caller');
                 lastCallerFinalized = undefined;
                 throw e;
@@ -1195,6 +1335,7 @@ async function buildFacade(args: InitArgs): Promise<FacadeEntry> {
         unshieldedKeystore,
         networkId: args.networkId,
         indexerHttpUrl: args.indexerHttpUrl,
+        walletConfiguration: configuration,
         attestationSecret: deriveAttestationSecret(roleSeeds.zswap)
     };
 }
@@ -1203,22 +1344,42 @@ async function buildFacade(args: InitArgs): Promise<FacadeEntry> {
 
 let saveSeqCounter = 0;
 
+// Ack waiters for pushes that need durability confirmation (dust snapshot
+// restore). Keyed by save seq; resolved by the dispatcher on state-save-ack
+// INDEPENDENTLY of the facade lookup, so a waiter cannot dangle when the
+// entry is evicted between push and ack.
+const saveAckWaiters = new Map<number, () => void>();
+
+export function resolveSaveAckWaiter(seq: number): void {
+    saveAckWaiters.get(seq)?.();
+}
+
 /**
  * Push a state-save to the main thread. `lastSavedBlobs` is only advanced by
  * the corresponding `state-save-ack` (see the parentPort dispatcher), so a
  * failed or dropped persist keeps the blobs "unsaved" and they are re-pushed
- * on the next tick.
+ * on the next tick. `beforePost` runs after the seq is allocated but BEFORE
+ * the message goes out, so an ack waiter can be registered race-free even
+ * against a synchronous ack.
  */
-function pushStateSave(sessionId: string, entry: FacadeEntry, blobs: { shielded?: string; unshielded?: string; dust?: string }): number {
+function pushStateSave(sessionId: string, entry: FacadeEntry, blobs: { shielded?: string; unshielded?: string; dust?: string }, beforePost?: (seq: number) => void): number {
     const seq = ++saveSeqCounter;
     entry.pendingSaves ??= new Map();
     entry.pendingSaves.set(seq, blobs);
+    // Tag dust-bearing pushes with the epoch their blob was serialized
+    // under, so applySaveAck can reject acks that arrive after a dust
+    // snapshot restore invalidated the blob.
+    if (blobs.dust !== undefined) {
+        (entry.dustSaveEpochs ??= new Map()).set(seq, entry.dustEpoch ?? 0);
+    }
     // Bound the in-flight map: acks normally clear entries; if main never
     // acks (persist layer down), keep only the most recent few.
     if (entry.pendingSaves.size > 4) {
         const oldest = Math.min(...entry.pendingSaves.keys());
         entry.pendingSaves.delete(oldest);
+        entry.dustSaveEpochs?.delete(oldest);
     }
+    beforePost?.(seq);
     parentPort?.postMessage({
         kind: 'state-save',
         sessionId,
@@ -1227,6 +1388,56 @@ function pushStateSave(sessionId: string, entry: FacadeEntry, blobs: { shielded?
         blobs
     });
     return seq;
+}
+
+function restoreSaveAckTimeoutMs(): number {
+    // Read per call so tests can shrink the window. The main-thread persist
+    // chain can queue behind other saves; 30s is generous but bounded.
+    return Number(process.env.NIGHTGATE_RESTORE_SAVE_ACK_TIMEOUT_MS || 30_000);
+}
+
+/**
+ * pushStateSave that resolves once the main thread CONFIRMED the persist
+ * (state-save-ack for this seq) and rejects after `timeoutMs` (there is no
+ * explicit nack: a sink failure simply never acks).
+ */
+function pushStateSaveAcked(sessionId: string, entry: FacadeEntry, blobs: { shielded?: string; unshielded?: string; dust?: string }, timeoutMs: number): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+        pushStateSave(sessionId, entry, blobs, (seq) => {
+            const timer = setTimeout(() => {
+                saveAckWaiters.delete(seq);
+                reject(new Error(`state-save seq=${seq} not acked within ${timeoutMs}ms`));
+            }, timeoutMs);
+            (timer as any).unref?.();
+            saveAckWaiters.set(seq, () => {
+                clearTimeout(timer);
+                saveAckWaiters.delete(seq);
+                resolve();
+            });
+        });
+    });
+}
+
+/**
+ * Apply a main-thread `state-save-ack`: advance the confirmed-saved blobs so
+ * the tick's unchanged-skip applies. Pushes carry only CHANGED sub-blobs, so
+ * this merges instead of replacing (a dust-only ack must not mark
+ * shielded/unshielded never-saved). A dust blob acked under a STALE dust
+ * epoch (a snapshot restore happened after its push) is dropped from the
+ * merge: the restore's own push is the only valid dust baseline from then
+ * on. Exported for the in-thread unit tests.
+ */
+export function applySaveAck(entry: FacadeEntry, seq: number): void {
+    const blobs = entry.pendingSaves?.get(seq);
+    if (!blobs) return;
+    let effective = blobs;
+    if (blobs.dust !== undefined && (entry.dustSaveEpochs?.get(seq) ?? 0) !== (entry.dustEpoch ?? 0)) {
+        const { dust: _stale, ...rest } = blobs;
+        effective = rest;
+    }
+    entry.lastSavedBlobs = { ...entry.lastSavedBlobs, ...effective };
+    entry.pendingSaves!.delete(seq);
+    entry.dustSaveEpochs?.delete(seq);
 }
 
 function startPeriodicSave(sessionId: string, entry: FacadeEntry): void {
@@ -1241,7 +1452,15 @@ function startPeriodicSave(sessionId: string, entry: FacadeEntry): void {
         log('debug', `save-tick #${tickCount} fired, calling collectSerializedStates...`);
         try {
             const collectStart = Date.now();
+            const epochAtCollect = entry.dustEpoch ?? 0;
             const blobs = await collectSerializedStates(entry.facade);
+            if ((entry.dustEpoch ?? 0) !== epochAtCollect && blobs.dust) {
+                // A dust snapshot restore landed while we were serializing:
+                // this blob may describe the pre-restore (poisoned) wallet,
+                // and the restore already persisted the clean snapshot.
+                delete blobs.dust;
+                log('debug', `save-tick #${tickCount} dropped dust blob (dust restore during collect)`);
+            }
             const collectMs = Date.now() - collectStart;
             const shape = [
                 `sh=${blobs.shielded ? blobs.shielded.length : '-'}`,
@@ -1516,6 +1735,7 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
         const verifyingKey = entry.unshieldedKeystore.getPublicKey();
         const signFn = (payload: Uint8Array) => entry.unshieldedKeystore.signData(payload);
 
+        await captureDustSnapshot(entry, 'dust-register');
         const recipe = await entry.facade.registerNightUtxosForDustGeneration(
             unregistered,
             verifyingKey,
@@ -1523,7 +1743,7 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
             receiverParsed
         );
         const finalized = await entry.facade.finalizeRecipe(recipe);
-        const txId = await entry.facade.submitTransaction(finalized);
+        const txId = await submitWithDustGuard(entry, finalized, 'dust-register');
 
         log('info', `dust-register: submitted ${unregistered.length} UTXO(s), txId=${String(txId).slice(0, 16)}...`);
 
@@ -1614,13 +1834,14 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
             log('info', `dust-deregister: fee sponsored by ${sponsorEntry === entry ? 'self' : String(sponsorSessionId).slice(0, 16)}`);
             await waitForGenuineSync(sponsorEntry, BALANCE_SYNC_TIMEOUT_MS, 'deregister sponsor');
         }
+        await captureDustSnapshot(payer, 'dust-deregister');
         const balanced = await payer.facade.balanceUnprovenTransaction(
             recipe.transaction,
             { shieldedSecretKeys: payer.zswapKeys, dustSecretKey: payer.dustKey },
             { ttl: new Date(Date.now() + 10 * 60000), tokenKindsToBalance: ['dust'] }
         );
         const finalized = await payer.facade.finalizeRecipe(balanced);
-        const txId = await payer.facade.submitTransaction(finalized);
+        const txId = await submitWithDustGuard(payer, finalized, 'dust-deregister');
 
         log('info', `dust-deregister: submitted ${registered.length} UTXO(s), txId=${String(txId).slice(0, 16)}...`);
 
@@ -1678,6 +1899,7 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
 
         log('info', `transfer: ${amount} ${tokenTypeHex ? `token ${tokenTypeHex.slice(0, 12)}...` : 'NIGHT'} to ${receiver.kind} addr ${receiverAddress.slice(0, 24)}...`);
 
+        await captureDustSnapshot(entry, 'transfer');
         const recipe = await entry.facade.transferTransaction(
             outputs,
             { shieldedSecretKeys: entry.zswapKeys, dustSecretKey: entry.dustKey },
@@ -1692,7 +1914,7 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
         const signFn = (payload: Uint8Array) => entry.unshieldedKeystore.signData(payload);
         const signed = await entry.facade.signRecipe(recipe, signFn);
         const finalized = await entry.facade.finalizeRecipe(signed);
-        const txId = await entry.facade.submitTransaction(finalized);
+        const txId = await submitWithDustGuard(entry, finalized, 'transfer');
 
         log('info', `transfer: submitted, txId=${String(txId).slice(0, 16)}...`);
 
@@ -1750,13 +1972,32 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
         const registeredCount = totalNightCoins.filter(
             (c: any) => c?.meta?.registeredForDustGeneration === true
         ).length;
+        // Dust-side diagnosability (dust-pending-note-leak FR): a wedged
+        // wallet (in-flight spend leaked by a pre-mempool abort) shows
+        // registered NIGHT but ZERO dust utxos and ZERO pending, which is
+        // otherwise indistinguishable from "genuinely empty" without logs.
+        const dustUtxos: any[] = synced?.dust?.totalCoins ?? [];
+        const dustPending: any[] = synced?.dust?.pendingCoins ?? [];
+        const dustPendingValue = dustPending.reduce(
+            (sum: bigint, c: any) => sum + (typeof c?.generatedNow === 'bigint' ? c.generatedNow : 0n), 0n
+        );
 
         return {
             shieldedNight: shieldedNight.toString(),
             unshieldedNight: unshieldedNight.toString(),
             dustBalance: dustBalance.toString(),
             registeredNightUtxoCount: registeredCount,
-            totalNightUtxoCount: totalNightCoins.length
+            totalNightUtxoCount: totalNightCoins.length,
+            dustUtxoCount: dustUtxos.length,
+            dustPendingCount: dustPending.length,
+            dustPendingValue: dustPendingValue.toString(),
+            // Persist-CONFIRMED snapshot restores (bumped only after the
+            // main thread acked the restore's re-persist). Exposed so the
+            // live e2e can ASSERT the whole guard lane ran, including
+            // durability (the SDK's own fast-path revert heals some aborts
+            // without it, and a fire-and-forget push could green-light a
+            // gate while the DB still holds the poisoned state).
+            dustRestoreCount: entry.dustRestoresPersisted ?? 0
         };
     },
 
@@ -2175,18 +2416,13 @@ if (!parentPort) {
 
 parentPort.on('message', async (msg: any) => {
     if (msg?.kind === 'state-save-ack') {
-        // Main thread confirmed it persisted save `seq`: advance the
-        // confirmed-saved blobs so the tick's unchanged-skip applies. An
-        // entry evicted in the meantime is simply ignored.
+        // Main thread confirmed it persisted save `seq`. Resolve durability
+        // waiters FIRST (independent of the facade lookup); an entry evicted
+        // in the meantime is otherwise ignored; merge/epoch rules in
+        // applySaveAck.
+        resolveSaveAckWaiter(msg.seq);
         const entry = facades.get(String(msg.sessionId ?? ''));
-        const blobs = entry?.pendingSaves?.get(msg.seq);
-        if (entry && blobs) {
-            // Pushes carry only CHANGED sub-blobs: merge instead of replace,
-            // otherwise a dust-only ack would mark shielded/unshielded as
-            // never-saved and re-push them forever.
-            entry.lastSavedBlobs = { ...entry.lastSavedBlobs, ...blobs };
-            entry.pendingSaves!.delete(msg.seq);
-        }
+        if (entry) applySaveAck(entry, msg.seq);
         return;
     }
     if (msg?.kind !== 'rpc' || !msg.port) {

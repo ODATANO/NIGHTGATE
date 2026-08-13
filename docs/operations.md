@@ -206,6 +206,7 @@ The wallet has less DUST than the operation's fee. Mostly hits on `deployContrac
 **Causes:**
 - Wallet has no unshielded NIGHT registered for dust gen (no accrual). Run `registerForDustGeneration` first, wait ~1-2 min for first dust.
 - Wallet is at dust cap (~5 tDUST on preprod default) and you need more. Wait for refill (~100 h to full from empty) or increase NIGHT holding.
+- **Dust-wedged wallet** (pre-0.15.2, or a case that slipped past the guard): a submission that died before the mempool (Substrate 1014 dust contention and friends) leaked its in-flight dust spend, and the wallet's whole dust sat in that one note. Signature in `getWalletBalance`: `registeredNightUtxoCount > 0` but `dustUtxoCount == 0` and `dustPendingCount == 0`, with `dustBalance` pinned at 0 across restarts. Since 0.15.2 the worker restores the dust sub-wallet from a pre-build snapshot on such rejects automatically. Manual heal: stop the server, delete the wallet's `midnight_WalletSyncStates` row, restart and reconnect the session; the cold re-sync rebuilds from chain (~5-15 min on preprod), where the aborted spend never existed.
 
 ### "Wallet.Sync: [object ErrorEvent]" spamming the log
 

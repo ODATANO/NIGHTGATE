@@ -1,5 +1,66 @@
 # Changelog
 
+## 0.15.2 - 2026-08-13
+
+Dust wedge protection plus a public set-root surface.
+
+### Dust pending-note leak on pre-mempool rejects (live incident, preprod)
+
+A submission rejected BEFORE the mempool (Substrate 1014 dust contention and
+friends) could leak the spent dust note's in-flight marker: the SDK facade's
+revert runs, but the dust wallet's sync filter can erase the pending marker
+in the build-to-reject window, after which nothing ever reclaims the note. A
+wallet whose whole dust sits in one note (the normal self-generation shape)
+is then permanently wedged (`could not balance dust`, dustBalance 0 across
+restarts); only a cold re-sync healed it. Upstream report drafted; NIGHTGATE
+now defends itself:
+
+- The worker serializes the dust sub-wallet BEFORE every build that books a
+  dust spend and, when the submit dies provably pre-mempool (1010/1014/1016,
+  deliberately not 1013 "already imported"), swaps in a dust wallet restored
+  from that snapshot. Sync resumes from the snapshot's progress index like a
+  restart warm-restore. Wired at every submit site: both wallet providers
+  (contract lanes incl. sponsored), `sendNight`, dust register/deregister.
+  Post-mempool failures never restore (a landed-but-failed tx has consumed
+  its dust fee).
+- The restored snapshot is persisted IMMEDIATELY under a bumped dust epoch,
+  and the restore path WAITS (bounded) for the main thread's persist ack:
+  a save tick that already serialized the pre-restore wallet drops its dust
+  blob, acks of dust pushed under an older epoch never advance the
+  confirmed baseline, and the main thread chains state-save persists in
+  arrival order. A crash between restore and the next periodic save can no
+  longer warm-restore the wedged state; `dustRestoreCount` counts only
+  persist-CONFIRMED restores, so the e2e gate also proves durability.
+- Reject classification reads the WHOLE error structure: the SDK buries the
+  node's reject under generic wrappers (live: `(FiberFailure)
+  SubmissionError: Transaction submission error` with the actual `1010:
+  Invalid Transaction` only in the nested cause), so matching `err.message`
+  alone never triggered the guard.
+- LIVE-PROVEN on preprod (`npm run dust-wedge:e2e`): a dust-spending send
+  whose ttl expires during proving dies pre-mempool (1010), the runner
+  ASSERTS the guard lane ran INCLUDING the acked re-persist
+  (`dustRestoreCount` 0 -> 1; a green balance alone would also be produced
+  by the SDK's fast-path revert, the exact path that failed in the
+  incident), the dust note survives, and a follow-up send succeeds
+  (tx `00c61e25217f71e8…`).
+- `getWalletBalance` gains `dustUtxoCount`, `dustPendingCount`,
+  `dustPendingValue` and `dustRestoreCount` (times the wedge protection
+  restored this wallet's dust state, process-lifetime): a wedged wallet
+  (registered NIGHT, zero dust UTXOs, zero pending) is now distinguishable
+  from a genuinely empty one. Manual heal for pre-0.15.2 wedges documented
+  in the operations guide.
+
+### `@odatano/nightgate/set-root` export
+
+The canonical membership-set rule (digest, dedupe, sort, pad-with-last,
+depth-6 fold) is now importable session-free: `buildMembershipSet`,
+`membershipPathFor`, `canonicalSetDigests`, `SET_DEPTH`, `MAX_SET_VALUES`.
+Dependency-clean (no CAP, no Node builtins; blake2b moved to a shared
+`hashing` module, hex via `@noble/hashes`), so it loads in Node CJS/ESM and
+browser bundlers alike; pure circuits stay a parameter. Consumers that
+re-implemented the rule locally (read-side verifiers, golden-vector tests)
+can now import it instead.
+
 ## 0.15.1 - 2026-08-11
 
 Internal job-runner cleanup, no API or schema change. `startJob` now defers
