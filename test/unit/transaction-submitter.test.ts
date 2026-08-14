@@ -218,7 +218,9 @@ describe('TransactionSubmitter.deploy', () => {
 
         const row = db.tables['midnight.PendingSubmissions'][0];
         expect(row.status).toBe('failed');
-        expect(row.errorCode).toBe('1014');
+        // "invalid transaction" is a Substrate 1010 VALIDITY reject; the
+        // literal 1014 in the message loses against that (see classify).
+        expect(row.errorCode).toBe('1010');
         expect(row.errorMessage).toMatch(/Invalid transaction/);
         // Even on failure the proxy is released.
         expect(unregisterPrivateStateProvider).toHaveBeenCalledTimes(1);
@@ -474,14 +476,69 @@ describe('TransactionSubmitter private-state backend guard', () => {
 });
 
 describe('classifySubmissionError', () => {
-    test('1014 is permanent', () => {
+    test('"invalid transaction" is a 1010 validity reject (permanent), even when 1014 appears in the text', () => {
         const c = classifySubmissionError(new Error('Substrate error 1014: invalid transaction'), 'preprod');
+        expect(c).toMatchObject({ code: '1010', retryable: false });
+    });
+
+    test('1010 with a ledger custom error carries it in the code (rebind repro shape)', () => {
+        const c = classifySubmissionError(
+            new Error('1010: Invalid Transaction: Custom error: 188'), 'preprod');
+        expect(c).toMatchObject({ code: '1010/188', retryable: false });
+        expect(c.message).toMatch(/ledger error 188/);
+    });
+
+    test('the custom error is found in the nested cause (SDK wrapper shape)', () => {
+        const wrapped: any = new Error('Transaction submission error');
+        wrapped.cause = new Error('1010: Invalid Transaction: Custom error: 170');
+        const c = classifySubmissionError(wrapped, 'preprod');
+        expect(c).toMatchObject({ code: '1010/170', retryable: false });
+    });
+
+    test('a stack frame like proof-provider.js:1010:27 is not read as a Substrate code', () => {
+        const err = new Error('totally harmless failure');
+        err.stack = 'Error: totally harmless failure\n    at prove (C:/app/proof-provider.js:1010:27)\n    at run (C:/app/worker.js:1014:5)';
+        const c = classifySubmissionError(err, 'preprod');
+        expect(c.code).not.toBe('1010');
+        expect(c.code).not.toBe('1014');
+    });
+
+    test('a SubmissionError keeps its original classification on re-classification (background-job path)', () => {
+        const wrapped: any = new Error('Transaction submission error');
+        wrapped.cause = new Error('1010: Invalid Transaction: Custom error: 188');
+        const first = classifySubmissionError(wrapped, 'preprod');
+        expect(first.code).toBe('1010/188');
+        // The submitter wraps the classification in a SubmissionError; the
+        // background job classifies THAT. The wrapper text only says "ledger
+        // error 188", so re-deriving would degrade the code to plain 1010.
+        const rethrown = new SubmissionError('sub-1', first, wrapped);
+        expect(classifySubmissionError(rethrown, 'preprod')).toEqual(first);
+    });
+
+    test('a throwing [util.inspect.custom] never breaks classification', () => {
+        const err: any = new Error('1010: Invalid Transaction: Custom error: 188');
+        err[Symbol.for('nodejs.util.inspect.custom')] = () => { throw new Error('inspector boom'); };
+        const c = classifySubmissionError(err, 'preprod');
+        expect(c).toMatchObject({ code: '1010/188', retryable: false });
+    });
+
+    test('a genuine 1014 priority reject keeps its own code (priority values must not be misread as 1010)', () => {
+        const c = classifySubmissionError(new Error('1014: Priority is too low: (1010 vs 1010)'), 'preprod');
         expect(c).toMatchObject({ code: '1014', retryable: false });
     });
 
     test('1016 on preprod is retryable', () => {
         const c = classifySubmissionError(new Error('1016 Immediately Dropped'), 'preprod');
         expect(c).toMatchObject({ code: '1016', retryable: true });
+    });
+
+    test('1016 buried in a nested cause is still classified (SDK wrapper shape)', () => {
+        const wrapped: any = new Error('Transaction submission error');
+        wrapped.cause = new Error('1016: Immediately Dropped');
+        expect(classifySubmissionError(wrapped, 'preprod')).toMatchObject({ code: '1016', retryable: true });
+        const onMainnet = classifySubmissionError(wrapped, 'mainnet');
+        expect(onMainnet).toMatchObject({ code: '1016', retryable: false });
+        expect(onMainnet.knownIssueRef).toMatch(/forum\.midnight\.network/);
     });
 
     test('1016 on mainnet is fail-fast with known-issue ref (forum 1190)', () => {

@@ -204,6 +204,22 @@ nothing reaches the chain), never silently proving in randomized order.
 Duplicate circuit names do not fail the ordering, but their relative order
 among themselves is not guaranteed (indistinguishable by `entryPoint`).
 
+One environment switch exists for diagnosis
+(`NIGHTGATE_BATCH_SEGMENT_MODE`): `rewrite` is the default described above;
+`observe` applies no ordering and only logs the randomized ids, so dependent
+batches then apply in dice order. Leave it unset in production.
+
+**Ledger sequencing rule (populated state):** the ledger's sequencing check
+rejects a batch in which a call that UPDATES an existing ledger cell is
+followed by a later call, once the contract state is non-trivially populated
+(`1010: Invalid Transaction: Custom error: 188`, SequencingCheckFailure).
+This is independent of NIGHTGATE's ordering mechanics (reproduced with
+untouched random ids). Order cell-updating calls LAST in the batch,
+dependency-permitting: e.g. a same-owner re-bind must be batched as
+`attest -> anchorContentRoot -> bindPassport`, not
+`attest -> bindPassport -> anchorContentRoot`. Insert-only batches (first
+bind, proofs, registrations) are unaffected.
+
 **Failure semantics** distinguish two phases. An error BEFORE submission (bad
 circuit name, a throwing call, proving/balancing) discards the scope; nothing
 is submitted. AFTER submission the ledger's fallible phase still applies: the

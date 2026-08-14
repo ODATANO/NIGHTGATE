@@ -8,7 +8,10 @@
  * assembly and delegates the scope mechanics here.
  */
 
-import { withOrderedBatchSegments } from './batch-segment-order';
+import {
+    withObservedBatchSegments,
+    withOrderedBatchSegments
+} from './batch-segment-order';
 
 export interface BatchCall {
     circuit: string;
@@ -64,13 +67,29 @@ export async function runBatchInScope(
     }
 
     const circuits = calls.map(c => c.circuit);
-    // Deterministic apply order: wrap the proof provider so segment ids are
-    // rewritten into call order before proving (see batch-segment-order.ts).
+    // Deterministic apply order (the ledger applies merged intents in
+    // ascending segment id order): the wrapped proof provider permutes the
+    // batch's existing segment ids into call order before proving
+    // (batch-segment-order.ts). Live-proven since 0.10.0 and EXONERATED as
+    // a 1010/188 cause (observe-mode runs reject identically with untouched
+    // ids). NIGHTGATE_BATCH_SEGMENT_MODE=observe skips the ordering and
+    // only logs the randomized ids (diagnosis; dependent batches then apply
+    // in dice order). Whatever the mode, the ledger's sequencing check
+    // rejects an update of an existing cell FOLLOWED by a later intent on
+    // populated state (1010/188): order cell-updating calls LAST in the
+    // batch (see docs/feature-requests/rebind-batch-invalid-on-populated-state.md).
     // Skipped when the bundle has no proveTx-capable proof provider (tests).
     const providersAny = providers as any;
+    const rawMode = process.env.NIGHTGATE_BATCH_SEGMENT_MODE || 'rewrite';
+    const mode = rawMode === 'observe' || rawMode === 'rewrite' ? rawMode : 'rewrite';
+    if (mode !== rawMode) {
+        console.warn(`[nightgate:batch-segments] unknown NIGHTGATE_BATCH_SEGMENT_MODE '${rawMode}', falling back to 'rewrite'`);
+    }
+    const wrapSegments = mode === 'observe' ? withObservedBatchSegments : withOrderedBatchSegments;
     const scopedProviders = typeof providersAny?.proofProvider?.proveTx === 'function'
-        ? { ...providersAny, proofProvider: withOrderedBatchSegments(providersAny.proofProvider, circuits) }
+        ? { ...providersAny, proofProvider: wrapSegments(providersAny.proofProvider, circuits) }
         : providers;
+
     const finalized = await contracts.withContractScopedTransaction(
         scopedProviders,
         async (txCtx: unknown) => {

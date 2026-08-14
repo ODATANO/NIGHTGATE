@@ -5,7 +5,10 @@
  * the proof-provider wrapper semantics.
  */
 
-import { orderBatchSegments, withOrderedBatchSegments } from '../../srv/midnight/batch-segment-order';
+import {
+    orderBatchSegments,
+    withOrderedBatchSegments
+} from '../../srv/midnight/batch-segment-order';
 
 function intentFor(circuit: string | Uint8Array) {
     return { actions: [{ entryPoint: circuit }] };

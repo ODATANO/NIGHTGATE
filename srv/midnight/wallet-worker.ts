@@ -28,8 +28,7 @@
 import { parentPort, MessageChannel, type MessagePort } from 'node:worker_threads';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { inspect } from 'node:util';
-import { formatErr } from '../utils/format-error';
+import { classificationHaystack, formatErr, safeDeepInspect } from '../utils/format-error';
 import { deriveIndexerWsUrl } from '../utils/indexer-url';
 import { runBatchInScope } from './batch-call-scope';
 import { buildWasmProofProvider, getSharedKeyMaterialProvider } from './wasm-proof-provider';
@@ -794,8 +793,11 @@ export async function feeOfDiscardedRecipe(facade: any, recipe: any, site: strin
  * deep inspection of the whole error structure, not just `message`.
  */
 export function isPreMempoolReject(err: unknown): boolean {
-    const haystack = inspect(err, { depth: 8, maxStringLength: 2048, breakLength: Infinity });
-    return /\b101[046]\b|priority is too low|immediately dropped|invalid transaction/i.test(haystack);
+    // classificationHaystack strips stack frames and :line:col tokens, so a
+    // source position like `wallet.js:1010:27` cannot register as a reject
+    // code; the numeric match additionally requires the node's `NNNN:` shape.
+    const haystack = classificationHaystack(err);
+    return /\b101[046]\s*:|priority is too low|immediately dropped|invalid transaction/i.test(haystack);
 }
 
 /**
@@ -876,7 +878,7 @@ async function submitWithDustGuard(entry: FacadeEntry, tx: any, site: string): P
             // Deliberate: a tx that may have reached the pool keeps its
             // booked spends. Log the inspected head so a mis-classified
             // reject is diagnosable from the field.
-            log('info', `${site}: submit failed, NOT classified pre-mempool (dust guard disarmed): ${inspect(e, { depth: 8, maxStringLength: 512, breakLength: Infinity }).slice(0, 600)}`);
+            log('info', `${site}: submit failed, NOT classified pre-mempool (dust guard disarmed): ${safeDeepInspect(e, 512).slice(0, 600)}`);
             entry.preSubmitDustSnapshot = undefined;
         }
         throw e;

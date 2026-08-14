@@ -21,6 +21,7 @@
  */
 
 import cds from '@sap/cds';
+import { classificationHaystack } from '../utils/format-error';
 import { reportExternalExecution, reportExternalSubmission } from './job-execution-context';
 const { INSERT, UPDATE } = cds.ql;
 import { PendingSubmissions } from '#cds-models/midnight';
@@ -536,6 +537,18 @@ const KNOWN_ISSUE_1016_MAINNET =
  * PendingSubmissions.errorCode/errorMessage.
  */
 export function classifySubmissionError(err: unknown, network: NightgateNetwork): SubmissionErrorClassification {
+    // An already-classified error (SubmissionError, or anything carrying a
+    // well-formed classification) keeps its classification VERBATIM.
+    // Re-deriving from the wrapper text loses detail: the wrapper message
+    // says "ledger error 188" while the extraction pattern needs the node's
+    // "Custom error: 188", so a background-job re-classification would
+    // degrade `1010/188` to `1010`.
+    const prior = (err as SubmissionError | undefined)?.classification;
+    if (prior && typeof prior.code === 'string' && typeof prior.retryable === 'boolean'
+        && typeof prior.message === 'string') {
+        return prior;
+    }
+
     const message = err instanceof Error ? err.message : String(err);
     const name = err instanceof Error ? err.name : 'Error';
 
@@ -544,11 +557,39 @@ export function classifySubmissionError(err: unknown, network: NightgateNetwork)
         return { code: 'TxFailed', retryable: false, message };
     }
 
-    // Substrate pool errors
-    if (/\b1014\b|invalid transaction/i.test(message)) {
-        return { code: '1014', retryable: false, message: `Invalid transaction (Substrate 1014): ${message}` };
+    // Substrate node rejects. The SDK buries the node's line under generic
+    // wrappers (FiberFailure/SubmissionError), so match against a bounded
+    // deep inspection, not just the message (same trick as the worker's
+    // isPreMempoolReject).
+    //
+    // 1010 "Invalid Transaction" is the node's VALIDITY reject (never
+    // entered the pool); its inner `Custom error: N` indexes the ledger's
+    // LedgerApiError enum (117 NotNormalized, 138 Overspend, 170 dust spend
+    // proof, 182 ttl, 188 sequencing check, 192 signature count, ...) and is
+    // surfaced in the code as `1010/N`. This was conflated with 1014
+    // ("priority too low", a POOL reject) until the rebind-batch diagnosis.
+    // classificationHaystack strips stack frames and :line:col tokens, so a
+    // source position like `wallet.js:1010:27` cannot register as a reject
+    // code; bare numeric matches additionally require the node's `NNNN:`
+    // shape or the semantic phrase.
+    const haystack = `${message} ${classificationHaystack(err)}`;
+    // "Priority is too low" first: its "(X vs Y)" priority values are
+    // arbitrary numbers and must not be misread as a 1010 code.
+    if (/priority is too low/i.test(haystack)) {
+        return { code: '1014', retryable: false, message: `Pool priority reject (Substrate 1014, priority too low): ${message}` };
     }
-    if (/\b1016\b|Immediately\s*Dropped/i.test(message)) {
+    if (/\b1010\s*:|invalid transaction/i.test(haystack)) {
+        const custom = /custom error:?\s*(\d+)/i.exec(haystack);
+        return {
+            code: custom ? `1010/${custom[1]}` : '1010',
+            retryable: false,
+            message: `Invalid transaction (Substrate 1010${custom ? `, ledger error ${custom[1]}` : ''}): ${message}`
+        };
+    }
+    if (/\b1014\s*:/.test(haystack)) {
+        return { code: '1014', retryable: false, message: `Pool reject (Substrate 1014): ${message}` };
+    }
+    if (/\b1016\s*:|Immediately\s*Dropped/i.test(haystack)) {
         if (network === 'mainnet') {
             return {
                 code: '1016',

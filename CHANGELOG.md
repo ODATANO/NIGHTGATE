@@ -1,5 +1,34 @@
 # Changelog
 
+## 0.15.3 - 2026-08-14
+
+- `classifySubmissionError` no longer conflates Substrate 1010 ("Invalid
+  Transaction", a node VALIDITY reject) with 1014 ("priority too low", a
+  POOL reject): invalid transactions now classify as `1010`, with the
+  ledger's inner `Custom error: N` surfaced as `1010/N` (e.g. `1010/188`
+  SequencingCheckFailure, `1010/170` InvalidDustSpendProof). The error is
+  deep-inspected, so codes buried in SDK wrappers are found. BEHAVIORAL:
+  consumers matching on errorCode `'1014'` for invalid transactions must
+  also accept `1010`/`1010/N` (retryability is unchanged: false for both).
+- New diagnosis lane `scripts/run-rebind-repro-e2e.mjs` (rebind-in-batch
+  reject on populated vault state; captures the node's RPC-CORE line).
+  Live diagnosis result: the ledger's sequencing check (1010/188) rejects a
+  batch whose update of an existing cell is FOLLOWED by a later intent on
+  populated contract state, independent of NIGHTGATE's segment-id handling
+  (reproduced with untouched randomized ids). Consumers should order
+  cell-updating calls LAST in a batch; insert-only batches are unaffected.
+- Batch segment ordering keeps the proven id rewrite (the diagnosis
+  exonerated it as a 1010/188 cause) and gains a diagnostic
+  `NIGHTGATE_BATCH_SEGMENT_MODE=observe` that proves as-is with the
+  randomized ids only logged; unknown mode values warn and fall back to the
+  rewrite. Rebind-in-batch with the update ordered last is live-proven on
+  the populated production vault (tx `c2fcb0d8765507a9…`).
+- Reject classification (`classifySubmissionError` and the worker's
+  pre-mempool detection) can no longer throw while inspecting an error: a
+  throwing `[util.inspect.custom]` on an SDK error now degrades to a safe
+  fallback instead of skipping job-failure handling or disarming the dust
+  guard.
+
 ## 0.15.2 - 2026-08-13
 
 Dust wedge protection plus a public set-root surface.

@@ -1035,6 +1035,16 @@ describe('isPreMempoolReject', () => {
         benign.cause = new Error('socket hang up');
         expect(workerExports.isPreMempoolReject(benign)).toBe(false);
     });
+
+    it('does not read a stack frame :1010:27 as a reject (a post-broadcast error must not restore dust)', () => {
+        const err = new Error('proving pipeline crashed');
+        err.stack = 'Error: proving pipeline crashed\n    at prove (C:/app/proof-provider.js:1010:27)\n    at submit (C:/app/wallet.js:1016:3)';
+        expect(workerExports.isPreMempoolReject(err)).toBe(false);
+
+        const nested: any = new Error('outer wrapper');
+        nested.cause = err; // nested stacks render as escaped one-line strings
+        expect(workerExports.isPreMempoolReject(nested)).toBe(false);
+    });
 });
 
 // ---- buildSponsoredWalletProvider: two-phase fee sponsoring ----------------

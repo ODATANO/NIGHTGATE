@@ -182,4 +182,126 @@ describe('runBatchInScope', () => {
         expect(tx.intents.get(4)).toBe(attest);
         expect(tx.intents.get(9)).toBe(bind);
     });
+
+    // ---- segment mode selection (NIGHTGATE_BATCH_SEGMENT_MODE) -------------
+
+    /**
+     * Contracts fake that behaves like submitTxCore: the scope run builds a
+     * tx with the given layout and pushes it through the wrapped proof
+     * provider, so the selected segment mode sees a realistic tx.
+     */
+    function makeLayoutFakes(layout: Array<[number, string]>) {
+        const contracts = {
+            withContractScopedTransaction: vi.fn(async (p: any, fn: (ctx: unknown) => Promise<void>) => {
+                await fn({});
+                const tx: any = { intents: new Map(layout.map(([id, ep]) => [id, { actions: [{ entryPoint: ep }] }])) };
+                await p.proofProvider.proveTx(tx);
+                return { public: { txHash: '0xlayout', status: 'SucceedEntirely' } };
+            })
+        };
+        const found = { callTx: { attest: vi.fn(async () => { }), bindPassport: vi.fn(async () => { }) } };
+        const providers = { proofProvider: { proveTx: vi.fn(async () => 'proven') } };
+        return { contracts, found, providers };
+    }
+
+    test('an unrecognized segment mode falls back to the default rewrite (one build, ids permuted)', async () => {
+        process.env.NIGHTGATE_BATCH_SEGMENT_MODE = 'rewrit'; // typo
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => { });
+        try {
+            const { contracts, found, providers } = makeLayoutFakes(
+                [[9, 'attest'], [4, 'bindPassport']] // inverted -> rewrite permutes
+            );
+            const out = await runBatchInScope(contracts, providers, found, [
+                { circuit: 'attest', args: [] },
+                { circuit: 'bindPassport', args: [] }
+            ], ADDR);
+            expect(out.txHash).toBe('0xlayout');
+            expect(contracts.withContractScopedTransaction).toHaveBeenCalledTimes(1);
+            expect(providers.proofProvider.proveTx).toHaveBeenCalledTimes(1);
+            expect(warn).toHaveBeenCalledWith(expect.stringContaining("unknown NIGHTGATE_BATCH_SEGMENT_MODE 'rewrit'"));
+        } finally {
+            delete process.env.NIGHTGATE_BATCH_SEGMENT_MODE;
+            warn.mockRestore();
+        }
+    });
+
+    test('observe mode proves as-is, ids untouched (diagnosis)', async () => {
+        process.env.NIGHTGATE_BATCH_SEGMENT_MODE = 'observe';
+        try {
+            let provenTx: any;
+            const contracts = {
+                withContractScopedTransaction: vi.fn(async (p: any, fn: (ctx: unknown) => Promise<void>) => {
+                    await fn({});
+                    const tx: any = { intents: new Map([[9, { actions: [{ entryPoint: 'attest' }] }], [4, { actions: [{ entryPoint: 'bindPassport' }] }]]) };
+                    await p.proofProvider.proveTx(tx);
+                    provenTx = tx;
+                    return { public: { txHash: '0xobserve', status: 'SucceedEntirely' } };
+                })
+            };
+            const found = { callTx: { attest: vi.fn(async () => { }), bindPassport: vi.fn(async () => { }) } };
+            const providers = { proofProvider: { proveTx: vi.fn(async () => 'proven') } };
+
+            const out = await runBatchInScope(contracts, providers, found, [
+                { circuit: 'attest', args: [] },
+                { circuit: 'bindPassport', args: [] }
+            ], ADDR);
+            expect(out.txHash).toBe('0xobserve');
+            // Inverted layout survives untouched: observe never reorders.
+            expect(provenTx.intents.get(9).actions[0].entryPoint).toBe('attest');
+            expect(provenTx.intents.get(4).actions[0].entryPoint).toBe('bindPassport');
+        } finally {
+            delete process.env.NIGHTGATE_BATCH_SEGMENT_MODE;
+        }
+    });
+
+    test('default rewrite orders an 8-call batch in one build', async () => {
+        const circuits = ['c1', 'c2', 'c3', 'c4', 'c5', 'c6', 'c7', 'c8'];
+        // Worst-case layout: ids fully inverted relative to call order.
+        const layout: Array<[number, string]> = circuits.map((ep, i) => [80 - i * 10, ep]);
+        let provenTx: any;
+        const contracts = {
+            withContractScopedTransaction: vi.fn(async (p: any, fn: (ctx: unknown) => Promise<void>) => {
+                await fn({});
+                const tx: any = { intents: new Map(layout.map(([id, ep]) => [id, { actions: [{ entryPoint: ep }] }])) };
+                await p.proofProvider.proveTx(tx);
+                provenTx = tx;
+                return { public: { txHash: '0x8call', status: 'SucceedEntirely' } };
+            })
+        };
+        const found = { callTx: Object.fromEntries(circuits.map(c => [c, vi.fn(async () => { })])) };
+        const providers = { proofProvider: { proveTx: vi.fn(async () => 'proven') } };
+
+        const out = await runBatchInScope(contracts, providers, found, circuits.map(c => ({ circuit: c, args: [] })), ADDR);
+
+        expect(out.txHash).toBe('0x8call');
+        expect(contracts.withContractScopedTransaction).toHaveBeenCalledTimes(1);
+        // Ids permuted so ascending order equals call order.
+        const idsAsc = [...provenTx.intents.keys()].sort((a: number, b: number) => a - b);
+        expect(idsAsc.map((id: number) => provenTx.intents.get(id).actions[0].entryPoint)).toEqual(circuits);
+    });
+
+    test('rewrite is the default without any env (ids permuted into call order)', async () => {
+        const attest = { actions: [{ entryPoint: 'attest' }] };
+        const bind = { actions: [{ entryPoint: 'bindPassport' }] };
+        const tx: any = { intents: new Map<number, any>([[4, bind], [9, attest]]) }; // inverted
+        let scopeProviders: any;
+        const contracts = {
+            withContractScopedTransaction: vi.fn(async (p: any, fn: (ctx: unknown) => Promise<void>) => {
+                scopeProviders = p;
+                await fn({});
+                return { public: { txHash: '0x1', status: 'SucceedEntirely' } };
+            })
+        };
+        const found = { callTx: { attest: vi.fn(async () => { }), bindPassport: vi.fn(async () => { }) } };
+        const providers = { proofProvider: { proveTx: vi.fn(async () => 'proven') } };
+
+        await runBatchInScope(contracts, providers, found, [
+            { circuit: 'attest', args: [] },
+            { circuit: 'bindPassport', args: [] }
+        ], ADDR);
+        await expect(scopeProviders.proofProvider.proveTx(tx)).resolves.toBe('proven');
+        // Rewrite semantics: ids permuted so attest gets the smaller id.
+        expect(tx.intents.get(4)).toBe(attest);
+        expect(tx.intents.get(9)).toBe(bind);
+    });
 });

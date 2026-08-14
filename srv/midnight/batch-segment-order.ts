@@ -25,6 +25,19 @@ function entryPointName(ep: unknown): string {
     return String(ep ?? '');
 }
 
+/** `circuit=segId` per intent, in map order; diagnostic logging only. */
+export function describeBatchSegments(tx: any): string {
+    try {
+        const intents: Map<number, any> | undefined = tx?.intents;
+        if (!intents || typeof intents.entries !== 'function') return 'no intents';
+        return Array.from(intents.entries())
+            .map(([segId, intent]) => `${entryPointName(intent?.actions?.[0]?.entryPoint) || '?'}=${segId}`)
+            .join(' ');
+    } catch (e) {
+        return `dump failed: ${(e as Error)?.message ?? e}`;
+    }
+}
+
 /**
  * Rewrite `tx.intents` so the intents matching `circuitsInOrder` (via their
  * first action's `entryPoint`) carry ascending segment ids in call order.
@@ -95,6 +108,7 @@ export function withOrderedBatchSegments(
     const wrapped = Object.create(proofProvider);
     wrapped.proveTx = async (tx: any, ...rest: unknown[]) => {
         if (circuitsInOrder.length >= 2) {
+            const before = describeBatchSegments(tx);
             let ordered = false;
             try {
                 ordered = orderBatchSegments(tx, circuitsInOrder);
@@ -110,7 +124,31 @@ export function withOrderedBatchSegments(
                     'aborting before proving (nothing submitted) because the deterministic apply order cannot be guaranteed'
                 );
             }
+            // Worker-thread console lands in the server log; one line per
+            // multi-call batch, and the id mapping is the load-bearing
+            // datum in any sequencing-reject diagnosis (ledger 1010/188).
+            console.log(`[nightgate:batch-segments] rewrite: ${before} -> ${describeBatchSegments(tx)}`);
         }
+        return proofProvider.proveTx(tx, ...rest);
+    };
+    return wrapped;
+}
+
+/**
+ * DIAGNOSTIC (NIGHTGATE_BATCH_SEGMENT_MODE=observe): do NOT rewrite; log the
+ * randomized segment ids and prove as-is. Apply order is then whatever the
+ * dice say, so dependent batches may fail ON-CHAIN with partial effects; use
+ * only to decide whether a pre-mempool sequencing reject (1010/188) also
+ * occurs when the rewrite touched nothing. See
+ * docs/feature-requests/rebind-batch-invalid-on-populated-state.md.
+ */
+export function withObservedBatchSegments(
+    proofProvider: any,
+    circuitsInOrder: string[]
+): any {
+    const wrapped = Object.create(proofProvider);
+    wrapped.proveTx = async (tx: any, ...rest: unknown[]) => {
+        console.log(`[nightgate:batch-segments] OBSERVE (no rewrite) for [${circuitsInOrder.join('+')}]: ${describeBatchSegments(tx)}`);
         return proofProvider.proveTx(tx, ...rest);
     };
     return wrapped;
