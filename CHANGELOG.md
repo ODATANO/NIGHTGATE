@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.16.2 - 2026-08-16
+
+Release-tooling fix; no runtime, circuit or packaged-code change (the
+compiled vault artifacts and every verifier key remain byte-identical to
+0.16.0, so a vault deployed with 0.16.0 stays valid).
+
+- The tag workflow's gate job ran `check:release` on a fresh checkout,
+  where `cds-typer` has not generated `@cds-models` yet, so `typecheck`
+  failed on every service import and no release or image was produced.
+  `check:release` now builds first, which makes the chain self-sufficient
+  for all three callers (CI, the tag workflow, `prepublishOnly`).
+- New `npm run check:fresh-tree`: runs the release gates in a throwaway
+  clone with no generated artifacts and a fresh `npm ci`, which is what
+  CI actually sees. A locally grown working tree hides missing build
+  outputs and optional native modules; this reproduces them.
+
 ## 0.16.1 - 2026-08-16
 
 Packaging and tooling fixes; no runtime or circuit change (the compiled

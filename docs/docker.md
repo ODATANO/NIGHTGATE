@@ -28,12 +28,12 @@ docker compose -f docker/docker-compose.yml up -d nightgate
 Or without compose:
 
 ```bash
-docker build -t odatano/nightgate:0.16.1 .
+docker build -t odatano/nightgate:0.16.2 .
 docker run -d --name nightgate -p 4004:4004 \
   -e ENCRYPTION_KEY=$(openssl rand -hex 32) \
   -e NIGHTGATE_HTTP_PASSWORD=change-me \
   -v nightgate-data:/data \
-  odatano/nightgate:0.16.1
+  odatano/nightgate:0.16.2
 ```
 
 The server listens on `http://localhost:4004`; the OData services sit under
