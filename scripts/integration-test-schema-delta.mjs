@@ -18,10 +18,10 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { createRequire } from 'node:module';
+// Built-in driver (Node >= 22.5), same choice as the migration itself, so
+// this lane needs no native module on CI or anywhere else.
+import { DatabaseSync } from 'node:sqlite';
 
-const require = createRequire(import.meta.url);
-const Database = require('better-sqlite3');
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(__dirname, '..');
 
@@ -38,7 +38,7 @@ function ok(name, value, detail) {
 const dir = mkdtempSync(path.join(tmpdir(), 'nightgate-delta-'));
 const dbPath = path.join(dir, 'legacy.db');
 
-const db = new Database(dbPath);
+const db = new DatabaseSync(dbPath);
 db.exec(`
 CREATE TABLE midnight_PredicateAttestations (
     ID TEXT NOT NULL PRIMARY KEY,
@@ -64,7 +64,7 @@ execFileSync(process.execPath, [path.join(repoRoot, 'scripts/apply-schema-delta.
     cwd: repoRoot, stdio: 'inherit'
 });
 
-const after = new Database(dbPath, { readonly: true });
+const after = new DatabaseSync(dbPath, { readOnly: true });
 const cols = new Map(after.prepare('PRAGMA table_info("midnight_PredicateAttestations")').all().map(r => [r.name, r]));
 ok('delta: 0.16.0 columns added',
     cols.has('payloadHashB') && cols.has('allowedMask') && cols.has('network') && cols.has('compiledArtifactRef'),

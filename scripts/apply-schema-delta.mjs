@@ -31,13 +31,24 @@ import { createRequire } from 'node:module';
 // AND from an installed node_modules/@odatano/nightgate via the bin alias).
 const packageRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
+// SQLite driver: prefer Node's BUILT-IN `node:sqlite` (>= 22.5), so neither
+// CI nor a consumer needs a native module. better-sqlite3 is only an OPTIONAL
+// peer of @cap-js/sqlite, i.e. not guaranteed to be installed; it stays as a
+// fallback for older runtimes. Both expose the prepare/all/get/exec surface
+// this script uses; only transactions differ (handled explicitly below).
 const require = createRequire(import.meta.url);
-let Database;
+let openDatabase;
 try {
-    Database = require('better-sqlite3');
+    const { DatabaseSync } = await import('node:sqlite');
+    openDatabase = (p) => new DatabaseSync(p);
 } catch {
-    console.error('[delta] ! better-sqlite3 is not resolvable. It ships with @cap-js/sqlite; install it next to this package: npm i better-sqlite3');
-    process.exit(1);
+    try {
+        const BetterSqlite3 = require('better-sqlite3');
+        openDatabase = (p) => new BetterSqlite3(p);
+    } catch {
+        console.error('[delta] ! no SQLite driver: this needs Node >= 22.5 (built-in node:sqlite) or an installed better-sqlite3.');
+        process.exit(1);
+    }
 }
 
 const DB_PATH = path.resolve(process.argv[2] || process.env.NIGHTGATE_DB_PATH || path.join(packageRoot, 'db/midnight.db'));
@@ -57,7 +68,7 @@ const statements = ddl
     .map(s => s.trim())
     .filter(Boolean);
 
-const db = new Database(DB_PATH);
+const db = openDatabase(DB_PATH);
 const existingTables = new Set(
     db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all().map(r => r.name)
 );
@@ -135,7 +146,7 @@ function rebuildTable(name, createStmt) {
 
 let restoredViews = 0;
 
-const tx = db.transaction(() => {
+const migrate = () => {
     // Drop ALL views up front: they are stateless and may reference tables
     // that get rebuilt below (DROP TABLE fails on dependent views otherwise).
     // Views managed by the DDL are recreated in this same transaction; any
@@ -213,8 +224,19 @@ const tx = db.transaction(() => {
             throw err;
         }
     }
-});
-tx();
+};
+
+// Explicit transaction (node:sqlite has no db.transaction() wrapper): the
+// whole migration commits or the database stays exactly as it was.
+db.exec('BEGIN');
+try {
+    migrate();
+    db.exec('COMMIT');
+} catch (err) {
+    try { db.exec('ROLLBACK'); } catch { /* the failing statement may already have aborted it */ }
+    db.close();
+    throw err;
+}
 db.close();
 
 console.log(`[delta] done: +${createdTables} tables, +${addedColumns} columns, ${rebuiltTables} rebuilt, ${refreshedViews} views refreshed, ${restoredViews} unmanaged views restored, ${skipped} existing tables reconciled.`);
