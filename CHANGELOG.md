@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.16.1 - 2026-08-16
+
+Packaging and tooling fixes; no runtime or circuit change (the compiled
+vault artifacts and every verifier key are byte-identical to 0.16.0, so a
+vault deployed with 0.16.0 stays valid).
+
+- The schema migration and its integration lane ran on `better-sqlite3`,
+  an OPTIONAL peer of `@cap-js/sqlite` that a clean install does not
+  guarantee (CI on Node 24 had none). Both now use Node's built-in
+  `node:sqlite`, so `npx nightgate-schema-delta` needs no native module;
+  `better-sqlite3` remains a fallback for older runtimes. The migration
+  keeps its all-or-nothing transaction, now via explicit BEGIN/COMMIT.
+- `npm run clean` deleted EVERY `.d.ts` under `src/` and `srv/`,
+  including the hand-written browser declarations that have no `.ts`
+  source. A build from a freshly cleaned tree therefore lost
+  `src/browser/index.d.ts` and shipped an untyped browser entry. Clean now
+  only removes files whose `.ts` source sits next to them.
+- `check:exports` additionally fails when a packed file is neither tracked
+  by git nor build output, which is exactly the gap that let the missing
+  declaration pass unnoticed locally.
+
 ## 0.16.0 - 2026-08-16
 
 Cross-root document diff proofs: the first BINARY vault circuits, relating
