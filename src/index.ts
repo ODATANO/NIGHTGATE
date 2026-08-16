@@ -14,6 +14,8 @@ import {
     DEFAULT_NETWORK
 } from '../srv/utils/nightgate-config';
 import { loadRegistryFromConfig, listRegisteredContracts } from '../srv/submission/contract-registry';
+import { redactUrlCredentials } from '../srv/utils/redact-url';
+import { ensureSyncStateSingleton } from '../srv/utils/sync-state';
 import { closeSessionsFromPreviousProcess } from '../srv/sessions/wallet-sessions';
 const log = cds.log('nightgate');
 import { startWalletWorker, stopWalletWorker } from '../srv/midnight/wallet-worker-client';
@@ -78,9 +80,12 @@ export class SchemaNotDeployedError extends Error {
         const causeMsg = cause instanceof Error ? cause.message : String(cause);
         super(
             `Nightgate schema is not deployed (or out of date): ` +
-            `missing table for '${missingTable}' in ${dbPath}. ` +
+            `missing table or column for '${missingTable}' in ${dbPath}. ` +
             `Underlying error: ${causeMsg}. ` +
-            `Fix: run \`npm run deploy\` from the project root.`
+            `Fix: fresh install \`npm run deploy\`; EXISTING database ` +
+            `\`node scripts/apply-schema-delta.mjs\` (installed package: ` +
+            `\`npx nightgate-schema-delta\`; additive, keeps data; pass the db ` +
+            `path or set NIGHTGATE_DB_PATH).`
         );
         this.name = 'SchemaNotDeployedError';
     }
@@ -103,28 +108,38 @@ function resolveDbPath(): string {
  * it explicitly via `npm run deploy`.
  **/
 async function ensureSchemaDeployed(): Promise<void> {
-    const requiredTables = [
-        'midnight.Blocks',
-        'midnight.SyncState',
-        'midnight.PendingSubmissions',
-        'midnight.TransactionResults',
-        'midnight.PrivateStates',
-        'midnight.ContractSigningKeys',
-        'midnight.WalletSyncStates',
-        'midnight.Attestations',
-        'midnight.Documents',
-        'midnight.DisclosureRoles',
-        'midnight.BackgroundJobs'
+    // `columns` probes the release's NEWEST columns, not just table
+    // existence: a database from the previous release passes a bare table
+    // probe and then fails on the first new action at runtime. Extend this
+    // list whenever a release adds columns to an existing table.
+    const requiredTables: Array<{ table: string; columns?: string[] }> = [
+        { table: 'midnight.Blocks' },
+        { table: 'midnight.SyncState' },
+        { table: 'midnight.PendingSubmissions' },
+        { table: 'midnight.TransactionResults' },
+        { table: 'midnight.PrivateStates' },
+        { table: 'midnight.ContractSigningKeys' },
+        { table: 'midnight.WalletSyncStates' },
+        { table: 'midnight.Attestations' },
+        // 0.16.0: evidence binding + owner scoping
+        { table: 'midnight.Documents', columns: ['userId', 'contractAddress', 'network', 'compiledArtifactRef', 'artifactDigest'] },
+        // 0.16.0: cross-root claim columns + evidence provenance
+        { table: 'midnight.PredicateAttestations', columns: ['payloadHashB', 'allowedMask', 'network', 'compiledArtifactRef', 'artifactDigest'] },
+        { table: 'midnight.DisclosureRoles' },
+        { table: 'midnight.BackgroundJobs' }
     ];
 
     const db = cds.db || await cds.connect.to('db');
     const { SELECT } = cds.ql;
 
-    for (const table of requiredTables) {
+    for (const { table, columns } of requiredTables) {
         try {
-            await db.run(SELECT.one.from(table));
+            // Column list via the from() overload: SELECT.one's fluent proxy
+            // does not chain .columns().
+            await db.run(columns ? SELECT.one.from(table, columns) : SELECT.one.from(table));
         } catch (probeErr) {
-            throw new SchemaNotDeployedError(table, resolveDbPath(), probeErr);
+            const what = columns ? `${table} (needs columns: ${columns.join(', ')})` : table;
+            throw new SchemaNotDeployedError(what, resolveDbPath(), probeErr);
         }
     }
 
@@ -165,8 +180,22 @@ export async function initialize(): Promise<NightgateIndexerStatus> {
     const crawlerEnabled = (crawlerConfig as any).enabled !== false;
 
     if (invalidNetwork) {
-        log.warn(`Invalid network "${invalidNetwork}". Must be one of: ${VALID_NIGHTGATE_NETWORKS.join(', ')}`);
-        log.warn(`Falling back to "${DEFAULT_NETWORK}"`);
+        // FAIL, do not fall back: a submission service silently switching to
+        // "preprod" on a typo would build and submit transactions against a
+        // network the operator did not choose.
+        const message = `Invalid network "${invalidNetwork}". Must be one of: ${VALID_NIGHTGATE_NETWORKS.join(', ')}. ` +
+            `Refusing to start on the "${DEFAULT_NETWORK}" fallback; fix NIGHTGATE_NETWORK / cds.requires.nightgate.network.`;
+        initialized = false;
+        lastStatus = {
+            initialized: false,
+            crawlerEnabled,
+            network,
+            nodeUrl,
+            mode: 'offline',
+            lastError: message
+        };
+        logStartupState('offline', 'invalid network');
+        throw new Error(message);
     }
 
     let runtimeTopology;
@@ -217,6 +246,28 @@ export async function initialize(): Promise<NightgateIndexerStatus> {
             runtimeWarnings: runtimeTopology.warnings
         };
         logStartupState('offline', 'schema unavailable');
+        throw err;
+    }
+
+    // Network/database binding, fail-closed and CENTRAL (not only when the
+    // crawler starts): an existing SyncState row from another network refuses
+    // the boot, so a submission-only deployment cannot silently mix chains
+    // either. Also backfills credential-redacted node URLs in place.
+    try {
+        const db = await cds.connect.to('db');
+        await ensureSyncStateSingleton(db);
+    } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        initialized = false;
+        lastStatus = {
+            initialized: false,
+            crawlerEnabled,
+            network,
+            nodeUrl,
+            mode: 'offline',
+            lastError: message
+        };
+        logStartupState('offline', 'network/database binding rejected');
         throw err;
     }
 
@@ -312,7 +363,7 @@ export async function initialize(): Promise<NightgateIndexerStatus> {
     }
 
     log.info(`Network: ${network}`);
-    log.info(`Node: ${nodeUrl}`);
+    log.info(`Node: ${redactUrlCredentials(nodeUrl)}`);
 
     let mode: NightgateIndexerStatus['mode'] = crawlerEnabled ? 'active' : 'idle';
     let lastError: string | undefined;
@@ -403,5 +454,7 @@ export async function shutdown(): Promise<void> {
 
 /** Return the last known indexer status. */
 export function getStatus(): NightgateIndexerStatus {
-    return { ...lastStatus };
+    // Exposure boundary: status flows into OData responses, so endpoint URLs
+    // are stripped of embedded credentials here rather than at every setter.
+    return { ...lastStatus, nodeUrl: redactUrlCredentials(lastStatus.nodeUrl) || undefined };
 }

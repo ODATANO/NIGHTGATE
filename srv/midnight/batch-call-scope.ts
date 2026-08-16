@@ -36,7 +36,7 @@ export interface BatchScopeResult {
  * `found` (a findDeployedContract result). Calls are invoked in array order,
  * and the wrapped proof provider rewrites the merged intents' segment ids
  * into call order before proving (batch-segment-order.ts), so the ledger
- * also APPLIES them in call order — dependent calls may be batched. With
+ * also APPLIES them in call order - dependent calls may be batched. With
  * duplicate circuit names in one batch the relative order among same-named
  * calls is not guaranteed (intents are indistinguishable by entryPoint);
  * batch distinct circuits when that matters. Validates every circuit BEFORE

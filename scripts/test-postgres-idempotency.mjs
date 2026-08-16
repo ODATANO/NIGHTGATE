@@ -9,7 +9,7 @@
  * concurrent transactions:
  *
  *   1. Without a savepoint, the loser's aborted transaction rejects every
- *      subsequent statement (SQLSTATE 25P02) — i.e. the raw catch-and-recover
+ *      subsequent statement (SQLSTATE 25P02) - i.e. the raw catch-and-recover
  *      on the ambient tx cannot work on Postgres.
  *   2. With SAVEPOINT / ROLLBACK TO SAVEPOINT, the loser recovers: it reads the
  *      winner's committed row and its outer transaction stays usable and commits.

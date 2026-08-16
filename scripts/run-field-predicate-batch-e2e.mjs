@@ -89,13 +89,13 @@ async function pollJob(sessionId, jobId, label, { expect = 'succeed', timeoutMs 
         }
         if (status === 'failed') {
             process.stdout.write('\n');
-            if (expect === 'fail') { console.log(`     [${label}] failed as expected: ${errorCode} — ${errorMessage}`); return { failed: true, errorCode, errorMessage }; }
-            fail(`[${label}] job failed: ${errorCode} — ${errorMessage}`);
+            if (expect === 'fail') { console.log(`     [${label}] failed as expected: ${errorCode} - ${errorMessage}`); return { failed: true, errorCode, errorMessage }; }
+            fail(`[${label}] job failed: ${errorCode} - ${errorMessage}`);
         }
         if (status === 'reconciliation_required') {
             process.stdout.write('\n');
-            if (expect === 'fail') { console.log(`     [${label}] reconciliation_required (terminal) — accepted as non-success: ${errorCode} — ${errorMessage}`); return { failed: true, reconciliation: true, errorCode, errorMessage }; }
-            fail(`[${label}] job entered reconciliation_required: ${errorCode} — ${errorMessage}`);
+            if (expect === 'fail') { console.log(`     [${label}] reconciliation_required (terminal) - accepted as non-success: ${errorCode} - ${errorMessage}`); return { failed: true, reconciliation: true, errorCode, errorMessage }; }
+            fail(`[${label}] job entered reconciliation_required: ${errorCode} - ${errorMessage}`);
         }
         await new Promise(res => setTimeout(res, intervalMs));
     }
@@ -252,7 +252,7 @@ function buildContentRoot(pc, fields /* [{name, value: bigint}] */) {
         claimFor(0, 'lessOrEqual', 50000) // exact duplicate: must be dropped
     ];
 
-    step('6. issueFieldPredicateAttestationBatch — POSITIVE (anchor in-batch + 3 claims + 1 dup)');
+    step('6. issueFieldPredicateAttestationBatch - POSITIVE (anchor in-batch + 3 claims + 1 dup)');
     r = await post('/issueFieldPredicateAttestationBatch', {
         payloadHash, contentRoot: tree.contentRoot,
         claimsJson: JSON.stringify(claims),
@@ -280,7 +280,7 @@ function buildContentRoot(pc, fields /* [{name, value: bigint}] */) {
     }
     console.log('OK   all 3 claims independently verified from live state');
 
-    step('8. issueFieldPredicateAttestationBatch — NEGATIVE (1 true + 1 FALSE claim → whole batch must abort)');
+    step('8. issueFieldPredicateAttestationBatch - NEGATIVE (1 true + 1 FALSE claim → whole batch must abort)');
     const negClaims = [
         claimFor(1, 'lessOrEqual', 200000),  // true on its own (120000 <= 200000)
         claimFor(0, 'lessOrEqual', 100)      // FALSE (47300 <= 100)
@@ -293,7 +293,7 @@ function buildContentRoot(pc, fields /* [{name, value: bigint}] */) {
     if (!negRes.failed) fail('negative batch did not fail');
     const negMsg = `${negRes.errorCode ?? ''} ${negRes.errorMessage ?? ''}`.trim();
     if (/timed out|stalled|sync/i.test(negMsg)) {
-        fail(`negative batch failed on a SYNC issue, not a predicate rejection: ${negMsg} — re-run when the public indexer is healthy`);
+        fail(`negative batch failed on a SYNC issue, not a predicate rejection: ${negMsg} - re-run when the public indexer is healthy`);
     }
     console.log(`OK   negative batch rejected during local execution: ${negMsg}`);
 

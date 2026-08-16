@@ -1,212 +1,417 @@
-// AttestationVault — tiered-disclosure attestation contract (T10-extended).
+// AttestationVault: tiered-disclosure attestation contract.
 //
-// On-chain state stores only commitments (hashes/identifiers) and the actual
-// payload and metadata bodies live off-chain in NIGHTGATE's tables. The
-// chain layer guarantees ownership and disclosure-grant integrity & the
-// off-chain layer carries the content.
+// On-chain state holds only commitments (hashes, identifiers); payload and
+// metadata bodies live off-chain in NIGHTGATE's tables. The chain layer
+// guarantees ownership and disclosure-grant integrity, the off-chain layer
+// carries the content.
 //
 //   payload_hash   : blake2b-256 of the private payload (caller-provided)
 //   metadata_hash  : blake2b-256 of the public metadata blob (caller-provided)
-//   attester_id    : persistent_hash(local_secret_key()) — derived in-circuit
+//   attester_id    : persistentHash(local_secret_key()), derived in-circuit
 //   grantee        : Bytes<32> identifier for the disclosure recipient
 //   level          : 0=public-only, 1=legitimate-interest, 2=authority
 //   passportId     : Bytes<32> battery-passport identifier (caller-provided)
-//
-// This is the single, unified contract: it carries the NIGHTPASS passport
-// extension (bindPassport) and the field-bound predicate hardening
-// (anchorContentRoot / proveFieldPredicate). The old separate
-// `passport-attestation` contract was folded in here and removed.
 
 pragma language_version >= 0.20;
 
 import CompactStandardLibrary;
 
-// Public ledger state.
 export ledger public_attestations: Map<Bytes<32>, Bytes<32>>;
 export ledger attestation_owners:  Map<Bytes<32>, Bytes<32>>;
 export ledger disclosures:         Map<Bytes<32>, Map<Bytes<32>, Uint<8>>>;
 
-// ZK-predicate extension (on-chain-verified model).
-//   value_commitments: payload_hash -> persistentCommit(value, salt). The
-//     attester binds a hidden numeric value to their attestation.
-//   predicate_results: claimKey -> true, where claimKey =
-//     persistentHash(PredicateClaim{payload_hash, threshold, op}). Presence of
-//     a (true) entry means "a proof that the committed value satisfies this
-//     predicate was verified on-chain". Consumers recompute claimKey and look
-//     it up via the indexer to trust the predicate without seeing the value.
-export ledger value_commitments:   Map<Bytes<32>, Bytes<32>>;
-export ledger predicate_results:   Map<Bytes<32>, Boolean>;
-
-// Passport extension: passportId -> payload_hash (the bound attestation), so a
-// QR-scanned passportId resolves on-chain to its attestation.
+// passportId -> payload_hash, so a scanned passportId resolves on-chain to
+// its attestation.
 export ledger passport_bindings:   Map<Bytes<32>, Bytes<32>>;
 
-// Passport-ownership pre-registration. The registrar (the vault's deployer,
-// locked in at deploy time) can pre-assign a passportId to a specific
-// attester_id. bindPassport then only accepts that attester for the id,
-// closing first-bind squatting for registered ids and recovering already-
-// squatted ones (the registered owner may rebind over a foreign binding).
-// Unregistered ids keep the open first-come-first-served semantics.
+// Passport-ownership pre-registration. The registrar may pre-assign a
+// passportId to an attester_id; bindPassport then accepts only that attester,
+// which closes first-bind squatting and recovers already-squatted ids.
+// Unregistered ids stay first-come-first-served.
 export ledger registrar:           Bytes<32>;
 export ledger passport_owners:     Map<Bytes<32>, Bytes<32>>;
 
-// Field-bound predicate extension.
-//   content_roots: payload_hash -> Merkle root over the passport's provable
-//     fields, each leaf = leafHash(field_key, scaled_value). Anchored by the
-//     attester so later proofs are bound to the passport's ACTUAL field values.
-//   field_predicate_results: claimKey -> true, where claimKey =
-//     persistentHash(FieldPredicateClaim{payload_hash, field_key, threshold,
-//     op}). A (true) entry means the value of `field_key` (proven to be in the
-//     anchored content root) satisfies the predicate — bound to THIS passport
-//     field, not an arbitrary committed number.
+// content_roots: payload_hash -> Merkle root over the passport's provable
+// fields, anchored by the attester so later proofs bind to the passport's
+// ACTUAL values. field_predicate_results: claimKey -> true means the value
+// behind `field_key` satisfies the predicate, bound to THIS passport field
+// rather than to an arbitrary number.
 export ledger content_roots:            Map<Bytes<32>, Bytes<32>>;
 export ledger field_predicate_results:  Map<Bytes<32>, Boolean>;
 
-// Bytes-valued field extension. Non-numeric fields (strings) enter the content
-// root as bytesLeafHash(field_key, value_digest) leaves, where value_digest is
-// the off-chain blake2b-256 of the canonical value bytes. Two claim families:
-//   field_equality_results: claimKey -> true, claimKey =
-//     persistentHash(FieldEqualityClaim{payload_hash, field_key, expected}).
-//     Means "field_key of THIS passport carries exactly the value whose digest
-//     is `expected`". Authenticity/binding, NOT confidentiality: the digest of
-//     a low-entropy value is dictionary-guessable.
-//   field_membership_results: claimKey -> true, claimKey =
-//     persistentHash(FieldMembershipClaim{payload_hash, field_key, set_root}).
-//     Means "field_key's hidden value is ONE OF the public allow-list whose
-//     canonical set root is `set_root`", without revealing which one.
+// Bytes-valued fields (strings) enter the content root as bytesLeafHash
+// leaves over the off-chain blake2b-256 of the canonical value bytes.
+//   field_equality_results:   "field_key carries exactly the value whose
+//     digest is `expected`". Authenticity, NOT confidentiality: a
+//     low-entropy value's digest is dictionary-guessable.
+//   field_membership_results: "field_key's hidden value is ONE OF the public
+//     allow-list behind `set_root`", without revealing which.
 export ledger field_equality_results:   Map<Bytes<32>, Boolean>;
 export ledger field_membership_results: Map<Bytes<32>, Boolean>;
 
-// Identifies a concrete predicate claim. Hashed to a stable result key so each
-// distinct (attestation, threshold, op) triple is recorded independently.
-struct PredicateClaim {
-  payload_hash: Bytes<32>,
-  threshold:    Uint<64>,
-  op:           Uint<8>
-}
-
-// A provable passport field: its canonical id and its scaled integer value.
-// Hashed to a Merkle leaf; the off-chain builder uses the exported `leafHash`
-// pure circuit so its tree hashes identically to this one.
+// A provable numeric field: canonical id, scaled integer value, per-slot
+// salt. The off-chain builder uses the exported `leafHash` so its tree hashes
+// identically.
 struct FieldLeaf {
   field_key: Bytes<32>,
-  value:     Uint<64>
+  value:     Uint<64>,
+  salt:      Bytes<32>
 }
 
-// An internal Merkle node (ordered pair of child digests).
+// An absent slot (no value, or padding beyond the field list). Salted like
+// value leaves, so a shared leaf layer does not reveal WHICH fields exist.
+struct AbsentLeaf {
+  field_key: Bytes<32>,
+  salt:      Bytes<32>
+}
+
 struct MerkleNode {
   left:  Bytes<32>,
   right: Bytes<32>
 }
 
-// Identifies a concrete field-bound predicate claim.
+// Per-slot schema interpretation, shared by both documents of a comparison.
+// `kind`: 0 = uint, 1 = bytes, 2 = padding. `scale` is the off-chain scaling
+// of uint slots (0 otherwise): it never enters the value comparison (values
+// arrive pre-scaled) but IS part of the schema root, so the same numbers
+// under a different scaling are a DIFFERENT schema.
+struct SlotDescriptor {
+  field_key: Bytes<32>,
+  kind:      Uint<8>,
+  scale:     Uint<64>
+}
+
+// One document's opening of one slot. The member not selected by the
+// descriptor's kind is ignored.
+struct SlotOpening {
+  present:      Boolean,
+  uint_value:   Uint<64>,
+  value_digest: Bytes<32>
+}
+
+// One 32-byte seed per document derives one salt per slot.
+struct SlotSalt {
+  seed:  Bytes<32>,
+  index: Uint<8>
+}
+
+// Claim identities. Every claim key embeds the payload's attestation EPOCH at
+// proving time (see attestationEpoch), so claims recorded during a
+// front-runner's ownership window stop verifying after a recovery.
 struct FieldPredicateClaim {
   payload_hash: Bytes<32>,
   field_key:    Bytes<32>,
   threshold:    Uint<64>,
-  op:           Uint<8>
+  op:           Uint<8>,
+  epoch:        Uint<64>
 }
 
-// A provable bytes-valued passport field: its canonical id and the blake2b-256
-// digest of its canonical value bytes. Distinct struct from FieldLeaf so the
-// two leaf families can never collide (persistentHash is domain-separated by
-// struct type).
+// A provable bytes-valued field. Distinct struct from FieldLeaf so the leaf
+// families cannot collide (the hash is domain-separated by struct type).
 struct BytesLeaf {
   field_key:    Bytes<32>,
-  value_digest: Bytes<32>
+  value_digest: Bytes<32>,
+  salt:         Bytes<32>
 }
 
-// A membership-set leaf: one allowed value's digest. Wrapped in its own struct
-// so set-tree leaves are domain-separated from content-tree leaves and inner
-// nodes.
+// One allowed value of a membership set, in its own struct so set leaves are
+// domain-separated from content leaves and inner nodes.
 struct SetLeaf {
   value_digest: Bytes<32>
 }
 
-// Identifies a concrete field-bound equality claim.
+// Cross-root comparison results, written by proveDocumentComparison:
+//   document_integrity_results: "B differs from A ONLY in the slots flagged
+//     by allowed_mask; every other slot carries the same value (or is empty
+//     on both sides)".
+//   document_diff_results: "at least k of the 16 aligned slots differ",
+//     values hidden. A difference is a value or presence change under the
+//     shared schema; both-empty compares equal.
+// (a, b) and (b, a) are distinct claims; verifiers query with the proving
+// order.
+export ledger document_integrity_results: Map<Bytes<32>, Boolean>;
+export ledger document_diff_results:      Map<Bytes<32>, Boolean>;
+
+// payload_hash -> schema root: the depth-4 root over the 16 slot descriptors.
+// Recomputable in-circuit, so a comparison verifies it against the witnessed
+// descriptor list instead of trusting the anchorer's label.
+export ledger content_schemas: Map<Bytes<32>, Bytes<32>>;
+
+// The mask travels as a boolean vector (Compact has no bitwise ops); the
+// off-chain recompute mirrors it as CompactTypeVector(16, CompactTypeBoolean).
+// Bit i true = slot i MAY differ.
+struct DocumentIntegrityClaim {
+  payload_hash_a: Bytes<32>,
+  payload_hash_b: Bytes<32>,
+  allowed_mask:   Vector<16, Boolean>,
+  epoch_a:        Uint<64>,
+  epoch_b:        Uint<64>
+}
+
+struct DocumentDiffClaim {
+  payload_hash_a: Bytes<32>,
+  payload_hash_b: Bytes<32>,
+  k:              Uint<8>,
+  epoch_a:        Uint<64>,
+  epoch_b:        Uint<64>
+}
+
 struct FieldEqualityClaim {
   payload_hash: Bytes<32>,
   field_key:    Bytes<32>,
-  expected:     Bytes<32>
+  expected:     Bytes<32>,
+  epoch:        Uint<64>
 }
 
-// Identifies a concrete field-bound set-membership claim.
 struct FieldMembershipClaim {
   payload_hash: Bytes<32>,
   field_key:    Bytes<32>,
-  set_root:     Bytes<32>
+  set_root:     Bytes<32>,
+  epoch:        Uint<64>
 }
 
-// Caller's secret, supplied off-chain. Hashed in-circuit to produce a stable
+// Caller's secret, supplied off-chain. Hashed in-circuit into a stable
 // attester_id without ever revealing the secret to the chain.
 witness local_secret_key(): Bytes<32>;
 
-// The hidden numeric value and its commitment opening (salt), supplied
-// off-chain. Never revealed to the chain — only proven about.
-witness attested_value(): Uint<64>;
-witness value_salt():     Bytes<32>;
-
-// Field-bound inclusion proof, supplied off-chain. `field_value` is the scaled
-// integer value of the field being proven; `merkle_siblings` / `merkle_dirs`
-// are its inclusion path in the anchored content root. DEPTH is fixed at 4
-// (=> up to 16 provable fields); the off-chain builder pads to 2^4.
+// Field-bound inclusion proof. DEPTH is fixed at 4 (up to 16 provable
+// fields); the off-chain builder pads to 2^4.
 witness field_value():     Uint<64>;
+witness field_salt():      Bytes<32>;
 witness merkle_siblings(): Vector<4, Bytes<32>>;
 witness merkle_dirs():     Vector<4, Boolean>;   // true => current node is the LEFT child
 
-// Bytes-valued field proof material, supplied off-chain. `field_digest` is the
-// blake2b-256 of the field's canonical value bytes (the hidden value for
-// membership proofs); `set_siblings` / `set_dirs` are its inclusion path in the
-// public membership-set tree. SET_DEPTH is fixed at 6 (=> up to 64 allowed
-// values); the off-chain builder dedupes, sorts and pads to 2^6.
+// Bytes-field proof material. `field_digest` is the blake2b-256 of the
+// canonical value bytes (the hidden value for membership proofs). SET_DEPTH
+// is fixed at 6 (up to 64 allowed values); the builder dedupes, sorts, pads.
 witness field_digest():    Bytes<32>;
 witness set_siblings():    Vector<6, Bytes<32>>;
 witness set_dirs():        Vector<6, Boolean>;   // true => current node is the LEFT child
 
-// Numeric commitment binding the hidden value to its 32-byte opening. The same
-// value+salt always reproduce this commitment, so the on-chain stored
-// commitment pins exactly which value later proofs must be about.
-circuit value_commitment(): Bytes<32> {
-  return persistentCommit<Uint<64>>(attested_value(), value_salt());
-}
+// Cross-root witnesses: ONE shared descriptor list (witnessing it once makes
+// schema parity structural) plus each document's salt seed and full opening.
+// The circuit recomputes schema and content roots from these, so nothing here
+// is trusted, only proven against the anchors.
+witness doc_schema():  Vector<16, SlotDescriptor>;
+witness doc_salt_a():  Bytes<32>;
+witness doc_salt_b():  Bytes<32>;
+witness doc_slots_a(): Vector<16, SlotOpening>;
+witness doc_slots_b(): Vector<16, SlotOpening>;
 
-// Derive the caller's identity commitment. The hash is one-way, so making it
-// on-chain does not leak the underlying secret.
+// The caller's identity commitment. One-way, so publishing it on-chain does
+// not leak the secret.
 circuit caller_id(): Bytes<32> {
   return persistentHash<Bytes<32>>(local_secret_key());
 }
 
-// Deploy locks in the registrar: the deployer's attester identity, derived
-// from the same local_secret_key witness the circuits use. The session that
-// deploys the vault is the only one that can pre-register passport ownership.
-constructor() {
-  registrar = disclose(caller_id());
+// The registrar is a PUBLIC constructor argument, not disclose(caller_id()):
+// a witness-backed constructor makes the deploy proof heavy enough that,
+// together with the verifier keys, the node rejects the deploy for exceeding
+// the block limits. A public argument keeps the deploy light, keeps the trust
+// model identical (the deployer controlled the value either way) and allows
+// nominating a registrar other than the deploying session.
+constructor(initial_registrar: Bytes<32>) {
+  registrar = disclose(initial_registrar);
 }
 
-// Merkle leaf hash — pure, so it is exported into the artifact's `pureCircuits`
-// and the off-chain content-root builder can hash leaves identically.
-export pure circuit leafHash(field_key: Bytes<32>, value: Uint<64>): Bytes<32> {
-  return persistentHash<FieldLeaf>(FieldLeaf { field_key: field_key, value: value });
+// ---- Tree hashing ----------------------------------------------------------
+//
+// All tree hashes are `transientHash` upgraded back to Bytes<32>, NOT
+// `persistentHash`: persistentHash is in-circuit SHA-256 at ~2 MB of prover
+// key PER INSTANCE, and the proof circuits are essentially hash-count times
+// that. Transient hashing cuts the vault's prover keys by ~87% while every
+// exported signature stays Bytes<32>.
+//
+// Trade-off (Compact standard library docs): transientHash is "not guaranteed
+// to persist between upgrades" and "should not be used to derive state data".
+// The anchored content root IS derived state data; we deviate deliberately. A
+// compiler generation change means re-anchoring by the holders (who hold the
+// data), while recorded claims persist in the result maps. Root computation
+// must therefore always go through THIS artifact's exported pure circuits,
+// never a re-implementation. Claim keys stay persistentHash (they ARE stored
+// state identity).
+export pure circuit leafHash(field_key: Bytes<32>, value: Uint<64>, salt: Bytes<32>): Bytes<32> {
+  return upgradeFromTransient(transientHash<FieldLeaf>(FieldLeaf { field_key: field_key, value: value, salt: salt }));
 }
 
-// Merkle inner-node hash — pure, exported for off-chain parity.
 export pure circuit nodeHash(left: Bytes<32>, right: Bytes<32>): Bytes<32> {
-  return persistentHash<MerkleNode>(MerkleNode { left: left, right: right });
+  return upgradeFromTransient(transientHash<MerkleNode>(MerkleNode { left: left, right: right }));
 }
 
-// Bytes-valued Merkle leaf hash: pure, exported so the off-chain content-root
-// builder hashes string-field leaves identically.
-export pure circuit bytesLeafHash(field_key: Bytes<32>, value_digest: Bytes<32>): Bytes<32> {
-  return persistentHash<BytesLeaf>(BytesLeaf { field_key: field_key, value_digest: value_digest });
+export pure circuit bytesLeafHash(field_key: Bytes<32>, value_digest: Bytes<32>, salt: Bytes<32>): Bytes<32> {
+  return upgradeFromTransient(transientHash<BytesLeaf>(BytesLeaf { field_key: field_key, value_digest: value_digest, salt: salt }));
 }
 
-// Membership-set leaf hash: pure, exported so the off-chain set builder hashes
-// allowed-value leaves identically.
+export pure circuit absentLeafHash(field_key: Bytes<32>, salt: Bytes<32>): Bytes<32> {
+  return upgradeFromTransient(transientHash<AbsentLeaf>(AbsentLeaf { field_key: field_key, salt: salt }));
+}
+
+// Membership-set leaves are UNSALTED by design: the allow-list is public and
+// every party must recompute the same set root from it.
 export pure circuit setLeafHash(value_digest: Bytes<32>): Bytes<32> {
-  return persistentHash<SetLeaf>(SetLeaf { value_digest: value_digest });
+  return upgradeFromTransient(transientHash<SetLeaf>(SetLeaf { value_digest: value_digest }));
 }
 
-// One Merkle fold step: combine `node` with its `sibling` in the correct order.
+export pure circuit descriptorLeafHash(field_key: Bytes<32>, kind: Uint<8>, scale: Uint<64>): Bytes<32> {
+  return upgradeFromTransient(transientHash<SlotDescriptor>(SlotDescriptor { field_key: field_key, kind: kind, scale: scale }));
+}
+
+export pure circuit slotSalt(seed: Bytes<32>, index: Uint<8>): Bytes<32> {
+  return upgradeFromTransient(transientHash<SlotSalt>(SlotSalt { seed: seed, index: index }));
+}
+
+// Canonical padding-slot key: ASCII, zero-padded to 32 bytes (pad() right-
+// pads). A literal digest is not expressible in Compact (out of Field range).
+// The off-chain builder consumes THIS circuit and a unit test pins byte
+// parity.
+export pure circuit emptyLeafKey(): Bytes<32> {
+  return pad(32, "nightgate/empty-leaf/v2");
+}
+
+// Fold a 16-leaf layer to its depth-4 root. Unrolled; a statically-bounded
+// `for` would expand to the identical circuit. Scalar args so callers need no
+// vector construction.
+pure circuit fold16(
+  l0: Bytes<32>,  l1: Bytes<32>,  l2: Bytes<32>,  l3: Bytes<32>,
+  l4: Bytes<32>,  l5: Bytes<32>,  l6: Bytes<32>,  l7: Bytes<32>,
+  l8: Bytes<32>,  l9: Bytes<32>,  l10: Bytes<32>, l11: Bytes<32>,
+  l12: Bytes<32>, l13: Bytes<32>, l14: Bytes<32>, l15: Bytes<32>
+): Bytes<32> {
+  const a0 = nodeHash(l0, l1);
+  const a1 = nodeHash(l2, l3);
+  const a2 = nodeHash(l4, l5);
+  const a3 = nodeHash(l6, l7);
+  const a4 = nodeHash(l8, l9);
+  const a5 = nodeHash(l10, l11);
+  const a6 = nodeHash(l12, l13);
+  const a7 = nodeHash(l14, l15);
+  const b0 = nodeHash(a0, a1);
+  const b1 = nodeHash(a2, a3);
+  const b2 = nodeHash(a4, a5);
+  const b3 = nodeHash(a6, a7);
+  return nodeHash(nodeHash(b0, b1), nodeHash(b2, b3));
+}
+
+// One slot's leaf. Padding slots and absent fields land on the salted absent
+// leaf; the unused opening members are ignored.
+pure circuit slotLeaf(d: SlotDescriptor, o: SlotOpening, salt: Bytes<32>): Bytes<32> {
+  if (d.kind == 0 && o.present) {
+    return leafHash(d.field_key, o.uint_value, salt);
+  }
+  if (d.kind == 1 && o.present) {
+    return bytesLeafHash(d.field_key, o.value_digest, salt);
+  }
+  return absentLeafHash(d.field_key, salt);
+}
+
+// Per-slot difference on VALUE level: leaf hashes cannot be compared across
+// documents, their salts differ. Padding never differs; both-absent is no
+// difference; present-vs-absent IS one; both-present compares the kind's
+// value member.
+pure circuit slotDiff(d: SlotDescriptor, a: SlotOpening, b: SlotOpening): Uint<8> {
+  if (d.kind == 2) {
+    return 0;
+  }
+  if (!a.present && !b.present) {
+    return 0;
+  }
+  if ((a.present && !b.present) || (!a.present && b.present)) {
+    return 1;
+  }
+  if (d.kind == 0) {
+    if (a.uint_value == b.uint_value) {
+      return 0;
+    }
+    return 1;
+  }
+  if (a.value_digest == b.value_digest) {
+    return 0;
+  }
+  return 1;
+}
+
+// Descriptors are WITNESS data, so their shape must be pinned before any root
+// math: an out-of-range kind would land on the absent leaf in slotLeaf but
+// compare as a bytes field in slotDiff, letting two all-absent roots prove a
+// fabricated difference. Pinning the canonical shape (no scale on non-uint
+// slots, canonical key and absence on padding) also gives one field list
+// exactly one descriptor encoding.
+pure circuit assertCanonicalSlot(d: SlotDescriptor, a: SlotOpening, b: SlotOpening): [] {
+  assert(d.kind <= 2, "schema kind out of range");
+  if (!(d.kind == 0)) {
+    assert(d.scale == 0, "schema scale must be 0 for non-uint slots");
+  }
+  if (d.kind == 2) {
+    assert(d.field_key == emptyLeafKey(), "padding slot key must be canonical");
+    assert(!a.present && !b.present, "padding slot must be absent");
+  }
+}
+
+// True when the mask actually CONSTRAINS this slot: a real (non-padding) slot
+// the mask does not free. An integrity claim whose mask frees every real slot
+// says nothing, so at least one constrained slot is required in-circuit; a
+// server-side reject alone would leave direct callers able to record the
+// vacuous claim.
+pure circuit constrainsSlot(allowed: Boolean, d: SlotDescriptor): Boolean {
+  return !allowed && !(d.kind == 2);
+}
+
+pure circuit assertUnchanged(allowed: Boolean, d: SlotDescriptor, a: SlotOpening, b: SlotOpening): [] {
+  if (!allowed) {
+    assert(slotDiff(d, a, b) == 0, "slot changed outside allowed mask");
+  }
+}
+
+// Schema root over a witnessed descriptor list, and a document's content root
+// over that schema, its opening and its salt seed. Both are recomputed
+// in-circuit and asserted against the anchors, which is what makes an
+// anchored schema id PROVEN rather than claimed.
+pure circuit schemaRootOf(ds: Vector<16, SlotDescriptor>): Bytes<32> {
+  return fold16(
+    descriptorLeafHash(ds[0].field_key,  ds[0].kind,  ds[0].scale),
+    descriptorLeafHash(ds[1].field_key,  ds[1].kind,  ds[1].scale),
+    descriptorLeafHash(ds[2].field_key,  ds[2].kind,  ds[2].scale),
+    descriptorLeafHash(ds[3].field_key,  ds[3].kind,  ds[3].scale),
+    descriptorLeafHash(ds[4].field_key,  ds[4].kind,  ds[4].scale),
+    descriptorLeafHash(ds[5].field_key,  ds[5].kind,  ds[5].scale),
+    descriptorLeafHash(ds[6].field_key,  ds[6].kind,  ds[6].scale),
+    descriptorLeafHash(ds[7].field_key,  ds[7].kind,  ds[7].scale),
+    descriptorLeafHash(ds[8].field_key,  ds[8].kind,  ds[8].scale),
+    descriptorLeafHash(ds[9].field_key,  ds[9].kind,  ds[9].scale),
+    descriptorLeafHash(ds[10].field_key, ds[10].kind, ds[10].scale),
+    descriptorLeafHash(ds[11].field_key, ds[11].kind, ds[11].scale),
+    descriptorLeafHash(ds[12].field_key, ds[12].kind, ds[12].scale),
+    descriptorLeafHash(ds[13].field_key, ds[13].kind, ds[13].scale),
+    descriptorLeafHash(ds[14].field_key, ds[14].kind, ds[14].scale),
+    descriptorLeafHash(ds[15].field_key, ds[15].kind, ds[15].scale)
+  );
+}
+
+pure circuit contentRootOf(
+  ds:   Vector<16, SlotDescriptor>,
+  os:   Vector<16, SlotOpening>,
+  seed: Bytes<32>
+): Bytes<32> {
+  return fold16(
+    slotLeaf(ds[0],  os[0],  slotSalt(seed, 0)),
+    slotLeaf(ds[1],  os[1],  slotSalt(seed, 1)),
+    slotLeaf(ds[2],  os[2],  slotSalt(seed, 2)),
+    slotLeaf(ds[3],  os[3],  slotSalt(seed, 3)),
+    slotLeaf(ds[4],  os[4],  slotSalt(seed, 4)),
+    slotLeaf(ds[5],  os[5],  slotSalt(seed, 5)),
+    slotLeaf(ds[6],  os[6],  slotSalt(seed, 6)),
+    slotLeaf(ds[7],  os[7],  slotSalt(seed, 7)),
+    slotLeaf(ds[8],  os[8],  slotSalt(seed, 8)),
+    slotLeaf(ds[9],  os[9],  slotSalt(seed, 9)),
+    slotLeaf(ds[10], os[10], slotSalt(seed, 10)),
+    slotLeaf(ds[11], os[11], slotSalt(seed, 11)),
+    slotLeaf(ds[12], os[12], slotSalt(seed, 12)),
+    slotLeaf(ds[13], os[13], slotSalt(seed, 13)),
+    slotLeaf(ds[14], os[14], slotSalt(seed, 14)),
+    slotLeaf(ds[15], os[15], slotSalt(seed, 15))
+  );
+}
+
 circuit merkleStep(node: Bytes<32>, sibling: Bytes<32>, goesLeft: Boolean): Bytes<32> {
   if (goesLeft) {
     return nodeHash(node, sibling);
@@ -214,93 +419,176 @@ circuit merkleStep(node: Bytes<32>, sibling: Bytes<32>, goesLeft: Boolean): Byte
   return nodeHash(sibling, node);
 }
 
-// Anyone can attest a NEW payload_hash. Locks in attester_id for later
-// grant/revoke checks. First-come-first-served: re-attesting an existing
-// payload_hash is rejected, because Map.insert overwrites — without the guard
-// anyone could re-attest a known (public) hash, take over attestation_owners,
-// and then pass every owner-gated assert (grant/revoke/commit/bind/anchor).
-// All arguments are caller-provided commitments that the caller explicitly
-// wants on-chain — wrap with `disclose(...)` to declare intent.
+// ---- Guarded attest (commit-reveal) ----------------------------------------
+//
+// attest() is first-come-first-served and its payload hash is a public
+// transaction input, so a mempool observer can front-run a visible attest and
+// own the hash permanently. The guarded path closes that window: record an
+// opaque commitment first (mode 0), reveal later (mode 1). Sequencing makes
+// it effective although plain attest still exists: every attestation records
+// the sequence it was created at, and a reveal whose commitment PREDATES the
+// current attestation takes it over. A sniper cannot manufacture an older
+// commitment (the nonce is unknown to them).
+//
+// A takeover erases the sniper's ownership window: content root, schema and
+// the payload's disclosure grants are removed, and claims recorded then stop
+// verifying because claim keys embed the attestation epoch, which the
+// takeover moves. Commitments are consumed on success (one-shot reveals).
+//
+// Scope: commit-reveal protects hashes that are SECRET until reveal. For
+// publicly known identifiers use registrar pre-assignment, since an adversary
+// who already knows the hash can commit first.
+struct AttestCommitPreimage {
+  payload_hash:  Bytes<32>,
+  metadata_hash: Bytes<32>,
+  nonce:         Bytes<32>
+}
+
+struct AttestCommitRecord {
+  owner: Bytes<32>,
+  seq:   Uint<64>
+}
+
+export ledger attest_commits:    Map<Bytes<32>, AttestCommitRecord>;
+export ledger attestation_seqs:  Map<Bytes<32>, Uint<64>>;
+export ledger attest_seq_next:   Uint<64>;
+
+// Anyone may attest a NEW payload_hash; this locks in attester_id for the
+// later owner-gated checks. Re-attesting an existing hash is rejected because
+// Map.insert overwrites: without the guard anyone could re-attest a known
+// hash, take over attestation_owners and pass every owner-gated assert.
+// Arguments are caller-provided commitments meant for the chain, hence
+// disclose(). The recorded sequence lets a guarded reveal with an older
+// commitment reclaim a front-run hash.
 export circuit attest(payload_hash: Bytes<32>, metadata_hash: Bytes<32>): [] {
   assert(!public_attestations.member(disclose(payload_hash)), "already attested");
   public_attestations.insert(disclose(payload_hash), disclose(metadata_hash));
   attestation_owners.insert(disclose(payload_hash), disclose(caller_id()));
+  attestation_seqs.insert(disclose(payload_hash), attest_seq_next);
+  attest_seq_next = (attest_seq_next + 1) as Uint<64>;
 }
 
-// Only the original attester may grant a disclosure level to a grantee.
+// Both phases share ONE circuit: each exported circuit costs ~2.1 KB of
+// verifier key in the deploy transaction, against the node's 32 KiB cap on a
+// transaction's written bytes.
+//   mode 0 (commit): `payload_hash` carries the COMMITMENT (persistentHash
+//     over AttestCommitPreimage, computable off-chain); metadata_hash and
+//     nonce ride as zero dummies. Insert-once.
+//   mode 1 (reveal): real payload_hash/metadata_hash/nonce. The circuit
+//     recomputes the commitment, checks the caller committed it, then attests
+//     or takes over an attestation newer than the commitment.
+// Callers: the reveal proves against a ledger snapshot, so if the contested
+// attest lands between proving and application, the reveal fails once and
+// succeeds on re-prove.
+export circuit attestGuarded(
+  mode:          Uint<8>,
+  payload_hash:  Bytes<32>,
+  metadata_hash: Bytes<32>,
+  nonce:         Bytes<32>
+): [] {
+  const m = disclose(mode);
+  assert(m <= 1, "mode out of range");
+  const zero = pad(32, "");
+  if (m == 0) {
+    assert(metadata_hash == zero, "metadata must be the neutral dummy in commit mode");
+    assert(nonce == zero, "nonce must be the neutral dummy in commit mode");
+    assert(!attest_commits.member(disclose(payload_hash)), "commitment already recorded");
+    attest_commits.insert(disclose(payload_hash), AttestCommitRecord {
+      owner: disclose(caller_id()),
+      seq:   attest_seq_next
+    });
+    attest_seq_next = (attest_seq_next + 1) as Uint<64>;
+    return;
+  }
+  const commitment = persistentHash<AttestCommitPreimage>(AttestCommitPreimage {
+    payload_hash:  payload_hash,
+    metadata_hash: metadata_hash,
+    nonce:         nonce
+  });
+  assert(attest_commits.member(disclose(commitment)), "no matching commitment");
+  const rec = attest_commits.lookup(disclose(commitment));
+  assert(rec.owner == caller_id(), "not committer");
+  if (!public_attestations.member(disclose(payload_hash))) {
+    // Consume the commitment: a successful reveal must be one-shot, or an
+    // identical replay would later satisfy rec.seq < attestation_seq, run the
+    // takeover branch against the revealer's OWN attestation and delete an
+    // anchored root.
+    attest_commits.remove(disclose(commitment));
+    public_attestations.insert(disclose(payload_hash), disclose(metadata_hash));
+    attestation_owners.insert(disclose(payload_hash), disclose(caller_id()));
+    attestation_seqs.insert(disclose(payload_hash), attest_seq_next);
+    attest_seq_next = (attest_seq_next + 1) as Uint<64>;
+    return;
+  }
+  // Takeover, only against an attestation NEWER than the commitment. The
+  // recorded sequence becomes the commitment's, so an even older commitment
+  // can still reclaim while re-reveals of newer ones cannot ping-pong. Moving
+  // the epoch is what invalidates the claims recorded during the sniper's
+  // window: verifiers always recompute claim keys with the CURRENT epoch, and
+  // sequence values are unique, so a stale epoch never recurs.
+  assert(attestation_seqs.member(disclose(payload_hash)), "attestation predates sequencing");
+  assert(rec.seq < attestation_seqs.lookup(disclose(payload_hash)), "attestation predates commitment");
+  attest_commits.remove(disclose(commitment));
+  public_attestations.insert(disclose(payload_hash), disclose(metadata_hash));
+  attestation_owners.insert(disclose(payload_hash), disclose(caller_id()));
+  attestation_seqs.insert(disclose(payload_hash), rec.seq);
+  if (content_roots.member(disclose(payload_hash))) {
+    content_roots.remove(disclose(payload_hash));
+    content_schemas.remove(disclose(payload_hash));
+  }
+  if (disclosures.member(disclose(payload_hash))) {
+    disclosures.remove(disclose(payload_hash));
+  }
+}
+
+// The sequence number of the payload's current ownership period. Every claim
+// key embeds it, and verifiers recompute with the CURRENT value from ledger
+// state, so claims from a superseded ownership window no longer resolve.
+circuit attestationEpoch(payload_hash: Bytes<32>): Uint<64> {
+  assert(attestation_seqs.member(disclose(payload_hash)), "no attestation epoch");
+  return attestation_seqs.lookup(disclose(payload_hash));
+}
+
 export circuit grantDisclosure(
   payload_hash: Bytes<32>,
   grantee:      Bytes<32>,
   level:        Uint<8>
 ): [] {
   assert(attestation_owners.lookup(disclose(payload_hash)) == caller_id(), "not attester");
+  // In-circuit, not just server-side: direct callers must not record levels
+  // outside the documented 0..2 tier model.
+  assert(level <= 2, "level out of range");
   if (!disclosures.member(disclose(payload_hash))) {
     disclosures.insert(disclose(payload_hash), default<Map<Bytes<32>, Uint<8>>>);
   }
   disclosures.lookup(disclose(payload_hash)).insert(disclose(grantee), disclose(level));
 }
 
-// Only the original attester may revoke a previously granted disclosure.
 export circuit revokeDisclosure(payload_hash: Bytes<32>, grantee: Bytes<32>): [] {
   assert(attestation_owners.lookup(disclose(payload_hash)) == caller_id(), "not attester");
   disclosures.lookup(disclose(payload_hash)).remove(disclose(grantee));
 }
 
-// Attester attaches a numeric commitment to an existing attestation. The
-// commitment is computed in-circuit from the off-chain value+salt, so the
-// chain only ever sees the commitment, never the value.
-export circuit commitValue(payload_hash: Bytes<32>): [] {
-  assert(attestation_owners.lookup(disclose(payload_hash)) == caller_id(), "not attester");
-  value_commitments.insert(disclose(payload_hash), disclose(value_commitment()));
-}
-
-// Prove the hidden committed value satisfies a predicate against a public
-// threshold, without revealing the value. `op`: 0 = lessOrEqual, 1 =
-// greaterOrEqual. Binds to the on-chain commitment so the proof can't be
-// swapped onto a different value, then records the (true) result keyed by the
-// claim so a consumer can verify it via the indexer.
-export circuit provePredicate(payload_hash: Bytes<32>, threshold: Uint<64>, op: Uint<8>): [] {
-  assert(value_commitments.member(disclose(payload_hash)), "no value commitment");
-  assert(value_commitments.lookup(disclose(payload_hash)) == value_commitment(), "commitment mismatch");
-  const v = attested_value();
-  if (op == 0) {
-    assert(v <= threshold, "predicate false");
-  } else {
-    assert(v >= threshold, "predicate false");
-  }
-  const claimKey = persistentHash<PredicateClaim>(PredicateClaim {
-    payload_hash: payload_hash,
-    threshold:    threshold,
-    op:           op
-  });
-  predicate_results.insert(disclose(claimKey), true);
-}
-
-// Registrar-only: pre-assign (or re-assign) a passportId to an attester
-// identity. Overwrite is deliberate: it is the ownership-transfer and
-// squatter-recovery path (the registrar re-points the id, the new owner
-// rebinds via bindPassport).
+// Registrar-only: pre-assign (or re-assign) a passportId to an attester.
+// Overwrite is deliberate, it is the ownership-transfer and squatter-recovery
+// path (the registrar re-points the id, the new owner rebinds).
 export circuit registerPassport(passportId: Bytes<32>, owner_id: Bytes<32>): [] {
   assert(caller_id() == registrar, "not registrar");
   passport_owners.insert(disclose(passportId), disclose(owner_id));
 }
 
-// Anchor a battery-passport identifier to an existing attestation's
-// payload_hash, so a QR-scanned passportId resolves on-chain to its
-// attestation. Only the attestation's owner may bind it. Authority over the
-// passportId itself is two-tier:
-//   1. REGISTERED ids (passport_owners): only the registered attester may
-//      bind or re-bind, regardless of any existing binding. Registration
-//      both prevents first-bind squatting and recovers an already-squatted
-//      id (registrar re-points it, the owner rebinds over the squatter).
-//   2. UNREGISTERED ids: first-come-first-served, and an existing binding
-//      may only be re-bound by the owner of its currently bound attestation
-//      (Map.insert overwrites; without the guard any attester could hijack
-//      a known passportId onto their own attestation, the same takeover
-//      class the attest() guard closes for attestation_owners). Same-owner
-//      rebinding stays allowed (e.g. a newer attestation version).
-// Unregistered FIRST binds remain squattable by design (open, permissionless
-// mode); use registerPassport where that risk matters.
+// Bind a passportId to an existing attestation, so a scanned id resolves
+// on-chain. Only the attestation's owner may bind. Authority over the id
+// itself is two-tier:
+//   1. REGISTERED ids: only the registered attester may bind or re-bind,
+//      regardless of an existing binding (prevents squatting, recovers a
+//      squatted id).
+//   2. UNREGISTERED ids: first-come-first-served, and an existing binding may
+//      only be re-bound by the owner of its currently bound attestation,
+//      otherwise any attester could hijack a known id onto their own
+//      attestation. Same-owner rebinding stays allowed.
+// First binds of unregistered ids remain squattable by design (open mode);
+// use registerPassport where that matters.
 export circuit bindPassport(passportId: Bytes<32>, payload_hash: Bytes<32>): [] {
   assert(public_attestations.member(disclose(payload_hash)), "no attestation");
   assert(attestation_owners.lookup(disclose(payload_hash)) == caller_id(), "not attester");
@@ -317,21 +605,35 @@ export circuit bindPassport(passportId: Bytes<32>, payload_hash: Bytes<32>): [] 
   passport_bindings.insert(disclose(passportId), disclose(payload_hash));
 }
 
-// Attester anchors the Merkle root over the passport's provable fields. The
-// root is computed off-chain from the SAME canonical content that produced
-// payload_hash, so a later proveFieldPredicate can bind a proven value to an
-// actual passport field. Only the attester may anchor.
-export circuit anchorContentRoot(payload_hash: Bytes<32>, content_root: Bytes<32>): [] {
+// The attester anchors the Merkle root over the passport's provable fields
+// plus the schema id of the ordered field list it was built over, computed
+// off-chain from the SAME canonical content that produced payload_hash.
+//
+// INSERT-ONCE-OR-IDENTICAL: a payload_hash names immutable content, so its
+// root and schema are immutable too. Without the guard the owner could
+// re-anchor a different root while recorded claim keys (which do not embed
+// the root) stayed true, silently detaching claims from the current tree.
+// Re-anchoring the identical pair stays allowed, so retries are idempotent.
+export circuit anchorContentRoot(
+  payload_hash: Bytes<32>,
+  content_root: Bytes<32>,
+  schema_id:    Bytes<32>
+): [] {
   assert(attestation_owners.lookup(disclose(payload_hash)) == caller_id(), "not attester");
-  content_roots.insert(disclose(payload_hash), disclose(content_root));
+  if (content_roots.member(disclose(payload_hash))) {
+    assert(content_roots.lookup(disclose(payload_hash)) == disclose(content_root), "content root already anchored");
+    assert(content_schemas.lookup(disclose(payload_hash)) == disclose(schema_id), "schema already anchored");
+  } else {
+    content_roots.insert(disclose(payload_hash), disclose(content_root));
+    content_schemas.insert(disclose(payload_hash), disclose(schema_id));
+  }
 }
 
-// Prove that a specific passport field (`field_key`) satisfies a predicate
-// against a public threshold, WITHOUT revealing the value — and bound to the
-// anchored content root so the value provably belongs to THIS passport. The
-// circuit recomputes the field's Merkle leaf and folds the witnessed inclusion
-// path up to a root, asserts it equals the anchored content_root, then checks
-// the predicate. `op`: 0 = lessOrEqual, 1 = greaterOrEqual.
+// Prove a field satisfies a predicate against a public threshold without
+// revealing the value, bound to the anchored content root so the value
+// provably belongs to THIS passport: recompute the leaf, fold the witnessed
+// inclusion path, assert it equals the anchored root, then check the
+// predicate. `op`: 0 = lessOrEqual, 1 = greaterOrEqual.
 export circuit proveFieldPredicate(
   payload_hash: Bytes<32>,
   field_key:    Bytes<32>,
@@ -339,11 +641,13 @@ export circuit proveFieldPredicate(
   op:           Uint<8>
 ): [] {
   assert(content_roots.member(disclose(payload_hash)), "no content root");
+  // In-circuit, not just server-side: any other op would silently select the
+  // greaterOrEqual branch for direct callers.
+  assert(op <= 1, "op out of range");
   const v = field_value();
   const sibs = merkle_siblings();
   const dirs = merkle_dirs();
-  // Fold the leaf up to the root — DEPTH (4) unrolled (Compact has no loops).
-  const n0 = leafHash(field_key, v);
+  const n0 = leafHash(field_key, v, field_salt());
   const n1 = merkleStep(n0, sibs[0], dirs[0]);
   const n2 = merkleStep(n1, sibs[1], dirs[1]);
   const n3 = merkleStep(n2, sibs[2], dirs[2]);
@@ -358,18 +662,18 @@ export circuit proveFieldPredicate(
     payload_hash: payload_hash,
     field_key:    field_key,
     threshold:    threshold,
-    op:           op
+    op:           op,
+    epoch:        attestationEpoch(payload_hash)
   });
   field_predicate_results.insert(disclose(claimKey), true);
 }
 
-// Prove that a specific bytes-valued passport field (`field_key`) carries
-// exactly the value whose canonical digest is `expected_digest`, bound to the
-// anchored content root. The expected digest is PUBLIC (it is the statement),
-// so no value witness is needed: the circuit recomputes the bytes leaf from the
-// public inputs and proves its inclusion path folds to the anchored root. This
-// is an authenticity/binding proof, not a confidentiality feature: for
-// low-entropy values the digest is dictionary-guessable.
+// Prove a bytes-valued field carries exactly the value whose canonical digest
+// is `expected_digest`. The digest is PUBLIC (it is the statement), so no
+// value witness is needed. The salt is witnessed, so the public digest alone
+// does not determine the leaf: only a holder of the slot's salt can run this.
+// Authenticity, not confidentiality: a low-entropy value's digest is
+// dictionary-guessable.
 export circuit proveFieldEquality(
   payload_hash:    Bytes<32>,
   field_key:       Bytes<32>,
@@ -378,8 +682,7 @@ export circuit proveFieldEquality(
   assert(content_roots.member(disclose(payload_hash)), "no content root");
   const sibs = merkle_siblings();
   const dirs = merkle_dirs();
-  // Fold the bytes leaf up to the root, DEPTH (4) unrolled (Compact has no loops).
-  const n0 = bytesLeafHash(field_key, expected_digest);
+  const n0 = bytesLeafHash(field_key, expected_digest, field_salt());
   const n1 = merkleStep(n0, sibs[0], dirs[0]);
   const n2 = merkleStep(n1, sibs[1], dirs[1]);
   const n3 = merkleStep(n2, sibs[2], dirs[2]);
@@ -388,18 +691,18 @@ export circuit proveFieldEquality(
   const claimKey = persistentHash<FieldEqualityClaim>(FieldEqualityClaim {
     payload_hash: payload_hash,
     field_key:    field_key,
-    expected:     expected_digest
+    expected:     expected_digest,
+    epoch:        attestationEpoch(payload_hash)
   });
   field_equality_results.insert(disclose(claimKey), true);
 }
 
-// Prove that a specific bytes-valued passport field's HIDDEN value is one of a
-// public allow-list, without revealing which one. Two folds over the same
-// witnessed digest: (1) the content fold binds the digest to `field_key` of
-// THIS passport's anchored root; (2) the set fold proves the digest is a leaf
-// of the public membership-set tree (`set_root`, SET_DEPTH 6, up to 64 values,
-// canonical off-chain rule: dedupe, sort digests ascending, pad). The digest
-// itself travels only as a witness.
+// Prove a bytes-valued field's HIDDEN value is one of a public allow-list,
+// without revealing which. Two folds over the same witnessed digest: the
+// content fold binds it to `field_key` of THIS passport's anchored root, the
+// set fold proves it is a leaf of the public set tree (canonical off-chain
+// rule: digest, dedupe, sort ascending, pad). The digest travels only as a
+// witness.
 export circuit proveFieldMembership(
   payload_hash: Bytes<32>,
   field_key:    Bytes<32>,
@@ -409,14 +712,12 @@ export circuit proveFieldMembership(
   const d = field_digest();
   const sibs = merkle_siblings();
   const dirs = merkle_dirs();
-  // Content fold: the hidden digest is field_key's value in THIS passport.
-  const n0 = bytesLeafHash(field_key, d);
+  const n0 = bytesLeafHash(field_key, d, field_salt());
   const n1 = merkleStep(n0, sibs[0], dirs[0]);
   const n2 = merkleStep(n1, sibs[1], dirs[1]);
   const n3 = merkleStep(n2, sibs[2], dirs[2]);
   const root = merkleStep(n3, sibs[3], dirs[3]);
   assert(root == content_roots.lookup(disclose(payload_hash)), "field not in passport");
-  // Set fold: the same hidden digest is a member of the public allow-list.
   const ssibs = set_siblings();
   const sdirs = set_dirs();
   const s0 = setLeafHash(d);
@@ -430,7 +731,164 @@ export circuit proveFieldMembership(
   const claimKey = persistentHash<FieldMembershipClaim>(FieldMembershipClaim {
     payload_hash: payload_hash,
     field_key:    field_key,
-    set_root:     set_root
+    set_root:     set_root,
+    epoch:        attestationEpoch(payload_hash)
   });
   field_membership_results.insert(disclose(claimKey), true);
+}
+
+// ONE mode-switched circuit for both cross-root claims. `mode` 0 proves B
+// differs from A ONLY in the slots flagged by `allowed_mask` (`k` ignored);
+// `mode` 1 proves at least `k` of the 16 aligned slots differ (`allowed_mask`
+// ignored). Values stay hidden in both; the recorded claim matches the mode,
+// so verifiers are untouched by the merge.
+//
+// One circuit instead of two because every exported circuit adds a 2119-byte
+// verifier key to the deploy transaction, against the node's 32 KiB cap on
+// written bytes (empirically bisected: a 13-circuit vault deploy wrote 33,361
+// bytes and was rejected, 31,781 was accepted).
+//
+// Both modes share one witness layer and one root-recompute pass per
+// document, executed before the mode branch. The schema root is recomputed
+// from the SHARED descriptor list and asserted against BOTH anchors, so
+// schema parity is structural AND the anchored schema id is proven to
+// describe the trees. A counted or blocked difference is a value change or a
+// field that appeared or disappeared; empty-vs-empty compares equal.
+export circuit proveDocumentComparison(
+  payload_hash_a: Bytes<32>,
+  payload_hash_b: Bytes<32>,
+  mode:           Uint<8>,
+  allowed_mask:   Vector<16, Boolean>,
+  k:              Uint<8>
+): [] {
+  // The mode selects which claim map is written, so disclose it before
+  // branching.
+  const m = disclose(mode);
+  assert(m <= 1, "mode out of range");
+  // The inactive mode's argument must ride as its fixed neutral dummy, so a
+  // transaction's public args never suggest a statement the circuit did not
+  // check. Neither dummy enters its mode's claim key.
+  if (m == 0) {
+    assert(k == 1, "k must be the neutral dummy in integrity mode");
+  } else {
+    assert(!(allowed_mask[0]  || allowed_mask[1]  || allowed_mask[2]  || allowed_mask[3]
+          || allowed_mask[4]  || allowed_mask[5]  || allowed_mask[6]  || allowed_mask[7]
+          || allowed_mask[8]  || allowed_mask[9]  || allowed_mask[10] || allowed_mask[11]
+          || allowed_mask[12] || allowed_mask[13] || allowed_mask[14] || allowed_mask[15]),
+           "mask must be the neutral dummy in diff mode");
+  }
+  // In-circuit, not just server-side: no trivially-true claim of a document
+  // against itself.
+  assert(!(payload_hash_a == payload_hash_b), "documents must differ");
+  assert(content_roots.member(disclose(payload_hash_a)), "no content root A");
+  assert(content_roots.member(disclose(payload_hash_b)), "no content root B");
+  const ds = doc_schema();
+  const oa = doc_slots_a();
+  const ob = doc_slots_b();
+  // Canonical-schema guard BEFORE any root math (see assertCanonicalSlot).
+  assertCanonicalSlot(ds[0],  oa[0],  ob[0]);
+  assertCanonicalSlot(ds[1],  oa[1],  ob[1]);
+  assertCanonicalSlot(ds[2],  oa[2],  ob[2]);
+  assertCanonicalSlot(ds[3],  oa[3],  ob[3]);
+  assertCanonicalSlot(ds[4],  oa[4],  ob[4]);
+  assertCanonicalSlot(ds[5],  oa[5],  ob[5]);
+  assertCanonicalSlot(ds[6],  oa[6],  ob[6]);
+  assertCanonicalSlot(ds[7],  oa[7],  ob[7]);
+  assertCanonicalSlot(ds[8],  oa[8],  ob[8]);
+  assertCanonicalSlot(ds[9],  oa[9],  ob[9]);
+  assertCanonicalSlot(ds[10], oa[10], ob[10]);
+  assertCanonicalSlot(ds[11], oa[11], ob[11]);
+  assertCanonicalSlot(ds[12], oa[12], ob[12]);
+  assertCanonicalSlot(ds[13], oa[13], ob[13]);
+  assertCanonicalSlot(ds[14], oa[14], ob[14]);
+  assertCanonicalSlot(ds[15], oa[15], ob[15]);
+  // ONE witnessed descriptor list must fold to BOTH anchored schema ids:
+  // parity is structural, and a mislabeled anchor fails here because the real
+  // descriptors cannot fold to it.
+  const schemaRoot = schemaRootOf(ds);
+  assert(schemaRoot == content_schemas.lookup(disclose(payload_hash_a)),
+         "doc A schema mismatch");
+  assert(schemaRoot == content_schemas.lookup(disclose(payload_hash_b)),
+         "doc B schema mismatch");
+  // Each document's witnessed opening and salt seed must recompute its
+  // anchored root under the shared schema.
+  assert(contentRootOf(ds, oa, doc_salt_a())
+           == content_roots.lookup(disclose(payload_hash_a)),
+         "doc A opening does not match anchored root");
+  assert(contentRootOf(ds, ob, doc_salt_b())
+           == content_roots.lookup(disclose(payload_hash_b)),
+         "doc B opening does not match anchored root");
+  if (m == 0) {
+    // Non-vacuity (see constrainsSlot): at least one real schema slot must
+    // stay constrained. Subsumes the all-ones mask and masks that free every
+    // non-padding slot of a shorter schema.
+    assert(constrainsSlot(allowed_mask[0],  ds[0])
+        || constrainsSlot(allowed_mask[1],  ds[1])
+        || constrainsSlot(allowed_mask[2],  ds[2])
+        || constrainsSlot(allowed_mask[3],  ds[3])
+        || constrainsSlot(allowed_mask[4],  ds[4])
+        || constrainsSlot(allowed_mask[5],  ds[5])
+        || constrainsSlot(allowed_mask[6],  ds[6])
+        || constrainsSlot(allowed_mask[7],  ds[7])
+        || constrainsSlot(allowed_mask[8],  ds[8])
+        || constrainsSlot(allowed_mask[9],  ds[9])
+        || constrainsSlot(allowed_mask[10], ds[10])
+        || constrainsSlot(allowed_mask[11], ds[11])
+        || constrainsSlot(allowed_mask[12], ds[12])
+        || constrainsSlot(allowed_mask[13], ds[13])
+        || constrainsSlot(allowed_mask[14], ds[14])
+        || constrainsSlot(allowed_mask[15], ds[15]),
+           "mask must constrain at least one schema slot");
+    assertUnchanged(allowed_mask[0],  ds[0],  oa[0],  ob[0]);
+    assertUnchanged(allowed_mask[1],  ds[1],  oa[1],  ob[1]);
+    assertUnchanged(allowed_mask[2],  ds[2],  oa[2],  ob[2]);
+    assertUnchanged(allowed_mask[3],  ds[3],  oa[3],  ob[3]);
+    assertUnchanged(allowed_mask[4],  ds[4],  oa[4],  ob[4]);
+    assertUnchanged(allowed_mask[5],  ds[5],  oa[5],  ob[5]);
+    assertUnchanged(allowed_mask[6],  ds[6],  oa[6],  ob[6]);
+    assertUnchanged(allowed_mask[7],  ds[7],  oa[7],  ob[7]);
+    assertUnchanged(allowed_mask[8],  ds[8],  oa[8],  ob[8]);
+    assertUnchanged(allowed_mask[9],  ds[9],  oa[9],  ob[9]);
+    assertUnchanged(allowed_mask[10], ds[10], oa[10], ob[10]);
+    assertUnchanged(allowed_mask[11], ds[11], oa[11], ob[11]);
+    assertUnchanged(allowed_mask[12], ds[12], oa[12], ob[12]);
+    assertUnchanged(allowed_mask[13], ds[13], oa[13], ob[13]);
+    assertUnchanged(allowed_mask[14], ds[14], oa[14], ob[14]);
+    assertUnchanged(allowed_mask[15], ds[15], oa[15], ob[15]);
+    const integrityKey = persistentHash<DocumentIntegrityClaim>(DocumentIntegrityClaim {
+      payload_hash_a: payload_hash_a,
+      payload_hash_b: payload_hash_b,
+      allowed_mask:   allowed_mask,
+      epoch_a:        attestationEpoch(payload_hash_a),
+      epoch_b:        attestationEpoch(payload_hash_b)
+    });
+    document_integrity_results.insert(disclose(integrityKey), true);
+    return;
+  }
+  assert(k >= 1 && k <= 16, "k out of range");
+  const count = slotDiff(ds[0],  oa[0],  ob[0])
+              + slotDiff(ds[1],  oa[1],  ob[1])
+              + slotDiff(ds[2],  oa[2],  ob[2])
+              + slotDiff(ds[3],  oa[3],  ob[3])
+              + slotDiff(ds[4],  oa[4],  ob[4])
+              + slotDiff(ds[5],  oa[5],  ob[5])
+              + slotDiff(ds[6],  oa[6],  ob[6])
+              + slotDiff(ds[7],  oa[7],  ob[7])
+              + slotDiff(ds[8],  oa[8],  ob[8])
+              + slotDiff(ds[9],  oa[9],  ob[9])
+              + slotDiff(ds[10], oa[10], ob[10])
+              + slotDiff(ds[11], oa[11], ob[11])
+              + slotDiff(ds[12], oa[12], ob[12])
+              + slotDiff(ds[13], oa[13], ob[13])
+              + slotDiff(ds[14], oa[14], ob[14])
+              + slotDiff(ds[15], oa[15], ob[15]);
+  assert(count >= k, "too few differing fields");
+  const diffKey = persistentHash<DocumentDiffClaim>(DocumentDiffClaim {
+    payload_hash_a: payload_hash_a,
+    payload_hash_b: payload_hash_b,
+    k:              k,
+    epoch_a:        attestationEpoch(payload_hash_a),
+    epoch_b:        attestationEpoch(payload_hash_b)
+  });
+  document_diff_results.insert(disclose(diffKey), true);
 }

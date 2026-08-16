@@ -38,8 +38,6 @@ const bytes32 = (fill) => new Uint8Array(32).fill(fill);
 const attesterSecret = bytes32(0x11);
 const witnesses = {
     local_secret_key(ctx) { return [ctx.privateState, attesterSecret]; },
-    attested_value(ctx)   { return [ctx.privateState, 0n]; },
-    value_salt(ctx)       { return [ctx.privateState, bytes32(0) ]; },
     field_value(ctx)      { return [ctx.privateState, 0n]; },
     merkle_siblings(ctx)  { return [ctx.privateState, [bytes32(0), bytes32(0), bytes32(0), bytes32(0)]]; },
     merkle_dirs(ctx)      { return [ctx.privateState, [true, true, true, true]]; }
@@ -124,6 +122,6 @@ ok('revoke: enumeration now empty', enumerateGrants(led2).length === 0);
 
 console.log();
 console.log(failures === 0
-    ? 'SPIKE PASS — ledger() decode + attestation_owners-driven enumeration works; outer disclosures map is not iterable as expected.'
+    ? 'SPIKE PASS - ledger() decode + attestation_owners-driven enumeration works; outer disclosures map is not iterable as expected.'
     : `${failures} failure(s).`);
 process.exit(failures === 0 ? 0 : 1);

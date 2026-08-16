@@ -43,22 +43,55 @@ console.log('[browser-bundle] smoke import of ./src/browser/index.mjs');
 try {
     const mod = await import('../src/browser/index.mjs');
     for (const name of [
-        'deriveAttestationSecret', 'deriveAttestationSecretFromSignature', 'buildAttestationVaultWitnesses',
-        'ATTESTER_SECRET_MESSAGE', 'CONTRACTS',
+        'deriveAttestationSecret', 'generateAttestationSecret', 'sealAttestationSecret',
+        'openAttestationSecret', 'buildAttestationVaultWitnesses', 'CONTRACTS',
         'FetchZkConfigProvider', 'InMemoryPrivateStateProvider', 'createNightgateConnectorProviders',
         'prepareRevokeDisclosure', 'prepareGrantDisclosure', 'prepareAttest'
     ]) {
         if (mod[name] === undefined) fail(`missing export: ${name}`);
     }
+    // The signature-as-secret footgun must STAY removed (0.16.0): a signature
+    // over a fixed public message is shareable evidence, not key material.
+    for (const name of ['deriveAttestationSecretFromSignature', 'ATTESTER_SECRET_MESSAGE']) {
+        if (mod[name] !== undefined) fail(`removed export resurfaced: ${name}`);
+    }
     // Functional smoke: derive a 32-byte secret and build witnesses.
     const secret = mod.deriveAttestationSecret(new Uint8Array(32).fill(7));
     if (!(secret instanceof Uint8Array) || secret.length !== 32) fail('deriveAttestationSecret did not return 32 bytes');
-    const sigSecret = mod.deriveAttestationSecretFromSignature('aa'.repeat(48));
-    if (!(sigSecret instanceof Uint8Array) || sigSecret.length !== 32) fail('deriveAttestationSecretFromSignature did not return 32 bytes');
+    // Random-secret + seal/open roundtrip (WebCrypto AES-GCM).
+    const rndSecret = mod.generateAttestationSecret();
+    if (!(rndSecret instanceof Uint8Array) || rndSecret.length !== 32) fail('generateAttestationSecret did not return 32 bytes');
+    const unlock = new Uint8Array(64).fill(9);
+    const sealed = await mod.sealAttestationSecret(rndSecret, unlock);
+    if (sealed.v !== 1 || !/^[0-9a-f]+$/.test(sealed.cipher)) fail('sealAttestationSecret blob malformed');
+    const reopened = await mod.openAttestationSecret(sealed, unlock);
+    if (Buffer.compare(Buffer.from(reopened), Buffer.from(rndSecret)) !== 0) fail('seal/open roundtrip mismatch');
+    let wrongUnlockThrew = false;
+    try { await mod.openAttestationSecret(sealed, new Uint8Array(64).fill(8)); } catch { wrongUnlockThrew = true; }
+    if (!wrongUnlockThrew) fail('openAttestationSecret accepted wrong unlock material');
     const w = mod.buildAttestationVaultWitnesses({ attestationSecret: secret });
     const [, out] = w.local_secret_key({ privateState: null });
     if (!(out instanceof Uint8Array) || out.length !== 32) fail('local_secret_key witness wrong shape');
     if (!mod.CONTRACTS['attestation-vault']) fail('CONTRACTS missing attestation-vault');
+
+    // Vacuous integrity masks must be rejected CLIENT-SIDE too (the circuit
+    // rejects them in-circuit; the helper gives a clean local error): a mask
+    // freeing every real (non-padding) slot says nothing.
+    const vacSchema = Array.from({ length: 16 }, (_, i) => ({ fieldKey: 'aa'.repeat(32), kind: i < 2 ? 0 : 2, scale: '0' }));
+    const vacOpening = { saltSeed: 'bb'.repeat(32), slots: Array.from({ length: 16 }, () => ({ present: false })) };
+    const vacPair = { schema: vacSchema, openingA: vacOpening, openingB: vacOpening };
+    let vacThrew = false;
+    try {
+        mod.prepareProveFieldsUnchangedExcept({ payloadHashA: 'cc'.repeat(32), payloadHashB: 'dd'.repeat(32), allowedMask: 0b11, docPair: vacPair });
+    } catch (e) { vacThrew = /vacuous/.test(String(e && e.message)); }
+    if (!vacThrew) fail('prepareProveFieldsUnchangedExcept accepted a VACUOUS mask (frees every real slot)');
+    let vacAllOnes = false;
+    try {
+        mod.prepareProveFieldsUnchangedExcept({ payloadHashA: 'cc'.repeat(32), payloadHashB: 'dd'.repeat(32), allowedMask: 0xffff, docPair: vacPair });
+    } catch (e) { vacAllOnes = /vacuous/.test(String(e && e.message)); }
+    if (!vacAllOnes) fail('prepareProveFieldsUnchangedExcept accepted the all-ones mask');
+    const nonVac = mod.prepareProveFieldsUnchangedExcept({ payloadHashA: 'cc'.repeat(32), payloadHashB: 'dd'.repeat(32), allowedMask: 0b10, docPair: vacPair });
+    if (nonVac.circuitId !== 'proveDocumentComparison') fail('prepareProveFieldsUnchangedExcept broken for a non-vacuous mask');
 
     // FetchZkConfigProvider with an injected fetch (no network).
     const fakeFetch = async (url) => ({ ok: true, arrayBuffer: async () => new Uint8Array([1, 2, 3]).buffer });

@@ -17,7 +17,9 @@ services:
       dockerfile: Dockerfile
     # Published by .github/workflows/release.yml on every v* tag; compose
     # pulls this and only builds locally when the image is unavailable.
-    image: ghcr.io/odatano/nightgate:0.14.0
+    # NIGHTGATE_IMAGE_TAG overrides; keep the default in lockstep with
+    # package.json on every release.
+    image: ghcr.io/odatano/nightgate:${NIGHTGATE_IMAGE_TAG:-0.16.0}
     container_name: odatano-nightgate
     ports:
       - "4004:4004"
@@ -180,7 +182,12 @@ services:
     container_name: odatano-night-proof-server
     command: ["midnight-proof-server", "--network", "${NIGHTGATE_PROOF_NETWORK:-preprod}"]
     ports:
-      - "6300:6300"
+      # Loopback-only: the proof server is unauthenticated and proving
+      # requests carry PRIVATE witness data, so it must never listen on a
+      # public interface. Other compose services still reach it via the
+      # compose network (http://proof-server:6300); override the bind address
+      # deliberately if a remote consumer really needs it.
+      - "127.0.0.1:6300:6300"
     volumes:
       - proof-server-data:/data
     restart: unless-stopped
@@ -192,8 +199,12 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "2.0"
-          memory: 4G
+          cpus: "4.0"
+          # 4G got the container OOM-killed (exit 137) under the vault's
+          # larger circuits and 6G held for ~10 MB provers; the 0.16.0
+          # cross-root circuit's prover is 38.5 MB, so give the server
+          # headroom for its constraint system.
+          memory: 12G
         reservations:
           cpus: "0.5"
           memory: 1G

@@ -44,7 +44,7 @@ export function describeBatchSegments(tx: any): string {
  * Only the matched intents' own ids are permuted; unmatched intents keep
  * theirs, so nothing can collide with segments added later (fee/dust
  * balancing). Duplicate circuit names are consumed in map-encounter order,
- * which is NOT guaranteed to be call order — batch distinct circuits when
+ * which is NOT guaranteed to be call order - batch distinct circuits when
  * relative order among same-named calls matters.
  *
  * Returns true when a rewrite happened. On ANY mismatch (missing intent for a

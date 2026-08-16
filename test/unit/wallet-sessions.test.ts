@@ -193,7 +193,7 @@ function createMockRequest(data: Record<string, unknown>, ip: string | null | un
 }
 
 // The project's .env sets NIGHTGATE_NETWORK / NODE_URL for live runs, and
-// VS Code's Jest extension propagates them into the test process. nightgate-
+// an IDE test runner propagates them into the test process. nightgate-
 // config.ts reads env vars BEFORE falling back to the mocked cds.env.requires,
 // so without this scrub the env-var wins and assertions on the resolved
 // network / nodeUrl break.

@@ -587,7 +587,6 @@ export interface WalletSubmitContractCallArgs {
     indexerWsUrl: string;
     proofServerUrl: string;
     networkId: 'preprod' | 'testnet' | 'mainnet' | 'undeployed' | 'devnet' | 'qanet' | 'preview';
-    witnessValues?: { attestedValue: string; valueSalt: string };
     merkleProof?: MerkleProofBundle;
     initialPrivateState?: unknown;
     sponsorSessionId?: string;

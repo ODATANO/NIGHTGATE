@@ -51,7 +51,7 @@ describe('buildProofProvider', () => {
             proving: 'wallet', connector: { getProvingProvider }, zkConfigProvider, proofMod
         });
         expect(res.provingModality).toBe('wallet');
-        // The wallet receives OUR key material provider — i.e. only the contract's circuits.
+        // The wallet receives OUR key material provider - i.e. only the contract's circuits.
         expect(getProvingProvider).toHaveBeenCalledWith({ marker: 'key-material' });
         expect(proofMod.httpClientProofProvider).not.toHaveBeenCalled(); // no server touched at all
 
@@ -62,7 +62,7 @@ describe('buildProofProvider', () => {
         expect(out).toBe('proven-tx');
     });
 
-    it("THROWS for proving:'wallet' against a wallet that cannot prove — never a silent downgrade", async () => {
+    it("THROWS for proving:'wallet' against a wallet that cannot prove - never a silent downgrade", async () => {
         await expect(
             buildProofProvider({
                 proving: 'wallet',

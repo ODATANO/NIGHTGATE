@@ -154,7 +154,7 @@ function coerceOne(raw: unknown, argType: CircuitArgType | undefined, index: num
     throw new CoercionError(
         index,
         'could not determine the circuit parameter type (the contract\'s ' +
-        'contract-info.json was not found — check the registered artifact path). ' +
+        'contract-info.json was not found - check the registered artifact path). ' +
         'Pass a tagged value instead: {"$bytes":"<hex>"} or {"$uint":<n>}.'
     );
 }

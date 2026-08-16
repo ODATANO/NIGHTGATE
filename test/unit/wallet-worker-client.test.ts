@@ -385,7 +385,7 @@ describe('wallet-worker-client', () => {
             // Unreffed MessagePorts created here are tracked so afterEach can
             // close them. An unclosed MessagePort keeps Node's event loop open,
             // and across this describe block that would otherwise leak ~6 ports
-            // and cause Jest's worker pool to force-exit the worker.
+            // and cause the test runner's worker pool to force-exit the worker.
             const trackedPorts: any[] = [];
 
             // worker_threads is mocked above; the RPC plumbing needs the REAL

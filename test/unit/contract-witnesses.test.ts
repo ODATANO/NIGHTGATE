@@ -69,61 +69,6 @@ describe('buildAttestationVaultWitnesses', () => {
     });
 });
 
-describe('buildAttestationVaultWitnesses: predicate witnesses (commitValue/provePredicate)', () => {
-    const secret = new Uint8Array(32).fill(0xab);
-    const SALT_HEX = 'a'.repeat(64);
-
-    test('always exposes attested_value + value_salt (Witnesses<PS> shape is complete)', () => {
-        const w = buildAttestationVaultWitnesses({ attestationSecret: secret });
-        expect(typeof w.attested_value).toBe('function');
-        expect(typeof w.value_salt).toBe('function');
-    });
-
-    test('attested_value returns [privateState, bigint] when witnessValues supplied', () => {
-        const w = buildAttestationVaultWitnesses({
-            attestationSecret: secret,
-            witnessValues: { attestedValue: '47300', valueSalt: SALT_HEX }
-        });
-        const ps = { s: 1 };
-        const [outPs, v] = w.attested_value({ privateState: ps });
-        expect(outPs).toBe(ps);
-        expect(v).toBe(47300n);
-    });
-
-    test('value_salt returns the decoded 32-byte opening', () => {
-        const w = buildAttestationVaultWitnesses({
-            attestationSecret: secret,
-            witnessValues: { attestedValue: '1', valueSalt: SALT_HEX }
-        });
-        const [, salt] = w.value_salt({ privateState: null });
-        expect(salt).toBeInstanceOf(Uint8Array);
-        expect(salt.byteLength).toBe(32);
-        expect(Buffer.from(salt).toString('hex')).toBe(SALT_HEX);
-    });
-
-    test('attested_value / value_salt throw if invoked without witnessValues', () => {
-        const w = buildAttestationVaultWitnesses({ attestationSecret: secret });
-        expect(() => w.attested_value({ privateState: null })).toThrow(/without a per-call value/);
-        expect(() => w.value_salt({ privateState: null })).toThrow(/without a per-call salt/);
-    });
-
-    test('local_secret_key still works alongside predicate witnesses', () => {
-        const w = buildAttestationVaultWitnesses({
-            attestationSecret: secret,
-            witnessValues: { attestedValue: '5', valueSalt: SALT_HEX }
-        });
-        const [, s] = w.local_secret_key({ privateState: null });
-        expect(s).toBe(secret);
-    });
-
-    test('malformed salt fails fast at build time', () => {
-        expect(() => buildAttestationVaultWitnesses({
-            attestationSecret: secret,
-            witnessValues: { attestedValue: '1', valueSalt: 'xyz' }
-        })).toThrow(/64 hex/);
-    });
-});
-
 describe('buildAttestationVaultWitnesses: field-bound proof witnesses (proveFieldPredicate)', () => {
     const secret = new Uint8Array(32).fill(0xab);
     const SIB = ['1', '2', '3', '4'].map((n) => n.repeat(64)); // 4 × 64-hex
@@ -295,6 +240,85 @@ describe('buildAttestationVaultWitnesses: bytes proof witnesses (proveFieldEqual
         holder.current = equality;
         expect(w.merkle_dirs({ privateState: null })[1]).toEqual([false, false, false, true]);
         expect(() => w.set_siblings({ privateState: null })).toThrow(/membership-set path/);
+    });
+});
+
+describe('buildAttestationVaultWitnesses: cross-root docPair witnesses (proveDocumentComparison, v4)', () => {
+    const secret = new Uint8Array(32).fill(0xab);
+    const SCHEMA = [
+        { fieldKey: 'a1'.repeat(32), kind: 0, scale: '1000' },
+        { fieldKey: 'b2'.repeat(32), kind: 1, scale: '0' },
+        ...Array.from({ length: 14 }, () => ({ fieldKey: 'ee'.repeat(32), kind: 2, scale: '0' }))
+    ];
+    const OPENING_A = {
+        saltSeed: '11'.repeat(32),
+        slots: [
+            { present: true, value: '47300' },
+            { present: true, valueDigest: 'cd'.repeat(32) },
+            ...Array.from({ length: 14 }, () => ({ present: false }))
+        ]
+    };
+    const OPENING_B = {
+        saltSeed: '22'.repeat(32),
+        slots: [
+            { present: true, value: '99000' },
+            { present: false },
+            ...Array.from({ length: 14 }, () => ({ present: false }))
+        ]
+    };
+    const PAIR = { docPair: { schema: SCHEMA, openingA: OPENING_A, openingB: OPENING_B } };
+
+    test('always exposes the five doc witnesses (Witnesses<PS> shape complete)', () => {
+        const w = buildAttestationVaultWitnesses({ attestationSecret: secret });
+        for (const name of ['doc_schema', 'doc_salt_a', 'doc_salt_b', 'doc_slots_a', 'doc_slots_b']) {
+            expect(typeof w[name]).toBe('function');
+        }
+    });
+
+    test('docPair bundle decodes schema + both openings into runtime shapes, no siblings needed', () => {
+        const w = buildAttestationVaultWitnesses({ attestationSecret: secret, merkleProof: PAIR });
+        const [, ds] = w.doc_schema({ privateState: null });
+        expect(ds).toHaveLength(16);
+        expect(Buffer.from(ds[0].field_key).toString('hex')).toBe('a1'.repeat(32));
+        expect(ds[0].kind).toBe(0n);
+        expect(ds[0].scale).toBe(1000n);
+        expect(ds[15].kind).toBe(2n);
+        expect(Buffer.from(w.doc_salt_a({ privateState: null })[1]).toString('hex')).toBe('11'.repeat(32));
+        expect(Buffer.from(w.doc_salt_b({ privateState: null })[1]).toString('hex')).toBe('22'.repeat(32));
+        const [, oa] = w.doc_slots_a({ privateState: null });
+        expect(oa[0]).toMatchObject({ present: true, uint_value: 47300n });
+        expect(Buffer.from(oa[1].value_digest).toString('hex')).toBe('cd'.repeat(32));
+        const [, ob] = w.doc_slots_b({ privateState: null });
+        expect(ob[1].present).toBe(false);
+        // Absent slots carry well-typed neutral members.
+        expect(ob[15]).toMatchObject({ present: false, uint_value: 0n });
+        // The single-field witnesses still demand an inclusion path.
+        expect(() => w.merkle_siblings({ privateState: null })).toThrow(/inclusion path/);
+    });
+
+    test('wrong-length or half-supplied bundles fail fast at build time', () => {
+        expect(() => buildAttestationVaultWitnesses({
+            attestationSecret: secret,
+            merkleProof: { docPair: { schema: SCHEMA.slice(0, 15), openingA: OPENING_A, openingB: OPENING_B } }
+        })).toThrow(/exactly 16 entries/);
+        expect(() => buildAttestationVaultWitnesses({
+            attestationSecret: secret,
+            merkleProof: { docPair: { schema: SCHEMA, openingA: OPENING_A } }
+        })).toThrow(/schema, openingA and openingB/);
+        expect(() => buildAttestationVaultWitnesses({
+            attestationSecret: secret,
+            merkleProof: { docPair: {} }
+        })).toThrow(/schema, openingA and openingB/);
+    });
+
+    test('holder mode rebinds docPair bundles per call like every other bundle kind', () => {
+        const holder: { current?: any } = { current: PAIR };
+        const w = buildAttestationVaultWitnesses({ attestationSecret: secret, merkleProofHolder: holder });
+        expect(Buffer.from(w.doc_salt_a({ privateState: null })[1]).toString('hex')).toBe('11'.repeat(32));
+        holder.current = { docPair: { schema: SCHEMA, openingA: OPENING_B, openingB: OPENING_A } };
+        expect(Buffer.from(w.doc_salt_a({ privateState: null })[1]).toString('hex')).toBe('22'.repeat(32));
+        holder.current = { siblings: ['1'.repeat(64), '2'.repeat(64), '3'.repeat(64), '4'.repeat(64)], dirs: [true, false, true, false] };
+        expect(() => w.doc_schema({ privateState: null })).toThrow(/schema/);
     });
 });
 

@@ -1,5 +1,385 @@
 # Changelog
 
+## 0.16.0 - 2026-08-16
+
+Cross-root document diff proofs: the first BINARY vault circuits, relating
+TWO anchored content roots in one proof.
+
+- **Integrity mode** (`issueDocumentIntegrityAttestation`): prove document
+  B differs from document A ONLY in the slots flagged by a public 16-bit
+  `allowedMask` (bit i = slot i may differ), values hidden. The canonical
+  version-integrity claim for re-anchored passports: "v2 changed nothing
+  outside the allowed field set". The proof witnesses the shared schema
+  descriptor list plus both documents' full openings (salt seed + slot
+  values), recomputes both salted content roots in-circuit and asserts
+  value equality outside the mask. A field that changed, appeared or
+  disappeared outside the mask fails the proof.
+- **Distinctness mode** (`issueDocumentDiffAttestation`): prove at least
+  `k` of the 16 aligned slots differ between two anchored documents,
+  without revealing which slots or what values. k=1 is "provably not the
+  same document"; higher k is the distinctness claim (USDA-style "differs
+  at enough loci"). Both modes share one v4 witness model
+  (`schemaJson` + `openingAJson`/`openingBJson`, see below) and compare on
+  VALUE level under the shared schema. Absence policy: both-empty is no
+  difference, present-vs-absent IS a difference, a changed value is a
+  difference, padding slots never count.
+- **Anchors carry a PROVEN schema id** (`anchorContentRoot(payload_hash,
+  content_root, schema_id)`, new `content_schemas` ledger map): the
+  schema id is the depth-4 root over the 16 slot DESCRIPTORS
+  (fieldKey/kind/scale; `prepareDocumentProof` returns it plus the
+  descriptor list as `schema`; `computeSchemaId` is exported).
+  `proveDocumentComparison` witnesses ONE shared descriptor list,
+  RECOMPUTES the schema root in-circuit and asserts it against BOTH
+  anchors, then recomputes both content roots from the witnessed openings
+  under that schema. Schema parity is therefore structural AND the
+  anchored label is proven to describe the trees: an attester who anchors
+  document B under document A's schema id while B's tree was built over a
+  different field list cannot run the comparison (adversarial repro pinned
+  in `integration:attestation-vault`). All anchoring actions take a
+  `schemaId` param (required whenever a contentRoot is supplied), and
+  `verifyAttestationState` gains a `schemaId` param + `schemaOk` result so
+  verifiers can check the anchored schema (and `attesterId`) crawler-free.
+- **Salted leaves** (v4 leaf rule): every content-tree leaf (uint, bytes
+  AND absent slots) carries a per-slot salt derived from a per-document
+  32-byte seed (`slotSalt` pure circuit; `prepareDocumentProof` generates
+  the seed, accepts `saltSeed` for deterministic re-prepare, and returns
+  the full `opening` bundle plus a per-field `salt`). Shared leaf hashes
+  are no longer dictionary-testable and do not reveal the presence
+  pattern. CONSUMER: the opening (seed) is the document's commitment
+  material, STORE it; the single-field proof actions now REQUIRE
+  `fieldSalt` (batch claims: `salt`), and the cross-root actions take
+  `schemaJson`/`openingAJson`/`openingBJson` instead of leaf layers. The
+  equality proof's public digest statement is unchanged (the digest is the
+  statement), but running it now needs the slot salt.
+- **Anchoring is insert-once-or-identical**: re-anchoring an
+  already-anchored payload with a different root or schema id is rejected
+  in-circuit ("content root already anchored" / "schema already
+  anchored"); an identical re-anchor stays a no-op. Previously the owner
+  could silently overwrite an anchored root, invalidating every claim
+  proven against it. Also in-circuit: a document cannot be compared with
+  itself (`payload_hash_a != payload_hash_b` asserted; previously
+  server-side only).
+- Both modes run through ONE mode-switched circuit,
+  `proveDocumentComparison(a, b, mode, allowedMask, k)` (mode 0 =
+  integrity, mode 1 = diff; the inactive statement rides as a neutral
+  dummy). One circuit instead of two because every exported circuit adds a
+  2119-byte verifier key to the DEPLOY transaction, and the node caps a
+  transaction's written bytes at 32 KiB: the 13-circuit vault deploy wrote
+  33,361 bytes and was rejected as `1010: Invalid Transaction: Transaction
+  would exhaust the block limits` (empirically bisected on preprod;
+  31,781-byte deploys are accepted). The 12-circuit merged vault writes
+  ~31.2 KiB. The claim structs, claim keys and result maps are unchanged,
+  so verifiers see no difference.
+- Both claim kinds are batchable via `issueFieldPredicateAttestationBatch`
+  (`predicate: 'documentIntegrity'` / `'documentDiff'` entries carry
+  `payloadHashB` plus `schema`/`openingA`/`openingB`; document A is the
+  batch payloadHash), verifiable crawler-free via `verifyPredicateState`
+  (new `payloadHashB` / `allowedMask` / `k` params) and
+  `verifyPredicateAttestation`, and grantable to agents.
+- Slot alignment is positional: both documents MUST be prepared with the
+  SAME ordered proofFields list. (A, B) order is part of the claim key;
+  verify with the proving order.
+- **Tree hashing moved to transient hashes**: every in-circuit tree hash
+  (`leafHash`, `nodeHash`, `bytesLeafHash`, `setLeafHash`) is now
+  `upgradeFromTransient(transientHash<...>(...))` instead of
+  `persistentHash`. In-circuit SHA-256 costs ~2.7 MB of prover key PER
+  INSTANCE; the algebraic transient hash costs ~0.13 MB once and is
+  near-free per additional instance (measured with compiled probe
+  contracts). Claim keys stay `persistentHash` (claims ARE stored state
+  identity), so all recorded claim keys and the crawler-free recomputes
+  are unchanged. CAVEAT per the Compact docs: `transientHash` is "not
+  guaranteed to persist between [Compact] upgrades", so a future compactc
+  upgrade that changes the transient hash changes every content/set root;
+  that already implies the redeploy-and-re-anchor procedure the vault has
+  for any leaf-rule change, and anchors are cheap to re-issue. Prover
+  sizes: `proveDocumentComparison` drops 290.4 MB -> 38.5 MB (still the
+  vault's largest; the in-circuit salted-root recompute over three leaf
+  families costs more than bare leaf folding, and stays in the
+  wasm-proven 0.15.0 size class), the whole vault ~76 MB. That removes
+  the 0.16.0-rc wasm limit: ALL circuits, cross-root included, prove in
+  in-process wasm mode again, no proof server required; the compose
+  proof-server memory limit is raised to 12G for the 38.5 MB circuit (4G
+  containers were OOM-killed under far smaller ones).
+- CONSUMER: vault REDEPLOY required (new verifier-key set, empty ledger,
+  re-anchor, same procedure as 0.15.0; bundle the two). The
+  `PredicateAttestations` table gains `payloadHashB` + `allowedMask`
+  columns (cds deploy or schema delta). BREAKING for external content-root
+  builders (NIGHTPASS passport-anchor.ts): the leaf/node rule is now the
+  contract's transient hash, so roots MUST be computed via the artifact's
+  pure circuits (as `srv/submission/document-proof.ts` does) rather than
+  reimplemented with a generic hash library; additionally the padding-slot
+  key changed from a blake2b digest to
+  `pad(32, "nightgate/empty-leaf/v2")` (a Compact literal cannot express
+  an arbitrary digest; the constant lives in the contract as the
+  `emptyLeafKey()` pure circuit and byte-parity is pinned by tests).
+- **Vault constructor now takes the registrar as a PUBLIC argument**
+  (`constructor(initial_registrar: Bytes<32>)`), replacing the
+  witness-derived `disclose(caller_id())`: shrinking the deploy was the
+  first response to the 32 KiB write cap, and the arg constructor is kept
+  because it is lighter and strictly more flexible. NIGHTGATE's worker
+  injects the deploy session's attester id automatically (`persistentHash`
+  over the same secret the `local_secret_key()` witness serves), so
+  "registrar = deploy session" semantics are unchanged; external deployers
+  must now pass the argument and MAY point the registrar at a different
+  identity. Deploy-time attester-id parity with the in-circuit
+  `caller_id()` is pinned in `integration:attestation-vault`.
+- The 32 KiB per-transaction write cap is documented for the Midnight team
+  with the full probe matrix; the node's error string does not name the
+  overflowing dimension, and the worker now logs every transaction's
+  serialized size and ledger cost (`Transaction.cost`) before submit so
+  future cap hits are diagnosable from the field.
+- **schemaId binds the full slot interpretation** (soundness fix): the
+  schema descriptors carry `kind` and `scale`, not just the field keys.
+  Without them, x=1 at scale 1000 and x=1000 at scale 1 produce the SAME
+  leaf value and previously the same schema id, so a mask-0 integrity
+  proof could claim "unchanged" across a 1000x reinterpretation; now the
+  two anchor different schema ids and the in-circuit schema recompute
+  rejects the comparison. Tree-hash generation binding: schema root and
+  content roots are computed by the SAME artifact hash, so a compactc
+  generation change (redeploy) can never mix root generations.
+- **BREAKING: the commitment-only predicate lane is removed**
+  (`issuePredicateAttestation` action, `commitValue`/`provePredicate`
+  circuits, `value_commitments`/`predicate_results` ledger maps, the
+  `attested_value`/`value_salt` witnesses and the browser `WitnessValues`
+  surface). Root cause: `commitValue` overwrote the stored commitment
+  while `PredicateClaim` did not embed it, so replacing the commitment
+  (which every new issue call did, with a fresh salt) left all previously
+  recorded claims verifiable against an opening that no longer matched.
+  Only immutable, root-bound field claims remain; numeric claims now
+  REQUIRE `fieldKey` in `verifyPredicateState`, the unverified
+  `valueCommitment` passthrough parameter/column is gone (the PAC
+  envelope's `digestMultibase` is now null and its `proof.circuit` is
+  derived from the predicate kind), and the vault drops two verifier keys
+  (~4.2 KB deploy budget) plus ~5.6 MB of prover keys.
+- **In-circuit range guards** for direct contract callers:
+  `proveFieldPredicate` asserts `op <= 1` (any other value used to
+  silently select greaterOrEqual), `grantDisclosure` asserts `level <= 2`,
+  and `proveDocumentComparison` pins the INACTIVE mode's argument to its
+  neutral dummy (integrity: k == 1; diff: all-false mask), so a
+  transaction's public args never suggest a statement the circuit did not
+  check.
+- Handler hardening: `value`/`threshold` are bounded to Uint<64> up-front,
+  and raw membership allow-lists are capped at 1024 entries before
+  hashing (64 distinct values as before; `prepareMembershipSet` enforces
+  the same raw cap).
+- **Vacuous integrity masks are rejected IN-CIRCUIT** (soundness fix): a
+  mask that frees every REAL (non-padding) schema slot says nothing
+  ("everything may differ"), and a server-side 400 alone left direct
+  wallet callers able to record that claim on-chain.
+  `proveDocumentComparison` mode 0 now asserts at least one constrained
+  real slot ("mask must constrain at least one schema slot"), which
+  subsumes the all-ones mask AND masks freeing every real slot of a
+  shorter schema. Server (single action + batch) and the browser helper
+  reject the same class schema-aware with a clean error; real-artifact
+  negatives (all-ones and 4-field-schema 0b1111) and browser negatives
+  are pinned.
+- **Canonical-slot guard** (soundness fix, in-circuit): the witnessed
+  schema descriptors are range-checked BEFORE any root math. An
+  out-of-range `kind` used to land on the absent leaf in `slotLeaf` but
+  compare as a bytes field in `slotDiff`, so two all-absent roots could
+  prove a fabricated k=1 diff. `proveDocumentComparison` now asserts
+  `kind <= 2` for all 16 slots, `scale == 0` for non-uint slots, and the
+  canonical empty key + absent openings for padding slots (adversarial
+  repro for kind 3 and 255 pinned in `integration:attestation-vault`;
+  ~2 KB prover-size cost).
+- **Holder/attester privilege separation (browser)**: the proof circuits
+  never invoke `local_secret_key`, so the browser proof helpers
+  (`prepareProveFieldPredicate`/`Equality`/`Membership`, both cross-root
+  helpers) no longer require `attestationSecret`, and
+  `buildAttestationVaultWitnesses` accepts a secret-less witness set (the
+  witness throws only if an owner-gated circuit actually resolves it).
+  `CONTRACTS['attestation-vault'].attesterGated` drops the proof circuits
+  accordingly. A holder proving against an anchored root never receives
+  the owner secret.
+- **Document evidence binding**: `Documents` rows persist `userId`,
+  `contractAddress` and `network` at anchor time. `verifyDocument` treats
+  the RECORDED anchoring vault as authoritative: a caller-supplied
+  `contractAddress` may only confirm it (mismatch = 400), so a different
+  vault attesting the same public hash can no longer make a document
+  appear verified. Rows from earlier releases carry nulls and keep the
+  caller-supplied behavior.
+- **Owner-scoped reads for `Documents` and `GranteeIdentities`**
+  (previously readable by every authenticated user, exposing `storageRef`
+  paths, not-yet-public hashes and userId->grantee bindings): non-admin
+  reads are filtered to the requesting user, like `WalletSessions`.
+  Cross-user verification stays possible via `verifyDocument` (the
+  documentId is an unguessable capability handle; the response carries no
+  `storageRef`). `getJobStatus` ownership is now FAIL-CLOSED: the job's
+  recorded `requestedBy` must match the caller (admins exempt); a
+  missing/closed session row no longer opens the job up.
+- Ops/delivery hardening: startup schema preflight probes the release's
+  NEW COLUMNS (`Documents.userId/contractAddress/network`,
+  `PredicateAttestations.payloadHashB/allowedMask`), so a previous-release
+  database fails at boot with the migration hint instead of at the first
+  action; `apply-schema-delta.mjs` takes the db path as argument /
+  `NIGHTGATE_DB_PATH` (Docker's `/data/nightgate.db`) instead of
+  hardcoding `db/midnight.db`; the compose image tag follows the release
+  (`NIGHTGATE_IMAGE_TAG` override); `/zk-config` responses drop
+  `immutable` for `no-cache` + content-hash ETag revalidation (the URL is
+  not content-addressed, and a redeploy must not leave browsers on
+  year-old keys); `@midnight-ntwrk/compact-runtime` is pinned EXACTLY to
+  0.16.0 (`transientHash` is not guaranteed stable across runtime
+  upgrades and published roots depend on it); an explicitly configured
+  invalid `NIGHTGATE_NETWORK` now REFUSES to start instead of silently
+  falling back to preprod; the compose proof-server binds to
+  127.0.0.1 only (unauthenticated, proving requests carry private
+  witness data); `SyncState.nodeUrl`, `getStatus` and startup logging
+  strip URL-embedded credentials; `getReadiness` treats a deliberately
+  disabled crawler as not-applicable (new `crawlerEnabled` result field)
+  instead of reporting a healthy submission-only deployment as
+  `ready: false`; agent grants can allowlist
+  `issueFieldEqualityAttestation`/`issueFieldMembershipAttestation`
+  (batch parity).
+- **Guarded attest: commit-reveal with front-run takeover** (new
+  `attestGuarded` circuit, the vault's 11th; 23.3 KB of verifier keys
+  total, deploy stays well under the 32 KiB write cap; its prover is
+  5.2 MB). Plain `attest` is first-come-first-served AND insert-once, so a
+  mempool observer could permanently claim a visible payload hash. The
+  guarded path commits an opaque commitment
+  (persistentHash{payload, metadataHash, nonce}) first and reveals later;
+  SEQUENCING makes it effective although plain attest keeps existing:
+  every attestation records its creation sequence
+  (`attestation_seqs`/`attest_seq_next` ledger state, plain attest
+  records it too), and a reveal whose commitment PREDATES the current
+  attestation takes it over in-circuit (the sniper cannot forge an older
+  commitment without the nonce; a NEWER commitment cannot re-take, no
+  ping-pong). A takeover erases EVERY effect of the sniper's ownership
+  window: the sniper-anchored content root + schema are removed, the
+  payload's disclosure grants are removed, and claim results recorded
+  during that window stop verifying, because ALL FIVE claim keys now
+  embed the payload's **attestation epoch** (`attestation_seqs`; cross-root
+  claims embed both documents' epochs) and the takeover moves it, while
+  the crawler-free readers always recompute claim keys with the CURRENT
+  epoch from ledger state (a claim under a stale epoch misses the map by
+  construction; sequence values are unique, so a stale epoch never
+  recurs). Commitments are CONSUMED on every successful reveal
+  (one-shot): without that, replaying an already-successful reveal would
+  satisfy the takeover comparison against the revealer's OWN attestation
+  and delete a meanwhile-anchored root, bypassing insert-once. Server
+  surface: `prepareAnchorCommitment` (compute-only; returns commitment +
+  SECRET nonce), `commitDocumentAnchor` (async commit), and
+  `anchorDocument` gains an optional `nonce` param (reveal). Browser:
+  `prepareAttestCommit`/`prepareAttestReveal`. Off-chain commitment
+  recompute (`computeAttestCommitment`) is byte-identical to the circuit;
+  pinned in `integration:attestation-vault`: the full sniper scenario
+  (attest + anchor + claim + self-grant, then takeover with root/grant
+  removal and the claim dead under the current epoch) AND the
+  reveal-replay repro (rejected, anchored root survives). BREAKING for
+  claim-key recomputes: `computeFieldPredicate/Equality/MembershipClaimKey`
+  take an `epoch`, the cross-root computers take `epochA`/`epochB`;
+  `verifyPredicateState`/`verifyPredicateAttestation` read the epoch from
+  the same state query automatically. Commit-reveal protects payload
+  hashes that are secret until reveal; for publicly known identifiers
+  registrar pre-assignment (`registerPassport`) remains the answer.
+- **BREAKING (browser): the signature-derived attester secret is
+  REMOVED** (`deriveAttestationSecretFromSignature`,
+  `ATTESTER_SECRET_MESSAGE`). A signature over a fixed public message is
+  shareable authentication evidence, not key material: any dApp that got
+  the user to sign the same message derived the SAME attester identity
+  and could run every owner-gated circuit as it. Replacement flow:
+  `generateAttestationSecret()` (random 32 bytes) +
+  `sealAttestationSecret`/`openAttestationSecret` (WebCrypto AES-256-GCM
+  under an HKDF-derived key; the unlock material MAY be a wallet
+  signature because it only decrypts a ciphertext held in the dApp's own
+  origin storage, it is not the secret). The browser bundle check pins
+  the removal so the footgun cannot resurface.
+- **Network/database binding, fail-closed**: an existing `SyncState` row
+  from ANOTHER network now refuses the boot (central in `initialize()`,
+  so submission-only deployments are covered too, not only the crawler
+  path); the error demands a separate database per network. A legacy row
+  WITHOUT a recorded network is no bypass either: a demonstrably empty
+  index (no blocks) is bound to the configured network in place, a
+  populated one refuses to start unless the operator confirms the
+  binding once via `NIGHTGATE_ASSUME_DB_NETWORK=<network>`. The same
+  pass backfills credential-redacted `nodeUrl` values persisted by
+  earlier releases, and `MidnightNodeProvider` redacts the node URL in
+  its connect log and connection errors (which feed `lastError`/status).
+  `facadeConfigFromEnv` now THROWS on an invalid configured network, so
+  every submission/job/provider entry point is fail-closed even though
+  the CAP host stays online after a rejected init.
+- **Evidence provenance completed**: `Documents` additionally records
+  `compiledArtifactRef`; `PredicateAttestations` gains `network` +
+  `compiledArtifactRef`. `verifyDocument` and `verifyPredicateAttestation`
+  verify against the RECORDED vault/artifact/network (caller parameters
+  may only confirm the recorded coordinates; the crawler-free state
+  fallback reads the recorded network's indexer instead of the currently
+  configured one). Pre-0.16.0 rows carry nulls and keep the old behavior.
+- **Artifact GENERATIONS are pinned by digest** (the registry name alone
+  is a mutable alias: `registerContract` overwrites, so after an upgrade
+  or re-configuration the same `compiledArtifactRef` can resolve to a
+  different artifact). `getArtifactGenerationDigest` canonically hashes
+  the FULL registration: the Compact-emitted module, the
+  `privateStateId` (for the vault that is an attester identity: the same
+  paths under a different id are a DIFFERENT registration) and every
+  proving-relevant asset (`keys/*.verifier`, `keys/*.prover`, `zkir/*`),
+  each length-prefixed section-labeled; the per-name cache invalidates
+  on register/unregister/clear. `startJob` stamps the digest into every
+  persisted contract command, workflow CHILD commands INHERIT the
+  parent's digest (so an alias re-pointed between workflow steps can
+  never mix generations within one workflow, e.g. anchor from one
+  artifact and proof from another), and both the executor AND the
+  reconciliation finalizer compare fail-closed at run time: a re-pointed
+  alias refuses to execute/finalize, and a digest-less command from an
+  older release refuses too instead of silently running against today's
+  registration (the reviewer's 0.15-deploy-job-executes-0.16 scenario).
+  Evidence rows (`Documents`, `PredicateAttestations`) record the digest
+  as `artifactDigest`, and the crawler-free verify paths return a clean
+  negative when the recorded generation no longer matches what the alias
+  resolves to. Historical generations stay usable by registering them
+  under their own (e.g. versioned) alias. Note the granularity: ANY
+  recompile yields a new generation (the emitted module embeds source line
+  numbers in its assert messages), even when the verifier keys are
+  byte-identical and a deployed vault therefore stays valid. Deliberate and
+  fail-closed: re-issue the action, or re-register the exact artifact,
+  rather than letting a command or an evidence row silently span two
+  builds. The binding is TAMPER-PROOF at
+  the registry seam too: registrations are stored as FROZEN CLONES and
+  `getContractRegistration` returns the readonly snapshot (a caller's
+  retained object is no longer a live handle into the registry), and
+  `resolveContract(name, expectedDigest)` verifies ATOMICALLY: it
+  captures the snapshot once, RECOMPUTES the digest from the files'
+  current bytes (no cache) and imports exactly that snapshot, so neither
+  a concurrent `registerContract` between check and use nor an asset
+  overwritten in place under an unchanged path can swap generations
+  (executor, reconciliation finalizer and both crawler-free verify paths
+  all resolve through this pinned form; race/mutation repros pinned in
+  the registry unit tests and the digest round-trip in
+  `integration:contract-registry`).
+- **Tag releases are gated by CI**: the `v*` release workflow now runs a
+  `check` job (the SAME `check:release` script npm `prepublishOnly` and
+  the test workflow use: lint, typecheck, full suite, real-artifact
+  vault integration, legacy schema-delta migration, browser bundle +
+  types, packed-tarball invariants) and verifies the tag version equals
+  `package.json` BEFORE any registry login; image build/push and the
+  GitHub release depend on that job, so a red gate can no longer publish
+  (previously the test workflow only ran in parallel).
+- **The migration actually ships**: `scripts/apply-schema-delta.mjs` is
+  published (files allowlist) and installed as the `nightgate-schema-delta`
+  bin; it resolves the package root itself, takes the db path as
+  argument/`NIGHTGATE_DB_PATH`, and states its SQLite-only scope
+  (PostgreSQL/HANA migrate via their own deployers). The Compact SOURCE
+  of the shipped artifacts is published too (auditability).
+  `check:exports` asserts both tarball invariants; `prepublishOnly` and
+  CI additionally run the real-artifact `integration:attestation-vault`
+  and the browser bundle check. The SQLite table-rebuild path (NOT NULL
+  relaxations) now snapshots and restores the table's indexes and
+  triggers inside the same transaction (previously DROP TABLE silently
+  discarded operator-added ones), pinned by the new
+  `integration:schema-delta` lane, which migrates a synthetic pre-0.15
+  legacy database and asserts columns, data, index and trigger all
+  survive (runs in CI). The browser type surface matches the runtime:
+  `BuildWitnessesInput.attestationSecret` is optional in the
+  declarations too, and the consumer-mode type check pins a secretless
+  holder build. Sizes with the new circuit: provers 81.0 MB total, npm
+  tarball 86.1 MB.
+- Live lane: `npm run document-diff:e2e`; real-circuit integration proof
+  (positive/negative for both kinds, absence policy, schema-mismatch
+  abort, re-anchor rejections, A-vs-A rejection, op/level/dummy range
+  rejections, empty-leaf parity, byte-exact claim-key parity incl.
+  order-sensitivity) in `integration:attestation-vault`. The
+  `predicate:e2e` lane is removed with its action; `state-verify:e2e`
+  runs the field-bound predicate instead.
+
 ## 0.15.3 - 2026-08-14
 
 - `classifySubmissionError` no longer conflates Substrate 1010 ("Invalid
@@ -356,7 +736,7 @@ wallet's own business, so a miss on our side is expected rather than an
 error.
 
 `proving: 'wallet'` THROWS when the connected wallet has no
-`getProvingProvider` — it never silently falls back to a remote proof
+`getProvingProvider` - it never silently falls back to a remote proof
 server, because that would move the preimage somewhere the caller did not
 ask for. `'auto'` is the forgiving variant (wallet when available, else
 server). The assembled modality is returned as `provingModality`
@@ -379,7 +759,7 @@ too.
   references it, so the declaration failed with TS2304 for any consumer.
 - New `npm run check:browser-types` (`scripts/check-browser-types.mjs`)
   typechecks a probe against the browser entry with **skipLibCheck OFF** and
-  package-name resolution — i.e. the way a consumer does. The repo's own
+  package-name resolution - i.e. the way a consumer does. The repo's own
   typecheck has skipLibCheck on and therefore checks no declaration contents
   at all, which is how both bugs above (and the `zk-config` import in
   `providers.d.mts`) stayed invisible here while breaking installs. Wired
@@ -394,16 +774,16 @@ too.
 - **`src/browser/*.d.ts` was never tracked in git.** The `src/**/*.d.ts`
   ignore treats declarations as in-place build output, but src/browser ships
   hand-written `.mjs` with hand-written declarations and has no `.ts` to
-  generate them from — so a fresh clone published
+  generate them from - so a fresh clone published
   `@odatano/nightgate/browser` with NO types at all. The ignore now has a
   negation and `index.d.ts` / `witnesses.d.ts` are tracked. Pre-existing, not
   introduced by this release.
 - `providers.d.mts` describes its zk-config dependency structurally instead of
   importing from the declaration-less `./zk-config.mjs`; the import made the
   file error for any consumer with `skipLibCheck: false` (the repo's own
-  typecheck hides this — only an installed-package typecheck catches it).
+  typecheck hides this - only an installed-package typecheck catches it).
 - New `npm run check:exports` (`scripts/check-package-exports.mjs`) verifies
-  every `exports` target — including every `types` condition — exists on disk
+  every `exports` target - including every `types` condition - exists on disk
   AND is inside the real `npm pack` tarball. Wired into `prepublishOnly`.
   Verified against an actual pack → install → deep-import → consumer-typecheck
   round trip, and confirmed to fail when either half of the fix is reverted.
@@ -716,7 +1096,7 @@ model had hidden the pattern. FR:
   superseded mid-run keeps its terminal `SUPERSEDED` status and its late
   result is discarded quietly (no `RESULT_PERSIST_FAILED` noise). Status
   readers should treat `SUPERSEDED` as expected and follow the successor job.
-  Design limit: this is status hygiene, not cancellation — an already-running
+  Design limit: this is status hygiene, not cancellation - an already-running
   worker wait continues until it resolves on its own (all prewarms of one
   account coalesce on the same facade sync). The sweep joins the handler's
   request tx, so it never requests a second pool connection.
@@ -1282,7 +1662,7 @@ replaces the per-network peer-instance workaround
 The `kind` marker never did anything: NIGHTGATE registers no CAP kind preset,
 and the configured-check always reduced to "is a network selected". Worse, the
 docs' minimal config (`{ "kind": "nightgate" }` alone, "defaults to preprod")
-did NOT actually start the crawler — without a `network` the plugin stays
+did NOT actually start the crawler - without a `network` the plugin stays
 idle by design (never auto-crawl a chain nobody chose). The documented minimal
 consumer config is now the one that works:
 
@@ -1290,7 +1670,7 @@ consumer config is now the one that works:
 "nightgate": { "network": "preprod" }
 ```
 
-Existing configs that still carry `"kind": "nightgate"` keep working — the
+Existing configs that still carry `"kind": "nightgate"` keep working - the
 marker is inert and ignored. `isNightgatePluginConfigured` is simplified to
 exactly that predicate, and the dead `kind`/empty-`kinds` entries are removed
 from the plugin's own package.json.
@@ -1307,8 +1687,8 @@ A coverage review after the migration closed the largest unit-test gaps
 rejection ladders of every token-op/diagnostics action and the TTL-cleanup
 facade eviction (wallet-sessions 77→92%), the parallel catch-up fetch
 pipeline incl. batch de-interleaving (BlockProcessor 70→97%), every
-CoercionError branch (arg-coercion 100%), and — newly possible because
-Vitest imports the ESM SDK — the off-chain claim-key recomputation pinned
+CoercionError branch (arg-coercion 100%), and - newly possible because
+Vitest imports the ESM SDK - the off-chain claim-key recomputation pinned
 byte-exact against the spike-verified encoding with the REAL compact-runtime,
 plus both crawler-free state-reader production wrappers (predicate-state
 32→100%, attestation-state 100%). The wallet worker itself is now driven
@@ -1321,10 +1701,10 @@ OPERATION bodies (transfer/shield/unshield/dust/deploy) intentionally stay
 covered by the live e2e scripts.
 
 A follow-up sweep covered the remaining substantive gaps: the FULL
-issueFieldPredicateAttestation handler (0.4.3's field-bound predicate —
+issueFieldPredicateAttestation handler (0.4.3's field-bound predicate  -
 validation ladder, witness-only value transport, optional content-root
 anchoring), REAL-SDK HD-derivation regression tests pinning the live-verified
-Lace per-role derivation byte-exact (wallet-hd 26→97%, wallet-info 41→100% —
+Lace per-role derivation byte-exact (wallet-hd 26→97%, wallet-info 41→100%  -
 the exact site of the 2026-05 wrong-account bug), the crawler's batch-retry
 policy, MidnightNodeProvider's rpcBatch protocol (order-by-id, batch errors,
 timeouts) and connect/subscription edges, plus rate-limiter capacity/sweep,
@@ -1337,7 +1717,7 @@ warn (wallet-worker 0→51% overall; the remaining half is the SDK
 choreography of the token/deploy op bodies, live-e2e territory).
 
 Coverage attribution fix: cds.test() boots the services from the compiled
-`srv/*.js` via native require, OUTSIDE vitest's module graph — handlers
+`srv/*.js` via native require, OUTSIDE vitest's module graph - handlers
 exercised through the booted server were counted as uncovered on the `.ts`
 sources (jest intercepted every require, so its numbers never showed this).
 The in-place build now emits sourcemaps (`tsconfig.build.json`
@@ -1346,7 +1726,7 @@ and the coverage include also lists `srv/**/*.js`, so the v8 provider remaps
 booted-server execution back onto the `.ts` sources
 (nightgate-service.ts 26→98%, nightgate-indexer-service.ts 64→97%). Overall
 statement coverage lands at 83% (lines 85%); statement/line are the robust
-metrics — the function metric gets noisier through the merged maps.
+metrics - the function metric gets noisier through the merged maps.
 Two behavioral notes for test authors, also recorded in CLAUDE.md: vi.mock
 factories cannot read non-hoisted top-level variables (use `vi.hoisted`), and
 mocks do NOT reach the CAP-booted service (cds.test() loads compiled `srv/*.js`
@@ -1583,13 +1963,13 @@ Live-validated on preprod through prove + balance via Lace; submit is gated only
 
 - **No more orphan optimistic rows**: `grantDisclosure` now reuses an existing `DisclosureGrants` row for the same `(contractAddress, payloadHash, grantee)` (re-affirming `level` and clearing a stale `revokedTxHash`) instead of inserting a duplicate on every retry/re-grant.
 - **Sweep grace window**: the post-submit reindexer no longer deactivates active rows modified within the last 10 minutes (`sweepGraceMs`, injectable). Protects just-submitted grants from being swept when the queried node/indexer view lags the chain; explicit revokes are unaffected (the revoke handler flips its own row directly).
-- **Self-service grantee registration is now gateable**: new `cds.requires.nightgate.allowSelfServiceGranteeRegistration` config (env: `NIGHTGATE_ALLOW_SELF_SERVICE_GRANTEE_REGISTRATION`). Default `true` (shipped 0.3.4 behavior). Set `false` on deployments where identities must come from an operator proofing flow — NIGHTGATE does not verify that a caller *owns* the binding input it registers, so open self-registration allows squatting a grantee id under `wallet`/`did` binding.
+- **Self-service grantee registration is now gateable**: new `cds.requires.nightgate.allowSelfServiceGranteeRegistration` config (env: `NIGHTGATE_ALLOW_SELF_SERVICE_GRANTEE_REGISTRATION`). Default `true` (shipped 0.3.4 behavior). Set `false` on deployments where identities must come from an operator proofing flow - NIGHTGATE does not verify that a caller *owns* the binding input it registers, so open self-registration allows squatting a grantee id under `wallet`/`did` binding.
 - **`contractAddress` normalized to lowercase** at every write/read boundary (grant/revoke handlers, reindexer, on-chain role gate), so mixed-case caller input can no longer split one logical grant across case-variant rows or miss the lookup.
 - **Cleanups**: removed a dead `try/catch` around `Number(level)`; the wallet-worker sync snapshot timeout timer is now cleared (no stray 30 s timers per poll iteration).
 
 ## 0.3.5 - 2026-06-09
 
-### Wallet sync robustness 
+### Wallet sync robustness
 
 - **`getWalletBalance` fix**: read the dust balance from the synced `FacadeState`'s `DustWalletState` (`synced.dust.balance(now)`), not `facade.dust` (a `DustWalletAPI` with no `balance()`). The latter threw `dust.balance is not a function` (HTTP 500).
 - **Genuine-sync gate** (`waitForGenuineSync`): the SDK's `isSynced` flag is unreliable: when the wallet never receives a chain tip, `highestIndex` stays `0` and `isSynced` is trivially true (`appliedIndex >= 0`) while the wallet is 100k+ blocks behind. Balancing then spends dust whose merkle roots have pruned out of the node's ~1h `root_history`, so the node rejects the tx with `Custom error 117` (NotNormalized / empty dust actions). The worker now polls the dust `appliedIndex` against the indexer's **real** tip and refuses to submit with a clear `"wallet N blocks behind"` instead of building a doomed stale-dust tx. Wired into the prewarm sync + `balanceTx`. Known limit: the public preprod endpoints stall the dust catch-up, so a far-behind wallet needs a stable local indexer to reach the tip.
@@ -1632,77 +2012,77 @@ The generic `submitContractCall` action can now pass `Bytes<N>` (and other non-J
 
 ### 2026-05-29: ZK predicate attestations (on-chain-verified)
 
-Extends `AttestationVault` from commitment + disclosure-grant into **proving a predicate** (`value ≤ / ≥ threshold`) over a hidden numeric value, without revealing the value — NIGHTGATE's differentiator for Tractus-X / Battery Passport. Verified live on preprod: `47300 ≤ 50000` accepted on-chain; `51 ≤ 50` rejected by the circuit (`failed assert: predicate false`).
+Extends `AttestationVault` from commitment + disclosure-grant into **proving a predicate** (`value ≤ / ≥ threshold`) over a hidden numeric value, without revealing the value - NIGHTGATE's differentiator for Tractus-X / Battery Passport. Verified live on preprod: `47300 ≤ 50000` accepted on-chain; `51 ≤ 50` rejected by the circuit (`failed assert: predicate false`).
 
 - Compact circuit (`contracts/attestation-vault`): new `commitValue` + `provePredicate` circuits, `value_commitments` / `predicate_results` ledger maps, `attested_value` / `value_salt` witnesses, `persistentCommit`-based numeric commitment. Existing `attest` / `grantDisclosure` / `revokeDisclosure` unchanged; recompiled `managed/` artifacts committed.
-- New OData actions on `NightgateService`: `issuePredicateAttestation` (async job: `commitValue` → `provePredicate`) and `verifyPredicateAttestation` (confirms the proof tx resolves to a SUCCESS result, mirroring `verifyDocument`). New `PredicateAttestations` entity — it never stores the hidden value or salt.
+- New OData actions on `NightgateService`: `issuePredicateAttestation` (async job: `commitValue` → `provePredicate`) and `verifyPredicateAttestation` (confirms the proof tx resolves to a SUCCESS result, mirroring `verifyDocument`). New `PredicateAttestations` entity - it never stores the hidden value or salt.
 - Per-call witnesses thread through `submitter.call` → wallet-worker → `withWitnesses`; the hidden value travels only as a circuit witness, never as a circuit arg.
 - PAC envelope helper `toPredicateEnvelope` (`digestMultibase` / `claim` / `proof`) in `src/sdk/AttestationService.ts` for consumer apps.
-- Verification model: Midnight exposes no standalone off-chain proof verifier, so verification is on-chain/indexer-trust — the ledger only includes the tx if the in-circuit predicate + commitment asserts held. VK-only portable verification is deferred.
+- Verification model: Midnight exposes no standalone off-chain proof verifier, so verification is on-chain/indexer-trust - the ledger only includes the tx if the in-circuit predicate + commitment asserts held. VK-only portable verification is deferred.
 
 ### 2026-05-29: Private-state + sync robustness fixes
 
 Both exposed by the first live deploy→call sequence (T15 was deploy-only; contract calls had only ever been mocked):
 
-- `CapDbPrivateStateProvider` used a **random per-instance salt**, so a contract CALL could not decrypt private state a prior DEPLOY wrote (`Salt mismatch: data was encrypted with a different password/salt`). Now a **deterministic per-(account, password) salt** — cross-instance reads work while keeping the one-PBKDF2-per-instance optimization and the integrity check. Regression test added.
+- `CapDbPrivateStateProvider` used a **random per-instance salt**, so a contract CALL could not decrypt private state a prior DEPLOY wrote (`Salt mismatch: data was encrypted with a different password/salt`). Now a **deterministic per-(account, password) salt** - cross-instance reads work while keeping the one-PBKDF2-per-instance optimization and the integrity check. Regression test added.
 - The `balanceTx` pre-sync `waitForSyncedState()` net (added below) was **unbounded** → a dropped, non-retried indexer subscription hung submissions forever. Now bounded via `NIGHTGATE_BALANCE_SYNC_TIMEOUT_MS` (default 180s); a stalled sync fails cleanly instead of hanging.
 
-### 2026-05-29: T15 — first live preprod contract deploy
+### 2026-05-29: T15 - first live preprod contract deploy
 
 The submission stack exercised end-to-end against preprod for the first time. Three fixes were required to reach green:
 
 - **Per-role HD key derivation** (`srv/utils/wallet-hd.ts`): keys were derived from the raw BIP39 seed → a different Midnight account than Lace (an empty sibling) → `could not balance dust`. Now derives the zswap / dust / night keys from their respective HD roles (account 0, index 0) via `@midnight-ntwrk/wallet-sdk-hd`, matching Lace. `connectWalletForSigning` now takes the BIP39 mnemonic (or 128-hex seed). New deps: `wallet-sdk-hd`, `bip39`, `undici`.
-- **Prewarm now blocks on `waitForSyncedState`** — it previously only kicked off the chain sync, so the deploy balanced against stale (restored) dust and the node rejected the tx with `1010 Invalid Transaction: Custom error: 170` (dust validity window). A safety `waitForSyncedState` was also added to `balanceTx`.
-- **Indexer endpoint guidance**: the wallet reads block timestamps (the dust `ctime`) from the indexer, so the indexer must be at the chain tip — a lagging indexer reproduces the same error 170. `.env.example` updated accordingly. Known caveat: the public preprod indexer's graphql-ws subscription degrades over long multi-call sessions; use a caught-up local indexer for heavy use.
+- **Prewarm now blocks on `waitForSyncedState`** - it previously only kicked off the chain sync, so the deploy balanced against stale (restored) dust and the node rejected the tx with `1010 Invalid Transaction: Custom error: 170` (dust validity window). A safety `waitForSyncedState` was also added to `balanceTx`.
+- **Indexer endpoint guidance**: the wallet reads block timestamps (the dust `ctime`) from the indexer, so the indexer must be at the chain tip - a lagging indexer reproduces the same error 170. `.env.example` updated accordingly. Known caveat: the public preprod indexer's graphql-ws subscription degrades over long multi-call sessions; use a caught-up local indexer for heavy use.
 
 ### 2026-05-20: Async-job migration for long-running actions
 
 All nine long-running OData actions now return `{ jobId, status }` immediately and the caller polls `getJobStatus(jobId, sessionId)`, instead of blocking the HTTP request on multi-minute proof/submit work.
 
-- New `BackgroundJobs` entity + `BackgroundJobStatus` / `BackgroundJobKind` types; new `srv/submission/background-jobs.ts` (per-kind semaphore — heavy=4, light=16 — plus idempotency and crash recovery that flips interrupted rows to `failed:PROCESS_RESTART` on boot).
+- New `BackgroundJobs` entity + `BackgroundJobStatus` / `BackgroundJobKind` types; new `srv/submission/background-jobs.ts` (per-kind semaphore - heavy=4, light=16 - plus idempotency and crash recovery that flips interrupted rows to `failed:PROCESS_RESTART` on boot).
 - New `getJobStatus(jobId, sessionId)` action (declared `action`/POST, so clients poll with the same POST+body pattern as everything else).
 - Migrated: `connectWalletForSigning` (returns `prewarmJobId`), `registerForDustGeneration`, `deregisterFromDustGeneration`, `sendNight`, `shieldFunds`, `unshieldFunds`, `deployContract`, `submitContractCall`, `anchorDocument`.
-- Note: `issuePredicateAttestation` (added later with the ZK predicate-attestation feature) also uses the async-job model — it returns `{ jobId, status }` and is polled via `getJobStatus`, making it the tenth async/pollable action in 0.3.0.
+- Note: `issuePredicateAttestation` (added later with the ZK predicate-attestation feature) also uses the async-job model - it returns `{ jobId, status }` and is polled via `getJobStatus`, making it the tenth async/pollable action in 0.3.0.
 - Auto-deploy removed: `ensureSchemaDeployed` is now probe-only (fail-fast); deploy explicitly with `npm run deploy`.
-- Trip-hazard documented: never hold a CAP transaction open across a worker `await` — `@cap-js/sqlite` pools a single connection, so doing so starves every other query. Work runs via `runWithoutAmbientTx` (clears `cds.context`) with short per-write txs.
+- Trip-hazard documented: never hold a CAP transaction open across a worker `await` - `@cap-js/sqlite` pools a single connection, so doing so starves every other query. Work runs via `runWithoutAmbientTx` (clears `cds.context`) with short per-write txs.
 
 ### 2026-05-20: Attestation / Documents / Disclosure surface (T11–T14)
 
 The published consumer surface that `@odatano/passport` (and other apps) import on top of the plugin.
 
-- **T11** — abstract `AttestationService` CDS mixin (`src/sdk/AttestationService.cds` / `.ts`) with `Public` / `Disclosed` / `Authority` role-tier projections over `Attestations`, wired by `registerAttestationServiceHandlers`. Exported as `@odatano/nightgate/sdk/AttestationService` (+ `.cds`).
-- **T12** — `Documents` entity + `anchorDocument` action: anchors a content hash on-chain via the `attest` circuit. Caller-managed storage by design — NIGHTGATE stores only the `sha256` + a caller-supplied `storageRef` (`file://` / `s3://` / `ipfs://`), never the document bytes.
-- **T13** — `verifyDocument(documentId, providedSha256)`: confirms the hash matches an anchored tx that resolves to a SUCCESS `TransactionResults` row.
-- **T14** — `DisclosureRoles` entity + `DisclosureRole` enum (`public_only` / `legitimate_interest` / `authority`, mapped to EU Battery Regulation Annex XIII tiers), `attachDisclosureRole` request middleware, and an authority-gated admin `grantRole` action.
+- **T11** - abstract `AttestationService` CDS mixin (`src/sdk/AttestationService.cds` / `.ts`) with `Public` / `Disclosed` / `Authority` role-tier projections over `Attestations`, wired by `registerAttestationServiceHandlers`. Exported as `@odatano/nightgate/sdk/AttestationService` (+ `.cds`).
+- **T12** - `Documents` entity + `anchorDocument` action: anchors a content hash on-chain via the `attest` circuit. Caller-managed storage by design - NIGHTGATE stores only the `sha256` + a caller-supplied `storageRef` (`file://` / `s3://` / `ipfs://`), never the document bytes.
+- **T13** - `verifyDocument(documentId, providedSha256)`: confirms the hash matches an anchored tx that resolves to a SUCCESS `TransactionResults` row.
+- **T14** - `DisclosureRoles` entity + `DisclosureRole` enum (`public_only` / `legitimate_interest` / `authority`, mapped to EU Battery Regulation Annex XIII tiers), `attachDisclosureRole` request middleware, and an authority-gated admin `grantRole` action.
 
 ### 2026-05-19: Diagnostics tier
 
 Read-only pre-flight functions complementing the Token-Ops Core write actions. Same worker-thread pattern, but using CDS `function` (GET) since these don't submit transactions.
 
 - New OData functions on `NightgateService`:
-  - `getWalletBalance(sessionId)` — snapshot of shielded NIGHT, unshielded NIGHT, current DUST, registered and total NIGHT UTXO counts. All amounts as decimal strings to preserve bigint precision.
-  - `estimateSendNightFee(sessionId, receiverAddress, amount, ttlIso?)` — pre-flight DUST fee for `sendNight`. Builds the recipe in the worker (no proof generation, no submit) and calls `facade.estimateTransactionFee`.
-  - `estimateShieldFee(sessionId, amount, ttlIso?)` / `estimateUnshieldFee(sessionId, amount, ttlIso?)` — symmetric pre-flight fees for the ledger-shift operations.
+  - `getWalletBalance(sessionId)` - snapshot of shielded NIGHT, unshielded NIGHT, current DUST, registered and total NIGHT UTXO counts. All amounts as decimal strings to preserve bigint precision.
+  - `estimateSendNightFee(sessionId, receiverAddress, amount, ttlIso?)` - pre-flight DUST fee for `sendNight`. Builds the recipe in the worker (no proof generation, no submit) and calls `facade.estimateTransactionFee`.
+  - `estimateShieldFee(sessionId, amount, ttlIso?)` / `estimateUnshieldFee(sessionId, amount, ttlIso?)` - symmetric pre-flight fees for the ledger-shift operations.
 - New worker RPCs: `walletGetBalance`, `walletEstimateTransferFee`, `walletEstimateSwapFee`.
 - Shared `loadSigningSessionAccountId` helper extracts the duplicated session-lookup + viewing-key-decrypt + accountId-derive block. New handlers use it; older handlers retain inlined logic (cleanup opportunity later).
 - Shared `handleSwapEstimate` factored helper removes duplication between shield/unshield estimate handlers.
-- Diagnostics rate limit: 60/min per client IP — generous since these inform UI and should be pollable.
+- Diagnostics rate limit: 60/min per client IP - generous since these inform UI and should be pollable.
 
 ### 2026-05-19: Token-Ops Core
 
 Four new write actions on `NightgateService` covering the basic Midnight wallet operations beyond contract deploy/call. All follow the established one-shot pattern (build + balance + prove + submit in a single worker RPC; primitives back across the thread boundary).
 
-- `sendNight(sessionId, receiverAddress, amount, ttlIso?)` — transfer NIGHT to any address. Destination ledger auto-detected from the Bech32m HRP prefix (`mn_shield-addr_` → shielded, `mn_addr_` → unshielded). Built via `facade.transferTransaction`.
-- `shieldFunds(sessionId, amount, ttlIso?)` — move the wallet's own NIGHT from unshielded → shielded via `facade.initSwap`. Same NIGHT atom amount appears on both sides (1:1 ledger shift, not value swap).
-- `unshieldFunds(sessionId, amount, ttlIso?)` — symmetric counterpart. Useful in practice for making NIGHT available to `registerForDustGeneration` (only unshielded NIGHT can be registered).
-- `deregisterFromDustGeneration(sessionId)` — symmetric pair to existing `registerForDustGeneration`. Removes ALL the wallet's registered NIGHT UTXOs from dust generation, making them spendable again. Per-UTXO narrowing not yet exposed.
+- `sendNight(sessionId, receiverAddress, amount, ttlIso?)` - transfer NIGHT to any address. Destination ledger auto-detected from the Bech32m HRP prefix (`mn_shield-addr_` → shielded, `mn_addr_` → unshielded). Built via `facade.transferTransaction`.
+- `shieldFunds(sessionId, amount, ttlIso?)` - move the wallet's own NIGHT from unshielded → shielded via `facade.initSwap`. Same NIGHT atom amount appears on both sides (1:1 ledger shift, not value swap).
+- `unshieldFunds(sessionId, amount, ttlIso?)` - symmetric counterpart. Useful in practice for making NIGHT available to `registerForDustGeneration` (only unshielded NIGHT can be registered).
+- `deregisterFromDustGeneration(sessionId)` - symmetric pair to existing `registerForDustGeneration`. Removes ALL the wallet's registered NIGHT UTXOs from dust generation, making them spendable again. Per-UTXO narrowing not yet exposed.
 - New `parseReceiverAddress` helper in the worker handles Bech32m prefix detection.
 - `encodeAddressString` extended with TypeScript overloads for `DustAddress` / `ShieldedAddress` / `UnshieldedAddress` (was DustAddress only). The library's invariant `HasCodec<T>` constraint forced this design.
 - New `srv/submission/token-ops.ts` module collects the wrappers for the three transfer/swap actions. The dust deregister wrapper lives alongside the existing register in `dust-registration.ts`.
 - Rate limits: `sendNight` 10/min, `shieldFunds`/`unshieldFunds` 5 per 5 min (heavier ZK work), `deregisterFromDustGeneration` 10/h.
 - Shared validation helpers: `parseNightAmount` (bigint parse + sanity bound at 10^18 atoms), `validateOptionalTtl` (ISO-8601 future timestamp check).
 
-### 2026-05-17: Phase 2b — `deployContract` / `submitContractCall` moved into the worker thread
+### 2026-05-17: Phase 2b - `deployContract` / `submitContractCall` moved into the worker thread
 
 Builds on Phase 1 (wallet SDK isolation) and Phase 2a (dust registration in worker). All contract submission paths now run entirely in the worker; no SDK objects cross the thread boundary.
 
@@ -1716,7 +2096,7 @@ Builds on Phase 1 (wallet SDK isolation) and Phase 2a (dust registration in work
 - Old `TransactionSubmitterDeps` test seams `deployContractImpl` / `findDeployedContractImpl` removed; replaced by `walletDeployContractImpl` / `walletSubmitContractCallImpl` (default to the real worker-client exports).
 - `DeployArgs` / `CallArgs` reshape: `{ contractName, registration: { artifactPath, privateStateId, zkConfigPath }, initialPrivateState, sessionId }`. `sessionId` now required (worker keys facade lookup on the derived accountId, but the audit row preserves the OData user-session UUID).
 - `ResolvedContract` gained `artifactPath: string` field so handlers can forward it without re-doing path resolution.
-- Legacy `level` private-state backend rejected on the worker-routed submission path with a clear error message — the SDK's bundled LevelDB provider doesn't cross thread boundaries.
+- Legacy `level` private-state backend rejected on the worker-routed submission path with a clear error message - the SDK's bundled LevelDB provider doesn't cross thread boundaries.
 - `buildFullProviderBundle` / `buildContractProviders` remain exported from `srv/midnight/providers.ts` for `test/unit/midnight-providers.test.ts` only; no longer the production path.
 
 ### 2026-05-18: Local Midnight indexer container
@@ -1724,8 +2104,8 @@ Builds on Phase 1 (wallet SDK isolation) and Phase 2a (dust registration in work
 The hosted `indexer.preprod.midnight.network` was observed returning 503s. Added a self-hosted alternative.
 
 - New `indexer` service in `docker/docker-compose.yml`: `midnightntwrk/indexer-standalone:4.3.2`, port 8088, named volume `indexer-data` for SQLite persistence.
-- Container talks to the hosted preprod Substrate RPC by default (`wss://rpc.preprod.midnight.network/`) — we self-host the *flaky* GraphQL layer but keep the *reliable* RPC hosted. Switch to a local node via `INDEXER_UPSTREAM_NODE_URL=ws://node:9944`.
-- New `npm run sync:probe` (`scripts/probe-indexer.mjs`) — verifies the container is up and returning data.
+- Container talks to the hosted preprod Substrate RPC by default (`wss://rpc.preprod.midnight.network/`) - we self-host the *flaky* GraphQL layer but keep the *reliable* RPC hosted. Switch to a local node via `INDEXER_UPSTREAM_NODE_URL=ws://node:9944`.
+- New `npm run sync:probe` (`scripts/probe-indexer.mjs`) - verifies the container is up and returning data.
 - NIGHTGATE flips to the local indexer via `NIGHTGATE_INDEXER_HTTP_URL` + `NIGHTGATE_INDEXER_WS_URL` env vars (already plumbed in `srv/utils/nightgate-config.ts:resolveNightgateRuntimeConfig`).
 - Initial container catch-up: ~2-3 blocks/sec observed → ~2-3 days for full preprod sync. Don't flip NIGHTGATE to use it until `caught_up: true` shows in the container logs.
 - Documentation: see [docs/operations.md#local-midnight-indexer](docs/operations.md#local-midnight-indexer-optional).
@@ -1734,7 +2114,7 @@ The hosted `indexer.preprod.midnight.network` was observed returning 503s. Added
 
 Repo-wide audit found 15 sloppiness items (lazy `as any` casts, silent `catch {}` blocks, duck-typed fallback chains, etc.). All fixable findings cleaned up; one (Tier 3 `typeof timer.unref` guard) was reverted after tests showed it was a load-bearing contract, not laziness.
 
-- `srv/utils/nightgate-config.ts:getNightgatePluginConfig()` — new typed accessor for `cds.requires.nightgate`. Consolidates 9 separate `(cds.env as any).requires?.nightgate || {}` callsites into one with a proper `NightgatePluginConfig` interface.
+- `srv/utils/nightgate-config.ts:getNightgatePluginConfig()` - new typed accessor for `cds.requires.nightgate`. Consolidates 9 separate `(cds.env as any).requires?.nightgate || {}` callsites into one with a proper `NightgatePluginConfig` interface.
 - `db` fields on service classes typed as `cds.DatabaseService` (was `any`). 8 sites cleaned.
 - `(this.nodeProvider as any).rpcBatch(...)` → typed `MidnightNodeProvider.rpcBatch()` direct.
 - `(provider as any)[method]` in worker-client → typed switch over the 8 known PrivateStateProvider methods.
@@ -1742,15 +2122,15 @@ Repo-wide audit found 15 sloppiness items (lazy `as any` casts, silent `catch {}
 - `(entry.saveTimer as any).unref?.()` → typed `entry.saveTimer.unref()` (NodeJS.Timeout always has unref).
 - `network as any` casts dropped (narrower union assigns cleanly to wider).
 - Worker `evict()` empty `catch {}` blocks now log via `formatErr()`.
-- New `srv/utils/format-error.ts:formatErr()` — single shared helper for "stringify error for log without producing `[object Object]`". Replaces 5 sites of duplicated `err?.message ?? err` / `err?.message ?? String(err)`.
+- New `srv/utils/format-error.ts:formatErr()` - single shared helper for "stringify error for log without producing `[object Object]`". Replaces 5 sites of duplicated `err?.message ?? err` / `err?.message ?? String(err)`.
 - `(cds as any).load` → typed `cds.load() + cds.linked()` (both typed in `@cap-js/cds-types`). Existence guards retained for tests with partial cds mocks.
 - DB query results in `nightgate-indexer-service.ts` typed via small `IdRow` projection interface.
-- Address parse/decode in worker uses proper `MidnightBech32m.parse(s).decode(DustAddress, networkId)` from `@midnight-ntwrk/wallet-sdk-address-format` (the previous code imported from the wrong package — `wallet-sdk-abstractions` — and silently dropped the conversion).
+- Address parse/decode in worker uses proper `MidnightBech32m.parse(s).decode(DustAddress, networkId)` from `@midnight-ntwrk/wallet-sdk-address-format` (the previous code imported from the wrong package - `wallet-sdk-abstractions` - and silently dropped the conversion).
 - Address encode uses proper `MidnightBech32m.encode<T>(networkId, addr).toString()` (was a 5-method-name try/catch fallback chain).
 - Obsolete debug script `scripts/derive-addresses.mjs` deleted.
 - `[deploy-debug]` console.log instrumentation in `srv/submission/handlers.ts` removed.
 
-### 2026-05-17: T30 — wallet state persistence
+### 2026-05-17: T30 - wallet state persistence
 
 - New `WalletSyncStates` entity per accountId, holding serialized shielded / unshielded / dust sub-wallet blobs.
 - Periodic state-save (every 30 s) pushed from the worker thread to the main thread via `state-save` message; persisted via standard CAP `db.run`.
@@ -1759,16 +2139,16 @@ Repo-wide audit found 15 sloppiness items (lazy `as any` casts, silent `catch {}
 - Encryption: each blob encrypted with a per-session storage password derived from the viewing key (PBKDF2 + AES-256-GCM, wire-format compatible with the SDK's LevelDB exports).
 - SDK-version gating on restore: the SDK can refuse blobs from incompatible versions; we record the version with each save.
 
-### 2026-05-17: T30 Phase 1 — wallet SDK in a worker thread
+### 2026-05-17: T30 Phase 1 - wallet SDK in a worker thread
 
 The Midnight wallet SDK is built on Effect.ts. Its fiber scheduler monopolises the host's microtask queue during sync, freezing CAP request handlers and `db.run` for tens of seconds at a time. Phase 1 isolates the SDK in a `worker_threads` worker.
 
-- New `srv/midnight/wallet-worker.ts` — worker entry holding the `WalletFacade` and the three sub-wallets.
-- New `srv/midnight/wallet-worker-client.ts` — main-thread RPC client. Per-call `MessageChannel`; push events on `parentPort` for state-save + log forwarding.
+- New `srv/midnight/wallet-worker.ts` - worker entry holding the `WalletFacade` and the three sub-wallets.
+- New `srv/midnight/wallet-worker-client.ts` - main-thread RPC client. Per-call `MessageChannel`; push events on `parentPort` for state-save + log forwarding.
 - Original synchronous facade-builder rewritten as a thin glue layer that spawns the worker, wires the state-save sink, and returns stub objects to legacy callers (which throw a Phase-2 migration error if used directly).
 - Diagnostic learnings (don't repeat): `_getActiveHandles()` doesn't count WebSocket subscriptions; `progress.appliedIndex` + `progress.highestRelevantWalletIndex` + `progress.isConnected` are the real fields (not `sourceGap` / `applyGap`); the two `RPC-CORE: subscribeRuntimeVersion ... 1000 Normal Closure` logs at sync start are NOT errors.
 
-### 2026-05-17: T30 Phase 2a — dust registration in the worker
+### 2026-05-17: T30 Phase 2a - dust registration in the worker
 
 `facade.registerNightUtxosForDustGeneration` flows wholly through the worker. No SDK objects cross the thread boundary; the worker returns only primitives (`txId`, counts, addresses as strings).
 
@@ -1776,7 +2156,7 @@ The Midnight wallet SDK is built on Effect.ts. Its fiber scheduler monopolises t
 - `srv/submission/dust-registration.ts` is now a thin wrapper around the worker RPC.
 - Tests rewritten to mock the worker-client (411 passing post-Phase-2a).
 
-### Pre-Phase-2 baseline — Server-side submission stack (T1–T10, T29)
+### Pre-Phase-2 baseline - Server-side submission stack (T1–T10, T29)
 
 Tracking T1–T10 (and T29) from `db/enhancements.md`. Code-complete on main as of 2026-05-16; not yet exercised against a live preprod chain (T15).
 

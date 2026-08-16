@@ -1,3 +1,4 @@
+#!/usr/bin/env node
 // Additive schema migration for an EXISTING db/midnight.db.
 //
 // `cds deploy` recreates (drops) all tables: destructive, would wipe the
@@ -10,19 +11,44 @@
 //
 // DDL is taken from `cds compile srv --to sql --dialect sqlite`. Run with the
 // server STOPPED (it holds the DB):  node scripts/apply-schema-delta.mjs
+// (installed package: `npx nightgate-schema-delta`).
+//
+// Target file: first CLI arg > NIGHTGATE_DB_PATH > db/midnight.db. The Docker
+// image sets NIGHTGATE_DB_PATH=/data/nightgate.db, so running this inside the
+// container (or with that env var) migrates the right file.
+//
+// SQLITE ONLY: this tool rewrites a SQLite file in place. PostgreSQL/HANA
+// deployments migrate through their own deployer (`cds deploy` against the
+// managed service / `@cap-js/hana` delta handling), not through this script.
 
 import { execSync } from 'node:child_process';
+import fs from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
 
-const require = createRequire(import.meta.url);
-const Database = require('better-sqlite3');
+// Resolve everything relative to the PACKAGE root (works from a repo checkout
+// AND from an installed node_modules/@odatano/nightgate via the bin alias).
+const packageRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
-const DB_PATH = path.resolve('db/midnight.db');
+const require = createRequire(import.meta.url);
+let Database;
+try {
+    Database = require('better-sqlite3');
+} catch {
+    console.error('[delta] ! better-sqlite3 is not resolvable. It ships with @cap-js/sqlite; install it next to this package: npm i better-sqlite3');
+    process.exit(1);
+}
+
+const DB_PATH = path.resolve(process.argv[2] || process.env.NIGHTGATE_DB_PATH || path.join(packageRoot, 'db/midnight.db'));
+if (!fs.existsSync(DB_PATH)) {
+    console.error(`[delta] ! no database at ${DB_PATH} (pass the path as an argument or set NIGHTGATE_DB_PATH); a fresh install uses \`npm run deploy\` instead.`);
+    process.exit(1);
+}
 console.log(`[delta] target: ${DB_PATH}`);
 
 const ddl = execSync('npx cds compile srv --to sql --dialect sqlite', {
-    encoding: 'utf8', maxBuffer: 64 * 1024 * 1024
+    encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, cwd: packageRoot
 });
 
 // Split into statements on the trailing ");" / semicolon boundaries.
@@ -86,6 +112,14 @@ function rebuildTable(name, createStmt) {
     const have = new Set(db.prepare(`PRAGMA table_info("${name}")`).all().map(r => r.name));
     const shared = parseColumns(createStmt).map(c => c.name).filter(n => have.has(n));
     const colList = shared.map(n => `"${n}"`).join(', ');
+    // DROP TABLE also drops every index and trigger attached to it; snapshot
+    // them from sqlite_master first and recreate them after the rename (same
+    // transaction), so a rebuild never silently loses operator-added indexes
+    // or triggers. Auto-indexes (PK/UNIQUE) carry NULL sql and recreate
+    // themselves with the table.
+    const attached = db.prepare(
+        "SELECT type, name, sql FROM sqlite_master WHERE type IN ('index','trigger') AND tbl_name = ? AND sql IS NOT NULL"
+    ).all(name);
     const tmp = `__delta_new_${name}`;
     const tmpStmt = createStmt.replace(/^CREATE TABLE\s+("?)(\w+)\1/i, `CREATE TABLE "${tmp}"`);
     db.exec(`DROP TABLE IF EXISTS "${tmp}";`);
@@ -93,6 +127,10 @@ function rebuildTable(name, createStmt) {
     db.exec(`INSERT INTO "${tmp}" (${colList}) SELECT ${colList} FROM "${name}";`);
     db.exec(`DROP TABLE "${name}";`);
     db.exec(`ALTER TABLE "${tmp}" RENAME TO "${name}";`);
+    for (const obj of attached) {
+        db.exec(obj.sql + ';');
+        console.log(`[delta] = restored ${obj.type} ${obj.name} on rebuilt ${name}`);
+    }
 }
 
 let restoredViews = 0;

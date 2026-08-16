@@ -34,27 +34,21 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Lint codebase
-        run: npm run lint
-
       - name: Clean generated build artifacts
         run: npm run clean
 
       - name: Build plugin
         run: npm run build
 
-      - name: Type check
-        run: npm run typecheck
-
-      - name: Validate packed npm contents
-        if: matrix.node-version == '22.x'
-        run: npm pack --dry-run
-
-      - name: Run tests with coverage
+      # The SAME gate set npm prepublishOnly and the tag-release workflow
+      # run (lint, typecheck, full suite with coverage, real-artifact vault
+      # integration, legacy schema-delta migration, browser bundle + types,
+      # packed-tarball invariants). One definition, three consumers.
+      - name: Release gates
         env:
           CI: true
           NODE_ENV: test
-        run: npm test
+        run: npm run check:release
 
       - name: Upload coverage artifact
         if: matrix.node-version == '22.x'

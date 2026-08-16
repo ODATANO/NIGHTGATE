@@ -176,7 +176,7 @@ const freshBindCalls = (pid) => {
     const a = await submitBatch(sessionId, vault, 'batch A (fresh bind)', freshBindCalls(pid));
     if (!a.ok) fail('fresh bind failed; vault or wallet unhealthy, aborting');
 
-    step('5. batch B: SAME-OWNER REBIND (same pid, new hash) — the failing shape');
+    step('5. batch B: SAME-OWNER REBIND (same pid, new hash) - the failing shape');
     const b = await submitBatch(sessionId, vault, 'batch B (rebind)', freshBindCalls(pid));
 
     if (!b.ok && process.env.REPRO_SKIP_CONTROLS !== '1') {

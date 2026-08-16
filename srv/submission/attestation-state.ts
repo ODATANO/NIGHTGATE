@@ -6,7 +6,7 @@
  *
  * All lookups are direct member/lookup on flat `Map<Bytes<32>, Bytes<32>>` (no
  * enumeration, unlike the disclosure indexer). Validated in
- * scripts/spike-state-verification.mjs.
+ * scripts/integration-test-attestation-vault.mjs.
  *
  * Decode/read logic is dependency-injected (`ledger`, `queryContractState`) to
  * unit-test without the ESM-only SDK; `readAttestationStateForContract` wires the
@@ -29,6 +29,7 @@ export interface AttestationLedger {
     public_attestations: { member(key: Uint8Array): boolean; lookup(key: Uint8Array): Uint8Array };
     attestation_owners:  { member(key: Uint8Array): boolean; lookup(key: Uint8Array): Uint8Array };
     content_roots:       { member(key: Uint8Array): boolean; lookup(key: Uint8Array): Uint8Array };
+    content_schemas:     { member(key: Uint8Array): boolean; lookup(key: Uint8Array): Uint8Array };
 }
 
 export interface AttestationStateResult {
@@ -36,6 +37,8 @@ export interface AttestationStateResult {
     attested: boolean;
     /** anchored content root equals the supplied `contentRoot` (false when none supplied). */
     contentRootOk: boolean;
+    /** anchored schema id equals the supplied `schemaId` (false when none supplied). */
+    schemaOk: boolean;
     /** owner grantee/attester id (hex) if attested, else ''. */
     attesterId: string;
 }
@@ -46,6 +49,8 @@ export interface ReadAttestationStateDeps {
     payloadHash: string;
     /** optional 64-hex content root to check against the anchored root. */
     contentRoot?: string;
+    /** optional 64-hex schema id to check against the anchored schema. */
+    schemaId?: string;
     /** Decoder from the compiled artifact (`ledger`). */
     ledger: (state: any) => AttestationLedger;
     /** publicDataProvider.queryContractState; returns ContractState | null. */
@@ -77,17 +82,28 @@ export async function readAttestationState(
             === deps.contentRoot.toLowerCase();
     }
 
+    // v4: the anchored schema id names the field panel the tree was built
+    // over. A verifier of cross-party claims checks it against the CANONICAL
+    // schema of the expected panel (plus attesterId against the identity it
+    // trusts); the comparison circuit proves the anchor describes the tree.
+    let schemaOk = false;
+    if (deps.schemaId && led.content_schemas.member(ph)) {
+        schemaOk = hex(led.content_schemas.lookup(ph)).toLowerCase()
+            === deps.schemaId.toLowerCase();
+    }
+
     const attesterId = attested && led.attestation_owners.member(ph)
         ? hex(led.attestation_owners.lookup(ph))
         : '';
 
-    return { attested, contentRootOk, attesterId };
+    return { attested, contentRootOk, schemaOk, attesterId };
 }
 
 export interface ReadAttestationStateForContractArgs {
     contractAddress: string;
     payloadHash: string;
     contentRoot?: string;
+    schemaId?: string;
     /** Path to the compiled contract artifact (`.../contract/index.js`). */
     artifactPath: string;
     /** Config for the contract-only provider bundle (no wallet needed to read). */
@@ -110,6 +126,7 @@ export async function readAttestationStateForContract(
         contractAddress: args.contractAddress,
         payloadHash: args.payloadHash,
         contentRoot: args.contentRoot,
+        schemaId: args.schemaId,
         ledger: artifact.ledger,
         queryContractState: (addr: string) => bundle.publicDataProvider.queryContractState(addr)
     });

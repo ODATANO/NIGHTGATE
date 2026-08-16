@@ -176,6 +176,7 @@ async function waitForServer() {
     if (r.status >= 400) fail(`prepareDocumentProof → ${r.status}: ${pretty(r.body)}`);
     const payloadHash = r.body.payloadHash;
     const contentRoot = r.body.contentRoot;
+    const schemaId = r.body.schemaId;
     const fields = JSON.parse(r.body.fields);
     const pick = (name) => fields.find(f => f.field === name) || fail(`prepared field '${name}' missing`);
     const chem = pick('chemistry');
@@ -200,7 +201,8 @@ async function waitForServer() {
     r = await post('/issueFieldEqualityAttestation', {
         payloadHash, fieldKey: chem.fieldKey,
         expectedValue: 'NMC811',
-        contentRoot,
+        fieldSalt: chem.salt,
+        contentRoot, schemaId,
         siblingsJson: JSON.stringify(chem.siblings),
         dirsJson: JSON.stringify(chem.dirs),
         sessionId, contractAddress
@@ -231,23 +233,23 @@ async function waitForServer() {
     step('9. Mixed batch: numeric + membership + duplicate equality (dropped)');
     const batchClaims = [
         {   // numeric: capacity (120 kWh x1000) >= 100000
-            fieldKey: capacity.fieldKey, value: capacity.value,
+            fieldKey: capacity.fieldKey, value: capacity.value, salt: capacity.salt,
             siblings: capacity.siblings, dirs: capacity.dirs,
             predicate: 'greaterOrEqual', threshold: '100000', unit: 'mkWh'
         },
         {   // membership via the allowedValues lane (server builds root + path)
-            fieldKey: origin.fieldKey, value: 'EEA',
+            fieldKey: origin.fieldKey, value: 'EEA', salt: origin.salt,
             allowedValues: ALLOWED,
             siblings: origin.siblings, dirs: origin.dirs,
             predicate: 'setMembership'
         },
         {   // exact duplicate of the step-6 equality claim: must be dropped
-            fieldKey: chem.fieldKey, expectedDigest: chem.valueDigest,
+            fieldKey: chem.fieldKey, expectedDigest: chem.valueDigest, salt: chem.salt,
             siblings: chem.siblings, dirs: chem.dirs,
             predicate: 'bytesEquality'
         },
         {   // and the SAME equality claim again: proves per-kind dedup
-            fieldKey: chem.fieldKey, expectedValue: 'NMC811',
+            fieldKey: chem.fieldKey, expectedValue: 'NMC811', salt: chem.salt,
             siblings: chem.siblings, dirs: chem.dirs,
             predicate: 'bytesEquality'
         }
@@ -280,6 +282,7 @@ async function waitForServer() {
     step('11. NEGATIVE a: value outside the allow-list → 400, no job');
     r = await post('/issueFieldMembershipAttestation', {
         payloadHash, fieldKey: origin.fieldKey, value: 'US',
+        fieldSalt: origin.salt,
         allowedValuesJson: JSON.stringify(ALLOWED),
         siblingsJson: JSON.stringify(origin.siblings),
         dirsJson: JSON.stringify(origin.dirs),
@@ -293,12 +296,12 @@ async function waitForServer() {
     const otherPath = await post('/prepareMembershipSet', { allowedValuesJson: JSON.stringify(otherList), value: 'CH' });
     if (otherPath.status >= 400) fail(`prepareMembershipSet(other) → ${otherPath.status}`);
     const freshNumeric = {
-        fieldKey: capacity.fieldKey, value: capacity.value,
+        fieldKey: capacity.fieldKey, value: capacity.value, salt: capacity.salt,
         siblings: capacity.siblings, dirs: capacity.dirs,
         predicate: 'greaterOrEqual', threshold: '50000', unit: 'mkWh' // fresh claim key
     };
     const wrongMembership = {
-        fieldKey: origin.fieldKey, valueDigest: origin.valueDigest, // digest('EEA')
+        fieldKey: origin.fieldKey, valueDigest: origin.valueDigest, salt: origin.salt, // digest('EEA')
         setRoot: otherPath.body.setRoot,                            // root over [CH, NO]
         setSiblings: JSON.parse(otherPath.body.setSiblingsJson),    // path of 'CH', not 'EEA'
         setDirs: JSON.parse(otherPath.body.setDirsJson),

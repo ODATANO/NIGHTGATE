@@ -1,6 +1,6 @@
 {
   "name": "@odatano/nightgate",
-  "version": "0.15.3",
+  "version": "0.16.0",
   "description": "CAP Plugin: Midnight Blockchain Indexer with OData V4 API",
   "homepage": "https://github.com/ODATANO/NIGHTGATE#readme",
   "repository": {
@@ -86,10 +86,15 @@
     "@cds-models/**/*.js",
     "@cds-models/**/*.d.ts",
     "contracts/**/managed/**/*",
+    "contracts/**/src/*.compact",
     "contracts/**/package.json",
+    "scripts/apply-schema-delta.mjs",
     "README.md",
     "LICENSE"
   ],
+  "bin": {
+    "nightgate-schema-delta": "scripts/apply-schema-delta.mjs"
+  },
   "scripts": {
     "clean": "node scripts/clean-build-artifacts.js",
     "prestart": "npm run build",
@@ -122,10 +127,12 @@
     "check:browser-types": "node scripts/check-browser-types.mjs",
     "check:job-idempotency": "node scripts/check-job-idempotency.mjs",
     "integration:attestation-vault": "node scripts/integration-test-attestation-vault.mjs",
+    "integration:schema-delta": "node scripts/integration-test-schema-delta.mjs",
     "deploy:e2e": "node --env-file=.env scripts/run-deploy-e2e.mjs",
-    "predicate:e2e": "node --env-file=.env scripts/run-predicate-e2e.mjs",
     "field-predicate-batch:e2e": "node --env-file=.env scripts/run-field-predicate-batch-e2e.mjs",
     "membership:e2e": "node --env-file=.env scripts/run-membership-e2e.mjs",
+    "document-diff:e2e": "node --env-file=.env scripts/run-document-diff-e2e.mjs",
+    "guarded-attest:e2e": "node --env-file=.env scripts/run-guarded-attest-e2e.mjs",
     "dust-wedge:e2e": "node --env-file=.env scripts/run-dust-wedge-e2e.mjs",
     "agent-layer:e2e": "node --env-file=.env scripts/run-agent-layer-e2e.mjs",
     "disclosure:e2e": "node --env-file=.env scripts/run-disclosure-e2e.mjs",
@@ -135,13 +142,14 @@
     "wasm-zswap:e2e": "node --env-file=.env scripts/run-wasm-zswap-e2e.mjs",
     "test:pg-idempotency": "node scripts/test-postgres-idempotency.mjs",
     "lint": "eslint .",
+    "check:release": "npm run lint && npm run typecheck && npm test && npm run integration:attestation-vault && npm run integration:schema-delta && npm run check:browser && npm run check:browser-types && npm run check:exports",
     "prepack": "npm run build:plugin",
-    "prepublishOnly": "npm run typecheck && npm test && npm run check:exports && npm run check:browser-types && npm run build:plugin",
+    "prepublishOnly": "npm run check:release && npm run build:plugin",
     "integration:derive-wallet-info": "node --env-file=.env scripts/integration-test-derive-wallet-info.mjs"
   },
   "dependencies": {
     "@midnight-ntwrk/compact-js": "2.5.0",
-    "@midnight-ntwrk/compact-runtime": "^0.16.0",
+    "@midnight-ntwrk/compact-runtime": "0.16.0",
     "@midnight-ntwrk/ledger-v8": "^8.1.0",
     "@midnight-ntwrk/midnight-js-contracts": "~4.0.4",
     "@midnight-ntwrk/midnight-js-http-client-proof-provider": "~4.0.4",

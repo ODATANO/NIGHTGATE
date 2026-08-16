@@ -11,9 +11,10 @@
 
 export {
     deriveAttestationSecret,
-    deriveAttestationSecretFromSignature,
-    buildAttestationVaultWitnesses,
-    ATTESTER_SECRET_MESSAGE
+    generateAttestationSecret,
+    sealAttestationSecret,
+    openAttestationSecret,
+    buildAttestationVaultWitnesses
 } from './witnesses.mjs';
 
 // Providers + typed call helpers.
@@ -24,12 +25,16 @@ export {
     prepareRevokeDisclosure,
     prepareGrantDisclosure,
     prepareAttest,
+    prepareAttestCommit,
+    prepareAttestReveal,
     prepareRegisterPassport,
     prepareBindPassport,
     prepareAnchorContentRoot,
     prepareProveFieldPredicate,
     prepareProveFieldEquality,
-    prepareProveFieldMembership
+    prepareProveFieldMembership,
+    prepareProveFieldsUnchangedExcept,
+    prepareProveFieldsDiffer
 } from './attestation-vault-calls.mjs';
 
 /**
@@ -41,14 +46,14 @@ export const CONTRACTS = {
     'attestation-vault': {
         name: 'attestation-vault',
         artifactSubpath: '@odatano/nightgate/browser/attestation-vault',
-        circuits: ['attest', 'grantDisclosure', 'revokeDisclosure', 'commitValue', 'provePredicate', 'registerPassport', 'bindPassport', 'anchorContentRoot', 'proveFieldPredicate', 'proveFieldEquality', 'proveFieldMembership'],
+        circuits: ['attest', 'attestGuarded', 'grantDisclosure', 'revokeDisclosure', 'registerPassport', 'bindPassport', 'anchorContentRoot', 'proveFieldPredicate', 'proveFieldEquality', 'proveFieldMembership', 'proveDocumentComparison'],
         // Circuits that need the attester-identity witness (local_secret_key).
-        attesterGated: ['attest', 'grantDisclosure', 'revokeDisclosure', 'commitValue', 'registerPassport', 'bindPassport', 'anchorContentRoot', 'proveFieldPredicate'],
-        // Circuits that need per-call value/salt witnesses.
-        valueWitnessed: ['commitValue', 'provePredicate'],
+        // The proof circuits are NOT in here: holders prove without the secret.
+        attesterGated: ['attest', 'attestGuarded', 'grantDisclosure', 'revokeDisclosure', 'registerPassport', 'bindPassport', 'anchorContentRoot'],
         // Circuits that need the per-call proof bundle witnesses
-        // (proveFieldEquality: path only; proveFieldMembership: digest + set path).
-        merkleWitnessed: ['proveFieldPredicate', 'proveFieldEquality', 'proveFieldMembership'],
+        // (proveFieldEquality: path only; proveFieldMembership: digest + set
+        // path; proveDocumentComparison: docPair leaf layers).
+        merkleWitnessed: ['proveFieldPredicate', 'proveFieldEquality', 'proveFieldMembership', 'proveDocumentComparison'],
         hasPrivateState: false
     }
 };

@@ -72,7 +72,7 @@ function makeTierGate(tier: AttestationTier) {
  * output is consumed unchanged.
  *
  * The proof is not standalone-verifiable with just a
- * VK. `proofValue` is therefore the `provePredicate` transaction hash.
+ * VK. `proofValue` is therefore the proving transaction's hash.
  */
 export interface PredicateAttestationEnvelope {
     digestMultibase: string | null;
@@ -85,16 +85,24 @@ export interface PredicateAttestationEnvelope {
     };
     proof: {
         system: 'midnight-compact';
-        circuit: 'provePredicate';
+        circuit: string;              // proving circuit, derived from the predicate kind
         verificationMethod: string;   // AttestationVault contract address
-        proofValue: string;   // provePredicate tx hash
+        proofValue: string;           // proving tx hash
     };
 }
 
+/** The AttestationVault circuit that proves a given predicate literal. */
+function circuitForPredicate(predicate: string): string {
+    if (predicate === 'bytesEquality') return 'proveFieldEquality';
+    if (predicate === 'setMembership') return 'proveFieldMembership';
+    if (predicate === 'documentIntegrity' || predicate === 'documentDiff') return 'proveDocumentComparison';
+    return 'proveFieldPredicate';
+}
+
 /**
- * Shape a `PredicateAttestations` row (or the `issuePredicateAttestation` job
- * result) into the PAC proof envelope. Pure/synchronous so consumers can call
- * it without any NIGHTGATE service context.
+ * Shape a `PredicateAttestations` row (or an issue* proof-action job result)
+ * into the PAC proof envelope. Pure/synchronous so consumers can call it
+ * without any NIGHTGATE service context.
  */
 export function toPredicateEnvelope(row: {
     predicate: string;
@@ -102,12 +110,11 @@ export function toPredicateEnvelope(row: {
     unit?: string | null;
     expectedDigest?: string | null;
     setRoot?: string | null;
-    valueCommitment?: string | null;
     contractAddress: string;
     provenTxHash?: string | null;
 }): PredicateAttestationEnvelope {
     return {
-        digestMultibase: row.valueCommitment ?? null,
+        digestMultibase: null,
         claim: {
             predicate: row.predicate,
             threshold: row.threshold === null || row.threshold === undefined ? null : String(row.threshold),
@@ -117,7 +124,7 @@ export function toPredicateEnvelope(row: {
         },
         proof: {
             system: 'midnight-compact',
-            circuit: 'provePredicate',
+            circuit: circuitForPredicate(row.predicate),
             verificationMethod: row.contractAddress,
             proofValue: row.provenTxHash ?? ''
         }

@@ -1,4 +1,4 @@
-/** `@odatano/nightgate/browser` — browser entry. See index.mjs. */
+/** `@odatano/nightgate/browser` - browser entry. See index.mjs. */
 
 // Local import as well as the re-export below: `export { … } from` re-exports a name without
 // binding it locally, and `PreparedCall.witnesses` REFERENCES this type further down. The repo's
@@ -8,17 +8,22 @@ import type { AttestationVaultWitnesses } from './witnesses.js';
 
 export {
     deriveAttestationSecret,
-    deriveAttestationSecretFromSignature,
+    generateAttestationSecret,
+    sealAttestationSecret,
+    openAttestationSecret,
     buildAttestationVaultWitnesses,
-    ATTESTER_SECRET_MESSAGE,
-    type WitnessValues,
+    type SealedAttestationSecret,
     type MerkleProof,
+    type SchemaDescriptor,
+    type SlotOpening,
+    type DocumentOpening,
+    type DocPair,
     type MerkleProofHolder,
     type BuildWitnessesInput,
     type AttestationVaultWitnesses
 } from './witnesses.js';
 
-// Phase 4 — providers + typed call helpers.
+// Phase 4 - providers + typed call helpers.
 
 /** Browser ZK-config provider that fetches keys/zkir from `/zk-config/<contract>`. */
 export class FetchZkConfigProvider {
@@ -54,10 +59,10 @@ export class InMemoryPrivateStateProvider {
 
 /**
  * Which proving modality a consumer wants.
- *   'server' — httpClientProofProvider against the connector-reported proof server (default).
- *   'wallet' — delegate contract proving to the wallet's own prover; THROWS when the connected
+ *   'server' - httpClientProofProvider against the connector-reported proof server (default).
+ *   'wallet' - delegate contract proving to the wallet's own prover; THROWS when the connected
  *              wallet has no `getProvingProvider` (never silently downgrades).
- *   'auto'   — wallet when available, else server.
+ *   'auto'   - wallet when available, else server.
  */
 export type ProvingModality = 'server' | 'wallet' | 'auto';
 
@@ -98,18 +103,23 @@ export function buildProofProvider(input: {
 
 export interface PreparedCall {
     circuitId: string;
-    args: Array<Uint8Array | bigint>;
+    /** boolean[] carries the cross-root integrity circuit's Vector<16, Boolean> mask arg. */
+    args: Array<Uint8Array | bigint | boolean[]>;
     witnesses: AttestationVaultWitnesses;
 }
 export function prepareRevokeDisclosure(input: { payloadHash: string; grantee: string; attestationSecret: Uint8Array }): PreparedCall;
 export function prepareGrantDisclosure(input: { payloadHash: string; grantee: string; level: number | bigint; attestationSecret: Uint8Array }): PreparedCall;
 export function prepareAttest(input: { payloadHash: string; metadataHash: string; attestationSecret: Uint8Array }): PreparedCall;
+export function prepareAttestCommit(input: { commitment: string; attestationSecret: Uint8Array }): PreparedCall;
+export function prepareAttestReveal(input: { payloadHash: string; metadataHash: string; nonce: string; attestationSecret: Uint8Array }): PreparedCall;
 export function prepareRegisterPassport(input: { passportId: string; ownerId: string; attestationSecret: Uint8Array }): PreparedCall;
 export function prepareBindPassport(input: { passportId: string; payloadHash: string; attestationSecret: Uint8Array }): PreparedCall;
-export function prepareAnchorContentRoot(input: { payloadHash: string; contentRoot: string; attestationSecret: Uint8Array }): PreparedCall;
-export function prepareProveFieldPredicate(input: { payloadHash: string; fieldKey: string; threshold: number | bigint; op: number | bigint; merkleProof: import('./witnesses.js').MerkleProof; attestationSecret: Uint8Array }): PreparedCall;
-export function prepareProveFieldEquality(input: { payloadHash: string; fieldKey: string; expectedDigest: string; merkleProof: import('./witnesses.js').MerkleProof; attestationSecret: Uint8Array }): PreparedCall;
-export function prepareProveFieldMembership(input: { payloadHash: string; fieldKey: string; setRoot: string; merkleProof: import('./witnesses.js').MerkleProof; attestationSecret: Uint8Array }): PreparedCall;
+export function prepareAnchorContentRoot(input: { payloadHash: string; contentRoot: string; schemaId: string; attestationSecret: Uint8Array }): PreparedCall;
+export function prepareProveFieldPredicate(input: { payloadHash: string; fieldKey: string; threshold: number | bigint; op: number | bigint; merkleProof: import('./witnesses.js').MerkleProof; attestationSecret?: Uint8Array }): PreparedCall;
+export function prepareProveFieldEquality(input: { payloadHash: string; fieldKey: string; expectedDigest: string; merkleProof: import('./witnesses.js').MerkleProof; attestationSecret?: Uint8Array }): PreparedCall;
+export function prepareProveFieldMembership(input: { payloadHash: string; fieldKey: string; setRoot: string; merkleProof: import('./witnesses.js').MerkleProof; attestationSecret?: Uint8Array }): PreparedCall;
+export function prepareProveFieldsUnchangedExcept(input: { payloadHashA: string; payloadHashB: string; allowedMask: number; docPair: import('./witnesses.js').DocPair; attestationSecret?: Uint8Array }): PreparedCall;
+export function prepareProveFieldsDiffer(input: { payloadHashA: string; payloadHashB: string; k: number; docPair: import('./witnesses.js').DocPair; attestationSecret?: Uint8Array }): PreparedCall;
 
 export interface ContractBrowserMeta {
     name: string;
@@ -118,8 +128,6 @@ export interface ContractBrowserMeta {
     circuits: string[];
     /** Circuits requiring the attester-identity witness (local_secret_key). */
     attesterGated: string[];
-    /** Circuits requiring per-call value/salt witnesses. */
-    valueWitnessed: string[];
     /** Circuits requiring the per-call Merkle inclusion proof witnesses. */
     merkleWitnessed?: string[];
     hasPrivateState: boolean;

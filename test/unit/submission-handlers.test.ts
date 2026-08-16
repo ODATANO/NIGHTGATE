@@ -21,13 +21,22 @@ import type { Mock } from 'vitest';
 const mockStartJob = vi.hoisted(() => (vi.fn(async (args: any) => {
     // Drive the work fn immediately so submitter.deploy/.call is exercised;
     // keeps the per-call args + registration meta assertions meaningful.
+    // Like the REAL startJob, stamp the artifact-generation digest before
+    // execution (the executor's provenance gate is fail-closed on it); the
+    // registry aliases are registered in beforeAll below.
     try {
         if (args.command) {
+            let command = args.command;
+            if (command && typeof command === 'object'
+                && typeof command.compiledArtifactRef === 'string'
+                && command.artifactDigest === undefined) {
+                command = { ...command, artifactDigest: getArtifactGenerationDigest(command.compiledArtifactRef) };
+            }
             const processor = registeredProcessors.get(`${args.kind}\0${args.commandVersion}`);
-            await processor?.(args.command, {
+            await processor?.(command, {
                 ID: 'job-test', kind: args.kind, sessionId: args.sessionId,
                 requestedBy: args.requestedBy, commandVersion: args.commandVersion,
-                command: JSON.stringify(args.command)
+                command: JSON.stringify(command)
             });
         } else {
             await args.work();
@@ -36,16 +45,29 @@ const mockStartJob = vi.hoisted(() => (vi.fn(async (args: any) => {
     return { jobId: `job-${args.kind}-test`, status: 'pending' as const };
 })));
 const registeredProcessors = vi.hoisted(() => new Map<string, (command: unknown, row: any) => Promise<unknown>>());
+const childCommandLog = vi.hoisted(() => [] as Array<{ kind: string; step: string; command: any }>);
 const registeredFinalizers = vi.hoisted(() => new Map<string, (command: unknown, row: any, evidence: any) => Promise<unknown>>());
 vi.mock('../../srv/submission/background-jobs', () => ({
     startJob: (...args: unknown[]) => (mockStartJob as any)(...args),
     runChildCommand: async (args: any) => {
         const processor = registeredProcessors.get(`${args.kind}\0${args.commandVersion}`);
         if (!processor) throw new Error(`missing child processor ${args.kind}`);
-        return processor(args.command, {
+        // Log the command EXACTLY as the handler passed it, so tests can pin
+        // that workflow children inherit the parent's artifactDigest instead
+        // of relying on stamp-at-child-creation.
+        childCommandLog.push({ kind: args.kind, step: args.step, command: args.command });
+        // Same provenance stamping as the real path (children persist through
+        // the real startJob in production).
+        let command = args.command;
+        if (command && typeof command === 'object'
+            && typeof command.compiledArtifactRef === 'string'
+            && command.artifactDigest === undefined) {
+            command = { ...command, artifactDigest: getArtifactGenerationDigest(command.compiledArtifactRef) };
+        }
+        return processor(command, {
             ID: `child-${args.step}`, kind: args.kind, sessionId: args.parent.sessionId,
             requestedBy: args.parent.requestedBy, commandVersion: args.commandVersion,
-            command: JSON.stringify(args.command), parentJobId: args.parent.ID, workflowStep: args.step
+            command: JSON.stringify(command), parentJobId: args.parent.ID, workflowStep: args.step
         });
     },
     registerBackgroundJobProcessor: (kind: string, version: number, processor: (command: unknown, row: any) => Promise<unknown>) => registeredProcessors.set(`${kind}\0${version}`, processor),
@@ -57,7 +79,28 @@ import {
     SubmissionError,
     type TransactionSubmitter
 } from '../../srv/submission/TransactionSubmitter';
-import { ContractNotRegisteredError } from '../../srv/submission/contract-registry';
+import { ContractNotRegisteredError, registerContract, unregisterContract, getArtifactGenerationDigest } from '../../srv/submission/contract-registry';
+
+// Provenance stamping (0.16.0): startJob resolves the command's
+// compiledArtifactRef through the REGISTRY to stamp the artifact-generation
+// digest, so the aliases the fixtures use must be registered (the resolver
+// itself stays the injected fake). The fixture artifact is any real file;
+// the digest only reads bytes.
+beforeAll(() => {
+    const fixtureArtifact = path.resolve(__dirname, '../fixtures/fake-vault-artifact.mjs');
+    for (const name of ['attestation-vault', 'a', 'x']) {
+        registerContract(name, {
+            artifactPath: fixtureArtifact,
+            privateStateId: 'test',
+            zkConfigPath: path.resolve(__dirname, '../fixtures')
+        });
+    }
+});
+afterAll(() => {
+    unregisterContract('attestation-vault');
+    unregisterContract('a');
+    unregisterContract('x');
+});
 import {
     SessionNotFoundError,
     WalletMaterialUnavailable
@@ -393,7 +436,7 @@ describe('error translation to OData status codes', () => {
             {
                 op: 'callBatch', contractAddress: '0xCONTRACT', compiledArtifactRef: 'attestation-vault',
                 calls: [{ circuit: 'attest', args: [] }, { circuit: 'bindPassport', args: [] }],
-                sponsorSessionId: 'sponsor-1'
+                sponsorSessionId: 'sponsor-1', artifactDigest: getArtifactGenerationDigest('attestation-vault')
             },
             { ID: 'job-r', kind: 'submitContractCallBatch', sessionId: 's', requestedBy: 'u', commandVersion: 1 },
             { submissionId: 'sub-9', txHash: '0xrecovered', contractAddress: '0xCONTRACT', finalizedAt: '2026-07-23T00:00:00Z' }
@@ -647,7 +690,8 @@ describe('anchorDocument', () => {
         const finalizer = registeredFinalizers.get('anchorDocument\0' + '1')!;
         const result = await finalizer({
             op: 'anchorDocument', documentId: 'doc-reconciled', payloadHash: VALID_SHA256,
-            metadataHash: 'b'.repeat(64), contractAddress: '0xVAULT', compiledArtifactRef: 'attestation-vault'
+            metadataHash: 'b'.repeat(64), contractAddress: '0xVAULT', compiledArtifactRef: 'attestation-vault',
+            artifactDigest: getArtifactGenerationDigest('attestation-vault')
         }, {}, { txHash: '0xanchor', finalizedAt: '2026-07-22T10:00:00Z' });
 
         expect(JSON.stringify(db.run.mock.calls[0][0])).toContain('doc-reconciled');
@@ -840,178 +884,33 @@ describe('verifyDocument', () => {
         const result: any = await srv.handlers['verifyDocument'](req);
         expect(result.verified).toBe(true);
     });
+
+    // Evidence binding (0.16.0): the recorded anchoring vault is
+    // authoritative; a caller pointing at a DIFFERENT vault that attests the
+    // same public hash must not turn the document verified.
+    test('rejects a caller contractAddress that differs from the recorded anchoring vault', async () => {
+        const srv = setupHandlersWithDb(makeDbWithSequence([
+            { ID: DOC_ID, sha256: VALID_SHA, anchoredTxHash: TX_HASH, anchoredAt: '2026-05-19T12:00:00Z', contractAddress: 'aa'.repeat(32) }
+        ]));
+        const req = makeReq({ documentId: DOC_ID, providedSha256: VALID_SHA, contractAddress: 'bb'.repeat(32) });
+        await srv.handlers['verifyDocument'](req);
+        expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/does not match the vault/));
+    });
+
+    test('accepts a caller contractAddress that CONFIRMS the recorded vault (case-insensitive)', async () => {
+        const srv = setupHandlersWithDb(makeDbWithSequence([
+            { ID: DOC_ID, sha256: VALID_SHA, anchoredTxHash: TX_HASH, anchoredAt: '2026-05-19T12:00:00Z', contractAddress: 'aa'.repeat(32) },
+            { ID: TX_ID, hash: TX_HASH },
+            { status: 'SUCCESS', outcomeSource: 'substrate-system-events' }
+        ]));
+        const req = makeReq({ documentId: DOC_ID, providedSha256: VALID_SHA, contractAddress: 'AA'.repeat(32) });
+        const result: any = await srv.handlers['verifyDocument'](req);
+        expect(req.reject).not.toHaveBeenCalled();
+        expect(result.verified).toBe(true);
+    });
 });
 
 // ---- issuePredicateAttestation (ZK predicate, on-chain model) -------------
-
-describe('issuePredicateAttestation', () => {
-    const VALID_PAYLOAD = 'a'.repeat(64);
-    const VALID_SALT = 'b'.repeat(64);
-    const VALID_ARGS = () => ({
-        payloadHash: VALID_PAYLOAD,
-        value: '47300',
-        salt: VALID_SALT,
-        predicate: 'lessOrEqual',
-        threshold: 50000,
-        unit: 'kgCO2e/kWh',
-        sessionId: `pred-${Math.random().toString(36).slice(2)}`,
-        contractAddress: '0xVAULT',
-        compiledArtifactRef: 'attestation-vault'
-    });
-
-    function makeFakeDb() {
-        return { run: vi.fn().mockResolvedValue(undefined) };
-    }
-
-    function setupHandlersWithDb(overrides: any = {}) {
-        const srv = makeFakeService();
-        const db = makeFakeDb();
-        registerSubmissionHandlers(srv as any, db, {
-            resolveContractImpl: vi.fn(async () => ({ ...RESOLVED_CONTRACT_FIXTURE })),
-            walletMaterialFactory: vi.fn(async () => ({
-                accountId: 'a',
-                privateStoragePasswordProvider: () => '0123456789ABCDEFG',
-                walletAndMidnightProvider: {}
-            })),
-            submitterFactory: vi.fn(() => makeSuccessfulSubmitter()),
-            ...overrides
-        });
-        return { srv, db };
-    }
-
-    test('rejects missing payloadHash', async () => {
-        const { srv } = setupHandlersWithDb();
-        const req = makeReq({ ...VALID_ARGS(), payloadHash: undefined });
-        await srv.handlers['issuePredicateAttestation'](req);
-        expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/payloadHash/));
-    });
-
-    test('rejects non-hex payloadHash', async () => {
-        const { srv } = setupHandlersWithDb();
-        const req = makeReq({ ...VALID_ARGS(), payloadHash: 'nope' });
-        await srv.handlers['issuePredicateAttestation'](req);
-        expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/64 hex chars/));
-    });
-
-    test('rejects missing value', async () => {
-        const { srv } = setupHandlersWithDb();
-        const req = makeReq({ ...VALID_ARGS(), value: undefined });
-        await srv.handlers['issuePredicateAttestation'](req);
-        expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/value is required/));
-    });
-
-    test('rejects non-integer value', async () => {
-        const { srv } = setupHandlersWithDb();
-        const req = makeReq({ ...VALID_ARGS(), value: '47.3' });
-        await srv.handlers['issuePredicateAttestation'](req);
-        expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/value must be an integer/));
-    });
-
-    test('rejects unknown predicate', async () => {
-        const { srv } = setupHandlersWithDb();
-        const req = makeReq({ ...VALID_ARGS(), predicate: 'between' });
-        await srv.handlers['issuePredicateAttestation'](req);
-        expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/lessOrEqual.*greaterOrEqual/));
-    });
-
-    test('rejects bad salt', async () => {
-        const { srv } = setupHandlersWithDb();
-        const req = makeReq({ ...VALID_ARGS(), salt: 'short' });
-        await srv.handlers['issuePredicateAttestation'](req);
-        expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/salt must be 64 hex/));
-    });
-
-    test('happy path: INSERT + commitValue + provePredicate + UPDATE; value never leaves as a circuit arg', async () => {
-        const submitter = makeSuccessfulSubmitter();
-        const { srv, db } = setupHandlersWithDb({ submitterFactory: () => submitter });
-        const req = makeReq(VALID_ARGS());
-
-        const result: any = await srv.handlers['issuePredicateAttestation'](req);
-
-        expect(req.reject).not.toHaveBeenCalled();
-        expect(result).toEqual({
-            jobId: 'job-issuePredicateAttestation-test',
-            status: 'pending',
-            predicateAttestationId: expect.any(String)
-        });
-
-        // INSERT (sync) + UPDATE (inside work) = 2 db.run.
-        expect(db.run).toHaveBeenCalledTimes(2);
-
-        // Two circuit calls in order: commitValue then provePredicate.
-        expect(submitter.call).toHaveBeenCalledTimes(2);
-        const c0 = (submitter.call as Mock).mock.calls[0][0];
-        const c1 = (submitter.call as Mock).mock.calls[1][0];
-
-        expect(c0.circuit).toBe('commitValue');
-        expect(c0.args).toHaveLength(1);
-        expect(c0.args[0]).toBeInstanceOf(Uint8Array);
-        expect(c0.args[0]).toHaveLength(32);
-
-        expect(c1.circuit).toBe('provePredicate');
-        expect(c1.args[0]).toBeInstanceOf(Uint8Array);
-        expect(c1.args[1]).toBe(50000n);   // threshold as bigint
-        expect(c1.args[2]).toBe(0n);       // op: lessOrEqual
-
-        // PRIVACY: the hidden value travels only as a witness, never as an arg.
-        for (const call of [c0, c1]) {
-            expect(call.witnessValues).toEqual({ attestedValue: '47300', valueSalt: VALID_SALT });
-            const argsHex = call.args.map((a: any) => a instanceof Uint8Array ? Buffer.from(a).toString('hex') : String(a));
-            expect(argsHex.join(',')).not.toContain('47300');
-        }
-    });
-
-    test('op=greaterOrEqual maps to 1n on provePredicate', async () => {
-        const submitter = makeSuccessfulSubmitter();
-        const { srv } = setupHandlersWithDb({ submitterFactory: () => submitter });
-        await srv.handlers['issuePredicateAttestation'](makeReq({ ...VALID_ARGS(), predicate: 'greaterOrEqual' }));
-        const c1 = (submitter.call as Mock).mock.calls[1][0];
-        expect(c1.args[2]).toBe(1n);
-    });
-
-    test('generates a 32-byte salt when omitted', async () => {
-        const submitter = makeSuccessfulSubmitter();
-        const { srv } = setupHandlersWithDb({ submitterFactory: () => submitter });
-        await srv.handlers['issuePredicateAttestation'](makeReq({ ...VALID_ARGS(), salt: undefined }));
-        const c0 = (submitter.call as Mock).mock.calls[0][0];
-        expect(c0.witnessValues.valueSalt).toMatch(/^[0-9a-f]{64}$/);
-    });
-
-    test('UPDATE is skipped when provePredicate throws inside work', async () => {
-        const subErr = new SubmissionError('sub-z', { code: 'OnChainStatus:Fail', retryable: false, message: 'predicate false' });
-        const failingSubmitter = {
-            deploy: vi.fn(),
-            // commitValue succeeds, provePredicate throws.
-            call: vi.fn()
-                .mockResolvedValueOnce({ txHash: '0xcommit', status: 'included' })
-                .mockRejectedValueOnce(subErr)
-        } as unknown as TransactionSubmitter;
-        const { srv, db } = setupHandlersWithDb({ submitterFactory: () => failingSubmitter });
-        const req = makeReq(VALID_ARGS());
-        const result: any = await srv.handlers['issuePredicateAttestation'](req);
-        // The parent workflow must not persist a proof result when the proof
-        // child failed (processor revalidation may perform additional DB I/O).
-        expect((db.run as Mock).mock.calls.some(([q]) => Boolean(q?.UPDATE)
-            && JSON.stringify(q).includes('provenTxHash'))).toBe(false);
-        expect(req.reject).not.toHaveBeenCalled();
-        expect(result).toMatchObject({ jobId: expect.any(String), status: 'pending' });
-    });
-
-    test('rate-limited at 10 proofs/hour/session', async () => {
-        const { srv } = setupHandlersWithDb();
-        const sessionId = `pred-rate-${Date.now()}`;
-        for (let i = 0; i < 10; i++) {
-            const req = makeReq({ ...VALID_ARGS(), sessionId });
-            await srv.handlers['issuePredicateAttestation'](req);
-            expect(req.reject).not.toHaveBeenCalled();
-        }
-        const overflow = makeReq({ ...VALID_ARGS(), sessionId });
-        await srv.handlers['issuePredicateAttestation'](overflow);
-        expect(overflow.reject).toHaveBeenCalledWith(429, expect.stringMatching(/Rate limited/));
-    });
-});
-
-// ---- verifyPredicateAttestation (ZK predicate, on-chain model) ------------
 
 describe('verifyPredicateAttestation', () => {
     const PA_ID = '00000000-0000-4000-8000-0000000000a1';
@@ -1229,7 +1128,8 @@ describe('grantDisclosure', () => {
         reindexer.mockClear();
         const result = await registeredFinalizers.get('grantDisclosure\0' + '1')!({
             op: 'grantDisclosure', disclosureGrantId: 'grant-reconciled', payloadHash: VALID_PAYLOAD,
-            grantee: VALID_GRANTEE, level: 2, contractAddress: '0xVAULT', compiledArtifactRef: 'attestation-vault'
+            grantee: VALID_GRANTEE, level: 2, contractAddress: '0xVAULT', compiledArtifactRef: 'attestation-vault',
+            artifactDigest: getArtifactGenerationDigest('attestation-vault')
         }, {}, { txHash: '0xgrant', finalizedAt: null });
 
         expect(JSON.stringify(db.run.mock.calls[0][0])).toContain('0xgrant');
@@ -1338,7 +1238,8 @@ describe('revokeDisclosure', () => {
         db.run.mockClear();
         const result = await registeredFinalizers.get('revokeDisclosure\0' + '1')!({
             op: 'revokeDisclosure', payloadHash: VALID_PAYLOAD, grantee: VALID_GRANTEE,
-            contractAddress: '0xVAULT', compiledArtifactRef: 'attestation-vault'
+            contractAddress: '0xVAULT', compiledArtifactRef: 'attestation-vault',
+            artifactDigest: getArtifactGenerationDigest('attestation-vault')
         }, {}, { txHash: '0xrevoke', finalizedAt: null });
 
         const update = JSON.stringify(db.run.mock.calls[0][0]);
@@ -1459,7 +1360,8 @@ describe('registerPassport', () => {
         setupHandlersWithDb();
         const result = await registeredFinalizers.get('registerPassport\0' + '1')!({
             op: 'registerPassport', passportId: VALID_PASSPORT, ownerId: VALID_OWNER,
-            contractAddress: '0xVAULT', compiledArtifactRef: 'attestation-vault'
+            contractAddress: '0xVAULT', compiledArtifactRef: 'attestation-vault',
+            artifactDigest: getArtifactGenerationDigest('attestation-vault')
         }, {}, { txHash: '0xregister', finalizedAt: null });
 
         expect(result).toEqual({
@@ -1810,7 +1712,9 @@ describe('issueFieldPredicateAttestation', () => {
         payloadHash: VALID_PAYLOAD,
         fieldKey: VALID_FIELD_KEY,
         value: '47300',
+        fieldSalt: 'f5'.repeat(32),
         contentRoot: VALID_ROOT,
+        schemaId: 'ab'.repeat(32),
         siblingsJson: JSON.stringify(SIBLINGS),
         dirsJson: JSON.stringify([true, false, true, false]),
         predicate: 'lessOrEqual',
@@ -1846,6 +1750,8 @@ describe('issueFieldPredicateAttestation', () => {
         [{ value: '' }, /value is required/],
         [{ value: '47.3' }, /value must be an integer/],
         [{ value: '-5' }, /value must be a non-negative integer/],
+        [{ fieldSalt: undefined }, /fieldSalt .*is required/],
+        [{ fieldSalt: 'zz' }, /fieldSalt/],
         [{ threshold: undefined }, /threshold is required/],
         [{ threshold: 'abc' }, /threshold must be an integer/],
         [{ predicate: 'between' }, /lessOrEqual.*greaterOrEqual/],
@@ -1900,7 +1806,7 @@ describe('issueFieldPredicateAttestation', () => {
         const prove = (submitter.call as Mock).mock.calls[1][0];
 
         expect(anchor.circuit).toBe('anchorContentRoot');
-        expect(anchor.args).toHaveLength(2); // payloadHash + contentRoot bytes
+        expect(anchor.args).toHaveLength(3); // payloadHash + contentRoot + schemaId bytes
         expect(anchor.merkleProof).toBeUndefined();
 
         expect(prove.circuit).toBe('proveFieldPredicate');
@@ -1911,6 +1817,7 @@ describe('issueFieldPredicateAttestation', () => {
         // The value + inclusion path travel as witnesses only.
         expect(prove.merkleProof).toEqual({
             fieldValue: '47300',
+            fieldSalt: 'f5'.repeat(32),
             siblings: SIBLINGS,
             dirs: [true, false, true, false]
         });
@@ -1948,6 +1855,7 @@ describe('issueFieldPredicateAttestationBatch', () => {
     const makeClaim = (n: number, patch: any = {}) => ({
         fieldKey: String(n).repeat(64).slice(0, 64),
         value: `${1000 + n}`,
+        salt: 'f5'.repeat(32),
         siblings: SIBLINGS,
         dirs: [true, false, true, false],
         predicate: 'lessOrEqual',
@@ -1958,6 +1866,7 @@ describe('issueFieldPredicateAttestationBatch', () => {
     const VALID_ARGS = (patch: any = {}) => ({
         payloadHash: VALID_PAYLOAD,
         contentRoot: VALID_ROOT,
+        schemaId: 'ab'.repeat(32),
         claimsJson: JSON.stringify([makeClaim(1), makeClaim(2)]),
         sessionId: `fieldpredbatch-${Math.random().toString(36).slice(2)}`,
         contractAddress: '0xVAULT',
@@ -1995,7 +1904,7 @@ describe('issueFieldPredicateAttestationBatch', () => {
         [{ claimsJson: JSON.stringify([makeClaim(1, { value: '47.3' })]) }, /claims\[0\].value must be an integer/],
         [{ claimsJson: JSON.stringify([makeClaim(1, { value: '-5' })]) }, /claims\[0\].value must be a non-negative integer/],
         [{ claimsJson: JSON.stringify([makeClaim(1, { threshold: 'abc' })]) }, /claims\[0\].threshold must be an integer/],
-        [{ claimsJson: JSON.stringify([makeClaim(1, { predicate: 'between' })]) }, /claims\[0\].predicate must be 'lessOrEqual', 'greaterOrEqual', 'bytesEquality' or 'setMembership'/],
+        [{ claimsJson: JSON.stringify([makeClaim(1, { predicate: 'between' })]) }, /claims\[0\].predicate must be 'lessOrEqual', 'greaterOrEqual', 'bytesEquality', 'setMembership', 'documentIntegrity' or 'documentDiff'/],
         [{ claimsJson: JSON.stringify([makeClaim(1, { siblings: SIBLINGS.slice(0, 2) })]) }, /claims\[0\].siblings must be a JSON array of 4 hashes/],
         [{ claimsJson: JSON.stringify([makeClaim(1, { siblings: [...SIBLINGS.slice(0, 3), 'short'] })]) }, /claims\[0\].siblings entries must be 64 hex/],
         [{ claimsJson: JSON.stringify([makeClaim(1, { dirs: [true] })]) }, /claims\[0\].dirs must be a JSON array of 4 booleans/],
@@ -2069,7 +1978,7 @@ describe('issueFieldPredicateAttestationBatch', () => {
         // Anchor first (distinct entryPoint; segment ordering pins it ahead),
         // no witness proof on it.
         expect(batchArgs.calls[0].circuit).toBe('anchorContentRoot');
-        expect(batchArgs.calls[0].args).toHaveLength(2);
+        expect(batchArgs.calls[0].args).toHaveLength(3);
         expect(batchArgs.calls[0].merkleProof).toBeUndefined();
 
         // Every proof call carries ITS OWN merkleProof; the value travels as
@@ -2081,6 +1990,7 @@ describe('issueFieldPredicateAttestationBatch', () => {
             expect(call.args[3]).toBe(0n);
             expect(call.merkleProof).toEqual({
                 fieldValue: `${1000 + i + 1}`,
+                fieldSalt: 'f5'.repeat(32),
                 siblings: SIBLINGS,
                 dirs: [true, false, true, false]
             });
@@ -2159,7 +2069,9 @@ describe('issueFieldEqualityAttestation', () => {
         payloadHash: VALID_PAYLOAD,
         fieldKey: VALID_FIELD_KEY,
         expectedDigest: EXPECTED,
+        fieldSalt: 'f5'.repeat(32),
         contentRoot: VALID_ROOT,
+        schemaId: 'ab'.repeat(32),
         siblingsJson: JSON.stringify(SIBLINGS),
         dirsJson: JSON.stringify([true, false, true, false]),
         sessionId: `fieldeq-${Math.random().toString(36).slice(2)}`,
@@ -2239,8 +2151,8 @@ describe('issueFieldEqualityAttestation', () => {
         // args: payloadHash, fieldKey, expectedDigest (all public Bytes<32>).
         expect(prove.args).toHaveLength(3);
         expect(Buffer.from(prove.args[2]).toString('hex')).toBe(EXPECTED);
-        // Path-only bundle: no fieldValue, no fieldDigest, no setProof.
-        expect(prove.merkleProof).toEqual({ siblings: SIBLINGS, dirs: [true, false, true, false] });
+        // Salted path bundle: no fieldValue, no fieldDigest, no setProof.
+        expect(prove.merkleProof).toEqual({ fieldSalt: 'f5'.repeat(32), siblings: SIBLINGS, dirs: [true, false, true, false] });
     });
 
     test('digests a raw expectedValue server-side (exact string, no trimming)', async () => {
@@ -2271,6 +2183,7 @@ describe('issueFieldMembershipAttestation', () => {
         payloadHash: VALID_PAYLOAD,
         fieldKey: VALID_FIELD_KEY,
         valueDigest: DIGEST,
+        fieldSalt: 'f5'.repeat(32),
         setRoot: SET_ROOT,
         setSiblingsJson: JSON.stringify(SET_SIBLINGS),
         setDirsJson: JSON.stringify([true, false, true, false, true, false]),
@@ -2363,6 +2276,7 @@ describe('issueFieldMembershipAttestation', () => {
         expect(flatArgs).not.toContain(DIGEST);
         expect(prove.merkleProof).toEqual({
             fieldDigest: DIGEST,
+            fieldSalt: 'f5'.repeat(32),
             siblings: SIBLINGS,
             dirs: [true, false, true, false],
             setProof: { siblings: SET_SIBLINGS, dirs: [true, false, true, false, true, false] }
@@ -2413,15 +2327,15 @@ describe('issueFieldPredicateAttestationBatch: mixed claim kinds', () => {
     const EXPECTED = 'b'.repeat(64);
 
     const numericClaim = {
-        fieldKey: '1'.repeat(64), value: '1001', siblings: SIBLINGS, dirs: [true, false, true, false],
+        fieldKey: '1'.repeat(64), value: '1001', salt: 'f5'.repeat(32), siblings: SIBLINGS, dirs: [true, false, true, false],
         predicate: 'lessOrEqual', threshold: '50001', unit: 'kg'
     };
     const equalityClaim = {
-        fieldKey: '2'.repeat(64), expectedDigest: EXPECTED, siblings: SIBLINGS, dirs: [true, false, true, false],
+        fieldKey: '2'.repeat(64), expectedDigest: EXPECTED, salt: 'f5'.repeat(32), siblings: SIBLINGS, dirs: [true, false, true, false],
         predicate: 'bytesEquality'
     };
     const membershipClaim = {
-        fieldKey: '3'.repeat(64), valueDigest: DIGEST,
+        fieldKey: '3'.repeat(64), valueDigest: DIGEST, salt: 'f5'.repeat(32),
         setRoot: SET_ROOT, setSiblings: SET_SIBLINGS, setDirs: [true, false, true, false, true, false],
         siblings: SIBLINGS, dirs: [true, false, true, false],
         predicate: 'setMembership'
@@ -2430,6 +2344,7 @@ describe('issueFieldPredicateAttestationBatch: mixed claim kinds', () => {
     const VALID_ARGS = (patch: any = {}) => ({
         payloadHash: VALID_PAYLOAD,
         contentRoot: VALID_ROOT,
+        schemaId: 'ab'.repeat(32),
         claimsJson: JSON.stringify([numericClaim, equalityClaim, membershipClaim]),
         sessionId: `mixedbatch-${Math.random().toString(36).slice(2)}`,
         contractAddress: '0xVAULT',
@@ -2459,7 +2374,7 @@ describe('issueFieldPredicateAttestationBatch: mixed claim kinds', () => {
         [{ claimsJson: JSON.stringify([{ ...membershipClaim, setRoot: undefined }]) }, /claims\[0\]: allowedValues or setRoot \+ setSiblings \+ setDirs is required/],
         [{ claimsJson: JSON.stringify([{ ...membershipClaim, allowedValues: ['x'] }]) }, /claims\[0\]: pass either allowedValues or setRoot/],
         [{ claimsJson: JSON.stringify([{ ...membershipClaim, setSiblings: SET_SIBLINGS.slice(0, 3) }]) }, /claims\[0\].setSiblings must be a JSON array of 6 hashes/],
-        [{ claimsJson: JSON.stringify([{ ...numericClaim, predicate: 'between' }]) }, /claims\[0\].predicate must be 'lessOrEqual', 'greaterOrEqual', 'bytesEquality' or 'setMembership'/]
+        [{ claimsJson: JSON.stringify([{ ...numericClaim, predicate: 'between' }]) }, /claims\[0\].predicate must be 'lessOrEqual', 'greaterOrEqual', 'bytesEquality', 'setMembership', 'documentIntegrity' or 'documentDiff'/]
     ])('rejects %o', async (patch, msg) => {
         const { srv } = setupHandlersWithDb();
         const req = makeReq(VALID_ARGS(patch));
@@ -2491,11 +2406,11 @@ describe('issueFieldPredicateAttestationBatch: mixed claim kinds', () => {
         expect(numeric.merkleProof.fieldValue).toBe('1001');
         expect(equality.args).toHaveLength(3);
         expect(Buffer.from(equality.args[2]).toString('hex')).toBe(EXPECTED);
-        expect(equality.merkleProof).toEqual({ siblings: SIBLINGS, dirs: [true, false, true, false] });
+        expect(equality.merkleProof).toEqual({ fieldSalt: 'f5'.repeat(32), siblings: SIBLINGS, dirs: [true, false, true, false] });
         expect(membership.args).toHaveLength(3);
         expect(Buffer.from(membership.args[2]).toString('hex')).toBe(SET_ROOT);
         expect(membership.merkleProof).toEqual({
-            fieldDigest: DIGEST, siblings: SIBLINGS, dirs: [true, false, true, false],
+            fieldDigest: DIGEST, fieldSalt: 'f5'.repeat(32), siblings: SIBLINGS, dirs: [true, false, true, false],
             setProof: { siblings: SET_SIBLINGS, dirs: [true, false, true, false, true, false] }
         });
         // The membership digest never appears as a circuit arg anywhere.
@@ -2529,5 +2444,415 @@ describe('issueFieldPredicateAttestationBatch: mixed claim kinds', () => {
         expect(batchArgs.calls.map((c: any) => c.circuit)).toEqual([
             'anchorContentRoot', 'proveFieldEquality', 'proveFieldMembership'
         ]);
+    });
+});
+
+// ---- cross-root document proofs (0.16.0) -----------------------------------
+
+// Shared v4 cross-root fixtures: one schema, two openings.
+const DOC_SCHEMA = [
+    { fieldKey: 'c1'.repeat(32), kind: 0, scale: '1000' },
+    { fieldKey: 'c2'.repeat(32), kind: 1, scale: '0' },
+    ...Array.from({ length: 14 }, () => ({ fieldKey: 'ee'.repeat(32), kind: 2, scale: '0' }))
+];
+const DOC_OPENING_A = {
+    saltSeed: '11'.repeat(32),
+    slots: [
+        { present: true, value: '47300' },
+        { present: true, valueDigest: 'cd'.repeat(32) },
+        ...Array.from({ length: 14 }, () => ({ present: false }))
+    ]
+};
+const DOC_OPENING_B = {
+    saltSeed: '22'.repeat(32),
+    slots: [
+        { present: true, value: '99000' },
+        { present: false },
+        ...Array.from({ length: 14 }, () => ({ present: false }))
+    ]
+};
+
+describe('issueDocumentIntegrityAttestation', () => {
+    const PAYLOAD_A = 'a'.repeat(64);
+    const PAYLOAD_B = 'b'.repeat(64);
+    const ROOT_A = 'd'.repeat(64);
+    const ROOT_B = 'e'.repeat(64);
+    const SCHEMA_ID = 'ab'.repeat(32);
+    const VALID_ARGS = () => ({
+        payloadHashA: PAYLOAD_A,
+        payloadHashB: PAYLOAD_B,
+        allowedMask: 5,
+        schemaJson: JSON.stringify(DOC_SCHEMA),
+        openingAJson: JSON.stringify(DOC_OPENING_A),
+        openingBJson: JSON.stringify(DOC_OPENING_B),
+        contentRootA: ROOT_A,
+        contentRootB: ROOT_B,
+        schemaId: SCHEMA_ID,
+        sessionId: `docinteg-${Math.random().toString(36).slice(2)}`,
+        contractAddress: '0xVAULT',
+        compiledArtifactRef: 'attestation-vault'
+    });
+
+    function setupHandlersWithDb(overrides: any = {}) {
+        const srv = makeFakeService();
+        const db = { run: vi.fn().mockResolvedValue(undefined) };
+        registerSubmissionHandlers(srv as any, db, {
+            resolveContractImpl: vi.fn(async () => ({ ...RESOLVED_CONTRACT_FIXTURE })),
+            walletMaterialFactory: vi.fn(async () => ({
+                accountId: 'a',
+                privateStoragePasswordProvider: () => '0123456789ABCDEFG',
+                walletAndMidnightProvider: {}
+            })),
+            submitterFactory: vi.fn(() => makeSuccessfulSubmitter()),
+            ...overrides
+        });
+        return { srv, db };
+    }
+
+    test.each([
+        [{ payloadHashA: undefined }, /payloadHashA is required/],
+        [{ payloadHashA: 'zz' }, /payloadHashA must be 64 hex/],
+        [{ payloadHashB: undefined }, /payloadHashB is required/],
+        [{ payloadHashB: PAYLOAD_A.toUpperCase() }, /must differ/],
+        [{ allowedMask: undefined }, /allowedMask is required/],
+        [{ allowedMask: -1 }, /0\.\.65535/],
+        [{ allowedMask: 65536 }, /0\.\.65535/],
+        [{ allowedMask: 1.5 }, /0\.\.65535/],
+        [{ allowedMask: 0xffff }, /vacuous/],
+        // DOC_SCHEMA has exactly 2 real slots (0, 1); mask 3 frees both.
+        [{ allowedMask: 3 }, /frees every real \(non-padding\) schema slot/],
+        [{ schemaJson: JSON.stringify(DOC_SCHEMA.slice(0, 15)) }, /exactly 16 slot descriptors/],
+        [{ schemaJson: JSON.stringify([{ ...DOC_SCHEMA[0], kind: 9 }, ...DOC_SCHEMA.slice(1)]) }, /kind must be 0/],
+        [{ openingAJson: JSON.stringify({ ...DOC_OPENING_A, saltSeed: 'zz' }) }, /saltSeed must be 64 hex/],
+        [{ openingBJson: JSON.stringify({ ...DOC_OPENING_B, slots: [{ present: true }, ...DOC_OPENING_B.slots.slice(1)] }) }, /present slot needs value or valueDigest/],
+        [{ schemaJson: 'not json' }, /must be valid JSON/],
+        [{ contentRootA: 'oops' }, /contentRootA must be 64 hex/],
+        [{ contentRootB: 'oops' }, /contentRootB must be 64 hex/],
+        [{ schemaId: undefined }, /schemaId .* is required when anchoring/],
+        [{ schemaId: 'oops' }, /schemaId/],
+        [{ sessionId: undefined }, /sessionId is required/],
+        [{ contractAddress: undefined }, /contractAddress is required/]
+    ])('rejects %o', async (patch, msg) => {
+        const { srv } = setupHandlersWithDb();
+        const req = makeReq({ ...VALID_ARGS(), ...patch });
+        await srv.handlers['issueDocumentIntegrityAttestation'](req);
+        expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(msg));
+    });
+
+    test('is blocked on mainnet by default (403)', async () => {
+        const prev = process.env.NIGHTGATE_NETWORK;
+        process.env.NIGHTGATE_NETWORK = 'mainnet';
+        try {
+            const { srv } = setupHandlersWithDb();
+            const req = makeReq(VALID_ARGS());
+            await srv.handlers['issueDocumentIntegrityAttestation'](req);
+            expect(req.reject).toHaveBeenCalledWith(403, expect.stringMatching(/mainnet/i));
+        } finally {
+            if (prev === undefined) delete process.env.NIGHTGATE_NETWORK;
+            else process.env.NIGHTGATE_NETWORK = prev;
+        }
+    });
+
+    test('happy path: both anchors then proveDocumentComparison (integrity mode) with mask vector + docPair openings', async () => {
+        const submitter = makeSuccessfulSubmitter();
+        const { srv, db } = setupHandlersWithDb({ submitterFactory: () => submitter });
+        const req = makeReq(VALID_ARGS());
+
+        const result: any = await srv.handlers['issueDocumentIntegrityAttestation'](req);
+        expect(req.reject).not.toHaveBeenCalled();
+        expect(result).toEqual({
+            jobId: 'job-issueDocumentIntegrityAttestation-test',
+            status: 'pending',
+            predicateAttestationId: expect.any(String)
+        });
+
+        const inserted = JSON.stringify((db.run as Mock).mock.calls[0][0]);
+        expect(inserted).toContain('documentIntegrity');
+        expect(inserted).toContain(PAYLOAD_B);
+
+        // anchor A, anchor B, then the proof.
+        expect(submitter.call).toHaveBeenCalledTimes(3);
+        const anchorA = (submitter.call as Mock).mock.calls[0][0];
+        expect(anchorA.circuit).toBe('anchorContentRoot');
+        expect(Buffer.from(anchorA.args[0]).toString('hex')).toBe(PAYLOAD_A);
+        expect(Buffer.from(anchorA.args[1]).toString('hex')).toBe(ROOT_A);
+        expect(Buffer.from(anchorA.args[2]).toString('hex')).toBe(SCHEMA_ID);
+        const anchorB = (submitter.call as Mock).mock.calls[1][0];
+        expect(Buffer.from(anchorB.args[0]).toString('hex')).toBe(PAYLOAD_B);
+        expect(Buffer.from(anchorB.args[1]).toString('hex')).toBe(ROOT_B);
+        expect(Buffer.from(anchorB.args[2]).toString('hex')).toBe(SCHEMA_ID);
+
+        const prove = (submitter.call as Mock).mock.calls[2][0];
+        expect(prove.circuit).toBe('proveDocumentComparison');
+        // (a, b, mode=0, allowed_mask, k-dummy)
+        expect(prove.args).toHaveLength(5);
+        expect(Buffer.from(prove.args[0]).toString('hex')).toBe(PAYLOAD_A);
+        expect(Buffer.from(prove.args[1]).toString('hex')).toBe(PAYLOAD_B);
+        expect(prove.args[2]).toBe(0n);
+        // Mask 5 = slots 0 and 2 allowed, expanded to the Vector<16, Boolean> arg.
+        const mask = prove.args[3] as boolean[];
+        expect(mask).toHaveLength(16);
+        expect(mask[0]).toBe(true);
+        expect(mask[1]).toBe(false);
+        expect(mask[2]).toBe(true);
+        expect(mask.filter(Boolean)).toHaveLength(2);
+        expect(prove.args[4]).toBe(1n);
+        // docPair bundle: shared schema + both openings; no inclusion path.
+        expect(prove.merkleProof).toEqual({ docPair: { schema: DOC_SCHEMA, openingA: DOC_OPENING_A, openingB: DOC_OPENING_B } });
+    });
+
+    test('without content roots the proof is the only call', async () => {
+        const submitter = makeSuccessfulSubmitter();
+        const { srv } = setupHandlersWithDb({ submitterFactory: () => submitter });
+        const req = makeReq({ ...VALID_ARGS(), contentRootA: undefined, contentRootB: undefined });
+        await srv.handlers['issueDocumentIntegrityAttestation'](req);
+        expect(req.reject).not.toHaveBeenCalled();
+        expect(submitter.call).toHaveBeenCalledTimes(1);
+        expect((submitter.call as Mock).mock.calls[0][0].circuit).toBe('proveDocumentComparison');
+    });
+});
+
+describe('issueDocumentDiffAttestation', () => {
+    const PAYLOAD_A = 'a'.repeat(64);
+    const PAYLOAD_B = 'b'.repeat(64);
+    const VALID_ARGS = () => ({
+        payloadHashA: PAYLOAD_A,
+        payloadHashB: PAYLOAD_B,
+        k: 2,
+        schemaJson: JSON.stringify(DOC_SCHEMA),
+        openingAJson: JSON.stringify(DOC_OPENING_A),
+        openingBJson: JSON.stringify(DOC_OPENING_B),
+        sessionId: `docdiff-${Math.random().toString(36).slice(2)}`,
+        contractAddress: '0xVAULT',
+        compiledArtifactRef: 'attestation-vault'
+    });
+
+    function setupHandlersWithDb(overrides: any = {}) {
+        const srv = makeFakeService();
+        const db = { run: vi.fn().mockResolvedValue(undefined) };
+        registerSubmissionHandlers(srv as any, db, {
+            resolveContractImpl: vi.fn(async () => ({ ...RESOLVED_CONTRACT_FIXTURE })),
+            walletMaterialFactory: vi.fn(async () => ({
+                accountId: 'a',
+                privateStoragePasswordProvider: () => '0123456789ABCDEFG',
+                walletAndMidnightProvider: {}
+            })),
+            submitterFactory: vi.fn(() => makeSuccessfulSubmitter()),
+            ...overrides
+        });
+        return { srv, db };
+    }
+
+    test.each([
+        [{ payloadHashA: undefined }, /payloadHashA is required/],
+        [{ payloadHashB: PAYLOAD_A }, /must differ/],
+        [{ k: undefined }, /k is required/],
+        [{ k: 0 }, /1\.\.16/],
+        [{ k: 17 }, /1\.\.16/],
+        [{ k: 1.5 }, /1\.\.16/],
+        [{ schemaJson: JSON.stringify(DOC_SCHEMA.slice(0, 15)) }, /schemaJson must be a JSON array of exactly 16 slot descriptors/],
+        [{ schemaJson: JSON.stringify([{ fieldKey: 'zz', kind: 0, scale: '1' }, ...DOC_SCHEMA.slice(1)]) }, /fieldKey must be 64 hex/],
+        [{ openingAJson: JSON.stringify({ ...DOC_OPENING_A, slots: DOC_OPENING_A.slots.slice(0, 15) }) }, /openingAJson.slots must be a JSON array of exactly 16/],
+        [{ openingBJson: 'not json' }, /must be valid JSON/],
+        [{ sessionId: undefined }, /sessionId is required/],
+        [{ contractAddress: undefined }, /contractAddress is required/]
+    ])('rejects %o', async (patch, msg) => {
+        const { srv } = setupHandlersWithDb();
+        const req = makeReq({ ...VALID_ARGS(), ...patch });
+        await srv.handlers['issueDocumentDiffAttestation'](req);
+        expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(msg));
+    });
+
+    test('happy path: proveDocumentComparison (diff mode) with k as BigInt and docPair openings; k lands in the threshold column', async () => {
+        const submitter = makeSuccessfulSubmitter();
+        const { srv, db } = setupHandlersWithDb({ submitterFactory: () => submitter });
+        const req = makeReq(VALID_ARGS());
+
+        const result: any = await srv.handlers['issueDocumentDiffAttestation'](req);
+        expect(req.reject).not.toHaveBeenCalled();
+        expect(result).toEqual({
+            jobId: 'job-issueDocumentDiffAttestation-test',
+            status: 'pending',
+            predicateAttestationId: expect.any(String)
+        });
+
+        const inserted = JSON.stringify((db.run as Mock).mock.calls[0][0]);
+        expect(inserted).toContain('documentDiff');
+        expect(inserted).toContain(PAYLOAD_B);
+
+        expect(submitter.call).toHaveBeenCalledTimes(1);
+        const prove = (submitter.call as Mock).mock.calls[0][0];
+        expect(prove.circuit).toBe('proveDocumentComparison');
+        // (a, b, mode=1, mask-dummy, k)
+        expect(prove.args).toHaveLength(5);
+        expect(Buffer.from(prove.args[0]).toString('hex')).toBe(PAYLOAD_A);
+        expect(Buffer.from(prove.args[1]).toString('hex')).toBe(PAYLOAD_B);
+        expect(prove.args[2]).toBe(1n);
+        expect((prove.args[3] as boolean[]).filter(Boolean)).toHaveLength(0);
+        expect(prove.args[4]).toBe(2n);
+        expect(prove.merkleProof).toEqual({ docPair: { schema: DOC_SCHEMA, openingA: DOC_OPENING_A, openingB: DOC_OPENING_B } });
+    });
+});
+
+describe('issueFieldPredicateAttestationBatch: cross-root document claims', () => {
+    const PAYLOAD_A = 'a'.repeat(64);
+    const PAYLOAD_B = 'b'.repeat(64);
+    const FIELD_KEY = 'f'.repeat(64);
+    const SIBLINGS = ['1'.repeat(64), '2'.repeat(64), '3'.repeat(64), '4'.repeat(64)];
+    const integrityClaim = { predicate: 'documentIntegrity', payloadHashB: PAYLOAD_B, allowedMask: 1, schema: DOC_SCHEMA, openingA: DOC_OPENING_A, openingB: DOC_OPENING_B };
+    const diffClaim = { predicate: 'documentDiff', payloadHashB: PAYLOAD_B, k: 1, schema: DOC_SCHEMA, openingA: DOC_OPENING_A, openingB: DOC_OPENING_B };
+    const numericClaim = {
+        fieldKey: FIELD_KEY, value: '1001', salt: 'f5'.repeat(32), siblings: SIBLINGS,
+        dirs: [true, false, true, false], predicate: 'greaterOrEqual', threshold: '1000'
+    };
+    const VALID_ARGS = (claims: unknown[]) => ({
+        payloadHash: PAYLOAD_A,
+        claimsJson: JSON.stringify(claims),
+        sessionId: `docbatch-${Math.random().toString(36).slice(2)}`,
+        contractAddress: '0xVAULT',
+        compiledArtifactRef: 'attestation-vault'
+    });
+
+    function setupHandlersWithDb(overrides: any = {}) {
+        const srv = makeFakeService();
+        const db = { run: vi.fn().mockResolvedValue(undefined) };
+        registerSubmissionHandlers(srv as any, db, {
+            resolveContractImpl: vi.fn(async () => ({ ...RESOLVED_CONTRACT_FIXTURE })),
+            walletMaterialFactory: vi.fn(async () => ({
+                accountId: 'a',
+                privateStoragePasswordProvider: () => '0123456789ABCDEFG',
+                walletAndMidnightProvider: {}
+            })),
+            submitterFactory: vi.fn(() => makeSuccessfulSubmitter()),
+            ...overrides
+        });
+        return { srv, db };
+    }
+
+    test.each([
+        [[{ ...integrityClaim, payloadHashB: undefined }], /payloadHashB must be 64 hex/],
+        [[{ ...integrityClaim, payloadHashB: PAYLOAD_A }], /must differ from the batch payloadHash/],
+        [[{ ...integrityClaim, allowedMask: 65536 }], /allowedMask must be an integer in 0\.\.65535/],
+        [[{ ...integrityClaim, schema: DOC_SCHEMA.slice(0, 15) }], /schema must be a JSON array of exactly 16 slot descriptors/],
+        [[{ ...diffClaim, k: 0 }], /k must be an integer in 1\.\.16/],
+        [[{ ...diffClaim, openingB: { ...DOC_OPENING_B, slots: DOC_OPENING_B.slots.slice(0, 15) } }], /openingB.slots must be a JSON array of exactly 16/],
+        [[{ ...diffClaim, openingA: { ...DOC_OPENING_A, saltSeed: 'zz' } }], /saltSeed must be 64 hex/]
+    ])('rejects %o', async (claims, msg) => {
+        const { srv } = setupHandlersWithDb();
+        const req = makeReq(VALID_ARGS(claims as unknown[]));
+        await srv.handlers['issueFieldPredicateAttestationBatch'](req);
+        expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(msg));
+    });
+
+    test('mixed batch: numeric + integrity + diff assemble one callBatch in claim order', async () => {
+        const submitter = makeSuccessfulSubmitter();
+        const { srv, db } = setupHandlersWithDb({ submitterFactory: () => submitter });
+        const req = makeReq(VALID_ARGS([numericClaim, integrityClaim, diffClaim]));
+
+        const result: any = await srv.handlers['issueFieldPredicateAttestationBatch'](req);
+        expect(req.reject).not.toHaveBeenCalled();
+        expect(result.droppedDuplicates).toBe(0);
+        const claims = JSON.parse(result.claims);
+        expect(claims).toHaveLength(3);
+        expect(claims[1]).toMatchObject({ predicate: 'documentIntegrity', payloadHashB: PAYLOAD_B, allowedMask: 1 });
+        expect(claims[2]).toMatchObject({ predicate: 'documentDiff', payloadHashB: PAYLOAD_B, k: 1 });
+
+        expect(submitter.callBatch).toHaveBeenCalledTimes(1);
+        const batch = (submitter.callBatch as Mock).mock.calls[0][0];
+        expect(batch.calls.map((c: any) => c.circuit)).toEqual([
+            'proveFieldPredicate', 'proveDocumentComparison', 'proveDocumentComparison'
+        ]);
+        const integ = batch.calls[1];
+        expect(Buffer.from(integ.args[0]).toString('hex')).toBe(PAYLOAD_A);
+        expect(Buffer.from(integ.args[1]).toString('hex')).toBe(PAYLOAD_B);
+        expect(integ.args[2]).toBe(0n);
+        const mask = integ.args[3] as boolean[];
+        // mask 1 = slot 0 only (mask 3 would free BOTH real slots of the
+        // 2-real-field DOC_SCHEMA and is rejected as vacuous since 0.16.0).
+        expect(mask.filter(Boolean)).toHaveLength(1);
+        expect(mask[0]).toBe(true);
+        expect(integ.merkleProof).toEqual({ docPair: { schema: DOC_SCHEMA, openingA: DOC_OPENING_A, openingB: DOC_OPENING_B } });
+        const diff = batch.calls[2];
+        expect(diff.args[2]).toBe(1n);
+        expect(diff.args[4]).toBe(1n);
+        expect(diff.merkleProof).toEqual({ docPair: { schema: DOC_SCHEMA, openingA: DOC_OPENING_A, openingB: DOC_OPENING_B } });
+
+        // Rows: documentDiff stores k in threshold; both carry payloadHashB.
+        const inserted = JSON.stringify((db.run as Mock).mock.calls[0][0]);
+        expect(inserted).toContain('documentIntegrity');
+        expect(inserted).toContain('documentDiff');
+        expect(inserted).toContain(PAYLOAD_B);
+    });
+
+    test('dedup: duplicate integrity tuples (payloadHashB + mask) collapse; different k survives', async () => {
+        const submitter = makeSuccessfulSubmitter();
+        const { srv } = setupHandlersWithDb({ submitterFactory: () => submitter });
+        const req = makeReq(VALID_ARGS([
+            integrityClaim, { ...integrityClaim }, diffClaim, { ...diffClaim, k: 2 }
+        ]));
+        const result: any = await srv.handlers['issueFieldPredicateAttestationBatch'](req);
+        expect(req.reject).not.toHaveBeenCalled();
+        expect(result.droppedDuplicates).toBe(1);
+        const batch = (submitter.callBatch as Mock).mock.calls[0][0];
+        expect(batch.calls.map((c: any) => c.circuit)).toEqual([
+            'proveDocumentComparison', 'proveDocumentComparison', 'proveDocumentComparison'
+        ]);
+        expect(batch.calls.map((c: any) => c.args[2])).toEqual([0n, 1n, 1n]);
+    });
+});
+
+// ---- artifact-generation provenance gates (0.16.0) --------------------------
+
+describe('artifact-generation provenance', () => {
+    const procKey = (kind: string, v: number) => kind + String.fromCharCode(0) + v;
+
+    it('workflow children INHERIT the parent artifactDigest (no re-stamp at child time)', async () => {
+        childCommandLog.length = 0;
+        const submitter = makeSuccessfulSubmitter();
+        const db = { run: vi.fn().mockResolvedValue(undefined) };
+        registerSubmissionHandlers(makeFakeService() as any, db as any, {
+            resolveContractImpl: vi.fn(async () => ({ ...RESOLVED_CONTRACT_FIXTURE })),
+            walletMaterialFactory: vi.fn(async () => ({
+                accountId: 'acc', privateStoragePasswordProvider: () => '0123456789ABCDEFG', walletAndMidnightProvider: {}
+            })),
+            submitterFactory: vi.fn(() => submitter)
+        });
+        const parentDigest = getArtifactGenerationDigest('attestation-vault');
+        const processor = registeredProcessors.get(procKey('issueFieldPredicateAttestation', 1));
+        expect(processor).toBeTruthy();
+        await processor!({
+            op: 'fieldPredicateWorkflow', predicateAttestationId: 'pa-prov-1',
+            payloadHash: 'aa'.repeat(32), fieldKey: 'bb'.repeat(32),
+            contractAddress: '0xV', compiledArtifactRef: 'attestation-vault',
+            predicate: 'lessOrEqual', threshold: '42', opCode: 0,
+            value: '41', salt: 'cc'.repeat(32),
+            siblings: ['dd'.repeat(32), 'dd'.repeat(32), 'dd'.repeat(32), 'dd'.repeat(32)],
+            dirs: [true, false, true, false],
+            contentRoot: 'ee'.repeat(32), schemaId: 'ff'.repeat(32),
+            artifactDigest: parentDigest
+        }, {
+            ID: 'job-prov-parent', kind: 'issueFieldPredicateAttestation',
+            sessionId: 'sess-prov', requestedBy: 'test-user', commandVersion: 1
+        } as any);
+        // anchorContentRoot child + proveFieldPredicate child, both carrying
+        // the PARENT's digest as passed by the handler (not re-stamped).
+        expect(childCommandLog.length).toBe(2);
+        for (const entry of childCommandLog) {
+            expect(entry.command.artifactDigest).toBe(parentDigest);
+        }
+    });
+
+    it('reconciliation finalizer fails closed on a missing or mismatched digest', async () => {
+        const finalize = registeredFinalizers.get(procKey('anchorDocument', 1));
+        expect(finalize).toBeTruthy();
+        const evidence: any = { txHash: '0xtx', finalizedAt: '2026-08-16T00:00:00Z' };
+        const base = {
+            op: 'anchorDocument', documentId: 'doc-prov-1', payloadHash: 'aa'.repeat(32),
+            metadataHash: 'bb'.repeat(32), contractAddress: '0xV', compiledArtifactRef: 'attestation-vault'
+        };
+        await expect(finalize!(base, { ID: 'job-prov-r1' } as any, evidence))
+            .rejects.toThrow(/no artifact-generation digest/);
+        await expect(finalize!({ ...base, artifactDigest: 'ff'.repeat(32) }, { ID: 'job-prov-r2' } as any, evidence))
+            .rejects.toThrow(/different generation/);
     });
 });

@@ -85,7 +85,7 @@ beforeEach(() => {
 // ---- verifyAttestationState ------------------------------------------------
 
 describe('verifyAttestationState network override', () => {
-    const POSITIVE = { attested: true, contentRootOk: false, attesterId: 'abc' };
+    const POSITIVE = { attested: true, contentRootOk: false, schemaOk: false, attesterId: 'abc' };
 
     test('omitted network → configured endpoints, exactly as before', async () => {
         const reader = vi.fn(async () => POSITIVE);
@@ -168,7 +168,7 @@ describe('verifyAttestationState network override', () => {
         const reader = vi.fn();
         const srv = setup({ attestationStateReader: reader });
         const r = await srv.handlers['verifyAttestationState'](makeReq({ contractAddress: VAULT, payloadHash: PAYLOAD }));
-        expect(r).toEqual({ verified: false, attested: false, contentRootOk: false, attesterId: '' });
+        expect(r).toEqual({ verified: false, attested: false, contentRootOk: false, schemaOk: false, attesterId: '' });
         expect(reader).not.toHaveBeenCalled();
     });
 });
@@ -176,7 +176,7 @@ describe('verifyAttestationState network override', () => {
 // ---- verifyPredicateState ----------------------------------------------------
 
 describe('verifyPredicateState network override', () => {
-    const ARGS = { contractAddress: VAULT, payloadHash: PAYLOAD, predicate: 'greaterOrEqual', threshold: 42 };
+    const ARGS = { contractAddress: VAULT, payloadHash: PAYLOAD, fieldKey: 'e'.repeat(64), predicate: 'greaterOrEqual', threshold: 42 };
 
     test('override to another network → that network\'s default public indexer', async () => {
         const reader = vi.fn(async () => true);

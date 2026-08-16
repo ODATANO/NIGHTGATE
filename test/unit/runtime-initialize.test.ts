@@ -85,6 +85,16 @@ vi.mock('../../srv/submission/wallet-sync-state-store', () => ({
     clearAllEncryptionKeys: mockClearAllEncryptionKeys
 }));
 
+// The network/database binding guard has its own behavioral tests
+// (sync-state-network-guard.test.ts, against a fake db). Here it is mocked so
+// the fully-mocked cds.ql of this suite does not need the .where chain; one
+// test below flips it to throwing to pin initialize()'s fail-closed path.
+const mockEnsureSyncStateSingleton = vi.hoisted(() => (vi.fn(async () => undefined)));
+vi.mock('../../srv/utils/sync-state', () => ({
+    ensureSyncStateSingleton: mockEnsureSyncStateSingleton,
+    SyncStateNetworkMismatchError: class SyncStateNetworkMismatchError extends Error {}
+}));
+
 import cds from '@sap/cds';
 import { getStatus, initialize, shutdown } from '../../src/index';
 
@@ -307,5 +317,18 @@ describe('runtime initialize', () => {
         } finally {
             logSpy.mockRestore();
         }
+    });
+
+    it('fails closed when the database is bound to another network', async () => {
+        mockEnsureSyncStateSingleton.mockRejectedValueOnce(
+            new Error("This database is bound to network 'preview'"));
+
+        await expect(initialize()).rejects.toThrow(/bound to network 'preview'/);
+        expect(mockStartCrawler).not.toHaveBeenCalled();
+        expect(getStatus()).toEqual(expect.objectContaining({
+            initialized: false,
+            mode: 'offline',
+            lastError: expect.stringContaining("bound to network 'preview'")
+        }));
     });
 });

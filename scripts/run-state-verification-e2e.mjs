@@ -8,7 +8,7 @@
 //   anchorDocument (attest payload) →
 //   verifyAttestationState        (#2: poll until verified=true from live state) →
 //   verifyDocument (+contractAddress)  (#3: state fallback, verified=true) →
-//   issuePredicateAttestation → verifyPredicateAttestation (#3: state fallback) →
+//   issueFieldPredicateAttestation → verifyPredicateAttestation (#3: state fallback) →
 //   grantDisclosure → reindexDisclosures (#1) → GET DisclosureGrants active=true →
 //   revokeDisclosure → reindexDisclosures (#1) → GET DisclosureGrants active=false
 //
@@ -87,7 +87,7 @@ async function pollJob(sessionId, jobId, label, { timeoutMs = PREWARM_TIMEOUT_MS
         if (status !== last) { process.stdout.write(`\n     [${label}] ${jobId.slice(0, 8)} status=${status}`); last = status; }
         else process.stdout.write('.');
         if (status === 'succeeded') { process.stdout.write('\n'); return result ? JSON.parse(result) : {}; }
-        if (status === 'failed') { process.stdout.write('\n'); fail(`[${label}] job failed: ${errorCode} — ${errorMessage}`); }
+        if (status === 'failed') { process.stdout.write('\n'); fail(`[${label}] job failed: ${errorCode} - ${errorMessage}`); }
         await new Promise(res => setTimeout(res, intervalMs));
     }
     fail(`[${label}] job ${jobId} did not finish within ${timeoutMs / 1000}s`);
@@ -168,7 +168,7 @@ async function waitForServer() {
         console.log(`OK   contractAddress = ${contractAddress}`);
     }
 
-    step('4. registerGranteeIdentity — bind principal → granteeId');
+    step('4. registerGranteeIdentity - bind principal → granteeId');
     r = await post('/registerGranteeIdentity', { bindingInput: randomBytes(32).toString('hex'), scope: contractAddress });
     if (r.status >= 400) fail(`registerGranteeIdentity → ${r.status}: ${pretty(r.body)}`);
     const grantee = r.body?.granteeId;
@@ -187,29 +187,43 @@ async function waitForServer() {
     await pollJob(sessionId, r.body.jobId, 'attest');
     console.log(`OK   payload attested (documentId=${documentId})`);
 
-    step('6. verifyAttestationState — crawler-free (#2), poll until verified=true');
+    step('6. verifyAttestationState - crawler-free (#2), poll until verified=true');
     const av = await pollVerify(fn('verifyAttestationState', { contractAddress, payloadHash }), 'verifyAttestationState');
     if (av.attested !== true) fail(`expected attested=true: ${pretty(av)}`);
     console.log(`OK   attestation confirmed from live state (attesterId=${(av.attesterId || '').slice(0, 12)}…)`);
 
-    step('7. verifyDocument with contractAddress — crawler-free fallback (#3)');
+    step('7. verifyDocument with contractAddress - crawler-free fallback (#3)');
     const vd = await pollVerify(
         fn('verifyDocument', { documentId: guid(documentId), providedSha256: payloadHash, contractAddress }),
         'verifyDocument');
     console.log(`OK   document verified via state fallback (anchoredTxHash=${(vd.anchoredTxHash || '').slice(0, 10)}…)`);
 
-    step('8. issuePredicateAttestation (value=5 <= threshold=10)');
-    r = await post('/issuePredicateAttestation', {
-        payloadHash, value: '5', predicate: 'lessOrEqual', threshold: 10,
-        unit: 'demo', sessionId, contractAddress
+    step('8. issueFieldPredicateAttestation (demoValue=5 <= threshold=10, root-bound)');
+    // The commitment-only issuePredicateAttestation was removed in 0.16.0;
+    // numeric predicates are field-bound. Build a tiny content tree and anchor
+    // it in-flow (anchorContentRoot + proveFieldPredicate).
+    r = await post('/prepareDocumentProof', {
+        documentJson: JSON.stringify({ demoValue: 5 }),
+        proofFieldsJson: JSON.stringify([{ field: 'demoValue', scale: 1 }])
     });
-    if (r.status >= 400) fail(`issuePredicateAttestation → ${r.status}: ${pretty(r.body)}`);
+    if (r.status >= 400) fail(`prepareDocumentProof → ${r.status}: ${pretty(r.body)}`);
+    const demoField = JSON.parse(r.body.fields).find(f => f.field === 'demoValue');
+    const demoRoot = r.body.contentRoot;
+    const demoSchemaId = r.body.schemaId;
+    r = await post('/issueFieldPredicateAttestation', {
+        payloadHash, fieldKey: demoField.fieldKey, value: demoField.value, fieldSalt: demoField.salt,
+        predicate: 'lessOrEqual', threshold: 10, unit: 'demo',
+        contentRoot: demoRoot, schemaId: demoSchemaId,
+        siblingsJson: JSON.stringify(demoField.siblings), dirsJson: JSON.stringify(demoField.dirs),
+        sessionId, contractAddress
+    });
+    if (r.status >= 400) fail(`issueFieldPredicateAttestation → ${r.status}: ${pretty(r.body)}`);
     const predicateAttestationId = r.body?.predicateAttestationId;
     if (!predicateAttestationId) fail(`no predicateAttestationId: ${pretty(r.body)}`);
     await pollJob(sessionId, r.body.jobId, 'predicate');
-    console.log(`OK   predicate proven on-chain (predicateAttestationId=${predicateAttestationId})`);
+    console.log(`OK   field predicate proven on-chain (predicateAttestationId=${predicateAttestationId})`);
 
-    step('9. verifyPredicateAttestation — crawler-free fallback (#3)');
+    step('9. verifyPredicateAttestation - crawler-free fallback (#3)');
     await pollVerify(fn('verifyPredicateAttestation', { predicateAttestationId: guid(predicateAttestationId) }),
         'verifyPredicateAttestation');
     console.log('OK   predicate result confirmed from live state');
@@ -234,6 +248,6 @@ async function waitForServer() {
     console.log(`Grantee:   ${grantee}`);
     console.log(`Payload:   ${payloadHash}`);
     console.log('\nNote: run with cds.requires.nightgate.crawler.enabled=false for a true');
-    console.log('criterion-6 check — every confirmation above came from queryContractState,');
+    console.log('criterion-6 check - every confirmation above came from queryContractState,');
     console.log('not from a locally-indexed txHash.');
 })();

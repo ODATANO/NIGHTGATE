@@ -381,12 +381,21 @@ entity Attestations : cuid, managed {
  * Document anchoring
  */
 entity Documents : cuid, managed {
-    sha256         : HexEncoded not null;
-    contentType    : String(100);
-    size           : Integer64;
-    storageRef     : String(500); // file:// | s3:// | ipfs://
-    anchoredTxHash : HexEncoded;
-    anchoredAt     : Timestamp;
+    sha256          : HexEncoded not null;
+    contentType     : String(100);
+    size            : Integer64;
+    storageRef      : String(500); // file:// | s3:// | ipfs://
+    anchoredTxHash  : HexEncoded;
+    anchoredAt      : Timestamp;
+    // Evidence binding (0.16.0): the anchoring context is part of the
+    // evidence, so verifyDocument can never be pointed at a DIFFERENT vault
+    // that happens to attest the same hash. Rows from earlier releases carry
+    // nulls; for those the caller-supplied contractAddress applies.
+    userId          : String(200); // req.user.id at anchor time; scopes reads
+    contractAddress : HexEncoded;  // AttestationVault the anchor was submitted to
+    network         : String(30);  // network id at anchor time
+    compiledArtifactRef : String(200); // registered artifact ALIAS the anchor used
+    artifactDigest      : HexEncoded;  // sha256 of the artifact GENERATION (alias is mutable)
 }
 
 /**
@@ -395,16 +404,23 @@ entity Documents : cuid, managed {
 entity PredicateAttestations : cuid, managed {
     payloadHash     : HexEncoded not null; // attestation this predicate is about
     contractAddress : HexEncoded not null; // AttestationVault deployment
-    predicate       : String(20) not null; // 'lessOrEqual' | 'greaterOrEqual' | 'bytesEquality' | 'setMembership'
+    predicate       : String(20) not null; // 'lessOrEqual' | 'greaterOrEqual' | 'bytesEquality' | 'setMembership' | 'documentIntegrity' | 'documentDiff'
     op              : Integer; // 0 | 1 for the numeric predicates; null for the bytes kinds
-    threshold       : Integer64; // scaled integer (numeric predicates only)
+    threshold       : Integer64; // scaled integer (numeric predicates); minimum differing slots k (documentDiff)
     unit            : String(50); // e.g. 'kgCO2e/kWh' (informational)
     fieldKey        : HexEncoded; // set for field-bound proofs (proveFieldPredicate); null for plain provePredicate
     expectedDigest  : HexEncoded; // bytesEquality: public expected value digest
     setRoot         : HexEncoded; // setMembership: canonical allow-list set root
-    valueCommitment : HexEncoded; // persistentCommit(value, salt), on-chain
+    payloadHashB    : HexEncoded; // cross-root kinds: the second document (payloadHash is document A)
+    allowedMask     : Integer; // documentIntegrity: packed 16-bit mask (bit i = slot i may differ)
     provenTxHash    : HexEncoded; // tx that recorded the on-chain result
     provenAt        : Timestamp;
+    // Evidence provenance (0.16.0): the proving context. The crawler-free
+    // verify path reads THESE coordinates instead of the current defaults;
+    // caller parameters may only confirm them. Null on pre-0.16.0 rows.
+    network             : String(30);  // network id at proving time
+    compiledArtifactRef : String(200); // registered artifact ALIAS the proof used
+    artifactDigest      : HexEncoded;  // sha256 of the artifact GENERATION (alias is mutable)
 }
 
 /**

@@ -2,20 +2,38 @@ import type * as __compactRuntime from '@midnight-ntwrk/compact-runtime';
 
 export type Witnesses<PS> = {
   local_secret_key(context: __compactRuntime.WitnessContext<Ledger, PS>): [PS, Uint8Array];
-  attested_value(context: __compactRuntime.WitnessContext<Ledger, PS>): [PS, bigint];
-  value_salt(context: __compactRuntime.WitnessContext<Ledger, PS>): [PS, Uint8Array];
   field_value(context: __compactRuntime.WitnessContext<Ledger, PS>): [PS, bigint];
+  field_salt(context: __compactRuntime.WitnessContext<Ledger, PS>): [PS, Uint8Array];
   merkle_siblings(context: __compactRuntime.WitnessContext<Ledger, PS>): [PS, Uint8Array[]];
   merkle_dirs(context: __compactRuntime.WitnessContext<Ledger, PS>): [PS, boolean[]];
   field_digest(context: __compactRuntime.WitnessContext<Ledger, PS>): [PS, Uint8Array];
   set_siblings(context: __compactRuntime.WitnessContext<Ledger, PS>): [PS, Uint8Array[]];
   set_dirs(context: __compactRuntime.WitnessContext<Ledger, PS>): [PS, boolean[]];
+  doc_schema(context: __compactRuntime.WitnessContext<Ledger, PS>): [PS, { field_key: Uint8Array,
+                                                                           kind: bigint,
+                                                                           scale: bigint
+                                                                         }[]];
+  doc_salt_a(context: __compactRuntime.WitnessContext<Ledger, PS>): [PS, Uint8Array];
+  doc_salt_b(context: __compactRuntime.WitnessContext<Ledger, PS>): [PS, Uint8Array];
+  doc_slots_a(context: __compactRuntime.WitnessContext<Ledger, PS>): [PS, { present: boolean,
+                                                                            uint_value: bigint,
+                                                                            value_digest: Uint8Array
+                                                                          }[]];
+  doc_slots_b(context: __compactRuntime.WitnessContext<Ledger, PS>): [PS, { present: boolean,
+                                                                            uint_value: bigint,
+                                                                            value_digest: Uint8Array
+                                                                          }[]];
 }
 
 export type ImpureCircuits<PS> = {
   attest(context: __compactRuntime.CircuitContext<PS>,
          payload_hash_0: Uint8Array,
          metadata_hash_0: Uint8Array): __compactRuntime.CircuitResults<PS, []>;
+  attestGuarded(context: __compactRuntime.CircuitContext<PS>,
+                mode_0: bigint,
+                payload_hash_0: Uint8Array,
+                metadata_hash_0: Uint8Array,
+                nonce_0: Uint8Array): __compactRuntime.CircuitResults<PS, []>;
   grantDisclosure(context: __compactRuntime.CircuitContext<PS>,
                   payload_hash_0: Uint8Array,
                   grantee_0: Uint8Array,
@@ -23,12 +41,6 @@ export type ImpureCircuits<PS> = {
   revokeDisclosure(context: __compactRuntime.CircuitContext<PS>,
                    payload_hash_0: Uint8Array,
                    grantee_0: Uint8Array): __compactRuntime.CircuitResults<PS, []>;
-  commitValue(context: __compactRuntime.CircuitContext<PS>,
-              payload_hash_0: Uint8Array): __compactRuntime.CircuitResults<PS, []>;
-  provePredicate(context: __compactRuntime.CircuitContext<PS>,
-                 payload_hash_0: Uint8Array,
-                 threshold_0: bigint,
-                 op_0: bigint): __compactRuntime.CircuitResults<PS, []>;
   registerPassport(context: __compactRuntime.CircuitContext<PS>,
                    passportId_0: Uint8Array,
                    owner_id_0: Uint8Array): __compactRuntime.CircuitResults<PS, []>;
@@ -37,7 +49,8 @@ export type ImpureCircuits<PS> = {
                payload_hash_0: Uint8Array): __compactRuntime.CircuitResults<PS, []>;
   anchorContentRoot(context: __compactRuntime.CircuitContext<PS>,
                     payload_hash_0: Uint8Array,
-                    content_root_0: Uint8Array): __compactRuntime.CircuitResults<PS, []>;
+                    content_root_0: Uint8Array,
+                    schema_id_0: Uint8Array): __compactRuntime.CircuitResults<PS, []>;
   proveFieldPredicate(context: __compactRuntime.CircuitContext<PS>,
                       payload_hash_0: Uint8Array,
                       field_key_0: Uint8Array,
@@ -51,12 +64,23 @@ export type ImpureCircuits<PS> = {
                        payload_hash_0: Uint8Array,
                        field_key_0: Uint8Array,
                        set_root_0: Uint8Array): __compactRuntime.CircuitResults<PS, []>;
+  proveDocumentComparison(context: __compactRuntime.CircuitContext<PS>,
+                          payload_hash_a_0: Uint8Array,
+                          payload_hash_b_0: Uint8Array,
+                          mode_0: bigint,
+                          allowed_mask_0: boolean[],
+                          k_0: bigint): __compactRuntime.CircuitResults<PS, []>;
 }
 
 export type ProvableCircuits<PS> = {
   attest(context: __compactRuntime.CircuitContext<PS>,
          payload_hash_0: Uint8Array,
          metadata_hash_0: Uint8Array): __compactRuntime.CircuitResults<PS, []>;
+  attestGuarded(context: __compactRuntime.CircuitContext<PS>,
+                mode_0: bigint,
+                payload_hash_0: Uint8Array,
+                metadata_hash_0: Uint8Array,
+                nonce_0: Uint8Array): __compactRuntime.CircuitResults<PS, []>;
   grantDisclosure(context: __compactRuntime.CircuitContext<PS>,
                   payload_hash_0: Uint8Array,
                   grantee_0: Uint8Array,
@@ -64,12 +88,6 @@ export type ProvableCircuits<PS> = {
   revokeDisclosure(context: __compactRuntime.CircuitContext<PS>,
                    payload_hash_0: Uint8Array,
                    grantee_0: Uint8Array): __compactRuntime.CircuitResults<PS, []>;
-  commitValue(context: __compactRuntime.CircuitContext<PS>,
-              payload_hash_0: Uint8Array): __compactRuntime.CircuitResults<PS, []>;
-  provePredicate(context: __compactRuntime.CircuitContext<PS>,
-                 payload_hash_0: Uint8Array,
-                 threshold_0: bigint,
-                 op_0: bigint): __compactRuntime.CircuitResults<PS, []>;
   registerPassport(context: __compactRuntime.CircuitContext<PS>,
                    passportId_0: Uint8Array,
                    owner_id_0: Uint8Array): __compactRuntime.CircuitResults<PS, []>;
@@ -78,7 +96,8 @@ export type ProvableCircuits<PS> = {
                payload_hash_0: Uint8Array): __compactRuntime.CircuitResults<PS, []>;
   anchorContentRoot(context: __compactRuntime.CircuitContext<PS>,
                     payload_hash_0: Uint8Array,
-                    content_root_0: Uint8Array): __compactRuntime.CircuitResults<PS, []>;
+                    content_root_0: Uint8Array,
+                    schema_id_0: Uint8Array): __compactRuntime.CircuitResults<PS, []>;
   proveFieldPredicate(context: __compactRuntime.CircuitContext<PS>,
                       payload_hash_0: Uint8Array,
                       field_key_0: Uint8Array,
@@ -92,30 +111,60 @@ export type ProvableCircuits<PS> = {
                        payload_hash_0: Uint8Array,
                        field_key_0: Uint8Array,
                        set_root_0: Uint8Array): __compactRuntime.CircuitResults<PS, []>;
+  proveDocumentComparison(context: __compactRuntime.CircuitContext<PS>,
+                          payload_hash_a_0: Uint8Array,
+                          payload_hash_b_0: Uint8Array,
+                          mode_0: bigint,
+                          allowed_mask_0: boolean[],
+                          k_0: bigint): __compactRuntime.CircuitResults<PS, []>;
 }
 
 export type PureCircuits = {
-  leafHash(field_key_0: Uint8Array, value_0: bigint): Uint8Array;
+  leafHash(field_key_0: Uint8Array, value_0: bigint, salt_0: Uint8Array): Uint8Array;
   nodeHash(left_0: Uint8Array, right_0: Uint8Array): Uint8Array;
-  bytesLeafHash(field_key_0: Uint8Array, value_digest_0: Uint8Array): Uint8Array;
+  bytesLeafHash(field_key_0: Uint8Array,
+                value_digest_0: Uint8Array,
+                salt_0: Uint8Array): Uint8Array;
+  absentLeafHash(field_key_0: Uint8Array, salt_0: Uint8Array): Uint8Array;
   setLeafHash(value_digest_0: Uint8Array): Uint8Array;
+  descriptorLeafHash(field_key_0: Uint8Array, kind_0: bigint, scale_0: bigint): Uint8Array;
+  slotSalt(seed_0: Uint8Array, index_0: bigint): Uint8Array;
+  emptyLeafKey(): Uint8Array;
 }
 
 export type Circuits<PS> = {
   leafHash(context: __compactRuntime.CircuitContext<PS>,
            field_key_0: Uint8Array,
-           value_0: bigint): __compactRuntime.CircuitResults<PS, Uint8Array>;
+           value_0: bigint,
+           salt_0: Uint8Array): __compactRuntime.CircuitResults<PS, Uint8Array>;
   nodeHash(context: __compactRuntime.CircuitContext<PS>,
            left_0: Uint8Array,
            right_0: Uint8Array): __compactRuntime.CircuitResults<PS, Uint8Array>;
   bytesLeafHash(context: __compactRuntime.CircuitContext<PS>,
                 field_key_0: Uint8Array,
-                value_digest_0: Uint8Array): __compactRuntime.CircuitResults<PS, Uint8Array>;
+                value_digest_0: Uint8Array,
+                salt_0: Uint8Array): __compactRuntime.CircuitResults<PS, Uint8Array>;
+  absentLeafHash(context: __compactRuntime.CircuitContext<PS>,
+                 field_key_0: Uint8Array,
+                 salt_0: Uint8Array): __compactRuntime.CircuitResults<PS, Uint8Array>;
   setLeafHash(context: __compactRuntime.CircuitContext<PS>,
               value_digest_0: Uint8Array): __compactRuntime.CircuitResults<PS, Uint8Array>;
+  descriptorLeafHash(context: __compactRuntime.CircuitContext<PS>,
+                     field_key_0: Uint8Array,
+                     kind_0: bigint,
+                     scale_0: bigint): __compactRuntime.CircuitResults<PS, Uint8Array>;
+  slotSalt(context: __compactRuntime.CircuitContext<PS>,
+           seed_0: Uint8Array,
+           index_0: bigint): __compactRuntime.CircuitResults<PS, Uint8Array>;
+  emptyLeafKey(context: __compactRuntime.CircuitContext<PS>): __compactRuntime.CircuitResults<PS, Uint8Array>;
   attest(context: __compactRuntime.CircuitContext<PS>,
          payload_hash_0: Uint8Array,
          metadata_hash_0: Uint8Array): __compactRuntime.CircuitResults<PS, []>;
+  attestGuarded(context: __compactRuntime.CircuitContext<PS>,
+                mode_0: bigint,
+                payload_hash_0: Uint8Array,
+                metadata_hash_0: Uint8Array,
+                nonce_0: Uint8Array): __compactRuntime.CircuitResults<PS, []>;
   grantDisclosure(context: __compactRuntime.CircuitContext<PS>,
                   payload_hash_0: Uint8Array,
                   grantee_0: Uint8Array,
@@ -123,12 +172,6 @@ export type Circuits<PS> = {
   revokeDisclosure(context: __compactRuntime.CircuitContext<PS>,
                    payload_hash_0: Uint8Array,
                    grantee_0: Uint8Array): __compactRuntime.CircuitResults<PS, []>;
-  commitValue(context: __compactRuntime.CircuitContext<PS>,
-              payload_hash_0: Uint8Array): __compactRuntime.CircuitResults<PS, []>;
-  provePredicate(context: __compactRuntime.CircuitContext<PS>,
-                 payload_hash_0: Uint8Array,
-                 threshold_0: bigint,
-                 op_0: bigint): __compactRuntime.CircuitResults<PS, []>;
   registerPassport(context: __compactRuntime.CircuitContext<PS>,
                    passportId_0: Uint8Array,
                    owner_id_0: Uint8Array): __compactRuntime.CircuitResults<PS, []>;
@@ -137,7 +180,8 @@ export type Circuits<PS> = {
                payload_hash_0: Uint8Array): __compactRuntime.CircuitResults<PS, []>;
   anchorContentRoot(context: __compactRuntime.CircuitContext<PS>,
                     payload_hash_0: Uint8Array,
-                    content_root_0: Uint8Array): __compactRuntime.CircuitResults<PS, []>;
+                    content_root_0: Uint8Array,
+                    schema_id_0: Uint8Array): __compactRuntime.CircuitResults<PS, []>;
   proveFieldPredicate(context: __compactRuntime.CircuitContext<PS>,
                       payload_hash_0: Uint8Array,
                       field_key_0: Uint8Array,
@@ -151,6 +195,12 @@ export type Circuits<PS> = {
                        payload_hash_0: Uint8Array,
                        field_key_0: Uint8Array,
                        set_root_0: Uint8Array): __compactRuntime.CircuitResults<PS, []>;
+  proveDocumentComparison(context: __compactRuntime.CircuitContext<PS>,
+                          payload_hash_a_0: Uint8Array,
+                          payload_hash_b_0: Uint8Array,
+                          mode_0: bigint,
+                          allowed_mask_0: boolean[],
+                          k_0: bigint): __compactRuntime.CircuitResults<PS, []>;
 }
 
 export type Ledger = {
@@ -179,20 +229,6 @@ export type Ledger = {
       lookup(key_1: Uint8Array): bigint;
       [Symbol.iterator](): Iterator<[Uint8Array, bigint]>
     }
-  };
-  value_commitments: {
-    isEmpty(): boolean;
-    size(): bigint;
-    member(key_0: Uint8Array): boolean;
-    lookup(key_0: Uint8Array): Uint8Array;
-    [Symbol.iterator](): Iterator<[Uint8Array, Uint8Array]>
-  };
-  predicate_results: {
-    isEmpty(): boolean;
-    size(): bigint;
-    member(key_0: Uint8Array): boolean;
-    lookup(key_0: Uint8Array): boolean;
-    [Symbol.iterator](): Iterator<[Uint8Array, boolean]>
   };
   passport_bindings: {
     isEmpty(): boolean;
@@ -237,6 +273,42 @@ export type Ledger = {
     lookup(key_0: Uint8Array): boolean;
     [Symbol.iterator](): Iterator<[Uint8Array, boolean]>
   };
+  document_integrity_results: {
+    isEmpty(): boolean;
+    size(): bigint;
+    member(key_0: Uint8Array): boolean;
+    lookup(key_0: Uint8Array): boolean;
+    [Symbol.iterator](): Iterator<[Uint8Array, boolean]>
+  };
+  document_diff_results: {
+    isEmpty(): boolean;
+    size(): bigint;
+    member(key_0: Uint8Array): boolean;
+    lookup(key_0: Uint8Array): boolean;
+    [Symbol.iterator](): Iterator<[Uint8Array, boolean]>
+  };
+  content_schemas: {
+    isEmpty(): boolean;
+    size(): bigint;
+    member(key_0: Uint8Array): boolean;
+    lookup(key_0: Uint8Array): Uint8Array;
+    [Symbol.iterator](): Iterator<[Uint8Array, Uint8Array]>
+  };
+  attest_commits: {
+    isEmpty(): boolean;
+    size(): bigint;
+    member(key_0: Uint8Array): boolean;
+    lookup(key_0: Uint8Array): { owner: Uint8Array, seq: bigint };
+    [Symbol.iterator](): Iterator<[Uint8Array, { owner: Uint8Array, seq: bigint }]>
+  };
+  attestation_seqs: {
+    isEmpty(): boolean;
+    size(): bigint;
+    member(key_0: Uint8Array): boolean;
+    lookup(key_0: Uint8Array): bigint;
+    [Symbol.iterator](): Iterator<[Uint8Array, bigint]>
+  };
+  readonly attest_seq_next: bigint;
 }
 
 export type ContractReferenceLocations = any;
@@ -249,7 +321,8 @@ export declare class Contract<PS = any, W extends Witnesses<PS> = Witnesses<PS>>
   impureCircuits: ImpureCircuits<PS>;
   provableCircuits: ProvableCircuits<PS>;
   constructor(witnesses: W);
-  initialState(context: __compactRuntime.ConstructorContext<PS>): __compactRuntime.ConstructorResult<PS>;
+  initialState(context: __compactRuntime.ConstructorContext<PS>,
+               initial_registrar_0: Uint8Array): __compactRuntime.ConstructorResult<PS>;
 }
 
 export declare function ledger(state: __compactRuntime.StateValue | __compactRuntime.ChargedState): Ledger;

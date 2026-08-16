@@ -41,7 +41,7 @@ import cds from '@sap/cds';
 import { BlockProcessor } from '../../srv/crawler/BlockProcessor';
 
 // Boot the in-memory CAP server. Not assigned to a `test` const on purpose
-// (would shadow Jest's global test()).
+// (would shadow Vitest's global test()).
 cds.test(__dirname + '/../..');
 
 const BLOCKS = 'midnight.Blocks';

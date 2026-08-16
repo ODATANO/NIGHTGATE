@@ -10,6 +10,7 @@
 
 import WebSocket from 'ws';
 import cds from '@sap/cds';
+import { redactUrlCredentials } from '../utils/redact-url';
 const log = cds.log('nightgate:node');
 
 // ============================================================================
@@ -116,7 +117,7 @@ export class MidnightNodeProvider {
                     this.connected = true;
                     this.reconnecting = false;
                     this.reconnectAttempts = 0;
-                    log.info(`Connected to ${this.config.nodeUrl}`);
+                    log.info(`Connected to ${redactUrlCredentials(this.config.nodeUrl)}`);
                     resolve();
                 });
 
@@ -140,7 +141,7 @@ export class MidnightNodeProvider {
 
                     if (!wasConnected) {
                         // Socket closed before 'open', reject the connect() promise
-                        reject(new Error(`WebSocket closed before connection established to ${this.config.nodeUrl}`));
+                        reject(new Error(`WebSocket closed before connection established to ${redactUrlCredentials(this.config.nodeUrl)}`));
                         return;
                     }
 

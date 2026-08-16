@@ -43,11 +43,11 @@ The two pipelines could share data (the indexer's GraphQL view duplicates much o
 
 ## Why a worker thread
 
-The Midnight wallet SDK is built on [Effect.ts](https://effect.website). Its fiber scheduler **monopolises the host's microtask queue** while a chain sync is running — we observed plain `setInterval` callbacks not firing for 75+ seconds during sync, and CAP request handlers timing out at 10 seconds while persistence saves were going through fine.
+The Midnight wallet SDK is built on [Effect.ts](https://effect.website). Its fiber scheduler **monopolises the host's microtask queue** while a chain sync is running - we observed plain `setInterval` callbacks not firing for 75+ seconds during sync, and CAP request handlers timing out at 10 seconds while persistence saves were going through fine.
 
 The fix is structural: run the wallet SDK in its own `worker_threads` worker. Each worker has its own V8 isolate with its own event loop, so the SDK's microtask saturation only affects that thread.
 
-### Phase 1 — wallet sync isolation (2026-05-17)
+### Phase 1 - wallet sync isolation (2026-05-17)
 
 - `srv/midnight/wallet-worker.ts` is the worker entry. Holds the `WalletFacade`, runs `facade.start()` for sync, owns the three sub-wallets.
 - `srv/midnight/wallet-worker-client.ts` is the main-thread RPC client. One `MessageChannel` per call: post `{ kind: 'rpc', method, args, port }`, await the reply on the port.
@@ -56,11 +56,11 @@ The fix is structural: run the wallet SDK in its own `worker_threads` worker. Ea
 
 Verification: in a Phase-1 test run, the main thread's `setInterval` callbacks fired regularly throughout a 75-second wallet sync, having been frozen entirely before.
 
-### Phase 2a — dust registration in the worker (2026-05-17)
+### Phase 2a - dust registration in the worker (2026-05-17)
 
-`facade.registerNightUtxosForDustGeneration` builds + finalizes + submits in one flow. Moving the whole flow into the worker means no SDK objects ever cross the thread boundary — the worker returns only primitives (`txId`, counts, addresses as strings). The RPC is `walletRegisterDustGeneration`.
+`facade.registerNightUtxosForDustGeneration` builds + finalizes + submits in one flow. Moving the whole flow into the worker means no SDK objects ever cross the thread boundary - the worker returns only primitives (`txId`, counts, addresses as strings). The RPC is `walletRegisterDustGeneration`.
 
-### Phase 2b — contract deploy + call in the worker (2026-05-17)
+### Phase 2b - contract deploy + call in the worker (2026-05-17)
 
 `TransactionSubmitter.deploy / .call` used to run the SDK on the main thread. Phase 2b moved them into the worker via new RPCs `walletDeployContract` / `walletSubmitContractCall`. The compiled contract artifact (Compact `managed/` output) is dynamic-imported inside the worker and cached by name.
 
@@ -75,7 +75,7 @@ The same worker pattern, extended to expose:
 - `walletTransferNight` (build + balance + finalize + submit a NIGHT transfer)
 - `walletDeregisterDustGeneration` (symmetric to register)
 - `walletGetBalance` (read-only snapshot of all three sub-wallet balances)
-- `walletEstimateTransferFee` (build the recipe in the worker, call `facade.estimateTransactionFee`, discard the recipe — no proof generation, no submit)
+- `walletEstimateTransferFee` (build the recipe in the worker, call `facade.estimateTransactionFee`, discard the recipe - no proof generation, no submit)
 
 (Phase 2b also shipped `walletShieldNight` / `walletUnshieldNight` / `walletEstimateSwapFee`; removed in 0.10.5: NIGHT is unshielded-only, so a cross-ledger shift is not a legal operation. See `docs/feature-requests/bug_003-initswap-drops-destination-half-fund-loss.md`.)
 
@@ -116,11 +116,11 @@ Since the 0.2.0 async-job migration the handler doesn't block on this flow: it w
 
 ### The "sessionId" indirection
 
-The OData layer's `sessionId` is the user-facing UUID stored in `WalletSessions`. But the worker stores facades keyed on `accountId` — a deterministic hash of the viewing key. Multiple OData sessions with the same wallet share the same facade in the worker.
+The OData layer's `sessionId` is the user-facing UUID stored in `WalletSessions`. But the worker stores facades keyed on `accountId` - a deterministic hash of the viewing key. Multiple OData sessions with the same wallet share the same facade in the worker.
 
 `TransactionSubmitter.makeDeployRpcArgs` / `makeCallRpcArgs` (and the token-ops handlers) translate `walletMaterial.accountId` → `sessionId` in the worker RPC. The OData session UUID stays on the `PendingSubmissions` row as audit metadata.
 
-This was a bug in the first Phase 2b draft (worker passed the OData UUID as lookup key, missed the facade) — caught on the first live T15 attempt. Now consistently fixed in 4 places: `makeDeployRpcArgs`, `makeCallRpcArgs`, and the 4 token-ops args builders.
+This was a bug in the first Phase 2b draft (worker passed the OData UUID as lookup key, missed the facade) - caught on the first live T15 attempt. Now consistently fixed in 4 places: `makeDeployRpcArgs`, `makeCallRpcArgs`, and the 4 token-ops args builders.
 
 ## Why no "build → external sign → submit"
 
@@ -132,7 +132,7 @@ ODATANO's Cardano transaction surface returns unsigned CBOR for external signing
 
 The `wallet-sdk-facade` doesn't expose a serialization of `FinalizedTransaction` for "build now, submit later" workflows. The low-level `ledger-v8.Transaction.serialize()` exists, but the facade doesn't surface it as part of its API contract.
 
-**Architectural decision**: NIGHTGATE follows the SDK's grain. Submissions are one-shot — build + balance + prove + submit in a single worker call. The seed key has to be available server-side for proof generation; we accept that and store it encrypted (AES-256-GCM via `ENCRYPTION_KEY`).
+**Architectural decision**: NIGHTGATE follows the SDK's grain. Submissions are one-shot - build + balance + prove + submit in a single worker call. The seed key has to be available server-side for proof generation; we accept that and store it encrypted (AES-256-GCM via `ENCRYPTION_KEY`).
 
 What we do expose for safety:
 - The seed is decrypted inside the OData handler, passed to the worker, and held in-memory only for the duration of the facade's lifetime.
@@ -150,7 +150,7 @@ One row per submission. Lifecycle:
 - UPDATE by crawler when indexing the tx (status=`finalized`)
 - On error: UPDATE to status=`failed` with `errorCode` from `classifySubmissionError`
 
-This is the crash-recovery point. If the server dies between worker submit and DB UPDATE, the row stays in `pending` but the txHash is null. On restart, the row will eventually get reconciled to `finalized` by the crawler IF the tx made it to the chain. If it didn't, the row stays orphan `pending` forever — call `/PendingSubmissions?$filter=status eq 'pending'&$top=10` to find them.
+This is the crash-recovery point. If the server dies between worker submit and DB UPDATE, the row stays in `pending` but the txHash is null. On restart, the row will eventually get reconciled to `finalized` by the crawler IF the tx made it to the chain. If it didn't, the row stays orphan `pending` forever - call `/PendingSubmissions?$filter=status eq 'pending'&$top=10` to find them.
 
 ### PrivateStates
 
@@ -160,7 +160,7 @@ Per-(`accountId`, `contractAddress`, `privateStateId`) row with AES-256-GCM encr
 
 Per-`accountId` row holding the serialized blobs for all three sub-wallets (shielded, unshielded, dust). Updated every 30 s during sync via the state-save push event. Restart-resilient: on next `connectWalletForSigning`, the facade-builder loads the prior blobs and the SDK does a delta-sync instead of starting from genesis (~5-6 h saved).
 
-The serialized state contains `sub.serializeState()` output verbatim. The SDK's restore path normalizes (sometimes shrinking the blob slightly) — that's not corruption, that's the SDK compacting the format.
+The serialized state contains `sub.serializeState()` output verbatim. The SDK's restore path normalizes (sometimes shrinking the blob slightly) - that's not corruption, that's the SDK compacting the format.
 
 ### WalletSessions
 
@@ -185,7 +185,7 @@ For each contract deploy/call, the worker assembles a 6-provider bundle the SDK 
 
 `buildWorkerContractProviders()` and `buildWorkerWalletProvider()` in `srv/midnight/wallet-worker.ts` assemble this per call.
 
-## Network ID — process-global gotcha
+## Network ID - process-global gotcha
 
 The Midnight SDK keeps the active network as **process-global** state via `setNetworkId()`. Every wallet/contract operation reads it and throws if it was never set. We call `ensureNetworkId(net, sdk)` in the worker before every SDK invocation. The wrapper is idempotent (cached, no-op on second call with same network).
 
@@ -197,4 +197,4 @@ All Midnight SDK packages (`@midnight-ntwrk/*` and the wallet-sdk family under `
 
 Type-only imports work when the SDK provides clean `.d.ts`: `import type * as AddressFormat from '@midnightntwrk/wallet-sdk-address-format'` gives us `AddressFormat.MidnightBech32m`, `AddressFormat.DustAddress`, etc. for type-checking without emitting a `require()`. We use this pattern in the worker for the address-format and ledger-v8 packages.
 
-For SDK packages with messy or absent types, we fall back to `any` and rely on runtime duck-typing — but per the project's no-duck-typing rule, only after verifying the actual `.d.ts` first. We don't write try/catch chains over guessed method names.
+For SDK packages with messy or absent types, we fall back to `any` and rely on runtime duck-typing - but per the project's no-duck-typing rule, only after verifying the actual `.d.ts` first. We don't write try/catch chains over guessed method names.

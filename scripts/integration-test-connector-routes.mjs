@@ -94,9 +94,11 @@ try {
     ok('manifest: vault artifactRef set', vault.artifactRef === '@odatano/nightgate/browser/attestation-vault', vault.artifactRef);
     ok('manifest: counter has NO artifactRef (not browser-exported)', byName.counter && byName.counter.artifactRef === undefined);
     const vc = vault.circuits || [];
-    for (const c of ['attest', 'commitValue', 'grantDisclosure', 'provePredicate', 'revokeDisclosure']) {
+    for (const c of ['attest', 'attestGuarded', 'grantDisclosure', 'revokeDisclosure', 'anchorContentRoot', 'proveFieldPredicate', 'proveDocumentComparison']) {
         ok(`manifest: vault circuit "${c}" present`, vc.includes(c));
     }
+    ok('manifest: removed commitment-lane circuits absent',
+        !vc.includes('commitValue') && !vc.includes('provePredicate'));
     ok('manifest: vault pinned address surfaced', Array.isArray(vault.addresses) && vault.addresses[0] === PINNED_ADDRESS, JSON.stringify(vault.addresses));
     ok('manifest: counter has no pinned address', byName.counter && byName.counter.addresses === undefined);
     ok('manifest: vault artifactHash is 64-hex', /^[0-9a-f]{64}$/.test(vault.artifactHash || ''), vault.artifactHash);
@@ -108,7 +110,9 @@ try {
     const etag = z1.headers.get('etag');
     ok('zk-config: HTTP 200', z1.status === 200, `got ${z1.status}`);
     ok('zk-config: octet-stream content-type', z1.headers.get('content-type') === 'application/octet-stream', z1.headers.get('content-type'));
-    ok('zk-config: immutable cache-control', /immutable/.test(z1.headers.get('cache-control') || ''), z1.headers.get('cache-control'));
+    // no-cache (NOT immutable): the URL is not content-addressed, so a
+    // contract upgrade would otherwise leave browsers on year-old keys/zkir.
+    ok('zk-config: revalidating cache-control', /no-cache/.test(z1.headers.get('cache-control') || '') && !/immutable/.test(z1.headers.get('cache-control') || ''), z1.headers.get('cache-control'));
     ok('zk-config: ETag present', !!etag, etag);
     ok('zk-config: non-empty body', body.byteLength > 0, `${body.byteLength} bytes`);
 

@@ -189,6 +189,23 @@ export default class NightgateService extends cds.ApplicationService {
             (req.query as any).where({ userId });
         });
 
+        // Owner-scoped like WalletSessions: Documents rows carry storageRef
+        // (internal file/S3/agent paths) and not-yet-public hashes,
+        // GranteeIdentities bind userId to wallet/DID grantee ids. Neither is
+        // anyone else's business. Rows from pre-0.16.0 releases have no
+        // userId and are therefore admin-only. Cross-user verification stays
+        // possible via verifyDocument (documentId is an unguessable
+        // capability handle and the response exposes no storageRef).
+        for (const entity of ['Documents', 'GranteeIdentities'] as const) {
+            this.before('READ', entity, (req: Request) => {
+                const user: any = (req as any).user;
+                if (user?.is?.('admin')) return;
+                const userId = user?.id;
+                if (!userId) return req.reject(401, 'authentication required');
+                (req.query as any).where({ userId });
+            });
+        }
+
         // Submission actions: deployContract, submitContractCall
 
         // Owner-scoped like WalletSessions: submissions carry no userId, so
@@ -226,13 +243,26 @@ export default class NightgateService extends cds.ApplicationService {
                 return req.reject(404, 'Job not found');
             }
 
-            // The session that owns this job must belong to the caller.
-            const sess: any = await this.db.run(
-                cds.ql.SELECT.one.from(WalletSessions).columns('userId').where({ sessionId })
-            );
-            const requesterId = (req as any).user?.id;
-            if (sess?.userId && sess.userId !== requesterId) {
-                return req.reject(404, 'Job not found');
+            // FAIL-CLOSED ownership (admins exempt, like the entity scopes):
+            // the job's recorded requester must be the caller; a
+            // missing/closed session row must not open the job up. Jobs
+            // without a recorded requester fall back to the session-row
+            // binding; if neither identity is resolvable, deny.
+            const user: any = (req as any).user;
+            if (!user?.is?.('admin')) {
+                const requesterId = user?.id;
+                if (job.requestedBy) {
+                    if (!requesterId || job.requestedBy !== requesterId) {
+                        return req.reject(404, 'Job not found');
+                    }
+                } else {
+                    const sess: any = await this.db.run(
+                        cds.ql.SELECT.one.from(WalletSessions).columns('userId').where({ sessionId })
+                    );
+                    if (!sess?.userId || !requesterId || sess.userId !== requesterId) {
+                        return req.reject(404, 'Job not found');
+                    }
+                }
             }
 
             return {

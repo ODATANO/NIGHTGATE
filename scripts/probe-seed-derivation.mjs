@@ -115,5 +115,5 @@ if (matched) {
     console.log(`Put this in .env as LACE_SEED_HEX:\n  LACE_SEED_HEX=${matched.seedHex}`);
 } else {
     console.log('NO MATCH among simple candidates → Lace likely uses an HD-path derivation.');
-    console.log('Next step would be replicating Midnight\'s HD scheme (BIP32 path) — tell Claude and we\'ll wire it.');
+    console.log('Next step would be replicating Midnight\'s HD scheme (BIP32 path) - tell Claude and we\'ll wire it.');
 }

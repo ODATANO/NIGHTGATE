@@ -61,7 +61,7 @@ describe('MidnightCrawler helper paths', () => {
     beforeEach(() => {
         vi.clearAllMocks();
         // The project's .env sets NIGHTGATE_NETWORK / NODE_URL for live runs;
-        // VS Code's Jest extension propagates those into the test process, where
+        // an IDE test runner propagates those into the test process, where
         // they'd override the mocked cds.env.requires.nightgate above and break
         // these assertions. Clear them per-test so the mocked config wins.
         for (const key of NIGHTGATE_ENV_KEYS) {
@@ -178,8 +178,10 @@ describe('MidnightCrawler helper paths', () => {
 
     it('does nothing when SyncState already exists (shared utility)', async () => {
         const { ensureSyncStateSingleton } = await import('../../srv/utils/sync-state.js');
+        // networkId matches the configured network: the row is properly bound,
+        // so neither the legacy-backfill nor the mismatch guard fires.
         const db = {
-            run: vi.fn().mockResolvedValueOnce({ ID: 'SINGLETON' })
+            run: vi.fn().mockResolvedValueOnce({ ID: 'SINGLETON', networkId: 'testnet' })
         };
 
         await expect(ensureSyncStateSingleton(db as any)).resolves.toBeUndefined();

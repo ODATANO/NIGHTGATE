@@ -95,8 +95,8 @@ async function pollJob(sessionId, jobId, label, { expect = 'succeed', timeoutMs 
         }
         if (status === 'failed') {
             process.stdout.write('\n');
-            if (expect === 'fail') { console.log(`     [${label}] failed as expected: ${errorCode} — ${errorMessage}`); return { failed: true, errorCode, errorMessage }; }
-            fail(`[${label}] job failed: ${errorCode} — ${errorMessage}`);
+            if (expect === 'fail') { console.log(`     [${label}] failed as expected: ${errorCode} - ${errorMessage}`); return { failed: true, errorCode, errorMessage }; }
+            fail(`[${label}] job failed: ${errorCode} - ${errorMessage}`);
         }
         await new Promise(res => setTimeout(res, intervalMs));
     }
@@ -160,7 +160,7 @@ async function waitForServer() {
         console.log(`OK   contractAddress = ${contractAddress}`);
     }
 
-    step('4. registerGranteeIdentity (Phase 0) — bind a principal → granteeId');
+    step('4. registerGranteeIdentity (Phase 0) - bind a principal → granteeId');
     // bindingInput is hex so it is valid under the default 'wallet' binding;
     // we grant to whatever granteeId the server derives, tying write↔read.
     const bindingInput = randomBytes(32).toString('hex');
@@ -186,7 +186,7 @@ async function waitForServer() {
     const grantRes = await pollJob(sessionId, r.body.jobId, 'grant');
     console.log(`OK   grant tx accepted on-chain: ${grantRes.txHash}`);
 
-    step('7. GET DisclosureGrants — poll until chain-confirmed active=true (validates live ledger read-back)');
+    step('7. GET DisclosureGrants - poll until chain-confirmed active=true (validates live ledger read-back)');
     const grantedRow = await pollGrantRow(contractAddress, grantee, 'read+', row => row && row.active === true);
     if (grantedRow.level !== 1) fail(`expected level=1, got ${grantedRow.level}`);
     if (!grantedRow.grantedTxHash) fail('grantedTxHash not recorded on the indexed row');
@@ -198,7 +198,7 @@ async function waitForServer() {
     const revokeRes = await pollJob(sessionId, r.body.jobId, 'revoke');
     console.log(`OK   revoke tx accepted on-chain: ${revokeRes.txHash}`);
 
-    step('9. GET DisclosureGrants — poll until active=false (revoke reflected)');
+    step('9. GET DisclosureGrants - poll until active=false (revoke reflected)');
     await pollGrantRow(contractAddress, grantee, 'read-', row => row && row.active === false);
     console.log('OK   grant deactivated after revoke');
 

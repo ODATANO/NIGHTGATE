@@ -21,7 +21,7 @@
 
 import cds, { Request } from '@sap/cds';
 import { sha256 } from '@noble/hashes/sha256';
-import { randomBytes, bytesToHex } from '@noble/hashes/utils';
+import { bytesToHex } from '@noble/hashes/utils';
 import {
     TransactionSubmitter,
     SubmissionError,
@@ -30,6 +30,8 @@ import {
 import {
     resolveContract,
     ContractNotRegisteredError,
+    getArtifactGenerationDigest,
+    assertArtifactGeneration,
     type ResolvedContract
 } from './contract-registry';
 import {
@@ -54,7 +56,8 @@ import { ensureNetworkId, type ContractProvidersConfig } from '../midnight/provi
 import { startJob, runChildCommand, registerBackgroundJobProcessor, registerBackgroundJobReconciliationFinalizer, type BackgroundJobRow, type ReconciliationEvidence } from './background-jobs';
 import { reindexDisclosuresForContract } from './disclosure-indexer';
 import { readAttestationStateForContract } from './attestation-state';
-import { readPredicateStateForContract } from './predicate-state';
+import { readPredicateStateForContract, expandAllowedMask, computeAttestCommitment } from './predicate-state';
+import { randomBytes } from 'node:crypto';
 import { blake2b256Hex, loadPureCircuitsFromRegistry, PureCircuitsUnavailableError } from './document-proof';
 import { membershipPathFor, SET_DEPTH } from './set-root';
 import { deriveGranteeId } from './grantee-identity';
@@ -69,8 +72,8 @@ const deployRateLimiter = new RateLimiter({ windowMs: 60 * 60 * 1000, maxRequest
 const callRateLimiter = new RateLimiter({ windowMs: 60 * 1000, maxRequests: 30 });
 // 10 doc anchors / hour / session, contract-call heavyweight + extra DB writes.
 const anchorRateLimiter = new RateLimiter({ windowMs: 60 * 60 * 1000, maxRequests: 10 });
-// 10 predicate proofs / hour / session; each is TWO heavyweight circuit calls
-// (commitValue + provePredicate), so bound it like anchors.
+// 10 predicate proofs / hour / session; heavyweight circuit calls (often an
+// anchor + a proof per request), so bound it like anchors.
 const predicateRateLimiter = new RateLimiter({ windowMs: 60 * 60 * 1000, maxRequests: 10 });
 // 30 disclosure grant/revoke ops / hour / session; single heavyweight circuit
 // call each, attester-gated; looser than predicate but tighter than plain calls.
@@ -85,47 +88,81 @@ const reindexRateLimiter = new RateLimiter({ windowMs: 60 * 60 * 1000, maxReques
 
 const SHA256_HEX_RE = /^[0-9a-fA-F]{64}$/;
 const DEFAULT_ATTESTATION_VAULT_REF = 'attestation-vault';
+// The circuits take Uint<64>; overflow would otherwise surface only as an
+// opaque proving-time failure.
+const UINT64_MAX = (1n << 64n) - 1n;
 
 /**
  * Per-call proof witness bundle. `fieldValue` feeds `field_value()` (numeric
  * proveFieldPredicate), `fieldDigest` feeds `field_digest()` (bytes-valued
  * proveFieldMembership; proveFieldEquality needs neither, only the path),
  * `siblings`/`dirs` feed the DEPTH=4 content-root path, `setProof` feeds the
- * DEPTH=6 membership-set path.
+ * DEPTH=6 membership-set path, `docPair` feeds the cross-root circuits'
+ * doc_leaves witnesses (those need no inclusion path, so
+ * `siblings`/`dirs` may be absent alongside it).
  */
 type MerkleProofBundle = {
     fieldValue?: string;
+    /** Per-slot salt, 64 hex (v4; required by every single-field proof). */
+    fieldSalt?: string;
     fieldDigest?: string;
-    siblings: string[];
-    dirs: boolean[];
+    siblings?: string[];
+    dirs?: boolean[];
     setProof?: { siblings: string[]; dirs: boolean[] };
+    docPair?: DocPairBundle;
+};
+
+/** One slot of the shared schema (wire form; matches document-proof.ts). */
+type SchemaSlotWire = { fieldKey: string; kind: number; scale: string };
+/** One document's cross-root opening (wire form; witness material). */
+type OpeningWire = { saltSeed: string; slots: Array<{ present: boolean; value?: string; valueDigest?: string }> };
+
+/** Cross-root witness bundle (v4): shared schema + both documents' openings. */
+type DocPairBundle = {
+    schema?: SchemaSlotWire[]; openingA?: OpeningWire; openingB?: OpeningWire;
 };
 
 /** One batch claim; `predicate` discriminates the kind. */
 type BatchClaimCommand = {
-    predicateAttestationId: string; fieldKey: string; predicate: string; unit?: string;
+    predicateAttestationId: string; predicate: string; unit?: string;
+    /** Absent only for the cross-root document kinds. */
+    fieldKey?: string;
+    /** Per-slot salt (v4); required for the single-field kinds. */
+    salt?: string;
     // numeric ('lessOrEqual' | 'greaterOrEqual')
     threshold?: string; opCode?: number; value?: string;
     // 'bytesEquality'
     expectedDigest?: string;
     // 'setMembership'
     setRoot?: string; valueDigest?: string; setSiblings?: string[]; setDirs?: boolean[];
-    siblings: string[]; dirs: boolean[];
+    // 'documentIntegrity' / 'documentDiff' (document A = the batch payloadHash)
+    payloadHashB?: string; allowedMask?: number; k?: number;
+    schema?: SchemaSlotWire[]; openingA?: OpeningWire; openingB?: OpeningWire;
+    siblings?: string[]; dirs?: boolean[];
 };
 
 type ContractCommandV1 =
     | { op: 'deploy'; compiledArtifactRef: string; initialPrivateState: unknown; sponsorSessionId?: string }
-    | { op: 'call'; contractAddress: string; circuit: string; compiledArtifactRef: string; args: unknown[]; initialPrivateState?: unknown; sponsorSessionId?: string; witnessValues?: { attestedValue: string; valueSalt: string }; merkleProof?: MerkleProofBundle }
-    | { op: 'callBatch'; contractAddress: string; calls: Array<{ circuit: string; args: unknown[]; merkleProof?: MerkleProofBundle }>; compiledArtifactRef: string; initialPrivateState?: unknown; sponsorSessionId?: string; witnessValues?: { attestedValue: string; valueSalt: string }; merkleProof?: MerkleProofBundle }
-    | { op: 'predicateWorkflow'; predicateAttestationId: string; payloadHash: string; contractAddress: string; compiledArtifactRef: string; predicate: string; threshold: string; opCode: number; unit?: string; value: string; salt: string; sponsorSessionId?: string }
-    | { op: 'fieldPredicateWorkflow'; predicateAttestationId: string; payloadHash: string; fieldKey: string; contractAddress: string; compiledArtifactRef: string; predicate: string; threshold: string; opCode: number; unit?: string; value: string; siblings: string[]; dirs: boolean[]; contentRoot?: string; sponsorSessionId?: string }
-    | { op: 'fieldEqualityWorkflow'; predicateAttestationId: string; payloadHash: string; fieldKey: string; contractAddress: string; compiledArtifactRef: string; expectedDigest: string; siblings: string[]; dirs: boolean[]; contentRoot?: string; sponsorSessionId?: string }
-    | { op: 'fieldMembershipWorkflow'; predicateAttestationId: string; payloadHash: string; fieldKey: string; contractAddress: string; compiledArtifactRef: string; setRoot: string; valueDigest: string; siblings: string[]; dirs: boolean[]; setSiblings: string[]; setDirs: boolean[]; contentRoot?: string; sponsorSessionId?: string }
-    | { op: 'fieldPredicateBatchWorkflow'; payloadHash: string; contractAddress: string; compiledArtifactRef: string; contentRoot?: string; claims: BatchClaimCommand[]; sponsorSessionId?: string }
-    | { op: 'anchorDocument'; documentId: string; payloadHash: string; metadataHash: string; contractAddress: string; compiledArtifactRef: string; sponsorSessionId?: string }
+    | { op: 'call'; contractAddress: string; circuit: string; compiledArtifactRef: string; args: unknown[]; initialPrivateState?: unknown; sponsorSessionId?: string; merkleProof?: MerkleProofBundle }
+    | { op: 'callBatch'; contractAddress: string; calls: Array<{ circuit: string; args: unknown[]; merkleProof?: MerkleProofBundle }>; compiledArtifactRef: string; initialPrivateState?: unknown; sponsorSessionId?: string; merkleProof?: MerkleProofBundle }
+    | { op: 'fieldPredicateWorkflow'; predicateAttestationId: string; payloadHash: string; fieldKey: string; contractAddress: string; compiledArtifactRef: string; predicate: string; threshold: string; opCode: number; unit?: string; value: string; salt: string; siblings: string[]; dirs: boolean[]; contentRoot?: string; schemaId?: string; sponsorSessionId?: string }
+    | { op: 'fieldEqualityWorkflow'; predicateAttestationId: string; payloadHash: string; fieldKey: string; contractAddress: string; compiledArtifactRef: string; expectedDigest: string; salt: string; siblings: string[]; dirs: boolean[]; contentRoot?: string; schemaId?: string; sponsorSessionId?: string }
+    | { op: 'fieldMembershipWorkflow'; predicateAttestationId: string; payloadHash: string; fieldKey: string; contractAddress: string; compiledArtifactRef: string; setRoot: string; valueDigest: string; salt: string; siblings: string[]; dirs: boolean[]; setSiblings: string[]; setDirs: boolean[]; contentRoot?: string; schemaId?: string; sponsorSessionId?: string }
+    | { op: 'fieldPredicateBatchWorkflow'; payloadHash: string; contractAddress: string; compiledArtifactRef: string; contentRoot?: string; schemaId?: string; claims: BatchClaimCommand[]; sponsorSessionId?: string }
+    | { op: 'documentIntegrityWorkflow'; predicateAttestationId: string; payloadHashA: string; payloadHashB: string; contractAddress: string; compiledArtifactRef: string; allowedMask: number; schema: SchemaSlotWire[]; openingA: OpeningWire; openingB: OpeningWire; contentRootA?: string; contentRootB?: string; schemaId?: string; sponsorSessionId?: string }
+    | { op: 'documentDiffWorkflow'; predicateAttestationId: string; payloadHashA: string; payloadHashB: string; contractAddress: string; compiledArtifactRef: string; k: number; schema: SchemaSlotWire[]; openingA: OpeningWire; openingB: OpeningWire; contentRootA?: string; contentRootB?: string; schemaId?: string; sponsorSessionId?: string }
+    | { op: 'anchorDocument'; documentId: string; payloadHash: string; metadataHash: string; contractAddress: string; compiledArtifactRef: string; sponsorSessionId?: string; guardedNonce?: string }
+    | { op: 'attestCommit'; commitment: string; contractAddress: string; compiledArtifactRef: string; sponsorSessionId?: string }
     | { op: 'grantDisclosure'; disclosureGrantId: string; payloadHash: string; grantee: string; level: number; contractAddress: string; compiledArtifactRef: string; sponsorSessionId?: string }
     | { op: 'revokeDisclosure'; payloadHash: string; grantee: string; contractAddress: string; compiledArtifactRef: string; sponsorSessionId?: string }
     | { op: 'registerPassport'; passportId: string; ownerId: string; contractAddress: string; compiledArtifactRef: string; sponsorSessionId?: string };
+
+/**
+ * Stamped by startJob at persistence time (see background-jobs.ts): the
+ * artifact GENERATION the command was created against. Verified fail-closed
+ * before execution; the registry name alone is a mutable alias.
+ */
+type ContractCommandV1WithProvenance = ContractCommandV1 & { artifactDigest?: string };
 
 function hexToBytes(hex: string): Uint8Array {
     const out = new Uint8Array(hex.length / 2);
@@ -135,19 +172,21 @@ function hexToBytes(hex: string): Uint8Array {
     return out;
 }
 
-type PredicateKind = 'numeric' | 'equality' | 'membership';
+type PredicateKind = 'numeric' | 'equality' | 'membership' | 'integrity' | 'diff';
 
 /**
  * The ONE predicate-literal parser (every call site validates through this,
  * so an unknown literal can never mint a wrong opCode / claim key).
  * `opCode` is the circuit's Uint<8> for the numeric predicates and null for
- * the bytes kinds, whose claim structs carry no op.
+ * every other kind, whose claim structs carry no op.
  */
 function parsePredicate(literal: unknown): { kind: PredicateKind; opCode: number | null } | null {
     if (literal === 'lessOrEqual') return { kind: 'numeric', opCode: 0 };
     if (literal === 'greaterOrEqual') return { kind: 'numeric', opCode: 1 };
     if (literal === 'bytesEquality') return { kind: 'equality', opCode: null };
     if (literal === 'setMembership') return { kind: 'membership', opCode: null };
+    if (literal === 'documentIntegrity') return { kind: 'integrity', opCode: null };
+    if (literal === 'documentDiff') return { kind: 'diff', opCode: null };
     return null;
 }
 
@@ -183,6 +222,100 @@ function parseInclusionPath(
         if (typeof d !== 'boolean') { req.reject(400, `${names.dirs} entries must be booleans`); return null; }
     }
     return { siblings: (siblings as string[]).map(s => s.toLowerCase()), dirs: dirs as boolean[] };
+}
+
+/**
+ * Validate a parsed 16-entry schema descriptor list (throws with a
+ * user-facing message on any shape violation; callers map to 400).
+ */
+function validateSchemaSlots(schema: unknown, name: string): SchemaSlotWire[] {
+    if (!Array.isArray(schema) || schema.length !== 16) {
+        throw new Error(`${name} must be a JSON array of exactly 16 slot descriptors`);
+    }
+    return schema.map((d: any, i: number) => {
+        if (!d || typeof d !== 'object') throw new Error(`${name}[${i}] must be an object`);
+        if (typeof d.fieldKey !== 'string' || !SHA256_HEX_RE.test(d.fieldKey)) {
+            throw new Error(`${name}[${i}].fieldKey must be 64 hex chars (32 bytes)`);
+        }
+        if (d.kind !== 0 && d.kind !== 1 && d.kind !== 2) {
+            throw new Error(`${name}[${i}].kind must be 0 (uint), 1 (bytes) or 2 (padding)`);
+        }
+        let scaleBig: bigint;
+        try { scaleBig = BigInt(d.scale ?? '0'); } catch { throw new Error(`${name}[${i}].scale must be an integer (decimal string)`); }
+        if (scaleBig < 0n || scaleBig > UINT64_MAX) throw new Error(`${name}[${i}].scale must fit Uint<64>`);
+        return { fieldKey: d.fieldKey.toLowerCase(), kind: d.kind, scale: scaleBig.toString() };
+    });
+}
+
+/**
+ * Validate a parsed cross-root document opening ({ saltSeed, slots[16] });
+ * throws with a user-facing message on any shape violation.
+ */
+function validateOpening(opening: unknown, name: string): OpeningWire {
+    const o = opening as any;
+    if (!o || typeof o !== 'object') throw new Error(`${name} must be an object`);
+    if (typeof o.saltSeed !== 'string' || !SHA256_HEX_RE.test(o.saltSeed)) {
+        throw new Error(`${name}.saltSeed must be 64 hex chars (32 bytes)`);
+    }
+    if (!Array.isArray(o.slots) || o.slots.length !== 16) {
+        throw new Error(`${name}.slots must be a JSON array of exactly 16 slot openings`);
+    }
+    const slots = o.slots.map((s: any, i: number) => {
+        if (!s || typeof s !== 'object') throw new Error(`${name}.slots[${i}] must be an object`);
+        if (typeof s.present !== 'boolean') throw new Error(`${name}.slots[${i}].present must be a boolean`);
+        const out: { present: boolean; value?: string; valueDigest?: string } = { present: s.present };
+        if (s.value !== undefined) {
+            let v: bigint;
+            try { v = BigInt(s.value); } catch { throw new Error(`${name}.slots[${i}].value must be an integer (decimal string)`); }
+            if (v < 0n || v > UINT64_MAX) throw new Error(`${name}.slots[${i}].value must fit Uint<64>`);
+            out.value = v.toString();
+        }
+        if (s.valueDigest !== undefined) {
+            if (typeof s.valueDigest !== 'string' || !SHA256_HEX_RE.test(s.valueDigest)) {
+                throw new Error(`${name}.slots[${i}].valueDigest must be 64 hex chars (32 bytes)`);
+            }
+            out.valueDigest = s.valueDigest.toLowerCase();
+        }
+        if (s.present && out.value === undefined && out.valueDigest === undefined) {
+            throw new Error(`${name}.slots[${i}]: a present slot needs value or valueDigest`);
+        }
+        return out;
+    });
+    return { saltSeed: o.saltSeed.toLowerCase(), slots };
+}
+
+/**
+ * Parse + validate a JSON-encoded schema/opening pair off a request; rejects
+ * the request (400) and returns null on any violation.
+ */
+/**
+ * True when `allowedMask` frees every REAL (non-padding) slot of `schema`.
+ * Such an integrity claim says nothing; the circuit rejects it in-circuit
+ * ("mask must constrain at least one schema slot"), this check gives API
+ * callers a clean 400 before any proving. Subsumes the all-ones case for
+ * schemas with fewer than 16 real fields.
+ */
+function isVacuousMask(allowedMask: number, schema: SchemaSlotWire[]): boolean {
+    return schema.every((s, i) => s.kind === 2 || (allowedMask & (1 << i)) !== 0);
+}
+
+function parseDocPairInputs(
+    req: Request,
+    schemaJson: string | undefined,
+    openingAJson: string | undefined,
+    openingBJson: string | undefined
+): { schema: SchemaSlotWire[]; openingA: OpeningWire; openingB: OpeningWire } | null {
+    try {
+        const schema = validateSchemaSlots(JSON.parse(schemaJson ?? ''), 'schemaJson');
+        const openingA = validateOpening(JSON.parse(openingAJson ?? ''), 'openingAJson');
+        const openingB = validateOpening(JSON.parse(openingBJson ?? ''), 'openingBJson');
+        return { schema, openingA, openingB };
+    } catch (e: any) {
+        req.reject(400, e instanceof SyntaxError
+            ? 'schemaJson / openingAJson / openingBJson must be valid JSON'
+            : String(e?.message ?? e));
+        return null;
+    }
 }
 
 /**
@@ -228,61 +361,69 @@ export function registerSubmissionHandlers(
         if (!command || job.commandVersion !== 1 || !job.sessionId || !job.requestedBy) {
             throw new Error(`Invalid persisted contract command for job ${job.ID}`);
         }
-        const callKinds = new Set(['submitContractCall', 'predicateCommitValue', 'predicateProof', 'fieldAnchorRoot', 'fieldPredicateProof', 'fieldEqualityProof', 'fieldMembershipProof']);
+        const callKinds = new Set(['submitContractCall', 'fieldAnchorRoot', 'fieldPredicateProof', 'fieldEqualityProof', 'fieldMembershipProof', 'documentIntegrityProof', 'documentDiffProof']);
         if ((job.kind === 'deployContract' && command.op !== 'deploy')
             || (callKinds.has(job.kind) && command.op !== 'call')
             || (job.kind === 'submitContractCallBatch' && command.op !== 'callBatch')
             || (job.kind === 'fieldPredicateBatchProof' && command.op !== 'callBatch')
-            || (job.kind === 'issuePredicateAttestation' && command.op !== 'predicateWorkflow')
             || (job.kind === 'issueFieldPredicateAttestation' && command.op !== 'fieldPredicateWorkflow')
             || (job.kind === 'issueFieldEqualityAttestation' && command.op !== 'fieldEqualityWorkflow')
             || (job.kind === 'issueFieldMembershipAttestation' && command.op !== 'fieldMembershipWorkflow')
             || (job.kind === 'issueFieldPredicateAttestationBatch' && command.op !== 'fieldPredicateBatchWorkflow')
+            || (job.kind === 'issueDocumentIntegrityAttestation' && command.op !== 'documentIntegrityWorkflow')
+            || (job.kind === 'issueDocumentDiffAttestation' && command.op !== 'documentDiffWorkflow')
             || (job.kind === 'anchorDocument' && command.op !== 'anchorDocument')
+            || (job.kind === 'commitDocumentAnchor' && command.op !== 'attestCommit')
             || (job.kind === 'grantDisclosure' && command.op !== 'grantDisclosure')
             || (job.kind === 'revokeDisclosure' && command.op !== 'revokeDisclosure')
             || (job.kind === 'registerPassport' && command.op !== 'registerPassport')) {
             throw new Error(`Persisted command operation '${command.op}' is incompatible with ${job.kind}`);
         }
 
-        if (command.op === 'predicateWorkflow') {
-            const witnessValues = { attestedValue: command.value, valueSalt: command.salt };
-            await runChildCommand({
-                parent: job, kind: 'predicateCommitValue', step: 'commitValue', commandVersion: 1,
-                request: { circuit: 'commitValue', payloadHash: command.payloadHash },
-                command: { op: 'call', contractAddress: command.contractAddress, circuit: 'commitValue', compiledArtifactRef: command.compiledArtifactRef, args: [command.payloadHash], witnessValues, sponsorSessionId: command.sponsorSessionId }
-            });
-            // Let it propagate: ambiguous child -> ChildReconciliationRequiredError (parent reconciles); definitive rejection -> plain error (parent fails cleanly).
-            const proof: any = await runChildCommand<any>({
-                parent: job, kind: 'predicateProof', step: 'provePredicate', commandVersion: 1,
-                request: { circuit: 'provePredicate', payloadHash: command.payloadHash },
-                command: { op: 'call', contractAddress: command.contractAddress, circuit: 'provePredicate', compiledArtifactRef: command.compiledArtifactRef, args: [command.payloadHash, command.threshold, String(command.opCode)], witnessValues, sponsorSessionId: command.sponsorSessionId }
-            });
-            const provenAt = new Date().toISOString();
-            await db.run(UPDATE.entity(PredicateAttestations).set({ provenTxHash: proof.txHash, provenAt, modifiedAt: provenAt }).where({ ID: command.predicateAttestationId }));
-            return {
-                predicateAttestationId: command.predicateAttestationId, payloadHash: command.payloadHash,
-                claim: { predicate: command.predicate, threshold: command.threshold, unit: command.unit ?? null },
-                proof: { system: 'midnight-compact', circuit: 'provePredicate', verificationMethod: command.contractAddress, proofValue: proof.txHash },
-                ...(command.sponsorSessionId ? { feeSponsor: command.sponsorSessionId } : {})
-            };
+        // Provenance gate: the command's compiledArtifactRef is a MUTABLE
+        // registry alias; refuse to execute against a different artifact
+        // GENERATION than the one the command was created for (and refuse
+        // digest-less commands from older releases outright, instead of
+        // silently running them against today's registration).
+        {
+            const cmd = command as ContractCommandV1WithProvenance;
+            if (typeof (cmd as any).compiledArtifactRef === 'string') {
+                assertArtifactGeneration(
+                    (cmd as any).compiledArtifactRef,
+                    cmd.artifactDigest,
+                    `Persisted '${command.op}' command of job ${job.ID}`);
+            }
         }
+        // Child commands INHERIT the parent's generation digest (instead of
+        // letting startJob stamp whatever the alias resolves to at
+        // child-creation time): a workflow whose alias is re-pointed between
+        // steps must fail the child's own gate, never mix generations within
+        // one workflow (e.g. anchor from one artifact, proof from another).
+        const parentArtifactDigest = (command as ContractCommandV1WithProvenance).artifactDigest;
+        const runChild = <T,>(args: Parameters<typeof runChildCommand>[0]): Promise<T> => runChildCommand<T>({
+            ...args,
+            command: (args.command && typeof args.command === 'object'
+                && typeof (args.command as any).compiledArtifactRef === 'string'
+                && (args.command as any).artifactDigest === undefined)
+                ? { ...(args.command as object), artifactDigest: parentArtifactDigest }
+                : args.command
+        });
 
         if (command.op === 'fieldPredicateWorkflow') {
             if (command.contentRoot) {
-                await runChildCommand({
+                await runChild({
                     parent: job, kind: 'fieldAnchorRoot', step: 'anchorContentRoot', commandVersion: 1,
                     request: { circuit: 'anchorContentRoot', payloadHash: command.payloadHash },
-                    command: { op: 'call', contractAddress: command.contractAddress, circuit: 'anchorContentRoot', compiledArtifactRef: command.compiledArtifactRef, args: [command.payloadHash, command.contentRoot], sponsorSessionId: command.sponsorSessionId }
+                    command: { op: 'call', contractAddress: command.contractAddress, circuit: 'anchorContentRoot', compiledArtifactRef: command.compiledArtifactRef, args: [command.payloadHash, command.contentRoot, command.schemaId], sponsorSessionId: command.sponsorSessionId }
                 });
             }
-            const proof: any = await runChildCommand<any>({
+            const proof: any = await runChild<any>({
                 parent: job, kind: 'fieldPredicateProof', step: 'proveFieldPredicate', commandVersion: 1,
                 request: { circuit: 'proveFieldPredicate', payloadHash: command.payloadHash, fieldKey: command.fieldKey },
                 command: {
                     op: 'call', contractAddress: command.contractAddress, circuit: 'proveFieldPredicate', compiledArtifactRef: command.compiledArtifactRef,
                     args: [command.payloadHash, command.fieldKey, command.threshold, String(command.opCode)],
-                    merkleProof: { fieldValue: command.value, siblings: command.siblings, dirs: command.dirs }, sponsorSessionId: command.sponsorSessionId
+                    merkleProof: { fieldValue: command.value, fieldSalt: command.salt, siblings: command.siblings, dirs: command.dirs }, sponsorSessionId: command.sponsorSessionId
                 }
             });
             const provenAt = new Date().toISOString();
@@ -297,21 +438,21 @@ export function registerSubmissionHandlers(
 
         if (command.op === 'fieldEqualityWorkflow') {
             if (command.contentRoot) {
-                await runChildCommand({
+                await runChild({
                     parent: job, kind: 'fieldAnchorRoot', step: 'anchorContentRoot', commandVersion: 1,
                     request: { circuit: 'anchorContentRoot', payloadHash: command.payloadHash },
-                    command: { op: 'call', contractAddress: command.contractAddress, circuit: 'anchorContentRoot', compiledArtifactRef: command.compiledArtifactRef, args: [command.payloadHash, command.contentRoot], sponsorSessionId: command.sponsorSessionId }
+                    command: { op: 'call', contractAddress: command.contractAddress, circuit: 'anchorContentRoot', compiledArtifactRef: command.compiledArtifactRef, args: [command.payloadHash, command.contentRoot, command.schemaId], sponsorSessionId: command.sponsorSessionId }
                 });
             }
             // The expected digest is the PUBLIC statement (also a circuit arg);
             // only the inclusion path travels as witness material.
-            const proof: any = await runChildCommand<any>({
+            const proof: any = await runChild<any>({
                 parent: job, kind: 'fieldEqualityProof', step: 'proveFieldEquality', commandVersion: 1,
                 request: { circuit: 'proveFieldEquality', payloadHash: command.payloadHash, fieldKey: command.fieldKey },
                 command: {
                     op: 'call', contractAddress: command.contractAddress, circuit: 'proveFieldEquality', compiledArtifactRef: command.compiledArtifactRef,
                     args: [command.payloadHash, command.fieldKey, command.expectedDigest],
-                    merkleProof: { siblings: command.siblings, dirs: command.dirs }, sponsorSessionId: command.sponsorSessionId
+                    merkleProof: { fieldSalt: command.salt, siblings: command.siblings, dirs: command.dirs }, sponsorSessionId: command.sponsorSessionId
                 }
             });
             const provenAt = new Date().toISOString();
@@ -326,20 +467,21 @@ export function registerSubmissionHandlers(
 
         if (command.op === 'fieldMembershipWorkflow') {
             if (command.contentRoot) {
-                await runChildCommand({
+                await runChild({
                     parent: job, kind: 'fieldAnchorRoot', step: 'anchorContentRoot', commandVersion: 1,
                     request: { circuit: 'anchorContentRoot', payloadHash: command.payloadHash },
-                    command: { op: 'call', contractAddress: command.contractAddress, circuit: 'anchorContentRoot', compiledArtifactRef: command.compiledArtifactRef, args: [command.payloadHash, command.contentRoot], sponsorSessionId: command.sponsorSessionId }
+                    command: { op: 'call', contractAddress: command.contractAddress, circuit: 'anchorContentRoot', compiledArtifactRef: command.compiledArtifactRef, args: [command.payloadHash, command.contentRoot, command.schemaId], sponsorSessionId: command.sponsorSessionId }
                 });
             }
-            const proof: any = await runChildCommand<any>({
+            const proof: any = await runChild<any>({
                 parent: job, kind: 'fieldMembershipProof', step: 'proveFieldMembership', commandVersion: 1,
                 request: { circuit: 'proveFieldMembership', payloadHash: command.payloadHash, fieldKey: command.fieldKey },
                 command: {
                     op: 'call', contractAddress: command.contractAddress, circuit: 'proveFieldMembership', compiledArtifactRef: command.compiledArtifactRef,
                     args: [command.payloadHash, command.fieldKey, command.setRoot],
                     merkleProof: {
-                        fieldDigest: command.valueDigest, siblings: command.siblings, dirs: command.dirs,
+                        fieldDigest: command.valueDigest, fieldSalt: command.salt,
+                        siblings: command.siblings, dirs: command.dirs,
                         setProof: { siblings: command.setSiblings, dirs: command.setDirs }
                     },
                     sponsorSessionId: command.sponsorSessionId
@@ -355,6 +497,63 @@ export function registerSubmissionHandlers(
             };
         }
 
+        if (command.op === 'documentIntegrityWorkflow' || command.op === 'documentDiffWorkflow') {
+            // Both content roots must be anchored before the proof; each
+            // optional anchor is its own child command (own tx), the same
+            // pattern as the single-field workflows. One-transaction flows go
+            // through the batch action's document claim kinds instead.
+            if (command.contentRootA) {
+                await runChild({
+                    parent: job, kind: 'fieldAnchorRoot', step: 'anchorContentRootA', commandVersion: 1,
+                    request: { circuit: 'anchorContentRoot', payloadHash: command.payloadHashA },
+                    command: { op: 'call', contractAddress: command.contractAddress, circuit: 'anchorContentRoot', compiledArtifactRef: command.compiledArtifactRef, args: [command.payloadHashA, command.contentRootA, command.schemaId], sponsorSessionId: command.sponsorSessionId }
+                });
+            }
+            if (command.contentRootB) {
+                await runChild({
+                    parent: job, kind: 'fieldAnchorRoot', step: 'anchorContentRootB', commandVersion: 1,
+                    request: { circuit: 'anchorContentRoot', payloadHash: command.payloadHashB },
+                    command: { op: 'call', contractAddress: command.contractAddress, circuit: 'anchorContentRoot', compiledArtifactRef: command.compiledArtifactRef, args: [command.payloadHashB, command.contentRootB, command.schemaId], sponsorSessionId: command.sponsorSessionId }
+                });
+            }
+            const isIntegrity = command.op === 'documentIntegrityWorkflow';
+            // ONE mode-switched circuit serves both kinds (a per-circuit
+            // verifier key costs 2119 deploy bytes against the node's 32 KiB
+            // per-tx write cap). Args: (a, b, mode, allowedMask, k); the
+            // inactive statement rides as a neutral dummy (mask 0 / k 1).
+            // Let it propagate: ambiguous child -> ChildReconciliationRequiredError (parent reconciles); definitive rejection -> plain error (parent fails cleanly).
+            const proof: any = isIntegrity
+                ? await runChild<any>({
+                    parent: job, kind: 'documentIntegrityProof', step: 'proveDocumentComparison-integrity', commandVersion: 1,
+                    request: { circuit: 'proveDocumentComparison', mode: 'integrity', payloadHashA: command.payloadHashA, payloadHashB: command.payloadHashB },
+                    command: {
+                        op: 'call', contractAddress: command.contractAddress, circuit: 'proveDocumentComparison', compiledArtifactRef: command.compiledArtifactRef,
+                        args: [command.payloadHashA, command.payloadHashB, '0', String(command.allowedMask), '1'],
+                        merkleProof: { docPair: { schema: command.schema, openingA: command.openingA, openingB: command.openingB } }, sponsorSessionId: command.sponsorSessionId
+                    }
+                })
+                : await runChild<any>({
+                    parent: job, kind: 'documentDiffProof', step: 'proveDocumentComparison-diff', commandVersion: 1,
+                    request: { circuit: 'proveDocumentComparison', mode: 'diff', payloadHashA: command.payloadHashA, payloadHashB: command.payloadHashB },
+                    command: {
+                        op: 'call', contractAddress: command.contractAddress, circuit: 'proveDocumentComparison', compiledArtifactRef: command.compiledArtifactRef,
+                        args: [command.payloadHashA, command.payloadHashB, '1', '0', String(command.k)],
+                        merkleProof: { docPair: { schema: command.schema, openingA: command.openingA, openingB: command.openingB } }, sponsorSessionId: command.sponsorSessionId
+                    }
+                });
+            const provenAt = new Date().toISOString();
+            await db.run(UPDATE.entity(PredicateAttestations).set({ provenTxHash: proof.txHash, provenAt, modifiedAt: provenAt }).where({ ID: command.predicateAttestationId }));
+            return {
+                predicateAttestationId: command.predicateAttestationId,
+                payloadHashA: command.payloadHashA, payloadHashB: command.payloadHashB,
+                claim: isIntegrity
+                    ? { predicate: 'documentIntegrity', allowedMask: command.allowedMask }
+                    : { predicate: 'documentDiff', k: command.k },
+                proof: { system: 'midnight-compact', circuit: 'proveDocumentComparison', verificationMethod: command.contractAddress, proofValue: proof.txHash },
+                ...(command.sponsorSessionId ? { feeSponsor: command.sponsorSessionId } : {})
+            };
+        }
+
         if (command.op === 'fieldPredicateBatchWorkflow') {
             // ONE transaction for the whole cart: optional anchorContentRoot
             // first (distinct entryPoint, so segment ordering pins it ahead of
@@ -364,21 +563,34 @@ export function registerSubmissionHandlers(
             // A false claim fails at local proving, before submission.
             const calls: Array<{ circuit: string; args: unknown[]; merkleProof?: MerkleProofBundle }> = [];
             if (command.contentRoot) {
-                calls.push({ circuit: 'anchorContentRoot', args: [command.payloadHash, command.contentRoot] });
+                calls.push({ circuit: 'anchorContentRoot', args: [command.payloadHash, command.contentRoot, command.schemaId] });
             }
             for (const claim of command.claims) {
-                if (claim.predicate === 'bytesEquality') {
+                if (claim.predicate === 'documentIntegrity') {
+                    calls.push({
+                        circuit: 'proveDocumentComparison',
+                        args: [command.payloadHash, claim.payloadHashB, '0', String(claim.allowedMask), '1'],
+                        merkleProof: { docPair: { schema: claim.schema, openingA: claim.openingA, openingB: claim.openingB } }
+                    });
+                } else if (claim.predicate === 'documentDiff') {
+                    calls.push({
+                        circuit: 'proveDocumentComparison',
+                        args: [command.payloadHash, claim.payloadHashB, '1', '0', String(claim.k)],
+                        merkleProof: { docPair: { schema: claim.schema, openingA: claim.openingA, openingB: claim.openingB } }
+                    });
+                } else if (claim.predicate === 'bytesEquality') {
                     calls.push({
                         circuit: 'proveFieldEquality',
                         args: [command.payloadHash, claim.fieldKey, claim.expectedDigest],
-                        merkleProof: { siblings: claim.siblings, dirs: claim.dirs }
+                        merkleProof: { fieldSalt: claim.salt, siblings: claim.siblings, dirs: claim.dirs }
                     });
                 } else if (claim.predicate === 'setMembership') {
                     calls.push({
                         circuit: 'proveFieldMembership',
                         args: [command.payloadHash, claim.fieldKey, claim.setRoot],
                         merkleProof: {
-                            fieldDigest: claim.valueDigest, siblings: claim.siblings, dirs: claim.dirs,
+                            fieldDigest: claim.valueDigest, fieldSalt: claim.salt,
+                            siblings: claim.siblings, dirs: claim.dirs,
                             setProof: { siblings: claim.setSiblings!, dirs: claim.setDirs! }
                         }
                     });
@@ -386,12 +598,12 @@ export function registerSubmissionHandlers(
                     calls.push({
                         circuit: 'proveFieldPredicate',
                         args: [command.payloadHash, claim.fieldKey, claim.threshold, String(claim.opCode)],
-                        merkleProof: { fieldValue: claim.value, siblings: claim.siblings, dirs: claim.dirs }
+                        merkleProof: { fieldValue: claim.value, fieldSalt: claim.salt, siblings: claim.siblings, dirs: claim.dirs }
                     });
                 }
             }
             // Let it propagate: ambiguous child -> ChildReconciliationRequiredError (parent reconciles); definitive rejection -> plain error (parent fails cleanly).
-            const proof: any = await runChildCommand<any>({
+            const proof: any = await runChild<any>({
                 parent: job, kind: 'fieldPredicateBatchProof', step: 'proveFieldPredicateBatch', commandVersion: 1,
                 request: { circuits: calls.map(c => c.circuit), payloadHash: command.payloadHash, claimCount: command.claims.length },
                 command: { op: 'callBatch', contractAddress: command.contractAddress, calls, compiledArtifactRef: command.compiledArtifactRef, sponsorSessionId: command.sponsorSessionId }
@@ -410,6 +622,8 @@ export function registerSubmissionHandlers(
                         predicate: c.predicate,
                         ...(c.predicate === 'bytesEquality' ? { expectedDigest: c.expectedDigest }
                             : c.predicate === 'setMembership' ? { setRoot: c.setRoot }
+                            : c.predicate === 'documentIntegrity' ? { payloadHashB: c.payloadHashB, allowedMask: c.allowedMask }
+                            : c.predicate === 'documentDiff' ? { payloadHashB: c.payloadHashB, k: c.k }
                             : { threshold: c.threshold, unit: c.unit ?? null })
                     }
                 })),
@@ -419,7 +633,14 @@ export function registerSubmissionHandlers(
         }
         const facadeCfg = facadeConfigFromEnv();
         await ensureNetworkId(facadeCfg.networkId);
-        const resolved = await contractResolver(command.compiledArtifactRef);
+        // ATOMIC generation binding: the resolver verifies the stamped digest
+        // against the exact registration snapshot it then imports (the gate
+        // at the top of this function fast-fails digest-less commands; this
+        // closes the check-then-resolve window against a concurrent
+        // registerContract and against assets overwritten in place).
+        const resolved = await contractResolver(
+            command.compiledArtifactRef,
+            (command as ContractCommandV1WithProvenance).artifactDigest);
         const wallet = await walletFactory({
             sessionId: job.sessionId, db, facadeConfig: facadeCfg, expectedUserId: job.requestedBy
         });
@@ -440,10 +661,28 @@ export function registerSubmissionHandlers(
             return { submissionId: result.submissionId, txHash: result.txHash, contractAddress: result.contractAddress, status: result.status, ...(sponsor ? { feeSponsor: sponsor.sponsorSessionId } : {}) };
         }
 
-        if (command.op === 'anchorDocument') {
+        if (command.op === 'attestCommit') {
+            // Guarded-attest phase 1: record the opaque commitment
+            // (attestGuarded mode 0; metadata/nonce args ride as zero dummies).
             const result = await submitter.call({
-                contractAddress: command.contractAddress, circuit: 'attest',
-                args: [hexToBytes(command.payloadHash), hexToBytes(command.metadataHash)],
+                contractAddress: command.contractAddress, circuit: 'attestGuarded',
+                args: [0n, hexToBytes(command.commitment), new Uint8Array(32), new Uint8Array(32)],
+                contractName: command.compiledArtifactRef,
+                registration: { artifactPath: resolved.artifactPath, privateStateId: resolved.privateStateId, zkConfigPath: resolved.zkConfigPath },
+                sessionId: job.sessionId
+            });
+            return { commitment: command.commitment, contractAddress: command.contractAddress, txHash: result.txHash, ...(sponsor ? { feeSponsor: sponsor.sponsorSessionId } : {}) };
+        }
+
+        if (command.op === 'anchorDocument') {
+            // Guarded reveal (attestGuarded mode 1) when the commit-reveal
+            // nonce rides with the command; plain attest otherwise.
+            const result = await submitter.call({
+                contractAddress: command.contractAddress,
+                circuit: command.guardedNonce ? 'attestGuarded' : 'attest',
+                args: command.guardedNonce
+                    ? [1n, hexToBytes(command.payloadHash), hexToBytes(command.metadataHash), hexToBytes(command.guardedNonce)]
+                    : [hexToBytes(command.payloadHash), hexToBytes(command.metadataHash)],
                 contractName: command.compiledArtifactRef,
                 registration: { artifactPath: resolved.artifactPath, privateStateId: resolved.privateStateId, zkConfigPath: resolved.zkConfigPath },
                 sessionId: job.sessionId
@@ -495,9 +734,11 @@ export function registerSubmissionHandlers(
             const coercedCalls = command.calls.map(c => {
                 if (job.kind === 'fieldPredicateBatchProof') {
                     const args = c.circuit === 'anchorContentRoot'
-                        ? [hexToBytes(String(c.args[0])), hexToBytes(String(c.args[1]))]
+                        ? [hexToBytes(String(c.args[0])), hexToBytes(String(c.args[1])), hexToBytes(String(c.args[2]))]
                         : (c.circuit === 'proveFieldEquality' || c.circuit === 'proveFieldMembership')
                             ? [hexToBytes(String(c.args[0])), hexToBytes(String(c.args[1])), hexToBytes(String(c.args[2]))]
+                            : c.circuit === 'proveDocumentComparison'
+                                ? [hexToBytes(String(c.args[0])), hexToBytes(String(c.args[1])), BigInt(String(c.args[2])), expandAllowedMask(Number(c.args[3])), BigInt(String(c.args[4]))]
                             : [hexToBytes(String(c.args[0])), hexToBytes(String(c.args[1])), BigInt(String(c.args[2])), BigInt(String(c.args[3]))];
                     return { circuit: c.circuit, args, merkleProof: c.merkleProof };
                 }
@@ -509,7 +750,6 @@ export function registerSubmissionHandlers(
                 calls: coercedCalls,
                 contractName: command.compiledArtifactRef,
                 initialPrivateState: command.initialPrivateState,
-                witnessValues: command.witnessValues,
                 merkleProof: command.merkleProof,
                 registration: { artifactPath: resolved.artifactPath, privateStateId: resolved.privateStateId, zkConfigPath: resolved.zkConfigPath },
                 sessionId: job.sessionId
@@ -518,16 +758,16 @@ export function registerSubmissionHandlers(
         }
 
         let coercedArgs: unknown[];
-        if (job.kind === 'predicateCommitValue') {
-            coercedArgs = [hexToBytes(String(command.args[0]))];
-        } else if (job.kind === 'predicateProof') {
-            coercedArgs = [hexToBytes(String(command.args[0])), BigInt(String(command.args[1])), BigInt(String(command.args[2]))];
-        } else if (job.kind === 'fieldAnchorRoot') {
-            coercedArgs = [hexToBytes(String(command.args[0])), hexToBytes(String(command.args[1]))];
+        if (job.kind === 'fieldAnchorRoot') {
+            coercedArgs = [hexToBytes(String(command.args[0])), hexToBytes(String(command.args[1])), hexToBytes(String(command.args[2]))];
         } else if (job.kind === 'fieldPredicateProof') {
             coercedArgs = [hexToBytes(String(command.args[0])), hexToBytes(String(command.args[1])), BigInt(String(command.args[2])), BigInt(String(command.args[3]))];
         } else if (job.kind === 'fieldEqualityProof' || job.kind === 'fieldMembershipProof') {
             coercedArgs = [hexToBytes(String(command.args[0])), hexToBytes(String(command.args[1])), hexToBytes(String(command.args[2]))];
+        } else if (job.kind === 'documentIntegrityProof' || job.kind === 'documentDiffProof') {
+            // proveDocumentComparison(a, b, mode, allowed_mask, k); the
+            // Vector<16, Boolean> mask arg expands from the packed integer.
+            coercedArgs = [hexToBytes(String(command.args[0])), hexToBytes(String(command.args[1])), BigInt(String(command.args[2])), expandAllowedMask(Number(command.args[3])), BigInt(String(command.args[4]))];
         } else {
             const argTypes = argTypesLoader(resolved.zkConfigPath, command.circuit);
             coercedArgs = coerceCircuitArgs(command.args, argTypes);
@@ -538,7 +778,6 @@ export function registerSubmissionHandlers(
             args: coercedArgs,
             contractName: command.compiledArtifactRef,
             initialPrivateState: command.initialPrivateState,
-            witnessValues: command.witnessValues,
             merkleProof: command.merkleProof,
             registration: { artifactPath: resolved.artifactPath, privateStateId: resolved.privateStateId, zkConfigPath: resolved.zkConfigPath },
             sessionId: job.sessionId
@@ -548,16 +787,18 @@ export function registerSubmissionHandlers(
     registerBackgroundJobProcessor('deployContract', 1, executeContractCommand);
     registerBackgroundJobProcessor('submitContractCall', 1, executeContractCommand);
     registerBackgroundJobProcessor('submitContractCallBatch', 1, executeContractCommand);
-    registerBackgroundJobProcessor('issuePredicateAttestation', 1, executeContractCommand);
     registerBackgroundJobProcessor('issueFieldPredicateAttestation', 1, executeContractCommand);
     registerBackgroundJobProcessor('issueFieldEqualityAttestation', 1, executeContractCommand);
     registerBackgroundJobProcessor('issueFieldMembershipAttestation', 1, executeContractCommand);
     registerBackgroundJobProcessor('issueFieldPredicateAttestationBatch', 1, executeContractCommand);
+    registerBackgroundJobProcessor('issueDocumentIntegrityAttestation', 1, executeContractCommand);
+    registerBackgroundJobProcessor('issueDocumentDiffAttestation', 1, executeContractCommand);
     registerBackgroundJobProcessor('anchorDocument', 1, executeContractCommand);
+    registerBackgroundJobProcessor('commitDocumentAnchor', 1, executeContractCommand);
     registerBackgroundJobProcessor('grantDisclosure', 1, executeContractCommand);
     registerBackgroundJobProcessor('revokeDisclosure', 1, executeContractCommand);
     registerBackgroundJobProcessor('registerPassport', 1, executeContractCommand);
-    for (const childKind of ['predicateCommitValue', 'predicateProof', 'fieldAnchorRoot', 'fieldPredicateProof', 'fieldEqualityProof', 'fieldMembershipProof', 'fieldPredicateBatchProof']) {
+    for (const childKind of ['predicateCommitValue', 'predicateProof', 'fieldAnchorRoot', 'fieldPredicateProof', 'fieldEqualityProof', 'fieldMembershipProof', 'fieldPredicateBatchProof', 'documentIntegrityProof', 'documentDiffProof']) {
         registerBackgroundJobProcessor(childKind, 1, executeContractCommand);
     }
 
@@ -567,6 +808,16 @@ export function registerSubmissionHandlers(
         evidence: ReconciliationEvidence
     ): Promise<unknown> => {
         const command = raw as ContractCommandV1;
+        // Same fail-closed provenance gate as the executor: reconciliation
+        // may run long after submission (restart, upgrade), and its
+        // projection/reindex work resolves the alias too; a re-pointed alias
+        // must not finalize against a different registration.
+        if (typeof (command as any).compiledArtifactRef === 'string') {
+            assertArtifactGeneration(
+                (command as any).compiledArtifactRef,
+                (command as ContractCommandV1WithProvenance).artifactDigest,
+                `Reconciled '${command.op}' command of job ${_job.ID}`);
+        }
         const changedAt = evidence.finalizedAt ?? new Date().toISOString();
         if (command.op === 'anchorDocument') {
             await db.run(UPDATE.entity(Documents).set({
@@ -593,7 +844,11 @@ export function registerSubmissionHandlers(
                     grantee: command.grantee
                 }));
             }
-            const resolved = await contractResolver(command.compiledArtifactRef);
+            // Same atomic generation binding as the executor (the gate at the
+            // top of the finalizer fast-fails digest-less commands).
+            const resolved = await contractResolver(
+                command.compiledArtifactRef,
+                (command as ContractCommandV1WithProvenance).artifactDigest);
             await reindexAfterSubmit(command.contractAddress, resolved);
             return {
                 reconciled: true,
@@ -604,6 +859,13 @@ export function registerSubmissionHandlers(
         if (command.op === 'registerPassport') {
             return {
                 reconciled: true, passportId: command.passportId, ownerId: command.ownerId,
+                contractAddress: command.contractAddress, txHash: evidence.txHash,
+                ...(command.sponsorSessionId ? { feeSponsor: command.sponsorSessionId } : {})
+            };
+        }
+        if (command.op === 'attestCommit') {
+            return {
+                reconciled: true, commitment: command.commitment,
                 contractAddress: command.contractAddress, txHash: evidence.txHash,
                 ...(command.sponsorSessionId ? { feeSponsor: command.sponsorSessionId } : {})
             };
@@ -625,6 +887,7 @@ export function registerSubmissionHandlers(
         throw new Error(`Unsupported projection finalizer operation '${(command as any)?.op}'`);
     };
     registerBackgroundJobReconciliationFinalizer('anchorDocument', 1, finalizeContractProjection);
+    registerBackgroundJobReconciliationFinalizer('commitDocumentAnchor', 1, finalizeContractProjection);
     registerBackgroundJobReconciliationFinalizer('grantDisclosure', 1, finalizeContractProjection);
     registerBackgroundJobReconciliationFinalizer('revokeDisclosure', 1, finalizeContractProjection);
     registerBackgroundJobReconciliationFinalizer('registerPassport', 1, finalizeContractProjection);
@@ -905,6 +1168,7 @@ export function registerSubmissionHandlers(
             compiledArtifactRef?: string;
             idempotencyKey?: string;
             sponsorSessionId?: string;
+            nonce?: string;
         };
 
         if (!data.sha256) return req.reject(400, 'sha256 is required');
@@ -913,6 +1177,14 @@ export function registerSubmissionHandlers(
         if (!data.contractAddress) return req.reject(400, 'contractAddress is required');
         if (!SHA256_HEX_RE.test(data.sha256)) {
             return req.reject(400, 'sha256 must be 64 hex chars (32 bytes)');
+        }
+        // Guarded reveal: with a nonce the anchor runs attestGuarded mode 1
+        // against the previously committed
+        // persistentHash(payload, metadataHash, nonce) (see
+        // prepareAnchorCommitment / commitDocumentAnchor). Front-run recovery:
+        // a plain attest that landed AFTER the commit is taken over.
+        if (data.nonce !== undefined && !SHA256_HEX_RE.test(data.nonce)) {
+            return req.reject(400, 'nonce must be 64 hex chars (32 bytes; from prepareAnchorCommitment)');
         }
 
         const metadataStr = data.metadata ?? '';
@@ -933,6 +1205,10 @@ export function registerSubmissionHandlers(
         // clients a stable handle without polling.
         const documentId = cds.utils.uuid();
         const insertedAt = new Date().toISOString();
+        // Anchoring context is persisted WITH the row (owner, vault, network,
+        // artifact): verifyDocument only trusts this recorded binding, never
+        // caller-supplied coordinates, and reads are owner-scoped.
+        const networkId = recordedNetworkId();
         await db.run(INSERT.into(Documents).entries({
             ID: documentId,
             sha256: data.sha256.toLowerCase(),
@@ -941,6 +1217,11 @@ export function registerSubmissionHandlers(
             storageRef: data.storageRef,
             anchoredTxHash: null,
             anchoredAt: null,
+            userId: (req as any).user?.id ?? null,
+            contractAddress: data.contractAddress ?? null,
+            network: networkId,
+            compiledArtifactRef: compiledRef,
+            artifactDigest: artifactDigestOrNull(compiledRef),
             createdAt: insertedAt,
             modifiedAt: insertedAt
         }));
@@ -967,7 +1248,8 @@ export function registerSubmissionHandlers(
                 },
                 idempotencyPayload: {
                     sha256: data.sha256!.toLowerCase(), contractAddress: data.contractAddress,
-                    compiledRef, metadata: metadataStr, feeSponsor: sponsor?.sponsorSessionId ?? null
+                    compiledRef, metadata: metadataStr, feeSponsor: sponsor?.sponsorSessionId ?? null,
+                    guardedNonce: data.nonce?.toLowerCase() ?? null
                 },
                 requestedBy: (req as any).user?.id,
                 commandVersion: 1,
@@ -975,13 +1257,93 @@ export function registerSubmissionHandlers(
                 command: {
                     op: 'anchorDocument', documentId, payloadHash: data.sha256!.toLowerCase(),
                     metadataHash: bytesToHex(metadataHashBytes), contractAddress: data.contractAddress!,
-                    compiledArtifactRef: compiledRef, sponsorSessionId: sponsor?.sponsorSessionId
+                    compiledArtifactRef: compiledRef, sponsorSessionId: sponsor?.sponsorSessionId,
+                    guardedNonce: data.nonce?.toLowerCase()
                 }
             });
 
             if (job.deduplicated) await db.run(DELETE.from(Documents).where({ ID: documentId }));
             const stableDocumentId = (job.originalRequest as any)?.documentId ?? documentId;
             return { jobId: job.jobId, status: job.status, documentId: stableDocumentId };
+        });
+    });
+
+    // Guarded attest, phase 0 (compute-only): the commitment + nonce for a
+    // commit-reveal anchor. The commitment is
+    // persistentHash(AttestCommitPreimage{sha256, metadataHash, nonce}),
+    // byte-identical to attestGuarded's in-circuit recompute. STORE the
+    // nonce: it is required at reveal time (anchorDocument with `nonce`) and
+    // must stay secret until then (it is what a front-runner cannot forge).
+    srv.on('prepareAnchorCommitment', async (req: Request) => {
+        const data = req.data as { sha256?: string; metadata?: string; nonce?: string };
+        if (!data.sha256) return req.reject(400, 'sha256 is required');
+        if (!SHA256_HEX_RE.test(data.sha256)) return req.reject(400, 'sha256 must be 64 hex chars (32 bytes)');
+        if (data.nonce !== undefined && !SHA256_HEX_RE.test(data.nonce)) {
+            return req.reject(400, 'nonce must be 64 hex chars (32 bytes)');
+        }
+        const metadataStr = data.metadata ?? '';
+        const metadataHash = bytesToHex(sha256(new TextEncoder().encode(metadataStr)));
+        const nonce = data.nonce?.toLowerCase() ?? randomBytes(32).toString('hex');
+        const commitment = await computeAttestCommitment(data.sha256.toLowerCase(), metadataHash, nonce);
+        return { commitment, nonce, metadataHash };
+    });
+
+    // Guarded attest, phase 1 (async submit): record the opaque commitment
+    // on-chain (attestGuarded mode 0). Nothing about the payload leaks; a
+    // mempool observer sees only the hash. After the commit finalizes, run
+    // `anchorDocument` WITH the nonce (phase 2, reveal): a plain attest that
+    // front-ran the reveal is taken over because its sequence number is
+    // newer than the commitment's.
+    srv.on('commitDocumentAnchor', async (req: Request) => {
+        const data = req.data as {
+            commitment?: string;
+            sessionId?: string;
+            contractAddress?: string;
+            compiledArtifactRef?: string;
+            idempotencyKey?: string;
+            sponsorSessionId?: string;
+        };
+        if (!data.commitment) return req.reject(400, 'commitment is required (from prepareAnchorCommitment)');
+        if (!SHA256_HEX_RE.test(data.commitment)) return req.reject(400, 'commitment must be 64 hex chars (32 bytes)');
+        if (!data.sessionId) return req.reject(400, 'sessionId is required');
+        if (!data.contractAddress) return req.reject(400, 'contractAddress is required');
+        const compiledRef = data.compiledArtifactRef && data.compiledArtifactRef.length > 0
+            ? data.compiledArtifactRef
+            : DEFAULT_ATTESTATION_VAULT_REF;
+        if (rejectIfMainnetBlocked(req)) return;
+        if (!checkRate(anchorRateLimiter, data.sessionId, req)) return;
+
+        return runSubmission(req, async () => {
+            const facadeCfg = facadeConfigFromEnv();
+            await ensureNetworkId(facadeCfg.networkId);
+            await contractResolver(compiledRef);
+            await walletFactory({ sessionId: data.sessionId!, db, facadeConfig: facadeCfg, expectedUserId: (req as any).user?.id });
+            const sponsor = await resolveSponsorForRequest(req, data.sponsorSessionId);
+
+            const job = await startJob({
+                kind: 'commitDocumentAnchor',
+                sessionId: data.sessionId!,
+                idempotencyKey: data.idempotencyKey,
+                request: {
+                    commitment: data.commitment!.toLowerCase(),
+                    contractAddress: data.contractAddress,
+                    compiledRef,
+                    feeSponsor: sponsor?.sponsorSessionId ?? null
+                },
+                idempotencyPayload: {
+                    commitment: data.commitment!.toLowerCase(), contractAddress: data.contractAddress,
+                    compiledRef, feeSponsor: sponsor?.sponsorSessionId ?? null
+                },
+                requestedBy: (req as any).user?.id,
+                commandVersion: 1,
+                encryptCommand: true,
+                command: {
+                    op: 'attestCommit', commitment: data.commitment!.toLowerCase(),
+                    contractAddress: data.contractAddress!, compiledArtifactRef: compiledRef,
+                    sponsorSessionId: sponsor?.sponsorSessionId
+                }
+            });
+            return { jobId: job.jobId, status: job.status };
         });
     });
 
@@ -1004,6 +1366,30 @@ export function registerSubmissionHandlers(
         );
         if (!doc) return req.reject(404, `Document ${documentId} not found`);
 
+        // Evidence binding: the row records its anchoring context (vault,
+        // artifact, network) and those recorded coordinates are
+        // authoritative. Caller-supplied values may only CONFIRM them; a
+        // different one is rejected, otherwise any other vault (or another
+        // artifact generation) attesting the same public hash could make
+        // this document appear verified. Rows from pre-0.16.0 releases carry
+        // nulls; only for those do the caller's values apply.
+        const recordedContract: string | null = doc.contractAddress ?? null;
+        if (recordedContract && contractAddress
+            && contractAddress.toLowerCase() !== recordedContract.toLowerCase()) {
+            return req.reject(400, 'contractAddress does not match the vault this document was anchored in');
+        }
+        const effectiveContract = recordedContract ?? contractAddress;
+        const recordedArtifact: string | null = doc.compiledArtifactRef ?? null;
+        if (recordedArtifact && compiledArtifactRef && compiledArtifactRef !== recordedArtifact) {
+            return req.reject(400, 'compiledArtifactRef does not match the artifact this document was anchored with');
+        }
+        const effectiveArtifact = recordedArtifact ?? compiledArtifactRef;
+        // Recorded network: the state fallback reads THAT chain's indexer,
+        // never silently the currently configured one.
+        const recordedNetwork = doc.network && (VALID_NIGHTGATE_NETWORKS as readonly string[]).includes(doc.network)
+            ? doc.network as NightgateNetwork
+            : undefined;
+
         const hashMatches = doc.sha256?.toLowerCase() === providedSha256.toLowerCase();
         const anchoredOk = Boolean(doc.anchoredTxHash);
 
@@ -1025,12 +1411,15 @@ export function registerSubmissionHandlers(
                 );
                 chainSuccess = result?.status === 'SUCCESS'
                     && result?.outcomeSource === 'substrate-system-events';
-            } else if (contractAddress && liveProviderConfigured()) {
+            } else if (effectiveContract && liveProviderConfigured(recordedNetwork)) {
                 // Crawler-free fallback (anchoring tx not indexed locally): confirm
                 // the effect against live state. The document's sha256 is its
                 // on-chain payload_hash, so a present attestation IS the proof.
+                // Runs against the RECORDED anchoring vault, artifact and
+                // network whenever the row carries them (evidence binding).
                 chainSuccess = await verifyDocumentViaState(
-                    contractAddress, doc.sha256, compiledArtifactRef);
+                    effectiveContract, doc.sha256, effectiveArtifact, recordedNetwork,
+                    doc.artifactDigest ?? null);
             }
         }
 
@@ -1042,134 +1431,13 @@ export function registerSubmissionHandlers(
         };
     });
 
-    srv.on('issuePredicateAttestation', async (req: Request) => {
-        const data = req.data as {
-            payloadHash?: string;
-            value?: string;
-            salt?: string;
-            predicate?: string;
-            threshold?: number | string;
-            unit?: string;
-            valueCommitment?: string;
-            sessionId?: string;
-            contractAddress?: string;
-            compiledArtifactRef?: string;
-            idempotencyKey?: string;
-            sponsorSessionId?: string;
-        };
-
-        if (!data.payloadHash) return req.reject(400, 'payloadHash is required');
-        if (!SHA256_HEX_RE.test(data.payloadHash)) return req.reject(400, 'payloadHash must be 64 hex chars (32 bytes)');
-        if (data.value === undefined || data.value === null || data.value === '') {
-            return req.reject(400, 'value is required');
-        }
-        let valueBig: bigint;
-        try { valueBig = BigInt(data.value); } catch { return req.reject(400, 'value must be an integer (decimal string)'); }
-        if (valueBig < 0n) return req.reject(400, 'value must be a non-negative integer');
-
-        if (data.threshold === undefined || data.threshold === null) return req.reject(400, 'threshold is required');
-        let thresholdBig: bigint;
-        try { thresholdBig = BigInt(data.threshold); } catch { return req.reject(400, 'threshold must be an integer'); }
-        if (thresholdBig < 0n) return req.reject(400, 'threshold must be a non-negative integer');
-
-        const parsedPredicate = parsePredicate(data.predicate);
-        if (!parsedPredicate || parsedPredicate.kind !== 'numeric') {
-            return req.reject(400, "predicate must be 'lessOrEqual' or 'greaterOrEqual'");
-        }
-        const op = parsedPredicate.opCode!;
-
-        if (!data.sessionId) return req.reject(400, 'sessionId is required');
-        if (!data.contractAddress) return req.reject(400, 'contractAddress is required');
-
-        let saltHex: string;
-        if (data.salt) {
-            if (!SHA256_HEX_RE.test(data.salt)) return req.reject(400, 'salt must be 64 hex chars (32 bytes)');
-            saltHex = data.salt.toLowerCase();
-        } else {
-            saltHex = bytesToHex(randomBytes(32));
-        }
-        if (data.valueCommitment && !SHA256_HEX_RE.test(data.valueCommitment)) {
-            return req.reject(400, 'valueCommitment must be 64 hex chars (32 bytes)');
-        }
-
-        const compiledRef = data.compiledArtifactRef && data.compiledArtifactRef.length > 0
-            ? data.compiledArtifactRef
-            : DEFAULT_ATTESTATION_VAULT_REF;
-
-        if (rejectIfMainnetBlocked(req)) return;
-        if (!checkRate(predicateRateLimiter, data.sessionId, req)) return;
-
-        // Row up-front (mirrors anchorDocument): a stable pollable handle.
-        // `value`/`salt` are intentionally NOT stored.
-        const predicateAttestationId = cds.utils.uuid();
-        const insertedAt = new Date().toISOString();
-        await db.run(INSERT.into(PredicateAttestations).entries({
-            ID: predicateAttestationId,
-            payloadHash: data.payloadHash.toLowerCase(),
-            contractAddress: data.contractAddress,
-            predicate: data.predicate,
-            op,
-            // Integer64 column; caller may pass the scaled integer as a string to
-            // preserve precision past Number.MAX_SAFE_INTEGER. cds-models types it
-            // as `number`, but the DB layer accepts the string at runtime.
-            threshold: data.threshold as any,
-            unit: data.unit ?? null,
-            valueCommitment: data.valueCommitment ? data.valueCommitment.toLowerCase() : null,
-            provenTxHash: null,
-            provenAt: null,
-            createdAt: insertedAt,
-            modifiedAt: insertedAt
-        }));
-
-        return runSubmission(req, async () => {
-            const facadeCfg = facadeConfigFromEnv();
-            await ensureNetworkId(facadeCfg.networkId);
-            await contractResolver(compiledRef);
-            await walletFactory({ sessionId: data.sessionId!, db, facadeConfig: facadeCfg, expectedUserId: (req as any).user?.id });
-            const sponsor = await resolveSponsorForRequest(req, data.sponsorSessionId);
-
-            const job = await startJob({
-                kind: 'issuePredicateAttestation',
-                sessionId: data.sessionId!,
-                idempotencyKey: data.idempotencyKey,
-                request: {
-                    payloadHash: data.payloadHash!.toLowerCase(),
-                    contractAddress: data.contractAddress,
-                    predicate: data.predicate,
-                    threshold: String(data.threshold),
-                    predicateAttestationId,
-                    feeSponsor: sponsor?.sponsorSessionId ?? null
-                },
-                idempotencyPayload: {
-                    payloadHash: data.payloadHash!.toLowerCase(), contractAddress: data.contractAddress,
-                    predicate: data.predicate, threshold: String(data.threshold),
-                    value: data.value, salt: data.salt, valueCommitment: data.valueCommitment,
-                    feeSponsor: sponsor?.sponsorSessionId ?? null
-                },
-                requestedBy: (req as any).user?.id,
-                commandVersion: 1,
-                encryptCommand: true,
-                command: {
-                    op: 'predicateWorkflow', predicateAttestationId,
-                    payloadHash: data.payloadHash!.toLowerCase(), contractAddress: data.contractAddress!,
-                    compiledArtifactRef: compiledRef, predicate: data.predicate!, threshold: thresholdBig.toString(),
-                    opCode: op, unit: data.unit, value: valueBig.toString(), salt: saltHex,
-                    sponsorSessionId: sponsor?.sponsorSessionId
-                }
-            });
-
-            if (job.deduplicated) await db.run(DELETE.from(PredicateAttestations).where({ ID: predicateAttestationId }));
-            const stablePredicateId = (job.originalRequest as any)?.predicateAttestationId ?? predicateAttestationId;
-            return { jobId: job.jobId, status: job.status, predicateAttestationId: stablePredicateId };
-        });
-    });
-
     srv.on('issueFieldPredicateAttestation', async (req: Request) => {
         const data = req.data as {
             payloadHash?: string;
             fieldKey?: string;
             value?: string;
-            contentRoot?: string;
+            fieldSalt?: string;
+            contentRoot?: string; schemaId?: string;
             siblingsJson?: string;
             dirsJson?: string;
             predicate?: string;
@@ -1192,11 +1460,16 @@ export function registerSubmissionHandlers(
         let valueBig: bigint;
         try { valueBig = BigInt(data.value); } catch { return req.reject(400, 'value must be an integer (decimal string)'); }
         if (valueBig < 0n) return req.reject(400, 'value must be a non-negative integer');
+        if (valueBig > UINT64_MAX) return req.reject(400, 'value exceeds Uint<64>');
+        if (!data.fieldSalt || !SHA256_HEX_RE.test(data.fieldSalt)) {
+            return req.reject(400, 'fieldSalt (64 hex chars) is required (v4 salted leaves; prepareDocumentProof returns it per field)');
+        }
 
         if (data.threshold === undefined || data.threshold === null) return req.reject(400, 'threshold is required');
         let thresholdBig: bigint;
         try { thresholdBig = BigInt(data.threshold); } catch { return req.reject(400, 'threshold must be an integer'); }
         if (thresholdBig < 0n) return req.reject(400, 'threshold must be a non-negative integer');
+        if (thresholdBig > UINT64_MAX) return req.reject(400, 'threshold exceeds Uint<64>');
 
         const parsedPredicate = parsePredicate(data.predicate);
         if (!parsedPredicate || parsedPredicate.kind !== 'numeric') {
@@ -1224,6 +1497,12 @@ export function registerSubmissionHandlers(
         if (data.contentRoot && !SHA256_HEX_RE.test(data.contentRoot)) {
             return req.reject(400, 'contentRoot must be 64 hex chars (32 bytes)');
         }
+        if (data.contentRoot && (!data.schemaId || !SHA256_HEX_RE.test(data.schemaId))) {
+            return req.reject(400, 'schemaId (64 hex chars) is required when contentRoot is supplied (anchorContentRoot anchors both)');
+        }
+        if (data.schemaId && !SHA256_HEX_RE.test(data.schemaId)) {
+            return req.reject(400, 'schemaId must be 64 hex chars (32 bytes)');
+        }
         if (!data.sessionId) return req.reject(400, 'sessionId is required');
         if (!data.contractAddress) return req.reject(400, 'contractAddress is required');
 
@@ -1248,7 +1527,9 @@ export function registerSubmissionHandlers(
             // Field-bound proof: record the field key so verifyPredicateAttestation's
             // crawler-free fallback can recompute the FieldPredicateClaim key.
             fieldKey: data.fieldKey.toLowerCase(),
-            valueCommitment: null,
+            network: recordedNetworkId(),
+            compiledArtifactRef: compiledRef,
+            artifactDigest: artifactDigestOrNull(compiledRef),
             provenTxHash: null,
             provenAt: null,
             createdAt: insertedAt,
@@ -1278,8 +1559,8 @@ export function registerSubmissionHandlers(
                 idempotencyPayload: {
                     payloadHash: data.payloadHash!.toLowerCase(), fieldKey: data.fieldKey!.toLowerCase(),
                     contractAddress: data.contractAddress, predicate: data.predicate,
-                    threshold: String(data.threshold), value: data.value,
-                    contentRoot: data.contentRoot, siblingsJson: data.siblingsJson, dirsJson: data.dirsJson,
+                    threshold: String(data.threshold), value: data.value, fieldSalt: data.fieldSalt,
+                    contentRoot: data.contentRoot, schemaId: data.schemaId, siblingsJson: data.siblingsJson, dirsJson: data.dirsJson,
                     feeSponsor: sponsor?.sponsorSessionId ?? null
                 },
                 requestedBy: (req as any).user?.id,
@@ -1290,8 +1571,9 @@ export function registerSubmissionHandlers(
                     payloadHash: data.payloadHash!.toLowerCase(), fieldKey: data.fieldKey!.toLowerCase(),
                     contractAddress: data.contractAddress!, compiledArtifactRef: compiledRef,
                     predicate: data.predicate!, threshold: thresholdBig.toString(), opCode: op,
-                    unit: data.unit, value: valueBig.toString(), siblings: siblings.map(s => s.toLowerCase()),
-                    dirs: dirsBool, contentRoot: data.contentRoot?.toLowerCase(),
+                    unit: data.unit, value: valueBig.toString(), salt: data.fieldSalt!.toLowerCase(),
+                    siblings: siblings.map(s => s.toLowerCase()),
+                    dirs: dirsBool, contentRoot: data.contentRoot?.toLowerCase(), schemaId: data.schemaId?.toLowerCase(),
                     sponsorSessionId: sponsor?.sponsorSessionId
                 }
             });
@@ -1305,8 +1587,8 @@ export function registerSubmissionHandlers(
     srv.on('issueFieldEqualityAttestation', async (req: Request) => {
         const data = req.data as {
             payloadHash?: string; fieldKey?: string;
-            expectedValue?: string; expectedDigest?: string;
-            contentRoot?: string; siblingsJson?: string; dirsJson?: string;
+            expectedValue?: string; expectedDigest?: string; fieldSalt?: string;
+            contentRoot?: string; schemaId?: string; siblingsJson?: string; dirsJson?: string;
             sessionId?: string; contractAddress?: string; compiledArtifactRef?: string;
             idempotencyKey?: string; sponsorSessionId?: string;
         };
@@ -1325,11 +1607,20 @@ export function registerSubmissionHandlers(
         // The digest covers the EXACT string (no trimming), matching the
         // bytes-leaf encoding of prepareDocumentProof.
         const expectedDigest = hasDigest ? data.expectedDigest!.toLowerCase() : blake2b256Hex(data.expectedValue!);
+        if (!data.fieldSalt || !SHA256_HEX_RE.test(data.fieldSalt)) {
+            return req.reject(400, 'fieldSalt (64 hex chars) is required (v4 salted leaves; prepareDocumentProof returns it per field)');
+        }
 
         const path = parseInclusionPath(req, data.siblingsJson, data.dirsJson, 4, { siblings: 'siblingsJson', dirs: 'dirsJson' });
         if (!path) return;
         if (data.contentRoot && !SHA256_HEX_RE.test(data.contentRoot)) {
             return req.reject(400, 'contentRoot must be 64 hex chars (32 bytes)');
+        }
+        if (data.contentRoot && (!data.schemaId || !SHA256_HEX_RE.test(data.schemaId))) {
+            return req.reject(400, 'schemaId (64 hex chars) is required when contentRoot is supplied (anchorContentRoot anchors both)');
+        }
+        if (data.schemaId && !SHA256_HEX_RE.test(data.schemaId)) {
+            return req.reject(400, 'schemaId must be 64 hex chars (32 bytes)');
         }
         if (!data.sessionId) return req.reject(400, 'sessionId is required');
         if (!data.contractAddress) return req.reject(400, 'contractAddress is required');
@@ -1355,7 +1646,9 @@ export function registerSubmissionHandlers(
             unit: null,
             fieldKey: data.fieldKey.toLowerCase(),
             expectedDigest,
-            valueCommitment: null,
+            network: recordedNetworkId(),
+            compiledArtifactRef: compiledRef,
+            artifactDigest: artifactDigestOrNull(compiledRef),
             provenTxHash: null,
             provenAt: null,
             createdAt: insertedAt,
@@ -1385,7 +1678,8 @@ export function registerSubmissionHandlers(
                 idempotencyPayload: {
                     payloadHash: data.payloadHash!.toLowerCase(), fieldKey: data.fieldKey!.toLowerCase(),
                     contractAddress: data.contractAddress, predicate: 'bytesEquality',
-                    expectedDigest, contentRoot: data.contentRoot,
+                    expectedDigest, fieldSalt: data.fieldSalt,
+                    contentRoot: data.contentRoot, schemaId: data.schemaId,
                     siblingsJson: data.siblingsJson, dirsJson: data.dirsJson,
                     feeSponsor: sponsor?.sponsorSessionId ?? null
                 },
@@ -1396,8 +1690,8 @@ export function registerSubmissionHandlers(
                     op: 'fieldEqualityWorkflow', predicateAttestationId,
                     payloadHash: data.payloadHash!.toLowerCase(), fieldKey: data.fieldKey!.toLowerCase(),
                     contractAddress: data.contractAddress!, compiledArtifactRef: compiledRef,
-                    expectedDigest, siblings: path.siblings, dirs: path.dirs,
-                    contentRoot: data.contentRoot?.toLowerCase(),
+                    expectedDigest, salt: data.fieldSalt!.toLowerCase(), siblings: path.siblings, dirs: path.dirs,
+                    contentRoot: data.contentRoot?.toLowerCase(), schemaId: data.schemaId?.toLowerCase(),
                     sponsorSessionId: sponsor?.sponsorSessionId
                 }
             });
@@ -1413,7 +1707,8 @@ export function registerSubmissionHandlers(
             payloadHash?: string; fieldKey?: string;
             value?: string; valueDigest?: string;
             allowedValuesJson?: string; setRoot?: string; setSiblingsJson?: string; setDirsJson?: string;
-            contentRoot?: string; siblingsJson?: string; dirsJson?: string;
+            fieldSalt?: string;
+            contentRoot?: string; schemaId?: string; siblingsJson?: string; dirsJson?: string;
             sessionId?: string; contractAddress?: string; compiledArtifactRef?: string;
             idempotencyKey?: string; sponsorSessionId?: string;
         };
@@ -1430,6 +1725,9 @@ export function registerSubmissionHandlers(
             return req.reject(400, 'valueDigest must be 64 hex chars (32 bytes)');
         }
         const valueDigest = hasDigest ? data.valueDigest!.toLowerCase() : blake2b256Hex(data.value!);
+        if (!data.fieldSalt || !SHA256_HEX_RE.test(data.fieldSalt)) {
+            return req.reject(400, 'fieldSalt (64 hex chars) is required (v4 salted leaves; prepareDocumentProof returns it per field)');
+        }
 
         const hasList = typeof data.allowedValuesJson === 'string' && data.allowedValuesJson.length > 0;
         const hasSetPath = !!(data.setRoot || data.setSiblingsJson || data.setDirsJson);
@@ -1444,6 +1742,12 @@ export function registerSubmissionHandlers(
         if (!path) return;
         if (data.contentRoot && !SHA256_HEX_RE.test(data.contentRoot)) {
             return req.reject(400, 'contentRoot must be 64 hex chars (32 bytes)');
+        }
+        if (data.contentRoot && (!data.schemaId || !SHA256_HEX_RE.test(data.schemaId))) {
+            return req.reject(400, 'schemaId (64 hex chars) is required when contentRoot is supplied (anchorContentRoot anchors both)');
+        }
+        if (data.schemaId && !SHA256_HEX_RE.test(data.schemaId)) {
+            return req.reject(400, 'schemaId must be 64 hex chars (32 bytes)');
         }
         if (!data.sessionId) return req.reject(400, 'sessionId is required');
         if (!data.contractAddress) return req.reject(400, 'contractAddress is required');
@@ -1462,6 +1766,11 @@ export function registerSubmissionHandlers(
             try { allowed = JSON.parse(data.allowedValuesJson!); } catch { return req.reject(400, 'allowedValuesJson must be valid JSON'); }
             if (!Array.isArray(allowed) || allowed.length === 0 || allowed.some(v => typeof v !== 'string' || v.length === 0)) {
                 return req.reject(400, 'allowedValuesJson must be a non-empty JSON array of non-empty strings');
+            }
+            // Every RAW entry is digested before dedupe; cap the raw list so an
+            // oversized duplicate-heavy list cannot buy unbounded hashing.
+            if (allowed.length > 1024) {
+                return req.reject(400, 'allowedValuesJson supports at most 1024 raw entries (64 distinct values)');
             }
             let pure;
             try {
@@ -1506,7 +1815,9 @@ export function registerSubmissionHandlers(
             unit: null,
             fieldKey: data.fieldKey.toLowerCase(),
             setRoot,
-            valueCommitment: null,
+            network: recordedNetworkId(),
+            compiledArtifactRef: compiledRef,
+            artifactDigest: artifactDigestOrNull(compiledRef),
             provenTxHash: null,
             provenAt: null,
             createdAt: insertedAt,
@@ -1536,7 +1847,8 @@ export function registerSubmissionHandlers(
                 idempotencyPayload: {
                     payloadHash: data.payloadHash!.toLowerCase(), fieldKey: data.fieldKey!.toLowerCase(),
                     contractAddress: data.contractAddress, predicate: 'setMembership',
-                    setRoot, valueDigest, contentRoot: data.contentRoot,
+                    setRoot, valueDigest, fieldSalt: data.fieldSalt,
+                    contentRoot: data.contentRoot, schemaId: data.schemaId,
                     siblingsJson: data.siblingsJson, dirsJson: data.dirsJson,
                     feeSponsor: sponsor?.sponsorSessionId ?? null
                 },
@@ -1547,9 +1859,255 @@ export function registerSubmissionHandlers(
                     op: 'fieldMembershipWorkflow', predicateAttestationId,
                     payloadHash: data.payloadHash!.toLowerCase(), fieldKey: data.fieldKey!.toLowerCase(),
                     contractAddress: data.contractAddress!, compiledArtifactRef: compiledRef,
-                    setRoot, valueDigest, siblings: path.siblings, dirs: path.dirs,
+                    setRoot, valueDigest, salt: data.fieldSalt!.toLowerCase(),
+                    siblings: path.siblings, dirs: path.dirs,
                     setSiblings, setDirs,
-                    contentRoot: data.contentRoot?.toLowerCase(),
+                    contentRoot: data.contentRoot?.toLowerCase(), schemaId: data.schemaId?.toLowerCase(),
+                    sponsorSessionId: sponsor?.sponsorSessionId
+                }
+            });
+
+            if (job.deduplicated) await db.run(DELETE.from(PredicateAttestations).where({ ID: predicateAttestationId }));
+            const stablePredicateId = (job.originalRequest as any)?.predicateAttestationId ?? predicateAttestationId;
+            return { jobId: job.jobId, status: job.status, predicateAttestationId: stablePredicateId };
+        });
+    });
+
+    srv.on('issueDocumentIntegrityAttestation', async (req: Request) => {
+        const data = req.data as {
+            payloadHashA?: string; payloadHashB?: string; allowedMask?: number;
+            schemaJson?: string; openingAJson?: string; openingBJson?: string;
+            contentRootA?: string; contentRootB?: string; schemaId?: string;
+            sessionId?: string; contractAddress?: string; compiledArtifactRef?: string;
+            idempotencyKey?: string; sponsorSessionId?: string;
+        };
+
+        if (!data.payloadHashA) return req.reject(400, 'payloadHashA is required');
+        if (!SHA256_HEX_RE.test(data.payloadHashA)) return req.reject(400, 'payloadHashA must be 64 hex chars (32 bytes)');
+        if (!data.payloadHashB) return req.reject(400, 'payloadHashB is required');
+        if (!SHA256_HEX_RE.test(data.payloadHashB)) return req.reject(400, 'payloadHashB must be 64 hex chars (32 bytes)');
+        if (data.payloadHashA.toLowerCase() === data.payloadHashB.toLowerCase()) {
+            return req.reject(400, 'payloadHashA and payloadHashB must differ (a document is trivially unchanged against itself)');
+        }
+        if (data.allowedMask === undefined || data.allowedMask === null) return req.reject(400, 'allowedMask is required');
+        if (!Number.isInteger(data.allowedMask) || data.allowedMask < 0 || data.allowedMask > 0xffff) {
+            return req.reject(400, 'allowedMask must be an integer in 0..65535 (packed 16-bit slot mask)');
+        }
+        if (data.allowedMask === 0xffff) {
+            return req.reject(400, 'allowedMask 65535 permits every slot to differ; the claim would be vacuous');
+        }
+        const docPair = parseDocPairInputs(req, data.schemaJson, data.openingAJson, data.openingBJson);
+        if (!docPair) return;
+        if (isVacuousMask(data.allowedMask, docPair.schema)) {
+            return req.reject(400, 'allowedMask frees every real (non-padding) schema slot; the claim would be vacuous');
+        }
+        for (const [name, root] of [['contentRootA', data.contentRootA], ['contentRootB', data.contentRootB]] as const) {
+            if (root && !SHA256_HEX_RE.test(root)) return req.reject(400, `${name} must be 64 hex chars (32 bytes)`);
+        }
+        if ((data.contentRootA || data.contentRootB) && (!data.schemaId || !SHA256_HEX_RE.test(data.schemaId))) {
+            return req.reject(400, 'schemaId (64 hex chars) is required when anchoring a content root (anchorContentRoot anchors both)');
+        }
+        if (data.schemaId && !SHA256_HEX_RE.test(data.schemaId)) {
+            return req.reject(400, 'schemaId must be 64 hex chars (32 bytes)');
+        }
+        if (!data.sessionId) return req.reject(400, 'sessionId is required');
+        if (!data.contractAddress) return req.reject(400, 'contractAddress is required');
+
+        const compiledRef = data.compiledArtifactRef && data.compiledArtifactRef.length > 0
+            ? data.compiledArtifactRef
+            : DEFAULT_ATTESTATION_VAULT_REF;
+
+        if (rejectIfMainnetBlocked(req)) return;
+        if (!checkRate(predicateRateLimiter, data.sessionId, req)) return;
+
+        // Row up-front, same lifecycle as the field actions. Document A rides
+        // in the shared payloadHash column; the mask is its own column so the
+        // two cross-root statements stay unmistakable.
+        const predicateAttestationId = cds.utils.uuid();
+        const insertedAt = new Date().toISOString();
+        await db.run(INSERT.into(PredicateAttestations).entries({
+            ID: predicateAttestationId,
+            payloadHash: data.payloadHashA.toLowerCase(),
+            contractAddress: data.contractAddress,
+            predicate: 'documentIntegrity',
+            op: null,
+            threshold: null,
+            unit: null,
+            fieldKey: null,
+            expectedDigest: null,
+            setRoot: null,
+            payloadHashB: data.payloadHashB.toLowerCase(),
+            allowedMask: data.allowedMask,
+            network: recordedNetworkId(),
+            compiledArtifactRef: compiledRef,
+            artifactDigest: artifactDigestOrNull(compiledRef),
+            provenTxHash: null,
+            provenAt: null,
+            createdAt: insertedAt,
+            modifiedAt: insertedAt
+        }));
+
+        return runSubmission(req, async () => {
+            const facadeCfg = facadeConfigFromEnv();
+            await ensureNetworkId(facadeCfg.networkId);
+            await contractResolver(compiledRef);
+            await walletFactory({ sessionId: data.sessionId!, db, facadeConfig: facadeCfg, expectedUserId: (req as any).user?.id });
+            const sponsor = await resolveSponsorForRequest(req, data.sponsorSessionId);
+
+            const job = await startJob({
+                kind: 'issueDocumentIntegrityAttestation',
+                sessionId: data.sessionId!,
+                idempotencyKey: data.idempotencyKey,
+                request: {
+                    payloadHashA: data.payloadHashA!.toLowerCase(),
+                    payloadHashB: data.payloadHashB!.toLowerCase(),
+                    contractAddress: data.contractAddress,
+                    predicate: 'documentIntegrity',
+                    allowedMask: data.allowedMask,
+                    predicateAttestationId,
+                    feeSponsor: sponsor?.sponsorSessionId ?? null
+                },
+                idempotencyPayload: {
+                    payloadHashA: data.payloadHashA!.toLowerCase(), payloadHashB: data.payloadHashB!.toLowerCase(),
+                    contractAddress: data.contractAddress, predicate: 'documentIntegrity',
+                    allowedMask: data.allowedMask,
+                    schema: docPair.schema, openingA: docPair.openingA, openingB: docPair.openingB,
+                    contentRootA: data.contentRootA?.toLowerCase() ?? null,
+                    contentRootB: data.contentRootB?.toLowerCase() ?? null,
+                    schemaId: data.schemaId?.toLowerCase() ?? null,
+                    feeSponsor: sponsor?.sponsorSessionId ?? null
+                },
+                requestedBy: (req as any).user?.id,
+                commandVersion: 1,
+                encryptCommand: true,
+                command: {
+                    op: 'documentIntegrityWorkflow', predicateAttestationId,
+                    payloadHashA: data.payloadHashA!.toLowerCase(), payloadHashB: data.payloadHashB!.toLowerCase(),
+                    contractAddress: data.contractAddress!, compiledArtifactRef: compiledRef,
+                    allowedMask: data.allowedMask!,
+                    schema: docPair.schema, openingA: docPair.openingA, openingB: docPair.openingB,
+                    contentRootA: data.contentRootA?.toLowerCase(),
+                    contentRootB: data.contentRootB?.toLowerCase(),
+                    schemaId: data.schemaId?.toLowerCase(),
+                    sponsorSessionId: sponsor?.sponsorSessionId
+                }
+            });
+
+            if (job.deduplicated) await db.run(DELETE.from(PredicateAttestations).where({ ID: predicateAttestationId }));
+            const stablePredicateId = (job.originalRequest as any)?.predicateAttestationId ?? predicateAttestationId;
+            return { jobId: job.jobId, status: job.status, predicateAttestationId: stablePredicateId };
+        });
+    });
+
+    srv.on('issueDocumentDiffAttestation', async (req: Request) => {
+        const data = req.data as {
+            payloadHashA?: string; payloadHashB?: string; k?: number;
+            schemaJson?: string; openingAJson?: string; openingBJson?: string;
+            contentRootA?: string; contentRootB?: string; schemaId?: string;
+            sessionId?: string; contractAddress?: string; compiledArtifactRef?: string;
+            idempotencyKey?: string; sponsorSessionId?: string;
+        };
+
+        if (!data.payloadHashA) return req.reject(400, 'payloadHashA is required');
+        if (!SHA256_HEX_RE.test(data.payloadHashA)) return req.reject(400, 'payloadHashA must be 64 hex chars (32 bytes)');
+        if (!data.payloadHashB) return req.reject(400, 'payloadHashB is required');
+        if (!SHA256_HEX_RE.test(data.payloadHashB)) return req.reject(400, 'payloadHashB must be 64 hex chars (32 bytes)');
+        if (data.payloadHashA.toLowerCase() === data.payloadHashB.toLowerCase()) {
+            return req.reject(400, 'payloadHashA and payloadHashB must differ (a document has no differences against itself)');
+        }
+        if (data.k === undefined || data.k === null) return req.reject(400, 'k is required');
+        if (!Number.isInteger(data.k) || data.k < 1 || data.k > 16) {
+            return req.reject(400, 'k must be an integer in 1..16 (minimum differing slots)');
+        }
+        const docPair = parseDocPairInputs(req, data.schemaJson, data.openingAJson, data.openingBJson);
+        if (!docPair) return;
+        for (const [name, root] of [['contentRootA', data.contentRootA], ['contentRootB', data.contentRootB]] as const) {
+            if (root && !SHA256_HEX_RE.test(root)) return req.reject(400, `${name} must be 64 hex chars (32 bytes)`);
+        }
+        if ((data.contentRootA || data.contentRootB) && (!data.schemaId || !SHA256_HEX_RE.test(data.schemaId))) {
+            return req.reject(400, 'schemaId (64 hex chars) is required when anchoring a content root (anchorContentRoot anchors both)');
+        }
+        if (data.schemaId && !SHA256_HEX_RE.test(data.schemaId)) {
+            return req.reject(400, 'schemaId must be 64 hex chars (32 bytes)');
+        }
+        if (!data.sessionId) return req.reject(400, 'sessionId is required');
+        if (!data.contractAddress) return req.reject(400, 'contractAddress is required');
+
+        const compiledRef = data.compiledArtifactRef && data.compiledArtifactRef.length > 0
+            ? data.compiledArtifactRef
+            : DEFAULT_ATTESTATION_VAULT_REF;
+
+        if (rejectIfMainnetBlocked(req)) return;
+        if (!checkRate(predicateRateLimiter, data.sessionId, req)) return;
+
+        // k rides in the threshold column (an integer bound, like the numeric
+        // predicates' threshold).
+        const predicateAttestationId = cds.utils.uuid();
+        const insertedAt = new Date().toISOString();
+        await db.run(INSERT.into(PredicateAttestations).entries({
+            ID: predicateAttestationId,
+            payloadHash: data.payloadHashA.toLowerCase(),
+            contractAddress: data.contractAddress,
+            predicate: 'documentDiff',
+            op: null,
+            threshold: data.k as any,
+            unit: null,
+            fieldKey: null,
+            expectedDigest: null,
+            setRoot: null,
+            payloadHashB: data.payloadHashB.toLowerCase(),
+            allowedMask: null,
+            network: recordedNetworkId(),
+            compiledArtifactRef: compiledRef,
+            artifactDigest: artifactDigestOrNull(compiledRef),
+            provenTxHash: null,
+            provenAt: null,
+            createdAt: insertedAt,
+            modifiedAt: insertedAt
+        }));
+
+        return runSubmission(req, async () => {
+            const facadeCfg = facadeConfigFromEnv();
+            await ensureNetworkId(facadeCfg.networkId);
+            await contractResolver(compiledRef);
+            await walletFactory({ sessionId: data.sessionId!, db, facadeConfig: facadeCfg, expectedUserId: (req as any).user?.id });
+            const sponsor = await resolveSponsorForRequest(req, data.sponsorSessionId);
+
+            const job = await startJob({
+                kind: 'issueDocumentDiffAttestation',
+                sessionId: data.sessionId!,
+                idempotencyKey: data.idempotencyKey,
+                request: {
+                    payloadHashA: data.payloadHashA!.toLowerCase(),
+                    payloadHashB: data.payloadHashB!.toLowerCase(),
+                    contractAddress: data.contractAddress,
+                    predicate: 'documentDiff',
+                    k: data.k,
+                    predicateAttestationId,
+                    feeSponsor: sponsor?.sponsorSessionId ?? null
+                },
+                idempotencyPayload: {
+                    payloadHashA: data.payloadHashA!.toLowerCase(), payloadHashB: data.payloadHashB!.toLowerCase(),
+                    contractAddress: data.contractAddress, predicate: 'documentDiff',
+                    k: data.k,
+                    schema: docPair.schema, openingA: docPair.openingA, openingB: docPair.openingB,
+                    contentRootA: data.contentRootA?.toLowerCase() ?? null,
+                    contentRootB: data.contentRootB?.toLowerCase() ?? null,
+                    schemaId: data.schemaId?.toLowerCase() ?? null,
+                    feeSponsor: sponsor?.sponsorSessionId ?? null
+                },
+                requestedBy: (req as any).user?.id,
+                commandVersion: 1,
+                encryptCommand: true,
+                command: {
+                    op: 'documentDiffWorkflow', predicateAttestationId,
+                    payloadHashA: data.payloadHashA!.toLowerCase(), payloadHashB: data.payloadHashB!.toLowerCase(),
+                    contractAddress: data.contractAddress!, compiledArtifactRef: compiledRef,
+                    k: data.k!,
+                    schema: docPair.schema, openingA: docPair.openingA, openingB: docPair.openingB,
+                    contentRootA: data.contentRootA?.toLowerCase(),
+                    contentRootB: data.contentRootB?.toLowerCase(),
+                    schemaId: data.schemaId?.toLowerCase(),
                     sponsorSessionId: sponsor?.sponsorSessionId
                 }
             });
@@ -1563,7 +2121,7 @@ export function registerSubmissionHandlers(
     srv.on('issueFieldPredicateAttestationBatch', async (req: Request) => {
         const data = req.data as {
             payloadHash?: string;
-            contentRoot?: string;
+            contentRoot?: string; schemaId?: string;
             claimsJson?: string;
             sessionId?: string;
             contractAddress?: string;
@@ -1577,6 +2135,12 @@ export function registerSubmissionHandlers(
         if (data.contentRoot && !SHA256_HEX_RE.test(data.contentRoot)) {
             return req.reject(400, 'contentRoot must be 64 hex chars (32 bytes)');
         }
+        if (data.contentRoot && (!data.schemaId || !SHA256_HEX_RE.test(data.schemaId))) {
+            return req.reject(400, 'schemaId (64 hex chars) is required when contentRoot is supplied (anchorContentRoot anchors both)');
+        }
+        if (data.schemaId && !SHA256_HEX_RE.test(data.schemaId)) {
+            return req.reject(400, 'schemaId must be 64 hex chars (32 bytes)');
+        }
         if (!data.sessionId) return req.reject(400, 'sessionId is required');
         if (!data.contractAddress) return req.reject(400, 'contractAddress is required');
         if (!data.claimsJson) return req.reject(400, 'claimsJson is required');
@@ -1585,15 +2149,20 @@ export function registerSubmissionHandlers(
         // occupies one slot.
         const maxClaims = data.contentRoot ? 7 : 8;
         // Mixed-kind batch claim; `predicate` discriminates (numeric /
-        // bytesEquality / setMembership). `allowedValues` is the raw list of a
-        // membership claim before set resolution.
+        // bytesEquality / setMembership / documentIntegrity / documentDiff).
+        // `allowedValues` is the raw list of a membership claim before set
+        // resolution. The document kinds carry no fieldKey/inclusion path;
+        // document A is the batch-level payloadHash.
         interface BatchClaim {
-            fieldKey: string; siblings: string[]; dirs: boolean[];
+            fieldKey?: string; siblings?: string[]; dirs?: boolean[];
             predicate: string; unit?: string;
             value?: string; threshold?: string; opCode?: number;
             expectedDigest?: string;
             setRoot?: string; valueDigest?: string; setSiblings?: string[]; setDirs?: boolean[];
             allowedValues?: string[];
+            salt?: string;
+            payloadHashB?: string; allowedMask?: number; k?: number;
+            schema?: SchemaSlotWire[]; openingA?: OpeningWire; openingB?: OpeningWire;
         }
         const parsePath = (entry: any, i: number, depth: number, sibName: string, dirName: string): { siblings: string[]; dirs: boolean[] } => {
             const sibs = entry[sibName];
@@ -1623,14 +2192,57 @@ export function registerSubmissionHandlers(
             }
             claims = v.map((entry: any, i: number): BatchClaim => {
                 if (!entry || typeof entry !== 'object') throw new Error(`claims[${i}] must be an object`);
+                const parsed = parsePredicate(entry.predicate);
+                if (!parsed) throw new Error(`claims[${i}].predicate must be 'lessOrEqual', 'greaterOrEqual', 'bytesEquality', 'setMembership', 'documentIntegrity' or 'documentDiff'`);
+
+                if (parsed.kind === 'integrity' || parsed.kind === 'diff') {
+                    // Cross-root document claims: document A is the batch
+                    // payloadHash, so an in-batch contentRoot anchor is A's
+                    // root and B's must already be anchored.
+                    if (typeof entry.payloadHashB !== 'string' || !SHA256_HEX_RE.test(entry.payloadHashB)) {
+                        throw new Error(`claims[${i}].payloadHashB must be 64 hex chars (32 bytes)`);
+                    }
+                    const payloadHashB = entry.payloadHashB.toLowerCase();
+                    if (payloadHashB === data.payloadHash!.toLowerCase()) {
+                        throw new Error(`claims[${i}].payloadHashB must differ from the batch payloadHash`);
+                    }
+                    const schema = validateSchemaSlots(entry.schema, `claims[${i}].schema`);
+                    const openingA = validateOpening(entry.openingA, `claims[${i}].openingA`);
+                    const openingB = validateOpening(entry.openingB, `claims[${i}].openingB`);
+                    if (parsed.kind === 'integrity') {
+                        if (!Number.isInteger(entry.allowedMask) || entry.allowedMask < 0 || entry.allowedMask > 0xffff) {
+                            throw new Error(`claims[${i}].allowedMask must be an integer in 0..65535`);
+                        }
+                        if (entry.allowedMask === 0xffff) {
+                            throw new Error(`claims[${i}].allowedMask 65535 permits every slot to differ; the claim would be vacuous`);
+                        }
+                        if (isVacuousMask(entry.allowedMask, schema)) {
+                            throw new Error(`claims[${i}].allowedMask frees every real (non-padding) schema slot; the claim would be vacuous`);
+                        }
+                        return {
+                            predicate: 'documentIntegrity', payloadHashB, allowedMask: entry.allowedMask,
+                            schema, openingA, openingB
+                        };
+                    }
+                    if (!Number.isInteger(entry.k) || entry.k < 1 || entry.k > 16) {
+                        throw new Error(`claims[${i}].k must be an integer in 1..16`);
+                    }
+                    return {
+                        predicate: 'documentDiff', payloadHashB, k: entry.k,
+                        schema, openingA, openingB
+                    };
+                }
+
                 if (typeof entry.fieldKey !== 'string' || !SHA256_HEX_RE.test(entry.fieldKey)) {
                     throw new Error(`claims[${i}].fieldKey must be 64 hex chars (32 bytes)`);
                 }
-                const parsed = parsePredicate(entry.predicate);
-                if (!parsed) throw new Error(`claims[${i}].predicate must be 'lessOrEqual', 'greaterOrEqual', 'bytesEquality' or 'setMembership'`);
                 const contentPath = parsePath(entry, i, 4, 'siblings', 'dirs');
+                if (typeof entry.salt !== 'string' || !SHA256_HEX_RE.test(entry.salt)) {
+                    throw new Error(`claims[${i}].salt must be 64 hex chars (32 bytes; v4 salted leaves)`);
+                }
                 const base = {
                     fieldKey: entry.fieldKey.toLowerCase(),
+                    salt: entry.salt.toLowerCase(),
                     siblings: contentPath.siblings,
                     dirs: contentPath.dirs,
                     predicate: entry.predicate as string,
@@ -1658,6 +2270,9 @@ export function registerSubmissionHandlers(
                         if ((entry.allowedValues as unknown[]).length === 0 || (entry.allowedValues as unknown[]).some(x => typeof x !== 'string' || x.length === 0)) {
                             throw new Error(`claims[${i}].allowedValues must be a non-empty array of non-empty strings`);
                         }
+                        if ((entry.allowedValues as unknown[]).length > 1024) {
+                            throw new Error(`claims[${i}].allowedValues supports at most 1024 raw entries (64 distinct values)`);
+                        }
                         return { ...base, valueDigest, allowedValues: entry.allowedValues as string[] };
                     }
                     if (!(entry.setRoot && entry.setSiblings && entry.setDirs)) {
@@ -1675,10 +2290,12 @@ export function registerSubmissionHandlers(
                 let valueBig: bigint;
                 try { valueBig = BigInt(entry.value); } catch { throw new Error(`claims[${i}].value must be an integer (decimal string)`); }
                 if (valueBig < 0n) throw new Error(`claims[${i}].value must be a non-negative integer`);
+                if (valueBig > UINT64_MAX) throw new Error(`claims[${i}].value exceeds Uint<64>`);
                 if (entry.threshold === undefined || entry.threshold === null) throw new Error(`claims[${i}].threshold is required`);
                 let thresholdBig: bigint;
                 try { thresholdBig = BigInt(entry.threshold); } catch { throw new Error(`claims[${i}].threshold must be an integer`); }
                 if (thresholdBig < 0n) throw new Error(`claims[${i}].threshold must be a non-negative integer`);
+                if (thresholdBig > UINT64_MAX) throw new Error(`claims[${i}].threshold exceeds Uint<64>`);
                 return { ...base, value: valueBig.toString(), threshold: thresholdBig.toString(), opCode: parsed.opCode! };
             });
         } catch (e: any) {
@@ -1726,6 +2343,8 @@ export function registerSubmissionHandlers(
         for (const c of claims) {
             const tuple = c.predicate === 'bytesEquality' ? `${c.fieldKey}|eq|${c.expectedDigest}`
                 : c.predicate === 'setMembership' ? `${c.fieldKey}|set|${c.setRoot}`
+                : c.predicate === 'documentIntegrity' ? `${c.payloadHashB}|integ|${c.allowedMask}`
+                : c.predicate === 'documentDiff' ? `${c.payloadHashB}|diff|${c.k}`
                 : `${c.fieldKey}|${c.threshold}|${c.opCode}`;
             if (seenTuples.has(tuple)) continue;
             seenTuples.add(tuple);
@@ -1749,12 +2368,18 @@ export function registerSubmissionHandlers(
             contractAddress: data.contractAddress,
             predicate: c.predicate,
             op: c.opCode ?? null,
-            threshold: (c.threshold ?? null) as any,
+            // documentDiff stores its k bound in the threshold column, like
+            // the numeric predicates store theirs.
+            threshold: (c.predicate === 'documentDiff' ? c.k : c.threshold ?? null) as any,
             unit: c.unit ?? null,
-            fieldKey: c.fieldKey,
+            fieldKey: c.fieldKey ?? null,
             expectedDigest: c.expectedDigest ?? null,
             setRoot: c.setRoot ?? null,
-            valueCommitment: null,
+            payloadHashB: c.payloadHashB ?? null,
+            allowedMask: c.allowedMask ?? null,
+            network: recordedNetworkId(),
+            compiledArtifactRef: compiledRef,
+            artifactDigest: artifactDigestOrNull(compiledRef),
             provenTxHash: null,
             provenAt: null,
             createdAt: insertedAt,
@@ -1773,6 +2398,8 @@ export function registerSubmissionHandlers(
                 predicate: c.predicate,
                 ...(c.predicate === 'bytesEquality' ? { expectedDigest: c.expectedDigest }
                     : c.predicate === 'setMembership' ? { setRoot: c.setRoot }
+                    : c.predicate === 'documentIntegrity' ? { payloadHashB: c.payloadHashB, allowedMask: c.allowedMask }
+                    : c.predicate === 'documentDiff' ? { payloadHashB: c.payloadHashB, k: c.k }
                     : { threshold: c.threshold, unit: c.unit ?? null })
             }));
             const job = await startJob({
@@ -1794,7 +2421,9 @@ export function registerSubmissionHandlers(
                         fieldKey: c.fieldKey, predicate: c.predicate, threshold: c.threshold,
                         value: c.value, expectedDigest: c.expectedDigest,
                         setRoot: c.setRoot, valueDigest: c.valueDigest,
-                        siblings: c.siblings, dirs: c.dirs
+                        salt: c.salt, siblings: c.siblings, dirs: c.dirs,
+                        payloadHashB: c.payloadHashB, allowedMask: c.allowedMask, k: c.k,
+                        schema: c.schema, openingA: c.openingA, openingB: c.openingB
                     })),
                     feeSponsor: sponsor?.sponsorSessionId ?? null
                 },
@@ -1806,7 +2435,7 @@ export function registerSubmissionHandlers(
                     payloadHash: data.payloadHash!.toLowerCase(),
                     contractAddress: data.contractAddress!,
                     compiledArtifactRef: compiledRef,
-                    contentRoot: data.contentRoot?.toLowerCase(),
+                    contentRoot: data.contentRoot?.toLowerCase(), schemaId: data.schemaId?.toLowerCase(),
                     claims: rowedClaims.map(c => ({
                         predicateAttestationId: c.predicateAttestationId,
                         fieldKey: c.fieldKey, predicate: c.predicate, threshold: c.threshold,
@@ -1814,7 +2443,9 @@ export function registerSubmissionHandlers(
                         expectedDigest: c.expectedDigest,
                         setRoot: c.setRoot, valueDigest: c.valueDigest,
                         setSiblings: c.setSiblings, setDirs: c.setDirs,
-                        siblings: c.siblings, dirs: c.dirs
+                        salt: c.salt, siblings: c.siblings, dirs: c.dirs,
+                        payloadHashB: c.payloadHashB, allowedMask: c.allowedMask, k: c.k,
+                        schema: c.schema, openingA: c.openingA, openingB: c.openingB
                     })),
                     sponsorSessionId: sponsor?.sponsorSessionId
                 }
@@ -1863,9 +2494,13 @@ export function registerSubmissionHandlers(
         }
 
         // Crawler-free fallback (proof tx not indexed locally): recompute the
-        // claim key from the row and look it up in predicate_results against live
-        // state. Verifies the effect, not the tx, so no crawler/txHash needed.
-        if (!chainSuccess && liveProviderConfigured() && row.contractAddress && row.payloadHash) {
+        // claim key from the row and look it up in predicate_results against
+        // live state OF THE RECORDED NETWORK/ARTIFACT (evidence provenance).
+        // Verifies the effect, not the tx, so no crawler/txHash needed.
+        const rowNetwork = row.network && (VALID_NIGHTGATE_NETWORKS as readonly string[]).includes(row.network)
+            ? row.network as NightgateNetwork
+            : undefined;
+        if (!chainSuccess && liveProviderConfigured(rowNetwork) && row.contractAddress && row.payloadHash) {
             chainSuccess = await verifyPredicateViaState(row);
         }
 
@@ -1876,7 +2511,8 @@ export function registerSubmissionHandlers(
             unit: row.unit ?? '',
             expectedDigest: row.expectedDigest ?? '',
             setRoot: row.setRoot ?? '',
-            valueCommitment: row.valueCommitment ?? '',
+            payloadHashB: row.payloadHashB ?? '',
+            allowedMask: row.allowedMask ?? null,
             provenTxHash: row.provenTxHash ?? '',
             provenAt: row.provenAt ?? null
         };
@@ -2115,6 +2751,7 @@ export function registerSubmissionHandlers(
             contractAddress?: string;
             payloadHash?: string;
             contentRoot?: string;
+            schemaId?: string;
             compiledArtifactRef?: string;
             network?: string;
         };
@@ -2127,6 +2764,9 @@ export function registerSubmissionHandlers(
         if (data.contentRoot && !SHA256_HEX_RE.test(data.contentRoot)) {
             return req.reject(400, 'contentRoot must be 64 hex chars (32 bytes)');
         }
+        if (data.schemaId && !SHA256_HEX_RE.test(data.schemaId)) {
+            return req.reject(400, 'schemaId must be 64 hex chars (32 bytes)');
+        }
         const netParsed = parseVerifyNetworkOverride(data.network, req);
         if (!netParsed.ok) return;
 
@@ -2134,7 +2774,7 @@ export function registerSubmissionHandlers(
             ? data.compiledArtifactRef
             : DEFAULT_ATTESTATION_VAULT_REF;
 
-        const NEGATIVE = { verified: false, attested: false, contentRootOk: false, attesterId: '' };
+        const NEGATIVE = { verified: false, attested: false, contentRootOk: false, schemaOk: false, attesterId: '' };
 
         // No live provider configured → clean negative, not a 5xx (criterion 5).
         if (!liveProviderConfigured(netParsed.network)) return NEGATIVE;
@@ -2145,6 +2785,7 @@ export function registerSubmissionHandlers(
                 contractAddress: data.contractAddress!,
                 payloadHash: data.payloadHash!,
                 contentRoot: data.contentRoot,
+                schemaId: data.schemaId,
                 artifactPath: resolved.artifactPath,
                 contractProvidersConfig: contractProvidersConfigForNetwork(resolved.zkConfigPath, netParsed.network)
             });
@@ -2152,11 +2793,14 @@ export function registerSubmissionHandlers(
             // Unknown contract / no on-chain state → clean negative.
             if (!state) return NEGATIVE;
 
-            const verified = state.attested && (data.contentRoot ? state.contentRootOk : true);
+            const verified = state.attested
+                && (data.contentRoot ? state.contentRootOk : true)
+                && (data.schemaId ? state.schemaOk : true);
             return {
                 verified,
                 attested: state.attested,
                 contentRootOk: state.contentRootOk,
+                schemaOk: state.schemaOk,
                 attesterId: state.attesterId
             };
         });
@@ -2171,6 +2815,9 @@ export function registerSubmissionHandlers(
             threshold?: number | string;
             expectedDigest?: string;
             setRoot?: string;
+            payloadHashB?: string;
+            allowedMask?: number;
+            k?: number;
             compiledArtifactRef?: string;
             network?: string;
         };
@@ -2185,7 +2832,7 @@ export function registerSubmissionHandlers(
         }
 
         const parsed = parsePredicate(data.predicate);
-        if (!parsed) return req.reject(400, "predicate must be 'lessOrEqual', 'greaterOrEqual', 'bytesEquality' or 'setMembership'");
+        if (!parsed) return req.reject(400, "predicate must be 'lessOrEqual', 'greaterOrEqual', 'bytesEquality', 'setMembership', 'documentIntegrity' or 'documentDiff'");
 
         // Per-kind statement coordinates. The claim key is recomputed from
         // exactly what the circuit hashed, so the wrong coordinate silently
@@ -2194,10 +2841,34 @@ export function registerSubmissionHandlers(
         let op: number | undefined;
         let expectedDigest: string | undefined;
         let setRoot: string | undefined;
-        if (parsed.kind === 'numeric') {
+        let payloadHashB: string | undefined;
+        let allowedMask: number | undefined;
+        let k: number | undefined;
+        if (parsed.kind === 'integrity' || parsed.kind === 'diff') {
+            if (!data.payloadHashB || !SHA256_HEX_RE.test(data.payloadHashB)) {
+                return req.reject(400, `payloadHashB (64 hex chars) is required for predicate '${data.predicate}'`);
+            }
+            payloadHashB = data.payloadHashB.toLowerCase();
+            if (parsed.kind === 'integrity') {
+                if (data.allowedMask === undefined || data.allowedMask === null
+                    || !Number.isInteger(data.allowedMask) || data.allowedMask < 0 || data.allowedMask > 0xffff) {
+                    return req.reject(400, "allowedMask (integer 0..65535) is required for predicate 'documentIntegrity'");
+                }
+                allowedMask = data.allowedMask;
+            } else {
+                if (data.k === undefined || data.k === null || !Number.isInteger(data.k) || data.k < 1 || data.k > 16) {
+                    return req.reject(400, "k (integer 1..16) is required for predicate 'documentDiff'");
+                }
+                k = data.k;
+            }
+        } else if (parsed.kind === 'numeric') {
+            // Numeric claims are field-bound only (the commitment-only plain
+            // kind was removed in 0.16.0 with commitValue/provePredicate).
+            if (!data.fieldKey) return req.reject(400, `fieldKey is required for predicate '${data.predicate}'`);
             if (data.threshold === undefined || data.threshold === null) return req.reject(400, 'threshold is required');
             try { thresholdBig = BigInt(data.threshold); } catch { return req.reject(400, 'threshold must be an integer'); }
             if (thresholdBig < 0n) return req.reject(400, 'threshold must be a non-negative integer');
+            if (thresholdBig > UINT64_MAX) return req.reject(400, 'threshold exceeds Uint<64>');
             op = parsed.opCode!;
         } else if (parsed.kind === 'equality') {
             if (!data.fieldKey) return req.reject(400, "fieldKey is required for predicate 'bytesEquality'");
@@ -2230,12 +2901,14 @@ export function registerSubmissionHandlers(
             const proven = await predicateStateReader({
                 contractAddress: data.contractAddress!,
                 payloadHash: data.payloadHash!.toLowerCase(),
-                // Field-bound iff fieldKey supplied; '' means plain.
                 fieldKey: data.fieldKey ? data.fieldKey.toLowerCase() : undefined,
                 threshold: thresholdBig,
                 op,
                 expectedDigest,
                 setRoot,
+                payloadHashB,
+                allowedMask,
+                k,
                 artifactPath: resolved.artifactPath,
                 contractProvidersConfig: contractProvidersConfigForNetwork(resolved.zkConfigPath, netParsed.network)
             });
@@ -2341,18 +3014,24 @@ export function registerSubmissionHandlers(
     async function verifyDocumentViaState(
         contractAddress: string,
         payloadHash: string,
-        compiledArtifactRef?: string
+        compiledArtifactRef?: string,
+        networkOverride?: NightgateNetwork,
+        recordedArtifactDigest?: string | null
     ): Promise<boolean> {
         try {
             const compiledRef = compiledArtifactRef && compiledArtifactRef.length > 0
                 ? compiledArtifactRef
                 : DEFAULT_ATTESTATION_VAULT_REF;
-            const resolved = await contractResolver(compiledRef);
+            // Generation binding, ATOMIC: the resolver verifies the recorded
+            // digest against the very snapshot it imports; a re-pointed alias
+            // or an in-place asset overwrite throws and yields the clean
+            // negative below, never a false "verified".
+            const resolved = await contractResolver(compiledRef, recordedArtifactDigest ?? undefined);
             const state = await attestationStateReader({
                 contractAddress,
                 payloadHash,
                 artifactPath: resolved.artifactPath,
-                contractProvidersConfig: contractProvidersConfigFromEnv(resolved.zkConfigPath)
+                contractProvidersConfig: contractProvidersConfigForNetwork(resolved.zkConfigPath, networkOverride)
             });
             return Boolean(state?.attested);
         } catch {
@@ -2368,22 +3047,42 @@ export function registerSubmissionHandlers(
      */
     async function verifyPredicateViaState(row: any): Promise<boolean> {
         try {
-            const resolved = await contractResolver(DEFAULT_ATTESTATION_VAULT_REF);
+            // Evidence provenance (0.16.0): the state read runs against the
+            // artifact and network RECORDED at proving time, not the current
+            // defaults (a redeploy or network switch must not silently change
+            // what a stored attestation verifies against). Pre-0.16.0 rows
+            // carry nulls and keep the previous default behavior. The alias
+            // is additionally pinned to its recorded GENERATION digest: a
+            // re-pointed alias yields a clean negative.
+            const rowRef = row.compiledArtifactRef || DEFAULT_ATTESTATION_VAULT_REF;
+            // Atomic: the resolver checks the recorded digest against the very
+            // snapshot it imports; a mismatch throws and lands in the clean
+            // negative below.
+            const resolved = await contractResolver(rowRef, row.artifactDigest ?? undefined);
+            const recordedNetwork = row.network && (VALID_NIGHTGATE_NETWORKS as readonly string[]).includes(row.network)
+                ? row.network as NightgateNetwork
+                : undefined;
             // The row's `predicate` literal discriminates the claim kind: the
             // bytes kinds carry expectedDigest/setRoot (no threshold/op); the
-            // numeric kinds carry threshold/op. Field-bound rows carry a
-            // fieldKey; plain rows check predicate_results.
+            // numeric kinds carry threshold/op + fieldKey (field-bound only
+            // since the commitment lane's removal in 0.16.0); the cross-root
+            // kinds carry payloadHashB plus allowedMask (integrity) or
+            // k-in-threshold (diff).
             const bytesKind = row.predicate === 'bytesEquality' || row.predicate === 'setMembership';
+            const docKind = row.predicate === 'documentIntegrity' || row.predicate === 'documentDiff';
             const proven = await predicateStateReader({
                 contractAddress: row.contractAddress,
                 payloadHash: row.payloadHash,
-                threshold: bytesKind ? undefined : BigInt(row.threshold),
-                op: bytesKind ? undefined : Number(row.op),
+                threshold: (bytesKind || docKind) ? undefined : BigInt(row.threshold),
+                op: (bytesKind || docKind) ? undefined : Number(row.op),
                 fieldKey: row.fieldKey || undefined,
                 expectedDigest: row.predicate === 'bytesEquality' ? (row.expectedDigest || undefined) : undefined,
                 setRoot: row.predicate === 'setMembership' ? (row.setRoot || undefined) : undefined,
+                payloadHashB: docKind ? (row.payloadHashB || undefined) : undefined,
+                allowedMask: row.predicate === 'documentIntegrity' ? Number(row.allowedMask) : undefined,
+                k: row.predicate === 'documentDiff' ? Number(row.threshold) : undefined,
                 artifactPath: resolved.artifactPath,
-                contractProvidersConfig: contractProvidersConfigFromEnv(resolved.zkConfigPath)
+                contractProvidersConfig: contractProvidersConfigForNetwork(resolved.zkConfigPath, recordedNetwork)
             });
             return proven === true;
         } catch {
@@ -2455,10 +3154,22 @@ export function registerSubmissionHandlers(
     }
 }
 
-/** Resolves the WalletFacade build config from cds.requires.nightgate + env vars. */
+/**
+ * Resolves the WalletFacade build config from cds.requires.nightgate + env
+ * vars. FAIL-CLOSED on an invalid configured network: initialize() already
+ * refuses the boot, but the CAP host deliberately stays online after a
+ * rejected init, so every submission/job/provider entry point that resolves
+ * its config HERE must refuse the silent preprod fallback too (not rely on
+ * the wallet worker never having started).
+ */
 function facadeConfigFromEnv() {
     const nightgateConfig = getNightgatePluginConfig();
-    const { network, nodeUrl, submissionEndpoints } = resolveNightgateRuntimeConfig(nightgateConfig);
+    const { network, nodeUrl, submissionEndpoints, invalidNetwork } = resolveNightgateRuntimeConfig(nightgateConfig);
+    if (invalidNetwork) {
+        throw new Error(
+            `Invalid network "${invalidNetwork}"; refusing to submit against the "${network}" fallback. ` +
+            `Fix NIGHTGATE_NETWORK / cds.requires.nightgate.network.`);
+    }
     return {
         networkId: network as 'preprod' | 'testnet' | 'mainnet' | 'undeployed',
         indexerHttpUrl: submissionEndpoints.indexerHttpUrl,
@@ -2466,6 +3177,19 @@ function facadeConfigFromEnv() {
         proofServerUrl: submissionEndpoints.proofServerUrl,
         relayUrl: nodeUrl
     };
+}
+
+/** Network id recorded on evidence rows; null when config is unresolvable. */
+function recordedNetworkId(): string | null {
+    try { return facadeConfigFromEnv().networkId ?? null; } catch { return null; }
+}
+
+/**
+ * Artifact-generation digest recorded on evidence rows; null when the alias
+ * is not registered yet (the submission itself then fails later anyway).
+ */
+function artifactDigestOrNull(compiledRef: string): string | null {
+    try { return getArtifactGenerationDigest(compiledRef); } catch { return null; }
 }
 
 /**

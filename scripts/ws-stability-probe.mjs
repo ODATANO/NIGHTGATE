@@ -90,7 +90,7 @@ const stallTimer = setInterval(() => {
     for (const k of ['node', 'indexer']) {
         const s = stats[k];
         if (s.opened && !s.closed && s.lastMsgAt && now - s.lastMsgAt > 40_000) {
-            log(k.toUpperCase(), `⚠️ STALLED — no message for ${((now - s.lastMsgAt) / 1000).toFixed(0)}s (last height ${s.lastHeight})`);
+            log(k.toUpperCase(), `⚠️ STALLED - no message for ${((now - s.lastMsgAt) / 1000).toFixed(0)}s (last height ${s.lastHeight})`);
             s.lastMsgAt = now; // avoid spamming
         }
     }
@@ -106,7 +106,7 @@ setTimeout(() => {
     const verdict = stats.node.closed && !stats.indexer.closed ? 'NODE is the unstable link'
         : stats.indexer.closed && !stats.node.closed ? 'INDEXER is the unstable link'
         : stats.node.closed && stats.indexer.closed ? 'BOTH dropped'
-        : 'Neither dropped in this window (drops may be load-induced — try longer / under sync load)';
+        : 'Neither dropped in this window (drops may be load-induced - try longer / under sync load)';
     console.log(`VERDICT: ${verdict}`);
     try { nodeWs.close(); } catch {}
     try { idxWs.close(); } catch {}

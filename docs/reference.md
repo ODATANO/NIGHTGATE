@@ -20,7 +20,7 @@ Configure the plugin under `cds.requires.nightgate`. Environment variables overr
 }
 ```
 
-Sufficient for read-side. `network` is the only required key — without it the plugin serves its OData surface but stays idle (no crawler, no submission), so a bare install never auto-crawls a chain nobody chose. Everything else defaults: `wss://rpc.preprod.midnight.network/`, the public Midnight indexer, `http://localhost:6300` for the proof server. A legacy `"kind": "nightgate"` in existing configs is inert and ignored.
+Sufficient for read-side. `network` is the only required key - without it the plugin serves its OData surface but stays idle (no crawler, no submission), so a bare install never auto-crawls a chain nobody chose. Everything else defaults: `wss://rpc.preprod.midnight.network/`, the public Midnight indexer, `http://localhost:6300` for the proof server. A legacy `"kind": "nightgate"` in existing configs is inert and ignored.
 
 ### Full
 
@@ -144,7 +144,7 @@ Sufficient for read-side. `network` is the only required key — without it the 
 | `LACE_VIEWING_KEY` | Consumed by `scripts/start-wallet-sync.mjs` and `scripts/run-deploy-e2e.mjs` to bootstrap a wallet session |
 | `LACE_MNEMONIC` | BIP39 recovery phrase the scripts pass to `connectWalletForSigning`; NIGHTGATE HD-derives the per-role keys |
 | `LACE_SEED_HEX` | Optional alternative to `LACE_MNEMONIC`: the full 64-byte BIP39 seed as 128 hex chars |
-| `DEPLOY_E2E_DUST_WAIT_SECONDS` | `run-deploy-e2e.mjs` parameter — how long to wait after dust registration |
+| `DEPLOY_E2E_DUST_WAIT_SECONDS` | `run-deploy-e2e.mjs` parameter - how long to wait after dust registration |
 | `DEPLOY_E2E_SKIP_DUST_REG` | `1` to skip dust registration step in `run-deploy-e2e.mjs` |
 | `NIGHTGATE_HEAP_MB` | Heap size for `scripts/dev.mjs` / `scripts/serve.mjs` (default `12288`) |
 
@@ -158,7 +158,7 @@ For local repository startup, drop these into a repo-root `.env`. The tracked te
 - Model roots registered from `db/` and `srv/`
 - Connector routes (`/zk-config`, `/contract-manifest`) attached during CAP bootstrap; HTTP security remains host-owned
 - `initialize()` runs on `cds.on('served')`:
-  1. Probes the CDS schema (SELECTs each required table). The schema is **not** auto-deployed — on the first missing table the plugin fails fast with `SchemaNotDeployedError` and instructs you to run `npm run deploy`
+  1. Probes the CDS schema (SELECTs each required table). The schema is **not** auto-deployed - on the first missing table the plugin fails fast with `SchemaNotDeployedError` and instructs you to run `npm run deploy`
   2. Loads `cds.requires.nightgate.contracts` into the contract registry
   3. Spawns the wallet worker thread (`startWalletWorker()`) and wires the state-save sink
   4. Starts the crawler if `enabled` (default true)
@@ -196,11 +196,11 @@ For every action that produces an on-chain transaction:
 
 1. **Main thread**: validate args, rate-limit check, INSERT `PendingSubmissions` row with status=`pending`
 2. **Main thread**: register a `CapDbPrivateStateProvider` instance under a fresh `proxyId` (only for deploy/call)
-3. **Worker**: receive RPC, build via facade, balance, finalize (ZK proof gen — heavy), submit; return primitives
+3. **Worker**: receive RPC, build via facade, balance, finalize (ZK proof gen - heavy), submit; return primitives
 4. **Main thread**: UPDATE row with `txHash` + `status=included`; release proxy; classify any error
 5. **Later, async**: crawler indexes the tx → `reconcilePendingSubmission` flips status to `finalized`
 
-The `sessionId` field on `PendingSubmissions` is the OData user-session UUID (audit trail). The worker keys its facade cache on `accountId` (deterministic from viewing key) — they're different identifiers; see [architecture.md#the-sessionid-indirection](architecture.md#the-sessionid-indirection).
+The `sessionId` field on `PendingSubmissions` is the OData user-session UUID (audit trail). The worker keys its facade cache on `accountId` (deterministic from viewing key) - they're different identifiers; see [architecture.md#the-sessionid-indirection](architecture.md#the-sessionid-indirection).
 
 ### Error classification
 
@@ -210,7 +210,7 @@ See [actions.md#error-model](actions.md#error-model) for the full table of error
 
 - On first startup, the package probes the schema by SELECTing each required table. The schema is **not** auto-deployed: on the first missing table Nightgate remains offline and logs a "run `npm run deploy`" error. It never terminates the consuming CAP host process.
 - If the Midnight node cannot be reached, the package logs a warning and continues in `offline` mode. Read-side requests are still served from cache; submission requests still work (they only need the indexer + proof server, not the node directly).
-- If the wallet worker fails to start, the plugin logs a warning and continues — submission requests will return an error, read-side is unaffected.
+- If the wallet worker fails to start, the plugin logs a warning and continues - submission requests will return an error, read-side is unaffected.
 - Repeated `initialize()` calls are idempotent.
 - Contract registry loads from `cds.requires.nightgate.contracts` on every `initialize()`.
 
@@ -309,7 +309,7 @@ caller creates a retry.
 
 One more terminal code exists for prewarm hygiene: a fresh
 `connectWalletForSigning` marks every older queued or running prewarm job of
-the same session as `failed / SUPERSEDED` — queued orphans never start, and
+the same session as `failed / SUPERSEDED` - queued orphans never start, and
 an orphan already mid-run is terminally marked (its wait continues, see
 below). `SUPERSEDED` is expected and needs no operator action; the successor
 job carries the live prewarm status.
@@ -317,8 +317,8 @@ job carries the live prewarm status.
 Superseding is status hygiene, not cancellation: a superseded PENDING job
 never starts, but one caught mid-run keeps its in-flight worker wait until
 that resolves on its own (its late completion is then discarded quietly). In
-practice those waits coalesce — every prewarm of the same account blocks on
-the same facade sync — but rapid-fire fresh prewarms during a long cold sync
+practice those waits coalesce - every prewarm of the same account blocks on
+the same facade sync - but rapid-fire fresh prewarms during a long cold sync
 still each add one real wait until the shared sync finishes.
 
 `BackgroundJobs.status` and `chainStatus` answer different questions. A job is
@@ -416,7 +416,7 @@ self-healing:
 - A leaf job whose transaction is finalized but whose `System.Events` never decode
   (a persistent runtime-metadata gap at that block) has no canonical outcome, so it
   stays `reconciliation_required` **indefinitely** instead of being resolved. This
-  never produces a false success, but there is no timeout — alert on a non-zero
+  never produces a false success, but there is no timeout - alert on a non-zero
   `odatano_nightgate_jobs_reconciliation_required` gauge that does not drain, and
   reconcile such jobs manually against chain state.
 - A job already resolved to `succeeded` / `failed` is not reverted if a later chain
@@ -434,7 +434,7 @@ not cancel or reclaim a hung live SDK promise because the old call may still
 cross the external boundary later. Command replay is crash recovery, not an
 unsafe concurrent takeover of a live process.
 
-The `PrivateStates`, `ContractSigningKeys`, and `WalletSyncStates` tables are encrypted with passwords derived from the viewing key (via PBKDF2). Losing the `ENCRYPTION_KEY` env var means stored viewing/seed keys become unreadable — back it up separately. For private state migration, use `exportPrivateStates({ password })` to produce a portable encrypted blob.
+The `PrivateStates`, `ContractSigningKeys`, and `WalletSyncStates` tables are encrypted with passwords derived from the viewing key (via PBKDF2). Losing the `ENCRYPTION_KEY` env var means stored viewing/seed keys become unreadable - back it up separately. For private state migration, use `exportPrivateStates({ password })` to produce a portable encrypted blob.
 
 ### Security middleware
 
@@ -491,8 +491,8 @@ For per-action signatures and curl examples, see [actions.md](actions.md).
 - `PredicateAttestations`: issued ZK predicate attestations
 - `DisclosureGrants`: on-chain disclosure ACL index
 - `GranteeIdentities`: registered grantee bindings
-- `PendingSubmissions` — submission lifecycle audit trail; READ is scoped to the caller's own sessions since 0.5.2 (admins read unfiltered)
-- `WalletSessions` — projection excludes `viewingKeyHash` and `encryptedViewingKey`; `encryptedSeedKey` also internal-only; READ is scoped to the owning `userId` since 0.5.2 (admins read unfiltered)
+- `PendingSubmissions` - submission lifecycle audit trail; READ is scoped to the caller's own sessions since 0.5.2 (admins read unfiltered)
+- `WalletSessions` - projection excludes `viewingKeyHash` and `encryptedViewingKey`; `encryptedSeedKey` also internal-only; READ is scoped to the owning `userId` since 0.5.2 (admins read unfiltered)
 
 ### Schema additions (vs. 0.1.2)
 
@@ -501,13 +501,13 @@ For per-action signatures and curl examples, see [actions.md](actions.md).
 | `PendingSubmissions` | Submission lifecycle (`pending` → `included` → `finalized` / `failed`). Written before SDK call, reconciled by crawler. |
 | `PrivateStates` | Encrypted contract private state per `(accountId, contractAddress, privateStateId)`. Replaces the SDK's LevelDB provider. |
 | `ContractSigningKeys` | Encrypted contract signing keys per `(accountId, contractAddress)`. |
-| `WalletSyncStates` | Serialized SDK sub-wallet blobs (shielded/unshielded/dust) per `accountId`. Restart-resilient — restored on next `connectWalletForSigning`. |
+| `WalletSyncStates` | Serialized SDK sub-wallet blobs (shielded/unshielded/dust) per `accountId`. Restart-resilient - restored on next `connectWalletForSigning`. |
 | `WalletSessions.encryptedSeedKey` | Nullable field populated by `connectWalletForSigning`. Sessions without it can still do read-side flows. |
 | `BackgroundJobs` | Async-job tracking for long-running actions (deploy, anchor, dust-reg, …). Poll via `getJobStatus(jobId, sessionId)`. |
 | `Attestations` | On-chain attestation index (payload-hash anchor, attester, public metadata, `disclosureLevel`). Backs the `AttestationService` mixin's tiered projections. |
-| `Documents` | Document anchor records. NIGHTGATE stores only the `sha256` commitment + a caller-supplied `storageRef` (`s3://…` \| `ipfs://…` \| `file:///…`) — **it never holds the document bytes**; the consumer owns storage. `anchorDocument` commits the hash on-chain via the `attest` circuit and records `anchoredTxHash`; `verifyDocument` re-checks the hash against the anchored, indexed, `SUCCESS` tx. |
+| `Documents` | Document anchor records. NIGHTGATE stores only the `sha256` commitment + a caller-supplied `storageRef` (`s3://…` \| `ipfs://…` \| `file:///…`) - **it never holds the document bytes**; the consumer owns storage. `anchorDocument` commits the hash on-chain via the `attest` circuit and records `anchoredTxHash`; `verifyDocument` re-checks the hash against the anchored, indexed, `SUCCESS` tx. |
 | `DisclosureRoles` | Per-user disclosure-tier grants (`userId`, `role`, optional `scope`, `validFrom`/`validUntil`). Off-chain, operator-configured; resolved per-request by `attachDisclosureRole`; granted via the authority-gated admin `grantRole`. |
-| `DisclosureGrants` | **Chain-derived** disclosure ACL, read off the AttestationVault `disclosures` ledger Map (`payloadHash`, `grantee`, `level`, `contractAddress`, `grantedTxHash`/`revokedTxHash`, `active`). Written by `grantDisclosure`/`revokeDisclosure` and reconciled to on-chain state by the post-submit reindexer. Distinct from the off-chain `DisclosureRoles` — this is the tamper-evident, attester-controlled source of truth. |
+| `DisclosureGrants` | **Chain-derived** disclosure ACL, read off the AttestationVault `disclosures` ledger Map (`payloadHash`, `grantee`, `level`, `contractAddress`, `grantedTxHash`/`revokedTxHash`, `active`). Written by `grantDisclosure`/`revokeDisclosure` and reconciled to on-chain state by the post-submit reindexer. Distinct from the off-chain `DisclosureRoles` - this is the tamper-evident, attester-controlled source of truth. |
 | `GranteeIdentities` | Binds `userId` → the `Bytes<32>` `granteeId` the AttestationVault checks (`bindingKind`, optional `scope`). Populated by `registerGranteeIdentity`; read by the disclosure gate to match a caller against on-chain grants. |
 
 New enums in `db/types.cds`:
@@ -531,13 +531,14 @@ New enums in `db/types.cds`:
 | Dust generation | ✅ `registerForDustGeneration` + `deregisterFromDustGeneration` |
 | Diagnostics (balance, fee estimates) | ✅ `getWalletBalance`, `estimateSendNightFee`, `getWalletSyncProgress` (catch-up rate + ETA, 0.13.0) |
 | Local Midnight indexer (docker) | ✅ Optional `midnightntwrk/indexer-standalone:4.3.2` service |
-| Wallet state persistence | ✅ `WalletSyncStates` — restart resumes in seconds, not hours |
+| Wallet state persistence | ✅ `WalletSyncStates` - restart resumes in seconds, not hours |
 | Worker-thread architecture | ✅ Wallet SDK isolated from main thread (Phase 1+2a+2b) |
 | Compact contracts | ✅ `counter` + `attestation-vault` + `shielded-token` registered with compiled artifacts shipped |
 | Live preprod end-to-end (T15) | ✅ Counter deployed live on preprod via the full stack (0.3.0) |
 | On-chain disclosure grants | ✅ `grantDisclosure`/`revokeDisclosure` + chain-indexed `DisclosureGrants` + `granteeBinding` + on-chain read gate (0.3.4). Live-validated through grant → index → read-back; live revoke pending a healthy preprod indexer |
 | Crawler-free state verification | ✅ `verifyAttestationState` / `verifyPredicateState` / `reindexDisclosures` read LIVE contract state (0.5.0); optional per-call `network` override reads another network's public indexer (0.7.0) |
 | Bytes equality + set membership proofs | ✅ `issueFieldEqualityAttestation` / `issueFieldMembershipAttestation` + mixed-kind batch + `prepareMembershipSet`; string fields via `prepareDocumentProof` `kind: 'bytes'` (0.15.0) |
+| Cross-root document diff proofs | ✅ `issueDocumentIntegrityAttestation` (unchanged-except with a 16-bit slot mask) / `issueDocumentDiffAttestation` (at least k of 16 slots differ) over TWO anchored content roots, batchable + crawler-free verifiable (0.16.0) |
 | Passport-binding hardening | ✅ `bindPassport` rebind guard + registrar-gated `registerPassport` pre-registration (0.10.0). Registered ids bind only for their registered attester; deployed vaults need a redeploy |
 | Mainnet submission | ❌ Gated by `allowMainnetSubmission: false` until forum 1190 resolves |
 | Built-in authorization | ✅ `@requires` annotations; consumer app provides auth strategy |
@@ -562,10 +563,10 @@ srv/
     MidnightNodeProvider.ts         # Substrate RPC client
   midnight/                         # Wallet SDK integration
     sdk-loader.ts                   # main-thread dynamic-import loader
-    wallet-worker.ts                # worker entry — SDK lives here
+    wallet-worker.ts                # worker entry - SDK lives here
     wallet-worker-client.ts         # main-thread RPC client
     providers.ts                    # provider bundle assembly (legacy main-thread path; test-only after Phase 2b)
-    CapDbPrivateStateProvider.ts    # T29 — encrypted CAP-DB private state
+    CapDbPrivateStateProvider.ts    # T29 - encrypted CAP-DB private state
   submission/                       # Submission orchestration (main thread)
     TransactionSubmitter.ts         # deploy/call lifecycle + pending-row mgmt
     handlers.ts                     # OData action handlers for deploy/call
@@ -628,7 +629,7 @@ npm run integration:contract-registry  # registry resolves the real compiled cou
 - 68 test suites, 1248 tests, 0 failures (Vitest; migrated from Jest in 0.7.0 after CAP 10 deprecated the Jest harness; counts as of 0.11.0)
 - Integration scripts pass against the real SDK (`smoke:sdk`, `integration:*`)
 - The worker's RPC dispatch, facade lifecycle, genuine-sync gate, save/ack protocol AND the facade operation bodies (transfer incl. `tokenTypeHex`, balance/fee reads, dust register/deregister, contract-call private-state seeding) are unit-tested in-thread against a fake facade (`wallet-worker-dispatch.test.ts`); real-SDK behavior is exercised by the live e2e scripts (`wasm-proving:e2e`, `wasm-contract:e2e`, `wasm-zswap:e2e`, `deploy:e2e`)
-- Coverage measurement note: the CAP-booted services execute the compiled `srv/*.js` (native require, outside vitest's module graph). The build emits sourcemaps and `vitest.config.ts` includes `srv/**/*.js` so this execution is remapped onto the `.ts` sources — don't remove either half, or every handler tested through the booted server reads as uncovered
+- Coverage measurement note: the CAP-booted services execute the compiled `srv/*.js` (native require, outside vitest's module graph). The build emits sourcemaps and `vitest.config.ts` includes `srv/**/*.js` so this execution is remapped onto the `.ts` sources - don't remove either half, or every handler tested through the booted server reads as uncovered
 
 Run locally:
 

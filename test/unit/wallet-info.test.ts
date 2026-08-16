@@ -2,7 +2,7 @@
  * Tests for srv/utils/wallet-info.ts.
  *
  * Only the validation paths are unit-tested here: they run before any
- * dynamic import of the ESM-only SDK packages, which Jest's resolver can't
+ * dynamic import of the ESM-only SDK packages, which unit tests never
  * load (same constraint as wallet-hd.test.ts). Derivation correctness,
  * including the Lace-address match, is verified live by
  * scripts/integration-test-derive-wallet-info.mjs.

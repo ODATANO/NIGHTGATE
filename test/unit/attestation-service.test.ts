@@ -29,7 +29,7 @@ import cds from '@sap/cds';
 import { registerAttestationServiceHandlers, toPredicateEnvelope } from '../../src/sdk/AttestationService';
 
 // Boot the in-memory CAP server. Not assigned to a `test` const on purpose
-// (would shadow Jest's global test()).
+// (would shadow Vitest's global test()).
 cds.test(__dirname + '/../..');
 
 const ROLES = 'midnight.DisclosureRoles';
@@ -335,27 +335,27 @@ describe('toPredicateEnvelope', () => {
         predicate: 'lessOrEqual',
         threshold: 50000,
         unit: 'kgCO2e/kWh',
-        valueCommitment: 'c'.repeat(64),
         contractAddress: '0xVAULT',
         provenTxHash: '0xprove'
     };
 
     test('maps a row to the PAC envelope shape', () => {
         expect(toPredicateEnvelope(row)).toEqual({
-            digestMultibase: 'c'.repeat(64),
+            digestMultibase: null,
             claim: { predicate: 'lessOrEqual', threshold: '50000', unit: 'kgCO2e/kWh' },
             proof: {
                 system: 'midnight-compact',
-                circuit: 'provePredicate',
+                circuit: 'proveFieldPredicate',
                 verificationMethod: '0xVAULT',
                 proofValue: '0xprove'
             }
         });
     });
 
-    test('digestMultibase is null when no commitment is known', () => {
-        const env = toPredicateEnvelope({ ...row, valueCommitment: null });
-        expect(env.digestMultibase).toBeNull();
+    test('the proving circuit is derived from the predicate kind', () => {
+        expect(toPredicateEnvelope({ ...row, predicate: 'bytesEquality' }).proof.circuit).toBe('proveFieldEquality');
+        expect(toPredicateEnvelope({ ...row, predicate: 'setMembership' }).proof.circuit).toBe('proveFieldMembership');
+        expect(toPredicateEnvelope({ ...row, predicate: 'documentDiff' }).proof.circuit).toBe('proveDocumentComparison');
     });
 
     test('threshold is always stringified; missing unit/txHash degrade gracefully', () => {

@@ -6,7 +6,42 @@ on:
       - 'v*'
 
 jobs:
+  # Release gates: the SAME checks CI and npm prepublishOnly run. A tag must
+  # never publish an image/release that CI would have failed, and a
+  # mis-versioned tag must die before anything is pushed.
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: 22.x
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Verify tag matches package.json version
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/v}
+          VERSION=${VERSION#.}
+          PKG=$(node -p "require('./package.json').version")
+          if [ "$VERSION" != "$PKG" ]; then
+            echo "::error::tag version '$VERSION' does not match package.json version '$PKG'"
+            exit 1
+          fi
+
+      - name: Release gates (lint, typecheck, tests, integrations, packaging)
+        env:
+          CI: true
+          NODE_ENV: test
+        run: npm run check:release
+
   build-and-release:
+    needs: check
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -15,16 +50,6 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Login to GitHub Container Registry
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Extract version
         id: version
@@ -38,9 +63,26 @@ jobs:
             echo "::error::tag '${GITHUB_REF#refs/tags/}' does not yield a valid version (got '$VERSION'); use vMAJOR.MINOR.PATCH"
             exit 1
           fi
+          # Belt-and-braces (the check job already gates on this): never push
+          # an image whose tag disagrees with package.json.
+          PKG=$(node -p "require('./package.json').version")
+          if [ "$VERSION" != "$PKG" ]; then
+            echo "::error::tag version '$VERSION' does not match package.json version '$PKG'"
+            exit 1
+          fi
           echo "version=$VERSION" >> $GITHUB_OUTPUT
           echo "git_sha=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
           echo "build_date=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> $GITHUB_OUTPUT
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set repository owner to lowercase
         id: repo

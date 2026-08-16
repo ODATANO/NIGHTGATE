@@ -542,13 +542,13 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
 
             // Boot hygiene (worker-calls-outside-request-tx FR item 4): this
             // prewarm supersedes every older queued/running prewarm of the
-            // session — queued orphans never start, one already mid-run keeps
+            // session - queued orphans never start, one already mid-run keeps
             // its current worker wait but stays terminally SUPERSEDED. The
             // sweep joins THIS handler's ambient tx (atomic with the job
             // insert above; a detached write here would request a second pool
-            // connection while the request tx pins one — deadlock at
+            // connection while the request tx pins one - deadlock at
             // pool.max=1). Best-effort: a failed sweep must not fail the
-            // connect — safe because the sweep savepoints its UPDATE, so a
+            // connect - safe because the sweep savepoints its UPDATE, so a
             // failure cannot leave the PostgreSQL tx aborted.
             try {
                 await supersedeQueuedJobs('connectWalletForSigning', sessionId, job.jobId);

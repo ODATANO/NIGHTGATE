@@ -48,7 +48,10 @@ service NightgateIndexerService {
 
     // K8s readiness probe, returns 200 only if subsystems are ready
     function getReadiness()                       returns {
-        ready  : Boolean;
+        ready          : Boolean;
+        // false = crawler deliberately disabled; its checks pass as
+        // not-applicable and the deployment is submission/verification-only.
+        crawlerEnabled : Boolean;
         checks : {
             database : Boolean;
             crawler  : Boolean;

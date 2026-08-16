@@ -2,9 +2,9 @@
 
 From `npm ci` to a working wallet-signed transaction. This walks through three paths in order of complexity:
 
-1. **Read-side only** — index Preprod blocks against the hosted RPC. ~2 min setup.
-2. **Wallet sessions + read** — connect a wallet, query its balance. ~5 min.
-3. **Full submission flow** — sign and submit a NIGHT transfer or contract deploy. ~5 min once a synced wallet is available.
+1. **Read-side only** - index Preprod blocks against the hosted RPC. ~2 min setup.
+2. **Wallet sessions + read** - connect a wallet, query its balance. ~5 min.
+3. **Full submission flow** - sign and submit a NIGHT transfer or contract deploy. ~5 min once a synced wallet is available.
 
 ## Prerequisites
 
@@ -31,7 +31,7 @@ curl "http://localhost:4004/api/v1/indexer/getSyncStatus()"
 curl "http://localhost:4004/api/v1/nightgate/Blocks?\$top=5&\$orderby=height desc"
 ```
 
-You should see non-zero `chainHeight` and the latest 5 blocks. **Done — read-side works.**
+You should see non-zero `chainHeight` and the latest 5 blocks. **Done - read-side works.**
 
 ## Path 2: Wallet sessions
 
@@ -49,7 +49,7 @@ Configuring `NIGHTGATE_PROOF_SERVER_URL` (or `proofServerUrl` in cds config) sel
 
 ### Configure wallet credentials
 
-Edit `.env` in the repo root (gitignored — never commit a real seed):
+Edit `.env` in the repo root (gitignored - never commit a real seed):
 
 ```env
 NIGHTGATE_NETWORK=preprod
@@ -59,7 +59,7 @@ NIGHTGATE_NODE_URL=wss://rpc.preprod.midnight.network/
 NIGHTGATE_CRAWLER_ENABLED=false
 
 # Viewing key (64-hex encryption public key) + BIP39 mnemonic.
-# NIGHTGATE HD-derives the per-role keys server-side, matching Lace — pass the mnemonic, not a raw seed.
+# NIGHTGATE HD-derives the per-role keys server-side, matching Lace - pass the mnemonic, not a raw seed.
 LACE_VIEWING_KEY=a32699a5a29e453f6e92624c2fbefdee173d3f1178e3f9c71bc3edb7d91c1403
 LACE_MNEMONIC="word1 word2 word3 ... word24"
 ```
@@ -71,7 +71,7 @@ LACE_MNEMONIC="word1 word2 ... word24" node scripts/derive-keys.mjs
 
 ### Start the server
 
-`serve:sync` runs `cds-serve` (no watch) against the persistent file DB, so deploy the schema once first (auto-deploy was removed — the submission path fails fast if the schema is missing):
+`serve:sync` runs `cds-serve` (no watch) against the persistent file DB, so deploy the schema once first (auto-deploy was removed - the submission path fails fast if the schema is missing):
 
 ```bash
 npm run deploy        # cds deploy --to sqlite:db/midnight.db (first run / after schema changes)
@@ -162,7 +162,7 @@ curl -X POST http://localhost:4004/api/v1/nightgate/sendNight \
   }'
 ```
 
-Response: `{"jobId":"...","status":"pending"}`. Submit actions are async — poll `getJobStatus(jobId, sessionId)` until `succeeded`; its `result` then holds `{"txId":"0x...","toLedger":"unshielded","amount":"1000000",...}`. The crawler later flips the matching `PendingSubmissions` row to `finalized` once the tx is indexed.
+Response: `{"jobId":"...","status":"pending"}`. Submit actions are async - poll `getJobStatus(jobId, sessionId)` until `succeeded`; its `result` then holds `{"txId":"0x...","toLedger":"unshielded","amount":"1000000",...}`. The crawler later flips the matching `PendingSubmissions` row to `finalized` once the tx is indexed.
 
 ### Deploy a contract
 
@@ -206,13 +206,13 @@ Add to `package.json`:
 }
 ```
 
-Then `cds watch`. `network` is the only required key (without it the plugin stays idle — it never auto-crawls a chain nobody chose); everything else defaults to the public Preprod endpoints. Override via env vars or CDS config — see [reference.md#configuration](reference.md#configuration). (A legacy `"kind": "nightgate"` in existing configs is harmless and ignored.)
+Then `cds watch`. `network` is the only required key (without it the plugin stays idle - it never auto-crawls a chain nobody chose); everything else defaults to the public Preprod endpoints. Override via env vars or CDS config - see [reference.md#configuration](reference.md#configuration). (A legacy `"kind": "nightgate"` in existing configs is harmless and ignored.)
 
 The plugin auto-registers four OData services under `/api/v1/{nightgate,indexer,analytics,admin}`. All actions and functions documented in [actions.md](actions.md) are available immediately.
 
 ## Common next steps
 
-- **Action reference** — [actions.md](actions.md) — every OData action + function with curl examples
-- **Operations guide** — [operations.md](operations.md) — scripts, local indexer container, troubleshooting
-- **Architecture** — [architecture.md](architecture.md) — worker-thread design, submission flow, persistence
-- **Full configuration matrix** — [reference.md#configuration](reference.md#configuration)
+- **Action reference** - [actions.md](actions.md) - every OData action + function with curl examples
+- **Operations guide** - [operations.md](operations.md) - scripts, local indexer container, troubleshooting
+- **Architecture** - [architecture.md](architecture.md) - worker-thread design, submission flow, persistence
+- **Full configuration matrix** - [reference.md#configuration](reference.md#configuration)

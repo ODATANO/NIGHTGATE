@@ -20,3 +20,22 @@ export function fromHex32(hex: string): Uint8Array {
     for (let i = 0; i < 32; i++) out[i] = parseInt(hex.substr(i * 2, 2), 16);
     return out;
 }
+
+/**
+ * Canonical empty-slot field key: "nightgate/empty-leaf/v2" ASCII,
+ * zero-padded to 32 bytes. MUST stay byte-identical to the contract's
+ * `emptyLeafKey()` pure circuit (Compact `pad(32, ...)` right-pads); a unit
+ * test pins the parity. v2 replaced the v1 blake2b-digest key in 0.16.0
+ * because a Compact literal cannot express an arbitrary digest.
+ */
+export const EMPTY_LEAF_KEY_LABEL = 'nightgate/empty-leaf/v2';
+
+export function emptyLeafKeyBytes(): Uint8Array {
+    const out = new Uint8Array(32);
+    out.set(new TextEncoder().encode(EMPTY_LEAF_KEY_LABEL));
+    return out;
+}
+
+export function emptyLeafKeyHex(): string {
+    return bytesToHex(emptyLeafKeyBytes());
+}

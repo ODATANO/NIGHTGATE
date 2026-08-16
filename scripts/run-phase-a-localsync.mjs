@@ -59,7 +59,7 @@ async function pollJob(sessionId, jobId, label) {
 }
 
 (async () => {
-    console.log('PHASE A — full wallet sync against LOCAL indexer (no revoke)');
+    console.log('PHASE A - full wallet sync against LOCAL indexer (no revoke)');
 
     step('1. connectWallet');
     let r = await post('/connectWallet', { viewingKey: VK });
@@ -71,15 +71,15 @@ async function pollJob(sessionId, jobId, label) {
     const t0 = Date.now();
     r = await post('/connectWalletForSigning', { sessionId, mnemonic: MNEMONIC });
     if (r.status >= 400) fail(`connectWalletForSigning -> ${r.status}: ${pretty(r.body)}`);
-    if (!r.body?.prewarmJobId) { console.log('WARN no prewarmJobId — wallet may already be synced'); process.exit(0); }
+    if (!r.body?.prewarmJobId) { console.log('WARN no prewarmJobId - wallet may already be synced'); process.exit(0); }
 
     const pw = await pollJob(sessionId, r.body.prewarmJobId, 'prewarm');
     const mins = ((Date.now() - t0) / 60000).toFixed(1);
     if (pw?.failed) {
-        console.log(`\nPHASE A FAILED after ${mins} min — ${pw.errorCode} — ${pw.errorMessage}`);
+        console.log(`\nPHASE A FAILED after ${mins} min - ${pw.errorCode} - ${pw.errorMessage}`);
         process.exit(1);
     }
-    console.log(`\nPHASE A DONE after ${mins} min — wallet synced to local head, state persisted to WalletSyncStates.`);
+    console.log(`\nPHASE A DONE after ${mins} min - wallet synced to local head, state persisted to WalletSyncStates.`);
     console.log('Next: stop server, switch NIGHTGATE_INDEXER_* to the PUBLIC indexer (dust cold-start OFF), restart, run the revoke.');
     process.exit(0);
 })();

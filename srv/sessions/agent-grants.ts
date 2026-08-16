@@ -55,10 +55,14 @@ const TOKEN_BYTES = 32;
  */
 export const AGENT_ALLOWLISTABLE_ACTIONS: readonly string[] = [
     'anchorDocument',
+    'commitDocumentAnchor',
     'attestAgentOutput',
-    'issuePredicateAttestation',
     'issueFieldPredicateAttestation',
+    'issueFieldEqualityAttestation',
+    'issueFieldMembershipAttestation',
     'issueFieldPredicateAttestationBatch',
+    'issueDocumentIntegrityAttestation',
+    'issueDocumentDiffAttestation',
     'grantDisclosure',
     'revokeDisclosure',
     'reindexDisclosures'
@@ -76,6 +80,7 @@ export const AGENT_ALWAYS_ALLOWED_EVENTS: ReadonlySet<string> = new Set([
     'verifyPredicateState',
     'verifyPredicateAttestation',
     'prepareDocumentProof', // compute-only, no chain write, no session needed
+    'prepareAnchorCommitment', // compute-only (commit-reveal phase 0)
     'getJobStatus'
 ]);
 

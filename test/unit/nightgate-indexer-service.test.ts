@@ -32,7 +32,7 @@ vi.spyOn(crawlerNative, 'isCrawlerRunning').mockImplementation(mockIsCrawlerRunn
 import cds from '@sap/cds';
 
 // Boot the in-memory CAP server. Not assigned to a `test` const on purpose
-// (would shadow Jest's global test()).
+// (would shadow Vitest's global test()).
 cds.test(__dirname + '/../..');
 
 const SYNC_STATE = 'midnight.SyncState';
@@ -271,6 +271,32 @@ describe('getLiveness', () => {
 });
 
 describe('getReadiness', () => {
+    // The crawler-behavior expectations below describe an ENABLED crawler; a
+    // deliberately disabled one passes its checks as not-applicable (0.16.0).
+    const prevCrawlerEnv = process.env.NIGHTGATE_CRAWLER_ENABLED;
+    beforeEach(() => { process.env.NIGHTGATE_CRAWLER_ENABLED = 'true'; });
+    afterEach(() => {
+        if (prevCrawlerEnv === undefined) delete process.env.NIGHTGATE_CRAWLER_ENABLED;
+        else process.env.NIGHTGATE_CRAWLER_ENABLED = prevCrawlerEnv;
+    });
+
+    it('reports ready with crawler/node checks passing as not-applicable when the crawler is disabled', async () => {
+        process.env.NIGHTGATE_CRAWLER_ENABLED = 'false';
+        await db.run(cds.ql.DELETE.from(SYNC_STATE));
+
+        const result = await srv.send('getReadiness');
+        expect(result).toEqual(expect.objectContaining({
+            ready: true,
+            crawlerEnabled: false,
+            checks: {
+                database: true,
+                crawler: true,
+                node: true,
+                runtime: true
+            }
+        }));
+    });
+
     it('returns false when SyncState is missing after the database check', async () => {
         await db.run(cds.ql.DELETE.from(SYNC_STATE));
 

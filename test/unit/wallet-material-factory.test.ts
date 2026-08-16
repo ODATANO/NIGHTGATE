@@ -12,7 +12,7 @@
 import crypto from 'crypto';
 
 // Mock loadLedgerV8, ledger-v8 is ESM-only and cannot be loaded from this
-// Jest CommonJS runtime. Tests verify wiring/shape; real crypto derivation is
+// unit suite (repo rule: never the real SDK). Tests verify wiring/shape; real crypto derivation is
 // exercised by scripts/integration-test-wallet-keys.mjs.
 vi.mock('../../srv/midnight/sdk-loader', async () => {
     const actual = await vi.importActual('../../srv/midnight/sdk-loader');

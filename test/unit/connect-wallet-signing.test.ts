@@ -8,7 +8,9 @@
  * Promise to pre-warm the wallet. We mock that here so the unawaited chain
  * resolves synchronously instead of touching the worker RPC + CAP model load.
  * Those held handles open past test completion and triggered "worker
- * failed to exit gracefully" warnings on Jest's worker pool teardown.
+ * failed to exit gracefully" warnings on the test runner's worker pool
+ * teardown (observed under the old Jest setup; the mock stays because the
+ * unawaited chain must not touch worker RPC + CAP model load either way).
  */
 
 vi.mock('../../srv/submission/wallet-facade-builder', () => ({

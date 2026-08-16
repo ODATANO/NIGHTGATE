@@ -304,7 +304,7 @@ describe('wallet session guard branches', () => {
             expect(req.reject).toHaveBeenCalledWith(410, 'Session expired');
         });
 
-        it('queues the job even with an undecryptable key — decrypt is deferred to the processor, not a request-path 500', async () => {
+        it('queues the job even with an undecryptable key - decrypt is deferred to the processor, not a request-path 500', async () => {
             mockDbRun.mockResolvedValue(signingSessionRow({ encryptedViewingKey: 'deadbeef' }));
             const req = makeReq(base);
             const result = await handlers[op](req);

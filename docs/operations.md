@@ -7,7 +7,7 @@ Running NIGHTGATE day-to-day. Audience: anyone deploying it, debugging a stuck s
 | Command | When to use | What it does |
 |---|---|---|
 | `npm run dev` | Iterating on code | `cds watch` with auto-reload + 12 GB heap (`scripts/dev.mjs`) |
-| `npm run serve:sync` | Long-running sync, demos | `cds-serve` with 12 GB heap (no watch — avoids restarting on DB writes) |
+| `npm run serve:sync` | Long-running sync, demos | `cds-serve` with 12 GB heap (no watch - avoids restarting on DB writes) |
 | `npm run serve` | Production-ish | Plain `cds-serve` (no heap pre-config) |
 | `npm run sync:start` | Bootstrap a wallet session | Calls `connectWallet` + `connectWalletForSigning` against `localhost:4004`, reads keys from `.env` |
 | `npm run sync:probe` | Check local indexer container | Verifies `localhost:8088` is up + returning data |
@@ -43,8 +43,8 @@ NIGHTGATE_CRAWLER_ENABLED=false                           # Turn off during wall
 # NIGHTGATE_INDEXER_WS_URL=ws://localhost:8088/api/v4/graphql/ws
 
 # Wallet credentials for npm scripts (sync:start, deploy:e2e). NIGHTGATE HD-derives
-# the per-role keys from the mnemonic, matching Lace — pass the mnemonic.
-# .env is gitignored — these stay local. NEVER commit a real seed/mnemonic.
+# the per-role keys from the mnemonic, matching Lace - pass the mnemonic.
+# .env is gitignored - these stay local. NEVER commit a real seed/mnemonic.
 LACE_VIEWING_KEY=a32699a5a29e453f6e92624c2fbefdee173d3f1178e3f9c71bc3edb7d91c1403
 LACE_MNEMONIC="word1 word2 word3 ... word24"
 
@@ -56,7 +56,7 @@ In dev mode without `ENCRYPTION_KEY` set, the crypto layer falls back to a deter
 
 ### CDS config
 
-Everything else goes under `cds.requires.nightgate` in `package.json` — see [reference.md#configuration](reference.md#configuration) for the full matrix.
+Everything else goes under `cds.requires.nightgate` in `package.json` - see [reference.md#configuration](reference.md#configuration) for the full matrix.
 
 ## Local Midnight indexer (optional)
 
@@ -68,7 +68,7 @@ The hosted Midnight indexer at `indexer.preprod.midnight.network` occasionally r
 docker compose -f docker/docker-compose.yml up -d indexer
 ```
 
-The container talks to the hosted Substrate RPC by default (so we self-host the *flaky* GraphQL layer but keep the *reliable* RPC hosted — see [architecture.md](architecture.md) for the rationale). Storage is SQLite in a named docker volume.
+The container talks to the hosted Substrate RPC by default (so we self-host the *flaky* GraphQL layer but keep the *reliable* RPC hosted - see [architecture.md](architecture.md) for the rationale). Storage is SQLite in a named docker volume.
 
 ### Verify it's up
 
@@ -118,14 +118,14 @@ npm run sync:start
 [facade-persist] saved <sid> sh=N un=N du=N                                                    (every ~30 s once events flow)
 ```
 
-A first-time cold sync from genesis on a fresh seed takes ~5-6 h wall-clock. The worker pegs ~3.8 GB heap once the shielded chain scan completes (it doesn't shrink — that's the in-memory merkle tree). Restart-from-blob is in seconds: every 30 s the worker persists state to `WalletSyncStates`, and a subsequent `connectWalletForSigning` for the same accountId loads the prior blob and delta-syncs from there.
+A first-time cold sync from genesis on a fresh seed takes ~5-6 h wall-clock. The worker pegs ~3.8 GB heap once the shielded chain scan completes (it doesn't shrink - that's the in-memory merkle tree). Restart-from-blob is in seconds: every 30 s the worker persists state to `WalletSyncStates`, and a subsequent `connectWalletForSigning` for the same accountId loads the prior blob and delta-syncs from there.
 
 ## Persistence + restart resilience
 
 Two state tables are load-bearing for restart:
 
-- **`midnight.SyncState`** (singleton row) — crawler's chain-height progress
-- **`midnight.WalletSyncStates`** (per-accountId) — wallet SDK's serialized sub-wallet blobs
+- **`midnight.SyncState`** (singleton row) - crawler's chain-height progress
+- **`midnight.WalletSyncStates`** (per-accountId) - wallet SDK's serialized sub-wallet blobs
 
 You can inspect them at any time:
 
@@ -136,7 +136,7 @@ node -e "const s=require('better-sqlite3'); const r=new s('db/midnight.db',{read
 Healthy progression looks like:
 - `sh` stays roughly stable once at tip (your shielded notes don't change every block)
 - `du` grows continuously (dust events flow at ~500/min on preprod)
-- `du` may *shrink slightly* between saves (dust UTXOs expire) — that's normal live-tip behavior
+- `du` may *shrink slightly* between saves (dust UTXOs expire) - that's normal live-tip behavior
 
 If you see `sh` or `du` shrink dramatically, the SDK is probably revalidating during restore; the new value is the post-validation form. Not corruption.
 
@@ -154,7 +154,7 @@ If you see `sh` or `du` shrink dramatically, the SDK is probably revalidating du
 }
 ```
 
-When `NIGHTGATE_CRAWLER_ENABLED=false`, the row stays at whatever the last crawler run wrote — chainHeight comes from the node (always fresh), indexedHeight from the persisted SyncState (frozen). `status: unhealthy` and `lag` numbers don't mean anything for the wallet sync.
+When `NIGHTGATE_CRAWLER_ENABLED=false`, the row stays at whatever the last crawler run wrote - chainHeight comes from the node (always fresh), indexedHeight from the persisted SyncState (frozen). `status: unhealthy` and `lag` numbers don't mean anything for the wallet sync.
 
 For wallet sync health, look at the `[facade-persist] saved` log lines (worker is processing events) and at the `WalletSyncStates` blob sizes (they should change between subsequent saves).
 
@@ -199,8 +199,8 @@ Leave `midnight_WalletSyncStates` alone: that is the expensive warm state, and d
 The wallet has less DUST than the operation's fee. Mostly hits on `deployContract` since contract deploys are dust-heavy.
 
 **Diagnosis path:**
-1. `getWalletBalance(sessionId)` — what's the actual dust balance?
-2. `estimateSendNightFee(...)` — pre-flight fee for what you're trying to do
+1. `getWalletBalance(sessionId)` - what's the actual dust balance?
+2. `estimateSendNightFee(...)` - pre-flight fee for what you're trying to do
 3. Compare. If fee > balance, wait for more dust to accrue or register more NIGHT UTXOs to raise the cap.
 
 **Causes:**
@@ -223,7 +223,7 @@ curl -s -o /dev/null -w "HTTP %{http_code}\n" \
 
 ### Submissions stall on the 5th+ call of a long session (public indexer)
 
-The hosted preprod indexer's graphql-ws subscription degrades over a long, multi-call session — early calls succeed but later ones can hang inside the SDK's balance/submit (the proof server goes idle). The pre-balance sync wait is bounded (`NIGHTGATE_BALANCE_SYNC_TIMEOUT_MS`, default 180s) so it fails rather than hangs forever, but the SDK's own balance/submit calls aren't. Mitigations: keep sessions short / run independent flows separately, restart the server for a fresh subscription, or use a **caught-up** local indexer for heavy use.
+The hosted preprod indexer's graphql-ws subscription degrades over a long, multi-call session - early calls succeed but later ones can hang inside the SDK's balance/submit (the proof server goes idle). The pre-balance sync wait is bounded (`NIGHTGATE_BALANCE_SYNC_TIMEOUT_MS`, default 180s) so it fails rather than hangs forever, but the SDK's own balance/submit calls aren't. Mitigations: keep sessions short / run independent flows separately, restart the server for a fresh subscription, or use a **caught-up** local indexer for heavy use.
 
 ### Contract calls feel slow: read the phase timing
 
@@ -243,7 +243,7 @@ execution, a large `balance` at wallet sync lag.
 Phase-2a observation: while the wallet worker is mid-sync at full CPU, the main thread's CAP request pipeline can get starved (10 s `getHealth` curls time out while worker `state-save` events fire normally every 30 s). State-save uses `worker.on('message')` callbacks which don't go through the CAP request pipeline; requests do (auth, AsyncLocalStorage, transaction binding).
 
 **Workarounds:**
-- Wait for the wallet to reach tip — once `du` blob is stable-ish, the worker's CPU load drops and request handlers respond again
+- Wait for the wallet to reach tip - once `du` blob is stable-ish, the worker's CPU load drops and request handlers respond again
 - For monitoring during sync, prefer direct DB queries over OData calls
 
 ### Zombie node processes / port 4004 in use
@@ -256,7 +256,7 @@ Get-NetTCPConnection -LocalPort 4004 -State Listen
 
 Kill stale PIDs before starting a new run.
 
-### Sync seems stuck — no new persist events
+### Sync seems stuck - no new persist events
 
 No `[facade-persist] saved` lines for several minutes:
 
@@ -303,7 +303,7 @@ Next `connectWalletForSigning` will start a fresh ~5-6 h cold sync.
 - [ ] `ENCRYPTION_KEY` set to a real 32-byte hex secret (not the dev fallback)
 - [ ] CDS database is PostgreSQL or HANA, not SQLite. Production SQLite is now **rejected at startup** (fail closed); `NIGHTGATE_ALLOW_PRODUCTION_SQLITE=true` is a temporary migration-only escape hatch
 - [ ] Exactly one replica declared (`NIGHTGATE_REPLICA_COUNT=1`); more than one replica, CAP multitenancy, or (on Cloud Foundry) `CF_INSTANCE_INDEX > 0` fails startup closed
-- [ ] `NIGHTGATE_CRAWLER_ENABLED` is true (or unset — the crawler defaults to on)
+- [ ] `NIGHTGATE_CRAWLER_ENABLED` is true (or unset - the crawler defaults to on)
 - [ ] CAP auth is configured (the default `dummy` strategy passes everyone)
 - [ ] Rate limiters reviewed for production load (they're tuned for dev/demo)
 - [ ] If using a local indexer container: it has reached `caught_up: true` AND has stable disk available

@@ -67,7 +67,7 @@ export async function createNightgateConnectorProviders(opts = {}) {
         proofProvider,
         /**
          * Which proving modality was actually assembled: 'server', 'wallet' or 'none'.
-         * Returned deliberately so a consumer can LOG and display it — a silent fall from wallet
+         * Returned deliberately so a consumer can LOG and display it - a silent fall from wallet
          * proving to a remote proof server changes where the transaction preimage goes, and that
          * must never be invisible.
          */
@@ -92,14 +92,14 @@ export async function createNightgateConnectorProviders(opts = {}) {
 /**
  * Assemble the proof provider for the requested modality.
  *
- *   'server' — midnight-js's httpClientProofProvider against `proverServerUri` (today's default,
+ *   'server' - midnight-js's httpClientProofProvider against `proverServerUri` (today's default,
  *              and what production uses). Needs a reachable, CORS-clean proof server.
- *   'wallet' — DELEGATE contract proving to the connected wallet's own prover
+ *   'wallet' - DELEGATE contract proving to the connected wallet's own prover
  *              (`connector.getProvingProvider`). No proof server, no CORS wall, and the
  *              transaction preimage never leaves the user's machine. Fails LOUDLY when the
  *              connector cannot do it: a silent fall back to a remote server would move the
  *              preimage somewhere the caller did not ask for.
- *   'auto'   — wallet when the connector offers it, else server.
+ *   'auto'   - wallet when the connector offers it, else server.
  *
  * The wallet path mirrors the server-side twin (`srv/midnight/wasm-proof-provider.ts`): the
  * `{ proveTx }` contract is a thin transport, and `unprovenTx.prove(...)` runs the ledger's own

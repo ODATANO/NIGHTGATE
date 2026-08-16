@@ -58,6 +58,22 @@ ok('registry: artifactPath surfaced',          resolved.artifactPath === artifac
 ok('registry: compiledContract resolves to a wrapper object',
     resolved.compiledContract && typeof resolved.compiledContract === 'object');
 
+// ---- Check 3: atomic generation-pinned resolve (0.16.0) --------------------
+// resolveContract(name, expectedDigest) recomputes the digest from the
+// captured snapshot's current file bytes and imports exactly that snapshot:
+// the correct digest resolves, a wrong one refuses BEFORE any import.
+const digest = registry.getArtifactGenerationDigest('counter');
+ok('digest: 64-hex generation digest', /^[0-9a-f]{64}$/.test(digest));
+const pinned = await registry.resolveContract('counter', digest);
+ok('digest: resolve with the CORRECT digest succeeds', pinned && pinned.privateStateId === 'counterPrivateState');
+let wrongDigestError = '';
+try {
+    await registry.resolveContract('counter', 'ff'.repeat(32));
+} catch (err) {
+    wrongDigestError = String(err?.message ?? err);
+}
+ok('digest: resolve with a WRONG digest refuses', wrongDigestError.includes('different generation'));
+
 console.log();
 console.log(failures === 0 ? 'Contract artifact resolves through the production registry path.' : `${failures} failure(s).`);
 process.exit(failures === 0 ? 0 : 1);

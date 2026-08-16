@@ -13,6 +13,7 @@
 
 import fs from 'fs';
 import path from 'path';
+import crypto from 'crypto';
 import { pathToFileURL } from 'url';
 
 // Package root (…/node_modules/@odatano/nightgate when installed). contract-registry
@@ -56,20 +57,105 @@ export interface ResolvedContract {
 }
 
 const registry = new Map<string, ContractRegistration>();
+const generationDigests = new Map<string, string>();
 
 export function registerContract(name: string, reg: ContractRegistration): void {
     if (!name || !reg.artifactPath || !reg.privateStateId || !reg.zkConfigPath) {
         throw new Error('registerContract: all fields are required');
     }
-    registry.set(name, reg);
+    // Store a FROZEN CLONE: the caller's object must not remain a live
+    // handle into the registry (mutating it after registration would change
+    // what the alias resolves to without going through registerContract,
+    // silently bypassing the generation digest).
+    registry.set(name, Object.freeze({ ...reg }));
+    // A name is a MUTABLE alias; whatever generation it pointed at before is
+    // no longer what it resolves to now.
+    generationDigests.delete(name);
+}
+
+/**
+ * Canonical digest of the FULL REGISTRATION a registered name currently
+ * resolves to: the Compact-emitted contract module, the `privateStateId`,
+ * and every proving-relevant asset under `zkConfigPath` (`keys/*.verifier`,
+ * `keys/*.prover`, `zkir/*`), each bound with a length-prefixed section
+ * label so file/field boundaries cannot be confused. The registry name is a
+ * mutable alias (`registerContract` overwrites), so persisted commands and
+ * evidence rows record THIS digest at creation time and the
+ * executor/verifier compares it fail-closed at resolve time; a re-pointed
+ * alias (upgrade, re-config, or the same paths under a DIFFERENT
+ * privateStateId, i.e. a different attester identity for the vault) can
+ * then never silently execute or verify against a different registration.
+ * Cached per name; the cache is invalidated by register/unregister/clear.
+ */
+export function getArtifactGenerationDigest(name: string): string {
+    const cached = generationDigests.get(name);
+    if (cached) return cached;
+    const reg = registry.get(name);
+    if (!reg) throw new ContractNotRegisteredError(name, listRegisteredContracts());
+    const digest = computeGenerationDigest(reg);
+    generationDigests.set(name, digest);
+    return digest;
+}
+
+/**
+ * Uncached digest over a concrete registration SNAPSHOT's files. Used by
+ * `resolveContract(name, expectedDigest)` so the check runs against exactly
+ * the snapshot that is then imported (no check-then-resolve race) AND
+ * against the files' CURRENT bytes (an asset overwritten under an unchanged
+ * path in the running process fails the resolve instead of riding the
+ * per-alias cache).
+ */
+function computeGenerationDigest(reg: ContractRegistration): string {
+    const hash = crypto.createHash('sha256');
+    const section = (label: string, data: Buffer | string) => {
+        const buf = typeof data === 'string' ? Buffer.from(data, 'utf8') : data;
+        hash.update(`${label}:${buf.length}\n`);
+        hash.update(buf);
+    };
+    section('module', fs.readFileSync(reg.artifactPath));
+    section('privateStateId', reg.privateStateId);
+    const assetDir = (sub: string, filter: (f: string) => boolean) => {
+        const dir = path.join(reg.zkConfigPath, sub);
+        let files: string[] = [];
+        try {
+            files = fs.readdirSync(dir).filter(filter).sort();
+        } catch { /* asset-less artifacts (pure-circuit-only) skip the section */ }
+        for (const f of files) section(`${sub}/${f}`, fs.readFileSync(path.join(dir, f)));
+    };
+    assetDir('keys', (f) => f.endsWith('.verifier') || f.endsWith('.prover'));
+    assetDir('zkir', () => true);
+    return hash.digest('hex');
+}
+
+/**
+ * Fail-closed generation check for persisted commands and stored evidence.
+ * `recorded === undefined` means the record predates 0.16.0's provenance
+ * binding: refuse (the alias may have been re-pointed since; the caller
+ * re-issues the action against the current generation deliberately).
+ */
+export function assertArtifactGeneration(name: string, recorded: string | undefined, what: string): void {
+    const current = getArtifactGenerationDigest(name);
+    if (!recorded) {
+        throw new Error(
+            `${what} carries no artifact-generation digest (created by an older release). ` +
+            `Refusing to run it against whatever '${name}' resolves to today; re-issue the action.`);
+    }
+    if (recorded !== current) {
+        throw new Error(
+            `${what} was created against artifact generation ${recorded.slice(0, 16)}… but '${name}' now ` +
+            `resolves to ${current.slice(0, 16)}…. Refusing to execute against a different generation; ` +
+            `re-register the original artifact under this name (or a versioned alias) to proceed.`);
+    }
 }
 
 export function unregisterContract(name: string): boolean {
+    generationDigests.delete(name);
     return registry.delete(name);
 }
 
 export function clearRegistry(): void {
     registry.clear();
+    generationDigests.clear();
 }
 
 export function listRegisteredContracts(): string[] {
@@ -81,9 +167,11 @@ export function listRegisteredContracts(): string[] {
  * importing the artifact. Used by the zk-config HTTP route to resolve a
  * contract's `zkConfigPath` cheaply. Returns undefined for unknown names,
  * which the route maps to 404 (the registry is the security boundary: only
- * registered contracts are servable).
+ * registered contracts are servable). The returned object is the stored
+ * FROZEN snapshot: readonly by construction, so no caller can mutate the
+ * registry through it.
  */
-export function getContractRegistration(name: string): ContractRegistration | undefined {
+export function getContractRegistration(name: string): Readonly<ContractRegistration> | undefined {
     return registry.get(name);
 }
 
@@ -105,11 +193,28 @@ export function loadRegistryFromConfig(config?: Record<string, any>, baseDir = p
     }
 }
 
-export async function resolveContract(name: string): Promise<ResolvedContract> {
+/**
+ * Resolve a registered contract, optionally pinned to an expected artifact
+ * GENERATION. With `expectedDigest`, the registration snapshot is captured
+ * ONCE, its digest is recomputed from the files' current bytes (no cache)
+ * and compared BEFORE anything is imported, and the import then uses exactly
+ * that snapshot: a concurrent `registerContract` between check and use
+ * cannot swap generations, and an asset overwritten in place fails closed.
+ */
+export async function resolveContract(name: string, expectedDigest?: string): Promise<ResolvedContract> {
     const reg = registry.get(name);
     if (!reg) {
         const available = listRegisteredContracts();
         throw new ContractNotRegisteredError(name, available);
+    }
+    if (expectedDigest !== undefined) {
+        const current = computeGenerationDigest(reg);
+        if (current !== expectedDigest) {
+            throw new Error(
+                `Contract '${name}' currently resolves to artifact generation ${current.slice(0, 16)}… but ` +
+                `${expectedDigest.slice(0, 16)}… was recorded. Refusing to load a different generation; ` +
+                `re-register the original artifact under this name (or a versioned alias) to proceed.`);
+        }
     }
     // Node's ESM loader on Windows rejects raw `C:\...` paths in dynamic
     // import, must be a file:// URL. pathToFileURL handles both platforms.

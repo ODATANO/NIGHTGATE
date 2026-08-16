@@ -13,6 +13,9 @@ import {
     listRegisteredContracts,
     resolveContract,
     loadRegistryFromConfig,
+    getContractRegistration,
+    getArtifactGenerationDigest,
+    assertArtifactGeneration,
     ContractNotRegisteredError
 } from '../../srv/submission/contract-registry';
 
@@ -68,10 +71,126 @@ describe('contract registry', () => {
     });
 });
 
+// Artifact-generation provenance (0.16.0): a registry NAME is a mutable
+// alias; the digest pins the generation it currently resolves to, and
+// persisted commands / evidence rows are verified against it fail-closed.
+describe('artifact generation digest', () => {
+    const REPO = path.resolve(__dirname, '../..');
+    const VAULT = {
+        artifactPath: path.join(REPO, 'contracts/attestation-vault/src/managed/attestation-vault/contract/index.js'),
+        privateStateId: 'vault',
+        zkConfigPath: path.join(REPO, 'contracts/attestation-vault/src/managed/attestation-vault')
+    };
+    // A second, DIFFERENT "generation" for the same alias: any other real
+    // file works, the digest only reads bytes (no keys dir -> module-only).
+    const OTHER = {
+        artifactPath: path.join(REPO, 'package.json'),
+        privateStateId: 'vault',
+        zkConfigPath: REPO
+    };
+
+    test('digest is deterministic and covers the artifact + verifier keys', () => {
+        registerContract('gen', VAULT);
+        const d1 = getArtifactGenerationDigest('gen');
+        expect(d1).toMatch(/^[0-9a-f]{64}$/);
+        expect(getArtifactGenerationDigest('gen')).toBe(d1);
+    });
+
+    test('re-pointing the alias changes the digest (mutable-alias hazard made visible)', () => {
+        registerContract('gen', VAULT);
+        const before = getArtifactGenerationDigest('gen');
+        registerContract('gen', OTHER);
+        expect(getArtifactGenerationDigest('gen')).not.toBe(before);
+    });
+
+    test('assertArtifactGeneration passes on match, fails closed otherwise', () => {
+        registerContract('gen', VAULT);
+        const digest = getArtifactGenerationDigest('gen');
+        expect(() => assertArtifactGeneration('gen', digest, 'Persisted command')).not.toThrow();
+        expect(() => assertArtifactGeneration('gen', undefined, 'Persisted command'))
+            .toThrow(/no artifact-generation digest.*re-issue/s);
+        registerContract('gen', OTHER);
+        expect(() => assertArtifactGeneration('gen', digest, 'Persisted command'))
+            .toThrow(/different generation/);
+    });
+
+    test('unknown alias throws ContractNotRegisteredError', () => {
+        expect(() => getArtifactGenerationDigest('nope')).toThrow(ContractNotRegisteredError);
+    });
+
+    test('privateStateId is part of the generation (same paths, different id -> different digest)', () => {
+        registerContract('gen', VAULT);
+        const asVault = getArtifactGenerationDigest('gen');
+        registerContract('gen', { ...VAULT, privateStateId: 'attester-B' });
+        expect(getArtifactGenerationDigest('gen')).not.toBe(asVault);
+    });
+
+    test('proving assets are part of the generation (same module/id, different zkConfigPath -> different digest)', () => {
+        registerContract('gen', VAULT);
+        const withAssets = getArtifactGenerationDigest('gen');
+        registerContract('gen', { ...VAULT, zkConfigPath: REPO });
+        expect(getArtifactGenerationDigest('gen')).not.toBe(withAssets);
+    });
+
+    test('registration is a FROZEN CLONE: post-register mutation of the input cannot change the alias', () => {
+        const input = { ...VAULT };
+        registerContract('gen', input);
+        const digest = getArtifactGenerationDigest('gen');
+        // Mutating the caller's object must not reach the registry...
+        input.privateStateId = 'attester-B';
+        expect(getContractRegistration('gen')!.privateStateId).toBe(VAULT.privateStateId);
+        expect(getArtifactGenerationDigest('gen')).toBe(digest);
+        // ...and the returned snapshot is readonly by construction.
+        const snapshot = getContractRegistration('gen')!;
+        expect(Object.isFrozen(snapshot)).toBe(true);
+        expect(() => { (snapshot as any).privateStateId = 'attester-B'; }).toThrow();
+        expect(getContractRegistration('gen')!.privateStateId).toBe(VAULT.privateStateId);
+    });
+
+    test('resolveContract(name, expectedDigest) fails closed when the alias was re-pointed after the check (TOCTOU)', async () => {
+        registerContract('gen', VAULT);
+        const digestA = getArtifactGenerationDigest('gen');
+        // The alias is re-pointed BETWEEN digest check and resolve; passing
+        // the previously checked digest into the resolver must refuse.
+        registerContract('gen', { ...VAULT, privateStateId: 'attester-B' });
+        await expect(resolveContract('gen', digestA)).rejects.toThrow(/different generation/);
+    });
+
+    test('resolveContract(name, expectedDigest) fails closed when an asset is overwritten IN PLACE', async () => {
+        const fs = await import('node:fs');
+        const os = await import('node:os');
+        const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ng-gen-'));
+        const artifact = path.join(dir, 'artifact.mjs');
+        try {
+            fs.writeFileSync(artifact, 'export const marker = 1;\n');
+            registerContract('gen', { artifactPath: artifact, privateStateId: 'p', zkConfigPath: dir });
+            const digest = getArtifactGenerationDigest('gen');
+            // Same path, different bytes: the per-alias cache must NOT satisfy
+            // the resolve-time check (it recomputes from current contents).
+            fs.writeFileSync(artifact, 'export const marker = 2;\n');
+            await expect(resolveContract('gen', digest)).rejects.toThrow(/different generation/);
+        } finally {
+            fs.rmSync(dir, { recursive: true, force: true });
+        }
+    });
+
+    test('unregisterContract and clearRegistry drop the digest cache', () => {
+        registerContract('gen', VAULT);
+        const digest = getArtifactGenerationDigest('gen');
+        unregisterContract('gen');
+        expect(() => getArtifactGenerationDigest('gen')).toThrow(ContractNotRegisteredError);
+        registerContract('gen', { ...VAULT, privateStateId: 'attester-B' });
+        expect(getArtifactGenerationDigest('gen')).not.toBe(digest);
+        clearRegistry();
+        expect(() => getArtifactGenerationDigest('gen')).toThrow(ContractNotRegisteredError);
+    });
+});
+
 // Real-artifact end-to-end resolution is exercised by
-// `npm run integration:contract-registry`. Jest's resolver rejects the
-// file:// URLs that the production registry uses for cross-platform ESM
-// imports, so we keep the live test in a native-ESM .mjs script.
+// `npm run integration:contract-registry`: resolveContract imports the REAL
+// @midnight-ntwrk/compact-js to build the CompiledContract wrapper, and unit
+// tests never load the real SDK packages (repo rule; real-SDK verification
+// lives in the scripts/integration-*.mjs lane).
 
 describe('loadRegistryFromConfig', () => {
     test('loads entries with absolute paths verbatim', () => {

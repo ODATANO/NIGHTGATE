@@ -63,5 +63,5 @@ function fmt(o) { return JSON.stringify(o, null, 2); }
 
     console.log(`\nCheck catch-up status:`);
     console.log(`  docker logs --tail 50 odatano-night-indexer | findstr caught_up`);
-    console.log(`(Look for "caught_up":true — only then are subscriptions live.)`);
+    console.log(`(Look for "caught_up":true - only then are subscriptions live.)`);
 })();

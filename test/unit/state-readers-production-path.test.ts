@@ -5,7 +5,7 @@
  *    @midnight-ntwrk/compact-runtime (vitest can import the ESM SDK, jest never
  *    could). The expected hex fixtures pin the persistentHash encoding;
  *    byte-exactness against a LIVE vault was proven in
- *    scripts/spike-state-verification.mjs; these tests keep the encoding from
+ *    scripts/integration-test-attestation-vault.mjs; these tests keep the encoding from
  *    drifting (refactors, compact-runtime upgrades) without a chain.
  *
  *  - readAttestationStateForContract / readPredicateStateForContract, the
@@ -27,7 +27,6 @@ vi.mock('../../srv/midnight/providers', () => ({
 }));
 
 import {
-    computePredicateClaimKey,
     computeFieldPredicateClaimKey,
     computeFieldEqualityClaimKey,
     computeFieldMembershipClaimKey,
@@ -44,21 +43,20 @@ const CFG = {
 };
 
 const PAYLOAD = 'a1'.repeat(32);
+const EPOCH = 7n; // attestation epoch embedded in every claim key (0.16.0)
 const FIELD_KEY = 'b2'.repeat(32);
 
-// Pinned against the encoding live-verified in spike-state-verification.mjs
-// (PredicateClaim: Bytes<32> ++ Uint<64> ++ Uint<8>; Field variant adds the
-// field key). Regenerate ONLY if the on-chain claim struct itself changes.
-const KEY_LE_42000 = '6e20691b65c4d12ea5ec5453461fd9c41b29834423a4b02e54b2d24e03c695c7';
-const KEY_GE_42000 = '938f8244f76dc86b191dccda73b934a452c07193075c76f13d72d80ef9f1d483';
-const FIELD_KEY_GE_18000 = '56116c3993ae2f0523e5797f0e9304866ab4290e99cc204b3f84e52362f705ae';
+// Pinned against the encoding live-verified in integration-test-attestation-vault.mjs
+// (FieldPredicateClaim: Bytes<32> ++ Bytes<32> ++ Uint<64> ++ Uint<8>).
+// Regenerate ONLY if the on-chain claim struct itself changes.
+const FIELD_KEY_GE_18000 = 'e00c7a136a859dcf087860a317e7d099d77a17611300e395833ab98a5af77f10';
 // Bytes-claim keys (0.15.0): Bytes<32> ++ Bytes<32> ++ Bytes<32> in struct
 // field order; byte-exactness against the live vault is asserted by the
 // membership e2e (verifyPredicateState on an on-chain proof).
 const EXPECTED_DIGEST = 'c3'.repeat(32);
 const SET_ROOT = 'd4'.repeat(32);
-const EQUALITY_KEY = '7de79a432299c9c2d44de03fac043ccbb14b3059222b44adf6c38b4872c46154';
-const MEMBERSHIP_KEY = '7372a6cb2119a4d19c83dbe973e854fbc329ea6dd50f2a6bc23e15950279afaa';
+const EQUALITY_KEY = 'fc8cfa0a80bd0756de4c353cd20971856ae7f9fe5d97e361b41da3b2ff1a968d';
+const MEMBERSHIP_KEY = '5e9067d705c772b5dd131c4546d092a68c728d2cf2d30789bc1a10c513954f68';
 
 beforeEach(() => {
     queryContractState.mockReset();
@@ -66,31 +64,23 @@ beforeEach(() => {
 });
 
 describe('claim-key recomputation (real compact-runtime)', () => {
-    it('computePredicateClaimKey reproduces the pinned lessOrEqual key', async () => {
-        await expect(computePredicateClaimKey(PAYLOAD, 42000n, 0)).resolves.toBe(KEY_LE_42000);
-    });
-
-    it('computePredicateClaimKey reproduces the pinned greaterOrEqual key', async () => {
-        await expect(computePredicateClaimKey(PAYLOAD, 42000n, 1)).resolves.toBe(KEY_GE_42000);
-    });
-
     it('computeFieldPredicateClaimKey reproduces the pinned field-bound key', async () => {
-        await expect(computeFieldPredicateClaimKey(PAYLOAD, FIELD_KEY, 18000n, 1)).resolves.toBe(FIELD_KEY_GE_18000);
+        await expect(computeFieldPredicateClaimKey(PAYLOAD, FIELD_KEY, 18000n, 1, EPOCH)).resolves.toBe(FIELD_KEY_GE_18000);
     });
 
     it('computeFieldEqualityClaimKey reproduces the pinned equality key', async () => {
-        await expect(computeFieldEqualityClaimKey(PAYLOAD, FIELD_KEY, EXPECTED_DIGEST)).resolves.toBe(EQUALITY_KEY);
+        await expect(computeFieldEqualityClaimKey(PAYLOAD, FIELD_KEY, EXPECTED_DIGEST, EPOCH)).resolves.toBe(EQUALITY_KEY);
     });
 
     it('computeFieldMembershipClaimKey reproduces the pinned membership key', async () => {
-        await expect(computeFieldMembershipClaimKey(PAYLOAD, FIELD_KEY, SET_ROOT)).resolves.toBe(MEMBERSHIP_KEY);
+        await expect(computeFieldMembershipClaimKey(PAYLOAD, FIELD_KEY, SET_ROOT, EPOCH)).resolves.toBe(MEMBERSHIP_KEY);
     });
 
     it('equality and membership keys differ even for identical coordinates', async () => {
         // Same 3 x Bytes<32> layout; only the persistentHash struct alignment
         // (via the value bytes) separates them. Same third coordinate:
-        const eq = await computeFieldEqualityClaimKey(PAYLOAD, FIELD_KEY, 'e5'.repeat(32));
-        const mem = await computeFieldMembershipClaimKey(PAYLOAD, FIELD_KEY, 'e5'.repeat(32));
+        const eq = await computeFieldEqualityClaimKey(PAYLOAD, FIELD_KEY, 'e5'.repeat(32), EPOCH);
+        const mem = await computeFieldMembershipClaimKey(PAYLOAD, FIELD_KEY, 'e5'.repeat(32), EPOCH);
         expect(eq).toMatch(/^[0-9a-f]{64}$/);
         // NOTE: with identical layouts persistentHash yields the SAME digest;
         // cross-kind isolation comes from the SEPARATE ledger maps, which the
@@ -99,15 +89,15 @@ describe('claim-key recomputation (real compact-runtime)', () => {
     });
 
     it('is sensitive to every coordinate (payload, threshold, op, fieldKey)', async () => {
-        const base = await computePredicateClaimKey(PAYLOAD, 42000n, 0);
+        const base = await computeFieldPredicateClaimKey(PAYLOAD, FIELD_KEY, 42000n, 0, EPOCH);
         expect(base).toMatch(/^[0-9a-f]{64}$/);
-        await expect(computePredicateClaimKey('ff'.repeat(32), 42000n, 0)).resolves.not.toBe(base);
-        await expect(computePredicateClaimKey(PAYLOAD, 42001n, 0)).resolves.not.toBe(base);
-        await expect(computePredicateClaimKey(PAYLOAD, 42000n, 1)).resolves.not.toBe(base);
-
-        const field = await computeFieldPredicateClaimKey(PAYLOAD, FIELD_KEY, 42000n, 0);
-        expect(field).not.toBe(base);
-        await expect(computeFieldPredicateClaimKey(PAYLOAD, 'cc'.repeat(32), 42000n, 0)).resolves.not.toBe(field);
+        await expect(computeFieldPredicateClaimKey('ff'.repeat(32), FIELD_KEY, 42000n, 0, EPOCH)).resolves.not.toBe(base);
+        await expect(computeFieldPredicateClaimKey(PAYLOAD, FIELD_KEY, 42001n, 0, EPOCH)).resolves.not.toBe(base);
+        await expect(computeFieldPredicateClaimKey(PAYLOAD, FIELD_KEY, 42000n, 1, EPOCH)).resolves.not.toBe(base);
+        await expect(computeFieldPredicateClaimKey(PAYLOAD, 'cc'.repeat(32), 42000n, 0, EPOCH)).resolves.not.toBe(base);
+        // Epoch sensitivity is the takeover kill switch: a claim recorded
+        // under a front-runner's epoch must miss under the recovered one.
+        await expect(computeFieldPredicateClaimKey(PAYLOAD, FIELD_KEY, 42000n, 0, 8n)).resolves.not.toBe(base);
     });
 });
 
@@ -138,7 +128,7 @@ describe('readAttestationStateForContract (production wrapper)', () => {
             artifactPath: ARTIFACT,
             contractProvidersConfig: CFG
         });
-        expect(result).toEqual({ attested: true, contentRootOk: true, attesterId: 'beef' });
+        expect(result).toEqual({ attested: true, contentRootOk: true, schemaOk: false, attesterId: 'beef' });
     });
 
     it('reports contentRootOk=false for a mismatching anchored root', async () => {
@@ -153,7 +143,7 @@ describe('readAttestationStateForContract (production wrapper)', () => {
             contractAddress: '0xvault', payloadHash: PAYLOAD, contentRoot: 'e5'.repeat(32),
             artifactPath: ARTIFACT, contractProvidersConfig: CFG
         });
-        expect(result).toEqual({ attested: true, contentRootOk: false, attesterId: '' });
+        expect(result).toEqual({ attested: true, contentRootOk: false, schemaOk: false, attesterId: '' });
     });
 
     it('accepts a bare StateValue (no .data wrapper)', async () => {
@@ -165,7 +155,7 @@ describe('readAttestationStateForContract (production wrapper)', () => {
         const result = await readAttestationStateForContract({
             contractAddress: '0xvault', payloadHash: PAYLOAD, artifactPath: ARTIFACT, contractProvidersConfig: CFG
         });
-        expect(result).toEqual({ attested: false, contentRootOk: false, attesterId: '' });
+        expect(result).toEqual({ attested: false, contentRootOk: false, schemaOk: false, attesterId: '' });
     });
 });
 
@@ -173,26 +163,38 @@ describe('readPredicateStateForContract (production wrapper)', () => {
     it('returns null when the contract has no on-chain state', async () => {
         queryContractState.mockResolvedValue(null);
         const result = await readPredicateStateForContract({
-            contractAddress: '0xvault', payloadHash: PAYLOAD, threshold: 42000n, op: 0,
+            contractAddress: '0xvault', payloadHash: PAYLOAD, fieldKey: FIELD_KEY, threshold: 42000n, op: 0,
             artifactPath: ARTIFACT, contractProvidersConfig: CFG
         });
         expect(result).toBeNull();
     });
 
-    it('confirms a plain proof via the REAL recomputed claim key in predicate_results', async () => {
+    it('rejects a numeric claim without a fieldKey (plain kind removed in 0.16.0)', async () => {
         queryContractState.mockResolvedValue({
-            data: { predicate_results: { [KEY_LE_42000]: true } }
+            data: { attestation_seqs: { [PAYLOAD]: EPOCH } }
         });
-        const result = await readPredicateStateForContract({
+        await expect(readPredicateStateForContract({
             contractAddress: '0xvault', payloadHash: PAYLOAD, threshold: 42000n, op: 0,
             artifactPath: ARTIFACT, contractProvidersConfig: CFG
-        });
-        expect(result).toBe(true);
+        })).rejects.toThrow(/fieldKey is required/);
     });
 
-    it('confirms a field-bound proof via field_predicate_results (real field claim key)', async () => {
+    it('reads as not proven when the payload has NO attestation epoch (nothing to bind to)', async () => {
         queryContractState.mockResolvedValue({
             data: { field_predicate_results: { [FIELD_KEY_GE_18000]: true } }
+        });
+        await expect(readPredicateStateForContract({
+            contractAddress: '0xvault', payloadHash: PAYLOAD, fieldKey: FIELD_KEY, threshold: 18000n, op: 1,
+            artifactPath: ARTIFACT, contractProvidersConfig: CFG
+        })).resolves.toBe(false);
+    });
+
+    it('confirms a field-bound proof via field_predicate_results (real field claim key, current epoch)', async () => {
+        queryContractState.mockResolvedValue({
+            data: {
+                attestation_seqs: { [PAYLOAD]: EPOCH },
+                field_predicate_results: { [FIELD_KEY_GE_18000]: true }
+            }
         });
         const result = await readPredicateStateForContract({
             contractAddress: '0xvault', payloadHash: PAYLOAD, fieldKey: FIELD_KEY, threshold: 18000n, op: 1,
@@ -201,33 +203,53 @@ describe('readPredicateStateForContract (production wrapper)', () => {
         expect(result).toBe(true);
     });
 
+    it('a claim recorded under a STALE epoch no longer verifies (takeover semantics)', async () => {
+        queryContractState.mockResolvedValue({
+            data: {
+                // Epoch moved (takeover); the recorded key was computed at EPOCH.
+                attestation_seqs: { [PAYLOAD]: 9n },
+                field_predicate_results: { [FIELD_KEY_GE_18000]: true }
+            }
+        });
+        await expect(readPredicateStateForContract({
+            contractAddress: '0xvault', payloadHash: PAYLOAD, fieldKey: FIELD_KEY, threshold: 18000n, op: 1,
+            artifactPath: ARTIFACT, contractProvidersConfig: CFG
+        })).resolves.toBe(false);
+    });
+
     it('reads as not proven when the claim key is absent or recorded false', async () => {
         queryContractState.mockResolvedValue({
-            data: { predicate_results: { [KEY_GE_42000]: false } }
+            data: {
+                attestation_seqs: { [PAYLOAD]: EPOCH },
+                field_predicate_results: { [FIELD_KEY_GE_18000]: false }
+            }
         });
-        // absent (different op → different key)
+        // absent (different op -> different key)
         await expect(readPredicateStateForContract({
-            contractAddress: '0xvault', payloadHash: PAYLOAD, threshold: 42000n, op: 0,
+            contractAddress: '0xvault', payloadHash: PAYLOAD, fieldKey: FIELD_KEY, threshold: 18000n, op: 0,
             artifactPath: ARTIFACT, contractProvidersConfig: CFG
         })).resolves.toBe(false);
         // present but false
         await expect(readPredicateStateForContract({
-            contractAddress: '0xvault', payloadHash: PAYLOAD, threshold: 42000n, op: 1,
+            contractAddress: '0xvault', payloadHash: PAYLOAD, fieldKey: FIELD_KEY, threshold: 18000n, op: 1,
             artifactPath: ARTIFACT, contractProvidersConfig: CFG
         })).resolves.toBe(false);
     });
 
     it('honours injected claim-key computers (the DI seam the handlers use)', async () => {
-        const computeClaimKey = vi.fn(async () => 'ab'.repeat(32));
+        const computeFieldClaimKey = vi.fn(async () => 'ab'.repeat(32));
         queryContractState.mockResolvedValue({
-            data: { predicate_results: { ['ab'.repeat(32)]: true } }
+            data: {
+                attestation_seqs: { [PAYLOAD]: EPOCH },
+                field_predicate_results: { ['ab'.repeat(32)]: true }
+            }
         });
         const result = await readPredicateStateForContract({
-            contractAddress: '0xvault', payloadHash: PAYLOAD, threshold: 5n, op: 1,
+            contractAddress: '0xvault', payloadHash: PAYLOAD, fieldKey: FIELD_KEY, threshold: 5n, op: 1,
             artifactPath: ARTIFACT, contractProvidersConfig: CFG,
-            computeClaimKey
+            computeFieldClaimKey
         });
         expect(result).toBe(true);
-        expect(computeClaimKey).toHaveBeenCalledWith(PAYLOAD, 5n, 1);
+        expect(computeFieldClaimKey).toHaveBeenCalledWith(PAYLOAD, FIELD_KEY, 5n, 1, EPOCH);
     });
 });

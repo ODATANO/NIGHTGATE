@@ -110,15 +110,15 @@ describe('verifyAttestationState', () => {
     });
 
     test('attested, no contentRoot → verified true', async () => {
-        const reader = vi.fn(async () => ({ attested: true, contentRootOk: false, attesterId: 'abc' }));
+        const reader = vi.fn(async () => ({ attested: true, contentRootOk: false, schemaOk: false, attesterId: 'abc' }));
         const srv = setup({ attestationStateReader: reader });
         const req = makeReq({ contractAddress: VAULT, payloadHash: PAYLOAD });
         const r = await srv.handlers['verifyAttestationState'](req);
-        expect(r).toEqual({ verified: true, attested: true, contentRootOk: false, attesterId: 'abc' });
+        expect(r).toEqual({ verified: true, attested: true, contentRootOk: false, schemaOk: false, attesterId: 'abc' });
     });
 
     test('not attested → verified false', async () => {
-        const reader = vi.fn(async () => ({ attested: false, contentRootOk: false, attesterId: '' }));
+        const reader = vi.fn(async () => ({ attested: false, contentRootOk: false, schemaOk: false, attesterId: '' }));
         const srv = setup({ attestationStateReader: reader });
         const req = makeReq({ contractAddress: VAULT, payloadHash: PAYLOAD });
         const r = await srv.handlers['verifyAttestationState'](req);
@@ -127,7 +127,7 @@ describe('verifyAttestationState', () => {
     });
 
     test('contentRoot supplied and matches → verified true', async () => {
-        const reader = vi.fn(async () => ({ attested: true, contentRootOk: true, attesterId: 'abc' }));
+        const reader = vi.fn(async () => ({ attested: true, contentRootOk: true, schemaOk: false, attesterId: 'abc' }));
         const srv = setup({ attestationStateReader: reader });
         const req = makeReq({ contractAddress: VAULT, payloadHash: PAYLOAD, contentRoot: ROOT });
         const r = await srv.handlers['verifyAttestationState'](req);
@@ -135,7 +135,7 @@ describe('verifyAttestationState', () => {
     });
 
     test('contentRoot supplied but mismatch → verified false even though attested', async () => {
-        const reader = vi.fn(async () => ({ attested: true, contentRootOk: false, attesterId: 'abc' }));
+        const reader = vi.fn(async () => ({ attested: true, contentRootOk: false, schemaOk: false, attesterId: 'abc' }));
         const srv = setup({ attestationStateReader: reader });
         const req = makeReq({ contractAddress: VAULT, payloadHash: PAYLOAD, contentRoot: ROOT });
         const r = await srv.handlers['verifyAttestationState'](req);
@@ -148,16 +148,16 @@ describe('verifyAttestationState', () => {
         const srv = setup({ attestationStateReader: reader });
         const req = makeReq({ contractAddress: VAULT, payloadHash: PAYLOAD });
         const r = await srv.handlers['verifyAttestationState'](req);
-        expect(r).toEqual({ verified: false, attested: false, contentRootOk: false, attesterId: '' });
+        expect(r).toEqual({ verified: false, attested: false, contentRootOk: false, schemaOk: false, attesterId: '' });
     });
 
     test('no live provider → clean negative, reader not called (criterion 5)', async () => {
         mockRuntimeCfg = NO_PROVIDER;
-        const reader = vi.fn(async () => ({ attested: true, contentRootOk: true, attesterId: 'x' }));
+        const reader = vi.fn(async () => ({ attested: true, contentRootOk: true, schemaOk: false, attesterId: 'x' }));
         const srv = setup({ attestationStateReader: reader });
         const req = makeReq({ contractAddress: VAULT, payloadHash: PAYLOAD });
         const r = await srv.handlers['verifyAttestationState'](req);
-        expect(r).toEqual({ verified: false, attested: false, contentRootOk: false, attesterId: '' });
+        expect(r).toEqual({ verified: false, attested: false, contentRootOk: false, schemaOk: false, attesterId: '' });
         expect(reader).not.toHaveBeenCalled();
     });
 });
@@ -176,7 +176,7 @@ describe('verifyPredicateState', () => {
         return srv;
     }
     const VALID = {
-        contractAddress: VAULT, payloadHash: PAYLOAD, fieldKey: '',
+        contractAddress: VAULT, payloadHash: PAYLOAD, fieldKey: FIELD_KEY,
         predicate: 'lessOrEqual', threshold: 1370
     };
 
@@ -229,7 +229,14 @@ describe('verifyPredicateState', () => {
         expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/non-negative/));
     });
 
-    test('plain proven on-chain → verified true; empty fieldKey passed as undefined', async () => {
+    test('numeric claims are field-bound: missing fieldKey is a 400 (plain kind removed)', async () => {
+        const srv = setup();
+        const req = makeReq({ ...VALID, fieldKey: '' });
+        await srv.handlers['verifyPredicateState'](req);
+        expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/fieldKey is required/));
+    });
+
+    test('proven on-chain → verified true; coordinates reach the reader', async () => {
         const reader = vi.fn(async () => true);
         const srv = setup({ predicateStateReader: reader });
         const req = makeReq({ ...VALID });
@@ -237,7 +244,7 @@ describe('verifyPredicateState', () => {
         expect(r).toEqual({ verified: true, proven: true });
         expect(reader).toHaveBeenCalledWith(expect.objectContaining({
             contractAddress: VAULT, payloadHash: PAYLOAD,
-            fieldKey: undefined, threshold: 1370n, op: 0
+            fieldKey: FIELD_KEY, threshold: 1370n, op: 0
         }));
     });
 
@@ -332,6 +339,55 @@ describe('verifyPredicateState', () => {
             }));
         });
     });
+
+    describe('cross-root claim kinds (0.16.0)', () => {
+        const PAYLOAD_B = 'b'.repeat(64);
+
+        test.each([
+            [{ predicate: 'documentIntegrity', allowedMask: 5 }, /payloadHashB .*required/],
+            [{ predicate: 'documentIntegrity', payloadHashB: 'zz', allowedMask: 5 }, /payloadHashB/],
+            [{ predicate: 'documentIntegrity', payloadHashB: PAYLOAD_B }, /allowedMask .*required/],
+            [{ predicate: 'documentIntegrity', payloadHashB: PAYLOAD_B, allowedMask: 65536 }, /allowedMask/],
+            [{ predicate: 'documentDiff', k: 2 }, /payloadHashB .*required/],
+            [{ predicate: 'documentDiff', payloadHashB: PAYLOAD_B }, /k .*required/],
+            [{ predicate: 'documentDiff', payloadHashB: PAYLOAD_B, k: 0 }, /k /],
+            [{ predicate: 'documentDiff', payloadHashB: PAYLOAD_B, k: 17 }, /k /]
+        ])('rejects %o', async (patch, msg) => {
+            const srv = setup();
+            const req = makeReq({ contractAddress: VAULT, payloadHash: PAYLOAD, fieldKey: '', ...patch });
+            await srv.handlers['verifyPredicateState'](req);
+            expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(msg));
+        });
+
+        test('documentIntegrity: payloadHashB + allowedMask reach the reader, no numeric coordinates', async () => {
+            const reader = vi.fn(async () => true);
+            const srv = setup({ predicateStateReader: reader });
+            const req = makeReq({
+                contractAddress: VAULT, payloadHash: PAYLOAD, fieldKey: '',
+                predicate: 'documentIntegrity', payloadHashB: PAYLOAD_B.toUpperCase(), allowedMask: 5
+            });
+            const r = await srv.handlers['verifyPredicateState'](req);
+            expect(r).toEqual({ verified: true, proven: true });
+            expect(reader).toHaveBeenCalledWith(expect.objectContaining({
+                payloadHash: PAYLOAD, payloadHashB: PAYLOAD_B, allowedMask: 5,
+                k: undefined, threshold: undefined, op: undefined, expectedDigest: undefined, setRoot: undefined
+            }));
+        });
+
+        test('documentDiff: payloadHashB + k reach the reader; mask stays undefined', async () => {
+            const reader = vi.fn(async () => true);
+            const srv = setup({ predicateStateReader: reader });
+            const req = makeReq({
+                contractAddress: VAULT, payloadHash: PAYLOAD, fieldKey: '',
+                predicate: 'documentDiff', payloadHashB: PAYLOAD_B, k: 3
+            });
+            const r = await srv.handlers['verifyPredicateState'](req);
+            expect(r).toEqual({ verified: true, proven: true });
+            expect(reader).toHaveBeenCalledWith(expect.objectContaining({
+                payloadHashB: PAYLOAD_B, k: 3, allowedMask: undefined
+            }));
+        });
+    });
 });
 
 // ---- reindexDisclosures ---------------------------------------------------
@@ -393,7 +449,7 @@ describe('verifyDocument crawler-free fallback', () => {
     }
 
     test('tx not indexed + contractAddress + attested on-chain → verified true', async () => {
-        const reader = vi.fn(async () => ({ attested: true, contentRootOk: false, attesterId: 'x' }));
+        const reader = vi.fn(async () => ({ attested: true, contentRootOk: false, schemaOk: false, attesterId: 'x' }));
         const db = makeDbWithSequence([
             { ID: DOC_ID, sha256: SHA, anchoredTxHash: TX_HASH, anchoredAt: '2026-07-06T00:00:00Z' },
             undefined // Transactions lookup: not indexed (crawler off/lag)
@@ -406,7 +462,7 @@ describe('verifyDocument crawler-free fallback', () => {
     });
 
     test('tx not indexed + contractAddress + NOT attested on-chain → verified false', async () => {
-        const reader = vi.fn(async () => ({ attested: false, contentRootOk: false, attesterId: '' }));
+        const reader = vi.fn(async () => ({ attested: false, contentRootOk: false, schemaOk: false, attesterId: '' }));
         const db = makeDbWithSequence([
             { ID: DOC_ID, sha256: SHA, anchoredTxHash: TX_HASH, anchoredAt: null },
             undefined
@@ -431,7 +487,7 @@ describe('verifyDocument crawler-free fallback', () => {
     });
 
     test('tx not indexed + NO contractAddress → fallback skipped, verified false', async () => {
-        const reader = vi.fn(async () => ({ attested: true, contentRootOk: false, attesterId: 'x' }));
+        const reader = vi.fn(async () => ({ attested: true, contentRootOk: false, schemaOk: false, attesterId: 'x' }));
         const db = makeDbWithSequence([
             { ID: DOC_ID, sha256: SHA, anchoredTxHash: TX_HASH, anchoredAt: null },
             undefined
@@ -445,7 +501,7 @@ describe('verifyDocument crawler-free fallback', () => {
 
     test('no live provider → fallback skipped even with contractAddress', async () => {
         mockRuntimeCfg = NO_PROVIDER;
-        const reader = vi.fn(async () => ({ attested: true, contentRootOk: false, attesterId: 'x' }));
+        const reader = vi.fn(async () => ({ attested: true, contentRootOk: false, schemaOk: false, attesterId: 'x' }));
         const db = makeDbWithSequence([
             { ID: DOC_ID, sha256: SHA, anchoredTxHash: TX_HASH, anchoredAt: null },
             undefined
@@ -579,6 +635,48 @@ describe('verifyPredicateAttestation crawler-free fallback', () => {
         expect(reader).toHaveBeenCalledWith(expect.objectContaining({
             fieldKey: FIELD_KEY, setRoot: SET_ROOT,
             expectedDigest: undefined, threshold: undefined, op: undefined
+        }));
+    });
+
+    test('documentIntegrity row passes payloadHashB + allowedMask, no numeric coordinates', async () => {
+        const PAYLOAD_B = 'b'.repeat(64);
+        const reader = vi.fn(async () => true);
+        const row = {
+            ...ROW, predicate: 'documentIntegrity', op: null, threshold: null,
+            fieldKey: null, expectedDigest: null, setRoot: null,
+            payloadHashB: PAYLOAD_B, allowedMask: 5
+        };
+        const db = makeDbWithSequence([row, undefined]);
+        const srv = setup(db, { predicateStateReader: reader });
+        const req = makeReq({ predicateAttestationId: PA_ID });
+        const r = await srv.handlers['verifyPredicateAttestation'](req);
+        expect(r.verified).toBe(true);
+        expect(r.payloadHashB).toBe(PAYLOAD_B);
+        expect(r.allowedMask).toBe(5);
+        expect(reader).toHaveBeenCalledWith(expect.objectContaining({
+            payloadHashB: PAYLOAD_B, allowedMask: 5,
+            k: undefined, threshold: undefined, op: undefined, expectedDigest: undefined, setRoot: undefined
+        }));
+    });
+
+    test('documentDiff row passes payloadHashB + k (from the threshold column)', async () => {
+        const PAYLOAD_B = 'b'.repeat(64);
+        const reader = vi.fn(async () => true);
+        const row = {
+            ...ROW, predicate: 'documentDiff', op: null, threshold: 3,
+            fieldKey: null, expectedDigest: null, setRoot: null,
+            payloadHashB: PAYLOAD_B, allowedMask: null
+        };
+        const db = makeDbWithSequence([row, undefined]);
+        const srv = setup(db, { predicateStateReader: reader });
+        const req = makeReq({ predicateAttestationId: PA_ID });
+        const r = await srv.handlers['verifyPredicateAttestation'](req);
+        expect(r.verified).toBe(true);
+        expect(r.payloadHashB).toBe(PAYLOAD_B);
+        expect(r.threshold).toBe(3);
+        expect(reader).toHaveBeenCalledWith(expect.objectContaining({
+            payloadHashB: PAYLOAD_B, k: 3, allowedMask: undefined,
+            threshold: undefined, op: undefined
         }));
     });
 });

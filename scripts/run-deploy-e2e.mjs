@@ -105,7 +105,7 @@ async function pollJob(sessionId, jobId, label, { timeoutMs = PREWARM_TIMEOUT_MS
         }
         if (status === 'failed') {
             process.stdout.write('\n');
-            fail(`[${label}] job ${jobId} failed: ${errorCode} — ${errorMessage}`);
+            fail(`[${label}] job ${jobId} failed: ${errorCode} - ${errorMessage}`);
         }
 
         await new Promise(r => setTimeout(r, intervalMs));
@@ -155,7 +155,7 @@ async function waitForServer() {
         await pollJob(sessionId, prewarmJobId, 'prewarm');
         console.log('OK   facade prewarm complete');
     } else {
-        console.log('WARN no prewarmJobId returned — scheduling may have failed; first action will pay sync cost inline.');
+        console.log('WARN no prewarmJobId returned - scheduling may have failed; first action will pay sync cost inline.');
     }
 
     if (!SKIP_DUST) {

@@ -35,6 +35,11 @@ const proof: MerkleProof = { fieldValue: '1', siblings: [], dirs: [] };
 const holder: MerkleProofHolder = { current: proof };
 void buildAttestationVaultWitnesses({ attestationSecret: new Uint8Array(32), merkleProofHolder: holder });
 void buildAttestationVaultWitnesses({ attestationSecret: new Uint8Array(32), merkleProof: proof });
+// Holder/attester separation MUST stay typeable: a holder proving against an
+// anchored root builds witnesses WITHOUT the owner secret. The argument-less
+// form matches the runtime's default parameter.
+void buildAttestationVaultWitnesses({ merkleProof: proof });
+void buildAttestationVaultWitnesses();
 void ((c: PreparedCall) => c);
 void createNightgateConnectorProviders;
 void buildProofProvider;

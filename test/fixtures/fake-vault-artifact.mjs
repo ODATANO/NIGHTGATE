@@ -26,9 +26,12 @@ export function ledger(state) {
         public_attestations: mapView(state.public_attestations),
         attestation_owners: mapView(state.attestation_owners),
         content_roots: mapView(state.content_roots),
-        predicate_results: mapView(state.predicate_results),
+        content_schemas: mapView(state.content_schemas),
         field_predicate_results: mapView(state.field_predicate_results),
         field_equality_results: mapView(state.field_equality_results),
-        field_membership_results: mapView(state.field_membership_results)
+        field_membership_results: mapView(state.field_membership_results),
+        document_integrity_results: mapView(state.document_integrity_results),
+        document_diff_results: mapView(state.document_diff_results),
+        attestation_seqs: mapView(state.attestation_seqs)
     };
 }

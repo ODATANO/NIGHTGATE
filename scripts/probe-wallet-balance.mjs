@@ -42,7 +42,7 @@ async function pollJob(sessionId, jobId, label) {
         if (status !== last) { process.stdout.write(`\n     [${label}] ${status}`); last = status; }
         else process.stdout.write('.');
         if (status === 'succeeded') { process.stdout.write('\n'); return; }
-        if (status === 'failed') fail(`[${label}] ${errorCode} — ${errorMessage}`);
+        if (status === 'failed') fail(`[${label}] ${errorCode} - ${errorMessage}`);
         await new Promise(r => setTimeout(r, POLL_MS));
     }
     fail(`[${label}] timed out`);

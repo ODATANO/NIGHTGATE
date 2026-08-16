@@ -167,7 +167,7 @@ async function waitForServer() {
     }
     console.log(`OK   snapshot restore ran (dustRestoreCount ${restoresBefore} -> ${after.dustRestoreCount})`);
     if (after.dustUtxoCount === 0 && after.dustPendingCount === 0) {
-        fail('WEDGED: dust UTXO gone and nothing pending — the restore did not protect the wallet');
+        fail('WEDGED: dust UTXO gone and nothing pending - the restore did not protect the wallet');
     }
     if (BigInt(after.dustBalance) === 0n) {
         fail('WEDGED: dustBalance dropped to 0 after the pre-mempool abort');

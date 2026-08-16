@@ -159,11 +159,17 @@ export default class NightgateIndexerService extends cds.ApplicationService {
         });
 
         this.on('getReadiness', async () => {
-            const topology = getRuntimeTopology(getNightgatePluginConfig());
+            const pluginConfig = getNightgatePluginConfig();
+            const topology = getRuntimeTopology(pluginConfig);
+            // A deliberately disabled crawler (the Docker default) is not a
+            // readiness failure: submission/verification runs without it. The
+            // crawler/node checks then pass as "not applicable" so ready
+            // reflects what this deployment actually operates.
+            const crawlerEnabled = (resolveNightgateRuntimeConfig(pluginConfig).crawlerConfig as any)?.enabled !== false;
             const checks = {
                 database: false,
-                crawler: false,
-                node: false,
+                crawler: !crawlerEnabled,
+                node: !crawlerEnabled,
                 runtime: topology.valid
             };
 
@@ -173,7 +179,7 @@ export default class NightgateIndexerService extends cds.ApplicationService {
                 );
                 checks.database = true;
 
-                if (syncState) {
+                if (syncState && crawlerEnabled) {
                     checks.crawler = syncState.syncStatus === 'syncing' || syncState.syncStatus === 'synced';
 
                     if (syncState.lastIndexedAt) {
@@ -187,6 +193,7 @@ export default class NightgateIndexerService extends cds.ApplicationService {
 
             return {
                 ready: checks.database && checks.crawler && checks.node && checks.runtime,
+                crawlerEnabled,
                 checks,
                 instanceId: topology.instanceId,
                 runtimeMode: topology.runtimeMode,

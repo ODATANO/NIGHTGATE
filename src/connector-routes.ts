@@ -53,7 +53,12 @@ export function mountZkConfigRoute(app: any): void {
             const etag = zkFileEtag(absPath);
             if (!etag) { res.status(404).end(); return; }
             res.setHeader('ETag', etag);
-            res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+            // NOT immutable: the URL is not content-addressed, so after a
+            // contract upgrade the same path serves DIFFERENT keys/zkir.
+            // no-cache forces an ETag revalidation per use (the ETag is a
+            // content hash, so unchanged files still answer 304 and cost one
+            // conditional request, never a re-download).
+            res.setHeader('Cache-Control', 'public, no-cache');
             res.setHeader('Content-Type', 'application/octet-stream');
             if (req.headers['if-none-match'] === etag) { res.status(304).end(); return; }
             fs.createReadStream(absPath)

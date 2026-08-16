@@ -37,7 +37,7 @@ function positiveInteger(value: unknown): number | undefined {
 }
 
 function configuredReplicaCount(config: NightgatePluginConfig): number {
-    // NB: WEB_CONCURRENCY is deliberately NOT consulted — it counts HTTP worker
+    // NB: WEB_CONCURRENCY is deliberately NOT consulted - it counts HTTP worker
     // processes within one instance (Puma/Heroku convention), not replicas of
     // this stateful service, so reading it would false-positive abort a single
     // instance that happens to set it.
@@ -49,7 +49,7 @@ function configuredReplicaCount(config: NightgatePluginConfig): number {
 }
 
 /**
- * Cloud Foundry sets CF_INSTANCE_INDEX (0-based) per running instance — unlike
+ * Cloud Foundry sets CF_INSTANCE_INDEX (0-based) per running instance - unlike
  * CF_INSTANCE_COUNT/KUBERNETES_REPLICA_COUNT, which the platforms do NOT inject
  * automatically. Any index > 0 means CF actually scaled Nightgate to multiple
  * instances, so THIS instance must not run the crawler/wallet/jobs. This is the
@@ -109,7 +109,7 @@ export function getRuntimeTopology(config: NightgatePluginConfig = {}): RuntimeT
     }
     const cfIndex = cfInstanceIndex();
     if (cfIndex != null && cfIndex > 0) {
-        errors.push(`CF_INSTANCE_INDEX is ${cfIndex}; Cloud Foundry scaled Nightgate to multiple instances. Only instance 0 may run the crawler, wallet cache and job scheduler — scale to a single instance.`);
+        errors.push(`CF_INSTANCE_INDEX is ${cfIndex}; Cloud Foundry scaled Nightgate to multiple instances. Only instance 0 may run the crawler, wallet cache and job scheduler - scale to a single instance.`);
     }
     if (multitenancy) {
         errors.push('CAP multitenancy is enabled, but Nightgate background work does not yet persist and restore tenant context.');

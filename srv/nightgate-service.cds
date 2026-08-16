@@ -197,11 +197,48 @@ service NightgateService {
                             contractAddress: String, // AttestationVault deployment to anchor into
                             compiledArtifactRef: String, // optional, defaults to 'attestation-vault'
                             idempotencyKey: String, // optional; dedupes retries
-                            sponsorSessionId: UUID // optional; second session pays the dust fee (see submitContractCall)
+                            sponsorSessionId: UUID, // optional; second session pays the dust fee (see submitContractCall)
+                            nonce: String // optional; guarded REVEAL (from prepareAnchorCommitment, after commitDocumentAnchor finalized)
     )                                                                 returns {
         jobId      : UUID;
         status     : String; // 'pending' | 'succeeded' (idempotent retry)
         documentId : UUID; // stable handle for Documents row polling
+    };
+
+    /**
+     * Guarded (commit-reveal) anchoring, phase 0: compute-only. Returns the
+     * opaque `commitment` for `commitDocumentAnchor` plus the `nonce` the
+     * later reveal (`anchorDocument` with `nonce`) requires. STORE the nonce
+     * and keep it secret until reveal: it is exactly what a mempool
+     * front-runner cannot forge. Why the guard exists: plain attest is
+     * first-come-first-served and insert-once, so a mempool observer could
+     * permanently claim a visible payload hash; a reveal whose commitment
+     * predates such a snipe takes the attestation over in-circuit.
+     */
+    action   prepareAnchorCommitment(sha256: String,
+                                     metadata: LargeString, // JSON; must equal the later anchorDocument metadata
+                                     nonce: String // optional; random when omitted
+    )                                                                 returns {
+        commitment   : String; // 64 hex; input to commitDocumentAnchor
+        nonce        : String; // 64 hex; SECRET until reveal, required by it
+        metadataHash : String; // 64 hex; informational
+    };
+
+    /**
+     * Guarded anchoring, phase 1: record the opaque commitment on-chain
+     * (AttestationVault `attestGuarded` mode 0). Async job; after it
+     * finalizes, run `anchorDocument` with the SAME sha256/metadata plus the
+     * `nonce` (phase 2, reveal). Rate limit shared with anchorDocument.
+     */
+    action   commitDocumentAnchor(commitment: String,
+                                  sessionId: UUID,
+                                  contractAddress: String,
+                                  compiledArtifactRef: String, // optional, defaults to 'attestation-vault'
+                                  idempotencyKey: String, // optional
+                                  sponsorSessionId: UUID // optional
+    )                                                                 returns {
+        jobId  : UUID;
+        status : String;
     };
 
     /**
@@ -241,51 +278,21 @@ service NightgateService {
     // ========================================================================
 
     /**
-     * Read-side view of predicate attestations. Rows are inserted by
-     * `issuePredicateAttestation` and gain `provenTxHash`/`provenAt` once the
-     * AttestationVault `provePredicate` call has been included on-chain.
+     * Read-side view of predicate attestations. Rows are inserted by the
+     * issue* proof actions and gain `provenTxHash`/`provenAt` once the
+     * proving AttestationVault call has been included on-chain.
+     *
+     * The commitment-only lane (`issuePredicateAttestation` via
+     * commitValue/provePredicate) was REMOVED in 0.16.0: the on-chain
+     * commitment was overwritable while recorded claims did not embed it, so
+     * a replaced commitment left stale claims verifiable. Every remaining
+     * claim kind is root-bound and immutable.
      */
     @readonly
     entity PredicateAttestations as projection on midnight.PredicateAttestations;
 
     /**
-     * Prove that a hidden numeric value satisfies a predicate against a public
-     * `threshold`, without revealing the value (on-chain-verified model).
-     *
-     * The job submits two AttestationVault circuit calls: `commitValue` (binds
-     * `persistentCommit(value, salt)` to the attestation) then `provePredicate`
-     * (asserts the commitment matches AND the predicate holds, recording the
-     * result on-chain). `value` is a scaled integer (the caller owns float
-     * scaling, e.g. kg CO2e/kWh × 1000); it is used ONLY as a circuit witness
-     * and is never persisted. `salt` is an optional 64-hex commitment opening
-     * (generated if omitted). `predicate` is 'lessOrEqual' | 'greaterOrEqual'.
-     *
-     * Async: returns `{ jobId, status, predicateAttestationId }` immediately.
-     * `predicateAttestationId` is a stable handle into PredicateAttestations
-     * (row inserted up-front). The job `result` carries the PAC envelope shape
-     * `{ predicateAttestationId, payloadHash, claim, proof }`.
-     */
-    action   issuePredicateAttestation(payloadHash: String, // attestation payload_hash (64 hex)
-                                       value: String, // scaled integer, decimal string (witness only)
-                                       salt: String, // optional 64-hex commitment opening
-                                       predicate: String, // 'lessOrEqual' | 'greaterOrEqual'
-                                       threshold: Integer64, // scaled integer
-                                       unit: String, // optional, informational (e.g. 'kgCO2e/kWh')
-                                       valueCommitment: String, // optional 64-hex on-chain commitment (for the envelope)
-                                       sessionId: UUID,
-                                       contractAddress: String, // AttestationVault deployment
-                                       compiledArtifactRef: String, // optional, defaults to 'attestation-vault'
-                                       idempotencyKey: String, // optional; dedupes retries
-                                       sponsorSessionId: UUID // optional; second session pays the dust fee (see submitContractCall)
-    )                                                                 returns {
-        jobId                  : UUID;
-        status                 : String;
-        predicateAttestationId : UUID;
-    };
-
-    /**
-     * Field-bound predicate proof (hardened model). Like
-     * `issuePredicateAttestation`, but the proven value is cryptographically
+     * Field-bound predicate proof: the proven value is cryptographically
      * bound to a SPECIFIC passport field via Merkle inclusion against an
      * anchored content root, so a verifier knows the value came from THIS
      * passport's `field_key`, not an arbitrary committed number.
@@ -303,7 +310,9 @@ service NightgateService {
     action   issueFieldPredicateAttestation(payloadHash: String, // attestation payload_hash (64 hex)
                                             fieldKey: String, // 64 hex canonical field id (public)
                                             value: String, // scaled integer, decimal string (witness only)
+                                            fieldSalt: String, // 64-hex per-slot salt (witness; prepareDocumentProof returns it per field)
                                             contentRoot: String, // optional 64-hex Merkle root to anchor first
+                                            schemaId: String, // 64-hex schema id (required with contentRoot; from prepareDocumentProof)
                                             siblingsJson: String, // JSON array of 4 × 64-hex sibling digests
                                             dirsJson: String, // JSON array of 4 booleans (left-child flags)
                                             predicate: String, // 'lessOrEqual' | 'greaterOrEqual'
@@ -328,7 +337,7 @@ service NightgateService {
      * root-exists assert holds); it then occupies one of the 8 call slots
      * (max 7 claims with anchor, 8 without).
      *
-     * `claimsJson` is a JSON array; entries may mix three claim kinds,
+     * `claimsJson` is a JSON array; entries may mix five claim kinds,
      * discriminated by `predicate`:
      *   - numeric: `{ fieldKey, value, siblings, dirs, predicate:
      *     'lessOrEqual'|'greaterOrEqual', threshold, unit? }`
@@ -337,10 +346,18 @@ service NightgateService {
      *   - membership: `{ fieldKey, value|valueDigest, allowedValues |
      *     setRoot+setSiblings+setDirs, siblings, dirs, predicate:
      *     'setMembership' }`
+     *   - cross-root integrity: `{ predicate: 'documentIntegrity',
+     *     payloadHashB, allowedMask, leavesA, leavesB }` (document A is the
+     *     batch payloadHash; see issueDocumentIntegrityAttestation)
+     *   - cross-root diff: `{ predicate: 'documentDiff', payloadHashB, k,
+     *     leavesA, leavesB }` (see issueDocumentDiffAttestation)
      * each entry validated exactly like its single action (64-hex keys,
-     * DEPTH=4 inclusion path; witness material never persisted). Exact
-     * duplicate claim tuples (numeric: fieldKey+threshold+predicate,
-     * equality: fieldKey+expectedDigest, membership: fieldKey+setRoot) are
+     * DEPTH=4 inclusion path; witness material never persisted). The
+     * cross-root kinds carry no fieldKey/path; an in-batch contentRoot
+     * anchor is document A's root, document B's must already be anchored.
+     * Exact duplicate claim tuples (numeric: fieldKey+threshold+predicate,
+     * equality: fieldKey+expectedDigest, membership: fieldKey+setRoot,
+     * integrity: payloadHashB+allowedMask, diff: payloadHashB+k) are
      * dropped server-side and reported via `droppedDuplicates`; claim keys
      * are idempotent on-chain, so this is a proving-time optimization only.
      *
@@ -364,6 +381,7 @@ service NightgateService {
      */
     action   issueFieldPredicateAttestationBatch(payloadHash: String, // shared attestation payload_hash (64 hex)
                                                  contentRoot: String, // optional 64-hex Merkle root, anchored in-batch first
+                                                 schemaId: String, // 64-hex schema id (required with contentRoot)
                                                  claimsJson: LargeString, // JSON array of claims (see above)
                                                  sessionId: UUID,
                                                  contractAddress: String, // AttestationVault deployment
@@ -400,7 +418,9 @@ service NightgateService {
                                            fieldKey: String, // 64 hex canonical field id (public)
                                            expectedValue: String, // raw string; server digests (pass this OR expectedDigest)
                                            expectedDigest: String, // 64-hex blake2b-256 of the exact value string
+                                           fieldSalt: String, // 64-hex per-slot salt (witness; prepareDocumentProof returns it per field)
                                            contentRoot: String, // optional 64-hex Merkle root to anchor first
+                                            schemaId: String, // 64-hex schema id (required with contentRoot; from prepareDocumentProof)
                                            siblingsJson: String, // JSON array of 4 × 64-hex sibling digests
                                            dirsJson: String, // JSON array of 4 booleans (left-child flags)
                                            sessionId: UUID,
@@ -441,7 +461,9 @@ service NightgateService {
                                              setRoot: String, // 64-hex canonical set root
                                              setSiblingsJson: String, // JSON array of 6 × 64-hex sibling digests
                                              setDirsJson: String, // JSON array of 6 booleans (left-child flags)
+                                             fieldSalt: String, // 64-hex per-slot salt (witness; prepareDocumentProof returns it per field)
                                              contentRoot: String, // optional 64-hex Merkle root to anchor first
+                                            schemaId: String, // 64-hex schema id (required with contentRoot; from prepareDocumentProof)
                                              siblingsJson: String, // JSON array of 4 × 64-hex sibling digests
                                              dirsJson: String, // JSON array of 4 booleans (left-child flags)
                                              sessionId: UUID,
@@ -456,9 +478,95 @@ service NightgateService {
     };
 
     /**
+     * Cross-root INTEGRITY proof: prove document B differs from document A
+     * ONLY in the slots flagged by `allowedMask`, both bound to their
+     * anchored content roots, values hidden (AttestationVault
+     * `proveDocumentComparison` mode 0). The canonical version-integrity claim:
+     * "the re-anchored passport changed nothing outside the allowed field
+     * set".
+     *
+     * `allowedMask` is the packed 16-bit slot mask (bit i = slot i MAY
+     * differ; 0 = identical values). v4 witness model: `schemaJson` is the
+     * SHARED 16-entry descriptor list (fieldKey/kind/scale per slot;
+     * `prepareDocumentProof` returns it as `schema`), `openingAJson` /
+     * `openingBJson` are the documents' full openings ({ saltSeed,
+     * slots[16] }; returned as `opening`). The circuit recomputes BOTH the
+     * schema root and both content roots from these, so the anchored schema
+     * id is PROVEN to describe the trees and the comparison runs on values.
+     * Both documents must be prepared with the SAME proofFields list in the
+     * same order, and both content roots must be anchored; optional
+     * `contentRootA` / `contentRootB` anchor them first (each a separate
+     * transaction ahead of the proof). A slot that changed, appeared or
+     * disappeared outside the mask fails at LOCAL proving time; nothing is
+     * submitted. `payloadHashA != payloadHashB` (a == b is trivially true).
+     * (A, B) order is part of the claim key; verify with the same order.
+     *
+     * Async: returns `{ jobId, status, predicateAttestationId }` immediately.
+     */
+    action   issueDocumentIntegrityAttestation(payloadHashA: String, // document A payload_hash (64 hex)
+                                               payloadHashB: String, // document B payload_hash (64 hex)
+                                               allowedMask: Integer, // packed 16-bit mask (bit i = slot i may differ)
+                                               schemaJson: LargeString, // JSON array of 16 slot descriptors (shared schema; from prepareDocumentProof)
+                                               openingAJson: LargeString, // document A opening { saltSeed, slots[16] } (witness; from prepareDocumentProof)
+                                               openingBJson: LargeString, // document B opening { saltSeed, slots[16] } (witness)
+                                               contentRootA: String, // optional 64-hex root to anchor for A first
+                                               contentRootB: String, // optional 64-hex root to anchor for B first
+                                               schemaId: String, // 64-hex schema id (required when anchoring; both docs share it)
+                                               sessionId: UUID,
+                                               contractAddress: String, // AttestationVault deployment
+                                               compiledArtifactRef: String, // optional, defaults to 'attestation-vault'
+                                               idempotencyKey: String, // optional; dedupes retries
+                                               sponsorSessionId: UUID // optional; second session pays the dust fee
+    )                                                                 returns {
+        jobId                  : UUID;
+        status                 : String;
+        predicateAttestationId : UUID;
+    };
+
+    /**
+     * Cross-root DISTINCTNESS proof: prove at least `k` of the 16 aligned
+     * slots differ between two anchored documents, without revealing which
+     * slots or what values (AttestationVault `proveDocumentComparison` mode 1). k = 1 is
+     * "provably not the same document"; higher k is the USDA-style
+     * "distinct at enough loci" claim.
+     *
+     * Same v4 witness model as the integrity mode: `schemaJson` (shared
+     * descriptor list) + `openingAJson` / `openingBJson` (full document
+     * openings). The circuit recomputes schema root and both content roots
+     * and counts VALUE-level differences under the shared schema: a counted
+     * difference is a value or presence change; both-empty compares equal;
+     * padding slots never count. Schema parity is structural (there is only
+     * ONE witnessed descriptor list, proven against both anchors). Both
+     * roots must be anchored (optional `contentRootA` / `contentRootB`
+     * anchor first). Fewer than k actual differences fail at LOCAL proving
+     * time; nothing is submitted. (A, B) order is part of the claim key.
+     *
+     * Async: returns `{ jobId, status, predicateAttestationId }` immediately.
+     */
+    action   issueDocumentDiffAttestation(payloadHashA: String, // document A payload_hash (64 hex)
+                                          payloadHashB: String, // document B payload_hash (64 hex)
+                                          k: Integer, // minimum differing slots, 1..16
+                                          schemaJson: LargeString, // JSON array of 16 slot descriptors (shared schema; from prepareDocumentProof)
+                                          openingAJson: LargeString, // document A opening { saltSeed, slots[16] } (witness; from prepareDocumentProof)
+                                          openingBJson: LargeString, // document B opening { saltSeed, slots[16] } (witness)
+                                          contentRootA: String, // optional 64-hex root to anchor for A first
+                                          contentRootB: String, // optional 64-hex root to anchor for B first
+                                          schemaId: String, // 64-hex schema id (required when anchoring; both docs share it)
+                                          sessionId: UUID,
+                                          contractAddress: String, // AttestationVault deployment
+                                          compiledArtifactRef: String, // optional, defaults to 'attestation-vault'
+                                          idempotencyKey: String, // optional; dedupes retries
+                                          sponsorSessionId: UUID // optional; second session pays the dust fee
+    )                                                                 returns {
+        jobId                  : UUID;
+        status                 : String;
+        predicateAttestationId : UUID;
+    };
+
+    /**
      * Verify a predicate attestation under the on-chain-verified model: the
-     * `provePredicate` proof is only accepted by the ledger if the in-circuit
-     * asserts (commitment match + predicate) held, so a successful tx IS the
+     * proving circuit call is only accepted by the ledger if its in-circuit
+     * asserts (root binding + predicate) held, so a successful tx IS the
      * proof. Confirms the row's `provenTxHash` resolves to a SUCCESS
      * `Transactions` result. Returns `verified: false` (not an error) for a
      * known-but-unproven row, mirroring `verifyDocument`.
@@ -466,23 +574,32 @@ service NightgateService {
      * Crawler-free fallback: when the local `Transactions` lookup finds nothing
      * (crawler disabled or lagging), the result is confirmed directly against
      * live contract state; the claim key is recomputed from the row and looked
-     * up in the vault's result map. No txHash and no crawler required. Plain
-     * proofs use `persistentHash(PredicateClaim{payloadHash, threshold, op})`
-     * against `predicate_results`; field-bound rows (with a `fieldKey`) use
-     * `persistentHash(FieldPredicateClaim{payloadHash, fieldKey, threshold, op})`
-     * against `field_predicate_results`. Bytes rows use
-     * `FieldEqualityClaim{payloadHash, fieldKey, expectedDigest}` against
-     * `field_equality_results` and `FieldMembershipClaim{payloadHash,
-     * fieldKey, setRoot}` against `field_membership_results`.
+     * up in the vault's result map. No txHash and no crawler required.
+     * Field-bound numeric rows use
+     * `persistentHash(FieldPredicateClaim{payloadHash, fieldKey, threshold,
+     * op, epoch})` against `field_predicate_results`. Bytes rows use
+     * `FieldEqualityClaim{payloadHash, fieldKey, expectedDigest, epoch}`
+     * against `field_equality_results` and `FieldMembershipClaim{payloadHash,
+     * fieldKey, setRoot, epoch}` against `field_membership_results`.
+     * Cross-root rows use `DocumentIntegrityClaim{payloadHash, payloadHashB,
+     * allowedMask, epochA, epochB}` against `document_integrity_results` and
+     * `DocumentDiffClaim{payloadHash, payloadHashB, k, epochA, epochB}`
+     * against `document_diff_results` (k rides in `threshold`). `epoch` is
+     * the payload's CURRENT attestation epoch (`attestation_seqs` in ledger
+     * state), read from the same state query: claims recorded during a
+     * front-runner's ownership window stop verifying after a guarded-attest
+     * takeover moved the epoch. External reimplementations MUST include the
+     * epoch(s) or they compute wrong claim keys.
      */
     function verifyPredicateAttestation(predicateAttestationId: UUID) returns {
         verified        : Boolean;
         predicate       : String;
-        threshold       : Integer64;
+        threshold       : Integer64; // numeric predicates: scaled threshold; documentDiff: k
         unit            : String;
         expectedDigest  : String; // bytesEquality rows: the public expected digest
         setRoot         : String; // setMembership rows: the canonical set root
-        valueCommitment : String;
+        payloadHashB    : String; // cross-root rows: the second document
+        allowedMask     : Integer; // documentIntegrity rows: packed 16-bit mask
         provenTxHash    : String;
         provenAt        : Timestamp;
     };
@@ -491,9 +608,14 @@ service NightgateService {
      * Verify an attestation directly against LIVE contract state
      * (`queryContractState`), independent of the block crawler and of any
      * txHash. Confirms `payloadHash` is present in the vault's attestation map
-     * (and, when `contentRoot` is supplied, that it equals the anchored content
-     * root for that payload). Read-only; keyed entirely by the caller-supplied
-     * `payloadHash`, so it needs no crawler and no enumeration.
+     * (and, when `contentRoot` / `schemaId` are supplied, that they equal the
+     * anchored content root / schema id for that payload). Read-only; keyed
+     * entirely by the caller-supplied `payloadHash`, so it needs no crawler
+     * and no enumeration. TRUST NOTE: an anchor is the anchoring attester's
+     * statement about their own payload; a verifier of cross-party claims
+     * must ALSO check `attesterId` against the identity it trusts (and, for
+     * cross-root claims, `schemaId` against the canonical schema of the
+     * expected field panel).
      *
      * Returns `verified: false` (not an error) for an absent attestation, and a
      * clean negative (not a 5xx) when no live provider is configured, mirroring
@@ -510,12 +632,14 @@ service NightgateService {
     function verifyAttestationState(contractAddress: String,
                                     payloadHash: String, // 64 hex
                                     contentRoot: String, // optional 64 hex, checked against anchored root
+                                    schemaId: String, // optional 64 hex, checked against anchored schema id
                                     compiledArtifactRef: String, // optional, defaults to 'attestation-vault'
                                     network: String // optional network override, e.g. 'preview' | 'preprod' | 'mainnet'
     )                                                                 returns {
         verified      : Boolean;
         attested      : Boolean; // payload_hash present in the attestation map
         contentRootOk : Boolean; // anchored content root matches (when contentRoot given)
+        schemaOk      : Boolean; // anchored schema id matches (when schemaId given)
         attesterId    : String; // owner grantee id, if present
     };
 
@@ -526,12 +650,17 @@ service NightgateService {
      * to `verifyPredicateAttestation` for WALLET-submitted proofs (browser signs,
      * NIGHTGATE never saw a jobId). Recomputes the on-chain claim key off-chain
      * from the supplied coordinates and confirms the vault recorded a true
-     * result for it. Supply `fieldKey` for a field-bound proof
-     * (`field_predicate_results`); omit it for a plain one (`predicate_results`).
-     * For the bytes claim kinds pass `predicate: 'bytesEquality'` +
+     * result for it. Numeric predicates are field-bound and require
+     * `fieldKey` (`field_predicate_results`); the commitment-only plain kind
+     * was removed in 0.16.0. For the bytes claim kinds pass `predicate: 'bytesEquality'` +
      * `expectedDigest` (`field_equality_results`) or `predicate:
      * 'setMembership'` + `setRoot` (`field_membership_results`); `threshold`
-     * is ignored for both.
+     * is ignored for both. For the cross-root kinds pass `predicate:
+     * 'documentIntegrity'` + `payloadHashB` + `allowedMask`
+     * (`document_integrity_results`) or `predicate: 'documentDiff'` +
+     * `payloadHashB` + `k` (`document_diff_results`); `payloadHash` is
+     * document A and the (A, B) order must match the proving order, since
+     * it is part of the claim key.
      *
      * `threshold` must be the SAME scaled Uint<64> integer the circuit hashed
      * into the claim key (e.g. raw value x1000 when the consumer scales by
@@ -546,12 +675,15 @@ service NightgateService {
      * read from another network's public indexer, 400 on unknown values.
      */
     function verifyPredicateState(contractAddress: String,
-                                  payloadHash: String, // 64 hex
-                                  fieldKey: String, // optional 64 hex; when set, field-bound
-                                  predicate: String, // 'lessOrEqual' | 'greaterOrEqual' | 'bytesEquality' | 'setMembership'
+                                  payloadHash: String, // 64 hex (cross-root kinds: document A)
+                                  fieldKey: String, // 64 hex; required for the numeric/bytes kinds
+                                  predicate: String, // 'lessOrEqual' | 'greaterOrEqual' | 'bytesEquality' | 'setMembership' | 'documentIntegrity' | 'documentDiff'
                                   threshold: Integer64, // scaled circuit integer (numeric predicates only)
                                   expectedDigest: String, // 64 hex, required for 'bytesEquality'
                                   setRoot: String, // 64 hex canonical set root, required for 'setMembership'
+                                  payloadHashB: String, // 64 hex document B, required for the cross-root kinds
+                                  allowedMask: Integer, // packed 16-bit mask, required for 'documentIntegrity'
+                                  k: Integer, // minimum differing slots 1..16, required for 'documentDiff'
                                   compiledArtifactRef: String, // optional, defaults to 'attestation-vault'
                                   network: String // optional network override, e.g. 'preview' | 'preprod' | 'mainnet'
     )                                                                 returns {
@@ -1056,25 +1188,36 @@ service NightgateService {
      * key containing dots wins over path descent. Values must resolve to
      * scalars (a path landing on an object/array is a 400; 'uint' requires
      * non-negative numerics, 'bytes' requires strings); absent values
-     * occupy a fixed empty leaf and are reported in `emptyFields`. Leaf/node hashing uses
-     * the contract artifact's exported pure circuits, so the root is
-     * byte-identical to the in-circuit fold.
+     * occupy the salted absent leaf and are reported in `emptyFields`.
+     * Every leaf is SALTED (v4) with a per-slot salt derived from a
+     * per-document 32-byte seed: random by default, or caller-supplied via
+     * `saltSeed` for a deterministic re-prepare of an already-anchored
+     * payload. Leaf/node/descriptor hashing uses the contract artifact's
+     * exported pure circuits, so root and schemaId are byte-identical to
+     * the in-circuit recompute.
      *
      * Compute-only and synchronous: nothing is persisted, no job started.
-     * The response's `fields` carry WITNESS material (scaled values); handle
-     * like the inputs of the predicate actions. `canonicalDocument` is the
-     * exact byte form behind `payloadHash`; store it at your `storageRef`,
-     * a re-serialization with different key order will not re-hash equal.
+     * The response's `fields` and `opening` carry WITNESS material (values,
+     * salts, the seed); STORE the `opening` alongside the document. Losing
+     * the seed makes the anchored root unprovable; leaking it makes shared
+     * leaf hashes dictionary-testable. `canonicalDocument` is the exact
+     * byte form behind `payloadHash`; store it at your `storageRef`, a
+     * re-serialization with different key order will not re-hash equal.
      */
     action   prepareDocumentProof(documentJson: LargeString, // JSON object: the full document
                                   proofFieldsJson: LargeString, // ordered JSON array of { field, kind?, scale? }, max 16
+                                  saltSeed: String, // optional 64-hex salt seed (deterministic re-prepare); random if omitted
                                   compiledArtifactRef: String // optional, defaults to 'attestation-vault'
     )                                                                 returns {
         payloadHash       : String; // blake2b-256 of canonicalDocument (64 hex)
         canonicalDocument : LargeString; // the exact hashed byte form
-        contentRoot       : String; // 64-hex Merkle root over the proof fields
-        fields            : LargeString; // JSON array of { field, fieldKey, kind, value?, valueDigest?, siblings, dirs }
-        emptyFields       : LargeString; // JSON array of fields without a value (empty leaf)
+        contentRoot       : String; // 64-hex SALTED Merkle root over the proof fields
+        fields            : LargeString; // JSON array of { field, fieldKey, kind, value?, valueDigest?, salt, siblings, dirs }
+        emptyFields       : LargeString; // JSON array of fields without a value (salted absent leaf)
+        schemaId          : String; // 64-hex schema root of the ORDERED proofFields list (anchored next to the root)
+        schema            : LargeString; // JSON array of 16 slot descriptors { fieldKey, kind, scale } (public)
+        leaves            : LargeString; // JSON array of 16 × 64-hex salted leaf hashes (informational)
+        opening           : LargeString; // JSON { saltSeed, slots[16] }: the cross-root witness bundle (STORE IT)
     };
 
     /**

@@ -139,7 +139,7 @@ describe('StorageEncryption', () => {
 describe('cross-compat: our blob decryptable by SDK-equivalent path', () => {
     // The SDK's import path uses decryptWithPassword-style logic. We verify
     // an end-to-end round-trip in that exact mode without touching the SDK
-    // (the SDK is ESM-only and not loadable from this Jest runtime). The
+    // (unit tests never load the real ESM-only SDK; repo rule). The
     // integration script scripts/integration-test-providers.mjs additionally
     // exercises the live SDK.
     test('encrypt then decryptWithPassword round-trip', () => {

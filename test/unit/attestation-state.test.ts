@@ -54,13 +54,13 @@ describe('readAttestationState', () => {
     test('attested present, no contentRoot supplied → attested true, contentRootOk false, attesterId set', async () => {
         const led = makeLedger({ attested: [0xaa], owners: { 0xaa: 0x11 } });
         const r = await readFor(led, 0xaa);
-        expect(r).toEqual({ attested: true, contentRootOk: false, attesterId: hx(b(0x11)) });
+        expect(r).toEqual({ attested: true, contentRootOk: false, schemaOk: false, attesterId: hx(b(0x11)) });
     });
 
     test('attestation absent → attested false, attesterId empty', async () => {
         const led = makeLedger({ attested: [0xaa], owners: { 0xaa: 0x11 } });
         const r = await readFor(led, 0x99);
-        expect(r).toEqual({ attested: false, contentRootOk: false, attesterId: '' });
+        expect(r).toEqual({ attested: false, contentRootOk: false, schemaOk: false, attesterId: '' });
     });
 
     test('contentRoot matches the anchored root → contentRootOk true', async () => {

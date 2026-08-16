@@ -35,6 +35,7 @@ import { classifySubmissionError, type SubmissionErrorClassification } from './T
 import { resolveNightgateRuntimeConfig, getNightgatePluginConfig } from '../utils/nightgate-config';
 import { runInJobExecutionContext } from './job-execution-context';
 import { encrypt as encryptAtRest, decrypt as decryptAtRest, getEncryptionKey } from '../utils/crypto';
+import { getArtifactGenerationDigest } from './contract-registry';
 
 const { SELECT, INSERT, UPDATE } = cds.ql;
 
@@ -85,11 +86,9 @@ const HEAVY_KINDS: ReadonlySet<string> = new Set([
     'submitContractCallBatch',
     'submitContractCall',
     'anchorDocument',
-    'issuePredicateAttestation',
+    'commitDocumentAnchor',
     'issueFieldPredicateAttestation',
     'issueFieldPredicateAttestationBatch',
-    'predicateCommitValue',
-    'predicateProof',
     'fieldAnchorRoot',
     'fieldPredicateProof',
     'fieldPredicateBatchProof',
@@ -98,7 +97,6 @@ const HEAVY_KINDS: ReadonlySet<string> = new Set([
     'registerPassport'
 ]);
 const WORKFLOW_PARENT_KINDS: ReadonlySet<string> = new Set([
-    'issuePredicateAttestation',
     'issueFieldPredicateAttestation',
     'issueFieldPredicateAttestationBatch'
 ]);
@@ -277,7 +275,7 @@ export async function startJob<TIn, TOut>(
     const reader = pinnedRunner ?? db;
 
     // Idempotency dedupe (fast path): sees rows committed by prior requests but
-    // not in-flight ones in another tx — the constraint covers that race below.
+    // not in-flight ones in another tx - the constraint covers that race below.
     if (idempotencyKey) {
         const dup = await dedupExisting<TIn, TOut>(reader, sessionId, kind, idempotencyKey, payloadFingerprint);
         if (dup) return dup;
@@ -289,7 +287,22 @@ export async function startJob<TIn, TOut>(
     // the sqlite write lock.
     const jobId = crypto.randomUUID();
     const queuedAt = new Date().toISOString();
-    const serializedCommand = replayable ? safeStringify(command) : null;
+    // Provenance binding (0.16.0): a persisted command names its artifact by
+    // a MUTABLE registry alias (`compiledArtifactRef`). Stamp the alias's
+    // CURRENT generation digest at creation time, so the executor fails
+    // closed if the alias is re-pointed before the (possibly much later)
+    // execution: upgrade, restart, re-configuration. Non-contract commands
+    // (no compiledArtifactRef) pass through untouched.
+    let effectiveCommand: unknown = command;
+    if (replayable && command && typeof command === 'object'
+        && typeof (command as any).compiledArtifactRef === 'string'
+        && (command as any).artifactDigest === undefined) {
+        effectiveCommand = {
+            ...(command as object),
+            artifactDigest: getArtifactGenerationDigest((command as any).compiledArtifactRef)
+        };
+    }
+    const serializedCommand = replayable ? safeStringify(effectiveCommand) : null;
     const commandEncoding = replayable ? (encryptCommand ? 'aes-gcm-v1' : 'json-v1') : null;
     const persistedCommand = serializedCommand && encryptCommand
         ? encryptAtRest(serializedCommand, getEncryptionKey())
@@ -484,7 +497,7 @@ function dispatchJob(jobId: string, kind: string, legacyWork?: () => Promise<unk
                 // on-chain effect worth reconciling. A failure while still in
                 // `external_execution` with no txHash (proof generation or
                 // balancing failed before any broadcast) is unambiguous, so it
-                // fails cleanly — a legitimately rejected job (e.g. a false
+                // fails cleanly - a legitimately rejected job (e.g. a false
                 // predicate) must not demand operator reconciliation. Crash
                 // recovery still fail-closes `external_execution` rows, which
                 // is the genuinely ambiguous case.
@@ -797,13 +810,13 @@ export async function dropPendingJobsForClosedSessions(sessionIds: string[]): Pr
  * cancellation: an in-flight worker wait runs until it resolves on its own.
  *
  * Runs on the caller's ambient request tx when present: the sweep is then
- * atomic with the successor insert (which is visible there — excludeJobId
+ * atomic with the successor insert (which is visible there - excludeJobId
  * guards it), and no second pool connection is requested while the request tx
  * still pins one (that second acquire deadlocks at pool.max=1 and collides
  * with the open writer on SQLite). On the ambient tx the UPDATE is wrapped in
  * a SAVEPOINT: a failed sweep must stay best-effort for the caller, and
  * without ROLLBACK TO SAVEPOINT a failed statement leaves a PostgreSQL tx
- * aborted — the caller's catch would then mask a connect whose seed write and
+ * aborted - the caller's catch would then mask a connect whose seed write and
  * job insert can no longer commit. Outside a request tx it autocommits.
  */
 export async function supersedeQueuedJobs(kind: string, sessionId: string, excludeJobId?: string): Promise<number> {

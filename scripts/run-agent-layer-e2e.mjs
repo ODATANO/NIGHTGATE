@@ -91,7 +91,7 @@ async function pollJob(sessionId, jobId, label, { headers = {}, timeoutMs = PREW
         if (status === 'succeeded') { process.stdout.write('\n'); return result ? JSON.parse(result) : {}; }
         if (status === 'failed' || status === 'reconciliation_required') {
             process.stdout.write('\n');
-            fail(`[${label}] job ${status}: ${errorCode} — ${errorMessage}`);
+            fail(`[${label}] job ${status}: ${errorCode} - ${errorMessage}`);
         }
         await new Promise(res => setTimeout(res, intervalMs));
     }
@@ -193,7 +193,7 @@ function expectStatus(r, want, label) {
         proofFieldsJson: JSON.stringify(PROOF_FIELDS)
     }, agent);
     if (r.status >= 400) fail(`prepareDocumentProof → ${r.status}: ${pretty(r.body)}`);
-    const { payloadHash, canonicalDocument, contentRoot } = r.body;
+    const { payloadHash, canonicalDocument, contentRoot, schemaId } = r.body;
     const fields = JSON.parse(r.body.fields);
     if (blake2b256Hex(canonicalDocument) !== payloadHash) fail('payloadHash does not re-hash from canonicalDocument');
     if (fields.length !== 2) fail(`expected 2 prepared fields, got ${fields.length}`);
@@ -219,7 +219,7 @@ function expectStatus(r, want, label) {
         { ...pick(fields, 'expiryDays'), predicate: 'greaterOrEqual', threshold: String(180 * 1000), unit: 'days' }
     ];
     r = await post('/issueFieldPredicateAttestationBatch', {
-        payloadHash, contentRoot,
+        payloadHash, contentRoot, schemaId,
         claimsJson: JSON.stringify(claims),
         contractAddress
         // again no sessionId: injected
@@ -282,5 +282,8 @@ function expectStatus(r, want, label) {
 function pick(fields, name) {
     const f = fields.find(x => x.field === name);
     if (!f) fail(`prepared fields miss '${name}'`);
-    return { fieldKey: f.fieldKey, value: f.value, siblings: f.siblings, dirs: f.dirs };
+    // v4 salted leaves: the slot salt is required per batch claim (the
+    // single-field actions take the same value as `fieldSalt`).
+    if (!f.salt) fail(`prepared field '${name}' has no salt (v4 salted leaves)`);
+    return { fieldKey: f.fieldKey, value: f.value, salt: f.salt, siblings: f.siblings, dirs: f.dirs };
 }

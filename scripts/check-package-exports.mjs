@@ -4,8 +4,8 @@
 // `@odatano/nightgate/browser/providers.mjs` while (a) that subpath was missing from
 // `package.json#exports`, so Node and every bundler reject it with ERR_PACKAGE_PATH_NOT_EXPORTED,
 // and (b) the `files` list covered `*.d.ts` but not `*.d.mts`, so the declaration would not have
-// been in the tarball at all. Both are invisible in the repo — everything resolves fine from
-// source — and only surface in a consumer's install. So the check runs against the REAL tarball
+// been in the tarball at all. Both are invisible in the repo - everything resolves fine from
+// source - and only surface in a consumer's install. So the check runs against the REAL tarball
 // contents (`npm pack --dry-run`), not against the working tree.
 //
 // Checks, per exports target (including every `types` condition):
@@ -62,6 +62,20 @@ for (const { subpath, target } of targets) {
             `check-package-exports: exports["${subpath}"] -> ${target} exists but is NOT published ` +
                 `(no "files" entry matches it). Consumers would get ERR_MODULE_NOT_FOUND or untyped imports.`,
         );
+        failed = true;
+    }
+}
+
+// Non-export tarball invariants: files the runtime or the docs point users at.
+//   - the migration CLI the SchemaNotDeployedError message recommends,
+//   - the Compact source of the shipped managed artifacts (auditability: a
+//     consumer must be able to diff source against the compiled circuits).
+for (const required of [
+    'scripts/apply-schema-delta.mjs',
+    'contracts/attestation-vault/src/attestation-vault.compact'
+]) {
+    if (!packed.has(required)) {
+        console.error(`check-package-exports: '${required}' is NOT in the tarball (files allowlist).`);
         failed = true;
     }
 }

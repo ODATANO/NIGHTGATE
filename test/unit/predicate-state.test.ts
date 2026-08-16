@@ -5,19 +5,20 @@
  * Exercises readPredicateResult against a FAKE `ledger()`-shaped object and a
  * fake queryContractState: no SDK, no chain. The claim-key recompute
  * (computePredicateClaimKey) needs the ESM compact-runtime and is covered by
- * scripts/spike-state-verification.mjs (byte-exact match to a live-emitted key).
+ * scripts/integration-test-attestation-vault.mjs (byte-exact match to a live-emitted key).
  */
-import { readPredicateResult } from '../../srv/submission/predicate-state';
+import { readPredicateResult, expandAllowedMask } from '../../srv/submission/predicate-state';
 
 const b = (fill: number) => new Uint8Array(32).fill(fill);
 const hx = (u: Uint8Array) => Buffer.from(u).toString('hex');
 
-/** The four result maps as fill-byte -> boolean maps. */
+/** The five result maps as fill-byte -> boolean maps. */
 function makeLedger(
-    results: Record<number, boolean>,
-    fieldResults: Record<number, boolean> = {},
+    fieldResults: Record<number, boolean>,
     equalityResults: Record<number, boolean> = {},
-    membershipResults: Record<number, boolean> = {}
+    membershipResults: Record<number, boolean> = {},
+    integrityResults: Record<number, boolean> = {},
+    diffResults: Record<number, boolean> = {}
 ) {
     const fillOf = (k: Uint8Array) => k[0];
     const map = (m: Record<number, boolean>) => ({
@@ -25,18 +26,18 @@ function makeLedger(
         lookup: (k: Uint8Array) => m[fillOf(k)]
     });
     return {
-        predicate_results: map(results),
         field_predicate_results: map(fieldResults),
         field_equality_results: map(equalityResults),
-        field_membership_results: map(membershipResults)
+        field_membership_results: map(membershipResults),
+        document_integrity_results: map(integrityResults),
+        document_diff_results: map(diffResults)
     } as any;
 }
 
-function readFor(ledger: any, claimFill: number, field = false) {
+function readFor(ledger: any, claimFill: number) {
     return readPredicateResult({
         contractAddress: '0xVAULT',
         claimKey: hx(b(claimFill)),
-        field,
         ledger: () => ledger,
         queryContractState: async () => ({})
     });
@@ -55,19 +56,14 @@ describe('readPredicateResult', () => {
         expect(await readFor(makeLedger({ 0x42: true }), 0x99)).toBe(false);
     });
 
-    test('field=true reads field_predicate_results, not predicate_results', async () => {
-        // Same fill present as true in the FIELD map only; the plain map is empty.
-        const led = makeLedger({}, { 0x42: true });
-        expect(await readFor(led, 0x42, true)).toBe(true);
-        expect(await readFor(led, 0x42, false)).toBe(false);
-    });
-
-    test('field=true with absent field key → false', async () => {
-        expect(await readFor(makeLedger({ 0x42: true }, { 0x43: true }), 0x42, true)).toBe(false);
+    test('default kind reads field_predicate_results only', async () => {
+        const led = makeLedger({ 0x42: true }, { 0x43: true });
+        expect(await readFor(led, 0x42)).toBe(true);
+        expect(await readFor(led, 0x43)).toBe(false);
     });
 
     test("kind: 'equality' / 'membership' read their own maps only", async () => {
-        const led = makeLedger({}, {}, { 0x42: true }, { 0x43: true });
+        const led = makeLedger({}, { 0x42: true }, { 0x43: true });
         const readKind = (fill: number, kind: any) => readPredicateResult({
             contractAddress: '0xVAULT', claimKey: hx(b(fill)), kind,
             ledger: () => led, queryContractState: async () => ({})
@@ -78,17 +74,8 @@ describe('readPredicateResult', () => {
         expect(await readKind(0x42, 'membership')).toBe(false);
         expect(await readKind(0x43, 'equality')).toBe(false);
         expect(await readKind(0x42, 'field')).toBe(false);
-        expect(await readKind(0x42, 'plain')).toBe(false);
     });
 
-    test('kind wins over the legacy field flag', async () => {
-        const led = makeLedger({}, { 0x42: true }, { 0x42: false });
-        const r = await readPredicateResult({
-            contractAddress: '0xVAULT', claimKey: hx(b(0x42)), kind: 'equality', field: true,
-            ledger: () => led, queryContractState: async () => ({})
-        });
-        expect(r).toBe(false);
-    });
 
     test('no contract state (null) → returns null (clean negative)', async () => {
         const r = await readPredicateResult({
@@ -98,6 +85,20 @@ describe('readPredicateResult', () => {
             queryContractState: async () => null
         });
         expect(r).toBeNull();
+    });
+
+    test("kind: 'integrity' / 'diff' read the cross-root maps only", async () => {
+        const led = makeLedger({}, {}, {}, { 0x42: true }, { 0x43: true });
+        const readKind = (fill: number, kind: any) => readPredicateResult({
+            contractAddress: '0xVAULT', claimKey: hx(b(fill)), kind,
+            ledger: () => led, queryContractState: async () => ({})
+        });
+        expect(await readKind(0x42, 'integrity')).toBe(true);
+        expect(await readKind(0x43, 'diff')).toBe(true);
+        // Cross-map isolation: the same key does not leak across kinds.
+        expect(await readKind(0x42, 'diff')).toBe(false);
+        expect(await readKind(0x43, 'integrity')).toBe(false);
+        expect(await readKind(0x42, 'equality')).toBe(false);
     });
 
     test('decodes via state.data when present (ChargedState shape)', async () => {
@@ -110,5 +111,28 @@ describe('readPredicateResult', () => {
         });
         expect(seen[0]).toBe('CHARGED_STATE');
         expect(r).toBe(true);
+    });
+});
+
+describe('expandAllowedMask', () => {
+    test('bit i set -> slot i allowed, little-endian bit order', () => {
+        expect(expandAllowedMask(0)).toEqual(Array(16).fill(false));
+        expect(expandAllowedMask(0xffff)).toEqual(Array(16).fill(true));
+        const m = expandAllowedMask(0b1000000000000101);
+        expect(m[0]).toBe(true);
+        expect(m[1]).toBe(false);
+        expect(m[2]).toBe(true);
+        expect(m[15]).toBe(true);
+        expect(m.filter(Boolean)).toHaveLength(3);
+    });
+
+    test('always 16 entries', () => {
+        expect(expandAllowedMask(1)).toHaveLength(16);
+    });
+
+    test('rejects out-of-range and non-integer masks', () => {
+        for (const bad of [-1, 0x10000, 1.5, NaN]) {
+            expect(() => expandAllowedMask(bad)).toThrow(/0\.\.65535/);
+        }
     });
 });

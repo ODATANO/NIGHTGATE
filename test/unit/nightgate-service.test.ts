@@ -30,7 +30,7 @@ vi.mock('../../srv/sessions/wallet-sessions', () => ({
 import cds from '@sap/cds';
 
 // Boot the in-memory CAP server. Not assigned to a `test` const on purpose
-// (would shadow Jest's global test()). We use the HTTP client `cap` for the
+// (would shadow Vitest's global test()). We use the HTTP client `cap` for the
 // bound OData functions and srv.send() for the unbound getJobStatus action.
 const cap = cds.test(__dirname + '/../..');
 
@@ -605,7 +605,7 @@ describe('BackgroundJobs idempotency constraint', () => {
     // on the pinned runner (db.tx(cds.context), the same connection backing the
     // handler's writes) a colliding INSERT raises the unique violation INSIDE a
     // savepoint, ROLLBACK TO undoes only that insert, and the surrounding tx
-    // stays usable — it can still read the winner and commit a further write.
+    // stays usable - it can still read the winner and commit a further write.
     // (The two-concurrent-transaction / Postgres "transaction aborted" variant
     // lives in scripts/test-postgres-idempotency.mjs; SQLite does not abort a tx
     // on a constraint error, so only Postgres proves the savepoint is required.)
@@ -700,9 +700,9 @@ describe('getJobStatus', () => {
     });
 
     it('returns the full job shape for a matching jobId + sessionId', async () => {
-        await seedJob();
+        await seedJob({ requestedBy: 'alice' });
 
-        const out = await srv.send('getJobStatus', { jobId: VALID_JOB_ID, sessionId: VALID_SESSION });
+        const out = await sendAs('alice');
 
         expect(out).toEqual(expect.objectContaining({
             jobId: VALID_JOB_ID,
@@ -727,14 +727,40 @@ describe('getJobStatus', () => {
             result: null,
             errorCode: '1016',
             errorMessage: 'Transaction pool full or immediately dropped',
-            finishedAt: '2026-05-19T12:00:30.000Z'
+            finishedAt: '2026-05-19T12:00:30.000Z',
+            requestedBy: 'alice'
         });
 
-        const out = await srv.send('getJobStatus', { jobId: VALID_JOB_ID, sessionId: VALID_SESSION });
+        const out = await sendAs('alice');
         expect(out.status).toBe('failed');
         expect(out.errorCode).toBe('1016');
         expect(out.errorMessage).toMatch(/pool full/);
         expect(out.result).toBeNull();
+    });
+
+    // Ownership is FAIL-CLOSED for non-admin callers (0.16.0): a missing
+    // session row (e.g. closed after a restart) must not open the job up.
+    function sendAs(userId: string): Promise<any> {
+        const user = new (cds as any).User({ id: userId, roles: [] });
+        return cds.tx({ user } as any, () =>
+            srv.send('getJobStatus', { jobId: VALID_JOB_ID, sessionId: VALID_SESSION }));
+    }
+
+    it('404s for a non-admin caller when the job has no requestedBy and no session row (fail-closed)', async () => {
+        await seedJob();
+        await expect(sendAs('mallory')).rejects.toMatchObject({ message: 'Job not found' });
+    });
+
+    it('404s for a non-admin caller whose id differs from the recorded requestedBy', async () => {
+        await seedJob({ requestedBy: 'alice' });
+        await expect(sendAs('mallory')).rejects.toMatchObject({ message: 'Job not found' });
+    });
+
+    it('returns the job for the non-admin caller recorded as requestedBy', async () => {
+        await seedJob({ requestedBy: 'alice' });
+        const out = await sendAs('alice');
+        expect(out.status).toBe('succeeded');
+        expect(out.jobId).toBe(VALID_JOB_ID);
     });
 });
 
@@ -819,5 +845,41 @@ describe('owner-scoped entity reads', () => {
     it('PendingSubmissions READ returns everything for admins (incl. session-less rows)', async () => {
         const rows = await readAs('ops', ['admin'], 'PendingSubmissions');
         expect(rows.map((r: any) => r.txHash).sort()).toEqual(['0xalice-tx', '0xbob-tx', '0xownerless-tx']);
+    });
+
+    // Documents / GranteeIdentities are owner-scoped too (0.16.0): storageRef
+    // and userId->granteeId bindings are nobody else's business. Legacy rows
+    // without a userId stay admin-only.
+    it('Documents READ is limited to the requesting user\'s rows (legacy null-userId rows admin-only)', async () => {
+        const DOCUMENTS = 'midnight.Documents';
+        await db.run(cds.ql.DELETE.from(DOCUMENTS));
+        const mk = (userId: string | null, tag: string) => db.run(cds.ql.INSERT.into(DOCUMENTS).entries({
+            ID: cds.utils.uuid(), sha256: tag.repeat(32), storageRef: `s3://internal/${tag}`, userId
+        }));
+        await mk('alice', 'aa');
+        await mk('bob', 'bb');
+        await mk(null, 'cc');
+
+        const aliceRows = await readAs('alice', [], 'Documents');
+        expect(aliceRows.map((r: any) => r.sha256)).toEqual(['aa'.repeat(32)]);
+        const adminRows = await readAs('ops', ['admin'], 'Documents');
+        expect(adminRows).toHaveLength(3);
+        await db.run(cds.ql.DELETE.from(DOCUMENTS));
+    });
+
+    it('GranteeIdentities READ is limited to the requesting user\'s bindings', async () => {
+        const GRANTEES = 'midnight.GranteeIdentities';
+        await db.run(cds.ql.DELETE.from(GRANTEES));
+        const mk = (userId: string, tag: string) => db.run(cds.ql.INSERT.into(GRANTEES).entries({
+            ID: cds.utils.uuid(), userId, granteeId: tag.repeat(32), bindingKind: 'wallet'
+        }));
+        await mk('alice', 'aa');
+        await mk('bob', 'bb');
+
+        const aliceRows = await readAs('alice', [], 'GranteeIdentities');
+        expect(aliceRows.map((r: any) => r.granteeId)).toEqual(['aa'.repeat(32)]);
+        const adminRows = await readAs('ops', ['admin'], 'GranteeIdentities');
+        expect(adminRows).toHaveLength(2);
+        await db.run(cds.ql.DELETE.from(GRANTEES));
     });
 });

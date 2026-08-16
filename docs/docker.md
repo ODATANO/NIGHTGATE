@@ -28,12 +28,12 @@ docker compose -f docker/docker-compose.yml up -d nightgate
 Or without compose:
 
 ```bash
-docker build -t odatano/nightgate:0.14.0 .
+docker build -t odatano/nightgate:0.16.0 .
 docker run -d --name nightgate -p 4004:4004 \
   -e ENCRYPTION_KEY=$(openssl rand -hex 32) \
   -e NIGHTGATE_HTTP_PASSWORD=change-me \
   -v nightgate-data:/data \
-  odatano/nightgate:0.14.0
+  odatano/nightgate:0.16.0
 ```
 
 The server listens on `http://localhost:4004`; the OData services sit under
@@ -66,13 +66,20 @@ and set `NIGHTGATE_PROOF_SERVER_URL=http://proof-server:6300`.
 
 The entrypoint deploys the schema ONLY when the database file does not
 exist yet: `cds deploy` recreates tables, an unconditional deploy would
-wipe data on every boot. After an image upgrade that adds entities (e.g.
-`AgentGrants` in 0.14.0), either recreate the volume (dev) or run the
-deploy manually, accepting the data loss, or apply a schema delta by hand:
+wipe data on every boot. The startup preflight also probes each release's
+NEW columns, so an old database refuses to boot with a migration hint
+instead of failing at the first new action. After an image upgrade that
+adds entities or columns (0.16.0: `Documents.userId/contractAddress/network`,
+`PredicateAttestations.payloadHashB/allowedMask`), run the ADDITIVE
+migration (keeps all data; it reads `NIGHTGATE_DB_PATH`, which the image
+sets to `/data/nightgate.db`):
 
 ```bash
-docker exec odatano-nightgate npx cds deploy --to "sqlite:/data/nightgate.db"
+docker exec odatano-nightgate node scripts/apply-schema-delta.mjs
 ```
+
+Recreating the volume (dev) or a destructive
+`npx cds deploy --to "sqlite:/data/nightgate.db"` remain the wipe options.
 
 ## Operational notes
 

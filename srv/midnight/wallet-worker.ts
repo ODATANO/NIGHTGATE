@@ -257,6 +257,23 @@ async function getContractScaffold(name: string, registration: ContractRegistrat
 }
 
 /**
+ * Per-contract constructor arguments for deploys. The AttestationVault
+ * constructor takes the registrar identity as a PUBLIC argument (0.16.0):
+ * a witness-backed constructor makes the deploy proof heavy enough that,
+ * with 13 circuits' verifier keys, the node rejects the deploy tx as
+ * exceeding its block cost limits. The worker injects the DEPLOY SESSION's
+ * attester id (persistentHash over the same secret the local_secret_key()
+ * witness serves), preserving the pre-0.16.0 "registrar = deploy session"
+ * semantics exactly.
+ */
+async function deployConstructorArgs(contractName: string, entry: FacadeEntry): Promise<unknown[]> {
+    if (contractName !== 'attestation-vault') return [];
+    const rt: any = await import('@midnight-ntwrk/compact-runtime');
+    const attesterId: Uint8Array = rt.persistentHash(new rt.CompactTypeBytes(32), entry.attestationSecret);
+    return [attesterId];
+}
+
+/**
  * Builds a CompiledContract for the given registered contract. If the
  * contract declares no witnesses, supplies vacant ones (counter). Otherwise
  * looks up the witness factory and feeds it the FacadeEntry's
@@ -270,7 +287,6 @@ async function getOrCompileContract(
     name: string,
     registration: ContractRegistration,
     entry: FacadeEntry,
-    witnessValues?: { attestedValue: string; valueSalt: string },
     merkleProof?: MerkleProofBundle,
     merkleProofHolder?: { current?: MerkleProofBundle }
 ): Promise<any> {
@@ -286,7 +302,7 @@ async function getOrCompileContract(
 
     const witnessFactory = getContractWitnessFactory(name);
     const witnessStep = witnessFactory
-        ? CompiledContract.withWitnesses(witnessFactory({ attestationSecret: entry.attestationSecret, witnessValues, merkleProof, merkleProofHolder }))
+        ? CompiledContract.withWitnesses(witnessFactory({ attestationSecret: entry.attestationSecret, merkleProof, merkleProofHolder }))
         : CompiledContract.withVacantWitnesses;
 
     return CompiledContract.make(name, contractClass).pipe(
@@ -860,6 +876,35 @@ async function restoreDustFromSnapshot(entry: FacadeEntry, site: string): Promis
 }
 
 /**
+ * Best-effort pre-submit diagnostics: serialized size and the ledger's own
+ * cost verdict for the transaction. Reads the ledger's cost model
+ * (Transaction.cost) so a "1010: Transaction would exhaust the block
+ * limits" reject is diagnosable from the field (which dimension overflowed,
+ * by how much). Never throws; costing failures only log.
+ */
+async function logTxCost(tx: any, site: string): Promise<void> {
+    try {
+        const bytes = typeof tx?.serialize === 'function' ? tx.serialize() : undefined;
+        const size = bytes?.length ?? bytes?.byteLength;
+        let costSummary = 'n/a';
+        try {
+            const ledger: any = cachedLedger ?? (cachedLedger = await import('@midnight-ntwrk/ledger-v8'));
+            const params = ledger.LedgerParameters?.initialParameters?.()
+                ?? ledger.LedgerParameters?.default?.();
+            if (params && typeof tx?.cost === 'function') {
+                const c = tx.cost(params);
+                costSummary = typeof c === 'object' ? JSON.stringify(c, (_k, v) => typeof v === 'bigint' ? v.toString() : v) : String(c);
+            }
+        } catch (err) {
+            costSummary = `cost() failed: ${(err as Error)?.message}`;
+        }
+        log('info', `${site}: pre-submit tx size=${size ?? '?'}B cost=${costSummary.slice(0, 800)}`);
+    } catch {
+        /* diagnostics only */
+    }
+}
+
+/**
  * facade.submitTransaction with the dust-wedge protection applied: a
  * pre-mempool reject restores the pre-build dust snapshot, every other
  * outcome (success, or a failure where the tx may have reached the pool)
@@ -867,6 +912,7 @@ async function restoreDustFromSnapshot(entry: FacadeEntry, site: string): Promis
  * landed and failed on-chain HAS consumed its guaranteed-section dust fee.
  */
 async function submitWithDustGuard(entry: FacadeEntry, tx: any, site: string): Promise<any> {
+    await logTxCost(tx, site);
     try {
         const txId = await entry.facade.submitTransaction(tx);
         entry.preSubmitDustSnapshot = undefined;
@@ -2103,10 +2149,12 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
         const { contracts } = await loadContractsSdk();
         log('info', `deployContract: starting ${contractName} sess=${sessionId.slice(0, 16)}` +
             (sponsorEntry ? ` (fee sponsored by ${String(sponsorSessionId).slice(0, 16)})` : ''));
+        const constructorArgs = await deployConstructorArgs(contractName, entry);
         const result = await contracts.deployContract(providers, {
             compiledContract,
             privateStateId: registration.privateStateId,
-            initialPrivateState
+            initialPrivateState,
+            ...(constructorArgs.length > 0 ? { args: constructorArgs } : {})
         });
         const pub = result?.deployTxData?.public;
         const out = {
@@ -2127,7 +2175,7 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
         sessionId, proxyId, contractName, registration,
         contractAddress, circuit, args: callArgs,
         indexerHttpUrl, indexerWsUrl, proofServerUrl,
-        networkId, witnessValues, merkleProof, initialPrivateState,
+        networkId, merkleProof, initialPrivateState,
         sponsorSessionId
     }: {
         sessionId: string;
@@ -2141,7 +2189,6 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
         indexerWsUrl: string;
         proofServerUrl: string;
         networkId: string;
-        witnessValues?: { attestedValue: string; valueSalt: string };
         merkleProof?: MerkleProofBundle;
         /** Seeded on this wallet's FIRST call to the contract (see below).
          *  Defaults to `{}`, which is what a stateless contract deploys with. */
@@ -2159,7 +2206,7 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
             await ensureNetworkId(networkId, sdk);
             timer.mark('init');
 
-            const compiledContract = await getOrCompileContract(contractName, registration, entry, witnessValues, merkleProof);
+            const compiledContract = await getOrCompileContract(contractName, registration, entry, merkleProof);
             timer.mark('compile');
             const contractProviders = await buildWorkerContractProviders({
                 indexerHttpUrl, indexerWsUrl, proofServerUrl,
@@ -2255,7 +2302,7 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
         sessionId, proxyId, contractName, registration,
         contractAddress, calls,
         indexerHttpUrl, indexerWsUrl, proofServerUrl,
-        networkId, witnessValues, merkleProof, initialPrivateState,
+        networkId, merkleProof, initialPrivateState,
         sponsorSessionId
     }: {
         sessionId: string;
@@ -2274,9 +2321,8 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
         indexerWsUrl: string;
         proofServerUrl: string;
         networkId: string;
-        /** Batch-level witnesses: bound once to the compiled contract instance
-         *  shared by every call in the scope (same semantics as a single call). */
-        witnessValues?: { attestedValue: string; valueSalt: string };
+        /** Batch-level proof bundle: bound once to the compiled contract
+         *  instance shared by every call in the scope. */
         merkleProof?: MerkleProofBundle;
         initialPrivateState?: unknown;
         /** Optional fee sponsor: this facade balances ['dust'] and submits. */
@@ -2310,7 +2356,7 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
                 : calls;
 
             const compiledContract = await getOrCompileContract(
-                contractName, registration, entry, witnessValues,
+                contractName, registration, entry,
                 holderMode ? undefined : merkleProof,
                 holderMode ? holder : undefined
             );

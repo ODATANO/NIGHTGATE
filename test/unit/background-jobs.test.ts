@@ -643,12 +643,12 @@ describe('startJob: insert row + return jobId', () => {
         const base = { sessionId: 'sess-1', idempotencyKey: null, request: '{}', result: null,
             errorCode: null, errorMessage: null, startedAt: now, finishedAt: null,
             createdAt: now, modifiedAt: now };
-        rows.set('parent-ready', { ...base, ID: 'parent-ready', kind: 'issuePredicateAttestation',
+        rows.set('parent-ready', { ...base, ID: 'parent-ready', kind: 'issueFieldPredicateAttestation',
             status: 'reconciliation_required', parentJobId: null, workflowStep: null,
             commandVersion: 1, command: '{}', requestedBy: 'alice' } as Row);
-        rows.set('child-a', { ...base, ID: 'child-a', kind: 'predicateCommitValue', status: 'succeeded',
+        rows.set('child-a', { ...base, ID: 'child-a', kind: 'fieldAnchorRoot', status: 'succeeded',
             parentJobId: 'parent-ready', workflowStep: 'commitValue' } as Row);
-        rows.set('child-b', { ...base, ID: 'child-b', kind: 'predicateProof', status: 'succeeded',
+        rows.set('child-b', { ...base, ID: 'child-b', kind: 'fieldPredicateProof', status: 'succeeded',
             parentJobId: 'parent-ready', workflowStep: 'provePredicate' } as Row);
 
         expect(await reconcileBackgroundJobs()).toBe(1);
@@ -752,11 +752,11 @@ describe('bounded background scans remain fair beyond one page', () => {
     test('advances past 100 unresolved workflow parents', async () => {
         for (let i = 0; i < 101; i++) {
             putRow(`parent-${String(i).padStart(3, '0')}`, {
-                kind: 'issuePredicateAttestation', chainStatus: 'pending', txHash: null
+                kind: 'issueFieldPredicateAttestation', chainStatus: 'pending', txHash: null
             });
         }
         putRow('child-late', {
-            kind: 'predicateProof', parentJobId: 'parent-100', chainStatus: 'success', txHash: '0xchild'
+            kind: 'fieldPredicateProof', parentJobId: 'parent-100', chainStatus: 'success', txHash: '0xchild'
         });
 
         expect(await refreshSucceededChainOutcomes()).toBe(0);
@@ -814,7 +814,7 @@ describe('confirmChainOutcomesViaIndexer: crawler-free chainStatus advance', () 
     test('skips workflow parents (chainStatus is aggregated from children)', async () => {
         const confirmer = vi.fn(async () => ({ status: 'success' as const }));
         registerChainOutcomeConfirmer(confirmer);
-        putSucceeded('parent-job', { kind: 'issuePredicateAttestation', txHash: '0xparent' });
+        putSucceeded('parent-job', { kind: 'issueFieldPredicateAttestation', txHash: '0xparent' });
         expect(await confirmChainOutcomesViaIndexer()).toBe(0);
         expect(confirmer).not.toHaveBeenCalled();
         expect(rows.get('parent-job')?.chainStatus).toBe('pending');
@@ -1266,7 +1266,7 @@ describe('supersedeQueuedJobs (prewarm boot hygiene)', () => {
         try {
             const count = await supersedeQueuedJobs('connectWalletForSigning', 'sess-1');
             expect(count).toBe(1);
-            // The UPDATE must run on db.tx(cds.context) — a detached write
+            // The UPDATE must run on db.tx(cds.context) - a detached write
             // would wait for a second pool connection while the request tx
             // pins one (deadlock at pool.max=1).
             expect(txSpy).toHaveBeenCalledWith(cdsMock.context);

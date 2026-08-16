@@ -94,13 +94,6 @@ export interface CallArgs {
     registration: ContractRegistrationMeta;
     sessionId: string;
     /**
-     * Per-call ZK-predicate witnesses (`commitValue`/`provePredicate`): the
-     * hidden value (decimal string) + commitment opening (64-hex salt). Passed
-     * to the worker's witness factory; never sent as a circuit arg. Omit for
-     * circuits that declare no per-call witnesses.
-     */
-    witnessValues?: { attestedValue: string; valueSalt: string };
-    /**
      * Per-call proof bundle for the field-bound proof circuits
      * (`proveFieldPredicate` / `proveFieldEquality` / `proveFieldMembership`):
      * scaled field value OR value digest + the DEPTH=4 content path, plus the
@@ -140,9 +133,8 @@ export interface CallBatchArgs {
     contractName: string;
     registration: ContractRegistrationMeta;
     sessionId: string;
-    /** Batch-level witnesses, bound once to the shared compiled contract
-     *  instance (same semantics as the single-call fields on CallArgs). */
-    witnessValues?: { attestedValue: string; valueSalt: string };
+    /** Batch-level proof bundle, bound once to the shared compiled contract
+     *  instance (same semantics as the single-call field on CallArgs). */
     merkleProof?: MerkleProofBundle;
     initialPrivateState?: unknown;
 }
@@ -445,7 +437,6 @@ export class TransactionSubmitter {
             indexerWsUrl:    this.deps.contractProvidersConfig.indexerWsUrl,
             proofServerUrl:  this.deps.contractProvidersConfig.proofServerUrl,
             networkId:       this.deps.network,
-            witnessValues:   args.witnessValues,
             merkleProof:     args.merkleProof,
             initialPrivateState: args.initialPrivateState,
             sponsorSessionId: this.deps.sponsorAccountId
@@ -464,7 +455,6 @@ export class TransactionSubmitter {
             indexerWsUrl:    this.deps.contractProvidersConfig.indexerWsUrl,
             proofServerUrl:  this.deps.contractProvidersConfig.proofServerUrl,
             networkId:       this.deps.network,
-            witnessValues:   args.witnessValues,
             merkleProof:     args.merkleProof,
             initialPrivateState: args.initialPrivateState,
             sponsorSessionId: this.deps.sponsorAccountId

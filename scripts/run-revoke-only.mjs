@@ -78,7 +78,7 @@ async function pollJob(sessionId, jobId, label) {
     if (r.body?.prewarmJobId) {
         const pw = await pollJob(sessionId, r.body.prewarmJobId, 'prewarm');
         if (pw?.failed) {
-            console.log(`\nWARN prewarm FAILED — ${pw.errorCode} — ${pw.errorMessage}`);
+            console.log(`\nWARN prewarm FAILED - ${pw.errorCode} - ${pw.errorMessage}`);
             console.log('     Sync did NOT reach tip (likely WS drop). Revoke will probably time out or 117.');
             console.log('     Proceeding anyway to record the failure mode...');
         } else {
@@ -88,7 +88,7 @@ async function pollJob(sessionId, jobId, label) {
         console.log('WARN no prewarmJobId');
     }
 
-    step('3. revokeDisclosure — IMMEDIATELY, first & only contract op');
+    step('3. revokeDisclosure - IMMEDIATELY, first & only contract op');
     const t0 = Date.now();
     r = await post('/revokeDisclosure', { payloadHash: PAYLOAD, grantee: GRANTEE, sessionId, contractAddress: CONTRACT });
     if (r.status >= 400) fail(`revokeDisclosure → ${r.status}: ${pretty(r.body)}`);
@@ -96,7 +96,7 @@ async function pollJob(sessionId, jobId, label) {
     const res = await pollJob(sessionId, r.body.jobId, 'revoke');
 
     if (res.failed) {
-        console.log(`\nRESULT: revoke FAILED — ${res.errorCode} — ${res.errorMessage}`);
+        console.log(`\nRESULT: revoke FAILED - ${res.errorCode} - ${res.errorMessage}`);
         if (/117|NotNormalized/i.test(`${res.errorCode} ${res.errorMessage}`)) {
             console.log('=> Still 117 even as the first op after a fresh sync → NIGHTGATE waitForSyncedState');
             console.log('   does NOT refresh dust roots (it no-ops once latched). Confirms the worker');
@@ -105,11 +105,11 @@ async function pollJob(sessionId, jobId, label) {
         process.exit(1);
     }
 
-    console.log(`\nRESULT: revoke SUCCEEDED on-chain — tx ${res.txHash}`);
+    console.log(`\nRESULT: revoke SUCCEEDED on-chain - tx ${res.txHash}`);
     step('4. confirm DisclosureGrants.active flipped to false');
     const filter = encodeURIComponent(`contractAddress eq '${CONTRACT}' and grantee eq '${GRANTEE}'`);
     const gr = await get(`/DisclosureGrants?$filter=${filter}`);
     const row = (gr.body?.value || [])[0];
     console.log(`   active = ${row?.active}  revokedTxHash = ${row?.revokedTxHash || '(pending index)'}`);
-    console.log('\nREVOKE-ONLY EXPERIMENT PASSED — first-op-after-fresh-sync clears 117.');
+    console.log('\nREVOKE-ONLY EXPERIMENT PASSED - first-op-after-fresh-sync clears 117.');
 })();

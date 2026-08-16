@@ -5,10 +5,10 @@ All OData V4 actions and functions exposed by NIGHTGATE, with signatures, reques
 OData distinguishes between **actions** (POST, may have side effects) and **functions** (GET, side-effect-free). NIGHTGATE follows this: write operations are actions, read-only operations are functions.
 
 **Base path conventions** in examples:
-- `http://localhost:4004/api/v1/nightgate/<actionName>` — main service
-- `http://localhost:4004/api/v1/indexer/<functionName>()` — indexer service
-- `http://localhost:4004/api/v1/analytics/<functionName>()` — analytics service
-- `http://localhost:4004/api/v1/admin/<actionName>` — admin service
+- `http://localhost:4004/api/v1/nightgate/<actionName>` - main service
+- `http://localhost:4004/api/v1/indexer/<functionName>()` - indexer service
+- `http://localhost:4004/api/v1/analytics/<functionName>()` - analytics service
+- `http://localhost:4004/api/v1/admin/<actionName>` - admin service
 
 ## Async job model (write actions)
 
@@ -18,7 +18,7 @@ Every action that submits an on-chain transaction is **asynchronous**: it return
 
 `status` (server-side workflow lifecycle): `pending | running | external_execution | submitted | reconciliation_required | succeeded | failed`. On success, `result` is a JSON string of the action's result shape; on failure, `errorCode` + `errorMessage` carry the classified error (see [Error model](#error-model)).
 
-`reconciliation_required` is an explicit **terminal** state: execution was interrupted after an external effect may have occurred. The caller must NOT auto-retry — a fresh attempt needs a new `idempotencyKey`. The single-instance reconciler resolves such jobs automatically from durable chain evidence (a finalized `PendingSubmission` plus a `System.Events` outcome) once it becomes available.
+`reconciliation_required` is an explicit **terminal** state: execution was interrupted after an external effect may have occurred. The caller must NOT auto-retry - a fresh attempt needs a new `idempotencyKey`. The single-instance reconciler resolves such jobs automatically from durable chain evidence (a finalized `PendingSubmission` plus a `System.Events` outcome) once it becomes available.
 
 `chainStatus` (`null | pending | success | failure`) is the on-chain execution outcome, **independent of `status`**, populated later from `System.Events`: `status: succeeded` means the submission workflow completed, while `chainStatus: success` confirms the transaction was finalized and executed successfully on-chain. A `chainStatus: failure` on a `succeeded` job means the tx finalized but the contract call reverted. The response also carries `submissionId`, `txHash`, `chainFinalizedAt`, and lease/attempt/timestamp bookkeeping fields.
 
@@ -53,7 +53,7 @@ Response:
 
 ### `connectWalletForSigning(sessionId, mnemonic, seedHex?, accountIndex?) → { sessionId, signingEnabled, prewarmJobId, prewarmStatus }`
 
-Upgrade a read-only session with **signing capability**, encrypting the BIP39 seed at rest. Keys are HD-derived per Midnight role (zswap / dust / night) to match Lace — see `srv/utils/wallet-hd.ts`. Schedules a tracked pre-warm job that syncs the wallet SDK in the worker; poll `getJobStatus(prewarmJobId, sessionId)` to know when sync-to-tip is done before submitting.
+Upgrade a read-only session with **signing capability**, encrypting the BIP39 seed at rest. Keys are HD-derived per Midnight role (zswap / dust / night) to match Lace - see `srv/utils/wallet-hd.ts`. Schedules a tracked pre-warm job that syncs the wallet SDK in the worker; poll `getJobStatus(prewarmJobId, sessionId)` to know when sync-to-tip is done before submitting.
 
 | Field | Type | Constraints |
 |---|---|---|
@@ -101,11 +101,11 @@ Source funds come from the same ledger as the receiver. There is no cross-ledger
 **Rate limit:** 10/min per client IP.
 
 **Errors:**
-- 400 — invalid address prefix, malformed amount, TTL in past
-- 404 — session not found
-- 412 — session not signing-enabled
-- 429 — rate-limited
-- 500 — `Wallet.InsufficientFunds`, `Wallet.Sync` errors from SDK
+- 400 - invalid address prefix, malformed amount, TTL in past
+- 404 - session not found
+- 412 - session not signing-enabled
+- 429 - rate-limited
+- 500 - `Wallet.InsufficientFunds`, `Wallet.Sync` errors from SDK
 
 ```bash
 curl -X POST http://localhost:4004/api/v1/nightgate/sendNight \
@@ -139,7 +139,7 @@ Reverse: deregister ALL the wallet's registered NIGHT UTXOs so they become spend
 
 Deploy a Compact-compiled contract. The contract must be registered via `cds.requires.nightgate.contracts.<ref>` (or programmatically via `registerContract()`).
 
-**Async** (see [Async job model](#async-job-model-write-actions)): returns `{ jobId, status: "pending" }` immediately; poll `getJobStatus(jobId, sessionId)`. The job result on success is `{ submissionId, txHash, contractAddress, status }` (here `status` is the `PendingSubmissions` lifecycle status — distinct from the job status).
+**Async** (see [Async job model](#async-job-model-write-actions)): returns `{ jobId, status: "pending" }` immediately; poll `getJobStatus(jobId, sessionId)`. The job result on success is `{ submissionId, txHash, contractAddress, status }` (here `status` is the `PendingSubmissions` lifecycle status - distinct from the job status).
 
 | Field | Type | Notes |
 |---|---|---|
@@ -153,9 +153,9 @@ A row is inserted into `PendingSubmissions` BEFORE the SDK is invoked (crash-rec
 **Rate limit:** 5/hour per session.
 
 **Errors:**
-- 400 — `Wallet.InsufficientFunds` (insufficient dust), `OnChainStatus:FailEntirely`, `MalformedResult`
-- 404 — contract not registered
-- 503 — retryable transient (network, 1016 on preprod)
+- 400 - `Wallet.InsufficientFunds` (insufficient dust), `OnChainStatus:FailEntirely`, `MalformedResult`
+- 404 - contract not registered
+- 503 - retryable transient (network, 1016 on preprod)
 
 ### `submitContractCall(contractAddress, circuit, compiledArtifactRef, sessionId, args, idempotencyKey?, initialPrivateState?, sponsorSessionId?) → { jobId, status }`
 
@@ -255,7 +255,7 @@ flow.
 #### Per-tx fee sponsoring (`sponsorSessionId`)
 
 Every submit action (`deployContract`, `submitContractCall`,
-`submitContractCallBatch`, `anchorDocument`, `issuePredicateAttestation`,
+`submitContractCallBatch`, `anchorDocument`,
 `issueFieldPredicateAttestation`, `issueFieldPredicateAttestationBatch`,
 `grantDisclosure`, `revokeDisclosure`,
 `registerPassport`, `deregisterFromDustGeneration`) accepts
@@ -275,7 +275,7 @@ cds config `feeSponsorSessions`. A foreign, non-listed id is rejected with
 #### Encoding circuit args
 
 `args` is a JSON array, but a compiled Compact circuit expects native value types
-that JSON can't carry directly — a `Bytes<N>` parameter must arrive as a real
+that JSON can't carry directly - a `Bytes<N>` parameter must arrive as a real
 `Uint8Array(N)`, and a `Uint<N>` as a `BigInt`. NIGHTGATE coerces each element
 **before** invoking the circuit, driven by the circuit's declared parameter types
 (read from the compiled artifact's `contract-info.json`). Two encodings are
@@ -296,10 +296,10 @@ circuit), use **tagged values**, which are honored regardless of metadata:
 
 An **untagged** argument for a circuit whose types can't be introspected is
 rejected with a clear **400** (rather than silently passed through to fail inside
-the circuit) — tag the value, or fix the registered contract's artifact path so
+the circuit) - tag the value, or fix the registered contract's artifact path so
 its `contract-info.json` resolves.
 
-Example — calling `bindPassport(passportId: Bytes<32>, payload_hash: Bytes<32>)`:
+Example - calling `bindPassport(passportId: Bytes<32>, payload_hash: Bytes<32>)`:
 
 ```jsonc
 // convention (introspected): each 64-hex string becomes a Uint8Array(32)
@@ -315,21 +315,29 @@ deep inside the circuit's type guard.
 
 ## Document anchoring
 
-### `anchorDocument(sha256, storageRef, sessionId, contractAddress, contentType?, size?, metadata?, compiledArtifactRef?) → { jobId, status, documentId }`
+### `anchorDocument(sha256, storageRef, sessionId, contractAddress, contentType?, size?, metadata?, compiledArtifactRef?, nonce?) → { jobId, status, documentId }`
 
-Anchor a document's content hash on-chain via the AttestationVault `attest` circuit. NIGHTGATE stores only the hash + a caller-supplied `storageRef` (`file://` | `s3://` | `ipfs://`) — **never the bytes**. `documentId` is returned synchronously (the `Documents` row is inserted up-front); the job result is `{ documentId, attestationId, txHash, anchoredAt }`. `compiledArtifactRef` defaults to `attestation-vault`. **Rate limit:** 10/hour per session.
+Anchor a document's content hash on-chain via the AttestationVault `attest` circuit. NIGHTGATE stores only the hash + a caller-supplied `storageRef` (`file://` | `s3://` | `ipfs://`) - **never the bytes**. `documentId` is returned synchronously (the `Documents` row is inserted up-front, recording the caller as owner plus the anchoring `contractAddress`, network and artifact as evidence context); the job result is `{ documentId, attestationId, txHash, anchoredAt }`. `compiledArtifactRef` defaults to `attestation-vault`. `Documents` entity reads are owner-scoped (admins unfiltered). With `nonce` (64 hex, from `prepareAnchorCommitment`), the anchor runs as the guarded REVEAL (`attestGuarded` mode 1) against a previously committed commitment; a plain attest that front-ran the reveal is taken over in-circuit because its sequence number is newer than the commitment's. **Rate limit:** 10/hour per session.
+
+### `prepareAnchorCommitment(sha256, metadata?, nonce?) → { commitment, nonce, metadataHash }` (compute-only)
+
+Guarded (commit-reveal) anchoring, phase 0: computes `commitment = persistentHash{sha256, metadataHash, nonce}` (byte-identical to the circuit's in-circuit recompute) plus a random `nonce` when none is supplied. STORE the nonce and keep it SECRET until reveal: it is exactly what a mempool front-runner cannot forge. `metadata` must equal the later `anchorDocument` metadata. Why the guard exists: plain attest is first-come-first-served and insert-once, so a mempool observer could permanently claim a visible payload hash; commit-reveal closes that window for hashes that are secret until reveal (publicly known identifiers use `registerPassport` pre-assignment instead).
+
+### `commitDocumentAnchor(commitment, sessionId, contractAddress, compiledArtifactRef?, idempotencyKey?, sponsorSessionId?) → { jobId, status }`
+
+Guarded anchoring, phase 1: records the opaque commitment on-chain (`attestGuarded` mode 0; a mempool observer learns nothing about the payload). After the job finalizes, run `anchorDocument` with the SAME sha256/metadata plus the `nonce` (phase 2). Note: the reveal proves against a ledger snapshot; if the contested attest lands between proving and application, the reveal fails once and succeeds on re-prove (takeover branch). **Rate limit:** shared with `anchorDocument`.
 
 ### `verifyDocument(documentId, providedSha256) → { verified, anchoredTxHash, anchoredAt, originalSha256 }` (function)
 
-`verified: true` iff the hash matches the stored `sha256`, `anchoredTxHash` is set, and that tx resolves to a `SUCCESS` result — or, when the crawler is disabled/lagging, confirmed directly against live contract state via the optional `contractAddress`. A hash mismatch returns `verified: false` (not an error).
+`verified: true` iff the hash matches the stored `sha256`, `anchoredTxHash` is set, and that tx resolves to a `SUCCESS` result - or, when the crawler is disabled/lagging, confirmed directly against live contract state. The vault, artifact and network recorded at anchor time are authoritative for that state check: caller-supplied `contractAddress`/`compiledArtifactRef` may only CONFIRM them (a different one is a 400) and the fallback reads the RECORDED network's indexer, so another vault, artifact generation or chain attesting the same public hash cannot make the document appear verified; only legacy rows without recorded coordinates use the caller's values. A hash mismatch returns `verified: false` (not an error). Callable by any authenticated user holding the documentId (an unguessable capability handle; the response exposes no `storageRef`).
 
 ## Document ingestion (compute-only)
 
 Synchronous helpers that turn structured data into the proof inputs the predicate actions consume. Nothing is persisted, no job is started; responses carry WITNESS material and are never logged.
 
-### `prepareDocumentProof(documentJson, proofFieldsJson, compiledArtifactRef?) → { payloadHash, canonicalDocument, contentRoot, fields, emptyFields }`
+### `prepareDocumentProof(documentJson, proofFieldsJson, saltSeed?, compiledArtifactRef?) → { payloadHash, canonicalDocument, contentRoot, fields, emptyFields, schemaId, schema, leaves, opening }`
 
-Canonical JSON (recursively key-sorted) → blake2b-256 `payloadHash` (the value `anchorDocument` anchors), plus a depth-4 Merkle `contentRoot` over the ORDERED `proofFieldsJson` list (leaf index = list position; keep the order stable across anchor and proof) with per-field inclusion paths. `proofFieldsJson` is up to 16 `{ field, kind?, scale? }` entries: `kind: 'uint'` (default; numeric, scaled by `scale`, default 1000) or `kind: 'bytes'` (string value, entered as the blake2b-256 digest of the EXACT string; feeds the equality/membership actions; `scale` not allowed). `field` is a dot-separated path (numeric segments index arrays; a literal top-level key containing dots wins). Absent values occupy a fixed empty leaf and are reported in `emptyFields`. Leaf/node hashing goes through the contract artifact's exported pure circuits, so the root is byte-identical to the in-circuit fold. `fields` is a JSON array of `{ field, fieldKey, kind, value?, valueDigest?, siblings, dirs }`. **Rate limit:** 120/hour per client.
+Canonical JSON (recursively key-sorted) → blake2b-256 `payloadHash` (the value `anchorDocument` anchors), plus a depth-4 SALTED Merkle `contentRoot` over the ORDERED `proofFieldsJson` list (leaf index = list position; keep the order stable across anchor and proof) with per-field inclusion paths. `proofFieldsJson` is up to 16 `{ field, kind?, scale? }` entries: `kind: 'uint'` (default; numeric, scaled by `scale`, default 1000) or `kind: 'bytes'` (string value, entered as the blake2b-256 digest of the EXACT string; feeds the equality/membership actions; `scale` not allowed). `field` is a dot-separated path (numeric segments index arrays; a literal top-level key containing dots wins). Every leaf carries a per-slot salt derived from a per-document 32-byte seed (`saltSeed`: random by default, caller-supplied for a deterministic re-prepare of an already-anchored payload); absent values occupy the salted absent leaf (padding key `nightgate/empty-leaf/v2` ASCII zero-padded) and are reported in `emptyFields`, so a shared leaf layer reveals neither values nor the presence pattern. Leaf/node/descriptor hashing goes through the contract artifact's exported pure circuits, so root and schemaId are byte-identical to the in-circuit recompute. `fields` is a JSON array of `{ field, fieldKey, kind, value?, valueDigest?, salt, siblings, dirs }` (the `salt` feeds every single-field proof action as `fieldSalt`). `schemaId` is the schema ROOT over the 16 slot descriptors `{ fieldKey, kind, scale }` (returned as `schema`); it is anchored next to the content root and PROVEN by the comparison circuit. `opening` (`{ saltSeed, slots[16] }`) is the cross-root witness bundle: STORE it with the document; losing the seed makes the anchored root unprovable, leaking it makes shared leaf hashes dictionary-testable. **Rate limit:** 120/hour per client.
 
 ### `prepareMembershipSet(allowedValuesJson, value?, valueDigest?, compiledArtifactRef?) → { setRoot, memberCount, setSiblingsJson?, setDirsJson? }`
 
@@ -339,47 +347,51 @@ Consumers who need the canonical rule OUTSIDE a server context (anonymous read-s
 
 ## ZK predicate attestations
 
-Prove statements about anchored field values without revealing them (on-chain-verified): numeric predicates against a public threshold, bytes equality against a public digest, and set membership in a public allow-list. See [the AttestationVault contract](../contracts/attestation-vault).
+Prove statements about anchored field values without revealing them (on-chain-verified): numeric predicates against a public threshold, bytes equality against a public digest, and set membership in a public allow-list. See [the AttestationVault contract](../contracts/attestation-vault). Every claim kind is root-bound; the commitment-only `issuePredicateAttestation` lane (commitValue/provePredicate) was removed in 0.16.0 because its on-chain commitment was overwritable while recorded claims did not embed it.
 
-### `issuePredicateAttestation(payloadHash, value, predicate, threshold, sessionId, contractAddress, salt?, unit?, valueCommitment?, compiledArtifactRef?) → { jobId, status, predicateAttestationId }`
+### `issueFieldPredicateAttestation(payloadHash, fieldKey, value, fieldSalt, predicate, threshold, sessionId, contractAddress, contentRoot?, schemaId?, siblingsJson?, dirsJson?, unit?, compiledArtifactRef?, idempotencyKey?, sponsorSessionId?) → { jobId, status, predicateAttestationId }`
 
-The payload must already be attested. Submits `commitValue` then `provePredicate`. A job with `status=succeeded` means the server-side submission workflow completed; inspect `getJobStatus.chainStatus` or call `verifyPredicateAttestation` for the later canonical chain outcome. `value` is a scaled integer (caller owns float scaling); it is used only as a circuit witness and **never persisted**. `predicate`: `lessOrEqual` | `greaterOrEqual`. `salt` (64-hex commitment opening) is generated if omitted. Job result: `{ predicateAttestationId, payloadHash, claim, proof }` (PAC-envelope shape). **Rate limit:** 10/hour per session.
+Field-bound predicate proof: the proven value is cryptographically bound to a SPECIFIC passport field via Merkle inclusion against an anchored content root, so a verifier knows the value came from THIS passport's `fieldKey`, not an arbitrary committed number. The caller builds the content root + inclusion path off-chain with the contract's exported `pureCircuits` (hashing matches in-circuit). If `contentRoot` is supplied it is anchored first (`anchorContentRoot`, together with the mandatory `schemaId` from `prepareDocumentProof`), then `proveFieldPredicate` runs with the Merkle witnesses. `value` is the scaled integer field value (witness only, never persisted); `value`/`threshold` must fit Uint<64>. `siblingsJson`/`dirsJson`: JSON arrays of the DEPTH=4 inclusion path (4 × 64-hex siblings; 4 booleans). Job result: `{ predicateAttestationId, payloadHash, claim, proof }` (PAC-envelope shape). **Rate limit:** 10/hour per session.
 
-### `issueFieldPredicateAttestation(payloadHash, fieldKey, value, predicate, threshold, sessionId, contractAddress, contentRoot?, siblingsJson?, dirsJson?, unit?, compiledArtifactRef?, idempotencyKey?, sponsorSessionId?) → { jobId, status, predicateAttestationId }`
+### `issueFieldPredicateAttestationBatch(payloadHash, claimsJson, sessionId, contractAddress, contentRoot?, schemaId?, compiledArtifactRef?, idempotencyKey?, sponsorSessionId?) → { jobId, status, claims, droppedDuplicates }`
 
-Field-bound predicate proof (hardened model). Like `issuePredicateAttestation`, but the proven value is cryptographically bound to a SPECIFIC passport field via Merkle inclusion against an anchored content root, so a verifier knows the value came from THIS passport's `fieldKey`, not an arbitrary committed number. The caller builds the content root + inclusion path off-chain with the contract's exported `pureCircuits` (hashing matches in-circuit). If `contentRoot` is supplied it is anchored first (`anchorContentRoot`), then `proveFieldPredicate` runs with the Merkle witnesses. `value` is the scaled integer field value (witness only, never persisted). `siblingsJson`/`dirsJson`: JSON arrays of the DEPTH=4 inclusion path (4 × 64-hex siblings; 4 booleans). **Rate limit:** 10/hour per session (shared with `issuePredicateAttestation`).
+Batch pendant to the single field actions: prove up to 8 field-bound claims on ONE passport in ONE transaction (one balancing round, one submit, one confirmation wait, one fee event; with `sponsorSessionId` one dust spend for the whole batch). `claimsJson` entries may MIX the five claim kinds, discriminated by `predicate`: numeric `{ fieldKey, value, salt, siblings, dirs, predicate: 'lessOrEqual'|'greaterOrEqual', threshold, unit? }`, equality `{ fieldKey, expectedValue|expectedDigest, salt, siblings, dirs, predicate: 'bytesEquality' }`, membership `{ fieldKey, value|valueDigest, salt, allowedValues | setRoot+setSiblings+setDirs, siblings, dirs, predicate: 'setMembership' }`, cross-root integrity `{ predicate: 'documentIntegrity', payloadHashB, allowedMask, schema, openingA, openingB }`, cross-root diff `{ predicate: 'documentDiff', payloadHashB, k, schema, openingA, openingB }`, each validated like its single action. The cross-root kinds carry no fieldKey/inclusion path; document A is the batch `payloadHash`, and an in-batch `contentRoot` anchor is document A's root (document B's must already be anchored). If `contentRoot` is supplied it is anchored (with the mandatory `schemaId`) as the FIRST call of the SAME batch (segment ordering pins the anchor ahead of the proofs) and occupies one of the 8 call slots (max 7 claims with anchor). Exact duplicate claim tuples (numeric: fieldKey+threshold+predicate, equality: fieldKey+expectedDigest, membership: fieldKey+setRoot, integrity: payloadHashB+allowedMask, diff: payloadHashB+k) are dropped server-side (`droppedDuplicates`); claim keys are idempotent on-chain, so this is only a proving-time optimization. One `PredicateAttestations` row per claim, all sharing one `provenTxHash` on success; `claims` in the response is a JSON array of `{ predicateAttestationId, fieldKey, predicate, ... }` with the kind's statement fields. Proving work stays additive (N proofs = N provings, sequential). Failure: a false claim fails at LOCAL proving time (nothing submitted, no row proven); after submission the ledger's fallible phase can finalize PARTIAL_SUCCESS, in which case the job fails with `OnChainStatus:...` and callers verify per claim via `verifyPredicateAttestation` (crawler-free, no txHash needed). **Rate limit:** counts N claims against the shared 10/hour predicate budget, not one call.
 
-### `issueFieldPredicateAttestationBatch(payloadHash, claimsJson, sessionId, contractAddress, contentRoot?, compiledArtifactRef?, idempotencyKey?, sponsorSessionId?) → { jobId, status, claims, droppedDuplicates }`
+### `issueFieldEqualityAttestation(payloadHash, fieldKey, expectedValue|expectedDigest, fieldSalt, sessionId, contractAddress, contentRoot?, schemaId?, siblingsJson?, dirsJson?, compiledArtifactRef?, idempotencyKey?, sponsorSessionId?) → { jobId, status, predicateAttestationId }`
 
-Batch pendant to the single field actions: prove up to 8 field-bound claims on ONE passport in ONE transaction (one balancing round, one submit, one confirmation wait, one fee event; with `sponsorSessionId` one dust spend for the whole batch). `claimsJson` entries may MIX the three claim kinds, discriminated by `predicate`: numeric `{ fieldKey, value, siblings, dirs, predicate: 'lessOrEqual'|'greaterOrEqual', threshold, unit? }`, equality `{ fieldKey, expectedValue|expectedDigest, siblings, dirs, predicate: 'bytesEquality' }`, membership `{ fieldKey, value|valueDigest, allowedValues | setRoot+setSiblings+setDirs, siblings, dirs, predicate: 'setMembership' }`, each validated like its single action. If `contentRoot` is supplied it is anchored as the FIRST call of the SAME batch (segment ordering pins the anchor ahead of the proofs) and occupies one of the 8 call slots (max 7 claims with anchor). Exact duplicate claim tuples (numeric: fieldKey+threshold+predicate, equality: fieldKey+expectedDigest, membership: fieldKey+setRoot) are dropped server-side (`droppedDuplicates`); claim keys are idempotent on-chain, so this is only a proving-time optimization. One `PredicateAttestations` row per claim, all sharing one `provenTxHash` on success; `claims` in the response is a JSON array of `{ predicateAttestationId, fieldKey, predicate, ... }` with the kind's statement fields. Proving work stays additive (N proofs = N provings, sequential). Failure: a false claim fails at LOCAL proving time (nothing submitted, no row proven); after submission the ledger's fallible phase can finalize PARTIAL_SUCCESS, in which case the job fails with `OnChainStatus:...` and callers verify per claim via `verifyPredicateAttestation` (crawler-free, no txHash needed). **Rate limit:** counts N claims against the shared 10/hour predicate budget, not one call.
+Field-bound EQUALITY proof for a bytes-valued (string) field (`proveFieldEquality`): the anchored content root carries, at `fieldKey`, exactly the value whose blake2b-256 digest is `expectedDigest`. Pass exactly one of `expectedValue` (raw string; the server digests the EXACT string, no trimming) or `expectedDigest` (64 hex). The digest is PUBLIC (it is the statement), so this is an authenticity/binding proof, not a confidentiality feature: for low-entropy values the digest is dictionary-guessable. The field must have entered the content root as a bytes leaf (`prepareDocumentProof` with `kind: 'bytes'`); `siblingsJson`/`dirsJson` are the DEPTH=4 path as on the numeric action. If `contentRoot` is supplied it is anchored first (requires `schemaId`). **Rate limit:** 10/hour per session (shared predicate budget).
 
-### `issueFieldEqualityAttestation(payloadHash, fieldKey, expectedValue|expectedDigest, sessionId, contractAddress, contentRoot?, siblingsJson?, dirsJson?, compiledArtifactRef?, idempotencyKey?, sponsorSessionId?) → { jobId, status, predicateAttestationId }`
-
-Field-bound EQUALITY proof for a bytes-valued (string) field (`proveFieldEquality`): the anchored content root carries, at `fieldKey`, exactly the value whose blake2b-256 digest is `expectedDigest`. Pass exactly one of `expectedValue` (raw string; the server digests the EXACT string, no trimming) or `expectedDigest` (64 hex). The digest is PUBLIC (it is the statement), so this is an authenticity/binding proof, not a confidentiality feature: for low-entropy values the digest is dictionary-guessable. The field must have entered the content root as a bytes leaf (`prepareDocumentProof` with `kind: 'bytes'`); `siblingsJson`/`dirsJson` are the DEPTH=4 path as on the numeric action. If `contentRoot` is supplied it is anchored first. **Rate limit:** 10/hour per session (shared predicate budget).
-
-### `issueFieldMembershipAttestation(payloadHash, fieldKey, value|valueDigest, allowedValuesJson | setRoot+setSiblingsJson+setDirsJson, sessionId, contractAddress, contentRoot?, siblingsJson?, dirsJson?, compiledArtifactRef?, idempotencyKey?, sponsorSessionId?) → { jobId, status, predicateAttestationId }`
+### `issueFieldMembershipAttestation(payloadHash, fieldKey, value|valueDigest, allowedValuesJson | setRoot+setSiblingsJson+setDirsJson, fieldSalt, sessionId, contractAddress, contentRoot?, schemaId?, siblingsJson?, dirsJson?, compiledArtifactRef?, idempotencyKey?, sponsorSessionId?) → { jobId, status, predicateAttestationId }`
 
 Field-bound SET-MEMBERSHIP proof (`proveFieldMembership`): the field's HIDDEN value is one of a public allow-list, without revealing which one. Two Merkle folds over the same witnessed digest: the DEPTH=4 content fold binds it to THIS passport's `fieldKey`, the DEPTH=6 set fold proves it is a leaf of the canonical membership-set tree (up to 64 distinct values; see `prepareMembershipSet` for the canonical rule). Pass exactly one of `value` (raw string) or `valueDigest` (64 hex); both stay witness material, never persisted. Supply the list as `allowedValuesJson` (the server builds root + path and rejects 400 when the value is not in the list, BEFORE any proving) or precomputed as `setRoot` + `setSiblingsJson`/`setDirsJson` (6 × 64-hex siblings; 6 booleans). **Rate limit:** 10/hour per session (shared predicate budget).
 
-### `verifyPredicateAttestation(predicateAttestationId) → { verified, predicate, threshold, unit, expectedDigest, setRoot, valueCommitment, provenTxHash, provenAt }` (function)
+### `issueDocumentIntegrityAttestation(payloadHashA, payloadHashB, allowedMask, schemaJson, openingAJson, openingBJson, sessionId, contractAddress, contentRootA?, contentRootB?, schemaId?, compiledArtifactRef?, idempotencyKey?, sponsorSessionId?) → { jobId, status, predicateAttestationId }`
 
-`verified: true` iff `provenTxHash` resolves to a `SUCCESS` result, or confirmed directly against live contract state when the crawler is disabled/lagging (the claim key is recomputed from the row; field-bound rows check `field_predicate_results`, `bytesEquality` rows `field_equality_results`, `setMembership` rows `field_membership_results`).
+Cross-root INTEGRITY proof (`proveDocumentComparison` mode 0): document B differs from document A ONLY in the slots flagged by the packed 16-bit `allowedMask` (bit i = slot i may differ; 0 = identical values; 65535 is rejected as vacuous), both bound to their anchored content roots, values hidden. The canonical version-integrity claim for re-anchored passports. v4 witness model: `schemaJson` is the SHARED 16-entry descriptor list and `openingAJson`/`openingBJson` are the documents' full openings (`prepareDocumentProof` returns them as `schema` and `opening`); the circuit recomputes the schema root AND both content roots in-circuit, so the anchored schema id is PROVEN to describe the trees (a forged schema label fails the proof) and the per-slot comparison runs on values under the shared schema. Both documents MUST be anchored under the SAME `schemaId`; a slot that changed, appeared or disappeared outside the mask fails at LOCAL proving time, nothing submitted. `payloadHashA != payloadHashB` (also asserted in-circuit); (A, B) order is part of the claim key. Optional `contentRootA`/`contentRootB` anchor first with `schemaId` (each a separate transaction; the batch action's `documentIntegrity` kind is the one-transaction path). **Rate limit:** 10/hour per session (shared predicate budget).
+
+### `issueDocumentDiffAttestation(payloadHashA, payloadHashB, k, schemaJson, openingAJson, openingBJson, sessionId, contractAddress, contentRootA?, contentRootB?, schemaId?, compiledArtifactRef?, idempotencyKey?, sponsorSessionId?) → { jobId, status, predicateAttestationId }`
+
+Cross-root DISTINCTNESS proof (`proveDocumentComparison` mode 1): at least `k` (1..16) of the 16 aligned slots differ between two anchored documents, without revealing which slots or what values. k=1 is "provably not the same document". Same v4 witness model as the integrity mode (`schemaJson` + `openingAJson`/`openingBJson`; witness material, never persisted). A counted difference is a value or presence change under the shared schema; both-empty compares equal; padding slots never count. Schema parity is structural: ONE witnessed descriptor list must fold to BOTH anchored schema ids. Fewer than k actual differences fail at LOCAL proving time. **Rate limit:** 10/hour per session (shared predicate budget).
+
+### `verifyPredicateAttestation(predicateAttestationId) → { verified, predicate, threshold, unit, expectedDigest, setRoot, payloadHashB, allowedMask, provenTxHash, provenAt }` (function)
+
+`verified: true` iff `provenTxHash` resolves to a `SUCCESS` result, or confirmed directly against live contract state when the crawler is disabled/lagging (the claim key is recomputed from the row; numeric rows check `field_predicate_results`, `bytesEquality` rows `field_equality_results`, `setMembership` rows `field_membership_results`, `documentIntegrity` rows `document_integrity_results`, `documentDiff` rows `document_diff_results`; a diff row's k rides in `threshold`).
 
 ## Crawler-free state verification
 
 Read LIVE contract state via `queryContractState`: no block crawler, no local txHash, no server-side row required. Made for wallet-submitted transactions NIGHTGATE never saw (browser signs, no jobId). Both return clean negatives (`verified: false`, not a 5xx) when the state is absent or no live provider is configured. `network` (optional, e.g. `preview` | `preprod`) reads ANOTHER network's public indexer instead of the configured one (stateless, wallet-free; unknown values are a 400; per-network endpoints via `cds.requires.nightgate.networks.<network>.*`).
 
-### `verifyAttestationState(contractAddress, payloadHash, contentRoot?, compiledArtifactRef?, network?) → { verified, attested, contentRootOk, attesterId }` (function)
+### `verifyAttestationState(contractAddress, payloadHash, contentRoot?, schemaId?, compiledArtifactRef?, network?) → { verified, attested, contentRootOk, schemaOk, attesterId }` (function)
 
-Confirms `payloadHash` is present in the vault's attestation map (and, when `contentRoot` is supplied, that it equals the anchored content root for that payload). Keyed entirely by the caller-supplied `payloadHash`: no enumeration.
+Confirms `payloadHash` is present in the vault's attestation map (and, when `contentRoot` / `schemaId` are supplied, that they equal the anchored content root / schema id for that payload). Keyed entirely by the caller-supplied `payloadHash`: no enumeration. TRUST NOTE: an anchor is the anchoring attester's statement about their own payload. A verifier of cross-party claims must ALSO check `attesterId` against the identity it trusts and, for cross-root claims, `schemaId` against the canonical schema of the expected field panel; the comparison circuit proves the anchored schema id describes the trees, and this function makes both checks crawler-free.
 
-### `verifyPredicateState(contractAddress, payloadHash, predicate, threshold?, fieldKey?, expectedDigest?, setRoot?, compiledArtifactRef?, network?) → { verified, proven }` (function)
+### `verifyPredicateState(contractAddress, payloadHash, predicate, threshold?, fieldKey?, expectedDigest?, setRoot?, payloadHashB?, allowedMask?, k?, compiledArtifactRef?, network?) → { verified, proven }` (function)
 
-The id-free counterpart to `verifyPredicateAttestation`: recomputes the on-chain claim key off-chain from the supplied coordinates and confirms the vault recorded a true result for it. Numeric predicates: supply `threshold` (the SAME scaled integer the circuit hashed into the claim key; a scaling mismatch silently yields `verified: false`) and `fieldKey` for a field-bound proof (`field_predicate_results`) or omit it for a plain one (`predicate_results`). Bytes kinds: `predicate: 'bytesEquality'` + `fieldKey` + `expectedDigest` (`field_equality_results`), or `predicate: 'setMembership'` + `fieldKey` + `setRoot` (`field_membership_results`); `threshold` is ignored for both.
+The id-free counterpart to `verifyPredicateAttestation`: recomputes the on-chain claim key off-chain from the supplied coordinates and confirms the vault recorded a true result for it. Numeric predicates: supply `fieldKey` (numeric claims are field-bound; the commitment-only plain kind was removed in 0.16.0) and `threshold` (the SAME scaled integer the circuit hashed into the claim key; a scaling mismatch silently yields `verified: false`); results live in `field_predicate_results`. Bytes kinds: `predicate: 'bytesEquality'` + `fieldKey` + `expectedDigest` (`field_equality_results`), or `predicate: 'setMembership'` + `fieldKey` + `setRoot` (`field_membership_results`); `threshold` is ignored for both. Cross-root kinds: `predicate: 'documentIntegrity'` + `payloadHashB` + `allowedMask` (`document_integrity_results`), or `predicate: 'documentDiff'` + `payloadHashB` + `k` (`document_diff_results`); `payloadHash` is document A and the (A, B) order must match the proving order (it is part of the claim key). Every claim key additionally embeds the payload's ATTESTATION EPOCH (cross-root: both epochs), which this function reads from the same live state automatically: claims recorded during a front-runner's ownership window stop verifying after a guarded-attest takeover moved the epoch. External recomputes via `computeFieldPredicate/Equality/MembershipClaimKey` and the cross-root computers must pass the current epoch(s) from `attestation_seqs`.
 
 ## Disclosure grants
 
-Surface the AttestationVault tiered-disclosure ACL (who is entitled to which tier of an attestation, on-chain) plus the passport-ownership registry. The grant/revoke circuits are attester-gated, `registerPassport` is registrar-gated (each enforced in-circuit; an unauthorized caller's tx is rejected). `level`: `0` = public, `1` = legitimate-interest, `2` = authority (EU Battery Reg Annex XIII tiers). See [the AttestationVault contract](../contracts/attestation-vault). **Note:** delivering tier-specific *cleartext* stays off-chain (consumer `after READ` redaction) — only entitlement is on-chain.
+Surface the AttestationVault tiered-disclosure ACL (who is entitled to which tier of an attestation, on-chain) plus the passport-ownership registry. The grant/revoke circuits are attester-gated, `registerPassport` is registrar-gated (each enforced in-circuit; an unauthorized caller's tx is rejected). `level`: `0` = public, `1` = legitimate-interest, `2` = authority (EU Battery Reg Annex XIII tiers). See [the AttestationVault contract](../contracts/attestation-vault). **Note:** delivering tier-specific *cleartext* stays off-chain (consumer `after READ` redaction) - only entitlement is on-chain.
 
 ### `grantDisclosure(payloadHash, grantee, level, sessionId, contractAddress, compiledArtifactRef?, idempotencyKey?, sponsorSessionId?) → { jobId, status, disclosureGrantId }`
 
@@ -395,7 +407,7 @@ Re-read the AttestationVault `disclosures` ledger Map from LIVE on-chain state a
 
 ### `registerPassport(passportId, ownerId, sessionId, contractAddress, compiledArtifactRef?, idempotencyKey?, sponsorSessionId?) → { jobId, status }`
 
-Pre-register (or re-register) passport ownership via the `registerPassport` circuit. Registrar-only: the calling session must be the vault's DEPLOYER (its attester identity is locked in as `registrar` at deploy time; a non-registrar caller's tx is rejected in-circuit). Assigns the `passportId` (64-hex `Bytes<32>`) to an attester id (`ownerId`), so only that attester may bind or re-bind it via `bindPassport`. This blocks first-bind squatting for registered ids; re-registering an id is the ownership-transfer and squatter-recovery path (registrar re-points the id, the new owner rebinds). Unregistered ids stay open first-come-first-served. Job result: `{ passportId, ownerId, contractAddress, txHash }`. `compiledArtifactRef` defaults to `attestation-vault`. **Rate limit:** 30/hour per session.
+Pre-register (or re-register) passport ownership via the `registerPassport` circuit. Registrar-only: normally the vault's DEPLOY session (since 0.16.0 the registrar identity is a public constructor argument; NIGHTGATE deploys inject the deploy session's attester id automatically, so the default semantics are unchanged, but an external deployer may nominate a DIFFERENT registrar identity; a non-registrar caller's tx is rejected in-circuit). Assigns the `passportId` (64-hex `Bytes<32>`) to an attester id (`ownerId`), so only that attester may bind or re-bind it via `bindPassport`. This blocks first-bind squatting for registered ids; re-registering an id is the ownership-transfer and squatter-recovery path (registrar re-points the id, the new owner rebinds). Unregistered ids stay open first-come-first-served. Job result: `{ passportId, ownerId, contractAddress, txHash }`. `compiledArtifactRef` defaults to `attestation-vault`. **Rate limit:** 30/hour per session.
 
 ### `registerGranteeIdentity(bindingInput, scope?) → { ID, granteeId, bindingKind }`
 
@@ -405,7 +417,7 @@ Bind the authenticated caller (`req.user.id`) to the `Bytes<32>` grantee id the 
 
 ### `getWalletBalance(sessionId) → { shieldedNight, unshieldedNight, dustBalance, registeredNightUtxoCount, totalNightUtxoCount, dustUtxoCount, dustPendingCount, dustPendingValue, dustRestoreCount }`
 
-Read-only snapshot. All balances as decimal NIGHT atoms (or DUST atoms) — strings to preserve `bigint` precision. The dust diagnostics fields (0.15.2) expose the dust sub-wallet's local UTXO view: `dustUtxoCount` is the number of DUST notes the wallet tracks, `dustPendingCount`/`dustPendingValue` are in-flight dust spends awaiting confirmation, and `dustRestoreCount` counts the dust wedge protection's snapshot restores whose re-persist the database CONFIRMED (process-lifetime; a restore that could not be durably persisted is logged but not counted, and the live e2e gates on this counter). A wallet showing `registeredNightUtxoCount > 0` but `dustUtxoCount == 0` and `dustPendingCount == 0` while fee payments keep failing is dust-wedged (leaked in-flight spend) rather than genuinely empty; see the operations guide.
+Read-only snapshot. All balances as decimal NIGHT atoms (or DUST atoms) - strings to preserve `bigint` precision. The dust diagnostics fields (0.15.2) expose the dust sub-wallet's local UTXO view: `dustUtxoCount` is the number of DUST notes the wallet tracks, `dustPendingCount`/`dustPendingValue` are in-flight dust spends awaiting confirmation, and `dustRestoreCount` counts the dust wedge protection's snapshot restores whose re-persist the database CONFIRMED (process-lifetime; a restore that could not be durably persisted is logged but not counted, and the live e2e gates on this counter). A wallet showing `registeredNightUtxoCount > 0` but `dustUtxoCount == 0` and `dustPendingCount == 0` while fee payments keep failing is dust-wedged (leaked in-flight spend) rather than genuinely empty; see the operations guide.
 
 **Rate limit:** 60/min per client IP.
 
@@ -483,29 +495,29 @@ Crawler sync state. **This is the crawler's view, not the wallet's.** During wal
 `getMetrics` returns Prometheus text format. Metric prefix: `odatano_nightgate_*`. Includes chain height, indexed height, sync lag, block throughput, error counts, uptime, sync status (mapped: stopped=0, syncing=1, synced=2, error=3), runtime-topology gauges (`_runtime_topology_valid`, `_runtime_replicas`, `_runtime_database_info`), and background-job gauges (`_jobs_queued`, `_jobs_running`, `_jobs_reconciliation_required`, `_jobs_oldest_queued_seconds`).
 
 ### `getLiveness() → { status, timestamp, uptime }`
-### `getReadiness() → { ready, checks: { database, crawler, node } }`
+### `getReadiness() → { ready, crawlerEnabled, checks: { database, crawler, node, runtime } }`
 
-Kubernetes-style probes. `getReadiness` reports `ready: true` only when all three subsystem checks pass.
+Kubernetes-style probes. `getReadiness` reports `ready: true` when every applicable check passes; a deliberately disabled crawler (the Docker default) passes its `crawler`/`node` checks as not-applicable and is flagged via `crawlerEnabled: false`, so a submission/verification-only deployment is not permanently unready.
 
 ### `getReorgHistory(limit?) → ReorgLog[]`
 
 Last `limit` (default 10, max 100) reorg events with depth, detected-at timestamp, rolled-back tx count.
 
-### `pauseCrawler() / resumeCrawler() / reindexFromHeight(height)` — actions
+### `pauseCrawler() / resumeCrawler() / reindexFromHeight(height)` - actions
 
 Operator controls, `@requires: 'admin'` (since 0.5.2; unauthenticated or non-admin callers get 401/403). `reindexFromHeight` triggers a rollback to the specified height (including a recompute of the `NightBalances` projection for affected addresses) and a fresh catch-up from there. The read-only status/health/metrics functions above stay unrestricted for K8s probes and Prometheus.
 
 ## Analytics
 
-`getBlockCount() / getTransactionCount() / getContractCount() / getAverageTransactionsPerBlock()` — simple aggregate queries over the indexed entities.
+`getBlockCount() / getTransactionCount() / getContractCount() / getAverageTransactionsPerBlock()` - simple aggregate queries over the indexed entities.
 
 ## Admin
 
-`invalidateSession(sessionId)` / `invalidateAllSessions()` — force-close sessions. Distinct from `disconnectWallet` in that admin can target any session, not just one the caller owns.
+`invalidateSession(sessionId)` / `invalidateAllSessions()` - force-close sessions. Distinct from `disconnectWallet` in that admin can target any session, not just one the caller owns.
 
-`grantRole(userId, role, scope?, validUntil?)` — grant a disclosure tier (`public_only` | `legitimate_interest` | `authority`) read by the `AttestationService` mixin's `attachDisclosureRole` middleware. Caller must already hold `authority`. This is the **off-chain** tier table (`DisclosureRoles`).
+`grantRole(userId, role, scope?, validUntil?)` - grant a disclosure tier (`public_only` | `legitimate_interest` | `authority`) read by the `AttestationService` mixin's `attachDisclosureRole` middleware. Caller must already hold `authority`. This is the **off-chain** tier table (`DisclosureRoles`).
 
-> **On-chain alternative.** `attachDisclosureRole(req, db, { contractAddress, payloadHash? })` resolves the tier from the **on-chain** `DisclosureGrants` ACL instead: it maps the caller (via `GranteeIdentities` → `registerGranteeIdentity`) to a `Bytes<32>` grantee and matches active grants for that contract. With a `contractAddress` the on-chain result is authoritative (no off-chain fallback); without one, the off-chain `grantRole` table applies. The gate is a programmatic middleware — the consumer wires it into the reads it wants to gate.
+> **On-chain alternative.** `attachDisclosureRole(req, db, { contractAddress, payloadHash? })` resolves the tier from the **on-chain** `DisclosureGrants` ACL instead: it maps the caller (via `GranteeIdentities` → `registerGranteeIdentity`) to a `Bytes<32>` grantee and matches active grants for that contract. With a `contractAddress` the on-chain result is authoritative (no off-chain fallback); without one, the off-chain `grantRole` table applies. The gate is a programmatic middleware - the consumer wires it into the reads it wants to gate.
 
 ## Standard OData over entities
 
@@ -544,16 +556,16 @@ Codes returned by `classifySubmissionError` (`srv/submission/TransactionSubmitte
 |---|---|---|
 | `TxFailed` | no | SDK `TxFailedError` (on-chain status wasn't `SucceedEntirely`) |
 | `1014` | no | Substrate "invalid transaction" (matches `1014` or `invalid transaction` in the error message) |
-| `1016` | yes (preprod) / no (mainnet) | "Immediately Dropped" — preprod transient, mainnet has a known deterministic-rejection issue |
+| `1016` | yes (preprod) / no (mainnet) | "Immediately Dropped" - preprod transient, mainnet has a known deterministic-rejection issue |
 | `NetworkOrTimeout` | yes | `ECONNREFUSED`, `ECONNRESET`, `ENOTFOUND`, `ETIMEDOUT`, `socket hang up`, `timeout` |
 | `ContractTypeError` / `IncompleteCallTxPrivateStateConfig` / `IncompleteFindContractPrivateStateConfig` | no | SDK contract-config errors (classified by the thrown error's `name`) |
 | `WalletSigningNotAvailable` | no | Session has no encrypted seed key |
-| `<error name>` (default) | no | Any otherwise-unrecognized error — falls back to the thrown error's `name`, assumed non-retryable |
+| `<error name>` (default) | no | Any otherwise-unrecognized error - falls back to the thrown error's `name`, assumed non-retryable |
 
 Other failures surface as the **raw node/SDK error** rather than a `classifySubmissionError` code:
 
-- **Custom error `170` (dust validity window)** — raised by the node when the wallet's dust `ctime` is outside the grace window, usually a lagging indexer or a wallet not synced to tip. (`failed assert: predicate false` is the distinct predicate-circuit rejection.)
-- **`Wallet.InsufficientFunds`** — raised by the wallet SDK when there's insufficient dust to pay fees, or insufficient NIGHT to satisfy outputs.
-- **`MalformedResult`** — thrown by `TransactionSubmitter` when the SDK returns without the expected fields (likely an SDK bug); it is a distinct thrown error, not a `classifySubmissionError` code.
+- **Custom error `170` (dust validity window)** - raised by the node when the wallet's dust `ctime` is outside the grace window, usually a lagging indexer or a wallet not synced to tip. (`failed assert: predicate false` is the distinct predicate-circuit rejection.)
+- **`Wallet.InsufficientFunds`** - raised by the wallet SDK when there's insufficient dust to pay fees, or insufficient NIGHT to satisfy outputs.
+- **`MalformedResult`** - thrown by `TransactionSubmitter` when the SDK returns without the expected fields (likely an SDK bug); it is a distinct thrown error, not a `classifySubmissionError` code.
 
 For diagnostic 503s caused by the hosted Midnight indexer, see [docs/operations.md#troubleshooting](operations.md#troubleshooting).
