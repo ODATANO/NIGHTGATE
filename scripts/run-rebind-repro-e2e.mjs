@@ -1,23 +1,35 @@
-// Live repro for docs/feature-requests/rebind-batch-invalid-on-populated-state.md:
-// a batched call list that OVERWRITES an existing ledger cell (same-owner
-// rebind: attest+bindPassport+anchorContentRoot on an already-bound pid) is
-// deterministically rejected by the node on a POPULATED vault, while fresh
-// binds, single-call rebinds and scratch-vault rebinds all land.
+// Live lane for the canonical anchor batch on a POPULATED vault:
+// [attest, anchorContentRoot, bindPassport] in ONE transaction, both as a
+// fresh bind and as a same-owner rebind (where bindPassport OVERWRITES an
+// existing ledger cell).
 //
-// This runner exists to capture the DECISIVE evidence from a server whose
-// stdout we control: the node's RPC-CORE reject line (1010 Custom error NNN
-// vs a genuine 1014 priority collision) plus NIGHTGATE's own guard logs.
-// Every job outcome is reported verbatim.
+// Two ledger behaviours meet here, and both need a populated vault to show up
+// at all, which is why this runner prefills:
+//   - expensive calls go LAST, since nothing behind them can be starved
+//     (the 0.15.3 "cell update last" rule is this in its special case);
+//   - the ledger's causality constraint: a call carrying a FALLIBLE
+//     transcript must not be followed by one carrying a GUARANTEED
+//     transcript, and which stage a call lands in is decided by its gas
+//     cost, which grows with contract state. `attest` crosses over from
+//     roughly the third attestation, which is why this runner prefills and
+//     why the batch dies mid-series rather than immediately.
+//
+// The runner reports every job outcome verbatim; the DECISIVE evidence is the
+// server's own stdout: the `[nightgate:batch-segments]` line carries each
+// call's stage and gas budget (`attest=1158[f:6.04G]`), and the RPC-CORE line
+// carries the node's real reject code. Run it against a server whose log you
+// can read.
 //
 // Server (separate terminal): npm run dev
-// Then:  node --env-file=.env scripts/run-rebind-repro-e2e.mjs
+// Then:  npm run anchor-batch:e2e   (or REPRO_PREFILL=4 npm run anchor-batch:e2e)
 //
 // Inputs (env vars):
 //   NIGHTGATE_URL       default http://localhost:4004
 //   LACE_VIEWING_KEY    required (64 hex)
 //   LACE_MNEMONIC       required (BIP39 phrase)
 //   REPRO_VAULT         existing vault address; unset -> deploy a throwaway
-//   REPRO_PREFILL       N fresh-bind batches to populate a scratch vault first (default 0)
+//   REPRO_PREFILL       N anchor batches to populate a scratch vault first (default 0)
+//   REPRO_VARIANT       bind-middle -> the known-failing order (see below)
 //   E2E_PREWARM_TIMEOUT_MIN / E2E_JOB_POLL_INTERVAL_MS as in the other lanes
 
 import { randomBytes } from 'node:crypto';
@@ -113,19 +125,21 @@ async function submitSingle(sessionId, vault, label, circuit, args) {
     return res;
 }
 
-// REPRO_VARIANT=bind-last reorders the batch to [attest, anchorContentRoot,
-// bindPassport]: dependency-valid (both bind and anchor only need attest),
-// and it puts the UPDATING call (bindPassport on a rebind) last. The
-// observe-mode data says the ledger's sequencing check rejects the rebind
-// exactly when a later intent follows the update (attest,bind,anchor ->
-// 1010/188 even naturally ordered; attest,anchor,bind -> landed).
-const BIND_LAST = process.env.REPRO_VARIANT === 'bind-last';
+// The batch defaults to [attest, anchorContentRoot, bindPassport]:
+// dependency-valid (both bind and anchor only need attest) and it puts the
+// costliest call of a rebind (the UPDATING bindPassport) last, where nothing
+// behind it can be starved. REPRO_VARIANT=bind-middle restores the original
+// order [attest, bindPassport, anchorContentRoot], which fails earlier because
+// the update then has a call behind it.
+const BIND_MIDDLE = process.env.REPRO_VARIANT === 'bind-middle';
 const freshBindCalls = (pid) => {
     const h = hex32();
     const attest = { circuit: 'attest', args: [h, hex32()] };
     const bind = { circuit: 'bindPassport', args: [pid, h] };
-    const anchor = { circuit: 'anchorContentRoot', args: [h, hex32()] };
-    return BIND_LAST ? [attest, anchor, bind] : [attest, bind, anchor];
+    // schemaId is the third argument since 0.16.0 (roots are anchored together
+    // with the schema they were built under).
+    const anchor = { circuit: 'anchorContentRoot', args: [h, hex32(), hex32()] };
+    return BIND_MIDDLE ? [attest, bind, anchor] : [attest, anchor, bind];
 };
 
 (async () => {
@@ -172,7 +186,7 @@ const freshBindCalls = (pid) => {
     }
 
     const pid = hex32();
-    step('4. batch A: fresh bind (attest+bindPassport+anchorContentRoot, new pid)');
+    step('4. batch A: fresh bind (attest+anchorContentRoot+bindPassport, new pid)');
     const a = await submitBatch(sessionId, vault, 'batch A (fresh bind)', freshBindCalls(pid));
     if (!a.ok) fail('fresh bind failed; vault or wallet unhealthy, aborting');
 

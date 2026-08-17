@@ -1,5 +1,47 @@
 # Changelog
 
+## 0.16.3 - 2026-08-17
+
+Diagnoses and fails fast on the ledger constraint that kills dependent batched
+calls. No circuit change, no vault redeploy: the compiled artifacts and every
+verifier key are byte-identical to 0.16.0.
+
+- **Root cause of the `1010/188` rejects.** Every contract call is split into a
+  GUARANTEED and a FALLIBLE transcript by the SDK's `partitionTranscripts`,
+  allocated by GAS COST. The ledger applies all guaranteed stages before any
+  fallible one and rejects a transaction where a fallible call is followed by a
+  guaranteed one, since the later call would read state its predecessor has not
+  written yet. Per-call cost grows with contract state, so a dependent batch
+  flips from valid to invalid as the contract fills up, with no change on the
+  caller's side. Live on preprod: batches 1 and 2 of
+  `attest -> anchorContentRoot -> bindPassport` landed with all calls
+  guaranteed, batch 3 was rejected once `attest` crossed into the fallible
+  stage (5.34G guaranteed vs 6.04G fallible).
+- This supersedes the 0.15.3 reading ("a call that updates an existing ledger
+  cell must not be followed by another call"), which was the special case of an
+  expensive call: updating calls are simply costly, and ordering them last
+  worked because nothing behind them could be starved.
+- **Fail fast instead of a blind reject.** `submitContractCallBatch` now checks
+  the partitioning BEFORE proving and aborts with an error naming the offending
+  pair, rather than spending proof generation and balancing on a transaction
+  the node will reject with a bare `1010/188`. The job fails with the stable
+  code `BatchCausalityViolation` (never retryable: nothing was submitted and
+  the shape is deterministic for the current contract state). Fail-open by
+  construction: if a future SDK exposes no transcripts, nothing is blocked.
+- **The partitioning is logged** for every multi-call batch, with each call's
+  execution budget:
+  `[nightgate:batch-segments] rewrite: ... -> attest=1158[f:6.04G] anchorContentRoot=52208[g:4.77G]`.
+- `docs/actions.md` documented the now-superseded cell-update rule and used the
+  affected order as its example; it now carries the causality rule, the
+  measured numbers and the consequences for callers.
+- New live lane `npm run anchor-batch:e2e` (deploys a throwaway vault,
+  populates it via `REPRO_PREFILL=N`, submits the anchor batch as a fresh bind
+  and as a same-owner rebind), and the runner is back on the current
+  `anchorContentRoot` signature.
+- Consumers: splitting the expensive leading call into its own transaction is
+  the durable shape. Live-verified over 8 consecutive rounds on a growing
+  vault, both remaining calls stayed guaranteed.
+
 ## 0.16.2 - 2026-08-16
 
 Release-tooling fix; no runtime, circuit or packaged-code change (the

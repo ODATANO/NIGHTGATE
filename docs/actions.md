@@ -183,10 +183,12 @@ calls execute inside one transaction scope (SDK
 `withContractScopedTransaction`) and the batch is balanced, signed and
 submitted ONCE. At most 8 calls per batch. Since 0.10.0 the on-chain apply
 order is deterministic and equals the call order, so DEPENDENT calls may be
-batched (e.g. `attest` -> `bindPassport` -> `anchorContentRoot` as one
-transaction). Exception: duplicate circuit names in one batch keep a random
-relative order among themselves (see below); batch distinct circuits when
-that matters.
+batched (e.g. `attest` -> `anchorContentRoot` -> `bindPassport` as one
+transaction). Two limits apply: duplicate circuit names in one batch keep a
+random relative order among themselves (see below), and a dependent batch stays
+valid only while its leading calls fit the ledger's guaranteed execution stage,
+which depends on the target contract's state (see **Ledger causality rule**
+below, and read it before relying on a dependent batch in production).
 
 How the ordering works: build-side state threading was never the problem
 (inside the scope the SDK already feeds each call's `nextContractState` into
@@ -209,16 +211,40 @@ One environment switch exists for diagnosis
 `observe` applies no ordering and only logs the randomized ids, so dependent
 batches then apply in dice order. Leave it unset in production.
 
-**Ledger sequencing rule (populated state):** the ledger's sequencing check
-rejects a batch in which a call that UPDATES an existing ledger cell is
-followed by a later call, once the contract state is non-trivially populated
-(`1010: Invalid Transaction: Custom error: 188`, SequencingCheckFailure).
-This is independent of NIGHTGATE's ordering mechanics (reproduced with
-untouched random ids). Order cell-updating calls LAST in the batch,
-dependency-permitting: e.g. a same-owner re-bind must be batched as
-`attest -> anchorContentRoot -> bindPassport`, not
-`attest -> bindPassport -> anchorContentRoot`. Insert-only batches (first
-bind, proofs, registrations) are unaffected.
+**Ledger causality rule (this limits what may be batched):** every contract
+call is split into a GUARANTEED and a FALLIBLE transcript by the SDK's
+`partitionTranscripts`, which allocates them by GAS COST. The ledger applies
+all guaranteed stages before any fallible stage, and therefore rejects a
+transaction in which a call carrying a fallible transcript is followed by a
+call carrying a guaranteed one: the later call would run against state its
+predecessor has not written yet. The node reports this as `1010: Invalid
+Transaction: Custom error: 188`.
+
+The catch is that per-call cost GROWS WITH CONTRACT STATE (deeper merkle paths
+on larger maps), so the same batch is valid on a small contract and invalid
+later, without any change on the caller's side. Measured on preprod with the
+AttestationVault, batching `attest -> anchorContentRoot -> bindPassport`:
+batches 1 and 2 landed with all three calls guaranteed, batch 3 was rejected
+because `attest` had crossed into the fallible stage (5.34G guaranteed vs
+6.04G fallible execution budget). Submitting `attest` on its own and batching
+`[anchorContentRoot, bindPassport]` runs indefinitely.
+
+Consequences for callers:
+
+- A dependent batch is safe only while its leading calls stay guaranteed. If
+  the first call is the expensive one (it usually is: it creates the record the
+  others read), expect to split it off as the contract fills up.
+- Putting the most expensive call LAST keeps a batch valid longest, since
+  nothing behind it can be starved. This is the general form of the
+  "order cell-updating calls last" rule from 0.15.3: an updating call is simply
+  an expensive one.
+- NIGHTGATE checks the partitioning BEFORE proving and fails the job with
+  `errorCode: "BatchCausalityViolation"` and an explanatory message naming both
+  calls, instead of spending proof generation and balancing on a transaction
+  the node will reject. Nothing is submitted, and the code is never retryable
+  (the shape is deterministic for the contract's current state). The per-call
+  stages and their gas budgets are logged for every multi-call batch:
+  `[nightgate:batch-segments] rewrite: ... -> attest=1158[f:6.04G] anchorContentRoot=52208[g:4.77G]`.
 
 **Failure semantics** distinguish two phases. An error BEFORE submission (bad
 circuit name, a throwing call, proving/balancing) discards the scope; nothing

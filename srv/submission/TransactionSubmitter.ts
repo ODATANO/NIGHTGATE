@@ -547,6 +547,17 @@ export function classifySubmissionError(err: unknown, network: NightgateNetwork)
         return { code: 'TxFailed', retryable: false, message };
     }
 
+    // OUR pre-proving batch check (batch-segment-order.ts). Matched on the
+    // message because midnight-js wraps the thrown error ("Unexpected error
+    // submitting scoped transaction ..."), which discards the name. Must come
+    // BEFORE the 1010 patterns: the explanatory text mentions 1010/188 and
+    // would otherwise be misread as a node reject. Nothing was submitted, and
+    // the batch shape is deterministic for the current contract state, so this
+    // is never retryable.
+    if (/violates the ledger's causality constraint/.test(message)) {
+        return { code: 'BatchCausalityViolation', retryable: false, message };
+    }
+
     // Substrate node rejects. The SDK buries the node's line under generic
     // wrappers (FiberFailure/SubmissionError), so match against a bounded
     // deep inspection, not just the message (same trick as the worker's

@@ -6,12 +6,29 @@
  */
 
 import {
+    findCausalityViolation,
     orderBatchSegments,
     withOrderedBatchSegments
 } from '../../srv/midnight/batch-segment-order';
 
 function intentFor(circuit: string | Uint8Array) {
     return { actions: [{ entryPoint: circuit }] };
+}
+
+/**
+ * An intent whose call carries the given execution stages. `partitionTranscripts`
+ * decides these by gas cost, so the same circuit is 'g' on a small contract
+ * state and 'f' once it grows expensive (live-observed: attest at 5.34G was
+ * guaranteed, at 6.04G fallible).
+ */
+function stagedIntent(circuit: string, stages: 'g' | 'f' | 'gf') {
+    return {
+        actions: [{
+            entryPoint: circuit,
+            guaranteedTranscript: stages.includes('g') ? { gas: { computeTime: 5_150_000_000n } } : undefined,
+            fallibleTranscript: stages.includes('f') ? { gas: { computeTime: 6_040_000_000n } } : undefined
+        }]
+    };
 }
 
 function txWithIntents(entries: Array<[number, any]>) {
@@ -86,6 +103,70 @@ describe('orderBatchSegments', () => {
     });
 });
 
+describe('findCausalityViolation', () => {
+    test('flags a fallible call that has a guaranteed call behind it', () => {
+        // The live 1010/188 shape: attest goes fallible once the vault fills,
+        // its dependents stay guaranteed, and the ledger rejects the batch.
+        const tx = txWithIntents([
+            [10, stagedIntent('attest', 'f')],
+            [20, stagedIntent('anchorContentRoot', 'g')],
+            [30, stagedIntent('bindPassport', 'g')]
+        ]);
+
+        const violation = findCausalityViolation(tx);
+
+        expect(violation).toMatch(/'attest' \(segment 10\) carries a FALLIBLE/);
+        expect(violation).toMatch(/'anchorContentRoot' \(segment 20\) behind it carries a GUARANTEED/);
+    });
+
+    test('accepts the same calls when the fallible one is LAST', () => {
+        const tx = txWithIntents([
+            [10, stagedIntent('anchorContentRoot', 'g')],
+            [20, stagedIntent('bindPassport', 'f')]
+        ]);
+        expect(findCausalityViolation(tx)).toBeNull();
+    });
+
+    test('accepts an all-fallible batch (nothing guaranteed can be starved)', () => {
+        const tx = txWithIntents([
+            [10, stagedIntent('attest', 'f')],
+            [20, stagedIntent('anchorContentRoot', 'f')]
+        ]);
+        expect(findCausalityViolation(tx)).toBeNull();
+    });
+
+    test('a call carrying BOTH stages still starves a later guaranteed call', () => {
+        const tx = txWithIntents([
+            [10, stagedIntent('attest', 'gf')],
+            [20, stagedIntent('bindPassport', 'g')]
+        ]);
+        expect(findCausalityViolation(tx)).toMatch(/FALLIBLE/);
+    });
+
+    test('judges by APPLY order (ascending segment id), not map order', () => {
+        // Same calls, inserted the other way round: the fallible call ends up
+        // LAST in apply order, so this batch is fine.
+        const tx = txWithIntents([
+            [30, stagedIntent('bindPassport', 'f')],
+            [10, stagedIntent('anchorContentRoot', 'g')]
+        ]);
+        expect(findCausalityViolation(tx)).toBeNull();
+    });
+
+    test('fails OPEN when the SDK exposes no transcripts', () => {
+        const tx = txWithIntents([[10, intentFor('attest')], [20, intentFor('bindPassport')]]);
+        expect(findCausalityViolation(tx)).toBeNull();
+    });
+
+    test('ignores intents without a contract call (fee/dust segments)', () => {
+        const tx = txWithIntents([
+            [1, { actions: [] }],
+            [10, stagedIntent('attest', 'f')]
+        ]);
+        expect(findCausalityViolation(tx)).toBeNull();
+    });
+});
+
 describe('withOrderedBatchSegments', () => {
     test('reorders before delegating and passes all arguments through', async () => {
         const attest = intentFor('attest');
@@ -123,6 +204,33 @@ describe('withOrderedBatchSegments', () => {
         await expect(wrapped.proveTx(txWithIntents([[1, intentFor('a')]])))
             .rejects.toThrow(/could not match.*aborting before proving/s);
         expect(provider.proveTx).not.toHaveBeenCalled();
+    });
+
+    test('a causality violation aborts BEFORE proving (no proof, no submit)', async () => {
+        const provider = { proveTx: vi.fn(async () => 'proven') };
+        const tx = txWithIntents([
+            [20, stagedIntent('anchorContentRoot', 'g')],
+            [10, stagedIntent('attest', 'f')]
+        ]);
+
+        const wrapped = withOrderedBatchSegments(provider, ['attest', 'anchorContentRoot']);
+
+        await expect(wrapped.proveTx(tx))
+            .rejects.toThrow(/violates the ledger's causality constraint.*FALLIBLE.*Aborted before proving/s);
+        expect(provider.proveTx).not.toHaveBeenCalled();
+    });
+
+    test('a batch whose calls are all guaranteed proves normally', async () => {
+        const provider = { proveTx: vi.fn(async () => 'proven') };
+        const tx = txWithIntents([
+            [20, stagedIntent('anchorContentRoot', 'g')],
+            [10, stagedIntent('attest', 'g')]
+        ]);
+
+        const wrapped = withOrderedBatchSegments(provider, ['attest', 'anchorContentRoot']);
+
+        await expect(wrapped.proveTx(tx)).resolves.toBe('proven');
+        expect(provider.proveTx).toHaveBeenCalledTimes(1);
     });
 
     test('single-call batches skip ordering and delegate', async () => {

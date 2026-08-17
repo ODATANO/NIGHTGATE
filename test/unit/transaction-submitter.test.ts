@@ -488,6 +488,21 @@ describe('classifySubmissionError', () => {
         expect(c.message).toMatch(/ledger error 188/);
     });
 
+    test('our pre-proving causality abort gets a stable code, not a 1010 reject', () => {
+        // Real shape: midnight-js wraps the thrown error, discarding its name,
+        // and our explanatory text mentions 1010/188 - which must NOT be read
+        // as a node reject, because nothing was ever submitted.
+        const wrapped = new Error(
+            "Unexpected error submitting scoped transaction 'batch:attest+anchorContentRoot': " +
+            "Error: batch [attest+anchorContentRoot] violates the ledger's causality constraint: " +
+            "'attest' (segment 48404) carries a FALLIBLE transcript while 'anchorContentRoot' " +
+            '(segment 49135) behind it carries a GUARANTEED one. ... the node rejects the ' +
+            'transaction as 1010/188. ... Aborted before proving; nothing was submitted.'
+        );
+        const c = classifySubmissionError(wrapped, 'preprod');
+        expect(c).toMatchObject({ code: 'BatchCausalityViolation', retryable: false });
+    });
+
     test('the custom error is found in the nested cause (SDK wrapper shape)', () => {
         const wrapped: any = new Error('Transaction submission error');
         wrapped.cause = new Error('1010: Invalid Transaction: Custom error: 170');

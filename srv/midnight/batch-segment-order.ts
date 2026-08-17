@@ -25,13 +25,110 @@ function entryPointName(ep: unknown): string {
     return String(ep ?? '');
 }
 
-/** `circuit=segId` per intent, in map order; diagnostic logging only. */
+/**
+ * Which execution stages a call carries: `g` = guaranteed transcript, `f` =
+ * fallible. `partitionTranscripts` splits every call heuristically by gas
+ * cost, so the SAME circuit is `g` on a small contract state and `gf` once its
+ * ops grow expensive enough (deeper merkle paths on bigger maps).
+ *
+ * This is the load-bearing datum for a 1010/188 diagnosis, because the ledger
+ * requires causality across the merged intents: a call carrying a FALLIBLE
+ * transcript must not be followed by a call carrying a GUARANTEED one (all
+ * guaranteed stages are applied before any fallible stage, so the later call
+ * would run against state its predecessor has not written yet). Its message,
+ * from the ledger sources: "causality violation: Calls must be arranged to
+ * ensure causality constraints are met, but found call at segment_id: X with
+ * fallible transcript and call at segment_id: Y with guaranteed transcript".
+ */
+function gasOf(transcript: any): string {
+    // Transcript.gas is the call's execution budget (RunningCost, picoseconds).
+    // computeTime is the dimension that grows with contract state and thus the
+    // one that decides when a call no longer fits the guaranteed stage.
+    const compute = transcript?.gas?.computeTime;
+    if (typeof compute !== 'bigint' && typeof compute !== 'number') return '';
+    return `:${(Number(compute) / 1e9).toFixed(2)}G`;
+}
+
+function transcriptStages(action: any): string {
+    try {
+        const g = action?.guaranteedTranscript;
+        const f = action?.fallibleTranscript;
+        const stages = `${g ? `g${gasOf(g)}` : ''}${g && f ? '+' : ''}${f ? `f${gasOf(f)}` : ''}`;
+        return stages || '-';
+    } catch {
+        return '?';
+    }
+}
+
+/**
+ * The batch's contract calls in APPLY order (ascending segment id), with the
+ * stages each one carries. Intents without a contract call (fee/dust segments
+ * added during balancing) are skipped.
+ */
+function orderedCalls(tx: any): Array<{ name: string; segId: number; guaranteed: boolean; fallible: boolean }> {
+    const intents: Map<number, any> | undefined = tx?.intents;
+    if (!intents || typeof intents.entries !== 'function') return [];
+    const calls: Array<{ name: string; segId: number; guaranteed: boolean; fallible: boolean }> = [];
+    for (const [segId, intent] of Array.from(intents.entries())) {
+        const action = intent?.actions?.[0];
+        const name = entryPointName(action?.entryPoint);
+        if (!name) continue;
+        calls.push({
+            name,
+            segId,
+            guaranteed: Boolean(action?.guaranteedTranscript),
+            fallible: Boolean(action?.fallibleTranscript)
+        });
+    }
+    return calls.sort((a, b) => a.segId - b.segId);
+}
+
+/**
+ * The ledger's causality constraint, checked BEFORE proving: a call carrying a
+ * fallible transcript must not be followed by one carrying a guaranteed
+ * transcript. Returns an explanatory message when the batch would be rejected,
+ * null when it is fine.
+ *
+ * Why this is worth checking ourselves: the node reports the violation as a
+ * bare `1010: Invalid Transaction: Custom error: 188` AFTER we have spent proof
+ * generation and balancing on the transaction, and the same call list is valid
+ * or invalid depending on the target contract's state, which the caller cannot
+ * see. Reading the partitioning here turns a blind, expensive reject into an
+ * immediate, actionable error.
+ *
+ * Fail-OPEN by construction: when the SDK exposes no transcripts (both flags
+ * false), nothing is reported, so a future SDK shape cannot make this block
+ * valid batches.
+ */
+export function findCausalityViolation(tx: any): string | null {
+    const calls = orderedCalls(tx);
+    for (let i = 0; i < calls.length; i++) {
+        if (!calls[i].fallible) continue;
+        const later = calls.slice(i + 1).find(c => c.guaranteed);
+        if (!later) continue;
+        return (
+            `'${calls[i].name}' (segment ${calls[i].segId}) carries a FALLIBLE transcript while ` +
+            `'${later.name}' (segment ${later.segId}) behind it carries a GUARANTEED one. The ledger ` +
+            'applies every guaranteed stage before any fallible stage, so the later call would run ' +
+            'against state the earlier one has not written yet, and the node rejects the transaction ' +
+            'as 1010/188. Which stage a call lands in is decided by its gas cost and therefore MOVES ' +
+            'as the contract state grows. Submit the fallible call as its own transaction and batch ' +
+            'the rest'
+        );
+    }
+    return null;
+}
+
+/** `circuit=segId[stages]` per intent, in map order; diagnostic logging only. */
 export function describeBatchSegments(tx: any): string {
     try {
         const intents: Map<number, any> | undefined = tx?.intents;
         if (!intents || typeof intents.entries !== 'function') return 'no intents';
         return Array.from(intents.entries())
-            .map(([segId, intent]) => `${entryPointName(intent?.actions?.[0]?.entryPoint) || '?'}=${segId}`)
+            .map(([segId, intent]) => {
+                const action = intent?.actions?.[0];
+                return `${entryPointName(action?.entryPoint) || '?'}=${segId}[${transcriptStages(action)}]`;
+            })
             .join(' ');
     } catch (e) {
         return `dump failed: ${(e as Error)?.message ?? e}`;
@@ -125,9 +222,16 @@ export function withOrderedBatchSegments(
                 );
             }
             // Worker-thread console lands in the server log; one line per
-            // multi-call batch, and the id mapping is the load-bearing
-            // datum in any sequencing-reject diagnosis (ledger 1010/188).
+            // multi-call batch, and the id mapping plus the per-call stages
+            // are the load-bearing data in any 1010/188 diagnosis.
             console.log(`[nightgate:batch-segments] rewrite: ${before} -> ${describeBatchSegments(tx)}`);
+            const violation = findCausalityViolation(tx);
+            if (violation) {
+                throw new Error(
+                    `batch [${circuitsInOrder.join('+')}] violates the ledger's causality constraint: ${violation}. ` +
+                    'Aborted before proving; nothing was submitted.'
+                );
+            }
         }
         return proofProvider.proveTx(tx, ...rest);
     };
