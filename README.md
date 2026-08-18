@@ -107,6 +107,7 @@ Submit actions are **async**: they return `{ jobId, status }`; poll `getJobStatu
 | Cross-root document proofs | `issueDocumentIntegrityAttestation` (document B differs from document A ONLY in a public 16-bit slot mask) and `issueDocumentDiffAttestation` (at least k of 16 aligned slots differ): one proof relating TWO anchored salted content roots, values hidden, schema ids proven in-circuit (0.16.0) |
 | Crawler-free verification | `verifyAttestationState` / `verifyPredicateState` / `reindexDisclosures` read live contract state from the public indexer (per-call `network` override, no wallet, no local index) |
 | Tiered disclosure (RBAC) | `grantDisclosure` / `revokeDisclosure` (+ `registerGranteeIdentity`), on-chain `DisclosureGrants` index, `AttestationService` mixin with EU Battery Reg tiers |
+| Cross-server fee sponsoring | `@odatano/nightgate/txbuilder` (or the slim standalone package [`@odatano/nightgate-tx`](packages/nightgate-tx/README.md), under 1 MB): build, prove and sign a contract call on YOUR machine with YOUR key (wasm proving, prover keys fetched from a public `/zk-config` and cached), then hand the ~5 KB fee-unpaid transaction to `sponsorFinalizedTransaction`, which pays the dust and submits. The attestation carries the caller's identity; the sponsor never sees a key, witness or preimage (0.17.0) |
 | Browser / connector | `@odatano/nightgate/browser` (providers, witnesses, `prepareAttest` / `prepareGrantDisclosure` / `prepareRevokeDisclosure`) + `GET /zk-config/<contract>/…` + `GET /contract-manifest`: a wallet-driven dApp (Lace) needs neither the Compact toolchain nor `managed/` artifacts |
 | Operations | Health / liveness / readiness, Prometheus metrics, `pauseCrawler` / `resumeCrawler` / `reindexFromHeight`, offline start (boots without upstream node), optional local indexer via docker-compose |
 
@@ -117,6 +118,7 @@ Submit actions are **async**: they return `{ jobId, status }`; poll `getJobStatu
 - **[Architecture:](docs/architecture.md)** worker-thread design, submission flow, persistence model
 - **[Operations:](docs/operations.md)** running NIGHTGATE day to day, scripts, local indexer, troubleshooting
 - **[Docker:](docs/docker.md)** standalone container (`ghcr.io/odatano/nightgate`), configuration, schema upgrades
+- **[Transaction builder:](docs/txbuilder.md)** build sponsorable transactions locally, without a NIGHTGATE server
 - **[Reference:](docs/reference.md)** full configuration matrix + project structure
 - **[Changelog:](CHANGELOG.md)** notable changes by version
 

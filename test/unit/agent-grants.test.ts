@@ -390,6 +390,60 @@ describe('agent grants', () => {
             expect(mockDbRun).toHaveBeenCalledTimes(1); // grant lookup only, no budget UPDATE
         });
 
+        it('sponsorFinalizedTransaction is grantable; the compute-only reads are free', async () => {
+            expect(AGENT_ALLOWLISTABLE_ACTIONS).toContain('sponsorFinalizedTransaction');
+            // still never grantable: the actions that could move funds or act
+            // as the session in any other way
+            expect(AGENT_ALLOWLISTABLE_ACTIONS).not.toContain('buildSponsorable');
+            expect(AGENT_ALLOWLISTABLE_ACTIONS).not.toContain('mintShieldedTestToken');
+
+            mockDbRun.mockResolvedValueOnce(grantRow({
+                allowedActions: JSON.stringify(['sponsorFinalizedTransaction']),
+                sponsorSessionId: 'sponsor-1'
+            }));
+            const req = tokenReq('sponsorFinalizedTransaction', { finalizedTxB64: 'AAAA' });
+            await enforceAgentGrant(req, db);
+            expect(req.reject).not.toHaveBeenCalled();
+            // sponsor injected from the grant, so the agent can only spend
+            // THIS sponsor's dust
+            expect(req.data.sponsorSessionId).toBe('sponsor-1');
+
+            for (const event of ['deriveTokenType', 'prepareMembershipSet']) {
+                mockDbRun.mockResolvedValueOnce(grantRow({ allowedActions: JSON.stringify([]) }));
+                const free = tokenReq(event, { contractAddress: 'c'.repeat(64) });
+                await enforceAgentGrant(free, db);
+                expect(free.reject).not.toHaveBeenCalled();
+            }
+        });
+
+        it('getJobStatus may poll under the grant sponsor session, writes may NOT run as it', async () => {
+            // phase-2 jobs are keyed by the SPONSOR session; polling them must work
+            mockDbRun.mockResolvedValueOnce(grantRow({ sponsorSessionId: 'sponsor-1' }));
+            const poll = tokenReq('getJobStatus', { jobId: 'j1', sessionId: 'sponsor-1' });
+            await enforceAgentGrant(poll, db);
+            expect(poll.reject).not.toHaveBeenCalled();
+            expect(poll.data.sessionId).toBe('sponsor-1'); // NOT overwritten
+
+            // but a foreign session still rejects
+            mockDbRun.mockResolvedValueOnce(grantRow({ sponsorSessionId: 'sponsor-1' }));
+            const foreign = tokenReq('getJobStatus', { jobId: 'j1', sessionId: 'someone-else' });
+            await enforceAgentGrant(foreign, db);
+            expect(foreign.reject).toHaveBeenCalledWith(403, expect.stringContaining('sessionId'));
+
+            // and a WRITE naming the sponsor session as sessionId still rejects:
+            // it would act under the sponsor's identity
+            mockDbRun.mockResolvedValueOnce(grantRow({ sponsorSessionId: 'sponsor-1' }));
+            const write = tokenReq('anchorDocument', { sha256: 'a'.repeat(64), sessionId: 'sponsor-1' });
+            await enforceAgentGrant(write, db);
+            expect(write.reject).toHaveBeenCalledWith(403, expect.stringContaining('sessionId'));
+
+            // without a pinned sponsor there is no sponsor-poll exception
+            mockDbRun.mockResolvedValueOnce(grantRow({ sponsorSessionId: null }));
+            const nopin = tokenReq('getJobStatus', { jobId: 'j1', sessionId: 'sponsor-1' });
+            await enforceAgentGrant(nopin, db);
+            expect(nopin.reject).toHaveBeenCalledWith(403, expect.stringContaining('sessionId'));
+        });
+
         it('pins the sponsor: mismatch rejects 403, absence injects it', async () => {
             mockDbRun.mockResolvedValueOnce(grantRow({ sponsorSessionId: 'sponsor-1' }));
             const bad = tokenReq('anchorDocument', { sponsorSessionId: 'other-sponsor' });

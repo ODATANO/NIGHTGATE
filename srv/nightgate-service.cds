@@ -873,6 +873,63 @@ service NightgateService {
     };
 
     /**
+     * EXPERIMENTAL PROTOTYPE (cross-server fee sponsoring). Runs a contract
+     * call as the caller's phase 1 (build + sign + finalize), round-trips the
+     * fee-unpaid finalized transaction through serialize/deserialize, and has
+     * the sponsor session balance dust onto it and submit (phase 2). Same
+     * worker for now; it proves the round-trip a cross-machine sponsor endpoint
+     * would depend on. Synchronous diagnostic (no job); returns the tx hash and
+     * the serialized size. Not a shipping path.
+     */
+    action   probeCrossServerSponsor(contractAddress: String,
+                                     circuit: String,
+                                     compiledArtifactRef: String,
+                                     sessionId: UUID,
+                                     args: LargeString,
+                                     sponsorSessionId: UUID // REQUIRED here: the session that pays dust
+    )                                                                 returns {
+        jobId  : UUID;
+        status : String; // poll getJobStatus; result = { txHash, serializedBytes, roundTrip }
+    };
+
+    /**
+     * Cross-server fee sponsoring, PHASE 1 (0.17.0). Build + sign + finalize a
+     * contract call under the CALLER's identity and return the fee-unpaid
+     * transaction as base64, WITHOUT submitting. The caller then hands those
+     * bytes to a sponsor (sponsorFinalizedTransaction) which pays the dust and
+     * submits; the attestation stays the caller's. Poll getJobStatus; the
+     * result is { finalizedTxB64, serializedBytes }. The txbuilder SDK runs this
+     * step on the caller's own machine so its signing key never leaves it.
+     */
+    action   buildSponsorable(contractAddress: String,
+                             circuit: String,
+                             compiledArtifactRef: String,
+                             sessionId: UUID,
+                             args: LargeString
+    )                                                                 returns {
+        jobId  : UUID;
+        status : String;
+    };
+
+    /**
+     * Cross-server fee sponsoring, PHASE 2 (0.17.0). Take a caller-finalized,
+     * fee-unpaid transaction (base64 from buildSponsorable / the txbuilder SDK),
+     * enforce the sponsor's allow-list policy (contracts + circuits), balance
+     * dust with `sponsorSessionId` and submit. The caller's identity is already
+     * baked into the tx; the sponsor only pays. This is the half a public or
+     * x402-metered endpoint exposes. Poll getJobStatus; result is
+     * { txHash, circuits, contractAddress }.
+     */
+    action   sponsorFinalizedTransaction(finalizedTxB64: LargeString,
+                                        sponsorSessionId: UUID,
+                                        idempotencyKey: String
+    )                                                                 returns {
+        jobId  : UUID;
+        status : String;
+        sessionId : UUID; // the SPONSOR session the job is keyed by; poll getJobStatus with it
+    };
+
+    /**
      * Submit SEVERAL circuit calls against ONE deployed contract as a SINGLE
      * transaction. `calls` is a JSON array of `{ circuit, args }` executed
      * inside one transaction scope (SDK withContractScopedTransaction); the
@@ -909,6 +966,57 @@ service NightgateService {
     )                                                                 returns {
         jobId  : UUID;
         status : String; // 'pending' | 'succeeded' (idempotent retry)
+    };
+
+    /**
+     * Mint the bundled `contracts/shielded-token` test token to the CALLER's
+     * own zswap public key (0.17.0). NIGHT is unshielded-only, so nothing in
+     * the NIGHT flow ever touches the zswap prover circuits; this is how you
+     * get shielded coins to exercise them, and how a consumer sanity-checks
+     * custom-token support end to end.
+     *
+     * Deploy the contract once with
+     * `deployContract(compiledArtifactRef: 'shielded-token')`, then call this
+     * with the resulting address. Each call mints 100000000 atoms; the mint
+     * round feeds the coin nonce, so repeated calls produce distinct coins.
+     *
+     * The job result carries `tokenTypeHex`, which is what makes the minted
+     * balance usable: hand it to `sendNight(tokenTypeHex: ...)` to transfer the
+     * custom token instead of NIGHT. Same sponsoring and auth rules as
+     * submitContractCall.
+     *
+     * Async: returns `{ jobId, status }`; the job `result` carries
+     * `{ submissionId, txHash, contractAddress, tokenTypeHex, amount }`.
+     */
+    action   mintShieldedTestToken(contractAddress: String,
+                                   sessionId: UUID,
+                                   compiledArtifactRef: String, // optional; defaults to 'shielded-token'
+                                   idempotencyKey: String, // optional; dedupes retries
+                                   sponsorSessionId: UUID // optional; second session pays the dust fee
+    )                                                                 returns {
+        jobId  : UUID;
+        status : String; // 'pending' | 'succeeded' (idempotent retry)
+    };
+
+    /**
+     * Derive the raw token type a minting contract produces (compute-only, no
+     * wallet, no chain access). A shielded/unshielded custom token is
+     * identified by `rawTokenType(domainSeparator, contractAddress)`, where the
+     * domain separator is the 32-byte `pad(32, "...")` the contract passes to
+     * `mintShieldedToken`/`mint`. Without it a caller cannot address the token
+     * it just minted.
+     *
+     * `domainSeparator` accepts the plain string the contract padded (e.g.
+     * `nightgate:zswap-e2e`, the bundled test token's, which is also the
+     * default) or 64 hex characters for the padded bytes verbatim. The result
+     * feeds `sendNight(tokenTypeHex: ...)`.
+     */
+    function deriveTokenType(contractAddress: String,
+                             domainSeparator: String // optional; string or 64 hex, defaults to the bundled test token's
+    )                                                                 returns {
+        tokenTypeHex         : String;
+        contractAddress      : String;
+        domainSeparator      : String; // echoed as the padded 64-hex form actually used
     };
 
     // ========================================================================

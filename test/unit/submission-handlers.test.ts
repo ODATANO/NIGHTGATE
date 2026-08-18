@@ -314,6 +314,87 @@ describe('submitContractCallBatch: argument validation', () => {
 
 // ---- Error translation ----------------------------------------------------
 
+describe('mintShieldedTestToken + deriveTokenType', () => {
+    const ADDRESS = 'c8f426c52a5418f3b0acda284ee04d530a38f68ab3c701116fa42fae0e90cfd6';
+
+    function setup(overrides: any = {}) {
+        const srv = makeFakeService();
+        registerSubmissionHandlers(srv as any, {}, {
+            resolveContractImpl: vi.fn(async () => ({ ...RESOLVED_CONTRACT_FIXTURE })),
+            walletMaterialFactory: vi.fn(async () => ({
+                accountId: 'acc', privateStoragePasswordProvider: () => '0123456789ABCDEFG', walletAndMidnightProvider: {}
+            })),
+            submitterFactory: vi.fn(() => makeSuccessfulSubmitter()),
+            ...overrides
+        });
+        return srv;
+    }
+
+    test('rejects a missing contractAddress or sessionId', async () => {
+        const srv = setup();
+        const r1 = makeReq({ sessionId: 'mint-s1' });
+        await srv.handlers['mintShieldedTestToken'](r1);
+        expect(r1.reject).toHaveBeenCalledWith(400, expect.stringMatching(/contractAddress/));
+
+        const r2 = makeReq({ contractAddress: ADDRESS });
+        await srv.handlers['mintShieldedTestToken'](r2);
+        expect(r2.reject).toHaveBeenCalledWith(400, expect.stringMatching(/sessionId/));
+    });
+
+    test('enqueues mint() with no arguments and defaults the artifact ref', async () => {
+        const srv = setup();
+        const req = makeReq({ contractAddress: ADDRESS, sessionId: 'mint-s2' });
+        const result = await srv.handlers['mintShieldedTestToken'](req);
+        expect(req.reject).not.toHaveBeenCalled();
+        expect(result).toEqual({ jobId: 'job-mintShieldedTestToken-test', status: 'pending' });
+        expect(mockStartJob.mock.calls.at(-1)?.[0]).toMatchObject({
+            kind: 'mintShieldedTestToken', requestedBy: 'test-user', encryptCommand: true,
+            command: { op: 'call', circuit: 'mint', compiledArtifactRef: 'shielded-token', args: [], contractAddress: ADDRESS }
+        });
+    });
+
+    test('rejects a foreign artifact ref (the result enrichment is fixture-specific)', async () => {
+        // The processor stamps the FIXTURE's domain separator and amount onto
+        // the result; a foreign mint contract would execute fine and then be
+        // reported with a wrong tokenTypeHex. Explicitly repeating the bundled
+        // name stays allowed.
+        const srv = setup();
+        const req = makeReq({ contractAddress: ADDRESS, sessionId: 'mint-s3', compiledArtifactRef: 'my-token' });
+        await srv.handlers['mintShieldedTestToken'](req);
+        expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/only mints the bundled/));
+
+        const ok = makeReq({ contractAddress: ADDRESS, sessionId: 'mint-s4', compiledArtifactRef: 'shielded-token' });
+        await srv.handlers['mintShieldedTestToken'](ok);
+        expect(ok.reject).not.toHaveBeenCalled();
+    });
+
+    test('deriveTokenType returns the token type without touching a wallet', async () => {
+        const walletMaterialFactory = vi.fn();
+        const srv = setup({ walletMaterialFactory });
+        const req = makeReq({ contractAddress: ADDRESS });
+        const out = await srv.handlers['deriveTokenType'](req) as any;
+        expect(req.reject).not.toHaveBeenCalled();
+        expect(out.tokenTypeHex).toMatch(/^[0-9a-f]{64}$/);
+        expect(out.contractAddress).toBe(ADDRESS);
+        expect(walletMaterialFactory).not.toHaveBeenCalled();
+    });
+
+    test('deriveTokenType rejects a missing or unusable input with 400', async () => {
+        const srv = setup();
+        const r1 = makeReq({});
+        await srv.handlers['deriveTokenType'](r1);
+        expect(r1.reject).toHaveBeenCalledWith(400, expect.stringMatching(/contractAddress/));
+
+        const r2 = makeReq({ contractAddress: 'not-an-address' });
+        await srv.handlers['deriveTokenType'](r2);
+        expect(r2.reject).toHaveBeenCalledWith(400, expect.any(String));
+
+        const r3 = makeReq({ contractAddress: ADDRESS, domainSeparator: 'x'.repeat(40) });
+        await srv.handlers['deriveTokenType'](r3);
+        expect(r3.reject).toHaveBeenCalledWith(400, expect.stringMatching(/at most 32/));
+    });
+});
+
 describe('error translation to OData status codes', () => {
     function setupHandlers(overrides: any = {}) {
         const srv = makeFakeService();

@@ -339,6 +339,115 @@ Invalid hex, a byte length that doesn't match `Bytes<N>`, or a non-integer/negat
 `Uint` value is rejected with a clear **400** (`args[i]: …`) rather than failing
 deep inside the circuit's type guard.
 
+## Custom tokens
+
+### `mintShieldedTestToken(contractAddress, sessionId, compiledArtifactRef?, idempotencyKey?, sponsorSessionId?) → { jobId, status }`
+
+`compiledArtifactRef` accepts only the bundled `shielded-token` (or may be
+omitted): the result is enriched with THIS fixture's domain separator and mint
+amount, so a foreign minting contract would execute fine and then be reported
+with a wrong `tokenTypeHex`. Other contracts go through `submitContractCall`
+plus `deriveTokenType` with their own separator.
+
+Mints the bundled `contracts/shielded-token` test token to the caller's own
+zswap public key. NIGHT is unshielded-only, so no NIGHT transfer ever exercises
+the zswap prover circuits; this is how you get shielded coins that do, and how a
+deployment sanity-checks custom-token support end to end.
+
+Deploy the contract once, then mint into it:
+
+```bash
+curl -X POST .../deployContract   -d '{"compiledArtifactRef":"shielded-token","sessionId":"<id>","initialPrivateState":"{}"}'
+# -> jobId; poll getJobStatus for contractAddress
+
+curl -X POST .../mintShieldedTestToken   -d '{"contractAddress":"<addr>","sessionId":"<id>"}'
+# -> jobId; result { txHash, contractAddress, tokenTypeHex, amount: "100000000" }
+```
+
+Each call mints 100000000 atoms. The contract's round counter feeds the coin
+nonce, so repeated calls mint distinct coins rather than colliding.
+
+`tokenTypeHex` is the part that makes the balance usable: pass it to
+`sendNight(tokenTypeHex: ...)` to transfer the custom token instead of NIGHT.
+The wallet has to sync the minted coin first, which takes a few blocks.
+
+### `deriveTokenType(contractAddress, domainSeparator?) → { tokenTypeHex, contractAddress, domainSeparator }` (function)
+
+Compute-only: no wallet, no chain access, no proving.
+
+A minted token is addressed by `rawTokenType(domainSeparator, contractAddress)`,
+where the separator is the 32 bytes the contract passes to `mintShieldedToken`
+(in Compact, `pad(32, "...")`). Two contracts with the same separator mint
+DIFFERENT tokens, and one contract can mint several by using several separators,
+so the pair is the identity.
+
+`domainSeparator` takes either the plain string the contract padded (default:
+`nightgate:zswap-e2e`, the bundled token's) or 64 hex characters for the padded
+bytes verbatim. The echoed `domainSeparator` is always the 64-hex form actually
+used, so you can see how your input was interpreted.
+
+This is not restricted to the bundled token: any minting contract's token type
+is derived the same way.
+
+## Cross-server fee sponsoring (0.17.0)
+
+Split a contract call in two: the **caller** builds, proves, signs and finalizes
+it, the **sponsor** pays the dust and submits. The two halves can run on
+different machines with only the serialized transaction between them, so the
+caller keeps its signing key and its identity while the sponsor carries the fee.
+The full client-side story, including the standalone
+`@odatano/nightgate/txbuilder` SDK, is in [txbuilder.md](txbuilder.md).
+
+### `buildSponsorable(contractAddress, circuit, compiledArtifactRef, sessionId, args) → { jobId, status }`
+
+Phase 1, server-side. Builds, proves, balances the caller's own side, signs and
+finalizes ONE circuit call, then STOPS before submitting. Poll `getJobStatus`;
+the result is `{ finalizedTxB64, serializedBytes }` (roughly 5 KB of base64 for
+a vault call). Nothing was submitted and no dust was spent.
+
+A caller who does not run NIGHTGATE at all does this same step locally with the
+txbuilder SDK, which is the point of the split.
+
+### `sponsorFinalizedTransaction(finalizedTxB64, sponsorSessionId, idempotencyKey?) → { jobId, status, sessionId }`
+
+Phase 2. Deserializes the caller's fee-unpaid transaction, enforces the
+sponsor's policy, balances dust with `sponsorSessionId` and submits. The
+response's `sessionId` is the SPONSOR session the job is keyed by; poll
+`getJobStatus` with it (an agent-grant caller may not know it otherwise, since
+the grant injects the pinned sponsor server-side). Job result:
+`{ txHash, circuits, contractAddress }`.
+
+The sponsor never sees a key, a witness or a preimage: the proof is already
+done. The policy is a FAIL-CLOSED shape check, not just an allow-list: the
+transaction may contain allow-listed contract calls and NOTHING else. A
+contract deploy, an unshielded transfer, a zswap offer or caller-side dust
+actions riding in the same envelope refuse, as does a transaction whose
+structure the inspection cannot read, or one over the size budget
+(`NIGHTGATE_SPONSOR_MAX_TX_BYTES`, default 65536; a single vault call is
+~5.4 KB). On top of that the allow-list bounds WHICH calls are paid for:
+
+```bash
+NIGHTGATE_SPONSOR_ALLOWED_CONTRACTS=<vault addr>,<other addr>
+NIGHTGATE_SPONSOR_ALLOWED_CIRCUITS=attest,anchorContentRoot,proveFieldPredicate
+```
+
+An empty list means "no restriction", which is only appropriate for a private
+deployment. Treat this endpoint as spend authority: whoever can reach it can
+make you pay a transaction fee.
+
+The caller's TTL applies. `buildSponsorable` (and the SDK's `ttlMinutes`,
+default 30) sets it; a transaction handed over too late is rejected by the node.
+
+### `probeCrossServerSponsor(contractAddress, circuit, compiledArtifactRef, sessionId, args, sponsorSessionId) → { jobId, status }`
+
+Runs both phases in one job (build, serialize, deserialize, sponsor, submit) as
+a deployment self-check for a sponsor operator. Result:
+`{ txHash, serializedBytes, roundTrip }`.
+
+A zero-funded caller session needs no wallet sync at all; set
+`NIGHTGATE_SPONSORED_CALLER_SYNC=skip` so a throwaway caller identity is usable
+within seconds instead of minutes.
+
 ## Document anchoring
 
 ### `anchorDocument(sha256, storageRef, sessionId, contractAddress, contentType?, size?, metadata?, compiledArtifactRef?, nonce?) → { jobId, status, documentId }`

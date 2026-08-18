@@ -1,5 +1,82 @@
 # Changelog
 
+## 0.17.0 - 2026-08-18
+
+Cross-server fee sponsoring: a caller builds, proves and signs a contract call
+on its OWN machine with its OWN key, and a separate NIGHTGATE server pays the
+dust and submits. No circuit change, no vault redeploy: the compiled artifacts
+and every verifier key are byte-identical to 0.16.0.
+
+- **`sponsorFinalizedTransaction(finalizedTxB64, sponsorSessionId,
+  idempotencyKey)`.** Takes a fee-unpaid, caller-signed, proven transaction as
+  base64, enforces the sponsor's contract and circuit allow-list
+  (`NIGHTGATE_SPONSOR_ALLOWED_CONTRACTS` / `_CIRCUITS`), balances dust with the
+  sponsor session and submits. The sponsor never sees a key, a witness or a
+  preimage: by the time the bytes arrive, the proof is done, and the on-chain
+  attestation carries the CALLER's attester id.
+- **`buildSponsorable(...)`** produces exactly those bytes server-side, for
+  callers that keep their session on a NIGHTGATE instance of their own. Phase 1
+  and phase 2 can run on different machines with only transport between them.
+- **`@odatano/nightgate/txbuilder`**: the same phase 1 as a standalone SDK.
+  `createTxBuilder({ seedHex, indexerHttpUrl, indexerWsUrl, zkConfigBaseUrl,
+  contractClass })` derives the caller's identity locally, fetches the prover
+  keys from a public `/zk-config` into a disk cache (offline from the second
+  run), proves in-process on wasm and returns `{ finalizedTxB64 }`. No CAP, no
+  database, no proof server, no Docker; the seed and the attestation secret
+  never leave the process. All `prepare*` helpers of the browser export feed
+  straight into it. Documented in `docs/txbuilder.md`.
+- **`probeCrossServerSponsor(...)`** runs both phases in one job against a live
+  network, as a deployment self-check for a sponsor operator.
+- **The sponsor policy is a fail-closed SHAPE check.** Review finding: the
+  allow-list only inspected the contract calls it FOUND, so a transaction with
+  one allowed call plus a deploy, an unshielded transfer, a zswap offer or its
+  own dust actions passed, and the sponsor paid for the whole envelope. Now
+  everything that is not an allow-listed contract call refuses, unreadable
+  structure refuses, and `NIGHTGATE_SPONSOR_MAX_TX_BYTES` (default 65536) caps
+  the size; a value that is not a positive integer falls back to the default
+  instead of disabling the cap. The response also returns the sponsor `sessionId` the job is keyed
+  by, so agent-grant callers (which never see the injected sponsor id) can
+  poll; the SDK prefers that server-returned session. `mintShieldedTestToken`
+  rejects a foreign `compiledArtifactRef` (the result enrichment is
+  fixture-specific), and the SDK's `sendNight` now waits for the job like
+  every other write method.
+- **`sponsorFinalizedTransaction` is agent-grantable.** The transaction arrives
+  proven and signed, so a grant spends nothing but the pinned sponsor's dust,
+  which is exactly what sponsor pinning and the daily budget already meter; the
+  on-chain effect carries the builder's identity, never the session's.
+  `getJobStatus` may poll under the grant's pinned sponsor session (phase-2
+  jobs are keyed by it); a WRITE naming that session still rejects.
+  `deriveTokenType` and `prepareMembershipSet` join the always-allowed
+  compute-only surface (the latter closes a gap: it was exposed as an MCP tool
+  but denied under a token). `buildSponsorable` and `mintShieldedTestToken`
+  stay non-grantable.
+- Sponsored callers with no coins can skip wallet sync entirely
+  (`NIGHTGATE_SPONSORED_CALLER_SYNC=skip`), which is what makes a throwaway
+  caller identity usable within seconds.
+- New live lanes: `npm run txbuilder:e2e` (local build, remote sponsor, the
+  real split) and `npm run cross-server-probe:e2e` (both phases server-side).
+- **`@odatano/nightgate-tx`, the client SDK (0.1.0).** Every capability of a
+  hosted NIGHTGATE as a callable function (the MCP server's surface, for code):
+  crawler-free verification, document ingestion, the ZK attestation actions,
+  disclosure, tokens, cross-server sponsoring, and job polling that submits and
+  waits in one call, plus the local txbuilder for the part no hosted API can
+  offer (your key stays on your machine). Under 1 MB packed, six entry points
+  (`.`, `./client`, `./txbuilder`, `./calls`, `./attestation-vault`,
+  `./set-root`), no `@sap/cds` anywhere in its dependency closure. GENERATED
+  from this tree by `npm run build:slim`, file by file at the same relative
+  path, so the call builders and witnesses stay the same code the server uses;
+  `npm run check:slim` resolves every entry point the way a consumer does and
+  fails if a proving artifact ever lands in the tarball. The client is also a
+  subpath of the main package (`@odatano/nightgate/client`). Runnable example
+  in `packages/nightgate-tx/example/anchor.mjs`.
+- **`mintShieldedTestToken` + `deriveTokenType`.** The bundled
+  `contracts/shielded-token` shipped compiled artifacts but had no first-class
+  surface: using it meant a generic `submitContractCall` plus knowing the
+  contract's domain separator to compute the token type by hand.
+  `mintShieldedTestToken(contractAddress, sessionId)` mints and returns the
+  `tokenTypeHex` you then hand to `sendNight`, and `deriveTokenType` exposes the
+  derivation on its own for any minting contract.
+
 ## 0.16.3 - 2026-08-17
 
 Diagnoses and fails fast on the ledger constraint that kills dependent batched

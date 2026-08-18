@@ -37,6 +37,8 @@ import type { MerkleProofBundle } from './contract-witnesses';
 import {
     walletDeployContract,
     walletSubmitContractCall,
+    walletProbeCrossServerSponsor,
+    walletBuildSponsorableTx,
     walletSubmitContractCallBatch,
     registerPrivateStateProvider,
     unregisterPrivateStateProvider,
@@ -181,6 +183,10 @@ export interface TransactionSubmitterDeps {
     walletSubmitContractCallImpl?: typeof walletSubmitContractCall;
     /** Same idea for `walletSubmitContractCallBatch`. */
     walletSubmitContractCallBatchImpl?: typeof walletSubmitContractCallBatch;
+    /** Test seam for the cross-server-sponsor probe (prototype). */
+    walletProbeCrossServerSponsorImpl?: typeof walletProbeCrossServerSponsor;
+    /** Test seam for cross-server sponsoring phase 1. */
+    walletBuildSponsorableTxImpl?: typeof walletBuildSponsorableTx;
     /** Network, used by classifySubmissionError to decide if 1016 is fail-fast. */
     network: NightgateNetwork;
     /**
@@ -422,6 +428,41 @@ export class TransactionSubmitter {
             initialPrivateState: args.initialPrivateState,
             sponsorSessionId: this.deps.sponsorAccountId
         };
+    }
+
+    /**
+     * EXPERIMENTAL PROTOTYPE (cross-server-fee-sponsoring FR). Runs a contract
+     * call as the caller's phase 1 (build + sign + finalize), round-trips the
+     * finalized tx through serialize/deserialize, and has the sponsor session
+     * balance dust + submit (phase 2). Requires `sponsorAccountId`. Does not
+     * touch PendingSubmissions bookkeeping; it is a diagnostic, not a shipping
+     * path.
+     */
+    async probeCrossServerSponsor(args: CallArgs): Promise<{ txHash: string; serializedBytes: number; roundTrip: boolean }> {
+        if (!this.deps.sponsorAccountId) throw new Error('probeCrossServerSponsor requires a fee sponsor (sponsorSessionId)');
+        const probeFn = this.deps.walletProbeCrossServerSponsorImpl ?? walletProbeCrossServerSponsor;
+        const proxy = await this.registerPrivateStateProxy();
+        try {
+            return await probeFn({ ...this.makeCallRpcArgs(args, proxy.proxyId), sponsorSessionId: this.deps.sponsorAccountId });
+        } finally {
+            proxy.release();
+        }
+    }
+
+    /**
+     * Cross-server sponsoring PHASE 1 (0.17.0): build + sign + finalize the
+     * call under the caller's identity and return the fee-unpaid finalized tx
+     * (base64), without submitting. No PendingSubmissions row: nothing reached
+     * the chain. A remote sponsor completes it via `sponsorFinalized`.
+     */
+    async buildSponsorable(args: CallArgs): Promise<{ finalizedTxB64: string; serializedBytes: number }> {
+        const buildFn = this.deps.walletBuildSponsorableTxImpl ?? walletBuildSponsorableTx;
+        const proxy = await this.registerPrivateStateProxy();
+        try {
+            return await buildFn(this.makeCallRpcArgs(args, proxy.proxyId));
+        } finally {
+            proxy.release();
+        }
     }
 
     private makeCallRpcArgs(args: CallArgs, proxyId: string): WalletSubmitContractCallArgs {

@@ -1,0 +1,98 @@
+{
+    "name": "@odatano/nightgate-tx",
+    "version": "0.1.0",
+    "description": "NIGHTGATE client SDK: drive a hosted NIGHTGATE (ZK attestations, verification, disclosure, fee sponsoring) and build transactions locally with your own key.",
+    "license": "Apache-2.0",
+    "author": "ODATANO",
+    "homepage": "https://github.com/ODATANO/NIGHTGATE#readme",
+    "repository": {
+        "type": "git",
+        "url": "git+https://github.com/ODATANO/NIGHTGATE.git",
+        "directory": "packages/nightgate-tx"
+    },
+    "bugs": {
+        "url": "https://github.com/ODATANO/NIGHTGATE/issues"
+    },
+    "keywords": [
+        "midnight",
+        "nightgate",
+        "zero-knowledge",
+        "attestation",
+        "sdk",
+        "fee-sponsoring",
+        "agent"
+    ],
+    "type": "commonjs",
+    "engines": {
+        "node": ">=20"
+    },
+    "publishConfig": {
+        "access": "public"
+    },
+    "exports": {
+        ".": {
+            "types": "./src/sdk/index.d.ts",
+            "import": "./src/sdk/index.mjs",
+            "default": "./src/sdk/index.mjs"
+        },
+        "./client": {
+            "types": "./src/sdk/client.d.ts",
+            "import": "./src/sdk/client.mjs",
+            "default": "./src/sdk/client.mjs"
+        },
+        "./txbuilder": {
+            "types": "./src/txbuilder/index.d.ts",
+            "import": "./src/txbuilder/index.mjs",
+            "default": "./src/txbuilder/index.mjs"
+        },
+        "./calls": {
+            "types": "./src/browser/index.d.ts",
+            "import": "./src/browser/index.mjs",
+            "default": "./src/browser/index.mjs"
+        },
+        "./set-root": {
+            "types": "./srv/submission/set-root.d.ts",
+            "default": "./srv/submission/set-root.js"
+        },
+        "./attestation-vault": {
+            "types": "./contracts/attestation-vault/src/managed/attestation-vault/contract/index.d.ts",
+            "default": "./contracts/attestation-vault/src/managed/attestation-vault/contract/index.js"
+        },
+        "./package.json": "./package.json"
+    },
+    "files": [
+        "src/**/*.mjs",
+        "src/**/*.d.ts",
+        "src/**/*.d.mts",
+        "srv/**/*.js",
+        "srv/**/*.d.ts",
+        "contracts/**/*.js",
+        "contracts/**/*.d.ts",
+        "contracts/**/package.json",
+        "README.md",
+        "LICENSE",
+        "example/anchor.mjs"
+    ],
+    "dependencies": {
+        "@midnight-ntwrk/compact-js": "2.5.0",
+        "@midnight-ntwrk/compact-runtime": "0.16.0",
+        "@midnight-ntwrk/ledger-v8": "^8.1.0",
+        "@midnight-ntwrk/midnight-js-contracts": "~4.0.4",
+        "@midnight-ntwrk/midnight-js-indexer-public-data-provider": "~4.0.4",
+        "@midnight-ntwrk/midnight-js-network-id": "~4.0.4",
+        "@midnight-ntwrk/midnight-js-node-zk-config-provider": "~4.0.4",
+        "@midnight-ntwrk/midnight-js-types": "4.0.4",
+        "@midnight-ntwrk/zkir-v2": "2.1.0",
+        "@midnightntwrk/wallet-sdk-abstractions": "^2.1.0",
+        "@midnightntwrk/wallet-sdk-capabilities": "3.3.1",
+        "@midnightntwrk/wallet-sdk-dust-wallet": "^4.2.0",
+        "@midnightntwrk/wallet-sdk-facade": "^4.1.0",
+        "@midnightntwrk/wallet-sdk-hd": "^3.0.3",
+        "@midnightntwrk/wallet-sdk-prover-client": "1.2.3",
+        "@midnightntwrk/wallet-sdk-shielded": "^3.0.2",
+        "@midnightntwrk/wallet-sdk-unshielded-wallet": "^3.1.0",
+        "@noble/hashes": "^1.8.0",
+        "bip39": "^3.1.0",
+        "ws": "^8"
+    }
+}

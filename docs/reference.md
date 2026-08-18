@@ -533,7 +533,7 @@ New enums in `db/types.cds`:
 | Local Midnight indexer (docker) | ✅ Optional `midnightntwrk/indexer-standalone:4.3.2` service |
 | Wallet state persistence | ✅ `WalletSyncStates` - restart resumes in seconds, not hours |
 | Worker-thread architecture | ✅ Wallet SDK isolated from main thread (Phase 1+2a+2b) |
-| Compact contracts | ✅ `counter` + `attestation-vault` + `shielded-token` registered with compiled artifacts shipped |
+| Compact contracts | ✅ `counter` + `attestation-vault` + `shielded-token` registered with compiled artifacts shipped (`mintShieldedTestToken` + `deriveTokenType` drive the token one) |
 | Live preprod end-to-end (T15) | ✅ Counter deployed live on preprod via the full stack (0.3.0) |
 | On-chain disclosure grants | ✅ `grantDisclosure`/`revokeDisclosure` + chain-indexed `DisclosureGrants` + `granteeBinding` + on-chain read gate (0.3.4). Live-validated through grant → index → read-back; live revoke pending a healthy preprod indexer |
 | Crawler-free state verification | ✅ `verifyAttestationState` / `verifyPredicateState` / `reindexDisclosures` read LIVE contract state (0.5.0); optional per-call `network` override reads another network's public indexer (0.7.0) |
@@ -551,6 +551,8 @@ Key directories:
 src/
   index.ts                          # initialize/shutdown/getStatus + lifecycle
   plugin.ts                         # cds-plugin.js entry, connector routes, lifecycle
+  browser/                          # @odatano/nightgate/browser (dApp providers, prepare* calls)
+  txbuilder/                        # @odatano/nightgate/txbuilder (headless, server-free build)
 srv/
   nightgate-service.{cds,ts}        # main OData service + wallet/token-ops/contract handlers
   nightgate-indexer-service.{cds,ts}# sync/health/metrics/reorg

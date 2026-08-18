@@ -616,6 +616,45 @@ export function walletSubmitContractCall(args: WalletSubmitContractCallArgs): Pr
     return rpc('submitContractCall', args);
 }
 
+/**
+ * EXPERIMENTAL PROTOTYPE (cross-server-fee-sponsoring FR). The caller builds +
+ * signs + finalizes a contract call (phase 1), the finalized tx round-trips
+ * through serialize/deserialize, and the sponsor session balances dust onto it
+ * and submits (phase 2). Same worker for now; proving the round-trip is the
+ * point. `sponsorSessionId` is required.
+ */
+export function walletProbeCrossServerSponsor(
+    args: WalletSubmitContractCallArgs & { sponsorSessionId: string }
+): Promise<{ txHash: string; serializedBytes: number; roundTrip: boolean }> {
+    return rpc('probeCrossServerSponsor', args);
+}
+
+/**
+ * Cross-server sponsoring PHASE 1 (0.17.0): build + sign + finalize a contract
+ * call under the CALLER's identity and return the fee-unpaid finalized tx as
+ * base64, without submitting. A remote sponsor pays dust and submits.
+ */
+export function walletBuildSponsorableTx(
+    args: Omit<WalletSubmitContractCallArgs, 'sponsorSessionId'>
+): Promise<{ finalizedTxB64: string; serializedBytes: number }> {
+    return rpc('buildSponsorableTx', args);
+}
+
+/**
+ * Cross-server sponsoring PHASE 2 (0.17.0): balance dust onto a caller-finalized
+ * tx (base64) with the sponsor session and submit, after an allow-list policy
+ * check. The attestation stays the caller's; the sponsor only pays.
+ */
+export function walletSponsorFinalizedTx(args: {
+    sponsorSessionId: string;
+    finalizedTxB64: string;
+    networkId: WalletSubmitContractCallArgs['networkId'];
+    allowedContracts?: string[];
+    allowedCircuits?: string[];
+}): Promise<{ txHash: string; circuits: string[]; contractAddress: string }> {
+    return rpc('sponsorFinalizedTx', args);
+}
+
 export interface WalletSubmitContractCallBatchArgs extends Omit<WalletSubmitContractCallArgs, 'circuit' | 'args'> {
     /** Ordered circuit calls, all executed inside ONE transaction scope. A
      *  call may carry its own `merkleProof` (per-call witness binding for

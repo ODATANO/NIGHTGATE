@@ -64,3 +64,12 @@ docs/release-*.md
 docs/code-review-*.md
 docs/cap10-upgrade-assessment.md
 .ng-types-probe/
+
+# @odatano/nightgate-tx is GENERATED from this tree by `npm run build:slim`.
+# Tracked: package.json, README.md, example/anchor.mjs. Everything else is output.
+packages/nightgate-tx/src/
+packages/nightgate-tx/srv/
+packages/nightgate-tx/contracts/
+packages/nightgate-tx/LICENSE
+packages/nightgate-tx/.probe/
+packages/nightgate-tx/example/node_modules/

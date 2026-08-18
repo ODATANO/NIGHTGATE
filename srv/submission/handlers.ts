@@ -53,6 +53,10 @@ import {
 import { resolveNightgateRuntimeConfig, type NightgateNetwork, VALID_NIGHTGATE_NETWORKS, resolveOverrideIndexerEndpoints, getConfiguredPrivateStateBackend, getNightgatePluginConfig, mainnetSubmissionBlockReason } from '../utils/nightgate-config';
 import { RateLimiter } from '../utils/rate-limiter';
 import { ensureNetworkId, type ContractProvidersConfig } from '../midnight/providers';
+import {
+    deriveRawTokenType, TokenTypeError,
+    SHIELDED_TEST_TOKEN_REF, SHIELDED_TEST_TOKEN_CIRCUIT, SHIELDED_TEST_TOKEN_AMOUNT
+} from './token-type';
 import { startJob, runChildCommand, registerBackgroundJobProcessor, registerBackgroundJobReconciliationFinalizer, type BackgroundJobRow, type ReconciliationEvidence } from './background-jobs';
 import { reindexDisclosuresForContract } from './disclosure-indexer';
 import { readAttestationStateForContract } from './attestation-state';
@@ -63,6 +67,7 @@ import { membershipPathFor, SET_DEPTH } from './set-root';
 import { deriveGranteeId } from './grantee-identity';
 import { getConfiguredGranteeBinding, isSelfServiceGranteeRegistrationAllowed } from '../utils/nightgate-config';
 import { Documents, Transactions, TransactionResults, PredicateAttestations, DisclosureGrants, GranteeIdentities } from '#cds-models/midnight';
+import { walletSponsorFinalizedTx } from '../midnight/wallet-worker-client';
 
 const { INSERT, UPDATE, SELECT, DELETE } = cds.ql;
 
@@ -361,7 +366,7 @@ export function registerSubmissionHandlers(
         if (!command || job.commandVersion !== 1 || !job.sessionId || !job.requestedBy) {
             throw new Error(`Invalid persisted contract command for job ${job.ID}`);
         }
-        const callKinds = new Set(['submitContractCall', 'fieldAnchorRoot', 'fieldPredicateProof', 'fieldEqualityProof', 'fieldMembershipProof', 'documentIntegrityProof', 'documentDiffProof']);
+        const callKinds = new Set(['submitContractCall', 'mintShieldedTestToken', 'fieldAnchorRoot', 'fieldPredicateProof', 'fieldEqualityProof', 'fieldMembershipProof', 'documentIntegrityProof', 'documentDiffProof']);
         if ((job.kind === 'deployContract' && command.op !== 'deploy')
             || (callKinds.has(job.kind) && command.op !== 'call')
             || (job.kind === 'submitContractCallBatch' && command.op !== 'callBatch')
@@ -757,6 +762,39 @@ export function registerSubmissionHandlers(
             return { submissionId: result.submissionId, txHash: result.txHash, contractAddress: result.contractAddress, circuits: result.circuits, status: result.status, ...(sponsor ? { feeSponsor: sponsor.sponsorSessionId } : {}) };
         }
 
+        if ((command as { op: string }).op === 'probeCrossServer') {
+            // EXPERIMENTAL PROTOTYPE (cross-server-fee-sponsoring FR). Runs in
+            // the background-job context (fully detached from any request tx),
+            // which is what lets the worker's private-state read acquire a DB
+            // connection instead of deadlocking against a pinned request tx.
+            const c = command as unknown as { contractAddress: string; circuit: string; compiledArtifactRef: string; args: unknown[] };
+            const argTypes = argTypesLoader(resolved.zkConfigPath, c.circuit);
+            const coerced = coerceCircuitArgs(c.args, argTypes);
+            const out = await submitter.probeCrossServerSponsor({
+                contractAddress: c.contractAddress, circuit: c.circuit, args: coerced,
+                contractName: c.compiledArtifactRef,
+                registration: { artifactPath: resolved.artifactPath, privateStateId: resolved.privateStateId, zkConfigPath: resolved.zkConfigPath },
+                sessionId: job.sessionId
+            });
+            return { ...out, contractAddress: c.contractAddress, circuit: c.circuit, ...(sponsor ? { feeSponsor: sponsor.sponsorSessionId } : {}) };
+        }
+
+        if ((command as { op: string }).op === 'buildSponsorable') {
+            // Cross-server sponsoring PHASE 1: build + sign + finalize under the
+            // caller's identity, return the fee-unpaid tx as base64. No sponsor,
+            // no submit here.
+            const c = command as unknown as { contractAddress: string; circuit: string; compiledArtifactRef: string; args: unknown[] };
+            const argTypes = argTypesLoader(resolved.zkConfigPath, c.circuit);
+            const coerced = coerceCircuitArgs(c.args, argTypes);
+            const out = await submitter.buildSponsorable({
+                contractAddress: c.contractAddress, circuit: c.circuit, args: coerced,
+                contractName: c.compiledArtifactRef,
+                registration: { artifactPath: resolved.artifactPath, privateStateId: resolved.privateStateId, zkConfigPath: resolved.zkConfigPath },
+                sessionId: job.sessionId
+            });
+            return { ...out, contractAddress: c.contractAddress, circuit: c.circuit };
+        }
+
         let coercedArgs: unknown[];
         if (job.kind === 'fieldAnchorRoot') {
             coercedArgs = [hexToBytes(String(command.args[0])), hexToBytes(String(command.args[1])), hexToBytes(String(command.args[2]))];
@@ -787,12 +825,43 @@ export function registerSubmissionHandlers(
     registerBackgroundJobProcessor('deployContract', 1, executeContractCommand);
     registerBackgroundJobProcessor('submitContractCall', 1, executeContractCommand);
     registerBackgroundJobProcessor('submitContractCallBatch', 1, executeContractCommand);
+    // Same execution as any contract call; the result additionally carries the
+    // token type, without which the caller cannot spend what it just minted.
+    registerBackgroundJobProcessor('mintShieldedTestToken', 1, async (raw, job) => {
+        const result = await executeContractCommand(raw, job) as Record<string, unknown> | undefined;
+        // Narrow to the call shape: this processor only ever runs commands the
+        // mint handler wrote, and the executor already rejected any other op.
+        const command = raw as Extract<ContractCommandV1, { op: 'call' }>;
+        const token = await deriveRawTokenType(String(command?.contractAddress ?? ''));
+        return { ...(result ?? {}), tokenTypeHex: token.tokenTypeHex, amount: SHIELDED_TEST_TOKEN_AMOUNT.toString() };
+    });
     registerBackgroundJobProcessor('issueFieldPredicateAttestation', 1, executeContractCommand);
     registerBackgroundJobProcessor('issueFieldEqualityAttestation', 1, executeContractCommand);
     registerBackgroundJobProcessor('issueFieldMembershipAttestation', 1, executeContractCommand);
     registerBackgroundJobProcessor('issueFieldPredicateAttestationBatch', 1, executeContractCommand);
     registerBackgroundJobProcessor('issueDocumentIntegrityAttestation', 1, executeContractCommand);
     registerBackgroundJobProcessor('issueDocumentDiffAttestation', 1, executeContractCommand);
+    registerBackgroundJobProcessor('probeCrossServerSponsor', 1, executeContractCommand);
+    registerBackgroundJobProcessor('buildSponsorableTx', 1, executeContractCommand);
+
+    // Cross-server sponsoring PHASE 2 job: no contract call of our own, just
+    // deserialize the caller's finalized tx, enforce policy, pay dust, submit.
+    const executeSponsorFinalized = async (command: any, job: BackgroundJobRow): Promise<unknown> => {
+        cds.log('nightgate').info(`sponsorFinalizedTransaction job: ${command.finalizedTxB64?.length ?? 0} b64 chars, sponsor ${String(command.sponsorSessionId).slice(0, 8)}`);
+        const facadeCfg = facadeConfigFromEnv();
+        await ensureNetworkId(facadeCfg.networkId);
+        const sponsor = await resolveFeeSponsor({ db, sponsorSessionId: command.sponsorSessionId, requestingUserId: job.requestedBy ?? undefined, config: getNightgatePluginConfig() });
+        await ensureFeeSponsorFacade(sponsor, facadeCfg);
+        const out = await walletSponsorFinalizedTx({
+            sponsorSessionId: sponsor.accountId,
+            finalizedTxB64: command.finalizedTxB64,
+            networkId: facadeCfg.networkId,
+            allowedContracts: command.allowedContracts,
+            allowedCircuits: command.allowedCircuits
+        });
+        return { ...out, feeSponsor: sponsor.sponsorSessionId };
+    };
+    registerBackgroundJobProcessor('sponsorFinalizedTransaction', 1, executeSponsorFinalized);
     registerBackgroundJobProcessor('anchorDocument', 1, executeContractCommand);
     registerBackgroundJobProcessor('commitDocumentAnchor', 1, executeContractCommand);
     registerBackgroundJobProcessor('grantDisclosure', 1, executeContractCommand);
@@ -1010,6 +1079,201 @@ export function registerSubmissionHandlers(
                 encryptCommand: true,
                 command: { op: 'call', contractAddress, circuit, compiledArtifactRef, args: parsedArgs, initialPrivateState: parsedInitialPrivateState, sponsorSessionId: sponsor?.sponsorSessionId }
             });
+        });
+    });
+
+    // The bundled shielded-token fixture, as a first-class surface. It shipped
+    // compiled artifacts from 0.11.0 on, but using it meant a generic
+    // submitContractCall PLUS knowing the contract's domain separator to derive
+    // the token type by hand, which is the one piece a caller cannot guess.
+    srv.on('mintShieldedTestToken', async (req: Request) => {
+        const { contractAddress, sessionId, compiledArtifactRef, idempotencyKey, sponsorSessionId } = req.data as {
+            contractAddress?: string; sessionId?: string; compiledArtifactRef?: string;
+            idempotencyKey?: string; sponsorSessionId?: string;
+        };
+        if (!contractAddress) return req.reject(400, 'contractAddress is required (deploy shielded-token first)');
+        if (!sessionId) return req.reject(400, 'sessionId is required');
+        if (rejectIfMainnetBlocked(req)) return;
+        if (!checkRate(callRateLimiter, sessionId, req)) return;
+
+        // The processor enriches the result with the FIXTURE's domain separator
+        // and mint amount, so a foreign minting contract would execute fine and
+        // then be reported with a WRONG tokenTypeHex. Only the bundled fixture
+        // (or an explicit repeat of its name) is accepted; other contracts go
+        // through submitContractCall + deriveTokenType with their own separator.
+        if (compiledArtifactRef && compiledArtifactRef !== SHIELDED_TEST_TOKEN_REF) {
+            return req.reject(400,
+                `mintShieldedTestToken only mints the bundled '${SHIELDED_TEST_TOKEN_REF}' fixture; `
+                + `for other contracts use submitContractCall and deriveTokenType with the contract's own domain separator`);
+        }
+        const artifactRef = SHIELDED_TEST_TOKEN_REF;
+
+        return runSubmission(req, async () => {
+            const facadeCfg = facadeConfigFromEnv();
+            await ensureNetworkId(facadeCfg.networkId);
+            await contractResolver(artifactRef);
+            await walletFactory({ sessionId, db, facadeConfig: facadeCfg, expectedUserId: (req as any).user?.id });
+            const sponsor = await resolveSponsorForRequest(req, sponsorSessionId);
+
+            return startJob({
+                kind: 'mintShieldedTestToken',
+                sessionId,
+                idempotencyKey,
+                request: { contractAddress, compiledArtifactRef: artifactRef, sessionId, feeSponsor: sponsor?.sponsorSessionId ?? null },
+                requestedBy: (req as any).user?.id,
+                commandVersion: 1,
+                encryptCommand: true,
+                // mint() takes no arguments; the contract's own round counter
+                // feeds the coin nonce, so repeat calls mint distinct coins.
+                command: {
+                    op: 'call', contractAddress, circuit: SHIELDED_TEST_TOKEN_CIRCUIT,
+                    compiledArtifactRef: artifactRef, args: [],
+                    sponsorSessionId: sponsor?.sponsorSessionId
+                }
+            });
+        });
+    });
+
+    // Compute-only: no wallet, no chain, no proving. Deliberately NOT
+    // restricted to the bundled token; any minting contract's token type is
+    // derived the same way.
+    srv.on('deriveTokenType', async (req: Request) => {
+        const { contractAddress, domainSeparator } = req.data as {
+            contractAddress?: string; domainSeparator?: string;
+        };
+        if (!contractAddress) return req.reject(400, 'contractAddress is required');
+        try {
+            return await deriveRawTokenType(contractAddress, domainSeparator);
+        } catch (e) {
+            if (e instanceof TokenTypeError) return req.reject(400, e.message);
+            throw e;
+        }
+    });
+
+    // EXPERIMENTAL PROTOTYPE (cross-server-fee-sponsoring FR). Synchronous
+    // diagnostic: runs a contract call as the caller's phase 1, round-trips the
+    // finalized tx through serialize/deserialize, and has the sponsor session
+    // balance dust + submit (phase 2). Proves the finalized-tx round-trip that
+    // a cross-machine sponsor endpoint would rely on. Not a shipping path; no
+    // job, no idempotency, no PendingSubmissions.
+    srv.on('probeCrossServerSponsor', async (req: Request) => {
+        const { contractAddress, circuit, compiledArtifactRef, sessionId, args, sponsorSessionId } = req.data as {
+            contractAddress?: string; circuit?: string; compiledArtifactRef?: string;
+            sessionId?: string; args?: string; sponsorSessionId?: string;
+        };
+        if (!contractAddress) return req.reject(400, 'contractAddress is required');
+        if (!circuit) return req.reject(400, 'circuit is required');
+        if (!compiledArtifactRef) return req.reject(400, 'compiledArtifactRef is required');
+        if (!sessionId) return req.reject(400, 'sessionId is required');
+        if (!sponsorSessionId) return req.reject(400, 'sponsorSessionId is required (the second session that pays dust)');
+        if (rejectIfMainnetBlocked(req)) return;
+
+        let parsedArgs: unknown[] = [];
+        if (args) {
+            try { const v = JSON.parse(args); if (!Array.isArray(v)) return req.reject(400, 'args must be a JSON array'); parsedArgs = v; }
+            catch { return req.reject(400, 'args must be valid JSON'); }
+        }
+
+        return runSubmission(req, async () => {
+            const facadeCfg = facadeConfigFromEnv();
+            await ensureNetworkId(facadeCfg.networkId);
+            const resolved = await contractResolver(compiledArtifactRef);
+            const argTypes = argTypesLoader(resolved.zkConfigPath, circuit);
+            const coercedArgs = coerceCircuitArgs(parsedArgs, argTypes);
+
+            await walletFactory({ sessionId, db, facadeConfig: facadeCfg, expectedUserId: (req as any).user?.id });
+            const sponsor = await resolveSponsorForRequest(req, sponsorSessionId);
+
+            // Runs as a background job (fully detached): the synchronous request
+            // path deadlocks the worker's private-state read against the pinned
+            // request tx connection. Poll getJobStatus for { txHash, roundTrip,
+            // serializedBytes }.
+            return startJob({
+                kind: 'probeCrossServerSponsor',
+                sessionId,
+                request: { contractAddress, circuit, compiledArtifactRef, sessionId, feeSponsor: sponsor?.sponsorSessionId ?? null },
+                requestedBy: (req as any).user?.id,
+                commandVersion: 1,
+                encryptCommand: true,
+                command: { op: 'probeCrossServer', contractAddress, circuit, compiledArtifactRef, args: parsedArgs, sponsorSessionId: sponsor?.sponsorSessionId }
+            });
+        });
+    });
+
+    // Cross-server sponsoring PHASE 1 (0.17.0). Build + sign + finalize a call
+    // under the caller's identity; returns the fee-unpaid tx as base64 (poll
+    // getJobStatus). The caller then ships those bytes to a sponsor endpoint.
+    // (Server-side variant; the txbuilder SDK runs this on the caller's own
+    // machine so its key never leaves it.)
+    srv.on('buildSponsorable', async (req: Request) => {
+        const { contractAddress, circuit, compiledArtifactRef, sessionId, args } = req.data as {
+            contractAddress?: string; circuit?: string; compiledArtifactRef?: string; sessionId?: string; args?: string;
+        };
+        if (!contractAddress) return req.reject(400, 'contractAddress is required');
+        if (!circuit) return req.reject(400, 'circuit is required');
+        if (!compiledArtifactRef) return req.reject(400, 'compiledArtifactRef is required');
+        if (!sessionId) return req.reject(400, 'sessionId is required');
+        if (rejectIfMainnetBlocked(req)) return;
+        let parsedArgs: unknown[] = [];
+        if (args) { try { const v = JSON.parse(args); if (!Array.isArray(v)) return req.reject(400, 'args must be a JSON array'); parsedArgs = v; } catch { return req.reject(400, 'args must be valid JSON'); } }
+
+        return runSubmission(req, async () => {
+            const facadeCfg = facadeConfigFromEnv();
+            await ensureNetworkId(facadeCfg.networkId);
+            const resolved = await contractResolver(compiledArtifactRef);
+            const argTypes = argTypesLoader(resolved.zkConfigPath, circuit);
+            coerceCircuitArgs(parsedArgs, argTypes); // validate now -> 400
+            await walletFactory({ sessionId, db, facadeConfig: facadeCfg, expectedUserId: (req as any).user?.id });
+            return startJob({
+                kind: 'buildSponsorableTx', sessionId,
+                request: { contractAddress, circuit, compiledArtifactRef, sessionId },
+                requestedBy: (req as any).user?.id, commandVersion: 1, encryptCommand: true,
+                command: { op: 'buildSponsorable', contractAddress, circuit, compiledArtifactRef, args: parsedArgs }
+            });
+        });
+    });
+
+    // Cross-server sponsoring PHASE 2 (0.17.0). Take a caller-finalized,
+    // fee-unpaid tx (base64), enforce policy (allowed vault + circuits), pay
+    // dust with the sponsor session and submit. This is the half a public /
+    // x402-metered endpoint exposes.
+    srv.on('sponsorFinalizedTransaction', async (req: Request) => {
+        const { finalizedTxB64, sponsorSessionId, idempotencyKey } = req.data as {
+            finalizedTxB64?: string; sponsorSessionId?: string; idempotencyKey?: string;
+        };
+        if (!finalizedTxB64) return req.reject(400, 'finalizedTxB64 is required');
+        if (!sponsorSessionId) return req.reject(400, 'sponsorSessionId is required (the wallet that pays dust)');
+        if (rejectIfMainnetBlocked(req)) return;
+
+        return runSubmission(req, async () => {
+            const facadeCfg = facadeConfigFromEnv();
+            await ensureNetworkId(facadeCfg.networkId);
+            const sponsor = await resolveFeeSponsor({ db, sponsorSessionId, requestingUserId: (req as any).user?.id, config: getNightgatePluginConfig() });
+            await ensureFeeSponsorFacade(sponsor, facadeCfg);
+            // Allow-list (optional): the contracts/circuits this sponsor will pay
+            // for, from env. Empty = allow any (dev). Sends/deploys are never
+            // in the vault's circuit set, so listing the vault's circuits scopes
+            // it to attestation work.
+            const allowedContracts = String(process.env.NIGHTGATE_SPONSOR_ALLOWED_CONTRACTS ?? '').split(',').map(s => s.trim()).filter(Boolean);
+            const allowedCircuits = String(process.env.NIGHTGATE_SPONSOR_ALLOWED_CIRCUITS ?? '').split(',').map(s => s.trim()).filter(Boolean);
+            const job = await startJob({
+                kind: 'sponsorFinalizedTransaction', sessionId: sponsorSessionId, idempotencyKey,
+                // Fingerprint the tx CONTENT, not its length: two different
+                // transactions of equal size under one idempotencyKey would
+                // otherwise dedupe onto each other and the second caller would
+                // be handed the first one's job.
+                request: {
+                    feeSponsor: sponsor.sponsorSessionId,
+                    bytes: finalizedTxB64.length,
+                    txHash: bytesToHex(sha256(Buffer.from(finalizedTxB64, 'base64')))
+                },
+                requestedBy: (req as any).user?.id, commandVersion: 1, encryptCommand: true,
+                command: { op: 'sponsorFinalized', finalizedTxB64, sponsorSessionId, allowedContracts, allowedCircuits }
+            });
+            // The job is keyed by the SPONSOR session, which an agent-grant
+            // caller may not know (the grant injects it server-side). Return it
+            // so the caller can poll getJobStatus without guessing.
+            return { ...job, sessionId: sponsorSessionId };
         });
     });
 

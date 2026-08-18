@@ -23,7 +23,9 @@
  *      write actions only when allow-listed (403); everything else 403
  *      (wallet lifecycle, sends, deploys, grant admin are not grantable)
  *   4. sessionId / sponsorSessionId pinned to the grant (403 on mismatch,
- *      injected when absent; a sponsor-bound agent MUST run sponsored)
+ *      injected when absent; a sponsor-bound agent MUST run sponsored).
+ *      One exception: getJobStatus may name the grant's PINNED sponsor
+ *      session, because phase-2 sponsoring jobs are keyed by it
  *   5. daily write-job budget consumed via atomic conditional UPDATE (429
  *      when exhausted). Detached from the request tx on purpose: budget
  *      spend must stick even when the request later fails, which
@@ -65,7 +67,12 @@ export const AGENT_ALLOWLISTABLE_ACTIONS: readonly string[] = [
     'issueDocumentDiffAttestation',
     'grantDisclosure',
     'revokeDisclosure',
-    'reindexDisclosures'
+    'reindexDisclosures',
+    // Cross-server fee sponsoring, phase 2 (0.17.0): the transaction arrives
+    // PROVEN and SIGNED, so the grant spends nothing but the sponsor's dust,
+    // which is exactly what sponsor pinning + the daily budget meter. The
+    // on-chain effect carries the BUILDER's identity, not the session's.
+    'sponsorFinalizedTransaction'
 ];
 
 /**
@@ -81,6 +88,8 @@ export const AGENT_ALWAYS_ALLOWED_EVENTS: ReadonlySet<string> = new Set([
     'verifyPredicateAttestation',
     'prepareDocumentProof', // compute-only, no chain write, no session needed
     'prepareAnchorCommitment', // compute-only (commit-reveal phase 0)
+    'prepareMembershipSet', // compute-only (canonical set tree)
+    'deriveTokenType', // compute-only (token identity from address + separator)
     'getJobStatus'
 ]);
 
@@ -292,10 +301,19 @@ export async function enforceAgentGrant(req: Request, db: any): Promise<unknown>
     // Bind the request to the grant's session (and sponsor, when pinned).
     const data = (req as any).data;
     if (data && typeof data === 'object' && event !== 'READ') {
-        if (data.sessionId !== undefined && data.sessionId !== null && data.sessionId !== grant.sessionId) {
+        // Phase-2 sponsoring jobs (sponsorFinalizedTransaction) are keyed by
+        // the SPONSOR session, so polling them is the ONE place the grant's
+        // pinned sponsor session is a valid job scope. Only getJobStatus:
+        // a write with the sponsor session as sessionId would act under the
+        // sponsor's identity and must keep failing.
+        const sponsorPoll = event === 'getJobStatus'
+            && !!grant.sponsorSessionId
+            && data.sessionId === grant.sponsorSessionId;
+        if (data.sessionId !== undefined && data.sessionId !== null
+            && data.sessionId !== grant.sessionId && !sponsorPoll) {
             return req.reject(403, 'sessionId does not match this agent grant');
         }
-        data.sessionId = grant.sessionId;
+        if (!sponsorPoll) data.sessionId = grant.sessionId;
         if (allowlisted && grant.sponsorSessionId) {
             if (data.sponsorSessionId !== undefined && data.sponsorSessionId !== null
                 && data.sponsorSessionId !== grant.sponsorSessionId) {

@@ -1122,6 +1122,222 @@ export function buildSponsoredWalletProvider(caller: FacadeEntry, sponsor: Facad
 }
 
 /**
+ * EXPERIMENTAL (cross-server-fee-sponsoring FR): a wallet provider that does
+ * ONLY the caller's phase 1 (balance shielded/unshielded, sign, finalize) and
+ * then STOPS instead of submitting. `submitTx` captures the fee-unpaid,
+ * caller-signed FinalizedTransaction into `holder.captured` and returns a
+ * sentinel, so the SDK's callTx completes without touching the chain. The
+ * captured tx is what a remote sponsor would receive, balance dust onto, and
+ * submit.
+ *
+ * This is the caller half of a cross-server split: prove it round-trips
+ * through serialize/deserialize and is still accepted by
+ * balanceFinalizedTransaction, and cross-machine sponsoring is just transport.
+ */
+/** Thrown by the build-only provider to stop the SDK's callTx at submit time. */
+class BuildOnlyStop extends Error {
+    constructor() { super('build-only: captured finalized tx, stopping before submit'); this.name = 'BuildOnlyStop'; }
+}
+
+function buildBuildOnlyWalletProvider(caller: FacadeEntry, holder: { captured?: any }): any {
+    return {
+        getCoinPublicKey(): string { return caller.zswapKeys.coinPublicKey; },
+        getEncryptionPublicKey(): string { return caller.zswapKeys.encryptionPublicKey; },
+        async balanceTx(tx: any, ttl?: Date): Promise<any> {
+            if (process.env.NIGHTGATE_SPONSORED_CALLER_SYNC !== 'skip') {
+                await waitForGenuineSync(caller, BALANCE_SYNC_TIMEOUT_MS, 'build-only caller');
+            }
+            const effectiveTtl = ttl ?? new Date(Date.now() + 30 * 60 * 1000);
+            log('info', 'build-only: balanceUnboundTransaction (shielded/unshielded)');
+            const recipe = await caller.facade.balanceUnboundTransaction(
+                tx,
+                { shieldedSecretKeys: caller.zswapKeys, dustSecretKey: caller.dustKey },
+                { ttl: effectiveTtl, tokenKindsToBalance: ['shielded', 'unshielded'] }
+            );
+            const callerSign = (payload: Uint8Array) => caller.unshieldedKeystore.signData(payload);
+            try {
+                log('info', 'build-only: signRecipe + finalizeRecipe');
+                const signed = await caller.facade.signRecipe(recipe, callerSign);
+                const fin = await caller.facade.finalizeRecipe(signed);
+                log('info', 'build-only: finalized (fee-unpaid); returning to callTx');
+                return fin;
+            } catch (e) {
+                await revertRecipeBestEffort(caller.facade, recipe, 'build-only caller');
+                throw e;
+            }
+        },
+        async submitTx(tx: any): Promise<any> {
+            // Capture and STOP: returning a fake tx id lets the SDK's callTx
+            // continue into a watch-for-confirmation phase that never resolves.
+            // Throwing aborts callTx here; the handler catches BuildOnlyStop and
+            // proceeds to the sponsor phase with holder.captured. The caller's
+            // phase-1 spends are pended by finalize and reverted by the handler
+            // if the sponsor half never runs.
+            holder.captured = tx;
+            throw new BuildOnlyStop();
+        }
+    };
+}
+
+/**
+ * Deserialize a caller-finalized (fee-unpaid, signed, proven, bound) Transaction
+ * from base64. ledger-v8 `Transaction.deserialize` takes three string markers
+ * (Signaturish/Proofish/Bindingish tags) + the raw bytes; a finalized tx is
+ * signed+proven+bound. Live-proven pairing: ('signature','proof','binding').
+ */
+async function deserializeFinalizedTx(b64: string): Promise<{ tx: any; bytes: Uint8Array }> {
+    const bytes = new Uint8Array(Buffer.from(b64, 'base64'));
+    const ledger: any = cachedLedger ?? (cachedLedger = await import('@midnight-ntwrk/ledger-v8'));
+    const attempts: Array<[string, string, string]> = [
+        ['signature', 'proof', 'binding'],
+        ['signature', 'proof', 'pre-binding']
+    ];
+    const errs: string[] = [];
+    for (const [s, p, b] of attempts) {
+        try { const tx = ledger.Transaction.deserialize(s, p, b, bytes); if (tx) return { tx, bytes }; }
+        catch (e) { errs.push(`(${s},${p},${b}): ${formatErr(e).slice(0, 60)}`); }
+    }
+    throw new Error(`could not deserialize finalized tx (${bytes.length}B); tried ${errs.join(' | ')}`);
+}
+
+/**
+ * The contract calls a deserialized tx carries: [{ address, entryPoint }].
+ * Used to enforce sponsor-side policy (allowed vault + circuits) before paying.
+ */
+function inspectTxCalls(tx: any): Array<{ address: string; entryPoint: string }> {
+    const out: Array<{ address: string; entryPoint: string }> = [];
+    try {
+        const intents: Map<number, any> | undefined = tx?.intents;
+        if (!intents || typeof intents.entries !== 'function') return out;
+        for (const [, intent] of Array.from(intents.entries())) {
+            for (const action of (intent?.actions ?? [])) {
+                const ep = action?.entryPoint;
+                const name = typeof ep === 'string' ? ep : (ep instanceof Uint8Array ? new TextDecoder().decode(ep) : '');
+                if (name) out.push({ address: String(action?.address ?? ''), entryPoint: name });
+            }
+        }
+    } catch { /* best-effort inspection */ }
+    return out;
+}
+
+/** True when an offer/action container visibly carries anything. */
+function offerNonEmpty(offer: any): boolean {
+    if (!offer) return false;
+    let sawKnownKey = false;
+    for (const key of ['inputs', 'outputs', 'transient', 'spends', 'registrations', 'deltas']) {
+        const v = offer[key];
+        if (v === undefined) continue;
+        sawKnownKey = true;
+        if (v === null) continue;
+        if (Array.isArray(v)) { if (v.length > 0) return true; continue; }
+        if (typeof v?.size === 'number') { if (v.size > 0) return true; continue; }
+        if (typeof v?.length === 'number') { if (v.length > 0) return true; continue; }
+        // a non-collection value under a content key counts as content
+        return true;
+    }
+    // An offer object whose shape we cannot read at all still counts as
+    // content: fail closed rather than sponsor the unknown.
+    return !sawKnownKey;
+}
+
+/** Default sponsor size budget; a single vault call is ~5.4 KB. */
+const DEFAULT_SPONSOR_MAX_TX_BYTES = 65536;
+
+/**
+ * FAIL-CLOSED shape check for a transaction the sponsor is about to pay for.
+ * The allow-list alone is not enough: a tx with one allowed call could carry
+ * a contract DEPLOY, unshielded transfers, zswap offers or its own dust
+ * actions in the same envelope, and the sponsor would pay for all of it.
+ * Everything that is not an allow-listed contract call is a reason to refuse,
+ * and so is structure this inspection cannot read.
+ * Exported for the in-thread unit tests.
+ */
+export function checkSponsorableShape(
+    tx: any,
+    byteLength: number,
+    allowedContracts?: string[],
+    allowedCircuits?: string[]
+): Array<{ address: string; entryPoint: string }> {
+    // A misconfigured budget must not DISABLE the budget ('abc' or 'Infinity'
+    // would have skipped the check entirely): anything that is not a positive
+    // finite integer falls back to the safe default.
+    const rawMax = process.env.NIGHTGATE_SPONSOR_MAX_TX_BYTES;
+    const parsedMax = rawMax === undefined ? DEFAULT_SPONSOR_MAX_TX_BYTES : Number(rawMax);
+    const maxBytes = (Number.isInteger(parsedMax) && parsedMax > 0) ? parsedMax : DEFAULT_SPONSOR_MAX_TX_BYTES;
+    if (maxBytes !== parsedMax) {
+        log('warn', `NIGHTGATE_SPONSOR_MAX_TX_BYTES='${rawMax}' is not a positive integer; using the default ${DEFAULT_SPONSOR_MAX_TX_BYTES}`);
+    }
+    if (byteLength > maxBytes) {
+        throw new Error(`refusing to sponsor: transaction is ${byteLength}B, over the ${maxBytes}B budget (NIGHTGATE_SPONSOR_MAX_TX_BYTES)`);
+    }
+
+    const intents: Map<number, any> | undefined = tx?.intents;
+    if (!intents || typeof intents.entries !== 'function') {
+        throw new Error('refusing to sponsor: transaction structure is not inspectable (no intents)');
+    }
+    // Value moves riding along at the transaction level (zswap).
+    for (const key of ['guaranteedOffer', 'fallibleOffer', 'guaranteedCoins', 'fallibleCoins']) {
+        const offer = (tx as any)[key];
+        if (offer === undefined || offer === null) continue;
+        if (typeof offer?.entries === 'function' && !('inputs' in offer)) {
+            for (const [, sub] of Array.from(offer.entries() as Iterable<[unknown, unknown]>)) {
+                if (offerNonEmpty(sub)) throw new Error(`refusing to sponsor: transaction carries a ${key} (shielded value transfer)`);
+            }
+        } else if (offerNonEmpty(offer)) {
+            throw new Error(`refusing to sponsor: transaction carries a ${key} (shielded value transfer)`);
+        }
+    }
+
+    const calls: Array<{ address: string; entryPoint: string }> = [];
+    for (const [, intent] of Array.from(intents.entries())) {
+        // Value moves riding along inside the intent (unshielded / dust). A
+        // sponsorable tx is fee-UNPAID by definition, so caller dust actions
+        // are just as suspect as token transfers.
+        for (const key of ['guaranteedUnshieldedOffer', 'fallibleUnshieldedOffer', 'dustActions']) {
+            if (offerNonEmpty(intent?.[key])) {
+                throw new Error(`refusing to sponsor: transaction carries ${key} alongside its contract calls`);
+            }
+        }
+        for (const action of (intent?.actions ?? [])) {
+            const ep = action?.entryPoint;
+            const name = typeof ep === 'string' ? ep : (ep instanceof Uint8Array ? new TextDecoder().decode(ep) : '');
+            if (!name) {
+                // deploys, maintenance updates, future action kinds
+                const kind = action?.constructor?.name || typeof action;
+                throw new Error(`refusing to sponsor: transaction carries a non-call action (${kind})`);
+            }
+            const address = String(action?.address ?? '');
+            if (allowedContracts?.length && !allowedContracts.includes(address)) {
+                throw new Error(`refusing to sponsor: contract ${address.slice(0, 16)} is not in the allow-list`);
+            }
+            if (allowedCircuits?.length && !allowedCircuits.includes(name)) {
+                throw new Error(`refusing to sponsor: circuit '${name}' is not sponsorable`);
+            }
+            calls.push({ address, entryPoint: name });
+        }
+    }
+    if (calls.length === 0) throw new Error('refusing to sponsor: the transaction carries no contract call');
+    return calls;
+}
+
+/**
+ * Phase 2 of sponsoring: balance dust onto a caller-finalized tx with the
+ * SPONSOR facade and submit. The caller's identity is already baked into the
+ * tx; the sponsor only pays. Shared by the probe and the standalone endpoint.
+ */
+async function sponsorAndSubmitFinalized(sponsor: FacadeEntry, rehydrated: any, site: string): Promise<string> {
+    await waitForGenuineSync(sponsor, BALANCE_SYNC_TIMEOUT_MS, `${site} sponsor`);
+    await captureDustSnapshot(sponsor, `${site} sponsor`);
+    const sponsorRecipe = await sponsor.facade.balanceFinalizedTransaction(
+        rehydrated,
+        { shieldedSecretKeys: sponsor.zswapKeys, dustSecretKey: sponsor.dustKey },
+        { ttl: new Date(Date.now() + 30 * 60 * 1000), tokenKindsToBalance: ['dust'] }
+    );
+    const finalized = await sponsor.facade.finalizeRecipe(sponsorRecipe);
+    return String(await submitWithDustGuard(sponsor, finalized, `${site} sponsor-submit`));
+}
+
+/**
  * Resolves the optional fee-sponsor facade. Throws a clear error when a
  * sponsor was requested but its facade is not initialised in this worker;
  * the main thread ensures the sponsor facade exists before dispatching, so
@@ -2279,6 +2495,219 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
     },
 
     /**
+     * EXPERIMENTAL PROTOTYPE (cross-server-fee-sponsoring FR). Proves the
+     * load-bearing unknown: a caller builds + signs + finalizes a contract
+     * call (phase 1), the fee-unpaid FinalizedTransaction survives a
+     * serialize -> deserialize round-trip, and a SEPARATE sponsor session then
+     * balances dust onto it and submits (phase 2). Same-worker here; splitting
+     * the two phases across machines is then only transport.
+     *
+     * Returns { txHash, serializedBytes, roundTrip }. On any failure after the
+     * caller finalized, the caller's phase-1 spends are reverted so its coins
+     * are not stuck pending.
+     */
+    async probeCrossServerSponsor(args: {
+        sessionId: string;
+        sponsorSessionId: string;
+        proxyId: string;
+        contractName: string;
+        registration: { artifactPath: string; privateStateId: string; zkConfigPath: string };
+        contractAddress: string;
+        circuit: string;
+        args?: unknown[]; // the call arguments (same field name as submitContractCall's RPC)
+        indexerHttpUrl: string;
+        indexerWsUrl: string;
+        proofServerUrl: string;
+        networkId: string;
+        merkleProof?: MerkleProofBundle;
+        initialPrivateState?: unknown;
+    }) {
+        const entry = facades.get(args.sessionId);
+        if (!entry) throw new Error(`No facade for sessionId=${args.sessionId.slice(0, 16)}`);
+        const sponsor = resolveSponsorEntry(args.sponsorSessionId);
+        if (!sponsor) throw new Error('probeCrossServerSponsor requires a sponsorSessionId');
+        log('info', `probe: start ${args.contractName}.${args.circuit}; caller=${args.sessionId.slice(0, 8)} sponsor=${args.sponsorSessionId.slice(0, 8)}`);
+
+        const sdk = await loadSdk();
+        await ensureNetworkId(args.networkId, sdk);
+        log('info', 'probe: compiling contract');
+        const compiledContract = await getOrCompileContract(args.contractName, args.registration, entry, args.merkleProof);
+        log('info', 'probe: building providers');
+        const contractProviders = await buildWorkerContractProviders({
+            indexerHttpUrl: args.indexerHttpUrl, indexerWsUrl: args.indexerWsUrl,
+            proofServerUrl: args.proofServerUrl, zkConfigPath: args.registration.zkConfigPath
+        });
+        const privateStateProvider = createPrivateStateProxy(args.proxyId);
+        const holder: { captured?: any } = {};
+        const walletProvider = buildBuildOnlyWalletProvider(entry, holder);
+        const providers = {
+            ...contractProviders,
+            publicDataProvider: withFindContractQueryCache(contractProviders.publicDataProvider, args.indexerHttpUrl),
+            privateStateProvider, walletProvider, midnightProvider: walletProvider
+        };
+        log('info', 'probe: loading contracts SDK');
+        const { contracts } = await loadContractsSdk();
+
+        // Same first-contact private-state seeding as submitContractCall.
+        log('info', 'probe: reading private state');
+        privateStateProvider.setContractAddress(args.contractAddress);
+        const existing = await privateStateProvider.get(args.registration.privateStateId);
+        const seed = existing === undefined || existing === null;
+        log('info', `probe: findDeployedContract (seed=${seed})`);
+        const found = await contracts.findDeployedContract(providers, {
+            contractAddress: args.contractAddress, compiledContract,
+            privateStateId: args.registration.privateStateId,
+            ...(seed ? { initialPrivateState: args.initialPrivateState ?? {} } : {})
+        });
+        const fn = found?.callTx?.[args.circuit];
+        if (typeof fn !== 'function') throw new Error(`Circuit '${args.circuit}' not found on contract at ${args.contractAddress}`);
+        log('info', 'probe: running phase 1 (build + sign + finalize)');
+
+        // Phase 1: build-only provider balances + signs + finalizes, then
+        // throws BuildOnlyStop from submitTx to abort the SDK's post-submit
+        // watch. The SDK WRAPS that throw ("Unexpected error submitting scoped
+        // transaction ... BuildOnlyStop"), so instanceof no longer matches;
+        // key the success on holder.captured being set instead. Only an empty
+        // holder means a real phase-1 failure.
+        try {
+            await fn(...(args.args ?? []));
+        } catch (e) {
+            if (!holder.captured) throw e;
+        }
+        const callerFinalized = holder.captured;
+        if (!callerFinalized || typeof callerFinalized.serialize !== 'function') {
+            throw new Error('phase 1 did not produce a serializable finalized transaction (holder empty)');
+        }
+        log('info', 'probe: phase 1 captured; serialize -> deserialize round-trip');
+
+        // The round-trip under test: serialize -> (this is what crosses the
+        // wire) -> deserialize -> feed to the sponsor's dust balancing. The
+        // finalized tx is the facade's type; try matching deserializers and
+        // whatever serialize actually returns (bytes or a hex string).
+        const serialized: any = callerFinalized.serialize();
+        const serKind = typeof serialized === 'string' ? 'string' : (serialized?.constructor?.name ?? typeof serialized);
+        const serLen = typeof serialized === 'string' ? serialized.length : (serialized?.byteLength ?? serialized?.length ?? 0);
+        const ownCtor: any = callerFinalized.constructor;
+        log('info', `probe: serialized kind=${serKind} len=${serLen}; own ctor=${ownCtor?.name} hasStaticDeserialize=${typeof ownCtor?.deserialize === 'function'}`);
+        const ledger: any = cachedLedger ?? (cachedLedger = await import('@midnight-ntwrk/ledger-v8'));
+
+        // Candidate (deserializer, input) pairs, in order of likelihood.
+        const asBytes = typeof serialized === 'string' ? new Uint8Array(Buffer.from(serialized, 'hex')) : new Uint8Array(serialized);
+        // ledger-v8 Transaction.deserialize takes THREE string markers
+        // (Signaturish/Proofish/Bindingish instance tags) + the raw bytes. A
+        // caller-finalized tx is signed + proven + bound. Try that first, then a
+        // couple of proof/binding variants in case finalize leaves it unbound.
+        const M = (s: string, p: string, b: string) => () => ledger.Transaction.deserialize(s, p, b, asBytes);
+        const candidates: Array<[string, () => any]> = [
+            ["deserialize('signature','proof','binding')", M('signature', 'proof', 'binding')],
+            ["deserialize('signature','proof','pre-binding')", M('signature', 'proof', 'pre-binding')],
+            ["deserialize('signature','pre-proof','pre-binding')", M('signature', 'pre-proof', 'pre-binding')],
+            ['ownCtor.deserialize(bytes)', () => ownCtor?.deserialize?.(asBytes)]
+        ];
+        let rehydrated: any;
+        const errs: string[] = [];
+        for (const [name, fnTry] of candidates) {
+            try { const r = fnTry(); if (r) { rehydrated = r; log('info', `probe: deserialized via ${name}`); break; } }
+            catch (e) { errs.push(`${name}: ${formatErr(e).slice(0, 80)}`); }
+        }
+        if (!rehydrated) {
+            await revertRecipeBestEffort(entry.facade, callerFinalized, 'probe caller (deserialize failed)');
+            throw new Error(`finalized-tx round-trip FAILED at deserialize; tried: ${errs.join(' | ')}`);
+        }
+        const bytes = asBytes;
+
+        try {
+            const txId = await sponsorAndSubmitFinalized(sponsor, rehydrated, 'probe');
+            log('info', `probeCrossServerSponsor: LANDED via cross-phase round-trip, txHash=${txId.slice(0, 16)} (${bytes.length}B)`);
+            return { txHash: txId, serializedBytes: bytes.length, roundTrip: true };
+        } catch (e) {
+            // The sponsor half failed: revert the caller's pended phase-1 spends.
+            await revertRecipeBestEffort(entry.facade, callerFinalized, 'probe caller (sponsor phase failed)');
+            throw e;
+        }
+    },
+
+    /**
+     * PHASE 1 of cross-server sponsoring (0.17.0): build + sign + finalize a
+     * contract call and return the fee-unpaid finalized tx as base64, WITHOUT
+     * submitting. The caller's identity is baked in here. A remote sponsor (or
+     * `sponsorFinalizedTx` below) balances dust onto it and submits. Same worker
+     * shape as submitContractCall, but the build-only provider stops at finalize.
+     */
+    async buildSponsorableTx(args: {
+        sessionId: string; proxyId: string; contractName: string;
+        registration: { artifactPath: string; privateStateId: string; zkConfigPath: string };
+        contractAddress: string; circuit: string; args?: unknown[];
+        indexerHttpUrl: string; indexerWsUrl: string; proofServerUrl: string;
+        networkId: string; merkleProof?: MerkleProofBundle; initialPrivateState?: unknown;
+    }) {
+        const entry = facades.get(args.sessionId);
+        if (!entry) throw new Error(`No facade for sessionId=${args.sessionId.slice(0, 16)}`);
+        const sdk = await loadSdk();
+        await ensureNetworkId(args.networkId, sdk);
+        const compiledContract = await getOrCompileContract(args.contractName, args.registration, entry, args.merkleProof);
+        const contractProviders = await buildWorkerContractProviders({
+            indexerHttpUrl: args.indexerHttpUrl, indexerWsUrl: args.indexerWsUrl,
+            proofServerUrl: args.proofServerUrl, zkConfigPath: args.registration.zkConfigPath
+        });
+        const privateStateProvider = createPrivateStateProxy(args.proxyId);
+        const holder: { captured?: any } = {};
+        const walletProvider = buildBuildOnlyWalletProvider(entry, holder);
+        const providers = {
+            ...contractProviders,
+            publicDataProvider: withFindContractQueryCache(contractProviders.publicDataProvider, args.indexerHttpUrl),
+            privateStateProvider, walletProvider, midnightProvider: walletProvider
+        };
+        const { contracts } = await loadContractsSdk();
+        privateStateProvider.setContractAddress(args.contractAddress);
+        const existing = await privateStateProvider.get(args.registration.privateStateId);
+        const seed = existing === undefined || existing === null;
+        const found = await contracts.findDeployedContract(providers, {
+            contractAddress: args.contractAddress, compiledContract,
+            privateStateId: args.registration.privateStateId,
+            ...(seed ? { initialPrivateState: args.initialPrivateState ?? {} } : {})
+        });
+        const fn = found?.callTx?.[args.circuit];
+        if (typeof fn !== 'function') throw new Error(`Circuit '${args.circuit}' not found on contract at ${args.contractAddress}`);
+        try { await fn(...(args.args ?? [])); } catch (e) { if (!holder.captured) throw e; }
+        const callerFinalized = holder.captured;
+        if (!callerFinalized || typeof callerFinalized.serialize !== 'function') {
+            throw new Error('phase 1 did not produce a serializable finalized transaction');
+        }
+        const bytes: Uint8Array = new Uint8Array(callerFinalized.serialize());
+        log('info', `buildSponsorableTx: ${args.contractName}.${args.circuit} finalized (${bytes.length}B, fee-unpaid)`);
+        return { finalizedTxB64: Buffer.from(bytes).toString('base64'), serializedBytes: bytes.length };
+    },
+
+    /**
+     * PHASE 2 of cross-server sponsoring (0.17.0): take a caller-finalized,
+     * fee-unpaid tx (base64), enforce sponsor-side policy (allowed vault +
+     * circuits), balance dust with the SPONSOR facade and submit. The
+     * attestation stays the caller's; the sponsor only pays. This is the half a
+     * public / x402-metered endpoint exposes; the caller half runs on the
+     * caller's own machine (the txbuilder SDK) so its key never leaves it.
+     */
+    async sponsorFinalizedTx(args: {
+        sponsorSessionId: string; finalizedTxB64: string; networkId: string;
+        allowedContracts?: string[]; allowedCircuits?: string[];
+    }) {
+        const sponsor = resolveSponsorEntry(args.sponsorSessionId);
+        if (!sponsor) throw new Error('sponsorFinalizedTx requires a sponsorSessionId');
+        const sdk = await loadSdk();
+        await ensureNetworkId(args.networkId, sdk);
+        const { tx, bytes } = await deserializeFinalizedTx(args.finalizedTxB64);
+
+        // Policy: FAIL-CLOSED shape check. Allow-listed contract calls are the
+        // only thing a sponsorable tx may contain; deploys, token transfers,
+        // caller dust, oversized or uninspectable transactions all refuse.
+        const calls = checkSponsorableShape(tx, bytes.length, args.allowedContracts, args.allowedCircuits);
+        log('info', `sponsorFinalizedTx: paying dust for ${calls.map(c => c.entryPoint).join('+')} (${bytes.length}B)`);
+        const txId = await sponsorAndSubmitFinalized(sponsor, tx, 'sponsor-endpoint');
+        log('info', `sponsorFinalizedTx: LANDED txHash=${txId.slice(0, 16)}`);
+        return { txHash: txId, circuits: calls.map(c => c.entryPoint), contractAddress: calls[0]?.address ?? '' };
+    },
+
+    /**
      * Submit SEVERAL circuit calls against ONE deployed contract as a SINGLE
      * transaction, via the SDK's `withContractScopedTransaction`. Each call is
      * added to the shared TransactionContext (the circuit-call interface's
@@ -2426,7 +2855,7 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
 const SUBMIT_METHODS = new Set([
     'deployContract', 'submitContractCall', 'submitContractCallBatch',
     'registerDustGeneration', 'deregisterDustGeneration',
-    'transferNight'
+    'transferNight', 'probeCrossServerSponsor', 'buildSponsorableTx', 'sponsorFinalizedTx'
 ]);
 
 const sessionChains = new Map<string, Promise<unknown>>();

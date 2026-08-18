@@ -1,6 +1,6 @@
 {
   "name": "@odatano/nightgate",
-  "version": "0.16.3",
+  "version": "0.17.0",
   "description": "CAP Plugin: Midnight Blockchain Indexer with OData V4 API",
   "homepage": "https://github.com/ODATANO/NIGHTGATE#readme",
   "repository": {
@@ -69,6 +69,16 @@
       "types": "./contracts/attestation-vault/src/managed/attestation-vault/contract/index.d.ts",
       "import": "./contracts/attestation-vault/src/managed/attestation-vault/contract/index.js",
       "default": "./contracts/attestation-vault/src/managed/attestation-vault/contract/index.js"
+    },
+    "./txbuilder": {
+      "types": "./src/txbuilder/index.d.ts",
+      "import": "./src/txbuilder/index.mjs",
+      "default": "./src/txbuilder/index.mjs"
+    },
+    "./client": {
+      "types": "./src/sdk/client.d.ts",
+      "import": "./src/sdk/client.mjs",
+      "default": "./src/sdk/client.mjs"
     }
   },
   "files": [
@@ -147,7 +157,12 @@
     "prepack": "npm run build:plugin",
     "prepublishOnly": "npm run check:release && npm run build:plugin",
     "integration:derive-wallet-info": "node --env-file=.env scripts/integration-test-derive-wallet-info.mjs",
-    "check:fresh-tree": "bash scripts/check-fresh-tree.sh"
+    "check:fresh-tree": "bash scripts/check-fresh-tree.sh",
+    "cross-server-probe:e2e": "node --env-file=.env scripts/run-cross-server-sponsor-probe-e2e.mjs",
+    "txbuilder:e2e": "node --env-file=.env scripts/run-txbuilder-e2e.mjs",
+    "build:slim": "node scripts/build-slim-package.mjs",
+    "check:slim": "npm run build:slim && node scripts/check-slim-package.mjs",
+    "mint-token:e2e": "node --env-file=.env scripts/run-mint-token-e2e.mjs"
   },
   "dependencies": {
     "@midnight-ntwrk/compact-js": "2.5.0",
