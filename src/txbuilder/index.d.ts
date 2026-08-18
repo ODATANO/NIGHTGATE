@@ -20,7 +20,10 @@ export interface EnsureZkAssetsInput {
     /** A public `/zk-config/<contract>` base URL. */
     zkConfigBaseUrl: string;
     cacheDir: string;
+    /** Restricts only the HEAVY prover keys + zkir; verifier keys are always fetched for verifierCircuits. */
     circuits?: string[];
+    /** Full circuit list of the contract (verifier keys are needed for ALL of them). */
+    verifierCircuits?: string[];
     fetchFn?: typeof fetch;
     onProgress?: (e: Record<string, unknown>) => void;
 }

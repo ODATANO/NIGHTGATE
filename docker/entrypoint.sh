@@ -21,11 +21,15 @@ case "$AUTH_KIND" in
             exit 1
         fi
         export __NG_DB="$DB_PATH" __NG_USER="${NIGHTGATE_HTTP_USER:-nightgate}" __NG_PW="$NIGHTGATE_HTTP_PASSWORD"
+        # Custom transport auth (0.17.1): basic as before, PLUS requests
+        # carrying x-agent-token pass for /api/v1/nightgate only, where the
+        # agent-grant hook does the real authentication. External agents
+        # therefore need ONLY their ngat_ token, not the operator password.
         CDS_CONFIG=$(node -e '
             const { __NG_DB, __NG_USER, __NG_PW } = process.env;
             console.log(JSON.stringify({ requires: {
                 db:   { kind: "sqlite", credentials: { url: __NG_DB } },
-                auth: { kind: "basic", users: { [__NG_USER]: { password: __NG_PW } } }
+                auth: { impl: "./srv/utils/agent-token-auth.js", users: { [__NG_USER]: { password: __NG_PW } } }
             }}));')
         ;;
     dummy)

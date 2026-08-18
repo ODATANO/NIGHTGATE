@@ -49,17 +49,27 @@ const exists = (p) => access(p).then(() => true, () => false);
  * The cache directory doubles as a compiled-assets directory, which is what
  * lets the local build use the same asset path the server uses.
  */
-export async function ensureZkAssets({ zkConfigBaseUrl, cacheDir, circuits = ATTESTATION_VAULT_CIRCUITS, fetchFn, onProgress }) {
+export async function ensureZkAssets({ zkConfigBaseUrl, cacheDir, circuits = ATTESTATION_VAULT_CIRCUITS, verifierCircuits, fetchFn, onProgress }) {
     if (!zkConfigBaseUrl) throw new Error('ensureZkAssets: zkConfigBaseUrl is required');
     const doFetch = fetchFn || fetch;
     const base = String(zkConfigBaseUrl).replace(/\/$/, '');
     await mkdir(join(cacheDir, 'keys'), { recursive: true });
     await mkdir(join(cacheDir, 'zkir'), { recursive: true });
 
+    // `circuits` restricts only the HEAVY prover keys (megabytes each). The
+    // ~2 KB VERIFIER keys must exist for EVERY circuit of the contract:
+    // findDeployedContract reads them all when it verifies the deployment, so
+    // a caller who fetched only its own circuit would fail on the first build.
+    const verifierSet = [...new Set([...(verifierCircuits ?? []), ...circuits])];
+
     let fetched = 0;
     let cached = 0;
-    for (const circuit of circuits) {
-        for (const [dir, ext] of [['keys', '.prover'], ['keys', '.verifier'], ['zkir', '.bzkir']]) {
+    const plan = [
+        ...circuits.flatMap(c => [[c, 'keys', '.prover'], [c, 'zkir', '.bzkir']]),
+        ...verifierSet.map(c => [c, 'keys', '.verifier'])
+    ];
+    {
+        for (const [circuit, dir, ext] of plan) {
             const rel = dir + '/' + circuit + ext;
             const dest = join(cacheDir, dir, circuit + ext);
             if (await exists(dest)) { cached++; continue; }
@@ -160,9 +170,20 @@ export async function createTxBuilder(opts) {
     if (typeof contractClass !== 'function') throw new Error('createTxBuilder: contractClass is required (the compiled Contract)');
     const cacheDir = opts.cacheDir ?? join(homedir(), '.cache', 'nightgate-txbuilder', contractName);
 
-    // 1. Proving assets: fetch once, then offline.
+    // 1. Proving assets: fetch once, then offline. The verifier keys must
+    //    cover EVERY circuit of the contract (see ensureZkAssets); introspect
+    //    the compiled class with a stub witnesses object to get the full list.
+    let allCircuits;
+    try {
+        const stub = new Proxy({}, { get: () => () => { /* never called */ }, has: () => true });
+        allCircuits = Object.keys(new contractClass(stub).impureCircuits ?? {});
+    } catch { allCircuits = undefined; }
     onProgress?.({ phase: 'zk-assets' });
-    const assets = await ensureZkAssets({ zkConfigBaseUrl, cacheDir, circuits, onProgress });
+    const assets = await ensureZkAssets({
+        zkConfigBaseUrl, cacheDir, circuits,
+        verifierCircuits: allCircuits ?? ATTESTATION_VAULT_CIRCUITS,
+        onProgress
+    });
 
     // 2. SDK + identity. Role-specific HD derivation (matching Lace) comes from
     //    the plugin's own helper, so the builder lands on the SAME account the

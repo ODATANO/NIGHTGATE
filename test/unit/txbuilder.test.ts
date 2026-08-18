@@ -28,12 +28,32 @@ describe('txbuilder: ensureZkAssets', () => {
         });
         expect(res.fetched).toBe(3);
         expect(res.cached).toBe(0);
-        expect(seen).toEqual([
+        expect(seen.sort()).toEqual([
             'https://sponsor.example/zk-config/attestation-vault/keys/attest.prover',
             'https://sponsor.example/zk-config/attestation-vault/keys/attest.verifier',
             'https://sponsor.example/zk-config/attestation-vault/zkir/attest.bzkir'
         ]);
         expect((await readFile(join(dir, 'keys', 'attest.prover'), 'utf8')).startsWith('x:')).toBe(true);
+    });
+
+    it('restricting circuits still fetches VERIFIER keys for the whole contract', async () => {
+        // findDeployedContract reads every circuit's verifier key; only the
+        // heavy prover keys may be restricted. 0.1.1's `circuits: ['attest']`
+        // broke the first build with ENOENT on attestGuarded.verifier.
+        const { ensureZkAssets } = await importTxBuilder();
+        const seen: string[] = [];
+        const res = await ensureZkAssets({
+            zkConfigBaseUrl: 'https://s/x', cacheDir: dir,
+            circuits: ['attest'], verifierCircuits: ['attest', 'attestGuarded', 'bindPassport'],
+            fetchFn: (async (u: string) => { seen.push(u); return (await okFetch()(u)); }) as any
+        });
+        expect(res.fetched).toBe(5); // 1 prover + 1 zkir + 3 verifiers
+        expect(seen.filter(u => u.endsWith('.prover'))).toHaveLength(1);
+        expect(seen.filter(u => u.endsWith('.verifier')).sort()).toEqual([
+            'https://s/x/keys/attest.verifier',
+            'https://s/x/keys/attestGuarded.verifier',
+            'https://s/x/keys/bindPassport.verifier'
+        ]);
     });
 
     it('serves a second run entirely from the cache (offline after the first build)', async () => {

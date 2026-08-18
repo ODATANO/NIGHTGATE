@@ -119,6 +119,39 @@ async function main() {
     if (mb > MAX_TARBALL_MB) bad(`tarball is ${mb.toFixed(1)} MB, over the ${MAX_TARBALL_MB} MB budget`);
     else ok(`tarball ${mb.toFixed(2)} MB, ${packed.entryCount} files (budget ${MAX_TARBALL_MB} MB)`);
 
+    // 6: REAL-INSTALL probe. The in-repo import probe resolves transitive
+    // dependencies by walking up into the MAIN tree's node_modules, which is
+    // exactly how the missing address-format phantom-dep shim shipped in
+    // 0.1.0: fine in the repo, ERR_MODULE_NOT_FOUND on every clean install.
+    // Pack the tarball, npm-install it into an isolated prefix and import the
+    // entry points THERE.
+    console.log('  ...   real-install probe (npm pack + install, takes a minute)');
+    const probeRoot = join(PKG_DIR, '.install-probe');
+    await rm(probeRoot, { recursive: true, force: true });
+    await mkdir(probeRoot, { recursive: true });
+    try {
+        const tarName = execFileSync('npm', ['pack', '--pack-destination', probeRoot], { cwd: PKG_DIR, encoding: 'utf8', shell: process.platform === 'win32' }).trim().split(/\r?\n/).pop();
+        await writeFile(join(probeRoot, 'package.json'), JSON.stringify({ name: 'install-probe', private: true, type: 'module' }));
+        execFileSync('npm', ['install', '--no-audit', '--no-fund', tarName], { cwd: probeRoot, encoding: 'utf8', shell: process.platform === 'win32' });
+        const probeMjs = join(probeRoot, 'probe.mjs');
+        await writeFile(probeMjs, [
+            "import '@odatano/nightgate-tx';",
+            "import '@odatano/nightgate-tx/client';",
+            "import '@odatano/nightgate-tx/txbuilder';",
+            "import '@odatano/nightgate-tx/calls';",
+            "import '@odatano/nightgate-tx/attestation-vault';",
+            "import '@odatano/nightgate-tx/set-root';",
+            "console.log('install-probe ok');"
+        ].join('\n'));
+        const out = execFileSync(process.execPath, [probeMjs], { cwd: probeRoot, encoding: 'utf8' }).trim();
+        if (!out.includes('install-probe ok')) bad('real-install probe: unexpected output ' + out);
+        else ok('real-install probe: all entry points import from a clean npm install');
+    } catch (e) {
+        bad('real-install probe failed: ' + String(e.stderr || e.message).split(/\r?\n/).slice(-6).join(' '));
+    } finally {
+        await rm(probeRoot, { recursive: true, force: true });
+    }
+
     if (problems.length) {
         console.error(`\ncheck-slim-package: ${problems.length} problem(s)`);
         process.exit(1);

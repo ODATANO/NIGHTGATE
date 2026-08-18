@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.17.1 - 2026-08-18
+
+Standalone-image fix for external agents; no runtime change for plugin
+consumers, no circuit change.
+
+- **Agent tokens pass transport auth on their own.** The image's basic auth
+  401ed every request before the grant hook ran, so an external agent needed
+  the OPERATOR's transport password alongside its `ngat_` token, which defeats
+  per-agent tokens. The image now wires a custom transport auth
+  (`srv/utils/agent-token-auth.ts`): basic credentials behave exactly as
+  before; a request carrying `x-agent-token` passes for `/api/v1/nightgate`
+  ONLY, where `enforceAgentGrant` performs the real authentication (invalid
+  token 401 non-leaking, out-of-scope event 403, principal swapped to the
+  grant's operator). All other services keep requiring basic auth; wrong basic
+  credentials never fall through to the token lane. Found live: the first
+  cross-machine sponsoring run against api.nightgate.dev.
+- `@odatano/nightgate-tx` 0.1.2: `circuits` restricts only the heavy prover
+  keys; verifier keys are always fetched for the contract's full circuit list
+  (findDeployedContract reads them all, so 0.1.1's restricted first build
+  died with ENOENT). Missing address-format shims fixed in 0.1.1; the slim
+  check now installs the packed tarball into a clean prefix and imports every
+  entry point, which is the probe that would have caught both.
+
 ## 0.17.0 - 2026-08-18
 
 Cross-server fee sponsoring: a caller builds, proves and signs a contract call

@@ -49,6 +49,7 @@ The server listens on `http://localhost:4004`; the OData services sit under
 | `ENCRYPTION_KEY` | required | Encrypts wallet viewing/seed keys at rest (32+ byte secret) |
 | `NIGHTGATE_HTTP_PASSWORD` | required | Basic-auth password |
 | `NIGHTGATE_HTTP_USER` | `nightgate` | Basic-auth user |
+| (agent tokens) | - | Requests carrying `x-agent-token` need NO basic credentials for `/api/v1/nightgate`; the agent-grant hook authenticates them (0.17.1) |
 | `NIGHTGATE_AUTH` | `basic` | `dummy` serves unauthenticated (local testing ONLY) |
 | `NIGHTGATE_NETWORK` | `preprod` | Target Midnight network |
 | `NIGHTGATE_CRAWLER_ENABLED` | `false` | Block crawler (verify surface works crawler-free) |
