@@ -68,6 +68,11 @@ import { deriveGranteeId } from './grantee-identity';
 import { getConfiguredGranteeBinding, isSelfServiceGranteeRegistrationAllowed } from '../utils/nightgate-config';
 import { Documents, Transactions, TransactionResults, PredicateAttestations, DisclosureGrants, GranteeIdentities } from '#cds-models/midnight';
 import { walletSponsorFinalizedTx } from '../midnight/wallet-worker-client';
+import {
+    PLATFORM_POOL_SENTINEL, acquireSponsor, releaseSponsor, benchSponsor,
+    isRetryableSponsorFailure, envMsSetting
+} from './sponsor-pool';
+import { getConfiguredFeeSponsorSessions } from './fee-sponsor';
 
 const { INSERT, UPDATE, SELECT, DELETE } = cds.ql;
 
@@ -847,19 +852,62 @@ export function registerSubmissionHandlers(
     // Cross-server sponsoring PHASE 2 job: no contract call of our own, just
     // deserialize the caller's finalized tx, enforce policy, pay dust, submit.
     const executeSponsorFinalized = async (command: any, job: BackgroundJobRow): Promise<unknown> => {
-        cds.log('nightgate').info(`sponsorFinalizedTransaction job: ${command.finalizedTxB64?.length ?? 0} b64 chars, sponsor ${String(command.sponsorSessionId).slice(0, 8)}`);
         const facadeCfg = facadeConfigFromEnv();
         await ensureNetworkId(facadeCfg.networkId);
-        const sponsor = await resolveFeeSponsor({ db, sponsorSessionId: command.sponsorSessionId, requestingUserId: job.requestedBy ?? undefined, config: getNightgatePluginConfig() });
-        await ensureFeeSponsorFacade(sponsor, facadeCfg);
-        const out = await walletSponsorFinalizedTx({
-            sponsorSessionId: sponsor.accountId,
-            finalizedTxB64: command.finalizedTxB64,
-            networkId: facadeCfg.networkId,
-            allowedContracts: command.allowedContracts,
-            allowedCircuits: command.allowedCircuits
-        });
-        return { ...out, feeSponsor: sponsor.sponsorSessionId };
+
+        // Candidate list: an explicit sponsor stays EXACT (grant pinning is a
+        // security boundary); the platform-pool sentinel fans out over the
+        // configured pool.
+        let candidates: string[];
+        if (command.sponsorSessionId === PLATFORM_POOL_SENTINEL) {
+            const pool = getConfiguredFeeSponsorSessions(getNightgatePluginConfig());
+            if (pool.length === 0) throw new Error('platform sponsor pool is empty (NIGHTGATE_FEE_SPONSOR_SESSION)');
+            candidates = [...pool];
+        } else {
+            candidates = [String(command.sponsorSessionId)];
+        }
+        cds.log('nightgate').info(`sponsorFinalizedTransaction job: ${command.finalizedTxB64?.length ?? 0} b64 chars, candidates ${candidates.map(c => c.slice(0, 8)).join('>')}`);
+
+        const waitMs = envMsSetting('NIGHTGATE_SPONSOR_LEASE_WAIT_MS', 120_000);
+        const cooldownMs = envMsSetting('NIGHTGATE_SPONSOR_COOLDOWN_MS', 120_000);
+        // ONE shared deadline: a fully busy pool QUEUES here (acquireSponsor
+        // polls the whole remaining candidate set) instead of skipping every
+        // busy member and failing instantly.
+        const deadline = Date.now() + waitMs;
+        let lastErr: unknown;
+        while (candidates.length > 0) {
+            let sessionId: string;
+            try {
+                sessionId = await acquireSponsor(candidates, Math.max(0, deadline - Date.now()));
+            } catch (e) {
+                throw lastErr ?? e; // pool stayed busy/cooling until the deadline
+            }
+            try {
+                const sponsor = await resolveFeeSponsor({ db, sponsorSessionId: sessionId, requestingUserId: job.requestedBy ?? undefined, config: getNightgatePluginConfig() });
+                await ensureFeeSponsorFacade(sponsor, facadeCfg);
+                const out = await walletSponsorFinalizedTx({
+                    sponsorSessionId: sponsor.accountId,
+                    finalizedTxB64: command.finalizedTxB64,
+                    networkId: facadeCfg.networkId,
+                    allowedContracts: command.allowedContracts,
+                    allowedCircuits: command.allowedCircuits
+                });
+                releaseSponsor(sessionId);
+                return { ...out, feeSponsor: sponsor.sponsorSessionId };
+            } catch (e) {
+                lastErr = e;
+                if (!isRetryableSponsorFailure(e)) {
+                    releaseSponsor(sessionId);
+                    throw e; // fails identically on every sponsor; do not burn the pool
+                }
+                // Bench EVERY retryable failure, so the NEXT job skips this
+                // sponsor too; whether WE continue depends on candidates left.
+                benchSponsor(sessionId, cooldownMs);
+                cds.log('nightgate').warn(`sponsor ${sessionId.slice(0, 8)} failed retryably (${String((e as Error).message).slice(0, 120)})`);
+                candidates = candidates.filter(c => c !== sessionId);
+            }
+        }
+        throw lastErr ?? new Error('no sponsor candidate available');
     };
     registerBackgroundJobProcessor('sponsorFinalizedTransaction', 1, executeSponsorFinalized);
     registerBackgroundJobProcessor('anchorDocument', 1, executeContractCommand);
@@ -1242,38 +1290,65 @@ export function registerSubmissionHandlers(
             finalizedTxB64?: string; sponsorSessionId?: string; idempotencyKey?: string;
         };
         if (!finalizedTxB64) return req.reject(400, 'finalizedTxB64 is required');
-        if (!sponsorSessionId) return req.reject(400, 'sponsorSessionId is required (the wallet that pays dust)');
+        // The platform-pool sentinel (or an omitted sponsor with a configured
+        // pool) defers the concrete choice to execution time, which is what
+        // enables failover; an explicit session id stays exact.
+        const pool = getConfiguredFeeSponsorSessions(getNightgatePluginConfig());
+        let effectiveSponsor = sponsorSessionId;
+        if (!effectiveSponsor || effectiveSponsor === PLATFORM_POOL_SENTINEL) {
+            if (pool.length === 0) {
+                return req.reject(400, 'sponsorSessionId is required (the wallet that pays dust); no platform pool is configured');
+            }
+            effectiveSponsor = PLATFORM_POOL_SENTINEL;
+        }
         if (rejectIfMainnetBlocked(req)) return;
 
         return runSubmission(req, async () => {
             const facadeCfg = facadeConfigFromEnv();
             await ensureNetworkId(facadeCfg.networkId);
-            const sponsor = await resolveFeeSponsor({ db, sponsorSessionId, requestingUserId: (req as any).user?.id, config: getNightgatePluginConfig() });
-            await ensureFeeSponsorFacade(sponsor, facadeCfg);
+            // Explicit sponsor: validate at admission, fail fast. POOL jobs
+            // validate NOTHING here: the pool is operator config, a broken
+            // first entry must not block admission (the processor resolves per
+            // candidate with failover), and the job key must be STABLE for
+            // idempotency, so pool jobs are keyed under the sentinel itself
+            // rather than under whichever member happened to be free.
+            if (effectiveSponsor !== PLATFORM_POOL_SENTINEL) {
+                const sponsor = await resolveFeeSponsor({ db, sponsorSessionId: effectiveSponsor, requestingUserId: (req as any).user?.id, config: getNightgatePluginConfig() });
+                await ensureFeeSponsorFacade(sponsor, facadeCfg);
+            }
             // Allow-list (optional): the contracts/circuits this sponsor will pay
             // for, from env. Empty = allow any (dev). Sends/deploys are never
             // in the vault's circuit set, so listing the vault's circuits scopes
             // it to attestation work.
             const allowedContracts = String(process.env.NIGHTGATE_SPONSOR_ALLOWED_CONTRACTS ?? '').split(',').map(s => s.trim()).filter(Boolean);
             const allowedCircuits = String(process.env.NIGHTGATE_SPONSOR_ALLOWED_CIRCUITS ?? '').split(',').map(s => s.trim()).filter(Boolean);
+            // Idempotency scope: pool jobs share ONE sessionId (the sentinel)
+            // and platform sponsors are shared across callers, so a raw key
+            // would put every caller into one global namespace (user A's key
+            // could dedupe or block user B's). Scope the key per caller.
+            const caller = String((req as any).user?.id ?? 'anonymous');
+            const scopedIdempotencyKey = idempotencyKey
+                ? bytesToHex(sha256(Buffer.from(`${caller}\u0000${idempotencyKey}`, 'utf8')))
+                : undefined;
             const job = await startJob({
-                kind: 'sponsorFinalizedTransaction', sessionId: sponsorSessionId, idempotencyKey,
+                kind: 'sponsorFinalizedTransaction', sessionId: effectiveSponsor, idempotencyKey: scopedIdempotencyKey,
                 // Fingerprint the tx CONTENT, not its length: two different
                 // transactions of equal size under one idempotencyKey would
                 // otherwise dedupe onto each other and the second caller would
                 // be handed the first one's job.
                 request: {
-                    feeSponsor: sponsor.sponsorSessionId,
+                    feeSponsor: effectiveSponsor,
+                    caller,
                     bytes: finalizedTxB64.length,
                     txHash: bytesToHex(sha256(Buffer.from(finalizedTxB64, 'base64')))
                 },
                 requestedBy: (req as any).user?.id, commandVersion: 1, encryptCommand: true,
-                command: { op: 'sponsorFinalized', finalizedTxB64, sponsorSessionId, allowedContracts, allowedCircuits }
+                command: { op: 'sponsorFinalized', finalizedTxB64, sponsorSessionId: effectiveSponsor, allowedContracts, allowedCircuits }
             });
-            // The job is keyed by the SPONSOR session, which an agent-grant
-            // caller may not know (the grant injects it server-side). Return it
-            // so the caller can poll getJobStatus without guessing.
-            return { ...job, sessionId: sponsorSessionId };
+            // The job is keyed by the SPONSOR session (or the pool sentinel),
+            // which an agent-grant caller may not know. Return it so the
+            // caller can poll getJobStatus without guessing.
+            return { ...job, sessionId: effectiveSponsor };
         });
     });
 

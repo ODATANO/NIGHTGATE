@@ -65,6 +65,7 @@ VEILCORE-REVIEW.md
 db/enhancements.md
 docs/feature-requests/
 scripts/probe-dust-sync-rate.mjs
+scripts/zz-make-api-sponsors.mjs
 docs/release-*.md
 docs/code-review-*.md
 docs/cap10-upgrade-assessment.md

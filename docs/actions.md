@@ -435,6 +435,20 @@ An empty list means "no restriction", which is only appropriate for a private
 deployment. Treat this endpoint as spend authority: whoever can reach it can
 make you pay a transaction fee.
 
+**Pool + failover (0.17.2).** The sessions in `NIGHTGATE_FEE_SPONSOR_SESSION`
+form a lease pool: one in-flight dust spend per wallet, callers queue on the
+pool (`NIGHTGATE_SPONSOR_LEASE_WAIT_MS`, default 120s), and a sponsor that
+fails retryably (cold facade, sync gap, stale dust) is benched for
+`NIGHTGATE_SPONSOR_COOLDOWN_MS` while the job tries the next one. Omit
+`sponsorSessionId` (or pass the pool sentinel
+`00000000-0000-0000-0000-706f6f6c0000`, a reserved UUID because the field is
+Edm.Guid) to use the pool; an explicit session stays exact. Grants may pin the
+sentinel as `sponsorSessionId`, but then only `sponsorFinalizedTransaction` is
+grantable (other actions cannot use the pool); `getJobStatus` polls under the
+sentinel (concrete member ids are normalized to it). Idempotency keys are
+scoped per caller. Throughput scales
+with the NUMBER of pool wallets, not with one wallet's balance.
+
 The caller's TTL applies. `buildSponsorable` (and the SDK's `ttlMinutes`,
 default 30) sets it; a transaction handed over too late is rejected by the node.
 

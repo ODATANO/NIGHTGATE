@@ -772,6 +772,43 @@ describe('getJobStatus', () => {
 // custom before/on handlers, so it is exercised programmatically with
 // explicit cds.User contexts via cds.tx.
 // ----------------------------------------------------------------------------
+describe('sponsorFinalizedTransaction over REAL OData (0.17.2 sentinel)', () => {
+    // The pool sentinel travels through fields DECLARED Edm.Guid
+    // (sponsorSessionId, the returned sessionId, getJobStatus.sessionId).
+    // A non-UUID string sentinel would be rejected by OData deserialization
+    // before any handler ran; this pins that the reserved UUID passes.
+    const SENTINEL = '00000000-0000-0000-0000-706f6f6c0000';
+
+    it('the sentinel passes Edm.Guid validation end to end', async () => {
+        process.env.NIGHTGATE_FEE_SPONSOR_SESSION = 'a4f1c8ee-0000-4000-8000-000000000001';
+        try {
+            // Reaches the HANDLER (mainnet gate / submission path), i.e. no
+            // OData 400 about a malformed Guid. The handler itself then fails
+            // on the unusable pool member, which proves admission accepted it.
+            const res = await cap.POST(`${API}/sponsorFinalizedTransaction`, {
+                finalizedTxB64: Buffer.from('probe').toString('base64'),
+                sponsorSessionId: SENTINEL
+            }).catch((e: any) => e.response ?? e);
+            const body = JSON.stringify(res?.data ?? res?.message ?? '');
+            expect(body).not.toMatch(/Deserialization|Invalid value.*Guid|not a valid UUID/i);
+        } finally {
+            delete process.env.NIGHTGATE_FEE_SPONSOR_SESSION;
+        }
+    });
+
+    it('a NON-UUID sentinel string never starts a job (what a string sentinel would hit)', async () => {
+        let jobId: string | undefined;
+        try {
+            const res: any = await cap.POST(`${API}/sponsorFinalizedTransaction`, {
+                finalizedTxB64: Buffer.from('probe').toString('base64'),
+                sponsorSessionId: 'platform-pool'
+            });
+            jobId = res?.data?.jobId;
+        } catch { /* rejected, which is the point */ }
+        expect(jobId).toBeUndefined();
+    });
+});
+
 describe('owner-scoped entity reads', () => {
     const WALLET_SESSIONS = 'midnight.WalletSessions';
     const PENDING_SUBMISSIONS = 'midnight.PendingSubmissions';

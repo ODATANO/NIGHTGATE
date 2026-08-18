@@ -37,6 +37,8 @@ import type { Request } from '@sap/cds';
 import crypto from 'crypto';
 import { AgentGrants, WalletSessions } from '#cds-models/midnight';
 import { RateLimiter } from '../utils/rate-limiter';
+import { PLATFORM_POOL_SENTINEL } from '../submission/sponsor-pool';
+import { getConfiguredFeeSponsorSessions } from '../submission/fee-sponsor';
 import { runWithoutAmbientTx } from '../submission/background-jobs';
 import { resolveFeeSponsor, FeeSponsorError } from '../submission/fee-sponsor';
 import { getNightgatePluginConfig } from '../utils/nightgate-config';
@@ -186,7 +188,25 @@ export function registerAgentGrantHandlers(srv: any, db: any): void {
         // runs (platform-listed or caller-owned, active, unexpired, signing
         // key present, decryptable). Use-time re-resolution stays in place:
         // this cannot guarantee the sponsor outlives the grant.
-        if (data.sponsorSessionId) {
+        if (data.sponsorSessionId === PLATFORM_POOL_SENTINEL) {
+            // Pool grant (0.17.2): the concrete sponsor is chosen per job with
+            // failover. Valid only when a platform pool is configured; there
+            // is no single session to validate here, the per-use resolution
+            // stays in place. ONLY sponsorFinalizedTransaction understands the
+            // sentinel: it would be injected into every other allow-listed
+            // write and fail AFTER burning daily budget, so restrict the
+            // action set at creation.
+            const pool = getConfiguredFeeSponsorSessions(getNightgatePluginConfig());
+            if (pool.length === 0) {
+                return req.reject(412, `sponsorSessionId: '${PLATFORM_POOL_SENTINEL}' requires a configured NIGHTGATE_FEE_SPONSOR_SESSION pool`);
+            }
+            const incompatible = actions.filter(a => a !== 'sponsorFinalizedTransaction');
+            if (incompatible.length > 0) {
+                return req.reject(400,
+                    `a platform-pool grant may only allow 'sponsorFinalizedTransaction'; `
+                    + `these actions resolve the sponsor directly and cannot use the pool: ${incompatible.join(', ')}`);
+            }
+        } else if (data.sponsorSessionId) {
             try {
                 await runWithoutAmbientTx(() => resolveFeeSponsor({
                     db,
@@ -308,7 +328,15 @@ export async function enforceAgentGrant(req: Request, db: any): Promise<unknown>
         // sponsor's identity and must keep failing.
         const sponsorPoll = event === 'getJobStatus'
             && !!grant.sponsorSessionId
-            && data.sessionId === grant.sponsorSessionId;
+            && (data.sessionId === grant.sponsorSessionId
+                || (grant.sponsorSessionId === PLATFORM_POOL_SENTINEL
+                    && getConfiguredFeeSponsorSessions(getNightgatePluginConfig()).includes(String(data.sessionId ?? ''))));
+        // Pool jobs are KEYED under the sentinel; a poll naming a concrete
+        // pool member would pass this gate and then 404 in getJobStatus.
+        // Normalize to the sentinel after the membership check.
+        if (sponsorPoll && grant.sponsorSessionId === PLATFORM_POOL_SENTINEL) {
+            data.sessionId = PLATFORM_POOL_SENTINEL;
+        }
         if (data.sessionId !== undefined && data.sessionId !== null
             && data.sessionId !== grant.sessionId && !sponsorPoll) {
             return req.reject(403, 'sessionId does not match this agent grant');

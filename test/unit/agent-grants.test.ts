@@ -49,7 +49,10 @@ vi.mock('../../srv/submission/fee-sponsor', () => {
             this.name = 'FeeSponsorError';
         }
     }
-    return { resolveFeeSponsor: mockResolveFeeSponsor, FeeSponsorError };
+    // real env-reading behavior for the pool sentinel tests
+    const getConfiguredFeeSponsorSessions = () =>
+        String(process.env.NIGHTGATE_FEE_SPONSOR_SESSION ?? '').split(',').map(s => s.trim()).filter(Boolean);
+    return { resolveFeeSponsor: mockResolveFeeSponsor, FeeSponsorError, getConfiguredFeeSponsorSessions };
 });
 vi.mock('../../srv/utils/nightgate-config', () => ({
     getNightgatePluginConfig: () => ({})
@@ -388,6 +391,57 @@ describe('agent grants', () => {
             await enforceAgentGrant(req, db);
             expect(req.reject).not.toHaveBeenCalled();
             expect(mockDbRun).toHaveBeenCalledTimes(1); // grant lookup only, no budget UPDATE
+        });
+
+        it('a grant may pin the platform-pool sentinel; requires a configured pool', async () => {
+            const PLATFORM_POOL_SENTINEL = '00000000-0000-0000-0000-706f6f6c0000';
+            // without a pool: 412 at creation (after the session-ownership check)
+            delete process.env.NIGHTGATE_FEE_SPONSOR_SESSION;
+            mockDbRun.mockResolvedValueOnce({ sessionId: 'sess-1', isActive: true, expiresAt: null });
+            const req = makeReq({
+                sessionId: 'sess-1', allowedActions: ['sponsorFinalizedTransaction'],
+                sponsorSessionId: PLATFORM_POOL_SENTINEL
+            });
+            await handlers.createAgentGrant(req);
+            expect(req.reject).toHaveBeenCalledWith(412, expect.stringMatching(/pool/));
+
+            // with a pool but EXTRA actions: 400 (only sponsorFinalizedTransaction
+            // understands the sentinel; anything else would burn budget and fail)
+            process.env.NIGHTGATE_FEE_SPONSOR_SESSION = 'pool-1,pool-2';
+            mockDbRun.mockResolvedValueOnce({ sessionId: 'sess-1', isActive: true, expiresAt: null });
+            const mixed = makeReq({
+                sessionId: 'sess-1',
+                allowedActions: ['sponsorFinalizedTransaction', 'anchorDocument'],
+                sponsorSessionId: PLATFORM_POOL_SENTINEL
+            });
+            await handlers.createAgentGrant(mixed);
+            expect(mixed.reject).toHaveBeenCalledWith(400, expect.stringMatching(/anchorDocument/));
+            delete process.env.NIGHTGATE_FEE_SPONSOR_SESSION;
+
+            // with a pool: getJobStatus may poll under ANY pool member
+            process.env.NIGHTGATE_FEE_SPONSOR_SESSION = 'pool-1,pool-2';
+            try {
+                mockDbRun.mockResolvedValueOnce(grantRow({ sponsorSessionId: PLATFORM_POOL_SENTINEL }));
+                const poll = tokenReq('getJobStatus', { jobId: 'j1', sessionId: 'pool-2' });
+                await enforceAgentGrant(poll, db);
+                expect(poll.reject).not.toHaveBeenCalled();
+                // NORMALIZED: pool jobs are keyed under the sentinel, a
+                // concrete member id would pass the gate and then 404
+                expect(poll.data.sessionId).toBe(PLATFORM_POOL_SENTINEL);
+
+                // and the sentinel itself polls too
+                mockDbRun.mockResolvedValueOnce(grantRow({ sponsorSessionId: PLATFORM_POOL_SENTINEL }));
+                const direct = tokenReq('getJobStatus', { jobId: 'j1', sessionId: PLATFORM_POOL_SENTINEL });
+                await enforceAgentGrant(direct, db);
+                expect(direct.reject).not.toHaveBeenCalled();
+
+                mockDbRun.mockResolvedValueOnce(grantRow({ sponsorSessionId: PLATFORM_POOL_SENTINEL }));
+                const foreign = tokenReq('getJobStatus', { jobId: 'j1', sessionId: 'not-in-pool' });
+                await enforceAgentGrant(foreign, db);
+                expect(foreign.reject).toHaveBeenCalledWith(403, expect.stringContaining('sessionId'));
+            } finally {
+                delete process.env.NIGHTGATE_FEE_SPONSOR_SESSION;
+            }
         });
 
         it('sponsorFinalizedTransaction is grantable; the compute-only reads are free', async () => {

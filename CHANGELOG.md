@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.17.2 - 2026-08-18
+
+Sponsor pool with failover; no circuit change.
+
+- **`sponsorFinalizedTransaction` fails over across the platform pool.** A
+  wallet carries ONE dust spend in flight (concurrent balances race its dust
+  notes into 1010 rejects), so throughput scales with the NUMBER of sponsor
+  wallets, not with one wallet's balance. The sessions in
+  `NIGHTGATE_FEE_SPONSOR_SESSION` now form a lease pool: each sponsored job
+  leases one wallet for its duration (callers queue on the pool, bounded by
+  `NIGHTGATE_SPONSOR_LEASE_WAIT_MS`, default 120s), and a sponsor that fails
+  RETRYABLY (cold facade, sync gap, stale dust `1010/170`) is benched for
+  `NIGHTGATE_SPONSOR_COOLDOWN_MS` while the job tries the next one. Policy
+  refusals and malformed transactions never retry: they would fail on every
+  sponsor identically.
+- **Pool grants.** `createAgentGrant` accepts the pool sentinel
+  `00000000-0000-0000-0000-706f6f6c0000` as `sponsorSessionId` (a reserved
+  UUID: every carrying surface is Edm.Guid): the concrete sponsor is chosen
+  per job with failover. A sentinel grant may allow ONLY
+  `sponsorFinalizedTransaction` (other actions cannot use the pool and would
+  burn budget before failing); `getJobStatus` polls under the sentinel, and
+  concrete member ids are normalized to it. Omitting `sponsorSessionId` on
+  `sponsorFinalizedTransaction` uses the pool too, when one is configured. An
+  EXPLICIT sponsor session stays exact: pinning is a security boundary. Pool
+  jobs are KEYED under the sentinel (stable idempotency identity) and
+  idempotency keys are scoped per caller, so shared sponsors never share a
+  dedupe namespace. Admission validates nothing for pool jobs: a broken pool
+  entry cannot block the request, resolution happens per candidate in the
+  processor (resolution failures fail over too).
+
 ## 0.17.1 - 2026-08-18
 
 Standalone-image fix for external agents; no runtime change for plugin
