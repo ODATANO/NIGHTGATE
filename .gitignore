@@ -24,6 +24,11 @@ src/**/*.d.ts.map
 # @odatano/nightgate/browser with no types at all (scripts/check-package-exports.mjs now fails
 # on exactly that).
 !src/browser/*.d.ts
+# Same story for the client SDK and the txbuilder (0.17.0): hand-written .mjs
+# with hand-written .d.ts siblings, no .ts source to generate them from.
+!src/sdk/client.d.ts
+!src/sdk/index.d.ts
+!src/txbuilder/index.d.ts
 srv/**/*.js
 srv/**/*.d.ts
 srv/**/*.js.map
