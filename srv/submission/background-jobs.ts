@@ -36,6 +36,7 @@ import { resolveNightgateRuntimeConfig, getNightgatePluginConfig } from '../util
 import { runInJobExecutionContext } from './job-execution-context';
 import { encrypt as encryptAtRest, decrypt as decryptAtRest, getEncryptionKey } from '../utils/crypto';
 import { getArtifactGenerationDigest } from './contract-registry';
+import { isCallNotAppliedFailure } from './sponsor-pool';
 
 const { SELECT, INSERT, UPDATE } = cds.ql;
 
@@ -94,7 +95,10 @@ const HEAVY_KINDS: ReadonlySet<string> = new Set([
     'fieldPredicateBatchProof',
     'grantDisclosure',
     'revokeDisclosure',
-    'registerPassport'
+    'registerPassport',
+    // 0.18: proves the sponsor's dust spend in-process (wasm) per job; the
+    // worker overlaps these (build-only lock), so the cap is the real width.
+    'sponsorUnboundTransaction'
 ]);
 const WORKFLOW_PARENT_KINDS: ReadonlySet<string> = new Set([
     'issueFieldPredicateAttestation',
@@ -326,38 +330,67 @@ export async function startJob<TIn, TOut>(
         maxAttempts: 1
     });
 
+    // ADMISSION write hardening: like the status writes below, the job-row
+    // INSERT can lose the SQLite write lock to a long-held foreign commit (a
+    // multi-MB wallet-state save on a box that keeps many wallets warm; live:
+    // `database is locked` 500 on sponsorFinalizedTransaction while nine
+    // facades were saving). A failed INSERT committed nothing, so a bounded
+    // retry is safe; under the pinned request tx the savepoint is rolled back
+    // between attempts so the tx stays clean.
     if (idempotencyKey && pinnedRunner) {
         // A concurrent same-key request can pass the dedupe read (winner not yet
         // committed) and collide here on the unique constraint; return the
         // WINNER's job, not a raw error. The savepoint lets ROLLBACK TO clear
         // Postgres's aborted-tx state so the handler can continue.
         const sp = 'nightgate_job_insert';
-        await pinnedRunner.run(`SAVEPOINT ${sp}`);
-        try {
-            await pinnedRunner.run(buildInsert());
-        } catch (insertErr) {
-            await pinnedRunner.run(`ROLLBACK TO SAVEPOINT ${sp}`);
-            await pinnedRunner.run(`RELEASE SAVEPOINT ${sp}`);
-            if (!isUniqueViolation(insertErr)) throw insertErr;
-            const dup = await dedupExisting<TIn, TOut>(pinnedRunner, sessionId, kind, idempotencyKey, payloadFingerprint);
-            if (dup) return dup;
-            throw insertErr;
+        for (let attempt = 0; ; attempt++) {
+            if (statusWriteBackoffMs[attempt]) await sleep(statusWriteBackoffMs[attempt]);
+            await pinnedRunner.run(`SAVEPOINT ${sp}`);
+            try {
+                await pinnedRunner.run(buildInsert());
+                await pinnedRunner.run(`RELEASE SAVEPOINT ${sp}`);
+                break;
+            } catch (insertErr) {
+                await pinnedRunner.run(`ROLLBACK TO SAVEPOINT ${sp}`);
+                await pinnedRunner.run(`RELEASE SAVEPOINT ${sp}`);
+                if (isLockContention(insertErr) && attempt + 1 < STATUS_WRITE_ATTEMPTS) {
+                    cds.log('nightgate').warn(`startJob(${kind}): admission insert lost the SQLite lock (attempt ${attempt + 1}/${STATUS_WRITE_ATTEMPTS})`);
+                    continue;
+                }
+                if (!isUniqueViolation(insertErr)) throw insertErr;
+                const dup = await dedupExisting<TIn, TOut>(pinnedRunner, sessionId, kind, idempotencyKey, payloadFingerprint);
+                if (dup) return dup;
+                throw insertErr;
+            }
         }
-        await pinnedRunner.run(`RELEASE SAVEPOINT ${sp}`);
     } else if (idempotencyKey) {
         // No pinned runner (outside a request tx): autocommit insert. Each db.run
         // is its own connection, so a collision poisons nothing; recover the
         // winner on a fresh read.
         try {
-            await db.run(buildInsert());
+            await withStatusWriteRetry(`startJob(${kind}) admission insert`, () => db.run(buildInsert()));
         } catch (insertErr) {
             if (!isUniqueViolation(insertErr)) throw insertErr;
             const dup = await dedupExisting<TIn, TOut>(db, sessionId, kind, idempotencyKey, payloadFingerprint);
             if (dup) return dup;
             throw insertErr;
         }
+    } else if (pinnedRunner) {
+        for (let attempt = 0; ; attempt++) {
+            if (statusWriteBackoffMs[attempt]) await sleep(statusWriteBackoffMs[attempt]);
+            try {
+                await pinnedRunner.run(buildInsert());
+                break;
+            } catch (insertErr) {
+                if (isLockContention(insertErr) && attempt + 1 < STATUS_WRITE_ATTEMPTS) {
+                    cds.log('nightgate').warn(`startJob(${kind}): admission insert lost the SQLite lock (attempt ${attempt + 1}/${STATUS_WRITE_ATTEMPTS})`);
+                    continue;
+                }
+                throw insertErr;
+            }
+        }
     } else {
-        await db.run(buildInsert());
+        await withStatusWriteRetry(`startJob(${kind}) admission insert`, () => db.run(buildInsert()));
     }
 
     // Detach; the semaphore caps concurrent jobs of this kind.
@@ -456,7 +489,8 @@ function dispatchJob(jobId: string, kind: string, legacyWork?: () => Promise<unk
                 const result = await runWithoutAmbientTx(() => runInJobExecutionContext(
                     {
                         reportExternalExecution: handle => markJobExternalExecution(jobId, handle),
-                        reportSubmitted: handle => markJobSubmitted(jobId, handle)
+                        reportSubmitted: handle => markJobSubmitted(jobId, handle),
+                        reportSubmissionRejected: handle => markJobSubmissionRejected(jobId, handle)
                     },
                     executable
                 ));
@@ -505,6 +539,12 @@ function dispatchJob(jobId: string, kind: string, legacyWork?: () => Promise<unk
                     cds.log('nightgate').info(
                         `Job ${jobId} errored after being superseded mid-run; keeping SUPERSEDED (dropped: ${classification.code})`
                     );
+                } else if (current?.txHash && IDENTIFIER_KEYED_KINDS.has(current.kind) && isCallNotAppliedFailure(err)) {
+                    // The worker PROVED the outcome via the indexer (in a block,
+                    // call not applied): terminal, no reconciliation detour (a
+                    // client polling waitForJob must not see a transient
+                    // reconciliation_required that flips seconds later).
+                    await markChainFailureAfterBroadcast(jobId, current);
                 } else if (current?.txHash) {
                     await markReconciliationRequired(jobId, {
                         code: 'EXTERNAL_EXECUTION_FAILED',
@@ -739,6 +779,23 @@ export async function recoverInterruptedJobs(): Promise<number> {
                 })
                 .where({ status: { in: ['pending', 'running'] }, commandVersion: null })
         );
+        // An identifier-keyed sponsor job in external_execution WITHOUT a hash is
+        // a job whose last broadcast attempt was provably rejected
+        // (markJobSubmissionRejected) and that was waiting to rebuild when the
+        // process died: nothing of it can be on-chain, and no confirmer could
+        // ever resolve it (no identifier). Fail it plainly instead of parking
+        // it in reconciliation_required forever.
+        await db.run(
+            UPDATE.entity(BackgroundJobs)
+                .set({
+                    status: 'failed',
+                    errorCode: 'PROCESS_RESTART_AFTER_REJECT',
+                    errorMessage: 'The process restarted while a rejected sponsoring attempt was waiting to be rebuilt; nothing of it is on-chain. Resubmit the call.',
+                    finishedAt: new Date().toISOString(),
+                    leaseOwner: null, leaseExpiresAt: null, heartbeatAt: null
+                })
+                .where({ status: 'external_execution', txHash: null, kind: { in: [...IDENTIFIER_KEYED_KINDS] } })
+        );
         await db.run(
             UPDATE.entity(BackgroundJobs)
                 .set({
@@ -882,12 +939,82 @@ let confirmerLegacyCursor: string | undefined;
 // crawler deployments see no behavior change.
 type ChainOutcomeConfirmer = (txHash: string) => Promise<{ status: 'success' | 'failure' } | null>;
 let chainOutcomeConfirmer: ChainOutcomeConfirmer | null = null;
+/**
+ * Kinds whose `txHash` is the LEDGER TRANSACTION IDENTIFIER (what the wallet
+ * SDK's submit returns), not the Substrate extrinsic hash the crawler keys
+ * on. Their chain outcome is confirmed/reconciled by the indexer confirmer
+ * only, which is therefore registered for them even when the crawler runs.
+ */
+export const IDENTIFIER_KEYED_KINDS: ReadonlySet<string> = new Set([
+    'sponsorFinalizedTransaction',
+    'sponsorUnboundTransaction'
+]);
+let confirmerReconcileCursor: string | undefined;
 let chainConfirmActive = false;
 const CHAIN_CONFIRM_CONCURRENCY = 8;
 
 /** Register (or clear, with null) the crawler-free tx-outcome confirmer. */
-export function registerChainOutcomeConfirmer(confirmer: ChainOutcomeConfirmer | null): void {
+/**
+ * Finalize an identifier-keyed sponsor job from its indexer outcome: the job
+ * row and the attempt's PendingSubmissions row change in ONE transaction (a
+ * lost second write cannot strand the submission as `pending`/`included`
+ * while the job is terminal). The result written on a reconciled success is
+ * the CANONICAL shape the action documents (`txHash, circuits,
+ * contractAddress, note?, feeSponsor`), rebuilt from the coordinates the
+ * worker announced at submit time (stored as JSON in the attempt row's
+ * internal `submitIntentData`; `finalizedTxData` stays the indexed-tx snapshot).
+ * `fromStatus: 'reconciliation_required'` moves the job to its terminal state;
+ * `fromStatus: 'in_flight'` does the same straight from the running job (the
+ * worker proved the outcome; lease-guarded); `fromStatus: 'succeeded'` only
+ * advances chainStatus (CAS on chainStatusWas).
+ */
+async function finalizeIdentifierKeyedJob(
+    db: any, job: BackgroundJobRow, status: 'success' | 'failure',
+    opts: { fromStatus: 'reconciliation_required' | 'in_flight' | 'succeeded'; chainStatusWas?: string | null }
+): Promise<number> {
+    const now = new Date().toISOString();
+    const submission = await db.run(SELECT.one.from(PendingSubmissions).where(job.submissionId ? { ID: job.submissionId } : { txHash: job.txHash }));
+    let coordinates: any = {};
+    try { coordinates = submission?.submitIntentData ? JSON.parse(submission.submitIntentData) : {}; } catch { coordinates = {}; }
+    const canonicalResult = {
+        txHash: job.txHash,
+        circuits: Array.isArray(coordinates.circuits) && coordinates.circuits.length ? coordinates.circuits : (submission?.circuitName ? [submission.circuitName] : []),
+        contractAddress: coordinates.contractAddress ?? submission?.contractAddress ?? '',
+        ...(coordinates.note ? { note: coordinates.note } : {}),
+        feeSponsor: coordinates.feeSponsor ?? job.sessionId,
+        reconciled: true
+    };
+    const terminal = opts.fromStatus === 'reconciliation_required' || opts.fromStatus === 'in_flight';
+    const jobPatch: Record<string, unknown> = terminal
+        ? (status === 'success'
+            ? { status: 'succeeded', chainStatus: 'success', chainFinalizedAt: now, errorCode: null, errorMessage: null, finishedAt: now, result: safeStringify(canonicalResult) }
+            : { status: 'failed', chainStatus: 'failure', chainFinalizedAt: now, finishedAt: now,
+                errorCode: 'CHAIN_EXECUTION_FAILED', errorMessage: `Transaction ${job.txHash} is on-chain but its contract call did not apply (ledger result failure)` })
+        : { chainStatus: status, chainFinalizedAt: now };
+    if (opts.fromStatus === 'in_flight') Object.assign(jobPatch, { leaseOwner: null, leaseExpiresAt: null, heartbeatAt: null });
+    const jobWhere: Record<string, unknown> = opts.fromStatus === 'reconciliation_required'
+        ? { ID: job.ID, status: 'reconciliation_required' }
+        : opts.fromStatus === 'in_flight'
+            ? { ID: job.ID, leaseOwner: getRuntimeWorkerId(), status: { in: ['running', 'external_execution', 'submitted'] } }
+            : { ID: job.ID, status: 'succeeded', chainStatus: opts.chainStatusWas ?? null };
+    const subPatch: Record<string, unknown> = {
+        status: status === 'success' ? 'finalized' : 'failed',
+        finalizedAt: now,
+        ...(status === 'failure' ? { errorCode: 'CHAIN_EXECUTION_FAILED', errorMessage: 'contract call did not apply (ledger result failure)' } : {})
+    };
+    return withStatusWriteRetry(`finalizeIdentifierKeyedJob(${job.ID})`, () => (db as any).tx(async (tx: any) => {
+        const affected = affectedRows(await tx.run(UPDATE.entity(BackgroundJobs).set(jobPatch as any).where(jobWhere)));
+        if (affected === 1 && submission?.ID) {
+            await tx.run(UPDATE.entity(PendingSubmissions).set(subPatch as any).where({ ID: submission.ID }));
+        }
+        return affected;
+    }));
+}
+
+let confirmerIdentifierKindsOnly = false;
+export function registerChainOutcomeConfirmer(confirmer: ChainOutcomeConfirmer | null, opts: { identifierKindsOnly?: boolean } = {}): void {
     chainOutcomeConfirmer = confirmer;
+    confirmerIdentifierKindsOnly = !!opts.identifierKindsOnly;
 }
 
 /**
@@ -1155,7 +1282,27 @@ export async function confirmChainOutcomesViaIndexer(existingDb?: any): Promise<
         status: 'succeeded', txHash: { '!=': null }, chainStatus: null
     }, confirmerLegacyCursor);
     confirmerLegacyCursor = legacyPage.cursor;
-    const jobs = [...pendingPage.rows, ...legacyPage.rows].filter(job => !WORKFLOW_PARENT_KINDS.has(job.kind));
+    // Identifier-keyed kinds (the sponsor paths store the ledger transaction
+    // identifier, which only the indexer answers; the crawler keys on the
+    // Substrate extrinsic hash and never finds them) are ALSO resolved from
+    // reconciliation_required here: the indexer's apply result is exactly the
+    // evidence reconciliation needs. Success -> succeeded (result carries the
+    // identifier), failure -> failed, not indexed -> stays.
+    const reconcilePage = await scanBackgroundJobPage(db, {
+        status: 'reconciliation_required', txHash: { '!=': null }, kind: { in: [...IDENTIFIER_KEYED_KINDS] }
+    }, confirmerReconcileCursor);
+    confirmerReconcileCursor = reconcilePage.cursor;
+    for (const job of reconcilePage.rows) {
+        let outcome: { status: 'success' | 'failure' } | null;
+        try { outcome = await confirmer(job.txHash!); } catch { continue; }
+        if (!outcome) continue;
+        try {
+            await finalizeIdentifierKeyedJob(db, job, outcome.status, { fromStatus: 'reconciliation_required' });
+        } catch { /* next pass */ }
+    }
+    const jobs = [...pendingPage.rows, ...legacyPage.rows]
+        .filter(job => !WORKFLOW_PARENT_KINDS.has(job.kind))
+        .filter(job => !confirmerIdentifierKindsOnly || IDENTIFIER_KEYED_KINDS.has(job.kind));
     let updated = 0;
     let lookupErrors = 0;
     let writeErrors = 0;
@@ -1174,13 +1321,19 @@ export async function confirmChainOutcomesViaIndexer(existingDb?: any): Promise<
         // for legacy rows, `IS NULL` - not `IN (...)`, which never matches NULL in
         // SQL). Keeps the write a safe no-op if the value changed since the scan.
         try {
-            const affected = await withStatusWriteRetry(`confirmChainOutcome(${job.ID})`, () => db.run(
-                UPDATE.entity(BackgroundJobs).set({
-                    chainStatus: outcome!.status,
-                    chainFinalizedAt: new Date().toISOString()
-                }).where({ ID: job.ID, status: 'succeeded', chainStatus: job.chainStatus ?? null })
-            ));
-            updated += affectedRows(affected);
+            if (IDENTIFIER_KEYED_KINDS.has(job.kind)) {
+                // Sponsor jobs: job chainStatus AND the attempt's PendingSubmissions
+                // row are finalized together (the crawler never sees these rows).
+                updated += await finalizeIdentifierKeyedJob(db, job, outcome.status, { fromStatus: 'succeeded', chainStatusWas: job.chainStatus ?? null });
+            } else {
+                const affected = await withStatusWriteRetry(`confirmChainOutcome(${job.ID})`, () => db.run(
+                    UPDATE.entity(BackgroundJobs).set({
+                        chainStatus: outcome!.status,
+                        chainFinalizedAt: new Date().toISOString()
+                    }).where({ ID: job.ID, status: 'succeeded', chainStatus: job.chainStatus ?? null })
+                ));
+                updated += affectedRows(affected);
+            }
         } catch {
             writeErrors++;
         }
@@ -1343,6 +1496,26 @@ async function markFailed(jobId: string, classification: SubmissionErrorClassifi
     }
 }
 
+/**
+ * Terminal failure of an identifier-keyed job whose on-chain outcome the
+ * worker already PROVED (transaction in a block, contract call not applied):
+ * same writes as the reconcile pass's FAILURE branch, but straight from the
+ * running job (lease-guarded CAS), job row + attempt row in one transaction.
+ */
+async function markChainFailureAfterBroadcast(jobId: string, current: BackgroundJobRow): Promise<void> {
+    const db = await cds.connect.to('db');
+    try {
+        const affected = await finalizeIdentifierKeyedJob(db, current, 'failure', { fromStatus: 'in_flight' });
+        if (affected !== 1) throw new Error(`Lease lost before terminal chain-failure update (${jobId})`);
+    } catch (writeErr) {
+        cds.log('nightgate').error(
+            `markChainFailureAfterBroadcast(${jobId}): could not persist the terminal status after ${STATUS_WRITE_ATTEMPTS} attempts; ` +
+            `job row stays non-terminal until restart recovery (identifier ${current.txHash}).`,
+            writeErr
+        );
+    }
+}
+
 async function markReconciliationRequired(jobId: string, classification: { code: string; message: string }): Promise<void> {
     const db = await cds.connect.to('db');
     try {
@@ -1442,6 +1615,29 @@ export async function markJobExternalExecution(jobId: string, submission: { subm
     throw new Error(`Lease lost before markJobExternalExecution(${jobId})`);
 }
 
+/**
+ * The announced attempt was provably rejected before inclusion: clear the
+ * job's txHash (and step back to external_execution) so that, if the retries
+ * are exhausted, the job fails as a plain `failed` instead of
+ * `reconciliation_required` (which needs a hash that MAY be on-chain). The
+ * attempt's own PendingSubmissions row keeps the rejected hash for audit.
+ */
+export async function markJobSubmissionRejected(jobId: string, submission: { submissionId?: string; txHash?: string }): Promise<void> {
+    const db = await cds.connect.to('db');
+    await withStatusWriteRetry(`markJobSubmissionRejected(${jobId})`, async () => db.run(
+        UPDATE.entity(BackgroundJobs)
+            .set({
+                status: 'external_execution',
+                txHash: null,
+                chainStatus: null,
+                submissionId: submission.submissionId ?? null,
+                heartbeatAt: new Date().toISOString(),
+                leaseExpiresAt: new Date(Date.now() + JOB_LEASE_MS).toISOString()
+            })
+            .where({ ID: jobId, status: { in: ['external_execution', 'submitted'] }, leaseOwner: getRuntimeWorkerId(), ...(submission.txHash ? { txHash: submission.txHash } : {}) })
+    ));
+}
+
 /** Persist the external transaction hash after the SDK call returned. */
 export async function markJobSubmitted(jobId: string, submission: { submissionId?: string; txHash?: string }): Promise<void> {
     const db = await cds.connect.to('db');
@@ -1465,6 +1661,8 @@ export async function markJobSubmitted(jobId: string, submission: { submissionId
 
 /** Test-only reset of the in-memory caches. */
 export function __resetForTests(): void {
+    confirmerIdentifierKindsOnly = false;
+    confirmerReconcileCursor = undefined;
     stopBackgroundJobProcessor();
     semaphores.clear();
     cachedNetwork = undefined;

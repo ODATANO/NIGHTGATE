@@ -76,14 +76,14 @@ function stripODataNoise(payload) {
  * @param {string} [opts.username]         Basic auth user (also alongside agentToken)
  * @param {string} [opts.password]
  * @param {number} [opts.timeoutMs]        per-request timeout, default 120000
- * @param {number} [opts.pollMs]           waitForJob poll interval, default 5000
+ * @param {number} [opts.pollMs]           waitForJob poll interval, default 2000
  * @param {Function} [opts.fetchFn]        override fetch (tests)
  */
 export function connect(opts) {
     const {
         baseUrl, servicePath = '/api/v1/nightgate',
         agentToken, token, username, password,
-        timeoutMs = 120_000, pollMs = 5_000, fetchFn
+        timeoutMs = 120_000, pollMs = 2_000, fetchFn
     } = opts ?? {};
     if (!baseUrl) throw new Error('connect: baseUrl is required');
     const doFetch = fetchFn || fetch;
@@ -136,13 +136,43 @@ export function connect(opts) {
         return request('POST', `${service}/${name}`, body);
     }
 
-    /** Poll getJobStatus until the job settles; returns the PARSED result. */
-    async function waitForJob({ jobId, sessionId, pollMs: overridePollMs, timeoutMs: waitTimeoutMs = 60 * 60 * 1000 }) {
+    /**
+     * A poll that failed for a reason that says nothing about the JOB: a proxy
+     * or server hiccup (502/503/504/429), a network error, a timeout. The job
+     * keeps running server-side, so the poll is retried (bounded) instead of
+     * losing the job handle. Live case: a reverse proxy answered one poll with
+     * 502 while the server was busy restoring a wallet; the jobs landed.
+     */
+    function isTransientPollError(err) {
+        if (err instanceof NightgateApiError) return [429, 502, 503, 504].includes(err.status);
+        if (err instanceof NightgateJobError) return false;
+        return err?.name === 'TimeoutError' || err?.name === 'AbortError' || /fetch failed|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN/i.test(String(err?.message ?? err));
+    }
+
+    /**
+     * Poll getJobStatus until the job settles; returns the PARSED result.
+     * Transient poll failures are retried for up to `pollGraceMs` (default 5
+     * minutes) of consecutive failures; a job failure is thrown immediately.
+     */
+    async function waitForJob({ jobId, sessionId, pollMs: overridePollMs, timeoutMs: waitTimeoutMs = 60 * 60 * 1000, pollGraceMs = 5 * 60 * 1000 }) {
         if (!jobId) throw new Error('waitForJob: jobId is required');
         const interval = overridePollMs ?? pollMs;
         const deadline = Date.now() + waitTimeoutMs;
+        let firstPollFailure = null;
         for (;;) {
-            const job = await callAction('getJobStatus', { jobId, sessionId });
+            let job;
+            try {
+                job = await callAction('getJobStatus', { jobId, sessionId });
+                firstPollFailure = null;
+            } catch (err) {
+                if (!isTransientPollError(err)) throw err;
+                firstPollFailure ??= Date.now();
+                // Both bounds apply: the grace for consecutive poll failures AND
+                // the job's overall deadline.
+                if (Date.now() - firstPollFailure > pollGraceMs || Date.now() > deadline) throw err;
+                await new Promise(r => setTimeout(r, interval));
+                continue;
+            }
             if (job.status === 'succeeded') {
                 let result = {};
                 try { result = job.result ? JSON.parse(job.result) : {}; } catch { result = { raw: job.result }; }
@@ -223,6 +253,8 @@ export function connect(opts) {
          * txHash. The job is keyed by the SPONSOR session.
          */
         sponsorFinalized: (p) => act('sponsorFinalizedTransaction', p, 'sponsorSessionId'),
+        /** 0.18 parallel channel: submit an UNBOUND tx (buildSponsorable bind:false). */
+        sponsorUnbound: (p) => act('sponsorUnboundTransaction', p, 'sponsorSessionId'),
         buildSponsorable: (p) => act('buildSponsorable', p)
     };
 }

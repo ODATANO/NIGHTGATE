@@ -58,6 +58,7 @@ import {
     SHIELDED_TEST_TOKEN_REF, SHIELDED_TEST_TOKEN_CIRCUIT, SHIELDED_TEST_TOKEN_AMOUNT
 } from './token-type';
 import { startJob, runChildCommand, registerBackgroundJobProcessor, registerBackgroundJobReconciliationFinalizer, type BackgroundJobRow, type ReconciliationEvidence } from './background-jobs';
+import { reportExternalExecution, reportExternalSubmission, reportSubmissionRejected } from './job-execution-context';
 import { reindexDisclosuresForContract } from './disclosure-indexer';
 import { readAttestationStateForContract } from './attestation-state';
 import { readPredicateStateForContract, expandAllowedMask, computeAttestCommitment } from './predicate-state';
@@ -66,11 +67,12 @@ import { blake2b256Hex, loadPureCircuitsFromRegistry, PureCircuitsUnavailableErr
 import { membershipPathFor, SET_DEPTH } from './set-root';
 import { deriveGranteeId } from './grantee-identity';
 import { getConfiguredGranteeBinding, isSelfServiceGranteeRegistrationAllowed } from '../utils/nightgate-config';
-import { Documents, Transactions, TransactionResults, PredicateAttestations, DisclosureGrants, GranteeIdentities } from '#cds-models/midnight';
-import { walletSponsorFinalizedTx } from '../midnight/wallet-worker-client';
+import { Documents, Transactions, TransactionResults, PredicateAttestations, DisclosureGrants, GranteeIdentities, PendingSubmissions } from '#cds-models/midnight';
+import { walletSponsorFinalizedTx, walletSponsorUnboundTx } from '../midnight/wallet-worker-client';
 import {
     PLATFORM_POOL_SENTINEL, acquireSponsor, releaseSponsor, benchSponsor,
-    isRetryableSponsorFailure, envMsSetting
+    isRetryableSponsorFailure, isDustRaceFailure, isGenericInvalidFailure, isPreInclusionReject, isAmbiguousSubmitOutcome, isCallNotAppliedFailure, envMsSetting,
+    sponsorCandidatesNonExclusive, touchSponsor
 } from './sponsor-pool';
 import { getConfiguredFeeSponsorSessions } from './fee-sponsor';
 
@@ -851,7 +853,71 @@ export function registerSubmissionHandlers(
 
     // Cross-server sponsoring PHASE 2 job: no contract call of our own, just
     // deserialize the caller's finalized tx, enforce policy, pay dust, submit.
+    /**
+     * EXTERNAL-EFFECT BOOKKEEPING across broadcast attempts of a sponsoring
+     * job (both channels). A job crosses the external_execution boundary ONCE
+     * (markJobExternalExecution is not re-entrant); every broadcast ATTEMPT
+     * gets its own PendingSubmissions row and is reported as submitted with its
+     * identifier (markJobSubmitted accepts external_execution|submitted, so it
+     * may repeat). A later attempt closes the previous row first: `REJECTED`
+     * (provably never on-chain; the job's hash is taken off via
+     * reportSubmissionRejected so an exhausted run fails plainly) or `REBUILT`.
+     * The job row's txHash is the LATEST attempt's identifier; reconciliation
+     * and chain-outcome confirmation resolve it against the indexer.
+     */
+    const sponsorAttemptLedger = (db: any, job: BackgroundJobRow, command: any, feeSponsorSessionId: () => string) => {
+        let boundaryCrossed = false;
+        let currentSubmissionId: string | null = null;
+        let currentTxHash: string | null = null;
+        const failPreviousAttempt = async (why: string, rejectedPreInclusion: boolean) => {
+            if (!currentSubmissionId) return;
+            try {
+                await db.run(UPDATE.entity(PendingSubmissions).set({ status: 'failed', errorCode: rejectedPreInclusion ? 'REJECTED' : 'REBUILT', errorMessage: why.slice(0, 500) }).where({ ID: currentSubmissionId }));
+            } catch { /* best effort */ }
+            if (rejectedPreInclusion) {
+                try { await reportSubmissionRejected({ submissionId: currentSubmissionId, txHash: currentTxHash ?? undefined }); } catch { /* best effort */ }
+            }
+            currentSubmissionId = null; currentTxHash = null;
+        };
+        // The intent carries what the WORKER inspected and chose (contract and
+        // circuits from the caller transaction, the dust backing, the paying
+        // account), so a reconciled result can be rebuilt canonically; stored
+        // as JSON on the attempt row (submitIntentData, internal; finalizedTxData
+        // keeps its public meaning: the indexed-transaction snapshot).
+        const onSubmitIntent = () => async (txHash: string, intent?: { contractAddress?: string; circuits?: string[]; note?: string; sponsorAccountId?: string }) => {
+            const submissionId = cds.utils.uuid();
+            const coordinates = {
+                feeSponsor: feeSponsorSessionId(), sponsorAccountId: intent?.sponsorAccountId ?? null,
+                circuits: intent?.circuits ?? [], contractAddress: intent?.contractAddress ?? null,
+                ...(intent?.note ? { note: intent.note } : {})
+            };
+            await db.run(INSERT.into(PendingSubmissions).entries({
+                ID: submissionId, txHash, contractAddress: intent?.contractAddress ?? null, circuitName: intent?.circuits?.[0] ?? null,
+                actionType: 'CALL', submittedAt: new Date().toISOString(), status: 'pending', sessionId: job.sessionId,
+                submitIntentData: JSON.stringify(coordinates)
+            }));
+            // Reference the row from here on, BEFORE the job-status writes: if
+            // either of them fails the worker is nacked and does not broadcast,
+            // and the row must be closed REJECTED rather than left pending.
+            currentSubmissionId = submissionId; currentTxHash = txHash;
+            try {
+                if (!boundaryCrossed) { await reportExternalExecution({ submissionId }); boundaryCrossed = true; }
+                await reportExternalSubmission({ submissionId, txHash });
+            } catch (e) {
+                await failPreviousAttempt(`submit-intent not persisted: ${String((e as Error)?.message ?? e)}`, true);
+                throw e;
+            }
+        };
+        const markIncluded = async (out: { contractAddress?: string; circuits?: string[] }) => {
+            if (!currentSubmissionId) return;
+            try { await db.run(UPDATE.entity(PendingSubmissions).set({ status: 'included', contractAddress: out.contractAddress ?? null, circuitName: out.circuits?.[0] ?? null }).where({ ID: currentSubmissionId })); } catch { /* best effort */ }
+        };
+        return { failPreviousAttempt, onSubmitIntent, markIncluded };
+    };
+
     const executeSponsorFinalized = async (command: any, job: BackgroundJobRow): Promise<unknown> => {
+        let activeSponsorSessionId = String(command.sponsorSessionId ?? job.sessionId);
+        const ledger = sponsorAttemptLedger(db, job, command, () => activeSponsorSessionId);
         const facadeCfg = facadeConfigFromEnv();
         await ensureNetworkId(facadeCfg.networkId);
 
@@ -885,17 +951,27 @@ export function registerSubmissionHandlers(
             try {
                 const sponsor = await resolveFeeSponsor({ db, sponsorSessionId: sessionId, requestingUserId: job.requestedBy ?? undefined, config: getNightgatePluginConfig() });
                 await ensureFeeSponsorFacade(sponsor, facadeCfg);
+                activeSponsorSessionId = sponsor.sponsorSessionId;
+                // Same durable external-effect boundary as the unbound path: the
+                // worker announces the identifier before it broadcasts, the job
+                // row carries it (and a PendingSubmissions row) from then on.
                 const out = await walletSponsorFinalizedTx({
                     sponsorSessionId: sponsor.accountId,
                     finalizedTxB64: command.finalizedTxB64,
                     networkId: facadeCfg.networkId,
                     allowedContracts: command.allowedContracts,
                     allowedCircuits: command.allowedCircuits
-                });
+                }, ledger.onSubmitIntent());
+                await ledger.markIncluded(out);
                 releaseSponsor(sessionId);
                 return { ...out, feeSponsor: sponsor.sponsorSessionId };
             } catch (e) {
                 lastErr = e;
+                // A failover to the next sponsor builds a NEW transaction: close
+                // this attempt's row. Whether the hash may stay on the job
+                // follows the same rule as the unbound path.
+                if (isAmbiguousSubmitOutcome(e)) { releaseSponsor(sessionId); throw e; }
+                await ledger.failPreviousAttempt(String((e as Error)?.message ?? e), isPreInclusionReject(e));
                 if (!isRetryableSponsorFailure(e)) {
                     releaseSponsor(sessionId);
                     throw e; // fails identically on every sponsor; do not burn the pool
@@ -910,6 +986,118 @@ export function registerSubmissionHandlers(
         throw lastErr ?? new Error('no sponsor candidate available');
     };
     registerBackgroundJobProcessor('sponsorFinalizedTransaction', 1, executeSponsorFinalized);
+
+    // 0.18 PARALLEL channel: same policy + pool + failover, but NO exclusive
+    // wallet lease. Concurrency comes from per-NOTE locking inside the worker,
+    // so many unbound jobs run on ONE wallet at once (distinct notes). The
+    // pool loop here only spreads load across wallets and fails over on error.
+    const executeSponsorUnbound = async (command: any, job: BackgroundJobRow): Promise<unknown> => {
+        const facadeCfg = facadeConfigFromEnv();
+        await ensureNetworkId(facadeCfg.networkId);
+
+        let candidates: string[];
+        if (command.sponsorSessionId === PLATFORM_POOL_SENTINEL) {
+            const pool = getConfiguredFeeSponsorSessions(getNightgatePluginConfig());
+            if (pool.length === 0) throw new Error('platform sponsor pool is empty (NIGHTGATE_FEE_SPONSOR_SESSION)');
+            candidates = sponsorCandidatesNonExclusive(pool);
+        } else {
+            candidates = [String(command.sponsorSessionId)];
+        }
+        const cooldownMs = envMsSetting('NIGHTGATE_SPONSOR_COOLDOWN_MS', 120_000);
+        // A 1010/170 or /196 is a transient dust race, not a sponsor-health problem:
+        // rebuild the dust spend fresh on the SAME sponsor and resubmit, up to
+        // dustRetries times with a short backoff (letting the dust state catch
+        // up). This is what makes concurrent sponsoring deterministic instead of
+        // "lands sometimes": a lost dust race self-heals rather than failing the
+        // job. Only a NON-dust retryable failure benches the sponsor + fails over.
+        // 4 x 5 s spans ~2 blocks: the rebuilt spend can only succeed once the
+        // sponsor's local dust wallet has applied the spend it lost against.
+        const dustRetries = envMsSetting('NIGHTGATE_SPONSOR_DUST_RETRIES', 4);
+        const dustBackoffMs = envMsSetting('NIGHTGATE_SPONSOR_DUST_BACKOFF_MS', 5_000);
+        cds.log('nightgate').info(`sponsorUnboundTransaction job: ${command.unboundTxB64?.length ?? 0} b64 chars, candidates ${candidates.map(c => c.slice(0, 8)).join('>')}`);
+
+        let lastErr: unknown;
+        let activeSponsorSessionId = String(command.sponsorSessionId ?? job.sessionId);
+        const ledger = sponsorAttemptLedger(db, job, command, () => activeSponsorSessionId);
+        const { failPreviousAttempt, onSubmitIntent } = ledger;
+        for (const sessionId of candidates) {
+            // LRU-touch BEFORE the first await: concurrent jobs compute their
+            // candidate order in the same tick, so a touch after the resolve
+            // would send them all to the same wallet instead of round-robin
+            // across the pool (one backing per wallet = one lane per wallet).
+            touchSponsor(sessionId);
+            for (let attempt = 0; attempt <= dustRetries; attempt++) {
+                try {
+                    const sponsor = await resolveFeeSponsor({ db, sponsorSessionId: sessionId, requestingUserId: job.requestedBy ?? undefined, config: getNightgatePluginConfig() });
+                    await ensureFeeSponsorFacade(sponsor, facadeCfg);
+                    activeSponsorSessionId = sponsor.sponsorSessionId;
+                    const out = await walletSponsorUnboundTx({
+                        sponsorSessionId: sponsor.accountId,
+                        unboundTxB64: command.unboundTxB64,
+                        networkId: facadeCfg.networkId,
+                        allowedContracts: command.allowedContracts,
+                        allowedCircuits: command.allowedCircuits
+                    }, onSubmitIntent());
+                    await ledger.markIncluded(out);
+                    return { ...out, feeSponsor: sponsor.sponsorSessionId };
+                } catch (e) {
+                    lastErr = e;
+                    if (isAmbiguousSubmitOutcome(e)) {
+                        // The broadcast may still be included: NO rebuild (two
+                        // identifiers / two fees could land). Leave the attempt
+                        // row pending and the job's hash in place; the job ends
+                        // reconciliation_required and the indexer confirmer
+                        // resolves it by identifier.
+                        cds.log('nightgate').warn(`unbound sponsor ${sessionId.slice(0, 8)}: ambiguous submit outcome, leaving the job for reconciliation: ${String((e as Error).message).slice(0, 120)}`);
+                        throw e;
+                    }
+                    if (isCallNotAppliedFailure(e)) {
+                        // On-chain, call not applied (PROVEN via the indexer):
+                        // the CALLER's transcript is stale (same-contract
+                        // conflict). No sponsor-side rebuild can fix that (the
+                        // same caller bytes are rejected at admission); the job
+                        // runner fails the job TERMINALLY with the identifier
+                        // (job + attempt row in one write, no detour through
+                        // reconciliation_required), the caller rebuilds against
+                        // the current contract state.
+                        cds.log('nightgate').warn(`unbound sponsor ${sessionId.slice(0, 8)}: sponsored call landed but did not apply (caller transcript stale); not retrying: ${String((e as Error).message).slice(0, 120)}`);
+                        throw e;
+                    }
+                    await failPreviousAttempt(String((e as Error)?.message ?? e), isPreInclusionReject(e));
+                    if (isDustRaceFailure(e)) {
+                        // Generic pool-Invalid: one rebuild only (each costs a
+                        // full dust proof and it may be a caller-side invalid tx).
+                        const budget = isGenericInvalidFailure(e) ? Math.min(1, dustRetries) : dustRetries;
+                        if (attempt < budget) {
+                            cds.log('nightgate').warn(`unbound sponsor ${sessionId.slice(0, 8)} hit a dust race (1010/170|196 or pool Invalid), rebuild-retry ${attempt + 1}/${budget}: ${String((e as Error).message).slice(-120)}`);
+                            await new Promise(resolve => setTimeout(resolve, dustBackoffMs));
+                            continue; // rebuild the dust spend fresh on the SAME sponsor
+                        }
+                        // Dust retries exhausted: this is the CALLER's transaction
+                        // losing (same-contract conflict, invalid tx), not a
+                        // sponsor-health problem. Do NOT bench the wallet; fail.
+                        throw e;
+                    }
+                    if (!isRetryableSponsorFailure(e)) throw e;
+                    benchSponsor(sessionId, cooldownMs);
+                    cds.log('nightgate').warn(`unbound sponsor ${sessionId.slice(0, 8)} failed retryably (${String((e as Error).message).slice(0, 120)})`);
+                    break; // fail over to the next candidate
+                }
+            }
+        }
+        throw lastErr ?? new Error('no sponsor candidate available');
+    };
+    // Parallel: the kind is HEAVY in background-jobs (4 concurrent by default,
+    // `jobs.concurrency.heavy`), and the worker's sponsorUnboundTx never books
+    // a spend in the sponsor's dust wallet and runs its proving + submit
+    // OUTSIDE the per-facade submit lock (only the fast dust build takes it),
+    // so N jobs overlap and land in parallel on N distinct dust backings.
+    // Same-backing jobs serialize on the worker's backing lock; a lost dust
+    // race (1010/170) self-heals via the rebuild-retry above. The whole-wallet
+    // dust-wedge snapshot/restore stays exclusive to the BOUND paths (which
+    // hold the whole-call lock); the unbound path never arms it.
+    registerBackgroundJobProcessor('sponsorUnboundTransaction', 1, executeSponsorUnbound);
+
     registerBackgroundJobProcessor('anchorDocument', 1, executeContractCommand);
     registerBackgroundJobProcessor('commitDocumentAnchor', 1, executeContractCommand);
     registerBackgroundJobProcessor('grantDisclosure', 1, executeContractCommand);
@@ -1348,6 +1536,48 @@ export function registerSubmissionHandlers(
             // The job is keyed by the SPONSOR session (or the pool sentinel),
             // which an agent-grant caller may not know. Return it so the
             // caller can poll getJobStatus without guessing.
+            return { ...job, sessionId: effectiveSponsor };
+        });
+    });
+
+    // 0.18 PARALLEL channel. Mirrors sponsorFinalizedTransaction but takes an
+    // UNBOUND caller tx; the processor uses per-note locking for parallelism.
+    srv.on('sponsorUnboundTransaction', async (req: Request) => {
+        const { unboundTxB64, sponsorSessionId, idempotencyKey } = req.data as {
+            unboundTxB64?: string; sponsorSessionId?: string; idempotencyKey?: string;
+        };
+        if (!unboundTxB64) return req.reject(400, 'unboundTxB64 is required');
+        const pool = getConfiguredFeeSponsorSessions(getNightgatePluginConfig());
+        let effectiveSponsor = sponsorSessionId;
+        if (!effectiveSponsor || effectiveSponsor === PLATFORM_POOL_SENTINEL) {
+            if (pool.length === 0) return req.reject(400, 'sponsorSessionId is required; no platform pool is configured');
+            effectiveSponsor = PLATFORM_POOL_SENTINEL;
+        }
+        if (rejectIfMainnetBlocked(req)) return;
+
+        return runSubmission(req, async () => {
+            const facadeCfg = facadeConfigFromEnv();
+            await ensureNetworkId(facadeCfg.networkId);
+            if (effectiveSponsor !== PLATFORM_POOL_SENTINEL) {
+                const sponsor = await resolveFeeSponsor({ db, sponsorSessionId: effectiveSponsor, requestingUserId: (req as any).user?.id, config: getNightgatePluginConfig() });
+                await ensureFeeSponsorFacade(sponsor, facadeCfg);
+            }
+            const allowedContracts = String(process.env.NIGHTGATE_SPONSOR_ALLOWED_CONTRACTS ?? '').split(',').map(s => s.trim()).filter(Boolean);
+            const allowedCircuits = String(process.env.NIGHTGATE_SPONSOR_ALLOWED_CIRCUITS ?? '').split(',').map(s => s.trim()).filter(Boolean);
+            const caller = String((req as any).user?.id ?? 'anonymous');
+            const scopedIdempotencyKey = idempotencyKey
+                ? bytesToHex(sha256(Buffer.from(`${caller}\u0000${idempotencyKey}`, 'utf8')))
+                : undefined;
+            const job = await startJob({
+                kind: 'sponsorUnboundTransaction', sessionId: effectiveSponsor, idempotencyKey: scopedIdempotencyKey,
+                request: {
+                    feeSponsor: effectiveSponsor, caller,
+                    bytes: unboundTxB64.length,
+                    txHash: bytesToHex(sha256(Buffer.from(unboundTxB64, 'base64')))
+                },
+                requestedBy: (req as any).user?.id, commandVersion: 1, encryptCommand: true,
+                command: { op: 'sponsorUnbound', unboundTxB64, sponsorSessionId: effectiveSponsor, allowedContracts, allowedCircuits }
+            });
             return { ...job, sessionId: effectiveSponsor };
         });
     });

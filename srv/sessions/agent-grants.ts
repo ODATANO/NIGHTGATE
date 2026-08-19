@@ -74,8 +74,16 @@ export const AGENT_ALLOWLISTABLE_ACTIONS: readonly string[] = [
     // PROVEN and SIGNED, so the grant spends nothing but the sponsor's dust,
     // which is exactly what sponsor pinning + the daily budget meter. The
     // on-chain effect carries the BUILDER's identity, not the session's.
-    'sponsorFinalizedTransaction'
+    // The unbound (parallel, 0.18) channel has the identical trust shape.
+    'sponsorFinalizedTransaction',
+    'sponsorUnboundTransaction'
 ];
+
+/** The phase-2 sponsoring actions: keyed by the SPONSOR session, pool-aware. */
+export const SPONSOR_PHASE2_ACTIONS: ReadonlySet<string> = new Set([
+    'sponsorFinalizedTransaction',
+    'sponsorUnboundTransaction'
+]);
 
 /**
  * Events every valid token may use without an allowlist entry and without
@@ -192,18 +200,18 @@ export function registerAgentGrantHandlers(srv: any, db: any): void {
             // Pool grant (0.17.2): the concrete sponsor is chosen per job with
             // failover. Valid only when a platform pool is configured; there
             // is no single session to validate here, the per-use resolution
-            // stays in place. ONLY sponsorFinalizedTransaction understands the
-            // sentinel: it would be injected into every other allow-listed
+            // stays in place. ONLY the phase-2 sponsoring actions understand
+            // the sentinel: it would be injected into every other allow-listed
             // write and fail AFTER burning daily budget, so restrict the
             // action set at creation.
             const pool = getConfiguredFeeSponsorSessions(getNightgatePluginConfig());
             if (pool.length === 0) {
                 return req.reject(412, `sponsorSessionId: '${PLATFORM_POOL_SENTINEL}' requires a configured NIGHTGATE_FEE_SPONSOR_SESSION pool`);
             }
-            const incompatible = actions.filter(a => a !== 'sponsorFinalizedTransaction');
+            const incompatible = actions.filter(a => !SPONSOR_PHASE2_ACTIONS.has(a));
             if (incompatible.length > 0) {
                 return req.reject(400,
-                    `a platform-pool grant may only allow 'sponsorFinalizedTransaction'; `
+                    `a platform-pool grant may only allow 'sponsorFinalizedTransaction' / 'sponsorUnboundTransaction'; `
                     + `these actions resolve the sponsor directly and cannot use the pool: ${incompatible.join(', ')}`);
             }
         } else if (data.sponsorSessionId) {
@@ -321,7 +329,8 @@ export async function enforceAgentGrant(req: Request, db: any): Promise<unknown>
     // Bind the request to the grant's session (and sponsor, when pinned).
     const data = (req as any).data;
     if (data && typeof data === 'object' && event !== 'READ') {
-        // Phase-2 sponsoring jobs (sponsorFinalizedTransaction) are keyed by
+        // Phase-2 sponsoring jobs (sponsorFinalizedTransaction /
+        // sponsorUnboundTransaction) are keyed by
         // the SPONSOR session, so polling them is the ONE place the grant's
         // pinned sponsor session is a valid job scope. Only getJobStatus:
         // a write with the sponsor session as sessionId would act under the

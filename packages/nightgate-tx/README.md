@@ -53,8 +53,8 @@ Covered: `verifyAttestation`, `verifyPredicate`, `verifyPredicateAttestation`,
 `proveDocumentDiff`, `grantDisclosure`, `revokeDisclosure`, `registerPassport`,
 wallet sessions, `deployContract`, `submitContractCall[Batch]`,
 `mintShieldedTestToken`, `deriveTokenType`, `sendNight`, `sponsorFinalized`,
-`buildSponsorable`, `waitForJob`, and `callFunction`/`callAction` as escape
-hatches for anything new.
+`sponsorUnbound`, `buildSponsorable`, `waitForJob`, and `callFunction`/`callAction`
+as escape hatches for anything new.
 
 **`createTxBuilder()`** is the part no hosted API can give you: build, prove
 (in-process wasm) and sign a transaction locally, so your seed and your
@@ -86,6 +86,12 @@ const { txHash } = await ng.sponsorFinalized({ finalizedTxB64, sponsorSessionId 
 The on-chain attestation carries **your** attester id; the sponsor pays the
 dust and never sees a key, a witness or a preimage. A complete runnable version
 is in [`example/anchor.mjs`](./example/anchor.mjs).
+
+Against a sponsor running NIGHTGATE 0.18 or later, prefer the parallel channel:
+`buildSponsorable({ contractAddress: VAULT, call, bind: false })` returns
+`unboundTxB64`, and `ng.sponsorUnbound({ unboundTxB64, sponsorSessionId })`
+lets one sponsor wallet pay for many callers at once (one per registered dust
+backing). Same proof, same identity, same TTL.
 
 ## Entry points
 

@@ -17,6 +17,7 @@ import { loadRegistryFromConfig, listRegisteredContracts } from '../srv/submissi
 import { redactUrlCredentials } from '../srv/utils/redact-url';
 import { ensureSyncStateSingleton } from '../srv/utils/sync-state';
 import { closeSessionsFromPreviousProcess } from '../srv/sessions/wallet-sessions';
+import { getConfiguredFeeSponsorSessions, prewarmFeeSponsorPool } from '../srv/submission/fee-sponsor';
 const log = cds.log('nightgate');
 import { startWalletWorker, stopWalletWorker } from '../srv/midnight/wallet-worker-client';
 import { wireWorkerStateSaveSink } from '../srv/submission/wallet-facade-builder';
@@ -115,7 +116,8 @@ async function ensureSchemaDeployed(): Promise<void> {
     const requiredTables: Array<{ table: string; columns?: string[] }> = [
         { table: 'midnight.Blocks' },
         { table: 'midnight.SyncState' },
-        { table: 'midnight.PendingSubmissions' },
+        // 0.18.0: sponsored-attempt intent coordinates (internal)
+        { table: 'midnight.PendingSubmissions', columns: ['submitIntentData'] },
         { table: 'midnight.TransactionResults' },
         { table: 'midnight.PrivateStates' },
         { table: 'midnight.ContractSigningKeys' },
@@ -347,15 +349,41 @@ export async function initialize(): Promise<NightgateIndexerStatus> {
         // per-tx Indexer lookup so `requireChainSuccess` is reachable without
         // block ingestion. Registered only when the crawler is off (or opted in);
         // with the crawler running it stays the source of truth.
+        // The indexer confirmer is ALWAYS registered: the sponsor paths store
+        // the ledger transaction identifier, which only the indexer answers (the
+        // crawler keys on extrinsic hashes and never finds them), so those jobs
+        // are confirmed/reconciled through it even when the crawler runs. With
+        // the crawler on, the pass is restricted to identifier-keyed kinds; the
+        // crawler stays the source of truth for everything else.
+        registerChainOutcomeConfirmer(buildIndexerTxConfirmer({
+            indexerHttpUrl: submissionEndpoints.indexerHttpUrl
+        }), { identifierKindsOnly: crawlerEnabled && !resolveCrawlerlessChainConfirmEnabled(crawlerEnabled, nightgateConfig) });
         if (resolveCrawlerlessChainConfirmEnabled(crawlerEnabled, nightgateConfig)) {
-            registerChainOutcomeConfirmer(buildIndexerTxConfirmer({
-                indexerHttpUrl: submissionEndpoints.indexerHttpUrl
-            }));
             log.info('Crawler-free chain-outcome confirmation enabled');
         } else if (crawlerEnabled && isCrawlerlessChainConfirmExplicitlyEnabled(nightgateConfig)) {
-            log.warn('crawlerlessChainConfirm opt-in ignored: the crawler is enabled and is the sole source of truth for chainStatus');
+            log.warn('crawlerlessChainConfirm opt-in ignored: the crawler is enabled and is the sole source of truth for chainStatus (identifier-keyed sponsor jobs are still confirmed via the indexer)');
+        } else {
+            log.info('Indexer chain-outcome confirmation enabled for identifier-keyed sponsor jobs');
         }
         log.info('Wallet worker thread ready');
+        // Warm the platform sponsor pool in the background (serialized; see
+        // prewarmFeeSponsorPool). Errors are logged per sponsor, never thrown.
+        const pool = getConfiguredFeeSponsorSessions(nightgateConfig);
+        if (pool.length > 0) {
+            log.info(`Sponsor pool: warming ${pool.length} sponsor facade(s) in the background`);
+            void prewarmFeeSponsorPool({
+                db: cds.db,
+                config: nightgateConfig,
+                facadeConfig: {
+                    networkId: network as any,
+                    indexerHttpUrl: submissionEndpoints.indexerHttpUrl,
+                    indexerWsUrl: submissionEndpoints.indexerWsUrl,
+                    proofServerUrl: submissionEndpoints.proofServerUrl,
+                    relayUrl: nodeUrl
+                },
+                log
+            }).catch(err => log.warn(`Sponsor pool prewarm aborted: ${err instanceof Error ? err.message : String(err)}`));
+        }
     } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         log.warn(`Wallet worker startup failed: ${msg}`);

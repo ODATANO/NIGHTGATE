@@ -26,7 +26,7 @@ export interface ConnectOptions {
     password?: string;
     /** per-request timeout, default 120000 */
     timeoutMs?: number;
-    /** waitForJob poll interval, default 5000 */
+    /** waitForJob poll interval, default 2000 */
     pollMs?: number;
     fetchFn?: typeof fetch;
 }
@@ -49,7 +49,8 @@ export interface NightgateClient {
     callFunction(name: string, params?: Params): Promise<any>;
     /** POST <service>/<name> */
     callAction(name: string, params?: ActionParams): Promise<any>;
-    waitForJob(input: { jobId: string; sessionId?: string; pollMs?: number; timeoutMs?: number }): Promise<JobResult>;
+    /** Polls getJobStatus; transient poll failures (429/502/503/504, network, timeout) are retried for up to pollGraceMs (default 5 min) of consecutive failures. */
+    waitForJob(input: { jobId: string; sessionId?: string; pollMs?: number; timeoutMs?: number; pollGraceMs?: number }): Promise<JobResult>;
 
     // crawler-free verification
     verifyAttestation(p: Params): Promise<any>;
@@ -97,6 +98,7 @@ export interface NightgateClient {
 
     // cross-server fee sponsoring
     sponsorFinalized(p: ActionParams): Promise<JobResult>;
+    sponsorUnbound(p: ActionParams): Promise<JobResult>;
     buildSponsorable(p: ActionParams): Promise<JobResult>;
 }
 

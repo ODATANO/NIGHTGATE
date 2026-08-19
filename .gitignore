@@ -79,3 +79,15 @@ packages/nightgate-tx/contracts/
 packages/nightgate-tx/LICENSE
 packages/nightgate-tx/.probe/
 packages/nightgate-tx/example/node_modules/
+scripts/probe-dust-notes.mjs
+scripts/probe-dust-merge.mjs
+scripts/probe-parallel-sponsor.mjs
+scripts/split-night-utxos.mjs
+scripts/probe-single-unbound.mjs
+scripts/probe-parallel-vaults.mjs
+scripts/probe-tx-cost.mjs
+scripts/zz-backings.mjs
+# local experiments (prebuilt unbound txs, probe logs, one-off probes)
+scratch/
+# DB backups taken by hand (e.g. before a wallet-state swap)
+db/*.bak

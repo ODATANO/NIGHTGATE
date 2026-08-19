@@ -142,10 +142,42 @@ describe('txbuilder: createTxBuilder input validation', () => {
         await expect(createTxBuilder({ ...base, contractClass: undefined })).rejects.toThrow(/contractClass is required/);
     });
 
+    it("server proving is an EXPLICIT opt-in: a bare proofServerUrl (documented unused in 0.17) does not select it, and 'server' without a URL rejects", async () => {
+        const { createTxBuilder } = await importTxBuilder();
+        await expect(createTxBuilder({ ...base, provingMode: 'tpu' })).rejects.toThrow(/provingMode must be 'wasm' or 'server'/);
+        await expect(createTxBuilder({ ...base, provingMode: 'server' })).rejects.toThrow(/requires proofServerUrl/);
+        // (a proofServerUrl alone keeps wasm: no rejection here; the build path is exercised live)
+    });
+
     it('exposes the vault circuit set', async () => {
         const { ATTESTATION_VAULT_CIRCUITS } = await importTxBuilder();
         expect(ATTESTATION_VAULT_CIRCUITS).toContain('attest');
         expect(ATTESTATION_VAULT_CIRCUITS).toContain('proveDocumentComparison');
         expect(new Set(ATTESTATION_VAULT_CIRCUITS).size).toBe(ATTESTATION_VAULT_CIRCUITS.length);
+    });
+});
+
+describe('txbuilder: unbound handover refuses a recipe that carries a balancing transaction (review P2)', () => {
+    it('bind:false throws when signRecipe returns a balancingTransaction; bind:true finalizes it', async () => {
+        const { buildOnlyWalletProvider } = await importTxBuilder();
+        const recipe: any = { type: 'UNBOUND_TRANSACTION', baseTransaction: { base: true }, balancingTransaction: { balancing: true } };
+        const facade = {
+            balanceUnboundTransaction: vi.fn(async (): Promise<any> => recipe),
+            signRecipe: vi.fn(async (r: any) => r),
+            finalizeRecipe: vi.fn(async () => ({ finalized: true }))
+        };
+        const keystore = { signData: vi.fn(() => new Uint8Array(64)) };
+        const holder: any = {};
+        const unbound = buildOnlyWalletProvider(facade, { coinPublicKey: 'c', encryptionPublicKey: 'e' }, { dust: true }, keystore, holder, 30, false);
+        await expect(unbound.balanceTx({ tx: true })).rejects.toThrow(/needs a balancing transaction.*bound handover/);
+        expect(holder.unbound).toBeUndefined();
+        const bound = buildOnlyWalletProvider(facade, { coinPublicKey: 'c', encryptionPublicKey: 'e' }, { dust: true }, keystore, {}, 30, true);
+        await expect(bound.balanceTx({ tx: true })).resolves.toEqual({ finalized: true });
+        // and a recipe WITHOUT balancing hands over the base unbound
+        facade.balanceUnboundTransaction.mockResolvedValueOnce({ type: 'UNBOUND_TRANSACTION', baseTransaction: { base: true } });
+        const holder2: any = {};
+        const unbound2 = buildOnlyWalletProvider(facade, { coinPublicKey: 'c', encryptionPublicKey: 'e' }, { dust: true }, keystore, holder2, 30, false);
+        await expect(unbound2.balanceTx({ tx: true })).resolves.toEqual({ base: true });
+        expect(holder2.unbound).toBe(true);
     });
 });

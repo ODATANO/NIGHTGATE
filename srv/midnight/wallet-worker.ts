@@ -28,7 +28,7 @@
 import { parentPort, MessageChannel, type MessagePort } from 'node:worker_threads';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { classificationHaystack, formatErr, safeDeepInspect } from '../utils/format-error';
+import { classificationHaystack, formatErr, formatErrWithCauses, safeDeepInspect } from '../utils/format-error';
 import { deriveIndexerWsUrl } from '../utils/indexer-url';
 import { runBatchInScope } from './batch-call-scope';
 import { buildWasmProofProvider, getSharedKeyMaterialProvider } from './wasm-proof-provider';
@@ -122,6 +122,23 @@ async function loadAddressFormat(): Promise<typeof AddressFormat> {
     if (cachedAddressFormat) return cachedAddressFormat;
     cachedAddressFormat = await import('@midnightntwrk/wallet-sdk-address-format');
     return cachedAddressFormat;
+}
+
+// The dust wallet's CoreWallet API (functional spendCoins), used by the
+// note-pool paths. Memoized as a PROMISE so concurrent first callers share
+// one module evaluation.
+let cachedDustCore: Promise<any> | undefined;
+function loadDustCoreWallet(): Promise<any> {
+    cachedDustCore ??= import('@midnightntwrk/wallet-sdk-dust-wallet/v1' as string).then((m: any) => m.CoreWallet);
+    return cachedDustCore;
+}
+
+// SDK submission service factory (dedicated per-submit node clients of the
+// parallel sponsor path). Memoized as a PROMISE, like loadDustCoreWallet.
+let cachedSubmission: Promise<any> | undefined;
+function loadSubmissionSdk(): Promise<any> {
+    cachedSubmission ??= import('@midnightntwrk/wallet-sdk-capabilities/submission' as string);
+    return cachedSubmission;
 }
 
 // Loaded only when NIGHTGATE_PROVING_MODE=wasm; the default server path
@@ -833,7 +850,10 @@ async function captureDustSnapshot(entry: FacadeEntry, site: string): Promise<vo
  * Replace the facade's dust sub-wallet with one restored from the armed
  * pre-build snapshot. The swap is safe mid-life: facade methods and our
  * periodic save / sync probes all reach the sub-wallet through `facade.dust`
- * at call time, and submits serialize per facade so no build is in flight.
+ * at call time, and submits serialize per facade (the dispatcher's
+ * SUBMIT_METHODS lock) so no other build is in flight. The unbound sponsor
+ * path runs outside that lock but never books a spend in this wallet and
+ * never arms this snapshot, so it cannot be rolled back by (or steal) one.
  * The old wallet is stopped only after the restored one started; if the
  * restore fails the old (wedged) wallet stays, which is no worse than today.
  */
@@ -928,6 +948,276 @@ async function submitWithDustGuard(entry: FacadeEntry, tx: any, site: string): P
             entry.preSubmitDustSnapshot = undefined;
         }
         throw e;
+    }
+}
+
+// ---- Dedicated submission clients (parallel sponsor path) ------------------
+//
+// The SDK's PolkadotNodeClient ends EVERY submission stream with
+// `api.disconnect()` on the facade's ONE shared node socket
+// (`Stream.ensuring` in sendMidnightTransaction). Two concurrent
+// submitAndWatch subscriptions on that client therefore kill each other: the
+// first stream to finish drops the socket and the other never receives its
+// InBlock/Finalized (live 2026-08-19: 3 of 4 concurrent sponsorings hung with
+// their transactions already on-chain). "Submits serialize per facade" is
+// thus a NODE-CLIENT invariant, independent of dust state. Every concurrent
+// unbound submit gets its OWN SDK SubmissionService (own socket) from a small
+// pool per relay URL; a slot is exclusive while its submit is in flight.
+//
+// SETTLE WINDOW: `WsProvider.disconnect()` returns before the socket is
+// closed and `isConnected` stays true until `onclose`, so the SDK's
+// ensureConnection skips the reconnect and sends on a CLOSING socket, which
+// rejects the request with `disconnected ...: 1000:: Normal Closure`. The
+// SDK client disconnects right after creation (PolkadotNodeClient.make) and
+// after every submission stream (Stream.ensuring), so a slot is unusable
+// for a moment after both (measured: broken at <= 300 ms, fine at >= 800 ms
+// against preprod). A slot therefore becomes ready only SUBMIT_CLIENT_SETTLE_MS
+// after creation and after each use; a submit that still dies on that exact
+// close is retried once (the request never left the closing socket, so no
+// double submit is possible).
+let SUBMIT_CLIENT_POOL_MAX = 8;
+const SUBMIT_CLIENT_SETTLE_MS = 2500;
+type SubmitClientSlot = { svc: any; busy: Promise<unknown> | null; readyAt: number };
+const submitClientPools = new Map<string, SubmitClientSlot[]>();
+const submitClientWaiters = new Map<string, number>(); // callers currently acquiring, per relay
+// Test seams: cap + pool introspection (the cap is a constant in production).
+export const __submitClientPoolForTests = {
+    setMax: (n: number) => { SUBMIT_CLIENT_POOL_MAX = n; },
+    size: (relayURL: URL) => submitClientPools.get(relayURL.toString())?.length ?? 0,
+    reset: () => submitClientPools.clear()
+};
+
+export class SubmitWatchTimeoutError extends Error {
+    constructor(ms: number) { super(`submit watch timed out after ${ms}ms without a Finalized status`); this.name = 'SubmitWatchTimeoutError'; }
+}
+
+async function withDedicatedSubmitClient<T>(relayURL: URL, fn: (svc: any) => Promise<T>, opts: { abandonAfterMs?: number } = {}): Promise<T> {
+    const key = relayURL.toString();
+    let pool = submitClientPools.get(key);
+    if (!pool) { pool = []; submitClientPools.set(key, pool); }
+    submitClientWaiters.set(key, (submitClientWaiters.get(key) ?? 0) + 1);
+    let slot: SubmitClientSlot | undefined;
+    try {
+        for (;;) {
+            const now = Date.now();
+            const free = pool.filter((s) => s.busy === null);
+            slot = free.find((s) => s.readyAt <= now);
+            if (slot) break;
+            // Create a client only when the free (ready or settling) slots cannot
+            // cover the callers currently waiting, and never beyond the cap. The
+            // slot is RESERVED SYNCHRONOUSLY (before any await) so concurrent
+            // first callers cannot all pass the size check and over-create; it is
+            // not ready (readyAt = Infinity) until the client exists.
+            const waiters = submitClientWaiters.get(key) ?? 1;
+            if (pool.length < SUBMIT_CLIENT_POOL_MAX && free.length < waiters) {
+                const created: SubmitClientSlot = { svc: null, busy: null, readyAt: Number.POSITIVE_INFINITY };
+                pool.push(created);
+                try {
+                    const caps: any = await loadSubmissionSdk();
+                    created.svc = caps.makeDefaultSubmissionService({ relayURL });
+                    created.readyAt = Date.now() + SUBMIT_CLIENT_SETTLE_MS;
+                } catch (e) {
+                    pool.splice(pool.indexOf(created), 1);
+                    throw e;
+                }
+                continue; // re-evaluate; the new slot becomes ready after its settle window
+            }
+            const settling = free.filter((s) => Number.isFinite(s.readyAt));
+            if (settling.length > 0) {
+                const wait = Math.max(0, Math.min(...settling.map((s) => s.readyAt)) - Date.now());
+                await new Promise((r) => setTimeout(r, wait));
+            } else if (free.length > 0) {
+                await new Promise((r) => setTimeout(r, 100)); // a slot is being created by another caller
+            } else {
+                await Promise.race(pool.map((s) => s.busy!.catch(() => undefined)));
+            }
+        }
+    } finally {
+        submitClientWaiters.set(key, Math.max(0, (submitClientWaiters.get(key) ?? 1) - 1));
+    }
+    const run = fn(slot.svc);
+    slot.busy = run.catch(() => undefined);
+    if (!opts.abandonAfterMs) {
+        try { return await run; } finally { slot.busy = null; slot.readyAt = Date.now() + SUBMIT_CLIENT_SETTLE_MS; }
+    }
+    // WATCHDOG: a submitAndWatch whose socket died mid-watch never resolves
+    // (the SDK client has no auto-reconnect after its own disconnect()). Do
+    // not let that pin the job until the TTL: abandon the call, EVICT the slot
+    // (its socket/subscription state is unknown) and let the caller decide via
+    // the indexer whether the transaction is on-chain.
+    let timer: NodeJS.Timeout | undefined;
+    const timeout = new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new SubmitWatchTimeoutError(opts.abandonAfterMs!)), opts.abandonAfterMs); });
+    try {
+        return await Promise.race([run, timeout]);
+    } catch (e) {
+        if (e instanceof SubmitWatchTimeoutError) {
+            const idx = pool.indexOf(slot);
+            if (idx >= 0) pool.splice(idx, 1);
+            try { await slot.svc?.close?.(); } catch { /* best effort */ }
+            slot.busy = null;
+        }
+        throw e;
+    } finally {
+        if (timer) clearTimeout(timer);
+        if (pool.includes(slot)) { slot.busy = null; slot.readyAt = Date.now() + SUBMIT_CLIENT_SETTLE_MS; }
+    }
+}
+
+/**
+ * Indexer lookup by transaction IDENTIFIER; null when unknown or unreachable.
+ * Also returns the ledger's APPLY result: `SUCCESS`, or `PARTIAL_SUCCESS` /
+ * `FAILURE` when a segment (the contract call) was rejected at apply time
+ * although the transaction sits in a block (its guaranteed part, i.e. the
+ * fee, went through). A sponsoring whose call did not apply is NOT a success
+ * (live: `attest` in block 2172277 with segment 42593 success=false, the
+ * anchor never existed, the sponsor paid).
+ */
+async function indexerBlockOfIdentifier(indexerHttpUrl: string, identifier: string): Promise<{ height: string; status: string | null; failedSegments: number[] } | null> {
+    try {
+        const r = await fetch(indexerHttpUrl, {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ query: `{ transactions(offset:{identifier:"${identifier}"}) { block { height } ... on RegularTransaction { transactionResult { status segments { id success } } } } }` }),
+            signal: AbortSignal.timeout(15_000)
+        });
+        const j: any = await r.json();
+        const t = j?.data?.transactions?.[0];
+        const h = t?.block?.height;
+        if (h == null) return null;
+        const res = t?.transactionResult;
+        const failed = Array.isArray(res?.segments) ? res.segments.filter((s: any) => s?.success === false).map((s: any) => Number(s.id)) : [];
+        return { height: String(h), status: res?.status ?? null, failedSegments: failed };
+    } catch { return null; }
+}
+
+export class SponsoredCallNotAppliedError extends Error {
+    constructor(identifier: string, height: string, status: string, failedSegments: number[]) {
+        super(`sponsored transaction ${identifier.slice(0, 16)} is in block ${height} but its contract call did NOT apply (ledger result ${status}, failed segment${failedSegments.length === 1 ? '' : 's'} ${failedSegments.join(',') || '?'}); the sponsor paid the fee, the call must be rebuilt against the current contract state`);
+        this.name = 'SponsoredCallNotAppliedError';
+    }
+}
+function assertApplied(found: { height: string; status: string | null; failedSegments: number[] }, identifier: string): void {
+    if (found.status && found.status !== 'SUCCESS') throw new SponsoredCallNotAppliedError(identifier, found.height, found.status, found.failedSegments);
+}
+// 60 s by default: a healthy submit sees Finalized well within that on preprod;
+// anything slower is answered by the indexer lookup (the tx landed) or by a
+// rebuild (it did not), instead of a watch that may never return.
+const SUBMIT_WATCH_TIMEOUT_MS = (() => { const n = Number(process.env.NIGHTGATE_SUBMIT_WATCH_TIMEOUT_MS); return Number.isFinite(n) && n > 0 ? n : 60_000; })();
+const SUBMIT_WATCH_CONFIRM_MS = 90_000;
+// Which submission stage the unbound sponsor path waits for. 'Finalized' is
+// what the facade waits for; 'InBlock' returns as soon as the transaction is
+// in a block (measured preprod: ~12-18 s earlier per transaction). The job's
+// chain outcome is confirmed by the indexer afterwards either way
+// (crawler-free chain-outcome confirmer), so a reorg before finality surfaces
+// as a failed chain status, not as a lost job. Default InBlock.
+const SPONSOR_SUBMIT_WAIT: 'InBlock' | 'Finalized' = process.env.NIGHTGATE_SPONSOR_WAIT?.toLowerCase() === 'finalized' ? 'Finalized' : 'InBlock';
+export function sponsorSubmitWaitStage(): 'InBlock' | 'Finalized' { return SPONSOR_SUBMIT_WAIT; }
+// After InBlock, wait (bounded) until the PUBLIC INDEXER has the transaction
+// before reporting landed: a caller that builds its next call right away reads
+// the contract state from that indexer, and between InBlock and indexing it
+// serves an inconsistent state (live: `expected a cell, received null` in the
+// caller's findDeployedContract). Finalized mode never needed this (the
+// indexer was always ahead by then).
+const SPONSOR_INDEXER_VISIBLE_MS = (() => { const n = Number(process.env.NIGHTGATE_SPONSOR_INDEXER_VISIBLE_MS); return Number.isFinite(n) && n >= 0 ? n : 30_000; })();
+async function waitIndexerVisible(indexerHttpUrl: string, identifier: string, site: string): Promise<void> {
+    if (SPONSOR_INDEXER_VISIBLE_MS === 0) return;
+    const t0 = Date.now();
+    while (Date.now() - t0 < SPONSOR_INDEXER_VISIBLE_MS) {
+        const found = await indexerBlockOfIdentifier(indexerHttpUrl, identifier);
+        if (found) {
+            log('debug', `${site}: indexer has the transaction in block ${found.height} (${found.status ?? 'status n/a'}) after ${Date.now() - t0}ms`);
+            assertApplied(found, identifier);
+            return;
+        }
+        await new Promise((r) => setTimeout(r, 1500));
+    }
+    log('warn', `${site}: transaction in block but not visible on the indexer after ${SPONSOR_INDEXER_VISIBLE_MS}ms; reporting landed anyway`);
+}
+
+/**
+ * Pre-broadcast handshake with the main thread over the RPC reply port: sends
+ * `{ kind: 'submit-intent', txHash }` and resolves when the client acks it
+ * (`submit-intent-ack`). Without a port (tests calling the handler directly)
+ * it is a no-op. A missing ack is NOT tolerated: better to fail the job before
+ * the broadcast than to broadcast without the durable boundary.
+ */
+/** What the worker knows about the transaction it is about to broadcast. */
+export interface SubmitIntent {
+    txHash: string;
+    /** Inspected from the caller transaction (shape check), not from the allow-list. */
+    contractAddress?: string;
+    circuits?: string[];
+    /** Unbound channel: the dust backing the sponsor pays from. */
+    note?: string;
+    /** The sponsor ACCOUNT paying (the facade's account id). */
+    sponsorAccountId?: string;
+}
+async function announceSubmitIntent(port: MessagePort | undefined, intent: SubmitIntent): Promise<void> {
+    if (!port) return;
+    const { txHash } = intent;
+    await new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(() => { port.off('message', onMsg); reject(new Error('submit-intent was not acknowledged by the main thread within 30s; not broadcasting')); }, 30_000);
+        const onMsg = (m: any) => {
+            if (m?.kind === 'submit-intent-ack' && m.txHash === txHash) {
+                clearTimeout(timer); port.off('message', onMsg);
+                if (m.ok === false) reject(new Error(`submit-intent rejected by the main thread: ${m.error ?? 'unknown'}`));
+                else resolve();
+            }
+        };
+        port.on('message', onMsg);
+        port.postMessage({ kind: 'submit-intent', ...intent });
+    });
+}
+
+/** The send itself died on the client's own lagging close (see settle window). */
+export function isClosingSocketReject(err: unknown): boolean {
+    return /disconnected from \S*:\s*1000\s*::\s*Normal Closure/i.test(classificationHaystack(err));
+}
+
+/**
+ * Submit on a DEDICATED node client, without the dust-wedge guard and without
+ * the facade's pending-tx tracker: for the unbound sponsor path, which never
+ * booked a spend in the facade's dust wallet (the sponsor learns about the
+ * landed spend from chain sync). Waits for FINALIZED like the facade does and
+ * returns the transaction identifier the facade would return. On failure it
+ * logs the reject class so a field 1010/170 is recognisable, then rethrows
+ * for the handler's own retry.
+ */
+async function submitOnDedicatedClient(entry: FacadeEntry, tx: any, site: string): Promise<any> {
+    await logTxCost(tx, site);
+    const relayURL: URL = entry.walletConfiguration.relayURL;
+    const identifier = String(tx.identifiers().at(-1));
+    for (let attempt = 0; ; attempt++) {
+        try {
+            await withDedicatedSubmitClient(relayURL, (svc) => svc.submitTransaction(tx, SPONSOR_SUBMIT_WAIT), { abandonAfterMs: SUBMIT_WATCH_TIMEOUT_MS });
+            if (SPONSOR_SUBMIT_WAIT === 'InBlock') await waitIndexerVisible(entry.indexerHttpUrl, identifier, site);
+            return identifier;
+        } catch (e) {
+            if (attempt === 0 && isClosingSocketReject(e)) {
+                log('warn', `${site}: submit request died on the client's own closing socket (SDK disconnect lag); retrying once on a settled client`);
+                continue;
+            }
+            if (e instanceof SubmitWatchTimeoutError) {
+                // The watch is gone, the transaction may well be on-chain (live:
+                // a watch that never saw Finalized while the block was final for
+                // minutes). Ask the indexer for up to SUBMIT_WATCH_CONFIRM_MS
+                // before calling it lost; only then let the handler rebuild.
+                const deadline = Date.now() + SUBMIT_WATCH_CONFIRM_MS;
+                for (;;) {
+                    const found = await indexerBlockOfIdentifier(entry.indexerHttpUrl, identifier);
+                    if (found) {
+                        log('info', `${site}: no Finalized within ${SUBMIT_WATCH_TIMEOUT_MS}ms, indexer has the transaction in block ${found.height} (${found.status ?? 'status n/a'}); landed`);
+                        assertApplied(found, identifier);
+                        return identifier;
+                    }
+                    if (Date.now() >= deadline) break;
+                    await new Promise((r) => setTimeout(r, 10_000));
+                }
+                log('warn', `${site}: submit watch timed out and the indexer does not know the transaction ${identifier.slice(0, 16)} after ${SUBMIT_WATCH_CONFIRM_MS}ms; failing for a rebuild`);
+                throw e;
+            }
+            log('info', `${site}: submit failed (${isPreMempoolReject(e) ? 'pre-mempool reject' : 'not pre-mempool'}; no dust guard on this path): ${safeDeepInspect(e, 512).slice(0, 600)}`);
+            throw e;
+        }
     }
 }
 
@@ -1325,7 +1615,114 @@ export function checkSponsorableShape(
  * SPONSOR facade and submit. The caller's identity is already baked into the
  * tx; the sponsor only pays. Shared by the probe and the standalone endpoint.
  */
-async function sponsorAndSubmitFinalized(sponsor: FacadeEntry, rehydrated: any, site: string): Promise<string> {
+/** Latest DustWalletState snapshot from the facade's dust state Observable. */
+async function firstDustState(dust: any): Promise<any> {
+    return await new Promise((resolve, reject) => {
+        let done = false;
+        const sub = dust.state?.subscribe?.({
+            next: (v: any) => { if (!done) { done = true; setImmediate(() => sub?.unsubscribe?.()); resolve(v); } },
+            error: (e: any) => { if (!done) { done = true; reject(e); } }
+        });
+        if (!sub) reject(new Error('facade.dust.state not observable'));
+        setTimeout(() => { if (!done) { done = true; try { sub?.unsubscribe?.(); } catch { /* */ } reject(new Error('no dust emission in 10s')); } }, 10_000);
+    });
+}
+
+/**
+ * 0.18 note-lock pool. One dust NOTE can back one in-flight spend, but a
+ * wallet has many notes, so N notes -> N parallel sponsorings. Locks are
+ * in-memory (this worker owns the wallet), keyed `sessionId|backingNight#idx`,
+ * TTL-expired so a crashed sponsor path frees the note.
+ */
+// key -> { expiry ms, lease token }. The token makes release OWNERSHIP-CHECKED:
+// a lease that outlived NIGHTGATE_NOTE_LEASE_MS (slow prove/submit) may have
+// been taken over by another job; the late finisher must not delete THAT
+// job's lock, or a third job would run on the same backing in parallel and
+// recreate the very 1010/196 race the lock exists for.
+const noteLocks = new Map<string, { exp: number; token: number }>();
+let noteLeaseSeq = 0;
+
+/**
+ * Lock key is the BACKING NIGHT utxo, NOT the individual note. All dust notes
+ * generated by one NIGHT utxo share one generation/nullifier state, so two
+ * concurrent spends against the SAME backing conflict in the ledger (1010/196).
+ * Parallelism therefore scales with the number of DISTINCT backing NIGHT utxos
+ * (many registered utxos in one wallet, or delegation from many accounts to one
+ * dust address), which is exactly the dust-note-pool feeder design. Locking per
+ * backing serializes same-backing spends and parallelizes distinct-backing ones.
+ */
+function backingKey(sessionId: string, note: any): string {
+    return `${sessionId}|${note?.token?.backingNight ?? '?'}`;
+}
+function tryLockBacking(sessionId: string, notes: any[], needSpecks: bigint, ttlMs: number): any | null {
+    const now = Date.now();
+    // Least-charged sufficient note first: keep the big notes for big fees.
+    const eligible = notes
+        .filter((n) => { try { return BigInt(n.generatedNow ?? 0) >= needSpecks; } catch { return false; } })
+        .sort((a, b) => (BigInt(a.generatedNow ?? 0) > BigInt(b.generatedNow ?? 0) ? 1 : -1));
+    for (const n of eligible) {
+        const key = backingKey(sessionId, n);
+        const held = noteLocks.get(key);
+        if (held && held.exp > now) continue; // this backing is busy; try a note on another backing
+        const token = ++noteLeaseSeq;
+        noteLocks.set(key, { exp: now + ttlMs, token });
+        return { note: n, key, token, backing: String(n?.token?.backingNight ?? '?').slice(0, 16) };
+    }
+    return null;
+}
+/**
+ * Lock a free BACKING, WAITING up to `waitMs` for one to free. On a single-
+ * backing wallet this SERIALIZES concurrent spends deterministically (the
+ * second waits out the first's submit) instead of failing; on a multi-backing
+ * wallet the second locks a different backing immediately (parallel). `notes`
+ * is refreshed by `refresh()` each poll so a freed backing is seen.
+ */
+async function acquireBacking(
+    sessionId: string, refresh: () => Promise<any[]>, needSpecks: bigint, ttlMs: number, waitMs: number
+): Promise<any> {
+    const deadline = Date.now() + waitMs;
+    for (;;) {
+        const notes = await refresh();
+        const leased = tryLockBacking(sessionId, notes, needSpecks, ttlMs);
+        if (leased) return leased;
+        if (Date.now() >= deadline) {
+            throw new Error(`no free dust backing with >= ${needSpecks} specks within ${waitMs}ms (all backings busy)`);
+        }
+        await new Promise((r) => setTimeout(r, 1000));
+    }
+}
+/** Release a backing lease; a no-op when the lease was already taken over. */
+function releaseNote(key: string, token: number): void {
+    const held = noteLocks.get(key);
+    if (held && held.token === token) noteLocks.delete(key);
+}
+/**
+ * Keep a lease alive while its job is still working (prove, submit, watch):
+ * the TTL is a crash backstop, not a time budget. An ACTIVE lease in this
+ * process must never be taken over by time; renewal every ttl/3 makes a
+ * takeover possible only once the holder stopped renewing (it died or
+ * finished). Returns a stop function.
+ */
+function keepLeaseAlive(key: string, token: number, ttlMs: number): () => void {
+    const every = Math.max(5, Math.floor(ttlMs / 3));
+    const timer = setInterval(() => {
+        const held = noteLocks.get(key);
+        if (held && held.token === token) held.exp = Date.now() + ttlMs;
+    }, every);
+    timer.unref?.();
+    return () => clearInterval(timer);
+}
+/** NIGHTGATE_NOTE_LEASE_MS, fail-safe: positive finite integer or the default. */
+function noteLeaseTtlMs(): number {
+    const raw = process.env.NIGHTGATE_NOTE_LEASE_MS;
+    if (raw === undefined) return 5 * 60 * 1000;
+    const n = Number(raw);
+    return Number.isInteger(n) && n > 0 ? n : 5 * 60 * 1000;
+}
+// Exported for the unit tests (lease ownership + takeover semantics).
+export const __noteLeaseForTests = { tryLockBacking, releaseNote, keepLeaseAlive, noteLeaseTtlMs, held: (key: string) => noteLocks.get(key), reset: () => noteLocks.clear() };
+
+async function sponsorAndSubmitFinalized(sponsor: FacadeEntry, rehydrated: any, site: string, replyPort?: MessagePort, calls?: Array<{ address: string; entryPoint: string }>): Promise<string> {
     await waitForGenuineSync(sponsor, BALANCE_SYNC_TIMEOUT_MS, `${site} sponsor`);
     await captureDustSnapshot(sponsor, `${site} sponsor`);
     const sponsorRecipe = await sponsor.facade.balanceFinalizedTransaction(
@@ -1334,6 +1731,17 @@ async function sponsorAndSubmitFinalized(sponsor: FacadeEntry, rehydrated: any, 
         { ttl: new Date(Date.now() + 30 * 60 * 1000), tokenKindsToBalance: ['dust'] }
     );
     const finalized = await sponsor.facade.finalizeRecipe(sponsorRecipe);
+    // Same external-effect boundary as the unbound path: the identifier is
+    // known before the broadcast; the main thread records it (and acks) first.
+    try {
+        await announceSubmitIntent(replyPort, {
+            txHash: String(finalized.identifiers().at(-1)),
+            contractAddress: calls?.[0]?.address, circuits: calls?.map(c => c.entryPoint), sponsorAccountId: sponsor.sessionId
+        });
+    } catch (e) {
+        await revertRecipeBestEffort(sponsor.facade, finalized, `${site} sponsor-intent`);
+        throw e;
+    }
     return String(await submitWithDustGuard(sponsor, finalized, `${site} sponsor-submit`));
 }
 
@@ -2690,6 +3098,8 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
     async sponsorFinalizedTx(args: {
         sponsorSessionId: string; finalizedTxB64: string; networkId: string;
         allowedContracts?: string[]; allowedCircuits?: string[];
+        /** Set by the dispatcher: the RPC reply port, for the pre-broadcast submit-intent handshake. */
+        __replyPort?: MessagePort;
     }) {
         const sponsor = resolveSponsorEntry(args.sponsorSessionId);
         if (!sponsor) throw new Error('sponsorFinalizedTx requires a sponsorSessionId');
@@ -2702,9 +3112,150 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
         // caller dust, oversized or uninspectable transactions all refuse.
         const calls = checkSponsorableShape(tx, bytes.length, args.allowedContracts, args.allowedCircuits);
         log('info', `sponsorFinalizedTx: paying dust for ${calls.map(c => c.entryPoint).join('+')} (${bytes.length}B)`);
-        const txId = await sponsorAndSubmitFinalized(sponsor, tx, 'sponsor-endpoint');
+        const txId = await sponsorAndSubmitFinalized(sponsor, tx, 'sponsor-endpoint', args.__replyPort, calls);
         log('info', `sponsorFinalizedTx: LANDED txHash=${txId.slice(0, 16)}`);
         return { txHash: txId, circuits: calls.map(c => c.entryPoint), contractAddress: calls[0]?.address ?? '' };
+    },
+
+    /**
+     * 0.18 PARALLEL sponsoring (dust-note-pool FR). Takes an UNBOUND
+     * (pre-binding) proven+signed caller tx, locks ONE free dust BACKING of
+     * the sponsor wallet, builds a dust-only tx against a note on it, proves
+     * it, merges it into the caller tx and binds, then submits. N backings
+     * back N parallel sponsorings from ONE wallet.
+     *
+     * CONCURRENCY CONTRACT (why this handler is NOT in SUBMIT_METHODS): the
+     * path never touches the sponsor facade's mutable state. spendCoins is
+     * functional (the updated CoreWallet state is discarded) and the submit
+     * goes out on a DEDICATED node client (see withDedicatedSubmitClient: the
+     * facade's shared client cannot carry two submits at once), so the facade
+     * never books, reverts or tracks anything for this tx. Proving + submit
+     * overlap between jobs; only the fast, key-using build runs under the
+     * per-session lock (evict can't zero the dust key mid-spend, and two
+     * builds never read the same dust snapshot). The whole-wallet dust-wedge
+     * snapshot/restore is deliberately NOT armed here: there is nothing to
+     * roll back, and a restore would swap `facade.dust` under concurrent
+     * jobs. A lost dust race (1010/170) is healed by the handler's
+     * rebuild-retry, an unused backing lock expires.
+     */
+    async sponsorUnboundTx(args: {
+        sponsorSessionId: string; unboundTxB64: string; networkId: string;
+        allowedContracts?: string[]; allowedCircuits?: string[];
+        /** Set by the dispatcher: the RPC reply port, for the pre-broadcast submit-intent handshake. */
+        __replyPort?: MessagePort;
+    }) {
+        const sponsor = resolveSponsorEntry(args.sponsorSessionId);
+        if (!sponsor) throw new Error('sponsorUnboundTx requires a sponsorSessionId');
+        const sdk = await loadSdk();
+        await ensureNetworkId(args.networkId, sdk);
+        const { tx: callerTx, bytes } = await deserializeFinalizedTx(args.unboundTxB64);
+
+        // Same fail-closed shape policy as the bound path.
+        const calls = checkSponsorableShape(callerTx, bytes.length, args.allowedContracts, args.allowedCircuits);
+
+        await waitForGenuineSync(sponsor, BALANCE_SYNC_TIMEOUT_MS, 'sponsor-unbound');
+
+        // Fee estimate for the caller tx -> how much dust the note must hold.
+        const params = sdk.ledger.LedgerParameters?.initialParameters?.() ?? sdk.ledger.LedgerParameters?.default?.();
+        let needSpecks: bigint;
+        try { needSpecks = callerTx.feesWithMargin(params, 2); }
+        catch { needSpecks = 100_000_000n; } // fallback floor if the estimate API shifts
+        if (needSpecks <= 0n) needSpecks = 100_000_000n;
+
+        // Read `facade.dust` at each use, never cache it: a bound-path dust
+        // restore on this sponsor swaps the sub-wallet object.
+        const leaseTtlMs = noteLeaseTtlMs();
+        const backingWaitMs = (() => {
+            const t = Number(process.env.NIGHTGATE_BACKING_WAIT_MS);
+            return Number.isInteger(t) && t >= 0 ? t : 5 * 60 * 1000;
+        })();
+
+        // Lock a BACKING first, WAITING if all backings are busy. This makes a
+        // single-backing wallet serialize deterministically (the 2nd request
+        // waits out the 1st's submit) and a multi-backing wallet parallel.
+        const snapshotNotes = async (): Promise<any[]> => {
+            const dws: any = await firstDustState(sponsor.facade.dust);
+            const cab = dws.capabilities?.coinsAndBalances;
+            return Array.from(cab?.getAvailableCoins?.(dws.state, new Date()) ?? []);
+        };
+        const leased = await acquireBacking(sponsor.sessionId, snapshotNotes, needSpecks, leaseTtlMs, backingWaitMs);
+
+        const stopRenewal = keepLeaseAlive(leased.key, leased.token, leaseTtlMs);
+        let built: { dustUnproven: any };
+        try {
+            // Block-time ctime (a wall-clock ctime ahead of the block is the
+            // 1010/170 site). Fetched BEFORE taking the lock: a network call
+            // must not hold the per-session lock, and an earlier ctime is
+            // safe (only a later one is rejected).
+            const tip = await getIndexerTip(sponsor.indexerHttpUrl);
+            const ctime = (() => {
+                const t = tip.timestampMs;
+                if (t == null || !Number.isFinite(t)) return new Date();
+                const ms = t > 1e12 ? t : t * 1000; // < 1e12 => seconds
+                const d = new Date(ms);
+                return Number.isNaN(d.getTime()) ? new Date() : d;
+            })();
+            const ttl = new Date(ctime.getTime() + 30 * 60 * 1000);
+            const CoreWalletApi = await loadDustCoreWallet();
+            // SERIALIZED per wallet under the session lock (the same lock the
+            // whole-call SUBMIT_METHODS hold): fresh snapshot -> spendCoins on
+            // the leased backing -> build dust-only tx. Two builds never read
+            // the same dust snapshot, and a bound-path job or an evict on this
+            // sponsor cannot interleave with the key-using step. This is the
+            // fast part; prove + submit follow OUTSIDE the lock, in parallel.
+            built = await withSessionLocks([sponsor.sessionId], async () => {
+                if (facades.get(sponsor.sessionId) !== sponsor) {
+                    throw new Error('sponsor facade was evicted while waiting for the dust build lock');
+                }
+                const dws: any = await firstDustState(sponsor.facade.dust);
+                const cab = dws.capabilities?.coinsAndBalances;
+                const fresh: any[] = Array.from(cab?.getAvailableCoins?.(dws.state, new Date()) ?? []);
+                const note = fresh.find((n) => backingKey(sponsor.sessionId, n) === leased.key
+                    && (() => { try { return BigInt(n.generatedNow ?? 0) >= needSpecks; } catch { return false; } })())
+                    ?? leased.note;
+                const [spends] = CoreWalletApi.spendCoins(dws.state, sponsor.dustKey, [{ token: note.token, value: needSpecks }], ctime);
+                const intent = sdk.ledger.Intent.new(ttl);
+                intent.dustActions = new sdk.ledger.DustActions('signature', 'pre-proof', ctime, [spends[0]]);
+                const dustUnproven = sdk.ledger.Transaction.fromPartsRandomized(args.networkId, undefined, undefined, intent);
+                return { dustUnproven };
+            });
+        } catch (e) { stopRenewal(); releaseNote(leased.key, leased.token); throw e; }
+
+        try {
+            // Prove (parallel-safe) + merge into the caller tx (both pre-binding) + bind.
+            // The sponsor's dust spend is proved with the FACADE's proving
+            // service: the proof server in server mode (native, multi-threaded;
+            // measured hosted: ~45 s in-process wasm vs single-digit seconds),
+            // the shared wasm prover in wasm mode. Before, this path always
+            // proved in wasm and that was the bulk of a sponsoring's latency.
+            const tProve = Date.now();
+            let provingService: any = sponsor.facade?.provingService;
+            if (!provingService?.prove) {
+                const provingSdk = await loadProvingSdk();
+                const sharedKeys = await getSharedKeyMaterialProvider();
+                provingService = provingSdk.makeWasmProvingService({ keyMaterialProvider: sharedKeys });
+            }
+            const dustProven = await provingService.prove(built.dustUnproven);
+            log('info', `sponsorUnboundTx: dust spend proven in ${Date.now() - tProve}ms (${sponsor.facade?.provingService?.prove ? resolveProvingMode() : 'wasm'})`);
+            const bound = dustProven.merge(callerTx).bind();
+            // EXTERNAL-EFFECT BOUNDARY: the transaction identifier is known
+            // before anything leaves the process. Hand it to the main thread
+            // and WAIT for its ack (the job row then carries the txHash and is
+            // in external_execution/submitted) before broadcasting, so a failure
+            // after the broadcast (socket drop, watch timeout) becomes
+            // reconciliation_required with the hash, never a plain `failed`
+            // for a call that may be on-chain.
+            await announceSubmitIntent(args.__replyPort, {
+                txHash: String(bound.identifiers().at(-1)),
+                contractAddress: calls[0]?.address, circuits: calls.map(c => c.entryPoint), note: leased.backing, sponsorAccountId: sponsor.sessionId
+            });
+            const txId = await submitOnDedicatedClient(sponsor, bound, 'sponsor-unbound-submit');
+            log('info', `sponsorUnboundTx: LANDED txHash=${String(txId).slice(0, 16)} on backing ${leased.backing}`);
+            return { txHash: String(txId), circuits: calls.map(c => c.entryPoint), contractAddress: calls[0]?.address ?? '', note: leased.backing };
+        } finally {
+            stopRenewal();
+            releaseNote(leased.key, leased.token);
+        }
     },
 
     /**
@@ -2852,6 +3403,11 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
 // on the SAME wallet would select overlapping UTXO/dust inputs and the node
 // rejects the second (double-select). A sponsored submit also balances the
 // sponsor's facade, so it locks both keys. Read-only handlers stay concurrent.
+// This whole-call lock is ALSO what makes the dust-wedge snapshot/restore
+// safe (one build/submit per facade at a time, see restoreDustFromSnapshot).
+// `sponsorUnboundTx` is deliberately NOT listed: it takes the lock itself
+// around its fast build only, so proving + submit overlap across jobs (its
+// doc comment states the contract that makes that safe).
 const SUBMIT_METHODS = new Set([
     'deployContract', 'submitContractCall', 'submitContractCallBatch',
     'registerDustGeneration', 'deregisterDustGeneration',
@@ -2910,14 +3466,20 @@ parentPort.on('message', async (msg: any) => {
     try {
         const fn = handlers[method];
         if (!fn) throw new Error(`Unknown method: ${method}`);
+        // The unbound sponsor path gets the reply port for its pre-broadcast
+        // submit-intent handshake (see announceSubmitIntent).
+        const callArgs = (method === 'sponsorUnboundTx' || method === 'sponsorFinalizedTx') ? { ...(args as object), __replyPort: port } : args;
         const result = SUBMIT_METHODS.has(method)
-            ? await withSessionLocks(submitLockKeys(args), () => fn(args))
-            : await fn(args);
+            ? await withSessionLocks(submitLockKeys(args), () => fn(callArgs))
+            : await fn(callArgs);
         port.postMessage({ ok: true, result } as RpcOk);
     } catch (err: any) {
+        // Carry the nested cause chain across the thread boundary: the node's
+        // `1010: ... Custom error: N` line lives in the innermost cause and the
+        // main-thread classifiers (dust race, failover) key on it.
         const payload: RpcErrorPayload = {
             name: err?.name ?? 'Error',
-            message: formatErr(err)
+            message: formatErrWithCauses(err)
         };
         port.postMessage({ ok: false, error: payload } as RpcErr);
     } finally {

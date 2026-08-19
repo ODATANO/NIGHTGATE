@@ -13,7 +13,7 @@
 
 import crypto from 'crypto';
 
-const getOrBuildWalletFacadeMock = vi.hoisted(() => vi.fn(async () => ({})));
+const getOrBuildWalletFacadeMock = vi.hoisted(() => vi.fn(async (..._args: any[]) => ({})));
 vi.mock('../../srv/submission/wallet-facade-builder', () => ({
     getOrBuildWalletFacade: getOrBuildWalletFacadeMock
 }));
@@ -22,6 +22,7 @@ import {
     resolveFeeSponsor,
     ensureFeeSponsorFacade,
     getConfiguredFeeSponsorSessions,
+    prewarmFeeSponsorPool,
     FeeSponsorError
 } from '../../srv/submission/fee-sponsor';
 import { deriveAccountId, deriveStoragePassword } from '../../srv/submission/wallet-material-factory';
@@ -144,6 +145,15 @@ describe('resolveFeeSponsor', () => {
         })).rejects.toMatchObject({ httpStatus: 410 });
     });
 
+    it('a CONFIGURED platform sponsor does not expire (infrastructure, not a caller session)', async () => {
+        // Live 2026-08-19: the hosted pool died 24 h after setup because its
+        // sessions expired like any caller session.
+        process.env.NIGHTGATE_FEE_SPONSOR_SESSION = 'sponsor-session-1';
+        const db = makeDb(sponsorRow({ userId: 'platform-operator', expiresAt: new Date(Date.now() - 60_000).toISOString() }));
+        const sponsor = await resolveFeeSponsor({ db, sponsorSessionId: 'sponsor-session-1', requestingUserId: 'anyone', encryptionKey: TEST_KEY });
+        expect(sponsor.accountId).toBe(deriveAccountId(VIEWING_KEY));
+    });
+
     it('rejects a viewing-key-only sponsor session with 412 (cannot pay dust without the seed)', async () => {
         const db = makeDb(sponsorRow({ userId: 'alice', encryptedSeedKey: null }));
         await expect(resolveFeeSponsor({
@@ -203,5 +213,39 @@ describe('ensureFeeSponsorFacade', () => {
             syncStatePassphrase: 'pass-1',
             accountIndex: 3
         });
+    });
+});
+
+describe('prewarmFeeSponsorPool (boot)', () => {
+    it('warms every configured pool sponsor one after another and skips (logs) the ones that fail', async () => {
+        process.env.NIGHTGATE_FEE_SPONSOR_SESSION = 'sponsor-session-1,sponsor-session-2';
+        const order: string[] = [];
+        const db = {
+            run: vi.fn(async (q: any) => {
+                const id = JSON.stringify(q).includes('sponsor-session-1') ? 'sponsor-session-1' : 'sponsor-session-2';
+                order.push(`resolve:${id}`);
+                return id === 'sponsor-session-1' ? sponsorRow({ sessionId: id }) : null; // #2 unknown -> 404
+            })
+        };
+        getOrBuildWalletFacadeMock.mockImplementation(async (accountId: string) => { order.push(`facade:${accountId.slice(0, 4)}`); return {}; });
+        const infos: string[] = [], warns: string[] = [];
+        const out = await prewarmFeeSponsorPool({
+            db, encryptionKey: TEST_KEY, log: { info: (m) => infos.push(m), warn: (m) => warns.push(m) },
+            facadeConfig: { networkId: 'preprod', indexerHttpUrl: 'http://i', indexerWsUrl: 'ws://i', proofServerUrl: 'http://p', relayUrl: 'ws://n' } as any
+        });
+        expect(out.warmed).toEqual(['sponsor-session-1']);
+        expect(out.failed).toEqual(['sponsor-session-2']);
+        expect(getOrBuildWalletFacadeMock).toHaveBeenCalledTimes(1);
+        expect(getOrBuildWalletFacadeMock.mock.calls[0][0]).toBe(deriveAccountId(VIEWING_KEY));
+        // serialized: sponsor 1 resolve -> facade -> then sponsor 2
+        expect(order).toEqual(['resolve:sponsor-session-1', `facade:${deriveAccountId(VIEWING_KEY).slice(0, 4)}`, 'resolve:sponsor-session-2']);
+        expect(infos.join(' ')).toMatch(/sponsor- facade ready in \d+s/);
+        expect(warns.join(' ')).toMatch(/sponsor- failed .*fails over at use time/);
+    });
+
+    it('is a no-op without a configured pool', async () => {
+        const out = await prewarmFeeSponsorPool({ db: { run: vi.fn() }, facadeConfig: {} as any });
+        expect(out).toEqual({ warmed: [], failed: [] });
+        expect(getOrBuildWalletFacadeMock).not.toHaveBeenCalled();
     });
 });

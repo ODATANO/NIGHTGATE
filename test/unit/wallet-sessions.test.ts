@@ -518,6 +518,34 @@ describe('wallet session handlers', () => {
         }
     });
 
+    it('session cleanup skips configured platform sponsor sessions (they do not expire, their keys stay)', async () => {
+        let callback: (() => Promise<void>) | undefined;
+        const setIntervalSpy = vi.spyOn(global, 'setInterval').mockImplementation(((handler: TimerHandler) => {
+            callback = handler as () => Promise<void>;
+            return {} as ReturnType<typeof setInterval>;
+        }) as any);
+        const encKey = getEncryptionKey();
+        const row = (id: string, hash: string) => ({ sessionId: id, viewingKeyHash: hash, encryptedViewingKey: encrypt('a'.repeat(64), encKey) });
+        process.env.NIGHTGATE_FEE_SPONSOR_SESSION = 'pool-sponsor-1';
+        const db = {
+            run: vi.fn()
+                .mockResolvedValueOnce([row('pool-sponsor-1', 'hash-pool'), row('caller-1', 'hash-c')])
+                .mockResolvedValueOnce(1)   // deactivate UPDATE: ONLY the caller row
+                .mockResolvedValueOnce([])  // guard for the caller's wallet
+        };
+        try {
+            startSessionCleanup(db);
+            await callback?.();
+            // The deactivating UPDATE names ONLY the caller row (the cds mock's
+            // updateWhereSpy records the where clause).
+            expect(updateWhereSpy).toHaveBeenCalledWith({ sessionId: { in: ['caller-1'] } });
+            expect(mockEvictWalletFacade).toHaveBeenCalledTimes(1); // the caller's wallet only
+        } finally {
+            delete process.env.NIGHTGATE_FEE_SPONSOR_SESSION;
+            setIntervalSpy.mockRestore();
+        }
+    });
+
     it('session cleanup evicts once per wallet when only expiring rows reference it', async () => {
         let callback: (() => Promise<void>) | undefined;
         const setIntervalSpy = vi.spyOn(global, 'setInterval').mockImplementation(((handler: TimerHandler) => {

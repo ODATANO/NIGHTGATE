@@ -53,3 +53,41 @@ export function classificationHaystack(err: unknown): string {
         .replace(/^\s*at .*$/gm, '')
         .replace(/:\d+:\d+\b/g, ':L:C');
 }
+
+/**
+ * `formatErr` plus the messages of the nested cause chain (bounded), for
+ * errors that cross a boundary where only a string survives (the wallet
+ * worker's RPC reply, a job's errorMessage). The SDK buries the node's reject
+ * under generic wrappers: `(FiberFailure) SubmissionError: Transaction
+ * submission error` on top, `1010: Invalid Transaction: Custom error: 196` or
+ * `TransactionInvalidError: ...` only in the innermost cause. Without this the
+ * main-thread classifiers (dust race, retryable failover) never see the node's
+ * line. Effect's FiberFailure has NO `cause` property (its Cause is behind a
+ * symbol and only rendered by inspect as `[cause]: Name: message` lines), so
+ * the walk reads the property chain first and the rendered `[cause]:` lines
+ * second; a bare Substrate `10xx:` line is the last resort.
+ */
+export function formatErrWithCauses(err: unknown): string {
+    const head = formatErr(err);
+    const parts: string[] = [];
+    const push = (msg: string) => {
+        const m = msg.trim();
+        if (m && m !== head && !parts.includes(m) && parts.length < 6) parts.push(m);
+    };
+    const seen = new Set<unknown>([err]);
+    let cur: any = (err as any)?.cause;
+    for (let depth = 0; cur != null && depth < 6 && !seen.has(cur); depth++) {
+        seen.add(cur);
+        push(formatErr(cur));
+        cur = cur?.cause;
+    }
+    if (parts.length === 0) {
+        const rendered = classificationHaystack(err);
+        for (const m of rendered.matchAll(/\[cause\]:\s*([^\n{]{1,200})/g)) push(m[1]);
+        if (parts.length === 0) {
+            const m = rendered.match(/\b10\d\d:\s*[^\n"']{0,120}/);
+            if (m && !head.includes(m[0])) push(m[0]);
+        }
+    }
+    return parts.length ? `${head} <- ${parts.join(' <- ')}` : head;
+}

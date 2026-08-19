@@ -966,11 +966,16 @@ export function startSessionCleanup(db: any): ReturnType<typeof setInterval> {
     const timer = setInterval(async () => {
         try {
             const now = new Date().toISOString();
-            const expiring: any[] = (await db.run(
+            // Configured platform sponsor sessions are infrastructure and do
+            // not expire while configured (resolveFeeSponsor agrees); the
+            // sweep used to deactivate them AND wipe their key material 24 h
+            // after setup, which silently killed the hosted pool.
+            const platformSponsors = new Set(getConfiguredFeeSponsorSessions(getNightgatePluginConfig()));
+            const expiring: any[] = ((await db.run(
                 SELECT.from(WalletSessions)
                     .columns('sessionId', 'viewingKeyHash', 'encryptedViewingKey')
                     .where({ isActive: true, expiresAt: { '<': now } })
-            )) || [];
+            )) || []).filter((s: any) => !platformSponsors.has(String(s.sessionId)));
             if (expiring.length === 0) return;
             // Deactivate FIRST, scoped to the selected rows: a row expiring
             // between SELECT and UPDATE must not be deactivated unseen (its

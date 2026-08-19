@@ -115,11 +115,20 @@ feed straight into these.
 
 Returns `{ attestationSecret, attesterId, zkAssets, addresses, buildSponsorable, close }`.
 
-### `buildSponsorable({ contractAddress, call, initialPrivateState }) -> { finalizedTxB64, serializedBytes }`
+### `buildSponsorable({ contractAddress, call, initialPrivateState, bind? }) -> { finalizedTxB64 | unboundTxB64, serializedBytes, bound }`
 
 Builds, proves, balances your own side, signs and finalizes ONE circuit call,
 then stops. Nothing is submitted. The transaction is fee-unpaid: it carries no
 dust, which is exactly what makes it sponsorable.
+
+`bind` picks the handover format. `true` (default) returns `finalizedTxB64`, a
+bound transaction for `sponsorFinalizedTransaction`. `false` returns
+`unboundTxB64`, the signed PRE-BINDING transaction for
+`sponsorUnboundTransaction` (0.18): the sponsor merges its own dust spend into
+it and binds, which is what lets ONE sponsor wallet pay for many callers in
+parallel (one per registered dust backing). Everything else is identical: same
+proof, same identity, same TTL. Prefer `bind: false` against a sponsor that
+runs 0.18 or later; the SDK client exposes it as `ng.sponsorUnbound(...)`.
 
 ### `ensureZkAssets({ zkConfigBaseUrl, cacheDir, circuits })`
 
@@ -133,8 +142,12 @@ re-downloaded, so only the first run needs the network for assets.
 The sponsor is a normal NIGHTGATE server with a funded, dust-registered wallet
 session. It exposes `sponsorFinalizedTransaction(finalizedTxB64,
 sponsorSessionId, idempotencyKey)`, which deserializes the transaction, enforces
-its contract and circuit allow-list, balances dust and submits. It never sees a
-key, a witness or a preimage: by the time the bytes arrive, the proof is done.
+its contract and circuit allow-list, balances dust and submits, and (0.18)
+`sponsorUnboundTransaction(unboundTxB64, ...)`, the parallel channel that pays
+from a locked dust backing so N callers can be sponsored at once from one
+wallet. It never sees a key, a witness or a preimage: by the time the bytes
+arrive, the proof is done. To sponsor N in parallel, register N NIGHT UTxOs
+for dust generation in the sponsor wallet (parallelism = distinct backings).
 
 If you want both halves on one machine (for a test), `buildSponsorable` also
 exists as an OData action, which runs phase 1 server-side against a stored
@@ -147,7 +160,20 @@ process and only the bytes going to the server.
 - **First run downloads the prover keys** (~81 MB for the full vault set) and
   caches them. Restrict `circuits` to what you actually call to cut that down.
 - **Proving blocks the thread.** It is wasm in-process; run it off your request
-  path or in a worker.
+  path or in a worker. Or opt in to `provingMode: 'server'` with
+  `proofServerUrl` pointing at YOUR OWN proof server (`docker run -d -p
+  6300:6300 midnightntwrk/proof-server:8.1.0 midnight-proof-server --network
+  preprod`): native and multi-threaded, `attest` drops from 25-35 s to 7-9 s
+  and the 38 MB comparison circuit from 4-5 min to well under a minute. The
+  proof server RECEIVES THE WITNESSES, so never point this at the sponsor's;
+  that is why it is an explicit opt-in and a bare `proofServerUrl` (documented
+  as unused in 0.17) still does nothing. `builder.provingMode` tells you which
+  mode is active.
+- **`bind: false` refuses calls that need a balancing transaction** (the call
+  moves shielded or unshielded value and the wallet had to add inputs): the
+  sponsor binds the base transaction alone, so handing it over unbound would
+  produce a different, unbalanced transaction. Use the bound handover for
+  those; the vault's attestation and proof circuits move no value.
 - **The TTL is real.** A transaction the sponsor submits after `ttlMinutes` is
   rejected by the node. Ship the bytes promptly.
 - **Artifact generations must match.** The `zkConfigBaseUrl` you fetch from and

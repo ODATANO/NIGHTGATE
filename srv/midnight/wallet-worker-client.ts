@@ -270,7 +270,17 @@ export function setStateSaveSink(sink: StateSaveSink | undefined): void {
  * Generic RPC helper. Allocates a MessageChannel per call, posts the request
  * with port1 transferred to the worker, awaits the single reply on port2.
  */
-async function rpc<T>(method: string, args: unknown, timeoutMs: number = RPC_TIMEOUT_MS): Promise<T> {
+/**
+ * Optional per-call hook: the worker announces the transaction identifier it
+ * is ABOUT to broadcast (`submit-intent`) and waits for the ack. The hook
+ * persists the external-effect boundary (job row: txHash + external_execution
+ * + submitted) before the broadcast happens; if it throws, the worker does not
+ * broadcast.
+ */
+export interface SubmitIntentInfo { txHash: string; contractAddress?: string; circuits?: string[]; note?: string; sponsorAccountId?: string }
+export type SubmitIntentHook = (txHash: string, intent: SubmitIntentInfo) => Promise<void>;
+
+async function rpc<T>(method: string, args: unknown, timeoutMs: number = RPC_TIMEOUT_MS, onSubmitIntent?: SubmitIntentHook): Promise<T> {
     if (!client) {
 
         if (!everStarted) {
@@ -300,8 +310,18 @@ async function rpc<T>(method: string, args: unknown, timeoutMs: number = RPC_TIM
             timeoutMs
         );
 
-        port2.once('message', (msg: any) => {
+        port2.on('message', (msg: any) => {
             if (settled) return;
+            if (msg?.kind === 'submit-intent') {
+                // Intermediate message, not the reply: persist the boundary,
+                // then ack (or nack) so the worker broadcasts (or does not).
+                const intent: SubmitIntentInfo = { txHash: String(msg.txHash), contractAddress: msg.contractAddress, circuits: msg.circuits, note: msg.note, sponsorAccountId: msg.sponsorAccountId };
+                Promise.resolve()
+                    .then(() => onSubmitIntent?.(intent.txHash, intent))
+                    .then(() => port2.postMessage({ kind: 'submit-intent-ack', txHash: msg.txHash, ok: true }))
+                    .catch((e) => port2.postMessage({ kind: 'submit-intent-ack', txHash: msg.txHash, ok: false, error: String((e as Error)?.message ?? e) }));
+                return;
+            }
             settle();
             if (msg?.ok) {
                 resolve(msg.result as T);
@@ -651,8 +671,8 @@ export function walletSponsorFinalizedTx(args: {
     networkId: WalletSubmitContractCallArgs['networkId'];
     allowedContracts?: string[];
     allowedCircuits?: string[];
-}): Promise<{ txHash: string; circuits: string[]; contractAddress: string }> {
-    return rpc('sponsorFinalizedTx', args);
+}, onSubmitIntent?: SubmitIntentHook): Promise<{ txHash: string; circuits: string[]; contractAddress: string }> {
+    return rpc('sponsorFinalizedTx', args, RPC_TIMEOUT_MS, onSubmitIntent);
 }
 
 export interface WalletSubmitContractCallBatchArgs extends Omit<WalletSubmitContractCallArgs, 'circuit' | 'args'> {
@@ -683,4 +703,19 @@ export function __resetWalletWorkerForTests(): void {
     stateSaveSink = undefined;
     pendingRpcs.clear();
     privateStateProviders.clear();
+}
+
+/**
+ * 0.18 PARALLEL sponsoring (dust-note-pool): submit an UNBOUND caller tx, the
+ * sponsor merges dust from a locked note and binds. Keyed by the sponsor
+ * account like walletSponsorFinalizedTx.
+ */
+export function walletSponsorUnboundTx(args: {
+    sponsorSessionId: string;
+    unboundTxB64: string;
+    networkId: WalletSubmitContractCallArgs['networkId'];
+    allowedContracts?: string[];
+    allowedCircuits?: string[];
+}, onSubmitIntent?: SubmitIntentHook): Promise<{ txHash: string; circuits: string[]; contractAddress: string; note: string }> {
+    return rpc('sponsorUnboundTx', args, RPC_TIMEOUT_MS, onSubmitIntent);
 }

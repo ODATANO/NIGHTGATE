@@ -416,6 +416,16 @@ describe('agent grants', () => {
             });
             await handlers.createAgentGrant(mixed);
             expect(mixed.reject).toHaveBeenCalledWith(400, expect.stringMatching(/anchorDocument/));
+
+            // both phase-2 sponsoring actions understand the sentinel: accepted together
+            mockDbRun.mockResolvedValueOnce({ sessionId: 'sess-1', isActive: true, expiresAt: null });
+            const both = makeReq({
+                sessionId: 'sess-1',
+                allowedActions: ['sponsorFinalizedTransaction', 'sponsorUnboundTransaction'],
+                sponsorSessionId: PLATFORM_POOL_SENTINEL
+            });
+            await handlers.createAgentGrant(both);
+            expect(both.reject).not.toHaveBeenCalled();
             delete process.env.NIGHTGATE_FEE_SPONSOR_SESSION;
 
             // with a pool: getJobStatus may poll under ANY pool member
@@ -446,6 +456,8 @@ describe('agent grants', () => {
 
         it('sponsorFinalizedTransaction is grantable; the compute-only reads are free', async () => {
             expect(AGENT_ALLOWLISTABLE_ACTIONS).toContain('sponsorFinalizedTransaction');
+            // 0.18: the parallel channel has the same trust shape and is grantable too.
+            expect(AGENT_ALLOWLISTABLE_ACTIONS).toContain('sponsorUnboundTransaction');
             // still never grantable: the actions that could move funds or act
             // as the session in any other way
             expect(AGENT_ALLOWLISTABLE_ACTIONS).not.toContain('buildSponsorable');

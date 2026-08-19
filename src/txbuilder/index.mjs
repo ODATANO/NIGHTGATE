@@ -106,12 +106,21 @@ export async function ensureZkAssets({ zkConfigBaseUrl, cacheDir, circuits = ATT
 }
 
 /**
- * A wallet provider that balances the caller's own side, signs, finalizes and
- * then STOPS instead of submitting: the fee-unpaid transaction is captured for
- * the sponsor. Throwing from submitTx is deliberate; returning a fake id makes
- * the SDK wait forever for a confirmation that will never come.
+ * A wallet provider that balances the caller's own side, signs, and then STOPS
+ * instead of submitting: the fee-unpaid transaction is captured for the
+ * sponsor. Throwing from submitTx is deliberate; returning a fake id makes the
+ * SDK wait forever for a confirmation that will never come.
+ *
+ * `bind` chooses the handover format:
+ *  - true  (default): FINALIZED (bound) tx -> sponsorFinalizedTransaction,
+ *    sponsor attaches dust via balanceFinalizedTransaction (serial per wallet).
+ *  - false: UNBOUND (pre-binding) signed tx -> sponsorUnboundTransaction, the
+ *    sponsor merges dust from a locked note and binds (parallel, 0.18). A
+ *    dust tx cannot merge into a bound tx, so parallel sponsoring REQUIRES
+ *    the unbound handover.
  */
-function buildOnlyWalletProvider(facade, zswapKeys, dustKey, keystore, holder, ttlMinutes) {
+// Exported for the unit tests only (not in the .d.ts): the handover rules live here.
+export function buildOnlyWalletProvider(facade, zswapKeys, dustKey, keystore, holder, ttlMinutes, bind) {
     return {
         getCoinPublicKey: () => zswapKeys.coinPublicKey,
         getEncryptionPublicKey: () => zswapKeys.encryptionPublicKey,
@@ -123,6 +132,22 @@ function buildOnlyWalletProvider(facade, zswapKeys, dustKey, keystore, holder, t
                 { ttl: effectiveTtl, tokenKindsToBalance: ['shielded', 'unshielded'] }
             );
             const signed = await facade.signRecipe(recipe, (payload) => keystore.signData(payload));
+            if (bind === false) {
+                // Return the signed UNBOUND (pre-binding) tx. The SDK's callTx
+                // flow forwards whatever balanceTx returns to submitTx, where
+                // we capture it. baseTransaction is the proven+signed tx.
+                // A recipe that ALSO carries a balancingTransaction (the call
+                // moved shielded/unshielded value and the wallet had to add
+                // inputs) cannot be handed over unbound: the sponsor would bind
+                // the base alone, i.e. a different, unbalanced transaction.
+                // Fail closed; the bound handover (finalizeRecipe merges both)
+                // covers that case.
+                if (signed?.balancingTransaction) {
+                    throw new Error('buildSponsorable({ bind: false }): this call needs a balancing transaction (it moves value); use the bound handover (bind: true / sponsorFinalizedTransaction) for it');
+                }
+                holder.unbound = true;
+                return signed?.baseTransaction ?? signed;
+            }
             return await facade.finalizeRecipe(signed);
         },
         async submitTx(tx) {
@@ -142,7 +167,14 @@ function buildOnlyWalletProvider(facade, zswapKeys, dustKey, keystore, holder, t
  * @param {string} opts.indexerHttpUrl
  * @param {string} opts.indexerWsUrl
  * @param {string} opts.nodeUrl          Substrate RPC (the SDK's relayURL), e.g. wss://rpc.preprod.midnight.network/
- * @param {string} [opts.proofServerUrl] unused in wasm proving; only the config type wants it
+ * @param {string} [opts.proofServerUrl] unused by default (only the SDK's config type wants it); see provingMode
+ * @param {'wasm'|'server'} [opts.provingMode] 'wasm' (default): prove the contract circuit in-process, nothing
+ *                                        leaves the process. 'server': prove on opts.proofServerUrl, which
+ *                                        then RECEIVES THE WITNESSES: native and multi-threaded, several
+ *                                        times faster on the big circuits, but only ever a proof server
+ *                                        you run yourself, never the sponsor's. An EXPLICIT opt-in on
+ *                                        purpose: in 0.17 proofServerUrl was documented as unused, so a
+ *                                        value left over from that must not start sending witnesses.
  * @param {string} opts.zkConfigBaseUrl   a public /zk-config/<contract>
  * @param {Function} opts.contractClass   compiled contract class (e.g. '@odatano/nightgate/browser/attestation-vault')
  * @param {string} [opts.contractName]    logical name, default 'attestation-vault'
@@ -153,6 +185,23 @@ function buildOnlyWalletProvider(facade, zswapKeys, dustKey, keystore, holder, t
  * @param {Uint8Array} [opts.attestationSecret] bring your own, else derived from the seed
  * @param {Function} [opts.onProgress]    progress callback
  */
+/**
+ * `findDeployedContract` with ONE retry on the transient read the public
+ * indexer serves between a block landing and being indexed (`expected a cell,
+ * received null`, or a null state): building immediately after a previous call
+ * landed InBlock hits it. Anything else rethrows at once.
+ */
+async function findDeployedWithRetry(contracts, providers, args) {
+    try {
+        return await contracts.findDeployedContract(providers, args);
+    } catch (e) {
+        const msg = String(e?.message ?? e);
+        if (!/expected a cell, received null|received null|ContractState.*null|no contract state/i.test(msg)) throw e;
+        await new Promise((r) => setTimeout(r, 10_000));
+        return contracts.findDeployedContract(providers, args);
+    }
+}
+
 export async function createTxBuilder(opts) {
     const {
         seedHex, networkId = 'preprod', accountIndex = 0,
@@ -168,6 +217,14 @@ export async function createTxBuilder(opts) {
     if (!nodeUrl) throw new Error('createTxBuilder: nodeUrl is required (the Substrate RPC the wallet SDK talks to)');
     if (!zkConfigBaseUrl) throw new Error('createTxBuilder: zkConfigBaseUrl is required (a public /zk-config/<contract>)');
     if (typeof contractClass !== 'function') throw new Error('createTxBuilder: contractClass is required (the compiled Contract)');
+    // Proving mode is validated HERE, before any asset fetch or SDK import,
+    // like the other input checks.
+    if (opts.provingMode !== undefined && opts.provingMode !== 'wasm' && opts.provingMode !== 'server') {
+        throw new Error(`createTxBuilder: provingMode must be 'wasm' or 'server' (got ${String(opts.provingMode)})`);
+    }
+    if (opts.provingMode === 'server' && !opts.proofServerUrl) {
+        throw new Error("createTxBuilder: provingMode 'server' requires proofServerUrl (a proof server YOU run; it receives the witnesses)");
+    }
     const cacheDir = opts.cacheDir ?? join(homedir(), '.cache', 'nightgate-txbuilder', contractName);
 
     // 1. Proving assets: fetch once, then offline. The verifier keys must
@@ -236,12 +293,31 @@ export async function createTxBuilder(opts) {
     const CompiledContract = compactJs.CompiledContract ?? compactJs.effect?.CompiledContract;
     if (!CompiledContract?.make) throw new Error('compact-js: CompiledContract.make not found');
     const zkConfigProvider = new zkNode.NodeZkConfigProvider(cacheDir);
-    const { buildWasmProofProvider } = require('../../srv/midnight/wasm-proof-provider.js');
-    const proofProvider = await buildWasmProofProvider(zkConfigProvider);
+    // Contract-circuit proving: in-process wasm by default (nothing leaves the
+    // process); a holder-owned proof server when configured (it sees the
+    // witnesses; native + multi-threaded, several times faster on the 38 MB
+    // comparison circuit). The wallet facade's own prover stays wasm either
+    // way: a sponsorable build carries no dust or zswap proof of its own.
+    let proofProvider;
+    const provingMode = opts.provingMode === 'server' ? 'server' : 'wasm';
+    if (provingMode === 'server') {
+        const { httpClientProofProvider } = await import('@midnight-ntwrk/midnight-js-http-client-proof-provider');
+        proofProvider = httpClientProofProvider(opts.proofServerUrl, zkConfigProvider);
+    } else {
+        const { buildWasmProofProvider } = require('../../srv/midnight/wasm-proof-provider.js');
+        proofProvider = await buildWasmProofProvider(zkConfigProvider);
+    }
     const { InMemoryPrivateStateProvider } = await import('../browser/private-state.mjs');
     const rt = require('@midnight-ntwrk/compact-runtime');
+    // ONE public-data provider per builder. It owns a WebSocket to the
+    // indexer; creating it per buildSponsorable leaked one open socket (plus
+    // its subscriptions) per transaction, and a process that built several
+    // transactions in a row degraded into a 100 % CPU stall on a later build.
+    const publicDataProvider = indexerSdk.indexerPublicDataProvider(indexerHttpUrl, indexerWsUrl, require('ws'));
 
     return {
+        /** 'wasm' (in-process, default) or 'server' (opts.proofServerUrl). */
+        provingMode,
         /** Your attestation secret; feed it to the browser export's prepare* helpers. */
         attestationSecret,
         /** The identity every attestation you build will carry. */
@@ -258,7 +334,7 @@ export async function createTxBuilder(opts) {
          * @param {{ contractAddress: string, call: { circuitId: string, args: unknown[], witnesses: object }, initialPrivateState?: unknown }} input
          * @returns {Promise<{ finalizedTxB64: string, serializedBytes: number }>}
          */
-        async buildSponsorable({ contractAddress, call, initialPrivateState }) {
+        async buildSponsorable({ contractAddress, call, initialPrivateState, bind = true }) {
             if (!contractAddress) throw new Error('buildSponsorable: contractAddress is required');
             if (!call?.circuitId) throw new Error('buildSponsorable: call must come from a prepare* helper');
             onProgress?.({ phase: 'build', circuit: call.circuitId });
@@ -268,10 +344,10 @@ export async function createTxBuilder(opts) {
                 CompiledContract.withCompiledFileAssets(cacheDir)
             );
             const holder = {};
-            const walletProvider = buildOnlyWalletProvider(facade, zswapKeys, dustKey, keystore, holder, ttlMinutes);
+            const walletProvider = buildOnlyWalletProvider(facade, zswapKeys, dustKey, keystore, holder, ttlMinutes, bind);
             const privateStateProvider = new InMemoryPrivateStateProvider();
             const providers = {
-                publicDataProvider: indexerSdk.indexerPublicDataProvider(indexerHttpUrl, indexerWsUrl, require('ws')),
+                publicDataProvider,
                 zkConfigProvider,
                 proofProvider,
                 privateStateProvider,
@@ -279,7 +355,7 @@ export async function createTxBuilder(opts) {
                 midnightProvider: walletProvider
             };
             privateStateProvider.setContractAddress?.(contractAddress);
-            const found = await contracts.findDeployedContract(providers, {
+            const found = await findDeployedWithRetry(contracts, providers, {
                 contractAddress,
                 compiledContract: compiled,
                 privateStateId,
@@ -297,10 +373,14 @@ export async function createTxBuilder(opts) {
             } catch (e) {
                 if (!holder.captured) throw e;
             }
-            if (!holder.captured?.serialize) throw new Error('build produced no serializable finalized transaction');
+            if (!holder.captured?.serialize) throw new Error('build produced no serializable transaction');
             const bytes = new Uint8Array(holder.captured.serialize());
-            onProgress?.({ phase: 'built', bytes: bytes.length });
-            return { finalizedTxB64: Buffer.from(bytes).toString('base64'), serializedBytes: bytes.length };
+            onProgress?.({ phase: 'built', bytes: bytes.length, bound: bind !== false });
+            // finalizedTxB64 kept as the field name for the bound handover
+            // (0.17.2 compat); unboundTxB64 is the 0.18 parallel handover.
+            return bind === false
+                ? { unboundTxB64: Buffer.from(bytes).toString('base64'), serializedBytes: bytes.length, bound: false }
+                : { finalizedTxB64: Buffer.from(bytes).toString('base64'), serializedBytes: bytes.length, bound: true };
         },
 
         async close() {

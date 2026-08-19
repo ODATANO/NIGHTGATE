@@ -1,5 +1,187 @@
 # Changelog
 
+## 0.18.0 - 2026-08-19
+
+Parallel fee sponsoring from ONE sponsor wallet; no circuit change, no vault
+redeploy.
+
+- **`sponsorUnboundTransaction`, the parallel sponsoring channel.** The caller
+  builds with `buildSponsorable({ bind: false })` (txbuilder SDK; client
+  `ng.sponsorUnbound`) and hands over the signed PRE-BINDING transaction; the
+  sponsor locks one free dust BACKING of its wallet, builds and proves a
+  dust-only spend against it, merges it into the caller's transaction, binds
+  and submits. Proving and submit run outside the per-wallet lock (only the
+  fast dust build is serialized), each in-flight submit uses its own node
+  client, so one wallet sponsors as many transactions at once as it has
+  distinct registered dust backings. Same shape check, allow-list, pool,
+  idempotency and grant surface as `sponsorFinalizedTransaction` (both
+  phase-2 actions are agent-grantable and pool-aware). Job concurrency is the
+  heavy cap (`jobs.concurrency.heavy`, default 4). Live on preprod: 4
+  sponsorings from one wallet, 4 backings, 3 of them in the same block, 86 s
+  end to end.
+- **Dust races self-heal.** A `1010/170` or `1010/196` (dust spend built
+  against a state the node moved past, or on a note whose nullifier the node
+  already knows) rebuilds and resubmits on the SAME sponsor
+  (`NIGHTGATE_SPONSOR_DUST_RETRIES`, default 4,
+  `NIGHTGATE_SPONSOR_DUST_BACKOFF_MS`, default 5000) instead of benching it;
+  the worker's RPC errors now carry the nested cause chain, so the node's
+  reject line is visible to that classification (it was not before);
+  same-backing requests queue on the backing lock (`NIGHTGATE_BACKING_WAIT_MS`,
+  default 5 min); the dust spend's ctime is the indexer block time, not the
+  wall clock. Only non-dust retryable failures still fail over.
+- **Two SDK node-client traits worked around** (both hit live): the wallet
+  SDK's node client shares ONE socket per facade and disconnects it when any
+  submission stream ends, so concurrent submits on one facade lose each
+  other's `Finalized`; and `WsProvider.disconnect()` returns before the socket
+  is closed, so a fresh or just-used client sends on a closing socket. The
+  parallel channel therefore submits on a pool of dedicated submission
+  clients with a settle window after creation and after every use, and
+  retries once when the request itself dies on that close.
+- **Read side.** `getWalletBalance` already reports dust notes; the sponsor
+  path logs the backing each transaction paid from and the pre-submit ledger
+  cost. Job result of `sponsorUnboundTransaction`:
+  `{ txHash, circuits, contractAddress, note }`.
+- **Sponsor pool warms at boot.** The sessions in `NIGHTGATE_FEE_SPONSOR_SESSION`
+  are restored one after another right after the worker starts (background,
+  per-sponsor failures logged); before, the first sponsored job after a
+  restart paid for the cold restore of a pool member (live: 6 min restore
+  plus catch-up of a 20 h old state, every other job queued behind it).
+  Concurrent pool jobs now spread round-robin across the members (the LRU
+  touch happens before the first await).
+- **A sponsored call that did not APPLY is a failure, not a success.** A
+  transaction can sit in a block with only its guaranteed part (the fee)
+  applied and the contract-call segment rejected (ledger `PARTIAL_SUCCESS`,
+  typically the call lost a concurrent write to the same contract state). The
+  unbound sponsor path now reads the ledger result from the indexer after the
+  transaction landed and fails the job with the failed segment ids
+  (`SponsoredCallNotAppliedError`); the caller rebuilds against the current
+  contract state (see the boundary entry below for why the sponsor does not).
+  Before, such a job reported `succeeded` and the caller's next call failed
+  with `expected a cell, received null`.
+- **Sponsoring latency.** The sponsor's dust spend is proved with the
+  facade's proving service (the proof server in server mode) instead of
+  always in-process wasm, which was ~45 s of every sponsoring on the hosted
+  box; the unbound submit returns at `InBlock` (`NIGHTGATE_SPONSOR_WAIT=
+  finalized` restores the old wait) and then waits until the public indexer
+  has the transaction (`NIGHTGATE_SPONSOR_INDEXER_VISIBLE_MS`, default 30 s
+  cap; a caller that builds its next call right away reads contract state
+  from that indexer, and between InBlock and indexing it served an
+  inconsistent state: `expected a cell, received null`); the txbuilder
+  retries a build once on that read; the client SDK polls every 2 s (was
+  5 s). Measured hosted: 64-88 s per sponsored transaction before, ~10 s after
+  (warm sponsor, proof server).
+- **Configured platform sponsor sessions do not expire.** The sessions in
+  `NIGHTGATE_FEE_SPONSOR_SESSION` are infrastructure: `resolveFeeSponsor`
+  ignores their `expiresAt` and the 15-min cleanup sweep skips them. Before,
+  the pool silently died 24 h after setup (`sessionTtlMs`) and the sweep even
+  wiped its key material (live: the hosted pool, 2026-08-19). Existing pools
+  set up before this release must be re-created once if they already
+  expired.
+- **Submit watchdog.** A sponsor submit whose `Finalized` watch never fires
+  (the node closed the socket under the subscription; the SDK client has no
+  auto-reconnect after its own disconnect) no longer pins the job until the
+  TTL: after `NIGHTGATE_SUBMIT_WATCH_TIMEOUT_MS` (default 60 s) the watch is
+  abandoned, the client evicted, and the indexer asked for the transaction
+  identifier; on-chain counts as landed, otherwise the outcome is AMBIGUOUS
+  and the job ends `reconciliation_required` for the indexer confirmer (never
+  a second broadcast, see below). Live: a content-root anchor hung 13+ min
+  with the node idle.
+- **txbuilder: `proofServerUrl`.** Prove the contract circuit on a
+  holder-owned proof server instead of in-process wasm (native,
+  multi-threaded: `attest` 7-9 s instead of 25-35 s; the 38 MB comparison
+  circuit minutes faster). It receives the witnesses, so only ever a proof
+  server you run yourself. `builder.provingMode` says which is active. The
+  builder now opens ONE indexer public-data provider (it leaked one WebSocket
+  per `buildSponsorable` before).
+- Review hardening on the new pool: a backing lease carries a token, is
+  RENEWED while its job works (the TTL is a crash backstop, an active lease
+  is never taken over by time) and released ownership-checked;
+  `NIGHTGATE_NOTE_LEASE_MS` is validated (positive integer, else the 5 min
+  default); the dedicated submit clients reserve their pool slot
+  synchronously (a concurrent first burst cannot exceed the cap of 8 clients
+  while the SDK import is pending); benched pool members are EXCLUDED from the
+  unbound candidate list for their cooldown (not merely sorted last); a dust
+  race that outlives its retries fails the job without benching the sponsor
+  (it is the caller's transaction losing, not a sponsor-health problem); a
+  GENERIC pool Invalid (no ledger code) gets one rebuild at most (each costs a
+  full dust proof and it may be a caller-side invalid transaction); the SDK's
+  `waitForJob` honours `timeoutMs` while polls fail transiently; the txbuilder
+  declaration types `buildSponsorable` as a discriminated union with
+  overloads, so a 0.17 consumer's `finalizedTxB64: string` still compiles.
+- **The unbound sponsor path crosses the external-effect boundary BEFORE it
+  broadcasts.** The worker announces the transaction identifier over the RPC
+  channel (`submit-intent`) and waits for the main thread to record the
+  boundary; only then does it send. The job crosses `external_execution` once;
+  every broadcast ATTEMPT (a dust-race rebuild is a new transaction) gets its
+  own `PendingSubmissions` row and is reported `submitted` with its
+  identifier, the previous attempt's row is marked failed (`REBUILT`). A
+  failure after a broadcast therefore ends in `reconciliation_required` with
+  the identifier, never in a plain `failed` for a call that may be on-chain;
+  if the boundary cannot be persisted, nothing is broadcast. Outcomes are
+  classified by what they prove: a PRE-INCLUSION reject (1010/*, pool
+  Invalid, closing socket, a nacked intent) cannot be on-chain, so the
+  attempt is marked `REJECTED`, its hash is taken off the job
+  (`reportSubmissionRejected`) and a rebuild may follow (an exhausted run is a
+  plain `failed`); a call that landed but did NOT apply (`PARTIAL_SUCCESS`)
+  is TERMINAL for the sponsor job (the caller's transcript is stale from a
+  same-contract conflict; re-attaching fresh dust to the same caller bytes is
+  rejected at admission every time, measured live: 6 losers x 4 retries x
+  1010): the job fails `CHAIN_EXECUTION_FAILED` with the identifier straight
+  from the runner (the worker proved the outcome via the indexer; job + attempt
+  row in one write, no transient `reconciliation_required` that a polling
+  client would read as terminal), the caller rebuilds against the current state; an AMBIGUOUS outcome (the watch
+  timed out and the indexer did not know the transaction yet) is never
+  rebuilt (two identifiers, two fees could land): the job ends
+  `reconciliation_required` with its identifier. The indexer chain-outcome
+  confirmer looks transactions up by IDENTIFIER (what the wallet SDK returns
+  and NIGHTGATE stores as `txHash`, `hash` as fallback), is registered even
+  with the crawler on (restricted to the identifier-keyed sponsor kinds,
+  which the crawler's extrinsic-hash matching can never resolve), and also
+  resolves `reconciliation_required` rows of those kinds: indexer SUCCESS ->
+  `succeeded`, FAILURE/PARTIAL_SUCCESS -> `failed`, unknown -> stays.
+  The BOUND channel (`sponsorFinalizedTransaction`) crosses the same boundary
+  (it had none before, not even in 0.17): the worker announces the identifier
+  between finalize and submit, the processor records the attempt, and a
+  failover to the next pool sponsor closes the attempt row first. Restart
+  recovery fails an identifier-keyed job that was waiting to rebuild after a
+  provable reject (`external_execution` without a hash) as
+  `PROCESS_RESTART_AFTER_REJECT` instead of parking it in reconciliation.
+  Job row and attempt row are finalized in ONE transaction (reconcile pass and
+  the regular succeeded-confirm pass alike, so a crawler-free deployment never
+  leaves the `PendingSubmissions` row `included` under a confirmed job); the
+  result written on a reconciled success is the CANONICAL action shape
+  (`txHash`, `circuits`, `contractAddress`, `note`, `feeSponsor` = the
+  CONCRETE sponsor, never the pool sentinel), rebuilt from the coordinates the
+  worker announced with the intent (inspected contract + circuits, dust
+  backing, paying account; stored in the attempt row's new INTERNAL column
+  `submitIntentData`, excluded from the OData projection, `finalizedTxData`
+  keeps its public meaning as the indexed-transaction snapshot; existing
+  databases: `nightgate-schema-delta` adds the column); a nacked intent (job
+  writes failed after the row insert) closes its attempt row `REJECTED`
+  instead of leaving it pending.
+- **txbuilder safety.** Server proving is an explicit opt-in
+  (`provingMode: 'server'` + `proofServerUrl`): a bare `proofServerUrl`,
+  documented as unused in 0.17, keeps in-process wasm, so an old value cannot
+  start sending witnesses on upgrade. `bind: false` refuses a call whose
+  recipe carries a balancing transaction (the sponsor binds the base alone;
+  the vault circuits move no value, value-moving calls use the bound
+  handover).
+- **SQLite lock contention no longer 500s an admission.** The job-row INSERT
+  retries a lost write lock like the status writes already did, and the busy
+  timeout is 30 s (`cds.requires.db.client.timeout`; image env
+  `NIGHTGATE_SQLITE_BUSY_TIMEOUT_MS`): a box that keeps many wallets warm saves
+  multi-MB states for seconds at a time (live: `database is locked` on
+  `sponsorFinalizedTransaction`).
+- `@odatano/nightgate-tx` 0.2.0: `buildSponsorable` gained `bind`, the client
+  `sponsorUnbound`, and `waitForJob` survives transient poll failures
+  (429/502/503/504, network, timeout) for up to `pollGraceMs` (default 5 min)
+  instead of losing a running job's handle (live: a reverse proxy answered
+  one poll with 502 while the server was restoring a wallet; the job landed).
+
+Not changed: concurrent writes to the SAME contract state still conflict at
+the ledger (the caller rebuilds), and the bound channel stays serialized per
+sponsor wallet; do not mix bound and unbound sponsoring on one wallet.
+
 ## 0.17.2 - 2026-08-18
 
 Sponsor pool with failover; no circuit change.

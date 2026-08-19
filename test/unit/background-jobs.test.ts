@@ -74,7 +74,7 @@ function matchesWhere(row: any, where: Record<string, unknown>): boolean {
 // Injects "database is locked" failures into UPDATE queries, optionally only
 // for updates that set a specific target status. Simulates the SQLite write
 // lock being held by a foreign long commit.
-const lockInjector = vi.hoisted(() => ({ failUpdates: 0, matchStatus: null as string | null }));
+const lockInjector = vi.hoisted(() => ({ failUpdates: 0, matchStatus: null as string | null, failInserts: 0 }));
 
 // Records db.tx(...) invocations so tests can assert whether a write joined
 // the ambient request tx (tx(context) → pinned runner) or ran autocommit.
@@ -105,6 +105,10 @@ const runMock = vi.hoisted(() => (vi.fn(async (q: any) => {
         return found;
     }
     if (q.kind === 'insert') {
+        if (lockInjector.failInserts > 0) {
+            lockInjector.failInserts--;
+            throw new Error('database is locked');
+        }
         const entry = Array.isArray(q.entry) ? q.entry[0] : q.entry;
         // Enforce the (sessionId, kind, idempotencyKey) unique constraint the
         // real DB carries, so the concurrent-collision recovery path is testable.
@@ -563,6 +567,25 @@ describe('startJob: insert row + return jobId', () => {
         expect(JSON.parse(rows.get(ret.jobId)!.result!)).toMatchObject({
             reconciled: true, txHash: '0xfinal', contractAddress: '0xcontract'
         });
+    });
+
+    test('a PROVEN on-chain failure of an identifier-keyed job (call did NOT apply) fails terminally, never reconciliation_required', async () => {
+        registerBackgroundJobProcessor('sponsorUnboundTransaction', 1, async () => {
+            await reportExternalExecution({ submissionId: 'sub-partial' });
+            await reportExternalSubmission({ submissionId: 'sub-partial', txHash: '00partial' });
+            throw new Error('sponsored transaction 00partial is in block 42 but its contract call did NOT apply (ledger result PARTIAL_SUCCESS)');
+        });
+        const ret = await startJob({
+            kind: 'sponsorUnboundTransaction', sessionId: 'sess-1', requestedBy: 'alice',
+            request: {}, commandVersion: 1, command: { unboundTxB64: 'x' }
+        });
+        await flushSpawn();
+        const row = rows.get(ret.jobId)!;
+        expect(row.status).toBe('failed');
+        expect(row.errorCode).toBe('CHAIN_EXECUTION_FAILED');
+        expect((row as any).chainStatus).toBe('failure');
+        expect(row.txHash).toBe('00partial');
+        expect(row.leaseOwner).toBeNull();
     });
 
     test('keeps the job in reconciliation when its projection finalizer fails', async () => {
@@ -1390,6 +1413,18 @@ describe('recoverInterruptedJobs', () => {
         expect(await recoverInterruptedJobs()).toBe(0);
     });
 
+    test('an identifier-keyed sponsor job in external_execution WITHOUT a hash (rejected attempt awaiting rebuild) fails plainly instead of parking in reconciliation', async () => {
+        const now = new Date().toISOString();
+        rows.set('rej', { ID: 'rej', kind: 'sponsorUnboundTransaction', sessionId: 's', status: 'external_execution', txHash: null, commandVersion: 1, command: '{}', requestedBy: 'u', idempotencyKey: null, request: null, result: null, errorCode: null, errorMessage: null, startedAt: now, finishedAt: null, createdAt: now, modifiedAt: now });
+        rows.set('amb', { ID: 'amb', kind: 'sponsorUnboundTransaction', sessionId: 's', status: 'external_execution', txHash: '00ambiguous', commandVersion: 1, command: '{}', requestedBy: 'u', idempotencyKey: null, request: null, result: null, errorCode: null, errorMessage: null, startedAt: now, finishedAt: null, createdAt: now, modifiedAt: now });
+        rows.set('oth', { ID: 'oth', kind: 'sendNight', sessionId: 's', status: 'external_execution', txHash: null, idempotencyKey: null, request: null, result: null, errorCode: null, errorMessage: null, startedAt: now, finishedAt: null, createdAt: now, modifiedAt: now });
+        await recoverInterruptedJobs();
+        expect(rows.get('rej')!.status).toBe('failed');
+        expect(rows.get('rej')!.errorCode).toBe('PROCESS_RESTART_AFTER_REJECT');
+        expect(rows.get('amb')!.status).toBe('reconciliation_required'); // has a hash: may be on-chain
+        expect(rows.get('oth')!.status).toBe('reconciliation_required'); // crawler-keyed kinds keep the conservative rule
+    });
+
     // Live regression (2026-08-04): every ungraceful stop left one more
     // `connectWalletForSigning` in `running`, and each boot replayed them all.
     // Since all wallet facades share the ONE worker thread, those unrequested
@@ -1480,6 +1515,23 @@ describe('status-write contention hardening', () => {
     beforeEach(() => {
         // Backoff without waiting; the schedule only skips zero entries.
         __setStatusWriteBackoffForTests([0, 0, 0]);
+    });
+
+    test('the ADMISSION insert survives transient lock contention (job still starts)', async () => {
+        // Live: `database is locked` 500 on sponsorFinalizedTransaction while a
+        // multi-wallet box was saving nine facades. Retried like a status write.
+        lockInjector.failInserts = 2;
+        const ret = await startJob({
+            kind:      'sendNight',
+            sessionId: 'sess-adm',
+            request:   {},
+            work:      async () => ({ txId: 'tx-after-locked-insert' })
+        });
+        await flushSpawn();
+        expect(lockInjector.failInserts).toBe(0);
+        const row = rows.get(ret.jobId)!;
+        expect(row.status).toBe('succeeded');
+        expect(JSON.parse(row.result!)).toEqual({ txId: 'tx-after-locked-insert' });
     });
 
     test('markSucceeded survives transient lock contention (2 lost races)', async () => {

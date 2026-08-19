@@ -10,6 +10,10 @@ if [ -z "${ENCRYPTION_KEY:-}" ]; then
 fi
 
 DB_PATH="${NIGHTGATE_DB_PATH:-/data/nightgate.db}"
+# SQLite busy timeout (ms): how long a writer waits for the lock before
+# `database is locked`. Multi-MB wallet-state saves of many warm facades hold
+# the lock for seconds; better-sqlite3's default of 5 s was too short live.
+export __NG_SQLITE_TIMEOUT="${NIGHTGATE_SQLITE_BUSY_TIMEOUT_MS:-30000}"
 mkdir -p "$(dirname "$DB_PATH")"
 
 AUTH_KIND="${NIGHTGATE_AUTH:-basic}"
@@ -28,7 +32,7 @@ case "$AUTH_KIND" in
         CDS_CONFIG=$(node -e '
             const { __NG_DB, __NG_USER, __NG_PW } = process.env;
             console.log(JSON.stringify({ requires: {
-                db:   { kind: "sqlite", credentials: { url: __NG_DB } },
+                db:   { kind: "sqlite", credentials: { url: __NG_DB }, client: { timeout: Number(process.env.__NG_SQLITE_TIMEOUT) || 30000 } },
                 auth: { impl: "./srv/utils/agent-token-auth.js", users: { [__NG_USER]: { password: __NG_PW } } }
             }}));')
         ;;
@@ -37,7 +41,7 @@ case "$AUTH_KIND" in
         export __NG_DB="$DB_PATH"
         CDS_CONFIG=$(node -e '
             console.log(JSON.stringify({ requires: {
-                db:   { kind: "sqlite", credentials: { url: process.env.__NG_DB } },
+                db:   { kind: "sqlite", credentials: { url: process.env.__NG_DB }, client: { timeout: Number(process.env.__NG_SQLITE_TIMEOUT) || 30000 } },
                 auth: { kind: "dummy" }
             }}));')
         ;;

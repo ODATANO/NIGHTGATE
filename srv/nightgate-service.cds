@@ -162,7 +162,7 @@ service NightgateService {
      * `finalized` by the crawler when the matching tx is indexed.
      */
     @readonly
-    entity PendingSubmissions    as projection on midnight.PendingSubmissions;
+    entity PendingSubmissions    as projection on midnight.PendingSubmissions excluding { submitIntentData };
 
     // ========================================================================
     // Document Anchoring
@@ -927,6 +927,24 @@ service NightgateService {
         jobId  : UUID;
         status : String;
         sessionId : UUID; // the SPONSOR session the job is keyed by; poll getJobStatus with it
+    };
+
+    /**
+     * Cross-server fee sponsoring, PARALLEL channel (0.18). Takes an UNBOUND
+     * (pre-binding) proven+signed caller tx from
+     * buildSponsorable({ bind: false }) (txbuilder SDK); the sponsor merges a
+     * dust spend from a locked BACKING and binds. Proving + submit run outside
+     * the per-wallet lock, so one wallet sponsors N txs in parallel (N =
+     * distinct registered dust backings). Same policy + pool + grant surface
+     * as the bound channel. Poll getJobStatus with the returned sessionId.
+     */
+    action   sponsorUnboundTransaction(unboundTxB64: LargeString,
+                                       sponsorSessionId: UUID,
+                                       idempotencyKey: String
+    )                                                                 returns {
+        jobId  : UUID;
+        status : String;
+        sessionId : UUID;
     };
 
     /**

@@ -285,6 +285,11 @@ entity PendingSubmissions : cuid, managed {
     status          : PendingSubmissionStatus default 'pending';
     finalizedAt     : Timestamp;
     finalizedTxData : LargeString; // JSON snapshot of crawler-indexed tx
+    // 0.18.0, INTERNAL (not projected into any service): what the worker
+    // announced with the submit-intent of a sponsored attempt (paying
+    // sponsor session + account, inspected contract/circuits, dust backing);
+    // the reconciled job result is rebuilt from it.
+    submitIntentData : LargeString;
     errorCode       : String(50); // e.g. '1016', 'TIMEOUT', 'TxFailed'
     errorMessage    : String(500);
     sessionId       : UUID; // links to WalletSessions for audit

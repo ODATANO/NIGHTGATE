@@ -43,6 +43,22 @@ void buildAttestationVaultWitnesses();
 void ((c: PreparedCall) => c);
 void createNightgateConnectorProviders;
 void buildProofProvider;
+
+// txbuilder: the DEFAULT (bound) build keeps finalizedTxB64 as a plain string under strict
+// TypeScript (0.18 made the return a discriminated union; a 0.17 consumer that
+// reads finalizedTxB64 without narrowing must still compile), and bind:false
+// narrows to unboundTxB64.
+import type { TxBuilder } from '@odatano/nightgate/txbuilder';
+async function txb(b: TxBuilder, call: PreparedCall) {
+    const bound = await b.buildSponsorable({ contractAddress: 'c', call });
+    const s1: string = bound.finalizedTxB64;
+    const unbound = await b.buildSponsorable({ contractAddress: 'c', call, bind: false });
+    const s2: string = unbound.unboundTxB64;
+    const either = await b.buildSponsorable({ contractAddress: 'c', call, bind: Math.random() > 0.5 });
+    const s3: string = either.bound ? either.finalizedTxB64 : either.unboundTxB64;
+    void [s1, s2, s3];
+}
+void txb;
 `,
 );
 writeFileSync(

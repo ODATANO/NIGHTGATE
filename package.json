@@ -1,6 +1,6 @@
 {
   "name": "@odatano/nightgate",
-  "version": "0.17.2",
+  "version": "0.18.0",
   "description": "CAP Plugin: Midnight Blockchain Indexer with OData V4 API",
   "homepage": "https://github.com/ODATANO/NIGHTGATE#readme",
   "repository": {
@@ -160,6 +160,7 @@
     "check:fresh-tree": "bash scripts/check-fresh-tree.sh",
     "cross-server-probe:e2e": "node --env-file=.env scripts/run-cross-server-sponsor-probe-e2e.mjs",
     "txbuilder:e2e": "node --env-file=.env scripts/run-txbuilder-e2e.mjs",
+    "burst-sponsor:e2e": "node --env-file=.env scripts/run-burst-sponsor-e2e.mjs",
     "build:slim": "node scripts/build-slim-package.mjs",
     "check:slim": "npm run build:slim && node scripts/check-slim-package.mjs",
     "mint-token:e2e": "node --env-file=.env scripts/run-mint-token-e2e.mjs"
@@ -225,6 +226,9 @@
         "kind": "sqlite",
         "credentials": {
           "url": "db/midnight.db"
+        },
+        "client": {
+          "timeout": 30000
         }
       },
       "nightgate": {

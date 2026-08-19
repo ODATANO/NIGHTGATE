@@ -56,6 +56,7 @@ The server listens on `http://localhost:4004`; the OData services sit under
 | `NIGHTGATE_NODE_URL` / `NIGHTGATE_INDEXER_HTTP_URL` / `NIGHTGATE_INDEXER_WS_URL` | per-network defaults | Endpoint overrides |
 | `NIGHTGATE_PROOF_SERVER_URL` | unset | Set to switch proving from in-process wasm to a proof server |
 | `NIGHTGATE_DB_PATH` | `/data/nightgate.db` | SQLite location (persist the `/data` volume) |
+| `NIGHTGATE_SQLITE_BUSY_TIMEOUT_MS` | `30000` | How long a writer waits for the SQLite lock; multi-MB wallet-state saves of many warm facades hold it for seconds |
 | `NODE_OPTIONS` | `--max-old-space-size=8192` | Heap; keep the container memory limit above it |
 
 Proving default is fully in-process (wasm): zero extra containers, but
@@ -71,7 +72,8 @@ wipe data on every boot. The startup preflight also probes each release's
 NEW columns, so an old database refuses to boot with a migration hint
 instead of failing at the first new action. After an image upgrade that
 adds entities or columns (0.16.0: `Documents.userId/contractAddress/network`,
-`PredicateAttestations.payloadHashB/allowedMask`), run the ADDITIVE
+`PredicateAttestations.payloadHashB/allowedMask`; 0.18.0:
+`PendingSubmissions.submitIntentData`), run the ADDITIVE
 migration (keeps all data; it reads `NIGHTGATE_DB_PATH`, which the image
 sets to `/data/nightgate.db`):
 

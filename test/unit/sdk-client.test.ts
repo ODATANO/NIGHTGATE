@@ -172,6 +172,44 @@ describe('connect: jobs', () => {
         await expect(ng.waitForJob({ jobId: 'j4', timeoutMs: 5 })).rejects.toThrow(/still processing/);
     });
 
+    test('waitForJob survives transient poll failures (proxy 502, network) and keeps the job handle', async () => {
+        // Live case: a reverse proxy answered one poll with 502 while the server
+        // was busy; the job itself landed.
+        const { connect } = await importClient();
+        const { fn, calls } = fakeFetch([
+            { status: 502, body: { error: { message: 'Bad Gateway' } } },
+            { status: 503, body: {} },
+            { body: { status: 'processing' } },
+            { body: { status: 'succeeded', result: JSON.stringify({ txHash: 'tx-after-502' }) } }
+        ]);
+        const ng = connect({ baseUrl: 'https://ng.example', fetchFn: fn as any, pollMs: 1 });
+        const out = await ng.waitForJob({ jobId: 'j5', sessionId: 's' });
+        expect(out.txHash).toBe('tx-after-502');
+        expect(calls.length).toBe(4);
+    });
+
+    test('waitForJob honours timeoutMs even while every poll fails transiently', async () => {
+        const { connect, NightgateApiError } = await importClient();
+        const always503 = fakeFetch([{ status: 503, body: {} }]);
+        const ng = connect({ baseUrl: 'https://ng.example', fetchFn: always503.fn as any, pollMs: 1 });
+        const t0 = Date.now();
+        await expect(ng.waitForJob({ jobId: 'j8', timeoutMs: 10, pollGraceMs: 60_000 })).rejects.toBeInstanceOf(NightgateApiError);
+        expect(Date.now() - t0).toBeLessThan(2_000); // bounded by timeoutMs, not by the 60 s grace
+    });
+
+    test('waitForJob gives up on transient poll failures after pollGraceMs, and never retries a 4xx', async () => {
+        const { connect, NightgateApiError } = await importClient();
+        const always502 = fakeFetch([{ status: 502, body: {} }]);
+        const ng = connect({ baseUrl: 'https://ng.example', fetchFn: always502.fn as any, pollMs: 1 });
+        await expect(ng.waitForJob({ jobId: 'j6', pollGraceMs: 20 })).rejects.toBeInstanceOf(NightgateApiError);
+        expect(always502.calls.length).toBeGreaterThan(1);
+
+        const forbidden = fakeFetch([{ status: 403, body: { error: { message: 'nope' } } }]);
+        const ng2 = connect({ baseUrl: 'https://ng.example', fetchFn: forbidden.fn as any, pollMs: 1 });
+        await expect(ng2.waitForJob({ jobId: 'j7' })).rejects.toThrow(/nope/);
+        expect(forbidden.calls.length).toBe(1);
+    });
+
     test('int64 rejects non-integers', async () => {
         const { int64 } = await importClient();
         expect(() => int64('1.5')).toThrow(/not an integer/);

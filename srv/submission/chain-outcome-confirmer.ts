@@ -57,18 +57,33 @@ export function createHttpTxConfirmer(
     const doFetch = cfg.fetchFn ?? fetch;
     const timeoutMs = cfg.timeoutMs ?? 8000;
 
-    return async (txHash: string): Promise<ChainOutcome | null> => {
+    // What NIGHTGATE stores as `txHash` is the ledger transaction IDENTIFIER
+    // (`tx.identifiers().at(-1)`, the value the wallet SDK's submit returns),
+    // which the Indexer answers under `offset.identifier`; the Substrate block
+    // hash (`offset.hash`) is a different value. Try identifier first, then
+    // hash for rows written by older code paths.
+    const lookup = async (offset: Record<string, string>): Promise<string | null> => {
         const res = await doFetch(cfg.indexerHttpUrl, {
             method: 'POST',
             headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ query: TX_STATUS_QUERY, variables: { offset: { hash: txHash } } }),
+            body: JSON.stringify({ query: TX_STATUS_QUERY, variables: { offset } }),
             signal: AbortSignal.timeout(timeoutMs)
         });
         if (!res.ok) throw new Error(`Indexer tx lookup HTTP ${res.status}`);
         const body: any = await res.json();
-        if (body?.errors?.length) throw new Error(`Indexer tx lookup GraphQL error: ${body.errors[0]?.message ?? 'unknown'}`);
+        if (body?.errors?.length) {
+            // An invalid offset value (e.g. a non-hash under `hash`) is a
+            // GraphQL error, not "not indexed": surface it as null so the other
+            // key is tried; any other GraphQL error is a real failure.
+            if (/invalid transaction (hash|identifier)|cannot convert/i.test(String(body.errors[0]?.message))) return null;
+            throw new Error(`Indexer tx lookup GraphQL error: ${body.errors[0]?.message ?? 'unknown'}`);
+        }
         const status = body?.data?.transactions?.[0]?.transactionResult?.status;
-        if (typeof status !== 'string') return null; // not indexed yet / no result
+        return typeof status === 'string' ? status : null;
+    };
+    return async (txHash: string): Promise<ChainOutcome | null> => {
+        const status = (await lookup({ identifier: txHash })) ?? (await lookup({ hash: txHash }));
+        if (status === null) return null; // not indexed yet / no result
         const mapped = mapIndexerStatus(status);
         return mapped ? { status: mapped } : null; // unknown/future status -> not confirmed
     };

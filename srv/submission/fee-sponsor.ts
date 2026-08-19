@@ -101,7 +101,11 @@ export async function resolveFeeSponsor(opts: ResolveFeeSponsorOptions): Promise
             'Sponsor session not found, inactive, or not usable by this caller. ' +
             'Use one of your own sessions, or a session listed in NIGHTGATE_FEE_SPONSOR_SESSION.');
     }
-    if (session.expiresAt && new Date(session.expiresAt) < new Date()) {
+    // A CONFIGURED platform sponsor does not expire while it is configured:
+    // it is infrastructure, not a caller's session. (The cleanup sweep skips
+    // it for the same reason; otherwise the pool silently died 24 h after it
+    // was set up and the sweep even wiped its key material: live 2026-08-19.)
+    if (!isPlatformSponsor && session.expiresAt && new Date(session.expiresAt) < new Date()) {
         throw new FeeSponsorError(410, 'Sponsor session expired');
     }
     if (!session.encryptedViewingKey) {
@@ -148,4 +152,40 @@ export async function ensureFeeSponsorFacade(
         syncStatePassphrase: sponsor.syncStatePassphrase,
         accountIndex: sponsor.accountIndex
     });
+}
+
+/**
+ * Warm the configured platform sponsor pool right after boot, one facade at a
+ * time (facade restores are CPU-bound on the single wallet worker thread, so
+ * parallel warm-ups only slow each other down). Fire-and-forget from the
+ * plugin's init: a sponsor that fails to warm is logged and skipped, the pool
+ * failover covers it at use time. Without this, the first sponsored job after
+ * a restart pays for the cold restore of a sponsor that may have been warm
+ * for days (live: 6 min restore + catch-up on a pool member whose stored
+ * state was 20 h old, with every other job queued behind it).
+ */
+export async function prewarmFeeSponsorPool(opts: {
+    db: any;
+    config?: Record<string, any>;
+    facadeConfig: Omit<WalletFacadeBuildArgs, 'seedHex' | 'syncStatePassphrase'>;
+    log?: { info: (m: string) => void; warn: (m: string) => void };
+    /** Test seam; defaults to the process-scoped key. */
+    encryptionKey?: Buffer;
+}): Promise<{ warmed: string[]; failed: string[] }> {
+    const pool = getConfiguredFeeSponsorSessions(opts.config);
+    const warmed: string[] = [];
+    const failed: string[] = [];
+    for (const sponsorSessionId of pool) {
+        const started = Date.now();
+        try {
+            const sponsor = await resolveFeeSponsor({ db: opts.db, sponsorSessionId, config: opts.config, encryptionKey: opts.encryptionKey });
+            await ensureFeeSponsorFacade(sponsor, opts.facadeConfig);
+            warmed.push(sponsorSessionId);
+            opts.log?.info(`sponsor pool prewarm: ${sponsorSessionId.slice(0, 8)} facade ready in ${Math.round((Date.now() - started) / 1000)}s`);
+        } catch (err) {
+            failed.push(sponsorSessionId);
+            opts.log?.warn(`sponsor pool prewarm: ${sponsorSessionId.slice(0, 8)} failed (${err instanceof Error ? err.message : String(err)}); the pool fails over at use time`);
+        }
+    }
+    return { warmed, failed };
 }

@@ -37,8 +37,16 @@ export interface CreateTxBuilderInput {
     indexerWsUrl: string;
     /** Substrate RPC the wallet SDK talks to (its `relayURL`). */
     nodeUrl: string;
-    /** Unused under wasm proving; only the SDK's config type asks for it. */
+    /** Unused unless `provingMode: 'server'` (only the SDK's config type asks for it otherwise). */
     proofServerUrl?: string;
+    /**
+     * 'wasm' (default): prove the contract circuit in-process; nothing leaves
+     * the process. 'server': prove on `proofServerUrl`, which then RECEIVES THE
+     * WITNESSES (native, multi-threaded, several times faster on the big
+     * circuits): only ever a proof server you run yourself, never the
+     * sponsor's. Explicit opt-in on purpose.
+     */
+    provingMode?: 'wasm' | 'server';
     /** A public `/zk-config/<contract>`; assets are fetched once and cached. */
     zkConfigBaseUrl: string;
     /** The compiled contract class, e.g. from `@odatano/nightgate/browser/attestation-vault`. */
@@ -57,21 +65,40 @@ export interface BuildSponsorableInput {
     contractAddress: string;
     call: PreparedCall;
     initialPrivateState?: unknown;
+    /** true (default): FINALIZED handover (sponsorFinalizedTransaction).
+     *  false: UNBOUND handover (sponsorUnboundTransaction, parallel 0.18). */
+    bind?: boolean;
 }
+export interface BuildSponsorableBoundInput extends BuildSponsorableInput { bind?: true; }
+export interface BuildSponsorableUnboundInput extends BuildSponsorableInput { bind: false; }
 
-export interface BuiltTransaction {
-    /** Base64 of the fee-unpaid, signed, proven transaction; hand this to a sponsor. */
+/** Bound handover (bind omitted or true): base64 of the fee-unpaid finalized tx -> sponsorFinalizedTransaction. */
+export interface BuiltBoundTransaction {
     finalizedTxB64: string;
+    unboundTxB64?: undefined;
     serializedBytes: number;
+    bound: true;
 }
+/** Unbound handover (bind:false): base64 of the pre-binding signed tx -> sponsorUnboundTransaction. */
+export interface BuiltUnboundTransaction {
+    unboundTxB64: string;
+    finalizedTxB64?: undefined;
+    serializedBytes: number;
+    bound: false;
+}
+export type BuiltTransaction = BuiltBoundTransaction | BuiltUnboundTransaction;
 
 export interface TxBuilder {
+    /** 'wasm' (in-process, default) or 'server' (proofServerUrl given). */
+    provingMode: 'wasm' | 'server';
     /** Feed this to the browser export's `prepare*` helpers. */
     attestationSecret: Uint8Array;
     /** The identity every attestation built here will carry (hex). */
     attesterId: string;
     zkAssets: ZkAssetResult;
     addresses: { night: string };
+    buildSponsorable(input: BuildSponsorableUnboundInput): Promise<BuiltUnboundTransaction>;
+    buildSponsorable(input: BuildSponsorableBoundInput): Promise<BuiltBoundTransaction>;
     buildSponsorable(input: BuildSponsorableInput): Promise<BuiltTransaction>;
     close(): Promise<void>;
 }

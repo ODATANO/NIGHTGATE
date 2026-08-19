@@ -45,6 +45,14 @@ vi.mock('node:worker_threads', async () => {
     const actual = await vi.importActual<any>('node:worker_threads');
     return { ...actual, parentPort: fakeParentPort };
 });
+// The sponsor submit watchdog (read at module load): 3 s here instead of the
+// 4 min default, so the watchdog test runs in seconds while every other
+// submit in this file resolves well within it.
+process.env.NIGHTGATE_SUBMIT_WATCH_TIMEOUT_MS = '3000';
+// The post-InBlock indexer-visibility wait is 0 in this file (the fake indexer
+// never knows a tx); the wait itself is covered by the watchdog test, which
+// stubs an indexer that DOES know the tx.
+process.env.NIGHTGATE_SPONSOR_INDEXER_VISIBLE_MS = '0';
 
 // ---- SDK seams --------------------------------------------------------------
 
@@ -62,13 +70,22 @@ vi.mock('../../srv/submission/contract-witnesses', () => ({
 }));
 
 const zswapClear = vi.hoisted(() => (vi.fn()));
+// Ledger seams the unbound sponsor path crosses (deserialize the caller tx,
+// assemble the dust-only intent); overridden per test.
+const ledgerTx = vi.hoisted(() => ({
+    deserialize: vi.fn(),
+    fromPartsRandomized: vi.fn((..._a: any[]) => ({ dustUnproven: true }))
+}));
 vi.mock('@midnight-ntwrk/ledger-v8', () => ({
     ZswapSecretKeys: {
         fromSeed: vi.fn(() => ({ coinPublicKey: 'cpk', encryptionPublicKey: 'epk', clear: zswapClear }))
     },
     DustSecretKey: { fromSeed: vi.fn(() => ({ dustKey: true })) },
     LedgerParameters: { initialParameters: vi.fn(() => ({ dust: { dustParams: true } })) },
-    nativeToken: vi.fn(() => ({ raw: 'night-raw-type' }))
+    nativeToken: vi.fn(() => ({ raw: 'night-raw-type' })),
+    Transaction: ledgerTx,
+    Intent: { new: vi.fn(() => ({})) },
+    DustActions: class { constructor(..._a: any[]) { /* stub */ } }
 }));
 
 // Receiver-address parsing + address encoding go through the real
@@ -135,14 +152,32 @@ const dustRestore = vi.hoisted(() => (vi.fn(() => 'du-restored')));
 vi.mock('@midnightntwrk/wallet-sdk-dust-wallet', () => ({
     DustWallet: vi.fn(() => ({ startWithSecretKey: dustStart, restore: dustRestore }))
 }));
+// CoreWallet.spendCoins (unbound sponsor build): functional, returns the spends
+// and an updated wallet the worker discards.
+const spendCoins = vi.hoisted(() => (vi.fn((_state: any, _sk: any, coins: any[]) =>
+    [coins.map((c: any) => ({ oldNullifier: `nul-${c.token.backingNight}` })), { updated: true }])));
+vi.mock('@midnightntwrk/wallet-sdk-dust-wallet/v1', () => ({
+    CoreWallet: { spendCoins }
+}));
 
 vi.mock('@midnightntwrk/wallet-sdk-abstractions', () => ({
     InMemoryTransactionHistoryStorage: class { constructor(..._a: any[]) { /* stub */ } }
 }));
 
-const makeWasmProvingService = vi.hoisted(() => (vi.fn((..._args: any[]) => ({ wasmProver: true }))));
+const makeWasmProvingService = vi.hoisted(() => (vi.fn((..._args: any[]): any => ({ wasmProver: true }))));
 vi.mock('@midnightntwrk/wallet-sdk-capabilities/proving', () => ({
     makeWasmProvingService
+}));
+// Dedicated per-submit node clients of the unbound sponsor path: each
+// makeDefaultSubmissionService call is one client with its own socket.
+const submitServices = vi.hoisted(() => [] as Array<{ submitTransaction: any; close: any }>);
+const makeDefaultSubmissionService = vi.hoisted(() => (vi.fn((_cfg: any): any => {
+    const svc = { submitTransaction: vi.fn(async (_tx: any, _status: string) => undefined), close: vi.fn(async () => undefined) };
+    submitServices.push(svc);
+    return svc;
+})));
+vi.mock('@midnightntwrk/wallet-sdk-capabilities/submission', () => ({
+    makeDefaultSubmissionService
 }));
 
 // wasm mode shares one key-material provider via wasm-proof-provider's
@@ -235,10 +270,24 @@ async function initSession(sessionId: string) {
 }
 
 /** Drive the worker's dispatcher exactly like wallet-worker-client does. */
+// Submit intents the worker announced before broadcasting (txHash per call),
+// and an optional hook to nack them (tests the "no ack -> no broadcast" rule).
+const submitIntents: string[] = [];
+let submitIntentHook: ((txHash: string) => Promise<void>) | undefined;
 function rpc(method: string, args: unknown): Promise<any> {
     const { port1, port2 } = new MessageChannel();
     const reply = new Promise<any>((resolve) => {
-        port2.once('message', (msg: any) => { port2.close(); resolve(msg); });
+        port2.on('message', (msg: any) => {
+            if (msg?.kind === 'submit-intent') {
+                // Like wallet-worker-client: persist (hook), then ack/nack.
+                submitIntents.push(String(msg.txHash));
+                Promise.resolve().then(() => submitIntentHook?.(String(msg.txHash)))
+                    .then(() => port2.postMessage({ kind: 'submit-intent-ack', txHash: msg.txHash, ok: true }))
+                    .catch((e) => port2.postMessage({ kind: 'submit-intent-ack', txHash: msg.txHash, ok: false, error: String(e?.message ?? e) }));
+                return;
+            }
+            port2.close(); resolve(msg);
+        });
     });
     fakeParentPort.emit('message', { kind: 'rpc', method, args, port: port1 });
     return reply;
@@ -1675,5 +1724,543 @@ describe('withFindContractQueryCache', () => {
         expect((await rpc('submitContractCall', callArgs('session-qcache-args-dddd', addr))).ok).toBe(true);
         expect((await rpc('submitContractCall', callArgs('session-qcache-args-dddd', addr))).ok).toBe(true);
         expect(publicDataMethods.queryDeployContractState).toHaveBeenCalledTimes(2);
+    });
+});
+
+// ---- sponsorUnboundTx: the 0.18 concurrency contract ------------------------
+//
+// The unbound sponsor path is NOT a whole-call SUBMIT_METHOD: only its fast,
+// key-using dust build takes the per-session lock; proving + submit overlap
+// across jobs. That is only safe because the path never books a spend in the
+// sponsor's dust wallet, never arms the whole-wallet dust-wedge snapshot, and
+// submits on DEDICATED node clients (the facade's shared client drops its
+// socket when any one submission stream ends). Pins all of it: overlap,
+// distinct backings, no snapshot, one client per concurrent submit.
+describe('sponsorUnboundTx concurrency contract', () => {
+    const SESSION = 'session-sponsor-unbound-aaaaaa';
+    const VAULT = 'aa'.repeat(32);
+    const args = {
+        sponsorSessionId: SESSION,
+        unboundTxB64: Buffer.from('caller-tx').toString('base64'),
+        networkId: 'preprod',
+        allowedContracts: [VAULT],
+        allowedCircuits: ['attest']
+    };
+
+    function callerTx() {
+        return {
+            intents: new Map([[0, { actions: [{ address: VAULT, entryPoint: 'attest' }], guaranteedUnshieldedOffer: null, dustActions: null }]]),
+            feesWithMargin: () => 1_000n
+        };
+    }
+
+    it('two concurrent sponsorings overlap in proving, land on distinct backings and never arm the dust snapshot', async () => {
+        const facade = await initSession(SESSION);
+        vi.stubGlobal('fetch', vi.fn(async () => ({
+            json: async () => ({ data: { block: { height: '500', timestamp: Date.now() } } })
+        })));
+        try {
+            facadeState.current = { dust: { progress: { appliedIndex: '95', isConnected: true } } };
+            wsTip.maxId = '100';
+            const notes = [
+                { token: { backingNight: 'backing-A' }, generatedNow: 10n ** 9n },
+                { token: { backingNight: 'backing-B' }, generatedNow: 10n ** 9n }
+            ];
+            facade.dust.state = {
+                subscribe(obs: any) {
+                    obs.next({ state: { core: true }, capabilities: { coinsAndBalances: { getAvailableCoins: () => notes } } });
+                    return { unsubscribe() { /* noop */ } };
+                }
+            };
+            ledgerTx.deserialize.mockImplementation(() => callerTx());
+            spendCoins.mockClear();
+
+            // Every prove blocks until released, so we can observe whether the
+            // second job reaches proving while the first is still proving.
+            const releases: Array<() => void> = [];
+            const proveCalls: any[] = [];
+            makeWasmProvingService.mockImplementation(() => ({
+                prove: async (unproven: any) => {
+                    proveCalls.push(unproven);
+                    await new Promise<void>((r) => releases.push(r));
+                    return { merge: (caller: any) => ({ bind: () => ({ bound: true, caller, identifiers: () => ['tx-id-fixture'] }) }) };
+                }
+            }));
+            // Both submits must be in flight AT ONCE to prove they got distinct
+            // clients: hold each submit until both were issued.
+            const submitReleases: Array<() => void> = [];
+            const clientsBefore = submitServices.length;
+            makeDefaultSubmissionService.mockImplementation((_cfg: any) => {
+                const svc = {
+                    submitTransaction: vi.fn(async (_tx: any, status: string) => {
+                        expect(status).toBe(workerExports.sponsorSubmitWaitStage());
+                        await new Promise<void>((r) => submitReleases.push(r));
+                    }),
+                    close: vi.fn(async () => undefined)
+                };
+                submitServices.push(svc);
+                return svc;
+            });
+
+            const p1 = rpc('sponsorUnboundTx', args);
+            const p2 = rpc('sponsorUnboundTx', args);
+            // Cold-cache runs may need one 3s sync re-poll before job 2 latches.
+            await vi.waitFor(() => expect(proveCalls).toHaveLength(2), { timeout: 15_000 });
+            // Job 2 is proving while job 1 has not submitted: no whole-call lock.
+            expect(facade.submitTransaction).not.toHaveBeenCalled();
+            expect(spendCoins).toHaveBeenCalledTimes(2);
+
+            submitIntents.length = 0;
+            releases.forEach((r) => r());
+            await vi.waitFor(() => expect(submitReleases).toHaveLength(2), { timeout: 15_000 });
+            // Both txs announced their identifier BEFORE the broadcast (external-effect boundary).
+            expect(submitIntents).toEqual(['tx-id-fixture', 'tx-id-fixture']);
+            // Two concurrent submits -> two DEDICATED clients, never the facade's.
+            expect(submitServices.length - clientsBefore).toBe(2);
+            expect(facade.submitTransaction).not.toHaveBeenCalled();
+            submitReleases.forEach((r) => r());
+            const [r1, r2] = await Promise.all([p1, p2]);
+            expect(r1.ok).toBe(true);
+            expect(r2.ok).toBe(true);
+            expect(r1.result.txHash).toBe('tx-id-fixture');
+            expect(new Set([r1.result.note, r2.result.note])).toEqual(new Set(['backing-A', 'backing-B']));
+            // The path never books a spend in facade.dust, so it never arms the
+            // whole-wallet wedge snapshot (a restore would swap facade.dust under
+            // the other in-flight job).
+            expect(facade.dust.serializeState).not.toHaveBeenCalled();
+        } finally {
+            vi.unstubAllGlobals();
+            makeWasmProvingService.mockImplementation((..._a: any[]) => ({ wasmProver: true }));
+            await rpc('evict', { sessionId: SESSION });
+        }
+    });
+
+    it('a pre-mempool reject on the unbound path is rethrown WITHOUT a dust restore (nothing was booked)', async () => {
+        const facade = await initSession('session-sponsor-unbound-bbbbbb');
+        vi.stubGlobal('fetch', vi.fn(async () => ({
+            json: async () => ({ data: { block: { height: '500', timestamp: Date.now() } } })
+        })));
+        try {
+            facadeState.current = { dust: { progress: { appliedIndex: '95', isConnected: true } } };
+            wsTip.maxId = '100';
+            facade.dust.state = {
+                subscribe(obs: any) {
+                    obs.next({ state: {}, capabilities: { coinsAndBalances: { getAvailableCoins: () => [{ token: { backingNight: 'backing-A' }, generatedNow: 10n ** 9n }] } } });
+                    return { unsubscribe() { /* noop */ } };
+                }
+            };
+            ledgerTx.deserialize.mockImplementation(() => callerTx());
+            makeWasmProvingService.mockImplementation(() => ({
+                prove: async () => ({ merge: () => ({ bind: () => ({ bound: true, identifiers: () => ['tx-id-fixture'] }) }) })
+            }));
+            // The client pool is worker-wide (slots from the previous test are
+            // reused, that is the point of the pool): make every existing AND
+            // any new client reject this one submit.
+            const reject170 = async () => { throw new Error('1010: Invalid Transaction: Custom error: 170'); };
+            for (const svc of submitServices) svc.submitTransaction.mockImplementationOnce(reject170);
+            makeDefaultSubmissionService.mockImplementation((_cfg: any) => {
+                const svc = { submitTransaction: vi.fn(reject170), close: vi.fn(async () => undefined) };
+                submitServices.push(svc);
+                return svc;
+            });
+            const restoresBefore = dustRestore.mock.calls.length;
+
+            const reply = await rpc('sponsorUnboundTx', { ...args, sponsorSessionId: 'session-sponsor-unbound-bbbbbb' });
+            expect(reply.ok).toBe(false);
+            expect(reply.error.message).toMatch(/Custom error: 170/);
+            expect(dustRestore.mock.calls.length).toBe(restoresBefore);
+            expect(facade.dust.serializeState).not.toHaveBeenCalled();
+            expect(stateSaves()).toEqual([]);
+        } finally {
+            vi.unstubAllGlobals();
+            makeWasmProvingService.mockImplementation((..._a: any[]) => ({ wasmProver: true }));
+            // Only one slot consumed its once-reject; drop the rest so later
+            // tests reuse clean pool slots.
+            for (const svc of submitServices) { svc.submitTransaction.mockReset(); svc.submitTransaction.mockImplementation(async () => undefined); }
+            await rpc('evict', { sessionId: 'session-sponsor-unbound-bbbbbb' });
+        }
+    });
+});
+
+describe('dedicated submit clients: settle window + closing-socket retry', () => {
+    it('isClosingSocketReject matches the SDK-wrapped "disconnected ... 1000:: Normal Closure" and nothing else', () => {
+        const live = new Error('Transaction submission error');
+        (live as any).cause = Object.assign(new Error('Transaction submission failed'), {
+            cause: new Error('disconnected from wss://rpc.preprod.midnight.network/: 1000:: Normal Closure')
+        });
+        expect(workerExports.isClosingSocketReject(live)).toBe(true);
+        expect(workerExports.isClosingSocketReject(new Error('1010: Invalid Transaction: Custom error: 170'))).toBe(false);
+        expect(workerExports.isClosingSocketReject(new Error('disconnected from wss://x/: 1006:: Abnormal Closure'))).toBe(false);
+    });
+
+    it("a send that dies on the client's own closing socket is retried once and lands", async () => {
+        const SESSION = 'session-sponsor-unbound-cccccc';
+        const facade = await initSession(SESSION);
+        vi.stubGlobal('fetch', vi.fn(async () => ({
+            json: async () => ({ data: { block: { height: '500', timestamp: Date.now() } } })
+        })));
+        try {
+            facadeState.current = { dust: { progress: { appliedIndex: '95', isConnected: true } } };
+            wsTip.maxId = '100';
+            facade.dust.state = {
+                subscribe(obs: any) {
+                    obs.next({ state: {}, capabilities: { coinsAndBalances: { getAvailableCoins: () => [{ token: { backingNight: 'backing-A' }, generatedNow: 10n ** 9n }] } } });
+                    return { unsubscribe() { /* noop */ } };
+                }
+            };
+            ledgerTx.deserialize.mockImplementation(() => ({
+                intents: new Map([[0, { actions: [{ address: 'aa'.repeat(32), entryPoint: 'attest' }], guaranteedUnshieldedOffer: null, dustActions: null }]]),
+                feesWithMargin: () => 1_000n
+            }));
+            makeWasmProvingService.mockImplementation(() => ({
+                prove: async () => ({ merge: () => ({ bind: () => ({ bound: true, identifiers: () => ['tx-after-retry'] }) }) })
+            }));
+            // Exactly ONE send (whichever slot gets it) dies on the closing socket.
+            let died = false;
+            const closingOnce = async () => {
+                if (died) return undefined;
+                died = true;
+                const e: any = new Error('Transaction submission error');
+                e.cause = Object.assign(new Error('Transaction submission failed'), { cause: new Error('disconnected from wss://rpc.preprod.midnight.network/: 1000:: Normal Closure') });
+                throw e;
+            };
+            for (const svc of submitServices) svc.submitTransaction.mockImplementation(closingOnce);
+            makeDefaultSubmissionService.mockImplementation((_cfg: any) => {
+                const svc = { submitTransaction: vi.fn(closingOnce), close: vi.fn(async () => undefined) };
+                submitServices.push(svc);
+                return svc;
+            });
+            const submitsBefore = submitServices.reduce((n, svc) => n + svc.submitTransaction.mock.calls.length, 0);
+
+            const reply = await rpc('sponsorUnboundTx', {
+                sponsorSessionId: SESSION, unboundTxB64: Buffer.from('caller-tx').toString('base64'), networkId: 'preprod',
+                allowedContracts: ['aa'.repeat(32)], allowedCircuits: ['attest']
+            });
+            expect(reply.ok).toBe(true);
+            expect(reply.result.txHash).toBe('tx-after-retry');
+            const submitsAfter = submitServices.reduce((n, svc) => n + svc.submitTransaction.mock.calls.length, 0);
+            expect(submitsAfter - submitsBefore).toBe(2); // one death, one retry
+            expect(died).toBe(true);
+        } finally {
+            vi.unstubAllGlobals();
+            makeWasmProvingService.mockImplementation((..._a: any[]) => ({ wasmProver: true }));
+            for (const svc of submitServices) { svc.submitTransaction.mockReset(); svc.submitTransaction.mockImplementation(async () => undefined); }
+            await rpc('evict', { sessionId: SESSION });
+        }
+    });
+});
+
+// ---- review findings on 0.18: lease ownership + client-pool cap -------------
+
+describe('dust backing lease ownership (review P1)', () => {
+    const notes = [{ token: { backingNight: 'backing-X' }, generatedNow: 10n ** 9n }];
+    beforeEach(() => workerExports.__noteLeaseForTests.reset());
+
+    it('a lease that outlived its TTL can be taken over; the late finisher does not release the new holder', async () => {
+        const { tryLockBacking, releaseNote, held } = workerExports.__noteLeaseForTests;
+        const a = tryLockBacking('sess', notes, 1n, 10); // job A, 10 ms TTL (slow prove/submit)
+        expect(a).toBeTruthy();
+        expect(tryLockBacking('sess', notes, 1n, 60_000)).toBeNull(); // still held
+        await new Promise((r) => setTimeout(r, 25));
+        const b = tryLockBacking('sess', notes, 1n, 60_000); // job B takes the expired lease over
+        expect(b).toBeTruthy();
+        expect(b.token).not.toBe(a.token);
+        releaseNote(a.key, a.token); // job A finishes late: must NOT free B's lock
+        expect(held(a.key)?.token).toBe(b.token);
+        expect(tryLockBacking('sess', notes, 1n, 60_000)).toBeNull(); // a third job still waits
+        releaseNote(b.key, b.token); // the real holder frees it
+        expect(held(b.key)).toBeUndefined();
+        expect(tryLockBacking('sess', notes, 1n, 60_000)).toBeTruthy();
+    });
+
+    it('a plain release by the holder frees the backing', () => {
+        const { tryLockBacking, releaseNote, held } = workerExports.__noteLeaseForTests;
+        const a = tryLockBacking('sess', notes, 1n, 60_000);
+        releaseNote(a.key, a.token);
+        expect(held(a.key)).toBeUndefined();
+    });
+});
+
+describe('dedicated submit client pool cap (review P2)', () => {
+    it('concurrent first callers never create more clients than the cap, even while the SDK import is pending', async () => {
+        const SESSION = 'session-sponsor-poolcap-aaaaaa';
+        const facade = await initSession(SESSION);
+        vi.stubGlobal('fetch', vi.fn(async () => ({
+            json: async () => ({ data: { block: { height: '500', timestamp: Date.now() } } })
+        })));
+        const relay = new URL(INIT_ARGS.relayUrl);
+        workerExports.__submitClientPoolForTests.reset();
+        workerExports.__submitClientPoolForTests.setMax(2);
+        try {
+            facadeState.current = { dust: { progress: { appliedIndex: '95', isConnected: true } } };
+            wsTip.maxId = '100';
+            const notes = ['A', 'B', 'C', 'D'].map((b) => ({ token: { backingNight: `backing-${b}` }, generatedNow: 10n ** 9n }));
+            facade.dust.state = {
+                subscribe(obs: any) {
+                    obs.next({ state: {}, capabilities: { coinsAndBalances: { getAvailableCoins: () => notes } } });
+                    return { unsubscribe() { /* noop */ } };
+                }
+            };
+            ledgerTx.deserialize.mockImplementation(() => ({
+                intents: new Map([[0, { actions: [{ address: 'aa'.repeat(32), entryPoint: 'attest' }], guaranteedUnshieldedOffer: null, dustActions: null }]]),
+                feesWithMargin: () => 1_000n
+            }));
+            makeWasmProvingService.mockImplementation(() => ({
+                prove: async () => ({ merge: () => ({ bind: () => ({ bound: true, identifiers: () => ['tx-cap'] }) }) })
+            }));
+            const created: any[] = [];
+            makeDefaultSubmissionService.mockImplementation((_cfg: any) => {
+                const svc = { submitTransaction: vi.fn(async () => { await new Promise((r) => setTimeout(r, 30)); }), close: vi.fn(async () => undefined) };
+                created.push(svc); submitServices.push(svc);
+                return svc;
+            });
+            const args = { sponsorSessionId: SESSION, unboundTxB64: Buffer.from('x').toString('base64'), networkId: 'preprod', allowedContracts: ['aa'.repeat(32)], allowedCircuits: ['attest'] };
+            const replies = await Promise.all([1, 2, 3, 4].map(() => rpc('sponsorUnboundTx', args)));
+            expect(replies.every((r) => r.ok)).toBe(true);
+            expect(created.length).toBe(2);
+            expect(workerExports.__submitClientPoolForTests.size(relay)).toBe(2);
+            // all four submits went through those two clients
+            expect(created.reduce((n, svc) => n + svc.submitTransaction.mock.calls.length, 0)).toBe(4);
+        } finally {
+            vi.unstubAllGlobals();
+            workerExports.__submitClientPoolForTests.setMax(8);
+            workerExports.__submitClientPoolForTests.reset();
+            makeWasmProvingService.mockImplementation((..._a: any[]) => ({ wasmProver: true }));
+            for (const svc of submitServices) { svc.submitTransaction.mockReset(); svc.submitTransaction.mockImplementation(async () => undefined); }
+            await rpc('evict', { sessionId: SESSION });
+        }
+    }, 60_000);
+});
+
+describe('sponsor submit watchdog (a watch that never sees Finalized)', () => {
+    it('abandons the hung watch, evicts the client, and reports landed when the indexer has the transaction', async () => {
+        const SESSION = 'session-sponsor-watchdog-aaaa';
+        const facade = await initSession(SESSION);
+        const relay = new URL(INIT_ARGS.relayUrl);
+        // fetch: tip queries (sync gate) AND the watchdog's indexer lookup by identifier
+        vi.stubGlobal('fetch', vi.fn(async (_url: string, init: any) => {
+            const body = String(init?.body ?? '');
+            if (body.includes('transactions(offset:{identifier:')) {
+                return { json: async () => ({ data: { transactions: [{ block: { height: '4242' } }] } }) };
+            }
+            return { json: async () => ({ data: { block: { height: '500', timestamp: Date.now() } } }) };
+        }));
+        workerExports.__submitClientPoolForTests.reset();
+        try {
+            facadeState.current = { dust: { progress: { appliedIndex: '95', isConnected: true } } };
+            wsTip.maxId = '100';
+            facade.dust.state = {
+                subscribe(obs: any) {
+                    obs.next({ state: {}, capabilities: { coinsAndBalances: { getAvailableCoins: () => [{ token: { backingNight: 'backing-W' }, generatedNow: 10n ** 9n }] } } });
+                    return { unsubscribe() { /* noop */ } };
+                }
+            };
+            ledgerTx.deserialize.mockImplementation(() => ({
+                intents: new Map([[0, { actions: [{ address: 'aa'.repeat(32), entryPoint: 'attest' }], guaranteedUnshieldedOffer: null, dustActions: null }]]),
+                feesWithMargin: () => 1_000n
+            }));
+            makeWasmProvingService.mockImplementation(() => ({
+                prove: async () => ({ merge: () => ({ bind: () => ({ bound: true, identifiers: () => ['tx-hung-watch'] }) }) })
+            }));
+            const closed: any[] = [];
+            makeDefaultSubmissionService.mockImplementation((_cfg: any) => {
+                const svc = {
+                    submitTransaction: vi.fn(() => new Promise(() => { /* never resolves: the watch is dead */ })),
+                    close: vi.fn(async () => { closed.push(svc); })
+                };
+                submitServices.push(svc);
+                return svc;
+            });
+            const t0 = Date.now();
+            const reply = await rpc('sponsorUnboundTx', {
+                sponsorSessionId: SESSION, unboundTxB64: Buffer.from('x').toString('base64'), networkId: 'preprod',
+                allowedContracts: ['aa'.repeat(32)], allowedCircuits: ['attest']
+            });
+            expect(reply.ok).toBe(true);
+            expect(reply.result.txHash).toBe('tx-hung-watch');
+            expect(Date.now() - t0).toBeGreaterThanOrEqual(2500);
+            expect(closed.length).toBe(1); // the dead client was closed...
+            expect(workerExports.__submitClientPoolForTests.size(relay)).toBe(0); // ...and evicted from the pool
+        } finally {
+            vi.unstubAllGlobals();
+            workerExports.__submitClientPoolForTests.reset();
+            makeWasmProvingService.mockImplementation((..._a: any[]) => ({ wasmProver: true }));
+            for (const svc of submitServices) { svc.submitTransaction.mockReset(); svc.submitTransaction.mockImplementation(async () => undefined); }
+            await rpc('evict', { sessionId: SESSION });
+        }
+    }, 60_000);
+});
+
+describe('sponsor dust spend proving', () => {
+    it("uses the facade's own proving service (the proof server in server mode) and not the in-process wasm prover", async () => {
+        const SESSION = 'session-sponsor-prover-aaaaaa';
+        const facade = await initSession(SESSION);
+        vi.stubGlobal('fetch', vi.fn(async () => ({ json: async () => ({ data: { block: { height: '500', timestamp: Date.now() } } }) })));
+        try {
+            facadeState.current = { dust: { progress: { appliedIndex: '95', isConnected: true } } };
+            wsTip.maxId = '100';
+            facade.dust.state = {
+                subscribe(obs: any) {
+                    obs.next({ state: {}, capabilities: { coinsAndBalances: { getAvailableCoins: () => [{ token: { backingNight: 'backing-P' }, generatedNow: 10n ** 9n }] } } });
+                    return { unsubscribe() { /* noop */ } };
+                }
+            };
+            ledgerTx.deserialize.mockImplementation(() => ({
+                intents: new Map([[0, { actions: [{ address: 'aa'.repeat(32), entryPoint: 'attest' }], guaranteedUnshieldedOffer: null, dustActions: null }]]),
+                feesWithMargin: () => 1_000n
+            }));
+            const facadeProve = vi.fn(async () => ({ merge: () => ({ bind: () => ({ bound: true, identifiers: () => ['tx-facade-prover'] }) }) }));
+            facade.provingService = { prove: facadeProve };
+            makeWasmProvingService.mockClear();
+            makeDefaultSubmissionService.mockImplementation((_cfg: any) => {
+                const svc = { submitTransaction: vi.fn(async () => undefined), close: vi.fn(async () => undefined) };
+                submitServices.push(svc);
+                return svc;
+            });
+            const reply = await rpc('sponsorUnboundTx', {
+                sponsorSessionId: SESSION, unboundTxB64: Buffer.from('x').toString('base64'), networkId: 'preprod',
+                allowedContracts: ['aa'.repeat(32)], allowedCircuits: ['attest']
+            });
+            expect(reply.ok).toBe(true);
+            expect(reply.result.txHash).toBe('tx-facade-prover');
+            expect(facadeProve).toHaveBeenCalledTimes(1);
+            expect(makeWasmProvingService).not.toHaveBeenCalled();
+        } finally {
+            vi.unstubAllGlobals();
+            workerExports.__submitClientPoolForTests.reset();
+            for (const svc of submitServices) { svc.submitTransaction.mockReset(); svc.submitTransaction.mockImplementation(async () => undefined); }
+            await rpc('evict', { sessionId: SESSION });
+        }
+    }, 30_000);
+});
+
+describe('sponsored call apply check', () => {
+    it('a transaction in a block whose call segment did NOT apply (PARTIAL_SUCCESS) fails the job instead of reporting landed', async () => {
+        const SESSION = 'session-sponsor-applycheck-aa';
+        const facade = await initSession(SESSION);
+        // indexer: the tx is in block 4242 but the call segment failed
+        vi.stubGlobal('fetch', vi.fn(async (_url: string, init: any) => {
+            const body = String(init?.body ?? '');
+            if (body.includes('transactions(offset:{identifier:')) {
+                return { json: async () => ({ data: { transactions: [{ block: { height: '4242' }, transactionResult: { status: 'PARTIAL_SUCCESS', segments: [{ id: 0, success: true }, { id: 42593, success: false }] } }] } }) };
+            }
+            return { json: async () => ({ data: { block: { height: '500', timestamp: Date.now() } } }) };
+        }));
+        const prevVisible = process.env.NIGHTGATE_SPONSOR_INDEXER_VISIBLE_MS;
+        try {
+            facadeState.current = { dust: { progress: { appliedIndex: '95', isConnected: true } } };
+            wsTip.maxId = '100';
+            facade.dust.state = {
+                subscribe(obs: any) {
+                    obs.next({ state: {}, capabilities: { coinsAndBalances: { getAvailableCoins: () => [{ token: { backingNight: 'backing-AC' }, generatedNow: 10n ** 9n }] } } });
+                    return { unsubscribe() { /* noop */ } };
+                }
+            };
+            ledgerTx.deserialize.mockImplementation(() => ({
+                intents: new Map([[0, { actions: [{ address: 'aa'.repeat(32), entryPoint: 'attest' }], guaranteedUnshieldedOffer: null, dustActions: null }]]),
+                feesWithMargin: () => 1_000n
+            }));
+            makeWasmProvingService.mockImplementation(() => ({
+                prove: async () => ({ merge: () => ({ bind: () => ({ bound: true, identifiers: () => ['tx-partial'] }) }) })
+            }));
+            // The watch never fires -> watchdog (3 s here) -> indexer says PARTIAL_SUCCESS.
+            makeDefaultSubmissionService.mockImplementation((_cfg: any) => {
+                const svc = { submitTransaction: vi.fn(() => new Promise(() => { /* hung */ })), close: vi.fn(async () => undefined) };
+                submitServices.push(svc);
+                return svc;
+            });
+            const reply = await rpc('sponsorUnboundTx', {
+                sponsorSessionId: SESSION, unboundTxB64: Buffer.from('x').toString('base64'), networkId: 'preprod',
+                allowedContracts: ['aa'.repeat(32)], allowedCircuits: ['attest']
+            });
+            expect(reply.ok).toBe(false);
+            expect(reply.error.message).toMatch(/did NOT apply/);
+            expect(reply.error.message).toMatch(/PARTIAL_SUCCESS/);
+            expect(reply.error.message).toMatch(/42593/);
+        } finally {
+            vi.unstubAllGlobals();
+            if (prevVisible === undefined) delete process.env.NIGHTGATE_SPONSOR_INDEXER_VISIBLE_MS; else process.env.NIGHTGATE_SPONSOR_INDEXER_VISIBLE_MS = prevVisible;
+            workerExports.__submitClientPoolForTests.reset();
+            for (const svc of submitServices) { svc.submitTransaction.mockReset(); svc.submitTransaction.mockImplementation(async () => undefined); }
+            await rpc('evict', { sessionId: SESSION });
+        }
+    }, 60_000);
+});
+
+describe('pre-broadcast submit intent (external-effect boundary)', () => {
+    it('when the main thread cannot persist the boundary (nack), the worker does NOT broadcast and the job fails before any external effect', async () => {
+        const SESSION = 'session-sponsor-intent-aaaaaa';
+        const facade = await initSession(SESSION);
+        vi.stubGlobal('fetch', vi.fn(async () => ({ json: async () => ({ data: { block: { height: '500', timestamp: Date.now() } } }) })));
+        try {
+            facadeState.current = { dust: { progress: { appliedIndex: '95', isConnected: true } } };
+            wsTip.maxId = '100';
+            facade.dust.state = {
+                subscribe(obs: any) {
+                    obs.next({ state: {}, capabilities: { coinsAndBalances: { getAvailableCoins: () => [{ token: { backingNight: 'backing-I' }, generatedNow: 10n ** 9n }] } } });
+                    return { unsubscribe() { /* noop */ } };
+                }
+            };
+            ledgerTx.deserialize.mockImplementation(() => ({
+                intents: new Map([[0, { actions: [{ address: 'aa'.repeat(32), entryPoint: 'attest' }], guaranteedUnshieldedOffer: null, dustActions: null }]]),
+                feesWithMargin: () => 1_000n
+            }));
+            makeWasmProvingService.mockImplementation(() => ({
+                prove: async () => ({ merge: () => ({ bind: () => ({ bound: true, identifiers: () => ['tx-intent-nack'] }) }) })
+            }));
+            const sends: any[] = [];
+            makeDefaultSubmissionService.mockImplementation((_cfg: any) => {
+                const svc = { submitTransaction: vi.fn(async () => { sends.push(1); }), close: vi.fn(async () => undefined) };
+                submitServices.push(svc);
+                return svc;
+            });
+            submitIntentHook = async () => { throw new Error('db down: cannot record txHash'); };
+            const reply = await rpc('sponsorUnboundTx', {
+                sponsorSessionId: SESSION, unboundTxB64: Buffer.from('x').toString('base64'), networkId: 'preprod',
+                allowedContracts: ['aa'.repeat(32)], allowedCircuits: ['attest']
+            });
+            expect(reply.ok).toBe(false);
+            expect(reply.error.message).toMatch(/submit-intent rejected.*cannot record txHash/);
+            expect(sends.length).toBe(0); // nothing left the process
+        } finally {
+            submitIntentHook = undefined;
+            vi.unstubAllGlobals();
+            workerExports.__submitClientPoolForTests.reset();
+            makeWasmProvingService.mockImplementation((..._a: any[]) => ({ wasmProver: true }));
+            for (const svc of submitServices) { svc.submitTransaction.mockReset(); svc.submitTransaction.mockImplementation(async () => undefined); }
+            await rpc('evict', { sessionId: SESSION });
+        }
+    }, 30_000);
+});
+
+describe('dust backing lease renewal + env (review P2)', () => {
+    const notes = [{ token: { backingNight: 'backing-R' }, generatedNow: 10n ** 9n }];
+    beforeEach(() => workerExports.__noteLeaseForTests.reset());
+
+    it('an ACTIVE lease is renewed and cannot be taken over by time; takeover only once the holder stops renewing', async () => {
+        const { tryLockBacking, keepLeaseAlive, releaseNote } = workerExports.__noteLeaseForTests;
+        const a = tryLockBacking('sess', notes, 1n, 30); // 30 ms TTL, renewed every 10 ms
+        const stop = keepLeaseAlive(a.key, a.token, 30);
+        await new Promise((r) => setTimeout(r, 120)); // 4x the TTL
+        expect(tryLockBacking('sess', notes, 1n, 30)).toBeNull(); // still held: renewal worked
+        stop();
+        await new Promise((r) => setTimeout(r, 60));
+        expect(tryLockBacking('sess', notes, 1n, 30)).toBeTruthy(); // holder stopped renewing (died): takeover
+        releaseNote(a.key, a.token);
+    });
+
+    it('NIGHTGATE_NOTE_LEASE_MS is fail-safe: non-positive or non-numeric falls back to the 5 min default', () => {
+        const { noteLeaseTtlMs } = workerExports.__noteLeaseForTests;
+        const prev = process.env.NIGHTGATE_NOTE_LEASE_MS;
+        try {
+            for (const bad of ['abc', '0', '-5', '1.5', 'Infinity', '']) {
+                process.env.NIGHTGATE_NOTE_LEASE_MS = bad;
+                expect(noteLeaseTtlMs(), `value ${bad}`).toBe(5 * 60 * 1000);
+            }
+            process.env.NIGHTGATE_NOTE_LEASE_MS = '120000';
+            expect(noteLeaseTtlMs()).toBe(120000);
+        } finally {
+            if (prev === undefined) delete process.env.NIGHTGATE_NOTE_LEASE_MS; else process.env.NIGHTGATE_NOTE_LEASE_MS = prev;
+        }
     });
 });

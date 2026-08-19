@@ -21,10 +21,22 @@ cd "$WORK" || exit 1
 
 if [ "$COMMITTED_ONLY" != "--committed" ]; then
   PATCH=$WORK.patch
-  ( cd "$SRC" && git diff HEAD ) > "$PATCH"
+  # Tracked changes AND untracked (not ignored) files: a new script that
+  # package.json references must travel with the release commit, and this
+  # gate is where that shows up (MODULE_NOT_FOUND otherwise).
+  ( cd "$SRC" && git diff HEAD --binary ) > "$PATCH"
   if [ -s "$PATCH" ]; then
     git apply "$PATCH" || { echo "==> FAILED to apply working-tree changes"; exit 1; }
     echo "==> applied uncommitted working-tree changes"
+  fi
+  UNTRACKED=$( cd "$SRC" && git ls-files --others --exclude-standard )
+  if [ -n "$UNTRACKED" ]; then
+    while IFS= read -r f; do
+      [ -z "$f" ] && continue
+      mkdir -p "$(dirname "$f")" && cp "$SRC/$f" "$f"
+    done <<< "$UNTRACKED"
+    echo "==> copied untracked files: $(echo "$UNTRACKED" | wc -l | tr -d ' ') (they must be git-added for the release commit)"
+    echo "$UNTRACKED" | sed 's/^/    /'
   fi
 fi
 

@@ -442,15 +442,71 @@ fails retryably (cold facade, sync gap, stale dust) is benched for
 `NIGHTGATE_SPONSOR_COOLDOWN_MS` while the job tries the next one. Omit
 `sponsorSessionId` (or pass the pool sentinel
 `00000000-0000-0000-0000-706f6f6c0000`, a reserved UUID because the field is
-Edm.Guid) to use the pool; an explicit session stays exact. Grants may pin the
-sentinel as `sponsorSessionId`, but then only `sponsorFinalizedTransaction` is
-grantable (other actions cannot use the pool); `getJobStatus` polls under the
+Edm.Guid) to use the pool; an explicit session stays exact. The pool members
+are warmed one after another at boot (0.18.0), so a restart does not hand the
+first jobs a cold sponsor. Grants may pin the
+sentinel as `sponsorSessionId`, but then only `sponsorFinalizedTransaction` /
+`sponsorUnboundTransaction` are grantable (other actions cannot use the pool);
+`getJobStatus` polls under the
 sentinel (concrete member ids are normalized to it). Idempotency keys are
 scoped per caller. Throughput scales
 with the NUMBER of pool wallets, not with one wallet's balance.
 
 The caller's TTL applies. `buildSponsorable` (and the SDK's `ttlMinutes`,
 default 30) sets it; a transaction handed over too late is rejected by the node.
+
+### `sponsorUnboundTransaction(unboundTxB64, sponsorSessionId, idempotencyKey?) → { jobId, status, sessionId }`
+
+Phase 2, PARALLEL channel (0.18). Takes the UNBOUND (pre-binding) proven and
+signed transaction the txbuilder SDK returns for `buildSponsorable({ bind:
+false })`, applies the same fail-closed shape check, allow-list, pool, grant and
+idempotency rules as `sponsorFinalizedTransaction`, then locks ONE free dust
+BACKING of the sponsor wallet, builds and proves a dust-only spend against it,
+merges it into the caller's transaction, binds and submits. Job result:
+`{ txHash, circuits, contractAddress, note }` (`note` = the backing paid from).
+
+What makes it parallel: the sponsor's proving and submit run outside the
+per-wallet lock (only the fast dust build is serialized), each in-flight submit
+uses its own node client, and one wallet sponsors as many transactions at once
+as it has DISTINCT registered dust backings (NIGHT UTxOs). Same-backing
+requests queue on the backing lock (`NIGHTGATE_BACKING_WAIT_MS`, default 5 min);
+a lost dust race (`1010/170`, `1010/196`) is rebuilt and resubmitted on the
+same sponsor (`NIGHTGATE_SPONSOR_DUST_RETRIES`, default 4, backoff
+`NIGHTGATE_SPONSOR_DUST_BACKOFF_MS`, default 5000). Job concurrency is the
+heavy cap (`cds.requires.nightgate.jobs.concurrency.heavy`, default 4). The
+sponsor proves its dust spend with its proving service (the proof server in
+server mode) and returns once the transaction is in a block
+(`NIGHTGATE_SPONSOR_WAIT=finalized` waits for finality instead); a watch that
+never fires is abandoned after `NIGHTGATE_SUBMIT_WATCH_TIMEOUT_MS` (default 60 s)
+and settled by an indexer lookup. Live on
+preprod: 4 sponsorings from one wallet, 4 backings, 3 of them in one block.
+
+Two things it does NOT change: concurrent writes to the SAME contract state
+still conflict at the ledger, and mixing bound and unbound sponsoring on ONE
+sponsor wallet is not recommended (the bound balancer does not see the backing
+locks; one side rejects and self-heals). The first is a property of Midnight's
+contract model, not of sponsoring: contract state is account-style (a shared
+value updated in place, see
+[ledgers](https://docs.midnight.network/concepts/ledgers)), and every call
+carries a transcript "read X, wrote Y" that the ledger applies only if X still
+holds (see [smart contract
+security](https://docs.midnight.network/compact/smart-contract-security)). Two
+callers that built against the same X race; the first to land changes X and the
+second is rejected at admission (`1010/104`, or pool status Invalid) and must
+REBUILD against the new state, resubmitting the same bytes never helps. The
+node validates against the best block, not against the pool, so a transaction
+built against a predicted post-tx1 state can only be submitted once tx1 is in a
+block. Parallelism is therefore across distinct contracts (one vault per
+tenant, for example); within one contract, serialize per caller or batch the
+calls into one transaction (`submitContractCallBatch`). Concretely for this
+action: when two sponsored calls on the same contract land in the same block,
+the loser's job fails with `errorCode` from the ledger result
+(`PARTIAL_SUCCESS`, the call segment did not apply; the sponsor paid the fee)
+and the transaction identifier; the sponsor does NOT retry it (re-attaching
+fresh dust to the same caller bytes is rejected at admission), the caller
+rebuilds the call against the current state and submits again. A transient
+dust race on the sponsor's side (`1010/170`, `1010/196`) IS retried by the
+sponsor, transparently.
 
 ### `probeCrossServerSponsor(contractAddress, circuit, compiledArtifactRef, sessionId, args, sponsorSessionId) → { jobId, status }`
 

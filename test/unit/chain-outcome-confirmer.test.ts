@@ -91,15 +91,37 @@ describe('createHttpTxConfirmer', () => {
         await expect(confirm('0xabc')).rejects.toThrow(/bad offset/);
     });
 
-    test('queries by tx hash (offset.hash) against the configured URL', async () => {
+    test('queries by transaction IDENTIFIER first (what NIGHTGATE stores as txHash), against the configured URL', async () => {
         const fetchFn = vi.fn(async (_url: string, _init: any) => jsonResponse(txResult('SUCCESS')));
         const confirm = createHttpTxConfirmer({ indexerHttpUrl: 'http://indexer/graphql', fetchFn: fetchFn as any });
-        await confirm('0xdeadbeef');
+        await confirm('00deadbeef');
         expect(fetchFn).toHaveBeenCalledTimes(1);
         const [url, init] = fetchFn.mock.calls[0];
         expect(url).toBe('http://indexer/graphql');
         expect(init.method).toBe('POST');
-        expect(JSON.parse(init.body)).toMatchObject({ variables: { offset: { hash: '0xdeadbeef' } } });
+        expect(JSON.parse(init.body)).toMatchObject({ variables: { offset: { identifier: '00deadbeef' } } });
         expect(init.signal).toBeDefined(); // AbortSignal deadline, so a stuck lookup cancels
+    });
+
+    test('falls back to offset.hash when the identifier lookup finds nothing (rows written by older paths)', async () => {
+        const fetchFn = vi.fn(async (_url: string, init: any) => {
+            const offset = JSON.parse(init.body).variables.offset;
+            return offset.identifier ? jsonResponse({ data: { transactions: [] } }) : jsonResponse(txResult('SUCCESS'));
+        });
+        const confirm = createHttpTxConfirmer({ indexerHttpUrl: 'http://indexer/graphql', fetchFn: fetchFn as any });
+        await expect(confirm('0xabc')).resolves.toEqual({ status: 'success' });
+        expect(fetchFn).toHaveBeenCalledTimes(2);
+        expect(JSON.parse(fetchFn.mock.calls[1][1].body)).toMatchObject({ variables: { offset: { hash: '0xabc' } } });
+    });
+
+    test('an "invalid transaction hash/identifier" GraphQL error is treated as not found for that key, not as a failure', async () => {
+        const fetchFn = vi.fn(async (_url: string, init: any) => {
+            const offset = JSON.parse(init.body).variables.offset;
+            return offset.identifier
+                ? jsonResponse(txResult('SUCCESS'))
+                : jsonResponse({ errors: [{ message: 'invalid transaction hash: cannot convert to ByteArray<32>' }] });
+        });
+        const confirm = createHttpTxConfirmer({ indexerHttpUrl: 'http://indexer/graphql', fetchFn: fetchFn as any });
+        await expect(confirm('00deadbeef')).resolves.toEqual({ status: 'success' });
     });
 });
