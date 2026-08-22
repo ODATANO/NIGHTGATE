@@ -247,6 +247,8 @@ interface ContractRegistration {
     artifactPath: string;
     privateStateId: string;
     zkConfigPath: string;
+    /** Content-tree width of a vault-family artifact (16 default, 32 for attestation-vault-32). */
+    slotWidth?: number;
 }
 
 // Cache of the heavy bits of contract compilation: imported module + ctor.
@@ -284,7 +286,11 @@ async function getContractScaffold(name: string, registration: ContractRegistrat
  * semantics exactly.
  */
 async function deployConstructorArgs(contractName: string, entry: FacadeEntry): Promise<unknown[]> {
-    if (contractName !== 'attestation-vault') return [];
+    // The whole vault family (attestation-vault, attestation-vault-32, future
+    // width variants) shares the registrar-as-public-arg constructor; a
+    // name-equality check here silently deployed variants with NO constructor
+    // args, which the contract rejects.
+    if (!contractName.startsWith('attestation-vault')) return [];
     const rt: any = await import('@midnight-ntwrk/compact-runtime');
     const attesterId: Uint8Array = rt.persistentHash(new rt.CompactTypeBytes(32), entry.attestationSecret);
     return [attesterId];
@@ -319,7 +325,12 @@ async function getOrCompileContract(
 
     const witnessFactory = getContractWitnessFactory(name);
     const witnessStep = witnessFactory
-        ? CompiledContract.withWitnesses(witnessFactory({ attestationSecret: entry.attestationSecret, merkleProof, merkleProofHolder }))
+        ? CompiledContract.withWitnesses(witnessFactory({
+            attestationSecret: entry.attestationSecret, merkleProof, merkleProofHolder,
+            // Width variants (attestation-vault-32) size the witness decode
+            // checks from the registration; absent means the classic 16.
+            ...(registration.slotWidth !== undefined ? { slotWidth: registration.slotWidth } : {})
+        }))
         : CompiledContract.withVacantWitnesses;
 
     return CompiledContract.make(name, contractClass).pipe(
@@ -2919,7 +2930,7 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
         sponsorSessionId: string;
         proxyId: string;
         contractName: string;
-        registration: { artifactPath: string; privateStateId: string; zkConfigPath: string };
+        registration: { artifactPath: string; privateStateId: string; zkConfigPath: string; slotWidth?: number };
         contractAddress: string;
         circuit: string;
         args?: unknown[]; // the call arguments (same field name as submitContractCall's RPC)
@@ -3044,7 +3055,7 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
      */
     async buildSponsorableTx(args: {
         sessionId: string; proxyId: string; contractName: string;
-        registration: { artifactPath: string; privateStateId: string; zkConfigPath: string };
+        registration: { artifactPath: string; privateStateId: string; zkConfigPath: string; slotWidth?: number };
         contractAddress: string; circuit: string; args?: unknown[];
         indexerHttpUrl: string; indexerWsUrl: string; proofServerUrl: string;
         networkId: string; merkleProof?: MerkleProofBundle; initialPrivateState?: unknown;

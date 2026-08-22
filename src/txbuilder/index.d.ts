@@ -6,6 +6,14 @@ export interface PreparedCall {
     circuitId: string;
     args: Array<Uint8Array | bigint | boolean[]>;
     witnesses: object;
+    /**
+     * Raw proof bundle passthrough (proof helpers only): the batch path
+     * rebinds it through a shared witness holder. Absent on the
+     * attester-gated helpers (attest, anchor, ...), which need no bundle.
+     */
+    merkleProof?: object;
+    /** Content-tree width the call was prepared for (16 default, 32 for attestation-vault-32). */
+    slotWidth?: number;
 }
 
 export interface ZkAssetResult {
@@ -63,7 +71,29 @@ export interface CreateTxBuilderInput {
 
 export interface BuildSponsorableInput {
     contractAddress: string;
-    call: PreparedCall;
+    /** ONE call (mutually exclusive with `calls`). */
+    call?: PreparedCall;
+    /**
+     * BATCH: up to 8 calls in ONE transaction (one balancing round, one fee
+     * event; apply order = array order, fail-closed segment ordering, and
+     * the causality pre-check aborts BEFORE proving with
+     * `code: 'BatchCausalityViolation'`). Per-call `witnesses` are IGNORED:
+     * one shared witnesses object (this builder's attestation secret, or
+     * `attestationSecret` below) serves all calls via a proof holder that
+     * swaps each entry's `merkleProof`. Prepare every batched call with the
+     * SAME secret. Same-named calls are indistinguishable to the segment
+     * ordering (relative order among them is NOT guaranteed), so duplicates
+     * are safe only when order-independent among themselves: GROUP them,
+     * e.g. both attests before both anchors. Put the most expensive call
+     * LAST (the causality pre-check aborts BEFORE proving otherwise, no
+     * fee). On a transient 1010/104 submit reject, REBUILD the batch and
+     * hand fresh bytes to the sponsor; resubmitting identical bytes tends
+     * to stay stuck. `bind: false` refuses a batch moving value, and every
+     * circuit must be on the sponsor's allow-list.
+     */
+    calls?: PreparedCall[];
+    /** Batch only: overrides the builder's own secret for the shared witnesses. */
+    attestationSecret?: Uint8Array;
     initialPrivateState?: unknown;
     /** true (default): FINALIZED handover (sponsorFinalizedTransaction).
      *  false: UNBOUND handover (sponsorUnboundTransaction, parallel 0.18). */

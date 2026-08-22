@@ -44,6 +44,20 @@ void ((c: PreparedCall) => c);
 void createNightgateConnectorProviders;
 void buildProofProvider;
 
+// Width variant (0.19): slotWidth must be typeable on the witness builder,
+// the proof-prepare helpers, the PreparedCall passthrough and the CONTRACTS
+// metadata; a consumer targeting attestation-vault-32 writes exactly this.
+import { prepareProveFieldEquality, prepareProveFieldsUnchangedExcept, CONTRACTS } from '@odatano/nightgate/browser';
+void buildAttestationVaultWitnesses({ merkleProof: proof, slotWidth: 32 });
+const eq = prepareProveFieldEquality({ payloadHash: 'p', fieldKey: 'f', expectedDigest: 'd', merkleProof: proof, slotWidth: 32 });
+const rebound: MerkleProof | undefined = eq.merkleProof;
+const w: number | undefined = eq.slotWidth;
+void [rebound, w];
+void prepareProveFieldsUnchangedExcept({ payloadHashA: 'a', payloadHashB: 'b', allowedMask: 0x80000001, docPair: {}, slotWidth: 32 });
+const meta = CONTRACTS['attestation-vault-32'];
+const dims: [number, number] = [meta.slotWidth, meta.merkleDepth];
+void dims;
+
 // txbuilder: the DEFAULT (bound) build keeps finalizedTxB64 as a plain string under strict
 // TypeScript (0.18 made the return a discriminated union; a 0.17 consumer that
 // reads finalizedTxB64 without narrowing must still compile), and bind:false

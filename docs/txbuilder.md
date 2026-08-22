@@ -103,7 +103,7 @@ feed straight into these.
 | `indexerHttpUrl`, `indexerWsUrl` | yes | any public Midnight indexer for the network. The WS URL is the HTTP one with a `/ws` suffix; the path is versioned, so copy it rather than deriving it by hand. |
 | `nodeUrl` | yes | the Substrate RPC the wallet SDK talks to (its `relayURL`) |
 | `zkConfigBaseUrl` | yes | a public `/zk-config/<contract>` (the sponsor's, or any host serving the same artifacts) |
-| `contractClass` | yes | the compiled `Contract` class |
+| `contractClass` | yes | the compiled `Contract` class (`@odatano/nightgate/browser/attestation-vault`, or `.../attestation-vault-32` for the 32-slot width variant; pass `contractName: 'attestation-vault-32'` and its `/zk-config/attestation-vault-32` base URL with it, and hand `slotWidth: 32` to the width-dependent `prepare*` helpers) |
 | `networkId` | no | `preprod` by default |
 | `accountIndex` | no | BIP32 account level, `0` by default |
 | `cacheDir` | no | `~/.cache/nightgate-txbuilder/<contractName>` |
@@ -115,11 +115,64 @@ feed straight into these.
 
 Returns `{ attestationSecret, attesterId, zkAssets, addresses, buildSponsorable, close }`.
 
-### `buildSponsorable({ contractAddress, call, initialPrivateState, bind? }) -> { finalizedTxB64 | unboundTxB64, serializedBytes, bound }`
+### `buildSponsorable({ contractAddress, call | calls, initialPrivateState, bind?, attestationSecret? }) -> { finalizedTxB64 | unboundTxB64, serializedBytes, bound }`
 
-Builds, proves, balances your own side, signs and finalizes ONE circuit call,
-then stops. Nothing is submitted. The transaction is fee-unpaid: it carries no
-dust, which is exactly what makes it sponsorable.
+Builds, proves, balances your own side, signs and finalizes ONE circuit call
+(`call`) or a BATCH of up to 8 calls (`calls`) in ONE transaction, then stops.
+Nothing is submitted. The transaction is fee-unpaid: it carries no dust, which
+is exactly what makes it sponsorable.
+
+**Batching** (`calls`): one transaction means one balancing round, one submit
+and one fee event for the whole list, and, decisively, ONE contract state
+transition: concurrent single attests against a vault conflict on its global
+attestation sequence counter (any two in a block, regardless of attester, and
+the losers' fees are spent), so a multi-document anchoring belongs in a batch,
+not in parallel singles. Apply order = array order (deterministic, fail-closed
+segment ordering); the ledger's causality rule is checked BEFORE proving and a
+violation throws with `code: 'BatchCausalityViolation'` (put the most
+expensive call last). Per-call `witnesses` are ignored for a batch: one shared
+witnesses object, built from this builder's attestation secret (override via
+`attestationSecret`), serves every call through a proof holder that swaps each
+entry's `merkleProof` (the `prepare*` helpers return the raw bundle for this),
+so prepare every batched call with the SAME secret. Same-named calls are
+indistinguishable to the segment ordering (their relative order is not
+guaranteed): duplicates are safe only when order-independent among
+themselves, so GROUP them (both attests before both anchors). `bind: false`
+refuses a batch that moves value; the sponsor's allow-list applies per
+circuit and its size cap (default 64 KiB) to the whole transaction (~5.4 KB
+per call).
+
+**Verify per claim, never per batch.** After the sponsor's txHash lands, the
+ledger's fallible phase can still finalize PARTIALLY: some calls applied,
+others not, the fee spent either way. A batch consumer must confirm every
+call's effect individually through the crawler-free reads
+(`verifyAttestationState` for attest/anchor effects with `contentRoot` +
+`schemaId`, `verifyPredicateState` for each proof claim with its exact
+coordinates) and treat only the individually confirmed claims as
+established. The txHash proves the transaction landed, not that every call
+in it applied.
+
+Two live-measured operational notes: (1) `1010/104` is the node's
+PRE-MEMPOOL reject for a guaranteed-phase STATE CONFLICT (measured: two
+concurrent read-modify-write calls on one cell reproduce it exactly): your
+transaction was proven against contract state that moved before the node
+executed its guaranteed stages. The fee is NOT spent. REBUILD against the
+current state and hand fresh bytes over; resubmitting the identical
+transaction re-runs the same stale reads and stays stuck. The fee-spending
+`CHAIN_EXECUTION_FAILED` is the fallible-phase flavor of the same
+conflict. (2) batching
+`attest` together with its `anchorContentRoot` works only on a YOUNG vault:
+`attest`'s gas crossed into the fallible class after roughly five
+attestations in measurement, from then on the causality pre-check aborts
+locally with `BatchCausalityViolation` (nothing submitted, no fee) and you
+split like the server lanes do, attest in its own transaction, batch the
+rest. The DURABLE batch shape is the proof cart: `anchorContentRoot` first,
+then the proof calls (equality/membership/predicate, each with its own
+`merkleProof`, swapped by the shared holder): anchor stays guaranteed and
+the proofs may go fallible without breaking the order, so this shape stays
+valid as the vault grows. Both the proof cart and the attest split are
+live-proven through BOTH sponsor channels (bound `sponsorFinalizedTransaction`
+and unbound `sponsorUnboundTransaction`).
 
 `bind` picks the handover format. `true` (default) returns `finalizedTxB64`, a
 bound transaction for `sponsorFinalizedTransaction`. `false` returns

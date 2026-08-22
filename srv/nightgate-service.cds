@@ -303,7 +303,9 @@ service NightgateService {
      * (AttestationVault `anchorContentRoot`); then `proveFieldPredicate` runs
      * with the Merkle witnesses. `value` is the scaled integer field value
      * (witness only, never persisted). `siblingsJson` / `dirsJson` are JSON
-     * arrays of the DEPTH=4 inclusion path (4 × 64-hex siblings; 4 booleans).
+     * arrays of the inclusion path at the artifact's depth: 4 entries for
+     * the 16-slot `attestation-vault` (default), 5 for the 32-slot
+     * `attestation-vault-32` width variant (registration `slotWidth`).
      *
      * Async: returns `{ jobId, status, predicateAttestationId }` immediately.
      */
@@ -313,8 +315,8 @@ service NightgateService {
                                             fieldSalt: String, // 64-hex per-slot salt (witness; prepareDocumentProof returns it per field)
                                             contentRoot: String, // optional 64-hex Merkle root to anchor first
                                             schemaId: String, // 64-hex schema id (required with contentRoot; from prepareDocumentProof)
-                                            siblingsJson: String, // JSON array of 4 × 64-hex sibling digests
-                                            dirsJson: String, // JSON array of 4 booleans (left-child flags)
+                                            siblingsJson: String, // JSON array of 64-hex sibling digests (artifact depth: 4 for the 16-slot vault, 5 for attestation-vault-32)
+                                            dirsJson: String, // JSON array of booleans, one per depth level (left-child flags)
                                             predicate: String, // 'lessOrEqual' | 'greaterOrEqual'
                                             threshold: Integer64, // scaled integer
                                             unit: String, // optional, informational
@@ -352,7 +354,8 @@ service NightgateService {
      *   - cross-root diff: `{ predicate: 'documentDiff', payloadHashB, k,
      *     leavesA, leavesB }` (see issueDocumentDiffAttestation)
      * each entry validated exactly like its single action (64-hex keys,
-     * DEPTH=4 inclusion path; witness material never persisted). The
+     * depth-log2(width) inclusion path; witness material never
+     * persisted). The
      * cross-root kinds carry no fieldKey/path; an in-batch contentRoot
      * anchor is document A's root, document B's must already be anchored.
      * Exact duplicate claim tuples (numeric: fieldKey+threshold+predicate,
@@ -408,7 +411,7 @@ service NightgateService {
      * the exact string, no trimming) or `expectedDigest` (64 hex). The field
      * must have entered the content root as a bytes leaf
      * (`prepareDocumentProof` with `kind: 'bytes'`); `siblingsJson` /
-     * `dirsJson` are the DEPTH=4 inclusion path exactly as for
+     * `dirsJson` are the depth-log2(width) inclusion path exactly as for
      * `issueFieldPredicateAttestation`. If `contentRoot` is supplied it is
      * anchored first.
      *
@@ -421,8 +424,8 @@ service NightgateService {
                                            fieldSalt: String, // 64-hex per-slot salt (witness; prepareDocumentProof returns it per field)
                                            contentRoot: String, // optional 64-hex Merkle root to anchor first
                                             schemaId: String, // 64-hex schema id (required with contentRoot; from prepareDocumentProof)
-                                           siblingsJson: String, // JSON array of 4 × 64-hex sibling digests
-                                           dirsJson: String, // JSON array of 4 booleans (left-child flags)
+                                           siblingsJson: String, // JSON array of 64-hex sibling digests (artifact depth: 4 for the 16-slot vault, 5 for attestation-vault-32)
+                                           dirsJson: String, // JSON array of booleans, one per depth level (left-child flags)
                                            sessionId: UUID,
                                            contractAddress: String, // AttestationVault deployment
                                            compiledArtifactRef: String, // optional, defaults to 'attestation-vault'
@@ -438,8 +441,8 @@ service NightgateService {
      * Field-bound SET-MEMBERSHIP proof for a bytes-valued (string) passport
      * field: prove the field's HIDDEN value is one of a public allow-list,
      * without revealing which one (AttestationVault `proveFieldMembership`).
-     * Two Merkle folds over the same witnessed digest: the DEPTH=4 content
-     * fold binds it to `fieldKey` of THIS passport, the DEPTH=6 set fold
+     * Two Merkle folds over the same witnessed digest: the depth-log2(width)
+     * content fold binds it to `fieldKey` of THIS passport, the DEPTH=6 set fold
      * proves it is a leaf of the canonical membership-set tree (up to 64
      * distinct values; rule: digest each value, dedupe, sort ascending, pad
      * by repeating the last member digest; see `prepareMembershipSet`).
@@ -464,8 +467,8 @@ service NightgateService {
                                              fieldSalt: String, // 64-hex per-slot salt (witness; prepareDocumentProof returns it per field)
                                              contentRoot: String, // optional 64-hex Merkle root to anchor first
                                             schemaId: String, // 64-hex schema id (required with contentRoot; from prepareDocumentProof)
-                                             siblingsJson: String, // JSON array of 4 × 64-hex sibling digests
-                                             dirsJson: String, // JSON array of 4 booleans (left-child flags)
+                                             siblingsJson: String, // JSON array of 64-hex sibling digests (artifact depth: 4 for the 16-slot vault, 5 for attestation-vault-32)
+                                             dirsJson: String, // JSON array of booleans, one per depth level (left-child flags)
                                              sessionId: UUID,
                                              contractAddress: String, // AttestationVault deployment
                                              compiledArtifactRef: String, // optional, defaults to 'attestation-vault'
@@ -485,12 +488,14 @@ service NightgateService {
      * "the re-anchored passport changed nothing outside the allowed field
      * set".
      *
-     * `allowedMask` is the packed 16-bit slot mask (bit i = slot i MAY
-     * differ; 0 = identical values). v4 witness model: `schemaJson` is the
-     * SHARED 16-entry descriptor list (fieldKey/kind/scale per slot;
-     * `prepareDocumentProof` returns it as `schema`), `openingAJson` /
-     * `openingBJson` are the documents' full openings ({ saltSeed,
-     * slots[16] }; returned as `opening`). The circuit recomputes BOTH the
+     * `allowedMask` is the packed slot mask, one bit per slot of the
+     * artifact's width (16-bit on the default vault, 32-bit on
+     * `attestation-vault-32`; bit i = slot i MAY differ; 0 = identical
+     * values). v4 witness model: `schemaJson` is the SHARED width-entry
+     * descriptor list (fieldKey/kind/scale per slot; `prepareDocumentProof`
+     * returns it as `schema`), `openingAJson` / `openingBJson` are the
+     * documents' full openings ({ saltSeed, slots[width] }; returned as
+     * `opening`). The circuit recomputes BOTH the
      * schema root and both content roots from these, so the anchored schema
      * id is PROVEN to describe the trees and the comparison runs on values.
      * Both documents must be prepared with the SAME proofFields list in the
@@ -505,10 +510,10 @@ service NightgateService {
      */
     action   issueDocumentIntegrityAttestation(payloadHashA: String, // document A payload_hash (64 hex)
                                                payloadHashB: String, // document B payload_hash (64 hex)
-                                               allowedMask: Integer, // packed 16-bit mask (bit i = slot i may differ)
-                                               schemaJson: LargeString, // JSON array of 16 slot descriptors (shared schema; from prepareDocumentProof)
-                                               openingAJson: LargeString, // document A opening { saltSeed, slots[16] } (witness; from prepareDocumentProof)
-                                               openingBJson: LargeString, // document B opening { saltSeed, slots[16] } (witness)
+                                               allowedMask: Integer64, // packed slot mask, width bits (16-bit default, 32-bit on attestation-vault-32; bit i = slot i may differ); Int64 so bit 31 survives Edm.Int32/DB Int32
+                                               schemaJson: LargeString, // JSON array of slot descriptors, one per slot of the artifact width (shared schema; from prepareDocumentProof)
+                                               openingAJson: LargeString, // document A opening { saltSeed, slots[width] } (witness; from prepareDocumentProof)
+                                               openingBJson: LargeString, // document B opening { saltSeed, slots[width] } (witness)
                                                contentRootA: String, // optional 64-hex root to anchor for A first
                                                contentRootB: String, // optional 64-hex root to anchor for B first
                                                schemaId: String, // 64-hex schema id (required when anchoring; both docs share it)
@@ -524,8 +529,9 @@ service NightgateService {
     };
 
     /**
-     * Cross-root DISTINCTNESS proof: prove at least `k` of the 16 aligned
-     * slots differ between two anchored documents, without revealing which
+     * Cross-root DISTINCTNESS proof: prove at least `k` of the width
+     * aligned slots (16 default, 32 on attestation-vault-32) differ
+     * between two anchored documents, without revealing which
      * slots or what values (AttestationVault `proveDocumentComparison` mode 1). k = 1 is
      * "provably not the same document"; higher k is the USDA-style
      * "distinct at enough loci" claim.
@@ -545,10 +551,10 @@ service NightgateService {
      */
     action   issueDocumentDiffAttestation(payloadHashA: String, // document A payload_hash (64 hex)
                                           payloadHashB: String, // document B payload_hash (64 hex)
-                                          k: Integer, // minimum differing slots, 1..16
-                                          schemaJson: LargeString, // JSON array of 16 slot descriptors (shared schema; from prepareDocumentProof)
-                                          openingAJson: LargeString, // document A opening { saltSeed, slots[16] } (witness; from prepareDocumentProof)
-                                          openingBJson: LargeString, // document B opening { saltSeed, slots[16] } (witness)
+                                          k: Integer, // minimum differing slots, 1..width (16 default, 32 on attestation-vault-32)
+                                          schemaJson: LargeString, // JSON array of slot descriptors, one per slot of the artifact width (shared schema; from prepareDocumentProof)
+                                          openingAJson: LargeString, // document A opening { saltSeed, slots[width] } (witness; from prepareDocumentProof)
+                                          openingBJson: LargeString, // document B opening { saltSeed, slots[width] } (witness)
                                           contentRootA: String, // optional 64-hex root to anchor for A first
                                           contentRootB: String, // optional 64-hex root to anchor for B first
                                           schemaId: String, // 64-hex schema id (required when anchoring; both docs share it)
@@ -599,7 +605,7 @@ service NightgateService {
         expectedDigest  : String; // bytesEquality rows: the public expected digest
         setRoot         : String; // setMembership rows: the canonical set root
         payloadHashB    : String; // cross-root rows: the second document
-        allowedMask     : Integer; // documentIntegrity rows: packed 16-bit mask
+        allowedMask     : Integer64; // documentIntegrity rows: packed slot mask (width bits; 16 default, 32 on attestation-vault-32)
         provenTxHash    : String;
         provenAt        : Timestamp;
     };
@@ -682,8 +688,8 @@ service NightgateService {
                                   expectedDigest: String, // 64 hex, required for 'bytesEquality'
                                   setRoot: String, // 64 hex canonical set root, required for 'setMembership'
                                   payloadHashB: String, // 64 hex document B, required for the cross-root kinds
-                                  allowedMask: Integer, // packed 16-bit mask, required for 'documentIntegrity'
-                                  k: Integer, // minimum differing slots 1..16, required for 'documentDiff'
+                                  allowedMask: Integer64, // packed width-bit mask, required for 'documentIntegrity'
+                                  k: Integer, // minimum differing slots 1..width, required for 'documentDiff'
                                   compiledArtifactRef: String, // optional, defaults to 'attestation-vault'
                                   network: String // optional network override, e.g. 'preview' | 'preprod' | 'mainnet'
     )                                                                 returns {
@@ -1298,14 +1304,16 @@ service NightgateService {
     /**
      * Turn a structured document into everything the field-predicate proof
      * surface needs: canonical JSON -> `payloadHash` (blake2b-256, the value
-     * `anchorDocument` anchors), plus a depth-4 Merkle `contentRoot` over the
+     * `anchorDocument` anchors), plus a depth-log2(width) Merkle `contentRoot` over the
      * ORDERED `proofFieldsJson` list (leaf index = list position; keep the
      * order stable across anchor and proof) with per-field inclusion paths
      * ready for `issueFieldPredicateAttestation[Batch]`.
      *
      * `documentJson` is a JSON object (the full document; all of it goes into
-     * `payloadHash`). `proofFieldsJson` is an ordered JSON array of up to 16
-     * `{ field, kind?, scale? }` entries. `kind` is 'uint' (default; numeric
+     * `payloadHash`). `proofFieldsJson` is an ordered JSON array of up to
+     * WIDTH `{ field, kind?, scale? }` entries, where width comes from the
+     * `compiledArtifactRef`'s registration `slotWidth` (16 on the default
+     * vault, 32 on `attestation-vault-32`). `kind` is 'uint' (default; numeric
      * value scaled by `scale`, default 1000 milli-units) or 'bytes' (string
      * value, entered as the blake2b-256 digest of the EXACT string; feeds
      * `issueFieldEqualityAttestation` / `issueFieldMembershipAttestation`;
@@ -1341,9 +1349,9 @@ service NightgateService {
         fields            : LargeString; // JSON array of { field, fieldKey, kind, value?, valueDigest?, salt, siblings, dirs }
         emptyFields       : LargeString; // JSON array of fields without a value (salted absent leaf)
         schemaId          : String; // 64-hex schema root of the ORDERED proofFields list (anchored next to the root)
-        schema            : LargeString; // JSON array of 16 slot descriptors { fieldKey, kind, scale } (public)
+        schema            : LargeString; // JSON array of width slot descriptors { fieldKey, kind, scale } (public)
         leaves            : LargeString; // JSON array of 16 × 64-hex salted leaf hashes (informational)
-        opening           : LargeString; // JSON { saltSeed, slots[16] }: the cross-root witness bundle (STORE IT)
+        opening           : LargeString; // JSON { saltSeed, slots[width] }: the cross-root witness bundle (STORE IT)
     };
 
     /**

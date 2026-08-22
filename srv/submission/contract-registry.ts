@@ -42,12 +42,32 @@ export interface ContractRegistration {
     privateStateId: string;
     /** Directory containing `keys/` and `zkir/` for NodeZkConfigProvider. */
     zkConfigPath: string;
+    /**
+     * Content-tree width of an attestation-vault-family artifact: how many
+     * provable fields per document (16 for the classic vault, 32 for
+     * `attestation-vault-32`). Drives every width-dependent validation and
+     * claim-key computation; MUST match the compiled artifact's `Vector<N,...>`
+     * witness shapes (a mismatch fails loudly at local proving, nothing is
+     * submitted). Optional; absent means 16. Part of the generation digest
+     * for NON-default widths (an alias re-pointed to a different width
+     * changes path depth and integrity claim-key semantics and must trip
+     * the guard); the default width adds no section, so every digest
+     * recorded by earlier releases (all width 16) stays valid.
+     */
+    slotWidth?: number;
+}
+
+/** A registration's content-tree width, defaulting to the classic 16. */
+export function slotWidthOf(reg: Pick<ContractRegistration, 'slotWidth'> | undefined): number {
+    return reg?.slotWidth ?? 16;
 }
 
 export interface ResolvedContract {
     compiledContract: unknown;
     privateStateId: string;
     zkConfigPath: string;
+    /** Content-tree width of a vault-family artifact (16 default, 32 for attestation-vault-32). */
+    slotWidth?: number;
     /**
      * Absolute path the worker uses to re-import the Compact-emitted contract
      * module inside the worker thread (compiledContract itself doesn't survive a
@@ -62,6 +82,14 @@ const generationDigests = new Map<string, string>();
 export function registerContract(name: string, reg: ContractRegistration): void {
     if (!name || !reg.artifactPath || !reg.privateStateId || !reg.zkConfigPath) {
         throw new Error('registerContract: all fields are required');
+    }
+    // 64 is deliberately NOT accepted: the mask path runs on JavaScript
+    // 32-bit bitwise ops ((1 << 64) wraps) and a full unsigned 64-bit mask
+    // does not survive Number or a signed Integer64 column. Measured, but
+    // shipping it needs a BigInt/String mask path first.
+    if (reg.slotWidth !== undefined
+        && (![8, 16, 32].includes(reg.slotWidth))) {
+        throw new Error(`registerContract: slotWidth must be 8, 16 or 32 (got ${String(reg.slotWidth)})`);
     }
     // Store a FROZEN CLONE: the caller's object must not remain a live
     // handle into the registry (mutating it after registration would change
@@ -114,6 +142,12 @@ function computeGenerationDigest(reg: ContractRegistration): string {
     };
     section('module', fs.readFileSync(reg.artifactPath));
     section('privateStateId', reg.privateStateId);
+    // The width is proof semantics (witness shapes, inclusion-path depth,
+    // integrity claim keys): the SAME artifact files registered under a
+    // different width must be a different generation. Only non-default
+    // widths add a section, keeping earlier releases' recorded digests
+    // (implicitly width 16) byte-identical; explicit 16 === absent.
+    if (slotWidthOf(reg) !== 16) section('slotWidth', String(slotWidthOf(reg)));
     const assetDir = (sub: string, filter: (f: string) => boolean) => {
         const dir = path.join(reg.zkConfigPath, sub);
         let files: string[] = [];
@@ -188,7 +222,8 @@ export function loadRegistryFromConfig(config?: Record<string, any>, baseDir = p
         registerContract(name, {
             artifactPath:   resolveContractPath(r.artifactPath, baseDir),
             privateStateId: r.privateStateId,
-            zkConfigPath:   resolveContractPath(r.zkConfigPath, baseDir)
+            zkConfigPath:   resolveContractPath(r.zkConfigPath, baseDir),
+            ...(r.slotWidth !== undefined ? { slotWidth: Number(r.slotWidth) } : {})
         });
     }
 }
@@ -245,7 +280,8 @@ export async function resolveContract(name: string, expectedDigest?: string): Pr
         compiledContract,
         privateStateId: reg.privateStateId,
         zkConfigPath: reg.zkConfigPath,
-        artifactPath: reg.artifactPath
+        artifactPath: reg.artifactPath,
+        ...(reg.slotWidth !== undefined ? { slotWidth: reg.slotWidth } : {})
     };
 }
 

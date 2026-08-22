@@ -93,6 +93,13 @@ Against a sponsor running NIGHTGATE 0.18 or later, prefer the parallel channel:
 lets one sponsor wallet pay for many callers at once (one per registered dust
 backing). Same proof, same identity, same TTL.
 
+Since 0.3.0, `buildSponsorable({ contractAddress: VAULT, calls: [...] })`
+batches up to 8 circuit calls into ONE transaction (one fee, one sponsoring),
+with the same deterministic segment ordering and pre-proving causality
+fail-fast as the server lane (`BatchCausalityViolation` aborts locally, no fee
+spent). The durable batch shape on a grown contract is the proof cart (anchor
+first, then proofs); see `docs/txbuilder.md` in the main repo.
+
 ## Entry points
 
 | Import | What you get |
@@ -102,6 +109,7 @@ backing). Same proof, same identity, same TTL.
 | `@odatano/nightgate-tx/txbuilder` | the local builder alone |
 | `@odatano/nightgate-tx/calls` | 13 `prepare*` call builders, witnesses, attestation-secret helpers |
 | `@odatano/nightgate-tx/attestation-vault` | the compiled contract class and its pure circuits |
+| `@odatano/nightgate-tx/attestation-vault-32` | the 32-slot width variant's contract class (panels of 17-32 fields; pass `slotWidth: 32` to the `prepare*` helpers and point `zkConfigBaseUrl` at `/zk-config/attestation-vault-32`) |
 | `@odatano/nightgate-tx/set-root` | the canonical membership-set rule |
 
 ## Auth

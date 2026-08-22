@@ -91,3 +91,7 @@ scripts/zz-backings.mjs
 scratch/
 # DB backups taken by hand (e.g. before a wallet-state swap)
 db/*.bak
+db/*.bak-shm
+db/*.bak-wal
+db/walletstate-*.json
+.env.fresh-sponsor

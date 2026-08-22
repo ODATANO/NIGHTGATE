@@ -1,6 +1,6 @@
 {
   "name": "@odatano/nightgate",
-  "version": "0.18.0",
+  "version": "0.19.0",
   "description": "CAP Plugin: Midnight Blockchain Indexer with OData V4 API",
   "homepage": "https://github.com/ODATANO/NIGHTGATE#readme",
   "repository": {
@@ -70,6 +70,11 @@
       "import": "./contracts/attestation-vault/src/managed/attestation-vault/contract/index.js",
       "default": "./contracts/attestation-vault/src/managed/attestation-vault/contract/index.js"
     },
+    "./browser/attestation-vault-32": {
+      "types": "./contracts/attestation-vault-32/src/managed/attestation-vault-32/contract/index.d.ts",
+      "import": "./contracts/attestation-vault-32/src/managed/attestation-vault-32/contract/index.js",
+      "default": "./contracts/attestation-vault-32/src/managed/attestation-vault-32/contract/index.js"
+    },
     "./txbuilder": {
       "types": "./src/txbuilder/index.d.ts",
       "import": "./src/txbuilder/index.mjs",
@@ -99,6 +104,7 @@
     "contracts/**/src/*.compact",
     "contracts/**/package.json",
     "scripts/apply-schema-delta.mjs",
+    "scripts/check-server.mjs",
     "README.md",
     "LICENSE"
   ],
@@ -136,7 +142,10 @@
     "check:exports": "node scripts/check-package-exports.mjs",
     "check:browser-types": "node scripts/check-browser-types.mjs",
     "check:job-idempotency": "node scripts/check-job-idempotency.mjs",
+    "check:server": "node --env-file=.env scripts/check-server.mjs",
+    "check:server:hosted": "node --env-file=.env scripts/check-server.mjs https://api.nightgate.dev",
     "integration:attestation-vault": "node scripts/integration-test-attestation-vault.mjs",
+    "integration:attestation-vault-32": "node scripts/integration-test-attestation-vault-32.mjs",
     "integration:schema-delta": "node scripts/integration-test-schema-delta.mjs",
     "deploy:e2e": "node --env-file=.env scripts/run-deploy-e2e.mjs",
     "field-predicate-batch:e2e": "node --env-file=.env scripts/run-field-predicate-batch-e2e.mjs",
@@ -153,7 +162,7 @@
     "wasm-zswap:e2e": "node --env-file=.env scripts/run-wasm-zswap-e2e.mjs",
     "test:pg-idempotency": "node scripts/test-postgres-idempotency.mjs",
     "lint": "eslint .",
-    "check:release": "npm run build && npm run lint && npm run typecheck && npm test && npm run integration:attestation-vault && npm run integration:schema-delta && npm run check:browser && npm run check:browser-types && npm run check:exports",
+    "check:release": "npm run build && npm run lint && npm run typecheck && npm test && npm run integration:attestation-vault && npm run integration:attestation-vault-32 && npm run integration:schema-delta && npm run check:browser && npm run check:browser-types && npm run check:slim && npm run check:exports",
     "prepack": "npm run build:plugin",
     "prepublishOnly": "npm run check:release && npm run build:plugin",
     "integration:derive-wallet-info": "node --env-file=.env scripts/integration-test-derive-wallet-info.mjs",
@@ -163,7 +172,8 @@
     "burst-sponsor:e2e": "node --env-file=.env scripts/run-burst-sponsor-e2e.mjs",
     "build:slim": "node scripts/build-slim-package.mjs",
     "check:slim": "npm run build:slim && node scripts/check-slim-package.mjs",
-    "mint-token:e2e": "node --env-file=.env scripts/run-mint-token-e2e.mjs"
+    "mint-token:e2e": "node --env-file=.env scripts/run-mint-token-e2e.mjs",
+    "width32:e2e": "node --env-file=.env scripts/run-width32-e2e.mjs"
   },
   "dependencies": {
     "@midnight-ntwrk/compact-js": "2.5.0",
@@ -212,7 +222,7 @@
     "@types/node": "^22",
     "@types/ws": "^8",
     "@vitest/coverage-v8": "^4.1.10",
-    "eslint": "^10",
+    "eslint": "^10.9.0",
     "express": "^4.22.2",
     "globals": "^14.0.0",
     "tsx": "^4",
@@ -242,6 +252,12 @@
             "artifactPath": "contracts/attestation-vault/src/managed/attestation-vault/contract/index.js",
             "privateStateId": "attestationVaultPrivateState",
             "zkConfigPath": "contracts/attestation-vault/src/managed/attestation-vault"
+          },
+          "attestation-vault-32": {
+            "artifactPath": "contracts/attestation-vault-32/src/managed/attestation-vault-32/contract/index.js",
+            "privateStateId": "attestationVaultPrivateState",
+            "zkConfigPath": "contracts/attestation-vault-32/src/managed/attestation-vault-32",
+            "slotWidth": 32
           },
           "shielded-token": {
             "artifactPath": "contracts/shielded-token/src/managed/shielded-token/contract/index.js",

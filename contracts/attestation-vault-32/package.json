@@ -1,0 +1,7 @@
+{
+  "name": "@odatano/nightgate-contract-attestation-vault-32",
+  "private": true,
+  "type": "module",
+  "description": "AttestationVault32: the 32-slot (depth-5) width variant of the attestation vault. Pre-registered as 'attestation-vault-32' (slotWidth 32) and shipped in the npm package since 0.19.0.",
+  "main": "src/managed/attestation-vault-32/contract/index.js"
+}

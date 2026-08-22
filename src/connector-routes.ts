@@ -68,7 +68,7 @@ export function mountZkConfigRoute(app: any): void {
 }
 
 // Contracts that ship a browser artifact export (`@odatano/nightgate/browser/<name>`).
-const BROWSER_EXPORTED = new Set(['attestation-vault']);
+const BROWSER_EXPORTED = new Set(['attestation-vault', 'attestation-vault-32']);
 
 // Circuit names = the `<circuit>.verifier` files in the contract's keys/ dir.
 function listContractCircuits(zkConfigPath: string): string[] {

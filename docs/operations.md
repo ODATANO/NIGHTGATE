@@ -15,6 +15,8 @@ Running NIGHTGATE day-to-day. Audience: anyone deploying it, debugging a stuck s
 | `npm run wasm-proving:e2e` | Verify in-process proving (server on `NIGHTGATE_PROVING_MODE=wasm`) | NIGHT self-transfer proved without a proof server; strongest with a dead `NIGHTGATE_PROOF_SERVER_URL` |
 | `npm run wasm-contract:e2e` | Verify contract flow under wasm mode | `deployContract(counter)` + `increment()`; in wasm mode both prove in-process |
 | `npm run wasm-zswap:e2e` | Measure zswap circuits in-process | Deploys `shielded-token`, mints, shielded self-transfer via `sendNight` `tokenTypeHex` |
+| `npm run width32:e2e` | Verify the 32-slot vault lineage | Deploys `attestation-vault-32`, 24-field document, attest+anchor batch, k-of-32 diff, crawler-free verify |
+| `npm run check:server` | Health-check a running server | Health/readiness plus sponsor dust/balance/sync when `NIGHTGATE_SPONSOR_SESSION_ID` is set; `check:server:hosted` targets the hosted box |
 | `npm run build` | Before publish or after schema change | Generates `@cds-models/` types + compiles TS in-place |
 | `npm run typecheck` | Pre-commit | `tsc --noEmit` |
 | `npm test` | Pre-commit | Full Vitest suite with coverage |

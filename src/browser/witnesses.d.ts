@@ -33,8 +33,9 @@ export interface DocPair {
 }
 
 /**
- * Per-call proof bundle for the field-bound proof circuits (DEPTH=4 content
- * path; DEPTH=6 set path for membership). `fieldValue` feeds
+ * Per-call proof bundle for the field-bound proof circuits (content path of
+ * log2(slotWidth) steps: 4 on the 16-slot default, 5 on attestation-vault-32;
+ * DEPTH=6 set path for membership). `fieldValue` feeds
  * proveFieldPredicate, `fieldDigest` + `setProof` feed proveFieldMembership;
  * proveFieldEquality needs only siblings/dirs; the cross-root circuits need
  * only `docPair` (and `siblings`/`dirs` may then be omitted).
@@ -46,9 +47,9 @@ export interface MerkleProof {
     fieldSalt?: string;
     /** 64-char hex digest of the field's value bytes (proveFieldMembership). */
     fieldDigest?: string;
-    /** 4 × 64-char hex sibling digests along the content-root path. Optional when `docPair` is present. */
+    /** log2(slotWidth) × 64-char hex sibling digests along the content-root path (4 on the 16er, 5 on the 32er). Optional when `docPair` is present. */
     siblings?: string[];
-    /** 4 booleans, true = current node is the LEFT child at that level. Optional when `docPair` is present. */
+    /** log2(slotWidth) booleans, true = current node is the LEFT child at that level. Optional when `docPair` is present. */
     dirs?: boolean[];
     /** Membership-set path (proveFieldMembership): 6 siblings + 6 booleans. */
     setProof?: { siblings: string[]; dirs: boolean[] };
@@ -80,6 +81,12 @@ export interface BuildWitnessesInput {
     merkleProof?: MerkleProof;
     /** Batch field-bound proofs. Mutually exclusive with `merkleProof` (the builder throws). */
     merkleProofHolder?: MerkleProofHolder;
+    /**
+     * Content-tree slot count of the target artifact: 16 (default) or 32 for
+     * attestation-vault-32. Sizes every decoded witness vector (schema slots,
+     * openings, inclusion path of log2(slotWidth) steps).
+     */
+    slotWidth?: number;
 }
 
 /** Generated `Witnesses<PS>` shape for the AttestationVault contract. */

@@ -75,7 +75,7 @@ Sufficient for read-side. `network` is the only required key - without it the pl
 | `proofServerUrl` | `http://localhost:6300` (only used in server proving mode) | Proof server for all submission flows (deploy/call/send/dust-gen). Explicitly configuring it selects server proving; leaving it unset selects in-process wasm proving. |
 | `zkConfigBasePath` | `./contracts` | Base for resolving relative `contracts.<name>.zkConfigPath` |
 | `privateStateBackend` | `cap-db` | `cap-db` (default, production-grade encrypted CAP-DB tables) or `level` (legacy SDK LevelDB, **dev-only**, blocked on worker-routed submissions) |
-| `contracts` | `{}` | Map of `<ref>` → `{ artifactPath, privateStateId, zkConfigPath }`, loaded into the in-memory registry on plugin startup |
+| `contracts` | `{}` | Map of `<ref>` → `{ artifactPath, privateStateId, zkConfigPath, slotWidth? }`, loaded into the in-memory registry on plugin startup. `slotWidth` (8/16/32, default 16) declares the content-tree width of an attestation-vault-family artifact; the shipped `attestation-vault-32` registers with 32 and the whole proof surface sizes masks, k bounds and inclusion paths from it |
 | `sessionTtlMs` | `86400000` (24 h) | Wallet session lifetime |
 | `closeSessionsOnRestart` | `true` | Close the wallet sessions the previous process left behind at startup. Configured `feeSponsorSessions` are exempt. `false` keeps them, for consumers that hold session ids across restarts |
 | `jobs.concurrency.heavy` | `4` | Concurrent jobs per proof-generating kind (deploy, call, send, attestations). 4 saturates one proof server |
@@ -533,12 +533,12 @@ New enums in `db/types.cds`:
 | Local Midnight indexer (docker) | ✅ Optional `midnightntwrk/indexer-standalone:4.3.2` service |
 | Wallet state persistence | ✅ `WalletSyncStates` - restart resumes in seconds, not hours |
 | Worker-thread architecture | ✅ Wallet SDK isolated from main thread (Phase 1+2a+2b) |
-| Compact contracts | ✅ `counter` + `attestation-vault` + `shielded-token` registered with compiled artifacts shipped (`mintShieldedTestToken` + `deriveTokenType` drive the token one) |
+| Compact contracts | ✅ `counter` + `attestation-vault` + `attestation-vault-32` (0.19.0, 32-slot width variant) + `shielded-token` registered with compiled artifacts shipped (`mintShieldedTestToken` + `deriveTokenType` drive the token one) |
 | Live preprod end-to-end (T15) | ✅ Counter deployed live on preprod via the full stack (0.3.0) |
 | On-chain disclosure grants | ✅ `grantDisclosure`/`revokeDisclosure` + chain-indexed `DisclosureGrants` + `granteeBinding` + on-chain read gate (0.3.4). Live-validated through grant → index → read-back; live revoke pending a healthy preprod indexer |
 | Crawler-free state verification | ✅ `verifyAttestationState` / `verifyPredicateState` / `reindexDisclosures` read LIVE contract state (0.5.0); optional per-call `network` override reads another network's public indexer (0.7.0) |
 | Bytes equality + set membership proofs | ✅ `issueFieldEqualityAttestation` / `issueFieldMembershipAttestation` + mixed-kind batch + `prepareMembershipSet`; string fields via `prepareDocumentProof` `kind: 'bytes'` (0.15.0) |
-| Cross-root document diff proofs | ✅ `issueDocumentIntegrityAttestation` (unchanged-except with a 16-bit slot mask) / `issueDocumentDiffAttestation` (at least k of 16 slots differ) over TWO anchored content roots, batchable + crawler-free verifiable (0.16.0) |
+| Cross-root document diff proofs | ✅ `issueDocumentIntegrityAttestation` (unchanged-except with a width-bit slot mask: 16 bits default, 32 on `attestation-vault-32`) / `issueDocumentDiffAttestation` (at least k of width slots differ, k up to 32) over TWO anchored content roots, batchable + crawler-free verifiable (0.16.0; width variants 0.19.0) |
 | Passport-binding hardening | ✅ `bindPassport` rebind guard + registrar-gated `registerPassport` pre-registration (0.10.0). Registered ids bind only for their registered attester; deployed vaults need a redeploy |
 | Mainnet submission | ❌ Gated by `allowMainnetSubmission: false` until forum 1190 resolves |
 | Built-in authorization | ✅ `@requires` annotations; consumer app provides auth strategy |

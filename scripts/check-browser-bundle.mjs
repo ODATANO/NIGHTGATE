@@ -92,6 +92,32 @@ try {
     if (!vacAllOnes) fail('prepareProveFieldsUnchangedExcept accepted the all-ones mask');
     const nonVac = mod.prepareProveFieldsUnchangedExcept({ payloadHashA: 'cc'.repeat(32), payloadHashB: 'dd'.repeat(32), allowedMask: 0b10, docPair: vacPair });
     if (nonVac.circuitId !== 'proveDocumentComparison') fail('prepareProveFieldsUnchangedExcept broken for a non-vacuous mask');
+    if (nonVac.args[3].length !== 16) fail('default mask vector must stay 16 entries');
+    if (!nonVac.merkleProof || !nonVac.merkleProof.docPair) fail('prepare* must pass the raw proof bundle through (batch rebinding)');
+
+    // Width-32 variant (0.19): CONTRACTS metadata + width-aware helpers.
+    if (!mod.CONTRACTS['attestation-vault-32']) fail('CONTRACTS missing attestation-vault-32');
+    if (mod.CONTRACTS['attestation-vault-32'].slotWidth !== 32 || mod.CONTRACTS['attestation-vault-32'].merkleDepth !== 5) {
+        fail('attestation-vault-32 CONTRACTS entry must carry slotWidth 32 / merkleDepth 5');
+    }
+    if (mod.CONTRACTS['attestation-vault'].slotWidth !== 16) fail('attestation-vault CONTRACTS entry must carry slotWidth 16');
+    const schema32 = Array.from({ length: 32 }, (_, i) => ({ fieldKey: 'aa'.repeat(32), kind: i < 2 ? 0 : 2, scale: '0' }));
+    const opening32 = { saltSeed: 'bb'.repeat(32), slots: Array.from({ length: 32 }, () => ({ present: false })) };
+    const pair32 = { schema: schema32, openingA: opening32, openingB: opening32 };
+    const wide = mod.prepareProveFieldsDiffer({ payloadHashA: 'cc'.repeat(32), payloadHashB: 'dd'.repeat(32), k: 20, docPair: pair32, slotWidth: 32 });
+    if (wide.args[3].length !== 32 || wide.args[4] !== 20n) fail('prepareProveFieldsDiffer slotWidth 32 wrong arg shapes');
+    let k17Threw = false;
+    try { mod.prepareProveFieldsDiffer({ payloadHashA: 'cc'.repeat(32), payloadHashB: 'dd'.repeat(32), k: 17, docPair: vacPair }); }
+    catch (e) { k17Threw = /1\.\.16/.test(String(e && e.message)); }
+    if (!k17Threw) fail('prepareProveFieldsDiffer default width must still cap k at 16');
+    let wrongWidthThrew = false;
+    try { mod.prepareProveFieldsDiffer({ payloadHashA: 'cc'.repeat(32), payloadHashB: 'dd'.repeat(32), k: 2, docPair: vacPair, slotWidth: 32 }); }
+    catch (e) { wrongWidthThrew = /32 entries/.test(String(e && e.message)); }
+    if (!wrongWidthThrew) fail('a 16-entry docPair must be rejected under slotWidth 32');
+    let vac32AllOnes = false;
+    try { mod.prepareProveFieldsUnchangedExcept({ payloadHashA: 'cc'.repeat(32), payloadHashB: 'dd'.repeat(32), allowedMask: 0xffffffff, docPair: pair32, slotWidth: 32 }); }
+    catch (e) { vac32AllOnes = /vacuous/.test(String(e && e.message)); }
+    if (!vac32AllOnes) fail('slotWidth 32 all-ones mask must be rejected as vacuous');
 
     // FetchZkConfigProvider with an injected fetch (no network).
     const fakeFetch = async (url) => ({ ok: true, arrayBuffer: async () => new Uint8Array([1, 2, 3]).buffer });

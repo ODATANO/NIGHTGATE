@@ -146,14 +146,17 @@ export function prepareAnchorContentRoot({ payloadHash, contentRoot, schemaId, a
  * ({ fieldValue, siblings[4] hex, dirs[4] }) proves `field_key`'s value is in the
  * anchored content root; `op`: 0 = value ≤ threshold, 1 = value ≥ threshold.
  */
-export function prepareProveFieldPredicate({ payloadHash, fieldKey, threshold, op, merkleProof, attestationSecret }) {
+export function prepareProveFieldPredicate({ payloadHash, fieldKey, threshold, op, merkleProof, attestationSecret, slotWidth }) {
     if (!merkleProof || !merkleProof.fieldSalt) throw new Error('merkleProof ({ fieldValue, fieldSalt, siblings, dirs }) is required (v4 salted leaves)');
     const opNum = BigInt(Number(op));
     if (opNum !== 0n && opNum !== 1n) throw new Error('op must be 0 (lessOrEqual) or 1 (greaterOrEqual)');
     return {
         circuitId: 'proveFieldPredicate',
         args: [hexTo32(payloadHash, 'payloadHash'), hexTo32(fieldKey, 'fieldKey'), BigInt(threshold), opNum],
-        witnesses: buildAttestationVaultWitnesses({ attestationSecret, merkleProof })
+        witnesses: buildAttestationVaultWitnesses({ attestationSecret, merkleProof, slotWidth }),
+        // Raw bundle passthrough for the txbuilder's batch path (one shared
+        // witnesses object with a proof holder swaps these per call).
+        merkleProof, slotWidth
     };
 }
 
@@ -163,12 +166,13 @@ export function prepareProveFieldPredicate({ payloadHash, fieldKey, threshold, o
  * value whose digest is `expectedDigest` (public statement; authenticity, not
  * confidentiality). `merkleProof` needs only { siblings[4] hex, dirs[4] }.
  */
-export function prepareProveFieldEquality({ payloadHash, fieldKey, expectedDigest, merkleProof, attestationSecret }) {
+export function prepareProveFieldEquality({ payloadHash, fieldKey, expectedDigest, merkleProof, attestationSecret, slotWidth }) {
     if (!merkleProof || !merkleProof.fieldSalt) throw new Error('merkleProof ({ fieldSalt, siblings, dirs }) is required (v4 salted leaves)');
     return {
         circuitId: 'proveFieldEquality',
         args: [hexTo32(payloadHash, 'payloadHash'), hexTo32(fieldKey, 'fieldKey'), hexTo32(expectedDigest, 'expectedDigest')],
-        witnesses: buildAttestationVaultWitnesses({ attestationSecret, merkleProof })
+        witnesses: buildAttestationVaultWitnesses({ attestationSecret, merkleProof, slotWidth }),
+        merkleProof, slotWidth
     };
 }
 
@@ -180,35 +184,42 @@ export function prepareProveFieldEquality({ payloadHash, fieldKey, expectedDiges
  * server's `prepareMembershipSet` (or an equivalent canonical builder:
  * digest, dedupe, sort ascending, pad to 64) yields setRoot + setProof.
  */
-export function prepareProveFieldMembership({ payloadHash, fieldKey, setRoot, merkleProof, attestationSecret }) {
+export function prepareProveFieldMembership({ payloadHash, fieldKey, setRoot, merkleProof, attestationSecret, slotWidth }) {
     if (!merkleProof || !merkleProof.fieldDigest || !merkleProof.fieldSalt || !merkleProof.setProof) {
         throw new Error('merkleProof ({ fieldDigest, fieldSalt, siblings, dirs, setProof }) is required (v4 salted leaves)');
     }
     return {
         circuitId: 'proveFieldMembership',
         args: [hexTo32(payloadHash, 'payloadHash'), hexTo32(fieldKey, 'fieldKey'), hexTo32(setRoot, 'setRoot')],
-        witnesses: buildAttestationVaultWitnesses({ attestationSecret, merkleProof })
+        witnesses: buildAttestationVaultWitnesses({ attestationSecret, merkleProof, slotWidth }),
+        merkleProof, slotWidth
     };
 }
 
 /**
  * Prepare a cross-root INTEGRITY call (0.16.0): document B differs from
- * document A ONLY in the slots flagged by `allowedMask` (packed 16-bit
- * integer, bit i = slot i may differ; expanded to the circuit's
- * Vector<16, Boolean> arg here). Runs the mode-switched
- * `proveDocumentComparison(a, b, mode=0, allowed_mask, k)` circuit (one
- * verifier key serves both cross-root kinds; the deploy's per-tx write cap
- * forbids two). `docPair` is `{ schema, openingA, openingB }` (v4): the
- * SHARED 16-entry descriptor list plus both documents' full openings
+ * document A ONLY in the slots flagged by `allowedMask` (packed width-bit
+ * integer, 16 bits default / 32 with `slotWidth: 32`, bit i = slot i may
+ * differ; expanded to the circuit's Vector<width, Boolean> arg here). Runs
+ * the mode-switched `proveDocumentComparison(a, b, mode=0, allowed_mask, k)`
+ * circuit (one verifier key serves both cross-root kinds; the deploy's
+ * per-tx write cap forbids two). `docPair` is `{ schema, openingA,
+ * openingB }` (v4): the SHARED width-entry descriptor list plus both
+ * documents' full openings
  * (the server's `prepareDocumentProof` returns them as `schema` and
  * `opening`). The circuit recomputes schema root and both content roots
  * from these. Both documents must be prepared with the SAME ordered
  * proofFields list; (A, B) order is part of the claim key.
  */
-export function prepareProveFieldsUnchangedExcept({ payloadHashA, payloadHashB, allowedMask, docPair, attestationSecret }) {
+export function prepareProveFieldsUnchangedExcept({ payloadHashA, payloadHashB, allowedMask, docPair, attestationSecret, slotWidth }) {
     if (!docPair || !docPair.schema || !docPair.openingA || !docPair.openingB) throw new Error('docPair ({ schema, openingA, openingB }) is required');
+    // Width of the target artifact (16 default, 32 for attestation-vault-32).
+    // JS bitwise operators are exact for bits 0..31, so a Number mask carries
+    // widths up to 32.
+    const width = slotWidth ?? 16;
+    const maxMask = width === 32 ? 0xffffffff : (1 << width) - 1;
     const mask = Number(allowedMask);
-    if (!Number.isInteger(mask) || mask < 0 || mask > 0xffff) throw new Error('allowedMask must be an integer in 0..65535');
+    if (!Number.isInteger(mask) || mask < 0 || mask > maxMask) throw new Error(`allowedMask must be an integer in 0..${maxMask}`);
     // Non-vacuity (the circuit rejects this too): at least one REAL
     // (non-padding) schema slot must stay constrained, or the claim says
     // nothing ("everything may differ").
@@ -216,11 +227,12 @@ export function prepareProveFieldsUnchangedExcept({ payloadHashA, payloadHashB, 
         && docPair.schema.every((s, i) => Number(s?.kind) === 2 || (mask & (1 << i)) !== 0)) {
         throw new Error('allowedMask frees every real (non-padding) schema slot; the claim would be vacuous');
     }
-    const maskVector = Array.from({ length: 16 }, (_, i) => (mask & (1 << i)) !== 0);
+    const maskVector = Array.from({ length: width }, (_, i) => (mask & (1 << i)) !== 0);
     return {
         circuitId: 'proveDocumentComparison',
         args: [hexTo32(payloadHashA, 'payloadHashA'), hexTo32(payloadHashB, 'payloadHashB'), 0n, maskVector, 1n],
-        witnesses: buildAttestationVaultWitnesses({ attestationSecret, merkleProof: { docPair } })
+        witnesses: buildAttestationVaultWitnesses({ attestationSecret, merkleProof: { docPair }, slotWidth }),
+        merkleProof: { docPair }, slotWidth
     };
 }
 
@@ -235,13 +247,15 @@ export function prepareProveFieldsUnchangedExcept({ payloadHashA, payloadHashB, 
  * list, proven against both anchors), so both documents must be anchored
  * with the same schemaId.
  */
-export function prepareProveFieldsDiffer({ payloadHashA, payloadHashB, k, docPair, attestationSecret }) {
+export function prepareProveFieldsDiffer({ payloadHashA, payloadHashB, k, docPair, attestationSecret, slotWidth }) {
     if (!docPair || !docPair.schema || !docPair.openingA || !docPair.openingB) throw new Error('docPair ({ schema, openingA, openingB }) is required');
+    const width = slotWidth ?? 16;
     const kNum = Number(k);
-    if (!Number.isInteger(kNum) || kNum < 1 || kNum > 16) throw new Error('k must be an integer in 1..16');
+    if (!Number.isInteger(kNum) || kNum < 1 || kNum > width) throw new Error(`k must be an integer in 1..${width}`);
     return {
         circuitId: 'proveDocumentComparison',
-        args: [hexTo32(payloadHashA, 'payloadHashA'), hexTo32(payloadHashB, 'payloadHashB'), 1n, Array.from({ length: 16 }, () => false), BigInt(kNum)],
-        witnesses: buildAttestationVaultWitnesses({ attestationSecret, merkleProof: { docPair } })
+        args: [hexTo32(payloadHashA, 'payloadHashA'), hexTo32(payloadHashB, 'payloadHashB'), 1n, Array.from({ length: width }, () => false), BigInt(kNum)],
+        witnesses: buildAttestationVaultWitnesses({ attestationSecret, merkleProof: { docPair }, slotWidth }),
+        merkleProof: { docPair }, slotWidth
     };
 }

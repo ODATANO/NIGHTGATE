@@ -10,7 +10,20 @@ Registered contracts:
 - **`counter`**: minimal increment-only contract; first registered artifact
   and the deploy/call smoke-test target.
 - **`attestation-vault`**: the tiered-disclosure attestation contract behind
-  the attestation / predicate / disclosure actions.
+  the attestation / predicate / disclosure actions (16 provable fields per
+  document, depth-4 content tree).
+- **`attestation-vault-32`**: the 32-slot width variant of the attestation
+  vault (depth-5 content tree), for field panels of 17-32 provable fields
+  that need ONE root (a global k-of-N diff claim only exists within one
+  document). Same circuit set and semantics; a SECOND lineage, not a
+  replacement: cross-root proofs only work between documents of the same
+  width. Registration carries `slotWidth: 32`; deploy size and cost are
+  identical to the 16er (every verifier key is 2119 B, though four verifier
+  CONTENTS differ: comparison plus the content-tree circuits), the
+  comparison prover doubles (72.9 MB, wasm-provable). Wider trees are not
+  supported: the registry rejects `slotWidth: 64` because the mask path is
+  32-bit, and a 64-wide comparison prover exceeds the wasm prover's memory
+  anyway (proof-server-only).
 - **`shielded-token`**: test token whose `mint()` sends the contract's own
   shielded token to the caller's zswap key; exists to exercise the zswap
   circuits (NIGHT is unshielded-only and can never touch them). Used by

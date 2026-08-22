@@ -36,6 +36,7 @@ const EXPECTED = {
     './calls': ['prepareAttest', 'prepareAnchorContentRoot', 'prepareProveFieldMembership',
         'buildAttestationVaultWitnesses', 'generateAttestationSecret', 'CONTRACTS'],
     './attestation-vault': ['Contract', 'pureCircuits', 'ledger'],
+    './attestation-vault-32': ['Contract', 'pureCircuits', 'ledger'],
     './set-root': ['buildMembershipSet', 'membershipPathFor', 'canonicalSetDigests']
 };
 
@@ -140,6 +141,7 @@ async function main() {
             "import '@odatano/nightgate-tx/txbuilder';",
             "import '@odatano/nightgate-tx/calls';",
             "import '@odatano/nightgate-tx/attestation-vault';",
+            "import '@odatano/nightgate-tx/attestation-vault-32';",
             "import '@odatano/nightgate-tx/set-root';",
             "console.log('install-probe ok');"
         ].join('\n'));

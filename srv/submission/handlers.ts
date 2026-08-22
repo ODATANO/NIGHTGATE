@@ -32,6 +32,8 @@ import {
     ContractNotRegisteredError,
     getArtifactGenerationDigest,
     assertArtifactGeneration,
+    getContractRegistration,
+    slotWidthOf,
     type ResolvedContract
 } from './contract-registry';
 import {
@@ -100,6 +102,18 @@ const reindexRateLimiter = new RateLimiter({ windowMs: 60 * 60 * 1000, maxReques
 
 const SHA256_HEX_RE = /^[0-9a-fA-F]{64}$/;
 const DEFAULT_ATTESTATION_VAULT_REF = 'attestation-vault';
+
+/**
+ * Width-dependent limits of a vault artifact (registration `slotWidth`,
+ * default 16): slot count, inclusion-path depth, and the packed-mask upper
+ * bound. JS bitwise operators are exact for bits 0..31, so widths up to 32
+ * work on a Number mask (the CDS `Integer` params carry them; validation
+ * happens here, not in the OData type).
+ */
+function vaultDims(compiledRef: string | undefined): { width: number; depth: number; maxMask: number } {
+    const width = slotWidthOf(getContractRegistration(compiledRef?.length ? compiledRef : DEFAULT_ATTESTATION_VAULT_REF));
+    return { width, depth: Math.log2(width), maxMask: width === 32 ? 0xffffffff : (1 << width) - 1 };
+}
 // The circuits take Uint<64>; overflow would otherwise surface only as an
 // opaque proving-time failure.
 const UINT64_MAX = (1n << 64n) - 1n;
@@ -240,9 +254,9 @@ function parseInclusionPath(
  * Validate a parsed 16-entry schema descriptor list (throws with a
  * user-facing message on any shape violation; callers map to 400).
  */
-function validateSchemaSlots(schema: unknown, name: string): SchemaSlotWire[] {
-    if (!Array.isArray(schema) || schema.length !== 16) {
-        throw new Error(`${name} must be a JSON array of exactly 16 slot descriptors`);
+function validateSchemaSlots(schema: unknown, name: string, width = 16): SchemaSlotWire[] {
+    if (!Array.isArray(schema) || schema.length !== width) {
+        throw new Error(`${name} must be a JSON array of exactly ${width} slot descriptors`);
     }
     return schema.map((d: any, i: number) => {
         if (!d || typeof d !== 'object') throw new Error(`${name}[${i}] must be an object`);
@@ -263,14 +277,14 @@ function validateSchemaSlots(schema: unknown, name: string): SchemaSlotWire[] {
  * Validate a parsed cross-root document opening ({ saltSeed, slots[16] });
  * throws with a user-facing message on any shape violation.
  */
-function validateOpening(opening: unknown, name: string): OpeningWire {
+function validateOpening(opening: unknown, name: string, width = 16): OpeningWire {
     const o = opening as any;
     if (!o || typeof o !== 'object') throw new Error(`${name} must be an object`);
     if (typeof o.saltSeed !== 'string' || !SHA256_HEX_RE.test(o.saltSeed)) {
         throw new Error(`${name}.saltSeed must be 64 hex chars (32 bytes)`);
     }
-    if (!Array.isArray(o.slots) || o.slots.length !== 16) {
-        throw new Error(`${name}.slots must be a JSON array of exactly 16 slot openings`);
+    if (!Array.isArray(o.slots) || o.slots.length !== width) {
+        throw new Error(`${name}.slots must be a JSON array of exactly ${width} slot openings`);
     }
     const slots = o.slots.map((s: any, i: number) => {
         if (!s || typeof s !== 'object') throw new Error(`${name}.slots[${i}] must be an object`);
@@ -311,16 +325,29 @@ function isVacuousMask(allowedMask: number, schema: SchemaSlotWire[]): boolean {
     return schema.every((s, i) => s.kind === 2 || (allowedMask & (1 << i)) !== 0);
 }
 
+/**
+ * CAP delivers Integer64 action parameters (and reads Integer64 columns) as
+ * STRINGS (IEEE754-compatible OData serialization); the mask is Integer64
+ * because bit 31 of a 32-slot mask overflows a signed Int32. Coerce to a
+ * plain number (masks are <= 32 bits, far below MAX_SAFE_INTEGER); null when
+ * not an integer.
+ */
+function coerceMask(raw: unknown): number | null {
+    const n = typeof raw === 'string' && raw.trim() !== '' ? Number(raw) : raw;
+    return typeof n === 'number' && Number.isInteger(n) ? n : null;
+}
+
 function parseDocPairInputs(
     req: Request,
     schemaJson: string | undefined,
     openingAJson: string | undefined,
-    openingBJson: string | undefined
+    openingBJson: string | undefined,
+    width = 16
 ): { schema: SchemaSlotWire[]; openingA: OpeningWire; openingB: OpeningWire } | null {
     try {
-        const schema = validateSchemaSlots(JSON.parse(schemaJson ?? ''), 'schemaJson');
-        const openingA = validateOpening(JSON.parse(openingAJson ?? ''), 'openingAJson');
-        const openingB = validateOpening(JSON.parse(openingBJson ?? ''), 'openingBJson');
+        const schema = validateSchemaSlots(JSON.parse(schemaJson ?? ''), 'schemaJson', width);
+        const openingA = validateOpening(JSON.parse(openingAJson ?? ''), 'openingAJson', width);
+        const openingB = validateOpening(JSON.parse(openingBJson ?? ''), 'openingBJson', width);
         return { schema, openingA, openingB };
     } catch (e: any) {
         req.reject(400, e instanceof SyntaxError
@@ -666,7 +693,7 @@ export function registerSubmissionHandlers(
         if (command.op === 'deploy') {
             const result = await submitter.deploy({
                 contractName: command.compiledArtifactRef,
-                registration: { artifactPath: resolved.artifactPath, privateStateId: resolved.privateStateId, zkConfigPath: resolved.zkConfigPath },
+                registration: { artifactPath: resolved.artifactPath, privateStateId: resolved.privateStateId, zkConfigPath: resolved.zkConfigPath, ...(resolved.slotWidth !== undefined ? { slotWidth: resolved.slotWidth } : {}) },
                 initialPrivateState: command.initialPrivateState,
                 sessionId: job.sessionId
             });
@@ -680,7 +707,7 @@ export function registerSubmissionHandlers(
                 contractAddress: command.contractAddress, circuit: 'attestGuarded',
                 args: [0n, hexToBytes(command.commitment), new Uint8Array(32), new Uint8Array(32)],
                 contractName: command.compiledArtifactRef,
-                registration: { artifactPath: resolved.artifactPath, privateStateId: resolved.privateStateId, zkConfigPath: resolved.zkConfigPath },
+                registration: { artifactPath: resolved.artifactPath, privateStateId: resolved.privateStateId, zkConfigPath: resolved.zkConfigPath, ...(resolved.slotWidth !== undefined ? { slotWidth: resolved.slotWidth } : {}) },
                 sessionId: job.sessionId
             });
             return { commitment: command.commitment, contractAddress: command.contractAddress, txHash: result.txHash, ...(sponsor ? { feeSponsor: sponsor.sponsorSessionId } : {}) };
@@ -696,7 +723,7 @@ export function registerSubmissionHandlers(
                     ? [1n, hexToBytes(command.payloadHash), hexToBytes(command.metadataHash), hexToBytes(command.guardedNonce)]
                     : [hexToBytes(command.payloadHash), hexToBytes(command.metadataHash)],
                 contractName: command.compiledArtifactRef,
-                registration: { artifactPath: resolved.artifactPath, privateStateId: resolved.privateStateId, zkConfigPath: resolved.zkConfigPath },
+                registration: { artifactPath: resolved.artifactPath, privateStateId: resolved.privateStateId, zkConfigPath: resolved.zkConfigPath, ...(resolved.slotWidth !== undefined ? { slotWidth: resolved.slotWidth } : {}) },
                 sessionId: job.sessionId
             });
             const anchoredAt = new Date().toISOString();
@@ -713,7 +740,7 @@ export function registerSubmissionHandlers(
                     ? [hexToBytes(command.payloadHash), hexToBytes(command.grantee), BigInt(command.level)]
                     : [hexToBytes(command.payloadHash), hexToBytes(command.grantee)],
                 contractName: command.compiledArtifactRef,
-                registration: { artifactPath: resolved.artifactPath, privateStateId: resolved.privateStateId, zkConfigPath: resolved.zkConfigPath },
+                registration: { artifactPath: resolved.artifactPath, privateStateId: resolved.privateStateId, zkConfigPath: resolved.zkConfigPath, ...(resolved.slotWidth !== undefined ? { slotWidth: resolved.slotWidth } : {}) },
                 sessionId: job.sessionId
             });
             const changedAt = new Date().toISOString();
@@ -732,7 +759,7 @@ export function registerSubmissionHandlers(
                 circuit: 'registerPassport',
                 args: [hexToBytes(command.passportId), hexToBytes(command.ownerId)],
                 contractName: command.compiledArtifactRef,
-                registration: { artifactPath: resolved.artifactPath, privateStateId: resolved.privateStateId, zkConfigPath: resolved.zkConfigPath },
+                registration: { artifactPath: resolved.artifactPath, privateStateId: resolved.privateStateId, zkConfigPath: resolved.zkConfigPath, ...(resolved.slotWidth !== undefined ? { slotWidth: resolved.slotWidth } : {}) },
                 sessionId: job.sessionId
             });
             return { passportId: command.passportId, ownerId: command.ownerId, contractAddress: command.contractAddress, txHash: result.txHash, ...(sponsor ? { feeSponsor: sponsor.sponsorSessionId } : {}) };
@@ -750,7 +777,7 @@ export function registerSubmissionHandlers(
                         : (c.circuit === 'proveFieldEquality' || c.circuit === 'proveFieldMembership')
                             ? [hexToBytes(String(c.args[0])), hexToBytes(String(c.args[1])), hexToBytes(String(c.args[2]))]
                             : c.circuit === 'proveDocumentComparison'
-                                ? [hexToBytes(String(c.args[0])), hexToBytes(String(c.args[1])), BigInt(String(c.args[2])), expandAllowedMask(Number(c.args[3])), BigInt(String(c.args[4]))]
+                                ? [hexToBytes(String(c.args[0])), hexToBytes(String(c.args[1])), BigInt(String(c.args[2])), expandAllowedMask(Number(c.args[3]), vaultDims(command.compiledArtifactRef).width), BigInt(String(c.args[4]))]
                             : [hexToBytes(String(c.args[0])), hexToBytes(String(c.args[1])), BigInt(String(c.args[2])), BigInt(String(c.args[3]))];
                     return { circuit: c.circuit, args, merkleProof: c.merkleProof };
                 }
@@ -763,7 +790,7 @@ export function registerSubmissionHandlers(
                 contractName: command.compiledArtifactRef,
                 initialPrivateState: command.initialPrivateState,
                 merkleProof: command.merkleProof,
-                registration: { artifactPath: resolved.artifactPath, privateStateId: resolved.privateStateId, zkConfigPath: resolved.zkConfigPath },
+                registration: { artifactPath: resolved.artifactPath, privateStateId: resolved.privateStateId, zkConfigPath: resolved.zkConfigPath, ...(resolved.slotWidth !== undefined ? { slotWidth: resolved.slotWidth } : {}) },
                 sessionId: job.sessionId
             });
             return { submissionId: result.submissionId, txHash: result.txHash, contractAddress: result.contractAddress, circuits: result.circuits, status: result.status, ...(sponsor ? { feeSponsor: sponsor.sponsorSessionId } : {}) };
@@ -780,7 +807,7 @@ export function registerSubmissionHandlers(
             const out = await submitter.probeCrossServerSponsor({
                 contractAddress: c.contractAddress, circuit: c.circuit, args: coerced,
                 contractName: c.compiledArtifactRef,
-                registration: { artifactPath: resolved.artifactPath, privateStateId: resolved.privateStateId, zkConfigPath: resolved.zkConfigPath },
+                registration: { artifactPath: resolved.artifactPath, privateStateId: resolved.privateStateId, zkConfigPath: resolved.zkConfigPath, ...(resolved.slotWidth !== undefined ? { slotWidth: resolved.slotWidth } : {}) },
                 sessionId: job.sessionId
             });
             return { ...out, contractAddress: c.contractAddress, circuit: c.circuit, ...(sponsor ? { feeSponsor: sponsor.sponsorSessionId } : {}) };
@@ -796,7 +823,7 @@ export function registerSubmissionHandlers(
             const out = await submitter.buildSponsorable({
                 contractAddress: c.contractAddress, circuit: c.circuit, args: coerced,
                 contractName: c.compiledArtifactRef,
-                registration: { artifactPath: resolved.artifactPath, privateStateId: resolved.privateStateId, zkConfigPath: resolved.zkConfigPath },
+                registration: { artifactPath: resolved.artifactPath, privateStateId: resolved.privateStateId, zkConfigPath: resolved.zkConfigPath, ...(resolved.slotWidth !== undefined ? { slotWidth: resolved.slotWidth } : {}) },
                 sessionId: job.sessionId
             });
             return { ...out, contractAddress: c.contractAddress, circuit: c.circuit };
@@ -811,8 +838,8 @@ export function registerSubmissionHandlers(
             coercedArgs = [hexToBytes(String(command.args[0])), hexToBytes(String(command.args[1])), hexToBytes(String(command.args[2]))];
         } else if (job.kind === 'documentIntegrityProof' || job.kind === 'documentDiffProof') {
             // proveDocumentComparison(a, b, mode, allowed_mask, k); the
-            // Vector<16, Boolean> mask arg expands from the packed integer.
-            coercedArgs = [hexToBytes(String(command.args[0])), hexToBytes(String(command.args[1])), BigInt(String(command.args[2])), expandAllowedMask(Number(command.args[3])), BigInt(String(command.args[4]))];
+            // Vector<width, Boolean> mask arg expands from the packed integer.
+            coercedArgs = [hexToBytes(String(command.args[0])), hexToBytes(String(command.args[1])), BigInt(String(command.args[2])), expandAllowedMask(Number(command.args[3]), vaultDims(command.compiledArtifactRef).width), BigInt(String(command.args[4]))];
         } else {
             const argTypes = argTypesLoader(resolved.zkConfigPath, command.circuit);
             coercedArgs = coerceCircuitArgs(command.args, argTypes);
@@ -824,7 +851,7 @@ export function registerSubmissionHandlers(
             contractName: command.compiledArtifactRef,
             initialPrivateState: command.initialPrivateState,
             merkleProof: command.merkleProof,
-            registration: { artifactPath: resolved.artifactPath, privateStateId: resolved.privateStateId, zkConfigPath: resolved.zkConfigPath },
+            registration: { artifactPath: resolved.artifactPath, privateStateId: resolved.privateStateId, zkConfigPath: resolved.zkConfigPath, ...(resolved.slotWidth !== undefined ? { slotWidth: resolved.slotWidth } : {}) },
             sessionId: job.sessionId
         });
         return { submissionId: result.submissionId, txHash: result.txHash, contractAddress: result.contractAddress, status: result.status, ...(sponsor ? { feeSponsor: sponsor.sponsorSessionId } : {}) };
@@ -1606,6 +1633,7 @@ export function registerSubmissionHandlers(
         // scope is slow to prove, and a single rejected call discards the
         // whole scope pre-submission (post-submission the fallible phase can
         // still finalize PARTIAL_SUCCESS; see the action doc).
+        const { depth: rawBatchDepth } = vaultDims(compiledArtifactRef);
         let parsedCalls: Array<{ circuit: string; args: unknown[]; merkleProof?: MerkleProofBundle }>;
         try {
             const v = JSON.parse(calls);
@@ -1641,14 +1669,14 @@ export function registerSubmissionHandlers(
                         }
                         fieldDigest = mp.fieldDigest.toLowerCase();
                     }
-                    if (!Array.isArray(mp.siblings) || mp.siblings.length !== 4) {
-                        throw new Error(`calls[${i}].merkleProof.siblings must be a JSON array of 4 hashes`);
+                    if (!Array.isArray(mp.siblings) || mp.siblings.length !== rawBatchDepth) {
+                        throw new Error(`calls[${i}].merkleProof.siblings must be a JSON array of ${rawBatchDepth} hashes`);
                     }
                     for (const s of mp.siblings) {
                         if (typeof s !== 'string' || !SHA256_HEX_RE.test(s)) throw new Error(`calls[${i}].merkleProof.siblings entries must be 64 hex chars (32 bytes)`);
                     }
-                    if (!Array.isArray(mp.dirs) || mp.dirs.length !== 4) {
-                        throw new Error(`calls[${i}].merkleProof.dirs must be a JSON array of 4 booleans`);
+                    if (!Array.isArray(mp.dirs) || mp.dirs.length !== rawBatchDepth) {
+                        throw new Error(`calls[${i}].merkleProof.dirs must be a JSON array of ${rawBatchDepth} booleans`);
                     }
                     for (const d of mp.dirs) {
                         if (typeof d !== 'boolean') throw new Error(`calls[${i}].merkleProof.dirs entries must be booleans`);
@@ -2046,13 +2074,15 @@ export function registerSubmissionHandlers(
         }
         const op = parsedPredicate.opCode!;
 
-        // Parse + validate the inclusion path (DEPTH=4).
+        // Parse + validate the inclusion path (depth = log2 of the artifact's
+        // slot width: 4 for the classic vault, 5 for attestation-vault-32).
+        const { depth } = vaultDims(data.compiledArtifactRef);
         let siblings: string[];
         let dirs: boolean[];
         try { siblings = JSON.parse(data.siblingsJson ?? '[]'); } catch { return req.reject(400, 'siblingsJson must be a JSON array'); }
         try { dirs = JSON.parse(data.dirsJson ?? '[]'); } catch { return req.reject(400, 'dirsJson must be a JSON array'); }
-        if (!Array.isArray(siblings) || siblings.length !== 4) return req.reject(400, 'siblingsJson must be a JSON array of 4 hashes');
-        if (!Array.isArray(dirs) || dirs.length !== 4) return req.reject(400, 'dirsJson must be a JSON array of 4 booleans');
+        if (!Array.isArray(siblings) || siblings.length !== depth) return req.reject(400, `siblingsJson must be a JSON array of ${depth} hashes`);
+        if (!Array.isArray(dirs) || dirs.length !== depth) return req.reject(400, `dirsJson must be a JSON array of ${depth} booleans`);
         for (const s of siblings) {
             if (typeof s !== 'string' || !SHA256_HEX_RE.test(s)) return req.reject(400, 'each sibling must be 64 hex chars (32 bytes)');
         }
@@ -2180,7 +2210,7 @@ export function registerSubmissionHandlers(
             return req.reject(400, 'fieldSalt (64 hex chars) is required (v4 salted leaves; prepareDocumentProof returns it per field)');
         }
 
-        const path = parseInclusionPath(req, data.siblingsJson, data.dirsJson, 4, { siblings: 'siblingsJson', dirs: 'dirsJson' });
+        const path = parseInclusionPath(req, data.siblingsJson, data.dirsJson, vaultDims(data.compiledArtifactRef).depth, { siblings: 'siblingsJson', dirs: 'dirsJson' });
         if (!path) return;
         if (data.contentRoot && !SHA256_HEX_RE.test(data.contentRoot)) {
             return req.reject(400, 'contentRoot must be 64 hex chars (32 bytes)');
@@ -2307,7 +2337,7 @@ export function registerSubmissionHandlers(
             return req.reject(400, 'allowedValuesJson or setRoot + setSiblingsJson + setDirsJson is required');
         }
 
-        const path = parseInclusionPath(req, data.siblingsJson, data.dirsJson, 4, { siblings: 'siblingsJson', dirs: 'dirsJson' });
+        const path = parseInclusionPath(req, data.siblingsJson, data.dirsJson, vaultDims(data.compiledArtifactRef).depth, { siblings: 'siblingsJson', dirs: 'dirsJson' });
         if (!path) return;
         if (data.contentRoot && !SHA256_HEX_RE.test(data.contentRoot)) {
             return req.reject(400, 'contentRoot must be 64 hex chars (32 bytes)');
@@ -2444,7 +2474,7 @@ export function registerSubmissionHandlers(
 
     srv.on('issueDocumentIntegrityAttestation', async (req: Request) => {
         const data = req.data as {
-            payloadHashA?: string; payloadHashB?: string; allowedMask?: number;
+            payloadHashA?: string; payloadHashB?: string; allowedMask?: number | string;
             schemaJson?: string; openingAJson?: string; openingBJson?: string;
             contentRootA?: string; contentRootB?: string; schemaId?: string;
             sessionId?: string; contractAddress?: string; compiledArtifactRef?: string;
@@ -2458,16 +2488,18 @@ export function registerSubmissionHandlers(
         if (data.payloadHashA.toLowerCase() === data.payloadHashB.toLowerCase()) {
             return req.reject(400, 'payloadHashA and payloadHashB must differ (a document is trivially unchanged against itself)');
         }
+        const { width: intWidth, maxMask } = vaultDims(data.compiledArtifactRef);
         if (data.allowedMask === undefined || data.allowedMask === null) return req.reject(400, 'allowedMask is required');
-        if (!Number.isInteger(data.allowedMask) || data.allowedMask < 0 || data.allowedMask > 0xffff) {
-            return req.reject(400, 'allowedMask must be an integer in 0..65535 (packed 16-bit slot mask)');
+        const allowedMask = coerceMask(data.allowedMask);
+        if (allowedMask === null || allowedMask < 0 || allowedMask > maxMask) {
+            return req.reject(400, `allowedMask must be an integer in 0..${maxMask} (packed ${intWidth}-bit slot mask)`);
         }
-        if (data.allowedMask === 0xffff) {
-            return req.reject(400, 'allowedMask 65535 permits every slot to differ; the claim would be vacuous');
+        if (allowedMask === maxMask) {
+            return req.reject(400, `allowedMask ${maxMask} permits every slot to differ; the claim would be vacuous`);
         }
-        const docPair = parseDocPairInputs(req, data.schemaJson, data.openingAJson, data.openingBJson);
+        const docPair = parseDocPairInputs(req, data.schemaJson, data.openingAJson, data.openingBJson, intWidth);
         if (!docPair) return;
-        if (isVacuousMask(data.allowedMask, docPair.schema)) {
+        if (isVacuousMask(allowedMask, docPair.schema)) {
             return req.reject(400, 'allowedMask frees every real (non-padding) schema slot; the claim would be vacuous');
         }
         for (const [name, root] of [['contentRootA', data.contentRootA], ['contentRootB', data.contentRootB]] as const) {
@@ -2506,7 +2538,7 @@ export function registerSubmissionHandlers(
             expectedDigest: null,
             setRoot: null,
             payloadHashB: data.payloadHashB.toLowerCase(),
-            allowedMask: data.allowedMask,
+            allowedMask,
             network: recordedNetworkId(),
             compiledArtifactRef: compiledRef,
             artifactDigest: artifactDigestOrNull(compiledRef),
@@ -2532,14 +2564,14 @@ export function registerSubmissionHandlers(
                     payloadHashB: data.payloadHashB!.toLowerCase(),
                     contractAddress: data.contractAddress,
                     predicate: 'documentIntegrity',
-                    allowedMask: data.allowedMask,
+                    allowedMask,
                     predicateAttestationId,
                     feeSponsor: sponsor?.sponsorSessionId ?? null
                 },
                 idempotencyPayload: {
                     payloadHashA: data.payloadHashA!.toLowerCase(), payloadHashB: data.payloadHashB!.toLowerCase(),
                     contractAddress: data.contractAddress, predicate: 'documentIntegrity',
-                    allowedMask: data.allowedMask,
+                    allowedMask,
                     schema: docPair.schema, openingA: docPair.openingA, openingB: docPair.openingB,
                     contentRootA: data.contentRootA?.toLowerCase() ?? null,
                     contentRootB: data.contentRootB?.toLowerCase() ?? null,
@@ -2553,7 +2585,7 @@ export function registerSubmissionHandlers(
                     op: 'documentIntegrityWorkflow', predicateAttestationId,
                     payloadHashA: data.payloadHashA!.toLowerCase(), payloadHashB: data.payloadHashB!.toLowerCase(),
                     contractAddress: data.contractAddress!, compiledArtifactRef: compiledRef,
-                    allowedMask: data.allowedMask!,
+                    allowedMask,
                     schema: docPair.schema, openingA: docPair.openingA, openingB: docPair.openingB,
                     contentRootA: data.contentRootA?.toLowerCase(),
                     contentRootB: data.contentRootB?.toLowerCase(),
@@ -2584,11 +2616,12 @@ export function registerSubmissionHandlers(
         if (data.payloadHashA.toLowerCase() === data.payloadHashB.toLowerCase()) {
             return req.reject(400, 'payloadHashA and payloadHashB must differ (a document has no differences against itself)');
         }
+        const { width: diffWidth } = vaultDims(data.compiledArtifactRef);
         if (data.k === undefined || data.k === null) return req.reject(400, 'k is required');
-        if (!Number.isInteger(data.k) || data.k < 1 || data.k > 16) {
-            return req.reject(400, 'k must be an integer in 1..16 (minimum differing slots)');
+        if (!Number.isInteger(data.k) || data.k < 1 || data.k > diffWidth) {
+            return req.reject(400, `k must be an integer in 1..${diffWidth} (minimum differing slots)`);
         }
-        const docPair = parseDocPairInputs(req, data.schemaJson, data.openingAJson, data.openingBJson);
+        const docPair = parseDocPairInputs(req, data.schemaJson, data.openingAJson, data.openingBJson, diffWidth);
         if (!docPair) return;
         for (const [name, root] of [['contentRootA', data.contentRootA], ['contentRootB', data.contentRootB]] as const) {
             if (root && !SHA256_HEX_RE.test(root)) return req.reject(400, `${name} must be 64 hex chars (32 bytes)`);
@@ -2752,6 +2785,7 @@ export function registerSubmissionHandlers(
             }
             return { siblings: sibs.map((s: string) => s.toLowerCase()), dirs: ds as boolean[] };
         };
+        const { width: batchWidth, depth: batchDepth, maxMask: batchMaxMask } = vaultDims(data.compiledArtifactRef);
         let claims: BatchClaim[];
         try {
             const v = JSON.parse(data.claimsJson);
@@ -2775,15 +2809,15 @@ export function registerSubmissionHandlers(
                     if (payloadHashB === data.payloadHash!.toLowerCase()) {
                         throw new Error(`claims[${i}].payloadHashB must differ from the batch payloadHash`);
                     }
-                    const schema = validateSchemaSlots(entry.schema, `claims[${i}].schema`);
-                    const openingA = validateOpening(entry.openingA, `claims[${i}].openingA`);
-                    const openingB = validateOpening(entry.openingB, `claims[${i}].openingB`);
+                    const schema = validateSchemaSlots(entry.schema, `claims[${i}].schema`, batchWidth);
+                    const openingA = validateOpening(entry.openingA, `claims[${i}].openingA`, batchWidth);
+                    const openingB = validateOpening(entry.openingB, `claims[${i}].openingB`, batchWidth);
                     if (parsed.kind === 'integrity') {
-                        if (!Number.isInteger(entry.allowedMask) || entry.allowedMask < 0 || entry.allowedMask > 0xffff) {
-                            throw new Error(`claims[${i}].allowedMask must be an integer in 0..65535`);
+                        if (!Number.isInteger(entry.allowedMask) || entry.allowedMask < 0 || entry.allowedMask > batchMaxMask) {
+                            throw new Error(`claims[${i}].allowedMask must be an integer in 0..${batchMaxMask}`);
                         }
-                        if (entry.allowedMask === 0xffff) {
-                            throw new Error(`claims[${i}].allowedMask 65535 permits every slot to differ; the claim would be vacuous`);
+                        if (entry.allowedMask === batchMaxMask) {
+                            throw new Error(`claims[${i}].allowedMask ${batchMaxMask} permits every slot to differ; the claim would be vacuous`);
                         }
                         if (isVacuousMask(entry.allowedMask, schema)) {
                             throw new Error(`claims[${i}].allowedMask frees every real (non-padding) schema slot; the claim would be vacuous`);
@@ -2793,8 +2827,8 @@ export function registerSubmissionHandlers(
                             schema, openingA, openingB
                         };
                     }
-                    if (!Number.isInteger(entry.k) || entry.k < 1 || entry.k > 16) {
-                        throw new Error(`claims[${i}].k must be an integer in 1..16`);
+                    if (!Number.isInteger(entry.k) || entry.k < 1 || entry.k > batchWidth) {
+                        throw new Error(`claims[${i}].k must be an integer in 1..${batchWidth}`);
                     }
                     return {
                         predicate: 'documentDiff', payloadHashB, k: entry.k,
@@ -2805,7 +2839,7 @@ export function registerSubmissionHandlers(
                 if (typeof entry.fieldKey !== 'string' || !SHA256_HEX_RE.test(entry.fieldKey)) {
                     throw new Error(`claims[${i}].fieldKey must be 64 hex chars (32 bytes)`);
                 }
-                const contentPath = parsePath(entry, i, 4, 'siblings', 'dirs');
+                const contentPath = parsePath(entry, i, batchDepth, 'siblings', 'dirs');
                 if (typeof entry.salt !== 'string' || !SHA256_HEX_RE.test(entry.salt)) {
                     throw new Error(`claims[${i}].salt must be 64 hex chars (32 bytes; v4 salted leaves)`);
                 }
@@ -3081,7 +3115,8 @@ export function registerSubmissionHandlers(
             expectedDigest: row.expectedDigest ?? '',
             setRoot: row.setRoot ?? '',
             payloadHashB: row.payloadHashB ?? '',
-            allowedMask: row.allowedMask ?? null,
+            // Integer64 column: some DB drivers hand the value back as a string
+            allowedMask: row.allowedMask === null || row.allowedMask === undefined ? null : coerceMask(row.allowedMask),
             provenTxHash: row.provenTxHash ?? '',
             provenAt: row.provenAt ?? null
         };
@@ -3385,7 +3420,7 @@ export function registerSubmissionHandlers(
             expectedDigest?: string;
             setRoot?: string;
             payloadHashB?: string;
-            allowedMask?: number;
+            allowedMask?: number | string;
             k?: number;
             compiledArtifactRef?: string;
             network?: string;
@@ -3414,19 +3449,22 @@ export function registerSubmissionHandlers(
         let allowedMask: number | undefined;
         let k: number | undefined;
         if (parsed.kind === 'integrity' || parsed.kind === 'diff') {
+            const { width: verifyWidth, maxMask: verifyMaxMask } = vaultDims(data.compiledArtifactRef);
             if (!data.payloadHashB || !SHA256_HEX_RE.test(data.payloadHashB)) {
                 return req.reject(400, `payloadHashB (64 hex chars) is required for predicate '${data.predicate}'`);
             }
             payloadHashB = data.payloadHashB.toLowerCase();
             if (parsed.kind === 'integrity') {
-                if (data.allowedMask === undefined || data.allowedMask === null
-                    || !Number.isInteger(data.allowedMask) || data.allowedMask < 0 || data.allowedMask > 0xffff) {
-                    return req.reject(400, "allowedMask (integer 0..65535) is required for predicate 'documentIntegrity'");
+                const coerced = data.allowedMask === undefined || data.allowedMask === null
+                    ? null
+                    : coerceMask(data.allowedMask);
+                if (coerced === null || coerced < 0 || coerced > verifyMaxMask) {
+                    return req.reject(400, `allowedMask (integer 0..${verifyMaxMask}) is required for predicate 'documentIntegrity'`);
                 }
-                allowedMask = data.allowedMask;
+                allowedMask = coerced;
             } else {
-                if (data.k === undefined || data.k === null || !Number.isInteger(data.k) || data.k < 1 || data.k > 16) {
-                    return req.reject(400, "k (integer 1..16) is required for predicate 'documentDiff'");
+                if (data.k === undefined || data.k === null || !Number.isInteger(data.k) || data.k < 1 || data.k > verifyWidth) {
+                    return req.reject(400, `k (integer 1..${verifyWidth}) is required for predicate 'documentDiff'`);
                 }
                 k = data.k;
             }
@@ -3478,6 +3516,7 @@ export function registerSubmissionHandlers(
                 payloadHashB,
                 allowedMask,
                 k,
+                slotWidth: vaultDims(compiledRef).width,
                 artifactPath: resolved.artifactPath,
                 contractProvidersConfig: contractProvidersConfigForNetwork(resolved.zkConfigPath, netParsed.network)
             });
@@ -3650,6 +3689,7 @@ export function registerSubmissionHandlers(
                 payloadHashB: docKind ? (row.payloadHashB || undefined) : undefined,
                 allowedMask: row.predicate === 'documentIntegrity' ? Number(row.allowedMask) : undefined,
                 k: row.predicate === 'documentDiff' ? Number(row.threshold) : undefined,
+                slotWidth: vaultDims(rowRef).width,
                 artifactPath: resolved.artifactPath,
                 contractProvidersConfig: contractProvidersConfigForNetwork(resolved.zkConfigPath, recordedNetwork)
             });

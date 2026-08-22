@@ -4,8 +4,9 @@
  *
  * `prepareDocumentProof` bridges "here is a document as structured fields"
  * to the fixed proof-input shapes of `issueFieldPredicateAttestation`:
- * canonical JSON -> payloadHash, ordered proof fields -> depth-4 Merkle
- * content root + per-field inclusion paths. Compute-only: nothing is
+ * canonical JSON -> payloadHash, ordered proof fields -> salted Merkle
+ * content root (depth log2(width): 4 on the 16-slot default, 5 on
+ * attestation-vault-32) + per-field inclusion paths. Compute-only: nothing is
  * persisted, no job is started, and the response carries witness material
  * (scaled values), so it is never logged.
  *
@@ -37,7 +38,7 @@ import { pathToFileURL } from 'node:url';
 import path from 'node:path';
 import { randomBytes } from 'node:crypto';
 import { RateLimiter } from '../utils/rate-limiter';
-import { getContractRegistration } from './contract-registry';
+import { getContractRegistration, slotWidthOf } from './contract-registry';
 import { blake2b256Hex, fromHex32, emptyLeafKeyHex } from './hashing';
 import { buildMembershipSet, membershipPathFor, canonicalSetDigests } from './set-root';
 
@@ -50,8 +51,17 @@ const log = cds.log('nightgate:document-proof');
 const HEX64_RE = /^[0-9a-fA-F]{64}$/;
 const DEFAULT_ATTESTATION_VAULT_REF = 'attestation-vault';
 
+// Classic 16-slot vault dimensions; kept exported for compatibility. The
+// tree builders below take an optional WIDTH (16/32) so wider vault variants
+// (`slotWidth` on the contract registration) reuse the same canonical rules.
 export const MERKLE_DEPTH = 4;
 export const MAX_PROOF_FIELDS = 1 << MERKLE_DEPTH; // 16
+
+/** Content-tree width (provable fields per document) of a registered artifact. */
+export function slotWidthForRef(compiledRef: string): number {
+    return slotWidthOf(getContractRegistration(compiledRef));
+}
+
 export const DEFAULT_VALUE_SCALE = 1000;
 const UINT64_MAX = 18446744073709551615n;
 
@@ -211,9 +221,9 @@ export interface DocumentOpeningWire {
  * presence; padding slots beyond the list use the canonical empty-leaf key
  * with kind 2 and scale 0.
  */
-export function computeSchemaDescriptors(specs: ProofFieldSpec[]): SchemaDescriptorWire[] {
+export function computeSchemaDescriptors(specs: ProofFieldSpec[], width: number = MAX_PROOF_FIELDS): SchemaDescriptorWire[] {
     const out: SchemaDescriptorWire[] = [];
-    for (let i = 0; i < MAX_PROOF_FIELDS; i++) {
+    for (let i = 0; i < width; i++) {
         const spec = i < specs.length ? specs[i] : undefined;
         if (!spec) {
             out.push({ fieldKey: emptyLeafKeyHex(), kind: 2, scale: '0' });
@@ -236,8 +246,8 @@ export function computeSchemaDescriptors(specs: ProofFieldSpec[]): SchemaDescrip
  * comparison circuit RECOMPUTES this root from witnessed descriptors, an
  * anchored schema id is proven to describe the tree, not merely claimed.
  */
-export function computeSchemaId(specs: ProofFieldSpec[], pure: PureCircuits): string {
-    const descriptors = computeSchemaDescriptors(specs);
+export function computeSchemaId(specs: ProofFieldSpec[], pure: PureCircuits, width: number = MAX_PROOF_FIELDS): string {
+    const descriptors = computeSchemaDescriptors(specs, width);
     let level = descriptors.map(d =>
         pure.descriptorLeafHash(fromHex32(d.fieldKey), BigInt(d.kind), BigInt(d.scale)));
     while (level.length > 1) {
@@ -274,17 +284,19 @@ export function buildDocumentContentRoot(
     document: Record<string, unknown>,
     specs: ProofFieldSpec[],
     pure: PureCircuits,
-    saltSeed: Uint8Array
+    saltSeed: Uint8Array,
+    width: number = MAX_PROOF_FIELDS
 ): BuiltContentRoot {
     if (!(saltSeed instanceof Uint8Array) || saltSeed.length !== 32) {
         throw new Error('saltSeed must be 32 bytes');
     }
-    const schema = computeSchemaDescriptors(specs);
+    const depth = Math.log2(width);
+    const schema = computeSchemaDescriptors(specs, width);
     type LeafValue = { kind: 'uint'; scaled: bigint } | { kind: 'bytes'; digest: string } | null;
     const leaves: Uint8Array[] = [];
     const salts: Uint8Array[] = [];
     const leafValues: LeafValue[] = [];
-    for (let i = 0; i < MAX_PROOF_FIELDS; i++) {
+    for (let i = 0; i < width; i++) {
         const spec = specs[i];
         const salt = pure.slotSalt(saltSeed, BigInt(i));
         salts.push(salt);
@@ -320,13 +332,13 @@ export function buildDocumentContentRoot(
     }
 
     const levels: Uint8Array[][] = [leaves];
-    for (let d = 0; d < MERKLE_DEPTH; d++) {
+    for (let d = 0; d < depth; d++) {
         const prev = levels[d];
         const next: Uint8Array[] = [];
         for (let i = 0; i < prev.length; i += 2) next.push(pure.nodeHash(prev[i], prev[i + 1]));
         levels.push(next);
     }
-    const contentRoot = Buffer.from(levels[MERKLE_DEPTH][0]).toString('hex');
+    const contentRoot = Buffer.from(levels[depth][0]).toString('hex');
 
     const fields: PreparedField[] = [];
     const emptyFields: string[] = [];
@@ -336,7 +348,7 @@ export function buildDocumentContentRoot(
         const siblings: string[] = [];
         const dirs: boolean[] = [];
         let node = idx;
-        for (let d = 0; d < MERKLE_DEPTH; d++) {
+        for (let d = 0; d < depth; d++) {
             const isLeft = node % 2 === 0;
             siblings.push(Buffer.from(levels[d][isLeft ? node + 1 : node - 1]).toString('hex'));
             dirs.push(isLeft);
@@ -363,7 +375,7 @@ export function buildDocumentContentRoot(
 
     const leafHexes = leaves.map(l => Buffer.from(l).toString('hex'));
     return {
-        contentRoot, schemaId: computeSchemaId(specs, pure), schema,
+        contentRoot, schemaId: computeSchemaId(specs, pure, width), schema,
         fields, emptyFields, leaves: leafHexes, opening
     };
 }
@@ -429,8 +441,12 @@ export function registerDocumentProofHandlers(srv: any, deps: DocumentProofHandl
         if (!Array.isArray(specs) || specs.length === 0) {
             return req.reject(400, 'proofFieldsJson must be a non-empty JSON array');
         }
-        if (specs.length > MAX_PROOF_FIELDS) {
-            return req.reject(400, `at most ${MAX_PROOF_FIELDS} proof fields (depth-${MERKLE_DEPTH} tree)`);
+        // Width comes from the target artifact's registration (slotWidth,
+        // default 16), so `attestation-vault-32` accepts up to 32 fields.
+        const widthRef = data.compiledArtifactRef?.length ? data.compiledArtifactRef : DEFAULT_ATTESTATION_VAULT_REF;
+        const slotWidth = slotWidthForRef(widthRef);
+        if (specs.length > slotWidth) {
+            return req.reject(400, `at most ${slotWidth} proof fields (depth-${Math.log2(slotWidth)} tree)`);
         }
         const seenFields = new Set<string>();
         for (let i = 0; i < specs.length; i++) {
@@ -451,7 +467,7 @@ export function registerDocumentProofHandlers(srv: any, deps: DocumentProofHandl
             }
         }
 
-        const compiledRef = data.compiledArtifactRef?.length ? data.compiledArtifactRef : DEFAULT_ATTESTATION_VAULT_REF;
+        const compiledRef = widthRef;
         let pure: PureCircuits;
         try {
             pure = await loadPure(compiledRef);
@@ -470,7 +486,7 @@ export function registerDocumentProofHandlers(srv: any, deps: DocumentProofHandl
             : randomBytes(32);
         let built: BuiltContentRoot;
         try {
-            built = buildDocumentContentRoot(document, specs, pure, saltSeed);
+            built = buildDocumentContentRoot(document, specs, pure, saltSeed, slotWidth);
         } catch (err) {
             return req.reject(400, (err as Error).message);
         }

@@ -103,9 +103,16 @@ export function buildProofProvider(input: {
 
 export interface PreparedCall {
     circuitId: string;
-    /** boolean[] carries the cross-root integrity circuit's Vector<16, Boolean> mask arg. */
+    /** boolean[] carries the cross-root integrity circuit's Vector<width, Boolean> mask arg. */
     args: Array<Uint8Array | bigint | boolean[]>;
     witnesses: AttestationVaultWitnesses;
+    /**
+     * The proof-prepare helpers pass their inputs through so a batch caller
+     * can rebind the SAME call bundle (e.g. into a shared witness holder).
+     */
+    merkleProof?: import('./witnesses.js').MerkleProof;
+    /** Slot width the call was prepared for (16 default, 32 for attestation-vault-32). */
+    slotWidth?: number;
 }
 export function prepareRevokeDisclosure(input: { payloadHash: string; grantee: string; attestationSecret: Uint8Array }): PreparedCall;
 export function prepareGrantDisclosure(input: { payloadHash: string; grantee: string; level: number | bigint; attestationSecret: Uint8Array }): PreparedCall;
@@ -115,11 +122,11 @@ export function prepareAttestReveal(input: { payloadHash: string; metadataHash: 
 export function prepareRegisterPassport(input: { passportId: string; ownerId: string; attestationSecret: Uint8Array }): PreparedCall;
 export function prepareBindPassport(input: { passportId: string; payloadHash: string; attestationSecret: Uint8Array }): PreparedCall;
 export function prepareAnchorContentRoot(input: { payloadHash: string; contentRoot: string; schemaId: string; attestationSecret: Uint8Array }): PreparedCall;
-export function prepareProveFieldPredicate(input: { payloadHash: string; fieldKey: string; threshold: number | bigint; op: number | bigint; merkleProof: import('./witnesses.js').MerkleProof; attestationSecret?: Uint8Array }): PreparedCall;
-export function prepareProveFieldEquality(input: { payloadHash: string; fieldKey: string; expectedDigest: string; merkleProof: import('./witnesses.js').MerkleProof; attestationSecret?: Uint8Array }): PreparedCall;
-export function prepareProveFieldMembership(input: { payloadHash: string; fieldKey: string; setRoot: string; merkleProof: import('./witnesses.js').MerkleProof; attestationSecret?: Uint8Array }): PreparedCall;
-export function prepareProveFieldsUnchangedExcept(input: { payloadHashA: string; payloadHashB: string; allowedMask: number; docPair: import('./witnesses.js').DocPair; attestationSecret?: Uint8Array }): PreparedCall;
-export function prepareProveFieldsDiffer(input: { payloadHashA: string; payloadHashB: string; k: number; docPair: import('./witnesses.js').DocPair; attestationSecret?: Uint8Array }): PreparedCall;
+export function prepareProveFieldPredicate(input: { payloadHash: string; fieldKey: string; threshold: number | bigint; op: number | bigint; merkleProof: import('./witnesses.js').MerkleProof; attestationSecret?: Uint8Array; slotWidth?: number }): PreparedCall;
+export function prepareProveFieldEquality(input: { payloadHash: string; fieldKey: string; expectedDigest: string; merkleProof: import('./witnesses.js').MerkleProof; attestationSecret?: Uint8Array; slotWidth?: number }): PreparedCall;
+export function prepareProveFieldMembership(input: { payloadHash: string; fieldKey: string; setRoot: string; merkleProof: import('./witnesses.js').MerkleProof; attestationSecret?: Uint8Array; slotWidth?: number }): PreparedCall;
+export function prepareProveFieldsUnchangedExcept(input: { payloadHashA: string; payloadHashB: string; allowedMask: number; docPair: import('./witnesses.js').DocPair; attestationSecret?: Uint8Array; slotWidth?: number }): PreparedCall;
+export function prepareProveFieldsDiffer(input: { payloadHashA: string; payloadHashB: string; k: number; docPair: import('./witnesses.js').DocPair; attestationSecret?: Uint8Array; slotWidth?: number }): PreparedCall;
 
 export interface ContractBrowserMeta {
     name: string;
@@ -131,6 +138,10 @@ export interface ContractBrowserMeta {
     /** Circuits requiring the per-call Merkle inclusion proof witnesses. */
     merkleWitnessed?: string[];
     hasPrivateState: boolean;
+    /** Content-tree width: provable fields per document (16 default, 32 on attestation-vault-32). */
+    slotWidth: number;
+    /** Inclusion-path depth, log2(slotWidth). */
+    merkleDepth: number;
 }
 
 export const CONTRACTS: Record<string, ContractBrowserMeta>;

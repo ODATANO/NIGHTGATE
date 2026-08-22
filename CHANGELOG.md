@@ -1,5 +1,57 @@
 # Changelog
 
+## 0.19.0 - 2026-08-22
+
+A 32-slot vault lineage and multi-call batches in the txbuilder SDK. No
+change to the existing 16-slot vault: deployed contracts, claim keys and
+byte layouts stay identical, nothing to redeploy.
+
+- **`attestation-vault-32`, a second registered contract lineage** with 32
+  content slots: documents up to 32 fields, k-of-32 diff proofs, 32-bit
+  integrity masks. Registered contracts carry a `slotWidth` attribute
+  (default 16) and the whole surface is width-parameterized from it
+  (document proofs, witnesses, mask/k/path validation, predicate-state
+  recompute, browser helpers via the new `./browser/attestation-vault-32`
+  subpath, `/zk-config` + contract manifest). Cross-root proofs work only
+  between documents of the SAME width; the width is part of the tree shape.
+  Cost is honest: the 32er prover set ships in the package (+114 MB; the
+  comparison prover alone is 72.9 MB and proves in ~443 s wasm / ~92 s on a
+  proof server, the content-tree circuits grow with the deeper fold, the
+  attest/anchor/grant circuits are byte-identical). Measured 8/16/32/64 before
+  choosing: keys scale linearly with width, wasm proving hits its 4 GB
+  ceiling at 64, so 16/32 is the supported menu (the registry accepts
+  8/16/32 and rejects 64: the mask path is 32-bit). A non-default width is
+  part of the artifact GENERATION digest: re-pointing a registered alias to
+  a different width trips the same fail-closed guard as swapping the
+  artifact bytes, while width-16 digests recorded by earlier releases stay
+  valid (the default adds no digest section).
+- **txbuilder multi-call batch**: `buildSponsorable({ calls: [...] })` puts
+  up to 8 circuit calls into ONE transaction (one fee, one sponsoring),
+  with the same deterministic segment ordering and pre-proving causality
+  fail-fast as the server lane (`BatchCausalityViolation`, no fee burned).
+  Same-name circuit calls are grouped but unordered among themselves. The
+  durable batch shape on a grown contract is the proof cart (anchor first,
+  then proofs); attest+anchor pairs stay legal only on young vaults.
+  `@odatano/nightgate-tx` 0.3.0 ships the same txbuilder (including the
+  batch) and exports the 32er contract module as `./attestation-vault-32`
+  (keys come from `/zk-config` as before).
+- **`allowedMask` is now `Integer64`** (entity column, action parameter and
+  the verify projections): a 32-bit mask with bit 31 set overflows a signed
+  Int32 column (PostgreSQL/HANA) and `Edm.Int32` clients. OData serializes
+  the value as a STRING now (IEEE754-compatible Int64 handling); the server
+  accepts both number and string. SQLite stores dynamically, so existing
+  dev databases need no migration; on typed databases redeploy the schema.
+- **Submit-race lore measured, docs corrected**: node reject `1010/104` is
+  the guaranteed-phase state conflict, rejected PRE-mempool with the fee
+  unspent; the cure is REBUILDING against fresh state (resubmitting the
+  identical bytes sticks). `CHAIN_EXECUTION_FAILED` is the fee-spending
+  fallible-phase flavor of the same conflict. `docs/txbuilder.md` and
+  `docs/actions.md` carry the operational guidance (verify per claim,
+  independent verification without NIGHTGATE, schema-id/segment caveat,
+  attest concurrency warning).
+- **`npm run check:server`**: one-shot health probe of a running server
+  (health, readiness, optional sponsor dust/balance/sync), local or hosted.
+
 ## 0.18.0 - 2026-08-19
 
 Parallel fee sponsoring from ONE sponsor wallet; no circuit change, no vault

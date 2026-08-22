@@ -417,7 +417,7 @@ entity PredicateAttestations : cuid, managed {
     expectedDigest  : HexEncoded; // bytesEquality: public expected value digest
     setRoot         : HexEncoded; // setMembership: canonical allow-list set root
     payloadHashB    : HexEncoded; // cross-root kinds: the second document (payloadHash is document A)
-    allowedMask     : Integer; // documentIntegrity: packed 16-bit mask (bit i = slot i may differ)
+    allowedMask     : Integer64; // documentIntegrity: packed slot mask, width bits (bit i = slot i may differ); Integer64 because a 32-bit mask with bit 31 set overflows a signed Int32 column
     provenTxHash    : HexEncoded; // tx that recorded the on-chain result
     provenAt        : Timestamp;
     // Evidence provenance (0.16.0): the proving context. The crawler-free

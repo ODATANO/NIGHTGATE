@@ -125,6 +125,22 @@ describe('artifact generation digest', () => {
         expect(getArtifactGenerationDigest('gen')).not.toBe(asVault);
     });
 
+    test('slotWidth is part of the generation (same files, different width -> different digest)', () => {
+        // The width changes path depth and integrity claim-key semantics, so
+        // an alias re-pointed to a different width must trip the guard.
+        registerContract('gen', VAULT);
+        const as16 = getArtifactGenerationDigest('gen');
+        registerContract('gen', { ...VAULT, slotWidth: 32 });
+        expect(getArtifactGenerationDigest('gen')).not.toBe(as16);
+    });
+
+    test('explicit slotWidth 16 digests identically to the implicit default (earlier releases stay valid)', () => {
+        registerContract('gen', VAULT);
+        const implicit = getArtifactGenerationDigest('gen');
+        registerContract('gen', { ...VAULT, slotWidth: 16 });
+        expect(getArtifactGenerationDigest('gen')).toBe(implicit);
+    });
+
     test('proving assets are part of the generation (same module/id, different zkConfigPath -> different digest)', () => {
         registerContract('gen', VAULT);
         const withAssets = getArtifactGenerationDigest('gen');

@@ -145,15 +145,17 @@ export async function openAttestationSecret(sealed, unlockMaterial) {
  * Witness signature matches the generated `Witnesses<PS>`:
  *   local_secret_key(ctx): [PS, Uint8Array]
  *   field_value(ctx):      [PS, bigint]
- *   merkle_siblings(ctx):  [PS, Uint8Array[]]   (DEPTH=4 × Bytes<32>)
- *   merkle_dirs(ctx):      [PS, boolean[]]      (DEPTH=4)
+ *   merkle_siblings(ctx):  [PS, Uint8Array[]]   (log2(slotWidth) × Bytes<32>; 4 on the 16er, 5 on the 32er)
+ *   merkle_dirs(ctx):      [PS, boolean[]]      (log2(slotWidth))
  * `ctx.privateState` is passed through unchanged; the vault has no private state.
  *
  * `merkleProof` is a per-call proof BUNDLE for the field-bound proof circuits:
- * { fieldValue?, fieldSalt?, fieldDigest?, siblings?: string[4] hex,
- *   dirs?: boolean[4], setProof?: { siblings: string[6] hex, dirs: boolean[6] },
- *   docPair?: { schema: descriptor[16], openingA: { saltSeed, slots[16] },
- *               openingB: { saltSeed, slots[16] } } }.
+ * { fieldValue?, fieldSalt?, fieldDigest?, siblings?: string[depth] hex,
+ *   dirs?: boolean[depth], setProof?: { siblings: string[6] hex, dirs: boolean[6] },
+ *   docPair?: { schema: descriptor[width], openingA: { saltSeed, slots[width] },
+ *               openingB: { saltSeed, slots[width] } } }
+ * where width comes from `slotWidth` (16 default, 32 for attestation-vault-32)
+ * and depth = log2(width).
  * `fieldValue` + `fieldSalt` feed proveFieldPredicate, `fieldDigest` +
  * `fieldSalt` + `setProof` feed proveFieldMembership; proveFieldEquality
  * needs `fieldSalt` + siblings/dirs; the mode-switched cross-root circuit
@@ -169,16 +171,18 @@ export async function openAttestationSecret(sealed, unlockMaterial) {
  * serves N proof calls inside one transaction scope. Mirrors the server's
  * `WitnessFactoryInput`.
  */
-const MERKLE_DEPTH = 4;
+// Classic 16-slot default; every decode takes the per-artifact slot count
+// (`slotWidth` on buildAttestationVaultWitnesses: 16 default, 32 for the
+// attestation-vault-32 width variant) and derives depth = log2(width).
 const SET_DEPTH = 6;
 const SLOT_COUNT = 16;
 
 const ZERO32 = new Uint8Array(32);
 
-function decodeSchema(schema, label) {
+function decodeSchema(schema, label, slotCount = SLOT_COUNT) {
     if (schema === undefined) return undefined;
-    if (!Array.isArray(schema) || schema.length !== SLOT_COUNT) {
-        throw new Error(`${label} must have exactly ${SLOT_COUNT} entries`);
+    if (!Array.isArray(schema) || schema.length !== slotCount) {
+        throw new Error(`${label} must have exactly ${slotCount} entries`);
     }
     return schema.map((d, i) => {
         const kind = BigInt(d.kind);
@@ -187,10 +191,10 @@ function decodeSchema(schema, label) {
     });
 }
 
-function decodeOpening(opening, label) {
+function decodeOpening(opening, label, slotCount = SLOT_COUNT) {
     if (opening === undefined) return undefined;
-    if (!Array.isArray(opening.slots) || opening.slots.length !== SLOT_COUNT) {
-        throw new Error(`${label}.slots must have exactly ${SLOT_COUNT} entries`);
+    if (!Array.isArray(opening.slots) || opening.slots.length !== slotCount) {
+        throw new Error(`${label}.slots must have exactly ${slotCount} entries`);
     }
     return {
         seed: hexToBytes32(opening.saltSeed),
@@ -202,7 +206,8 @@ function decodeOpening(opening, label) {
     };
 }
 
-function decodeMerkleProof(proof) {
+function decodeMerkleProof(proof, slotCount = SLOT_COUNT) {
+    const depth = Math.log2(slotCount);
     const fieldValue = proof.fieldValue !== undefined ? BigInt(proof.fieldValue) : undefined;
     const fieldSalt = proof.fieldSalt !== undefined ? hexToBytes32(proof.fieldSalt) : undefined;
     const fieldDigest = proof.fieldDigest !== undefined ? hexToBytes32(proof.fieldDigest) : undefined;
@@ -213,8 +218,8 @@ function decodeMerkleProof(proof) {
     if (proof.siblings !== undefined || proof.dirs !== undefined || !proof.docPair) {
         siblings = (proof.siblings || []).map(hexToBytes32);
         dirs = (proof.dirs || []).map(Boolean);
-        if (siblings.length !== MERKLE_DEPTH || dirs.length !== MERKLE_DEPTH) {
-            throw new Error(`merkleProof.siblings and .dirs must each have ${MERKLE_DEPTH} entries`);
+        if (siblings.length !== depth || dirs.length !== depth) {
+            throw new Error(`merkleProof.siblings and .dirs must each have ${depth} entries`);
         }
     }
     let setSiblings;
@@ -226,9 +231,9 @@ function decodeMerkleProof(proof) {
             throw new Error(`merkleProof.setProof.siblings and .dirs must each have ${SET_DEPTH} entries`);
         }
     }
-    const docSchema = decodeSchema(proof.docPair?.schema, 'merkleProof.docPair.schema');
-    const openingA = decodeOpening(proof.docPair?.openingA, 'merkleProof.docPair.openingA');
-    const openingB = decodeOpening(proof.docPair?.openingB, 'merkleProof.docPair.openingB');
+    const docSchema = decodeSchema(proof.docPair?.schema, 'merkleProof.docPair.schema', slotCount);
+    const openingA = decodeOpening(proof.docPair?.openingA, 'merkleProof.docPair.openingA', slotCount);
+    const openingB = decodeOpening(proof.docPair?.openingB, 'merkleProof.docPair.openingB', slotCount);
     if (proof.docPair && (docSchema === undefined || openingA === undefined || openingB === undefined)) {
         throw new Error('merkleProof.docPair requires schema, openingA and openingB');
     }
@@ -239,7 +244,7 @@ function decodeMerkleProof(proof) {
     };
 }
 
-export function buildAttestationVaultWitnesses({ attestationSecret, merkleProof, merkleProofHolder } = {}) {
+export function buildAttestationVaultWitnesses({ attestationSecret, merkleProof, merkleProofHolder, slotWidth } = {}) {
     // OPTIONAL (holder/attester separation): the proof circuits
     // (proveFieldPredicate/Equality/Membership, proveDocumentComparison) never
     // invoke local_secret_key, so a holder proving against an anchored root
@@ -253,14 +258,15 @@ export function buildAttestationVaultWitnesses({ attestationSecret, merkleProof,
     if (merkleProof && merkleProofHolder) {
         throw new Error('merkleProof and merkleProofHolder are mutually exclusive');
     }
-    const staticProof = merkleProof ? decodeMerkleProof(merkleProof) : undefined;
+    const slotCount = slotWidth ?? SLOT_COUNT;
+    const staticProof = merkleProof ? decodeMerkleProof(merkleProof, slotCount) : undefined;
     const holder = merkleProofHolder;
     const currentProof = (witnessName) => {
         if (holder) {
             if (!holder.current) {
                 throw new Error(`${witnessName} witness invoked with an empty batch proof holder; set holder.current before the call`);
             }
-            return decodeMerkleProof(holder.current);
+            return decodeMerkleProof(holder.current, slotCount);
         }
         if (staticProof === undefined) {
             throw new Error(`${witnessName} witness invoked without a merkleProof; the field-bound proof circuits require a proof bundle`);

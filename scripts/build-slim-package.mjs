@@ -23,6 +23,7 @@ import { fileURLToPath } from 'node:url';
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 const OUT = join(ROOT, 'packages', 'nightgate-tx');
 const VAULT = 'contracts/attestation-vault/src/managed/attestation-vault';
+const VAULT32 = 'contracts/attestation-vault-32/src/managed/attestation-vault-32';
 
 /**
  * Everything the slim package ships, as repo-relative paths. `required: false`
@@ -52,6 +53,12 @@ const FILES = [
     { path: 'srv/utils/wallet-hd.d.ts', buildOutput: true },
     { path: 'srv/midnight/wasm-proof-provider.js', buildOutput: true },
     { path: 'srv/midnight/wasm-proof-provider.d.ts', buildOutput: true },
+    // Batch path (0.19): buildSponsorable({ calls }) requires the scope +
+    // segment-order helpers (dependency-clean, no CAP, no worker).
+    { path: 'srv/midnight/batch-call-scope.js', buildOutput: true },
+    { path: 'srv/midnight/batch-call-scope.d.ts', buildOutput: true },
+    { path: 'srv/midnight/batch-segment-order.js', buildOutput: true },
+    { path: 'srv/midnight/batch-segment-order.d.ts', buildOutput: true },
     // the canonical membership-set rule (already a public subpath of the main
     // package); both are @noble/hashes only, no CAP, no registry.
     { path: 'srv/submission/set-root.js', buildOutput: true },
@@ -62,6 +69,9 @@ const FILES = [
     // builder fetches from the sponsor's /zk-config, generation-pinned.
     { path: `${VAULT}/contract/index.js` },
     { path: `${VAULT}/contract/index.d.ts` },
+    // 32-slot width variant (0.19): same rule, module only, keys via /zk-config.
+    { path: `${VAULT32}/contract/index.js` },
+    { path: `${VAULT32}/contract/index.d.ts` },
     { path: 'LICENSE' }
 ];
 
@@ -124,14 +134,16 @@ async function main() {
     // decides that per nearest package.json, so the contract tree needs its own
     // `"type": "module"` marker (the main package ships the contract's real
     // package.json for exactly this reason).
-    const marker = join(OUT, 'contracts', 'attestation-vault', 'package.json');
-    await mkdir(dirname(marker), { recursive: true });
-    await writeFile(marker, JSON.stringify({
-        name: '@odatano/nightgate-tx-contract-attestation-vault',
-        type: 'module',
-        main: 'src/managed/attestation-vault/contract/index.js'
-    }, null, 4) + String.fromCharCode(10));
-    copied++;
+    for (const vault of ['attestation-vault', 'attestation-vault-32']) {
+        const marker = join(OUT, 'contracts', vault, 'package.json');
+        await mkdir(dirname(marker), { recursive: true });
+        await writeFile(marker, JSON.stringify({
+            name: `@odatano/nightgate-tx-contract-${vault}`,
+            type: 'module',
+            main: `src/managed/${vault}/contract/index.js`
+        }, null, 4) + String.fromCharCode(10));
+        copied++;
+    }
 
     if (missingBuildOutput.length) {
         throw new Error(

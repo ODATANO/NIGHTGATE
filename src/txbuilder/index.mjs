@@ -327,20 +327,63 @@ export async function createTxBuilder(opts) {
         addresses: { night: unshielded.PublicKey.fromKeyStore(keystore).address },
 
         /**
-         * Build + prove + sign + finalize ONE circuit call, WITHOUT submitting.
-         * Hand `finalizedTxB64` to a sponsor endpoint, which pays the dust and
-         * submits. The attestation carries your attester id, not the sponsor's.
+         * Build + prove + sign + finalize one transaction WITHOUT submitting:
+         * ONE circuit call (`call`) or a BATCH of up to 8 calls (`calls`) in
+         * ONE transaction (one balancing round, one fee event; segment order
+         * = call order, fail-closed, with the 0.16.3 causality pre-check
+         * aborting BEFORE proving). Hand the result to a sponsor endpoint,
+         * which pays the dust and submits.
          *
-         * @param {{ contractAddress: string, call: { circuitId: string, args: unknown[], witnesses: object }, initialPrivateState?: unknown }} input
+         * Batch witnesses: the per-call `witnesses` objects are IGNORED for a
+         * batch; ONE shared witnesses object (built from this builder's
+         * attestation secret, override via `attestationSecret`) serves all
+         * calls through a proof holder that swaps each call's `merkleProof`
+         * bundle (the `prepare*` helpers return it since 0.19) immediately
+         * before the call. Prepare every batched call with the SAME secret.
+         * A batch containing a value-moving call refuses `bind: false`.
+         *
+         * @param {{ contractAddress: string, call?: { circuitId: string, args: unknown[], witnesses: object }, calls?: Array<{ circuitId: string, args: unknown[], merkleProof?: object, slotWidth?: number }>, initialPrivateState?: unknown, bind?: boolean, attestationSecret?: Uint8Array }} input
          * @returns {Promise<{ finalizedTxB64: string, serializedBytes: number }>}
          */
-        async buildSponsorable({ contractAddress, call, initialPrivateState, bind = true }) {
+        async buildSponsorable({ contractAddress, call, calls, initialPrivateState, bind = true, attestationSecret: batchSecret }) {
             if (!contractAddress) throw new Error('buildSponsorable: contractAddress is required');
-            if (!call?.circuitId) throw new Error('buildSponsorable: call must come from a prepare* helper');
-            onProgress?.({ phase: 'build', circuit: call.circuitId });
+            if (call && calls) throw new Error('buildSponsorable: pass either call or calls, not both');
+            const callList = calls ?? (call ? [call] : []);
+            if (!Array.isArray(callList) || callList.length === 0) {
+                throw new Error('buildSponsorable: call (or a non-empty calls array) is required');
+            }
+            if (callList.length > 8) throw new Error('buildSponsorable: calls supports at most 8 entries per batch');
+            for (const c of callList) {
+                if (!c?.circuitId) throw new Error('buildSponsorable: every call must come from a prepare* helper');
+            }
+            const isBatch = callList.length > 1;
+            onProgress?.({ phase: 'build', circuit: callList.map(c => c.circuitId).join('+') });
+
+            let witnesses;
+            let scopeCalls;
+            if (isBatch) {
+                const widths = [...new Set(callList.map(c => c.slotWidth).filter(w => w !== undefined))];
+                if (widths.length > 1) throw new Error(`buildSponsorable: batched calls target different slot widths (${widths.join(', ')})`);
+                const { buildAttestationVaultWitnesses } = await import('../browser/witnesses.mjs');
+                const proofHolder = {};
+                witnesses = buildAttestationVaultWitnesses({
+                    attestationSecret: batchSecret ?? attestationSecret,
+                    merkleProofHolder: proofHolder,
+                    ...(widths.length === 1 ? { slotWidth: widths[0] } : {})
+                });
+                // EVERY call gets a hook: a proof-less call clears the holder
+                // instead of inheriting its predecessor's bundle.
+                scopeCalls = callList.map(c => ({
+                    circuit: c.circuitId,
+                    args: c.args ?? [],
+                    before: () => { proofHolder.current = c.merkleProof; }
+                }));
+            } else {
+                witnesses = callList[0].witnesses;
+            }
 
             const compiled = CompiledContract.make(contractName, contractClass).pipe(
-                CompiledContract.withWitnesses(call.witnesses),
+                CompiledContract.withWitnesses(witnesses),
                 CompiledContract.withCompiledFileAssets(cacheDir)
             );
             const holder = {};
@@ -361,17 +404,37 @@ export async function createTxBuilder(opts) {
                 privateStateId,
                 initialPrivateState: initialPrivateState ?? {}
             });
-            const fn = found?.callTx?.[call.circuitId];
-            if (typeof fn !== 'function') {
-                throw new Error("circuit '" + call.circuitId + "' is not on the contract at " + contractAddress);
-            }
 
-            // The build-only provider stops at submit; the SDK wraps that error,
-            // so only an EMPTY holder means a real build failure.
-            try {
-                await fn(...(call.args ?? []));
-            } catch (e) {
-                if (!holder.captured) throw e;
+            if (isBatch) {
+                // One merged, segment-ordered, causality-checked transaction.
+                // The build-only provider throws at submit; only an EMPTY
+                // capture holder means a real build failure. The causality
+                // pre-check aborts BEFORE proving; surface it with the same
+                // stable code the server uses (the SDK's scope wrapper
+                // discards the error NAME, so match the message).
+                const { runBatchInScope } = require('../../srv/midnight/batch-call-scope.js');
+                try {
+                    await runBatchInScope(contracts, providers, found, scopeCalls, contractAddress);
+                } catch (e) {
+                    if (/violates the ledger's causality constraint/.test(String(e?.message ?? e))) {
+                        try { e.code = 'BatchCausalityViolation'; } catch { /* frozen error */ }
+                        throw e;
+                    }
+                    if (!holder.captured) throw e;
+                }
+            } else {
+                const single = callList[0];
+                const fn = found?.callTx?.[single.circuitId];
+                if (typeof fn !== 'function') {
+                    throw new Error("circuit '" + single.circuitId + "' is not on the contract at " + contractAddress);
+                }
+                // The build-only provider stops at submit; the SDK wraps that error,
+                // so only an EMPTY holder means a real build failure.
+                try {
+                    await fn(...(single.args ?? []));
+                } catch (e) {
+                    if (!holder.captured) throw e;
+                }
             }
             if (!holder.captured?.serialize) throw new Error('build produced no serializable transaction');
             const bytes = new Uint8Array(holder.captured.serialize());

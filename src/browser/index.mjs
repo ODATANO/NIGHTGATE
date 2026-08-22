@@ -54,6 +54,24 @@ export const CONTRACTS = {
         // (proveFieldEquality: path only; proveFieldMembership: digest + set
         // path; proveDocumentComparison: docPair leaf layers).
         merkleWitnessed: ['proveFieldPredicate', 'proveFieldEquality', 'proveFieldMembership', 'proveDocumentComparison'],
-        hasPrivateState: false
+        hasPrivateState: false,
+        // Content-tree dimensions: provable fields per document and the
+        // inclusion-path depth. Pass `slotWidth` to the prepare* helpers /
+        // buildAttestationVaultWitnesses when targeting a non-16 variant.
+        slotWidth: 16,
+        merkleDepth: 4
+    },
+    // 32-slot width variant: same circuit set and semantics, tree width 32
+    // (panels of 17-32 provable fields under ONE root). Cross-root proofs
+    // only work between documents of the SAME width.
+    'attestation-vault-32': {
+        name: 'attestation-vault-32',
+        artifactSubpath: '@odatano/nightgate/browser/attestation-vault-32',
+        circuits: ['attest', 'attestGuarded', 'grantDisclosure', 'revokeDisclosure', 'registerPassport', 'bindPassport', 'anchorContentRoot', 'proveFieldPredicate', 'proveFieldEquality', 'proveFieldMembership', 'proveDocumentComparison'],
+        attesterGated: ['attest', 'attestGuarded', 'grantDisclosure', 'revokeDisclosure', 'registerPassport', 'bindPassport', 'anchorContentRoot'],
+        merkleWitnessed: ['proveFieldPredicate', 'proveFieldEquality', 'proveFieldMembership', 'proveDocumentComparison'],
+        hasPrivateState: false,
+        slotWidth: 32,
+        merkleDepth: 5
     }
 };

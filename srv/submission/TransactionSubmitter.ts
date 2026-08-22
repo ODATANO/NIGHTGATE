@@ -74,6 +74,8 @@ export interface ContractRegistrationMeta {
     artifactPath:   string;
     privateStateId: string;
     zkConfigPath:   string;
+    /** Content-tree width of a vault-family artifact (16 default, 32 for attestation-vault-32). */
+    slotWidth?:     number;
 }
 
 export interface DeployArgs<PS = unknown> {

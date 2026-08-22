@@ -110,11 +110,29 @@ if (tracked) {
 //     consumer must be able to diff source against the compiled circuits).
 for (const required of [
     'scripts/apply-schema-delta.mjs',
-    'contracts/attestation-vault/src/attestation-vault.compact'
+    'contracts/attestation-vault/src/attestation-vault.compact',
+    'contracts/attestation-vault-32/src/attestation-vault-32.compact',
+    'contracts/attestation-vault-32/src/managed/attestation-vault-32/keys/proveDocumentComparison.prover'
 ]) {
     if (!packed.has(required)) {
         console.error(`check-package-exports: '${required}' is NOT in the tarball (files allowlist).`);
         failed = true;
+    }
+}
+
+// Only the four shipped contracts may pack. Anything else under a
+// contracts/<dir>/ (a local experiment, a stray artifact) would silently
+// add prover keys to every install: the 8/64-slot width prototypes alone
+// were ~240 MB. Files directly under contracts/ (README.md) are npm's own
+// business, not a contract tree.
+const SHIPPED_CONTRACTS = ['counter', 'attestation-vault', 'attestation-vault-32', 'shielded-token'];
+for (const packedFile of packed) {
+    const segments = packedFile.split('/');
+    if (segments[0] !== 'contracts' || segments.length < 3) continue;
+    if (!SHIPPED_CONTRACTS.includes(segments[1])) {
+        console.error(`check-package-exports: unexpected contract file '${packedFile}' in the tarball.`);
+        failed = true;
+        break;
     }
 }
 

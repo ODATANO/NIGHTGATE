@@ -40,6 +40,14 @@ export interface NightgatePluginConfig {
         privateStateId: string;
         zkConfigPath: string;
         /**
+         * Content-tree width for attestation-vault-family artifacts (provable
+         * fields per document). Default 16; `attestation-vault-32` registers
+         * with 32; accepted values are 8, 16 and 32 (64 is measured but the
+         * mask path would need BigInt first). Must match the compiled
+         * artifact's witness vector shapes.
+         */
+        slotWidth?: number;
+        /**
          * Optional canonical deployed address(es) for this contract, advertised
          * in `GET /contract-manifest` so connector consumers can self-configure.
          * NIGHTGATE does not require it; the deployed address is otherwise

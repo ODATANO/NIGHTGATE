@@ -216,14 +216,18 @@ export async function computeFieldMembershipClaimKey(
 }
 
 /**
- * Expand a packed 16-bit allowed mask (bit i = slot i may differ) into the
- * boolean vector the circuit takes. Exported for the handlers and tests.
+ * Expand a packed allowed mask (bit i = slot i may differ) into the boolean
+ * vector the circuit takes. `width` is the artifact's slot count (16 for the
+ * classic vault, 32 for `attestation-vault-32`); the mask must fit in it.
+ * Exported for the handlers and tests. JS bitwise operators are exact for
+ * bits 0..31, so widths up to 32 are safe on a Number mask.
  */
-export function expandAllowedMask(mask: number): boolean[] {
-    if (!Number.isInteger(mask) || mask < 0 || mask > 0xffff) {
-        throw new Error('allowedMask must be an integer in 0..65535');
+export function expandAllowedMask(mask: number, width: number = 16): boolean[] {
+    const maxMask = width === 32 ? 0xffffffff : (1 << width) - 1;
+    if (!Number.isInteger(mask) || mask < 0 || mask > maxMask) {
+        throw new Error(`allowedMask must be an integer in 0..${maxMask}`);
     }
-    return Array.from({ length: 16 }, (_, i) => (mask & (1 << i)) !== 0);
+    return Array.from({ length: width }, (_, i) => (mask & (1 << i)) !== 0);
 }
 
 /**
@@ -238,12 +242,15 @@ export async function computeDocumentIntegrityClaimKey(
     payloadHashB: string,
     allowedMask: number,
     epochA: bigint,
-    epochB: bigint
+    epochB: bigint,
+    width: number = 16
 ): Promise<string> {
     const rt: any = await import('@midnight-ntwrk/compact-runtime');
     const dBytes32 = new rt.CompactTypeBytes(32);
     const dU64 = new rt.CompactTypeUnsignedInteger(18446744073709551615n, 8);
-    const dMask = new rt.CompactTypeVector(16, rt.CompactTypeBoolean);
+    // The mask member's width is part of the claim identity: a 32-slot
+    // artifact's DocumentIntegrityClaim hashes a Vector<32, Boolean>.
+    const dMask = new rt.CompactTypeVector(width, rt.CompactTypeBoolean);
     const integrityClaimType = {
         alignment() {
             return dBytes32.alignment().concat(dBytes32.alignment().concat(dMask.alignment().concat(dU64.alignment().concat(dU64.alignment()))));
@@ -256,7 +263,7 @@ export async function computeDocumentIntegrityClaimKey(
     const digest: Uint8Array = rt.persistentHash(integrityClaimType, {
         payload_hash_a: hexToBytes(payloadHashA),
         payload_hash_b: hexToBytes(payloadHashB),
-        allowed_mask: expandAllowedMask(allowedMask),
+        allowed_mask: expandAllowedMask(allowedMask, width),
         epoch_a: epochA,
         epoch_b: epochB
     });
@@ -312,10 +319,16 @@ export interface ReadPredicateStateForContractArgs {
     setRoot?: string;
     /** Cross-root claims: the second document's payload hash. */
     payloadHashB?: string;
-    /** Document-integrity claim: packed 16-bit allowed mask (with payloadHashB). */
+    /** Document-integrity claim: packed allowed mask (with payloadHashB), width bits. */
     allowedMask?: number;
     /** Document-diff claim: minimum differing slot count (with payloadHashB). */
     k?: number;
+    /**
+     * Content-tree width of the artifact (16 default, 32 for
+     * `attestation-vault-32`). Only the integrity claim key depends on it
+     * (its mask member is a Vector<width, Boolean>).
+     */
+    slotWidth?: number;
     /** Path to the compiled contract artifact (`.../contract/index.js`). */
     artifactPath: string;
     /** Config for the contract-only provider bundle (no wallet needed to read). */
@@ -363,7 +376,7 @@ export async function readPredicateStateForContract(
         const epochB = epochOf(args.payloadHashB!);
         if (epochB === null) return false;
         if (kind === 'integrity') {
-            claimKey = await computeDocumentIntegrityClaimKey(args.payloadHash, args.payloadHashB!, args.allowedMask!, epochA, epochB);
+            claimKey = await computeDocumentIntegrityClaimKey(args.payloadHash, args.payloadHashB!, args.allowedMask!, epochA, epochB, args.slotWidth ?? 16);
         } else {
             if (args.k === undefined) throw new Error('k is required for a document-diff claim');
             claimKey = await computeDocumentDiffClaimKey(args.payloadHash, args.payloadHashB!, args.k, epochA, epochB);

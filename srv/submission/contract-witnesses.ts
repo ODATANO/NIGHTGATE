@@ -50,6 +50,14 @@ export interface WitnessFactoryInput {
     merkleProofHolder?: {
         current?: MerkleProofBundle;
     };
+    /**
+     * Content-tree width of the target artifact (provable fields per
+     * document): 16 for the classic vault (default), 32 for
+     * `attestation-vault-32`. Sizes every width-dependent decode check
+     * (schema/opening slot counts, inclusion-path depth = log2(width)).
+     * Comes from the contract registration's `slotWidth`.
+     */
+    slotWidth?: number;
 }
 
 export interface MerkleProofBundle {
@@ -91,6 +99,8 @@ export interface DocPairBundle {
     openingB?: { saltSeed: string; slots: SlotOpeningWire[] };
 }
 
+// Classic 16-slot defaults; the decode helpers take the per-artifact width
+// (WitnessFactoryInput.slotWidth) and derive depth = log2(width) from it.
 const MERKLE_DEPTH = 4;
 const SET_DEPTH = 6;
 const SLOT_COUNT = 16;
@@ -116,10 +126,10 @@ interface DecodedMerkleProof {
 
 const ZERO32 = new Uint8Array(32);
 
-function decodeSchema(schema: SchemaDescriptorWire[] | undefined, label: string): DecodedDescriptor[] | undefined {
+function decodeSchema(schema: SchemaDescriptorWire[] | undefined, label: string, slotCount: number = SLOT_COUNT): DecodedDescriptor[] | undefined {
     if (schema === undefined) return undefined;
-    if (!Array.isArray(schema) || schema.length !== SLOT_COUNT) {
-        throw new Error(`${label} must have exactly ${SLOT_COUNT} entries`);
+    if (!Array.isArray(schema) || schema.length !== slotCount) {
+        throw new Error(`${label} must have exactly ${slotCount} entries`);
     }
     return schema.map((d, i) => {
         const kind = BigInt(d.kind);
@@ -130,11 +140,12 @@ function decodeSchema(schema: SchemaDescriptorWire[] | undefined, label: string)
 
 function decodeOpening(
     opening: { saltSeed: string; slots: SlotOpeningWire[] } | undefined,
-    label: string
+    label: string,
+    slotCount: number = SLOT_COUNT
 ): { seed: Uint8Array; slots: DecodedOpening[] } | undefined {
     if (opening === undefined) return undefined;
-    if (!Array.isArray(opening.slots) || opening.slots.length !== SLOT_COUNT) {
-        throw new Error(`${label}.slots must have exactly ${SLOT_COUNT} entries`);
+    if (!Array.isArray(opening.slots) || opening.slots.length !== slotCount) {
+        throw new Error(`${label}.slots must have exactly ${slotCount} entries`);
     }
     const seed = hexToBytes32(opening.saltSeed);
     const slots = opening.slots.map((s) => ({
@@ -145,7 +156,8 @@ function decodeOpening(
     return { seed, slots };
 }
 
-function decodeMerkleProof(proof: MerkleProofBundle): DecodedMerkleProof {
+function decodeMerkleProof(proof: MerkleProofBundle, slotCount: number = SLOT_COUNT): DecodedMerkleProof {
+    const depth = Math.log2(slotCount);
     const fieldValue = proof.fieldValue !== undefined ? BigInt(proof.fieldValue) : undefined;
     const fieldSalt = proof.fieldSalt !== undefined ? hexToBytes32(proof.fieldSalt) : undefined;
     const fieldDigest = proof.fieldDigest !== undefined ? hexToBytes32(proof.fieldDigest) : undefined;
@@ -157,8 +169,8 @@ function decodeMerkleProof(proof: MerkleProofBundle): DecodedMerkleProof {
     if (proof.siblings !== undefined || proof.dirs !== undefined || !proof.docPair) {
         siblings = (proof.siblings || []).map(hexToBytes32);
         dirs = (proof.dirs || []).map(Boolean);
-        if (siblings.length !== MERKLE_DEPTH || dirs.length !== MERKLE_DEPTH) {
-            throw new Error(`merkleProof.siblings and .dirs must each have ${MERKLE_DEPTH} entries`);
+        if (siblings.length !== depth || dirs.length !== depth) {
+            throw new Error(`merkleProof.siblings and .dirs must each have ${depth} entries`);
         }
     }
     let setSiblings: Uint8Array[] | undefined;
@@ -170,9 +182,9 @@ function decodeMerkleProof(proof: MerkleProofBundle): DecodedMerkleProof {
             throw new Error(`merkleProof.setProof.siblings and .dirs must each have ${SET_DEPTH} entries`);
         }
     }
-    const docSchema = decodeSchema(proof.docPair?.schema, 'merkleProof.docPair.schema');
-    const openingA = decodeOpening(proof.docPair?.openingA, 'merkleProof.docPair.openingA');
-    const openingB = decodeOpening(proof.docPair?.openingB, 'merkleProof.docPair.openingB');
+    const docSchema = decodeSchema(proof.docPair?.schema, 'merkleProof.docPair.schema', slotCount);
+    const openingA = decodeOpening(proof.docPair?.openingA, 'merkleProof.docPair.openingA', slotCount);
+    const openingB = decodeOpening(proof.docPair?.openingB, 'merkleProof.docPair.openingB', slotCount);
     if (proof.docPair && (docSchema === undefined || openingA === undefined || openingB === undefined)) {
         throw new Error('merkleProof.docPair requires schema, openingA and openingB');
     }
@@ -220,14 +232,15 @@ export function buildAttestationVaultWitnesses(input: WitnessFactoryInput): any 
     if (input.merkleProof && input.merkleProofHolder) {
         throw new Error('merkleProof and merkleProofHolder are mutually exclusive');
     }
-    const staticProof = input.merkleProof ? decodeMerkleProof(input.merkleProof) : undefined;
+    const slotCount = input.slotWidth ?? SLOT_COUNT;
+    const staticProof = input.merkleProof ? decodeMerkleProof(input.merkleProof, slotCount) : undefined;
     const holder = input.merkleProofHolder;
     const currentProof = (witnessName: string): DecodedMerkleProof => {
         if (holder) {
             if (!holder.current) {
                 throw new Error(`${witnessName} witness invoked with an empty batch proof holder; set holder.current before the call`);
             }
-            return decodeMerkleProof(holder.current);
+            return decodeMerkleProof(holder.current, slotCount);
         }
         if (staticProof === undefined) {
             throw new Error(`${witnessName} witness invoked without a merkleProof; the field-bound proof circuits require a proof bundle`);
@@ -333,9 +346,16 @@ export type WitnessFactory = (input: WitnessFactoryInput) => any;
  * witnesses; only valid for those). Counter is one such case.
  */
 const FACTORIES: Record<string, WitnessFactory> = {
-    'attestation-vault': buildAttestationVaultWitnesses
+    'attestation-vault': buildAttestationVaultWitnesses,
+    'attestation-vault-32': buildAttestationVaultWitnesses
 };
 
 export function getContractWitnessFactory(contractName: string): WitnessFactory | undefined {
-    return FACTORIES[contractName];
+    const exact = FACTORIES[contractName];
+    if (exact) return exact;
+    // Width variants and consumer aliases of the vault family (e.g. a
+    // versioned re-registration) share one witness shape; falling through to
+    // vacant witnesses for them would silently break every owner-gated call.
+    if (contractName.startsWith('attestation-vault')) return buildAttestationVaultWitnesses;
+    return undefined;
 }

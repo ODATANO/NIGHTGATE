@@ -168,6 +168,8 @@ Response: `{"jobId":"...","status":"pending"}`. Submit actions are async - poll 
 
 The repo ships with a pre-compiled `counter` contract under `contracts/counter/`. Registration is already in `package.json` under `cds.requires.nightgate.contracts`.
 
+The attestation vault comes in two widths, both pre-registered: `attestation-vault` (16 provable fields per document, the default everywhere) and `attestation-vault-32` (32 fields under ONE root, for larger field panels that need a global "at least k of N differ" claim; ~2x proving time on the comparison circuit, everything else identical). Pick the width per document family via `compiledArtifactRef`; cross-root proofs only work between documents of the same width. See `contracts/README.md` and the width note in `docs/actions.md`.
+
 ```bash
 curl -X POST http://localhost:4004/api/v1/nightgate/deployContract \
   -H "Content-Type: application/json" \

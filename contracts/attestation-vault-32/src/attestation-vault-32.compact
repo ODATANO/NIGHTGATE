@@ -1,0 +1,868 @@
+// AttestationVault32: the 32-slot (depth-5) WIDTH VARIANT of the attestation
+// vault, registered as `attestation-vault-32`.
+//
+// Identical circuit set and semantics to contracts/attestation-vault, tree
+// width doubled to 32 provable fields: for panels of 17-32 fields that need
+// ONE root (a global "at least k of 32 differ" claim only exists within one
+// document). A SECOND lineage next to the 16-slot vault, never a
+// replacement: cross-root proofs only work between documents of the SAME
+// width (the tree shapes are incompatible), so an ecosystem picks its width
+// per document family. Every verifier key is 2119 B, so deploy SIZE and
+// cost equal the 16er, but four key CONTENTS differ (comparison plus the
+// content-tree circuits); the comparison prover doubles (72.9 MB,
+// wasm-provable) and its proving time scales with width (~60 s fixed +
+// ~12 s per slot in wasm).
+//
+// Width changes vs. the 16-slot vault (everything else is a verbatim copy):
+//   - inclusion proofs: depth 4 -> 5 (merkle_siblings/dirs Vector<5>)
+//   - fold16 -> fold32, schemaRootOf/contentRootOf over Vector<32, ...>
+//   - allowed_mask Vector<16, Boolean> -> Vector<32, Boolean>, k <= 32
+//   - membership SET tree unchanged (depth 6, 64 values)
+
+pragma language_version >= 0.20;
+
+import CompactStandardLibrary;
+
+export ledger public_attestations: Map<Bytes<32>, Bytes<32>>;
+export ledger attestation_owners:  Map<Bytes<32>, Bytes<32>>;
+export ledger disclosures:         Map<Bytes<32>, Map<Bytes<32>, Uint<8>>>;
+
+// passportId -> payload_hash, so a scanned passportId resolves on-chain to
+// its attestation.
+export ledger passport_bindings:   Map<Bytes<32>, Bytes<32>>;
+
+// Passport-ownership pre-registration. The registrar may pre-assign a
+// passportId to an attester_id; bindPassport then accepts only that attester,
+// which closes first-bind squatting and recovers already-squatted ids.
+// Unregistered ids stay first-come-first-served.
+export ledger registrar:           Bytes<32>;
+export ledger passport_owners:     Map<Bytes<32>, Bytes<32>>;
+
+// content_roots: payload_hash -> Merkle root over the passport's provable
+// fields, anchored by the attester so later proofs bind to the passport's
+// ACTUAL values. field_predicate_results: claimKey -> true means the value
+// behind `field_key` satisfies the predicate, bound to THIS passport field
+// rather than to an arbitrary number.
+export ledger content_roots:            Map<Bytes<32>, Bytes<32>>;
+export ledger field_predicate_results:  Map<Bytes<32>, Boolean>;
+
+// Bytes-valued fields (strings) enter the content root as bytesLeafHash
+// leaves over the off-chain blake2b-256 of the canonical value bytes.
+export ledger field_equality_results:   Map<Bytes<32>, Boolean>;
+export ledger field_membership_results: Map<Bytes<32>, Boolean>;
+
+// A provable numeric field: canonical id, scaled integer value, per-slot
+// salt. The off-chain builder uses the exported `leafHash` so its tree hashes
+// identically.
+struct FieldLeaf {
+  field_key: Bytes<32>,
+  value:     Uint<64>,
+  salt:      Bytes<32>
+}
+
+// An absent slot (no value, or padding beyond the field list). Salted like
+// value leaves, so a shared leaf layer does not reveal WHICH fields exist.
+struct AbsentLeaf {
+  field_key: Bytes<32>,
+  salt:      Bytes<32>
+}
+
+struct MerkleNode {
+  left:  Bytes<32>,
+  right: Bytes<32>
+}
+
+// Per-slot schema interpretation, shared by both documents of a comparison.
+// `kind`: 0 = uint, 1 = bytes, 2 = padding. `scale` is the off-chain scaling
+// of uint slots (0 otherwise).
+struct SlotDescriptor {
+  field_key: Bytes<32>,
+  kind:      Uint<8>,
+  scale:     Uint<64>
+}
+
+// One document's opening of one slot. The member not selected by the
+// descriptor's kind is ignored.
+struct SlotOpening {
+  present:      Boolean,
+  uint_value:   Uint<64>,
+  value_digest: Bytes<32>
+}
+
+// One 32-byte seed per document derives one salt per slot.
+struct SlotSalt {
+  seed:  Bytes<32>,
+  index: Uint<8>
+}
+
+// Claim identities. Every claim key embeds the payload's attestation EPOCH at
+// proving time (see attestationEpoch).
+struct FieldPredicateClaim {
+  payload_hash: Bytes<32>,
+  field_key:    Bytes<32>,
+  threshold:    Uint<64>,
+  op:           Uint<8>,
+  epoch:        Uint<64>
+}
+
+// A provable bytes-valued field. Distinct struct from FieldLeaf so the leaf
+// families cannot collide (the hash is domain-separated by struct type).
+struct BytesLeaf {
+  field_key:    Bytes<32>,
+  value_digest: Bytes<32>,
+  salt:         Bytes<32>
+}
+
+// One allowed value of a membership set, in its own struct so set leaves are
+// domain-separated from content leaves and inner nodes.
+struct SetLeaf {
+  value_digest: Bytes<32>
+}
+
+// Cross-root comparison results, written by proveDocumentComparison.
+export ledger document_integrity_results: Map<Bytes<32>, Boolean>;
+export ledger document_diff_results:      Map<Bytes<32>, Boolean>;
+
+// payload_hash -> schema root: the depth-5 root over the 32 slot descriptors.
+export ledger content_schemas: Map<Bytes<32>, Bytes<32>>;
+
+// The mask travels as a boolean vector (Compact has no bitwise ops); the
+// off-chain recompute mirrors it as CompactTypeVector(32, CompactTypeBoolean).
+// Bit i true = slot i MAY differ.
+struct DocumentIntegrityClaim {
+  payload_hash_a: Bytes<32>,
+  payload_hash_b: Bytes<32>,
+  allowed_mask:   Vector<32, Boolean>,
+  epoch_a:        Uint<64>,
+  epoch_b:        Uint<64>
+}
+
+struct DocumentDiffClaim {
+  payload_hash_a: Bytes<32>,
+  payload_hash_b: Bytes<32>,
+  k:              Uint<8>,
+  epoch_a:        Uint<64>,
+  epoch_b:        Uint<64>
+}
+
+struct FieldEqualityClaim {
+  payload_hash: Bytes<32>,
+  field_key:    Bytes<32>,
+  expected:     Bytes<32>,
+  epoch:        Uint<64>
+}
+
+struct FieldMembershipClaim {
+  payload_hash: Bytes<32>,
+  field_key:    Bytes<32>,
+  set_root:     Bytes<32>,
+  epoch:        Uint<64>
+}
+
+// Caller's secret, supplied off-chain. Hashed in-circuit into a stable
+// attester_id without ever revealing the secret to the chain.
+witness local_secret_key(): Bytes<32>;
+
+// Field-bound inclusion proof. DEPTH is fixed at 5 (up to 32 provable
+// fields); the off-chain builder pads to 2^5.
+witness field_value():     Uint<64>;
+witness field_salt():      Bytes<32>;
+witness merkle_siblings(): Vector<5, Bytes<32>>;
+witness merkle_dirs():     Vector<5, Boolean>;   // true => current node is the LEFT child
+
+// Bytes-field proof material. `field_digest` is the blake2b-256 of the
+// canonical value bytes (the hidden value for membership proofs). SET_DEPTH
+// is fixed at 6 (up to 64 allowed values); the builder dedupes, sorts, pads.
+witness field_digest():    Bytes<32>;
+witness set_siblings():    Vector<6, Bytes<32>>;
+witness set_dirs():        Vector<6, Boolean>;   // true => current node is the LEFT child
+
+// Cross-root witnesses: ONE shared descriptor list plus each document's salt
+// seed and full opening. The circuit recomputes schema and content roots from
+// these, so nothing here is trusted, only proven against the anchors.
+witness doc_schema():  Vector<32, SlotDescriptor>;
+witness doc_salt_a():  Bytes<32>;
+witness doc_salt_b():  Bytes<32>;
+witness doc_slots_a(): Vector<32, SlotOpening>;
+witness doc_slots_b(): Vector<32, SlotOpening>;
+
+// The caller's identity commitment. One-way, so publishing it on-chain does
+// not leak the secret.
+circuit caller_id(): Bytes<32> {
+  return persistentHash<Bytes<32>>(local_secret_key());
+}
+
+// The registrar is a PUBLIC constructor argument (see the 16-slot vault for
+// the deploy-weight rationale).
+constructor(initial_registrar: Bytes<32>) {
+  registrar = disclose(initial_registrar);
+}
+
+// ---- Tree hashing ----------------------------------------------------------
+//
+// All tree hashes are `transientHash` upgraded back to Bytes<32>, NOT
+// `persistentHash` (prover-key cost; see the 16-slot vault's rationale).
+// Claim keys stay persistentHash (they ARE stored state identity).
+export pure circuit leafHash(field_key: Bytes<32>, value: Uint<64>, salt: Bytes<32>): Bytes<32> {
+  return upgradeFromTransient(transientHash<FieldLeaf>(FieldLeaf { field_key: field_key, value: value, salt: salt }));
+}
+
+export pure circuit nodeHash(left: Bytes<32>, right: Bytes<32>): Bytes<32> {
+  return upgradeFromTransient(transientHash<MerkleNode>(MerkleNode { left: left, right: right }));
+}
+
+export pure circuit bytesLeafHash(field_key: Bytes<32>, value_digest: Bytes<32>, salt: Bytes<32>): Bytes<32> {
+  return upgradeFromTransient(transientHash<BytesLeaf>(BytesLeaf { field_key: field_key, value_digest: value_digest, salt: salt }));
+}
+
+export pure circuit absentLeafHash(field_key: Bytes<32>, salt: Bytes<32>): Bytes<32> {
+  return upgradeFromTransient(transientHash<AbsentLeaf>(AbsentLeaf { field_key: field_key, salt: salt }));
+}
+
+// Membership-set leaves are UNSALTED by design: the allow-list is public and
+// every party must recompute the same set root from it.
+export pure circuit setLeafHash(value_digest: Bytes<32>): Bytes<32> {
+  return upgradeFromTransient(transientHash<SetLeaf>(SetLeaf { value_digest: value_digest }));
+}
+
+export pure circuit descriptorLeafHash(field_key: Bytes<32>, kind: Uint<8>, scale: Uint<64>): Bytes<32> {
+  return upgradeFromTransient(transientHash<SlotDescriptor>(SlotDescriptor { field_key: field_key, kind: kind, scale: scale }));
+}
+
+export pure circuit slotSalt(seed: Bytes<32>, index: Uint<8>): Bytes<32> {
+  return upgradeFromTransient(transientHash<SlotSalt>(SlotSalt { seed: seed, index: index }));
+}
+
+// Canonical padding-slot key. Same domain constant as the 16-slot vault; the
+// tree shapes differ, so roots cannot collide across the variants anyway.
+export pure circuit emptyLeafKey(): Bytes<32> {
+  return pad(32, "nightgate/empty-leaf/v2");
+}
+
+// Fold a 32-leaf layer to its depth-5 root. Unrolled; a statically-bounded
+// `for` would expand to the identical circuit.
+pure circuit fold32(
+  l0: Bytes<32>,  l1: Bytes<32>,  l2: Bytes<32>,  l3: Bytes<32>,
+  l4: Bytes<32>,  l5: Bytes<32>,  l6: Bytes<32>,  l7: Bytes<32>,
+  l8: Bytes<32>,  l9: Bytes<32>,  l10: Bytes<32>, l11: Bytes<32>,
+  l12: Bytes<32>, l13: Bytes<32>, l14: Bytes<32>, l15: Bytes<32>,
+  l16: Bytes<32>, l17: Bytes<32>, l18: Bytes<32>, l19: Bytes<32>,
+  l20: Bytes<32>, l21: Bytes<32>, l22: Bytes<32>, l23: Bytes<32>,
+  l24: Bytes<32>, l25: Bytes<32>, l26: Bytes<32>, l27: Bytes<32>,
+  l28: Bytes<32>, l29: Bytes<32>, l30: Bytes<32>, l31: Bytes<32>
+): Bytes<32> {
+  const a0  = nodeHash(l0, l1);
+  const a1  = nodeHash(l2, l3);
+  const a2  = nodeHash(l4, l5);
+  const a3  = nodeHash(l6, l7);
+  const a4  = nodeHash(l8, l9);
+  const a5  = nodeHash(l10, l11);
+  const a6  = nodeHash(l12, l13);
+  const a7  = nodeHash(l14, l15);
+  const a8  = nodeHash(l16, l17);
+  const a9  = nodeHash(l18, l19);
+  const a10 = nodeHash(l20, l21);
+  const a11 = nodeHash(l22, l23);
+  const a12 = nodeHash(l24, l25);
+  const a13 = nodeHash(l26, l27);
+  const a14 = nodeHash(l28, l29);
+  const a15 = nodeHash(l30, l31);
+  const b0 = nodeHash(a0, a1);
+  const b1 = nodeHash(a2, a3);
+  const b2 = nodeHash(a4, a5);
+  const b3 = nodeHash(a6, a7);
+  const b4 = nodeHash(a8, a9);
+  const b5 = nodeHash(a10, a11);
+  const b6 = nodeHash(a12, a13);
+  const b7 = nodeHash(a14, a15);
+  const c0 = nodeHash(b0, b1);
+  const c1 = nodeHash(b2, b3);
+  const c2 = nodeHash(b4, b5);
+  const c3 = nodeHash(b6, b7);
+  return nodeHash(nodeHash(c0, c1), nodeHash(c2, c3));
+}
+
+// One slot's leaf. Padding slots and absent fields land on the salted absent
+// leaf; the unused opening members are ignored.
+pure circuit slotLeaf(d: SlotDescriptor, o: SlotOpening, salt: Bytes<32>): Bytes<32> {
+  if (d.kind == 0 && o.present) {
+    return leafHash(d.field_key, o.uint_value, salt);
+  }
+  if (d.kind == 1 && o.present) {
+    return bytesLeafHash(d.field_key, o.value_digest, salt);
+  }
+  return absentLeafHash(d.field_key, salt);
+}
+
+// Per-slot difference on VALUE level: leaf hashes cannot be compared across
+// documents, their salts differ. Padding never differs; both-absent is no
+// difference; present-vs-absent IS one; both-present compares the kind's
+// value member.
+pure circuit slotDiff(d: SlotDescriptor, a: SlotOpening, b: SlotOpening): Uint<8> {
+  if (d.kind == 2) {
+    return 0;
+  }
+  if (!a.present && !b.present) {
+    return 0;
+  }
+  if ((a.present && !b.present) || (!a.present && b.present)) {
+    return 1;
+  }
+  if (d.kind == 0) {
+    if (a.uint_value == b.uint_value) {
+      return 0;
+    }
+    return 1;
+  }
+  if (a.value_digest == b.value_digest) {
+    return 0;
+  }
+  return 1;
+}
+
+// Descriptors are WITNESS data, so their shape must be pinned before any root
+// math (see the 16-slot vault's rationale).
+pure circuit assertCanonicalSlot(d: SlotDescriptor, a: SlotOpening, b: SlotOpening): [] {
+  assert(d.kind <= 2, "schema kind out of range");
+  if (!(d.kind == 0)) {
+    assert(d.scale == 0, "schema scale must be 0 for non-uint slots");
+  }
+  if (d.kind == 2) {
+    assert(d.field_key == emptyLeafKey(), "padding slot key must be canonical");
+    assert(!a.present && !b.present, "padding slot must be absent");
+  }
+}
+
+// True when the mask actually CONSTRAINS this slot: a real (non-padding) slot
+// the mask does not free.
+pure circuit constrainsSlot(allowed: Boolean, d: SlotDescriptor): Boolean {
+  return !allowed && !(d.kind == 2);
+}
+
+pure circuit assertUnchanged(allowed: Boolean, d: SlotDescriptor, a: SlotOpening, b: SlotOpening): [] {
+  if (!allowed) {
+    assert(slotDiff(d, a, b) == 0, "slot changed outside allowed mask");
+  }
+}
+
+// Schema root over a witnessed descriptor list, and a document's content root
+// over that schema, its opening and its salt seed. Both are recomputed
+// in-circuit and asserted against the anchors.
+pure circuit schemaRootOf(ds: Vector<32, SlotDescriptor>): Bytes<32> {
+  return fold32(
+    descriptorLeafHash(ds[0].field_key,  ds[0].kind,  ds[0].scale),
+    descriptorLeafHash(ds[1].field_key,  ds[1].kind,  ds[1].scale),
+    descriptorLeafHash(ds[2].field_key,  ds[2].kind,  ds[2].scale),
+    descriptorLeafHash(ds[3].field_key,  ds[3].kind,  ds[3].scale),
+    descriptorLeafHash(ds[4].field_key,  ds[4].kind,  ds[4].scale),
+    descriptorLeafHash(ds[5].field_key,  ds[5].kind,  ds[5].scale),
+    descriptorLeafHash(ds[6].field_key,  ds[6].kind,  ds[6].scale),
+    descriptorLeafHash(ds[7].field_key,  ds[7].kind,  ds[7].scale),
+    descriptorLeafHash(ds[8].field_key,  ds[8].kind,  ds[8].scale),
+    descriptorLeafHash(ds[9].field_key,  ds[9].kind,  ds[9].scale),
+    descriptorLeafHash(ds[10].field_key, ds[10].kind, ds[10].scale),
+    descriptorLeafHash(ds[11].field_key, ds[11].kind, ds[11].scale),
+    descriptorLeafHash(ds[12].field_key, ds[12].kind, ds[12].scale),
+    descriptorLeafHash(ds[13].field_key, ds[13].kind, ds[13].scale),
+    descriptorLeafHash(ds[14].field_key, ds[14].kind, ds[14].scale),
+    descriptorLeafHash(ds[15].field_key, ds[15].kind, ds[15].scale),
+    descriptorLeafHash(ds[16].field_key, ds[16].kind, ds[16].scale),
+    descriptorLeafHash(ds[17].field_key, ds[17].kind, ds[17].scale),
+    descriptorLeafHash(ds[18].field_key, ds[18].kind, ds[18].scale),
+    descriptorLeafHash(ds[19].field_key, ds[19].kind, ds[19].scale),
+    descriptorLeafHash(ds[20].field_key, ds[20].kind, ds[20].scale),
+    descriptorLeafHash(ds[21].field_key, ds[21].kind, ds[21].scale),
+    descriptorLeafHash(ds[22].field_key, ds[22].kind, ds[22].scale),
+    descriptorLeafHash(ds[23].field_key, ds[23].kind, ds[23].scale),
+    descriptorLeafHash(ds[24].field_key, ds[24].kind, ds[24].scale),
+    descriptorLeafHash(ds[25].field_key, ds[25].kind, ds[25].scale),
+    descriptorLeafHash(ds[26].field_key, ds[26].kind, ds[26].scale),
+    descriptorLeafHash(ds[27].field_key, ds[27].kind, ds[27].scale),
+    descriptorLeafHash(ds[28].field_key, ds[28].kind, ds[28].scale),
+    descriptorLeafHash(ds[29].field_key, ds[29].kind, ds[29].scale),
+    descriptorLeafHash(ds[30].field_key, ds[30].kind, ds[30].scale),
+    descriptorLeafHash(ds[31].field_key, ds[31].kind, ds[31].scale)
+  );
+}
+
+pure circuit contentRootOf(
+  ds:   Vector<32, SlotDescriptor>,
+  os:   Vector<32, SlotOpening>,
+  seed: Bytes<32>
+): Bytes<32> {
+  return fold32(
+    slotLeaf(ds[0],  os[0],  slotSalt(seed, 0)),
+    slotLeaf(ds[1],  os[1],  slotSalt(seed, 1)),
+    slotLeaf(ds[2],  os[2],  slotSalt(seed, 2)),
+    slotLeaf(ds[3],  os[3],  slotSalt(seed, 3)),
+    slotLeaf(ds[4],  os[4],  slotSalt(seed, 4)),
+    slotLeaf(ds[5],  os[5],  slotSalt(seed, 5)),
+    slotLeaf(ds[6],  os[6],  slotSalt(seed, 6)),
+    slotLeaf(ds[7],  os[7],  slotSalt(seed, 7)),
+    slotLeaf(ds[8],  os[8],  slotSalt(seed, 8)),
+    slotLeaf(ds[9],  os[9],  slotSalt(seed, 9)),
+    slotLeaf(ds[10], os[10], slotSalt(seed, 10)),
+    slotLeaf(ds[11], os[11], slotSalt(seed, 11)),
+    slotLeaf(ds[12], os[12], slotSalt(seed, 12)),
+    slotLeaf(ds[13], os[13], slotSalt(seed, 13)),
+    slotLeaf(ds[14], os[14], slotSalt(seed, 14)),
+    slotLeaf(ds[15], os[15], slotSalt(seed, 15)),
+    slotLeaf(ds[16], os[16], slotSalt(seed, 16)),
+    slotLeaf(ds[17], os[17], slotSalt(seed, 17)),
+    slotLeaf(ds[18], os[18], slotSalt(seed, 18)),
+    slotLeaf(ds[19], os[19], slotSalt(seed, 19)),
+    slotLeaf(ds[20], os[20], slotSalt(seed, 20)),
+    slotLeaf(ds[21], os[21], slotSalt(seed, 21)),
+    slotLeaf(ds[22], os[22], slotSalt(seed, 22)),
+    slotLeaf(ds[23], os[23], slotSalt(seed, 23)),
+    slotLeaf(ds[24], os[24], slotSalt(seed, 24)),
+    slotLeaf(ds[25], os[25], slotSalt(seed, 25)),
+    slotLeaf(ds[26], os[26], slotSalt(seed, 26)),
+    slotLeaf(ds[27], os[27], slotSalt(seed, 27)),
+    slotLeaf(ds[28], os[28], slotSalt(seed, 28)),
+    slotLeaf(ds[29], os[29], slotSalt(seed, 29)),
+    slotLeaf(ds[30], os[30], slotSalt(seed, 30)),
+    slotLeaf(ds[31], os[31], slotSalt(seed, 31))
+  );
+}
+
+circuit merkleStep(node: Bytes<32>, sibling: Bytes<32>, goesLeft: Boolean): Bytes<32> {
+  if (goesLeft) {
+    return nodeHash(node, sibling);
+  }
+  return nodeHash(sibling, node);
+}
+
+// ---- Guarded attest (commit-reveal) ----------------------------------------
+// Verbatim from the 16-slot vault; see there for the design rationale.
+struct AttestCommitPreimage {
+  payload_hash:  Bytes<32>,
+  metadata_hash: Bytes<32>,
+  nonce:         Bytes<32>
+}
+
+struct AttestCommitRecord {
+  owner: Bytes<32>,
+  seq:   Uint<64>
+}
+
+export ledger attest_commits:    Map<Bytes<32>, AttestCommitRecord>;
+export ledger attestation_seqs:  Map<Bytes<32>, Uint<64>>;
+export ledger attest_seq_next:   Uint<64>;
+
+export circuit attest(payload_hash: Bytes<32>, metadata_hash: Bytes<32>): [] {
+  assert(!public_attestations.member(disclose(payload_hash)), "already attested");
+  public_attestations.insert(disclose(payload_hash), disclose(metadata_hash));
+  attestation_owners.insert(disclose(payload_hash), disclose(caller_id()));
+  attestation_seqs.insert(disclose(payload_hash), attest_seq_next);
+  attest_seq_next = (attest_seq_next + 1) as Uint<64>;
+}
+
+export circuit attestGuarded(
+  mode:          Uint<8>,
+  payload_hash:  Bytes<32>,
+  metadata_hash: Bytes<32>,
+  nonce:         Bytes<32>
+): [] {
+  const m = disclose(mode);
+  assert(m <= 1, "mode out of range");
+  const zero = pad(32, "");
+  if (m == 0) {
+    assert(metadata_hash == zero, "metadata must be the neutral dummy in commit mode");
+    assert(nonce == zero, "nonce must be the neutral dummy in commit mode");
+    assert(!attest_commits.member(disclose(payload_hash)), "commitment already recorded");
+    attest_commits.insert(disclose(payload_hash), AttestCommitRecord {
+      owner: disclose(caller_id()),
+      seq:   attest_seq_next
+    });
+    attest_seq_next = (attest_seq_next + 1) as Uint<64>;
+    return;
+  }
+  const commitment = persistentHash<AttestCommitPreimage>(AttestCommitPreimage {
+    payload_hash:  payload_hash,
+    metadata_hash: metadata_hash,
+    nonce:         nonce
+  });
+  assert(attest_commits.member(disclose(commitment)), "no matching commitment");
+  const rec = attest_commits.lookup(disclose(commitment));
+  assert(rec.owner == caller_id(), "not committer");
+  if (!public_attestations.member(disclose(payload_hash))) {
+    attest_commits.remove(disclose(commitment));
+    public_attestations.insert(disclose(payload_hash), disclose(metadata_hash));
+    attestation_owners.insert(disclose(payload_hash), disclose(caller_id()));
+    attestation_seqs.insert(disclose(payload_hash), attest_seq_next);
+    attest_seq_next = (attest_seq_next + 1) as Uint<64>;
+    return;
+  }
+  assert(attestation_seqs.member(disclose(payload_hash)), "attestation predates sequencing");
+  assert(rec.seq < attestation_seqs.lookup(disclose(payload_hash)), "attestation predates commitment");
+  attest_commits.remove(disclose(commitment));
+  public_attestations.insert(disclose(payload_hash), disclose(metadata_hash));
+  attestation_owners.insert(disclose(payload_hash), disclose(caller_id()));
+  attestation_seqs.insert(disclose(payload_hash), rec.seq);
+  if (content_roots.member(disclose(payload_hash))) {
+    content_roots.remove(disclose(payload_hash));
+    content_schemas.remove(disclose(payload_hash));
+  }
+  if (disclosures.member(disclose(payload_hash))) {
+    disclosures.remove(disclose(payload_hash));
+  }
+}
+
+// The sequence number of the payload's current ownership period.
+circuit attestationEpoch(payload_hash: Bytes<32>): Uint<64> {
+  assert(attestation_seqs.member(disclose(payload_hash)), "no attestation epoch");
+  return attestation_seqs.lookup(disclose(payload_hash));
+}
+
+export circuit grantDisclosure(
+  payload_hash: Bytes<32>,
+  grantee:      Bytes<32>,
+  level:        Uint<8>
+): [] {
+  assert(attestation_owners.lookup(disclose(payload_hash)) == caller_id(), "not attester");
+  assert(level <= 2, "level out of range");
+  if (!disclosures.member(disclose(payload_hash))) {
+    disclosures.insert(disclose(payload_hash), default<Map<Bytes<32>, Uint<8>>>);
+  }
+  disclosures.lookup(disclose(payload_hash)).insert(disclose(grantee), disclose(level));
+}
+
+export circuit revokeDisclosure(payload_hash: Bytes<32>, grantee: Bytes<32>): [] {
+  assert(attestation_owners.lookup(disclose(payload_hash)) == caller_id(), "not attester");
+  disclosures.lookup(disclose(payload_hash)).remove(disclose(grantee));
+}
+
+// Registrar-only: pre-assign (or re-assign) a passportId to an attester.
+export circuit registerPassport(passportId: Bytes<32>, owner_id: Bytes<32>): [] {
+  assert(caller_id() == registrar, "not registrar");
+  passport_owners.insert(disclose(passportId), disclose(owner_id));
+}
+
+// Bind a passportId to an existing attestation (two-tier authority; see the
+// 16-slot vault).
+export circuit bindPassport(passportId: Bytes<32>, payload_hash: Bytes<32>): [] {
+  assert(public_attestations.member(disclose(payload_hash)), "no attestation");
+  assert(attestation_owners.lookup(disclose(payload_hash)) == caller_id(), "not attester");
+  if (passport_owners.member(disclose(passportId))) {
+    assert(passport_owners.lookup(disclose(passportId)) == caller_id(), "not passport owner");
+  } else {
+    if (passport_bindings.member(disclose(passportId))) {
+      assert(
+        attestation_owners.lookup(passport_bindings.lookup(disclose(passportId))) == caller_id(),
+        "passport bound by another attester"
+      );
+    }
+  }
+  passport_bindings.insert(disclose(passportId), disclose(payload_hash));
+}
+
+// The attester anchors the Merkle root over the passport's provable fields
+// plus the schema id. INSERT-ONCE-OR-IDENTICAL.
+export circuit anchorContentRoot(
+  payload_hash: Bytes<32>,
+  content_root: Bytes<32>,
+  schema_id:    Bytes<32>
+): [] {
+  assert(attestation_owners.lookup(disclose(payload_hash)) == caller_id(), "not attester");
+  if (content_roots.member(disclose(payload_hash))) {
+    assert(content_roots.lookup(disclose(payload_hash)) == disclose(content_root), "content root already anchored");
+    assert(content_schemas.lookup(disclose(payload_hash)) == disclose(schema_id), "schema already anchored");
+  } else {
+    content_roots.insert(disclose(payload_hash), disclose(content_root));
+    content_schemas.insert(disclose(payload_hash), disclose(schema_id));
+  }
+}
+
+// Prove a field satisfies a predicate against a public threshold without
+// revealing the value. Depth-5 inclusion path.
+export circuit proveFieldPredicate(
+  payload_hash: Bytes<32>,
+  field_key:    Bytes<32>,
+  threshold:    Uint<64>,
+  op:           Uint<8>
+): [] {
+  assert(content_roots.member(disclose(payload_hash)), "no content root");
+  assert(op <= 1, "op out of range");
+  const v = field_value();
+  const sibs = merkle_siblings();
+  const dirs = merkle_dirs();
+  const n0 = leafHash(field_key, v, field_salt());
+  const n1 = merkleStep(n0, sibs[0], dirs[0]);
+  const n2 = merkleStep(n1, sibs[1], dirs[1]);
+  const n3 = merkleStep(n2, sibs[2], dirs[2]);
+  const n4 = merkleStep(n3, sibs[3], dirs[3]);
+  const root = merkleStep(n4, sibs[4], dirs[4]);
+  assert(root == content_roots.lookup(disclose(payload_hash)), "field not in passport");
+  if (op == 0) {
+    assert(v <= threshold, "predicate false");
+  } else {
+    assert(v >= threshold, "predicate false");
+  }
+  const claimKey = persistentHash<FieldPredicateClaim>(FieldPredicateClaim {
+    payload_hash: payload_hash,
+    field_key:    field_key,
+    threshold:    threshold,
+    op:           op,
+    epoch:        attestationEpoch(payload_hash)
+  });
+  field_predicate_results.insert(disclose(claimKey), true);
+}
+
+// Prove a bytes-valued field carries exactly the value whose canonical digest
+// is `expected_digest`. Depth-5 inclusion path.
+export circuit proveFieldEquality(
+  payload_hash:    Bytes<32>,
+  field_key:       Bytes<32>,
+  expected_digest: Bytes<32>
+): [] {
+  assert(content_roots.member(disclose(payload_hash)), "no content root");
+  const sibs = merkle_siblings();
+  const dirs = merkle_dirs();
+  const n0 = bytesLeafHash(field_key, expected_digest, field_salt());
+  const n1 = merkleStep(n0, sibs[0], dirs[0]);
+  const n2 = merkleStep(n1, sibs[1], dirs[1]);
+  const n3 = merkleStep(n2, sibs[2], dirs[2]);
+  const n4 = merkleStep(n3, sibs[3], dirs[3]);
+  const root = merkleStep(n4, sibs[4], dirs[4]);
+  assert(root == content_roots.lookup(disclose(payload_hash)), "field not in passport");
+  const claimKey = persistentHash<FieldEqualityClaim>(FieldEqualityClaim {
+    payload_hash: payload_hash,
+    field_key:    field_key,
+    expected:     expected_digest,
+    epoch:        attestationEpoch(payload_hash)
+  });
+  field_equality_results.insert(disclose(claimKey), true);
+}
+
+// Prove a bytes-valued field's HIDDEN value is one of a public allow-list.
+// Content fold depth 5; SET fold unchanged at depth 6.
+export circuit proveFieldMembership(
+  payload_hash: Bytes<32>,
+  field_key:    Bytes<32>,
+  set_root:     Bytes<32>
+): [] {
+  assert(content_roots.member(disclose(payload_hash)), "no content root");
+  const d = field_digest();
+  const sibs = merkle_siblings();
+  const dirs = merkle_dirs();
+  const n0 = bytesLeafHash(field_key, d, field_salt());
+  const n1 = merkleStep(n0, sibs[0], dirs[0]);
+  const n2 = merkleStep(n1, sibs[1], dirs[1]);
+  const n3 = merkleStep(n2, sibs[2], dirs[2]);
+  const n4 = merkleStep(n3, sibs[3], dirs[3]);
+  const root = merkleStep(n4, sibs[4], dirs[4]);
+  assert(root == content_roots.lookup(disclose(payload_hash)), "field not in passport");
+  const ssibs = set_siblings();
+  const sdirs = set_dirs();
+  const s0 = setLeafHash(d);
+  const s1 = merkleStep(s0, ssibs[0], sdirs[0]);
+  const s2 = merkleStep(s1, ssibs[1], sdirs[1]);
+  const s3 = merkleStep(s2, ssibs[2], sdirs[2]);
+  const s4 = merkleStep(s3, ssibs[3], sdirs[3]);
+  const s5 = merkleStep(s4, ssibs[4], sdirs[4]);
+  const sroot = merkleStep(s5, ssibs[5], sdirs[5]);
+  assert(sroot == set_root, "value not in set");
+  const claimKey = persistentHash<FieldMembershipClaim>(FieldMembershipClaim {
+    payload_hash: payload_hash,
+    field_key:    field_key,
+    set_root:     set_root,
+    epoch:        attestationEpoch(payload_hash)
+  });
+  field_membership_results.insert(disclose(claimKey), true);
+}
+
+// ONE mode-switched circuit for both cross-root claims, over 32 slots.
+// `mode` 0 proves B differs from A ONLY in the slots flagged by
+// `allowed_mask` (`k` ignored); `mode` 1 proves at least `k` of the 32
+// aligned slots differ (`allowed_mask` ignored).
+export circuit proveDocumentComparison(
+  payload_hash_a: Bytes<32>,
+  payload_hash_b: Bytes<32>,
+  mode:           Uint<8>,
+  allowed_mask:   Vector<32, Boolean>,
+  k:              Uint<8>
+): [] {
+  const m = disclose(mode);
+  assert(m <= 1, "mode out of range");
+  if (m == 0) {
+    assert(k == 1, "k must be the neutral dummy in integrity mode");
+  } else {
+    assert(!(allowed_mask[0]  || allowed_mask[1]  || allowed_mask[2]  || allowed_mask[3]
+          || allowed_mask[4]  || allowed_mask[5]  || allowed_mask[6]  || allowed_mask[7]
+          || allowed_mask[8]  || allowed_mask[9]  || allowed_mask[10] || allowed_mask[11]
+          || allowed_mask[12] || allowed_mask[13] || allowed_mask[14] || allowed_mask[15]
+          || allowed_mask[16] || allowed_mask[17] || allowed_mask[18] || allowed_mask[19]
+          || allowed_mask[20] || allowed_mask[21] || allowed_mask[22] || allowed_mask[23]
+          || allowed_mask[24] || allowed_mask[25] || allowed_mask[26] || allowed_mask[27]
+          || allowed_mask[28] || allowed_mask[29] || allowed_mask[30] || allowed_mask[31]),
+           "mask must be the neutral dummy in diff mode");
+  }
+  assert(!(payload_hash_a == payload_hash_b), "documents must differ");
+  assert(content_roots.member(disclose(payload_hash_a)), "no content root A");
+  assert(content_roots.member(disclose(payload_hash_b)), "no content root B");
+  const ds = doc_schema();
+  const oa = doc_slots_a();
+  const ob = doc_slots_b();
+  assertCanonicalSlot(ds[0],  oa[0],  ob[0]);
+  assertCanonicalSlot(ds[1],  oa[1],  ob[1]);
+  assertCanonicalSlot(ds[2],  oa[2],  ob[2]);
+  assertCanonicalSlot(ds[3],  oa[3],  ob[3]);
+  assertCanonicalSlot(ds[4],  oa[4],  ob[4]);
+  assertCanonicalSlot(ds[5],  oa[5],  ob[5]);
+  assertCanonicalSlot(ds[6],  oa[6],  ob[6]);
+  assertCanonicalSlot(ds[7],  oa[7],  ob[7]);
+  assertCanonicalSlot(ds[8],  oa[8],  ob[8]);
+  assertCanonicalSlot(ds[9],  oa[9],  ob[9]);
+  assertCanonicalSlot(ds[10], oa[10], ob[10]);
+  assertCanonicalSlot(ds[11], oa[11], ob[11]);
+  assertCanonicalSlot(ds[12], oa[12], ob[12]);
+  assertCanonicalSlot(ds[13], oa[13], ob[13]);
+  assertCanonicalSlot(ds[14], oa[14], ob[14]);
+  assertCanonicalSlot(ds[15], oa[15], ob[15]);
+  assertCanonicalSlot(ds[16], oa[16], ob[16]);
+  assertCanonicalSlot(ds[17], oa[17], ob[17]);
+  assertCanonicalSlot(ds[18], oa[18], ob[18]);
+  assertCanonicalSlot(ds[19], oa[19], ob[19]);
+  assertCanonicalSlot(ds[20], oa[20], ob[20]);
+  assertCanonicalSlot(ds[21], oa[21], ob[21]);
+  assertCanonicalSlot(ds[22], oa[22], ob[22]);
+  assertCanonicalSlot(ds[23], oa[23], ob[23]);
+  assertCanonicalSlot(ds[24], oa[24], ob[24]);
+  assertCanonicalSlot(ds[25], oa[25], ob[25]);
+  assertCanonicalSlot(ds[26], oa[26], ob[26]);
+  assertCanonicalSlot(ds[27], oa[27], ob[27]);
+  assertCanonicalSlot(ds[28], oa[28], ob[28]);
+  assertCanonicalSlot(ds[29], oa[29], ob[29]);
+  assertCanonicalSlot(ds[30], oa[30], ob[30]);
+  assertCanonicalSlot(ds[31], oa[31], ob[31]);
+  const schemaRoot = schemaRootOf(ds);
+  assert(schemaRoot == content_schemas.lookup(disclose(payload_hash_a)),
+         "doc A schema mismatch");
+  assert(schemaRoot == content_schemas.lookup(disclose(payload_hash_b)),
+         "doc B schema mismatch");
+  assert(contentRootOf(ds, oa, doc_salt_a())
+           == content_roots.lookup(disclose(payload_hash_a)),
+         "doc A opening does not match anchored root");
+  assert(contentRootOf(ds, ob, doc_salt_b())
+           == content_roots.lookup(disclose(payload_hash_b)),
+         "doc B opening does not match anchored root");
+  if (m == 0) {
+    assert(constrainsSlot(allowed_mask[0],  ds[0])
+        || constrainsSlot(allowed_mask[1],  ds[1])
+        || constrainsSlot(allowed_mask[2],  ds[2])
+        || constrainsSlot(allowed_mask[3],  ds[3])
+        || constrainsSlot(allowed_mask[4],  ds[4])
+        || constrainsSlot(allowed_mask[5],  ds[5])
+        || constrainsSlot(allowed_mask[6],  ds[6])
+        || constrainsSlot(allowed_mask[7],  ds[7])
+        || constrainsSlot(allowed_mask[8],  ds[8])
+        || constrainsSlot(allowed_mask[9],  ds[9])
+        || constrainsSlot(allowed_mask[10], ds[10])
+        || constrainsSlot(allowed_mask[11], ds[11])
+        || constrainsSlot(allowed_mask[12], ds[12])
+        || constrainsSlot(allowed_mask[13], ds[13])
+        || constrainsSlot(allowed_mask[14], ds[14])
+        || constrainsSlot(allowed_mask[15], ds[15])
+        || constrainsSlot(allowed_mask[16], ds[16])
+        || constrainsSlot(allowed_mask[17], ds[17])
+        || constrainsSlot(allowed_mask[18], ds[18])
+        || constrainsSlot(allowed_mask[19], ds[19])
+        || constrainsSlot(allowed_mask[20], ds[20])
+        || constrainsSlot(allowed_mask[21], ds[21])
+        || constrainsSlot(allowed_mask[22], ds[22])
+        || constrainsSlot(allowed_mask[23], ds[23])
+        || constrainsSlot(allowed_mask[24], ds[24])
+        || constrainsSlot(allowed_mask[25], ds[25])
+        || constrainsSlot(allowed_mask[26], ds[26])
+        || constrainsSlot(allowed_mask[27], ds[27])
+        || constrainsSlot(allowed_mask[28], ds[28])
+        || constrainsSlot(allowed_mask[29], ds[29])
+        || constrainsSlot(allowed_mask[30], ds[30])
+        || constrainsSlot(allowed_mask[31], ds[31]),
+           "mask must constrain at least one schema slot");
+    assertUnchanged(allowed_mask[0],  ds[0],  oa[0],  ob[0]);
+    assertUnchanged(allowed_mask[1],  ds[1],  oa[1],  ob[1]);
+    assertUnchanged(allowed_mask[2],  ds[2],  oa[2],  ob[2]);
+    assertUnchanged(allowed_mask[3],  ds[3],  oa[3],  ob[3]);
+    assertUnchanged(allowed_mask[4],  ds[4],  oa[4],  ob[4]);
+    assertUnchanged(allowed_mask[5],  ds[5],  oa[5],  ob[5]);
+    assertUnchanged(allowed_mask[6],  ds[6],  oa[6],  ob[6]);
+    assertUnchanged(allowed_mask[7],  ds[7],  oa[7],  ob[7]);
+    assertUnchanged(allowed_mask[8],  ds[8],  oa[8],  ob[8]);
+    assertUnchanged(allowed_mask[9],  ds[9],  oa[9],  ob[9]);
+    assertUnchanged(allowed_mask[10], ds[10], oa[10], ob[10]);
+    assertUnchanged(allowed_mask[11], ds[11], oa[11], ob[11]);
+    assertUnchanged(allowed_mask[12], ds[12], oa[12], ob[12]);
+    assertUnchanged(allowed_mask[13], ds[13], oa[13], ob[13]);
+    assertUnchanged(allowed_mask[14], ds[14], oa[14], ob[14]);
+    assertUnchanged(allowed_mask[15], ds[15], oa[15], ob[15]);
+    assertUnchanged(allowed_mask[16], ds[16], oa[16], ob[16]);
+    assertUnchanged(allowed_mask[17], ds[17], oa[17], ob[17]);
+    assertUnchanged(allowed_mask[18], ds[18], oa[18], ob[18]);
+    assertUnchanged(allowed_mask[19], ds[19], oa[19], ob[19]);
+    assertUnchanged(allowed_mask[20], ds[20], oa[20], ob[20]);
+    assertUnchanged(allowed_mask[21], ds[21], oa[21], ob[21]);
+    assertUnchanged(allowed_mask[22], ds[22], oa[22], ob[22]);
+    assertUnchanged(allowed_mask[23], ds[23], oa[23], ob[23]);
+    assertUnchanged(allowed_mask[24], ds[24], oa[24], ob[24]);
+    assertUnchanged(allowed_mask[25], ds[25], oa[25], ob[25]);
+    assertUnchanged(allowed_mask[26], ds[26], oa[26], ob[26]);
+    assertUnchanged(allowed_mask[27], ds[27], oa[27], ob[27]);
+    assertUnchanged(allowed_mask[28], ds[28], oa[28], ob[28]);
+    assertUnchanged(allowed_mask[29], ds[29], oa[29], ob[29]);
+    assertUnchanged(allowed_mask[30], ds[30], oa[30], ob[30]);
+    assertUnchanged(allowed_mask[31], ds[31], oa[31], ob[31]);
+    const integrityKey = persistentHash<DocumentIntegrityClaim>(DocumentIntegrityClaim {
+      payload_hash_a: payload_hash_a,
+      payload_hash_b: payload_hash_b,
+      allowed_mask:   allowed_mask,
+      epoch_a:        attestationEpoch(payload_hash_a),
+      epoch_b:        attestationEpoch(payload_hash_b)
+    });
+    document_integrity_results.insert(disclose(integrityKey), true);
+    return;
+  }
+  assert(k >= 1 && k <= 32, "k out of range");
+  const count = slotDiff(ds[0],  oa[0],  ob[0])
+              + slotDiff(ds[1],  oa[1],  ob[1])
+              + slotDiff(ds[2],  oa[2],  ob[2])
+              + slotDiff(ds[3],  oa[3],  ob[3])
+              + slotDiff(ds[4],  oa[4],  ob[4])
+              + slotDiff(ds[5],  oa[5],  ob[5])
+              + slotDiff(ds[6],  oa[6],  ob[6])
+              + slotDiff(ds[7],  oa[7],  ob[7])
+              + slotDiff(ds[8],  oa[8],  ob[8])
+              + slotDiff(ds[9],  oa[9],  ob[9])
+              + slotDiff(ds[10], oa[10], ob[10])
+              + slotDiff(ds[11], oa[11], ob[11])
+              + slotDiff(ds[12], oa[12], ob[12])
+              + slotDiff(ds[13], oa[13], ob[13])
+              + slotDiff(ds[14], oa[14], ob[14])
+              + slotDiff(ds[15], oa[15], ob[15])
+              + slotDiff(ds[16], oa[16], ob[16])
+              + slotDiff(ds[17], oa[17], ob[17])
+              + slotDiff(ds[18], oa[18], ob[18])
+              + slotDiff(ds[19], oa[19], ob[19])
+              + slotDiff(ds[20], oa[20], ob[20])
+              + slotDiff(ds[21], oa[21], ob[21])
+              + slotDiff(ds[22], oa[22], ob[22])
+              + slotDiff(ds[23], oa[23], ob[23])
+              + slotDiff(ds[24], oa[24], ob[24])
+              + slotDiff(ds[25], oa[25], ob[25])
+              + slotDiff(ds[26], oa[26], ob[26])
+              + slotDiff(ds[27], oa[27], ob[27])
+              + slotDiff(ds[28], oa[28], ob[28])
+              + slotDiff(ds[29], oa[29], ob[29])
+              + slotDiff(ds[30], oa[30], ob[30])
+              + slotDiff(ds[31], oa[31], ob[31]);
+  assert(count >= k, "too few differing fields");
+  const diffKey = persistentHash<DocumentDiffClaim>(DocumentDiffClaim {
+    payload_hash_a: payload_hash_a,
+    payload_hash_b: payload_hash_b,
+    k:              k,
+    epoch_a:        attestationEpoch(payload_hash_a),
+    epoch_b:        attestationEpoch(payload_hash_b)
+  });
+  document_diff_results.insert(disclose(diffKey), true);
+}
