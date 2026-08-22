@@ -11,6 +11,7 @@
  * ({ artifactPath, privateStateId, zkConfigPath } per name).
  */
 
+import cds from '@sap/cds';
 import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
@@ -219,13 +220,38 @@ export function loadRegistryFromConfig(config?: Record<string, any>, baseDir = p
     for (const [name, reg] of Object.entries(contracts)) {
         const r = reg as ContractRegistration;
         if (!r?.artifactPath || !r?.privateStateId || !r?.zkConfigPath) continue;
-        registerContract(name, {
+        const resolved = {
             artifactPath:   resolveContractPath(r.artifactPath, baseDir),
             privateStateId: r.privateStateId,
             zkConfigPath:   resolveContractPath(r.zkConfigPath, baseDir),
             ...(r.slotWidth !== undefined ? { slotWidth: Number(r.slotWidth) } : {})
-        });
+        };
+        registerContract(name, resolved);
+        warnOnMissingProverKeys(name, resolved.zkConfigPath);
     }
+}
+
+/**
+ * Verifier keys without prover keys: the contract deploys and its claims
+ * verify, but nothing can PROVE its circuits here, and `/zk-config` answers
+ * a bare 404 to browser provers. The npm package ships the width-32 vault
+ * this way (its prover set is 113 MB, over the registry's publish limit),
+ * so say it once at boot instead of failing opaquely at proving time.
+ */
+function warnOnMissingProverKeys(name: string, zkConfigPath: string): void {
+    let files: string[];
+    try { files = fs.readdirSync(path.join(zkConfigPath, 'keys')); } catch { return; }
+    const missing = files
+        .filter(f => f.endsWith('.verifier'))
+        .map(f => f.replace(/\.verifier$/, ''))
+        .filter(circuit => !files.includes(`${circuit}.prover`));
+    if (missing.length === 0) return;
+    cds.log('nightgate').warn(
+        `contract '${name}' has no prover keys for ${missing.length} circuit(s) ` +
+        `(${missing.slice(0, 3).join(', ')}${missing.length > 3 ? ', …' : ''}). Deploy and crawler-free ` +
+        `verification work; PROVING those circuits here (and serving them over /zk-config) does not. ` +
+        `Fetch them with "npx nightgate-fetch-keys ${name}" (they land in ${path.join(zkConfigPath, 'keys')}), ` +
+        `then restart. Doing so changes this contract's artifact generation digest, so fetch before the first proof.`);
 }
 
 /**

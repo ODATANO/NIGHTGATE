@@ -101,15 +101,18 @@
     "@cds-models/**/*.js",
     "@cds-models/**/*.d.ts",
     "contracts/**/managed/**/*",
+    "!contracts/attestation-vault-32/**/*.prover",
     "contracts/**/src/*.compact",
     "contracts/**/package.json",
     "scripts/apply-schema-delta.mjs",
     "scripts/check-server.mjs",
+    "scripts/fetch-contract-keys.mjs",
     "README.md",
     "LICENSE"
   ],
   "bin": {
-    "nightgate-schema-delta": "scripts/apply-schema-delta.mjs"
+    "nightgate-schema-delta": "scripts/apply-schema-delta.mjs",
+    "nightgate-fetch-keys": "scripts/fetch-contract-keys.mjs"
   },
   "scripts": {
     "clean": "node scripts/clean-build-artifacts.js",

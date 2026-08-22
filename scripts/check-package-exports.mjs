@@ -38,13 +38,16 @@ collectTargets(pkg.exports ?? {}, '.', targets);
 
 // `npm pack --dry-run --json` reports exactly what would ship, `files` globs already applied.
 let packed;
+let packedBytes = 0;
 try {
     const out = execFileSync('npm', ['pack', '--dry-run', '--json'], {
         encoding: 'utf8',
         stdio: ['ignore', 'pipe', 'ignore'],
         shell: process.platform === 'win32',
     });
-    packed = new Set(JSON.parse(out)[0].files.map((f) => f.path.replace(/\\/g, '/')));
+    const report = JSON.parse(out)[0];
+    packed = new Set(report.files.map((f) => f.path.replace(/\\/g, '/')));
+    packedBytes = Number(report.size ?? 0);
 } catch (e) {
     console.error(`check-package-exports: could not run "npm pack --dry-run": ${e.message}`);
     process.exit(1);
@@ -110,9 +113,14 @@ if (tracked) {
 //     consumer must be able to diff source against the compiled circuits).
 for (const required of [
     'scripts/apply-schema-delta.mjs',
+    // the CLI that fetches the prover keys this tarball deliberately omits
+    'scripts/fetch-contract-keys.mjs',
     'contracts/attestation-vault/src/attestation-vault.compact',
     'contracts/attestation-vault-32/src/attestation-vault-32.compact',
-    'contracts/attestation-vault-32/src/managed/attestation-vault-32/keys/proveDocumentComparison.prover'
+    // the width-32 PROVER keys are fetched, not packed (see below), but its
+    // verifier keys must ship: deploy and the circuit list depend on them
+    'contracts/attestation-vault-32/src/managed/attestation-vault-32/keys/proveDocumentComparison.verifier',
+    'contracts/attestation-vault/src/managed/attestation-vault/keys/proveDocumentComparison.prover'
 ]) {
     if (!packed.has(required)) {
         console.error(`check-package-exports: '${required}' is NOT in the tarball (files allowlist).`);
@@ -134,6 +142,26 @@ for (const packedFile of packed) {
         failed = true;
         break;
     }
+}
+
+// The width-32 prover set is 113 MB and pushed the tarball past the
+// registry's publish limit (E413 at 204 MB; 0.18.0 shipped at 85 MB). Its
+// verifier keys, zkir and contract module ship, the provers do not. Keep
+// that deliberate: re-adding them silently makes the release unpublishable.
+if ([...packed].some((f) => /^contracts\/attestation-vault-32\/.*\.prover$/.test(f))) {
+    console.error(
+        'check-package-exports: width-32 prover keys are back in the tarball. They are 113 MB and the ' +
+            'registry rejects the resulting package (E413); keep the "!contracts/attestation-vault-32/**/*.prover" deny.',
+    );
+    failed = true;
+}
+const MAX_TARBALL_MB = 120;
+if (packedBytes / (1024 * 1024) > MAX_TARBALL_MB) {
+    console.error(
+        `check-package-exports: tarball is ${(packedBytes / (1024 * 1024)).toFixed(1)} MB, over the ` +
+            `${MAX_TARBALL_MB} MB budget. The registry answers E413 well before 200 MB.`,
+    );
+    failed = true;
 }
 
 if (failed) process.exit(1);

@@ -20,7 +20,10 @@ Registered contracts:
   width. Registration carries `slotWidth: 32`; deploy size and cost are
   identical to the 16er (every verifier key is 2119 B, though four verifier
   CONTENTS differ: comparison plus the content-tree circuits), the
-  comparison prover doubles (72.9 MB, wasm-provable). Wider trees are not
+  comparison prover doubles (72.9 MB, wasm-provable). Its prover keys are
+  committed here but NOT packed into the npm tarball (113 MB, over the
+  registry's publish limit); an npm consumer fetches them once with
+  `npx nightgate-fetch-keys attestation-vault-32`. Wider trees are not
   supported: the registry rejects `slotWidth: 64` because the mask path is
   32-bit, and a 64-wide comparison prover exceeds the wasm prover's memory
   anyway (proof-server-only).

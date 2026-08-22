@@ -14,10 +14,12 @@ byte layouts stay identical, nothing to redeploy.
   recompute, browser helpers via the new `./browser/attestation-vault-32`
   subpath, `/zk-config` + contract manifest). Cross-root proofs work only
   between documents of the SAME width; the width is part of the tree shape.
-  Cost is honest: the 32er prover set ships in the package (+114 MB; the
-  comparison prover alone is 72.9 MB and proves in ~443 s wasm / ~92 s on a
-  proof server, the content-tree circuits grow with the deeper fold, the
-  attest/anchor/grant circuits are byte-identical). Measured 8/16/32/64 before
+  Cost is honest: the comparison prover alone is 72.9 MB and proves in
+  ~443 s wasm / ~92 s on a proof server, the content-tree circuits grow with
+  the deeper fold, the attest/anchor/grant circuits are byte-identical.
+  The 32er's 113 MB of PROVER keys are the one thing the package does not
+  carry (the registry rejects the resulting tarball); see the entry below.
+  Measured 8/16/32/64 before
   choosing: keys scale linearly with width, wasm proving hits its 4 GB
   ceiling at 64, so 16/32 is the supported menu (the registry accepts
   8/16/32 and rejects 64: the mask path is 32-bit). A non-default width is
@@ -49,6 +51,22 @@ byte layouts stay identical, nothing to redeploy.
   `docs/actions.md` carry the operational guidance (verify per claim,
   independent verification without NIGHTGATE, schema-id/segment caveat,
   attest concurrency warning).
+- **Width-32 prover keys are fetched, not packed.** Carrying every width's
+  full prover set made the tarball 204 MB and the npm registry refuses it
+  (413). The package ships the 32er's contract module, verifier keys, zkir
+  and Compact source; its 113 MB of prover keys are not in it, which keeps
+  the package in the same size class as 0.18. Deploying `attestation-vault-32`
+  and verifying its claims crawler-free work as they are; PROVING its
+  circuits locally (and serving them over `/zk-config`) needs the keys on
+  disk. One command puts them there, defaulting to this release's own git
+  tag, whose layout IS the `/zk-config` layout:
+  `npx nightgate-fetch-keys attestation-vault-32` (or `--from
+  https://host/zk-config/attestation-vault-32` to pull from a NIGHTGATE that
+  has them). Run it before the first proof: prover keys are part of the
+  artifact GENERATION digest, so adding them changes what the contract
+  resolves to. A server that boots without them says so once, by name.
+  Container images are unaffected, they build from the repo and have
+  everything.
 - **`npm run check:server`**: one-shot health probe of a running server
   (health, readiness, optional sponsor dust/balance/sync), local or hosted.
 
