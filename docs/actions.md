@@ -663,6 +663,54 @@ Response:
 
 **Wallet still syncing:** the read waits at most `NIGHTGATE_WALLET_READ_SYNC_TIMEOUT_MS` (default 10 s) for the facade to reach the indexer tip, then answers `503` with error code `WALLET_SYNCING`. Treat it as retryable: poll again once the prewarm job reports ready. The same gate applies to the fee estimate below.
 
+### `getSponsorPoolStatus() → [{ sessionId, configured, usable, dustBalance, unshieldedNight, totalNightUtxoCount, registeredNightUtxos, dustNotes, pendingDustNotes, dustRestoreCount, caughtUp, lastError }]`
+
+Fee-sponsor pool health in one call (0.20.0). Covers every session listed in `NIGHTGATE_FEE_SPONSOR_SESSION` / `cds.requires.nightgate.feeSponsorSessions`, so a caller no longer has to know those ids out of band and fan out `getWalletBalance` per sponsor.
+
+`dustNotes` **is** the parallelism: unbound sponsoring locks one free dust note per in-flight transaction, so N notes means N concurrent sponsorships from one wallet. It counts SPENDABLE notes, so a note already committed to an in-flight spend is not in it (it shows up in `pendingDustNotes` instead). It is not `registeredNightUtxos`, which counts the sponsor own NIGHT registered for dust generation: dust generation is delegable, so a foreign wallet pointing its NIGHT here grows the notes while the own registrations stay put. `pendingDustNotes > 0` means a spend is in flight or a note leaked (the wedge signature), `dustRestoreCount` counts how often the wedge protection fired, and `usable` is the short answer (spendable notes present and dust above zero).
+
+Listed for every authenticated caller, because every authenticated caller may already use these sponsors and a dry pool is why their submissions fail. `dustBalance` and `unshieldedNight` are null unless the caller is an admin or owns the session; the counts and operational flags stay readable either way. An unreadable sponsor comes back as a row with `lastError` rather than failing the call, so one bad entry cannot hide the rest of the pool.
+
+**Not available to agent tokens.** A token request runs as the grant's operator, so allowing it would have let any grant, whatever session it is bound to, read the pool status of every sponsor session that operator owns, exact balances included. It is neither always-allowed nor allow-listable and returns 403.
+
+The read never builds a cold wallet facade. A sponsor is treated as cold only when it is NEITHER resident in this process NOR has reported sync progress, and such a row comes back with `lastError` saying so; a facade restored from persisted state at the tip is resident without ever reporting progress, and it IS read. A status endpoint that creates work lets a polling monitor accumulate worker calls that outlive their request. Each sponsor is additionally capped by `NIGHTGATE_SPONSOR_STATUS_TIMEOUT_MS` (default 20 s), and the cap reaches the worker RPC itself rather than only the caller's wait.
+
+**Rate limit:** 60/min per client IP.
+
+Response:
+```json
+[
+  {
+    "sessionId": "cf5a952e-744a-4543-ac57-5ee7c97db6ab",
+    "configured": true,
+    "usable": true,
+    "dustBalance": "12065772407328298858",
+    "unshieldedNight": "950000000",
+    "totalNightUtxoCount": 4,
+    "registeredNightUtxos": 4,
+    "dustNotes": 11,
+    "pendingDustNotes": 0,
+    "dustRestoreCount": 0,
+    "caughtUp": true,
+    "lastError": null
+  },
+  {
+    "sessionId": "ccfbe02d-7e0e-458b-8a12-3738c75c8f09",
+    "configured": true,
+    "usable": false,
+    "dustBalance": null,
+    "unshieldedNight": null,
+    "totalNightUtxoCount": 0,
+    "registeredNightUtxos": 0,
+    "dustNotes": 0,
+    "pendingDustNotes": 0,
+    "dustRestoreCount": 0,
+    "caughtUp": false,
+    "lastError": "sponsor facade is not warm yet; ask again once it has synced"
+  }
+]
+```
+
 ### `getWalletSyncProgress(sessionId) → { known, caughtUp, appliedIndex, streamTip, behindEvents, eventsPerSecond, etaSeconds, blockHeight, isConnected, indexerFresh, elapsedMs, phase, updatedAt }`
 
 How far the wallet's catch-up has got and how fast it is moving. Poll this instead of guessing from elapsed time: a wallet that has been idle for a day needs a long catch-up, and without these numbers a slow sync and a hung one look identical.
@@ -713,12 +761,42 @@ Crawler sync state. **This is the crawler's view, not the wallet's.** During wal
 ### `getSyncStatus() → SyncState`
 ### `getMetrics() → String`
 
-`getMetrics` returns Prometheus text format. Metric prefix: `odatano_nightgate_*`. Includes chain height, indexed height, sync lag, block throughput, error counts, uptime, sync status (mapped: stopped=0, syncing=1, synced=2, error=3), runtime-topology gauges (`_runtime_topology_valid`, `_runtime_replicas`, `_runtime_database_info`), and background-job gauges (`_jobs_queued`, `_jobs_running`, `_jobs_reconciliation_required`, `_jobs_oldest_queued_seconds`).
+`getMetrics` returns Prometheus text format. Metric prefix: `odatano_nightgate_*`. Includes chain height, indexed height, sync lag, block throughput, error counts, uptime, sync status (mapped: stopped=0, syncing=1, synced=2, error=3), runtime-topology gauges (`_runtime_topology_valid`, `_runtime_replicas`, `_runtime_database_info`), background-job gauges (`_jobs_queued`, `_jobs_running`, `_jobs_reconciliation_required`, `_jobs_oldest_queued_seconds`) and wallet-worker gauges (`_wallet_worker_running`, `_wallet_worker_inflight_rpcs`, `_wallet_worker_exits`).
+
+**Scrapers want the plain route, not this function.** Over OData the body arrives wrapped as `{"@odata.context":"...","value":"# HELP ..."}`, which no Prometheus can parse. Since 0.20.0 the identical text is served as `text/plain` at `GET /nightgate/metrics`, alongside `GET /nightgate/health` and `GET /nightgate/ready` for probes that cannot express an OData function call. Same payloads, computed by the same code.
+
+Those routes are mounted on the express app during CAP's `bootstrap` event, **before** CAP attaches its authentication middlewares to the service paths, so whatever protects the OData surface does not protect them. Two consequences, both deliberate:
+
+- **Fail-closed.** Nothing is mounted until the operator says how the routes may be reached: `NIGHTGATE_STATUS_TOKEN=<secret>` (then every request needs `Authorization: Bearer <secret>`, compared in constant time) or `NIGHTGATE_STATUS_ROUTES=public` for deliberate anonymous access. Neither set means no extra HTTP surface. `NIGHTGATE_STATUS_ROUTES=off` disables them outright.
+- **Namespaced.** Everything lives under a prefix, `/nightgate` by default and configurable via `NIGHTGATE_STATUS_ROUTES_PREFIX`. NIGHTGATE is a plugin in someone else's express app, and CAP registers its own `/health` right after the bootstrap event, so a handler on a generic path would shadow the host's own liveness endpoint and let a NIGHTGATE database problem decide a foreign app's health.
+
+Error responses carry no internal detail; the reason goes to the log.
+
+### `getRuntimeInfo() → { version, network, provingMode, instanceId, runtimeMode, databaseKind, uptime, contracts[] }`
+
+What this process IS, including two digests per registered contract. `artifactDigest` is the generation this process **loaded** and stamped onto persisted commands; `currentDigest` is what the files hash to **right now**, which is what `resolveContract` compares against. `digestStale: true` means they disagree: artifacts were replaced under the running server, and every write job fails the generation guard until it restarts. Reporting only the cached digest would have hidden exactly the failure this function exists to explain. A contract whose artifact does not load returns both digests as null with `digestError` set.
+
+Hashing the registered artifacts is expensive (roughly 200 MB for the bundled set), so `currentDigest` is memoised behind a per-file stat fingerprint (size, mtime, ctime, inode, mode) and re-hashed regardless once the entry is older than `NIGHTGATE_ARTIFACT_DIGEST_MAX_AGE_MS` (default 5 minutes). `resolveContract` does not use that cache: its check runs against the bytes it is about to import. `@requires: 'authenticated-user'`, rate-limited to 30/min per client.
+
+### `getWorkerStatus() → { started, running, inFlightRpcs, exitCount, lastExitCode, lastExitAt, rpcTimeoutMs, facadeCount, facades[] }`
+
+Wallet worker health at process level, as opposed to `getWalletSyncProgress(sessionId)` per facade. A climbing `exitCount` means the submission side is crash-looping; an `inFlightRpcs` that only grows is a stall. Deliberately its own function and **not** an entry in `getReadiness().checks`: a worker that is merely busy must not take the process out of rotation.
+
+`facades[]` is **admin only** and empty for everyone else; `facadeCount` is always populated. The per-facade `sessionId` is the wallet cacheKey, an accountId derived from wallet material and stable across sessions, so handing the list to every authenticated caller would disclose which wallets the process holds, across tenants. `@requires: 'authenticated-user'`.
 
 ### `getLiveness() → { status, timestamp, uptime }`
-### `getReadiness() → { ready, crawlerEnabled, checks: { database, crawler, node, runtime } }`
+### `getReadiness() → { ready, crawlerEnabled, checks: { database, crawler, node, runtime, initialization }, initializationMode }`
 
 Kubernetes-style probes. `getReadiness` reports `ready: true` when every applicable check passes; a deliberately disabled crawler (the Docker default) passes its `crawler`/`node` checks as not-applicable and is flagged via `crawlerEnabled: false`, so a submission/verification-only deployment is not permanently unready.
+
+`initialization` (0.20.0) is true only once `initialize()` has **completed successfully**: it requires both that the process finished initialising and that it did not end up offline. Two states fail it, and neither condition alone catches both:
+
+- **Initialisation failed**, `initializationMode: 'offline'` — an un-migrated database the schema preflight refused, a crawler that would not start, a submission pipeline that did not come up. `initialize()` still sets its initialised flag in some of these, so the mode has to be checked as well.
+- **Initialisation never ran or was torn down**, `initializationMode: 'idle'` with the flag unset — the startup window before `initialize()` runs, `SKIP_AUTO_INIT`, a host that never started the plugin, or the state after `shutdown()`. Note that a *successful* crawler-less start also reports `'idle'`, so the mode alone cannot separate these.
+
+Before this check, such a process answered `ready: true` whenever the crawler was disabled, because a plain SELECT on the old `SyncState` table succeeded, and the pod took traffic with submission and sessions never wired up. When the check fails, a stable, sanitised reason is appended to `runtimeWarnings`; the raw startup error stays in the log because it carries the database path and driver SQL.
+
+**If you embed NIGHTGATE with `SKIP_AUTO_INIT`** and still want its readiness to describe your host, either let the plugin initialise or probe your own endpoint: this one reports what NIGHTGATE can do, and a NIGHTGATE that never started cannot serve.
 
 ### `getReorgHistory(limit?) → ReorgLog[]`
 
@@ -735,6 +813,10 @@ Operator controls, `@requires: 'admin'` (since 0.5.2; unauthenticated or non-adm
 ## Admin
 
 `invalidateSession(sessionId)` / `invalidateAllSessions()` - force-close sessions. Distinct from `disconnectWallet` in that admin can target any session, not just one the caller owns.
+
+`BackgroundJobs` (read-only entity, 0.20.0) - the job queue over OData, projected without `command`, `request` and `result` (payload carriers; `command` is encrypted at rest). Until now the queue was only reachable through `getJobStatus(jobId, sessionId)`, which needs an id the caller already has. Full OData query surface, so `?$filter=status eq 'failed'&$orderby=createdAt desc` works. **Adding this projection creates a SQL view, so it does not exist on an already-deployed database until `cds deploy` or `nightgate-schema-delta` has run.**
+
+`getJobStats(windowHours?) → { windowHours, since, total, byStatus[], topErrors[], oldestQueuedSeconds }` (0.20.0) - the cheap aggregate for a dashboard: counts per status plus the ten error codes that are piling up, over the last `windowHours` (default 24, max 720). `topErrors` is what turns "many jobs failed" into a diagnosis, for instance a run of `1010/188` meaning batched calls are crossing the guaranteed/fallible boundary.
 
 `grantRole(userId, role, scope?, validUntil?)` - grant a disclosure tier (`public_only` | `legitimate_interest` | `authority`) read by the `AttestationService` mixin's `attachDisclosureRole` middleware. Caller must already hold `authority`. This is the **off-chain** tier table (`DisclosureRoles`).
 

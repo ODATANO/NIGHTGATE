@@ -16,7 +16,7 @@ import { decrypt, getEncryptionKey } from './utils/crypto';
 import { deriveAccountId } from './submission/wallet-material-factory';
 import { evictWalletFacade } from './submission/wallet-facade-builder';
 
-import { WalletSessions, DisclosureRoles } from '#cds-models/midnight';
+import { WalletSessions, DisclosureRoles, BackgroundJobs } from '#cds-models/midnight';
 
 /**
  * Drop the in-memory WalletFacade (live secret keys) cached for a session, so a
@@ -42,6 +42,60 @@ export default class NightgateAdminService extends cds.ApplicationService {
     async init(): Promise<void> {
         await ensureNightgateModelLoaded();
         this.db = await cds.connect.to('db');
+
+        this.on('getJobStats', async (req: Request) => {
+            const { windowHours } = req.data as { windowHours?: number };
+            const hours = Math.min(Math.max(Number(windowHours) || 24, 1), 720);
+            const since = new Date(Date.now() - hours * 3600_000).toISOString();
+
+            // Aggregate in the DATABASE, not here. The window bounds time, not
+            // row count: at a high job rate "the last 720 hours" is millions of
+            // rows, and pulling them into the process on every dashboard poll
+            // would cost memory and query time for numbers SQL can fold itself.
+            const [statusRows, errorRows, oldestRows] = await Promise.all([
+                this.db.run(
+                    SELECT.from(BackgroundJobs)
+                        .columns('status', 'count(*) as count')
+                        .where({ createdAt: { '>=': since } })
+                        .groupBy('status')
+                ),
+                this.db.run(
+                    SELECT.from(BackgroundJobs)
+                        .columns('errorCode', 'count(*) as count')
+                        .where({ createdAt: { '>=': since }, and: { errorCode: { '!=': null } } })
+                        .groupBy('errorCode')
+                ),
+                this.db.run(
+                    SELECT.from(BackgroundJobs)
+                        .columns('min(createdAt) as oldest')
+                        .where({ createdAt: { '>=': since }, and: { status: 'pending' } })
+                )
+            ]);
+
+            const byStatus = ((statusRows as Array<{ status?: string; count?: number }>) || [])
+                .map(row => ({ status: row.status || 'unknown', count: Number(row.count ?? 0) }))
+                .sort((a, b) => b.count - a.count);
+
+            const topErrors = ((errorRows as Array<{ errorCode?: string; count?: number }>) || [])
+                .filter(row => row.errorCode)
+                .map(row => ({ errorCode: String(row.errorCode), count: Number(row.count ?? 0) }))
+                .sort((a, b) => b.count - a.count)
+                .slice(0, 10);
+
+            const oldest = (oldestRows as Array<{ oldest?: string | null }> | undefined)?.[0]?.oldest;
+            const oldestMs = oldest ? new Date(oldest).getTime() : NaN;
+
+            return {
+                windowHours: hours,
+                since,
+                total: byStatus.reduce((sum, row) => sum + row.count, 0),
+                byStatus,
+                topErrors,
+                oldestQueuedSeconds: Number.isFinite(oldestMs)
+                    ? Math.max(0, Math.round((Date.now() - oldestMs) / 1000))
+                    : 0
+            };
+        });
 
         this.on('invalidateSession', async (req: Request) => {
             const { sessionId } = req.data as { sessionId: string };

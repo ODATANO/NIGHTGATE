@@ -32,9 +32,14 @@ vi.mock('@sap/cds', () => {
                 },
                 from: (entity: string) => {
                     selectFromSpy(entity);
+                    // getJobStats aggregates in SQL: .columns().where().groupBy()
+                    const withGroupBy = (...args: any[]) => {
+                        selectWhereSpy(...args);
+                        return { groupBy: vi.fn() };
+                    };
                     return {
                         where: selectWhereSpy,
-                        columns: vi.fn().mockReturnValue({ where: selectWhereSpy })
+                        columns: vi.fn().mockReturnValue({ where: withGroupBy })
                     };
                 }
             },
@@ -309,6 +314,82 @@ describe('NightgateAdminService', () => {
             const req = createMockRequest({ userId: 'bob', role: 'authority' });
             await handler(req);
             expect(req.reject).toHaveBeenCalledWith(403, expect.any(String));
+        });
+    });
+
+    describe('getJobStats', () => {
+        /**
+         * The three aggregates the handler issues, in order: counts per status,
+         * counts per error code, oldest pending timestamp. They are computed in
+         * SQL rather than by pulling the window's rows into the process, which
+         * at a high job rate would be millions of records per poll.
+         */
+        function aggregates(oldestPendingAgeMs: number | null = 300_000) {
+            mockDbRun
+                .mockResolvedValueOnce([
+                    { status: 'succeeded', count: 2 },
+                    { status: 'failed', count: 3 },
+                    { status: 'pending', count: 2 }
+                ])
+                .mockResolvedValueOnce([
+                    { errorCode: 'SubmissionError', count: 1 },
+                    { errorCode: '1010/188', count: 2 }
+                ])
+                .mockResolvedValueOnce([
+                    { oldest: oldestPendingAgeMs === null ? null : new Date(Date.now() - oldestPendingAgeMs).toISOString() }
+                ]);
+        }
+
+        it('counts by status and ranks the error codes that are piling up', async () => {
+            aggregates();
+            const result: any = await registeredHandlers['getJobStats'](createMockRequest({}, 'admin-1'));
+
+            expect(result.total).toBe(7);
+            expect(result.byStatus).toEqual([
+                { status: 'failed', count: 3 },
+                { status: 'succeeded', count: 2 },
+                { status: 'pending', count: 2 }
+            ]);
+            // The ranking is the point: it turns "many jobs failed" into a
+            // diagnosis, here batched calls crossing the fallible boundary.
+            expect(result.topErrors[0]).toEqual({ errorCode: '1010/188', count: 2 });
+        });
+
+        it('aggregates in the database instead of loading the window', async () => {
+            aggregates();
+            await registeredHandlers['getJobStats'](createMockRequest({}, 'admin-1'));
+            // Three grouped queries, not one row-by-row read.
+            expect(mockDbRun).toHaveBeenCalledTimes(3);
+        });
+
+        it('ages the OLDEST queued job', async () => {
+            aggregates(300_000);
+            const result: any = await registeredHandlers['getJobStats'](createMockRequest({}, 'admin-1'));
+            expect(result.oldestQueuedSeconds).toBeGreaterThanOrEqual(290);
+            expect(result.oldestQueuedSeconds).toBeLessThan(320);
+        });
+
+        it('reports zero queue age when nothing is pending', async () => {
+            aggregates(null);
+            const result: any = await registeredHandlers['getJobStats'](createMockRequest({}, 'admin-1'));
+            expect(result.oldestQueuedSeconds).toBe(0);
+        });
+
+        it('defaults to 24 hours and clamps the window at both ends', async () => {
+            mockDbRun.mockResolvedValue([]);
+            const call = async (windowHours?: number) =>
+                (await registeredHandlers['getJobStats'](createMockRequest({ windowHours }, 'admin-1'))) as any;
+
+            expect((await call()).windowHours).toBe(24);
+            expect((await call(0)).windowHours).toBe(24);   // 0 is falsy → default
+            expect((await call(-5)).windowHours).toBe(1);
+            expect((await call(10_000)).windowHours).toBe(720);
+        });
+
+        it('survives an empty queue', async () => {
+            mockDbRun.mockResolvedValue([]);
+            const result: any = await registeredHandlers['getJobStats'](createMockRequest({}, 'admin-1'));
+            expect(result).toMatchObject({ total: 0, byStatus: [], topErrors: [] });
         });
     });
 });

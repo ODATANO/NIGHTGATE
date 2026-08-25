@@ -37,7 +37,19 @@ vi.mock('@sap/cds', () => {
                         __kind: 'one',
                         __table: table
                     }))
-                }
+                },
+                // The submission bootstrap (job recovery) reads with the
+                // plain form. Without it initialize() now reports the
+                // submission pipeline as failed, which it would be.
+                from: vi.fn((table: unknown) => ({
+                    __kind: 'select',
+                    __table: table,
+                    columns: vi.fn().mockReturnThis(),
+                    where: vi.fn().mockReturnThis(),
+                    orderBy: vi.fn().mockReturnThis(),
+                    limit: vi.fn().mockReturnThis(),
+                    groupBy: vi.fn().mockReturnThis()
+                }))
             },
             DELETE: {
                 from: vi.fn((table: unknown) => ({
@@ -78,6 +90,26 @@ vi.mock('../../srv/submission/wallet-facade-builder', () => ({
     evictWalletFacade:       vi.fn(async () => undefined),
     __getCacheSizeForTests:            vi.fn(() => 0),
     __clearAllFacadesForTests:         vi.fn()
+}));
+
+// The submission bootstrap (job recovery, processor, chain confirmer) is its
+// own concern with its own suites. This harness mocks cds.ql minimally on
+// purpose, so without these stubs the bootstrap throws and initialize()
+// correctly reports the process as offline, which is not what these tests are
+// about. mockRecoverJobs is flipped to throwing in one test below to pin
+// exactly that path.
+const mockRecoverJobs = vi.hoisted(() => (vi.fn(async () => undefined)));
+const mockStartJobProcessor = vi.hoisted(() => (vi.fn(async () => undefined)));
+vi.mock('../../srv/submission/background-jobs', () => ({
+    recoverInterruptedJobs: mockRecoverJobs,
+    dropPendingJobsForClosedSessions: vi.fn(async () => 0),
+    startBackgroundJobProcessor: mockStartJobProcessor,
+    stopBackgroundJobProcessor: vi.fn(async () => undefined),
+    registerChainOutcomeConfirmer: vi.fn()
+}));
+
+vi.mock('../../srv/sessions/wallet-sessions', () => ({
+    closeSessionsFromPreviousProcess: vi.fn(async () => 0)
 }));
 
 const mockClearAllEncryptionKeys = vi.hoisted(() => (vi.fn(async () => undefined)));
@@ -260,6 +292,38 @@ describe('runtime initialize', () => {
         expect(mockDbDeploy).not.toHaveBeenCalled();
         expect(mockCdsDeploy).not.toHaveBeenCalled();
         // Crawler also never started; we fail before any subsequent init step.
+        expect(mockStartCrawler).not.toHaveBeenCalled();
+    });
+
+    it('reports offline when the submission pipeline fails to start', async () => {
+        // It used to be a log line and nothing else: initialize() carried on,
+        // set initialized = true and published active/idle, so a process that
+        // could not sign, submit or sponsor anything still answered ready.
+        mockStartJobProcessor.mockRejectedValueOnce(new Error('worker thread refused to spawn'));
+
+        const status = await initialize();
+
+        expect(status).toEqual(expect.objectContaining({
+            mode: 'offline',
+            lastError: expect.stringContaining('submission pipeline did not start')
+        }));
+        expect(status.lastError).toContain('worker thread refused to spawn');
+    });
+
+    it('refuses to start on a database missing a column this release added', async () => {
+        const { SchemaNotDeployedError } = await import('../../src/index.js');
+
+        // The probe list carries each release's NEW columns, not just table
+        // names: a 0.19 database passes every table probe and would then die
+        // on the first connectWallet, which writes WalletSessions.label. It
+        // has to fail here instead, with the migration named.
+        const probesBeforeWalletSessions = 12;
+        for (let i = 0; i < probesBeforeWalletSessions; i++) mockDbRun.mockResolvedValueOnce({});
+        mockDbRun.mockRejectedValueOnce(new Error('no such column: label'));
+
+        const err = await initialize().catch(e => e);
+        expect(err).toBeInstanceOf(SchemaNotDeployedError);
+        expect(err.missingTable).toBe('midnight.WalletSessions (needs columns: label)');
         expect(mockStartCrawler).not.toHaveBeenCalled();
     });
 

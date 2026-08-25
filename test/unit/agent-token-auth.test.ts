@@ -33,6 +33,22 @@ describe('agent-token-auth', () => {
         expect(req.user.id).toBe('nightgate');
     });
 
+    test('the operator carries its configured roles, so the admin surface is reachable', () => {
+        // Dropping the roles made user.is('admin') false for the only account
+        // the standard image has, and the whole admin service answered 403.
+        (cds as any).env.requires.auth = {
+            impl: 'x',
+            users: { nightgate: { password: 'op-secret', roles: ['admin'] } }
+        };
+        const { req } = run({ authorization: basic('nightgate', 'op-secret') }, '/api/v1/admin/whatever');
+        expect(req.user.is('admin')).toBe(true);
+    });
+
+    test('a user configured without roles gets none', () => {
+        const { req } = run({ authorization: basic('nightgate', 'op-secret') }, '/api/v1/admin/whatever');
+        expect(req.user.is('admin')).toBe(false);
+    });
+
     test('wrong basic credentials 401 and NEVER fall through to the token lane', () => {
         const { res, next } = run({
             authorization: basic('nightgate', 'wrong'),

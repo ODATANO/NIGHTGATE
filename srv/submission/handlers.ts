@@ -59,7 +59,7 @@ import {
     deriveRawTokenType, TokenTypeError,
     SHIELDED_TEST_TOKEN_REF, SHIELDED_TEST_TOKEN_CIRCUIT, SHIELDED_TEST_TOKEN_AMOUNT
 } from './token-type';
-import { startJob, runChildCommand, registerBackgroundJobProcessor, registerBackgroundJobReconciliationFinalizer, type BackgroundJobRow, type ReconciliationEvidence } from './background-jobs';
+import { startJob, JobAdmissionBusyError, runChildCommand, registerBackgroundJobProcessor, registerBackgroundJobReconciliationFinalizer, type BackgroundJobRow, type ReconciliationEvidence } from './background-jobs';
 import { reportExternalExecution, reportExternalSubmission, reportSubmissionRejected } from './job-execution-context';
 import { reindexDisclosuresForContract } from './disclosure-indexer';
 import { readAttestationStateForContract } from './attestation-state';
@@ -3915,6 +3915,11 @@ async function runSubmission(req: Request, op: () => Promise<unknown>): Promise<
             // 501 = the session lacks signing material (no seed). The caller must
             // run connectWalletForSigning before deploy/call/submit actions.
             return req.reject(501, err.message);
+        }
+        if (err instanceof JobAdmissionBusyError) {
+            // Busy, not broken: nothing was written and nothing submitted, so the
+            // caller can send the same request again.
+            return req.reject(err.httpStatus, err.message);
         }
         if (err instanceof SubmissionError) {
             const c = err.classification;

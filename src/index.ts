@@ -15,6 +15,7 @@ import {
 } from '../srv/utils/nightgate-config';
 import { loadRegistryFromConfig, listRegisteredContracts } from '../srv/submission/contract-registry';
 import { redactUrlCredentials } from '../srv/utils/redact-url';
+import { publishRuntimeState } from '../srv/utils/runtime-state';
 import { ensureSyncStateSingleton } from '../srv/utils/sync-state';
 import { closeSessionsFromPreviousProcess } from '../srv/sessions/wallet-sessions';
 import { getConfiguredFeeSponsorSessions, prewarmFeeSponsorPool } from '../srv/submission/fee-sponsor';
@@ -53,6 +54,17 @@ let lastStatus: NightgateIndexerStatus = {
     crawlerEnabled: false,
     mode: 'idle'
 };
+
+/**
+ * Single write path for the status, so every change is also published to the
+ * flat holder in srv/. Readiness needs to know whether initialisation failed,
+ * and srv/ cannot import this module: it sits on top of half of srv/ and,
+ * through it, the Midnight SDK.
+ */
+function setLastStatus(next: NightgateIndexerStatus): void {
+    lastStatus = next;
+    publishRuntimeState({ initialized: next.initialized, mode: next.mode, lastError: next.lastError });
+}
 
 function isLikelyNodeConnectionError(message: string): boolean {
     return /ECONNREFUSED|ECONNRESET|ENOTFOUND|ETIMEDOUT|socket hang up|WebSocket|Not connected to Midnight Node/i.test(message);
@@ -128,7 +140,12 @@ async function ensureSchemaDeployed(): Promise<void> {
         // 0.16.0: cross-root claim columns + evidence provenance
         { table: 'midnight.PredicateAttestations', columns: ['payloadHashB', 'allowedMask', 'network', 'compiledArtifactRef', 'artifactDigest'] },
         { table: 'midnight.DisclosureRoles' },
-        { table: 'midnight.BackgroundJobs' }
+        { table: 'midnight.BackgroundJobs' },
+        // 0.20.0: operator-facing session label. Cosmetic, but CAP writes the
+        // column on every connectWallet, so an un-migrated database has to
+        // fail HERE with a message naming the fix, not later on the first
+        // session with an opaque "no such column".
+        { table: 'midnight.WalletSessions', columns: ['label'] }
     ];
 
     const db = cds.db || await cds.connect.to('db');
@@ -165,11 +182,11 @@ export async function initialize(): Promise<NightgateIndexerStatus> {
 
     const nightgateConfig = getNightgatePluginConfig();
     if (!isNightgatePluginConfigured(nightgateConfig)) {
-        lastStatus = {
+        setLastStatus({
             initialized: false,
             crawlerEnabled: false,
             mode: 'idle'
-        };
+        });
         logStartupState('stopped', 'plugin not configured');
         return getStatus();
     }
@@ -188,14 +205,14 @@ export async function initialize(): Promise<NightgateIndexerStatus> {
         const message = `Invalid network "${invalidNetwork}". Must be one of: ${VALID_NIGHTGATE_NETWORKS.join(', ')}. ` +
             `Refusing to start on the "${DEFAULT_NETWORK}" fallback; fix NIGHTGATE_NETWORK / cds.requires.nightgate.network.`;
         initialized = false;
-        lastStatus = {
+        setLastStatus({
             initialized: false,
             crawlerEnabled,
             network,
             nodeUrl,
             mode: 'offline',
             lastError: message
-        };
+        });
         logStartupState('offline', 'invalid network');
         throw new Error(message);
     }
@@ -207,7 +224,7 @@ export async function initialize(): Promise<NightgateIndexerStatus> {
         const message = err instanceof Error ? err.message : String(err);
         const rejected = err instanceof UnsupportedRuntimeTopologyError ? err.topology : undefined;
         initialized = false;
-        lastStatus = {
+        setLastStatus({
             initialized: false,
             crawlerEnabled,
             network,
@@ -219,7 +236,7 @@ export async function initialize(): Promise<NightgateIndexerStatus> {
             replicaCount: rejected?.replicaCount,
             databaseKind: rejected?.databaseKind,
             runtimeWarnings: rejected?.warnings
-        };
+        });
         logStartupState('offline', 'unsupported runtime topology');
         throw err;
     }
@@ -234,7 +251,7 @@ export async function initialize(): Promise<NightgateIndexerStatus> {
     } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         initialized = false;
-        lastStatus = {
+        setLastStatus({
             initialized: false,
             crawlerEnabled,
             network,
@@ -246,7 +263,7 @@ export async function initialize(): Promise<NightgateIndexerStatus> {
             replicaCount: runtimeTopology.replicaCount,
             databaseKind: runtimeTopology.databaseKind,
             runtimeWarnings: runtimeTopology.warnings
-        };
+        });
         logStartupState('offline', 'schema unavailable');
         throw err;
     }
@@ -261,14 +278,14 @@ export async function initialize(): Promise<NightgateIndexerStatus> {
     } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         initialized = false;
-        lastStatus = {
+        setLastStatus({
             initialized: false,
             crawlerEnabled,
             network,
             nodeUrl,
             mode: 'offline',
             lastError: message
-        };
+        });
         logStartupState('offline', 'network/database binding rejected');
         throw err;
     }
@@ -313,6 +330,12 @@ export async function initialize(): Promise<NightgateIndexerStatus> {
         }
     }
 
+
+    // Set when the submission pipeline (wallet worker, job processor, chain
+    // confirmer) fails to come up. It used to be logged and forgotten, which
+    // let a process with no working submission path publish itself as
+    // initialised and answer ready.
+    let submissionStartupError: string | undefined;
 
     // Load any contracts declared under cds.requires.nightgate.contracts into
     // the in-memory registry. Safe to call repeatedly, idempotent.
@@ -388,13 +411,18 @@ export async function initialize(): Promise<NightgateIndexerStatus> {
         const msg = err instanceof Error ? err.message : String(err);
         log.warn(`Wallet worker startup failed: ${msg}`);
         log.warn('Signing-related operations will fail until restart');
+        // Not just a log line: with the submission pipeline dead this process
+        // cannot sign, submit or sponsor anything, so it must not report
+        // itself ready. Readiness reads the published mode.
+        submissionStartupError = `submission pipeline did not start: ${msg}`;
     }
 
     log.info(`Network: ${network}`);
     log.info(`Node: ${redactUrlCredentials(nodeUrl)}`);
 
     let mode: NightgateIndexerStatus['mode'] = crawlerEnabled ? 'active' : 'idle';
-    let lastError: string | undefined;
+    let lastError: string | undefined = submissionStartupError;
+    if (submissionStartupError) mode = 'offline';
 
     if (crawlerEnabled) {
         try {
@@ -424,7 +452,7 @@ export async function initialize(): Promise<NightgateIndexerStatus> {
     }
 
     initialized = true;
-    lastStatus = {
+    setLastStatus({
         initialized,
         crawlerEnabled,
         network,
@@ -436,7 +464,7 @@ export async function initialize(): Promise<NightgateIndexerStatus> {
         replicaCount: runtimeTopology.replicaCount,
         databaseKind: runtimeTopology.databaseKind,
         runtimeWarnings: runtimeTopology.warnings
-    };
+    });
 
     return getStatus();
 }
@@ -453,10 +481,10 @@ export async function shutdown(): Promise<void> {
     } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         log.warn(`Crawler stop error: ${message}`);
-        lastStatus = {
+        setLastStatus({
             ...lastStatus,
             lastError: message
-        };
+        });
     }
     try {
         await stopWalletWorker();
@@ -473,11 +501,11 @@ export async function shutdown(): Promise<void> {
         log.warn(`Encryption key cleanup error: ${message}`);
     }
     initialized = false;
-    lastStatus = {
+    setLastStatus({
         ...lastStatus,
         initialized: false,
         mode: 'idle'
-    };
+    });
 }
 
 /** Return the last known indexer status. */

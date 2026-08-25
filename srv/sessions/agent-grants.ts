@@ -42,6 +42,7 @@ import { getConfiguredFeeSponsorSessions } from '../submission/fee-sponsor';
 import { runWithoutAmbientTx } from '../submission/background-jobs';
 import { resolveFeeSponsor, FeeSponsorError } from '../submission/fee-sponsor';
 import { getNightgatePluginConfig } from '../utils/nightgate-config';
+import { isSessionExpired } from '../utils/session-expiry';
 
 const { SELECT, INSERT, UPDATE } = cds.ql;
 
@@ -101,6 +102,12 @@ export const AGENT_ALWAYS_ALLOWED_EVENTS: ReadonlySet<string> = new Set([
     'prepareMembershipSet', // compute-only (canonical set tree)
     'deriveTokenType', // compute-only (token identity from address + separator)
     'getJobStatus'
+    // NOT getSponsorPoolStatus. It looked harmless ("let a pinned agent see
+    // whether its sponsor can still pay"), but the enforcement hook below
+    // replaces the principal with the grant's OPERATOR, so any token, however
+    // minimal and whatever session it is bound to, would read the pool status
+    // of every sponsor session that operator owns, exact balances included.
+    // That is precisely the boundary a grant exists to draw.
 ]);
 
 const grantAdminRateLimiter = new RateLimiter({ windowMs: 60 * 60 * 1000, maxRequests: 10 });
@@ -186,7 +193,10 @@ export function registerAgentGrantHandlers(srv: any, db: any): void {
             SELECT.one.from(WalletSessions).where({ sessionId: data.sessionId, isActive: true, userId })
         ));
         if (!session) return req.reject(404, 'Session not found or inactive');
-        if (session.expiresAt && new Date(session.expiresAt) < new Date()) {
+        // Shared rule (srv/utils/session-expiry.ts): a configured platform fee
+        // sponsor is infrastructure and does not expire while configured, so a
+        // grant may be issued through one.
+        if (isSessionExpired(data.sessionId, session.expiresAt)) {
             return req.reject(410, 'Session expired');
         }
 

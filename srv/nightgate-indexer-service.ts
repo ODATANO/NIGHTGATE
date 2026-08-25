@@ -12,12 +12,23 @@ import { resolveNightgateRuntimeConfig, getNightgatePluginConfig } from './utils
 import { ensureSyncStateSingleton } from './utils/sync-state';
 import { isCrawlerRunning, startCrawler, stopCrawler } from './crawler';
 import { rollbackIndexedDataFromHeight, RollbackResult } from './crawler/rollback';
-import { SyncState, ReorgLog, BackgroundJobs } from '#cds-models/midnight';
-import { getRuntimeTopology } from './utils/runtime-topology';
+import { SyncState, ReorgLog } from '#cds-models/midnight';
+import {
+    buildHealth,
+    buildLiveness,
+    buildMetricsText,
+    buildReadiness,
+    buildRuntimeInfo,
+    buildWorkerStatus
+} from './monitoring/status';
+
+import { RateLimiter } from './utils/rate-limiter';
 
 const log = cds.log('nightgate:indexer');
-const processStartTime = Date.now();
-const metricPrefix = 'odatano_nightgate';
+
+// getRuntimeInfo can force a full artifact re-hash; keep a caller from
+// hammering it. Generous enough for any dashboard cadence.
+const runtimeInfoRateLimiter = new RateLimiter({ windowMs: 60 * 1000, maxRequests: 30 });
 
 export default class NightgateIndexerService extends cds.ApplicationService {
     private db!: cds.DatabaseService;
@@ -83,60 +94,10 @@ export default class NightgateIndexerService extends cds.ApplicationService {
             };
         });
 
-        this.on('getHealth', async () => {
-            const topology = getRuntimeTopology(getNightgatePluginConfig());
-            const syncState = await this.db.run(
-                SELECT.one.from(SyncState).where({ ID: 'SINGLETON' })
-            );
-
-            if (!syncState) {
-                return {
-                    status: 'unknown',
-                    chainHeight: 0,
-                    indexedHeight: 0,
-                    finalizedHeight: 0,
-                    lag: 0,
-                    finalizedLag: 0,
-                    blocksPerSecond: 0,
-                    syncStatus: 'stopped',
-                    instanceId: topology.instanceId,
-                    runtimeMode: topology.runtimeMode,
-                    replicaCount: topology.replicaCount,
-                    databaseKind: topology.databaseKind,
-                    topologyValid: topology.valid,
-                    runtimeWarnings: [...topology.errors, ...topology.warnings]
-                };
-            }
-
-            // Integer64/Decimal columns come back as STRINGS from CAP 10
-            // databases (ieee754compatible); coerce so the health payload
-            // keeps its numeric contract on both CAP 9 and 10.
-            const chainHeight = Number(syncState.chainHeight || 0);
-            const indexedHeight = Number(syncState.lastIndexedHeight || 0);
-            const finalizedHeight = Number(syncState.lastFinalizedHeight || 0);
-            const lag = Math.max(chainHeight - indexedHeight, 0);
-            const finalizedLag = Math.max(chainHeight - finalizedHeight, 0);
-            let status = 'healthy';
-            if (lag > 100) status = 'unhealthy';
-            else if (lag > 10) status = 'degraded';
-
-            return {
-                status,
-                chainHeight,
-                indexedHeight,
-                finalizedHeight,
-                lag,
-                finalizedLag,
-                blocksPerSecond: Number(syncState.blocksPerSecond || 0),
-                syncStatus: syncState.syncStatus || 'stopped',
-                instanceId: topology.instanceId,
-                runtimeMode: topology.runtimeMode,
-                replicaCount: topology.replicaCount,
-                databaseKind: topology.databaseKind,
-                topologyValid: topology.valid,
-                runtimeWarnings: [...topology.errors, ...topology.warnings]
-            };
-        });
+        // The four status handlers below delegate to srv/monitoring/status.ts,
+        // which the plain /health, /ready and /metrics routes call as well.
+        // Same code, same numbers, whichever way a caller arrives.
+        this.on('getHealth', async () => buildHealth(this.db));
 
         this.on('getReorgHistory', async (req: Request) => {
             const { limit } = req.data as { limit?: number };
@@ -148,144 +109,31 @@ export default class NightgateIndexerService extends cds.ApplicationService {
             );
         });
 
-        this.on('getLiveness', async () => {
-            const topology = getRuntimeTopology(getNightgatePluginConfig());
-            return {
-                status: 'alive',
-                timestamp: new Date().toISOString(),
-                uptime: Math.floor((Date.now() - processStartTime) / 1000),
-                instanceId: topology.instanceId
-            };
-        });
+        this.on('getLiveness', async () => buildLiveness());
 
-        this.on('getReadiness', async () => {
-            const pluginConfig = getNightgatePluginConfig();
-            const topology = getRuntimeTopology(pluginConfig);
-            // A deliberately disabled crawler (the Docker default) is not a
-            // readiness failure: submission/verification runs without it. The
-            // crawler/node checks then pass as "not applicable" so ready
-            // reflects what this deployment actually operates.
-            const crawlerEnabled = (resolveNightgateRuntimeConfig(pluginConfig).crawlerConfig as any)?.enabled !== false;
-            const checks = {
-                database: false,
-                crawler: !crawlerEnabled,
-                node: !crawlerEnabled,
-                runtime: topology.valid
-            };
-
-            try {
-                const syncState = await this.db.run(
-                    SELECT.one.from(SyncState).where({ ID: 'SINGLETON' })
-                );
-                checks.database = true;
-
-                if (syncState && crawlerEnabled) {
-                    checks.crawler = syncState.syncStatus === 'syncing' || syncState.syncStatus === 'synced';
-
-                    if (syncState.lastIndexedAt) {
-                        const lastActivity = new Date(syncState.lastIndexedAt).getTime();
-                        checks.node = (Date.now() - lastActivity) < 5 * 60 * 1000;
-                    }
-                }
-            } catch {
-                // Database not available
+        // New in this release, both deliberately their own functions rather
+        // than extra fields on getReadiness: nothing gates on them.
+        // Rate-limited: the first call after an artifact change hashes every
+        // prover, verifier and zkir file (around 200 MB for the default
+        // registration set) on the event loop. The stat-fingerprint cache
+        // makes the steady state cheap, but a caller that keeps forcing the
+        // slow path must not be able to starve the process.
+        this.on('getRuntimeInfo', async (req: Request) => {
+            const clientKey = (req as any)?._?.req?.ip || 'global';
+            const rate = runtimeInfoRateLimiter.check(clientKey);
+            if (!rate.allowed) {
+                return req.reject(429, `Rate limited. Retry after ${Math.ceil(rate.retryAfterMs / 1000)}s`);
             }
-
-            return {
-                ready: checks.database && checks.crawler && checks.node && checks.runtime,
-                crawlerEnabled,
-                checks,
-                instanceId: topology.instanceId,
-                runtimeMode: topology.runtimeMode,
-                replicaCount: topology.replicaCount,
-                databaseKind: topology.databaseKind,
-                runtimeWarnings: [...topology.errors, ...topology.warnings]
-            };
+            return buildRuntimeInfo();
         });
+        // The per-facade list carries wallet-derived account ids, so it is
+        // admin only; everyone else gets the counts.
+        this.on('getWorkerStatus', async (req: Request) =>
+            buildWorkerStatus(Boolean((req.user as any)?.is?.('admin'))));
 
-        this.on('getMetrics', async () => {
-            const syncState = await this.db.run(
-                SELECT.one.from(SyncState).where({ ID: 'SINGLETON' })
-            );
+        this.on('getReadiness', async () => buildReadiness(this.db));
 
-            const lines: string[] = [];
-            // Number() coercion: Integer64/Decimal read back as strings on CAP 10.
-            const chainHeight = Number(syncState?.chainHeight || 0);
-            const indexedHeight = Number(syncState?.lastIndexedHeight || 0);
-            const lag = chainHeight - indexedHeight;
-            const bps = Number(syncState?.blocksPerSecond || 0);
-            const errors = syncState?.consecutiveErrors || 0;
-            const uptimeSec = Math.floor((Date.now() - processStartTime) / 1000);
-            const syncStatus = syncState?.syncStatus || 'stopped';
-            const topology = getRuntimeTopology(getNightgatePluginConfig());
-            let jobRows: Array<{ status?: string; createdAt?: string }> = [];
-            try {
-                jobRows = await this.db.run(
-                    SELECT.from(BackgroundJobs).columns('status', 'createdAt')
-                        .where({ status: { in: ['pending', 'running', 'external_execution', 'submitted', 'reconciliation_required'] } })
-                ) || [];
-            } catch {
-                // Metrics must stay available during schema rollout/degraded DB states.
-            }
-            const queuedJobs = jobRows.filter(job => job.status === 'pending');
-            const runningJobs = jobRows.filter(job => ['running', 'external_execution', 'submitted'].includes(job.status || ''));
-            const reconciliationJobs = jobRows.filter(job => job.status === 'reconciliation_required');
-            const oldestQueuedSeconds = queuedJobs.length
-                ? Math.max(0, (Date.now() - Math.min(...queuedJobs.map(job => new Date(job.createdAt || Date.now()).getTime()))) / 1000)
-                : 0;
-
-            lines.push(`# HELP ${metricPrefix}_chain_height Current chain height`);
-            lines.push(`# TYPE ${metricPrefix}_chain_height gauge`);
-            lines.push(`${metricPrefix}_chain_height ${chainHeight}`);
-
-            lines.push(`# HELP ${metricPrefix}_indexed_height Last indexed block height`);
-            lines.push(`# TYPE ${metricPrefix}_indexed_height gauge`);
-            lines.push(`${metricPrefix}_indexed_height ${indexedHeight}`);
-
-            lines.push(`# HELP ${metricPrefix}_sync_lag Blocks behind chain tip`);
-            lines.push(`# TYPE ${metricPrefix}_sync_lag gauge`);
-            lines.push(`${metricPrefix}_sync_lag ${lag}`);
-
-            lines.push(`# HELP ${metricPrefix}_blocks_per_second Indexing throughput`);
-            lines.push(`# TYPE ${metricPrefix}_blocks_per_second gauge`);
-            lines.push(`${metricPrefix}_blocks_per_second ${bps}`);
-
-            lines.push(`# HELP ${metricPrefix}_consecutive_errors Consecutive indexing errors`);
-            lines.push(`# TYPE ${metricPrefix}_consecutive_errors gauge`);
-            lines.push(`${metricPrefix}_consecutive_errors ${errors}`);
-
-            lines.push(`# HELP ${metricPrefix}_uptime_seconds Process uptime in seconds`);
-            lines.push(`# TYPE ${metricPrefix}_uptime_seconds gauge`);
-            lines.push(`${metricPrefix}_uptime_seconds ${uptimeSec}`);
-
-            lines.push(`# HELP ${metricPrefix}_sync_status Sync status (0=stopped, 1=syncing, 2=synced, 3=error)`);
-            lines.push(`# TYPE ${metricPrefix}_sync_status gauge`);
-            const statusMap: Record<string, number> = { stopped: 0, syncing: 1, synced: 2, error: 3 };
-            lines.push(`${metricPrefix}_sync_status ${statusMap[syncStatus] ?? 0}`);
-
-            lines.push(`# HELP ${metricPrefix}_runtime_topology_valid Runtime topology support (1=supported, 0=unsupported)`);
-            lines.push(`# TYPE ${metricPrefix}_runtime_topology_valid gauge`);
-            lines.push(`${metricPrefix}_runtime_topology_valid ${topology.valid ? 1 : 0}`);
-
-            lines.push(`# HELP ${metricPrefix}_runtime_replicas Declared Nightgate process/replica count`);
-            lines.push(`# TYPE ${metricPrefix}_runtime_replicas gauge`);
-            lines.push(`${metricPrefix}_runtime_replicas ${topology.replicaCount}`);
-            lines.push(`${metricPrefix}_runtime_database_info{kind="${topology.databaseKind}"} 1`);
-            lines.push(`# HELP ${metricPrefix}_jobs_queued Background jobs waiting to execute`);
-            lines.push(`# TYPE ${metricPrefix}_jobs_queued gauge`);
-            lines.push(`${metricPrefix}_jobs_queued ${queuedJobs.length}`);
-            lines.push(`# HELP ${metricPrefix}_jobs_running Background jobs currently executing or submitted`);
-            lines.push(`# TYPE ${metricPrefix}_jobs_running gauge`);
-            lines.push(`${metricPrefix}_jobs_running ${runningJobs.length}`);
-            lines.push(`# HELP ${metricPrefix}_jobs_reconciliation_required Jobs requiring external-state reconciliation`);
-            lines.push(`# TYPE ${metricPrefix}_jobs_reconciliation_required gauge`);
-            lines.push(`${metricPrefix}_jobs_reconciliation_required ${reconciliationJobs.length}`);
-            lines.push(`# HELP ${metricPrefix}_jobs_oldest_queued_seconds Age of the oldest queued job`);
-            lines.push(`# TYPE ${metricPrefix}_jobs_oldest_queued_seconds gauge`);
-            lines.push(`${metricPrefix}_jobs_oldest_queued_seconds ${oldestQueuedSeconds}`);
-
-            return lines.join('\n') + '\n';
-        });
+        this.on('getMetrics', async () => buildMetricsText(this.db));
 
         this.on('pauseCrawler', async () => {
             if (!isCrawlerRunning()) {

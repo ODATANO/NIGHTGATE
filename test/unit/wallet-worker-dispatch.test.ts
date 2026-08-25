@@ -1425,10 +1425,36 @@ describe('getBalance / estimateTransferFee', () => {
             registeredNightUtxoCount: 1,
             totalNightUtxoCount: 3,
             dustUtxoCount: 2,
+            // `totalCoins` is available PLUS pending, so both notes here are
+            // committed to a spend and none is free. Reading the total as free
+            // capacity promised two parallel sponsorships from a wallet that
+            // could serve none.
+            dustAvailableCount: 0,
             dustPendingCount: 2,
             dustPendingValue: '44',
             dustRestoreCount: 0
         });
+    });
+
+    it('getBalance takes the SDK own available-note list over the subtraction', async () => {
+        const facade = await initSession('session-avail-ffffffffff');
+        facade.waitForSyncedState.mockResolvedValue({
+            shielded: { balances: {} },
+            unshielded: { balances: {}, totalCoins: [], availableCoins: [] },
+            dust: {
+                balance: vi.fn(() => 500n),
+                progress: {},
+                // Deliberately inconsistent with the difference (5 - 2 = 3):
+                // the SDK's own list wins, because the arithmetic is a fallback
+                // for SDK versions that do not expose one.
+                totalCoins: [{}, {}, {}, {}, {}],
+                availableCoins: [{}],
+                pendingCoins: [{}, {}]
+            }
+        });
+        const reply = await rpc('getBalance', { sessionId: 'session-avail-ffffffffff' });
+        expect(reply.ok).toBe(true);
+        expect(reply.result).toMatchObject({ dustUtxoCount: 5, dustAvailableCount: 1, dustPendingCount: 2 });
     });
 
     it('estimateTransferFee prices via calculateTransactionFee and ALWAYS reverts the recipe (bug_002)', async () => {

@@ -24,6 +24,7 @@ import {
     walletInit,
     walletEvict,
     setStateSaveSink,
+    onWorkerGone,
     type WalletInitArgs
 } from '../midnight/wallet-worker-client';
 import {
@@ -118,7 +119,52 @@ export function seedFingerprintOf(seedHex: string): string {
         .digest('hex');
 }
 
+/**
+ * What we know about a wallet, which is TWO things with different lifetimes.
+ *
+ * `sessionRegistry` holds the material a persisted save needs: passphrase,
+ * network, seed fingerprint. `residentAccounts` records that a facade for the
+ * account is alive INSIDE the worker right now.
+ *
+ * They were one map, and that was wrong in both directions. A worker crash
+ * takes every facade with it, so residency has to be dropped; but state-save
+ * events the worker already delivered can still be queued behind a slow DB
+ * write, and dropping the passphrase with the residency made those saves fail
+ * to resolve a session and be discarded. The worker is dead by then and cannot
+ * resend, so the next start restored an older snapshot and cold-resynced the
+ * part in between. Persistence material therefore outlives the worker; only
+ * the residency claim dies with it.
+ */
 const sessionRegistry = new Map<string, SessionRecord>();
+const residentAccounts = new Set<string>();
+
+/** State-save handlers currently writing, so a planned stop can wait for them. */
+const savesInFlight = new Set<Promise<void>>();
+
+onWorkerGone(async (reason) => {
+    if (residentAccounts.size > 0) {
+        log.info(`worker ${reason}: dropping ${residentAccounts.size} facade residency claim(s)`);
+        residentAccounts.clear();
+    }
+    if (reason === 'exit') {
+        // A crash cannot be waited on, and saves the worker already delivered
+        // may still be queued behind a slower write. Their passphrases have to
+        // stay until they resolve, because a dead worker cannot resend.
+        return;
+    }
+    // An intentional stop CAN wait. Finish the queued writes, then release the
+    // storage passphrases: keeping them would leave credentials of closed
+    // sessions referenced for the life of the process, and a shutdown followed
+    // by a re-initialise in the same process is a normal thing to do.
+    if (savesInFlight.size > 0) {
+        log.info(`worker stop: draining ${savesInFlight.size} state-save(s) before releasing passphrases`);
+        await Promise.allSettled([...savesInFlight]);
+    }
+    if (sessionRegistry.size > 0) {
+        log.info(`worker stop: releasing persistence material for ${sessionRegistry.size} account(s)`);
+        sessionRegistry.clear();
+    }
+});
 
 /**
  * Initialise a wallet for `cacheKey` via the worker. Idempotent: subsequent calls
@@ -185,6 +231,11 @@ async function buildWalletFacadeLocked(
         `alreadyExisted=${result.alreadyExisted} sdk=${result.sdkVersion ?? '?'}`
     );
 
+    // Residency is claimed for EVERY facade the worker built, whether or not
+    // the caller asked for persistence: a status surface must see a wallet
+    // that is warm, and persistence is a separate concern below.
+    residentAccounts.add(cacheKey);
+
     if (args.syncStatePassphrase) {
         sessionRegistry.set(cacheKey, {
             passphrase:      args.syncStatePassphrase,
@@ -216,6 +267,7 @@ export async function evictWalletFacade(cacheKey: string): Promise<void> {
     } catch (err) {
         log.warn(`evict failed for ${cacheKey.slice(0, 16)}:`, formatErr(err));
     } finally {
+        residentAccounts.delete(cacheKey);
         sessionRegistry.delete(cacheKey);
         // Registry entry is gone, so the save sink drops any NEW save for this
         // account; now the memoized storage key can go. evictEncryptionKey
@@ -229,13 +281,47 @@ export async function evictWalletFacade(cacheKey: string): Promise<void> {
     }
 }
 
-/** Test-only: registry size probe (no production caller). */
+/**
+ * Is a facade for this account resident RIGHT NOW? A pure in-memory read that
+ * builds nothing, for status surfaces that must report on wallets without
+ * creating work for the worker.
+ *
+ * The sync-progress cache is not a substitute: the worker only pushes progress
+ * snapshots while a sync WAIT is running, so a facade restored from persisted
+ * state that was already at the tip is fully usable and never reported any
+ * progress at all (live-observed on the hosted sponsor pool).
+ */
+export function hasWalletFacade(cacheKey: string): boolean {
+    return residentAccounts.has(cacheKey);
+}
+
+/**
+ * Every account whose facade is resident right now, for status surfaces. Same
+ * caveat as `hasWalletFacade`: the sync-progress cache under-reports, because
+ * a facade restored at the tip never pushes a snapshot, so a warm pool can
+ * look empty. This registry is the authority on what the process holds.
+ */
+export function listWalletFacades(): string[] {
+    return [...residentAccounts];
+}
+
+/** Test-only: residency size probe (no production caller). */
 export function __getCacheSizeForTests(): number {
+    return residentAccounts.size;
+}
+
+/**
+ * Test-only: how many accounts carry PERSISTENCE material. Distinct from
+ * residency on purpose: a facade built without a passphrase is warm but not
+ * persisted, and a facade whose worker died is persisted but not warm.
+ */
+export function __getPersistenceSizeForTests(): number {
     return sessionRegistry.size;
 }
 
-/** Test-only: reset the registry between tests (no production caller). */
+/** Test-only: reset both maps between tests (no production caller). */
 export function __clearAllFacadesForTests(): void {
+    residentAccounts.clear();
     sessionRegistry.clear();
 }
 
@@ -245,7 +331,17 @@ export function __clearAllFacadesForTests(): void {
  * `startWalletWorker()` has resolved.
  */
 export function wireWorkerStateSaveSink(): void {
-    setStateSaveSink(async event => {
+    // Every handler is tracked while it runs, so a planned stop can drain them
+    // before releasing the passphrases they need.
+    setStateSaveSink(event => {
+        const running = handleStateSave(event);
+        savesInFlight.add(running);
+        return running.finally(() => savesInFlight.delete(running));
+    });
+}
+
+async function handleStateSave(event: Parameters<Parameters<typeof setStateSaveSink>[0] & object>[0]): Promise<void> {
+    {
         const session = sessionRegistry.get(event.sessionId);
         if (!session) {
             // The session was evicted between save scheduling and arrival,
@@ -281,5 +377,5 @@ export function wireWorkerStateSaveSink(): void {
             // keeps its lastSavedBlobs stale and re-pushes on the next tick.
             throw err;
         }
-    });
+    }
 }

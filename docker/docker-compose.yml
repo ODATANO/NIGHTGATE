@@ -19,7 +19,7 @@ services:
     # pulls this and only builds locally when the image is unavailable.
     # NIGHTGATE_IMAGE_TAG overrides; keep the default in lockstep with
     # package.json on every release.
-    image: ghcr.io/odatano/nightgate:${NIGHTGATE_IMAGE_TAG:-0.18.0}
+    image: ghcr.io/odatano/nightgate:${NIGHTGATE_IMAGE_TAG:-0.20.0}
     container_name: odatano-nightgate
     ports:
       - "4004:4004"
@@ -39,6 +39,19 @@ services:
       # Optional: switches proving from in-process wasm to a proof server,
       # e.g. http://proof-server:6300 with the service below.
       NIGHTGATE_PROOF_SERVER_URL: "${NIGHTGATE_PROOF_SERVER_URL:-}"
+      # Plain status routes (/nightgate/metrics|health|ready). They sit outside
+      # CAP authentication, so they stay unmounted unless one of these is set.
+      # Leave both empty and the entrypoint still generates an internal token
+      # for the container's own healthcheck; set a token here to scrape from
+      # outside, or NIGHTGATE_STATUS_ROUTES=public to serve them anonymously.
+      NIGHTGATE_STATUS_TOKEN: "${NIGHTGATE_STATUS_TOKEN:-}"
+      NIGHTGATE_STATUS_ROUTES: "${NIGHTGATE_STATUS_ROUTES:-}"
+      # The healthcheck probes <prefix>/ready, so a custom prefix has to reach
+      # the container or the probe would look in the wrong place.
+      NIGHTGATE_STATUS_ROUTES_PREFIX: "${NIGHTGATE_STATUS_ROUTES_PREFIX:-}"
+      # Roles for the single basic-auth operator. Defaults to admin, which the
+      # admin service (session invalidation, job queue) requires.
+      NIGHTGATE_HTTP_ROLES: "${NIGHTGATE_HTTP_ROLES:-admin}"
     volumes:
       - nightgate-data:/data
     restart: unless-stopped

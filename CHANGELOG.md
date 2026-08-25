@@ -1,5 +1,77 @@
 # Changelog
 
+## 0.20.0 - 2026-08-24
+
+Monitoring surface. What a dashboard or a scraper needs was already known
+inside the process and unreachable from outside. Additive, with one migration.
+
+- **Plain status routes.** `getMetrics()` builds Prometheus text and CAP wraps
+  it as `{"value": "# HELP ..."}`, which no scraper parses; a container probe
+  cannot express `/api/v1/indexer/getReadiness()` either. The same payloads are
+  now served as `text/plain` and plain JSON from the same code
+  (`srv/monitoring/status.ts`), and ready answers 200 or 503.
+
+  They mount during CAP's bootstrap, BEFORE its authentication middlewares, so
+  they are **fail-closed**: nothing mounts until an operator sets
+  `NIGHTGATE_STATUS_TOKEN` (bearer, constant-time compare) or
+  `NIGHTGATE_STATUS_ROUTES=public`. And they are **namespaced** under
+  `/nightgate` (`NIGHTGATE_STATUS_ROUTES_PREFIX`): CAP registers its own
+  `/health` right after that event, so a generic path would let a NIGHTGATE
+  database problem decide an unrelated service's health.
+- **`getRuntimeInfo()`**: version, network, proving mode, and two artifact
+  digests per registered contract. `artifactDigest` is the generation this
+  process loaded, `currentDigest` what is on disk now; a mismatch is exactly
+  the state where every write job fails the generation guard until restart.
+  Memoised behind a stat fingerprint (365 ms to 12.8 ms).
+- **`getWorkerStatus()`**: wallet worker health, exit history included. The
+  per-facade list is admin-only (it names the wallets this process holds); the
+  count is not. Residency comes from the facade registry and is dropped when
+  the worker exits, so a pool restored at the tip is neither under- nor
+  over-reported.
+- **`getSponsorPoolStatus()`**: fee-sponsor pool health in one call.
+  `dustNotes` is the parallelism and counts FREE notes only. It is not
+  `registeredNightUtxos`, the sponsor's own NIGHT registered for dust
+  generation: generation is delegable, so a foreign wallet pointing its NIGHT
+  here grows the notes while the own count stays put (measured, 3 to 14).
+  Never builds a cold facade, and not grantable to agent tokens.
+- **`getJobStats()`** on the admin service, aggregating in SQL rather than over
+  every row of the window.
+- **Readiness includes initialisation.** A process whose `initialize()` bailed
+  answered ready:true whenever the crawler was disabled. It now requires
+  `initialized` AND a non-offline mode, and a failed submission bootstrap
+  counts as a failed initialisation rather than a warning.
+- **A worker crash and a planned stop are told apart.** Both drop facade
+  residency, since a facade lives in the worker. A crash then keeps the storage
+  passphrases that state-saves the worker already delivered still need, because
+  it cannot be waited on; a planned stop drains those saves and releases the
+  passphrases, so a `shutdown()` plus re-initialise in one process does not
+  leave credentials of closed sessions referenced.
+- **One session-expiry rule** (`srv/utils/session-expiry.ts`), replacing nine
+  bare date comparisons that each had to remember the platform-sponsor
+  exemption. Facade eviction uses it too.
+- **Registered contracts with witnesses can be deployed.** An unknown contract
+  got an empty witness object, and a Compact constructor checks every declared
+  name, so anything with a witness died before the deploy started. The
+  fallback is now a stub that satisfies the check and throws when a circuit
+  reaches for it.
+- **Job admission survives a busy database.** Five attempts over ~14 s instead
+  of three over 5.5 s, and an exhausted budget answers 503 ("nothing was
+  written, retry") instead of a bare 500. A workflow whose earlier step is
+  already on chain escalates to `reconciliation_required` rather than failing,
+  and does so conservatively when the child state cannot be read either.
+- **Optional `label` on wallet sessions**, settable at `connectWallet`.
+  Cosmetic, never used for lookup or authorisation.
+- **The image health-checks NIGHTGATE, not just its HTTP port**
+  (`docker/healthcheck.mjs`); a 401 or an unexpected 404 is a failure.
+
+**Migration:** `WalletSessions` gains `label`. Run `nightgate-schema-delta`
+before upgrading; the entrypoint only deploys a schema when the database file
+does not exist. A 0.19 database keeps the server offline with the missing
+column named, rather than failing on the first `connectWallet`.
+
+No SDK release: nothing under `packages/`, `src/txbuilder`, `src/browser` or
+`src/sdk` changed.
+
 ## 0.19.0 - 2026-08-22
 
 A 32-slot vault lineage and multi-call batches in the txbuilder SDK. No

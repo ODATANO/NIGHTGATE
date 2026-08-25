@@ -51,6 +51,8 @@ export async function sendNight(args: SendNightArgs): Promise<SendNightResult> {
 export interface GetWalletBalanceArgs {
     cacheKey: string;
     syncTimeoutMs?: number;
+    /** Bounds the worker RPC itself, so an abandoned read cannot linger. */
+    rpcTimeoutMs?: number;
 }
 
 export interface WalletBalanceSnapshot {
@@ -77,7 +79,8 @@ export interface WalletBalanceSnapshot {
 export async function getWalletBalance(args: GetWalletBalanceArgs): Promise<WalletBalanceSnapshot> {
     return walletGetBalance({
         sessionId:     args.cacheKey,
-        syncTimeoutMs: args.syncTimeoutMs
+        syncTimeoutMs: args.syncTimeoutMs,
+        rpcTimeoutMs:  args.rpcTimeoutMs
     });
 }
 

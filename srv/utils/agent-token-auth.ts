@@ -67,7 +67,7 @@ function reject401(res: any): void {
  * module.exports; a default export would land under `.default`.
  */
 function agentTokenAuth(req: any, res: any, next: () => void): void {
-    const users: Record<string, { password?: string }> =
+    const users: Record<string, { password?: string; roles?: string[] }> =
         (cds as any).env?.requires?.auth?.users ?? {};
 
     // Lane 1: valid basic credentials, the operator. Same behavior as before.
@@ -76,7 +76,13 @@ function agentTokenAuth(req: any, res: any, next: () => void): void {
         const known = Object.prototype.hasOwnProperty.call(users, basic.user) ? users[basic.user] : undefined;
         if (known && timingSafeEqualStr(basic.password, String(known.password ?? ''))) {
             const UserCtor = (cds as any).User;
-            (req as any).user = UserCtor ? new UserCtor({ id: basic.user }) : { id: basic.user };
+            // Carry the configured roles. Dropping them made `user.is('admin')`
+            // false for everyone, so the whole admin service answered 403 to
+            // the operator the deployment was built around.
+            const roles = Array.isArray(known.roles) ? known.roles : [];
+            (req as any).user = UserCtor
+                ? new UserCtor({ id: basic.user, roles })
+                : { id: basic.user, roles };
             return next();
         }
         return reject401(res); // wrong credentials never fall through to the token lane

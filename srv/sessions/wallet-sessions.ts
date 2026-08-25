@@ -20,7 +20,7 @@ import {
     estimateSendNightFee
 } from '../submission/token-ops';
 import { ensureNetworkId } from '../midnight/providers';
-import { getOrBuildWalletFacade } from '../submission/wallet-facade-builder';
+import { getOrBuildWalletFacade, hasWalletFacade } from '../submission/wallet-facade-builder';
 import { walletWaitForSyncedState, walletGetSyncProgress } from '../midnight/wallet-worker-client';
 import {
     resolveNightgateRuntimeConfig, getNightgatePluginConfig, mainnetSubmissionBlockReason,
@@ -31,6 +31,7 @@ import { reportExternalExecution } from '../submission/job-execution-context';
 import { mnemonicToBip39SeedHex } from '../utils/wallet-hd';
 import { deriveWalletInfo, resolveBip39SeedHex, deriveViewingKeyForAccount } from '../utils/wallet-info';
 import { resolveFeeSponsor, ensureFeeSponsorFacade, FeeSponsorError, getConfiguredFeeSponsorSessions } from '../submission/fee-sponsor';
+import { isSessionExpired } from '../utils/session-expiry';
 
 // Upper bound for the prewarm sync-to-tip wait
 const PREWARM_SYNC_TIMEOUT_MS = Number(
@@ -132,7 +133,7 @@ async function executeWalletCommand(raw: unknown, job: BackgroundJobRow, db: any
         SELECT.one.from(WalletSessions).where({ sessionId: job.sessionId, isActive: true, userId: job.requestedBy })
     );
     if (!session) throw new Error('Session not found, inactive, or no longer owned by the requesting principal');
-    if (session.expiresAt && new Date(session.expiresAt) < new Date()) throw new Error('Session expired');
+    if (isSessionExpired(job.sessionId, session.expiresAt)) throw new Error('Session expired');
     if (!session.encryptedViewingKey || !session.encryptedSeedKey) throw new Error('Session no longer has signing material');
 
     const encKey = getEncryptionKey();
@@ -252,15 +253,31 @@ function requireUserId(req: Request): string | undefined {
 async function loadSigningSessionAccountId(
     db: any,
     sessionId: string,
-    userId: string
+    /**
+     * Owner constraint. `undefined` looks the session up WITHOUT it, which is
+     * only correct for a configured platform fee sponsor: that session is
+     * infrastructure every authenticated caller may already use as a sponsor,
+     * exactly as resolveFeeSponsor() treats it. Never pass undefined for a
+     * session id that came from a request.
+     */
+    userId: string | undefined,
+    /**
+     * Skip the expiry check. ONLY for a configured platform fee sponsor, which
+     * resolveFeeSponsor() exempts for the same reason: it is infrastructure,
+     * not a caller's session, and the cleanup sweep skips it too. Without this
+     * a perfectly working sponsor pool reads back as expired.
+     */
+    ignoreExpiry = false
 ): Promise<{ ok: true; accountId: string } | { ok: false; status: number; msg: string }> {
+    const where: Record<string, unknown> = { sessionId, isActive: true };
+    if (userId !== undefined) where.userId = userId;
     const session: any = await runWithoutAmbientTx(() => db.run(
-        SELECT.one.from(WalletSessions).where({ sessionId, isActive: true, userId })
+        SELECT.one.from(WalletSessions).where(where)
     ));
     if (!session) return { ok: false, status: 404, msg: 'Session not found or inactive' };
     if (!session.encryptedViewingKey) return { ok: false, status: 404, msg: 'Session has no viewing key' };
     if (!session.encryptedSeedKey) return { ok: false, status: 412, msg: 'Session has no signing key. Call connectWalletForSigning first.' };
-    if (session.expiresAt && new Date(session.expiresAt) < new Date()) {
+    if (!ignoreExpiry && isSessionExpired(sessionId, session.expiresAt)) {
         return { ok: false, status: 410, msg: 'Session expired' };
     }
     let viewingKey: string;
@@ -284,13 +301,19 @@ async function hasLiveSessionForWallet(
     viewingKeyHash: string | null | undefined
 ): Promise<boolean> {
     if (!viewingKeyHash) return false;
-    const now = new Date().toISOString();
+    // Ask the DB only for ACTIVE rows and decide expiry HERE, with the same
+    // predicate the rest of the server uses. A SQL `expiresAt > now` does not
+    // know that a configured platform sponsor never expires, so an expired
+    // sponsor row looked dead to this check while staying alive everywhere
+    // else, and disconnecting a sibling session of the same wallet then
+    // evicted a facade the pool was still sponsoring from.
     const rows: any = await runWithoutAmbientTx(() => db.run(
         SELECT.from(WalletSessions)
-            .columns('sessionId')
-            .where({ viewingKeyHash, isActive: true, expiresAt: { '>': now } })
+            .columns('sessionId', 'expiresAt')
+            .where({ viewingKeyHash, isActive: true })
     ));
-    return Array.isArray(rows) && rows.length > 0;
+    if (!Array.isArray(rows)) return false;
+    return rows.some((r: any) => !isSessionExpired(r.sessionId, r.expiresAt));
 }
 
 /**
@@ -348,11 +371,17 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
         const userId = requireUserId(req);
         if (!userId) return;
 
-        const { viewingKey } = req.data as { viewingKey: string };
+        const { viewingKey, label } = req.data as { viewingKey: string; label?: string };
 
         const validationError = validateViewingKey(viewingKey);
         if (validationError) {
             return req.reject(400, validationError);
+        }
+        // Purely cosmetic, but it is the difference between an operator view
+        // that reads and a wall of UUIDs. Bounded so it cannot be used as a
+        // storage field.
+        if (label !== undefined && label !== null && String(label).length > 100) {
+            return req.reject(400, 'label must be at most 100 characters');
         }
 
         const encKey = getEncryptionKey();
@@ -369,6 +398,7 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
             sessionId: cds.utils.uuid(),
             viewingKeyHash: vkHash,
             encryptedViewingKey: encryptedVk,
+            label: label ? String(label) : null,
             connectedAt: new Date().toISOString(),
             expiresAt,
             isActive: true
@@ -379,6 +409,7 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
         return {
             ID: session.ID,
             sessionId: session.sessionId,
+            label: session.label,
             connectedAt: session.connectedAt,
             expiresAt: session.expiresAt,
             isActive: true
@@ -476,7 +507,7 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
             SELECT.one.from(WalletSessions).where({ sessionId, isActive: true, userId })
         ));
         if (!session) return req.reject(404, 'Session not found or inactive');
-        if (session.expiresAt && new Date(session.expiresAt) < new Date()) {
+        if (isSessionExpired(sessionId, session.expiresAt)) {
             return req.reject(410, 'Session expired');
         }
 
@@ -586,7 +617,7 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
             return req.reject(404, 'Session not found');
         }
 
-        if (session.expiresAt && new Date(session.expiresAt) < new Date()) {
+        if (isSessionExpired(sessionId, session.expiresAt)) {
             await runWithoutAmbientTx(() => db.run(
                 UPDATE.entity(WalletSessions)
                     .set({ isActive: false, encryptedViewingKey: null, encryptedSeedKey: null })
@@ -644,7 +675,7 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
         if (!session) return req.reject(404, 'Session not found or inactive');
         if (!session.encryptedViewingKey) return req.reject(404, 'Session has no viewing key');
         if (!session.encryptedSeedKey) return req.reject(412, 'Session has no signing key. Call connectWalletForSigning first.');
-        if (session.expiresAt && new Date(session.expiresAt) < new Date()) {
+        if (isSessionExpired(sessionId, session.expiresAt)) {
             return req.reject(410, 'Session expired');
         }
 
@@ -685,7 +716,7 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
         if (!session) return req.reject(404, 'Session not found or inactive');
         if (!session.encryptedViewingKey) return req.reject(404, 'Session has no viewing key');
         if (!session.encryptedSeedKey) return req.reject(412, 'Session has no signing key. Call connectWalletForSigning first.');
-        if (session.expiresAt && new Date(session.expiresAt) < new Date()) {
+        if (isSessionExpired(sessionId, session.expiresAt)) {
             return req.reject(410, 'Session expired');
         }
 
@@ -767,7 +798,7 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
         if (!session) return req.reject(404, 'Session not found or inactive');
         if (!session.encryptedViewingKey) return req.reject(404, 'Session has no viewing key');
         if (!session.encryptedSeedKey) return req.reject(412, 'Session has no signing key. Call connectWalletForSigning first.');
-        if (session.expiresAt && new Date(session.expiresAt) < new Date()) {
+        if (isSessionExpired(sessionId, session.expiresAt)) {
             return req.reject(410, 'Session expired');
         }
 
@@ -805,6 +836,212 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
         } catch (err) {
             return rejectWorkerReadError(req, 'getWalletBalance', err);
         }
+    });
+
+    /**
+     * Fee-sponsor pool health in one call.
+     *
+     * Without it a client has to know the configured sponsor session ids out
+     * of band and then call getWalletBalance once per sponsor, which it can
+     * only do for sponsors it owns. What an operator actually wants before a
+     * burst is: can the pool pay, and how many transactions can it sponsor in
+     * parallel (one per registered dust backing).
+     *
+     * Visibility: the pool is listed for every authenticated caller, because
+     * every authenticated caller may already USE it as a sponsor and a dry
+     * pool is the reason their submissions fail. Exact balances are held back
+     * unless the caller is an admin or owns the session; `dustBalance` is null
+     * otherwise, while the operational flags stay readable.
+     */
+    srv.on('getSponsorPoolStatus', async (req: Request) => {
+        const userId = requireUserId(req);
+        if (!userId) return;
+        const clientKey = (req as any)?._.req?.ip || 'global';
+        const rate = diagnosticsRateLimiter.check(clientKey);
+        if (!rate.allowed) {
+            return req.reject(429, `Rate limited. Retry after ${Math.ceil(rate.retryAfterMs / 1000)}s`);
+        }
+
+        const sponsorIds = getConfiguredFeeSponsorSessions(getNightgatePluginConfig());
+        if (sponsorIds.length === 0) return [];
+
+        const isAdmin = Boolean((req.user as any)?.is?.('admin'));
+
+        // A status endpoint must never park the caller. The read-sync gate
+        // bounds the catch-up wait, but BUILDING a cold facade happens before
+        // it and is unbounded, so the whole per-sponsor read gets its own cap.
+        // Sponsors are independent, so they run concurrently rather than
+        // adding their timeouts up.
+        const perSponsorTimeoutMs = (() => {
+            const raw = Number(process.env.NIGHTGATE_SPONSOR_STATUS_TIMEOUT_MS);
+            return Number.isFinite(raw) && raw > 0 ? raw : 20_000;
+        })();
+        const withCap = async <T>(work: Promise<T>, what: string): Promise<T> => {
+            let timer: NodeJS.Timeout | undefined;
+            try {
+                return await Promise.race([
+                    work,
+                    new Promise<never>((_, reject) => {
+                        timer = setTimeout(
+                            () => reject(new Error(`${what} did not answer within ${perSponsorTimeoutMs}ms (facade still warming up?)`)),
+                            perSponsorTimeoutMs
+                        );
+                    })
+                ]);
+            } finally {
+                if (timer) clearTimeout(timer);
+            }
+        };
+
+        const readSponsor = async (sessionId: string) => {
+            const unusable = (lastError: string) => ({
+                sessionId,
+                configured: true,
+                usable: false,
+                dustBalance: null,
+                unshieldedNight: null,
+                totalNightUtxoCount: 0,
+                registeredNightUtxos: 0,
+                dustNotes: 0,
+                pendingDustNotes: 0,
+                dustRestoreCount: 0,
+                caughtUp: false,
+                lastError
+            });
+
+            const session: any = await runWithoutAmbientTx(() => db.run(
+                SELECT.one.from(WalletSessions).where({ sessionId, isActive: true })
+            ));
+            if (!session) return unusable('configured sponsor session is missing or inactive');
+            // A viewing-key-only sponsor cannot sign, so it cannot sponsor
+            // anything. Worth saying plainly: it looks configured and is not.
+            if (!session.encryptedSeedKey) {
+                return unusable('sponsor session has no signing key; call connectWalletForSigning for it');
+            }
+
+            const maySeeAmounts = isAdmin || session.userId === userId;
+
+            // Platform sponsors are looked up without the owner constraint AND
+            // without the expiry check, on purpose: they are infrastructure,
+            // and resolveFeeSponsor() treats them exactly the same way. A pool
+            // that sponsors fine must not read back here as expired.
+            const sess = await loadSigningSessionAccountId(db, sessionId, undefined, true);
+            if (!sess.ok) return unusable(sess.msg);
+
+            const progress = walletGetSyncProgress(sess.accountId);
+            // A STATUS endpoint must not create work. getWalletBalance() builds
+            // the facade when it is absent, and that build outlives the capped
+            // request: a monitor polling every minute would pile up worker RPCs
+            // that never settle (live-observed: inFlightRpcs climbing while no
+            // facade had reported anything).
+            //
+            // Two pure in-memory reads decide whether asking is worth it, and
+            // BOTH are needed. The progress cache only fills while a sync WAIT
+            // runs, so a facade restored from persisted state that was already
+            // at the tip never reports progress even though it is ready (also
+            // live-observed, on the hosted sponsor pool). The facade registry
+            // answers that case.
+            if (!progress && !hasWalletFacade(sess.accountId)) {
+                return {
+                    ...unusable('sponsor facade is not warm yet; ask again once it has synced'),
+                    caughtUp: false
+                };
+            }
+            try {
+                const balance: any = await getWalletBalance({
+                    cacheKey: sess.accountId,
+                    syncTimeoutMs: readSyncTimeoutMs(),
+                    // The cap goes all the way to the worker, not just around
+                    // our own wait: abandoning the promise alone would leave
+                    // the RPC in pendingRpcs until the 30-minute backstop, and
+                    // a polling monitor would rebuild the very backlog this
+                    // endpoint is trying not to cause.
+                    rpcTimeoutMs: perSponsorTimeoutMs
+                });
+                // The parallelism is the number of SPENDABLE dust notes, not
+                // the sponsor's own registered NIGHT. Dust generation can be
+                // delegated: a foreign wallet points its NIGHT at this dust
+                // address and every one of its registered UTXOs yields a note
+                // here, while this sponsor's own registration count never
+                // moves. Reading the own count as capacity showed a pool that
+                // had just quadrupled as flat.
+                const ownRegistered = Number(balance?.registeredNightUtxoCount ?? 0);
+                // FREE notes, not all of them: `dustUtxoCount` is the SDK's
+                // total, which includes notes already committed to an in-flight
+                // spend, and one of those cannot back another sponsorship.
+                const pendingNotes = Number(balance?.dustPendingCount ?? 0);
+                const dustNotes = balance?.dustAvailableCount !== undefined
+                    ? Number(balance.dustAvailableCount)
+                    : Math.max(0, Number(balance?.dustUtxoCount ?? 0) - pendingNotes);
+                return {
+                    sessionId,
+                    configured: true,
+                    // Usable means it can actually pay for something NOW, which
+                    // is about notes in hand. Own registrations are about future
+                    // production and deliberately do not gate this.
+                    usable: dustNotes > 0 && BigInt(String(balance?.dustBalance ?? '0')) > 0n,
+                    dustBalance: maySeeAmounts ? String(balance?.dustBalance ?? '0') : null,
+                    // Dust is GENERATED from registered NIGHT, so the NIGHT
+                    // behind the pool is part of its health: a sponsor whose
+                    // NIGHT is gone stops producing dust once the current
+                    // stock is spent. Amount redacted like the dust balance;
+                    // the UTXO count is operational, not a holding.
+                    unshieldedNight: maySeeAmounts ? String(balance?.unshieldedNight ?? '0') : null,
+                    totalNightUtxoCount: Number(balance?.totalNightUtxoCount ?? 0),
+                    registeredNightUtxos: ownRegistered,
+                    dustNotes,
+                    pendingDustNotes: pendingNotes,
+                    dustRestoreCount: Number(balance?.dustRestoreCount ?? 0),
+                    // The balance read passed the sync gate to get here, so
+                    // the facade reached the indexer tip: this IS the fresher
+                    // observation. `progress` was read BEFORE that call, so a
+                    // snapshot that said "behind" back then would otherwise
+                    // outvote a sync that has since completed, and a facade
+                    // restored at the tip never pushes a snapshot at all.
+                    caughtUp: true,
+                    lastError: null
+                };
+            } catch (err) {
+                // One unreadable sponsor must not hide the rest of the pool.
+                return {
+                    ...unusable(err instanceof Error ? err.message : String(err)),
+                    caughtUp: progress?.caughtUp ?? false
+                };
+            }
+        };
+
+        // Bounded concurrency: independent sponsors must not add their
+        // timeouts up, but a large pool must not build every facade at once.
+        // The cap wraps the WHOLE per-sponsor read, database lookups included,
+        // so a slow query cannot park the caller either.
+        const rows: unknown[] = new Array(sponsorIds.length);
+        let next = 0;
+        await Promise.all(Array.from({ length: Math.min(3, sponsorIds.length) }, async () => {
+            for (;;) {
+                const index = next++;
+                const id = sponsorIds[index];
+                if (id === undefined) return;
+                try {
+                    rows[index] = await withCap(readSponsor(id), 'sponsor status read');
+                } catch (err) {
+                    rows[index] = {
+                        sessionId: id,
+                        configured: true,
+                        usable: false,
+                        dustBalance: null,
+                        unshieldedNight: null,
+                        totalNightUtxoCount: 0,
+                        registeredNightUtxos: 0,
+                        dustNotes: 0,
+                        pendingDustNotes: 0,
+                        dustRestoreCount: 0,
+                        caughtUp: false,
+                        lastError: err instanceof Error ? err.message : String(err)
+                    };
+                }
+            }
+        }));
+        return rows;
     });
 
     srv.on('getWalletSyncProgress', async (req: Request) => {

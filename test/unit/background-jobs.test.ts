@@ -301,6 +301,52 @@ describe('startJob: insert row + return jobId', () => {
         });
     });
 
+    test('an admission that stays locked AFTER a completed step demands reconciliation, not failure', async () => {
+        // The parent carries no txHash of its own, so an ordinary error marks
+        // it `failed` and the parent reconciler never looks at it again. With
+        // step one already on chain, a retry would spend those fees twice.
+        const processor = vi.fn(async () => ({ txHash: '0xstep-one' }));
+        registerBackgroundJobProcessor('childStep', 1, processor);
+        const parent = {
+            ID: 'parent-busy', kind: 'workflow', sessionId: 'sess-1', requestedBy: 'alice', commandVersion: 1
+        } as any;
+
+        const firstPromise = runChildCommand<{ txHash: string }>({
+            parent, kind: 'childStep', step: 'one', commandVersion: 1,
+            request: { step: 'one' }, command: { op: 'submit' }
+        });
+        await flushSpawn();
+        await firstPromise;
+
+        lockInjector.failInserts = 99;
+        try {
+            await expect(runChildCommand({
+                parent, kind: 'childStep', step: 'two', commandVersion: 1,
+                request: { step: 'two' }, command: { op: 'submit' }
+            })).rejects.toBeInstanceOf(WorkflowReconciliationRequiredError);
+        } finally {
+            lockInjector.failInserts = 0;
+        }
+    });
+
+    test('an admission that stays locked with NOTHING done yet fails cleanly', async () => {
+        // Nothing was written and nothing submitted, so this is busy, not
+        // ambiguous: it must not drag an operator into reconciliation.
+        registerBackgroundJobProcessor('childStep', 1, vi.fn(async () => ({ txHash: '0xnope' })));
+        const parent = {
+            ID: 'parent-clean', kind: 'workflow', sessionId: 'sess-1', requestedBy: 'alice', commandVersion: 1
+        } as any;
+        lockInjector.failInserts = 99;
+        try {
+            await expect(runChildCommand({
+                parent, kind: 'childStep', step: 'one', commandVersion: 1,
+                request: { step: 'one' }, command: { op: 'submit' }
+            })).rejects.toMatchObject({ name: 'JobAdmissionBusyError' });
+        } finally {
+            lockInjector.failInserts = 0;
+        }
+    });
+
     test('deduplicates a deterministic workflow child and executes it only once', async () => {
         const processor = vi.fn(async () => ({ txHash: '0xchild' }));
         registerBackgroundJobProcessor('childStep', 1, processor);
@@ -1489,7 +1535,7 @@ describe('recoverInterruptedJobs', () => {
     });
 
     test('survives transient lock contention on the recovery UPDATE', async () => {
-        __setStatusWriteBackoffForTests([0, 0, 0]);
+        __setStatusWriteBackoffForTests([0, 0, 0, 0, 0]);
         const now = new Date().toISOString();
         rows.set('p1', { ID: 'p1', kind: 'sendNight', sessionId: 's', status: 'pending', idempotencyKey: null, request: null, result: null, errorCode: null, errorMessage: null, startedAt: null, finishedAt: null, createdAt: now, modifiedAt: now });
 
@@ -1514,7 +1560,7 @@ describe('recoverInterruptedJobs', () => {
 describe('status-write contention hardening', () => {
     beforeEach(() => {
         // Backoff without waiting; the schedule only skips zero entries.
-        __setStatusWriteBackoffForTests([0, 0, 0]);
+        __setStatusWriteBackoffForTests([0, 0, 0, 0, 0]);
     });
 
     test('the ADMISSION insert survives transient lock contention (job still starts)', async () => {
@@ -1532,6 +1578,23 @@ describe('status-write contention hardening', () => {
         const row = rows.get(ret.jobId)!;
         expect(row.status).toBe('succeeded');
         expect(JSON.parse(row.result!)).toEqual({ txId: 'tx-after-locked-insert' });
+    });
+
+    test('an admission that stays locked is a 503, not a raw lock error', async () => {
+        // Exhausting the budget used to surface `database is locked` as a 500,
+        // which reads as "your request broke the server". Nothing was written
+        // and nothing submitted, so the honest answer is: busy, send it again.
+        lockInjector.failInserts = 99;
+        try {
+            await expect(startJob({
+                kind:      'sponsorUnboundTransaction',
+                sessionId: 'sess-busy',
+                request:   {},
+                work:      async () => ({ txId: 'never-reached' })
+            })).rejects.toMatchObject({ name: 'JobAdmissionBusyError', httpStatus: 503 });
+        } finally {
+            lockInjector.failInserts = 0;
+        }
     });
 
     test('markSucceeded survives transient lock contention (2 lost races)', async () => {
@@ -1590,9 +1653,10 @@ describe('status-write contention hardening', () => {
     });
 
     test('markSucceeded exhausted: job ends failed:RESULT_PERSIST_FAILED instead of stranded running', async () => {
-        // 3 lost races exhaust the succeeded write; the fallback markFailed
-        // write (status 'failed') must go through.
-        lockInjector.failUpdates = 3;
+        // Lost races enough to exhaust the succeeded write (the budget is
+        // STATUS_WRITE_ATTEMPTS); the fallback markFailed write (status
+        // 'failed') must go through.
+        lockInjector.failUpdates = 5;
         lockInjector.matchStatus = 'succeeded';
 
         const ret = await startJob({

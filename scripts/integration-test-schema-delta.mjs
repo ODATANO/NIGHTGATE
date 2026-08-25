@@ -57,6 +57,30 @@ BEGIN
 END;
 INSERT INTO midnight_PredicateAttestations (ID, payloadHash, contractAddress, predicate, op, threshold)
 VALUES ('row-1', 'aa', 'bb', 'lessOrEqual', 0, 42);
+
+-- A 0.19-shaped WalletSessions: everything 0.19 had, WITHOUT the 0.20 label
+-- column. This is the table 0.20's startup preflight refuses on, and the
+-- migration the changelog promises as not-code-only. Without it here the
+-- delta would simply CREATE the table and the ALTER path would go untested.
+CREATE TABLE midnight_WalletSessions (
+    ID TEXT NOT NULL PRIMARY KEY,
+    createdAt TEXT,
+    createdBy TEXT,
+    modifiedAt TEXT,
+    modifiedBy TEXT,
+    userId TEXT,
+    viewingKeyHash TEXT,
+    encryptedViewingKey TEXT,
+    encryptedSeedKey TEXT,
+    accountIndex INTEGER,
+    sessionId TEXT NOT NULL,
+    connectedAt TEXT NOT NULL,
+    disconnectedAt TEXT,
+    expiresAt TEXT,
+    isActive INTEGER DEFAULT TRUE
+);
+INSERT INTO midnight_WalletSessions (ID, userId, sessionId, connectedAt, isActive, encryptedViewingKey)
+VALUES ('sess-row-1', 'operator', 'sess-1', '2026-08-01T00:00:00.000Z', 1, 'cipher');
 `);
 db.close();
 
@@ -78,6 +102,36 @@ const master = after.prepare(
 ).all();
 ok('delta: operator index survived the rebuild', master.some(m => m.type === 'index' && m.name === 'operator_pa_payload_idx'), JSON.stringify(master));
 ok('delta: operator trigger survived the rebuild', master.some(m => m.type === 'trigger' && m.name === 'operator_pa_touch'), JSON.stringify(master));
+
+// --- the 0.20.0 upgrade path, the one the changelog calls not-code-only -----
+const sessionCols = new Map(
+    after.prepare('PRAGMA table_info("midnight_WalletSessions")').all().map(r => [r.name, r])
+);
+ok('delta 0.20: label added to an EXISTING WalletSessions table', sessionCols.has('label'),
+    [...sessionCols.keys()].join(','));
+// ADD COLUMN cannot introduce NOT NULL on a populated table, and the column is
+// cosmetic anyway; a nullable column is the correct outcome.
+ok('delta 0.20: the added label column is nullable', sessionCols.get('label')?.notnull === 0);
+const sessionRow = after.prepare("SELECT * FROM midnight_WalletSessions WHERE ID = 'sess-row-1'").get();
+ok('delta 0.20: the existing session row survived, keys intact',
+    sessionRow?.sessionId === 'sess-1' && sessionRow?.encryptedViewingKey === 'cipher' && sessionRow?.label === null,
+    JSON.stringify(sessionRow));
+
+const jobsView = after.prepare(
+    "SELECT type FROM sqlite_master WHERE name = 'NightgateAdminService_BackgroundJobs'"
+).get();
+ok('delta 0.20: the admin BackgroundJobs projection exists as a view', jobsView?.type === 'view');
+const jobsViewCols = after.prepare('PRAGMA table_info("NightgateAdminService_BackgroundJobs")').all().map(r => r.name);
+ok('delta 0.20: the projection excludes the payload carriers',
+    jobsViewCols.length > 0
+    && !jobsViewCols.includes('command')
+    && !jobsViewCols.includes('request')
+    && !jobsViewCols.includes('result'),
+    jobsViewCols.join(','));
+ok('delta 0.20: the projection keeps what an operator needs',
+    jobsViewCols.includes('status') && jobsViewCols.includes('errorCode') && jobsViewCols.includes('errorMessage'),
+    jobsViewCols.join(','));
+
 after.close();
 rmSync(dir, { recursive: true, force: true });
 

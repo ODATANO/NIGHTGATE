@@ -47,12 +47,16 @@ vi.mock('@sap/cds', () => {
 });
 
 import NightgateIndexerService from '../../srv/nightgate-indexer-service';
+import { publishRuntimeState } from '../../srv/utils/runtime-state';
 
 describe('NightgateIndexerService health', () => {
     let service: NightgateIndexerService;
 
     beforeEach(async () => {
         vi.clearAllMocks();
+        // Readiness requires a completed initialisation; initialize() never
+        // runs here, so publish the state the builder reads.
+        publishRuntimeState({ initialized: true, mode: 'idle' });
         Object.keys(registeredHandlers).forEach(k => delete registeredHandlers[k]);
         mockDbRun.mockResolvedValueOnce({ ID: 'SINGLETON' });
 
@@ -101,7 +105,8 @@ describe('NightgateIndexerService health', () => {
                 database: true,
                 crawler: true,
                 node: true,
-                runtime: true
+                runtime: true,
+                initialization: true
             }
         }));
     });
@@ -123,7 +128,8 @@ describe('NightgateIndexerService health', () => {
                 database: true,
                 crawler: true,
                 node: false,
-                runtime: true
+                runtime: true,
+                initialization: true
             }
         }));
     });

@@ -306,6 +306,30 @@ async function deployConstructorArgs(contractName: string, entry: FacadeEntry): 
  * so we must build them fresh per call; different sessions yield different
  * attester ids.
  */
+/**
+ * Witnesses for a registered contract NIGHTGATE has no witness factory for.
+ *
+ * Every name reads as a function, which is all a Compact constructor checks,
+ * and calling one throws instead of feeding a circuit silent zeroes. A proxy
+ * rather than a fixed set because the declared names live only in the emitted
+ * constructor's checks, not in an exported list.
+ */
+export function unregisteredWitnessStub(contractName: string): Record<string, unknown> {
+    return new Proxy({}, {
+        has: () => true,
+        get: (_target, prop: string | symbol) => {
+            if (typeof prop === 'symbol') return undefined;
+            return () => {
+                throw new Error(
+                    `contract '${contractName}' asked for the witness '${String(prop)}', which NIGHTGATE holds no material for. `
+                    + 'Registered foreign contracts can be deployed (a constructor takes no witnesses); calls into them have to be '
+                    + 'built by the caller, e.g. with @odatano/nightgate/txbuilder, and sponsored.'
+                );
+            };
+        }
+    });
+}
+
 async function getOrCompileContract(
     name: string,
     registration: ContractRegistration,
@@ -331,7 +355,14 @@ async function getOrCompileContract(
             // checks from the registration; absent means the classic 16.
             ...(registration.slotWidth !== undefined ? { slotWidth: registration.slotWidth } : {})
         }))
-        : CompiledContract.withVacantWitnesses;
+        // No factory: a contract we hold no witness material for. Vacant
+        // witnesses are an EMPTY object, and a Compact constructor checks each
+        // declared witness name individually, so anything with witnesses died
+        // in `new Contract({})` before it could be deployed. A deploy never
+        // calls a witness (the constructor runs on public args), so a stub that
+        // satisfies the name check and throws when a CIRCUIT reaches for it
+        // makes foreign contracts deployable and still fails calls loudly.
+        : CompiledContract.withWitnesses(unregisteredWitnessStub(name));
 
     return CompiledContract.make(name, contractClass).pipe(
         witnessStep,
@@ -2661,6 +2692,12 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
         // otherwise indistinguishable from "genuinely empty" without logs.
         const dustUtxos: any[] = synced?.dust?.totalCoins ?? [];
         const dustPending: any[] = synced?.dust?.pendingCoins ?? [];
+        // `totalCoins` is available PLUS pending, so it is not the number of
+        // notes you can spend right now; unbound sponsoring locks one FREE
+        // note per in-flight transaction, and reading the total as capacity
+        // counts notes that are already committed to a spend. Take the SDK's
+        // own available list when it has one, and fall back to the difference.
+        const dustAvailable: any[] | undefined = synced?.dust?.availableCoins;
         const dustPendingValue = dustPending.reduce(
             (sum: bigint, c: any) => sum + (typeof c?.generatedNow === 'bigint' ? c.generatedNow : 0n), 0n
         );
@@ -2672,6 +2709,9 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
             registeredNightUtxoCount: registeredCount,
             totalNightUtxoCount: totalNightCoins.length,
             dustUtxoCount: dustUtxos.length,
+            dustAvailableCount: Array.isArray(dustAvailable)
+                ? dustAvailable.length
+                : Math.max(0, dustUtxos.length - dustPending.length),
             dustPendingCount: dustPending.length,
             dustPendingValue: dustPendingValue.toString(),
             // Persist-CONFIRMED snapshot restores (bumped only after the

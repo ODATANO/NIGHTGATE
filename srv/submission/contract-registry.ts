@@ -100,6 +100,7 @@ export function registerContract(name: string, reg: ContractRegistration): void 
     // A name is a MUTABLE alias; whatever generation it pointed at before is
     // no longer what it resolves to now.
     generationDigests.delete(name);
+    currentDigestCache.delete(name);
 }
 
 /**
@@ -123,6 +124,91 @@ export function getArtifactGenerationDigest(name: string): string {
     if (!reg) throw new ContractNotRegisteredError(name, listRegisteredContracts());
     const digest = computeGenerationDigest(reg);
     generationDigests.set(name, digest);
+    return digest;
+}
+
+/**
+ * How long a cached current-digest may be trusted before it is recomputed
+ * regardless of what the stat metadata says. Bounds the residual risk below.
+ */
+const CURRENT_DIGEST_MAX_AGE_MS = (() => {
+    const raw = Number(process.env.NIGHTGATE_ARTIFACT_DIGEST_MAX_AGE_MS);
+    return Number.isFinite(raw) && raw >= 0 ? raw : 5 * 60 * 1000;
+})();
+
+/**
+ * Cheap change detector: the files' identities and metadata, without reading a
+ * byte of content.
+ *
+ * Size and mtime alone are not enough. A rebuild can produce a byte-different
+ * artifact of the same size, and an atomic replace (write temp, rename) or a
+ * restore from a reproducible-build archive can carry the ORIGINAL mtime over,
+ * leaving both unchanged. So the inode and ctime come along: a rename puts a
+ * different inode in place, and ctime moves on any metadata change including a
+ * permission flip, neither of which a writer can preserve while replacing a
+ * file. Belt and braces, since the failure mode is reporting an artifact swap
+ * as no-change while every job is being refused for exactly that swap; the
+ * caller additionally re-hashes on a timer.
+ */
+function statFingerprint(reg: ContractRegistration): string {
+    const parts: string[] = [];
+    const add = (file: string) => {
+        try {
+            const st = fs.statSync(file);
+            parts.push(`${file}:${st.size}:${st.mtimeMs}:${st.ctimeMs}:${st.ino}:${st.mode}`);
+        } catch {
+            parts.push(`${file}:missing`);
+        }
+    };
+    add(reg.artifactPath);
+    parts.push(`privateStateId:${reg.privateStateId}`);
+    parts.push(`slotWidth:${slotWidthOf(reg)}`);
+    for (const sub of ['keys', 'zkir']) {
+        const dir = path.join(reg.zkConfigPath, sub);
+        let files: string[] = [];
+        try {
+            files = fs.readdirSync(dir).sort();
+        } catch { /* asset-less artifacts */ }
+        for (const f of files) add(path.join(dir, f));
+    }
+    return crypto.createHash('sha256').update(parts.join('\n')).digest('hex');
+}
+
+const currentDigestCache = new Map<string, { fingerprint: string; digest: string; computedAt: number }>();
+
+/**
+ * Digest over the registration's files as they are ON DISK RIGHT NOW. This is
+ * what `resolveContract` compares against, so it is also the only honest
+ * answer for monitoring: after an in-place artifact overwrite the per-alias
+ * cache still reports the generation the process LOADED, while every job is
+ * being refused against this one.
+ *
+ * Hashing those files is NOT cheap: the default registration set is around
+ * 200 MB of prover, verifier and zkir assets, so recomputing it per request
+ * blocks the event loop for hundreds of milliseconds and a handful of polls
+ * would starve the process. The result is therefore memoised behind a
+ * stat-only fingerprint (size, mtime, ctime, inode and mode per file), and
+ * re-hashed anyway once the entry is older than
+ * NIGHTGATE_ARTIFACT_DIGEST_MAX_AGE_MS (default 5 minutes) so no metadata
+ * trick can pin a stale answer indefinitely. Repeated calls inside that window
+ * cost a few stat() syscalls.
+ *
+ * `resolveContract` deliberately does NOT use this: its check must run against
+ * the bytes it is about to import, with no cache between check and use.
+ *
+ * Throws like the cached accessor when the name is not registered.
+ */
+export function getCurrentArtifactDigest(name: string): string {
+    const reg = registry.get(name);
+    if (!reg) throw new ContractNotRegisteredError(name, listRegisteredContracts());
+
+    const fingerprint = statFingerprint(reg);
+    const cached = currentDigestCache.get(name);
+    const fresh = cached && Date.now() - cached.computedAt < CURRENT_DIGEST_MAX_AGE_MS;
+    if (cached && fresh && cached.fingerprint === fingerprint) return cached.digest;
+
+    const digest = computeGenerationDigest(reg);
+    currentDigestCache.set(name, { fingerprint, digest, computedAt: Date.now() });
     return digest;
 }
 
@@ -185,12 +271,14 @@ export function assertArtifactGeneration(name: string, recorded: string | undefi
 
 export function unregisterContract(name: string): boolean {
     generationDigests.delete(name);
+    currentDigestCache.delete(name);
     return registry.delete(name);
 }
 
 export function clearRegistry(): void {
     registry.clear();
     generationDigests.clear();
+    currentDigestCache.clear();
 }
 
 export function listRegisteredContracts(): string[] {

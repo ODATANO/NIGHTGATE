@@ -6,6 +6,9 @@ gen/
 db/*.db
 db/*.db-shm
 db/*.db-wal
+# dated sqlite copies from apply-schema-delta / VACUUM INTO
+db/*.backup-*
+db/backup-*
 *.sqlite
 *.sqlite-shm
 *.sqlite-wal
@@ -39,6 +42,9 @@ srv/**/*.d.ts.map
 .env.local
 .env.*.local
 .env.backup*
+# any hand-made env copy, whatever the suffix: these carry seeds and keys
+.env.bak*
+.env.*.bak
 
 # IDE
 .vscode/
@@ -95,3 +101,7 @@ db/*.bak-shm
 db/*.bak-wal
 db/walletstate-*.json
 .env.fresh-sponsor
+
+# Operator notes for the hosted deployment: host, paths, backup and deploy
+# procedure. Deliberately untracked, this repo is public.
+OPERATIONS.local.md

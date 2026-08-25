@@ -194,6 +194,10 @@ entity DustLedgerEvents : cuid {
 @assert.unique.sessionId: [sessionId]
 entity WalletSessions : cuid, managed {
     userId              : String(200); // owning principal (req.user.id); all session actions are gated on this
+    // Operator-facing name, optional and purely cosmetic: an operator view
+    // that shows "sponsor-pool-1" instead of 523ac66c-a15f-... is the whole
+    // point. Never used for lookup or authorisation.
+    label               : String(100);
     viewingKeyHash      : String(64); // SHA-256 of viewing key (for lookup/dedup)
     encryptedViewingKey : LargeString; // AES-256-GCM encrypted viewing key
     encryptedSeedKey    : LargeString; // optional: AES-256-GCM encrypted seed/signing key

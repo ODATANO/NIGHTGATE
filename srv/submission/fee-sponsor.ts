@@ -51,18 +51,14 @@ export interface ResolvedFeeSponsor {
 
 /**
  * Session ids that any authenticated caller may use as fee sponsor.
- * Env NIGHTGATE_FEE_SPONSOR_SESSION wins over cds config `feeSponsorSessions`
- * (string, comma separated, or array of strings).
+ *
+ * Lives in srv/utils/session-expiry.ts, because the expiry rule that depends on
+ * it has to be callable from modules below this one (wallet-material-factory,
+ * which this module imports). Re-exported here so every existing caller keeps
+ * its import.
  */
-export function getConfiguredFeeSponsorSessions(config?: Record<string, any>): string[] {
-    const fromEnv = process.env.NIGHTGATE_FEE_SPONSOR_SESSION?.trim();
-    const fromConfig = Array.isArray(config?.feeSponsorSessions)
-        ? config!.feeSponsorSessions.join(',')
-        : config?.feeSponsorSessions;
-    const raw = fromEnv || fromConfig;
-    if (!raw || typeof raw !== 'string') return [];
-    return raw.split(',').map(s => s.trim()).filter(Boolean);
-}
+export { getConfiguredFeeSponsorSessions } from '../utils/session-expiry';
+import { getConfiguredFeeSponsorSessions, isSessionExpired } from '../utils/session-expiry';
 
 export interface ResolveFeeSponsorOptions {
     /** DB handle (tests inject a minimal `{ run }`). */
@@ -105,7 +101,9 @@ export async function resolveFeeSponsor(opts: ResolveFeeSponsorOptions): Promise
     // it is infrastructure, not a caller's session. (The cleanup sweep skips
     // it for the same reason; otherwise the pool silently died 24 h after it
     // was set up and the sweep even wiped its key material: live 2026-08-19.)
-    if (!isPlatformSponsor && session.expiresAt && new Date(session.expiresAt) < new Date()) {
+    // The rule itself now lives in one place, so every other read of the same
+    // session agrees with this one.
+    if (isSessionExpired(opts.sponsorSessionId, session.expiresAt, opts.config)) {
         throw new FeeSponsorError(410, 'Sponsor session expired');
     }
     if (!session.encryptedViewingKey) {

@@ -142,6 +142,69 @@ Healthy progression looks like:
 
 If you see `sh` or `du` shrink dramatically, the SDK is probably revalidating during restore; the new value is the post-validation form. Not corruption.
 
+## Upgrading to 0.20.0
+
+The release adds one column (`WalletSessions.label`) and one SQL view (the
+`BackgroundJobs` projection), so an existing database needs the migration
+once:
+
+```bash
+npx nightgate-schema-delta                 # or: node scripts/apply-schema-delta.mjs
+docker exec odatano-nightgate node scripts/apply-schema-delta.mjs   # in the image
+```
+
+It is additive and keeps existing rows. If you skip it, the startup preflight
+names exactly what is missing and Nightgate stays offline rather than failing
+later on the first `connectWallet`; the host process keeps running.
+
+## Monitoring endpoints
+
+Three plain HTTP routes exist next to the OData functions, because the OData
+shapes cannot be consumed by the tools that want this data. `getMetrics()`
+returns the Prometheus body wrapped as `{"value": "# HELP ..."}`, which no
+scraper parses, and a `HEALTHCHECK` or Kubernetes probe cannot express
+`/api/v1/indexer/getReadiness()`.
+
+**They stay off until you configure them.** They are mounted during CAP's
+bootstrap event, BEFORE CAP attaches its authentication middlewares to the
+service paths, so whatever protects the OData surface does not protect these.
+Pick one:
+
+```bash
+NIGHTGATE_STATUS_TOKEN=$(openssl rand -hex 32)   # bearer token, the sane default
+NIGHTGATE_STATUS_ROUTES=public                   # anonymous, a deliberate choice
+```
+
+```bash
+curl -H "authorization: Bearer $TOKEN" http://localhost:4004/nightgate/metrics
+curl -H "authorization: Bearer $TOKEN" http://localhost:4004/nightgate/health
+curl -i -H "authorization: Bearer $TOKEN" http://localhost:4004/nightgate/ready
+```
+
+Same payloads as the functions they mirror, computed by the same code
+(`srv/monitoring/status.ts`). `/nightgate/ready` is the one with a status code
+worth scripting against: 200 when ready, 503 otherwise, with the failing check
+named in the body.
+
+The prefix is not decoration. NIGHTGATE is a CAP plugin, usually inside
+somebody else's express app, and CAP registers its OWN `/health` immediately
+after the bootstrap event where these mount. A handler on a generic path would
+shadow the host's liveness endpoint for the whole application, letting a
+NIGHTGATE database problem decide a foreign service's health. Override with
+`NIGHTGATE_STATUS_ROUTES_PREFIX`; `NIGHTGATE_STATUS_ROUTES=off` disables them.
+
+Two reads answer questions that used to have no answer from outside:
+
+- `getRuntimeInfo()` carries two digests per contract: the generation this
+  process LOADED, and what the files hash to right now. `digestStale: true`
+  means artifacts were replaced under the running server, which makes the
+  generation guard refuse every write job until it restarts. When all writes
+  suddenly fail, look here first.
+- `getWorkerStatus()` reports the wallet worker at process level. A climbing
+  `exitCount` is a crash loop; an `inFlightRpcs` that only grows is a stall.
+  It deliberately does not feed `getReadiness()`, so a busy worker never takes
+  the process out of rotation. The per-facade list is admin only.
+
 ## Reading the indexer health endpoint
 
 `GET /api/v1/indexer/getHealth()` reports the **crawler's** view, not the wallet's:

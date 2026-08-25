@@ -15,6 +15,7 @@ import crypto from 'crypto';
 import { decrypt, getEncryptionKey } from '../utils/crypto';
 import { loadLedgerV8 } from '../midnight/sdk-loader';
 import { deriveRoleSeeds } from '../utils/wallet-hd';
+import { isSessionExpired } from '../utils/session-expiry';
 import { getOrBuildWalletFacade, type WalletFacadeBuildArgs } from './wallet-facade-builder';
 import type { WalletMaterial, PrivateStateBackend } from '../midnight/providers';
 
@@ -89,7 +90,9 @@ export async function buildWalletMaterialForSession(opts: BuildWalletMaterialOpt
         SELECT.one.from(WalletSessions).where(where)
     );
     if (!session) throw new SessionNotFoundError(opts.sessionId);
-    if (session.expiresAt && new Date(session.expiresAt) < new Date()) {
+    // Shared rule: a configured platform fee sponsor is infrastructure and
+    // does not expire while it is configured (see srv/utils/session-expiry.ts).
+    if (isSessionExpired(opts.sessionId, session.expiresAt)) {
         throw new SessionNotFoundError(opts.sessionId);
     }
     if (!session.encryptedViewingKey) {

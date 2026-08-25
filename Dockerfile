@@ -46,6 +46,11 @@ COPY --from=build /app /app
 RUN chmod +x /app/docker/entrypoint.sh
 VOLUME /data
 EXPOSE 4004
-HEALTHCHECK --interval=30s --timeout=5s --start-period=90s --retries=5 \
-    CMD node -e "fetch('http://localhost:4004/').then(r=>process.exit(r.status<500?0:1)).catch(()=>process.exit(1))"
+# Ask NIGHTGATE whether it can work, not merely whether the HTTP port answers:
+# the plugin keeps its CAP host alive when Nightgate itself is offline, so a
+# probe against `/` calls such a container healthy while nothing works. Logic
+# lives in docker/healthcheck.mjs (route prefix, token, when a fallback is
+# legitimate) rather than in an unreadable one-liner.
+HEALTHCHECK --interval=30s --timeout=10s --start-period=90s --retries=5 \
+    CMD node /app/docker/healthcheck.mjs
 ENTRYPOINT ["/app/docker/entrypoint.sh"]

@@ -1063,9 +1063,12 @@ service NightgateService {
      * Create a read-only session by storing the viewing key encrypted at rest.
      * Returns the new session's UUID and metadata.
      */
-    action   connectWallet(viewingKey: String)                        returns {
+    action   connectWallet(viewingKey: String,
+                           label: String // optional, <= 100 chars; operator-facing name
+    )                                                                 returns {
         ID          : UUID;
         sessionId   : UUID;
+        label       : String;
         connectedAt : Timestamp;
         expiresAt   : Timestamp;
         isActive    : Boolean;
@@ -1280,6 +1283,56 @@ service NightgateService {
     };
 
     /**
+     * Fee-sponsor pool health in ONE call: for every session configured as a
+     * platform fee sponsor (`NIGHTGATE_FEE_SPONSOR_SESSION` or
+     * `cds.requires.nightgate.feeSponsorSessions`), can it pay, and how many
+     * transactions can it sponsor in parallel.
+     *
+     * `dustNotes` IS the parallelism: unbound sponsoring locks one free dust
+     * note per in-flight transaction, so N notes means N concurrent
+     * sponsorships from one wallet. It is NOT the same as
+     * `registeredNightUtxos`, which counts the sponsor's OWN NIGHT registered
+     * for dust generation. A foreign wallet may delegate its generation here,
+     * and then the notes grow while the sponsor's own registrations do not:
+     * one registered NIGHT UTXO, whoever owns it, yields one note at the
+     * receiver. Reading the own registrations as capacity makes a delegated
+     * pool look flat exactly when it grew.
+     *
+     * `pendingDustNotes` above zero means a spend is in flight or a note
+     * leaked (the wedge signature); `dustRestoreCount` counts how often the
+     * wedge protection has fired. `usable` is the short answer: spendable
+     * notes present and dust above zero. `registeredNightUtxos` is about
+     * FUTURE production, so it does not gate `usable`.
+     *
+     * Visibility: listed for every authenticated caller, because every
+     * authenticated caller may already USE these sponsors and a dry pool is
+     * why their submissions fail. `dustBalance` is null unless the caller is
+     * an admin or owns the session; the operational flags stay readable
+     * either way.
+     *
+     * An unreadable sponsor is reported as a row with `lastError` rather than
+     * failing the call, so one bad entry cannot hide the rest of the pool.
+     */
+    function getSponsorPoolStatus()                                   returns array of {
+        sessionId          : UUID;
+        configured         : Boolean;
+        usable             : Boolean;
+        dustBalance        : String; // null unless admin or session owner
+        // Dust is GENERATED from registered NIGHT, so the NIGHT behind the
+        // pool is part of its health: a sponsor whose NIGHT is gone stops
+        // producing dust once the current stock is spent. Amount redacted
+        // like dustBalance; the UTXO count is operational, not a holding.
+        unshieldedNight    : String; // null unless admin or session owner
+        totalNightUtxoCount : Integer;
+        registeredNightUtxos : Integer; // the sponsor's OWN NIGHT registered for dust generation
+        dustNotes          : Integer; // spendable dust notes = parallel sponsoring capacity
+        pendingDustNotes   : Integer; // > 0: spend in flight, or a wedge
+        dustRestoreCount   : Integer;
+        caughtUp           : Boolean;
+        lastError          : String;
+    };
+
+    /**
      * Pre-flight DUST fee estimate for a `sendNight` transfer. Builds the
      * recipe in the worker (lightweight; no ZK proof generation, no submit),
      * returns the estimated fee in DUST atoms (decimal string). The recipe
@@ -1339,7 +1392,9 @@ service NightgateService {
      * re-serialization with different key order will not re-hash equal.
      */
     action   prepareDocumentProof(documentJson: LargeString, // JSON object: the full document
-                                  proofFieldsJson: LargeString, // ordered JSON array of { field, kind?, scale? }, max 16
+                                  proofFieldsJson: LargeString, // ordered JSON array of { field, kind?, scale? }; at most
+                                  // the artifact's slot width: 16 by default, 32 with
+                                  // compiledArtifactRef 'attestation-vault-32'
                                   saltSeed: String, // optional 64-hex salt seed (deterministic re-prepare); random if omitted
                                   compiledArtifactRef: String // optional, defaults to 'attestation-vault'
     )                                                                 returns {
@@ -1350,7 +1405,7 @@ service NightgateService {
         emptyFields       : LargeString; // JSON array of fields without a value (salted absent leaf)
         schemaId          : String; // 64-hex schema root of the ORDERED proofFields list (anchored next to the root)
         schema            : LargeString; // JSON array of width slot descriptors { fieldKey, kind, scale } (public)
-        leaves            : LargeString; // JSON array of 16 × 64-hex salted leaf hashes (informational)
+        leaves            : LargeString; // JSON array of width × 64-hex salted leaf hashes (informational)
         opening           : LargeString; // JSON { saltSeed, slots[width] }: the cross-root witness bundle (STORE IT)
     };
 

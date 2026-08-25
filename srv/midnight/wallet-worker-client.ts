@@ -94,6 +94,13 @@ let client: ClientState | null = null;
 // after a successful start" (respawn). Cleared on explicit stop/reset.
 let everStarted = false;
 
+// Worker exits since process start, for getWorkerStatus()/metrics. A climbing
+// count is the signal that the submission side is crash-looping, which is
+// otherwise only visible as individual jobs failing.
+let workerExitCount = 0;
+let lastExitCode: number | null = null;
+let lastExitAt: string | null = null;
+
 // Kept at module scope (not on ClientState) so it survives a worker respawn:
 // the sink is wired once at startup and must keep persisting state-save events
 // even from a freshly respawned worker.
@@ -222,9 +229,15 @@ export async function startWalletWorker(): Promise<void> {
     worker.on('exit', code => {
         log.warn(`worker exited code=${code}`);
         client = null;
+        workerExitCount += 1;
+        lastExitCode = code;
+        lastExitAt = new Date().toISOString();
         // No facade survived the exit, so no snapshot describes anything that
         // is still running. Keeping them would report phantom catch-ups.
         syncProgressCache.clear();
+        // A crash cannot be waited on: the worker is already gone, so a
+        // listener may only keep what queued work still needs.
+        void notifyWorkerGone('exit');
         // Fail every in-flight call now; their reply ports are dead and would
         // otherwise never settle. The next rpc() lazily respawns the worker.
         rejectAllPendingRpcs(`wallet-worker exited (code=${code}) with in-flight calls`);
@@ -252,7 +265,52 @@ export async function stopWalletWorker(timeoutMs = 5000): Promise<void> {
     } finally {
         // Force-terminate if still alive.
         try { await w.terminate(); } catch { }
+        // The exit handler normally does this, but a forced terminate after
+        // the timeout must not leave the main thread believing in facades.
+        syncProgressCache.clear();
+        // Intentional teardown, so listeners may finish their work and release
+        // everything; this is the only path that can wait for them.
+        await notifyWorkerGone('stop');
     }
+}
+
+/**
+ * Callbacks to run when the worker is gone, on crash or on intentional stop.
+ *
+ * Anything the MAIN thread believes about facades is wrong from that moment:
+ * a facade lives inside the worker, so a crash takes every one of them with
+ * it. Without this the main-thread registry kept reporting facades a
+ * respawned, empty worker does not have, which makes `facadeCount` a lie and
+ * lets a "is it warm?" guard wave a cold wallet through.
+ */
+/**
+ * `'exit'` is a crash: the worker is already gone, so nothing can be finished
+ * off and a listener may only keep what still-queued work needs. `'stop'` is
+ * an intentional teardown, where the caller CAN wait, so a listener may drain
+ * and then release everything, including material a crash path has to hold on
+ * to. Same event, opposite obligations.
+ */
+export type WorkerGoneReason = 'exit' | 'stop';
+type WorkerGoneListener = (reason: WorkerGoneReason) => void | Promise<void>;
+const workerGoneListeners = new Set<WorkerGoneListener>();
+
+function notifyWorkerGone(reason: WorkerGoneReason): Promise<void> {
+    const running: Array<Promise<void>> = [];
+    for (const listener of workerGoneListeners) {
+        try {
+            const result = listener(reason);
+            if (result) running.push(result.catch(err => log.warn(`worker-gone listener failed: ${String(err)}`)));
+        } catch (err) {
+            log.warn(`worker-gone listener failed: ${String(err)}`);
+        }
+    }
+    return Promise.all(running).then(() => undefined);
+}
+
+/** Register a listener; returns an unsubscribe for tests. */
+export function onWorkerGone(listener: WorkerGoneListener): () => void {
+    workerGoneListeners.add(listener);
+    return () => workerGoneListeners.delete(listener);
 }
 
 /**
@@ -471,6 +529,48 @@ export function walletGetSyncProgress(sessionId: string): WalletSyncProgress | n
     return syncProgressCache.get(sessionId) ?? null;
 }
 
+export interface WalletWorkerStatus {
+    /** The worker has been started at least once in this process. */
+    started: boolean;
+    /** A worker thread is alive right now. */
+    running: boolean;
+    /** Calls waiting for an answer; a number that only grows is a stall. */
+    inFlightRpcs: number;
+    /** Worker exits since process start. Climbing means crash-looping. */
+    exitCount: number;
+    lastExitCode: number | null;
+    lastExitAt: string | null;
+    rpcTimeoutMs: number;
+    /** Facades that have reported catch-up progress, newest state per facade. */
+    facades: Array<{ sessionId: string; label: string; caughtUp: boolean; updatedAt: string }>;
+}
+
+/**
+ * Worker health at PROCESS level, as opposed to `walletGetSyncProgress`, which
+ * answers per facade. When the worker is wedged every session looks
+ * individually slow and nothing says why; this says why.
+ *
+ * Synchronous and main-thread only: it reads state the client already keeps,
+ * so it stays answerable exactly when the worker cannot answer anything.
+ */
+export function getWalletWorkerStatus(): WalletWorkerStatus {
+    return {
+        started: everStarted,
+        running: client !== null,
+        inFlightRpcs: pendingRpcs.size,
+        exitCount: workerExitCount,
+        lastExitCode,
+        lastExitAt,
+        rpcTimeoutMs: RPC_TIMEOUT_MS,
+        facades: [...syncProgressCache.values()].map(p => ({
+            sessionId: p.sessionId,
+            label: p.label,
+            caughtUp: p.caughtUp,
+            updatedAt: p.updatedAt
+        }))
+    };
+}
+
 /**
  * End-to-end NIGHT-UTXO registration for DUST generation.
  * Single RPC that wraps wait-sync → filter → register → finalize → submit.
@@ -544,6 +644,14 @@ export function walletTransferNight(args: {
 export function walletGetBalance(args: {
     sessionId: string;
     syncTimeoutMs?: number;
+    /**
+     * Bound for the WORKER RPC itself, not just the caller's wait. Without it
+     * an abandoned read keeps its pendingRpcs entry until the 30-minute
+     * backstop, so a monitor polling a stuck worker piles up entries. The
+     * worker still finishes whatever it started, but the client side settles
+     * and the backlog cannot grow.
+     */
+    rpcTimeoutMs?: number;
 }): Promise<{
     shieldedNight: string;
     unshieldedNight: string;
@@ -555,7 +663,8 @@ export function walletGetBalance(args: {
     dustPendingValue: string;
     dustRestoreCount: number;
 }> {
-    return rpc('getBalance', args);
+    const { rpcTimeoutMs, ...rest } = args;
+    return rpc('getBalance', rest, rpcTimeoutMs);
 }
 
 /**
@@ -705,6 +814,9 @@ export function __resetWalletWorkerForTests(): void {
     stateSaveSink = undefined;
     pendingRpcs.clear();
     privateStateProviders.clear();
+    workerExitCount = 0;
+    lastExitCode = null;
+    lastExitAt = null;
 }
 
 /**

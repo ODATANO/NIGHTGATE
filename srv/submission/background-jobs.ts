@@ -357,6 +357,7 @@ export async function startJob<TIn, TOut>(
                     cds.log('nightgate').warn(`startJob(${kind}): admission insert lost the SQLite lock (attempt ${attempt + 1}/${STATUS_WRITE_ATTEMPTS})`);
                     continue;
                 }
+                if (isLockContention(insertErr)) throw new JobAdmissionBusyError(kind);
                 if (!isUniqueViolation(insertErr)) throw insertErr;
                 const dup = await dedupExisting<TIn, TOut>(pinnedRunner, sessionId, kind, idempotencyKey, payloadFingerprint);
                 if (dup) return dup;
@@ -370,6 +371,10 @@ export async function startJob<TIn, TOut>(
         try {
             await withStatusWriteRetry(`startJob(${kind}) admission insert`, () => db.run(buildInsert()));
         } catch (insertErr) {
+            // `runChildCommand` lands here, so an opaque lock error would reach
+            // a workflow parent as an ordinary failure. Same translation as the
+            // other branches: busy, nothing written.
+            if (isLockContention(insertErr)) throw new JobAdmissionBusyError(kind);
             if (!isUniqueViolation(insertErr)) throw insertErr;
             const dup = await dedupExisting<TIn, TOut>(db, sessionId, kind, idempotencyKey, payloadFingerprint);
             if (dup) return dup;
@@ -386,11 +391,17 @@ export async function startJob<TIn, TOut>(
                     cds.log('nightgate').warn(`startJob(${kind}): admission insert lost the SQLite lock (attempt ${attempt + 1}/${STATUS_WRITE_ATTEMPTS})`);
                     continue;
                 }
+                if (isLockContention(insertErr)) throw new JobAdmissionBusyError(kind);
                 throw insertErr;
             }
         }
     } else {
-        await withStatusWriteRetry(`startJob(${kind}) admission insert`, () => db.run(buildInsert()));
+        try {
+            await withStatusWriteRetry(`startJob(${kind}) admission insert`, () => db.run(buildInsert()));
+        } catch (insertErr) {
+            if (isLockContention(insertErr)) throw new JobAdmissionBusyError(kind);
+            throw insertErr;
+        }
     }
 
     // Detach; the semaphore caps concurrent jobs of this kind.
@@ -594,6 +605,37 @@ function childWaitTimeoutMs(): number {
 }
 
 /**
+ * Has any step of this workflow already finished, successfully or by leaving
+ * an effect behind? `succeeded` is the plain case; a child that reached
+ * `reconciliation_required` or recorded a txHash also means the workflow is
+ * no longer a clean no-op.
+ */
+async function hasCompletedChild(parentJobId: string): Promise<boolean> {
+    try {
+        const db = await cds.connect.to('db');
+        if (!db) return true;
+        const children = await db.run(
+            SELECT.from(BackgroundJobs).columns('status', 'txHash').where({ parentJobId })
+        ) as Array<{ status?: string; txHash?: string | null }>;
+        if (!Array.isArray(children)) return true;
+        return children.some(c => c.status === 'succeeded' || c.status === 'reconciliation_required' || !!c.txHash);
+    } catch (err) {
+        // This runs precisely BECAUSE the database was too busy to admit a
+        // job, so the read can lose the same lock. An unreadable answer is
+        // not "nothing happened": it is "we do not know", and the two are
+        // opposite in consequence. Guessing "nothing" marks a workflow whose
+        // first step may be on chain as plainly failed, which no reconciler
+        // revisits and a retry pays for twice. Guessing "something" costs an
+        // operator one look at a job that was in fact clean.
+        cds.log('nightgate').warn(
+            `hasCompletedChild(${parentJobId}) could not read child state (${String((err as Error)?.message ?? err)}); ` +
+            'assuming the workflow is partially executed'
+        );
+        return true;
+    }
+}
+
+/**
  * Execute one deterministic child command and wait for its durable result.
  * Each child may cross the external-effect boundary at most once. Re-running a
  * parent after a crash resolves the same child through its immutable key.
@@ -609,19 +651,36 @@ export async function runChildCommand<T>(args: {
 }): Promise<T> {
     const { parent, kind, step, commandVersion, command, request, encryptCommand = true } = args;
     if (!parent.sessionId || !parent.requestedBy) throw new Error(`Parent job ${parent.ID} lacks execution identity`);
-    const child = await startJob({
-        kind,
-        sessionId: parent.sessionId,
-        requestedBy: parent.requestedBy,
-        idempotencyKey: `workflow:${parent.ID}:${step}`,
-        idempotencyPayload: { parentJobId: parent.ID, step, commandVersion, command },
-        request,
-        commandVersion,
-        command,
-        encryptCommand,
-        parentJobId: parent.ID,
-        workflowStep: step
-    });
+    let child;
+    try {
+        child = await startJob({
+            kind,
+            sessionId: parent.sessionId,
+            requestedBy: parent.requestedBy,
+            idempotencyKey: `workflow:${parent.ID}:${step}`,
+            idempotencyPayload: { parentJobId: parent.ID, step, commandVersion, command },
+            request,
+            commandVersion,
+            command,
+            encryptCommand,
+            parentJobId: parent.ID,
+            workflowStep: step
+        });
+    } catch (err) {
+        // The workflow could not even ENQUEUE this step. That is harmless on a
+        // parent that has done nothing yet, and it is not harmless once an
+        // earlier step is on chain: the parent carries no txHash of its own, so
+        // the generic failure path would mark it `failed`, the parent
+        // reconciler never looks at it again, and a retry would repeat the
+        // steps that already spent fees. Escalate to reconciliation instead,
+        // but only when there is something to reconcile.
+        if (err instanceof JobAdmissionBusyError && await hasCompletedChild(parent.ID)) {
+            throw new WorkflowReconciliationRequiredError(
+                `Could not admit workflow step '${step}' (${err.message}), and an earlier step of job ${parent.ID} already completed; verify chain state before retrying`
+            );
+        }
+        throw err;
+    }
     if (child.status === 'succeeded' && child.result !== undefined) return child.result as T;
 
     const deadline = Date.now() + childWaitTimeoutMs();
@@ -1373,12 +1432,40 @@ async function mapWithConcurrency<T>(items: T[], limit: number, fn: (item: T) =>
     await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
 }
 
-const STATUS_WRITE_ATTEMPTS = 3;
-const DEFAULT_STATUS_WRITE_BACKOFF_MS: readonly number[] = [0, 1500, 4000];
+// Five attempts over ~14s. Three over 5.5s was not enough: a sponsored submit
+// that arrives while the PREVIOUS one is still writing its completion loses
+// the lock for longer than that, and the caller then sees a 500 for a
+// transaction the server would happily have taken a moment later. The call it
+// guards takes 40s of proving and submitting anyway, so patience here is
+// cheap; what is expensive is a rejected submission.
+const STATUS_WRITE_ATTEMPTS = 5;
+const DEFAULT_STATUS_WRITE_BACKOFF_MS: readonly number[] = [0, 500, 1500, 4000, 8000];
 let statusWriteBackoffMs: readonly number[] = DEFAULT_STATUS_WRITE_BACKOFF_MS;
 
 function isLockContention(err: unknown): boolean {
     return /database is locked|SQLITE_BUSY/i.test(String((err as Error)?.message ?? err));
+}
+
+/**
+ * The job was never admitted because the database stayed busy for the whole
+ * retry budget. Nothing was written and nothing was submitted, so the caller
+ * may simply send the same request again; raw `database is locked` reached
+ * them as a 500, which reads as "your transaction broke the server" rather
+ * than "come back in a second".
+ */
+export class JobAdmissionBusyError extends Error {
+    readonly httpStatus = 503;
+    // CAP normalises a thrown error over `status` / `statusCode` / a numeric
+    // `code`, and it never sees `httpStatus`. The wallet actions
+    // (registerForDustGeneration, deregisterFromDustGeneration, sendNight)
+    // return startJob's promise straight to CAP without passing through
+    // runSubmission, so without these the caller would still get a 500.
+    readonly status = 503;
+    readonly statusCode = 503;
+    constructor(kind: string) {
+        super(`the server is busy writing another job and could not admit this ${kind} request; nothing was submitted, retry in a moment`);
+        this.name = 'JobAdmissionBusyError';
+    }
 }
 
 /**

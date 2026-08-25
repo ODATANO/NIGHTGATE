@@ -56,6 +56,14 @@ beforeAll(async () => {
 });
 
 beforeEach(async () => {
+    // Readiness now requires a COMPLETED initialisation, and these tests boot
+    // the service with SKIP_AUTO_INIT, so initialize() never runs and the real
+    // holder reports a process that has not started. vi.mock cannot reach the
+    // booted service (see the header note), so the state is published into the
+    // same module the service reads instead.
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    require('../../srv/utils/runtime-state').publishRuntimeState({ initialized: true, mode: 'idle' });
+
     mockStartCrawler.mockReset();
     mockStopCrawler.mockReset();
     mockIsCrawlerRunning.mockReset();
@@ -292,7 +300,8 @@ describe('getReadiness', () => {
                 database: true,
                 crawler: true,
                 node: true,
-                runtime: true
+                runtime: true,
+                initialization: true
             }
         }));
     });
@@ -307,7 +316,8 @@ describe('getReadiness', () => {
                 database: true,
                 crawler: false,
                 node: false,
-                runtime: true
+                runtime: true,
+                initialization: true
             }
         }));
     });
@@ -325,7 +335,8 @@ describe('getReadiness', () => {
                     database: false,
                     crawler: false,
                     node: false,
-                    runtime: true
+                    runtime: true,
+                    initialization: true
                 }
             }));
         } finally {
@@ -346,7 +357,8 @@ describe('getReadiness', () => {
                 database: true,
                 crawler: true,
                 node: true,
-                runtime: true
+                runtime: true,
+                initialization: true
             }
         }));
     });
@@ -364,7 +376,8 @@ describe('getReadiness', () => {
                 database: true,
                 crawler: true,
                 node: false,
-                runtime: true
+                runtime: true,
+                initialization: true
             }
         }));
     });
@@ -382,7 +395,8 @@ describe('getReadiness', () => {
                 database: true,
                 crawler: false,
                 node: true,
-                runtime: true
+                runtime: true,
+                initialization: true
             }
         }));
     });

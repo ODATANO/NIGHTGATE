@@ -17,10 +17,14 @@ const mockSaveSyncState = vi.hoisted(() => (vi.fn()));
 const mockGetWalletSdkVersion = vi.hoisted(() => (vi.fn(() => 'sdk-test')));
 const mockEvictEncryptionKey = vi.hoisted(() => (vi.fn(async () => undefined)));
 
+// Capture the worker-gone listener the module registers at load, so a test
+// can fire it the way a crash or a stop would.
+const workerGoneListeners = vi.hoisted(() => [] as Array<(r: "exit" | "stop") => void | Promise<void>>);
 vi.mock('../../srv/midnight/wallet-worker-client', () => ({
     walletInit: mockWalletInit,
     walletEvict: mockWalletEvict,
-    setStateSaveSink: mockSetStateSaveSink
+    setStateSaveSink: mockSetStateSaveSink,
+    onWorkerGone: (fn: (r: "exit" | "stop") => void | Promise<void>) => { workerGoneListeners.push(fn); return () => { }; }
 }));
 
 vi.mock('../../srv/submission/wallet-sync-state-store', () => ({
@@ -34,6 +38,9 @@ import {
     getOrBuildWalletFacade,
     evictWalletFacade,
     __getCacheSizeForTests,
+    __getPersistenceSizeForTests,
+    hasWalletFacade,
+    listWalletFacades,
     __clearAllFacadesForTests,
     wireWorkerStateSaveSink,
     type WalletFacadeBuildArgs
@@ -57,6 +64,93 @@ describe('wallet-facade-builder', () => {
         mockWalletEvict.mockResolvedValue({ evicted: true });
         mockLoadSyncState.mockResolvedValue(undefined);
         mockSaveSyncState.mockResolvedValue(undefined);
+    });
+
+    describe('worker lifecycle', () => {
+        it('drops every registration when the worker is gone (no phantom facades)', async () => {
+            // A facade lives INSIDE the worker, so a crash or a stop takes all
+            // of them. Keeping the registrations made `facadeCount` count
+            // wallets a respawned, empty worker does not hold, and let the
+            // sponsor-status cold guard treat them as warm.
+            const logSpy = vi.spyOn(cds.log('nightgate:facade'), 'info').mockImplementation(() => {});
+            try {
+                await getOrBuildWalletFacade('cache-key-gone-1111', baseArgs);
+                await getOrBuildWalletFacade('cache-key-gone-2222', baseArgs);
+                expect(__getCacheSizeForTests()).toBe(2);
+                expect(hasWalletFacade('cache-key-gone-1111')).toBe(true);
+
+                expect(workerGoneListeners.length).toBeGreaterThan(0);
+                for (const fire of workerGoneListeners) await fire("exit");
+
+                expect(__getCacheSizeForTests()).toBe(0);
+                expect(hasWalletFacade('cache-key-gone-1111')).toBe(false);
+                expect(listWalletFacades()).toEqual([]);
+            } finally {
+                logSpy.mockRestore();
+            }
+        });
+
+        it('keeps persistence material so a save already in flight can still be written', async () => {
+            // The worker delivers `state-save` events before it dies, and they
+            // can be queued behind a slower DB write. Dropping the passphrase
+            // together with the residency made the sink fail to resolve a
+            // session and discard the snapshot, and a dead worker cannot
+            // resend it: the next start restored an older blob and cold-synced
+            // the gap.
+            const logSpy = vi.spyOn(cds.log('nightgate:facade'), 'info').mockImplementation(() => {});
+            try {
+                await getOrBuildWalletFacade('cache-key-inflight', baseArgs);
+                wireWorkerStateSaveSink();
+                const sink = mockSetStateSaveSink.mock.calls.at(-1)![0] as (e: any) => Promise<void>;
+
+                for (const fire of workerGoneListeners) await fire("exit");
+                expect(hasWalletFacade('cache-key-inflight')).toBe(false);   // no longer warm
+                expect(__getPersistenceSizeForTests()).toBe(1);              // still persistable
+
+                await sink({ sessionId: 'cache-key-inflight', blobs: { shielded: 'late-blob' }, seq: 1 });
+                expect(mockSaveSyncState).toHaveBeenCalledWith(expect.objectContaining({
+                    accountId: 'cache-key-inflight'
+                }));
+            } finally {
+                logSpy.mockRestore();
+            }
+        });
+
+        it('a planned stop drains the queued saves and THEN releases the passphrases', async () => {
+            // A crash has to keep them; a stop can wait, and must, because the
+            // passphrases are derived storage credentials of sessions that are
+            // now closed. shutdown() followed by a re-initialise in the same
+            // process would otherwise keep them referenced for the process's
+            // life.
+            const logSpy = vi.spyOn(cds.log('nightgate:facade'), 'info').mockImplementation(() => {});
+            try {
+                await getOrBuildWalletFacade('cache-key-stop', baseArgs);
+                wireWorkerStateSaveSink();
+                const sink = mockSetStateSaveSink.mock.calls.at(-1)![0] as (e: any) => Promise<void>;
+
+                // A save still writing when the stop arrives.
+                let finishSave: () => void = () => { };
+                mockSaveSyncState.mockImplementationOnce(() => new Promise<void>(res => { finishSave = res; }));
+                const pending = sink({ sessionId: 'cache-key-stop', blobs: { dust: 'blob' }, seq: 1 });
+
+                const stopped = Promise.all(workerGoneListeners.map(fire => fire('stop')));
+                await Promise.resolve();
+                // Still held: the queued save has not been written yet.
+                expect(__getPersistenceSizeForTests()).toBe(1);
+
+                finishSave();
+                await pending;
+                await stopped;
+
+                expect(mockSaveSyncState).toHaveBeenCalledWith(expect.objectContaining({
+                    accountId: 'cache-key-stop'
+                }));
+                expect(__getPersistenceSizeForTests()).toBe(0);
+                expect(__getCacheSizeForTests()).toBe(0);
+            } finally {
+                logSpy.mockRestore();
+            }
+        });
     });
 
     describe('getOrBuildWalletFacade', () => {
@@ -114,7 +208,11 @@ describe('wallet-facade-builder', () => {
                 expect(mockWalletInit).toHaveBeenCalledWith(expect.objectContaining({
                     restoreBlobs: undefined
                 }));
-                expect(__getCacheSizeForTests()).toBe(0);
+                // No persistence material, but the facade IS warm: residency
+                // and persistence are separate registries with separate
+                // lifetimes.
+                expect(__getPersistenceSizeForTests()).toBe(0);
+                expect(__getCacheSizeForTests()).toBe(1);
             } finally {
                 logSpy.mockRestore();
             }

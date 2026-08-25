@@ -75,9 +75,11 @@ vi.mock('../../srv/midnight/wallet-worker-client', () => ({
     walletGetSyncProgress: mockWalletGetSyncProgress
 }));
 
+const mockHasWalletFacade = vi.hoisted(() => (vi.fn(() => false)));
 vi.mock('../../srv/submission/wallet-facade-builder', () => ({
     evictWalletFacade: mockEvictWalletFacade,
-    getOrBuildWalletFacade: mockGetOrBuildWalletFacade
+    getOrBuildWalletFacade: mockGetOrBuildWalletFacade,
+    hasWalletFacade: mockHasWalletFacade
 }));
 
 vi.mock('../../srv/submission/wallet-material-factory', () => ({
@@ -540,6 +542,38 @@ describe('wallet session handlers', () => {
             // updateWhereSpy records the where clause).
             expect(updateWhereSpy).toHaveBeenCalledWith({ sessionId: { in: ['caller-1'] } });
             expect(mockEvictWalletFacade).toHaveBeenCalledTimes(1); // the caller's wallet only
+        } finally {
+            delete process.env.NIGHTGATE_FEE_SPONSOR_SESSION;
+            setIntervalSpy.mockRestore();
+        }
+    });
+
+    it('session cleanup keeps the facade when the surviving sibling is an EXPIRED platform sponsor', async () => {
+        // The guard used to ask SQL for `expiresAt > now`, which does not know
+        // that a configured platform sponsor never expires. Its row therefore
+        // looked dead to this one check while staying alive everywhere else,
+        // and disconnecting any sibling session of the same wallet evicted the
+        // facade the pool was still sponsoring from.
+        let callback: (() => Promise<void>) | undefined;
+        const setIntervalSpy = vi.spyOn(global, 'setInterval').mockImplementation(((handler: TimerHandler) => {
+            callback = handler as () => Promise<void>;
+            return {} as ReturnType<typeof setInterval>;
+        }) as any);
+        const encKey = getEncryptionKey();
+        process.env.NIGHTGATE_FEE_SPONSOR_SESSION = 'pool-sponsor-9';
+        const longAgo = new Date(Date.now() - 86_400_000).toISOString();
+        const db = {
+            run: vi.fn()
+                .mockResolvedValueOnce([{ sessionId: 'caller-9', viewingKeyHash: 'hash-shared', encryptedViewingKey: encrypt('a'.repeat(64), encKey) }])
+                .mockResolvedValueOnce(1)
+                // The guard now reads active rows WITH their expiry and judges
+                // them itself: the sponsor row is long past its TTL and still counts.
+                .mockResolvedValueOnce([{ sessionId: 'pool-sponsor-9', expiresAt: longAgo }])
+        };
+        try {
+            startSessionCleanup(db);
+            await callback?.();
+            expect(mockEvictWalletFacade).not.toHaveBeenCalled();
         } finally {
             delete process.env.NIGHTGATE_FEE_SPONSOR_SESSION;
             setIntervalSpy.mockRestore();
@@ -1184,6 +1218,355 @@ describe('wallet session handlers', () => {
 
             expect(mockEvictWalletFacade).not.toHaveBeenCalled();
             expect(req.reject).toHaveBeenCalledWith(410, 'Session expired');
+        });
+    });
+
+    describe('connectWallet label', () => {
+        it('stores the operator-facing label and returns it', async () => {
+            mockDbRun.mockResolvedValueOnce(undefined);
+            const req = createMockRequest({ viewingKey: 'a'.repeat(64), label: 'sponsor-pool-1' });
+            const result: any = await registeredHandlers['connectWallet'](req);
+
+            expect(insertEntriesSpy.mock.calls[0][0].label).toBe('sponsor-pool-1');
+            expect(result.label).toBe('sponsor-pool-1');
+        });
+
+        it('stores null when no label is given, so nothing changes for existing callers', async () => {
+            mockDbRun.mockResolvedValueOnce(undefined);
+            await registeredHandlers['connectWallet'](createMockRequest({ viewingKey: 'a'.repeat(64) }));
+            expect(insertEntriesSpy.mock.calls[0][0].label).toBeNull();
+        });
+
+        it('rejects an oversized label instead of letting it become a storage field', async () => {
+            const req = createMockRequest({ viewingKey: 'a'.repeat(64), label: 'x'.repeat(101) });
+            await registeredHandlers['connectWallet'](req);
+            expect(req.reject).toHaveBeenCalledWith(400, expect.stringContaining('at most 100'));
+            expect(insertEntriesSpy).not.toHaveBeenCalled();
+        });
+    });
+
+    describe('platform-sponsor expiry exemption', () => {
+        const SPONSOR_SESSION = 'sponsor-session-x';
+        const previousPool = process.env.NIGHTGATE_FEE_SPONSOR_SESSION;
+
+        afterEach(() => {
+            if (previousPool === undefined) delete process.env.NIGHTGATE_FEE_SPONSOR_SESSION;
+            else process.env.NIGHTGATE_FEE_SPONSOR_SESSION = previousPool;
+        });
+
+        it('reads the balance of an EXPIRED session that is configured as a sponsor', async () => {
+            // Live-observed on the hosted server: the pool's own sessions have
+            // long-past expiresAt (they are exempt where they act as
+            // infrastructure), so every ordinary read answered 410 for wallets
+            // that were paying for everyone's transactions.
+            process.env.NIGHTGATE_FEE_SPONSOR_SESSION = SPONSOR_SESSION;
+            mockDbRun.mockResolvedValueOnce({ ...activeSessionRow({ expiresInMs: -60_000 }), sessionId: SPONSOR_SESSION });
+            mockGetWalletBalance.mockResolvedValueOnce({ dustBalance: '42', registeredNightUtxoCount: 1 });
+
+            const req = createMockRequest({ sessionId: SPONSOR_SESSION });
+            const result: any = await registeredHandlers['getWalletBalance'](req);
+
+            expect(req.reject).not.toHaveBeenCalled();
+            expect(result.dustBalance).toBe('42');
+        });
+
+        it('still rejects an expired session that is NOT a configured sponsor', async () => {
+            delete process.env.NIGHTGATE_FEE_SPONSOR_SESSION;
+            mockDbRun.mockResolvedValueOnce(activeSessionRow({ expiresInMs: -60_000 }));
+
+            const req = createMockRequest({ sessionId: 'sess-1' });
+            await registeredHandlers['getWalletBalance'](req);
+
+            expect(req.reject).toHaveBeenCalledWith(410, 'Session expired');
+        });
+
+        it('applies the same rule to sendNight, so one path cannot disagree with another', async () => {
+            process.env.NIGHTGATE_FEE_SPONSOR_SESSION = SPONSOR_SESSION;
+            mockDbRun.mockResolvedValueOnce({ ...activeSessionRow({ expiresInMs: -60_000 }), sessionId: SPONSOR_SESSION });
+
+            const req = createMockRequest({
+                sessionId: SPONSOR_SESSION,
+                receiverAddress: 'addr'.repeat(20),
+                amount: '1000'
+            });
+            await registeredHandlers['sendNight'](req);
+
+            expect(req.reject).not.toHaveBeenCalledWith(410, expect.anything());
+        });
+    });
+
+    describe('getSponsorPoolStatus', () => {
+        const SPONSOR = 'sponsor-session-1';
+        const previousPoolEnv = process.env.NIGHTGATE_FEE_SPONSOR_SESSION;
+
+        afterEach(() => {
+            if (previousPoolEnv === undefined) delete process.env.NIGHTGATE_FEE_SPONSOR_SESSION;
+            else process.env.NIGHTGATE_FEE_SPONSOR_SESSION = previousPoolEnv;
+        });
+
+        function adminRequest() {
+            const req = createMockRequest({});
+            req.user.is = (role: string) => role === 'admin';
+            return req;
+        }
+
+        beforeEach(() => {
+            // Default to a WARM facade: the handler refuses to read a balance
+            // from a cold one, so every other case here needs progress present.
+            mockWalletGetSyncProgress.mockReturnValue({ caughtUp: true });
+            mockHasWalletFacade.mockReturnValue(false);
+        });
+
+        it('is empty when no sponsor pool is configured', async () => {
+            delete process.env.NIGHTGATE_FEE_SPONSOR_SESSION;
+            const result: any = await registeredHandlers['getSponsorPoolStatus'](createMockRequest({}));
+            expect(result).toEqual([]);
+            expect(mockDbRun).not.toHaveBeenCalled();
+        });
+
+        it('reports backings as the parallel sponsoring capacity', async () => {
+            process.env.NIGHTGATE_FEE_SPONSOR_SESSION = SPONSOR;
+            const row = { ...activeSessionRow(), sessionId: SPONSOR, userId: 'someone-else' };
+            mockDbRun.mockResolvedValueOnce(row);   // visibility lookup
+            mockDbRun.mockResolvedValueOnce(row);   // loadSigningSessionAccountId
+            mockGetWalletBalance.mockResolvedValueOnce({
+                dustBalance: '5000',
+                registeredNightUtxoCount: 4, dustUtxoCount: 4,
+                dustPendingCount: 0,
+                dustRestoreCount: 1
+            });
+
+            const result: any = await registeredHandlers['getSponsorPoolStatus'](adminRequest());
+            expect(result).toHaveLength(1);
+            expect(result[0]).toMatchObject({
+                sessionId: SPONSOR,
+                usable: true,
+                registeredNightUtxos: 4, dustNotes: 4,
+                pendingDustNotes: 0,
+                dustRestoreCount: 1,
+                lastError: null
+            });
+        });
+
+        it('is not usable with backings but no dust', async () => {
+            process.env.NIGHTGATE_FEE_SPONSOR_SESSION = SPONSOR;
+            const row = { ...activeSessionRow(), sessionId: SPONSOR };
+            mockDbRun.mockResolvedValueOnce(row).mockResolvedValueOnce(row);
+            mockGetWalletBalance.mockResolvedValueOnce({ dustBalance: '0', registeredNightUtxoCount: 2 });
+
+            const result: any = await registeredHandlers['getSponsorPoolStatus'](adminRequest());
+            expect(result[0].usable).toBe(false);
+        });
+
+        it('counts DELEGATED dust notes as the capacity, not the sponsor own registrations', async () => {
+            // Dust generation is delegable: a foreign wallet points its NIGHT
+            // at this sponsor's dust address, and every one of its registered
+            // UTXOs yields a note here while this sponsor's own registration
+            // count never moves. Reporting the own count showed a pool that had
+            // just gone from 3 to 14 notes as flat, and a sponsor funded purely
+            // by donors as unusable.
+            process.env.NIGHTGATE_FEE_SPONSOR_SESSION = SPONSOR;
+            const row = { ...activeSessionRow(), sessionId: SPONSOR };
+            mockDbRun.mockResolvedValueOnce(row).mockResolvedValueOnce(row);
+            mockGetWalletBalance.mockResolvedValueOnce({
+                dustBalance: '6510232317207628087',
+                registeredNightUtxoCount: 0,   // owns nothing registered
+                dustUtxoCount: 14,             // fourteen notes, all delegated
+                dustPendingCount: 0,
+                dustRestoreCount: 0
+            });
+
+            const result: any = await registeredHandlers['getSponsorPoolStatus'](adminRequest());
+            expect(result[0]).toMatchObject({ usable: true, registeredNightUtxos: 0, dustNotes: 14 });
+        });
+
+        it('counts only FREE dust notes, since a pending one cannot back another sponsorship', async () => {
+            // `dustUtxoCount` is the SDK's total, which is available PLUS
+            // pending. Reading it as capacity promised four parallel
+            // sponsorships from a wallet that could serve two.
+            process.env.NIGHTGATE_FEE_SPONSOR_SESSION = SPONSOR;
+            const row = { ...activeSessionRow(), sessionId: SPONSOR };
+            mockDbRun.mockResolvedValueOnce(row).mockResolvedValueOnce(row);
+            mockGetWalletBalance.mockResolvedValueOnce({
+                dustBalance: '5000', registeredNightUtxoCount: 4,
+                dustUtxoCount: 4, dustPendingCount: 2, dustRestoreCount: 0
+            });
+
+            const result: any = await registeredHandlers['getSponsorPoolStatus'](adminRequest());
+            expect(result[0]).toMatchObject({ dustNotes: 2, pendingDustNotes: 2 });
+        });
+
+        it('prefers the worker own free-note count over the subtraction', async () => {
+            // The worker reports `dustAvailableCount` where the SDK exposes an
+            // available list; trust it rather than re-deriving the arithmetic.
+            process.env.NIGHTGATE_FEE_SPONSOR_SESSION = SPONSOR;
+            const row = { ...activeSessionRow(), sessionId: SPONSOR };
+            mockDbRun.mockResolvedValueOnce(row).mockResolvedValueOnce(row);
+            mockGetWalletBalance.mockResolvedValueOnce({
+                dustBalance: '5000', registeredNightUtxoCount: 4,
+                dustUtxoCount: 9, dustAvailableCount: 3, dustPendingCount: 2, dustRestoreCount: 0
+            });
+
+            const result: any = await registeredHandlers['getSponsorPoolStatus'](adminRequest());
+            expect(result[0]).toMatchObject({ dustNotes: 3 });
+        });
+
+        it('a wallet whose notes are ALL pending is not usable', async () => {
+            process.env.NIGHTGATE_FEE_SPONSOR_SESSION = SPONSOR;
+            const row = { ...activeSessionRow(), sessionId: SPONSOR };
+            mockDbRun.mockResolvedValueOnce(row).mockResolvedValueOnce(row);
+            mockGetWalletBalance.mockResolvedValueOnce({
+                dustBalance: '5000', registeredNightUtxoCount: 4,
+                dustUtxoCount: 2, dustPendingCount: 2, dustRestoreCount: 0
+            });
+
+            const result: any = await registeredHandlers['getSponsorPoolStatus'](adminRequest());
+            expect(result[0]).toMatchObject({ usable: false, dustNotes: 0 });
+        });
+
+        it('hides the exact balance from a caller who is neither admin nor owner, keeping the flags', async () => {
+            process.env.NIGHTGATE_FEE_SPONSOR_SESSION = SPONSOR;
+            const row = { ...activeSessionRow(), sessionId: SPONSOR, userId: 'someone-else' };
+            mockDbRun.mockResolvedValueOnce(row).mockResolvedValueOnce(row);
+            mockGetWalletBalance.mockResolvedValueOnce({
+                dustBalance: '5000',
+                registeredNightUtxoCount: 4, dustUtxoCount: 4,
+                dustPendingCount: 2
+            });
+
+            const result: any = await registeredHandlers['getSponsorPoolStatus'](createMockRequest({}));
+            expect(result[0].dustBalance).toBeNull();
+            // Still enough to answer "can the pool pay, and is it wedged".
+            expect(result[0]).toMatchObject({ usable: true, registeredNightUtxos: 4, dustNotes: 2, pendingDustNotes: 2 });
+        });
+
+        it('shows the exact balance to the session owner', async () => {
+            process.env.NIGHTGATE_FEE_SPONSOR_SESSION = SPONSOR;
+            const row = { ...activeSessionRow(), sessionId: SPONSOR, userId: TEST_USER_ID };
+            mockDbRun.mockResolvedValueOnce(row).mockResolvedValueOnce(row);
+            mockGetWalletBalance.mockResolvedValueOnce({ dustBalance: '5000', registeredNightUtxoCount: 1 });
+
+            const result: any = await registeredHandlers['getSponsorPoolStatus'](createMockRequest({}));
+            expect(result[0].dustBalance).toBe('5000');
+        });
+
+        it('does NOT call a configured sponsor expired, the way resolveFeeSponsor does not', async () => {
+            // Live-found: the pool reported all three production sponsors as
+            // "Session expired" while sponsoring worked fine. A configured
+            // platform sponsor is infrastructure and does not expire while it
+            // is configured; the cleanup sweep exempts it for the same reason.
+            process.env.NIGHTGATE_FEE_SPONSOR_SESSION = SPONSOR;
+            const expired = { ...activeSessionRow({ expiresInMs: -60_000 }), sessionId: SPONSOR };
+            mockDbRun.mockResolvedValueOnce(expired).mockResolvedValueOnce(expired);
+            mockGetWalletBalance.mockResolvedValueOnce({ dustBalance: '900', registeredNightUtxoCount: 3, dustUtxoCount: 3 });
+
+            const result: any = await registeredHandlers['getSponsorPoolStatus'](adminRequest());
+            expect(result[0].lastError).toBeNull();
+            expect(result[0]).toMatchObject({ usable: true, registeredNightUtxos: 3, dustNotes: 3 });
+        });
+
+        it('names a configured sponsor that is missing or inactive', async () => {
+            process.env.NIGHTGATE_FEE_SPONSOR_SESSION = SPONSOR;
+            mockDbRun.mockResolvedValueOnce(undefined);
+
+            const result: any = await registeredHandlers['getSponsorPoolStatus'](adminRequest());
+            expect(result[0]).toMatchObject({ usable: false, registeredNightUtxos: 0, dustNotes: 0 });
+            expect(result[0].lastError).toContain('missing or inactive');
+            expect(mockGetWalletBalance).not.toHaveBeenCalled();
+        });
+
+        it('names a sponsor that cannot sign, which looks configured and is not', async () => {
+            process.env.NIGHTGATE_FEE_SPONSOR_SESSION = SPONSOR;
+            mockDbRun.mockResolvedValueOnce({ ...activeSessionRow({ withSeed: false }), sessionId: SPONSOR });
+
+            const result: any = await registeredHandlers['getSponsorPoolStatus'](adminRequest());
+            expect(result[0].usable).toBe(false);
+            expect(result[0].lastError).toContain('no signing key');
+        });
+
+        it('reads a resident facade that never reported progress', async () => {
+            // Live-observed on the hosted pool: a facade restored from
+            // persisted state and already at the tip is fully usable and
+            // pushes no progress snapshot, because the worker only sends those
+            // while a sync WAIT runs. Gating on progress alone reported such a
+            // sponsor as cold forever.
+            process.env.NIGHTGATE_FEE_SPONSOR_SESSION = SPONSOR;
+            const row = { ...activeSessionRow(), sessionId: SPONSOR };
+            mockDbRun.mockResolvedValueOnce(row).mockResolvedValueOnce(row);
+            mockWalletGetSyncProgress.mockReturnValue(null);
+            mockHasWalletFacade.mockReturnValue(true);
+            mockGetWalletBalance.mockResolvedValueOnce({ dustBalance: '700', registeredNightUtxoCount: 2, dustUtxoCount: 2 });
+
+            const result: any = await registeredHandlers['getSponsorPoolStatus'](adminRequest());
+            expect(result[0]).toMatchObject({ usable: true, registeredNightUtxos: 2, dustNotes: 2, lastError: null });
+        });
+
+        it('never builds a cold facade: a status read must not create work', async () => {
+            // Live-observed: polling this against a freshly booted server piled
+            // up worker RPCs (inFlightRpcs climbing, facades still empty),
+            // because getWalletBalance builds the facade and that build
+            // outlives the capped request. The progress cache decides instead.
+            process.env.NIGHTGATE_FEE_SPONSOR_SESSION = SPONSOR;
+            const row = { ...activeSessionRow(), sessionId: SPONSOR };
+            mockDbRun.mockResolvedValueOnce(row).mockResolvedValueOnce(row);
+            mockWalletGetSyncProgress.mockReturnValue(null);
+
+            const result: any = await registeredHandlers['getSponsorPoolStatus'](adminRequest());
+            expect(mockGetWalletBalance).not.toHaveBeenCalled();
+            expect(result[0].usable).toBe(false);
+            expect(result[0].lastError).toContain('not warm yet');
+        });
+
+        it('caps a sponsor whose facade never answers instead of parking the caller', async () => {
+            // A status endpoint must not hang. The read-sync gate bounds the
+            // catch-up wait, but BUILDING a cold facade happens before it and
+            // is unbounded, so the whole per-sponsor read carries its own cap.
+            process.env.NIGHTGATE_FEE_SPONSOR_SESSION = SPONSOR;
+            process.env.NIGHTGATE_SPONSOR_STATUS_TIMEOUT_MS = '80';
+            try {
+                const row = { ...activeSessionRow(), sessionId: SPONSOR };
+                mockDbRun.mockResolvedValueOnce(row).mockResolvedValueOnce(row);
+                mockGetWalletBalance.mockImplementationOnce(() => new Promise(() => { /* never settles */ }));
+
+                const started = Date.now();
+                const result: any = await registeredHandlers['getSponsorPoolStatus'](adminRequest());
+                expect(Date.now() - started).toBeLessThan(3000);
+                expect(result[0].usable).toBe(false);
+                expect(result[0].lastError).toContain('warming up');
+            } finally {
+                delete process.env.NIGHTGATE_SPONSOR_STATUS_TIMEOUT_MS;
+            }
+        });
+
+        it('keeps reporting the rest of the pool when one sponsor is unreadable', async () => {
+            process.env.NIGHTGATE_FEE_SPONSOR_SESSION = `${SPONSOR},sponsor-session-2`;
+            const first = { ...activeSessionRow(), sessionId: SPONSOR };
+            const second = { ...activeSessionRow(), sessionId: 'sponsor-session-2' };
+            mockDbRun
+                .mockResolvedValueOnce(first).mockResolvedValueOnce(first)
+                .mockResolvedValueOnce(second).mockResolvedValueOnce(second);
+            mockGetWalletBalance
+                .mockRejectedValueOnce(new Error('wallet not genuinely synced'))
+                .mockResolvedValueOnce({ dustBalance: '900', registeredNightUtxoCount: 2, dustUtxoCount: 2 });
+
+            const result: any = await registeredHandlers['getSponsorPoolStatus'](adminRequest());
+            expect(result).toHaveLength(2);
+            expect(result[0].lastError).toContain('not genuinely synced');
+            expect(result[1].usable).toBe(true);
+        });
+
+        it('looks a platform sponsor up WITHOUT the owner constraint', async () => {
+            process.env.NIGHTGATE_FEE_SPONSOR_SESSION = SPONSOR;
+            const row = { ...activeSessionRow(), sessionId: SPONSOR, userId: 'someone-else' };
+            mockDbRun.mockResolvedValueOnce(row).mockResolvedValueOnce(row);
+            mockGetWalletBalance.mockResolvedValueOnce({ dustBalance: '1', registeredNightUtxoCount: 1 });
+
+            await registeredHandlers['getSponsorPoolStatus'](createMockRequest({}));
+            // Same rule resolveFeeSponsor() applies: a configured sponsor is
+            // infrastructure, not a caller's session.
+            for (const call of selectWhereSpy.mock.calls) {
+                expect(call[0]).not.toHaveProperty('userId');
+            }
         });
     });
 });
