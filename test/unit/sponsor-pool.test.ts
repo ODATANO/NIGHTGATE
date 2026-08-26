@@ -124,7 +124,7 @@ describe('non-exclusive candidates (unbound path)', () => {
     });
 });
 
-describe('submit outcome classification (review round 4)', () => {
+describe('submit outcome classification', () => {
     it('pre-inclusion rejects are rebuildable and clear the hash; not-applied is rebuildable but on-chain; a watch timeout is ambiguous', () => {
         const rejects = [
             '1010: Invalid Transaction: Custom error: 196',

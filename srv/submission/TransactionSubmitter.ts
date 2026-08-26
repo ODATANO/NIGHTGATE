@@ -22,6 +22,7 @@
 
 import cds from '@sap/cds';
 import { classificationHaystack } from '../utils/format-error';
+import { DUST_RACE_LEDGER_CODES, dustRaceLedgerCode } from './dust-race';
 import { reportExternalExecution, reportExternalSubmission } from './job-execution-context';
 const { INSERT, UPDATE } = cds.ql;
 import { PendingSubmissions } from '#cds-models/midnight';
@@ -72,6 +73,8 @@ export interface PendingSubmissionRow {
  */
 export interface ContractRegistrationMeta {
     artifactPath:   string;
+    /** Generation digest (module + verifier keys) of the resolved artifact; keys the worker's module cache. */
+    artifactDigest?: string;
     privateStateId: string;
     zkConfigPath:   string;
     /** Content-tree width of a vault-family artifact (16 default, 32 for attestation-vault-32). */
@@ -153,7 +156,24 @@ export interface SubmissionErrorClassification {
     retryable: boolean;
     knownIssueRef?: string;
     message: string;
+    /**
+     * `'dust-race'`: the dust spend was built against a dust state the node has
+     * already moved past (`1010/170` stale merkle root or validity window,
+     * `1010/196` nullifier already known). Pre-mempool, fee unspent; rebuild
+     * against the caught-up dust wallet and resubmit. One definition for all
+     * submitting paths (bound deploy/call/batch here, sponsored paths via sponsor-pool).
+     */
+    transient?: 'dust-race';
 }
+
+export { DUST_RACE_LEDGER_CODES, dustRaceLedgerCode };
+
+const envInt = (name: string, fallback: number): number => {
+    const raw = process.env[name];
+    if (raw === undefined || raw === '') return fallback;
+    const n = Number(raw);
+    return Number.isFinite(n) && n >= 0 ? n : fallback;
+};
 
 export class SubmissionError extends Error {
     constructor(
@@ -208,6 +228,28 @@ export class TransactionSubmitter {
         if (deps.db) this.db = deps.db;
     }
 
+    /**
+     * Rebuild-retry on a transient dust race (`dustRaceLedgerCode`). 170/196
+     * are pre-mempool rejects: nothing broadcast, no fee spent, dust wallet
+     * already restored by the worker's wedge protection. Runs inside the worker
+     * call, before any txHash exists, so a retry never races a broadcast.
+     * Every other failure propagates unchanged.
+     */
+    private async withDustRaceRetry<T>(what: string, submissionId: string, attempt: () => Promise<T>): Promise<T> {
+        const retries = envInt('NIGHTGATE_DUST_RACE_RETRIES', 2);
+        const backoffMs = envInt('NIGHTGATE_DUST_RACE_BACKOFF_MS', 5_000);
+        for (let n = 0; ; n++) {
+            try {
+                return await attempt();
+            } catch (err) {
+                const code = dustRaceLedgerCode(err);
+                if (code == null || n >= retries) throw err;
+                log.warn(`${what} ${submissionId.slice(0, 8)}: transient dust race (${code}), rebuild-retry ${n + 1}/${retries} after ${backoffMs}ms`);
+                await new Promise(resolve => setTimeout(resolve, backoffMs));
+            }
+        }
+    }
+
     async deploy<PS = unknown>(args: DeployArgs<PS>): Promise<DeployResult> {
         const submissionId = await this.insertPending('DEPLOY', null, null, args.sessionId);
 
@@ -218,7 +260,7 @@ export class TransactionSubmitter {
             const proxy = await this.registerPrivateStateProxy();
             release = proxy.release;
             await reportExternalExecution({ submissionId });
-            workerResult = await deployFn(this.makeDeployRpcArgs(args, proxy.proxyId));
+            workerResult = await this.withDustRaceRetry('deploy', submissionId, () => deployFn(this.makeDeployRpcArgs(args, proxy.proxyId)));
         } catch (err) {
             release?.();
             const classification = classifySubmissionError(err, this.deps.network);
@@ -269,7 +311,7 @@ export class TransactionSubmitter {
             const proxy = await this.registerPrivateStateProxy();
             release = proxy.release;
             await reportExternalExecution({ submissionId });
-            workerResult = await callFn(this.makeCallRpcArgs(args, proxy.proxyId));
+            workerResult = await this.withDustRaceRetry(`call ${args.circuit}`, submissionId, () => callFn(this.makeCallRpcArgs(args, proxy.proxyId)));
         } catch (err) {
             release?.();
             const classification = classifySubmissionError(err, this.deps.network);
@@ -333,7 +375,7 @@ export class TransactionSubmitter {
             const proxy = await this.registerPrivateStateProxy();
             release = proxy.release;
             await reportExternalExecution({ submissionId });
-            workerResult = await batchFn(this.makeCallBatchRpcArgs(args, proxy.proxyId));
+            workerResult = await this.withDustRaceRetry(`batch ${circuitLabel}`, submissionId, () => batchFn(this.makeCallBatchRpcArgs(args, proxy.proxyId)));
         } catch (err) {
             release?.();
             const classification = classifySubmissionError(err, this.deps.network);
@@ -623,6 +665,15 @@ export function classifySubmissionError(err: unknown, network: NightgateNetwork)
         return { code: '1014', retryable: false, message: `Pool priority reject (Substrate 1014, priority too low): ${message}` };
     }
     if (/\b1010\s*:|invalid transaction/i.test(haystack)) {
+        const dustRace = dustRaceLedgerCode(err);
+        if (dustRace) {
+            return {
+                code: dustRace,
+                retryable: true,
+                transient: 'dust-race',
+                message: `Transient dust race (Substrate 1010, ledger error ${dustRace.slice(5)}): the dust spend was built against a dust state the node has already moved past; nothing entered the pool and no fee was spent, rebuild and resubmit: ${message}`
+            };
+        }
         const custom = /custom error:?\s*(\d+)/i.exec(haystack);
         return {
             code: custom ? `1010/${custom[1]}` : '1010',

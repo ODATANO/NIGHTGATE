@@ -516,7 +516,66 @@ describe('waitForSyncedState (genuine sync gate)', () => {
         try {
             const reply = await rpc('waitForSyncedState', { sessionId: INIT_ARGS.sessionId, timeoutMs: 0 });
             expect(reply.ok).toBe(false);
-            expect(reply.error.message).toMatch(/wallet not synced to tip after 0ms/);
+            expect(reply.error.message).toMatch(/wallet not synced to tip after 0ms \(absolute ceiling\)/);
+            expect(reply.error.message).toMatch(/no stall detected/);
+        } finally {
+            vi.unstubAllGlobals();
+        }
+    });
+
+    // An index that does not move for stallMs fails as stalled while the absolute ceiling is far away; the last snapshot stays readable.
+    it('fails as STALLED when appliedIndex does not advance within stallMs, before the ceiling', async () => {
+        vi.stubGlobal('fetch', vi.fn(async () => ({
+            json: async () => ({ data: { block: { height: '500', timestamp: Date.now() } } })
+        })));
+        try {
+            facadeState.current = { dust: { progress: { appliedIndex: '10', isConnected: true } } };
+            wsTip.maxId = '100000'; // far from the tip, so caughtUp never latches
+            fakeParentPort.postMessage.mockClear();
+            const reply = await rpc('waitForSyncedState', { sessionId: INIT_ARGS.sessionId, timeoutMs: 60_000, stallMs: 1 });
+            expect(reply.ok).toBe(false);
+            expect(reply.error.message).toMatch(/wallet sync stalled: no progress for \d+ min/);
+            expect(reply.error.message).toMatch(/appliedIndex stuck at 10/);
+            expect(reply.error.message).not.toMatch(/absolute ceiling/);
+            const pushed = fakeParentPort.postMessage.mock.calls
+                .map((c: any[]) => c[0]).filter((m: any) => m?.kind === 'sync-progress');
+            expect(pushed.at(-1)?.snapshot).toMatchObject({ appliedIndex: '10', caughtUp: false });
+            expect(typeof pushed.at(-1)?.snapshot?.lastProgressAt).toBe('string');
+        } finally {
+            vi.unstubAllGlobals();
+        }
+    });
+
+    // A state observable that cannot be read (peek timeout or error on every poll) counts as no progress.
+    it('fails as STALLED when the wallet state is not readable for stallMs', async () => {
+        vi.stubGlobal('fetch', vi.fn(async () => ({
+            json: async () => ({ data: { block: { height: '500', timestamp: Date.now() } } })
+        })));
+        const saved = facadeState.current;
+        Object.defineProperty(facadeState, 'current', { configurable: true, get() { throw new Error('state observable dead'); } });
+        try {
+            wsTip.maxId = '100000';
+            const reply = await rpc('waitForSyncedState', { sessionId: INIT_ARGS.sessionId, timeoutMs: 60_000, stallMs: 1 });
+            expect(reply.ok).toBe(false);
+            expect(reply.error.message).toMatch(/wallet sync stalled: no progress for \d+ min and the wallet state is not readable/);
+            expect(reply.error.message).not.toMatch(/absolute ceiling/);
+        } finally {
+            delete (facadeState as any).current;
+            (facadeState as any).current = saved;
+            vi.unstubAllGlobals();
+        }
+    });
+
+    it('stallMs <= 0 disables the stall bound (ceiling only)', async () => {
+        vi.stubGlobal('fetch', vi.fn(async () => ({
+            json: async () => ({ data: { block: { height: '500', timestamp: Date.now() } } })
+        })));
+        try {
+            facadeState.current = { dust: { progress: { appliedIndex: '10', isConnected: true } } };
+            wsTip.maxId = '100000';
+            const reply = await rpc('waitForSyncedState', { sessionId: INIT_ARGS.sessionId, timeoutMs: 0, stallMs: 0 });
+            expect(reply.ok).toBe(false);
+            expect(reply.error.message).toMatch(/absolute ceiling/);
         } finally {
             vi.unstubAllGlobals();
         }
@@ -981,7 +1040,7 @@ describe('buildWorkerWalletProvider', () => {
     });
 });
 
-// ---- dust save epoch guard (dust-pending-note-leak FR, review P1) ----------
+// ---- dust save epoch guard ------------------------------------------------
 //
 // After a dust snapshot restore, neither a save tick that already serialized
 // the pre-restore (poisoned) wallet nor a late ack of an older dust push may
@@ -1475,31 +1534,103 @@ describe('getBalance / estimateTransferFee', () => {
 // ---- dust register / deregister --------------------------------------------
 
 describe('registerDustGeneration / deregisterDustGeneration', () => {
+    // The post-submit settle observation polls in real time; off by default here, one test turns it on.
+    beforeEach(() => { process.env.NIGHTGATE_DUST_REGISTER_SETTLE_MS = '0'; });
+    afterEach(() => { delete process.env.NIGHTGATE_DUST_REGISTER_SETTLE_MS; });
+
     it('registers exactly the UNREGISTERED subset of available coins', async () => {
         const facade = await initSession('session-dustreg-ffffffff');
         const unreg1 = { id: 'c1', meta: { registeredForDustGeneration: false } };
         const unreg2 = { id: 'c2' };
         const reg = { id: 'c3', meta: { registeredForDustGeneration: true } };
+        // SDK shape: the registered coin is not in availableCoins; the total counts it.
         facade.waitForSyncedState.mockResolvedValue({
-            unshielded: { availableCoins: [reg, unreg1, unreg2] }
+            unshielded: { availableCoins: [unreg1, unreg2], totalCoins: [reg, unreg1, unreg2] }
         });
         const reply = await rpc('registerDustGeneration', { sessionId: 'session-dustreg-ffffffff' });
         expect(reply.ok).toBe(true);
         expect(reply.result.registeredCount).toBe(2);
         expect(reply.result.totalNightUtxos).toBe(3);
         expect(reply.result.txId).toBe('tx-hash-fixture');
+        // outcome fields: applied receiver echoed, before-count from the full coin set, no observation window = not settled, count unknown
+        expect(reply.result).toMatchObject({
+            changed: true, reason: null, dustReceiverAddress: expect.any(String),
+            registeredUtxosBefore: 1, registeredUtxosAfter: null, settled: false, consolidated: null
+        });
         const [coins] = facade.registerNightUtxosForDustGeneration.mock.calls[0];
         expect(coins).toEqual([unreg1, unreg2]);
     });
 
-    it('returns a no-op result when every coin is already registered', async () => {
+    it('reports the RESULTING registered-UTXO count once the tx applies locally, flagging consolidation', async () => {
+        process.env.NIGHTGATE_DUST_REGISTER_SETTLE_MS = '5000';
+        const facade = await initSession('session-dustreg-settle-hh');
+        const inputs = Array.from({ length: 9 }, (_, i) => ({ id: `n${i}` }));
+        facade.waitForSyncedState.mockResolvedValue({
+            unshielded: { availableCoins: inputs, totalCoins: inputs }
+        });
+        // Nine inputs, two registered UTXOs after consolidation.
+        facadeState.current = {
+            unshielded: { totalCoins: [{ meta: { registeredForDustGeneration: true } }, { meta: { registeredForDustGeneration: true } }] }
+        };
+        const reply = await rpc('registerDustGeneration', { sessionId: 'session-dustreg-settle-hh' });
+        expect(reply.ok).toBe(true);
+        expect(reply.result).toMatchObject({
+            changed: true, registeredCount: 9, registeredUtxosBefore: 0, registeredUtxosAfter: 2,
+            settled: true, consolidated: true
+        });
+        expect(reply.result.message).toMatch(/consolidated/i);
+    });
+
+    // SDK shape: `availableCoins` excludes registered UTXOs; a fully registered wallet has
+    // an empty available set and its coins in totalCoins. The reason comes from the full set.
+    it('returns a no-op result when every coin is already registered (empty availableCoins, registered totalCoins)', async () => {
         const facade = await initSession('session-dustreg-noop-gggg');
         facade.waitForSyncedState.mockResolvedValue({
-            unshielded: { availableCoins: [{ meta: { registeredForDustGeneration: true } }] }
+            unshielded: { availableCoins: [], totalCoins: [{ meta: { registeredForDustGeneration: true } }] }
         });
         const reply = await rpc('registerDustGeneration', { sessionId: 'session-dustreg-noop-gggg' });
         expect(reply.ok).toBe(true);
-        expect(reply.result).toMatchObject({ txId: null, registeredCount: 0, totalNightUtxos: 1 });
+        expect(reply.result).toMatchObject({
+            txId: null, registeredCount: 0, totalNightUtxos: 1,
+            changed: false, reason: 'already-registered', dustReceiverAddress: null, settled: true
+        });
+        expect(facade.registerNightUtxosForDustGeneration).not.toHaveBeenCalled();
+    });
+
+    // Registration binds the address: a different receiver on a registered wallet changes nothing and is not echoed.
+    it('a different receiver on an already-registered wallet: changed=false, receiver NOT echoed, deregister hint', async () => {
+        const facade = await initSession('session-dustreg-recv-iiii');
+        facade.waitForSyncedState.mockResolvedValue({
+            unshielded: { availableCoins: [], totalCoins: [{ meta: { registeredForDustGeneration: true } }] }
+        });
+        const reply = await rpc('registerDustGeneration', {
+            sessionId: 'session-dustreg-recv-iiii', dustReceiverAddress: 'mn_dust_other_receiver'
+        });
+        expect(reply.ok).toBe(true);
+        expect(reply.result).toMatchObject({ changed: false, reason: 'already-registered', dustReceiverAddress: null });
+        expect(reply.result.requestedReceiver).toEqual(expect.any(String));
+        expect(reply.result.message).toMatch(/NOT applied/);
+        expect(reply.result.message).toMatch(/deregisterFromDustGeneration/);
+        expect(facade.registerNightUtxosForDustGeneration).not.toHaveBeenCalled();
+    });
+
+    it('no unshielded NIGHT at all: reason no-night-utxos', async () => {
+        const facade = await initSession('session-dustreg-empty-jjjj');
+        facade.waitForSyncedState.mockResolvedValue({ unshielded: { availableCoins: [], totalCoins: [] } });
+        const reply = await rpc('registerDustGeneration', { sessionId: 'session-dustreg-empty-jjjj' });
+        expect(reply.ok).toBe(true);
+        expect(reply.result).toMatchObject({ changed: false, reason: 'no-night-utxos', registeredCount: 0, totalNightUtxos: 0 });
+        expect(reply.result.message).not.toMatch(/already/);
+    });
+
+    it('a registered coin that the SDK still lists as available is counted as registered too (no full coin set)', async () => {
+        const facade = await initSession('session-dustreg-avail-kkkk');
+        facade.waitForSyncedState.mockResolvedValue({
+            unshielded: { availableCoins: [{ meta: { registeredForDustGeneration: true } }] }
+        });
+        const reply = await rpc('registerDustGeneration', { sessionId: 'session-dustreg-avail-kkkk' });
+        expect(reply.ok).toBe(true);
+        expect(reply.result).toMatchObject({ changed: false, reason: 'already-registered', totalNightUtxos: 1, registeredUtxosBefore: 1 });
         expect(facade.registerNightUtxosForDustGeneration).not.toHaveBeenCalled();
     });
 
@@ -1978,7 +2109,7 @@ describe('dedicated submit clients: settle window + closing-socket retry', () =>
 
 // ---- review findings on 0.18: lease ownership + client-pool cap -------------
 
-describe('dust backing lease ownership (review P1)', () => {
+describe('dust backing lease ownership', () => {
     const notes = [{ token: { backingNight: 'backing-X' }, generatedNow: 10n ** 9n }];
     beforeEach(() => workerExports.__noteLeaseForTests.reset());
 
@@ -2007,7 +2138,7 @@ describe('dust backing lease ownership (review P1)', () => {
     });
 });
 
-describe('dedicated submit client pool cap (review P2)', () => {
+describe('dedicated submit client pool cap', () => {
     it('concurrent first callers never create more clients than the cap, even while the SDK import is pending', async () => {
         const SESSION = 'session-sponsor-poolcap-aaaaaa';
         const facade = await initSession(SESSION);
@@ -2259,7 +2390,7 @@ describe('pre-broadcast submit intent (external-effect boundary)', () => {
     }, 30_000);
 });
 
-describe('dust backing lease renewal + env (review P2)', () => {
+describe('dust backing lease renewal + env', () => {
     const notes = [{ token: { backingNight: 'backing-R' }, generatedNow: 10n ** 9n }];
     beforeEach(() => workerExports.__noteLeaseForTests.reset());
 
@@ -2287,6 +2418,41 @@ describe('dust backing lease renewal + env (review P2)', () => {
             expect(noteLeaseTtlMs()).toBe(120000);
         } finally {
             if (prev === undefined) delete process.env.NIGHTGATE_NOTE_LEASE_MS; else process.env.NIGHTGATE_NOTE_LEASE_MS = prev;
+        }
+    });
+});
+
+// A due rotation is a drain: checked on every completion (failed calls count), admission closes
+// with the announcement (later calls are refused with WORKER_ROTATING), exit once nothing is in flight.
+describe('worker rotation drains: admission closes, in-flight completes, exit at zero', () => {
+    it('rotates after a FAILED call, refuses calls that arrive after the announcement', async () => {
+        const w: any = await import('../../srv/midnight/wallet-worker.js');
+        w.__resetRotationForTests();
+        process.env.NIGHTGATE_WORKER_MAX_GENERATIONS = '1';
+        const exitSpy = vi.spyOn(process, 'exit').mockImplementation((() => undefined) as any);
+        fakeParentPort.postMessage.mockClear();
+        try {
+            expect(w.noteGenerationImported('d'.repeat(64))).toBe(true);
+            // a failed call (no such facade) still completes the rotation
+            const failed = await rpc('waitForSyncedState', { sessionId: 'no-such-session-for-rotation', timeoutMs: 1 });
+            expect(failed.ok).toBe(false);
+            expect(failed.error?.name).not.toBe('WORKER_ROTATING'); // it was admitted before the drain
+            const rotating = fakeParentPort.postMessage.mock.calls.map(c => c[0]).find((m: any) => m?.kind === 'rotating');
+            expect(rotating).toMatchObject({ generations: 1, inflight: 0 });
+            await new Promise(r => setImmediate(r)); await new Promise(r => setImmediate(r));
+            expect(exitSpy).toHaveBeenCalledWith(0);
+            expect(w.__rotationStateForTests()).toMatchObject({ pending: true, draining: true, inflight: 0 });
+            // admission is closed: a call arriving now is refused, never started
+            const refused = await rpc('evict', { sessionId: 'another' });
+            expect(refused.ok).toBe(false);
+            expect(refused.error?.name).toBe('WORKER_ROTATING');
+            expect(w.__admitRpcForTests()).toBe(false);
+        } finally {
+            // let a scheduled exit hit the spy, never the real process.exit
+            await new Promise(r => setImmediate(r)); await new Promise(r => setImmediate(r));
+            exitSpy.mockRestore();
+            delete process.env.NIGHTGATE_WORKER_MAX_GENERATIONS;
+            w.__resetRotationForTests();
         }
     });
 });

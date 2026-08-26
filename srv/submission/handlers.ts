@@ -59,8 +59,8 @@ import {
     deriveRawTokenType, TokenTypeError,
     SHIELDED_TEST_TOKEN_REF, SHIELDED_TEST_TOKEN_CIRCUIT, SHIELDED_TEST_TOKEN_AMOUNT
 } from './token-type';
-import { startJob, JobAdmissionBusyError, runChildCommand, registerBackgroundJobProcessor, registerBackgroundJobReconciliationFinalizer, type BackgroundJobRow, type ReconciliationEvidence } from './background-jobs';
-import { reportExternalExecution, reportExternalSubmission, reportSubmissionRejected } from './job-execution-context';
+import { startJob, JobAdmissionBusyError, runChildCommand, registerBackgroundJobProcessor, registerBackgroundJobReconciliationFinalizer, withLockContentionRetry, SponsorAttemptBookkeepingPendingError, type BackgroundJobRow, type ReconciliationEvidence } from './background-jobs';
+import { reportSubmissionRejectedOn, reportBroadcastOn } from './job-execution-context';
 import { reindexDisclosuresForContract } from './disclosure-indexer';
 import { readAttestationStateForContract } from './attestation-state';
 import { readPredicateStateForContract, expandAllowedMask, computeAttestCommitment } from './predicate-state';
@@ -76,6 +76,8 @@ import {
     isRetryableSponsorFailure, isDustRaceFailure, isGenericInvalidFailure, isPreInclusionReject, isAmbiguousSubmitOutcome, isCallNotAppliedFailure, envMsSetting,
     sponsorCandidatesNonExclusive, touchSponsor
 } from './sponsor-pool';
+import { resolveSponsorPolicyForRequest, SponsorPolicyEmptyError, SponsorPolicyUnavailableError } from './sponsor-policy';
+import { recordDeployedContracts, reserveDeployBudget, releaseDeployBudget } from '../sessions/agent-grants';
 import { getConfiguredFeeSponsorSessions } from './fee-sponsor';
 
 const { INSERT, UPDATE, SELECT, DELETE } = cds.ql;
@@ -693,7 +695,7 @@ export function registerSubmissionHandlers(
         if (command.op === 'deploy') {
             const result = await submitter.deploy({
                 contractName: command.compiledArtifactRef,
-                registration: { artifactPath: resolved.artifactPath, privateStateId: resolved.privateStateId, zkConfigPath: resolved.zkConfigPath, ...(resolved.slotWidth !== undefined ? { slotWidth: resolved.slotWidth } : {}) },
+                registration: { artifactPath: resolved.artifactPath, artifactDigest: resolved.artifactDigest, privateStateId: resolved.privateStateId, zkConfigPath: resolved.zkConfigPath, ...(resolved.slotWidth !== undefined ? { slotWidth: resolved.slotWidth } : {}) },
                 initialPrivateState: command.initialPrivateState,
                 sessionId: job.sessionId
             });
@@ -707,7 +709,7 @@ export function registerSubmissionHandlers(
                 contractAddress: command.contractAddress, circuit: 'attestGuarded',
                 args: [0n, hexToBytes(command.commitment), new Uint8Array(32), new Uint8Array(32)],
                 contractName: command.compiledArtifactRef,
-                registration: { artifactPath: resolved.artifactPath, privateStateId: resolved.privateStateId, zkConfigPath: resolved.zkConfigPath, ...(resolved.slotWidth !== undefined ? { slotWidth: resolved.slotWidth } : {}) },
+                registration: { artifactPath: resolved.artifactPath, artifactDigest: resolved.artifactDigest, privateStateId: resolved.privateStateId, zkConfigPath: resolved.zkConfigPath, ...(resolved.slotWidth !== undefined ? { slotWidth: resolved.slotWidth } : {}) },
                 sessionId: job.sessionId
             });
             return { commitment: command.commitment, contractAddress: command.contractAddress, txHash: result.txHash, ...(sponsor ? { feeSponsor: sponsor.sponsorSessionId } : {}) };
@@ -723,7 +725,7 @@ export function registerSubmissionHandlers(
                     ? [1n, hexToBytes(command.payloadHash), hexToBytes(command.metadataHash), hexToBytes(command.guardedNonce)]
                     : [hexToBytes(command.payloadHash), hexToBytes(command.metadataHash)],
                 contractName: command.compiledArtifactRef,
-                registration: { artifactPath: resolved.artifactPath, privateStateId: resolved.privateStateId, zkConfigPath: resolved.zkConfigPath, ...(resolved.slotWidth !== undefined ? { slotWidth: resolved.slotWidth } : {}) },
+                registration: { artifactPath: resolved.artifactPath, artifactDigest: resolved.artifactDigest, privateStateId: resolved.privateStateId, zkConfigPath: resolved.zkConfigPath, ...(resolved.slotWidth !== undefined ? { slotWidth: resolved.slotWidth } : {}) },
                 sessionId: job.sessionId
             });
             const anchoredAt = new Date().toISOString();
@@ -740,7 +742,7 @@ export function registerSubmissionHandlers(
                     ? [hexToBytes(command.payloadHash), hexToBytes(command.grantee), BigInt(command.level)]
                     : [hexToBytes(command.payloadHash), hexToBytes(command.grantee)],
                 contractName: command.compiledArtifactRef,
-                registration: { artifactPath: resolved.artifactPath, privateStateId: resolved.privateStateId, zkConfigPath: resolved.zkConfigPath, ...(resolved.slotWidth !== undefined ? { slotWidth: resolved.slotWidth } : {}) },
+                registration: { artifactPath: resolved.artifactPath, artifactDigest: resolved.artifactDigest, privateStateId: resolved.privateStateId, zkConfigPath: resolved.zkConfigPath, ...(resolved.slotWidth !== undefined ? { slotWidth: resolved.slotWidth } : {}) },
                 sessionId: job.sessionId
             });
             const changedAt = new Date().toISOString();
@@ -759,7 +761,7 @@ export function registerSubmissionHandlers(
                 circuit: 'registerPassport',
                 args: [hexToBytes(command.passportId), hexToBytes(command.ownerId)],
                 contractName: command.compiledArtifactRef,
-                registration: { artifactPath: resolved.artifactPath, privateStateId: resolved.privateStateId, zkConfigPath: resolved.zkConfigPath, ...(resolved.slotWidth !== undefined ? { slotWidth: resolved.slotWidth } : {}) },
+                registration: { artifactPath: resolved.artifactPath, artifactDigest: resolved.artifactDigest, privateStateId: resolved.privateStateId, zkConfigPath: resolved.zkConfigPath, ...(resolved.slotWidth !== undefined ? { slotWidth: resolved.slotWidth } : {}) },
                 sessionId: job.sessionId
             });
             return { passportId: command.passportId, ownerId: command.ownerId, contractAddress: command.contractAddress, txHash: result.txHash, ...(sponsor ? { feeSponsor: sponsor.sponsorSessionId } : {}) };
@@ -790,7 +792,7 @@ export function registerSubmissionHandlers(
                 contractName: command.compiledArtifactRef,
                 initialPrivateState: command.initialPrivateState,
                 merkleProof: command.merkleProof,
-                registration: { artifactPath: resolved.artifactPath, privateStateId: resolved.privateStateId, zkConfigPath: resolved.zkConfigPath, ...(resolved.slotWidth !== undefined ? { slotWidth: resolved.slotWidth } : {}) },
+                registration: { artifactPath: resolved.artifactPath, artifactDigest: resolved.artifactDigest, privateStateId: resolved.privateStateId, zkConfigPath: resolved.zkConfigPath, ...(resolved.slotWidth !== undefined ? { slotWidth: resolved.slotWidth } : {}) },
                 sessionId: job.sessionId
             });
             return { submissionId: result.submissionId, txHash: result.txHash, contractAddress: result.contractAddress, circuits: result.circuits, status: result.status, ...(sponsor ? { feeSponsor: sponsor.sponsorSessionId } : {}) };
@@ -807,7 +809,7 @@ export function registerSubmissionHandlers(
             const out = await submitter.probeCrossServerSponsor({
                 contractAddress: c.contractAddress, circuit: c.circuit, args: coerced,
                 contractName: c.compiledArtifactRef,
-                registration: { artifactPath: resolved.artifactPath, privateStateId: resolved.privateStateId, zkConfigPath: resolved.zkConfigPath, ...(resolved.slotWidth !== undefined ? { slotWidth: resolved.slotWidth } : {}) },
+                registration: { artifactPath: resolved.artifactPath, artifactDigest: resolved.artifactDigest, privateStateId: resolved.privateStateId, zkConfigPath: resolved.zkConfigPath, ...(resolved.slotWidth !== undefined ? { slotWidth: resolved.slotWidth } : {}) },
                 sessionId: job.sessionId
             });
             return { ...out, contractAddress: c.contractAddress, circuit: c.circuit, ...(sponsor ? { feeSponsor: sponsor.sponsorSessionId } : {}) };
@@ -823,7 +825,7 @@ export function registerSubmissionHandlers(
             const out = await submitter.buildSponsorable({
                 contractAddress: c.contractAddress, circuit: c.circuit, args: coerced,
                 contractName: c.compiledArtifactRef,
-                registration: { artifactPath: resolved.artifactPath, privateStateId: resolved.privateStateId, zkConfigPath: resolved.zkConfigPath, ...(resolved.slotWidth !== undefined ? { slotWidth: resolved.slotWidth } : {}) },
+                registration: { artifactPath: resolved.artifactPath, artifactDigest: resolved.artifactDigest, privateStateId: resolved.privateStateId, zkConfigPath: resolved.zkConfigPath, ...(resolved.slotWidth !== undefined ? { slotWidth: resolved.slotWidth } : {}) },
                 sessionId: job.sessionId
             });
             return { ...out, contractAddress: c.contractAddress, circuit: c.circuit };
@@ -851,7 +853,7 @@ export function registerSubmissionHandlers(
             contractName: command.compiledArtifactRef,
             initialPrivateState: command.initialPrivateState,
             merkleProof: command.merkleProof,
-            registration: { artifactPath: resolved.artifactPath, privateStateId: resolved.privateStateId, zkConfigPath: resolved.zkConfigPath, ...(resolved.slotWidth !== undefined ? { slotWidth: resolved.slotWidth } : {}) },
+            registration: { artifactPath: resolved.artifactPath, artifactDigest: resolved.artifactDigest, privateStateId: resolved.privateStateId, zkConfigPath: resolved.zkConfigPath, ...(resolved.slotWidth !== undefined ? { slotWidth: resolved.slotWidth } : {}) },
             sessionId: job.sessionId
         });
         return { submissionId: result.submissionId, txHash: result.txHash, contractAddress: result.contractAddress, status: result.status, ...(sponsor ? { feeSponsor: sponsor.sponsorSessionId } : {}) };
@@ -896,14 +898,37 @@ export function registerSubmissionHandlers(
         let boundaryCrossed = false;
         let currentSubmissionId: string | null = null;
         let currentTxHash: string | null = null;
+        // Deploys reserved from the grant's lifetime budget for this job: taken at
+        // the first submit-intent naming deploys, kept across rebuild attempts,
+        // refunded only when the attempt is provably not on chain.
+        let reservedDeploys = 0;
         const failPreviousAttempt = async (why: string, rejectedPreInclusion: boolean) => {
             if (!currentSubmissionId) return;
+            // Row close, deploy refund (only for an attempt provably not on chain) and
+            // taking the rejected hash off the job (CAS on lease + hash) are one transaction.
+            // A write that still fails after the contention retry throws: no rebuild on an unclosed attempt.
+            const refund = rejectedPreInclusion && reservedDeploys > 0 && command?.grantId ? reservedDeploys : 0;
+            const rowId = currentSubmissionId;
+            const rowHash = currentTxHash ?? undefined;
             try {
-                await db.run(UPDATE.entity(PendingSubmissions).set({ status: 'failed', errorCode: rejectedPreInclusion ? 'REJECTED' : 'REBUILT', errorMessage: why.slice(0, 500) }).where({ ID: currentSubmissionId }));
-            } catch { /* best effort */ }
-            if (rejectedPreInclusion) {
-                try { await reportSubmissionRejected({ submissionId: currentSubmissionId, txHash: currentTxHash ?? undefined }); } catch { /* best effort */ }
+                await withLockContentionRetry(`failSponsorAttempt(${job.ID})`, () => runInOneTransaction(db, async (tx) => {
+                    await tx.run(UPDATE.entity(PendingSubmissions).set({ status: 'failed', errorCode: rejectedPreInclusion ? 'REJECTED' : 'REBUILT', errorMessage: why.slice(0, 500) }).where({ ID: rowId }));
+                    if (refund > 0) await releaseDeployBudget(tx, String(command.grantId), refund);
+                    if (rejectedPreInclusion) await reportSubmissionRejectedOn(tx, { submissionId: rowId, txHash: rowHash });
+                }));
+            } catch (e) {
+                cds.log('nightgate').error(`sponsor attempt ${rowId} of job ${job.ID} could not be closed as ${rejectedPreInclusion ? 'REJECTED' : 'REBUILT'}${refund > 0 ? ` (deploy reservation of ${refund} NOT refunded)` : ''}; not retrying: ${String((e as Error)?.message ?? e)}`);
+                if (rejectedPreInclusion) {
+                    // The runner persists this error's code as the job's errorCode;
+                    // settleRejectedSponsorAttempts re-runs the bookkeeping from it.
+                    // Generic reconciliation cannot resolve it: the hash never reached a mempool.
+                    throw new SponsorAttemptBookkeepingPendingError(
+                        `sponsoring attempt ${rowId} was rejected before inclusion but its bookkeeping (close, refund, hash) could not be committed: ${String((e as Error)?.message ?? e)}. Settled by the reconciler. Original failure: ${why.slice(0, 200)}`,
+                        { submissionId: rowId, txHash: rowHash, grantId: refund > 0 ? String(command.grantId) : undefined, refund });
+                }
+                throw new Error(`sponsoring attempt could not be closed (${String((e as Error)?.message ?? e)}); the job stops here for reconciliation instead of rebuilding on an open attempt. Original failure: ${why.slice(0, 200)}`);
             }
+            if (refund > 0) reservedDeploys = 0;
             currentSubmissionId = null; currentTxHash = null;
         };
         // The intent carries what the WORKER inspected and chose (contract and
@@ -911,29 +936,44 @@ export function registerSubmissionHandlers(
         // account), so a reconciled result can be rebuilt canonically; stored
         // as JSON on the attempt row (submitIntentData, internal; finalizedTxData
         // keeps its public meaning: the indexed-transaction snapshot).
-        const onSubmitIntent = () => async (txHash: string, intent?: { contractAddress?: string; circuits?: string[]; note?: string; sponsorAccountId?: string }) => {
+        const onSubmitIntent = () => async (txHash: string, intent?: { contractAddress?: string; circuits?: string[]; note?: string; sponsorAccountId?: string; deployed?: string[] }) => {
             const submissionId = cds.utils.uuid();
+            const deployed = (intent?.deployed ?? []).map(String).filter(Boolean);
+            const grantId = command?.grantId ? String(command.grantId) : null;
+            // A sponsored deploy consumes the grant's lifetime budget here, before the
+            // ack that lets the worker broadcast: one conditional UPDATE, fail-closed (nack, no broadcast).
+            // Reservation and attempt row are one transaction; the row carries grant + deployed addresses for the reconciliation finalizer.
+            const need = grantId && deployed.length > reservedDeploys ? deployed.length - reservedDeploys : 0;
             const coordinates = {
                 feeSponsor: feeSponsorSessionId(), sponsorAccountId: intent?.sponsorAccountId ?? null,
                 circuits: intent?.circuits ?? [], contractAddress: intent?.contractAddress ?? null,
-                ...(intent?.note ? { note: intent.note } : {})
+                ...(intent?.note ? { note: intent.note } : {}),
+                ...(deployed.length ? { deployed } : {}),
+                ...(grantId && deployed.length ? { deployReservation: { grantId, count: deployed.length } } : {})
             };
-            await db.run(INSERT.into(PendingSubmissions).entries({
+            const row = {
                 ID: submissionId, txHash, contractAddress: intent?.contractAddress ?? null, circuitName: intent?.circuits?.[0] ?? null,
-                actionType: 'CALL', submittedAt: new Date().toISOString(), status: 'pending', sessionId: job.sessionId,
+                actionType: (deployed.length ? 'DEPLOY' : 'CALL') as 'DEPLOY' | 'CALL', submittedAt: new Date().toISOString(), status: 'pending' as const, sessionId: job.sessionId,
                 submitIntentData: JSON.stringify(coordinates)
-            }));
-            // Reference the row from here on, BEFORE the job-status writes: if
-            // either of them fails the worker is nacked and does not broadcast,
-            // and the row must be closed REJECTED rather than left pending.
+            };
+            // The job transition (running -> submitted, or the rebuild's new hash) rides
+            // the same transaction: after a crash the job is either still running with
+            // nothing reserved, or submitted with hash, row and reservation all present.
+            let budgetExhausted: Error | null = null;
+            await withLockContentionRetry(`sponsorAttempt(${job.ID})`, () => runInOneTransaction(db, async (tx) => {
+                await tx.run(INSERT.into(PendingSubmissions).entries(row));
+                if (need > 0) {
+                    const ok = await reserveDeployBudget(tx, grantId!, need);
+                    if (!ok) {
+                        budgetExhausted = new Error(`deploy budget of the grant is exhausted or the grant no longer allows deploys (${deployed.length} deploy(s) in this transaction); not broadcasting`);
+                        throw budgetExhausted;
+                    }
+                }
+                await reportBroadcastOn(tx, { submissionId, txHash, firstBoundary: !boundaryCrossed });
+            })).catch((e) => { throw budgetExhausted ?? e; });
+            boundaryCrossed = true;
+            if (grantId && deployed.length) reservedDeploys = deployed.length;
             currentSubmissionId = submissionId; currentTxHash = txHash;
-            try {
-                if (!boundaryCrossed) { await reportExternalExecution({ submissionId }); boundaryCrossed = true; }
-                await reportExternalSubmission({ submissionId, txHash });
-            } catch (e) {
-                await failPreviousAttempt(`submit-intent not persisted: ${String((e as Error)?.message ?? e)}`, true);
-                throw e;
-            }
         };
         const markIncluded = async (out: { contractAddress?: string; circuits?: string[] }) => {
             if (!currentSubmissionId) return;
@@ -987,10 +1027,12 @@ export function registerSubmissionHandlers(
                     finalizedTxB64: command.finalizedTxB64,
                     networkId: facadeCfg.networkId,
                     allowedContracts: command.allowedContracts,
-                    allowedCircuits: command.allowedCircuits
+                    allowedCircuits: command.allowedCircuits,
+                    allowDeploy: command.allowDeploy === true
                 }, ledger.onSubmitIntent());
                 await ledger.markIncluded(out);
                 releaseSponsor(sessionId);
+                if (command.grantId && out.deployed?.length) await recordDeployedContracts(db, command.grantId, out.deployed);
                 return { ...out, feeSponsor: sponsor.sponsorSessionId };
             } catch (e) {
                 lastErr = e;
@@ -998,7 +1040,12 @@ export function registerSubmissionHandlers(
                 // this attempt's row. Whether the hash may stay on the job
                 // follows the same rule as the unbound path.
                 if (isAmbiguousSubmitOutcome(e)) { releaseSponsor(sessionId); throw e; }
-                await ledger.failPreviousAttempt(String((e as Error)?.message ?? e), isPreInclusionReject(e));
+                try {
+                    await ledger.failPreviousAttempt(String((e as Error)?.message ?? e), isPreInclusionReject(e));
+                } catch (closeErr) {
+                    releaseSponsor(sessionId);
+                    throw closeErr;
+                }
                 if (!isRetryableSponsorFailure(e)) {
                     releaseSponsor(sessionId);
                     throw e; // fails identically on every sponsor; do not burn the pool
@@ -1012,6 +1059,37 @@ export function registerSubmissionHandlers(
         }
         throw lastErr ?? new Error('no sponsor candidate available');
     };
+
+    /**
+     * Reconciliation finalizer for both sponsoring channels: a broadcast whose
+     * outcome was ambiguous in-process and is later proven included by the
+     * indexer still records the deployed address on the grant. Reads only the
+     * attempt row (`deployed`, `deployReservation`). Idempotent (recording is
+     * a merge). A reconciled chain failure keeps the reservation consumed:
+     * refunds are only for transactions that provably never reached the chain.
+     */
+    const finalizeSponsoredSubmission = async (raw: unknown, _job: BackgroundJobRow, evidence: ReconciliationEvidence): Promise<unknown> => {
+        const command = raw as { grantId?: string; sponsorSessionId?: string };
+        const submission: any = evidence.submissionId
+            ? await db.run(SELECT.one.from(PendingSubmissions).where({ ID: evidence.submissionId }))
+            : await db.run(SELECT.one.from(PendingSubmissions).where({ txHash: evidence.txHash }));
+        let coordinates: any = {};
+        try { coordinates = submission?.submitIntentData ? JSON.parse(submission.submitIntentData) : {}; } catch { coordinates = {}; }
+        const deployed: string[] = Array.isArray(coordinates.deployed) ? coordinates.deployed.map(String) : [];
+        const grantId = coordinates.deployReservation?.grantId ?? command?.grantId;
+        if (deployed.length && grantId) await recordDeployedContracts(db, String(grantId), deployed);
+        return {
+            reconciled: true, ...evidence, status: 'finalized',
+            circuits: Array.isArray(coordinates.circuits) ? coordinates.circuits : [],
+            contractAddress: coordinates.contractAddress ?? evidence.contractAddress ?? '',
+            ...(coordinates.note ? { note: coordinates.note } : {}),
+            ...(deployed.length ? { deployed } : {}),
+            feeSponsor: coordinates.feeSponsor ?? command?.sponsorSessionId ?? _job.sessionId
+        };
+    };
+    registerBackgroundJobReconciliationFinalizer('sponsorFinalizedTransaction', 1, finalizeSponsoredSubmission);
+    registerBackgroundJobReconciliationFinalizer('sponsorUnboundTransaction', 1, finalizeSponsoredSubmission);
+
     registerBackgroundJobProcessor('sponsorFinalizedTransaction', 1, executeSponsorFinalized);
 
     // 0.18 PARALLEL channel: same policy + pool + failover, but NO exclusive
@@ -1063,9 +1141,11 @@ export function registerSubmissionHandlers(
                         unboundTxB64: command.unboundTxB64,
                         networkId: facadeCfg.networkId,
                         allowedContracts: command.allowedContracts,
-                        allowedCircuits: command.allowedCircuits
+                        allowedCircuits: command.allowedCircuits,
+                        allowDeploy: command.allowDeploy === true
                     }, onSubmitIntent());
                     await ledger.markIncluded(out);
+                    if (command.grantId && out.deployed?.length) await recordDeployedContracts(db, command.grantId, out.deployed);
                     return { ...out, feeSponsor: sponsor.sponsorSessionId };
                 } catch (e) {
                     lastErr = e;
@@ -1531,12 +1611,12 @@ export function registerSubmissionHandlers(
                 const sponsor = await resolveFeeSponsor({ db, sponsorSessionId: effectiveSponsor, requestingUserId: (req as any).user?.id, config: getNightgatePluginConfig() });
                 await ensureFeeSponsorFacade(sponsor, facadeCfg);
             }
-            // Allow-list (optional): the contracts/circuits this sponsor will pay
-            // for, from env. Empty = allow any (dev). Sends/deploys are never
-            // in the vault's circuit set, so listing the vault's circuits scopes
-            // it to attestation work.
-            const allowedContracts = String(process.env.NIGHTGATE_SPONSOR_ALLOWED_CONTRACTS ?? '').split(',').map(s => s.trim()).filter(Boolean);
-            const allowedCircuits = String(process.env.NIGHTGATE_SPONSOR_ALLOWED_CIRCUITS ?? '').split(',').map(s => s.trim()).filter(Boolean);
+            // Allow-list: platform floor (env or NIGHTGATE_SPONSOR_POLICY_FILE) narrowed by
+            // the agent grant's lists when the request carries a token; empty floor = allow any (dev).
+            // Refused at admission, before a job exists: empty intersection or unusable policy file.
+            const { allowedContracts, allowedCircuits, allowDeploy } = resolveSponsorPolicyForRequest(req);
+            // Grant behind a token request; a sponsored deploy's address is recorded onto it.
+            const grantId: string | undefined = (req as any).agentGrant?.ID ? String((req as any).agentGrant.ID) : undefined;
             // Idempotency scope: pool jobs share ONE sessionId (the sentinel)
             // and platform sponsors are shared across callers, so a raw key
             // would put every caller into one global namespace (user A's key
@@ -1558,7 +1638,7 @@ export function registerSubmissionHandlers(
                     txHash: bytesToHex(sha256(Buffer.from(finalizedTxB64, 'base64')))
                 },
                 requestedBy: (req as any).user?.id, commandVersion: 1, encryptCommand: true,
-                command: { op: 'sponsorFinalized', finalizedTxB64, sponsorSessionId: effectiveSponsor, allowedContracts, allowedCircuits }
+                command: { op: 'sponsorFinalized', finalizedTxB64, sponsorSessionId: effectiveSponsor, allowedContracts, allowedCircuits, allowDeploy, grantId }
             });
             // The job is keyed by the SPONSOR session (or the pool sentinel),
             // which an agent-grant caller may not know. Return it so the
@@ -1589,8 +1669,10 @@ export function registerSubmissionHandlers(
                 const sponsor = await resolveFeeSponsor({ db, sponsorSessionId: effectiveSponsor, requestingUserId: (req as any).user?.id, config: getNightgatePluginConfig() });
                 await ensureFeeSponsorFacade(sponsor, facadeCfg);
             }
-            const allowedContracts = String(process.env.NIGHTGATE_SPONSOR_ALLOWED_CONTRACTS ?? '').split(',').map(s => s.trim()).filter(Boolean);
-            const allowedCircuits = String(process.env.NIGHTGATE_SPONSOR_ALLOWED_CIRCUITS ?? '').split(',').map(s => s.trim()).filter(Boolean);
+            // Floor narrowed by the agent grant; see sponsorFinalizedTransaction above.
+            const { allowedContracts, allowedCircuits, allowDeploy } = resolveSponsorPolicyForRequest(req);
+            // Grant behind a token request; a sponsored deploy's address is recorded onto it.
+            const grantId: string | undefined = (req as any).agentGrant?.ID ? String((req as any).agentGrant.ID) : undefined;
             const caller = String((req as any).user?.id ?? 'anonymous');
             const scopedIdempotencyKey = idempotencyKey
                 ? bytesToHex(sha256(Buffer.from(`${caller}\u0000${idempotencyKey}`, 'utf8')))
@@ -1603,7 +1685,7 @@ export function registerSubmissionHandlers(
                     txHash: bytesToHex(sha256(Buffer.from(unboundTxB64, 'base64')))
                 },
                 requestedBy: (req as any).user?.id, commandVersion: 1, encryptCommand: true,
-                command: { op: 'sponsorUnbound', unboundTxB64, sponsorSessionId: effectiveSponsor, allowedContracts, allowedCircuits }
+                command: { op: 'sponsorUnbound', unboundTxB64, sponsorSessionId: effectiveSponsor, allowedContracts, allowedCircuits, allowDeploy, grantId }
             });
             return { ...job, sessionId: effectiveSponsor };
         });
@@ -3892,6 +3974,20 @@ function checkRate(limiter: RateLimiter, sessionId: string, req: Request, count 
     return true;
 }
 
+/**
+ * Run `fn` in one transaction of `db` (commit on return, rollback on throw).
+ * A test double without `tx` runs it directly, without atomicity.
+ */
+async function runInOneTransaction<T>(db: any, fn: (tx: { run: (q: unknown) => Promise<unknown> }) => Promise<T>): Promise<T> {
+    if (typeof db?.tx === 'function') return db.tx(fn);
+    return fn(db);
+}
+
+/** `Retry-After` on a retryable 503. `req.http` is absent outside an HTTP request (tests, programmatic calls). */
+function setRetryAfter(req: Request, seconds: number): void {
+    try { (req as any).http?.res?.set?.('Retry-After', String(seconds)); } catch { /* header is a courtesy */ }
+}
+
 /** Catch the known error classes and translate to OData status codes. */
 async function runSubmission(req: Request, op: () => Promise<unknown>): Promise<unknown> {
     try {
@@ -3911,25 +4007,39 @@ async function runSubmission(req: Request, op: () => Promise<unknown>): Promise<
         if (err instanceof FeeSponsorError) {
             return req.reject(err.httpStatus, err.message);
         }
+        if (err instanceof SponsorPolicyEmptyError) {
+            // Grant ∩ platform floor is empty: 403 at admission, nothing written.
+            return req.reject({ status: err.httpStatus, code: err.code, message: err.message } as any);
+        }
+        if (err instanceof SponsorPolicyUnavailableError) {
+            // Policy file configured but unusable, nothing good loaded yet: fail closed,
+            // message kept readable in production.
+            return req.reject({ status: err.httpStatus, code: err.code, message: err.message, $sanitize: false } as any);
+        }
         if (err instanceof WalletMaterialUnavailable) {
             // 501 = the session lacks signing material (no seed). The caller must
             // run connectWalletForSigning before deploy/call/submit actions.
             return req.reject(501, err.message);
         }
         if (err instanceof JobAdmissionBusyError) {
-            // Busy, not broken: nothing was written and nothing submitted, so the
-            // caller can send the same request again.
-            return req.reject(err.httpStatus, err.message);
+            // Busy, not broken: nothing written, nothing submitted, the caller can resend.
+            // Rejected as an object so code and `$sanitize: false` ride along; a bare
+            // (status, message) pair is re-wrapped by CAP and sanitised in production.
+            setRetryAfter(req, err.retryAfterSeconds);
+            return req.reject({ status: err.httpStatus, code: err.code, message: err.message, $sanitize: false } as any);
         }
         if (err instanceof SubmissionError) {
             const c = err.classification;
-            return req.reject(c.retryable ? 503 : 400, JSON.stringify({
+            const body = JSON.stringify({
                 code: c.code,
                 retryable: c.retryable,
                 knownIssueRef: c.knownIssueRef,
                 message: c.message,
                 submissionId: err.submissionId
-            }));
+            });
+            // A retryable classification stays readable in production (same as above).
+            if (c.retryable) return req.reject({ status: 503, code: c.code, message: body, $sanitize: false } as any);
+            return req.reject(400, body);
         }
         const msg = err instanceof Error ? err.message : String(err);
         return req.reject(500, msg);

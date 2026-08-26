@@ -14,6 +14,7 @@ import {
     DEFAULT_NETWORK
 } from '../srv/utils/nightgate-config';
 import { loadRegistryFromConfig, listRegisteredContracts } from '../srv/submission/contract-registry';
+import { loadPersistedRegistrations } from '../srv/submission/contract-registrations';
 import { redactUrlCredentials } from '../srv/utils/redact-url';
 import { publishRuntimeState } from '../srv/utils/runtime-state';
 import { ensureSyncStateSingleton } from '../srv/utils/sync-state';
@@ -145,7 +146,10 @@ async function ensureSchemaDeployed(): Promise<void> {
         // column on every connectWallet, so an un-migrated database has to
         // fail HERE with a message naming the fix, not later on the first
         // session with an opaque "no such column".
-        { table: 'midnight.WalletSessions', columns: ['label'] }
+        { table: 'midnight.WalletSessions', columns: ['label'] },
+        // Per-grant sponsor policy + runtime contract registrations.
+        { table: 'midnight.AgentGrants', columns: ['allowedContracts', 'allowedCircuits', 'allowDeploy', 'maxDeploys', 'deploysUsed', 'deployedContracts'] },
+        { table: 'midnight.ContractRegistrations' }
     ];
 
     const db = cds.db || await cds.connect.to('db');
@@ -345,6 +349,8 @@ export async function initialize(): Promise<NightgateIndexerStatus> {
         if (refs.length) {
             log.info(`Registered contracts: ${refs.join(', ')}`);
         }
+        // Runtime registrations from ContractRegistrations, on top of the config floor. A bad row is skipped with a warning.
+        await loadPersistedRegistrations(cds.db || await cds.connect.to('db'));
     } catch (regErr) {
         const msg = regErr instanceof Error ? regErr.message : String(regErr);
         log.warn(`Contract registry load warning: ${msg}`);

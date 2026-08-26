@@ -102,7 +102,7 @@ export async function ensureZkAssets({ zkConfigBaseUrl, cacheDir, circuits = ATT
             onProgress?.({ phase: 'zk-asset', circuit, file: rel, fetched, cached });
         }
     }
-    return { cacheDir, fetched, cached };
+    return { cacheDir, fetched, cached, source: 'remote' };
 }
 
 /**
@@ -180,7 +180,7 @@ export function buildOnlyWalletProvider(facade, zswapKeys, dustKey, keystore, ho
  * @param {string} [opts.contractName]    logical name, default 'attestation-vault'
  * @param {string} [opts.privateStateId]  default 'attestationVaultPrivateState'
  * @param {string} [opts.cacheDir]        zk asset cache, default ~/.cache/nightgate-txbuilder/<contractName>
- * @param {string[]} [opts.circuits]      circuits to make available, default the vault's set
+ * @param {string[]} [opts.circuits]      circuits to make available (prover keys + zkir); default: every circuit of contractClass
  * @param {number} [opts.ttlMinutes]      transaction TTL, default 30; the sponsor must submit within it
  * @param {Uint8Array} [opts.attestationSecret] bring your own, else derived from the seed
  * @param {Function} [opts.onProgress]    progress callback
@@ -202,6 +202,63 @@ async function findDeployedWithRetry(contracts, providers, args) {
     }
 }
 
+/**
+ * The contract address a built deploy transaction creates: the `address` of its
+ * single ContractDeploy action (an action without `entryPoint`). Throws unless
+ * exactly one such action with a non-empty address exists.
+ */
+export function readDeployAddress(tx) {
+    const intents = tx?.intents;
+    if (!intents || typeof intents.entries !== 'function') {
+        throw new Error('deploy build: transaction structure is not inspectable (no intents)');
+    }
+    const found = [];
+    for (const [, intent] of Array.from(intents.entries())) {
+        for (const action of (intent?.actions ?? [])) {
+            const ep = action?.entryPoint;
+            const isCall = typeof ep === 'string' || ep instanceof Uint8Array;
+            if (isCall) continue;
+            if (action?.updates !== undefined) throw new Error('deploy build: transaction carries a maintenance update');
+            if (action?.address === undefined) continue;
+            found.push(String(action.address));
+        }
+    }
+    if (found.length !== 1 || !found[0]) {
+        throw new Error(`deploy build: expected exactly one contract deploy action with an address, found ${found.length}`);
+    }
+    return found[0];
+}
+
+/**
+ * `zkConfigDir` mode: checks keys/ + zkir/ and a verifier key per circuit, fetches
+ * nothing, and returns a `ZkAssetResult` (`fetched` 0, `cached` = key files found, `source: 'local'`).
+ */
+export async function describeLocalZkAssets(zkConfigDir, circuits = [], proveCircuits = circuits) {
+    const { statSync, readdirSync } = await import('node:fs');
+    const keysDir = join(zkConfigDir, 'keys');
+    const zkirDir = join(zkConfigDir, 'zkir');
+    const isDir = (d) => { try { return statSync(d).isDirectory(); } catch { return false; } };
+    if (!isDir(keysDir) || !isDir(zkirDir)) {
+        throw new Error(`createTxBuilder: zkConfigDir ${zkConfigDir} must hold keys/ and zkir/ directories`);
+    }
+    const files = readdirSync(keysDir);
+    const zkirFiles = readdirSync(zkirDir);
+    // Verifier keys for EVERY circuit of the contract (a deploy writes them
+    // all); prover key + bzkir for the circuits this builder will prove. A
+    // gap here is a build that fails at proving time otherwise.
+    const missing = circuits.filter(c => !files.includes(`${c}.verifier`));
+    if (missing.length > 0) throw new Error(`createTxBuilder: zkConfigDir lacks verifier keys for ${missing.join(', ')}`);
+    const missingProver = proveCircuits.filter(c => !files.includes(`${c}.prover`));
+    if (missingProver.length > 0) throw new Error(`createTxBuilder: zkConfigDir lacks prover keys for ${missingProver.join(', ')} (keys/<circuit>.prover)`);
+    const missingZkir = proveCircuits.filter(c => !zkirFiles.includes(`${c}.bzkir`));
+    if (missingZkir.length > 0) throw new Error(`createTxBuilder: zkConfigDir lacks zkir for ${missingZkir.join(', ')} (zkir/<circuit>.bzkir)`);
+    // `cached`: the files this check verified (every circuit's verifier key,
+    // prover key + bzkir of the circuits to prove), the same set the remote
+    // path would have fetched.
+    const cached = circuits.length + proveCircuits.length * 2;
+    return { cacheDir: zkConfigDir, fetched: 0, cached, source: 'local' };
+}
+
 export async function createTxBuilder(opts) {
     const {
         seedHex, networkId = 'preprod', accountIndex = 0,
@@ -215,7 +272,11 @@ export async function createTxBuilder(opts) {
     }
     if (!indexerHttpUrl || !indexerWsUrl) throw new Error('createTxBuilder: indexerHttpUrl and indexerWsUrl are required');
     if (!nodeUrl) throw new Error('createTxBuilder: nodeUrl is required (the Substrate RPC the wallet SDK talks to)');
-    if (!zkConfigBaseUrl) throw new Error('createTxBuilder: zkConfigBaseUrl is required (a public /zk-config/<contract>)');
+    // Proving assets come from a public /zk-config (fetched once, cached) or
+    // from a local zkConfigDir holding keys/ and zkir/.
+    if (!zkConfigBaseUrl && !opts.zkConfigDir) {
+        throw new Error('createTxBuilder: zkConfigBaseUrl is required (a public /zk-config/<contract>), unless zkConfigDir names a local directory with keys/ and zkir/');
+    }
     if (typeof contractClass !== 'function') throw new Error('createTxBuilder: contractClass is required (the compiled Contract)');
     // Proving mode is validated HERE, before any asset fetch or SDK import,
     // like the other input checks.
@@ -225,22 +286,36 @@ export async function createTxBuilder(opts) {
     if (opts.provingMode === 'server' && !opts.proofServerUrl) {
         throw new Error("createTxBuilder: provingMode 'server' requires proofServerUrl (a proof server YOU run; it receives the witnesses)");
     }
-    const cacheDir = opts.cacheDir ?? join(homedir(), '.cache', 'nightgate-txbuilder', contractName);
+    const cacheDir = opts.zkConfigDir ?? opts.cacheDir ?? join(homedir(), '.cache', 'nightgate-txbuilder', contractName);
 
     // 1. Proving assets: fetch once, then offline. The verifier keys must
     //    cover EVERY circuit of the contract (see ensureZkAssets); introspect
     //    the compiled class with a stub witnesses object to get the full list.
+    //    With zkConfigDir nothing is fetched, the directory is only checked.
     let allCircuits;
     try {
         const stub = new Proxy({}, { get: () => () => { /* never called */ }, has: () => true });
         allCircuits = Object.keys(new contractClass(stub).impureCircuits ?? {});
     } catch { allCircuits = undefined; }
     onProgress?.({ phase: 'zk-assets' });
-    const assets = await ensureZkAssets({
-        zkConfigBaseUrl, cacheDir, circuits,
-        verifierCircuits: allCircuits ?? ATTESTATION_VAULT_CIRCUITS,
-        onProgress
-    });
+    let assets;
+    if (opts.zkConfigDir) {
+        // Same fallback as the remote path: a class that cannot be introspected
+        // and no `circuits` given means the vault's set, never "nothing to
+        // check" (empty asset directories would otherwise pass).
+        const verifierSet = allCircuits ?? ATTESTATION_VAULT_CIRCUITS;
+        const proveSet = circuits ?? allCircuits ?? ATTESTATION_VAULT_CIRCUITS;
+        assets = await describeLocalZkAssets(opts.zkConfigDir, verifierSet, proveSet);
+    } else {
+        assets = await ensureZkAssets({
+            zkConfigBaseUrl, cacheDir,
+            // Prover keys + zkir: the caller's list, else every circuit of the
+            // contract class, else the vault's set.
+            circuits: circuits ?? allCircuits ?? ATTESTATION_VAULT_CIRCUITS,
+            verifierCircuits: allCircuits ?? ATTESTATION_VAULT_CIRCUITS,
+            onProgress
+        });
+    }
 
     // 2. SDK + identity. Role-specific HD derivation (matching Lace) comes from
     //    the plugin's own helper, so the builder lands on the SAME account the
@@ -334,18 +409,18 @@ export async function createTxBuilder(opts) {
          * aborting BEFORE proving). Hand the result to a sponsor endpoint,
          * which pays the dust and submits.
          *
-         * Batch witnesses: the per-call `witnesses` objects are IGNORED for a
-         * batch; ONE shared witnesses object (built from this builder's
-         * attestation secret, override via `attestationSecret`) serves all
-         * calls through a proof holder that swaps each call's `merkleProof`
-         * bundle (the `prepare*` helpers return it since 0.19) immediately
-         * before the call. Prepare every batched call with the SAME secret.
+         * Batch witnesses: one witnesses object serves the batch: the `witnesses`
+         * input, else the object every entry carries when it is the same one,
+         * else (attestation-vault family only) the builder's own, whose proof
+         * holder swaps each call's `merkleProof` before the call; anything else
+         * is refused up front. Per-call state goes through the entries' `before`
+         * hooks; every batched vault call must be prepared with the same secret.
          * A batch containing a value-moving call refuses `bind: false`.
          *
          * @param {{ contractAddress: string, call?: { circuitId: string, args: unknown[], witnesses: object }, calls?: Array<{ circuitId: string, args: unknown[], merkleProof?: object, slotWidth?: number }>, initialPrivateState?: unknown, bind?: boolean, attestationSecret?: Uint8Array }} input
          * @returns {Promise<{ finalizedTxB64: string, serializedBytes: number }>}
          */
-        async buildSponsorable({ contractAddress, call, calls, initialPrivateState, bind = true, attestationSecret: batchSecret }) {
+        async buildSponsorable({ contractAddress, call, calls, witnesses: sharedWitnesses, initialPrivateState, bind = true, attestationSecret: batchSecret }) {
             if (!contractAddress) throw new Error('buildSponsorable: contractAddress is required');
             if (call && calls) throw new Error('buildSponsorable: pass either call or calls, not both');
             const callList = calls ?? (call ? [call] : []);
@@ -354,7 +429,7 @@ export async function createTxBuilder(opts) {
             }
             if (callList.length > 8) throw new Error('buildSponsorable: calls supports at most 8 entries per batch');
             for (const c of callList) {
-                if (!c?.circuitId) throw new Error('buildSponsorable: every call must come from a prepare* helper');
+                if (!c?.circuitId) throw new Error('buildSponsorable: every call must come from a prepare* helper (or carry circuitId, args and witnesses)');
             }
             const isBatch = callList.length > 1;
             onProgress?.({ phase: 'build', circuit: callList.map(c => c.circuitId).join('+') });
@@ -362,24 +437,44 @@ export async function createTxBuilder(opts) {
             let witnesses;
             let scopeCalls;
             if (isBatch) {
-                const widths = [...new Set(callList.map(c => c.slotWidth).filter(w => w !== undefined))];
-                if (widths.length > 1) throw new Error(`buildSponsorable: batched calls target different slot widths (${widths.join(', ')})`);
-                const { buildAttestationVaultWitnesses } = await import('../browser/witnesses.mjs');
-                const proofHolder = {};
-                witnesses = buildAttestationVaultWitnesses({
-                    attestationSecret: batchSecret ?? attestationSecret,
-                    merkleProofHolder: proofHolder,
-                    ...(widths.length === 1 ? { slotWidth: widths[0] } : {})
-                });
-                // EVERY call gets a hook: a proof-less call clears the holder
-                // instead of inheriting its predecessor's bundle.
-                scopeCalls = callList.map(c => ({
-                    circuit: c.circuitId,
-                    args: c.args ?? [],
-                    before: () => { proofHolder.current = c.merkleProof; }
-                }));
+                // A Compact contract instance binds its witnesses once. Shared
+                // witnesses source, in order: the `witnesses` input, the same
+                // object on every call, the vault family's own (with the proof holder).
+                const perCall = callList.map(c => c.witnesses).filter(w => w !== undefined);
+                const sameForAll = perCall.length === callList.length && perCall.every(w => w === perCall[0]);
+                if (sharedWitnesses) {
+                    witnesses = sharedWitnesses;
+                    scopeCalls = callList.map(c => ({ circuit: c.circuitId, args: c.args ?? [], ...(typeof c.before === 'function' ? { before: c.before } : {}) }));
+                } else if (sameForAll) {
+                    witnesses = perCall[0];
+                    scopeCalls = callList.map(c => ({ circuit: c.circuitId, args: c.args ?? [], ...(typeof c.before === 'function' ? { before: c.before } : {}) }));
+                } else if (String(contractName).startsWith('attestation-vault')) {
+                    const widths = [...new Set(callList.map(c => c.slotWidth).filter(w => w !== undefined))];
+                    if (widths.length > 1) throw new Error(`buildSponsorable: batched calls target different slot widths (${widths.join(', ')})`);
+                    const { buildAttestationVaultWitnesses } = await import('../browser/witnesses.mjs');
+                    const proofHolder = {};
+                    witnesses = buildAttestationVaultWitnesses({
+                        attestationSecret: batchSecret ?? attestationSecret,
+                        merkleProofHolder: proofHolder,
+                        ...(widths.length === 1 ? { slotWidth: widths[0] } : {})
+                    });
+                    // EVERY call gets a hook: a proof-less call clears the holder
+                    // instead of inheriting its predecessor's bundle.
+                    scopeCalls = callList.map(c => ({
+                        circuit: c.circuitId,
+                        args: c.args ?? [],
+                        before: () => { proofHolder.current = c.merkleProof; }
+                    }));
+                } else {
+                    throw new Error(
+                        `buildSponsorable: a batch on '${contractName}' needs ONE shared witnesses object: pass \`witnesses\` on the input ` +
+                        '(with optional per-call `before` hooks for what varies per call), or give every call the same `witnesses`. ' +
+                        'Only the attestation-vault family gets its batch witnesses supplied by this builder.'
+                    );
+                }
             } else {
-                witnesses = callList[0].witnesses;
+                witnesses = sharedWitnesses ?? callList[0].witnesses;
+                if (!witnesses) throw new Error('buildSponsorable: the call carries no witnesses (pass `witnesses` on the call or on the input)');
             }
 
             const compiled = CompiledContract.make(contractName, contractClass).pipe(
@@ -444,6 +539,56 @@ export async function createTxBuilder(opts) {
             return bind === false
                 ? { unboundTxB64: Buffer.from(bytes).toString('base64'), serializedBytes: bytes.length, bound: false }
                 : { finalizedTxB64: Buffer.from(bytes).toString('base64'), serializedBytes: bytes.length, bound: true };
+        },
+
+        /**
+         * 0.21.0: build + prove + sign a contract deploy without submitting; the
+         * caller's key signs it, a sponsor pays the dust. Sponsoring needs
+         * NIGHTGATE_SPONSOR_ALLOW_DEPLOY on the server and, for a token caller,
+         * `allowDeploy` with budget left on the grant. The landed address joins the
+         * grant's sponsorable contracts. The initial private state lives in this process only.
+         *
+         * @param {{ initialPrivateState?: unknown, constructorArgs?: unknown[], witnesses?: object, bind?: boolean }} input
+         * @returns {Promise<{ finalizedTxB64?: string, unboundTxB64?: string, serializedBytes: number, bound: boolean, contractAddress: string }>}
+         */
+        async buildDeploySponsorable({ initialPrivateState, constructorArgs, witnesses, bind = true } = {}) {
+            onProgress?.({ phase: 'build', circuit: '<deploy>' });
+            const compiled = CompiledContract.make(contractName, contractClass).pipe(
+                witnesses ? CompiledContract.withWitnesses(witnesses) : CompiledContract.withVacantWitnesses,
+                CompiledContract.withCompiledFileAssets(cacheDir)
+            );
+            const holder = {};
+            const walletProvider = buildOnlyWalletProvider(facade, zswapKeys, dustKey, keystore, holder, ttlMinutes, bind);
+            const privateStateProvider = new InMemoryPrivateStateProvider();
+            const providers = {
+                publicDataProvider,
+                zkConfigProvider,
+                proofProvider,
+                privateStateProvider,
+                walletProvider,
+                midnightProvider: walletProvider
+            };
+            // The build-only provider stops at submit and the SDK wraps that
+            // error; only an empty holder means a real build failure.
+            try {
+                await contracts.deployContract(providers, {
+                    compiledContract: compiled,
+                    privateStateId,
+                    initialPrivateState: initialPrivateState ?? {},
+                    ...(Array.isArray(constructorArgs) && constructorArgs.length > 0 ? { args: constructorArgs } : {})
+                });
+            } catch (e) {
+                if (!holder.captured) throw e;
+            }
+            if (!holder.captured?.serialize) throw new Error('deploy build produced no serializable transaction');
+            // Read the address off the deploy action, where the sponsor's shape
+            // check reads it; anything but exactly one deploy action fails the build.
+            const contractAddress = readDeployAddress(holder.captured);
+            const bytes = new Uint8Array(holder.captured.serialize());
+            onProgress?.({ phase: 'built', bytes: bytes.length, bound: bind !== false, contractAddress });
+            return bind === false
+                ? { unboundTxB64: Buffer.from(bytes).toString('base64'), serializedBytes: bytes.length, bound: false, contractAddress }
+                : { finalizedTxB64: Buffer.from(bytes).toString('base64'), serializedBytes: bytes.length, bound: true, contractAddress };
         },
 
         async close() {

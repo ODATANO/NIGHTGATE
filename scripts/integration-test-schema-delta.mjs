@@ -81,6 +81,31 @@ CREATE TABLE midnight_WalletSessions (
 );
 INSERT INTO midnight_WalletSessions (ID, userId, sessionId, connectedAt, isActive, encryptedViewingKey)
 VALUES ('sess-row-1', 'operator', 'sess-1', '2026-08-01T00:00:00.000Z', 1, 'cipher');
+
+-- A 0.20-shaped AgentGrants: everything 0.20 had, WITHOUT the six 0.21 policy /
+-- deploy columns. The upgrade note promises the ALTER path keeps existing
+-- grants (and their tokens) working.
+CREATE TABLE midnight_AgentGrants (
+    ID TEXT NOT NULL PRIMARY KEY,
+    createdAt TEXT,
+    createdBy TEXT,
+    modifiedAt TEXT,
+    modifiedBy TEXT,
+    userId TEXT NOT NULL,
+    agentLabel TEXT,
+    sessionId TEXT NOT NULL,
+    tokenHash TEXT NOT NULL,
+    allowedActions TEXT NOT NULL,
+    maxJobsPerDay INTEGER,
+    jobsUsedToday INTEGER DEFAULT 0,
+    budgetWindow TEXT,
+    sponsorSessionId TEXT,
+    validUntil TEXT,
+    isActive INTEGER DEFAULT TRUE,
+    revokedAt TEXT
+);
+INSERT INTO midnight_AgentGrants (ID, userId, sessionId, tokenHash, allowedActions, maxJobsPerDay, jobsUsedToday, isActive)
+VALUES ('grant-row-1', 'operator', 'sess-1', 'deadbeef', '["anchorDocument"]', 20, 3, 1);
 `);
 db.close();
 
@@ -116,6 +141,25 @@ const sessionRow = after.prepare("SELECT * FROM midnight_WalletSessions WHERE ID
 ok('delta 0.20: the existing session row survived, keys intact',
     sessionRow?.sessionId === 'sess-1' && sessionRow?.encryptedViewingKey === 'cipher' && sessionRow?.label === null,
     JSON.stringify(sessionRow));
+
+// --- the 0.21.0 upgrade path: six columns on an existing AgentGrants ---------
+const grantCols = new Map(
+    after.prepare('PRAGMA table_info("midnight_AgentGrants")').all().map(r => [r.name, r])
+);
+const added021 = ['allowedContracts', 'allowedCircuits', 'allowDeploy', 'maxDeploys', 'deploysUsed', 'deployedContracts'];
+ok('delta 0.21: the six grant columns were added to an EXISTING AgentGrants table',
+    added021.every(c => grantCols.has(c)), [...grantCols.keys()].join(','));
+ok('delta 0.21: the added grant columns are nullable', added021.every(c => grantCols.get(c)?.notnull === 0));
+const grantRow = after.prepare("SELECT * FROM midnight_AgentGrants WHERE ID = 'grant-row-1'").get();
+ok('delta 0.21: the existing grant survived with its token and budget intact',
+    grantRow?.tokenHash === 'deadbeef' && grantRow?.maxJobsPerDay === 20 && grantRow?.jobsUsedToday === 3 && grantRow?.isActive === 1,
+    JSON.stringify(grantRow));
+ok('delta 0.21: the existing grant inherits the floor (null lists) and has NO deploy right',
+    grantRow?.allowedContracts === null && grantRow?.allowedCircuits === null && grantRow?.deployedContracts === null
+        && !grantRow?.allowDeploy && (grantRow?.deploysUsed === 0 || grantRow?.deploysUsed === null),
+    JSON.stringify(grantRow));
+const regs = after.prepare("SELECT type FROM sqlite_master WHERE name = 'midnight_ContractRegistrations'").get();
+ok('delta 0.21: the ContractRegistrations table exists', regs?.type === 'table');
 
 const jobsView = after.prepare(
     "SELECT type FROM sqlite_master WHERE name = 'NightgateAdminService_BackgroundJobs'"

@@ -116,6 +116,67 @@ describe('txbuilder: ensureZkAssets', () => {
     });
 });
 
+describe('txbuilder: zkConfigDir assets (0.21.0) keep the public ZkAssetResult shape', () => {
+    let dir: string;
+    beforeEach(async () => { dir = await mkdtemp(join(tmpdir(), 'ng-txb-local-')); });
+    afterEach(async () => { await rm(dir, { recursive: true, force: true }); });
+
+    it('ensureZkAssets says where its assets came from', async () => {
+        const { ensureZkAssets } = await importTxBuilder();
+        const fetchFn = async (url: string) => ({ ok: true, status: 200, arrayBuffer: async () => Buffer.from('k:' + url) }) as any;
+        const out = await ensureZkAssets({ zkConfigBaseUrl: 'http://zk/attestation-vault', cacheDir: dir, circuits: ['attest'], verifierCircuits: ['attest'], fetchFn });
+        expect(out).toMatchObject({ cacheDir: dir, cached: 0, source: 'remote' });
+        expect(typeof out.fetched).toBe('number');
+    });
+
+    it('createTxBuilder with zkConfigDir falls back to the vault circuit set when the class cannot be introspected (empty asset dirs do not pass)', async () => {
+        const { createTxBuilder } = await importTxBuilder();
+        await mkdir(join(dir, 'keys'), { recursive: true });
+        await mkdir(join(dir, 'zkir'), { recursive: true });
+        class Throws { constructor() { throw new Error('not introspectable'); } }
+        await expect(createTxBuilder({
+            seedHex: 'ab'.repeat(64), indexerHttpUrl: 'http://i', indexerWsUrl: 'ws://i', nodeUrl: 'ws://n',
+            zkConfigDir: dir, contractClass: Throws as any
+        })).rejects.toThrow(/lacks verifier keys for attest/);
+    });
+
+    it('a local directory is described with fetched: 0 (not `downloaded`), cached = key files, source local', async () => {
+        const { describeLocalZkAssets } = await importTxBuilder();
+        await mkdir(join(dir, 'keys'), { recursive: true });
+        await mkdir(join(dir, 'zkir'), { recursive: true });
+        await writeFile(join(dir, 'keys', 'attest.verifier'), 'v');
+        await writeFile(join(dir, 'keys', 'attest.prover'), 'p');
+        await writeFile(join(dir, 'zkir', 'attest.bzkir'), 'z');
+        const out = await describeLocalZkAssets(dir, ['attest']);
+        expect(out).toEqual({ cacheDir: dir, fetched: 0, cached: 3, source: 'local' });
+        expect((out as any).downloaded).toBeUndefined();
+    });
+
+    it('refuses a directory without keys/ + zkir/ DIRECTORIES, one lacking a verifier key of the contract, and one lacking the prover key or bzkir of a circuit to prove', async () => {
+        const { describeLocalZkAssets } = await importTxBuilder();
+        await expect(describeLocalZkAssets(dir, [])).rejects.toThrow(/must hold keys\/ and zkir\/ directories/);
+        await mkdir(join(dir, 'keys'), { recursive: true });
+        await writeFile(join(dir, 'zkir'), 'not a directory');
+        await expect(describeLocalZkAssets(dir, [])).rejects.toThrow(/must hold keys\/ and zkir\/ directories/);
+        await rm(join(dir, 'zkir'));
+        await mkdir(join(dir, 'zkir'), { recursive: true });
+        await writeFile(join(dir, 'keys', 'attest.verifier'), 'v');
+        await expect(describeLocalZkAssets(dir, ['attest', 'anchorContentRoot'])).rejects.toThrow(/lacks verifier keys for anchorContentRoot/);
+        // verifier present, but nothing to PROVE attest with
+        await expect(describeLocalZkAssets(dir, ['attest'], ['attest'])).rejects.toThrow(/lacks prover keys for attest/);
+        await writeFile(join(dir, 'keys', 'attest.prover'), 'p');
+        await expect(describeLocalZkAssets(dir, ['attest'], ['attest'])).rejects.toThrow(/lacks zkir for attest/);
+        await writeFile(join(dir, 'zkir', 'attest.bzkir'), 'z');
+        expect(await describeLocalZkAssets(dir, ['attest'], ['attest'])).toEqual({ cacheDir: dir, fetched: 0, cached: 3, source: 'local' });
+        // a stray extra file in zkir/ is not "cached": only the verified set counts
+        await writeFile(join(dir, 'zkir', 'attest.zkir'), 'text form');
+        expect((await describeLocalZkAssets(dir, ['attest'], ['attest'])).cached).toBe(3);
+        // circuits not proven here need only their verifier key
+        await writeFile(join(dir, 'keys', 'anchorContentRoot.verifier'), 'v');
+        expect((await describeLocalZkAssets(dir, ['attest', 'anchorContentRoot'], ['attest'])).source).toBe('local');
+    });
+});
+
 describe('txbuilder: createTxBuilder input validation', () => {
     // These all reject BEFORE any SDK import or network access, which is what
     // keeps a misconfigured caller from downloading 80 MB of prover keys first.
@@ -157,7 +218,7 @@ describe('txbuilder: createTxBuilder input validation', () => {
     });
 });
 
-describe('txbuilder: unbound handover refuses a recipe that carries a balancing transaction (review P2)', () => {
+describe('txbuilder: unbound handover refuses a recipe that carries a balancing transaction', () => {
     it('bind:false throws when signRecipe returns a balancingTransaction; bind:true finalizes it', async () => {
         const { buildOnlyWalletProvider } = await importTxBuilder();
         const recipe: any = { type: 'UNBOUND_TRANSACTION', baseTransaction: { base: true }, balancingTransaction: { balancing: true } };
@@ -179,5 +240,25 @@ describe('txbuilder: unbound handover refuses a recipe that carries a balancing 
         const unbound2 = buildOnlyWalletProvider(facade, { coinPublicKey: 'c', encryptionPublicKey: 'e' }, { dust: true }, keystore, holder2, 30, false);
         await expect(unbound2.balanceTx({ tx: true })).resolves.toEqual({ base: true });
         expect(holder2.unbound).toBe(true);
+    });
+});
+
+// A deploy build names the contract it creates, or fails.
+describe('txbuilder: readDeployAddress requires exactly one deploy action', () => {
+    const tx = (intents: Array<Record<string, unknown>>) => ({ intents: new Map(intents.map((i, n) => [n, i])) });
+    const DEPLOY = (address: string) => ({ address, initialState: {} });
+    const CALL = () => ({ address: 'aa'.repeat(32), entryPoint: 'attest' });
+
+    it('returns the single deploy address, ignoring call actions', async () => {
+        const { readDeployAddress } = await importTxBuilder();
+        expect(readDeployAddress(tx([{ actions: [CALL(), DEPLOY('bb'.repeat(32))] }]))).toBe('bb'.repeat(32));
+    });
+    it('throws on no deploy, two deploys, an empty address, an uninspectable tx or a maintenance update', async () => {
+        const { readDeployAddress } = await importTxBuilder();
+        expect(() => readDeployAddress(tx([{ actions: [CALL()] }]))).toThrow(/expected exactly one contract deploy action.*found 0/);
+        expect(() => readDeployAddress(tx([{ actions: [DEPLOY('bb'.repeat(32))] }, { actions: [DEPLOY('cc'.repeat(32))] }]))).toThrow(/found 2/);
+        expect(() => readDeployAddress(tx([{ actions: [DEPLOY('')] }]))).toThrow(/expected exactly one/);
+        expect(() => readDeployAddress({})).toThrow(/not inspectable/);
+        expect(() => readDeployAddress(tx([{ actions: [{ address: 'bb'.repeat(32), updates: [] }] }]))).toThrow(/maintenance update/);
     });
 });

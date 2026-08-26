@@ -64,6 +64,9 @@ import {
     registerAgentGrantHandlers,
     enforceAgentGrant,
     hashAgentToken,
+    recordDeployedContracts,
+    reserveDeployBudget,
+    releaseDeployBudget,
     AGENT_ALLOWLISTABLE_ACTIONS
 } from '../../srv/sessions/agent-grants';
 
@@ -270,6 +273,159 @@ describe('agent grants', () => {
     // enforceAgentGrant
     // ------------------------------------------------------------------
 
+    // ------------------------------------------------------------------
+    // policy follows the grant
+    // ------------------------------------------------------------------
+
+    describe('per-grant sponsor allow-list (0.21.0)', () => {
+        const VALID = { sessionId: 'sess-1', allowedActions: ['sponsorFinalizedTransaction'] };
+
+        it('persists allowedContracts/allowedCircuits as JSON and returns them', async () => {
+            mockDbRun.mockResolvedValueOnce(activeSessionRow());
+            const req = makeReq({ ...VALID, allowedContracts: [' 0xVAULT ', '0xVAULT'], allowedCircuits: ['attest'] });
+            const result = await handlers.createAgentGrant(req);
+            expect(req.reject).not.toHaveBeenCalled();
+            expect(insertEntriesSpy).toHaveBeenCalledWith(expect.objectContaining({
+                allowedContracts: JSON.stringify(['0xVAULT']),
+                allowedCircuits: JSON.stringify(['attest'])
+            }));
+            expect(result).toMatchObject({ allowedContracts: ['0xVAULT'], allowedCircuits: ['attest'] });
+        });
+
+        it('absent lists are stored as null (inherit the platform floor) and returned empty', async () => {
+            mockDbRun.mockResolvedValueOnce(activeSessionRow());
+            const req = makeReq(VALID);
+            const result = await handlers.createAgentGrant(req);
+            expect(insertEntriesSpy).toHaveBeenCalledWith(expect.objectContaining({ allowedContracts: null, allowedCircuits: null }));
+            expect(result).toMatchObject({ allowedContracts: [], allowedCircuits: [] });
+        });
+
+        it('rejects 400 on an entry that cannot be an address or circuit', async () => {
+            const req = makeReq({ ...VALID, allowedContracts: ['0xVAULT,0xOTHER'] });
+            await handlers.createAgentGrant(req);
+            expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/allowedContracts.*not a contract address/));
+            expect(insertEntriesSpy).not.toHaveBeenCalled();
+        });
+
+        it('the enforcement hook attaches the parsed lists to req.agentGrant', async () => {
+            const TOKEN = 'ngat_' + 'b'.repeat(64);
+            mockDbRun.mockResolvedValueOnce(grantRow({
+                allowedActions: JSON.stringify(['sponsorFinalizedTransaction']),
+                allowedContracts: JSON.stringify(['0xVAULT']),
+                allowedCircuits: null
+            }));
+            const req = makeReq({ sponsorSessionId: undefined }, {
+                event: 'sponsorFinalizedTransaction', user: { id: 'transport-user' }, headers: { 'x-agent-token': TOKEN }
+            });
+            await enforceAgentGrant(req, db);
+            expect(req.reject).not.toHaveBeenCalled();
+            expect(req.agentGrant).toMatchObject({ ID: 'grant-1', allowedContracts: ['0xVAULT'], allowedCircuits: [] });
+        });
+    });
+
+    // A sponsored deploy is a distinct grant right with its own budget.
+    describe('allowDeploy (sponsored deploys)', () => {
+        it('needs a sponsor* action: a deploy is sponsored, never run by the server wallet', async () => {
+            const req = makeReq({ sessionId: 'sess-1', allowedActions: ['anchorDocument'], allowDeploy: true });
+            await handlers.createAgentGrant(req);
+            expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/allowDeploy needs 'sponsorFinalizedTransaction'/));
+        });
+
+        it('defaults the deploy budget to 1, validates an explicit one, and refuses a budget without the right', async () => {
+            mockDbRun.mockResolvedValueOnce(activeSessionRow());
+            const req = makeReq({ sessionId: 'sess-1', allowedActions: ['sponsorUnboundTransaction'], allowDeploy: true });
+            const result = await handlers.createAgentGrant(req);
+            expect(insertEntriesSpy).toHaveBeenCalledWith(expect.objectContaining({ allowDeploy: true, maxDeploys: 1, deploysUsed: 0 }));
+            expect(result).toMatchObject({ allowDeploy: true, maxDeploys: 1 });
+
+            const bad = makeReq({ sessionId: 'sess-1', allowedActions: ['sponsorUnboundTransaction'], allowDeploy: true, maxDeploys: 0 });
+            await handlers.createAgentGrant(bad);
+            expect(bad.reject).toHaveBeenCalledWith(400, expect.stringMatching(/maxDeploys must be an integer between 1 and 100/));
+
+            const noRight = makeReq({ sessionId: 'sess-1', allowedActions: ['sponsorUnboundTransaction'], maxDeploys: 3 });
+            await handlers.createAgentGrant(noRight);
+            expect(noRight.reject).toHaveBeenCalledWith(400, expect.stringMatching(/maxDeploys needs allowDeploy/));
+        });
+
+        it('the hook grants the deploy right only while the budget lasts', async () => {
+            const TOKEN = 'ngat_' + 'c'.repeat(64);
+            const tokenReq = () => makeReq({}, { event: 'sponsorUnboundTransaction', user: { id: 'transport-user' }, headers: { 'x-agent-token': TOKEN } });
+            mockDbRun.mockResolvedValueOnce(grantRow({ allowedActions: JSON.stringify(['sponsorUnboundTransaction']), allowDeploy: true, maxDeploys: 2, deploysUsed: 1 }));
+            const open = tokenReq();
+            await enforceAgentGrant(open, db);
+            expect(open.agentGrant.allowDeploy).toBe(true);
+
+            mockDbRun.mockResolvedValueOnce(grantRow({ allowedActions: JSON.stringify(['sponsorUnboundTransaction']), allowDeploy: true, maxDeploys: 2, deploysUsed: 2 }));
+            const spent = tokenReq();
+            await enforceAgentGrant(spent, db);
+            expect(spent.agentGrant.allowDeploy).toBe(false);
+
+            mockDbRun.mockResolvedValueOnce(grantRow({ allowedActions: JSON.stringify(['sponsorUnboundTransaction']) }));
+            const none = tokenReq();
+            await enforceAgentGrant(none, db);
+            expect(none.agentGrant.allowDeploy).toBe(false);
+        });
+
+        // The budget is reserved atomically before the broadcast; recordDeployedContracts only
+        // remembers the address, in its own column.
+        it('recordDeployedContracts records the address in deployedContracts and leaves the counter alone', async () => {
+            mockDbRun.mockResolvedValueOnce(grantRow({ allowedContracts: JSON.stringify(['0xOLD']), deployedContracts: JSON.stringify(['0xEARLIER']), allowDeploy: true, maxDeploys: 2, deploysUsed: 1 }));
+            await recordDeployedContracts(db, 'grant-1', ['0xNEW', '0xEARLIER']);
+            expect(updateSetSpy).toHaveBeenCalledWith({ deployedContracts: JSON.stringify(['0xEARLIER', '0xNEW']) });
+            expect(updateWhereSpy).toHaveBeenCalledWith({ ID: 'grant-1' });
+            // nothing new: no write
+            updateSetSpy.mockClear();
+            mockDbRun.mockResolvedValueOnce(grantRow({ deployedContracts: JSON.stringify(['0xNEW']), allowDeploy: true }));
+            await recordDeployedContracts(db, 'grant-1', ['0xNEW']);
+            expect(updateSetSpy).not.toHaveBeenCalled();
+        });
+
+        it('the hook hands deployedContracts to the sponsor policy', async () => {
+            const TOKEN = 'ngat_' + 'd'.repeat(64);
+            mockDbRun.mockResolvedValueOnce(grantRow({ allowedActions: JSON.stringify(['sponsorUnboundTransaction']), deployedContracts: JSON.stringify(['0xNEW']) }));
+            const req = makeReq({}, { event: 'sponsorUnboundTransaction', user: { id: 'transport-user' }, headers: { 'x-agent-token': TOKEN } });
+            await enforceAgentGrant(req, db);
+            expect(req.agentGrant.deployedContracts).toEqual(['0xNEW']);
+        });
+
+        it('reserveDeployBudget is ONE conditional UPDATE bounded by maxDeploys (parallel callers cannot overspend)', async () => {
+            mockDbRun.mockResolvedValueOnce(grantRow({ allowDeploy: true, maxDeploys: 2, deploysUsed: 1 }));
+            mockDbRun.mockResolvedValueOnce(1); // the UPDATE hit a row
+            expect(await reserveDeployBudget(db, 'grant-1', 1)).toBe(true);
+            expect(updateSetSpy).toHaveBeenCalledWith({ deploysUsed: { '+=': 1 } });
+            expect(updateWhereSpy).toHaveBeenCalledWith({ ID: 'grant-1', isActive: true, allowDeploy: true, deploysUsed: { '<=': 1 } });
+
+            // the same stale read, second caller: the UPDATE matches no row
+            mockDbRun.mockResolvedValueOnce(grantRow({ allowDeploy: true, maxDeploys: 2, deploysUsed: 1 }));
+            mockDbRun.mockResolvedValueOnce(0);
+            expect(await reserveDeployBudget(db, 'grant-1', 1)).toBe(false);
+
+            // a tx with more deploys than the whole budget
+            mockDbRun.mockResolvedValueOnce(grantRow({ allowDeploy: true, maxDeploys: 1, deploysUsed: 0 }));
+            mockDbRun.mockResolvedValueOnce(0);
+            expect(await reserveDeployBudget(db, 'grant-1', 2)).toBe(false);
+            expect(updateWhereSpy).toHaveBeenLastCalledWith({ ID: 'grant-1', isActive: true, allowDeploy: true, deploysUsed: { '<=': -1 } });
+        });
+
+        it('reserveDeployBudget refuses without the right, on a revoked grant, or for a non-positive count, touching nothing', async () => {
+            updateSetSpy.mockClear();
+            mockDbRun.mockResolvedValueOnce(grantRow({ allowDeploy: false, maxDeploys: 5 }));
+            expect(await reserveDeployBudget(db, 'grant-1', 1)).toBe(false);
+            mockDbRun.mockResolvedValueOnce(grantRow({ allowDeploy: true, maxDeploys: 5, isActive: false }));
+            expect(await reserveDeployBudget(db, 'grant-1', 1)).toBe(false);
+            expect(await reserveDeployBudget(db, 'grant-1', 0)).toBe(false);
+            expect(await reserveDeployBudget(db, '', 1)).toBe(false);
+            expect(updateSetSpy).not.toHaveBeenCalled();
+        });
+
+        it('releaseDeployBudget gives a reservation back, never below zero', async () => {
+            mockDbRun.mockResolvedValueOnce(1);
+            await releaseDeployBudget(db, 'grant-1', 1);
+            expect(updateSetSpy).toHaveBeenCalledWith({ deploysUsed: { '-=': 1 } });
+            expect(updateWhereSpy).toHaveBeenCalledWith({ ID: 'grant-1', deploysUsed: { '>=': 1 } });
+        });
+    });
+
     describe('enforceAgentGrant', () => {
         const TOKEN = 'ngat_' + 'a'.repeat(64);
 
@@ -340,7 +496,7 @@ describe('agent grants', () => {
             expect(req.reject).not.toHaveBeenCalled();
             expect(req.user.id).toBe(TEST_USER_ID);
             expect(req.data.sessionId).toBe('sess-1');
-            expect(req.agentGrant).toEqual({ ID: 'grant-1', sessionId: 'sess-1', userId: TEST_USER_ID });
+            expect(req.agentGrant).toEqual({ ID: 'grant-1', sessionId: 'sess-1', userId: TEST_USER_ID, allowedContracts: [], allowedCircuits: [], deployedContracts: [], allowDeploy: false });
         });
 
         it('rejects 403 on a sessionId that does not match the grant', async () => {

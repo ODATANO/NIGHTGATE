@@ -98,3 +98,10 @@ Recreating the volume (dev) or a destructive
 - The image contains the compiled contract artifacts
   (`contracts/**/managed`), so `attestation-vault`, `counter` and
   `shielded-token` resolve out of the box.
+- A consumer's own artifact goes into a directory named by
+  `NIGHTGATE_CONTRACTS_DIR` (bind-mount it, e.g. `/data/contracts`) and is
+  registered on the running container with the admin action
+  `registerContract` (0.21.0); no recreate, no restart. The registration is
+  persisted and reloaded at boot. Likewise the sponsor allow-list can live in
+  `NIGHTGATE_SPONSOR_POLICY_FILE` under the data volume and is re-read on
+  every sponsored call.

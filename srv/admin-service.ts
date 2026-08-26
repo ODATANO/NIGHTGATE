@@ -17,6 +17,7 @@ import { deriveAccountId } from './submission/wallet-material-factory';
 import { evictWalletFacade } from './submission/wallet-facade-builder';
 
 import { WalletSessions, DisclosureRoles, BackgroundJobs } from '#cds-models/midnight';
+import { listContracts, registerContractAtRuntime, unregisterContractAtRuntime, ContractRegistrationError } from './submission/contract-registrations';
 
 /**
  * Drop the in-memory WalletFacade (live secret keys) cached for a session, so a
@@ -95,6 +96,40 @@ export default class NightgateAdminService extends cds.ApplicationService {
                     ? Math.max(0, Math.round((Date.now() - oldestMs) / 1000))
                     : 0
             };
+        });
+
+        // Runtime contract registration on top of the config floor; the
+        // service-level @requires 'admin' gates the caller.
+        this.on('listContracts', async () => listContracts());
+
+        this.on('registerContract', async (req: Request) => {
+            const data = req.data as { name?: string; artifactPath?: string; zkConfigPath?: string; privateStateId?: string; slotWidth?: number | null };
+            for (const field of ['name', 'artifactPath', 'zkConfigPath', 'privateStateId'] as const) {
+                if (typeof data[field] !== 'string' || !data[field]!.trim()) return req.reject(400, `${field} is required`);
+            }
+            try {
+                return await registerContractAtRuntime(this.db, {
+                    name: data.name!, artifactPath: data.artifactPath!, zkConfigPath: data.zkConfigPath!,
+                    privateStateId: data.privateStateId!, slotWidth: data.slotWidth ?? null
+                }, {
+                    registeredBy: (req as any).user?.id,
+                    networkId: process.env.NIGHTGATE_NETWORK ?? undefined
+                });
+            } catch (err) {
+                if (err instanceof ContractRegistrationError) return req.reject(err.httpStatus, err.message);
+                throw err;
+            }
+        });
+
+        this.on('unregisterContract', async (req: Request) => {
+            const { name } = req.data as { name?: string };
+            if (typeof name !== 'string' || !name.trim()) return req.reject(400, 'name is required');
+            try {
+                return await unregisterContractAtRuntime(this.db, name.trim());
+            } catch (err) {
+                if (err instanceof ContractRegistrationError) return req.reject(err.httpStatus, err.message);
+                throw err;
+            }
         });
 
         this.on('invalidateSession', async (req: Request) => {

@@ -237,3 +237,36 @@ process and only the bytes going to the server.
   shape check (only allow-listed contract calls, nothing else in the envelope,
   size-capped via `NIGHTGATE_SPONSOR_MAX_TX_BYTES`); allow-listing contracts
   and circuits bounds which calls it will pay for.
+
+## Batches on your own contract, and sponsored deploys (0.21.0)
+
+**Batch witnesses.** A Compact contract instance binds its witnesses once, so a
+batch needs ONE shared witnesses object plus a way to switch what varies per
+call. Until 0.21.0 the batch path supplied the attestation vault's witnesses
+regardless of contract, so a batch on your own contract failed at the first
+witness the vault does not define. Now `buildSponsorable({ calls, witnesses })`
+takes your shared witnesses (per-call `before` hooks swap what varies), a batch
+whose entries all carry the same `witnesses` object uses that, and the vault
+family keeps getting both from the builder. A foreign-contract batch without
+either is refused up front with the real reason.
+
+**Your own contract, your own keys.** `createTxBuilder({ zkConfigDir })` reads
+`keys/` and `zkir/` from a local directory instead of a sponsor's `/zk-config`;
+the verifier keys must cover every circuit of `contractClass`.
+
+**Sponsored deploy.** `buildDeploySponsorable({ initialPrivateState,
+constructorArgs, witnesses, bind })` builds, proves and signs a contract deploy
+with YOUR key and hands back the fee-unpaid transaction plus the
+`contractAddress` it will create. A sponsor pays the dust when its policy allows
+deploys (`NIGHTGATE_SPONSOR_ALLOW_DEPLOY`, or `allowDeploy` in the policy file)
+and, for a token caller, the grant carries `allowDeploy` with deploy budget
+left (`maxDeploys`, default 1, separate from the daily job budget). A deploy has
+its own byte ceiling (`NIGHTGATE_SPONSOR_MAX_DEPLOY_BYTES`, default 40960).
+The budget is reserved before the sponsor broadcasts (one deploy per
+transaction). After it lands, the address is recorded on the grant
+(`deployedContracts`) and is sponsorable on top of the platform allow-list,
+so the follow-up calls are sponsorable without an operator round trip. Contract
+maintenance updates are never sponsored. The build fails unless the
+transaction carries exactly one deploy action with an address, so a returned
+`contractAddress` is always usable. Persist the initial private state
+yourself: the builder keeps it in memory only.

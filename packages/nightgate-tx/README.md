@@ -100,6 +100,18 @@ fail-fast as the server lane (`BatchCausalityViolation` aborts locally, no fee
 spent). The durable batch shape on a grown contract is the proof cart (anchor
 first, then proofs); see `docs/txbuilder.md` in the main repo.
 
+Since 0.4.0 (sponsor running NIGHTGATE 0.21 or later), the builder works for
+YOUR contract, not only the vault: `createTxBuilder({ contractClass, zkConfigDir })`
+reads your own `keys/` and `zkir/` (nothing is fetched; the default
+`circuits` are those of the class you hand in), `buildSponsorable({ calls,
+witnesses })` batches calls on any contract under one shared witnesses object
+(per-call `before` hooks swap what varies), and `buildDeploySponsorable()`
+builds, proves and signs a contract DEPLOY with your key and names the
+address it will create; a sponsor pays the dust when its grant carries
+`allowDeploy` with budget left, and the landed address is sponsorable under
+the same token at once. `zkAssets.source` says whether the assets came from a
+`/zk-config` or your directory.
+
 ## Entry points
 
 | Import | What you get |

@@ -501,7 +501,9 @@ function dispatchJob(jobId: string, kind: string, legacyWork?: () => Promise<unk
                     {
                         reportExternalExecution: handle => markJobExternalExecution(jobId, handle),
                         reportSubmitted: handle => markJobSubmitted(jobId, handle),
-                        reportSubmissionRejected: handle => markJobSubmissionRejected(jobId, handle)
+                        reportSubmissionRejected: handle => markJobSubmissionRejected(jobId, handle),
+                        markBroadcastOn: (runner, handle) => markJobBroadcastOn(runner, jobId, handle),
+                        markSubmissionRejectedOn: (runner, handle) => markJobSubmissionRejectedOn(runner, jobId, handle)
                     },
                     executable
                 ));
@@ -556,6 +558,11 @@ function dispatchJob(jobId: string, kind: string, legacyWork?: () => Promise<unk
                     // client polling waitForJob must not see a transient
                     // reconciliation_required that flips seconds later).
                     await markChainFailureAfterBroadcast(jobId, current);
+                } else if (err instanceof SponsorAttemptBookkeepingPendingError && current?.txHash) {
+                    // Rejected attempt whose close/refund/hash-clear did not commit:
+                    // park under the marker settleRejectedSponsorAttempts looks for,
+                    // not under the generic code (the indexer would never resolve it).
+                    await markReconciliationRequired(jobId, { code: err.code, message: err.message });
                 } else if (current?.txHash) {
                     await markReconciliationRequired(jobId, {
                         code: 'EXTERNAL_EXECUTION_FAILED',
@@ -935,6 +942,20 @@ export async function dropPendingJobsForClosedSessions(sessionIds: string[]): Pr
  * aborted - the caller's catch would then mask a connect whose seed write and
  * job insert can no longer commit. Outside a request tx it autocommits.
  */
+/**
+ * The most recent job of one kind for a session (any status), or null.
+ * Detached read: callers are diagnostics that must not hold a request tx.
+ */
+export async function findLatestJob(kind: string, sessionId: string): Promise<{ ID: string; status: string } | null> {
+    const db = await cds.connect.to('db');
+    const row = await runWithoutAmbientTx(() => db.run(
+        SELECT.one.from(BackgroundJobs).columns('ID', 'status')
+            .where({ sessionId, kind })
+            .orderBy('createdAt desc')
+    ));
+    return row ? { ID: row.ID, status: row.status } : null;
+}
+
 export async function supersedeQueuedJobs(kind: string, sessionId: string, excludeJobId?: string): Promise<number> {
     const db = await cds.connect.to('db');
     const where: Record<string, unknown> = { kind, sessionId, status: { in: ['pending', 'running'] } };
@@ -1044,9 +1065,23 @@ async function finalizeIdentifierKeyedJob(
         reconciled: true
     };
     const terminal = opts.fromStatus === 'reconciliation_required' || opts.fromStatus === 'in_flight';
+    // A reconciled success runs the kind's finalizer first (same as the
+    // crawler-evidence path); its result becomes the job result. A throwing
+    // finalizer keeps the job in reconciliation_required for the next pass.
+    let finalizedResult: unknown = canonicalResult;
+    if (opts.fromStatus === 'reconciliation_required' && status === 'success') {
+        const evidence: ReconciliationEvidence = {
+            submissionId: submission?.ID ?? job.submissionId ?? null,
+            txHash: job.txHash!,
+            contractAddress: submission?.contractAddress ?? null,
+            finalizedAt: submission?.finalizedAt ?? null
+        };
+        const fromFinalizer = await runReconciliationFinalizer(job, evidence);
+        if (fromFinalizer !== undefined) finalizedResult = { ...canonicalResult, ...(fromFinalizer as object) };
+    }
     const jobPatch: Record<string, unknown> = terminal
         ? (status === 'success'
-            ? { status: 'succeeded', chainStatus: 'success', chainFinalizedAt: now, errorCode: null, errorMessage: null, finishedAt: now, result: safeStringify(canonicalResult) }
+            ? { status: 'succeeded', chainStatus: 'success', chainFinalizedAt: now, errorCode: null, errorMessage: null, finishedAt: now, result: safeStringify(finalizedResult) }
             : { status: 'failed', chainStatus: 'failure', chainFinalizedAt: now, finishedAt: now,
                 errorCode: 'CHAIN_EXECUTION_FAILED', errorMessage: `Transaction ${job.txHash} is on-chain but its contract call did not apply (ledger result failure)` })
         : { chainStatus: status, chainFinalizedAt: now };
@@ -1068,6 +1103,87 @@ async function finalizeIdentifierKeyedJob(
         }
         return affected;
     }));
+}
+
+let settleRejectedCursor: string | undefined;
+
+/**
+ * Re-run the bookkeeping of sponsoring attempts that were provably rejected
+ * before inclusion but not booked in-process (job errorCode
+ * `REJECTED_ATTEMPT_BOOKKEEPING_PENDING`): close the attempt row REJECTED,
+ * refund a deploy reservation the row still holds, take the hash off the job
+ * and fail the job terminally. One transaction per job, idempotent (a closed
+ * row refunds nothing, a moved job is skipped by its CAS). Runs on every
+ * reconciliation tick and at startup.
+ */
+export async function settleRejectedSponsorAttempts(existingDb?: any): Promise<number> {
+    const db = existingDb ?? await cds.connect.to('db');
+    const page = await scanBackgroundJobPage(db, {
+        status: 'reconciliation_required', errorCode: REJECTED_ATTEMPT_BOOKKEEPING_PENDING
+    }, settleRejectedCursor);
+    settleRejectedCursor = page.cursor;
+    let settled = 0;
+    for (const job of page.rows) {
+        try {
+            const submission: any = job.submissionId
+                ? await db.run(SELECT.one.from(PendingSubmissions).where({ ID: job.submissionId }))
+                : (job.txHash ? await db.run(SELECT.one.from(PendingSubmissions).where({ txHash: job.txHash, status: 'pending' })) : null);
+            let reservation: { grantId?: string; count?: number } | null = null;
+            try { reservation = submission?.submitIntentData ? JSON.parse(submission.submitIntentData)?.deployReservation ?? null : null; } catch { reservation = null; }
+            const now = new Date().toISOString();
+            const affected = await withStatusWriteRetry(`settleRejectedSponsorAttempt(${job.ID})`, () => (db as any).tx(async (tx: any) => {
+                let rowClosed = 0;
+                if (submission?.ID) {
+                    rowClosed = affectedRows(await tx.run(
+                        UPDATE.entity(PendingSubmissions)
+                            .set({ status: 'failed', errorCode: 'REJECTED', errorMessage: 'rejected before inclusion; bookkeeping settled by the reconciler' })
+                            .where({ ID: submission.ID, status: 'pending' })
+                    ));
+                }
+                // Only a row closed here (still pending) can still hold the reservation.
+                if (rowClosed === 1 && reservation?.grantId && Number.isInteger(reservation.count) && (reservation.count as number) > 0) {
+                    await tx.run(
+                        UPDATE.entity('midnight.AgentGrants')
+                            .set({ deploysUsed: { '-=': reservation.count } })
+                            .where({ ID: reservation.grantId, deploysUsed: { '>=': reservation.count } })
+                    );
+                }
+                return affectedRows(await tx.run(
+                    UPDATE.entity(BackgroundJobs)
+                        .set({
+                            status: 'failed', txHash: null, chainStatus: null, finishedAt: now,
+                            errorCode: 'SPONSOR_ATTEMPT_REJECTED',
+                            errorMessage: `The sponsoring attempt was rejected before inclusion (nothing is on chain) and its bookkeeping was settled by the reconciler. ${String(job.errorMessage ?? '').slice(0, 1500)}`
+                        })
+                        .where({ ID: job.ID, status: 'reconciliation_required', errorCode: REJECTED_ATTEMPT_BOOKKEEPING_PENDING })
+                ));
+            }));
+            if (affected === 1) {
+                settled++;
+                cds.log('nightgate').info(`settled the rejected sponsoring attempt of job ${job.ID}${reservation?.count ? ` (refunded ${reservation.count} deploy reservation(s) on grant ${String(reservation.grantId).slice(0, 8)}…)` : ''}`);
+            }
+        } catch (err) {
+            cds.log('nightgate').warn(`could not settle the rejected sponsoring attempt of job ${job.ID} this tick: ${String((err as Error)?.message ?? err)}`);
+        }
+    }
+    return settled;
+}
+
+/**
+ * Run the finalizer registered for the job's kind/version with the decrypted
+ * command; undefined when none is registered. Shared by both reconciliation
+ * paths (crawler evidence and the crawler-free indexer confirmer) so neither
+ * closes a job as succeeded without the finalizer's writes.
+ */
+async function runReconciliationFinalizer(job: BackgroundJobRow, evidence: ReconciliationEvidence): Promise<unknown | undefined> {
+    const finalizer = job.commandVersion
+        ? reconciliationFinalizers.get(processorKey(job.kind, job.commandVersion))
+        : undefined;
+    if (!finalizer) return undefined;
+    const serialized = job.commandEncoding === 'aes-gcm-v1'
+        ? decryptAtRest(job.command!, getEncryptionKey())
+        : job.command!;
+    return finalizer(JSON.parse(serialized), job, evidence);
 }
 
 let confirmerIdentifierKindsOnly = false;
@@ -1125,6 +1241,7 @@ async function scanBackgroundJobPage(
 export async function startBackgroundJobProcessor(): Promise<void> {
     if (commandPollTimer) return;
     await pollPersistedCommands();
+    await settleRejectedSponsorAttempts();
     await reconcileBackgroundJobs();
     await refreshSucceededChainOutcomes();
     triggerChainConfirmPass();
@@ -1153,6 +1270,7 @@ async function pollPersistedCommands(): Promise<void> {
         for (const row of rows as Array<{ ID: string; kind: string; commandVersion: number }>) {
             if (processors.has(processorKey(row.kind, row.commandVersion))) scheduleJob(row.ID, row.kind);
         }
+        await settleRejectedSponsorAttempts(db);
         await reconcileBackgroundJobs(db);
         await refreshSucceededChainOutcomes(db);
         triggerChainConfirmPass();
@@ -1229,24 +1347,14 @@ export async function reconcileBackgroundJobs(existingDb?: any): Promise<number>
             contractAddress: submission?.contractAddress ?? null,
             finalizedAt: submission?.finalizedAt ?? null
         };
-        const finalizer = job.commandVersion
-            ? reconciliationFinalizers.get(processorKey(job.kind, job.commandVersion))
-            : undefined;
-        let result: unknown = {
-            reconciled: true, ...evidence, status: 'finalized'
-        };
-        if (finalizer) {
-            try {
-                const serialized = job.commandEncoding === 'aes-gcm-v1'
-                    ? decryptAtRest(job.command!, getEncryptionKey())
-                    : job.command!;
-                result = await finalizer(JSON.parse(serialized), job, evidence);
-            } catch (err) {
-                cds.log('nightgate').warn(
-                    `Reconciliation finalizer for ${job.kind} job ${job.ID} failed; keeping reconciliation_required: ${String((err as Error)?.message ?? err)}`
-                );
-                continue;
-            }
+        let result: unknown;
+        try {
+            result = await runReconciliationFinalizer(job, evidence) ?? { reconciled: true, ...evidence, status: 'finalized' };
+        } catch (err) {
+            cds.log('nightgate').warn(
+                `Reconciliation finalizer for ${job.kind} job ${job.ID} failed; keeping reconciliation_required: ${String((err as Error)?.message ?? err)}`
+            );
+            continue;
         }
         const affected = await withStatusWriteRetry(`reconcileJob(${job.ID})`, () => db.run(
             UPDATE.entity(BackgroundJobs).set({
@@ -1351,18 +1459,21 @@ export async function confirmChainOutcomesViaIndexer(existingDb?: any): Promise<
         status: 'reconciliation_required', txHash: { '!=': null }, kind: { in: [...IDENTIFIER_KEYED_KINDS] }
     }, confirmerReconcileCursor);
     confirmerReconcileCursor = reconcilePage.cursor;
+    let updated = 0;
     for (const job of reconcilePage.rows) {
         let outcome: { status: 'success' | 'failure' } | null;
         try { outcome = await confirmer(job.txHash!); } catch { continue; }
         if (!outcome) continue;
         try {
-            await finalizeIdentifierKeyedJob(db, job, outcome.status, { fromStatus: 'reconciliation_required' });
-        } catch { /* next pass */ }
+            updated += await finalizeIdentifierKeyedJob(db, job, outcome.status, { fromStatus: 'reconciliation_required' });
+        } catch (err) {
+            // next pass; a finalizer that keeps throwing is visible here
+            cds.log('nightgate').debug(`Crawler-free reconciliation of ${job.kind} job ${job.ID} deferred: ${String((err as Error)?.message ?? err)}`);
+        }
     }
     const jobs = [...pendingPage.rows, ...legacyPage.rows]
         .filter(job => !WORKFLOW_PARENT_KINDS.has(job.kind))
         .filter(job => !confirmerIdentifierKindsOnly || IDENTIFIER_KEYED_KINDS.has(job.kind));
-    let updated = 0;
     let lookupErrors = 0;
     let writeErrors = 0;
     // Bounded parallelism: each lookup is one short Indexer query. Serial would
@@ -1453,6 +1564,24 @@ function isLockContention(err: unknown): boolean {
  * them as a 500, which reads as "your transaction broke the server" rather
  * than "come back in a second".
  */
+/**
+ * Job errorCode for a sponsoring attempt provably rejected before inclusion
+ * whose bookkeeping (attempt row REJECTED, deploy reservation refunded, hash
+ * off the job) did not commit. The job parks in reconciliation_required under
+ * this code and `settleRejectedSponsorAttempts` re-runs the transaction on
+ * every reconciliation tick. The indexer cannot resolve such a job: the
+ * identifier never reached a mempool.
+ */
+export const REJECTED_ATTEMPT_BOOKKEEPING_PENDING = 'REJECTED_ATTEMPT_BOOKKEEPING_PENDING';
+
+export class SponsorAttemptBookkeepingPendingError extends Error {
+    readonly code = REJECTED_ATTEMPT_BOOKKEEPING_PENDING;
+    constructor(message: string, public readonly details: { submissionId: string; txHash?: string; grantId?: string; refund: number }) {
+        super(message);
+        this.name = 'SponsorAttemptBookkeepingPendingError';
+    }
+}
+
 export class JobAdmissionBusyError extends Error {
     readonly httpStatus = 503;
     // CAP normalises a thrown error over `status` / `statusCode` / a numeric
@@ -1462,6 +1591,17 @@ export class JobAdmissionBusyError extends Error {
     // runSubmission, so without these the caller would still get a 500.
     readonly status = 503;
     readonly statusCode = 503;
+    /** Stable wire code for clients to switch on. */
+    readonly code = 'JOB_ADMISSION_BUSY';
+    /** Value for the `Retry-After` header, seconds. */
+    readonly retryAfterSeconds = 2;
+    /**
+     * CAP's HTTP adapter replaces the message of every 5xx with the generic
+     * reason phrase under NODE_ENV=production unless the error carries
+     * `$sanitize: false`. This 503 tells the caller "nothing was written,
+     * send it again"; the message must reach the client.
+     */
+    readonly $sanitize = false;
     constructor(kind: string) {
         super(`the server is busy writing another job and could not admit this ${kind} request; nothing was submitted, retry in a moment`);
         this.name = 'JobAdmissionBusyError';
@@ -1724,6 +1864,71 @@ export async function markJobSubmissionRejected(jobId: string, submission: { sub
             .where({ ID: jobId, status: { in: ['external_execution', 'submitted'] }, leaseOwner: getRuntimeWorkerId(), ...(submission.txHash ? { txHash: submission.txHash } : {}) })
     ));
 }
+
+/**
+ * Cross the external-effect boundary and record the identifier in one
+ * statement on the given runner (a transaction the caller owns), so the job
+ * transition commits with the attempt row and grant reservation, or not at
+ * all. `firstBoundary` selects running -> submitted (at most once per job); a
+ * rebuild attempt moves external_execution|submitted -> submitted with the new
+ * identifier. Throws on a lost lease (the caller's transaction rolls back).
+ */
+export async function markJobBroadcastOn(
+    runner: { run: (q: unknown) => Promise<unknown> },
+    jobId: string,
+    submission: { submissionId?: string; txHash?: string; firstBoundary?: boolean }
+): Promise<void> {
+    const now = new Date().toISOString();
+    const first = submission.firstBoundary !== false;
+    const affected = await runner.run(
+        UPDATE.entity(BackgroundJobs)
+            .set({
+                status: 'submitted',
+                submissionId: submission.submissionId ?? null,
+                txHash: submission.txHash ?? null,
+                chainStatus: 'pending',
+                ...(first ? { externalExecutionAt: now } : {}),
+                submittedAt: now,
+                heartbeatAt: now,
+                leaseExpiresAt: new Date(Date.now() + JOB_LEASE_MS).toISOString()
+            })
+            .where(first
+                ? { ID: jobId, status: 'running', leaseOwner: getRuntimeWorkerId() }
+                : { ID: jobId, status: { in: ['external_execution', 'submitted'] }, leaseOwner: getRuntimeWorkerId() })
+    );
+    if (affectedRows(affected) === 1) return;
+    throw new Error(`Lease lost before markJobBroadcastOn(${jobId})${first ? '' : ' (rebuild attempt)'}`);
+}
+
+/**
+ * Twin of `markJobBroadcastOn` for a rejected attempt: take the identifier
+ * off the job (back to external_execution, no hash) in one statement on the
+ * caller's transaction, CAS-guarded on the lease and on the rejected hash.
+ * Throws when the guard does not hold (the caller's transaction rolls back).
+ */
+export async function markJobSubmissionRejectedOn(
+    runner: { run: (q: unknown) => Promise<unknown> },
+    jobId: string,
+    submission: { submissionId?: string; txHash?: string }
+): Promise<void> {
+    const affected = await runner.run(
+        UPDATE.entity(BackgroundJobs)
+            .set({
+                status: 'external_execution',
+                txHash: null,
+                chainStatus: null,
+                submissionId: submission.submissionId ?? null,
+                heartbeatAt: new Date().toISOString(),
+                leaseExpiresAt: new Date(Date.now() + JOB_LEASE_MS).toISOString()
+            })
+            .where({ ID: jobId, status: { in: ['external_execution', 'submitted'] }, leaseOwner: getRuntimeWorkerId(), ...(submission.txHash ? { txHash: submission.txHash } : {}) })
+    );
+    if (affectedRows(affected) === 1) return;
+    throw new Error(`Lease lost (or hash already moved) before markJobSubmissionRejectedOn(${jobId})`);
+}
+
+/** Same lock-contention retry for callers writing status inside their own transaction. */
+export const withLockContentionRetry = withStatusWriteRetry;
 
 /** Persist the external transaction hash after the SDK call returned. */
 export async function markJobSubmitted(jobId: string, submission: { submissionId?: string; txHash?: string }): Promise<void> {

@@ -48,6 +48,53 @@ service NightgateAdminService {
     action invalidateAllSessions();
 
     /**
+     * Contracts known to this process (0.21.0): the config floor plus runtime
+     * registrations. `artifactDigest` is the generation persisted commands are
+     * pinned to; `hasProverKeys` false means the contract deploys and verifies
+     * but cannot be proven here.
+     */
+    function listContracts() returns array of {
+        name           : String;
+        source         : String; // 'config' | 'runtime'
+        artifactPath   : String;
+        zkConfigPath   : String;
+        privateStateId : String;
+        slotWidth      : Integer;
+        artifactDigest : String;
+        hasProverKeys  : Boolean;
+    };
+
+    /**
+     * Register a contract artifact at runtime (0.21.0). Paths must resolve
+     * inside `NIGHTGATE_CONTRACTS_DIR`; the module must export a Compact
+     * `Contract` class, the zk-config directory must hold verifier keys and
+     * `zkir/`. Validated before anything changes, persisted in
+     * `ContractRegistrations`, reloaded at boot. A config name is refused with
+     * 409. Re-registering a runtime name under a new artifact is a new
+     * generation; jobs recorded against the previous one refuse.
+     */
+    action registerContract(name: String,
+                            artifactPath: String,
+                            zkConfigPath: String,
+                            privateStateId: String,
+                            slotWidth: Integer // optional; 8 | 16 | 32, default 16
+    ) returns {
+        name           : String;
+        source         : String;
+        artifactPath   : String;
+        zkConfigPath   : String;
+        privateStateId : String;
+        slotWidth      : Integer;
+        artifactDigest : String;
+        hasProverKeys  : Boolean;
+    };
+
+    /** Remove a runtime registration (memory + table). Config names refuse with 409. */
+    action unregisterContract(name: String) returns {
+        removed : Boolean;
+    };
+
+    /**
      * Job queue in one call: counts per status plus the error codes that are
      * piling up, over the last `windowHours` (default 24, max 720).
      *

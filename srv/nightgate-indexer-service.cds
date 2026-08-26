@@ -161,6 +161,7 @@ service NightgateIndexerService {
         running      : Boolean;
         inFlightRpcs : Integer;
         exitCount    : Integer;
+        rotationCount : Integer; // controlled worker rotations (generation budget), not crashes
         lastExitCode : Integer;
         lastExitAt   : Timestamp;
         rpcTimeoutMs : Integer;

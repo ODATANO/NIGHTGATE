@@ -1,5 +1,233 @@
 # Changelog
 
+## 0.21.0 - 2026-08-25
+
+A running server can be told about a new consumer, and it stops reporting
+things that are not true. Additive, one schema migration (six nullable
+`AgentGrants` columns + the `ContractRegistrations` table); no vault
+redeploy, no circuit change.
+
+- **The 503 reason reaches the caller.** CAP replaces the message of every
+  5xx with the generic reason phrase when `NODE_ENV=production`, so the
+  "nothing was written, retry" advice of a busy admission only ever reached
+  the server log; a client classifying on the message treated a retryable
+  503 as a failed step. The retryable 503s (`JOB_ADMISSION_BUSY`,
+  `WALLET_SYNCING`, retryable submission classifications) now opt out of the
+  sanitisation, carry a stable `error.code`, and set `Retry-After`. Genuine
+  server faults stay sanitised.
+- **Sync progress says when it is old.** `getWalletSyncProgress` kept
+  answering `caughtUp: false` with its last figures after the prewarm job had
+  ended; a poller reported progress off a two-hour-old snapshot. It now
+  carries `staleSeconds` and `stale` (past `NIGHTGATE_SYNC_PROGRESS_STALE_S`,
+  60 s), `lastProgressAt`, and the session's latest prewarm `jobId`/`jobStatus`
+  so the next call is `getJobStatus`, not a guess. It also says whether the
+  facade was RESTORED from the persisted sync snapshot (minutes of delta,
+  `snapshotSavedAt`) or COLD-STARTED (hours from zero), the difference an
+  operator could not see until the sync was over; the same fact is one INFO
+  line under `nightgate:facade` instead of a debug line. Registered BEFORE
+  the worker init (`facadeBuildStartedAt`, `facadeBuiltAt` null meanwhile):
+  a grown dust snapshot deserialises for minutes (live: 15 MB, ~7 min, then
+  4 s of chain delta), and those minutes must not read as "nothing known".
+- **Prewarm bounded by progress, not by the clock.** A healthy wallet syncing
+  at a third of its idle rate on a loaded machine failed at three hours while
+  still applying events. The wait now fails when `appliedIndex` has not
+  advanced for `NIGHTGATE_PREWARM_STALL_MS` (10 min) and says "no progress";
+  a moving sync runs up to the absolute ceiling
+  `NIGHTGATE_PREWARM_SYNC_TIMEOUT_MS`, now 12 h, whose message says "still N
+  events behind". Both are retryable for the sponsor pool.
+- **One dust-race classification for every submitting path.** `1010/170`
+  (stale dust proof) and `1010/196` (nullifier already known) are a transient
+  race: pre-mempool, fee unspent, heal = rebuild. The sponsored paths had
+  rebuilt-and-retried on them since 0.18 while `classifySubmissionError`
+  still marked every 1010 terminal, so a deploy hitting the same race failed
+  and the operator retried by hand. The coded race now has one definition
+  (`srv/submission/dust-race.ts`), the classifier reports it `retryable`
+  with `transient: "dust-race"`, and the bound deploy/call/batch paths
+  rebuild-retry inside the worker call, before any txHash exists
+  (`NIGHTGATE_DUST_RACE_RETRIES` 2, `NIGHTGATE_DUST_RACE_BACKOFF_MS` 5 s).
+- **Dust registration reports the outcome, not the inputs.** Registration
+  binds the address, so registering an already-registered wallet with a
+  different receiver did nothing and answered success, echoing the receiver
+  it had not applied. The result now carries `changed`/`reason`, a
+  `dustReceiverAddress` only when one was applied, `requestedReceiver`, and a
+  `message` naming `deregisterFromDustGeneration` as the way to move
+  generation. And since one registration over many UTXOs consolidates them
+  (nine in, two out, two dust notes instead of nine), the result reports
+  `registeredUtxosBefore`/`registeredUtxosAfter` observed after the tx
+  applies locally (`settled`, `consolidated`;
+  `NIGHTGATE_DUST_REGISTER_SETTLE_MS`). Register first, fund afterwards in
+  separate payments, to keep the notes split; documented in `docs/actions.md`.
+- **Policy follows the grant.** Onboarding a sponsored consumer needed an
+  agent grant AND a matching entry in `NIGHTGATE_SPONSOR_ALLOWED_CONTRACTS`,
+  maintained by hand in two places, and the env change meant a container
+  recreate with a ~20 min cold sponsor pool (three times on 2026-08-24/25).
+  `createAgentGrant` gains `allowedContracts`/`allowedCircuits`; a sponsored
+  call under the grant's token runs under the intersection of the platform
+  floor and the grant (absent grant list = inherit, empty floor = the grant
+  is the policy, empty intersection = `403 SPONSOR_POLICY_EMPTY` at
+  admission). Revoking the grant removes its sponsoring reach. Two nullable
+  columns on `AgentGrants` (`allowedContracts`, `allowedCircuits`, schema
+  delta); existing grants behave as before.
+- **Sponsor policy file.** `NIGHTGATE_SPONSOR_POLICY_FILE` names a JSON
+  `{ allowedContracts, allowedCircuits }` re-read per sponsored call behind
+  an mtime cache, replacing the env lists while set: the platform floor
+  changes without a restart. Fail-closed: an unreadable or invalid file keeps
+  the last good policy, and with none loaded yet sponsored calls answer
+  `503 SPONSOR_POLICY_UNAVAILABLE`, never "allow any".
+- **Batches on any contract.** The txbuilder's batch path hard-coded the
+  attestation vault's witnesses, so a batch on a consumer's own contract
+  failed at the first witness the vault does not define, with an error
+  naming that witness and not the cause. `buildSponsorable({ calls,
+  witnesses })` now takes one shared witnesses object for any contract
+  (per-call `before` hooks swap what varies), a batch whose entries carry the
+  same witnesses uses those, the vault family keeps getting both from the
+  builder, and a foreign batch without either is refused up front with the
+  real reason. `createTxBuilder({ zkConfigDir })` reads a consumer's own
+  `keys/` and `zkir/` locally instead of a sponsor's `/zk-config`.
+  `@odatano/nightgate-tx` 0.4.0 ships this txbuilder: `buildDeploySponsorable`,
+  `zkConfigDir`, foreign-contract batches with shared `witnesses`, the
+  contract's own circuits as the default `circuits`, `ZkAssetResult.source`,
+  `describeLocalZkAssets` and `readDeployAddress`.
+- **Sponsored deploys, a distinct right.** A consumer deploying its own
+  contract needed a funded wallet with dust first, the one step sponsoring
+  exists to remove. txbuilder `buildDeploySponsorable()` builds, proves and
+  signs the deploy with the caller's own key (the caller owns the contract)
+  and hands the fee-unpaid transaction plus its future address to a sponsor.
+  The sponsor pays only when its floor opens deploys
+  (`NIGHTGATE_SPONSOR_ALLOW_DEPLOY` / policy file `allowDeploy`) AND, for a
+  token caller, the grant carries `allowDeploy` with budget left
+  (`maxDeploys`, default 1, separate from the daily job budget: a deploy
+  writes verifier keys on chain and costs a multiple of a call). The shape
+  check now tells a deploy from a maintenance update (the latter stays
+  refused forever), applies a deploy-specific byte ceiling
+  (`NIGHTGATE_SPONSOR_MAX_DEPLOY_BYTES`, 40960) and admits ONE deploy per
+  transaction. The budget is reserved atomically at the submit-intent,
+  before the sponsor broadcasts (one conditional UPDATE bounded by
+  `maxDeploys`, in the SAME database transaction as the attempt row AND
+  the job's own transition to `submitted` with the identifier; the row
+  carries the grant and the deployed address; a nack means nothing goes
+  out, a provably rejected attempt is closed, refunded and taken off the
+  job (hash CAS on the lease) in one transaction; if that transaction
+  cannot commit after its retries the rebuild loop stops and the job parks
+  under the persisted marker `REJECTED_ATTEMPT_BOOKKEEPING_PENDING`, which
+  the reconciler's settle pass (every tick, crawler or not, and after a
+  restart) resolves by re-running exactly that bookkeeping and failing the
+  job as `SPONSOR_ATTEMPT_REJECTED`, instead of the generic reconciliation
+  an indexer lookup could never resolve; and a broadcast that is only
+  reconciled later, by the
+  crawler evidence or the crawler-free indexer confirmer alike, records the
+  address from the row through the kind's reconciliation finalizer), so
+  parallel requests on a stale counter cannot overspend and a crash leaves
+  the job either still running with nothing reserved (replayed on restart)
+  or submitted with hash, row and reservation together. A deploy whose
+  transaction is proven to have FAILED on chain keeps its reservation (the
+  sponsor paid the fee); refunds are only for attempts that never reached
+  the chain. The landed address is recorded in the grant's
+  `deployedContracts` and is sponsorable ON TOP of `floor ∩ grant`: appended
+  to `allowedContracts` it would have been intersected away again under a
+  non-empty platform floor. Four more nullable `AgentGrants` columns
+  (`allowDeploy`, `maxDeploys`, `deploysUsed`, `deployedContracts`), covered
+  by the same schema delta.
+- **Contracts registered at runtime.** `cds.requires.nightgate.contracts` was
+  read once at startup, so making a consumer's artifact known meant a
+  restart that closed every wallet session and re-warmed the facades (three
+  for one consumer's contract and its revisions on 2026-08-24/25). The
+  admin service gains `registerContract` / `unregisterContract` /
+  `listContracts`: validated before anything changes (paths inside
+  `NIGHTGATE_CONTRACTS_DIR`, module exports a `Contract` class, verifier keys
+  and `zkir/` present), persisted in a new `ContractRegistrations` table
+  (schema delta), reloaded at boot, and pinned by the same generation
+  digest a startup registration gets. The config stays the immutable floor
+  (409). Register/unregister of one name are serialised (memory entry,
+  digest and persisted row belong to the same generation; a failed request
+  cannot roll back a concurrent successful one), and contract modules are
+  loaded pinned to their generation digest, on the main thread and in the
+  worker: an ESM artifact under a URL keyed by the digest, a CommonJS
+  artifact with its filename cache entry dropped first (Node caches CJS by
+  filename underneath `import()`), so a re-pointed alias or a revision
+  written in place under the same path executes as itself instead of the
+  cached class. The main process imports no artifact for a job any more
+  (`resolveContract` compiles only on request, registration validates the
+  module in a disposable worker thread), so hot re-registrations no longer
+  grow the main process's module cache either; relative registration paths
+  are tried under EVERY allowed root (`NIGHTGATE_CONTRACTS_DIR` takes
+  several; the defaults are two) and roots are canonical, so a root behind
+  a symlink or junction works. The digest is not a label the worker trusts: it recomputes
+  it from the module, the prover/verifier keys and the zkir files on disk
+  (`srv/submission/artifact-digest.ts`, the same bytes the registry hashes)
+  and refuses a mismatch. And because Node reads a module when `import()`
+  runs and the SDK reads keys and zkir lazily at proving time, the worker
+  never hands either of them the mutable registration directory: per
+  generation it materialises an immutable, content-addressed snapshot
+  (`NIGHTGATE_ARTIFACT_SNAPSHOT_DIR/<install>/<pid>/<digest>`, one tree
+  per installation AND per process so a second instance or an overlapping
+  upgrade can neither repoint the runtime link nor sweep a snapshot another
+  process is proving from, roots of dead processes swept at start-up;
+  canonical module name
+  `artifact.mjs`/`.cjs` carrying the EFFECTIVE module format, which is
+  decided by the nearest package.json for a `.js` file and is part of the
+  generation digest (ESM adds no section, so recorded digests stay as they
+  were; a CommonJS artifact's digest changes, and jobs or evidence recorded
+  by 0.20.0 against an unchanged CommonJS artifact keep working because the
+  pre-0.21.0 form is accepted as the same generation, said once at INFO),
+  so byte-identical artifacts under different file names share one
+  snapshot and a `.js` ESM contract does not depend on Node's syntax
+  detection outside its package scope; built under a temp name, verified
+  against the digest, renamed into place, never written again, with a
+  `node_modules` link so the module's bare `@midnight-ntwrk/compact-runtime`
+  import resolves to NIGHTGATE's own pinned runtime; the root is marked as
+  NIGHTGATE's and a foreign `node_modules` under it makes the worker refuse
+  rather than delete), imports the class from the snapshot module and points
+  `withCompiledFileAssets` and the zk config provider at the snapshot only.
+  A file rewritten in place after that can neither change the pinned class
+  nor be combined with it. Retention: a job holds its generation for the
+  whole call, a generation evicted from the worker's bounded caches
+  (`NIGHTGATE_WORKER_GENERATION_CACHE`, 8) is swept once no job holds it,
+  and stale snapshots (`NIGHTGATE_ARTIFACT_SNAPSHOT_TTL_DAYS`, 14) plus
+  leftover temp builds go at the worker's first use; the indexer WebSocket
+  client is shared per endpoint. Node's own ESM module cache keeps every
+  imported generation until the worker exits, so the worker counts the
+  distinct generations it imported and rotates after
+  `NIGHTGATE_WORKER_MAX_GENERATIONS` (32; 0 = never): a DRAIN, checked on
+  every call's completion (failed calls included), that closes admission
+  first (a call arriving after the announcement is refused with
+  `WORKER_ROTATING` and retried by the main thread on the respawned worker,
+  calls made meanwhile wait for the exit), lets everything in flight finish
+  and exits at zero; reported as `rotationCount` (also the
+  `wallet_worker_rotations` metric), never as a crash.
+- **Smaller corrections from the release review.** `registerForDustGeneration`
+  decides `already-registered` from the full coin set (the SDK's available
+  set excludes registered UTXOs, so a fully registered wallet used to read as
+  `no-night-utxos`); the prewarm stall bound also fires when the wallet state
+  cannot be read (a dead state observable ran to the 12 h ceiling);
+  `registerForDustGeneration`, `deregisterFromDustGeneration` and `sendNight`
+  set `Retry-After` on a busy admission like the submission actions do; the
+  txbuilder's default `circuits` is now every circuit of the `contractClass`
+  handed in, not the vault's set (live: a foreign contract's only circuit had
+  no prover key on the follow-up call); its `zkConfigDir` mode returns the public `ZkAssetResult` shape
+  (`fetched: 0`, `source: 'local'`; `ensureZkAssets` reports
+  `source: 'remote'`); the txbuilder declaration and JSDoc describe the
+  batch witness rule as implemented (one shared object, or the entries'
+  common one, or the vault family's own); the worker client's
+  `registerDustGeneration` type carries the 0.21.0 outcome fields; a
+  snapshot copies the module's source map under the referenced name with
+  its `sourceRoot` rebased so the sources keep resolving; `zkConfigDir`
+  requires `keys/` and `zkir/` to be directories and, for the circuits the
+  builder will prove, the prover key and bzkir (not only every circuit's
+  verifier key; a class that cannot be introspected falls back to the
+  vault's set like the remote path, so empty asset directories never pass;
+  `cached` counts the verified files), and a runtime registration requires
+  `zkir/` to be a
+  directory; a missing sponsor policy file is logged once, not per call;
+  `buildDeploySponsorable` fails the build unless
+  exactly one deploy action with an address is present (no empty
+  `contractAddress` as a success) and its declaration returns the
+  bound-or-unbound union for a generally typed input; a successful dust
+  registration reports the full NIGHT UTXO count; the facade origin
+  (`restoredFromSnapshot`, build timestamps) is dropped with the worker, so
+  `getWalletSyncProgress` never describes a facade of a dead worker; the
+  compose default image tag follows the release.
+
 ## 0.20.0 - 2026-08-24
 
 Monitoring surface. What a dashboard or a scraper needs was already known

@@ -16,6 +16,7 @@ import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
 import { pathToFileURL } from 'url';
+import { computeArtifactGenerationDigest, artifactGenerationMatch } from './artifact-digest';
 
 // Package root (…/node_modules/@odatano/nightgate when installed). contract-registry
 // lives at <root>/srv/submission/, so ../.. is the package root.
@@ -64,7 +65,8 @@ export function slotWidthOf(reg: Pick<ContractRegistration, 'slotWidth'> | undef
 }
 
 export interface ResolvedContract {
-    compiledContract: unknown;
+    /** Main-thread CompiledContract wrapper; only with `{ compile: true }`. Jobs compile in the worker. */
+    compiledContract?: unknown;
     privateStateId: string;
     zkConfigPath: string;
     /** Content-tree width of a vault-family artifact (16 default, 32 for attestation-vault-32). */
@@ -75,6 +77,8 @@ export interface ResolvedContract {
      * thread boundary). Same value stored at registerContract() time.
      */
     artifactPath: string;
+    /** Generation digest of the resolved artifact (module + verifier keys). */
+    artifactDigest: string;
 }
 
 const registry = new Map<string, ContractRegistration>();
@@ -221,31 +225,25 @@ export function getCurrentArtifactDigest(name: string): string {
  * per-alias cache).
  */
 function computeGenerationDigest(reg: ContractRegistration): string {
-    const hash = crypto.createHash('sha256');
-    const section = (label: string, data: Buffer | string) => {
-        const buf = typeof data === 'string' ? Buffer.from(data, 'utf8') : data;
-        hash.update(`${label}:${buf.length}\n`);
-        hash.update(buf);
-    };
-    section('module', fs.readFileSync(reg.artifactPath));
-    section('privateStateId', reg.privateStateId);
-    // The width is proof semantics (witness shapes, inclusion-path depth,
-    // integrity claim keys): the SAME artifact files registered under a
-    // different width must be a different generation. Only non-default
-    // widths add a section, keeping earlier releases' recorded digests
-    // (implicitly width 16) byte-identical; explicit 16 === absent.
-    if (slotWidthOf(reg) !== 16) section('slotWidth', String(slotWidthOf(reg)));
-    const assetDir = (sub: string, filter: (f: string) => boolean) => {
-        const dir = path.join(reg.zkConfigPath, sub);
-        let files: string[] = [];
-        try {
-            files = fs.readdirSync(dir).filter(filter).sort();
-        } catch { /* asset-less artifacts (pure-circuit-only) skip the section */ }
-        for (const f of files) section(`${sub}/${f}`, fs.readFileSync(path.join(dir, f)));
-    };
-    assetDir('keys', (f) => f.endsWith('.verifier') || f.endsWith('.prover'));
-    assetDir('zkir', () => true);
-    return hash.digest('hex');
+    // Algorithm in artifact-digest.ts (dependency-free); the wallet worker
+    // recomputes the same digest from the files it loads.
+    return computeArtifactGenerationDigest(reg);
+}
+
+const legacyDigestNoted = new Set<string>();
+/**
+ * The pre-0.21.0 digest form of an unchanged CommonJS artifact (no
+ * module-format section; ESM digests never changed) is the same generation
+ * and is accepted. Logged once per alias at INFO.
+ */
+function acceptsLegacyDigest(name: string, recorded: string): boolean {
+    const reg = registry.get(name);
+    if (!reg || artifactGenerationMatch(reg, recorded) !== 'legacy') return false;
+    if (!legacyDigestNoted.has(name)) {
+        legacyDigestNoted.add(name);
+        cds.log('nightgate').info(`contract '${name}': accepting pre-0.21.0 generation digest ${recorded.slice(0, 16)}… (same CommonJS artifact; the digest format gained the module-format section)`);
+    }
+    return true;
 }
 
 /**
@@ -261,6 +259,7 @@ export function assertArtifactGeneration(name: string, recorded: string | undefi
             `${what} carries no artifact-generation digest (created by an older release). ` +
             `Refusing to run it against whatever '${name}' resolves to today; re-issue the action.`);
     }
+    if (recorded !== current && acceptsLegacyDigest(name, recorded)) return;
     if (recorded !== current) {
         throw new Error(
             `${what} was created against artifact generation ${recorded.slice(0, 16)}… but '${name}' now ` +
@@ -279,6 +278,17 @@ export function clearRegistry(): void {
     registry.clear();
     generationDigests.clear();
     currentDigestCache.clear();
+    configNames.clear();
+}
+
+/**
+ * Names from `cds.requires.nightgate.contracts`: the immutable floor. Runtime
+ * registrations may add names but never re-point or remove one.
+ */
+const configNames = new Set<string>();
+
+export function isConfigRegisteredContract(name: string): boolean {
+    return configNames.has(name);
 }
 
 export function listRegisteredContracts(): string[] {
@@ -309,22 +319,21 @@ export function loadRegistryFromConfig(config?: Record<string, any>, baseDir = p
         const r = reg as ContractRegistration;
         if (!r?.artifactPath || !r?.privateStateId || !r?.zkConfigPath) continue;
         const resolved = {
-            artifactPath:   resolveContractPath(r.artifactPath, baseDir),
+            artifactPath: resolveContractPath(r.artifactPath, baseDir),
             privateStateId: r.privateStateId,
-            zkConfigPath:   resolveContractPath(r.zkConfigPath, baseDir),
+            zkConfigPath: resolveContractPath(r.zkConfigPath, baseDir),
             ...(r.slotWidth !== undefined ? { slotWidth: Number(r.slotWidth) } : {})
         };
         registerContract(name, resolved);
+        configNames.add(name);
         warnOnMissingProverKeys(name, resolved.zkConfigPath);
     }
 }
 
 /**
  * Verifier keys without prover keys: the contract deploys and its claims
- * verify, but nothing can PROVE its circuits here, and `/zk-config` answers
- * a bare 404 to browser provers. The npm package ships the width-32 vault
- * this way (its prover set is 113 MB, over the registry's publish limit),
- * so say it once at boot instead of failing opaquely at proving time.
+ * verify, but its circuits cannot be proven here and `/zk-config` answers 404.
+ * Said once at boot.
  */
 function warnOnMissingProverKeys(name: string, zkConfigPath: string): void {
     let files: string[];
@@ -350,53 +359,82 @@ function warnOnMissingProverKeys(name: string, zkConfigPath: string): void {
  * that snapshot: a concurrent `registerContract` between check and use
  * cannot swap generations, and an asset overwritten in place fails closed.
  */
-export async function resolveContract(name: string, expectedDigest?: string): Promise<ResolvedContract> {
+export async function resolveContract(name: string, expectedDigest?: string, opts: { compile?: boolean } = {}): Promise<ResolvedContract> {
     const reg = registry.get(name);
     if (!reg) {
         const available = listRegisteredContracts();
         throw new ContractNotRegisteredError(name, available);
     }
+    let digest: string | undefined;
     if (expectedDigest !== undefined) {
         const current = computeGenerationDigest(reg);
-        if (current !== expectedDigest) {
+        digest = current;
+        // The pre-0.21.0 digest form of a CommonJS artifact is the same
+        // generation; the worker is handed the current digest either way.
+        if (current !== expectedDigest && artifactGenerationMatch(reg, expectedDigest) !== 'legacy') {
             throw new Error(
                 `Contract '${name}' currently resolves to artifact generation ${current.slice(0, 16)}… but ` +
                 `${expectedDigest.slice(0, 16)}… was recorded. Refusing to load a different generation; ` +
                 `re-register the original artifact under this name (or a versioned alias) to proceed.`);
         }
     }
-    // Node's ESM loader on Windows rejects raw `C:\...` paths in dynamic
-    // import, must be a file:// URL. pathToFileURL handles both platforms.
-    const importSpec = path.isAbsolute(reg.artifactPath)
-        ? pathToFileURL(reg.artifactPath).href
-        : reg.artifactPath;
-    const mod: any = await import(importSpec);
-    const ContractClass = mod.Contract ?? mod.default ?? mod;
-
-    // midnight-js-contracts expects a `CompiledContract` wrapper around the raw
-    // Compact-emitted `Contract` class, not the class itself: it attaches
-    // witnesses + ZK asset paths (keys/, zkir/) and the Symbol-keyed CompactContext
-    // that `deployContract` reads. Pattern from example-counter:
-    //   CompiledContract.make(name, Contract)
-    //     .pipe(withVacantWitnesses, withCompiledFileAssets(zkConfigPath))
-    const compactJs: any = await import('@midnight-ntwrk/compact-js');
-    // CompiledContract is re-exported at top level from `effect/CompiledContract`.
-    const CompiledContract = compactJs.CompiledContract ?? compactJs.effect?.CompiledContract;
-    if (!CompiledContract?.make) {
-        throw new Error(`CompiledContract.make not found in @midnight-ntwrk/compact-js exports; got keys: ${Object.keys(compactJs).join(',')}`);
+    digest ??= getArtifactGenerationDigest(name);
+    // The main process imports no artifact for a job (the worker compiles from
+    // the generation's snapshot; an import here stays in Node's module cache).
+    // Only `compile: true` builds the main-thread CompiledContract wrapper.
+    let compiledContract: unknown;
+    if (opts.compile) {
+        const mod: any = await importArtifactGeneration(reg.artifactPath, digest);
+        const ContractClass = mod.Contract ?? mod.default ?? mod;
+        // midnight-js-contracts expects a `CompiledContract` wrapper around the
+        // raw Compact-emitted `Contract` class.
+        const compactJs: any = await import('@midnight-ntwrk/compact-js');
+        const CompiledContract = compactJs.CompiledContract ?? compactJs.effect?.CompiledContract;
+        if (!CompiledContract?.make) {
+            throw new Error(`CompiledContract.make not found in @midnight-ntwrk/compact-js exports; got keys: ${Object.keys(compactJs).join(',')}`);
+        }
+        compiledContract = CompiledContract.make(name, ContractClass).pipe(
+            CompiledContract.withVacantWitnesses,
+            CompiledContract.withCompiledFileAssets(reg.zkConfigPath)
+        );
     }
-    const compiledContract = CompiledContract.make(name, ContractClass).pipe(
-        CompiledContract.withVacantWitnesses,
-        CompiledContract.withCompiledFileAssets(reg.zkConfigPath)
-    );
 
     return {
-        compiledContract,
+        ...(compiledContract !== undefined ? { compiledContract } : {}),
         privateStateId: reg.privateStateId,
         zkConfigPath: reg.zkConfigPath,
         artifactPath: reg.artifactPath,
+        artifactDigest: digest,
         ...(reg.slotWidth !== undefined ? { slotWidth: reg.slotWidth } : {})
     };
+}
+
+/**
+ * Dynamic-import specifier for an artifact module of a given generation: a
+ * file:// URL keyed by the digest, so an in-place revision is its own ESM
+ * module instance (Node caches ESM per URL). Bare package specifiers are
+ * returned as is.
+ */
+export function artifactImportSpec(artifactPath: string, generation: string): string {
+    if (!path.isAbsolute(artifactPath)) return artifactPath;
+    const url = pathToFileURL(artifactPath);
+    url.searchParams.set('gen', generation.slice(0, 32));
+    return url.href;
+}
+
+/**
+ * Import an artifact module pinned to a generation, ESM or CommonJS. Node 22
+ * serves a CommonJS module from its cache by filename regardless of the import
+ * query, so the CJS cache entry is dropped first.
+ */
+export async function importArtifactGeneration(artifactPath: string, generation: string): Promise<any> {
+    if (path.isAbsolute(artifactPath)) {
+        try {
+            const resolved = require.resolve(artifactPath);
+            delete require.cache[resolved];
+        } catch { /* not resolvable as CJS (fine for ESM) */ }
+    }
+    return import(artifactImportSpec(artifactPath, generation));
 }
 
 export class ContractNotRegisteredError extends Error {

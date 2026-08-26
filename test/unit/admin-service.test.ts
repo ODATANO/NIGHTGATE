@@ -65,7 +65,23 @@ vi.mock('@sap/cds', () => {
     return cds;
 });
 
+const mockRegisterAtRuntime = vi.hoisted(() => vi.fn());
+const mockUnregisterAtRuntime = vi.hoisted(() => vi.fn());
+const mockListContracts = vi.hoisted(() => vi.fn(() => []));
+vi.mock('../../srv/submission/contract-registrations', () => {
+    class ContractRegistrationError extends Error {
+        constructor(public readonly httpStatus: number, message: string) { super(message); this.name = 'ContractRegistrationError'; }
+    }
+    return {
+        ContractRegistrationError,
+        listContracts: (...a: unknown[]) => (mockListContracts as any)(...a),
+        registerContractAtRuntime: (...a: unknown[]) => (mockRegisterAtRuntime as any)(...a),
+        unregisterContractAtRuntime: (...a: unknown[]) => (mockUnregisterAtRuntime as any)(...a)
+    };
+});
+
 import NightgateAdminService from '../../srv/admin-service';
+import { ContractRegistrationError } from '../../srv/submission/contract-registrations';
 
 function createMockRequest(data: Record<string, unknown>, userId?: string) {
     const req: any = {
@@ -86,6 +102,52 @@ describe('NightgateAdminService', () => {
         Object.keys(registeredHandlers).forEach(k => delete registeredHandlers[k]);
         service = new NightgateAdminService();
         await service.init();
+    });
+
+    // Runtime contract registration through the admin service.
+    describe('registerContract / unregisterContract / listContracts', () => {
+        const INPUT = { name: 'customer-vault', artifactPath: 'customer/contract/index.cjs', zkConfigPath: 'customer', privateStateId: 'ps' };
+
+        it('rejects 400 when a required field is missing, before touching the registry', async () => {
+            const req = createMockRequest({ ...INPUT, zkConfigPath: '' }, 'admin-1');
+            await registeredHandlers['registerContract'](req);
+            expect(req.reject).toHaveBeenCalledWith(400, expect.stringContaining('zkConfigPath'));
+            expect(mockRegisterAtRuntime).not.toHaveBeenCalled();
+        });
+
+        it('delegates with the admin principal and network, returning the listing', async () => {
+            process.env.NIGHTGATE_NETWORK = 'preprod';
+            try {
+                mockRegisterAtRuntime.mockResolvedValueOnce({ name: 'customer-vault', source: 'runtime', slotWidth: 16, artifactDigest: 'd'.repeat(64), hasProverKeys: true });
+                const req = createMockRequest({ ...INPUT, slotWidth: 16 }, 'admin-1');
+                const out = await registeredHandlers['registerContract'](req);
+                expect(mockRegisterAtRuntime).toHaveBeenCalledWith(expect.anything(),
+                    expect.objectContaining({ name: 'customer-vault', slotWidth: 16 }),
+                    { registeredBy: 'admin-1', networkId: 'preprod' });
+                expect(out).toMatchObject({ name: 'customer-vault', source: 'runtime' });
+            } finally {
+                delete process.env.NIGHTGATE_NETWORK;
+            }
+        });
+
+        it('maps ContractRegistrationError to its status (409 for a config name, 400 for a bad path)', async () => {
+            mockRegisterAtRuntime.mockRejectedValueOnce(new ContractRegistrationError(409, 'the config is the immutable floor'));
+            const req = createMockRequest(INPUT, 'admin-1');
+            await registeredHandlers['registerContract'](req);
+            expect(req.reject).toHaveBeenCalledWith(409, expect.stringContaining('floor'));
+
+            mockUnregisterAtRuntime.mockRejectedValueOnce(new ContractRegistrationError(409, 'cannot be removed at runtime'));
+            const req2 = createMockRequest({ name: 'floor' }, 'admin-1');
+            await registeredHandlers['unregisterContract'](req2);
+            expect(req2.reject).toHaveBeenCalledWith(409, expect.stringContaining('removed'));
+        });
+
+        it('unregister + list pass through', async () => {
+            mockUnregisterAtRuntime.mockResolvedValueOnce({ removed: true });
+            expect(await registeredHandlers['unregisterContract'](createMockRequest({ name: 'customer-vault' }, 'admin-1'))).toEqual({ removed: true });
+            mockListContracts.mockReturnValueOnce([{ name: 'a', source: 'config' }] as any);
+            expect(await registeredHandlers['listContracts'](createMockRequest({}, 'admin-1'))).toEqual([{ name: 'a', source: 'config' }]);
+        });
     });
 
     describe('invalidateSession', () => {

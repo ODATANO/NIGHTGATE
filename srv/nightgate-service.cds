@@ -1280,6 +1280,15 @@ service NightgateService {
         elapsedMs       : Integer; // how long this sync wait has been running
         phase           : String;  // 'prewarm' | 'balance' | ...
         updatedAt       : Timestamp; // when the worker last reported
+        lastProgressAt  : Timestamp; // when appliedIndex last advanced; null from a pre-0.21 worker
+        staleSeconds    : Integer; // now - updatedAt; null when unknown
+        stale           : Boolean; // staleSeconds past NIGHTGATE_SYNC_PROGRESS_STALE_S (60 s): nobody is syncing
+        jobId           : UUID;    // latest prewarm job of the session, for getJobStatus; null if none
+        jobStatus       : String;  // that job's status as recorded
+        restoredFromSnapshot : Boolean;   // true = resumed from a persisted sync snapshot; false = cold start; null = no facade built
+        snapshotSavedAt : Timestamp; // when that snapshot was saved; the reconnect resumes from it
+        facadeBuildStartedAt : Timestamp; // when this process started building the facade
+        facadeBuiltAt   : Timestamp; // when the worker finished building it; null while still deserialising
     };
 
     /**
@@ -1512,12 +1521,20 @@ service NightgateService {
                               maxJobsPerDay: Integer, // optional; null = unlimited
                               sponsorSessionId: UUID, // optional; fixed fee-sponsor binding
                               validUntil: Timestamp, // optional; null = no expiry
-                              agentLabel: String // optional, informational
+                              agentLabel: String, // optional, informational
+                              allowedContracts: array of String, // optional (0.21.0): contracts this grant may have sponsored; effective = platform floor ∩ grant; absent = the floor
+                              allowedCircuits: array of String, // optional (0.21.0): same for circuit names
+                              allowDeploy: Boolean, // optional (0.21.0): the sponsor also pays for a contract deploy the caller built; needs a sponsor* action and NIGHTGATE_SPONSOR_ALLOW_DEPLOY; the landed address is recorded in deployedContracts and sponsorable on top of floor ∩ grant
+                              maxDeploys: Integer // optional (0.21.0): lifetime deploy budget, separate from maxJobsPerDay; default 1 when allowDeploy
     )                                                                 returns {
-        grantId        : UUID;
-        token          : String; // shown once, never stored
-        allowedActions : array of String;
-        validUntil     : Timestamp;
+        grantId          : UUID;
+        token            : String; // shown once, never stored
+        allowedActions   : array of String;
+        allowedContracts : array of String; // as recorded; empty = inherits the platform floor
+        allowedCircuits  : array of String;
+        allowDeploy      : Boolean;
+        maxDeploys       : Integer;
+        validUntil       : Timestamp;
     };
 
     /**

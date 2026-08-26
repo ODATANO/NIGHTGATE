@@ -796,6 +796,30 @@ describe('sponsorFinalizedTransaction over REAL OData (0.17.2 sentinel)', () => 
         }
     });
 
+    // CAP strips every 5xx message under NODE_ENV=production; the busy 503 opts out. Pins the wire for one production request.
+    it('a busy admission keeps code + message on the wire in production, with Retry-After', async () => {
+        const bg = require('../../srv/submission/background-jobs');
+        const spy = vi.spyOn(bg, 'startJob').mockRejectedValueOnce(new bg.JobAdmissionBusyError('sponsorFinalizedTransaction'));
+        const prevNodeEnv = process.env.NODE_ENV;
+        process.env.NIGHTGATE_FEE_SPONSOR_SESSION = 'a4f1c8ee-0000-4000-8000-000000000001';
+        process.env.NODE_ENV = 'production';
+        try {
+            const res: any = await cap.POST(`${API}/sponsorFinalizedTransaction`, {
+                finalizedTxB64: Buffer.from('probe').toString('base64'),
+                sponsorSessionId: SENTINEL
+            }).catch((e: any) => e.response ?? e);
+            expect(spy).toHaveBeenCalled();
+            expect(res.status).toBe(503);
+            expect(res.headers?.['retry-after']).toBe('2');
+            expect(res.data?.error?.code).toBe('JOB_ADMISSION_BUSY');
+            expect(res.data?.error?.message).toMatch(/nothing was submitted, retry/);
+        } finally {
+            if (prevNodeEnv === undefined) delete process.env.NODE_ENV; else process.env.NODE_ENV = prevNodeEnv;
+            delete process.env.NIGHTGATE_FEE_SPONSOR_SESSION;
+            spy.mockRestore();
+        }
+    });
+
     it('a NON-UUID sentinel string never starts a job (what a string sentinel would hit)', async () => {
         let jobId: string | undefined;
         try {

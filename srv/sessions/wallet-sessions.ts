@@ -20,23 +20,30 @@ import {
     estimateSendNightFee
 } from '../submission/token-ops';
 import { ensureNetworkId } from '../midnight/providers';
-import { getOrBuildWalletFacade, hasWalletFacade } from '../submission/wallet-facade-builder';
+import { getOrBuildWalletFacade, hasWalletFacade, getFacadeOrigin } from '../submission/wallet-facade-builder';
 import { walletWaitForSyncedState, walletGetSyncProgress } from '../midnight/wallet-worker-client';
 import {
     resolveNightgateRuntimeConfig, getNightgatePluginConfig, mainnetSubmissionBlockReason,
     getConfiguredNightgateNetwork, normalizeNightgateNetwork
 } from '../utils/nightgate-config';
-import { startJob, registerBackgroundJobProcessor, runWithoutAmbientTx, supersedeQueuedJobs, type BackgroundJobRow } from '../submission/background-jobs';
+import { startJob, registerBackgroundJobProcessor, runWithoutAmbientTx, supersedeQueuedJobs, findLatestJob, JobAdmissionBusyError, type BackgroundJobRow } from '../submission/background-jobs';
 import { reportExternalExecution } from '../submission/job-execution-context';
 import { mnemonicToBip39SeedHex } from '../utils/wallet-hd';
 import { deriveWalletInfo, resolveBip39SeedHex, deriveViewingKeyForAccount } from '../utils/wallet-info';
 import { resolveFeeSponsor, ensureFeeSponsorFacade, FeeSponsorError, getConfiguredFeeSponsorSessions } from '../submission/fee-sponsor';
 import { isSessionExpired } from '../utils/session-expiry';
 
-// Upper bound for the prewarm sync-to-tip wait
+// Absolute ceiling for the prewarm sync-to-tip wait; the primary bound is
+// lack of progress (NIGHTGATE_PREWARM_STALL_MS, worker default 10 min).
 const PREWARM_SYNC_TIMEOUT_MS = Number(
-    process.env.NIGHTGATE_PREWARM_SYNC_TIMEOUT_MS || 3 * 60 * 60 * 1000
+    process.env.NIGHTGATE_PREWARM_SYNC_TIMEOUT_MS || 12 * 60 * 60 * 1000
 );
+const PREWARM_STALL_MS = process.env.NIGHTGATE_PREWARM_STALL_MS !== undefined
+    ? Number(process.env.NIGHTGATE_PREWARM_STALL_MS)
+    : undefined; // worker default
+// A getWalletSyncProgress snapshot older than this is reported `stale`; the
+// worker pushes every ~15 s while a wait runs.
+const SYNC_PROGRESS_STALE_S = Number(process.env.NIGHTGATE_SYNC_PROGRESS_STALE_S ?? 60);
 
 // Bounded sync gate for facade-backed READ actions (getWalletBalance and the
 // fee estimates): a facade still catching up must not park the request for
@@ -49,6 +56,22 @@ const readSyncTimeoutMs = (): number | undefined =>
     WALLET_READ_SYNC_TIMEOUT_MS > 0 ? WALLET_READ_SYNC_TIMEOUT_MS : undefined;
 
 /**
+ * `startJob` for wallet actions that do not go through `runSubmission`: a busy
+ * admission is the same retryable 503 with `Retry-After`.
+ */
+async function startJobOrRetryAfter(req: Request, input: Parameters<typeof startJob>[0]): Promise<Awaited<ReturnType<typeof startJob>>> {
+    try {
+        return await startJob(input);
+    } catch (err) {
+        if (err instanceof JobAdmissionBusyError) {
+            try { (req as any).http?.res?.set?.('Retry-After', String(err.retryAfterSeconds)); } catch { /* courtesy header */ }
+            return req.reject({ status: err.httpStatus, code: err.code, message: err.message, $sanitize: false } as any);
+        }
+        throw err;
+    }
+}
+
+/**
  * Map a wallet-worker read failure onto the OData response: a sync-gate
  * timeout is a retryable 503 with a stable code (`WALLET_SYNCING`), everything
  * else stays a 500 with the worker's message.
@@ -56,10 +79,14 @@ const readSyncTimeoutMs = (): number | undefined =>
 function rejectWorkerReadError(req: Request, action: string, err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
     if (/sync timeout/i.test(msg)) {
+        // `$sanitize: false`: CAP strips every 5xx message in production; this
+        // one is the retry advice.
+        try { (req as any).http?.res?.set?.('Retry-After', '15'); } catch { /* courtesy header */ }
         return req.reject({
             code: 'WALLET_SYNCING',
             status: 503,
-            message: `${action}: wallet is still syncing to the indexer tip; retry shortly`
+            message: `${action}: wallet is still syncing to the indexer tip; retry shortly`,
+            $sanitize: false
         } as any);
     }
     return req.reject(500, `${action} failed: ${msg}`);
@@ -155,7 +182,7 @@ async function executeWalletCommand(raw: unknown, job: BackgroundJobRow, db: any
     await getOrBuildWalletFacade(accountId, { seedHex, ...facadeConfig });
 
     if (command.op === 'prewarm') {
-        await walletWaitForSyncedState(accountId, PREWARM_SYNC_TIMEOUT_MS);
+        await walletWaitForSyncedState(accountId, PREWARM_SYNC_TIMEOUT_MS, PREWARM_STALL_MS);
         return { ready: true };
     }
     if (command.op === 'registerDust') {
@@ -164,7 +191,9 @@ async function executeWalletCommand(raw: unknown, job: BackgroundJobRow, db: any
             cacheKey: accountId, seedHex, facadeConfig,
             dustReceiverAddress: command.dustReceiverAddress || undefined
         });
-        return { txId: result.txId ?? '', registeredCount: result.registeredCount, totalNightUtxos: result.totalNightUtxos, dustReceiverAddress: result.dustReceiverAddress };
+        // The worker reports the outcome (changed/reason, applied receiver,
+        // resulting registered-UTXO count); passed through whole.
+        return { ...result, txId: result.txId ?? '' };
     }
     if (command.op === 'deregisterDust') {
         const sponsor = command.sponsorSessionId
@@ -681,7 +710,7 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
 
         // Detach the worker round-trip so the client polls job status instead of
         // waiting for the whole registration.
-        return startJob({
+        return startJobOrRetryAfter(req, {
             kind: 'registerForDustGeneration',
             sessionId,
             idempotencyKey,
@@ -736,7 +765,7 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
             }
         }
 
-        return startJob({
+        return startJobOrRetryAfter(req, {
             kind: 'deregisterFromDustGeneration',
             sessionId,
             idempotencyKey,
@@ -802,7 +831,7 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
             return req.reject(410, 'Session expired');
         }
 
-        return startJob({
+        return startJobOrRetryAfter(req, {
             kind: 'sendNight',
             sessionId,
             idempotencyKey,
@@ -1062,15 +1091,34 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
         // Main-thread cache read: no worker round trip, so a saturated worker
         // cannot make its own progress unreadable.
         const p = walletGetSyncProgress(sess.accountId);
+        // The prewarm job behind the numbers: a frozen snapshot plus a job
+        // that is no longer running is the diagnosis.
+        const prewarmJob = await findLatestJob('connectWalletForSigning', sessionId);
+        // Restored snapshot (minutes of delta) or cold start (hours from
+        // zero); null while no facade exists for the account.
+        const origin = getFacadeOrigin(sess.accountId);
+        const originFields = {
+            restoredFromSnapshot: origin ? origin.restoredFromSnapshot : null,
+            snapshotSavedAt: origin?.snapshotSavedAt ?? null,
+            facadeBuildStartedAt: origin?.buildStartedAt ?? null,
+            facadeBuiltAt: origin?.builtAt ?? null
+        };
         if (!p) {
             return {
                 known: false, caughtUp: false,
                 appliedIndex: null, streamTip: null, behindEvents: null,
                 eventsPerSecond: null, etaSeconds: null, blockHeight: null,
                 isConnected: false, indexerFresh: false,
-                elapsedMs: null, phase: null, updatedAt: null
+                elapsedMs: null, phase: null, updatedAt: null,
+                lastProgressAt: null, staleSeconds: null, stale: false,
+                jobId: prewarmJob?.ID ?? null, jobStatus: prewarmJob?.status ?? null,
+                ...originFields
             };
         }
+        // Age of the reading, derived once here; past the threshold the
+        // numbers describe a sync nobody is running any more.
+        const updatedAtMs = Date.parse(p.updatedAt);
+        const staleSeconds = Number.isFinite(updatedAtMs) ? Math.max(0, Math.round((Date.now() - updatedAtMs) / 1000)) : null;
         return {
             known: true,
             caughtUp: p.caughtUp,
@@ -1084,7 +1132,13 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
             indexerFresh: p.indexerFresh,
             elapsedMs: p.elapsedMs,
             phase: p.label,
-            updatedAt: p.updatedAt
+            updatedAt: p.updatedAt,
+            lastProgressAt: p.lastProgressAt ?? null,
+            staleSeconds,
+            stale: staleSeconds != null && staleSeconds > SYNC_PROGRESS_STALE_S,
+            jobId: prewarmJob?.ID ?? null,
+            jobStatus: prewarmJob?.status ?? null,
+            ...originFields
         };
     });
 

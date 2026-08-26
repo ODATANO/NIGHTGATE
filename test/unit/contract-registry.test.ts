@@ -6,6 +6,8 @@
  */
 
 import path from 'path';
+import fs from 'fs';
+import os from 'os';
 import {
     registerContract,
     unregisterContract,
@@ -88,6 +90,16 @@ describe('artifact generation digest', () => {
         privateStateId: 'vault',
         zkConfigPath: REPO
     };
+
+    // The worker's recomputed generation is byte-identical to the registry's; jobs and evidence are pinned to it.
+    test('computeArtifactGenerationDigest (shared module, used by the worker) equals the registry digest', async () => {
+        const { computeArtifactGenerationDigest } = await import('../../srv/submission/artifact-digest.js');
+        registerContract('parity-vault', VAULT);
+        registerContract('parity-other', OTHER);
+        for (const name of ['parity-vault', 'parity-other']) {
+            expect(computeArtifactGenerationDigest(getContractRegistration(name)!)).toBe(getArtifactGenerationDigest(name));
+        }
+    });
 
     test('digest is deterministic and covers the artifact + verifier keys', () => {
         registerContract('gen', VAULT);
@@ -311,7 +323,7 @@ describe('resolveContract', () => {
             privateStateId: 'fixturePS',
             zkConfigPath: '/zk/fixture'
         });
-        const resolved = await resolveContract('fixture');
+        const resolved = await resolveContract('fixture', undefined, { compile: true }); // compile is opt-in: production jobs compile in the worker
 
         expect(resolved.privateStateId).toBe('fixturePS');
         expect(resolved.zkConfigPath).toBe('/zk/fixture');
@@ -329,3 +341,46 @@ describe('resolveContract', () => {
         await expect(resolveContract('nope')).rejects.toThrow(/known/);
     });
 });
+
+// A CommonJS digest gained a module-format section in 0.21.0; the 0.20 form recorded on jobs/evidence
+// stays accepted for an unchanged artifact. ESM digests never changed.
+describe('artifact digest: pre-0.21.0 CommonJS digests stay accepted after the upgrade', () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ng-legacy-digest-'));
+    const cjsDir = path.join(tmp, 'cjs');
+    fs.mkdirSync(path.join(cjsDir, 'contract'), { recursive: true });
+    fs.writeFileSync(path.join(cjsDir, 'package.json'), '{"type":"commonjs"}');
+    fs.writeFileSync(path.join(cjsDir, 'contract', 'index.js'), 'exports.Contract = class Contract {};\n');
+    const CJS = { artifactPath: path.join(cjsDir, 'contract', 'index.js'), privateStateId: 'legacy', zkConfigPath: cjsDir };
+
+    it('assertArtifactGeneration and resolveContract accept the legacy (0.20) form of a CommonJS digest, not a foreign one', async () => {
+        const { computeArtifactGenerationDigest, artifactGenerationMatch } = await import('../../srv/submission/artifact-digest.js');
+        registerContract('legacy-cjs', CJS);
+        const current = getArtifactGenerationDigest('legacy-cjs');
+        const legacy = computeArtifactGenerationDigest(CJS, { legacyModuleFormat: true });
+        expect(legacy).not.toBe(current);
+        expect(artifactGenerationMatch(CJS, legacy)).toBe('legacy');
+        expect(artifactGenerationMatch(CJS, current)).toBe('current');
+        expect(artifactGenerationMatch(CJS, 'f'.repeat(64))).toBeNull();
+        expect(() => assertArtifactGeneration('legacy-cjs', legacy, 'a 0.20 job')).not.toThrow();
+        expect(() => assertArtifactGeneration('legacy-cjs', current, 'a 0.21 job')).not.toThrow();
+        expect(() => assertArtifactGeneration('legacy-cjs', 'f'.repeat(64), 'a foreign job')).toThrow(/different generation/);
+        const resolved = await resolveContract('legacy-cjs', legacy);
+        expect(resolved.artifactDigest).toBe(current); // the worker is pinned to the CURRENT form
+        await expect(resolveContract('legacy-cjs', 'f'.repeat(64))).rejects.toThrow(/Refusing to load a different generation/);
+    });
+
+    it('an ESM artifact has no legacy form (its digest did not change)', async () => {
+        const { computeArtifactGenerationDigest, artifactGenerationMatch } = await import('../../srv/submission/artifact-digest.js');
+        expect(computeArtifactGenerationDigest(VAULT_FIXTURE(), { legacyModuleFormat: true })).toBe(computeArtifactGenerationDigest(VAULT_FIXTURE()));
+        expect(artifactGenerationMatch(VAULT_FIXTURE(), computeArtifactGenerationDigest(VAULT_FIXTURE()))).toBe('current');
+    });
+});
+
+function VAULT_FIXTURE() {
+    const REPO = path.resolve(__dirname, '../..');
+    return {
+        artifactPath: path.join(REPO, 'contracts/attestation-vault/src/managed/attestation-vault/contract/index.js'),
+        privateStateId: 'vault',
+        zkConfigPath: path.join(REPO, 'contracts/attestation-vault/src/managed/attestation-vault')
+    };
+}

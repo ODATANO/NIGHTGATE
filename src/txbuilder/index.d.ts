@@ -5,7 +5,10 @@
 export interface PreparedCall {
     circuitId: string;
     args: Array<Uint8Array | bigint | boolean[]>;
-    witnesses: object;
+    /** The contract's witness functions. Optional on a batch entry when the batch carries shared `witnesses`. */
+    witnesses?: object;
+    /** Batch only: runs immediately before this call, to swap per-call state in the shared witnesses. */
+    before?: () => void;
     /**
      * Raw proof bundle passthrough (proof helpers only): the batch path
      * rebinds it through a shared witness holder. Absent on the
@@ -18,10 +21,12 @@ export interface PreparedCall {
 
 export interface ZkAssetResult {
     cacheDir: string;
-    /** Files downloaded on this run. */
+    /** Files downloaded on this run; 0 with `zkConfigDir`. */
     fetched: number;
-    /** Files already present in the cache. */
+    /** Files already present in the cache. With `zkConfigDir`: the verified files, i.e. every circuit's verifier key plus prover key and bzkir of the circuits to prove. */
     cached: number;
+    /** `'remote'`: a public `/zk-config`; `'local'`: `zkConfigDir`. */
+    source?: 'remote' | 'local';
 }
 
 export interface EnsureZkAssetsInput {
@@ -55,13 +60,19 @@ export interface CreateTxBuilderInput {
      * sponsor's. Explicit opt-in on purpose.
      */
     provingMode?: 'wasm' | 'server';
-    /** A public `/zk-config/<contract>`; assets are fetched once and cached. */
-    zkConfigBaseUrl: string;
+    /** A public `/zk-config/<contract>`; assets are fetched once and cached. Optional when `zkConfigDir` is given. */
+    zkConfigBaseUrl?: string;
+    /**
+     * Local directory holding `keys/` and `zkir/` (a contract the sponsor does not serve).
+     * Nothing is fetched; the verifier keys must cover every circuit of `contractClass`.
+     */
+    zkConfigDir?: string;
     /** The compiled contract class, e.g. from `@odatano/nightgate/browser/attestation-vault`. */
     contractClass: Function;
     contractName?: string;
     privateStateId?: string;
     cacheDir?: string;
+    /** Circuits to fetch prover keys + zkir for; verifier keys cover the whole contract. Default: every circuit of `contractClass`, else the vault's set. */
     circuits?: string[];
     /** Transaction TTL in minutes (default 30): the sponsor must submit within it. */
     ttlMinutes?: number;
@@ -74,25 +85,25 @@ export interface BuildSponsorableInput {
     /** ONE call (mutually exclusive with `calls`). */
     call?: PreparedCall;
     /**
-     * BATCH: up to 8 calls in ONE transaction (one balancing round, one fee
-     * event; apply order = array order, fail-closed segment ordering, and
-     * the causality pre-check aborts BEFORE proving with
-     * `code: 'BatchCausalityViolation'`). Per-call `witnesses` are IGNORED:
-     * one shared witnesses object (this builder's attestation secret, or
-     * `attestationSecret` below) serves all calls via a proof holder that
-     * swaps each entry's `merkleProof`. Prepare every batched call with the
-     * SAME secret. Same-named calls are indistinguishable to the segment
-     * ordering (relative order among them is NOT guaranteed), so duplicates
-     * are safe only when order-independent among themselves: GROUP them,
-     * e.g. both attests before both anchors. Put the most expensive call
-     * LAST (the causality pre-check aborts BEFORE proving otherwise, no
-     * fee). On a transient 1010/104 submit reject, REBUILD the batch and
-     * hand fresh bytes to the sponsor; resubmitting identical bytes tends
-     * to stay stuck. `bind: false` refuses a batch moving value, and every
+     * Batch: up to 8 calls in one transaction. Apply order = array order, segment
+     * ordering fail-closed, causality pre-check aborts before proving with
+     * `code: 'BatchCausalityViolation'`: put the most expensive call last.
+     * One witnesses object serves the batch: the `witnesses` input, else the
+     * object every entry carries when it is the same one, else (attestation-vault
+     * family only) the builder's own; anything else is refused up front. Per-call
+     * state goes through the entries' `before` hooks; every batched vault call
+     * must be prepared with the same secret. Same-named calls are unordered among
+     * themselves: group them. On a 1010/104 reject rebuild the batch, do not
+     * resubmit identical bytes. `bind: false` refuses a value-moving batch; every
      * circuit must be on the sponsor's allow-list.
      */
     calls?: PreparedCall[];
-    /** Batch only: overrides the builder's own secret for the shared witnesses. */
+    /**
+     * Batch only: one shared witnesses object for any contract (a Compact instance
+     * binds its witnesses once); per-call state goes through the entries' `before` hooks.
+     */
+    witnesses?: object;
+    /** Batch only (vault family): overrides the builder's own secret for the shared witnesses. */
     attestationSecret?: Uint8Array;
     initialPrivateState?: unknown;
     /** true (default): FINALIZED handover (sponsorFinalizedTransaction).
@@ -130,9 +141,39 @@ export interface TxBuilder {
     buildSponsorable(input: BuildSponsorableUnboundInput): Promise<BuiltUnboundTransaction>;
     buildSponsorable(input: BuildSponsorableBoundInput): Promise<BuiltBoundTransaction>;
     buildSponsorable(input: BuildSponsorableInput): Promise<BuiltTransaction>;
+    /**
+     * 0.21.0: build + prove + sign a contract deploy without submitting; the caller's
+     * key signs it, a sponsor pays the dust. Sponsoring needs
+     * `NIGHTGATE_SPONSOR_ALLOW_DEPLOY` on the server and, for a token caller,
+     * `allowDeploy` with budget left on the grant. The landed address is recorded
+     * in the grant's `deployedContracts` and sponsorable on top of the allow-list.
+     * `contractAddress` is read off the deploy action before anything is submitted.
+     */
+    buildDeploySponsorable(input: BuildDeploySponsorableUnboundInput): Promise<BuiltUnboundDeploy>;
+    buildDeploySponsorable(input?: BuildDeploySponsorableBoundInput): Promise<BuiltBoundDeploy>;
+    buildDeploySponsorable(input: BuildDeploySponsorableInput): Promise<BuiltDeploy>;
     close(): Promise<void>;
 }
 
+export interface BuildDeploySponsorableInput {
+    /** Initial private state for `privateStateId`; lives in this process only. */
+    initialPrivateState?: unknown;
+    /** Public constructor arguments of the contract, in declaration order. */
+    constructorArgs?: unknown[];
+    /** Witnesses the constructor needs; vacant when omitted. */
+    witnesses?: object;
+    bind?: boolean;
+}
+export interface BuildDeploySponsorableBoundInput extends BuildDeploySponsorableInput { bind?: true; }
+export interface BuildDeploySponsorableUnboundInput extends BuildDeploySponsorableInput { bind: false; }
+export interface BuiltBoundDeploy extends BuiltBoundTransaction { contractAddress: string; }
+export interface BuiltUnboundDeploy extends BuiltUnboundTransaction { contractAddress: string; }
+export type BuiltDeploy = BuiltBoundDeploy | BuiltUnboundDeploy;
+/** The contract address a built deploy transaction creates; throws unless exactly one deploy action is present. */
+export declare function readDeployAddress(tx: unknown): string;
+
 export declare const ATTESTATION_VAULT_CIRCUITS: string[];
 export declare function ensureZkAssets(input: EnsureZkAssetsInput): Promise<ZkAssetResult>;
+/** Checks a local keys/ + zkir/ directory and describes it as a `ZkAssetResult` (`source: 'local'`, nothing fetched). */
+export declare function describeLocalZkAssets(zkConfigDir: string, circuits?: string[], proveCircuits?: string[]): Promise<ZkAssetResult>;
 export declare function createTxBuilder(opts: CreateTxBuilderInput): Promise<TxBuilder>;

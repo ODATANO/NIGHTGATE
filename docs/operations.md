@@ -12,6 +12,7 @@ Running NIGHTGATE day-to-day. Audience: anyone deploying it, debugging a stuck s
 | `npm run sync:start` | Bootstrap a wallet session | Calls `connectWallet` + `connectWalletForSigning` against `localhost:4004`, reads keys from `.env` |
 | `npm run sync:probe` | Check local indexer container | Verifies `localhost:8088` is up + returning data |
 | `npm run deploy:e2e` | End-to-end deploy flow | `sync:start` + `registerForDustGeneration` + 90 s wait + `deployContract(counter)` |
+| `npm run sponsored-deploy:e2e` | Sponsored DEPLOY under an agent grant (0.21.0) | grant with `allowDeploy`/`maxDeploys: 1` -> txbuilder `buildDeploySponsorable` (caller key) -> `sponsorUnboundTransaction` under the token -> follow-up call on the landed address under the same token -> second deploy refused. `NIGHTGATE_GRANT_CONTRACTS=<a>,<b>` puts more contracts on the grant; prints `GRANT_TOKEN`/`SPONSOR_SESSION` for `burst-sponsor:e2e` (`NIGHTGATE_AGENT_TOKEN`) |
 | `npm run wasm-proving:e2e` | Verify in-process proving (server on `NIGHTGATE_PROVING_MODE=wasm`) | NIGHT self-transfer proved without a proof server; strongest with a dead `NIGHTGATE_PROOF_SERVER_URL` |
 | `npm run wasm-contract:e2e` | Verify contract flow under wasm mode | `deployContract(counter)` + `increment()`; in wasm mode both prove in-process |
 | `npm run wasm-zswap:e2e` | Measure zswap circuits in-process | Deploys `shielded-token`, mints, shielded self-transfer via `sendNight` `tokenTypeHex` |
@@ -141,6 +142,22 @@ Healthy progression looks like:
 - `du` may *shrink slightly* between saves (dust UTXOs expire) - that's normal live-tip behavior
 
 If you see `sh` or `du` shrink dramatically, the SDK is probably revalidating during restore; the new value is the post-validation form. Not corruption.
+
+## Upgrading to 0.21.0
+
+Six nullable columns on `AgentGrants` (`allowedContracts`, `allowedCircuits`,
+`allowDeploy`, `maxDeploys`, `deploysUsed`, `deployedContracts`) and one table
+(`ContractRegistrations`); same migration command as below, once, with the
+server stopped. Existing grants keep working unchanged (they inherit the
+floor and hold no deploy right). Nothing else changes shape; the startup
+preflight names any column that is missing.
+
+Afterwards a consumer is onboarded on the running server: put the artifact
+under `NIGHTGATE_CONTRACTS_DIR`, call the admin action `registerContract`,
+then `createAgentGrant` with `allowedContracts` naming that contract. No
+restart, no container recreate, the sponsor pool stays warm. The platform
+allow-list itself can move from the two env variables into
+`NIGHTGATE_SPONSOR_POLICY_FILE` under the data volume (re-read per call).
 
 ## Upgrading to 0.20.0
 

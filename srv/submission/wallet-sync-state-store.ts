@@ -64,6 +64,8 @@ export interface LoadedSyncState {
     shielded?: string;
     unshielded?: string;
     dust?: string;
+    /** When the snapshot was last saved (row updatedAt); a reconnect resumes from it. */
+    savedAt?: string | null;
 }
 
 // ---- DB handle cache ------------------------------------------------------
@@ -329,7 +331,7 @@ export async function loadSyncState(args: LoadSyncStateArgs): Promise<LoadedSync
     }
 
     try {
-        const result: LoadedSyncState = {};
+        const result: LoadedSyncState = { savedAt: row.updatedAt ?? null };
         if (row.shieldedStateBlob) {
             result.shielded = decryptWithPassword(row.shieldedStateBlob, passphrase);
         }

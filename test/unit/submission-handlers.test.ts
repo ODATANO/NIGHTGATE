@@ -47,7 +47,9 @@ const mockStartJob = vi.hoisted(() => (vi.fn(async (args: any) => {
 const registeredProcessors = vi.hoisted(() => new Map<string, (command: unknown, row: any) => Promise<unknown>>());
 const childCommandLog = vi.hoisted(() => [] as Array<{ kind: string; step: string; command: any }>);
 const registeredFinalizers = vi.hoisted(() => new Map<string, (command: unknown, row: any, evidence: any) => Promise<unknown>>());
-vi.mock('../../srv/submission/background-jobs', () => ({
+vi.mock('../../srv/submission/background-jobs', async (importOriginal) => ({
+    // The real error class: runSubmission narrows on `instanceof`.
+    JobAdmissionBusyError: (await importOriginal<typeof import('../../srv/submission/background-jobs')>()).JobAdmissionBusyError,
     startJob: (...args: unknown[]) => (mockStartJob as any)(...args),
     runChildCommand: async (args: any) => {
         const processor = registeredProcessors.get(`${args.kind}\0${args.commandVersion}`);
@@ -75,6 +77,7 @@ vi.mock('../../srv/submission/background-jobs', () => ({
 }));
 
 import { registerSubmissionHandlers } from '../../srv/submission/handlers';
+import { JobAdmissionBusyError } from '../../srv/submission/background-jobs';
 import {
     SubmissionError,
     type TransactionSubmitter
@@ -157,7 +160,8 @@ const RESOLVED_CONTRACT_FIXTURE = {
     compiledContract: {},
     privateStateId: 'demo',
     zkConfigPath: '/tmp/managed',
-    artifactPath: '/tmp/managed/contract/index.js'
+    artifactPath: '/tmp/managed/contract/index.js',
+    artifactDigest: 'a'.repeat(64)
 };
 
 function makeSuccessfulSubmitter() {
@@ -586,6 +590,20 @@ describe('error translation to OData status codes', () => {
         const req = makeReq({ ...VALID_DEPLOY_ARGS, sessionId: 'session-501' });
         await srv.handlers['deployContract'](req);
         expect(req.reject).toHaveBeenCalledWith(501, expect.stringMatching(/Wallet material unavailable/));
+    });
+
+    test('a busy admission rejects 503 with a stable code, Retry-After, and $sanitize:false', async () => {
+        mockStartJob.mockRejectedValueOnce(new JobAdmissionBusyError('deployContract'));
+        const srv = setupHandlers();
+        const setHeader = vi.fn();
+        const req = { ...makeReq({ ...VALID_DEPLOY_ARGS, sessionId: 'session-busy' }), http: { res: { set: setHeader } } };
+        await srv.handlers['deployContract'](req);
+        // Rejected as an object: a (status, message) pair loses the code and is sanitised to `Service Unavailable` in production.
+        expect(req.reject).toHaveBeenCalledWith(expect.objectContaining({
+            status: 503, code: 'JOB_ADMISSION_BUSY', $sanitize: false,
+            message: expect.stringMatching(/nothing was submitted, retry/)
+        }));
+        expect(setHeader).toHaveBeenCalledWith('Retry-After', '2');
     });
 
     // SubmissionError no longer surfaces via OData. It now

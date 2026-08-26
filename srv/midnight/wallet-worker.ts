@@ -27,9 +27,13 @@
 
 import { parentPort, MessageChannel, type MessagePort } from 'node:worker_threads';
 import path from 'node:path';
+import fs from 'node:fs';
+import os from 'node:os';
+import crypto from 'node:crypto';
 import { pathToFileURL } from 'node:url';
 import { classificationHaystack, formatErr, formatErrWithCauses, safeDeepInspect } from '../utils/format-error';
 import { deriveIndexerWsUrl } from '../utils/indexer-url';
+import { computeArtifactGenerationDigest, effectiveModuleFormat } from '../submission/artifact-digest';
 import { runBatchInScope } from './batch-call-scope';
 import { buildWasmProofProvider, getSharedKeyMaterialProvider } from './wasm-proof-provider';
 import {
@@ -245,6 +249,8 @@ async function loadContractsSdk(): Promise<{
 
 interface ContractRegistration {
     artifactPath: string;
+    /** Generation digest the main thread resolved (module + verifier keys); keys the module cache. */
+    artifactDigest?: string;
     privateStateId: string;
     zkConfigPath: string;
     /** Content-tree width of a vault-family artifact (16 default, 32 for attestation-vault-32). */
@@ -260,19 +266,440 @@ interface ContractRegistration {
 interface ContractScaffold {
     contractClass: any;
 }
-const contractScaffolds = new Map<string, ContractScaffold>();
 
-async function getContractScaffold(name: string, registration: ContractRegistration): Promise<ContractScaffold> {
-    const cached = contractScaffolds.get(name);
+/** Insertion-ordered bounded map: `get` refreshes, `set` evicts the oldest entry past `max`. */
+export class BoundedCache<K, V> {
+    private readonly map = new Map<K, V>();
+    constructor(private readonly max: number, private readonly onEvict?: (key: K, value: V) => void) {}
+    get(key: K): V | undefined {
+        const v = this.map.get(key);
+        if (v !== undefined) { this.map.delete(key); this.map.set(key, v); }
+        return v;
+    }
+    set(key: K, value: V): void {
+        this.map.delete(key);
+        this.map.set(key, value);
+        while (this.map.size > this.max) {
+            const oldest = this.map.keys().next().value as K;
+            const evicted = this.map.get(oldest) as V;
+            this.map.delete(oldest);
+            try { this.onEvict?.(oldest, evicted); } catch { /* eviction hooks are best effort */ }
+        }
+    }
+    has(key: K): boolean { return this.map.has(key); }
+    delete(key: K): boolean { return this.map.delete(key); }
+    get size(): number { return this.map.size; }
+    keys(): K[] { return [...this.map.keys()]; }
+}
+
+/** Artifact generations kept warm (classes, zk config + proving providers); NIGHTGATE_WORKER_GENERATION_CACHE, default 8. */
+function generationCacheSize(): number {
+    const n = Number(process.env.NIGHTGATE_WORKER_GENERATION_CACHE);
+    return Number.isInteger(n) && n >= 1 ? n : 8;
+}
+const contractScaffolds = new BoundedCache<string, ContractScaffold>(generationCacheSize(), (key) => onGenerationEvicted(key.split('\0')[2] ?? ''));
+
+/** Test seam: drop every cached class. Node's ESM cache keeps the modules. */
+export function __resetScaffoldCacheForTests(): void {
+    for (const k of contractScaffolds.keys()) contractScaffolds.delete(k);
+}
+
+export async function getContractScaffold(name: string, registration: ContractRegistration): Promise<ContractScaffold> {
+    // Keyed by name, artifact path and generation digest: a registry name is a
+    // mutable alias and a revision can be rewritten in place under one path.
+    // The class is imported from the generation's verified immutable snapshot.
+    const generation = registration.artifactDigest ?? '';
+    const key = `${name}\0${registration.artifactPath}\0${generation}`;
+    const cached = contractScaffolds.get(key);
     if (cached) return cached;
-    const importSpec = path.isAbsolute(registration.artifactPath)
-        ? pathToFileURL(registration.artifactPath).href
-        : registration.artifactPath;
-    const mod: any = await import(importSpec);
+    let mod: any;
+    if (generation) {
+        const snapshot = materializeArtifactSnapshot(name, registration);
+        mod = await importArtifactGeneration(snapshot!.modulePath, generation);
+        noteGenerationImported(generation);
+    } else {
+        // No digest on the registration (pre-0.21 caller): nothing to pin to.
+        mod = await importArtifactGeneration(registration.artifactPath, generation);
+    }
     const contractClass = mod.Contract ?? mod.default ?? mod;
     const scaffold: ContractScaffold = { contractClass };
-    contractScaffolds.set(name, scaffold);
+    contractScaffolds.set(key, scaffold);
     return scaffold;
+}
+
+// ---- Content-addressed artifact snapshots ---------------------------------
+
+/**
+ * Immutable content-addressed snapshot of one artifact generation:
+ * `<root>/<digest>/{module/artifact.<ext>,keys,zkir}`, root = NIGHTGATE_ARTIFACT_SNAPSHOT_DIR
+ * or the OS temp dir. The SDK reads keys/zkir lazily at proving time and Node reads the
+ * module at `import()`, so neither ever gets the mutable registration directory.
+ * Built under a temp name, verified against the pinned digest, renamed into place, never
+ * written again. The root links `node_modules` to the worker's own so the bare
+ * `@midnight-ntwrk/compact-runtime` import resolves to the pinned runtime. A snapshot is
+ * swept when evicted from the bounded caches with no job holding it (retainGeneration);
+ * stale ones (NIGHTGATE_ARTIFACT_SNAPSHOT_TTL_DAYS, default 14) and `.tmp-*` builds are
+ * swept once per process at first use. Node's ESM module cache is not bounded by any of this.
+ */
+export interface ArtifactSnapshot {
+    digest: string;
+    /** Immutable directory holding keys/ and zkir/ of this generation. */
+    zkConfigPath: string;
+    /** The module inside the snapshot; the class is imported from here. */
+    modulePath: string;
+}
+const verifiedSnapshots = new Set<string>();
+let snapshotRootPrepared: string | null = null;
+const SNAPSHOT_ROOT_MARKER = '.nightgate-snapshot-root';
+
+/** The configured or default base; the per-install and per-process levels live below it. */
+export function artifactSnapshotBase(): string {
+    const configured = process.env.NIGHTGATE_ARTIFACT_SNAPSHOT_DIR?.trim();
+    return configured || path.join(os.tmpdir(), 'nightgate-artifact-snapshots');
+}
+
+/** One level per installation (the node_modules the runtime resolves from); two installs never share a link. */
+function installKey(): string {
+    return crypto.createHash('sha256').update(runtimeNodeModulesDir()).digest('hex').slice(0, 16);
+}
+
+/**
+ * This process's snapshot root: `<base>/<install>/<pid>`. Snapshots, the node_modules
+ * link, refcounts and evictions are process-local; another NIGHTGATE process cannot
+ * repoint the link or sweep a snapshot in use here. Dead-process roots are removed in
+ * prepareSnapshotRoot.
+ */
+export function artifactSnapshotRoot(): string {
+    return path.join(artifactSnapshotBase(), installKey(), String(process.pid));
+}
+
+function processAlive(pid: number): boolean {
+    if (!Number.isInteger(pid) || pid <= 0) return false;
+    try { process.kill(pid, 0); return true; } catch (e) { return (e as NodeJS.ErrnoException)?.code === 'EPERM'; }
+}
+
+/** Test seam: forget which snapshots this process verified and prepared. */
+export function __resetArtifactSnapshotsForTests(): void {
+    verifiedSnapshots.clear();
+    snapshotRootPrepared = null;
+    generationRefs.clear();
+}
+
+function snapshotTtlMs(): number {
+    const days = Number(process.env.NIGHTGATE_ARTIFACT_SNAPSHOT_TTL_DAYS);
+    return (Number.isFinite(days) && days >= 0 ? days : 14) * 24 * 60 * 60 * 1000;
+}
+
+/** The node_modules directory the worker itself resolves compact-runtime from. */
+function runtimeNodeModulesDir(): string {
+    const resolved = require.resolve('@midnight-ntwrk/compact-runtime');
+    const idx = resolved.lastIndexOf(`${path.sep}node_modules${path.sep}`);
+    if (idx < 0) throw new Error(`cannot locate the node_modules directory of @midnight-ntwrk/compact-runtime (resolved to ${resolved})`);
+    return resolved.slice(0, idx + `${path.sep}node_modules`.length);
+}
+
+/** Once per process: create the root, link its node_modules, sweep stale snapshots and leftover temp builds. */
+function prepareSnapshotRoot(): string {
+    const root = artifactSnapshotRoot();
+    if (snapshotRootPrepared === root) return root;
+    fs.mkdirSync(root, { recursive: true });
+    // Only a link this code created (marker present, entry is a link) is replaced;
+    // a real node_modules directory or a foreign link fails closed.
+    const marker = path.join(root, SNAPSHOT_ROOT_MARKER);
+    const link = path.join(root, 'node_modules');
+    const target = runtimeNodeModulesDir();
+    let linkOk = false;
+    let current: fs.Stats | null = null;
+    try { current = fs.lstatSync(link); } catch { current = null; }
+    if (current) {
+        if (!current.isSymbolicLink()) {
+            throw new Error(`artifact snapshot root ${root} contains a real node_modules directory; NIGHTGATE_ARTIFACT_SNAPSHOT_DIR must be a directory of its own (it links node_modules for artifact resolution). Refusing to touch it.`);
+        }
+        try { linkOk = path.resolve(fs.realpathSync(link)) === path.resolve(fs.realpathSync(target)); } catch { linkOk = false; }
+        if (!linkOk) {
+            if (!fs.existsSync(marker)) {
+                throw new Error(`artifact snapshot root ${root} contains a node_modules link NIGHTGATE did not create (no ${SNAPSHOT_ROOT_MARKER} marker); refusing to replace it. Point NIGHTGATE_ARTIFACT_SNAPSHOT_DIR at a directory of its own.`);
+            }
+            fs.rmSync(link, { force: true });
+        }
+    }
+    if (!fs.existsSync(marker)) fs.writeFileSync(marker, 'content-addressed contract artifact snapshots of @odatano/nightgate; safe to delete while no NIGHTGATE is running\n');
+    if (!linkOk) {
+        fs.symlinkSync(target, link, process.platform === 'win32' ? 'junction' : 'dir');
+    }
+    // Sweep 1: roots of dead processes of this installation. A live process, or
+    // one this user cannot signal, keeps its root.
+    const installDir = path.dirname(root);
+    try {
+        for (const entry of fs.readdirSync(installDir)) {
+            const pid = Number(entry);
+            if (!Number.isInteger(pid) || pid === process.pid || processAlive(pid)) continue;
+            const full = path.join(installDir, entry);
+            try {
+                if (fs.lstatSync(full).isDirectory()) {
+                    fs.rmSync(full, { recursive: true, force: true });
+                    log('info', `artifact snapshot sweep: removed root of dead process ${pid}`);
+                }
+            } catch { /* best effort */ }
+        }
+    } catch { /* best effort */ }
+    // Sweep 2: leftover temp builds and snapshots unused within the TTL (mtime is bumped on every use, touchSnapshot).
+    const cutoff = Date.now() - snapshotTtlMs();
+    for (const entry of fs.readdirSync(root)) {
+        if (entry === 'node_modules' || entry === SNAPSHOT_ROOT_MARKER) continue;
+        const full = path.join(root, entry);
+        try {
+            const st = fs.lstatSync(full);
+            if (!st.isDirectory()) continue;
+            if (entry.includes('.tmp-') || st.mtimeMs < cutoff) {
+                fs.rmSync(full, { recursive: true, force: true });
+                log('info', `artifact snapshot sweep: removed ${entry.includes('.tmp-') ? 'leftover build' : 'stale snapshot'} ${entry.slice(0, 24)}…`);
+            }
+        } catch { /* best effort */ }
+    }
+    snapshotRootPrepared = root;
+    return root;
+}
+
+function copyDirFiltered(from: string, to: string, filter: (f: string) => boolean): void {
+    let files: string[] = [];
+    try { files = fs.readdirSync(from).filter(filter).sort(); } catch { return; }
+    if (files.length === 0) return;
+    fs.mkdirSync(to, { recursive: true });
+    for (const f of files) fs.copyFileSync(path.join(from, f), path.join(to, f));
+}
+
+/**
+ * Canonical module name inside a snapshot; the digest is the identity, not the file
+ * name. The extension carries the effective module format (`.mjs`/`.cjs`): the snapshot
+ * lives outside the package scope whose package.json made a `.js` file ESM. The format
+ * is part of the digest.
+ */
+function snapshotModuleName(registration: ContractRegistration): string {
+    return effectiveModuleFormat(registration.artifactPath) === 'module' ? 'artifact.mjs' : 'artifact.cjs';
+}
+
+function snapshotRegistration(dir: string, registration: ContractRegistration) {
+    return {
+        artifactPath: path.join(dir, 'module', snapshotModuleName(registration)),
+        privateStateId: registration.privateStateId,
+        zkConfigPath: dir,
+        ...(registration.slotWidth !== undefined ? { slotWidth: registration.slotWidth } : {})
+    };
+}
+
+/**
+ * Copy a source map next to the snapshot module with its `sourceRoot` made
+ * absolute against the ORIGINAL module directory, so the `sources` it names
+ * keep resolving (they are relative to where the map used to live). An
+ * unparseable map is copied verbatim.
+ */
+function copySourceMapRebased(from: string, to: string, originalDir: string): void {
+    try {
+        const map = JSON.parse(fs.readFileSync(from, 'utf8'));
+        if (map && typeof map === 'object') {
+            // An absolute directory (trailing separator), which is what Node's
+            // and Vite's source-map resolvers prepend to each `sources` entry.
+            map.sourceRoot = path.resolve(originalDir, String(map.sourceRoot ?? '')) + path.sep;
+            fs.writeFileSync(to, JSON.stringify(map));
+            return;
+        }
+    } catch { /* fall through: verbatim copy */ }
+    fs.copyFileSync(from, to);
+}
+
+function touchSnapshot(dir: string): void {
+    try { const now = new Date(); fs.utimesSync(dir, now, now); } catch { /* best effort */ }
+}
+
+export function materializeArtifactSnapshot(name: string, registration: ContractRegistration): ArtifactSnapshot | null {
+    const digest = registration.artifactDigest;
+    if (!digest) return null;
+    const root = prepareSnapshotRoot();
+    const dir = path.join(root, digest);
+    const snapReg = snapshotRegistration(dir, registration);
+    const result: ArtifactSnapshot = { digest, zkConfigPath: dir, modulePath: snapReg.artifactPath };
+
+    if (verifiedSnapshots.has(digest) && fs.existsSync(snapReg.artifactPath)) { touchSnapshot(dir); return result; }
+    if (fs.existsSync(dir)) {
+        let onDisk: string | null = null;
+        try { onDisk = computeArtifactGenerationDigest(snapReg); } catch { onDisk = null; }
+        if (onDisk === digest) { verifiedSnapshots.add(digest); touchSnapshot(dir); return result; }
+        log('warn', `artifact snapshot ${digest.slice(0, 16)}… for '${name}' does not verify (${onDisk ? onDisk.slice(0, 16) + '…' : 'unreadable'}); rebuilding it from the registration`);
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
+
+    const tmp = `${dir}.tmp-${process.pid}-${crypto.randomBytes(4).toString('hex')}`;
+    try {
+        fs.mkdirSync(path.join(tmp, 'module'), { recursive: true });
+        fs.copyFileSync(registration.artifactPath, path.join(tmp, 'module', snapshotModuleName(registration)));
+        // Carry the source map under the name the module's sourceMappingURL names,
+        // so stack traces keep working. Not part of the digest.
+        const mapName = `${path.basename(registration.artifactPath)}.map`;
+        const mapPath = path.join(path.dirname(registration.artifactPath), mapName);
+        if (fs.existsSync(mapPath)) copySourceMapRebased(mapPath, path.join(tmp, 'module', mapName), path.dirname(registration.artifactPath));
+        copyDirFiltered(path.join(registration.zkConfigPath, 'keys'), path.join(tmp, 'keys'), (f) => f.endsWith('.verifier') || f.endsWith('.prover'));
+        copyDirFiltered(path.join(registration.zkConfigPath, 'zkir'), path.join(tmp, 'zkir'), () => true);
+        const built = computeArtifactGenerationDigest(snapshotRegistration(tmp, registration));
+        if (built !== digest) {
+            throw new Error(
+                `Contract '${name}' on disk is artifact generation ${built.slice(0, 16)}… but this job was pinned to ` +
+                `${digest.slice(0, 16)}…; the module or its zk assets changed since the job was resolved. ` +
+                `Refusing to snapshot a different generation; re-register the artifact (or re-issue the action against the current one).`);
+        }
+        try {
+            fs.renameSync(tmp, dir);
+        } catch (e) {
+            // A concurrent job of the same generation won the rename: use its
+            // snapshot if it verifies, otherwise surface the error.
+            if (!fs.existsSync(dir) || computeArtifactGenerationDigest(snapReg) !== digest) throw e;
+        }
+        verifiedSnapshots.add(digest);
+        log('info', `artifact snapshot ${digest.slice(0, 16)}… materialised for '${name}' under ${dir}`);
+        return result;
+    } finally {
+        fs.rmSync(tmp, { recursive: true, force: true });
+    }
+}
+
+// ---- Worker rotation ---------------------------------------------------------
+
+/**
+ * Node's ESM module cache keeps every imported generation for the life of the thread.
+ * After NIGHTGATE_WORKER_MAX_GENERATIONS (default 32, 0 = never) distinct generations the
+ * worker exits at the next idle moment (no RPC in flight, so no session lock held and no
+ * proof running); the main thread respawns it and counts a rotation, not a crash.
+ * A rotation makes the facade set cold (a large dust snapshot deserialises for minutes).
+ */
+const importedGenerations = new Set<string>();
+let rotationPending = false;
+/** Admission closed: in-flight RPCs drain, new ones are refused with WORKER_ROTATING and retried by the client. */
+let draining = false;
+let inflightRpcs = 0;
+export const WORKER_ROTATING = 'WORKER_ROTATING';
+
+function maxGenerationsBeforeRotation(): number {
+    const n = Number(process.env.NIGHTGATE_WORKER_MAX_GENERATIONS);
+    return Number.isInteger(n) && n >= 0 ? n : 32;
+}
+
+/** Records an imported generation; returns true once a rotation is due. */
+export function noteGenerationImported(digest: string): boolean {
+    if (!digest) return rotationPending;
+    importedGenerations.add(digest);
+    const max = maxGenerationsBeforeRotation();
+    if (max > 0 && importedGenerations.size >= max && !rotationPending) {
+        rotationPending = true;
+        log('warn', `worker imported ${importedGenerations.size} distinct artifact generations (NIGHTGATE_WORKER_MAX_GENERATIONS=${max}); rotating at the next idle moment to release Node's module cache`);
+    }
+    return rotationPending;
+}
+
+/** Test seam. */
+export function __rotationStateForTests(): { generations: number; pending: boolean; draining: boolean; inflight: number } {
+    return { generations: importedGenerations.size, pending: rotationPending, draining, inflight: inflightRpcs };
+}
+export function __resetRotationForTests(): void {
+    importedGenerations.clear(); rotationPending = false; draining = false; inflightRpcs = 0;
+}
+
+/**
+ * Runs on every RPC completion (success or failure) and when a rotation becomes due:
+ * close admission first (the main thread holds new calls until the respawn), then exit
+ * once nothing is in flight. An admitted proof or submission always completes.
+ */
+function rotateIfDue(): void {
+    if (!rotationPending) return;
+    if (!draining) {
+        draining = true;
+        parentPort?.postMessage({ kind: 'rotating', generations: importedGenerations.size, inflight: inflightRpcs });
+        log('info', `worker rotating after ${importedGenerations.size} artifact generations: admission closed, ${inflightRpcs} call(s) draining; the main thread respawns it`);
+    }
+    if (inflightRpcs > 0) return;
+    // In a worker thread process.exit() ends this thread only.
+    setImmediate(() => process.exit(0));
+}
+
+/** Test seam: the dispatcher's admission decision. */
+export function __admitRpcForTests(): boolean { return !draining; }
+
+// ---- Generation retention ---------------------------------------------------
+
+const generationRefs = new Map<string, number>();
+
+/** A job holds its generation for the whole RPC; the snapshot cannot be swept meanwhile. */
+export function retainGeneration(digest: string | undefined): () => void {
+    if (!digest) return () => undefined;
+    generationRefs.set(digest, (generationRefs.get(digest) ?? 0) + 1);
+    let released = false;
+    return () => {
+        if (released) return;
+        released = true;
+        const n = (generationRefs.get(digest) ?? 1) - 1;
+        if (n > 0) generationRefs.set(digest, n);
+        else { generationRefs.delete(digest); sweepGenerationIfUnused(digest); }
+    };
+}
+
+function generationCached(digest: string): boolean {
+    return contractScaffolds.keys().some(k => k.endsWith(`\0${digest}`)) || zkProviderBundles.keys().some(k => k.endsWith(`|${digest}`));
+}
+
+/** Evicted from a cache: drop the snapshot unless a job or the other cache still uses the generation. */
+function onGenerationEvicted(digest: string): void {
+    if (digest) sweepGenerationIfUnused(digest);
+}
+
+function sweepGenerationIfUnused(digest: string): void {
+    if (!digest || generationRefs.has(digest) || generationCached(digest)) return;
+    const dir = path.join(artifactSnapshotRoot(), digest);
+    verifiedSnapshots.delete(digest);
+    try {
+        if (fs.existsSync(dir)) {
+            fs.rmSync(dir, { recursive: true, force: true });
+            log('info', `artifact snapshot ${digest.slice(0, 16)}… released (generation no longer cached or in use)`);
+        }
+    } catch (e) {
+        log('warn', `artifact snapshot ${digest.slice(0, 16)}… could not be removed: ${String((e as Error)?.message ?? e)}`);
+    }
+}
+
+/** Test seam: run the eviction path for a digest as the caches would. */
+export function __evictGenerationForTests(digest: string): void {
+    for (const k of contractScaffolds.keys()) if (k.endsWith(`\0${digest}`)) contractScaffolds.delete(k);
+    for (const k of zkProviderBundles.keys()) if (k.endsWith(`|${digest}`)) zkProviderBundles.delete(k);
+    onGenerationEvicted(digest);
+}
+
+/** Zk asset path for a job: the immutable snapshot of its pinned generation, or the registration directory when there is no digest. */
+export function artifactAssetPath(name: string, registration: ContractRegistration): string {
+    return materializeArtifactSnapshot(name, registration)?.zkConfigPath ?? registration.zkConfigPath;
+}
+
+/** Refuses a contract whose files no longer hash to the pinned generation. No digest on the registration = nothing to verify. */
+export function assertArtifactGenerationOnDisk(name: string, registration: ContractRegistration): void {
+    if (!registration.artifactDigest) return;
+    const onDisk = computeArtifactGenerationDigest(registration);
+    if (onDisk !== registration.artifactDigest) {
+        throw new Error(
+            `Contract '${name}' on disk is artifact generation ${onDisk.slice(0, 16)}… but this job was pinned to ` +
+            `${registration.artifactDigest.slice(0, 16)}…; the module or its zk assets changed since the job was resolved. ` +
+            `Refusing to load a different generation; re-register the artifact (or re-issue the action against the current one).`);
+    }
+}
+
+/**
+ * Generation-pinned artifact import for both module formats (mirrors contract-registry's
+ * loader). ESM is cached per URL, so a `?gen=<digest>` query yields a fresh instance;
+ * Node 22 serves a CommonJS module from its cache by filename regardless of the query,
+ * so its cache entry is dropped first.
+ */
+export async function importArtifactGeneration(artifactPath: string, generation: string): Promise<any> {
+    if (!path.isAbsolute(artifactPath)) return import(artifactPath);
+    try { delete require.cache[require.resolve(artifactPath)]; } catch { /* ESM-only path */ }
+    const url = pathToFileURL(artifactPath);
+    if (generation) url.searchParams.set('gen', generation.slice(0, 32));
+    return import(url.href);
 }
 
 /**
@@ -366,40 +793,51 @@ async function getOrCompileContract(
 
     return CompiledContract.make(name, contractClass).pipe(
         witnessStep,
-        CompiledContract.withCompiledFileAssets(registration.zkConfigPath)
+        // Assets of the pinned generation, never the mutable directory.
+        CompiledContract.withCompiledFileAssets(artifactAssetPath(name, registration))
     );
 }
 
 // ---- Worker-side provider construction (Phase 2b) -------------------------
 
-// One long-lived provider bundle per (indexer + proof + zkConfig) tuple. The
-// indexerPublicDataProvider opens a graphql-ws connection; building a fresh one
-// on every deploy/call leaked a socket per submission. Reusing a bundle keeps a
-// single connection, the way a normal dapp wires providers once at startup. The
-// PROMISE is cached (set synchronously before the first await) so concurrent
-// first callers can't both build one.
-const contractProvidersCache = new Map<string, Promise<{ publicDataProvider: any; zkConfigProvider: any; proofProvider: any }>>();
+// One indexerPublicDataProvider (graphql-ws connection) per indexer endpoint, shared by
+// every contract and generation. Zk config + proving providers are per (proof server,
+// asset path, generation) and bounded.
+const publicDataProviders = new Map<string, Promise<any>>();
+const zkProviderBundles = new BoundedCache<string, Promise<{ zkConfigProvider: any; proofProvider: any }>>(generationCacheSize(), (key) => onGenerationEvicted(key.split('|').pop() ?? ''));
+
+function getPublicDataProvider(indexerHttpUrl: string, indexerWsUrl: string): Promise<any> {
+    const key = `${indexerHttpUrl}|${indexerWsUrl}`;
+    let p = publicDataProviders.get(key);
+    if (!p) {
+        p = (async () => {
+            // `ws` is CJS; Node 22 worker_threads can `require` it freely.
+            // eslint-disable-next-line @typescript-eslint/no-var-requires
+            const WebSocket = require('ws');
+            const { indexer } = await loadContractsSdk();
+            return indexer.indexerPublicDataProvider(indexerHttpUrl, indexerWsUrl, WebSocket);
+        })();
+        p.catch(() => { publicDataProviders.delete(key); });
+        publicDataProviders.set(key, p);
+    }
+    return p;
+}
 
 function buildWorkerContractProviders(args: {
     indexerHttpUrl: string;
     indexerWsUrl: string;
     proofServerUrl: string;
+    /** Immutable asset path of the pinned generation (artifactAssetPath), or the registration dir for digest-less callers. */
     zkConfigPath: string;
+    /** Artifact generation the assets belong to; part of the provider cache key. */
+    generation?: string;
 }): Promise<{ publicDataProvider: any; zkConfigProvider: any; proofProvider: any }> {
-    const cacheKey = `${args.indexerHttpUrl}|${args.indexerWsUrl}|${args.proofServerUrl}|${args.zkConfigPath}`;
-    let bundleP = contractProvidersCache.get(cacheKey);
+    const key = `${args.proofServerUrl}|${args.zkConfigPath}|${args.generation ?? ''}`;
+    let bundleP = zkProviderBundles.get(key);
     if (!bundleP) {
         bundleP = (async () => {
-            // `ws` is CJS; Node 22 worker_threads can `require` it freely.
-            // eslint-disable-next-line @typescript-eslint/no-var-requires
-            const WebSocket = require('ws');
-            const { indexer, proof, zk } = await loadContractsSdk();
+            const { proof, zk } = await loadContractsSdk();
             const zkConfigProvider = new zk.NodeZkConfigProvider(args.zkConfigPath);
-            const publicDataProvider = indexer.indexerPublicDataProvider(
-                args.indexerHttpUrl,
-                args.indexerWsUrl,
-                WebSocket
-            );
             let proofProvider;
             if (resolveProvingMode() === 'wasm') {
                 proofProvider = await buildWasmProofProvider(zkConfigProvider);
@@ -407,14 +845,15 @@ function buildWorkerContractProviders(args: {
             } else {
                 proofProvider = proof.httpClientProofProvider(args.proofServerUrl, zkConfigProvider);
             }
-            return { publicDataProvider, zkConfigProvider, proofProvider };
+            return { zkConfigProvider, proofProvider };
         })();
         // A failed build (e.g. transient import error) must not stick: evict
         // the rejected promise so the next deploy/call retries.
-        bundleP.catch(() => { contractProvidersCache.delete(cacheKey); });
-        contractProvidersCache.set(cacheKey, bundleP);
+        bundleP.catch(() => { zkProviderBundles.delete(key); });
+        zkProviderBundles.set(key, bundleP);
     }
-    return bundleP;
+    return Promise.all([getPublicDataProvider(args.indexerHttpUrl, args.indexerWsUrl), bundleP])
+        .then(([publicDataProvider, bundle]) => ({ publicDataProvider, ...bundle }));
 }
 
 // ---- findDeployedContract query caching -----------------------------------
@@ -486,6 +925,11 @@ const SYNC_PROGRESS_LOG_MS = 15_000;
 // Rate is measured against an anchor no older than this, so a long catch-up
 // reports its CURRENT throughput rather than an average diluted by the start.
 const SYNC_RATE_WINDOW_MS = 60_000;
+// A sync whose appliedIndex has not moved for this long is stalled; a sync still
+// applying events is slow and runs up to the absolute ceiling. <= 0 disables.
+const SYNC_STALL_MS = Number(process.env.NIGHTGATE_PREWARM_STALL_MS ?? 600_000);
+// Absolute ceiling for the prewarm wait when the caller passes none; SYNC_STALL_MS is the primary limit.
+const SYNC_CEILING_MS = 12 * 60 * 60 * 1000;
 const wsleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
 
 /**
@@ -530,6 +974,11 @@ export interface SyncProgressSnapshot {
     /** The wait that produced this snapshot ('prewarm', 'balance', ...). */
     label: string;
     updatedAt: string;
+    /**
+     * When `appliedIndex` last advanced (the wait's start until it first moves).
+     * Unchanged across polls while `updatedAt` moves = stalled, not slow.
+     */
+    lastProgressAt: string;
 }
 
 const syncProgress = new Map<string, SyncProgressSnapshot>();
@@ -645,13 +1094,52 @@ async function getDustStreamTip(indexerHttpUrl: string): Promise<bigint | null> 
  * stream tip, the current rate and an ETA, so a slow catch-up is legible from
  * the log and from `getSyncProgress` instead of looking identical to a hang.
  */
-async function waitForGenuineSync(entry: FacadeEntry, timeoutMs: number, label: string): Promise<void> {
+/** One emission of the non-blocking `facade.state()` observable, or null on timeout/error. Never blocks on `waitForSyncedState()`. */
+async function peekFacadeState(facade: any, timeoutMs: number): Promise<any | null> {
+    let sub: any;
+    let timer: NodeJS.Timeout | undefined;
+    try {
+        return await Promise.race([
+            new Promise<any>((res, rej) => {
+                try { sub = facade.state().subscribe({ next: (v: any) => res(v), error: (e: any) => rej(e) }); }
+                catch (e) { rej(e); }
+            }),
+            new Promise<null>(res => { timer = setTimeout(() => res(null), timeoutMs); })
+        ]);
+    } catch {
+        return null;
+    } finally {
+        try { sub && sub.unsubscribe(); } catch { }
+        if (timer) clearTimeout(timer);
+    }
+}
+
+/** Registered NIGHT UTXOs in a facade state's full unshielded coin set. */
+function countRegisteredNightUtxos(state: any): number {
+    // The full coin set when the SDK exposes one, else the available set (some shapes flag registered coins there).
+    const all: any[] = state?.unshielded?.totalCoins
+        ?? state?.unshielded?.allCoins ?? state?.unshielded?.coins ?? state?.unshielded?.availableCoins ?? [];
+    return all.filter((c: any) => c?.meta?.registeredForDustGeneration === true).length;
+}
+
+/** Every unshielded NIGHT UTXO, registered or not; `fallback` when the SDK exposes no full coin set. */
+function countAllNightUtxos(state: any, fallback: number): number {
+    const all: any[] | undefined = state?.unshielded?.totalCoins
+        ?? state?.unshielded?.allCoins ?? state?.unshielded?.coins;
+    return Array.isArray(all) ? all.length : fallback;
+}
+
+async function waitForGenuineSync(entry: FacadeEntry, timeoutMs: number, label: string, stallMs: number = SYNC_STALL_MS): Promise<void> {
     const { facade, indexerHttpUrl, sessionId } = entry;
     const startedAt = Date.now();
     const deadline = startedAt + timeoutMs;
     let lastLog = 0;
     let lastApplied = -1n;
     let lastHighest = -1n;
+    // The first observation seeds the index without counting as progress: an
+    // index unchanged from the start is stalled once stallMs has passed.
+    let progressApplied = -1n;
+    let lastProgressAt = startedAt;
     // Sliding anchor for the rate: refreshed once it ages past the window, so
     // the reported throughput tracks the present, not the whole wait.
     let anchor: { applied: bigint; at: number } | null = null;
@@ -690,7 +1178,8 @@ async function waitForGenuineSync(entry: FacadeEntry, timeoutMs: number, label: 
             caughtUp,
             elapsedMs: now - startedAt,
             label,
-            updatedAt: new Date(now).toISOString()
+            updatedAt: new Date(now).toISOString(),
+            lastProgressAt: new Date(lastProgressAt).toISOString()
         };
         syncProgress.set(sessionId, snapshot);
         return snapshot;
@@ -726,7 +1215,16 @@ async function waitForGenuineSync(entry: FacadeEntry, timeoutMs: number, label: 
             try { sub && sub.unsubscribe(); } catch { }
             if (peekTimer) clearTimeout(peekTimer);
         }
-        if (peekFailed) { await wsleep(SYNC_POLL_MS); continue; }
+        if (peekFailed) {
+            // A state observable that never emits (or errors every poll) counts as no
+            // progress for the stall bound. The last readable snapshot stays for diagnosis.
+            if (stallMs > 0 && Date.now() - lastProgressAt > stallMs) {
+                const last = syncProgress.get(sessionId);
+                throw new Error(`wallet sync stalled: no progress for ${Math.round((Date.now() - lastProgressAt) / 60_000)} min and the wallet state is not readable (state peek timed out or failed on every poll; last snapshot: dust appliedIndex=${last?.appliedIndex ?? lastApplied}, streamTip=${last?.streamTip ?? lastHighest}, isConnected=${last?.isConnected ?? '?'}, elapsed=${Math.round((Date.now() - startedAt) / 1000)}s)`);
+            }
+            await wsleep(SYNC_POLL_MS);
+            continue;
+        }
         const p: any = state?.dust?.progress;
         const applied = p?.appliedIndex != null ? BigInt(p.appliedIndex) : -1n;
         const streamTip = await getDustStreamTip(indexerHttpUrl);
@@ -735,12 +1233,22 @@ async function waitForGenuineSync(entry: FacadeEntry, timeoutMs: number, label: 
         const fresh = tip.timestampMs != null && Date.now() - tip.timestampMs <= SYNC_FRESHNESS_MS;
         lastApplied = applied;
         lastHighest = highest;
+        if (applied >= 0n) {
+            if (progressApplied >= 0n && applied > progressApplied) lastProgressAt = Date.now();
+            progressApplied = applied;
+        }
         const caughtUp = connected && highest > 0n && applied >= 0n && applied >= highest - SYNC_TIP_GAP && fresh;
         const snapshot = publish(applied, highest, tip.height, connected, fresh, caughtUp);
         if (caughtUp) {
             pushSyncProgress(snapshot);
             log('info', `genuine-sync [${label}] CAUGHT UP: appliedIndex=${applied} streamTip=${highest} blockHeight=${tip.height} fresh=${fresh} after=${Math.round(snapshot.elapsedMs / 1000)}s`);
             return;
+        }
+        if (stallMs > 0 && Date.now() - lastProgressAt > stallMs) {
+            // The last snapshot stays readable; the message names this condition ("no progress", not "too slow").
+            pushSyncProgress(snapshot);
+            const behind = snapshot.behindEvents ?? '?';
+            throw new Error(`wallet sync stalled: no progress for ${Math.round((Date.now() - lastProgressAt) / 60_000)} min (dust appliedIndex stuck at ${applied}, streamTip=${highest}, ${behind} events behind, blockHeight=${tip.height}, isConnected=${connected}, indexerFresh=${fresh}, elapsed=${Math.round(snapshot.elapsedMs / 1000)}s)`);
         }
         // INFO, not debug: without this line a multi-hour catch-up is
         // indistinguishable from a hang for anyone outside this thread. The
@@ -760,7 +1268,7 @@ async function waitForGenuineSync(entry: FacadeEntry, timeoutMs: number, label: 
     // the timeout can still read how far the wallet got and how fast it was
     // moving, which is what separates "too slow" from "stalled".
     const rate = syncProgress.get(sessionId)?.eventsPerSecond;
-    throw new Error(`wallet not synced to tip after ${timeoutMs}ms: dust appliedIndex=${lastApplied} streamTip=${lastHighest} (${behind} events behind at ${rate != null ? rate.toFixed(1) : '?'} events/s, blockHeight=${tip.height}, isConnected/freshness check failed or stalled)`);
+    throw new Error(`wallet not synced to tip after ${timeoutMs}ms (absolute ceiling): still ${behind} events behind at ${rate != null ? rate.toFixed(1) : '?'} events/s, dust appliedIndex=${lastApplied} streamTip=${lastHighest}, blockHeight=${tip.height}; the sync was moving (no stall detected), raise NIGHTGATE_PREWARM_SYNC_TIMEOUT_MS or wait for a quieter machine`);
 }
 
 /**
@@ -1192,6 +1700,8 @@ export interface SubmitIntent {
     note?: string;
     /** The sponsor ACCOUNT paying (the facade's account id). */
     sponsorAccountId?: string;
+    /** Addresses of contract deploy actions in the tx; the main thread reserves the grant's deploy budget on them before acking. */
+    deployed?: string[];
 }
 async function announceSubmitIntent(port: MessagePort | undefined, intent: SubmitIntent): Promise<void> {
     if (!port) return;
@@ -1574,6 +2084,8 @@ function offerNonEmpty(offer: any): boolean {
 
 /** Default sponsor size budget; a single vault call is ~5.4 KB. */
 const DEFAULT_SPONSOR_MAX_TX_BYTES = 65536;
+// A sponsored deploy's own ceiling: verifier keys cost a multiple of a call; the ledger caps written bytes at 32 KiB.
+const DEFAULT_SPONSOR_MAX_DEPLOY_BYTES = 40_960;
 
 /**
  * FAIL-CLOSED shape check for a transaction the sponsor is about to pay for.
@@ -1584,12 +2096,21 @@ const DEFAULT_SPONSOR_MAX_TX_BYTES = 65536;
  * and so is structure this inspection cannot read.
  * Exported for the in-thread unit tests.
  */
+/** Marker entry point for a sponsored deploy in the returned call list. */
+export const DEPLOY_ENTRY_POINT = '<deploy>';
+
 export function checkSponsorableShape(
     tx: any,
     byteLength: number,
     allowedContracts?: string[],
-    allowedCircuits?: string[]
+    allowedCircuits?: string[],
+    // With `allowDeploy` (floor and grant, decided at admission) a ContractDeploy
+    // action is sponsorable: never matched against `allowedContracts` (the address is
+    // new), recorded onto the grant afterwards. `maxDeploys` caps deploys per tx (default 1).
+    options: { allowDeploy?: boolean; maxDeploys?: number } = {}
 ): Array<{ address: string; entryPoint: string }> {
+    const maxDeploysPerTx = Number.isInteger(options.maxDeploys) && (options.maxDeploys as number) >= 0 ? (options.maxDeploys as number) : 1;
+    let deployCount = 0;
     // A misconfigured budget must not DISABLE the budget ('abc' or 'Infinity'
     // would have skipped the check entirely): anything that is not a positive
     // finite integer falls back to the safe default.
@@ -1636,7 +2157,32 @@ export function checkSponsorableShape(
             if (!name) {
                 // deploys, maintenance updates, future action kinds
                 const kind = action?.constructor?.name || typeof action;
-                throw new Error(`refusing to sponsor: transaction carries a non-call action (${kind})`);
+                // A maintenance update changes a contract's authority and is never sponsored;
+                // a deploy is refused only without the deploy right. Told apart by shape,
+                // not by class name alone.
+                const isMaintenance = kind === 'MaintenanceUpdate' || action?.updates !== undefined;
+                if (isMaintenance) {
+                    throw new Error('refusing to sponsor: transaction carries a contract maintenance update (never sponsorable)');
+                }
+                const isDeploy = kind === 'ContractDeploy' || (action?.initialState !== undefined && action?.address !== undefined);
+                if (isDeploy && options.allowDeploy === true) {
+                    const address = String(action?.address ?? '');
+                    if (!address) throw new Error('refusing to sponsor: deploy action carries no contract address');
+                    deployCount++;
+                    if (deployCount > maxDeploysPerTx) {
+                        throw new Error(`refusing to sponsor: transaction carries ${deployCount}+ contract deploys; at most ${maxDeploysPerTx} per sponsored transaction`);
+                    }
+                    // A deploy writes verifier keys on chain and costs a multiple of a call: its own byte ceiling.
+                    const rawDeployMax = process.env.NIGHTGATE_SPONSOR_MAX_DEPLOY_BYTES;
+                    const parsedDeployMax = rawDeployMax === undefined ? DEFAULT_SPONSOR_MAX_DEPLOY_BYTES : Number(rawDeployMax);
+                    const maxDeployBytes = (Number.isInteger(parsedDeployMax) && parsedDeployMax > 0) ? parsedDeployMax : DEFAULT_SPONSOR_MAX_DEPLOY_BYTES;
+                    if (byteLength > maxDeployBytes) {
+                        throw new Error(`refusing to sponsor: deploy transaction is ${byteLength}B, over the ${maxDeployBytes}B deploy budget (NIGHTGATE_SPONSOR_MAX_DEPLOY_BYTES)`);
+                    }
+                    calls.push({ address, entryPoint: DEPLOY_ENTRY_POINT });
+                    continue;
+                }
+                throw new Error(`refusing to sponsor: transaction carries a non-call action (${kind})${isDeploy ? '; deploys need allowDeploy on the grant and NIGHTGATE_SPONSOR_ALLOW_DEPLOY on the server' : ''}`);
             }
             const address = String(action?.address ?? '');
             if (allowedContracts?.length && !allowedContracts.includes(address)) {
@@ -1778,7 +2324,8 @@ async function sponsorAndSubmitFinalized(sponsor: FacadeEntry, rehydrated: any, 
     try {
         await announceSubmitIntent(replyPort, {
             txHash: String(finalized.identifiers().at(-1)),
-            contractAddress: calls?.[0]?.address, circuits: calls?.map(c => c.entryPoint), sponsorAccountId: sponsor.sessionId
+            contractAddress: calls?.[0]?.address, circuits: calls?.map(c => c.entryPoint), sponsorAccountId: sponsor.sessionId,
+            deployed: calls?.filter(c => c.entryPoint === DEPLOY_ENTRY_POINT).map(c => c.address) ?? []
         });
     } catch (e) {
         await revertRecipeBestEffort(sponsor.facade, finalized, `${site} sponsor-intent`);
@@ -2329,14 +2876,13 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
         return { facadeReady: true, alreadyExisted: false, sdkVersion: entry.sdkVersion };
     },
 
-    async waitForSyncedState({ sessionId, timeoutMs }: { sessionId: string; timeoutMs?: number }) {
+    async waitForSyncedState({ sessionId, timeoutMs, stallMs }: { sessionId: string; timeoutMs?: number; stallMs?: number }) {
         const entry = facades.get(sessionId);
         if (!entry) throw new Error(`No facade for sessionId=${sessionId.slice(0, 16)}`);
-        // GENUINE catch-up to the indexer tip (ignores the unreliable isSynced
-        // flag, which is trivially true when highestIndex=0). This is the
-        // prewarm path → use a long budget so a far-behind wallet can actually
-        // reach the tip before any submission balances dust.
-        await waitForGenuineSync(entry, timeoutMs ?? 3 * 60 * 60 * 1000, 'prewarm');
+        // Genuine catch-up to the indexer tip (the isSynced flag is trivially true
+        // when highestIndex=0). Prewarm path: bounded by lack of progress (stallMs),
+        // with an absolute ceiling as backstop.
+        await waitForGenuineSync(entry, timeoutMs ?? SYNC_CEILING_MS, 'prewarm', stallMs ?? SYNC_STALL_MS);
         return { synced: true };
     },
 
@@ -2405,33 +2951,48 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
             : await entry.facade.waitForSyncedState();
         log('info', `dust-register: synced.`);
 
+        // `availableCoins` excludes UTXOs already registered for dust generation (SDK
+        // contract); registered ones are counted off the full coin set.
         const availableCoins: any[] = synced?.unshielded?.availableCoins ?? [];
         const unregistered = availableCoins.filter(
             (c: any) => c?.meta?.registeredForDustGeneration !== true
         );
+        const registeredUtxosBefore = countRegisteredNightUtxos(synced);
+        // Without a full coin set the total is the available set plus the
+        // registered UTXOs it does not already list.
+        const registeredInAvailable = availableCoins.filter((c: any) => c?.meta?.registeredForDustGeneration === true).length;
+        const totalNightUtxos = countAllNightUtxos(synced, availableCoins.length + registeredUtxosBefore - registeredInAvailable);
 
         const myDustAddr = await entry.facade.dust.getAddress();
         const receiverRaw = dustReceiverAddress || myDustAddr;
         const dustAddrStr = await encodeAddressString(receiverRaw, entry.networkId);
 
         if (unregistered.length === 0) {
-            // Two distinct cases produce an empty unregistered list, distinguish
-            // for the caller via the log so triage is faster.
-            if (availableCoins.length === 0) {
-                log('info',
-                    `dust-register: no unshielded NIGHT UTXOs visible to this wallet. ` +
-                    `Either all your NIGHT is held shielded (unshield via Lace to enable dust-gen), ` +
-                    `or your unshielded UTXOs are already committed to dust generation and no longer ` +
-                    `surface in synced.unshielded.availableCoins (the SDK's "available" excludes ` +
-                    `registered UTXOs). Check Lace's "Refilling NhNNmin" indicator for the latter.`);
-            } else {
-                log('info', `dust-register: ${availableCoins.length} NIGHT UTXO(s) are already registered for dust-gen.`);
-            }
+            // Registration binds the address, so a call naming a different receiver
+            // changes nothing. The standing receiver is not readable from the SDK
+            // (only a boolean per UTXO): answer "unchanged, receiver not applied".
+            const reason = registeredUtxosBefore > 0 ? 'already-registered' : 'no-night-utxos';
+            const message = reason === 'no-night-utxos'
+                ? 'no unshielded NIGHT UTXOs visible to this wallet (all NIGHT is held shielded, or the wallet is ' +
+                  'unfunded); nothing was registered and no receiver was applied'
+                : `all ${totalNightUtxos} NIGHT UTXO(s) are already registered to their standing receiver; ` +
+                  'nothing was registered and the requested receiver was NOT applied. To move generation to a ' +
+                  'different receiver, deregisterFromDustGeneration first, then register again naming it';
+            log(dustReceiverAddress ? 'warn' : 'info', `dust-register: ${message}`);
             return {
                 txId: null,
+                changed: false,
+                reason,
                 registeredCount: 0,
-                totalNightUtxos: availableCoins.length,
-                dustReceiverAddress: dustAddrStr
+                totalNightUtxos,
+                // Never echo a receiver that was not applied.
+                dustReceiverAddress: null,
+                requestedReceiver: dustAddrStr,
+                registeredUtxosBefore,
+                registeredUtxosAfter: registeredUtxosBefore,
+                settled: true,
+                consolidated: null,
+                message
             };
         }
 
@@ -2461,11 +3022,42 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
 
         log('info', `dust-register: submitted ${unregistered.length} UTXO(s), txId=${String(txId).slice(0, 16)}...`);
 
+        // Report the resulting shape: one registration over several UTXOs consolidates
+        // them, and one registered UTXO yields one dust note. Bounded observation;
+        // `settled: false` with a null count if the tx is not applied locally in time.
+        const settleMs = Number(process.env.NIGHTGATE_DUST_REGISTER_SETTLE_MS ?? 90_000);
+        const settleStartedAt = Date.now();
+        let registeredUtxosAfter: number | null = null;
+        while (settleMs > 0 && Date.now() - settleStartedAt < settleMs) {
+            const state = await peekFacadeState(entry.facade, 10_000);
+            const n = state ? countRegisteredNightUtxos(state) : null;
+            if (n != null && n > registeredUtxosBefore) { registeredUtxosAfter = n; break; }
+            await wsleep(SYNC_POLL_MS);
+        }
+        const settled = registeredUtxosAfter != null;
+        const consolidated = settled ? (registeredUtxosAfter! - registeredUtxosBefore) < unregistered.length : null;
+        if (settled) {
+            log('info', `dust-register: settled, registered NIGHT UTXOs ${registeredUtxosBefore} -> ${registeredUtxosAfter} (${unregistered.length} input(s)${consolidated ? ', CONSOLIDATED' : ''})`);
+        } else {
+            log('info', `dust-register: not yet applied locally after ${Math.round((Date.now() - settleStartedAt) / 1000)}s; resulting UTXO count unknown`);
+        }
+
         return {
             txId: String(txId),
+            changed: true,
+            reason: null,
             registeredCount: unregistered.length,
-            totalNightUtxos: availableCoins.length,
-            dustReceiverAddress: dustAddrStr
+            totalNightUtxos,
+            dustReceiverAddress: dustAddrStr,
+            requestedReceiver: dustAddrStr,
+            registeredUtxosBefore,
+            registeredUtxosAfter,
+            settled,
+            consolidated,
+            message: settled
+                ? `${unregistered.length} UTXO(s) registered; the wallet now holds ${registeredUtxosAfter} registered NIGHT UTXO(s)` +
+                  (consolidated ? ' (inputs were consolidated: register first, fund in separate payments afterwards to keep them split)' : '')
+                : `${unregistered.length} UTXO(s) registered; the resulting UTXO count was not observable within ${settleMs}ms`
         };
     },
 
@@ -2807,7 +3399,7 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
         const compiledContract = await getOrCompileContract(contractName, registration, entry);
         const contractProviders = await buildWorkerContractProviders({
             indexerHttpUrl, indexerWsUrl, proofServerUrl,
-            zkConfigPath: registration.zkConfigPath
+            zkConfigPath: artifactAssetPath(contractName, registration), generation: registration.artifactDigest
         });
         const privateStateProvider = createPrivateStateProxy(proxyId);
         const walletProvider = sponsorEntry
@@ -2885,7 +3477,7 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
             timer.mark('compile');
             const contractProviders = await buildWorkerContractProviders({
                 indexerHttpUrl, indexerWsUrl, proofServerUrl,
-                zkConfigPath: registration.zkConfigPath
+                zkConfigPath: artifactAssetPath(contractName, registration), generation: registration.artifactDigest
             });
             timer.mark('providers');
             const privateStateProvider = createPrivateStateProxy(proxyId);
@@ -2970,7 +3562,7 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
         sponsorSessionId: string;
         proxyId: string;
         contractName: string;
-        registration: { artifactPath: string; privateStateId: string; zkConfigPath: string; slotWidth?: number };
+        registration: { artifactPath: string; artifactDigest?: string; privateStateId: string; zkConfigPath: string; slotWidth?: number };
         contractAddress: string;
         circuit: string;
         args?: unknown[]; // the call arguments (same field name as submitContractCall's RPC)
@@ -2994,7 +3586,7 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
         log('info', 'probe: building providers');
         const contractProviders = await buildWorkerContractProviders({
             indexerHttpUrl: args.indexerHttpUrl, indexerWsUrl: args.indexerWsUrl,
-            proofServerUrl: args.proofServerUrl, zkConfigPath: args.registration.zkConfigPath
+            proofServerUrl: args.proofServerUrl, zkConfigPath: artifactAssetPath(args.contractName, args.registration), generation: args.registration.artifactDigest
         });
         const privateStateProvider = createPrivateStateProxy(args.proxyId);
         const holder: { captured?: any } = {};
@@ -3095,7 +3687,7 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
      */
     async buildSponsorableTx(args: {
         sessionId: string; proxyId: string; contractName: string;
-        registration: { artifactPath: string; privateStateId: string; zkConfigPath: string; slotWidth?: number };
+        registration: { artifactPath: string; artifactDigest?: string; privateStateId: string; zkConfigPath: string; slotWidth?: number };
         contractAddress: string; circuit: string; args?: unknown[];
         indexerHttpUrl: string; indexerWsUrl: string; proofServerUrl: string;
         networkId: string; merkleProof?: MerkleProofBundle; initialPrivateState?: unknown;
@@ -3107,7 +3699,7 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
         const compiledContract = await getOrCompileContract(args.contractName, args.registration, entry, args.merkleProof);
         const contractProviders = await buildWorkerContractProviders({
             indexerHttpUrl: args.indexerHttpUrl, indexerWsUrl: args.indexerWsUrl,
-            proofServerUrl: args.proofServerUrl, zkConfigPath: args.registration.zkConfigPath
+            proofServerUrl: args.proofServerUrl, zkConfigPath: artifactAssetPath(args.contractName, args.registration), generation: args.registration.artifactDigest
         });
         const privateStateProvider = createPrivateStateProxy(args.proxyId);
         const holder: { captured?: any } = {};
@@ -3148,7 +3740,7 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
      */
     async sponsorFinalizedTx(args: {
         sponsorSessionId: string; finalizedTxB64: string; networkId: string;
-        allowedContracts?: string[]; allowedCircuits?: string[];
+        allowedContracts?: string[]; allowedCircuits?: string[]; allowDeploy?: boolean;
         /** Set by the dispatcher: the RPC reply port, for the pre-broadcast submit-intent handshake. */
         __replyPort?: MessagePort;
     }) {
@@ -3161,11 +3753,14 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
         // Policy: FAIL-CLOSED shape check. Allow-listed contract calls are the
         // only thing a sponsorable tx may contain; deploys, token transfers,
         // caller dust, oversized or uninspectable transactions all refuse.
-        const calls = checkSponsorableShape(tx, bytes.length, args.allowedContracts, args.allowedCircuits);
+        const calls = checkSponsorableShape(tx, bytes.length, args.allowedContracts, args.allowedCircuits, { allowDeploy: args.allowDeploy === true });
         log('info', `sponsorFinalizedTx: paying dust for ${calls.map(c => c.entryPoint).join('+')} (${bytes.length}B)`);
         const txId = await sponsorAndSubmitFinalized(sponsor, tx, 'sponsor-endpoint', args.__replyPort, calls);
         log('info', `sponsorFinalizedTx: LANDED txHash=${txId.slice(0, 16)}`);
-        return { txHash: txId, circuits: calls.map(c => c.entryPoint), contractAddress: calls[0]?.address ?? '' };
+        return {
+            txHash: txId, circuits: calls.map(c => c.entryPoint), contractAddress: calls[0]?.address ?? '',
+            deployed: calls.filter(c => c.entryPoint === DEPLOY_ENTRY_POINT).map(c => c.address)
+        };
     },
 
     /**
@@ -3191,7 +3786,7 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
      */
     async sponsorUnboundTx(args: {
         sponsorSessionId: string; unboundTxB64: string; networkId: string;
-        allowedContracts?: string[]; allowedCircuits?: string[];
+        allowedContracts?: string[]; allowedCircuits?: string[]; allowDeploy?: boolean;
         /** Set by the dispatcher: the RPC reply port, for the pre-broadcast submit-intent handshake. */
         __replyPort?: MessagePort;
     }) {
@@ -3202,7 +3797,7 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
         const { tx: callerTx, bytes } = await deserializeFinalizedTx(args.unboundTxB64);
 
         // Same fail-closed shape policy as the bound path.
-        const calls = checkSponsorableShape(callerTx, bytes.length, args.allowedContracts, args.allowedCircuits);
+        const calls = checkSponsorableShape(callerTx, bytes.length, args.allowedContracts, args.allowedCircuits, { allowDeploy: args.allowDeploy === true });
 
         await waitForGenuineSync(sponsor, BALANCE_SYNC_TIMEOUT_MS, 'sponsor-unbound');
 
@@ -3298,11 +3893,15 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
             // for a call that may be on-chain.
             await announceSubmitIntent(args.__replyPort, {
                 txHash: String(bound.identifiers().at(-1)),
-                contractAddress: calls[0]?.address, circuits: calls.map(c => c.entryPoint), note: leased.backing, sponsorAccountId: sponsor.sessionId
+                contractAddress: calls[0]?.address, circuits: calls.map(c => c.entryPoint), note: leased.backing, sponsorAccountId: sponsor.sessionId,
+                deployed: calls.filter(c => c.entryPoint === DEPLOY_ENTRY_POINT).map(c => c.address)
             });
             const txId = await submitOnDedicatedClient(sponsor, bound, 'sponsor-unbound-submit');
             log('info', `sponsorUnboundTx: LANDED txHash=${String(txId).slice(0, 16)} on backing ${leased.backing}`);
-            return { txHash: String(txId), circuits: calls.map(c => c.entryPoint), contractAddress: calls[0]?.address ?? '', note: leased.backing };
+            return {
+                txHash: String(txId), circuits: calls.map(c => c.entryPoint), contractAddress: calls[0]?.address ?? '', note: leased.backing,
+                deployed: calls.filter(c => c.entryPoint === DEPLOY_ENTRY_POINT).map(c => c.address)
+            };
         } finally {
             stopRenewal();
             releaseNote(leased.key, leased.token);
@@ -3394,7 +3993,7 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
             timer.mark('compile');
             const contractProviders = await buildWorkerContractProviders({
                 indexerHttpUrl, indexerWsUrl, proofServerUrl,
-                zkConfigPath: registration.zkConfigPath
+                zkConfigPath: artifactAssetPath(contractName, registration), generation: registration.artifactDigest
             });
             timer.mark('providers');
             const privateStateProvider = createPrivateStateProxy(proxyId);
@@ -3514,15 +4113,32 @@ parentPort.on('message', async (msg: any) => {
         return;
     }
     const { method, args, port } = msg as RpcRequest;
+    if (draining) {
+        // Admission is closed for the rotation; the client retries on the respawn.
+        port.postMessage({ ok: false, error: { name: WORKER_ROTATING, message: 'wallet worker is rotating (artifact generation budget); retry on the respawned worker' } } as RpcErr);
+        port.close();
+        return;
+    }
     try {
         const fn = handlers[method];
         if (!fn) throw new Error(`Unknown method: ${method}`);
         // The unbound sponsor path gets the reply port for its pre-broadcast
         // submit-intent handshake (see announceSubmitIntent).
         const callArgs = (method === 'sponsorUnboundTx' || method === 'sponsorFinalizedTx') ? { ...(args as object), __replyPort: port } : args;
-        const result = SUBMIT_METHODS.has(method)
-            ? await withSessionLocks(submitLockKeys(args), () => fn(callArgs))
-            : await fn(callArgs);
+        // A contract job holds its artifact generation for the whole call.
+        const releaseGeneration = retainGeneration((args as any)?.registration?.artifactDigest);
+        inflightRpcs++;
+        let result: unknown;
+        try {
+            result = SUBMIT_METHODS.has(method)
+                ? await withSessionLocks(submitLockKeys(args), () => fn(callArgs))
+                : await fn(callArgs);
+        } finally {
+            inflightRpcs--;
+            releaseGeneration();
+            // Shared completion path (success and failure).
+            rotateIfDue();
+        }
         port.postMessage({ ok: true, result } as RpcOk);
     } catch (err: any) {
         // Carry the nested cause chain across the thread boundary: the node's

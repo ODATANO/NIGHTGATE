@@ -12,7 +12,7 @@
  * worker for `cacheKey` via `getOrBuildWalletFacade(...)` first.
  */
 
-import { walletRegisterDustGeneration, walletDeregisterDustGeneration } from '../midnight/wallet-worker-client';
+import { walletRegisterDustGeneration, walletDeregisterDustGeneration, type RegisterDustGenerationOutcome } from '../midnight/wallet-worker-client';
 import type { WalletFacadeBuildArgs } from './wallet-facade-builder';
 
 export interface RegisterDustGenerationArgs {
@@ -34,16 +34,8 @@ export interface RegisterDustGenerationArgs {
     syncTimeoutMs?: number;
 }
 
-export interface RegisterDustGenerationResult {
-    /** Transaction ID of the registration submission. Null if nothing needed registering. */
-    txId: string | null;
-    /** Number of UTXOs that were registered in this call. */
-    registeredCount: number;
-    /** Total number of NIGHT UTXOs in the wallet at registration time. */
-    totalNightUtxos: number;
-    /** Dust receiver used (derived or user-supplied). */
-    dustReceiverAddress: string;
-}
+/** The worker's outcome report (RegisterDustGenerationOutcome in wallet-worker-client). */
+export type RegisterDustGenerationResult = RegisterDustGenerationOutcome;
 
 export async function registerNightUtxosForDust(
     args: RegisterDustGenerationArgs

@@ -37,6 +37,7 @@ vi.mock('../../srv/submission/wallet-sync-state-store', () => ({
 import {
     getOrBuildWalletFacade,
     evictWalletFacade,
+    getFacadeOrigin,
     __getCacheSizeForTests,
     __getPersistenceSizeForTests,
     hasWalletFacade,
@@ -80,11 +81,16 @@ describe('wallet-facade-builder', () => {
                 expect(hasWalletFacade('cache-key-gone-1111')).toBe(true);
 
                 expect(workerGoneListeners.length).toBeGreaterThan(0);
+                expect(getFacadeOrigin('cache-key-gone-1111')).not.toBeNull();
                 for (const fire of workerGoneListeners) await fire("exit");
 
                 expect(__getCacheSizeForTests()).toBe(0);
                 expect(hasWalletFacade('cache-key-gone-1111')).toBe(false);
                 expect(listWalletFacades()).toEqual([]);
+                // The origin of a facade that died with the worker is gone; the next build registers a fresh one.
+                expect(getFacadeOrigin('cache-key-gone-1111')).toBeNull();
+                await getOrBuildWalletFacade('cache-key-gone-1111', baseArgs);
+                expect(getFacadeOrigin('cache-key-gone-1111')).not.toBeNull();
             } finally {
                 logSpy.mockRestore();
             }
@@ -193,6 +199,37 @@ describe('wallet-facade-builder', () => {
                 expect(mockWalletInit).toHaveBeenCalledWith(expect.objectContaining({
                     restoreBlobs: { shielded: 'sh-blob', unshielded: 'un-blob', dust: 'du-blob' }
                 }));
+            } finally {
+                logSpy.mockRestore();
+            }
+        });
+
+        // Restored snapshot vs cold start is recorded per build and logged at INFO.
+        it('records the facade origin (restored + snapshotSavedAt) and says so at INFO', async () => {
+            const logSpy = vi.spyOn(cds.log('nightgate:facade'), 'info').mockImplementation(() => {});
+            mockLoadSyncState.mockResolvedValue({ shielded: 'sh', unshielded: 'un', dust: 'du', savedAt: '2026-08-25T17:08:00.000Z' });
+            try {
+                await getOrBuildWalletFacade('origin-restored', baseArgs);
+                expect(getFacadeOrigin('origin-restored')).toMatchObject({ restoredFromSnapshot: true, snapshotSavedAt: '2026-08-25T17:08:00.000Z' });
+                // buildStartedAt is registered before the worker init, builtAt once it returned.
+                expect(typeof getFacadeOrigin('origin-restored')?.buildStartedAt).toBe('string');
+                expect(typeof getFacadeOrigin('origin-restored')?.builtAt).toBe('string');
+                expect(logSpy).toHaveBeenCalledWith(expect.stringMatching(/sync state RESTORED from snapshot saved 2026-08-25T17:08/));
+                expect(logSpy).toHaveBeenCalledWith(expect.stringMatching(/built in \d+s \(snapshot deserialised\)/));
+
+                mockLoadSyncState.mockResolvedValue(null);
+                await getOrBuildWalletFacade('origin-cold', baseArgs);
+                expect(getFacadeOrigin('origin-cold')).toMatchObject({ restoredFromSnapshot: false, snapshotSavedAt: null });
+                expect(logSpy).toHaveBeenCalledWith(expect.stringMatching(/COLD START/));
+
+                await evictWalletFacade('origin-cold');
+                expect(getFacadeOrigin('origin-cold')).toBeNull();
+                expect(getFacadeOrigin('never-built')).toBeNull();
+
+                // A failed worker init leaves no origin behind.
+                mockWalletInit.mockRejectedValueOnce(new Error('worker init boom'));
+                await expect(getOrBuildWalletFacade('origin-failed', baseArgs)).rejects.toThrow(/boom/);
+                expect(getFacadeOrigin('origin-failed')).toBeNull();
             } finally {
                 logSpy.mockRestore();
             }

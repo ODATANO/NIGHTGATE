@@ -138,6 +138,25 @@ export function seedFingerprintOf(seedHex: string): string {
 const sessionRegistry = new Map<string, SessionRecord>();
 const residentAccounts = new Set<string>();
 
+/**
+ * Origin of the resident facade (0.21.0): restored from a persisted sync
+ * snapshot (delta since `snapshotSavedAt`, minutes) or cold-started (hours).
+ * Surfaced by getWalletSyncProgress; dropped with the facade.
+ */
+export interface FacadeOrigin {
+    restoredFromSnapshot: boolean;
+    snapshotSavedAt: string | null;
+    /** When this process started building the facade, before the worker init. */
+    buildStartedAt: string;
+    /** When the worker finished building it; null while the snapshot is still deserialising. */
+    builtAt: string | null;
+}
+const facadeOrigins = new Map<string, FacadeOrigin>();
+
+export function getFacadeOrigin(cacheKey: string): FacadeOrigin | null {
+    return facadeOrigins.get(cacheKey) ?? null;
+}
+
 /** State-save handlers currently writing, so a planned stop can wait for them. */
 const savesInFlight = new Set<Promise<void>>();
 
@@ -146,6 +165,9 @@ onWorkerGone(async (reason) => {
         log.info(`worker ${reason}: dropping ${residentAccounts.size} facade residency claim(s)`);
         residentAccounts.clear();
     }
+    // The origins describe facades that died with the worker; a stale entry
+    // would keep the next build from registering its own.
+    facadeOrigins.clear();
     if (reason === 'exit') {
         // A crash cannot be waited on, and saves the worker already delivered
         // may still be queued behind a slower write. Their passphrases have to
@@ -189,6 +211,7 @@ async function buildWalletFacadeLocked(
 ): Promise<{ facade: any; zswapKeys: any; dustKey: any; unshieldedKeystore: any }> {
     // Attempt to restore from CAP-persisted state (plain `db.run(SELECT)`).
     let restoreBlobs: { shielded?: string; unshielded?: string; dust?: string } | undefined;
+    let pendingOrigin: FacadeOrigin | undefined;
     const seedFingerprint = seedFingerprintOf(args.seedHex);
     if (args.syncStatePassphrase) {
         const loaded = await loadSyncState({
@@ -211,6 +234,29 @@ async function buildWalletFacadeLocked(
         } else {
             dbgSync(`no usable prior state for ${cacheKey.slice(0, 16)} (cold start)`);
         }
+        // Recorded once per build; a facade the worker already had keeps the
+        // origin of the build that created it.
+        pendingOrigin = {
+            restoredFromSnapshot: !!loaded,
+            snapshotSavedAt: loaded?.savedAt ?? null,
+            buildStartedAt: new Date().toISOString(),
+            builtAt: null
+        };
+    } else {
+        pendingOrigin = { restoredFromSnapshot: false, snapshotSavedAt: null, buildStartedAt: new Date().toISOString(), builtAt: null };
+    }
+    // Registered before the worker init: deserialising a large dust snapshot
+    // takes minutes, and the progress surface reports the origin meanwhile.
+    const earlyRegistered = !facadeOrigins.has(cacheKey);
+    if (earlyRegistered) {
+        facadeOrigins.set(cacheKey, pendingOrigin);
+        if (pendingOrigin.restoredFromSnapshot) {
+            const savedMs = pendingOrigin.snapshotSavedAt ? Date.parse(pendingOrigin.snapshotSavedAt) : NaN;
+            const age = Number.isFinite(savedMs) ? `${Math.round((Date.now() - savedMs) / 60_000)} min old` : 'age unknown';
+            log.info(`facade ${cacheKey.slice(0, 16)}: sync state RESTORED from snapshot saved ${pendingOrigin.snapshotSavedAt ?? '?'} (${age}); the reconnect applies only the delta since (deserialising the snapshot first)`);
+        } else {
+            log.info(`facade ${cacheKey.slice(0, 16)}: COLD START, no usable prior sync state; a wallet with history syncs from zero (hours)`);
+        }
     }
 
     const initArgs: WalletInitArgs = {
@@ -225,11 +271,24 @@ async function buildWalletFacadeLocked(
         restoreBlobs
     };
 
-    const result = await walletInit(initArgs);
+    let result: Awaited<ReturnType<typeof walletInit>>;
+    try {
+        result = await walletInit(initArgs);
+    } catch (err) {
+        // No facade came of it; drop the early origin.
+        if (earlyRegistered) facadeOrigins.delete(cacheKey);
+        throw err;
+    }
     dbgSync(
         `worker init ok for ${cacheKey.slice(0, 16)}: ` +
         `alreadyExisted=${result.alreadyExisted} sdk=${result.sdkVersion ?? '?'}`
     );
+    const current = facadeOrigins.get(cacheKey);
+    if (current && current.builtAt === null) {
+        facadeOrigins.set(cacheKey, { ...current, builtAt: new Date().toISOString() });
+        const took = Math.round((Date.now() - Date.parse(current.buildStartedAt)) / 1000);
+        log.info(`facade ${cacheKey.slice(0, 16)}: built in ${took}s (${current.restoredFromSnapshot ? 'snapshot deserialised' : 'cold'}), catching up now`);
+    }
 
     // Residency is claimed for EVERY facade the worker built, whether or not
     // the caller asked for persistence: a status surface must see a wallet
@@ -268,6 +327,7 @@ export async function evictWalletFacade(cacheKey: string): Promise<void> {
         log.warn(`evict failed for ${cacheKey.slice(0, 16)}:`, formatErr(err));
     } finally {
         residentAccounts.delete(cacheKey);
+        facadeOrigins.delete(cacheKey);
         sessionRegistry.delete(cacheKey);
         // Registry entry is gone, so the save sink drops any NEW save for this
         // account; now the memoized storage key can go. evictEncryptionKey
@@ -322,6 +382,7 @@ export function __getPersistenceSizeForTests(): number {
 /** Test-only: reset both maps between tests (no production caller). */
 export function __clearAllFacadesForTests(): void {
     residentAccounts.clear();
+    facadeOrigins.clear();
     sessionRegistry.clear();
 }
 

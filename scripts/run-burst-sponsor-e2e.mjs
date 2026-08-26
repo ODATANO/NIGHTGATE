@@ -19,7 +19,8 @@
 //      NIGHTGATE_INDEXER_HTTP_URL, NIGHTGATE_NODE_URL, NIGHTGATE_BURST_N (default 4),
 //      REUSE=1 (reuse prebuilt txs from scratch/unbound, only within their 30 min
 //      TTL), NIGHTGATE_URL (default http://localhost:4004), NIGHTGATE_HTTP_USER /
-//      NIGHTGATE_HTTP_PASSWORD (basic auth of a hosted server).
+//      NIGHTGATE_HTTP_PASSWORD (basic auth of a hosted server), NIGHTGATE_AGENT_TOKEN
+//      (run the burst under an agent grant's token).
 // Passes when every burst member landed.
 import { randomBytes } from 'node:crypto';
 import { join } from 'node:path';
@@ -43,8 +44,11 @@ const { deriveIndexerWsUrl } = await import('../srv/utils/nightgate-config.js');
 const IWS = process.env.NIGHTGATE_INDEXER_WS_URL || deriveIndexerWsUrl(IHTTP);
 const DIR = join(process.cwd(), 'scratch', 'unbound');
 mkdirSync(DIR, { recursive: true });
+// NIGHTGATE_AGENT_TOKEN: run under an agent grant; the sponsor policy is
+// floor ∩ grant and NIGHTGATE_SPONSOR_SESSION_ID names the grant's sponsor.
 const ng = connect({
   baseUrl: BASE, timeoutMs: 60 * 60 * 1000,
+  agentToken: process.env.NIGHTGATE_AGENT_TOKEN || undefined,
   username: process.env.NIGHTGATE_HTTP_USER, password: process.env.NIGHTGATE_HTTP_PASSWORD
 });
 

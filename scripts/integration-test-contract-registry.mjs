@@ -48,7 +48,7 @@ registry.registerContract('counter', {
     zkConfigPath
 });
 
-const resolved = await registry.resolveContract('counter');
+const resolved = await registry.resolveContract('counter', undefined, { compile: true });
 ok('registry: resolveContract returns object', resolved);
 ok('registry: privateStateId preserved',       resolved.privateStateId === 'counterPrivateState');
 ok('registry: zkConfigPath preserved',         resolved.zkConfigPath === zkConfigPath);

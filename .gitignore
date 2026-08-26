@@ -60,6 +60,7 @@ coverage/
 
 # Logs
 *.log
+*.log.err
 npm-debug.log*
 @cds-models
 

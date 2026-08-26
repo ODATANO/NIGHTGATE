@@ -76,10 +76,12 @@ vi.mock('../../srv/midnight/wallet-worker-client', () => ({
 }));
 
 const mockHasWalletFacade = vi.hoisted(() => (vi.fn(() => false)));
+const mockGetFacadeOrigin = vi.hoisted(() => vi.fn((): any => null));
 vi.mock('../../srv/submission/wallet-facade-builder', () => ({
     evictWalletFacade: mockEvictWalletFacade,
     getOrBuildWalletFacade: mockGetOrBuildWalletFacade,
-    hasWalletFacade: mockHasWalletFacade
+    hasWalletFacade: mockHasWalletFacade,
+    getFacadeOrigin: (...a: unknown[]) => (mockGetFacadeOrigin as any)(...a)
 }));
 
 vi.mock('../../srv/submission/wallet-material-factory', () => ({
@@ -125,11 +127,17 @@ const registeredProcessors = vi.hoisted(() => new Map<string, (command: unknown,
 // tests assert the read handlers actually route their session reads through it.
 const mockRunWithoutAmbientTx = vi.hoisted(() => (vi.fn((fn: () => Promise<unknown>) => fn())));
 const mockSupersedeQueuedJobs = vi.hoisted(() => (vi.fn(async () => 0)));
+const mockFindLatestJob = vi.hoisted(() => (vi.fn(async (): Promise<{ ID: string; status: string } | null> => null)));
+const MockJobAdmissionBusyError = vi.hoisted(() => class MockJobAdmissionBusyError extends Error {
+    readonly httpStatus = 503; readonly status = 503; readonly code = 'JOB_ADMISSION_BUSY'; readonly retryAfterSeconds = 2; readonly $sanitize = false;
+});
 vi.mock('../../srv/submission/background-jobs', () => ({
+    JobAdmissionBusyError: MockJobAdmissionBusyError,
     startJob: (...args: unknown[]) => (mockStartJob as any)(...args),
     registerBackgroundJobProcessor: (kind: string, _version: number, processor: (command: unknown, row: any) => Promise<unknown>) => registeredProcessors.set(kind, processor),
     runWithoutAmbientTx: (fn: () => Promise<unknown>) => (mockRunWithoutAmbientTx as any)(fn),
-    supersedeQueuedJobs: (...args: unknown[]) => (mockSupersedeQueuedJobs as any)(...args)
+    supersedeQueuedJobs: (...args: unknown[]) => (mockSupersedeQueuedJobs as any)(...args),
+    findLatestJob: (...args: unknown[]) => (mockFindLatestJob as any)(...args)
 }));
 
 import cds from '@sap/cds';
@@ -740,7 +748,8 @@ describe('wallet session handlers', () => {
             }));
             // The prewarm must block on sync-to-tip before returning, so the
             // deploy path doesn't balance against stale dust (Custom error 170).
-            expect(mockWalletWaitForSyncedState).toHaveBeenCalledWith('acct-derived', expect.any(Number));
+            // Third argument = stall bound; undefined here selects the worker's env default.
+            expect(mockWalletWaitForSyncedState).toHaveBeenCalledWith('acct-derived', expect.any(Number), undefined);
         });
 
         it('supersedes older prewarm jobs of the session, excluding the fresh one', async () => {
@@ -873,6 +882,26 @@ describe('wallet session handlers', () => {
             }
         });
 
+        // These actions return startJob's result directly, bypassing runSubmission; a busy admission still answers 503 + code + Retry-After.
+        it.each(['registerForDustGeneration', 'deregisterFromDustGeneration'])('%s answers a busy admission with 503 JOB_ADMISSION_BUSY and Retry-After', async (action) => {
+            mockDbRun.mockResolvedValueOnce(activeSessionRow());
+            mockStartJob.mockRejectedValueOnce(new MockJobAdmissionBusyError('admission busy, retry'));
+            const req = createMockRequest({ sessionId: 's1' });
+            const set = vi.fn();
+            req.http = { res: { set } };
+            const result: any = await registeredHandlers[action](req);
+            expect(req.reject).toHaveBeenCalledWith(expect.objectContaining({ status: 503, code: 'JOB_ADMISSION_BUSY', $sanitize: false, message: expect.stringMatching(/busy/) }));
+            expect(set).toHaveBeenCalledWith('Retry-After', '2');
+            expect(result?.__rejected).toBe(true);
+        });
+
+        it('other startJob failures still propagate unchanged', async () => {
+            mockDbRun.mockResolvedValueOnce(activeSessionRow());
+            mockStartJob.mockRejectedValueOnce(new Error('disk full'));
+            const req = createMockRequest({ sessionId: 's1' });
+            await expect(registeredHandlers['deregisterFromDustGeneration'](req)).rejects.toThrow(/disk full/);
+        });
+
         it('deregisterFromDustGeneration returns { jobId, status } and defers the inner call to startJob', async () => {
             mockDbRun.mockResolvedValueOnce(activeSessionRow());
             mockDeregisterNightUtxosFromDust.mockResolvedValueOnce({
@@ -966,7 +995,7 @@ describe('wallet session handlers', () => {
 
             expect(result).toEqual({ jobId: 'job-sendNight-test', status: 'pending' });
             expect(mockSendNight).not.toHaveBeenCalled();
-            // Funds-moving command: must persist encrypted (review_002 P-low).
+            // Funds-moving command: must persist encrypted.
             expect(mockStartJob.mock.calls[0][0].encryptCommand).toBe(true);
 
             // Drive the captured work fn and confirm it dispatches with the
@@ -1046,6 +1075,59 @@ describe('wallet session handlers', () => {
                 phase: 'prewarm'
             });
             expect(req.reject).not.toHaveBeenCalled();
+        });
+
+        // The snapshot age is derived once here and the job behind the numbers is named.
+        it('getWalletSyncProgress reports the snapshot age, stale past the threshold, and the prewarm job', async () => {
+            mockDbRun.mockResolvedValueOnce(activeSessionRow());
+            mockFindLatestJob.mockResolvedValueOnce({ ID: 'job-prewarm-1', status: 'failed' });
+            const twoHoursAgo = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString();
+            mockWalletGetSyncProgress.mockReturnValueOnce({
+                sessionId: 'acct-1', appliedIndex: '1200', streamTip: '1500',
+                behindEvents: '300', eventsPerSecond: 12.5, etaSeconds: 24,
+                blockHeight: '1951462', isConnected: true, indexerFresh: true,
+                caughtUp: false, elapsedMs: 45_000, label: 'prewarm',
+                updatedAt: twoHoursAgo, lastProgressAt: twoHoursAgo
+            });
+            mockGetFacadeOrigin.mockReturnValueOnce({ restoredFromSnapshot: true, snapshotSavedAt: '2026-08-25T17:08:00.000Z', buildStartedAt: '2026-08-25T17:11:00.000Z', builtAt: '2026-08-25T17:11:30.000Z' });
+            const req = createMockRequest({ sessionId: 's1' });
+            const result = await registeredHandlers['getWalletSyncProgress'](req);
+
+            expect(result.stale).toBe(true);
+            expect(result.staleSeconds).toBeGreaterThanOrEqual(7190);
+            expect(result.lastProgressAt).toBe(twoHoursAgo);
+            expect(result).toMatchObject({ jobId: 'job-prewarm-1', jobStatus: 'failed' });
+            expect(mockFindLatestJob).toHaveBeenCalledWith('connectWalletForSigning', 's1');
+            // Restored snapshot vs cold start is reported before the sync is over.
+            expect(result).toMatchObject({
+                restoredFromSnapshot: true, snapshotSavedAt: '2026-08-25T17:08:00.000Z',
+                facadeBuildStartedAt: '2026-08-25T17:11:00.000Z', facadeBuiltAt: '2026-08-25T17:11:30.000Z'
+            });
+            expect(mockGetFacadeOrigin).toHaveBeenCalledWith('acct-derived');
+        });
+
+        it('getWalletSyncProgress reports restoredFromSnapshot=null while no facade exists', async () => {
+            mockDbRun.mockResolvedValueOnce(activeSessionRow());
+            mockWalletGetSyncProgress.mockReturnValueOnce(null);
+            mockGetFacadeOrigin.mockReturnValueOnce(null);
+            const result = await registeredHandlers['getWalletSyncProgress'](createMockRequest({ sessionId: 's1' }));
+            expect(result).toMatchObject({ known: false, restoredFromSnapshot: null, snapshotSavedAt: null, facadeBuiltAt: null });
+        });
+
+        it('getWalletSyncProgress: a fresh snapshot is not stale', async () => {
+            mockDbRun.mockResolvedValueOnce(activeSessionRow());
+            mockWalletGetSyncProgress.mockReturnValueOnce({
+                sessionId: 'acct-1', appliedIndex: '1200', streamTip: '1500',
+                behindEvents: '300', eventsPerSecond: 12.5, etaSeconds: 24,
+                blockHeight: '1951462', isConnected: true, indexerFresh: true,
+                caughtUp: false, elapsedMs: 45_000, label: 'prewarm',
+                updatedAt: new Date().toISOString(), lastProgressAt: new Date().toISOString()
+            });
+            const req = createMockRequest({ sessionId: 's1' });
+            const result = await registeredHandlers['getWalletSyncProgress'](req);
+            expect(result.stale).toBe(false);
+            expect(result.staleSeconds).toBeLessThan(5);
+            expect(result.jobId).toBeNull();
         });
 
         it('getWalletSyncProgress reports known=false when no snapshot exists yet', async () => {
@@ -1192,7 +1274,7 @@ describe('wallet session handlers', () => {
             expect(mockEvictWalletFacade).toHaveBeenCalledWith('acct-derived');
         });
 
-        // session-sweep FR review P1: the expired-disconnect path must run the
+        // The expired-disconnect path must run the
         // same shared-session-aware eviction, or a sole session's in-memory
         // keys outlive the row forever (the sweep only selects active rows).
 

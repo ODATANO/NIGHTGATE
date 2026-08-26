@@ -101,6 +101,7 @@ const WORKER = {
     running: true,
     inFlightRpcs: 0,
     exitCount: 0,
+    rotationCount: 0,
     lastExitCode: null,
     lastExitAt: null,
     rpcTimeoutMs: 1_800_000,
@@ -292,6 +293,7 @@ describe('buildMetricsText', () => {
         expect(text).toContain('odatano_nightgate_wallet_worker_running 0');
         expect(text).toContain('odatano_nightgate_wallet_worker_inflight_rpcs 3');
         expect(text).toContain('odatano_nightgate_wallet_worker_exits 2');
+        expect(text).toContain('odatano_nightgate_wallet_worker_rotations 0');
     });
 
     it('still answers when the jobs table is unreadable during a schema rollout', async () => {

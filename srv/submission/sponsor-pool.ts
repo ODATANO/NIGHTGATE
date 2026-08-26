@@ -26,6 +26,8 @@
  * AgentGrants.sponsorSessionId column) is typed UUID end to end; a plain
  * string would be rejected by OData deserialization before any handler ran.
  */
+import { dustRaceLedgerCode } from './dust-race';
+
 export const PLATFORM_POOL_SENTINEL = '00000000-0000-0000-0000-706f6f6c0000';
 
 interface LaneState {
@@ -99,7 +101,7 @@ export function isRetryableSponsorFailure(err: unknown): boolean {
     // are sponsor-state problems by definition.
     if ((err as Error)?.name === 'FeeSponsorError') return true;
     const msg = String((err as Error)?.message ?? err ?? '');
-    return /genuine(ly)? sync|not caught up|sync.*(timeout|timed out)|No facade for sponsorSessionId|Custom error:? ?(170|196)\b|1010\/(170|196)\b|InvalidDustSpendProof|dust.*(stale|validity)|WALLET_SYNCING|Sponsor session/i.test(msg);
+    return /genuine(ly)? sync|not caught up|sync.*(timeout|timed out|stalled)|not synced to tip|No facade for sponsorSessionId|Custom error:? ?(170|196)\b|1010\/(170|196)\b|InvalidDustSpendProof|dust.*(stale|validity)|WALLET_SYNCING|Sponsor session/i.test(msg);
 }
 
 /**
@@ -128,8 +130,11 @@ export function isRetryableSponsorFailure(err: unknown): boolean {
  * isAmbiguousSubmitOutcome).
  */
 export function isDustRaceFailure(err: unknown): boolean {
+    // Coded rejects: dustRaceLedgerCode (dust-race.ts) is the single definition.
+    // The regex below adds pool-status shapes only the sponsored paths see.
+    if (dustRaceLedgerCode(err) != null) return true;
     const msg = String((err as Error)?.message ?? err ?? '');
-    return /Custom error:? ?(170|196)\b|1010\/(170|196)\b|InvalidDustSpendProof|TransactionInvalidError|Transaction is invalid and was rejected by the node/i.test(msg);
+    return /InvalidDustSpendProof|TransactionInvalidError|Transaction is invalid and was rejected by the node/i.test(msg);
 }
 
 /**

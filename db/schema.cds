@@ -228,9 +228,31 @@ entity AgentGrants : cuid, managed {
     jobsUsedToday    : Integer default 0; // consumed budget inside budgetWindow
     budgetWindow     : String(10); // UTC day 'YYYY-MM-DD' the counter belongs to
     sponsorSessionId : UUID; // fixed fee-sponsor binding; requests may not override it
+    allowedContracts : LargeString; // JSON array; sponsored calls run under floor ∩ grant; null = platform floor
+    allowedCircuits  : LargeString; // JSON array, same rule
+    allowDeploy      : Boolean default false; // the sponsor also pays for a contract deploy built by the caller
+    maxDeploys       : Integer; // lifetime deploy budget, separate from maxJobsPerDay; default 1 when allowDeploy
+    deploysUsed      : Integer default 0; // reserved before broadcast; released only for a rejected tx
+    deployedContracts : LargeString; // JSON array of addresses deployed under this grant; sponsorable on top of floor ∩ grant
     validUntil       : Timestamp; // null = no expiry
     isActive         : Boolean default true;
     revokedAt        : Timestamp;
+}
+
+/**
+ * Contracts registered at runtime through the admin service (0.21.0), on top
+ * of the config floor. Loaded into the registry at boot after the config; a
+ * row never shadows a config name. Paths are absolute, inside
+ * NIGHTGATE_CONTRACTS_DIR, validated when the row was written.
+ */
+entity ContractRegistrations : managed {
+    key name           : String(100);
+        artifactPath   : String(1000) not null; // Compact-emitted JS module, absolute
+        zkConfigPath   : String(1000) not null; // directory holding keys/ and zkir/, absolute
+        privateStateId : String(200) not null;
+        slotWidth      : Integer; // vault-family content-tree width; null = 16
+        networkId      : String(30); // network of the registering process, informational
+        registeredBy   : String(200); // admin principal
 }
 
 /**

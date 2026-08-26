@@ -321,6 +321,9 @@ export async function buildMetricsText(db: Db): Promise<string> {
     lines.push(`# HELP ${metricPrefix}_wallet_worker_exits Wallet worker thread exits since process start`);
     lines.push(`# TYPE ${metricPrefix}_wallet_worker_exits counter`);
     lines.push(`${metricPrefix}_wallet_worker_exits ${worker.exitCount}`);
+    lines.push(`# HELP ${metricPrefix}_wallet_worker_rotations Controlled wallet worker rotations (artifact generation budget) since process start`);
+    lines.push(`# TYPE ${metricPrefix}_wallet_worker_rotations counter`);
+    lines.push(`${metricPrefix}_wallet_worker_rotations ${worker.rotationCount ?? 0}`);
 
     return lines.join('\n') + '\n';
 }
@@ -421,6 +424,7 @@ export function buildWorkerStatus(isAdmin = false): Record<string, unknown> {
         running: worker.running,
         inFlightRpcs: worker.inFlightRpcs,
         exitCount: worker.exitCount,
+        rotationCount: worker.rotationCount ?? 0,
         lastExitCode: worker.lastExitCode,
         lastExitAt: worker.lastExitAt,
         rpcTimeoutMs: worker.rpcTimeoutMs,

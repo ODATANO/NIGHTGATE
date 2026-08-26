@@ -30,7 +30,7 @@ import {
     SubmissionError,
     classifySubmissionError,
     reconcilePendingSubmission,
-    type TransactionSubmitterDeps
+    type TransactionSubmitterDeps, dustRaceLedgerCode
 } from '../../srv/submission/TransactionSubmitter';
 import type { ContractProvidersConfig, WalletMaterial } from '../../srv/midnight/providers';
 
@@ -148,6 +148,64 @@ beforeEach(() => {
 });
 
 // ---- Tests ----------------------------------------------------------------
+
+// The bound deploy/call/batch paths rebuild-retry a 1010/170|196 inside the worker call, before any txHash exists.
+describe('TransactionSubmitter dust-race rebuild-retry', () => {
+    const dustRace = () => {
+        const wrapped: any = new Error('Transaction submission error');
+        wrapped.cause = new Error('1010: Invalid Transaction: Custom error: 170');
+        return wrapped;
+    };
+    beforeEach(() => { process.env.NIGHTGATE_DUST_RACE_BACKOFF_MS = '0'; });
+    afterEach(() => { delete process.env.NIGHTGATE_DUST_RACE_BACKOFF_MS; delete process.env.NIGHTGATE_DUST_RACE_RETRIES; });
+
+    test('deploy: a 1010/170 is rebuilt and resubmitted; the second attempt lands on the SAME submission row', async () => {
+        walletDeployContract
+            .mockRejectedValueOnce(dustRace())
+            .mockResolvedValueOnce({ txHash: '0xsecond', contractAddress: '0xCONTRACT', onChainStatus: 'SucceedEntirely' });
+        const { submitter, db } = newSubmitter();
+        const result = await submitter.deploy({ contractName: 'counter', registration: REGISTRATION, initialPrivateState: {}, sessionId: 'session-race' });
+        expect(result).toMatchObject({ txHash: '0xsecond', status: 'included' });
+        expect(walletDeployContract).toHaveBeenCalledTimes(2);
+        const rows = db.tables['midnight.PendingSubmissions'];
+        expect(rows.length).toBe(1);
+        expect(rows[0]).toMatchObject({ txHash: '0xsecond', status: 'included' });
+    });
+
+    test('call and batch retry the same way', async () => {
+        walletSubmitContractCall
+            .mockRejectedValueOnce(dustRace())
+            .mockResolvedValueOnce({ txHash: '0xcall', onChainStatus: 'SucceedEntirely' });
+        walletSubmitContractCallBatch
+            .mockRejectedValueOnce(dustRace())
+            .mockResolvedValueOnce({ txHash: '0xbatch', onChainStatus: 'SucceedEntirely', circuits: ['a', 'b'] });
+        const { submitter } = newSubmitter();
+        const call = await submitter.call({ contractAddress: '0xC', circuit: 'increment', args: [], contractName: 'counter', registration: REGISTRATION, sessionId: 's' });
+        expect(call.txHash).toBe('0xcall');
+        expect(walletSubmitContractCall).toHaveBeenCalledTimes(2);
+        const batch = await submitter.callBatch({ contractAddress: '0xC', calls: [{ circuit: 'a', args: [] }, { circuit: 'b', args: [] }], contractName: 'counter', registration: REGISTRATION, sessionId: 's' } as any);
+        expect(batch.txHash).toBe('0xbatch');
+        expect(walletSubmitContractCallBatch).toHaveBeenCalledTimes(2);
+    });
+
+    test('budget exhausted: fails with the retryable dust-race classification, not a generic 1010', async () => {
+        process.env.NIGHTGATE_DUST_RACE_RETRIES = '1';
+        walletDeployContract.mockRejectedValue(dustRace());
+        const { submitter, db } = newSubmitter();
+        await expect(submitter.deploy({ contractName: 'counter', registration: REGISTRATION, initialPrivateState: {}, sessionId: 's' }))
+            .rejects.toMatchObject({ classification: { code: '1010/170', retryable: true, transient: 'dust-race' } });
+        expect(walletDeployContract).toHaveBeenCalledTimes(2); // 1 + 1 retry
+        expect(db.tables['midnight.PendingSubmissions'][0]).toMatchObject({ status: 'failed', errorCode: '1010/170' });
+    });
+
+    test('any other failure is NOT retried', async () => {
+        walletDeployContract.mockRejectedValue(new Error('1010: Invalid Transaction: Custom error: 188'));
+        const { submitter } = newSubmitter();
+        await expect(submitter.deploy({ contractName: 'counter', registration: REGISTRATION, initialPrivateState: {}, sessionId: 's' }))
+            .rejects.toMatchObject({ classification: { code: '1010/188', retryable: false } });
+        expect(walletDeployContract).toHaveBeenCalledTimes(1);
+    });
+});
 
 describe('TransactionSubmitter.deploy', () => {
     test('inserts pending row, then transitions to included on success', async () => {
@@ -507,7 +565,22 @@ describe('classifySubmissionError', () => {
         const wrapped: any = new Error('Transaction submission error');
         wrapped.cause = new Error('1010: Invalid Transaction: Custom error: 170');
         const c = classifySubmissionError(wrapped, 'preprod');
-        expect(c).toMatchObject({ code: '1010/170', retryable: false });
+        // a coded dust race is retryable (rebuild + resubmit) on every submitting path
+        expect(c).toMatchObject({ code: '1010/170', retryable: true, transient: 'dust-race' });
+        expect(c.message).toMatch(/rebuild and resubmit/);
+    });
+
+    test('1010/196 is the same transient dust race; other 1010 codes stay terminal', () => {
+        expect(classifySubmissionError(new Error('1010: Invalid Transaction: Custom error: 196'), 'preprod'))
+            .toMatchObject({ code: '1010/196', retryable: true, transient: 'dust-race' });
+        for (const n of ['117', '138', '182', '188', '192']) {
+            const c = classifySubmissionError(new Error(`1010: Invalid Transaction: Custom error: ${n}`), 'preprod');
+            expect(c, n).toMatchObject({ code: `1010/${n}`, retryable: false });
+            expect(c.transient, n).toBeUndefined();
+        }
+        expect(dustRaceLedgerCode(new Error('1010: Invalid Transaction: Custom error: 170'))).toBe('1010/170');
+        expect(dustRaceLedgerCode(new Error('Priority is too low: (170 vs 196)'))).toBeNull();
+        expect(dustRaceLedgerCode(new Error('harmless'))).toBeNull();
     });
 
     test('a stack frame like proof-provider.js:1010:27 is not read as a Substrate code', () => {

@@ -74,6 +74,8 @@ export interface WalletSyncProgress {
     elapsedMs: number;
     label: string;
     updatedAt: string;
+    /** When appliedIndex last advanced; absent from snapshots of a pre-0.21 worker. */
+    lastProgressAt?: string;
 }
 
 // Latest pushed snapshot per facade. Module scope (not ClientState) because
@@ -100,6 +102,14 @@ let everStarted = false;
 let workerExitCount = 0;
 let lastExitCode: number | null = null;
 let lastExitAt: string | null = null;
+// Controlled rotations (the worker exits after NIGHTGATE_WORKER_MAX_GENERATIONS
+// artifact generations to release Node's module cache), counted apart from crashes.
+let workerRotationCount = 0;
+let rotationAnnounced = false;
+// Worker that announced its rotation and has not exited yet; new calls wait
+// for its exit and go to the respawned worker.
+let drainingWorker: Worker | null = null;
+const WORKER_ROTATING = 'WORKER_ROTATING';
 
 // Kept at module scope (not on ClientState) so it survives a worker respawn:
 // the sink is wired once at startup and must keep persisting state-save events
@@ -219,6 +229,10 @@ export async function startWalletWorker(): Promise<void> {
             }
         } else if (msg?.kind === 'private-state-rpc') {
             dispatchPrivateStateRpc(msg);
+        } else if (msg?.kind === 'rotating') {
+            rotationAnnounced = true;
+            drainingWorker = worker;
+            log.info(`worker announced its rotation (${msg.generations} artifact generations, ${msg.inflight ?? 0} call(s) draining); new calls wait for the respawn`);
         }
     });
 
@@ -227,11 +241,18 @@ export async function startWalletWorker(): Promise<void> {
         rejectAllPendingRpcs(`wallet-worker crashed: ${err instanceof Error ? err.message : String(err)}`);
     });
     worker.on('exit', code => {
-        log.warn(`worker exited code=${code}`);
         client = null;
-        workerExitCount += 1;
-        lastExitCode = code;
-        lastExitAt = new Date().toISOString();
+        if (drainingWorker === worker) drainingWorker = null;
+        if (rotationAnnounced && code === 0) {
+            rotationAnnounced = false;
+            workerRotationCount += 1;
+            log.info(`worker rotated (controlled exit after its generation budget); the next call respawns it`);
+        } else {
+            log.warn(`worker exited code=${code}`);
+            workerExitCount += 1;
+            lastExitCode = code;
+            lastExitAt = new Date().toISOString();
+        }
         // No facade survived the exit, so no snapshot describes anything that
         // is still running. Keeping them would report phantom catch-ups.
         syncProgressCache.clear();
@@ -335,10 +356,35 @@ export function setStateSaveSink(sink: StateSaveSink | undefined): void {
  * + submitted) before the broadcast happens; if it throws, the worker does not
  * broadcast.
  */
-export interface SubmitIntentInfo { txHash: string; contractAddress?: string; circuits?: string[]; note?: string; sponsorAccountId?: string }
+export interface SubmitIntentInfo { txHash: string; contractAddress?: string; circuits?: string[]; note?: string; sponsorAccountId?: string; deployed?: string[] }
 export type SubmitIntentHook = (txHash: string, intent: SubmitIntentInfo) => Promise<void>;
 
 async function rpc<T>(method: string, args: unknown, timeoutMs: number = RPC_TIMEOUT_MS, onSubmitIntent?: SubmitIntentHook): Promise<T> {
+    // A rotating worker takes no new work: wait for its exit, then call the
+    // respawned worker. A WORKER_ROTATING refusal is retried once the same way.
+    for (let attempt = 0; ; attempt++) {
+        await waitForDrainingWorker();
+        try {
+            return await rpcOnce<T>(method, args, timeoutMs, onSubmitIntent);
+        } catch (err) {
+            if ((err as Error)?.name === WORKER_ROTATING && attempt === 0) continue;
+            throw err;
+        }
+    }
+}
+
+async function waitForDrainingWorker(): Promise<void> {
+    const w = drainingWorker;
+    if (!w) return;
+    await new Promise<void>(resolve => {
+        const done = () => resolve();
+        w.once('exit', done);
+        // Exit fired before we subscribed: the exit handler cleared it.
+        if (drainingWorker !== w) { w.off('exit', done); resolve(); }
+    });
+}
+
+async function rpcOnce<T>(method: string, args: unknown, timeoutMs: number, onSubmitIntent?: SubmitIntentHook): Promise<T> {
     if (!client) {
 
         if (!everStarted) {
@@ -373,7 +419,7 @@ async function rpc<T>(method: string, args: unknown, timeoutMs: number = RPC_TIM
             if (msg?.kind === 'submit-intent') {
                 // Intermediate message, not the reply: persist the boundary,
                 // then ack (or nack) so the worker broadcasts (or does not).
-                const intent: SubmitIntentInfo = { txHash: String(msg.txHash), contractAddress: msg.contractAddress, circuits: msg.circuits, note: msg.note, sponsorAccountId: msg.sponsorAccountId };
+                const intent: SubmitIntentInfo = { txHash: String(msg.txHash), contractAddress: msg.contractAddress, circuits: msg.circuits, note: msg.note, sponsorAccountId: msg.sponsorAccountId, ...(Array.isArray(msg.deployed) ? { deployed: msg.deployed.map(String) } : {}) };
                 Promise.resolve()
                     .then(() => onSubmitIntent?.(intent.txHash, intent))
                     .then(() => port2.postMessage({ kind: 'submit-intent-ack', txHash: msg.txHash, ok: true }))
@@ -500,9 +546,14 @@ export function walletInit(args: WalletInitArgs): Promise<{
     return rpc('init', args);
 }
 
-export function walletWaitForSyncedState(sessionId: string, timeoutMs?: number): Promise<{ synced: true }> {
-    const workerBudgetMs = timeoutMs ?? 3 * 60 * 60 * 1000;
-    return rpc('waitForSyncedState', { sessionId, timeoutMs }, workerBudgetMs + 5 * 60 * 1000);
+/**
+ * Prewarm sync gate. `timeoutMs` is the absolute ceiling, `stallMs` the
+ * no-progress bound (the worker's env default when omitted); the wait fails
+ * on whichever fires first and its message says which.
+ */
+export function walletWaitForSyncedState(sessionId: string, timeoutMs?: number, stallMs?: number): Promise<{ synced: true }> {
+    const workerBudgetMs = timeoutMs ?? 12 * 60 * 60 * 1000;
+    return rpc('waitForSyncedState', { sessionId, timeoutMs, stallMs }, workerBudgetMs + 5 * 60 * 1000);
 }
 
 export async function walletEvict(sessionId: string): Promise<{ evicted: boolean }> {
@@ -538,6 +589,8 @@ export interface WalletWorkerStatus {
     inFlightRpcs: number;
     /** Worker exits since process start. Climbing means crash-looping. */
     exitCount: number;
+    /** Controlled rotations (generation budget), not crashes. */
+    rotationCount: number;
     lastExitCode: number | null;
     lastExitAt: string | null;
     rpcTimeoutMs: number;
@@ -559,6 +612,7 @@ export function getWalletWorkerStatus(): WalletWorkerStatus {
         running: client !== null,
         inFlightRpcs: pendingRpcs.size,
         exitCount: workerExitCount,
+        rotationCount: workerRotationCount,
         lastExitCode,
         lastExitAt,
         rpcTimeoutMs: RPC_TIMEOUT_MS,
@@ -581,13 +635,33 @@ export function walletRegisterDustGeneration(args: {
     sessionId: string;
     dustReceiverAddress?: string;
     syncTimeoutMs?: number;
-}): Promise<{
-    txId: string | null;
-    registeredCount: number;
-    totalNightUtxos: number;
-    dustReceiverAddress: string;
-}> {
+}): Promise<RegisterDustGenerationOutcome> {
     return rpc('registerDustGeneration', args);
+}
+
+/** Outcome of `registerDustGeneration` (0.21.0). */
+export interface RegisterDustGenerationOutcome {
+    /** Transaction ID of the registration submission; null when nothing was registered. */
+    txId: string | null;
+    /** Whether a registration was submitted. */
+    changed: boolean;
+    /** Why nothing changed: 'already-registered' | 'no-night-utxos'; null when changed. */
+    reason: 'already-registered' | 'no-night-utxos' | null;
+    registeredCount: number;
+    /** All NIGHT UTXOs of the wallet, registered or not, at the time of the call. */
+    totalNightUtxos: number;
+    /** The applied receiver; null when nothing was registered. */
+    dustReceiverAddress: string | null;
+    /** The receiver the call asked for (derived or supplied), applied or not. */
+    requestedReceiver: string;
+    registeredUtxosBefore: number;
+    /** Registered NIGHT UTXOs once the tx applied locally; null when not observed within the settle window. */
+    registeredUtxosAfter: number | null;
+    /** Whether the resulting count was observed (NIGHTGATE_DUST_REGISTER_SETTLE_MS). */
+    settled: boolean;
+    /** Whether the registration consolidated inputs (fewer registered UTXOs than inputs); null when unobserved. */
+    consolidated: boolean | null;
+    message: string;
 }
 
 /**
@@ -686,6 +760,8 @@ export function walletEstimateTransferFee(args: {
 
 export interface WorkerContractRegistration {
     artifactPath: string;
+    /** Generation digest (module + verifier keys); the worker keys its module cache by it. */
+    artifactDigest?: string;
     privateStateId: string;
     zkConfigPath: string;
     /** Content-tree width of a vault-family artifact (16 default, 32 for attestation-vault-32). */
@@ -782,7 +858,9 @@ export function walletSponsorFinalizedTx(args: {
     networkId: WalletSubmitContractCallArgs['networkId'];
     allowedContracts?: string[];
     allowedCircuits?: string[];
-}, onSubmitIntent?: SubmitIntentHook): Promise<{ txHash: string; circuits: string[]; contractAddress: string }> {
+    /** Floor and grant both allow a sponsored ContractDeploy in this transaction. */
+    allowDeploy?: boolean;
+}, onSubmitIntent?: SubmitIntentHook): Promise<{ txHash: string; circuits: string[]; contractAddress: string; deployed?: string[] }> {
     return rpc('sponsorFinalizedTx', args, RPC_TIMEOUT_MS, onSubmitIntent);
 }
 
@@ -830,6 +908,8 @@ export function walletSponsorUnboundTx(args: {
     networkId: WalletSubmitContractCallArgs['networkId'];
     allowedContracts?: string[];
     allowedCircuits?: string[];
-}, onSubmitIntent?: SubmitIntentHook): Promise<{ txHash: string; circuits: string[]; contractAddress: string; note: string }> {
+    /** Floor and grant both allow a sponsored ContractDeploy in this transaction. */
+    allowDeploy?: boolean;
+}, onSubmitIntent?: SubmitIntentHook): Promise<{ txHash: string; circuits: string[]; contractAddress: string; note: string; deployed?: string[] }> {
     return rpc('sponsorUnboundTx', args, RPC_TIMEOUT_MS, onSubmitIntent);
 }

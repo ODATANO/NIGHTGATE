@@ -117,9 +117,15 @@ curl -X POST http://localhost:4004/api/v1/nightgate/sendNight \
   }'
 ```
 
-### `registerForDustGeneration(sessionId, dustReceiverAddress?) → { txId, registeredCount, totalNightUtxos, dustReceiverAddress }`
+### `registerForDustGeneration(sessionId, dustReceiverAddress?) → { txId, changed, reason, registeredCount, totalNightUtxos, dustReceiverAddress, requestedReceiver, registeredUtxosBefore, registeredUtxosAfter, settled, consolidated, message }`
 
-Register the wallet's **unregistered unshielded NIGHT UTXOs** for dust generation. Returns a no-op response (`txId: ""`, `registeredCount: 0`) if there are no unregistered UTXOs to process.
+Register the wallet's **unregistered unshielded NIGHT UTXOs** for dust generation.
+
+**The result reports what happened, not what was asked** (0.21.0):
+
+- Registration binds the **address**: once a wallet is registered, every NIGHT arriving there generates dust for the same receiver. A call naming a different receiver on an already-registered wallet therefore changes nothing. It answers `changed: false`, `reason: "already-registered"`, `dustReceiverAddress: null` (a receiver is only echoed when it was applied), `requestedReceiver` and a `message` pointing at `deregisterFromDustGeneration` (deregister, then register again naming the new receiver). The standing receiver is not readable from the wallet SDK, so the server cannot tell an identical re-request from a changed one and does not refuse; the job succeeds with `changed: false`. `reason: "no-night-utxos"` is the other no-op: nothing unshielded to register.
+- `registeredCount` counts the **inputs**. One registration over several UTXOs is one transaction and it **consolidates** them (measured: nine 100-NIGHT UTXOs registered as nine, settled as two). One registered UTXO yields one dust note and dust notes are the parallel sponsoring capacity, so the number that matters is `registeredUtxosAfter`: the wallet's registered NIGHT UTXO count observed after the transaction was applied locally (`settled: true`; bounded by `NIGHTGATE_DUST_REGISTER_SETTLE_MS`, default 90 s, else `settled: false` and `null`). `consolidated: true` says the inputs merged.
+- **Order matters:** register the wallet first, fund it afterwards in separate payments. Each later payment arrives already registered and stays a separate UTXO (measured: eleven payments, eleven notes). A bulk registration of many existing UTXOs merges them.
 
 | Field | Type | Notes |
 |---|---|---|
@@ -435,6 +441,52 @@ An empty list means "no restriction", which is only appropriate for a private
 deployment. Treat this endpoint as spend authority: whoever can reach it can
 make you pay a transaction fee.
 
+**Changeable while the server runs (0.21.0).** A container's environment is
+fixed at creation, so a one-line change to these lists used to mean a
+recreate and a ~20 min cold sponsor pool. Two layers replace that:
+
+- **Policy follows the grant.** `createAgentGrant(..., allowedContracts,
+  allowedCircuits)` records which contracts and circuits THAT consumer may
+  have sponsored. A sponsored call made with the grant's token runs under the
+  intersection of the platform lists and the grant's; an absent grant list
+  inherits the platform list, an empty platform list lets the grant be the
+  whole policy. Onboarding a consumer is then one call, and revoking the
+  grant removes its sponsoring reach with it. Two non-empty lists that share
+  nothing refuse at admission with `403 SPONSOR_POLICY_EMPTY` (a grant can
+  narrow the floor, never widen it).
+- **Policy file for the platform floor.** Set `NIGHTGATE_SPONSOR_POLICY_FILE`
+  to a JSON file `{ "allowedContracts": [...], "allowedCircuits": [...] }`
+  (for the Docker image, under the data volume). It is re-read on every
+  sponsored call behind an mtime cache and replaces the two env variables
+  while set. Fail-closed: an unreadable or invalid file keeps the last good
+  policy in force, and with none loaded yet every sponsored call answers
+  `503 SPONSOR_POLICY_UNAVAILABLE`; it never falls back to "allow any".
+- **Sponsored deploys, a distinct right.** A consumer deploying its own
+  contract used to need a funded wallet with dust first, the one step
+  sponsoring exists to remove. `createAgentGrant(..., allowDeploy: true,
+  maxDeploys?)` lets the sponsor also pay for a contract DEPLOY the caller
+  built and signed with its own key (txbuilder `buildDeploySponsorable`; the
+  caller owns the contract, the sponsor never sees a key). Off by default,
+  never implied by an action list, and gated twice: the server's floor must
+  open it (`NIGHTGATE_SPONSOR_ALLOW_DEPLOY=true`, or `allowDeploy` in the
+  policy file) AND the grant must carry it with deploy budget left
+  (`maxDeploys`, default 1, a lifetime count separate from `maxJobsPerDay`,
+  because a deploy writes verifier keys on chain and costs a multiple of a
+  call). A deploy is not matched against `allowedContracts` (the address does
+  not exist yet); it has its own byte ceiling
+  (`NIGHTGATE_SPONSOR_MAX_DEPLOY_BYTES`, default 40960), and at most ONE
+  deploy per sponsored transaction. The budget is reserved at the
+  submit-intent, before the sponsor broadcasts, in one database transaction
+  with the attempt row and the job's transition: two parallel deploys under
+  a `maxDeploys: 1` grant cannot both go out, a crash cannot leave a
+  reservation without its attempt, and an attempt the node provably rejects
+  is closed and refunded together. A deploy that lands but fails on chain
+  keeps its reservation (the fee was paid). After the deploy lands the
+  address is recorded in the grant's `deployedContracts` and is sponsorable
+  ON TOP of `floor ∩ grant` (no static allow-list could have named it), so the
+  follow-up calls are sponsorable at once, whatever the platform floor says.
+  Contract maintenance updates are never sponsored.
+
 **Pool + failover (0.17.2).** The sessions in `NIGHTGATE_FEE_SPONSOR_SESSION`
 form a lease pool: one in-flight dust spend per wallet, callers queue on the
 pool (`NIGHTGATE_SPONSOR_LEASE_WAIT_MS`, default 120s), and a sponsor that
@@ -711,7 +763,7 @@ Response:
 ]
 ```
 
-### `getWalletSyncProgress(sessionId) → { known, caughtUp, appliedIndex, streamTip, behindEvents, eventsPerSecond, etaSeconds, blockHeight, isConnected, indexerFresh, elapsedMs, phase, updatedAt }`
+### `getWalletSyncProgress(sessionId) → { known, caughtUp, appliedIndex, streamTip, behindEvents, eventsPerSecond, etaSeconds, blockHeight, isConnected, indexerFresh, elapsedMs, phase, updatedAt, lastProgressAt, staleSeconds, stale, jobId, jobStatus, restoredFromSnapshot, snapshotSavedAt, facadeBuiltAt }`
 
 How far the wallet's catch-up has got and how fast it is moving. Poll this instead of guessing from elapsed time: a wallet that has been idle for a day needs a long catch-up, and without these numbers a slow sync and a hung one look identical.
 
@@ -719,7 +771,11 @@ How far the wallet's catch-up has got and how fast it is moving. Poll this inste
 
 **Reading it:** slow but healthy is `appliedIndex` climbing with `eventsPerSecond` above zero. Genuinely stuck is `appliedIndex` unchanged across polls while `elapsedMs` grows, or `isConnected: false`. `indexerFresh: false` means the indexer itself is lagging, so its tip does not count as chain tip.
 
-Cheap and safe to poll during a sync: the answer comes from a snapshot the wallet worker pushes to the main thread about every 15s, so no request reaches the CPU-saturated worker. `updatedAt` says how fresh the snapshot is. The same numbers appear in the server log at INFO under `nightgate:worker` (`genuine-sync [prewarm] ... rate=... eta=...`).
+Cheap and safe to poll during a sync: the answer comes from a snapshot the wallet worker pushes to the main thread about every 15s, so no request reaches the CPU-saturated worker. The same numbers appear in the server log at INFO under `nightgate:worker` (`genuine-sync [prewarm] ... rate=... eta=...`).
+
+**Is anyone still syncing?** (0.21.0) The snapshot outlives the wait that produced it, so a poller could read plausible numbers for hours after the prewarm job had ended. `staleSeconds` is the age of the reading and `stale` is true past `NIGHTGATE_SYNC_PROGRESS_STALE_S` (default 60 s, four push intervals): a stale snapshot describes a sync nobody is running. `jobId`/`jobStatus` name the session's latest prewarm job, so the next call is `getJobStatus(jobId)` rather than a guess. `lastProgressAt` is when `appliedIndex` last advanced; unchanged while `updatedAt` keeps moving is a stalled sync, which the prewarm now fails on its own after `NIGHTGATE_PREWARM_STALL_MS` (default 10 min) with a message that says so. A slow-but-moving sync runs up to the absolute ceiling `NIGHTGATE_PREWARM_SYNC_TIMEOUT_MS` (default 12 h) and its failure message says that instead.
+
+**Minutes or hours?** (0.21.0) A restart destroys the session row, not the wallet's sync state: that is persisted per account (`WalletSyncStates`) and restored on the next `connectWallet`, so a reconnect applies only the delta since the last save (measured: 4 s when fresh, ~6 min after an hour of chain). Only a wallet with no usable snapshot syncs from zero (3 to 4 h for one with history). `restoredFromSnapshot` says which of the two is running, `snapshotSavedAt` what it resumes from, `facadeBuildStartedAt` when this process started building the facade and `facadeBuiltAt` when the worker finished (`null` while it is still deserialising the snapshot: a grown dust state is large, live 15 MB took ~7 min to deserialise and then 4 s to catch up, so the fields are set BEFORE the worker init and already say what is being restored). All four are `null` while nothing is being built. The same fact is one INFO line under `nightgate:facade` (`sync state RESTORED from snapshot saved ...` / `COLD START`, then `built in Ns`).
 
 **Rate limit:** 60/min per client IP.
 
@@ -742,7 +798,12 @@ Response:
   "indexerFresh": true,
   "elapsedMs": 245000,
   "phase": "prewarm",
-  "updatedAt": "2026-08-04T09:00:00.000Z"
+  "updatedAt": "2026-08-04T09:00:00.000Z",
+  "lastProgressAt": "2026-08-04T08:59:57.000Z",
+  "staleSeconds": 4,
+  "stale": false,
+  "jobId": "9e2c1c1a-...",
+  "jobStatus": "running"
 }
 ```
 
@@ -818,6 +879,12 @@ Operator controls, `@requires: 'admin'` (since 0.5.2; unauthenticated or non-adm
 
 `getJobStats(windowHours?) → { windowHours, since, total, byStatus[], topErrors[], oldestQueuedSeconds }` (0.20.0) - the cheap aggregate for a dashboard: counts per status plus the ten error codes that are piling up, over the last `windowHours` (default 24, max 720). `topErrors` is what turns "many jobs failed" into a diagnosis, for instance a run of `1010/188` meaning batched calls are crossing the guaranteed/fallible boundary.
 
+`registerContract(name, artifactPath, zkConfigPath, privateStateId, slotWidth?) → { name, source, artifactPath, zkConfigPath, privateStateId, slotWidth, artifactDigest, hasProverKeys }` (0.21.0) - make a contract artifact known **without a restart**. Until now `cds.requires.nightgate.contracts` was read once at startup, so every new consumer contract (and each revision) cost a process restart that closed every wallet session and re-warmed the facades. The config stays the immutable floor: a config name is refused with `409`, and everything else adds next to it. Paths must resolve inside `NIGHTGATE_CONTRACTS_DIR` (default: the package's and the working directory's `contracts/`; importing an artifact executes its module, so an arbitrary path is not accepted from anyone). Validated before anything changes: the module must export a Compact `Contract` class, the zk-config directory must hold `keys/*.verifier` and `zkir/`. Persisted in `ContractRegistrations` and reloaded at boot; the returned `artifactDigest` is the generation every persisted command gets pinned to. Re-registering a runtime name under a new artifact is a new generation, so jobs recorded against the previous one refuse, exactly as after a config change. `hasProverKeys: false` means the contract deploys and verifies here but cannot be proven here. `/zk-config`, `/contract-manifest` and `getRuntimeInfo()` see the new contract immediately. Onboarding a consumer is then `registerContract` + `createAgentGrant(allowedContracts: [...])`, no restart, no recreate.
+
+`unregisterContract(name) → { removed }` (0.21.0) - remove a runtime registration (memory + table). Config names refuse with `409`.
+
+`listContracts() → [{ name, source, ..., artifactDigest, hasProverKeys }]` (0.21.0) - every contract this process knows, `source` `config` or `runtime`.
+
 `grantRole(userId, role, scope?, validUntil?)` - grant a disclosure tier (`public_only` | `legitimate_interest` | `authority`) read by the `AttestationService` mixin's `attachDisclosureRole` middleware. Caller must already hold `authority`. This is the **off-chain** tier table (`DisclosureRoles`).
 
 > **On-chain alternative.** `attachDisclosureRole(req, db, { contractAddress, payloadHash? })` resolves the tier from the **on-chain** `DisclosureGrants` ACL instead: it maps the caller (via `GranteeIdentities` → `registerGranteeIdentity`) to a `Bytes<32>` grantee and matches active grants for that contract. With a `contractAddress` the on-chain result is authoritative (no off-chain fallback); without one, the off-chain `grantRole` table applies. The gate is a programmatic middleware - the consumer wires it into the reads it wants to gate.
@@ -853,6 +920,16 @@ Error responses follow OData's `{ error: { code, message } }` envelope. For subm
 }
 ```
 
+**Retryable 503s keep their body in production.** CAP replaces the message of every 5xx with the generic reason phrase when `NODE_ENV=production`. The 503s NIGHTGATE raises as advice opt out of that, so a client can switch on `error.code` and read `error.message` in any environment; each also sets a `Retry-After` header:
+
+| `error.code` | Meaning | `Retry-After` |
+|---|---|---|
+| `JOB_ADMISSION_BUSY` | the database stayed busy for the whole admission retry budget; nothing was written, nothing submitted, send the same request again | 2 s |
+| `WALLET_SYNCING` | a facade-backed read hit the bounded sync gate; poll again once the prewarm job reports ready | 15 s |
+| a retryable submission code (`1016`, `NetworkOrTimeout`) | the JSON payload below, with `retryable: true` | none |
+
+Every other 5xx is a genuine server fault and stays sanitised.
+
 Codes returned by `classifySubmissionError` (`srv/submission/TransactionSubmitter.ts`):
 
 | Code | Retryable | Trigger |
@@ -867,7 +944,7 @@ Codes returned by `classifySubmissionError` (`srv/submission/TransactionSubmitte
 
 Other failures surface as the **raw node/SDK error** rather than a `classifySubmissionError` code:
 
-- **Custom error `170` (dust validity window)** - raised by the node when the wallet's dust `ctime` is outside the grace window, usually a lagging indexer or a wallet not synced to tip. (`failed assert: predicate false` is the distinct predicate-circuit rejection.)
+- **`1010/170` and `1010/196` (transient dust race)** - the dust spend was built against a dust state the node has already moved past (170: stale merkle root or validity window, usually a lagging indexer or a wallet not synced to tip; 196: the note's nullifier is already known, a concurrent spend on the same note). Pre-mempool, no fee spent. Since 0.21.0 ONE classification covers every submitting path: `classifySubmissionError` marks them `retryable: true, transient: "dust-race"`, and the bound `deployContract` / `submitContractCall` / batch paths rebuild and resubmit inside the worker call before any txHash exists (`NIGHTGATE_DUST_RACE_RETRIES`, default 2, `NIGHTGATE_DUST_RACE_BACKOFF_MS`, default 5000), the same self-heal the sponsored paths have had since 0.18 (`NIGHTGATE_SPONSOR_DUST_RETRIES`). A job that still fails carries that code. (`failed assert: predicate false` is the distinct predicate-circuit rejection.)
 - **`Wallet.InsufficientFunds`** - raised by the wallet SDK when there's insufficient dust to pay fees, or insufficient NIGHT to satisfy outputs.
 - **`MalformedResult`** - thrown by `TransactionSubmitter` when the SDK returns without the expected fields (likely an SDK bug); it is a distinct thrown error, not a `classifySubmissionError` code.
 

@@ -11,6 +11,7 @@ import { bytesToHex } from '@noble/hashes/utils';
 
 const startJobCalls = vi.hoisted(() => [] as any[]);
 const processors = vi.hoisted(() => new Map<string, (command: any, job: any) => Promise<unknown>>());
+const finalizers = vi.hoisted(() => new Map<string, (command: any, job: any, evidence: any) => Promise<unknown>>());
 // The VERSION each processor registered under: startJob only finds a
 // processor registered under the SAME version its action passes as
 // commandVersion (background-jobs processorKey), so a mismatch is a live 500
@@ -18,11 +19,15 @@ const processors = vi.hoisted(() => new Map<string, (command: any, job: any) => 
 const processorVersions = vi.hoisted(() => new Map<string, number>());
 const workerCalls = vi.hoisted(() => [] as any[]);
 const workerImpl = vi.hoisted(() => ({ fn: async (_args: any): Promise<any> => ({ txHash: '00aa', circuits: ['attest'], contractAddress: 'c' }) }));
-vi.mock('../../srv/submission/background-jobs', () => ({
+vi.mock('../../srv/submission/background-jobs', async (importOriginal) => ({
+    // the real error class + marker: the processor throws it, the runner persists its code
+    SponsorAttemptBookkeepingPendingError: (await importOriginal<any>()).SponsorAttemptBookkeepingPendingError,
+    REJECTED_ATTEMPT_BOOKKEEPING_PENDING: 'REJECTED_ATTEMPT_BOOKKEEPING_PENDING',
     startJob: vi.fn(async (args: any) => { startJobCalls.push(args); return { jobId: 'job-1', status: 'pending' }; }),
     runChildCommand: vi.fn(),
     registerBackgroundJobProcessor: vi.fn((kind: string, v: number, fn: any) => { processors.set(kind, fn); processorVersions.set(kind, v); }),
-    registerBackgroundJobReconciliationFinalizer: vi.fn()
+    registerBackgroundJobReconciliationFinalizer: vi.fn((kind: string, v: number, fn: any) => { finalizers.set(kind, fn); }),
+    withLockContentionRetry: (_label: string, fn: () => Promise<unknown>) => fn()
 }));
 const unboundWorkerCalls = vi.hoisted(() => [] as any[]);
 const unboundWorkerImpl = vi.hoisted(() => ({ fn: async (_args: any): Promise<any> => ({ txHash: '00bb', circuits: ['attest'], contractAddress: 'c', note: 'b' }) }));
@@ -38,7 +43,21 @@ vi.mock('../../srv/submission/job-execution-context', async (importOriginal) => 
     ...(await importOriginal<Record<string, unknown>>()),
     reportExternalExecution: vi.fn(async (h: any) => { boundaryCalls.push(['external_execution', h]); }),
     reportExternalSubmission: vi.fn(async (h: any) => { boundaryCalls.push(['submitted', h]); }),
-    reportSubmissionRejected: vi.fn(async (h: any) => { boundaryCalls.push(['rejected', h]); })
+    reportSubmissionRejected: vi.fn(async (h: any) => { boundaryCalls.push(['rejected', h]); }),
+    reportSubmissionRejectedOn: vi.fn(async (runner: any, h: any) => { boundaryCalls.push(['rejected', { ...h, runner }]); }),
+    // one statement on the attempt transaction: first crossing = external_execution + submitted, a rebuild = submitted
+    reportBroadcastOn: vi.fn(async (_runner: any, h: any) => { if (h.firstBoundary) boundaryCalls.push(['external_execution', h]); boundaryCalls.push(['submitted', h]); })
+}));
+const grantBudget = vi.hoisted(() => ({
+    reserve: vi.fn(async (_db: any, _grantId: string, _n: number) => true),
+    release: vi.fn(async () => undefined),
+    record: vi.fn(async () => undefined)
+}));
+vi.mock('../../srv/sessions/agent-grants', async (importOriginal) => ({
+    ...(await importOriginal<Record<string, unknown>>()),
+    reserveDeployBudget: (...a: any[]) => (grantBudget.reserve as any)(...a),
+    releaseDeployBudget: (...a: any[]) => (grantBudget.release as any)(...a),
+    recordDeployedContracts: (...a: any[]) => (grantBudget.record as any)(...a)
 }));
 vi.mock('../../srv/submission/fee-sponsor', async (importOriginal) => ({
     ...(await importOriginal<Record<string, unknown>>()),
@@ -56,7 +75,7 @@ import {
     acquireSponsor, releaseSponsor, PLATFORM_POOL_SENTINEL, sponsorCandidatesNonExclusive
 } from '../../srv/submission/sponsor-pool';
 import { resolveFeeSponsor } from '../../srv/submission/fee-sponsor';
-import { reportExternalSubmission } from '../../srv/submission/job-execution-context';
+import { reportBroadcastOn, reportSubmissionRejectedOn } from '../../srv/submission/job-execution-context';
 
 function makeFakeService() {
     const handlers: Record<string, (req: any) => Promise<unknown>> = {};
@@ -67,7 +86,17 @@ function makeReq(data: Record<string, unknown>) {
 }
 // db.run captures PendingSubmissions writes (one row per broadcast attempt).
 const dbWrites: any[] = [];
-const fakeDb = { run: vi.fn(async (q: any) => { dbWrites.push(q); return 1; }) };
+const fakeDbRows = { next: null as any };
+const fakeDb = {
+    run: vi.fn(async (q: any) => { dbWrites.push(q); if (q?.SELECT) { const r = fakeDbRows.next; fakeDbRows.next = null; return r; } return 1; }),
+    // Staged transaction: writes reach dbWrites when the callback returns (commit), a throw drops them (rollback).
+    tx: vi.fn(async (fn: (tx: any) => Promise<unknown>) => {
+        const staged: any[] = [];
+        const out = await fn({ run: async (q: any) => { staged.push(q); return 1; } });
+        dbWrites.push(...staged);
+        return out;
+    })
+};
 function setup() {
     const srv = makeFakeService();
     registerSubmissionHandlers(srv as any, fakeDb as any, {
@@ -286,6 +315,43 @@ describe('sponsorFinalizedTransaction', () => {
     });
 });
 
+// The persisted command carries the effective lists (floor ∩ grant); an empty intersection refuses at admission with 403 and starts no job.
+describe('per-grant sponsor policy (0.21.0)', () => {
+    beforeEach(() => { startJobCalls.length = 0; });
+    afterEach(() => {
+        delete process.env.NIGHTGATE_SPONSOR_ALLOWED_CONTRACTS;
+        delete process.env.NIGHTGATE_SPONSOR_ALLOWED_CIRCUITS;
+    });
+
+    test('a grant narrows the platform floor to the intersection', async () => {
+        process.env.NIGHTGATE_SPONSOR_ALLOWED_CONTRACTS = '0xVAULT,0xOTHER';
+        process.env.NIGHTGATE_SPONSOR_ALLOWED_CIRCUITS = 'attest,anchorContentRoot';
+        const srv = setup();
+        const req: any = makeReq({ finalizedTxB64: TX_A, sponsorSessionId: 'sponsor-1' });
+        req.agentGrant = { ID: 'g1', sessionId: 's', userId: 'test-user', allowedContracts: ['0xOTHER'], allowedCircuits: ['attest'] };
+        await srv.handlers['sponsorFinalizedTransaction'](req);
+        expect(startJobCalls[0].command).toMatchObject({ allowedContracts: ['0xOTHER'], allowedCircuits: ['attest'] });
+    });
+
+    test('an unrestricted floor makes the grant the whole policy (onboarding = issuing the grant)', async () => {
+        const srv = setup();
+        const req: any = makeReq({ unboundTxB64: TX_B, sponsorSessionId: 'sponsor-1' });
+        req.agentGrant = { ID: 'g1', sessionId: 's', userId: 'test-user', allowedContracts: ['0xCUSTOMER'], allowedCircuits: [] };
+        await srv.handlers['sponsorUnboundTransaction'](req);
+        expect(startJobCalls[0].command).toMatchObject({ op: 'sponsorUnbound', allowedContracts: ['0xCUSTOMER'], allowedCircuits: [] });
+    });
+
+    test('grant ∩ floor empty: 403 SPONSOR_POLICY_EMPTY at admission, no job started', async () => {
+        process.env.NIGHTGATE_SPONSOR_ALLOWED_CONTRACTS = '0xVAULT';
+        const srv = setup();
+        const req: any = makeReq({ finalizedTxB64: TX_A, sponsorSessionId: 'sponsor-1' });
+        req.agentGrant = { ID: 'g1', sessionId: 's', userId: 'test-user', allowedContracts: ['0xELSEWHERE'], allowedCircuits: [] };
+        await srv.handlers['sponsorFinalizedTransaction'](req);
+        expect(req.reject).toHaveBeenCalledWith(expect.objectContaining({ status: 403, code: 'SPONSOR_POLICY_EMPTY' }));
+        expect(startJobCalls).toHaveLength(0);
+    });
+});
+
 describe('sponsorUnboundTransaction (0.18 parallel channel)', () => {
     beforeEach(() => {
         startJobCalls.length = 0;
@@ -376,7 +442,7 @@ describe('sponsorUnboundTransaction external-effect boundary', () => {
         expect(inserts().length).toBe(1); // one PendingSubmissions row for the one attempt
     });
 
-    test('a rebuild-retry after a broadcast crosses the boundary ONCE and gets its own PendingSubmissions row (review P1)', async () => {
+    test('a rebuild-retry after a broadcast crosses the boundary ONCE and gets its own PendingSubmissions row', async () => {
         // Live-shaped sequence: attempt 1 announces + broadcasts, the ledger
         // answers 196 (dust race) -> attempt 2 is rebuilt, announces a NEW
         // identifier and broadcasts again. external_execution may only be
@@ -456,7 +522,7 @@ describe('sponsorUnboundTransaction external-effect boundary', () => {
     });
 });
 
-describe('sponsorUnboundTransaction dust-retry policy (review P2)', () => {
+describe('sponsorUnboundTransaction dust-retry policy', () => {
     beforeEach(() => {
         unboundWorkerCalls.length = 0;
         __resetSponsorPoolForTests();
@@ -488,7 +554,7 @@ describe('sponsorUnboundTransaction dust-retry policy (review P2)', () => {
     });
 });
 
-describe('sponsorFinalizedTransaction external-effect boundary (review round 5)', () => {
+describe('sponsorFinalizedTransaction external-effect boundary', () => {
     beforeEach(() => {
         boundaryCalls.length = 0; boundIntentHooks.length = 0; dbWrites.length = 0; workerCalls.length = 0;
         __resetSponsorPoolForTests();
@@ -531,7 +597,7 @@ describe('sponsorFinalizedTransaction external-effect boundary (review round 5)'
     });
 });
 
-describe('submit-intent persistence (review round 6)', () => {
+describe('submit-intent persistence', () => {
     beforeEach(() => {
         boundaryCalls.length = 0; unboundIntentHooks.length = 0; dbWrites.length = 0; unboundWorkerCalls.length = 0;
         __resetSponsorPoolForTests();
@@ -563,10 +629,12 @@ describe('submit-intent persistence (review round 6)', () => {
         expect(coords.feeSponsor).not.toBe(PLATFORM_POOL_SENTINEL);
     });
 
-    test('when the job-status write fails after the INSERT, the intent is nacked AND the attempt row is closed REJECTED (never left pending)', async () => {
+    test('when the job transition fails inside the attempt transaction, NOTHING is persisted and the intent is nacked', async () => {
+        // Row, reservation and job transition are one transaction: a lost lease rolls the row
+        // back, no pending row to close, no rejected identifier to report, the job failed before its first boundary.
         setup();
         const proc = processors.get('sponsorUnboundTransaction')!;
-        vi.mocked(reportExternalSubmission as any).mockRejectedValueOnce(new Error('Lease lost before markJobSubmitted(j)'));
+        vi.mocked(reportBroadcastOn as any).mockRejectedValueOnce(new Error('Lease lost before markJobBroadcastOn(j)'));
         unboundWorkerImpl.fn = async () => {
             // the worker: announce -> the hook throws -> the worker nacks and does not broadcast
             await unboundIntentHooks.at(-1)('00nack'.padEnd(64, '0'), { txHash: '00nack'.padEnd(64, '0') });
@@ -574,9 +642,209 @@ describe('submit-intent persistence (review round 6)', () => {
         };
         await expect(proc({ op: 'sponsorUnbound', unboundTxB64: TX_A, sponsorSessionId: 'sponsor-1', allowedContracts: [], allowedCircuits: [] }, { ID: 'j', sessionId: 'sponsor-1', requestedBy: 'u' } as any))
             .rejects.toThrow(/Lease lost/);
-        expect(dbWrites.filter((q) => q?.INSERT).length).toBe(1);
-        const closing = dbWrites.filter((q) => q?.UPDATE);
-        expect(JSON.stringify(closing)).toMatch(/REJECTED/);
-        expect(boundaryCalls.filter((c) => c[0] === 'rejected').length).toBe(1);
+        expect(dbWrites.filter((q) => q?.INSERT).length).toBe(0);
+        expect(dbWrites.filter((q) => q?.UPDATE).length).toBe(0);
+        expect(boundaryCalls.filter((c) => c[0] === 'submitted').length).toBe(0);
+        expect(boundaryCalls.filter((c) => c[0] === 'rejected').length).toBe(0);
+    });
+});
+
+// A sponsored deploy reserves the grant's lifetime budget at the submit-intent, before the ack that
+// lets the worker broadcast: exhausted budget = nack, a rejected attempt refunds, success records the address.
+describe('sponsored deploy budget is reserved at the submit-intent', () => {
+    const NEW_ADDR = 'cc'.repeat(32);
+    const withDeployIntent = (n: number, address = NEW_ADDR) => async () => {
+        const hook = unboundIntentHooks.at(-1);
+        const txHash = `00deploy${n}`.padEnd(64, '0');
+        try {
+            await hook(txHash, { txHash, contractAddress: address, circuits: ['<deploy>'], note: 'b', sponsorAccountId: 'acct-sponsor-1', deployed: [address] });
+        } catch (e) {
+            // a nack: no broadcast, the reason travels
+            throw new Error(`submit-intent rejected by the main thread: ${(e as Error).message}`);
+        }
+        return { txHash, circuits: ['<deploy>'], contractAddress: address, note: 'b', deployed: [address] };
+    };
+    beforeEach(() => {
+        boundaryCalls.length = 0; unboundIntentHooks.length = 0; dbWrites.length = 0; unboundWorkerCalls.length = 0;
+        __resetSponsorPoolForTests();
+        grantBudget.reserve.mockReset().mockResolvedValue(true);
+        grantBudget.release.mockReset().mockResolvedValue(undefined);
+        grantBudget.record.mockReset().mockResolvedValue(undefined);
+        fakeDb.tx.mockClear(); fakeDbRows.next = null;
+        process.env.NIGHTGATE_SPONSOR_DUST_RETRIES = '0';
+        process.env.NIGHTGATE_SPONSOR_DUST_BACKOFF_MS = '0';
+        vi.mocked(resolveFeeSponsor).mockImplementation(async ({ sponsorSessionId }: any) => ({ sponsorSessionId, accountId: `acct-${sponsorSessionId}` } as any));
+    });
+    afterEach(() => { delete process.env.NIGHTGATE_SPONSOR_DUST_RETRIES; delete process.env.NIGHTGATE_SPONSOR_DUST_BACKOFF_MS; });
+
+    test('the attempt row and the reservation are ONE transaction; the row carries grant + deployed addresses', async () => {
+        setup();
+        const proc = processors.get('sponsorUnboundTransaction')!;
+        unboundWorkerImpl.fn = withDeployIntent(1);
+        await proc({ op: 'sponsorUnbound', unboundTxB64: TX_A, sponsorSessionId: 'sponsor-1', allowedContracts: [], allowedCircuits: [], allowDeploy: true, grantId: 'grant-1' }, { ID: 'j', requestedBy: 'u' } as any);
+        expect(fakeDb.tx).toHaveBeenCalledTimes(1);
+        // the reservation ran on the transaction's runner, not on the service
+        const runner = grantBudget.reserve.mock.calls[0][0];
+        expect(runner).not.toBe(fakeDb);
+        expect(typeof runner.run).toBe('function');
+        const insert: any = dbWrites.find((q) => q?.INSERT);
+        const row = insert.INSERT.entries[0];
+        expect(row.actionType).toBe('DEPLOY');
+        const coords = JSON.parse(row.submitIntentData);
+        expect(coords.deployed).toEqual([NEW_ADDR]);
+        expect(coords.deployReservation).toEqual({ grantId: 'grant-1', count: 1 });
+    });
+
+    test('the reconciliation finalizer records the deployed address from the attempt row (no process memory needed)', async () => {
+        setup();
+        const finalize = finalizers.get('sponsorUnboundTransaction')!;
+        expect(finalizers.get('sponsorFinalizedTransaction')).toBe(finalize);
+        fakeDbRows.next = {
+            ID: 'sub-1', txHash: '00late'.padEnd(64, '0'), contractAddress: NEW_ADDR,
+            submitIntentData: JSON.stringify({ feeSponsor: 'sponsor-1', circuits: ['<deploy>'], contractAddress: NEW_ADDR, deployed: [NEW_ADDR], deployReservation: { grantId: 'grant-1', count: 1 } })
+        };
+        const out: any = await finalize({ op: 'sponsorUnbound', grantId: 'grant-1', sponsorSessionId: 'sponsor-1' }, { ID: 'j', sessionId: 'sponsor-1' } as any,
+            { submissionId: 'sub-1', txHash: '00late'.padEnd(64, '0'), contractAddress: NEW_ADDR, finalizedAt: null });
+        expect(grantBudget.record).toHaveBeenCalledWith(expect.anything(), 'grant-1', [NEW_ADDR]);
+        expect(out).toMatchObject({ reconciled: true, status: 'finalized', deployed: [NEW_ADDR], contractAddress: NEW_ADDR, feeSponsor: 'sponsor-1', circuits: ['<deploy>'] });
+        // a plain call reconciles without touching any grant
+        grantBudget.record.mockClear();
+        fakeDbRows.next = { ID: 'sub-2', submitIntentData: JSON.stringify({ circuits: ['attest'], contractAddress: 'dd'.repeat(32) }) };
+        const plain: any = await finalize({ op: 'sponsorUnbound', grantId: 'grant-1' }, { ID: 'j2', sessionId: 'sponsor-1' } as any, { submissionId: 'sub-2', txHash: '00plain'.padEnd(64, '0'), contractAddress: null, finalizedAt: null });
+        expect(grantBudget.record).not.toHaveBeenCalled();
+        expect(plain.deployed).toBeUndefined();
+    });
+
+    test('reserves BEFORE the boundary is crossed and records the address after inclusion', async () => {
+        setup();
+        const proc = processors.get('sponsorUnboundTransaction')!;
+        const order: string[] = [];
+        grantBudget.reserve.mockImplementation(async () => { order.push('reserve'); return true; });
+        vi.mocked(reportBroadcastOn).mockImplementationOnce(async (_runner: any, h: any) => { order.push('submitted'); boundaryCalls.push(['submitted', h]); });
+        unboundWorkerImpl.fn = withDeployIntent(1);
+        const out: any = await proc({ op: 'sponsorUnbound', unboundTxB64: TX_A, sponsorSessionId: 'sponsor-1', allowedContracts: [], allowedCircuits: [], allowDeploy: true, grantId: 'grant-1' }, { ID: 'j', requestedBy: 'u' } as any);
+        expect(grantBudget.reserve).toHaveBeenCalledWith(expect.anything(), 'grant-1', 1);
+        expect(order).toEqual(['reserve', 'submitted']);
+        expect(out.deployed).toEqual([NEW_ADDR]);
+        expect(grantBudget.record).toHaveBeenCalledWith(expect.anything(), 'grant-1', [NEW_ADDR]);
+        expect(grantBudget.release).not.toHaveBeenCalled();
+    });
+
+    test('an exhausted budget nacks the intent: nothing broadcast, no attempt row, no failover, no record', async () => {
+        process.env.NIGHTGATE_FEE_SPONSOR_SESSION = 'pool-1,pool-2';
+        try {
+            setup();
+            const proc = processors.get('sponsorUnboundTransaction')!;
+            grantBudget.reserve.mockResolvedValue(false);
+            let attempts = 0;
+            unboundWorkerImpl.fn = async () => { attempts++; return withDeployIntent(attempts)(); };
+            await expect(proc({ op: 'sponsorUnbound', unboundTxB64: TX_A, sponsorSessionId: PLATFORM_POOL_SENTINEL, allowedContracts: [], allowedCircuits: [], allowDeploy: true, grantId: 'grant-1' }, { ID: 'j', sessionId: PLATFORM_POOL_SENTINEL, requestedBy: 'u' } as any))
+                .rejects.toThrow(/deploy budget of the grant is exhausted/);
+            expect(attempts).toBe(1); // a policy fact, not a sponsor-health failure: no failover to pool-2
+            expect(boundaryCalls.filter((c) => c[0] === 'submitted')).toHaveLength(0);
+            expect(dbWrites.filter((q) => q?.INSERT)).toHaveLength(0);
+            expect(grantBudget.record).not.toHaveBeenCalled();
+            expect(grantBudget.release).not.toHaveBeenCalled();
+        } finally {
+            delete process.env.NIGHTGATE_FEE_SPONSOR_SESSION;
+        }
+    });
+
+    test('a pre-inclusion reject after the reservation gives the budget back', async () => {
+        setup();
+        const proc = processors.get('sponsorUnboundTransaction')!;
+        unboundWorkerImpl.fn = async () => {
+            await withDeployIntent(1)();
+            throw new Error('Transaction submission error <- RpcError: 1010: Invalid Transaction: Custom error: 196');
+        };
+        await expect(proc({ op: 'sponsorUnbound', unboundTxB64: TX_A, sponsorSessionId: 'sponsor-1', allowedContracts: [], allowedCircuits: [], allowDeploy: true, grantId: 'grant-1' }, { ID: 'j', requestedBy: 'u' } as any))
+            .rejects.toThrow(/196/);
+        expect(grantBudget.reserve).toHaveBeenCalledTimes(1);
+        expect(grantBudget.release).toHaveBeenCalledWith(expect.anything(), 'grant-1', 1);
+        expect(grantBudget.record).not.toHaveBeenCalled();
+    });
+
+    test('row, reservation and job transition are one transaction: a lost lease rolls all of it back', async () => {
+        setup();
+        const proc = processors.get('sponsorUnboundTransaction')!;
+        vi.mocked(reportBroadcastOn as any).mockRejectedValueOnce(new Error('Lease lost before markJobBroadcastOn(j)'));
+        unboundWorkerImpl.fn = withDeployIntent(1);
+        await expect(proc({ op: 'sponsorUnbound', unboundTxB64: TX_A, sponsorSessionId: 'sponsor-1', allowedContracts: [], allowedCircuits: [], allowDeploy: true, grantId: 'grant-1' }, { ID: 'j', requestedBy: 'u' } as any))
+            .rejects.toThrow(/Lease lost/);
+        // the reservation ran inside the transaction that was rolled back ...
+        expect(grantBudget.reserve).toHaveBeenCalledTimes(1);
+        // ... so nothing reached the database and nothing needs a refund
+        expect(dbWrites.filter((q) => q?.INSERT)).toHaveLength(0);
+        expect(grantBudget.release).not.toHaveBeenCalled();
+        expect(grantBudget.record).not.toHaveBeenCalled();
+    });
+
+    test('closing a rejected attempt refunds in the SAME transaction as the row update', async () => {
+        setup();
+        const proc = processors.get('sponsorUnboundTransaction')!;
+        unboundWorkerImpl.fn = async () => {
+            await withDeployIntent(1)();
+            throw new Error('Transaction submission error <- RpcError: 1010: Invalid Transaction: Custom error: 196');
+        };
+        await expect(proc({ op: 'sponsorUnbound', unboundTxB64: TX_A, sponsorSessionId: 'sponsor-1', allowedContracts: [], allowedCircuits: [], allowDeploy: true, grantId: 'grant-1' }, { ID: 'j', requestedBy: 'u' } as any))
+            .rejects.toThrow(/196/);
+        expect(fakeDb.tx).toHaveBeenCalledTimes(2); // the attempt, then its close + refund
+        const releaseRunner = (grantBudget.release.mock.calls as any[])[0][0];
+        expect(releaseRunner).not.toBe(fakeDb);
+        expect(JSON.stringify(dbWrites.filter((q) => q?.UPDATE))).toMatch(/REJECTED/);
+    });
+
+    test('row close, refund and the job hash-CAS commit in ONE transaction', async () => {
+        setup();
+        const proc = processors.get('sponsorUnboundTransaction')!;
+        unboundWorkerImpl.fn = async () => {
+            await withDeployIntent(1)();
+            throw new Error('Transaction submission error <- RpcError: 1010: Invalid Transaction: Custom error: 196');
+        };
+        await expect(proc({ op: 'sponsorUnbound', unboundTxB64: TX_A, sponsorSessionId: 'sponsor-1', allowedContracts: [], allowedCircuits: [], allowDeploy: true, grantId: 'grant-1' }, { ID: 'j', requestedBy: 'u' } as any))
+            .rejects.toThrow(/196/);
+        const rejected = boundaryCalls.filter((c) => c[0] === 'rejected');
+        expect(rejected).toHaveLength(1);
+        // the hash-CAS ran on the same staged runner as the refund, not on the service
+        expect(rejected[0][1].runner).not.toBe(fakeDb);
+        expect((grantBudget.release.mock.calls as any[])[0][0]).toBe(rejected[0][1].runner);
+        expect(rejected[0][1].txHash).toBe('00deploy1'.padEnd(64, '0'));
+    });
+
+    test('when closing a rejected attempt fails for good, the retry loop STOPS instead of rebuilding on an open attempt', async () => {
+        process.env.NIGHTGATE_SPONSOR_DUST_RETRIES = '2';
+        setup();
+        const proc = processors.get('sponsorUnboundTransaction')!;
+        vi.mocked(reportSubmissionRejectedOn as any).mockRejectedValue(new Error('Lease lost (or hash already moved) before markJobSubmissionRejectedOn(j)'));
+        let attempts = 0;
+        unboundWorkerImpl.fn = async () => {
+            attempts++;
+            await withDeployIntent(attempts)();
+            throw new Error('Transaction submission error <- RpcError: 1010: Invalid Transaction: Custom error: 196');
+        };
+        const failure: any = await proc({ op: 'sponsorUnbound', unboundTxB64: TX_A, sponsorSessionId: 'sponsor-1', allowedContracts: [], allowedCircuits: [], allowDeploy: true, grantId: 'grant-1' }, { ID: 'j', requestedBy: 'u' } as any).catch((e) => e);
+        expect(failure).toBeInstanceOf(Error);
+        expect(failure.message).toMatch(/could not be committed/);
+        // the persisted marker the settle pass looks for, with its details
+        expect(failure.code).toBe('REJECTED_ATTEMPT_BOOKKEEPING_PENDING');
+        expect(failure.details).toMatchObject({ txHash: '00deploy1'.padEnd(64, '0'), grantId: 'grant-1', refund: 1 });
+        expect(failure.details.submissionId).toMatch(/[0-9a-f-]{36}/);
+        expect(attempts).toBe(1); // no rebuild after a failed close
+        // the close transaction was rolled back: no REJECTED row update reached the database
+        expect(JSON.stringify(dbWrites.filter((q) => q?.UPDATE))).not.toMatch(/REJECTED/);
+        vi.mocked(reportSubmissionRejectedOn as any).mockReset().mockImplementation(async (runner: any, h: any) => { boundaryCalls.push(['rejected', { ...h, runner }]); });
+    });
+
+    test('a plain call under a deploy-capable grant reserves nothing', async () => {
+        setup();
+        const proc = processors.get('sponsorUnboundTransaction')!;
+        unboundWorkerImpl.fn = async () => {
+            const hook = unboundIntentHooks.at(-1);
+            await hook('00call'.padEnd(64, '0'), { txHash: '00call'.padEnd(64, '0'), contractAddress: 'dd'.repeat(32), circuits: ['attest'], note: 'b', deployed: [] });
+            return { txHash: '00call'.padEnd(64, '0'), circuits: ['attest'], contractAddress: 'dd'.repeat(32), note: 'b', deployed: [] };
+        };
+        await proc({ op: 'sponsorUnbound', unboundTxB64: TX_A, sponsorSessionId: 'sponsor-1', allowedContracts: [], allowedCircuits: [], allowDeploy: true, grantId: 'grant-1' }, { ID: 'j', requestedBy: 'u' } as any);
+        expect(grantBudget.reserve).not.toHaveBeenCalled();
+        expect(grantBudget.record).not.toHaveBeenCalled();
     });
 });
