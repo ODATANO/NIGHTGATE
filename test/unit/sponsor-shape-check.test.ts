@@ -476,3 +476,22 @@ describe('assertArtifactGenerationOnDisk: the worker verifies the pinned generat
         expect(() => workerExports.assertArtifactGenerationOnDisk('b', reg)).not.toThrow();
     });
 });
+
+describe('ownContracts: circuits of a grant-deployed contract are sponsorable under a circuit floor', () => {
+    const OWN = 'cc'.repeat(32);
+    it('a call on an own contract passes the circuit list; the same circuit on another allowed contract still refuses', () => {
+        const t = tx([{ actions: [CALL(OWN, 'increment')], guaranteedUnshieldedOffer: null, dustActions: null }]);
+        expect(workerExports.checkSponsorableShape(t, 5000, ['aa'.repeat(32), OWN], ['attest'], { ownContracts: [OWN] }))
+            .toEqual([{ address: OWN, entryPoint: 'increment' }]);
+        const other = tx([{ actions: [CALL('aa'.repeat(32), 'increment')], guaranteedUnshieldedOffer: null, dustActions: null }]);
+        expect(() => workerExports.checkSponsorableShape(other, 5000, ['aa'.repeat(32), OWN], ['attest'], { ownContracts: [OWN] }))
+            .toThrow(/circuit 'increment' is not sponsorable/);
+    });
+    it('the exemption never widens the contract list or the byte ceiling', () => {
+        const t = tx([{ actions: [CALL(OWN, 'increment')], guaranteedUnshieldedOffer: null, dustActions: null }]);
+        expect(() => workerExports.checkSponsorableShape(t, 5000, ['aa'.repeat(32)], ['attest'], { ownContracts: [OWN] }))
+            .toThrow(/not in the allow-list/);
+        process.env.NIGHTGATE_SPONSOR_MAX_TX_BYTES = '1000';
+        expect(() => workerExports.checkSponsorableShape(t, 5000, [], [], { ownContracts: [OWN] })).toThrow(/over the 1000B budget/);
+    });
+});

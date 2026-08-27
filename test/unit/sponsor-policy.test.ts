@@ -209,3 +209,18 @@ describe('resolveSponsorPolicyForRequest', () => {
         expect(resolveSponsorPolicyForRequest({})).toMatchObject({ allowedContracts: ['A', 'B'], allowedCircuits: [] });
     });
 });
+
+describe('ownContracts: calls on grant-deployed addresses are exempt from the circuit floor', () => {
+    const floor = { allowedContracts: ['A'], allowedCircuits: ['attest'] };
+    it('lists the grant\'s deployed addresses as ownContracts, deduplicated, blanks dropped', () => {
+        expect(effectiveSponsorPolicy(floor, { deployedContracts: ['NEW', '', 'NEW', 'OTHER'] }).ownContracts).toEqual(['NEW', 'OTHER']);
+    });
+    it('is absent without a grant or without deployed addresses (no exemption)', () => {
+        expect(effectiveSponsorPolicy(floor).ownContracts).toBeUndefined();
+        expect(effectiveSponsorPolicy(floor, { deployedContracts: [] }).ownContracts).toBeUndefined();
+        expect(effectiveSponsorPolicy(floor, { allowedContracts: ['A'] }).ownContracts).toBeUndefined();
+    });
+    it('does not widen allowedCircuits itself', () => {
+        expect(effectiveSponsorPolicy(floor, { deployedContracts: ['NEW'] }).allowedCircuits).toEqual(['attest']);
+    });
+});

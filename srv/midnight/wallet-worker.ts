@@ -2107,7 +2107,9 @@ export function checkSponsorableShape(
     // With `allowDeploy` (floor and grant, decided at admission) a ContractDeploy
     // action is sponsorable: never matched against `allowedContracts` (the address is
     // new), recorded onto the grant afterwards. `maxDeploys` caps deploys per tx (default 1).
-    options: { allowDeploy?: boolean; maxDeploys?: number } = {}
+    // `ownContracts`: addresses deployed under the requesting grant; calls on them
+    // skip the circuit list (their circuits are the caller's, not the floor's).
+    options: { allowDeploy?: boolean; maxDeploys?: number; ownContracts?: string[] } = {}
 ): Array<{ address: string; entryPoint: string }> {
     const maxDeploysPerTx = Number.isInteger(options.maxDeploys) && (options.maxDeploys as number) >= 0 ? (options.maxDeploys as number) : 1;
     let deployCount = 0;
@@ -2188,7 +2190,8 @@ export function checkSponsorableShape(
             if (allowedContracts?.length && !allowedContracts.includes(address)) {
                 throw new Error(`refusing to sponsor: contract ${address.slice(0, 16)} is not in the allow-list`);
             }
-            if (allowedCircuits?.length && !allowedCircuits.includes(name)) {
+            const own = Array.isArray(options.ownContracts) && options.ownContracts.includes(address);
+            if (!own && allowedCircuits?.length && !allowedCircuits.includes(name)) {
                 throw new Error(`refusing to sponsor: circuit '${name}' is not sponsorable`);
             }
             calls.push({ address, entryPoint: name });
@@ -3740,7 +3743,7 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
      */
     async sponsorFinalizedTx(args: {
         sponsorSessionId: string; finalizedTxB64: string; networkId: string;
-        allowedContracts?: string[]; allowedCircuits?: string[]; allowDeploy?: boolean;
+        allowedContracts?: string[]; allowedCircuits?: string[]; allowDeploy?: boolean; ownContracts?: string[];
         /** Set by the dispatcher: the RPC reply port, for the pre-broadcast submit-intent handshake. */
         __replyPort?: MessagePort;
     }) {
@@ -3753,7 +3756,7 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
         // Policy: FAIL-CLOSED shape check. Allow-listed contract calls are the
         // only thing a sponsorable tx may contain; deploys, token transfers,
         // caller dust, oversized or uninspectable transactions all refuse.
-        const calls = checkSponsorableShape(tx, bytes.length, args.allowedContracts, args.allowedCircuits, { allowDeploy: args.allowDeploy === true });
+        const calls = checkSponsorableShape(tx, bytes.length, args.allowedContracts, args.allowedCircuits, { allowDeploy: args.allowDeploy === true, ownContracts: args.ownContracts });
         log('info', `sponsorFinalizedTx: paying dust for ${calls.map(c => c.entryPoint).join('+')} (${bytes.length}B)`);
         const txId = await sponsorAndSubmitFinalized(sponsor, tx, 'sponsor-endpoint', args.__replyPort, calls);
         log('info', `sponsorFinalizedTx: LANDED txHash=${txId.slice(0, 16)}`);
@@ -3786,7 +3789,7 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
      */
     async sponsorUnboundTx(args: {
         sponsorSessionId: string; unboundTxB64: string; networkId: string;
-        allowedContracts?: string[]; allowedCircuits?: string[]; allowDeploy?: boolean;
+        allowedContracts?: string[]; allowedCircuits?: string[]; allowDeploy?: boolean; ownContracts?: string[];
         /** Set by the dispatcher: the RPC reply port, for the pre-broadcast submit-intent handshake. */
         __replyPort?: MessagePort;
     }) {
@@ -3797,7 +3800,7 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
         const { tx: callerTx, bytes } = await deserializeFinalizedTx(args.unboundTxB64);
 
         // Same fail-closed shape policy as the bound path.
-        const calls = checkSponsorableShape(callerTx, bytes.length, args.allowedContracts, args.allowedCircuits, { allowDeploy: args.allowDeploy === true });
+        const calls = checkSponsorableShape(callerTx, bytes.length, args.allowedContracts, args.allowedCircuits, { allowDeploy: args.allowDeploy === true, ownContracts: args.ownContracts });
 
         await waitForGenuineSync(sponsor, BALANCE_SYNC_TIMEOUT_MS, 'sponsor-unbound');
 

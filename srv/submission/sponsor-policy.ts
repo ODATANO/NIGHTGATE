@@ -22,6 +22,14 @@ export interface SponsorPolicy {
      * the grant afterwards. Absent = false.
      */
     allowDeploy?: boolean;
+    /**
+     * Addresses deployed under the requesting grant. Calls on them are exempt
+     * from `allowedCircuits`: the circuit floor names the shared contracts'
+     * circuits, a grant-deployed contract has its own; without the exemption a
+     * server with a circuit floor could sponsor the deploy but never a call
+     * on it. The byte ceiling still applies. Absent/empty = no exemption.
+     */
+    ownContracts?: string[];
 }
 
 export interface GrantPolicyInput {
@@ -208,7 +216,8 @@ export function effectiveSponsorPolicy(floor: SponsorPolicy, grant?: GrantPolicy
         allowedContracts: withDeployed,
         allowedCircuits: intersect(floor.allowedCircuits, grant?.allowedCircuits, 'allowedCircuits'),
         // Floor must open it and, for a token caller, the grant must carry it.
-        allowDeploy: floor.allowDeploy === true && (grant ? grant.allowDeploy === true : true)
+        allowDeploy: floor.allowDeploy === true && (grant ? grant.allowDeploy === true : true),
+        ...(deployed.length ? { ownContracts: deployed } : {})
     };
 }
 

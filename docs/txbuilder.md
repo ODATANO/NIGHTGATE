@@ -265,7 +265,9 @@ its own byte ceiling (`NIGHTGATE_SPONSOR_MAX_DEPLOY_BYTES`, default 40960).
 The budget is reserved before the sponsor broadcasts (one deploy per
 transaction). After it lands, the address is recorded on the grant
 (`deployedContracts`) and is sponsorable on top of the platform allow-list,
-so the follow-up calls are sponsorable without an operator round trip. Contract
+circuits included (a sponsor's circuit list names the shared contracts'
+circuits, not yours), so the follow-up calls are sponsorable without an
+operator round trip. Contract
 maintenance updates are never sponsored. The build fails unless the
 transaction carries exactly one deploy action with an address, so a returned
 `contractAddress` is always usable. Persist the initial private state

@@ -485,7 +485,10 @@ recreate and a ~20 min cold sponsor pool. Two layers replace that:
   address is recorded in the grant's `deployedContracts` and is sponsorable
   ON TOP of `floor ∩ grant` (no static allow-list could have named it), so the
   follow-up calls are sponsorable at once, whatever the platform floor says.
-  Contract maintenance updates are never sponsored.
+  That includes the circuit list (0.21.2): calls on a grant-deployed address
+  are exempt from `allowedCircuits`, whose names belong to the shared
+  contracts, not to the caller's own; the contract list and the byte
+  ceiling still apply. Contract maintenance updates are never sponsored.
 
 **Pool + failover (0.17.2).** The sessions in `NIGHTGATE_FEE_SPONSOR_SESSION`
 form a lease pool: one in-flight dust spend per wallet, callers queue on the

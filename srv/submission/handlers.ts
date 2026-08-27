@@ -1028,7 +1028,8 @@ export function registerSubmissionHandlers(
                     networkId: facadeCfg.networkId,
                     allowedContracts: command.allowedContracts,
                     allowedCircuits: command.allowedCircuits,
-                    allowDeploy: command.allowDeploy === true
+                    allowDeploy: command.allowDeploy === true,
+                    ownContracts: command.ownContracts
                 }, ledger.onSubmitIntent());
                 await ledger.markIncluded(out);
                 releaseSponsor(sessionId);
@@ -1142,7 +1143,8 @@ export function registerSubmissionHandlers(
                         networkId: facadeCfg.networkId,
                         allowedContracts: command.allowedContracts,
                         allowedCircuits: command.allowedCircuits,
-                        allowDeploy: command.allowDeploy === true
+                        allowDeploy: command.allowDeploy === true,
+                        ownContracts: command.ownContracts
                     }, onSubmitIntent());
                     await ledger.markIncluded(out);
                     if (command.grantId && out.deployed?.length) await recordDeployedContracts(db, command.grantId, out.deployed);
@@ -1614,7 +1616,7 @@ export function registerSubmissionHandlers(
             // Allow-list: platform floor (env or NIGHTGATE_SPONSOR_POLICY_FILE) narrowed by
             // the agent grant's lists when the request carries a token; empty floor = allow any (dev).
             // Refused at admission, before a job exists: empty intersection or unusable policy file.
-            const { allowedContracts, allowedCircuits, allowDeploy } = resolveSponsorPolicyForRequest(req);
+            const { allowedContracts, allowedCircuits, allowDeploy, ownContracts } = resolveSponsorPolicyForRequest(req);
             // Grant behind a token request; a sponsored deploy's address is recorded onto it.
             const grantId: string | undefined = (req as any).agentGrant?.ID ? String((req as any).agentGrant.ID) : undefined;
             // Idempotency scope: pool jobs share ONE sessionId (the sentinel)
@@ -1638,7 +1640,7 @@ export function registerSubmissionHandlers(
                     txHash: bytesToHex(sha256(Buffer.from(finalizedTxB64, 'base64')))
                 },
                 requestedBy: (req as any).user?.id, commandVersion: 1, encryptCommand: true,
-                command: { op: 'sponsorFinalized', finalizedTxB64, sponsorSessionId: effectiveSponsor, allowedContracts, allowedCircuits, allowDeploy, grantId }
+                command: { op: 'sponsorFinalized', finalizedTxB64, sponsorSessionId: effectiveSponsor, allowedContracts, allowedCircuits, allowDeploy, ownContracts, grantId }
             });
             // The job is keyed by the SPONSOR session (or the pool sentinel),
             // which an agent-grant caller may not know. Return it so the
@@ -1670,7 +1672,7 @@ export function registerSubmissionHandlers(
                 await ensureFeeSponsorFacade(sponsor, facadeCfg);
             }
             // Floor narrowed by the agent grant; see sponsorFinalizedTransaction above.
-            const { allowedContracts, allowedCircuits, allowDeploy } = resolveSponsorPolicyForRequest(req);
+            const { allowedContracts, allowedCircuits, allowDeploy, ownContracts } = resolveSponsorPolicyForRequest(req);
             // Grant behind a token request; a sponsored deploy's address is recorded onto it.
             const grantId: string | undefined = (req as any).agentGrant?.ID ? String((req as any).agentGrant.ID) : undefined;
             const caller = String((req as any).user?.id ?? 'anonymous');
@@ -1685,7 +1687,7 @@ export function registerSubmissionHandlers(
                     txHash: bytesToHex(sha256(Buffer.from(unboundTxB64, 'base64')))
                 },
                 requestedBy: (req as any).user?.id, commandVersion: 1, encryptCommand: true,
-                command: { op: 'sponsorUnbound', unboundTxB64, sponsorSessionId: effectiveSponsor, allowedContracts, allowedCircuits, allowDeploy, grantId }
+                command: { op: 'sponsorUnbound', unboundTxB64, sponsorSessionId: effectiveSponsor, allowedContracts, allowedCircuits, allowDeploy, ownContracts, grantId }
             });
             return { ...job, sessionId: effectiveSponsor };
         });

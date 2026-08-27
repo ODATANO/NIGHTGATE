@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.21.2 - 2026-08-27
+
+Sponsored deploys under a circuit floor. No schema change, no SDK change.
+
+- Calls on a contract deployed under a grant (`deployedContracts`) are
+  exempt from `allowedCircuits`: the effective policy carries the grant's
+  deployed addresses as `ownContracts`, the sponsor command passes them
+  through and the worker's shape check skips the circuit list for a call
+  on one of them. The contract list and the byte ceiling still apply. On a
+  server with `NIGHTGATE_SPONSOR_ALLOWED_CIRCUITS` (or a policy file with
+  `allowedCircuits`) the deploy used to land and every follow-up call was
+  refused with `circuit '<name>' is not sponsorable` (api.nightgate.dev,
+  `counter.increment`, 2026-08-27).
+
 ## 0.21.1 - 2026-08-27
 
 PostgreSQL in the standalone image. No schema change, no SDK change.

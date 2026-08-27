@@ -860,6 +860,8 @@ export function walletSponsorFinalizedTx(args: {
     allowedCircuits?: string[];
     /** Floor and grant both allow a sponsored ContractDeploy in this transaction. */
     allowDeploy?: boolean;
+    /** Addresses deployed under the requesting grant: calls on them skip `allowedCircuits`. */
+    ownContracts?: string[];
 }, onSubmitIntent?: SubmitIntentHook): Promise<{ txHash: string; circuits: string[]; contractAddress: string; deployed?: string[] }> {
     return rpc('sponsorFinalizedTx', args, RPC_TIMEOUT_MS, onSubmitIntent);
 }
@@ -910,6 +912,8 @@ export function walletSponsorUnboundTx(args: {
     allowedCircuits?: string[];
     /** Floor and grant both allow a sponsored ContractDeploy in this transaction. */
     allowDeploy?: boolean;
+    /** Addresses deployed under the requesting grant: calls on them skip `allowedCircuits`. */
+    ownContracts?: string[];
 }, onSubmitIntent?: SubmitIntentHook): Promise<{ txHash: string; circuits: string[]; contractAddress: string; note: string; deployed?: string[] }> {
     return rpc('sponsorUnboundTx', args, RPC_TIMEOUT_MS, onSubmitIntent);
 }
