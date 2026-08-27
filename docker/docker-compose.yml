@@ -19,17 +19,22 @@ services:
     # pulls this and only builds locally when the image is unavailable.
     # NIGHTGATE_IMAGE_TAG overrides; keep the default in lockstep with
     # package.json on every release.
-    image: ghcr.io/odatano/nightgate:${NIGHTGATE_IMAGE_TAG:-0.21.0}
+    image: ghcr.io/odatano/nightgate:${NIGHTGATE_IMAGE_TAG:-0.21.1}
     container_name: odatano-nightgate
     ports:
       - "4004:4004"
     environment:
       # Required: encrypts wallet viewing/seed keys at rest (openssl rand -hex 32).
-      ENCRYPTION_KEY: "${ENCRYPTION_KEY:?set ENCRYPTION_KEY (openssl rand -hex 32)}"
+      # Not a compose `:?` variable: compose would demand it even for
+      # `up proof-server`; the entrypoint refuses to start without it instead.
+      ENCRYPTION_KEY: "${ENCRYPTION_KEY:-}"
+      # Optional (0.21.1): PostgreSQL instead of the SQLite file under /data.
+      # With `--profile postgres` the bundled service below matches this URL.
+      NIGHTGATE_DB_URL: "${NIGHTGATE_DB_URL:-}"
       # Basic-auth credentials for the OData services (NIGHTGATE_AUTH=dummy
       # serves unauthenticated, local testing only).
       NIGHTGATE_HTTP_USER: "${NIGHTGATE_HTTP_USER:-nightgate}"
-      NIGHTGATE_HTTP_PASSWORD: "${NIGHTGATE_HTTP_PASSWORD:?set NIGHTGATE_HTTP_PASSWORD}"
+      NIGHTGATE_HTTP_PASSWORD: "${NIGHTGATE_HTTP_PASSWORD:-}"   # refused by cds-config.mjs when empty
       NIGHTGATE_NETWORK: "${NIGHTGATE_NETWORK:-preprod}"
       NIGHTGATE_CRAWLER_ENABLED: "${NIGHTGATE_CRAWLER_ENABLED:-false}"
       # Optional overrides (empty = built-in per-network defaults):
@@ -222,8 +227,34 @@ services:
           cpus: "0.5"
           memory: 1G
 
+  # PostgreSQL for NIGHTGATE (0.21.1). Start with `--profile postgres` and set
+  # NIGHTGATE_DB_URL=postgres://nightgate:${NIGHTGATE_PG_PASSWORD}@nightgate-postgres:5432/nightgate
+  # on the nightgate service. Migrate an existing SQLite volume with the image's
+  # `migrate` mode (docs/docker.md, "PostgreSQL").
+  # NIGHTGATE_PG_PASSWORD is not a `:?` required variable: compose interpolates
+  # those before profile selection, which would break the SQLite quickstart.
+  # An empty password fails inside the container instead (the postgres image
+  # refuses to initialise without POSTGRES_PASSWORD).
+  nightgate-postgres:
+    image: postgres:16-alpine
+    container_name: nightgate-postgres
+    profiles: ["postgres"]
+    environment:
+      POSTGRES_USER: nightgate
+      POSTGRES_DB: nightgate
+      POSTGRES_PASSWORD: "${NIGHTGATE_PG_PASSWORD:-}"
+    volumes:
+      - nightgate-pg-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U nightgate -d nightgate"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
+
 volumes:
   nightgate-data:
+  nightgate-pg-data:
   node-data:
   proof-server-data:
   indexer-data:

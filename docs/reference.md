@@ -131,6 +131,9 @@ Sufficient for read-side. `network` is the only required key - without it the pl
 | `NIGHTGATE_CONTRACTS_DIR` | Root directories (path-delimiter separated) a runtime `registerContract` (admin, 0.21.0) may point into; default: the package's and the working directory's `contracts/`. Importing an artifact executes its module, so paths outside are refused. |
 | `NIGHTGATE_SPONSOR_POLICY_FILE` | Path to a JSON file `{ "allowedContracts": [], "allowedCircuits": [] }` that replaces `NIGHTGATE_SPONSOR_ALLOWED_CONTRACTS`/`_CIRCUITS` while set (0.21.0). Re-read per sponsored call behind an mtime cache, so the sponsor policy changes without a container recreate. Fail-closed: an unreadable or invalid file keeps the last good policy, and with none loaded yet sponsored calls answer `503 SPONSOR_POLICY_UNAVAILABLE`. |
 | `NIGHTGATE_SPONSOR_ALLOW_DEPLOY` | Opens sponsored contract DEPLOYS on this deployment (0.21.0): `true`/`1`/`yes`. Off by default. A token caller additionally needs `allowDeploy` on its grant with deploy budget left; a plain caller inherits the floor. Also settable as `allowDeploy` in `NIGHTGATE_SPONSOR_POLICY_FILE`. |
+| `NIGHTGATE_DB_URL` | Standalone image (0.21.1): `postgres://user:pw@host:5432/db` selects PostgreSQL; the schema is deployed on every boot (`cds deploy`, additive). `?sslmode=`: `disable`, `require` (TLS unverified) or `verify-full` (chain + hostname, `sslrootcert=<pem>` optional); `allow`/`prefer`/`verify-ca` and unknown values refuse to start. Unset = SQLite file at `NIGHTGATE_DB_PATH`. |
+| `NIGHTGATE_DB_DEPLOY` | Standalone image with `NIGHTGATE_DB_URL`: `auto` (default) deploys the schema at boot, `never` skips it. |
+| `NIGHTGATE_DB_WAIT_SECONDS` | Standalone image `migrate` mode: seconds to wait for the PostgreSQL listener before `cds deploy` (default 60; 1..86400, other values refuse; each connect attempt is capped at the time left, so a dropped SYN cannot outlive the window). |
 | `NIGHTGATE_ARTIFACT_SNAPSHOT_DIR` | Base directory under which the wallet worker materialises the immutable, content-addressed snapshot of each contract artifact generation it loads and proves with (0.21.0). Layout: `<base>/<install>/<pid>/<digest>/{module/artifact.mjs\|.cjs,keys,zkir}` plus a `node_modules` link for bare-specifier resolution at the per-process level, so two installations or two processes of one user never share a link or a snapshot (refcounts and evictions are process-local). Default base: the OS temp directory (`nightgate-artifact-snapshots`). The per-process root is marked with `.nightgate-snapshot-root`; a real `node_modules` directory or a link NIGHTGATE did not create there makes the worker refuse (fail-closed, nothing is deleted). Roots of dead processes are removed at the worker's first use; a snapshot is removed when its generation leaves the worker's caches and no job holds it. Budget the prover keys of the generations in use, per running process. |
 | `NIGHTGATE_WORKER_MAX_GENERATIONS` | Distinct contract artifact generations the wallet worker imports before it rotates (exits cleanly at its next idle moment; the main thread respawns it on the next call and counts a `rotationCount`, not an exit) to release Node's ESM module cache (0.21.0). Default 32; `0` never rotates. A rotation costs the warm facades (a large dust snapshot deserialises for minutes), so keep it generous unless you hot-register many revisions. |
 | `NIGHTGATE_ARTIFACT_SNAPSHOT_TTL_DAYS` | Snapshots not used for this long (and leftover `.tmp-*` builds of dead processes) are swept at the worker's first snapshot use (0.21.0). Default 14; `0` sweeps everything unused at start-up. |
@@ -279,10 +282,16 @@ automatic schema evolution is non-destructive but cannot perform lossy key or
 type changes; inspect generated deltas and back up before every deployment.
 
 SQLite-to-PostgreSQL is a data migration, not an in-place schema evolution:
-deploy the CDS model to an empty PostgreSQL database, stop all writers, export
-and import the business/NIGHTGATE rows with a verified ETL, compare row counts
-and `SyncState`, then switch the binding. Keep the SQLite file read-only until
-the PostgreSQL backup and application smoke test succeed.
+deploy the CDS model to an empty PostgreSQL database, stop all writers, copy
+the rows with `npx nightgate-db-migrate --from <sqlite file> --to <postgres url>`
+(0.21.1; every persisted entity of the loaded model incl. `.texts` and CAP's
+own tables, streamed in batches with integers read as BigInt, a Decimal
+SQLite rounded beyond 2^53 aborts, unknown source tables with rows abort
+unless `--ignore-unknown`, row counts compared per table; needs
+`@cap-js/postgres` and `better-sqlite3` in the host; the standalone image does
+both steps as `docker compose run --rm --no-deps nightgate migrate --from
+<file>`), then switch the binding. Keep the SQLite file read-only until the
+PostgreSQL backup and application smoke test succeed.
 
 `db/midnight.db` persists indexed data plus encrypted wallet state. When switching networks, delete `db/midnight.db*` first.
 

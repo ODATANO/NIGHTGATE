@@ -383,7 +383,7 @@ Next `connectWalletForSigning` will start a fresh ~5-6 h cold sync.
 ## Production checklist (before deploying)
 
 - [ ] `ENCRYPTION_KEY` set to a real 32-byte hex secret (not the dev fallback)
-- [ ] CDS database is PostgreSQL or HANA, not SQLite. Production SQLite is now **rejected at startup** (fail closed); `NIGHTGATE_ALLOW_PRODUCTION_SQLITE=true` is a temporary migration-only escape hatch
+- [ ] CDS database is PostgreSQL or HANA, not SQLite (standalone image: `NIGHTGATE_DB_URL`, migration via `nightgate-db-migrate`, see docs/docker.md). Production SQLite is now **rejected at startup** (fail closed); `NIGHTGATE_ALLOW_PRODUCTION_SQLITE=true` is a temporary migration-only escape hatch
 - [ ] Exactly one replica declared (`NIGHTGATE_REPLICA_COUNT=1`); more than one replica, CAP multitenancy, or (on Cloud Foundry) `CF_INSTANCE_INDEX > 0` fails startup closed
 - [ ] `NIGHTGATE_CRAWLER_ENABLED` is true (or unset - the crawler defaults to on)
 - [ ] CAP auth is configured (the default `dummy` strategy passes everyone)

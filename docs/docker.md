@@ -84,14 +84,69 @@ docker exec odatano-nightgate node scripts/apply-schema-delta.mjs
 Recreating the volume (dev) or a destructive
 `npx cds deploy --to "sqlite:/data/nightgate.db"` remain the wipe options.
 
+## PostgreSQL (0.21.1)
+
+Set `NIGHTGATE_DB_URL=postgres://user:pw@host:5432/db` and the container uses
+PostgreSQL instead of the SQLite file: the schema is deployed with
+`cds deploy` on every boot (additive evolution, an image upgrade brings its
+own columns and views), `NIGHTGATE_DB_DEPLOY=never` skips that. The SQLite
+busy-timeout and `NIGHTGATE_ALLOW_PRODUCTION_SQLITE` do not apply. The
+compose file bundles a `postgres:16-alpine` under `--profile postgres`
+(`NIGHTGATE_PG_PASSWORD`; the SQLite quickstart does not need it).
+
+TLS via the `sslmode` query parameter, limited to what node-postgres honours
+exactly: unset/`disable` = no TLS, `require` (or `ssl=true`) = TLS without
+certificate verification, `verify-full` = chain and hostname verified against
+the system CAs or `sslrootcert=<pem file>`. `allow`/`prefer` (opportunistic
+TLS) and `verify-ca` (chain without hostname) are refused, as is any other
+value.
+
+Migrating an existing SQLite volume: stop the service, start the database
+and wait for its healthcheck, then run the nightgate service once in
+`migrate` mode. `docker compose run` attaches the same volume, network and
+environment as the service, so the container sees `/data/nightgate.db` and
+resolves `nightgate-postgres`:
+
+```bash
+docker compose -f docker/docker-compose.yml --profile postgres up -d --wait nightgate-postgres
+docker compose -f docker/docker-compose.yml stop nightgate
+NIGHTGATE_DB_URL=postgres://nightgate:$NIGHTGATE_PG_PASSWORD@nightgate-postgres:5432/nightgate \
+  docker compose -f docker/docker-compose.yml --profile postgres run --rm --no-deps nightgate \
+  migrate --from /data/nightgate.db
+```
+
+`migrate` mode serves nothing and needs only `NIGHTGATE_DB_URL`: neither
+`ENCRYPTION_KEY` nor `NIGHTGATE_HTTP_PASSWORD` is read. It also waits for the
+PostgreSQL listener itself (`NIGHTGATE_DB_WAIT_SECONDS`, default 60) before
+`cds deploy`, so `--wait` is belt and braces. (A plain `docker run` needs the
+project's volume and network names, which compose prefixes with the project:
+`docker volume ls` / `docker network ls`.)
+
+It deploys the schema and copies every persisted entity of the model,
+`.texts` and CAP's own tables (`cds_outbox_Messages`) included: rows streamed
+in batches, integers read as BigInt so `Integer64` keeps every digit, SQLite
+0/1 become booleans, JSON columns stay text, views are skipped. A source
+table the model does not define is listed; with rows it stops the run
+unless `--ignore-unknown`. `Decimal` columns are copied as SQLite holds
+them (integral values exact up to 64 bit; a value SQLite stored as a REAL
+beyond 2^53 was rounded at write time and aborts the run). Row counts are
+compared per table, a mismatch exits non-zero. `--dry-run` prints the plan,
+`--force` appends into a non-empty target; the `SyncState` singleton a
+previous boot may have written is replaced. The same script is
+`npx nightgate-db-migrate --from <file> --to <url>` for a plugin host, which
+needs `@cap-js/postgres` and `better-sqlite3` installed (the script says so
+by name when one is missing). Keep the SQLite file until the PostgreSQL
+backup and a smoke test succeed.
+
 ## Operational notes
 
 - Single instance only (`runtimeMode` is enforced by the app); do not scale
   the service to multiple replicas against one database.
-- The entrypoint sets `NIGHTGATE_ALLOW_PRODUCTION_SQLITE=true`: the core
-  rejects SQLite under the production profile by default, and the container
-  is exactly the supported exception (one instance, volume-persisted).
-  For production-grade deployments configure PostgreSQL/HANA and unset it.
+- Without `NIGHTGATE_DB_URL` the entrypoint sets
+  `NIGHTGATE_ALLOW_PRODUCTION_SQLITE=true`: the core rejects SQLite under the
+  production profile by default, and the container is exactly the supported
+  exception (one instance, volume-persisted). For production-grade
+  deployments set `NIGHTGATE_DB_URL`.
 - Mainnet submission stays gated off regardless of configuration.
 - The healthcheck probes the HTTP root; first boot needs the start period
   because schema deploy and plugin init run before the port opens.
