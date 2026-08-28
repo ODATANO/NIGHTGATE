@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.21.6 - 2026-08-28
+
+Worker GC load from the save tick. No schema change, no SDK change.
+
+- **Save tick 60 s, configurable.** `NIGHTGATE_SAVE_INTERVAL_MS` (default
+  60000, min 10000; was a fixed 30 s). Measured on the hosted pool with
+  `profileWorker` (0.21.5, three warm facades): 63 scavenges of ~180 ms in a
+  20 s window, GC 42 % of the worker, `DustWallet.serialize` the only hot
+  path; the dust blob changes with practically every block, so each tick
+  re-serialized and pushed multi-MB strings per facade.
+- **Worker young generation 128 MB.** `NIGHTGATE_WORKER_YOUNG_GEN_MB`
+  (default 128, `0` = V8 default 16 MB, 16..2048) sets
+  `resourceLimits.maxYoungGenerationSizeMb` on the wallet worker; the
+  old-generation limit still comes from NODE_OPTIONS (verified: a worker with
+  only the young size set keeps the inherited `heap_size_limit`).
+- Hosted box: the Contabo image's hourly `drop_caches` cron was found and
+  disabled (operations note); it explains the hourly IO stalls behind the
+  0.21.3 pool incident.
+
 ## 0.21.5 - 2026-08-28
 
 `profileWorker` sees both threads and the heap. No schema change, no SDK

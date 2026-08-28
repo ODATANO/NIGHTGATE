@@ -484,3 +484,15 @@ describe('wallet-worker-client', () => {
         });
     });
 });
+
+describe('workerResourceLimits (young generation of the wallet worker)', () => {
+    it('defaults to 128 MB, honours the env var within 16..2048, 0 disables, garbage falls back', async () => {
+        const { workerResourceLimits } = await import('../../srv/midnight/wallet-worker-client.js');
+        expect(workerResourceLimits({})).toEqual({ maxYoungGenerationSizeMb: 128 });
+        expect(workerResourceLimits({ NIGHTGATE_WORKER_YOUNG_GEN_MB: '256' })).toEqual({ maxYoungGenerationSizeMb: 256 });
+        expect(workerResourceLimits({ NIGHTGATE_WORKER_YOUNG_GEN_MB: '4' })).toEqual({ maxYoungGenerationSizeMb: 16 });
+        expect(workerResourceLimits({ NIGHTGATE_WORKER_YOUNG_GEN_MB: '99999' })).toEqual({ maxYoungGenerationSizeMb: 2048 });
+        expect(workerResourceLimits({ NIGHTGATE_WORKER_YOUNG_GEN_MB: '0' })).toBeUndefined();
+        expect(workerResourceLimits({ NIGHTGATE_WORKER_YOUNG_GEN_MB: 'abc' })).toEqual({ maxYoungGenerationSizeMb: 128 });
+    });
+});

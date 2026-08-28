@@ -118,6 +118,22 @@ let stateSaveSink: StateSaveSink | undefined;
 
 // Serializes state-save persists in arrival order (each handler settles, so
 // the chain never rejects and a failed persist doesn't block later ones).
+/**
+ * Worker thread heap sizing. Only the young generation is set; the old
+ * generation keeps the limit NODE_OPTIONS gives the process (measured: a
+ * worker with `maxYoungGenerationSizeMb` alone still reports the inherited
+ * 8 GB `heap_size_limit`). `NIGHTGATE_WORKER_YOUNG_GEN_MB`: default 128,
+ * `0` = V8 default (16 MB semi-spaces), clamped to 16..2048.
+ */
+export function workerResourceLimits(env: NodeJS.ProcessEnv = process.env): { maxYoungGenerationSizeMb: number } | undefined {
+    const raw = env.NIGHTGATE_WORKER_YOUNG_GEN_MB;
+    if (raw === undefined || raw === '') return { maxYoungGenerationSizeMb: 128 };
+    const n = Number(raw);
+    if (!Number.isFinite(n)) return { maxYoungGenerationSizeMb: 128 };
+    if (n <= 0) return undefined;
+    return { maxYoungGenerationSizeMb: Math.min(2048, Math.max(16, Math.floor(n))) };
+}
+
 let stateSaveChain: Promise<void> = Promise.resolve();
 
 // In-flight rpc rejectors, so a worker crash/exit rejects every pending call
@@ -178,8 +194,13 @@ export async function startWalletWorker(): Promise<void> {
     const worker = new Worker(entry, {
 
         workerData: {},
-        // resourceLimits undefined: inherit NODE_OPTIONS (wallet SDK heap).
-        resourceLimits: undefined,
+        // Old-generation limit is inherited from NODE_OPTIONS (wallet SDK
+        // heap) whether or not resourceLimits is given. The YOUNG generation
+        // is sized explicitly (0.21.6): every save tick serializes multi-MB
+        // wallet blobs, and with the default 16 MB semi-space the worker
+        // spent ~40 % of its time in scavenges (~180 ms each) on the hosted
+        // pool. NIGHTGATE_WORKER_YOUNG_GEN_MB, default 128, 0 = V8 default.
+        resourceLimits: workerResourceLimits(),
         // stdout/stderr from the worker should surface to the main process.
         stderr: false,
         stdout: false

@@ -326,6 +326,10 @@ const INIT_ARGS = {
 let workerExports: any;
 
 beforeAll(async () => {
+    // Several suites below advance fake time in 30 s steps for the save
+    // tick; pin the interval to that (NIGHTGATE_SAVE_INTERVAL_MS, default
+    // 60 s since 0.21.6). Read per facade at startPeriodicSave time.
+    process.env.NIGHTGATE_SAVE_INTERVAL_MS = '30000';
     facadeInit.mockImplementation(async (opts: any) => {
         // Real WalletFacade.init calls the sub-wallet factories; do the same
         // so the restore-vs-fresh closures in buildFacade are exercised.
@@ -590,8 +594,9 @@ describe('waitForSyncedState (genuine sync gate)', () => {
 
 describe('periodic save + ack protocol', () => {
     it('pushes on tick, skips unchanged only after the ack confirmed the save', async () => {
-        // The 30s interval must be ARMED under fake timers, so this test
-        // inits its own session inside the fake-timer scope.
+        // The save interval must be ARMED under fake timers, so this test
+        // inits its own session inside the fake-timer scope. Pinned to 30 s
+        // here (NIGHTGATE_SAVE_INTERVAL_MS; the default is 60 s since 0.21.6).
         vi.useFakeTimers();
         const SESSION = 'session-savetick-dddddddddd';
         try {

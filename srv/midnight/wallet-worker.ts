@@ -2759,10 +2759,26 @@ function startProgressWatch(sessionId: string, entry: FacadeEntry): void {
     entry.progressTimer.unref();
 }
 
+/**
+ * Save tick interval (0.21.6: `NIGHTGATE_SAVE_INTERVAL_MS`, default 60 s,
+ * min 10 s; was a fixed 30 s). Every tick serializes all three sub-wallets
+ * of a facade into multi-MB hex strings; the dust wallet changes with
+ * practically every block, so the tick nearly always allocates and pushes.
+ * On the hosted pool (three facades) that churn made minor GC the worker's
+ * main occupation (profileWorker: 63 scavenges of ~180 ms in 20 s, GC 42 %).
+ * The interval bounds only how much sync work a crash re-does on restore.
+ */
+function saveIntervalMs(): number {
+    const raw = Number(process.env.NIGHTGATE_SAVE_INTERVAL_MS);
+    if (!Number.isFinite(raw) || raw <= 0) return 60_000;
+    return Math.max(10_000, Math.floor(raw));
+}
+
 function startPeriodicSave(sessionId: string, entry: FacadeEntry): void {
     if (entry.saveTimer) return;
     let tickCount = 0;
-    log('info', `periodic-save interval armed for ${sessionId.slice(0, 16)}`);
+    const intervalMs = saveIntervalMs();
+    log('info', `periodic-save interval armed for ${sessionId.slice(0, 16)} (every ${Math.round(intervalMs / 1000)}s)`);
     entry.saveTimer = setInterval(async () => {
         tickCount++;
         const tickStart = Date.now();
@@ -2806,7 +2822,7 @@ function startPeriodicSave(sessionId: string, entry: FacadeEntry): void {
         } catch (err: any) {
             log('warn', `periodic save failed: ${formatErr(err)}`);
         }
-    }, 30_000);
+    }, intervalMs);
     entry.saveTimer.unref();
 }
 
