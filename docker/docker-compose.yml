@@ -239,6 +239,11 @@ services:
     image: postgres:16-alpine
     container_name: nightgate-postgres
     profiles: ["postgres"]
+    # The wallet snapshot table is write-heavy (tens of MB per save): with the
+    # image defaults (128 MB shared_buffers, 5 min checkpoints) a checkpoint
+    # wrote for minutes and stalled the app's connections. Sized for a host
+    # with a few GB to spare; scale shared_buffers with the box.
+    command: ["postgres", "-c", "shared_buffers=1GB", "-c", "max_wal_size=4GB", "-c", "checkpoint_timeout=15min", "-c", "wal_buffers=64MB"]
     environment:
       POSTGRES_USER: nightgate
       POSTGRES_DB: nightgate

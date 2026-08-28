@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.21.3 - 2026-08-28
+
+CAP connection pool under load. No schema change, no SDK change.
+
+- **`features.use_generic_pool` defaults to true** (`src/cap-pool-default.ts`,
+  applied at plugin registration; an explicit host value stays). CAP's
+  built-in pool (`@cap-js/db-service` 3.0.x, `generic-pool.js` `#dispense`)
+  loses a connection whenever it dispenses one to a request that already
+  timed out: with the kind default of 1 s the pool emptied on
+  api.nightgate.dev after a night of checkpoint stalls and every request
+  failed with `Pool resource could not be acquired` (2026-08-28 04:25 UTC).
+  `generic-pool` (new dependency) does not have the defect; the repro is
+  pinned against the installed db-service in `test/unit/cap-db-pool.test.ts`.
+- Standalone image, PostgreSQL: `requires.db.pool` = max 20, acquire 30 s,
+  destroy 5 s, idle 60 s, eviction 60 s, testOnBorrow; `requires.db.client`
+  `connectionTimeoutMillis` 10 s (`docker/cds-config.mjs`; CAP's
+  `cds_requires_db_pool_*` env vars override). Compose `nightgate-postgres`:
+  `shared_buffers=1GB max_wal_size=4GB checkpoint_timeout=15min
+  wal_buffers=64MB`.
+
 ## 0.21.2 - 2026-08-27
 
 Sponsored deploys under a circuit floor. No schema change, no SDK change.

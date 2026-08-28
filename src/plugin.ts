@@ -5,6 +5,7 @@ import { initialize, shutdown, SchemaNotDeployedError } from './index';
 const log = cds.log('nightgate');
 import { mountZkConfigRoute, mountContractManifestRoute } from './connector-routes';
 import { mountStatusRoutes } from './status-routes';
+import { applyPoolDefault } from './cap-pool-default';
 
 const pluginRoot = path.resolve(__dirname, '..');
 
@@ -12,6 +13,11 @@ let registered = false;
 
 function registerModels(): void {
     cds.env.roots = [...(cds.env.roots || []), pluginRoot];
+    // Connection pool: CAP's built-in one leaks under acquire timeouts, see
+    // cap-pool-default.ts. Must run before db-service loads.
+    if (applyPoolDefault(cds.env as { features?: Record<string, unknown> })) {
+        log.info('features.use_generic_pool defaulted to true (the built-in @cap-js/db-service pool loses connections on acquire timeouts); set it explicitly in the host config to override');
+    }
 
     const requires = ((cds.env as unknown as {
         requires?: Record<string, any>;

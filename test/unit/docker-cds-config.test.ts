@@ -34,10 +34,17 @@ describe('docker/cds-config.mjs', () => {
 
     it('NIGHTGATE_DB_URL selects PostgreSQL as pg Pool fields (host, port, user, password, database), no SQLite client block', () => {
         const cfg = JSON.parse(run({ NIGHTGATE_HTTP_PASSWORD: 'pw', NIGHTGATE_DB_URL: 'postgres://u:p%40ss@db:5433/nightgate', NIGHTGATE_DB_PATH: '/ignored.db' }).out);
-        expect(cfg.requires.db).toEqual({ kind: 'postgres', credentials: { host: 'db', port: 5433, user: 'u', password: 'p@ss', database: 'nightgate' } });
+        expect(cfg.requires.db).toMatchObject({ kind: 'postgres', credentials: { host: 'db', port: 5433, user: 'u', password: 'p@ss', database: 'nightgate' } });
+        expect(cfg.requires.db.credentials.ssl).toBeUndefined();
         // the plugin's kind definition rides along: under NODE_ENV=production CAP does not load devDependency plugins
         expect(cfg.requires.kinds.postgres).toMatchObject({ impl: '@cap-js/postgres', dialect: 'postgres', schema_evolution: 'auto' });
-        expect(JSON.parse(run({ NIGHTGATE_HTTP_PASSWORD: 'pw' }).out).requires.kinds).toBeUndefined();
+        // pool sized for load + generic-pool selected (the built-in pool leaks on acquire timeouts)
+        expect(cfg.requires.db.pool).toEqual({ min: 0, max: 20, testOnBorrow: true, acquireTimeoutMillis: 30000, destroyTimeoutMillis: 5000, idleTimeoutMillis: 60000, evictionRunIntervalMillis: 60000 });
+        expect(cfg.requires.db.client).toEqual({ connectionTimeoutMillis: 10000 });
+        expect(cfg.features).toEqual({ use_generic_pool: true });
+        const sqlite = JSON.parse(run({ NIGHTGATE_HTTP_PASSWORD: 'pw' }).out);
+        expect(sqlite.requires.kinds).toBeUndefined();
+        expect(sqlite.features).toBeUndefined();
         const dflt = JSON.parse(run({ NIGHTGATE_HTTP_PASSWORD: 'pw', NIGHTGATE_DB_URL: 'postgresql://u:p@db/nightgate' }).out);
         expect(dflt.requires.db.credentials).toMatchObject({ port: 5432, database: 'nightgate' });
         expect(dflt.requires.db.credentials.ssl).toBeUndefined();
@@ -89,9 +96,10 @@ describe('docker/cds-config.mjs', () => {
         const r = spawnSync(process.execPath, [SCRIPT, '--db-only'], { env: { PATH: process.env.PATH ?? '', NIGHTGATE_DB_URL: 'postgres://u:p@db:5433/nightgate' }, encoding: 'utf8' });
         expect(r.status).toBe(0);
         const cfg = JSON.parse(r.stdout);
-        expect(cfg.requires.db).toEqual({ kind: 'postgres', credentials: { host: 'db', port: 5433, user: 'u', password: 'p', database: 'nightgate' } });
+        expect(cfg.requires.db).toMatchObject({ kind: 'postgres', credentials: { host: 'db', port: 5433, user: 'u', password: 'p', database: 'nightgate' } });
         expect(cfg.requires.auth).toBeUndefined();
         expect(cfg.requires.kinds.postgres).toMatchObject({ impl: '@cap-js/postgres' });
+        expect(cfg.features).toEqual({ use_generic_pool: true });
     });
 });
 

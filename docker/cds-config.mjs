@@ -63,10 +63,27 @@ function sslOptions(params) {
     throw new Error(`unsupported sslmode='${mode}' in NIGHTGATE_DB_URL (use: disable | require | verify-full)`);
 }
 
+/**
+ * Pool + client settings for PostgreSQL. CAP's kind defaults (max 10,
+ * acquire 1 s, destroy 1 s) are sized for an idle dev box: under checkpoint
+ * stalls the 1 s acquire timeout fires, and the built-in pool of
+ * @cap-js/db-service 3.0.x then leaks the connection it was about to hand
+ * over (see cdsConfig: `features.use_generic_pool`). Wide timeouts, a
+ * connect timeout so a hung TCP connect cannot pin a slot, and a pool that
+ * survives the worker's snapshot writes. Any of these can be overridden by
+ * CAP's own `cds_requires_db_pool_*` / `cds_requires_db_client_*` env vars.
+ */
+export const POSTGRES_POOL = Object.freeze({
+    min: 0, max: 20, testOnBorrow: true,
+    acquireTimeoutMillis: 30000, destroyTimeoutMillis: 5000,
+    idleTimeoutMillis: 60000, evictionRunIntervalMillis: 60000
+});
+export const POSTGRES_CLIENT = Object.freeze({ connectionTimeoutMillis: 10000 });
+
 export function databaseConfig(env = process.env) {
     const url = String(env.NIGHTGATE_DB_URL ?? '').trim();
     if (url) {
-        return { kind: 'postgres', credentials: postgresCredentials(url) };
+        return { kind: 'postgres', credentials: postgresCredentials(url), pool: { ...POSTGRES_POOL }, client: { ...POSTGRES_CLIENT } };
     }
     const path = String(env.NIGHTGATE_DB_PATH ?? '/data/nightgate.db');
     const timeout = Number(env.NIGHTGATE_SQLITE_BUSY_TIMEOUT_MS) || 30000;
@@ -109,7 +126,12 @@ export function postgresKind() {
 export function cdsConfig(env = process.env, { dbOnly = false } = {}) {
     const db = databaseConfig(env);
     const requires = dbOnly ? { db } : { db, auth: authConfig(env) };
-    if (db.kind === 'postgres') requires.kinds = { postgres: postgresKind() };
+    if (db.kind === 'postgres') {
+        requires.kinds = { postgres: postgresKind() };
+        // The plugin sets the same default at load; the image states it
+        // explicitly so `cds deploy` (no plugin hooks) uses the same pool.
+        return { features: { use_generic_pool: true }, requires };
+    }
     return { requires };
 }
 

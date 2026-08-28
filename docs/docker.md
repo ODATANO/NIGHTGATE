@@ -94,6 +94,17 @@ busy-timeout and `NIGHTGATE_ALLOW_PRODUCTION_SQLITE` do not apply. The
 compose file bundles a `postgres:16-alpine` under `--profile postgres`
 (`NIGHTGATE_PG_PASSWORD`; the SQLite quickstart does not need it).
 
+Connection pool (0.21.3): the image sets `requires.db.pool` to max 20,
+acquire 30 s, destroy 5 s, idle 60 s, eviction 60 s, `testOnBorrow`, plus a
+10 s client connect timeout, and `features.use_generic_pool: true`. CAP's
+built-in pool loses a connection per timed-out acquire and empties under
+load; the kind defaults (max 10, 1 s) did exactly that on a busy host.
+Override any value with CAP's env vars (`cds_requires_db_pool_max=30`,
+`cds_requires_db_pool_acquireTimeoutMillis=...`). The bundled
+`nightgate-postgres` runs with `shared_buffers=1GB`, `max_wal_size=4GB`,
+`checkpoint_timeout=15min`, `wal_buffers=64MB` (the wallet snapshot table is
+write-heavy; scale `shared_buffers` with the host).
+
 TLS via the `sslmode` query parameter, limited to what node-postgres honours
 exactly: unset/`disable` = no TLS, `require` (or `ssl=true`) = TLS without
 certificate verification, `verify-full` = chain and hostname verified against

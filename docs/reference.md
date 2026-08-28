@@ -277,6 +277,13 @@ uses profile-specific database kinds:
 
 Install `@cap-js/postgres` in the host. Inject production credentials through a
 CAP service binding or `cds_requires_db_credentials_*`; never commit passwords.
+Pool (0.21.3): the plugin defaults `cds.features.use_generic_pool` to `true`
+at registration (CAP's built-in pool loses a connection per timed-out
+acquire and empties under load; `generic-pool` ships as a dependency), an
+explicit host value wins. Size the pool for the worker's snapshot writes:
+`cds.requires.db.pool` `{ max: 20, acquireTimeoutMillis: 30000,
+destroyTimeoutMillis: 5000 }` and `cds.requires.db.client`
+`{ connectionTimeoutMillis: 10000 }` are what the standalone image uses.
 Run `cds deploy --profile production` before starting a new database. CAP's
 automatic schema evolution is non-destructive but cannot perform lossy key or
 type changes; inspect generated deltas and back up before every deployment.
