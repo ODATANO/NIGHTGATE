@@ -29,7 +29,7 @@ import { parentPort, MessageChannel, type MessagePort } from 'node:worker_thread
 import path from 'node:path';
 import fs from 'node:fs';
 import os from 'node:os';
-import { summarizeCpuProfile } from './cpu-profile-summary';
+import { profileCurrentThread } from './cpu-profile';
 import crypto from 'node:crypto';
 import { pathToFileURL } from 'node:url';
 import { classificationHaystack, formatErr, formatErrWithCauses, safeDeepInspect } from '../utils/format-error';
@@ -2943,32 +2943,9 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
      * three warm facades and nothing in the log said why.
      */
     async cpuProfile({ seconds, dir }: { seconds?: number; dir?: string }) {
-        const secs = Math.min(120, Math.max(1, Math.floor(Number(seconds) || 20)));
-        const inspector = await import('node:inspector');
-        const session = new inspector.Session();
-        session.connect();
-        const post = (m: string, p?: object) => new Promise<any>((res, rej) => (session as any).post(m, p ?? {}, (e: Error | null, r: unknown) => e ? rej(e) : res(r)));
-        try {
-            await post('Profiler.enable');
-            await post('Profiler.setSamplingInterval', { interval: 1000 });
-            await post('Profiler.start');
-            await wsleep(secs * 1000);
-            const { profile } = await post('Profiler.stop');
-            const summary = summarizeCpuProfile(profile, 25);
-            let file: string | null = null;
-            try {
-                const outDir = dir || path.join(os.tmpdir(), 'nightgate-profiles');
-                fs.mkdirSync(outDir, { recursive: true });
-                file = path.join(outDir, `worker-${new Date().toISOString().replace(/[:.]/g, '-')}-${secs}s.cpuprofile`);
-                fs.writeFileSync(file, JSON.stringify(profile));
-            } catch (e) {
-                log('warn', `cpuProfile: raw profile not written: ${formatErr(e)}`);
-            }
-            log('info', `cpuProfile: ${secs}s sampled, idle ${summary.idlePercent}%, gc ${summary.gcPercent}%, wasm ${summary.wasmPercent}%, top: ${summary.topFunctions.slice(0, 3).map((f: { label: string; percent: number }) => `${f.label.split('  ')[0]} ${f.percent}%`).join(', ')}`);
-            return { seconds: secs, file, facadeCount: facades.size, ...summary };
-        } finally {
-            try { session.disconnect(); } catch { /* already gone */ }
-        }
+        const p = await profileCurrentThread(seconds ?? 20, { dir, filePrefix: 'worker' });
+        log('info', `cpuProfile: ${p.seconds}s sampled, idle ${p.idlePercent}%, gc ${p.gcPercent}% (${p.gc.count} collections, ${p.gc.totalMs}ms), wasm ${p.wasmPercent}%, heap ${p.heapAfter.usedMb}/${p.heapAfter.limitMb} MB, external ${p.heapAfter.externalMb} MB, top: ${p.topFunctions.slice(0, 3).map((f: { label: string; percent: number }) => `${f.label.split('  ')[0]} ${f.percent}%`).join(', ')}`);
+        return { thread: 'worker', facadeCount: facades.size, ...p, gc: { ...p.gc, byKind: JSON.stringify(p.gc.byKind) } };
     },
 
     async waitForSyncedState({ sessionId, timeoutMs, stallMs }: { sessionId: string; timeoutMs?: number; stallMs?: number }) {

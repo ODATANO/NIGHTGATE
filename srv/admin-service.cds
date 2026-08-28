@@ -112,7 +112,8 @@ service NightgateAdminService {
      * `nightgate-profiles/`) for a DevTools deep dive; `file` names it.
      * Diagnostic for "the worker is busy and the log does not say why".
      */
-    action profileWorker(seconds: Integer, dir: String) returns {
+    action profileWorker(seconds: Integer, dir: String, thread: String) returns {
+        thread        : String; // 'worker' (default) or 'main' (the CAP process: requests, save pipeline, pollers)
         seconds       : Integer;
         file          : String;
         facadeCount   : Integer;
@@ -123,6 +124,9 @@ service NightgateAdminService {
         topFunctions  : array of { label: String; percent: Double };
         topFiles      : array of { label: String; percent: Double };
         topInclusive  : array of { label: String; percent: Double };
+        heapBefore    : { usedMb: Integer; totalMb: Integer; limitMb: Integer; externalMb: Integer; mallocedMb: Integer; rssMb: Integer; arrayBuffersMb: Integer };
+        heapAfter     : { usedMb: Integer; totalMb: Integer; limitMb: Integer; externalMb: Integer; mallocedMb: Integer; rssMb: Integer; arrayBuffersMb: Integer };
+        gc            : { count: Integer; totalMs: Integer; byKind: String }; // byKind: JSON { kind: { count, ms } }
     };
 
     function getJobStats(windowHours: Integer) returns {

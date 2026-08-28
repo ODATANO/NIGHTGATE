@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.21.5 - 2026-08-28
+
+`profileWorker` sees both threads and the heap. No schema change, no SDK
+change.
+
+- `profileWorker(seconds, dir, thread)`: `thread: 'main'` profiles the CAP
+  process's main thread (request handling, state-save pipeline, pollers)
+  with the same in-thread profiler; `'worker'` stays the default. Both
+  return `heapBefore`/`heapAfter` (used/total/limit/external heap, malloced,
+  RSS, ArrayBuffers in MB of that isolate) and `gc` (collections in the
+  window, total ms, JSON `byKind`). Shared implementation
+  `srv/midnight/cpu-profile.ts`. Live finding that asked for it: five
+  minutes after a sponsored call the hosted worker sampled at GC 77 % /
+  idle 14 % with the heap far below its 8 GB limit, and the main thread
+  carried a steady 35 % of a core.
+- `profileWorker` failures keep their message in production (`$sanitize:
+  false`), a 503 no longer reads "Service Unavailable" only.
+
 ## 0.21.4 - 2026-08-28
 
 Sponsor pool on one worker thread: the cheap fixes from the sharding

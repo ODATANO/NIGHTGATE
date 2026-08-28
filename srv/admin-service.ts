@@ -19,6 +19,7 @@ import { evictWalletFacade } from './submission/wallet-facade-builder';
 import { WalletSessions, DisclosureRoles, BackgroundJobs } from '#cds-models/midnight';
 import { listContracts, registerContractAtRuntime, unregisterContractAtRuntime, ContractRegistrationError } from './submission/contract-registrations';
 import { walletCpuProfile } from './midnight/wallet-worker-client';
+import { profileCurrentThread } from './midnight/cpu-profile';
 
 /**
  * Drop the in-memory WalletFacade (live secret keys) cached for a session, so a
@@ -106,16 +107,26 @@ export default class NightgateAdminService extends cds.ApplicationService {
         // Worker CPU profile: bounded sampling window, runs while the worker
         // keeps serving; the caller waits for the result (up to seconds + 60 s).
         this.on('profileWorker', async (req: Request) => {
-            const data = req.data as { seconds?: number | null; dir?: string | null };
+            const data = req.data as { seconds?: number | null; dir?: string | null; thread?: string | null };
             const seconds = Number(data.seconds ?? 20);
             if (!Number.isFinite(seconds) || seconds < 1 || seconds > 120) {
                 return req.reject(400, 'seconds must be between 1 and 120');
             }
+            const thread = (data.thread ?? 'worker').toString().trim().toLowerCase();
+            if (thread !== 'worker' && thread !== 'main') return req.reject(400, "thread must be 'worker' (default) or 'main'");
             const dir = typeof data.dir === 'string' && data.dir.trim() ? data.dir.trim() : undefined;
             try {
+                if (thread === 'main') {
+                    // The CAP process itself: request handling, the save pipeline
+                    // (encrypt + persist of the worker's state blobs), pollers.
+                    const p = await profileCurrentThread(seconds, { dir, filePrefix: 'main' });
+                    return { thread: 'main', facadeCount: null, ...p, gc: { ...p.gc, byKind: JSON.stringify(p.gc.byKind) } };
+                }
                 return await walletCpuProfile(seconds, dir);
             } catch (e: any) {
-                return req.reject(503, `worker profile failed: ${e?.message ?? String(e)}`);
+                const err: any = new Error(`${thread} profile failed: ${e?.message ?? String(e)}`);
+                err.status = 503; err.$sanitize = false;
+                return req.reject(err);
             }
         });
 
