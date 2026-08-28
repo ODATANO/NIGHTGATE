@@ -103,6 +103,16 @@ describe('docker/cds-config.mjs', () => {
     });
 });
 
+describe('docker/entrypoint.sh', () => {
+    it('runs node as PID 1 (exec node ...), never through npx/sh, so docker stop reaches the server', () => {
+        const sh = fs.readFileSync(path.resolve(__dirname, '../../docker/entrypoint.sh'), 'utf8');
+        const execLines = sh.split('\n').filter(l => /^\s*exec\s/.test(l));
+        expect(execLines.some(l => /^\s*exec node \S*@sap\/cds\/bin\/serve\.js/.test(l))).toBe(true);
+        expect(execLines.some(l => /exec\s+npx/.test(l))).toBe(false);
+        expect(sh.includes('\r')).toBe(false);   // a CRLF entrypoint dies with "bash\r: No such file"
+    });
+});
+
 describe('scripts/migrate-values.mjs (nightgate-db-migrate row conversion)', () => {
     const el = (type: string) => ({ type });
 

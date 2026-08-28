@@ -121,4 +121,9 @@ else
 fi
 
 echo "Starting NIGHTGATE (network=${NIGHTGATE_NETWORK:-preprod}, auth=$AUTH_KIND, db=$DB_LABEL)"
-exec npx cds-serve
+# node itself becomes PID 1 (0.21.7). `exec npx cds-serve` put npm -> sh ->
+# node in between, `sh -c` does not forward SIGTERM, so `docker stop` never
+# reached the server: every stop ended in SIGKILL after the grace period
+# (wallet state unsaved, sessions left open, one recreate raced and stayed
+# down). With node in front, cds runs its shutdown hooks on SIGTERM.
+exec node /app/node_modules/@sap/cds/bin/serve.js

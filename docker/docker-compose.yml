@@ -19,7 +19,7 @@ services:
     # pulls this and only builds locally when the image is unavailable.
     # NIGHTGATE_IMAGE_TAG overrides; keep the default in lockstep with
     # package.json on every release.
-    image: ghcr.io/odatano/nightgate:${NIGHTGATE_IMAGE_TAG:-0.21.6}
+    image: ghcr.io/odatano/nightgate:${NIGHTGATE_IMAGE_TAG:-0.21.7}
     container_name: odatano-nightgate
     ports:
       - "4004:4004"
@@ -60,6 +60,9 @@ services:
     volumes:
       - nightgate-data:/data
     restart: unless-stopped
+    # A graceful stop flushes wallet state and closes sessions; with three
+    # warm facades that takes longer than docker's default 10 s.
+    stop_grace_period: 90s
     logging:
       driver: json-file
       options:

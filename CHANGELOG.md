@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.21.7 - 2026-08-28
+
+Graceful container stop. No schema change, no SDK change.
+
+- Entrypoint runs `exec node /app/node_modules/@sap/cds/bin/serve.js`:
+  node is PID 1 and receives SIGTERM, so cds runs its shutdown hooks
+  (wallet state flush, worker exit). `exec npx cds-serve` put npm -> sh ->
+  node in between and `sh -c` does not forward the signal: every
+  `docker stop` ended in SIGKILL after 10 s ("Container failed to exit
+  within 10s of kill" in the docker journal), and one recreate raced on the
+  kill and left the new container in `Created` (api.nightgate.dev, ~10 min
+  outage, 2026-08-28 12:54 UTC).
+- Compose `nightgate` service: `stop_grace_period: 90s`.
+- `test/unit/docker-cds-config.test.ts` pins the entrypoint's exec form and
+  LF line endings.
+
 ## 0.21.6 - 2026-08-28
 
 Worker GC load from the save tick. No schema change, no SDK change.

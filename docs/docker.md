@@ -151,6 +151,12 @@ backup and a smoke test succeed.
 
 ## Operational notes
 
+- Stop gracefully (0.21.7): the entrypoint execs node as PID 1, so
+  `docker stop` delivers SIGTERM to the server and cds runs its shutdown
+  hooks (wallet state flush, worker exit). Give it time: the compose file
+  sets `stop_grace_period: 90s`; with a plain `docker stop` pass `-t 90`.
+  Before 0.21.7 the signal stopped at `npx`, and every stop was a SIGKILL
+  after 10 s.
 - Single instance only (`runtimeMode` is enforced by the app); do not scale
   the service to multiple replicas against one database.
 - Without `NIGHTGATE_DB_URL` the entrypoint sets
