@@ -17,12 +17,17 @@ const getOrBuildWalletFacadeMock = vi.hoisted(() => vi.fn(async (..._args: any[]
 vi.mock('../../srv/submission/wallet-facade-builder', () => ({
     getOrBuildWalletFacade: getOrBuildWalletFacadeMock
 }));
+const walletWaitForSyncedStateMock = vi.hoisted(() => vi.fn(async (..._args: any[]) => ({ synced: true })));
+vi.mock('../../srv/midnight/wallet-worker-client', () => ({
+    walletWaitForSyncedState: walletWaitForSyncedStateMock
+}));
 
 import {
     resolveFeeSponsor,
     ensureFeeSponsorFacade,
     getConfiguredFeeSponsorSessions,
     prewarmFeeSponsorPool,
+    prewarmSyncBudgetMs,
     FeeSponsorError
 } from '../../srv/submission/fee-sponsor';
 import { deriveAccountId, deriveStoragePassword } from '../../srv/submission/wallet-material-factory';
@@ -228,6 +233,7 @@ describe('prewarmFeeSponsorPool (boot)', () => {
             })
         };
         getOrBuildWalletFacadeMock.mockImplementation(async (accountId: string) => { order.push(`facade:${accountId.slice(0, 4)}`); return {}; });
+        walletWaitForSyncedStateMock.mockImplementation(async (accountId: string) => { order.push(`tip:${accountId.slice(0, 4)}`); return { synced: true }; });
         const infos: string[] = [], warns: string[] = [];
         const out = await prewarmFeeSponsorPool({
             db, encryptionKey: TEST_KEY, log: { info: (m) => infos.push(m), warn: (m) => warns.push(m) },
@@ -237,10 +243,36 @@ describe('prewarmFeeSponsorPool (boot)', () => {
         expect(out.failed).toEqual(['sponsor-session-2']);
         expect(getOrBuildWalletFacadeMock).toHaveBeenCalledTimes(1);
         expect(getOrBuildWalletFacadeMock.mock.calls[0][0]).toBe(deriveAccountId(VIEWING_KEY));
-        // serialized: sponsor 1 resolve -> facade -> then sponsor 2
-        expect(order).toEqual(['resolve:sponsor-session-1', `facade:${deriveAccountId(VIEWING_KEY).slice(0, 4)}`, 'resolve:sponsor-session-2']);
+        // serialized to the TIP: sponsor 1 resolve -> facade -> synced -> then sponsor 2
+        const acct = deriveAccountId(VIEWING_KEY).slice(0, 4);
+        expect(order).toEqual(['resolve:sponsor-session-1', `facade:${acct}`, `tip:${acct}`, 'resolve:sponsor-session-2']);
+        expect(walletWaitForSyncedStateMock).toHaveBeenCalledWith(deriveAccountId(VIEWING_KEY), 30 * 60 * 1000);
         expect(infos.join(' ')).toMatch(/sponsor- facade ready in \d+s/);
+        expect(infos.join(' ')).toMatch(/sponsor- at tip after \d+s; next sponsor/);
         expect(warns.join(' ')).toMatch(/sponsor- failed .*fails over at use time/);
+    });
+
+    it('a sponsor still behind at the sync budget is logged and the loop moves on; budget 0 skips the wait', async () => {
+        process.env.NIGHTGATE_FEE_SPONSOR_SESSION = 'sponsor-session-1';
+        const db = { run: vi.fn(async () => sponsorRow({ sessionId: 'sponsor-session-1' })) };
+        getOrBuildWalletFacadeMock.mockImplementation(async () => ({}));
+        walletWaitForSyncedStateMock.mockImplementation(async () => { throw new Error('wallet sync stalled: no progress for 12 min'); });
+        const warns: string[] = [];
+        const cfg = { networkId: 'preprod', indexerHttpUrl: 'http://i', indexerWsUrl: 'ws://i', proofServerUrl: 'http://p', relayUrl: 'ws://n' } as any;
+        const out = await prewarmFeeSponsorPool({ db, encryptionKey: TEST_KEY, syncBudgetMs: 5000, log: { info: () => {}, warn: (m) => warns.push(m) }, facadeConfig: cfg });
+        expect(out.warmed).toEqual(['sponsor-session-1']);      // the facade IS warm; only the tip wait gave up
+        expect(warns.join(' ')).toMatch(/not at tip within 5s .*wallet sync stalled.*fails over to a synced member/);
+        walletWaitForSyncedStateMock.mockClear();
+        await prewarmFeeSponsorPool({ db, encryptionKey: TEST_KEY, syncBudgetMs: 0, facadeConfig: cfg });
+        expect(walletWaitForSyncedStateMock).not.toHaveBeenCalled();
+    });
+
+    it('prewarmSyncBudgetMs: default 30 min, env override, invalid values fall back', () => {
+        expect(prewarmSyncBudgetMs({})).toBe(30 * 60 * 1000);
+        expect(prewarmSyncBudgetMs({ NIGHTGATE_SPONSOR_PREWARM_SYNC_MS: '0' })).toBe(0);
+        expect(prewarmSyncBudgetMs({ NIGHTGATE_SPONSOR_PREWARM_SYNC_MS: '600000' })).toBe(600000);
+        expect(prewarmSyncBudgetMs({ NIGHTGATE_SPONSOR_PREWARM_SYNC_MS: 'abc' })).toBe(30 * 60 * 1000);
+        expect(prewarmSyncBudgetMs({ NIGHTGATE_SPONSOR_PREWARM_SYNC_MS: '-5' })).toBe(30 * 60 * 1000);
     });
 
     it('is a no-op without a configured pool', async () => {

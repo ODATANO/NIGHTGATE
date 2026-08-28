@@ -901,9 +901,12 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
         // it and is unbounded, so the whole per-sponsor read gets its own cap.
         // Sponsors are independent, so they run concurrently rather than
         // adding their timeouts up.
+        // 45 s (0.21.4, was 20 s): with three warm facades on the one worker
+        // thread a status read routinely takes 5-30 s on the hosted server;
+        // 20 s reported healthy sponsors as "not warm" several times an hour.
         const perSponsorTimeoutMs = (() => {
             const raw = Number(process.env.NIGHTGATE_SPONSOR_STATUS_TIMEOUT_MS);
-            return Number.isFinite(raw) && raw > 0 ? raw : 20_000;
+            return Number.isFinite(raw) && raw > 0 ? raw : 45_000;
         })();
         const withCap = async <T>(work: Promise<T>, what: string): Promise<T> => {
             let timer: NodeJS.Timeout | undefined;
@@ -1219,7 +1222,9 @@ const SESSION_CLOSE_CHUNK = 200;
  * deployment config and usable by any authenticated caller
  * (`resolveFeeSponsor`), i.e. they are deliberately long-lived and process
  * independent. Closing them would break sponsored submissions after every
- * restart until an operator pinned a fresh id.
+ * restart until an operator pinned a fresh id. SESSIONS HOLDING A SIGNING
+ * KEY are kept as well (0.21.4): the key is the expensive, irreplaceable
+ * part, and a leftover viewing-only session is the only thing worth sweeping.
  *
  * No facade eviction here (a fresh process has no facades) and no key material
  * survives: the same columns `disconnectWallet` clears are cleared.
@@ -1227,9 +1232,18 @@ const SESSION_CLOSE_CHUNK = 200;
 export async function closeSessionsFromPreviousProcess(db: any, config?: Record<string, any>): Promise<string[]> {
     const exempt = new Set(getConfiguredFeeSponsorSessions(config));
     const active: any[] = (await db.run(
-        SELECT.from(WalletSessions).columns('sessionId').where({ isActive: true })
+        SELECT.from(WalletSessions).columns('sessionId', 'encryptedSeedKey').where({ isActive: true })
     )) || [];
-    const stale = active.map(r => r.sessionId).filter((id: string) => id && !exempt.has(id));
+    // A session holding a SIGNING key was upgraded with a mnemonic on purpose
+    // (a pool member taken out of the config for a while, a consumer's
+    // custodial wallet). Closing it revokes the key, and nothing short of a
+    // fresh connectWalletForSigning brings it back, so such sessions stay
+    // active; their facades are rebuilt lazily on first use. (0.21.4)
+    const keyed = active.filter(r => r?.sessionId && r.encryptedSeedKey && !exempt.has(r.sessionId)).map(r => r.sessionId as string);
+    if (keyed.length) {
+        cds.log('nightgate').info(`Boot sweep keeps ${keyed.length} session(s) holding a signing key: ${keyed.map(id => id.slice(0, 8)).join(', ')}`);
+    }
+    const stale = active.map(r => r?.sessionId).filter((id: string) => id && !exempt.has(id) && !keyed.includes(id));
     if (stale.length === 0) return [];
 
     const now = new Date().toISOString();

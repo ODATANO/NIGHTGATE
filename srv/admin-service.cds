@@ -103,6 +103,28 @@ service NightgateAdminService {
      * jobs failed" into a diagnosis, e.g. a run of `1010/188` meaning batched
      * calls are crossing the guaranteed/fallible boundary.
      */
+    /**
+     * CPU profile of the wallet worker thread (0.21.4): samples the running
+     * worker for `seconds` (1..120, default 20) with the in-thread V8 profiler
+     * while it keeps serving, and returns where the time went (self time by
+     * function and file, inclusive hot paths, idle/gc/wasm shares). The raw
+     * .cpuprofile is written under `dir` (default: the OS temp dir,
+     * `nightgate-profiles/`) for a DevTools deep dive; `file` names it.
+     * Diagnostic for "the worker is busy and the log does not say why".
+     */
+    action profileWorker(seconds: Integer, dir: String) returns {
+        seconds       : Integer;
+        file          : String;
+        facadeCount   : Integer;
+        sampledMs     : Integer;
+        idlePercent   : Double;
+        gcPercent     : Double;
+        wasmPercent   : Double;
+        topFunctions  : array of { label: String; percent: Double };
+        topFiles      : array of { label: String; percent: Double };
+        topInclusive  : array of { label: String; percent: Double };
+    };
+
     function getJobStats(windowHours: Integer) returns {
         windowHours         : Integer;
         since               : Timestamp;

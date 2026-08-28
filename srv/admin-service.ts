@@ -18,6 +18,7 @@ import { evictWalletFacade } from './submission/wallet-facade-builder';
 
 import { WalletSessions, DisclosureRoles, BackgroundJobs } from '#cds-models/midnight';
 import { listContracts, registerContractAtRuntime, unregisterContractAtRuntime, ContractRegistrationError } from './submission/contract-registrations';
+import { walletCpuProfile } from './midnight/wallet-worker-client';
 
 /**
  * Drop the in-memory WalletFacade (live secret keys) cached for a session, so a
@@ -101,6 +102,22 @@ export default class NightgateAdminService extends cds.ApplicationService {
         // Runtime contract registration on top of the config floor; the
         // service-level @requires 'admin' gates the caller.
         this.on('listContracts', async () => listContracts());
+
+        // Worker CPU profile: bounded sampling window, runs while the worker
+        // keeps serving; the caller waits for the result (up to seconds + 60 s).
+        this.on('profileWorker', async (req: Request) => {
+            const data = req.data as { seconds?: number | null; dir?: string | null };
+            const seconds = Number(data.seconds ?? 20);
+            if (!Number.isFinite(seconds) || seconds < 1 || seconds > 120) {
+                return req.reject(400, 'seconds must be between 1 and 120');
+            }
+            const dir = typeof data.dir === 'string' && data.dir.trim() ? data.dir.trim() : undefined;
+            try {
+                return await walletCpuProfile(seconds, dir);
+            } catch (e: any) {
+                return req.reject(503, `worker profile failed: ${e?.message ?? String(e)}`);
+            }
+        });
 
         this.on('registerContract', async (req: Request) => {
             const data = req.data as { name?: string; artifactPath?: string; zkConfigPath?: string; privateStateId?: string; slotWidth?: number | null };

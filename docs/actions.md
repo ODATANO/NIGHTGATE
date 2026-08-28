@@ -886,6 +886,8 @@ Operator controls, `@requires: 'admin'` (since 0.5.2; unauthenticated or non-adm
 
 `unregisterContract(name) → { removed }` (0.21.0) - remove a runtime registration (memory + table). Config names refuse with `409`.
 
+`profileWorker(seconds?, dir?) → { seconds, file, facadeCount, sampledMs, idlePercent, gcPercent, wasmPercent, topFunctions[], topFiles[], topInclusive[] }` (0.21.4) - CPU profile of the wallet worker thread, taken with the in-thread V8 profiler for `seconds` (1..120, default 20) while the worker keeps serving. The summary says where the time went (self time by function and by file, inclusive hot paths, each as a share of the sampled window, plus the idle/GC/wasm shares); the raw `.cpuprofile` is written under `dir` (default: OS temp dir, `nightgate-profiles/`) for Chrome DevTools. The caller waits for the window (request timeout `seconds + 60 s`). Use it when the worker is busy and the log does not say why; a warm facade at tip idles above 90 %.
+
 `listContracts() → [{ name, source, ..., artifactDigest, hasProverKeys }]` (0.21.0) - every contract this process knows, `source` `config` or `runtime`.
 
 `grantRole(userId, role, scope?, validUntil?)` - grant a disclosure tier (`public_only` | `legitimate_interest` | `authority`) read by the `AttestationService` mixin's `attachDisclosureRole` middleware. Caller must already hold `authority`. This is the **off-chain** tier table (`DisclosureRoles`).

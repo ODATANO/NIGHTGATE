@@ -465,6 +465,26 @@ describe('wallet session handlers', () => {
             expect(updateWhereSpy).toHaveBeenCalledWith({ sessionId: { in: ['a'] } });
         });
 
+        // A session upgraded with a mnemonic keeps its signing key across a
+        // restart: closing it would revoke the key, and only a fresh
+        // connectWalletForSigning brings it back (a pool member taken out of
+        // the config for a while used to be lost this way).
+        it('keeps sessions holding a signing key, closes the rest', async () => {
+            delete process.env.NIGHTGATE_FEE_SPONSOR_SESSION;
+            const db = {
+                run: vi.fn()
+                    .mockResolvedValueOnce([
+                        { sessionId: 'viewing-only', encryptedSeedKey: null },
+                        { sessionId: 'keyed', encryptedSeedKey: 'enc:seed' },
+                        { sessionId: 'other', encryptedSeedKey: '' }
+                    ])
+                    .mockResolvedValueOnce(2)
+            };
+
+            expect(await closeSessionsFromPreviousProcess(db)).toEqual(['viewing-only', 'other']);
+            expect(updateWhereSpy).toHaveBeenCalledWith({ sessionId: { in: ['viewing-only', 'other'] } });
+        });
+
         it('does not write when only exempt sessions are active', async () => {
             process.env.NIGHTGATE_FEE_SPONSOR_SESSION = 'sponsor-1';
             const db = { run: vi.fn().mockResolvedValueOnce([{ sessionId: 'sponsor-1' }]) };

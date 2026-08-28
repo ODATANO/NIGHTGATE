@@ -1,5 +1,40 @@
 # Changelog
 
+## 0.21.4 - 2026-08-28
+
+Sponsor pool on one worker thread: the cheap fixes from the sharding
+analysis. No schema change, no SDK change.
+
+- **Prewarm serializes catch-up to the tip.** `prewarmFeeSponsorPool` waits
+  for each sponsor to reach the chain tip (`walletWaitForSyncedState`) before
+  starting the next one, so the first pool member is usable after 1/N of
+  the wall clock instead of all N crawling together on the shared thread
+  (measured: one wallet alone 113 events/s, three together ~26 each).
+  `NIGHTGATE_SPONSOR_PREWARM_SYNC_MS` caps the wait per sponsor (default
+  30 min; 0 = build only, the old behaviour); a sponsor still behind is
+  logged and the loop moves on.
+- **Boot sweep keeps sessions holding a signing key.**
+  `closeSessionsFromPreviousProcess` closes viewing-only leftovers only; a
+  session upgraded with a mnemonic (a pool member taken out of the config,
+  a consumer's custodial wallet) stays active and is rebuilt lazily. Before,
+  removing an id from `NIGHTGATE_FEE_SPONSOR_SESSION` and restarting revoked
+  its key for good.
+- **Idle progress watch.** The worker peeks every facade's dust progress
+  every `NIGHTGATE_PROGRESS_WATCH_MS` (default 60 s), refreshes the cached
+  `getWalletSyncProgress` snapshot and logs `idle-sync ... behindEvents=`
+  while a facade is behind with no job waiting. A far-behind idle wallet no
+  longer looks like a hang.
+- `getSponsorPoolStatus`: per-sponsor status read cap 45 s (was 20 s;
+  `NIGHTGATE_SPONSOR_STATUS_TIMEOUT_MS`). Three warm facades on one thread
+  make a read take 5-30 s; 20 s reported healthy sponsors as not warm.
+- **Admin `profileWorker(seconds?, dir?)`**: CPU profile of the wallet worker
+  thread with the in-thread V8 profiler (`node:inspector` inside the worker,
+  1..120 s, worker keeps serving); returns self time by function/file,
+  inclusive hot paths and the idle/GC/wasm shares
+  (`srv/midnight/cpu-profile-summary.ts`), writes the raw `.cpuprofile` for
+  DevTools. Reference point: a warm facade at tip idles > 90 % (local
+  measurement: 8 % of the worker for one facade, dust serialisation + GC).
+
 ## 0.21.3 - 2026-08-28
 
 CAP connection pool under load. No schema change, no SDK change.

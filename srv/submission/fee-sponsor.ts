@@ -24,6 +24,23 @@ import { WalletSessions } from '#cds-models/midnight';
 import { decrypt, getEncryptionKey } from '../utils/crypto';
 import { deriveAccountId, deriveStoragePassword } from './wallet-material-factory';
 import { getOrBuildWalletFacade, type WalletFacadeBuildArgs } from './wallet-facade-builder';
+import { walletWaitForSyncedState } from '../midnight/wallet-worker-client';
+
+/**
+ * Prewarm waits for each sponsor to reach the chain tip before it starts the
+ * next one (0.21.4). All facades share ONE worker thread, so N cold wallets
+ * catching up together each get 1/N of the throughput and none is usable
+ * for hours; one at a time, the first is usable after 1/N of that wall
+ * clock and the pool fails over to it. `NIGHTGATE_SPONSOR_PREWARM_SYNC_MS`
+ * caps the wait per sponsor (default 30 min; 0 = build only, as before);
+ * a sponsor still behind at the cap is logged and the loop moves on.
+ */
+export function prewarmSyncBudgetMs(env: NodeJS.ProcessEnv = process.env): number {
+    const raw = env.NIGHTGATE_SPONSOR_PREWARM_SYNC_MS;
+    if (raw === undefined || raw === '') return 30 * 60 * 1000;
+    const n = Number(raw);
+    return Number.isFinite(n) && n >= 0 ? n : 30 * 60 * 1000;
+}
 
 /**
  * Typed error with the OData status the handlers should reject with.
@@ -169,6 +186,8 @@ export async function prewarmFeeSponsorPool(opts: {
     log?: { info: (m: string) => void; warn: (m: string) => void };
     /** Test seam; defaults to the process-scoped key. */
     encryptionKey?: Buffer;
+    /** Per-sponsor sync-to-tip wait; defaults to `prewarmSyncBudgetMs()`. 0 = build only. */
+    syncBudgetMs?: number;
 }): Promise<{ warmed: string[]; failed: string[] }> {
     const pool = getConfiguredFeeSponsorSessions(opts.config);
     const warmed: string[] = [];
@@ -180,6 +199,15 @@ export async function prewarmFeeSponsorPool(opts: {
             await ensureFeeSponsorFacade(sponsor, opts.facadeConfig);
             warmed.push(sponsorSessionId);
             opts.log?.info(`sponsor pool prewarm: ${sponsorSessionId.slice(0, 8)} facade ready in ${Math.round((Date.now() - started) / 1000)}s`);
+            const syncBudget = opts.syncBudgetMs ?? prewarmSyncBudgetMs();
+            if (syncBudget > 0) {
+                try {
+                    await walletWaitForSyncedState(sponsor.accountId, syncBudget);
+                    opts.log?.info(`sponsor pool prewarm: ${sponsorSessionId.slice(0, 8)} at tip after ${Math.round((Date.now() - started) / 1000)}s; next sponsor`);
+                } catch (err) {
+                    opts.log?.warn(`sponsor pool prewarm: ${sponsorSessionId.slice(0, 8)} not at tip within ${Math.round(syncBudget / 1000)}s (${err instanceof Error ? err.message : String(err)}); it keeps catching up, the pool fails over to a synced member`);
+                }
+            }
         } catch (err) {
             failed.push(sponsorSessionId);
             opts.log?.warn(`sponsor pool prewarm: ${sponsorSessionId.slice(0, 8)} failed (${err instanceof Error ? err.message : String(err)}); the pool fails over at use time`);

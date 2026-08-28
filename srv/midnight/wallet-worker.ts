@@ -29,6 +29,7 @@ import { parentPort, MessageChannel, type MessagePort } from 'node:worker_thread
 import path from 'node:path';
 import fs from 'node:fs';
 import os from 'node:os';
+import { summarizeCpuProfile } from './cpu-profile-summary';
 import crypto from 'node:crypto';
 import { pathToFileURL } from 'node:url';
 import { classificationHaystack, formatErr, formatErrWithCauses, safeDeepInspect } from '../utils/format-error';
@@ -79,6 +80,8 @@ interface FacadeEntry {
     dustKey: any;
     unshieldedKeystore: any;
     saveTimer?: NodeJS.Timeout;
+    /** Idle progress watch (startProgressWatch); cleared with the facade. */
+    progressTimer?: NodeJS.Timeout;
     lastSavedBlobs?: { shielded?: string; unshielded?: string; dust?: string }; // Blobs of the last save the MAIN THREAD CONFIRMED it persisted
     pendingSaves?: Map<number, { shielded?: string; unshielded?: string; dust?: string }>; // In-flight saves by sequence number, resolved by `state-save-ack
     networkId: string;
@@ -2704,6 +2707,58 @@ export function applySaveAck(entry: FacadeEntry, seq: number): void {
     entry.dustSaveEpochs?.delete(seq);
 }
 
+/**
+ * Idle progress watch (0.21.4): `waitForGenuineSync` only publishes progress
+ * while a job waits, so a facade that is far behind but has nothing to do
+ * logs nothing and its `getWalletSyncProgress` row goes stale, which reads
+ * like a hang. Every PROGRESS_WATCH_MS this peeks the dust progress (bounded
+ * state read + one tip query), refreshes the cached snapshot and logs an INFO
+ * line while the facade is behind; silent once at tip. Skipped while a
+ * genuine-sync wait refreshed the snapshot itself within the interval.
+ */
+const PROGRESS_WATCH_MS = Math.max(15_000, Number(process.env.NIGHTGATE_PROGRESS_WATCH_MS) || 60_000);
+
+function startProgressWatch(sessionId: string, entry: FacadeEntry): void {
+    if (entry.progressTimer) return;
+    let busy = false;
+    entry.progressTimer = setInterval(async () => {
+        if (busy) return;
+        busy = true;
+        try {
+            const last = syncProgress.get(sessionId);
+            if (last && Date.now() - Date.parse(last.updatedAt) < PROGRESS_WATCH_MS) return;
+            let state: any; let sub: any; let timer: NodeJS.Timeout | undefined;
+            try {
+                state = await Promise.race([
+                    new Promise<any>((res, rej) => { try { sub = entry.facade.state().subscribe({ next: (v: any) => res(v), error: (e: any) => rej(e) }); } catch (e) { rej(e); } }),
+                    new Promise((_, rej) => { timer = setTimeout(() => rej(new Error('state peek timeout')), 5_000); })
+                ]);
+            } catch { return; } finally { try { sub && sub.unsubscribe(); } catch { } if (timer) clearTimeout(timer); }
+            const p: any = state?.dust?.progress;
+            const applied = p?.appliedIndex != null ? BigInt(p.appliedIndex) : -1n;
+            const highest = (await getDustStreamTip(entry.indexerHttpUrl)) ?? -1n;
+            const behind = highest >= 0n && applied >= 0n ? highest - applied : null;
+            const caughtUp = behind != null && behind <= SYNC_TIP_GAP;
+            const now = Date.now();
+            syncProgress.set(sessionId, {
+                sessionId, appliedIndex: applied.toString(), streamTip: highest.toString(),
+                behindEvents: behind != null ? behind.toString() : null, eventsPerSecond: null, etaSeconds: caughtUp ? 0 : null,
+                blockHeight: null, isConnected: p?.isConnected === true, indexerFresh: true, caughtUp,
+                elapsedMs: 0, label: last?.label ?? 'idle', updatedAt: new Date(now).toISOString(),
+                lastProgressAt: last && last.appliedIndex === applied.toString() ? last.lastProgressAt : new Date(now).toISOString()
+            });
+            if (!caughtUp) {
+                log('info', `idle-sync ${sessionId.slice(0, 16)} appliedIndex=${applied} streamTip=${highest} behindEvents=${behind ?? '?'} connected=${p?.isConnected === true} (no job waiting)`);
+            }
+        } catch (e) {
+            log('debug', `progress watch ${sessionId.slice(0, 16)}: ${formatErr(e)}`);
+        } finally {
+            busy = false;
+        }
+    }, PROGRESS_WATCH_MS);
+    entry.progressTimer.unref();
+}
+
 function startPeriodicSave(sessionId: string, entry: FacadeEntry): void {
     if (entry.saveTimer) return;
     let tickCount = 0;
@@ -2876,7 +2931,44 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
         const entry = await buildFacade(args);
         facades.set(args.sessionId, entry);
         startPeriodicSave(args.sessionId, entry);
+        startProgressWatch(args.sessionId, entry);
         return { facadeReady: true, alreadyExisted: false, sdkVersion: entry.sdkVersion };
+    },
+
+    /**
+     * CPU profile of THIS worker thread for `seconds` (1..120), taken with the
+     * in-thread inspector while the worker keeps serving; the summary travels
+     * back, the raw .cpuprofile stays on disk for DevTools. Admin diagnostic
+     * (`profileWorker`), added when the hosted worker sat at 100 % CPU with
+     * three warm facades and nothing in the log said why.
+     */
+    async cpuProfile({ seconds, dir }: { seconds?: number; dir?: string }) {
+        const secs = Math.min(120, Math.max(1, Math.floor(Number(seconds) || 20)));
+        const inspector = await import('node:inspector');
+        const session = new inspector.Session();
+        session.connect();
+        const post = (m: string, p?: object) => new Promise<any>((res, rej) => (session as any).post(m, p ?? {}, (e: Error | null, r: unknown) => e ? rej(e) : res(r)));
+        try {
+            await post('Profiler.enable');
+            await post('Profiler.setSamplingInterval', { interval: 1000 });
+            await post('Profiler.start');
+            await wsleep(secs * 1000);
+            const { profile } = await post('Profiler.stop');
+            const summary = summarizeCpuProfile(profile, 25);
+            let file: string | null = null;
+            try {
+                const outDir = dir || path.join(os.tmpdir(), 'nightgate-profiles');
+                fs.mkdirSync(outDir, { recursive: true });
+                file = path.join(outDir, `worker-${new Date().toISOString().replace(/[:.]/g, '-')}-${secs}s.cpuprofile`);
+                fs.writeFileSync(file, JSON.stringify(profile));
+            } catch (e) {
+                log('warn', `cpuProfile: raw profile not written: ${formatErr(e)}`);
+            }
+            log('info', `cpuProfile: ${secs}s sampled, idle ${summary.idlePercent}%, gc ${summary.gcPercent}%, wasm ${summary.wasmPercent}%, top: ${summary.topFunctions.slice(0, 3).map((f: { label: string; percent: number }) => `${f.label.split('  ')[0]} ${f.percent}%`).join(', ')}`);
+            return { seconds: secs, file, facadeCount: facades.size, ...summary };
+        } finally {
+            try { session.disconnect(); } catch { /* already gone */ }
+        }
     },
 
     async waitForSyncedState({ sessionId, timeoutMs, stallMs }: { sessionId: string; timeoutMs?: number; stallMs?: number }) {
@@ -2896,6 +2988,7 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
         facades.delete(sessionId);
         syncProgress.delete(sessionId);
         if (entry.saveTimer) clearInterval(entry.saveTimer);
+        if (entry.progressTimer) clearInterval(entry.progressTimer);
         // Teardown (final save + zeroing secrets + stopping the facade) runs under
         // the per-session submit lock so it can't yank key material from a submit
         // still in flight for this session (it holds `entry` mid-SDK-call). New

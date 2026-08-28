@@ -576,6 +576,12 @@ export async function walletEvict(sessionId: string): Promise<{ evicted: boolean
  * how fresh the answer is; a snapshot that stops advancing while `elapsedMs`
  * grows is the signature of a genuine stall.
  */
+/** CPU profile of the worker thread for `seconds` (1..120); summary back, raw file on disk. Admin diagnostic. */
+export function walletCpuProfile(seconds: number, dir?: string): Promise<Record<string, unknown>> {
+    const secs = Math.min(120, Math.max(1, Math.floor(Number(seconds) || 20)));
+    return rpc('cpuProfile', { seconds: secs, dir }, (secs + 60) * 1000);
+}
+
 export function walletGetSyncProgress(sessionId: string): WalletSyncProgress | null {
     return syncProgressCache.get(sessionId) ?? null;
 }
