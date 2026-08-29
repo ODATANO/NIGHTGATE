@@ -77,7 +77,39 @@ export interface CreateTxBuilderInput {
     /** Transaction TTL in minutes (default 30): the sponsor must submit within it. */
     ttlMinutes?: number;
     attestationSecret?: Uint8Array;
+    /**
+     * `true` (default): the wallet syncs from genesis against the indexer on
+     * the calling thread for the life of the builder (a full core while it
+     * catches up). `false`: no sync. A call that moves no value (every vault
+     * circuit) needs no wallet state to build, prove and sign; a call that
+     * does move value then fails at balancing instead of building wrong.
+     */
+    walletSync?: boolean;
     onProgress?: (e: Record<string, unknown>) => void;
+}
+
+export interface DeriveIdentityInput {
+    /** 128 hex chars (64-byte BIP39 seed). */
+    seedHex: string;
+    /** Default `preprod`; only the NIGHT address format depends on it. */
+    networkId?: string;
+    accountIndex?: number;
+    /** Bring your own, else derived from the seed. */
+    attestationSecret?: Uint8Array;
+}
+
+export interface Identity {
+    /** hex, `persistentHash` of the attestation secret */
+    attesterId: string;
+    attestationSecret: Uint8Array;
+    addresses: { night: string };
+}
+
+/** Tracks the sockets a `ws` class opens; `closeAll()` terminates them. */
+export interface TrackingWebSocket {
+    WebSocket: Function;
+    readonly size: number;
+    closeAll(): void;
 }
 
 export interface BuildSponsorableInput {
@@ -152,6 +184,7 @@ export interface TxBuilder {
     buildDeploySponsorable(input: BuildDeploySponsorableUnboundInput): Promise<BuiltUnboundDeploy>;
     buildDeploySponsorable(input?: BuildDeploySponsorableBoundInput): Promise<BuiltBoundDeploy>;
     buildDeploySponsorable(input: BuildDeploySponsorableInput): Promise<BuiltDeploy>;
+    /** Stops the wallet sync and ends the indexer sockets. Call it; the sync otherwise runs until the process exits. */
     close(): Promise<void>;
 }
 
@@ -177,3 +210,6 @@ export declare function ensureZkAssets(input: EnsureZkAssetsInput): Promise<ZkAs
 /** Checks a local keys/ + zkir/ directory and describes it as a `ZkAssetResult` (`source: 'local'`, nothing fetched). */
 export declare function describeLocalZkAssets(zkConfigDir: string, circuits?: string[], proveCircuits?: string[]): Promise<ZkAssetResult>;
 export declare function createTxBuilder(opts: CreateTxBuilderInput): Promise<TxBuilder>;
+/** The identity a seed yields (attester id, attestation secret, NIGHT address) without a builder, a wallet or the network; ~150 ms. */
+export declare function deriveIdentity(opts: DeriveIdentityInput): Promise<Identity>;
+export declare function trackingWebSocket(WebSocketImpl: Function): TrackingWebSocket;

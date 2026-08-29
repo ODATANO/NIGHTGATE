@@ -111,9 +111,19 @@ feed straight into these.
 | `ttlMinutes` | no | transaction TTL, default 30. The sponsor must submit within it. |
 | `attestationSecret` | no | bring your own, else derived from the seed |
 | `proofServerUrl` | no | unused under wasm proving; the SDK's config type asks for a URL, nothing calls it |
+| `walletSync` | no | `true` by default: the wallet syncs from genesis against the indexer, on the calling thread, for the life of the builder (a full core until it reaches the tip, hours on preprod). `false`: no sync. A call that moves no value (every vault circuit) builds, proves and signs without wallet state; a value-moving call then fails at balancing. Measured, `attest` bind:false, fresh seed: build 24.5 s vs 27.7 s (proving dominates), event-loop lag p50 108 ms vs 7 ms during the build, idle CPU with the builder open 101 % vs 2 %. |
 | `onProgress` | no | callback for asset download and build phases |
 
-Returns `{ attestationSecret, attesterId, zkAssets, addresses, buildSponsorable, close }`.
+Returns `{ attestationSecret, attesterId, zkAssets, addresses, buildSponsorable, buildDeploySponsorable, close }`.
+`close()` stops the wallet sync and ends the indexer sockets; without it both
+run until the process exits (one sync at a full core per builder).
+
+### `deriveIdentity({ seedHex, networkId?, accountIndex?, attestationSecret? }) -> { attesterId, attestationSecret, addresses }`
+
+The identity a seed yields, with no builder, no wallet and no network: the
+same derivation `createTxBuilder` runs (role seeds, attestation secret,
+`attesterId` = persistentHash of the secret, NIGHT address), in ~150 ms.
+Use it to show or register an identity before the first build.
 
 ### `buildSponsorable({ contractAddress, call | calls, initialPrivateState, bind?, attestationSecret? }) -> { finalizedTxB64 | unboundTxB64, serializedBytes, bound }`
 
@@ -212,6 +222,12 @@ process and only the bytes going to the server.
 
 - **First run downloads the prover keys** (~81 MB for the full vault set) and
   caches them. Restrict `circuits` to what you actually call to cut that down.
+- **Everything runs on the calling thread.** Ledger assembly, the wallet
+  sync (`walletSync`, default on) and wasm proving all execute where
+  `createTxBuilder` and `buildSponsorable` are awaited; in a server that is
+  the request thread. Host the builder in a `worker_threads` worker and
+  proxy the calls, and pass `walletSync: false` for calls that move no
+  value.
 - **Proving blocks the thread.** It is wasm in-process; run it off your request
   path or in a worker. Or opt in to `provingMode: 'server'` with
   `proofServerUrl` pointing at YOUR OWN proof server (`docker run -d -p

@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.21.8 - 2026-08-29
+
+txbuilder: wallet sync cost, socket leak, identity. No schema change, no
+SDK change, no circuit change. `@odatano/nightgate-tx` 0.4.1.
+
+- **`close()` stopped nothing.** It called `facade.close?.()`; the facade
+  has `stop()`, so the call was a no-op and every builder's wallet sync
+  (three indexer streams, from genesis) ran until the process exited. Now
+  `facade.stop()` plus the public-data provider's sockets:
+  `indexerPublicDataProvider` has no close, so the builder hands it a
+  tracking `ws` subclass (`trackingWebSocket`) and terminates what it
+  opened. Measured (attest, bind:false, fresh seed, wasm): idle CPU with
+  the builder open 89-101 %, after `close()` 93 % before / 0 % now; indexer
+  sockets 1-2 before / 0 after.
+- **`walletSync: false`** on `createTxBuilder` skips `facade.start()`. A
+  call that moves no value needs no wallet state to build, prove and sign
+  (balancing returns the tx untouched, signing is the keystore alone); a
+  value-moving call fails at balancing. Measured against the default: build
+  27.7 s vs 24.5 s (proving dominates), event-loop lag p50 7 ms vs 108 ms
+  during the build, idle CPU 2 % vs 101 %, identical 5284 bytes. Sponsored
+  on preprod from a never-synced seed: 006f31fc4a5831e05dddf3d2598912ff0f7b2fdc4c86f4482646b1a3d87fbf9b8e (66 s incl. dust proof in wasm; verifyAttestationState confirms the caller attester id).
+- **`deriveIdentity({ seedHex, networkId?, accountIndex?, attestationSecret? })`**:
+  `attesterId`, attestation secret and NIGHT address without a builder or
+  the network (~150 ms; was a full `createTxBuilder`). Exported from
+  `@odatano/nightgate/txbuilder` and the `nightgate-tx` root.
+- Docs: everything the builder does runs on the calling thread; host it in
+  a `worker_threads` worker (`docs/txbuilder.md`, slim README, example).
+
 ## 0.21.7 - 2026-08-28
 
 Graceful container stop. No schema change, no SDK change.

@@ -262,3 +262,59 @@ describe('txbuilder: readDeployAddress requires exactly one deploy action', () =
         expect(() => readDeployAddress(tx([{ actions: [{ address: 'bb'.repeat(32), updates: [] }] }]))).toThrow(/maintenance update/);
     });
 });
+
+describe('txbuilder: trackingWebSocket lets close() end the indexer sockets the SDK provider hides', () => {
+    // graphql-ws accepts a WebSocket implementation only when it looks like one
+    // (a function carrying the CONNECTING/OPEN/CLOSING/CLOSED statics); the
+    // subclass must keep passing that check.
+    class FakeWs {
+        static CONNECTING = 0; static OPEN = 1; static CLOSING = 2; static CLOSED = 3;
+        handlers: Record<string, Array<() => void>> = {};
+        terminated = false;
+        constructor(public url: string) { /* no I/O */ }
+        once(ev: string, fn: () => void) { (this.handlers[ev] ??= []).push(fn); }
+        emit(ev: string) { for (const fn of this.handlers[ev] ?? []) fn(); }
+        terminate() { this.terminated = true; }
+    }
+
+    it('subclass passes the graphql-ws implementation check and tracks open sockets until they close', async () => {
+        const { trackingWebSocket } = await importTxBuilder();
+        const tracked = trackingWebSocket(FakeWs);
+        const W: any = tracked.WebSocket;
+        expect(typeof W).toBe('function');
+        for (const k of ['CONNECTING', 'OPEN', 'CLOSING', 'CLOSED']) expect(k in W).toBe(true);
+        const a = new W('ws://i/graphql/ws');
+        const b = new W('ws://i/graphql/ws');
+        expect(tracked.size).toBe(2);
+        a.emit('close');
+        expect(tracked.size).toBe(1);
+        tracked.closeAll();
+        expect(b.terminated).toBe(true);
+        expect(a.terminated).toBe(false);
+        expect(tracked.size).toBe(0);
+    });
+
+    it('closeAll falls back to close() and survives a socket that throws', async () => {
+        const { trackingWebSocket } = await importTxBuilder();
+        class NoTerminate { static CONNECTING = 0; static OPEN = 1; static CLOSING = 2; static CLOSED = 3; closed = false; close() { this.closed = true; } }
+        class Throws { static CONNECTING = 0; static OPEN = 1; static CLOSING = 2; static CLOSED = 3; terminate() { throw new Error('gone'); } }
+        const t1 = trackingWebSocket(NoTerminate);
+        const s1: any = new (t1.WebSocket as any)();
+        t1.closeAll();
+        expect(s1.closed).toBe(true);
+        const t2 = trackingWebSocket(Throws);
+        new (t2.WebSocket as any)();
+        expect(() => t2.closeAll()).not.toThrow();
+        expect(t2.size).toBe(0);
+    });
+});
+
+describe('txbuilder: deriveIdentity validates the seed before touching the SDK', () => {
+    it('rejects a malformed seed', async () => {
+        const { deriveIdentity } = await importTxBuilder();
+        for (const seedHex of ['', 'abc', 'a'.repeat(127), 'z'.repeat(128)]) {
+            await expect(deriveIdentity({ seedHex })).rejects.toThrow(/128 hex chars/);
+        }
+        await expect(deriveIdentity(undefined as any)).rejects.toThrow(/128 hex chars/);
+    });
+});

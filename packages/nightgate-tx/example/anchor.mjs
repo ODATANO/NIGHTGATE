@@ -55,6 +55,9 @@ const builder = await createTxBuilder({
     // generation of the contract actually deployed at VAULT.
     zkConfigBaseUrl: `${SPONSOR}/zk-config/attestation-vault`,
     contractClass: Contract,
+    // An attest moves no value: nothing to balance, so the wallet need not sync
+    // (the default sync runs from genesis at a full core until the tip).
+    walletSync: false,
     onProgress: e => e.phase === 'zk-assets' && console.log('fetching prover keys (first run only)...')
 });
 console.log(`attester id : ${builder.attesterId}`);

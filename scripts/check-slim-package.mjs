@@ -30,9 +30,9 @@ const exists = (p) => access(p).then(() => true, () => false);
 
 /** Expected surface per entry point: what the README promises. */
 const EXPECTED = {
-    '.': ['connect', 'int64', 'createTxBuilder', 'ensureZkAssets', 'ATTESTATION_VAULT_CIRCUITS'],
+    '.': ['connect', 'int64', 'createTxBuilder', 'deriveIdentity', 'ensureZkAssets', 'ATTESTATION_VAULT_CIRCUITS'],
     './client': ['connect', 'int64', 'NightgateApiError', 'NightgateJobError'],
-    './txbuilder': ['createTxBuilder', 'ensureZkAssets'],
+    './txbuilder': ['createTxBuilder', 'deriveIdentity', 'ensureZkAssets'],
     './calls': ['prepareAttest', 'prepareAnchorContentRoot', 'prepareProveFieldMembership',
         'buildAttestationVaultWitnesses', 'generateAttestationSecret', 'CONTRACTS'],
     './attestation-vault': ['Contract', 'pureCircuits', 'ledger'],

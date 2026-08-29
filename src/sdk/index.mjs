@@ -13,4 +13,4 @@
 // SPDX-License-Identifier: Apache-2.0
 
 export { connect, int64, NightgateApiError, NightgateJobError } from './client.mjs';
-export { createTxBuilder, ensureZkAssets, ATTESTATION_VAULT_CIRCUITS } from '../txbuilder/index.mjs';
+export { createTxBuilder, deriveIdentity, ensureZkAssets, ATTESTATION_VAULT_CIRCUITS } from '../txbuilder/index.mjs';

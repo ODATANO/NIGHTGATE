@@ -259,6 +259,69 @@ export async function describeLocalZkAssets(zkConfigDir, circuits = [], proveCir
     return { cacheDir: zkConfigDir, fetched: 0, cached, source: 'local' };
 }
 
+/**
+ * A `ws` subclass that remembers every socket it opens, so a builder's
+ * `close()` can end the SDK's indexer connection: `indexerPublicDataProvider`
+ * exposes no close and keeps its graphql-ws client private; the WebSocket
+ * class it is handed is the only hook.
+ */
+export function trackingWebSocket(WebSocketImpl) {
+    const open = new Set();
+    class TrackedWebSocket extends WebSocketImpl {
+        constructor(...args) {
+            super(...args);
+            open.add(this);
+            this.once?.('close', () => open.delete(this));
+        }
+    }
+    return {
+        WebSocket: TrackedWebSocket,
+        get size() { return open.size; },
+        closeAll() {
+            for (const s of open) {
+                try { if (typeof s.terminate === 'function') s.terminate(); else s.close?.(); } catch { /* already gone */ }
+            }
+            open.clear();
+        }
+    };
+}
+
+/** Everything the seed determines, keys included. Internal; `deriveIdentity` is the public, key-free cut. */
+async function deriveKeyMaterial({ seedHex, networkId = 'preprod', accountIndex = 0, attestationSecret: ownSecret }) {
+    if (!/^[0-9a-fA-F]{128}$/.test(String(seedHex ?? ''))) {
+        throw new Error('seedHex must be 128 hex chars (64-byte BIP39 seed)');
+    }
+    const [unshielded, { deriveAttestationSecret }] = await Promise.all([
+        import('@midnightntwrk/wallet-sdk-unshielded-wallet'),
+        import('../browser/witnesses.mjs')
+    ]);
+    const { deriveRoleSeeds } = require('../../srv/utils/wallet-hd.js');
+    const rt = require('@midnight-ntwrk/compact-runtime');
+    const roleSeeds = await deriveRoleSeeds(new Uint8Array(Buffer.from(seedHex, 'hex')), accountIndex);
+    const keystore = unshielded.createKeystore(roleSeeds.night, networkId);
+    const attestationSecret = ownSecret ?? deriveAttestationSecret(roleSeeds.zswap);
+    return {
+        roleSeeds,
+        keystore,
+        attestationSecret,
+        attesterId: Buffer.from(rt.persistentHash(new rt.CompactTypeBytes(32), attestationSecret)).toString('hex'),
+        addresses: { night: unshielded.PublicKey.fromKeyStore(keystore).address }
+    };
+}
+
+/**
+ * The identity a seed yields, without a builder, a wallet or the network:
+ * attestation secret, `attesterId` (persistentHash of the secret) and the
+ * NIGHT address. Same derivation as `createTxBuilder`, ~150 ms.
+ *
+ * @param {{ seedHex: string, networkId?: string, accountIndex?: number, attestationSecret?: Uint8Array }} opts
+ * @returns {Promise<{ attesterId: string, attestationSecret: Uint8Array, addresses: { night: string } }>}
+ */
+export async function deriveIdentity(opts) {
+    const { attesterId, attestationSecret, addresses } = await deriveKeyMaterial(opts ?? {});
+    return { attesterId, attestationSecret, addresses };
+}
+
 export async function createTxBuilder(opts) {
     const {
         seedHex, networkId = 'preprod', accountIndex = 0,
@@ -336,13 +399,9 @@ export async function createTxBuilder(opts) {
     ]);
     netId.setNetworkId?.(networkId);
 
-    const { deriveRoleSeeds } = require('../../srv/utils/wallet-hd.js');
-    const { deriveAttestationSecret } = await import('../browser/witnesses.mjs');
-    const roleSeeds = await deriveRoleSeeds(new Uint8Array(Buffer.from(seedHex, 'hex')), accountIndex);
+    const { roleSeeds, keystore, attestationSecret, attesterId, addresses } = await deriveKeyMaterial({ seedHex, networkId, accountIndex, attestationSecret: opts.attestationSecret });
     const zswapKeys = ledger.ZswapSecretKeys.fromSeed(roleSeeds.zswap);
     const dustKey = ledger.DustSecretKey.fromSeed(roleSeeds.dust);
-    const keystore = unshielded.createKeystore(roleSeeds.night, networkId);
-    const attestationSecret = opts.attestationSecret ?? deriveAttestationSecret(roleSeeds.zswap);
 
     // 3. Facade with in-process (wasm) proving: no proof server, no Docker.
     onProgress?.({ phase: 'wallet' });
@@ -363,7 +422,13 @@ export async function createTxBuilder(opts) {
         unshielded: () => unshielded.UnshieldedWallet(configuration).startWithPublicKey(unshielded.PublicKey.fromKeyStore(keystore)),
         dust: () => dust.DustWallet(configuration).startWithSecretKey(dustKey, ledger.LedgerParameters.initialParameters().dust)
     });
-    await facade.start(zswapKeys, dustKey);
+    // `start()` = startSyncInBackground per sub-wallet: a fresh seed syncs from
+    // genesis on THIS thread for the life of the builder. A call that moves no
+    // value needs no state (balancing returns the tx untouched, signing is the
+    // keystore); `walletSync: false` skips the sync, and a value-moving call
+    // then fails at balancing instead of building wrong.
+    const walletSync = opts.walletSync !== false;
+    if (walletSync) await facade.start(zswapKeys, dustKey);
 
     const CompiledContract = compactJs.CompiledContract ?? compactJs.effect?.CompiledContract;
     if (!CompiledContract?.make) throw new Error('compact-js: CompiledContract.make not found');
@@ -383,12 +448,13 @@ export async function createTxBuilder(opts) {
         proofProvider = await buildWasmProofProvider(zkConfigProvider);
     }
     const { InMemoryPrivateStateProvider } = await import('../browser/private-state.mjs');
-    const rt = require('@midnight-ntwrk/compact-runtime');
     // ONE public-data provider per builder. It owns a WebSocket to the
     // indexer; creating it per buildSponsorable leaked one open socket (plus
     // its subscriptions) per transaction, and a process that built several
     // transactions in a row degraded into a 100 % CPU stall on a later build.
-    const publicDataProvider = indexerSdk.indexerPublicDataProvider(indexerHttpUrl, indexerWsUrl, require('ws'));
+    // The provider has no close; its sockets are tracked so close() can end them.
+    const sockets = trackingWebSocket(require('ws'));
+    const publicDataProvider = indexerSdk.indexerPublicDataProvider(indexerHttpUrl, indexerWsUrl, sockets.WebSocket);
 
     return {
         /** 'wasm' (in-process, default) or 'server' (opts.proofServerUrl). */
@@ -396,10 +462,10 @@ export async function createTxBuilder(opts) {
         /** Your attestation secret; feed it to the browser export's prepare* helpers. */
         attestationSecret,
         /** The identity every attestation you build will carry. */
-        attesterId: Buffer.from(rt.persistentHash(new rt.CompactTypeBytes(32), attestationSecret)).toString('hex'),
+        attesterId,
         /** Where the proving assets were cached, and how many were downloaded. */
         zkAssets: assets,
-        addresses: { night: unshielded.PublicKey.fromKeyStore(keystore).address },
+        addresses,
 
         /**
          * Build + prove + sign + finalize one transaction WITHOUT submitting:
@@ -591,8 +657,10 @@ export async function createTxBuilder(opts) {
                 : { finalizedTxB64: Buffer.from(bytes).toString('base64'), serializedBytes: bytes.length, bound: true, contractAddress };
         },
 
+        /** Stops the wallet sync streams (`facade.stop()`; the facade has no `close`) and ends the indexer sockets. */
         async close() {
-            try { await facade.close?.(); } catch { /* best effort */ }
+            try { await facade.stop(); } catch { /* best effort */ }
+            sockets.closeAll();
         }
     };
 }

@@ -87,6 +87,16 @@ The on-chain attestation carries **your** attester id; the sponsor pays the
 dust and never sees a key, a witness or a preimage. A complete runnable version
 is in [`example/anchor.mjs`](./example/anchor.mjs).
 
+Two things to know before hosting the builder in a server: everything it does
+runs on the thread that awaits it (put it in a `worker_threads` worker), and
+by default the wallet syncs from genesis in the background for the life of
+the builder, a full core until it reaches the tip. Vault calls move no value
+and need no wallet state: pass `walletSync: false` (idle CPU 101 % -> 2 %,
+same bytes, same proof), and always `await builder.close()` (it stops the
+sync and the indexer sockets; before 0.4.1 it stopped nothing).
+`deriveIdentity({ seedHex })` gives `attesterId` and the NIGHT address
+without a builder, in ~150 ms.
+
 Against a sponsor running NIGHTGATE 0.18 or later, prefer the parallel channel:
 `buildSponsorable({ contractAddress: VAULT, call, bind: false })` returns
 `unboundTxB64`, and `ng.sponsorUnbound({ unboundTxB64, sponsorSessionId })`
