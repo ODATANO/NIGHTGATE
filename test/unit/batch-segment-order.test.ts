@@ -6,6 +6,7 @@
  */
 
 import {
+    BatchCausalityError,
     findCausalityViolation,
     orderBatchSegments,
     withOrderedBatchSegments
@@ -246,5 +247,103 @@ describe('withOrderedBatchSegments', () => {
         const wrapped = withOrderedBatchSegments(provider, ['a', 'b']);
         expect(wrapped.somethingElse()).toBe(42);
         expect(wrapped.proveTx).not.toBe(provider.proveTx);
+    });
+});
+
+describe('orderBatchSegments with independentCalls: stage grouping', () => {
+    // The proof-cart shapes measured on a grown vault (batch-segments log
+    // lines): the same circuit lands in different stages for different claim
+    // keys, so call order alone violates causality about every second cart.
+    function cart(stages: Array<'g' | 'f' | 'gf'>) {
+        const names = ['proveFieldMembership', 'proveFieldPredicate', 'proveFieldPredicate', 'proveFieldPredicate', 'proveFieldPredicate'];
+        const intents = names.map((n, i) => stagedIntent(n, stages[i]));
+        // Randomized ids, deliberately not in call order.
+        const ids = [50, 10, 40, 20, 30];
+        return { tx: txWithIntents(intents.map((it, i) => [ids[i], it] as [number, any])), names, intents };
+    }
+    const applyOrder = (tx: any) => Array.from(tx.intents.entries()).sort((a: any, b: any) => a[0] - b[0]).map((e: any) => e[1]);
+
+    test('g,g,f,g,f in call order is refused; grouped it is guaranteed-first and passes', () => {
+        const { tx, names, intents } = cart(['g', 'g', 'f', 'g', 'f']);
+        expect(orderBatchSegments(tx, names)).toBe(true);
+        expect(findCausalityViolation(tx)).toMatch(/FALLIBLE/);
+
+        const { tx: tx2, intents: intents2 } = cart(['g', 'g', 'f', 'g', 'f']);
+        expect(orderBatchSegments(tx2, names, { independentCalls: true })).toBe(true);
+        expect(findCausalityViolation(tx2)).toBeNull();
+        // membership, predicate#1, predicate#3 (all g) first, then #2 and #4 (f), call order within a group
+        expect(applyOrder(tx2)).toEqual([intents2[0], intents2[1], intents2[3], intents2[2], intents2[4]]);
+        void intents;
+    });
+
+    test('g,g,g,f,g grouped: the single fallible claim moves last', () => {
+        const { tx, names, intents } = cart(['g', 'g', 'g', 'f', 'g']);
+        expect(orderBatchSegments(tx, names, { independentCalls: true })).toBe(true);
+        expect(findCausalityViolation(tx)).toBeNull();
+        expect(applyOrder(tx)).toEqual([intents[0], intents[1], intents[2], intents[4], intents[3]]);
+    });
+
+    test('an all-guaranteed cart keeps call order under grouping (byte-identical to today)', () => {
+        const { tx, names, intents } = cart(['g', 'g', 'g', 'g', 'g']);
+        expect(orderBatchSegments(tx, names, { independentCalls: true })).toBe(true);
+        expect(applyOrder(tx)).toEqual(intents);
+    });
+
+    test('orderedPrefix pins a leading dependency (in-batch anchor) even when it carries a fallible transcript', () => {
+        const anchor = stagedIntent('anchorContentRoot', 'gf');
+        const p1 = stagedIntent('proveFieldPredicate', 'g');
+        const p2 = stagedIntent('proveFieldPredicate', 'f');
+        const tx = txWithIntents([[30, p2], [10, anchor], [20, p1]]);
+        expect(orderBatchSegments(tx, ['anchorContentRoot', 'proveFieldPredicate', 'proveFieldPredicate'], { independentCalls: true, orderedPrefix: 1 })).toBe(true);
+        // anchor stays first (dependency), the rest is grouped; the anchor's
+        // fallible part then starves p1, which is the real, unfixable case.
+        expect(applyOrder(tx)).toEqual([anchor, p1, p2]);
+        expect(findCausalityViolation(tx)).toMatch(/'anchorContentRoot' \(segment 10\)/);
+    });
+
+    test('without independentCalls a dependent batch keeps call order regardless of stages', () => {
+        const attest = stagedIntent('attest', 'f');
+        const anchor = stagedIntent('anchorContentRoot', 'g');
+        const tx = txWithIntents([[20, anchor], [10, attest]]);
+        expect(orderBatchSegments(tx, ['attest', 'anchorContentRoot'], {})).toBe(true);
+        expect(applyOrder(tx)).toEqual([attest, anchor]);
+    });
+
+    test('stages are read per intent, so unknown transcripts count as guaranteed-only (fail-open like the check)', () => {
+        const a = intentFor('a');
+        const b = stagedIntent('b', 'f');
+        const tx = txWithIntents([[1, b], [2, a]]);
+        expect(orderBatchSegments(tx, ['b', 'a'], { independentCalls: true })).toBe(true);
+        expect(applyOrder(tx)).toEqual([a, b]);
+    });
+});
+
+describe('withOrderedBatchSegments: grouping and the structured refusal', () => {
+    test('independentCalls turns a refused cart into a proven one', async () => {
+        const provider = { proveTx: vi.fn(async () => 'proven') };
+        const names = ['proveFieldMembership', 'proveFieldPredicate', 'proveFieldPredicate'];
+        // Same-named calls are picked in map-encounter order: the fallible
+        // predicate comes first, so call order yields g,f,g (refused).
+        const mk = () => txWithIntents([[2, stagedIntent('proveFieldPredicate', 'f')], [1, stagedIntent('proveFieldMembership', 'g')], [3, stagedIntent('proveFieldPredicate', 'g')]]);
+
+        await expect(withOrderedBatchSegments(provider, names).proveTx(mk())).rejects.toThrow(/causality/);
+        expect(provider.proveTx).not.toHaveBeenCalled();
+        await expect(withOrderedBatchSegments(provider, names, { independentCalls: true }).proveTx(mk())).resolves.toBe('proven');
+        expect(provider.proveTx).toHaveBeenCalledTimes(1);
+    });
+
+    test('the refusal carries code + per-call stages, in the error and in the message', async () => {
+        const provider = { proveTx: vi.fn(async () => 'proven') };
+        const tx = txWithIntents([[20, stagedIntent('anchorContentRoot', 'g')], [10, stagedIntent('attest', 'f')]]);
+        let err: any;
+        try { await withOrderedBatchSegments(provider, ['attest', 'anchorContentRoot']).proveTx(tx); } catch (e) { err = e; }
+        expect(err).toBeInstanceOf(BatchCausalityError);
+        expect(err.code).toBe('BatchCausalityViolation');
+        expect(err.calls).toEqual([
+            { name: 'attest', segId: 10, stages: 'f:6.04G' },
+            { name: 'anchorContentRoot', segId: 20, stages: 'g:5.15G' }
+        ]);
+        expect(err.message).toMatch(/Stages in apply order: attest=10\[f:6\.04G\] anchorContentRoot=20\[g:5\.15G\]$/);
+        expect(provider.proveTx).not.toHaveBeenCalled();
     });
 });

@@ -119,6 +119,40 @@ export function findCausalityViolation(tx: any): string | null {
     return null;
 }
 
+/** One call of a batch with its apply position and execution stages, for a structured error. */
+export interface BatchCallStage {
+    name: string;
+    segId: number;
+    /** `g`, `f`, `g+f` (with gas figures when the SDK exposes them), `-` when the SDK exposes no transcripts. */
+    stages: string;
+}
+
+/** The batch's contract calls in APPLY order with their stages; `[]` without an intents map. */
+export function batchCallStages(tx: any): BatchCallStage[] {
+    return orderedCalls(tx).map(c => ({
+        name: c.name,
+        segId: c.segId,
+        stages: transcriptStages(tx.intents.get(c.segId)?.actions?.[0])
+    }));
+}
+
+/**
+ * The pre-proving causality refusal. `code` is stable for job classification;
+ * `calls` carries every call's apply position and stages, so a consumer can
+ * split the batch deterministically instead of parsing the message. The SDK's
+ * scope wrapper may re-wrap this error and keep only the message, which is
+ * why the message carries the same per-call list.
+ */
+export class BatchCausalityError extends Error {
+    readonly code = 'BatchCausalityViolation';
+    readonly calls: BatchCallStage[];
+    constructor(message: string, calls: BatchCallStage[]) {
+        super(message);
+        this.name = 'BatchCausalityError';
+        this.calls = calls;
+    }
+}
+
 /** `circuit=segId[stages]` per intent, in map order; diagnostic logging only. */
 export function describeBatchSegments(tx: any): string {
     try {
@@ -135,6 +169,13 @@ export function describeBatchSegments(tx: any): string {
     }
 }
 
+export interface BatchOrderOptions {
+    /** The calls past `orderedPrefix` are order-free: group them by stage. */
+    independentCalls?: boolean;
+    /** Leading calls that keep their position even under `independentCalls`. */
+    orderedPrefix?: number;
+}
+
 /**
  * Rewrite `tx.intents` so the intents matching `circuitsInOrder` (via their
  * first action's `entryPoint`) carry ascending segment ids in call order.
@@ -144,12 +185,23 @@ export function describeBatchSegments(tx: any): string {
  * which is NOT guaranteed to be call order - batch distinct circuits when
  * relative order among same-named calls matters.
  *
+ * `independentCalls`: the calls (past `orderedPrefix`) share no state and may
+ * apply in any order. They are then grouped by execution stage, guaranteed-only
+ * calls first, calls with a fallible transcript after, call order within a
+ * group. That is always causality-valid for such a set, while call order alone
+ * is not: `partitionTranscripts` assigns stages by gas cost per call, and on a
+ * grown contract the same circuit lands in different stages for different map
+ * keys, so a set of claim proofs in call order fails the causality check about
+ * every second time while a valid order exists. The first `orderedPrefix` calls
+ * keep their position (an in-batch anchor the proofs read, for instance); a
+ * dependent batch passes neither flag and keeps call order.
+ *
  * Returns true when a rewrite happened. On ANY mismatch (missing intent for a
  * circuit, leftover unmatched call, no intents map) the transaction is left
  * untouched and false is returned; the batch wrapper below treats that as
  * fatal for multi-call batches.
  */
-export function orderBatchSegments(tx: any, circuitsInOrder: string[]): boolean {
+export function orderBatchSegments(tx: any, circuitsInOrder: string[], opts: BatchOrderOptions = {}): boolean {
     const intents: Map<number, any> | undefined = tx?.intents;
     if (!intents || typeof intents.entries !== 'function') return false;
     if (circuitsInOrder.length < 2 || intents.size < 2) return false;
@@ -163,11 +215,23 @@ export function orderBatchSegments(tx: any, circuitsInOrder: string[]): boolean 
         else pools.set(name, [[segId, intent]]);
     }
 
-    const picked: Array<[number, any]> = [];
+    let picked: Array<[number, any]> = [];
     for (const circuit of circuitsInOrder) {
         const pool = pools.get(circuit);
         if (!pool || pool.length === 0) return false;
         picked.push(pool.shift()!);
+    }
+
+    if (opts.independentCalls) {
+        const prefix = Math.max(0, Math.min(Math.floor(opts.orderedPrefix ?? 0), picked.length));
+        const rank = (i: number) => {
+            if (i < prefix) return 0;
+            return picked[i][1]?.actions?.[0]?.fallibleTranscript ? 2 : 1;
+        };
+        picked = picked
+            .map((entry, i) => ({ entry, i, rank: rank(i) }))
+            .sort((a, b) => a.rank - b.rank || a.i - b.i)
+            .map(x => x.entry);
     }
 
     const pickedIntents = new Set(picked.map(([, intent]) => intent));
@@ -200,7 +264,8 @@ export function orderBatchSegments(tx: any, circuitsInOrder: string[]): boolean 
  */
 export function withOrderedBatchSegments(
     proofProvider: any,
-    circuitsInOrder: string[]
+    circuitsInOrder: string[],
+    opts: BatchOrderOptions = {}
 ): any {
     const wrapped = Object.create(proofProvider);
     wrapped.proveTx = async (tx: any, ...rest: unknown[]) => {
@@ -208,7 +273,7 @@ export function withOrderedBatchSegments(
             const before = describeBatchSegments(tx);
             let ordered = false;
             try {
-                ordered = orderBatchSegments(tx, circuitsInOrder);
+                ordered = orderBatchSegments(tx, circuitsInOrder, opts);
             } catch (err) {
                 throw new Error(
                     `batch segment ordering failed for [${circuitsInOrder.join('+')}]: ${(err as Error)?.message ?? err}; ` +
@@ -224,12 +289,18 @@ export function withOrderedBatchSegments(
             // Worker-thread console lands in the server log; one line per
             // multi-call batch, and the id mapping plus the per-call stages
             // are the load-bearing data in any 1010/188 diagnosis.
-            console.log(`[nightgate:batch-segments] rewrite: ${before} -> ${describeBatchSegments(tx)}`);
+            console.log(`[nightgate:batch-segments] rewrite${opts.independentCalls ? ' (stage-grouped)' : ''}: ${before} -> ${describeBatchSegments(tx)}`);
             const violation = findCausalityViolation(tx);
             if (violation) {
-                throw new Error(
+                // Under independentCalls the grouping makes this unreachable
+                // for a set past the prefix; a hit then means the prefix
+                // (a dependent leading call) went fallible and still throws.
+                const calls = batchCallStages(tx);
+                throw new BatchCausalityError(
                     `batch [${circuitsInOrder.join('+')}] violates the ledger's causality constraint: ${violation}. ` +
-                    'Aborted before proving; nothing was submitted.'
+                    'Aborted before proving; nothing was submitted. ' +
+                    `Stages in apply order: ${calls.map(c => `${c.name}=${c.segId}[${c.stages}]`).join(' ')}`,
+                    calls
                 );
             }
         }

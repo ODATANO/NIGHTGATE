@@ -137,6 +137,17 @@ export interface BuildSponsorableInput {
     witnesses?: object;
     /** Batch only (vault family): overrides the builder's own secret for the shared witnesses. */
     attestationSecret?: Uint8Array;
+    /**
+     * Batch only: the calls past `orderedPrefix` share no state (a proof cart of
+     * distinct claims). They are grouped by execution stage before proving,
+     * guaranteed-only calls first, call order within a group: on a grown contract
+     * the same circuit lands in different stages for different keys, and call
+     * order alone then fails the causality pre-check although a valid order
+     * exists. Leave unset for dependent batches (apply order = array order).
+     */
+    independentCalls?: boolean;
+    /** Batch only, with `independentCalls`: leading calls that keep their position (an in-batch anchor the proofs read). */
+    orderedPrefix?: number;
     initialPrivateState?: unknown;
     /** true (default): FINALIZED handover (sponsorFinalizedTransaction).
      *  false: UNBOUND handover (sponsorUnboundTransaction, parallel 0.18). */

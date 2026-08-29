@@ -486,7 +486,7 @@ export async function createTxBuilder(opts) {
          * @param {{ contractAddress: string, call?: { circuitId: string, args: unknown[], witnesses: object }, calls?: Array<{ circuitId: string, args: unknown[], merkleProof?: object, slotWidth?: number }>, initialPrivateState?: unknown, bind?: boolean, attestationSecret?: Uint8Array }} input
          * @returns {Promise<{ finalizedTxB64: string, serializedBytes: number }>}
          */
-        async buildSponsorable({ contractAddress, call, calls, witnesses: sharedWitnesses, initialPrivateState, bind = true, attestationSecret: batchSecret }) {
+        async buildSponsorable({ contractAddress, call, calls, witnesses: sharedWitnesses, initialPrivateState, bind = true, attestationSecret: batchSecret, independentCalls = false, orderedPrefix = 0 }) {
             if (!contractAddress) throw new Error('buildSponsorable: contractAddress is required');
             if (call && calls) throw new Error('buildSponsorable: pass either call or calls, not both');
             const callList = calls ?? (call ? [call] : []);
@@ -575,10 +575,18 @@ export async function createTxBuilder(opts) {
                 // discards the error NAME, so match the message).
                 const { runBatchInScope } = require('../../srv/midnight/batch-call-scope.js');
                 try {
-                    await runBatchInScope(contracts, providers, found, scopeCalls, contractAddress);
+                    await runBatchInScope(contracts, providers, found, scopeCalls, contractAddress, { independentCalls: independentCalls === true, orderedPrefix: Number(orderedPrefix) || 0 });
                 } catch (e) {
                     if (/violates the ledger's causality constraint/.test(String(e?.message ?? e))) {
-                        try { e.code = 'BatchCausalityViolation'; } catch { /* frozen error */ }
+                        try {
+                            e.code = 'BatchCausalityViolation';
+                            // Per-call stages in apply order, parsed back from the
+                            // message when the SDK wrapper dropped the typed error.
+                            if (!Array.isArray(e.calls)) {
+                                const m = /Stages in apply order: (.*)$/.exec(String(e.message));
+                                if (m) e.calls = m[1].trim().split(/\s+/).map(t => { const mm = /^(.+?)=(\d+)\[(.*)\]$/.exec(t); return mm ? { name: mm[1], segId: Number(mm[2]), stages: mm[3] } : { name: t, segId: -1, stages: '?' }; });
+                            }
+                        } catch { /* frozen error */ }
                         throw e;
                     }
                     if (!holder.captured) throw e;

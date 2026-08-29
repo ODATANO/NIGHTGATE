@@ -182,7 +182,7 @@ Invoke a circuit on a deployed contract.
 
 **Rate limit:** 30/min per session.
 
-### `submitContractCallBatch(contractAddress, calls, compiledArtifactRef, sessionId, idempotencyKey?, initialPrivateState?, sponsorSessionId?) → { jobId, status }`
+### `submitContractCallBatch(contractAddress, calls, compiledArtifactRef, sessionId, idempotencyKey?, initialPrivateState?, sponsorSessionId?, independentCalls?) → { jobId, status }`
 
 Invoke SEVERAL circuits on ONE deployed contract as a SINGLE transaction. The
 calls execute inside one transaction scope (SDK
@@ -251,6 +251,18 @@ Consequences for callers:
   (the shape is deterministic for the contract's current state). The per-call
   stages and their gas budgets are logged for every multi-call batch:
   `[nightgate:batch-segments] rewrite: ... -> attest=1158[f:6.04G] anchorContentRoot=52208[g:4.77G]`.
+  The refusal's message ends with `Stages in apply order: <call>=<segment>[<stages>] ...`
+  for every call, so a consumer can split the batch deterministically.
+- A batch of INDEPENDENT calls (distinct claim keys, no shared cell) always
+  has a valid order, but call order is not it once the same circuit lands in
+  different stages for different keys (measured on a grown vault:
+  `proveFieldPredicate` 5.86G guaranteed for one key, 6.05G fallible for the
+  next, budget in between; about every second proof cart in call order was
+  refused). `independentCalls: true` on `submitContractCallBatch` groups the
+  calls by stage before proving, guaranteed-only first, call order within a
+  group. `issueFieldPredicateAttestationBatch` sets it itself; its optional
+  in-batch `anchorContentRoot` stays first (the proofs read it). Dependent
+  batches leave the flag unset and keep call order.
 
 **Failure semantics** distinguish two phases. An error BEFORE submission (bad
 circuit name, a throwing call, proving/balancing) discards the scope; nothing

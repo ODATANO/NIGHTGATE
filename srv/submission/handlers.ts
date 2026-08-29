@@ -172,7 +172,7 @@ type BatchClaimCommand = {
 type ContractCommandV1 =
     | { op: 'deploy'; compiledArtifactRef: string; initialPrivateState: unknown; sponsorSessionId?: string }
     | { op: 'call'; contractAddress: string; circuit: string; compiledArtifactRef: string; args: unknown[]; initialPrivateState?: unknown; sponsorSessionId?: string; merkleProof?: MerkleProofBundle }
-    | { op: 'callBatch'; contractAddress: string; calls: Array<{ circuit: string; args: unknown[]; merkleProof?: MerkleProofBundle }>; compiledArtifactRef: string; initialPrivateState?: unknown; sponsorSessionId?: string; merkleProof?: MerkleProofBundle }
+    | { op: 'callBatch'; contractAddress: string; calls: Array<{ circuit: string; args: unknown[]; merkleProof?: MerkleProofBundle }>; compiledArtifactRef: string; initialPrivateState?: unknown; sponsorSessionId?: string; merkleProof?: MerkleProofBundle; independentCalls?: boolean; orderedPrefix?: number }
     | { op: 'fieldPredicateWorkflow'; predicateAttestationId: string; payloadHash: string; fieldKey: string; contractAddress: string; compiledArtifactRef: string; predicate: string; threshold: string; opCode: number; unit?: string; value: string; salt: string; siblings: string[]; dirs: boolean[]; contentRoot?: string; schemaId?: string; sponsorSessionId?: string }
     | { op: 'fieldEqualityWorkflow'; predicateAttestationId: string; payloadHash: string; fieldKey: string; contractAddress: string; compiledArtifactRef: string; expectedDigest: string; salt: string; siblings: string[]; dirs: boolean[]; contentRoot?: string; schemaId?: string; sponsorSessionId?: string }
     | { op: 'fieldMembershipWorkflow'; predicateAttestationId: string; payloadHash: string; fieldKey: string; contractAddress: string; compiledArtifactRef: string; setRoot: string; valueDigest: string; salt: string; siblings: string[]; dirs: boolean[]; setSiblings: string[]; setDirs: boolean[]; contentRoot?: string; schemaId?: string; sponsorSessionId?: string }
@@ -647,7 +647,9 @@ export function registerSubmissionHandlers(
             const proof: any = await runChild<any>({
                 parent: job, kind: 'fieldPredicateBatchProof', step: 'proveFieldPredicateBatch', commandVersion: 1,
                 request: { circuits: calls.map(c => c.circuit), payloadHash: command.payloadHash, claimCount: command.claims.length },
-                command: { op: 'callBatch', contractAddress: command.contractAddress, calls, compiledArtifactRef: command.compiledArtifactRef, sponsorSessionId: command.sponsorSessionId }
+                // The claims are a set (distinct claim keys, no shared cell); only
+                // an in-batch anchor is a dependency and stays first.
+                command: { op: 'callBatch', contractAddress: command.contractAddress, calls, compiledArtifactRef: command.compiledArtifactRef, sponsorSessionId: command.sponsorSessionId, independentCalls: true, orderedPrefix: calls[0]?.circuit === 'anchorContentRoot' ? 1 : 0 }
             });
             // ONE statement for all rows: the tx is already on chain here, so a
             // partial projection (some rows proven, some not) must be impossible.
@@ -793,7 +795,9 @@ export function registerSubmissionHandlers(
                 initialPrivateState: command.initialPrivateState,
                 merkleProof: command.merkleProof,
                 registration: { artifactPath: resolved.artifactPath, artifactDigest: resolved.artifactDigest, privateStateId: resolved.privateStateId, zkConfigPath: resolved.zkConfigPath, ...(resolved.slotWidth !== undefined ? { slotWidth: resolved.slotWidth } : {}) },
-                sessionId: job.sessionId
+                sessionId: job.sessionId,
+                independentCalls: command.independentCalls,
+                orderedPrefix: command.orderedPrefix
             });
             return { submissionId: result.submissionId, txHash: result.txHash, contractAddress: result.contractAddress, circuits: result.circuits, status: result.status, ...(sponsor ? { feeSponsor: sponsor.sponsorSessionId } : {}) };
         }
@@ -1694,7 +1698,7 @@ export function registerSubmissionHandlers(
     });
 
     srv.on('submitContractCallBatch', async (req: Request) => {
-        const { contractAddress, calls, compiledArtifactRef, sessionId, idempotencyKey, initialPrivateState, sponsorSessionId } = req.data as {
+        const { contractAddress, calls, compiledArtifactRef, sessionId, idempotencyKey, initialPrivateState, sponsorSessionId, independentCalls } = req.data as {
             contractAddress?: string;
             calls?: string;
             compiledArtifactRef?: string;
@@ -1702,6 +1706,7 @@ export function registerSubmissionHandlers(
             idempotencyKey?: string;
             initialPrivateState?: string;
             sponsorSessionId?: string;
+            independentCalls?: boolean;
         };
 
         if (!contractAddress) return req.reject(400, 'contractAddress is required');
@@ -1832,7 +1837,7 @@ export function registerSubmissionHandlers(
                 requestedBy: (req as any).user?.id,
                 commandVersion: 1,
                 encryptCommand: true,
-                command: { op: 'callBatch', contractAddress, calls: parsedCalls, compiledArtifactRef, initialPrivateState: parsedInitialPrivateState, sponsorSessionId: sponsor?.sponsorSessionId }
+                command: { op: 'callBatch', contractAddress, calls: parsedCalls, compiledArtifactRef, initialPrivateState: parsedInitialPrivateState, sponsorSessionId: sponsor?.sponsorSessionId, ...(independentCalls === true ? { independentCalls: true } : {}) }
             });
         });
     });

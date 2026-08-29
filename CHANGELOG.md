@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.21.9 - 2026-08-29
+
+Stage-grouped segment order for independent batch calls. No schema change,
+no SDK change, no circuit change. `@odatano/nightgate-tx` 0.4.2.
+
+- **`independentCalls`** on `submitContractCallBatch`, the worker's batch op
+  and txbuilder `buildSponsorable({ calls })`: the calls past
+  `orderedPrefix` share no state and are grouped by execution stage before
+  proving (guaranteed-only first, call order within a group).
+  `issueFieldPredicateAttestationBatch` sets it itself, with its optional
+  in-batch `anchorContentRoot` pinned first. Why: a proof cart is a set of
+  claims with distinct keys, and on a grown vault `partitionTranscripts`
+  puts the same circuit in different stages for different keys (measured
+  on demo.zkpassport.eu, vault 4a8893cf: `proveFieldPredicate` 5.86G
+  guaranteed vs 6.05G fallible, budget in between), so call order alone
+  failed the causality pre-check on about every second cart while a valid
+  order existed. Dependent batches leave the flag unset and keep call
+  order, including the fail-fast.
+- **Structured refusal.** The pre-check throws `BatchCausalityError`
+  (`code: 'BatchCausalityViolation'`, `calls: [{ name, segId, stages }]` in
+  apply order) and appends the same list to the message
+  (`Stages in apply order: ...`); the txbuilder restores `calls` from the
+  message when the SDK wrapper drops the typed error.
+- `orderBatchSegments`/`withOrderedBatchSegments`/`runBatchInScope` take
+  `{ independentCalls, orderedPrefix }`; `batchCallStages(tx)` exported.
+
 ## 0.21.8 - 2026-08-29
 
 txbuilder: wallet sync cost, socket leak, identity. No schema change, no

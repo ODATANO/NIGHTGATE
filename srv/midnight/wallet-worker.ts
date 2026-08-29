@@ -846,7 +846,7 @@ function buildWorkerContractProviders(args: {
                 proofProvider = await buildWasmProofProvider(zkConfigProvider);
                 log('info', 'contract proving: in-process (wasm), proof server not used');
             } else {
-                proofProvider = proof.httpClientProofProvider(args.proofServerUrl, zkConfigProvider);
+                proofProvider = proof.httpClientProofProvider(args.proofServerUrl, zkConfigProvider, { timeout: Number(process.env.NIGHTGATE_PROOF_TIMEOUT_MS || 300000) }); // MZCASH: proof HTTP timeout override (default 5 min = midnight-js DEFAULT_TIMEOUT)
             }
             return { zkConfigProvider, proofProvider };
         })();
@@ -4022,7 +4022,7 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
         contractAddress, calls,
         indexerHttpUrl, indexerWsUrl, proofServerUrl,
         networkId, merkleProof, initialPrivateState,
-        sponsorSessionId
+        sponsorSessionId, independentCalls, orderedPrefix
     }: {
         sessionId: string;
         proxyId: string;
@@ -4046,6 +4046,9 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
         initialPrivateState?: unknown;
         /** Optional fee sponsor: this facade balances ['dust'] and submits. */
         sponsorSessionId?: string;
+        /** The calls past `orderedPrefix` share no state: group them by execution stage before proving. */
+        independentCalls?: boolean;
+        orderedPrefix?: number;
     }) {
         if (!Array.isArray(calls) || calls.length === 0) {
             throw new Error('submitContractCallBatch: calls must be a non-empty array');
@@ -4126,7 +4129,7 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
             // result mapping) live in batch-call-scope.ts so they are unit-testable
             // outside the worker-thread guard.
             callRegion.start = Date.now();
-            const out = await runBatchInScope(contracts, providers, found, scopeCalls, contractAddress);
+            const out = await runBatchInScope(contracts, providers, found, scopeCalls, contractAddress, { independentCalls, orderedPrefix });
             timer.add('callTotal', Date.now() - callRegion.start);
             log('info', `submitContractCallBatch: done txHash=${out.txHash.slice(0, 16)} status=${out.onChainStatus} calls=${out.circuits.length}`);
             return out;

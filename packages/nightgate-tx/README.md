@@ -110,6 +110,13 @@ fail-fast as the server lane (`BatchCausalityViolation` aborts locally, no fee
 spent). The durable batch shape on a grown contract is the proof cart (anchor
 first, then proofs); see `docs/txbuilder.md` in the main repo.
 
+Since 0.4.2, `buildSponsorable({ calls, independentCalls: true })` groups a
+batch of independent calls (a proof cart: distinct claim keys) by execution
+stage before proving, guaranteed-only first, so the cart stays causality-valid
+on a grown vault where call order alone is refused about every second time;
+`orderedPrefix: 1` keeps a leading in-batch anchor in front. A refusal now
+carries `calls: [{ name, segId, stages }]` next to `code`.
+
 Since 0.4.0 (sponsor running NIGHTGATE 0.21 or later), the builder works for
 YOUR contract, not only the vault: `createTxBuilder({ contractClass, zkConfigDir })`
 reads your own `keys/` and `zkir/` (nothing is fetched; the default

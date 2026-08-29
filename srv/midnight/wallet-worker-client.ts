@@ -899,6 +899,9 @@ export interface WalletSubmitContractCallBatchArgs extends Omit<WalletSubmitCont
      *  proveFieldPredicate); mutually exclusive with the batch-level
      *  `merkleProof` inherited from WalletSubmitContractCallArgs. */
     calls: Array<{ circuit: string; args: unknown[]; merkleProof?: MerkleProofBundle }>;
+    /** The calls past `orderedPrefix` share no state: the worker groups them by execution stage before proving. */
+    independentCalls?: boolean;
+    orderedPrefix?: number;
 }
 
 /**

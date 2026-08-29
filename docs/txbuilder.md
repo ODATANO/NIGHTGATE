@@ -125,7 +125,7 @@ same derivation `createTxBuilder` runs (role seeds, attestation secret,
 `attesterId` = persistentHash of the secret, NIGHT address), in ~150 ms.
 Use it to show or register an identity before the first build.
 
-### `buildSponsorable({ contractAddress, call | calls, initialPrivateState, bind?, attestationSecret? }) -> { finalizedTxB64 | unboundTxB64, serializedBytes, bound }`
+### `buildSponsorable({ contractAddress, call | calls, initialPrivateState, bind?, attestationSecret?, independentCalls?, orderedPrefix? }) -> { finalizedTxB64 | unboundTxB64, serializedBytes, bound }`
 
 Builds, proves, balances your own side, signs and finalizes ONE circuit call
 (`call`) or a BATCH of up to 8 calls (`calls`) in ONE transaction, then stops.
@@ -183,6 +183,21 @@ the proofs may go fallible without breaking the order, so this shape stays
 valid as the vault grows. Both the proof cart and the attest split are
 live-proven through BOTH sponsor channels (bound `sponsorFinalizedTransaction`
 and unbound `sponsorUnboundTransaction`).
+
+**Independent calls** (`independentCalls: true`, 0.21.9): a proof cart is a
+SET of claims (distinct claim keys, no shared cell), and for a set there is
+always a causality-valid order, but call order alone is not it: on a grown
+vault the same circuit lands in the guaranteed stage for one claim key and in
+the fallible stage for another (measured: `proveFieldPredicate` 5.86G vs
+6.05G on one vault, budget in between), so about every second cart in call
+order hit the pre-check. With the flag the builder groups the calls past
+`orderedPrefix` by stage before proving, guaranteed-only first, call order
+within a group; `orderedPrefix: 1` keeps an in-batch `anchorContentRoot` in
+front (the proofs read it). Dependent batches leave the flag unset and keep
+array order. When the pre-check still throws, the error carries
+`code: 'BatchCausalityViolation'` and `calls: [{ name, segId, stages }]` in
+apply order (also appended to the message as `Stages in apply order: ...`),
+so a consumer can split deterministically.
 
 `bind` picks the handover format. `true` (default) returns `finalizedTxB64`, a
 bound transaction for `sponsorFinalizedTransaction`. `false` returns

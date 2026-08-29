@@ -144,6 +144,9 @@ export interface CallBatchArgs {
      *  instance (same semantics as the single-call field on CallArgs). */
     merkleProof?: MerkleProofBundle;
     initialPrivateState?: unknown;
+    /** The calls past `orderedPrefix` share no state: grouped by execution stage before proving. */
+    independentCalls?: boolean;
+    orderedPrefix?: number;
 }
 
 export interface CallBatchResult extends CallResult {
@@ -542,7 +545,9 @@ export class TransactionSubmitter {
             networkId:       this.deps.network,
             merkleProof:     args.merkleProof,
             initialPrivateState: args.initialPrivateState,
-            sponsorSessionId: this.deps.sponsorAccountId
+            sponsorSessionId: this.deps.sponsorAccountId,
+            independentCalls: args.independentCalls,
+            orderedPrefix: args.orderedPrefix
         };
     }
 

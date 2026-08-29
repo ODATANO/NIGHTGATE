@@ -9,6 +9,7 @@
  */
 
 import {
+    type BatchOrderOptions,
     withObservedBatchSegments,
     withOrderedBatchSegments
 } from './batch-segment-order';
@@ -49,7 +50,9 @@ export async function runBatchInScope(
     providers: unknown,
     found: any,
     calls: BatchCall[],
-    contractAddress: string
+    contractAddress: string,
+    /** Order-free calls are grouped by execution stage before proving (batch-segment-order.ts). */
+    orderOpts: BatchOrderOptions = {}
 ): Promise<BatchScopeResult> {
     if (!Array.isArray(calls) || calls.length === 0) {
         throw new Error('submitContractCallBatch: calls must be a non-empty array');
@@ -87,7 +90,7 @@ export async function runBatchInScope(
     }
     const wrapSegments = mode === 'observe' ? withObservedBatchSegments : withOrderedBatchSegments;
     const scopedProviders = typeof providersAny?.proofProvider?.proveTx === 'function'
-        ? { ...providersAny, proofProvider: wrapSegments(providersAny.proofProvider, circuits) }
+        ? { ...providersAny, proofProvider: wrapSegments(providersAny.proofProvider, circuits, orderOpts) }
         : providers;
 
     const finalized = await contracts.withContractScopedTransaction(

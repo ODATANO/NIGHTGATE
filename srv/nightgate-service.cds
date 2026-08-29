@@ -986,7 +986,8 @@ service NightgateService {
                                      sessionId: UUID,
                                      idempotencyKey: String, // optional; dedupes retries
                                      initialPrivateState: LargeString, // optional JSON; seeded on this wallet's first call
-                                     sponsorSessionId: UUID // optional; second session pays the dust fee (see submitContractCall)
+                                     sponsorSessionId: UUID, // optional; second session pays the dust fee (see submitContractCall)
+                                     independentCalls: Boolean // optional; the calls share no state: they are grouped by execution stage (guaranteed first) before proving, which keeps a set of independent calls causality-valid on a grown contract; leave unset for dependent batches (call order is kept)
     )                                                                 returns {
         jobId  : UUID;
         status : String; // 'pending' | 'succeeded' (idempotent retry)
