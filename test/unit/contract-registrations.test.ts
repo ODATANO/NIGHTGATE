@@ -245,6 +245,21 @@ describe('registerContractAtRuntime / unregisterContractAtRuntime', () => {
         expect(await probeArtifactModule(path.join(root, 'missing.cjs'))).toMatchObject({ ok: false });
     });
 
+    it('an artifact outside the package resolves bare imports from this runtime (no node_modules of its own)', async () => {
+        // os.tmpdir() has no node_modules chain; the probe copies the module next
+        // to a link to the process's node_modules, like the worker's snapshots.
+        fs.mkdirSync(path.join(outside, 'esm'), { recursive: true });
+        const artifactPath = path.join(outside, 'esm', 'index.mjs');
+        fs.writeFileSync(artifactPath, "import 'generic-pool';\nexport class Contract {}\n");
+        expect(await probeArtifactModule(artifactPath)).toEqual({ ok: true, hasContract: true, error: undefined });
+        const cjsPath = path.join(outside, 'esm', 'index.cjs');
+        fs.writeFileSync(cjsPath, "require('generic-pool');\nexports.Contract = class Contract {};\n");
+        expect(await probeArtifactModule(cjsPath)).toEqual({ ok: true, hasContract: true, error: undefined });
+        // nothing of the probe stays behind
+        const leftovers = fs.readdirSync(os.tmpdir()).filter(n => n.startsWith('nightgate-artifact-probe-'));
+        expect(leftovers).toEqual([]);
+    });
+
     it('unregister removes memory + row', async () => {
         const db = fakeDb();
         const a = writeArtifact(path.join(root, 'v1'));

@@ -27,7 +27,9 @@ import path from 'path';
 /** A single circuit parameter's type, distilled from contract-info.json. */
 export interface CircuitArgType {
     name: string;
-    kind: 'Bytes' | 'Uint' | 'Boolean' | 'other';
+    kind: 'Bytes' | 'Uint' | 'Boolean' | 'Struct' | 'other';
+    /** Struct fields (in declaration order) for kind 'Struct', e.g. ShieldedCoinInfo { nonce, color, value }. */
+    elements?: CircuitArgType[];
     /** Byte length for Bytes<N>. */
     length?: number;
     /** Upper bound for Uint<N> (omitted when the compiler's value exceeds JS safe-integer range). */
@@ -143,6 +145,22 @@ function coerceOne(raw: unknown, argType: CircuitArgType | undefined, index: num
             case 'Boolean':
                 if (typeof raw === 'boolean') return raw;
                 throw new CoercionError(index, `expected boolean, got ${typeof raw}`);
+            case 'Struct': {
+                // A Compact struct (e.g. ShieldedCoinInfo for receiveShielded) arrives as a
+                // JSON object; coerce every declared field with its own type so tagged
+                // ({"$bytes"}/{"$uint"}) and introspected values both work one level down.
+                if (!isPlainObject(raw)) {
+                    throw new CoercionError(index, `expected an object for struct ${argType.name}, got ${typeof raw}`);
+                }
+                const out: Record<string, unknown> = {};
+                for (const el of argType.elements ?? []) {
+                    if (!Object.prototype.hasOwnProperty.call(raw, el.name)) {
+                        throw new CoercionError(index, `struct field "${el.name}" is missing`);
+                    }
+                    out[el.name] = coerceOne(raw[el.name], el, index);
+                }
+                return out;
+            }
             default:
                 return raw;
         }
@@ -172,8 +190,10 @@ export function coerceCircuitArgs(rawArgs: unknown[], argTypes?: CircuitArgType[
 
 interface RawArgTypeNode {
     'type-name'?: string;
+    name?: string;
     length?: number;
     maxval?: number;
+    elements?: Array<{ name?: string; type?: RawArgTypeNode }>;
 }
 interface RawCircuit {
     name?: string;
@@ -185,6 +205,9 @@ function mapArgType(node: RawArgTypeNode | undefined, name: string): CircuitArgT
     if (tn === 'Bytes') return { name, kind: 'Bytes', length: node?.length };
     if (tn === 'Uint') return { name, kind: 'Uint', maxval: node?.maxval };
     if (tn === 'Boolean') return { name, kind: 'Boolean' };
+    if (tn === 'Struct') {
+        return { name, kind: 'Struct', elements: (node?.elements ?? []).map((e) => mapArgType(e.type, e.name ?? '')) };
+    }
     return { name, kind: 'other' };
 }
 

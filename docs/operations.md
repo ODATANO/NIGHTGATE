@@ -143,6 +143,15 @@ Healthy progression looks like:
 
 If you see `sh` or `du` shrink dramatically, the SDK is probably revalidating during restore; the new value is the post-validation form. Not corruption.
 
+## Upgrading to 0.22.0
+
+One nullable column on `AgentGrants` (`allowedTokenTypes`); same migration
+command as below, once, with the server stopped. Existing grants keep
+working unchanged (null = the platform floor, which by default names no
+token type, so no offer is sponsored until `NIGHTGATE_SPONSOR_ALLOWED_TOKEN_TYPES`
+or the policy file opens one). The startup preflight names the column if
+it is missing.
+
 ## Upgrading to 0.21.0
 
 Six nullable columns on `AgentGrants` (`allowedContracts`, `allowedCircuits`,
@@ -319,6 +328,18 @@ Expected shape on preprod: `prove` (proof server or in-process wasm) and
 immutable deploy queries are cached per contract address, the verifier-key
 check stays live). A large `circuitToProve` points at local circuit
 execution, a large `balance` at wallet sync lag.
+
+### A proof takes longer than 5 minutes
+
+midnight-js gives one proof request 5 min and re-requests a timed-out proof up to three times, so a large custom relation or a busy proof server failed the job and then proved three more times. Set `proofTimeoutMs` (cds) or `NIGHTGATE_PROOF_TIMEOUT_MS` above the slowest proof (0.22.0) and raise the proof-server container's job TTL with it (`MIDNIGHT_PROOF_SERVER_JOB_TIMEOUT`, default 600 s), or a finished-but-expired job answers 5xx and triggers the same re-proving. `NIGHTGATE_WORKER_RPC_TIMEOUT_MS` bounds the whole build+prove+submit and must stay above the sum. The compose file passes `NIGHTGATE_PROOF_TIMEOUT_MS` to the server and `MIDNIGHT_PROOF_SERVER_JOB_TIMEOUT` to the proof-server container; set both in `.env`.
+
+### Submit failed with `1000 Normal Closure` / `ECONNRESET`
+
+The RPC closed the websocket while the finalized transaction was being sent. Since 0.22.0 the worker resends the SAME transaction (`NIGHTGATE_SUBMIT_TRANSPORT_RETRIES`, default 2) after asking the indexer whether the first send landed; the log says `resending the SAME transaction (no rebuild, no re-proving)` or `landed`. A job that still fails after the resends is a real outage; re-issue it. A node reject (`1010`, `1014`, `1016`) is never resent.
+
+### Contract artifacts outside the package
+
+Point `NIGHTGATE_CONTRACTS_DIR` at the consumer's directory; the artifact's bare `@midnight-ntwrk/compact-runtime` import resolves from NIGHTGATE's own node_modules (worker snapshots, and since 0.22.0 the registration probe), so nothing is copied into `node_modules/@odatano/nightgate` and the directory needs no node_modules of its own.
 
 ### Server is up but OData requests hang
 

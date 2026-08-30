@@ -1043,6 +1043,208 @@ describe('buildWorkerWalletProvider', () => {
             vi.unstubAllGlobals();
         }
     });
+
+    // ---- same-transaction resend on a transport failure --------------------
+
+    const TRANSPORT_ERR = 'disconnected from wss://rpc.preprod.midnight.network/: 1000:: Normal Closure';
+
+    function withIndexer(landed: boolean) {
+        vi.stubGlobal('fetch', vi.fn(async (_url: any, init: any) => ({
+            json: async () => String(init?.body ?? '').includes('transactions(')
+                ? { data: { transactions: landed ? [{ block: { height: '7' }, transactionResult: { status: 'SUCCESS', segments: [] } }] : [] } }
+                : { data: { block: { height: '500', timestamp: Date.now() } } }
+        })));
+        facadeState.current = { dust: { progress: { appliedIndex: '100', isConnected: true } } };
+        wsTip.maxId = '100';
+    }
+    function withFastResend() {
+        process.env.NIGHTGATE_SUBMIT_TRANSPORT_BACKOFF_MS = '0';
+        process.env.NIGHTGATE_SUBMIT_LANDED_PROBE_MS = '0';
+        return () => {
+            delete process.env.NIGHTGATE_SUBMIT_TRANSPORT_BACKOFF_MS;
+            delete process.env.NIGHTGATE_SUBMIT_LANDED_PROBE_MS;
+            delete process.env.NIGHTGATE_SUBMIT_TRANSPORT_RETRIES;
+        };
+    }
+    function logsMatching(re: RegExp): string[] {
+        return fakeParentPort.postMessage.mock.calls.map(c => c[0])
+            .filter((m: any) => m.kind === 'log' && re.test(m.message)).map((m: any) => m.message);
+    }
+
+    it('submitTx resends the SAME transaction after a transport failure instead of failing the job', async () => {
+        withIndexer(false);
+        const restore = withFastResend();
+        try {
+            const { entry, facade, finalized } = makeEntry(DUST_OK);
+            (finalized as any).identifiers = () => ['0xfirst', '0xtxid'];
+            facade.submitTransaction = vi.fn()
+                .mockRejectedValueOnce(new Error(TRANSPORT_ERR))
+                .mockResolvedValueOnce('0xtxid');
+            const provider = workerExports.buildWorkerWalletProvider(entry);
+            await provider.balanceTx({});
+            await expect(provider.submitTx(finalized)).resolves.toBe('0xtxid');
+            expect(facade.submitTransaction).toHaveBeenCalledTimes(2);
+            expect(facade.submitTransaction.mock.calls[1][0]).toBe(finalized);
+            expect((entry as any).preSubmitDustSnapshot).toBeUndefined();
+            expect(logsMatching(/resending the SAME transaction \(no rebuild, no re-proving\)/).length).toBe(1);
+        } finally {
+            restore(); vi.unstubAllGlobals();
+        }
+    });
+
+    it('a transaction the indexer already has after a lost reply is reported as submitted, not resent', async () => {
+        withIndexer(true);
+        const restore = withFastResend();
+        try {
+            const { entry, facade, finalized } = makeEntry(DUST_OK);
+            (finalized as any).identifiers = () => ['0xtxid'];
+            facade.submitTransaction = vi.fn().mockRejectedValue(new Error(TRANSPORT_ERR));
+            const provider = workerExports.buildWorkerWalletProvider(entry);
+            await provider.balanceTx({});
+            await expect(provider.submitTx(finalized)).resolves.toBe('0xtxid');
+            expect(facade.submitTransaction).toHaveBeenCalledTimes(1);
+            expect(logsMatching(/is in block 7 .*although the submit reply was lost/).length).toBe(1);
+        } finally {
+            restore(); vi.unstubAllGlobals();
+        }
+    });
+
+    it('a landed transaction whose call did NOT apply is a TxFailed, never a success', async () => {
+        const restore = withFastResend();
+        vi.stubGlobal('fetch', vi.fn(async (_url: any, init: any) => ({
+            json: async () => String(init?.body ?? '').includes('transactions(')
+                ? { data: { transactions: [{ block: { height: '11' }, transactionResult: { status: 'PARTIAL_SUCCESS', segments: [{ id: 1, success: false }] } }] } }
+                : { data: { block: { height: '500', timestamp: Date.now() } } }
+        })));
+        facadeState.current = { dust: { progress: { appliedIndex: '100', isConnected: true } } };
+        wsTip.maxId = '100';
+        dustRestore.mockClear();
+        try {
+            const { entry, facade, finalized } = makeEntry(DUST_OK);
+            (finalized as any).identifiers = () => ['0xtxid'];
+            facade.submitTransaction = vi.fn().mockRejectedValue(new Error(TRANSPORT_ERR));
+            const provider = workerExports.buildWorkerWalletProvider(entry);
+            await provider.balanceTx({});
+            await expect(provider.submitTx(finalized)).rejects.toThrow(/TxFailedError: transaction 0xtxid is in block 11 but did not apply \(ledger result PARTIAL_SUCCESS, failed segment 1\)/);
+            expect(facade.submitTransaction).toHaveBeenCalledTimes(1);
+            // on-chain failure spent the fee: no dust restore
+            expect(dustRestore).not.toHaveBeenCalled();
+            expect((entry as any).preSubmitDustSnapshot).toBeUndefined();
+        } finally {
+            restore(); vi.unstubAllGlobals();
+        }
+    });
+
+    it('a timed-out or unanswered submit is a transport failure too (resent, not rebuilt)', async () => {
+        withIndexer(false);
+        const restore = withFastResend();
+        try {
+            for (const msg of ['TimeoutError: submitAndWatch timed out', 'no reply from node within 60000ms', 'request timeout']) {
+                const { entry, facade, finalized } = makeEntry(DUST_OK);
+                (finalized as any).identifiers = () => ['0xtxid'];
+                facade.submitTransaction = vi.fn().mockRejectedValueOnce(new Error(msg)).mockResolvedValueOnce('0xtxid');
+                const provider = workerExports.buildWorkerWalletProvider(entry);
+                await provider.balanceTx({});
+                await expect(provider.submitTx(finalized)).resolves.toBe('0xtxid');
+                expect(facade.submitTransaction).toHaveBeenCalledTimes(2);
+            }
+        } finally {
+            restore(); vi.unstubAllGlobals();
+        }
+    });
+
+    it('a resend refused as already imported resolves once the indexer has the transaction', async () => {
+        withIndexer(false);
+        const restore = withFastResend();
+        try {
+            const { entry, facade, finalized } = makeEntry(DUST_OK);
+            (finalized as any).identifiers = () => ['0xtxid'];
+            let lookups = 0;
+            (globalThis.fetch as any).mockImplementation(async (_url: any, init: any) => ({
+                json: async () => String(init?.body ?? '').includes('transactions(')
+                    ? { data: { transactions: ++lookups >= 2 ? [{ block: { height: '12' }, transactionResult: { status: 'SUCCESS', segments: [] } }] : [] } }
+                    : { data: { block: { height: '500', timestamp: Date.now() } } }
+            }));
+            facade.submitTransaction = vi.fn()
+                .mockRejectedValueOnce(new Error('TimeoutError: no reply'))
+                .mockRejectedValueOnce(new Error('1013: Transaction Already Imported'));
+            const provider = workerExports.buildWorkerWalletProvider(entry);
+            await provider.balanceTx({});
+            await expect(provider.submitTx(finalized)).resolves.toBe('0xtxid');
+            expect(facade.submitTransaction).toHaveBeenCalledTimes(2);
+        } finally {
+            restore(); vi.unstubAllGlobals();
+        }
+    });
+
+    it('a resend that the node rejects is checked against the indexer before the reject propagates', async () => {
+        const restore = withFastResend();
+        let lookups = 0;
+        vi.stubGlobal('fetch', vi.fn(async (_url: any, init: any) => ({
+            json: async () => String(init?.body ?? '').includes('transactions(')
+                ? { data: { transactions: ++lookups >= 2 ? [{ block: { height: '9' }, transactionResult: { status: 'SUCCESS', segments: [] } }] : [] } }
+                : { data: { block: { height: '500', timestamp: Date.now() } } }
+        })));
+        facadeState.current = { dust: { progress: { appliedIndex: '100', isConnected: true } } };
+        wsTip.maxId = '100';
+        dustRestore.mockClear();
+        try {
+            const { entry, facade, finalized } = makeEntry(DUST_OK);
+            (finalized as any).identifiers = () => ['0xtxid'];
+            facade.submitTransaction = vi.fn()
+                .mockRejectedValueOnce(new Error(TRANSPORT_ERR))
+                .mockRejectedValueOnce(new Error('1010: Invalid Transaction: Custom error: 196'));
+            const provider = workerExports.buildWorkerWalletProvider(entry);
+            await provider.balanceTx({});
+            await expect(provider.submitTx(finalized)).resolves.toBe('0xtxid');
+            expect(facade.submitTransaction).toHaveBeenCalledTimes(2);
+            // the earlier send landed: no dust restore, the snapshot is simply disarmed
+            expect(dustRestore).not.toHaveBeenCalled();
+            expect((entry as any).preSubmitDustSnapshot).toBeUndefined();
+        } finally {
+            restore(); vi.unstubAllGlobals();
+        }
+    });
+
+    it('resends are bounded (NIGHTGATE_SUBMIT_TRANSPORT_RETRIES) and a node reject is never resent', async () => {
+        withIndexer(false);
+        const restore = withFastResend();
+        process.env.NIGHTGATE_SUBMIT_TRANSPORT_RETRIES = '1';
+        try {
+            const { entry, facade, finalized } = makeEntry(DUST_OK);
+            (finalized as any).identifiers = () => ['0xtxid'];
+            facade.submitTransaction = vi.fn().mockRejectedValue(new Error(TRANSPORT_ERR));
+            const provider = workerExports.buildWorkerWalletProvider(entry);
+            await provider.balanceTx({});
+            await expect(provider.submitTx(finalized)).rejects.toThrow(/Normal Closure/);
+            expect(facade.submitTransaction).toHaveBeenCalledTimes(2);
+
+            facade.submitTransaction = vi.fn().mockRejectedValue(new Error('1010: Invalid Transaction: Custom error: 170'));
+            await provider.balanceTx({});
+            await expect(provider.submitTx(finalized)).rejects.toThrow(/170/);
+            expect(facade.submitTransaction).toHaveBeenCalledTimes(1);
+        } finally {
+            restore(); vi.unstubAllGlobals();
+        }
+    });
+
+    it('isSubmitTransportFailure: socket/connection failures only, never a node reject', () => {
+        const f = workerExports.isSubmitTransportFailure;
+        expect(f(new Error(TRANSPORT_ERR))).toBe(true);
+        expect(f(new Error('disconnected from wss://x/: 1006:: Abnormal Closure'))).toBe(true);
+        expect(f(new Error('read ECONNRESET'))).toBe(true);
+        expect(f(new Error('WebSocket is not connected'))).toBe(true);
+        expect(f(new Error('TimeoutError: submitAndWatch timed out'))).toBe(true);
+        expect(f(new Error('no reply from node'))).toBe(true);
+        expect(f(new Error('1013: Transaction Already Imported'))).toBe(false);
+        expect(f(new Error('1010: Invalid Transaction: Custom error: 170'))).toBe(false);
+        expect(f(new Error('1014: Priority is too low'))).toBe(false);
+        expect(f(new Error('TxFailedError: status was not success'))).toBe(false);
+        // the SDK wrapper with the transport line only in the cause chain
+        const wrapped = new Error('Transaction submission error');
+        (wrapped as any).cause = new Error(TRANSPORT_ERR);
+        expect(f(wrapped)).toBe(true);
+    });
 });
 
 // ---- dust save epoch guard ------------------------------------------------
@@ -1461,7 +1663,7 @@ describe('getBalance / estimateTransferFee', () => {
     it('getBalance maps NIGHT balances, dust balance and UTXO counts from the synced state', async () => {
         const facade = await initSession('session-balance-dddddddddd');
         facade.waitForSyncedState.mockResolvedValue({
-            shielded: { balances: { 'night-raw-type': 111n } },
+            shielded: { balances: { 'night-raw-type': 111n, ['aa'.repeat(32)]: 420_000_000n, ['bb'.repeat(32)]: 0n } },
             unshielded: {
                 balances: { 'night-raw-type': 222n },
                 totalCoins: [
@@ -1485,6 +1687,8 @@ describe('getBalance / estimateTransferFee', () => {
         expect(reply.result).toEqual({
             shieldedNight: '111',
             unshieldedNight: '222',
+            // every other shielded token type with a balance, raw type -> atoms
+            shieldedTokens: [{ tokenType: 'aa'.repeat(32), amount: '420000000' }],
             dustBalance: '333',
             registeredNightUtxoCount: 1,
             totalNightUtxoCount: 3,

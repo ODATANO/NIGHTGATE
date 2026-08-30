@@ -7,6 +7,7 @@
  * Validation completes before the registry or the table changes.
  */
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import cds from '@sap/cds';
 import { Worker } from 'node:worker_threads';
@@ -21,6 +22,7 @@ import {
     slotWidthOf,
     type ContractRegistration
 } from './contract-registry';
+import { effectiveModuleFormat, runtimeNodeModulesDir } from './artifact-digest';
 
 const log = cds.log('nightgate:contracts');
 const PACKAGE_ROOT = path.resolve(__dirname, '..', '..');
@@ -99,8 +101,28 @@ function resolveInsideRoots(what: string, p: string, roots: string[]): string {
 /**
  * Import the artifact in a disposable worker thread and report whether it
  * exports a contract class. The main process keeps no module instance of it.
+ * The import runs on a disposable copy next to a `node_modules` link to this
+ * process's runtime (the worker's snapshots do the same), so the module's bare
+ * `@midnight-ntwrk/compact-runtime` import resolves wherever the consumer keeps
+ * its artifacts; a directory outside the package needs no node_modules of its own.
  */
 export function probeArtifactModule(artifactPath: string, timeoutMs = 60_000): Promise<{ ok: boolean; hasContract: boolean; error?: string }> {
+    let probeDir: string | null = null;
+    const cleanup = () => { if (probeDir) { try { fs.rmSync(probeDir, { recursive: true, force: true }); } catch { /* best effort */ } probeDir = null; } };
+    let importPath: string;
+    try {
+        probeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'nightgate-artifact-probe-'));
+        fs.symlinkSync(runtimeNodeModulesDir(), path.join(probeDir, 'node_modules'), process.platform === 'win32' ? 'junction' : 'dir');
+        importPath = path.join(probeDir, effectiveModuleFormat(artifactPath) === 'module' ? 'artifact.mjs' : 'artifact.cjs');
+        fs.copyFileSync(artifactPath, importPath);
+    } catch (e) {
+        cleanup();
+        return Promise.resolve({ ok: false, hasContract: false, error: String((e as Error)?.message ?? e) });
+    }
+    return probeCopiedModule(importPath, timeoutMs).finally(cleanup);
+}
+
+function probeCopiedModule(artifactPath: string, timeoutMs: number): Promise<{ ok: boolean; hasContract: boolean; error?: string }> {
     const code = `
         const { parentPort, workerData } = require('node:worker_threads');
         const { pathToFileURL } = require('node:url');

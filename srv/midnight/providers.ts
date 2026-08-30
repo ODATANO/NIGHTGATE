@@ -14,6 +14,7 @@ import WebSocket from 'ws';
 import { loadMidnightSdk } from './sdk-loader';
 import { CapDbPrivateStateProvider } from './CapDbPrivateStateProvider';
 import { isWasmProvingMode, buildWasmProofProvider } from './wasm-proof-provider';
+import { proofRequestTimeoutMs } from '../utils/proof-timeout';
 
 /**
  * The Midnight SDK keeps the active network as process-global state (see
@@ -77,7 +78,7 @@ export async function buildContractProviders(cfg: ContractProvidersConfig): Prom
     );
     const proofProvider = isWasmProvingMode()
         ? await buildWasmProofProvider(zkConfigProvider)
-        : sdk.proof.httpClientProofProvider(cfg.proofServerUrl, zkConfigProvider as any);
+        : sdk.proof.httpClientProofProvider(cfg.proofServerUrl, zkConfigProvider as any, { timeout: proofRequestTimeoutMs() });
 
     return { publicDataProvider, zkConfigProvider, proofProvider };
 }

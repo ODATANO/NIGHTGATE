@@ -19,7 +19,7 @@ services:
     # pulls this and only builds locally when the image is unavailable.
     # NIGHTGATE_IMAGE_TAG overrides; keep the default in lockstep with
     # package.json on every release.
-    image: ghcr.io/odatano/nightgate:${NIGHTGATE_IMAGE_TAG:-0.21.7}
+    image: ghcr.io/odatano/nightgate:${NIGHTGATE_IMAGE_TAG:-0.22.0}
     container_name: odatano-nightgate
     ports:
       - "4004:4004"
@@ -44,6 +44,10 @@ services:
       # Optional: switches proving from in-process wasm to a proof server,
       # e.g. http://proof-server:6300 with the service below.
       NIGHTGATE_PROOF_SERVER_URL: "${NIGHTGATE_PROOF_SERVER_URL:-}"
+      # HTTP timeout of one proof request in server mode (default 300000 =
+      # 5 min). Raise it with the proof server's job TTL below for proofs
+      # past 5 min; the SDK re-requests a timed-out proof up to three times.
+      NIGHTGATE_PROOF_TIMEOUT_MS: "${NIGHTGATE_PROOF_TIMEOUT_MS:-}"
       # Plain status routes (/nightgate/metrics|health|ready). They sit outside
       # CAP authentication, so they stay unmounted unless one of these is set.
       # Leave both empty and the entrypoint still generates an internal token
@@ -202,6 +206,10 @@ services:
     image: midnightntwrk/proof-server:8.1.0
     container_name: odatano-night-proof-server
     command: ["midnight-proof-server", "--network", "${NIGHTGATE_PROOF_NETWORK:-preprod}"]
+    environment:
+      # Per-job TTL of the proving pool, seconds (default 600). A finished
+      # job past it answers 5xx; keep it above NIGHTGATE_PROOF_TIMEOUT_MS.
+      MIDNIGHT_PROOF_SERVER_JOB_TIMEOUT: "${MIDNIGHT_PROOF_SERVER_JOB_TIMEOUT:-600}"
     ports:
       # Loopback-only: the proof server is unauthenticated and proving
       # requests carry PRIVATE witness data, so it must never listen on a

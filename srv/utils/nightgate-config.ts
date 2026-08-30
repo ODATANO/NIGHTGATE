@@ -1,5 +1,6 @@
 import cds from '@sap/cds';
 import { deriveIndexerWsUrl } from './indexer-url';
+import { DEFAULT_PROOF_TIMEOUT_MS } from './proof-timeout';
 
 export { deriveIndexerWsUrl };
 
@@ -18,6 +19,8 @@ export interface NightgatePluginConfig {
     indexerHttpUrl?: string;
     indexerWsUrl?: string;
     proofServerUrl?: string;
+    /** HTTP timeout of one proof request in server proving mode, ms; default 300000. */
+    proofTimeoutMs?: number;
     crawlerNodeUrl?: string;
     privateStateBackend?: PrivateStateBackend;
     sessionTtlMs?: number;
@@ -301,6 +304,19 @@ export function resolveEffectiveProvingMode(config?: Record<string, any> | null)
     const explicit = (readEnv('NIGHTGATE_PROVING_MODE') || '').trim().toLowerCase();
     if (explicit === 'server' || explicit === 'wasm') return explicit;
     return (readEnv('NIGHTGATE_PROOF_SERVER_URL') || config?.proofServerUrl) ? 'server' : 'wasm';
+}
+
+/**
+ * Timeout of one proof request to the proof server. Precedence:
+ * NIGHTGATE_PROOF_TIMEOUT_MS, `proofTimeoutMs`, midnight-js default (5 min).
+ * `initialize()` pins the result into the env before the wallet worker spawns.
+ */
+export function resolveProofTimeoutMs(config?: Record<string, any> | null): number {
+    const env = parseIntEnv('NIGHTGATE_PROOF_TIMEOUT_MS');
+    if (env !== undefined) return env;
+    const cfg = Number(config?.proofTimeoutMs);
+    if (Number.isFinite(cfg) && cfg > 0) return Math.floor(cfg);
+    return DEFAULT_PROOF_TIMEOUT_MS;
 }
 
 export function resolveSubmissionEndpoints(

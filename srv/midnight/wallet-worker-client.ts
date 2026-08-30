@@ -756,6 +756,8 @@ export function walletGetBalance(args: {
 }): Promise<{
     shieldedNight: string;
     unshieldedNight: string;
+    /** Every other shielded token type with a balance: raw 64-hex type, atoms. */
+    shieldedTokens: Array<{ tokenType: string; amount: string }>;
     dustBalance: string;
     registeredNightUtxoCount: number;
     totalNightUtxoCount: number;
@@ -889,6 +891,8 @@ export function walletSponsorFinalizedTx(args: {
     allowDeploy?: boolean;
     /** Addresses deployed under the requesting grant: calls on them skip `allowedCircuits`. */
     ownContracts?: string[];
+    /** Raw shielded token types whose zswap offers the sponsor pays for (floor ∩ grant); absent = no offers. */
+    allowedTokenTypes?: string[];
 }, onSubmitIntent?: SubmitIntentHook): Promise<{ txHash: string; circuits: string[]; contractAddress: string; deployed?: string[] }> {
     return rpc('sponsorFinalizedTx', args, RPC_TIMEOUT_MS, onSubmitIntent);
 }
@@ -944,6 +948,8 @@ export function walletSponsorUnboundTx(args: {
     allowDeploy?: boolean;
     /** Addresses deployed under the requesting grant: calls on them skip `allowedCircuits`. */
     ownContracts?: string[];
+    /** Raw shielded token types whose zswap offers the sponsor pays for (floor ∩ grant); absent = no offers. */
+    allowedTokenTypes?: string[];
 }, onSubmitIntent?: SubmitIntentHook): Promise<{ txHash: string; circuits: string[]; contractAddress: string; note: string; deployed?: string[] }> {
     return rpc('sponsorUnboundTx', args, RPC_TIMEOUT_MS, onSubmitIntent);
 }

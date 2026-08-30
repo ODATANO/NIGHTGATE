@@ -60,6 +60,12 @@ export interface CreateTxBuilderInput {
      * sponsor's. Explicit opt-in on purpose.
      */
     provingMode?: 'wasm' | 'server';
+    /**
+     * Server proving only: HTTP timeout of one proof request, ms (default the
+     * SDK's 300000). The SDK re-requests a timed-out proof up to three times,
+     * so set it above your slowest circuit. Positive integer.
+     */
+    proofTimeoutMs?: number;
     /** A public `/zk-config/<contract>`; assets are fetched once and cached. Optional when `zkConfigDir` is given. */
     zkConfigBaseUrl?: string;
     /**
@@ -214,6 +220,8 @@ export interface BuiltBoundDeploy extends BuiltBoundTransaction { contractAddres
 export interface BuiltUnboundDeploy extends BuiltUnboundTransaction { contractAddress: string; }
 export type BuiltDeploy = BuiltBoundDeploy | BuiltUnboundDeploy;
 /** The contract address a built deploy transaction creates; throws unless exactly one deploy action is present. */
+/** `{ timeout }` for the SDK's proof provider when `proofTimeoutMs` is set, else undefined. */
+export declare function proofProviderConfig(opts: { proofTimeoutMs?: number } | undefined): { timeout: number } | undefined;
 export declare function readDeployAddress(tx: unknown): string;
 
 export declare const ATTESTATION_VAULT_CIRCUITS: string[];

@@ -114,6 +114,70 @@ describe('checkSponsorableShape', () => {
             .toThrow(/fallibleOffer/);
     });
 
+    // allowedTokenTypes: a contract's own token may ride in the offer
+    const T = 'ab'.repeat(32);
+    const NIGHT = 'ff'.repeat(32);
+    const offer = (deltas: Array<[string, bigint]>, extra: Record<string, unknown> = {}) =>
+        ({ inputs: [], outputs: [{}], transients: [], deltas: new Map(deltas), ...extra });
+    const withTokens = (t: any, opts: Record<string, unknown> = {}) =>
+        workerExports.checkSponsorableShape(t, 5000, ['aa'.repeat(32)], ['mint'], { allowedTokenTypes: [T], nightTokenType: NIGHT, ...opts });
+
+    it('accepts an offer whose net change is on an allow-listed token type (a mint to the caller)', () => {
+        const calls = withTokens(tx([{ actions: [CALL(undefined, 'mint')] }], { guaranteedOffer: offer([[T, -420n]]) }));
+        expect(calls).toEqual([{ address: 'aa'.repeat(32), entryPoint: 'mint' }]);
+        // per-segment map form, 0x-prefixed and upper-case types normalize
+        expect(withTokens(tx([{ actions: [CALL(undefined, 'mint')] }], { fallibleCoins: new Map([[1, offer([['0x' + T.toUpperCase(), -1n]])]]) }))).toHaveLength(1);
+    });
+
+    it('without allowedTokenTypes every non-empty offer still refuses', () => {
+        expect(() => check(tx([{ actions: [CALL()] }], { guaranteedOffer: offer([[T, -1n]]) })))
+            .toThrow(/guaranteedOffer \(shielded value transfer\)/);
+        expect(() => withTokens(tx([{ actions: [CALL()] }], { guaranteedOffer: offer([[T, -1n]]) }), { allowedTokenTypes: [] }))
+            .toThrow(/shielded value transfer/);
+    });
+
+    it('refuses an offer on a type outside the list, on NIGHT, and one that nets to zero', () => {
+        expect(() => withTokens(tx([{ actions: [CALL()] }], { guaranteedOffer: offer([['cd'.repeat(32), -1n]]) })))
+            .toThrow(/moves token type cdcdcdcdcdcdcdcd…, not in allowedTokenTypes/);
+        expect(() => withTokens(tx([{ actions: [CALL()] }], { guaranteedOffer: offer([[T, -1n], ['cd'.repeat(32), 5n]]) })))
+            .toThrow(/not in allowedTokenTypes/);
+        expect(() => withTokens(tx([{ actions: [CALL()] }], { guaranteedOffer: offer([[NIGHT, -1n]]) }), { allowedTokenTypes: [T, NIGHT] }))
+            .toThrow(/moves NIGHT/);
+        expect(() => withTokens(tx([{ actions: [CALL()] }], { guaranteedOffer: offer([]) })))
+            .toThrow(/nets to zero and carries no contract-owned coin/);
+        expect(() => withTokens(tx([{ actions: [CALL()] }], { guaranteedOffer: { inputs: [{}], outputs: [] } })))
+            .toThrow(/exposes no deltas/);
+    });
+
+    it('accepts a zero-net offer when a sponsorable contract owns a coin in it (a burn: receive + send to the burn address)', () => {
+        // Live shape of the MZCASH burn (preprod tx 3b37b5a2…): 1 user input, 2 commitment outputs
+        // (change + burn address), 1 transient owned by the contract, deltas empty.
+        const burn = offer([], { inputs: [{}], outputs: [{}, {}], transients: [{ contractAddress: 'aa'.repeat(32) }] });
+        expect(withTokens(tx([{ actions: [CALL(undefined, 'mint')] }], { guaranteedOffer: burn }))).toHaveLength(1);
+        // the contract-owned coin must still be sponsorable
+        const foreignBurn = offer([], { inputs: [{}], outputs: [{}], transients: [{ contractAddress: 'ee'.repeat(32) }] });
+        expect(() => withTokens(tx([{ actions: [CALL(undefined, 'mint')] }], { guaranteedOffer: foreignBurn })))
+            .toThrow(/coin owned by contract eeeeeeeeeeeeeeee…/);
+        // a zero-net offer with only user coins is still a transfer riding along
+        expect(() => withTokens(tx([{ actions: [CALL(undefined, 'mint')] }], { guaranteedOffer: offer([], { inputs: [{}], outputs: [{}] }) })))
+            .toThrow(/nets to zero and carries no contract-owned coin/);
+    });
+
+    it('contract-owned coins in the offer must belong to a sponsorable contract', () => {
+        const burn = offer([[T, 100n]], { inputs: [{}], outputs: [{ contractAddress: 'aa'.repeat(32) }, {}] });
+        expect(withTokens(tx([{ actions: [CALL(undefined, 'mint')] }], { guaranteedOffer: burn }))).toHaveLength(1);
+        const foreign = offer([[T, 100n]], { inputs: [{ contractAddress: 'ee'.repeat(32) }], outputs: [] });
+        expect(() => withTokens(tx([{ actions: [CALL(undefined, 'mint')] }], { guaranteedOffer: foreign })))
+            .toThrow(/coin owned by contract eeeeeeeeeeeeeeee…/);
+        // a grant-deployed contract counts, and an unrestricted contract floor accepts any owner
+        expect(withTokens(tx([{ actions: [CALL(undefined, 'mint')] }], { guaranteedOffer: foreign }), { ownContracts: ['ee'.repeat(32)] })).toHaveLength(1);
+        expect(workerExports.checkSponsorableShape(tx([{ actions: [CALL()] }], { guaranteedOffer: foreign }), 5000, undefined, undefined, { allowedTokenTypes: [T] })).toHaveLength(1);
+    });
+
+    it('an offer never stands in for the contract call', () => {
+        expect(() => withTokens(tx([{ actions: [] }], { guaranteedOffer: offer([[T, -1n]]) }))).toThrow(/carries no contract call/);
+    });
+
     it('tolerates EMPTY offer containers (the SDK materializes them as empty)', () => {
         const calls = check(tx(
             [{ actions: [CALL()], guaranteedUnshieldedOffer: EMPTY_OFFER, dustActions: { spends: [], registrations: [] } }],

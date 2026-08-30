@@ -1,5 +1,86 @@
 # Changelog
 
+## 0.22.0 - 2026-08-30
+
+Custom-token balances, struct circuit arguments, proof request timeout,
+same-transaction resend, contract artifacts outside the package, sponsored
+zswap offers of a contract's own token. Additive schema migration (one
+nullable `AgentGrants` column). No circuit change. `@odatano/nightgate-tx`
+0.4.3.
+
+- **`getWalletBalance.shieldedTokens[]`**: every shielded token type other
+  than NIGHT with a non-zero balance, `{ tokenType, amount }` (raw 64-hex
+  type, atoms). Pairs with `deriveTokenType` and `sendNight(tokenTypeHex)`;
+  a contract-minted token was spendable but invisible.
+- **Struct circuit arguments** on `submitContractCall` /
+  `submitContractCallBatch`: a `contract-info.json` `Struct` parameter
+  (`ShieldedCoinInfo`, `QualifiedShieldedCoinInfo`, own structs) is coerced
+  field by field with the field's own type, tagged or introspected, nested
+  structs included; missing field / non-object / field errors keep the
+  `args[i]` prefix. `Vector` / `Maybe` / `Either` still pass through.
+- **`proofTimeoutMs`** (cds) / `NIGHTGATE_PROOF_TIMEOUT_MS`: HTTP timeout of
+  one proof request in server proving mode, default 300000 (midnight-js'
+  default), pinned into the env at init like the proving mode. A proof past
+  the timeout failed the job and midnight-js re-requested it up to three
+  times. The proof server's `MIDNIGHT_PROOF_SERVER_JOB_TIMEOUT` goes with it.
+- **Same-transaction resend on a transport failure**: when the SEND of a
+  finalized transaction fails (websocket closed at submit, `1000 Normal
+  Closure`, `ECONNRESET`, no reply), the worker asks the indexer for the
+  identifier, then hands the SAME transaction back to
+  `facade.submitTransaction` (which re-pends the spends):
+  `NIGHTGATE_SUBMIT_TRANSPORT_RETRIES` (2), `_BACKOFF_MS` (5 s),
+  `NIGHTGATE_SUBMIT_LANDED_PROBE_MS` (30 s). A landed transaction is
+  reported as submitted only with ledger result `SUCCESS`; in a block
+  but not applied (`FAILURE` / `PARTIAL_SUCCESS`) fails as `TxFailed`
+  (fee spent, rebuild). Any refused resend (validity reject, `1013
+  Already Imported`) is checked against the indexer before the refusal
+  propagates. Transport = socket closed/reset/refused, submit timeouts
+  (`TimeoutError`, `timed out`, `no reply`). Every bound submit (deploy/call/batch,
+  sends, dust registration, bound sponsoring). Before: the job failed and a
+  re-run rebuilt and re-proved the call (live: a 13 min proof twice). Node
+  rejects are never resent. `classifySubmissionError` counts the transport
+  lines as `NetworkOrTimeout`.
+- **Contract artifacts outside the package**: the `registerContract`
+  validation probe imports the artifact from a disposable copy next to a
+  `node_modules` link to NIGHTGATE's runtime (as the worker's snapshots do),
+  so `NIGHTGATE_CONTRACTS_DIR` points at a consumer's own directory without a
+  node_modules there. Documented as the supported layout.
+- **Sponsored zswap offers, `allowedTokenTypes`**: the sponsor shape check
+  refused every non-empty offer, so a token contract's `mint` (minted coin
+  to the caller) or `burn` / `receiveShielded` (caller's coin into the
+  contract) could never be sponsored although no sponsor value moves.
+  Floor `NIGHTGATE_SPONSOR_ALLOWED_TOKEN_TYPES` / policy-file
+  `allowedTokenTypes`, grant `createAgentGrant(..., allowedTokenTypes)`
+  (new nullable column, effective = floor ∩ grant, the floor must open
+  it; empty = no offers, unchanged). With a list, an offer passes iff every
+  net change (`deltas`, public per raw token type) is on a listed type and
+  never NIGHT, every contract-owned coin belongs to a sponsorable contract,
+  and a net change exists or a coin in the offer is owned by a sponsorable
+  contract (the ledger drops zero deltas: a zero-net offer says nothing and
+  is refused, except when the contract itself received or spent a coin in
+  it, which is what a burn looks like: user input, contract transient,
+  burn-address output, net zero). User outputs are commitments, so a
+  transfer of a listed type between users riding along is accepted by
+  design. Entries are raw 64-hex types (`deriveTokenType`); an invalid
+  floor entry fails closed (503).
+- **txbuilder `proofTimeoutMs`** (`@odatano/nightgate-tx` 0.4.3):
+  `createTxBuilder({ provingMode: 'server', proofServerUrl, proofTimeoutMs })`
+  passes the HTTP timeout of one proof request to the SDK (default 5 min,
+  the same ceiling as the server's). The TTL is stamped after proving.
+- Packaging: `files` names the four shipped contracts explicitly
+  (`counter`, `attestation-vault`, `attestation-vault-32`,
+  `shielded-token`) instead of `contracts/**`, so a foreign directory
+  under `contracts/` never reaches the tarball; `.dockerignore` drops
+  `scratch/` and those directories from local image builds. Compose:
+  image tag 0.22.0, `NIGHTGATE_PROOF_TIMEOUT_MS` passed to the server,
+  `MIDNIGHT_PROOF_SERVER_JOB_TIMEOUT` (default 600) to the proof-server
+  container, both in `.env.example`. `proofTimeoutMs` in the plugin's
+  `cds.schema`; `shieldedTokens` on the client/token-ops return types;
+  txbuilder `proofProviderConfig()` exported.
+- Docs: `docs/reference.md` (config + env), `docs/actions.md` (struct
+  arguments, `shieldedTokens`, sponsored offers), `docs/operations.md`
+  (upgrade note, three troubleshooting entries), `docs/txbuilder.md`.
+
 ## 0.21.9 - 2026-08-29
 
 Stage-grouped segment order for independent batch calls. No schema change,

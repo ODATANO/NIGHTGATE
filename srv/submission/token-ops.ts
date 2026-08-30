@@ -60,6 +60,8 @@ export interface WalletBalanceSnapshot {
     shieldedNight: string;
     /** NIGHT atoms held on the unshielded ledger, decimal string. */
     unshieldedNight: string;
+    /** Every other shielded token type with a non-zero balance: raw 64-hex type (deriveTokenType), atoms. */
+    shieldedTokens: Array<{ tokenType: string; amount: string }>;
     /** Current DUST atoms (accrued from registered NIGHT), decimal string. */
     dustBalance: string;
     /** Number of NIGHT UTXOs currently registered for dust generation. */

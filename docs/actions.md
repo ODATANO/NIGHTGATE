@@ -330,7 +330,8 @@ supported per element:
 | `Bytes<N>` | hex string (`"ab…"`, optional `0x` prefix), **or** a `number[]` of bytes | `Uint8Array(N)` (length-checked) |
 | `Uint<N>` | a number (`47300`) or a decimal string (`"47300"`) | `BigInt` |
 | `Boolean` | `true` / `false` | boolean |
-| other (`Vector`, struct, …) | the JSON value | passed through unchanged |
+| a Compact struct (`ShieldedCoinInfo`, `QualifiedShieldedCoinInfo`, your own) | a JSON object with every declared field, each in its own encoding from this table (tags work one level down, nested structs recurse) | an object with the fields coerced by their own types (0.22.0); a missing field or a non-object is a 400 naming the argument index |
+| other (`Vector`, `Maybe`, `Either`, …) | the JSON value | passed through unchanged |
 
 For circuits NIGHTGATE can't introspect (no `contract-info.json` found for the
 circuit), use **tagged values**, which are honored regardless of metadata:
@@ -442,7 +443,17 @@ contract deploy, an unshielded transfer, a zswap offer or caller-side dust
 actions riding in the same envelope refuse, as does a transaction whose
 structure the inspection cannot read, or one over the size budget
 (`NIGHTGATE_SPONSOR_MAX_TX_BYTES`, default 65536; a single vault call is
-~5.4 KB). On top of that the allow-list bounds WHICH calls are paid for:
+~5.4 KB). One exception since 0.22.0: a zswap offer passes when the
+policy names its token types (`NIGHTGATE_SPONSOR_ALLOWED_TOKEN_TYPES`,
+policy-file / grant `allowedTokenTypes`): a token contract's `mint` puts
+the minted coin into the offer, its `burn` / `receiveShielded` spends one
+from the caller, and none of that is the sponsor's value. Every net change
+of the offer must be on a listed type (never NIGHT), every contract-owned
+coin must belong to a sponsorable contract, and a net change must exist
+unless a coin in the offer is owned by a sponsorable contract (a burn nets
+to zero by construction: user input, contract transient, burn-address
+output; the contract's own coin is the evidence that the call moved the
+value). On top of that the allow-list bounds WHICH calls are paid for:
 
 ```bash
 NIGHTGATE_SPONSOR_ALLOWED_CONTRACTS=<vault addr>,<other addr>
@@ -458,16 +469,19 @@ fixed at creation, so a one-line change to these lists used to mean a
 recreate and a ~20 min cold sponsor pool. Two layers replace that:
 
 - **Policy follows the grant.** `createAgentGrant(..., allowedContracts,
-  allowedCircuits)` records which contracts and circuits THAT consumer may
-  have sponsored. A sponsored call made with the grant's token runs under the
+  allowedCircuits, allowedTokenTypes)` records which contracts, circuits and
+  (0.22.0) shielded token types THAT consumer may have sponsored. A sponsored call made with the grant's token runs under the
   intersection of the platform lists and the grant's; an absent grant list
-  inherits the platform list, an empty platform list lets the grant be the
-  whole policy. Onboarding a consumer is then one call, and revoking the
+  inherits the platform list, and for contracts and circuits an empty
+  platform list lets the grant be the whole policy. Token types differ:
+  an empty platform list means NO offers, whatever the grant says (the
+  floor opens offers, a grant only narrows them). Onboarding a consumer is then one call, and revoking the
   grant removes its sponsoring reach with it. Two non-empty lists that share
   nothing refuse at admission with `403 SPONSOR_POLICY_EMPTY` (a grant can
   narrow the floor, never widen it).
 - **Policy file for the platform floor.** Set `NIGHTGATE_SPONSOR_POLICY_FILE`
-  to a JSON file `{ "allowedContracts": [...], "allowedCircuits": [...] }`
+  to a JSON file `{ "allowedContracts": [...], "allowedCircuits": [...],
+  "allowDeploy": false, "allowedTokenTypes": [...] }`
   (for the Docker image, under the data volume). It is re-read on every
   sponsored call behind an mtime cache and replaces the two env variables
   while set. Fail-closed: an unreadable or invalid file keeps the last good
@@ -703,9 +717,9 @@ Bind the authenticated caller (`req.user.id`) to the `Bytes<32>` grantee id the 
 
 ## Diagnostics
 
-### `getWalletBalance(sessionId) → { shieldedNight, unshieldedNight, dustBalance, registeredNightUtxoCount, totalNightUtxoCount, dustUtxoCount, dustPendingCount, dustPendingValue, dustRestoreCount }`
+### `getWalletBalance(sessionId) → { shieldedNight, unshieldedNight, shieldedTokens[], dustBalance, registeredNightUtxoCount, totalNightUtxoCount, dustUtxoCount, dustPendingCount, dustPendingValue, dustRestoreCount }`
 
-Read-only snapshot. All balances as decimal NIGHT atoms (or DUST atoms) - strings to preserve `bigint` precision. The dust diagnostics fields (0.15.2) expose the dust sub-wallet's local UTXO view: `dustUtxoCount` is the number of DUST notes the wallet tracks, `dustPendingCount`/`dustPendingValue` are in-flight dust spends awaiting confirmation, and `dustRestoreCount` counts the dust wedge protection's snapshot restores whose re-persist the database CONFIRMED (process-lifetime; a restore that could not be durably persisted is logged but not counted, and the live e2e gates on this counter). A wallet showing `registeredNightUtxoCount > 0` but `dustUtxoCount == 0` and `dustPendingCount == 0` while fee payments keep failing is dust-wedged (leaked in-flight spend) rather than genuinely empty; see the operations guide.
+Read-only snapshot. All balances as decimal NIGHT atoms (or DUST atoms) - strings to preserve `bigint` precision. `shieldedTokens` (0.22.0) lists every OTHER shielded token type the wallet holds with a non-zero balance: `tokenType` is the raw 64-hex token type (what `deriveTokenType(contractAddress, domainSeparator)` returns), `amount` the atoms. A contract-minted token (`shielded-token`, a wrapped asset) shows up here and is spent via `sendNight(tokenTypeHex)`. The dust diagnostics fields (0.15.2) expose the dust sub-wallet's local UTXO view: `dustUtxoCount` is the number of DUST notes the wallet tracks, `dustPendingCount`/`dustPendingValue` are in-flight dust spends awaiting confirmation, and `dustRestoreCount` counts the dust wedge protection's snapshot restores whose re-persist the database CONFIRMED (process-lifetime; a restore that could not be durably persisted is logged but not counted, and the live e2e gates on this counter). A wallet showing `registeredNightUtxoCount > 0` but `dustUtxoCount == 0` and `dustPendingCount == 0` while fee payments keep failing is dust-wedged (leaked in-flight spend) rather than genuinely empty; see the operations guide.
 
 **Rate limit:** 60/min per client IP.
 
@@ -718,6 +732,7 @@ Response:
 {
   "shieldedNight": "1000000000000",
   "unshieldedNight": "0",
+  "shieldedTokens": [{ "tokenType": "248c11531d5a35b333a590489c47d6fe114be403e442bf6e088e3e9b0c06fdbc", "amount": "420000000" }],
   "dustBalance": "2098000",
   "registeredNightUtxoCount": 1,
   "totalNightUtxoCount": 1,

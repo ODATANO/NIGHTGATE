@@ -234,6 +234,7 @@ entity AgentGrants : cuid, managed {
     maxDeploys       : Integer; // lifetime deploy budget, separate from maxJobsPerDay; default 1 when allowDeploy
     deploysUsed      : Integer default 0; // reserved before broadcast; released only for a rejected tx
     deployedContracts : LargeString; // JSON array of addresses deployed under this grant; sponsorable on top of floor ∩ grant
+    allowedTokenTypes : LargeString; // JSON array of raw shielded token types whose zswap offers the sponsor pays for; null = platform floor
     validUntil       : Timestamp; // null = no expiry
     isActive         : Boolean default true;
     revokedAt        : Timestamp;

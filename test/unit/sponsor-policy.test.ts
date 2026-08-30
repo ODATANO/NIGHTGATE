@@ -15,6 +15,7 @@ vi.mock('@sap/cds', () => {
 
 import {
     validatePolicyList,
+    validateTokenTypeList,
     effectiveSponsorPolicy,
     getGlobalSponsorPolicy,
     resolveSponsorPolicyForRequest,
@@ -24,7 +25,7 @@ import {
     __resetSponsorPolicyForTests
 } from '../../srv/submission/sponsor-policy';
 
-const ENV_KEYS = ['NIGHTGATE_SPONSOR_ALLOWED_CONTRACTS', 'NIGHTGATE_SPONSOR_ALLOWED_CIRCUITS', 'NIGHTGATE_SPONSOR_POLICY_FILE'];
+const ENV_KEYS = ['NIGHTGATE_SPONSOR_ALLOWED_CONTRACTS', 'NIGHTGATE_SPONSOR_ALLOWED_CIRCUITS', 'NIGHTGATE_SPONSOR_POLICY_FILE', 'NIGHTGATE_SPONSOR_ALLOWED_TOKEN_TYPES'];
 let tmpDir: string;
 
 beforeEach(() => {
@@ -51,6 +52,48 @@ describe('validatePolicyList', () => {
         expect(() => validatePolicyList('allowedContracts', [42 as any])).toThrow(/strings/);
         expect(() => validatePolicyList('allowedContracts', ['x'.repeat(131)])).toThrow(/longer/);
         expect(() => validatePolicyList('allowedContracts', Array.from({ length: MAX_POLICY_ENTRIES + 1 }, (_, i) => `c${i}`))).toThrow(/at most/);
+    });
+});
+
+describe('allowedTokenTypes (0.22.0): raw types, floor opens, grant narrows', () => {
+    const T1 = 'ab'.repeat(32);
+    const T2 = 'cd'.repeat(32);
+
+    it('validateTokenTypeList accepts 64 hex with optional 0x, normalizes and de-duplicates', () => {
+        expect(validateTokenTypeList('x', undefined)).toEqual([]);
+        expect(validateTokenTypeList('x', [' 0x' + T1.toUpperCase() + ' ', T1])).toEqual([T1]);
+        expect(() => validateTokenTypeList('allowedTokenTypes', ['attest'])).toThrow(/not a raw token type/);
+        expect(() => validateTokenTypeList('allowedTokenTypes', [T1.slice(1)])).toThrow(/not a raw token type/);
+        expect(() => validateTokenTypeList('allowedTokenTypes', 'x' as any)).toThrow(/array/);
+    });
+
+    it('env floor: NIGHTGATE_SPONSOR_ALLOWED_TOKEN_TYPES, invalid entries fail closed (503)', () => {
+        expect(getGlobalSponsorPolicy().allowedTokenTypes).toEqual([]);
+        process.env.NIGHTGATE_SPONSOR_ALLOWED_TOKEN_TYPES = `${T1}, 0x${T2}`;
+        expect(getGlobalSponsorPolicy().allowedTokenTypes).toEqual([T1, T2]);
+        process.env.NIGHTGATE_SPONSOR_ALLOWED_TOKEN_TYPES = 'wzec';
+        expect(() => getGlobalSponsorPolicy()).toThrow(SponsorPolicyUnavailableError);
+    });
+
+    it('policy file: allowedTokenTypes is a known key and validated', () => {
+        const file = path.join(tmpDir, 'policy.json');
+        fs.writeFileSync(file, JSON.stringify({ allowedContracts: ['A'], allowedTokenTypes: [T1] }));
+        process.env.NIGHTGATE_SPONSOR_POLICY_FILE = file;
+        expect(getGlobalSponsorPolicy().allowedTokenTypes).toEqual([T1]);
+        fs.writeFileSync(file, JSON.stringify({ allowedTokenTypes: ['nope'] }));
+        __resetSponsorPolicyForTests();
+        expect(() => getGlobalSponsorPolicy()).toThrow(SponsorPolicyUnavailableError);
+    });
+
+    it('effective: a closed floor stays closed whatever the grant says; a grant narrows an open floor', () => {
+        const closed = { allowedContracts: [], allowedCircuits: [] };
+        expect(effectiveSponsorPolicy(closed).allowedTokenTypes).toEqual([]);
+        expect(effectiveSponsorPolicy(closed, { allowedTokenTypes: [T1] }).allowedTokenTypes).toEqual([]);
+        const open = { allowedContracts: [], allowedCircuits: [], allowedTokenTypes: [T1, T2] };
+        expect(effectiveSponsorPolicy(open).allowedTokenTypes).toEqual([T1, T2]);
+        expect(effectiveSponsorPolicy(open, { allowedTokenTypes: [] }).allowedTokenTypes).toEqual([T1, T2]);
+        expect(effectiveSponsorPolicy(open, { allowedTokenTypes: [T2] }).allowedTokenTypes).toEqual([T2]);
+        expect(() => effectiveSponsorPolicy(open, { allowedTokenTypes: ['ef'.repeat(32)] })).toThrow(SponsorPolicyEmptyError);
     });
 });
 

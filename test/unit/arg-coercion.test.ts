@@ -223,3 +223,66 @@ describe('contract-info.json introspection', () => {
         }
     });
 });
+
+describe('Struct coercion (e.g. ShieldedCoinInfo for receiveShielded)', () => {
+    const COIN: CircuitArgType = {
+        name: 'coin', kind: 'Struct', elements: [
+            { name: 'nonce', kind: 'Bytes', length: 32 },
+            { name: 'color', kind: 'Bytes', length: 32 },
+            { name: 'value', kind: 'Uint' }
+        ]
+    };
+    const HEX32 = 'ab'.repeat(32);
+
+    it('coerces every declared field with its own type (tagged and untagged)', () => {
+        const [coin] = coerceCircuitArgs(
+            [{ nonce: { $bytes: HEX32 }, color: HEX32, value: { $uint: '100000000' } }], [COIN]
+        ) as [Record<string, unknown>];
+        expect(coin.nonce).toBeInstanceOf(Uint8Array);
+        expect((coin.nonce as Uint8Array).length).toBe(32);
+        expect(coin.color).toBeInstanceOf(Uint8Array);
+        expect(coin.value).toBe(100000000n);
+        expect(Object.keys(coin)).toEqual(['nonce', 'color', 'value']);
+    });
+
+    it('rejects a non-object and a missing field with the argument index', () => {
+        expect(coerceErr('not-an-object', COIN).message).toMatch(/args\[0\]: expected an object for struct coin/);
+        expect(coerceErr({ nonce: { $bytes: HEX32 }, value: 1 }, COIN).message).toMatch(/struct field "color" is missing/);
+    });
+
+    it('surfaces a field-level error (wrong Bytes length)', () => {
+        expect(coerceErr({ nonce: 'abcd', color: HEX32, value: 1 }, COIN).message).toMatch(/expected 32 bytes/);
+    });
+
+    it('is mapped from contract-info.json with its elements', () => {
+        const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'nightgate-arginfo-struct-'));
+        __clearArgTypeCacheForTests();
+        try {
+            fs.mkdirSync(path.join(dir, 'compiler'), { recursive: true });
+            fs.writeFileSync(path.join(dir, 'compiler', 'contract-info.json'), JSON.stringify({
+                circuits: [{
+                    name: 'burn',
+                    arguments: [
+                        { name: 'coin', type: { 'type-name': 'Struct', name: 'ShieldedCoinInfo', elements: [
+                            { name: 'nonce', type: { 'type-name': 'Bytes', length: 32 } },
+                            { name: 'color', type: { 'type-name': 'Bytes', length: 32 } },
+                            { name: 'value', type: { 'type-name': 'Uint', maxval: 255 } }
+                        ] } },
+                        { name: 'zcashRecipient', type: { 'type-name': 'Bytes', length: 43 } }
+                    ]
+                }]
+            }));
+            expect(loadCircuitArgTypes(dir, 'burn')).toEqual([
+                { name: 'coin', kind: 'Struct', elements: [
+                    { name: 'nonce', kind: 'Bytes', length: 32 },
+                    { name: 'color', kind: 'Bytes', length: 32 },
+                    { name: 'value', kind: 'Uint', maxval: 255 }
+                ] },
+                { name: 'zcashRecipient', kind: 'Bytes', length: 43 }
+            ]);
+        } finally {
+            fs.rmSync(dir, { recursive: true, force: true });
+            __clearArgTypeCacheForTests();
+        }
+    });
+});

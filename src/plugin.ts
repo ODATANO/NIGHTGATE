@@ -114,6 +114,11 @@ const plugin = {
                         type: 'string',
                         default: 'http://localhost:6300'
                     },
+                    proofTimeoutMs: {
+                        description: 'HTTP timeout of one proof request to the proof server in server proving mode, ms. Override via NIGHTGATE_PROOF_TIMEOUT_MS env var.',
+                        type: 'integer',
+                        default: 300000
+                    },
                     zkConfigBasePath: {
                         description: 'Base directory containing contract managed/ artifacts (keys + zkIR). Resolved per contract by appending the contract name. Override via NIGHTGATE_ZK_CONFIG_BASE env var.',
                         type: 'string',

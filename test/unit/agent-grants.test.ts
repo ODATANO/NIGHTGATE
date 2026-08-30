@@ -292,12 +292,27 @@ describe('agent grants', () => {
             expect(result).toMatchObject({ allowedContracts: ['0xVAULT'], allowedCircuits: ['attest'] });
         });
 
+        it('persists allowedTokenTypes (raw 64-hex, normalized) and refuses anything else', async () => {
+            const T = 'ab'.repeat(32);
+            mockDbRun.mockResolvedValueOnce(activeSessionRow());
+            const req = makeReq({ ...VALID, allowedTokenTypes: ['0x' + T.toUpperCase(), T] });
+            const result = await handlers.createAgentGrant(req);
+            expect(req.reject).not.toHaveBeenCalled();
+            expect(insertEntriesSpy).toHaveBeenCalledWith(expect.objectContaining({ allowedTokenTypes: JSON.stringify([T]) }));
+            expect(result).toMatchObject({ allowedTokenTypes: [T] });
+
+            mockDbRun.mockResolvedValueOnce(activeSessionRow());
+            const bad = makeReq({ ...VALID, allowedTokenTypes: ['wzec'] });
+            await handlers.createAgentGrant(bad);
+            expect(bad.reject).toHaveBeenCalledWith(400, expect.stringMatching(/allowedTokenTypes.*not a raw token type/));
+        });
+
         it('absent lists are stored as null (inherit the platform floor) and returned empty', async () => {
             mockDbRun.mockResolvedValueOnce(activeSessionRow());
             const req = makeReq(VALID);
             const result = await handlers.createAgentGrant(req);
-            expect(insertEntriesSpy).toHaveBeenCalledWith(expect.objectContaining({ allowedContracts: null, allowedCircuits: null }));
-            expect(result).toMatchObject({ allowedContracts: [], allowedCircuits: [] });
+            expect(insertEntriesSpy).toHaveBeenCalledWith(expect.objectContaining({ allowedContracts: null, allowedCircuits: null, allowedTokenTypes: null }));
+            expect(result).toMatchObject({ allowedContracts: [], allowedCircuits: [], allowedTokenTypes: [] });
         });
 
         it('rejects 400 on an entry that cannot be an address or circuit', async () => {
@@ -319,7 +334,7 @@ describe('agent grants', () => {
             });
             await enforceAgentGrant(req, db);
             expect(req.reject).not.toHaveBeenCalled();
-            expect(req.agentGrant).toMatchObject({ ID: 'grant-1', allowedContracts: ['0xVAULT'], allowedCircuits: [] });
+            expect(req.agentGrant).toMatchObject({ ID: 'grant-1', allowedContracts: ['0xVAULT'], allowedCircuits: [], allowedTokenTypes: [] });
         });
     });
 
@@ -496,7 +511,7 @@ describe('agent grants', () => {
             expect(req.reject).not.toHaveBeenCalled();
             expect(req.user.id).toBe(TEST_USER_ID);
             expect(req.data.sessionId).toBe('sess-1');
-            expect(req.agentGrant).toEqual({ ID: 'grant-1', sessionId: 'sess-1', userId: TEST_USER_ID, allowedContracts: [], allowedCircuits: [], deployedContracts: [], allowDeploy: false });
+            expect(req.agentGrant).toEqual({ ID: 'grant-1', sessionId: 'sess-1', userId: TEST_USER_ID, allowedContracts: [], allowedCircuits: [], deployedContracts: [], allowedTokenTypes: [], allowDeploy: false });
         });
 
         it('rejects 403 on a sessionId that does not match the grant', async () => {

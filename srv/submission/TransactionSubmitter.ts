@@ -702,7 +702,7 @@ export function classifySubmissionError(err: unknown, network: NightgateNetwork)
     }
 
     // Network / timeout patterns
-    if (/ECONNREFUSED|ECONNRESET|ENOTFOUND|ETIMEDOUT|socket hang up|timeout/i.test(message)) {
+    if (/ECONNREFUSED|ECONNRESET|ENOTFOUND|ETIMEDOUT|socket hang up|timeout|disconnected from|Normal Closure|Abnormal Closure|WebSocket is not connected/i.test(haystack)) {
         return { code: 'NetworkOrTimeout', retryable: true, message };
     }
 

@@ -8,6 +8,7 @@ import {
     resolveCrawlerlessChainConfirmEnabled,
     isCrawlerlessChainConfirmExplicitlyEnabled,
     resolveEffectiveProvingMode,
+    resolveProofTimeoutMs,
     VALID_NIGHTGATE_NETWORKS,
     getNightgatePluginConfig,
     isCloseSessionsOnRestartEnabled,
@@ -148,7 +149,7 @@ async function ensureSchemaDeployed(): Promise<void> {
         // session with an opaque "no such column".
         { table: 'midnight.WalletSessions', columns: ['label'] },
         // Per-grant sponsor policy + runtime contract registrations.
-        { table: 'midnight.AgentGrants', columns: ['allowedContracts', 'allowedCircuits', 'allowDeploy', 'maxDeploys', 'deploysUsed', 'deployedContracts'] },
+        { table: 'midnight.AgentGrants', columns: ['allowedContracts', 'allowedCircuits', 'allowDeploy', 'maxDeploys', 'deploysUsed', 'deployedContracts', 'allowedTokenTypes'] },
         { table: 'midnight.ContractRegistrations' }
     ];
 
@@ -362,9 +363,12 @@ export async function initialize(): Promise<NightgateIndexerStatus> {
     // explicitly configured or the mode was set.
     const provingMode = resolveEffectiveProvingMode(nightgateConfig);
     process.env.NIGHTGATE_PROVING_MODE = provingMode;
+    // Same for the proof request timeout (env or `proofTimeoutMs`).
+    const proofTimeoutMs = resolveProofTimeoutMs(nightgateConfig);
+    process.env.NIGHTGATE_PROOF_TIMEOUT_MS = String(proofTimeoutMs);
     log.info(`Proving mode: ${provingMode}` + (provingMode === 'wasm'
         ? ' (in-process; set NIGHTGATE_PROOF_SERVER_URL or NIGHTGATE_PROVING_MODE=server for a proof server)'
-        : ` (proof server at ${submissionEndpoints.proofServerUrl})`));
+        : ` (proof server at ${submissionEndpoints.proofServerUrl}, proof request timeout ${proofTimeoutMs} ms)`));
 
     // Spin up the wallet worker thread now so it's ready when the first
     // connectWalletForSigning request lands. The Midnight wallet SDK

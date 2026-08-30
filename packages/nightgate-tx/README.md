@@ -96,6 +96,9 @@ same bytes, same proof), and always `await builder.close()` (it stops the
 sync and the indexer sockets; before 0.4.1 it stopped nothing).
 `deriveIdentity({ seedHex })` gives `attesterId` and the NIGHT address
 without a builder, in ~150 ms.
+With `provingMode: 'server'` (a proof server YOU run; it receives the
+witnesses), `proofTimeoutMs` raises the SDK's 5 min timeout of one proof
+request for circuits that prove longer (0.4.3).
 
 Against a sponsor running NIGHTGATE 0.18 or later, prefer the parallel channel:
 `buildSponsorable({ contractAddress: VAULT, call, bind: false })` returns

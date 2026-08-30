@@ -210,6 +210,21 @@ describe('txbuilder: createTxBuilder input validation', () => {
         // (a proofServerUrl alone keeps wasm: no rejection here; the build path is exercised live)
     });
 
+    it('proofTimeoutMs reaches the SDK proof provider as { timeout }; unset keeps the SDK default', async () => {
+        const { proofProviderConfig } = await importTxBuilder();
+        expect(proofProviderConfig({ proofTimeoutMs: 900_000 })).toEqual({ timeout: 900_000 });
+        expect(proofProviderConfig({})).toBeUndefined();
+        expect(proofProviderConfig(undefined)).toBeUndefined();
+    });
+
+    it('proofTimeoutMs must be a positive integer', async () => {
+        const { createTxBuilder } = await importTxBuilder();
+        for (const bad of [0, -1, 1.5, 'soon', NaN]) {
+            await expect(createTxBuilder({ ...base, provingMode: 'server', proofServerUrl: 'http://127.0.0.1:6300', proofTimeoutMs: bad as any }))
+                .rejects.toThrow(/proofTimeoutMs must be a positive integer/);
+        }
+    });
+
     it('exposes the vault circuit set', async () => {
         const { ATTESTATION_VAULT_CIRCUITS } = await importTxBuilder();
         expect(ATTESTATION_VAULT_CIRCUITS).toContain('attest');

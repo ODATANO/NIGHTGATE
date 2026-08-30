@@ -39,7 +39,7 @@ import { AgentGrants, WalletSessions } from '#cds-models/midnight';
 import { RateLimiter } from '../utils/rate-limiter';
 import { PLATFORM_POOL_SENTINEL } from '../submission/sponsor-pool';
 import { getConfiguredFeeSponsorSessions } from '../submission/fee-sponsor';
-import { validatePolicyList } from '../submission/sponsor-policy';
+import { validatePolicyList, validateTokenTypeList } from '../submission/sponsor-policy';
 import { withKeyedLock } from '../utils/keyed-lock';
 import { runWithoutAmbientTx } from '../submission/background-jobs';
 import { resolveFeeSponsor, FeeSponsorError } from '../submission/fee-sponsor';
@@ -129,6 +129,7 @@ interface AgentGrantRow {
     maxDeploys?: number | null;
     deploysUsed?: number | null;
     deployedContracts?: string | null; // JSON array: addresses deployed under this grant
+    allowedTokenTypes?: string | null; // JSON array of raw token types, or null
     validUntil?: string | null;
     isActive?: boolean;
 }
@@ -257,6 +258,7 @@ export function registerAgentGrantHandlers(srv: any, db: any): void {
             allowedCircuits?: string[] | null;
             allowDeploy?: boolean | null;
             maxDeploys?: number | null;
+            allowedTokenTypes?: string[] | null;
         };
 
         if (!data.sessionId) return req.reject(400, 'sessionId is required');
@@ -280,9 +282,11 @@ export function registerAgentGrantHandlers(srv: any, db: any): void {
         // sponsored call is floor ∩ grant (srv/submission/sponsor-policy.ts).
         let allowedContracts: string[];
         let allowedCircuits: string[];
+        let allowedTokenTypes: string[];
         try {
             allowedContracts = validatePolicyList('allowedContracts', data.allowedContracts);
             allowedCircuits = validatePolicyList('allowedCircuits', data.allowedCircuits);
+            allowedTokenTypes = validateTokenTypeList('allowedTokenTypes', data.allowedTokenTypes);
         } catch (e) {
             return req.reject(400, (e as Error).message);
         }
@@ -381,6 +385,7 @@ export function registerAgentGrantHandlers(srv: any, db: any): void {
             maxDeploys,
             deploysUsed: 0,
             deployedContracts: null,
+            allowedTokenTypes: allowedTokenTypes.length ? JSON.stringify(allowedTokenTypes) : null,
             validUntil: data.validUntil ?? null,
             isActive: true
         };
@@ -388,9 +393,10 @@ export function registerAgentGrantHandlers(srv: any, db: any): void {
         log.info(`agent grant ${grant.ID} created for session ${String(data.sessionId).slice(0, 8)}… ` +
             `(actions: ${actions.join(', ')}${grant.maxJobsPerDay ? `, budget ${grant.maxJobsPerDay}/day` : ''}` +
             `${allowedContracts.length ? `, contracts ${allowedContracts.map(c => c.slice(0, 12)).join('|')}` : ''}` +
-            `${allowedCircuits.length ? `, circuits ${allowedCircuits.join('|')}` : ''})`);
+            `${allowedCircuits.length ? `, circuits ${allowedCircuits.join('|')}` : ''}` +
+            `${allowedTokenTypes.length ? `, token types ${allowedTokenTypes.map(t => t.slice(0, 12)).join('|')}` : ''})`);
 
-        return { grantId: grant.ID, token, allowedActions: actions, allowedContracts, allowedCircuits, allowDeploy, maxDeploys, validUntil: grant.validUntil };
+        return { grantId: grant.ID, token, allowedActions: actions, allowedContracts, allowedCircuits, allowDeploy, maxDeploys, allowedTokenTypes, validUntil: grant.validUntil };
     });
 
     srv.on('revokeAgentGrant', async (req: Request) => {
@@ -520,6 +526,7 @@ export async function enforceAgentGrant(req: Request, db: any): Promise<unknown>
         allowedCircuits: parseGrantList(grant.allowedCircuits),
         // Sponsorable on top of the intersection (see recordDeployedContracts).
         deployedContracts: parseGrantList(grant.deployedContracts),
+        allowedTokenTypes: parseGrantList(grant.allowedTokenTypes),
         // Admission pre-check only; the lifetime budget is reserved per deploy
         // before the broadcast (reserveDeployBudget).
         allowDeploy: grant.allowDeploy === true && (grant.deploysUsed ?? 0) < (grant.maxDeploys ?? 1)

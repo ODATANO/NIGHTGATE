@@ -106,3 +106,10 @@ db/walletstate-*.json
 # Operator notes for the hosted deployment: host, paths, backup and deploy
 # procedure. Deliberately untracked, this repo is public.
 OPERATIONS.local.md
+
+# MZCASH demo contracts are deploy-time copies; their source of truth is ODATANO/MZCASH/t2-deploy-path/
+contracts/ping/
+contracts/mint/
+contracts/mint2/
+contracts/mint3/
+contracts/mint4/

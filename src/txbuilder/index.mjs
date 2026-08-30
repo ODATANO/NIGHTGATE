@@ -168,6 +168,10 @@ export function buildOnlyWalletProvider(facade, zswapKeys, dustKey, keystore, ho
  * @param {string} opts.indexerWsUrl
  * @param {string} opts.nodeUrl          Substrate RPC (the SDK's relayURL), e.g. wss://rpc.preprod.midnight.network/
  * @param {string} [opts.proofServerUrl] unused by default (only the SDK's config type wants it); see provingMode
+ * @param {number} [opts.proofTimeoutMs]  server proving only: HTTP timeout of ONE proof request, ms; default
+ *                                        midnight-js' 300000. The SDK re-requests a timed-out proof up to three
+ *                                        times, so set it above your slowest circuit (a large custom relation
+ *                                        can take 15 min). The TTL is stamped after proving, unaffected.
  * @param {'wasm'|'server'} [opts.provingMode] 'wasm' (default): prove the contract circuit in-process, nothing
  *                                        leaves the process. 'server': prove on opts.proofServerUrl, which
  *                                        then RECEIVES THE WITNESSES: native and multi-threaded, several
@@ -207,6 +211,14 @@ async function findDeployedWithRetry(contracts, providers, args) {
  * single ContractDeploy action (an action without `entryPoint`). Throws unless
  * exactly one such action with a non-empty address exists.
  */
+/**
+ * Config handed to midnight-js' `httpClientProofProvider`: `{ timeout }` when
+ * `proofTimeoutMs` is set, else undefined (the SDK's 5 min default).
+ */
+export function proofProviderConfig(opts) {
+    return opts?.proofTimeoutMs ? { timeout: opts.proofTimeoutMs } : undefined;
+}
+
 export function readDeployAddress(tx) {
     const intents = tx?.intents;
     if (!intents || typeof intents.entries !== 'function') {
@@ -349,6 +361,9 @@ export async function createTxBuilder(opts) {
     if (opts.provingMode === 'server' && !opts.proofServerUrl) {
         throw new Error("createTxBuilder: provingMode 'server' requires proofServerUrl (a proof server YOU run; it receives the witnesses)");
     }
+    if (opts.proofTimeoutMs !== undefined && !(Number.isInteger(opts.proofTimeoutMs) && opts.proofTimeoutMs > 0)) {
+        throw new Error(`createTxBuilder: proofTimeoutMs must be a positive integer (ms), got ${String(opts.proofTimeoutMs)}`);
+    }
     const cacheDir = opts.zkConfigDir ?? opts.cacheDir ?? join(homedir(), '.cache', 'nightgate-txbuilder', contractName);
 
     // 1. Proving assets: fetch once, then offline. The verifier keys must
@@ -442,7 +457,8 @@ export async function createTxBuilder(opts) {
     const provingMode = opts.provingMode === 'server' ? 'server' : 'wasm';
     if (provingMode === 'server') {
         const { httpClientProofProvider } = await import('@midnight-ntwrk/midnight-js-http-client-proof-provider');
-        proofProvider = httpClientProofProvider(opts.proofServerUrl, zkConfigProvider);
+        // One proof request's HTTP timeout; the SDK's default is 5 min.
+        proofProvider = httpClientProofProvider(opts.proofServerUrl, zkConfigProvider, proofProviderConfig(opts));
     } else {
         const { buildWasmProofProvider } = require('../../srv/midnight/wasm-proof-provider.js');
         proofProvider = await buildWasmProofProvider(zkConfigProvider);

@@ -10,3 +10,11 @@ test
 @cds-models
 *.log
 npm-debug.log*
+# local experiments and deploy-time copies of foreign contracts (see .gitignore)
+scratch
+contracts/ping
+contracts/mint
+contracts/mint2
+contracts/mint3
+contracts/mint4
+OPERATIONS.local.md

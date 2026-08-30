@@ -50,6 +50,19 @@ export function effectiveModuleFormat(artifactPath: string): ModuleFormat {
 }
 
 /**
+ * The node_modules directory this process resolves `@midnight-ntwrk/compact-runtime`
+ * from. A snapshot or probe directory links its own `node_modules` here, so a
+ * Compact-emitted module imports the pinned runtime from wherever it was copied
+ * (a consumer's artifact directory needs no node_modules of its own).
+ */
+export function runtimeNodeModulesDir(): string {
+    const resolved = require.resolve('@midnight-ntwrk/compact-runtime');
+    const idx = resolved.lastIndexOf(`${path.sep}node_modules${path.sep}`);
+    if (idx < 0) throw new Error(`cannot locate the node_modules directory of @midnight-ntwrk/compact-runtime (resolved to ${resolved})`);
+    return resolved.slice(0, idx + `${path.sep}node_modules`.length);
+}
+
+/**
  * `legacyModuleFormat`: the pre-0.21 digest without the module-format section.
  * Only a CommonJS artifact differs; ESM forms are byte-identical. Keeps 0.20
  * jobs and evidence on unchanged CommonJS artifacts acceptable.

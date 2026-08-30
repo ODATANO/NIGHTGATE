@@ -34,7 +34,8 @@ import crypto from 'node:crypto';
 import { pathToFileURL } from 'node:url';
 import { classificationHaystack, formatErr, formatErrWithCauses, safeDeepInspect } from '../utils/format-error';
 import { deriveIndexerWsUrl } from '../utils/indexer-url';
-import { computeArtifactGenerationDigest, effectiveModuleFormat } from '../submission/artifact-digest';
+import { proofRequestTimeoutMs } from '../utils/proof-timeout';
+import { computeArtifactGenerationDigest, effectiveModuleFormat, runtimeNodeModulesDir } from '../submission/artifact-digest';
 import { runBatchInScope } from './batch-call-scope';
 import { buildWasmProofProvider, getSharedKeyMaterialProvider } from './wasm-proof-provider';
 import {
@@ -391,14 +392,6 @@ export function __resetArtifactSnapshotsForTests(): void {
 function snapshotTtlMs(): number {
     const days = Number(process.env.NIGHTGATE_ARTIFACT_SNAPSHOT_TTL_DAYS);
     return (Number.isFinite(days) && days >= 0 ? days : 14) * 24 * 60 * 60 * 1000;
-}
-
-/** The node_modules directory the worker itself resolves compact-runtime from. */
-function runtimeNodeModulesDir(): string {
-    const resolved = require.resolve('@midnight-ntwrk/compact-runtime');
-    const idx = resolved.lastIndexOf(`${path.sep}node_modules${path.sep}`);
-    if (idx < 0) throw new Error(`cannot locate the node_modules directory of @midnight-ntwrk/compact-runtime (resolved to ${resolved})`);
-    return resolved.slice(0, idx + `${path.sep}node_modules`.length);
 }
 
 /** Once per process: create the root, link its node_modules, sweep stale snapshots and leftover temp builds. */
@@ -846,7 +839,7 @@ function buildWorkerContractProviders(args: {
                 proofProvider = await buildWasmProofProvider(zkConfigProvider);
                 log('info', 'contract proving: in-process (wasm), proof server not used');
             } else {
-                proofProvider = proof.httpClientProofProvider(args.proofServerUrl, zkConfigProvider, { timeout: Number(process.env.NIGHTGATE_PROOF_TIMEOUT_MS || 300000) }); // MZCASH: proof HTTP timeout override (default 5 min = midnight-js DEFAULT_TIMEOUT)
+                proofProvider = proof.httpClientProofProvider(args.proofServerUrl, zkConfigProvider, { timeout: proofRequestTimeoutMs() });
             }
             return { zkConfigProvider, proofProvider };
         })();
@@ -1477,6 +1470,105 @@ async function logTxCost(tx: any, site: string): Promise<void> {
     }
 }
 
+// ---- Same-transaction resend on a transport failure -----------------------
+//
+// A proof is bound to its transaction. When the SEND fails (the RPC closed the
+// websocket at submit, connection reset, no reply), the finalized bytes are
+// still valid and nothing needs re-proving; re-running the job rebuilt and
+// re-proved the call instead (live preprod 2026-08-30: a 13 min relation
+// proof twice for one `1000 Normal Closure`). The facade reverts its pending
+// bookkeeping on any submit failure and re-pends on the next
+// submitTransaction, so the SAME tx object is handed back to it. A send whose
+// reply was lost may still have reached the node, so the indexer is asked for
+// the identifier before every resend and after a reject of a resend; a landed
+// transaction is reported as submitted (the SDK reads its apply status from
+// the indexer as usual). Real rejects (pre-mempool, on-chain) are never resent.
+function submitTransportRetries(): number {
+    const n = Number(process.env.NIGHTGATE_SUBMIT_TRANSPORT_RETRIES);
+    return Number.isFinite(n) && n >= 0 ? Math.floor(n) : 2;
+}
+function submitTransportBackoffMs(): number {
+    const n = Number(process.env.NIGHTGATE_SUBMIT_TRANSPORT_BACKOFF_MS);
+    return Number.isFinite(n) && n >= 0 ? n : 5_000;
+}
+function submitLandedProbeMs(): number {
+    const n = Number(process.env.NIGHTGATE_SUBMIT_LANDED_PROBE_MS);
+    return Number.isFinite(n) && n >= 0 ? n : 30_000;
+}
+
+/**
+ * The send itself failed (socket closed, reset, refused, timed out, no
+ * reply); never a node reject. Runs only on the submit call, so any timeout
+ * wording here is the submit's own (the proof round is over by then).
+ */
+export function isSubmitTransportFailure(err: unknown): boolean {
+    if (isPreMempoolReject(err)) return false;
+    return /disconnected from|Normal Closure|Abnormal Closure|WebSocket is not connected|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EPIPE|socket hang up|Unable to connect|TimeoutError|TimeoutException|timed? ?out|no reply|no response|request timeout/i
+        .test(classificationHaystack(err));
+}
+
+/**
+ * A transaction found on the indexer after a lost reply: in a block, but
+ * its call did not apply (ledger result FAILURE / PARTIAL_SUCCESS; the
+ * guaranteed part, i.e. the fee, went through). Named like the SDK's own
+ * error for the same outcome so the main-thread classification
+ * (`TxFailed`, not retryable) applies.
+ */
+export class LandedTxFailedError extends Error {
+    constructor(identifier: string, height: string, status: string, failedSegments: number[]) {
+        super(`TxFailedError: transaction ${identifier.slice(0, 16)} is in block ${height} but did not apply (ledger result ${status}, failed segment${failedSegments.length === 1 ? '' : 's'} ${failedSegments.join(',') || '?'}); the fee was spent, the call must be rebuilt against the current contract state`);
+        this.name = 'TxFailedError';
+    }
+}
+function landedOrThrow(found: { height: string; status: string | null; failedSegments: number[] }, identifier: string, site: string, how: string): string {
+    if (found.status && found.status !== 'SUCCESS') throw new LandedTxFailedError(identifier, found.height, found.status, found.failedSegments);
+    log('info', `${site}: transaction ${identifier.slice(0, 16)} is in block ${found.height} (${found.status ?? 'status n/a'}) ${how}; landed`);
+    return identifier;
+}
+
+function txIdentifierOf(tx: any): string | null {
+    try {
+        const id = typeof tx?.identifiers === 'function' ? tx.identifiers().at(-1) : undefined;
+        return id == null ? null : String(id);
+    } catch { return null; }
+}
+
+/** Poll the indexer for the identifier for up to `windowMs`; null when it is not there. */
+async function waitLandedOnIndexer(entry: FacadeEntry, identifier: string, windowMs: number) {
+    const deadline = Date.now() + windowMs;
+    for (;;) {
+        const found = await indexerBlockOfIdentifier(entry.indexerHttpUrl, identifier);
+        if (found) return found;
+        if (Date.now() >= deadline) return null;
+        await new Promise((r) => setTimeout(r, Math.min(5_000, Math.max(0, deadline - Date.now()))));
+    }
+}
+
+async function submitSameTxWithTransportRetry(entry: FacadeEntry, tx: any, site: string): Promise<any> {
+    const retries = submitTransportRetries();
+    const identifier = txIdentifierOf(tx);
+    for (let attempt = 0; ; attempt++) {
+        try {
+            return await entry.facade.submitTransaction(tx);
+        } catch (e) {
+            if (attempt > 0 && identifier && !isSubmitTransportFailure(e)) {
+                // The resend was refused (a validity reject, `1013 Already Imported`,
+                // anything but transport): the send whose reply was lost may have
+                // reached the node after all, and the same bytes are then a replay.
+                const found = await waitLandedOnIndexer(entry, identifier, submitLandedProbeMs());
+                if (found) return landedOrThrow(found, identifier, site, 'although the resend was refused');
+                throw e;
+            }
+            if (!identifier || attempt >= retries || !isSubmitTransportFailure(e)) throw e;
+            log('warn', `${site}: submit transport failure (send ${attempt + 1}/${retries + 1}): ${formatErrWithCauses(e).slice(0, 300)}; ` +
+                `checking the indexer for ${identifier.slice(0, 16)}, then resending the SAME transaction (no rebuild, no re-proving)`);
+            const found = await waitLandedOnIndexer(entry, identifier, submitLandedProbeMs());
+            if (found) return landedOrThrow(found, identifier, site, 'although the submit reply was lost');
+            await new Promise((r) => setTimeout(r, submitTransportBackoffMs()));
+        }
+    }
+}
+
 /**
  * facade.submitTransaction with the dust-wedge protection applied: a
  * pre-mempool reject restores the pre-build dust snapshot, every other
@@ -1487,7 +1579,7 @@ async function logTxCost(tx: any, site: string): Promise<void> {
 async function submitWithDustGuard(entry: FacadeEntry, tx: any, site: string): Promise<any> {
     await logTxCost(tx, site);
     try {
-        const txId = await entry.facade.submitTransaction(tx);
+        const txId = await submitSameTxWithTransportRetry(entry, tx, site);
         entry.preSubmitDustSnapshot = undefined;
         return txId;
     } catch (e) {
@@ -2085,6 +2177,57 @@ function offerNonEmpty(offer: any): boolean {
     return !sawKnownKey;
 }
 
+function normalizeTokenType(t: unknown): string {
+    return String(t ?? '').trim().toLowerCase().replace(/^0x/, '');
+}
+
+/**
+ * A zswap offer the sponsor may pay for: every net value change (`deltas`,
+ * public per token type) is on an allow-listed type and never NIGHT, every
+ * contract-owned coin belongs to a sponsorable contract, and there IS a net
+ * change OR a contract-owned coin. Outputs to users are commitments (type
+ * and recipient hidden), and the ledger drops zero deltas, so an offer that
+ * nets to zero says nothing about what it moves and is refused, UNLESS a coin
+ * in it is owned by a sponsorable contract: then the call itself moved the
+ * value (`receiveShielded` + `sendImmediateShielded`, i.e. a burn, nets to
+ * zero by construction: user input, contract transient, burn-address
+ * output). A transfer of an allow-listed type between users riding along
+ * with a net change is accepted by design (the sponsor pays dust, no sponsor
+ * value moves). Unreadable structure refuses.
+ */
+function checkOfferTokens(offer: any, key: string, tokenTypes: string[], nightType: string | undefined, contractSponsorable: (address: string) => boolean): void {
+    const deltas = offer?.deltas;
+    const entries: Array<[unknown, unknown]> | null = typeof deltas?.entries === 'function'
+        ? Array.from(deltas.entries() as Iterable<[unknown, unknown]>)
+        : (Array.isArray(deltas) ? deltas as Array<[unknown, unknown]> : null);
+    if (!entries) throw new Error(`refusing to sponsor: ${key} exposes no deltas (token types not inspectable)`);
+    if (entries.length === 0) {
+        const contractCoin = ['inputs', 'outputs', 'transients', 'transient'].some((coll) =>
+            Array.isArray(offer?.[coll]) && offer[coll].some((coin: any) => coin?.contractAddress !== undefined && coin?.contractAddress !== null));
+        if (!contractCoin) {
+            throw new Error(`refusing to sponsor: ${key} nets to zero and carries no contract-owned coin (a shielded transfer alongside the call, not value the call moves)`);
+        }
+        // else: the contract received/spent a coin in this offer; its owner is checked below.
+    }
+    for (const [rawType] of entries) {
+        const type = normalizeTokenType(rawType);
+        if (nightType && type === nightType) throw new Error(`refusing to sponsor: ${key} moves NIGHT`);
+        if (!tokenTypes.includes(type)) throw new Error(`refusing to sponsor: ${key} moves token type ${type.slice(0, 16)}…, not in allowedTokenTypes`);
+    }
+    for (const coll of ['inputs', 'outputs', 'transients', 'transient']) {
+        const list = offer?.[coll];
+        if (!Array.isArray(list)) continue;
+        for (const coin of list) {
+            const owner = coin?.contractAddress;
+            if (owner === undefined || owner === null) continue;
+            const address = String(owner);
+            if (!address || !contractSponsorable(address)) {
+                throw new Error(`refusing to sponsor: ${key} carries a coin owned by contract ${address.slice(0, 16)}…, which is not sponsorable here`);
+            }
+        }
+    }
+}
+
 /** Default sponsor size budget; a single vault call is ~5.4 KB. */
 const DEFAULT_SPONSOR_MAX_TX_BYTES = 65536;
 // A sponsored deploy's own ceiling: verifier keys cost a multiple of a call; the ledger caps written bytes at 32 KiB.
@@ -2112,8 +2255,16 @@ export function checkSponsorableShape(
     // new), recorded onto the grant afterwards. `maxDeploys` caps deploys per tx (default 1).
     // `ownContracts`: addresses deployed under the requesting grant; calls on them
     // skip the circuit list (their circuits are the caller's, not the floor's).
-    options: { allowDeploy?: boolean; maxDeploys?: number; ownContracts?: string[] } = {}
+    // `allowedTokenTypes`: raw shielded token types whose zswap offers pass
+    // (checkOfferTokens); absent/empty = any non-empty offer refuses.
+    // `nightTokenType`: the network's NIGHT raw type, never sponsorable in an offer.
+    options: { allowDeploy?: boolean; maxDeploys?: number; ownContracts?: string[]; allowedTokenTypes?: string[]; nightTokenType?: string } = {}
 ): Array<{ address: string; entryPoint: string }> {
+    const tokenTypes = (options.allowedTokenTypes ?? []).map(normalizeTokenType);
+    const nightType = options.nightTokenType ? normalizeTokenType(options.nightTokenType) : undefined;
+    const contractSponsorable = (address: string): boolean =>
+        !allowedContracts?.length || allowedContracts.includes(address)
+        || (Array.isArray(options.ownContracts) && options.ownContracts.includes(address));
     const maxDeploysPerTx = Number.isInteger(options.maxDeploys) && (options.maxDeploys as number) >= 0 ? (options.maxDeploys as number) : 1;
     let deployCount = 0;
     // A misconfigured budget must not DISABLE the budget ('abc' or 'Infinity'
@@ -2133,16 +2284,18 @@ export function checkSponsorableShape(
     if (!intents || typeof intents.entries !== 'function') {
         throw new Error('refusing to sponsor: transaction structure is not inspectable (no intents)');
     }
-    // Value moves riding along at the transaction level (zswap).
+    // Value moves riding along at the transaction level (zswap): refused,
+    // unless the policy names the token types the call itself moves.
     for (const key of ['guaranteedOffer', 'fallibleOffer', 'guaranteedCoins', 'fallibleCoins']) {
         const offer = (tx as any)[key];
         if (offer === undefined || offer === null) continue;
-        if (typeof offer?.entries === 'function' && !('inputs' in offer)) {
-            for (const [, sub] of Array.from(offer.entries() as Iterable<[unknown, unknown]>)) {
-                if (offerNonEmpty(sub)) throw new Error(`refusing to sponsor: transaction carries a ${key} (shielded value transfer)`);
-            }
-        } else if (offerNonEmpty(offer)) {
-            throw new Error(`refusing to sponsor: transaction carries a ${key} (shielded value transfer)`);
+        const parts: unknown[] = typeof offer?.entries === 'function' && !('inputs' in offer)
+            ? Array.from(offer.entries() as Iterable<[unknown, unknown]>).map(([, sub]) => sub)
+            : [offer];
+        for (const part of parts) {
+            if (!offerNonEmpty(part)) continue;
+            if (tokenTypes.length === 0) throw new Error(`refusing to sponsor: transaction carries a ${key} (shielded value transfer)`);
+            checkOfferTokens(part, key, tokenTypes, nightType, contractSponsorable);
         }
     }
 
@@ -3383,9 +3536,16 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
             (sum: bigint, c: any) => sum + (typeof c?.generatedNow === 'bigint' ? c.generatedNow : 0n), 0n
         );
 
+        // Every OTHER shielded token type the wallet holds (contract-minted
+        // custom tokens, e.g. a wrapped asset): raw token type hex -> atoms.
+        const shieldedTokens = Object.entries(shieldedBalances)
+            .filter(([tokenType, amount]) => tokenType !== nightRawType && amount > 0n)
+            .map(([tokenType, amount]) => ({ tokenType, amount: amount.toString() }));
+
         return {
             shieldedNight: shieldedNight.toString(),
             unshieldedNight: unshieldedNight.toString(),
+            shieldedTokens,
             dustBalance: dustBalance.toString(),
             registeredNightUtxoCount: registeredCount,
             totalNightUtxoCount: totalNightCoins.length,
@@ -3829,7 +3989,7 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
      */
     async sponsorFinalizedTx(args: {
         sponsorSessionId: string; finalizedTxB64: string; networkId: string;
-        allowedContracts?: string[]; allowedCircuits?: string[]; allowDeploy?: boolean; ownContracts?: string[];
+        allowedContracts?: string[]; allowedCircuits?: string[]; allowDeploy?: boolean; ownContracts?: string[]; allowedTokenTypes?: string[];
         /** Set by the dispatcher: the RPC reply port, for the pre-broadcast submit-intent handshake. */
         __replyPort?: MessagePort;
     }) {
@@ -3842,7 +4002,7 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
         // Policy: FAIL-CLOSED shape check. Allow-listed contract calls are the
         // only thing a sponsorable tx may contain; deploys, token transfers,
         // caller dust, oversized or uninspectable transactions all refuse.
-        const calls = checkSponsorableShape(tx, bytes.length, args.allowedContracts, args.allowedCircuits, { allowDeploy: args.allowDeploy === true, ownContracts: args.ownContracts });
+        const calls = checkSponsorableShape(tx, bytes.length, args.allowedContracts, args.allowedCircuits, { allowDeploy: args.allowDeploy === true, ownContracts: args.ownContracts, allowedTokenTypes: args.allowedTokenTypes, nightTokenType: sdk.ledger.nativeToken().raw });
         log('info', `sponsorFinalizedTx: paying dust for ${calls.map(c => c.entryPoint).join('+')} (${bytes.length}B)`);
         const txId = await sponsorAndSubmitFinalized(sponsor, tx, 'sponsor-endpoint', args.__replyPort, calls);
         log('info', `sponsorFinalizedTx: LANDED txHash=${txId.slice(0, 16)}`);
@@ -3875,7 +4035,7 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
      */
     async sponsorUnboundTx(args: {
         sponsorSessionId: string; unboundTxB64: string; networkId: string;
-        allowedContracts?: string[]; allowedCircuits?: string[]; allowDeploy?: boolean; ownContracts?: string[];
+        allowedContracts?: string[]; allowedCircuits?: string[]; allowDeploy?: boolean; ownContracts?: string[]; allowedTokenTypes?: string[];
         /** Set by the dispatcher: the RPC reply port, for the pre-broadcast submit-intent handshake. */
         __replyPort?: MessagePort;
     }) {
@@ -3886,7 +4046,7 @@ const handlers: Record<string, (args: any) => Promise<unknown>> = {
         const { tx: callerTx, bytes } = await deserializeFinalizedTx(args.unboundTxB64);
 
         // Same fail-closed shape policy as the bound path.
-        const calls = checkSponsorableShape(callerTx, bytes.length, args.allowedContracts, args.allowedCircuits, { allowDeploy: args.allowDeploy === true, ownContracts: args.ownContracts });
+        const calls = checkSponsorableShape(callerTx, bytes.length, args.allowedContracts, args.allowedCircuits, { allowDeploy: args.allowDeploy === true, ownContracts: args.ownContracts, allowedTokenTypes: args.allowedTokenTypes, nightTokenType: sdk.ledger.nativeToken().raw });
 
         await waitForGenuineSync(sponsor, BALANCE_SYNC_TIMEOUT_MS, 'sponsor-unbound');
 

@@ -24,6 +24,7 @@ import {
     isCloseSessionsOnRestartEnabled,
     resolveSubmissionEndpoints,
     resolveEffectiveProvingMode,
+    resolveProofTimeoutMs,
     deriveIndexerWsUrl,
     DEFAULT_INDEXER_URLS
 } from '../../srv/utils/nightgate-config';
@@ -371,6 +372,29 @@ describe('resolveOverrideIndexerEndpoints (cross-network verify indexer endpoint
         delete process.env.NIGHTGATE_INDEXER_WS_URL;
         expect(eps.indexerHttpUrl).toBe(DEFAULT_INDEXER_URLS.mainnet.http);
         expect(eps.indexerWsUrl).toBe(DEFAULT_INDEXER_URLS.mainnet.ws);
+    });
+});
+
+describe('resolveProofTimeoutMs', () => {
+    afterEach(() => { delete process.env.NIGHTGATE_PROOF_TIMEOUT_MS; });
+
+    test('defaults to the midnight-js 5 min proof request timeout', () => {
+        expect(resolveProofTimeoutMs(undefined)).toBe(300_000);
+        expect(resolveProofTimeoutMs({})).toBe(300_000);
+    });
+
+    test('proofTimeoutMs from the cds config, invalid values ignored', () => {
+        expect(resolveProofTimeoutMs({ proofTimeoutMs: 7_200_000 })).toBe(7_200_000);
+        expect(resolveProofTimeoutMs({ proofTimeoutMs: '900000' })).toBe(900_000);
+        expect(resolveProofTimeoutMs({ proofTimeoutMs: 0 })).toBe(300_000);
+        expect(resolveProofTimeoutMs({ proofTimeoutMs: 'soon' })).toBe(300_000);
+    });
+
+    test('NIGHTGATE_PROOF_TIMEOUT_MS wins over the config', () => {
+        process.env.NIGHTGATE_PROOF_TIMEOUT_MS = '1200000';
+        expect(resolveProofTimeoutMs({ proofTimeoutMs: 7_200_000 })).toBe(1_200_000);
+        process.env.NIGHTGATE_PROOF_TIMEOUT_MS = 'x';
+        expect(resolveProofTimeoutMs({ proofTimeoutMs: 7_200_000 })).toBe(7_200_000);
     });
 });
 
