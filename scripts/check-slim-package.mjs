@@ -32,7 +32,10 @@ const exists = (p) => access(p).then(() => true, () => false);
 const EXPECTED = {
     '.': ['connect', 'int64', 'createTxBuilder', 'deriveIdentity', 'ensureZkAssets', 'ATTESTATION_VAULT_CIRCUITS'],
     './client': ['connect', 'int64', 'NightgateApiError', 'NightgateJobError'],
-    './txbuilder': ['createTxBuilder', 'deriveIdentity', 'ensureZkAssets'],
+    './txbuilder': ['createTxBuilder', 'deriveIdentity', 'ensureZkAssets',
+        'deserializeTransaction', 'txIdentifiers', 'submitFinalized', 'submitExtrinsic',
+        'classifyNodeReject', 'isPreMempoolReject', 'isTransportFailure', 'isAlreadyImported',
+        'probeLanded', 'waitLanded', 'withDustGuard', 'nodeHttpUrlFor'],
     './calls': ['prepareAttest', 'prepareAnchorContentRoot', 'prepareProveFieldMembership',
         'buildAttestationVaultWitnesses', 'generateAttestationSecret', 'CONTRACTS'],
     './attestation-vault': ['Contract', 'pureCircuits', 'ledger'],

@@ -34,6 +34,13 @@ import { homedir } from 'node:os';
 
 const require = createRequire(import.meta.url);
 
+// Self-funded submission (pay your own dust, submit to the node yourself).
+export {
+    deserializeTransaction, txIdentifiers, submitFinalized, submitExtrinsic,
+    classifyNodeReject, isPreMempoolReject, isTransportFailure, isAlreadyImported,
+    probeLanded, waitLanded, withDustGuard, nodeHttpUrlFor
+} from './submit.mjs';
+
 /** Circuits whose proving assets are fetched by default (the vault's set). */
 export const ATTESTATION_VAULT_CIRCUITS = [
     'attest', 'attestGuarded', 'anchorContentRoot', 'bindPassport', 'registerPassport',
@@ -119,6 +126,17 @@ export async function ensureZkAssets({ zkConfigBaseUrl, cacheDir, circuits = ATT
  *    dust tx cannot merge into a bound tx, so parallel sponsoring REQUIRES
  *    the unbound handover.
  */
+/**
+ * A single call honors its `before` hook exactly like a batch entry: the hook
+ * swaps this call's state into the shared witnesses right before proving. A
+ * batch split into single-call transactions keeps working unchanged.
+ */
+// Exported for the unit tests only (not in the .d.ts).
+export async function runSingleCall(single, fn) {
+    if (typeof single.before === 'function') single.before();
+    return fn(...(single.args ?? []));
+}
+
 // Exported for the unit tests only (not in the .d.ts): the handover rules live here.
 export function buildOnlyWalletProvider(facade, zswapKeys, dustKey, keystore, holder, ttlMinutes, bind) {
     return {
@@ -616,7 +634,7 @@ export async function createTxBuilder(opts) {
                 // The build-only provider stops at submit; the SDK wraps that error,
                 // so only an EMPTY holder means a real build failure.
                 try {
-                    await fn(...(single.args ?? []));
+                    await runSingleCall(single, fn);
                 } catch (e) {
                     if (!holder.captured) throw e;
                 }

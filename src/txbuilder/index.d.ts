@@ -7,7 +7,7 @@ export interface PreparedCall {
     args: Array<Uint8Array | bigint | boolean[]>;
     /** The contract's witness functions. Optional on a batch entry when the batch carries shared `witnesses`. */
     witnesses?: object;
-    /** Batch only: runs immediately before this call, to swap per-call state in the shared witnesses. */
+    /** Runs immediately before this call is proven (single call and batch entry alike), to swap per-call state in the shared witnesses. */
     before?: () => void;
     /**
      * Raw proof bundle passthrough (proof helpers only): the batch path
@@ -223,6 +223,94 @@ export type BuiltDeploy = BuiltBoundDeploy | BuiltUnboundDeploy;
 /** `{ timeout }` for the SDK's proof provider when `proofTimeoutMs` is set, else undefined. */
 export declare function proofProviderConfig(opts: { proofTimeoutMs?: number } | undefined): { timeout: number } | undefined;
 export declare function readDeployAddress(tx: unknown): string;
+
+// ---- self-funded submission (pay your own dust, submit to the node yourself)
+
+/** A deserialized ledger transaction; opaque here (the ledger package owns the type). */
+export interface LedgerTransaction {
+    serialize(): Uint8Array;
+    identifiers(): Iterable<unknown>;
+}
+
+/** Deserializes bytes or base64 into a ledger `Transaction` (bound tags first, then pre-binding). */
+export declare function deserializeTransaction(bytesOrB64: Uint8Array | string): Promise<LedgerTransaction>;
+/** The transaction's identifiers; the LAST one is what the indexer's `transactions(offset:{identifier})` takes. */
+export declare function txIdentifiers(tx: LedgerTransaction): string[];
+
+export interface SubmitOptions {
+    /** The node WebSocket RPC, e.g. `wss://rpc.preprod.midnight.network/`. */
+    nodeUrl: string;
+    /** HTTP RPC for the extrinsic encoding; derived from `nodeUrl` by protocol swap when omitted. */
+    nodeHttpUrl?: string;
+    /** One-shot submit timeout, default 30000 ms. On timeout the transaction MAY be in the mempool: probe before resending. */
+    timeoutMs?: number;
+    /** Test seam / custom WebSocket class; defaults to `ws`. */
+    WebSocketImpl?: Function;
+}
+
+/**
+ * Submit a finalized (bound, fee-paid) transaction: encodes the
+ * `midnight.sendMnTransaction` extrinsic over HTTP, submits over a one-shot
+ * WebSocket (the node's HTTP gateway 403s bodies over ~14 KB). Returns the
+ * extrinsic hash. Needs `@polkadot/api` (optional peer dependency).
+ */
+export declare function submitFinalized(tx: LedgerTransaction | Uint8Array | string, opts: SubmitOptions): Promise<string>;
+/** The WebSocket half of `submitFinalized`, for an already-encoded extrinsic. */
+export declare function submitExtrinsic(extrinsicHex: string, opts: SubmitOptions): Promise<string>;
+/** `wss://` -> `https://` (and ws -> http); http(s) passes through. */
+export declare function nodeHttpUrlFor(nodeUrl: string): string;
+
+export interface NodeRejectClassification {
+    /**
+     * 'stale-dust-proof' (170/171/196): re-sync the dust wallet, rebuild, resubmit; the wallet is NOT out of dust.
+     * 'funds' (138/173, "could not balance dust"): the wallet cannot pay; retrying buys nothing.
+     * 'sequencing' (219-224, 188): split the batch into single-call transactions.
+     * 'malformed' (117): neither waiting nor an identical rebuild fixes it.
+     * 'unknown': a 1010 this table does not know, or not a coded reject.
+     */
+    kind: 'stale-dust-proof' | 'funds' | 'sequencing' | 'malformed' | 'unknown';
+    subCode: number | null;
+}
+
+/** What a node reject means, from the ledger sub-code in the error's message or cause chain. */
+export declare function classifyNodeReject(err: unknown): NodeRejectClassification;
+/** 1010/1014/1016: the transaction provably never entered the mempool (fee unspent). NOT 1013 (already imported). */
+export declare function isPreMempoolReject(err: unknown): boolean;
+/** The SEND failed (socket closed/reset, no reply): probe the indexer, then resend the SAME bytes; never rebuild on transport alone. */
+export declare function isTransportFailure(err: unknown): boolean;
+/** 1013 Transaction Already Imported: the transaction IS in the pool. Expected after a resend whose first reply was lost; go to the confirmation loop, never treat it as a failure. */
+export declare function isAlreadyImported(err: unknown): boolean;
+
+export interface LandedProbeResult {
+    height: string;
+    status: string;
+    failedSegments: number[];
+    /** true only for ledger result SUCCESS; false: in a block but the call did NOT apply (fee spent, rebuild against current state). */
+    applied: boolean;
+}
+
+/** Ask the indexer whether the transaction with this identifier landed; null while unknown (not indexed yet, an HTTP/GraphQL error, or a partial answer without a transaction result). Confirm by identifier, never by watching the contract address. */
+export declare function probeLanded(identifier: string, opts: { indexerHttpUrl: string, fetchFn?: typeof fetch, timeoutMs?: number }): Promise<LandedProbeResult | null>;
+/** `probeLanded` in a bounded loop (one probe minimum; `timeoutMs` default 30000, `pollMs` default 5000). Run it before trusting the refusal of a RESEND: any reject of resent bytes can mean the first send landed while the indexer still lags. */
+export declare function waitLanded(identifier: string, opts: { indexerHttpUrl: string, timeoutMs?: number, pollMs?: number, fetchFn?: typeof fetch }): Promise<LandedProbeResult | null>;
+
+export interface DustGuardOptions {
+    /** The configuration object the facade was created with. */
+    configuration: object;
+    /** The dust secret key the facade runs on. */
+    dustKey: unknown;
+    /** Your own `(configuration) => DustWallet`; defaults to the SDK's. */
+    dustWalletFactory?: (configuration: object) => { restore(snapshot: unknown): { start(dustKey: unknown): Promise<unknown> } };
+}
+
+/**
+ * Dust wedge protection around ONE dust-spending build + submit: snapshots the
+ * facade's dust sub-wallet before `fn` and, on a pre-mempool reject, swaps in
+ * a wallet restored from the snapshot (the rethrown error carries
+ * `dustRestored: true`). The caller owns persistence: never persist a
+ * post-reject dust state. One guarded build per facade at a time.
+ */
+export declare function withDustGuard<T>(facade: { dust: object }, opts: DustGuardOptions, fn: () => Promise<T>): Promise<T>;
 
 export declare const ATTESTATION_VAULT_CIRCUITS: string[];
 export declare function ensureZkAssets(input: EnsureZkAssetsInput): Promise<ZkAssetResult>;

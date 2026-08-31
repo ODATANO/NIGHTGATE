@@ -1,6 +1,6 @@
 {
   "name": "@odatano/nightgate",
-  "version": "0.22.0",
+  "version": "0.22.1",
   "description": "CAP Plugin: Midnight Blockchain Indexer with OData V4 API",
   "homepage": "https://github.com/ODATANO/NIGHTGATE#readme",
   "repository": {
@@ -222,10 +222,14 @@
   },
   "peerDependencies": {
     "@midnight-ntwrk/dapp-connector-api": "^4.0.0",
+    "@polkadot/api": ">=14",
     "@sap/cds": ">=10 <11"
   },
   "peerDependenciesMeta": {
     "@midnight-ntwrk/dapp-connector-api": {
+      "optional": true
+    },
+    "@polkadot/api": {
       "optional": true
     }
   },

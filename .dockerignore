@@ -2,13 +2,28 @@
 node_modules
 db/*.db
 db/*.db-*
-.env
-.env.*
+# mirrors .gitignore: hand-taken DB backups, schema-delta/VACUUM copies and
+# wallet-state dumps carry live operational data and must never enter an image
+db/*.bak
+db/*.bak-*
+db/*.backup-*
+db/backup-*
+db/walletstate-*.json
+**/*.sqlite
+**/*.sqlite-shm
+**/*.sqlite-wal
+# recursive: a real .env next to deploy templates (deploy/contabo/) must
+# never enter the context either; only the committed examples are allowed in
+**/.env
+**/.env.*
+!**/.env.example
 coverage
 docs
 test
 @cds-models
-*.log
+# .dockerignore patterns are rooted (unlike .gitignore): **/ is needed to
+# catch logs in subdirectories, e.g. local serve logs under db/
+**/*.log
 npm-debug.log*
 # local experiments and deploy-time copies of foreign contracts (see .gitignore)
 scratch

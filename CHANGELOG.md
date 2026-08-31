@@ -1,5 +1,44 @@
 # Changelog
 
+## 0.22.1 - 2026-08-31
+
+Single-call `before` hooks and self-funded submission, under
+`@odatano/nightgate/txbuilder` and `@odatano/nightgate-tx` 0.4.4 alike. No
+server behavior change, no schema change, no circuit change.
+
+- **`before` hooks run for single calls**: `buildSponsorable({ call })` (and a
+  one-entry `calls`) now invokes the call's `before` hook immediately before
+  proving, exactly like a batch entry. Previously the hook was batch-only: a
+  single call proved with the witnesses as they stood, and a batch split into
+  single-call transactions silently dropped its hooks; an unarmed witness
+  holder then proves value 0 with a zero salt, which on an insert-style
+  circuit lands as a commitment nobody can open.
+- **Self-funded submission** exports on `/txbuilder`, for callers that pay
+  their own dust and submit to the node themselves: `submitFinalized`
+  (extrinsic encoding over HTTP via `@polkadot/api`, a new optional peer
+  dependency; submit over a one-shot WebSocket, the node's HTTP gateway 403s
+  bodies over ~14 KB) plus `submitExtrinsic`, `deserializeTransaction`,
+  `txIdentifiers`, `probeLanded` (confirm by identifier, reports
+  `applied: false` for in-a-block-but-call-failed), `classifyNodeReject`
+  (170/171/196 stale dust proof, 138/173 funds, 219-224 sequencing, 117
+  malformed), `isPreMempoolReject`, `isTransportFailure` (probe, then resend
+  the SAME bytes), `isAlreadyImported` (1013 after a resend = the first send
+  reached the pool, confirm by identifier instead of failing), `waitLanded`
+  (`probeLanded` in a bounded loop; ANY refused resend can mean the first
+  send landed while the indexer lags, so wait for the identifier before
+  trusting the reject) and
+  `withDustGuard` (dust sub-wallet snapshot before a
+  build, restore on a pre-mempool reject). `probeLanded` reads a missing
+  transaction result, an HTTP failure or a GraphQL error as unknown (null),
+  never as applied; a socket close before the submit reply fails immediately
+  as transport instead of waiting out the timeout. Docs: `docs/txbuilder.md`,
+  "Self-funded submission"; the packaged README carries the same flow.
+- **Image chores**: `.dockerignore` mirrors the `.gitignore` rules for DB
+  backups, wallet-state dumps and env files, recursively (`**/.env*` with an
+  `.env.example` exception; dockerignore patterns are rooted, so `*.log` and
+  `.env.*` never covered subdirectories and a local `COPY . .` build shipped
+  operational data); compose default image tag 0.22.1.
+
 ## 0.22.0 - 2026-08-30
 
 Custom-token balances, struct circuit arguments, proof request timeout,

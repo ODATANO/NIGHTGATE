@@ -304,3 +304,107 @@ maintenance updates are never sponsored. The build fails unless the
 transaction carries exactly one deploy action with an address, so a returned
 `contractAddress` is always usable. Persist the initial private state
 yourself: the builder keeps it in memory only.
+
+## Self-funded submission (0.4.4)
+
+A caller that pays its own dust and submits to the node itself needs four
+things the build path does not cover: submitting the bytes, classifying a
+reject, confirming the landing, and surviving a reject without wedging its
+dust wallet. All four ship as exports of `@odatano/nightgate-tx/txbuilder`
+(and `@odatano/nightgate/txbuilder`); `submitFinalized` additionally needs
+`@polkadot/api` (an optional peer dependency) for the extrinsic encoding.
+
+`facade`, `configuration`, `zswapKeys` and `dustKey` below are your own
+wallet-sdk facade and the values it was created with (the runner that pays
+the fee); `builder` is a `createTxBuilder` instance.
+
+```js
+import {
+    deserializeTransaction, txIdentifiers, submitFinalized,
+    isTransportFailure, isAlreadyImported, waitLanded, withDustGuard
+} from '@odatano/nightgate-tx/txbuilder';
+
+const built = await builder.buildSponsorable({ contractAddress, calls, witnesses });
+const tx = await deserializeTransaction(built.finalizedTxB64);
+
+// Pay the fee from your own facade and submit, inside the dust guard so a
+// node reject cannot wedge the wallet.
+const landed = await withDustGuard(facade, { configuration, dustKey }, async () => {
+    const recipe = await facade.balanceFinalizedTransaction(
+        tx, { shieldedSecretKeys: zswapKeys, dustSecretKey: dustKey },
+        { ttl: new Date(Date.now() + 30 * 60_000), tokenKindsToBalance: ['dust'] }
+    );
+    const finalized = await facade.finalizeRecipe(recipe);
+    const identifier = txIdentifiers(finalized).at(-1);
+    const nodeUrl = 'wss://rpc.preprod.midnight.network/';
+    const indexerHttpUrl = 'https://indexer.preprod.midnight.network/api/v4/graphql';
+
+    // Submit. On a transport failure the transaction MAY be in the mempool:
+    // probe for the identifier, then resend the SAME bytes; never rebuild here.
+    for (let attempt = 0; ; attempt++) {
+        try { await submitFinalized(finalized, { nodeUrl }); break; }
+        catch (e) {
+            // 1013 Already Imported = the transaction IS in the pool (the
+            // first send reached it): go straight to the confirmation loop.
+            if (isAlreadyImported(e)) break;
+            // ANY other reject of a RESEND (e.g. a 1010 whose note the landed
+            // first send already spent) can mean the FIRST send is on chain
+            // while the indexer still lags: wait for the identifier before
+            // trusting the reject. A first-send reject gets one immediate
+            // probe (the reply may have been lost).
+            const found = await waitLanded(identifier, { indexerHttpUrl, timeoutMs: attempt > 0 ? 30_000 : 0 });
+            if (found) return found;
+            if (!isTransportFailure(e) || attempt >= 2) throw e;
+            await new Promise((r) => setTimeout(r, 5_000));
+        }
+    }
+
+    // Confirm by identifier (blocks are ~6 s apart; indexer lag is real).
+    const found = await waitLanded(identifier, { indexerHttpUrl, timeoutMs: 240_000, pollMs: 6_000 });
+    if (found) return found;
+    throw new Error('not visible on the indexer yet; it may still land');
+});
+if (!landed.applied) {
+    // In a block but the call failed: the fee was spent, rebuild against
+    // current contract state (classifyNodeReject explains node rejects).
+}
+```
+
+The rules these helpers encode, learned from rejected transactions:
+
+- **Submit over WebSocket.** The node's HTTP gateway rejects request bodies
+  over ~14 KB with a 403, and a proven contract call is bigger than that.
+  `submitFinalized` encodes the `midnight.sendMnTransaction` extrinsic over
+  HTTP (a metadata read, so a runtime upgrade cannot silently break the
+  encoding) and submits `author_submitExtrinsic` over a one-shot socket.
+- **A reject's sub-code is the whole diagnosis** (`classifyNodeReject`):
+  `stale-dust-proof` (170/171/196) means re-sync the dust wallet and rebuild,
+  the wallet is NOT out of dust; `funds` (138/173, "could not balance dust")
+  is the only shape that means out of dust; `sequencing` (219-224) is healed
+  by splitting the batch into single-call transactions; `malformed` (117) is
+  fixed by neither waiting nor an identical rebuild.
+- **Transport is not a reject** (`isTransportFailure`): a lost reply means the
+  transaction MAY be in the mempool. Probe the indexer for the identifier
+  (`probeLanded`), then resend the SAME bytes; a rebuild produces a second
+  valid transaction that can land next to the first. A resend answered with
+  `1013 Transaction Already Imported` (`isAlreadyImported`) means the FIRST
+  send reached the pool: confirm by identifier, never treat it as a failure.
+  Any OTHER refused resend can mean the same thing (the landed first send
+  already spent the note): run a bounded `waitLanded` before trusting the
+  reject, or a landed transaction reads as failed and a dust guard restores
+  a snapshot it must not.
+- **Confirm by identifier, never by watching the contract address**: on a
+  public contract someone else's call confirms yours otherwise. `probeLanded`
+  also reports `applied: false` (in a block, call failed, fee spent: rebuild
+  against current state).
+- **A pre-mempool reject leaks the spent dust note** inside the SDK's dust
+  wallet (upstream bug; the pending atoms accumulate until a funded wallet
+  cannot balance a fee). `withDustGuard` snapshots the dust sub-wallet before
+  the build and swaps in the restored wallet on such a reject. The caller
+  owns persistence: never persist a post-reject dust state, or a restart
+  restores the wedge. One guarded build per facade at a time.
+
+Create builders as often as you like, but with `walletSync: false` (the sync
+is pure cost when your own facade does the balancing) and `close()` them: on
+0.4.0 `close()` was a no-op and every builder leaked a genesis-syncing facade
+plus an indexer socket.

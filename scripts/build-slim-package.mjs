@@ -35,9 +35,10 @@ const FILES = [
     { path: 'src/sdk/index.d.ts' },
     { path: 'src/sdk/client.mjs' },
     { path: 'src/sdk/client.d.ts' },
-    // the local builder
+    // the local builder + self-funded submission
     { path: 'src/txbuilder/index.mjs' },
     { path: 'src/txbuilder/index.d.ts' },
+    { path: 'src/txbuilder/submit.mjs' },
     // the call/witness helpers (identical to @odatano/nightgate/browser)
     { path: 'src/browser/index.mjs' },
     { path: 'src/browser/index.d.ts' },
