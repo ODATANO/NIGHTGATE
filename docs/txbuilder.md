@@ -254,6 +254,21 @@ process and only the bytes going to the server.
   that is why it is an explicit opt-in and a bare `proofServerUrl` (documented
   as unused in 0.17) still does nothing. `builder.provingMode` tells you which
   mode is active.
+- **Memory is set by the circuit's k, not by the prover-key size.** Measured
+  on the vault's comparison circuit (offline, one prove per process): k=17
+  (38.5 MB prover key) peaks at 1.82 GB RSS, k=18 (72.9 MB) at 3.45 GB,
+  about 47x the key and doubling per k. The JS heap stays near 50 MB; the
+  rest is wasm linear memory, which never shrinks, so a long-lived process
+  stays at the high-water mark (a second prove adds ~46 MB) and
+  `--max-old-space-size` does not reach it. Two proves in one process
+  serialize and peak at the maximum, not the sum; each process or worker
+  has its own wasm memory, so size for the number of proving processes.
+  Read a circuit's k with `Zkir.deserialize(bzkir).getK()` from
+  `@midnight-ntwrk/zkir-v2`. Under `provingMode: 'server'` the client still
+  loads the prover key (it travels in every `/prove` request, so budget
+  about twice the key size transiently); the proving working set moves to
+  the proof server. Timer-based RSS sampling under-reads during a prove
+  (the event loop is blocked); use `process.resourceUsage().maxRSS`.
 - **`bind: false` refuses calls that need a balancing transaction** (the call
   moves shielded or unshielded value and the wallet had to add inputs): the
   sponsor binds the base transaction alone, so handing it over unbound would

@@ -83,6 +83,21 @@ export async function buildContractProviders(cfg: ContractProvidersConfig): Prom
     return { publicDataProvider, zkConfigProvider, proofProvider };
 }
 
+/**
+ * Storage password for the SDK's LevelDB private-state provider. midnight-js
+ * 4.1.1 validates it (16+ characters, three character classes, no run of
+ * more than three identical characters, no four-character sequence); the
+ * derived 64-char hex has two classes and can contain runs or sequences.
+ * Deterministic re-encoding that satisfies the rules for EVERY hex: byte
+ * pairs joined by '-' (no run beyond two, no alphanumeric sequence longer
+ * than two) plus a fixed mixed-case suffix. Level is the dev-only backend;
+ * a store written before 0.22.2 was keyed by the bare hex and does not open.
+ */
+export function levelStoragePassword(password: string): string {
+    const pairs = password.match(/.{1,2}/g) ?? [password];
+    return `${pairs.join('-')}-Ng`;
+}
+
 export async function buildFullProviderBundle(
     cfg: ContractProvidersConfig,
     wallet: WalletMaterial
@@ -109,7 +124,7 @@ export async function buildFullProviderBundle(
         const sdk = await loadMidnightSdk();
         privateStateProvider = sdk.level.levelPrivateStateProvider({
             accountId: wallet.accountId,
-            privateStoragePasswordProvider: checkedPasswordProvider
+            privateStoragePasswordProvider: async () => levelStoragePassword(await checkedPasswordProvider())
         });
     }
 

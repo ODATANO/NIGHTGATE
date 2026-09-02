@@ -194,6 +194,24 @@ The verification reads need none.
   to the sponsor promptly.
 - **Fetch prover keys from the host you submit to**: that pins the artifact
   generation to the actually deployed contract.
+- **Memory of in-process proving is set by the circuit's k, not the key
+  size.** Measured on the vault's comparison circuit: k=17 (38.5 MB prover
+  key) peaks at 1.82 GB RSS, k=18 (72.9 MB) at 3.45 GB, about 47x the key,
+  doubling per k. The JS heap stays near 50 MB; the rest is wasm linear
+  memory, which never shrinks, so a long-lived process stays at the
+  high-water mark (a second prove adds ~46 MB). Two proves in one process
+  serialize and peak at the maximum, not the sum; each process or worker
+  has its own wasm memory. `--max-old-space-size` does not reach it. Read a
+  circuit's k with `Zkir.deserialize(bzkir).getK()` from `@midnight-ntwrk/zkir-v2`.
+  Under `provingMode: 'server'` the client still loads the prover key (it
+  travels in every `/prove` request), the proving working set moves to the
+  proof server.
+- **Match the Midnight line.** 0.4.5 pins midnight-js 4.1.1, compact-js
+  2.5.1, ledger-v8 8.1.0, compact-runtime 0.16.0 and zkir-v2 2.1.0 exactly;
+  midnight-js 4.1.1 pins the same set through `midnight-js-protocol`. A
+  project on a different line ends up with two copies of a wasm-bearing
+  package, and the two reject each other's objects (`expected instance of
+  ContractMaintenanceAuthority`); align via `overrides` or upgrade.
 
 ## Relationship to NIGHTGATE and the MCP server
 

@@ -11,6 +11,7 @@ import type { Mock } from 'vitest';
 import {
     buildContractProviders,
     buildFullProviderBundle,
+    levelStoragePassword,
     type ContractProvidersConfig,
     type WalletMaterial
 } from '../../srv/midnight/providers';
@@ -144,6 +145,18 @@ describe('buildFullProviderBundle', () => {
         await expect(psp.set('x', { v: 1 })).rejects.toThrow(/at least 16 characters/);
     });
 
+    test('level backend receives the re-encoded storage password', async () => {
+        const hex = 'ab'.repeat(32);
+        await buildFullProviderBundle(validCfg, {
+            ...validWallet,
+            privateStateBackend: 'level',
+            privateStoragePasswordProvider: () => hex
+        });
+        const { level } = await loadMidnightSdk();
+        const lastCallCfg = (level.levelPrivateStateProvider as Mock).mock.calls.slice(-1)[0][0];
+        await expect(lastCallCfg.privateStoragePasswordProvider()).resolves.toBe(levelStoragePassword(hex));
+    });
+
     test('rejects short passwords at use time (level backend)', async () => {
         const bundle = await buildFullProviderBundle(validCfg, {
             ...validWallet,
@@ -161,5 +174,46 @@ describe('buildFullProviderBundle', () => {
 describe('sdk-loader caching contract', () => {
     test('resetMidnightSdkCache is exposed', () => {
         expect(typeof resetMidnightSdkCache).toBe('function');
+    });
+});
+
+// Mirrors the SDK LevelDB provider's password rules (midnight-js-utils 4.1.1
+// validatePassword): length, character classes, identical runs, sequences.
+function sdkPasswordRuleViolation(pw: string): string | undefined {
+    if (pw.length < 16) return 'too_short';
+    if (/(.){3}/.test(pw)) return 'repeated_characters';
+    const classes = [/[a-z]/, /[A-Z]/, /[0-9]/, /[^a-zA-Z0-9]/].filter(r => r.test(pw)).length;
+    if (classes < 3) return 'insufficient_classes';
+    const lower = pw.toLowerCase();
+    for (let i = 0; i + 4 <= lower.length; i++) {
+        let asc = true, desc = true;
+        for (let j = 1; j < 4; j++) {
+            const d = lower.charCodeAt(i + j) - lower.charCodeAt(i + j - 1);
+            if (d !== 1) asc = false;
+            if (d !== -1) desc = false;
+        }
+        if (asc || desc) return 'sequential_pattern';
+    }
+    return undefined;
+}
+
+describe('levelStoragePassword', () => {
+    const cases = {
+        'all zero': '0'.repeat(64),
+        'all f': 'f'.repeat(64),
+        'ascending run': '0123456789abcdef'.repeat(4),
+        'descending run': 'fedcba9876543210'.repeat(4),
+        'mixed': 'a3f9c0e17b2d4865' + '9e8d7c6b5a4f3e2d' + '1111222233334444' + 'abcdefabcdef0123'
+    };
+    for (const [name, hex] of Object.entries(cases)) {
+        test(`re-encoded ${name} hex passes the SDK password rules`, () => {
+            expect(sdkPasswordRuleViolation(hex)).toBeDefined();
+            expect(sdkPasswordRuleViolation(levelStoragePassword(hex))).toBeUndefined();
+        });
+    }
+    test('is deterministic and keeps every hex digit in order', () => {
+        const hex = 'a3f9c0e17b2d4865'.repeat(4);
+        expect(levelStoragePassword(hex)).toBe(levelStoragePassword(hex));
+        expect(levelStoragePassword(hex).replace(/-/g, '').slice(0, 64)).toBe(hex);
     });
 });

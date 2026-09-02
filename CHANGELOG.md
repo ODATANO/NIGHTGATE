@@ -1,5 +1,54 @@
 # Changelog
 
+## 0.22.2 - 2026-09-02
+
+Midnight SDK line moved to midnight-js 4.1.1 / compact-js 2.5.1 / ledger-v8
+8.1.0 (exact pins) in `@odatano/nightgate` and `@odatano/nightgate-tx` 0.4.5.
+No schema change, no circuit change, no action change.
+
+- **One copy of every Midnight package.** midnight-js 4.1.1 routes all its
+  ledger, compact-js, compact-runtime, onchain-runtime and platform-js
+  imports through the new `@midnight-ntwrk/midnight-js-protocol`, which pins
+  ledger-v8 8.1.0, compact-js 2.5.1, compact-runtime 0.16.0 exactly. Both
+  packages now pin the same set exactly (midnight-js 4.1.1, compact-js
+  2.5.1, ledger-v8 8.1.0, compact-runtime 0.16.0, zkir-v2 2.1.0); a consumer
+  on that line dedupes without overrides. Two copies of a wasm-bearing
+  package reject each other's objects with messages like `expected instance
+  of ContractMaintenanceAuthority`. compact-js 2.5.3 is NOT the target: it
+  depends on a ledger-v9 alpha. The 0.22.1 tree itself carried a second
+  compact-runtime (0.15.0 nested under compact-js 2.5.0); gone.
+- **Zswap offers follow the transcript segment** (upstream, midnight-js
+  contracts 4.1.1): shielded outputs, inputs and transients of a contract
+  call are placed in the guaranteed or fallible segment according to where
+  the contract's transcript claims them, instead of always in segment 0.
+  The sponsor's offer check already inspected both `guaranteedOffer` and
+  `fallibleOffer`; nothing to change on the NIGHTGATE side.
+- **LevelDB private-state backend password** (dev-only opt-in
+  `privateStateBackend: 'level'`): midnight-js 4.1.1 validates the storage
+  password (16+ characters, three character classes, no runs, no
+  sequences); the derived 64-char hex has two classes. `levelStoragePassword`
+  re-encodes it deterministically for the level provider only (byte pairs
+  joined by `-`, fixed suffix). A level store written before 0.22.2 does not
+  open with the new key; the default CAP-DB backend is unaffected.
+- **Upstream additions worth knowing:** the indexer provider moved to Apollo
+  client 4 and throws typed `IndexerQueryError`/`IndexerDataError`/
+  `IndexerSubscriptionDataError` instead of bare `Error`s; midnight-js warns
+  on the console when a proof-server or indexer URL uses `http:`/`ws:` to a
+  non-loopback host (the compose proof server at `http://proof-server:6300`
+  logs it once per provider bundle); `NodeZkConfigProvider` rejects circuit
+  ids outside `[a-zA-Z0-9._-]` (the standard-circuit lookups such as
+  `midnight/zswap/spend` keep failing over to the wallet SDK's key material
+  as before).
+- **Sizing note for in-process wasm proving**, measured on the vault's
+  `proveDocumentComparison`: k=17 (38.5 MB prover key) peaks at 1.82 GB
+  RSS, k=18 (72.9 MB) at 3.45 GB; ~47x the prover key, doubling per k. The
+  JS heap stays around 50 MB, the rest is wasm linear memory, which never
+  shrinks (a second prove in the same process adds ~46 MB). Two proves in
+  one process serialize and peak at the maximum, not the sum. Under
+  `provingMode: 'server'` the client still loads the prover key (it travels
+  in every `/prove` request) but not the proving working set. Documented in
+  `docs/txbuilder.md`.
+
 ## 0.22.1 - 2026-08-31
 
 Single-call `before` hooks and self-funded submission, under
