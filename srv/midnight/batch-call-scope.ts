@@ -13,7 +13,7 @@ import {
     withObservedBatchSegments,
     withOrderedBatchSegments
 } from './batch-segment-order';
-import { configEnum } from '../utils/config';
+import { runtimeConfigEnum } from './runtime-config';
 
 export interface BatchCall {
     circuit: string;
@@ -84,7 +84,7 @@ export async function runBatchInScope(
     // batch.
     // Skipped when the bundle has no proveTx-capable proof provider (tests).
     const providersAny = providers as any;
-    const mode = configEnum<'observe' | 'rewrite'>('NIGHTGATE_BATCH_SEGMENT_MODE') ?? 'rewrite';
+    const mode = runtimeConfigEnum<'observe' | 'rewrite'>('NIGHTGATE_BATCH_SEGMENT_MODE') ?? 'rewrite';
     const wrapSegments = mode === 'observe' ? withObservedBatchSegments : withOrderedBatchSegments;
     const scopedProviders = typeof providersAny?.proofProvider?.proveTx === 'function'
         ? { ...providersAny, proofProvider: wrapSegments(providersAny.proofProvider, circuits, orderOpts) }

@@ -216,6 +216,15 @@ The verification reads need none.
   project on a different line ends up with two copies of a wasm-bearing
   package, and the two reject each other's objects (`expected instance of
   ContractMaintenanceAuthority`); align via `overrides` or upgrade.
+  The wallet SDK packages declare `^8.1.x` for ledger-v8, so a FRESH install
+  next to the pinned 8.1.0 resolves a second copy (8.1.1) and the dust
+  wallet fails at builder start with `expected instance of DustParameters`:
+  pin it in the consumer's package.json,
+  `"overrides": { "@midnight-ntwrk/ledger-v8": "8.1.0" }`.
+- **0.5.1** ships the fix for a 0.5.0 packaging break: every in-process
+  (wasm) build failed on load with `Cannot find module '../utils/config'`
+  (a server-only module reached from the shipped proof provider; server
+  proving was unaffected).
 
 ## Relationship to NIGHTGATE and the MCP server
 

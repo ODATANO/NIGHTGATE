@@ -55,6 +55,8 @@ const FILES = [
     // two helpers the builder requires by relative path (BUILD OUTPUT)
     { path: 'srv/utils/wallet-hd.js', buildOutput: true },
     { path: 'srv/utils/wallet-hd.d.ts', buildOutput: true },
+    { path: 'srv/midnight/runtime-config.js', buildOutput: true },
+    { path: 'srv/midnight/runtime-config.d.ts', buildOutput: true },
     { path: 'srv/midnight/wasm-proof-provider.js', buildOutput: true },
     { path: 'srv/midnight/wasm-proof-provider.d.ts', buildOutput: true },
     // Batch path (0.19): buildSponsorable({ calls }) requires the scope +

@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.23.2 - 2026-09-06
+
+`@odatano/nightgate-tx` 0.5.1, the fix for a 0.5.0 packaging break.
+
+- **nightgate-tx 0.5.1.** Every in-process (wasm) build of 0.5.0 failed on
+  load with `Cannot find module '../utils/config'`: the shipped proof
+  provider and the batch scope imported the server's config table
+  statically, and the table is not in the package (server proving was
+  unaffected). Both now read through `srv/midnight/runtime-config`: the
+  config table inside the server, the environment in the package.
+  `check:slim` walks every relative require of a shipped runtime file and
+  refuses one that resolves outside the package; the real-install probe
+  loads the proof provider from the clean install and checks the
+  environment fallback.
+- The package README documents the ledger-v8 override a fresh consumer
+  install needs: the wallet SDK declares `^8.1.x`, a second copy (8.1.1)
+  next to the pinned 8.1.0 fails the dust wallet with `expected instance
+  of DustParameters`; pin `"@midnight-ntwrk/ledger-v8": "8.1.0"` in
+  `overrides`.
+- Image tag `0.23.2`; no server behaviour change.
+
 ## 0.23.1 - 2026-09-06
 
 `@odatano/nightgate-tx` 0.5.0, the caller-side companion of 0.23.0. The

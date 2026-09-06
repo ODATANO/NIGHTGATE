@@ -59,9 +59,15 @@ export async function getSharedKeyMaterialProvider(): Promise<{ lookupKey(loc: s
     return (await loadDeps()).fallbackKeys;
 }
 
-/** True when NIGHTGATE_PROVING_MODE selects in-process WASM proving. */
+import { runtimeConfigEnum } from './runtime-config';
+
+/**
+ * True when NIGHTGATE_PROVING_MODE selects in-process WASM proving. Reads
+ * through runtime-config: this file ships in the slim package, where the
+ * server's config table does not exist and the environment decides.
+ */
 export function isWasmProvingMode(): boolean {
-    return configEnum('NIGHTGATE_PROVING_MODE') === 'wasm';
+    return runtimeConfigEnum('NIGHTGATE_PROVING_MODE') === 'wasm';
 }
 
 /**
@@ -101,5 +107,3 @@ export async function buildWasmProofProvider(zkConfigProvider: any): Promise<{ p
         proveTx: (unprovenTx: any) => unprovenTx.prove(provingProvider, ledger.CostModel.initialCostModel())
     };
 }
-
-import { configEnum } from '../utils/config';

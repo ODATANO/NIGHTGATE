@@ -9,13 +9,15 @@
 //   3. nothing pulls @sap/cds or @odatano/nightgate back in
 //   4. every file the `files` list promises exists
 //   5. the tarball stays small (the 78 MB of prover keys must NOT be in it)
+//   (3 also walks every relative require of a shipped runtime file: it must
+//   resolve inside the package, not in the server tree it was built from)
 //
 // Run via `npm run check:slim` (which builds first).
 //
 // SPDX-License-Identifier: Apache-2.0
 
 import { readFile, mkdir, writeFile, rm, access, readdir, stat } from 'node:fs/promises';
-import { dirname, join, relative } from 'node:path';
+import { dirname, join, relative, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { execFileSync } from 'node:child_process';
 
@@ -99,6 +101,21 @@ async function main() {
         if (/(from|require\()\s*['"]@sap\/cds/.test(text)) dirty.push(`${relative(PKG_DIR, f)} imports @sap/cds`);
         if (/(from|require\()\s*['"]@odatano\/nightgate(?!-tx)/.test(text)) dirty.push(`${relative(PKG_DIR, f)} imports @odatano/nightgate`);
         if (/@odatano\/nightgate(?!-tx)/.test(text)) dirty.push(`${relative(PKG_DIR, f)} still names @odatano/nightgate`);
+        // A shipped runtime file may only reach files that ship with it. The
+        // built srv/ twins are copied out of a tree that has everything, so a
+        // relative require of a server-only module (0.5.0: wasm-proof-provider
+        // -> ../utils/config) passes the import probes and fails on the
+        // consumer's first build.
+        if (/\.m?js$/.test(f)) {
+            for (const [line, spec] of text.matchAll(/^.*?(?:from|require\()\s*['"](\.{1,2}\/[^'"]+)['"].*$/gm)) {
+                // the one sanctioned exception: a require marked slim-optional
+                // (runtime-config's guarded lookup of the server config table)
+                if (/slim-optional/.test(line)) continue;
+                const base = resolve(dirname(f), spec);
+                const candidates = [base, `${base}.js`, `${base}.mjs`, `${base}.cjs`, join(base, 'index.js'), join(base, 'index.mjs')];
+                if (!(await Promise.all(candidates.map(exists))).some(Boolean)) dirty.push(`${relative(PKG_DIR, f)} requires ${spec}, which is not in the package`);
+            }
+        }
     }
     if (dirty.length) dirty.forEach(bad); else ok(`${sources.length} source files, none referencing CAP or the main package`);
 
@@ -146,11 +163,21 @@ async function main() {
             "import '@odatano/nightgate-tx/attestation-vault';",
             "import '@odatano/nightgate-tx/attestation-vault-32';",
             "import '@odatano/nightgate-tx/set-root';",
+            // The entry points load the proof provider lazily, so a server-only
+            // require inside it (0.5.0) passes the imports above and dies on
+            // the consumer's first wasm build. Load it here, in the clean
+            // install, and check the environment fallback answers.
+            "import { createRequire } from 'node:module';",
+            "const wpp = createRequire(import.meta.url)('./node_modules/@odatano/nightgate-tx/srv/midnight/wasm-proof-provider.js');",
+            "process.env.NIGHTGATE_PROVING_MODE = 'wasm';",
+            "if (wpp.isWasmProvingMode() !== true) throw new Error('wasm-proof-provider: NIGHTGATE_PROVING_MODE=wasm not seen from the environment');",
+            "delete process.env.NIGHTGATE_PROVING_MODE;",
+            "if (wpp.isWasmProvingMode() !== false) throw new Error('wasm-proof-provider: unset NIGHTGATE_PROVING_MODE reads as wasm');",
             "console.log('install-probe ok');"
         ].join('\n'));
         const out = execFileSync(process.execPath, [probeMjs], { cwd: probeRoot, encoding: 'utf8' }).trim();
         if (!out.includes('install-probe ok')) bad('real-install probe: unexpected output ' + out);
-        else ok('real-install probe: all entry points import from a clean npm install');
+        else ok('real-install probe: all entry points import from a clean npm install, proof provider loads');
     } catch (e) {
         bad('real-install probe failed: ' + String(e.stderr || e.message).split(/\r?\n/).slice(-6).join(' '));
     } finally {
