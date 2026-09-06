@@ -123,16 +123,23 @@ export function postgresKind() {
  * `migrate` mode, which deploys and copies data but serves nothing, so it
  * needs neither HTTP credentials nor the wallet encryption key.
  */
+// CAP's JSON log format writes every request header into each line and masks
+// only its defaults (authorization, cookie, cert, ssl, api-key). The agent
+// token header is added here for the image, and by the plugin at load for
+// any host; the image states it explicitly so it holds before the plugin runs.
+export const LOG_MASK_HEADERS = ['/authorization/i', '/cookie/i', '/cert/i', '/ssl/i', '/api-key/i', '/x-agent-token/i'];
+
 export function cdsConfig(env = process.env, { dbOnly = false } = {}) {
     const db = databaseConfig(env);
     const requires = dbOnly ? { db } : { db, auth: authConfig(env) };
+    const log = { mask_headers: LOG_MASK_HEADERS };
     if (db.kind === 'postgres') {
         requires.kinds = { postgres: postgresKind() };
         // The plugin sets the same default at load; the image states it
         // explicitly so `cds deploy` (no plugin hooks) uses the same pool.
-        return { features: { use_generic_pool: true }, requires };
+        return { features: { use_generic_pool: true }, log, requires };
     }
-    return { requires };
+    return { log, requires };
 }
 
 if (import.meta.url === `file://${process.argv[1]}` || import.meta.url === `file:///${String(process.argv[1]).replace(/\\/g, '/')}`) {

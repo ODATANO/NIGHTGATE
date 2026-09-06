@@ -28,7 +28,34 @@ export function mapIndexerStatus(status: string): 'success' | 'failure' | null {
     return null;
 }
 
-export type ChainOutcome = { status: 'success' | 'failure' };
+/**
+ * A confirmed outcome plus the indexer's coordinates of the inclusion. The
+ * block height is the ONLY thing a reorg rollback can correlate a job with:
+ * the ledger identifier a job stores, the indexer's transaction hash and the
+ * Substrate extrinsic hash the crawler indexes are three different values.
+ */
+/**
+ * A non-negative integer from a JSON value: a number, or a string of digits
+ * (the indexer serialises heights as strings in some schemas). Anything else,
+ * `null` and `''` included, is `null`; `Number(null)` would have been 0.
+ */
+export function nonNegativeInteger(raw: unknown): number | null {
+    if (typeof raw === 'number') return Number.isInteger(raw) && raw >= 0 ? raw : null;
+    if (typeof raw === 'string' && /^\d+$/.test(raw.trim())) {
+        const n = Number(raw.trim());
+        return Number.isSafeInteger(n) ? n : null;
+    }
+    return null;
+}
+
+export type ChainOutcome = {
+    status: 'success' | 'failure';
+    /** Inclusion height: the ONLY key a reorg rollback correlates on, so an outcome never exists without it. */
+    blockHeight: number;
+    blockHash?: string | null;
+    /** The indexer's own transaction hash (not the identifier, not the extrinsic hash). */
+    indexerTxHash?: string | null;
+};
 
 export interface IndexerTxConfirmerConfig {
     indexerHttpUrl: string;
@@ -38,11 +65,19 @@ export interface IndexerTxConfirmerConfig {
     fetchFn?: typeof fetch;
 }
 
-// Minimal slice of TX_ID_QUERY: just the finalized status by tx hash.
+// Minimal slice of TX_ID_QUERY: the finalized status plus the inclusion
+// coordinates (block height/hash, the indexer's transaction hash).
 const TX_STATUS_QUERY =
     'query NightgateTxStatus($offset: TransactionOffset!) {' +
     ' transactions(offset: $offset) {' +
-    ' ... on RegularTransaction { transactionResult { status } } } }';
+    ' ... on RegularTransaction { hash block { hash height } transactionResult { status } } } }';
+
+interface IndexedTxSlice {
+    status: string;
+    hash: string | null;
+    blockHash: string | null;
+    blockHeight: number | null;
+}
 
 /**
  * Confirm a submitted tx by hash in one Indexer query. Returns the mapped
@@ -62,7 +97,7 @@ export function createHttpTxConfirmer(
     // which the Indexer answers under `offset.identifier`; the Substrate block
     // hash (`offset.hash`) is a different value. Try identifier first, then
     // hash for rows written by older code paths.
-    const lookup = async (offset: Record<string, string>): Promise<string | null> => {
+    const lookup = async (offset: Record<string, string>): Promise<IndexedTxSlice | null> => {
         const res = await doFetch(cfg.indexerHttpUrl, {
             method: 'POST',
             headers: { 'content-type': 'application/json' },
@@ -78,14 +113,28 @@ export function createHttpTxConfirmer(
             if (/invalid transaction (hash|identifier)|cannot convert/i.test(String(body.errors[0]?.message))) return null;
             throw new Error(`Indexer tx lookup GraphQL error: ${body.errors[0]?.message ?? 'unknown'}`);
         }
-        const status = body?.data?.transactions?.[0]?.transactionResult?.status;
-        return typeof status === 'string' ? status : null;
+        const tx = body?.data?.transactions?.[0];
+        const status = tx?.transactionResult?.status;
+        if (typeof status !== 'string') return null;
+        // A result without its block height is not a confirmation: the
+        // height is the rollback coordinate, and evidence a reorg could never
+        // revert must not be recorded. The next tick asks again. The raw value
+        // is checked BEFORE conversion: Number(null) is 0, a plausible height.
+        const height = nonNegativeInteger(tx?.block?.height);
+        if (height === null) return null;
+        return {
+            status,
+            hash: typeof tx?.hash === 'string' ? tx.hash : null,
+            blockHash: typeof tx?.block?.hash === 'string' ? tx.block.hash : null,
+            blockHeight: height
+        };
     };
     return async (txHash: string): Promise<ChainOutcome | null> => {
-        const status = (await lookup({ identifier: txHash })) ?? (await lookup({ hash: txHash }));
-        if (status === null) return null; // not indexed yet / no result
-        const mapped = mapIndexerStatus(status);
-        return mapped ? { status: mapped } : null; // unknown/future status -> not confirmed
+        const found = (await lookup({ identifier: txHash })) ?? (await lookup({ hash: txHash }));
+        if (found === null) return null; // not indexed yet / no result
+        const mapped = mapIndexerStatus(found.status);
+        if (!mapped) return null; // unknown/future status -> not confirmed
+        return { status: mapped, blockHeight: found.blockHeight as number, blockHash: found.blockHash, indexerTxHash: found.hash };
     };
 }
 

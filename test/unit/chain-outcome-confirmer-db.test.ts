@@ -36,7 +36,7 @@ test('advances both a pending and a legacy NULL-chainStatus leaf (real SQL NULL 
         { ID: 'job-pending', kind: 'submitContractCall', status: 'succeeded', txHash: '0xpending', chainStatus: 'pending' },
         { ID: 'job-legacy',  kind: 'submitContractCall', status: 'succeeded', txHash: '0xlegacy',  chainStatus: null }
     ));
-    registerChainOutcomeConfirmer(async () => ({ status: 'success' }));
+    registerChainOutcomeConfirmer(async () => ({ status: 'success', blockHeight: 4711 }));
 
     const updated = await confirmChainOutcomesViaIndexer(db);
 
@@ -48,13 +48,36 @@ test('advances both a pending and a legacy NULL-chainStatus leaf (real SQL NULL 
     expect(byId['job-legacy']).toBe('success');
 });
 
+test('a reorg rollback during the indexer lookup refuses the commit; the next tick records the fresh outcome', async () => {
+    const SYNC = 'midnight.SyncState';
+    await db.run(cds.ql.DELETE.from(SYNC));
+    await db.run(cds.ql.INSERT.into(SYNC).entries({ ID: 'SINGLETON', syncStatus: 'synced', reorgGeneration: 3 }));
+    await db.run(cds.ql.INSERT.into(BG).entries(
+        { ID: 'job-race', kind: 'submitContractCall', status: 'succeeded', txHash: '00race', chainStatus: 'pending' }
+    ));
+    // The lookup answers with the OLD fork's block while a rollback bumps the generation.
+    registerChainOutcomeConfirmer(async () => {
+        await db.run(cds.ql.UPDATE.entity(SYNC).set({ reorgGeneration: 4 }).where({ ID: 'SINGLETON' }));
+        return { status: 'success', blockHeight: 900, blockHash: '0xoldfork' };
+    });
+    expect(await confirmChainOutcomesViaIndexer(db)).toBe(0);
+    let row = await db.run(cds.ql.SELECT.one.from(BG).where({ ID: 'job-race' }));
+    expect(row).toMatchObject({ chainStatus: 'pending', chainBlockHeight: null });
+    // Same generation from here on: the fresh outcome commits.
+    registerChainOutcomeConfirmer(async () => ({ status: 'success', blockHeight: 901, blockHash: '0xnewfork' }));
+    expect(await confirmChainOutcomesViaIndexer(db)).toBe(1);
+    row = await db.run(cds.ql.SELECT.one.from(BG).where({ ID: 'job-race' }));
+    expect(row).toMatchObject({ chainStatus: 'success', chainBlockHeight: 901, chainBlockHash: '0xnewfork' });
+    await db.run(cds.ql.DELETE.from(SYNC));
+});
+
 test('CAS no-op: does not overwrite a chainStatus already resolved since the scan', async () => {
     await db.run(cds.ql.INSERT.into(BG).entries(
         { ID: 'job-resolved', kind: 'submitContractCall', status: 'succeeded', txHash: '0xresolved', chainStatus: 'success' }
     ));
     // A confirmer that would (wrongly) report failure; the scan excludes resolved
     // rows, and even if it did not the CAS on the read value guards the write.
-    registerChainOutcomeConfirmer(async () => ({ status: 'failure' }));
+    registerChainOutcomeConfirmer(async () => ({ status: 'failure', blockHeight: 4711 }));
 
     const updated = await confirmChainOutcomesViaIndexer(db);
 
@@ -71,7 +94,7 @@ test('resolves reconciliation_required rows of identifier-keyed sponsor kinds vi
         { ID: 'other',   kind: 'submitContractCall',          status: 'reconciliation_required', txHash: '0xother' }
     ));
     registerChainOutcomeConfirmer(async (txHash: string) =>
-        txHash === '00id-ok' ? { status: 'success' } : txHash === '00id-bad' ? { status: 'failure' } : null);
+        txHash === '00id-ok' ? { status: 'success', blockHeight: 4711 } : txHash === '00id-bad' ? { status: 'failure', blockHeight: 4711 } : null);
 
     await confirmChainOutcomesViaIndexer(db);
 
@@ -100,7 +123,7 @@ test('reconcile-by-identifier also finalizes the attempt PendingSubmissions row 
     ));
     // the attempt row carries the coordinates the worker announced (JSON in the internal submitIntentData)
     await db.run(cds.ql.UPDATE.entity(PS).set({ submitIntentData: JSON.stringify({ feeSponsor: 'concrete-sponsor', sponsorAccountId: 'acct-1', circuits: ['attest', 'anchorContentRoot'], contractAddress: 'c8f4'.padEnd(64, '0'), note: 'backing-Z' }) }).where({ ID: 'sub-ok' }));
-    registerChainOutcomeConfirmer(async (txHash: string) => txHash === '00id-ok2' ? { status: 'success' } : { status: 'failure' });
+    registerChainOutcomeConfirmer(async (txHash: string) => txHash === '00id-ok2' ? { status: 'success', blockHeight: 4711 } : { status: 'failure', blockHeight: 4711 });
     await confirmChainOutcomesViaIndexer(db);
     const jobs = Object.fromEntries((await db.run(cds.ql.SELECT.from(BG).columns('ID', 'status', 'result'))).map((r: any) => [r.ID, r]));
     expect(jobs['j-ok'].status).toBe('succeeded');
@@ -123,7 +146,7 @@ test('the normal succeeded-confirm pass ALSO finalizes the sponsor attempt row (
     await db.run(cds.ql.INSERT.into(BG).entries(
         { ID: 'j-inc', kind: 'sponsorUnboundTransaction', sessionId: 'sp-sess', status: 'succeeded', txHash: '00id-inc', submissionId: 'sub-inc', chainStatus: 'pending', result: '{"txHash":"00id-inc"}' }
     ));
-    registerChainOutcomeConfirmer(async () => ({ status: 'success' }));
+    registerChainOutcomeConfirmer(async () => ({ status: 'success', blockHeight: 4711 }));
     const updated = await confirmChainOutcomesViaIndexer(db);
     expect(updated).toBe(1);
     const job = (await db.run(cds.ql.SELECT.one.from(BG).columns('status', 'chainStatus', 'result').where({ ID: 'j-inc' })));
@@ -134,16 +157,39 @@ test('the normal succeeded-confirm pass ALSO finalizes the sponsor attempt row (
     expect(sub.finalizedAt).toBeTruthy();
 });
 
-test('identifierKindsOnly (crawler on): the succeeded-pass confirms sponsor kinds only', async () => {
+test('the succeeded-pass confirms every kind with a hash, identifier-keyed or not', async () => {
     await db.run(cds.ql.INSERT.into(BG).entries(
         { ID: 'sp',    kind: 'sponsorUnboundTransaction', status: 'succeeded', txHash: '00id-sp', chainStatus: 'pending' },
         { ID: 'call',  kind: 'submitContractCall',        status: 'succeeded', txHash: '0xcall',  chainStatus: 'pending' }
     ));
-    registerChainOutcomeConfirmer(async () => ({ status: 'success' }), { identifierKindsOnly: true });
+    registerChainOutcomeConfirmer(async () => ({ status: 'success', blockHeight: 4711 }));
     const updated = await confirmChainOutcomesViaIndexer(db);
-    expect(updated).toBe(1);
+    expect(updated).toBe(2);
     const rows = await db.run(cds.ql.SELECT.from(BG).columns('ID', 'chainStatus'));
     const byId = Object.fromEntries(rows.map((r: any) => [r.ID, r.chainStatus]));
     expect(byId['sp']).toBe('success');
-    expect(byId['call']).toBe('pending'); // the crawler owns this one
+    expect(byId['call']).toBe('success'); // the crawler's CAS on 'pending' is then a no-op
+});
+
+test('records the inclusion coordinates on the job and the attempt row (what a reorg rollback reverts by)', async () => {
+    const PS = 'midnight.PendingSubmissions';
+    await db.run(cds.ql.DELETE.from(PS));
+    await db.run(cds.ql.INSERT.into(PS).entries(
+        { ID: 'sub-ev', txHash: '00id-ev', actionType: 'CALL', submittedAt: new Date().toISOString(), status: 'included', sessionId: 's' },
+        { ID: 'sub-ev-recon', txHash: '00id-ev2', actionType: 'CALL', submittedAt: new Date().toISOString(), status: 'included', sessionId: 's' }
+    ));
+    await db.run(cds.ql.INSERT.into(BG).entries(
+        { ID: 'j-ev', kind: 'submitContractCall', status: 'succeeded', txHash: '00id-ev', submissionId: 'sub-ev', chainStatus: 'pending' },
+        { ID: 'j-ev-recon', kind: 'sponsorUnboundTransaction', sessionId: 's', status: 'reconciliation_required', txHash: '00id-ev2', submissionId: 'sub-ev-recon' }
+    ));
+    registerChainOutcomeConfirmer(async (txHash: string) => ({
+        status: 'success', blockHeight: txHash === '00id-ev' ? 2415919 : 2415920, blockHash: `0xblock-${txHash}`, indexerTxHash: `0xindexer-${txHash}`
+    }));
+    await confirmChainOutcomesViaIndexer(db);
+    const jobs = Object.fromEntries((await db.run(cds.ql.SELECT.from(BG).columns('ID', 'status', 'chainStatus', 'chainBlockHeight', 'chainBlockHash', 'indexerTxHash'))).map((r: any) => [r.ID, r]));
+    expect(jobs['j-ev']).toMatchObject({ chainStatus: 'success', chainBlockHeight: 2415919, chainBlockHash: '0xblock-00id-ev', indexerTxHash: '0xindexer-00id-ev' });
+    expect(jobs['j-ev-recon']).toMatchObject({ status: 'succeeded', chainBlockHeight: 2415920, chainBlockHash: '0xblock-00id-ev2' });
+    const subs = Object.fromEntries((await db.run(cds.ql.SELECT.from(PS).columns('ID', 'status', 'chainBlockHeight', 'indexerTxHash'))).map((r: any) => [r.ID, r]));
+    expect(subs['sub-ev']).toMatchObject({ status: 'finalized', chainBlockHeight: 2415919, indexerTxHash: '0xindexer-00id-ev' });
+    expect(subs['sub-ev-recon']).toMatchObject({ status: 'finalized', chainBlockHeight: 2415920 });
 });

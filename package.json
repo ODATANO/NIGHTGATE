@@ -1,6 +1,6 @@
 {
   "name": "@odatano/nightgate",
-  "version": "0.22.2",
+  "version": "0.23.0",
   "description": "CAP Plugin: Midnight Blockchain Indexer with OData V4 API",
   "homepage": "https://github.com/ODATANO/NIGHTGATE#readme",
   "repository": {
@@ -29,7 +29,7 @@
   "types": "src/index.d.ts",
   "type": "commonjs",
   "engines": {
-    "node": ">=22"
+    "node": ">=22.12"
   },
   "imports": {
     "#cds-models/*": "./@cds-models/*/index.js"
@@ -84,6 +84,11 @@
       "types": "./src/sdk/client.d.ts",
       "import": "./src/sdk/client.mjs",
       "default": "./src/sdk/client.mjs"
+    },
+    "./sdk": {
+      "types": "./src/sdk/index.d.ts",
+      "import": "./src/sdk/index.mjs",
+      "default": "./src/sdk/index.mjs"
     }
   },
   "files": [
@@ -107,17 +112,18 @@
     "contracts/attestation-vault/src/*.compact",
     "contracts/attestation-vault/package.json",
     "contracts/attestation-vault-32/src/managed/**/*",
-    "!contracts/attestation-vault-32/**/*.prover",
     "contracts/attestation-vault-32/src/*.compact",
     "contracts/attestation-vault-32/package.json",
     "contracts/shielded-token/src/managed/**/*",
     "contracts/shielded-token/src/*.compact",
     "contracts/shielded-token/package.json",
+    "!contracts/**/*.prover",
     "scripts/apply-schema-delta.mjs",
     "scripts/check-server.mjs",
     "scripts/fetch-contract-keys.mjs",
     "scripts/migrate-sqlite-to-postgres.mjs",
     "scripts/migrate-values.mjs",
+    "scripts/rewrap-encryption-keys.mjs",
     "docker/cds-config.mjs",
     "README.md",
     "LICENSE"
@@ -125,7 +131,8 @@
   "bin": {
     "nightgate-schema-delta": "scripts/apply-schema-delta.mjs",
     "nightgate-fetch-keys": "scripts/fetch-contract-keys.mjs",
-    "nightgate-db-migrate": "scripts/migrate-sqlite-to-postgres.mjs"
+    "nightgate-db-migrate": "scripts/migrate-sqlite-to-postgres.mjs",
+    "nightgate-rewrap-keys": "scripts/rewrap-encryption-keys.mjs"
   },
   "scripts": {
     "clean": "node scripts/clean-build-artifacts.js",
@@ -155,7 +162,10 @@
     "integration:contract-registry": "node scripts/integration-test-contract-registry.mjs",
     "integration:connector-routes": "node scripts/integration-test-connector-routes.mjs",
     "check:browser": "node scripts/check-browser-bundle.mjs",
+    "check:vault-parity": "node scripts/check-vault-parity.mjs",
     "check:exports": "node scripts/check-package-exports.mjs",
+    "keys:manifest": "node scripts/write-key-manifest.mjs",
+    "keys:manifest:check": "node scripts/write-key-manifest.mjs --check --require-keys",
     "check:browser-types": "node scripts/check-browser-types.mjs",
     "check:job-idempotency": "node scripts/check-job-idempotency.mjs",
     "check:server": "node --env-file=.env scripts/check-server.mjs",
@@ -163,6 +173,7 @@
     "integration:attestation-vault": "node scripts/integration-test-attestation-vault.mjs",
     "integration:attestation-vault-32": "node scripts/integration-test-attestation-vault-32.mjs",
     "integration:schema-delta": "node scripts/integration-test-schema-delta.mjs",
+    "integration:postgres": "node scripts/integration-test-postgres.mjs",
     "deploy:e2e": "node --env-file=.env scripts/run-deploy-e2e.mjs",
     "field-predicate-batch:e2e": "node --env-file=.env scripts/run-field-predicate-batch-e2e.mjs",
     "membership:e2e": "node --env-file=.env scripts/run-membership-e2e.mjs",
@@ -178,19 +189,20 @@
     "wasm-zswap:e2e": "node --env-file=.env scripts/run-wasm-zswap-e2e.mjs",
     "test:pg-idempotency": "node scripts/test-postgres-idempotency.mjs",
     "lint": "eslint .",
-    "check:release": "npm run build && npm run lint && npm run typecheck && npm test && npm run integration:attestation-vault && npm run integration:attestation-vault-32 && npm run integration:schema-delta && npm run check:browser && npm run check:browser-types && npm run check:slim && npm run check:exports",
+    "check:release": "npm run build && npm run lint && npm run typecheck && npm test && npm run integration:attestation-vault && npm run integration:attestation-vault-32 && npm run integration:schema-delta && npm run check:vault-parity && npm run check:browser && npm run check:browser-types && npm run check:slim && npm run check:exports",
+    "check:release:full": "npm run check:release && npm run integration:postgres",
     "prepack": "npm run build:plugin",
     "prepublishOnly": "npm run check:release && npm run build:plugin",
     "integration:derive-wallet-info": "node --env-file=.env scripts/integration-test-derive-wallet-info.mjs",
     "check:fresh-tree": "bash scripts/check-fresh-tree.sh",
-    "cross-server-probe:e2e": "node --env-file=.env scripts/run-cross-server-sponsor-probe-e2e.mjs",
     "txbuilder:e2e": "node --env-file=.env scripts/run-txbuilder-e2e.mjs",
     "burst-sponsor:e2e": "node --env-file=.env scripts/run-burst-sponsor-e2e.mjs",
     "sponsored-deploy:e2e": "node --env-file=.env scripts/run-sponsored-deploy-e2e.mjs",
     "build:slim": "node scripts/build-slim-package.mjs",
     "check:slim": "npm run build:slim && node scripts/check-slim-package.mjs",
     "mint-token:e2e": "node --env-file=.env scripts/run-mint-token-e2e.mjs",
-    "width32:e2e": "node --env-file=.env scripts/run-width32-e2e.mjs"
+    "width32:e2e": "node --env-file=.env scripts/run-width32-e2e.mjs",
+    "config:table": "node scripts/print-config-table.mjs --write"
   },
   "dependencies": {
     "@midnight-ntwrk/compact-js": "2.5.1",

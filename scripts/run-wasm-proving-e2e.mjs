@@ -1,4 +1,4 @@
-// Live AC for docs/feature-requests/wasm-proving-without-docker.md:
+// Live acceptance lane for in-process wasm proving (0.11.0):
 // with the SERVER started under NIGHTGATE_PROVING_MODE=wasm (and ideally a
 // dead NIGHTGATE_PROOF_SERVER_URL so any accidental server-proving fails
 // loudly), build → sign → prove → submit a NIGHT self-transfer and get a

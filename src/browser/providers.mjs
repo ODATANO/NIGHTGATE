@@ -22,19 +22,37 @@ import { InMemoryPrivateStateProvider } from './private-state.mjs';
  * @param {object}   opts
  * @param {object}   opts.connector  a connected DApp-Connector wallet (`@midnight-ntwrk/dapp-connector-api` ConnectedAPI)
  * @param {object}   opts.manifest   the parsed `/contract-manifest` JSON
+ * @param {string}   [opts.manifestUrl]  the URL the manifest was fetched from; required when the
+ *                                       manifest carries relative `zkConfigBaseUrl`s (the server's
+ *                                       default without NIGHTGATE_ZK_CONFIG_PUBLIC_URL) and the dApp
+ *                                       is served from another origin
  * @param {string}   opts.contract   contract name, e.g. 'attestation-vault'
  * @param {typeof fetch} [opts.fetchFn]    injectable fetch (defaults to global)
  * @param {any}      [opts.webSocket]      WebSocket impl (defaults to global)
  * @param {'server'|'wallet'|'auto'} [opts.proving='server']  proving modality, see below
  * @returns assembled providers + prefetched wallet keys + the connector
  */
+/**
+ * Absolute form of a manifest URL. The server emits RELATIVE `/zk-config/...`
+ * URLs unless it is configured with a public base, so a dApp on another
+ * origin must resolve them against the manifest's own URL.
+ */
+export function resolveManifestUrl(url, manifestUrl) {
+    const raw = String(url ?? '');
+    if (/^[a-z][a-z0-9+.-]*:\/\//i.test(raw)) return raw;
+    if (manifestUrl) return new URL(raw, manifestUrl).toString();
+    if (typeof location !== 'undefined' && location.origin) return new URL(raw, location.origin).toString();
+    throw new Error(`createNightgateConnectorProviders: manifest URL '${raw}' is relative; pass opts.manifestUrl (the URL the manifest was fetched from)`);
+}
+
 export async function createNightgateConnectorProviders(opts = {}) {
-    const { connector, manifest, contract, fetchFn, webSocket, proving = 'server' } = opts;
+    const { connector, manifest, manifestUrl, contract, fetchFn, webSocket, proving = 'server' } = opts;
     if (!connector) throw new Error('createNightgateConnectorProviders: connector is required');
     if (!contract) throw new Error('createNightgateConnectorProviders: contract is required');
 
-    const entry = (manifest && manifest.contracts || []).find(c => c.name === contract);
-    if (!entry) throw new Error(`createNightgateConnectorProviders: contract '${contract}' not in manifest`);
+    const found = (manifest && manifest.contracts || []).find(c => c.name === contract);
+    if (!found) throw new Error(`createNightgateConnectorProviders: contract '${contract}' not in manifest`);
+    const entry = { ...found, zkConfigBaseUrl: resolveManifestUrl(found.zkConfigBaseUrl, manifestUrl) };
 
     const cfg = await connector.getConfiguration(); // { indexerUri, indexerWsUri, substrateNodeUri, networkId, proverServerUri? }
     const WS = webSocket || (typeof WebSocket !== 'undefined' ? WebSocket : undefined);

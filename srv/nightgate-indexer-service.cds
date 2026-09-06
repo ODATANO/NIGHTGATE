@@ -114,6 +114,7 @@ service NightgateIndexerService {
     @requires: 'authenticated-user'
     function getRuntimeInfo()                     returns {
         version       : String;
+        apiVersion    : String; // major.minor of the package; a minor bump may change the API while 0.x
         network       : String;
         provingMode   : String; // wasm | server
         instanceId    : String;

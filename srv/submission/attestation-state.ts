@@ -12,16 +12,11 @@
  * unit-test without the ESM-only SDK; `readAttestationStateForContract` wires the
  * real provider bundle + artifact.
  */
-import { pathToFileURL } from 'node:url';
+import { hexToBytes } from '../utils/hex';
+import { importArtifactByPath } from './contract-registry';
 
 function hex(b: Uint8Array): string {
     return Buffer.from(b).toString('hex');
-}
-
-function hexToBytes(h: string): Uint8Array {
-    const out = new Uint8Array(h.length / 2);
-    for (let i = 0; i < out.length; i++) out[i] = parseInt(h.substr(i * 2, 2), 16);
-    return out;
 }
 
 /** Minimal shape of the compiled artifact's `ledger(state)` return we rely on. */
@@ -120,7 +115,7 @@ export async function readAttestationStateForContract(
 ): Promise<AttestationStateResult | null> {
     const { buildContractProviders } = await import('../midnight/providers.js');
     const bundle = await buildContractProviders(args.contractProvidersConfig);
-    const artifact: any = await import(pathToFileURL(args.artifactPath).href);
+    const artifact: any = await importArtifactByPath(args.artifactPath);
 
     return readAttestationState({
         contractAddress: args.contractAddress,

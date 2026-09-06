@@ -33,15 +33,17 @@ import {
     getWalletSdkVersion,
     evictEncryptionKey
 } from './wallet-sync-state-store';
+import { evictAccountDek } from './account-keys';
 import { formatErr } from '../utils/format-error';
 import { withKeyedLock } from '../utils/keyed-lock';
 import cds from '@sap/cds';
 const log = cds.log('nightgate:facade');
 import nodeCrypto from 'node:crypto';
+import { configFlag } from '../utils/config';
 
 // Opt-in facade-restore diagnostics (off by default; enable with
 // NIGHTGATE_DEBUG_WALLET_SYNC=true). Keeps the plugin quiet on a consumer's stdout.
-const DEBUG_SYNC = process.env.NIGHTGATE_DEBUG_WALLET_SYNC === 'true';
+const DEBUG_SYNC = configFlag('NIGHTGATE_DEBUG_WALLET_SYNC');
 const dbgSync = (msg: string): void => { if (DEBUG_SYNC) log.debug(msg); };
 
 export interface WalletFacadeBuildArgs {
@@ -65,36 +67,6 @@ export interface WalletFacadeBuildArgs {
      */
     accountIndex?: number;
 }
-
-/** Stub returned to callers that still expect a `facade` object; throws if a method is actually called. */
-const phase2Stub = (op: string) => () => {
-    throw new Error(
-        `[phase-1 worker migration] ${op} is not yet wired through wallet-worker-client. ` +
-        `Re-route this call site to use srv/midnight/wallet-worker-client directly.`
-    );
-};
-
-const subStub = (label: string): any => ({
-    start: phase2Stub(`${label}.start`),
-    stop: phase2Stub(`${label}.stop`),
-    waitForSyncedState: phase2Stub(`${label}.waitForSyncedState`),
-    balanceTransaction: phase2Stub(`${label}.balanceTransaction`),
-    serializeState: phase2Stub(`${label}.serializeState`)
-});
-
-const facadeStub: any = {
-    state: phase2Stub('facade.state'),
-    waitForSyncedState: phase2Stub('facade.waitForSyncedState'),
-    submitTransaction: phase2Stub('facade.submitTransaction'),
-    balanceUnboundTransaction: phase2Stub('facade.balanceUnboundTransaction'),
-    finalizeRecipe: phase2Stub('facade.finalizeRecipe'),
-    registerNightUtxosForDustGeneration: phase2Stub('facade.registerNightUtxosForDustGeneration'),
-    revert: phase2Stub('facade.revert'),
-    stop: phase2Stub('facade.stop'),
-    shielded:   subStub('shielded'),
-    unshielded: subStub('unshielded'),
-    dust:       subStub('dust')
-};
 
 interface SessionRecord {
     /** Passphrase needed to encrypt periodic state-save events. */
@@ -201,14 +173,14 @@ onWorkerGone(async (reason) => {
 export function getOrBuildWalletFacade(
     cacheKey: string,
     args: WalletFacadeBuildArgs
-): Promise<{ facade: any; zswapKeys: any; dustKey: any; unshieldedKeystore: any }> {
+): Promise<void> {
     return withKeyedLock(cacheKey, () => buildWalletFacadeLocked(cacheKey, args));
 }
 
 async function buildWalletFacadeLocked(
     cacheKey: string,
     args: WalletFacadeBuildArgs
-): Promise<{ facade: any; zswapKeys: any; dustKey: any; unshieldedKeystore: any }> {
+): Promise<void> {
     // Attempt to restore from CAP-persisted state (plain `db.run(SELECT)`).
     let restoreBlobs: { shielded?: string; unshielded?: string; dust?: string } | undefined;
     let pendingOrigin: FacadeOrigin | undefined;
@@ -304,12 +276,6 @@ async function buildWalletFacadeLocked(
         });
     }
 
-    return {
-        facade:             facadeStub,
-        zswapKeys:          { clear: () => undefined, __phase2: true },
-        dustKey:            { __phase2: true },
-        unshieldedKeystore: { __phase2: true }
-    };
 }
 
 /**
@@ -335,6 +301,7 @@ export async function evictWalletFacade(cacheKey: string): Promise<void> {
         // be encrypting) before zeroing, so no blob is garbled mid-encrypt.
         try {
             await evictEncryptionKey(cacheKey);
+            evictAccountDek(cacheKey);
         } catch (err) {
             log.warn(`key evict failed for ${cacheKey.slice(0, 16)}:`, formatErr(err));
         }

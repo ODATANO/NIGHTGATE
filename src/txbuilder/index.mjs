@@ -93,7 +93,13 @@ export async function ensureZkAssets({ zkConfigBaseUrl, cacheDir, circuits = ATT
             // every later build would fail deep inside the prover instead of
             // re-downloading. rename() is atomic within the directory.
             const body = Buffer.from(await res.arrayBuffer());
-            const declared = Number(res.headers?.get?.('content-length') ?? NaN);
+            // A proxy that gzips on the fly reports the ENCODED length while
+            // fetch hands back the decoded body; only an identity body is
+            // comparable to content-length.
+            const encoding = String(res.headers?.get?.('content-encoding') ?? '').trim().toLowerCase();
+            const declared = encoding === '' || encoding === 'identity'
+                ? Number(res.headers?.get?.('content-length') ?? NaN)
+                : NaN;
             if (Number.isFinite(declared) && declared !== body.length) {
                 throw new Error('ensureZkAssets: ' + rel + ' truncated (' + body.length + ' of ' + declared + ' bytes)');
             }

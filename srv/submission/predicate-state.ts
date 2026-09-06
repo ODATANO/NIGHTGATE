@@ -17,13 +17,8 @@
  * `computeClaimKey`) to unit-test without the ESM-only SDK;
  * `readPredicateStateForContract` wires the real runtime + providers.
  */
-import { pathToFileURL } from 'node:url';
-
-function hexToBytes(h: string): Uint8Array {
-    const out = new Uint8Array(h.length / 2);
-    for (let i = 0; i < out.length; i++) out[i] = parseInt(h.substr(i * 2, 2), 16);
-    return out;
-}
+import { hexToBytes } from '../utils/hex';
+import { importArtifactByPath } from './contract-registry';
 
 interface ResultMap { member(key: Uint8Array): boolean; lookup(key: Uint8Array): boolean }
 
@@ -347,7 +342,7 @@ export async function readPredicateStateForContract(
 ): Promise<boolean | null> {
     const { buildContractProviders } = await import('../midnight/providers.js');
     const bundle = await buildContractProviders(args.contractProvidersConfig);
-    const artifact: any = await import(pathToFileURL(args.artifactPath).href);
+    const artifact: any = await importArtifactByPath(args.artifactPath);
 
     // Query the state FIRST: claim keys embed the payload's CURRENT
     // attestation epoch (0.16.0), so the recompute needs the live ledger. A

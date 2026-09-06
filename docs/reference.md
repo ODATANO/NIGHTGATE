@@ -76,7 +76,7 @@ Sufficient for read-side. `network` is the only required key - without it the pl
 | `proofTimeoutMs` | `300000` | HTTP timeout of ONE proof request to the proof server in server proving mode (0.22.0). midnight-js' own default; a proof past it fails the job and midnight-js re-requests the proof up to three times, so set it above the slowest proof. Ignored in wasm mode. |
 | `zkConfigBasePath` | `./contracts` | Base for resolving relative `contracts.<name>.zkConfigPath` |
 | `privateStateBackend` | `cap-db` | `cap-db` (default, production-grade encrypted CAP-DB tables) or `level` (legacy SDK LevelDB, **dev-only**, blocked on worker-routed submissions) |
-| `contracts` | `{}` | Map of `<ref>` → `{ artifactPath, privateStateId, zkConfigPath, slotWidth? }`, loaded into the in-memory registry on plugin startup. `slotWidth` (8/16/32, default 16) declares the content-tree width of an attestation-vault-family artifact; the shipped `attestation-vault-32` registers with 32 and the whole proof surface sizes masks, k bounds and inclusion paths from it |
+| `contracts` | `{}` | Map of `<ref>` → `{ artifactPath, privateStateId, zkConfigPath, slotWidth? }`, loaded into the in-memory registry on plugin startup. `slotWidth` (16 or 32, default 16) declares the content-tree width of an attestation-vault-family artifact; the shipped `attestation-vault-32` registers with 32 and the whole proof surface sizes masks, k bounds and inclusion paths from it |
 | `sessionTtlMs` | `86400000` (24 h) | Wallet session lifetime |
 | `closeSessionsOnRestart` | `true` | Close the wallet sessions the previous process left behind at startup. Configured `feeSponsorSessions` are exempt. `false` keeps them, for consumers that hold session ids across restarts |
 | `jobs.concurrency.heavy` | `4` | Concurrent jobs per proof-generating kind (deploy, call, send, attestations). 4 saturates one proof server |
@@ -91,7 +91,6 @@ Sufficient for read-side. `network` is the only required key - without it the pl
 | `crawler.fetchConcurrency` | `(default)` | Parallel RPC fetches during catch-up |
 | `crawler.rpcBatchSize` | `(default)` | Substrate JSON-RPC batch size |
 | `crawler.requestTimeout` | `30000` | RPC timeout (ms) |
-| `crawlerlessChainConfirm` | `!crawler.enabled` | Advance a submitted job's `chainStatus` by a single per-tx Indexer query (`transactions(offset:{hash})`) instead of the crawler's `Transactions`/`TransactionResults`, so `requireChainSuccess` is reachable crawler-free. Only runs when the crawler is disabled (where it defaults on); `false` opts out. With the crawler enabled it never runs (the crawler is the sole source of truth), and an explicit opt-in is ignored with a warning |
 | `palletMap` | `(built-in)` | Optional override of the Substrate pallet-index → tx-type classification map used by the `BlockProcessor` (`{ "<index>": { name, txType, isShielded?, isSystem? } }`) |
 | `allowMainnetSubmission` | `false` | Gate for mainnet submission. Stays off until [forum thread 1190](https://forum.midnight.network) (`1016 Immediately Dropped`) is resolved |
 | `granteeBinding` | `wallet` | How an authenticated principal maps to the AttestationVault `Bytes<32>` grantee id for on-chain disclosure grants: `wallet` (coin pubkey hash) / `did` (DID string) / `custom` (opaque 64-hex). Used by `registerGranteeIdentity` + the disclosure read gate |
@@ -100,80 +99,111 @@ Sufficient for read-side. `network` is the only required key - without it the pl
 
 ### Environment variables
 
+Every variable below is declared in `srv/utils/config-table.ts` with its kind,
+default and bounds; the table is the single truth for the code, this section
+(generated: `npm run config:table`, pinned by a unit test) and the wallet
+worker, which receives the resolved values from the main thread and reads no
+environment of its own. Parsing rules: an empty value counts as unset; a value
+that does not parse is logged once and the default applies; a number outside
+its bounds is clamped with a warning; booleans accept `true`/`false`, `1`/`0`,
+`yes`/`no`, `on`/`off`. A CAP host may set any of them as
+`cds.requires.nightgate.<camelCase>` (`NIGHTGATE_WORKER_RPC_TIMEOUT_MS` ->
+`workerRpcTimeoutMs`); the environment variable wins, the CAP value beats the
+default. The `ENCRYPTION_*` secrets are environment only.
+
+<!-- config-table:start -->
+| Variable | Kind | Default | Purpose |
+|---|---|---|---|
+| `NIGHTGATE_NETWORK` | `preview` / `testnet` / `preprod` / `mainnet` / `undeployed` |  | Override `network` |
+| `NIGHTGATE_NODE_URL` | url |  | Override `nodeUrl` |
+| `NIGHTGATE_CRAWLER_NODE_URL` | url |  | Override `crawler.nodeUrl` |
+| `NIGHTGATE_INDEXER_HTTP_URL` | url |  | Override `indexerHttpUrl` (e.g. point at local indexer container) |
+| `NIGHTGATE_INDEXER_WS_URL` | url |  | Override `indexerWsUrl`; optional, derived from the HTTP URL when unset |
+| `NIGHTGATE_PROOF_SERVER_URL` | url |  | Override `proofServerUrl` |
+| `NIGHTGATE_PROVING_MODE` | `server` / `wasm` |  | Proving mode `wasm` (in-process) or `server` (proof server). Unset: `server` when a proof server is configured, `wasm` otherwise. `initialize()` pins the effective value into the env for the worker. Read in the wallet worker. |
+| `NIGHTGATE_PROOF_TIMEOUT_MS` | ms (min 1) | `300000` | Override `proofTimeoutMs` (0.22.0); pinned into the env at plugin init for the wallet worker. The proof-server container has its own job TTL (`MIDNIGHT_PROOF_SERVER_JOB_TIMEOUT`, default 600 s): raise both, or a finished-but-expired job answers 5xx and midnight-js re-proves. Read in the wallet worker. |
+| `NIGHTGATE_ZK_CONFIG_BASE` | path | `./contracts` | Override `zkConfigBasePath` |
+| `NIGHTGATE_ZK_CONFIG_PUBLIC_URL` | url |  | Public base URL advertised by `/contract-manifest` for the `/zk-config/...` routes (behind a reverse proxy); unset = relative URLs, resolved by the client against the origin it fetched the manifest from |
+| `NIGHTGATE_ZK_ASSET_URL` | string |  | A `/zk-config` base the server fetches missing prover keys from (`<url>/<contract>/keys/<circuit>.prover`, verified against `keys/manifest.json`); `none`/`off` disables the fetch. Unset: the release tag on raw.githubusercontent.com for the shipped contracts, no source for others. Offline installs run `nightgate-fetch-keys` once. |
+| `NIGHTGATE_CONTRACTS_DIR` | string |  | Root directories (path-delimiter separated) a runtime `registerContract` (admin, 0.21.0) may point into; default: the package's and the working directory's `contracts/`. Importing an artifact executes its module, so paths outside are refused. The supported way to keep a consumer's artifacts outside the package: point it at that directory. The artifact's `@midnight-ntwrk/compact-runtime` import resolves from NIGHTGATE's own node_modules (worker snapshots since 0.21.0, the registration probe since 0.22.0), so the directory needs no node_modules of its own. |
+| `NIGHTGATE_PRIVATE_STATE_BACKEND` | `cap-db` / `level` |  | Override `privateStateBackend` |
+| `NIGHTGATE_GRANTEE_BINDING` | `wallet` / `did` / `custom` |  | Override `granteeBinding` (`wallet` / `did` / `custom`) |
+| `NIGHTGATE_ALLOW_SELF_SERVICE_GRANTEE_REGISTRATION` | bool |  | Override `allowSelfServiceGranteeRegistration` (`false` / `0` / `no` / `off` disables) |
+| `NIGHTGATE_CLOSE_SESSIONS_ON_RESTART` | bool |  | Override `closeSessionsOnRestart` (default on): `false` keeps the previous process's wallet sessions open across a restart |
+| `NIGHTGATE_INSTANCE_ID` | string |  | Stable operator-provided instance identifier; otherwise CF instance GUID, hostname, or a generated UUID |
+| `NIGHTGATE_REPLICA_COUNT` | int (min 1) |  | Actual process/replica count. Must be `1`; takes precedence over CDS `replicaCount` |
+| `NIGHTGATE_ALLOW_PRODUCTION_SQLITE` | bool | `false` | `true` temporarily permits production SQLite with a high-severity warning; intended only for a migration window |
+| `NIGHTGATE_ASSUME_DB_NETWORK` | string |  | Confirms which network an index written before 0.16.2 (rows without a recorded network id) belongs to; the boot guard refuses to bind such an index to the configured network otherwise. |
+| `NIGHTGATE_STATUS_ROUTES` | `off` / `public` |  | Plain `/nightgate/metrics|health|ready` routes: unset = mounted only with `NIGHTGATE_STATUS_TOKEN`, `public` = mounted without a token, `off` = not mounted. |
+| `NIGHTGATE_STATUS_ROUTES_PREFIX` | path | `/nightgate` | Path prefix of the plain status routes. |
+| `NIGHTGATE_STATUS_TOKEN` | secret |  | Bearer token the plain status routes require; without it (and without `NIGHTGATE_STATUS_ROUTES=public`) they are not mounted. |
+| `NIGHTGATE_DEBUG_WALLET_SYNC` | bool | `false` | `true` logs wallet sync-state persistence at debug level |
+| `NIGHTGATE_CRAWLER_ENABLED` | bool |  | `false` / `0` / `no` / `off` disables the crawler at boot |
+| `NIGHTGATE_FETCH_CONCURRENCY` | int (min 1) |  | Override `crawler.fetchConcurrency` |
+| `NIGHTGATE_RPC_BATCH_SIZE` | int (min 1) |  | Override `crawler.rpcBatchSize` |
+| `NIGHTGATE_JOB_LEASE_TTL_MS` | ms (min 1) | `300000` | A `running` job whose heartbeat is older than this is reclaimed (re-dispatched with `attempt + 1`) unless it crossed the external-effect boundary; default 5 minutes. |
+| `NIGHTGATE_CHILD_JOB_WAIT_TIMEOUT_MS` | ms (min 1) |  | Parent-workflow watchdog; defaults to the worker RPC timeout plus 5 minutes. Timeout is fail-closed while the child may continue. |
+| `NIGHTGATE_WORKER_RPC_TIMEOUT_MS` | ms (min 1) | `1800000` | Backstop timeout of one wallet-worker RPC (a proof or a submit); default 30 minutes. |
+| `NIGHTGATE_WORKER_DRAIN_MAX_MS` | ms (min 1) | `600000` | Upper bound of a worker rotation drain (in-flight submits complete first); default 10 minutes, then the worker is terminated and the cut calls fail `WORKER_ROTATED`. |
+| `NIGHTGATE_WORKER_YOUNG_GEN_MB` | int (min 0, max 2048) | `128` | Young-generation size of the wallet worker thread (`resourceLimits.maxYoungGenerationSizeMb`); default 128, `0` = V8 default, clamped to 16..2048. |
+| `NIGHTGATE_WORKER_MAX_GENERATIONS` | int (min 0) | `32` | Distinct artifact generations a worker loads before it rotates (drain + fresh thread); default 32. Read in the wallet worker. |
+| `NIGHTGATE_WORKER_GENERATION_CACHE` | int (min 1) | `8` | Scaffold and provider cache size per worker (bounded cache of artifact generations); default 8. Read in the wallet worker. |
+| `NIGHTGATE_ARTIFACT_SNAPSHOT_DIR` | path |  | Base directory of the immutable content-addressed artifact snapshots the worker proves from; default `<tmpdir>/nightgate-artifact-snapshots`, layout `<base>/<install>/<digest>`. Read in the wallet worker. |
+| `NIGHTGATE_ARTIFACT_SNAPSHOT_TTL_DAYS` | int (min 0) | `14` | Snapshots no live process holds are swept after this many days; default 14. Read in the wallet worker. |
+| `NIGHTGATE_ARTIFACT_DIGEST_MAX_AGE_MS` | ms (min 0) | `300000` | How long the memoised current artifact digest (`getRuntimeInfo`, job resolves) may be trusted before the files are re-hashed regardless of their stat fingerprint. |
+| `NIGHTGATE_DUST_RACE_RETRIES` | int (min 0) | `2` | Rebuild-retries of a bound deploy/call/batch on a transient dust race (`1010/170`, `1010/196`, pre-mempool, fee unspent); default `2`. Each retry re-proves the call, hence smaller than the sponsor path's `NIGHTGATE_SPONSOR_DUST_RETRIES`. `0` disables. |
+| `NIGHTGATE_DUST_RACE_BACKOFF_MS` | ms (min 0) | `5000` | Pause before such a rebuild, letting the dust wallet apply the spend it lost against; default `5000`. |
+| `NIGHTGATE_PREWARM_SYNC_TIMEOUT_MS` | ms (min 1) | `43200000` | Absolute ceiling for the `connectWalletForSigning` prewarm sync-to-tip wait; default `43200000` (12 h, 0.21.0; was 3 h). A backstop: the primary bound is `NIGHTGATE_PREWARM_STALL_MS`. |
+| `NIGHTGATE_PREWARM_STALL_MS` | ms (min 0) | `600000` | Prewarm fails when `appliedIndex` has not advanced for this long, regardless of elapsed time; default `600000` (10 min). A slow-but-moving sync is not stalled. `0` disables the stall bound (ceiling only). Read in the wallet worker. |
+| `NIGHTGATE_SYNC_PROGRESS_STALE_S` | int (min 1) | `60` | `getWalletSyncProgress` reports `stale: true` once its snapshot is older than this; default `60` (four worker push intervals). |
+| `NIGHTGATE_WALLET_READ_SYNC_TIMEOUT_MS` | ms (min 0) | `10000` | Bounded sync gate for facade-backed read actions (`getWalletBalance`, fee estimates): a catching-up facade answers 503 `WALLET_SYNCING` after this instead of parking the request; default `10000`, `0` waits indefinitely. |
+| `NIGHTGATE_BALANCE_SYNC_TIMEOUT_MS` | ms (min 1) | `180000` | Worker-side wait for a genuine wallet sync before balancing a transaction; default `180000`. Read in the wallet worker. |
+| `NIGHTGATE_SYNC_TIP_GAP` | int (min 0) | `8` | Blocks behind the indexer tip a wallet may be and still count as synced; default `8`. Read in the wallet worker. |
+| `NIGHTGATE_SYNC_FRESHNESS_MS` | ms (min 1) | `300000` | How old the indexer's latest block may be for a wallet to count as synced (guards against a lagging self-hosted indexer, error 117); default `300000`. Read in the wallet worker. |
+| `NIGHTGATE_PROGRESS_WATCH_MS` | ms (min 15000) | `60000` | Interval of the worker's idle progress watch that keeps `getWalletSyncProgress` fresh while a facade is behind; default `60000`, floor 15 s. Read in the wallet worker. |
+| `NIGHTGATE_SAVE_INTERVAL_MS` | ms (min 10000) | `60000` | Wallet-state save tick of the worker; default `60000` (0.21.6, was 30 s), floor 10 s. Read in the wallet worker. |
+| `NIGHTGATE_RESTORE_SAVE_ACK_TIMEOUT_MS` | ms (min 1) | `30000` | How long a facade restore waits for the acknowledgement of its immediate re-save; default `30000`. Read in the wallet worker. |
+| `NIGHTGATE_DUST_COLD_START` | bool | `false` | `true` starts the dust sub-wallet from the secret key instead of the persisted state (diagnostic). Read in the wallet worker. |
+| `NIGHTGATE_DUST_REGISTER_SETTLE_MS` | ms (min 0) | `90000` | How long `registerForDustGeneration` waits for the registration to apply locally before it reports `settled: false`; default `90000`. Read in the wallet worker. |
+| `NIGHTGATE_SIGNING_KEY_RATE_LIMIT` | int (min 1) | `10` | `connectWalletForSigning` attempts per hour per principal; default `10`. |
+| `NIGHTGATE_FEE_SPONSOR_SESSION` | list |  | Comma list of platform fee-sponsor session ids (the pool); overrides `feeSponsorSessions`. |
+| `NIGHTGATE_SUBMIT_TRANSPORT_RETRIES` | int (min 0) | `2` | Resends of the SAME finalized transaction when the send itself fails (websocket closed at submit, `1000 Normal Closure`, `ECONNRESET`; never a node reject, never a reply-less wait), 0.22.0; default `2`, `0` disables. No rebuild, no re-proving: the facade re-pends the spends and the identical bytes go out again. Applies to every bound submit (deploy/call/batch, sends, dust registration, bound sponsoring). Read in the wallet worker. |
+| `NIGHTGATE_SUBMIT_TRANSPORT_BACKOFF_MS` | ms (min 0) | `5000` | Pause before such a resend; default `5000`. Read in the wallet worker. |
+| `NIGHTGATE_SUBMIT_LANDED_PROBE_MS` | ms (min 0) | `30000` | How long the worker polls the indexer for the transaction identifier before a resend, and after a resend was rejected (a reply lost on the first send may still have reached the node); default `30000`. A landed transaction is reported as submitted only with ledger result `SUCCESS`; in a block but not applied fails as `TxFailed` (fee spent). Read in the wallet worker. |
+| `NIGHTGATE_SUBMIT_WATCH_TIMEOUT_MS` | ms (min 1) | `60000` | How long a bound submit waits for the node's first status after the send before the outcome counts as ambiguous (reconciled by identifier, never resent); default `60000`. Read in the wallet worker. |
+| `NIGHTGATE_BATCH_SEGMENT_MODE` | `rewrite` / `observe` | `rewrite` | Batch segment ordering: `rewrite` (deterministic stage-grouped order) or `observe` (log only). Read in the wallet worker. |
+| `NIGHTGATE_SPONSOR_POLICY_FILE` | path |  | Path to a JSON file `{ "allowedContracts": [], "allowedCircuits": [], "allowDeploy": false, "allowedTokenTypes": [] }` that replaces `NIGHTGATE_SPONSOR_ALLOWED_CONTRACTS`/`_CIRCUITS` while set (0.21.0). Calls on a grant's `deployedContracts` are exempt from `allowedCircuits` (0.21.2). Re-read per sponsored call behind an mtime cache, so the sponsor policy changes without a container recreate. Fail-closed: an unreadable or invalid file keeps the last good policy, and with none loaded yet sponsored calls answer `503 SPONSOR_POLICY_UNAVAILABLE`. |
+| `NIGHTGATE_SPONSOR_ALLOWED_CONTRACTS` | list |  | Comma list of contract addresses a sponsor pays for (platform floor); empty = any. Replaced by `NIGHTGATE_SPONSOR_POLICY_FILE` while that is set. |
+| `NIGHTGATE_SPONSOR_ALLOWED_CIRCUITS` | list |  | Comma list of circuit names a sponsor pays for (platform floor); empty = any. Replaced by `NIGHTGATE_SPONSOR_POLICY_FILE` while that is set. |
+| `NIGHTGATE_SPONSOR_ALLOWED_TOKEN_TYPES` | list |  | Comma list of raw shielded token types (64 hex, what `deriveTokenType` returns) whose zswap offers the sponsor also pays for (0.22.0): a contract minting its own token to the caller, a caller spending that token into the contract. Unset = no offer at all (the default, unchanged). Also `allowedTokenTypes` in the policy file and on a grant (effective = floor ∩ grant; the floor must open it, a grant only narrows). The shape check then requires every net change of the offer (`deltas`, public per type) to be on a listed type, never NIGHT, every contract-owned coin to belong to a sponsorable contract, and a net change to exist OR a coin in the offer to be owned by a sponsorable contract (a burn nets to zero by construction: user input, contract transient, burn-address output; a zero-net offer without a contract coin is refused). User outputs are commitments, so a transfer of a listed type between users riding along is accepted by design: the sponsor pays dust, no sponsor value moves. An invalid entry fails closed (`503 SPONSOR_POLICY_UNAVAILABLE`). |
+| `NIGHTGATE_SPONSOR_ALLOW_DEPLOY` | bool | `false` | Opens sponsored contract DEPLOYS on this deployment (0.21.0): `true`/`1`/`yes`. Off by default. A token caller additionally needs `allowDeploy` on its grant with deploy budget left; a plain caller inherits the floor. Also settable as `allowDeploy` in `NIGHTGATE_SPONSOR_POLICY_FILE`. |
+| `NIGHTGATE_SPONSOR_MAX_TX_BYTES` | int (min 1) | `65536` | Byte ceiling of a sponsored call transaction the worker accepts; default `65536`. Read in the wallet worker. |
+| `NIGHTGATE_SPONSOR_MAX_DEPLOY_BYTES` | int (min 1) | `40960` | Byte ceiling of a sponsored DEPLOY transaction (a deploy writes verifier keys on chain and costs a multiple of a call); default `40960`. Read in the wallet worker. |
+| `NIGHTGATE_SPONSOR_WAIT` | `inblock` / `finalized` | `inblock` | Submission stage the unbound sponsor path waits for: `inblock` (default) or `finalized`. Read in the wallet worker. |
+| `NIGHTGATE_SPONSOR_INDEXER_VISIBLE_MS` | ms (min 0) | `30000` | After InBlock, bounded wait until the public indexer shows the sponsored transaction; `0` skips the wait; default `30000`. Read in the wallet worker. |
+| `NIGHTGATE_SPONSORED_CALLER_SYNC` | `wait` / `skip` | `wait` | `skip` omits the caller-side wallet sync when balancing a sponsored transaction (vault calls move no caller value). Read in the wallet worker. |
+| `NIGHTGATE_NOTE_LEASE_MS` | ms (min 1) | `300000` | Lease on a dust note backing a sponsored transaction (parallel sponsoring from one wallet); a non-positive or non-numeric value falls back to the default `300000`. Read in the wallet worker. |
+| `NIGHTGATE_BACKING_WAIT_MS` | ms (min 0) | `300000` | How long an unbound sponsoring waits for a free dust backing before it refuses; default `300000`. Read in the wallet worker. |
+| `NIGHTGATE_SPONSOR_PREWARM_SYNC_MS` | ms (min 0) | `1800000` | Prewarm brings pool members to the chain tip one at a time (0.21.4); this caps the wait per sponsor, default 30 min, `0` = build only. |
+| `NIGHTGATE_SPONSOR_STATUS_TIMEOUT_MS` | ms (min 1) | `45000` | Per-sponsor read cap of `getSponsorPoolStatus`; default `45000`. |
+| `NIGHTGATE_SPONSOR_LEASE_WAIT_MS` | ms (min 0) | `120000` | How long a sponsored job waits for a busy or cooling sponsor before it fails over or gives up; default `120000`. |
+| `NIGHTGATE_SPONSOR_COOLDOWN_MS` | ms (min 0) | `120000` | Bench time of a sponsor after a retryable failure; default `120000`. |
+| `NIGHTGATE_SPONSOR_DUST_RETRIES` | int (min 0) | `4` | Rebuild-retries of a sponsored transaction on a dust race, on the same sponsor; default `4`. |
+| `NIGHTGATE_SPONSOR_DUST_BACKOFF_MS` | ms (min 0) | `5000` | Pause before such a rebuild; default `5000`. |
+| `ENCRYPTION_KEY` | secret |  | At-rest secret (32+ byte hex) for viewing keys, seed keys and encrypted job commands; key id `1` of the ring. Without any key a random per-process dev key is used (rows do not survive a restart); **required** in production. Env only, no CAP mapping. |
+| `ENCRYPTION_KEYS` | secret |  | Key ring `id=secret,id=secret` (ids `[A-Za-z0-9_-]{1,16}`); `ENCRYPTION_KEY` joins it as id `1`. Every secret is HKDF-stretched; ciphertexts are `v2:<keyId>:...` envelopes (per-row data key wrapped by the ring key, key id bound as AAD). Pre-0.23 `iv:tag:data` values stay readable under id `1`. Env only, no CAP mapping. |
+| `ENCRYPTION_KEY_ACTIVE` | string |  | Id of the ring key new ciphertexts are written under (required with more than one key). Startup refuses a database whose ciphertexts name a key id outside the ring; `nightgate-rewrap-keys` moves rows to the active key (see docs/operations.md, key rotation). Env only, no CAP mapping. |
+<!-- config-table:end -->
+
+Read by the standalone image and the dev scripts, not by the plugin:
+
 | Variable | Purpose |
 |---|---|
-| `ENCRYPTION_KEY` | AES-256-GCM key (32-byte hex) for at-rest encryption of viewing keys + seed keys. Falls back to a dev key with warning if not set; **required** in production. |
-| `NODE_ENV=production` | Enforces `ENCRYPTION_KEY` and rejects SQLite unless the emergency override is active |
-| `NIGHTGATE_INSTANCE_ID` | Stable operator-provided instance identifier; otherwise CF instance GUID, hostname, or a generated UUID |
-| `NIGHTGATE_REPLICA_COUNT` | Actual process/replica count. Must be `1`; takes precedence over CDS `replicaCount` |
-| `CF_INSTANCE_INDEX` | Read-only, injected by Cloud Foundry (0-based). Any value `> 0` fails closed: only instance `0` may run the crawler, wallet cache and job scheduler. Not consulted off Cloud Foundry |
-| `NIGHTGATE_ALLOW_PRODUCTION_SQLITE` | `true` temporarily permits production SQLite with a high-severity warning; intended only for a migration window |
-| `NIGHTGATE_CHILD_JOB_WAIT_TIMEOUT_MS` | Parent-workflow watchdog; defaults to the worker RPC timeout plus 5 minutes. Timeout is fail-closed while the child may continue. |
-| `NIGHTGATE_NETWORK` | Override `network` |
-| `NIGHTGATE_NODE_URL` | Override `nodeUrl` |
-| `NIGHTGATE_CRAWLER_NODE_URL` | Override `crawler.nodeUrl` |
-| `NIGHTGATE_CRAWLER_ENABLED` | `false` / `0` / `no` / `off` disables the crawler at boot |
-| `NIGHTGATE_CRAWLERLESS_CHAIN_CONFIRM` | Override `crawlerlessChainConfirm` (only effective with the crawler disabled); `false`/`0`/`no`/`off` opts out. Unset defaults to on when the crawler is disabled |
-| `NIGHTGATE_FETCH_CONCURRENCY` | Override `crawler.fetchConcurrency` |
-| `NIGHTGATE_RPC_BATCH_SIZE` | Override `crawler.rpcBatchSize` |
-| `NIGHTGATE_INDEXER_HTTP_URL` | Override `indexerHttpUrl` (e.g. point at local indexer container) |
-| `NIGHTGATE_INDEXER_WS_URL` | Override `indexerWsUrl`; optional, derived from the HTTP URL when unset |
-| `NIGHTGATE_PROOF_SERVER_URL` | Override `proofServerUrl` |
-| `NIGHTGATE_PROOF_TIMEOUT_MS` | Override `proofTimeoutMs` (0.22.0); pinned into the env at plugin init for the wallet worker. The proof-server container has its own job TTL (`MIDNIGHT_PROOF_SERVER_JOB_TIMEOUT`, default 600 s): raise both, or a finished-but-expired job answers 5xx and midnight-js re-proves. |
-| `NIGHTGATE_PROOF_NETWORK` | Network passed to the proof-server container; defaults to `preprod` |
-| `NIGHTGATE_ZK_CONFIG_BASE` | Override `zkConfigBasePath` |
-| `NIGHTGATE_PRIVATE_STATE_BACKEND` | Override `privateStateBackend` |
-| `NIGHTGATE_GRANTEE_BINDING` | Override `granteeBinding` (`wallet` / `did` / `custom`) |
-| `NIGHTGATE_ALLOW_SELF_SERVICE_GRANTEE_REGISTRATION` | Override `allowSelfServiceGranteeRegistration` (`false` / `0` / `no` / `off` disables) |
-| `NIGHTGATE_PREWARM_SYNC_TIMEOUT_MS` | Absolute ceiling for the `connectWalletForSigning` prewarm sync-to-tip wait; default `43200000` (12 h, 0.21.0; was 3 h). A backstop: the primary bound is `NIGHTGATE_PREWARM_STALL_MS`. |
-| `NIGHTGATE_PREWARM_STALL_MS` | Prewarm fails when `appliedIndex` has not advanced for this long, regardless of elapsed time; default `600000` (10 min). A slow-but-moving sync is not stalled. `0` disables the stall bound (ceiling only). |
-| `NIGHTGATE_SYNC_PROGRESS_STALE_S` | `getWalletSyncProgress` reports `stale: true` once its snapshot is older than this; default `60` (four worker push intervals). |
-| `NIGHTGATE_DUST_RACE_RETRIES` | Rebuild-retries of a bound deploy/call/batch on a transient dust race (`1010/170`, `1010/196`, pre-mempool, fee unspent); default `2`. Each retry re-proves the call, hence smaller than the sponsor path's `NIGHTGATE_SPONSOR_DUST_RETRIES`. `0` disables. |
-| `NIGHTGATE_DUST_RACE_BACKOFF_MS` | Pause before such a rebuild, letting the dust wallet apply the spend it lost against; default `5000`. |
-| `NIGHTGATE_SUBMIT_TRANSPORT_RETRIES` | Resends of the SAME finalized transaction when the send itself fails (websocket closed at submit, `1000 Normal Closure`, `ECONNRESET`, submit timeout, no reply; never a node reject), 0.22.0; default `2`, `0` disables. No rebuild, no re-proving: the facade re-pends the spends and the identical bytes go out again. Applies to every bound submit (deploy/call/batch, sends, dust registration, bound sponsoring). |
-| `NIGHTGATE_SUBMIT_TRANSPORT_BACKOFF_MS` | Pause before such a resend; default `5000`. |
-| `NIGHTGATE_SUBMIT_LANDED_PROBE_MS` | How long the worker polls the indexer for the transaction identifier before a resend, and after a resend was rejected (a reply lost on the first send may still have reached the node); default `30000`. A landed transaction is reported as submitted only with ledger result `SUCCESS`; in a block but not applied fails as `TxFailed` (fee spent). |
-| `NIGHTGATE_CONTRACTS_DIR` | Root directories (path-delimiter separated) a runtime `registerContract` (admin, 0.21.0) may point into; default: the package's and the working directory's `contracts/`. Importing an artifact executes its module, so paths outside are refused. The supported way to keep a consumer's artifacts outside the package: point it at that directory. The artifact's `@midnight-ntwrk/compact-runtime` import resolves from NIGHTGATE's own node_modules (worker snapshots since 0.21.0, the registration probe since 0.22.0), so the directory needs no node_modules of its own. |
-| `NIGHTGATE_SPONSOR_POLICY_FILE` | Path to a JSON file `{ "allowedContracts": [], "allowedCircuits": [], "allowDeploy": false, "allowedTokenTypes": [] }` that replaces `NIGHTGATE_SPONSOR_ALLOWED_CONTRACTS`/`_CIRCUITS` while set (0.21.0). Calls on a grant's `deployedContracts` are exempt from `allowedCircuits` (0.21.2). Re-read per sponsored call behind an mtime cache, so the sponsor policy changes without a container recreate. Fail-closed: an unreadable or invalid file keeps the last good policy, and with none loaded yet sponsored calls answer `503 SPONSOR_POLICY_UNAVAILABLE`. |
-| `NIGHTGATE_SPONSOR_ALLOW_DEPLOY` | Opens sponsored contract DEPLOYS on this deployment (0.21.0): `true`/`1`/`yes`. Off by default. A token caller additionally needs `allowDeploy` on its grant with deploy budget left; a plain caller inherits the floor. Also settable as `allowDeploy` in `NIGHTGATE_SPONSOR_POLICY_FILE`. |
-| `NIGHTGATE_SPONSOR_ALLOWED_TOKEN_TYPES` | Comma list of raw shielded token types (64 hex, what `deriveTokenType` returns) whose zswap offers the sponsor also pays for (0.22.0): a contract minting its own token to the caller, a caller spending that token into the contract. Unset = no offer at all (the default, unchanged). Also `allowedTokenTypes` in the policy file and on a grant (effective = floor ∩ grant; the floor must open it, a grant only narrows). The shape check then requires every net change of the offer (`deltas`, public per type) to be on a listed type, never NIGHT, every contract-owned coin to belong to a sponsorable contract, and a net change to exist OR a coin in the offer to be owned by a sponsorable contract (a burn nets to zero by construction: user input, contract transient, burn-address output; a zero-net offer without a contract coin is refused). User outputs are commitments, so a transfer of a listed type between users riding along is accepted by design: the sponsor pays dust, no sponsor value moves. An invalid entry fails closed (`503 SPONSOR_POLICY_UNAVAILABLE`). |
 | `NIGHTGATE_DB_URL` | Standalone image (0.21.1): `postgres://user:pw@host:5432/db` selects PostgreSQL; the schema is deployed on every boot (`cds deploy`, additive). `?sslmode=`: `disable`, `require` (TLS unverified) or `verify-full` (chain + hostname, `sslrootcert=<pem>` optional); `allow`/`prefer`/`verify-ca` and unknown values refuse to start. Unset = SQLite file at `NIGHTGATE_DB_PATH`. |
 | `NIGHTGATE_DB_DEPLOY` | Standalone image with `NIGHTGATE_DB_URL`: `auto` (default) deploys the schema at boot, `never` skips it. |
-| `NIGHTGATE_SAVE_INTERVAL_MS` | Worker save tick per facade (0.21.6): every tick serializes the three sub-wallets into hex blobs and pushes what changed. Default 60000 (was a fixed 30 s), min 10000. Bounds only the sync work a crash re-does on restore; on a busy pool the serialisation churn was the worker's main GC load. |
-| `NIGHTGATE_WORKER_YOUNG_GEN_MB` | Young-generation size of the wallet worker thread (0.21.6): default 128, `0` = V8 default (16 MB semi-spaces), 16..2048. The old-generation limit stays the one NODE_OPTIONS gives the process. |
-| `NIGHTGATE_SPONSOR_PREWARM_SYNC_MS` | Pool prewarm (0.21.4): wait for each sponsor to reach the chain tip before warming the next (default 30 min per sponsor; `0` = build the facade only). One wallet at a time reaches tip N times sooner than N wallets sharing the worker thread. |
-| `NIGHTGATE_PROGRESS_WATCH_MS` | Worker idle progress watch (0.21.4): interval (default 60000, min 15000) at which every facade's dust progress is peeked, the `getWalletSyncProgress` snapshot refreshed and `idle-sync` logged while behind. |
-| `NIGHTGATE_SPONSOR_STATUS_TIMEOUT_MS` | `getSponsorPoolStatus`: cap per sponsor status read (default 45000 since 0.21.4, 20000 before). A read past the cap reports the sponsor as not usable with `lastError` "did not answer within". |
 | `NIGHTGATE_DB_WAIT_SECONDS` | Standalone image `migrate` mode: seconds to wait for the PostgreSQL listener before `cds deploy` (default 60; 1..86400, other values refuse; each connect attempt is capped at the time left, so a dropped SYN cannot outlive the window). |
-| `NIGHTGATE_ARTIFACT_SNAPSHOT_DIR` | Base directory under which the wallet worker materialises the immutable, content-addressed snapshot of each contract artifact generation it loads and proves with (0.21.0). Layout: `<base>/<install>/<pid>/<digest>/{module/artifact.mjs\|.cjs,keys,zkir}` plus a `node_modules` link for bare-specifier resolution at the per-process level, so two installations or two processes of one user never share a link or a snapshot (refcounts and evictions are process-local). Default base: the OS temp directory (`nightgate-artifact-snapshots`). The per-process root is marked with `.nightgate-snapshot-root`; a real `node_modules` directory or a link NIGHTGATE did not create there makes the worker refuse (fail-closed, nothing is deleted). Roots of dead processes are removed at the worker's first use; a snapshot is removed when its generation leaves the worker's caches and no job holds it. Budget the prover keys of the generations in use, per running process. |
-| `NIGHTGATE_WORKER_MAX_GENERATIONS` | Distinct contract artifact generations the wallet worker imports before it rotates (exits cleanly at its next idle moment; the main thread respawns it on the next call and counts a `rotationCount`, not an exit) to release Node's ESM module cache (0.21.0). Default 32; `0` never rotates. A rotation costs the warm facades (a large dust snapshot deserialises for minutes), so keep it generous unless you hot-register many revisions. |
-| `NIGHTGATE_ARTIFACT_SNAPSHOT_TTL_DAYS` | Snapshots not used for this long (and leftover `.tmp-*` builds of dead processes) are swept at the worker's first snapshot use (0.21.0). Default 14; `0` sweeps everything unused at start-up. |
-| `NIGHTGATE_WORKER_GENERATION_CACHE` | How many artifact generations the worker keeps warm at once (contract classes, zk config + proving providers), oldest evicted (0.21.0). Default 8. |
-| `NIGHTGATE_SPONSOR_MAX_DEPLOY_BYTES` | Byte ceiling for a sponsored deploy transaction; default `40960` (a deploy writes verifier keys on chain; the ledger caps written bytes at 32 KiB). Separate from `NIGHTGATE_SPONSOR_MAX_TX_BYTES`. |
-| `NIGHTGATE_DUST_REGISTER_SETTLE_MS` | How long `registerForDustGeneration` watches the wallet for the registration to apply locally before reporting `registeredUtxosAfter`; default `90000`. `0` skips the observation (`settled: false`). |
-| `NIGHTGATE_BALANCE_SYNC_TIMEOUT_MS` | Wallet balance sync-to-tip timeout in the worker's `balanceTx` pre-sync; default `180000` (180 s). A stalled sync fails cleanly instead of hanging. |
-| `NIGHTGATE_WALLET_READ_SYNC_TIMEOUT_MS` | Bounded sync gate for the facade-backed read actions (`getWalletBalance`, `estimateSendNightFee`); default `10000` (10 s). A facade still syncing answers `503` with code `WALLET_SYNCING` instead of blocking the request; `0` or negative disables the gate (wait indefinitely). |
-| `NIGHTGATE_PROVING_MODE` | How transactions are proved: `server` proxies to the proof-server container at `proofServerUrl`; `wasm` proves in-process, so no Docker proof server is needed. Default: `server` when a proof server is explicitly configured (env var or cds config), otherwise `wasm` (fully public zero-config). Wallet transactions go through the SDK's WASM prover; contract deploy/call circuits go through NIGHTGATE's own in-process provider (`srv/midnight/wasm-proof-provider.ts`, zkir over the contract's local key material). WASM caveats: standard-circuit proving keys download from Midnight's S3 bucket at runtime (hard-coded host inside the SDK, NO integrity verification of the fetched material, one in-memory cache per process start) and each proof costs seconds of CPU in the worker thread. Accepted risk for the dev/test scope of this mode; production stays on `server`. |
-| `NIGHTGATE_DEBUG_WALLET_SYNC` | Set `true` to emit per-save wallet-sync timing logs; off by default to keep a consumer's stdout quiet |
-| `NIGHTGATE_RESTORE_SAVE_ACK_TIMEOUT_MS` | How long the dust wedge protection waits for the DB to confirm the restored snapshot's re-persist before logging `persist NOT confirmed` (the restore itself stays effective in memory); default `30000` |
-| `NIGHTGATE_WORKER_RPC_TIMEOUT_MS` | Upper bound for a single worker RPC (build+prove+submit); default `1800000` (30 min). The child-job wait timeout derives from it (+5 min) unless `NIGHTGATE_CHILD_JOB_WAIT_TIMEOUT_MS` overrides it explicitly. |
-| `NIGHTGATE_SYNC_TIP_GAP` | Max allowed gap (dust-event indices) between wallet state and indexer tip for the genuine-sync gate to latch; default `8` |
-| `NIGHTGATE_SYNC_FRESHNESS_MS` | Max age of the indexer's latest block for the sync gate to accept it as "fresh"; default `300000` (5 min) |
-| `NIGHTGATE_DUST_COLD_START` | Set `true` to ignore the persisted dust state blob and rebuild the dust sub-wallet from chain (escape hatch for pruned merkle roots / error 117) |
-| `NIGHTGATE_SPONSORED_CALLER_SYNC` | Set `skip` to skip the caller-facade sync wait in sponsored contract calls (advanced; default is to wait) |
-| `NIGHTGATE_FEE_SPONSOR_SESSION` | Operator-designated sponsor sessionId allowed to pay fees across users (security-relevant; unset = same-user sponsoring only). Exempt from the restart cleanup below, so a pinned id survives restarts |
-| `NIGHTGATE_CLOSE_SESSIONS_ON_RESTART` | Close the wallet sessions left by the previous process at startup; default `true` (`false` / `0` / `no` / `off` opts out). Sessions are per-connect handles owned by a caller in a process, so an ungraceful stop otherwise leaks them for the full TTL. Set `false` only if consumers hold session ids across restarts and expect them to keep working |
-| `NIGHTGATE_SIGNING_KEY_RATE_LIMIT` | Max `connectWalletForSigning` requests per client per hour; default `10` |
-| `NIGHTGATE_ZK_CONFIG_PUBLIC_URL` | Public base URL advertised by `/contract-manifest` for the `/zk-config/...` routes (behind a reverse proxy); default = request host |
-| `SKIP_AUTO_INIT` | Set `true` **only in tests** to skip the plugin's `initialize()` (crawler + wallet worker). Must NOT be set in production. |
-| `INDEXER_SECRET` | 32-byte hex secret for the indexer container's `APP__INFRA__SECRET` |
-| `INDEXER_UPSTREAM_NODE_URL` | Upstream Substrate RPC for the indexer container (default = hosted preprod) |
-| `LACE_VIEWING_KEY` | Consumed by `scripts/start-wallet-sync.mjs` and `scripts/run-deploy-e2e.mjs` to bootstrap a wallet session |
-| `LACE_MNEMONIC` | BIP39 recovery phrase the scripts pass to `connectWalletForSigning`; NIGHTGATE HD-derives the per-role keys |
-| `LACE_SEED_HEX` | Optional alternative to `LACE_MNEMONIC`: the full 64-byte BIP39 seed as 128 hex chars |
-| `DEPLOY_E2E_DUST_WAIT_SECONDS` | `run-deploy-e2e.mjs` parameter - how long to wait after dust registration |
-| `DEPLOY_E2E_SKIP_DUST_REG` | `1` to skip dust registration step in `run-deploy-e2e.mjs` |
 | `NIGHTGATE_HEAP_MB` | Heap size for `scripts/dev.mjs` / `scripts/serve.mjs` (default `12288`) |
+| `NIGHTGATE_PROOF_NETWORK` | Network passed to the proof-server container; defaults to `preprod` |
 
 For local repository startup, drop these into a repo-root `.env`. The tracked template is at [.env.example](../.env.example).
 
@@ -202,7 +232,7 @@ NIGHTGATE runs two independent flows that meet at one reconciliation point. The 
 | **Block crawler** | Main thread | Catch-up + live block subscription via Substrate RPC; writes Blocks/Tx/Actions/UTXOs/Balances into CAP DB |
 | **Wallet SDK** | `worker_threads` worker | ZK-aware wallet ops: shielded/unshielded/dust sub-wallets, transfer/contract submission via the Midnight indexer + prover (proof server or in-process wasm) |
 
-They meet at `reconcilePendingSubmission`: when the crawler indexes a transaction whose hash matches a row in `PendingSubmissions`, the row's status flips to `finalized`.
+They do not meet on a hash (a job's identifier, the crawler's extrinsic hash and the indexer's transaction hash are three different values). The indexer confirmer resolves a job by its identifier and records the inclusion's block height and hash (`chainBlockHeight`, `chainBlockHash`, `indexerTxHash`) on the job and its `PendingSubmissions` row; a reorg rollback reverts every outcome confirmed at or above the fork height.
 
 For each fetched block the crawler also reads Substrate `System.Events` at that
 exact block hash. Runtime metadata is cached by `specVersion` and used to map
@@ -225,7 +255,7 @@ For every action that produces an on-chain transaction:
 2. **Main thread**: register a `CapDbPrivateStateProvider` instance under a fresh `proxyId` (only for deploy/call)
 3. **Worker**: receive RPC, build via facade, balance, finalize (ZK proof gen - heavy), submit; return primitives
 4. **Main thread**: UPDATE row with `txHash` + `status=included`; release proxy; classify any error
-5. **Later, async**: crawler indexes the tx → `reconcilePendingSubmission` flips status to `finalized`
+5. **Later, async**: the indexer confirmer resolves the identifier → `chainStatus`, block height/hash on the job, the attempt row flips to `finalized`
 
 The `sessionId` field on `PendingSubmissions` is the OData user-session UUID (audit trail). The worker keys its facade cache on `accountId` (deterministic from viewing key) - they're different identifiers; see [architecture.md#the-sessionid-indirection](architecture.md#the-sessionid-indirection).
 
@@ -341,8 +371,12 @@ retry:
   return to the queue, unless the session they sign with was closed by the
   restart cleanup (`failed / PROCESS_RESTART_SESSION_CLOSED`, see the
   wallet-session section);
-- `external_execution` or `submitted` becomes `reconciliation_required /
-  PROCESS_RESTART_RECONCILE`;
+- `external_execution` WITHOUT a `txHash` becomes `failed /
+  PROCESS_RESTART_BEFORE_BROADCAST` (0.23.0): every submitting path
+  announces its identifier to the main thread and broadcasts only after it
+  is persisted, so a hash-less row never sent anything;
+- `external_execution` with a `txHash`, or `submitted`, becomes
+  `reconciliation_required / PROCESS_RESTART_RECONCILE`;
 - a job in `reconciliation_required` must be checked against
   `PendingSubmissions`, its persisted `txHash`, or live contract state before a
 caller creates a retry.
@@ -365,9 +399,13 @@ still each add one real wait until the shared sync finishes.
 `succeeded` when NIGHTGATE's command/submission workflow returned successfully;
 this does not assert that the finalized extrinsic executed successfully.
 `chainStatus` is null for non-chain jobs, `pending` after a tx hash is reported,
-and later `success` or `failure` only after the crawler correlates the finalized
-transaction with a canonical `System.Events` outcome. `chainFinalizedAt` records
-when that evidence became available. Predicate workflow parents aggregate their
+and later `success` or `failure` only after the indexer confirmer resolves the
+job's ledger identifier to a finalized transaction result; `chainFinalizedAt`
+records when that evidence became available and `chainBlockHeight` /
+`chainBlockHash` / `indexerTxHash` where the indexer places the inclusion. The
+crawler cannot provide this evidence (it indexes the extrinsic hash, a
+different value); it uses the recorded block height to revert outcomes on a
+reorg. Predicate workflow parents aggregate their
 children: any failed child means `failure`, all successful children mean
 `success`, otherwise the parent remains `pending`.
 
@@ -421,7 +459,7 @@ never replayed.
 
 Contract deploy and generic contract-call jobs also use versioned commands.
 Their complete circuit arguments and initial private state are stored only as
-AES-256-GCM ciphertext (`commandEncoding = aes-gcm-v1`) under `ENCRYPTION_KEY`;
+AES-256-GCM ciphertext (`commandEncoding = aes-gcm-v1`) under the active ring key;
 the public `request` column remains redacted. The processor re-resolves the
 registered artifact, revalidates wallet and sponsor ownership, coerces circuit
 arguments again, and only then executes.
@@ -474,7 +512,7 @@ not cancel or reclaim a hung live SDK promise because the old call may still
 cross the external boundary later. Command replay is crash recovery, not an
 unsafe concurrent takeover of a live process.
 
-The `PrivateStates`, `ContractSigningKeys`, and `WalletSyncStates` tables are encrypted with passwords derived from the viewing key (via PBKDF2). Losing the `ENCRYPTION_KEY` env var means stored viewing/seed keys become unreadable - back it up separately. For private state migration, use `exportPrivateStates({ password })` to produce a portable encrypted blob.
+The `PrivateStates`, `ContractSigningKeys` and `WalletSyncStates` rows are encrypted (PBKDF2 + AES-GCM) under passwords derived from a per-account data key (`AccountKeys`). That key is sealed twice: under the ring's active key, so `nightgate-rewrap-keys` rotates it without the wallet's viewing key, and under the viewing-key-derived storage password, so a session that presents its viewing key opens it even after the ring rotated (and re-seals it under the active key). The ring alone therefore opens an account's rows; the viewing key alone opens nothing. Rows written before the account key (`keyScheme` null) are under ring key + viewing key or viewing key only: a session read migrates them, the rewrap tool migrates the ones a stored viewing key reaches and reports the rest, and the ring key they were written under must stay until none remain. A sync-state blob nobody can open is treated as no cached state (the wallet re-syncs). Losing every ring key means stored viewing/seed keys and account keys become unreadable - back the secrets up separately. For private state migration, use `exportPrivateStates({ password })` to produce a portable encrypted blob.
 
 ### Security middleware
 
@@ -523,10 +561,13 @@ For per-action signatures and curl examples, see [actions.md](actions.md).
 ### NightgateService entities (all `@readonly` unless noted)
 
 - `Blocks`, `Transactions`, `TransactionResults`, `TransactionSegments`, `TransactionFees`
-- `ContractActions`, `ContractBalances`
-- `UnshieldedUtxos`
+- `ContractActions` (one row per `Midnight` pallet extrinsic with its action
+  type; `address` and `state` are null until the ledger payload is decoded),
+  `ContractBalances`
+- `UnshieldedUtxos` (written only by a decoder of the ledger payload; the
+  crawler does not derive UTXOs from the extrinsic envelope)
 - `ZswapLedgerEvents`, `DustLedgerEvents`
-- `NightBalances`
+- `NightBalances` (same: no balance is derived from the extrinsic envelope)
 - `Documents`: anchored document hashes (`anchorDocument`)
 - `PredicateAttestations`: issued ZK predicate attestations
 - `DisclosureGrants`: on-chain disclosure ACL index

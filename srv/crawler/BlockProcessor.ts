@@ -12,8 +12,7 @@ import { Metadata } from '@polkadot/types/metadata';
 import { MidnightNodeProvider, SignedBlock } from '../providers/MidnightNodeProvider';
 import { ensureNightgateModelLoaded } from '../utils/cds-model';
 import { getNightgatePluginConfig } from '../utils/nightgate-config';
-import { parseExtrinsicCallIndices, parseExtrinsicParticipantInfo } from '../utils/scale';
-import { reconcilePendingSubmission } from '../submission/TransactionSubmitter';
+import { parseExtrinsicCallIndices, parseExtrinsicCall, decodeCompactBigInt } from '../utils/scale';
 import {
     Blocks, Transactions, TransactionResults, TransactionFees, ContractActions,
     UnshieldedUtxos, NightBalances, SyncState
@@ -94,15 +93,19 @@ const DEFAULT_PALLET_MAP: Record<number, PalletMapping> = {
 
 const NIGHT_TOKEN_TYPE_HEX = '0x4e49474854';
 
-function buildPalletMap(): Map<number, PalletMapping> {
+/** `cds.requires.nightgate.palletMap`: index-keyed overrides, applied on top of whatever the defaults or the runtime metadata say. */
+/**
+ * The persisted form of an extrinsic: CAP carries `LargeBinary` values as
+ * base64 text on every dialect (SQLite stores that text, PostgreSQL decodes
+ * it to BYTEA on write and encodes on read; a Buffer on the entries path is
+ * JSON-serialised as an object). Reads return the same base64 string.
+ */
+function hexToBinaryValue(hex: string): string {
+    return Buffer.from(hex.startsWith('0x') ? hex.slice(2) : hex, 'hex').toString('base64');
+}
+
+function configPalletOverrides(): Map<number, PalletMapping> {
     const map = new Map<number, PalletMapping>();
-
-    // Load defaults
-    for (const [idx, entry] of Object.entries(DEFAULT_PALLET_MAP)) {
-        map.set(Number(idx), entry);
-    }
-
-    // Override with config
     const nightgateConfig = getNightgatePluginConfig();
     const configMap = nightgateConfig.palletMap;
     if (configMap && typeof configMap === 'object') {
@@ -115,8 +118,45 @@ function buildPalletMap(): Map<number, PalletMapping> {
             map.set(Number(idx), mapping);
         }
     }
-
     return map;
+}
+
+function buildPalletMap(): Map<number, PalletMapping> {
+    const map = new Map<number, PalletMapping>();
+    for (const [idx, entry] of Object.entries(DEFAULT_PALLET_MAP)) {
+        map.set(Number(idx), entry);
+    }
+    for (const [idx, entry] of configPalletOverrides()) map.set(idx, entry);
+    return map;
+}
+
+/**
+ * Resolve the pallet map from the runtime's own metadata: every pallet the
+ * chain declares is matched BY NAME to the default mapping, so a runtime
+ * upgrade that renumbers pallets cannot silently turn ledger transactions
+ * into `unknown` (or an inherent into a contract call). Config overrides
+ * (index-keyed) stay on top. Returns the map plus what changed, for the log.
+ */
+export function resolvePalletMapFromMetadata(
+    pallets: Array<{ name: unknown; index: unknown }>,
+    overrides: Map<number, PalletMapping> = new Map()
+): { map: Map<number, PalletMapping>; moved: string[]; unmapped: string[] } {
+    const byName = new Map<string, PalletMapping>();
+    for (const entry of Object.values(DEFAULT_PALLET_MAP)) byName.set(entry.name, entry);
+    const map = new Map<number, PalletMapping>();
+    const moved: string[] = [];
+    const unmapped: string[] = [];
+    for (const p of pallets) {
+        const name = String((p.name as any)?.toString?.() ?? p.name);
+        const index = Number((p.index as any)?.toNumber?.() ?? p.index);
+        if (!Number.isInteger(index)) continue;
+        const mapping = byName.get(name);
+        if (!mapping) { unmapped.push(`${name}@${index}`); continue; }
+        map.set(index, mapping);
+        if (DEFAULT_PALLET_MAP[index]?.name !== name) moved.push(`${name}@${index}`);
+    }
+    for (const [idx, entry] of overrides) map.set(idx, entry);
+    return { map, moved, unmapped };
 }
 
 // ============================================================================
@@ -131,11 +171,19 @@ export interface ProcessResult {
     processingTimeMs: number;
 }
 
+/** What one runtime version decodes with: its event registry and its pallet map, cached together per specVersion. */
+interface RuntimeContext {
+    registry: TypeRegistry;
+    palletMap: Map<number, PalletMapping>;
+}
+
 /**
  * Per-block data fetched from the node, ready to persist. Produced by
  * `fetchBlockBatch`, consumed by `persistBlockData`. Decoupling fetch from
  * persist lets the crawler pipeline RPC fetches in parallel while writing to
- * SQLite serially.
+ * SQLite serially; every block carries the pallet map of its own runtime, so
+ * a batch straddling a runtime upgrade, or two batches in flight, classify
+ * each block with the right map.
  *
  * Discriminated union on `alreadyIndexed`: a DB short-circuit omits the heavy
  * RPC fields; a full fetch has them all.
@@ -154,6 +202,8 @@ export interface PreparedBlockFetched {
     height: number;
     signedBlock: SignedBlock;
     protocolVersion: number;
+    /** The pallet map of THIS block's runtime version; classification never reads processor state. */
+    palletMap: Map<number, PalletMapping>;
     timestamp: number;
     extrinsicOutcomes: Map<number, 'SUCCESS' | 'FAILURE'>;
     fetchStartedAt: number;
@@ -168,12 +218,11 @@ export interface PreparedBlockFetched {
 
 export class BlockProcessor {
     private db!: cds.DatabaseService;
-    private palletMap: Map<number, PalletMapping>;
-    /** Last successfully fetched specVersion. Fallback ONLY when the
-     *  runtime-version RPC fails; never used to skip the query (runtime
-     *  upgrades would otherwise persist blocks with a stale version). */
-    private cachedSpecVersion: number = 0;
-    private eventRegistries = new Map<number, TypeRegistry>();
+    /** Pallet map without runtime metadata (defaults + config overrides); the metadata-derived map per specVersion lives in `runtimes`. */
+    private readonly defaultPalletMap: Map<number, PalletMapping>;
+    /** Event registry + pallet map per runtime specVersion, loaded once from the node's metadata. */
+    private readonly runtimes = new Map<number, RuntimeContext>();
+    private readonly palletOverrides = configPalletOverrides();
 
     /** Well-known Substrate storage key for Timestamp::Now (twox128("Timestamp") + twox128("Now")) */
     private static readonly TIMESTAMP_STORAGE_KEY =
@@ -185,7 +234,12 @@ export class BlockProcessor {
     constructor(
         private nodeProvider: MidnightNodeProvider
     ) {
-        this.palletMap = buildPalletMap();
+        this.defaultPalletMap = buildPalletMap();
+    }
+
+    /** The pallet map of a runtime version: from its metadata when loaded, else the defaults. */
+    private palletMapFor(specVersion: number): Map<number, PalletMapping> {
+        return this.runtimes.get(specVersion)?.palletMap ?? this.defaultPalletMap;
     }
 
     async init(): Promise<void> {
@@ -245,32 +299,28 @@ export class BlockProcessor {
             if (hashes[i] && !existingSet.has(hashes[i])) newIndices.push(i);
         }
 
-        // Round 2: block + timestamp + System.Events for every new hash.
+        // Round 2: block + timestamp + System.Events + runtime version for
+        // every new hash, one batch frame. The version rides per block (it is
+        // cheap inside the frame) so a runtime upgrade inside a batch is
+        // decoded with the right metadata from its first block on.
         let blockResults: SignedBlock[] = [];
         let tsResults: (string | null)[] = [];
         let eventResults: (string | null)[] = [];
+        let versionResults: Array<{ specVersion?: number } | null> = [];
         if (newIndices.length > 0) {
             const requests: Array<{ method: string; params: unknown[] }> = [];
             for (const i of newIndices) {
                 requests.push({ method: 'chain_getBlock', params: [hashes[i]] });
                 requests.push({ method: 'state_getStorage', params: [BlockProcessor.TIMESTAMP_STORAGE_KEY, hashes[i]] });
                 requests.push({ method: 'state_getStorage', params: [BlockProcessor.SYSTEM_EVENTS_STORAGE_KEY, hashes[i]] });
+                requests.push({ method: 'state_getRuntimeVersion', params: [hashes[i]] });
             }
             const flat = await this.nodeProvider.rpcBatch(requests);
-            blockResults = newIndices.map((_, k) => flat[k * 3]);
-            tsResults = newIndices.map((_, k) => flat[k * 3 + 1]);
-            eventResults = newIndices.map((_, k) => flat[k * 3 + 2]);
+            blockResults = newIndices.map((_, k) => flat[k * 4]);
+            tsResults = newIndices.map((_, k) => flat[k * 4 + 1]);
+            eventResults = newIndices.map((_, k) => flat[k * 4 + 2]);
+            versionResults = newIndices.map((_, k) => flat[k * 4 + 3]);
         }
-
-        // ProtocolVersion is queried once per batch (first hash) so runtime
-        // upgrades land at batch granularity: one extra RPC per batch, and an
-        // upgrade mid-batch is reflected from the next batch onward.
-        const protocolVersion = heights.length > 0 && hashes[0]
-            ? await this.getProtocolVersion(hashes[0])
-            : this.cachedSpecVersion;
-        const eventRegistry = newIndices.length > 0 && hashes[0]
-            ? await this.getEventRegistry(hashes[0], protocolVersion)
-            : undefined;
 
         const fetchCompletedAt = Date.now();
 
@@ -296,14 +346,18 @@ export class BlockProcessor {
             if (!signedBlock?.block) {
                 throw new Error(`No block body returned for height ${heights[i]} (pruned or racing node)`);
             }
-            const timestamp = this.parseTimestampHex(tsResults[newIdx]);
-            const extrinsicOutcomes = this.decodeExtrinsicOutcomes(eventResults[newIdx], eventRegistry);
+            const protocolVersion = this.specVersionFromBatch(versionResults[newIdx], `height ${heights[i]}`);
+            const eventRegistry = await this.getEventRegistry(blockHash, protocolVersion);
+            const palletMap = this.palletMapFor(protocolVersion);
+            const timestamp = this.resolveTimestamp(tsResults[newIdx], signedBlock.block.extrinsics, `height ${heights[i]}`, palletMap);
+            const extrinsicOutcomes = this.decodeExtrinsicOutcomes(eventResults[newIdx], eventRegistry, `height ${heights[i]}`, signedBlock.block.extrinsics?.length ?? 0);
             newIdx++;
             out[i] = {
                 blockHash,
                 height: heights[i],
                 signedBlock,
                 protocolVersion,
+                palletMap,
                 timestamp,
                 extrinsicOutcomes,
                 fetchStartedAt,
@@ -314,14 +368,42 @@ export class BlockProcessor {
         return out;
     }
 
-    private parseTimestampHex(hex: string | null | undefined): number {
-        if (!hex) return Math.floor(Date.now() / 1000);
+    /** Timestamp::Now storage (SCALE u64 LE milliseconds) as UNIX seconds, or null when absent/unparseable. */
+    private parseTimestampHex(hex: string | null | undefined): number | null {
+        if (!hex) return null;
         const clean = hex.startsWith('0x') ? hex.slice(2) : hex;
         try {
             return Number(Buffer.from(clean, 'hex').readBigUInt64LE(0) / 1000n);
         } catch {
-            return Math.floor(Date.now() / 1000);
+            return null;
         }
+    }
+
+    /**
+     * The block's own timestamp: Timestamp::Now storage first; against a
+     * pruning node (state gone) the `Timestamp.set(now)` inherent that every
+     * block carries as extrinsic 0 (Compact<u64> ms, no state read needed).
+     * NEVER the wall clock: a catch-up would persist "now" on every historical
+     * block with nothing marking the rows.
+     */
+    private resolveTimestamp(storageHex: string | null | undefined, extrinsics: string[] | undefined, where: string, palletMap: Map<number, PalletMapping> = this.defaultPalletMap): number {
+        const fromStorage = this.parseTimestampHex(storageHex);
+        if (fromStorage != null) return fromStorage;
+        const fromInherent = this.decodeTimestampInherent(extrinsics, palletMap);
+        if (fromInherent != null) return fromInherent;
+        throw new Error(`No timestamp for ${where}: Timestamp storage empty and no Timestamp.set inherent (pruned or racing node)`);
+    }
+
+    private decodeTimestampInherent(extrinsics: string[] | undefined, palletMap: Map<number, PalletMapping> = this.defaultPalletMap): number | null {
+        const first = extrinsics?.[0];
+        if (!first) return null;
+        const call = parseExtrinsicCall(first);
+        if (!call) return null;
+        const pallet = palletMap.get(call.palletIndex);
+        if (pallet?.name !== 'Timestamp' || call.callIndex !== 0) return null;
+        const decoded = decodeCompactBigInt(call.buf, call.argsOffset);
+        if (!decoded) return null;
+        return Number(decoded[0] / 1000n);
     }
 
     /**
@@ -375,10 +457,10 @@ export class BlockProcessor {
             };
         }
 
-        // Parallelize the three independent RPC fetches over the same WSS.
-        const [signedBlock, timestamp, protocolVersion, rawEvents] = await Promise.all([
+        // Parallelize the independent RPC fetches over the same WSS.
+        const [signedBlock, timestampHex, protocolVersion, rawEvents] = await Promise.all([
             this.nodeProvider.getBlock(blockHash),
-            this.getBlockTimestamp(blockHash),
+            this.getBlockTimestampHex(blockHash),
             this.getProtocolVersion(blockHash),
             this.nodeProvider.getStorage(BlockProcessor.SYSTEM_EVENTS_STORAGE_KEY, blockHash)
         ]);
@@ -388,14 +470,17 @@ export class BlockProcessor {
         const header = signedBlock.block.header;
         const height = MidnightNodeProvider.parseBlockNumber(header.number);
         const eventRegistry = await this.getEventRegistry(blockHash, protocolVersion);
+        const palletMap = this.palletMapFor(protocolVersion);
+        const timestamp = this.resolveTimestamp(timestampHex, signedBlock.block.extrinsics, `block ${blockHash}`, palletMap);
 
         return this.persistFromNode({
             blockHash,
             height,
             signedBlock,
             protocolVersion,
+            palletMap,
             timestamp,
-            extrinsicOutcomes: this.decodeExtrinsicOutcomes(rawEvents, eventRegistry),
+            extrinsicOutcomes: this.decodeExtrinsicOutcomes(rawEvents, eventRegistry, `block ${blockHash}`, signedBlock.block.extrinsics?.length ?? 0),
             fetchStartedAt: start,
             alreadyIndexed: false
         }, start, opts);
@@ -406,7 +491,7 @@ export class BlockProcessor {
         start: number,
         opts?: { requireParent?: boolean }
     ): Promise<ProcessResult> {
-        const { blockHash, height, signedBlock, protocolVersion, timestamp, extrinsicOutcomes } = prep;
+        const { blockHash, height, signedBlock, protocolVersion, palletMap, timestamp, extrinsicOutcomes } = prep;
         const header = signedBlock.block.header;
         const extrinsics = signedBlock.block.extrinsics;
 
@@ -444,33 +529,37 @@ export class BlockProcessor {
             const txResultRows: Record<string, unknown>[] = [];
             const txFeeRows: Record<string, unknown>[] = [];
             const contractActionRows: Record<string, unknown>[] = [];
-            const pendingReconciles: Array<{ hash: string; ctx: Record<string, unknown> }> = [];
-            const transferProjections: Array<{
-                txId: string; txHash: string; blockHeight: number; blockTimestamp: number;
-                senderAddress: string | null; receiverAddress: string; amount: string; outputIndex: number;
-            }> = [];
 
             for (let i = 0; i < extrinsics.length; i++) {
                 const extrinsicHex = extrinsics[i];
                 const txId = cds.utils.uuid();
-                const classification = this.classifyExtrinsic(extrinsicHex);
-                const participants = parseExtrinsicParticipantInfo(extrinsicHex);
+                const classification = this.classifyExtrinsic(extrinsicHex, palletMap);
                 const extrinsicHash = this.hashExtrinsic(extrinsicHex);
                 const txSize = this.extrinsicSize(extrinsicHex);
                 const circuitName = this.buildCircuitName(classification);
                 const contractActionType = this.toContractActionType(classification.txType);
-                const contractAddress = contractActionType ? this.deriveContractAddress(extrinsicHash) : null;
-                const senderAddress = participants?.senderAddress || null;
-                const isTransferLike = !!participants?.receiverAddress && !!participants?.amount && !classification.isSystem;
-                const receiverAddress = isTransferLike ? participants!.receiverAddress! : null;
-                const nightAmount = isTransferLike ? participants!.amount! : null;
+                // The ledger payload inside `Midnight.send_mn_transaction` is not
+                // decoded here. A NIGHT transfer, a contract address, the
+                // sender and the amount live in that payload, so these columns
+                // stay null rather than carry values derived from the
+                // extrinsic envelope (which used to mint a "contract address"
+                // from the extrinsic hash and a "transfer" from any signed
+                // extrinsic that happened to parse as MultiAddress + Compact).
+                const contractAddress: string | null = null;
+                const senderAddress: string | null = null;
+                const receiverAddress: string | null = null;
+                const nightAmount: string | null = null;
 
                 txRows.push({
                     ID: txId,
                     transactionId: i,
                     hash: extrinsicHash,
                     protocolVersion,
-                    raw: extrinsicHex,
+                    // Base64 of the bytes (CAP's LargeBinary transport), not the
+                    // hex text: PostgreSQL base64-decodes a string in a binary
+                    // column (garbage or a rejected batch); SQLite kept the hex
+                    // verbatim, which is why nobody noticed.
+                    raw: hexToBinaryValue(extrinsicHex),
                     transactionType: classification.isSystem ? 'SYSTEM' : 'REGULAR',
                     txType: classification.txType,
                     isShielded: classification.isShielded,
@@ -502,34 +591,16 @@ export class BlockProcessor {
                     transaction_ID: txId
                 });
 
-                pendingReconciles.push({
-                    hash: extrinsicHash,
-                    ctx: {
-                        txId, transactionId: i, txType: classification.txType,
-                        contractAddress, circuitName, blockId, blockHeight: height, timestamp
-                    }
-                });
-
-                if (isTransferLike && receiverAddress && nightAmount) {
-                    transferProjections.push({
-                        txId,
-                        txHash: extrinsicHash,
-                        blockHeight: height,
-                        blockTimestamp: timestamp,
-                        senderAddress,
-                        receiverAddress,
-                        amount: nightAmount,
-                        outputIndex: i
-                    });
-                }
-
-                if (contractActionType && contractAddress) {
+                if (contractActionType) {
                     contractActionRows.push({
                         ID: cds.utils.uuid(),
                         address: contractAddress,
                         actionType: contractActionType,
                         entryPoint: circuitName,
-                        state: extrinsicHex,
+                        // The ledger payload is not decoded, so there is no
+                        // contract state to record; the extrinsic bytes live
+                        // once, on the transaction row.
+                        state: null,
                         transaction_ID: txId
                     });
                     actionCount++;
@@ -543,14 +614,6 @@ export class BlockProcessor {
             if (txResultRows.length) await tx.run(INSERT.into(TransactionResults).entries(txResultRows));
             if (txFeeRows.length) await tx.run(INSERT.into(TransactionFees).entries(txFeeRows));
             if (contractActionRows.length) await tx.run(INSERT.into(ContractActions).entries(contractActionRows));
-
-            // Cold path
-            for (const r of pendingReconciles) {
-                await reconcilePendingSubmission(tx, r.hash, r.ctx);
-            }
-            for (const tp of transferProjections) {
-                await this.persistTransferProjections(tx, tp);
-            }
 
             // 3. Update SyncState
             await tx.run(
@@ -572,7 +635,8 @@ export class BlockProcessor {
         };
     }
 
-    private classifyExtrinsic(hex: string): ExtrinsicClassification {
+    /** Classify with the pallet map of the block's runtime; the default map only when none is given (tests). */
+    private classifyExtrinsic(hex: string, palletMap: Map<number, PalletMapping> = this.defaultPalletMap): ExtrinsicClassification {
         if (!hex || hex.length < 10) {
             return { txType: 'system', isShielded: false, isSystem: true };
         }
@@ -581,7 +645,7 @@ export class BlockProcessor {
         const indices = parseExtrinsicCallIndices(hex);
         if (indices) {
             return {
-                ...this.mapPalletCall(indices.palletIndex, indices.callIndex),
+                ...this.mapPalletCall(indices.palletIndex, indices.callIndex, palletMap),
                 palletIndex: indices.palletIndex,
                 callIndex: indices.callIndex
             };
@@ -606,12 +670,6 @@ export class BlockProcessor {
         return null;
     }
 
-    private deriveContractAddress(extrinsicHash: string): string {
-        const cleanHash = extrinsicHash.startsWith('0x') ? extrinsicHash.slice(2) : extrinsicHash;
-        // Keep a deterministic 28-byte key-hash-like identifier for contract address grouping.
-        return `0x${cleanHash.slice(0, 56)}`;
-    }
-
     private buildCircuitName(classification: ExtrinsicClassification): string | null {
         if (classification.palletIndex == null || classification.callIndex == null) {
             return null;
@@ -620,17 +678,18 @@ export class BlockProcessor {
         return `${classification.palletIndex}:${classification.callIndex}`;
     }
 
-    private mapPalletCall(palletIndex: number, callIndex: number): {
+    private mapPalletCall(palletIndex: number, callIndex: number, palletMap: Map<number, PalletMapping> = this.defaultPalletMap): {
         txType: string;
         isShielded: boolean;
         isSystem: boolean;
     } {
-        const entry = this.palletMap.get(palletIndex);
+        const entry = palletMap.get(palletIndex);
         if (!entry) {
             return { txType: 'unknown', isShielded: false, isSystem: false };
         }
 
-        // For Contracts pallet, distinguish deploy vs call vs update by call_index
+        // A `Contracts`-named mapping (config override / tests) distinguishes
+        // deploy vs call vs update by call_index.
         let txType = entry.txType;
         if (entry.name === 'Contracts') {
             if (callIndex === 0) txType = 'contract_call';
@@ -643,134 +702,6 @@ export class BlockProcessor {
             isShielded: entry.isShielded || false,
             isSystem: entry.isSystem || false
         };
-    }
-
-    private async persistTransferProjections(tx: any, params: {
-        txId: string;
-        txHash: string;
-        blockHeight: number;
-        blockTimestamp: number;
-        senderAddress: string | null;
-        receiverAddress: string;
-        amount: string;
-        outputIndex: number;
-    }): Promise<void> {
-        const amount = this.toBigInt(params.amount);
-        if (amount <= 0n) return;
-
-        await tx.run(INSERT.into(UnshieldedUtxos).entries({
-            ID: cds.utils.uuid(),
-            owner: params.receiverAddress,
-            tokenType: NIGHT_TOKEN_TYPE_HEX,
-            value: amount.toString(),
-            intentHash: params.txHash,
-            outputIndex: params.outputIndex,
-            ctime: params.blockTimestamp,
-            initialNonce: params.txHash,
-            registeredForDustGeneration: false,
-            createdAtTransaction_ID: params.txId
-        }));
-
-        await this.upsertNightBalance(tx, {
-            address: params.receiverAddress,
-            blockHeight: params.blockHeight,
-            balanceDelta: amount,
-            utxoCountDelta: 1,
-            txSentDelta: 0,
-            txReceivedDelta: 1,
-            sentAmountDelta: 0n,
-            receivedAmountDelta: amount
-        });
-
-        if (params.senderAddress && params.senderAddress !== params.receiverAddress) {
-            await this.upsertNightBalance(tx, {
-                address: params.senderAddress,
-                blockHeight: params.blockHeight,
-                balanceDelta: 0n,
-                utxoCountDelta: 0,
-                txSentDelta: 1,
-                txReceivedDelta: 0,
-                sentAmountDelta: amount,
-                receivedAmountDelta: 0n
-            });
-        }
-    }
-
-    private async upsertNightBalance(tx: any, params: {
-        address: string;
-        blockHeight: number;
-        balanceDelta: bigint;
-        utxoCountDelta: number;
-        txSentDelta: number;
-        txReceivedDelta: number;
-        sentAmountDelta: bigint;
-        receivedAmountDelta: bigint;
-    }): Promise<void> {
-        const nowIso = new Date().toISOString();
-        const existing = await tx.run(
-            SELECT.one
-                .from(NightBalances)
-                .columns(
-                    'address',
-                    'balance',
-                    'utxoCount',
-                    'txSentCount',
-                    'txReceivedCount',
-                    'totalSent',
-                    'totalReceived'
-                )
-                .where({ address: params.address })
-        );
-
-        if (!existing) {
-            const initialBalance = params.balanceDelta < 0n ? 0n : params.balanceDelta;
-
-            await tx.run(INSERT.into(NightBalances).entries({
-                address: params.address,
-                balance: initialBalance.toString() as any,
-                utxoCount: Math.max(params.utxoCountDelta, 0),
-                firstSeenHeight: params.blockHeight,
-                firstSeenAt: nowIso,
-                lastActivityHeight: params.blockHeight,
-                lastActivityAt: nowIso,
-                txSentCount: Math.max(params.txSentDelta, 0),
-                txReceivedCount: Math.max(params.txReceivedDelta, 0),
-                totalSent: params.sentAmountDelta.toString() as any,
-                totalReceived: params.receivedAmountDelta.toString() as any,
-                lastUpdatedHeight: params.blockHeight,
-                lastUpdatedAt: nowIso
-            }));
-            return;
-        }
-
-        const currentBalance = this.toBigInt(existing.balance);
-        const nextBalanceRaw = currentBalance + params.balanceDelta;
-        const nextBalance = nextBalanceRaw < 0n ? 0n : nextBalanceRaw;
-
-        const currentUtxoCount = this.toInt(existing.utxoCount);
-        const nextUtxoCount = Math.max(currentUtxoCount + params.utxoCountDelta, 0);
-
-        const currentSentCount = this.toInt(existing.txSentCount);
-        const currentReceivedCount = this.toInt(existing.txReceivedCount);
-
-        const currentTotalSent = this.toBigInt(existing.totalSent);
-        const currentTotalReceived = this.toBigInt(existing.totalReceived);
-
-        await tx.run(
-            UPDATE.entity(NightBalances).set({
-                // Decimal(20,0) columns carrying u128 amounts as strings, see INSERT above.
-                balance: nextBalance.toString() as any,
-                utxoCount: nextUtxoCount,
-                txSentCount: currentSentCount + params.txSentDelta,
-                txReceivedCount: currentReceivedCount + params.txReceivedDelta,
-                totalSent: (currentTotalSent + params.sentAmountDelta).toString() as any,
-                totalReceived: (currentTotalReceived + params.receivedAmountDelta).toString() as any,
-                lastActivityHeight: params.blockHeight,
-                lastActivityAt: nowIso,
-                lastUpdatedHeight: params.blockHeight,
-                lastUpdatedAt: nowIso
-            }).where({ address: params.address })
-        );
     }
 
     private toBigInt(value: unknown): bigint {
@@ -806,29 +737,88 @@ export class BlockProcessor {
         return '0x' + bytesToHex(hash);
     }
 
+    /**
+     * The event registry (and pallet map) of a runtime version, loaded from
+     * the node's metadata once per specVersion. Fail-closed: when the
+     * metadata cannot be loaded or decoded the block is NOT processed under
+     * the previous version's map (outcomes and pallet names would be guesses);
+     * the error propagates as a block-level fetch failure, so the batch is
+     * retried like any other RPC failure and nothing is persisted. A failed
+     * load is not cached.
+     */
     private async getEventRegistry(blockHash: string, specVersion: number): Promise<TypeRegistry | undefined> {
-        if (!specVersion) return undefined;
-        const cached = this.eventRegistries.get(specVersion);
-        if (cached) return cached;
-        try {
-            const metadataHex = await this.nodeProvider.getMetadata(blockHash);
-            const registry = new TypeRegistry();
-            registry.setMetadata(new Metadata(registry, metadataHex as `0x${string}`));
-            this.eventRegistries.set(specVersion, registry);
-            return registry;
-        } catch (err) {
-            log.warn(`Failed to load runtime metadata for System.Events at ${blockHash}: ${(err as Error).message}`);
-            return undefined;
+        // specVersionFromBatch admits 0 as a valid version; a falsy check here
+        // would classify such a block with the default map and no metadata.
+        if (!Number.isInteger(specVersion) || specVersion < 0) {
+            throw new Error(`Invalid runtime specVersion ${String(specVersion)} for block ${blockHash}`);
         }
+        const cached = this.runtimes.get(specVersion);
+        if (cached) return cached.registry;
+        let metadataHex: unknown;
+        try {
+            metadataHex = await this.nodeProvider.getMetadata(blockHash);
+        } catch (err) {
+            throw new Error(`Runtime metadata unavailable for block ${blockHash} (specVersion ${specVersion}): ${(err as Error).message}`);
+        }
+        if (typeof metadataHex !== 'string' || !metadataHex.startsWith('0x') || metadataHex.length < 4) {
+            // A null/empty answer is what a pruned or racing node gives: transient.
+            throw new Error(`No runtime metadata for block ${blockHash} (specVersion ${specVersion}): pruned or racing node`);
+        }
+        let registry: TypeRegistry;
+        try {
+            registry = new TypeRegistry();
+            registry.setMetadata(new Metadata(registry, metadataHex as `0x${string}`));
+        } catch (err) {
+            throw new Error(`Runtime metadata for block ${blockHash} (specVersion ${specVersion}) does not decode: ${(err as Error).message}`);
+        }
+        // Registry and pallet map are ONE cache entry per specVersion: a block
+        // is always classified with the map of the runtime it was produced by.
+        this.runtimes.set(specVersion, { registry, palletMap: this.palletMapFromMetadata(registry, specVersion) });
+        return registry;
     }
 
-    /** Decode only the canonical System outcome event for each extrinsic. */
+    /**
+     * The runtime's own pallet list decides the map (see
+     * resolvePalletMapFromMetadata). A metadata whose pallets cannot be read is
+     * an unsupported representation: the block fails instead of being
+     * classified with the compiled default indices.
+     */
+    private palletMapFromMetadata(registry: TypeRegistry, specVersion: number): Map<number, PalletMapping> {
+        let pallets: Array<{ name: unknown; index: unknown }>;
+        try { pallets = ((registry.metadata as any)?.pallets ?? []) as Array<{ name: unknown; index: unknown }>; } catch (err) {
+            throw new Error(`Runtime metadata for specVersion ${specVersion} exposes no readable pallet list (unsupported metadata representation): ${(err as Error).message}`);
+        }
+        if (!Array.isArray(pallets) || pallets.length === 0) {
+            throw new Error(`Runtime metadata for specVersion ${specVersion} lists no pallets (unsupported metadata representation); refusing to classify with the default pallet indices`);
+        }
+        const { map, moved, unmapped } = resolvePalletMapFromMetadata(pallets, this.palletOverrides);
+        const detail = [
+            moved.length ? `moved from the default indices: ${moved.join(', ')}` : '',
+            unmapped.length ? `not in the default map (txType unknown): ${unmapped.join(', ')}` : ''
+        ].filter(Boolean).join('; ');
+        (moved.length ? log.warn : log.info).call(log, `pallet map for specVersion ${specVersion} resolved from runtime metadata (${map.size} pallets)${detail ? ': ' + detail : ''}`);
+        return map;
+    }
+
+    /**
+     * Decode only the canonical System outcome event for each extrinsic. When
+     * the events cannot be read or decoded the outcomes stay unknown; that is
+     * logged per block (a job waiting on the outcome of one of these
+     * transactions never resolves from crawler evidence).
+     */
     private decodeExtrinsicOutcomes(
         rawEvents: string | null | undefined,
-        registry: TypeRegistry | undefined
+        registry: TypeRegistry | undefined,
+        where: string = '',
+        extrinsicCount: number = 0
     ): Map<number, 'SUCCESS' | 'FAILURE'> {
         const outcomes = new Map<number, 'SUCCESS' | 'FAILURE'>();
-        if (!rawEvents || !registry) return outcomes;
+        if (!rawEvents || !registry) {
+            if (extrinsicCount > 0) {
+                log.warn(`${where || 'block'}: transaction outcomes unknown (${!rawEvents ? 'System.Events storage empty (pruned or racing node)' : 'no runtime metadata registry'}); ${extrinsicCount} extrinsic(s) get no TransactionResults row`);
+            }
+            return outcomes;
+        }
         try {
             const records: any = registry.createType('Vec<EventRecord>', rawEvents);
             for (const record of records as any) {
@@ -847,42 +837,51 @@ export class BlockProcessor {
     }
 
     /**
-     * Query the Timestamp pallet storage at a specific block to get the on-chain timestamp.
-     * Returns UNIX timestamp in seconds. Falls back to wall-clock time if query fails.
+     * The batched `state_getRuntimeVersion` answer for one block. Fail-closed:
+     * without it the block is not persisted (it would be decoded with another
+     * runtime's map); the error is transient, the batch is retried.
      */
-    private async getBlockTimestamp(blockHash: string): Promise<number> {
+    private specVersionFromBatch(rv: { specVersion?: unknown } | null | undefined, where: string): number {
+        // The raw value must be a number (or a digit string) BEFORE conversion:
+        // Number(null), Number('') and Number(false) are all 0, a valid version,
+        // and would file this block's metadata under runtime 0.
+        const raw = rv?.specVersion;
+        const v = typeof raw === 'number' ? raw
+            : typeof raw === 'string' && /^\d+$/.test(raw) ? Number(raw)
+            : NaN;
+        if (Number.isInteger(v) && v >= 0) return v;
+        throw new Error(`No runtime version for ${where} (pruned or racing node)`);
+    }
+
+    /** Timestamp::Now storage at a block as UNIX seconds, null when absent (no wall clock). */
+    private async getBlockTimestamp(blockHash: string): Promise<number | null> {
+        return this.parseTimestampHex(await this.getBlockTimestampHex(blockHash));
+    }
+
+    /** Timestamp::Now storage at a block (raw hex), null when the RPC fails or the state is gone. */
+    private async getBlockTimestampHex(blockHash: string): Promise<string | null> {
         try {
-            const result = await this.nodeProvider.getStorage(
-                BlockProcessor.TIMESTAMP_STORAGE_KEY,
-                blockHash
-            );
-            if (result) {
-                const hex = result.startsWith('0x') ? result.slice(2) : result;
-                const buf = Buffer.from(hex, 'hex');
-                // Timestamp::Now is a SCALE-encoded u64, little-endian, in milliseconds
-                const msTimestamp = buf.readBigUInt64LE(0);
-                return Number(msTimestamp / 1000n);
-            }
+            return (await this.nodeProvider.getStorage(BlockProcessor.TIMESTAMP_STORAGE_KEY, blockHash)) ?? null;
         } catch (err) {
             log.warn(`Failed to read on-chain timestamp for ${blockHash}: ${(err as Error).message}`);
+            return null;
         }
-        return Math.floor(Date.now() / 1000);
     }
 
     /**
-     * Get the runtime specVersion at a specific block. Always queried per
-     * block/batch so runtime upgrades are reflected; the cached value is only
-     * a fallback when the RPC itself fails.
+     * The runtime specVersion at a specific block, queried per block so a
+     * runtime upgrade is reflected from its first block on. Fail-closed: a
+     * failed or empty answer refuses the block (never a previous version's
+     * map), as a transient error the caller retries.
      */
     private async getProtocolVersion(blockHash: string): Promise<number> {
+        let rv: { specVersion?: number } | null | undefined;
         try {
-            const rv = await this.nodeProvider.getRuntimeVersion(blockHash);
-            this.cachedSpecVersion = rv.specVersion;
-            return rv.specVersion;
+            rv = await this.nodeProvider.getRuntimeVersion(blockHash);
         } catch (err) {
-            log.warn(`Failed to get runtime version for ${blockHash}: ${(err as Error).message}`);
-            return this.cachedSpecVersion;
+            throw new Error(`No runtime version for block ${blockHash}: ${(err as Error).message}`);
         }
+        return this.specVersionFromBatch(rv, `block ${blockHash}`);
     }
 
     /**

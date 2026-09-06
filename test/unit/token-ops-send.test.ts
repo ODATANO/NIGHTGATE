@@ -43,7 +43,7 @@ describe('sendNight', () => {
             amount:          '1000000',
             ttlIso:          '2026-12-31T00:00:00Z',
             syncTimeoutMs:   60000
-        });
+        }, undefined);
         expect(result).toMatchObject({
             txId: 'tx-1',
             toLedger: 'unshielded',
@@ -90,7 +90,7 @@ describe('sendNight', () => {
             amount:          '500',
             ttlIso:          undefined,
             syncTimeoutMs:   undefined
-        });
+        }, undefined);
     });
 
     test('propagates worker errors to caller', async () => {

@@ -47,7 +47,7 @@ vi.mock('../../srv/utils/wallet-info', async () => {
     };
 });
 
-import { registerWalletSessionHandlers } from '../../srv/sessions/wallet-sessions';
+import { registerWalletSessionHandlers, __resetWalletRateLimitersForTests } from '../../srv/sessions/wallet-sessions';
 import { encrypt, decrypt, getEncryptionKey } from '../../srv/utils/crypto';
 
 type Handler = (req: any) => Promise<any>;
@@ -149,6 +149,8 @@ function seedSession(db: ReturnType<typeof makeFakeDb>, overrides: any = {}) {
         ...overrides
     });
 }
+
+beforeEach(() => { __resetWalletRateLimitersForTests(); });
 
 describe('connectWalletForSigning: argument validation', () => {
     function setup() {
@@ -404,13 +406,13 @@ describe('connectWalletForSigning: state transitions', () => {
         expect(req.reject).toHaveBeenCalledWith(401, expect.stringMatching(/authentication/i));
     });
 
-    test('rate-limited after 10 attempts/hour/ip (default)', async () => {
+    test('rate-limited after 10 attempts/hour per principal (default)', async () => {
         const srv = makeFakeService();
         const db = makeFakeDb();
         seedSession(db);
         registerWalletSessionHandlers(srv as any, db);
 
-        // Pin a single IP so the rate limit applies to all eleven requests.
+        // Every request runs as the same user, so the limit applies to all eleven.
         const PINNED_IP = `rate-test-${Date.now()}`;
         for (let i = 0; i < 10; i++) {
             const req = makeReq({ sessionId: 'sess-1', seedHex: VALID_SEED }, PINNED_IP);

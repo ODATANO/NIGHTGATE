@@ -20,6 +20,7 @@ import { WalletSessions, DisclosureRoles, BackgroundJobs } from '#cds-models/mid
 import { listContracts, registerContractAtRuntime, unregisterContractAtRuntime, ContractRegistrationError } from './submission/contract-registrations';
 import { walletCpuProfile } from './midnight/wallet-worker-client';
 import { profileCurrentThread } from './midnight/cpu-profile';
+import { getConfiguredNightgateNetwork } from './utils/nightgate-config';
 
 /**
  * Drop the in-memory WalletFacade (live secret keys) cached for a session, so a
@@ -141,7 +142,8 @@ export default class NightgateAdminService extends cds.ApplicationService {
                     privateStateId: data.privateStateId!, slotWidth: data.slotWidth ?? null
                 }, {
                     registeredBy: (req as any).user?.id,
-                    networkId: process.env.NIGHTGATE_NETWORK ?? undefined
+                    // The resolved plugin network (env, then cds.requires.nightgate.network), not the env alone.
+                    networkId: getConfiguredNightgateNetwork((cds as any).env?.requires?.nightgate) ?? undefined
                 });
             } catch (err) {
                 if (err instanceof ContractRegistrationError) return req.reject(err.httpStatus, err.message);

@@ -11,6 +11,22 @@ jobs:
   # mis-versioned tag must die before anything is pushed.
   check:
     runs-on: ubuntu-latest
+    # The PostgreSQL lane is part of the tag gate: a tag must not publish
+    # before the database the image ships with has been exercised.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: nightgate
+          POSTGRES_PASSWORD: nightgate
+          POSTGRES_DB: nightgate
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U nightgate"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -34,11 +50,12 @@ jobs:
             exit 1
           fi
 
-      - name: Release gates (lint, typecheck, tests, integrations, packaging)
+      - name: Release gates (lint, typecheck, tests, integrations, packaging, PostgreSQL)
         env:
           CI: true
           NODE_ENV: test
-        run: npm run check:release
+          NIGHTGATE_PG_URL: postgres://nightgate:nightgate@127.0.0.1:5432/nightgate
+        run: npm run check:release:full
 
   build-and-release:
     needs: check

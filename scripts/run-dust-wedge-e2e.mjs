@@ -1,4 +1,4 @@
-// Live AC for docs/feature-requests/dust-pending-note-leak-on-presubmit-abort.md
+// Live acceptance lane for the dust wedge protection (0.15.2)
 // (0.15.2 dust wedge protection): force a dust-spending submission to die
 // provably PRE-MEMPOOL, then prove the wallet is NOT wedged: the pre-build
 // dust snapshot restore kicked in (server log), getWalletBalance still shows

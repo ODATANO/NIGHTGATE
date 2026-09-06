@@ -58,9 +58,26 @@ if (!fs.existsSync(DB_PATH)) {
 }
 console.log(`[delta] target: ${DB_PATH}`);
 
-const ddl = execSync('npx cds compile srv --to sql --dialect sqlite', {
-    encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, cwd: packageRoot
-});
+/**
+ * The SQLite DDL of the shipped model. Compiled IN-PROCESS with @sap/cds
+ * (a dependency of every consumer); the `cds` CLI lives in @sap/cds-dk,
+ * which a host app does not have, so it is only the fallback.
+ */
+async function compileSqliteDdl() {
+    try {
+        const cds = require('@sap/cds');
+        cds.root = packageRoot;
+        const csn = await cds.load(path.join(packageRoot, 'srv'));
+        const out = cds.compile.to.sql(csn, { dialect: 'sqlite' });
+        return Array.isArray(out) ? out.join(';\n') + ';\n' : String(out);
+    } catch (err) {
+        console.warn(`[delta] in-process compile failed (${err.message}); falling back to the cds CLI`);
+        return execSync('npx cds compile srv --to sql --dialect sqlite', {
+            encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, cwd: packageRoot
+        });
+    }
+}
+const ddl = await compileSqliteDdl();
 
 // Split into statements on the trailing ");" / semicolon boundaries.
 const statements = ddl
@@ -205,6 +222,56 @@ const migrate = () => {
             refreshedViews++;
         }
     }
+    // Secondary indexes (0.23.0), same list the server applies at startup.
+    try {
+        const { NIGHTGATE_INDEXES, indexStatement } = require(path.join(packageRoot, 'srv/utils/db-indexes.js'));
+        for (const spec of NIGHTGATE_INDEXES) {
+            if (!existingTables.has(spec.table) && !db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name=?").get(spec.table)) continue;
+            db.exec(indexStatement(spec) + ';');
+        }
+        console.log(`[delta] = ensured ${NIGHTGATE_INDEXES.length} secondary index(es)`);
+    } catch (err) {
+        console.warn(`[delta] ! indexes skipped (${err.message}); the server creates them at startup`);
+    }
+
+    // 0.23.0: Transactions.raw was written as the "0x..." HEX TEXT of the
+    // extrinsic through CAP's binary transport, which base64-DECODES a string
+    // (invalid characters dropped, a trailing partial group truncated) and
+    // stores what that yields. The stored value is therefore LOSSY: it cannot
+    // be turned back into the extrinsic by any re-encoding. Clear those
+    // values (they start with "0x" because full base64 groups round-trip; a
+    // genuine extrinsic never encodes to "0x..." since 0xd3 is no valid
+    // compact length prefix) and the second copy ContractActions.state held;
+    // reindexFromHeight(0) restores them from the chain.
+    try {
+        if (db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='midnight_Transactions'").get()) {
+            const lossy = db.prepare("SELECT count(*) AS n FROM midnight_Transactions WHERE typeof(raw) = 'text' AND raw LIKE '0x%'").get()?.n ?? 0;
+            if (lossy > 0) db.exec("UPDATE midnight_Transactions SET raw = NULL WHERE typeof(raw) = 'text' AND raw LIKE '0x%';");
+            let stateCleared = 0;
+            if (db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='midnight_ContractActions'").get()) {
+                stateCleared = db.prepare("UPDATE midnight_ContractActions SET state = NULL WHERE state IS NOT NULL").run()?.changes ?? 0;
+            }
+            if (lossy > 0 || stateCleared > 0) {
+                console.log(`[delta] ~ cleared ${lossy} lossy Transactions.raw value(s) written before 0.23.0 and ${stateCleared} ContractActions.state copy(ies); run reindexFromHeight(0) on the indexer service to restore the extrinsic bytes`);
+            // Values derived from the extrinsic ENVELOPE before 0.23.0: a
+            // "contract address" minted from the extrinsic hash, and a NIGHT
+            // "transfer" (sender, receiver, amount, UTXO, balance) read from any
+            // signed extrinsic whose args parsed as MultiAddress + Compact. The
+            // ledger payload is not decoded, so the columns are null and the
+            // derived rows go; a re-index writes none of them back.
+            const addrCleared = db.prepare("UPDATE midnight_ContractActions SET address = NULL WHERE address IS NOT NULL").run()?.changes ?? 0;
+            const txCleared = db.prepare("UPDATE midnight_Transactions SET contractAddress = NULL, senderAddress = NULL, receiverAddress = NULL, nightAmount = NULL WHERE contractAddress IS NOT NULL OR senderAddress IS NOT NULL OR receiverAddress IS NOT NULL OR nightAmount IS NOT NULL").run()?.changes ?? 0;
+            let utxoCleared = 0, balanceCleared = 0;
+            if (db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='midnight_UnshieldedUtxos'").get()) utxoCleared = db.prepare("DELETE FROM midnight_UnshieldedUtxos").run()?.changes ?? 0;
+            if (db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='midnight_NightBalances'").get()) balanceCleared = db.prepare("DELETE FROM midnight_NightBalances").run()?.changes ?? 0;
+            if (addrCleared || txCleared || utxoCleared || balanceCleared)
+                console.log(`[delta] ~ cleared envelope-derived values written before 0.23.0: ${addrCleared} ContractActions.address, ${txCleared} Transactions sender/receiver/amount/contractAddress, ${utxoCleared} UnshieldedUtxos row(s), ${balanceCleared} NightBalances row(s)`);
+            }
+        }
+    } catch (err) {
+        console.warn(`[delta] ! raw cleanup skipped (${err.message}); run reindexFromHeight(0) once the server is up`);
+    }
+
     // Restore views the target DDL does not manage from their snapshotted SQL.
     for (const v of preViews) {
         if (recreatedViews.has(v.name) || !v.sql) continue;

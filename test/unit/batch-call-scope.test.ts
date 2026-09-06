@@ -218,7 +218,7 @@ describe('runBatchInScope', () => {
             expect(out.txHash).toBe('0xlayout');
             expect(contracts.withContractScopedTransaction).toHaveBeenCalledTimes(1);
             expect(providers.proofProvider.proveTx).toHaveBeenCalledTimes(1);
-            expect(warn).toHaveBeenCalledWith(expect.stringContaining("unknown NIGHTGATE_BATCH_SEGMENT_MODE 'rewrit'"));
+            expect(warn).toHaveBeenCalledWith(expect.stringContaining("NIGHTGATE_BATCH_SEGMENT_MODE: 'rewrit' is not one of"));
         } finally {
             delete process.env.NIGHTGATE_BATCH_SEGMENT_MODE;
             warn.mockRestore();

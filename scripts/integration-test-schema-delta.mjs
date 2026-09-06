@@ -106,6 +106,83 @@ CREATE TABLE midnight_AgentGrants (
 );
 INSERT INTO midnight_AgentGrants (ID, userId, sessionId, tokenHash, allowedActions, maxJobsPerDay, jobsUsedToday, isActive)
 VALUES ('grant-row-1', 'operator', 'sess-1', 'deadbeef', '["anchorDocument"]', 20, 3, 1);
+
+-- Pre-0.23.0 crawler rows: Transactions.raw carries what CAP made of the
+-- "0x..." hex text in a binary column (lossy), ContractActions.state a copy.
+CREATE TABLE midnight_Transactions (
+    ID TEXT NOT NULL PRIMARY KEY,
+    transactionId INTEGER,
+    hash TEXT,
+    protocolVersion INTEGER,
+    raw TEXT,
+    transactionType TEXT
+);
+INSERT INTO midnight_Transactions (ID, transactionId, hash, protocolVersion, raw, transactionType)
+VALUES ('tx-lossy', 0, '0xhash', 1, '0xdeadbeeQ==', 'REGULAR'),
+       ('tx-null', 1, '0xhash2', 1, NULL, 'SYSTEM');
+CREATE TABLE midnight_ContractActions (
+    ID TEXT NOT NULL PRIMARY KEY,
+    address TEXT,
+    actionType TEXT,
+    state TEXT,
+    transaction_ID TEXT
+);
+INSERT INTO midnight_ContractActions (ID, address, actionType, state, transaction_ID)
+VALUES ('ca-1', '0xaddr', 'CALL', '0xdeadbeeQ==', 'tx-lossy');
+-- Pre-account-key private state and sync state (0.22 shape: no keyScheme).
+-- The delta adds the nullable marker and leaves the rows as legacy rows.
+CREATE TABLE midnight_PrivateStates (
+    accountId TEXT NOT NULL,
+    contractAddress TEXT NOT NULL,
+    privateStateId TEXT NOT NULL,
+    ciphertext TEXT NOT NULL,
+    createdAt TEXT,
+    updatedAt TEXT,
+    PRIMARY KEY (accountId, contractAddress, privateStateId)
+);
+INSERT INTO midnight_PrivateStates (accountId, contractAddress, privateStateId, ciphertext)
+VALUES ('acct-legacy', '0xc1', 'ps', 'AQID');
+CREATE TABLE midnight_ContractSigningKeys (
+    accountId TEXT NOT NULL,
+    contractAddress TEXT NOT NULL,
+    ciphertext TEXT NOT NULL,
+    createdAt TEXT,
+    updatedAt TEXT,
+    PRIMARY KEY (accountId, contractAddress)
+);
+INSERT INTO midnight_ContractSigningKeys (accountId, contractAddress, ciphertext) VALUES ('acct-legacy', '0xc1', 'AQID');
+CREATE TABLE midnight_WalletSyncStates (
+    accountId TEXT NOT NULL PRIMARY KEY,
+    shieldedStateBlob TEXT,
+    unshieldedStateBlob TEXT,
+    dustStateBlob TEXT,
+    sdkVersion TEXT NOT NULL,
+    networkId TEXT,
+    seedFingerprint TEXT,
+    createdAt TEXT,
+    updatedAt TEXT
+);
+INSERT INTO midnight_WalletSyncStates (accountId, dustStateBlob, sdkVersion) VALUES ('acct-legacy', 'AQID', 'sdk@test');
+
+-- Pre-0.23.0 submission rows: no inclusion coordinates yet.
+CREATE TABLE midnight_PendingSubmissions (
+    ID TEXT NOT NULL PRIMARY KEY,
+    txHash TEXT,
+    actionType TEXT NOT NULL,
+    submittedAt TEXT NOT NULL,
+    status TEXT DEFAULT 'pending'
+);
+INSERT INTO midnight_PendingSubmissions (ID, txHash, actionType, submittedAt, status)
+VALUES ('sub-legacy', '00identifier', 'CALL', '2026-09-01T00:00:00Z', 'included');
+CREATE TABLE midnight_BackgroundJobs (
+    ID TEXT NOT NULL PRIMARY KEY,
+    kind TEXT NOT NULL,
+    status TEXT DEFAULT 'pending',
+    txHash TEXT,
+    chainStatus TEXT
+);
+INSERT INTO midnight_BackgroundJobs (ID, kind, status, txHash, chainStatus)
+VALUES ('job-legacy', 'submitContractCall', 'succeeded', '00identifier', 'pending');
 `);
 db.close();
 
@@ -160,8 +237,36 @@ ok('delta 0.21: the existing grant inherits the floor (null lists) and has NO de
     grantRow?.allowedContracts === null && grantRow?.allowedCircuits === null && grantRow?.deployedContracts === null
         && !grantRow?.allowDeploy && (grantRow?.deploysUsed === 0 || grantRow?.deploysUsed === null),
     JSON.stringify(grantRow));
+// --- 0.23.0: lossy binary rows are cleared, never re-encoded ---------------
+const lossy = after.prepare("SELECT raw FROM midnight_Transactions WHERE ID = 'tx-lossy'").get();
+ok('delta 0.23: a pre-0.23.0 Transactions.raw value (lossy hex-through-base64) is cleared for reindexing', lossy?.raw === null, JSON.stringify(lossy));
+ok('delta 0.23: the Transactions row itself survives', after.prepare("SELECT hash FROM midnight_Transactions WHERE ID = 'tx-lossy'").get()?.hash === '0xhash');
+const stateRow = after.prepare("SELECT state FROM midnight_ContractActions WHERE ID = 'ca-1'").get();
+ok('delta 0.23: the ContractActions.state copy is cleared', stateRow?.state === null, JSON.stringify(stateRow));
+const ngIdx = after.prepare("SELECT name FROM sqlite_master WHERE type='index' AND name LIKE 'ng_%'").all().map(r => r.name);
+ok('delta 0.23: secondary indexes exist after the migration', ngIdx.includes('ng_transactions_hash') && ngIdx.includes('ng_blocks_height'), ngIdx.join(','));
+
 const regs = after.prepare("SELECT type FROM sqlite_master WHERE name = 'midnight_ContractRegistrations'").get();
 ok('delta 0.21: the ContractRegistrations table exists', regs?.type === 'table');
+
+// 0.23: account keys + the key-scheme marker on the three stores.
+const accountKeys = after.prepare("SELECT type FROM sqlite_master WHERE name = 'midnight_AccountKeys'").get();
+ok('delta 0.23: the AccountKeys table exists', accountKeys?.type === 'table');
+for (const table of ['midnight_PrivateStates', 'midnight_ContractSigningKeys', 'midnight_WalletSyncStates']) {
+    const tcols = new Map(after.prepare(`PRAGMA table_info("${table}")`).all().map(r => [r.name, r]));
+    ok(`delta 0.23: keyScheme added to an EXISTING ${table}, nullable`, tcols.has('keyScheme') && tcols.get('keyScheme')?.notnull === 0, [...tcols.keys()].join(','));
+    const legacy = after.prepare(`SELECT keyScheme, count(*) AS n FROM "${table}" WHERE accountId = 'acct-legacy'`).get();
+    ok(`delta 0.23: the pre-account-key row of ${table} survives as a legacy row (keyScheme null)`, legacy?.n === 1 && legacy?.keyScheme === null, JSON.stringify(legacy));
+}
+
+for (const table of ['midnight_PendingSubmissions', 'midnight_BackgroundJobs']) {
+    const evidenceCols = new Map(after.prepare(`PRAGMA table_info("${table}")`).all().map(r => [r.name, r]));
+    ok(`delta 0.23: inclusion coordinates added to an EXISTING ${table} table`,
+        ['chainBlockHeight', 'chainBlockHash', 'indexerTxHash'].every(c => evidenceCols.has(c) && evidenceCols.get(c).notnull === 0),
+        [...evidenceCols.keys()].join(','));
+}
+ok('delta 0.23: the legacy submission row survived with null coordinates',
+    after.prepare("SELECT chainBlockHeight FROM midnight_PendingSubmissions WHERE ID = 'sub-legacy'").get()?.chainBlockHeight === null);
 
 const jobsView = after.prepare(
     "SELECT type FROM sqlite_master WHERE name = 'NightgateAdminService_BackgroundJobs'"

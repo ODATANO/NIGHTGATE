@@ -11,23 +11,27 @@ import { CURRENT_ENCRYPTION_VERSION } from '../../srv/utils/storage-encryption';
 
 const store = new Map<string, any>();
 
+// Two tables share the fake: WalletSyncStates rows in `store`, the account
+// keys (account-keys.ts) in `keysStore`, both keyed by accountId.
+const keysStore = vi.hoisted(() => new Map<string, any>());
 const runMock = vi.hoisted(() => (vi.fn(async (q: any) => {
     if (!q || typeof q !== 'object') return undefined;
+    const table = q.entity === 'midnight.AccountKeys' ? keysStore : store;
     if (q.kind === 'selectOne') {
-        return store.get(q.where.accountId) ?? null;
+        return table.get(q.where.accountId) ?? null;
     }
     if (q.kind === 'insert') {
         const entry = Array.isArray(q.entry) ? q.entry[0] : q.entry;
-        store.set(entry.accountId, { ...entry });
+        table.set(entry.accountId, { ...entry });
         return undefined;
     }
     if (q.kind === 'update') {
-        const existing = store.get(q.where.accountId);
-        if (existing) store.set(q.where.accountId, { ...existing, ...q.set });
+        const existing = table.get(q.where.accountId);
+        if (existing) table.set(q.where.accountId, { ...existing, ...q.set });
         return undefined;
     }
     if (q.kind === 'delete') {
-        store.delete(q.where.accountId);
+        table.delete(q.where.accountId);
         return undefined;
     }
     return undefined;
@@ -93,19 +97,34 @@ import {
     clearAllEncryptionKeys,
     __resetDbHandleForTests,
     __resetEncryptionCacheForTests,
-    __getEncryptionCacheSizeForTests
+    __getEncryptionCacheSizeForTests,
+    deriveStableSalt,
+    syncStatePassphraseCandidates
 } from '../../srv/submission/wallet-sync-state-store';
-import { extractEncryptedComponents } from '../../srv/utils/storage-encryption';
+import { extractEncryptedComponents, StorageEncryption, decryptWithPassword } from '../../srv/utils/storage-encryption';
+import { getEncryptionKey, __resetKeyRingForTests, inspectCiphertext } from '../../srv/utils/crypto';
+import { resolveAccountDek, syncStatePassphraseFromDek, clearAllAccountDeks } from '../../srv/submission/account-keys';
+import { SALT_LABEL_DEK } from '../../srv/submission/wallet-sync-state-store';
+import nodeCrypto from 'node:crypto';
 
 const PASS = 'a-deterministic-passphrase-32-bytes-or-more-please';
 const SDK  = 'wallet-sdk-facade@1.2.3';
 
 beforeEach(() => {
     store.clear();
+    keysStore.clear();
     runMock.mockClear();
     __resetDbHandleForTests();
     __resetEncryptionCacheForTests();
+    clearAllAccountDeks();
 });
+
+/** The account's DEK-derived blob passphrase, as the store derives it. */
+async function dekPassphraseOf(accountId: string, passphrase: string): Promise<string> {
+    const dek = await resolveAccountDek({ db: { run: runMock }, ring: getEncryptionKey(), accountId, storagePassword: passphrase, create: false });
+    if (!dek) throw new Error('no account key');
+    return syncStatePassphraseFromDek(dek, accountId);
+}
 
 describe('saveSyncState / loadSyncState round-trip', () => {
     test('persists all three sub-state blobs and restores them byte-identical', async () => {
@@ -399,5 +418,110 @@ describe('validation', () => {
             passphrase: PASS,
             expectedSdkVersion: ''
         })).rejects.toThrow(/expectedSdkVersion/);
+    });
+});
+
+describe('account-key binding of the blob passphrase', () => {
+    const RING_ENV = ['ENCRYPTION_KEY', 'ENCRYPTION_KEYS', 'ENCRYPTION_KEY_ACTIVE'] as const;
+    let saved: Record<string, string | undefined> = {};
+    beforeEach(() => {
+        saved = Object.fromEntries(RING_ENV.map(k => [k, process.env[k]]));
+        for (const k of RING_ENV) delete process.env[k];
+        __resetKeyRingForTests();
+    });
+    afterEach(() => {
+        for (const k of RING_ENV) { if (saved[k] === undefined) delete process.env[k]; else process.env[k] = saved[k]; }
+        __resetKeyRingForTests();
+    });
+    const legacySalt = (accountId: string) => nodeCrypto.createHash('sha256').update(`${PASS}|${accountId}|nightgate-wallet-sync-salt-v1`).digest();
+    const saltOf = (blobB64: string) => extractEncryptedComponents(Buffer.from(blobB64, 'base64')).salt;
+
+    test('a blob is written under the account key, sealed under the ring AND the viewing key; the passphrase alone does not open it', async () => {
+        await saveSyncState({ accountId: 'acct-ring', passphrase: PASS, sdkVersion: SDK, states: { dust: 'du-ring' } });
+        const row = store.get('acct-ring');
+        const key = keysStore.get('acct-ring');
+        expect(row.keyScheme).toBe('dek1');
+        expect(inspectCiphertext(key.wrappedDek)).toEqual({ version: 2, keyId: getEncryptionKey().activeId });
+        expect(key.wrappedDekByViewingKey).toMatch(/^vk1:/);
+        const dekPass = await dekPassphraseOf('acct-ring', PASS);
+        expect(saltOf(row.dustStateBlob).equals(deriveStableSalt('acct-ring', dekPass, SALT_LABEL_DEK))).toBe(true);
+        expect(saltOf(row.dustStateBlob).equals(legacySalt('acct-ring'))).toBe(false);
+        expect(() => decryptWithPassword(row.dustStateBlob, PASS)).toThrow();
+        expect(decryptWithPassword(row.dustStateBlob, dekPass)).toBe('du-ring');
+    });
+
+    test('a pre-ring blob (passphrase only) still loads; the next save moves EVERY blob under the account key and marks the row', async () => {
+        const legacy = new StorageEncryption(PASS, legacySalt('acct-legacy'));
+        store.set('acct-legacy', {
+            accountId: 'acct-legacy', sdkVersion: SDK, keyScheme: null,
+            shieldedStateBlob: legacy.encrypt('sh-legacy'), unshieldedStateBlob: null, dustStateBlob: legacy.encrypt('du-legacy')
+        });
+        const loaded = await loadSyncState({ accountId: 'acct-legacy', passphrase: PASS, expectedSdkVersion: SDK });
+        expect(loaded).toEqual({ savedAt: null, shielded: 'sh-legacy', dust: 'du-legacy' });
+        expect(keysStore.has('acct-legacy')).toBe(false); // a load creates no key
+
+        await saveSyncState({ accountId: 'acct-legacy', passphrase: PASS, sdkVersion: SDK, states: { dust: 'du-new' } });
+        const row = store.get('acct-legacy');
+        const dekPass = await dekPassphraseOf('acct-legacy', PASS);
+        expect(row.keyScheme).toBe('dek1');
+        expect(saltOf(row.dustStateBlob).equals(deriveStableSalt('acct-legacy', dekPass, SALT_LABEL_DEK))).toBe(true);
+        // The blob this save did not touch was carried over under the account key too.
+        expect(saltOf(row.shieldedStateBlob).equals(deriveStableSalt('acct-legacy', dekPass, SALT_LABEL_DEK))).toBe(true);
+        const again = await loadSyncState({ accountId: 'acct-legacy', passphrase: PASS, expectedSdkVersion: SDK });
+        expect(again!.shielded).toBe('sh-legacy');
+        expect(again!.dust).toBe('du-new');
+    });
+
+    test('a blob under a previous ring key (pre-account-key form) loads while that key is in the ring and is a cold start once it leaves', async () => {
+        process.env.ENCRYPTION_KEYS = 'k1=' + 'a'.repeat(32) + ',k2=' + 'b'.repeat(32);
+        process.env.ENCRYPTION_KEY_ACTIVE = 'k1';
+        __resetKeyRingForTests();
+        const k1 = syncStatePassphraseCandidates(getEncryptionKey(), PASS)[0];
+        const k1Enc = new StorageEncryption(k1.passphrase, deriveStableSalt('acct-rot', k1.passphrase));
+        store.set('acct-rot', { accountId: 'acct-rot', sdkVersion: SDK, keyScheme: null, shieldedStateBlob: null, unshieldedStateBlob: null, dustStateBlob: k1Enc.encrypt('du-k1') });
+
+        process.env.ENCRYPTION_KEY_ACTIVE = 'k2';
+        __resetKeyRingForTests();
+        __resetEncryptionCacheForTests();
+        const underK2 = await loadSyncState({ accountId: 'acct-rot', passphrase: PASS, expectedSdkVersion: SDK });
+        expect(underK2!.dust).toBe('du-k1');
+
+        process.env.ENCRYPTION_KEYS = 'k2=' + 'b'.repeat(32);
+        __resetKeyRingForTests();
+        __resetEncryptionCacheForTests();
+        await expect(loadSyncState({ accountId: 'acct-rot', passphrase: PASS, expectedSdkVersion: SDK })).resolves.toBeNull();
+    });
+
+    test('a blob under the account key survives the ring key leaving: the viewing-key seal opens the key and it is re-sealed under the active key', async () => {
+        process.env.ENCRYPTION_KEYS = 'k1=' + 'a'.repeat(32);
+        process.env.ENCRYPTION_KEY_ACTIVE = 'k1';
+        __resetKeyRingForTests();
+        await saveSyncState({ accountId: 'acct-dek', passphrase: PASS, sdkVersion: SDK, states: { dust: 'du-dek' } });
+        expect(inspectCiphertext(keysStore.get('acct-dek').wrappedDek).keyId).toBe('k1');
+
+        process.env.ENCRYPTION_KEYS = 'k2=' + 'b'.repeat(32);
+        process.env.ENCRYPTION_KEY_ACTIVE = 'k2';
+        __resetKeyRingForTests();
+        __resetEncryptionCacheForTests();
+        clearAllAccountDeks();
+        const loaded = await loadSyncState({ accountId: 'acct-dek', passphrase: PASS, expectedSdkVersion: SDK });
+        expect(loaded!.dust).toBe('du-dek');
+        expect(inspectCiphertext(keysStore.get('acct-dek').wrappedDek).keyId).toBe('k2');
+        expect(keysStore.get('acct-dek').rotatedAt).toBeTruthy();
+        // Without the viewing key, a ring that holds neither key is a cold start, never a crash.
+        clearAllAccountDeks();
+        keysStore.get('acct-dek').wrappedDek = keysStore.get('acct-dek').wrappedDek.replace(/^v2:k2:/, 'v2:k9:');
+        keysStore.get('acct-dek').wrappedDekByViewingKey = 'vk1:AAAA:BBBB:CCCC';
+        await expect(loadSyncState({ accountId: 'acct-dek', passphrase: PASS, expectedSdkVersion: SDK })).resolves.toBeNull();
+    });
+
+    test('candidates: active key first, other ring keys, then the pre-ring form', () => {
+        process.env.ENCRYPTION_KEYS = 'k1=' + 'a'.repeat(32) + ',k2=' + 'b'.repeat(32);
+        process.env.ENCRYPTION_KEY_ACTIVE = 'k2';
+        __resetKeyRingForTests();
+        const c = syncStatePassphraseCandidates(getEncryptionKey(), PASS);
+        expect(c.map(x => x.keyId)).toEqual(['k2', 'k1', null]);
+        expect(c[2]).toMatchObject({ passphrase: PASS, legacy: true });
+        expect(new Set(c.map(x => x.passphrase)).size).toBe(3);
     });
 });

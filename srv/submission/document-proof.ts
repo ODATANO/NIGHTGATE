@@ -34,11 +34,10 @@
  */
 
 import cds, { Request } from '@sap/cds';
-import { pathToFileURL } from 'node:url';
 import path from 'node:path';
 import { randomBytes } from 'node:crypto';
 import { RateLimiter } from '../utils/rate-limiter';
-import { getContractRegistration, slotWidthOf } from './contract-registry';
+import { getContractRegistration, slotWidthOf, importRegisteredArtifact } from './contract-registry';
 import { blake2b256Hex, fromHex32, emptyLeafKeyHex } from './hashing';
 import { buildMembershipSet, membershipPathFor, canonicalSetDigests } from './set-root';
 
@@ -71,7 +70,12 @@ const prepareRateLimiter = new RateLimiter({ windowMs: 60 * 60 * 1000, maxReques
 
 // ---- Canonical JSON + hashing ---------------------------------------------
 
-/** Recursively sort object keys so the same logical payload always hashes equal. */
+/**
+ * Recursively sort object keys so the same logical payload always hashes
+ * equal. Note that a JS object cannot HOLD the RFC 8785 order for integer-like
+ * keys (`{"10":..,"9":..}` always enumerates 9 before 10), so the hash input
+ * is produced by `canonicalize`, never by stringifying this result.
+ */
 export function sortKeys(value: unknown): unknown {
     if (Array.isArray(value)) return value.map(sortKeys);
     if (value && typeof value === 'object') {
@@ -83,9 +87,21 @@ export function sortKeys(value: unknown): unknown {
     return value;
 }
 
-/** Deterministic canonical JSON string of a payload. */
+/**
+ * Deterministic canonical JSON string of a payload: RFC 8785 member order
+ * (keys sorted by UTF-16 code units, integer-like keys included), arrays in
+ * order, JSON.stringify's number and string forms. `undefined` members are
+ * dropped and `undefined` array elements become null, as JSON.stringify does.
+ */
 export function canonicalize(value: unknown): string {
-    return JSON.stringify(sortKeys(value));
+    if (value === null || typeof value !== 'object') {
+        const s = JSON.stringify(value);
+        return s === undefined ? 'null' : s;
+    }
+    if (Array.isArray(value)) return '[' + value.map(v => canonicalize(v === undefined ? null : v)).join(',') + ']';
+    const obj = value as Record<string, unknown>;
+    const keys = Object.keys(obj).filter(k => obj[k] !== undefined && typeof obj[k] !== 'function').sort();
+    return '{' + keys.map(k => JSON.stringify(k) + ':' + canonicalize(obj[k])).join(',') + '}';
 }
 
 /** Canonical 32-byte field id for a field path (public label hash). */
@@ -114,6 +130,9 @@ export function scaleFieldValue(raw: number | string, scale: number, label: stri
         // error.
         raw = raw.trim();
         if (raw === '') throw new Error(`${label}: value must not be blank`);
+        // Decimal notation only: Number('0x10') and Number('1e3') parse, but a
+        // proof value must not depend on JavaScript's numeric literal rules.
+        if (!/^\d+(\.\d+)?$/.test(raw)) throw new Error(`${label}: numeric strings must be decimal digits with an optional fraction`);
     }
     if (typeof raw === 'string' && /^\d+$/.test(raw)) {
         const scaled = BigInt(raw) * BigInt(scale);
@@ -173,7 +192,9 @@ export function resolveFieldValue(document: Record<string, unknown>, fieldPath: 
     if (Object.prototype.hasOwnProperty.call(document, fieldPath)) return document[fieldPath];
     let cur: unknown = document;
     for (const seg of fieldPath.split('.')) {
-        if (cur === null || typeof cur !== 'object') return undefined;
+        // Own properties only: a path segment such as `constructor` or
+        // `__proto__` must not resolve through the prototype chain.
+        if (cur === null || typeof cur !== 'object' || !Object.prototype.hasOwnProperty.call(cur, seg)) return undefined;
         cur = (cur as Record<string, unknown>)[seg];
     }
     return cur;
@@ -385,10 +406,7 @@ export function buildDocumentContentRoot(
 export async function loadPureCircuitsFromRegistry(compiledRef: string): Promise<PureCircuits> {
     const reg = getContractRegistration(compiledRef);
     if (!reg) throw new PureCircuitsUnavailableError(`contract '${compiledRef}' is not registered`);
-    const importSpec = path.isAbsolute(reg.artifactPath)
-        ? pathToFileURL(reg.artifactPath).href
-        : reg.artifactPath;
-    const mod: any = await import(importSpec);
+    const mod: any = await importRegisteredArtifact(compiledRef);
     const pure = mod.pureCircuits ?? mod.default?.pureCircuits;
     if (!pure?.leafHash || !pure?.nodeHash || !pure?.bytesLeafHash || !pure?.absentLeafHash
         || !pure?.setLeafHash || !pure?.descriptorLeafHash || !pure?.slotSalt || !pure?.emptyLeafKey) {

@@ -10,6 +10,7 @@
  */
 
 import crypto from 'crypto';
+import { openDekByStoragePassword, privateStatePasswordFromDek, clearAllAccountDeks } from '../../srv/submission/account-keys';
 
 // Mock loadLedgerV8, ledger-v8 is ESM-only and cannot be loaded from this
 // unit suite (repo rule: never the real SDK). Tests verify wiring/shape; real crypto derivation is
@@ -65,19 +66,26 @@ vi.mock('../../srv/submission/wallet-facade-builder', () => ({
 }));
 
 import {
+    derivePrivateStatePassword, privateStatePasswordCandidates,
     buildWalletMaterialForSession,
     deriveAccountId,
     deriveStoragePassword,
     SessionNotFoundError,
     WalletSigningNotAvailable
 } from '../../srv/submission/wallet-material-factory';
-import { encrypt, getEncryptionKey } from '../../srv/utils/crypto';
+import { encrypt, getEncryptionKey, KeyRing, decrypt } from '../../srv/utils/crypto';
 
 // ---- Fake DB --------------------------------------------------------------
 
 function makeDbWithSession(row: Record<string, any> | null) {
     return {
-        run: vi.fn(async (_q: any) => row)
+        run: vi.fn(async (q: any) => {
+            const from = q?.SELECT?.from;
+            const entity = typeof from === 'string' ? from : from?.ref?.[0];
+            if (entity === 'midnight.AccountKeys') return null;   // no account key yet
+            if (q?.INSERT || q?.UPDATE) return 1;
+            return row;
+        })
     };
 }
 
@@ -134,7 +142,22 @@ describe('deriveAccountId / deriveStoragePassword', () => {
 
 // ---- buildWalletMaterialForSession ----------------------------------------
 
+describe('privateStatePasswordCandidates', () => {
+    test('active ring key first, the other keys, then the pre-ring form; every value distinct', () => {
+        const ring = new KeyRing({ activeId: 'k2', keys: [{ id: '1', secret: 'one-secret-of-thirty-two-chars!!' }, { id: 'k2', secret: 'two-secret-of-thirty-two-chars!!' }] });
+        const vk = 'vk-candidates';
+        const c = privateStatePasswordCandidates(ring, vk);
+        expect(c.map(x => [x.keyId, x.legacy])).toEqual([['k2', false], ['1', false], [null, true]]);
+        expect(c[0].password).toBe(derivePrivateStatePassword(ring, 'k2', vk));
+        expect(c[2].password).toBe(deriveStoragePassword(vk));
+        expect(new Set(c.map(x => x.password)).size).toBe(3);
+        for (const x of c) expect(x.password).toMatch(/^[0-9a-f]{64}$/);
+    });
+});
+
 describe('buildWalletMaterialForSession', () => {
+    beforeEach(() => { clearAllAccountDeks(); });
+
     test('returns a WalletMaterial with deterministic accountId and storage password', async () => {
         const viewingKey = 'mn_shield-vk_alice';
         const db = makeDbWithSession(buildEncryptedSession(viewingKey));
@@ -145,8 +168,27 @@ describe('buildWalletMaterialForSession', () => {
 
         expect(material.accountId).toBe(deriveAccountId(viewingKey));
         const pw = await material.privateStoragePasswordProvider();
-        expect(pw).toBe(deriveStoragePassword(viewingKey));
+        // Derived from the account DEK the factory created on first use: the
+        // key was inserted sealed under the ring (TEST_KEY as key 1) and under
+        // the viewing key; the password is neither the viewing-key form nor
+        // any ring-bound form.
+        const ring = KeyRing.fromKek(TEST_KEY);
+        const insert = db.run.mock.calls.map(c => c[0]).find((q: any) => q?.INSERT?.into === 'midnight.AccountKeys' || q?.INSERT?.into?.ref?.[0] === 'midnight.AccountKeys');
+        expect(insert).toBeDefined();
+        const entry = (insert as any).INSERT.entries[0];
+        expect(entry.accountId).toBe(material.accountId);
+        expect(entry.wrappedDekByViewingKey).toMatch(/^vk1:/);
+        const dek = Buffer.from(decrypt(entry.wrappedDek, ring), 'hex');
+        expect(dek).toHaveLength(32);
+        expect(openDekByStoragePassword(entry.wrappedDekByViewingKey, deriveStoragePassword(viewingKey)).equals(dek)).toBe(true);
+        expect(pw).toBe(privateStatePasswordFromDek(dek, material.accountId));
+        expect(pw).not.toBe(deriveStoragePassword(viewingKey));
+        expect(pw).not.toBe(derivePrivateStatePassword(ring, ring.activeId, viewingKey));
         expect(pw.length).toBeGreaterThanOrEqual(16);
+        // Legacy candidates read the pre-DEK rows: ring-bound form(s), then the viewing-key form.
+        const fallbacks = await material.privateStoragePasswordFallbacks!();
+        expect(fallbacks).toEqual(privateStatePasswordCandidates(ring, viewingKey).map(c => c.password));
+        expect(fallbacks[fallbacks.length - 1]).toBe(deriveStoragePassword(viewingKey));
         expect(material.walletAndMidnightProvider).toBeDefined();
     });
 

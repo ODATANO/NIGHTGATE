@@ -42,6 +42,8 @@ export interface ContractProvidersConfig {
 export interface WalletMaterial {
     accountId: string; // Stable identifier scoping private-state storage (wallet address)
     privateStoragePasswordProvider: () => Promise<string> | string; // passphrase used to encrypt private state on disk
+    /** Older derivations of that passphrase, read-only: a row found under one is rewritten under the current. */
+    privateStoragePasswordFallbacks?: () => Promise<string[]> | string[];
     walletAndMidnightProvider: any; // Wallet+midnight provider built from the wallet-sdk-facade
     privateStateBackend?: PrivateStateBackend; // backend to use for the SDK's private-state provider (default: 'cap-db')
     // Idempotently initialises this wallet's facade in the worker
@@ -118,7 +120,8 @@ export async function buildFullProviderBundle(
     if (backend === 'cap-db') {
         privateStateProvider = new CapDbPrivateStateProvider({
             accountId: wallet.accountId,
-            privateStoragePasswordProvider: checkedPasswordProvider
+            privateStoragePasswordProvider: checkedPasswordProvider,
+            privateStoragePasswordFallbacks: wallet.privateStoragePasswordFallbacks
         });
     } else {
         const sdk = await loadMidnightSdk();

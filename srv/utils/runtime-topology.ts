@@ -1,11 +1,12 @@
 import crypto from 'node:crypto';
 import cds from '@sap/cds';
 import type { NightgatePluginConfig } from './nightgate-config';
+import { configString, configInt, configFlag } from './config';
 
 export const NIGHTGATE_RUNTIME_MODE = 'single-instance' as const;
 
 const instanceId = (
-    process.env.NIGHTGATE_INSTANCE_ID
+    configString('NIGHTGATE_INSTANCE_ID')
     || process.env.CF_INSTANCE_GUID
     || process.env.HOSTNAME
     || crypto.randomUUID()
@@ -41,7 +42,7 @@ function configuredReplicaCount(config: NightgatePluginConfig): number {
     // processes within one instance (Puma/Heroku convention), not replicas of
     // this stateful service, so reading it would false-positive abort a single
     // instance that happens to set it.
-    return positiveInteger(process.env.NIGHTGATE_REPLICA_COUNT)
+    return configInt('NIGHTGATE_REPLICA_COUNT')
         ?? positiveInteger(process.env.CF_INSTANCE_COUNT)
         ?? positiveInteger(process.env.KUBERNETES_REPLICA_COUNT)
         ?? positiveInteger(config.replicaCount)
@@ -89,7 +90,7 @@ function databaseKind(): string {
 }
 
 function allowProductionSqlite(config: NightgatePluginConfig): boolean {
-    return process.env.NIGHTGATE_ALLOW_PRODUCTION_SQLITE === 'true'
+    return configFlag('NIGHTGATE_ALLOW_PRODUCTION_SQLITE')
         || config.allowProductionSqlite === true;
 }
 

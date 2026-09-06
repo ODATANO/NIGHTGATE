@@ -15,6 +15,9 @@ COPY package.json package-lock.json ./
 # (@sap/cds, @sap/cds-dk, @cap-js/sqlite). Slimming is a later optimization.
 RUN npm ci
 COPY . .
+# The image carries every prover key (the checkout is complete, unlike the
+# npm tarball); refuse to build one that would fetch at runtime.
+RUN node scripts/write-key-manifest.mjs --check --require-keys
 RUN npm run build
 
 FROM node:22-slim
@@ -42,8 +45,11 @@ ENV NIGHTGATE_NETWORK=preprod
 # puller wants. Enable explicitly to run NIGHTGATE as a block indexer.
 ENV NIGHTGATE_CRAWLER_ENABLED=false
 WORKDIR /app
-COPY --from=build /app /app
-RUN chmod +x /app/docker/entrypoint.sh
+# Unprivileged runtime: the image's own user owns /app (contract registration
+# writes under NIGHTGATE_CONTRACTS_DIR) and /data (database, wallet state).
+COPY --from=build --chown=node:node /app /app
+RUN chmod +x /app/docker/entrypoint.sh && mkdir -p /data && chown node:node /data
+USER node
 VOLUME /data
 EXPOSE 4004
 # Ask NIGHTGATE whether it can work, not merely whether the HTTP port answers:

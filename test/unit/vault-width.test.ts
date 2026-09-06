@@ -43,8 +43,8 @@ describe('contract-registry slotWidth', () => {
     // 64 measured but NOT shipped: the mask path is 32-bit JS bitwise
     // ((1 << 64) wraps to an allowed range of 0..0) and a full unsigned
     // 64-bit mask survives neither Number nor a signed Integer64 column.
-    test.each([0, 3, 15, 17, 64, 128, -16])('rejects invalid width %d', (w) => {
-        expect(() => registerContract(WIDE, { ...base, slotWidth: w })).toThrow(/slotWidth must be 8, 16 or 32/);
+    test.each([0, 3, 8, 15, 17, 64, 128, -16])('rejects invalid width %d', (w) => {
+        expect(() => registerContract(WIDE, { ...base, slotWidth: w })).toThrow(/slotWidth must be 16 or 32/);
     });
 });
 
@@ -180,7 +180,6 @@ describe('expandAllowedMask width', () => {
 
 describe('browser witness/call helpers width', () => {
     test('witnesses.mjs slotWidth mirrors the server twin', async () => {
-        // @ts-expect-error the .mjs ships its types as witnesses.d.ts (package-export mapped), no .d.mts twin
         const mod = await import('../../src/browser/witnesses.mjs');
         const hex64 = 'cd'.repeat(32);
         const secret = new Uint8Array(32).fill(2);

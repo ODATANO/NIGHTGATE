@@ -26,11 +26,33 @@
 
 import crypto from 'node:crypto';
 import cds from '@sap/cds';
+import { AGENT_TOKEN_HEADER, AGENT_TOKEN_TRANSPORT_USER } from './agent-token-transport';
+import { RateLimiter } from './rate-limiter';
 
-const AGENT_TOKEN_HEADER = 'x-agent-token';
 const AGENT_LANE_PREFIX = '/api/v1/nightgate';
-/** Marker principal for token requests between transport auth and the grant hook. */
-const AGENT_TOKEN_TRANSPORT_USER = 'agent-token-transport';
+
+// Failed basic-auth attempts per client address. The image has one operator
+// account with a static password, so an unthrottled 401 is an offline-speed
+// guessing oracle. After the budget a client gets 429 for the rest of the
+// window, correct password or not.
+const BASIC_AUTH_FAILURE_WINDOW_MS = 15 * 60 * 1000;
+const BASIC_AUTH_MAX_FAILURES = 20;
+const basicFailures = new RateLimiter({ windowMs: BASIC_AUTH_FAILURE_WINDOW_MS, maxRequests: BASIC_AUTH_MAX_FAILURES, maxKeys: 10000 });
+
+function clientFailureKey(req: any): string {
+    const ip = req?.ip ?? req?.socket?.remoteAddress ?? req?.connection?.remoteAddress ?? 'unknown';
+    return `${String(ip)}:basic-auth`;
+}
+
+function reject429(res: any, retryAfterMs: number): void {
+    res.set?.('Retry-After', String(Math.max(1, Math.ceil(retryAfterMs / 1000))));
+    res.status?.(429);
+    res.send?.('Too many failed authentication attempts');
+}
+
+function __resetBasicAuthThrottleForTests(): void {
+    basicFailures.reset();
+}
 
 function timingSafeEqualStr(a: string, b: string): boolean {
     const ab = Buffer.from(String(a));
@@ -73,6 +95,9 @@ function agentTokenAuth(req: any, res: any, next: () => void): void {
     // Lane 1: valid basic credentials, the operator. Same behavior as before.
     const basic = parseBasic(req.headers?.authorization);
     if (basic) {
+        const failureKey = clientFailureKey(req);
+        const locked = basicFailures.peek(failureKey);
+        if (!locked.allowed) return reject429(res, locked.retryAfterMs);
         const known = Object.prototype.hasOwnProperty.call(users, basic.user) ? users[basic.user] : undefined;
         if (known && timingSafeEqualStr(basic.password, String(known.password ?? ''))) {
             const UserCtor = (cds as any).User;
@@ -85,6 +110,8 @@ function agentTokenAuth(req: any, res: any, next: () => void): void {
                 : { id: basic.user, roles };
             return next();
         }
+        const failed = basicFailures.check(failureKey);
+        if (!failed.allowed) return reject429(res, failed.retryAfterMs);
         return reject401(res); // wrong credentials never fall through to the token lane
     }
 
@@ -97,6 +124,10 @@ function agentTokenAuth(req: any, res: any, next: () => void): void {
     const inLane = path === AGENT_LANE_PREFIX
         || path.startsWith(AGENT_LANE_PREFIX + '/')
         || path.startsWith(AGENT_LANE_PREFIX + '?');
+    // $batch: every part runs as its own request under the envelope's principal
+    // (the marker set below); the grant hook authenticates each part from the
+    // envelope token CAP merges into the part's `req.headers`, and rejects a
+    // part that reaches it under the marker principal without a token.
     if (typeof token === 'string' && token.length > 0 && inLane) {
         const UserCtor = (cds as any).User;
         (req as any).user = UserCtor
@@ -109,4 +140,7 @@ function agentTokenAuth(req: any, res: any, next: () => void): void {
 }
 
 agentTokenAuth.AGENT_TOKEN_TRANSPORT_USER = AGENT_TOKEN_TRANSPORT_USER;
+agentTokenAuth.BASIC_AUTH_FAILURE_WINDOW_MS = BASIC_AUTH_FAILURE_WINDOW_MS;
+agentTokenAuth.BASIC_AUTH_MAX_FAILURES = BASIC_AUTH_MAX_FAILURES;
+agentTokenAuth.__resetBasicAuthThrottleForTests = __resetBasicAuthThrottleForTests;
 export = agentTokenAuth;

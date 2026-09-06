@@ -289,13 +289,15 @@ describe('fetch retry wrappers (parallel catch-up pipeline)', () => {
     });
 
     it('fetchBlockBatchWithRetry aborts immediately on permanent errors', async () => {
+        // "No block at height" is transient since 0.23.0 (a lagging replica
+        // behind a load balancer answers null for a finalized height).
         const processor = {
-            fetchBlockBatch: vi.fn().mockRejectedValue(new Error('No block at height 11'))
+            fetchBlockBatch: vi.fn().mockRejectedValue(new Error('Malformed block header at height 11'))
         };
         const errorSpy = vi.spyOn(cds.log('nightgate:crawler'), 'error').mockImplementation(() => {});
         try {
             const crawler = makeCrawler(processor);
-            await expect(crawler.fetchBlockBatchWithRetry([10, 11])).rejects.toThrow('No block at height 11');
+            await expect(crawler.fetchBlockBatchWithRetry([10, 11])).rejects.toThrow('Malformed block header at height 11');
             expect(processor.fetchBlockBatch).toHaveBeenCalledTimes(1);
             expect(crawler.sleep).not.toHaveBeenCalled();
             expect(errorSpy).toHaveBeenCalledWith(expect.stringMatching(/permanent error/));

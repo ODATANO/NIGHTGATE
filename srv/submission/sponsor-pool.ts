@@ -19,6 +19,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+import { classifySubmitFailure } from '../midnight/submit-error-classification';
+
 /**
  * Grants/requests may name this instead of a concrete sponsor session. A
  * RESERVED UUID (the tail spells 'pool' in hex), because every surface that
@@ -26,21 +28,22 @@
  * AgentGrants.sponsorSessionId column) is typed UUID end to end; a plain
  * string would be rejected by OData deserialization before any handler ran.
  */
-import { dustRaceLedgerCode } from './dust-race';
-
 export const PLATFORM_POOL_SENTINEL = '00000000-0000-0000-0000-706f6f6c0000';
 
-interface LaneState {
+interface SponsorLane {
     busy: boolean;
     lastUsed: number;
     cooldownUntil: number;
 }
 
-const lanes = new Map<string, LaneState>();
+const lanes = new Map<string, SponsorLane>();
 
-function lane(id: string): LaneState {
+function lane(id: string): SponsorLane {
     let s = lanes.get(id);
-    if (!s) { s = { busy: false, lastUsed: 0, cooldownUntil: 0 }; lanes.set(id, s); }
+    if (!s) {
+        s = { busy: false, lastUsed: 0, cooldownUntil: 0 };
+        lanes.set(id, s);
+    }
     return s;
 }
 
@@ -51,7 +54,10 @@ export function pickFreeSponsor(poolIds: string[], now: number = Date.now()): st
     for (const id of poolIds) {
         const s = lane(id);
         if (s.busy || s.cooldownUntil > now) continue;
-        if (s.lastUsed < bestUsed) { best = id; bestUsed = s.lastUsed; }
+        if (s.lastUsed < bestUsed) {
+            best = id;
+            bestUsed = s.lastUsed;
+        }
     }
     return best;
 }
@@ -95,46 +101,36 @@ export function benchSponsor(id: string, cooldownMs: number): void {
  * problem (cold facade, sync gap, stale dust, an expired or key-less session
  * row), not the caller's transaction. A policy refusal or a deserialization
  * error would fail on every sponsor identically and must NOT burn the pool.
+ * A coded dust race (170/196) counts too: once the same-sponsor rebuilds are
+ * exhausted the next wallet may hold a fresher dust state; a pool-status
+ * Invalid does not (it is the caller's bytes, not the sponsor's health).
  */
 export function isRetryableSponsorFailure(err: unknown): boolean {
     // Resolution failures of a POOL member (expired, no signing key, gone)
     // are sponsor-state problems by definition.
-    if ((err as Error)?.name === 'FeeSponsorError') return true;
-    const msg = String((err as Error)?.message ?? err ?? '');
-    return /genuine(ly)? sync|not caught up|sync.*(timeout|timed out|stalled)|not synced to tip|No facade for sponsorSessionId|Custom error:? ?(170|196)\b|1010\/(170|196)\b|InvalidDustSpendProof|dust.*(stale|validity)|WALLET_SYNCING|Sponsor session/i.test(msg);
+    if ((err as any)?.name === 'FeeSponsorError') return true;
+    const info = classifySubmitFailure(err);
+    if (info.code === 'dust-race') return info.ledgerCode !== 'pool-invalid';
+    if (info.code !== 'internal') return false;
+    // Sponsor-health failures are not submit failures and never cross the
+    // worker RPC with a code (sync gates, facade lookup, session rows), so
+    // they are recognised by their wording. Pinned in sponsor-pool.test.ts.
+    const msg = String((err as any)?.message ?? err ?? '');
+    return /genuine(ly)? sync|not caught up|sync.*(timeout|timed out|stalled)|not synced to tip|No facade for sponsorSessionId|dust.*(stale|validity)|WALLET_SYNCING|Sponsor session/i.test(msg);
 }
 
 /**
- * A TRANSIENT dust race: the dust spend was built against a dust state the
- * node has already moved past. `1010/170` (InvalidDustSpendProof: stale
- * merkle root / validity window) and `1010/196` (the spent note's nullifier is
- * already known to the node: a concurrent spend on the same note, live-proven
- * by forcing two sponsorings onto one note). Unlike a sponsor-health failure it
- * must NOT bench the sponsor; the fix is to REBUILD the dust spend fresh on the
- * SAME sponsor and resubmit (the consumer-side rebuild-on-170 pattern), once
- * the local dust wallet has caught up. Kept deliberately narrower than
- * {@link isRetryableSponsorFailure}, so a genuinely unhealthy sponsor still
- * fails over. The same race surfaces as `TransactionInvalidError` (pool status
- * Invalid: the tx was accepted, then a competing tx consumed the note first)
- * when the loser reached the pool before the winner landed. Both are also what
- * a conflicting write to the SAME contract state can surface as; the retries
- * are then wasted but harmless, the job still fails. Matches the worker's
- * message, which carries the cause chain (formatErrWithCauses), so the node's
- * line is visible on this side. NOT a dust race: a transaction that sits in
- * a block with its contract call NOT applied (ledger PARTIAL_SUCCESS). That
- * is the CALLER's transcript losing to a concurrent write on the same
- * contract; only the caller can rebuild it against the current state, the
- * sponsor re-attaching fresh dust to the same caller bytes is rejected at
- * admission every time (live: 6 losers x 4 retries x 1010). Also NOT a
- * dust race: `submit watch timed out` (ambiguous, see
- * isAmbiguousSubmitOutcome).
+ * A TRANSIENT dust race: `1010/170` (InvalidDustSpendProof: stale merkle root
+ * or validity window), `1010/196` (the spent note's nullifier is already
+ * known: a concurrent spend on the same note) or a pool status Invalid (the
+ * loser reached the pool, the winner consumed the note first). The fix is to
+ * REBUILD the dust spend fresh on the SAME sponsor and resubmit, once the
+ * local dust wallet has caught up. NOT a dust race: a transaction in a block
+ * whose call did not apply (the caller's transcript lost, only the caller
+ * can rebuild), and a watch timeout (ambiguous, never rebuild).
  */
 export function isDustRaceFailure(err: unknown): boolean {
-    // Coded rejects: dustRaceLedgerCode (dust-race.ts) is the single definition.
-    // The regex below adds pool-status shapes only the sponsored paths see.
-    if (dustRaceLedgerCode(err) != null) return true;
-    const msg = String((err as Error)?.message ?? err ?? '');
-    return /InvalidDustSpendProof|TransactionInvalidError|Transaction is invalid and was rejected by the node/i.test(msg);
+    return classifySubmitFailure(err).code === 'dust-race';
 }
 
 /**
@@ -144,21 +140,20 @@ export function isDustRaceFailure(err: unknown): boolean {
  * the identifier, the caller rebuilds against the current contract state.
  */
 export function isCallNotAppliedFailure(err: unknown): boolean {
-    return /did NOT apply/i.test(String((err as Error)?.message ?? err ?? ''));
+    return classifySubmitFailure(err).code === 'landed-not-applied';
 }
 
 /**
- * The announced attempt can NOT be on-chain: a node reject at admission
- * (1010/*), pool status Invalid, the send died on the client's own closing
- * socket, or the main thread nacked the intent. Safe to clear the job's hash
- * and rebuild; an exhausted run of these is a plain `failed`. Deliberately
- * NOT matched: `did NOT apply` (the tx IS on-chain, only the call lost; the
- * attempt row records that) and `submit watch timed out` (ambiguous).
+ * The announced attempt can NOT be on-chain: a node reject at admission,
+ * pool status Invalid, the send died on the client's own closing socket, or
+ * the main thread nacked the intent. Safe to clear the job's hash and
+ * rebuild; an exhausted run of these is a plain `failed`. Deliberately NOT
+ * matched: landed-not-applied (the tx IS on-chain) and ambiguous.
  */
 export function isPreInclusionReject(err: unknown): boolean {
-    const msg = String((err as Error)?.message ?? err ?? '');
-    return /Custom error:? ?\d+|1010\/\d+|1010:\s*Invalid|InvalidDustSpendProof|TransactionInvalidError|Transaction is invalid and was rejected by the node|closing socket|submit-intent (rejected|was not acknowledged)/i.test(msg)
-        && !/did NOT apply/i.test(msg);
+    const info = classifySubmitFailure(err);
+    if (info.code === 'pre-mempool-reject' || info.code === 'dust-race') return true;
+    return info.code === 'transport' && info.ledgerCode === 'closing-socket';
 }
 
 /**
@@ -169,32 +164,44 @@ export function isPreInclusionReject(err: unknown): boolean {
  * resolved by the indexer confirmer.
  */
 export function isAmbiguousSubmitOutcome(err: unknown): boolean {
-    return /submit watch timed out/i.test(String((err as Error)?.message ?? err ?? ''));
+    return classifySubmitFailure(err).code === 'ambiguous';
 }
 
 /**
- * The GENERIC pool-status Invalid (`TransactionInvalidError` without a ledger
- * code) cannot be told apart from a caller transaction that is structurally
- * allowed but cryptographically invalid; every retry of it costs a full
- * sponsor dust proof. Such failures get at most ONE rebuild (enough for the
- * genuine race seen live), the coded rejects keep the configured retries.
+ * The GENERIC pool-status Invalid (no ledger code) cannot be told apart from
+ * a caller transaction that is structurally allowed but cryptographically
+ * invalid; every retry of it costs a full sponsor dust proof. Such failures
+ * get at most ONE rebuild, the coded rejects keep the configured retries.
  */
 export function isGenericInvalidFailure(err: unknown): boolean {
-    const msg = String((err as Error)?.message ?? err ?? '');
-    return /TransactionInvalidError|Transaction is invalid and was rejected by the node/i.test(msg)
-        && !/Custom error:? ?\d+|1010\/\d+|InvalidDustSpendProof|did NOT apply/i.test(msg);
+    const info = classifySubmitFailure(err);
+    return info.code === 'dust-race' && info.ledgerCode === 'pool-invalid';
 }
 
 /**
- * Env-configured duration, fail-safe: anything that is not a finite
- * non-negative integer falls back to the default. 'abc' or 'Infinity' would
- * otherwise turn a bounded wait into an unbounded one (NaN deadline).
+ * What a sponsoring executor does with a failed attempt. ONE table for the
+ * finalized (exclusive lease) and the unbound (parallel) channel:
+ *
+ *  ambiguous           leave the attempt row pending, the job reconciles by identifier
+ *  landed-not-applied  terminal: on-chain, the caller's call lost
+ *  dust-rebuild        close the attempt, rebuild fresh on the SAME sponsor
+ *                      (`generic`: pool Invalid, one rebuild only)
+ *  failover            close the attempt, bench this sponsor, try the next candidate
+ *  fail                close the attempt, fail the job (policy, causality,
+ *                      transport, unknown): identical on every sponsor
  */
-export function envMsSetting(name: string, fallback: number): number {
-    const raw = process.env[name];
-    if (raw === undefined) return fallback;
-    const n = Number(raw);
-    return Number.isInteger(n) && n >= 0 ? n : fallback;
+export type SponsorFailureDecision = 'ambiguous' | 'landed-not-applied' | 'dust-rebuild' | 'failover' | 'fail';
+
+export function decideSponsorFailure(err: unknown): { decision: SponsorFailureDecision; generic: boolean; preInclusion: boolean } {
+    const info = classifySubmitFailure(err);
+    const preInclusion = isPreInclusionReject(err);
+    if (info.code === 'ambiguous') return { decision: 'ambiguous', generic: false, preInclusion: false };
+    if (info.code === 'landed-not-applied') return { decision: 'landed-not-applied', generic: false, preInclusion: false };
+    // Dust race wins over the generic bench: the sponsor is healthy, its dust
+    // state merely lags; benching it and failing over would waste the pool.
+    if (info.code === 'dust-race') return { decision: 'dust-rebuild', generic: info.ledgerCode === 'pool-invalid', preInclusion };
+    if (isRetryableSponsorFailure(err)) return { decision: 'failover', generic: false, preInclusion };
+    return { decision: 'fail', generic: false, preInclusion };
 }
 
 /**

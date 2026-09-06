@@ -25,7 +25,7 @@ vi.mock('../../srv/submission/background-jobs', async (importOriginal) => ({
     REJECTED_ATTEMPT_BOOKKEEPING_PENDING: 'REJECTED_ATTEMPT_BOOKKEEPING_PENDING',
     startJob: vi.fn(async (args: any) => { startJobCalls.push(args); return { jobId: 'job-1', status: 'pending' }; }),
     runChildCommand: vi.fn(),
-    registerBackgroundJobProcessor: vi.fn((kind: string, v: number, fn: any) => { processors.set(kind, fn); processorVersions.set(kind, v); }),
+    registerBackgroundJobProcessor: vi.fn((kind: string, v: number, _traits: unknown, fn: any) => { processors.set(kind, fn); processorVersions.set(kind, v); }),
     registerBackgroundJobReconciliationFinalizer: vi.fn((kind: string, v: number, fn: any) => { finalizers.set(kind, fn); }),
     withLockContentionRetry: (_label: string, fn: () => Promise<unknown>) => fn()
 }));
@@ -43,7 +43,6 @@ vi.mock('../../srv/submission/job-execution-context', async (importOriginal) => 
     ...(await importOriginal<Record<string, unknown>>()),
     reportExternalExecution: vi.fn(async (h: any) => { boundaryCalls.push(['external_execution', h]); }),
     reportExternalSubmission: vi.fn(async (h: any) => { boundaryCalls.push(['submitted', h]); }),
-    reportSubmissionRejected: vi.fn(async (h: any) => { boundaryCalls.push(['rejected', h]); }),
     reportSubmissionRejectedOn: vi.fn(async (runner: any, h: any) => { boundaryCalls.push(['rejected', { ...h, runner }]); }),
     // one statement on the attempt transaction: first crossing = external_execution + submitted, a rebuild = submitted
     reportBroadcastOn: vi.fn(async (_runner: any, h: any) => { if (h.firstBoundary) boundaryCalls.push(['external_execution', h]); boundaryCalls.push(['submitted', h]); })
@@ -57,7 +56,14 @@ vi.mock('../../srv/sessions/agent-grants', async (importOriginal) => ({
     ...(await importOriginal<Record<string, unknown>>()),
     reserveDeployBudget: (...a: any[]) => (grantBudget.reserve as any)(...a),
     releaseDeployBudget: (...a: any[]) => (grantBudget.release as any)(...a),
-    recordDeployedContracts: (...a: any[]) => (grantBudget.record as any)(...a)
+    recordDeployedContracts: (...a: any[]) => (grantBudget.record as any)(...a),
+    // The executors re-resolve the grant's policy per job; these tests cover
+    // the budget bookkeeping under a deploy-capable grant.
+    currentGrantPolicy: vi.fn(async () => ({ allowedContracts: [], allowedCircuits: [], deployedContracts: [], allowedTokenTypes: [], allowDeploy: true }))
+}));
+vi.mock('../../srv/submission/sponsor-policy', async (importOriginal) => ({
+    ...(await importOriginal<any>()),
+    getGlobalSponsorPolicy: () => ({ allowedContracts: [], allowedCircuits: [], allowedTokenTypes: [], allowDeploy: true })
 }));
 vi.mock('../../srv/submission/fee-sponsor', async (importOriginal) => ({
     ...(await importOriginal<Record<string, unknown>>()),
@@ -71,9 +77,8 @@ vi.mock('../../srv/midnight/providers', async (importOriginal) => ({
 
 import { registerSubmissionHandlers } from '../../srv/submission/handlers';
 import {
-    __resetSponsorPoolForTests, envMsSetting, pickFreeSponsor,
-    acquireSponsor, releaseSponsor, PLATFORM_POOL_SENTINEL, sponsorCandidatesNonExclusive
-} from '../../srv/submission/sponsor-pool';
+    __resetSponsorPoolForTests, pickFreeSponsor,
+    acquireSponsor, releaseSponsor, PLATFORM_POOL_SENTINEL, sponsorCandidatesNonExclusive } from '../../srv/submission/sponsor-pool';
 import { resolveFeeSponsor } from '../../srv/submission/fee-sponsor';
 import { reportBroadcastOn, reportSubmissionRejectedOn } from '../../srv/submission/job-execution-context';
 
@@ -163,7 +168,7 @@ describe('sponsorFinalizedTransaction', () => {
     });
 
     test('pool jobs are keyed under the SENTINEL: stable idempotency identity', async () => {
-        // The review finding this pins: keying under whichever member was free
+        // Keying under whichever member was free
         // made a retry with the same idempotencyKey land under a DIFFERENT
         // session and start a second job.
         process.env.NIGHTGATE_FEE_SPONSOR_SESSION = 'pool-1,pool-2';
@@ -210,15 +215,6 @@ describe('sponsorFinalizedTransaction', () => {
         expect(out.txHash).toBe('00aa');
     });
 
-    test('a NaN lease-wait env falls back to the default instead of waiting forever', async () => {
-        for (const bad of ['abc', 'Infinity', 'NaN', '-5', '1.5']) {
-            process.env.NIGHTGATE_SPONSOR_LEASE_WAIT_MS = bad;
-            expect(envMsSetting('NIGHTGATE_SPONSOR_LEASE_WAIT_MS', 120_000), bad).toBe(120_000);
-        }
-        process.env.NIGHTGATE_SPONSOR_LEASE_WAIT_MS = '0';
-        expect(envMsSetting('NIGHTGATE_SPONSOR_LEASE_WAIT_MS', 120_000)).toBe(0);
-        delete process.env.NIGHTGATE_SPONSOR_LEASE_WAIT_MS;
-    });
 
     test('the LAST failing sponsor is benched too, so the next job skips it', async () => {
         process.env.NIGHTGATE_FEE_SPONSOR_SESSION = 'pool-1';

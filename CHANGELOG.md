@@ -1,5 +1,159 @@
 # Changelog
 
+## 0.23.0 - 2026-09-05
+
+Hardening release across the whole server: authentication, submission
+bookkeeping, encryption at rest, crawler correctness, worker structure,
+configuration and packaging. Schema delta: `ContractActions.address`
+nullable, inclusion columns on `BackgroundJobs` and `PendingSubmissions`,
+`SyncState.reorgGeneration`, new `AccountKeys` table, `keyScheme` marker on
+the private-state tables; `nightgate-schema-delta` applies all of it, the
+image redeploys. Breaking items first; every deployed attestation vault
+must be redeployed and its documents re-anchored.
+
+### Breaking
+
+- **Vault lineage 3.** `attestGuarded(mode, payload, meta, nonce,
+  expires_at)`: a commitment is bound to its committer, expires at block
+  time (7-day cap), a fresh reveal inherits the commitment's sequence and a
+  revealed attestation is final. `anchorDocument` is guarded by default
+  (`guarded: false` for public hashes); `commitDocumentAnchor` and browser
+  `prepareAttestCommit` take `expiresAt`. Both widths recompiled.
+- **Prover keys leave the npm tarball** (0.72 MB packed, was 86.9 MB). A
+  missing `keys/<circuit>.prover` is fetched from `NIGHTGATE_ZK_ASSET_URL`
+  (default: the release's GitHub tree for shipped contracts) and verified
+  against `keys/manifest.json`; `nightgate-fetch-keys` pre-fetches for
+  offline installs. The artifact digest covers verifier keys, zkir, module
+  and manifest; 0.22 digests still match as `legacy`.
+- **Nothing is derived from the extrinsic envelope.** No contract address
+  from the extrinsic hash, no NIGHT transfer, UTXO or balance from a signed
+  extrinsic's call args. Those `Transactions` columns and
+  `ContractActions.address` are null until the ledger payload is decoded;
+  `ContractStatistics` counts per action type. The delta clears old values.
+- **Canonical JSON follows RFC 8785**: integer-like keys sort as strings.
+- **`/contract-manifest` emits relative URLs** unless
+  `NIGHTGATE_ZK_CONFIG_PUBLIC_URL` is set; a dApp on another origin passes
+  `manifestUrl` to `createNightgateConnectorProviders` or uses
+  `resolveManifestUrl`.
+- **Removed:** `probeCrossServerSponsor` (action, executor, worker handler),
+  `crawlerlessChainConfirm` (the confirmer is always on), the lease fields
+  of `getJobStatus`. **Node 22.12 or newer.**
+
+### Security
+
+- `$batch` parts are authenticated from the envelope token; the transport
+  principal without a token is rejected. Owner-scoped entity reads under a
+  token return the caller's rows.
+- The agent token never reaches the request log: CAP's JSON format prints
+  every header and masked only its defaults. `src/cap-log-mask-boot.ts`
+  adds `x-agent-token` to `log.mask_headers` as the first import of every
+  entry point (the formatter freezes the list on a logger's first use);
+  the image config states it too. Rotate tokens issued earlier if the
+  container logs were readable by anyone but the operator.
+- Rate limits are keyed by grant, then user, then address, 64 keys per
+  principal with LRU eviction; new limits on the sponsor actions (120/h)
+  and `buildSponsorable` (30/h). Failed basic-auth attempts are throttled
+  per address (20 per 15 min, then 429 with `Retry-After`).
+- Sponsor policy is resolved when the job runs (`AGENT_GRANT_REVOKED` for a
+  revoked grant); an unpinned grant cannot name a sponsor; a wallet facade
+  stays warm only for the same user's sessions; admin `WalletSessions` and
+  `DisclosureRoles` are read-only; `prepareDocumentProof` resolves own
+  properties only and accepts decimal numeric strings only.
+
+### Encryption at rest
+
+- Key ring: `ENCRYPTION_KEYS=id=secret,...` + `ENCRYPTION_KEY_ACTIVE`
+  (`ENCRYPTION_KEY` alone = id `1`). Ciphertexts are v2 envelopes (per-row
+  DEK under an HKDF-stretched KEK, key id in the AAD); legacy `iv:tag:data`
+  still reads. The dev fallback key is random per process.
+- Account data keys (`AccountKeys`): private states, contract signing keys
+  and sync-state blobs are encrypted under a per-account DEK sealed under
+  the ring and under the viewing-key password. `nightgate-rewrap-keys`
+  rotates every account without a viewing key and exits 1 while legacy
+  rows remain; the boot preflight refuses an unknown key id. Cached DEKs are
+  zeroed on disconnect and shutdown, and a resolution in flight at eviction
+  time does not repopulate the cache.
+
+### Submission
+
+- Every submit path announces the transaction identifier before it
+  broadcasts and persists it as the job's `txHash` first; rejected attempts
+  are closed, refunded and taken off the job in one transaction; restart
+  recovery fails hash-less `external_execution` rows plainly
+  (`PROCESS_RESTART_BEFORE_BROADCAST`).
+- Chain evidence is the indexer confirmer's block: `chainBlockHeight`,
+  `chainBlockHash`, `indexerTxHash` on job and attempt row, written in one
+  transaction and never without a height. Every commit is reorg-safe: each
+  rollback increments `SyncState.reorgGeneration` as its first write (one
+  atomic `+ 1` that holds the row lock for the whole rollback), a confirmer
+  captures the generation before its lookup and refuses the commit when it
+  moved. A reorg rollback and `reindexFromHeight` revert every job and
+  attempt confirmed at or above the fork by that height, chain-failed
+  attempts included. A failure the worker proves directly goes through the
+  same lookup or parks as `CHAIN_EXECUTION_FAILED_UNCONFIRMED`.
+- Submit failures are classified once in the worker (`pre-mempool-reject`,
+  `dust-race`, `transport`, `ambiguous`, `landed-not-applied`, `policy`,
+  `causality`, `internal`) and travel the RPC as data (`WorkerSubmitError`);
+  both sponsor channels share one decision table
+  (`NIGHTGATE_SPONSOR_DUST_RETRIES`). A wait that ended without a reply is
+  ambiguous, never resent.
+- Unbound sponsoring picks the free dust backing with the most headroom,
+  values the notes at the spend's block time and refuses a backing whose
+  fresh note no longer covers the fee before proving (three re-selects).
+- Job kinds declare their traits in one table (`srv/submission/job-kinds.ts`);
+  the heavy, workflow-parent, identifier-keyed and session-bound sets derive
+  from it. Expired leases are reclaimed (`NIGHTGATE_JOB_LEASE_TTL_MS`), the
+  poller claims rows up to free capacity, the equality/membership/integrity/
+  diff workflow parents reconcile.
+- Worker rotation drains submitting calls only, bounded by
+  `NIGHTGATE_WORKER_DRAIN_MAX_MS`; rotation and shutdown flush every facade
+  with an acked save; reads cut by a rotation are repeated once
+  (`WORKER_ROTATED`); sync waits and private-state round trips are bounded.
+
+### Crawler
+
+- `Transactions.raw` is a binary value (PostgreSQL-safe; the delta clears
+  lossy text values, `reindexFromHeight(0)` restores them). Block timestamps
+  come from storage or the `Timestamp.set` inherent, never the wall clock.
+  The runtime version rides per block; registry and pallet map are cached
+  per `specVersion` and a block is classified with its own runtime's map.
+  A missing or invalid runtime version, an unreadable metadata or one that
+  lists no pallets fails the block instead of guessing.
+- The node provider never stops reconnecting, `stop()` waits for the
+  in-flight persist, a failed header lookup during the fork search
+  propagates, secondary indexes are created at startup, lock contention is
+  recognised by SQLSTATE (40001, 40P01, 55P03, 57014) with a shared retry.
+
+### Structure
+
+- The wallet worker is eleven modules under `srv/midnight/worker/`;
+  `wallet-worker.ts` is the composition root. Artifact snapshots live per
+  install (`<base>/<install>/<digest>` with holder files).
+- One typed config table (`srv/utils/config-table.ts`, 80 keys): uniform
+  parsing, every key settable via `cds.requires.nightgate`, the worker reads
+  the resolved snapshot from `workerData`, `docs/reference.md` is generated
+  (`npm run config:table`) and pinned by a test.
+- One witness builder and one hex codec (`src/browser/witnesses.mjs`,
+  `hex.mjs`) for server, worker and browser; `npm run check:vault-parity`
+  keeps the 16- and 32-slot sources in step; `slotWidth` is 16 or 32.
+  Main-thread artifact readers are generation-pinned; a job resolve compares
+  the memoised digest instead of re-hashing the prover keys.
+
+### Packaging and operations
+
+- PostgreSQL integration lane (`npm run integration:postgres`), a CI job and
+  part of the tag gate (`check:release:full`). `nightgate-schema-delta` needs
+  no cds-dk. `check:exports` verifies every `bin`, every manifest circuit's
+  verifier/zkir/bzkir in the tarball, and that packed build output has a
+  tracked source.
+- Image runs as `node`; `.dockerignore` excludes `packages/`, `deploy/`,
+  `.github/`; `deploy/contabo/` removed; the compose tag is pinned to the
+  package version by a test; `packages/nightgate-tx` publishes only from a
+  fresh generated tree; the txbuilder's asset fetch accepts gzip responses.
+- `getRuntimeInfo().apiVersion` and a written 0.x API rule;
+  `estimateSendNightFee` takes `tokenTypeHex`; `mintShieldedTestToken` runs
+  under the heavy cap; bins are linted.
+
 ## 0.22.2 - 2026-09-02
 
 Midnight SDK line moved to midnight-js 4.1.1 / compact-js 2.5.1 / ledger-v8

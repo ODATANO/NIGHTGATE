@@ -4,6 +4,7 @@ import fs from 'fs';
 
 import { getNightgatePluginConfig, getConfiguredNightgateNetwork, DEFAULT_NETWORK } from '../srv/utils/nightgate-config';
 import { getContractRegistration, listRegisteredContracts } from '../srv/submission/contract-registry';
+import { configString } from '../srv/utils/config';
 
 // Browser DApp-connector HTTP surface. Two routes:
 //   GET /zk-config/<contract>/<dir>/<file>  -> serve proving artifacts
@@ -24,16 +25,18 @@ import { getContractRegistration, listRegisteredContracts } from '../srv/submiss
 // Only REGISTERED contracts are servable; the registry is the security
 // boundary.
 const ZK_FILE_RE = /^[A-Za-z0-9_]+\.(prover|verifier|zkir|bzkir)$/;
-const zkEtagCache = new Map<string, { mtimeMs: number; etag: string }>();
+// Content-hash ETag per file, keyed by (mtime, size): a prover key of up to
+// 76 MB is read and hashed ONCE per generation, not per request.
+const zkEtagCache = new Map<string, { mtimeMs: number; size: number; etag: string }>();
 
 export function zkFileEtag(absPath: string): string | null {
     let stat: fs.Stats;
     try { stat = fs.statSync(absPath); } catch { return null; }
     const cached = zkEtagCache.get(absPath);
-    if (cached && cached.mtimeMs === stat.mtimeMs) return cached.etag;
+    if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) return cached.etag;
     const hash = crypto.createHash('sha256').update(fs.readFileSync(absPath)).digest('hex');
     const etag = `"${hash}"`;
-    zkEtagCache.set(absPath, { mtimeMs: stat.mtimeMs, etag });
+    zkEtagCache.set(absPath, { mtimeMs: stat.mtimeMs, size: stat.size, etag });
     return etag;
 }
 
@@ -89,7 +92,10 @@ export function mountContractManifestRoute(app: any): void {
     app.get('/contract-manifest', (req: any, res: any) => {
         const cfg = getNightgatePluginConfig();
         const network = getConfiguredNightgateNetwork(cfg) || DEFAULT_NETWORK;
-        const base = (process.env.NIGHTGATE_ZK_CONFIG_PUBLIC_URL || `${req.protocol}://${req.get('host')}`).replace(/\/+$/, '');
+        // Without a configured public base the URLs are RELATIVE: a browser
+        // resolves them against the origin it fetched the manifest from, and
+        // nothing from the request's Host header is reflected into the body.
+        const base = (configString('NIGHTGATE_ZK_CONFIG_PUBLIC_URL') ?? '').replace(/\/+$/, '');
         const contracts = listRegisteredContracts().map((name: string) => {
             const reg = getContractRegistration(name);
             if (!reg) return null;

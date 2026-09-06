@@ -7,7 +7,11 @@ const TRANSIENT_PATTERNS = [
   'connection closed', 'connection lost', 'not connected',
   'websocket', 'rpc timeout', 'socket hang up',
   'network', 'epipe', 'ehostunreach',
-  'no block body'  // pruned/racing node returned null for a finalized hash
+  'no block body',  // pruned/racing node returned null for a finalized hash
+  'no block at height',  // a lagging replica behind a load balancer answers null for a finalized height
+  'no timestamp for',  // Timestamp storage empty and no inherent: pruned or racing node
+  'no runtime metadata for',  // state_getMetadata answered null: pruned or racing node
+  'no runtime version for'  // state_getRuntimeVersion failed or answered null: the block is not decoded under another runtime's map
 ];
 
 /**

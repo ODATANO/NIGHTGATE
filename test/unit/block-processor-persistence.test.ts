@@ -16,26 +16,7 @@
  *
  * External collaborators stay MOCKED:
  *  - MidnightNodeProvider          → per-test inline fake objects (no real RPC)
- *  - reconcilePendingSubmission    → vi.mock (no-op; PendingSubmissions is
- *    empty in these tests, so reconciliation is a no-op anyway; mocking keeps
- *    the persist path decoupled from the submission module).
- *
- * Note on the pallet map: the processor's constructor builds its pallet map from
- * `cds.env.requires.nightgate.palletMap`. The [test] profile config does not set
- * one, so the old test's pallet-15 → Zswap/shielded_transfer entry is injected
- * onto cds.env before constructing the processor (test-only env tweak, mirrors
- * what the old cds mock hard-coded). Defaults (System=0, Contracts=10,
- * Balances=4) come from the source's DEFAULT_PALLET_MAP.
  */
-
-// External collaborator: keep mocked. vi.mock is hoisted; only override
-// reconcilePendingSubmission, preserve every other real export so the
-// framework-booted submission handlers still load normally.
-const mockReconcile = vi.hoisted(() => (vi.fn().mockResolvedValue(undefined)));
-vi.mock('../../srv/submission/TransactionSubmitter', async () => ({
-    ...await vi.importActual('../../srv/submission/TransactionSubmitter'),
-    reconcilePendingSubmission: (...args: any[]) => mockReconcile(...args)
-}));
 
 import cds from '@sap/cds';
 import { BlockProcessor } from '../../srv/crawler/BlockProcessor';
@@ -105,6 +86,11 @@ function buildTimestampHex(seconds: number): string {
 function makeProcessor(provider: any): BlockProcessor {
     const processor = new BlockProcessor(provider as any);
     (processor as any).db = db;
+    // The fake providers carry no runtime metadata, and a missing registry
+    // refuses the block (fail-closed; covered in block-processor-fetch.test.ts).
+    if (typeof provider?.getMetadata !== 'function') {
+        vi.spyOn(processor as any, 'getEventRegistry').mockResolvedValue(undefined);
+    }
     return processor;
 }
 
@@ -134,7 +120,6 @@ beforeAll(async () => {
 
 beforeEach(async () => {
     vi.clearAllMocks();
-    mockReconcile.mockResolvedValue(undefined);
 
     // Reset DB state used by these tests (children before parents).
     await db.run(cds.ql.DELETE.from(CONTRACT_ACTIONS));
@@ -197,6 +182,41 @@ describe('BlockProcessor persistence paths', () => {
         // No duplicate block, no transactions persisted.
         expect((await db.run(cds.ql.SELECT.from(BLOCKS).where({ hash: '0xknown' }))).length).toBe(1);
         expect((await db.run(cds.ql.SELECT.from(TRANSACTIONS))).length).toBe(0);
+    });
+
+    // ------------------------------------------------------------------------
+    // The extrinsic is persisted as BYTES (LargeBinary), not as hex text: on
+    // PostgreSQL a string in a binary column is base64-decoded.
+    // ------------------------------------------------------------------------
+    it('stores Transactions.raw as the extrinsic bytes and no second copy as ContractActions.state', async () => {
+        const extrinsic = buildUnsignedExtrinsic(10, 0); // contract_call per the injected palletMap
+        const provider = {
+            getBlock: vi.fn().mockResolvedValue({
+                block: { header: { parentHash: '0xnoparent-raw', number: '0x09', stateRoot: '0xstate-raw' }, extrinsics: [extrinsic] },
+                justifications: null
+            }),
+            getRuntimeVersion: vi.fn().mockResolvedValue({ specVersion: 77 }),
+            getStorage: vi.fn().mockResolvedValue(buildTimestampHex(1_700_000_000))
+        };
+        const processor = makeProcessor(provider);
+        const warnSpy = vi.spyOn(cds.log('nightgate:crawler'), 'warn').mockImplementation(() => {});
+        try {
+            await processor.processBlockByHash('0xrawbytes');
+            // LargeBinary is left out of a default projection; ask for it.
+            const txRows = await db.run(cds.ql.SELECT.from(TRANSACTIONS).columns('ID', 'raw'));
+            expect(txRows).toHaveLength(1);
+            // CAP hands a LargeBinary back as a Readable of the stored bytes.
+            const raw = txRows[0].raw;
+            const chunks: Buffer[] = [];
+            for await (const c of raw as AsyncIterable<Buffer | string>) chunks.push(Buffer.isBuffer(c) ? c : Buffer.from(c));
+            const stored = Buffer.concat(chunks);
+            expect(stored.toString('hex')).toBe(extrinsic.slice(2));
+            const actions = await db.run(cds.ql.SELECT.from(CONTRACT_ACTIONS).columns('ID', 'state'));
+            expect(actions).toHaveLength(1);
+            expect(actions[0].state).toBeNull();
+        } finally {
+            warnSpy.mockRestore();
+        }
     });
 
     // ------------------------------------------------------------------------
@@ -285,10 +305,9 @@ describe('BlockProcessor persistence paths', () => {
         expect(txRows.map((t: any) => t.size)).toEqual([4, 4, 4, 4, 4]);
         expect(txRows.map((t: any) => t.hasProof)).toEqual([false, false, false, false, true]);
         expect(txRows.map((t: any) => t.circuitName)).toEqual(['0:0', '10:0', '10:1', '10:2', '15:0']);
-        // Contract txs (indices 1-3) get a derived 28-byte contract address.
-        expect(txRows.slice(1, 4).every((t: any) => /^0x[0-9a-f]{56}$/.test(t.contractAddress))).toBe(true);
-        expect(txRows[0].contractAddress).toBeNull();
-        expect(txRows[4].contractAddress).toBeNull();
+        // No contract address is minted from the extrinsic hash: the ledger
+        // payload is not decoded, so the column is null for every row.
+        expect(txRows.every((t: any) => t.contractAddress === null)).toBe(true);
         expect(txRows.every((t: any) => t.block_ID === blockId)).toBe(true);
         expect(txRows.every((t: any) => /^0x[0-9a-f]{64}$/.test(t.hash))).toBe(true);
 
@@ -313,7 +332,7 @@ describe('BlockProcessor persistence paths', () => {
         const actionsByEntry = actionRows.sort((a: any, b: any) => a.entryPoint.localeCompare(b.entryPoint));
         expect(actionsByEntry.map((a: any) => a.entryPoint)).toEqual(['10:0', '10:1', '10:2']);
         expect(actionsByEntry.map((a: any) => a.actionType)).toEqual(['CALL', 'DEPLOY', 'UPDATE']);
-        expect(actionRows.every((a: any) => /^0x[0-9a-f]{56}$/.test(a.address))).toBe(true);
+        expect(actionRows.every((a: any) => a.address === null)).toBe(true);
         expect(actionRows.every((a: any) => txIds.has(a.transaction_ID))).toBe(true);
 
         // --- SyncState advanced to the new tip ---
@@ -322,15 +341,12 @@ describe('BlockProcessor persistence paths', () => {
         expect(sync.lastIndexedHash).toBe('0xnew');
         expect(sync.syncStatus).toBe('syncing');
         expect(typeof sync.lastIndexedAt).toBe('string');
-
-        // --- Reconciliation hook fired once per tx ---
-        expect(mockReconcile).toHaveBeenCalledTimes(5);
     });
 
     // ------------------------------------------------------------------------
     // Fallback metadata: missing runtime version + missing timestamp storage.
     // ------------------------------------------------------------------------
-    it('falls back cleanly when runtime and timestamp metadata are unavailable', async () => {
+    it('refuses to persist a block whose runtime version or timestamp cannot be determined (no wall-clock, no version 0)', async () => {
         const provider = {
             getBlock: vi.fn().mockResolvedValue({
                 block: {
@@ -346,61 +362,31 @@ describe('BlockProcessor persistence paths', () => {
             getRuntimeVersion: vi.fn().mockRejectedValue(new Error('runtime unavailable')),
             getStorage: vi.fn().mockResolvedValue(null)
         };
-
         const processor = makeProcessor(provider);
-
         const warnSpy = vi.spyOn(cds.log('nightgate:crawler'), 'warn').mockImplementation(() => {});
-        // getBlockTimestamp falls back to Math.floor(Date.now()/1000) when storage
-        // is null; pin Date.now so the persisted timestamp is deterministic.
-        const nowSpy = vi.spyOn(Date, 'now').mockReturnValue(1_700_000_000_000);
-
         try {
-            const result = await processor.processBlockByHash('0xfallback');
-            expect(result).toEqual(expect.objectContaining({
-                blockHeight: 6,
-                blockHash: '0xfallback',
-                transactionCount: 1,
-                contractActionCount: 0
-            }));
+            // runtime version unavailable -> refused, never a previous version's map
+            await expect(processor.processBlockByHash('0xfallback')).rejects.toThrow(/No runtime version for block 0xfallback/);
+            expect(await db.run(cds.ql.SELECT.one.from(BLOCKS).where({ hash: '0xfallback' }))).toBeFalsy();
 
-            // --- Block row: cached specVersion 0 (runtime fetch failed), no parent,
-            //     no author (no digest logs), timestamp from wall-clock fallback. ---
-            const blockRow = await db.run(cds.ql.SELECT.one.from(BLOCKS).where({ hash: '0xfallback' }));
-            expect(blockRow).toEqual(expect.objectContaining({
-                protocolVersion: 0,
-                timestamp: 1_700_000_000,
-                author: null,
-                parent_ID: null
-            }));
-
-            // --- Single unclassified transaction (60-byte size, REGULAR, unknown). ---
-            const txRows = await db.run(cds.ql.SELECT.from(TRANSACTIONS));
-            expect(txRows).toHaveLength(1);
-            expect(txRows[0]).toEqual(expect.objectContaining({
-                txType: 'unknown',
-                transactionType: 'REGULAR',
-                isShielded: false,
-                hasProof: false,
-                size: 60,
-                protocolVersion: 0,
-                block_ID: blockRow.ID
-            }));
-
-            // No contract actions for an unclassified tx.
-            expect((await db.run(cds.ql.SELECT.from(CONTRACT_ACTIONS))).length).toBe(0);
-
-            expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('Failed to get runtime version'));
+            // runtime known, timestamp storage empty and no inherent -> refused, nothing persisted
+            provider.getRuntimeVersion.mockResolvedValue({ specVersion: 7 });
+            await expect(processor.processBlockByHash('0xfallback')).rejects.toThrow(/No timestamp for block 0xfallback/);
+            expect(await db.run(cds.ql.SELECT.one.from(BLOCKS).where({ hash: '0xfallback' }))).toBeFalsy();
+            expect(await db.run(cds.ql.SELECT.from(TRANSACTIONS))).toHaveLength(0);
         } finally {
             warnSpy.mockRestore();
-            nowSpy.mockRestore();
         }
     });
 
     // ------------------------------------------------------------------------
     // Signed night transfer → projected into a UTXO + sender/receiver balances.
     // ------------------------------------------------------------------------
-    it('projects signed night transfers into addresses, UTXOs, and NightBalances', async () => {
-        // Seed the parent block so parent_ID resolves.
+    it('does not project a transfer, sender or balance from an undecoded extrinsic', async () => {
+        // A signed extrinsic whose call args happen to parse as MultiAddress +
+        // Compact used to become a NIGHT transfer with sender, receiver and
+        // amount, and fed UnshieldedUtxos + NightBalances. The ledger payload
+        // is not decoded, so none of that is written.
         const parentId = cds.utils.uuid();
         await db.run(cds.ql.INSERT.into(BLOCKS).entries({
             ID: parentId,
@@ -430,57 +416,21 @@ describe('BlockProcessor persistence paths', () => {
         };
 
         const processor = makeProcessor(provider);
-
         await expect(processor.processBlockByHash('0xtransfer')).resolves.toEqual(expect.objectContaining({
             blockHeight: 9,
-            transactionCount: 1,
-            contractActionCount: 0
+            transactionCount: 1
         }));
 
-        // --- Transaction row carries sender/receiver/amount. ---
         const txRows = await db.run(cds.ql.SELECT.from(TRANSACTIONS));
         expect(txRows).toHaveLength(1);
-        const txRow = txRows[0];
-        expect(txRow).toEqual(expect.objectContaining({
-            txType: 'night_transfer',
-            senderAddress: `0x${'11'.repeat(32)}`,
-            receiverAddress: `0x${'22'.repeat(32)}`,
-            nightAmount: '100'
+        expect(txRows[0]).toEqual(expect.objectContaining({
+            senderAddress: null,
+            receiverAddress: null,
+            nightAmount: null,
+            contractAddress: null
         }));
-
-        // --- UTXO created for the receiver. ---
-        const utxoRows = await db.run(cds.ql.SELECT.from(UNSHIELDED_UTXOS));
-        expect(utxoRows).toHaveLength(1);
-        expect(utxoRows[0]).toEqual(expect.objectContaining({
-            owner: `0x${'22'.repeat(32)}`,
-            tokenType: '0x4e49474854',
-            value: '100',
-            outputIndex: 0,
-            ctime: 1_700_100_000,
-            createdAtTransaction_ID: txRow.ID
-        }));
-        expect(utxoRows[0].intentHash).toMatch(/^0x[0-9a-f]{64}$/);
-
-        // --- NightBalances: one credited receiver, one debited sender. ---
-        const balanceRows = await db.run(cds.ql.SELECT.from(NIGHT_BALANCES));
-        expect(balanceRows).toHaveLength(2);
-
-        const receiverBalance = balanceRows.find((b: any) => b.address === `0x${'22'.repeat(32)}`);
-        expect(receiverBalance).toBeTruthy();
-        expect(String(receiverBalance.balance)).toBe('100');
-        expect(receiverBalance.utxoCount).toBe(1);
-        expect(receiverBalance.txReceivedCount).toBe(1);
-        expect(String(receiverBalance.totalReceived)).toBe('100');
-        expect(receiverBalance.txSentCount).toBe(0);
-        expect(String(receiverBalance.totalSent)).toBe('0');
-
-        const senderBalance = balanceRows.find((b: any) => b.address === `0x${'11'.repeat(32)}`);
-        expect(senderBalance).toBeTruthy();
-        expect(String(senderBalance.balance)).toBe('0');
-        expect(senderBalance.txSentCount).toBe(1);
-        expect(String(senderBalance.totalSent)).toBe('100');
-        expect(senderBalance.txReceivedCount).toBe(0);
-        expect(String(senderBalance.totalReceived)).toBe('0');
+        expect(await db.run(cds.ql.SELECT.from(UNSHIELDED_UTXOS))).toHaveLength(0);
+        expect(await db.run(cds.ql.SELECT.from(NIGHT_BALANCES))).toHaveLength(0);
     });
 });
 

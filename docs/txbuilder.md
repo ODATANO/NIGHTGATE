@@ -230,9 +230,8 @@ for dust generation in the sponsor wallet (parallelism = distinct backings).
 
 If you want both halves on one machine (for a test), `buildSponsorable` also
 exists as an OData action, which runs phase 1 server-side against a stored
-session. `npm run cross-server-probe:e2e` exercises that path;
-`npm run txbuilder:e2e` exercises the real split, with phase 1 in the local
-process and only the bytes going to the server.
+session. `npm run txbuilder:e2e` exercises the real split, with phase 1 in
+the local process and only the bytes going to the server.
 
 ## Costs and caveats
 

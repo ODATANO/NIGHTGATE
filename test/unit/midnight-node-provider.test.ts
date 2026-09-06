@@ -174,20 +174,37 @@ describe('MidnightNodeProvider connection management', () => {
         }
     });
 
-    it('stops reconnect attempts once the configured limit has been reached', () => {
+    it('signals abandonment ONCE past the configured limit but keeps reconnecting with a capped delay', async () => {
         const provider = new MidnightNodeProvider({
             nodeUrl: 'ws://localhost:9944',
+            reconnectInterval: 100,
             maxReconnectAttempts: 2
         });
         const errorSpy = vi.spyOn(cds.log('nightgate:node'), 'error').mockImplementation(() => {});
+        const failed = vi.fn();
+        provider.setOnReconnectFailed(failed);
+        const connectSpy = vi.spyOn(provider, 'connect').mockRejectedValue(new Error('still down'));
 
         try {
             (provider as any).reconnectAttempts = 2;
             (provider as any).attemptReconnect();
-
             expect(errorSpy).toHaveBeenCalledWith('Max reconnect attempts (2) reached');
+            expect(failed).toHaveBeenCalledTimes(1);
+            // a timer is scheduled anyway: an indexer never gives up on its node
+            expect((provider as any).reconnectTimer).not.toBeNull();
+            // attempt 3 fires after interval x 3, fails, and reschedules; the
+            // abandonment signal does not repeat within the same outage
+            await vi.advanceTimersByTimeAsync(300);
+            await Promise.resolve();
+            expect(connectSpy).toHaveBeenCalledTimes(1);
+            expect(failed).toHaveBeenCalledTimes(1);
+            expect((provider as any).reconnectTimer).not.toBeNull();
+            // the delay is capped at interval x 12
+            expect((provider as any).reconnectAttempts).toBe(4);
         } finally {
+            if ((provider as any).reconnectTimer) clearTimeout((provider as any).reconnectTimer);
             errorSpy.mockRestore();
+            connectSpy.mockRestore();
         }
     });
 

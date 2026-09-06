@@ -10,6 +10,7 @@
 export const DEFAULT_PROOF_TIMEOUT_MS = 300_000;
 
 export function proofRequestTimeoutMs(env: NodeJS.ProcessEnv = process.env): number {
-    const n = Number(env.NIGHTGATE_PROOF_TIMEOUT_MS);
-    return Number.isFinite(n) && n > 0 ? Math.floor(n) : DEFAULT_PROOF_TIMEOUT_MS;
+    return configNumberFrom('NIGHTGATE_PROOF_TIMEOUT_MS', env);
 }
+
+import { configNumberFrom } from './config';

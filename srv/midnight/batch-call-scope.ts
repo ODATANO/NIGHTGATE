@@ -13,6 +13,7 @@ import {
     withObservedBatchSegments,
     withOrderedBatchSegments
 } from './batch-segment-order';
+import { configEnum } from '../utils/config';
 
 export interface BatchCall {
     circuit: string;
@@ -80,14 +81,10 @@ export async function runBatchInScope(
     // in dice order). Whatever the mode, the ledger's sequencing check
     // rejects an update of an existing cell FOLLOWED by a later intent on
     // populated state (1010/188): order cell-updating calls LAST in the
-    // batch (see docs/feature-requests/rebind-batch-invalid-on-populated-state.md).
+    // batch.
     // Skipped when the bundle has no proveTx-capable proof provider (tests).
     const providersAny = providers as any;
-    const rawMode = process.env.NIGHTGATE_BATCH_SEGMENT_MODE || 'rewrite';
-    const mode = rawMode === 'observe' || rawMode === 'rewrite' ? rawMode : 'rewrite';
-    if (mode !== rawMode) {
-        console.warn(`[nightgate:batch-segments] unknown NIGHTGATE_BATCH_SEGMENT_MODE '${rawMode}', falling back to 'rewrite'`);
-    }
+    const mode = configEnum<'observe' | 'rewrite'>('NIGHTGATE_BATCH_SEGMENT_MODE') ?? 'rewrite';
     const wrapSegments = mode === 'observe' ? withObservedBatchSegments : withOrderedBatchSegments;
     const scopedProviders = typeof providersAny?.proofProvider?.proveTx === 'function'
         ? { ...providersAny, proofProvider: wrapSegments(providersAny.proofProvider, circuits, orderOpts) }

@@ -195,6 +195,14 @@ cd my-cap-app
 npm install @odatano/nightgate @cap-js/sqlite
 ```
 
+The package is small (under 1 MB): it ships every contract's module,
+verifier keys and zkir, but no prover key. The first job that proves a
+circuit fetches the missing keys from the release's git tag (override with
+`NIGHTGATE_ZK_ASSET_URL`, a `/zk-config` base) and verifies them against the
+packed `keys/manifest.json`. For a machine without outbound access run
+`npx nightgate-fetch-keys attestation-vault` (and `attestation-vault-32`,
+`counter`, `shielded-token` as needed) once after the install.
+
 Add to `package.json`:
 
 ```json

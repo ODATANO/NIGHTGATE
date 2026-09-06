@@ -65,3 +65,46 @@ jobs:
           token: ${{ secrets.CODECOV_TOKEN }}
           directory: coverage
           fail_ci_if_error: false
+
+  # The database paths against a REAL PostgreSQL (the hosted dialect): model
+  # deploy, BYTEA round trip of Transactions.raw through the BlockProcessor,
+  # secondary indexes, SQLSTATE-based lock-contention classification and
+  # retry. Everything else runs on SQLite.
+  postgres:
+    name: PostgreSQL integration
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: nightgate
+          POSTGRES_PASSWORD: nightgate
+          POSTGRES_DB: nightgate
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U nightgate"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: 22.x
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build plugin
+        run: npm run build
+
+      - name: PostgreSQL lane
+        env:
+          NIGHTGATE_PG_URL: postgres://nightgate:nightgate@127.0.0.1:5432/nightgate
+        run: npm run integration:postgres

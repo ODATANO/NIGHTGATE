@@ -314,8 +314,7 @@ export function withOrderedBatchSegments(
  * randomized segment ids and prove as-is. Apply order is then whatever the
  * dice say, so dependent batches may fail ON-CHAIN with partial effects; use
  * only to decide whether a pre-mempool sequencing reject (1010/188) also
- * occurs when the rewrite touched nothing. See
- * docs/feature-requests/rebind-batch-invalid-on-populated-state.md.
+ * occurs when the rewrite touched nothing.
  */
 export function withObservedBatchSegments(
     proofProvider: any,

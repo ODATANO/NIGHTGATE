@@ -1,6 +1,14 @@
 import cds from '@sap/cds';
 import { deriveIndexerWsUrl } from './indexer-url';
 import { DEFAULT_PROOF_TIMEOUT_MS } from './proof-timeout';
+import { configBool, configEnum, configInt, configString, setConfigOverrideSource, setConfigWarnSink } from './config';
+import { configSpec, parseConfigValue } from './config-table';
+
+// Every typed accessor in `./config` sees the CAP host's block from here on:
+// `cds.requires.nightgate.<camelCase>` for any key of the table (env wins),
+// and parse warnings go to the plugin's logger.
+setConfigOverrideSource(() => getNightgatePluginConfig() as Record<string, unknown>);
+setConfigWarnSink((message) => cds.log('nightgate:config').warn(message));
 
 export { deriveIndexerWsUrl };
 
@@ -118,8 +126,9 @@ export interface NightgatePluginConfig {
  * typed `NightgatePluginConfig` via this function.
  */
 export function getNightgatePluginConfig(): NightgatePluginConfig {
-    const env = cds.env as { requires?: { nightgate?: NightgatePluginConfig } };
-    return env.requires?.nightgate ?? {};
+    // `cds.env` is absent under a bare cds mock (unit tests); no block then.
+    const env = (cds as any).env as { requires?: { nightgate?: NightgatePluginConfig } } | undefined;
+    return env?.requires?.nightgate ?? {};
 }
 
 export const DEFAULT_NETWORK: NightgateNetwork = 'preprod';
@@ -177,7 +186,7 @@ export type PrivateStateBackend = (typeof VALID_PRIVATE_STATE_BACKENDS)[number];
 export const DEFAULT_PRIVATE_STATE_BACKEND: PrivateStateBackend = 'cap-db';
 
 export function getConfiguredPrivateStateBackend(config?: Record<string, any>): PrivateStateBackend {
-    const raw = readEnv('NIGHTGATE_PRIVATE_STATE_BACKEND') || config?.privateStateBackend;
+    const raw = configEnum('NIGHTGATE_PRIVATE_STATE_BACKEND') || config?.privateStateBackend;
     if (raw && (VALID_PRIVATE_STATE_BACKENDS as readonly string[]).includes(raw)) {
         return raw as PrivateStateBackend;
     }
@@ -189,7 +198,7 @@ export type GranteeBinding = (typeof VALID_GRANTEE_BINDINGS)[number];
 export const DEFAULT_GRANTEE_BINDING: GranteeBinding = 'wallet';
 
 export function getConfiguredGranteeBinding(config?: Record<string, any>): GranteeBinding {
-    const raw = readEnv('NIGHTGATE_GRANTEE_BINDING') || config?.granteeBinding;
+    const raw = configEnum('NIGHTGATE_GRANTEE_BINDING') || config?.granteeBinding;
     if (raw && (VALID_GRANTEE_BINDINGS as readonly string[]).includes(raw)) {
         return raw as GranteeBinding;
     }
@@ -197,8 +206,8 @@ export function getConfiguredGranteeBinding(config?: Record<string, any>): Grant
 }
 
 export function isSelfServiceGranteeRegistrationAllowed(config?: Record<string, any>): boolean {
-    const raw = readEnv('NIGHTGATE_ALLOW_SELF_SERVICE_GRANTEE_REGISTRATION');
-    if (raw != null) return !/^(false|0|no|off)$/i.test(raw);
+    const raw = configBool('NIGHTGATE_ALLOW_SELF_SERVICE_GRANTEE_REGISTRATION');
+    if (raw !== undefined) return raw;
     // Secure default: OFF. NIGHTGATE cannot verify ownership of
     // the binding input, so a caller could register another principal's key and
     // inherit their on-chain grants. Deployments that want self-service must
@@ -224,33 +233,24 @@ export function isSelfServiceGranteeRegistrationAllowed(config?: Record<string, 
  * restarts and expect them to keep working.
  */
 export function isCloseSessionsOnRestartEnabled(config?: Record<string, any>): boolean {
-    const env = readEnv('NIGHTGATE_CLOSE_SESSIONS_ON_RESTART');
-    if (env != null) return !/^(false|0|no|off)$/i.test(env);
+    const env = configBool('NIGHTGATE_CLOSE_SESSIONS_ON_RESTART');
+    if (env !== undefined) return env;
     if (typeof config?.closeSessionsOnRestart === 'boolean') return config.closeSessionsOnRestart;
     return true;
 }
 
-function readEnv(key: string): string | undefined {
-    return process.env[key]?.trim() || undefined;
-}
-
-function parseIntEnv(key: string): number | undefined {
-    const raw = readEnv(key);
-    if (raw == null) return undefined;
-    const n = Number.parseInt(raw, 10);
-    return Number.isFinite(n) && n > 0 ? n : undefined;
-}
-
 export function getConfiguredNightgateNetwork(config?: Record<string, any>): string | undefined {
-    return readEnv('NIGHTGATE_NETWORK') || config?.network;
+    // Raw on purpose: an invalid value must reach normalizeNightgateNetwork,
+    // which refuses to start instead of silently falling back.
+    return process.env.NIGHTGATE_NETWORK?.trim() || config?.network;
 }
 
 export function getConfiguredNightgateNodeUrl(config?: Record<string, any>): string | undefined {
-    return readEnv('NIGHTGATE_NODE_URL') || config?.nodeUrl;
+    return configString('NIGHTGATE_NODE_URL') || config?.nodeUrl;
 }
 
 export function getConfiguredNightgateCrawlerNodeUrl(config?: Record<string, any>): string | undefined {
-    return readEnv('NIGHTGATE_CRAWLER_NODE_URL') || config?.crawler?.nodeUrl;
+    return configString('NIGHTGATE_CRAWLER_NODE_URL') || config?.crawler?.nodeUrl;
 }
 
 /**
@@ -301,9 +301,9 @@ export interface SubmissionEndpointsConfig {
  * env var directly.
  */
 export function resolveEffectiveProvingMode(config?: Record<string, any> | null): 'server' | 'wasm' {
-    const explicit = (readEnv('NIGHTGATE_PROVING_MODE') || '').trim().toLowerCase();
-    if (explicit === 'server' || explicit === 'wasm') return explicit;
-    return (readEnv('NIGHTGATE_PROOF_SERVER_URL') || config?.proofServerUrl) ? 'server' : 'wasm';
+    const explicit = configEnum<'server' | 'wasm'>('NIGHTGATE_PROVING_MODE');
+    if (explicit) return explicit;
+    return (configString('NIGHTGATE_PROOF_SERVER_URL') || config?.proofServerUrl) ? 'server' : 'wasm';
 }
 
 /**
@@ -312,8 +312,12 @@ export function resolveEffectiveProvingMode(config?: Record<string, any> | null)
  * `initialize()` pins the result into the env before the wallet worker spawns.
  */
 export function resolveProofTimeoutMs(config?: Record<string, any> | null): number {
-    const env = parseIntEnv('NIGHTGATE_PROOF_TIMEOUT_MS');
-    if (env !== undefined) return env;
+    const raw = process.env.NIGHTGATE_PROOF_TIMEOUT_MS?.trim();
+    if (raw) {
+        const parsed = parseConfigValue(configSpec('NIGHTGATE_PROOF_TIMEOUT_MS'), raw);
+        if (!parsed.warning && typeof parsed.value === 'number') return parsed.value;
+        cds.log('nightgate:config').warn(parsed.warning ?? `NIGHTGATE_PROOF_TIMEOUT_MS: '${raw}' ignored`);
+    }
     const cfg = Number(config?.proofTimeoutMs);
     if (Number.isFinite(cfg) && cfg > 0) return Math.floor(cfg);
     return DEFAULT_PROOF_TIMEOUT_MS;
@@ -324,13 +328,13 @@ export function resolveSubmissionEndpoints(
     config?: Record<string, any>
 ): SubmissionEndpointsConfig {
     const defaults = DEFAULT_INDEXER_URLS[network];
-    const httpOverride = readEnv('NIGHTGATE_INDEXER_HTTP_URL') || config?.indexerHttpUrl;
-    const wsOverride = readEnv('NIGHTGATE_INDEXER_WS_URL') || config?.indexerWsUrl;
+    const httpOverride = configString('NIGHTGATE_INDEXER_HTTP_URL') || config?.indexerHttpUrl;
+    const wsOverride = configString('NIGHTGATE_INDEXER_WS_URL') || config?.indexerWsUrl;
     return {
         indexerHttpUrl: httpOverride || defaults.http,
         indexerWsUrl: wsOverride || (httpOverride ? deriveIndexerWsUrl(httpOverride) : defaults.ws),
-        proofServerUrl: readEnv('NIGHTGATE_PROOF_SERVER_URL') || config?.proofServerUrl || DEFAULT_PROOF_SERVER_URL,
-        zkConfigBasePath: readEnv('NIGHTGATE_ZK_CONFIG_BASE') || config?.zkConfigBasePath || DEFAULT_ZK_CONFIG_BASE
+        proofServerUrl: configString('NIGHTGATE_PROOF_SERVER_URL') || config?.proofServerUrl || DEFAULT_PROOF_SERVER_URL,
+        zkConfigBasePath: process.env.NIGHTGATE_ZK_CONFIG_BASE?.trim() || config?.zkConfigBasePath || DEFAULT_ZK_CONFIG_BASE
     };
 }
 
@@ -356,32 +360,15 @@ export function resolveOverrideIndexerEndpoints(
 }
 
 /**
- * Whether the crawler-free chain-outcome confirmer runs. The crawler is the sole
- * source of truth for `chainStatus`, so with it enabled the confirmer NEVER runs
- * (running both risks divergent verdicts overwriting each other). With the
- * crawler off it defaults on; `NIGHTGATE_CRAWLERLESS_CHAIN_CONFIRM=false` /
- * `config.crawlerlessChainConfirm: false` opts out.
+ * The indexer confirmer is the only chain-evidence path for submitted jobs
+ * and always runs; `crawlerlessChainConfirm` / `NIGHTGATE_CRAWLERLESS_CHAIN_CONFIRM`
+ * used to opt out of it. A value that is still set is reported once and ignored.
  */
-export function resolveCrawlerlessChainConfirmEnabled(
-    crawlerEnabled: boolean,
-    config?: Record<string, any>
-): boolean {
-    if (crawlerEnabled) return false;
-    const env = readEnv('NIGHTGATE_CRAWLERLESS_CHAIN_CONFIRM');
-    if (env != null) return !/^(false|0|no|off)$/i.test(env);
-    if (typeof config?.crawlerlessChainConfirm === 'boolean') return config.crawlerlessChainConfirm;
-    return true;
-}
-
-/**
- * Whether the confirmer was explicitly requested on (env/config), independent of
- * the crawler gate. Lets the caller warn when an opt-in is ignored because the
- * crawler is active, instead of silently dropping it.
- */
-export function isCrawlerlessChainConfirmExplicitlyEnabled(config?: Record<string, any>): boolean {
-    const env = readEnv('NIGHTGATE_CRAWLERLESS_CHAIN_CONFIRM');
-    if (env != null) return !/^(false|0|no|off)$/i.test(env);
-    return config?.crawlerlessChainConfirm === true;
+export function warnIfCrawlerlessChainConfirmSet(config?: Record<string, any>, warn: (msg: string) => void = (m) => cds.log('nightgate:config').warn(m)): boolean {
+    const envRaw = process.env.NIGHTGATE_CRAWLERLESS_CHAIN_CONFIRM;
+    const set = (typeof envRaw === 'string' && envRaw.trim() !== '') || config?.crawlerlessChainConfirm !== undefined;
+    if (set) warn('crawlerlessChainConfirm / NIGHTGATE_CRAWLERLESS_CHAIN_CONFIRM is no longer an option: the indexer confirmer is the only chain-evidence path and always runs; remove the setting');
+    return set;
 }
 
 export function resolveNightgateRuntimeConfig(config: Record<string, any> = {}): {
@@ -395,15 +382,12 @@ export function resolveNightgateRuntimeConfig(config: Record<string, any> = {}):
     const rawCrawlerConfig = config.crawler || {};
     // env-var overrides for crawler tuning. Numeric vars are parsed; anything
     // unparseable falls back to the config value (or built-in default).
-    const fetchConcurrencyEnv = parseIntEnv('NIGHTGATE_FETCH_CONCURRENCY');
-    const rpcBatchSizeEnv = parseIntEnv('NIGHTGATE_RPC_BATCH_SIZE');
+    const fetchConcurrencyEnv = configInt('NIGHTGATE_FETCH_CONCURRENCY');
+    const rpcBatchSizeEnv = configInt('NIGHTGATE_RPC_BATCH_SIZE');
     // NIGHTGATE_CRAWLER_ENABLED=false disables the crawler at boot. Useful for
     // running submission tests in isolation so the wallet sync isn't competing
     // with block ingestion for CPU/RAM on the same event loop.
-    const crawlerEnabledEnv = readEnv('NIGHTGATE_CRAWLER_ENABLED');
-    const crawlerEnabledOverride = crawlerEnabledEnv == null
-        ? undefined
-        : !/^(false|0|no|off)$/i.test(crawlerEnabledEnv);
+    const crawlerEnabledOverride = configBool('NIGHTGATE_CRAWLER_ENABLED');
     const crawlerConfig: Record<string, unknown> = {
         ...rawCrawlerConfig,
         ...(fetchConcurrencyEnv != null && { fetchConcurrency: fetchConcurrencyEnv }),

@@ -84,7 +84,7 @@ try {
     ok('manifest: HTTP 200', mRes.status === 200, `got ${mRes.status}`);
     const manifest = await mRes.json();
     ok('manifest: network reflects configured network (undeployed)', manifest.network === 'undeployed', manifest.network);
-    ok('manifest: zkConfigBaseUrl present', manifest.zkConfigBaseUrl === `${base}/zk-config`, manifest.zkConfigBaseUrl);
+    ok('manifest: zkConfigBaseUrl is relative without a public base (nothing from Host is reflected)', manifest.zkConfigBaseUrl === '/zk-config', manifest.zkConfigBaseUrl);
 
     const byName = Object.fromEntries((manifest.contracts || []).map((c) => [c.name, c]));
     ok('manifest: counter listed', !!byName.counter);

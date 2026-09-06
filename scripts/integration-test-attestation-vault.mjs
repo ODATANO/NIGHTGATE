@@ -170,12 +170,18 @@ const ownerRegistrarId = offchainAttesterId(ownerSecret);
 
 const ctorCtx = rt.createConstructorContext({}, '00'.repeat(32));
 const init = ownerContract.initialState(ctorCtx, ownerRegistrarId);
+// Fixed block time: lineage-3 commitments carry a block-time expiry.
+const BLOCK_TIME = 1_700_000_000;
 let circuitCtx = rt.createCircuitContext(
     rt.dummyContractAddress(),
     ctorCtx.initialZswapLocalState.coinPublicKey,
     init.currentContractState.data,
-    init.currentPrivateState
+    init.currentPrivateState,
+    undefined, undefined, BLOCK_TIME
 );
+function setBlockTime(seconds) {
+    circuitCtx.currentQueryContext.block = { ...circuitCtx.currentQueryContext.block, secondsSinceEpoch: BigInt(seconds) };
+}
 function runCircuit(contract, name, ...args) {
     const out = contract.impureCircuits[name](circuitCtx, ...args);
     circuitCtx = out.context; // thread the mutated context forward
@@ -563,7 +569,7 @@ runCircuit(ownerContract, 'anchorContentRoot', payloadA9, hexToBytes(builtA9.con
 runCircuit(ownerContract, 'anchorContentRoot', payloadB9, hexToBytes(builtB9.contentRoot), hexToBytes(builtB9.schemaId));
 runCircuit(ownerContract, 'anchorContentRoot', payloadC9, hexToBytes(builtC9.contentRoot), hexToBytes(builtC9.schemaId));
 
-// P1 fix (0.16.0): anchoring is insert-once-or-identical. A re-anchor with a
+// Insert-once anchoring (0.16.0): anchoring is insert-once-or-identical. A re-anchor with a
 // DIFFERENT root (or same root, different schema) must throw; an identical
 // re-anchor stays a harmless no-op.
 let reanchorRootError = '';
@@ -671,7 +677,7 @@ try {
 ok('crossroot: tampered opening fails the anchored-root binding',
     tamperError.includes('doc B opening does not match anchored root'), tamperError || 'did NOT throw');
 
-// P1 fix (0.16.0): a document cannot be compared with itself, in-circuit.
+// Self-comparison guard (0.16.0): a document cannot be compared with itself, in-circuit.
 let selfError = '';
 try {
     runCircuit(integContract, 'proveDocumentComparison', payloadA9, payloadA9, 0n, maskOf(), 1n);
@@ -832,13 +838,13 @@ const reversedKey = await ps.computeDocumentIntegrityClaimKey(payloadB9Hex, payl
 ok('crossroot: reversed (B, A) order is a DIFFERENT claim key',
     crossLedger.document_integrity_results.member(hexToBytes(reversedKey)) === false);
 
-// ---- Check 10: guarded attest (commit-reveal + sniper takeover, 0.16.0) ----
+// ---- Check 10: guarded attest, lineage 3 (0.23.0) --------------------------
 // attest() is FCFS and insert-once, so a mempool observer could permanently
-// claim a visible payload hash. attestGuarded closes it: commit an opaque
-// commitment first, reveal later; sequencing lets a reveal whose commitment
-// PREDATES a snipe take the attestation over. The off-chain
-// computeAttestCommitment parity is proven implicitly: the reveal recomputes
-// the commitment in-circuit and must hit the committed entry.
+// claim a visible payload hash. attestGuarded closes it: commit an opaque,
+// caller-bound, EXPIRING commitment first, reveal later; the reveal inherits
+// the commitment's sequence and is final. The off-chain computeAttestCommitment
+// parity is proven implicitly: the reveal recomputes the commitment in-circuit
+// and must hit the committed entry.
 ok('guarded: attestGuarded circuit present', typeof instance.circuits?.attestGuarded === 'function');
 
 const gPayload = bytes32(0xf1);
@@ -847,35 +853,33 @@ const gNonce = bytes32(0xf3);
 const gPayloadHex = Buffer.from(gPayload).toString('hex');
 const gMetaHex = Buffer.from(gMeta).toString('hex');
 const gCommitment = hexToBytes(await ps.computeAttestCommitment(gPayloadHex, gMetaHex, Buffer.from(gNonce).toString('hex')));
+const EXPIRY = BigInt(BLOCK_TIME + 3600);
+const throwsWith = (fn) => { try { fn(); return ''; } catch (err) { return String(err?.message ?? err) || 'threw'; } };
 
-let commitDummyError = '';
-try {
-    runCircuit(ownerContract, 'attestGuarded', 0n, gCommitment, bytes32(1), bytes32(0));
-} catch (err) {
-    commitDummyError = String(err?.message ?? err);
-}
 ok('guarded: commit mode rejects non-dummy metadata',
-    commitDummyError.includes('metadata must be the neutral dummy'), commitDummyError || 'did NOT throw');
-
-let noCommitError = '';
-try {
-    runCircuit(ownerContract, 'attestGuarded', 1n, gPayload, gMeta, gNonce);
-} catch (err) {
-    noCommitError = String(err?.message ?? err);
-}
+    throwsWith(() => runCircuit(ownerContract, 'attestGuarded', 0n, gCommitment, bytes32(1), bytes32(0), EXPIRY)).includes('metadata must be the neutral dummy'));
+ok('guarded: reveal mode rejects a non-dummy expiry',
+    throwsWith(() => runCircuit(ownerContract, 'attestGuarded', 1n, gPayload, gMeta, gNonce, EXPIRY)).includes('expires_at must be the neutral dummy'));
 ok('guarded: reveal without a commitment rejected',
-    noCommitError.includes('no matching commitment'), noCommitError || 'did NOT throw');
+    throwsWith(() => runCircuit(ownerContract, 'attestGuarded', 1n, gPayload, gMeta, gNonce, 0n)).includes('no matching commitment'));
+// The kernel block-time comparisons return booleans the circuit asserts; the
+// local runtime evaluates them against the query context's block time.
+ok('guarded: a commitment expiring in the past is refused at commit',
+    throwsWith(() => runCircuit(ownerContract, 'attestGuarded', 0n, gCommitment, bytes32(0), bytes32(0), BigInt(BLOCK_TIME - 1))).includes('commitment expiry must lie in the future'));
+ok('guarded: a commitment more than 7 days ahead is refused at commit',
+    throwsWith(() => runCircuit(ownerContract, 'attestGuarded', 0n, gCommitment, bytes32(0), bytes32(0), BigInt(BLOCK_TIME + 8 * 86400))).includes('commitment expiry too far ahead'));
 
 // Victim (owner) commits.
-runCircuit(ownerContract, 'attestGuarded', 0n, gCommitment, bytes32(0), bytes32(0));
-let dupCommitError = '';
-try {
-    runCircuit(ownerContract, 'attestGuarded', 0n, gCommitment, bytes32(0), bytes32(0));
-} catch (err) {
-    dupCommitError = String(err?.message ?? err);
-}
-ok('guarded: duplicate commitment rejected',
-    dupCommitError.includes('commitment already recorded'), dupCommitError || 'did NOT throw');
+runCircuit(ownerContract, 'attestGuarded', 0n, gCommitment, bytes32(0), bytes32(0), EXPIRY);
+ok('guarded: duplicate commitment by the SAME committer rejected',
+    throwsWith(() => runCircuit(ownerContract, 'attestGuarded', 0n, gCommitment, bytes32(0), bytes32(0), EXPIRY)).includes('commitment already recorded'));
+// Copy-griefing: the attacker records the victim's commitment VALUE under
+// their own key; it is inert (the victim's entry is untouched, the attacker
+// cannot reveal it without the nonce: a guessed nonce recomputes a different
+// commitment, whose key has no record).
+runCircuit(attackerContract, 'attestGuarded', 0n, gCommitment, bytes32(0), bytes32(0), EXPIRY);
+ok('guarded: a copied commitment is a separate, inert record (cannot be revealed by the copier)',
+    throwsWith(() => runCircuit(attackerContract, 'attestGuarded', 1n, gPayload, gMeta, bytes32(0xee), 0n)).includes('no matching commitment'));
 
 // SNIPER: the attacker front-runs the reveal with a plain attest AND, while
 // they own the attestation, anchors a content root, PROVES a claim against
@@ -901,18 +905,10 @@ ok('guarded: sniper owns the payload pre-reveal',
     Buffer.compare(Buffer.from(led10.attestation_owners.lookup(gPayload)), Buffer.from(attackerId10)) === 0);
 ok('guarded: sniper claim verifies pre-takeover (under the sniper epoch)',
     led10.field_equality_results.member(hexToBytes(sniperEraKey)) === true);
-
-let notCommitterError = '';
-try {
-    runCircuit(attackerContract, 'attestGuarded', 1n, gPayload, gMeta, gNonce);
-} catch (err) {
-    notCommitterError = String(err?.message ?? err);
-}
-ok('guarded: reveal by a non-committer rejected',
-    notCommitterError.includes('not committer'), notCommitterError || 'did NOT throw');
+ok('guarded: a plain attestation is not guarded', led10.guarded_attestations.member(gPayload) === false);
 
 // Victim reveals: TAKEOVER (the commitment predates the snipe).
-runCircuit(ownerContract, 'attestGuarded', 1n, gPayload, gMeta, gNonce);
+runCircuit(ownerContract, 'attestGuarded', 1n, gPayload, gMeta, gNonce, 0n);
 led10 = mod.ledger(circuitCtx.currentQueryContext.state);
 ok('guarded: reveal takes the sniped attestation over',
     Buffer.compare(Buffer.from(led10.attestation_owners.lookup(gPayload)), Buffer.from(ownerId10)) === 0);
@@ -928,39 +924,94 @@ ok('guarded: sniper claim NO LONGER verifies after the takeover (current epoch m
     led10.field_equality_results.member(hexToBytes(currentEraKey)) === false);
 ok('guarded: sniper disclosure grant removed by the takeover',
     led10.disclosures.member(gPayload) === false);
+ok('guarded: the recovered attestation is guarded (final)', led10.guarded_attestations.member(gPayload) === true);
+ok('guarded: the commitment was consumed by the reveal',
+    throwsWith(() => runCircuit(ownerContract, 'attestGuarded', 1n, gPayload, gMeta, gNonce, 0n)).includes('no matching commitment'));
 
-// No ping-pong: a commitment made AFTER the snipe (newer seq) cannot re-take.
+// ---- Check 10b: the reveal itself cannot be front-run (lineage 3) ----------
+// Previous lineage: a fresh reveal received a NEW sequence, so a commit that
+// landed between the legitimate commit and its reveal was "older" than the
+// attestation and could take it over later. Now the reveal inherits the
+// commitment's sequence and a revealed attestation is final.
+const l3Payload = bytes32(0xf5);
+const l3Meta = bytes32(0xf6);
+const l3Nonce = bytes32(0xf7);
+const l3Commitment = hexToBytes(await ps.computeAttestCommitment(Buffer.from(l3Payload).toString('hex'), Buffer.from(l3Meta).toString('hex'), Buffer.from(l3Nonce).toString('hex')));
+runCircuit(ownerContract, 'attestGuarded', 0n, l3Commitment, bytes32(0), bytes32(0), EXPIRY);
+const l3OwnerCommitSeq = mod.ledger(circuitCtx.currentQueryContext.state).attest_seq_next - 1n;
+// Attacker sees the payload in the reveal's mempool and commits their own
+// (metadata/nonce of their choosing) BEFORE the reveal lands.
+const l3SnipeNonce = bytes32(0xf9);
+const l3SnipeCommitment = hexToBytes(await ps.computeAttestCommitment(Buffer.from(l3Payload).toString('hex'), Buffer.from(l3Meta).toString('hex'), Buffer.from(l3SnipeNonce).toString('hex')));
+runCircuit(attackerContract, 'attestGuarded', 0n, l3SnipeCommitment, bytes32(0), bytes32(0), EXPIRY);
+runCircuit(ownerContract, 'attestGuarded', 1n, l3Payload, l3Meta, l3Nonce, 0n);
+let l3Led = mod.ledger(circuitCtx.currentQueryContext.state);
+ok('guarded: a fresh reveal inherits the COMMITMENT sequence as its epoch',
+    l3Led.attestation_seqs.lookup(l3Payload) === l3OwnerCommitSeq);
+ok('guarded: the attacker commit that front-ran the reveal cannot take over (attestation is guarded)',
+    throwsWith(() => runCircuit(attackerContract, 'attestGuarded', 1n, l3Payload, l3Meta, l3SnipeNonce, 0n)).includes('attestation is guarded'));
+l3Led = mod.ledger(circuitCtx.currentQueryContext.state);
+ok('guarded: the owner keeps the attestation',
+    Buffer.compare(Buffer.from(l3Led.attestation_owners.lookup(l3Payload)), Buffer.from(ownerId10)) === 0);
+
+// Self-reveal: the owner commits again for the same payload (new nonce) and
+// reveals; nothing changes, the commitment is consumed.
+const l3SelfNonce = bytes32(0xfa);
+const l3SelfCommitment = hexToBytes(await ps.computeAttestCommitment(Buffer.from(l3Payload).toString('hex'), Buffer.from(l3Meta).toString('hex'), Buffer.from(l3SelfNonce).toString('hex')));
+runCircuit(ownerContract, 'attestGuarded', 0n, l3SelfCommitment, bytes32(0), bytes32(0), EXPIRY);
+runCircuit(ownerContract, 'attestGuarded', 1n, l3Payload, l3Meta, l3SelfNonce, 0n);
+const l3LedSelf = mod.ledger(circuitCtx.currentQueryContext.state);
+ok('guarded: a self-reveal against an own attestation changes nothing',
+    l3LedSelf.attestation_seqs.lookup(l3Payload) === l3OwnerCommitSeq
+    && Buffer.compare(Buffer.from(l3LedSelf.attestation_owners.lookup(l3Payload)), Buffer.from(ownerId10)) === 0);
+ok('guarded: the self-reveal consumed its commitment',
+    throwsWith(() => runCircuit(ownerContract, 'attestGuarded', 1n, l3Payload, l3Meta, l3SelfNonce, 0n)).includes('no matching commitment'));
+
+// ---- Check 10c: commitments expire ----------------------------------------
+const l3ExpPayload = bytes32(0xfb);
+const l3ExpNonce = bytes32(0xfc);
+const l3ExpCommitment = hexToBytes(await ps.computeAttestCommitment(Buffer.from(l3ExpPayload).toString('hex'), Buffer.from(l3Meta).toString('hex'), Buffer.from(l3ExpNonce).toString('hex')));
+runCircuit(ownerContract, 'attestGuarded', 0n, l3ExpCommitment, bytes32(0), bytes32(0), BigInt(BLOCK_TIME + 100));
+setBlockTime(BLOCK_TIME + 101);
+ok('guarded: a reveal after the commitment expired is refused',
+    throwsWith(() => runCircuit(ownerContract, 'attestGuarded', 1n, l3ExpPayload, l3Meta, l3ExpNonce, 0n)).includes('commitment expired'));
+setBlockTime(BLOCK_TIME);
+
+// No ping-pong: the recovered attestation is guarded, so a later commitment
+// fails there; on a PLAIN attestation a commitment made AFTER it (newer seq)
+// cannot take over either.
 const aNonce = bytes32(0xf5);
 const aCommitment = hexToBytes(await ps.computeAttestCommitment(gPayloadHex, gMetaHex, Buffer.from(aNonce).toString('hex')));
-runCircuit(attackerContract, 'attestGuarded', 0n, aCommitment, bytes32(0), bytes32(0));
-let pingPongError = '';
-try {
-    runCircuit(attackerContract, 'attestGuarded', 1n, gPayload, gMeta, aNonce);
-} catch (err) {
-    pingPongError = String(err?.message ?? err);
-}
-ok('guarded: a NEWER commitment cannot re-take the attestation',
-    pingPongError.includes('attestation predates commitment'), pingPongError || 'did NOT throw');
+runCircuit(attackerContract, 'attestGuarded', 0n, aCommitment, bytes32(0), bytes32(0), EXPIRY);
+ok('guarded: a NEWER commitment cannot re-take the recovered attestation',
+    throwsWith(() => runCircuit(attackerContract, 'attestGuarded', 1n, gPayload, gMeta, aNonce, 0n)).includes('attestation is guarded'));
+const pPayload = bytes32(0xfd);
+const pNonce = bytes32(0xfe);
+const pCommitment = hexToBytes(await ps.computeAttestCommitment(Buffer.from(pPayload).toString('hex'), gMetaHex, Buffer.from(pNonce).toString('hex')));
+runCircuit(ownerContract, 'attest', pPayload, gMeta);
+runCircuit(attackerContract, 'attestGuarded', 0n, pCommitment, bytes32(0), bytes32(0), EXPIRY);
+ok('guarded: a commitment NEWER than a plain attestation cannot take it over',
+    throwsWith(() => runCircuit(attackerContract, 'attestGuarded', 1n, pPayload, gMeta, pNonce, 0n)).includes('attestation predates commitment'));
 
 // Uncontested commit-reveal attests normally.
 const hPayload = bytes32(0xf6);
 const hNonce = bytes32(0xf7);
 const hCommitment = hexToBytes(await ps.computeAttestCommitment(Buffer.from(hPayload).toString('hex'), gMetaHex, Buffer.from(hNonce).toString('hex')));
-runCircuit(ownerContract, 'attestGuarded', 0n, hCommitment, bytes32(0), bytes32(0));
-runCircuit(ownerContract, 'attestGuarded', 1n, hPayload, gMeta, hNonce);
+runCircuit(ownerContract, 'attestGuarded', 0n, hCommitment, bytes32(0), bytes32(0), EXPIRY);
+runCircuit(ownerContract, 'attestGuarded', 1n, hPayload, gMeta, hNonce, 0n);
 led10 = mod.ledger(circuitCtx.currentQueryContext.state);
 ok('guarded: uncontested commit-reveal attests',
     led10.public_attestations.member(hPayload) === true
     && Buffer.compare(Buffer.from(led10.attestation_owners.lookup(hPayload)), Buffer.from(ownerId10)) === 0);
 
-// REPLAY (P1 repro): commitments are CONSUMED on success. Without that, this
+// REPLAY: commitments are CONSUMED on success. Without that, this
 // second identical reveal would satisfy rec.seq < attestation_seq, run the
 // takeover branch against the revealer's OWN attestation and delete the
 // meanwhile-anchored root, re-opening insert-once.
 runCircuit(ownerContract, 'anchorContentRoot', hPayload, hexToBytes(builtB9.contentRoot), hexToBytes(builtB9.schemaId));
 let replayError = '';
 try {
-    runCircuit(ownerContract, 'attestGuarded', 1n, hPayload, gMeta, hNonce);
+    runCircuit(ownerContract, 'attestGuarded', 1n, hPayload, gMeta, hNonce, 0n);
 } catch (err) {
     replayError = String(err?.message ?? err);
 }

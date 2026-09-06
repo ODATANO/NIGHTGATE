@@ -81,6 +81,9 @@ type SubscriptionCallback = (result: any) => void | Promise<void>;
 // Midnight Node Provider
 // ============================================================================
 
+/** Reconnect delay = reconnectInterval x min(attempt, this): 5 s x 12 = one attempt a minute in a long outage. */
+const MAX_RECONNECT_DELAY_FACTOR = 12;
+
 export class MidnightNodeProvider {
     private ws: WebSocket | null = null;
     private requestId: number = 0;
@@ -117,6 +120,7 @@ export class MidnightNodeProvider {
                     this.connected = true;
                     this.reconnecting = false;
                     this.reconnectAttempts = 0;
+                    this.reconnectAbandonSignalled = false;
                     log.info(`Connected to ${redactUrlCredentials(this.config.nodeUrl)}`);
                     resolve();
                 });
@@ -195,20 +199,30 @@ export class MidnightNodeProvider {
         this.onReconnectFailedCallback = callback;
     }
 
+    /** True once the abandonment signal fired for the current outage (reset on connect). */
+    private reconnectAbandonSignalled = false;
+
     private attemptReconnect(): void {
         if (this.reconnecting) return;
-        if (this.reconnectAttempts >= this.config.maxReconnectAttempts) {
+        // An indexer never gives up on its node. Past `maxReconnectAttempts`
+        // the abandonment is SIGNALLED once (the crawler marks the sync
+        // errored, operators see it) and the attempts continue with a capped
+        // delay; a successful connect resets both. Giving up here left the
+        // index frozen after any node restart longer than ~3 min, with
+        // `resumeCrawler` answering "already running".
+        if (this.reconnectAttempts >= this.config.maxReconnectAttempts && !this.reconnectAbandonSignalled) {
             log.error(`Max reconnect attempts (${this.config.maxReconnectAttempts}) reached`);
+            log.error(`Node unreachable after ${this.config.maxReconnectAttempts} attempts; sync marked errored, reconnecting continues every ${this.config.reconnectInterval * MAX_RECONNECT_DELAY_FACTOR}ms`);
+            this.reconnectAbandonSignalled = true;
             if (this.onReconnectFailedCallback) {
                 try { this.onReconnectFailedCallback(); } catch { /* best-effort signal */ }
             }
-            return;
         }
 
         this.reconnecting = true;
         this.reconnectAttempts++;
 
-        const delay = this.config.reconnectInterval * Math.min(this.reconnectAttempts, 5);
+        const delay = this.config.reconnectInterval * Math.min(this.reconnectAttempts, MAX_RECONNECT_DELAY_FACTOR);
         log.info(`Reconnecting in ${delay}ms (attempt ${this.reconnectAttempts})`);
 
         this.reconnectTimer = setTimeout(async () => {

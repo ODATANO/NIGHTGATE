@@ -198,7 +198,8 @@ service NightgateService {
                             compiledArtifactRef: String, // optional, defaults to 'attestation-vault'
                             idempotencyKey: String, // optional; dedupes retries
                             sponsorSessionId: UUID, // optional; second session pays the dust fee (see submitContractCall)
-                            nonce: String // optional; guarded REVEAL (from prepareAnchorCommitment, after commitDocumentAnchor finalized)
+                            nonce: String, // optional; guarded REVEAL (from prepareAnchorCommitment, after commitDocumentAnchor finalized)
+                            guarded: Boolean // optional; default true since 0.23.0: commit + reveal in one workflow (two transactions). false = one plain attest, only for hashes that are public anyway
     )                                                                 returns {
         jobId      : UUID;
         status     : String; // 'pending' | 'succeeded' (idempotent retry)
@@ -220,6 +221,7 @@ service NightgateService {
                                      nonce: String // optional; random when omitted
     )                                                                 returns {
         commitment   : String; // 64 hex; input to commitDocumentAnchor
+        expiresAt    : Integer64; // suggested commitment expiry (UNIX seconds, now + 24 h); pass to commitDocumentAnchor
         nonce        : String; // 64 hex; SECRET until reveal, required by it
         metadataHash : String; // 64 hex; informational
     };
@@ -235,7 +237,8 @@ service NightgateService {
                                   contractAddress: String,
                                   compiledArtifactRef: String, // optional, defaults to 'attestation-vault'
                                   idempotencyKey: String, // optional
-                                  sponsorSessionId: UUID // optional
+                                  sponsorSessionId: UUID, // optional
+                                  expiresAt: Integer64 // optional; commitment expiry, UNIX seconds, > now + 60 and <= now + 7 days (default now + 24 h)
     )                                                                 returns {
         jobId  : UUID;
         status : String;
@@ -879,26 +882,6 @@ service NightgateService {
     };
 
     /**
-     * EXPERIMENTAL PROTOTYPE (cross-server fee sponsoring). Runs a contract
-     * call as the caller's phase 1 (build + sign + finalize), round-trips the
-     * fee-unpaid finalized transaction through serialize/deserialize, and has
-     * the sponsor session balance dust onto it and submit (phase 2). Same
-     * worker for now; it proves the round-trip a cross-machine sponsor endpoint
-     * would depend on. Synchronous diagnostic (no job); returns the tx hash and
-     * the serialized size. Not a shipping path.
-     */
-    action   probeCrossServerSponsor(contractAddress: String,
-                                     circuit: String,
-                                     compiledArtifactRef: String,
-                                     sessionId: UUID,
-                                     args: LargeString,
-                                     sponsorSessionId: UUID // REQUIRED here: the session that pays dust
-    )                                                                 returns {
-        jobId  : UUID;
-        status : String; // poll getJobStatus; result = { txHash, serializedBytes, roundTrip }
-    };
-
-    /**
      * Cross-server fee sponsoring, PHASE 1 (0.17.0). Build + sign + finalize a
      * contract call under the CALLER's identity and return the fee-unpaid
      * transaction as base64, WITHOUT submitting. The caller then hands those
@@ -1358,7 +1341,8 @@ service NightgateService {
     function estimateSendNightFee(sessionId: UUID,
                                   receiverAddress: String,
                                   amount: String,
-                                  ttlIso: String // optional
+                                  ttlIso: String, // optional
+                                  tokenTypeHex: String // optional, raw token type instead of NIGHT
     )                                                                 returns {
         fee      : String;
         toLedger : String;
@@ -1588,9 +1572,8 @@ service NightgateService {
         txHash        : String;
         chainStatus   : String; // null | pending | success | failure; independent of job status
         chainFinalizedAt : Timestamp;
-        leaseOwner    : String;
-        leaseExpiresAt: Timestamp;
-        heartbeatAt   : Timestamp;
+        chainBlockHeight : Integer; // indexer block height of the confirmed inclusion; null until confirmed
+        chainBlockHash   : String;
         queuedAt      : Timestamp;
         externalExecutionAt : Timestamp;
         submittedAt  : Timestamp;

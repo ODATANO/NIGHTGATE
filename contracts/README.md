@@ -11,7 +11,11 @@ Registered contracts:
   and the deploy/call smoke-test target.
 - **`attestation-vault`**: the tiered-disclosure attestation contract behind
   the attestation / predicate / disclosure actions (16 provable fields per
-  document, depth-4 content tree).
+  document, depth-4 content tree). Lineage 3 since 0.23.0: caller-bound,
+  expiring commitments and takeover-proof reveals (`attestGuarded` takes
+  `expires_at` as fifth argument); see
+  `docs/feature-requests/vault-lineage-3.md`. Deploys of earlier lineages
+  are not compatible (ledger layout changed).
 - **`attestation-vault-32`**: the 32-slot width variant of the attestation
   vault (depth-5 content tree), for field panels of 17-32 provable fields
   that need ONE root (a global k-of-N diff claim only exists within one

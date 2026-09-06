@@ -23,11 +23,22 @@ export default [
             'srv/**/*.d.ts.map',
             'test/**/*.js',
             'test/**/*.d.ts',
-            'scripts/**',
+            // scripts/ are runners and probes, except the published bins
+            // (file patterns, not a directory pattern: a negation cannot
+            // un-ignore a file below an ignored directory).
+            'scripts/**/*.{js,mjs,cjs,ts}',
+            '!scripts/apply-schema-delta.mjs',
+            '!scripts/fetch-contract-keys.mjs',
+            '!scripts/migrate-sqlite-to-postgres.mjs',
             'contracts/**/managed/**'
         ]
     },
     ...cds.recommended,
+    {
+        // The published bins are CLIs; their output IS the console.
+        files: ['scripts/*.mjs'],
+        rules: { 'no-console': 'off' }
+    },
     {
         // The src/browser building blocks run in the browser (Lace connector),
         // not Node, so they use browser globals (WebSocket, TextEncoder, crypto,

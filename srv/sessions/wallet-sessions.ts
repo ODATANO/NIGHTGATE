@@ -12,6 +12,7 @@ import { RateLimiter } from '../utils/rate-limiter';
 import { evictWalletFacade } from '../submission/wallet-facade-builder';
 import { withKeyedLock } from '../utils/keyed-lock';
 import { deriveAccountId, deriveStoragePassword } from '../submission/wallet-material-factory';
+import { resolveAccountDek } from '../submission/account-keys';
 import { registerNightUtxosForDust, deregisterNightUtxosFromDust } from '../submission/dust-registration';
 const log = cds.log('nightgate:sessions');
 import {
@@ -27,31 +28,29 @@ import {
     getConfiguredNightgateNetwork, normalizeNightgateNetwork
 } from '../utils/nightgate-config';
 import { startJob, registerBackgroundJobProcessor, runWithoutAmbientTx, supersedeQueuedJobs, findLatestJob, JobAdmissionBusyError, type BackgroundJobRow } from '../submission/background-jobs';
-import { reportExternalExecution } from '../submission/job-execution-context';
+import { declaredJobKindTraits } from '../submission/job-kinds';
+import { reportExternalExecution, reportBroadcastOn, reportSubmissionRejectedOn } from '../submission/job-execution-context';
+import { isPreInclusionReject } from '../submission/sponsor-pool';
 import { mnemonicToBip39SeedHex } from '../utils/wallet-hd';
 import { deriveWalletInfo, resolveBip39SeedHex, deriveViewingKeyForAccount } from '../utils/wallet-info';
 import { resolveFeeSponsor, ensureFeeSponsorFacade, FeeSponsorError, getConfiguredFeeSponsorSessions } from '../submission/fee-sponsor';
 import { isSessionExpired } from '../utils/session-expiry';
+import { principalRateKey } from '../utils/rate-limiter';
+import { configMs, configNumber } from '../utils/config';
 
 // Absolute ceiling for the prewarm sync-to-tip wait; the primary bound is
 // lack of progress (NIGHTGATE_PREWARM_STALL_MS, worker default 10 min).
-const PREWARM_SYNC_TIMEOUT_MS = Number(
-    process.env.NIGHTGATE_PREWARM_SYNC_TIMEOUT_MS || 12 * 60 * 60 * 1000
-);
-const PREWARM_STALL_MS = process.env.NIGHTGATE_PREWARM_STALL_MS !== undefined
-    ? Number(process.env.NIGHTGATE_PREWARM_STALL_MS)
-    : undefined; // worker default
+const PREWARM_SYNC_TIMEOUT_MS = configMs('NIGHTGATE_PREWARM_SYNC_TIMEOUT_MS');
+const PREWARM_STALL_MS = configMs('NIGHTGATE_PREWARM_STALL_MS');
 // A getWalletSyncProgress snapshot older than this is reported `stale`; the
 // worker pushes every ~15 s while a wait runs.
-const SYNC_PROGRESS_STALE_S = Number(process.env.NIGHTGATE_SYNC_PROGRESS_STALE_S ?? 60);
+const SYNC_PROGRESS_STALE_S = configNumber('NIGHTGATE_SYNC_PROGRESS_STALE_S');
 
 // Bounded sync gate for facade-backed READ actions (getWalletBalance and the
 // fee estimates): a facade still catching up must not park the request for
 // minutes; the caller gets 503 WALLET_SYNCING and polls again. <= 0 disables
 // the gate (wait indefinitely, the pre-0.10.2 behavior).
-const WALLET_READ_SYNC_TIMEOUT_MS = Number(
-    process.env.NIGHTGATE_WALLET_READ_SYNC_TIMEOUT_MS ?? 10_000
-);
+const WALLET_READ_SYNC_TIMEOUT_MS = configMs('NIGHTGATE_WALLET_READ_SYNC_TIMEOUT_MS');
 const readSyncTimeoutMs = (): number | undefined =>
     WALLET_READ_SYNC_TIMEOUT_MS > 0 ? WALLET_READ_SYNC_TIMEOUT_MS : undefined;
 
@@ -103,7 +102,7 @@ const signingKeyRateLimiter = new RateLimiter({
     // several server wallets at login (shared with deriveWalletInfo).
     // Override via env when a deployment needs a different budget.
     windowMs: 60 * 60 * 1000,
-    maxRequests: Number(process.env.NIGHTGATE_SIGNING_KEY_RATE_LIMIT || 10)
+    maxRequests: configNumber('NIGHTGATE_SIGNING_KEY_RATE_LIMIT')
 });
 
 const dustRegRateLimiter = new RateLimiter({
@@ -126,6 +125,11 @@ const diagnosticsRateLimiter = new RateLimiter({
     windowMs: 60 * 1000,
     maxRequests: 60
 });
+
+/** Forget every rate-limit window (tests: one principal serves every case). */
+export function __resetWalletRateLimitersForTests(): void {
+    for (const l of [walletRateLimiter, signingKeyRateLimiter, dustRegRateLimiter, sendRateLimiter, diagnosticsRateLimiter]) l.reset();
+}
 
 const MAX_NIGHT_AMOUNT_ATOMS = 10n ** 18n;
 // Custom tokens are Uint<128> on-chain; the NIGHT supply bound does not apply.
@@ -185,12 +189,36 @@ async function executeWalletCommand(raw: unknown, job: BackgroundJobRow, db: any
         await walletWaitForSyncedState(accountId, PREWARM_SYNC_TIMEOUT_MS, PREWARM_STALL_MS);
         return { ready: true };
     }
+    // The worker announces the identifier before it broadcasts; recording it
+    // here makes the job's txHash the one transaction that may be on chain (a
+    // restart in between reconciles against it instead of guessing). A
+    // definitive node reject of that identifier takes it off the job again
+    // (nothing of it can be on chain), so the job fails plainly.
+    let announced: string | null = null;
+    const onSubmitIntent = async (txHash: string) => { await reportBroadcastOn(db, { txHash, firstBoundary: false }); announced = txHash; };
+    const withRejectBookkeeping = async <T>(work: () => Promise<T>): Promise<T> => {
+        try {
+            return await work();
+        } catch (err) {
+            const rejected = announced;
+            if (rejected && isPreInclusionReject(err)) {
+                try {
+                    await reportSubmissionRejectedOn(db, { txHash: rejected });
+                    announced = null;
+                } catch (e) {
+                    cds.log('nightgate').warn(`rejected identifier ${rejected.slice(0, 16)} could not be taken off job ${job.ID}; it stays for reconciliation: ${String((e as Error)?.message ?? e)}`);
+                }
+            }
+            throw err;
+        }
+    };
     if (command.op === 'registerDust') {
         await reportExternalExecution({});
-        const result = await registerNightUtxosForDust({
+        const result = await withRejectBookkeeping(() => registerNightUtxosForDust({
             cacheKey: accountId, seedHex, facadeConfig,
-            dustReceiverAddress: command.dustReceiverAddress || undefined
-        });
+            dustReceiverAddress: command.dustReceiverAddress || undefined,
+            onSubmitIntent
+        }));
         // The worker reports the outcome (changed/reason, applied receiver,
         // resulting registered-UTXO count); passed through whole.
         return { ...result, txId: result.txId ?? '' };
@@ -201,12 +229,12 @@ async function executeWalletCommand(raw: unknown, job: BackgroundJobRow, db: any
             : null;
         if (sponsor) await ensureFeeSponsorFacade(sponsor, facadeConfig);
         await reportExternalExecution({});
-        const result = await deregisterNightUtxosFromDust({ cacheKey: accountId, sponsorCacheKey: sponsor?.accountId });
+        const result = await withRejectBookkeeping(() => deregisterNightUtxosFromDust({ cacheKey: accountId, sponsorCacheKey: sponsor?.accountId, onSubmitIntent }));
         return { txId: result.txId ?? '', deregisteredCount: result.deregisteredCount, totalNightUtxos: result.totalNightUtxos, ...(sponsor ? { feeSponsor: sponsor.sponsorSessionId } : {}) };
     }
     if (command.op === 'sendNight') {
         await reportExternalExecution({});
-        const result = await sendNight({ cacheKey: accountId, receiverAddress: command.receiverAddress, amount: command.amount, ttlIso: command.ttlIso, tokenTypeHex: command.tokenTypeHex });
+        const result = await withRejectBookkeeping(() => sendNight({ cacheKey: accountId, receiverAddress: command.receiverAddress, amount: command.amount, ttlIso: command.ttlIso, tokenTypeHex: command.tokenTypeHex, onSubmitIntent }));
         return { txId: result.txId, toLedger: result.toLedger, amount: result.amount, receiverAddress: result.receiverAddress };
     }
     throw new Error(`Unsupported wallet command operation: ${(command as any).op}`);
@@ -327,9 +355,10 @@ async function loadSigningSessionAccountId(
  */
 async function hasLiveSessionForWallet(
     db: any,
-    viewingKeyHash: string | null | undefined
+    viewingKeyHash: string | null | undefined,
+    userId: string | null | undefined
 ): Promise<boolean> {
-    if (!viewingKeyHash) return false;
+    if (!viewingKeyHash || !userId) return false;
     // Ask the DB only for ACTIVE rows and decide expiry HERE, with the same
     // predicate the rest of the server uses. A SQL `expiresAt > now` does not
     // know that a configured platform sponsor never expires, so an expired
@@ -337,9 +366,12 @@ async function hasLiveSessionForWallet(
     // else, and disconnecting a sibling session of the same wallet then
     // evicted a facade the pool was still sponsoring from.
     const rows: any = await runWithoutAmbientTx(() => db.run(
+        // Same wallet AND same user: another user's view-only session on this
+        // wallet must not keep the disconnecting owner's signing keys warm; it
+        // re-opens its own facade from its own material on next use.
         SELECT.from(WalletSessions)
             .columns('sessionId', 'expiresAt')
-            .where({ viewingKeyHash, isActive: true })
+            .where({ viewingKeyHash, userId, isActive: true })
     ));
     if (!Array.isArray(rows)) return false;
     return rows.some((r: any) => !isSessionExpired(r.sessionId, r.expiresAt));
@@ -366,7 +398,7 @@ async function hasLiveSessionForWallet(
  */
 async function evictFacadeUnlessShared(
     db: any,
-    session: { encryptedViewingKey?: string | null; viewingKeyHash?: string | null },
+    session: { encryptedViewingKey?: string | null; viewingKeyHash?: string | null; userId?: string | null },
     context: string
 ): Promise<void> {
     try {
@@ -374,8 +406,8 @@ async function evictFacadeUnlessShared(
         const viewingKey = decrypt(session.encryptedViewingKey, getEncryptionKey());
         const accountId = deriveAccountId(viewingKey);
         await withKeyedLock(accountId, async () => {
-            if (session.viewingKeyHash && await hasLiveSessionForWallet(db, session.viewingKeyHash)) {
-                log.info(`${context}: keeping facade ${accountId.slice(0, 16)} (another active session uses this wallet)`);
+            if (session.viewingKeyHash && await hasLiveSessionForWallet(db, session.viewingKeyHash, session.userId)) {
+                log.info(`${context}: keeping facade ${accountId.slice(0, 16)} (another active session of this user uses this wallet)`);
                 return;
             }
             log.info(`${context}: evicting facade ${accountId.slice(0, 16)}`);
@@ -388,10 +420,10 @@ const BIP39_SEED_HEX_LENGTH = 128; // 64-byte BIP39 seed; HD-derived per role in
 
 export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: any): void {
     for (const kind of WALLET_COMMAND_KINDS) {
-        registerBackgroundJobProcessor(kind, 1, (command, row) => executeWalletCommand(command, row, db));
+        registerBackgroundJobProcessor(kind, 1, declaredJobKindTraits(kind), (command, row) => executeWalletCommand(command, row, db));
     }
     srv.on('connectWallet', async (req: Request) => {
-        const clientKey = (req as any)?._.req?.ip || 'global';
+        const clientKey = principalRateKey(req, 'wallet');
         const rateResult = walletRateLimiter.check(clientKey);
         if (!rateResult.allowed) {
             return req.reject(429, `Rate limited. Retry after ${Math.ceil(rateResult.retryAfterMs / 1000)}s`);
@@ -434,6 +466,14 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
         };
 
         await db.run(INSERT.into(WalletSessions).entries(session));
+        // The account's data key exists from the first connect, sealed under
+        // the ring AND the viewing key, so a later ring rotation rewraps it
+        // without this wallet having to be connected. Idempotent per account.
+        try {
+            await resolveAccountDek({ db, ring: encKey, accountId: deriveAccountId(viewingKey), storagePassword: deriveStoragePassword(viewingKey) });
+        } catch (err) {
+            log.warn(`connectWallet: account key not created now (${String((err as Error)?.message ?? err)}); it is created on first use`);
+        }
 
         return {
             ID: session.ID,
@@ -447,7 +487,7 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
 
     // Pure derivation
     srv.on('deriveWalletInfo', async (req: Request) => {
-        const clientKey = (req as any)?._.req?.ip || 'global';
+        const clientKey = principalRateKey(req, 'wallet');
         const rateResult = signingKeyRateLimiter.check(clientKey);
         if (!rateResult.allowed) {
             return req.reject(429, `Rate limited. Retry after ${Math.ceil(rateResult.retryAfterMs / 1000)}s`);
@@ -488,7 +528,7 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
     });
 
     srv.on('connectWalletForSigning', async (req: Request) => {
-        const clientKey = (req as any)?._.req?.ip || 'global';
+        const clientKey = principalRateKey(req, 'wallet');
         const rateResult = signingKeyRateLimiter.check(clientKey);
         if (!rateResult.allowed) {
             return req.reject(429, `Rate limited. Retry after ${Math.ceil(rateResult.retryAfterMs / 1000)}s`);
@@ -685,7 +725,7 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
         if (rejectIfMainnetBlocked(req)) return;
         const userId = requireUserId(req);
         if (!userId) return;
-        const clientKey = (req as any)?._.req?.ip || 'global';
+        const clientKey = principalRateKey(req, 'wallet');
         const rate = dustRegRateLimiter.check(clientKey);
         if (!rate.allowed) {
             return req.reject(429, `Rate limited. Retry after ${Math.ceil(rate.retryAfterMs / 1000)}s`);
@@ -726,7 +766,7 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
         if (rejectIfMainnetBlocked(req)) return;
         const userId = requireUserId(req);
         if (!userId) return;
-        const clientKey = (req as any)?._.req?.ip || 'global';
+        const clientKey = principalRateKey(req, 'wallet');
         const rate = dustRegRateLimiter.check(clientKey);
         if (!rate.allowed) {
             return req.reject(429, `Rate limited. Retry after ${Math.ceil(rate.retryAfterMs / 1000)}s`);
@@ -781,7 +821,7 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
         if (rejectIfMainnetBlocked(req)) return;
         const userId = requireUserId(req);
         if (!userId) return;
-        const clientKey = (req as any)?._.req?.ip || 'global';
+        const clientKey = principalRateKey(req, 'wallet');
         const rate = sendRateLimiter.check(clientKey);
         if (!rate.allowed) {
             return req.reject(429, `Rate limited. Retry after ${Math.ceil(rate.retryAfterMs / 1000)}s`);
@@ -848,7 +888,7 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
     srv.on('getWalletBalance', async (req: Request) => {
         const userId = requireUserId(req);
         if (!userId) return;
-        const clientKey = (req as any)?._.req?.ip || 'global';
+        const clientKey = principalRateKey(req, 'wallet');
         const rate = diagnosticsRateLimiter.check(clientKey);
         if (!rate.allowed) {
             return req.reject(429, `Rate limited. Retry after ${Math.ceil(rate.retryAfterMs / 1000)}s`);
@@ -885,7 +925,7 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
     srv.on('getSponsorPoolStatus', async (req: Request) => {
         const userId = requireUserId(req);
         if (!userId) return;
-        const clientKey = (req as any)?._.req?.ip || 'global';
+        const clientKey = principalRateKey(req, 'wallet');
         const rate = diagnosticsRateLimiter.check(clientKey);
         if (!rate.allowed) {
             return req.reject(429, `Rate limited. Retry after ${Math.ceil(rate.retryAfterMs / 1000)}s`);
@@ -904,10 +944,7 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
         // 45 s (0.21.4, was 20 s): with three warm facades on the one worker
         // thread a status read routinely takes 5-30 s on the hosted server;
         // 20 s reported healthy sponsors as "not warm" several times an hour.
-        const perSponsorTimeoutMs = (() => {
-            const raw = Number(process.env.NIGHTGATE_SPONSOR_STATUS_TIMEOUT_MS);
-            return Number.isFinite(raw) && raw > 0 ? raw : 45_000;
-        })();
+        const perSponsorTimeoutMs = configMs('NIGHTGATE_SPONSOR_STATUS_TIMEOUT_MS');
         const withCap = async <T>(work: Promise<T>, what: string): Promise<T> => {
             let timer: NodeJS.Timeout | undefined;
             try {
@@ -1079,7 +1116,7 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
     srv.on('getWalletSyncProgress', async (req: Request) => {
         const userId = requireUserId(req);
         if (!userId) return;
-        const clientKey = (req as any)?._.req?.ip || 'global';
+        const clientKey = principalRateKey(req, 'wallet');
         const rate = diagnosticsRateLimiter.check(clientKey);
         if (!rate.allowed) {
             return req.reject(429, `Rate limited. Retry after ${Math.ceil(rate.retryAfterMs / 1000)}s`);
@@ -1148,21 +1185,25 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
     srv.on('estimateSendNightFee', async (req: Request) => {
         const userId = requireUserId(req);
         if (!userId) return;
-        const clientKey = (req as any)?._.req?.ip || 'global';
+        const clientKey = principalRateKey(req, 'wallet');
         const rate = diagnosticsRateLimiter.check(clientKey);
         if (!rate.allowed) {
             return req.reject(429, `Rate limited. Retry after ${Math.ceil(rate.retryAfterMs / 1000)}s`);
         }
 
-        const { sessionId, receiverAddress, amount, ttlIso } = req.data as {
+        const { sessionId, receiverAddress, amount, ttlIso, tokenTypeHex } = req.data as {
             sessionId: string;
             receiverAddress: string;
             amount: string;
             ttlIso?: string;
+            tokenTypeHex?: string;
         };
 
         if (!sessionId) return req.reject(400, 'sessionId is required');
         if (!receiverAddress) return req.reject(400, 'receiverAddress is required');
+        if (tokenTypeHex !== undefined && tokenTypeHex !== null && tokenTypeHex !== '' && !/^[0-9a-fA-F]{64}$/.test(String(tokenTypeHex))) {
+            return req.reject(400, 'tokenTypeHex must be 64 hex characters');
+        }
         const hrpOK = receiverAddress.startsWith('mn_shield-addr_') || receiverAddress.startsWith('mn_addr_');
         if (!hrpOK) {
             return req.reject(400,
@@ -1278,7 +1319,7 @@ export function startSessionCleanup(db: any): ReturnType<typeof setInterval> {
             const platformSponsors = new Set(getConfiguredFeeSponsorSessions(getNightgatePluginConfig()));
             const expiring: any[] = ((await db.run(
                 SELECT.from(WalletSessions)
-                    .columns('sessionId', 'viewingKeyHash', 'encryptedViewingKey')
+                    .columns('sessionId', 'viewingKeyHash', 'encryptedViewingKey', 'userId')
                     .where({ isActive: true, expiresAt: { '<': now } })
             )) || []).filter((s: any) => !platformSponsors.has(String(s.sessionId)));
             if (expiring.length === 0) return;

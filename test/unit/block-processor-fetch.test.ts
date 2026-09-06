@@ -9,6 +9,7 @@
 
 import cds from '@sap/cds';
 import { BlockProcessor, type PreparedBlockFetched } from '../../srv/crawler/BlockProcessor';
+import { isTransientError } from '../../srv/utils/retry';
 
 /** Narrow the PreparedBlock union to the fetched variant (assert + type). */
 function asFetched(b: { alreadyIndexed: boolean }): PreparedBlockFetched {
@@ -56,9 +57,15 @@ async function seedBlock(height: number, hash: string): Promise<void> {
     }));
 }
 
-async function makeProcessor(provider: any): Promise<BlockProcessor> {
+/**
+ * The fixture provider has no metadata, and a missing registry is a block
+ * fetch FAILURE (fail-closed), so the registry lookup is stubbed out here;
+ * the fail-closed path has its own tests below.
+ */
+async function makeProcessor(provider: any, opts: { realRegistry?: boolean } = {}): Promise<BlockProcessor> {
     const p = new BlockProcessor(provider);
     await p.init();
+    if (!opts.realRegistry) vi.spyOn(p as any, 'getEventRegistry').mockResolvedValue(undefined);
     return p;
 }
 
@@ -82,23 +89,23 @@ describe('fetchBlockBatch', () => {
         provider.rpcBatch
             // Round 1: heights → hashes
             .mockResolvedValueOnce(['0xh10', '0xh11', '0xh12'])
-            // Round 2: interleaved [block10, ts10, events10, block12, ts12, events12]
+            // Round 2: interleaved [block10, ts10, events10, rv10, block12, ts12, events12, rv12]
             .mockResolvedValueOnce([
-                blockA, timestampHex(1_700_000_010_000n), null,
-                blockB, timestampHex(1_700_000_012_000n), null
+                blockA, timestampHex(1_700_000_010_000n), null, { specVersion: 7 },
+                blockB, timestampHex(1_700_000_012_000n), null, { specVersion: 7 }
             ]);
         const p = await makeProcessor(provider);
 
         const out = await p.fetchBlockBatch([10, 11, 12]);
 
-        // Round 2 must only request the two NEW hashes, block+timestamp interleaved.
+        // Round 2 must only request the two NEW hashes, block+timestamp+events+version interleaved.
         const round2 = provider.rpcBatch.mock.calls[1][0];
         expect(round2.map((r: any) => r.method)).toEqual([
-            'chain_getBlock', 'state_getStorage', 'state_getStorage',
-            'chain_getBlock', 'state_getStorage', 'state_getStorage'
+            'chain_getBlock', 'state_getStorage', 'state_getStorage', 'state_getRuntimeVersion',
+            'chain_getBlock', 'state_getStorage', 'state_getStorage', 'state_getRuntimeVersion'
         ]);
         expect(round2[0].params).toEqual(['0xh10']);
-        expect(round2[3].params).toEqual(['0xh12']);
+        expect(round2[4].params).toEqual(['0xh12']);
 
         expect(out[0]).toMatchObject({
             height: 10, blockHash: '0xh10', alreadyIndexed: false,
@@ -129,36 +136,83 @@ describe('fetchBlockBatch', () => {
         const provider = fakeProvider();
         provider.rpcBatch
             .mockResolvedValueOnce(['0xok', null])
-            .mockResolvedValueOnce([{ block: {} }, timestampHex(1_700_000_000_000n)]);
+            .mockResolvedValueOnce([{ block: {} }, timestampHex(1_700_000_000_000n), null, { specVersion: 7 }]);
         const p = await makeProcessor(provider);
         await expect(p.fetchBlockBatch([30, 31])).rejects.toThrow('No block at height 31');
     });
 
-    it('queries the protocol version once per batch and falls back to the cached one on failure', async () => {
+    it('takes the runtime version PER BLOCK from the batch frame (an upgrade inside a batch lands on its first block)', async () => {
         const provider = fakeProvider();
-        const warnSpy = vi.spyOn(cds.log('nightgate:crawler'), 'warn').mockImplementation(() => {});
-        try {
-            provider.getRuntimeVersion
-                .mockResolvedValueOnce({ specVersion: 9 })
-                .mockRejectedValueOnce(new Error('rpc down'));
-            provider.rpcBatch
-                .mockResolvedValueOnce(['0xb1'])
-                .mockResolvedValueOnce([{ block: { n: 1 } }, timestampHex(1_700_000_000_000n)])
-                .mockResolvedValueOnce(['0xb2'])
-                .mockResolvedValueOnce([{ block: { n: 2 } }, timestampHex(1_700_000_001_000n)]);
-            const p = await makeProcessor(provider);
+        provider.rpcBatch
+            .mockResolvedValueOnce(['0xb1', '0xb2'])
+            .mockResolvedValueOnce([
+                { block: { n: 1 } }, timestampHex(1_700_000_000_000n), null, { specVersion: 9 },
+                { block: { n: 2 } }, timestampHex(1_700_000_001_000n), null, { specVersion: 10 }
+            ]);
+        const p = await makeProcessor(provider);
+        const out = await p.fetchBlockBatch([40, 41]);
+        expect(asFetched(out[0]).protocolVersion).toBe(9);
+        expect(asFetched(out[1]).protocolVersion).toBe(10);
+        expect(provider.getRuntimeVersion).not.toHaveBeenCalled(); // no per-batch RPC any more
+    });
 
-            const first = await p.fetchBlockBatch([40]);
-            expect(asFetched(first[0]).protocolVersion).toBe(9);
-            expect(provider.getRuntimeVersion).toHaveBeenCalledTimes(1);
+    it('refuses the block when the runtime metadata cannot be loaded (nothing is decoded under a stale pallet map)', async () => {
+        const provider = fakeProvider();
+        provider.getMetadata.mockRejectedValue(new Error('metadata unavailable: connection closed'));
+        provider.rpcBatch
+            .mockResolvedValueOnce(['0xm1'])
+            .mockResolvedValueOnce([{ block: { n: 1 } }, timestampHex(1_700_000_000_000n), null, { specVersion: 7 }]);
+        const p = await makeProcessor(provider, { realRegistry: true });
+        await expect(p.fetchBlockBatch([60])).rejects.toThrow(/Runtime metadata unavailable for block 0xm1 \(specVersion 7\): metadata unavailable: connection closed/);
+        // Not cached: the next block asks the node again.
+        provider.rpcBatch
+            .mockResolvedValueOnce(['0xm2'])
+            .mockResolvedValueOnce([{ block: { n: 2 } }, timestampHex(1_700_000_001_000n), null, { specVersion: 7 }]);
+        await expect(p.fetchBlockBatch([61])).rejects.toThrow(/Runtime metadata unavailable/);
+        expect(provider.getMetadata).toHaveBeenCalledTimes(2);
+    });
 
-            // Second batch: runtime-version RPC fails → cached specVersion 9 sticks.
-            const second = await p.fetchBlockBatch([41]);
-            expect(asFetched(second[0]).protocolVersion).toBe(9);
-            expect(warnSpy).toHaveBeenCalledWith(expect.stringMatching(/Failed to get runtime version/));
-        } finally {
-            warnSpy.mockRestore();
-        }
+    it('treats an empty metadata answer as a transient node problem and a non-decodable one as a permanent error', async () => {
+        const provider = fakeProvider();
+        provider.getMetadata.mockResolvedValueOnce(null).mockResolvedValueOnce('0x00');
+        provider.rpcBatch
+            .mockResolvedValueOnce(['0xm3'])
+            .mockResolvedValueOnce([{ block: { n: 3 } }, timestampHex(1_700_000_000_000n), null, { specVersion: 7 }])
+            .mockResolvedValueOnce(['0xm4'])
+            .mockResolvedValueOnce([{ block: { n: 4 } }, timestampHex(1_700_000_001_000n), null, { specVersion: 7 }]);
+        const p = await makeProcessor(provider, { realRegistry: true });
+        const empty = await p.fetchBlockBatch([62]).then(() => null, (e: Error) => e);
+        expect(empty?.message).toMatch(/No runtime metadata for block 0xm3/);
+        expect(isTransientError(empty!)).toBe(true);
+        const broken = await p.fetchBlockBatch([63]).then(() => null, (e: Error) => e);
+        expect(broken?.message).toMatch(/Runtime metadata for block 0xm4 \(specVersion 7\) does not decode/);
+        expect(isTransientError(broken!)).toBe(false);
+    });
+
+    it('refuses the block when the frame carries no runtime version (transient; never a previous version)', async () => {
+        const provider = fakeProvider();
+        provider.rpcBatch
+            .mockResolvedValueOnce(['0xc1'])
+            .mockResolvedValueOnce([{ block: { n: 1 } }, timestampHex(1_700_000_000_000n), null, { specVersion: 9 }]);
+        const p = await makeProcessor(provider);
+        expect(asFetched((await p.fetchBlockBatch([51]))[0]).protocolVersion).toBe(9);
+        provider.rpcBatch
+            .mockResolvedValueOnce(['0xc3'])
+            .mockResolvedValueOnce([{ block: { n: 3 } }, timestampHex(1_700_000_002_000n), null, null]);
+        const err = await p.fetchBlockBatch([52]).then(() => null, (e: Error) => e);
+        expect(err?.message).toMatch(/No runtime version for height 52/);
+        expect(isTransientError(err!)).toBe(true);
+        expect(await db.run(cds.ql.SELECT.from(BLOCKS))).toHaveLength(0);
+    });
+
+    it('processBlockByHash refuses a block whose runtime version cannot be fetched', async () => {
+        const provider = fakeProvider();
+        provider.getBlock.mockResolvedValue({ block: { header: { parentHash: '0x0', number: '0x5', digest: { logs: [] } }, extrinsics: [] } });
+        provider.getStorage.mockResolvedValue(timestampHex(1_700_000_000_000n));
+        provider.getRuntimeVersion.mockRejectedValueOnce(new Error('connection closed'));
+        const p = await makeProcessor(provider);
+        await expect(p.processBlockByHash('0xnover')).rejects.toThrow(/No runtime version for block 0xnover: connection closed/);
+        expect(await db.run(cds.ql.SELECT.from(BLOCKS))).toHaveLength(0);
     });
 });
 
@@ -170,12 +224,10 @@ describe('parsing helpers', () => {
         expect((p as any).parseTimestampHex(timestampHex(1_700_000_042_000n).slice(2))).toBe(1_700_000_042);
     });
 
-    it('parseTimestampHex falls back to wall-clock time for null/undefined/undecodable input', async () => {
+    it('parseTimestampHex yields null (never the wall clock) for null/undefined/undecodable input', async () => {
         const p = await makeProcessor(fakeProvider());
-        const nowSec = Math.floor(Date.now() / 1000);
         for (const bad of [null, undefined, '0x00']) {
-            const parsed = (p as any).parseTimestampHex(bad);
-            expect(Math.abs(parsed - nowSec)).toBeLessThanOrEqual(2);
+            expect((p as any).parseTimestampHex(bad)).toBeNull();
         }
     });
 
@@ -197,5 +249,88 @@ describe('parsing helpers', () => {
         expect(p.toBigInt('nope')).toBe(0n);
         expect(p.toBigInt('')).toBe(0n);
         expect(p.toBigInt(undefined)).toBe(0n);
+    });
+});
+
+// ---- The pallet map travels with the block -------------------------------
+//
+// Every PreparedBlock carries the map of ITS runtime version. A batch that
+// straddles a runtime upgrade, or two batches in flight at once, must classify
+// each block with the map of the version the block was produced under, never
+// with whatever version was loaded last.
+describe('pallet map per block', () => {
+    const TRANSACTIONS = 'midnight.Transactions';
+    const unsigned = (pallet: number, call: number) => '0x' + Buffer.from([0x0c, 0x04, pallet, call]).toString('hex');
+    const header = (parentHash: string, height: number) => ({ parentHash, number: '0x' + height.toString(16), stateRoot: '0xs', digest: { logs: [] } });
+    const contractCallAt = (index: number) => new Map([[index, { name: 'Midnight', txType: 'contract_call' }]]);
+
+    /** A processor whose runtime cache is seeded per specVersion (no metadata RPC in the fixture). */
+    async function processorWithRuntimes(provider: any, maps: Record<number, Map<number, any>>): Promise<BlockProcessor> {
+        const p = await makeProcessor(provider);
+        for (const [spec, palletMap] of Object.entries(maps)) (p as any).runtimes.set(Number(spec), { registry: undefined, palletMap });
+        return p;
+    }
+
+    beforeEach(async () => {
+        await db.run(cds.ql.DELETE.from(TRANSACTIONS));
+    });
+
+    it('a batch straddling a runtime upgrade classifies the older block with the older map', async () => {
+        await seedBlock(41, '0xp41');
+        const provider = fakeProvider();
+        provider.rpcBatch
+            .mockResolvedValueOnce(['0xv1', '0xv2'])
+            .mockResolvedValueOnce([
+                { block: { header: header('0xp41', 42), extrinsics: [unsigned(5, 0)] } }, timestampHex(1_700_000_000_000n), null, { specVersion: 9 },
+                { block: { header: header('0xv1', 43), extrinsics: [unsigned(5, 0)] } }, timestampHex(1_700_000_001_000n), null, { specVersion: 10 }
+            ]);
+        // Version 9 has the ledger pallet at index 5; version 10 moved it to 7.
+        const p = await processorWithRuntimes(provider, { 9: contractCallAt(5), 10: contractCallAt(7) });
+        const out = await p.fetchBlockBatch([42, 43]);
+        expect(asFetched(out[0]).palletMap.get(5)?.txType).toBe('contract_call');
+        expect(asFetched(out[1]).palletMap.get(5)).toBeUndefined();
+        for (const prep of out) await p.persistPreparedBlock(prep);
+        const txs = await db.run(cds.ql.SELECT.from(TRANSACTIONS).columns('txType', 'block_ID'));
+        expect(txs.map((t: any) => t.txType).sort()).toEqual(['contract_call', 'unknown']);
+    });
+
+    it('two batches in flight keep their own maps', async () => {
+        await seedBlock(41, '0xp41');
+        const provider = fakeProvider();
+        // Answers keyed by what is asked, so the two batches may interleave
+        // their rounds in any order: height 42 is a version-9 block, 43 a
+        // version-10 block.
+        const blocks: Record<string, any> = {
+            '0xa': [{ block: { header: header('0xp41', 42), extrinsics: [unsigned(5, 0)] } }, timestampHex(1_700_000_000_000n), null, { specVersion: 9 }],
+            '0xb': [{ block: { header: header('0xa', 43), extrinsics: [unsigned(5, 0)] } }, timestampHex(1_700_000_001_000n), null, { specVersion: 10 }]
+        };
+        provider.rpcBatch.mockImplementation(async (reqs: any[]) =>
+            reqs[0].method === 'chain_getBlockHash' ? [reqs[0].params[0] === 42 ? '0xa' : '0xb'] : blocks[reqs[0].params[0]]);
+        const p = await processorWithRuntimes(provider, { 9: contractCallAt(5), 10: contractCallAt(7) });
+        const [first, second] = await Promise.all([p.fetchBlockBatch([42]), p.fetchBlockBatch([43])]);
+        expect(asFetched(first[0]).protocolVersion).toBe(9);
+        expect(asFetched(second[0]).protocolVersion).toBe(10);
+        expect(asFetched(first[0]).palletMap).not.toBe(asFetched(second[0]).palletMap);
+        await p.persistPreparedBlock(first[0]);
+        await p.persistPreparedBlock(second[0]);
+        const txs = await db.run(cds.ql.SELECT.from(TRANSACTIONS).columns('txType'));
+        expect(txs.map((t: any) => t.txType).sort()).toEqual(['contract_call', 'unknown']);
+    });
+
+    it('a cached runtime version re-activates its own map for a later block', async () => {
+        await seedBlock(41, '0xp41');
+        const provider = fakeProvider();
+        provider.rpcBatch
+            .mockResolvedValueOnce(['0xn1'])
+            .mockResolvedValueOnce([{ block: { header: header('0xp41', 42), extrinsics: [unsigned(7, 0)] } }, timestampHex(1_700_000_000_000n), null, { specVersion: 10 }])
+            .mockResolvedValueOnce(['0xn2'])
+            .mockResolvedValueOnce([{ block: { header: header('0xn1', 43), extrinsics: [unsigned(5, 0)] } }, timestampHex(1_700_000_001_000n), null, { specVersion: 9 }]);
+        const p = await processorWithRuntimes(provider, { 9: contractCallAt(5), 10: contractCallAt(7) });
+        const newer = await p.fetchBlockBatch([42]);
+        const older = await p.fetchBlockBatch([43]); // an older runtime seen AFTER the newer one (reindex, replica)
+        await p.persistPreparedBlock(newer[0]);
+        await p.persistPreparedBlock(older[0]);
+        const txs = await db.run(cds.ql.SELECT.from(TRANSACTIONS).columns('txType'));
+        expect(txs.map((t: any) => t.txType)).toEqual(['contract_call', 'contract_call']);
     });
 });

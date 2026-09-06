@@ -2,11 +2,12 @@
 // Fetch a shipped contract's PROVER keys into the installed package.
 //
 // Why this exists: prover keys are tens of megabytes each and the npm
-// registry rejects a tarball that carries every width variant's full set
-// (413 at 204 MB). The package therefore ships the width-32 vault with its
-// contract module, verifier keys and zkir, but WITHOUT its 113 MB of prover
-// keys. Deploying and crawler-free verification work without them; PROVING
-// its circuits (and serving them over /zk-config) needs them on disk.
+// registry rejects a tarball that carries them (413 at 204 MB). The package
+// ships every contract's module, verifier keys, zkir and a keys/manifest.json
+// (sha256 + size per prover key), but no prover key. A running server fetches
+// a missing key on first need (NIGHTGATE_ZK_ASSET_URL, shipped contracts
+// default to the release tag); this CLI does the same ahead of time, for an
+// install that will run offline or behind a firewall.
 //
 // The default source is this release's own git tag on GitHub, whose layout
 // is byte-for-byte the /zk-config layout, so `--from` also takes any
@@ -14,11 +15,13 @@
 //   npx nightgate-fetch-keys attestation-vault-32
 //   npx nightgate-fetch-keys attestation-vault-32 --from https://host/zk-config/attestation-vault-32
 //
-// Run it BEFORE the first proof: the keys are part of the artifact
-// GENERATION digest, so adding them changes what this contract resolves to
-// and evidence recorded beforehand fails the generation guard by design.
+// Every downloaded key is verified against the manifest; a mismatch is
+// deleted again. Prover keys are not part of the artifact generation digest,
+// so fetching them changes nothing a job or evidence row was pinned to, and
+// the server needs no restart.
 
-import { readdirSync, readFileSync, existsSync } from 'node:fs';
+import { readdirSync, readFileSync, existsSync, rmSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
@@ -76,9 +79,30 @@ try {
         console.error(`nightgate-fetch-keys: source did not serve ${still.length} prover key(s): ${still.join(', ')}`);
         process.exit(1);
     }
-    console.log(`nightgate-fetch-keys: '${contract}' complete${result?.fetched != null ? ` (${result.fetched} files fetched)` : ''}.`);
-    console.log("  This changed the contract's artifact generation digest; evidence recorded before now");
-    console.log('  will fail the generation guard, which is intended. Restart the server to pick it up.');
+    // Verify what landed against the shipped manifest; a key the source
+    // altered or truncated must not stay on disk.
+    let manifest = null;
+    try { manifest = JSON.parse(readFileSync(path.join(managed, 'keys', 'manifest.json'), 'utf8')); } catch { manifest = null; }
+    if (!manifest?.prover) {
+        console.error(`nightgate-fetch-keys: '${contract}' ships no keys/manifest.json; cannot verify the download`);
+        process.exit(1);
+    }
+    const bad = [];
+    for (const c of missing) {
+        const file = path.join(managed, 'keys', `${c}.prover`);
+        const body = readFileSync(file);
+        const entry = manifest.prover[c];
+        if (!entry || entry.bytes !== body.length || entry.sha256 !== createHash('sha256').update(body).digest('hex')) {
+            rmSync(file, { force: true });
+            bad.push(c);
+        }
+    }
+    if (bad.length > 0) {
+        console.error(`nightgate-fetch-keys: ${bad.length} downloaded key(s) did not match keys/manifest.json and were removed: ${bad.join(', ')}`);
+        process.exit(1);
+    }
+    console.log(`nightgate-fetch-keys: '${contract}' complete${result?.fetched != null ? ` (${result.fetched} files fetched)` : ''}, all keys verified against the manifest.`);
+    console.log('  The artifact generation digest is unchanged; a running server picks the keys up on the next job.');
 } catch (e) {
     console.error(`nightgate-fetch-keys: ${e?.message ?? e}`);
     process.exit(1);

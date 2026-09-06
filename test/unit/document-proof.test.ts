@@ -82,6 +82,15 @@ describe('canonicalization + hashing', () => {
         expect(blake2b256Hex(canonicalize(a))).toBe(blake2b256Hex(canonicalize(b)));
     });
 
+    it('canonicalize follows RFC 8785 member order for integer-like keys', () => {
+        // A JS object enumerates 9 before 10 whatever the insertion order;
+        // the canonical form sorts by code units, so "10" precedes "9".
+        expect(canonicalize({ 9: 1, 10: 2, b: 3, a: { 2: 1, 10: 0 } })).toBe('{"10":2,"9":1,"a":{"10":0,"2":1},"b":3}');
+        expect(canonicalize({ b: [undefined, 1], u: undefined })).toBe('{"b":[null,1]}');
+        expect(canonicalize('x')).toBe('"x"');
+        expect(canonicalize(null)).toBe('null');
+    });
+
     it('sortKeys leaves arrays in order (order is data, not noise)', () => {
         expect(sortKeys({ a: [3, 1, 2] })).toEqual({ a: [3, 1, 2] });
     });

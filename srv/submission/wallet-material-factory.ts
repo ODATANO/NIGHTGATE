@@ -12,7 +12,8 @@ import cds from '@sap/cds';
 const { SELECT } = cds.ql;
 import { WalletSessions } from '#cds-models/midnight';
 import crypto from 'crypto';
-import { decrypt, getEncryptionKey } from '../utils/crypto';
+import { decrypt, getEncryptionKey, deriveBoundSecret, KeyRing } from '../utils/crypto';
+import { resolveAccountDek, privateStatePasswordFromDek } from './account-keys';
 import { loadLedgerV8 } from '../midnight/sdk-loader';
 import { deriveRoleSeeds } from '../utils/wallet-hd';
 import { isSessionExpired } from '../utils/session-expiry';
@@ -109,7 +110,21 @@ export async function buildWalletMaterialForSession(opts: BuildWalletMaterialOpt
     }
 
     const accountId = deriveAccountId(viewingKey);
-    const password  = deriveStoragePassword(viewingKey);
+    // Private-state password derived from the account DEK (account-keys.ts):
+    // the DEK is opened through the ring or, after a rotation the ring no
+    // longer covers, through the viewing key, and created here on first
+    // need. Rows written before the DEK (the ring-bound and the pre-ring
+    // derivations) are read through the legacy candidates and rewritten
+    // under the DEK by the provider.
+    const ring = encKey instanceof KeyRing ? encKey : Buffer.isBuffer(encKey) ? KeyRing.fromKek(encKey) : getEncryptionKey();
+    const storagePassword = deriveStoragePassword(viewingKey);
+    const dek = await resolveAccountDek({ db, ring, accountId, storagePassword });
+    if (!dek) throw new SessionNotFoundError(opts.sessionId);
+    const password = privateStatePasswordFromDek(dek, accountId);
+    const legacyPasswords = privateStatePasswordCandidates(ring, viewingKey).map(c => c.password);
+    // The sync-state store resolves the same DEK itself from this passphrase
+    // (it is the viewing-key seal's password); hand it the viewing-key form.
+    const syncStatePassphrase = storagePassword;
     // BIP32 account the seed signs with, persisted by connectWalletForSigning.
     // Sourced from the session row (not caller-supplied) so signing derivation
     // always matches the account the session's viewing key belongs to.
@@ -131,12 +146,12 @@ export async function buildWalletMaterialForSession(opts: BuildWalletMaterialOpt
             walletAndMidnightProvider = await createFacadeBackedWalletAdapter(
                 accountId,
                 seedHex,
-                { ...opts.facadeConfig, syncStatePassphrase: password, accountIndex }
+                { ...opts.facadeConfig, syncStatePassphrase, accountIndex }
             );
             // Worker-routed submissions look the facade up by accountId; make it
             // creatable on demand so a never-prewarmed (or evicted) session does
             // not die with "No facade for sessionId". Idempotent.
-            const facadeArgs = { ...opts.facadeConfig, seedHex, syncStatePassphrase: password, accountIndex };
+            const facadeArgs = { ...opts.facadeConfig, seedHex, syncStatePassphrase, accountIndex };
             ensureFacade = async () => { await getOrBuildWalletFacade(accountId, facadeArgs); };
         } else {
             // Seed present but no facade configured: pubkeys real, signing throws.
@@ -149,6 +164,7 @@ export async function buildWalletMaterialForSession(opts: BuildWalletMaterialOpt
     return {
         accountId,
         privateStoragePasswordProvider: () => password,
+        privateStoragePasswordFallbacks: () => legacyPasswords,
         walletAndMidnightProvider,
         privateStateBackend: opts.privateStateBackend,
         ensureFacade
@@ -171,6 +187,31 @@ export function deriveAccountId(viewingKey: string): string {
  */
 export function deriveStoragePassword(viewingKey: string): string {
     return crypto.createHmac('sha256', PRIVATE_STATE_PASSWORD_LABEL).update(viewingKey).digest('hex');
+}
+
+const PRIVATE_STATE_INFO = 'nightgate/private-state/v2';
+
+/**
+ * The pre-DEK private-state password under ring key `keyId`: HKDF over the
+ * ring key and the viewing-key-derived password. Read-only since the account
+ * DEK: rows under it are rewritten under the DEK when a session reads them.
+ */
+export function derivePrivateStatePassword(ring: KeyRing, keyId: string, viewingKey: string): string {
+    return deriveBoundSecret(ring, keyId, deriveStoragePassword(viewingKey), PRIVATE_STATE_INFO).toString('hex');
+}
+
+/**
+ * Every LEGACY password a private-state row of this wallet may have been
+ * written under before the account DEK: the ring's keys (active first) and
+ * the pre-ring form. Shared with the rewrap tool so both sides derive
+ * identically; none of them is written any more.
+ */
+export function privateStatePasswordCandidates(ring: KeyRing, viewingKey: string): Array<{ keyId: string | null; password: string; legacy: boolean }> {
+    const out = [ring.activeId, ...ring.ids().filter(i => i !== ring.activeId)].map(id => ({
+        keyId: id as string | null, password: derivePrivateStatePassword(ring, id, viewingKey), legacy: false
+    }));
+    out.push({ keyId: null, password: deriveStoragePassword(viewingKey), legacy: true });
+    return out;
 }
 
 // ---- Wallet adapter -------------------------------------------------------
@@ -217,30 +258,16 @@ async function createFacadeBackedWalletAdapter(
     const coinPublicKey       = zswapKeys.coinPublicKey;
     const encryptionPublicKey = zswapKeys.encryptionPublicKey;
 
-    let facadePromise: Promise<{ facade: any; zswapKeys: any; dustKey: any }> | undefined;
-    const getFacade = () => {
-        if (!facadePromise) {
-            facadePromise = getOrBuildWalletFacade(accountId, { ...facadeConfig, seedHex });
-        }
-        return facadePromise;
-    };
-
     return {
         getCoinPublicKey(): string         { return coinPublicKey; },
         getEncryptionPublicKey(): string   { return encryptionPublicKey; },
-        async balanceTx(tx: any, ttl?: Date): Promise<any> {
-            const { facade, zswapKeys, dustKey } = await getFacade();
-            const effectiveTtl = ttl ?? new Date(Date.now() + 60 * 60 * 1000);
-            const recipe = await facade.balanceUnboundTransaction(
-                tx,
-                { shieldedSecretKeys: zswapKeys, dustSecretKey: dustKey },
-                { ttl: effectiveTtl }
-            );
-            return facade.finalizeRecipe(recipe);
+        // Balancing and submission run inside the wallet worker; this adapter
+        // only carries the public keys into a main-thread provider bundle.
+        async balanceTx(): Promise<never> {
+            throw new Error('balanceTx is not available on the main thread; transactions are balanced in the wallet worker');
         },
-        async submitTx(tx: any): Promise<any> {
-            const { facade } = await getFacade();
-            return facade.submitTransaction(tx);
+        async submitTx(): Promise<never> {
+            throw new Error('submitTx is not available on the main thread; transactions are submitted in the wallet worker');
         },
         _internal: { zswapKeys, cacheKey: accountId }
     };

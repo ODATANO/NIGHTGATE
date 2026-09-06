@@ -10,6 +10,7 @@
 
 import type { Mock, MockInstance } from 'vitest';
 import cds from '@sap/cds';
+import { WorkerSubmitError } from '../../srv/midnight/wallet-worker-protocol';
 import { EventEmitter } from 'node:events';
 
 type SentMessage = {
@@ -17,11 +18,14 @@ type SentMessage = {
     transfer?: ReadonlyArray<unknown>;
 };
 
+/** Responder a NEW fake worker starts with (a respawn happens inside the client, before a test can reach it). */
+let defaultResponder: (msg: any) => any | undefined = () => undefined;
+
 class FakeWorker extends EventEmitter {
     sent: SentMessage[] = [];
     terminated = false;
     /** Programmable: how to respond when the main thread posts an rpc message. */
-    rpcResponder: (msg: any) => any | undefined = () => undefined;
+    rpcResponder: (msg: any) => any | undefined = defaultResponder;
 
     constructor(_entry: string, _opts?: unknown) {
         super();
@@ -85,6 +89,7 @@ import {
     walletSubmitContractCall,
     walletWaitForSyncedState,
     walletGetSyncProgress,
+    getWalletWorkerStatus,
     __resetWalletWorkerForTests
 } from '../../srv/midnight/wallet-worker-client';
 
@@ -104,6 +109,7 @@ describe('wallet-worker-client', () => {
         warnSpy = vi.spyOn(cds.log('nightgate:worker-client'), 'warn').mockImplementation(() => {});
         __resetWalletWorkerForTests();
         latestWorker = undefined;
+        defaultResponder = () => undefined;
     });
 
     afterEach(async () => {
@@ -138,6 +144,85 @@ describe('wallet-worker-client', () => {
             await stopWalletWorker(10);
             expect(w.terminated).toBe(true);
         });
+
+        it('stopWalletWorker asks the worker to flush every facade (shutdown rpc) before terminating', async () => {
+            const seen: string[] = [];
+            const w = await startWithResponder((msg) => {
+                seen.push(msg.method);
+                return msg.method === 'shutdown' ? { ok: true, result: { evicted: 3, failed: 0 } } : undefined;
+            });
+            await stopWalletWorker(1000);
+            expect(seen).toEqual(['shutdown']);
+            expect(w.terminated).toBe(true);
+            expect(logSpy).toHaveBeenCalledWith(expect.stringMatching(/worker shutdown: 3 facade\(s\) evicted, all saves confirmed/));
+            // no respawn after an intentional stop
+            await expect(walletEvict('s1')).rejects.toThrow(/wallet-worker not started/);
+        });
+
+        it('stopWalletWorker terminates anyway when the flush does not complete in time', async () => {
+            const w = await startWithResponder(() => undefined); // never answers
+            await stopWalletWorker(10);
+            expect(w.terminated).toBe(true);
+            expect(warnSpy).toHaveBeenCalledWith(expect.stringMatching(/shutdown flush did not complete/));
+        });
+    });
+
+    describe('rotation', () => {
+        it('a WORKER_ROTATING refusal marks the worker draining; the call is retried on the respawn', async () => {
+            defaultResponder = () => ({ ok: true, result: { evicted: true } });
+            const w1 = await startWithResponder((msg) => {
+                // the worker refuses on the call port; its `rotating` announcement and exit follow
+                setImmediate(() => { w1.emit('message', { kind: 'rotating', generations: 32, inflight: 0 }); w1.emit('exit', 0); });
+                return { ok: false, error: { name: 'WORKER_ROTATING', message: 'rotating' } };
+            });
+            await expect(walletEvict('s1')).resolves.toEqual({ evicted: true });
+            expect(latestWorker).not.toBe(w1);
+            expect(getWalletWorkerStatus().rotationCount).toBe(1);
+        });
+
+        it('rotation-done: the client terminates the worker; a read cut in flight is repeated once, a submit is not', async () => {
+            defaultResponder = (msg) => ({ ok: true, result: msg.method === 'getBalance' ? { balance: 'fresh' } : { txId: 'never' } });
+            const w1 = await startWithResponder(() => undefined); // never answers: both calls stay in flight
+            const read = walletGetBalance({ sessionId: 's1' });
+            // settle the rejection as it happens: an unobserved rejection between the
+            // exit event and the assertion is reported as an unhandled promise
+            const submit = walletTransferNight({ sessionId: 's1', receiverAddress: 'r', amount: '1' }).then(() => null, (e: Error) => e);
+            await new Promise(r => setImmediate(r));
+            w1.emit('message', { kind: 'rotation-done', generations: 32 });
+            await expect(read).resolves.toEqual({ balance: 'fresh' });
+            await expect(submit).resolves.toMatchObject({ name: 'WORKER_ROTATED' });
+            expect(w1.terminated).toBe(true);
+            expect(getWalletWorkerStatus().rotationCount).toBe(1);
+            expect(getWalletWorkerStatus().exitCount ?? 0).toBe(0);
+        });
+
+        it('a drain that exceeds NIGHTGATE_WORKER_DRAIN_MAX_MS terminates the draining worker', async () => {
+            process.env.NIGHTGATE_WORKER_DRAIN_MAX_MS = '20';
+            try {
+                defaultResponder = () => ({ ok: true, result: { evicted: false } });
+                const w1 = await startWithResponder(() => undefined);
+                w1.emit('message', { kind: 'rotating', generations: 32, inflight: 1 }); // announces, never exits
+                await expect(walletEvict('s1')).resolves.toEqual({ evicted: false });
+                expect(w1.terminated).toBe(true);
+                expect(warnSpy).toHaveBeenCalledWith(expect.stringMatching(/drain exceeded 20ms/));
+            } finally {
+                delete process.env.NIGHTGATE_WORKER_DRAIN_MAX_MS;
+            }
+        });
+
+        it('a late exit event of a stopped worker does not orphan its replacement', async () => {
+            const w1 = await startWithResponder(() => undefined);
+            w1.terminate = async () => { w1.terminated = true; }; // exit event arrives LATER
+            await stopWalletWorker(10);
+            await startWalletWorker();
+            const w2 = latestWorker!;
+            expect(w2).not.toBe(w1);
+            w2.rpcResponder = () => ({ ok: true, result: { evicted: true } });
+            w1.emit('exit', 0); // the stopped worker's exit lands after the replacement started
+            await expect(walletEvict('s1')).resolves.toEqual({ evicted: true });
+            expect(latestWorker).toBe(w2); // no third worker was spawned
+            expect(getWalletWorkerStatus().exitCount ?? 0).toBe(0); // a stop is not a crash
+        });
     });
 
     describe('rpc helper', () => {
@@ -159,6 +244,25 @@ describe('wallet-worker-client', () => {
         it('falls back to "worker rpc failed" for an unrecognised payload shape', async () => {
             await startWithResponder(() => ({ ok: false }));
             await expect(walletEvict('s1')).rejects.toThrow('worker rpc failed');
+        });
+
+        it('rebuilds a WorkerSubmitError from a classified failure payload (code and friends as data)', async () => {
+            const calls = [{ name: 'attest', segId: 1158, stages: 'f' }];
+            await startWithResponder(() => ({ ok: false, error: {
+                name: 'Error', message: 'Transaction submission error <- 1010: Custom error: 196',
+                code: 'dust-race', ledgerCode: '1010/196', retryable: true, causes: ['1010: Custom error: 196'], calls
+            } }));
+            const err: any = await walletEvict('s1').then(() => null, e => e);
+            expect(err).toBeInstanceOf(WorkerSubmitError);
+            expect(err).toMatchObject({ name: 'Error', code: 'dust-race', ledgerCode: '1010/196', retryable: true, causes: ['1010: Custom error: 196'], calls });
+            expect(err.message).toMatch(/Custom error: 196/);
+        });
+
+        it('an unknown code is not a classification: plain Error as before', async () => {
+            await startWithResponder(() => ({ ok: false, error: { name: 'X', message: 'm', code: 'made-up' } }));
+            const err: any = await walletEvict('s1').then(() => null, e => e);
+            expect(err).not.toBeInstanceOf(WorkerSubmitError);
+            expect(err).toMatchObject({ name: 'X', message: 'm' });
         });
     });
 
@@ -202,6 +306,25 @@ describe('wallet-worker-client', () => {
             await startWithResponder(captureResponder({}));
             await invoke();
             expect(captured[0].method).toBe(expectedMethod);
+        });
+
+        it('the bound wrappers forward onSubmitIntent: the intent is persisted, then acked, then the reply arrives', async () => {
+            const acks: any[] = [];
+            await startWithResponder((msg) => {
+                // worker: announce first, reply only after the ack
+                msg.port.on('message', (m: any) => { if (m?.kind === 'submit-intent-ack') { acks.push(m); msg.port.postMessage({ ok: true, result: { txHash: 'h1', onChainStatus: 'ok' } }); } });
+                msg.port.postMessage({ kind: 'submit-intent', txHash: 'h1', contractAddress: 'c', circuits: ['increment'] });
+                return undefined;
+            });
+            const persisted: any[] = [];
+            const result = await walletSubmitContractCall({
+                sessionId: 's1', proxyId: 'p', contractName: 'counter', contractAddress: 'c', circuit: 'increment', args: [],
+                registration: { artifactPath: '/a', privateStateId: 'p', zkConfigPath: '/zk' },
+                indexerHttpUrl: '', indexerWsUrl: '', proofServerUrl: '', networkId: 'preprod'
+            } as any, async (txHash, intent) => { persisted.push({ txHash, intent }); });
+            expect(result).toEqual({ txHash: 'h1', onChainStatus: 'ok' });
+            expect(persisted).toEqual([{ txHash: 'h1', intent: expect.objectContaining({ txHash: 'h1', contractAddress: 'c', circuits: ['increment'] }) }]);
+            expect(acks).toEqual([{ kind: 'submit-intent-ack', txHash: 'h1', ok: true }]);
         });
 
         it('walletDeployContract / walletSubmitContractCall route to their RPC methods', async () => {

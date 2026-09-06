@@ -26,6 +26,9 @@
     "engines": {
         "node": ">=20"
     },
+    "scripts": {
+        "prepublishOnly": "node ../../scripts/build-slim-package.mjs && node ../../scripts/check-slim-package.mjs && git -C ../.. diff --quiet -- packages/nightgate-tx"
+    },
     "publishConfig": {
         "access": "public"
     },

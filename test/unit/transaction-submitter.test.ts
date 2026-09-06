@@ -29,10 +29,11 @@ import {
     TransactionSubmitter,
     SubmissionError,
     classifySubmissionError,
-    reconcilePendingSubmission,
     type TransactionSubmitterDeps, dustRaceLedgerCode
 } from '../../srv/submission/TransactionSubmitter';
+import { WorkerSubmitError } from '../../srv/midnight/wallet-worker-protocol';
 import type { ContractProvidersConfig, WalletMaterial } from '../../srv/midnight/providers';
+import { runInJobExecutionContext, SponsorAttemptBookkeepingPendingError } from '../../srv/submission/job-execution-context';
 
 // ---- In-memory fake DB ----------------------------------------------------
 
@@ -534,6 +535,34 @@ describe('TransactionSubmitter private-state backend guard', () => {
 });
 
 describe('classifySubmissionError', () => {
+    const coded = (code: any, extra: Record<string, unknown> = {}, message = 'worker message') =>
+        new WorkerSubmitError({ name: 'Error', message, code, retryable: false, ...extra } as any);
+
+    test('a worker-classified failure maps by code, whatever its text says', () => {
+        expect(classifySubmissionError(coded('dust-race', { ledgerCode: '1010/196', retryable: true }, 'no digits here'), 'preprod'))
+            .toMatchObject({ code: '1010/196', retryable: true, transient: 'dust-race' });
+        expect(classifySubmissionError(coded('dust-race', { ledgerCode: 'pool-invalid', retryable: true }), 'preprod'))
+            .toMatchObject({ code: 'PoolInvalid', retryable: true, transient: 'dust-race' });
+        expect(classifySubmissionError(coded('pre-mempool-reject', { ledgerCode: '1010/188' }), 'preprod')).toMatchObject({ code: '1010/188', retryable: false });
+        expect(classifySubmissionError(coded('pre-mempool-reject', { ledgerCode: '1014' }), 'preprod')).toMatchObject({ code: '1014', retryable: false });
+        expect(classifySubmissionError(coded('pre-mempool-reject', { ledgerCode: '1016', retryable: true }), 'preprod')).toMatchObject({ code: '1016', retryable: true });
+        expect(classifySubmissionError(coded('pre-mempool-reject', { ledgerCode: '1016', retryable: true }), 'mainnet')).toMatchObject({ code: '1016', retryable: false, knownIssueRef: expect.stringContaining('forum') });
+        expect(classifySubmissionError(coded('pre-mempool-reject', { ledgerCode: 'intent-rejected' }), 'preprod')).toMatchObject({ code: 'SubmitIntentRejected', retryable: false });
+        expect(classifySubmissionError(coded('transport', { retryable: true }), 'preprod')).toMatchObject({ code: 'NetworkOrTimeout', retryable: true });
+        // Ambiguous is NOT retried by rebuilding: the identifier may land.
+        expect(classifySubmissionError(coded('ambiguous', {}, 'submit watch timed out after 60000ms'), 'preprod')).toMatchObject({ code: 'SubmitAmbiguous', retryable: false });
+        expect(classifySubmissionError(coded('landed-not-applied'), 'preprod')).toMatchObject({ code: 'TxFailed', retryable: false });
+        expect(classifySubmissionError(coded('policy'), 'preprod')).toMatchObject({ code: 'SponsorPolicyRefused', retryable: false });
+        expect(classifySubmissionError(coded('internal'), 'preprod')).toMatchObject({ code: 'UnknownError', retryable: false });
+    });
+
+    test('a causality refusal keeps every call\'s apply position on the classification and in the message', () => {
+        const calls = [{ name: 'attest', segId: 1158, stages: 'f' }, { name: 'anchorContentRoot', segId: 1159, stages: 'g' }];
+        const c = classifySubmissionError(coded('causality', { calls }, "batch violates the ledger's causality constraint. Stages in apply order: attest=1158[f] anchorContentRoot=1159[g]"), 'preprod');
+        expect(c).toMatchObject({ code: 'BatchCausalityViolation', retryable: false, calls });
+        expect(c.message).toMatch(/attest=1158\[f\] anchorContentRoot=1159\[g\]/);
+    });
+
     test('"invalid transaction" is a 1010 validity reject (permanent), even when 1014 appears in the text', () => {
         const c = classifySubmissionError(new Error('Substrate error 1014: invalid transaction'), 'preprod');
         expect(c).toMatchObject({ code: '1010', retryable: false });
@@ -655,57 +684,113 @@ describe('classifySubmissionError', () => {
     });
 });
 
-describe('reconcilePendingSubmission', () => {
-    test('updates pending row to finalized with snapshot', async () => {
-        const db = makeFakeDb();
-        db.tables['midnight.PendingSubmissions'].push({
-            ID: 'sub-1', txHash: '0xMATCH', status: 'included',
-            actionType: 'DEPLOY', submittedAt: new Date().toISOString()
+describe('bound channel submit-intent bookkeeping', () => {
+    const dustRace = () => {
+        const wrapped: any = new Error('Transaction submission error');
+        wrapped.cause = new Error('1010: Invalid Transaction: Custom error: 170');
+        return wrapped;
+    };
+    /** Run `fn` as a background job would: the boundary hooks record into `calls`. */
+    function inJob<T>(calls: any[], fn: () => Promise<T>, opts: { rejectFails?: boolean } = {}): Promise<T> {
+        return runInJobExecutionContext({
+            reportExternalExecution: async (h) => { calls.push(['externalExecution', h]); },
+            reportSubmitted: async (h) => { calls.push(['submitted', h]); },
+            markBroadcastOn: async (_runner, h) => { calls.push(['broadcastOn', h]); },
+            markSubmissionRejectedOn: async (_runner, h) => {
+                if (opts.rejectFails) throw new Error('Lease lost (or hash already moved)');
+                calls.push(['rejectedOn', h]);
+            }
+        }, fn);
+    }
+    beforeEach(() => { process.env.NIGHTGATE_DUST_RACE_BACKOFF_MS = '0'; });
+    afterEach(() => { delete process.env.NIGHTGATE_DUST_RACE_BACKOFF_MS; delete process.env.NIGHTGATE_DUST_RACE_RETRIES; });
+
+    test('the announced identifier lands on the attempt row and crosses the job boundary BEFORE the worker sends', async () => {
+        const order: string[] = [];
+        walletDeployContract.mockImplementationOnce(async (_args: unknown, onSubmitIntent: any) => {
+            await onSubmitIntent('0xannounced', { circuits: ['<deploy>'], note: 'deploy' });
+            order.push('sent');
+            return { txHash: '0xannounced', contractAddress: '0xCONTRACT', onChainStatus: 'SucceedEntirely' };
         });
-        await reconcilePendingSubmission(db, '0xMATCH', { blockHeight: 42 });
-        const row = db.tables['midnight.PendingSubmissions'][0];
-        expect(row.status).toBe('finalized');
-        expect(row.finalizedAt).toBeDefined();
-        expect(JSON.parse(row.finalizedTxData)).toEqual({ blockHeight: 42 });
+        const { submitter, db } = newSubmitter();
+        const calls: any[] = [];
+        const result = await inJob(calls, () => submitter.deploy({ contractName: 'counter', registration: REGISTRATION, initialPrivateState: {}, sessionId: 's' }));
+        const rows = db.tables['midnight.PendingSubmissions'];
+        expect(rows.length).toBe(1);
+        expect(result.submissionId).toBe(rows[0].ID);
+        expect(rows[0]).toMatchObject({ txHash: '0xannounced', status: 'included' });
+        expect(JSON.parse(rows[0].submitIntentData)).toMatchObject({ channel: 'bound', circuits: ['<deploy>'], note: 'deploy' });
+        const broadcast = calls.find(c => c[0] === 'broadcastOn');
+        expect(broadcast[1]).toEqual({ submissionId: rows[0].ID, txHash: '0xannounced', firstBoundary: false });
+        // boundary crossed before the send, submitted (same hash) after
+        expect(calls.map(c => c[0])).toEqual(['externalExecution', 'broadcastOn', 'submitted']);
+        expect(order).toEqual(['sent']);
     });
 
-    test('also updates pending (no SDK return) → finalized', async () => {
-        const db = makeFakeDb();
-        db.tables['midnight.PendingSubmissions'].push({
-            ID: 'sub-2', txHash: '0xMATCH', status: 'pending',
-            actionType: 'CALL', submittedAt: new Date().toISOString()
-        });
-        await reconcilePendingSubmission(db, '0xMATCH', { blockHeight: 100 });
-        expect(db.tables['midnight.PendingSubmissions'][0].status).toBe('finalized');
+    test('a dust-race rebuild after an announced hash closes that attempt REJECTED, takes the hash off the job, and the rebuild opens a new row', async () => {
+        walletDeployContract
+            .mockImplementationOnce(async (_a: unknown, onSubmitIntent: any) => { await onSubmitIntent('0xfirst', { note: 'deploy' }); throw dustRace(); })
+            .mockImplementationOnce(async (_a: unknown, onSubmitIntent: any) => { await onSubmitIntent('0xsecond', { note: 'deploy' }); return { txHash: '0xsecond', contractAddress: '0xC', onChainStatus: 'SucceedEntirely' }; });
+        const { submitter, db } = newSubmitter();
+        const calls: any[] = [];
+        const result = await inJob(calls, () => submitter.deploy({ contractName: 'counter', registration: REGISTRATION, initialPrivateState: {}, sessionId: 's' }));
+        const rows = db.tables['midnight.PendingSubmissions'];
+        expect(rows.length).toBe(2);
+        expect(rows[0]).toMatchObject({ txHash: '0xfirst', status: 'failed', errorCode: 'REJECTED' });
+        expect(rows[1]).toMatchObject({ txHash: '0xsecond', status: 'included', actionType: 'DEPLOY', sessionId: 's' });
+        expect(result.submissionId).toBe(rows[1].ID);
+        expect(calls.map(c => c[0])).toEqual(['externalExecution', 'broadcastOn', 'rejectedOn', 'broadcastOn', 'submitted']);
+        expect(calls[2][1]).toEqual({ submissionId: rows[0].ID, txHash: '0xfirst' });
+        expect(calls[3][1]).toEqual({ submissionId: rows[1].ID, txHash: '0xsecond', firstBoundary: false });
     });
 
-    test('is a no-op when no row matches the txHash', async () => {
-        const db = makeFakeDb();
-        db.tables['midnight.PendingSubmissions'].push({
-            ID: 'sub-3', txHash: '0xOTHER', status: 'included',
-            actionType: 'CALL', submittedAt: new Date().toISOString()
+    test('a final pre-inclusion reject of an announced attempt fails plainly: row REJECTED, hash off the job', async () => {
+        walletSubmitContractCall.mockImplementationOnce(async (_a: unknown, onSubmitIntent: any) => {
+            await onSubmitIntent('0xlast', { contractAddress: '0xC', circuits: ['increment'] });
+            throw new Error('1010: Invalid Transaction: Custom error: 188');
         });
-        await reconcilePendingSubmission(db, '0xNOMATCH', { blockHeight: 1 });
-        expect(db.tables['midnight.PendingSubmissions'][0].status).toBe('included');
+        const { submitter, db } = newSubmitter();
+        const calls: any[] = [];
+        const err = await inJob(calls, () => submitter.call({ contractAddress: '0xC', circuit: 'increment', args: [], contractName: 'counter', registration: REGISTRATION, sessionId: 's' })).catch(e => e);
+        expect(err).toBeInstanceOf(SubmissionError);
+        const rows = db.tables['midnight.PendingSubmissions'];
+        expect(rows[0]).toMatchObject({ txHash: '0xlast', status: 'failed', errorCode: 'REJECTED' });
+        expect(err.submissionId).toBe(rows[0].ID);
+        expect(calls.map(c => c[0])).toEqual(['externalExecution', 'broadcastOn', 'rejectedOn']);
     });
 
-    test('does not touch already-finalized rows', async () => {
-        const db = makeFakeDb();
-        db.tables['midnight.PendingSubmissions'].push({
-            ID: 'sub-4', txHash: '0xDONE', status: 'finalized',
-            finalizedAt: '2026-01-01T00:00:00Z', actionType: 'CALL', submittedAt: '2026-01-01T00:00:00Z'
+    test('an ambiguous failure after the announcement keeps the hash on the job (reconciliation, not a plain failure)', async () => {
+        walletSubmitContractCallBatch.mockImplementationOnce(async (_a: unknown, onSubmitIntent: any) => {
+            await onSubmitIntent('0xmaybe', { contractAddress: '0xC', circuits: ['a', 'b'] });
+            throw new Error('submit watch timed out after 240000ms without a Finalized status');
         });
-        await reconcilePendingSubmission(db, '0xDONE', { blockHeight: 2 });
-        // finalizedAt unchanged
-        expect(db.tables['midnight.PendingSubmissions'][0].finalizedAt).toBe('2026-01-01T00:00:00Z');
+        const { submitter, db } = newSubmitter();
+        const calls: any[] = [];
+        await expect(inJob(calls, () => submitter.callBatch({ contractAddress: '0xC', calls: [{ circuit: 'a', args: [] }, { circuit: 'b', args: [] }], contractName: 'counter', registration: REGISTRATION, sessionId: 's' } as any)))
+            .rejects.toBeInstanceOf(SubmissionError);
+        // the row stays pending (reconciliation can still finalize it), the reason is recorded
+        expect(db.tables['midnight.PendingSubmissions'][0]).toMatchObject({ txHash: '0xmaybe', status: 'pending', errorCode: expect.any(String) });
+        expect(db.tables['midnight.PendingSubmissions'][0].errorMessage).toMatch(/outcome unknown after broadcast/);
+        expect(calls.map(c => c[0])).toEqual(['externalExecution', 'broadcastOn']); // no rejectedOn: the hash may land
     });
 
-    test('is a no-op on empty txHash', async () => {
-        const db = makeFakeDb();
-        db.tables['midnight.PendingSubmissions'].push({
-            ID: 'sub-5', txHash: null, status: 'pending', actionType: 'CALL', submittedAt: new Date().toISOString()
+    test('bookkeeping that cannot commit parks the job instead of rebuilding on an open attempt', async () => {
+        walletDeployContract.mockImplementationOnce(async (_a: unknown, onSubmitIntent: any) => { await onSubmitIntent('0xfirst', { note: 'deploy' }); throw dustRace(); });
+        const { submitter } = newSubmitter();
+        const calls: any[] = [];
+        const err = await inJob(calls, () => submitter.deploy({ contractName: 'counter', registration: REGISTRATION, initialPrivateState: {}, sessionId: 's' }), { rejectFails: true }).catch(e => e);
+        expect(err).toBeInstanceOf(SponsorAttemptBookkeepingPendingError);
+        expect(err.details).toMatchObject({ txHash: '0xfirst', refund: 0 });
+        expect(walletDeployContract).toHaveBeenCalledTimes(1); // no rebuild
+    });
+
+    test('outside a background job the hook still records the identifier on the row (boundary hooks are no-ops)', async () => {
+        walletDeployContract.mockImplementationOnce(async (_a: unknown, onSubmitIntent: any) => {
+            await onSubmitIntent('0xplain', { note: 'deploy' });
+            return { txHash: '0xplain', contractAddress: '0xC', onChainStatus: 'SucceedEntirely' };
         });
-        await reconcilePendingSubmission(db, '', { blockHeight: 1 });
-        expect(db.tables['midnight.PendingSubmissions'][0].status).toBe('pending');
+        const { submitter, db } = newSubmitter();
+        await submitter.deploy({ contractName: 'counter', registration: REGISTRATION, initialPrivateState: {}, sessionId: 's' });
+        expect(db.tables['midnight.PendingSubmissions'][0]).toMatchObject({ txHash: '0xplain', status: 'included' });
     });
 });

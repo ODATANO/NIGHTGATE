@@ -43,6 +43,9 @@ interface ReorgInfo {
 // Crawler Orchestrator
 // ============================================================================
 
+/** stop() waits this long for the in-flight batch or live block before unsubscribing. */
+const STOP_DRAIN_MS = 30_000;
+
 export class MidnightCrawler {
     private isRunning: boolean = false;
     private isCatchingUp: boolean = false;
@@ -50,6 +53,8 @@ export class MidnightCrawler {
     private pendingRedrive: boolean = false;  // A drive request that arrived while a pipeline was still unwinding
     private processing: boolean = false;  // Mutex: prevent concurrent block processing
     private pendingHeights: number[] = [];  // Queued live block heights received during processing
+    private ingestPromise: Promise<void> | null = null;  // The running pipeline, awaited by stop()
+    private liveProcessing: Promise<void> | null = null;  // The live block being persisted, awaited by stop()
     private subscriptionId: string | null = null;
     private db!: cds.DatabaseService;
     private processor!: BlockProcessor;
@@ -167,7 +172,7 @@ export class MidnightCrawler {
         if (this.ingestActive) { this.pendingRedrive = true; return; }
         this.ingestActive = true;
         this.pendingRedrive = false;
-        this.runIngestPipeline()
+        this.ingestPromise = this.runIngestPipeline()
             .catch((err: unknown) => {
                 const msg = err instanceof Error ? err.message : String(err);
                 if (this.isRunning && this.isConnectionLossError(err)) {
@@ -194,6 +199,19 @@ export class MidnightCrawler {
     async stop(): Promise<void> {
         log.info('Stopping...');
         this.isRunning = false;
+
+        // Let the in-flight work finish: the pipeline checks isRunning between
+        // blocks, a live block is one persist transaction. Without this a
+        // reindexFromHeight rolled the index back UNDER a persist that then
+        // committed a block whose parent was gone. Bounded, so a stalled RPC
+        // cannot hold shutdown.
+        const inflight = [this.ingestPromise, this.liveProcessing].filter((p): p is Promise<void> => !!p);
+        if (inflight.length > 0) {
+            await Promise.race([
+                Promise.allSettled(inflight),
+                new Promise<void>(resolve => { const t = setTimeout(resolve, STOP_DRAIN_MS); (t as any).unref?.(); })
+            ]);
+        }
 
         // Unsubscribe from live updates
         if (this.subscriptionId) {
@@ -448,6 +466,14 @@ export class MidnightCrawler {
     private async subscribeLive(): Promise<void> {
         log.info('Starting live subscription...');
 
+        // A re-drive after a reconnect that raced the previous pipeline's tail
+        // would subscribe twice and process every head twice; drop the old one.
+        if (this.subscriptionId) {
+            const stale = this.subscriptionId;
+            this.subscriptionId = null;
+            try { await this.nodeProvider.unsubscribeFinalizedHeads(stale); } catch { /* the socket it lived on may be gone */ }
+        }
+
         // Reconnect handling is registered once in start() (setOnReconnect →
         // driveIngest), so a drop during catch-up OR live is covered there.
         this.subscriptionId = await this.nodeProvider.subscribeFinalizedHeads(async (header: BlockHeader) => {
@@ -463,21 +489,24 @@ export class MidnightCrawler {
 
             this.processing = true;
 
-            try {
-                await this.processLiveBlock(header, height);
+            this.liveProcessing = (async () => {
+                try {
+                    await this.processLiveBlock(header, height);
 
-                // Drain queued heights: clear the queue and let catchUp() close
-                // any gap between the current tip and the chain head.
-                while (this.pendingHeights.length > 0 && this.isRunning) {
-                    this.pendingHeights = [];
-                    const gapBlocks = await this.catchUp();
-                    if (gapBlocks > 0) {
-                        log.debug(`Drained ${gapBlocks} queued blocks`);
+                    // Drain queued heights: clear the queue and let catchUp() close
+                    // any gap between the current tip and the chain head.
+                    while (this.pendingHeights.length > 0 && this.isRunning) {
+                        this.pendingHeights = [];
+                        const gapBlocks = await this.catchUp();
+                        if (gapBlocks > 0) {
+                            log.debug(`Drained ${gapBlocks} queued blocks`);
+                        }
                     }
+                } finally {
+                    this.processing = false;
                 }
-            } finally {
-                this.processing = false;
-            }
+            })();
+            await this.liveProcessing;
         });
 
         // Update sync state
@@ -622,13 +651,16 @@ export class MidnightCrawler {
                 return height + 1;
             }
 
-            try {
-                const prevHeader = await this.nodeProvider.getHeader(currentHash);
-                currentHash = prevHeader.parentHash;
-                height--;
-            } catch {
-                return height;
+            // A failed header lookup is a transport problem, not a fork point:
+            // returning `height` here would roll the index back to wherever
+            // the RPC happened to fail. Propagate; the live handler records
+            // the error and the next head runs the search again.
+            const prevHeader = await this.nodeProvider.getHeader(currentHash);
+            if (!prevHeader?.parentHash) {
+                throw new Error(`No header for ${currentHash} during fork search (pruned or racing node)`);
             }
+            currentHash = prevHeader.parentHash;
+            height--;
 
             if (MidnightNodeProvider.parseBlockNumber(header.number) - height > 100) {
                 log.error('Reorg depth > 100 blocks, stopping search');
@@ -653,6 +685,9 @@ export class MidnightCrawler {
             });
 
             if (result.blocksRolledBack === 0) return;
+            if (result.submissionsReverted || result.jobsReverted) {
+                log.warn(`Reorg at ${reorg.forkHeight}: ${result.submissionsReverted} submission(s) and ${result.jobsReverted} job outcome(s) returned to pending`);
+            }
 
             await tx.run(INSERT.into(ReorgLog).entries({
                 ID: reorgLogId,

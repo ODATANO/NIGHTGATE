@@ -33,7 +33,8 @@ export type ImpureCircuits<PS> = {
                 mode_0: bigint,
                 payload_hash_0: Uint8Array,
                 metadata_hash_0: Uint8Array,
-                nonce_0: Uint8Array): __compactRuntime.CircuitResults<PS, []>;
+                nonce_0: Uint8Array,
+                expires_at_0: bigint): __compactRuntime.CircuitResults<PS, []>;
   grantDisclosure(context: __compactRuntime.CircuitContext<PS>,
                   payload_hash_0: Uint8Array,
                   grantee_0: Uint8Array,
@@ -80,7 +81,8 @@ export type ProvableCircuits<PS> = {
                 mode_0: bigint,
                 payload_hash_0: Uint8Array,
                 metadata_hash_0: Uint8Array,
-                nonce_0: Uint8Array): __compactRuntime.CircuitResults<PS, []>;
+                nonce_0: Uint8Array,
+                expires_at_0: bigint): __compactRuntime.CircuitResults<PS, []>;
   grantDisclosure(context: __compactRuntime.CircuitContext<PS>,
                   payload_hash_0: Uint8Array,
                   grantee_0: Uint8Array,
@@ -164,7 +166,8 @@ export type Circuits<PS> = {
                 mode_0: bigint,
                 payload_hash_0: Uint8Array,
                 metadata_hash_0: Uint8Array,
-                nonce_0: Uint8Array): __compactRuntime.CircuitResults<PS, []>;
+                nonce_0: Uint8Array,
+                expires_at_0: bigint): __compactRuntime.CircuitResults<PS, []>;
   grantDisclosure(context: __compactRuntime.CircuitContext<PS>,
                   payload_hash_0: Uint8Array,
                   grantee_0: Uint8Array,
@@ -298,8 +301,11 @@ export type Ledger = {
     isEmpty(): boolean;
     size(): bigint;
     member(key_0: Uint8Array): boolean;
-    lookup(key_0: Uint8Array): { owner: Uint8Array, seq: bigint };
-    [Symbol.iterator](): Iterator<[Uint8Array, { owner: Uint8Array, seq: bigint }]>
+    lookup(key_0: Uint8Array): { owner: Uint8Array,
+                                 seq: bigint,
+                                 expires_at: bigint
+                               };
+    [Symbol.iterator](): Iterator<[Uint8Array, { owner: Uint8Array, seq: bigint, expires_at: bigint }]>
   };
   attestation_seqs: {
     isEmpty(): boolean;
@@ -309,6 +315,12 @@ export type Ledger = {
     [Symbol.iterator](): Iterator<[Uint8Array, bigint]>
   };
   readonly attest_seq_next: bigint;
+  guarded_attestations: {
+    isEmpty(): boolean;
+    size(): bigint;
+    member(elem_0: Uint8Array): boolean;
+    [Symbol.iterator](): Iterator<Uint8Array>
+  };
 }
 
 export type ContractReferenceLocations = any;

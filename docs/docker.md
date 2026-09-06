@@ -36,6 +36,14 @@ docker run -d --name nightgate -p 4004:4004 \
   odatano/nightgate:0.16.2
 ```
 
+The request log (JSON) masks `authorization`, `cookie` and `x-agent-token`
+(`log.mask_headers` in the generated CDS config); a host embedding the plugin
+gets the same mask at plugin load.
+
+The container runs as the unprivileged `node` user (uid 1000). A named
+volume for `/data` inherits that ownership; a bind-mounted host directory
+must be writable by uid 1000 (`chown 1000:1000 <dir>`).
+
 The server listens on `http://localhost:4004`; the OData services sit under
 `/api/v1/nightgate`, `/api/v1/indexer`, `/api/v1/analytics`,
 `/api/v1/admin`. All requests authenticate with HTTP basic
@@ -46,10 +54,10 @@ The server listens on `http://localhost:4004`; the OData services sit under
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `ENCRYPTION_KEY` | required | Encrypts wallet viewing/seed keys at rest (32+ byte secret) |
+| `ENCRYPTION_KEY` | required | Encrypts wallet viewing/seed keys and job commands at rest (32+ byte secret); a key ring `ENCRYPTION_KEYS=id=secret,...` + `ENCRYPTION_KEY_ACTIVE` is accepted instead (rotation: docs/operations.md) |
 | `NIGHTGATE_HTTP_PASSWORD` | required | Basic-auth password |
 | `NIGHTGATE_HTTP_USER` | `nightgate` | Basic-auth user |
-| (agent tokens) | - | Requests carrying `x-agent-token` need NO basic credentials for `/api/v1/nightgate`; the agent-grant hook authenticates them (0.17.1) |
+| (agent tokens) | - | Requests carrying `x-agent-token` need NO basic credentials for `/api/v1/nightgate`; the agent-grant hook authenticates them (0.17.1), every `$batch` part included (0.23.0) |
 | `NIGHTGATE_AUTH` | `basic` | `dummy` serves unauthenticated (local testing ONLY) |
 | `NIGHTGATE_NETWORK` | `preprod` | Target Midnight network |
 | `NIGHTGATE_CRAWLER_ENABLED` | `false` | Block crawler (verify surface works crawler-free) |
@@ -80,6 +88,15 @@ sets to `/data/nightgate.db`):
 ```bash
 docker exec odatano-nightgate node scripts/apply-schema-delta.mjs
 ```
+
+0.23.0 changed what the crawler stores, not the schema: `Transactions.raw`
+now holds the extrinsic as a binary value (CAP's base64 transport; it held
+`0x` hex text in a binary column, which PostgreSQL decodes as base64) and
+`ContractActions.state` is empty (it was a second copy of the extrinsic).
+The schema-delta script re-encodes existing SQLite rows in place and creates
+the secondary indexes (the server creates the indexes at startup as well). On PostgreSQL the crawler could not have
+indexed correctly before 0.23.0; if it ran, `reindexFromHeight(0)` on the
+indexer service is the migration.
 
 Recreating the volume (dev) or a destructive
 `npx cds deploy --to "sqlite:/data/nightgate.db"` remain the wipe options.
@@ -153,8 +170,10 @@ backup and a smoke test succeed.
 
 - Stop gracefully (0.21.7): the entrypoint execs node as PID 1, so
   `docker stop` delivers SIGTERM to the server and cds runs its shutdown
-  hooks (wallet state flush, worker exit). Give it time: the compose file
-  sets `stop_grace_period: 90s`; with a plain `docker stop` pass `-t 90`.
+  hooks. Since 0.23.0 that includes the wallet state flush: every facade is
+  evicted with an acked final save (up to 60 s) before the worker thread is
+  terminated. Give it time: the compose file sets `stop_grace_period: 90s`;
+  with a plain `docker stop` pass `-t 90`.
   Before 0.21.7 the signal stopped at `npx`, and every stop was a SIGKILL
   after 10 s.
 - Single instance only (`runtimeMode` is enforced by the app); do not scale

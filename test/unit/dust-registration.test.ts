@@ -53,7 +53,7 @@ describe('registerNightUtxosForDust', () => {
             sessionId:           'acc-1',
             dustReceiverAddress: 'dust1-custom',
             syncTimeoutMs:       undefined
-        });
+        }, undefined);
         expect(result).toEqual({
             txId: null,
             registeredCount: 0,
@@ -81,7 +81,7 @@ describe('registerNightUtxosForDust', () => {
             sessionId:           'acc-2',
             dustReceiverAddress: undefined,
             syncTimeoutMs:       90_000
-        });
+        }, undefined);
         expect(result.txId).toBe('tx-abc');
         expect(result.registeredCount).toBe(3);
     });
@@ -129,7 +129,7 @@ describe('deregisterNightUtxosFromDust', () => {
         expect(walletDeregisterDustGeneration).toHaveBeenCalledWith({
             sessionId:     'acc-d-1',
             syncTimeoutMs: undefined
-        });
+        }, undefined);
         expect(result).toEqual({
             txId: 'tx-de-1',
             deregisteredCount: 3,
@@ -152,7 +152,7 @@ describe('deregisterNightUtxosFromDust', () => {
         expect(walletDeregisterDustGeneration).toHaveBeenCalledWith({
             sessionId:     'acc-d-2',
             syncTimeoutMs: 30_000
-        });
+        }, undefined);
         expect(result.txId).toBeNull();
     });
 

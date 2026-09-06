@@ -64,6 +64,7 @@ import cds from '@sap/cds';
 import { blake2b } from '@noble/hashes/blake2b';
 import { bytesToHex } from '@noble/hashes/utils';
 import { BlockProcessor } from '../../srv/crawler/BlockProcessor';
+import { isTransientError } from '../../srv/utils/retry';
 
 function buildUnsignedExtrinsic(palletIndex: number, callIndex: number): string {
     return '0x' + Buffer.from([0x0c, 0x04, palletIndex, callIndex]).toString('hex');
@@ -140,11 +141,8 @@ describe('classifyExtrinsic and mapPalletCall', () => {
     });
 
     it('derives deterministic metadata helpers for contract transactions', () => {
-        const hash = (processor as any).hashExtrinsic(buildUnsignedExtrinsic(10, 2));
-
         expect((processor as any).toContractActionType('contract_call')).toBe('CALL');
         expect((processor as any).toContractActionType('night_transfer')).toBeNull();
-        expect((processor as any).deriveContractAddress(hash)).toMatch(/^0x[0-9a-f]{56}$/);
         expect((processor as any).extrinsicSize('0x0c040a02')).toBe(4);
         expect((processor as any).buildCircuitName({ palletIndex: 10, callIndex: 2 })).toBe('10:2');
     });
@@ -217,18 +215,71 @@ describe('getBlockTimestamp: SCALE u64 LE parsing', () => {
         await expect((processor as any).getBlockTimestamp('0xblock')).resolves.toBe(1577836800);
     });
 
-    it('falls back to wall clock time when storage lookup fails', async () => {
-        const nowSpy = vi.spyOn(Date, 'now').mockReturnValue(1_700_000_000_000);
+    it('returns null (never the wall clock) when the storage lookup fails', async () => {
         const warnSpy = vi.spyOn(cds.log('nightgate:crawler'), 'warn').mockImplementation(() => {});
         provider.getStorage.mockRejectedValueOnce(new Error('storage unavailable'));
 
         try {
-            await expect((processor as any).getBlockTimestamp('0xblock')).resolves.toBe(1_700_000_000);
+            await expect((processor as any).getBlockTimestamp('0xblock')).resolves.toBeNull();
             expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('Failed to read on-chain timestamp'));
         } finally {
-            nowSpy.mockRestore();
             warnSpy.mockRestore();
         }
+    });
+
+    it('resolveTimestamp takes the Timestamp.set inherent when the storage is gone, and refuses without either', () => {
+        // extrinsic 0 = Timestamp.set(Compact<u64> ms): unsigned v4 extrinsic
+        // [compact len][0x04][pallet 1][call 0][compact ms]
+        const ms = 1_700_000_000_000n;
+        // compact encoding of a u64 > 2^30: big-integer mode, 6 bytes needed
+        const bytes: number[] = [];
+        let v = ms; const payload: number[] = [];
+        while (v > 0n) { payload.push(Number(v & 0xffn)); v >>= 8n; }
+        bytes.push(((payload.length - 4) << 2) | 0b11, ...payload);
+        const body = [0x04, 0x01, 0x00, ...bytes];
+        const len = body.length; // < 64: single-byte compact
+        const hex = '0x' + Buffer.from([len << 2, ...body]).toString('hex');
+        expect((processor as any).resolveTimestamp(null, [hex], 'height 9')).toBe(1_700_000_000);
+        expect(() => (processor as any).resolveTimestamp(null, ['0x' + 'aa'.repeat(20)], 'height 9')).toThrow(/No timestamp for height 9/);
+        expect(() => (processor as any).resolveTimestamp(null, [], 'height 9')).toThrow(/No timestamp/);
+    });
+
+    it('resolves the pallet map from runtime metadata by NAME (renumbered pallets cannot become unknown silently)', () => {
+        const warnSpy = vi.spyOn(cds.log('nightgate:crawler'), 'warn').mockImplementation(() => {});
+        try {
+            const fakeRegistry = { metadata: { pallets: [
+                { name: 'System', index: 0 },
+                { name: 'Timestamp', index: 1 },
+                { name: 'Midnight', index: 7 },        // moved from 5
+                { name: 'BrandNewPallet', index: 5 }   // took the old ledger index
+            ] } };
+            const map = (processor as any).palletMapFromMetadata(fakeRegistry, 4242);
+            expect((processor as any).mapPalletCall(7, 0, map)).toMatchObject({ txType: 'contract_call' });
+            expect((processor as any).mapPalletCall(5, 0, map)).toMatchObject({ txType: 'unknown' });
+            expect((processor as any).mapPalletCall(1, 0, map)).toMatchObject({ isSystem: true });
+            // The processor's default map is untouched: the metadata map belongs to its runtime version only.
+            expect((processor as any).mapPalletCall(5, 0)).toMatchObject({ txType: 'contract_call' });
+            expect(warnSpy).toHaveBeenCalledWith(expect.stringMatching(/moved from the default indices: Midnight@7/));
+            expect(warnSpy).toHaveBeenCalledWith(expect.stringMatching(/BrandNewPallet@5/));
+        } finally {
+            warnSpy.mockRestore();
+        }
+    });
+
+    it('specVersionFromBatch: 0 is a version, null / empty / false are not (they would alias runtime 0)', () => {
+        expect((processor as any).specVersionFromBatch({ specVersion: 0 }, 'h')).toBe(0);
+        expect((processor as any).specVersionFromBatch({ specVersion: '12' }, 'h')).toBe(12);
+        for (const bad of [null, '', false, undefined, -1, 1.5, 'abc']) {
+            expect(() => (processor as any).specVersionFromBatch({ specVersion: bad }, 'height 9'), String(bad)).toThrow(/No runtime version/);
+        }
+        expect(() => (processor as any).specVersionFromBatch(null, 'height 9')).toThrow(/No runtime version/);
+    });
+
+    it('refuses a metadata without a readable pallet list instead of guessing the default indices', () => {
+        expect(() => (processor as any).palletMapFromMetadata({ metadata: { pallets: [] } }, 4243)).toThrow(/lists no pallets/);
+        expect(() => (processor as any).palletMapFromMetadata({ metadata: {} }, 4244)).toThrow(/lists no pallets/);
+        const throwing = { get metadata() { throw new Error('unsupported v16 layout'); } };
+        expect(() => (processor as any).palletMapFromMetadata(throwing, 4245)).toThrow(/unsupported metadata representation/);
     });
 });
 
@@ -267,41 +318,20 @@ describe('getProtocolVersion: RuntimeVersion per-block query with error fallback
         await expect((processor as any).getProtocolVersion('0xpost-upgrade')).resolves.toBe(6);
     });
 
-    it('falls back to the last successfully fetched value when the RPC fails', async () => {
+    it('never falls back to a previously fetched version: a failed or empty answer refuses the block (transient)', async () => {
         const provider = {
             getRuntimeVersion: vi.fn()
         } as any;
         const processor = new BlockProcessor(provider);
-        const warnSpy = vi.spyOn(cds.log('nightgate:crawler'), 'warn').mockImplementation(() => {});
         provider.getRuntimeVersion
             .mockResolvedValueOnce({ specVersion: 42 })
-            .mockRejectedValueOnce(new Error('runtime unavailable'));
-
-        try {
-            await expect((processor as any).getProtocolVersion('0xabc')).resolves.toBe(42);
-            await expect((processor as any).getProtocolVersion('0xdef')).resolves.toBe(42);
-            expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('Failed to get runtime version'));
-        } finally {
-            warnSpy.mockRestore();
-        }
-    });
-
-    it('logs a warning and returns the cached value if the initial fetch fails', async () => {
-        const provider = {
-            getRuntimeVersion: vi.fn()
-        } as any;
-        const processor = new BlockProcessor(provider);
-        const warnSpy = vi.spyOn(cds.log('nightgate:crawler'), 'warn').mockImplementation(() => {});
-        provider.getRuntimeVersion.mockRejectedValueOnce(new Error('runtime unavailable'));
-
-        try {
-            // Cache uninitialised; on RPC failure we surface 0 (the initial value)
-            // and log the failure so the operator sees it.
-            await expect((processor as any).getProtocolVersion('0xabc')).resolves.toBe(0);
-            expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('Failed to get runtime version'));
-        } finally {
-            warnSpy.mockRestore();
-        }
+            .mockRejectedValueOnce(new Error('runtime unavailable'))
+            .mockResolvedValueOnce(null);
+        await expect((processor as any).getProtocolVersion('0xabc')).resolves.toBe(42);
+        const failed = await (processor as any).getProtocolVersion('0xdef').then(() => null, (e: Error) => e);
+        expect(failed?.message).toMatch(/No runtime version for block 0xdef: runtime unavailable/);
+        expect(isTransientError(failed!)).toBe(true);
+        await expect((processor as any).getProtocolVersion('0xnull')).rejects.toThrow(/No runtime version for block 0xnull/);
     });
 });
 

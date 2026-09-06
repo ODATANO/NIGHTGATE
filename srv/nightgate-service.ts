@@ -7,7 +7,7 @@
 import cds, { Request } from '@sap/cds';
 
 import { registerWalletSessionHandlers, startSessionCleanup } from './sessions/wallet-sessions';
-import { attachAgentGrantEnforcement, registerAgentGrantHandlers } from './sessions/agent-grants';
+import { attachAgentGrantEnforcement, registerAgentGrantHandlers, awaitAgentPrincipal } from './sessions/agent-grants';
 import { ensureNightgateModelLoaded } from './utils/cds-model';
 import { registerSubmissionHandlers } from './submission/handlers';
 import { registerDocumentProofHandlers } from './submission/document-proof';
@@ -169,7 +169,8 @@ export default class NightgateService extends cds.ApplicationService {
 
         registerWalletSessionHandlers(this, this.db);
 
-        this.before('READ', 'WalletSessions', (req: Request) => {
+        this.before('READ', 'WalletSessions', async (req: Request) => {
+            await awaitAgentPrincipal(req);
             const user: any = (req as any).user;
             if (user?.is?.('admin')) return;
             const userId = user?.id;
@@ -181,7 +182,8 @@ export default class NightgateService extends cds.ApplicationService {
 
         registerAgentGrantHandlers(this, this.db);
 
-        this.before('READ', 'AgentGrants', (req: Request) => {
+        this.before('READ', 'AgentGrants', async (req: Request) => {
+            await awaitAgentPrincipal(req);
             const user: any = (req as any).user;
             if (user?.is?.('admin')) return;
             const userId = user?.id;
@@ -197,7 +199,8 @@ export default class NightgateService extends cds.ApplicationService {
         // possible via verifyDocument (documentId is an unguessable
         // capability handle and the response exposes no storageRef).
         for (const entity of ['Documents', 'GranteeIdentities'] as const) {
-            this.before('READ', entity, (req: Request) => {
+            this.before('READ', entity, async (req: Request) => {
+                await awaitAgentPrincipal(req);
                 const user: any = (req as any).user;
                 if (user?.is?.('admin')) return;
                 const userId = user?.id;
@@ -278,9 +281,8 @@ export default class NightgateService extends cds.ApplicationService {
                 txHash: job.txHash,
                 chainStatus: job.chainStatus,
                 chainFinalizedAt: job.chainFinalizedAt,
-                leaseOwner: job.leaseOwner,
-                leaseExpiresAt: job.leaseExpiresAt,
-                heartbeatAt: job.heartbeatAt,
+                chainBlockHeight: job.chainBlockHeight ?? null,
+                chainBlockHash: job.chainBlockHash ?? null,
                 queuedAt: job.queuedAt ?? job.createdAt,
                 externalExecutionAt: job.externalExecutionAt,
                 submittedAt: job.submittedAt,

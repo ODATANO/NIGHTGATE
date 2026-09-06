@@ -22,6 +22,7 @@ Running NIGHTGATE day-to-day. Audience: anyone deploying it, debugging a stuck s
 | `npm run typecheck` | Pre-commit | `tsc --noEmit` |
 | `npm test` | Pre-commit | Full Vitest suite with coverage |
 | Integration scripts | Verifying SDK wiring | `smoke:sdk`, `integration:providers`, `integration:wallet-keys`, `integration:wallet-facade`, `integration:contract-registry` |
+| `npm run integration:postgres` | Before a tag, after any change to the crawler write path, indexes or the lock-retry classifier | The database paths against a REAL PostgreSQL 16: model deploy, `Transactions.raw` BYTEA round trip through the BlockProcessor, `ensureIndexes` idempotency, SQLSTATE classification (55P03, 40P01, 57014, 40001; 23505 stays out) and `withLockContentionRetry`. Starts a throwaway `postgres:16` container on port 15432 (Docker) unless `NIGHTGATE_PG_URL` points at a database; CI runs it against a service container. `npm run check:release:full` = `check:release` + this lane |
 
 ### Why `serve:sync` and not `dev` for long runs
 
@@ -51,11 +52,12 @@ NIGHTGATE_CRAWLER_ENABLED=false                           # Turn off during wall
 LACE_VIEWING_KEY=a32699a5a29e453f6e92624c2fbefdee173d3f1178e3f9c71bc3edb7d91c1403
 LACE_MNEMONIC="word1 word2 word3 ... word24"
 
-# Production-only: at-rest encryption key for stored viewing/seed keys
+# At-rest encryption key for stored viewing/seed keys and job commands
+# (key id 1 of the ring; a ring is ENCRYPTION_KEYS=id=secret,... + ENCRYPTION_KEY_ACTIVE)
 # ENCRYPTION_KEY=<64-hex-char>
 ```
 
-In dev mode without `ENCRYPTION_KEY` set, the crypto layer falls back to a deterministic dev key with a warning log. Across restarts the dev key stays the same (so previously encrypted sessions still decrypt) but production deployments MUST set a real 32-byte secret.
+Without any encryption key the crypto layer uses a random per-process dev key with a warning log: encrypted rows (wallet sessions, encrypted job commands) do not survive a restart. Set `ENCRYPTION_KEY` for anything that should persist; production refuses to start without one.
 
 ### CDS config
 
@@ -123,6 +125,26 @@ npm run sync:start
 
 A first-time cold sync from genesis on a fresh seed takes ~5-6 h wall-clock. The worker pegs ~3.8 GB heap once the shielded chain scan completes (it doesn't shrink - that's the in-memory merkle tree). Restart-from-blob is in seconds: every 30 s the worker persists state to `WalletSyncStates`, and a subsequent `connectWalletForSigning` for the same accountId loads the prior blob and delta-syncs from there.
 
+## Prover keys
+
+The npm tarball ships no `*.prover` file. A job that proves a circuit of a
+registered contract fetches the missing keys on first need
+(`NIGHTGATE_ZK_ASSET_URL`, a `/zk-config` base of any NIGHTGATE that has
+them; shipped contracts default to the release's git tag), verifies each
+against the contract's `keys/manifest.json` and writes it next to the
+verifier keys. Neither the artifact digest nor any recorded evidence
+changes, and no restart is needed. Offline or firewalled installs:
+
+```bash
+npx nightgate-fetch-keys attestation-vault
+npx nightgate-fetch-keys attestation-vault-32 --from https://host/zk-config/attestation-vault-32
+NIGHTGATE_ZK_ASSET_URL=none   # refuse to fetch; a missing key fails the job with PROVER_KEYS_UNAVAILABLE
+```
+
+After recompiling a shipped contract, run `npm run keys:manifest` and commit
+the manifest with the managed tree (`check:exports` fails on a stale one).
+The Docker image builds from the checkout and carries every key.
+
 ## Persistence + restart resilience
 
 Two state tables are load-bearing for restart:
@@ -143,7 +165,26 @@ Healthy progression looks like:
 
 If you see `sh` or `du` shrink dramatically, the SDK is probably revalidating during restore; the new value is the post-validation form. Not corruption.
 
+### Reorgs and `reindexFromHeight`
+
+Submitted jobs carry the inclusion coordinates the indexer confirmer reported
+(`chainBlockHeight`, `chainBlockHash`, `indexerTxHash` on `BackgroundJobs`
+and `PendingSubmissions`). A crawler reorg rollback and a manual
+`reindexFromHeight(h)` return every job and attempt row confirmed at or above
+`h` to a pending chain status in the same transaction that removes the
+blocks; the confirmer re-confirms them on its next tick, so a reindex from a
+low height briefly shows `chainStatus: pending` on old jobs. Nothing else
+correlates a job with a block: the job's identifier, the crawler's extrinsic
+hash and the indexer's transaction hash are three different values.
+
 ## Upgrading to 0.22.0
+
+Attempt rows closed as `CHAIN_EXECUTION_FAILED` (the call landed but did not
+apply) carry the same height and return to `pending` with their job; an
+attempt rejected before the mempool has no height and is never touched. A
+job that failed that way without a recorded height (it was proven by the
+worker before the confirmer ran) parks under `CHAIN_EXECUTION_FAILED_UNCONFIRMED`
+and is finalized by the confirmer with the coordinates on its next tick.
 
 One nullable column on `AgentGrants` (`allowedTokenTypes`); same migration
 command as below, once, with the server stopped. Existing grants keep
@@ -377,6 +418,17 @@ npm run build
 
 Then restart. (Or use `npm run dev` while iterating, accepting the watch-driven restarts.)
 
+## Rotating the encryption key
+
+Ciphertexts carry the id of the ring key they were written under, so a rotation is additive. Wallet sessions, encrypted job commands and the per-account data keys (`AccountKeys`, under which private state, signing keys and sync-state blobs are encrypted) are rewrapped by the tool alone. Rows written before the account key (0.22 and earlier: `keyScheme` null on `PrivateStates`, `ContractSigningKeys`, `WalletSyncStates`) need the wallet's viewing key and migrate when that wallet reconnects; the tool migrates the ones whose session still holds a readable viewing key and reports the rest.
+
+1. Add the new key and make it active, keeping the old one: `ENCRYPTION_KEYS=k2=<new secret>` plus `ENCRYPTION_KEY_ACTIVE=k2`, `ENCRYPTION_KEY` (id `1`) stays set. Restart: new rows are written under `k2`, old rows still open.
+2. Stop the server and run `npx nightgate-rewrap-keys --dry-run`, then without `--dry-run` (same `NIGHTGATE_DB_URL` / `NIGHTGATE_DB_PATH` as the server). It prints counts per table and source key. Exit code 0: nothing legacy remains. Exit code 1: the tool lists the accounts whose rows still need their viewing key; the old key MUST stay in the ring.
+3. Start the server with both keys. Every wallet that reconnects migrates its own rows. Run the tool again (server stopped) until it exits 0. A wallet that never comes back keeps its legacy rows: `--drop-legacy-sync-state` deletes such a wallet's sync-state row (it re-syncs from genesis on its next connect); private state and signing keys are never dropped by the tool, so decide per account whether to keep the old key or accept that those rows stay unreadable.
+4. Only then remove the old key (`ENCRYPTION_KEY` unset, `ENCRYPTION_KEYS=k2=...`) and restart. Startup refuses to run while any ring-sealed ciphertext (sessions, job commands, account keys) names a key outside the ring; it logs the legacy count with a warning, since those rows are unreadable without the viewing key either way.
+
+The secrets stay in the process environment of the CAP host (the worker thread receives the resolved ring from the main thread, it never parses the environment itself).
+
 ## Database operations
 
 ### Reset (lose everything)
@@ -403,7 +455,8 @@ Next `connectWalletForSigning` will start a fresh ~5-6 h cold sync.
 
 ## Production checklist (before deploying)
 
-- [ ] `ENCRYPTION_KEY` set to a real 32-byte hex secret (not the dev fallback)
+- [ ] `ENCRYPTION_KEY` (or `ENCRYPTION_KEYS` + `ENCRYPTION_KEY_ACTIVE`) set to real 32-byte hex secrets (not the dev fallback)
+- [ ] after a key rotation: `nightgate-rewrap-keys` exited 0 before the old key left the ring
 - [ ] CDS database is PostgreSQL or HANA, not SQLite (standalone image: `NIGHTGATE_DB_URL`, migration via `nightgate-db-migrate`, see docs/docker.md). Production SQLite is now **rejected at startup** (fail closed); `NIGHTGATE_ALLOW_PRODUCTION_SQLITE=true` is a temporary migration-only escape hatch
 - [ ] Exactly one replica declared (`NIGHTGATE_REPLICA_COUNT=1`); more than one replica, CAP multitenancy, or (on Cloud Foundry) `CF_INSTANCE_INDEX > 0` fails startup closed
 - [ ] `NIGHTGATE_CRAWLER_ENABLED` is true (or unset - the crawler defaults to on)
@@ -412,3 +465,4 @@ Next `connectWalletForSigning` will start a fresh ~5-6 h cold sync.
 - [ ] If using a local indexer container: it has reached `caught_up: true` AND has stable disk available
 - [ ] `cds.requires.nightgate.allowMainnetSubmission` is `false` until the [forum 1190 issue](https://forum.midnight.network) is resolved
 - [ ] Backup strategy in place for `WalletSyncStates` and `PendingSubmissions`
+- [ ] `npm run check:release:full` passed (the PostgreSQL lane needs Docker or `NIGHTGATE_PG_URL`)

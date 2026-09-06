@@ -19,6 +19,7 @@
  */
 
 import { getNightgatePluginConfig } from './nightgate-config';
+import { configList } from './config';
 
 /**
  * Session ids any authenticated caller may use as fee sponsor.
@@ -26,11 +27,11 @@ import { getNightgatePluginConfig } from './nightgate-config';
  * (string, comma separated, or array of strings).
  */
 export function getConfiguredFeeSponsorSessions(config?: Record<string, any>): string[] {
-    const fromEnv = process.env.NIGHTGATE_FEE_SPONSOR_SESSION?.trim();
-    const fromConfig = Array.isArray(config?.feeSponsorSessions)
+    const fromEnv = configList('NIGHTGATE_FEE_SPONSOR_SESSION');
+    if (fromEnv.length) return fromEnv;
+    const raw = Array.isArray(config?.feeSponsorSessions)
         ? config!.feeSponsorSessions.join(',')
         : config?.feeSponsorSessions;
-    const raw = fromEnv || fromConfig;
     if (!raw || typeof raw !== 'string') return [];
     return raw.split(',').map(s => s.trim()).filter(Boolean);
 }

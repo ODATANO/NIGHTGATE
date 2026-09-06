@@ -7,8 +7,10 @@
  * suite hermetic and fast, no SQLite spin-up needed.
  */
 
+import { extractEncryptedComponents } from '../../srv/utils/storage-encryption';
 import {
     CapDbPrivateStateProvider,
+    privateStateStableSalt,
     ExportDecryptionError,
     InvalidExportFormatError,
     ImportConflictError
@@ -106,6 +108,71 @@ function newProvider(accountId = ACCOUNT, db = makeFakeDb()) {
 }
 
 // ---- Tests -----------------------------------------------------------------
+
+describe('CapDbPrivateStateProvider: password fallbacks', () => {
+    test('a row under an older password is read through the fallback and rewritten under the current one', async () => {
+        const { provider: old, db } = newProvider();
+        await old.setContractAddress(CONTRACT);
+        await old.set('ps-1', { v: 1 });
+        await old.setSigningKey(CONTRACT, 'sk-1');
+        const before = db.tables['midnight.PrivateStates'][0].ciphertext;
+
+        const current = new CapDbPrivateStateProvider({
+            accountId: ACCOUNT,
+            privateStoragePasswordProvider: () => PASSWORD + '-rotated',
+            privateStoragePasswordFallbacks: () => ['not-this-one-but-long-enough', PASSWORD],
+            db
+        });
+        current.setContractAddress(CONTRACT);
+        expect(await current.get('ps-1')).toEqual({ v: 1 });
+        expect(await current.getSigningKey(CONTRACT)).toBe('sk-1');
+        // rewritten: the stored blob now carries the current password's stable salt
+        const after = db.tables['midnight.PrivateStates'][0].ciphertext;
+        expect(after).not.toBe(before);
+        expect(privateStateStableSalt(ACCOUNT, PASSWORD + '-rotated').equals(extractEncryptedComponents(Buffer.from(after, 'base64')).salt)).toBe(true);
+        // and opens without any fallback from now on
+        const strict = new CapDbPrivateStateProvider({ accountId: ACCOUNT, privateStoragePasswordProvider: () => PASSWORD + '-rotated', db });
+        strict.setContractAddress(CONTRACT);
+        expect(await strict.get('ps-1')).toEqual({ v: 1 });
+        expect(await strict.getSigningKey(CONTRACT)).toBe('sk-1');
+    });
+
+    test('without a matching fallback the original decrypt error surfaces', async () => {
+        const { provider: old, db } = newProvider();
+        await old.setContractAddress(CONTRACT);
+        await old.set('ps-1', { v: 1 });
+        const current = new CapDbPrivateStateProvider({
+            accountId: ACCOUNT,
+            privateStoragePasswordProvider: () => PASSWORD + '-rotated',
+            privateStoragePasswordFallbacks: () => ['some-other-password-of-length'],
+            db
+        });
+        current.setContractAddress(CONTRACT);
+        await expect(current.get('ps-1')).rejects.toThrow(/Salt mismatch/);
+    });
+});
+
+describe('CapDbPrivateStateProvider: key scheme marker', () => {
+    test('every write and every fallback rewrite marks the row dek1', async () => {
+        const { provider: old, db } = newProvider();
+        old.setContractAddress(CONTRACT);
+        await old.set('ps-1', { v: 1 });
+        await old.setSigningKey(CONTRACT, 'sk-1');
+        expect(db.tables['midnight.PrivateStates'][0].keyScheme).toBe('dek1');
+        expect(db.tables['midnight.ContractSigningKeys'][0].keyScheme).toBe('dek1');
+        // A legacy row (no marker) read through a fallback comes back marked.
+        db.tables['midnight.PrivateStates'][0].keyScheme = null;
+        const current = new CapDbPrivateStateProvider({
+            accountId: ACCOUNT,
+            privateStoragePasswordProvider: () => PASSWORD + '-dek',
+            privateStoragePasswordFallbacks: () => [PASSWORD],
+            db
+        });
+        current.setContractAddress(CONTRACT);
+        expect(await current.get('ps-1')).toEqual({ v: 1 });
+        expect(db.tables['midnight.PrivateStates'][0].keyScheme).toBe('dek1');
+    });
+});
 
 describe('CapDbPrivateStateProvider: CRUD', () => {
     test('set + get round-trips a JSON-serializable state', async () => {

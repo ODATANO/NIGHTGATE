@@ -33,3 +33,9 @@ contracts/mint2
 contracts/mint3
 contracts/mint4
 OPERATIONS.local.md
+# never part of the image: the generated client package, deployment
+# templates, CI definitions and local one-off scripts
+packages
+deploy
+.github
+scripts/zz-*

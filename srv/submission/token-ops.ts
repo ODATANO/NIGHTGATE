@@ -7,6 +7,7 @@
 
 import {
     walletTransferNight,
+    type SubmitIntentHook,
     walletGetBalance,
     walletEstimateTransferFee
 } from '../midnight/wallet-worker-client';
@@ -26,6 +27,8 @@ export interface SendNightArgs {
     syncTimeoutMs?: number;
     /** Raw token type (64 hex) to send instead of NIGHT; e.g. a contract-minted shielded token. */
     tokenTypeHex?: string;
+    /** Pre-broadcast handshake: persist the announced identifier, then the worker sends. */
+    onSubmitIntent?: SubmitIntentHook;
 }
 
 export interface SendNightResult {
@@ -43,7 +46,7 @@ export async function sendNight(args: SendNightArgs): Promise<SendNightResult> {
         ttlIso:          args.ttlIso,
         syncTimeoutMs:   args.syncTimeoutMs,
         tokenTypeHex:    args.tokenTypeHex
-    });
+    }, args.onSubmitIntent);
 }
 
 // ---- Diagnostics: getWalletBalance ---------------------------------------
@@ -94,6 +97,8 @@ export interface EstimateSendNightFeeArgs {
     amount: string;
     ttlIso?: string;
     syncTimeoutMs?: number;
+    /** Raw token type (64 hex) to price instead of NIGHT. */
+    tokenTypeHex?: string;
 }
 
 export interface EstimateFeeResult {
@@ -109,6 +114,7 @@ export async function estimateSendNightFee(args: EstimateSendNightFeeArgs): Prom
         receiverAddress: args.receiverAddress,
         amount:          args.amount,
         ttlIso:          args.ttlIso,
-        syncTimeoutMs:   args.syncTimeoutMs
+        syncTimeoutMs:   args.syncTimeoutMs,
+        tokenTypeHex:    args.tokenTypeHex
     });
 }

@@ -7,8 +7,7 @@
  * throw rather than degrade, and the assembled modality is reported back for logging.
  *
  * The ledger import is stubbed at the seam (same policy as wasm-proof-provider.test.ts); the real
- * ledger prove loop is exercised by the live acceptance test described in
- * docs/feature-requests/browser-wallet-delegated-proving.md.
+ * ledger prove loop is exercised by the live wallet-proving lane.
  */
 import { describe, it, expect, vi, beforeAll, beforeEach } from 'vitest';
 

@@ -10,15 +10,25 @@ OData distinguishes between **actions** (POST, may have side effects) and **func
 - `http://localhost:4004/api/v1/analytics/<functionName>()` - analytics service
 - `http://localhost:4004/api/v1/admin/<actionName>` - admin service
 
+## API versioning while 0.x
+
+The OData paths stay `/api/v1/...` until 1.0. Under 0.x a MINOR bump may
+change or remove an action, a PATCH bump never does. An action that is going
+away is marked `@deprecated` in its CDS doc comment and in this file for at
+least one minor release before removal. `getRuntimeInfo().apiVersion` reports
+the running major.minor so a client can pin what it was written against.
+
 ## Async job model (write actions)
 
 Every action that submits an on-chain transaction is **asynchronous**: it returns `{ jobId, status: "pending" }` immediately, then you poll `getJobStatus(jobId, sessionId)` until `succeeded` or `failed`. This keeps multi-minute proof/submit work off the HTTP request. Each write action below documents its **job-result** shape (the parsed `result` on success); read-only **functions** return their result directly.
 
-### `getJobStatus(jobId, sessionId) → { status, chainStatus, result, errorCode, errorMessage, submissionId, txHash, chainFinalizedAt, … }`
+### `getJobStatus(jobId, sessionId) → { status, chainStatus, result, errorCode, errorMessage, submissionId, txHash, chainFinalizedAt, chainBlockHeight, chainBlockHash, … }`
 
-`status` (server-side workflow lifecycle): `pending | running | external_execution | submitted | reconciliation_required | succeeded | failed`. On success, `result` is a JSON string of the action's result shape; on failure, `errorCode` + `errorMessage` carry the classified error (see [Error model](#error-model)).
+`status` (server-side workflow lifecycle): `pending | running | external_execution | submitted | reconciliation_required | succeeded | failed`. On success, `result` is a JSON string of the action's result shape; on failure, `errorCode` + `errorMessage` carry the classified error (see [Error model](#error-model)). `chainBlockHeight` / `chainBlockHash` are the inclusion coordinates the indexer confirmer recorded; they are what a reorg rollback correlates on. A job whose on-chain failure the worker proved without a block height sits briefly in `reconciliation_required` with `errorCode: CHAIN_EXECUTION_FAILED_UNCONFIRMED` until the confirmer finalizes it with the coordinates.
 
 `reconciliation_required` is an explicit **terminal** state: execution was interrupted after an external effect may have occurred. The caller must NOT auto-retry - a fresh attempt needs a new `idempotencyKey`. The single-instance reconciler resolves such jobs automatically from durable chain evidence (a finalized `PendingSubmission` plus a `System.Events` outcome) once it becomes available.
+
+Since 0.23.0 every submitting path announces the transaction identifier to the main thread and broadcasts only after it is persisted as the job's `txHash` (submit-intent handshake, both channels). A job that ends `failed` without a `txHash` therefore never sent anything, and `reconciliation_required` always carries the ONE identifier that may be on chain. A pre-mempool reject of an announced attempt (a dust race that is rebuilt, or a final node reject) closes that attempt `REJECTED` on `PendingSubmissions` and takes its hash off the job before anything else is sent.
 
 `chainStatus` (`null | pending | success | failure`) is the on-chain execution outcome, **independent of `status`**, populated later from `System.Events`: `status: succeeded` means the submission workflow completed, while `chainStatus: success` confirms the transaction was finalized and executed successfully on-chain. A `chainStatus: failure` on a `succeeded` job means the tx finalized but the contract call reverted. The response also carries `submissionId`, `txHash`, `chainFinalizedAt`, and lease/attempt/timestamp bookkeeping fields.
 
@@ -425,7 +435,12 @@ the result is `{ finalizedTxB64, serializedBytes }` (roughly 5 KB of base64 for
 a vault call). Nothing was submitted and no dust was spent.
 
 A caller who does not run NIGHTGATE at all does this same step locally with the
-txbuilder SDK, which is the point of the split.
+txbuilder SDK, which is the point of the split. **Rate limit:** 30/hour per
+session.
+
+Rate limits on session-scoped actions are keyed by principal AND session
+(`<agent grant or user>:<sessionId>`), so a caller can only ever spend its own
+budget (0.23.0).
 
 ### `sponsorFinalizedTransaction(finalizedTxB64, sponsorSessionId, idempotencyKey?) → { jobId, status, sessionId }`
 
@@ -434,7 +449,8 @@ sponsor's policy, balances dust with `sponsorSessionId` and submits. The
 response's `sessionId` is the SPONSOR session the job is keyed by; poll
 `getJobStatus` with it (an agent-grant caller may not know it otherwise, since
 the grant injects the pinned sponsor server-side). Job result:
-`{ txHash, circuits, contractAddress }`.
+`{ txHash, circuits, contractAddress }`. **Rate limit:** 120/hour per
+principal (agent grant or user), shared with `sponsorUnboundTransaction`.
 
 The sponsor never sees a key, a witness or a preimage: the proof is already
 done. The policy is a FAIL-CLOSED shape check, not just an allow-list: the
@@ -468,6 +484,22 @@ make you pay a transaction fee.
 fixed at creation, so a one-line change to these lists used to mean a
 recreate and a ~20 min cold sponsor pool. Two layers replace that:
 
+- **Sponsor binding.** A grant without `sponsorSessionId` cannot name a
+  sponsor at all: a request carrying `sponsorSessionId` under such a token is
+  refused with 403. A token never inherits the operator's other sponsors or
+  the platform pool by default; bind the grant to one sponsor session, or to
+  the pool sentinel, when its jobs are to be paid for.
+- **Always allowed under any token** (no allow-list entry, no budget):
+  entity reads (owner-scoped), `verifyDocument`, `verifyAttestationState`,
+  `verifyPredicateState`, `verifyPredicateAttestation`,
+  `prepareDocumentProof`, `prepareAnchorCommitment`, `prepareMembershipSet`,
+  `deriveTokenType` and `getJobStatus`. Everything else needs an entry in
+  `allowedActions`; wallet lifecycle, sends, deploys, registration and grant
+  administration are never grantable.
+- **Policy is re-resolved when the job runs.** The lists a queued sponsored
+  job runs under are the CURRENT floor narrowed by the grant's CURRENT lists,
+  not the admission snapshot: revoking a grant fails its queued jobs
+  (`AGENT_GRANT_REVOKED`), a narrowed policy file applies to them too.
 - **Policy follows the grant.** `createAgentGrant(..., allowedContracts,
   allowedCircuits, allowedTokenTypes)` records which contracts, circuits and
   (0.22.0) shielded token types THAT consumer may have sponsored. A sponsored call made with the grant's token runs under the
@@ -545,6 +577,8 @@ idempotency rules as `sponsorFinalizedTransaction`, then locks ONE free dust
 BACKING of the sponsor wallet, builds and proves a dust-only spend against it,
 merges it into the caller's transaction, binds and submits. Job result:
 `{ txHash, circuits, contractAddress, note }` (`note` = the backing paid from).
+**Rate limit:** 120/hour per principal (agent grant or user), shared with
+`sponsorFinalizedTransaction`; a sponsor-paid dust spend and proof per job.
 
 What makes it parallel: the sponsor's proving and submit run outside the
 per-wallet lock (only the fast dust build is serialized), each in-flight submit
@@ -589,31 +623,23 @@ rebuilds the call against the current state and submits again. A transient
 dust race on the sponsor's side (`1010/170`, `1010/196`) IS retried by the
 sponsor, transparently.
 
-### `probeCrossServerSponsor(contractAddress, circuit, compiledArtifactRef, sessionId, args, sponsorSessionId) → { jobId, status }`
+### `anchorDocument(sha256, storageRef, sessionId, contractAddress, contentType?, size?, metadata?, compiledArtifactRef?, nonce?, guarded?) → { jobId, status, documentId }`
 
-Runs both phases in one job (build, serialize, deserialize, sponsor, submit) as
-a deployment self-check for a sponsor operator. Result:
-`{ txHash, serializedBytes, roundTrip }`.
+Anchor a document's content hash on-chain in the AttestationVault. NIGHTGATE stores only the hash + a caller-supplied `storageRef` (`file://` | `s3://` | `ipfs://`) - **never the bytes**. `documentId` is returned synchronously (the `Documents` row is inserted up-front, recording the caller as owner plus the anchoring `contractAddress`, network and artifact as evidence context). `compiledArtifactRef` defaults to `attestation-vault`. `Documents` entity reads are owner-scoped (admins unfiltered). Three lanes (0.23.0, vault lineage 3):
 
-A zero-funded caller session needs no wallet sync at all; set
-`NIGHTGATE_SPONSORED_CALLER_SYNC=skip` so a throwaway caller identity is usable
-within seconds instead of minutes.
+- **Default, guarded:** one workflow job (`anchorDocumentGuarded`) with two child transactions: `attestGuarded` mode 0 records an opaque, caller-bound commitment (server-side nonce, expiry now + 24 h), then mode 1 reveals. The payload hash never appears in a mempool before its commitment is on chain, the attestation inherits the commitment's sequence and is FINAL (never taken over). Two fees. Job result `{ documentId, attestationId, txHash, commitTxHash, anchoredAt, guarded: true }`.
+- **`guarded: false`:** one plain `attest` transaction. The hash is visible in the mempool before it is owned and a commitment older than the attest may take it over; only for hashes that are public anyway. Job result `{ documentId, attestationId, txHash, anchoredAt }`.
+- **`nonce`:** the REVEAL of an earlier `commitDocumentAnchor` (manual commit-reveal, the nonce from `prepareAnchorCommitment`). A plain attest that front-ran the reveal is taken over in-circuit because its sequence number is newer than the commitment's.
 
-## Document anchoring
+**Rate limit:** 10/hour per session (a guarded anchor counts once).
 
-**Concurrency note (applies to every attest path, including wallet/txbuilder-submitted):** every `attest`/`attestGuarded` call reads and increments the vault's GLOBAL attestation sequence counter (part of the 0.16 front-running protection), so two attest transactions landing in the same block window conflict regardless of attester: the first applies, the rest finalize as failed contract calls WITH the fee spent (`CHAIN_EXECUTION_FAILED`). Do not fire concurrent attests against one vault and do not blind-retry on that failure. Anchor sequentially, or put multiple calls into ONE transaction via `submitContractCallBatch` / the batch attestation action (one state transition, one fee event).
+### `prepareAnchorCommitment(sha256, metadata?, nonce?) → { commitment, nonce, metadataHash, expiresAt }` (compute-only)
 
-### `anchorDocument(sha256, storageRef, sessionId, contractAddress, contentType?, size?, metadata?, compiledArtifactRef?, nonce?) → { jobId, status, documentId }`
+Manual guarded anchoring, phase 0: computes `commitment = persistentHash{sha256, metadataHash, nonce}` (byte-identical to the circuit's in-circuit recompute) plus a random `nonce` when none is supplied, and a suggested `expiresAt` (UNIX seconds, now + 24 h). STORE the nonce and keep it SECRET until reveal: it is exactly what a mempool front-runner cannot forge. `metadata` must equal the later `anchorDocument` metadata. Publicly known identifiers are first-come-first-served for commits too; use `registerPassport` pre-assignment for those.
 
-Anchor a document's content hash on-chain via the AttestationVault `attest` circuit. NIGHTGATE stores only the hash + a caller-supplied `storageRef` (`file://` | `s3://` | `ipfs://`) - **never the bytes**. `documentId` is returned synchronously (the `Documents` row is inserted up-front, recording the caller as owner plus the anchoring `contractAddress`, network and artifact as evidence context); the job result is `{ documentId, attestationId, txHash, anchoredAt }`. `compiledArtifactRef` defaults to `attestation-vault`. `Documents` entity reads are owner-scoped (admins unfiltered). With `nonce` (64 hex, from `prepareAnchorCommitment`), the anchor runs as the guarded REVEAL (`attestGuarded` mode 1) against a previously committed commitment; a plain attest that front-ran the reveal is taken over in-circuit because its sequence number is newer than the commitment's. **Rate limit:** 10/hour per session.
+### `commitDocumentAnchor(commitment, sessionId, contractAddress, compiledArtifactRef?, idempotencyKey?, sponsorSessionId?, expiresAt?) → { jobId, status }`
 
-### `prepareAnchorCommitment(sha256, metadata?, nonce?) → { commitment, nonce, metadataHash }` (compute-only)
-
-Guarded (commit-reveal) anchoring, phase 0: computes `commitment = persistentHash{sha256, metadataHash, nonce}` (byte-identical to the circuit's in-circuit recompute) plus a random `nonce` when none is supplied. STORE the nonce and keep it SECRET until reveal: it is exactly what a mempool front-runner cannot forge. `metadata` must equal the later `anchorDocument` metadata. Why the guard exists: plain attest is first-come-first-served and insert-once, so a mempool observer could permanently claim a visible payload hash; commit-reveal closes that window for hashes that are secret until reveal (publicly known identifiers use `registerPassport` pre-assignment instead).
-
-### `commitDocumentAnchor(commitment, sessionId, contractAddress, compiledArtifactRef?, idempotencyKey?, sponsorSessionId?) → { jobId, status }`
-
-Guarded anchoring, phase 1: records the opaque commitment on-chain (`attestGuarded` mode 0; a mempool observer learns nothing about the payload). After the job finalizes, run `anchorDocument` with the SAME sha256/metadata plus the `nonce` (phase 2). Note: the reveal proves against a ledger snapshot; if the contested attest lands between proving and application, the reveal fails once and succeeds on re-prove (takeover branch). **Rate limit:** shared with `anchorDocument`.
+Manual guarded anchoring, phase 1: records the opaque commitment on-chain (`attestGuarded` mode 0; a mempool observer learns nothing about the payload). `expiresAt` (UNIX seconds; more than a minute and at most 7 days ahead, default now + 24 h) is asserted by the vault against the block time at commit and at reveal: an unrevealed commitment cannot be held as an option. The record is bound to the committer; a copied commitment is inert. After the job finalizes, run `anchorDocument` with the SAME sha256/metadata plus the `nonce` (phase 2) before `expiresAt`. Note: the reveal proves against a ledger snapshot; if a plain attest lands between proving and application, the reveal fails once and succeeds on re-prove (takeover branch). **Rate limit:** shared with `anchorDocument`.
 
 ### `verifyDocument(documentId, providedSha256) → { verified, anchoredTxHash, anchoredAt, originalSha256 }` (function)
 
@@ -625,7 +651,7 @@ Synchronous helpers that turn structured data into the proof inputs the predicat
 
 ### `prepareDocumentProof(documentJson, proofFieldsJson, saltSeed?, compiledArtifactRef?) → { payloadHash, canonicalDocument, contentRoot, fields, emptyFields, schemaId, schema, leaves, opening }`
 
-Canonical JSON (recursively key-sorted) → blake2b-256 `payloadHash` (the value `anchorDocument` anchors), plus a SALTED Merkle `contentRoot` of depth log2(width) (4 on the 16-slot default, 5 on `attestation-vault-32`) over the ORDERED `proofFieldsJson` list (leaf index = list position; keep the order stable across anchor and proof) with per-field inclusion paths. `proofFieldsJson` is up to WIDTH `{ field, kind?, scale? }` entries (16 default, 32 with `compiledArtifactRef: 'attestation-vault-32'`): `kind: 'uint'` (default; numeric, scaled by `scale`, default 1000) or `kind: 'bytes'` (string value, entered as the blake2b-256 digest of the EXACT string; feeds the equality/membership actions; `scale` not allowed). `field` is a dot-separated path (numeric segments index arrays; a literal top-level key containing dots wins). Every leaf carries a per-slot salt derived from a per-document 32-byte seed (`saltSeed`: random by default, caller-supplied for a deterministic re-prepare of an already-anchored payload); absent values occupy the salted absent leaf (padding key `nightgate/empty-leaf/v2` ASCII zero-padded) and are reported in `emptyFields`, so a shared leaf layer reveals neither values nor the presence pattern. Leaf/node/descriptor hashing goes through the contract artifact's exported pure circuits, so root and schemaId are byte-identical to the in-circuit recompute. `fields` is a JSON array of `{ field, fieldKey, kind, value?, valueDigest?, salt, siblings, dirs }` (the `salt` feeds every single-field proof action as `fieldSalt`). `schemaId` is the schema ROOT over the width slot descriptors `{ fieldKey, kind, scale }` (returned as `schema`); it is anchored next to the content root and PROVEN by the comparison circuit. The schema id covers EXACTLY field keys, kinds, scales and their order, nothing from the document body: two documents prepared with identically-shaped field lists share ONE schemaId. When splitting a larger panel across several segment documents, put the segment into the field path itself (e.g. `seg02.locus03` instead of `locus03`) so each segment anchors a distinct, self-identifying schema; the panel name inside the document does not reach the schema id. `opening` (`{ saltSeed, slots[width] }`) is the cross-root witness bundle: STORE it with the document; losing the seed makes the anchored root unprovable, leaking it makes shared leaf hashes dictionary-testable. **Rate limit:** 120/hour per client.
+Canonical JSON (RFC 8785 member order: keys sorted by UTF-16 code units, integer-like keys included, so `"10"` precedes `"9"`; a payloadHash computed elsewhere must follow the same rule) → blake2b-256 `payloadHash` (the value `anchorDocument` anchors), plus a SALTED Merkle `contentRoot` of depth log2(width) (4 on the 16-slot default, 5 on `attestation-vault-32`) over the ORDERED `proofFieldsJson` list (leaf index = list position; keep the order stable across anchor and proof) with per-field inclusion paths. `proofFieldsJson` is up to WIDTH `{ field, kind?, scale? }` entries (16 default, 32 with `compiledArtifactRef: 'attestation-vault-32'`): `kind: 'uint'` (default; numeric, scaled by `scale`, default 1000) or `kind: 'bytes'` (string value, entered as the blake2b-256 digest of the EXACT string; feeds the equality/membership actions; `scale` not allowed). `field` is a dot-separated path (numeric segments index arrays; a literal top-level key containing dots wins). Every leaf carries a per-slot salt derived from a per-document 32-byte seed (`saltSeed`: random by default, caller-supplied for a deterministic re-prepare of an already-anchored payload); absent values occupy the salted absent leaf (padding key `nightgate/empty-leaf/v2` ASCII zero-padded) and are reported in `emptyFields`, so a shared leaf layer reveals neither values nor the presence pattern. Leaf/node/descriptor hashing goes through the contract artifact's exported pure circuits, so root and schemaId are byte-identical to the in-circuit recompute. `fields` is a JSON array of `{ field, fieldKey, kind, value?, valueDigest?, salt, siblings, dirs }` (the `salt` feeds every single-field proof action as `fieldSalt`). `schemaId` is the schema ROOT over the width slot descriptors `{ fieldKey, kind, scale }` (returned as `schema`); it is anchored next to the content root and PROVEN by the comparison circuit. The schema id covers EXACTLY field keys, kinds, scales and their order, nothing from the document body: two documents prepared with identically-shaped field lists share ONE schemaId. When splitting a larger panel across several segment documents, put the segment into the field path itself (e.g. `seg02.locus03` instead of `locus03`) so each segment anchors a distinct, self-identifying schema; the panel name inside the document does not reach the schema id. `opening` (`{ saltSeed, slots[width] }`) is the cross-root witness bundle: STORE it with the document; losing the seed makes the anchored root unprovable, leaking it makes shared leaf hashes dictionary-testable. **Rate limit:** 120/hour per client.
 
 ### `prepareMembershipSet(allowedValuesJson, value?, valueDigest?, compiledArtifactRef?) → { setRoot, memberCount, setSiblingsJson?, setDirsJson? }`
 
@@ -639,7 +665,7 @@ Prove statements about anchored field values without revealing them (on-chain-ve
 
 **Width variants:** every document-bound action takes its tree dimensions from the `compiledArtifactRef`'s registration (`slotWidth`, default 16). With `compiledArtifactRef: 'attestation-vault-32'` a document carries up to 32 provable fields under ONE root (depth-5 inclusion paths of 5 siblings/dirs, 32-entry schema/opening lists, `allowedMask` up to 32 bits, `k` up to 32), which is what a global "at least k of N differ" claim over a 17-32-field panel needs. Everything else is unchanged: same circuits, same claim maps, identical deploy cost; `proveDocumentComparison`'s prover doubles (72.9 MB, ~2x proving time) and the content-tree circuits (equality/membership/predicate) grow moderately with the deeper fold, while the attest/anchor/grant provers stay byte-identical. Cross-root proofs work only between documents of the SAME width, and both variants are separate deployed contracts: pick the width per document family and keep it. The 16-slot default behaves exactly as before.
 
-**Getting the 32er prover keys.** The npm package ships `attestation-vault-32` with its contract module, verifier keys and zkir, but not its 113 MB of prover keys (with them the tarball exceeds what the registry accepts). Deploying the contract and verifying its claims crawler-free need nothing else; proving its circuits on this machine, and serving them to browser provers over `/zk-config`, needs the keys on disk. Fetch them once, before the first proof, and restart the server:
+**Prover keys.** The npm package ships every contract's module, verifier keys, zkir and a `keys/manifest.json` (sha256 + size per prover key), but no prover key (the two vault lineages alone are 200 MB). Deploying a contract and verifying its claims crawler-free need nothing else; the first job that proves a circuit fetches the missing keys from `NIGHTGATE_ZK_ASSET_URL` (a `/zk-config` base; shipped contracts default to the release's git tag, whose layout is byte-for-byte the `/zk-config` layout), verifies them against the manifest and writes them next to the verifier keys. Serving them to browser provers over `/zk-config` needs them on disk as well. For an install without outbound access, fetch once:
 
 ```bash
 npx nightgate-fetch-keys attestation-vault-32
@@ -647,7 +673,7 @@ npx nightgate-fetch-keys attestation-vault-32
 npx nightgate-fetch-keys attestation-vault-32 --from https://host/zk-config/attestation-vault-32
 ```
 
-The default source is the release's own git tag, whose directory layout is byte-for-byte the `/zk-config` layout. Prover keys are part of the artifact GENERATION digest, so adding them changes what the alias resolves to: evidence recorded before the fetch fails the generation guard by design. Container images build from the repo and already contain the keys.
+The artifact generation digest pins the manifest, not the key bytes, so a fetch changes neither what the alias resolves to nor any recorded evidence, and the server needs no restart. Container images build from the repo and already contain the keys.
 
 ### `issueFieldPredicateAttestation(payloadHash, fieldKey, value, fieldSalt, predicate, threshold, sessionId, contractAddress, contentRoot?, schemaId?, siblingsJson?, dirsJson?, unit?, compiledArtifactRef?, idempotencyKey?, sponsorSessionId?) → { jobId, status, predicateAttestationId }`
 
@@ -837,7 +863,9 @@ Response:
 }
 ```
 
-### `estimateSendNightFee(sessionId, receiverAddress, amount, ttlIso?) → { fee, toLedger }`
+### `estimateSendNightFee(sessionId, receiverAddress, amount, ttlIso?, tokenTypeHex?) → { fee, toLedger }`
+
+`tokenTypeHex` (64 hex) prices a custom-token send instead of NIGHT, the same shape `sendNight` takes.
 
 Pre-flight DUST fee for a `sendNight` call. Builds the recipe in the worker (lightweight; no ZK proof generation, no submit), discards it after fee calc. Useful to gate the user on whether dust balance is sufficient before triggering the actual send.
 
@@ -895,11 +923,11 @@ Last `limit` (default 10, max 100) reorg events with depth, detected-at timestam
 
 ### `pauseCrawler() / resumeCrawler() / reindexFromHeight(height)` - actions
 
-Operator controls, `@requires: 'admin'` (since 0.5.2; unauthenticated or non-admin callers get 401/403). `reindexFromHeight` triggers a rollback to the specified height (including a recompute of the `NightBalances` projection for affected addresses) and a fresh catch-up from there. The read-only status/health/metrics functions above stay unrestricted for K8s probes and Prometheus.
+Operator controls, `@requires: 'admin'` (since 0.5.2; unauthenticated or non-admin callers get 401/403). `reindexFromHeight` triggers a rollback to the specified height (including a recompute of the `NightBalances` projection for affected addresses, and every job or submission outcome the indexer confirmer recorded at or above that height goes back to a pending chain status until the confirmer re-confirms it) and a fresh catch-up from there. The read-only status/health/metrics functions above stay unrestricted for K8s probes and Prometheus.
 
 ## Analytics
 
-`getBlockCount() / getTransactionCount() / getContractCount() / getAverageTransactionsPerBlock()` - simple aggregate queries over the indexed entities.
+`getBlockCount() / getTransactionCount() / getContractCount() / getAverageTransactionsPerBlock()` - simple aggregate queries over the indexed entities. `getContractCount` counts distinct decoded contract addresses, which is 0 until the ledger payload is decoded; `ContractStatistics` counts actions per type.
 
 ## Admin
 
@@ -962,6 +990,8 @@ Error responses follow OData's `{ error: { code, message } }` envelope. For subm
 
 Every other 5xx is a genuine server fault and stays sanitised.
 
+**Where the classification happens.** The wallet worker classifies a submit failure ONCE, against the SDK error objects it holds, into a closed set that rides over its RPC as data (`code`, `ledgerCode`, `retryable`, batch `calls`, the cause chain); the main thread branches on that code, never on message text (`srv/midnight/submit-error-classification.ts`). The set: `pre-mempool-reject` (the node refused before the mempool, fee unspent; `ledgerCode` `1010/<n>`, `1014`, `1016` or `intent-rejected`), `dust-race` (`1010/170`, `1010/196` or `pool-invalid`; rebuild-retryable), `transport` (the send died before an answer; `closing-socket` when it never left), `ambiguous` (the broadcast may have landed; reconciled by identifier, never rebuilt), `landed-not-applied`, `policy` (sponsor shape or allow-list refusal), `causality` (batch causality refusal before proving, `calls` in apply order), `internal`. The job codes below are derived from it.
+
 Codes returned by `classifySubmissionError` (`srv/submission/TransactionSubmitter.ts`):
 
 | Code | Retryable | Trigger |
@@ -969,7 +999,12 @@ Codes returned by `classifySubmissionError` (`srv/submission/TransactionSubmitte
 | `TxFailed` | no | SDK `TxFailedError` (on-chain status wasn't `SucceedEntirely`) |
 | `1014` | no | Substrate "invalid transaction" (matches `1014` or `invalid transaction` in the error message) |
 | `1016` | yes (preprod) / no (mainnet) | "Immediately Dropped" - preprod transient, mainnet has a known deterministic-rejection issue |
-| `NetworkOrTimeout` | yes | `ECONNREFUSED`, `ECONNRESET`, `ENOTFOUND`, `ETIMEDOUT`, `socket hang up`, `timeout` |
+| `NetworkOrTimeout` | yes | worker code `transport`: `ECONNREFUSED`, `ECONNRESET`, `ENOTFOUND`, `ETIMEDOUT`, `socket hang up`, `timeout` |
+| `SubmitAmbiguous` | no | worker code `ambiguous`: the watch died and the indexer did not know the transaction; the job ends `reconciliation_required` and is resolved by identifier, never by a rebuild |
+| `PoolInvalid` | yes | worker code `dust-race` with `pool-invalid`: pool status Invalid without a ledger code; one rebuild on the sponsored paths |
+| `SubmitIntentRejected` | no | worker code `pre-mempool-reject` with `intent-rejected`: the main thread could not persist the announced identifier, nothing was broadcast |
+| `SponsorPolicyRefused` | no | worker code `policy`: the sponsor's shape check or allow-list refused the transaction |
+| `BatchCausalityViolation` | no | worker code `causality`: refused before proving; `calls` (name, segId, stages in apply order) rides on the classification and in the message |
 | `ContractTypeError` / `IncompleteCallTxPrivateStateConfig` / `IncompleteFindContractPrivateStateConfig` | no | SDK contract-config errors (classified by the thrown error's `name`) |
 | `WalletSigningNotAvailable` | no | Session has no encrypted seed key |
 | `<error name>` (default) | no | Any otherwise-unrecognized error - falls back to the thrown error's `name`, assumed non-retryable |

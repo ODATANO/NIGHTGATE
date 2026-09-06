@@ -7,11 +7,18 @@ using { midnight } from '../db/schema';
 @requires: 'admin'
 service NightgateAdminService {
 
+    /**
+     * Read-only: every write goes through an action. A generic PATCH/DELETE
+     * would bypass invalidateSession's facade eviction.
+     */
+    @readonly
     entity WalletSessions as projection on midnight.WalletSessions excluding {
         encryptedViewingKey,    // Encrypted viewing key, never exposed via admin API
         encryptedSeedKey        // Encrypted signing seed, never exposed via admin API
     };
 
+    /** Read-only: roles change only through grantRole / revokeRole (authority-gated). */
+    @readonly
     entity DisclosureRoles as projection on midnight.DisclosureRoles;
 
     /**
@@ -77,7 +84,7 @@ service NightgateAdminService {
                             artifactPath: String,
                             zkConfigPath: String,
                             privateStateId: String,
-                            slotWidth: Integer // optional; 8 | 16 | 32, default 16
+                            slotWidth: Integer // optional; 16 | 32, default 16
     ) returns {
         name           : String;
         source         : String;
@@ -94,15 +101,6 @@ service NightgateAdminService {
         removed : Boolean;
     };
 
-    /**
-     * Job queue in one call: counts per status plus the error codes that are
-     * piling up, over the last `windowHours` (default 24, max 720).
-     *
-     * The cheap read for a dashboard that wants the shape of the queue without
-     * paging the whole BackgroundJobs entity. `topErrors` is what turns "many
-     * jobs failed" into a diagnosis, e.g. a run of `1010/188` meaning batched
-     * calls are crossing the guaranteed/fallible boundary.
-     */
     /**
      * CPU profile of the wallet worker thread (0.21.4): samples the running
      * worker for `seconds` (1..120, default 20) with the in-thread V8 profiler
@@ -129,6 +127,15 @@ service NightgateAdminService {
         gc            : { count: Integer; totalMs: Integer; byKind: String }; // byKind: JSON { kind: { count, ms } }
     };
 
+    /**
+     * Job queue in one call: counts per status plus the error codes that are
+     * piling up, over the last `windowHours` (default 24, max 720).
+     *
+     * The cheap read for a dashboard that wants the shape of the queue without
+     * paging the whole BackgroundJobs entity. `topErrors` is what turns "many
+     * jobs failed" into a diagnosis, e.g. a run of `1010/188` meaning batched
+     * calls are crossing the guaranteed/fallible boundary.
+     */
     function getJobStats(windowHours: Integer) returns {
         windowHours         : Integer;
         since               : Timestamp;

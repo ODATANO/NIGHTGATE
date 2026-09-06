@@ -20,7 +20,7 @@ export {
 // Providers + typed call helpers.
 export { FetchZkConfigProvider } from './zk-config.mjs';
 export { InMemoryPrivateStateProvider } from './private-state.mjs';
-export { createNightgateConnectorProviders, buildProofProvider } from './providers.mjs';
+export { createNightgateConnectorProviders, buildProofProvider, resolveManifestUrl } from './providers.mjs';
 export {
     prepareRevokeDisclosure,
     prepareGrantDisclosure,

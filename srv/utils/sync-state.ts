@@ -11,6 +11,7 @@ const { SELECT, INSERT, UPDATE } = cds.ql;
 import { SyncState, Blocks } from '#cds-models/midnight';
 import { getConfiguredNightgateNodeUrl, resolveNightgateRuntimeConfig, getNightgatePluginConfig } from './nightgate-config';
 import { redactUrlCredentials } from './redact-url';
+import { configString } from './config';
 
 /**
  * Thrown when the database's SyncState row belongs to a DIFFERENT network
@@ -50,7 +51,7 @@ export async function ensureSyncStateSingleton(db: cds.DatabaseService, nodeUrl?
         // NIGHTGATE_ASSUME_DB_NETWORK to the configured network.
         if (!existing.networkId) {
             const anyBlock = await db.run(SELECT.one.from(Blocks));
-            const assumed = process.env.NIGHTGATE_ASSUME_DB_NETWORK;
+            const assumed = configString('NIGHTGATE_ASSUME_DB_NETWORK');
             if (anyBlock && assumed !== network) {
                 throw new Error(
                     `This database carries indexed chain data but no recorded network binding ` +
@@ -89,7 +90,8 @@ export async function ensureSyncStateSingleton(db: cds.DatabaseService, nodeUrl?
             }));
         } catch (err: any) {
             // Race condition: another service instance inserted first, safe to ignore
-            if (!err.message?.includes('UNIQUE constraint')) throw err;
+            // SQLite: "UNIQUE constraint failed"; PostgreSQL: "duplicate key value violates unique constraint".
+            if (!/unique constraint|duplicate key/i.test(String(err.message ?? ''))) throw err;
         }
     }
 }

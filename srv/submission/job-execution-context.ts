@@ -1,5 +1,23 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 
+/**
+ * Job errorCode for a broadcast attempt provably rejected before inclusion
+ * whose bookkeeping (attempt row REJECTED, deploy reservation refunded, hash
+ * off the job) did not commit. The job parks in reconciliation_required under
+ * this code and `settleRejectedSponsorAttempts` re-runs the transaction on
+ * every reconciliation tick. The indexer cannot resolve such a job: the
+ * identifier never reached a mempool. Raised by both submission channels.
+ */
+export const REJECTED_ATTEMPT_BOOKKEEPING_PENDING = 'REJECTED_ATTEMPT_BOOKKEEPING_PENDING';
+
+export class SponsorAttemptBookkeepingPendingError extends Error {
+    readonly code = REJECTED_ATTEMPT_BOOKKEEPING_PENDING;
+    constructor(message: string, public readonly details: { submissionId: string; txHash?: string; grantId?: string; refund: number }) {
+        super(message);
+        this.name = 'SponsorAttemptBookkeepingPendingError';
+    }
+}
+
 export interface ExternalSubmissionHandle {
     submissionId?: string;
     txHash?: string;
@@ -13,8 +31,6 @@ export type StatementRunner = { run: (q: unknown) => Promise<unknown> };
 interface JobExecutionContext {
     reportExternalExecution: (handle: ExternalSubmissionHandle) => Promise<void>;
     reportSubmitted: (handle: ExternalSubmissionHandle) => Promise<void>;
-    /** The announced attempt was provably rejected before inclusion: drop its hash from the job (see markJobSubmissionRejected). */
-    reportSubmissionRejected: (handle: ExternalSubmissionHandle) => Promise<void>;
     /** Boundary crossing + identifier in one statement on the caller's transaction (see markJobBroadcastOn). */
     markBroadcastOn: (runner: StatementRunner, handle: ExternalSubmissionHandle) => Promise<void>;
     /** Rejected identifier off the job, CAS-guarded, on the caller's transaction (see markJobSubmissionRejectedOn). */
@@ -38,16 +54,6 @@ export async function reportExternalSubmission(handle: ExternalSubmissionHandle)
 /** Marks the point after which a crash cannot prove that no broadcast occurred. */
 export async function reportExternalExecution(handle: ExternalSubmissionHandle): Promise<void> {
     await storage.getStore()?.reportExternalExecution(handle);
-}
-
-/**
- * The announced broadcast attempt was rejected BEFORE inclusion (a 1010 node
- * reject, pool status Invalid, the send died on a closing socket, the main
- * thread nacked the intent): nothing of it can be on-chain, so the job must
- * not keep its hash as "possibly executed". No-op outside a background job.
- */
-export async function reportSubmissionRejected(handle: ExternalSubmissionHandle): Promise<void> {
-    await storage.getStore()?.reportSubmissionRejected(handle);
 }
 
 /**

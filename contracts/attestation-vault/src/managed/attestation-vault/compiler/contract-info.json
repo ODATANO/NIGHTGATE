@@ -261,6 +261,13 @@
             "type-name": "Bytes",
             "length": 32
           }
+        },
+        {
+          "name": "expires_at",
+          "type": {
+            "type-name": "Uint",
+            "maxval": 18446744073709551615
+          }
         }
       ],
       "result-type": {
@@ -805,8 +812,8 @@
     {
       "name": "attestation_owners",
       "index": [
-        1,
-        0
+        0,
+        1
       ],
       "exported": true,
       "storage": "Map",
@@ -823,7 +830,7 @@
       "name": "disclosures",
       "index": [
         1,
-        1
+        0
       ],
       "exported": true,
       "storage": "Map",
@@ -847,7 +854,7 @@
       "name": "passport_bindings",
       "index": [
         1,
-        2
+        1
       ],
       "exported": true,
       "storage": "Map",
@@ -864,7 +871,7 @@
       "name": "registrar",
       "index": [
         1,
-        3
+        2
       ],
       "exported": true,
       "storage": "Cell",
@@ -877,7 +884,7 @@
       "name": "passport_owners",
       "index": [
         1,
-        4
+        3
       ],
       "exported": true,
       "storage": "Map",
@@ -894,7 +901,7 @@
       "name": "content_roots",
       "index": [
         1,
-        5
+        4
       ],
       "exported": true,
       "storage": "Map",
@@ -911,7 +918,7 @@
       "name": "field_predicate_results",
       "index": [
         1,
-        6
+        5
       ],
       "exported": true,
       "storage": "Map",
@@ -927,7 +934,7 @@
       "name": "field_equality_results",
       "index": [
         1,
-        7
+        6
       ],
       "exported": true,
       "storage": "Map",
@@ -943,7 +950,7 @@
       "name": "field_membership_results",
       "index": [
         1,
-        8
+        7
       ],
       "exported": true,
       "storage": "Map",
@@ -959,7 +966,7 @@
       "name": "document_integrity_results",
       "index": [
         1,
-        9
+        8
       ],
       "exported": true,
       "storage": "Map",
@@ -975,7 +982,7 @@
       "name": "document_diff_results",
       "index": [
         1,
-        10
+        9
       ],
       "exported": true,
       "storage": "Map",
@@ -991,7 +998,7 @@
       "name": "content_schemas",
       "index": [
         1,
-        11
+        10
       ],
       "exported": true,
       "storage": "Map",
@@ -1008,7 +1015,7 @@
       "name": "attest_commits",
       "index": [
         1,
-        12
+        11
       ],
       "exported": true,
       "storage": "Map",
@@ -1033,6 +1040,13 @@
               "type-name": "Uint",
               "maxval": 18446744073709551615
             }
+          },
+          {
+            "name": "expires_at",
+            "type": {
+              "type-name": "Uint",
+              "maxval": 18446744073709551615
+            }
           }
         ]
       }
@@ -1041,7 +1055,7 @@
       "name": "attestation_seqs",
       "index": [
         1,
-        13
+        12
       ],
       "exported": true,
       "storage": "Map",
@@ -1058,13 +1072,26 @@
       "name": "attest_seq_next",
       "index": [
         1,
-        14
+        13
       ],
       "exported": true,
       "storage": "Cell",
       "type": {
         "type-name": "Uint",
         "maxval": 18446744073709551615
+      }
+    },
+    {
+      "name": "guarded_attestations",
+      "index": [
+        1,
+        14
+      ],
+      "exported": true,
+      "storage": "Set",
+      "type": {
+        "type-name": "Bytes",
+        "length": 32
       }
     }
   ]

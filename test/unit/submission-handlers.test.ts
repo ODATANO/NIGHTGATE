@@ -72,7 +72,7 @@ vi.mock('../../srv/submission/background-jobs', async (importOriginal) => ({
             command: JSON.stringify(command), parentJobId: args.parent.ID, workflowStep: args.step
         });
     },
-    registerBackgroundJobProcessor: (kind: string, version: number, processor: (command: unknown, row: any) => Promise<unknown>) => registeredProcessors.set(`${kind}\0${version}`, processor),
+    registerBackgroundJobProcessor: (kind: string, version: number, _traits: unknown, processor: (command: unknown, row: any) => Promise<unknown>) => registeredProcessors.set(`${kind}\0${version}`, processor),
     registerBackgroundJobReconciliationFinalizer: (kind: string, version: number, finalizer: (command: unknown, row: any, evidence: any) => Promise<unknown>) => registeredFinalizers.set(`${kind}\0${version}`, finalizer)
 }));
 
@@ -749,7 +749,7 @@ describe('anchorDocument', () => {
         expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/contractAddress/));
     });
 
-    test('happy path: INSERT, submitter.call, UPDATE all run; handler returns { jobId, status, documentId }', async () => {
+    test('default lane (guarded): commit + reveal children, handler returns { jobId, status, documentId }', async () => {
         const submitter = makeSuccessfulSubmitter();
         const { srv, db } = setupHandlersWithDb({ submitterFactory: () => submitter });
         const req = makeReq(VALID_ANCHOR_ARGS());
@@ -757,20 +757,58 @@ describe('anchorDocument', () => {
         const result: any = await srv.handlers['anchorDocument'](req);
 
         expect(req.reject).not.toHaveBeenCalled();
-        // New shape: jobId + status + documentId (the documentId stays sync
-        // so callers can poll the Documents row directly).
+        // jobId + status + documentId (the documentId stays sync so callers
+        // can poll the Documents row directly); the job is the guarded workflow.
         expect(result).toEqual({
-            jobId: 'job-anchorDocument-test',
+            jobId: 'job-anchorDocumentGuarded-test',
             status: 'pending',
             documentId: expect.any(String)
         });
-        expect(result.documentId.length).toBeGreaterThan(0);
+        // The server-side nonce is random per request and must stay OUT of the
+        // idempotency payload (a retry under the same key has to dedupe) and
+        // out of the request snapshot.
+        const started = mockStartJob.mock.calls.at(-1)![0];
+        expect(started.kind).toBe('anchorDocumentGuarded');
+        expect(started.command).toMatchObject({ op: 'anchorGuardedWorkflow', nonce: expect.stringMatching(/^[0-9a-f]{64}$/), expiresAt: expect.any(Number) });
+        expect(started.idempotencyPayload).toMatchObject({ lane: 'guarded', guardedNonce: null });
+        expect(JSON.stringify(started.idempotencyPayload)).not.toContain(started.command.nonce);
+        expect(JSON.stringify(started.request)).not.toContain(started.command.nonce);
+        expect(started.command.expiresAt).toBeGreaterThan(Math.floor(Date.now() / 1000) + 3600);
+        expect(started.command.expiresAt).toBeLessThanOrEqual(Math.floor(Date.now() / 1000) + 7 * 86400);
 
-        // INSERT (sync, on req.tx) + UPDATE (inside work fn, exercised by
-        // the startJob mock invoking work eagerly) = 2 db.run calls.
+        // INSERT (sync) + UPDATE (reveal child, run eagerly by the mocks) = 2 db.run calls.
         expect(db.run).toHaveBeenCalledTimes(2);
 
-        // submitter.call was invoked with circuit='attest' and Uint8Array args
+        // Two transactions: attestGuarded mode 0 (commit, expiry as the 5th
+        // arg) then mode 1 (reveal, expiry dummy 0).
+        expect(submitter.call).toHaveBeenCalledTimes(2);
+        const commit = (submitter.call as Mock).mock.calls[0][0];
+        const reveal = (submitter.call as Mock).mock.calls[1][0];
+        expect(commit.circuit).toBe('attestGuarded');
+        expect(commit.args).toHaveLength(5);
+        expect(commit.args[0]).toBe(0n);
+        expect(commit.args[1]).toBeInstanceOf(Uint8Array);
+        expect(commit.args[4]).toBe(BigInt(started.command.expiresAt));
+        expect(reveal.circuit).toBe('attestGuarded');
+        expect(reveal.args).toHaveLength(5);
+        expect(reveal.args[0]).toBe(1n);
+        expect(reveal.args[3]).toBeInstanceOf(Uint8Array);
+        expect(Buffer.from(reveal.args[3]).toString('hex')).toBe(started.command.nonce);
+        expect(reveal.args[4]).toBe(0n);
+        const children = childCommandLog.filter(c => c.kind === 'anchorCommit' || c.kind === 'anchorReveal');
+        expect(children.map(c => c.kind)).toEqual(['anchorCommit', 'anchorReveal']);
+    });
+
+    test('guarded: false runs ONE plain attest with Uint8Array args (hashes that are public anyway)', async () => {
+        const submitter = makeSuccessfulSubmitter();
+        const { srv, db } = setupHandlersWithDb({ submitterFactory: () => submitter });
+        const req = makeReq({ ...VALID_ANCHOR_ARGS(), guarded: false });
+
+        const result: any = await srv.handlers['anchorDocument'](req);
+
+        expect(req.reject).not.toHaveBeenCalled();
+        expect(result).toEqual({ jobId: 'job-anchorDocument-test', status: 'pending', documentId: expect.any(String) });
+        expect(db.run).toHaveBeenCalledTimes(2);
         expect(submitter.call).toHaveBeenCalledTimes(1);
         const callArgs = (submitter.call as Mock).mock.calls[0][0];
         expect(callArgs.circuit).toBe('attest');
@@ -781,6 +819,20 @@ describe('anchorDocument', () => {
         expect(callArgs.args[0]).toHaveLength(32);
         expect(callArgs.args[1]).toBeInstanceOf(Uint8Array);
         expect(callArgs.args[1]).toHaveLength(32);
+    });
+
+    test('with a nonce the anchor is the REVEAL of an earlier commit (5 args, expiry dummy 0)', async () => {
+        const submitter = makeSuccessfulSubmitter();
+        const { srv } = setupHandlersWithDb({ submitterFactory: () => submitter });
+        const req = makeReq({ ...VALID_ANCHOR_ARGS(), nonce: 'c'.repeat(64) });
+        const result: any = await srv.handlers['anchorDocument'](req);
+        expect(result.jobId).toBe('job-anchorDocument-test');
+        expect(submitter.call).toHaveBeenCalledTimes(1);
+        const callArgs = (submitter.call as Mock).mock.calls[0][0];
+        expect(callArgs.circuit).toBe('attestGuarded');
+        expect(callArgs.args).toHaveLength(5);
+        expect(callArgs.args[0]).toBe(1n);
+        expect(callArgs.args[4]).toBe(0n);
     });
 
     test('reconciliation finalizer restores the document projection and typed result without submitting', async () => {

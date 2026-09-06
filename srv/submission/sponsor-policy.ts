@@ -8,6 +8,7 @@
  */
 import fs from 'node:fs';
 import cds from '@sap/cds';
+import { configList, configFlag, configString } from '../utils/config';
 
 const log = cds.log('nightgate:sponsor-policy');
 
@@ -95,23 +96,18 @@ export function validateTokenTypeList(name: string, raw: unknown): string[] {
 
 // ---- Platform floor --------------------------------------------------------
 
-const parseEnvList = (raw: string | undefined): string[] =>
-    String(raw ?? '').split(',').map(s => s.trim()).filter(Boolean);
-
-const envFlag = (raw: string | undefined): boolean => /^(1|true|yes|on)$/i.test(String(raw ?? '').trim());
-
 function envPolicy(): SponsorPolicy {
     let allowedTokenTypes: string[];
     try {
-        allowedTokenTypes = validateTokenTypeList('NIGHTGATE_SPONSOR_ALLOWED_TOKEN_TYPES', parseEnvList(process.env.NIGHTGATE_SPONSOR_ALLOWED_TOKEN_TYPES));
+        allowedTokenTypes = validateTokenTypeList('NIGHTGATE_SPONSOR_ALLOWED_TOKEN_TYPES', configList('NIGHTGATE_SPONSOR_ALLOWED_TOKEN_TYPES'));
     } catch (e) {
         // Fail closed and say why, instead of sponsoring offers under a list that silently lost an entry.
         throw new SponsorPolicyUnavailableError(`${(e as Error).message}; refusing to sponsor`);
     }
     return {
-        allowedContracts: parseEnvList(process.env.NIGHTGATE_SPONSOR_ALLOWED_CONTRACTS),
-        allowedCircuits: parseEnvList(process.env.NIGHTGATE_SPONSOR_ALLOWED_CIRCUITS),
-        allowDeploy: envFlag(process.env.NIGHTGATE_SPONSOR_ALLOW_DEPLOY),
+        allowedContracts: configList('NIGHTGATE_SPONSOR_ALLOWED_CONTRACTS'),
+        allowedCircuits: configList('NIGHTGATE_SPONSOR_ALLOWED_CIRCUITS'),
+        allowDeploy: configFlag('NIGHTGATE_SPONSOR_ALLOW_DEPLOY'),
         allowedTokenTypes
     };
 }
@@ -165,7 +161,7 @@ function readPolicyFile(filePath: string): SponsorPolicy {
  * no good policy was loaded before.
  */
 export function getGlobalSponsorPolicy(): SponsorPolicy {
-    const filePath = process.env.NIGHTGATE_SPONSOR_POLICY_FILE?.trim();
+    const filePath = configString('NIGHTGATE_SPONSOR_POLICY_FILE');
     if (!filePath) return envPolicy();
 
     let stat: fs.Stats | null = null;

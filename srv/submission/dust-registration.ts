@@ -12,7 +12,7 @@
  * worker for `cacheKey` via `getOrBuildWalletFacade(...)` first.
  */
 
-import { walletRegisterDustGeneration, walletDeregisterDustGeneration, type RegisterDustGenerationOutcome } from '../midnight/wallet-worker-client';
+import { walletRegisterDustGeneration, walletDeregisterDustGeneration, type RegisterDustGenerationOutcome, type SubmitIntentHook } from '../midnight/wallet-worker-client';
 import type { WalletFacadeBuildArgs } from './wallet-facade-builder';
 
 export interface RegisterDustGenerationArgs {
@@ -32,6 +32,8 @@ export interface RegisterDustGenerationArgs {
      * started this long before).
      */
     syncTimeoutMs?: number;
+    /** Pre-broadcast handshake: persist the announced identifier, then the worker sends. */
+    onSubmitIntent?: SubmitIntentHook;
 }
 
 /** The worker's outcome report (RegisterDustGenerationOutcome in wallet-worker-client). */
@@ -46,7 +48,7 @@ export async function registerNightUtxosForDust(
         sessionId:           args.cacheKey,
         dustReceiverAddress: args.dustReceiverAddress,
         syncTimeoutMs:       args.syncTimeoutMs
-    });
+    }, args.onSubmitIntent);
 }
 
 // ---- Deregister ----------------------------------------------------------
@@ -66,6 +68,8 @@ export interface DeregisterDustGenerationArgs {
      * for a wallet whose whole generation is delegated away (own dust 0).
      */
     sponsorCacheKey?: string;
+    /** Pre-broadcast handshake: persist the announced identifier, then the worker sends. */
+    onSubmitIntent?: SubmitIntentHook;
 }
 
 export interface DeregisterDustGenerationResult {
@@ -84,5 +88,5 @@ export async function deregisterNightUtxosFromDust(
         sessionId:        args.cacheKey,
         syncTimeoutMs:    args.syncTimeoutMs,
         sponsorSessionId: args.sponsorCacheKey
-    });
+    }, args.onSubmitIntent);
 }

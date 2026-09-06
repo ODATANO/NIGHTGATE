@@ -1,11 +1,3 @@
-/**
- * Minimal SCALE codec helpers for Substrate extrinsic parsing.
- *
- * Includes:
- * - compact integer decoding
- * - pallet/call extraction
- * - signed participant extraction (sender/receiver/amount for transfer-like calls)
- */
 
 interface ParsedAddress {
     address: string;
@@ -19,15 +11,6 @@ interface ParsedExtrinsicCore {
     callIndex: number;
     argsOffset: number;
     senderAddress?: string;
-}
-
-export interface ExtrinsicParticipantInfo {
-    isSigned: boolean;
-    palletIndex: number;
-    callIndex: number;
-    senderAddress?: string;
-    receiverAddress?: string;
-    amount?: string;
 }
 
 /**
@@ -209,6 +192,13 @@ function parseExtrinsicCore(hex: string): ParsedExtrinsicCore | null {
     };
 }
 
+/** Pallet/call index plus where the call arguments start (for decoding an inherent's payload). */
+export function parseExtrinsicCall(hex: string): { buf: Buffer; palletIndex: number; callIndex: number; argsOffset: number } | null {
+    const core = parseExtrinsicCore(hex);
+    if (!core) return null;
+    return { buf: core.buf, palletIndex: core.palletIndex, callIndex: core.callIndex, argsOffset: core.argsOffset };
+}
+
 /**
  * Parse a hex-encoded Substrate extrinsic to extract pallet_index and call_index.
  * Returns null on parse failure (safe fallback to existing heuristics).
@@ -228,28 +218,3 @@ export function parseExtrinsicCallIndices(hex: string): { palletIndex: number; c
  * This parser is intentionally conservative: receiver/amount are set only when
  * the first call args decode as MultiAddress + Compact<Balance>.
  */
-export function parseExtrinsicParticipantInfo(hex: string): ExtrinsicParticipantInfo | null {
-    const core = parseExtrinsicCore(hex);
-    if (!core) return null;
-
-    const result: ExtrinsicParticipantInfo = {
-        isSigned: core.isSigned,
-        palletIndex: core.palletIndex,
-        callIndex: core.callIndex,
-        senderAddress: core.senderAddress
-    };
-
-    const destination = parseAddress(core.buf, core.argsOffset);
-    if (!destination) {
-        return result;
-    }
-
-    const amount = decodeCompactBigInt(core.buf, destination.nextOffset);
-    if (!amount) {
-        return result;
-    }
-
-    result.receiverAddress = destination.address;
-    result.amount = amount[0].toString();
-    return result;
-}

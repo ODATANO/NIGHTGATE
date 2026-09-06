@@ -65,6 +65,8 @@ function matchesWhere(row: any, where: Record<string, unknown>): boolean {
             if (excluded === null ? row[k] == null : row[k] === excluded) return false;
         } else if (v && typeof v === 'object' && '>' in (v as any)) {
             if (!(row[k] > (v as any)['>'])) return false;
+        } else if (v && typeof v === 'object' && '<' in (v as any)) {
+            if (row[k] == null || !(row[k] < (v as any)['<'])) return false;
         } else if (v && typeof v === 'object' && '>=' in (v as any)) {
             if (!(row[k] >= (v as any)['>='])) return false;
         } else if (v === null ? row[k] != null : row[k] !== v) {
@@ -281,8 +283,11 @@ import {
     SponsorAttemptBookkeepingPendingError,
     registerChainOutcomeConfirmer,
     __resetForTests,
-    __setStatusWriteBackoffForTests
+    __setStatusWriteBackoffForTests,
+    __workflowParentKindsForTests,
+    declareJobKind
 } from '../../srv/submission/background-jobs';
+import { JOB_KIND_TRAITS, LIGHT_KIND } from '../../srv/submission/job-kinds';
 import { reportExternalExecution, reportExternalSubmission } from '../../srv/submission/job-execution-context';
 
 async function flushSpawn(): Promise<void> {
@@ -299,13 +304,15 @@ beforeEach(() => {
     lockInjector.failUpdates = 0;
     lockInjector.matchStatus = null;
     __resetForTests();
+    // The production kinds carry their table traits here too (concurrency class, parent set).
+    for (const [kind, traits] of Object.entries(JOB_KIND_TRAITS)) declareJobKind(kind, traits);
 });
 
 // ---- startJob: insert + spawn + transitions --------------------------------
 
 describe('startJob: insert row + return jobId', () => {
     test('marks a partially effective workflow for reconciliation instead of failed', async () => {
-        registerBackgroundJobProcessor('partialWorkflow', 1, async () => {
+        registerBackgroundJobProcessor('partialWorkflow', 1, LIGHT_KIND, async () => {
             throw new WorkflowReconciliationRequiredError('step one succeeded; step two failed');
         });
         const ret = await startJob({
@@ -326,7 +333,7 @@ describe('startJob: insert row + return jobId', () => {
         // it `failed` and the parent reconciler never looks at it again. With
         // step one already on chain, a retry would spend those fees twice.
         const processor = vi.fn(async () => ({ txHash: '0xstep-one' }));
-        registerBackgroundJobProcessor('childStep', 1, processor);
+        registerBackgroundJobProcessor('childStep', 1, LIGHT_KIND, processor);
         const parent = {
             ID: 'parent-busy', kind: 'workflow', sessionId: 'sess-1', requestedBy: 'alice', commandVersion: 1
         } as any;
@@ -352,7 +359,7 @@ describe('startJob: insert row + return jobId', () => {
     test('an admission that stays locked with NOTHING done yet fails cleanly', async () => {
         // Nothing was written and nothing submitted, so this is busy, not
         // ambiguous: it must not drag an operator into reconciliation.
-        registerBackgroundJobProcessor('childStep', 1, vi.fn(async () => ({ txHash: '0xnope' })));
+        registerBackgroundJobProcessor('childStep', 1, LIGHT_KIND, vi.fn(async () => ({ txHash: '0xnope' })));
         const parent = {
             ID: 'parent-clean', kind: 'workflow', sessionId: 'sess-1', requestedBy: 'alice', commandVersion: 1
         } as any;
@@ -369,7 +376,7 @@ describe('startJob: insert row + return jobId', () => {
 
     test('deduplicates a deterministic workflow child and executes it only once', async () => {
         const processor = vi.fn(async () => ({ txHash: '0xchild' }));
-        registerBackgroundJobProcessor('childStep', 1, processor);
+        registerBackgroundJobProcessor('childStep', 1, LIGHT_KIND, processor);
         const parent = {
             ID: 'parent-1', kind: 'workflow', sessionId: 'sess-1', requestedBy: 'alice',
             commandVersion: 1
@@ -392,7 +399,7 @@ describe('startJob: insert row + return jobId', () => {
     });
     test('executes a versioned persisted command without an in-memory work closure', async () => {
         const processor = vi.fn(async (command: unknown) => ({ echoed: command }));
-        registerBackgroundJobProcessor('durableTest', 1, processor);
+        registerBackgroundJobProcessor('durableTest', 1, LIGHT_KIND, processor);
         const ret = await startJob({
             kind: 'durableTest', sessionId: 'sess-1', requestedBy: 'alice',
             request: { value: 7 }, commandVersion: 1, command: { value: 7 }
@@ -407,7 +414,7 @@ describe('startJob: insert row + return jobId', () => {
 
     test('encrypts private commands at rest and decrypts only for the processor', async () => {
         const processor = vi.fn(async () => ({ ok: true }));
-        registerBackgroundJobProcessor('encryptedTest', 1, processor);
+        registerBackgroundJobProcessor('encryptedTest', 1, LIGHT_KIND, processor);
         const ret = await startJob({
             kind: 'encryptedTest', sessionId: 'sess-1', requestedBy: 'alice',
             request: { secretPresent: true }, commandVersion: 1,
@@ -609,37 +616,45 @@ describe('startJob: insert row + return jobId', () => {
         });
     });
 
-    test('automatically succeeds a reconciliation job from exact finalized/indexed evidence', async () => {
+    test('resolves a reconciliation job from the indexer confirmer and records the inclusion coordinates', async () => {
         const ret = await startJob({
             kind: 'deployContract', sessionId: 'sess-1', request: {},
             work: async () => {
                 await reportExternalExecution({ submissionId: 'sub-final' });
-                await reportExternalSubmission({ submissionId: 'sub-final', txHash: '0xfinal' });
+                await reportExternalSubmission({ submissionId: 'sub-final', txHash: '00final' });
                 throw new Error('reply lost');
             }
         });
         await flushSpawn();
         evidenceTables.get('midnight.PendingSubmissions')!.push({
-            ID: 'sub-final', txHash: '0xfinal', contractAddress: '0xcontract', status: 'finalized'
+            ID: 'sub-final', txHash: '00final', contractAddress: '0xcontract', status: 'included'
         });
-        evidenceTables.get('midnight.Transactions')!.push({ ID: 'indexed-1', hash: '0xfinal' });
-        evidenceTables.get('midnight.TransactionResults')!.push({
-            transaction_ID: 'indexed-1', status: 'SUCCESS', outcomeSource: 'substrate-system-events'
-        });
-
-        expect(await reconcileBackgroundJobs()).toBe(1);
-        expect(rows.get(ret.jobId)).toMatchObject({ status: 'succeeded', errorCode: null });
-        expect(rows.get(ret.jobId)?.chainStatus).toBe('success');
-        expect(JSON.parse(rows.get(ret.jobId)!.result!)).toMatchObject({
-            reconciled: true, txHash: '0xfinal', contractAddress: '0xcontract'
-        });
+        // The crawler cannot correlate the job (it indexes extrinsic hashes);
+        // the confirmer answers by the ledger identifier the job stores.
+        registerChainOutcomeConfirmer(async () => ({ status: 'success', blockHeight: 4711, blockHash: '0xb4711', indexerTxHash: '0xi1' }));
+        try {
+            expect(await reconcileBackgroundJobs()).toBe(0);
+            let n = await confirmChainOutcomesViaIndexer();
+            if (n === 0) n = await confirmChainOutcomesViaIndexer();
+            expect(n).toBe(1);
+        } finally {
+            registerChainOutcomeConfirmer(null);
+        }
+        expect(rows.get(ret.jobId)).toMatchObject({ status: 'succeeded', errorCode: null, chainStatus: 'success', chainBlockHeight: 4711, chainBlockHash: '0xb4711', indexerTxHash: '0xi1' });
+        expect(JSON.parse(rows.get(ret.jobId)!.result!)).toMatchObject({ reconciled: true, txHash: '00final', contractAddress: '0xcontract' });
+        expect(evidenceTables.get('midnight.PendingSubmissions')![0]).toMatchObject({ status: 'finalized', chainBlockHeight: 4711 });
     });
 
-    test('a PROVEN on-chain failure of an identifier-keyed job (call did NOT apply) fails terminally, never reconciliation_required', async () => {
-        registerBackgroundJobProcessor('sponsorUnboundTransaction', 1, async () => {
+    test('a PROVEN on-chain failure of an identifier-keyed job (call did NOT apply) fails terminally WITH the confirmer block height, never reconciliation_required', async () => {
+        registerChainOutcomeConfirmer(async () => ({ status: 'failure', blockHeight: 42, blockHash: '0xb42' }));
+        registerBackgroundJobProcessor('sponsorUnboundTransaction', 1, JOB_KIND_TRAITS.sponsorUnboundTransaction, async () => {
             await reportExternalExecution({ submissionId: 'sub-partial' });
             await reportExternalSubmission({ submissionId: 'sub-partial', txHash: '00partial' });
-            throw new Error('sponsored transaction 00partial is in block 42 but its contract call did NOT apply (ledger result PARTIAL_SUCCESS)');
+            // What the worker RPC hands the main thread: the code and the height ride as data.
+            const err: any = new Error('sponsored transaction 00partial is in block 42 but its contract call did NOT apply (ledger result PARTIAL_SUCCESS)');
+            err.name = 'SponsoredCallNotAppliedError';
+            err.code = 'landed-not-applied'; err.retryable = false; err.blockHeight = 42;
+            throw err;
         });
         const ret = await startJob({
             kind: 'sponsorUnboundTransaction', sessionId: 'sess-1', requestedBy: 'alice',
@@ -650,14 +665,35 @@ describe('startJob: insert row + return jobId', () => {
         expect(row.status).toBe('failed');
         expect(row.errorCode).toBe('CHAIN_EXECUTION_FAILED');
         expect((row as any).chainStatus).toBe('failure');
+        // The rollback coordinate: without it a reorg could never revert this failure.
+        expect((row as any).chainBlockHeight).toBe(42);
         expect(row.txHash).toBe('00partial');
         expect(row.leaseOwner).toBeNull();
+    });
+
+    test('a proven on-chain failure parks for the reconciliation pass when no confirmer answers (no evidence without generation-checked coordinates)', async () => {
+        registerChainOutcomeConfirmer(null);
+        registerBackgroundJobProcessor('sponsorUnboundTransaction', 1, JOB_KIND_TRAITS.sponsorUnboundTransaction, async () => {
+            await reportExternalExecution({ submissionId: 'sub-noheight' });
+            await reportExternalSubmission({ submissionId: 'sub-noheight', txHash: '00noheight' });
+            const err: any = new Error('sponsored transaction 00noheight is in block ? but its contract call did NOT apply');
+            err.name = 'SponsoredCallNotAppliedError';
+            err.code = 'landed-not-applied'; err.retryable = false;
+            throw err;
+        });
+        const ret = await startJob({
+            kind: 'sponsorUnboundTransaction', sessionId: 'sess-1', requestedBy: 'alice',
+            request: {}, commandVersion: 1, command: { unboundTxB64: 'x' }
+        });
+        await flushSpawn();
+        expect(rows.get(ret.jobId)).toMatchObject({ status: 'reconciliation_required', errorCode: 'CHAIN_EXECUTION_FAILED_UNCONFIRMED', txHash: '00noheight' });
+        expect((rows.get(ret.jobId) as any).chainBlockHeight ?? null).toBeNull();
     });
 
     // A rejected sponsoring attempt whose bookkeeping could not commit parks under a persisted
     // marker; the settle pass re-runs that bookkeeping until it commits.
     test('a rejected attempt whose bookkeeping failed parks under REJECTED_ATTEMPT_BOOKKEEPING_PENDING, and the settle pass closes row, refunds the grant and fails the job', async () => {
-        registerBackgroundJobProcessor('sponsorUnboundTransaction', 1, async () => {
+        registerBackgroundJobProcessor('sponsorUnboundTransaction', 1, JOB_KIND_TRAITS.sponsorUnboundTransaction, async () => {
             await reportExternalExecution({ submissionId: 'sub-unbooked' });
             await reportExternalSubmission({ submissionId: 'sub-unbooked', txHash: '00rejected' });
             throw new SponsorAttemptBookkeepingPendingError('close/refund/hash could not be committed', { submissionId: 'sub-unbooked', txHash: '00rejected', grantId: 'grant-1', refund: 1 });
@@ -710,9 +746,9 @@ describe('startJob: insert row + return jobId', () => {
     });
 
     test('keeps the job in reconciliation when its projection finalizer fails', async () => {
-        registerBackgroundJobProcessor('projectionLeaf', 1, async () => {
+        registerBackgroundJobProcessor('projectionLeaf', 1, LIGHT_KIND, async () => {
             await reportExternalExecution({ submissionId: 'sub-projection' });
-            await reportExternalSubmission({ submissionId: 'sub-projection', txHash: '0xprojection' });
+            await reportExternalSubmission({ submissionId: 'sub-projection', txHash: '00projection' });
             throw new Error('reply lost');
         });
         registerBackgroundJobReconciliationFinalizer('projectionLeaf', 1, async () => {
@@ -723,39 +759,40 @@ describe('startJob: insert row + return jobId', () => {
             request: {}, commandVersion: 1, command: { resourceId: 'r1' }
         });
         await flushSpawn();
-        evidenceTables.get('midnight.PendingSubmissions')!.push({
-            ID: 'sub-projection', txHash: '0xprojection', status: 'finalized'
-        });
-        evidenceTables.get('midnight.Transactions')!.push({ ID: 'indexed-projection', hash: '0xprojection' });
-        evidenceTables.get('midnight.TransactionResults')!.push({
-            transaction_ID: 'indexed-projection', status: 'SUCCESS', outcomeSource: 'substrate-system-events'
-        });
-
-        expect(await reconcileBackgroundJobs()).toBe(0);
+        evidenceTables.get('midnight.PendingSubmissions')!.push({ ID: 'sub-projection', txHash: '00projection', status: 'included' });
+        registerChainOutcomeConfirmer(async () => ({ status: 'success', blockHeight: 1 }));
+        try {
+            expect(await confirmChainOutcomesViaIndexer()).toBe(0);
+            expect(await confirmChainOutcomesViaIndexer()).toBe(0);
+        } finally {
+            registerChainOutcomeConfirmer(null);
+        }
         expect(rows.get(ret.jobId)?.status).toBe('reconciliation_required');
     });
 
-    test('keeps an included but not finalized submission open', async () => {
-        const makeAmbiguous = async (submissionId: string, txHash: string) => {
-            const ret = await startJob({
-                kind: 'submitContractCall', sessionId: 'sess-1', request: {},
-                work: async () => {
-                    await reportExternalExecution({ submissionId });
-                    await reportExternalSubmission({ submissionId, txHash });
-                    throw new Error('reply lost');
-                }
-            });
-            await flushSpawn();
-            return ret;
-        };
-        const unresolved = await makeAmbiguous('sub-open', '0xopen');
-        evidenceTables.get('midnight.PendingSubmissions')!.push({ ID: 'sub-open', txHash: '0xopen', status: 'included' });
+    test('keeps a job open while the indexer has not confirmed its identifier', async () => {
+        const ret = await startJob({
+            kind: 'submitContractCall', sessionId: 'sess-1', request: {},
+            work: async () => {
+                await reportExternalExecution({ submissionId: 'sub-open' });
+                await reportExternalSubmission({ submissionId: 'sub-open', txHash: '00open' });
+                throw new Error('reply lost');
+            }
+        });
+        await flushSpawn();
+        evidenceTables.get('midnight.PendingSubmissions')!.push({ ID: 'sub-open', txHash: '00open', status: 'included' });
+        // A crawler row whose extrinsic hash happens to look related proves nothing.
+        evidenceTables.get('midnight.Transactions')!.push({ ID: 'indexed-open', hash: '0x00open' });
         expect(await reconcileBackgroundJobs()).toBe(0);
-        expect(rows.get(unresolved.jobId)?.status).toBe('reconciliation_required');
-
-        evidenceTables.get('midnight.Transactions')!.push({ ID: 'indexed-open', hash: '0xopen' });
-        expect(await reconcileBackgroundJobs()).toBe(0);
-        expect(rows.get(unresolved.jobId)?.status).toBe('reconciliation_required');
+        registerChainOutcomeConfirmer(async () => null);
+        try {
+            expect(await confirmChainOutcomesViaIndexer()).toBe(0);
+            expect(await confirmChainOutcomesViaIndexer()).toBe(0);
+        } finally {
+            registerChainOutcomeConfirmer(null);
+        }
+        expect(rows.get(ret.jobId)?.status).toBe('reconciliation_required');
+        expect(evidenceTables.get('midnight.PendingSubmissions')![0]).toMatchObject({ status: 'included' });
     });
 
     test('keeps workflow success separate from a later canonical chain failure', async () => {
@@ -763,23 +800,21 @@ describe('startJob: insert row + return jobId', () => {
             kind: 'submitContractCall', sessionId: 'sess-1', request: {},
             work: async () => {
                 await reportExternalExecution({ submissionId: 'sub-chain-fail' });
-                await reportExternalSubmission({ submissionId: 'sub-chain-fail', txHash: '0xchainfail' });
-                return { txHash: '0xchainfail', status: 'included' };
+                await reportExternalSubmission({ submissionId: 'sub-chain-fail', txHash: '00chainfail' });
+                return { txHash: '00chainfail', status: 'included' };
             }
         });
         await flushSpawn();
-        evidenceTables.get('midnight.PendingSubmissions')!.push({
-            ID: 'sub-chain-fail', txHash: '0xchainfail', status: 'finalized', finalizedAt: '2026-07-22T12:00:00Z'
-        });
-        evidenceTables.get('midnight.Transactions')!.push({ ID: 'indexed-chain-fail', hash: '0xchainfail' });
-        evidenceTables.get('midnight.TransactionResults')!.push({
-            transaction_ID: 'indexed-chain-fail', status: 'FAILURE', outcomeSource: 'substrate-system-events'
-        });
-
-        expect(await refreshSucceededChainOutcomes()).toBe(1);
-        expect(rows.get(ret.jobId)).toMatchObject({
-            status: 'succeeded', chainStatus: 'failure', chainFinalizedAt: '2026-07-22T12:00:00Z'
-        });
+        evidenceTables.get('midnight.PendingSubmissions')!.push({ ID: 'sub-chain-fail', txHash: '00chainfail', status: 'included' });
+        registerChainOutcomeConfirmer(async () => ({ status: 'failure', blockHeight: 77, blockHash: '0xb77', indexerTxHash: '0xi77' }));
+        try {
+            expect(await confirmChainOutcomesViaIndexer()).toBe(1);
+        } finally {
+            registerChainOutcomeConfirmer(null);
+        }
+        expect(rows.get(ret.jobId)).toMatchObject({ status: 'succeeded', chainStatus: 'failure', chainBlockHeight: 77, chainBlockHash: '0xb77' });
+        expect(rows.get(ret.jobId)?.chainFinalizedAt).toBeTruthy();
+        expect(evidenceTables.get('midnight.PendingSubmissions')![0]).toMatchObject({ status: 'failed', errorCode: 'CHAIN_EXECUTION_FAILED', chainBlockHeight: 77 });
     });
 
     test('requeues a reconciliation parent only after every durable child succeeded', async () => {
@@ -857,40 +892,36 @@ describe('bounded background scans remain fair beyond one page', () => {
             putRow(`recon-${String(i).padStart(3, '0')}`, {
                 status: 'reconciliation_required', result: null,
                 submissionId: i === 100 ? 'sub-late' : `sub-open-${i}`,
-                txHash: i === 100 ? '0xlate' : `0xopen${i}`
+                txHash: i === 100 ? '00late' : `00open${i}`
             });
         }
-        evidenceTables.get('midnight.PendingSubmissions')!.push({
-            ID: 'sub-late', txHash: '0xlate', status: 'finalized', finalizedAt: '2026-07-22T12:00:00Z'
-        });
-        evidenceTables.get('midnight.Transactions')!.push({ ID: 'tx-late', hash: '0xlate' });
-        evidenceTables.get('midnight.TransactionResults')!.push({
-            transaction_ID: 'tx-late', status: 'SUCCESS', outcomeSource: 'substrate-system-events'
-        });
-
-        expect(await reconcileBackgroundJobs()).toBe(0);
-        expect(await reconcileBackgroundJobs()).toBe(1);
-        expect(rows.get('recon-100')).toMatchObject({ status: 'succeeded', chainStatus: 'success' });
+        evidenceTables.get('midnight.PendingSubmissions')!.push({ ID: 'sub-late', txHash: '00late', status: 'included' });
+        registerChainOutcomeConfirmer(async (txHash) => txHash === '00late' ? { status: 'success', blockHeight: 5 } : null);
+        try {
+            expect(await confirmChainOutcomesViaIndexer()).toBe(0);
+            expect(await confirmChainOutcomesViaIndexer()).toBe(1);
+        } finally {
+            registerChainOutcomeConfirmer(null);
+        }
+        expect(rows.get('recon-100')).toMatchObject({ status: 'succeeded', chainStatus: 'success', chainBlockHeight: 5 });
     });
 
     test('advances past 100 unresolved pending chain outcomes', async () => {
         for (let i = 0; i < 101; i++) {
             putRow(`chain-${String(i).padStart(3, '0')}`, {
                 chainStatus: 'pending', submissionId: i === 100 ? 'sub-late' : `sub-open-${i}`,
-                txHash: i === 100 ? '0xlate' : `0xopen${i}`
+                txHash: i === 100 ? '00late' : `00open${i}`
             });
         }
-        evidenceTables.get('midnight.PendingSubmissions')!.push({
-            ID: 'sub-late', txHash: '0xlate', status: 'finalized', finalizedAt: '2026-07-22T12:00:00Z'
-        });
-        evidenceTables.get('midnight.Transactions')!.push({ ID: 'tx-late', hash: '0xlate' });
-        evidenceTables.get('midnight.TransactionResults')!.push({
-            transaction_ID: 'tx-late', status: 'SUCCESS', outcomeSource: 'substrate-system-events'
-        });
-
-        expect(await refreshSucceededChainOutcomes()).toBe(0);
-        expect(await refreshSucceededChainOutcomes()).toBe(1);
-        expect(rows.get('chain-100')).toMatchObject({ chainStatus: 'success' });
+        evidenceTables.get('midnight.PendingSubmissions')!.push({ ID: 'sub-late', txHash: '00late', status: 'included' });
+        registerChainOutcomeConfirmer(async (txHash) => txHash === '00late' ? { status: 'success', blockHeight: 6 } : null);
+        try {
+            expect(await confirmChainOutcomesViaIndexer()).toBe(0);
+            expect(await confirmChainOutcomesViaIndexer()).toBe(1);
+        } finally {
+            registerChainOutcomeConfirmer(null);
+        }
+        expect(rows.get('chain-100')).toMatchObject({ chainStatus: 'success', chainBlockHeight: 6 });
     });
 
     test('advances past 100 unresolved workflow parents', async () => {
@@ -933,7 +964,7 @@ describe('confirmChainOutcomesViaIndexer: crawler-free chainStatus advance', () 
     });
 
     test('advances a pending leaf to success without the crawler tables', async () => {
-        registerChainOutcomeConfirmer(async () => ({ status: 'success' }));
+        registerChainOutcomeConfirmer(async () => ({ status: 'success', blockHeight: 4711 }));
         putSucceeded('job-ok', { txHash: '0xok' });
         // evidenceTables intentionally empty: no PendingSubmissions / Transactions needed.
         expect(await confirmChainOutcomesViaIndexer()).toBe(1);
@@ -942,10 +973,25 @@ describe('confirmChainOutcomesViaIndexer: crawler-free chainStatus advance', () 
     });
 
     test('advances a legacy (null chainStatus) leaf to failure, keeping status succeeded', async () => {
-        registerChainOutcomeConfirmer(async () => ({ status: 'failure' }));
+        registerChainOutcomeConfirmer(async () => ({ status: 'failure', blockHeight: 4711 }));
         putSucceeded('job-legacy', { txHash: '0xfail', chainStatus: null });
         expect(await confirmChainOutcomesViaIndexer()).toBe(1);
         expect(rows.get('job-legacy')).toMatchObject({ status: 'succeeded', chainStatus: 'failure' });
+    });
+
+    test('finalizes the attempt row with the outcome (without the crawler nothing else moves it past included)', async () => {
+        registerChainOutcomeConfirmer(async () => ({ status: 'success', blockHeight: 4711 }));
+        putSucceeded('job-row', { txHash: 'bare1', submissionId: 'sub-row' });
+        evidenceTables.get('midnight.PendingSubmissions')!.push({ ID: 'sub-row', txHash: 'bare1', status: 'included' });
+        expect(await confirmChainOutcomesViaIndexer()).toBe(1);
+        expect(evidenceTables.get('midnight.PendingSubmissions')![0]).toMatchObject({ status: 'finalized' });
+        expect(evidenceTables.get('midnight.PendingSubmissions')![0].finalizedAt).toBeTruthy();
+
+        registerChainOutcomeConfirmer(async () => ({ status: 'failure', blockHeight: 4711 }));
+        putSucceeded('job-row-fail', { txHash: 'bare2' });
+        evidenceTables.get('midnight.PendingSubmissions')!.push({ ID: 'sub-row-fail', txHash: 'bare2', status: 'included' });
+        expect(await confirmChainOutcomesViaIndexer()).toBe(1);
+        expect(evidenceTables.get('midnight.PendingSubmissions')![1]).toMatchObject({ status: 'failed', errorCode: 'CHAIN_EXECUTION_FAILED' });
     });
 
     test('leaves the job pending when the tx is not yet finalized (null outcome)', async () => {
@@ -955,12 +1001,28 @@ describe('confirmChainOutcomesViaIndexer: crawler-free chainStatus advance', () 
         expect(rows.get('job-pending')?.chainStatus).toBe('pending');
     });
 
+    test('resolves a BOUND kind parked in reconciliation_required with a hash (crawler off: no other evidence exists)', async () => {
+        registerChainOutcomeConfirmer(async () => ({ status: 'success', blockHeight: 4711 }));
+        const now = new Date().toISOString();
+        rows.set('job-recon-bound', {
+            ID: 'job-recon-bound', kind: 'submitContractCall', sessionId: 'sess-1', status: 'reconciliation_required',
+            idempotencyKey: null, request: '{}', result: null, errorCode: 'EXTERNAL_EXECUTION_FAILED', errorMessage: 'watch timed out',
+            startedAt: now, finishedAt: null, createdAt: now, modifiedAt: now, chainStatus: 'pending',
+            txHash: '00bound'.padEnd(64, '0'), commandVersion: 1, commandEncoding: null, command: JSON.stringify({ op: 'call' })
+        } as any);
+        let n = await confirmChainOutcomesViaIndexer();
+        if (n === 0) n = await confirmChainOutcomesViaIndexer();
+        expect(n).toBe(1);
+        expect(rows.get('job-recon-bound')).toMatchObject({ status: 'succeeded', chainStatus: 'success', errorCode: null });
+        expect(JSON.parse(rows.get('job-recon-bound')!.result as string)).toMatchObject({ txHash: '00bound'.padEnd(64, '0'), reconciled: true });
+    });
+
     // The crawler-free path resolves identifier-keyed sponsor jobs from reconciliation_required too;
     // a reconciled success runs the kind's registered finalizer and reports its result.
     test('runs the registered finalizer for a reconciled identifier-keyed job and persists its result', async () => {
         const finalizer = vi.fn(async (_cmd: unknown, _job: unknown, evidence: any) => ({ reconciled: true, txHash: evidence.txHash, deployed: ['cc'.repeat(32)], status: 'finalized' }));
         registerBackgroundJobReconciliationFinalizer('sponsorUnboundTransaction', 1, finalizer);
-        registerChainOutcomeConfirmer(async () => ({ status: 'success' }));
+        registerChainOutcomeConfirmer(async () => ({ status: 'success', blockHeight: 4711 }));
         const now = new Date().toISOString();
         rows.set('job-recon-deploy', {
             ID: 'job-recon-deploy', kind: 'sponsorUnboundTransaction', sessionId: 'sponsor-1', status: 'reconciliation_required',
@@ -982,7 +1044,7 @@ describe('confirmChainOutcomesViaIndexer: crawler-free chainStatus advance', () 
 
     test('a throwing finalizer keeps a reconciled identifier-keyed job in reconciliation_required', async () => {
         registerBackgroundJobReconciliationFinalizer('sponsorUnboundTransaction', 1, async () => { throw new Error('grant write failed'); });
-        registerChainOutcomeConfirmer(async () => ({ status: 'success' }));
+        registerChainOutcomeConfirmer(async () => ({ status: 'success', blockHeight: 4711 }));
         const now = new Date().toISOString();
         rows.set('job-recon-throw', {
             ID: 'job-recon-throw', kind: 'sponsorUnboundTransaction', sessionId: 'sponsor-1', status: 'reconciliation_required',
@@ -996,7 +1058,7 @@ describe('confirmChainOutcomesViaIndexer: crawler-free chainStatus advance', () 
     });
 
     test('skips workflow parents (chainStatus is aggregated from children)', async () => {
-        const confirmer = vi.fn(async () => ({ status: 'success' as const }));
+        const confirmer = vi.fn(async () => ({ status: 'success' as const, blockHeight: 4711 }));
         registerChainOutcomeConfirmer(confirmer);
         putSucceeded('parent-job', { kind: 'issueFieldPredicateAttestation', txHash: '0xparent' });
         expect(await confirmChainOutcomesViaIndexer()).toBe(0);
@@ -1007,7 +1069,7 @@ describe('confirmChainOutcomesViaIndexer: crawler-free chainStatus advance', () 
     test('continues past a throwing confirmer without failing the whole pass', async () => {
         registerChainOutcomeConfirmer(async (txHash) => {
             if (txHash === '0xthrow') throw new Error('lookup blew up');
-            return { status: 'success' };
+            return { status: 'success', blockHeight: 4711 };
         });
         putSucceeded('job-throw', { txHash: '0xthrow' });
         putSucceeded('job-after', { txHash: '0xafter' });
@@ -1245,6 +1307,43 @@ describe('startJob: per-kind semaphore', () => {
         expect(inFlight.peak).toBeLessThanOrEqual(4);
     });
 
+    test('every workflow parent kind is reconciled as a parent (none falls through to the leaf path)', () => {
+        // A parent row carries no txHash; the leaf sweep would skip it forever.
+        // Every handler kind whose executor drives runChild must be listed.
+        const parents = __workflowParentKindsForTests();
+        for (const kind of [
+            'issueFieldPredicateAttestation', 'issueFieldPredicateAttestationBatch',
+            'issueFieldEqualityAttestation', 'issueFieldMembershipAttestation',
+            'issueDocumentIntegrityAttestation', 'issueDocumentDiffAttestation',
+            'anchorDocumentGuarded'
+        ]) {
+            expect(parents.has(kind), kind).toBe(true);
+        }
+    });
+
+    test('proof-generating child kinds and caller-side builds run under the heavy cap of 4', async () => {
+        for (const kind of ['fieldEqualityProof', 'fieldMembershipProof', 'documentIntegrityProof', 'documentDiffProof', 'buildSponsorableTx']) {
+            __resetForTests();
+            const releaseGates: Array<() => void> = [];
+            const inFlight = { count: 0, peak: 0 };
+            const makeWork = () => vi.fn(async () => {
+                inFlight.count++;
+                inFlight.peak = Math.max(inFlight.peak, inFlight.count);
+                await new Promise<void>(r => releaseGates.push(r));
+                inFlight.count--;
+            });
+            for (let i = 0; i < 6; i++) {
+                await startJob({ kind, sessionId: `sess-${i}`, request: {}, work: makeWork() });
+            }
+            await flushSpawn();
+            expect(inFlight.peak, kind).toBeLessThanOrEqual(4);
+            expect(inFlight.count, kind).toBe(4);
+            releaseGates.forEach(r => r());
+            await flushSpawn();
+            await flushSpawn();
+        }
+    });
+
     test('light kind defaults to cap of 16', async () => {
         const releaseGates: Array<() => void> = [];
         const inFlight = { count: 0, peak: 0 };
@@ -1257,7 +1356,7 @@ describe('startJob: per-kind semaphore', () => {
 
         for (let i = 0; i < 20; i++) {
             await startJob({
-                kind:      'lightKindTest',   // in neither HEAVY_KINDS nor SERIAL_KINDS
+                kind:      'lightKindTest',   // undeclared: light by default
                 sessionId: `sess-${i}`,
                 request:   {},
                 work:      makeWork()
@@ -1338,7 +1437,7 @@ describe('getJobById', () => {
 describe('scheduleJob commit hook (ambient request context)', () => {
     test('defers the work until the context fires succeeded, then runs it', async () => {
         const processor = vi.fn(async () => ({ ok: true }));
-        registerBackgroundJobProcessor('deferredDispatchTest', 1, processor);
+        registerBackgroundJobProcessor('deferredDispatchTest', 1, LIGHT_KIND, processor);
         const cdsMock: any = ((await import('@sap/cds')) as any).default;
         const hooks: Record<string, () => void> = {};
         cdsMock.context = { id: 'req-hook', on: vi.fn((ev: string, cb: () => void) => { hooks[ev] = cb; }) };
@@ -1367,7 +1466,7 @@ describe('scheduleJob commit hook (ambient request context)', () => {
 
     test('a truthy context without on() dispatches immediately and warns (mock-context shape)', async () => {
         const processor = vi.fn(async () => ({ ok: true }));
-        registerBackgroundJobProcessor('bareContextDispatchTest', 1, processor);
+        registerBackgroundJobProcessor('bareContextDispatchTest', 1, LIGHT_KIND, processor);
         const cdsMock: any = ((await import('@sap/cds')) as any).default;
         const log = cdsMock.log();
         log.warn.mockClear();
@@ -1390,7 +1489,7 @@ describe('scheduleJob commit hook (ambient request context)', () => {
 
     test('a rolled-back request never runs the work (succeeded hook never fires)', async () => {
         const processor = vi.fn(async () => ({ ok: true }));
-        registerBackgroundJobProcessor('rolledBackDispatchTest', 1, processor);
+        registerBackgroundJobProcessor('rolledBackDispatchTest', 1, LIGHT_KIND, processor);
         const cdsMock: any = ((await import('@sap/cds')) as any).default;
         cdsMock.context = { id: 'req-rollback', on: vi.fn() };
         try {
@@ -1484,7 +1583,7 @@ describe('supersedeQueuedJobs (prewarm boot hygiene)', () => {
 
     test('a job superseded while still pending is never claimed (clean skip, no work run)', async () => {
         const processor = vi.fn(async () => ({ ready: true }));
-        registerBackgroundJobProcessor('prewarmSkipTest', 1, processor);
+        registerBackgroundJobProcessor('prewarmSkipTest', 1, LIGHT_KIND, processor);
 
         const ret = await startJob({
             kind: 'prewarmSkipTest', sessionId: 'sess-1', requestedBy: 'alice',
@@ -1502,7 +1601,7 @@ describe('supersedeQueuedJobs (prewarm boot hygiene)', () => {
     test('a job superseded mid-run stays SUPERSEDED; its late completion is discarded quietly', async () => {
         let release!: () => void;
         const gate = new Promise<void>(resolve => { release = resolve; });
-        registerBackgroundJobProcessor('prewarmMidRunTest', 1, async () => { await gate; return { ready: true }; });
+        registerBackgroundJobProcessor('prewarmMidRunTest', 1, LIGHT_KIND, async () => { await gate; return { ready: true }; });
 
         const ret = await startJob({
             kind: 'prewarmMidRunTest', sessionId: 'sess-1', requestedBy: 'alice',
@@ -1525,7 +1624,7 @@ describe('supersedeQueuedJobs (prewarm boot hygiene)', () => {
     test('a job that ERRORS after being superseded mid-run also stays SUPERSEDED', async () => {
         let releaseWithError!: () => void;
         const gate = new Promise<void>((_, reject) => { releaseWithError = () => reject(new Error('sync gate timed out')); });
-        registerBackgroundJobProcessor('prewarmMidRunErrTest', 1, async () => { await gate; });
+        registerBackgroundJobProcessor('prewarmMidRunErrTest', 1, LIGHT_KIND, async () => { await gate; });
 
         const ret = await startJob({
             kind: 'prewarmMidRunErrTest', sessionId: 'sess-1', requestedBy: 'alice',
@@ -1563,8 +1662,11 @@ describe('recoverInterruptedJobs', () => {
         expect(rows.get('r1')!.status).toBe('failed');
         expect(rows.get('r1')!.errorCode).toBe('PROCESS_RESTART_BEFORE_EXECUTION');
         expect(rows.get('d1')).toMatchObject({ status: 'pending', leaseOwner: null, errorCode: null });
-        expect(rows.get('e1')!.status).toBe('reconciliation_required');
-        expect(rows.get('e1')!.errorCode).toBe('PROCESS_RESTART_RECONCILE');
+        // external_execution WITHOUT a hash: every worker submit path announces
+        // its identifier and waits for the ack before sending, so nothing was
+        // broadcast; fails plainly (a hash would have parked it for reconciliation).
+        expect(rows.get('e1')!.status).toBe('failed');
+        expect(rows.get('e1')!.errorCode).toBe('PROCESS_RESTART_BEFORE_BROADCAST');
 
         expect(rows.get('s1')!.status).toBe('succeeded');
         expect(rows.get('f1')!.errorCode).toBe('OldErr');
@@ -1574,16 +1676,18 @@ describe('recoverInterruptedJobs', () => {
         expect(await recoverInterruptedJobs()).toBe(0);
     });
 
-    test('an identifier-keyed sponsor job in external_execution WITHOUT a hash (rejected attempt awaiting rebuild) fails plainly instead of parking in reconciliation', async () => {
+    test('external_execution WITHOUT a hash fails plainly for every kind (nothing announced = nothing broadcast); with a hash it parks for reconciliation', async () => {
         const now = new Date().toISOString();
         rows.set('rej', { ID: 'rej', kind: 'sponsorUnboundTransaction', sessionId: 's', status: 'external_execution', txHash: null, commandVersion: 1, command: '{}', requestedBy: 'u', idempotencyKey: null, request: null, result: null, errorCode: null, errorMessage: null, startedAt: now, finishedAt: null, createdAt: now, modifiedAt: now });
         rows.set('amb', { ID: 'amb', kind: 'sponsorUnboundTransaction', sessionId: 's', status: 'external_execution', txHash: '00ambiguous', commandVersion: 1, command: '{}', requestedBy: 'u', idempotencyKey: null, request: null, result: null, errorCode: null, errorMessage: null, startedAt: now, finishedAt: null, createdAt: now, modifiedAt: now });
         rows.set('oth', { ID: 'oth', kind: 'sendNight', sessionId: 's', status: 'external_execution', txHash: null, idempotencyKey: null, request: null, result: null, errorCode: null, errorMessage: null, startedAt: now, finishedAt: null, createdAt: now, modifiedAt: now });
         await recoverInterruptedJobs();
         expect(rows.get('rej')!.status).toBe('failed');
-        expect(rows.get('rej')!.errorCode).toBe('PROCESS_RESTART_AFTER_REJECT');
+        expect(rows.get('rej')!.errorCode).toBe('PROCESS_RESTART_BEFORE_BROADCAST');
         expect(rows.get('amb')!.status).toBe('reconciliation_required'); // has a hash: may be on-chain
-        expect(rows.get('oth')!.status).toBe('reconciliation_required'); // crawler-keyed kinds keep the conservative rule
+        expect(rows.get('amb')!.errorCode).toBe('PROCESS_RESTART_RECONCILE');
+        expect(rows.get('oth')!.status).toBe('failed'); // bound kinds announce too
+        expect(rows.get('oth')!.errorCode).toBe('PROCESS_RESTART_BEFORE_BROADCAST');
     });
 
     // Live regression (2026-08-04): every ungraceful stop left one more
@@ -1756,7 +1860,7 @@ describe('status-write contention hardening', () => {
         lockInjector.failUpdates = 2;
         lockInjector.matchStatus = 'reconciliation_required';
 
-        registerBackgroundJobProcessor('partialWorkflow', 1, async () => {
+        registerBackgroundJobProcessor('partialWorkflow', 1, LIGHT_KIND, async () => {
             throw new WorkflowReconciliationRequiredError('first chain step already succeeded');
         });
         const ret = await startJob({

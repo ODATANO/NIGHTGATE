@@ -125,16 +125,44 @@ describe('RateLimiter.checkMany (all-or-nothing batch consume)', () => {
 });
 
 describe('RateLimiter capacity + sweep + destroy', () => {
-    it('rejects NEW keys once the key map is at capacity (memory DoS guard)', () => {
+    it('evicts the least recently used key at capacity instead of locking new callers out', () => {
         const limiter = new RateLimiter({ windowMs: 60_000, maxRequests: 5, maxKeys: 2 });
         try {
             expect(limiter.check('a').allowed).toBe(true);
             expect(limiter.check('b').allowed).toBe(true);
-            // Third DISTINCT key is rejected; existing keys keep working.
-            const overflow = limiter.check('c');
-            expect(overflow.allowed).toBe(false);
-            expect(overflow.retryAfterMs).toBe(60_000);
-            expect(limiter.check('a').allowed).toBe(true);
+            expect(limiter.check('a').allowed).toBe(true); // a is now the most recent
+            // A third DISTINCT key is admitted and evicts b (least recently used);
+            // a keeps its window. Memory stays bounded at maxKeys.
+            expect(limiter.check('c').allowed).toBe(true);
+            expect((limiter as any).hits.size).toBe(2);
+            expect((limiter as any).hits.has('b')).toBe(false);
+            expect((limiter as any).hits.has('a')).toBe(true);
+            // Refusing new keys instead let one caller with made-up keys lock
+            // every other principal out for a whole window.
+            for (let i = 0; i < 50; i++) expect(limiter.check(`junk-${i}`).allowed).toBe(true);
+            expect((limiter as any).hits.size).toBe(2);
+            expect(limiter.check('fresh').allowed).toBe(true);
+        } finally {
+            limiter.destroy();
+        }
+    });
+
+    it('caps the distinct keys ONE principal may hold, so made-up scopes cannot evict other principals', () => {
+        const limiter = new RateLimiter({ windowMs: 60_000, maxRequests: 5, maxKeys: 100, maxKeysPerGroup: 3 });
+        try {
+            expect(limiter.check('victim:session-1').allowed).toBe(true);
+            for (let i = 0; i < 3; i++) expect(limiter.check(`attacker:made-up-${i}`).allowed).toBe(true);
+            // the 4th distinct scope of the attacker is refused, the table is untouched
+            const refused = limiter.check('attacker:made-up-3');
+            expect(refused.allowed).toBe(false);
+            expect(refused.retryAfterMs).toBe(60_000);
+            expect((limiter as any).hits.has('victim:session-1')).toBe(true);
+            // an existing scope of the attacker keeps working
+            expect(limiter.check('attacker:made-up-0').allowed).toBe(true);
+            // the sweep releases the group's slots
+            (limiter as any).hits.set('attacker:made-up-0', [Date.now() - 120_000]);
+            (limiter as any).sweep();
+            expect(limiter.check('attacker:made-up-3').allowed).toBe(true);
         } finally {
             limiter.destroy();
         }

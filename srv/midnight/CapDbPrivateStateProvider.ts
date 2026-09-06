@@ -23,8 +23,10 @@ const { SELECT, INSERT, UPDATE, DELETE } = cds.ql;
 import {
     StorageEncryption,
     decryptWithPassword,
+    extractEncryptedComponents,
     SALT_LENGTH
 } from '../utils/storage-encryption';
+import { DEK_SCHEME } from '../submission/account-keys';
 import { ensureNightgateModelLoaded } from '../utils/cds-model';
 import { PrivateStates, ContractSigningKeys } from '#cds-models/midnight';
 
@@ -105,8 +107,29 @@ export class ImportConflictError extends Error {
 //  Config
 export interface CapDbPrivateStateProviderConfig {
     accountId: string;
+    /** The account-DEK-derived password (wallet-material-factory.ts); every row is written under it. */
     privateStoragePasswordProvider: () => Promise<string> | string;
+    /**
+     * Passwords a row may still be encrypted under (the pre-DEK ring-bound
+     * and viewing-key-only derivations). Read-only: a row opened through one
+     * is rewritten under the current password, marked `keyScheme = 'dek1'`.
+     */
+    privateStoragePasswordFallbacks?: () => Promise<string[]> | string[];
     db?: any;
+}
+
+const PRIVATE_STATE_SALT_LABEL = 'nightgate-private-state-salt-v1';
+
+/**
+ * Deterministic 32-byte salt per (account, password). The salt in a stored
+ * blob therefore names the password it was written under, which is how the
+ * read fallback and the rewrap tool pick a candidate without trial decrypts.
+ */
+export function privateStateStableSalt(accountId: string, password: string): Buffer {
+    return crypto
+        .createHash('sha256')
+        .update(`${password}|${accountId}|${PRIVATE_STATE_SALT_LABEL}`)
+        .digest();
 }
 
 //  Provider
@@ -147,8 +170,7 @@ export class CapDbPrivateStateProvider<PSI extends PrivateStateId = PrivateState
             })
         );
         if (!row) return null;
-        const enc = await this.getEncryption();
-        const json = enc.decrypt(row.ciphertext);
+        const json = await this.decryptStored(row.ciphertext, fresh => this.upsertPrivateState(contractAddress, privateStateId, fresh));
         return JSON.parse(json) as PS;
     }
 
@@ -186,8 +208,7 @@ export class CapDbPrivateStateProvider<PSI extends PrivateStateId = PrivateState
             })
         );
         if (!row) return null;
-        const enc = await this.getEncryption();
-        return enc.decrypt(row.ciphertext);
+        return this.decryptStored(row.ciphertext, fresh => this.upsertSigningKey(address, fresh));
     }
 
     async removeSigningKey(address: ContractAddress): Promise<void> {
@@ -224,9 +245,8 @@ export class CapDbPrivateStateProvider<PSI extends PrivateStateId = PrivateState
         }
 
         const states: Record<string, unknown> = {};
-        const inst = await this.getEncryption();
         for (const r of rows) {
-            const json = inst.decrypt(r.ciphertext);
+            const json = await this.decryptStored(r.ciphertext, fresh => this.upsertPrivateState(contractAddress, r.privateStateId, fresh));
             states[r.privateStateId] = JSON.parse(json);
         }
 
@@ -448,10 +468,30 @@ export class CapDbPrivateStateProvider<PSI extends PrivateStateId = PrivateState
 
     /** Deterministic 32-byte salt for this account's internal storage. */
     private deriveStableSalt(password: string): Buffer {
-        return crypto
-            .createHash('sha256')
-            .update(`${password}|${this.config.accountId}|nightgate-private-state-salt-v1`)
-            .digest();
+        return privateStateStableSalt(this.config.accountId, password);
+    }
+
+    /**
+     * Decrypt a stored row under the current password, or under the fallback
+     * whose stable salt the blob carries; a fallback hit is rewritten under
+     * the current password so the next read needs no fallback.
+     */
+    private async decryptStored(ciphertext: string, rewrite: (fresh: string) => Promise<void>): Promise<string> {
+        const enc = await this.getEncryption();
+        try {
+            return enc.decrypt(ciphertext);
+        } catch (primary) {
+            const fallbacks = await this.config.privateStoragePasswordFallbacks?.() ?? [];
+            let salt: Buffer;
+            try { salt = extractEncryptedComponents(Buffer.from(ciphertext, 'base64')).salt; } catch { throw primary; }
+            for (const password of fallbacks) {
+                if (!this.deriveStableSalt(password).equals(salt)) continue;
+                const plain = decryptWithPassword(ciphertext, password);
+                try { await rewrite(enc.encrypt(plain)); } catch { /* the next read rewrites */ }
+                return plain;
+            }
+            throw primary;
+        }
     }
 
     private async upsertPrivateState(contractAddress: string, privateStateId: string, ciphertext: string): Promise<void> {
@@ -465,13 +505,13 @@ export class CapDbPrivateStateProvider<PSI extends PrivateStateId = PrivateState
         if (existing) {
             await db.run(
                 UPDATE.entity(PrivateStates)
-                    .set({ ciphertext, updatedAt: now })
+                    .set({ ciphertext, keyScheme: DEK_SCHEME, updatedAt: now })
                     .where({ accountId: this.config.accountId, contractAddress, privateStateId })
             );
         } else {
             await db.run(INSERT.into(PrivateStates).entries({
                 accountId: this.config.accountId, contractAddress, privateStateId,
-                ciphertext, createdAt: now, updatedAt: now
+                ciphertext, keyScheme: DEK_SCHEME, createdAt: now, updatedAt: now
             }));
         }
     }
@@ -487,13 +527,13 @@ export class CapDbPrivateStateProvider<PSI extends PrivateStateId = PrivateState
         if (existing) {
             await db.run(
                 UPDATE.entity(ContractSigningKeys)
-                    .set({ ciphertext, updatedAt: now })
+                    .set({ ciphertext, keyScheme: DEK_SCHEME, updatedAt: now })
                     .where({ accountId: this.config.accountId, contractAddress })
             );
         } else {
             await db.run(INSERT.into(ContractSigningKeys).entries({
                 accountId: this.config.accountId, contractAddress,
-                ciphertext, createdAt: now, updatedAt: now
+                ciphertext, keyScheme: DEK_SCHEME, createdAt: now, updatedAt: now
             }));
         }
     }

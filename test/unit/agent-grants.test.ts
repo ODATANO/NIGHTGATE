@@ -60,7 +60,7 @@ vi.mock('../../srv/utils/nightgate-config', () => ({
 
 import { FeeSponsorError } from '../../srv/submission/fee-sponsor';
 
-import {
+import { __resetGrantRateLimiterForTests, currentGrantPolicy,
     registerAgentGrantHandlers,
     enforceAgentGrant,
     hashAgentToken,
@@ -127,6 +127,7 @@ describe('agent grants', () => {
     const db = { run: mockDbRun };
 
     beforeEach(() => {
+        __resetGrantRateLimiterForTests();
         vi.clearAllMocks();
         mockDbRun.mockResolvedValue(null);
         updateSetSpy.mockReturnValue({ where: updateWhereSpy });
@@ -232,14 +233,16 @@ describe('agent grants', () => {
             expect(insertEntriesSpy.mock.calls[0][0].sponsorSessionId).toBe('sponsor-1');
         });
 
-        it('rate-limits the 11th call from one client with 429', async () => {
-            const ip = '10.99.0.1';
+        it('rate-limits the 11th call of one principal with 429; another principal is unaffected', async () => {
             for (let i = 0; i < 10; i++) {
-                await handlers.createAgentGrant(makeReq(VALID, { user: undefined, ip }));
+                await handlers.createAgentGrant(makeReq(VALID, { user: { id: 'rl-user' } }));
             }
-            const req = makeReq(VALID, { ip });
+            const req = makeReq(VALID, { user: { id: 'rl-user' } });
             await handlers.createAgentGrant(req);
             expect(req.reject).toHaveBeenCalledWith(429, expect.stringContaining('Rate limited'));
+            const other = makeReq(VALID, { user: { id: 'rl-other' } });
+            await handlers.createAgentGrant(other);
+            expect(other.reject).not.toHaveBeenCalledWith(429, expect.anything());
         });
     });
 
@@ -452,11 +455,86 @@ describe('agent grants', () => {
             });
         }
 
+        it('an unpinned grant may not choose a sponsor', async () => {
+            mockDbRun.mockResolvedValueOnce(grantRow({ sponsorSessionId: null, allowedActions: JSON.stringify(['anchorDocument']) }));
+            const req = tokenReq('anchorDocument', { sessionId: 'sess-1', sponsorSessionId: 'some-sponsor' });
+            await enforceAgentGrant(req, db);
+            expect(req.reject).toHaveBeenCalledWith(403, expect.stringMatching(/no sponsor binding/));
+        });
+
+        it('currentGrantPolicy: the live lists of an active grant, null once revoked', async () => {
+            mockDbRun.mockResolvedValueOnce(grantRow({ allowedContracts: JSON.stringify(['c1']), allowedCircuits: null, deployedContracts: JSON.stringify(['d1']), allowDeploy: true }));
+            expect(await currentGrantPolicy(db, 'g1')).toEqual({
+                allowedContracts: ['c1'], allowedCircuits: [], deployedContracts: ['d1'], allowedTokenTypes: [], allowDeploy: true
+            });
+            mockDbRun.mockResolvedValueOnce(grantRow({ isActive: false }));
+            expect(await currentGrantPolicy(db, 'g1')).toBeNull();
+            mockDbRun.mockResolvedValueOnce(grantRow({ revokedAt: '2026-09-05T00:00:00Z' }));
+            expect(await currentGrantPolicy(db, 'g1')).toBeNull();
+            mockDbRun.mockResolvedValueOnce(null);
+            expect(await currentGrantPolicy(db, 'g1')).toBeNull();
+        });
+
         it('is a no-op without the token header', async () => {
             const req = makeReq({}, { event: 'anchorDocument', user: { id: 'u' } });
             await enforceAgentGrant(req, db);
             expect(req.reject).not.toHaveBeenCalled();
             expect(req.user).toEqual({ id: 'u' });
+            expect(mockDbRun).not.toHaveBeenCalled();
+        });
+
+        it('reads the token from the merged req.headers, where the $batch envelope header lands', async () => {
+            // A batch part's synthetic Express request carries no token; CAP
+            // merges the envelope headers into the cds Request's `headers`.
+            mockDbRun.mockResolvedValueOnce(grantRow({ allowedActions: JSON.stringify(['anchorDocument']) }));
+            const req = makeReq({ sessionId: 'sess-1' }, { event: 'anchorDocument', user: { id: 'agent-token-transport' } });
+            req.headers = { 'x-agent-token': TOKEN };
+            await enforceAgentGrant(req, db);
+            expect(req.reject).not.toHaveBeenCalled();
+            expect(req.user).toEqual({ id: TEST_USER_ID });
+        });
+
+        it('refunds the daily budget unit when the handler refuses the request as invalid (4xx below 429), keeps it otherwise', async () => {
+            const today = new Date().toISOString().slice(0, 10);
+            const handlers: Record<string, (err: unknown) => void> = {};
+            const run = async (status: number) => {
+                mockDbRun.mockReset();
+                updateWhereSpy.mockClear();
+                mockDbRun
+                    .mockResolvedValueOnce(grantRow({ maxJobsPerDay: 5, jobsUsedToday: 1, budgetWindow: today })) // grant lookup
+                    .mockResolvedValueOnce(1)   // consume (increment)
+                    .mockResolvedValueOnce(1);  // refund
+                const req = tokenReq('anchorDocument', { sessionId: 'sess-1' });
+                req.on = (event: string, cb: (err: unknown) => void) => { handlers[event] = cb; };
+                await enforceAgentGrant(req, db);
+                expect(req.reject).not.toHaveBeenCalled();
+                expect(handlers.failed).toBeDefined();
+                const before = mockDbRun.mock.calls.length;
+                handlers.failed({ status });
+                await new Promise(r => setImmediate(r));
+                return mockDbRun.mock.calls.length - before;
+            };
+            try {
+                expect(await run(400)).toBe(1);   // refund UPDATE issued
+                expect(updateSetSpy).toHaveBeenCalledWith({ jobsUsedToday: { '-=': 1 } });
+                expect(await run(404)).toBe(1);
+                expect(await run(429)).toBe(0);   // exhausted stays exhausted
+                expect(await run(503)).toBe(0);   // a server-side failure after admission keeps the unit
+            } finally {
+                // unconsumed mockResolvedValueOnce values must not leak into the next test
+                mockDbRun.mockReset();
+                mockDbRun.mockResolvedValue(null);
+            }
+        });
+
+        it('rejects 401 when the transport marker principal arrives without a token (a $batch part)', async () => {
+            // The standalone image admits a token request under a marker principal
+            // and relies on this hook; a batch part carries no token header but
+            // inherits that principal. It must not run as an authenticated user.
+            const req = makeReq({}, { event: 'sponsorFinalizedTransaction', user: { id: 'agent-token-transport' } });
+            await enforceAgentGrant(req, db);
+            expect(req.reject).toHaveBeenCalledWith(401, expect.stringContaining('agent token required'));
+            expect(req.user).toEqual({ id: 'agent-token-transport' });
             expect(mockDbRun).not.toHaveBeenCalled();
         });
 

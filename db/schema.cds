@@ -122,8 +122,8 @@ entity TransactionFees : cuid {
  * Contract actions (Deploy, Call, Update)
  */
 entity ContractActions : cuid, managed {
-    address            : HexEncoded not null;
-    state              : LargeBinary; // hex-encoded serialized state
+    address            : HexEncoded; // null until the ledger payload is decoded
+    state              : LargeBinary; // null until the ledger payload is decoded
     zswapState         : LargeBinary; // contract-specific zswap state
     actionType         : ContractActionType not null;
     entryPoint         : String(256); // only for CALL actions
@@ -278,6 +278,10 @@ entity SyncState {
 
         // Status
         syncStatus          : SyncStatus default 'stopped';
+        // Bumped inside every rollback transaction. A confirmer commit that
+        // read its outcome under an older generation is refused: the evidence
+        // may belong to the fork that was just rolled back.
+        reorgGeneration     : Integer64 default 0;
         syncProgress        : Decimal(5, 2) default 0;
         blocksPerSecond     : Decimal(10, 2) default 0;
 
@@ -311,7 +315,12 @@ entity PendingSubmissions : cuid, managed {
     submittedAt     : Timestamp not null;
     status          : PendingSubmissionStatus default 'pending';
     finalizedAt     : Timestamp;
-    finalizedTxData : LargeString; // JSON snapshot of crawler-indexed tx
+    finalizedTxData : LargeString; // JSON snapshot of the confirmed inclusion
+    // Inclusion coordinates from the indexer confirmer (0.23.0); a reorg
+    // rollback reverts by chainBlockHeight. Null until confirmed.
+    chainBlockHeight : Integer;
+    chainBlockHash   : HexEncoded;
+    indexerTxHash    : HexEncoded; // the indexer's transaction hash, distinct from txHash (ledger identifier)
     // 0.18.0, INTERNAL (not projected into any service): what the worker
     // announced with the submit-intent of a sponsored attempt (paying
     // sponsor session + account, inspected contract/circuits, dust backing);
@@ -355,7 +364,12 @@ entity BackgroundJobs : cuid, managed {
     submissionId   : UUID; // PendingSubmissions.ID once known
     txHash         : HexEncoded; // external transaction id once known
     chainStatus    : String(20); // pending | success | failure; null = no chain outcome yet/not applicable
-    chainFinalizedAt : Timestamp; // when a canonical System.Events outcome was observed
+    chainFinalizedAt : Timestamp; // when the indexer confirmed the outcome
+    // Inclusion coordinates from the indexer confirmer (0.23.0); a reorg
+    // rollback reverts by chainBlockHeight. Null until confirmed.
+    chainBlockHeight : Integer;
+    chainBlockHash   : HexEncoded;
+    indexerTxHash    : HexEncoded;
 }
 
 /**
@@ -366,6 +380,7 @@ entity PrivateStates {
     key contractAddress : String(200);
     key privateStateId  : String(200);
         ciphertext      : LargeString not null;
+        keyScheme       : String(16); // 'dek1' = under the account DEK; null = legacy derivation (viewing key, ring + viewing key)
         createdAt       : Timestamp;
         updatedAt       : Timestamp;
 }
@@ -377,8 +392,25 @@ entity ContractSigningKeys {
     key accountId       : String(200);
     key contractAddress : String(200);
         ciphertext      : LargeString not null;
+        keyScheme       : String(16); // see PrivateStates.keyScheme
         createdAt       : Timestamp;
         updatedAt       : Timestamp;
+}
+
+/**
+ * Per-account data-encryption key. Private states, signing keys and the
+ * sync-state blobs are encrypted under passwords derived from this DEK. The
+ * DEK is sealed twice: under the ring's active key (rewrappable by the
+ * operator without the viewing key) and under the viewing-key-derived
+ * storage password (a session that presents the viewing key opens it even
+ * after the ring rotated).
+ */
+entity AccountKeys {
+    key accountId              : String(200);
+        wrappedDek             : LargeString not null; // v2 envelope under the ring (key id in the prefix)
+        wrappedDekByViewingKey : LargeString not null; // AES-GCM under HKDF(storage password)
+        createdAt              : Timestamp;
+        rotatedAt              : Timestamp;
 }
 
 /**
@@ -389,6 +421,7 @@ entity WalletSyncStates {
         shieldedStateBlob   : LargeString;
         unshieldedStateBlob : LargeString;
         dustStateBlob       : LargeString;
+        keyScheme           : String(16); // 'dek1' = blobs under the account DEK; null = legacy derivation
         sdkVersion          : String(64) not null;
         networkId           : String(32);
         seedFingerprint     : String(64);

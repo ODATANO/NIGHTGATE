@@ -211,20 +211,31 @@ function mapArgType(node: RawArgTypeNode | undefined, name: string): CircuitArgT
     return { name, kind: 'other' };
 }
 
-// Cache parsed circuit-arg maps per artifact directory; contract-info.json is
-// immutable for a compiled artifact, so parse it once per zkConfigPath.
+// Cache parsed circuit-arg maps per artifact directory, keyed by the
+// contract-info.json's stat identity as well: a runtime re-registration that
+// recompiles under the SAME path must not coerce with the previous artifact.
 const argTypeCache = new Map<string, Map<string, CircuitArgType[]> | null>();
 
+function contractInfoKey(infoPath: string): string {
+    try {
+        const st = fs.statSync(infoPath);
+        return `${infoPath}|${st.size}|${st.mtimeMs}|${st.ino}`;
+    } catch {
+        return `${infoPath}|missing`;
+    }
+}
+
 function loadContractInfo(zkConfigPath: string): Map<string, CircuitArgType[]> | null {
-    if (argTypeCache.has(zkConfigPath)) return argTypeCache.get(zkConfigPath)!;
     const infoPath = path.join(zkConfigPath, 'compiler', 'contract-info.json');
+    const key = contractInfoKey(infoPath);
+    if (argTypeCache.has(key)) return argTypeCache.get(key)!;
     let parsed: { circuits?: RawCircuit[] };
     try {
         parsed = JSON.parse(fs.readFileSync(infoPath, 'utf8'));
     } catch {
         // Missing/unreadable contract-info.json → no introspection available.
         // Tagged values still work; untagged args pass through (back-compat).
-        argTypeCache.set(zkConfigPath, null);
+        argTypeCache.set(key, null);
         return null;
     }
     const byCircuit = new Map<string, CircuitArgType[]>();
@@ -232,7 +243,9 @@ function loadContractInfo(zkConfigPath: string): Map<string, CircuitArgType[]> |
         if (!c.name) continue;
         byCircuit.set(c.name, (c.arguments ?? []).map((a) => mapArgType(a.type, a.name ?? '')));
     }
-    argTypeCache.set(zkConfigPath, byCircuit);
+    // One entry per path: drop a stale generation's map when a new one lands.
+    for (const k of [...argTypeCache.keys()]) if (k.startsWith(infoPath + '|') && k !== key) argTypeCache.delete(k);
+    argTypeCache.set(key, byCircuit);
     return byCircuit;
 }
 

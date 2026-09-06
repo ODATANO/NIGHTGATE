@@ -23,6 +23,8 @@ import {
     type ContractRegistration
 } from './contract-registry';
 import { effectiveModuleFormat, runtimeNodeModulesDir } from './artifact-digest';
+import { hasAllProverKeys } from './prover-keys';
+import { configString } from '../utils/config';
 
 const log = cds.log('nightgate:contracts');
 const PACKAGE_ROOT = path.resolve(__dirname, '..', '..');
@@ -57,7 +59,7 @@ const NAME_RE = /^[a-z0-9][a-z0-9._-]{0,99}$/;
 
 /** The directories a runtime registration may point into. */
 export function allowedContractRoots(): string[] {
-    const raw = process.env.NIGHTGATE_CONTRACTS_DIR?.trim();
+    const raw = configString('NIGHTGATE_CONTRACTS_DIR');
     const roots = raw
         ? raw.split(path.delimiter).map(s => s.trim()).filter(Boolean)
         : [path.join(PACKAGE_ROOT, 'contracts'), path.join(process.cwd(), 'contracts')];
@@ -187,7 +189,7 @@ export async function validateRuntimeRegistration(input: RuntimeRegistrationInpu
     if (!zkirIsDir) {
         throw new ContractRegistrationError(400, `zkConfigPath has no zkir/ directory: ${zkConfigPath}`);
     }
-    const hasProverKeys = keyFiles.some(f => f.endsWith('.prover'));
+    const hasProverKeys = hasAllProverKeys(zkConfigPath);
 
     const probe = await probeArtifactModule(artifactPath);
     if (!probe.ok) {
@@ -329,8 +331,7 @@ function describeContract(name: string, source: 'config' | 'runtime'): ContractL
     if (!reg) return null;
     let artifactDigest: string | null = null;
     try { artifactDigest = getArtifactGenerationDigest(name); } catch { /* reported as null */ }
-    let hasProverKeys = false;
-    try { hasProverKeys = fs.readdirSync(path.join(reg.zkConfigPath, 'keys')).some(f => f.endsWith('.prover')); } catch { /* none */ }
+    const hasProverKeys = hasAllProverKeys(reg.zkConfigPath);
     return {
         name, source,
         artifactPath: reg.artifactPath, zkConfigPath: reg.zkConfigPath, privateStateId: reg.privateStateId,

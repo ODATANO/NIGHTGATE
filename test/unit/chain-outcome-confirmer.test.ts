@@ -12,7 +12,7 @@ const jsonResponse = (data: any, init?: { ok?: boolean; status?: number }) => ({
     json: async () => data
 }) as any;
 
-const txResult = (status: string) => ({ data: { transactions: [{ transactionResult: { status } }] } });
+const txResult = (status: string) => ({ data: { transactions: [{ hash: '0xindexerhash', block: { hash: '0xblockhash', height: 2415919 }, transactionResult: { status } }] } });
 
 describe('mapIndexerStatus', () => {
     test('SUCCESS maps to success', () => {
@@ -38,7 +38,7 @@ describe('createHttpTxConfirmer', () => {
             indexerHttpUrl: 'http://indexer/graphql',
             fetchFn: async () => jsonResponse(txResult('SUCCESS'))
         });
-        await expect(confirm('0xabc')).resolves.toEqual({ status: 'success' });
+        await expect(confirm('0xabc')).resolves.toMatchObject({ status: 'success' });
     });
 
     test('maps FAILURE and PARTIAL_SUCCESS to failure', async () => {
@@ -47,8 +47,36 @@ describe('createHttpTxConfirmer', () => {
                 indexerHttpUrl: 'http://indexer/graphql',
                 fetchFn: async () => jsonResponse(txResult(s))
             });
-            await expect(confirm('0xabc')).resolves.toEqual({ status: 'failure' });
+            await expect(confirm('0xabc')).resolves.toMatchObject({ status: 'failure' });
         }
+    });
+
+    test('carries the inclusion coordinates, and confirms nothing without a block height', async () => {
+        const confirm = createHttpTxConfirmer({
+            indexerHttpUrl: 'http://indexer/graphql',
+            fetchFn: async () => jsonResponse(txResult('SUCCESS'))
+        });
+        await expect(confirm('00identifier')).resolves.toEqual({
+            status: 'success', blockHeight: 2415919, blockHash: '0xblockhash', indexerTxHash: '0xindexerhash'
+        });
+        const bare = createHttpTxConfirmer({
+            indexerHttpUrl: 'http://indexer/graphql',
+            fetchFn: async () => jsonResponse({ data: { transactions: [{ transactionResult: { status: 'SUCCESS' } }] } })
+        });
+        // No height, no confirmation: the height is the rollback coordinate.
+        await expect(bare('00identifier')).resolves.toBeNull();
+        // `block.height: null` is "no height" too (Number(null) would be 0, a plausible block).
+        const nullHeight = createHttpTxConfirmer({
+            indexerHttpUrl: 'http://indexer/graphql',
+            fetchFn: async () => jsonResponse({ data: { transactions: [{ block: { hash: '0xb', height: null }, transactionResult: { status: 'SUCCESS' } }] } })
+        });
+        await expect(nullHeight('00identifier')).resolves.toBeNull();
+        // A digit string is a height (some indexer schemas serialise it that way).
+        const stringHeight = createHttpTxConfirmer({
+            indexerHttpUrl: 'http://indexer/graphql',
+            fetchFn: async () => jsonResponse({ data: { transactions: [{ block: { hash: '0xb', height: '2415919' }, transactionResult: { status: 'SUCCESS' } }] } })
+        });
+        await expect(stringHeight('00identifier')).resolves.toMatchObject({ status: 'success', blockHeight: 2415919 });
     });
 
     test('returns null for an unknown/future status (not confirmed)', async () => {
@@ -109,7 +137,7 @@ describe('createHttpTxConfirmer', () => {
             return offset.identifier ? jsonResponse({ data: { transactions: [] } }) : jsonResponse(txResult('SUCCESS'));
         });
         const confirm = createHttpTxConfirmer({ indexerHttpUrl: 'http://indexer/graphql', fetchFn: fetchFn as any });
-        await expect(confirm('0xabc')).resolves.toEqual({ status: 'success' });
+        await expect(confirm('0xabc')).resolves.toMatchObject({ status: 'success' });
         expect(fetchFn).toHaveBeenCalledTimes(2);
         expect(JSON.parse(fetchFn.mock.calls[1][1].body)).toMatchObject({ variables: { offset: { hash: '0xabc' } } });
     });
@@ -122,6 +150,6 @@ describe('createHttpTxConfirmer', () => {
                 : jsonResponse({ errors: [{ message: 'invalid transaction hash: cannot convert to ByteArray<32>' }] });
         });
         const confirm = createHttpTxConfirmer({ indexerHttpUrl: 'http://indexer/graphql', fetchFn: fetchFn as any });
-        await expect(confirm('00deadbeef')).resolves.toEqual({ status: 'success' });
+        await expect(confirm('00deadbeef')).resolves.toMatchObject({ status: 'success' });
     });
 });

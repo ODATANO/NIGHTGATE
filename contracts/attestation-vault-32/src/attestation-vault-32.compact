@@ -433,23 +433,72 @@ circuit merkleStep(node: Bytes<32>, sibling: Bytes<32>, goesLeft: Boolean): Byte
   return nodeHash(sibling, node);
 }
 
-// ---- Guarded attest (commit-reveal) ----------------------------------------
-// Verbatim from the 16-slot vault; see there for the design rationale.
+// ---- Guarded attest (commit-reveal), lineage 3 -----------------------------
+//
+// attest() is first-come-first-served and its payload hash is a public
+// transaction input, so a mempool observer can front-run a visible attest and
+// own the hash. The guarded path closes that window: record an opaque,
+// caller-bound commitment first (mode 0), reveal later (mode 1).
+//
+// Rules (lineage 3, 0.23.0; the earlier lineage let any older commitment take
+// over any newer attestation, including a revealed one, and a fresh reveal
+// received a NEW sequence, so even the reveal could be front-run):
+//   * A commitment is keyed by (commitment, committer): copying someone's
+//     commitment records a different, inert entry and blocks nothing.
+//   * A commitment EXPIRES. `expires_at` (block time, seconds since epoch) is
+//     asserted in the future and at most MAX_COMMIT_LIFETIME ahead at commit,
+//     and still in the future at reveal. An option cannot be held.
+//   * A fresh reveal inherits the COMMITMENT's sequence as the attestation
+//     epoch, so only a commitment OLDER than the legitimate commit could ever
+//     outrank it, and that requires knowing the hash before it was committed.
+//   * A revealed attestation is FINAL: it is never taken over. Takeover exists
+//     only against a plain attest() that front-ran a reveal, by a commitment
+//     older than that attest. A takeover moves the epoch (claims recorded in
+//     the sniper's window stop verifying), removes content root, schema and
+//     disclosures, and marks the payload guarded.
+//   * Revealing against one's own attestation consumes the commitment and
+//     changes nothing.
+//
+// Scope: a hash that is public BEFORE its commit (a predictable identifier)
+// is first-come-first-served for commits too; bind such ids through the
+// registrar (registerPassport) instead of relying on commit-reveal.
 struct AttestCommitPreimage {
   payload_hash:  Bytes<32>,
   metadata_hash: Bytes<32>,
   nonce:         Bytes<32>
 }
 
-struct AttestCommitRecord {
-  owner: Bytes<32>,
-  seq:   Uint<64>
+// Ledger key of a commitment: bound to the committer.
+struct AttestCommitKey {
+  commitment: Bytes<32>,
+  owner:      Bytes<32>
 }
 
-export ledger attest_commits:    Map<Bytes<32>, AttestCommitRecord>;
-export ledger attestation_seqs:  Map<Bytes<32>, Uint<64>>;
-export ledger attest_seq_next:   Uint<64>;
+struct AttestCommitRecord {
+  owner:      Bytes<32>,
+  seq:        Uint<64>,
+  expires_at: Uint<64>
+}
 
+export ledger attest_commits:       Map<Bytes<32>, AttestCommitRecord>;
+export ledger attestation_seqs:     Map<Bytes<32>, Uint<64>>;
+export ledger attest_seq_next:      Uint<64>;
+// Payloads whose current attestation came from a reveal: takeover-proof.
+export ledger guarded_attestations: Set<Bytes<32>>;
+
+// Longest a commitment may stay open, in seconds (7 days).
+pure circuit maxCommitLifetime(): Uint<64> {
+  return 604800;
+}
+
+// Anyone may attest a NEW payload_hash; this locks in attester_id for the
+// later owner-gated checks. Re-attesting an existing hash is rejected because
+// Map.insert overwrites: without the guard anyone could re-attest a known
+// hash, take over attestation_owners and pass every owner-gated assert.
+// Arguments are caller-provided commitments meant for the chain, hence
+// disclose(). A plain attestation records its sequence and stays open to a
+// takeover by an OLDER commitment (front-run recovery); use the guarded
+// path for any hash that is secret until it is anchored.
 export circuit attest(payload_hash: Bytes<32>, metadata_hash: Bytes<32>): [] {
   assert(!public_attestations.member(disclose(payload_hash)), "already attested");
   public_attestations.insert(disclose(payload_hash), disclose(metadata_hash));
@@ -458,11 +507,25 @@ export circuit attest(payload_hash: Bytes<32>, metadata_hash: Bytes<32>): [] {
   attest_seq_next = (attest_seq_next + 1) as Uint<64>;
 }
 
+// Both phases share ONE circuit: each exported circuit costs ~2.1 KB of
+// verifier key in the deploy transaction, against the node's 32 KiB cap on a
+// transaction's written bytes.
+//   mode 0 (commit): `payload_hash` carries the COMMITMENT (persistentHash
+//     over AttestCommitPreimage, computable off-chain); metadata_hash and
+//     nonce ride as zero dummies; `expires_at` is the commitment's expiry.
+//   mode 1 (reveal): real payload_hash/metadata_hash/nonce, `expires_at` 0.
+//     The circuit recomputes the commitment, finds the caller's own record,
+//     checks it has not expired, then attests (inheriting the commitment's
+//     sequence) or takes over a plain attestation newer than the commitment.
+// Callers: the reveal proves against a ledger snapshot, so if the contested
+// attest lands between proving and application, the reveal fails once and
+// succeeds on re-prove.
 export circuit attestGuarded(
   mode:          Uint<8>,
   payload_hash:  Bytes<32>,
   metadata_hash: Bytes<32>,
-  nonce:         Bytes<32>
+  nonce:         Bytes<32>,
+  expires_at:    Uint<64>
 ): [] {
   const m = disclose(mode);
   assert(m <= 1, "mode out of range");
@@ -470,36 +533,66 @@ export circuit attestGuarded(
   if (m == 0) {
     assert(metadata_hash == zero, "metadata must be the neutral dummy in commit mode");
     assert(nonce == zero, "nonce must be the neutral dummy in commit mode");
-    assert(!attest_commits.member(disclose(payload_hash)), "commitment already recorded");
-    attest_commits.insert(disclose(payload_hash), AttestCommitRecord {
-      owner: disclose(caller_id()),
-      seq:   attest_seq_next
+    // Usable now, and not for longer than the lifetime cap: the transaction
+    // is only valid in a block whose time lies in (expires_at - cap, expires_at).
+    // The kernel comparisons RETURN a boolean (they do not assert); the
+    // recorded result is what the ledger re-checks at application.
+    assert(kernel.blockTimeLessThan(disclose(expires_at)), "commitment expiry must lie in the future");
+    if (disclose(expires_at > maxCommitLifetime())) {
+      assert(kernel.blockTimeGreaterThan(disclose((expires_at - maxCommitLifetime()) as Uint<64>)), "commitment expiry too far ahead");
+    }
+    const key = persistentHash<AttestCommitKey>(AttestCommitKey {
+      commitment: payload_hash,
+      owner:      caller_id()
+    });
+    assert(!attest_commits.member(disclose(key)), "commitment already recorded");
+    attest_commits.insert(disclose(key), AttestCommitRecord {
+      owner:      disclose(caller_id()),
+      seq:        attest_seq_next,
+      expires_at: disclose(expires_at)
     });
     attest_seq_next = (attest_seq_next + 1) as Uint<64>;
     return;
   }
+  assert(expires_at == 0, "expires_at must be the neutral dummy in reveal mode");
   const commitment = persistentHash<AttestCommitPreimage>(AttestCommitPreimage {
     payload_hash:  payload_hash,
     metadata_hash: metadata_hash,
     nonce:         nonce
   });
-  assert(attest_commits.member(disclose(commitment)), "no matching commitment");
-  const rec = attest_commits.lookup(disclose(commitment));
+  const key = persistentHash<AttestCommitKey>(AttestCommitKey {
+    commitment: commitment,
+    owner:      caller_id()
+  });
+  assert(attest_commits.member(disclose(key)), "no matching commitment");
+  const rec = attest_commits.lookup(disclose(key));
   assert(rec.owner == caller_id(), "not committer");
+  assert(kernel.blockTimeLessThan(rec.expires_at), "commitment expired");
+  // Consumed on every successful reveal path: one-shot, never replayable.
+  attest_commits.remove(disclose(key));
   if (!public_attestations.member(disclose(payload_hash))) {
-    attest_commits.remove(disclose(commitment));
     public_attestations.insert(disclose(payload_hash), disclose(metadata_hash));
     attestation_owners.insert(disclose(payload_hash), disclose(caller_id()));
-    attestation_seqs.insert(disclose(payload_hash), attest_seq_next);
-    attest_seq_next = (attest_seq_next + 1) as Uint<64>;
+    attestation_seqs.insert(disclose(payload_hash), rec.seq);
+    guarded_attestations.insert(disclose(payload_hash));
     return;
   }
+  // The branch condition compares against a witness-derived hash; the
+  // outcome (own attestation or not) is public by nature of what follows.
+  if (disclose(attestation_owners.lookup(disclose(payload_hash)) == caller_id())) {
+    // Own attestation: nothing to recover, nothing changes.
+    return;
+  }
+  // Takeover: only a PLAIN attestation, and only by an older commitment. The
+  // recorded sequence becomes the commitment's; sequence values are unique,
+  // so a stale epoch never recurs and claims from the sniper's window die.
+  assert(!guarded_attestations.member(disclose(payload_hash)), "attestation is guarded");
   assert(attestation_seqs.member(disclose(payload_hash)), "attestation predates sequencing");
   assert(rec.seq < attestation_seqs.lookup(disclose(payload_hash)), "attestation predates commitment");
-  attest_commits.remove(disclose(commitment));
   public_attestations.insert(disclose(payload_hash), disclose(metadata_hash));
   attestation_owners.insert(disclose(payload_hash), disclose(caller_id()));
   attestation_seqs.insert(disclose(payload_hash), rec.seq);
+  guarded_attestations.insert(disclose(payload_hash));
   if (content_roots.member(disclose(payload_hash))) {
     content_roots.remove(disclose(payload_hash));
     content_schemas.remove(disclose(payload_hash));

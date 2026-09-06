@@ -21,6 +21,9 @@ import path from 'node:path';
 import type { CapDbPrivateStateProvider } from './CapDbPrivateStateProvider';
 import type { MerkleProofBundle } from '../submission/contract-witnesses';
 import { formatErr } from '../utils/format-error';
+import { isSubmittingMethod, WORKER_ROTATING, WORKER_ROTATED, WorkerSubmitError, isSubmitFailureCode } from './wallet-worker-protocol';
+import { getEncryptionKey } from '../utils/crypto';
+import { configMs, configNumberFrom, resolvedConfigSnapshot } from '../utils/config';
 
 const log = cds.log('nightgate:worker-client');
 
@@ -109,7 +112,19 @@ let rotationAnnounced = false;
 // Worker that announced its rotation and has not exited yet; new calls wait
 // for its exit and go to the respawned worker.
 let drainingWorker: Worker | null = null;
-const WORKER_ROTATING = 'WORKER_ROTATING';
+// Worker being stopped on purpose (stopWalletWorker): its exit is neither a
+// crash nor a rotation.
+let stoppingWorker: Worker | null = null;
+
+/**
+ * Ceiling on a rotation drain (`NIGHTGATE_WORKER_DRAIN_MAX_MS`, default 10
+ * min). A drain waits for in-flight submits only; past the ceiling the worker
+ * is terminated: every submit announced its identifier before sending, so
+ * reconciliation resolves whatever was cut.
+ */
+function drainMaxMs(): number {
+    return configMs('NIGHTGATE_WORKER_DRAIN_MAX_MS');
+}
 
 // Kept at module scope (not on ClientState) so it survives a worker respawn:
 // the sink is wired once at startup and must keep persisting state-save events
@@ -126,12 +141,9 @@ let stateSaveSink: StateSaveSink | undefined;
  * `0` = V8 default (16 MB semi-spaces), clamped to 16..2048.
  */
 export function workerResourceLimits(env: NodeJS.ProcessEnv = process.env): { maxYoungGenerationSizeMb: number } | undefined {
-    const raw = env.NIGHTGATE_WORKER_YOUNG_GEN_MB;
-    if (raw === undefined || raw === '') return { maxYoungGenerationSizeMb: 128 };
-    const n = Number(raw);
-    if (!Number.isFinite(n)) return { maxYoungGenerationSizeMb: 128 };
+    const n = configNumberFrom('NIGHTGATE_WORKER_YOUNG_GEN_MB', env);
     if (n <= 0) return undefined;
-    return { maxYoungGenerationSizeMb: Math.min(2048, Math.max(16, Math.floor(n))) };
+    return { maxYoungGenerationSizeMb: Math.max(16, n) };
 }
 
 let stateSaveChain: Promise<void> = Promise.resolve();
@@ -141,15 +153,17 @@ let stateSaveChain: Promise<void> = Promise.resolve();
 interface PendingRpc { reject: (e: Error) => void; }
 const pendingRpcs = new Set<PendingRpc>();
 
-function rejectAllPendingRpcs(reason: string): void {
+function rejectAllPendingRpcs(reason: string, name?: string): void {
     for (const p of [...pendingRpcs]) {
-        try { p.reject(new Error(reason)); } catch { /* already settled */ }
+        const err = new Error(reason);
+        if (name) err.name = name;
+        try { p.reject(err); } catch { /* already settled */ }
     }
     pendingRpcs.clear();
 }
 
 // Backstop timeout for a single worker RPC.
-const RPC_TIMEOUT_MS = Number(process.env.NIGHTGATE_WORKER_RPC_TIMEOUT_MS || 30 * 60 * 1000);
+const RPC_TIMEOUT_MS = configMs('NIGHTGATE_WORKER_RPC_TIMEOUT_MS');
 
 /**
  * Per-submission private-state provider registry (Phase 2b).
@@ -192,8 +206,11 @@ export async function startWalletWorker(): Promise<void> {
     everStarted = true;
     const entry = resolveWorkerEntry();
     const worker = new Worker(entry, {
-
-        workerData: {},
+        // The worker never parses ENCRYPTION_KEY* itself: it receives the
+        // resolved key ring (sync-state blob binding) from the main thread.
+        // The worker never parses NIGHTGATE_* or ENCRYPTION_KEY* itself: it
+        // receives the resolved configuration and key ring from the main thread.
+        workerData: { encryptionKeyRing: getEncryptionKey().toSpec() ?? null, config: resolvedConfigSnapshot() },
         // Old-generation limit is inherited from NODE_OPTIONS (wallet SDK
         // heap) whether or not resourceLimits is given. The YOUNG generation
         // is sized explicitly (0.21.6): every save tick serializes multi-MB
@@ -231,7 +248,13 @@ export async function startWalletWorker(): Promise<void> {
             // out of order in the DB. The dust-restore push (wallet-worker's
             // dust wedge protection) relies on last-sent-wins.
             stateSaveChain = stateSaveChain
-                .then(() => stateSaveSink?.(msg))
+                .then(() => {
+                    // No sink = nothing persisted = no ack; the worker keeps
+                    // the blobs unconfirmed and re-pushes them. Acking here
+                    // would silently drop a save.
+                    if (!stateSaveSink) throw new Error('no state-save sink wired');
+                    return stateSaveSink(msg);
+                })
                 .then(() => {
                     if (msg.seq != null) worker.postMessage({ kind: 'state-save-ack', sessionId: msg.sessionId, seq: msg.seq });
                 })
@@ -254,6 +277,14 @@ export async function startWalletWorker(): Promise<void> {
             rotationAnnounced = true;
             drainingWorker = worker;
             log.info(`worker announced its rotation (${msg.generations} artifact generations, ${msg.inflight ?? 0} call(s) draining); new calls wait for the respawn`);
+        } else if (msg?.kind === 'rotation-done') {
+            // Nothing submitting is in flight any more; every reply the worker
+            // posted before this message has been delivered. Terminate it here
+            // rather than letting it exit itself mid-reply.
+            rotationAnnounced = true;
+            drainingWorker = worker;
+            log.info(`worker rotation drained (${msg.generations} artifact generations); terminating it, the next call respawns`);
+            void worker.terminate().catch(() => undefined);
         }
     });
 
@@ -262,9 +293,16 @@ export async function startWalletWorker(): Promise<void> {
         rejectAllPendingRpcs(`wallet-worker crashed: ${err instanceof Error ? err.message : String(err)}`);
     });
     worker.on('exit', code => {
-        client = null;
+        // A replacement started meanwhile (stop, then start) must not be orphaned
+        // by the old worker's late exit event.
+        if (client?.worker === worker) client = null;
         if (drainingWorker === worker) drainingWorker = null;
-        if (rotationAnnounced && code === 0) {
+        const stopped = stoppingWorker === worker;
+        const rotated = !stopped && rotationAnnounced;
+        if (stopped) {
+            stoppingWorker = null;
+            log.info(`worker stopped (code=${code})`);
+        } else if (rotated) {
             rotationAnnounced = false;
             workerRotationCount += 1;
             log.info(`worker rotated (controlled exit after its generation budget); the next call respawns it`);
@@ -282,7 +320,11 @@ export async function startWalletWorker(): Promise<void> {
         void notifyWorkerGone('exit');
         // Fail every in-flight call now; their reply ports are dead and would
         // otherwise never settle. The next rpc() lazily respawns the worker.
-        rejectAllPendingRpcs(`wallet-worker exited (code=${code}) with in-flight calls`);
+        // A rotation names its rejection so rpc() can repeat a read on the respawn.
+        rejectAllPendingRpcs(
+            rotated ? `wallet-worker rotated with in-flight calls` : `wallet-worker exited (code=${code}) with in-flight calls`,
+            rotated ? WORKER_ROTATED : undefined
+        );
     });
 
     await readyPromise;
@@ -290,30 +332,45 @@ export async function startWalletWorker(): Promise<void> {
 }
 
 /**
- * Stop the worker. Safe to call multiple times. Waits up to `timeoutMs` for
- * graceful exit before terminating.
+ * Stop the worker. Safe to call multiple times. First asks the worker to
+ * evict every facade (final state save, acked by the sink, keys zeroed),
+ * bounded by `timeoutMs`; then terminates it. The flush needs the save sink
+ * still wired, so callers run this BEFORE dropping encryption keys.
  */
-export async function stopWalletWorker(timeoutMs = 5000): Promise<void> {
+export async function stopWalletWorker(timeoutMs = 60_000): Promise<void> {
     if (!client) return;
     const w = client.worker;
-    client = null;
     // Intentional teardown: do NOT let a later rpc respawn the worker.
     everStarted = false;
     try {
-        await Promise.race([
-            new Promise<void>(resolve => w.once('exit', () => resolve())),
-            new Promise<void>(resolve => setTimeout(resolve, timeoutMs))
-        ]);
-    } finally {
-        // Force-terminate if still alive.
-        try { await w.terminate(); } catch { }
-        // The exit handler normally does this, but a forced terminate after
-        // the timeout must not leave the main thread believing in facades.
-        syncProgressCache.clear();
-        // Intentional teardown, so listeners may finish their work and release
-        // everything; this is the only path that can wait for them.
-        await notifyWorkerGone('stop');
+        const r = await rpcOnce<{ evicted: number; failed: number }>('shutdown', {}, timeoutMs);
+        if (r.failed > 0) log.error(`worker shutdown: ${r.evicted} facade(s) evicted, ${r.failed} WITHOUT a confirmed final save`);
+        else log.info(`worker shutdown: ${r.evicted} facade(s) evicted, all saves confirmed`);
+    } catch (err) {
+        if ((err as Error)?.name === WORKER_ROTATING) {
+            // A rotating worker flushes its facades itself and asks to be
+            // terminated (rotation-done); wait for that instead of cutting it.
+            log.info('worker is rotating during shutdown; waiting for its own facade flush and exit');
+            if (!drainingWorker) drainingWorker = w;
+            await Promise.race([
+                new Promise<void>(resolve => { w.once('exit', () => resolve()); if (drainingWorker !== w) resolve(); }),
+                new Promise<void>(resolve => { const t = setTimeout(resolve, timeoutMs); (t as any).unref?.(); })
+            ]);
+        } else {
+            log.warn(`worker shutdown flush did not complete: ${err instanceof Error ? err.message : String(err)}; terminating`);
+        }
     }
+    if (client?.worker !== w) return; // replaced or already gone meanwhile
+    client = null;
+    stoppingWorker = w;
+    // Terminate (the flush is done or timed out; nothing else keeps the thread).
+    try { await w.terminate(); } catch { }
+    // The exit handler normally does this, but a forced terminate after
+    // the timeout must not leave the main thread believing in facades.
+    syncProgressCache.clear();
+    // Intentional teardown, so listeners may finish their work and release
+    // everything; this is the only path that can wait for them.
+    await notifyWorkerGone('stop');
 }
 
 /**
@@ -382,13 +439,23 @@ export type SubmitIntentHook = (txHash: string, intent: SubmitIntentInfo) => Pro
 
 async function rpc<T>(method: string, args: unknown, timeoutMs: number = RPC_TIMEOUT_MS, onSubmitIntent?: SubmitIntentHook): Promise<T> {
     // A rotating worker takes no new work: wait for its exit, then call the
-    // respawned worker. A WORKER_ROTATING refusal is retried once the same way.
+    // respawned worker. A WORKER_ROTATING refusal is retried once the same way,
+    // and so is a read or wait the rotation exit cut off (WORKER_ROTATED); a
+    // submitting call is never repeated (its identifier was announced; the
+    // job reconciles it).
     for (let attempt = 0; ; attempt++) {
         await waitForDrainingWorker();
         try {
             return await rpcOnce<T>(method, args, timeoutMs, onSubmitIntent);
         } catch (err) {
-            if ((err as Error)?.name === WORKER_ROTATING && attempt === 0) continue;
+            const name = (err as Error)?.name;
+            if (attempt === 0 && name === WORKER_ROTATING) {
+                // The refusal can arrive before the `rotating` announcement
+                // (two ports): mark the worker draining from the refusal itself.
+                if (!drainingWorker && client) drainingWorker = client.worker;
+                continue;
+            }
+            if (attempt === 0 && name === WORKER_ROTATED && !isSubmittingMethod(method)) continue;
             throw err;
         }
     }
@@ -397,11 +464,19 @@ async function rpc<T>(method: string, args: unknown, timeoutMs: number = RPC_TIM
 async function waitForDrainingWorker(): Promise<void> {
     const w = drainingWorker;
     if (!w) return;
+    const ceiling = drainMaxMs();
     await new Promise<void>(resolve => {
-        const done = () => resolve();
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        const done = () => { if (timer) clearTimeout(timer); resolve(); };
         w.once('exit', done);
         // Exit fired before we subscribed: the exit handler cleared it.
-        if (drainingWorker !== w) { w.off('exit', done); resolve(); }
+        if (drainingWorker !== w) { w.off('exit', done); resolve(); return; }
+        timer = setTimeout(() => {
+            if (drainingWorker !== w) return;
+            log.warn(`worker rotation drain exceeded ${ceiling}ms; terminating the draining worker (in-flight submits announced their identifiers, reconciliation resolves them)`);
+            void w.terminate().catch(() => undefined);
+        }, ceiling);
+        (timer as any).unref?.();
     });
 }
 
@@ -454,6 +529,13 @@ async function rpcOnce<T>(method: string, args: unknown, timeoutMs: number, onSu
             }
             const payload = msg?.error;
             if (payload && typeof payload === 'object' && typeof payload.message === 'string') {
+                // A classified failure (submitting methods) keeps its code,
+                // ledger code, retryability, batch stages and cause chain as
+                // data; the main thread never re-derives them from the text.
+                if (isSubmitFailureCode(payload.code)) {
+                    reject(new WorkerSubmitError(payload));
+                    return;
+                }
                 const err = new Error(payload.message);
                 if (typeof payload.name === 'string' && payload.name) err.name = payload.name;
                 reject(err);
@@ -577,9 +659,11 @@ export function walletWaitForSyncedState(sessionId: string, timeoutMs?: number, 
     return rpc('waitForSyncedState', { sessionId, timeoutMs, stallMs }, workerBudgetMs + 5 * 60 * 1000);
 }
 
-export async function walletEvict(sessionId: string): Promise<{ evicted: boolean }> {
+export async function walletEvict(sessionId: string): Promise<{ evicted: boolean; saved?: boolean }> {
     try {
-        return await rpc('evict', { sessionId });
+        // awaitSaveAck: the reply lets the caller drop the session from the
+        // save registry, so the worker's final save must be persisted first.
+        return await rpc('evict', { sessionId, awaitSaveAck: true });
     } finally {
         // The facade is gone either way; a surviving snapshot would report a
         // catch-up that nothing is running any more.
@@ -662,8 +746,8 @@ export function walletRegisterDustGeneration(args: {
     sessionId: string;
     dustReceiverAddress?: string;
     syncTimeoutMs?: number;
-}): Promise<RegisterDustGenerationOutcome> {
-    return rpc('registerDustGeneration', args);
+}, onSubmitIntent?: SubmitIntentHook): Promise<RegisterDustGenerationOutcome> {
+    return rpc('registerDustGeneration', args, RPC_TIMEOUT_MS, onSubmitIntent);
 }
 
 /** Outcome of `registerDustGeneration` (0.21.0). */
@@ -705,12 +789,12 @@ export function walletDeregisterDustGeneration(args: {
      * wallet whose whole generation is delegated away (own dust stays 0).
      */
     sponsorSessionId?: string;
-}): Promise<{
+}, onSubmitIntent?: SubmitIntentHook): Promise<{
     txId: string | null;
     deregisteredCount: number;
     totalNightUtxos: number;
 }> {
-    return rpc('deregisterDustGeneration', args);
+    return rpc('deregisterDustGeneration', args, RPC_TIMEOUT_MS, onSubmitIntent);
 }
 
 /**
@@ -728,13 +812,13 @@ export function walletTransferNight(args: {
     syncTimeoutMs?: number;
     /** Raw token type (64 hex) to send instead of NIGHT. */
     tokenTypeHex?: string;
-}): Promise<{
+}, onSubmitIntent?: SubmitIntentHook): Promise<{
     txId: string;
     toLedger: 'shielded' | 'unshielded';
     amount: string;
     receiverAddress: string;
 }> {
-    return rpc('transferNight', args);
+    return rpc('transferNight', args, RPC_TIMEOUT_MS, onSubmitIntent);
 }
 
 /**
@@ -781,6 +865,7 @@ export function walletEstimateTransferFee(args: {
     amount: string;
     ttlIso?: string;
     syncTimeoutMs?: number;
+    tokenTypeHex?: string;
 }): Promise<{ fee: string; toLedger: 'shielded' | 'unshielded' }> {
     return rpc('estimateTransferFee', args);
 }
@@ -833,36 +918,23 @@ export interface WalletSubmitContractCallArgs {
  * owns the SDK and the wallet facade; private-state CRUD round-trips back to
  * the main-side provider registered under `proxyId`.
  */
-export function walletDeployContract(args: WalletDeployContractArgs): Promise<{
+export function walletDeployContract(args: WalletDeployContractArgs, onSubmitIntent?: SubmitIntentHook): Promise<{
     txHash: string;
     contractAddress: string;
     onChainStatus: string;
 }> {
-    return rpc('deployContract', args);
+    return rpc('deployContract', args, RPC_TIMEOUT_MS, onSubmitIntent);
 }
 
 /**
  * Invoke a circuit on a deployed contract through the worker. Same wiring as
  * `walletDeployContract`. Returns the submission txHash + on-chain status.
  */
-export function walletSubmitContractCall(args: WalletSubmitContractCallArgs): Promise<{
+export function walletSubmitContractCall(args: WalletSubmitContractCallArgs, onSubmitIntent?: SubmitIntentHook): Promise<{
     txHash: string;
     onChainStatus: string;
 }> {
-    return rpc('submitContractCall', args);
-}
-
-/**
- * EXPERIMENTAL PROTOTYPE (cross-server-fee-sponsoring FR). The caller builds +
- * signs + finalizes a contract call (phase 1), the finalized tx round-trips
- * through serialize/deserialize, and the sponsor session balances dust onto it
- * and submits (phase 2). Same worker for now; proving the round-trip is the
- * point. `sponsorSessionId` is required.
- */
-export function walletProbeCrossServerSponsor(
-    args: WalletSubmitContractCallArgs & { sponsorSessionId: string }
-): Promise<{ txHash: string; serializedBytes: number; roundTrip: boolean }> {
-    return rpc('probeCrossServerSponsor', args);
+    return rpc('submitContractCall', args, RPC_TIMEOUT_MS, onSubmitIntent);
 }
 
 /**
@@ -913,12 +985,12 @@ export interface WalletSubmitContractCallBatchArgs extends Omit<WalletSubmitCont
  * (the worker batches them via the SDK's withContractScopedTransaction).
  * Returns the one submission txHash + on-chain status for the whole batch.
  */
-export function walletSubmitContractCallBatch(args: WalletSubmitContractCallBatchArgs): Promise<{
+export function walletSubmitContractCallBatch(args: WalletSubmitContractCallBatchArgs, onSubmitIntent?: SubmitIntentHook): Promise<{
     txHash: string;
     onChainStatus: string;
     circuits: string[];
 }> {
-    return rpc('submitContractCallBatch', args);
+    return rpc('submitContractCallBatch', args, RPC_TIMEOUT_MS, onSubmitIntent);
 }
 
 /** Test-only: reset the singleton so subsequent calls re-spawn. */
@@ -931,6 +1003,10 @@ export function __resetWalletWorkerForTests(): void {
     workerExitCount = 0;
     lastExitCode = null;
     lastExitAt = null;
+    workerRotationCount = 0;
+    rotationAnnounced = false;
+    drainingWorker = null;
+    stoppingWorker = null;
 }
 
 /**

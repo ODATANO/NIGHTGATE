@@ -9,7 +9,7 @@
  *     registered BEFORE all other before-hooks so the effective user is
  *     already the grant's operator when owner-scoping hooks read it.
  *
- * Model (see docs/feature-requests/agent-access-layer.md): the token is a
+ * Model: the token is a
  * bearer capability, NOT an identity. On-chain authority stays the session
  * wallet; the grant only restricts. Transport authentication remains the
  * host app's concern; the token authorizes and scopes WITHIN the service,
@@ -39,18 +39,20 @@ import { AgentGrants, WalletSessions } from '#cds-models/midnight';
 import { RateLimiter } from '../utils/rate-limiter';
 import { PLATFORM_POOL_SENTINEL } from '../submission/sponsor-pool';
 import { getConfiguredFeeSponsorSessions } from '../submission/fee-sponsor';
-import { validatePolicyList, validateTokenTypeList } from '../submission/sponsor-policy';
+import { GrantPolicyInput, validatePolicyList, validateTokenTypeList } from '../submission/sponsor-policy';
 import { withKeyedLock } from '../utils/keyed-lock';
 import { runWithoutAmbientTx } from '../submission/background-jobs';
 import { resolveFeeSponsor, FeeSponsorError } from '../submission/fee-sponsor';
 import { getNightgatePluginConfig } from '../utils/nightgate-config';
 import { isSessionExpired } from '../utils/session-expiry';
+import { AGENT_TOKEN_HEADER, AGENT_TOKEN_TRANSPORT_USER } from '../utils/agent-token-transport';
+import { principalRateKey } from '../utils/rate-limiter';
 
 const { SELECT, INSERT, UPDATE } = cds.ql;
 
 const log = cds.log('nightgate:agent-grants');
 
-export const AGENT_TOKEN_HEADER = 'x-agent-token';
+export { AGENT_TOKEN_HEADER };
 const TOKEN_PREFIX = 'ngat_';
 const TOKEN_BYTES = 32;
 
@@ -114,6 +116,11 @@ export const AGENT_ALWAYS_ALLOWED_EVENTS: ReadonlySet<string> = new Set([
 
 const grantAdminRateLimiter = new RateLimiter({ windowMs: 60 * 60 * 1000, maxRequests: 10 });
 
+/** Forget every rate-limit window (tests: one principal serves every case). */
+export function __resetGrantRateLimiterForTests(): void {
+    grantAdminRateLimiter.reset();
+}
+
 interface AgentGrantRow {
     ID: string;
     userId: string;
@@ -132,6 +139,7 @@ interface AgentGrantRow {
     allowedTokenTypes?: string | null; // JSON array of raw token types, or null
     validUntil?: string | null;
     isActive?: boolean;
+    revokedAt?: string | null;
 }
 
 /** Anything that runs a CQL statement: the db service, or one transaction of it. */
@@ -209,6 +217,23 @@ export async function releaseDeployBudget(db: Runner, grantId: string, count: nu
 }
 
 /** A grant's JSON list column as an array; malformed or absent = no narrowing. */
+/**
+ * The grant's CURRENT policy input for a job that was admitted earlier. The
+ * sponsoring executors re-resolve the policy per job, so a revoke or a
+ * narrowed grant applies to queued jobs too. `null` = revoked or gone.
+ */
+export async function currentGrantPolicy(runner: Runner, grantId: string): Promise<GrantPolicyInput | null> {
+    const grant = await runner.run(SELECT.one.from(AgentGrants).where({ ID: grantId })) as AgentGrantRow | null;
+    if (!grant || grant.isActive === false || grant.revokedAt) return null;
+    return {
+        allowedContracts: parseGrantList(grant.allowedContracts),
+        allowedCircuits: parseGrantList(grant.allowedCircuits),
+        deployedContracts: parseGrantList(grant.deployedContracts),
+        allowedTokenTypes: parseGrantList(grant.allowedTokenTypes),
+        allowDeploy: grant.allowDeploy === true
+    };
+}
+
 function parseGrantList(raw: string | null | undefined): string[] {
     if (!raw) return [];
     try {
@@ -237,7 +262,7 @@ function utcDay(now: Date = new Date()): string {
 
 export function registerAgentGrantHandlers(srv: any, db: any): void {
     srv.on('createAgentGrant', async (req: Request) => {
-        const clientKey = (req as any)?._.req?.ip || 'global';
+        const clientKey = principalRateKey(req, 'grant-admin');
         const rate = grantAdminRateLimiter.check(clientKey);
         if (!rate.allowed) {
             return req.reject(429, `Rate limited. Retry after ${Math.ceil(rate.retryAfterMs / 1000)}s`);
@@ -424,13 +449,47 @@ export function registerAgentGrantHandlers(srv: any, db: any): void {
  * before-hook.
  */
 export function attachAgentGrantEnforcement(srv: any, db: any): void {
-    srv.before('*', (req: Request) => enforceAgentGrant(req, db));
+    srv.before('*', (req: Request) => {
+        // CAP runs every before-handler of an event in PARALLEL (Promise.all in
+        // srv-dispatch), so the principal swap below, which comes after an
+        // awaited grant lookup, would land after a synchronous owner-scoping
+        // hook already read the transport marker. Those hooks await this.
+        const resolution = enforceAgentGrant(req, db);
+        (req as any)[AGENT_PRINCIPAL_READY] = resolution.then(() => undefined, () => undefined);
+        return resolution;
+    });
+}
+
+const AGENT_PRINCIPAL_READY = Symbol.for('nightgate.agentPrincipalReady');
+
+/**
+ * Await the effective principal. Every before-hook that reads `req.user`
+ * (owner scoping) calls this first; without a token request it resolves at
+ * once. Registration order alone does not sequence CAP's before-handlers.
+ */
+export async function awaitAgentPrincipal(req: Request): Promise<void> {
+    const ready = (req as any)[AGENT_PRINCIPAL_READY];
+    if (ready) await ready;
 }
 
 /** Exported for unit tests; see module doc for the enforcement ladder. */
 export async function enforceAgentGrant(req: Request, db: any): Promise<unknown> {
-    const token = (req as any)?._?.req?.headers?.[AGENT_TOKEN_HEADER];
-    if (!token || typeof token !== 'string') return; // normal principal path
+    // `req.headers` is CAP's merged view: for a $batch part it is the envelope's
+    // headers overlaid with the part's own (libx/odata/middleware/operation.js),
+    // so the token an agent sends on the batch request reaches every part;
+    // `_.req.headers` alone is only the synthetic part request.
+    const token = (req as any)?.headers?.[AGENT_TOKEN_HEADER] ?? (req as any)?._?.req?.headers?.[AGENT_TOKEN_HEADER];
+    if (!token || typeof token !== 'string') {
+        // Transport auth admitted this request on a token it did not validate
+        // (the standalone image's agent-token lane) and this hook cannot see
+        // the token, so nobody has authenticated it: a $batch part carries only
+        // its own headers while the envelope's principal is inherited. The
+        // marker principal must never reach a handler as an authenticated user.
+        if ((req as any)?.user?.id === AGENT_TOKEN_TRANSPORT_USER) {
+            return req.reject(401, 'agent token required');
+        }
+        return; // normal principal path
+    }
 
     if (!token.startsWith(TOKEN_PREFIX)) {
         return req.reject(401, 'invalid agent token');
@@ -504,6 +563,10 @@ export async function enforceAgentGrant(req: Request, db: any): Promise<unknown>
                 return req.reject(403, 'sponsorSessionId does not match this agent grant');
             }
             data.sponsorSessionId = grant.sponsorSessionId;
+        } else if (allowlisted && data.sponsorSessionId !== undefined && data.sponsorSessionId !== null && data.sponsorSessionId !== '') {
+            // An unpinned grant does not inherit the operator's sponsors: a
+            // token may only spend fee budget the grant names explicitly.
+            return req.reject(403, 'this agent grant has no sponsor binding; issue the grant with sponsorSessionId to sponsor its jobs');
         }
     }
 
@@ -513,6 +576,15 @@ export async function enforceAgentGrant(req: Request, db: any): Promise<unknown>
         if (!consumed) {
             return req.reject(429, `agent grant daily job budget exhausted (${grant.maxJobsPerDay}/day)`);
         }
+        // A request the handler refuses as invalid (400..428: bad input,
+        // unknown session, session not signing) admitted no job: give the unit
+        // back. 429 and every 5xx keep it (over-count rather than under-count).
+        (req as any).on?.('failed', (err: any) => {
+            const status = Number(err?.status ?? err?.statusCode ?? err?.code);
+            if (Number.isInteger(status) && status >= 400 && status < 429) {
+                void refundDailyBudget(db, grant).catch((e: unknown) => log.warn(`daily budget refund for grant ${grant.ID} failed: ${String((e as Error)?.message ?? e)}`));
+            }
+        });
     }
 
     // Effective principal: the operator. All existing userId gates now apply.
@@ -539,6 +611,15 @@ export async function enforceAgentGrant(req: Request, db: any): Promise<unknown>
  * the OLD window value) and a bounded increment (`jobsUsedToday < max`).
  * Both run detached; whichever statement reports an affected row wins.
  */
+/** Undo one consumeDailyBudget within the same UTC day (a refused request created no job). */
+async function refundDailyBudget(db: any, grant: AgentGrantRow): Promise<void> {
+    await runWithoutAmbientTx(() => db.run(
+        UPDATE.entity(AgentGrants)
+            .set({ jobsUsedToday: { '-=': 1 } })
+            .where({ ID: grant.ID, budgetWindow: utcDay(), jobsUsedToday: { '>': 0 } })
+    ));
+}
+
 async function consumeDailyBudget(db: any, grant: AgentGrantRow): Promise<boolean> {
     const today = utcDay();
     const max = grant.maxJobsPerDay as number;

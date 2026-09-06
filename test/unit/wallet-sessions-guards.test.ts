@@ -2,7 +2,7 @@
  * Guard-branch tests for srv/sessions/wallet-sessions.ts.
  *
  * wallet-sessions.test.ts covers the happy paths; this file covers the
- * rejection ladders that were uncovered until the coverage review:
+ * rejection ladders:
  *   - the deriveWalletInfo HANDLER (rate limit, auth, validation, and the
  *     "error paths never echo the secret" guarantee; the util itself is
  *     covered in wallet-info.test.ts)
@@ -90,7 +90,7 @@ vi.mock('../../srv/utils/wallet-info', () => ({
 import cds from '@sap/cds';
 import { encrypt, getEncryptionKey } from '../../srv/utils/crypto';
 import { RateLimiter } from '../../srv/utils/rate-limiter';
-import { registerWalletSessionHandlers, startSessionCleanup } from '../../srv/sessions/wallet-sessions';
+import { registerWalletSessionHandlers, startSessionCleanup, __resetWalletRateLimitersForTests } from '../../srv/sessions/wallet-sessions';
 
 const TEST_USER_ID = 'guard-user';
 let __ipCounter = 0;
@@ -145,6 +145,7 @@ describe('wallet session guard branches', () => {
     });
 
     beforeEach(() => {
+        __resetWalletRateLimitersForTests();
         vi.clearAllMocks();
         for (const k of NIGHTGATE_ENV_KEYS) delete process.env[k];
         (cds.env as any).requires = { nightgate: {} };

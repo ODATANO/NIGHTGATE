@@ -15,8 +15,8 @@
  * real providers + artifact.
  */
 import cds from '@sap/cds';
-import { pathToFileURL } from 'node:url';
 import { DisclosureGrants } from '#cds-models/midnight';
+import { importArtifactByPath } from './contract-registry';
 
 const { SELECT, INSERT, UPDATE } = cds.ql;
 
@@ -182,7 +182,7 @@ export async function reindexDisclosuresForContract(
 
     const { buildContractProviders } = await import('../midnight/providers.js');
     const bundle = await buildContractProviders(contractProvidersConfig);
-    const artifact: any = await import(pathToFileURL(artifactPath).href);
+    const artifact: any = await importArtifactByPath(artifactPath);
 
     return reindexDisclosures({
         db,

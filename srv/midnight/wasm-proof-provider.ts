@@ -61,7 +61,7 @@ export async function getSharedKeyMaterialProvider(): Promise<{ lookupKey(loc: s
 
 /** True when NIGHTGATE_PROVING_MODE selects in-process WASM proving. */
 export function isWasmProvingMode(): boolean {
-    return (process.env.NIGHTGATE_PROVING_MODE || 'server').trim().toLowerCase() === 'wasm';
+    return configEnum('NIGHTGATE_PROVING_MODE') === 'wasm';
 }
 
 /**
@@ -101,3 +101,5 @@ export async function buildWasmProofProvider(zkConfigProvider: any): Promise<{ p
         proveTx: (unprovenTx: any) => unprovenTx.prove(provingProvider, ledger.CostModel.initialCostModel())
     };
 }
+
+import { configEnum } from '../utils/config';

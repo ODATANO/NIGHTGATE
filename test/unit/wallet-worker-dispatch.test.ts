@@ -53,6 +53,9 @@ process.env.NIGHTGATE_SUBMIT_WATCH_TIMEOUT_MS = '3000';
 // never knows a tx); the wait itself is covered by the watchdog test, which
 // stubs an indexer that DOES know the tx.
 process.env.NIGHTGATE_SPONSOR_INDEXER_VISIBLE_MS = '0';
+// evict awaits the main thread's ack of its final save (bounded); the fake
+// parent port acks nothing unless a test says so, so keep the bound short.
+process.env.NIGHTGATE_RESTORE_SAVE_ACK_TIMEOUT_MS = '50';
 
 // ---- SDK seams --------------------------------------------------------------
 
@@ -251,7 +254,8 @@ function makeFakeFacade() {
         revert: vi.fn(async () => undefined),
         transferTransaction: vi.fn(async () => ({ type: 'UNPROVEN_TRANSACTION', transaction: { unproven: true } })),
         signRecipe: vi.fn(async (r: any) => r),
-        finalizeRecipe: vi.fn(async () => ({ finalized: true })),
+        // identifiers(): every submit announces the last one before broadcasting
+        finalizeRecipe: vi.fn(async () => ({ finalized: true, identifiers: () => ['tx-id-fixture'] })),
         submitTransaction: vi.fn(async () => 'tx-hash-fixture'),
         calculateTransactionFee: vi.fn(async () => 42n),
         registerNightUtxosForDustGeneration: vi.fn(async () => ({ type: 'RECIPE', transaction: { reg: true } })),
@@ -368,6 +372,9 @@ describe('dispatcher', () => {
         expect(reply.ok).toBe(false);
         expect(reply.error.message).toMatch(/Unknown method: definitely-not-a-method/);
         expect(reply.error.name).toBe('Error');
+        // Not a submitting method: no classification rides along.
+        expect(reply.error.code).toBeUndefined();
+        expect(reply.error.causes).toEqual([]);
     });
 
     it('warns (via the log push) on malformed messages instead of crashing', () => {
@@ -468,7 +475,7 @@ describe('init', () => {
             expect(facadeInit.mock.calls[0][0].provingService).toBeUndefined();
             const warns = fakeParentPort.postMessage.mock.calls
                 .map(c => c[0])
-                .filter((m: any) => m.kind === 'log' && m.level === 'warn' && /NIGHTGATE_PROVING_MODE 'gpu'/.test(m.message));
+                .filter((m: any) => m.kind === 'log' && m.level === 'warn' && /NIGHTGATE_PROVING_MODE: 'gpu' is not one of/.test(m.message));
             expect(warns.length).toBe(1);
         } finally {
             delete process.env.NIGHTGATE_PROVING_MODE;
@@ -494,6 +501,62 @@ describe('evict', () => {
         const reply = await rpc('evict', { sessionId: 'ghost-session-xxxxxxxxxxxxx' });
         expect(reply.ok).toBe(true);
         expect(reply.result.evicted).toBe(false);
+    });
+
+    it('evict waits for the main thread to ack the final save before replying', async () => {
+        await initSession('session-evict-acked-aaaaaaaa');
+        fakeParentPort.postMessage.mockClear();
+        let ackedSeq: number | undefined;
+        const base = fakeParentPort.postMessage.getMockImplementation()!;
+        fakeParentPort.postMessage.mockImplementation((m: any) => {
+            base(m);
+            if (m?.kind === 'state-save' && m.sessionId === 'session-evict-acked-aaaaaaaa') {
+                ackedSeq = m.seq;
+                setTimeout(() => fakeParentPort.emit('message', { kind: 'state-save-ack', sessionId: m.sessionId, seq: m.seq }), 5);
+            }
+        });
+        try {
+            const reply = await rpc('evict', { sessionId: 'session-evict-acked-aaaaaaaa', awaitSaveAck: true });
+            expect(reply.result.evicted).toBe(true);
+            expect(ackedSeq).toBeDefined();
+            const timeouts = fakeParentPort.postMessage.mock.calls.map(c => c[0])
+                .filter((m: any) => m.kind === 'log' && /final-save failed/.test(m.message));
+            expect(timeouts).toEqual([]);
+        } finally {
+            fakeParentPort.postMessage.mockImplementation(base);
+        }
+    });
+
+    it('shutdown evicts every facade, closes admission and reports the count', async () => {
+        await initSession('session-shutdown-1-aaaaaaaaaa');
+        await initSession('session-shutdown-2-aaaaaaaaaa');
+        fakeParentPort.postMessage.mockClear();
+        // a healthy persist layer acks every final save
+        const base = fakeParentPort.postMessage.getMockImplementation()!;
+        fakeParentPort.postMessage.mockImplementation((m: any) => {
+            base(m);
+            if (m?.kind === 'state-save') setTimeout(() => fakeParentPort.emit('message', { kind: 'state-save-ack', sessionId: m.sessionId, seq: m.seq }), 2);
+        });
+        try {
+            const reply = await rpc('shutdown', {});
+            expect(reply.ok).toBe(true);
+            // every facade this file has left alive goes, incl. the two above
+            expect(reply.result.failed).toBe(0);
+            expect(reply.result.evicted).toBeGreaterThanOrEqual(2);
+            const saved = stateSaves().map((m: any) => m.sessionId);
+            expect(saved).toContain('session-shutdown-1-aaaaaaaaaa');
+            expect(saved).toContain('session-shutdown-2-aaaaaaaaaa');
+            // admission is closed: the main thread terminates the worker next
+            const refused = await rpc('evict', { sessionId: 'session-shutdown-1-aaaaaaaaaa' });
+            expect(refused.ok).toBe(false);
+            expect(refused.error?.name).toBe('WORKER_ROTATING');
+        } finally {
+            fakeParentPort.postMessage.mockImplementation(base);
+            workerExports.__resetRotationForTests();
+            // shutdown evicted EVERY facade, incl. the file's default session
+            // that later describes rely on; bring it back.
+            await initSession(INIT_ARGS.sessionId);
+        }
     });
 });
 
@@ -827,6 +890,58 @@ describe('buildWorkerWalletProvider', () => {
         expect(provider.getEncryptionPublicKey()).toBe('epk');
     });
 
+    it('submitTx announces the identifier on the reply port and sends only after the ack (bound channel)', async () => {
+        const { entry, facade, finalized } = makeEntry(DUST_OK);
+        (finalized as any).identifiers = () => ['tx-bound-1'];
+        const { port1, port2 } = new MessageChannel();
+        const seen: any[] = [];
+        const order: string[] = [];
+        port2.on('message', (m: any) => {
+            if (m?.kind === 'submit-intent') {
+                seen.push(m); order.push('intent');
+                port2.postMessage({ kind: 'submit-intent-ack', txHash: m.txHash, ok: true });
+            }
+        });
+        facade.submitTransaction = vi.fn(async () => { order.push('send'); return 'tx-bound-1'; });
+        try {
+            const provider = workerExports.buildWorkerWalletProvider(entry, { replyPort: port1, contractAddress: 'c'.repeat(64), circuits: ['increment'] });
+            await provider.submitTx(finalized);
+            expect(seen).toHaveLength(1);
+            expect(seen[0]).toMatchObject({ txHash: 'tx-bound-1', contractAddress: 'c'.repeat(64), circuits: ['increment'] });
+            expect(order).toEqual(['intent', 'send']);
+        } finally {
+            port1.close(); port2.close();
+        }
+    });
+
+    it('a nacked intent is never broadcast: the tx is reverted and the dust snapshot restored', async () => {
+        const { entry, facade, finalized } = makeEntry(DUST_OK);
+        (finalized as any).identifiers = () => ['tx-bound-2'];
+        (entry as any).preSubmitDustSnapshot = 'du-blob';
+        facade.dust.stop = vi.fn(async () => undefined);
+        dustRestore.mockClear();
+        const { port1, port2 } = new MessageChannel();
+        port2.on('message', (m: any) => {
+            if (m?.kind === 'submit-intent') port2.postMessage({ kind: 'submit-intent-ack', txHash: m.txHash, ok: false, error: 'db down: cannot record txHash' });
+        });
+        try {
+            const provider = workerExports.buildWorkerWalletProvider(entry, { replyPort: port1, note: 'transfer' });
+            await expect(provider.submitTx(finalized)).rejects.toThrow(/submit-intent rejected.*cannot record txHash/);
+            expect(facade.submitTransaction).not.toHaveBeenCalled();
+            expect(facade.revert).toHaveBeenCalledWith(finalized);
+            expect(dustRestore).toHaveBeenCalledWith('du-blob');
+        } finally {
+            port1.close(); port2.close();
+        }
+    });
+
+    it('without a reply port submitTx sends directly (no handshake to wait for)', async () => {
+        const { entry, facade, finalized } = makeEntry(DUST_OK);
+        const provider = workerExports.buildWorkerWalletProvider(entry);
+        await provider.submitTx(finalized);
+        expect(facade.submitTransaction).toHaveBeenCalledTimes(1);
+    });
+
     it('balanceTx waits for genuine sync, balances with the session keys and returns the finalized tx', async () => {
         withSyncedIndexer();
         try {
@@ -977,7 +1092,7 @@ describe('buildWorkerWalletProvider', () => {
                 .filter((m: any) => m.kind === 'log' && m.level === 'warn' && /persist NOT confirmed/.test(m.message));
             expect(warns.length).toBe(1);
         } finally {
-            delete process.env.NIGHTGATE_RESTORE_SAVE_ACK_TIMEOUT_MS;
+            process.env.NIGHTGATE_RESTORE_SAVE_ACK_TIMEOUT_MS = '50'; // the file-wide bound (evict)
             vi.unstubAllGlobals();
         }
     });
@@ -1135,7 +1250,7 @@ describe('buildWorkerWalletProvider', () => {
         }
     });
 
-    it('a timed-out or unanswered submit is a transport failure too (resent, not rebuilt)', async () => {
+    it('a timed-out or unanswered submit is ambiguous: never resent, never rebuilt (the send may have landed)', async () => {
         withIndexer(false);
         const restore = withFastResend();
         try {
@@ -1145,8 +1260,9 @@ describe('buildWorkerWalletProvider', () => {
                 facade.submitTransaction = vi.fn().mockRejectedValueOnce(new Error(msg)).mockResolvedValueOnce('0xtxid');
                 const provider = workerExports.buildWorkerWalletProvider(entry);
                 await provider.balanceTx({});
-                await expect(provider.submitTx(finalized)).resolves.toBe('0xtxid');
-                expect(facade.submitTransaction).toHaveBeenCalledTimes(2);
+                await expect(provider.submitTx(finalized)).rejects.toThrow(msg);
+                // one send only: a resend of a landed transaction is a 1013 duplicate
+                expect(facade.submitTransaction).toHaveBeenCalledTimes(1);
             }
         } finally {
             restore(); vi.unstubAllGlobals();
@@ -1166,7 +1282,7 @@ describe('buildWorkerWalletProvider', () => {
                     : { data: { block: { height: '500', timestamp: Date.now() } } }
             }));
             facade.submitTransaction = vi.fn()
-                .mockRejectedValueOnce(new Error('TimeoutError: no reply'))
+                .mockRejectedValueOnce(new Error('read ECONNRESET'))
                 .mockRejectedValueOnce(new Error('1013: Transaction Already Imported'));
             const provider = workerExports.buildWorkerWalletProvider(entry);
             await provider.balanceTx({});
@@ -1234,8 +1350,9 @@ describe('buildWorkerWalletProvider', () => {
         expect(f(new Error('disconnected from wss://x/: 1006:: Abnormal Closure'))).toBe(true);
         expect(f(new Error('read ECONNRESET'))).toBe(true);
         expect(f(new Error('WebSocket is not connected'))).toBe(true);
-        expect(f(new Error('TimeoutError: submitAndWatch timed out'))).toBe(true);
-        expect(f(new Error('no reply from node'))).toBe(true);
+        // a wait that ended without a reply is ambiguous, not transport: no resend
+        expect(f(new Error('TimeoutError: submitAndWatch timed out'))).toBe(false);
+        expect(f(new Error('no reply from node'))).toBe(false);
         expect(f(new Error('1013: Transaction Already Imported'))).toBe(false);
         expect(f(new Error('1010: Invalid Transaction: Custom error: 170'))).toBe(false);
         expect(f(new Error('1014: Priority is too low'))).toBe(false);
@@ -1742,6 +1859,26 @@ describe('getBalance / estimateTransferFee', () => {
 
 // ---- dust register / deregister --------------------------------------------
 
+describe('classified failure payload of a submitting method', () => {
+    beforeEach(() => { process.env.NIGHTGATE_DUST_REGISTER_SETTLE_MS = '0'; });
+    afterEach(() => { delete process.env.NIGHTGATE_DUST_REGISTER_SETTLE_MS; });
+
+    it('carries the code, ledger code, retryability and cause chain as data', async () => {
+        const facade = await initSession('session-classified-aaaaaaaa');
+        facade.waitForSyncedState.mockResolvedValue({ unshielded: { availableCoins: [{ id: 'c1' }], totalCoins: [{ id: 'c1' }] } });
+        // Live SDK shape: generic wrappers on top, the node's line in the innermost cause.
+        const node = new Error('1010: Invalid Transaction: Custom error: 196');
+        const submission = new Error('Transaction submission failed', { cause: node });
+        const fiber = new Error('Transaction submission error', { cause: submission });
+        facade.registerNightUtxosForDustGeneration.mockRejectedValueOnce(fiber);
+        const reply = await rpc('registerDustGeneration', { sessionId: 'session-classified-aaaaaaaa' });
+        expect(reply.ok).toBe(false);
+        expect(reply.error).toMatchObject({ code: 'dust-race', ledgerCode: '1010/196', retryable: true });
+        expect(reply.error.causes).toEqual(['Transaction submission failed', '1010: Invalid Transaction: Custom error: 196']);
+        expect(reply.error.message).toMatch(/Custom error: 196/);
+    });
+});
+
 describe('registerDustGeneration / deregisterDustGeneration', () => {
     // The post-submit settle observation polls in real time; off by default here, one test turns it on.
     beforeEach(() => { process.env.NIGHTGATE_DUST_REGISTER_SETTLE_MS = '0'; });
@@ -1832,15 +1969,15 @@ describe('registerDustGeneration / deregisterDustGeneration', () => {
         expect(reply.result.message).not.toMatch(/already/);
     });
 
-    it('a registered coin that the SDK still lists as available is counted as registered too (no full coin set)', async () => {
-        const facade = await initSession('session-dustreg-avail-kkkk');
+    it('deregister no-ops when totalCoins holds nothing registered', async () => {
+        const facade = await initSession('session-dustdereg-noop-ii');
         facade.waitForSyncedState.mockResolvedValue({
-            unshielded: { availableCoins: [{ meta: { registeredForDustGeneration: true } }] }
+            unshielded: { totalCoins: [{ meta: { registeredForDustGeneration: false } }] }
         });
-        const reply = await rpc('registerDustGeneration', { sessionId: 'session-dustreg-avail-kkkk' });
+        const reply = await rpc('deregisterDustGeneration', { sessionId: 'session-dustdereg-noop-ii' });
         expect(reply.ok).toBe(true);
-        expect(reply.result).toMatchObject({ changed: false, reason: 'already-registered', totalNightUtxos: 1, registeredUtxosBefore: 1 });
-        expect(facade.registerNightUtxosForDustGeneration).not.toHaveBeenCalled();
+        expect(reply.result).toMatchObject({ txId: null, deregisteredCount: 0, totalNightUtxos: 1 });
+        expect(facade.deregisterFromDustGeneration).not.toHaveBeenCalled();
     });
 
     it('deregisters the REGISTERED subset of totalCoins and balances the fee-less recipe with dust', async () => {
@@ -1862,16 +1999,6 @@ describe('registerDustGeneration / deregisterDustGeneration', () => {
         expect(facade.signRecipe).not.toHaveBeenCalled();
     });
 
-    it('deregister falls back across the SDK naming generations (allCoins) and no-ops when none registered', async () => {
-        const facade = await initSession('session-dustdereg-noop-ii');
-        facade.waitForSyncedState.mockResolvedValue({
-            unshielded: { allCoins: [{ meta: { registeredForDustGeneration: false } }] }
-        });
-        const reply = await rpc('deregisterDustGeneration', { sessionId: 'session-dustdereg-noop-ii' });
-        expect(reply.ok).toBe(true);
-        expect(reply.result).toMatchObject({ txId: null, deregisteredCount: 0, totalNightUtxos: 1 });
-        expect(facade.deregisterFromDustGeneration).not.toHaveBeenCalled();
-    });
 });
 
 // ---- submitContractCall: first-contact private-state seeding guard ----------
@@ -2345,6 +2472,37 @@ describe('dust backing lease ownership', () => {
         releaseNote(a.key, a.token);
         expect(held(a.key)).toBeUndefined();
     });
+
+    it('locks the free backing with the MOST headroom, so the load rotates instead of draining one backing', () => {
+        const { tryLockBacking, releaseNote } = workerExports.__noteLeaseForTests;
+        const pool = [
+            { token: { backingNight: 'small' }, generatedNow: 5n },
+            { token: { backingNight: 'big' }, generatedNow: 9n },
+            { token: { backingNight: 'mid' }, generatedNow: 7n },
+            { token: { backingNight: 'tiny' }, generatedNow: 2n }   // below the fee: never eligible
+        ];
+        const first = tryLockBacking('sess', pool, 3n, 60_000);
+        expect(first.backing).toBe('big');
+        const second = tryLockBacking('sess', pool, 3n, 60_000);
+        expect(second.backing).toBe('mid');
+        const third = tryLockBacking('sess', pool, 3n, 60_000);
+        expect(third.backing).toBe('small');
+        expect(tryLockBacking('sess', pool, 3n, 60_000)).toBeNull();
+        for (const l of [first, second, third]) releaseNote(l.key, l.token);
+        // A backing that came up short at build time is skipped for the run.
+        expect(tryLockBacking('sess', pool, 3n, 60_000, new Set(['sess|big'])).backing).toBe('mid');
+    });
+
+    it('sufficientNoteOnBacking judges the leased backing by the fresh, spend-time valued notes', () => {
+        const { sufficientNoteOnBacking } = workerExports.__noteLeaseForTests;
+        const fresh = [
+            { token: { backingNight: 'A' }, generatedNow: 407n },
+            { token: { backingNight: 'B' }, generatedNow: 900n }
+        ];
+        expect(sufficientNoteOnBacking('sess', fresh, 'sess|A', 412n)).toBeNull();     // 407 < 412: refused before proving
+        expect(sufficientNoteOnBacking('sess', fresh, 'sess|B', 412n)?.token.backingNight).toBe('B');
+        expect(sufficientNoteOnBacking('sess', fresh, 'sess|A', 400n)?.token.backingNight).toBe('A');
+    });
 });
 
 describe('dedicated submit client pool cap', () => {
@@ -2648,8 +2806,17 @@ describe('worker rotation drains: admission closes, in-flight completes, exit at
             expect(failed.error?.name).not.toBe('WORKER_ROTATING'); // it was admitted before the drain
             const rotating = fakeParentPort.postMessage.mock.calls.map(c => c[0]).find((m: any) => m?.kind === 'rotating');
             expect(rotating).toMatchObject({ generations: 1, inflight: 0 });
-            await new Promise(r => setImmediate(r)); await new Promise(r => setImmediate(r));
-            expect(exitSpy).toHaveBeenCalledWith(0);
+            // the worker never exits itself: it saves and evicts every facade,
+            // then asks the main thread to terminate it AFTER its reply left (a
+            // self process.exit could drop a queued reply)
+            const done = await vi.waitFor(() => {
+                const m = fakeParentPort.postMessage.mock.calls.map(c => c[0]).find((m: any) => m?.kind === 'rotation-done');
+                expect(m).toBeDefined();
+                return m;
+            }, { timeout: 5_000 });
+            expect(exitSpy).not.toHaveBeenCalled();
+            expect(done).toMatchObject({ generations: 1, evicted: expect.any(Number), failed: expect.any(Number) });
+            expect(stateSaves().length).toBe(done.evicted); // one final save per facade
             expect(w.__rotationStateForTests()).toMatchObject({ pending: true, draining: true, inflight: 0 });
             // admission is closed: a call arriving now is refused, never started
             const refused = await rpc('evict', { sessionId: 'another' });
@@ -2662,6 +2829,7 @@ describe('worker rotation drains: admission closes, in-flight completes, exit at
             exitSpy.mockRestore();
             delete process.env.NIGHTGATE_WORKER_MAX_GENERATIONS;
             w.__resetRotationForTests();
+            await initSession(INIT_ARGS.sessionId); // the rotation evicted every facade
         }
     });
 });

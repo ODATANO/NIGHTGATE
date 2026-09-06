@@ -5,8 +5,7 @@ import { ensureNightgateModelLoaded } from '../srv/utils/cds-model';
 import {
     isNightgatePluginConfigured,
     resolveNightgateRuntimeConfig,
-    resolveCrawlerlessChainConfirmEnabled,
-    isCrawlerlessChainConfirmExplicitlyEnabled,
+    warnIfCrawlerlessChainConfirmSet,
     resolveEffectiveProvingMode,
     resolveProofTimeoutMs,
     VALID_NIGHTGATE_NETWORKS,
@@ -25,6 +24,8 @@ const log = cds.log('nightgate');
 import { startWalletWorker, stopWalletWorker } from '../srv/midnight/wallet-worker-client';
 import { wireWorkerStateSaveSink } from '../srv/submission/wallet-facade-builder';
 import { clearAllEncryptionKeys } from '../srv/submission/wallet-sync-state-store';
+import { ensureIndexes } from '../srv/utils/db-indexes';
+import { assertStoredKeyIdsKnown } from '../srv/utils/encryption-rewrap';
 import { recoverInterruptedJobs, dropPendingJobsForClosedSessions, startBackgroundJobProcessor, stopBackgroundJobProcessor, registerChainOutcomeConfirmer } from '../srv/submission/background-jobs';
 import { buildIndexerTxConfirmer } from '../srv/submission/chain-outcome-confirmer';
 import { TransactionResults } from '#cds-models/midnight';
@@ -166,6 +167,15 @@ async function ensureSchemaDeployed(): Promise<void> {
             throw new SchemaNotDeployedError(what, resolveDbPath(), probeErr);
         }
     }
+
+    // Secondary indexes (idempotent): every hot lookup was a table scan.
+    const dbKind = String((cds.env as any).requires?.db?.kind ?? '');
+    const created = await ensureIndexes(db as any, dbKind, msg => log.warn(msg));
+    log.debug(`ensured ${created} secondary index(es)`);
+
+    // Every stored ciphertext must be openable with the configured key ring
+    // (fail-closed: an unreadable seed must not pass as a missing one).
+    await assertStoredKeyIdsKnown(db as any);
 
     // Pre-0.9 rows were unconditional SUCCESS placeholders. Keeping them would
     // continue exposing a known-false execution claim through OData. The new
@@ -378,26 +388,17 @@ export async function initialize(): Promise<NightgateIndexerStatus> {
         await startWalletWorker();
         wireWorkerStateSaveSink();
         await startBackgroundJobProcessor();
-        // Crawler-free chain-outcome confirmation: advance chainStatus by a
-        // per-tx Indexer lookup so `requireChainSuccess` is reachable without
-        // block ingestion. Registered only when the crawler is off (or opted in);
-        // with the crawler running it stays the source of truth.
-        // The indexer confirmer is ALWAYS registered: the sponsor paths store
-        // the ledger transaction identifier, which only the indexer answers (the
-        // crawler keys on extrinsic hashes and never finds them), so those jobs
-        // are confirmed/reconciled through it even when the crawler runs. With
-        // the crawler on, the pass is restricted to identifier-keyed kinds; the
-        // crawler stays the source of truth for everything else.
+        // The indexer confirmer is the ONLY chain-evidence path for submitted
+        // jobs and is always registered, for every kind: a job stores the
+        // ledger transaction identifier, which only the indexer answers; the
+        // crawler indexes the Substrate extrinsic hash, a different value, so
+        // it cannot correlate a job with a block. The confirmer records the
+        // inclusion coordinates (block height/hash) the reorg rollback reverts by.
         registerChainOutcomeConfirmer(buildIndexerTxConfirmer({
             indexerHttpUrl: submissionEndpoints.indexerHttpUrl
-        }), { identifierKindsOnly: crawlerEnabled && !resolveCrawlerlessChainConfirmEnabled(crawlerEnabled, nightgateConfig) });
-        if (resolveCrawlerlessChainConfirmEnabled(crawlerEnabled, nightgateConfig)) {
-            log.info('Crawler-free chain-outcome confirmation enabled');
-        } else if (crawlerEnabled && isCrawlerlessChainConfirmExplicitlyEnabled(nightgateConfig)) {
-            log.warn('crawlerlessChainConfirm opt-in ignored: the crawler is enabled and is the sole source of truth for chainStatus (identifier-keyed sponsor jobs are still confirmed via the indexer)');
-        } else {
-            log.info('Indexer chain-outcome confirmation enabled for identifier-keyed sponsor jobs');
-        }
+        }));
+        warnIfCrawlerlessChainConfirmSet(nightgateConfig);
+        log.info(`Indexer chain-outcome confirmation enabled${crawlerEnabled ? ' (alongside the crawler)' : ' (crawler off)'}`);
         log.info('Wallet worker thread ready');
         // Warm the platform sponsor pool in the background (serialized; see
         // prewarmFeeSponsorPool). Errors are logged per sponsor, never thrown.

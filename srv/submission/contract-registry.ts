@@ -17,6 +17,8 @@ import path from 'path';
 import crypto from 'crypto';
 import { pathToFileURL } from 'url';
 import { computeArtifactGenerationDigest, artifactGenerationMatch } from './artifact-digest';
+import { ensureProverKeys, missingProverKeys, ZK_ASSET_URL_ENV } from './prover-keys';
+import { configMs } from '../utils/config';
 
 // Package root (…/node_modules/@odatano/nightgate when installed). contract-registry
 // lives at <root>/srv/submission/, so ../.. is the package root.
@@ -92,9 +94,10 @@ export function registerContract(name: string, reg: ContractRegistration): void 
     // 32-bit bitwise ops ((1 << 64) wraps) and a full unsigned 64-bit mask
     // does not survive Number or a signed Integer64 column. Measured, but
     // shipping it needs a BigInt/String mask path first.
+    // 8 was measured, never shipped: no lineage, no keys, no browser export.
     if (reg.slotWidth !== undefined
-        && (![8, 16, 32].includes(reg.slotWidth))) {
-        throw new Error(`registerContract: slotWidth must be 8, 16 or 32 (got ${String(reg.slotWidth)})`);
+        && (![16, 32].includes(reg.slotWidth))) {
+        throw new Error(`registerContract: slotWidth must be 16 or 32 (got ${String(reg.slotWidth)})`);
     }
     // Store a FROZEN CLONE: the caller's object must not remain a live
     // handle into the registry (mutating it after registration would change
@@ -135,10 +138,7 @@ export function getArtifactGenerationDigest(name: string): string {
  * How long a cached current-digest may be trusted before it is recomputed
  * regardless of what the stat metadata says. Bounds the residual risk below.
  */
-const CURRENT_DIGEST_MAX_AGE_MS = (() => {
-    const raw = Number(process.env.NIGHTGATE_ARTIFACT_DIGEST_MAX_AGE_MS);
-    return Number.isFinite(raw) && raw >= 0 ? raw : 5 * 60 * 1000;
-})();
+const CURRENT_DIGEST_MAX_AGE_MS = configMs('NIGHTGATE_ARTIFACT_DIGEST_MAX_AGE_MS');
 
 /**
  * Cheap change detector: the files' identities and metadata, without reading a
@@ -197,8 +197,8 @@ const currentDigestCache = new Map<string, { fingerprint: string; digest: string
  * trick can pin a stale answer indefinitely. Repeated calls inside that window
  * cost a few stat() syscalls.
  *
- * `resolveContract` deliberately does NOT use this: its check must run against
- * the bytes it is about to import, with no cache between check and use.
+ * `resolveContract` uses this for job resolves (nothing is imported on the
+ * main thread for a job) and the uncached digest when it imports itself.
  *
  * Throws like the cached accessor when the name is not registered.
  */
@@ -332,23 +332,18 @@ export function loadRegistryFromConfig(config?: Record<string, any>, baseDir = p
 
 /**
  * Verifier keys without prover keys: the contract deploys and its claims
- * verify, but its circuits cannot be proven here and `/zk-config` answers 404.
- * Said once at boot.
+ * verify; the missing prover keys are fetched the first time a job needs
+ * them (`NIGHTGATE_ZK_ASSET_URL`, shipped contracts default to the release
+ * tag). Said once at boot so an offline install knows what to do.
  */
 function warnOnMissingProverKeys(name: string, zkConfigPath: string): void {
-    let files: string[];
-    try { files = fs.readdirSync(path.join(zkConfigPath, 'keys')); } catch { return; }
-    const missing = files
-        .filter(f => f.endsWith('.verifier'))
-        .map(f => f.replace(/\.verifier$/, ''))
-        .filter(circuit => !files.includes(`${circuit}.prover`));
+    const missing = missingProverKeys(zkConfigPath);
     if (missing.length === 0) return;
-    cds.log('nightgate').warn(
+    cds.log('nightgate').info(
         `contract '${name}' has no prover keys for ${missing.length} circuit(s) ` +
-        `(${missing.slice(0, 3).join(', ')}${missing.length > 3 ? ', …' : ''}). Deploy and crawler-free ` +
-        `verification work; PROVING those circuits here (and serving them over /zk-config) does not. ` +
-        `Fetch them with "npx nightgate-fetch-keys ${name}" (they land in ${path.join(zkConfigPath, 'keys')}), ` +
-        `then restart. Doing so changes this contract's artifact generation digest, so fetch before the first proof.`);
+        `(${missing.slice(0, 3).join(', ')}${missing.length > 3 ? ', …' : ''}); they are fetched on first need ` +
+        `(${ZK_ASSET_URL_ENV}, verified against keys/manifest.json). Offline: "npx nightgate-fetch-keys ${name}" ` +
+        `puts them under ${path.join(zkConfigPath, 'keys')}; no restart needed, the digest does not change.`);
 }
 
 /**
@@ -366,8 +361,19 @@ export async function resolveContract(name: string, expectedDigest?: string, opt
         throw new ContractNotRegisteredError(name, available);
     }
     let digest: string | undefined;
+    if (expectedDigest !== undefined && !opts.compile) {
+        // A job proves in the worker from a snapshot of these files: every
+        // prover key must be on disk first. Fetched from the configured
+        // source and verified against the manifest; not part of the digest.
+        const { fetched } = await ensureProverKeys(name, reg, { log: (m) => cds.log('nightgate').info(m) });
+        if (fetched.length) cds.log('nightgate').info(`contract '${name}': ${fetched.length} prover key(s) fetched on first need`);
+    }
     if (expectedDigest !== undefined) {
-        const current = computeGenerationDigest(reg);
+        // A job resolve imports nothing here (the worker hashes the snapshot it
+        // loads), so the stat-fingerprinted digest is enough and a 100 MB
+        // re-hash per job stays off the event loop. A main-thread import
+        // (`compile: true`) checks the bytes it is about to load, uncached.
+        const current = opts.compile ? computeGenerationDigest(reg) : getCurrentArtifactDigest(name);
         digest = current;
         // The pre-0.21.0 digest form of a CommonJS artifact is the same
         // generation; the worker is handed the current digest either way.
@@ -427,6 +433,26 @@ export function artifactImportSpec(artifactPath: string, generation: string): st
  * serves a CommonJS module from its cache by filename regardless of the import
  * query, so the CJS cache entry is dropped first.
  */
+/**
+ * Main-thread readers (pure circuits, ledger decoders, arg coercion) import a
+ * registered artifact pinned to the generation this process loaded, so a
+ * runtime re-registration is a new module instance for them too. A path no
+ * registration owns (test fixtures) imports unpinned.
+ */
+export async function importRegisteredArtifact(name: string): Promise<any> {
+    const reg = registry.get(name);
+    if (!reg) throw new ContractNotRegisteredError(name, listRegisteredContracts());
+    return importArtifactGeneration(reg.artifactPath, getArtifactGenerationDigest(name));
+}
+
+export async function importArtifactByPath(artifactPath: string): Promise<any> {
+    const wanted = path.resolve(artifactPath);
+    for (const [name, reg] of registry) {
+        if (path.resolve(reg.artifactPath) === wanted) return importRegisteredArtifact(name);
+    }
+    return import(path.isAbsolute(artifactPath) ? pathToFileURL(artifactPath).href : artifactPath);
+}
+
 export async function importArtifactGeneration(artifactPath: string, generation: string): Promise<any> {
     if (path.isAbsolute(artifactPath)) {
         try {
@@ -438,11 +464,11 @@ export async function importArtifactGeneration(artifactPath: string, generation:
 }
 
 export class ContractNotRegisteredError extends Error {
-    constructor(public readonly name: string, public readonly available: string[]) {
+    constructor(public readonly contractName: string, public readonly available: string[]) {
         super(
             available.length === 0
-                ? `Contract '${name}' is not registered. No contracts are registered yet (register via cds.requires.nightgate.contracts or call registerContract()).`
-                : `Contract '${name}' is not registered. Available: ${available.join(', ')}`
+                ? `Contract '${contractName}' is not registered. No contracts are registered yet (register via cds.requires.nightgate.contracts or call registerContract()).`
+                : `Contract '${contractName}' is not registered. Available: ${available.join(', ')}`
         );
         this.name = 'ContractNotRegisteredError';
     }

@@ -23,6 +23,7 @@ import {
 } from './monitoring/status';
 
 import { RateLimiter } from './utils/rate-limiter';
+import { principalRateKey } from './utils/rate-limiter';
 
 const log = cds.log('nightgate:indexer');
 
@@ -119,7 +120,7 @@ export default class NightgateIndexerService extends cds.ApplicationService {
         // makes the steady state cheap, but a caller that keeps forcing the
         // slow path must not be able to starve the process.
         this.on('getRuntimeInfo', async (req: Request) => {
-            const clientKey = (req as any)?._?.req?.ip || 'global';
+            const clientKey = principalRateKey(req, 'runtime-info');
             const rate = runtimeInfoRateLimiter.check(clientKey);
             if (!rate.allowed) {
                 return req.reject(429, `Rate limited. Retry after ${Math.ceil(rate.retryAfterMs / 1000)}s`);

@@ -145,87 +145,15 @@ describe('facade-backed wallet adapter: happy path', () => {
         expect(getOrBuildWalletFacade).not.toHaveBeenCalled();
     });
 
-    test('balanceTx routes through balanceUnboundTransaction then finalizeRecipe', async () => {
-        STUB_FACADE.balanceUnboundTransaction.mockResolvedValue({ recipe: 'unbound' });
-        STUB_FACADE.finalizeRecipe.mockResolvedValue({ tag: 'finalized-tx' });
-
+    test('balanceTx and submitTx are not available on the main thread (the worker balances and submits)', async () => {
         const db = makeDbWithSession(buildSession());
         const material = await buildWalletMaterialForSession({
             sessionId: 'sess-1', db, encryptionKey: TEST_KEY, facadeConfig: FACADE_CONFIG
         });
-
-        const fakeTx = { tag: 'unbound-input-tx' };
-        const result = await (material.walletAndMidnightProvider as any).balanceTx(fakeTx);
-
-        expect(STUB_FACADE.balanceUnboundTransaction).toHaveBeenCalledTimes(1);
-        const [tx, keys, opts] = STUB_FACADE.balanceUnboundTransaction.mock.calls[0];
-        expect(tx).toBe(fakeTx);
-        expect(keys.shieldedSecretKeys).toBe(STUB_KEYS.zswapKeys);
-        expect(keys.dustSecretKey).toBe(STUB_KEYS.dustKey);
-        expect(opts.ttl).toBeInstanceOf(Date);
-
-        expect(STUB_FACADE.finalizeRecipe).toHaveBeenCalledWith({ recipe: 'unbound' });
-        expect(result).toEqual({ tag: 'finalized-tx' });
-    });
-
-    test('balanceTx accepts an explicit TTL', async () => {
-        STUB_FACADE.balanceUnboundTransaction.mockResolvedValue({ recipe: 'x' });
-        STUB_FACADE.finalizeRecipe.mockResolvedValue({});
-
-        const db = makeDbWithSession(buildSession());
-        const material = await buildWalletMaterialForSession({
-            sessionId: 'sess-1', db, encryptionKey: TEST_KEY, facadeConfig: FACADE_CONFIG
-        });
-
-        const explicitTtl = new Date(Date.now() + 120_000);
-        await (material.walletAndMidnightProvider as any).balanceTx({}, explicitTtl);
-        const opts = STUB_FACADE.balanceUnboundTransaction.mock.calls[0][2];
-        expect(opts.ttl).toBe(explicitTtl);
-    });
-
-    test('submitTx routes directly to facade.submitTransaction and returns its result', async () => {
-        STUB_FACADE.submitTransaction.mockResolvedValue('tx-id-123');
-        const db = makeDbWithSession(buildSession());
-        const material = await buildWalletMaterialForSession({
-            sessionId: 'sess-1', db, encryptionKey: TEST_KEY, facadeConfig: FACADE_CONFIG
-        });
-        const finalizedTx = { _finalized: true };
-        const id = await (material.walletAndMidnightProvider as any).submitTx(finalizedTx);
-        expect(STUB_FACADE.submitTransaction).toHaveBeenCalledWith(finalizedTx);
-        expect(id).toBe('tx-id-123');
-    });
-
-    test('facade is built once across multiple balance/submit calls', async () => {
-        STUB_FACADE.balanceUnboundTransaction.mockResolvedValue({});
-        STUB_FACADE.finalizeRecipe.mockResolvedValue({});
-        STUB_FACADE.submitTransaction.mockResolvedValue('id');
-
-        const db = makeDbWithSession(buildSession());
-        const material = await buildWalletMaterialForSession({
-            sessionId: 'sess-1', db, encryptionKey: TEST_KEY, facadeConfig: FACADE_CONFIG
-        });
-
         const w: any = material.walletAndMidnightProvider;
-        await w.balanceTx({});
-        await w.submitTx({});
-        await w.balanceTx({});
-
-        expect(getOrBuildWalletFacade).toHaveBeenCalledTimes(1);
-    });
-
-    test('facade build is keyed on accountId (deterministic from viewing key)', async () => {
-        const db = makeDbWithSession(buildSession());
-        const material = await buildWalletMaterialForSession({
-            sessionId: 'sess-1', db, encryptionKey: TEST_KEY, facadeConfig: FACADE_CONFIG
-        });
-        STUB_FACADE.submitTransaction.mockResolvedValue('id');
-        await (material.walletAndMidnightProvider as any).submitTx({});
-
-        const [cacheKey, _args] = (getOrBuildWalletFacade as Mock).mock.calls[0];
-        // accountId is HMAC-SHA256(viewingKey, label).hex, 64-char hex
-        expect(typeof cacheKey).toBe('string');
-        expect(cacheKey).toMatch(/^[0-9a-f]{64}$/);
-        expect(cacheKey).toBe(material.accountId);
+        await expect(w.balanceTx({})).rejects.toThrow(/not available on the main thread/);
+        await expect(w.submitTx({})).rejects.toThrow(/not available on the main thread/);
+        expect(getOrBuildWalletFacade).not.toHaveBeenCalled();
     });
 });
 

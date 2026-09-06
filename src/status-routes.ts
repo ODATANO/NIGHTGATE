@@ -1,5 +1,6 @@
 import crypto from 'crypto';
 import cds from '@sap/cds';
+import { configEnum, configString } from '../srv/utils/config';
 
 // Plain HTTP status surface, so the tools that want this data can consume it:
 //
@@ -65,12 +66,12 @@ export type StatusRouteAccess =
  * HTTP surface, and is told once how to turn it on.
  */
 export function resolveStatusRouteAccess(): StatusRouteAccess {
-    const mode = String(process.env.NIGHTGATE_STATUS_ROUTES ?? '').trim().toLowerCase();
+    const mode = configEnum('NIGHTGATE_STATUS_ROUTES') ?? '';
     if (mode === 'off') {
         return { mounted: false, reason: 'NIGHTGATE_STATUS_ROUTES=off' };
     }
 
-    const token = String(process.env.NIGHTGATE_STATUS_TOKEN ?? '').trim();
+    const token = configString('NIGHTGATE_STATUS_TOKEN') ?? '';
     if (token) return { mounted: true, auth: 'token', token };
     if (mode === 'public') return { mounted: true, auth: 'public' };
 
@@ -83,7 +84,7 @@ export function resolveStatusRouteAccess(): StatusRouteAccess {
 }
 
 export function statusRoutePrefix(): string {
-    const raw = String(process.env.NIGHTGATE_STATUS_ROUTES_PREFIX ?? '/nightgate').trim();
+    const raw = configString('NIGHTGATE_STATUS_ROUTES_PREFIX') ?? '/nightgate';
     const withSlash = raw.startsWith('/') ? raw : `/${raw}`;
     const trimmed = withSlash.replace(/\/+$/, '');
     // An empty prefix would put us back on the host's generic paths.

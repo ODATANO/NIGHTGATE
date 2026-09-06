@@ -234,6 +234,43 @@ describe('MidnightCrawler orchestration', () => {
             expect(row.syncStatus).toBe('stopped');
         });
 
+        it('waits for the in-flight pipeline before unsubscribing (a reindex must not roll back under a persist)', async () => {
+            const provider = {
+                isConnected: vi.fn().mockReturnValue(true),
+                setOnReconnect: vi.fn(),
+                setOnReconnectFailed: vi.fn(),
+                unsubscribeFinalizedHeads: vi.fn().mockResolvedValue(true)
+            };
+            const crawler = new MidnightCrawler(provider as any, { enabled: true });
+            let finishPipeline: () => void = () => {};
+            const pipeline = new Promise<void>(resolve => { finishPipeline = resolve; });
+            vi.spyOn(crawler as any, 'runIngestPipeline').mockReturnValueOnce(pipeline);
+            await crawler.start();
+
+            let stopped = false;
+            const stopping = crawler.stop().then(() => { stopped = true; });
+            await new Promise(r => setImmediate(r));
+            expect(stopped).toBe(false); // still persisting: stop() holds
+            finishPipeline();
+            await stopping;
+            expect(stopped).toBe(true);
+        });
+
+        it('drops a stale live subscription before subscribing again (no double processing after a reconnect race)', async () => {
+            const provider = {
+                subscribeFinalizedHeads: vi.fn().mockResolvedValueOnce('sub-1').mockResolvedValueOnce('sub-2'),
+                unsubscribeFinalizedHeads: vi.fn().mockResolvedValue(true)
+            };
+            const crawler = new MidnightCrawler(provider as any, { enabled: true });
+            (crawler as any).db = db;
+            (crawler as any).isRunning = true;
+            await (crawler as any).subscribeLive();
+            await (crawler as any).subscribeLive();
+            expect(provider.unsubscribeFinalizedHeads).toHaveBeenCalledWith('sub-1');
+            expect((crawler as any).subscriptionId).toBe('sub-2');
+            await crawler.stop();
+        });
+
         it('swallows unsubscribe and DB errors during stop', async () => {
             const provider = {
                 unsubscribeFinalizedHeads: vi.fn().mockRejectedValue(new Error('unsubscribe failed'))
@@ -895,7 +932,7 @@ describe('MidnightCrawler orchestration', () => {
             })).resolves.toBeNull();
         });
 
-        it('finds fork points from local blocks and falls back when the node lookup fails', async () => {
+        it('finds fork points from local blocks and propagates a failed node lookup instead of reporting a fork', async () => {
             const provider = {
                 getHeader: vi.fn().mockRejectedValue(new Error('header unavailable'))
             };
@@ -913,8 +950,9 @@ describe('MidnightCrawler orchestration', () => {
                 digest: { logs: [] }
             })).resolves.toBe(6); // height (5) + 1
 
-            // No local block for the parent: the node lookup throws → fall back to
-            // the current height (5).
+            // No local block for the parent and the node lookup throws: that is
+            // a transport problem, not a fork point. A rollback to "wherever the
+            // RPC failed" would destroy valid data; the search fails instead.
             await db.run(cds.ql.DELETE.from(BLOCKS));
             await expect((crawler as any).findForkPoint({
                 number: '0x6',
@@ -922,7 +960,22 @@ describe('MidnightCrawler orchestration', () => {
                 stateRoot: '',
                 extrinsicsRoot: '',
                 digest: { logs: [] }
-            })).resolves.toBe(5);
+            })).rejects.toThrow('header unavailable');
+        });
+
+        it('refuses a header without a parent hash during the fork search', async () => {
+            const provider = {
+                getHeader: vi.fn().mockResolvedValue({})
+            };
+            const crawler = new MidnightCrawler(provider as any, { enabled: true });
+            (crawler as any).db = db;
+            await expect((crawler as any).findForkPoint({
+                number: '0x6',
+                parentHash: '0x5',
+                stateRoot: '',
+                extrinsicsRoot: '',
+                digest: { logs: [] }
+            })).rejects.toThrow(/No header for 0x5 during fork search/);
         });
 
         it('walks backward through remote headers until it finds the local fork point', async () => {

@@ -83,6 +83,8 @@ export interface ConnectorProvidersResult {
 export function createNightgateConnectorProviders(opts: {
     connector: any;
     manifest: { contracts: Array<{ name: string; zkConfigBaseUrl: string; circuits: string[] }> };
+    /** URL the manifest was fetched from; required when it carries relative zkConfigBaseUrls and the dApp runs on another origin. */
+    manifestUrl?: string;
     contract: string;
     fetchFn?: typeof fetch;
     webSocket?: any;
@@ -117,7 +119,7 @@ export interface PreparedCall {
 export function prepareRevokeDisclosure(input: { payloadHash: string; grantee: string; attestationSecret: Uint8Array }): PreparedCall;
 export function prepareGrantDisclosure(input: { payloadHash: string; grantee: string; level: number | bigint; attestationSecret: Uint8Array }): PreparedCall;
 export function prepareAttest(input: { payloadHash: string; metadataHash: string; attestationSecret: Uint8Array }): PreparedCall;
-export function prepareAttestCommit(input: { commitment: string; attestationSecret: Uint8Array }): PreparedCall;
+export function prepareAttestCommit(input: { commitment: string; expiresAt: number | bigint; attestationSecret: Uint8Array }): PreparedCall;
 export function prepareAttestReveal(input: { payloadHash: string; metadataHash: string; nonce: string; attestationSecret: Uint8Array }): PreparedCall;
 export function prepareRegisterPassport(input: { passportId: string; ownerId: string; attestationSecret: Uint8Array }): PreparedCall;
 export function prepareBindPassport(input: { passportId: string; payloadHash: string; attestationSecret: Uint8Array }): PreparedCall;
@@ -145,3 +147,6 @@ export interface ContractBrowserMeta {
 }
 
 export const CONTRACTS: Record<string, ContractBrowserMeta>;
+
+/** Absolute form of a manifest URL (relative ones resolve against manifestUrl, then the page origin). */
+export function resolveManifestUrl(url: string, manifestUrl?: string): string;

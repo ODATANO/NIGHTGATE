@@ -22,6 +22,7 @@ import { sha256 } from '@noble/hashes/sha256';
 import { bytesToHex } from '@noble/hashes/utils';
 import { GranteeIdentities } from '#cds-models/midnight';
 import { type GranteeBinding } from '../utils/nightgate-config';
+import { hexToBytes } from '../utils/hex';
 
 const { SELECT } = cds.ql;
 
@@ -101,8 +102,3 @@ export async function resolveGranteeId(
 }
 
 // Local hex→bytes (avoids importing the handler's copy; same semantics).
-function hexToBytes(hex: string): Uint8Array {
-    const out = new Uint8Array(hex.length / 2);
-    for (let i = 0; i < out.length; i++) out[i] = parseInt(hex.substr(i * 2, 2), 16);
-    return out;
-}

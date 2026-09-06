@@ -179,7 +179,7 @@ describe('wallet-facade-builder', () => {
                     proofServerUrl: baseArgs.proofServerUrl,
                     relayUrl: baseArgs.relayUrl
                 }));
-                expect(result.facade).toBeDefined();
+                expect(result).toBeUndefined();
                 expect(__getCacheSizeForTests()).toBe(1);
             } finally {
                 logSpy.mockRestore();
@@ -255,16 +255,6 @@ describe('wallet-facade-builder', () => {
             }
         });
 
-        it('returns phase-2 stubs that throw when their methods are called', async () => {
-            const logSpy = vi.spyOn(cds.log('nightgate:facade'), 'info').mockImplementation(() => {});
-            try {
-                const result = await getOrBuildWalletFacade('cache-key', baseArgs);
-                expect(() => result.facade.submitTransaction()).toThrow(/phase-1 worker migration/);
-                expect(() => result.facade.shielded.start()).toThrow(/phase-1 worker migration/);
-            } finally {
-                logSpy.mockRestore();
-            }
-        });
     });
 
     describe('evictWalletFacade', () => {

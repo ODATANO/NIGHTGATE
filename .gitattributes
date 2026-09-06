@@ -9,3 +9,7 @@ contracts/**/managed/**/*.zkir      binary
 # The container entrypoint runs inside a Linux image; a CRLF checkout on
 # Windows would break bash ("\r: command not found").
 docker/entrypoint.sh                eol=lf
+
+# Compact sources: the vault parity check diffs the two lineages line by
+# line, and the compiler runs in WSL. Keep them LF on every checkout.
+contracts/**/*.compact              eol=lf

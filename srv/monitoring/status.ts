@@ -387,6 +387,7 @@ export function buildRuntimeInfo(): Record<string, unknown> {
 
     return {
         version,
+        apiVersion: version.split('.').slice(0, 2).join('.'),
         network: getConfiguredNightgateNetwork(config),
         provingMode: resolveEffectiveProvingMode(config),
         instanceId: topology.instanceId,

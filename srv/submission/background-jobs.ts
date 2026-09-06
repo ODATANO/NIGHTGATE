@@ -27,16 +27,23 @@
  * `TxFailed`, ...) land in the job row.
  */
 
+import { withLockContentionRetry as withDbLockRetry, isLockContention, lockContentionBackoffMs, LOCK_CONTENTION_ATTEMPTS, __setLockContentionBackoffForTests, __resetLockContentionBackoffForTests } from './db-write-retry';
+import { REJECTED_ATTEMPT_BOOKKEEPING_PENDING, SponsorAttemptBookkeepingPendingError } from './job-execution-context';
+import { JOB_KIND_TRAITS, LIGHT_KIND, type JobKindTraits } from './job-kinds';
 import cds from '@sap/cds';
 import crypto from 'crypto';
 import { AsyncResource } from 'async_hooks';
-import { BackgroundJobs, PendingSubmissions, Transactions, TransactionResults } from '#cds-models/midnight';
+import { BackgroundJobs, PendingSubmissions } from '#cds-models/midnight';
 import { classifySubmissionError, type SubmissionErrorClassification } from './TransactionSubmitter';
+import type { ChainOutcome } from './chain-outcome-confirmer';
 import { resolveNightgateRuntimeConfig, getNightgatePluginConfig } from '../utils/nightgate-config';
 import { runInJobExecutionContext } from './job-execution-context';
 import { encrypt as encryptAtRest, decrypt as decryptAtRest, getEncryptionKey } from '../utils/crypto';
 import { getArtifactGenerationDigest } from './contract-registry';
 import { isCallNotAppliedFailure } from './sponsor-pool';
+import { configInt, configMs, configString } from '../utils/config';
+import { carriedSubmitFailure } from '../midnight/wallet-worker-protocol';
+import { readReorgGeneration, lockReorgGeneration } from './reorg-generation';
 
 const { SELECT, INSERT, UPDATE } = cds.ql;
 
@@ -50,60 +57,37 @@ const detachedJobScope = new AsyncResource('nightgate.detached-job-work');
 const DEFAULT_CONCURRENCY = { heavy: 4, light: 16, serial: 1 } as const;
 
 /**
- * Kinds capped at ONE concurrent job because the work they wait on already
- * serializes downstream, so running them in parallel does not finish anything
- * sooner; it only makes every one of them slower.
- *
- * `connectWalletForSigning` warms a wallet facade. Every facade lives in the
- * ONE singleton worker thread (`startWalletWorker`), and SDK catch-up is
- * CPU-bound single-threaded work, so N simultaneous prewarms each run at
- * roughly 1/N speed and the host's FIRST wallet becomes usable N times later
- * than it needs to. Serialized, wallet A finishes in its own time, then B,
- * then C: same total, but the caller can start working after the first one.
- * Live case: three wallets, none caught up after 80 minutes together, 19
- * minutes for one alone.
- *
- * This is why the kind is not merely "light". The `HEAVY_KINDS` split is about
- * proving capacity in THIS process; the constraint here is one thread further
- * out, and from the job runner's side a prewarm does look idle while it waits.
+ * Kind traits, declared with the registration (`srv/submission/job-kinds.ts`
+ * holds the table). The concurrency class, the workflow-parent set and the
+ * identifier-keyed set are DERIVED from what was registered, never listed a
+ * second time here.
  */
-const SERIAL_KINDS: ReadonlySet<string> = new Set([
-    'connectWalletForSigning'
-]);
+const kindTraits = new Map<string, JobKindTraits>();
 
-/**
- * Kinds where each job runs full ZK proof generation (proof server in the
- * default `server` proving mode; in-process WASM proving under
- * NIGHTGATE_PROVING_MODE=wasm, where proofs additionally serialize on the
- * single worker thread). 4 concurrent saturates one proof-server instance;
- * wider just queues inside it. "light" kinds (not in this set) are sync-bound
- * (wait on `waitForSyncedState`, no heavy compute here).
- */
-const HEAVY_KINDS: ReadonlySet<string> = new Set([
-    'registerForDustGeneration',
-    'deregisterFromDustGeneration',
-    'sendNight',
-    'deployContract',
-    'submitContractCallBatch',
-    'submitContractCall',
-    'anchorDocument',
-    'commitDocumentAnchor',
-    'issueFieldPredicateAttestation',
-    'issueFieldPredicateAttestationBatch',
-    'fieldAnchorRoot',
-    'fieldPredicateProof',
-    'fieldPredicateBatchProof',
-    'grantDisclosure',
-    'revokeDisclosure',
-    'registerPassport',
-    // 0.18: proves the sponsor's dust spend in-process (wasm) per job; the
-    // worker overlaps these (build-only lock), so the cap is the real width.
-    'sponsorUnboundTransaction'
-]);
-const WORKFLOW_PARENT_KINDS: ReadonlySet<string> = new Set([
-    'issueFieldPredicateAttestation',
-    'issueFieldPredicateAttestationBatch'
-]);
+function isTraits(value: unknown): value is JobKindTraits {
+    const t = value as JobKindTraits | null;
+    return !!t && typeof t === 'object'
+        && typeof t.heavy === 'boolean' && typeof t.workflowParent === 'boolean' && typeof t.identifierKeyed === 'boolean';
+}
+
+/** Declare a kind's traits (registration does this; tests declare legacy closure kinds directly). */
+export function declareJobKind(kind: string, traits: JobKindTraits): void {
+    if (!kind || !isTraits(traits)) throw new Error(`declareJobKind(${kind}): heavy, workflowParent and identifierKeyed must be booleans`);
+    kindTraits.set(kind, { ...traits });
+}
+
+/** Traits of a kind; an unregistered kind (a legacy row of a removed kind) counts as light. */
+export function jobKindTraits(kind: string): JobKindTraits {
+    return kindTraits.get(kind) ?? LIGHT_KIND;
+}
+
+/** Every registered kind carrying `trait`. */
+export function kindsWithTrait(trait: 'heavy' | 'workflowParent' | 'identifierKeyed' | 'serial' | 'sessionBound'): string[] {
+    return [...kindTraits.entries()].filter(([, t]) => t[trait] === true).map(([k]) => k);
+}
+
+/** Test seam: the derived workflow-parent set. */
+export function __workflowParentKindsForTests(): ReadonlySet<string> { return new Set(kindsWithTrait('workflowParent')); }
 
 class Semaphore {
     private inFlight = 0;
@@ -127,6 +111,11 @@ class Semaphore {
             this.inFlight = Math.max(0, this.inFlight - 1);
         }
     }
+
+    /** Slots a new dispatch would get without waiting. */
+    available(): number {
+        return Math.max(0, this.max - this.inFlight - this.waiters.length);
+    }
 }
 
 const semaphores: Map<string, Semaphore> = new Map();
@@ -135,9 +124,10 @@ function getSemaphore(kind: string): Semaphore {
     const cached = semaphores.get(kind);
     if (cached) return cached;
     const userCaps = ((cds.env as any).requires?.nightgate?.jobs?.concurrency || {}) as { heavy?: number; light?: number; serial?: number };
-    const max = SERIAL_KINDS.has(kind)
+    const traits = jobKindTraits(kind);
+    const max = traits.serial
         ? (typeof userCaps.serial === 'number' ? userCaps.serial : DEFAULT_CONCURRENCY.serial)
-        : HEAVY_KINDS.has(kind)
+        : traits.heavy
             ? (typeof userCaps.heavy === 'number' ? userCaps.heavy : DEFAULT_CONCURRENCY.heavy)
             : (typeof userCaps.light === 'number' ? userCaps.light : DEFAULT_CONCURRENCY.light);
     const sem = new Semaphore(max);
@@ -235,6 +225,9 @@ export interface BackgroundJobRow {
     txHash: string | null;
     chainStatus: 'pending' | 'success' | 'failure' | null;
     chainFinalizedAt: string | null;
+    chainBlockHeight?: number | null;
+    chainBlockHash?: string | null;
+    indexerTxHash?: string | null;
     createdAt: string;
     modifiedAt: string;
 }
@@ -326,7 +319,7 @@ export async function startJob<TIn, TOut>(
         parentJobId: parentJobId ?? null,
         workflowStep: workflowStep ?? null,
         queuedAt,
-        attempt: 0,
+        attempt: 1,
         maxAttempts: 1
     });
 
@@ -344,7 +337,7 @@ export async function startJob<TIn, TOut>(
         // Postgres's aborted-tx state so the handler can continue.
         const sp = 'nightgate_job_insert';
         for (let attempt = 0; ; attempt++) {
-            if (statusWriteBackoffMs[attempt]) await sleep(statusWriteBackoffMs[attempt]);
+            if (lockContentionBackoffMs()[attempt]) await sleep(lockContentionBackoffMs()[attempt]);
             await pinnedRunner.run(`SAVEPOINT ${sp}`);
             try {
                 await pinnedRunner.run(buildInsert());
@@ -382,7 +375,7 @@ export async function startJob<TIn, TOut>(
         }
     } else if (pinnedRunner) {
         for (let attempt = 0; ; attempt++) {
-            if (statusWriteBackoffMs[attempt]) await sleep(statusWriteBackoffMs[attempt]);
+            if (lockContentionBackoffMs()[attempt]) await sleep(lockContentionBackoffMs()[attempt]);
             try {
                 await pinnedRunner.run(buildInsert());
                 break;
@@ -416,6 +409,8 @@ export interface ReconciliationEvidence {
     txHash: string;
     contractAddress: string | null;
     finalizedAt: string | null;
+    /** Indexer block height of the inclusion, when the confirmer reported one. */
+    blockHeight: number;
 }
 type BackgroundJobReconciliationFinalizer = (
     command: unknown,
@@ -426,12 +421,19 @@ const processors = new Map<string, BackgroundJobProcessor>();
 const reconciliationFinalizers = new Map<string, BackgroundJobReconciliationFinalizer>();
 const processorKey = (kind: string, version: number): string => `${kind}\0${version}`;
 
-/** Register one deterministic processor per durable job kind. */
-export function registerBackgroundJobProcessor(kind: string, version: number, processor: BackgroundJobProcessor): void {
+/** Register one deterministic processor per durable job kind, with the kind's traits. */
+export function registerBackgroundJobProcessor(kind: string, version: number, traits: JobKindTraits, processor: BackgroundJobProcessor): void {
     if (!kind || !Number.isInteger(version) || version < 1 || typeof processor !== 'function') {
-        throw new Error('registerBackgroundJobProcessor: kind, positive version and processor are required');
+        throw new Error('registerBackgroundJobProcessor: kind, positive version, traits and processor are required');
     }
+    declareJobKind(kind, traits);
     processors.set(processorKey(kind, version), processor);
+}
+
+/** Kinds declared in the table but registered by nobody: the runner refuses to start with any. */
+export function undeclaredOrUnregisteredJobKinds(): string[] {
+    const registered = new Set([...processors.keys()].map(k => k.split('\0')[0]));
+    return Object.keys(JOB_KIND_TRAITS).filter(kind => !registered.has(kind));
 }
 
 /** Register idempotent post-submit writes for one durable leaf command. */
@@ -478,10 +480,24 @@ function scheduleJob(jobId: string, kind: string, legacyWork?: () => Promise<unk
     dispatchJob(jobId, kind, legacyWork);
 }
 
+/**
+ * Jobs with a dispatch in flight in THIS process (queued behind the
+ * semaphore, or running). The poller skips them, so a row is dispatched once
+ * per lease instead of once per tick.
+ */
+const dispatching = new Set<string>();
+
 function dispatchJob(jobId: string, kind: string, legacyWork?: () => Promise<unknown>): void {
+    if (dispatching.has(jobId)) return;
+    dispatching.add(jobId);
     const semaphore = getSemaphore(kind);
     setImmediate(() => void runWithoutAmbientTx(async () => {
-        await semaphore.acquire();
+        try {
+            await semaphore.acquire();
+        } catch (err) {
+            dispatching.delete(jobId);
+            throw err;
+        }
         try {
             const claimed = await markRunning(jobId);
             if (!claimed) {
@@ -501,7 +517,6 @@ function dispatchJob(jobId: string, kind: string, legacyWork?: () => Promise<unk
                     {
                         reportExternalExecution: handle => markJobExternalExecution(jobId, handle),
                         reportSubmitted: handle => markJobSubmitted(jobId, handle),
-                        reportSubmissionRejected: handle => markJobSubmissionRejected(jobId, handle),
                         markBroadcastOn: (runner, handle) => markJobBroadcastOn(runner, jobId, handle),
                         markSubmissionRejectedOn: (runner, handle) => markJobSubmissionRejectedOn(runner, jobId, handle)
                     },
@@ -552,12 +567,12 @@ function dispatchJob(jobId: string, kind: string, legacyWork?: () => Promise<unk
                     cds.log('nightgate').info(
                         `Job ${jobId} errored after being superseded mid-run; keeping SUPERSEDED (dropped: ${classification.code})`
                     );
-                } else if (current?.txHash && IDENTIFIER_KEYED_KINDS.has(current.kind) && isCallNotAppliedFailure(err)) {
+                } else if (current?.txHash && jobKindTraits(current.kind).identifierKeyed && isCallNotAppliedFailure(err)) {
                     // The worker PROVED the outcome via the indexer (in a block,
                     // call not applied): terminal, no reconciliation detour (a
                     // client polling waitForJob must not see a transient
                     // reconciliation_required that flips seconds later).
-                    await markChainFailureAfterBroadcast(jobId, current);
+                    await markChainFailureAfterBroadcast(jobId, current, err);
                 } else if (err instanceof SponsorAttemptBookkeepingPendingError && current?.txHash) {
                     // Rejected attempt whose close/refund/hash-clear did not commit:
                     // park under the marker settleRejectedSponsorAttempts looks for,
@@ -573,6 +588,7 @@ function dispatchJob(jobId: string, kind: string, legacyWork?: () => Promise<unk
                 }
             }
         } finally {
+            dispatching.delete(jobId);
             semaphore.release();
         }
     }).catch(err => cds.log('nightgate').error(`Detached job ${jobId} crashed outside its guarded execution path`, err)));
@@ -602,13 +618,9 @@ class ChildReconciliationRequiredError extends WorkflowReconciliationRequiredErr
 }
 
 function childWaitTimeoutMs(): number {
-    const explicit = Number(process.env.NIGHTGATE_CHILD_JOB_WAIT_TIMEOUT_MS);
-    if (Number.isFinite(explicit) && explicit > 0) return explicit;
-    const configuredWorkerTimeout = Number(process.env.NIGHTGATE_WORKER_RPC_TIMEOUT_MS);
-    const workerTimeout = Number.isFinite(configuredWorkerTimeout) && configuredWorkerTimeout > 0
-        ? configuredWorkerTimeout
-        : 30 * 60_000;
-    return workerTimeout + 5 * 60_000;
+    const explicit = configInt('NIGHTGATE_CHILD_JOB_WAIT_TIMEOUT_MS');
+    if (explicit !== undefined) return explicit;
+    return configMs('NIGHTGATE_WORKER_RPC_TIMEOUT_MS') + 5 * 60_000;
 }
 
 /**
@@ -780,7 +792,6 @@ async function dedupExisting<TIn, TOut>(
  * Criterion for adding a kind here: interrupting it can leave nothing behind
  * that a later caller could observe or would have to reconcile.
  */
-const SESSION_BOUND_JOB_KINDS = ['connectWalletForSigning'];
 
 /**
  * Resolve jobs left behind by a process restart without risking a duplicate
@@ -816,7 +827,7 @@ export async function recoverInterruptedJobs(): Promise<number> {
                     leaseExpiresAt: null,
                     heartbeatAt: null
                 })
-                .where({ status: { in: ['pending', 'running'] }, kind: { in: SESSION_BOUND_JOB_KINDS } })
+                .where({ status: { in: ['pending', 'running'] }, kind: { in: kindsWithTrait('sessionBound') } })
         );
         // Replayable commands are safe to put back in the queue only while
         // still before the persisted external-effect boundary.
@@ -845,22 +856,23 @@ export async function recoverInterruptedJobs(): Promise<number> {
                 })
                 .where({ status: { in: ['pending', 'running'] }, commandVersion: null })
         );
-        // An identifier-keyed sponsor job in external_execution WITHOUT a hash is
-        // a job whose last broadcast attempt was provably rejected
-        // (markJobSubmissionRejected) and that was waiting to rebuild when the
-        // process died: nothing of it can be on-chain, and no confirmer could
-        // ever resolve it (no identifier). Fail it plainly instead of parking
-        // it in reconciliation_required forever.
+        // A job in external_execution WITHOUT a hash never broadcast: every
+        // submitting worker path announces the identifier to the main thread
+        // and waits for the ack before it sends (submit-intent), and the ack is
+        // the persisted hash. So the process died before any broadcast (or after
+        // a rejected attempt whose hash was taken off the job while it waited to
+        // rebuild): nothing of it can be on chain, and no confirmer could ever
+        // resolve it. Fail it plainly instead of parking it forever.
         await db.run(
             UPDATE.entity(BackgroundJobs)
                 .set({
                     status: 'failed',
-                    errorCode: 'PROCESS_RESTART_AFTER_REJECT',
-                    errorMessage: 'The process restarted while a rejected sponsoring attempt was waiting to be rebuilt; nothing of it is on-chain. Resubmit the call.',
+                    errorCode: 'PROCESS_RESTART_BEFORE_BROADCAST',
+                    errorMessage: 'The process restarted before this job announced a transaction for broadcast (or after its last attempt was rejected); nothing of it is on chain. A new idempotency key may be used for an intentional retry.',
                     finishedAt: new Date().toISOString(),
                     leaseOwner: null, leaseExpiresAt: null, heartbeatAt: null
                 })
-                .where({ status: 'external_execution', txHash: null, kind: { in: [...IDENTIFIER_KEYED_KINDS] } })
+                .where({ status: 'external_execution', txHash: null })
         );
         await db.run(
             UPDATE.entity(BackgroundJobs)
@@ -1007,8 +1019,6 @@ let commandPollTimer: ReturnType<typeof setInterval> | undefined;
 let commandPollActive = false;
 const SCAN_PAGE_SIZE = 100;
 let reconciliationCursor: string | undefined;
-let chainPendingCursor: string | undefined;
-let chainLegacyCursor: string | undefined;
 let parentPendingCursor: string | undefined;
 let parentLegacyCursor: string | undefined;
 let confirmerPendingCursor: string | undefined;
@@ -1017,18 +1027,17 @@ let confirmerLegacyCursor: string | undefined;
 // Crawler-free chain-outcome confirmer, injected at startup only when the
 // crawler is disabled (or explicitly opted in). Null keeps the pass a no-op, so
 // crawler deployments see no behavior change.
-type ChainOutcomeConfirmer = (txHash: string) => Promise<{ status: 'success' | 'failure' } | null>;
+type ChainOutcomeConfirmer = (txHash: string) => Promise<ChainOutcome | null>;
+
+/** The evidence columns written with every confirmed outcome (job row and attempt row alike). */
+function chainEvidencePatch(outcome: ChainOutcome): Record<string, unknown> {
+    return {
+        chainBlockHeight: Number.isInteger(outcome.blockHeight) ? outcome.blockHeight : null,
+        chainBlockHash: outcome.blockHash ?? null,
+        indexerTxHash: outcome.indexerTxHash ?? null
+    };
+}
 let chainOutcomeConfirmer: ChainOutcomeConfirmer | null = null;
-/**
- * Kinds whose `txHash` is the LEDGER TRANSACTION IDENTIFIER (what the wallet
- * SDK's submit returns), not the Substrate extrinsic hash the crawler keys
- * on. Their chain outcome is confirmed/reconciled by the indexer confirmer
- * only, which is therefore registered for them even when the crawler runs.
- */
-export const IDENTIFIER_KEYED_KINDS: ReadonlySet<string> = new Set([
-    'sponsorFinalizedTransaction',
-    'sponsorUnboundTransaction'
-]);
 let confirmerReconcileCursor: string | undefined;
 let chainConfirmActive = false;
 const CHAIN_CONFIRM_CONCURRENCY = 8;
@@ -1049,9 +1058,11 @@ const CHAIN_CONFIRM_CONCURRENCY = 8;
  * advances chainStatus (CAS on chainStatusWas).
  */
 async function finalizeIdentifierKeyedJob(
-    db: any, job: BackgroundJobRow, status: 'success' | 'failure',
-    opts: { fromStatus: 'reconciliation_required' | 'in_flight' | 'succeeded'; chainStatusWas?: string | null }
+    db: any, job: BackgroundJobRow, outcome: ChainOutcome,
+    opts: { fromStatus: 'reconciliation_required' | 'in_flight' | 'succeeded'; chainStatusWas?: string | null; generation: number }
 ): Promise<number> {
+    const status = outcome.status;
+    const evidence = chainEvidencePatch(outcome);
     const now = new Date().toISOString();
     const submission = await db.run(SELECT.one.from(PendingSubmissions).where(job.submissionId ? { ID: job.submissionId } : { txHash: job.txHash }));
     let coordinates: any = {};
@@ -1070,21 +1081,25 @@ async function finalizeIdentifierKeyedJob(
     // finalizer keeps the job in reconciliation_required for the next pass.
     let finalizedResult: unknown = canonicalResult;
     if (opts.fromStatus === 'reconciliation_required' && status === 'success') {
-        const evidence: ReconciliationEvidence = {
+        const reconciliationEvidence: ReconciliationEvidence = {
             submissionId: submission?.ID ?? job.submissionId ?? null,
             txHash: job.txHash!,
             contractAddress: submission?.contractAddress ?? null,
-            finalizedAt: submission?.finalizedAt ?? null
+            finalizedAt: submission?.finalizedAt ?? null,
+            blockHeight: outcome.blockHeight
         };
-        const fromFinalizer = await runReconciliationFinalizer(job, evidence);
+        const fromFinalizer = await runReconciliationFinalizer(job, reconciliationEvidence);
         if (fromFinalizer !== undefined) finalizedResult = { ...canonicalResult, ...(fromFinalizer as object) };
     }
-    const jobPatch: Record<string, unknown> = terminal
-        ? (status === 'success'
-            ? { status: 'succeeded', chainStatus: 'success', chainFinalizedAt: now, errorCode: null, errorMessage: null, finishedAt: now, result: safeStringify(finalizedResult) }
-            : { status: 'failed', chainStatus: 'failure', chainFinalizedAt: now, finishedAt: now,
-                errorCode: 'CHAIN_EXECUTION_FAILED', errorMessage: `Transaction ${job.txHash} is on-chain but its contract call did not apply (ledger result failure)` })
-        : { chainStatus: status, chainFinalizedAt: now };
+    const jobPatch: Record<string, unknown> = {
+        ...(terminal
+            ? (status === 'success'
+                ? { status: 'succeeded', chainStatus: 'success', chainFinalizedAt: now, errorCode: null, errorMessage: null, finishedAt: now, result: safeStringify(finalizedResult) }
+                : { status: 'failed', chainStatus: 'failure', chainFinalizedAt: now, finishedAt: now,
+                    errorCode: 'CHAIN_EXECUTION_FAILED', errorMessage: `Transaction ${job.txHash} is on-chain but its contract call did not apply (ledger result failure)` })
+            : { chainStatus: status, chainFinalizedAt: now }),
+        ...evidence
+    };
     if (opts.fromStatus === 'in_flight') Object.assign(jobPatch, { leaseOwner: null, leaseExpiresAt: null, heartbeatAt: null });
     const jobWhere: Record<string, unknown> = opts.fromStatus === 'reconciliation_required'
         ? { ID: job.ID, status: 'reconciliation_required' }
@@ -1094,9 +1109,12 @@ async function finalizeIdentifierKeyedJob(
     const subPatch: Record<string, unknown> = {
         status: status === 'success' ? 'finalized' : 'failed',
         finalizedAt: now,
+        ...evidence,
         ...(status === 'failure' ? { errorCode: 'CHAIN_EXECUTION_FAILED', errorMessage: 'contract call did not apply (ledger result failure)' } : {})
     };
     return withStatusWriteRetry(`finalizeIdentifierKeyedJob(${job.ID})`, () => (db as any).tx(async (tx: any) => {
+        // A rollback since the lookup: the outcome may describe the old fork.
+        if (await lockReorgGeneration(tx) !== opts.generation) return 0;
         const affected = affectedRows(await tx.run(UPDATE.entity(BackgroundJobs).set(jobPatch as any).where(jobWhere)));
         if (affected === 1 && submission?.ID) {
             await tx.run(UPDATE.entity(PendingSubmissions).set(subPatch as any).where({ ID: submission.ID }));
@@ -1186,10 +1204,8 @@ async function runReconciliationFinalizer(job: BackgroundJobRow, evidence: Recon
     return finalizer(JSON.parse(serialized), job, evidence);
 }
 
-let confirmerIdentifierKindsOnly = false;
-export function registerChainOutcomeConfirmer(confirmer: ChainOutcomeConfirmer | null, opts: { identifierKindsOnly?: boolean } = {}): void {
+export function registerChainOutcomeConfirmer(confirmer: ChainOutcomeConfirmer | null): void {
     chainOutcomeConfirmer = confirmer;
-    confirmerIdentifierKindsOnly = !!opts.identifierKindsOnly;
 }
 
 /**
@@ -1240,6 +1256,10 @@ async function scanBackgroundJobPage(
  */
 export async function startBackgroundJobProcessor(): Promise<void> {
     if (commandPollTimer) return;
+    const missing = undeclaredOrUnregisteredJobKinds();
+    if (missing.length > 0) {
+        throw new Error(`background-job kinds declared without a processor: ${missing.join(', ')} (srv/submission/job-kinds.ts vs the registrations)`);
+    }
     await pollPersistedCommands();
     await settleRejectedSponsorAttempts();
     await reconcileBackgroundJobs();
@@ -1256,19 +1276,86 @@ export function stopBackgroundJobProcessor(): void {
     commandPollTimer = undefined;
 }
 
+/**
+ * Heartbeat silence after which a `running` lease counts as dead (the owning
+ * process is gone or wedged). `running` is the only reclaimable state: a row
+ * past the external-effect boundary carries an identifier the reconciliation
+ * sweeps resolve, and a second dispatch could spend a second fee.
+ */
+const JOB_LEASE_TTL_MS = configMs('NIGHTGATE_JOB_LEASE_TTL_MS');
+/** A job whose lease died this often is failed instead of re-queued (a crash loop must end). */
+const MAX_LEASE_RECLAIMS = 3;
+
+/**
+ * Re-queue `running` jobs whose heartbeat stopped for longer than the lease
+ * TTL. CAS on (ID, leaseOwner, status, heartbeatAt): a heartbeat that lands
+ * between the scan and the write keeps the lease. Legacy closures cannot be
+ * re-dispatched (their work lived in the dead process) and fail; a job
+ * reclaimed MAX_LEASE_RECLAIMS times fails too.
+ */
+export async function reclaimExpiredLeases(existingDb?: any): Promise<number> {
+    const db = existingDb ?? await cds.connect.to('db');
+    const cutoff = new Date(Date.now() - JOB_LEASE_TTL_MS).toISOString();
+    const columns = ['ID', 'kind', 'attempt', 'leaseOwner', 'heartbeatAt', 'startedAt', 'commandVersion'];
+    const silent = await db.run(
+        SELECT.from(BackgroundJobs).columns(...columns).where({ status: 'running', heartbeatAt: { '<': cutoff } }).limit(SCAN_PAGE_SIZE)
+    ) as BackgroundJobRow[];
+    const neverBeat = await db.run(
+        SELECT.from(BackgroundJobs).columns(...columns).where({ status: 'running', heartbeatAt: null, startedAt: { '<': cutoff } }).limit(SCAN_PAGE_SIZE)
+    ) as BackgroundJobRow[];
+    let reclaimed = 0;
+    for (const row of [...(silent ?? []), ...(neverBeat ?? [])]) {
+        const guard = { ID: row.ID, status: 'running', leaseOwner: row.leaseOwner ?? null, heartbeatAt: row.heartbeatAt ?? null };
+        const attempt = (row.attempt ?? 1) + 1;
+        const terminal = !row.commandVersion
+            ? 'its work was an in-process closure that died with the lease owner'
+            : attempt > MAX_LEASE_RECLAIMS + 1
+                ? `its lease expired ${MAX_LEASE_RECLAIMS} times`
+                : null;
+        const patch: Record<string, unknown> = terminal
+            ? {
+                status: 'failed', errorCode: 'LEASE_EXPIRED',
+                errorMessage: `no heartbeat from ${row.leaseOwner ?? 'unknown owner'} for more than ${JOB_LEASE_TTL_MS} ms; ${terminal}`.slice(0, 4000),
+                finishedAt: new Date().toISOString(), leaseOwner: null, leaseExpiresAt: null, heartbeatAt: null
+            }
+            : { status: 'pending', attempt, startedAt: null, leaseOwner: null, leaseExpiresAt: null, heartbeatAt: null };
+        const affected = await withStatusWriteRetry(`reclaimLease(${row.ID})`, () => db.run(
+            UPDATE.entity(BackgroundJobs).set(patch).where(guard)
+        ));
+        if (affectedRows(affected) !== 1) continue;
+        reclaimed++;
+        (terminal ? cds.log('nightgate').error : cds.log('nightgate').warn).call(cds.log('nightgate'),
+            `lease of ${row.kind} job ${row.ID} held by ${row.leaseOwner ?? 'unknown'} expired (no heartbeat since ${row.heartbeatAt ?? row.startedAt}): ` +
+            (terminal ? `failed LEASE_EXPIRED, ${terminal}` : `re-queued as attempt ${attempt}`));
+    }
+    return reclaimed;
+}
+
 async function pollPersistedCommands(): Promise<void> {
     if (commandPollActive) return;
     commandPollActive = true;
     try {
         const db = await cds.connect.to('db');
+        await reclaimExpiredLeases(db);
         const rows = await db.run(
             SELECT.from(BackgroundJobs)
                 .columns('ID', 'kind', 'commandVersion')
                 .where({ status: 'pending', commandVersion: { '!=': null } })
+                .orderBy('createdAt asc')
                 .limit(100)
         );
+        // Dispatch up to the FREE capacity of each concurrency class, once per
+        // job: a row already dispatched in this process is skipped, the rest
+        // wait for the next tick instead of piling up behind the semaphore.
+        const budget = new Map<Semaphore, number>();
         for (const row of rows as Array<{ ID: string; kind: string; commandVersion: number }>) {
-            if (processors.has(processorKey(row.kind, row.commandVersion))) scheduleJob(row.ID, row.kind);
+            if (dispatching.has(row.ID)) continue;
+            if (!processors.has(processorKey(row.kind, row.commandVersion))) continue;
+            const semaphore = getSemaphore(row.kind);
+            const free = budget.get(semaphore) ?? semaphore.available();
+            if (free <= 0) continue;
+            budget.set(semaphore, free - 1);
+            scheduleJob(row.ID, row.kind);
         }
         await settleRejectedSponsorAttempts(db);
         await reconcileBackgroundJobs(db);
@@ -1280,12 +1367,12 @@ async function pollPersistedCommands(): Promise<void> {
 }
 
 /**
- * Conservatively resolve ambiguous jobs from durable chain evidence. A job
- * completes only when its exact tx is finalized in PendingSubmissions AND indexed
- * by the crawler (proves submission/inclusion, not business success); a txHash or
- * an `included` PendingSubmission alone is not enough. Workflow parents are
- * re-queued only after every child step succeeded; their processor then rebuilds
- * the typed result without re-submitting any child.
+ * Workflow parents parked in `reconciliation_required` are re-queued once
+ * every child step succeeded; their processor then rebuilds the typed result
+ * without re-submitting any child. Leaf jobs are NOT resolved here: their only
+ * chain evidence is the indexer confirmer (`confirmChainOutcomesViaIndexer`),
+ * keyed by the ledger identifier the job stores. The crawler cannot correlate
+ * them: it indexes the Substrate extrinsic hash, a different value.
  */
 export async function reconcileBackgroundJobs(existingDb?: any): Promise<number> {
     const db = existingDb ?? await cds.connect.to('db');
@@ -1297,7 +1384,7 @@ export async function reconcileBackgroundJobs(existingDb?: any): Promise<number>
     let resolved = 0;
 
     for (const job of candidates) {
-        if (WORKFLOW_PARENT_KINDS.has(job.kind)) {
+        if (jobKindTraits(job.kind).workflowParent) {
             const children = await db.run(
                 SELECT.from(BackgroundJobs).where({ parentJobId: job.ID })
             ) as BackgroundJobRow[];
@@ -1313,102 +1400,24 @@ export async function reconcileBackgroundJobs(existingDb?: any): Promise<number>
             continue;
         }
 
-        const submission = job.submissionId
-            ? await db.run(SELECT.one.from(PendingSubmissions).where({ ID: job.submissionId }))
-            : job.txHash
-                ? await db.run(SELECT.one.from(PendingSubmissions).where({ txHash: job.txHash }))
-                : null;
-        const txHash = job.txHash ?? submission?.txHash;
-        if (!txHash || submission?.status !== 'finalized') continue;
-
-        const indexedTx = await db.run(SELECT.one.from(Transactions).columns('ID', 'hash').where({ hash: txHash }));
-        if (!indexedTx?.ID) continue;
-        const txResult = await db.run(
-            SELECT.one.from(TransactionResults).columns('status', 'outcomeSource').where({ transaction_ID: indexedTx.ID })
-        );
-        if (txResult?.outcomeSource !== 'substrate-system-events'
-            || (txResult.status !== 'SUCCESS' && txResult.status !== 'FAILURE')) continue;
-        const chainFinalizedAt = submission?.finalizedAt ?? new Date().toISOString();
-        if (txResult.status === 'FAILURE') {
-            const affected = await withStatusWriteRetry(`reconcileFailedJob(${job.ID})`, () => db.run(
-                UPDATE.entity(BackgroundJobs).set({
-                    status: 'failed', chainStatus: 'failure', chainFinalizedAt,
-                    errorCode: 'CHAIN_EXECUTION_FAILED',
-                    errorMessage: `Transaction ${txHash} was finalized with system.ExtrinsicFailed`,
-                    finishedAt: new Date().toISOString()
-                }).where({ ID: job.ID, status: 'reconciliation_required' })
-            ));
-            resolved += affectedRows(affected);
-            continue;
-        }
-        const evidence: ReconciliationEvidence = {
-            submissionId: submission?.ID ?? job.submissionId,
-            txHash,
-            contractAddress: submission?.contractAddress ?? null,
-            finalizedAt: submission?.finalizedAt ?? null
-        };
-        let result: unknown;
-        try {
-            result = await runReconciliationFinalizer(job, evidence) ?? { reconciled: true, ...evidence, status: 'finalized' };
-        } catch (err) {
-            cds.log('nightgate').warn(
-                `Reconciliation finalizer for ${job.kind} job ${job.ID} failed; keeping reconciliation_required: ${String((err as Error)?.message ?? err)}`
-            );
-            continue;
-        }
-        const affected = await withStatusWriteRetry(`reconcileJob(${job.ID})`, () => db.run(
-            UPDATE.entity(BackgroundJobs).set({
-                status: 'succeeded',
-                chainStatus: 'success', chainFinalizedAt,
-                result: safeStringify(result),
-                errorCode: null, errorMessage: null, finishedAt: new Date().toISOString()
-            }).where({ ID: job.ID, status: 'reconciliation_required' })
-        ));
-        resolved += affectedRows(affected);
     }
     return resolved;
 }
 
-/** Enrich already-completed submission workflows with their later chain outcome. */
+/**
+ * Aggregate a succeeded workflow parent's `chainStatus` from its children.
+ * Leaf outcomes come from the indexer confirmer only.
+ */
 export async function refreshSucceededChainOutcomes(existingDb?: any): Promise<number> {
     const db = existingDb ?? await cds.connect.to('db');
-    const pendingPage = await scanBackgroundJobPage(db, {
-        status: 'succeeded', txHash: { '!=': null }, chainStatus: 'pending'
-    }, chainPendingCursor);
-    chainPendingCursor = pendingPage.cursor;
-    const legacyPage = await scanBackgroundJobPage(db, {
-        status: 'succeeded', txHash: { '!=': null }, chainStatus: null
-    }, chainLegacyCursor);
-    chainLegacyCursor = legacyPage.cursor;
-    const jobs = [...pendingPage.rows, ...legacyPage.rows];
     let updated = 0;
-    for (const job of jobs) {
-        const submission = job.submissionId
-            ? await db.run(SELECT.one.from(PendingSubmissions).where({ ID: job.submissionId }))
-            : await db.run(SELECT.one.from(PendingSubmissions).where({ txHash: job.txHash }));
-        if (submission?.status !== 'finalized') continue;
-        const indexedTx = await db.run(SELECT.one.from(Transactions).columns('ID').where({ hash: job.txHash }));
-        if (!indexedTx?.ID) continue;
-        const outcome = await db.run(
-            SELECT.one.from(TransactionResults).columns('status', 'outcomeSource').where({ transaction_ID: indexedTx.ID })
-        );
-        if (outcome?.outcomeSource !== 'substrate-system-events'
-            || (outcome.status !== 'SUCCESS' && outcome.status !== 'FAILURE')) continue;
-        const affected = await withStatusWriteRetry(`refreshChainOutcome(${job.ID})`, () => db.run(
-            UPDATE.entity(BackgroundJobs).set({
-                chainStatus: outcome.status === 'SUCCESS' ? 'success' : 'failure',
-                chainFinalizedAt: submission.finalizedAt ?? new Date().toISOString()
-            }).where({ ID: job.ID, status: 'succeeded' })
-        ));
-        updated += affectedRows(affected);
-    }
 
     const pendingParents = await scanBackgroundJobPage(db, {
-        status: 'succeeded', kind: { in: [...WORKFLOW_PARENT_KINDS] }, chainStatus: 'pending'
+        status: 'succeeded', kind: { in: kindsWithTrait('workflowParent') }, chainStatus: 'pending'
     }, parentPendingCursor);
     parentPendingCursor = pendingParents.cursor;
     const legacyParents = await scanBackgroundJobPage(db, {
-        status: 'succeeded', kind: { in: [...WORKFLOW_PARENT_KINDS] }, chainStatus: null
+        status: 'succeeded', kind: { in: kindsWithTrait('workflowParent') }, chainStatus: null
     }, parentLegacyCursor);
     parentLegacyCursor = legacyParents.cursor;
     const parents = [...pendingParents.rows, ...legacyParents.rows];
@@ -1431,11 +1440,13 @@ export async function refreshSucceededChainOutcomes(existingDb?: any): Promise<n
 }
 
 /**
- * Crawler-free twin of `refreshSucceededChainOutcomes`' leaf pass: advance a
- * succeeded leaf job's `chainStatus` by a per-tx Indexer lookup instead of the
- * crawler-populated `Transactions`/`TransactionResults`. No-op unless a confirmer
- * is registered (crawler on -> not registered). Workflow parents are skipped;
- * their `chainStatus` is aggregated from children by `refreshSucceededChainOutcomes`.
+ * The chain evidence path for leaf jobs: advance a succeeded leaf job's
+ * `chainStatus` and resolve a parked `reconciliation_required` job by a per-tx
+ * Indexer lookup keyed by the ledger identifier the job stores. The inclusion
+ * coordinates the indexer reports (block height/hash, its transaction hash)
+ * are recorded on the job and the attempt row; a reorg rollback reverts by
+ * that block height. Workflow parents are skipped; their `chainStatus` is
+ * aggregated from children by `refreshSucceededChainOutcomes`.
  */
 export async function confirmChainOutcomesViaIndexer(existingDb?: any): Promise<number> {
     const confirmer = chainOutcomeConfirmer;
@@ -1449,37 +1460,41 @@ export async function confirmChainOutcomesViaIndexer(existingDb?: any): Promise<
         status: 'succeeded', txHash: { '!=': null }, chainStatus: null
     }, confirmerLegacyCursor);
     confirmerLegacyCursor = legacyPage.cursor;
-    // Identifier-keyed kinds (the sponsor paths store the ledger transaction
-    // identifier, which only the indexer answers; the crawler keys on the
-    // Substrate extrinsic hash and never finds them) are ALSO resolved from
-    // reconciliation_required here: the indexer's apply result is exactly the
-    // evidence reconciliation needs. Success -> succeeded (result carries the
-    // identifier), failure -> failed, not indexed -> stays.
+    // EVERY kind parked in reconciliation_required with a hash is resolved
+    // here: since 0.23.0 the bound channel records the ledger transaction
+    // identifier the worker announces before broadcasting (what the indexer
+    // answers), and a crawler-off deployment has no other evidence. The
+    // indexer's apply result is exactly what reconciliation needs. Success ->
+    // succeeded (result carries the identifier), failure -> failed, not indexed
+    // -> stays (the crawler path keeps trying too when it runs).
     const reconcilePage = await scanBackgroundJobPage(db, {
-        status: 'reconciliation_required', txHash: { '!=': null }, kind: { in: [...IDENTIFIER_KEYED_KINDS] }
+        status: 'reconciliation_required', txHash: { '!=': null }
     }, confirmerReconcileCursor);
     confirmerReconcileCursor = reconcilePage.cursor;
     let updated = 0;
+    // Captured before the lookups; each commit compares under the row lock.
+    let generation = await readReorgGeneration(db);
     for (const job of reconcilePage.rows) {
-        let outcome: { status: 'success' | 'failure' } | null;
+        let outcome: ChainOutcome | null;
         try { outcome = await confirmer(job.txHash!); } catch { continue; }
         if (!outcome) continue;
         try {
-            updated += await finalizeIdentifierKeyedJob(db, job, outcome.status, { fromStatus: 'reconciliation_required' });
+            updated += await finalizeIdentifierKeyedJob(db, job, outcome, { fromStatus: 'reconciliation_required', generation });
         } catch (err) {
             // next pass; a finalizer that keeps throwing is visible here
             cds.log('nightgate').debug(`Crawler-free reconciliation of ${job.kind} job ${job.ID} deferred: ${String((err as Error)?.message ?? err)}`);
         }
     }
     const jobs = [...pendingPage.rows, ...legacyPage.rows]
-        .filter(job => !WORKFLOW_PARENT_KINDS.has(job.kind))
-        .filter(job => !confirmerIdentifierKindsOnly || IDENTIFIER_KEYED_KINDS.has(job.kind));
+        .filter(job => !jobKindTraits(job.kind).workflowParent);
     let lookupErrors = 0;
     let writeErrors = 0;
     // Bounded parallelism: each lookup is one short Indexer query. Serial would
     // let a full page stack per-lookup latency; unbounded would hammer the Indexer.
+    generation = await readReorgGeneration(db);
+    let staleGeneration = 0;
     await mapWithConcurrency(jobs, CHAIN_CONFIRM_CONCURRENCY, async job => {
-        let outcome: { status: 'success' | 'failure' } | null;
+        let outcome: ChainOutcome | null;
         try {
             outcome = await confirmer(job.txHash!);
         } catch {
@@ -1491,23 +1506,51 @@ export async function confirmChainOutcomesViaIndexer(existingDb?: any): Promise<
         // for legacy rows, `IS NULL` - not `IN (...)`, which never matches NULL in
         // SQL). Keeps the write a safe no-op if the value changed since the scan.
         try {
-            if (IDENTIFIER_KEYED_KINDS.has(job.kind)) {
+            if (jobKindTraits(job.kind).identifierKeyed) {
                 // Sponsor jobs: job chainStatus AND the attempt's PendingSubmissions
                 // row are finalized together (the crawler never sees these rows).
-                updated += await finalizeIdentifierKeyedJob(db, job, outcome.status, { fromStatus: 'succeeded', chainStatusWas: job.chainStatus ?? null });
+                updated += await finalizeIdentifierKeyedJob(db, job, outcome, { fromStatus: 'succeeded', chainStatusWas: job.chainStatus ?? null, generation });
             } else {
-                const affected = await withStatusWriteRetry(`confirmChainOutcome(${job.ID})`, () => db.run(
-                    UPDATE.entity(BackgroundJobs).set({
-                        chainStatus: outcome!.status,
-                        chainFinalizedAt: new Date().toISOString()
-                    }).where({ ID: job.ID, status: 'succeeded', chainStatus: job.chainStatus ?? null })
-                ));
-                updated += affectedRows(affected);
+                const now = new Date().toISOString();
+                const evidence = chainEvidencePatch(outcome);
+                // Job CAS and attempt row in ONE transaction: a job with a
+                // terminal chainStatus leaves the scan for good, so its attempt
+                // must never be left behind by a failed second write.
+                const n: number = await withStatusWriteRetry(`confirmChainOutcome(${job.ID})`, () => (db as any).tx(async (tx: any): Promise<number> => {
+                    // A rollback since the lookup: the outcome may describe the old fork.
+                    if (await lockReorgGeneration(tx) !== generation) { staleGeneration++; return 0; }
+                    const affected = affectedRows(await tx.run(
+                        UPDATE.entity(BackgroundJobs).set({
+                            chainStatus: outcome!.status,
+                            chainFinalizedAt: now,
+                            ...evidence
+                        }).where({ ID: job.ID, status: 'succeeded', chainStatus: job.chainStatus ?? null })
+                    ));
+                    // The attempt row follows the outcome: nothing else moves it
+                    // past `included` (the crawler cannot correlate it).
+                    if (affected === 1) {
+                        await tx.run(
+                            UPDATE.entity(PendingSubmissions).set({
+                                status: outcome!.status === 'success' ? 'finalized' : 'failed',
+                                finalizedAt: now,
+                                ...evidence,
+                                ...(outcome!.status === 'failure' ? { errorCode: 'CHAIN_EXECUTION_FAILED', errorMessage: 'contract call did not apply (ledger result failure)' } : {})
+                            }).where(job.submissionId
+                                ? { ID: job.submissionId, status: { in: ['pending', 'included'] } }
+                                : { txHash: job.txHash, status: { in: ['pending', 'included'] } })
+                        );
+                    }
+                    return affected;
+                }));
+                updated += n;
             }
         } catch {
             writeErrors++;
         }
     });
+    if (staleGeneration > 0) {
+        cds.log('nightgate').info(`Crawler-free chain confirm: ${staleGeneration} outcome(s) read before a reorg rollback were not recorded; next tick looks again`);
+    }
     if (lookupErrors > 0 || writeErrors > 0) {
         cds.log('nightgate').warn(
             `Crawler-free chain confirm: ${lookupErrors} lookup / ${writeErrors} write error(s) of ${jobs.length} this pass`
@@ -1549,13 +1592,7 @@ async function mapWithConcurrency<T>(items: T[], limit: number, fn: (item: T) =>
 // transaction the server would happily have taken a moment later. The call it
 // guards takes 40s of proving and submitting anyway, so patience here is
 // cheap; what is expensive is a rejected submission.
-const STATUS_WRITE_ATTEMPTS = 5;
-const DEFAULT_STATUS_WRITE_BACKOFF_MS: readonly number[] = [0, 500, 1500, 4000, 8000];
-let statusWriteBackoffMs: readonly number[] = DEFAULT_STATUS_WRITE_BACKOFF_MS;
-
-function isLockContention(err: unknown): boolean {
-    return /database is locked|SQLITE_BUSY/i.test(String((err as Error)?.message ?? err));
-}
+const STATUS_WRITE_ATTEMPTS = LOCK_CONTENTION_ATTEMPTS;
 
 /**
  * The job was never admitted because the database stayed busy for the whole
@@ -1572,15 +1609,7 @@ function isLockContention(err: unknown): boolean {
  * every reconciliation tick. The indexer cannot resolve such a job: the
  * identifier never reached a mempool.
  */
-export const REJECTED_ATTEMPT_BOOKKEEPING_PENDING = 'REJECTED_ATTEMPT_BOOKKEEPING_PENDING';
-
-export class SponsorAttemptBookkeepingPendingError extends Error {
-    readonly code = REJECTED_ATTEMPT_BOOKKEEPING_PENDING;
-    constructor(message: string, public readonly details: { submissionId: string; txHash?: string; grantId?: string; refund: number }) {
-        super(message);
-        this.name = 'SponsorAttemptBookkeepingPendingError';
-    }
-}
+export { REJECTED_ATTEMPT_BOOKKEEPING_PENDING, SponsorAttemptBookkeepingPendingError } from './job-execution-context';
 
 export class JobAdmissionBusyError extends Error {
     readonly httpStatus = 503;
@@ -1620,20 +1649,8 @@ function isUniqueViolation(err: unknown): boolean {
         .test(String(anyErr?.message ?? err));
 }
 
-async function withStatusWriteRetry<T>(label: string, write: () => Promise<T>): Promise<T> {
-    let lastErr: unknown;
-    for (let attempt = 0; attempt < STATUS_WRITE_ATTEMPTS; attempt++) {
-        if (statusWriteBackoffMs[attempt]) await sleep(statusWriteBackoffMs[attempt]);
-        try {
-            return await write();
-        } catch (err) {
-            if (!isLockContention(err)) throw err;
-            lastErr = err;
-            cds.log('nightgate').warn(`${label}: status write lost the SQLite lock (attempt ${attempt + 1}/${STATUS_WRITE_ATTEMPTS})`);
-        }
-    }
-    throw lastErr;
-}
+const withStatusWriteRetry = <T>(label: string, write: () => Promise<T>): Promise<T> =>
+    withDbLockRetry(label, write, (msg: string) => cds.log('nightgate').warn(msg));
 
 function affectedRows(value: unknown): number {
     return typeof value === 'number' ? value : Number((value as any)?.changes ?? value ?? 0);
@@ -1648,7 +1665,6 @@ async function markRunning(jobId: string): Promise<boolean> {
                     .set({
                         status: 'running',
                         startedAt: new Date().toISOString(),
-                        attempt: 1,
                         leaseOwner: getRuntimeWorkerId(),
                         heartbeatAt: new Date().toISOString(),
                         leaseExpiresAt: new Date(Date.now() + JOB_LEASE_MS).toISOString()
@@ -1729,11 +1745,37 @@ async function markFailed(jobId: string, classification: SubmissionErrorClassifi
  * same writes as the reconcile pass's FAILURE branch, but straight from the
  * running job (lease-guarded CAS), job row + attempt row in one transaction.
  */
-async function markChainFailureAfterBroadcast(jobId: string, current: BackgroundJobRow): Promise<void> {
+async function markChainFailureAfterBroadcast(jobId: string, current: BackgroundJobRow, err: unknown): Promise<void> {
+    // The rollback correlates by block height only: a terminal failure without
+    // the height could never be reverted after a reorg. The worker carries the
+    // indexer's height on the error; without it the job parks for the
+    // confirmer, which records the full coordinates before finalizing.
+    // The worker proved the failure against the indexer, but its answer is not
+    // generation-protected: a rollback between that probe and this write would
+    // record the old fork. Ask the registered confirmer again under a captured
+    // generation; without a confirmer or an answer the job parks for the
+    // reconciliation pass, which does the same with its coordinates.
     const db = await cds.connect.to('db');
+    const carried = carriedSubmitFailure(err)?.blockHeight;
+    const generation = await readReorgGeneration(db);
+    let outcome: ChainOutcome | null = null;
+    try { outcome = chainOutcomeConfirmer ? await chainOutcomeConfirmer(current.txHash!) : null; } catch { outcome = null; }
+    if (!outcome) {
+        await markReconciliationRequired(jobId, {
+            code: 'CHAIN_EXECUTION_FAILED_UNCONFIRMED',
+            message: `Transaction ${current.txHash} is on-chain and its contract call did not apply` +
+                (Number.isInteger(carried) ? ` (worker saw block ${carried})` : '') +
+                `; the indexer confirmer finalizes it with generation-checked coordinates`
+        });
+        return;
+    }
     try {
-        const affected = await finalizeIdentifierKeyedJob(db, current, 'failure', { fromStatus: 'in_flight' });
-        if (affected !== 1) throw new Error(`Lease lost before terminal chain-failure update (${jobId})`);
+        const affected = await finalizeIdentifierKeyedJob(db, current, outcome, { fromStatus: 'in_flight', generation });
+        if (affected !== 1) {
+            // Lease lost, or a rollback since the lookup: park rather than guess.
+            await markReconciliationRequired(jobId, { code: 'CHAIN_EXECUTION_FAILED_UNCONFIRMED', message: `Transaction ${current.txHash}: terminal chain-failure write refused (lease or reorg generation changed); the reconciliation pass finalizes it` });
+            return;
+        }
     } catch (writeErr) {
         cds.log('nightgate').error(
             `markChainFailureAfterBroadcast(${jobId}): could not persist the terminal status after ${STATUS_WRITE_ATTEMPTS} attempts; ` +
@@ -1782,7 +1824,7 @@ let runtimeWorkerId: string | undefined;
 
 function getRuntimeWorkerId(): string {
     return runtimeWorkerId ??= (
-        process.env.NIGHTGATE_INSTANCE_ID
+        configString('NIGHTGATE_INSTANCE_ID')
         || process.env.CF_INSTANCE_GUID
         || process.env.HOSTNAME
         || crypto.randomUUID()
@@ -1840,29 +1882,6 @@ export async function markJobExternalExecution(jobId: string, submission: { subm
         throw new Error(`markJobExternalExecution(${jobId}): job already crossed the external-effect boundary; a background job may perform at most one external submission.`);
     }
     throw new Error(`Lease lost before markJobExternalExecution(${jobId})`);
-}
-
-/**
- * The announced attempt was provably rejected before inclusion: clear the
- * job's txHash (and step back to external_execution) so that, if the retries
- * are exhausted, the job fails as a plain `failed` instead of
- * `reconciliation_required` (which needs a hash that MAY be on-chain). The
- * attempt's own PendingSubmissions row keeps the rejected hash for audit.
- */
-export async function markJobSubmissionRejected(jobId: string, submission: { submissionId?: string; txHash?: string }): Promise<void> {
-    const db = await cds.connect.to('db');
-    await withStatusWriteRetry(`markJobSubmissionRejected(${jobId})`, async () => db.run(
-        UPDATE.entity(BackgroundJobs)
-            .set({
-                status: 'external_execution',
-                txHash: null,
-                chainStatus: null,
-                submissionId: submission.submissionId ?? null,
-                heartbeatAt: new Date().toISOString(),
-                leaseExpiresAt: new Date(Date.now() + JOB_LEASE_MS).toISOString()
-            })
-            .where({ ID: jobId, status: { in: ['external_execution', 'submitted'] }, leaseOwner: getRuntimeWorkerId(), ...(submission.txHash ? { txHash: submission.txHash } : {}) })
-    ));
 }
 
 /**
@@ -1951,9 +1970,12 @@ export async function markJobSubmitted(jobId: string, submission: { submissionId
     if (affectedRows(affected) !== 1) throw new Error(`Lease lost before markJobSubmitted(${jobId})`);
 }
 
+/** Test seam: one poller tick (reclaim, budgeted dispatch, sweeps). */
+export function __pollOnceForTests(): Promise<void> { return pollPersistedCommands(); }
+
 /** Test-only reset of the in-memory caches. */
 export function __resetForTests(): void {
-    confirmerIdentifierKindsOnly = false;
+    dispatching.clear();
     confirmerReconcileCursor = undefined;
     stopBackgroundJobProcessor();
     semaphores.clear();
@@ -1961,18 +1983,16 @@ export function __resetForTests(): void {
     runtimeWorkerId = undefined;
     commandPollActive = false;
     reconciliationCursor = undefined;
-    chainPendingCursor = undefined;
-    chainLegacyCursor = undefined;
     parentPendingCursor = undefined;
     parentLegacyCursor = undefined;
     confirmerPendingCursor = undefined;
     confirmerLegacyCursor = undefined;
     chainOutcomeConfirmer = null;
     chainConfirmActive = false;
-    statusWriteBackoffMs = DEFAULT_STATUS_WRITE_BACKOFF_MS;
+    __resetLockContentionBackoffForTests();
 }
 
 /** Test-only override of the status-write retry backoff schedule. */
 export function __setStatusWriteBackoffForTests(ms: readonly number[]): void {
-    statusWriteBackoffMs = ms;
+    __setLockContentionBackoffForTests(ms);
 }

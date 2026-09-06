@@ -26,6 +26,11 @@ describe('docker/cds-config.mjs', () => {
         expect(cfg.requires.auth).toEqual({ impl: './srv/utils/agent-token-auth.js', users: { nightgate: { password: 'pw', roles: ['admin'] } } });
     });
 
+    it('masks the agent token header in the JSON request log (CAP prints every header otherwise)', () => {
+        const cfg = JSON.parse(run({ NIGHTGATE_HTTP_PASSWORD: 'pw' }).out);
+        expect(cfg.log.mask_headers).toEqual(expect.arrayContaining(['/authorization/i', '/cookie/i', '/x-agent-token/i']));
+    });
+
     it('honours NIGHTGATE_DB_PATH, the busy timeout, user and roles', () => {
         const cfg = JSON.parse(run({ NIGHTGATE_HTTP_PASSWORD: 'pw', NIGHTGATE_DB_PATH: '/x/y.db', NIGHTGATE_SQLITE_BUSY_TIMEOUT_MS: '5000', NIGHTGATE_HTTP_USER: 'ops', NIGHTGATE_HTTP_ROLES: 'admin, viewer' }).out);
         expect(cfg.requires.db).toEqual({ kind: 'sqlite', credentials: { url: '/x/y.db' }, client: { timeout: 5000 } });

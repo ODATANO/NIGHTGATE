@@ -26,11 +26,15 @@ import crypto from 'crypto';
 import cds from '@sap/cds';
 const { SELECT, INSERT, UPDATE } = cds.ql;
 import { WalletSyncStates } from '#cds-models/midnight';
-import { StorageEncryption, decryptWithPassword } from '../utils/storage-encryption';
+import { StorageEncryption, decryptWithPassword, extractEncryptedComponents } from '../utils/storage-encryption';
+import { getEncryptionKey, deriveBoundSecret, type KeyRing } from '../utils/crypto';
+import { resolveAccountDek, syncStatePassphraseFromDek, clearAllAccountDeks, DEK_SCHEME } from './account-keys';
 import { ensureNightgateModelLoaded } from '../utils/cds-model';
+import { isLockContention } from './db-write-retry';
+import { configFlag } from '../utils/config';
 const log = cds.log('nightgate:sync');
 
-const DEBUG_SYNC = process.env.NIGHTGATE_DEBUG_WALLET_SYNC === 'true';
+const DEBUG_SYNC = configFlag('NIGHTGATE_DEBUG_WALLET_SYNC');
 const dbgSync = (msg: string): void => { if (DEBUG_SYNC) log.debug(msg); };
 
 /**
@@ -101,18 +105,57 @@ async function getDb(): Promise<cds.DatabaseService> {
  * is bounded by the number of CONNECTED wallets, not ever-connected ones.
  */
 interface EncryptionCacheEntry {
-    /** Hash of (accountId, passphrase) so a changed passphrase re-derives. */
+    /** Hash of (accountId, effective passphrase) so a changed passphrase or key re-derives. */
     passHash: string;
     pending: Promise<StorageEncryption>;
 }
 
 const encryptionCache = new Map<string, EncryptionCacheEntry>();
 
-function deriveStableSalt(accountId: string, passphrase: string): Buffer {
+/**
+ * The blob passphrase derives from the ACCOUNT DEK (account-keys.ts), which
+ * the store resolves from the caller's passphrase (the viewing-key-derived
+ * storage password: it opens the DEK's viewing-key seal and creates a
+ * missing DEK). The ring rewraps the DEK without the viewing key; the
+ * viewing key alone opens nothing. Blobs written before the DEK (salt label
+ * v2 = ring key + passphrase, v1 = passphrase only) are still readable
+ * through the legacy candidates and rewritten under the DEK at the next
+ * save, which marks the row `keyScheme = 'dek1'`.
+ */
+const SYNC_STATE_INFO = 'nightgate/sync-state/v2';
+const SALT_LABEL_V1 = 'nightgate-wallet-sync-salt-v1';
+const SALT_LABEL_V2 = 'nightgate-wallet-sync-salt-v2';
+/** Blobs under the account DEK (account-keys.ts); the row is marked `keyScheme = 'dek1'`. */
+export const SALT_LABEL_DEK = 'nightgate-wallet-sync-salt-dek1';
+
+function boundPassphrase(ring: KeyRing, keyId: string, passphrase: string): string {
+    return deriveBoundSecret(ring, keyId, passphrase, SYNC_STATE_INFO).toString('hex');
+}
+
+/** Salt in the blob header: names the derivation the blob was written with. */
+export function deriveStableSalt(accountId: string, passphrase: string, label: string = SALT_LABEL_V2): Buffer {
     return crypto
         .createHash('sha256')
-        .update(`${passphrase}|${accountId}|nightgate-wallet-sync-salt-v1`)
+        .update(`${passphrase}|${accountId}|${label}`)
         .digest();
+}
+
+/**
+ * Every passphrase a blob of this account may have been written under:
+ * the ring's keys (active first) and the pre-ring passphrase-only form.
+ * Shared with the rewrap tool so both sides derive identically.
+ */
+/**
+ * Every LEGACY passphrase a blob may have been written under before the
+ * account DEK: the ring's keys (active first) and the pre-ring passphrase-
+ * only form. Read-only; the DEK passphrase (`SALT_LABEL_DEK`) writes.
+ */
+export function syncStatePassphraseCandidates(ring: KeyRing, passphrase: string): Array<{ keyId: string | null; passphrase: string; label: string; legacy: boolean }> {
+    const out = [ring.activeId, ...ring.ids().filter(i => i !== ring.activeId)].map(id => ({
+        keyId: id as string | null, passphrase: boundPassphrase(ring, id, passphrase), label: SALT_LABEL_V2, legacy: false
+    }));
+    out.push({ keyId: null, passphrase, label: SALT_LABEL_V1, legacy: true });
+    return out;
 }
 
 function getEncryption(accountId: string, passphrase: string): Promise<StorageEncryption> {
@@ -126,7 +169,7 @@ function getEncryption(accountId: string, passphrase: string): Promise<StorageEn
         // Same account, different passphrase: replace, zeroing the old key.
         void hit.pending.then(e => e.clear()).catch(() => undefined);
     }
-    const pending = StorageEncryption.createAsync(passphrase, deriveStableSalt(accountId, passphrase));
+    const pending = StorageEncryption.createAsync(passphrase, deriveStableSalt(accountId, passphrase, SALT_LABEL_DEK));
     encryptionCache.set(accountId, { passHash, pending });
     // A failed derivation must not poison the cache.
     pending.catch(() => {
@@ -178,6 +221,7 @@ export async function evictEncryptionKey(accountId: string): Promise<void> {
 /** Zeroes and drops ALL memoized storage keys (plugin shutdown). */
 export async function clearAllEncryptionKeys(): Promise<void> {
     await Promise.allSettled([...encryptionCache.keys()].map(evictEncryptionKey));
+    clearAllAccountDeks();
 }
 
 // ---- Global persist chain -------------------------------------------------
@@ -218,11 +262,25 @@ async function saveSyncStateInner(args: SaveSyncStateArgs): Promise<void> {
     // (one async PBKDF2 per account per process, see getEncryption).
     dbgSync(`${callId} resolving encryption key`);
     const t0 = Date.now();
-    const enc = await getEncryption(accountId, passphrase);
+    const ring = getEncryptionKey();
+    const dek = await resolveAccountDek({ db, ring, accountId, storagePassword: passphrase });
+    if (!dek) throw new Error('saveSyncState: the account key could not be resolved');
+    const dekPassphrase = syncStatePassphraseFromDek(dek, accountId);
+    const enc = await getEncryption(accountId, dekPassphrase);
     const shieldedCipher = states.shielded ? enc.encrypt(states.shielded) : null;
     const unshieldedCipher = states.unshielded ? enc.encrypt(states.unshielded) : null;
     const dustCipher = states.dust ? enc.encrypt(states.dust) : null;
     dbgSync(`${callId} encrypt done in ${Date.now() - t0}ms`);
+
+    // A blob this save leaves untouched must still end up under the DEK: a
+    // legacy blob (ring-bound or pre-ring derivation) is re-encrypted here,
+    // one nobody can open is dropped (that sub-wallet re-syncs). The row is
+    // then marked `dek1` as a whole.
+    const carry = (blob: string | null | undefined): string | null => {
+        if (!blob) return null;
+        const plain = decryptSyncBlob(accountId, blob, passphrase, ring, dekPassphrase);
+        return plain === null ? null : (plain.underDek ? blob : enc.encrypt(plain.text));
+    };
 
     const persistOnce = async (): Promise<void> => {
         const now = new Date().toISOString();
@@ -238,9 +296,10 @@ async function saveSyncStateInner(args: SaveSyncStateArgs): Promise<void> {
             await db.run(
                 UPDATE.entity(WalletSyncStates)
                     .set({
-                        shieldedStateBlob: shieldedCipher ?? existing.shieldedStateBlob,
-                        unshieldedStateBlob: unshieldedCipher ?? existing.unshieldedStateBlob,
-                        dustStateBlob: dustCipher ?? existing.dustStateBlob,
+                        shieldedStateBlob: shieldedCipher ?? carry(existing.shieldedStateBlob),
+                        unshieldedStateBlob: unshieldedCipher ?? carry(existing.unshieldedStateBlob),
+                        dustStateBlob: dustCipher ?? carry(existing.dustStateBlob),
+                        keyScheme: DEK_SCHEME,
                         sdkVersion,
                         networkId: networkId ?? existing.networkId,
                         seedFingerprint: seedFingerprint ?? existing.seedFingerprint,
@@ -255,6 +314,7 @@ async function saveSyncStateInner(args: SaveSyncStateArgs): Promise<void> {
                     shieldedStateBlob: shieldedCipher,
                     unshieldedStateBlob: unshieldedCipher,
                     dustStateBlob: dustCipher,
+                    keyScheme: DEK_SCHEME,
                     sdkVersion,
                     networkId: networkId ?? null,
                     seedFingerprint: seedFingerprint ?? null,
@@ -276,7 +336,9 @@ async function saveSyncStateInner(args: SaveSyncStateArgs): Promise<void> {
             } catch (e) {
                 lastErr = e;
                 const msg = String((e as Error)?.message ?? e);
-                if (!/database is locked|SQLITE_BUSY/i.test(msg)) throw e;
+                // SQLite busy AND the PostgreSQL / pool-acquire flavours (the
+                // hosted instance runs PostgreSQL; a lost save costs a save interval).
+                if (!isLockContention(e)) throw e;
                 dbgSync(`${callId} write contention (attempt ${attempt + 1}): ${msg.slice(0, 60)}`);
             }
         }
@@ -330,21 +392,70 @@ export async function loadSyncState(args: LoadSyncStateArgs): Promise<LoadedSync
         return null;
     }
 
+    const ring = getEncryptionKey();
+    // The DEK is opened, never created, on a load: a blob without a DEK is a
+    // legacy blob and is read through the legacy candidates.
+    let dekPassphrase: string | undefined;
     try {
-        const result: LoadedSyncState = { savedAt: row.updatedAt ?? null };
-        if (row.shieldedStateBlob) {
-            result.shielded = decryptWithPassword(row.shieldedStateBlob, passphrase);
-        }
-        if (row.unshieldedStateBlob) {
-            result.unshielded = decryptWithPassword(row.unshieldedStateBlob, passphrase);
-        }
-        if (row.dustStateBlob) {
-            result.dust = decryptWithPassword(row.dustStateBlob, passphrase);
-        }
-        return result;
+        const dek = await resolveAccountDek({ db, ring, accountId, storagePassword: passphrase, create: false });
+        if (dek) dekPassphrase = syncStatePassphraseFromDek(dek, accountId);
+    } catch (err) {
+        log.warn(`sync state for ${accountId.slice(0, 16)}: ${String((err as Error)?.message ?? err)}; starting from a cold sync`);
+        return null;
+    }
+    const result: LoadedSyncState = { savedAt: row.updatedAt ?? null };
+    const blobs: Array<[keyof Pick<LoadedSyncState, 'shielded' | 'unshielded' | 'dust'>, string | null | undefined]> = [
+        ['shielded', row.shieldedStateBlob],
+        ['unshielded', row.unshieldedStateBlob],
+        ['dust', row.dustStateBlob]
+    ];
+    for (const [name, blob] of blobs) {
+        if (!blob) continue;
+        const plain = decryptSyncBlob(accountId, blob, passphrase, ring, dekPassphrase);
+        if (plain === null) return null;
+        result[name] = plain.text;
+    }
+    return result;
+}
+
+const legacyBlobNoted = new Set<string>();
+const unreadableBlobNoted = new Set<string>();
+
+/**
+ * Open one blob: the salt in its header names the derivation it was written
+ * with (the account DEK, then the legacy forms: ring keys, then the pre-ring
+ * passphrase-only form). No match or an authentication failure means "no
+ * cached state" (the wallet re-syncs), never a crash. `underDek` tells the
+ * save path whether the blob may be carried over as it is.
+ */
+function decryptSyncBlob(accountId: string, blob: string, passphrase: string, ring: KeyRing, dekPassphrase?: string): { text: string; underDek: boolean } | null {
+    let salt: Buffer;
+    try {
+        salt = extractEncryptedComponents(Buffer.from(blob, 'base64')).salt;
     } catch {
         return null;
     }
+    if (dekPassphrase && deriveStableSalt(accountId, dekPassphrase, SALT_LABEL_DEK).equals(salt)) {
+        try { return { text: decryptWithPassword(blob, dekPassphrase), underDek: true }; } catch { return null; }
+    }
+    for (const c of syncStatePassphraseCandidates(ring, passphrase)) {
+        if (!deriveStableSalt(accountId, c.passphrase, c.label).equals(salt)) continue;
+        try {
+            const plain = decryptWithPassword(blob, c.passphrase);
+            if (!legacyBlobNoted.has(accountId)) {
+                legacyBlobNoted.add(accountId);
+                log.info(`sync state for ${accountId.slice(0, 16)} predates the account key; it is rewritten under it at the next save`);
+            }
+            return { text: plain, underDek: false };
+        } catch {
+            return null;
+        }
+    }
+    if (!unreadableBlobNoted.has(accountId)) {
+        unreadableBlobNoted.add(accountId);
+        log.warn(`sync state for ${accountId.slice(0, 16)} was written under an encryption key that is not in the ring; starting from a cold sync`);
+    }
+    return null;
 }
 
 /**

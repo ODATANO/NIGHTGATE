@@ -7,8 +7,9 @@ import { describe, it, expect, beforeEach } from 'vitest';
 import {
     pickFreeSponsor, acquireSponsor, releaseSponsor, benchSponsor,
     isRetryableSponsorFailure, isDustRaceFailure, isGenericInvalidFailure, __resetSponsorPoolForTests, PLATFORM_POOL_SENTINEL,
-    sponsorCandidatesNonExclusive, isPreInclusionReject, isAmbiguousSubmitOutcome, isCallNotAppliedFailure
+    sponsorCandidatesNonExclusive, isPreInclusionReject, isAmbiguousSubmitOutcome, isCallNotAppliedFailure, decideSponsorFailure
 } from '../../srv/submission/sponsor-pool';
+import { WorkerSubmitError } from '../../srv/midnight/wallet-worker-protocol';
 
 const POOL = ['sp-a', 'sp-b', 'sp-c'];
 
@@ -145,5 +146,40 @@ describe('submit outcome classification', () => {
         expect(isAmbiguousSubmitOutcome(new Error(timeout))).toBe(true);
         expect(isDustRaceFailure(new Error(timeout))).toBe(false);  // never rebuild on it
         expect(isPreInclusionReject(new Error(timeout))).toBe(false);
+    });
+});
+
+describe('decideSponsorFailure (one table for both sponsoring channels)', () => {
+    const coded = (code: any, extra: Record<string, unknown> = {}, message = 'm') =>
+        new WorkerSubmitError({ name: 'Error', message, code, retryable: false, ...extra } as any);
+
+    it('branches on the carried code, never on the text', () => {
+        // The text would match the sponsor-health regex; the code says policy.
+        expect(decideSponsorFailure(coded('policy', {}, 'wallet not genuinely synced within 180000ms'))).toEqual({ decision: 'fail', generic: false, preInclusion: false });
+        expect(decideSponsorFailure(coded('ambiguous'))).toEqual({ decision: 'ambiguous', generic: false, preInclusion: false });
+        expect(decideSponsorFailure(coded('landed-not-applied'))).toEqual({ decision: 'landed-not-applied', generic: false, preInclusion: false });
+        expect(decideSponsorFailure(coded('dust-race', { ledgerCode: '1010/170', retryable: true }))).toEqual({ decision: 'dust-rebuild', generic: false, preInclusion: true });
+        expect(decideSponsorFailure(coded('dust-race', { ledgerCode: 'pool-invalid', retryable: true }))).toEqual({ decision: 'dust-rebuild', generic: true, preInclusion: true });
+        expect(decideSponsorFailure(coded('pre-mempool-reject', { ledgerCode: '1010/188' }))).toEqual({ decision: 'fail', generic: false, preInclusion: true });
+        expect(decideSponsorFailure(coded('transport', { retryable: true }))).toEqual({ decision: 'fail', generic: false, preInclusion: false });
+        expect(decideSponsorFailure(coded('transport', { ledgerCode: 'closing-socket', retryable: true }))).toEqual({ decision: 'fail', generic: false, preInclusion: true });
+        expect(decideSponsorFailure(coded('causality'))).toEqual({ decision: 'fail', generic: false, preInclusion: false });
+    });
+
+    it('a dust race rebuilds on the SAME sponsor; it never benches it (the order that used to be wrong)', () => {
+        // Matches both the dust-race and the old sponsor-health patterns.
+        const race = new Error('Transaction submission error <- 1010: Invalid Transaction: Custom error: 170');
+        expect(isRetryableSponsorFailure(race)).toBe(true);
+        expect(decideSponsorFailure(race).decision).toBe('dust-rebuild');
+    });
+
+    it('sponsor-health failures fail over (text fallback: they never cross the RPC with a code)', () => {
+        for (const msg of ['wallet not genuinely synced within 180000ms', 'No facade for sponsorSessionId=abc', '503 WALLET_SYNCING']) {
+            expect(decideSponsorFailure(new Error(msg)), msg).toEqual({ decision: 'failover', generic: false, preInclusion: false });
+        }
+        const gone = new Error('Sponsor session expired'); gone.name = 'FeeSponsorError';
+        expect(decideSponsorFailure(gone).decision).toBe('failover');
+        expect(decideSponsorFailure(new Error("refusing to sponsor: circuit 'x' is not sponsorable")).decision).toBe('fail');
+        expect(decideSponsorFailure(new Error('finalized-tx round-trip FAILED at deserialize')).decision).toBe('fail');
     });
 });

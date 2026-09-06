@@ -7,8 +7,7 @@
 import {
     decodeCompact,
     decodeCompactBigInt,
-    parseExtrinsicCallIndices,
-    parseExtrinsicParticipantInfo
+    parseExtrinsicCallIndices
 } from '../../srv/utils/scale';
 
 describe('decodeCompact', () => {
@@ -375,104 +374,5 @@ describe('parseExtrinsicCallIndices', () => {
         expect(parseExtrinsicCallIndices(hex)).toBeNull();
     });
 
-    it('should parse sender + receiver + amount from signed transfer-like calls', () => {
-        const receiver = Array(32).fill(0x22);
-        const amount100 = [0x91, 0x01]; // compact(100)
 
-        const hex = buildSignedExtrinsicParts({
-            addressType: 0x00,
-            signatureType: 0x01,
-            eraBytes: [0x00],
-            nonceBytes: [0x00],
-            tipBytes: [0x00],
-            callBytes: [0x04, 0x00, 0x00, ...receiver, ...amount100]
-        });
-
-        expect(parseExtrinsicParticipantInfo(hex)).toEqual(expect.objectContaining({
-            isSigned: true,
-            palletIndex: 4,
-            callIndex: 0,
-            senderAddress: `0x${'aa'.repeat(32)}`,
-            receiverAddress: `0x${'22'.repeat(32)}`,
-            amount: '100'
-        }));
-    });
-
-    it('should return sender metadata even when receiver/amount args are absent', () => {
-        const hex = buildSignedExtrinsic(10, 1);
-        expect(parseExtrinsicParticipantInfo(hex)).toEqual(expect.objectContaining({
-            isSigned: true,
-            palletIndex: 10,
-            callIndex: 1,
-            senderAddress: `0x${'aa'.repeat(32)}`
-        }));
-    });
-
-    it('should parse unsigned call metadata without sender', () => {
-        const hex = buildUnsignedExtrinsic(4, 0);
-        expect(parseExtrinsicParticipantInfo(hex)).toEqual({
-            isSigned: false,
-            palletIndex: 4,
-            callIndex: 0,
-            senderAddress: undefined
-        });
-    });
-});
-
-// ---- MultiAddress variants + big-compact edge (participant parsing) --------
-
-describe('parseExtrinsicParticipantInfo MultiAddress variants', () => {
-    /** Wrap raw extrinsic body bytes with the SCALE compact length prefix. */
-    function extrinsicHex(bytes: number[]): string {
-        const body = Buffer.from(bytes);
-        const len = body.length;
-        const prefix = len <= 63
-            ? Buffer.from([len << 2])
-            : Buffer.from([((len << 2) | 0x01) & 0xff, (len >> 6) & 0xff]);
-        return '0x' + Buffer.concat([prefix, body]).toString('hex');
-    }
-
-    // Unsigned extrinsic: version 0x04, pallet 7, call 0, then call args.
-    const HEAD = [0x04, 0x07, 0x00];
-
-    it('decodes an Address20 destination (type 0x04)', () => {
-        const dest20 = Array(20).fill(0xab);
-        const hex = extrinsicHex([...HEAD, 0x04, ...dest20, 0x04 /* amount compact(1) */]);
-        const info = parseExtrinsicParticipantInfo(hex)!;
-        expect(info.receiverAddress).toBe('0x' + 'ab'.repeat(20));
-        expect(info.amount).toBe('1');
-    });
-
-    it('decodes an Index destination (type 0x01)', () => {
-        const hex = extrinsicHex([...HEAD, 0x01, 0x14 /* compact(5) */, 0x08 /* amount compact(2) */]);
-        const info = parseExtrinsicParticipantInfo(hex)!;
-        expect(info.receiverAddress).toBe('index:5');
-        expect(info.amount).toBe('2');
-    });
-
-    it('decodes a Raw destination (type 0x02, length-prefixed)', () => {
-        const raw = [0xde, 0xad, 0xbe, 0xef];
-        const hex = extrinsicHex([...HEAD, 0x02, raw.length << 2, ...raw, 0x0c /* amount compact(3) */]);
-        const info = parseExtrinsicParticipantInfo(hex)!;
-        expect(info.receiverAddress).toBe('0xdeadbeef');
-        expect(info.amount).toBe('3');
-    });
-
-    it('keeps sender/pallet info but omits receiver when the amount is missing', () => {
-        // Address32 destination but the buffer ends before the amount compact.
-        const dest32 = Array(32).fill(0x11);
-        const hex = extrinsicHex([...HEAD, 0x00, ...dest32]);
-        const info = parseExtrinsicParticipantInfo(hex)!;
-        expect(info.palletIndex).toBe(7);
-        expect(info.receiverAddress).toBeUndefined();
-        expect(info.amount).toBeUndefined();
-    });
-
-    it('decodeCompact collapses beyond-safe-integer big-int values to 0 (explicit sentinel)', () => {
-        // Big-int mode: header 0b11 with (numBytes-4)<<2 → 8 bytes, value 2^63.
-        const buf = Buffer.from([0x13, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80]);
-        expect(decodeCompact(buf, 0)).toEqual([0, 9]);
-        // The bigint decoder keeps the full value.
-        expect(decodeCompactBigInt(buf, 0)).toEqual([2n ** 63n, 9]);
-    });
 });

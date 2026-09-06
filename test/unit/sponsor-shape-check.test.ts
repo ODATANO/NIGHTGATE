@@ -1,6 +1,6 @@
 /**
  * `checkSponsorableShape` (wallet-worker): the FAIL-CLOSED policy on what a
- * sponsor will pay for. The review finding this pins: the old inspection only
+ * sponsor will pay for. The old inspection only
  * COLLECTED contract calls, so a transaction with one allowed call plus a
  * deploy, a token transfer or its own dust actions sailed through the
  * allow-list and the sponsor paid for all of it.
@@ -53,7 +53,7 @@ describe('checkSponsorableShape', () => {
             .toThrow(/not sponsorable/);
     });
 
-    it('rejects a NON-CALL action even when an allowed call rides in front (the P1 attack)', () => {
+    it('rejects a NON-CALL action even when an allowed call rides in front', () => {
         expect(() => check(
             tx([{ actions: [CALL(), DEPLOY()] }]),
             5000, ['aa'.repeat(32)], ['attest']
@@ -346,23 +346,32 @@ describe('assertArtifactGenerationOnDisk: the worker verifies the pinned generat
         const snapRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ng-snap4-'));
         process.env.NIGHTGATE_ARTIFACT_SNAPSHOT_DIR = snapRoot;
         try {
-            // leftovers in this process's root, a snapshot unused for 30 days,
-            // and the whole root of a dead sibling process of the same installation
+            // leftovers in the install's root, a snapshot unused for 30 days that
+            // no live process holds, one that another live process (the parent) holds,
+            // and a per-process root of the 0.21-0.22 layout whose process is gone
             const myRoot = workerExports.artifactSnapshotRoot();
             fs.mkdirSync(path.join(myRoot, 'deadbeef.tmp-1-abcd', 'module'), { recursive: true });
             fs.mkdirSync(path.join(myRoot, 'f'.repeat(64), 'keys'), { recursive: true });
             const old = new Date(Date.now() - 30 * 24 * 3600 * 1000);
             fs.utimesSync(path.join(myRoot, 'f'.repeat(64)), old, old);
-            const deadRoot = path.join(path.dirname(myRoot), '999999');
+            fs.mkdirSync(path.join(myRoot, 'd'.repeat(64), '.holders'), { recursive: true });
+            fs.writeFileSync(path.join(myRoot, 'd'.repeat(64), '.holders', String(process.ppid)), 'x');
+            fs.utimesSync(path.join(myRoot, 'd'.repeat(64)), old, old);
+            const deadRoot = path.join(myRoot, '999999');
             fs.mkdirSync(path.join(deadRoot, 'a'.repeat(64)), { recursive: true });
-            expect(path.basename(myRoot)).toBe(String(process.pid));
+            // one level per install, none per process: a restart reuses the snapshots
+            expect(myRoot).toBe(path.join(snapRoot, path.basename(myRoot)));
+            expect(path.basename(myRoot)).toMatch(/^[0-9a-f]{16}$/);
             const reg = layout('e');
             const digest = computeArtifactGenerationDigest(reg);
             const release = workerExports.retainGeneration(digest);
             const snap = workerExports.materializeArtifactSnapshot('e', { ...reg, artifactDigest: digest });
             expect(fs.existsSync(path.join(myRoot, 'deadbeef.tmp-1-abcd'))).toBe(false);
             expect(fs.existsSync(path.join(myRoot, 'f'.repeat(64)))).toBe(false);
+            expect(fs.existsSync(path.join(myRoot, 'd'.repeat(64)))).toBe(true);
             expect(fs.existsSync(deadRoot)).toBe(false);
+            // the materialised snapshot records this process as a holder
+            expect(fs.existsSync(path.join(snap.zkConfigPath, '.holders', String(process.pid)))).toBe(true);
             await workerExports.getContractScaffold('e', { ...reg, artifactDigest: digest });
             // evicted while a job holds the generation: the snapshot stays
             workerExports.__evictGenerationForTests(digest);

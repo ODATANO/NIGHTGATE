@@ -19,14 +19,14 @@ service NightgateAnalyticsService {
     } group by ID, height, timestamp;
 
     /**
-     * Contract deployment statistics
+     * Contract action counts per action type. Addresses are not decoded from
+     * the ledger payload yet, so the statistics are per type, not per contract.
      */
     @readonly
     entity ContractStatistics as select from midnight.ContractActions {
-        key address,
-        actionType,
+        key actionType,
         count(ID) as actionCount : Integer
-    } where actionType = 'DEPLOY' group by address, actionType;
+    } group by actionType;
 
     // Aggregation functions
     function getBlockCount() returns Integer;

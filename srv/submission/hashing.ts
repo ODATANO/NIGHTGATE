@@ -8,6 +8,8 @@
 
 import { blake2b } from '@noble/hashes/blake2b';
 import { bytesToHex } from '@noble/hashes/utils';
+// The shared codec ships in the slim txbuilder package next to this file.
+import { hexToBytes32 } from '../../src/browser/hex.mjs';
 
 /** blake2b-256 hex of a UTF-8 string (the on-chain hashing scheme). */
 export function blake2b256Hex(input: string): string {
@@ -16,9 +18,7 @@ export function blake2b256Hex(input: string): string {
 
 /** 64-hex string -> 32 bytes. */
 export function fromHex32(hex: string): Uint8Array {
-    const out = new Uint8Array(32);
-    for (let i = 0; i < 32; i++) out[i] = parseInt(hex.substr(i * 2, 2), 16);
-    return out;
+    return hexToBytes32(hex);
 }
 
 /**

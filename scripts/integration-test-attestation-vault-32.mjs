@@ -77,12 +77,17 @@ const ownerContract = new ContractClass(witnesses.buildAttestationVaultWitnesses
 const registrarId = rt.persistentHash(new rt.CompactTypeBytes(32), ownerSecret);
 const ctorCtx = rt.createConstructorContext({}, '00'.repeat(32));
 const init = ownerContract.initialState(ctorCtx, registrarId);
+const BLOCK_TIME = 1_700_000_000;
 let circuitCtx = rt.createCircuitContext(
     rt.dummyContractAddress(),
     ctorCtx.initialZswapLocalState.coinPublicKey,
     init.currentContractState.data,
-    init.currentPrivateState
+    init.currentPrivateState,
+    undefined, undefined, BLOCK_TIME
 );
+function setBlockTime(seconds) {
+    circuitCtx.currentQueryContext.block = { ...circuitCtx.currentQueryContext.block, secondsSinceEpoch: BigInt(seconds) };
+}
 function runCircuit(contract, name, ...args) {
     const out = contract.impureCircuits[name](circuitCtx, ...args);
     circuitCtx = out.context;
@@ -169,6 +174,38 @@ const diffKey = await ps.computeDocumentDiffClaimKey(payloadAHex, payloadBHex, 2
 ok('width: diff claim key recompute matches the circuit',
     led.document_diff_results.member(hexToBytes(diffKey)) === true
     && led.document_diff_results.lookup(hexToBytes(diffKey)) === true);
+
+// ---- Guarded commit-reveal on the width-32 artifact -------------------------
+const throwsWith = (fn) => { try { fn(); return ''; } catch (err) { return String(err?.message ?? err) || 'threw'; } };
+const gPayload = bytes32(0xe1);
+const gMeta = bytes32(0xe2);
+const gNonce = bytes32(0xe3);
+const gCommitment = hexToBytes(await ps.computeAttestCommitment(
+    Buffer.from(gPayload).toString('hex'), Buffer.from(gMeta).toString('hex'), Buffer.from(gNonce).toString('hex')));
+const EXPIRY = BigInt(BLOCK_TIME + 3600);
+ok('width: a commitment expiring in the past is refused at commit',
+    throwsWith(() => runCircuit(ownerContract, 'attestGuarded', 0n, gCommitment, bytes32(0), bytes32(0), BigInt(BLOCK_TIME - 1))).includes('commitment expiry must lie in the future'));
+runCircuit(ownerContract, 'attestGuarded', 0n, gCommitment, bytes32(0), bytes32(0), EXPIRY);
+ok('width: a reveal without the nonce is refused',
+    throwsWith(() => runCircuit(ownerContract, 'attestGuarded', 1n, gPayload, gMeta, bytes32(0xe4), 0n)).includes('no matching commitment'));
+const seqBefore = mod.ledger(circuitCtx.currentQueryContext.state).attest_seq_next;
+runCircuit(ownerContract, 'attestGuarded', 1n, gPayload, gMeta, gNonce, 0n);
+const ledG = mod.ledger(circuitCtx.currentQueryContext.state);
+ok('width: commit-reveal attests, guarded, epoch = commitment sequence',
+    ledG.public_attestations.member(gPayload) === true
+    && ledG.guarded_attestations.member(gPayload) === true
+    && ledG.attestation_seqs.lookup(gPayload) < seqBefore);
+ok('width: the commitment was consumed by the reveal',
+    throwsWith(() => runCircuit(ownerContract, 'attestGuarded', 1n, gPayload, gMeta, gNonce, 0n)).includes('no matching commitment'));
+const xPayload = bytes32(0xe5);
+const xNonce = bytes32(0xe6);
+const xCommitment = hexToBytes(await ps.computeAttestCommitment(
+    Buffer.from(xPayload).toString('hex'), Buffer.from(gMeta).toString('hex'), Buffer.from(xNonce).toString('hex')));
+runCircuit(ownerContract, 'attestGuarded', 0n, xCommitment, bytes32(0), bytes32(0), BigInt(BLOCK_TIME + 100));
+setBlockTime(BLOCK_TIME + 101);
+ok('width: a reveal after the commitment expired is refused',
+    throwsWith(() => runCircuit(ownerContract, 'attestGuarded', 1n, xPayload, gMeta, xNonce, 0n)).includes('commitment expired'));
+setBlockTime(BLOCK_TIME);
 
 if (failures > 0) {
     console.error(`\n${failures} check(s) FAILED`);

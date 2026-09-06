@@ -16,14 +16,7 @@
 // (see providers.mjs scope note).
 
 import { buildAttestationVaultWitnesses } from './witnesses.mjs';
-
-function hexTo32(hex, label) {
-    const clean = String(hex || '').replace(/^0x/, '');
-    if (!/^[0-9a-fA-F]{64}$/.test(clean)) throw new Error(`${label} must be 32-byte hex (64 chars)`);
-    const out = new Uint8Array(32);
-    for (let i = 0; i < 32; i++) out[i] = parseInt(clean.substr(i * 2, 2), 16);
-    return out;
-}
+import { hexToBytes32 } from './hex.mjs';
 
 /**
  * Prepare a `revokeDisclosure(payload_hash, grantee)` call.
@@ -33,7 +26,7 @@ export function prepareRevokeDisclosure({ payloadHash, grantee, attestationSecre
     if (!(attestationSecret instanceof Uint8Array)) throw new Error('attestationSecret (Uint8Array) is required');
     return {
         circuitId: 'revokeDisclosure',
-        args: [hexTo32(payloadHash, 'payloadHash'), hexTo32(grantee, 'grantee')],
+        args: [hexToBytes32(payloadHash, 'payloadHash'), hexToBytes32(grantee, 'grantee')],
         witnesses: buildAttestationVaultWitnesses({ attestationSecret })
     };
 }
@@ -48,7 +41,7 @@ export function prepareGrantDisclosure({ payloadHash, grantee, level, attestatio
     if (lvl < 0n || lvl > 2n) throw new Error('level must be 0, 1 or 2');
     return {
         circuitId: 'grantDisclosure',
-        args: [hexTo32(payloadHash, 'payloadHash'), hexTo32(grantee, 'grantee'), lvl],
+        args: [hexToBytes32(payloadHash, 'payloadHash'), hexToBytes32(grantee, 'grantee'), lvl],
         witnesses: buildAttestationVaultWitnesses({ attestationSecret })
     };
 }
@@ -60,7 +53,7 @@ export function prepareAttest({ payloadHash, metadataHash, attestationSecret }) 
     if (!(attestationSecret instanceof Uint8Array)) throw new Error('attestationSecret (Uint8Array) is required');
     return {
         circuitId: 'attest',
-        args: [hexTo32(payloadHash, 'payloadHash'), hexTo32(metadataHash, 'metadataHash')],
+        args: [hexToBytes32(payloadHash, 'payloadHash'), hexToBytes32(metadataHash, 'metadataHash')],
         witnesses: buildAttestationVaultWitnesses({ attestationSecret })
     };
 }
@@ -75,7 +68,7 @@ export function prepareRegisterPassport({ passportId, ownerId, attestationSecret
     if (!(attestationSecret instanceof Uint8Array)) throw new Error('attestationSecret (Uint8Array) is required');
     return {
         circuitId: 'registerPassport',
-        args: [hexTo32(passportId, 'passportId'), hexTo32(ownerId, 'ownerId')],
+        args: [hexToBytes32(passportId, 'passportId'), hexToBytes32(ownerId, 'ownerId')],
         witnesses: buildAttestationVaultWitnesses({ attestationSecret })
     };
 }
@@ -87,38 +80,44 @@ export function prepareBindPassport({ passportId, payloadHash, attestationSecret
     if (!(attestationSecret instanceof Uint8Array)) throw new Error('attestationSecret (Uint8Array) is required');
     return {
         circuitId: 'bindPassport',
-        args: [hexTo32(passportId, 'passportId'), hexTo32(payloadHash, 'payloadHash')],
+        args: [hexToBytes32(passportId, 'passportId'), hexToBytes32(payloadHash, 'payloadHash')],
         witnesses: buildAttestationVaultWitnesses({ attestationSecret })
     };
 }
 
 /**
- * Prepare an `attestGuarded(mode=0, commitment, zero, zero)` COMMIT call
- * (commit-reveal attest, 0.16.0). `commitment` is
+ * Prepare an `attestGuarded(mode=0, commitment, zero, zero, expiresAt)` COMMIT
+ * call (commit-reveal attest; lineage 3 since 0.23.0). `commitment` is
  * persistentHash(AttestCommitPreimage{payloadHash, metadataHash, nonce}); the
  * server's `prepareAnchorCommitment` computes it (or any byte-identical
- * recompute). Keep the nonce secret until reveal.
+ * recompute). `expiresAt` is the commitment's expiry as UNIX seconds: the
+ * vault accepts the commit only in a block whose time lies in
+ * (expiresAt - 7 days, expiresAt) and the reveal only before expiresAt. The
+ * record is bound to the committer. Keep the nonce secret until reveal.
  */
-export function prepareAttestCommit({ commitment, attestationSecret }) {
+export function prepareAttestCommit({ commitment, expiresAt, attestationSecret }) {
     if (!(attestationSecret instanceof Uint8Array)) throw new Error('attestationSecret (Uint8Array) is required');
+    const exp = BigInt(expiresAt ?? 0);
+    if (exp <= 0n) throw new Error('expiresAt (UNIX seconds, in the future, at most 7 days ahead) is required');
     return {
         circuitId: 'attestGuarded',
-        args: [0n, hexTo32(commitment, 'commitment'), new Uint8Array(32), new Uint8Array(32)],
+        args: [0n, hexToBytes32(commitment, 'commitment'), new Uint8Array(32), new Uint8Array(32), exp],
         witnesses: buildAttestationVaultWitnesses({ attestationSecret })
     };
 }
 
 /**
- * Prepare an `attestGuarded(mode=1, payload_hash, metadata_hash, nonce)`
- * REVEAL call. Requires a finalized commit by the SAME attester; a plain
- * attest that front-ran the reveal is taken over in-circuit when its
- * sequence number is newer than the commitment's.
+ * Prepare an `attestGuarded(mode=1, payload_hash, metadata_hash, nonce, 0)`
+ * REVEAL call. Requires an unexpired commit by the SAME attester. The
+ * attestation inherits the commitment's sequence and is FINAL (never taken
+ * over); a plain attest that front-ran the reveal is taken over in-circuit
+ * when its sequence number is newer than the commitment's.
  */
 export function prepareAttestReveal({ payloadHash, metadataHash, nonce, attestationSecret }) {
     if (!(attestationSecret instanceof Uint8Array)) throw new Error('attestationSecret (Uint8Array) is required');
     return {
         circuitId: 'attestGuarded',
-        args: [1n, hexTo32(payloadHash, 'payloadHash'), hexTo32(metadataHash, 'metadataHash'), hexTo32(nonce, 'nonce')],
+        args: [1n, hexToBytes32(payloadHash, 'payloadHash'), hexToBytes32(metadataHash, 'metadataHash'), hexToBytes32(nonce, 'nonce'), 0n],
         witnesses: buildAttestationVaultWitnesses({ attestationSecret })
     };
 }
@@ -135,7 +134,7 @@ export function prepareAnchorContentRoot({ payloadHash, contentRoot, schemaId, a
     if (!(attestationSecret instanceof Uint8Array)) throw new Error('attestationSecret (Uint8Array) is required');
     return {
         circuitId: 'anchorContentRoot',
-        args: [hexTo32(payloadHash, 'payloadHash'), hexTo32(contentRoot, 'contentRoot'), hexTo32(schemaId, 'schemaId')],
+        args: [hexToBytes32(payloadHash, 'payloadHash'), hexToBytes32(contentRoot, 'contentRoot'), hexToBytes32(schemaId, 'schemaId')],
         witnesses: buildAttestationVaultWitnesses({ attestationSecret })
     };
 }
@@ -152,7 +151,7 @@ export function prepareProveFieldPredicate({ payloadHash, fieldKey, threshold, o
     if (opNum !== 0n && opNum !== 1n) throw new Error('op must be 0 (lessOrEqual) or 1 (greaterOrEqual)');
     return {
         circuitId: 'proveFieldPredicate',
-        args: [hexTo32(payloadHash, 'payloadHash'), hexTo32(fieldKey, 'fieldKey'), BigInt(threshold), opNum],
+        args: [hexToBytes32(payloadHash, 'payloadHash'), hexToBytes32(fieldKey, 'fieldKey'), BigInt(threshold), opNum],
         witnesses: buildAttestationVaultWitnesses({ attestationSecret, merkleProof, slotWidth }),
         // Raw bundle passthrough for the txbuilder's batch path (one shared
         // witnesses object with a proof holder swaps these per call).
@@ -170,7 +169,7 @@ export function prepareProveFieldEquality({ payloadHash, fieldKey, expectedDiges
     if (!merkleProof || !merkleProof.fieldSalt) throw new Error('merkleProof ({ fieldSalt, siblings, dirs }) is required (v4 salted leaves)');
     return {
         circuitId: 'proveFieldEquality',
-        args: [hexTo32(payloadHash, 'payloadHash'), hexTo32(fieldKey, 'fieldKey'), hexTo32(expectedDigest, 'expectedDigest')],
+        args: [hexToBytes32(payloadHash, 'payloadHash'), hexToBytes32(fieldKey, 'fieldKey'), hexToBytes32(expectedDigest, 'expectedDigest')],
         witnesses: buildAttestationVaultWitnesses({ attestationSecret, merkleProof, slotWidth }),
         merkleProof, slotWidth
     };
@@ -190,7 +189,7 @@ export function prepareProveFieldMembership({ payloadHash, fieldKey, setRoot, me
     }
     return {
         circuitId: 'proveFieldMembership',
-        args: [hexTo32(payloadHash, 'payloadHash'), hexTo32(fieldKey, 'fieldKey'), hexTo32(setRoot, 'setRoot')],
+        args: [hexToBytes32(payloadHash, 'payloadHash'), hexToBytes32(fieldKey, 'fieldKey'), hexToBytes32(setRoot, 'setRoot')],
         witnesses: buildAttestationVaultWitnesses({ attestationSecret, merkleProof, slotWidth }),
         merkleProof, slotWidth
     };
@@ -230,7 +229,7 @@ export function prepareProveFieldsUnchangedExcept({ payloadHashA, payloadHashB, 
     const maskVector = Array.from({ length: width }, (_, i) => (mask & (1 << i)) !== 0);
     return {
         circuitId: 'proveDocumentComparison',
-        args: [hexTo32(payloadHashA, 'payloadHashA'), hexTo32(payloadHashB, 'payloadHashB'), 0n, maskVector, 1n],
+        args: [hexToBytes32(payloadHashA, 'payloadHashA'), hexToBytes32(payloadHashB, 'payloadHashB'), 0n, maskVector, 1n],
         witnesses: buildAttestationVaultWitnesses({ attestationSecret, merkleProof: { docPair }, slotWidth }),
         merkleProof: { docPair }, slotWidth
     };
@@ -254,7 +253,7 @@ export function prepareProveFieldsDiffer({ payloadHashA, payloadHashB, k, docPai
     if (!Number.isInteger(kNum) || kNum < 1 || kNum > width) throw new Error(`k must be an integer in 1..${width}`);
     return {
         circuitId: 'proveDocumentComparison',
-        args: [hexTo32(payloadHashA, 'payloadHashA'), hexTo32(payloadHashB, 'payloadHashB'), 1n, Array.from({ length: width }, () => false), BigInt(kNum)],
+        args: [hexToBytes32(payloadHashA, 'payloadHashA'), hexToBytes32(payloadHashB, 'payloadHashB'), 1n, Array.from({ length: width }, () => false), BigInt(kNum)],
         witnesses: buildAttestationVaultWitnesses({ attestationSecret, merkleProof: { docPair }, slotWidth }),
         merkleProof: { docPair }, slotWidth
     };

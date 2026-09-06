@@ -4,6 +4,7 @@
  * Verify disconnect flow consistently uses the public sessionId field.
  */
 
+import { runInJobExecutionContext } from '../../srv/submission/job-execution-context';
 import type { MockInstance } from 'vitest';
 const mockDbRun = vi.fn();
 const selectWhereSpy = vi.hoisted(() => (vi.fn()));
@@ -134,7 +135,7 @@ const MockJobAdmissionBusyError = vi.hoisted(() => class MockJobAdmissionBusyErr
 vi.mock('../../srv/submission/background-jobs', () => ({
     JobAdmissionBusyError: MockJobAdmissionBusyError,
     startJob: (...args: unknown[]) => (mockStartJob as any)(...args),
-    registerBackgroundJobProcessor: (kind: string, _version: number, processor: (command: unknown, row: any) => Promise<unknown>) => registeredProcessors.set(kind, processor),
+    registerBackgroundJobProcessor: (kind: string, _version: number, _traits: unknown, processor: (command: unknown, row: any) => Promise<unknown>) => registeredProcessors.set(kind, processor),
     runWithoutAmbientTx: (fn: () => Promise<unknown>) => (mockRunWithoutAmbientTx as any)(fn),
     supersedeQueuedJobs: (...args: unknown[]) => (mockSupersedeQueuedJobs as any)(...args),
     findLatestJob: (...args: unknown[]) => (mockFindLatestJob as any)(...args)
@@ -143,7 +144,7 @@ vi.mock('../../srv/submission/background-jobs', () => ({
 import cds from '@sap/cds';
 import { encrypt, getEncryptionKey } from '../../srv/utils/crypto';
 import { RateLimiter } from '../../srv/utils/rate-limiter';
-import { registerWalletSessionHandlers, startSessionCleanup, closeSessionsFromPreviousProcess } from '../../srv/sessions/wallet-sessions';
+import { __resetWalletRateLimitersForTests, registerWalletSessionHandlers, startSessionCleanup, closeSessionsFromPreviousProcess } from '../../srv/sessions/wallet-sessions';
 
 async function runPersistedCommand(args: any): Promise<unknown> {
     const processor = registeredProcessors.get(args.kind);
@@ -240,6 +241,7 @@ describe('wallet session handlers', () => {
     });
 
     beforeEach(() => {
+        __resetWalletRateLimitersForTests();
         vi.clearAllMocks();
         for (const key of NIGHTGATE_ENV_KEYS) delete process.env[key];
         mockDbRun.mockReset();
@@ -284,7 +286,7 @@ describe('wallet session handlers', () => {
 
             await handler(req);
 
-            expect(checkSpy).toHaveBeenCalledWith('10.0.0.1');
+            expect(checkSpy).toHaveBeenCalledWith(expect.stringMatching(/^user=.*:wallet$/));
             expect(req.reject).toHaveBeenCalledWith(429, 'Rate limited. Retry after 2s');
             expect(insertEntriesSpy).not.toHaveBeenCalled();
         } finally {
@@ -312,7 +314,7 @@ describe('wallet session handlers', () => {
         expect(result.sessionToken).toBeUndefined();
     });
 
-    it('connectWallet falls back to the global rate-limit key and default TTL when no config is present', async () => {
+    it('connectWallet keys the rate limit by principal and uses the default TTL when no config is present', async () => {
         const checkSpy = vi.spyOn(RateLimiter.prototype, 'check');
         const nowSpy = vi.spyOn(Date, 'now').mockReturnValue(1_700_000_000_000);
         (cds.env as any).requires = {};
@@ -323,7 +325,7 @@ describe('wallet session handlers', () => {
             const req = createMockRequest({ viewingKey: 'a'.repeat(64) }, null);
             const result = await handler(req);
 
-            expect(checkSpy).toHaveBeenCalledWith('global');
+            expect(checkSpy).toHaveBeenCalledWith(expect.stringMatching(/^user=.*:wallet$/));
             expect(result.expiresAt).toBe(new Date(1_700_086_400_000).toISOString());
             expect(insertEntriesSpy).toHaveBeenCalledWith(expect.objectContaining({
                 expiresAt: new Date(1_700_086_400_000).toISOString()
@@ -534,7 +536,7 @@ describe('wallet session handlers', () => {
         const encKey = getEncryptionKey();
         const db = {
             run: vi.fn()
-                .mockResolvedValueOnce([{ sessionId: 'old-1', viewingKeyHash: 'hash-a', encryptedViewingKey: encrypt('a'.repeat(64), encKey) }])
+                .mockResolvedValueOnce([{ sessionId: 'old-1', viewingKeyHash: 'hash-a', encryptedViewingKey: encrypt('a'.repeat(64), encKey), userId: 'owner-1' }])
                 .mockResolvedValueOnce(1)                          // deactivate UPDATE (runs FIRST)
                 .mockResolvedValueOnce([{ sessionId: 'live-1' }]) // guard: live sibling remains
         };
@@ -555,7 +557,7 @@ describe('wallet session handlers', () => {
             return {} as ReturnType<typeof setInterval>;
         }) as any);
         const encKey = getEncryptionKey();
-        const row = (id: string, hash: string) => ({ sessionId: id, viewingKeyHash: hash, encryptedViewingKey: encrypt('a'.repeat(64), encKey) });
+        const row = (id: string, hash: string) => ({ sessionId: id, viewingKeyHash: hash, encryptedViewingKey: encrypt('a'.repeat(64), encKey), userId: 'owner-1' });
         process.env.NIGHTGATE_FEE_SPONSOR_SESSION = 'pool-sponsor-1';
         const db = {
             run: vi.fn()
@@ -592,7 +594,7 @@ describe('wallet session handlers', () => {
         const longAgo = new Date(Date.now() - 86_400_000).toISOString();
         const db = {
             run: vi.fn()
-                .mockResolvedValueOnce([{ sessionId: 'caller-9', viewingKeyHash: 'hash-shared', encryptedViewingKey: encrypt('a'.repeat(64), encKey) }])
+                .mockResolvedValueOnce([{ sessionId: 'caller-9', viewingKeyHash: 'hash-shared', encryptedViewingKey: encrypt('a'.repeat(64), encKey), userId: 'owner-9' }])
                 .mockResolvedValueOnce(1)
                 // The guard now reads active rows WITH their expiry and judges
                 // them itself: the sponsor row is long past its TTL and still counts.
@@ -615,7 +617,7 @@ describe('wallet session handlers', () => {
             return {} as ReturnType<typeof setInterval>;
         }) as any);
         const encKey = getEncryptionKey();
-        const expiringRow = (id: string) => ({ sessionId: id, viewingKeyHash: 'hash-a', encryptedViewingKey: encrypt('a'.repeat(64), encKey) });
+        const expiringRow = (id: string) => ({ sessionId: id, viewingKeyHash: 'hash-a', encryptedViewingKey: encrypt('a'.repeat(64), encKey), userId: 'owner-1' });
         const db = {
             run: vi.fn()
                 .mockResolvedValueOnce([expiringRow('old-1'), expiringRow('old-2')])
@@ -768,8 +770,9 @@ describe('wallet session handlers', () => {
             }));
             // The prewarm must block on sync-to-tip before returning, so the
             // deploy path doesn't balance against stale dust (Custom error 170).
-            // Third argument = stall bound; undefined here selects the worker's env default.
-            expect(mockWalletWaitForSyncedState).toHaveBeenCalledWith('acct-derived', expect.any(Number), undefined);
+            // Third argument = stall bound, resolved from the config table on the
+            // main thread (NIGHTGATE_PREWARM_STALL_MS, default 10 min).
+            expect(mockWalletWaitForSyncedState).toHaveBeenCalledWith('acct-derived', expect.any(Number), 600000);
         });
 
         it('supersedes older prewarm jobs of the session, excluding the fresh one', async () => {
@@ -922,6 +925,48 @@ describe('wallet session handlers', () => {
             await expect(registeredHandlers['deregisterFromDustGeneration'](req)).rejects.toThrow(/disk full/);
         });
 
+        it('sendNight: the announced identifier is persisted before the send and taken off the job on a definitive node reject', async () => {
+            const calls: any[] = [];
+            const ctx = {
+                reportExternalExecution: async (h: any) => { calls.push(['externalExecution', h]); },
+                reportSubmitted: async (h: any) => { calls.push(['submitted', h]); },
+                markBroadcastOn: async (_r: any, h: any) => { calls.push(['broadcastOn', h]); },
+                markSubmissionRejectedOn: async (_r: any, h: any) => { calls.push(['rejectedOn', h]); }
+            };
+            mockDbRun.mockResolvedValueOnce(activeSessionRow());
+            const req = createMockRequest({ sessionId: 's1', receiverAddress: 'mn_shield-addr_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', amount: '1' });
+            await registeredHandlers['sendNight'](req);
+            const args = mockStartJob.mock.calls.at(-1)![0];
+            mockSendNight.mockImplementationOnce(async (a: any) => {
+                await a.onSubmitIntent('0xsend-announced');
+                throw new Error('1010: Invalid Transaction: Custom error: 188');
+            });
+            await expect(runInJobExecutionContext(ctx as any, () => runPersistedCommand(args))).rejects.toThrow(/188/);
+            expect(calls.map(c => c[0])).toEqual(['externalExecution', 'broadcastOn', 'rejectedOn']);
+            expect(calls[1][1]).toEqual({ txHash: '0xsend-announced', firstBoundary: false });
+            expect(calls[2][1]).toEqual({ txHash: '0xsend-announced' });
+        });
+
+        it('sendNight: an ambiguous failure after the announcement keeps the identifier on the job', async () => {
+            const calls: any[] = [];
+            const ctx = {
+                reportExternalExecution: async () => { calls.push('externalExecution'); },
+                reportSubmitted: async () => { calls.push('submitted'); },
+                markBroadcastOn: async () => { calls.push('broadcastOn'); },
+                markSubmissionRejectedOn: async () => { calls.push('rejectedOn'); }
+            };
+            mockDbRun.mockResolvedValueOnce(activeSessionRow());
+            const req = createMockRequest({ sessionId: 's1', receiverAddress: 'mn_shield-addr_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', amount: '1' });
+            await registeredHandlers['sendNight'](req);
+            const args = mockStartJob.mock.calls.at(-1)![0];
+            mockSendNight.mockImplementationOnce(async (a: any) => {
+                await a.onSubmitIntent('0xsend-maybe');
+                throw new Error('submit watch timed out after 240000ms without a Finalized status');
+            });
+            await expect(runInJobExecutionContext(ctx as any, () => runPersistedCommand(args))).rejects.toThrow(/watch timed out/);
+            expect(calls).toEqual(['externalExecution', 'broadcastOn']);
+        });
+
         it('deregisterFromDustGeneration returns { jobId, status } and defers the inner call to startJob', async () => {
             mockDbRun.mockResolvedValueOnce(activeSessionRow());
             mockDeregisterNightUtxosFromDust.mockResolvedValueOnce({
@@ -944,7 +989,7 @@ describe('wallet session handlers', () => {
             expect(args.kind).toBe('deregisterFromDustGeneration');
             expect(args.sessionId).toBe('s1');
             await runPersistedCommand(args);
-            expect(mockDeregisterNightUtxosFromDust).toHaveBeenCalledWith({ cacheKey: 'acct-derived' });
+            expect(mockDeregisterNightUtxosFromDust).toHaveBeenCalledWith(expect.objectContaining({ cacheKey: 'acct-derived', onSubmitIntent: expect.any(Function) }));
         });
 
         it('deregisterFromDustGeneration forwards idempotencyKey to startJob', async () => {
@@ -1271,7 +1316,7 @@ describe('wallet session handlers', () => {
         // evict the facade a sibling active session still uses.
 
         it('keeps the facade when another active session still uses the wallet', async () => {
-            mockDbRun.mockResolvedValueOnce({ ...activeSessionRow(), viewingKeyHash: 'hash-a' });
+            mockDbRun.mockResolvedValueOnce({ ...activeSessionRow(), viewingKeyHash: 'hash-a', userId: TEST_USER_ID });
             mockDbRun.mockResolvedValueOnce(1);                             // deactivate UPDATE (runs first)
             mockDbRun.mockResolvedValueOnce([{ sessionId: 'other-live' }]); // guard: live sibling
 
@@ -1284,7 +1329,7 @@ describe('wallet session handlers', () => {
         });
 
         it('evicts when the disconnecting session was the only live reference', async () => {
-            mockDbRun.mockResolvedValueOnce({ ...activeSessionRow(), viewingKeyHash: 'hash-a' });
+            mockDbRun.mockResolvedValueOnce({ ...activeSessionRow(), viewingKeyHash: 'hash-a', userId: TEST_USER_ID });
             mockDbRun.mockResolvedValueOnce(1);  // deactivate UPDATE (runs first)
             mockDbRun.mockResolvedValueOnce([]); // guard: own row already inactive, nobody else
 
@@ -1299,7 +1344,7 @@ describe('wallet session handlers', () => {
         // keys outlive the row forever (the sweep only selects active rows).
 
         it('expired disconnect evicts the facade when it was the only live reference', async () => {
-            mockDbRun.mockResolvedValueOnce({ ...activeSessionRow({ expiresInMs: -1000 }), viewingKeyHash: 'hash-a' });
+            mockDbRun.mockResolvedValueOnce({ ...activeSessionRow({ expiresInMs: -1000 }), viewingKeyHash: 'hash-a', userId: TEST_USER_ID });
             mockDbRun.mockResolvedValueOnce(1);  // deactivate UPDATE
             mockDbRun.mockResolvedValueOnce([]); // guard: no live session left
 
@@ -1311,7 +1356,7 @@ describe('wallet session handlers', () => {
         });
 
         it('expired disconnect keeps the facade when another active session uses the wallet', async () => {
-            mockDbRun.mockResolvedValueOnce({ ...activeSessionRow({ expiresInMs: -1000 }), viewingKeyHash: 'hash-a' });
+            mockDbRun.mockResolvedValueOnce({ ...activeSessionRow({ expiresInMs: -1000 }), viewingKeyHash: 'hash-a', userId: TEST_USER_ID });
             mockDbRun.mockResolvedValueOnce(1);                             // deactivate UPDATE
             mockDbRun.mockResolvedValueOnce([{ sessionId: 'other-live' }]); // guard: live sibling
 

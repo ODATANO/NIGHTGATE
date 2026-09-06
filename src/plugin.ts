@@ -1,11 +1,15 @@
+// First import on purpose: the header mask must exist before `./index` and
+// its dependencies are evaluated, since they may log (cap-log-mask-boot.ts).
+import './cap-log-mask-boot';
 import cds from '@sap/cds';
 import path from 'path';
 
 import { initialize, shutdown, SchemaNotDeployedError } from './index';
-const log = cds.log('nightgate');
 import { mountZkConfigRoute, mountContractManifestRoute } from './connector-routes';
 import { mountStatusRoutes } from './status-routes';
 import { applyPoolDefault } from './cap-pool-default';
+
+const log = cds.log('nightgate');
 
 const pluginRoot = path.resolve(__dirname, '..');
 
@@ -176,8 +180,8 @@ const plugin = {
                             enabled: { type: 'boolean', description: 'Enable active crawler (default: true)' },
                             nodeUrl: { type: 'string', description: 'Override node URL for crawler (default: uses top-level nodeUrl). Override via NIGHTGATE_CRAWLER_NODE_URL env var.' },
                             batchSize: { type: 'number', description: 'Blocks per batch during catch-up (default: 10)' },
-                            fetchConcurrency: { type: 'number', description: 'Parallel block-fetch requests during catch-up. Override via NIGHTGATE_CRAWLER_FETCH_CONCURRENCY env var.' },
-                            rpcBatchSize: { type: 'number', description: 'Batched JSON-RPC calls per round during catch-up. Override via NIGHTGATE_CRAWLER_RPC_BATCH_SIZE env var.' },
+                            fetchConcurrency: { type: 'number', description: 'Parallel block-fetch requests during catch-up. Override via NIGHTGATE_FETCH_CONCURRENCY env var.' },
+                            rpcBatchSize: { type: 'number', description: 'Batched JSON-RPC calls per round during catch-up. Override via NIGHTGATE_RPC_BATCH_SIZE env var.' },
                             maxRetries: { type: 'number', description: 'Max retries per block before error (default: 3)' },
                             retryDelay: { type: 'number', description: 'Base retry delay in ms (default: 2000)' },
                             requestTimeout: { type: 'number', description: 'RPC request timeout ms (default: 30000)' }

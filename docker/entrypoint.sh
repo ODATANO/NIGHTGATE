@@ -56,9 +56,9 @@ if [ "$MODE" = "migrate" ]; then
     exec node /app/scripts/migrate-sqlite-to-postgres.mjs --to "$DB_URL" "$@"
 fi
 
-if [ -z "${ENCRYPTION_KEY:-}" ]; then
-    echo "FATAL: ENCRYPTION_KEY is required (high-entropy 32+ byte secret; generate with: openssl rand -hex 32)." >&2
-    echo "       Wallet viewing/seed keys are AES-256-GCM encrypted at rest under this key." >&2
+if [ -z "${ENCRYPTION_KEY:-}" ] && [ -z "${ENCRYPTION_KEYS:-}" ]; then
+    echo "FATAL: ENCRYPTION_KEY (or a key ring in ENCRYPTION_KEYS=id=secret,... with ENCRYPTION_KEY_ACTIVE) is required (high-entropy 32+ byte secret; generate with: openssl rand -hex 32)." >&2
+    echo "       Wallet viewing/seed keys and job commands are AES-256-GCM encrypted at rest under this key." >&2
     exit 1
 fi
 

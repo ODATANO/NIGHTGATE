@@ -12,7 +12,7 @@
  *   3. Resolve `compiledArtifactRef` → compiled contract + zkConfigPath +
  *      privateStateId via the contract registry.
  *   4. Look up the wallet session (signing key required: 412 without one).
- *   5. Catch SubmissionError / SessionNotFoundError / ContractNotRegisteredError
+ *   5. Catch SessionNotFoundError / ContractNotRegisteredError
  *      and translate to OData status codes.
  *
  * The submitter (`srv/submission/TransactionSubmitter.ts`) handles the actual
@@ -24,7 +24,6 @@ import { sha256 } from '@noble/hashes/sha256';
 import { bytesToHex } from '@noble/hashes/utils';
 import {
     TransactionSubmitter,
-    SubmissionError,
     type TransactionSubmitterDeps
 } from './TransactionSubmitter';
 import {
@@ -53,7 +52,7 @@ import {
     CoercionError
 } from './arg-coercion';
 import { resolveNightgateRuntimeConfig, type NightgateNetwork, VALID_NIGHTGATE_NETWORKS, resolveOverrideIndexerEndpoints, getConfiguredPrivateStateBackend, getNightgatePluginConfig, mainnetSubmissionBlockReason } from '../utils/nightgate-config';
-import { RateLimiter } from '../utils/rate-limiter';
+import { RateLimiter, principalRateKey } from '../utils/rate-limiter';
 import { ensureNetworkId, type ContractProvidersConfig } from '../midnight/providers';
 import {
     deriveRawTokenType, TokenTypeError,
@@ -61,6 +60,7 @@ import {
 } from './token-type';
 import { startJob, JobAdmissionBusyError, runChildCommand, registerBackgroundJobProcessor, registerBackgroundJobReconciliationFinalizer, withLockContentionRetry, SponsorAttemptBookkeepingPendingError, type BackgroundJobRow, type ReconciliationEvidence } from './background-jobs';
 import { reportSubmissionRejectedOn, reportBroadcastOn } from './job-execution-context';
+import { declaredJobKindTraits } from './job-kinds';
 import { reindexDisclosuresForContract } from './disclosure-indexer';
 import { readAttestationStateForContract } from './attestation-state';
 import { readPredicateStateForContract, expandAllowedMask, computeAttestCommitment } from './predicate-state';
@@ -73,12 +73,42 @@ import { Documents, Transactions, TransactionResults, PredicateAttestations, Dis
 import { walletSponsorFinalizedTx, walletSponsorUnboundTx } from '../midnight/wallet-worker-client';
 import {
     PLATFORM_POOL_SENTINEL, acquireSponsor, releaseSponsor, benchSponsor,
-    isRetryableSponsorFailure, isDustRaceFailure, isGenericInvalidFailure, isPreInclusionReject, isAmbiguousSubmitOutcome, isCallNotAppliedFailure, envMsSetting,
+    decideSponsorFailure,
     sponsorCandidatesNonExclusive, touchSponsor
-} from './sponsor-pool';
-import { resolveSponsorPolicyForRequest, SponsorPolicyEmptyError, SponsorPolicyUnavailableError } from './sponsor-policy';
-import { recordDeployedContracts, reserveDeployBudget, releaseDeployBudget } from '../sessions/agent-grants';
+ } from './sponsor-pool';
+import { resolveSponsorPolicyForRequest, effectiveSponsorPolicy, getGlobalSponsorPolicy, SponsorPolicyEmptyError, SponsorPolicyUnavailableError, type SponsorPolicy } from './sponsor-policy';
+import { recordDeployedContracts, reserveDeployBudget, releaseDeployBudget, currentGrantPolicy } from '../sessions/agent-grants';
+
+/**
+ * The policy a sponsoring job runs under, resolved when the job RUNS: the
+ * current floor narrowed by the grant's current lists. The lists persisted in
+ * the command are the admission snapshot only; a revoke or a narrowed policy
+ * file applies to queued jobs as well. A revoked grant fails the job for good,
+ * an unreadable policy file keeps it retryable.
+ */
+async function liveSponsorPolicyForJob(db: any, command: { grantId?: string | null }): Promise<SponsorPolicy> {
+    try {
+        const grant = command.grantId ? await currentGrantPolicy(db, command.grantId) : null;
+        if (command.grantId && !grant) {
+            const err: any = new Error(`agent grant ${command.grantId} is revoked; nothing was sponsored`);
+            err.code = 'AGENT_GRANT_REVOKED'; err.retryable = false;
+            throw err;
+        }
+        return effectiveSponsorPolicy(getGlobalSponsorPolicy(), grant);
+    } catch (e: any) {
+        if (e instanceof SponsorPolicyUnavailableError || e instanceof SponsorPolicyEmptyError) {
+            const err: any = new Error(e.message);
+            err.code = e instanceof SponsorPolicyUnavailableError ? 'SPONSOR_POLICY_UNAVAILABLE' : 'SPONSOR_POLICY_EMPTY';
+            err.retryable = e instanceof SponsorPolicyUnavailableError;
+            err.cause = e;
+            throw err;
+        }
+        throw e;
+    }
+}
 import { getConfiguredFeeSponsorSessions } from './fee-sponsor';
+import { hexToBytes } from '../utils/hex';
+import { configMs, configNumber } from '../utils/config';
 
 const { INSERT, UPDATE, SELECT, DELETE } = cds.ql;
 
@@ -101,8 +131,34 @@ const registrarRateLimiter = new RateLimiter({ windowMs: 60 * 60 * 1000, maxRequ
 // keyed by contractAddress (no session). Loose enough for a wallet-flow poll,
 // tight enough not to hammer the indexer.
 const reindexRateLimiter = new RateLimiter({ windowMs: 60 * 60 * 1000, maxRequests: 60 });
+// 120 sponsor submissions / hour / principal (grant or user): the dust and a
+// wasm dust proof per job are paid by the sponsor pool, so the bound is per
+// caller, not per session. Above the live burst lanes, below what would
+// occupy the pool; token callers additionally carry the grant's daily budget.
+const sponsorRateLimiter = new RateLimiter({ windowMs: 60 * 60 * 1000, maxRequests: 120 });
+// 30 caller-side builds / hour / session (buildSponsorable): a full circuit
+// proof per request, same weight class as predicates.
+const buildRateLimiter = new RateLimiter({ windowMs: 60 * 60 * 1000, maxRequests: 30 });
 
 const SHA256_HEX_RE = /^[0-9a-fA-F]{64}$/;
+
+/**
+ * Commitment lifetime (lineage 3): the vault asserts the commit's `expires_at`
+ * lies in (block time, block time + 7 days] at commit and is still ahead at
+ * reveal. The server default leaves a day for the reveal.
+ */
+const COMMIT_DEFAULT_LIFETIME_S = 24 * 60 * 60;
+const COMMIT_MAX_LIFETIME_S = 7 * 24 * 60 * 60;
+function defaultCommitExpiry(): number {
+    return Math.floor(Date.now() / 1000) + COMMIT_DEFAULT_LIFETIME_S;
+}
+function validateCommitExpiry(expiresAt: number): string | null {
+    const now = Math.floor(Date.now() / 1000);
+    if (!Number.isInteger(expiresAt)) return 'expiresAt must be an integer UNIX time in seconds';
+    if (expiresAt <= now + 60) return 'expiresAt must lie at least a minute in the future (the reveal has to fit before it)';
+    if (expiresAt > now + COMMIT_MAX_LIFETIME_S) return `expiresAt may lie at most ${COMMIT_MAX_LIFETIME_S} seconds (7 days) ahead; the vault refuses longer commitments`;
+    return null;
+}
 const DEFAULT_ATTESTATION_VAULT_REF = 'attestation-vault';
 
 /**
@@ -180,7 +236,9 @@ type ContractCommandV1 =
     | { op: 'documentIntegrityWorkflow'; predicateAttestationId: string; payloadHashA: string; payloadHashB: string; contractAddress: string; compiledArtifactRef: string; allowedMask: number; schema: SchemaSlotWire[]; openingA: OpeningWire; openingB: OpeningWire; contentRootA?: string; contentRootB?: string; schemaId?: string; sponsorSessionId?: string }
     | { op: 'documentDiffWorkflow'; predicateAttestationId: string; payloadHashA: string; payloadHashB: string; contractAddress: string; compiledArtifactRef: string; k: number; schema: SchemaSlotWire[]; openingA: OpeningWire; openingB: OpeningWire; contentRootA?: string; contentRootB?: string; schemaId?: string; sponsorSessionId?: string }
     | { op: 'anchorDocument'; documentId: string; payloadHash: string; metadataHash: string; contractAddress: string; compiledArtifactRef: string; sponsorSessionId?: string; guardedNonce?: string }
-    | { op: 'attestCommit'; commitment: string; contractAddress: string; compiledArtifactRef: string; sponsorSessionId?: string }
+    | { op: 'attestCommit'; commitment: string; expiresAt: number; contractAddress: string; compiledArtifactRef: string; sponsorSessionId?: string }
+    // Default anchoring (lineage 3): commit, then reveal, as two child jobs.
+    | { op: 'anchorGuardedWorkflow'; documentId: string; payloadHash: string; metadataHash: string; nonce: string; expiresAt: number; contractAddress: string; compiledArtifactRef: string; sponsorSessionId?: string }
     | { op: 'grantDisclosure'; disclosureGrantId: string; payloadHash: string; grantee: string; level: number; contractAddress: string; compiledArtifactRef: string; sponsorSessionId?: string }
     | { op: 'revokeDisclosure'; payloadHash: string; grantee: string; contractAddress: string; compiledArtifactRef: string; sponsorSessionId?: string }
     | { op: 'registerPassport'; passportId: string; ownerId: string; contractAddress: string; compiledArtifactRef: string; sponsorSessionId?: string };
@@ -191,14 +249,6 @@ type ContractCommandV1 =
  * before execution; the registry name alone is a mutable alias.
  */
 type ContractCommandV1WithProvenance = ContractCommandV1 & { artifactDigest?: string };
-
-function hexToBytes(hex: string): Uint8Array {
-    const out = new Uint8Array(hex.length / 2);
-    for (let i = 0; i < out.length; i++) {
-        out[i] = parseInt(hex.substr(i * 2, 2), 16);
-    }
-    return out;
-}
 
 type PredicateKind = 'numeric' | 'equality' | 'membership' | 'integrity' | 'diff';
 
@@ -414,7 +464,10 @@ export function registerSubmissionHandlers(
             || (job.kind === 'issueDocumentIntegrityAttestation' && command.op !== 'documentIntegrityWorkflow')
             || (job.kind === 'issueDocumentDiffAttestation' && command.op !== 'documentDiffWorkflow')
             || (job.kind === 'anchorDocument' && command.op !== 'anchorDocument')
+            || (job.kind === 'anchorReveal' && command.op !== 'anchorDocument')
             || (job.kind === 'commitDocumentAnchor' && command.op !== 'attestCommit')
+            || (job.kind === 'anchorCommit' && command.op !== 'attestCommit')
+            || (job.kind === 'anchorDocumentGuarded' && command.op !== 'anchorGuardedWorkflow')
             || (job.kind === 'grantDisclosure' && command.op !== 'grantDisclosure')
             || (job.kind === 'revokeDisclosure' && command.op !== 'revokeDisclosure')
             || (job.kind === 'registerPassport' && command.op !== 'registerPassport')) {
@@ -705,11 +758,12 @@ export function registerSubmissionHandlers(
         }
 
         if (command.op === 'attestCommit') {
-            // Guarded-attest phase 1: record the opaque commitment
-            // (attestGuarded mode 0; metadata/nonce args ride as zero dummies).
+            // Guarded-attest phase 1: record the opaque, caller-bound commitment
+            // (attestGuarded mode 0; metadata/nonce ride as zero dummies, the
+            // expiry is the commitment's block-time lifetime).
             const result = await submitter.call({
                 contractAddress: command.contractAddress, circuit: 'attestGuarded',
-                args: [0n, hexToBytes(command.commitment), new Uint8Array(32), new Uint8Array(32)],
+                args: [0n, hexToBytes(command.commitment), new Uint8Array(32), new Uint8Array(32), BigInt(command.expiresAt)],
                 contractName: command.compiledArtifactRef,
                 registration: { artifactPath: resolved.artifactPath, artifactDigest: resolved.artifactDigest, privateStateId: resolved.privateStateId, zkConfigPath: resolved.zkConfigPath, ...(resolved.slotWidth !== undefined ? { slotWidth: resolved.slotWidth } : {}) },
                 sessionId: job.sessionId
@@ -724,7 +778,7 @@ export function registerSubmissionHandlers(
                 contractAddress: command.contractAddress,
                 circuit: command.guardedNonce ? 'attestGuarded' : 'attest',
                 args: command.guardedNonce
-                    ? [1n, hexToBytes(command.payloadHash), hexToBytes(command.metadataHash), hexToBytes(command.guardedNonce)]
+                    ? [1n, hexToBytes(command.payloadHash), hexToBytes(command.metadataHash), hexToBytes(command.guardedNonce), 0n]
                     : [hexToBytes(command.payloadHash), hexToBytes(command.metadataHash)],
                 contractName: command.compiledArtifactRef,
                 registration: { artifactPath: resolved.artifactPath, artifactDigest: resolved.artifactDigest, privateStateId: resolved.privateStateId, zkConfigPath: resolved.zkConfigPath, ...(resolved.slotWidth !== undefined ? { slotWidth: resolved.slotWidth } : {}) },
@@ -733,6 +787,29 @@ export function registerSubmissionHandlers(
             const anchoredAt = new Date().toISOString();
             await db.run(UPDATE.entity(Documents).set({ anchoredTxHash: result.txHash, anchoredAt, modifiedAt: anchoredAt }).where({ ID: command.documentId }));
             return { documentId: command.documentId, attestationId: command.payloadHash, txHash: result.txHash, anchoredAt, ...(sponsor ? { feeSponsor: sponsor.sponsorSessionId } : {}) };
+        }
+
+        if (command.op === 'anchorGuardedWorkflow') {
+            // Lineage 3 default: the payload hash never appears in a mempool
+            // before its commitment is on chain, and the revealed attestation
+            // is final. Two transactions, each its own child job (own attempt
+            // row, own reconciliation); the parent carries no hash.
+            const commitment = await computeAttestCommitment(command.payloadHash, command.metadataHash, command.nonce);
+            const commit = await runChild<{ txHash: string }>({
+                parent: job, kind: 'anchorCommit', step: 'commit', commandVersion: 1,
+                request: { circuit: 'attestGuarded', mode: 0, documentId: command.documentId },
+                command: { op: 'attestCommit', commitment, expiresAt: command.expiresAt, contractAddress: command.contractAddress, compiledArtifactRef: command.compiledArtifactRef, sponsorSessionId: command.sponsorSessionId }
+            });
+            const reveal = await runChild<{ txHash: string; anchoredAt: string }>({
+                parent: job, kind: 'anchorReveal', step: 'reveal', commandVersion: 1,
+                request: { circuit: 'attestGuarded', mode: 1, documentId: command.documentId },
+                command: { op: 'anchorDocument', documentId: command.documentId, payloadHash: command.payloadHash, metadataHash: command.metadataHash, contractAddress: command.contractAddress, compiledArtifactRef: command.compiledArtifactRef, sponsorSessionId: command.sponsorSessionId, guardedNonce: command.nonce }
+            });
+            return {
+                documentId: command.documentId, attestationId: command.payloadHash, txHash: reveal?.txHash, commitTxHash: commit?.txHash,
+                anchoredAt: reveal?.anchoredAt ?? new Date().toISOString(), guarded: true,
+                ...(sponsor ? { feeSponsor: sponsor.sponsorSessionId } : {})
+            };
         }
 
         if (command.op === 'grantDisclosure' || command.op === 'revokeDisclosure') {
@@ -802,23 +879,6 @@ export function registerSubmissionHandlers(
             return { submissionId: result.submissionId, txHash: result.txHash, contractAddress: result.contractAddress, circuits: result.circuits, status: result.status, ...(sponsor ? { feeSponsor: sponsor.sponsorSessionId } : {}) };
         }
 
-        if ((command as { op: string }).op === 'probeCrossServer') {
-            // EXPERIMENTAL PROTOTYPE (cross-server-fee-sponsoring FR). Runs in
-            // the background-job context (fully detached from any request tx),
-            // which is what lets the worker's private-state read acquire a DB
-            // connection instead of deadlocking against a pinned request tx.
-            const c = command as unknown as { contractAddress: string; circuit: string; compiledArtifactRef: string; args: unknown[] };
-            const argTypes = argTypesLoader(resolved.zkConfigPath, c.circuit);
-            const coerced = coerceCircuitArgs(c.args, argTypes);
-            const out = await submitter.probeCrossServerSponsor({
-                contractAddress: c.contractAddress, circuit: c.circuit, args: coerced,
-                contractName: c.compiledArtifactRef,
-                registration: { artifactPath: resolved.artifactPath, artifactDigest: resolved.artifactDigest, privateStateId: resolved.privateStateId, zkConfigPath: resolved.zkConfigPath, ...(resolved.slotWidth !== undefined ? { slotWidth: resolved.slotWidth } : {}) },
-                sessionId: job.sessionId
-            });
-            return { ...out, contractAddress: c.contractAddress, circuit: c.circuit, ...(sponsor ? { feeSponsor: sponsor.sponsorSessionId } : {}) };
-        }
-
         if ((command as { op: string }).op === 'buildSponsorable') {
             // Cross-server sponsoring PHASE 1: build + sign + finalize under the
             // caller's identity, return the fee-unpaid tx as base64. No sponsor,
@@ -862,12 +922,12 @@ export function registerSubmissionHandlers(
         });
         return { submissionId: result.submissionId, txHash: result.txHash, contractAddress: result.contractAddress, status: result.status, ...(sponsor ? { feeSponsor: sponsor.sponsorSessionId } : {}) };
     };
-    registerBackgroundJobProcessor('deployContract', 1, executeContractCommand);
-    registerBackgroundJobProcessor('submitContractCall', 1, executeContractCommand);
-    registerBackgroundJobProcessor('submitContractCallBatch', 1, executeContractCommand);
+    registerBackgroundJobProcessor('deployContract', 1, declaredJobKindTraits('deployContract'), executeContractCommand);
+    registerBackgroundJobProcessor('submitContractCall', 1, declaredJobKindTraits('submitContractCall'), executeContractCommand);
+    registerBackgroundJobProcessor('submitContractCallBatch', 1, declaredJobKindTraits('submitContractCallBatch'), executeContractCommand);
     // Same execution as any contract call; the result additionally carries the
     // token type, without which the caller cannot spend what it just minted.
-    registerBackgroundJobProcessor('mintShieldedTestToken', 1, async (raw, job) => {
+    registerBackgroundJobProcessor('mintShieldedTestToken', 1, declaredJobKindTraits('mintShieldedTestToken'), async (raw, job) => {
         const result = await executeContractCommand(raw, job) as Record<string, unknown> | undefined;
         // Narrow to the call shape: this processor only ever runs commands the
         // mint handler wrote, and the executor already rejected any other op.
@@ -875,14 +935,13 @@ export function registerSubmissionHandlers(
         const token = await deriveRawTokenType(String(command?.contractAddress ?? ''));
         return { ...(result ?? {}), tokenTypeHex: token.tokenTypeHex, amount: SHIELDED_TEST_TOKEN_AMOUNT.toString() };
     });
-    registerBackgroundJobProcessor('issueFieldPredicateAttestation', 1, executeContractCommand);
-    registerBackgroundJobProcessor('issueFieldEqualityAttestation', 1, executeContractCommand);
-    registerBackgroundJobProcessor('issueFieldMembershipAttestation', 1, executeContractCommand);
-    registerBackgroundJobProcessor('issueFieldPredicateAttestationBatch', 1, executeContractCommand);
-    registerBackgroundJobProcessor('issueDocumentIntegrityAttestation', 1, executeContractCommand);
-    registerBackgroundJobProcessor('issueDocumentDiffAttestation', 1, executeContractCommand);
-    registerBackgroundJobProcessor('probeCrossServerSponsor', 1, executeContractCommand);
-    registerBackgroundJobProcessor('buildSponsorableTx', 1, executeContractCommand);
+    registerBackgroundJobProcessor('issueFieldPredicateAttestation', 1, declaredJobKindTraits('issueFieldPredicateAttestation'), executeContractCommand);
+    registerBackgroundJobProcessor('issueFieldEqualityAttestation', 1, declaredJobKindTraits('issueFieldEqualityAttestation'), executeContractCommand);
+    registerBackgroundJobProcessor('issueFieldMembershipAttestation', 1, declaredJobKindTraits('issueFieldMembershipAttestation'), executeContractCommand);
+    registerBackgroundJobProcessor('issueFieldPredicateAttestationBatch', 1, declaredJobKindTraits('issueFieldPredicateAttestationBatch'), executeContractCommand);
+    registerBackgroundJobProcessor('issueDocumentIntegrityAttestation', 1, declaredJobKindTraits('issueDocumentIntegrityAttestation'), executeContractCommand);
+    registerBackgroundJobProcessor('issueDocumentDiffAttestation', 1, declaredJobKindTraits('issueDocumentDiffAttestation'), executeContractCommand);
+    registerBackgroundJobProcessor('buildSponsorableTx', 1, declaredJobKindTraits('buildSponsorableTx'), executeContractCommand);
 
     // Cross-server sponsoring PHASE 2 job: no contract call of our own, just
     // deserialize the caller's finalized tx, enforce policy, pay dust, submit.
@@ -894,7 +953,7 @@ export function registerSubmissionHandlers(
      * identifier (markJobSubmitted accepts external_execution|submitted, so it
      * may repeat). A later attempt closes the previous row first: `REJECTED`
      * (provably never on-chain; the job's hash is taken off via
-     * reportSubmissionRejected so an exhausted run fails plainly) or `REBUILT`.
+     * reportSubmissionRejectedOn so an exhausted run fails plainly) or `REBUILT`.
      * The job row's txHash is the LATEST attempt's identifier; reconciliation
      * and chain-outcome confirmation resolve it against the indexer.
      */
@@ -1005,8 +1064,10 @@ export function registerSubmissionHandlers(
         }
         cds.log('nightgate').info(`sponsorFinalizedTransaction job: ${command.finalizedTxB64?.length ?? 0} b64 chars, candidates ${candidates.map(c => c.slice(0, 8)).join('>')}`);
 
-        const waitMs = envMsSetting('NIGHTGATE_SPONSOR_LEASE_WAIT_MS', 120_000);
-        const cooldownMs = envMsSetting('NIGHTGATE_SPONSOR_COOLDOWN_MS', 120_000);
+        const waitMs = configMs('NIGHTGATE_SPONSOR_LEASE_WAIT_MS');
+        const cooldownMs = configMs('NIGHTGATE_SPONSOR_COOLDOWN_MS');
+        const dustRetries = configNumber('NIGHTGATE_SPONSOR_DUST_RETRIES');
+        const dustBackoffMs = configMs('NIGHTGATE_SPONSOR_DUST_BACKOFF_MS');
         // ONE shared deadline: a fully busy pool QUEUES here (acquireSponsor
         // polls the whole remaining candidate set) instead of skipping every
         // busy member and failing instantly.
@@ -1019,48 +1080,65 @@ export function registerSubmissionHandlers(
             } catch (e) {
                 throw lastErr ?? e; // pool stayed busy/cooling until the deadline
             }
-            try {
-                const sponsor = await resolveFeeSponsor({ db, sponsorSessionId: sessionId, requestingUserId: job.requestedBy ?? undefined, config: getNightgatePluginConfig() });
-                await ensureFeeSponsorFacade(sponsor, facadeCfg);
-                activeSponsorSessionId = sponsor.sponsorSessionId;
-                // Same durable external-effect boundary as the unbound path: the
-                // worker announces the identifier before it broadcasts, the job
-                // row carries it (and a PendingSubmissions row) from then on.
-                const out = await walletSponsorFinalizedTx({
-                    sponsorSessionId: sponsor.accountId,
-                    finalizedTxB64: command.finalizedTxB64,
-                    networkId: facadeCfg.networkId,
-                    allowedContracts: command.allowedContracts,
-                    allowedCircuits: command.allowedCircuits,
-                    allowDeploy: command.allowDeploy === true,
-                    ownContracts: command.ownContracts,
-                    allowedTokenTypes: command.allowedTokenTypes
-                }, ledger.onSubmitIntent());
-                await ledger.markIncluded(out);
-                releaseSponsor(sessionId);
-                if (command.grantId && out.deployed?.length) await recordDeployedContracts(db, command.grantId, out.deployed);
-                return { ...out, feeSponsor: sponsor.sponsorSessionId };
-            } catch (e) {
-                lastErr = e;
-                // A failover to the next sponsor builds a NEW transaction: close
-                // this attempt's row. Whether the hash may stay on the job
-                // follows the same rule as the unbound path.
-                if (isAmbiguousSubmitOutcome(e)) { releaseSponsor(sessionId); throw e; }
+            // Same-sponsor rebuilds on a dust race, then the pool decision.
+            let outcome: 'next' | undefined;
+            for (let attempt = 0; attempt <= dustRetries && outcome === undefined; attempt++) {
                 try {
-                    await ledger.failPreviousAttempt(String((e as Error)?.message ?? e), isPreInclusionReject(e));
-                } catch (closeErr) {
+                    const sponsor = await resolveFeeSponsor({ db, sponsorSessionId: sessionId, requestingUserId: job.requestedBy ?? undefined, config: getNightgatePluginConfig() });
+                    await ensureFeeSponsorFacade(sponsor, facadeCfg);
+                    activeSponsorSessionId = sponsor.sponsorSessionId;
+                    // Same durable external-effect boundary as the unbound path: the
+                    // worker announces the identifier before it broadcasts, the job
+                    // row carries it (and a PendingSubmissions row) from then on.
+                    const policy = await liveSponsorPolicyForJob(db, command);
+                    const out = await walletSponsorFinalizedTx({
+                        sponsorSessionId: sponsor.accountId,
+                        finalizedTxB64: command.finalizedTxB64,
+                        networkId: facadeCfg.networkId,
+                        allowedContracts: policy.allowedContracts,
+                        allowedCircuits: policy.allowedCircuits,
+                        allowDeploy: policy.allowDeploy === true,
+                        ownContracts: policy.ownContracts,
+                        allowedTokenTypes: policy.allowedTokenTypes
+                    }, ledger.onSubmitIntent());
+                    await ledger.markIncluded(out);
                     releaseSponsor(sessionId);
-                    throw closeErr;
+                    if (command.grantId && out.deployed?.length) await recordDeployedContracts(db, command.grantId, out.deployed);
+                    return { ...out, feeSponsor: sponsor.sponsorSessionId };
+                } catch (e) {
+                    lastErr = e;
+                    const verdict = decideSponsorFailure(e);
+                    // Ambiguous or on-chain: the attempt row stays as it is, the
+                    // job runner takes it from here (reconciliation / terminal).
+                    if (verdict.decision === 'ambiguous' || verdict.decision === 'landed-not-applied') { releaseSponsor(sessionId); throw e; }
+                    // Everything else builds a NEW transaction: close this attempt's row.
+                    try {
+                        await ledger.failPreviousAttempt(String((e as Error)?.message ?? e), verdict.preInclusion);
+                    } catch (closeErr) {
+                        releaseSponsor(sessionId);
+                        throw closeErr;
+                    }
+                    if (verdict.decision === 'dust-rebuild') {
+                        const budget = verdict.generic ? Math.min(1, dustRetries) : dustRetries;
+                        if (attempt < budget) {
+                            cds.log('nightgate').warn(`sponsor ${sessionId.slice(0, 8)} hit a dust race, rebuild-retry ${attempt + 1}/${budget} on the same sponsor: ${String((e as Error).message).slice(-120)}`);
+                            await new Promise(resolve => setTimeout(resolve, dustBackoffMs));
+                            continue;
+                        }
+                        // Rebuilds exhausted: a coded race may clear on the next
+                        // wallet, a pool Invalid is the caller's transaction.
+                        if (verdict.generic) { releaseSponsor(sessionId); throw e; }
+                    } else if (verdict.decision === 'fail') {
+                        releaseSponsor(sessionId);
+                        throw e; // fails identically on every sponsor; do not burn the pool
+                    }
+                    // Bench EVERY failover, so the NEXT job skips this sponsor
+                    // too; whether WE continue depends on candidates left.
+                    benchSponsor(sessionId, cooldownMs);
+                    cds.log('nightgate').warn(`sponsor ${sessionId.slice(0, 8)} failed over (${String((e as Error).message).slice(0, 120)})`);
+                    candidates = candidates.filter(c => c !== sessionId);
+                    outcome = 'next';
                 }
-                if (!isRetryableSponsorFailure(e)) {
-                    releaseSponsor(sessionId);
-                    throw e; // fails identically on every sponsor; do not burn the pool
-                }
-                // Bench EVERY retryable failure, so the NEXT job skips this
-                // sponsor too; whether WE continue depends on candidates left.
-                benchSponsor(sessionId, cooldownMs);
-                cds.log('nightgate').warn(`sponsor ${sessionId.slice(0, 8)} failed retryably (${String((e as Error).message).slice(0, 120)})`);
-                candidates = candidates.filter(c => c !== sessionId);
             }
         }
         throw lastErr ?? new Error('no sponsor candidate available');
@@ -1096,7 +1174,7 @@ export function registerSubmissionHandlers(
     registerBackgroundJobReconciliationFinalizer('sponsorFinalizedTransaction', 1, finalizeSponsoredSubmission);
     registerBackgroundJobReconciliationFinalizer('sponsorUnboundTransaction', 1, finalizeSponsoredSubmission);
 
-    registerBackgroundJobProcessor('sponsorFinalizedTransaction', 1, executeSponsorFinalized);
+    registerBackgroundJobProcessor('sponsorFinalizedTransaction', 1, declaredJobKindTraits('sponsorFinalizedTransaction'), executeSponsorFinalized);
 
     // 0.18 PARALLEL channel: same policy + pool + failover, but NO exclusive
     // wallet lease. Concurrency comes from per-NOTE locking inside the worker,
@@ -1114,7 +1192,7 @@ export function registerSubmissionHandlers(
         } else {
             candidates = [String(command.sponsorSessionId)];
         }
-        const cooldownMs = envMsSetting('NIGHTGATE_SPONSOR_COOLDOWN_MS', 120_000);
+        const cooldownMs = configMs('NIGHTGATE_SPONSOR_COOLDOWN_MS');
         // A 1010/170 or /196 is a transient dust race, not a sponsor-health problem:
         // rebuild the dust spend fresh on the SAME sponsor and resubmit, up to
         // dustRetries times with a short backoff (letting the dust state catch
@@ -1123,8 +1201,8 @@ export function registerSubmissionHandlers(
         // job. Only a NON-dust retryable failure benches the sponsor + fails over.
         // 4 x 5 s spans ~2 blocks: the rebuilt spend can only succeed once the
         // sponsor's local dust wallet has applied the spend it lost against.
-        const dustRetries = envMsSetting('NIGHTGATE_SPONSOR_DUST_RETRIES', 4);
-        const dustBackoffMs = envMsSetting('NIGHTGATE_SPONSOR_DUST_BACKOFF_MS', 5_000);
+        const dustRetries = configNumber('NIGHTGATE_SPONSOR_DUST_RETRIES');
+        const dustBackoffMs = configMs('NIGHTGATE_SPONSOR_DUST_BACKOFF_MS');
         cds.log('nightgate').info(`sponsorUnboundTransaction job: ${command.unboundTxB64?.length ?? 0} b64 chars, candidates ${candidates.map(c => c.slice(0, 8)).join('>')}`);
 
         let lastErr: unknown;
@@ -1142,22 +1220,24 @@ export function registerSubmissionHandlers(
                     const sponsor = await resolveFeeSponsor({ db, sponsorSessionId: sessionId, requestingUserId: job.requestedBy ?? undefined, config: getNightgatePluginConfig() });
                     await ensureFeeSponsorFacade(sponsor, facadeCfg);
                     activeSponsorSessionId = sponsor.sponsorSessionId;
+                    const policy = await liveSponsorPolicyForJob(db, command);
                     const out = await walletSponsorUnboundTx({
                         sponsorSessionId: sponsor.accountId,
                         unboundTxB64: command.unboundTxB64,
                         networkId: facadeCfg.networkId,
-                        allowedContracts: command.allowedContracts,
-                        allowedCircuits: command.allowedCircuits,
-                        allowDeploy: command.allowDeploy === true,
-                        ownContracts: command.ownContracts,
-                        allowedTokenTypes: command.allowedTokenTypes
+                        allowedContracts: policy.allowedContracts,
+                        allowedCircuits: policy.allowedCircuits,
+                        allowDeploy: policy.allowDeploy === true,
+                        ownContracts: policy.ownContracts,
+                        allowedTokenTypes: policy.allowedTokenTypes
                     }, onSubmitIntent());
                     await ledger.markIncluded(out);
                     if (command.grantId && out.deployed?.length) await recordDeployedContracts(db, command.grantId, out.deployed);
                     return { ...out, feeSponsor: sponsor.sponsorSessionId };
                 } catch (e) {
                     lastErr = e;
-                    if (isAmbiguousSubmitOutcome(e)) {
+                    const verdict = decideSponsorFailure(e);
+                    if (verdict.decision === 'ambiguous') {
                         // The broadcast may still be included: NO rebuild (two
                         // identifiers / two fees could land). Leave the attempt
                         // row pending and the job's hash in place; the job ends
@@ -1166,7 +1246,7 @@ export function registerSubmissionHandlers(
                         cds.log('nightgate').warn(`unbound sponsor ${sessionId.slice(0, 8)}: ambiguous submit outcome, leaving the job for reconciliation: ${String((e as Error).message).slice(0, 120)}`);
                         throw e;
                     }
-                    if (isCallNotAppliedFailure(e)) {
+                    if (verdict.decision === 'landed-not-applied') {
                         // On-chain, call not applied (PROVEN via the indexer):
                         // the CALLER's transcript is stale (same-contract
                         // conflict). No sponsor-side rebuild can fix that (the
@@ -1178,11 +1258,11 @@ export function registerSubmissionHandlers(
                         cds.log('nightgate').warn(`unbound sponsor ${sessionId.slice(0, 8)}: sponsored call landed but did not apply (caller transcript stale); not retrying: ${String((e as Error).message).slice(0, 120)}`);
                         throw e;
                     }
-                    await failPreviousAttempt(String((e as Error)?.message ?? e), isPreInclusionReject(e));
-                    if (isDustRaceFailure(e)) {
+                    await failPreviousAttempt(String((e as Error)?.message ?? e), verdict.preInclusion);
+                    if (verdict.decision === 'dust-rebuild') {
                         // Generic pool-Invalid: one rebuild only (each costs a
                         // full dust proof and it may be a caller-side invalid tx).
-                        const budget = isGenericInvalidFailure(e) ? Math.min(1, dustRetries) : dustRetries;
+                        const budget = verdict.generic ? Math.min(1, dustRetries) : dustRetries;
                         if (attempt < budget) {
                             cds.log('nightgate').warn(`unbound sponsor ${sessionId.slice(0, 8)} hit a dust race (1010/170|196 or pool Invalid), rebuild-retry ${attempt + 1}/${budget}: ${String((e as Error).message).slice(-120)}`);
                             await new Promise(resolve => setTimeout(resolve, dustBackoffMs));
@@ -1193,9 +1273,9 @@ export function registerSubmissionHandlers(
                         // sponsor-health problem. Do NOT bench the wallet; fail.
                         throw e;
                     }
-                    if (!isRetryableSponsorFailure(e)) throw e;
+                    if (verdict.decision === 'fail') throw e;
                     benchSponsor(sessionId, cooldownMs);
-                    cds.log('nightgate').warn(`unbound sponsor ${sessionId.slice(0, 8)} failed retryably (${String((e as Error).message).slice(0, 120)})`);
+                    cds.log('nightgate').warn(`unbound sponsor ${sessionId.slice(0, 8)} failed over (${String((e as Error).message).slice(0, 120)})`);
                     break; // fail over to the next candidate
                 }
             }
@@ -1211,15 +1291,18 @@ export function registerSubmissionHandlers(
     // race (1010/170) self-heals via the rebuild-retry above. The whole-wallet
     // dust-wedge snapshot/restore stays exclusive to the BOUND paths (which
     // hold the whole-call lock); the unbound path never arms it.
-    registerBackgroundJobProcessor('sponsorUnboundTransaction', 1, executeSponsorUnbound);
+    registerBackgroundJobProcessor('sponsorUnboundTransaction', 1, declaredJobKindTraits('sponsorUnboundTransaction'), executeSponsorUnbound);
 
-    registerBackgroundJobProcessor('anchorDocument', 1, executeContractCommand);
-    registerBackgroundJobProcessor('commitDocumentAnchor', 1, executeContractCommand);
-    registerBackgroundJobProcessor('grantDisclosure', 1, executeContractCommand);
-    registerBackgroundJobProcessor('revokeDisclosure', 1, executeContractCommand);
-    registerBackgroundJobProcessor('registerPassport', 1, executeContractCommand);
-    for (const childKind of ['predicateCommitValue', 'predicateProof', 'fieldAnchorRoot', 'fieldPredicateProof', 'fieldEqualityProof', 'fieldMembershipProof', 'fieldPredicateBatchProof', 'documentIntegrityProof', 'documentDiffProof']) {
-        registerBackgroundJobProcessor(childKind, 1, executeContractCommand);
+    registerBackgroundJobProcessor('anchorDocument', 1, declaredJobKindTraits('anchorDocument'), executeContractCommand);
+    registerBackgroundJobProcessor('commitDocumentAnchor', 1, declaredJobKindTraits('commitDocumentAnchor'), executeContractCommand);
+    registerBackgroundJobProcessor('anchorDocumentGuarded', 1, declaredJobKindTraits('anchorDocumentGuarded'), executeContractCommand);
+    registerBackgroundJobProcessor('anchorCommit', 1, declaredJobKindTraits('anchorCommit'), executeContractCommand);
+    registerBackgroundJobProcessor('anchorReveal', 1, declaredJobKindTraits('anchorReveal'), executeContractCommand);
+    registerBackgroundJobProcessor('grantDisclosure', 1, declaredJobKindTraits('grantDisclosure'), executeContractCommand);
+    registerBackgroundJobProcessor('revokeDisclosure', 1, declaredJobKindTraits('revokeDisclosure'), executeContractCommand);
+    registerBackgroundJobProcessor('registerPassport', 1, declaredJobKindTraits('registerPassport'), executeContractCommand);
+    for (const childKind of ['fieldAnchorRoot', 'fieldPredicateProof', 'fieldEqualityProof', 'fieldMembershipProof', 'fieldPredicateBatchProof', 'documentIntegrityProof', 'documentDiffProof']) {
+        registerBackgroundJobProcessor(childKind, 1, declaredJobKindTraits(childKind), executeContractCommand);
     }
 
     const finalizeContractProjection = async (
@@ -1239,6 +1322,9 @@ export function registerSubmissionHandlers(
                 `Reconciled '${command.op}' command of job ${_job.ID}`);
         }
         const changedAt = evidence.finalizedAt ?? new Date().toISOString();
+        if (command.op === 'attestCommit') {
+            return { reconciled: true, commitment: command.commitment, contractAddress: command.contractAddress, txHash: evidence.txHash, ...(command.sponsorSessionId ? { feeSponsor: command.sponsorSessionId } : {}) };
+        }
         if (command.op === 'anchorDocument') {
             await db.run(UPDATE.entity(Documents).set({
                 anchoredTxHash: evidence.txHash, anchoredAt: changedAt, modifiedAt: changedAt
@@ -1283,13 +1369,6 @@ export function registerSubmissionHandlers(
                 ...(command.sponsorSessionId ? { feeSponsor: command.sponsorSessionId } : {})
             };
         }
-        if (command.op === 'attestCommit') {
-            return {
-                reconciled: true, commitment: command.commitment,
-                contractAddress: command.contractAddress, txHash: evidence.txHash,
-                ...(command.sponsorSessionId ? { feeSponsor: command.sponsorSessionId } : {})
-            };
-        }
         if (command.op === 'callBatch') {
             // Rebuild the documented batch result from the encrypted command
             // (the ordered circuits) + the durable evidence. Without this the
@@ -1308,6 +1387,8 @@ export function registerSubmissionHandlers(
     };
     registerBackgroundJobReconciliationFinalizer('anchorDocument', 1, finalizeContractProjection);
     registerBackgroundJobReconciliationFinalizer('commitDocumentAnchor', 1, finalizeContractProjection);
+    registerBackgroundJobReconciliationFinalizer('anchorReveal', 1, finalizeContractProjection);
+    registerBackgroundJobReconciliationFinalizer('anchorCommit', 1, finalizeContractProjection);
     registerBackgroundJobReconciliationFinalizer('grantDisclosure', 1, finalizeContractProjection);
     registerBackgroundJobReconciliationFinalizer('revokeDisclosure', 1, finalizeContractProjection);
     registerBackgroundJobReconciliationFinalizer('registerPassport', 1, finalizeContractProjection);
@@ -1501,56 +1582,6 @@ export function registerSubmissionHandlers(
         }
     });
 
-    // EXPERIMENTAL PROTOTYPE (cross-server-fee-sponsoring FR). Synchronous
-    // diagnostic: runs a contract call as the caller's phase 1, round-trips the
-    // finalized tx through serialize/deserialize, and has the sponsor session
-    // balance dust + submit (phase 2). Proves the finalized-tx round-trip that
-    // a cross-machine sponsor endpoint would rely on. Not a shipping path; no
-    // job, no idempotency, no PendingSubmissions.
-    srv.on('probeCrossServerSponsor', async (req: Request) => {
-        const { contractAddress, circuit, compiledArtifactRef, sessionId, args, sponsorSessionId } = req.data as {
-            contractAddress?: string; circuit?: string; compiledArtifactRef?: string;
-            sessionId?: string; args?: string; sponsorSessionId?: string;
-        };
-        if (!contractAddress) return req.reject(400, 'contractAddress is required');
-        if (!circuit) return req.reject(400, 'circuit is required');
-        if (!compiledArtifactRef) return req.reject(400, 'compiledArtifactRef is required');
-        if (!sessionId) return req.reject(400, 'sessionId is required');
-        if (!sponsorSessionId) return req.reject(400, 'sponsorSessionId is required (the second session that pays dust)');
-        if (rejectIfMainnetBlocked(req)) return;
-
-        let parsedArgs: unknown[] = [];
-        if (args) {
-            try { const v = JSON.parse(args); if (!Array.isArray(v)) return req.reject(400, 'args must be a JSON array'); parsedArgs = v; }
-            catch { return req.reject(400, 'args must be valid JSON'); }
-        }
-
-        return runSubmission(req, async () => {
-            const facadeCfg = facadeConfigFromEnv();
-            await ensureNetworkId(facadeCfg.networkId);
-            const resolved = await contractResolver(compiledArtifactRef);
-            const argTypes = argTypesLoader(resolved.zkConfigPath, circuit);
-            const coercedArgs = coerceCircuitArgs(parsedArgs, argTypes);
-
-            await walletFactory({ sessionId, db, facadeConfig: facadeCfg, expectedUserId: (req as any).user?.id });
-            const sponsor = await resolveSponsorForRequest(req, sponsorSessionId);
-
-            // Runs as a background job (fully detached): the synchronous request
-            // path deadlocks the worker's private-state read against the pinned
-            // request tx connection. Poll getJobStatus for { txHash, roundTrip,
-            // serializedBytes }.
-            return startJob({
-                kind: 'probeCrossServerSponsor',
-                sessionId,
-                request: { contractAddress, circuit, compiledArtifactRef, sessionId, feeSponsor: sponsor?.sponsorSessionId ?? null },
-                requestedBy: (req as any).user?.id,
-                commandVersion: 1,
-                encryptCommand: true,
-                command: { op: 'probeCrossServer', contractAddress, circuit, compiledArtifactRef, args: parsedArgs, sponsorSessionId: sponsor?.sponsorSessionId }
-            });
-        });
-    });
-
     // Cross-server sponsoring PHASE 1 (0.17.0). Build + sign + finalize a call
     // under the caller's identity; returns the fee-unpaid tx as base64 (poll
     // getJobStatus). The caller then ships those bytes to a sponsor endpoint.
@@ -1565,6 +1596,7 @@ export function registerSubmissionHandlers(
         if (!compiledArtifactRef) return req.reject(400, 'compiledArtifactRef is required');
         if (!sessionId) return req.reject(400, 'sessionId is required');
         if (rejectIfMainnetBlocked(req)) return;
+        if (!checkRate(buildRateLimiter, sessionId, req)) return;
         let parsedArgs: unknown[] = [];
         if (args) { try { const v = JSON.parse(args); if (!Array.isArray(v)) return req.reject(400, 'args must be a JSON array'); parsedArgs = v; } catch { return req.reject(400, 'args must be valid JSON'); } }
 
@@ -1605,6 +1637,7 @@ export function registerSubmissionHandlers(
             effectiveSponsor = PLATFORM_POOL_SENTINEL;
         }
         if (rejectIfMainnetBlocked(req)) return;
+        if (!checkRate(sponsorRateLimiter, 'sponsor', req)) return;
 
         return runSubmission(req, async () => {
             const facadeCfg = facadeConfigFromEnv();
@@ -1616,8 +1649,10 @@ export function registerSubmissionHandlers(
             // idempotency, so pool jobs are keyed under the sentinel itself
             // rather than under whichever member happened to be free.
             if (effectiveSponsor !== PLATFORM_POOL_SENTINEL) {
-                const sponsor = await resolveFeeSponsor({ db, sponsorSessionId: effectiveSponsor, requestingUserId: (req as any).user?.id, config: getNightgatePluginConfig() });
-                await ensureFeeSponsorFacade(sponsor, facadeCfg);
+                // Row-level validation only (ownership, signing key): the facade
+                // restore can take minutes and does not belong under the request
+                // transaction; the executor ensures the facade.
+                await resolveFeeSponsor({ db, sponsorSessionId: effectiveSponsor, requestingUserId: (req as any).user?.id, config: getNightgatePluginConfig() });
             }
             // Allow-list: platform floor (env or NIGHTGATE_SPONSOR_POLICY_FILE) narrowed by
             // the agent grant's lists when the request carries a token; empty floor = allow any (dev).
@@ -1669,13 +1704,16 @@ export function registerSubmissionHandlers(
             effectiveSponsor = PLATFORM_POOL_SENTINEL;
         }
         if (rejectIfMainnetBlocked(req)) return;
+        if (!checkRate(sponsorRateLimiter, 'sponsor', req)) return;
 
         return runSubmission(req, async () => {
             const facadeCfg = facadeConfigFromEnv();
             await ensureNetworkId(facadeCfg.networkId);
             if (effectiveSponsor !== PLATFORM_POOL_SENTINEL) {
-                const sponsor = await resolveFeeSponsor({ db, sponsorSessionId: effectiveSponsor, requestingUserId: (req as any).user?.id, config: getNightgatePluginConfig() });
-                await ensureFeeSponsorFacade(sponsor, facadeCfg);
+                // Row-level validation only (ownership, signing key): the facade
+                // restore can take minutes and does not belong under the request
+                // transaction; the executor ensures the facade.
+                await resolveFeeSponsor({ db, sponsorSessionId: effectiveSponsor, requestingUserId: (req as any).user?.id, config: getNightgatePluginConfig() });
             }
             // Floor narrowed by the agent grant; see sponsorFinalizedTransaction above.
             const { allowedContracts, allowedCircuits, allowDeploy, ownContracts, allowedTokenTypes } = resolveSponsorPolicyForRequest(req);
@@ -1857,6 +1895,7 @@ export function registerSubmissionHandlers(
             idempotencyKey?: string;
             sponsorSessionId?: string;
             nonce?: string;
+            guarded?: boolean;
         };
 
         if (!data.sha256) return req.reject(400, 'sha256 is required');
@@ -1923,8 +1962,18 @@ export function registerSubmissionHandlers(
             await walletFactory({ sessionId: data.sessionId!, db, facadeConfig: facadeCfg, expectedUserId: (req as any).user?.id });
             const sponsor = await resolveSponsorForRequest(req, data.sponsorSessionId);
 
+            // Three lanes. With `nonce`: the caller ran commit (commitDocumentAnchor)
+            // and this is the REVEAL. `guarded: false`: one plain attest (the
+            // payload hash is visible in the mempool before it is owned; only
+            // for hashes that are public anyway). Default: commit + reveal as
+            // one workflow with a server-side nonce, so the hash is never
+            // exposed before its commitment is on chain and the attestation is
+            // final on arrival (lineage 3).
+            const lane = data.nonce ? 'reveal' : (data.guarded === false ? 'plain' : 'guarded');
+            const guardedNonce = lane === 'guarded' ? randomBytes(32).toString('hex') : (lane === 'reveal' ? data.nonce!.toLowerCase() : undefined);
+            const expiresAt = lane === 'guarded' ? defaultCommitExpiry() : undefined;
             const job = await startJob({
-                kind: 'anchorDocument',
+                kind: lane === 'guarded' ? 'anchorDocumentGuarded' : 'anchorDocument',
                 sessionId: data.sessionId!,
                 idempotencyKey: data.idempotencyKey,
                 request: {
@@ -1932,22 +1981,31 @@ export function registerSubmissionHandlers(
                     contractAddress: data.contractAddress,
                     compiledRef,
                     documentId,
+                    lane,
                     feeSponsor: sponsor?.sponsorSessionId ?? null
                 },
+                // The server-side nonce is random per request and stays out of the
+                // idempotency payload: a retry under the same key must dedupe.
                 idempotencyPayload: {
                     sha256: data.sha256!.toLowerCase(), contractAddress: data.contractAddress,
                     compiledRef, metadata: metadataStr, feeSponsor: sponsor?.sponsorSessionId ?? null,
-                    guardedNonce: data.nonce?.toLowerCase() ?? null
+                    lane, guardedNonce: lane === 'reveal' ? guardedNonce : null
                 },
                 requestedBy: (req as any).user?.id,
                 commandVersion: 1,
                 encryptCommand: true,
-                command: {
-                    op: 'anchorDocument', documentId, payloadHash: data.sha256!.toLowerCase(),
-                    metadataHash: bytesToHex(metadataHashBytes), contractAddress: data.contractAddress!,
-                    compiledArtifactRef: compiledRef, sponsorSessionId: sponsor?.sponsorSessionId,
-                    guardedNonce: data.nonce?.toLowerCase()
-                }
+                command: lane === 'guarded'
+                    ? {
+                        op: 'anchorGuardedWorkflow', documentId, payloadHash: data.sha256!.toLowerCase(),
+                        metadataHash: bytesToHex(metadataHashBytes), nonce: guardedNonce!, expiresAt: expiresAt!,
+                        contractAddress: data.contractAddress!, compiledArtifactRef: compiledRef, sponsorSessionId: sponsor?.sponsorSessionId
+                    }
+                    : {
+                        op: 'anchorDocument', documentId, payloadHash: data.sha256!.toLowerCase(),
+                        metadataHash: bytesToHex(metadataHashBytes), contractAddress: data.contractAddress!,
+                        compiledArtifactRef: compiledRef, sponsorSessionId: sponsor?.sponsorSessionId,
+                        guardedNonce
+                    }
             });
 
             if (job.deduplicated) await db.run(DELETE.from(Documents).where({ ID: documentId }));
@@ -1973,7 +2031,7 @@ export function registerSubmissionHandlers(
         const metadataHash = bytesToHex(sha256(new TextEncoder().encode(metadataStr)));
         const nonce = data.nonce?.toLowerCase() ?? randomBytes(32).toString('hex');
         const commitment = await computeAttestCommitment(data.sha256.toLowerCase(), metadataHash, nonce);
-        return { commitment, nonce, metadataHash };
+        return { commitment, nonce, metadataHash, expiresAt: defaultCommitExpiry() };
     });
 
     // Guarded attest, phase 1 (async submit): record the opaque commitment
@@ -1990,9 +2048,13 @@ export function registerSubmissionHandlers(
             compiledArtifactRef?: string;
             idempotencyKey?: string;
             sponsorSessionId?: string;
+            expiresAt?: number | string;
         };
         if (!data.commitment) return req.reject(400, 'commitment is required (from prepareAnchorCommitment)');
         if (!SHA256_HEX_RE.test(data.commitment)) return req.reject(400, 'commitment must be 64 hex chars (32 bytes)');
+        const expiresAt = data.expiresAt === undefined || data.expiresAt === null || data.expiresAt === '' ? defaultCommitExpiry() : Number(data.expiresAt);
+        const expiryError = validateCommitExpiry(expiresAt);
+        if (expiryError) return req.reject(400, expiryError);
         if (!data.sessionId) return req.reject(400, 'sessionId is required');
         if (!data.contractAddress) return req.reject(400, 'contractAddress is required');
         const compiledRef = data.compiledArtifactRef && data.compiledArtifactRef.length > 0
@@ -2016,17 +2078,18 @@ export function registerSubmissionHandlers(
                     commitment: data.commitment!.toLowerCase(),
                     contractAddress: data.contractAddress,
                     compiledRef,
+                    expiresAt,
                     feeSponsor: sponsor?.sponsorSessionId ?? null
                 },
                 idempotencyPayload: {
                     commitment: data.commitment!.toLowerCase(), contractAddress: data.contractAddress,
-                    compiledRef, feeSponsor: sponsor?.sponsorSessionId ?? null
+                    compiledRef, expiresAt, feeSponsor: sponsor?.sponsorSessionId ?? null
                 },
                 requestedBy: (req as any).user?.id,
                 commandVersion: 1,
                 encryptCommand: true,
                 command: {
-                    op: 'attestCommit', commitment: data.commitment!.toLowerCase(),
+                    op: 'attestCommit', commitment: data.commitment!.toLowerCase(), expiresAt,
                     contractAddress: data.contractAddress!, compiledArtifactRef: compiledRef,
                     sponsorSessionId: sponsor?.sponsorSessionId
                 }
@@ -3973,9 +4036,20 @@ function rejectIfMainnetBlocked(req: Request): boolean {
     return false;
 }
 
-function checkRate(limiter: RateLimiter, sessionId: string, req: Request, count = 1): boolean {
+/**
+ * Rate-limit key: the PRINCIPAL first (agent grant when the request carries a
+ * token, else the user), then the caller-supplied scope (session id or
+ * contract address). The scope alone is caller input and is checked before
+ * ownership, so keyed on it alone any authenticated user could spend another
+ * user's budget by naming their session.
+ */
+function rateKey(req: Request, scope: string): string {
+    return principalRateKey(req, scope);
+}
+
+function checkRate(limiter: RateLimiter, scope: string, req: Request, count = 1): boolean {
     // checkMany is all-or-nothing: a rejected batch consumes NO budget.
-    const r = limiter.checkMany(sessionId, count);
+    const r = limiter.checkMany(rateKey(req, scope), count);
     if (!r.allowed) {
         req.reject?.(429, `Rate limited. Retry after ${Math.ceil(r.retryAfterMs / 1000)}s`);
         return false;
@@ -4036,19 +4110,6 @@ async function runSubmission(req: Request, op: () => Promise<unknown>): Promise<
             // (status, message) pair is re-wrapped by CAP and sanitised in production.
             setRetryAfter(req, err.retryAfterSeconds);
             return req.reject({ status: err.httpStatus, code: err.code, message: err.message, $sanitize: false } as any);
-        }
-        if (err instanceof SubmissionError) {
-            const c = err.classification;
-            const body = JSON.stringify({
-                code: c.code,
-                retryable: c.retryable,
-                knownIssueRef: c.knownIssueRef,
-                message: c.message,
-                submissionId: err.submissionId
-            });
-            // A retryable classification stays readable in production (same as above).
-            if (c.retryable) return req.reject({ status: 503, code: c.code, message: body, $sanitize: false } as any);
-            return req.reject(400, body);
         }
         const msg = err instanceof Error ? err.message : String(err);
         return req.reject(500, msg);

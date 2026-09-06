@@ -8,12 +8,13 @@ import { describe, test, expect, vi, beforeEach } from 'vitest';
 import cds from '@sap/cds';
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 const agentTokenAuth = require('../../srv/utils/agent-token-auth');
+const { __resetBasicAuthThrottleForTests, BASIC_AUTH_MAX_FAILURES } = require('../../srv/utils/agent-token-auth');
 
 const USERS = { nightgate: { password: 'op-secret' } };
 const basic = (u: string, p: string) => 'Basic ' + Buffer.from(`${u}:${p}`).toString('base64');
 
-function run(headers: Record<string, string>, path = '/api/v1/nightgate/sponsorFinalizedTransaction') {
-    const req: any = { headers, baseUrl: path, originalUrl: path };
+function run(headers: Record<string, string>, path = '/api/v1/nightgate/sponsorFinalizedTransaction', ip = '10.0.0.1') {
+    const req: any = { headers, baseUrl: path, originalUrl: path, ip };
     const res: any = { set: vi.fn(), status: vi.fn().mockReturnThis(), send: vi.fn() };
     const next = vi.fn();
     agentTokenAuth(req, res, next);
@@ -21,6 +22,7 @@ function run(headers: Record<string, string>, path = '/api/v1/nightgate/sponsorF
 }
 
 beforeEach(() => {
+    __resetBasicAuthThrottleForTests();
     (cds as any).env.requires = (cds as any).env.requires ?? {};
     (cds as any).env.requires.auth = { impl: 'x', users: USERS };
 });
@@ -79,6 +81,18 @@ describe('agent-token-auth', () => {
         }
     });
 
+    test('$batch is admitted under the marker principal; the grant hook authenticates every part', () => {
+        for (const path of ['/api/v1/nightgate/$batch', '/api/v1/nightgate/$batch?x=1']) {
+            const { req, next } = run({ 'x-agent-token': 'ngat_abc' }, path);
+            expect(next, path).toHaveBeenCalled();
+            // never an authenticated user: the hook swaps in the operator or 401s
+            expect(req.user.id).toBe(agentTokenAuth.AGENT_TOKEN_TRANSPORT_USER);
+        }
+        const ok = run({ authorization: basic('nightgate', 'op-secret') }, '/api/v1/nightgate/$batch');
+        expect(ok.next).toHaveBeenCalled();
+        expect(ok.req.user.id).toBe('nightgate');
+    });
+
     test('an empty token header does not open the lane', () => {
         const { res, next } = run({ 'x-agent-token': '' });
         expect(next).not.toHaveBeenCalled();
@@ -105,5 +119,19 @@ describe('agent-token-auth', () => {
             const { next } = run({ 'x-agent-token': 'ngat_abc' }, path);
             expect(next, path).toHaveBeenCalled();
         }
+    });
+
+    test('failed basic-auth attempts are throttled per client address, the correct password included', () => {
+        for (let i = 0; i < BASIC_AUTH_MAX_FAILURES; i++) {
+            const { res } = run({ authorization: basic('nightgate', 'wrong-' + i) }, '/api/v1/admin/x');
+            expect(res.status).toHaveBeenCalledWith(401);
+        }
+        const locked = run({ authorization: basic('nightgate', 'op-secret') }, '/api/v1/admin/x');
+        expect(locked.next).not.toHaveBeenCalled();
+        expect(locked.res.status).toHaveBeenCalledWith(429);
+        expect(locked.res.set).toHaveBeenCalledWith('Retry-After', expect.stringMatching(/^\d+$/));
+        // another address is unaffected
+        const other = run({ authorization: basic('nightgate', 'op-secret') }, '/api/v1/admin/x', '10.0.0.2');
+        expect(other.next).toHaveBeenCalled();
     });
 });

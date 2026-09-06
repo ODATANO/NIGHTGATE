@@ -36,10 +36,7 @@ import { walletWaitForSyncedState } from '../midnight/wallet-worker-client';
  * a sponsor still behind at the cap is logged and the loop moves on.
  */
 export function prewarmSyncBudgetMs(env: NodeJS.ProcessEnv = process.env): number {
-    const raw = env.NIGHTGATE_SPONSOR_PREWARM_SYNC_MS;
-    if (raw === undefined || raw === '') return 30 * 60 * 1000;
-    const n = Number(raw);
-    return Number.isFinite(n) && n >= 0 ? n : 30 * 60 * 1000;
+    return configNumberFrom('NIGHTGATE_SPONSOR_PREWARM_SYNC_MS', env);
 }
 
 /**
@@ -76,6 +73,7 @@ export interface ResolvedFeeSponsor {
  */
 export { getConfiguredFeeSponsorSessions } from '../utils/session-expiry';
 import { getConfiguredFeeSponsorSessions, isSessionExpired } from '../utils/session-expiry';
+import { configNumberFrom } from '../utils/config';
 
 export interface ResolveFeeSponsorOptions {
     /** DB handle (tests inject a minimal `{ run }`). */
