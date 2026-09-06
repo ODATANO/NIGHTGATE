@@ -35,7 +35,12 @@ shape an x402-style pay-per-call gate wants.
 ## Install
 
 If you only want to BUILD transactions, install the slim companion instead: it
-is the same code, packaged on its own, under 1 MB instead of 81 MB.
+is the same code, packaged on its own, under 1 MB.
+
+Version pairing: the SDK ships the vault modules it builds calls for, so it
+follows the vault lineage. `@odatano/nightgate-tx` 0.5.0 or newer builds
+lineage-3 calls (server 0.23 and later, vaults redeployed with it); 0.4.x
+builds lineage-2 calls and fails against a lineage-3 vault.
 
 ```bash
 npm install @odatano/nightgate-tx     # caller only

@@ -1,5 +1,9 @@
 # @odatano/nightgate-tx
 
+[![npm](https://img.shields.io/npm/v/@odatano/nightgate-tx)](https://www.npmjs.com/package/@odatano/nightgate-tx)
+[![npm downloads](https://img.shields.io/npm/dt/@odatano/nightgate-tx?logo=npm&label=downloads&color=blue)](https://www.npmjs.com/package/@odatano/nightgate-tx)
+[![License](https://img.shields.io/badge/license-Apache--2.0-yellow)](LICENSE)
+
 The NIGHTGATE client SDK: everything a hosted NIGHTGATE can do, as functions.
 Verify ZK attestations, ingest documents, prove field predicates, manage
 disclosure, sponsor fees, and build transactions **on your own machine with

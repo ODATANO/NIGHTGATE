@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.23.1 - 2026-09-06
+
+`@odatano/nightgate-tx` 0.5.0, the caller-side companion of 0.23.0. The
+server release carried the generated package at 0.4.5, which builds
+lineage-2 vault calls.
+
+- **nightgate-tx 0.5.0 (BREAKING).** Ships the lineage-3 vault modules
+  (`attestation-vault`, `attestation-vault-32`); `prepareAttestCommit` takes
+  `expiresAt` and `prepareAttestReveal` emits the five-argument
+  `attestGuarded`, so a 0.4.x caller fails against a redeployed vault. The
+  witness builder and hex codec are the shared `src/browser` sources; the
+  zk-asset fetch accepts gzip-encoded responses; `prepublishOnly` refuses a
+  stale generated tree.
+- Image tag `0.23.1`; no server code change.
+
 ## 0.23.0 - 2026-09-05
 
 Hardening release across the whole server: authentication, submission

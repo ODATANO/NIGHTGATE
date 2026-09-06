@@ -8,6 +8,8 @@
 [![Coverage](https://img.shields.io/codecov/c/github/ODATANO/NIGHTGATE)](https://codecov.io/gh/ODATANO/NIGHTGATE)
 [![npm](https://img.shields.io/npm/v/@odatano/nightgate)](https://www.npmjs.com/package/@odatano/nightgate)
 [![npm downloads](https://img.shields.io/npm/dt/@odatano/nightgate?logo=npm&label=downloads&color=blue)](https://www.npmjs.com/package/@odatano/nightgate)
+[![npm nightgate-tx](https://img.shields.io/npm/v/@odatano/nightgate-tx?label=nightgate-tx)](https://www.npmjs.com/package/@odatano/nightgate-tx)
+[![nightgate-tx downloads](https://img.shields.io/npm/dt/@odatano/nightgate-tx?logo=npm&label=nightgate-tx%20downloads&color=blue)](https://www.npmjs.com/package/@odatano/nightgate-tx)
 [![SAP CAP](https://img.shields.io/badge/SAP%20CAP-%40sap%2Fcds%20%5E10-0faaff?logo=sap)](https://cap.cloud.sap/)
 [![License](https://img.shields.io/badge/license-Apache--2.0-yellow)](LICENSE)
 
