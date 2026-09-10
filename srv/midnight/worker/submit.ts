@@ -13,7 +13,8 @@ import { classifySubmitFailure, isPreMempoolFailure } from '../submit-error-clas
 import path from 'node:path';
 import { classificationHaystack, formatErr, formatErrWithCauses, safeDeepInspect } from '../../utils/format-error';
 import { type MessagePort } from 'node:worker_threads';
-import { FacadeEntry, loadSdk, loadSubmissionSdk, log, loadLedger } from './context';
+import { FacadeEntry, loadSdk, loadNodeClientSdk, log, loadLedger } from './context';
+import { createPhasedSubmitService, createSdkNodeAdapter, submitPhaseOf, type PhasedSubmitService } from './phased-submit';
 import { BALANCE_SYNC_TIMEOUT_MS, applySaveAck, pushStateSaveAcked, restoreSaveAckTimeoutMs, waitForGenuineSync } from './facades';
 
 export function describeTxDust(tx: any): { summary: string; emptyDustActions: boolean } {
@@ -320,6 +321,8 @@ export interface BoundSubmitIntent {
     contractAddress?: string;
     circuits?: string[];
     note?: string;
+    /** Set by the balancing provider: the ttl it balanced with (ISO). */
+    ttl?: string;
 }
 
 export async function submitWithDustGuard(entry: FacadeEntry, tx: any, site: string, intent?: BoundSubmitIntent): Promise<any> {
@@ -330,7 +333,7 @@ export async function submitWithDustGuard(entry: FacadeEntry, tx: any, site: str
             if (typeof tx?.identifiers !== 'function') throw new Error(`${site}: transaction exposes no identifiers(); refusing to broadcast unannounced`);
             await announceSubmitIntent(intent.replyPort, {
                 txHash: String(tx.identifiers().at(-1)),
-                contractAddress: intent.contractAddress, circuits: intent.circuits, note: intent.note
+                contractAddress: intent.contractAddress, circuits: intent.circuits, note: intent.note, ttl: intent.ttl
             });
         } catch (e) {
             // Not broadcast: free the booked spends and the dust as a pre-mempool
@@ -385,21 +388,36 @@ export async function submitWithDustGuard(entry: FacadeEntry, tx: any, site: str
 // double submit is possible).
 export let SUBMIT_CLIENT_POOL_MAX = 8;
 export const SUBMIT_CLIENT_SETTLE_MS = 2500;
+/** Bound on closing an abandoned client: its SDK close waits for the client's own initialisation, which may be what hung. */
+export const SUBMIT_CLOSE_TIMEOUT_MS = 5000;
 export type SubmitClientSlot = { svc: any; busy: Promise<unknown> | null; readyAt: number };
 export const submitClientPools = new Map<string, SubmitClientSlot[]>();
 export const submitClientWaiters = new Map<string, number>(); // callers currently acquiring, per relay
-// Test seams: cap + pool introspection (the cap is a constant in production).
+export type SubmitServiceFactory = (relayURL: URL) => Promise<PhasedSubmitService> | PhasedSubmitService;
+/**
+ * A pool slot's client: the phased submit service over the SDK's node client
+ * (`phased-submit.ts`), created lazily so the connect phase covers the
+ * client's own initialisation.
+ */
+const defaultSubmitServiceFactory: SubmitServiceFactory = (relayURL) => createPhasedSubmitService({
+    adapter: () => createSdkNodeAdapter(relayURL, { connectTimeoutMs: SUBMIT_CONNECT_TIMEOUT_MS, sdk: loadNodeClientSdk }),
+    timeouts: { connectMs: SUBMIT_CONNECT_TIMEOUT_MS, requestMs: SUBMIT_REQUEST_TIMEOUT_MS, watchMs: SUBMIT_WATCH_TIMEOUT_MS, closeMs: SUBMIT_CLOSE_TIMEOUT_MS, lateGraceMs: SUBMIT_LATE_GRACE_MS }
+});
+let submitServiceFactory: SubmitServiceFactory = defaultSubmitServiceFactory;
+// Test seams: cap + pool introspection (the cap is a constant in production),
+// and the service factory (the unit suites inject fakes below the phases).
 export const __submitClientPoolForTests = {
     setMax: (n: number) => { SUBMIT_CLIENT_POOL_MAX = n; },
     size: (relayURL: URL) => submitClientPools.get(relayURL.toString())?.length ?? 0,
-    reset: () => submitClientPools.clear()
+    reset: () => submitClientPools.clear(),
+    setServiceFactory: (factory: SubmitServiceFactory | null) => { submitServiceFactory = factory ?? defaultSubmitServiceFactory; }
 };
 
 export class SubmitWatchTimeoutError extends Error {
     constructor(ms: number) { super(`submit watch timed out after ${ms}ms without a Finalized status`); this.name = 'SubmitWatchTimeoutError'; }
 }
 
-export async function withDedicatedSubmitClient<T>(relayURL: URL, fn: (svc: any) => Promise<T>, opts: { abandonAfterMs?: number } = {}): Promise<T> {
+export async function withDedicatedSubmitClient<T>(relayURL: URL, fn: (svc: any) => Promise<T>, opts: { abandonAfterMs?: number; label?: string } = {}): Promise<T> {
     const key = relayURL.toString();
     let pool = submitClientPools.get(key);
     if (!pool) { pool = []; submitClientPools.set(key, pool); }
@@ -421,8 +439,7 @@ export async function withDedicatedSubmitClient<T>(relayURL: URL, fn: (svc: any)
                 const created: SubmitClientSlot = { svc: null, busy: null, readyAt: Number.POSITIVE_INFINITY };
                 pool.push(created);
                 try {
-                    const caps: any = await loadSubmissionSdk();
-                    created.svc = caps.makeDefaultSubmissionService({ relayURL });
+                    created.svc = await submitServiceFactory(relayURL);
                     created.readyAt = Date.now() + SUBMIT_CLIENT_SETTLE_MS;
                 } catch (e) {
                     pool.splice(pool.indexOf(created), 1);
@@ -445,24 +462,52 @@ export async function withDedicatedSubmitClient<T>(relayURL: URL, fn: (svc: any)
     }
     const run = fn(slot.svc);
     slot.busy = run.catch(() => undefined);
+    const label = opts.label ?? 'submit';
+    // Evict a slot whose client state is unknown: the socket/subscription may
+    // be dead or half-open. The close is BOUNDED: the SDK's close waits for the
+    // client's own initialisation, and a hung initialisation is one of the
+    // states this handles; it must not hang the failure path itself.
+    const evict = async (): Promise<void> => {
+        const idx = pool!.indexOf(slot!);
+        if (idx >= 0) pool!.splice(idx, 1);
+        await Promise.race([
+            Promise.resolve().then(() => slot!.svc?.close?.()).catch(() => undefined),
+            new Promise<void>((r) => setTimeout(r, SUBMIT_CLOSE_TIMEOUT_MS))
+        ]);
+        slot!.busy = null;
+    };
     if (!opts.abandonAfterMs) {
-        try { return await run; } finally { slot.busy = null; slot.readyAt = Date.now() + SUBMIT_CLIENT_SETTLE_MS; }
+        try {
+            return await run;
+        } catch (e) {
+            // connect: nothing sent, the next attempt gets a fresh client.
+            // request/watch: the client keeps listening for a late outcome;
+            // no new submit may ride on that socket.
+            if (submitPhaseOf(e) !== null) await evict();
+            throw e;
+        } finally {
+            if (pool.includes(slot)) { slot.busy = null; slot.readyAt = Date.now() + SUBMIT_CLIENT_SETTLE_MS; }
+        }
     }
-    // WATCHDOG: a submitAndWatch whose socket died mid-watch never resolves
-    // (the SDK client has no auto-reconnect after its own disconnect()). Do
-    // not let that pin the job until the TTL: abandon the call, EVICT the slot
-    // (its socket/subscription state is unknown) and let the caller decide via
-    // the indexer whether the transaction is on-chain.
+    // BACKSTOP: the phased service bounds every phase itself; this outer
+    // watchdog only catches a service that does not return within the whole
+    // budget (a hung close inside the SDK, a fake without phases). Abandon
+    // the call, EVICT the slot and let the caller decide via the indexer.
     let timer: NodeJS.Timeout | undefined;
     const timeout = new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new SubmitWatchTimeoutError(opts.abandonAfterMs!)), opts.abandonAfterMs); });
     try {
         return await Promise.race([run, timeout]);
     } catch (e) {
         if (e instanceof SubmitWatchTimeoutError) {
-            const idx = pool.indexOf(slot);
-            if (idx >= 0) pool.splice(idx, 1);
-            try { await slot.svc?.close?.(); } catch { /* best effort */ }
-            slot.busy = null;
+            // A late outcome of the abandoned call is evidence for the next
+            // incident; log it under the same label instead of dropping it.
+            void run.then(
+                () => log('warn', `${label}: submit resolved ${'after'} the ${opts.abandonAfterMs}ms backstop had abandoned it (the transaction reached the node; the confirmer resolves the job)`),
+                (err) => log('warn', `${label}: submit failed after the ${opts.abandonAfterMs}ms backstop had abandoned it: ${formatErrWithCauses(err).slice(0, 400)}`)
+            );
+            await evict();
+        } else if (submitPhaseOf(e) !== null) {
+            await evict();
         }
         throw e;
     } finally {
@@ -510,11 +555,22 @@ export class SponsoredCallNotAppliedError extends Error {
 export function assertApplied(found: { height: string; status: string | null; failedSegments: number[] }, identifier: string): void {
     if (found.status && found.status !== 'SUCCESS') throw new SponsoredCallNotAppliedError(identifier, found.height, found.status, found.failedSegments);
 }
-// 60 s by default: a healthy submit sees Finalized well within that on preprod;
-// anything slower is answered by the indexer lookup (the tx landed) or by a
-// rebuild (it did not), instead of a watch that may never return.
+// 75 s by default: a healthy submit sees InBlock/Finalized well within that on
+// preprod; anything slower is answered by the indexer lookup (the tx landed)
+// or parked for the confirmer (it did not), instead of a watch that may never
+// return. The value stays ABOVE the node client's own 60 s request timeout
+// (polkadot-js WsProvider, `No response received from RPC endpoint in 60s`):
+// a send the node never answers then fails with that message, which is a
+// different finding from this watch timeout (the node answered the request
+// and nothing was included). At 60 s the two were indistinguishable: this
+// timer starts before the request and won every race.
 export const SUBMIT_WATCH_TIMEOUT_MS = configMs('NIGHTGATE_SUBMIT_WATCH_TIMEOUT_MS');
+export const SUBMIT_CONNECT_TIMEOUT_MS = configMs('NIGHTGATE_SUBMIT_CONNECT_TIMEOUT_MS');
+export const SUBMIT_REQUEST_TIMEOUT_MS = configMs('NIGHTGATE_SUBMIT_REQUEST_TIMEOUT_MS');
+export const SUBMIT_LATE_GRACE_MS = configMs('NIGHTGATE_SUBMIT_LATE_GRACE_MS');
 export const SUBMIT_WATCH_CONFIRM_MS = 90_000;
+/** The outer backstop of a dedicated-client submit: every phase budget plus room for the phased service's own bookkeeping. */
+export function submitBackstopMs(): number { return SUBMIT_CONNECT_TIMEOUT_MS + SUBMIT_REQUEST_TIMEOUT_MS + SUBMIT_WATCH_TIMEOUT_MS + Math.min(10_000, SUBMIT_WATCH_TIMEOUT_MS); }
 // Which submission stage the unbound sponsor path waits for. 'Finalized' is
 // what the facade waits for; 'InBlock' returns as soon as the transaction is
 // in a block (measured preprod: ~12-18 s earlier per transaction). The job's
@@ -564,6 +620,12 @@ export interface SubmitIntent {
     sponsorAccountId?: string;
     /** Addresses of contract deploy actions in the tx; the main thread reserves the grant's deploy budget on them before acking. */
     deployed?: string[];
+    /**
+     * End of the transaction's validity window (ISO). A block with a later
+     * timestamp can never include it, so a job parked on this identifier is
+     * provably not on chain once the indexer tip is past it.
+     */
+    ttl?: string;
 }
 export async function announceSubmitIntent(port: MessagePort | undefined, intent: SubmitIntent): Promise<void> {
     if (!port) return;
@@ -602,7 +664,7 @@ export async function submitOnDedicatedClient(entry: FacadeEntry, tx: any, site:
     const identifier = String(tx.identifiers().at(-1));
     for (let attempt = 0; ; attempt++) {
         try {
-            await withDedicatedSubmitClient(relayURL, (svc) => svc.submitTransaction(tx, SPONSOR_SUBMIT_WAIT), { abandonAfterMs: SUBMIT_WATCH_TIMEOUT_MS });
+            await withDedicatedSubmitClient(relayURL, (svc) => svc.submitTransaction(tx, SPONSOR_SUBMIT_WAIT, { identifier, correlation: site }), { abandonAfterMs: submitBackstopMs(), label: `${site} ${identifier.slice(0, 16)}` });
             if (SPONSOR_SUBMIT_WAIT === 'InBlock') await waitIndexerVisible(entry.indexerHttpUrl, identifier, site);
             return identifier;
         } catch (e) {
@@ -610,7 +672,12 @@ export async function submitOnDedicatedClient(entry: FacadeEntry, tx: any, site:
                 log('warn', `${site}: submit request died on the client's own closing socket (SDK disconnect lag); retrying once on a settled client`);
                 continue;
             }
-            if (e instanceof SubmitWatchTimeoutError) {
+            if (attempt === 0 && submitPhaseOf(e) === 'connect') {
+                // Nothing was sent: a fresh client (the slot was evicted) once.
+                log('warn', `${site}: submit connect phase failed, nothing sent; retrying once on a fresh client: ${formatErr(e).slice(0, 200)}`);
+                continue;
+            }
+            if (e instanceof SubmitWatchTimeoutError || submitPhaseOf(e) === 'watch' || submitPhaseOf(e) === 'request') {
                 // The watch is gone, the transaction may well be on-chain (live:
                 // a watch that never saw Finalized while the block was final for
                 // minutes). Ask the indexer for up to SUBMIT_WATCH_CONFIRM_MS
@@ -619,14 +686,15 @@ export async function submitOnDedicatedClient(entry: FacadeEntry, tx: any, site:
                 for (;;) {
                     const found = await indexerBlockOfIdentifier(entry.indexerHttpUrl, identifier);
                     if (found) {
-                        log('info', `${site}: no Finalized within ${SUBMIT_WATCH_TIMEOUT_MS}ms, indexer has the transaction in block ${found.height} (${found.status ?? 'status n/a'}); landed`);
+                        log('info', `${site}: no ${SPONSOR_SUBMIT_WAIT} status from the watch, indexer has the transaction in block ${found.height} (${found.status ?? 'status n/a'}); landed`);
                         assertApplied(found, identifier);
                         return identifier;
                     }
                     if (Date.now() >= deadline) break;
                     await new Promise((r) => setTimeout(r, 10_000));
                 }
-                log('warn', `${site}: submit watch timed out and the indexer does not know the transaction ${identifier.slice(0, 16)} after ${SUBMIT_WATCH_CONFIRM_MS}ms; failing for a rebuild`);
+                const phase = submitPhaseOf(e);
+                log('warn', `${site}: ${phase === 'request' ? 'no status from the node after the send' : 'submit watch timed out'} and the indexer does not know the transaction ${identifier.slice(0, 16)} after ${SUBMIT_WATCH_CONFIRM_MS}ms; leaving it to the confirmer${phase ? '' : ' (backstop timeout, no phase information)'}`);
                 throw e;
             }
             log('info', `${site}: submit failed (${isPreMempoolReject(e) ? 'pre-mempool reject' : 'not pre-mempool'}; no dust guard on this path): ${safeDeepInspect(e, 512).slice(0, 600)}`);
@@ -653,6 +721,7 @@ export function buildWorkerWalletProvider(entry: FacadeEntry, intent?: BoundSubm
             // Arm the dust-wedge protection BEFORE the build books the spend.
             await captureDustSnapshot(entry, 'balance');
             const effectiveTtl = ttl ?? new Date(Date.now() + 60 * 60 * 1000);
+            if (intent) intent.ttl = effectiveTtl.toISOString();
             const recipe = await entry.facade.balanceUnboundTransaction(
                 tx,
                 { shieldedSecretKeys: entry.zswapKeys, dustSecretKey: entry.dustKey },
@@ -744,6 +813,7 @@ export function buildSponsoredWalletProvider(caller: FacadeEntry, sponsor: Facad
             }
             await waitForGenuineSync(sponsor, BALANCE_SYNC_TIMEOUT_MS, 'sponsored-balance sponsor');
             const effectiveTtl = ttl ?? new Date(Date.now() + 30 * 60 * 1000);
+            if (intent) intent.ttl = effectiveTtl.toISOString();
 
             const recipe = await caller.facade.balanceUnboundTransaction(
                 tx,

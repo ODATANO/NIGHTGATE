@@ -153,7 +153,9 @@ export function isCallNotAppliedFailure(err: unknown): boolean {
 export function isPreInclusionReject(err: unknown): boolean {
     const info = classifySubmitFailure(err);
     if (info.code === 'pre-mempool-reject' || info.code === 'dust-race') return true;
-    return info.code === 'transport' && info.ledgerCode === 'closing-socket';
+    // The client's own closing socket, or a connect phase that never sent:
+    // the request never left, nothing can be on chain.
+    return info.code === 'transport' && (info.ledgerCode === 'closing-socket' || info.ledgerCode === 'not-sent');
 }
 
 /**

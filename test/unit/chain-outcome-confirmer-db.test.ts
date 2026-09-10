@@ -10,16 +10,28 @@ import { test, expect, beforeAll, beforeEach, afterEach } from 'vitest';
 import cds from '@sap/cds';
 import {
     confirmChainOutcomesViaIndexer,
+    reconcileBackgroundJobs,
     registerChainOutcomeConfirmer,
+    declareJobKind,
     __resetForTests
 } from '../../srv/submission/background-jobs';
+import { JOB_KIND_TRAITS } from '../../srv/submission/job-kinds';
+import { CHAIN_ABSENT, chainAbsent } from '../../srv/submission/chain-outcome-confirmer';
 
 cds.test(__dirname + '/../..');
 
 const BG = 'midnight.BackgroundJobs';
 let db: any;
+const GRANT_ROW = (ID: string, extra: Record<string, unknown> = {}) => ({
+    ID, userId: 'op', sessionId: '00000000-0000-4000-8000-000000000001', tokenHash: 'h'.padEnd(64, 'h'),
+    allowedActions: '[]', isActive: true, ...extra
+});
 
-beforeAll(async () => { db = await cds.connect.to('db'); });
+beforeAll(async () => {
+    db = await cds.connect.to('db');
+    // the kind table is declared at processor registration; this suite boots no processors
+    for (const [kind, traits] of Object.entries(JOB_KIND_TRAITS)) declareJobKind(kind, traits);
+});
 
 beforeEach(async () => {
     __resetForTests();
@@ -192,4 +204,143 @@ test('records the inclusion coordinates on the job and the attempt row (what a r
     const subs = Object.fromEntries((await db.run(cds.ql.SELECT.from(PS).columns('ID', 'status', 'chainBlockHeight', 'indexerTxHash'))).map((r: any) => [r.ID, r]));
     expect(subs['sub-ev']).toMatchObject({ status: 'finalized', chainBlockHeight: 2415919, indexerTxHash: '0xindexer-00id-ev' });
     expect(subs['sub-ev-recon']).toMatchObject({ status: 'finalized', chainBlockHeight: 2415920 });
+});
+
+test('a broadcast the indexer never shows ends failed/BROADCAST_NOT_INCLUDED once the tip is past its ttl; a live ttl, a lagging tip, a bookkeeping-pending row and a workflow parent stay parked', async () => {
+    const PS = 'midnight.PendingSubmissions';
+    await db.run(cds.ql.DELETE.from(PS));
+    const H = 60 * 60 * 1000;
+    const now = Date.now();
+    const lostTtl = new Date(now - 2 * H).toISOString();
+    const sub = (ID: string, txHash: string, submittedAt: number, intent: Record<string, unknown>) => ({
+        ID, txHash, contractAddress: 'c8f4'.padEnd(64, '0'), circuitName: 'attest', actionType: 'CALL',
+        submittedAt: new Date(submittedAt).toISOString(), status: 'pending', sessionId: 'sp-sess', submitIntentData: JSON.stringify(intent)
+    });
+    await db.run(cds.ql.INSERT.into(PS).entries(
+        sub('sub-lost',   '00lost',   now - 3 * H, { circuits: ['attest'], ttl: lostTtl }),
+        sub('sub-live',   '00live',   now,         { circuits: ['attest'], ttl: new Date(now + 10 * 60_000).toISOString() }),
+        sub('sub-legacy', '00legacy', now - 3 * H, { circuits: ['attest'] }),           // announced before the ttl was recorded
+        sub('sub-lag',    '00lag',    now - 3 * H, { circuits: ['attest'], ttl: new Date(now - 4 * 60_000).toISOString() }),
+        sub('sub-book',   '00book',   now - 3 * H, { circuits: ['attest'], ttl: lostTtl })
+    ));
+    await db.run(cds.ql.INSERT.into(BG).entries(
+        { ID: 'j-lost',   kind: 'sponsorUnboundTransaction', sessionId: 'sp-sess', status: 'reconciliation_required', errorCode: 'BROADCAST_UNCONFIRMED', txHash: '00lost',   submissionId: 'sub-lost' },
+        { ID: 'j-live',   kind: 'sponsorUnboundTransaction', sessionId: 'sp-sess', status: 'reconciliation_required', errorCode: 'BROADCAST_UNCONFIRMED', txHash: '00live',   submissionId: 'sub-live' },
+        { ID: 'j-legacy', kind: 'submitContractCall',        sessionId: 'sp-sess', status: 'reconciliation_required', errorCode: 'EXTERNAL_EXECUTION_FAILED', txHash: '00legacy', submissionId: 'sub-legacy' },
+        { ID: 'j-lag',    kind: 'sponsorUnboundTransaction', sessionId: 'sp-sess', status: 'reconciliation_required', errorCode: 'BROADCAST_UNCONFIRMED', txHash: '00lag',    submissionId: 'sub-lag' },
+        { ID: 'j-book',   kind: 'sponsorUnboundTransaction', sessionId: 'sp-sess', status: 'reconciliation_required', errorCode: 'REJECTED_ATTEMPT_BOOKKEEPING_PENDING', txHash: '00book', submissionId: 'sub-book' },
+        { ID: 'j-parent', kind: 'anchorDocumentGuarded',     sessionId: 'sp-sess', status: 'reconciliation_required', errorCode: 'CHILD_RECONCILIATION_REQUIRED', txHash: '00parent' }
+    ));
+    // the indexer has none of them (ABSENT, not merely unconfirmable); the answer's own tip is "now" (4 min past j-lag's ttl: inside the 5 min margin)
+    registerChainOutcomeConfirmer(async () => chainAbsent(now));
+
+    await confirmChainOutcomesViaIndexer(db);
+
+    const jobs = Object.fromEntries((await db.run(cds.ql.SELECT.from(BG).columns('ID', 'status', 'errorCode', 'errorMessage', 'chainStatus', 'finishedAt'))).map((r: any) => [r.ID, r]));
+    expect(jobs['j-lost']).toMatchObject({ status: 'failed', errorCode: 'BROADCAST_NOT_INCLUDED', chainStatus: 'dropped' });
+    expect(jobs['j-lost'].finishedAt).toBeTruthy();
+    expect(String(jobs['j-lost'].errorMessage)).toMatch(/never included/);
+    expect(jobs['j-legacy']).toMatchObject({ status: 'failed', errorCode: 'BROADCAST_NOT_INCLUDED', chainStatus: 'dropped' });
+    expect(String(jobs['j-legacy'].errorMessage)).toMatch(/assumed from the submit time/);
+    expect(jobs['j-live'].status).toBe('reconciliation_required');
+    expect(jobs['j-lag'].status).toBe('reconciliation_required');
+    expect(jobs['j-book']).toMatchObject({ status: 'reconciliation_required', errorCode: 'REJECTED_ATTEMPT_BOOKKEEPING_PENDING' });
+    expect(jobs['j-parent'].status).toBe('reconciliation_required');
+    const subs = Object.fromEntries((await db.run(cds.ql.SELECT.from(PS).columns('ID', 'status', 'errorCode', 'finalizedAt'))).map((r: any) => [r.ID, r]));
+    expect(subs['sub-lost']).toMatchObject({ status: 'failed', errorCode: 'BROADCAST_NOT_INCLUDED' });
+    expect(subs['sub-lost'].finalizedAt).toBeTruthy();
+    expect(subs['sub-live'].status).toBe('pending');
+    expect(subs['sub-lag'].status).toBe('pending');
+
+    // the margin passes: the lagging one ends too
+    registerChainOutcomeConfirmer(async () => chainAbsent(now + 6 * 60_000));
+    await confirmChainOutcomesViaIndexer(db);
+    const lag = await db.run(cds.ql.SELECT.one.from(BG).where({ ID: 'j-lag' }));
+    expect(lag).toMatchObject({ status: 'failed', errorCode: 'BROADCAST_NOT_INCLUDED' });
+});
+
+test('an indexed but not yet confirmable transaction (null lookup: unknown status, no height) is NOT absence: the job stays parked past its ttl', async () => {
+    const PS = 'midnight.PendingSubmissions';
+    await db.run(cds.ql.DELETE.from(PS));
+    const old = new Date(Date.now() - 5 * 60 * 60 * 1000).toISOString();
+    await db.run(cds.ql.INSERT.into(PS).entries(
+        { ID: 'sub-future', txHash: '00future', contractAddress: 'c8f4'.padEnd(64, '0'), circuitName: 'attest', actionType: 'CALL', submittedAt: old, status: 'pending', sessionId: 'sp-sess', submitIntentData: JSON.stringify({ circuits: ['attest'], ttl: old }) }
+    ));
+    await db.run(cds.ql.INSERT.into(BG).entries(
+        { ID: 'j-future', kind: 'sponsorUnboundTransaction', sessionId: 'sp-sess', status: 'reconciliation_required', errorCode: 'BROADCAST_UNCONFIRMED', txHash: '00future', submissionId: 'sub-future' }
+    ));
+    // the indexer HAS the transaction, with a status this build cannot classify (a future status / no block height yet)
+    registerChainOutcomeConfirmer(async () => null);
+    await confirmChainOutcomesViaIndexer(db);
+    expect(await db.run(cds.ql.SELECT.one.from(BG).where({ ID: 'j-future' }))).toMatchObject({ status: 'reconciliation_required', errorCode: 'BROADCAST_UNCONFIRMED' });
+    expect((await db.run(cds.ql.SELECT.one.from(PS).where({ ID: 'sub-future' }))).status).toBe('pending');
+});
+
+test("a lost sponsored DEPLOY refunds the grant's deploy reservation exactly once", async () => {
+    const PS = 'midnight.PendingSubmissions';
+    const AG = 'midnight.AgentGrants';
+    await db.run(cds.ql.DELETE.from(PS));
+    await db.run(cds.ql.DELETE.from(AG).where({ ID: 'grant-deploy' }));
+    await db.run(cds.ql.INSERT.into(AG).entries(GRANT_ROW('grant-deploy', { allowDeploy: true, maxDeploys: 1, deploysUsed: 1 })));
+    const old = new Date(Date.now() - 5 * 60 * 60 * 1000).toISOString();
+    await db.run(cds.ql.INSERT.into(PS).entries(
+        { ID: 'sub-deploy', txHash: '00deploy', contractAddress: null, circuitName: null, actionType: 'DEPLOY', submittedAt: old, status: 'pending', sessionId: 'sp-sess',
+          submitIntentData: JSON.stringify({ circuits: [], deployed: ['d1'.padEnd(64, '0')], deployReservation: { grantId: 'grant-deploy', count: 1 }, ttl: old }) }
+    ));
+    await db.run(cds.ql.INSERT.into(BG).entries(
+        { ID: 'j-deploy', kind: 'sponsorUnboundTransaction', sessionId: 'sp-sess', status: 'reconciliation_required', errorCode: 'BROADCAST_UNCONFIRMED', txHash: '00deploy', submissionId: 'sub-deploy' }
+    ));
+    registerChainOutcomeConfirmer(async () => chainAbsent(Date.now()));
+    await confirmChainOutcomesViaIndexer(db);
+    expect(await db.run(cds.ql.SELECT.one.from(BG).where({ ID: 'j-deploy' }))).toMatchObject({ status: 'failed', errorCode: 'BROADCAST_NOT_INCLUDED' });
+    expect((await db.run(cds.ql.SELECT.one.from(AG).where({ ID: 'grant-deploy' }))).deploysUsed).toBe(0); // the budget is free again
+    // a second pass changes nothing (the row is closed, the job is terminal)
+    await confirmChainOutcomesViaIndexer(db);
+    expect((await db.run(cds.ql.SELECT.one.from(AG).where({ ID: 'grant-deploy' }))).deploysUsed).toBe(0);
+});
+
+test('a workflow parent whose child broadcast was lost ends failed/CHILD_FAILED instead of staying parked', async () => {
+    const PS = 'midnight.PendingSubmissions';
+    await db.run(cds.ql.DELETE.from(PS));
+    const old = new Date(Date.now() - 5 * 60 * 60 * 1000).toISOString();
+    await db.run(cds.ql.INSERT.into(PS).entries(
+        { ID: 'sub-child', txHash: '00child', contractAddress: 'c8f4'.padEnd(64, '0'), circuitName: 'anchorReveal', actionType: 'CALL', submittedAt: old, status: 'pending', sessionId: 'sp-sess', submitIntentData: JSON.stringify({ channel: 'bound', circuits: ['anchorReveal'], ttl: old }) }
+    ));
+    await db.run(cds.ql.INSERT.into(BG).entries(
+        { ID: 'j-parent2', kind: 'anchorDocumentGuarded', sessionId: 'sp-sess', status: 'reconciliation_required', errorCode: 'CHILD_RECONCILIATION_REQUIRED' },
+        { ID: 'j-commit',  kind: 'anchorCommit', sessionId: 'sp-sess', status: 'succeeded', parentJobId: 'j-parent2', workflowStep: 'commit', txHash: '00commit' },
+        { ID: 'j-reveal',  kind: 'anchorReveal', sessionId: 'sp-sess', status: 'reconciliation_required', errorCode: 'BROADCAST_UNCONFIRMED', parentJobId: 'j-parent2', workflowStep: 'reveal', txHash: '00child', submissionId: 'sub-child' }
+    ));
+    registerChainOutcomeConfirmer(async (txHash: string) => txHash === '00child' ? chainAbsent(Date.now()) : { status: 'success', blockHeight: 1 });
+    await confirmChainOutcomesViaIndexer(db);
+    expect(await db.run(cds.ql.SELECT.one.from(BG).where({ ID: 'j-reveal' }))).toMatchObject({ status: 'failed', errorCode: 'BROADCAST_NOT_INCLUDED' });
+    // the parent reconciler propagates the terminal child failure
+    await reconcileBackgroundJobs(db);
+    const parent = await db.run(cds.ql.SELECT.one.from(BG).where({ ID: 'j-parent2' }));
+    expect(parent).toMatchObject({ status: 'failed', errorCode: 'CHILD_FAILED' });
+    expect(String(parent.errorMessage)).toMatch(/step 'reveal'.*BROADCAST_NOT_INCLUDED/);
+    expect(String(parent.errorMessage)).toMatch(/already on chain: commit/);
+    expect(parent.finishedAt).toBeTruthy();
+});
+
+test('an absence whose answer carried no tip gives no verdict: the never-indexed broadcast stays parked', async () => {
+    const PS = 'midnight.PendingSubmissions';
+    await db.run(cds.ql.DELETE.from(PS));
+    const old = new Date(Date.now() - 5 * 60 * 60 * 1000).toISOString();
+    await db.run(cds.ql.INSERT.into(PS).entries(
+        { ID: 'sub-notip', txHash: '00notip', contractAddress: 'c8f4'.padEnd(64, '0'), circuitName: 'attest', actionType: 'CALL', submittedAt: old, status: 'pending', sessionId: 'sp-sess', submitIntentData: JSON.stringify({ circuits: ['attest'], ttl: old }) }
+    ));
+    await db.run(cds.ql.INSERT.into(BG).entries(
+        { ID: 'j-notip', kind: 'sponsorUnboundTransaction', sessionId: 'sp-sess', status: 'reconciliation_required', errorCode: 'BROADCAST_UNCONFIRMED', txHash: '00notip', submissionId: 'sub-notip' }
+    ));
+    registerChainOutcomeConfirmer(async () => CHAIN_ABSENT);
+    await confirmChainOutcomesViaIndexer(db);
+    expect((await db.run(cds.ql.SELECT.one.from(BG).where({ ID: 'j-notip' }))).status).toBe('reconciliation_required');
+    registerChainOutcomeConfirmer(async () => chainAbsent(null));
+    await confirmChainOutcomesViaIndexer(db);
+    expect((await db.run(cds.ql.SELECT.one.from(BG).where({ ID: 'j-notip' }))).status).toBe('reconciliation_required');
+    // and a tip that is NOT past the ttl + margin (a lagging replica answered) keeps it parked too
+    registerChainOutcomeConfirmer(async () => chainAbsent(Date.parse(old) + 60_000));
+    await confirmChainOutcomesViaIndexer(db);
+    expect((await db.run(cds.ql.SELECT.one.from(BG).where({ ID: 'j-notip' }))).status).toBe('reconciliation_required');
 });

@@ -112,9 +112,29 @@ describe('docker/entrypoint.sh', () => {
     it('runs node as PID 1 (exec node ...), never through npx/sh, so docker stop reaches the server', () => {
         const sh = fs.readFileSync(path.resolve(__dirname, '../../docker/entrypoint.sh'), 'utf8');
         const execLines = sh.split('\n').filter(l => /^\s*exec\s/.test(l));
-        expect(execLines.some(l => /^\s*exec node \S*@sap\/cds\/bin\/serve\.js/.test(l))).toBe(true);
+        expect(execLines.some(l => /^\s*exec node (\$NODE_FLAGS )?\S*@sap\/cds\/bin\/serve\.js/.test(l))).toBe(true);
         expect(execLines.some(l => /exec\s+npx/.test(l))).toBe(false);
         expect(sh.includes('\r')).toBe(false);   // a CRLF entrypoint dies with "bash\r: No such file"
+    });
+});
+
+describe('docker/entrypoint.sh node flags', () => {
+    const sh = fs.readFileSync(path.resolve(__dirname, '../../docker/entrypoint.sh'), 'utf8');
+
+    it('passes --no-concurrent-recompilation to node by default; NIGHTGATE_NODE_FLAGS overrides, an empty value passes nothing', () => {
+        // ${VAR-default}: unset -> default, set (even empty) -> the value. A
+        // ${VAR:-default} would silently re-enable the flag on an empty override.
+        expect(sh).toMatch(/NODE_FLAGS="\$\{NIGHTGATE_NODE_FLAGS---no-concurrent-recompilation\}"/);
+        expect(sh).toMatch(/^\s*exec node \$NODE_FLAGS \/app\/node_modules\/@sap\/cds\/bin\/serve\.js\s*$/m);
+    });
+
+    it('node takes the flag on the command line only, NODE_OPTIONS refuses it', () => {
+        const ok = spawnSync(process.execPath, ['--no-concurrent-recompilation', '-e', 'process.stdout.write("ok")'], { encoding: 'utf8' });
+        expect(ok.status).toBe(0);
+        expect(ok.stdout).toBe('ok');
+        const bad = spawnSync(process.execPath, ['-e', '0'], { encoding: 'utf8', env: { ...process.env, NODE_OPTIONS: '--no-concurrent-recompilation' } });
+        expect(bad.status).not.toBe(0);
+        expect(bad.stderr).toMatch(/not allowed in NODE_OPTIONS/);
     });
 });
 

@@ -616,6 +616,23 @@ describe('startJob: insert row + return jobId', () => {
         });
     });
 
+    test('parks an ambiguous submit (no node status, not on the indexer) under BROADCAST_UNCONFIRMED, not the failure code', async () => {
+        const ret = await startJob({
+            kind: 'sponsorUnboundTransaction', sessionId: 'sess-1', request: {},
+            work: async () => {
+                await reportExternalExecution({ submissionId: 'sub-unconfirmed' });
+                await reportExternalSubmission({ submissionId: 'sub-unconfirmed', txHash: '00unconfirmed' });
+                // what the worker RPC delivers: the classified ambiguous outcome (worker code `ambiguous` -> SubmitAmbiguous)
+                const message = 'submit watch timed out after 75000ms without a Finalized status';
+                throw Object.assign(new Error(message), { classification: { code: 'SubmitAmbiguous', retryable: false, message } });
+            }
+        });
+        await flushSpawn();
+        const row = rows.get(ret.jobId)!;
+        expect(row).toMatchObject({ status: 'reconciliation_required', errorCode: 'BROADCAST_UNCONFIRMED', txHash: '00unconfirmed' });
+        expect(String(row.errorMessage)).toMatch(/BROADCAST_NOT_INCLUDED/);
+    });
+
     test('resolves a reconciliation job from the indexer confirmer and records the inclusion coordinates', async () => {
         const ret = await startJob({
             kind: 'deployContract', sessionId: 'sess-1', request: {},

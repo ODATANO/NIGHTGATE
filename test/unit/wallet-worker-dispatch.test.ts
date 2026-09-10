@@ -49,6 +49,9 @@ vi.mock('node:worker_threads', async () => {
 // 4 min default, so the watchdog test runs in seconds while every other
 // submit in this file resolves well within it.
 process.env.NIGHTGATE_SUBMIT_WATCH_TIMEOUT_MS = '3000';
+// The fakes below have no phases; the outer backstop (connect + request + watch + min(10 s, watch)) is what bounds a hung fake.
+process.env.NIGHTGATE_SUBMIT_CONNECT_TIMEOUT_MS = '500';
+process.env.NIGHTGATE_SUBMIT_REQUEST_TIMEOUT_MS = '500';
 // The post-InBlock indexer-visibility wait is 0 in this file (the fake indexer
 // never knows a tx); the wait itself is covered by the watchdog test, which
 // stubs an indexer that DOES know the tx.
@@ -343,6 +346,10 @@ beforeAll(async () => {
         return makeFakeFacade();
     });
     workerExports = await import('../../srv/midnight/wallet-worker.js');
+    // The pool's real client is the phased submit service over the SDK node
+    // client (phased-submit.test.ts covers its phases); this suite injects the
+    // plain `{ submitTransaction, close }` fakes below the phases.
+    workerExports.__submitClientPoolForTests.setServiceFactory((relayURL: URL) => makeDefaultSubmissionService({ relayURL }));
 });
 
 beforeEach(() => {

@@ -379,10 +379,11 @@ export const __noteLeaseForTests = { tryLockBacking, sufficientNoteOnBacking, re
 export async function sponsorAndSubmitFinalized(sponsor: FacadeEntry, rehydrated: any, site: string, replyPort?: MessagePort, calls?: Array<{ address: string; entryPoint: string }>): Promise<string> {
     await waitForGenuineSync(sponsor, BALANCE_SYNC_TIMEOUT_MS, `${site} sponsor`);
     await captureDustSnapshot(sponsor, `${site} sponsor`);
+    const sponsorTtl = new Date(Date.now() + 30 * 60 * 1000);
     const sponsorRecipe = await sponsor.facade.balanceFinalizedTransaction(
         rehydrated,
         { shieldedSecretKeys: sponsor.zswapKeys, dustSecretKey: sponsor.dustKey },
-        { ttl: new Date(Date.now() + 30 * 60 * 1000), tokenKindsToBalance: ['dust'] }
+        { ttl: sponsorTtl, tokenKindsToBalance: ['dust'] }
     );
     const finalized = await sponsor.facade.finalizeRecipe(sponsorRecipe);
     // Same external-effect boundary as the unbound path: the identifier is
@@ -391,7 +392,8 @@ export async function sponsorAndSubmitFinalized(sponsor: FacadeEntry, rehydrated
         await announceSubmitIntent(replyPort, {
             txHash: String(finalized.identifiers().at(-1)),
             contractAddress: calls?.[0]?.address, circuits: calls?.map(c => c.entryPoint), sponsorAccountId: sponsor.sessionId,
-            deployed: calls?.filter(c => c.entryPoint === DEPLOY_ENTRY_POINT).map(c => c.address) ?? []
+            deployed: calls?.filter(c => c.entryPoint === DEPLOY_ENTRY_POINT).map(c => c.address) ?? [],
+            ttl: sponsorTtl.toISOString()
         });
     } catch (e) {
         await revertRecipeBestEffort(sponsor.facade, finalized, `${site} sponsor-intent`);
@@ -673,7 +675,10 @@ export async function sponsorUnboundTx(args: {
         await announceSubmitIntent(args.__replyPort, {
             txHash: String(bound.identifiers().at(-1)),
             contractAddress: calls[0]?.address, circuits: calls.map(c => c.entryPoint), note: leased.backing, sponsorAccountId: sponsor.sessionId,
-            deployed: calls.filter(c => c.entryPoint === DEPLOY_ENTRY_POINT).map(c => c.address)
+            deployed: calls.filter(c => c.entryPoint === DEPLOY_ENTRY_POINT).map(c => c.address),
+            // The dust spend's ttl. The caller's own ttl may end earlier; the
+            // later of the two is the conservative deadline for "never landed".
+            ttl: ttl.toISOString()
         });
         const txId = await submitOnDedicatedClient(sponsor, bound, 'sponsor-unbound-submit');
         log('info', `sponsorUnboundTx: LANDED txHash=${String(txId).slice(0, 16)} on backing ${leased.backing}`);

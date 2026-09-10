@@ -126,4 +126,15 @@ echo "Starting NIGHTGATE (network=${NIGHTGATE_NETWORK:-preprod}, auth=$AUTH_KIND
 # reached the server: every stop ended in SIGKILL after the grace period
 # (wallet state unsaved, sessions left open, one recreate raced and stayed
 # down). With node in front, cds runs its shutdown hooks on SIGTERM.
-exec node /app/node_modules/@sap/cds/bin/serve.js
+#
+# V8 flags for the server process (0.23.3). Default: no concurrent
+# recompilation. A live server deadlocked inside V8: the main thread held
+# the transition-array lock, allocated, and waited at a GC safepoint for a
+# background TurboFan compile that was blocked on the same lock. Without
+# the background compile threads that deadlock cannot form; optimizing
+# compiles then run on the calling thread, a few ms each. V8 flags are not
+# accepted in NODE_OPTIONS, so they go on the command line here. Set
+# NIGHTGATE_NODE_FLAGS to override (an empty value passes no flag).
+NODE_FLAGS="${NIGHTGATE_NODE_FLAGS---no-concurrent-recompilation}"
+# shellcheck disable=SC2086  # word splitting is the point: several flags
+exec node $NODE_FLAGS /app/node_modules/@sap/cds/bin/serve.js

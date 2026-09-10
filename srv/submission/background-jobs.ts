@@ -35,7 +35,7 @@ import crypto from 'crypto';
 import { AsyncResource } from 'async_hooks';
 import { BackgroundJobs, PendingSubmissions } from '#cds-models/midnight';
 import { classifySubmissionError, type SubmissionErrorClassification } from './TransactionSubmitter';
-import type { ChainOutcome } from './chain-outcome-confirmer';
+import { isChainOutcome, isChainAbsent, type ChainOutcome, type ChainLookup } from './chain-outcome-confirmer';
 import { resolveNightgateRuntimeConfig, getNightgatePluginConfig } from '../utils/nightgate-config';
 import { runInJobExecutionContext } from './job-execution-context';
 import { encrypt as encryptAtRest, decrypt as decryptAtRest, getEncryptionKey } from '../utils/crypto';
@@ -578,6 +578,16 @@ function dispatchJob(jobId: string, kind: string, legacyWork?: () => Promise<unk
                     // park under the marker settleRejectedSponsorAttempts looks for,
                     // not under the generic code (the indexer would never resolve it).
                     await markReconciliationRequired(jobId, { code: err.code, message: err.message });
+                } else if (current?.txHash && classification.code === 'SubmitAmbiguous') {
+                    // Broadcast attempted, nothing observed: neither a status from
+                    // the node nor the transaction on the indexer. Not a failure
+                    // yet, so not the failure code: the confirmer ends the job
+                    // from chain evidence (indexed -> succeeded/failed) or from
+                    // its absence past the ttl (BROADCAST_NOT_INCLUDED).
+                    await markReconciliationRequired(jobId, {
+                        code: BROADCAST_UNCONFIRMED,
+                        message: `Broadcast of ${current.txHash} is unconfirmed: ${classification.message}. The job ends succeeded or failed once the indexer shows the transaction, or failed/${BROADCAST_NOT_INCLUDED} once the indexer tip is past its validity window; a new attempt needs a new idempotencyKey either way.`
+                    });
                 } else if (current?.txHash) {
                     await markReconciliationRequired(jobId, {
                         code: 'EXTERNAL_EXECUTION_FAILED',
@@ -1027,7 +1037,7 @@ let confirmerLegacyCursor: string | undefined;
 // Crawler-free chain-outcome confirmer, injected at startup only when the
 // crawler is disabled (or explicitly opted in). Null keeps the pass a no-op, so
 // crawler deployments see no behavior change.
-type ChainOutcomeConfirmer = (txHash: string) => Promise<ChainOutcome | null>;
+type ChainOutcomeConfirmer = (txHash: string) => Promise<ChainLookup>;
 
 /** The evidence columns written with every confirmed outcome (job row and attempt row alike). */
 function chainEvidencePatch(outcome: ChainOutcome): Record<string, unknown> {
@@ -1041,6 +1051,67 @@ let chainOutcomeConfirmer: ChainOutcomeConfirmer | null = null;
 let confirmerReconcileCursor: string | undefined;
 let chainConfirmActive = false;
 const CHAIN_CONFIRM_CONCURRENCY = 8;
+
+/** Park code while a broadcast is neither seen on chain nor provably absent. */
+export const BROADCAST_UNCONFIRMED = 'BROADCAST_UNCONFIRMED';
+/** Terminal code once the indexer tip is past the transaction's ttl and the transaction is still unknown. */
+export const BROADCAST_NOT_INCLUDED = 'BROADCAST_NOT_INCLUDED';
+/** Rows announced before the ttl was recorded: the longest ttl any submitting path balances with. */
+const LEGACY_BROADCAST_TTL_MS = 60 * 60 * 1000;
+
+/**
+ * A parked job whose transaction the indexer does not know: is its absence
+ * proof by now? The ttl comes from the attempt row (announced at the submit
+ * intent), else the submit time plus the longest ttl any path sets. The
+ * verdict needs the indexer tip PAST the ttl by the margin, and the tip is
+ * the one THE ABSENCE ANSWER ITSELF carried (same request, same replica): an
+ * indexer that lags behind the chain, or a fresher replica answering a
+ * separate tip query, must not turn a landed transaction into a lost one
+ * (the caller would rebuild and pay twice). No tip, no verdict.
+ */
+async function finalizeLostBroadcast(db: any, job: BackgroundJobRow, tipMs: number | null, generation: number): Promise<number> {
+    if (tipMs === null || job.errorCode === REJECTED_ATTEMPT_BOOKKEEPING_PENDING || jobKindTraits(job.kind).workflowParent) return 0;
+    const submission = await db.run(SELECT.one.from(PendingSubmissions).where(job.submissionId ? { ID: job.submissionId } : { txHash: job.txHash }));
+    let coordinates: any = {};
+    try { coordinates = submission?.submitIntentData ? JSON.parse(submission.submitIntentData) : {}; } catch { coordinates = {}; }
+    const reservation: { grantId?: string; count?: number } | null = coordinates?.deployReservation ?? null;
+    const recorded = typeof coordinates.ttl === 'string' ? Date.parse(coordinates.ttl) : NaN;
+    const submittedAt = Date.parse(String(submission?.submittedAt ?? job.submittedAt ?? ''));
+    const ttlMs = Number.isFinite(recorded) ? recorded : Number.isFinite(submittedAt) ? submittedAt + LEGACY_BROADCAST_TTL_MS : NaN;
+    if (!Number.isFinite(ttlMs)) return 0;
+    const margin = configMs('NIGHTGATE_BROADCAST_EXPIRY_MARGIN_MS');
+    if (tipMs <= ttlMs + margin) return 0;
+    const now = new Date().toISOString();
+    const ttlIso = new Date(ttlMs).toISOString();
+    const message = `Transaction ${job.txHash} was broadcast but never included: the indexer tip (${new Date(tipMs).toISOString()}) is past its validity window (ttl ${ttlIso}${Number.isFinite(recorded) ? '' : ', assumed from the submit time'}) and the indexer does not know it. Nothing of it is on chain; a new attempt needs a new idempotencyKey.`;
+    return withStatusWriteRetry(`finalizeLostBroadcast(${job.ID})`, () => (db as any).tx(async (tx: any) => {
+        if (await lockReorgGeneration(tx) !== generation) return 0;
+        const affected = affectedRows(await tx.run(UPDATE.entity(BackgroundJobs).set({
+            status: 'failed', chainStatus: 'dropped', finishedAt: now,
+            errorCode: BROADCAST_NOT_INCLUDED, errorMessage: message
+        } as any).where({ ID: job.ID, status: 'reconciliation_required' })));
+        let rowClosed = 0;
+        if (affected === 1 && submission?.ID) {
+            rowClosed = affectedRows(await tx.run(UPDATE.entity(PendingSubmissions).set({
+                status: 'failed', finalizedAt: now, errorCode: BROADCAST_NOT_INCLUDED,
+                errorMessage: `not included before ttl ${ttlIso}`
+            } as any).where({ ID: submission.ID, status: 'pending' })));
+        }
+        // A deploy that never landed must not keep the grant's lifetime budget:
+        // refund the reservation the attempt row holds, exactly once (only the
+        // row closed HERE, still pending, can still hold it; same rule as the
+        // rejected-attempt settlement).
+        if (rowClosed === 1 && reservation?.grantId && Number.isInteger(reservation.count) && (reservation.count as number) > 0) {
+            await tx.run(
+                UPDATE.entity('midnight.AgentGrants')
+                    .set({ deploysUsed: { '-=': reservation.count } })
+                    .where({ ID: reservation.grantId, deploysUsed: { '>=': reservation.count } })
+            );
+        }
+        if (affected === 1) cds.log('nightgate').warn(`${job.kind} job ${job.ID}: ${message}${rowClosed === 1 && reservation?.count ? ` (refunded ${reservation.count} deploy reservation(s) on grant ${String(reservation.grantId).slice(0, 8)})` : ''}`);
+        return affected;
+    }));
+}
 
 /** Register (or clear, with null) the crawler-free tx-outcome confirmer. */
 /**
@@ -1396,6 +1467,24 @@ export async function reconcileBackgroundJobs(existingDb?: any): Promise<number>
                     }).where({ ID: job.ID, status: 'reconciliation_required' })
                 ));
                 resolved += affectedRows(affected);
+                continue;
+            }
+            // A child that ended TERMINALLY failed (a lost broadcast, a call
+            // that did not apply) can never be re-run under its immutable step
+            // key, so the parent ends the same way the in-flight path ends it
+            // (`Child job X failed [CODE]`), naming the steps that did land.
+            const failedChild = children.find(child => child.status === 'failed');
+            if (failedChild) {
+                const landed = children.filter(child => child.status === 'succeeded').map(child => child.workflowStep ?? child.ID);
+                const affected = await withStatusWriteRetry(`failReconciledParent(${job.ID})`, () => db.run(
+                    UPDATE.entity(BackgroundJobs).set({
+                        status: 'failed', errorCode: 'CHILD_FAILED', finishedAt: new Date().toISOString(),
+                        errorMessage: `Child job ${failedChild.ID} (workflow step '${failedChild.workflowStep ?? '?'}') failed [${failedChild.errorCode ?? 'UNKNOWN'}]: ${String(failedChild.errorMessage ?? 'unknown error').slice(0, 1500)}` +
+                            (landed.length ? ` Steps already on chain: ${landed.join(', ')}.` : ' No step of this workflow is on chain.') +
+                            ' A new attempt needs a new idempotencyKey.'
+                    }).where({ ID: job.ID, status: 'reconciliation_required' })
+                ));
+                resolved += affectedRows(affected);
             }
             continue;
         }
@@ -1475,9 +1564,17 @@ export async function confirmChainOutcomesViaIndexer(existingDb?: any): Promise<
     // Captured before the lookups; each commit compares under the row lock.
     let generation = await readReorgGeneration(db);
     for (const job of reconcilePage.rows) {
-        let outcome: ChainOutcome | null;
+        let outcome: ChainLookup;
         try { outcome = await confirmer(job.txHash!); } catch { continue; }
-        if (!outcome) continue;
+        if (!isChainOutcome(outcome)) {
+            // Only ABSENCE is evidence: an indexed-but-unconfirmable
+            // transaction (null) may be on chain and keeps the job parked.
+            // The tip the absence is judged against is the answer's own.
+            if (isChainAbsent(outcome)) {
+                try { updated += await finalizeLostBroadcast(db, job, outcome.asOfMs, generation); } catch { /* next pass */ }
+            }
+            continue;
+        }
         try {
             updated += await finalizeIdentifierKeyedJob(db, job, outcome, { fromStatus: 'reconciliation_required', generation });
         } catch (err) {
@@ -1494,14 +1591,14 @@ export async function confirmChainOutcomesViaIndexer(existingDb?: any): Promise<
     generation = await readReorgGeneration(db);
     let staleGeneration = 0;
     await mapWithConcurrency(jobs, CHAIN_CONFIRM_CONCURRENCY, async job => {
-        let outcome: ChainOutcome | null;
+        let outcome: ChainLookup;
         try {
             outcome = await confirmer(job.txHash!);
         } catch {
             lookupErrors++;
             return;
         }
-        if (!outcome) return; // not yet indexed -> retry next tick
+        if (!isChainOutcome(outcome)) return; // not yet indexed / not confirmable -> retry next tick
         // CAS on the exact chainStatus we read (compiles to `= 'pending'` or,
         // for legacy rows, `IS NULL` - not `IN (...)`, which never matches NULL in
         // SQL). Keeps the write a safe no-op if the value changed since the scan.
@@ -1509,7 +1606,10 @@ export async function confirmChainOutcomesViaIndexer(existingDb?: any): Promise<
             if (jobKindTraits(job.kind).identifierKeyed) {
                 // Sponsor jobs: job chainStatus AND the attempt's PendingSubmissions
                 // row are finalized together (the crawler never sees these rows).
-                updated += await finalizeIdentifierKeyedJob(db, job, outcome, { fromStatus: 'succeeded', chainStatusWas: job.chainStatus ?? null, generation });
+                // `updated += await f()` would read `updated` BEFORE the await and lose the
+                // increments of the callbacks running concurrently with it.
+                const n = await finalizeIdentifierKeyedJob(db, job, outcome, { fromStatus: 'succeeded', chainStatusWas: job.chainStatus ?? null, generation });
+                updated += n;
             } else {
                 const now = new Date().toISOString();
                 const evidence = chainEvidencePatch(outcome);
@@ -1758,9 +1858,9 @@ async function markChainFailureAfterBroadcast(jobId: string, current: Background
     const db = await cds.connect.to('db');
     const carried = carriedSubmitFailure(err)?.blockHeight;
     const generation = await readReorgGeneration(db);
-    let outcome: ChainOutcome | null = null;
+    let outcome: ChainLookup = null;
     try { outcome = chainOutcomeConfirmer ? await chainOutcomeConfirmer(current.txHash!) : null; } catch { outcome = null; }
-    if (!outcome) {
+    if (!isChainOutcome(outcome)) {
         await markReconciliationRequired(jobId, {
             code: 'CHAIN_EXECUTION_FAILED_UNCONFIRMED',
             message: `Transaction ${current.txHash} is on-chain and its contract call did not apply` +

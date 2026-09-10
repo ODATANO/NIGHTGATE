@@ -66,11 +66,41 @@ The server listens on `http://localhost:4004`; the OData services sit under
 | `NIGHTGATE_DB_PATH` | `/data/nightgate.db` | SQLite location (persist the `/data` volume) |
 | `NIGHTGATE_SQLITE_BUSY_TIMEOUT_MS` | `30000` | How long a writer waits for the SQLite lock; multi-MB wallet-state saves of many warm facades hold it for seconds |
 | `NODE_OPTIONS` | `--max-old-space-size=8192` | Heap; keep the container memory limit above it |
+| `NIGHTGATE_NODE_FLAGS` | `--no-concurrent-recompilation` | V8 flags on the node command line (V8 flags are refused in `NODE_OPTIONS`). The default keeps optimizing compiles on the calling thread; a background compile thread and the main thread deadlocked at a GC safepoint on a live server (0.23.3). An empty value passes no flag |
 
 Proving default is fully in-process (wasm): zero extra containers, but
 proofs run for minutes each and block the executing thread. For serious
 throughput bring up the `proof-server` service from the same compose file
 and set `NIGHTGATE_PROOF_SERVER_URL=http://proof-server:6300`.
+
+## Watchdog on the healthcheck
+
+The image's HEALTHCHECK probes the readiness route every 30 s, and Docker
+marks the container `unhealthy` after five failures. Docker never restarts
+it for that: `restart: unless-stopped` acts on exits only. A process that
+hangs with its main thread blocked stays up and unhealthy until someone
+looks (seen live on 0.23.1: a deadlock inside V8, one hour of timeouts).
+Run a watchdog next to the container, for example from cron every minute:
+
+```sh
+#!/bin/sh
+C=nightgate-api; S=/run/nightgate-watchdog.count
+st=$(docker inspect -f '{{.State.Health.Status}}' "$C" 2>/dev/null) || exit 0
+n=$(cat "$S" 2>/dev/null || echo 0)
+if [ "$st" = unhealthy ]; then
+    n=$((n + 1)); echo "$n" > "$S"
+    [ "$n" -ge 3 ] && docker restart -t 5 "$C" && echo 0 > "$S"
+else
+    echo 0 > "$S"
+fi
+```
+
+Three consecutive unhealthy checks a minute apart, then `docker restart`
+with a 5 s stop timeout: a hung main thread cannot handle SIGTERM, so the
+90 s grace period would only delay the kill. The restart recovery closes
+the previous process's sessions and fails or replays its interrupted jobs
+(the sponsor pool re-warms afterwards). `starting` during the boot grace
+period does not count.
 
 ## Schema upgrades
 

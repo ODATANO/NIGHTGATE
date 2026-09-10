@@ -313,7 +313,7 @@ describe('wallet-worker-client', () => {
             await startWithResponder((msg) => {
                 // worker: announce first, reply only after the ack
                 msg.port.on('message', (m: any) => { if (m?.kind === 'submit-intent-ack') { acks.push(m); msg.port.postMessage({ ok: true, result: { txHash: 'h1', onChainStatus: 'ok' } }); } });
-                msg.port.postMessage({ kind: 'submit-intent', txHash: 'h1', contractAddress: 'c', circuits: ['increment'] });
+                msg.port.postMessage({ kind: 'submit-intent', txHash: 'h1', contractAddress: 'c', circuits: ['increment'], ttl: '2026-09-10T06:31:34.000Z' });
                 return undefined;
             });
             const persisted: any[] = [];
@@ -323,7 +323,8 @@ describe('wallet-worker-client', () => {
                 indexerHttpUrl: '', indexerWsUrl: '', proofServerUrl: '', networkId: 'preprod'
             } as any, async (txHash, intent) => { persisted.push({ txHash, intent }); });
             expect(result).toEqual({ txHash: 'h1', onChainStatus: 'ok' });
-            expect(persisted).toEqual([{ txHash: 'h1', intent: expect.objectContaining({ txHash: 'h1', contractAddress: 'c', circuits: ['increment'] }) }]);
+            // the ttl rides along: the confirmer's deadline for a broadcast that never lands
+            expect(persisted).toEqual([{ txHash: 'h1', intent: expect.objectContaining({ txHash: 'h1', contractAddress: 'c', circuits: ['increment'], ttl: '2026-09-10T06:31:34.000Z' }) }]);
             expect(acks).toEqual([{ kind: 'submit-intent-ack', txHash: 'h1', ok: true }]);
         });
 

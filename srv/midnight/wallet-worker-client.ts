@@ -434,7 +434,7 @@ export function setStateSaveSink(sink: StateSaveSink | undefined): void {
  * + submitted) before the broadcast happens; if it throws, the worker does not
  * broadcast.
  */
-export interface SubmitIntentInfo { txHash: string; contractAddress?: string; circuits?: string[]; note?: string; sponsorAccountId?: string; deployed?: string[] }
+export interface SubmitIntentInfo { txHash: string; contractAddress?: string; circuits?: string[]; note?: string; sponsorAccountId?: string; deployed?: string[]; ttl?: string }
 export type SubmitIntentHook = (txHash: string, intent: SubmitIntentInfo) => Promise<void>;
 
 async function rpc<T>(method: string, args: unknown, timeoutMs: number = RPC_TIMEOUT_MS, onSubmitIntent?: SubmitIntentHook): Promise<T> {
@@ -515,7 +515,7 @@ async function rpcOnce<T>(method: string, args: unknown, timeoutMs: number, onSu
             if (msg?.kind === 'submit-intent') {
                 // Intermediate message, not the reply: persist the boundary,
                 // then ack (or nack) so the worker broadcasts (or does not).
-                const intent: SubmitIntentInfo = { txHash: String(msg.txHash), contractAddress: msg.contractAddress, circuits: msg.circuits, note: msg.note, sponsorAccountId: msg.sponsorAccountId, ...(Array.isArray(msg.deployed) ? { deployed: msg.deployed.map(String) } : {}) };
+                const intent: SubmitIntentInfo = { txHash: String(msg.txHash), contractAddress: msg.contractAddress, circuits: msg.circuits, note: msg.note, sponsorAccountId: msg.sponsorAccountId, ...(Array.isArray(msg.deployed) ? { deployed: msg.deployed.map(String) } : {}), ...(typeof msg.ttl === 'string' ? { ttl: msg.ttl } : {}) };
                 Promise.resolve()
                     .then(() => onSubmitIntent?.(intent.txHash, intent))
                     .then(() => port2.postMessage({ kind: 'submit-intent-ack', txHash: msg.txHash, ok: true }))

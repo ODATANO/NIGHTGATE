@@ -1,5 +1,49 @@
 # Changelog
 
+## 0.23.3 - 2026-09-10
+
+A production hang and a lost broadcast. No schema or circuit change.
+
+- **A lost broadcast ends the job.** A sponsored transaction the node never
+  included (four in ~2100 sponsorings: no reject, no status, never on the
+  indexer) parked its job in `reconciliation_required` forever. Every
+  submit intent now records the transaction's `ttl` on the attempt row;
+  once the indexer tip is past it plus `NIGHTGATE_BROADCAST_EXPIRY_MARGIN_MS`
+  (5 min) and the indexer has no record, the job ends
+  `failed / BROADCAST_NOT_INCLUDED`, `chainStatus: dropped`. Only absence
+  counts (an indexed transaction without a confirmable result stays
+  parked), the tip comes from the same indexer answer as the absence (the
+  older one when identifier and hash are both tried), and without a tip
+  there is no verdict. A lost sponsored deploy refunds its deploy
+  reservation; a workflow parent whose child was lost ends
+  `failed / CHILD_FAILED`. Rows from before this release use the submit
+  time plus one hour.
+- **`BROADCAST_UNCONFIRMED` while parked.** The ambiguous submit outcome
+  has its own park code; `EXTERNAL_EXECUTION_FAILED` stays for a failure
+  after the broadcast.
+- **The submit says which phase died.** The dedicated-client submit
+  (unbound sponsoring) drives the node client's event stream itself
+  (`srv/midnight/worker/phased-submit.ts`) with one budget per phase:
+  connect (`NIGHTGATE_SUBMIT_CONNECT_TIMEOUT_MS`, 20 s; nothing sent,
+  retried once on a fresh client, then a clean pre-inclusion failure),
+  request (`NIGHTGATE_SUBMIT_REQUEST_TIMEOUT_MS`, 30 s, until the node's
+  first status; ambiguous `no-reply`) and watch
+  (`NIGHTGATE_SUBMIT_WATCH_TIMEOUT_MS`, 75 s, until InBlock; ambiguous).
+  Every status and socket event is logged with its offset; a timed-out
+  attempt keeps listening for `NIGHTGATE_SUBMIT_LATE_GRACE_MS` (5 min) and
+  logs a late reject or InBlock under the identifier; closing an abandoned
+  client is bounded. `@midnightntwrk/wallet-sdk-node-client` and `effect`
+  are direct dependencies now.
+- **No concurrent recompilation in the container.** A live 0.23.1 server
+  stopped answering for an hour: a lock-order deadlock inside V8 (node
+  22.23.2) between the main thread at a GC safepoint and a background
+  TurboFan compile holding the same transition-array lock. The entrypoint
+  starts node with `--no-concurrent-recompilation`; `NIGHTGATE_NODE_FLAGS`
+  overrides the flag list (V8 flags are refused in `NODE_OPTIONS`).
+- `docs/docker.md` carries a cron watchdog on the healthcheck: Docker never
+  restarts an unhealthy container by itself.
+- Image tag `0.23.3`.
+
 ## 0.23.2 - 2026-09-06
 
 `@odatano/nightgate-tx` 0.5.1, the fix for a 0.5.0 packaging break.

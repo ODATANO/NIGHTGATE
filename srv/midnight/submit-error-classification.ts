@@ -101,6 +101,16 @@ export function classifySubmitFailure(err: unknown): SubmitFailureInfo {
         const own = Array.isArray((causality as any)?.calls) ? (causality as any).calls as BatchCallStageInfo[] : undefined;
         return { code: 'causality', retryable: false, calls: own?.length ? own : parseBatchCallStages(haystack) };
     }
+    // A phased submit says WHICH phase died. connect: nothing was sent, a
+    // resend is safe (transport, pre-inclusion). request: sent, no status
+    // (the node may hold it: ambiguous, no-reply). watch: the node took it,
+    // nothing was included in time (ambiguous).
+    const phased = chain.find((e: any) => nameOf(e) === 'SubmitPhaseError' && typeof e?.phase === 'string') as any;
+    if (phased) {
+        if (phased.phase === 'connect') return { code: 'transport', ledgerCode: 'not-sent', retryable: true };
+        if (phased.phase === 'request') return { code: 'ambiguous', ledgerCode: 'no-reply', retryable: false };
+        return { code: 'ambiguous', retryable: false };
+    }
     if (names.includes('SubmitWatchTimeoutError') || /submit watch timed out/i.test(haystack)) {
         return { code: 'ambiguous', retryable: false };
     }

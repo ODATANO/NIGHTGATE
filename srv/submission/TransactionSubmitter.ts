@@ -286,7 +286,8 @@ export class TransactionSubmitter {
             const coordinates = {
                 channel: 'bound', circuits: intent?.circuits ?? [],
                 contractAddress: intent?.contractAddress ?? shape.contractAddress,
-                ...(intent?.note ? { note: intent.note } : {})
+                ...(intent?.note ? { note: intent.note } : {}),
+                ...(intent?.ttl ? { ttl: intent.ttl } : {})
             };
             const targetRow = rowId ?? cds.utils.uuid();
             const reuse = rowId !== null;

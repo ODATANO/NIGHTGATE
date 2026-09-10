@@ -394,9 +394,7 @@ export async function initialize(): Promise<NightgateIndexerStatus> {
         // crawler indexes the Substrate extrinsic hash, a different value, so
         // it cannot correlate a job with a block. The confirmer records the
         // inclusion coordinates (block height/hash) the reorg rollback reverts by.
-        registerChainOutcomeConfirmer(buildIndexerTxConfirmer({
-            indexerHttpUrl: submissionEndpoints.indexerHttpUrl
-        }));
+        registerChainOutcomeConfirmer(buildIndexerTxConfirmer({ indexerHttpUrl: submissionEndpoints.indexerHttpUrl }));
         warnIfCrawlerlessChainConfirmSet(nightgateConfig);
         log.info(`Indexer chain-outcome confirmation enabled${crawlerEnabled ? ' (alongside the crawler)' : ' (crawler off)'}`);
         log.info('Wallet worker thread ready');

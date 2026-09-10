@@ -170,7 +170,11 @@ default. The `ENCRYPTION_*` secrets are environment only.
 | `NIGHTGATE_SUBMIT_TRANSPORT_RETRIES` | int (min 0) | `2` | Resends of the SAME finalized transaction when the send itself fails (websocket closed at submit, `1000 Normal Closure`, `ECONNRESET`; never a node reject, never a reply-less wait), 0.22.0; default `2`, `0` disables. No rebuild, no re-proving: the facade re-pends the spends and the identical bytes go out again. Applies to every bound submit (deploy/call/batch, sends, dust registration, bound sponsoring). Read in the wallet worker. |
 | `NIGHTGATE_SUBMIT_TRANSPORT_BACKOFF_MS` | ms (min 0) | `5000` | Pause before such a resend; default `5000`. Read in the wallet worker. |
 | `NIGHTGATE_SUBMIT_LANDED_PROBE_MS` | ms (min 0) | `30000` | How long the worker polls the indexer for the transaction identifier before a resend, and after a resend was rejected (a reply lost on the first send may still have reached the node); default `30000`. A landed transaction is reported as submitted only with ledger result `SUCCESS`; in a block but not applied fails as `TxFailed` (fee spent). Read in the wallet worker. |
-| `NIGHTGATE_SUBMIT_WATCH_TIMEOUT_MS` | ms (min 1) | `60000` | How long a bound submit waits for the node's first status after the send before the outcome counts as ambiguous (reconciled by identifier, never resent); default `60000`. Read in the wallet worker. |
+| `NIGHTGATE_SUBMIT_CONNECT_TIMEOUT_MS` | ms (min 1) | `20000` | Connect phase of a dedicated-client submit: client creation plus socket; default `20000`. A timeout here sent nothing (`transport/not-sent`, retried once on a fresh client, then a clean pre-inclusion failure). Read in the wallet worker. |
+| `NIGHTGATE_SUBMIT_REQUEST_TIMEOUT_MS` | ms (min 1) | `30000` | Request phase of a dedicated-client submit: from the send until the node's first status (subscription acknowledged); default `30000`. A timeout here is ambiguous (`no-reply`): the transaction may or may not be in the pool, the job parks for the confirmer. Read in the wallet worker. |
+| `NIGHTGATE_SUBMIT_LATE_GRACE_MS` | ms (min 0) | `300000` | After a request or watch phase timeout the attempt keeps its node subscription open this long and logs a late status or reject under the transaction identifier (evidence only; the job is parked for the confirmer either way); default `300000`. Read in the wallet worker. |
+| `NIGHTGATE_SUBMIT_WATCH_TIMEOUT_MS` | ms (min 1) | `75000` | Watch phase of a submit: from the node's first status until InBlock (or Finalized, `NIGHTGATE_SPONSOR_WAIT`); default `75000`. A timeout here is ambiguous: the node took the request and nothing was included in time; the indexer is asked for 90 s, then the job parks for the confirmer. On the facade (bound) path this is the whole wait after the send. Read in the wallet worker. |
+| `NIGHTGATE_BROADCAST_EXPIRY_MARGIN_MS` | ms (min 0) | `300000` | A job parked in `reconciliation_required` whose transaction the indexer does not know ends `failed / BROADCAST_NOT_INCLUDED` once the indexer tip is this far past the transaction's validity window (ttl); default `300000`. The ttl is recorded at the submit intent; rows without one use the submit time plus one hour. |
 | `NIGHTGATE_BATCH_SEGMENT_MODE` | `rewrite` / `observe` | `rewrite` | Batch segment ordering: `rewrite` (deterministic stage-grouped order) or `observe` (log only). Read in the wallet worker. |
 | `NIGHTGATE_SPONSOR_POLICY_FILE` | path |  | Path to a JSON file `{ "allowedContracts": [], "allowedCircuits": [], "allowDeploy": false, "allowedTokenTypes": [] }` that replaces `NIGHTGATE_SPONSOR_ALLOWED_CONTRACTS`/`_CIRCUITS` while set (0.21.0). Calls on a grant's `deployedContracts` are exempt from `allowedCircuits` (0.21.2). Re-read per sponsored call behind an mtime cache, so the sponsor policy changes without a container recreate. Fail-closed: an unreadable or invalid file keeps the last good policy, and with none loaded yet sponsored calls answer `503 SPONSOR_POLICY_UNAVAILABLE`. |
 | `NIGHTGATE_SPONSOR_ALLOWED_CONTRACTS` | list |  | Comma list of contract addresses a sponsor pays for (platform floor); empty = any. Replaced by `NIGHTGATE_SPONSOR_POLICY_FILE` while that is set. |
@@ -412,8 +416,32 @@ children: any failed child means `failure`, all successful children mean
 The same rule applies without a process restart: if work throws after reaching
 `external_execution` or `submitted`, the job becomes
 `reconciliation_required / EXTERNAL_EXECUTION_FAILED`, because broadcast may
-already have happened. Only failures proven to occur before that boundary are
-ordinary `failed` jobs.
+already have happened. A submit that ended without any node status and without
+the transaction on the indexer parks as `reconciliation_required /
+BROADCAST_UNCONFIRMED` instead: nothing failed yet, nothing was seen either.
+Only failures proven to occur before that boundary are ordinary `failed` jobs.
+
+A parked job leaves `reconciliation_required` in one of three ways: the
+indexer shows the transaction (`succeeded`, or `failed /
+CHAIN_EXECUTION_FAILED` when the call did not apply); the indexer tip passes
+the transaction's validity window (`ttl`, recorded on the attempt row at the
+submit intent, 30 to 60 minutes after the build; rows from before 0.23.3 use
+the submit time plus one hour) by `NIGHTGATE_BROADCAST_EXPIRY_MARGIN_MS`
+without the transaction appearing, which is proof it never landed: `failed /
+BROADCAST_NOT_INCLUDED`, `chainStatus: dropped`, attempt row `failed`; or a
+workflow parent's children all succeed. The tip must be PAST the ttl, so a
+lagging indexer keeps the job parked rather than declaring a landed
+transaction lost, and only ABSENCE counts: a transaction the indexer has
+but cannot confirm yet (no result status, no block height, an unknown
+status) keeps its job parked. The tip an absence is judged against is the
+one the SAME indexer answer carried (transaction and latest block in one
+request, so one replica); when both keys are tried (identifier, then hash)
+the joint absence is as of the OLDER of the two tips. A separate tip
+query, or the fresher of two answers, could come from a replica that
+caught up in between and turn "not indexed yet" into "never included". A lost sponsored deploy refunds the grant's
+deploy reservation in the same transaction. A workflow parent whose child
+ended `failed` this way (or any other terminal way) ends `failed /
+CHILD_FAILED`, naming the child, its code and the steps already on chain.
 
 The command poller also performs conservative automatic reconciliation. It
 requires the exact job `txHash` (or the hash on its linked
@@ -496,7 +524,9 @@ self-healing:
   stays `reconciliation_required` **indefinitely** instead of being resolved. This
   never produces a false success, but there is no timeout - alert on a non-zero
   `odatano_nightgate_jobs_reconciliation_required` gauge that does not drain, and
-  reconcile such jobs manually against chain state.
+  reconcile such jobs manually against chain state. (A broadcast the indexer
+  never shows is NOT in this class: it ends `failed / BROADCAST_NOT_INCLUDED`
+  once the indexer tip is past its ttl, see above.)
 - A job already resolved to `succeeded` / `failed` is not reverted if a later chain
   reorg removes its block and the cascaded `TransactionResults`. This is low risk
   because reconciliation only fires after `PendingSubmissions.status = finalized`

@@ -4,7 +4,7 @@
  * status mapping run without a real Indexer.
  */
 import { describe, test, expect, vi } from 'vitest';
-import { mapIndexerStatus, createHttpTxConfirmer } from '../../srv/submission/chain-outcome-confirmer';
+import { mapIndexerStatus, createHttpTxConfirmer, CHAIN_ABSENT, chainAbsent, isChainOutcome, isChainAbsent } from '../../srv/submission/chain-outcome-confirmer';
 
 const jsonResponse = (data: any, init?: { ok?: boolean; status?: number }) => ({
     ok: init?.ok ?? true,
@@ -87,12 +87,14 @@ describe('createHttpTxConfirmer', () => {
         await expect(confirm('0xfuture')).resolves.toBeNull();
     });
 
-    test('returns null when the tx is not indexed yet (empty transactions)', async () => {
+    test('reports CHAIN_ABSENT (no outcome, provable absence) when the indexer has no such tx (empty transactions)', async () => {
         const confirm = createHttpTxConfirmer({
             indexerHttpUrl: 'http://indexer/graphql',
             fetchFn: async () => jsonResponse({ data: { transactions: [] } })
         });
-        await expect(confirm('0xnotyet')).resolves.toBeNull();
+        const lookup = await confirm('0xnotyet');
+        expect(lookup).toEqual(CHAIN_ABSENT); // no block in the answer: absent without a tip
+        expect(isChainOutcome(lookup)).toBe(false);
     });
 
     test('returns null for a found tx without a result (non-regular / no status)', async () => {
@@ -151,5 +153,52 @@ describe('createHttpTxConfirmer', () => {
         });
         const confirm = createHttpTxConfirmer({ indexerHttpUrl: 'http://indexer/graphql', fetchFn: fetchFn as any });
         await expect(confirm('00deadbeef')).resolves.toMatchObject({ status: 'success' });
+    });
+});
+
+describe('absence vs. unconfirmable', () => {
+    test('no transaction under identifier nor hash is CHAIN_ABSENT; an indexed transaction without a usable result is null (present, not confirmable)', async () => {
+        // the answer carries the indexer's tip: the absence is "as of" that tip, from the same replica
+        const empty = createHttpTxConfirmer({ indexerHttpUrl: 'http://indexer/graphql', fetchFn: vi.fn(async () => jsonResponse({ data: { transactions: [], block: { height: 2484576, timestamp: 1789020090000 } } })) as any });
+        const absent = await empty('00gone');
+        expect(absent).toEqual(chainAbsent(1789020090000));
+        expect(isChainAbsent(absent)).toBe(true);
+        expect(isChainOutcome(absent)).toBe(false);
+        // seconds are scaled, garbage is no tip
+        const secs = createHttpTxConfirmer({ indexerHttpUrl: 'http://indexer/graphql', fetchFn: vi.fn(async () => jsonResponse({ data: { transactions: [], block: { timestamp: '1789020090' } } })) as any });
+        expect(await secs('00gone')).toEqual(chainAbsent(1789020090000));
+        const junk = createHttpTxConfirmer({ indexerHttpUrl: 'http://indexer/graphql', fetchFn: vi.fn(async () => jsonResponse({ data: { transactions: [], block: { timestamp: 'soon' } } })) as any });
+        expect(await junk('00gone')).toEqual(chainAbsent(null));
+        // identifier lookup absent WITH a tip, hash lookup a GraphQL error without data: the identifier answer's tip survives
+        const mixed = createHttpTxConfirmer({ indexerHttpUrl: 'http://indexer/graphql', fetchFn: vi.fn(async (_u: string, init: any) => {
+            const offset = JSON.parse(init.body).variables.offset;
+            return offset.identifier
+                ? jsonResponse({ data: { transactions: [], block: { timestamp: 1789020090000 } } })
+                : jsonResponse({ errors: [{ message: 'invalid transaction hash: cannot convert to ByteArray<32>' }] });
+        }) as any });
+        expect(await mixed('00gone')).toEqual(chainAbsent(1789020090000));
+        // both keys absent with DIFFERENT tips (two requests, a fresher replica answered the second):
+        // the joint absence is as of the OLDER tip, the identifier absence was not re-checked at the newer one
+        const skew = createHttpTxConfirmer({ indexerHttpUrl: 'http://indexer/graphql', fetchFn: vi.fn(async (_u: string, init: any) => {
+            const offset = JSON.parse(init.body).variables.offset;
+            return jsonResponse({ data: { transactions: [], block: { timestamp: offset.identifier ? 1789020000000 : 1789020600000 } } });
+        }) as any });
+        expect(await skew('00gone')).toEqual(chainAbsent(1789020000000));
+        // one of the two answers without a tip: no tip for the joint absence
+        const half = createHttpTxConfirmer({ indexerHttpUrl: 'http://indexer/graphql', fetchFn: vi.fn(async (_u: string, init: any) => {
+            const offset = JSON.parse(init.body).variables.offset;
+            return jsonResponse({ data: { transactions: [], ...(offset.identifier ? { block: { timestamp: 1789020000000 } } : {}) } });
+        }) as any });
+        expect(await half('00gone')).toEqual(chainAbsent(null));
+        const future = createHttpTxConfirmer({ indexerHttpUrl: 'http://indexer/graphql', fetchFn: vi.fn(async () => jsonResponse(txResult('SOMETHING_NEW'))) as any });
+        expect(await future('00future')).toBeNull();
+        const noHeight = createHttpTxConfirmer({ indexerHttpUrl: 'http://indexer/graphql', fetchFn: vi.fn(async () => jsonResponse({ data: { transactions: [{ hash: '0xh', block: null, transactionResult: { status: 'SUCCESS' } }] } })) as any });
+        expect(await noHeight('00noheight')).toBeNull();
+        const noResult = createHttpTxConfirmer({ indexerHttpUrl: 'http://indexer/graphql', fetchFn: vi.fn(async () => jsonResponse({ data: { transactions: [{ hash: '0xh' }] } })) as any });
+        expect(await noResult('00noresult')).toBeNull();
+        expect(isChainOutcome(null)).toBe(false);
+        expect(isChainAbsent(null)).toBe(false);
+        expect(JSON.parse((await (async () => { let body = ''; const c = createHttpTxConfirmer({ indexerHttpUrl: 'http://indexer/graphql', fetchFn: vi.fn(async (_u: string, init: any) => { body = init.body; return jsonResponse({ data: { transactions: [] } }); }) as any }); await c('00q'); return body; })())).query).toMatch(/block \{ height timestamp \}/); // tip and transaction in ONE request
+        expect(isChainOutcome({ status: 'success', blockHeight: 1 })).toBe(true);
     });
 });

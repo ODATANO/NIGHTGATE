@@ -219,8 +219,13 @@ The verification reads need none.
   The wallet SDK packages declare `^8.1.x` for ledger-v8, so a FRESH install
   next to the pinned 8.1.0 resolves a second copy (8.1.1) and the dust
   wallet fails at builder start with `expected instance of DustParameters`:
-  pin it in the consumer's package.json,
-  `"overrides": { "@midnight-ntwrk/ledger-v8": "8.1.0" }`.
+  pin it in the consumer's package.json. The same happens with
+  `onchain-runtime-v3` (compact-runtime accepts 3.1.0, midnight-js-protocol
+  pins 3.0.0; the symptom is `expected instance of StateValue` on every
+  contract call). Both together:
+  `"overrides": { "@midnight-ntwrk/ledger-v8": "8.1.0", "@midnight-ntwrk/onchain-runtime-v3": "3.0.0" }`.
+  Check with `find node_modules -type d -path '*@midnight-ntwrk/<pkg>'`: one
+  directory per package.
 - **0.5.1** ships the fix for a 0.5.0 packaging break: every in-process
   (wasm) build failed on load with `Cannot find module '../utils/config'`
   (a server-only module reached from the shipped proof provider; server

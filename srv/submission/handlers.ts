@@ -999,7 +999,7 @@ export function registerSubmissionHandlers(
         // account), so a reconciled result can be rebuilt canonically; stored
         // as JSON on the attempt row (submitIntentData, internal; finalizedTxData
         // keeps its public meaning: the indexed-transaction snapshot).
-        const onSubmitIntent = () => async (txHash: string, intent?: { contractAddress?: string; circuits?: string[]; note?: string; sponsorAccountId?: string; deployed?: string[] }) => {
+        const onSubmitIntent = () => async (txHash: string, intent?: { contractAddress?: string; circuits?: string[]; note?: string; sponsorAccountId?: string; deployed?: string[]; ttl?: string }) => {
             const submissionId = cds.utils.uuid();
             const deployed = (intent?.deployed ?? []).map(String).filter(Boolean);
             const grantId = command?.grantId ? String(command.grantId) : null;
@@ -1011,6 +1011,7 @@ export function registerSubmissionHandlers(
                 feeSponsor: feeSponsorSessionId(), sponsorAccountId: intent?.sponsorAccountId ?? null,
                 circuits: intent?.circuits ?? [], contractAddress: intent?.contractAddress ?? null,
                 ...(intent?.note ? { note: intent.note } : {}),
+                ...(intent?.ttl ? { ttl: intent.ttl } : {}),
                 ...(deployed.length ? { deployed } : {}),
                 ...(grantId && deployed.length ? { deployReservation: { grantId, count: deployed.length } } : {})
             };

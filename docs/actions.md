@@ -26,11 +26,11 @@ Every action that submits an on-chain transaction is **asynchronous**: it return
 
 `status` (server-side workflow lifecycle): `pending | running | external_execution | submitted | reconciliation_required | succeeded | failed`. On success, `result` is a JSON string of the action's result shape; on failure, `errorCode` + `errorMessage` carry the classified error (see [Error model](#error-model)). `chainBlockHeight` / `chainBlockHash` are the inclusion coordinates the indexer confirmer recorded; they are what a reorg rollback correlates on. A job whose on-chain failure the worker proved without a block height sits briefly in `reconciliation_required` with `errorCode: CHAIN_EXECUTION_FAILED_UNCONFIRMED` until the confirmer finalizes it with the coordinates.
 
-`reconciliation_required` is an explicit **terminal** state: execution was interrupted after an external effect may have occurred. The caller must NOT auto-retry - a fresh attempt needs a new `idempotencyKey`. The single-instance reconciler resolves such jobs automatically from durable chain evidence (a finalized `PendingSubmission` plus a `System.Events` outcome) once it becomes available.
+`reconciliation_required` is an explicit **terminal** state: execution was interrupted after an external effect may have occurred. The caller must NOT auto-retry - a fresh attempt needs a new `idempotencyKey`. The single-instance reconciler resolves such jobs automatically from chain evidence: the indexer confirmer looks the job's `txHash` (the ledger identifier) up on every tick and ends the job `succeeded` or `failed / CHAIN_EXECUTION_FAILED`. A broadcast the indexer never shows ends too: once the indexer tip is past the transaction's validity window (the `ttl` recorded at the submit intent, 30 to 60 minutes; plus `NIGHTGATE_BROADCAST_EXPIRY_MARGIN_MS`, default 5 min) the job becomes `failed / BROADCAST_NOT_INCLUDED` with `chainStatus: dropped`, and nothing of it is on chain. While parked, the `errorCode` says why: `BROADCAST_UNCONFIRMED` (submitted, no node status, not on the indexer yet), `EXTERNAL_EXECUTION_FAILED` (a failure after the broadcast), `PROCESS_RESTART_RECONCILE` (restart after the broadcast). To check by hand: `verifyAttestationState(payloadHash)` for an `attest`, otherwise the identifier on the indexer.
 
 Since 0.23.0 every submitting path announces the transaction identifier to the main thread and broadcasts only after it is persisted as the job's `txHash` (submit-intent handshake, both channels). A job that ends `failed` without a `txHash` therefore never sent anything, and `reconciliation_required` always carries the ONE identifier that may be on chain. A pre-mempool reject of an announced attempt (a dust race that is rebuilt, or a final node reject) closes that attempt `REJECTED` on `PendingSubmissions` and takes its hash off the job before anything else is sent.
 
-`chainStatus` (`null | pending | success | failure`) is the on-chain execution outcome, **independent of `status`**, populated later from `System.Events`: `status: succeeded` means the submission workflow completed, while `chainStatus: success` confirms the transaction was finalized and executed successfully on-chain. A `chainStatus: failure` on a `succeeded` job means the tx finalized but the contract call reverted. The response also carries `submissionId`, `txHash`, `chainFinalizedAt`, and lease/attempt/timestamp bookkeeping fields.
+`chainStatus` (`null | pending | success | failure | dropped`) is the on-chain execution outcome, **independent of `status`**, populated later from `System.Events`: `status: succeeded` means the submission workflow completed, while `chainStatus: success` confirms the transaction was finalized and executed successfully on-chain. A `chainStatus: failure` on a `succeeded` job means the tx finalized but the contract call reverted. `dropped` is the verdict of the lost-broadcast rule above: the transaction was never included and cannot be any more. The response also carries `submissionId`, `txHash`, `chainFinalizedAt`, and lease/attempt/timestamp bookkeeping fields.
 
 ## Session lifecycle
 
@@ -592,8 +592,18 @@ heavy cap (`cds.requires.nightgate.jobs.concurrency.heavy`, default 4). The
 sponsor proves its dust spend with its proving service (the proof server in
 server mode) and returns once the transaction is in a block
 (`NIGHTGATE_SPONSOR_WAIT=finalized` waits for finality instead); a watch that
-never fires is abandoned after `NIGHTGATE_SUBMIT_WATCH_TIMEOUT_MS` (default 60 s)
-and settled by an indexer lookup. Live on
+never fires is bounded PER PHASE (0.23.3): connect (client + socket,
+`NIGHTGATE_SUBMIT_CONNECT_TIMEOUT_MS`, 20 s; a timeout sent nothing and is
+retried once on a fresh client), request (send until the node's first status,
+`NIGHTGATE_SUBMIT_REQUEST_TIMEOUT_MS`, 30 s; a timeout is ambiguous, `no-reply`)
+and watch (first status until InBlock, `NIGHTGATE_SUBMIT_WATCH_TIMEOUT_MS`,
+75 s; a timeout is ambiguous, the node took the request). Every status and
+socket event is logged with its offset (`submit-phases <site> <identifier>
+phase=... connect=... request=... statuses=...`); a timed-out attempt keeps
+listening for `NIGHTGATE_SUBMIT_LATE_GRACE_MS` (5 min) and logs a late status
+or reject as `submit-late <identifier>`. An ambiguous outcome is settled by an
+indexer lookup (90 s); unknown there, the job parks as `BROADCAST_UNCONFIRMED`
+until the indexer shows the transaction or its ttl passes. Live on
 preprod: 4 sponsorings from one wallet, 4 backings, 3 of them in one block.
 
 Two things it does NOT change: concurrent writes to the SAME contract state
@@ -1000,7 +1010,8 @@ Codes returned by `classifySubmissionError` (`srv/submission/TransactionSubmitte
 | `1014` | no | Substrate "invalid transaction" (matches `1014` or `invalid transaction` in the error message) |
 | `1016` | yes (preprod) / no (mainnet) | "Immediately Dropped" - preprod transient, mainnet has a known deterministic-rejection issue |
 | `NetworkOrTimeout` | yes | worker code `transport`: `ECONNREFUSED`, `ECONNRESET`, `ENOTFOUND`, `ETIMEDOUT`, `socket hang up`, `timeout` |
-| `SubmitAmbiguous` | no | worker code `ambiguous`: the watch died and the indexer did not know the transaction; the job ends `reconciliation_required` and is resolved by identifier, never by a rebuild |
+| `NetworkOrTimeout` (`not-sent`) | yes | worker code `transport` with ledger code `not-sent`: the connect phase of a dedicated-client submit timed out or failed before the send; nothing is on chain, the attempt row closes REJECTED (pre-inclusion) and the sponsored job fails cleanly after one retry on a fresh client |
+| `SubmitAmbiguous` | no | worker code `ambiguous`: the request phase got no status from the node (`no-reply`), the watch phase saw no InBlock, or the node's own request timeout fired, and the indexer did not know the transaction; the job parks as `reconciliation_required / BROADCAST_UNCONFIRMED` and is resolved by identifier, never by a rebuild: `succeeded` or `failed` once indexed, `failed / BROADCAST_NOT_INCLUDED` (`chainStatus: dropped`) once the indexer tip is past the transaction's ttl |
 | `PoolInvalid` | yes | worker code `dust-race` with `pool-invalid`: pool status Invalid without a ledger code; one rebuild on the sponsored paths |
 | `SubmitIntentRejected` | no | worker code `pre-mempool-reject` with `intent-rejected`: the main thread could not persist the announced identifier, nothing was broadcast |
 | `SponsorPolicyRefused` | no | worker code `policy`: the sponsor's shape check or allow-list refused the transaction |

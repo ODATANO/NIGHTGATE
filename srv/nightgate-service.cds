@@ -1570,7 +1570,7 @@ service NightgateService {
         maxAttempts  : Integer;
         submissionId : UUID;
         txHash        : String;
-        chainStatus   : String; // null | pending | success | failure; independent of job status
+        chainStatus   : String; // null | pending | success | failure | dropped (never included before its ttl); independent of job status
         chainFinalizedAt : Timestamp;
         chainBlockHeight : Integer; // indexer block height of the confirmed inclusion; null until confirmed
         chainBlockHash   : String;

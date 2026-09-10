@@ -120,12 +120,21 @@ export function loadDustCoreWallet(): Promise<any> {
     return cachedDustCore;
 }
 
-// SDK submission service factory (dedicated per-submit node clients of the
-// parallel sponsor path). Memoized as a PROMISE, like loadDustCoreWallet.
-export let cachedSubmission: Promise<any> | undefined;
-export function loadSubmissionSdk(): Promise<any> {
-    cachedSubmission ??= import('@midnightntwrk/wallet-sdk-capabilities/submission' as string);
-    return cachedSubmission;
+// The node client's effect API (dedicated per-submit node clients of the
+// parallel sponsor path; `phased-submit.ts` drives its event stream itself).
+// Memoized as a PROMISE, like loadDustCoreWallet.
+export let cachedNodeClient: Promise<any> | undefined;
+export function loadNodeClientSdk(): Promise<any> {
+    cachedNodeClient ??= Promise.all([
+        import('@midnightntwrk/wallet-sdk-node-client/effect' as string),
+        import('@midnightntwrk/wallet-sdk-abstractions' as string),
+        import('effect' as string)
+    ]).then(([nodeClient, abstractions, effect]: any[]) => ({
+        PolkadotNodeClient: nodeClient.PolkadotNodeClient,
+        SerializedTransaction: abstractions.SerializedTransaction,
+        Effect: effect.Effect, Scope: effect.Scope, Exit: effect.Exit, Stream: effect.Stream, Duration: effect.Duration
+    }));
+    return cachedNodeClient;
 }
 
 // Loaded only when NIGHTGATE_PROVING_MODE=wasm; the default server path
