@@ -1226,7 +1226,7 @@ describe('grantDisclosure', () => {
         expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/contractAddress is required/));
     });
 
-    test('happy path: SELECT + INSERT up-front + single grantDisclosure call + UPDATE grantedTxHash', async () => {
+    test('happy path: SELECT + INSERT after the session check + single grantDisclosure call + UPDATE grantedTxHash', async () => {
         const submitter = makeSuccessfulSubmitter();
         const { srv, db } = setupHandlersWithDb({ submitterFactory: () => submitter });
         const req = makeReq(VALID_ARGS());
@@ -1240,7 +1240,7 @@ describe('grantDisclosure', () => {
             disclosureGrantId: expect.any(String)
         });
 
-        // SELECT.one existing (sync) + INSERT (sync) + UPDATE (inside work) = 3 db.run.
+        // SELECT.one existing + INSERT (both after the session check) + UPDATE (executor) = 3 db.run.
         expect(db.run).toHaveBeenCalledTimes(3);
 
         // Exactly one circuit call: grantDisclosure(payload, grantee, level).
@@ -1315,12 +1315,20 @@ describe('grantDisclosure', () => {
 
         const queries = run.mock.calls.map(c => c[0]);
         expect(queries.some(q => q.INSERT)).toBe(false);
-        // Up-front re-grant UPDATE re-affirms level and clears any stale revoke.
+        // The re-grant records the request as pendingLevel; the confirmed
+        // level and any revoke marker stay until the chain took the change.
         const updates = queries.filter(q => q.UPDATE);
-        expect(updates.length).toBeGreaterThanOrEqual(1);
-        const upFront = JSON.stringify(updates[0].UPDATE.data ?? updates[0].UPDATE.with);
-        expect(upFront).toContain('"level":1');
-        expect(upFront).toContain('"revokedTxHash":null');
+        expect(updates.length).toBeGreaterThanOrEqual(2);
+        const request = JSON.stringify(updates[0].UPDATE.data ?? updates[0].UPDATE.with);
+        expect(request).toContain('"pendingLevel":1');
+        expect(request).not.toContain('"level":1');
+        expect(request).not.toContain('"revokedTxHash"');
+        // The in-process inclusion confirms it: level moves, marker and revoke clear.
+        const confirmed = JSON.stringify(updates[1].UPDATE.data ?? updates[1].UPDATE.with);
+        expect(confirmed).toContain('"level":1');
+        expect(confirmed).toContain('"pendingLevel":null');
+        expect(confirmed).toContain('"revokedTxHash":null');
+        expect(confirmed).toContain('"grantedTxHash":"0xcafe"');
     });
 
     test('a reindex failure does not fail the grant', async () => {

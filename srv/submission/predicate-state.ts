@@ -11,7 +11,7 @@
  * The recompute uses `@midnight-ntwrk/compact-runtime`'s `persistentHash` +
  * CompactType constructors to reproduce the exact bytes the compiled circuit
  * emits. Validated against a live-emitted key in
- * scripts/integration-test-attestation-vault.mjs.
+ * test/integration/attestation-vault.test.ts.
  *
  * Read/decode logic is dependency-injected (`ledger`, `queryContractState`,
  * `computeClaimKey`) to unit-test without the ESM-only SDK;
@@ -126,7 +126,7 @@ export async function computeFieldPredicateClaimKey(
  * Off-chain recompute of the guarded-attest commitment:
  * persistentHash(AttestCommitPreimage{payload_hash, metadata_hash, nonce}),
  * byte-identical to attestGuarded's in-circuit recompute (parity pinned in
- * scripts/integration-test-attestation-vault.mjs).
+ * test/integration/attestation-vault.test.ts).
  */
 export async function computeAttestCommitment(
     payloadHash: string,

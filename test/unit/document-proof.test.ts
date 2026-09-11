@@ -571,6 +571,6 @@ describe('empty-leaf key parity (hashing.ts vs contract constant)', () => {
         expect(Buffer.from(bytes).equals(expected)).toBe(true);
         expect(emptyLeafKeyHex()).toBe(expected.toString('hex'));
         // Byte parity with the REAL compiled circuit's pad(32, ...) constant is
-        // asserted in integration:attestation-vault (the artifact is ESM-only).
+        // asserted in test/integration/attestation-vault.test.ts (the artifact is ESM-only).
     });
 });

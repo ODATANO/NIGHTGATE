@@ -49,6 +49,7 @@ vi.mock('../../srv/utils/wallet-info', async () => {
 
 import { registerWalletSessionHandlers, __resetWalletRateLimitersForTests } from '../../srv/sessions/wallet-sessions';
 import { encrypt, decrypt, getEncryptionKey } from '../../srv/utils/crypto';
+import { walletSessionSeedBinding } from '../../srv/utils/envelope-bindings';
 
 type Handler = (req: any) => Promise<any>;
 
@@ -287,8 +288,8 @@ describe('connectWalletForSigning: state transitions', () => {
         const row = db.tables['midnight.WalletSessions'][0];
         expect(row.encryptedSeedKey).toBeDefined();
         expect(row.encryptedSeedKey).not.toBe(VALID_SEED); // encrypted, not stored verbatim
-        // round-trip:
-        expect(decrypt(row.encryptedSeedKey, getEncryptionKey())).toBe(VALID_SEED);
+        // round-trip, bound to the session row:
+        expect(decrypt(row.encryptedSeedKey, getEncryptionKey(), walletSessionSeedBinding(row.sessionId))).toBe(VALID_SEED);
 
         // The pre-warm job was scheduled with the right kind + a seed-less
         // request snapshot.
@@ -319,7 +320,7 @@ describe('connectWalletForSigning: state transitions', () => {
         });
         // Seed still encrypted + persisted; only the sync job was skipped.
         const row = db.tables['midnight.WalletSessions'][0];
-        expect(decrypt(row.encryptedSeedKey, getEncryptionKey())).toBe(VALID_SEED);
+        expect(decrypt(row.encryptedSeedKey, getEncryptionKey(), walletSessionSeedBinding(row.sessionId))).toBe(VALID_SEED);
         expect(mockStartJob).not.toHaveBeenCalled();
     });
 

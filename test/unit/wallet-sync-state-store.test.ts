@@ -441,8 +441,9 @@ describe('account-key binding of the blob passphrase', () => {
         const row = store.get('acct-ring');
         const key = keysStore.get('acct-ring');
         expect(row.keyScheme).toBe('dek1');
-        expect(inspectCiphertext(key.wrappedDek)).toEqual({ version: 2, keyId: getEncryptionKey().activeId });
-        expect(key.wrappedDekByViewingKey).toMatch(/^vk1:/);
+        expect(inspectCiphertext(key.wrappedDek)).toEqual({ version: 3, keyId: getEncryptionKey().activeId });
+        // The viewing-key seal is wrapped in the ring envelope, not stored bare.
+        expect(inspectCiphertext(key.wrappedDekByViewingKey)).toEqual({ version: 3, keyId: getEncryptionKey().activeId });
         const dekPass = await dekPassphraseOf('acct-ring', PASS);
         expect(saltOf(row.dustStateBlob).equals(deriveStableSalt('acct-ring', dekPass, SALT_LABEL_DEK))).toBe(true);
         expect(saltOf(row.dustStateBlob).equals(legacySalt('acct-ring'))).toBe(false);
@@ -492,14 +493,16 @@ describe('account-key binding of the blob passphrase', () => {
         await expect(loadSyncState({ accountId: 'acct-rot', passphrase: PASS, expectedSdkVersion: SDK })).resolves.toBeNull();
     });
 
-    test('a blob under the account key survives the ring key leaving: the viewing-key seal opens the key and it is re-sealed under the active key', async () => {
+    test('a rotation with the old key still in the ring re-seals the account key under the active key; a key that left without a rewrap is a cold start', async () => {
         process.env.ENCRYPTION_KEYS = 'k1=' + 'a'.repeat(32);
         process.env.ENCRYPTION_KEY_ACTIVE = 'k1';
         __resetKeyRingForTests();
         await saveSyncState({ accountId: 'acct-dek', passphrase: PASS, sdkVersion: SDK, states: { dust: 'du-dek' } });
         expect(inspectCiphertext(keysStore.get('acct-dek').wrappedDek).keyId).toBe('k1');
+        expect(inspectCiphertext(keysStore.get('acct-dek').wrappedDekByViewingKey).keyId).toBe('k1');
 
-        process.env.ENCRYPTION_KEYS = 'k2=' + 'b'.repeat(32);
+        // Both keys in the ring, k2 active: the load re-seals both seals under k2.
+        process.env.ENCRYPTION_KEYS = 'k1=' + 'a'.repeat(32) + ',k2=' + 'b'.repeat(32);
         process.env.ENCRYPTION_KEY_ACTIVE = 'k2';
         __resetKeyRingForTests();
         __resetEncryptionCacheForTests();
@@ -507,10 +510,19 @@ describe('account-key binding of the blob passphrase', () => {
         const loaded = await loadSyncState({ accountId: 'acct-dek', passphrase: PASS, expectedSdkVersion: SDK });
         expect(loaded!.dust).toBe('du-dek');
         expect(inspectCiphertext(keysStore.get('acct-dek').wrappedDek).keyId).toBe('k2');
+        expect(inspectCiphertext(keysStore.get('acct-dek').wrappedDekByViewingKey).keyId).toBe('k2');
         expect(keysStore.get('acct-dek').rotatedAt).toBeTruthy();
-        // Without the viewing key, a ring that holds neither key is a cold start, never a crash.
+
+        // k2 leaves without a rewrap: the viewing-key seal is wrapped in the ring too, so the passphrase alone
+        // opens nothing, a cold start, never a crash.
+        process.env.ENCRYPTION_KEYS = 'k3=' + 'c'.repeat(32);
+        process.env.ENCRYPTION_KEY_ACTIVE = 'k3';
+        __resetKeyRingForTests();
+        __resetEncryptionCacheForTests();
         clearAllAccountDeks();
-        keysStore.get('acct-dek').wrappedDek = keysStore.get('acct-dek').wrappedDek.replace(/^v2:k2:/, 'v2:k9:');
+        await expect(loadSyncState({ accountId: 'acct-dek', passphrase: PASS, expectedSdkVersion: SDK })).resolves.toBeNull();
+        // A damaged bare seal from before the wrapping is no crash either.
+        clearAllAccountDeks();
         keysStore.get('acct-dek').wrappedDekByViewingKey = 'vk1:AAAA:BBBB:CCCC';
         await expect(loadSyncState({ accountId: 'acct-dek', passphrase: PASS, expectedSdkVersion: SDK })).resolves.toBeNull();
     });

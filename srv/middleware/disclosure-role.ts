@@ -6,8 +6,8 @@
  * and CDS projections can gate response width by tier.
  * When no grant applies, the default is `public_only`.
  *
- * The disclosure-role tiers map 1:1 to the EU Battery Regulation Annex XIII /
- * Art. 77 access tiers (general public / legitimate-interest / authority).
+ * The disclosure-role tiers are the document disclosure tiers of the vault:
+ * 0 public, 1 legitimate interest, 2 authority.
  * The middleware is intentionally orthogonal to CAP's `@requires` auth roles:
  * that gates access to *services*, this gates the *shape* of responses
  * within a service the caller already reached.
@@ -34,8 +34,8 @@ const RANK: Record<DisclosureRoleValue, number> = {
 
 /**
  * On-chain disclosure level (0/1/2) → disclosure-role tier. Inverse of the
- * RANK above; the AttestationVault `level` maps 1:1 onto the EU Battery
- * Regulation Annex XIII access tiers.
+ * RANK above; the AttestationVault `level` maps 1:1 onto the document
+ * disclosure tiers (0 public, 1 legitimate interest, 2 authority).
  */
 const LEVEL_TO_ROLE: Record<number, DisclosureRoleValue> = {
     0: 'public_only',
@@ -129,6 +129,8 @@ async function resolveOnChainRole(
 
     const { SELECT } = cds.ql;
     // Grants are stored lowercase (handlers + indexer normalize on write).
+    // Only the chain-confirmed `level` of an active row counts; a level
+    // request still waiting for inclusion (`pendingLevel`) is never read.
     const where: Record<string, unknown> = {
         contractAddress: contractAddress.toLowerCase(),
         grantee: granteeId,

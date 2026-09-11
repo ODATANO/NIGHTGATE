@@ -61,14 +61,14 @@ const VALID_TX_TYPES = new Set([
  * `contract_call`. Finer classification needs decoding the ledger tx payload.
  */
 const DEFAULT_PALLET_MAP: Record<number, PalletMapping> = {
-    0:  { name: 'System', txType: 'system', isSystem: true },
-    1:  { name: 'Timestamp', txType: 'system', isSystem: true },
-    2:  { name: 'Aura', txType: 'system', isSystem: true },
-    3:  { name: 'Grandpa', txType: 'system', isSystem: true },
-    4:  { name: 'Sidechain', txType: 'system', isSystem: true },
-    5:  { name: 'Midnight', txType: 'contract_call' }, // send_mn_transaction: all ledger txs
-    6:  { name: 'MidnightSystem', txType: 'system', isSystem: true },
-    8:  { name: 'SessionCommitteeManagement', txType: 'system', isSystem: true },
+    0: { name: 'System', txType: 'system', isSystem: true },
+    1: { name: 'Timestamp', txType: 'system', isSystem: true },
+    2: { name: 'Aura', txType: 'system', isSystem: true },
+    3: { name: 'Grandpa', txType: 'system', isSystem: true },
+    4: { name: 'Sidechain', txType: 'system', isSystem: true },
+    5: { name: 'Midnight', txType: 'contract_call' }, // send_mn_transaction: all ledger txs
+    6: { name: 'MidnightSystem', txType: 'system', isSystem: true },
+    8: { name: 'SessionCommitteeManagement', txType: 'system', isSystem: true },
     11: { name: 'NodeVersion', txType: 'system', isSystem: true },
     13: { name: 'CNightObservation', txType: 'system', isSystem: true }, // per-block inherent
     15: { name: 'Preimage', txType: 'system', isSystem: true },
@@ -538,13 +538,6 @@ export class BlockProcessor {
                 const txSize = this.extrinsicSize(extrinsicHex);
                 const circuitName = this.buildCircuitName(classification);
                 const contractActionType = this.toContractActionType(classification.txType);
-                // The ledger payload inside `Midnight.send_mn_transaction` is not
-                // decoded here. A NIGHT transfer, a contract address, the
-                // sender and the amount live in that payload, so these columns
-                // stay null rather than carry values derived from the
-                // extrinsic envelope (which used to mint a "contract address"
-                // from the extrinsic hash and a "transfer" from any signed
-                // extrinsic that happened to parse as MultiAddress + Compact).
                 const contractAddress: string | null = null;
                 const senderAddress: string | null = null;
                 const receiverAddress: string | null = null;
@@ -555,10 +548,6 @@ export class BlockProcessor {
                     transactionId: i,
                     hash: extrinsicHash,
                     protocolVersion,
-                    // Base64 of the bytes (CAP's LargeBinary transport), not the
-                    // hex text: PostgreSQL base64-decodes a string in a binary
-                    // column (garbage or a rejected batch); SQLite kept the hex
-                    // verbatim, which is why nobody noticed.
                     raw: hexToBinaryValue(extrinsicHex),
                     transactionType: classification.isSystem ? 'SYSTEM' : 'REGULAR',
                     txType: classification.txType,
@@ -597,9 +586,6 @@ export class BlockProcessor {
                         address: contractAddress,
                         actionType: contractActionType,
                         entryPoint: circuitName,
-                        // The ledger payload is not decoded, so there is no
-                        // contract state to record; the extrinsic bytes live
-                        // once, on the transaction row.
                         state: null,
                         transaction_ID: txId
                     });
@@ -609,7 +595,7 @@ export class BlockProcessor {
                 txCount++;
             }
 
-            // Bulk inserts: one statement per table regardless of tx count.
+            // Bulk inserts
             if (txRows.length) await tx.run(INSERT.into(Transactions).entries(txRows));
             if (txResultRows.length) await tx.run(INSERT.into(TransactionResults).entries(txResultRows));
             if (txFeeRows.length) await tx.run(INSERT.into(TransactionFees).entries(txFeeRows));
@@ -848,7 +834,7 @@ export class BlockProcessor {
         const raw = rv?.specVersion;
         const v = typeof raw === 'number' ? raw
             : typeof raw === 'string' && /^\d+$/.test(raw) ? Number(raw)
-            : NaN;
+                : NaN;
         if (Number.isInteger(v) && v >= 0) return v;
         throw new Error(`No runtime version for ${where} (pruned or racing node)`);
     }

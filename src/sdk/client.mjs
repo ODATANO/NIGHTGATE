@@ -79,6 +79,20 @@ function stripODataNoise(payload) {
  * @param {number} [opts.pollMs]           waitForJob poll interval, default 2000
  * @param {Function} [opts.fetchFn]        override fetch (tests)
  */
+/** A request may be sent twice only when the second delivery cannot create a second effect. */
+function isSafeToRepeat(method, body) {
+    if (method === 'GET') return true;
+    const key = body && typeof body === 'object' ? body.idempotencyKey : undefined;
+    return typeof key === 'string' && key.length > 0;
+}
+
+/** undici surfaces a keep-alive socket the peer closed as `fetch failed` with an ECONNRESET / EPIPE / UND_ERR_SOCKET cause. */
+function isStaleSocketError(err) {
+    const cause = err?.cause ?? err;
+    const code = String(cause?.code ?? '');
+    return /fetch failed/i.test(String(err?.message ?? '')) && /^(ECONNRESET|EPIPE|UND_ERR_SOCKET)$/.test(code);
+}
+
 export function connect(opts) {
     const {
         baseUrl, servicePath = '/api/v1/nightgate',
@@ -101,11 +115,24 @@ export function connect(opts) {
         }
         if (body !== undefined) headers['Content-Type'] = 'application/json';
 
-        const response = await doFetch(url, {
+        const init = () => ({
             method, headers,
             body: body === undefined ? undefined : JSON.stringify(body),
             signal: AbortSignal.timeout(timeoutMs)
         });
+        let response;
+        try {
+            response = await doFetch(url, init());
+        } catch (err) {
+            // A closed keep-alive socket (idle longer than the server's timeout,
+            // e.g. while the caller proved locally) fails with this error both
+            // when nothing reached the server and when the response was lost
+            // after the server accepted the request. Only requests that are safe
+            // to repeat are retried: GETs, and POSTs carrying an `idempotencyKey`
+            // the server dedupes on. A write without a key surfaces the error.
+            if (!isStaleSocketError(err) || !isSafeToRepeat(method, body)) throw err;
+            response = await doFetch(url, init());
+        }
         const text = await response.text();
         let payload;
         try { payload = text ? JSON.parse(text) : {}; } catch { payload = { raw: text }; }

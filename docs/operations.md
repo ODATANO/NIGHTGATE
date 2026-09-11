@@ -427,7 +427,20 @@ Ciphertexts carry the id of the ring key they were written under, so a rotation 
 3. Start the server with both keys. Every wallet that reconnects migrates its own rows. Run the tool again (server stopped) until it exits 0. A wallet that never comes back keeps its legacy rows: `--drop-legacy-sync-state` deletes such a wallet's sync-state row (it re-syncs from genesis on its next connect); private state and signing keys are never dropped by the tool, so decide per account whether to keep the old key or accept that those rows stay unreadable.
 4. Only then remove the old key (`ENCRYPTION_KEY` unset, `ENCRYPTION_KEYS=k2=...`) and restart. Startup refuses to run while any ring-sealed ciphertext (sessions, job commands, account keys) names a key outside the ring; it logs the legacy count with a warning, since those rows are unreadable without the viewing key either way.
 
-The secrets stay in the process environment of the CAP host (the worker thread receives the resolved ring from the main thread, it never parses the environment itself).
+The secrets stay in the process environment of the CAP host (the worker thread receives the resolved ring from the main thread, it never parses the environment itself). In production every ring secret must be at least 32 characters; a shorter one refuses to start.
+
+Every stored envelope is bound to its row (`v3`: key id, purpose and row id in the AAD). A value copied into another row or column does not decrypt; the rewrap tool rewrites older `v2` values into the bound form. The per-account data key is sealed under the ring and, separately, under the viewing key wrapped in the ring: a database copy plus a viewing key opens nothing without `ENCRYPTION_KEY`, and a ring key that leaves the ring without a rewrap takes the data keys it sealed with it. Run the rewrap before removing a key.
+
+## Contract signing keys (maintenance authority)
+
+Every deploy samples a signing key for the contract (midnight-js) and stores it in `ContractSigningKeys` under the deploying session's account key. That key is the contract's maintenance authority: it can replace the contract's verifier keys. For a contract that matters (a mainnet vault), export it once and keep the export offline:
+
+```
+POST /api/v1/admin/exportContractSigningKey
+{ "sessionId": "<deploying session>", "contractAddress": "<address>", "password": "<16+ characters>" }
+```
+
+The answer is a `midnight-signing-key-export` envelope (`encryptedPayload`, `salt`) sealed under the password, the format `importSigningKeys` restores into another NIGHTGATE. The action needs the admin role and the session's viewing key in the ring, and refuses a key row that a session has not read since the account key was introduced. Decide per contract who holds the export and where; a contract whose key is meant to be unusable is documented as such, the export is then not taken.
 
 ## Database operations
 

@@ -5,7 +5,7 @@
  * Exercises readPredicateResult against a FAKE `ledger()`-shaped object and a
  * fake queryContractState: no SDK, no chain. The claim-key recompute
  * (computePredicateClaimKey) needs the ESM compact-runtime and is covered by
- * scripts/integration-test-attestation-vault.mjs (byte-exact match to a live-emitted key).
+ * test/integration/attestation-vault.test.ts (byte-exact match to a live-emitted key).
  */
 import { readPredicateResult, expandAllowedMask } from '../../srv/submission/predicate-state';
 

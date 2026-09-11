@@ -814,19 +814,29 @@ export function registerSubmissionHandlers(
 
         if (command.op === 'grantDisclosure' || command.op === 'revokeDisclosure') {
             const isGrant = command.op === 'grantDisclosure';
-            const result = await submitter.call({
-                contractAddress: command.contractAddress,
-                circuit: isGrant ? 'grantDisclosure' : 'revokeDisclosure',
-                args: isGrant
-                    ? [hexToBytes(command.payloadHash), hexToBytes(command.grantee), BigInt(command.level)]
-                    : [hexToBytes(command.payloadHash), hexToBytes(command.grantee)],
-                contractName: command.compiledArtifactRef,
-                registration: { artifactPath: resolved.artifactPath, artifactDigest: resolved.artifactDigest, privateStateId: resolved.privateStateId, zkConfigPath: resolved.zkConfigPath, ...(resolved.slotWidth !== undefined ? { slotWidth: resolved.slotWidth } : {}) },
-                sessionId: job.sessionId
-            });
+            let result: { txHash: string };
+            try {
+                result = await submitter.call({
+                    contractAddress: command.contractAddress,
+                    circuit: isGrant ? 'grantDisclosure' : 'revokeDisclosure',
+                    args: isGrant
+                        ? [hexToBytes(command.payloadHash), hexToBytes(command.grantee), BigInt(command.level)]
+                        : [hexToBytes(command.payloadHash), hexToBytes(command.grantee)],
+                    contractName: command.compiledArtifactRef,
+                    registration: { artifactPath: resolved.artifactPath, artifactDigest: resolved.artifactDigest, privateStateId: resolved.privateStateId, zkConfigPath: resolved.zkConfigPath, ...(resolved.slotWidth !== undefined ? { slotWidth: resolved.slotWidth } : {}) },
+                    sessionId: job.sessionId
+                });
+            } catch (err) {
+                // The chain did not take the level change (rejected, or never
+                // submitted): the confirmed level stays, the request is dropped.
+                if (isGrant) await clearPendingDisclosureLevel(command.disclosureGrantId, command.level);
+                throw err;
+            }
             const changedAt = new Date().toISOString();
             if (isGrant) {
-                await db.run(UPDATE.entity(DisclosureGrants).set({ grantedTxHash: result.txHash, modifiedAt: changedAt }).where({ ID: command.disclosureGrantId }));
+                await db.run(UPDATE.entity(DisclosureGrants)
+                    .set(confirmedDisclosureLevel(command.level, result.txHash, changedAt))
+                    .where({ ID: command.disclosureGrantId }));
             } else {
                 await db.run(UPDATE.entity(DisclosureGrants).set({ revokedTxHash: result.txHash, active: false, modifiedAt: changedAt }).where({ contractAddress: command.contractAddress, payloadHash: command.payloadHash, grantee: command.grantee }));
             }
@@ -1339,9 +1349,9 @@ export function registerSubmissionHandlers(
         if (command.op === 'grantDisclosure' || command.op === 'revokeDisclosure') {
             const isGrant = command.op === 'grantDisclosure';
             if (isGrant) {
-                await db.run(UPDATE.entity(DisclosureGrants).set({
-                    grantedTxHash: evidence.txHash, modifiedAt: changedAt
-                }).where({ ID: command.disclosureGrantId }));
+                await db.run(UPDATE.entity(DisclosureGrants)
+                    .set(confirmedDisclosureLevel(command.level, evidence.txHash, changedAt))
+                    .where({ ID: command.disclosureGrantId }));
             } else {
                 await db.run(UPDATE.entity(DisclosureGrants).set({
                     revokedTxHash: evidence.txHash, active: false, modifiedAt: changedAt
@@ -1950,6 +1960,7 @@ export function registerSubmissionHandlers(
             network: networkId,
             compiledArtifactRef: compiledRef,
             artifactDigest: artifactDigestOrNull(compiledRef),
+            sessionId: data.sessionId ?? null,
             createdAt: insertedAt,
             modifiedAt: insertedAt
         }));
@@ -3314,66 +3325,85 @@ export function registerSubmissionHandlers(
         const granteeLc = data.grantee.toLowerCase();
         const contractAddressLc = data.contractAddress.toLowerCase();
 
-        // Row up-front: a stable pollable handle. active=false (optimistic
-        // placeholder) until the chain indexer confirms the grant in ledger
-        // state; the chain is the source of truth. Reuse an existing row for the
-        // same (contract, payloadHash, grantee) so retries don't orphan rows.
-        const insertedAt = new Date().toISOString();
-        const existingGrant: any = await db.run(
-            SELECT.one.from(DisclosureGrants).columns('ID').where({
-                contractAddress: contractAddressLc,
-                payloadHash: payloadHashLc,
-                grantee: granteeLc
-            })
-        );
-        const disclosureGrantId = existingGrant?.ID ?? cds.utils.uuid();
-        if (existingGrant) {
-            await db.run(UPDATE.entity(DisclosureGrants)
-                .set({ level: levelNum, revokedTxHash: null, modifiedAt: insertedAt })
-                .where({ ID: disclosureGrantId }));
-        } else {
-            await db.run(INSERT.into(DisclosureGrants).entries({
-                ID: disclosureGrantId,
-                payloadHash: payloadHashLc,
-                grantee: granteeLc,
-                level: levelNum,
-                contractAddress: contractAddressLc,
-                grantedTxHash: null,
-                revokedTxHash: null,
-                active: false,
-                createdAt: insertedAt,
-                modifiedAt: insertedAt
-            }));
-        }
-
         return runSubmission(req, async () => {
             const facadeCfg = facadeConfigFromEnv();
             await ensureNetworkId(facadeCfg.networkId);
             await contractResolver(compiledRef);
+            // Session ownership comes first: the grant row is the off-chain
+            // read ACL, so nothing is written for a caller who does not hold
+            // the session (SessionNotFoundError -> 401 below, row untouched).
             await walletFactory({ sessionId: data.sessionId!, db, facadeConfig: facadeCfg, expectedUserId: (req as any).user?.id });
             const sponsor = await resolveSponsorForRequest(req, data.sponsorSessionId);
 
-            const job = await startJob({
-                kind: 'grantDisclosure',
-                sessionId: data.sessionId!,
-                idempotencyKey: data.idempotencyKey,
-                request: {
+            // Row: a stable pollable handle, reused for the same (contract,
+            // payloadHash, grantee) so a retry reuses the row. A NEW row is
+            // inactive until the chain indexer confirms the grant in ledger
+            // state. An EXISTING row keeps its confirmed `level`; the requested
+            // one rides as `pendingLevel` until inclusion, so a request the
+            // chain has not accepted never widens what the grantee may read.
+            const insertedAt = new Date().toISOString();
+            const existingGrant: any = await db.run(
+                SELECT.one.from(DisclosureGrants).columns('ID').where({
+                    contractAddress: contractAddressLc,
+                    payloadHash: payloadHashLc,
+                    grantee: granteeLc
+                })
+            );
+            const disclosureGrantId = existingGrant?.ID ?? cds.utils.uuid();
+            if (existingGrant) {
+                await db.run(UPDATE.entity(DisclosureGrants)
+                    .set({ pendingLevel: levelNum, modifiedAt: insertedAt })
+                    .where({ ID: disclosureGrantId }));
+            } else {
+                await db.run(INSERT.into(DisclosureGrants).entries({
+                    ID: disclosureGrantId,
                     payloadHash: payloadHashLc,
                     grantee: granteeLc,
                     level: levelNum,
+                    pendingLevel: null,
                     contractAddress: contractAddressLc,
-                    disclosureGrantId,
-                    feeSponsor: sponsor?.sponsorSessionId ?? null
-                },
-                requestedBy: (req as any).user?.id,
-                commandVersion: 1,
-                encryptCommand: true,
-                command: {
-                    op: 'grantDisclosure', disclosureGrantId, payloadHash: payloadHashLc,
-                    grantee: granteeLc, level: levelNum, contractAddress: contractAddressLc,
-                    compiledArtifactRef: compiledRef, sponsorSessionId: sponsor?.sponsorSessionId
+                    grantedTxHash: null,
+                    revokedTxHash: null,
+                    active: false,
+                    createdAt: insertedAt,
+                    modifiedAt: insertedAt
+                }));
+            }
+
+            let job: Awaited<ReturnType<typeof startJob>>;
+            try {
+                job = await startJob({
+                    kind: 'grantDisclosure',
+                    sessionId: data.sessionId!,
+                    idempotencyKey: data.idempotencyKey,
+                    request: {
+                        payloadHash: payloadHashLc,
+                        grantee: granteeLc,
+                        level: levelNum,
+                        contractAddress: contractAddressLc,
+                        disclosureGrantId,
+                        feeSponsor: sponsor?.sponsorSessionId ?? null
+                    },
+                    requestedBy: (req as any).user?.id,
+                    commandVersion: 1,
+                    encryptCommand: true,
+                    command: {
+                        op: 'grantDisclosure', disclosureGrantId, payloadHash: payloadHashLc,
+                        grantee: granteeLc, level: levelNum, contractAddress: contractAddressLc,
+                        compiledArtifactRef: compiledRef, sponsorSessionId: sponsor?.sponsorSessionId
+                    }
+                });
+            } catch (err) {
+                // Nothing was admitted: leave no half-written handle behind.
+                if (existingGrant) {
+                    await db.run(UPDATE.entity(DisclosureGrants)
+                        .set({ pendingLevel: null, modifiedAt: new Date().toISOString() })
+                        .where({ ID: disclosureGrantId, pendingLevel: levelNum }));
+                } else {
+                    await db.run(DELETE.from(DisclosureGrants).where({ ID: disclosureGrantId }));
                 }
-            });
+                throw err;
+            }
 
             return { jobId: job.jobId, status: job.status, disclosureGrantId };
         });
@@ -3859,6 +3889,31 @@ export function registerSubmissionHandlers(
      * all errors: an indexing failure must never fail the submission (the row
      * already records intent; a later reindex reconciles).
      */
+    /**
+     * Column values of a grant row once the chain took the level: the
+     * requested level becomes the confirmed one, the pending marker and a
+     * stale revoke are cleared. `active` is left to the disclosure indexer,
+     * which re-materialises it from ledger state right after.
+     */
+    function confirmedDisclosureLevel(level: number, txHash: string, changedAt: string): Record<string, unknown> {
+        return { level, pendingLevel: null, grantedTxHash: txHash, revokedTxHash: null, modifiedAt: changedAt };
+    }
+
+    /**
+     * Drop the pending marker of a level request the chain did not take. The
+     * `pendingLevel` predicate keeps a NEWER request (a different level
+     * asked for after this job was admitted) untouched.
+     */
+    async function clearPendingDisclosureLevel(disclosureGrantId: string, level: number): Promise<void> {
+        try {
+            await db.run(UPDATE.entity(DisclosureGrants)
+                .set({ pendingLevel: null, modifiedAt: new Date().toISOString() })
+                .where({ ID: disclosureGrantId, pendingLevel: level }));
+        } catch {
+            /* best-effort; the marker is never read by the ACL */
+        }
+    }
+
     async function reindexAfterSubmit(contractAddress: string, resolved: ResolvedContract): Promise<void> {
         try {
             await disclosureReindexer({

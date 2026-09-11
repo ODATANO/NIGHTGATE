@@ -459,6 +459,11 @@ entity Documents : cuid, managed {
     network             : String(30); // network id at anchor time
     compiledArtifactRef : String(200); // registered artifact ALIAS the anchor used
     artifactDigest      : HexEncoded; // sha256 of the artifact GENERATION (alias is mutable)
+    // The wallet session that anchored the row. An agent token is bound to
+    // ONE session and reads only that session's rows; rows from releases
+    // before this column carry null and stay owner-readable, never token-
+    // readable.
+    sessionId           : UUID;
 }
 
 /**
@@ -514,7 +519,11 @@ entity DisclosureRoles : cuid, managed {
 entity DisclosureGrants : cuid, managed {
     payloadHash     : HexEncoded not null; // attestation the grant is scoped to
     grantee         : HexEncoded not null; // Bytes<32> grantee identifier
-    level           : Integer not null; // 0 | 1 | 2
+    level           : Integer not null; // 0 | 1 | 2, as confirmed on-chain
+    // Level requested for an existing row while its chain confirmation is
+    // pending. Never read by the disclosure-role ACL; the finalizer moves it
+    // into `level` on inclusion and drops it when the chain refuses.
+    pendingLevel    : Integer;
     contractAddress : HexEncoded not null; // AttestationVault deployment
     grantedTxHash   : HexEncoded; // tx that set this grant on-chain
     revokedTxHash   : HexEncoded; // set when revoked on-chain

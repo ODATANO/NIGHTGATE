@@ -63,6 +63,8 @@ import { FeeSponsorError } from '../../srv/submission/fee-sponsor';
 import { __resetGrantRateLimiterForTests, currentGrantPolicy,
     registerAgentGrantHandlers,
     enforceAgentGrant,
+    grantScopeViolation,
+    circuitsOfRequest,
     hashAgentToken,
     recordDeployedContracts,
     reserveDeployBudget,
@@ -475,6 +477,50 @@ describe('agent grants', () => {
             expect(await currentGrantPolicy(db, 'g1')).toBeNull();
         });
 
+        it('currentGrantPolicy: an expired grant yields no policy, a future validUntil does', async () => {
+            mockDbRun.mockResolvedValueOnce(grantRow({ validUntil: '2000-01-01T00:00:00.000Z', allowedContracts: JSON.stringify(['c1']) }));
+            expect(await currentGrantPolicy(db, 'g1')).toBeNull();
+            mockDbRun.mockResolvedValueOnce(grantRow({ validUntil: new Date(Date.now() + 60_000).toISOString(), allowedContracts: JSON.stringify(['c1']) }));
+            expect(await currentGrantPolicy(db, 'g1')).toMatchObject({ allowedContracts: ['c1'] });
+        });
+
+        it('the grant lists bound every action naming a contract or circuit, an empty list bounds nothing', async () => {
+            const scoped = () => grantRow({
+                allowedActions: JSON.stringify(['anchorDocument', 'issueFieldPredicateAttestation']),
+                allowedContracts: JSON.stringify(['ABCDEF01']),
+                allowedCircuits: JSON.stringify(['attest', 'attestGuarded', 'anchorContentRoot', 'proveFieldPredicate'])
+            });
+            mockDbRun.mockResolvedValueOnce(scoped());
+            const outside = tokenReq('anchorDocument', { sessionId: 'sess-1', contractAddress: 'ffff0000' });
+            await enforceAgentGrant(outside, db);
+            expect(outside.reject).toHaveBeenCalledWith(403, expect.stringMatching(/ffff0000.*allowedContracts/));
+
+            mockDbRun.mockResolvedValueOnce(scoped());
+            const inside = tokenReq('anchorDocument', { sessionId: 'sess-1', contractAddress: 'abcdef01' });
+            await enforceAgentGrant(inside, db);
+            expect(inside.reject).not.toHaveBeenCalled();
+            expect(inside.user.id).toBe(TEST_USER_ID);
+
+            mockDbRun.mockResolvedValueOnce(scoped());
+            const circuit = tokenReq('issueFieldPredicateAttestation', { sessionId: 'sess-1', contractAddress: 'abcdef01', circuit: 'bindPassport' });
+            await enforceAgentGrant(circuit, db);
+            expect(circuit.reject).toHaveBeenCalledWith(403, expect.stringMatching(/bindPassport.*allowedCircuits/));
+
+            mockDbRun.mockResolvedValueOnce(grantRow({ allowedContracts: null, allowedCircuits: null }));
+            const open = tokenReq('anchorDocument', { sessionId: 'sess-1', contractAddress: 'ffff0000' });
+            await enforceAgentGrant(open, db);
+            expect(open.reject).not.toHaveBeenCalled();
+
+            // the sponsoring actions keep their own floor-and-grant check in the worker
+            mockDbRun.mockResolvedValueOnce(grantRow({
+                allowedActions: JSON.stringify(['sponsorFinalizedTransaction']), sponsorSessionId: 'sponsor-1',
+                allowedContracts: JSON.stringify(['abcdef01'])
+            }));
+            const sponsored = tokenReq('sponsorFinalizedTransaction', { sessionId: 'sess-1', contractAddress: 'ffff0000', transactionHex: '00' });
+            await enforceAgentGrant(sponsored, db);
+            expect(sponsored.reject).not.toHaveBeenCalled();
+        });
+
         it('is a no-op without the token header', async () => {
             const req = makeReq({}, { event: 'anchorDocument', user: { id: 'u' } });
             await enforceAgentGrant(req, db);
@@ -606,10 +652,24 @@ describe('agent grants', () => {
             expect(req.reject).toHaveBeenCalledWith(403, expect.stringContaining('sessionId'));
         });
 
+        it('refuses READs of entities outside the agent-readable set', async () => {
+            for (const target of ['NightgateService.GranteeIdentities', 'NightgateService.DisclosureRoles', 'NightgateService.Anything']) {
+                mockDbRun.mockResolvedValueOnce(grantRow());
+                const whereSpy = vi.fn();
+                const req = tokenReq('READ');
+                req.target = { name: target };
+                req.query = { where: whereSpy };
+                await enforceAgentGrant(req, db);
+                expect(req.reject).toHaveBeenCalledWith(403, expect.stringMatching(new RegExp(target.split('.').pop() as string)));
+                expect(whereSpy).not.toHaveBeenCalled();
+            }
+        });
+
         it('narrows READs of session-scoped entities to the grant, leaves chain entities open', async () => {
             for (const [target, expectedWhere] of [
                 ['NightgateService.WalletSessions', { sessionId: 'sess-1' }],
                 ['NightgateService.PendingSubmissions', { sessionId: 'sess-1' }],
+                ['NightgateService.Documents', { sessionId: 'sess-1' }],
                 ['NightgateService.AgentGrants', { ID: 'grant-1' }]
             ] as const) {
                 mockDbRun.mockResolvedValueOnce(grantRow());
@@ -802,5 +862,65 @@ describe('agent grants', () => {
             await enforceAgentGrant(req, db);
             expect(req.reject).toHaveBeenCalledWith(429, expect.stringContaining('budget'));
         });
+    });
+});
+
+describe('agent grant circuit scope follows the action, not the request fields', () => {
+    const db = { run: mockDbRun };
+    const TOKEN_R2 = 'ngat_' + 'd'.repeat(64);
+    const tokenReq = (event: string, data: Record<string, unknown>) => ({
+        event, data, headers: { 'x-agent-token': TOKEN_R2 }, reject: vi.fn(), user: { id: 'anonymous' }
+    }) as any;
+    const attestOnly = (actions: string[]) => grantRow({
+        allowedActions: JSON.stringify(actions),
+        allowedContracts: JSON.stringify(['abcdef01']), allowedCircuits: JSON.stringify(['attest'])
+    });
+
+    it('grantDisclosure runs the grantDisclosure circuit, so a grant limited to attest is refused', async () => {
+        mockDbRun.mockResolvedValueOnce(attestOnly(['grantDisclosure']));
+        const req = tokenReq('grantDisclosure', { sessionId: 'sess-1', contractAddress: 'abcdef01', payloadHash: 'b'.repeat(64), grantee: 'c'.repeat(64), level: 2 });
+        await enforceAgentGrant(req, db);
+        expect(req.reject).toHaveBeenCalledWith(403, expect.stringMatching(/grantDisclosure.*allowedCircuits/));
+    });
+
+    it('a batch names its circuits in the calls JSON and every one of them counts', async () => {
+        mockDbRun.mockResolvedValueOnce(attestOnly(['submitContractCallBatch']));
+        const calls = JSON.stringify([{ circuit: 'attest', args: [] }, { circuit: 'revokeDisclosure', args: ['b'.repeat(64), 'c'.repeat(64)] }]);
+        const req = tokenReq('submitContractCallBatch', { sessionId: 'sess-1', contractAddress: 'abcdef01', calls });
+        await enforceAgentGrant(req, db);
+        expect(req.reject).toHaveBeenCalledWith(403, expect.stringMatching(/revokeDisclosure.*allowedCircuits/));
+    });
+
+    it('anchorDocument commits by default and needs only attestGuarded; guarded false needs only attest', () => {
+        const plainOnly = { allowedContracts: null, allowedCircuits: JSON.stringify(['attest']) };
+        expect(grantScopeViolation(plainOnly, { contractAddress: 'abcdef01' }, 'anchorDocument')).toMatch(/attestGuarded/);
+        expect(grantScopeViolation(plainOnly, { contractAddress: 'abcdef01', guarded: false }, 'anchorDocument')).toBeNull();
+        expect(grantScopeViolation(plainOnly, { contractAddress: 'abcdef01', nonce: 'ab'.repeat(32) }, 'anchorDocument')).toMatch(/attestGuarded/);
+        const guardedOnly = { allowedContracts: null, allowedCircuits: JSON.stringify(['attestGuarded']) };
+        expect(grantScopeViolation(guardedOnly, { contractAddress: 'abcdef01' }, 'anchorDocument')).toBeNull();
+        expect(grantScopeViolation(guardedOnly, { contractAddress: 'abcdef01', nonce: 'ab'.repeat(32) }, 'anchorDocument')).toBeNull();
+        expect(grantScopeViolation(guardedOnly, { contractAddress: 'abcdef01' }, 'attestAgentOutput')).toBeNull();
+        expect(grantScopeViolation(plainOnly, { contractAddress: 'abcdef01', guarded: false }, 'attestAgentOutput')).toMatch(/attestGuarded/);
+        expect(circuitsOfRequest('anchorDocument', {})).toEqual(['attestGuarded']);
+        expect(circuitsOfRequest('anchorDocument', { guarded: false })).toEqual(['attest']);
+    });
+
+    it('an action whose circuits cannot be derived is refused while a circuit list is set, and passes without one', () => {
+        const listed = { allowedContracts: null, allowedCircuits: JSON.stringify(['attest']) };
+        expect(grantScopeViolation(listed, { contractAddress: 'abcdef01' }, 'someFutureAction')).toMatch(/cannot be matched/);
+        expect(grantScopeViolation(listed, { contractAddress: 'abcdef01', calls: 'not json' }, 'submitContractCallBatch')).toMatch(/cannot be matched/);
+        expect(grantScopeViolation(listed, { contractAddress: 'abcdef01', calls: JSON.stringify([{ args: [] }]) }, 'submitContractCallBatch')).toMatch(/cannot be matched/);
+        expect(grantScopeViolation({ allowedContracts: null, allowedCircuits: null }, { contractAddress: 'abcdef01' }, 'someFutureAction')).toBeNull();
+        expect(grantScopeViolation(listed, {}, 'reindexDisclosures')).toBeNull();
+    });
+
+    it('circuitsOfRequest lists the server-side circuits of every grantable action', () => {
+        expect(circuitsOfRequest('issueFieldPredicateAttestationBatch', {})).toEqual(expect.arrayContaining(['anchorContentRoot', 'proveFieldPredicate', 'proveFieldEquality', 'proveFieldMembership', 'proveDocumentComparison']));
+        expect(circuitsOfRequest('issueDocumentDiffAttestation', {})).toEqual(expect.arrayContaining(['anchorContentRoot', 'proveDocumentComparison']));
+        expect(circuitsOfRequest('commitDocumentAnchor', {})).toEqual(['attestGuarded']);
+        expect(circuitsOfRequest('revokeDisclosure', {})).toEqual(['revokeDisclosure']);
+        expect(circuitsOfRequest('reindexDisclosures', {})).toEqual([]);
+        expect(circuitsOfRequest('unknownAction', {})).toBeNull();
+        expect(circuitsOfRequest('unknownAction', { circuit: 'attest' })).toEqual(['attest']);
     });
 });

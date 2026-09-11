@@ -5,16 +5,27 @@
  * encrypted under passwords derived from a random 32-byte DEK per account.
  * The DEK is stored in `AccountKeys`, sealed twice:
  *
- *   wrappedDek             v2 envelope under the ring's ACTIVE key (crypto.ts);
- *                          the key id sits in the prefix, so the boot preflight
- *                          scans it and the rewrap tool rotates it WITHOUT the
- *                          viewing key
- *   wrappedDekByViewingKey AES-256-GCM under HKDF(storage password), where the
- *                          storage password derives from the viewing key; a
- *                          session presenting the viewing key opens its DEK
- *                          even when the ring no longer holds the key that
- *                          wrapped `wrappedDek`, and re-seals it under the
- *                          active key on the spot
+ *   wrappedDek             v3 envelope under the ring's ACTIVE key (crypto.ts),
+ *                          bound to the account id; the key id sits in the
+ *                          prefix, so the boot preflight scans it and the
+ *                          rewrap tool rotates it WITHOUT the viewing key
+ *   wrappedDekByViewingKey the viewing-key seal (`vk1:...`, AES-256-GCM under
+ *                          HKDF(storage password), where the storage password
+ *                          derives from the viewing key) wrapped in a v3
+ *                          envelope under the ring, bound to the account id.
+ *                          Opening it takes BOTH secrets: a database copy plus
+ *                          a viewing key opens nothing without the ring, and
+ *                          a session still proves its viewing key against the
+ *                          account (a wrong key is refused even when the ring
+ *                          opened `wrappedDek`). The outer envelope rotates
+ *                          with the ring like `wrappedDek`; a bare `vk1:` seal
+ *                          from before this format is read and wrapped on
+ *                          first use.
+ *
+ * A ring key that left the ring without a rewrap cannot be replaced by the
+ * viewing key: the rewrap tool is the rotation path, and a DEK sealed under
+ * a lost key is lost with it, private states and signing keys included
+ * (signing keys have a custody export for that case).
  *
  * Rows written before the DEK existed (`keyScheme` null) were encrypted under
  * derivations that need the viewing key; they are migrated when a session
@@ -25,6 +36,7 @@
 import crypto from 'node:crypto';
 import cds from '@sap/cds';
 import { encrypt, decrypt, inspectCiphertext, KeyRing, UnknownEncryptionKeyError } from '../utils/crypto';
+import { accountDekBinding, accountDekViewingKeySealBinding } from '../utils/envelope-bindings';
 
 const { SELECT, INSERT, UPDATE } = cds.ql;
 const ENTITY = 'midnight.AccountKeys';
@@ -82,12 +94,34 @@ export function openDekByStoragePassword(sealed: string, storagePassword: string
     }
 }
 
-function wrapDek(dek: Buffer, ring: KeyRing): string {
-    return encrypt(dek.toString('hex'), ring);
+/** True for a bare `vk1:` seal written before the ring wrapped it. */
+export function isBareViewingKeySeal(stored: string): boolean {
+    return String(stored).startsWith(`${VK_SEAL_VERSION}:`);
 }
 
-function unwrapDek(wrapped: string, ring: KeyRing): Buffer {
-    const hex = decrypt(wrapped, ring);
+/**
+ * Seal the DEK under the viewing key AND the ring: the `vk1` seal wrapped in
+ * a ring envelope bound to the account. Either secret alone opens nothing.
+ */
+export function sealDekByViewingKey(dek: Buffer, storagePassword: string, ring: KeyRing, accountId: string): string {
+    return encrypt(sealDekByStoragePassword(dek, storagePassword), ring, accountDekViewingKeySealBinding(accountId));
+}
+
+/**
+ * Open a viewing-key seal: the ring envelope first (a bare `vk1:` seal from
+ * before the wrapping is accepted as is), then the storage password.
+ */
+export function openDekByViewingKey(stored: string, storagePassword: string, ring: KeyRing, accountId: string): Buffer {
+    const inner = isBareViewingKeySeal(stored) ? stored : decrypt(stored, ring, accountDekViewingKeySealBinding(accountId));
+    return openDekByStoragePassword(inner, storagePassword);
+}
+
+function wrapDek(dek: Buffer, ring: KeyRing, accountId: string): string {
+    return encrypt(dek.toString('hex'), ring, accountDekBinding(accountId));
+}
+
+function unwrapDek(wrapped: string, ring: KeyRing, accountId: string): Buffer {
+    const hex = decrypt(wrapped, ring, accountDekBinding(accountId));
     const dek = Buffer.from(hex, 'hex');
     if (dek.length !== DEK_LENGTH) throw new Error(`Invalid account key length: ${dek.length}`);
     return dek;
@@ -206,23 +240,27 @@ async function resolveUncached(args: ResolveAccountDekArgs, token: symbol): Prom
         let dek: Buffer | undefined;
         let ringError: unknown;
         try {
-            dek = unwrapDek(row.wrappedDek, ring);
+            dek = unwrapDek(row.wrappedDek, ring, accountId);
         } catch (err) {
             ringError = err;
         }
         let vkOpens: boolean | undefined;
+        let vkUnknownKey: UnknownEncryptionKeyError | undefined;
         if (storagePassword && row.wrappedDekByViewingKey) {
             try {
-                const viaVk = openDekByStoragePassword(row.wrappedDekByViewingKey, storagePassword);
+                const viaVk = openDekByViewingKey(row.wrappedDekByViewingKey, storagePassword, ring, accountId);
                 vkOpens = !dek || viaVk.equals(dek);
                 dek ??= viaVk;
-            } catch {
-                vkOpens = false;
+            } catch (err) {
+                // The seal's own ring key missing is not a wrong viewing key.
+                if (err instanceof UnknownEncryptionKeyError) vkUnknownKey = err;
+                else vkOpens = false;
             }
         }
         if (!dek) {
-            const reason = ringError instanceof UnknownEncryptionKeyError
-                ? `it is sealed under encryption key id '${ringError.keyId}', which is not in the ring`
+            const missing = ringError instanceof UnknownEncryptionKeyError ? ringError : vkUnknownKey;
+            const reason = missing
+                ? `it is sealed under encryption key id '${missing.keyId}', which is not in the ring`
                 : storagePassword ? 'neither the ring nor the viewing key opens it' : 'the ring does not open it and no viewing key is at hand';
             throw new AccountDekUnavailableError(accountId, reason);
         }
@@ -231,10 +269,28 @@ async function resolveUncached(args: ResolveAccountDekArgs, token: symbol): Prom
             // this account's: a session never reads another wallet's rows.
             throw new AccountDekUnavailableError(accountId, 'the viewing key does not match the account key');
         }
-        const { keyId } = inspectCiphertext(row.wrappedDek);
-        if (keyId !== ring.activeId || ringError) {
-            const set: Record<string, unknown> = { wrappedDek: wrapDek(dek, ring), rotatedAt: new Date().toISOString() };
-            if (storagePassword && !row.wrappedDekByViewingKey) set.wrappedDekByViewingKey = sealDekByStoragePassword(dek, storagePassword);
+        const { keyId, version } = inspectCiphertext(row.wrappedDek);
+        const set: Record<string, unknown> = {};
+        if (keyId !== ring.activeId || version !== 3 || ringError) {
+            set.wrappedDek = wrapDek(dek, ring, accountId);
+        }
+        if (storagePassword && !row.wrappedDekByViewingKey) {
+            set.wrappedDekByViewingKey = sealDekByViewingKey(dek, storagePassword, ring, accountId);
+        } else if (row.wrappedDekByViewingKey && isBareViewingKeySeal(row.wrappedDekByViewingKey)) {
+            // A seal from before the ring wrapped it: wrap it now, no viewing
+            // key needed for that.
+            set.wrappedDekByViewingKey = encrypt(row.wrappedDekByViewingKey, ring, accountDekViewingKeySealBinding(accountId));
+        } else if (row.wrappedDekByViewingKey && !vkUnknownKey) {
+            const sealed = inspectCiphertext(row.wrappedDekByViewingKey);
+            if (sealed.keyId !== ring.activeId) {
+                // Rotate the outer envelope with the ring; the inner seal stays.
+                set.wrappedDekByViewingKey = encrypt(
+                    decrypt(row.wrappedDekByViewingKey, ring, accountDekViewingKeySealBinding(accountId)),
+                    ring, accountDekViewingKeySealBinding(accountId));
+            }
+        }
+        if (Object.keys(set).length) {
+            set.rotatedAt = new Date().toISOString();
             await db.run(UPDATE.entity(ENTITY).set(set).where({ accountId }));
         }
         const copy = Buffer.from(dek);
@@ -248,8 +304,8 @@ async function resolveUncached(args: ResolveAccountDekArgs, token: symbol): Prom
     try {
         await db.run(INSERT.into(ENTITY).entries({
             accountId,
-            wrappedDek: wrapDek(dek, ring),
-            wrappedDekByViewingKey: sealDekByStoragePassword(dek, storagePassword),
+            wrappedDek: wrapDek(dek, ring, accountId),
+            wrappedDekByViewingKey: sealDekByViewingKey(dek, storagePassword, ring, accountId),
             createdAt: now,
             rotatedAt: null
         }));

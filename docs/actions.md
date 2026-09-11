@@ -490,7 +490,10 @@ recreate and a ~20 min cold sponsor pool. Two layers replace that:
   the platform pool by default; bind the grant to one sponsor session, or to
   the pool sentinel, when its jobs are to be paid for.
 - **Always allowed under any token** (no allow-list entry, no budget):
-  entity reads (owner-scoped), `verifyDocument`, `verifyAttestationState`,
+  entity reads (chain projections as-is; `WalletSessions`,
+  `PendingSubmissions` and `Documents` narrowed to the grant's session,
+  `AgentGrants` to the grant itself; `GranteeIdentities` and every other
+  entity answer 403), `verifyDocument`, `verifyAttestationState`,
   `verifyPredicateState`, `verifyPredicateAttestation`,
   `prepareDocumentProof`, `prepareAnchorCommitment`, `prepareMembershipSet`,
   `deriveTokenType` and `getJobStatus`. Everything else needs an entry in
@@ -502,10 +505,21 @@ recreate and a ~20 min cold sponsor pool. Two layers replace that:
   (`AGENT_GRANT_REVOKED`), a narrowed policy file applies to them too.
 - **Policy follows the grant.** `createAgentGrant(..., allowedContracts,
   allowedCircuits, allowedTokenTypes)` records which contracts, circuits and
-  (0.22.0) shielded token types THAT consumer may have sponsored. A sponsored call made with the grant's token runs under the
-  intersection of the platform lists and the grant's; an absent grant list
-  inherits the platform list, and for contracts and circuits an empty
-  platform list lets the grant be the whole policy. Token types differ:
+  (0.22.0) shielded token types THAT consumer may touch. The lists bound
+  EVERY action made with the grant's token (0.23.4): an `anchorDocument` or
+  `issue*` call naming a `contractAddress` outside `allowedContracts` is
+  refused with 403 at admission, and so is an action whose circuits are not
+  all in `allowedCircuits`. The circuits come from the action, not from a
+  request field: `grantDisclosure` needs `grantDisclosure`, `anchorDocument`
+  needs `attestGuarded` (`attest` with `guarded: false`), the `issue*` actions need their proof circuit(s) plus
+  `anchorContentRoot`, a batch needs every circuit in its `calls`. An empty
+  list is no restriction; an action whose circuits cannot be derived is
+  refused while a list is set. A sponsored call additionally runs under
+  the intersection of the platform lists and the grant's; an absent grant
+  list inherits the platform list, and for contracts and circuits an empty
+  platform list lets the grant be the whole policy. The policy a queued job
+  runs under is re-read at execution, so an expired grant sponsors nothing
+  after `validUntil`, whenever the job was admitted. Token types differ:
   an empty platform list means NO offers, whatever the grant says (the
   floor opens offers, a grant only narrows them). Onboarding a consumer is then one call, and revoking the
   grant removes its sponsoring reach with it. Two non-empty lists that share
@@ -729,7 +743,7 @@ The id-free counterpart to `verifyPredicateAttestation`: recomputes the on-chain
 
 ## Disclosure grants
 
-Surface the AttestationVault tiered-disclosure ACL (who is entitled to which tier of an attestation, on-chain) plus the passport-ownership registry. The grant/revoke circuits are attester-gated, `registerPassport` is registrar-gated (each enforced in-circuit; an unauthorized caller's tx is rejected). `level`: `0` = public, `1` = legitimate-interest, `2` = authority (EU Battery Reg Annex XIII tiers). See [the AttestationVault contract](../contracts/attestation-vault). **Note:** delivering tier-specific *cleartext* stays off-chain (consumer `after READ` redaction) - only entitlement is on-chain.
+Surface the AttestationVault tiered-disclosure ACL (who is entitled to which tier of an attestation, on-chain) plus the identifier-ownership registry (the `registerPassport` / `bindPassport` circuits bind an external document identifier to an attestation; the names are the contract's API). The grant/revoke circuits are attester-gated, `registerPassport` is registrar-gated (each enforced in-circuit; an unauthorized caller's tx is rejected). `level`: `0` = public, `1` = legitimate-interest, `2` = authority (EU Battery Reg Annex XIII tiers). See [the AttestationVault contract](../contracts/attestation-vault). **Note:** delivering tier-specific *cleartext* stays off-chain (consumer `after READ` redaction) - only entitlement is on-chain.
 
 ### `grantDisclosure(payloadHash, grantee, level, sessionId, contractAddress, compiledArtifactRef?, idempotencyKey?, sponsorSessionId?) → { jobId, status, disclosureGrantId }`
 

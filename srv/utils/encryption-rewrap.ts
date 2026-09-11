@@ -4,12 +4,16 @@
  * rewrap that moves every row to the active key (`nightgate-rewrap-keys`).
  *
  * Ring-sealed columns (the key id is in the value's prefix, so they are
- * scanned without decryption and rewrapped without any wallet secret):
+ * scanned without decryption and rewrapped without any wallet secret; every
+ * rewrap writes the v3 envelope bound to the row, envelope-bindings.ts):
  *   WalletSessions.encryptedViewingKey / encryptedSeedKey   envelope (crypto.ts)
  *   BackgroundJobs.command where commandEncoding=aes-gcm-v1 envelope (crypto.ts)
  *   AccountKeys.wrappedDek                                  envelope (crypto.ts):
  *     the per-account data key that PrivateStates, ContractSigningKeys and the
  *     WalletSyncStates blobs are encrypted under (account-keys.ts)
+ *   AccountKeys.wrappedDekByViewingKey                      envelope around the
+ *     viewing-key seal; a bare `vk1:` seal from before the wrapping is wrapped
+ *     here without the viewing key
  *
  * Legacy rows (`keyScheme` null on PrivateStates / ContractSigningKeys /
  * WalletSyncStates) were written before the account DEK under derivations
@@ -23,8 +27,12 @@
 
 import cds from '@sap/cds';
 import {
-    decrypt, encrypt, inspectCiphertext, getEncryptionKey, UnknownEncryptionKeyError, KeyRing, LEGACY_KEY_ID
+    decrypt, encrypt, inspectCiphertext, getEncryptionKey, UnknownEncryptionKeyError, KeyRing, LEGACY_KEY_ID,
+    BOUND_ENVELOPE_VERSION, ENVELOPE_VERSION, EnvelopeBinding
 } from './crypto';
+import {
+    walletSessionViewingKeyBinding, walletSessionSeedBinding, jobCommandBinding, accountDekBinding, accountDekViewingKeySealBinding
+} from './envelope-bindings';
 import { StorageEncryption, decryptWithPassword, extractEncryptedComponents } from './storage-encryption';
 // Static: one module instance (and one DEK cache) shared with the sessions
 // that read the same rows; the heavy wallet modules below stay lazy.
@@ -42,13 +50,23 @@ export interface CiphertextColumn {
     /** Extra filter for the rows that hold ciphertext. */
     where?: Record<string, unknown>;
     whereSql?: string;
+    /** Columns the binding needs besides the key. */
+    select?: string[];
+    /** The v3 binding of a row's value (envelope-bindings.ts). */
+    binding: (row: Record<string, any>) => EnvelopeBinding;
+    /** A value with this prefix is not an envelope but plaintext to wrap (a bare seal). */
+    plainPrefix?: string;
 }
 
+/** Prefix of a bare viewing-key seal (account-keys.ts) that predates the ring wrapping. */
+export const BARE_VIEWING_KEY_SEAL_PREFIX = 'vk1:';
+
 export const ENVELOPE_COLUMNS: readonly CiphertextColumn[] = [
-    { entity: 'midnight.WalletSessions', table: 'midnight_WalletSessions', key: 'ID', column: 'encryptedViewingKey' },
-    { entity: 'midnight.WalletSessions', table: 'midnight_WalletSessions', key: 'ID', column: 'encryptedSeedKey' },
-    { entity: 'midnight.BackgroundJobs', table: 'midnight_BackgroundJobs', key: 'ID', column: 'command', where: { commandEncoding: 'aes-gcm-v1' }, whereSql: "commandEncoding = 'aes-gcm-v1'" },
-    { entity: 'midnight.AccountKeys', table: 'midnight_AccountKeys', key: 'accountId', column: 'wrappedDek' }
+    { entity: 'midnight.WalletSessions', table: 'midnight_WalletSessions', key: 'ID', column: 'encryptedViewingKey', select: ['sessionId'], binding: r => walletSessionViewingKeyBinding(r.sessionId) },
+    { entity: 'midnight.WalletSessions', table: 'midnight_WalletSessions', key: 'ID', column: 'encryptedSeedKey', select: ['sessionId'], binding: r => walletSessionSeedBinding(r.sessionId) },
+    { entity: 'midnight.BackgroundJobs', table: 'midnight_BackgroundJobs', key: 'ID', column: 'command', where: { commandEncoding: 'aes-gcm-v1' }, whereSql: "commandEncoding = 'aes-gcm-v1'", binding: r => jobCommandBinding(r.ID) },
+    { entity: 'midnight.AccountKeys', table: 'midnight_AccountKeys', key: 'accountId', column: 'wrappedDek', binding: r => accountDekBinding(r.accountId) },
+    { entity: 'midnight.AccountKeys', table: 'midnight_AccountKeys', key: 'accountId', column: 'wrappedDekByViewingKey', binding: r => accountDekViewingKeySealBinding(r.accountId), plainPrefix: BARE_VIEWING_KEY_SEAL_PREFIX }
 ];
 
 /** Tables whose rows are under the account DEK once `keyScheme` = 'dek1'; null = legacy derivation. */
@@ -58,11 +76,17 @@ export const DEK_TABLES = [
     { entity: 'midnight.WalletSyncStates', table: 'midnight_WalletSyncStates', what: 'sync-state row(s)' }
 ] as const;
 
-/** Key id named by the first bytes of a stored ciphertext (no decryption). */
-export function keyIdFromPrefix(prefix: string): string {
-    if (prefix.startsWith('v2:')) {
-        const end = prefix.indexOf(':', 3);
-        return end > 3 ? prefix.slice(3, end) : prefix.slice(3);
+/**
+ * Key id named by the first bytes of a stored ciphertext (no decryption);
+ * null for a bare viewing-key seal, which names no ring key.
+ */
+export function keyIdFromPrefix(prefix: string): string | null {
+    if (prefix.startsWith(BARE_VIEWING_KEY_SEAL_PREFIX)) return null;
+    for (const version of [BOUND_ENVELOPE_VERSION, ENVELOPE_VERSION]) {
+        const head = `${version}:`;
+        if (!prefix.startsWith(head)) continue;
+        const end = prefix.indexOf(':', head.length);
+        return end > head.length ? prefix.slice(head.length, end) : prefix.slice(head.length);
     }
     return LEGACY_KEY_ID;
 }
@@ -82,7 +106,8 @@ export async function scanStoredKeyIds(db: Db): Promise<Array<{ column: Cipherte
         const ids = new Set<string>();
         for (const r of (Array.isArray(rows) ? rows : [])) {
             const prefix = String(r.prefix ?? r.PREFIX ?? '');
-            if (prefix) ids.add(keyIdFromPrefix(prefix));
+            const id = prefix ? keyIdFromPrefix(prefix) : null;
+            if (id) ids.add(id);
         }
         out.push({ column, keyIds: [...ids].sort() });
     }
@@ -202,7 +227,7 @@ export async function rewrapStoredCiphertexts(db: Db, opts: RewrapOptions = {}):
         const stats = { column: `${column.entity}.${column.column}`, scanned: 0, rewrapped: 0, unreadable: 0, bySourceKey: {} as Record<string, number> };
         let last: string | undefined;
         for (;;) {
-            let q = SELECT.from(column.entity).columns(column.key, column.column, ...Object.keys(column.where ?? {})).orderBy(column.key).limit(batchSize);
+            let q = SELECT.from(column.entity).columns(column.key, column.column, ...(column.select ?? []), ...Object.keys(column.where ?? {})).orderBy(column.key).limit(batchSize);
             if (last !== undefined) q = q.where({ [column.key]: { '>': last } });
             const rows: Array<Record<string, any>> = await db.run(q);
             if (!rows?.length) break;
@@ -213,11 +238,18 @@ export async function rewrapStoredCiphertexts(db: Db, opts: RewrapOptions = {}):
                 if (typeof value !== 'string' || !value) continue;
                 if (column.where && !Object.entries(column.where).every(([k, v]) => row[k] === v)) continue;
                 stats.scanned++;
+                const binding = column.binding(row);
+                if (column.plainPrefix && value.startsWith(column.plainPrefix)) {
+                    // A bare value that predates the envelope: wrap it as is.
+                    stats.bySourceKey.bare = (stats.bySourceKey.bare ?? 0) + 1;
+                    updates.push({ id: String(row[column.key]), value: encrypt(value, ring, binding) });
+                    continue;
+                }
                 const { version, keyId } = inspectCiphertext(value);
-                if (version === 2 && keyId === ring.activeId) continue;
+                if (version === 3 && keyId === ring.activeId) continue;
                 let plain: string;
                 try {
-                    plain = decrypt(value, ring);
+                    plain = decrypt(value, ring, binding);
                 } catch (err) {
                     if (err instanceof UnknownEncryptionKeyError) throw err;
                     // Wrong secret for a known id, or a damaged value: left as
@@ -226,7 +258,7 @@ export async function rewrapStoredCiphertexts(db: Db, opts: RewrapOptions = {}):
                     continue;
                 }
                 stats.bySourceKey[keyId] = (stats.bySourceKey[keyId] ?? 0) + 1;
-                updates.push({ id: String(row[column.key]), value: encrypt(plain, ring) });
+                updates.push({ id: String(row[column.key]), value: encrypt(plain, ring, binding) });
             }
             if (updates.length && !dryRun) {
                 await db.tx(async tx => {
@@ -273,8 +305,8 @@ async function migrateLegacyRows(db: Db, ring: KeyRing, dryRun: boolean, report:
     // eslint-disable-next-line @typescript-eslint/no-var-requires
     const { deriveStableSalt, syncStatePassphraseCandidates, SALT_LABEL_DEK } = require('../submission/wallet-sync-state-store') as typeof import('../submission/wallet-sync-state-store');
 
-    const sessions: Array<{ encryptedViewingKey: string | null }> = await db.run(
-        SELECT.from('midnight.WalletSessions').columns('encryptedViewingKey').where({ encryptedViewingKey: { '!=': null } })
+    const sessions: Array<{ sessionId: string; encryptedViewingKey: string | null }> = await db.run(
+        SELECT.from('midnight.WalletSessions').columns('sessionId', 'encryptedViewingKey').where({ encryptedViewingKey: { '!=': null } })
     );
     const migrated = new Set<string>();
     const seen = new Set<string>();
@@ -282,7 +314,7 @@ async function migrateLegacyRows(db: Db, ring: KeyRing, dryRun: boolean, report:
         if (!s.encryptedViewingKey) continue;
         let viewingKey: string;
         try {
-            viewingKey = decrypt(s.encryptedViewingKey, ring);
+            viewingKey = decrypt(s.encryptedViewingKey, ring, walletSessionViewingKeyBinding(s.sessionId));
         } catch (err) {
             if (err instanceof UnknownEncryptionKeyError) throw err;
             report.syncState.sessionsUnreadable++;

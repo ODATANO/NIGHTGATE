@@ -43,23 +43,28 @@ export function registerAttestationServiceHandlers(
     srv: cds.ApplicationService,
     db: cds.DatabaseService
 ): void {
-    // 1. Populate req.disclosureRole on every incoming request. The handler
-    //    no-ops if there's no req.user (anonymous → public_only default).
+    // 1. Populate req.disclosureRole on every incoming request, so handlers
+    //    of ungated entities and consumer code see it. The handler no-ops if
+    //    there's no req.user (anonymous -> public_only default).
     (srv as any).before('*', async (req: cds.Request) => {
         await attachDisclosureRole(req, db);
     });
 
-    // 2. Gate per-entity reads. Service handlers run AFTER the before('*')
-    //    hook so the role is already on req. We use entity-specific before
-    //    handlers so the rejection fires before CAP runs the DB query.
-    (srv as any).before('READ', 'Disclosed', makeTierGate('Disclosed'));
-    (srv as any).before('READ', 'Authority', makeTierGate('Authority'));
+    // 2. Gate per-entity reads. CAP starts every before-handler of an event
+    //    at once, so the gate cannot rely on the '*' hook having finished:
+    //    it resolves the role itself when it is not on the request yet. The
+    //    rejection still fires before CAP runs the DB query.
+    (srv as any).before('READ', 'Disclosed', makeTierGate('Disclosed', db));
+    (srv as any).before('READ', 'Authority', makeTierGate('Authority', db));
 }
 
-function makeTierGate(tier: AttestationTier) {
+function makeTierGate(tier: AttestationTier, db: cds.DatabaseService) {
     const required = REQUIRED[tier];
-    return (req: cds.Request) => {
-        const actual = (req as any).disclosureRole as DisclosureRoleValue | undefined;
+    return async (req: cds.Request) => {
+        let actual = (req as any).disclosureRole as DisclosureRoleValue | undefined;
+        if (actual === undefined) {
+            actual = await attachDisclosureRole(req, db);
+        }
         if (!meetsDisclosure(actual, required)) {
             return req.reject(403, `disclosure tier '${tier}' requires role '${required}'; caller has '${actual ?? 'public_only'}'`);
         }

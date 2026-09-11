@@ -13,6 +13,8 @@ import {
     DISCLOSURE_ROLE_VALUES
 } from './middleware/disclosure-role';
 import { decrypt, getEncryptionKey } from './utils/crypto';
+import { walletSessionViewingKeyBinding } from './utils/envelope-bindings';
+import { exportContractSigningKeyForSession, SigningKeyExportError } from './submission/signing-key-export';
 import { deriveAccountId } from './submission/wallet-material-factory';
 import { evictWalletFacade } from './submission/wallet-facade-builder';
 
@@ -27,10 +29,10 @@ import { getConfiguredNightgateNetwork } from './utils/nightgate-config';
  * forced invalidation removes secrets from RAM, not just the DB.
  * Best-effort: eviction failures never block the invalidation.
  */
-async function evictSessionFacade(session: { encryptedViewingKey?: string | null }): Promise<void> {
+async function evictSessionFacade(session: { sessionId: string; encryptedViewingKey?: string | null }): Promise<void> {
     try {
         if (session.encryptedViewingKey) {
-            const vk = decrypt(session.encryptedViewingKey, getEncryptionKey());
+            const vk = decrypt(session.encryptedViewingKey, getEncryptionKey(), walletSessionViewingKeyBinding(session.sessionId));
             const accountId = deriveAccountId(vk);
             // Deliberately account-wide (operator tool: forced invalidation
             // must drop secrets even if other sessions share the wallet).
@@ -192,11 +194,23 @@ export default class NightgateAdminService extends cds.ApplicationService {
             );
         });
 
+        this.on('exportContractSigningKey', async (req: Request) => {
+            const { sessionId, contractAddress, password } = req.data as { sessionId?: string; contractAddress?: string; password?: string };
+            try {
+                const out = await exportContractSigningKeyForSession(this.db, getEncryptionKey(), String(sessionId ?? ''), String(contractAddress ?? ''), String(password ?? ''));
+                cds.log('nightgate:admin').info('signing key exported', out.contractAddress.slice(0, 16), 'account', out.accountId.slice(0, 16), 'by', req.user?.id);
+                return out;
+            } catch (err) {
+                if (err instanceof SigningKeyExportError) return req.reject(err.status, err.message);
+                throw err;
+            }
+        });
+
         this.on('invalidateAllSessions', async () => {
             // Evict cached facades before nulling keys so live signing keys are
             // dropped from RAM too.
             const active: any[] = (await this.db.run(
-                SELECT.from(WalletSessions).columns('encryptedViewingKey').where({ isActive: true })
+                SELECT.from(WalletSessions).columns('sessionId', 'encryptedViewingKey').where({ isActive: true })
             )) || [];
             for (const s of active) await evictSessionFacade(s);
 

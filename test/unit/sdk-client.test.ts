@@ -216,3 +216,70 @@ describe('connect: jobs', () => {
         expect(int64('12').$int64).toBe('12');
     });
 });
+
+describe('connect: stale keep-alive socket', () => {
+    const staleSocket = () => Object.assign(new TypeError('fetch failed'), { cause: Object.assign(new Error('read ECONNRESET'), { code: 'ECONNRESET' }) });
+
+    test('retries a GET and a POST that carries an idempotencyKey once on a fresh connection', async () => {
+        const { connect } = await importClient();
+        const fn = vi.fn()
+            .mockRejectedValueOnce(staleSocket())
+            .mockResolvedValueOnce({ ok: true, status: 200, text: async () => JSON.stringify({ jobId: 'j1' }) });
+        const ng = connect({ baseUrl: 'https://ng.example', fetchFn: fn as any });
+        await expect(ng.callAction('sendNight', { amount: '1', receiverAddress: 'addr', idempotencyKey: 'k-1' })).resolves.toMatchObject({ jobId: 'j1' });
+        expect(fn).toHaveBeenCalledTimes(2);
+        expect(JSON.parse(fn.mock.calls[1][1].body)).toMatchObject({ idempotencyKey: 'k-1' });
+
+        const get = vi.fn()
+            .mockRejectedValueOnce(staleSocket())
+            .mockResolvedValueOnce({ ok: true, status: 200, text: async () => JSON.stringify({ ok: true }) });
+        const ng2 = connect({ baseUrl: 'https://ng.example', fetchFn: get as any });
+        await expect(ng2.callFunction('getWalletBalance', { sessionId: 's' })).resolves.toMatchObject({ ok: true });
+        expect(get).toHaveBeenCalledTimes(2);
+    });
+
+    test('a write without an idempotencyKey is never sent twice: the error surfaces after one attempt', async () => {
+        const { connect } = await importClient();
+        const once = vi.fn().mockRejectedValue(staleSocket());
+        const ng = connect({ baseUrl: 'https://ng.example', fetchFn: once as any });
+        await expect(ng.callAction('sendNight', { amount: '1', receiverAddress: 'addr' })).rejects.toThrow(/fetch failed/);
+        expect(once).toHaveBeenCalledTimes(1);
+    });
+
+    test('a response lost after the server accepted a keyless write reaches the server exactly once (loopback)', async () => {
+        const http = await import('node:http');
+        const { connect } = await importClient();
+        let received = 0;
+        const server = http.createServer((req, res) => {
+            req.resume();
+            req.on('end', () => {
+                received++;
+                if (received === 1) { req.socket.destroy(); return; }
+                res.setHeader('Content-Type', 'application/json');
+                res.end(JSON.stringify({ jobId: `job-${received}` }));
+            });
+        });
+        await new Promise<void>(resolve => server.listen(0, '127.0.0.1', () => resolve()));
+        try {
+            const port = (server.address() as any).port;
+            const ng = connect({ baseUrl: `http://127.0.0.1:${port}`, timeoutMs: 5000 });
+            await expect(ng.callAction('sendNight', { sessionId: 's', receiverAddress: 'addr', amount: '1' })).rejects.toThrow();
+            expect(received).toBe(1);
+        } finally {
+            server.closeAllConnections();
+            await new Promise<void>(resolve => server.close(() => resolve()));
+        }
+    });
+
+    test('a second stale-socket failure and every other network error surface unchanged', async () => {
+        const { connect } = await importClient();
+        const twice = vi.fn().mockRejectedValue(staleSocket());
+        const ng = connect({ baseUrl: 'https://ng.example', fetchFn: twice as any });
+        await expect(ng.callAction('getJobStatus', { jobId: 'j1', idempotencyKey: 'k' })).rejects.toThrow(/fetch failed/);
+        expect(twice).toHaveBeenCalledTimes(2);
+        const refused = vi.fn().mockRejectedValue(Object.assign(new TypeError('fetch failed'), { cause: Object.assign(new Error('connect ECONNREFUSED'), { code: 'ECONNREFUSED' }) }));
+        const ng2 = connect({ baseUrl: 'https://ng.example', fetchFn: refused as any });
+        await expect(ng2.callAction('getJobStatus', { jobId: 'j1' })).rejects.toThrow(/fetch failed/);
+        expect(refused).toHaveBeenCalledTimes(1);
+    });
+});

@@ -9,6 +9,7 @@ import cds, { Request } from '@sap/cds';
 import { registerWalletSessionHandlers, startSessionCleanup } from './sessions/wallet-sessions';
 import { attachAgentGrantEnforcement, registerAgentGrantHandlers, awaitAgentPrincipal } from './sessions/agent-grants';
 import { ensureNightgateModelLoaded } from './utils/cds-model';
+import { attachRuntimeGate } from './utils/runtime-gate';
 import { registerSubmissionHandlers } from './submission/handlers';
 import { registerDocumentProofHandlers } from './submission/document-proof';
 import { getJobById } from './submission/background-jobs';
@@ -27,6 +28,10 @@ export default class NightgateService extends cds.ApplicationService {
         // Agent-token enforcement MUST be the first before-hook: it swaps the
         // effective principal, and every owner-scoping hook below reads it.
         attachAgentGrantEnforcement(this, this.db);
+
+        // Write actions are refused with a retryable 503 while the runtime is
+        // down (initialisation failed or has not completed); reads stay up.
+        attachRuntimeGate(this);
 
         // Blocks
         this.on('READ', 'Blocks', async (req: Request) => {

@@ -7,6 +7,7 @@ import cds, { Request } from '@sap/cds';
 const { SELECT, INSERT, UPDATE } = cds.ql;
 import { WalletSessions } from '#cds-models/midnight';
 import { getEncryptionKey, encrypt, decrypt, hashViewingKey } from '../utils/crypto';
+import { walletSessionViewingKeyBinding, walletSessionSeedBinding } from '../utils/envelope-bindings';
 import { validateViewingKey } from '../utils/validation';
 import { RateLimiter } from '../utils/rate-limiter';
 import { evictWalletFacade } from '../submission/wallet-facade-builder';
@@ -168,8 +169,8 @@ async function executeWalletCommand(raw: unknown, job: BackgroundJobRow, db: any
     if (!session.encryptedViewingKey || !session.encryptedSeedKey) throw new Error('Session no longer has signing material');
 
     const encKey = getEncryptionKey();
-    const viewingKey = decrypt(session.encryptedViewingKey, encKey);
-    const seedHex = decrypt(session.encryptedSeedKey, encKey);
+    const viewingKey = decrypt(session.encryptedViewingKey, encKey, walletSessionViewingKeyBinding(session.sessionId));
+    const seedHex = decrypt(session.encryptedSeedKey, encKey, walletSessionSeedBinding(session.sessionId));
     const accountId = deriveAccountId(viewingKey);
     const syncPass = deriveStoragePassword(viewingKey);
     const { network, nodeUrl, submissionEndpoints } = resolveNightgateRuntimeConfig(getNightgatePluginConfig());
@@ -339,7 +340,7 @@ async function loadSigningSessionAccountId(
     }
     let viewingKey: string;
     try {
-        viewingKey = decrypt(session.encryptedViewingKey, getEncryptionKey());
+        viewingKey = decrypt(session.encryptedViewingKey, getEncryptionKey(), walletSessionViewingKeyBinding(session.sessionId));
     } catch {
         return { ok: false, status: 500, msg: 'Failed to decrypt session keys (ENCRYPTION_KEY mismatch?)' };
     }
@@ -398,12 +399,12 @@ async function hasLiveSessionForWallet(
  */
 async function evictFacadeUnlessShared(
     db: any,
-    session: { encryptedViewingKey?: string | null; viewingKeyHash?: string | null; userId?: string | null },
+    session: { sessionId: string; encryptedViewingKey?: string | null; viewingKeyHash?: string | null; userId?: string | null },
     context: string
 ): Promise<void> {
     try {
         if (!session.encryptedViewingKey) return;
-        const viewingKey = decrypt(session.encryptedViewingKey, getEncryptionKey());
+        const viewingKey = decrypt(session.encryptedViewingKey, getEncryptionKey(), walletSessionViewingKeyBinding(session.sessionId));
         const accountId = deriveAccountId(viewingKey);
         await withKeyedLock(accountId, async () => {
             if (session.viewingKeyHash && await hasLiveSessionForWallet(db, session.viewingKeyHash, session.userId)) {
@@ -447,7 +448,8 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
 
         const encKey = getEncryptionKey();
         const vkHash = hashViewingKey(viewingKey);
-        const encryptedVk = encrypt(viewingKey, encKey);
+        const sessionId = cds.utils.uuid();
+        const encryptedVk = encrypt(viewingKey, encKey, walletSessionViewingKeyBinding(sessionId));
 
         const nightgateConfig = getNightgatePluginConfig();
         const sessionTtlMs = nightgateConfig.sessionTtlMs || 24 * 60 * 60 * 1000;
@@ -456,7 +458,7 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
         const session = {
             ID: cds.utils.uuid(),
             userId,
-            sessionId: cds.utils.uuid(),
+            sessionId,
             viewingKeyHash: vkHash,
             encryptedViewingKey: encryptedVk,
             label: label ? String(label) : null,
@@ -590,7 +592,7 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
         // reported for the connected account.
         let sessionViewingKey: string;
         try {
-            sessionViewingKey = decrypt(session.encryptedViewingKey, encKey);
+            sessionViewingKey = decrypt(session.encryptedViewingKey, encKey, walletSessionViewingKeyBinding(session.sessionId));
         } catch {
             return req.reject(500, 'Failed to decrypt session viewing key (ENCRYPTION_KEY mismatch?)');
         }
@@ -607,7 +609,7 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
                 `Connect the session with the viewingKey deriveWalletInfo returns for the same secret and accountIndex.`);
         }
 
-        const encryptedSeedKey = encrypt(bip39SeedHex, encKey);
+        const encryptedSeedKey = encrypt(bip39SeedHex, encKey, walletSessionSeedBinding(session.sessionId));
 
         await db.run(
             UPDATE.entity(WalletSessions)

@@ -10,7 +10,8 @@
  */
 
 import crypto from 'crypto';
-import { openDekByStoragePassword, privateStatePasswordFromDek, clearAllAccountDeks } from '../../srv/submission/account-keys';
+import { openDekByViewingKey, privateStatePasswordFromDek, clearAllAccountDeks } from '../../srv/submission/account-keys';
+import { accountDekBinding } from '../../srv/utils/envelope-bindings';
 
 // Mock loadLedgerV8, ledger-v8 is ESM-only and cannot be loaded from this
 // unit suite (repo rule: never the real SDK). Tests verify wiring/shape; real crypto derivation is
@@ -177,10 +178,11 @@ describe('buildWalletMaterialForSession', () => {
         expect(insert).toBeDefined();
         const entry = (insert as any).INSERT.entries[0];
         expect(entry.accountId).toBe(material.accountId);
-        expect(entry.wrappedDekByViewingKey).toMatch(/^vk1:/);
-        const dek = Buffer.from(decrypt(entry.wrappedDek, ring), 'hex');
+        // Both seals are ring envelopes bound to the account; the viewing-key seal needs the ring too.
+        expect(entry.wrappedDekByViewingKey).toMatch(/^v3:/);
+        const dek = Buffer.from(decrypt(entry.wrappedDek, ring, accountDekBinding(entry.accountId)), 'hex');
         expect(dek).toHaveLength(32);
-        expect(openDekByStoragePassword(entry.wrappedDekByViewingKey, deriveStoragePassword(viewingKey)).equals(dek)).toBe(true);
+        expect(openDekByViewingKey(entry.wrappedDekByViewingKey, deriveStoragePassword(viewingKey), ring, entry.accountId).equals(dek)).toBe(true);
         expect(pw).toBe(privateStatePasswordFromDek(dek, material.accountId));
         expect(pw).not.toBe(deriveStoragePassword(viewingKey));
         expect(pw).not.toBe(derivePrivateStatePassword(ring, ring.activeId, viewingKey));

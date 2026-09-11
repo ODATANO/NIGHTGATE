@@ -13,6 +13,7 @@ const { SELECT } = cds.ql;
 import { WalletSessions } from '#cds-models/midnight';
 import crypto from 'crypto';
 import { decrypt, getEncryptionKey, deriveBoundSecret, KeyRing } from '../utils/crypto';
+import { walletSessionViewingKeyBinding, walletSessionSeedBinding } from '../utils/envelope-bindings';
 import { resolveAccountDek, privateStatePasswordFromDek } from './account-keys';
 import { loadLedgerV8 } from '../midnight/sdk-loader';
 import { deriveRoleSeeds } from '../utils/wallet-hd';
@@ -103,7 +104,7 @@ export async function buildWalletMaterialForSession(opts: BuildWalletMaterialOpt
     const encKey = opts.encryptionKey ?? getEncryptionKey();
     let viewingKey: string;
     try {
-        viewingKey = decrypt(session.encryptedViewingKey, encKey);
+        viewingKey = decrypt(session.encryptedViewingKey, encKey, walletSessionViewingKeyBinding(session.sessionId));
     } catch (err) {
         // Wrong ENCRYPTION_KEY, tampered ciphertext, or rotated key.
         throw new SessionNotFoundError(opts.sessionId);
@@ -136,7 +137,7 @@ export async function buildWalletMaterialForSession(opts: BuildWalletMaterialOpt
         // Real signing material is present.
         let seedHex: string;
         try {
-            seedHex = decrypt(session.encryptedSeedKey, encKey);
+            seedHex = decrypt(session.encryptedSeedKey, encKey, walletSessionSeedBinding(session.sessionId));
         } catch {
             throw new SessionNotFoundError(opts.sessionId);
         }

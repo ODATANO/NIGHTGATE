@@ -55,6 +55,21 @@ service NightgateAdminService {
     action invalidateAllSessions();
 
     /**
+     * Custody export of one contract's signing key (its maintenance
+     * authority), read through the session that deployed it. The result is
+     * the `midnight-signing-key-export` envelope sealed under `password`
+     * (16+ characters), which `importSigningKeys` restores. Store it offline;
+     * whoever holds it can replace the contract's verifier keys.
+     */
+    action exportContractSigningKey(sessionId: UUID, contractAddress: String, password: String) returns {
+        format          : String;
+        encryptedPayload: LargeString;
+        salt            : String;
+        contractAddress : String;
+        accountId       : String;
+    };
+
+    /**
      * Contracts known to this process (0.21.0): the config floor plus runtime
      * registrations. `artifactDigest` is the generation persisted commands are
      * pinned to; `hasProverKeys` false means the contract deploys and verifies

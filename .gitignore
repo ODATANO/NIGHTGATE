@@ -113,3 +113,9 @@ contracts/mint/
 contracts/mint2/
 contracts/mint3/
 contracts/mint4/
+
+*review* 
+# Review records stay local
+REVIEW-*.md
+review-*.md
+*.local.md

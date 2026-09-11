@@ -91,9 +91,24 @@ export const SPONSOR_PHASE2_ACTIONS: ReadonlySet<string> = new Set([
 ]);
 
 /**
+ * Entities a token may READ. Chain-derived projections are public data; the
+ * four session-bound ones are narrowed to the grant's session (or the grant
+ * itself) in enforceAgentGrant. Every other entity (GranteeIdentities among
+ * them) is a 403 for a token: the token is bound to one session, and an
+ * owner-scoped listing would expose the operator's other sessions.
+ */
+export const AGENT_READABLE_ENTITIES: ReadonlySet<string> = new Set([
+    'Blocks', 'Transactions', 'TransactionResults', 'TransactionSegments', 'TransactionFees',
+    'ContractActions', 'ContractBalances', 'UnshieldedUtxos', 'ZswapLedgerEvents',
+    'DustLedgerEvents', 'NightBalances', 'PredicateAttestations', 'DisclosureGrants',
+    'WalletSessions', 'PendingSubmissions', 'AgentGrants', 'Documents'
+]);
+
+/**
  * Events every valid token may use without an allowlist entry and without
- * consuming budget: the read-only verify surface, entity READs (already
- * owner-scoped downstream) and job polling.
+ * consuming budget: the read-only verify surface, entity READs (limited to
+ * AGENT_READABLE_ENTITIES and narrowed to the grant's session) and job
+ * polling.
  */
 export const AGENT_ALWAYS_ALLOWED_EVENTS: ReadonlySet<string> = new Set([
     'READ',
@@ -106,12 +121,9 @@ export const AGENT_ALWAYS_ALLOWED_EVENTS: ReadonlySet<string> = new Set([
     'prepareMembershipSet', // compute-only (canonical set tree)
     'deriveTokenType', // compute-only (token identity from address + separator)
     'getJobStatus'
-    // NOT getSponsorPoolStatus. It looked harmless ("let a pinned agent see
-    // whether its sponsor can still pay"), but the enforcement hook below
-    // replaces the principal with the grant's OPERATOR, so any token, however
-    // minimal and whatever session it is bound to, would read the pool status
-    // of every sponsor session that operator owns, exact balances included.
-    // That is precisely the boundary a grant exists to draw.
+    // getSponsorPoolStatus is excluded: the hook below runs the request as the
+    // grant's operator, so a token would read the pool status and balances of
+    // every sponsor session that operator owns, not only its pinned sponsor.
 ]);
 
 const grantAdminRateLimiter = new RateLimiter({ windowMs: 60 * 60 * 1000, maxRequests: 10 });
@@ -216,15 +228,15 @@ export async function releaseDeployBudget(db: Runner, grantId: string, count: nu
     }
 }
 
-/** A grant's JSON list column as an array; malformed or absent = no narrowing. */
 /**
  * The grant's CURRENT policy input for a job that was admitted earlier. The
- * sponsoring executors re-resolve the policy per job, so a revoke or a
- * narrowed grant applies to queued jobs too. `null` = revoked or gone.
+ * sponsoring executors re-resolve the policy per job, so a revoke, an expiry
+ * or a narrowed grant applies to queued jobs too. `null` = revoked, expired
+ * or gone.
  */
 export async function currentGrantPolicy(runner: Runner, grantId: string): Promise<GrantPolicyInput | null> {
     const grant = await runner.run(SELECT.one.from(AgentGrants).where({ ID: grantId })) as AgentGrantRow | null;
-    if (!grant || grant.isActive === false || grant.revokedAt) return null;
+    if (!grant || grant.isActive === false || grant.revokedAt || grantExpired(grant)) return null;
     return {
         allowedContracts: parseGrantList(grant.allowedContracts),
         allowedCircuits: parseGrantList(grant.allowedCircuits),
@@ -234,6 +246,7 @@ export async function currentGrantPolicy(runner: Runner, grantId: string): Promi
     };
 }
 
+/** A grant's JSON list column as an array; malformed or absent = no narrowing. */
 function parseGrantList(raw: string | null | undefined): string[] {
     if (!raw) return [];
     try {
@@ -242,6 +255,100 @@ function parseGrantList(raw: string | null | undefined): string[] {
     } catch {
         return [];
     }
+}
+
+function grantExpired(grant: Pick<AgentGrantRow, 'validUntil'>, now: Date = new Date()): boolean {
+    return !!grant.validUntil && new Date(grant.validUntil) < now;
+}
+
+/**
+ * The request's contract and circuit(s) against the grant's allow-lists.
+ * Returns the 403 message, or null when the request is within scope. Contract
+ * addresses are hex, compared case-insensitively; circuit names as written.
+ */
+export function grantScopeViolation(
+    grant: Pick<AgentGrantRow, 'allowedContracts' | 'allowedCircuits'>,
+    data: unknown,
+    event?: string
+): string | null {
+    const d = (data && typeof data === 'object' ? data : {}) as Record<string, unknown>;
+    const contracts = parseGrantList(grant.allowedContracts).map(c => c.toLowerCase());
+    if (contracts.length > 0 && typeof d.contractAddress === 'string' && d.contractAddress.length > 0
+        && !contracts.includes(d.contractAddress.toLowerCase())) {
+        return `contract '${d.contractAddress.slice(0, 16)}' is not in this agent grant's allowedContracts`;
+    }
+    const circuits = parseGrantList(grant.allowedCircuits);
+    if (circuits.length === 0) return null;
+    const required = circuitsOfRequest(event ?? '', d);
+    if (required === null) {
+        return `action '${(event ?? '').slice(0, 64)}' cannot be matched against this agent grant's allowedCircuits`;
+    }
+    for (const c of required) {
+        if (!circuits.includes(c)) {
+            return `circuit '${c.slice(0, 64)}' is not in this agent grant's allowedCircuits`;
+        }
+    }
+    return null;
+}
+
+/**
+ * The circuits an action MAY run on the contract, so a grant with a circuit
+ * list has to allow every one of them. Actions that pick their circuits
+ * server-side are listed here; a request that names circuits itself
+ * (`circuit`, `circuits`, batch `calls`) contributes those too. An action
+ * that resolves to nothing known is refused while a circuit list is set.
+ */
+const ACTION_CIRCUITS: Readonly<Record<string, readonly string[]>> = {
+    commitDocumentAnchor: ['attestGuarded'],
+    issueFieldPredicateAttestation: ['anchorContentRoot', 'proveFieldPredicate'],
+    issueFieldEqualityAttestation: ['anchorContentRoot', 'proveFieldEquality'],
+    issueFieldMembershipAttestation: ['anchorContentRoot', 'proveFieldMembership'],
+    issueFieldPredicateAttestationBatch: ['anchorContentRoot', 'proveFieldPredicate', 'proveFieldEquality', 'proveFieldMembership', 'proveDocumentComparison'],
+    issueDocumentIntegrityAttestation: ['anchorContentRoot', 'proveDocumentComparison'],
+    issueDocumentDiffAttestation: ['anchorContentRoot', 'proveDocumentComparison'],
+    grantDisclosure: ['grantDisclosure'],
+    revokeDisclosure: ['revokeDisclosure'],
+    reindexDisclosures: []
+};
+
+export function circuitsOfRequest(event: string, d: Record<string, unknown>): string[] | null {
+    const out = new Set<string>();
+    let known = false;
+    if (event === 'anchorDocument') {
+        known = true;
+        // The lane follows the request: a nonce reveals, `guarded: false` is a
+        // plain attest, everything else commits (guarded). Neither lane anchors
+        // a content root; that is the issue* actions' job.
+        if (d.nonce) out.add('attestGuarded');
+        else if (d.guarded === false) out.add('attest');
+        else out.add('attestGuarded');
+    } else if (event === 'attestAgentOutput') {
+        // Delegates to anchorDocument without forwarding a lane choice: always
+        // the guarded commit.
+        known = true;
+        out.add('attestGuarded');
+    } else if (Object.prototype.hasOwnProperty.call(ACTION_CIRCUITS, event)) {
+        known = true;
+        for (const c of ACTION_CIRCUITS[event]) out.add(c);
+    }
+    if (typeof d.circuit === 'string') { known = true; out.add(d.circuit); }
+    if (Array.isArray(d.circuits)) {
+        known = true;
+        for (const c of d.circuits) { if (typeof c === 'string') out.add(c); else return null; }
+    }
+    if (d.calls !== undefined && d.calls !== null) {
+        known = true;
+        let calls: unknown = d.calls;
+        if (typeof calls === 'string') { try { calls = JSON.parse(calls); } catch { return null; } }
+        if (!Array.isArray(calls)) return null;
+        for (const call of calls) {
+            const c = call && typeof call === 'object' ? (call as Record<string, unknown>) : null;
+            const name = c ? (c.circuit ?? c.name) : undefined;
+            if (typeof name !== 'string' || name.length === 0) return null;
+            out.add(name);
+        }
+    }
+    return known ? [...out] : null;
 }
 
 export function hashAgentToken(token: string): string {
@@ -498,7 +605,7 @@ export async function enforceAgentGrant(req: Request, db: any): Promise<unknown>
         SELECT.one.from(AgentGrants).where({ tokenHash: hashAgentToken(token), isActive: true })
     )) as AgentGrantRow | null;
     if (!grant) return req.reject(401, 'invalid agent token'); // non-leaking
-    if (grant.validUntil && new Date(grant.validUntil) < new Date()) {
+    if (grantExpired(grant)) {
         return req.reject(410, 'agent grant expired');
     }
 
@@ -516,20 +623,36 @@ export async function enforceAgentGrant(req: Request, db: any): Promise<unknown>
 
     // READ narrowing: a grant is scoped to ONE session, so listing surfaces
     // that are merely user-scoped downstream must not widen to the whole
-    // operator. WalletSessions/PendingSubmissions collapse to the grant's
-    // session, AgentGrants to the grant itself; chain-derived entities
-    // (blocks, transactions, documents, ...) stay readable as-is. The
-    // owner-scoping before-hooks add their userId filter on top (ANDed).
+    // operator. Only AGENT_READABLE_ENTITIES are readable at all;
+    // WalletSessions/PendingSubmissions/Documents collapse to the grant's
+    // session (Documents rows without a session are older than the column
+    // and stay owner-only), AgentGrants to the grant itself; chain-derived
+    // entities stay readable as-is. The owner-scoping before-hooks add their
+    // userId filter on top (ANDed).
     if (event === 'READ') {
         const target = String((req as any).target?.name ?? '');
+        const entity = target.slice(target.lastIndexOf('.') + 1);
+        if (!AGENT_READABLE_ENTITIES.has(entity)) {
+            return req.reject(403, `entity '${entity}' is not readable with an agent token`);
+        }
         const query: any = (req as any).query;
         if (query?.where) {
-            if (target.endsWith('.WalletSessions') || target.endsWith('.PendingSubmissions')) {
+            if (entity === 'WalletSessions' || entity === 'PendingSubmissions' || entity === 'Documents') {
                 query.where({ sessionId: grant.sessionId });
-            } else if (target.endsWith('.AgentGrants')) {
+            } else if (entity === 'AgentGrants') {
                 query.where({ ID: grant.ID });
             }
         }
+    }
+
+    // Contract scope: the grant's allow-lists bound every action that names a
+    // contract, not only the sponsored ones. The phase-2 sponsoring actions
+    // keep their own check (floor ∩ grant on the transaction's shape, in the
+    // worker); here the request's own contractAddress and circuit(s) are
+    // matched against the grant's lists, an empty list being no restriction.
+    if (allowlisted && !SPONSOR_PHASE2_ACTIONS.has(event)) {
+        const scope = grantScopeViolation(grant, (req as any).data, event);
+        if (scope) return req.reject(403, scope);
     }
 
     // Bind the request to the grant's session (and sponsor, when pinned).

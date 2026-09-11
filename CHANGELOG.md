@@ -1,5 +1,86 @@
 # Changelog
 
+## 0.23.4 - 2026-09-11
+
+Authorization, key handling and runtime gating. No circuit change; schema delta:
+two nullable columns (`DisclosureGrants.pendingLevel`, `Documents.sessionId`),
+added by `cds deploy` at boot. Stored `v2` envelopes stay readable; run
+`nightgate-rewrap-keys` to bind them.
+
+- **A disclosure level changes only once the chain took it.** `grantDisclosure`
+  on an existing grant used to write the requested level into the row before
+  the session check and before any confirmation, and the off-chain read ACL
+  trusts that row. The row is now written after the session check, an existing
+  row keeps its confirmed `level` and carries the request as `pendingLevel`
+  (new nullable column, additive); the executor and the reconciliation
+  finalizer move it into `level` on inclusion and drop it when the chain
+  refuses. A refused caller leaves the row untouched.
+- **Write actions answer 503 while the runtime is down.** Initialisation
+  failed or not completed: every action that needs the wallet worker, node or
+  proof server (`connectWallet`, sends, deploys, submits, grants) is refused
+  with `RUNTIME_UNAVAILABLE`, `Retry-After` and a message that survives
+  production sanitising and names no internals (the startup error stays in
+  the log and the admin status), instead of creating half-backed state. Reads,
+  readiness and the compute-only actions (`prepareDocumentProof`,
+  `prepareMembershipSet`, `deriveWalletInfo`, `getJobStatus`, grant admin)
+  stay reachable.
+- **Agent-token reads stop at the session.** A token could list every
+  `Documents` row of its operator, `storageRef` included, because entity
+  reads were only owner-scoped. Tokens now read an explicit entity set
+  (chain projections, plus `WalletSessions`, `PendingSubmissions`,
+  `Documents` narrowed to the grant's session and the grant's own
+  `AgentGrants` row); everything else answers 403. Schema delta: one
+  nullable `Documents.sessionId` column, filled by `anchorDocument`; rows
+  from before the column stay owner-readable and never token-readable.
+- **Grant lists bound every action.** `allowedContracts` /
+  `allowedCircuits` now refuse (403) any token action outside them, not only
+  sponsored calls; an empty list is still no restriction. The circuits are
+  derived from the action itself (`grantDisclosure` runs `grantDisclosure`,
+  `anchorDocument` commits with `attestGuarded`, or `attest` with `guarded:
+  false`, the `issue*` actions their proof circuits plus `anchorContentRoot`) and from
+  batch `calls`, not only from a `circuit` field; an action whose circuits
+  cannot be derived is refused while a circuit list is set. The execution-time policy treats a grant past `validUntil`
+  like a revoked one, so an expired grant sponsors no queued job.
+- **Tier gates resolve the role themselves.** The SDK's `Disclosed` /
+  `Authority` before-handlers read `req.disclosureRole` that the `*` hook
+  attaches; CAP starts both at once, so a reader could be refused before
+  the role was there. The gate now attaches the role itself when it is
+  missing, and both dispatch orders give the same answer.
+- **Stored envelopes are bound to their row.** New ciphertexts are `v3`
+  envelopes whose AAD carries key id, purpose and row id (session id, job
+  id, account id); a value copied to another row or column does not
+  decrypt. `v2` stays readable; `nightgate-rewrap-keys` rewrites it.
+- **The viewing-key seal of the account key needs the ring too.** The
+  `vk1` seal is now wrapped in a ring envelope: a database copy plus a
+  viewing key opens no data key, private state or contract signing key
+  without `ENCRYPTION_KEY`. Bare seals are wrapped on first use and by the
+  rewrap tool. A ring key that leaves without a rewrap can no longer be
+  replaced by the viewing key; run the rewrap first.
+- **Signing-key custody.** Admin action `exportContractSigningKey(sessionId,
+  contractAddress, password)` returns one contract's maintenance authority
+  as the `midnight-signing-key-export` envelope `importSigningKeys` restores;
+  procedure in docs/operations.md. Production refuses an encryption secret
+  shorter than 32 characters instead of warning.
+- The real-circuit contract checks are Vitest suites now:
+  `test/integration/attestation-vault.test.ts` (76 scenarios) and
+  `attestation-vault-32.test.ts` (18), one test per guard, each describe on
+  a fresh contract state; `npm test` runs them, `npm run test:contract`
+  runs just those. The sequential scripts
+  `scripts/integration-test-attestation-vault[-32].mjs` and their npm
+  aliases are gone; `check:release` no longer needs the compiled srv twins
+  for them.
+- **SDK client survives a closed keep-alive socket, without doubling a write.**
+  A caller that proves locally between two requests came back to a pooled
+  socket the server had already closed and got `fetch failed` /
+  `ECONNRESET`. `connect()` now retries such a request once on a fresh
+  connection, but only when a second delivery cannot create a second effect:
+  GETs, and POSTs that carry an `idempotencyKey` the server dedupes on. A
+  write without a key surfaces the error after one attempt; pass
+  `idempotencyKey` on submit actions to get the retry.
+- **Wording.** Comments and docs describe the vault in terms of documents,
+  canonical JSON and external identifiers; the circuit and action names
+  (`registerPassport`, `bindPassport`, `passportId`) are unchanged API.
+
 ## 0.23.3 - 2026-09-10
 
 A production hang and a lost broadcast. No schema or circuit change.

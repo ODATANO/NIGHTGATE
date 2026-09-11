@@ -1,6 +1,6 @@
 {
   "name": "@odatano/nightgate",
-  "version": "0.23.3",
+  "version": "0.23.4",
   "description": "CAP Plugin: Midnight Blockchain Indexer with OData V4 API",
   "homepage": "https://github.com/ODATANO/NIGHTGATE#readme",
   "repository": {
@@ -170,8 +170,7 @@
     "check:job-idempotency": "node scripts/check-job-idempotency.mjs",
     "check:server": "node --env-file=.env scripts/check-server.mjs",
     "check:server:hosted": "node --env-file=.env scripts/check-server.mjs https://api.nightgate.dev",
-    "integration:attestation-vault": "node scripts/integration-test-attestation-vault.mjs",
-    "integration:attestation-vault-32": "node scripts/integration-test-attestation-vault-32.mjs",
+    "test:contract": "vitest run test/integration/attestation-vault --coverage.enabled=false",
     "integration:schema-delta": "node scripts/integration-test-schema-delta.mjs",
     "integration:postgres": "node scripts/integration-test-postgres.mjs",
     "deploy:e2e": "node --env-file=.env scripts/run-deploy-e2e.mjs",
@@ -189,7 +188,7 @@
     "wasm-zswap:e2e": "node --env-file=.env scripts/run-wasm-zswap-e2e.mjs",
     "test:pg-idempotency": "node scripts/test-postgres-idempotency.mjs",
     "lint": "eslint .",
-    "check:release": "npm run build && npm run lint && npm run typecheck && npm test && npm run integration:attestation-vault && npm run integration:attestation-vault-32 && npm run integration:schema-delta && npm run check:vault-parity && npm run check:browser && npm run check:browser-types && npm run check:slim && npm run check:exports",
+    "check:release": "npm run build && npm run lint && npm run typecheck && npm test && npm run integration:schema-delta && npm run check:vault-parity && npm run check:browser && npm run check:browser-types && npm run check:slim && npm run check:exports",
     "check:release:full": "npm run check:release && npm run integration:postgres",
     "prepack": "npm run build:plugin",
     "prepublishOnly": "npm run check:release && npm run build:plugin",

@@ -139,10 +139,14 @@ async function ensureSchemaDeployed(): Promise<void> {
         { table: 'midnight.WalletSyncStates' },
         { table: 'midnight.Attestations' },
         // 0.16.0: evidence binding + owner scoping
-        { table: 'midnight.Documents', columns: ['userId', 'contractAddress', 'network', 'compiledArtifactRef', 'artifactDigest'] },
+        // The anchoring session: the scope of agent-token reads.
+        { table: 'midnight.Documents', columns: ['userId', 'contractAddress', 'network', 'compiledArtifactRef', 'artifactDigest', 'sessionId'] },
         // 0.16.0: cross-root claim columns + evidence provenance
         { table: 'midnight.PredicateAttestations', columns: ['payloadHashB', 'allowedMask', 'network', 'compiledArtifactRef', 'artifactDigest'] },
         { table: 'midnight.DisclosureRoles' },
+        // Level requests on existing grants ride as pendingLevel until the
+        // chain confirms them; the handler writes the column on every re-grant.
+        { table: 'midnight.DisclosureGrants', columns: ['pendingLevel'] },
         { table: 'midnight.BackgroundJobs' },
         // 0.20.0: operator-facing session label. Cosmetic, but CAP writes the
         // column on every connectWallet, so an un-migrated database has to

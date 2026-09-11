@@ -25,8 +25,9 @@ import {
 } from '../../srv/submission/wallet-sync-state-store';
 import {
     resolveAccountDek, privateStatePasswordFromDek, syncStatePassphraseFromDek, sealDekByStoragePassword,
-    openDekByStoragePassword, clearAllAccountDeks, evictAccountDek, residentAccountDekCount, inflightAccountDekCount, DEK_SCHEME
+    openDekByStoragePassword, openDekByViewingKey, clearAllAccountDeks, evictAccountDek, residentAccountDekCount, inflightAccountDekCount, DEK_SCHEME
 } from '../../srv/submission/account-keys';
+import { walletSessionViewingKeyBinding, walletSessionSeedBinding, accountDekBinding, jobCommandBinding } from '../../srv/utils/envelope-bindings';
 
 cds.test(__dirname + '/../..');
 
@@ -179,10 +180,14 @@ describe('encryption key rewrap', () => {
         const created = await resolveAccountDek({ db, ring: BOTH, accountId, storagePassword: pass });
         expect(created).toHaveLength(32);
         const row = await db.run(SELECT.one.from('midnight.AccountKeys').where({ accountId }));
-        expect(inspectCiphertext(row.wrappedDek)).toEqual({ version: 2, keyId: 'k2' });
-        expect(Buffer.from(decrypt(row.wrappedDek, NEW_ONLY), 'hex').equals(created!)).toBe(true);
-        expect(openDekByStoragePassword(row.wrappedDekByViewingKey, pass).equals(created!)).toBe(true);
-        expect(() => openDekByStoragePassword(row.wrappedDekByViewingKey, 'not-the-password')).toThrow();
+        expect(inspectCiphertext(row.wrappedDek)).toEqual({ version: 3, keyId: 'k2' });
+        expect(Buffer.from(decrypt(row.wrappedDek, NEW_ONLY, accountDekBinding(accountId)), 'hex').equals(created!)).toBe(true);
+        // The viewing-key seal is wrapped in the ring: both secrets open it, either alone does not.
+        expect(inspectCiphertext(row.wrappedDekByViewingKey)).toEqual({ version: 3, keyId: 'k2' });
+        expect(openDekByViewingKey(row.wrappedDekByViewingKey, pass, NEW_ONLY, accountId).equals(created!)).toBe(true);
+        expect(() => openDekByViewingKey(row.wrappedDekByViewingKey, 'not-the-password', NEW_ONLY, accountId)).toThrow();
+        expect(() => openDekByViewingKey(row.wrappedDekByViewingKey, pass, K3_ONLY, accountId)).toThrow();
+        expect(() => openDekByStoragePassword(row.wrappedDekByViewingKey, pass)).toThrow(/expected vk1/);
         // Without the viewing key the operator's ring opens it (rewrap); a session with the wrong viewing key does not.
         clearAllAccountDeks();
         expect((await resolveAccountDek({ db, ring: BOTH, accountId, create: false }))!.equals(created!)).toBe(true);
@@ -198,7 +203,7 @@ describe('encryption key rewrap', () => {
         const before = await db.run(SELECT.from('midnight.WalletSessions').columns('ID', 'encryptedViewingKey', 'encryptedSeedKey').orderBy('ID'));
         const report = await rewrapStoredCiphertexts(db, { ring: BOTH, dryRun: true });
         expect(report.dryRun).toBe(true);
-        expect(report.envelope.map(e => e.rewrapped)).toEqual([2, 1, 1, 0]);
+        expect(report.envelope.map(e => e.rewrapped)).toEqual([2, 1, 1, 0, 0]);
         expect(report.syncState).toEqual({ accounts: 2, blobsRewrapped: 3, blobsDropped: 0, sessionsUnreadable: 0 });
         expect(report.privateState).toEqual({ accounts: 2, rowsRewrapped: 3, rowsUnreadable: 0 });
         expect(report.legacy.total).toBe(5);
@@ -217,7 +222,8 @@ describe('encryption key rewrap', () => {
             ['midnight.WalletSessions.encryptedViewingKey', 2, 2, { '1': 2 }],
             ['midnight.WalletSessions.encryptedSeedKey', 1, 1, { '1': 1 }],
             ['midnight.BackgroundJobs.command', 1, 1, { '1': 1 }],
-            ['midnight.AccountKeys.wrappedDek', 0, 0, {}]
+            ['midnight.AccountKeys.wrappedDek', 0, 0, {}],
+            ['midnight.AccountKeys.wrappedDekByViewingKey', 0, 0, {}]
         ]);
         expect(report.syncState).toEqual({ accounts: 2, blobsRewrapped: 3, blobsDropped: 0, sessionsUnreadable: 0 });
         expect(report.privateState).toEqual({ accounts: 2, rowsRewrapped: 3, rowsUnreadable: 0 });
@@ -225,16 +231,19 @@ describe('encryption key rewrap', () => {
         expect(messages.some(m => /encryptedViewingKey: 2 ciphertext\(s\), 2 rewrapped from '1'x2/.test(m))).toBe(true);
         expect(messages.some(m => /no legacy rows remain/.test(m))).toBe(true);
 
-        const sessions = await db.run(SELECT.from('midnight.WalletSessions').columns('ID', 'encryptedViewingKey', 'encryptedSeedKey').orderBy('ID'));
-        expect(sessions.map((r: any) => inspectCiphertext(r.encryptedViewingKey))).toEqual([{ version: 2, keyId: 'k2' }, { version: 2, keyId: 'k2' }]);
-        expect(decrypt(sessions[0].encryptedViewingKey, NEW_ONLY)).toBe(VK_A);
-        expect(decrypt(sessions[0].encryptedSeedKey, NEW_ONLY)).toBe('seed-a');
+        const sessions = await db.run(SELECT.from('midnight.WalletSessions').columns('ID', 'sessionId', 'encryptedViewingKey', 'encryptedSeedKey').orderBy('ID'));
+        expect(sessions.map((r: any) => inspectCiphertext(r.encryptedViewingKey))).toEqual([{ version: 3, keyId: 'k2' }, { version: 3, keyId: 'k2' }]);
+        expect(decrypt(sessions[0].encryptedViewingKey, NEW_ONLY, walletSessionViewingKeyBinding(sessions[0].sessionId))).toBe(VK_A);
+        expect(decrypt(sessions[0].encryptedSeedKey, NEW_ONLY, walletSessionSeedBinding(sessions[0].sessionId))).toBe('seed-a');
         expect(sessions[1].encryptedSeedKey).toBeNull();
-        expect(decrypt(sessions[1].encryptedViewingKey, NEW_ONLY)).toBe(VK_B);
+        expect(decrypt(sessions[1].encryptedViewingKey, NEW_ONLY, walletSessionViewingKeyBinding(sessions[1].sessionId))).toBe(VK_B);
+        // Bound to its row: the same value under another session id does not open.
+        expect(() => decrypt(sessions[0].encryptedViewingKey, NEW_ONLY, walletSessionViewingKeyBinding(sessions[1].sessionId))).toThrow();
+        expect(() => decrypt(sessions[0].encryptedViewingKey, NEW_ONLY)).toThrow(/bound to a purpose/);
 
         const jobs = await db.run(SELECT.from('midnight.BackgroundJobs').columns('ID', 'command', 'commandEncoding').orderBy('ID'));
         expect(jobs[0].commandEncoding).toBe('aes-gcm-v1');
-        expect(decrypt(jobs[0].command, NEW_ONLY)).toBe('{"secret":true}');
+        expect(decrypt(jobs[0].command, NEW_ONLY, jobCommandBinding(jobs[0].ID))).toBe('{"secret":true}');
         expect(jobs[1]).toMatchObject({ commandEncoding: 'json-v1', command: '{"plain":true}' });
 
         // Account keys exist for both wallets, sealed under k2; the sync-state blobs sit under
@@ -272,7 +281,7 @@ describe('encryption key rewrap', () => {
 
         // Idempotent: a second run has nothing left to do.
         const again = await rewrapStoredCiphertexts(db, { ring: NEW_ONLY });
-        expect(again.envelope.map(e => [e.scanned, e.rewrapped])).toEqual([[2, 0], [1, 0], [1, 0], [2, 0]]);
+        expect(again.envelope.map(e => [e.scanned, e.rewrapped])).toEqual([[2, 0], [1, 0], [1, 0], [2, 0], [2, 0]]);
         expect(again.syncState).toEqual({ accounts: 0, blobsRewrapped: 0, blobsDropped: 0, sessionsUnreadable: 0 });
         expect(again.privateState).toEqual({ accounts: 0, rowsRewrapped: 0, rowsUnreadable: 0 });
         expect(again.legacy.total).toBe(0);
@@ -389,5 +398,42 @@ describe('encryption key rewrap', () => {
         expect(await db.run(SELECT.one.from('midnight.ContractSigningKeys').where({ accountId: accountA }))).toMatchObject({ keyScheme: null });
         expect(report.legacy.total).toBe(2);
         expect(report.legacy.accounts).toEqual([accountA]);
+    });
+
+    it('a bare viewing-key seal from before the wrapping opens, is wrapped on first use, and the rewrap wraps the rest', async () => {
+        const vk = 'ff'.repeat(32);
+        const accountId = deriveAccountId(vk);
+        const pass = deriveStoragePassword(vk);
+        const dek = nodeCrypto.randomBytes(32);
+        await db.run(INSERT.into('midnight.AccountKeys').entries({
+            accountId, wrappedDek: encrypt(dek.toString('hex'), BOTH),
+            wrappedDekByViewingKey: sealDekByStoragePassword(dek, pass), createdAt: new Date().toISOString()
+        }));
+        // The preflight ignores the bare seal (it names no ring key).
+        await expect(assertStoredKeyIdsKnown(db, BOTH)).resolves.toBeUndefined();
+        clearAllAccountDeks();
+        const opened = await resolveAccountDek({ db, ring: BOTH, accountId, storagePassword: pass, create: false });
+        expect(opened!.equals(dek)).toBe(true);
+        let row = await db.run(SELECT.one.from('midnight.AccountKeys').where({ accountId }));
+        expect(inspectCiphertext(row.wrappedDek)).toEqual({ version: 3, keyId: 'k2' });
+        expect(inspectCiphertext(row.wrappedDekByViewingKey)).toEqual({ version: 3, keyId: 'k2' });
+        expect(openDekByViewingKey(row.wrappedDekByViewingKey, pass, BOTH, accountId).equals(dek)).toBe(true);
+        expect(() => openDekByViewingKey(row.wrappedDekByViewingKey, pass, K3_ONLY, accountId)).toThrow();
+
+        // Another bare seal the wallet never touched: the rewrap wraps it without the viewing key.
+        const other = 'ab'.repeat(32);
+        const otherId = deriveAccountId(other);
+        const otherDek = nodeCrypto.randomBytes(32);
+        await db.run(INSERT.into('midnight.AccountKeys').entries({
+            accountId: otherId, wrappedDek: encrypt(otherDek.toString('hex'), BOTH),
+            wrappedDekByViewingKey: sealDekByStoragePassword(otherDek, deriveStoragePassword(other)), createdAt: new Date().toISOString()
+        }));
+        const report = await rewrapStoredCiphertexts(db, { ring: BOTH });
+        expect(report.envelope.find(e => e.column === 'midnight.AccountKeys.wrappedDekByViewingKey')).toMatchObject({ rewrapped: 1, bySourceKey: { bare: 1 } });
+        row = await db.run(SELECT.one.from('midnight.AccountKeys').where({ accountId: otherId }));
+        expect(inspectCiphertext(row.wrappedDekByViewingKey)).toEqual({ version: 3, keyId: 'k2' });
+        expect(openDekByViewingKey(row.wrappedDekByViewingKey, deriveStoragePassword(other), BOTH, otherId).equals(otherDek)).toBe(true);
+        await db.run(DELETE.from('midnight.AccountKeys').where({ accountId: { in: [accountId, otherId] } }));
+        clearAllAccountDeks();
     });
 });

@@ -22,6 +22,7 @@ import cds from '@sap/cds';
 const { SELECT } = cds.ql;
 import { WalletSessions } from '#cds-models/midnight';
 import { decrypt, getEncryptionKey } from '../utils/crypto';
+import { walletSessionViewingKeyBinding, walletSessionSeedBinding } from '../utils/envelope-bindings';
 import { deriveAccountId, deriveStoragePassword } from './wallet-material-factory';
 import { getOrBuildWalletFacade, type WalletFacadeBuildArgs } from './wallet-facade-builder';
 import { walletWaitForSyncedState } from '../midnight/wallet-worker-client';
@@ -133,8 +134,8 @@ export async function resolveFeeSponsor(opts: ResolveFeeSponsorOptions): Promise
     let viewingKey: string;
     let seedHex: string;
     try {
-        viewingKey = decrypt(session.encryptedViewingKey, encKey);
-        seedHex = decrypt(session.encryptedSeedKey, encKey);
+        viewingKey = decrypt(session.encryptedViewingKey, encKey, walletSessionViewingKeyBinding(session.sessionId));
+        seedHex = decrypt(session.encryptedSeedKey, encKey, walletSessionSeedBinding(session.sessionId));
     } catch {
         throw new FeeSponsorError(500, 'Failed to decrypt sponsor session keys (ENCRYPTION_KEY mismatch?)');
     }

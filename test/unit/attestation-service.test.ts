@@ -171,11 +171,37 @@ describe('registerAttestationServiceHandlers', () => {
             expect(req.reject).toHaveBeenCalledWith(403, expect.stringContaining("'Disclosed'"));
         });
 
-        test('rejects undefined role (treated as public_only)', () => {
+        test('resolves the role itself when the star hook has not run: a user without a grant is rejected', async () => {
             const gate = gateFor('Disclosed');
             const req = makeReq('bob');
-            gate(req);
+            await gate(req);
+            expect(req.disclosureRole).toBe('public_only');
             expect(req.reject).toHaveBeenCalledWith(403, expect.any(String));
+        });
+
+        test('the gate does not depend on the star hook finishing first: both dispatch orders pass an authority reader', async () => {
+            await seedRoles({ userId: 'ivy', role: 'authority' });
+            // CAP starts every before-handler of an event at once; simulate the
+            // gate winning the race (role not attached yet) and losing it.
+            const first = pipeline('Disclosed');
+            const reqGateFirst = makeReq('ivy');
+            const gateRun = first.gate(reqGateFirst);
+            const starRun = first.star(reqGateFirst);
+            await Promise.all([gateRun, starRun]);
+            expect(reqGateFirst.disclosureRole).toBe('authority');
+            expect(reqGateFirst.reject).not.toHaveBeenCalled();
+
+            const second = pipeline('Disclosed');
+            const reqStarFirst = makeReq('ivy');
+            await second.star(reqStarFirst);
+            await second.gate(reqStarFirst);
+            expect(reqStarFirst.reject).not.toHaveBeenCalled();
+
+            // A public reader is rejected in both orders.
+            const third = pipeline('Authority');
+            const reqPublic = makeReq('nobody');
+            await Promise.all([third.gate(reqPublic), third.star(reqPublic)]);
+            expect(reqPublic.reject).toHaveBeenCalledWith(403, expect.stringContaining("'Authority'"));
         });
 
         test('allows legitimate_interest', () => {

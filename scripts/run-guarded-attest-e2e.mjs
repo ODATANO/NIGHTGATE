@@ -13,7 +13,7 @@
 //
 // The full sniper-takeover semantics (front-run + epoch move + grant/claim
 // erasure) is chain-agnostically pinned against the real artifact in
-// `integration:attestation-vault`; this lane proves the commit-reveal wire
+// `test/integration/attestation-vault.test.ts`; this lane proves the commit-reveal wire
 // (server actions, worker, proving, node acceptance) live.
 //
 // Inputs (env): NIGHTGATE_URL (default http://localhost:4004),

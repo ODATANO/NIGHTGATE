@@ -625,7 +625,7 @@ New enums in `db/types.cds`:
 
 - `PendingSubmissionStatus`: `pending` | `included` | `finalized` | `failed`
 - `BackgroundJobStatus`: `pending` | `running` | `external_execution` | `submitted` | `reconciliation_required` | `succeeded` | `failed` (durable job lifecycle; `reconciliation_required` is terminal until chain evidence resolves it)
-- `DisclosureRole`: `public_only` | `legitimate_interest` | `authority` (EU Battery Reg Annex XIII tiers)
+- `DisclosureRole`: `public_only` | `legitimate_interest` | `authority` (the three document disclosure tiers, levels 0, 1, 2)
 
 ## Capability matrix
 

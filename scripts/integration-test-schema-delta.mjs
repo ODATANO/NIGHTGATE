@@ -58,6 +58,28 @@ END;
 INSERT INTO midnight_PredicateAttestations (ID, payloadHash, contractAddress, predicate, op, threshold)
 VALUES ('row-1', 'aa', 'bb', 'lessOrEqual', 0, 42);
 
+-- A 0.23-shaped Documents: the evidence columns of 0.16, WITHOUT the 0.23.4
+-- anchoring session. The row must survive with sessionId NULL (owner-
+-- readable, never token-readable).
+CREATE TABLE midnight_Documents (
+    ID TEXT NOT NULL PRIMARY KEY,
+    createdAt TEXT,
+    modifiedAt TEXT,
+    sha256 TEXT NOT NULL,
+    contentType TEXT,
+    size INTEGER,
+    storageRef TEXT,
+    anchoredTxHash TEXT,
+    anchoredAt TEXT,
+    userId TEXT,
+    contractAddress TEXT,
+    network TEXT,
+    compiledArtifactRef TEXT,
+    artifactDigest TEXT
+);
+INSERT INTO midnight_Documents (ID, sha256, storageRef, userId)
+VALUES ('doc-row-1', 'cc', 'file:///legacy', 'operator-1');
+
 -- A 0.19-shaped WalletSessions: everything 0.19 had, WITHOUT the 0.20 label
 -- column. This is the table 0.20's startup preflight refuses on, and the
 -- migration the changelog promises as not-code-only. Without it here the
@@ -237,6 +259,16 @@ ok('delta 0.21: the existing grant inherits the floor (null lists) and has NO de
     grantRow?.allowedContracts === null && grantRow?.allowedCircuits === null && grantRow?.deployedContracts === null
         && !grantRow?.allowDeploy && (grantRow?.deploysUsed === 0 || grantRow?.deploysUsed === null),
     JSON.stringify(grantRow));
+// --- Documents.sessionId added to an existing table ------------------------------
+const docCols = new Map(
+    after.prepare('PRAGMA table_info("midnight_Documents")').all().map(r => [r.name, r])
+);
+ok('delta: sessionId was added to an EXISTING Documents table, nullable',
+    docCols.has('sessionId') && docCols.get('sessionId')?.notnull === 0, [...docCols.keys()].join(','));
+const docRow = after.prepare("SELECT * FROM midnight_Documents WHERE ID = 'doc-row-1'").get();
+ok('delta: the existing document survived with a null session (owner-readable only)',
+    docRow?.sha256 === 'cc' && docRow?.storageRef === 'file:///legacy' && docRow?.sessionId === null,
+    JSON.stringify(docRow));
 // --- 0.23.0: lossy binary rows are cleared, never re-encoded ---------------
 const lossy = after.prepare("SELECT raw FROM midnight_Transactions WHERE ID = 'tx-lossy'").get();
 ok('delta 0.23: a pre-0.23.0 Transactions.raw value (lossy hex-through-base64) is cleared for reindexing', lossy?.raw === null, JSON.stringify(lossy));

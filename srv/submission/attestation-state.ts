@@ -6,7 +6,7 @@
  *
  * All lookups are direct member/lookup on flat `Map<Bytes<32>, Bytes<32>>` (no
  * enumeration, unlike the disclosure indexer). Validated in
- * scripts/integration-test-attestation-vault.mjs.
+ * test/integration/attestation-vault.test.ts.
  *
  * Decode/read logic is dependency-injected (`ledger`, `queryContractState`) to
  * unit-test without the ESM-only SDK; `readAttestationStateForContract` wires the

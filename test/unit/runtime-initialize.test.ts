@@ -317,7 +317,9 @@ describe('runtime initialize', () => {
         // names: a 0.19 database passes every table probe and would then die
         // on the first connectWallet, which writes WalletSessions.label. It
         // has to fail here instead, with the migration named.
-        const probesBeforeWalletSessions = 12;
+        // Table probes plus the column probes that precede WalletSessions in
+        // the list (Documents, PredicateAttestations, DisclosureGrants).
+        const probesBeforeWalletSessions = 13;
         for (let i = 0; i < probesBeforeWalletSessions; i++) mockDbRun.mockResolvedValueOnce({});
         mockDbRun.mockRejectedValueOnce(new Error('no such column: label'));
 

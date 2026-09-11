@@ -54,7 +54,7 @@ The server listens on `http://localhost:4004`; the OData services sit under
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `ENCRYPTION_KEY` | required | Encrypts wallet viewing/seed keys and job commands at rest (32+ byte secret); a key ring `ENCRYPTION_KEYS=id=secret,...` + `ENCRYPTION_KEY_ACTIVE` is accepted instead (rotation: docs/operations.md) |
+| `ENCRYPTION_KEY` | required | Encrypts wallet viewing/seed keys, job commands and the per-account data keys at rest; at least 32 characters, production refuses a shorter one; a key ring `ENCRYPTION_KEYS=id=secret,...` + `ENCRYPTION_KEY_ACTIVE` is accepted instead (rotation: docs/operations.md) |
 | `NIGHTGATE_HTTP_PASSWORD` | required | Basic-auth password |
 | `NIGHTGATE_HTTP_USER` | `nightgate` | Basic-auth user |
 | (agent tokens) | - | Requests carrying `x-agent-token` need NO basic credentials for `/api/v1/nightgate`; the agent-grant hook authenticates them (0.17.1), every `$batch` part included (0.23.0) |

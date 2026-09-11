@@ -6,16 +6,21 @@
  * ring as id `1` (active when it is the only key). Every secret is stretched
  * with HKDF-SHA256 into a 32-byte key-encryption key (KEK).
  *
- * Envelope format (written for every new ciphertext):
+ * Envelope formats:
  *
- *   v2:<keyId>:<wrappedDek>:<iv>:<tag>:<data>
+ *   v3:<keyId>:<wrappedDek>:<iv>:<tag>:<data>   bound to a purpose and a subject
+ *   v2:<keyId>:<wrappedDek>:<iv>:<tag>:<data>   bound to the key id only
  *
  * A random 32-byte data key (DEK) encrypts the payload with AES-256-GCM; the
  * DEK is wrapped with the KEK (AES-256-GCM, `wrappedDek` = iv || tag ||
- * ciphertext). The key id is the AAD of both layers, so a ciphertext cannot
- * be re-labelled to another key. Legacy v1 ciphertexts (`iv:tag:data`, key =
- * SHA-256 fold of the secret) stay readable under id `1` only; the rewrap
- * tool (`nightgate-rewrap-keys`) rewrites them.
+ * ciphertext). The AAD of both layers is the key id (v2) or the key id plus
+ * the binding's purpose and subject (v3): a v3 ciphertext cannot be
+ * re-labelled to another key, moved to another row or read as another kind
+ * of material. Every persisted value is written as v3 (`EnvelopeBinding` names
+ * the column and the row); v2 is still read, the rewrap tool
+ * (`nightgate-rewrap-keys`) rewrites it. Legacy v1 ciphertexts
+ * (`iv:tag:data`, key = SHA-256 fold of the secret) stay readable under id
+ * `1` only and are rewritten the same way.
  *
  * A raw 32-byte Buffer is accepted wherever a ring is: it acts as a
  * single-key ring with id `1` whose KEK (and v1 key) is the buffer itself.
@@ -34,7 +39,22 @@ const KEK_LENGTH = 32;
 const WRAPPED_DEK_LENGTH = IV_LENGTH + AUTH_TAG_LENGTH + DEK_LENGTH;
 
 export const ENVELOPE_VERSION = 'v2';
+export const BOUND_ENVELOPE_VERSION = 'v3';
 export const LEGACY_KEY_ID = '1';
+/** Secrets shorter than this are refused in production and warned about elsewhere. */
+export const MIN_SECRET_LENGTH = 32;
+
+/**
+ * What a v3 ciphertext is for and which row it belongs to. Both strings enter
+ * the AAD, so the same plaintext under another purpose or subject is a
+ * different ciphertext that does not decrypt here.
+ */
+export interface EnvelopeBinding {
+    /** Kind of material, e.g. `wallet-session/viewing-key`. */
+    purpose: string;
+    /** Row identity the value belongs to, e.g. the session id or the job id. */
+    subject: string;
+}
 export const KEY_ID_PATTERN = /^[A-Za-z0-9_-]{1,16}$/;
 const KEK_INFO = 'nightgate/kek/v2';
 
@@ -181,7 +201,11 @@ export function getEncryptionKey(): KeyRing {
     const spec = parseKeyRingSpec();
     if (spec) {
         for (const k of spec.keys) {
-            if (k.secret.length < 32) log.warn(`encryption key '${k.id}' is shorter than 32 characters; use a high-entropy 32+ byte secret (hex or base64)`);
+            if (k.secret.length >= MIN_SECRET_LENGTH) continue;
+            if (production) {
+                throw new Error(`encryption key '${k.id}' is shorter than ${MIN_SECRET_LENGTH} characters; production requires a high-entropy secret of at least ${MIN_SECRET_LENGTH} characters (hex or base64) in ENCRYPTION_KEY / ENCRYPTION_KEYS`);
+            }
+            log.warn(`encryption key '${k.id}' is shorter than ${MIN_SECRET_LENGTH} characters; use a high-entropy ${MIN_SECRET_LENGTH}+ byte secret (hex or base64), production refuses to start with it`);
         }
         cachedRing = { snapshot, ring: new KeyRing(spec) };
         return cachedRing.ring;
@@ -209,6 +233,20 @@ function aad(keyId: string): Buffer {
     return Buffer.from(`${ENVELOPE_VERSION}:${keyId}`, 'utf8');
 }
 
+/** v3 AAD: version, key id, purpose and subject, NUL-separated so no field can absorb another. */
+function boundAad(keyId: string, binding: EnvelopeBinding): Buffer {
+    return Buffer.from([BOUND_ENVELOPE_VERSION, keyId, binding.purpose, binding.subject].join(' '), 'utf8');
+}
+
+function assertBinding(binding: EnvelopeBinding): void {
+    if (!binding || typeof binding.purpose !== 'string' || !binding.purpose || typeof binding.subject !== 'string' || !binding.subject) {
+        throw new Error('envelope binding needs a non-empty purpose and subject');
+    }
+    if (binding.purpose.includes(' ') || binding.subject.includes(' ')) {
+        throw new Error('envelope binding fields must not contain NUL');
+    }
+}
+
 function gcmEncrypt(key: Buffer, plaintext: Buffer, associated: Buffer): { iv: Buffer; tag: Buffer; data: Buffer } {
     const iv = crypto.randomBytes(IV_LENGTH);
     const cipher = crypto.createCipheriv(ALGORITHM, key, iv, { authTagLength: AUTH_TAG_LENGTH });
@@ -226,39 +264,51 @@ function gcmDecrypt(key: Buffer, iv: Buffer, tag: Buffer, data: Buffer, associat
     return Buffer.concat([decipher.update(data), decipher.final()]);
 }
 
-/** Encrypt under the ring's ACTIVE key: `v2:<keyId>:<wrappedDek>:<iv>:<tag>:<data>`. */
-export function encrypt(plaintext: string, key: EncryptionKey): string {
+/**
+ * Encrypt under the ring's ACTIVE key. With a binding the result is a v3
+ * envelope (`v3:<keyId>:<wrappedDek>:<iv>:<tag>:<data>`) that only decrypts
+ * with the same binding; without one it is a v2 envelope bound to the key id
+ * alone. Persisted material always passes a binding.
+ */
+export function encrypt(plaintext: string, key: EncryptionKey, binding?: EnvelopeBinding): string {
     const ring = asRing(key);
     const keyId = ring.activeId;
-    const associated = aad(keyId);
+    let version = ENVELOPE_VERSION;
+    let associated = aad(keyId);
+    if (binding) {
+        assertBinding(binding);
+        version = BOUND_ENVELOPE_VERSION;
+        associated = boundAad(keyId, binding);
+    }
     const dek = crypto.randomBytes(DEK_LENGTH);
     try {
         const payload = gcmEncrypt(dek, Buffer.from(plaintext, 'utf8'), associated);
         const wrap = gcmEncrypt(ring.kek(keyId), dek, associated);
         const wrappedDek = Buffer.concat([wrap.iv, wrap.tag, wrap.data]);
-        return [ENVELOPE_VERSION, keyId, wrappedDek.toString('base64'), payload.iv.toString('base64'), payload.tag.toString('base64'), payload.data.toString('base64')].join(':');
+        return [version, keyId, wrappedDek.toString('base64'), payload.iv.toString('base64'), payload.tag.toString('base64'), payload.data.toString('base64')].join(':');
     } finally {
         dek.fill(0);
     }
 }
 
 /** Version and key id of a stored ciphertext without decrypting it. */
-export function inspectCiphertext(combined: string): { version: 1 | 2; keyId: string } {
+export function inspectCiphertext(combined: string): { version: 1 | 2 | 3; keyId: string } {
     const parts = combined.split(':');
     if (parts.length === 3) return { version: 1, keyId: LEGACY_KEY_ID };
-    if (parts.length === 6 && parts[0] === ENVELOPE_VERSION) {
+    if (parts.length === 6 && (parts[0] === ENVELOPE_VERSION || parts[0] === BOUND_ENVELOPE_VERSION)) {
         if (!KEY_ID_PATTERN.test(parts[1])) throw new Error(`Invalid encrypted format: bad key id '${parts[1]}'`);
-        return { version: 2, keyId: parts[1] };
+        return { version: parts[0] === BOUND_ENVELOPE_VERSION ? 3 : 2, keyId: parts[1] };
     }
-    throw new Error('Invalid encrypted format: expected v2:keyId:wrappedDek:iv:authTag:ciphertext or iv:authTag:ciphertext');
+    throw new Error('Invalid encrypted format: expected v3|v2:keyId:wrappedDek:iv:authTag:ciphertext or iv:authTag:ciphertext');
 }
 
 /**
- * Decrypt a v2 envelope or a legacy v1 ciphertext. Throws on authentication
- * failure (tampered ciphertext or wrong key) and `UnknownEncryptionKeyError`
- * when the ring lacks the ciphertext's key id.
+ * Decrypt a v3 envelope (needs the binding it was written under), a v2
+ * envelope (the binding is ignored) or a legacy v1 ciphertext. Throws on
+ * authentication failure (tampered ciphertext, wrong key, wrong binding) and
+ * `UnknownEncryptionKeyError` when the ring lacks the ciphertext's key id.
  */
-export function decrypt(combined: string, key: EncryptionKey): string {
+export function decrypt(combined: string, key: EncryptionKey, binding?: EnvelopeBinding): string {
     const ring = asRing(key);
     const { version, keyId } = inspectCiphertext(combined);
     const parts = combined.split(':');
@@ -271,7 +321,12 @@ export function decrypt(combined: string, key: EncryptionKey): string {
     const [, , wrappedB64, ivB64, tagB64, dataB64] = parts;
     const wrapped = Buffer.from(wrappedB64, 'base64');
     if (wrapped.length !== WRAPPED_DEK_LENGTH) throw new Error(`Invalid wrapped key length: expected ${WRAPPED_DEK_LENGTH} bytes, got ${wrapped.length}`);
-    const associated = aad(keyId);
+    let associated = aad(keyId);
+    if (version === 3) {
+        if (!binding) throw new Error('ciphertext is bound to a purpose and a subject; decrypt it with the binding it was written under');
+        assertBinding(binding);
+        associated = boundAad(keyId, binding);
+    }
     const dek = gcmDecrypt(
         ring.kek(keyId),
         wrapped.subarray(0, IV_LENGTH),

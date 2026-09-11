@@ -219,6 +219,53 @@ describe('getEncryptionKey', () => {
         process.env.NODE_ENV = 'production';
         expect(() => getEncryptionKey()).toThrow(/ENCRYPTION_KEY must be set in production/);
     });
+
+    it('refuses a secret shorter than 32 characters in production and only warns elsewhere', () => {
+        process.env.ENCRYPTION_KEY = 'x';
+        process.env.NODE_ENV = 'production';
+        expect(() => getEncryptionKey()).toThrow(/shorter than 32 characters; production requires/);
+        __resetKeyRingForTests();
+        process.env.NODE_ENV = 'test';
+        const ring = getEncryptionKey();
+        expect(decrypt(encrypt('seed', ring), ring)).toBe('seed');
+        __resetKeyRingForTests();
+        process.env.ENCRYPTION_KEY = 'a-secret-that-is-exactly-32-chars';
+        process.env.NODE_ENV = 'production';
+        expect(getEncryptionKey().activeId).toBe('1');
+    });
+});
+
+describe('v3 bound envelopes', () => {
+    const ring = new KeyRing({ activeId: 'k', keys: [{ id: 'k', secret: 'bound-secret-of-thirty-two-chars' }] });
+    const rowA = { purpose: 'wallet-session/seed', subject: 'session-a' };
+    const rowB = { purpose: 'wallet-session/seed', subject: 'session-b' };
+    const otherPurpose = { purpose: 'wallet-session/viewing-key', subject: 'session-a' };
+
+    it('round-trips under the binding it was written with and is a v3 envelope', () => {
+        const ct = encrypt('seed-a', ring, rowA);
+        expect(ct.startsWith('v3:k:')).toBe(true);
+        expect(inspectCiphertext(ct)).toEqual({ version: 3, keyId: 'k' });
+        expect(decrypt(ct, ring, rowA)).toBe('seed-a');
+    });
+
+    it('does not open under another subject, another purpose or without a binding', () => {
+        const ct = encrypt('seed-a', ring, rowA);
+        expect(() => decrypt(ct, ring, rowB)).toThrow();
+        expect(() => decrypt(ct, ring, otherPurpose)).toThrow();
+        expect(() => decrypt(ct, ring)).toThrow(/bound to a purpose and a subject/);
+    });
+
+    it('a v2 envelope still opens whether or not a binding is passed', () => {
+        const ct = encrypt('legacy', ring);
+        expect(inspectCiphertext(ct).version).toBe(2);
+        expect(decrypt(ct, ring)).toBe('legacy');
+        expect(decrypt(ct, ring, rowA)).toBe('legacy');
+    });
+
+    it('refuses an empty or NUL-bearing binding', () => {
+        expect(() => encrypt('x', ring, { purpose: '', subject: 'a' })).toThrow(/non-empty purpose and subject/);
+        expect(() => encrypt('x', ring, { purpose: 'p', subject: 'a b' })).toThrow(/NUL/);
+    });
 });
 
 describe('hashViewingKey: SHA-256', () => {

@@ -39,6 +39,7 @@ import { isChainOutcome, isChainAbsent, type ChainOutcome, type ChainLookup } fr
 import { resolveNightgateRuntimeConfig, getNightgatePluginConfig } from '../utils/nightgate-config';
 import { runInJobExecutionContext } from './job-execution-context';
 import { encrypt as encryptAtRest, decrypt as decryptAtRest, getEncryptionKey } from '../utils/crypto';
+import { jobCommandBinding } from '../utils/envelope-bindings';
 import { getArtifactGenerationDigest } from './contract-registry';
 import { isCallNotAppliedFailure } from './sponsor-pool';
 import { configInt, configMs, configString } from '../utils/config';
@@ -302,7 +303,7 @@ export async function startJob<TIn, TOut>(
     const serializedCommand = replayable ? safeStringify(effectiveCommand) : null;
     const commandEncoding = replayable ? (encryptCommand ? 'aes-gcm-v1' : 'json-v1') : null;
     const persistedCommand = serializedCommand && encryptCommand
-        ? encryptAtRest(serializedCommand, getEncryptionKey())
+        ? encryptAtRest(serializedCommand, getEncryptionKey(), jobCommandBinding(jobId))
         : serializedCommand;
     const buildInsert = () => INSERT.into(BackgroundJobs).entries({
         ID: jobId,
@@ -608,7 +609,7 @@ async function executePersistedCommand(row: BackgroundJobRow): Promise<unknown> 
     const processor = processors.get(processorKey(row.kind, row.commandVersion!));
     if (!processor) throw new Error(`No background-job processor registered for '${row.kind}' v${row.commandVersion}`);
     const serialized = row.commandEncoding === 'aes-gcm-v1'
-        ? decryptAtRest(row.command!, getEncryptionKey())
+        ? decryptAtRest(row.command!, getEncryptionKey(), jobCommandBinding(String(row.ID)))
         : row.command!;
     return processor(JSON.parse(serialized), row);
 }

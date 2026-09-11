@@ -49,7 +49,7 @@ interface PrivateStateExport {
     readonly salt: string;          // hex 32 bytes
 }
 
-interface SigningKeyExport {
+export interface SigningKeyExport {
     readonly format: 'midnight-signing-key-export';
     readonly encryptedPayload: string;
     readonly salt: string;
@@ -346,19 +346,7 @@ export class CapDbPrivateStateProvider<PSI extends PrivateStateId = PrivateState
         const keys: Record<string, string> = {};
         const inst = await this.getEncryption();
         for (const r of rows) keys[r.contractAddress] = inst.decrypt(r.ciphertext);
-
-        const payload = { version: CURRENT_EXPORT_VERSION, keyCount: rows.length, keys };
-
-        const password = options?.password ?? await this.getStoragePassword();
-        validateExportPassword(password);
-        const exporter = new StorageEncryption(password);
-        const encryptedPayload = exporter.encrypt(JSON.stringify(payload));
-
-        return {
-            format: SIGNING_KEY_EXPORT_FORMAT,
-            encryptedPayload,
-            salt: exporter.salt.toString('hex')
-        };
+        return buildSigningKeyExport(keys, options?.password ?? await this.getStoragePassword());
     }
 
     async importSigningKeys(exportData: SigningKeyExport, options?: ImportSigningKeysOptions): Promise<ImportSigningKeysResult> {
@@ -544,6 +532,27 @@ export class CapDbPrivateStateProvider<PSI extends PrivateStateId = PrivateState
 function validateExportPassword(password: string): void {
     if (typeof password !== 'string' || password.length < 16) {
         throw new Error('Export password must be at least 16 characters');
+    }
+}
+
+/**
+ * The signing-key export envelope (`midnight-signing-key-export`, version 1)
+ * over already-decrypted keys, sealed under `password`; `importSigningKeys`
+ * reads it back. Shared with the admin export of a single contract's key.
+ */
+export function buildSigningKeyExport(keys: Record<string, string>, password: string): SigningKeyExport {
+    validateExportPassword(password);
+    const addresses = Object.keys(keys);
+    const payload = { version: CURRENT_EXPORT_VERSION, keyCount: addresses.length, keys };
+    const exporter = new StorageEncryption(password);
+    try {
+        return {
+            format: SIGNING_KEY_EXPORT_FORMAT,
+            encryptedPayload: exporter.encrypt(JSON.stringify(payload)),
+            salt: exporter.salt.toString('hex')
+        };
+    } finally {
+        exporter.clear();
     }
 }
 

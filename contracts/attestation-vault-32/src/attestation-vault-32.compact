@@ -27,21 +27,21 @@ export ledger public_attestations: Map<Bytes<32>, Bytes<32>>;
 export ledger attestation_owners:  Map<Bytes<32>, Bytes<32>>;
 export ledger disclosures:         Map<Bytes<32>, Map<Bytes<32>, Uint<8>>>;
 
-// passportId -> payload_hash, so a scanned passportId resolves on-chain to
-// its attestation.
+// passportId -> payload_hash, so an external document identifier resolves
+// on-chain to its attestation.
 export ledger passport_bindings:   Map<Bytes<32>, Bytes<32>>;
 
-// Passport-ownership pre-registration. The registrar may pre-assign a
+// Identifier-ownership pre-registration. The registrar may pre-assign a
 // passportId to an attester_id; bindPassport then accepts only that attester,
 // which closes first-bind squatting and recovers already-squatted ids.
 // Unregistered ids stay first-come-first-served.
 export ledger registrar:           Bytes<32>;
 export ledger passport_owners:     Map<Bytes<32>, Bytes<32>>;
 
-// content_roots: payload_hash -> Merkle root over the passport's provable
-// fields, anchored by the attester so later proofs bind to the passport's
-// ACTUAL values. field_predicate_results: claimKey -> true means the value
-// behind `field_key` satisfies the predicate, bound to THIS passport field
+// content_roots: payload_hash -> Merkle root over the document's provable
+// fields (canonical JSON, off-chain), anchored by the attester so later
+// proofs bind to the document's ACTUAL values. field_predicate_results: claimKey -> true means the value
+// behind `field_key` satisfies the predicate, bound to THIS document field
 // rather than to an arbitrary number.
 export ledger content_roots:            Map<Bytes<32>, Bytes<32>>;
 export ledger field_predicate_results:  Map<Bytes<32>, Boolean>;
@@ -106,7 +106,12 @@ struct FieldPredicateClaim {
 }
 
 // A provable bytes-valued field. Distinct struct from FieldLeaf so the leaf
-// families cannot collide (the hash is domain-separated by struct type).
+// families cannot collide: transientHash carries no type tag, it hashes the
+// field-element sequence, so separation comes from the ARITY (Bytes<32> is
+// two elements, a Uint one): FieldLeaf 5, BytesLeaf 6, MerkleNode 4.
+// AbsentLeaf and SlotDescriptor share the node's arity and DO collide with
+// it; they only occur inside fixed-shape recomputes, never on a witnessed
+// path, so no prover chooses where they sit.
 struct BytesLeaf {
   field_key:    Bytes<32>,
   value_digest: Bytes<32>,
@@ -114,7 +119,7 @@ struct BytesLeaf {
 }
 
 // One allowed value of a membership set, in its own struct so set leaves are
-// domain-separated from content leaves and inner nodes.
+// separated from content leaves and inner nodes by arity (2 elements).
 struct SetLeaf {
   value_digest: Bytes<32>
 }
@@ -626,7 +631,8 @@ export circuit revokeDisclosure(payload_hash: Bytes<32>, grantee: Bytes<32>): []
   disclosures.lookup(disclose(payload_hash)).remove(disclose(grantee));
 }
 
-// Registrar-only: pre-assign (or re-assign) a passportId to an attester.
+// Registrar-only: pre-assign (or re-assign) a passportId (external document
+// identifier) to an attester.
 export circuit registerPassport(passportId: Bytes<32>, owner_id: Bytes<32>): [] {
   assert(caller_id() == registrar, "not registrar");
   passport_owners.insert(disclose(passportId), disclose(owner_id));
@@ -650,7 +656,7 @@ export circuit bindPassport(passportId: Bytes<32>, payload_hash: Bytes<32>): [] 
   passport_bindings.insert(disclose(passportId), disclose(payload_hash));
 }
 
-// The attester anchors the Merkle root over the passport's provable fields
+// The attester anchors the Merkle root over the document's provable fields
 // plus the schema id. INSERT-ONCE-OR-IDENTICAL.
 export circuit anchorContentRoot(
   payload_hash: Bytes<32>,

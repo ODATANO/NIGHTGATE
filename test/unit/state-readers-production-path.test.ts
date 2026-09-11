@@ -5,7 +5,7 @@
  *    @midnight-ntwrk/compact-runtime (vitest can import the ESM SDK, jest never
  *    could). The expected hex fixtures pin the persistentHash encoding;
  *    byte-exactness against a LIVE vault was proven in
- *    scripts/integration-test-attestation-vault.mjs; these tests keep the encoding from
+ *    test/integration/attestation-vault.test.ts; these tests keep the encoding from
  *    drifting (refactors, compact-runtime upgrades) without a chain.
  *
  *  - readAttestationStateForContract / readPredicateStateForContract, the
@@ -46,7 +46,7 @@ const PAYLOAD = 'a1'.repeat(32);
 const EPOCH = 7n; // attestation epoch embedded in every claim key (0.16.0)
 const FIELD_KEY = 'b2'.repeat(32);
 
-// Pinned against the encoding live-verified in integration-test-attestation-vault.mjs
+// Pinned against the encoding live-verified in test/integration/attestation-vault.test.ts
 // (FieldPredicateClaim: Bytes<32> ++ Bytes<32> ++ Uint<64> ++ Uint<8>).
 // Regenerate ONLY if the on-chain claim struct itself changes.
 const FIELD_KEY_GE_18000 = 'e00c7a136a859dcf087860a317e7d099d77a17611300e395833ab98a5af77f10';
