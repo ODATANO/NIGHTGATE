@@ -2,12 +2,7 @@
  * NIGHT and custom-token operations: transfers, balances, fee estimates,
  * dust-generation registration.
  */
-
-// First import on purpose: the worker modules import each other in cycles,
-// and a value read at module level must come from an import that is
-// resolved before the cycle re-enters this module.
 import { configMs } from '../../utils/config';
-import path from 'node:path';
 import type * as AddressFormat from '@midnightntwrk/wallet-sdk-address-format';
 import { type MessagePort } from 'node:worker_threads';
 import { encodeAddressString, ensureNetworkId, facades, loadAddressFormat, loadSdk, log, parseReceiverAddress } from './context';
@@ -15,11 +10,7 @@ import { BALANCE_SYNC_TIMEOUT_MS, SYNC_POLL_MS, countAllNightUtxos, countRegiste
 import { captureDustSnapshot, feeOfDiscardedRecipe, submitWithDustGuard } from './submit';
 import { resolveSponsorEntry } from './sponsor';
 
-/**
- * End-to-end NIGHT-UTXO registration for DUST generation. Wraps:
- *   waitForSyncedState → filter unregistered → register/finalize/submit.
- * Runs entirely in the worker so no SDK objects cross the thread boundary.
- */
+/** NIGHT-UTXO registration for DUST generation. */
 export async function registerDustGeneration({ sessionId, dustReceiverAddress, syncTimeoutMs, __replyPort }: {
     sessionId: string;
     dustReceiverAddress?: string;
@@ -30,20 +21,17 @@ export async function registerDustGeneration({ sessionId, dustReceiverAddress, s
     const entry = facades.get(sessionId);
     if (!entry) throw new Error(`No facade for sessionId=${sessionId.slice(0, 16)}`);
 
-    // 1. Block until the wallet is synced enough to see its NIGHT UTXOs.
     log('info', `dust-register: waiting for synced state...`);
     const synced = await waitForSyncedStateBounded(entry, 'dust-register', syncTimeoutMs);
     log('info', `dust-register: synced.`);
 
-    // `availableCoins` excludes UTXOs already registered for dust generation (SDK
-    // contract); registered ones are counted off the full coin set.
+    // `availableCoins` excludes registered UTXOs; those are counted off the full coin set.
     const availableCoins: any[] = synced?.unshielded?.availableCoins ?? [];
     const unregistered = availableCoins.filter(
         (c: any) => c?.meta?.registeredForDustGeneration !== true
     );
     const registeredUtxosBefore = countRegisteredNightUtxos(synced);
-    // Without a full coin set the total is the available set plus the
-    // registered UTXOs it does not already list.
+    // Fallback total without a full coin set.
     const registeredInAvailable = availableCoins.filter((c: any) => c?.meta?.registeredForDustGeneration === true).length;
     const totalNightUtxos = countAllNightUtxos(synced, availableCoins.length + registeredUtxosBefore - registeredInAvailable);
 
@@ -52,16 +40,15 @@ export async function registerDustGeneration({ sessionId, dustReceiverAddress, s
     const dustAddrStr = await encodeAddressString(receiverRaw, entry.networkId);
 
     if (unregistered.length === 0) {
-        // Registration binds the address, so a call naming a different receiver
-        // changes nothing. The standing receiver is not readable from the SDK
-        // (only a boolean per UTXO): answer "unchanged, receiver not applied".
+        // Registration binds the address and the SDK exposes no standing
+        // receiver, so a different requested receiver is reported as not applied.
         const reason = registeredUtxosBefore > 0 ? 'already-registered' : 'no-night-utxos';
         const message = reason === 'no-night-utxos'
             ? 'no unshielded NIGHT UTXOs visible to this wallet (all NIGHT is held shielded, or the wallet is ' +
-              'unfunded); nothing was registered and no receiver was applied'
+            'unfunded); nothing was registered and no receiver was applied'
             : `all ${totalNightUtxos} NIGHT UTXO(s) are already registered to their standing receiver; ` +
-              'nothing was registered and the requested receiver was NOT applied. To move generation to a ' +
-              'different receiver, deregisterFromDustGeneration first, then register again naming it';
+            'nothing was registered and the requested receiver was NOT applied. To move generation to a ' +
+            'different receiver, deregisterFromDustGeneration first, then register again naming it';
         log(dustReceiverAddress ? 'warn' : 'info', `dust-register: ${message}`);
         return {
             txId: null,
@@ -80,8 +67,6 @@ export async function registerDustGeneration({ sessionId, dustReceiverAddress, s
         };
     }
 
-    // 2. Parse Bech32m receiver string into a DustAddress, which is what
-    //    `registerNightUtxosForDustGeneration` expects on the wire.
     let receiverParsed: AddressFormat.DustAddress | string = receiverRaw;
     if (typeof receiverRaw === 'string') {
         const af = await loadAddressFormat();
@@ -90,7 +75,6 @@ export async function registerDustGeneration({ sessionId, dustReceiverAddress, s
             .decode(af.DustAddress, entry.networkId);
     }
 
-    // 3. Build registration recipe + finalize + submit. All in-process.
     const verifyingKey = entry.unshieldedKeystore.getPublicKey();
     const signFn = (payload: Uint8Array) => entry.unshieldedKeystore.signData(payload);
 
@@ -106,9 +90,8 @@ export async function registerDustGeneration({ sessionId, dustReceiverAddress, s
 
     log('info', `dust-register: submitted ${unregistered.length} UTXO(s), txId=${String(txId).slice(0, 16)}...`);
 
-    // Report the resulting shape: one registration over several UTXOs consolidates
-    // them, and one registered UTXO yields one dust note. Bounded observation;
-    // `settled: false` with a null count if the tx is not applied locally in time.
+    // One registration over several UTXOs consolidates them (one dust note);
+    // observe the resulting count within a bounded window.
     const settleMs = configMs('NIGHTGATE_DUST_REGISTER_SETTLE_MS');
     const settleStartedAt = Date.now();
     let registeredUtxosAfter: number | null = null;
@@ -140,32 +123,17 @@ export async function registerDustGeneration({ sessionId, dustReceiverAddress, s
         consolidated,
         message: settled
             ? `${unregistered.length} UTXO(s) registered; the wallet now holds ${registeredUtxosAfter} registered NIGHT UTXO(s)` +
-              (consolidated ? ' (inputs were consolidated: register first, fund in separate payments afterwards to keep them split)' : '')
+            (consolidated ? ' (inputs were consolidated: register first, fund in separate payments afterwards to keep them split)' : '')
             : `${unregistered.length} UTXO(s) registered; the resulting UTXO count was not observable within ${settleMs}ms`
     };
 }
 
-/**
- * Symmetric pair to `registerDustGeneration`. Removes NIGHT UTXOs from
- * dust generation so they become spendable again (registered UTXOs are
- * committed to dust accrual and excluded from `availableCoins`).
- *
- * The SDK's `synced.unshielded.availableCoins` only lists *unregistered*
- * UTXOs, so we read registered ones from the full set the wallet tracks.
- * This action deregisters ALL registered UTXOs; per-UTXO
- * narrowing is a follow-up once we have a stable UTXO-id surface.
- */
+/** Deregisters every registered NIGHT UTXO. */
 export async function deregisterDustGeneration({ sessionId, syncTimeoutMs, sponsorSessionId, __replyPort }: {
     sessionId: string;
     syncTimeoutMs?: number;
     /** Set by the dispatcher: the pre-broadcast submit-intent handshake. */
     __replyPort?: MessagePort;
-    /**
-     * Optional fee sponsor: that facade balances the deregistration fee
-     * from ITS dust and submits. This is the escape hatch for a wallet
-     * whose entire generation is delegated away (dust balance 0 forever),
-     * which otherwise cannot pay its own deregistration.
-     */
     sponsorSessionId?: string;
 }) {
     const entry = facades.get(sessionId);
@@ -176,9 +144,7 @@ export async function deregisterDustGeneration({ sessionId, syncTimeoutMs, spons
     const synced = await waitForSyncedStateBounded(entry, 'dust-deregister', syncTimeoutMs);
     log('info', `dust-deregister: synced.`);
 
-    // The full coin set is `totalCoins` on the unshielded state
-    // (UnshieldedWalletState, wallet-sdk-unshielded-wallet 3.1). Registered
-    // UTXOs only surface in the full set, and deregistration needs exactly those.
+    // `totalCoins`, not `availableCoins`: the latter excludes registered UTXOs.
     const allCoins: any[] = synced?.unshielded?.totalCoins ?? [];
     const registered = allCoins.filter(
         (c: any) => c?.meta?.registeredForDustGeneration === true
@@ -201,19 +167,7 @@ export async function deregisterDustGeneration({ sessionId, syncTimeoutMs, spons
         verifyingKey,
         signFn
     );
-    // The deregistration recipe is fee-less by design (allowFeePayment 0,
-    // no dust spends): the SDK expects THE CALLER to balance the fee via
-    // balanceUnprovenTransaction with tokenKindsToBalance ['dust'] (stated
-    // in the facade's createDustActionTransaction step-4 comment).
-    // Without it the node rejects 1010/138 BalanceCheckOverspend. The tx
-    // is already fully signed by the facade; an extra signRecipe pass
-    // DUPLICATES the offer signatures (1010/192). So: balance, then
-    // finalize, no re-signing.
-    //
-    // With a sponsor, the SPONSOR's facade balances the fee from ITS dust
-    // and submits. The dust spender must be genuinely synced first (stale
-    // dust merkle roots are the Custom error 117 site); the unsponsored
-    // path gets that freshness from the caller's own sync above.
+
     const payer = sponsorEntry ?? entry;
     if (sponsorEntry) {
         log('info', `dust-deregister: fee sponsored by ${sponsorEntry === entry ? 'self' : String(sponsorSessionId).slice(0, 16)}`);
@@ -237,24 +191,14 @@ export async function deregisterDustGeneration({ sessionId, syncTimeoutMs, spons
     };
 }
 
-/**
- * Send NIGHT to any Midnight address. The receiver's Bech32m prefix
- * decides the destination ledger (`mn_shield-addr_` → shielded,
- * `mn_addr_` → unshielded). Source funds are selected by the SDK's
- * balancer from the wallet's available UTXOs on the target ledger;
- * cross-ledger funding is not attempted (NIGHT is unshielded-only,
- * there is no shield/unshield conversion in the protocol).
- *
- * Build + balance + prove + submit all in-worker via `facade.transferTransaction`.
- * Returns primitives only; no SDK objects cross the thread boundary.
- */
+/** Send NIGHT or another token to a Midnight address. */
 export async function transferNight({ sessionId, receiverAddress, amount, ttlIso, syncTimeoutMs, tokenTypeHex, __replyPort }: {
     sessionId: string;
     receiverAddress: string;
     amount: string;          // bigint atoms as decimal string
-    ttlIso?: string;          // ISO-8601 future timestamp; defaults to +10min
+    ttlIso?: string;          // defaults to +10min
     syncTimeoutMs?: number;
-    /** Raw token type (64 hex) to send instead of NIGHT; e.g. a contract-minted shielded token. */
+    /** Raw token type (64 hex) to send instead of NIGHT. */
     tokenTypeHex?: string;
     /** Set by the dispatcher: the pre-broadcast submit-intent handshake. */
     __replyPort?: MessagePort;
@@ -285,12 +229,7 @@ export async function transferNight({ sessionId, receiverAddress, amount, ttlIso
         { shieldedSecretKeys: entry.zswapKeys, dustSecretKey: entry.dustKey },
         { ttl }
     );
-    // UNSHIELDED inputs are signature-authorized (not proof-authorized like
-    // zswap): the recipe must pass through signRecipe with the keystore's
-    // sign function, or the intent ships inputs with an empty signature
-    // list and the node rejects it at the mempool with
-    // `1010 Custom error: 192` (MalformedError::InputsSignaturesLengthMismatch).
-    // No-op when the balancer selected no unshielded inputs.
+    // UNSHIELDED inputs are signature-authorized
     const signFn = (payload: Uint8Array) => entry.unshieldedKeystore.signData(payload);
     const signed = await entry.facade.signRecipe(recipe, signFn);
     const finalized = await entry.facade.finalizeRecipe(signed);
@@ -306,17 +245,7 @@ export async function transferNight({ sessionId, receiverAddress, amount, ttlIso
     };
 }
 
-/**
- * Read-only snapshot of the wallet's current balances and dust state.
- *
- * Pulls from the cached synced state via `waitForSyncedState()` (which
- * resolves immediately when at tip, blocks during initial catch-up).
- * No transaction is built or submitted.
- *
- * Returns only NIGHT for shielded/unshielded in this first version
- * (other custom tokens omitted; add a `tokensJson` field later if a
- * consumer needs them).
- */
+/** Read-only snapshot of balances and dust state; blocks during initial catch-up. */
 export async function getBalance({ sessionId, syncTimeoutMs }: {
     sessionId: string;
     syncTimeoutMs?: number;
@@ -335,11 +264,8 @@ export async function getBalance({ sessionId, syncTimeoutMs }: {
 
     const shieldedNight = shieldedBalances[nightRawType] ?? 0n;
     const unshieldedNight = unshieldedBalances[nightRawType] ?? 0n;
-    // dust.balance(time) is synchronous and returns Balance (= bigint). It
-    // lives on the DustWalletState carried by the synced FacadeState, NOT
-    // on facade.dust (which is a DustWalletAPI with no balance() method).
+
     const dustBalance: bigint = synced?.dust ? synced.dust.balance(new Date()) : 0n;
-    // DIAGNOSTIC: real sync distance to tip + whether 'synced' is genuine.
     try {
         const p: any = (synced as any)?.dust?.progress;
         log('debug', `SYNC-PROGRESS isSynced=${(synced as any)?.isSynced} isConnected=${p?.isConnected} appliedIndex=${p?.appliedIndex} highestIndex=${p?.highestIndex} highestRelevantIndex=${p?.highestRelevantIndex}`);
@@ -347,24 +273,13 @@ export async function getBalance({ sessionId, syncTimeoutMs }: {
     const registeredCount = totalNightCoins.filter(
         (c: any) => c?.meta?.registeredForDustGeneration === true
     ).length;
-    // Dust-side diagnosability (dust-pending-note-leak FR): a wedged
-    // wallet (in-flight spend leaked by a pre-mempool abort) shows
-    // registered NIGHT but ZERO dust utxos and ZERO pending, which is
-    // otherwise indistinguishable from "genuinely empty" without logs.
     const dustUtxos: any[] = synced?.dust?.totalCoins ?? [];
     const dustPending: any[] = synced?.dust?.pendingCoins ?? [];
-    // `totalCoins` is available PLUS pending, so it is not the number of
-    // notes you can spend right now; unbound sponsoring locks one FREE
-    // note per in-flight transaction, and reading the total as capacity
-    // counts notes that are already committed to a spend. Take the SDK's
-    // own available list when it has one, and fall back to the difference.
     const dustAvailable: any[] | undefined = synced?.dust?.availableCoins;
     const dustPendingValue = dustPending.reduce(
         (sum: bigint, c: any) => sum + (typeof c?.generatedNow === 'bigint' ? c.generatedNow : 0n), 0n
     );
 
-    // Every OTHER shielded token type the wallet holds (contract-minted
-    // custom tokens, e.g. a wrapped asset): raw token type hex -> atoms.
     const shieldedTokens = Object.entries(shieldedBalances)
         .filter(([tokenType, amount]) => tokenType !== nightRawType && amount > 0n)
         .map(([tokenType, amount]) => ({ tokenType, amount: amount.toString() }));
@@ -382,23 +297,13 @@ export async function getBalance({ sessionId, syncTimeoutMs }: {
             : Math.max(0, dustUtxos.length - dustPending.length),
         dustPendingCount: dustPending.length,
         dustPendingValue: dustPendingValue.toString(),
-        // Persist-CONFIRMED snapshot restores (bumped only after the
-        // main thread acked the restore's re-persist). Exposed so the
-        // live e2e can ASSERT the whole guard lane ran, including
-        // durability (the SDK's own fast-path revert heals some aborts
-        // without it, and a fire-and-forget push could green-light a
-        // gate while the DB still holds the poisoned state).
         dustRestoreCount: entry.dustRestoresPersisted ?? 0
     };
 }
 
 /**
- * Pre-flight fee estimate for a NIGHT transfer. Builds the
- * `transferTransaction` recipe in the worker (which runs balancing
- * (lightweight) but NOT proof generation (heavy)), then prices the
- * balanced recipe via `calculateTransactionFee`. No submit. The recipe
- * is discarded AND reverted, so the coins the build moved into
- * `pendingUtxos` become spendable again (bug_002).
+ * Fee estimate for a token transfer, no submit. The recipe is reverted so the
+ * coins the build moved into `pendingUtxos` become spendable again.
  */
 export async function estimateTransferFee({ sessionId, receiverAddress, amount, ttlIso, syncTimeoutMs, tokenTypeHex }: {
     sessionId: string;
@@ -417,8 +322,6 @@ export async function estimateTransferFee({ sessionId, receiverAddress, amount, 
 
     const receiver = await parseReceiverAddress(receiverAddress, entry.networkId);
     const amountBig = BigInt(amount);
-    // Same output shape as transferNight: the estimate must price the
-    // token that will be sent, not NIGHT regardless.
     const rawType: string = tokenTypeHex || sdk.ledger.nativeToken().raw;
     const ttl = ttlIso ? new Date(ttlIso) : new Date(Date.now() + 10 * 60 * 1000);
 
@@ -431,7 +334,6 @@ export async function estimateTransferFee({ sessionId, receiverAddress, amount, 
         { shieldedSecretKeys: entry.zswapKeys, dustSecretKey: entry.dustKey },
         { ttl }
     );
-    // recipe is UnprovenTransactionRecipe: { type: 'UNPROVEN_TRANSACTION', transaction }
     const fee = await feeOfDiscardedRecipe(entry.facade, recipe, 'estimateTransferFee');
     return { fee: fee.toString(), toLedger: receiver.kind };
 }

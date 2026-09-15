@@ -39,7 +39,7 @@ vi.mock('@sap/cds', () => {
                     }))
                 },
                 // The submission bootstrap (job recovery) reads with the
-                // plain form. Without it initialize() now reports the
+                // plain form. Without it initialize() reports the
                 // submission pipeline as failed, which it would be.
                 from: vi.fn((table: unknown) => ({
                     __kind: 'select',
@@ -296,9 +296,9 @@ describe('runtime initialize', () => {
     });
 
     it('reports offline when the submission pipeline fails to start', async () => {
-        // It used to be a log line and nothing else: initialize() carried on,
-        // set initialized = true and published active/idle, so a process that
-        // could not sign, submit or sponsor anything still answered ready.
+        // A failed submission bootstrap must not leave initialize() publishing
+        // active/idle: a process that cannot sign, submit or sponsor anything
+        // must not answer ready.
         mockStartJobProcessor.mockRejectedValueOnce(new Error('worker thread refused to spawn'));
 
         const status = await initialize();
@@ -314,9 +314,10 @@ describe('runtime initialize', () => {
         const { SchemaNotDeployedError } = await import('../../src/index.js');
 
         // The probe list carries each release's NEW columns, not just table
-        // names: a 0.19 database passes every table probe and would then die
-        // on the first connectWallet, which writes WalletSessions.label. It
-        // has to fail here instead, with the migration named.
+        // names: a database from an earlier release passes every table probe
+        // and would then die on the first connectWallet, which writes
+        // WalletSessions.label. It has to fail here instead, with the
+        // migration named.
         // Table probes plus the column probes that precede WalletSessions in
         // the list (Documents, PredicateAttestations, DisclosureGrants).
         const probesBeforeWalletSessions = 13;

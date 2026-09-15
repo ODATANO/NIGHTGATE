@@ -1,7 +1,5 @@
 /**
- * Nightgate Service: OData V4 read API over local SQLite (populated by Crawler).
- *
- * Data flow: Midnight Node -> Crawler -> SQLite -> Nightgate OData V4
+ * Nightgate Service: OData V4 read API
  */
 
 import cds, { Request } from '@sap/cds';
@@ -25,12 +23,10 @@ export default class NightgateService extends cds.ApplicationService {
         await ensureNightgateModelLoaded();
         this.db = await cds.connect.to('db');
 
-        // Agent-token enforcement MUST be the first before-hook: it swaps the
-        // effective principal, and every owner-scoping hook below reads it.
+        // Agent-token enforcement MUST be the first before-hook
         attachAgentGrantEnforcement(this, this.db);
 
-        // Write actions are refused with a retryable 503 while the runtime is
-        // down (initialisation failed or has not completed); reads stay up.
+        // Write actions are refused with a retryable 503 while the runtime is down 
         attachRuntimeGate(this);
 
         // Blocks
@@ -72,10 +68,7 @@ export default class NightgateService extends cds.ApplicationService {
             }
 
             const effectiveLimit = Math.min(Math.max(limit || 100, 1), 5000);
-            // Use a tagged-template predicate for the range window. The object form
-            // `{ height: { '>=': s, '<=': e } }` (two operators on one field) produces
-            // CQN without the connective and is silently dropped by @cap-js/sqlite,
-            // so the window would not filter at all.
+            // use a tagged-template predicate for the range window
             return this.db.run(
                 cds.ql.SELECT.from(Blocks)
                     .where`height >= ${startHeight} and height <= ${endHeight}`
@@ -85,7 +78,6 @@ export default class NightgateService extends cds.ApplicationService {
         });
 
         // Transactions
-
         this.on('READ', 'Transactions', async (req: Request) => {
             return await this.db.run(req.query) || [];
         });
@@ -184,7 +176,6 @@ export default class NightgateService extends cds.ApplicationService {
         });
 
         // Agent grants (delegated); owner-scoped read like WalletSessions
-
         registerAgentGrantHandlers(this, this.db);
 
         this.before('READ', 'AgentGrants', async (req: Request) => {
@@ -196,13 +187,7 @@ export default class NightgateService extends cds.ApplicationService {
             (req.query as any).where({ userId });
         });
 
-        // Owner-scoped like WalletSessions: Documents rows carry storageRef
-        // (internal file/S3/agent paths) and not-yet-public hashes,
-        // GranteeIdentities bind userId to wallet/DID grantee ids. Neither is
-        // anyone else's business. Rows from pre-0.16.0 releases have no
-        // userId and are therefore admin-only. Cross-user verification stays
-        // possible via verifyDocument (documentId is an unguessable
-        // capability handle and the response exposes no storageRef).
+        // Owner-scoped like WalletSessions
         for (const entity of ['Documents', 'GranteeIdentities'] as const) {
             this.before('READ', entity, async (req: Request) => {
                 await awaitAgentPrincipal(req);
@@ -216,9 +201,7 @@ export default class NightgateService extends cds.ApplicationService {
 
         // Submission actions: deployContract, submitContractCall
 
-        // Owner-scoped like WalletSessions: submissions carry no userId, so
-        // the caller's sessions are resolved first and the read is limited to
-        // those sessionIds. Admins read unfiltered.
+        // Owner-scoped like WalletSessions
         this.on('READ', 'PendingSubmissions', async (req: Request) => {
             const user: any = (req as any).user;
             if (!user?.is?.('admin')) {
@@ -238,24 +221,17 @@ export default class NightgateService extends cds.ApplicationService {
         registerDocumentProofHandlers(this);
 
         // Background Jobs
-
         this.on('getJobStatus', async (req: Request) => {
             const { jobId, sessionId } = req.data as { jobId?: string; sessionId?: string };
             if (!jobId) return req.reject(400, 'jobId is required');
             if (!sessionId) return req.reject(400, 'sessionId is required');
 
             const job = await getJobById(jobId);
-            // 404 on foreign sessionId: same shape as not-found so a probe
-            // cannot leak existence of a job owned by another session.
             if (!job || job.sessionId !== sessionId) {
                 return req.reject(404, 'Job not found');
             }
 
-            // FAIL-CLOSED ownership (admins exempt, like the entity scopes):
-            // the job's recorded requester must be the caller; a
-            // missing/closed session row must not open the job up. Jobs
-            // without a recorded requester fall back to the session-row
-            // binding; if neither identity is resolvable, deny.
+            // FAIL-CLOSED ownership 
             const user: any = (req as any).user;
             if (!user?.is?.('admin')) {
                 const requesterId = user?.id;

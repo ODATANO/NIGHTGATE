@@ -2,8 +2,8 @@
  * The job-kind trait table (`srv/submission/job-kinds.ts`) is the ONE place a
  * kind's concurrency class, workflow-parent role and identifier keying are
  * declared; the runner derives its sets from the registrations. These tests
- * pin the table against the behaviour the runner used to hard-code, and the
- * guards that stop the table and the registrations from drifting apart.
+ * pin the declared traits and the guards that stop the table and the
+ * registrations from drifting apart.
  */
 import { describe, it, expect, beforeEach } from 'vitest';
 import {
@@ -23,15 +23,13 @@ describe('job kind traits', () => {
         for (const kind of [
             'issueFieldPredicateAttestation', 'issueFieldPredicateAttestationBatch',
             'issueFieldEqualityAttestation', 'issueFieldMembershipAttestation',
-            'issueDocumentIntegrityAttestation', 'issueDocumentDiffAttestation',
-            'anchorDocumentGuarded'
+            'issueDocumentIntegrityAttestation', 'issueDocumentDiffAttestation'
         ]) {
             expect(JOB_KIND_TRAITS[kind]?.workflowParent, kind).toBe(true);
         }
         // and nothing else: a parent row carries no hash, the leaf sweep skips it
         const parents = Object.entries(JOB_KIND_TRAITS).filter(([, t]) => t.workflowParent).map(([k]) => k).sort();
         expect(parents).toEqual([
-            'anchorDocumentGuarded',
             'issueDocumentDiffAttestation', 'issueDocumentIntegrityAttestation',
             'issueFieldEqualityAttestation', 'issueFieldMembershipAttestation',
             'issueFieldPredicateAttestation', 'issueFieldPredicateAttestationBatch'

@@ -1,23 +1,7 @@
 /**
- * Programmatic wallet identity derivation.
- *
- * Pure function of the secret input: derives the connectable identity of a
- * wallet WITHOUT creating a session or persisting anything. Consumers use the
- * result to fund a fresh wallet (`nightAddress` at the faucet) and to open
- * sessions (`connectWallet(viewingKey)` + `connectWalletForSigning`), removing
- * the last Lace dependency from programmatic wallet creation.
- *
- * Derivation is IDENTICAL to the signing path: BIP39 seed -> per-role HD seeds
- * (srv/utils/wallet-hd.ts, Lace-exact) -> ZswapSecretKeys for the shielded
- * account, unshielded keystore for the NIGHT account. `viewingKey` is the
- * zswap encryption public key, the same 64-hex value the signing adapter's
- * `getEncryptionPublicKey()` returns and `validateViewingKey` accepts.
- *
- * Secret hygiene: the mnemonic/seed is never logged or returned; role seeds
- * are zeroed and the zswap secret keys cleared after use.
- *
- * The SDK packages are ESM-only; loaded via dynamic import from this CommonJS
- * module (same pattern as srv/midnight/wallet-worker.ts).
+ * Wallet identity (viewing key, addresses, attester id) from a mnemonic or seed, without a session.
+ * Derivation must stay identical to the signing path. The seed is never logged or returned;
+ * role seeds are zeroed and secret keys cleared after use.
  */
 import { persistentHash, CompactTypeBytes } from '@midnight-ntwrk/compact-runtime';
 import { mnemonicToBip39SeedHex, deriveRoleSeeds, type RoleSeeds } from './wallet-hd';
@@ -55,12 +39,7 @@ async function loadUnshielded(): Promise<any> {
 
 const BIP39_SEED_HEX_RE = /^[0-9a-fA-F]{128}$/;
 
-/**
- * AttestationVault attester id (64-hex) from the wallet's zswap role seed:
- * `persistentHash<Bytes<32>>(deriveAttestationSecret(zswapSeed))`, byte-exact
- * to the compiled circuit's `caller_id()` (which hashes the same secret the
- * worker's witness returns). Zeroes the intermediate secret after hashing.
- */
+/** Vault attester id: `persistentHash<Bytes<32>>(deriveAttestationSecret(zswapSeed))`, byte-exact to `caller_id()`. */
 export function deriveAttesterId(zswapSeed: Uint8Array): string {
     const secret = deriveAttestationSecret(zswapSeed);
     try {
@@ -70,15 +49,9 @@ export function deriveAttesterId(zswapSeed: Uint8Array): string {
     }
 }
 
-/**
- * Viewing key (64-hex zswap encryption public key) for one account of a seed.
- * Used by connectWalletForSigning to verify, fail-closed, that the presented
- * seed + accountIndex actually derive the session's viewing key; without this
- * check a wrong account (or wrong mnemonic) silently signs with foreign keys.
- */
+/** Viewing key of one seed account; lets connectWalletForSigning refuse a seed that is not the session's. */
 export async function deriveViewingKeyForAccount(bip39SeedHex: string, accountIndex: number): Promise<string> {
-    // The try/finally opens BEFORE the HD derivation so bip39Seed is zeroed
-    // even when the SDK import or deriveRoleSeeds itself throws.
+    // The finally must cover a throwing derivation, so bip39Seed is always zeroed.
     const bip39Seed = new Uint8Array(Buffer.from(bip39SeedHex, 'hex'));
     let roleSeeds: RoleSeeds | undefined;
     try {
@@ -100,13 +73,10 @@ export async function deriveViewingKeyForAccount(bip39SeedHex: string, accountIn
     }
 }
 
-/**
- * Resolve the 64-byte BIP39 seed hex from the options, validating input.
- * Split out so the (jest-loadable, ESM-free) validation paths are unit-testable.
- */
+/** Validated 64-byte BIP39 seed hex from a mnemonic or seed. */
 export function resolveBip39SeedHex(opts: Pick<DeriveWalletInfoOptions, 'mnemonic' | 'seedHex'>): string {
     if (opts.mnemonic) {
-        return mnemonicToBip39SeedHex(opts.mnemonic); // throws on an invalid phrase
+        return mnemonicToBip39SeedHex(opts.mnemonic);
     }
     if (opts.seedHex) {
         if (!BIP39_SEED_HEX_RE.test(opts.seedHex)) {
@@ -117,7 +87,7 @@ export function resolveBip39SeedHex(opts: Pick<DeriveWalletInfoOptions, 'mnemoni
     throw new Error('either mnemonic or seedHex (64-byte BIP39 seed, 128 hex chars) is required');
 }
 
-/** Derive viewing key + addresses for a wallet account. See module docs. */
+/** Viewing key, addresses and attester id of a wallet account. */
 export async function deriveWalletInfo(opts: DeriveWalletInfoOptions): Promise<WalletInfo> {
     const accountIndex = opts.accountIndex ?? 0;
     if (!Number.isInteger(accountIndex) || accountIndex < 0) {
@@ -126,8 +96,7 @@ export async function deriveWalletInfo(opts: DeriveWalletInfoOptions): Promise<W
     if (!opts.network) throw new Error('network is required');
 
     const bip39SeedHex = resolveBip39SeedHex(opts);
-    // try/finally opens BEFORE the HD derivation: bip39Seed must be zeroed
-    // even when the SDK import or deriveRoleSeeds itself throws.
+    // The finally must cover a throwing derivation, so bip39Seed is always zeroed.
     const bip39Seed = new Uint8Array(Buffer.from(bip39SeedHex, 'hex'));
     let roleSeeds: RoleSeeds | undefined;
     try {
@@ -153,9 +122,7 @@ export async function deriveWalletInfo(opts: DeriveWalletInfoOptions): Promise<W
         const keystore = unshielded.createKeystore(roleSeeds.night, opts.network);
         const nightAddress: string = unshielded.PublicKey.fromKeyStore(keystore).address;
 
-        // DUST address: where dust generation accrues for this wallet. Needed
-        // as the `dustReceiverAddress` input of registerForDustGeneration when
-        // ANOTHER (funded) wallet sponsors this wallet's dust generation.
+        // The `dustReceiverAddress` when another wallet sponsors this wallet's dust generation.
         const dustKey = ledger.DustSecretKey.fromSeed(roleSeeds.dust);
         let dustAddress: string;
         try {
@@ -164,13 +131,7 @@ export async function deriveWalletInfo(opts: DeriveWalletInfoOptions): Promise<W
             dustKey.clear?.();
         }
 
-        // AttestationVault attester identity: the circuits' `caller_id()` is
-        // `persistentHash<Bytes<32>>(local_secret_key())`, and the worker feeds
-        // `local_secret_key` from deriveAttestationSecret(roleSeeds.zswap). Both
-        // halves replicated here, so consumers know a wallet's attester id
-        // BEFORE its first on-chain call (e.g. as registerPassport's ownerId).
-        // Network-independent (pure function of the seed). Verified against
-        // live ledger state: attestation_owners stores exactly this value.
+        // Network-independent; known before the wallet's first on-chain call.
         const attesterId = deriveAttesterId(roleSeeds.zswap);
 
         return { viewingKey, shieldedAddress, nightAddress, dustAddress, attesterId, accountIndex, network: opts.network };

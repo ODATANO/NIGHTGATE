@@ -58,7 +58,7 @@ export interface MerkleProof {
 }
 
 /**
- * Batch mode (0.12.0): one witness object serving N proof calls in ONE
+ * Batch mode: one witness object serving N proof calls in ONE
  * transaction scope. The proof is read at witness INVOCATION time, so the batch loop swaps
  * `current` immediately before each `callTx`. Mirrors the server's `WitnessFactoryInput`.
  */

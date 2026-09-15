@@ -12,9 +12,6 @@
  *  - BlockProcessor        → vi.mock (heavy block parsing/persistence)
  *  - ensureSyncStateSingleton → vi.mock (the real SINGLETON row is seeded
  *    directly via the DB in beforeEach)
- *
- * Only the hand-rolled vi.mock('@sap/cds') cds.ql mock was removed; the
- * crawler now uses the framework's real cds.ql against the in-memory DB.
  */
 
 // --- External collaborators: keep mocked. vi.mock is hoisted. ---
@@ -600,8 +597,8 @@ describe('MidnightCrawler orchestration', () => {
         });
 
         it('start() registers a reconnect handler that re-drives ingestion', async () => {
-            // Reconnect handling now lives in start() (registered before the
-            // pipeline is driven) so a drop during the initial catch-up recovers.
+            // Reconnect handling is registered in start() before the pipeline
+            // is driven, so a drop during the initial catch-up recovers.
             let reconnectCallback: (() => Promise<void>) | undefined;
             const provider = {
                 isConnected: vi.fn().mockReturnValue(true),

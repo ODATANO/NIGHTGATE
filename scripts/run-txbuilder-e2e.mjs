@@ -13,7 +13,7 @@
 //   5. The attestation is verified on chain to carry OUR attester id.
 //
 // This is what an autonomous agent does: it proves under its own identity and
-// pays for the API call (x402 later), while the sponsor covers the chain fee.
+// pays for the API call, while the sponsor covers the chain fee.
 //
 // Server (separate terminal): npm run dev
 // Then:  NIGHTGATE_VAULT=<vault> node --env-file=.env scripts/run-txbuilder-e2e.mjs
@@ -125,7 +125,7 @@ function fnCall(name, params) {
     console.log(`OK   sponsor submitted: ${out.txHash}`);
 
     step('4. Verify on chain that the attestation is OURS');
-    const res = await fetch(`${ENDPOINT}${fnCall('verifyAttestationState', { contractAddress: VAULT, payloadHash })}`);
+    const res = await fetch(`${ENDPOINT}${fnCall('verifyAttestationState', { contractAddress: VAULT, attesterId: builder.attesterId, payloadHash })}`);
     const v = await res.json();
     const attesterOk = String(v.attesterId ?? '').toLowerCase() === builder.attesterId.toLowerCase();
     console.log(`     attested=${v.attested} attesterId=${String(v.attesterId ?? '').slice(0, 24)}…`);

@@ -119,6 +119,13 @@ export function isTransportFailure(err) {
  *                       into single-call transactions is the remedy.
  *   'malformed'         117 NotNormalized (classically a zero fee). Neither
  *                       waiting nor an identical rebuild fixes it.
+ *   'stale-transcript'  104: the node refused the call's transcript against
+ *                       the current contract state. Another transaction on
+ *                       the same contract landed first (typically it grew a
+ *                       map by one trie level, so the declared gas budget no
+ *                       longer covers the call). Nothing entered the pool, no
+ *                       fee: build the call AGAIN against current state
+ *                       (`rebuildOnStaleTranscript`), never resend the bytes.
  *   'unknown'           a 1010 this table does not know, or not a coded reject.
  *
  * Rebuilds after a reject must produce FRESH bytes; resubmitting identical
@@ -126,9 +133,10 @@ export function isTransportFailure(err) {
  */
 export function classifyNodeReject(err) {
     const haystack = rejectHaystack(err);
-    const custom = /custom error:?\s*(\d+)/i.exec(haystack);
+    const custom = /custom error:?\s*(\d+)/i.exec(haystack) ?? /\b1010\/(\d+)\b/.exec(haystack);
     const subCode = custom ? Number(custom[1]) : null;
     if (subCode !== null) {
+        if (subCode === 104) return { kind: 'stale-transcript', subCode };
         if ([170, 171, 196].includes(subCode)) return { kind: 'stale-dust-proof', subCode };
         if ([138, 173].includes(subCode)) return { kind: 'funds', subCode };
         if ((subCode >= 219 && subCode <= 224) || subCode === 188) return { kind: 'sequencing', subCode };
@@ -137,6 +145,27 @@ export function classifyNodeReject(err) {
     if (/insufficient funds|could not balance dust/i.test(haystack)) return { kind: 'funds', subCode };
     if (/causality|sequencing/i.test(haystack)) return { kind: 'sequencing', subCode };
     return { kind: 'unknown', subCode };
+}
+
+/**
+ * Run `attempt` again when the node (or a sponsor job) refused the call's
+ * transcript against the current contract state (`classifyNodeReject` kind
+ * `stale-transcript`, ledger error 104). `attempt(retry)` must BUILD fresh
+ * bytes each time (`buildSponsorable` reads the current state) and hand them
+ * over; identical bytes stay refused. Any other error, and the last refusal
+ * once `retries` are used, is rethrown. The pause lets the indexer serve the
+ * state that includes the competing transaction.
+ */
+export async function rebuildOnStaleTranscript(attempt, { retries = 2, backoffMs = 15_000, onRetry, sleep = (ms) => new Promise((r) => setTimeout(r, ms)) } = {}) {
+    for (let retry = 0; ; retry++) {
+        try {
+            return await attempt(retry);
+        } catch (err) {
+            if (retry >= retries || classifyNodeReject(err).kind !== 'stale-transcript') throw err;
+            if (typeof onRetry === 'function') onRetry(retry + 1, err);
+            await sleep(backoffMs);
+        }
+    }
 }
 
 /** `wss://host/path` -> `https://host/path` (and ws -> http); http(s) passes through. */

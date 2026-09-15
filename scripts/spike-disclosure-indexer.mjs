@@ -2,7 +2,7 @@
 // `disclosures` ledger Map back out via the compiled artifact's `ledger()`
 // decoder, AND that the enumeration strategy works given the central
 // constraint: the OUTER `disclosures` map is NOT iterable (member/lookup only),
-// while sibling maps (attestation_owners) and the INNER per-payload map ARE.
+// while sibling maps (attestations) and the INNER per-payload map ARE.
 //
 // It drives the REAL Compact-emitted circuits locally (no chain / no proof
 // server): attest -> grantDisclosure -> decode+enumerate -> revokeDisclosure
@@ -65,8 +65,8 @@ let circuitCtx = rt.createCircuitContext(
 // ---- decode the EMPTY state + confirm the iterability asymmetry ------------
 const led0 = ledger(circuitCtx.currentQueryContext.state);
 ok('decode: disclosures present + empty', led0.disclosures?.isEmpty?.() === true);
-ok('decode: attestation_owners iterable',
-    typeof led0.attestation_owners?.[Symbol.iterator] === 'function');
+ok('decode: attestations iterable',
+    typeof led0.attestations?.[Symbol.iterator] === 'function');
 ok('CONSTRAINT: outer disclosures NOT iterable (member/lookup only)',
     typeof led0.disclosures?.[Symbol.iterator] !== 'function',
     'if this ever flips, the indexer can iterate disclosures directly');
@@ -95,11 +95,11 @@ ok('grant: inner has grantee', inner.member(grantee) === true);
 ok('grant: level round-trips', inner.lookup(grantee) === LEVEL, `got ${inner.lookup(grantee)}`);
 
 // ---- THE PRODUCTION ENUMERATION STRATEGY ----------------------------------
-// Outer map not iterable -> enumerate payload hashes from attestation_owners
+// Outer map not iterable -> enumerate payload hashes from attestations
 // (iterable, keyed by payload_hash), then drill into disclosures.lookup(ph).
 function enumerateGrants(led) {
     const rows = [];
-    for (const [phBytes] of led.attestation_owners) {
+    for (const [phBytes] of led.attestations) {
         if (!led.disclosures.member(phBytes)) continue;
         for (const [gBytes, levelBig] of led.disclosures.lookup(phBytes)) {
             rows.push({ payloadHash: hex(phBytes), grantee: hex(gBytes), level: Number(levelBig) });
@@ -122,6 +122,6 @@ ok('revoke: enumeration now empty', enumerateGrants(led2).length === 0);
 
 console.log();
 console.log(failures === 0
-    ? 'SPIKE PASS - ledger() decode + attestation_owners-driven enumeration works; outer disclosures map is not iterable as expected.'
+    ? 'SPIKE PASS - ledger() decode + attestations-driven enumeration works; outer disclosures map is not iterable as expected.'
     : `${failures} failure(s).`);
 process.exit(failures === 0 ? 0 : 1);

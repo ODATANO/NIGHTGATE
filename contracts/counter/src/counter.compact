@@ -1,7 +1,5 @@
-// Minimal Compact contract for NIGHTGATE's first registered artifact.
-// Mirrors example-counter (github.com/midnightntwrk/example-counter) so we
-// inherit a known-good upstream pattern. T10-extended replaces this with the
-// tiered-disclosure AttestationVault once that pattern is designed.
+// Minimal Compact contract, registered as the `counter` artifact.
+// Mirrors example-counter (github.com/midnightntwrk/example-counter).
 
 pragma language_version >= 0.20;
 

@@ -1,6 +1,6 @@
 /**
  * Secondary indexes the hot query paths need. CDS emits only primary keys and
- * `@assert.unique` constraints; everything below was a full table scan:
+ * `@assert.unique` constraints; everything below is otherwise a full table scan:
  * `Blocks.height` (latest / byHeight / rollback), `Transactions.hash` (job
  * reconciliation, verifyDocument), `PendingSubmissions.txHash` (scanned once
  * per extrinsic per block inside the persist transaction), the UTXO owner and
@@ -31,7 +31,8 @@ export const NIGHTGATE_INDEXES: readonly IndexSpec[] = [
     { name: 'ng_unshieldedutxos_spent', table: 'midnight_UnshieldedUtxos', columns: ['spentAtTransaction_ID'] },
     { name: 'ng_pendingsubmissions_txhash', table: 'midnight_PendingSubmissions', columns: ['txHash'] },
     { name: 'ng_backgroundjobs_status', table: 'midnight_BackgroundJobs', columns: ['status', 'kind'] },
-    { name: 'ng_backgroundjobs_parent', table: 'midnight_BackgroundJobs', columns: ['parentJobId'] }
+    { name: 'ng_backgroundjobs_parent', table: 'midnight_BackgroundJobs', columns: ['parentJobId'] },
+    { name: 'ng_backgroundjobs_grant', table: 'midnight_BackgroundJobs', columns: ['grantId', 'queuedAt'] }
 ];
 
 /** The DDL for one index, dialect-neutral (SQLite + PostgreSQL). */

@@ -1,13 +1,3 @@
-/**
- * Core of the worker's `submitContractCallBatch`: run an ordered list of
- * circuit calls inside ONE SDK transaction scope and map the finalized result.
- *
- * Lives outside wallet-worker.ts so it is unit-testable: the worker module
- * itself refuses to load without a worker_threads parentPort, which keeps its
- * op bodies out of reach for tests. The worker op does the facade/provider
- * assembly and delegates the scope mechanics here.
- */
-
 import {
     type BatchOrderOptions,
     withObservedBatchSegments,
@@ -18,33 +8,26 @@ import { runtimeConfigEnum } from './runtime-config';
 export interface BatchCall {
     circuit: string;
     args: unknown[];
-    /**
-     * Invoked immediately before this entry's `callTx`. Calls run
-     * sequentially inside the scope, so the hook may rebind per-call state
-     * (e.g. swap a witness holder's current Merkle proof) deterministically.
-     * Entries without a hook behave exactly as before.
-     */
     before?: () => void;
+}
+
+/** The block height a finalized tx landed in, or null when the SDK reported none. */
+export function landedHeight(pub: any): number | null {
+    const h = Number(pub?.blockHeight);
+    return Number.isInteger(h) && h >= 0 ? h : null;
 }
 
 export interface BatchScopeResult {
     txHash: string;
     onChainStatus: string;
+    /** Indexer block height of the inclusion, when the SDK reported one. */
+    blockHeight: number | null;
     circuits: string[];
 }
 
 /**
- * Execute `calls` inside a single `withContractScopedTransaction` scope on
- * `found` (a findDeployedContract result). Calls are invoked in array order,
- * and the wrapped proof provider rewrites the merged intents' segment ids
- * into call order before proving (batch-segment-order.ts), so the ledger
- * also APPLIES them in call order - dependent calls may be batched. With
- * duplicate circuit names in one batch the relative order among same-named
- * calls is not guaranteed (intents are indistinguishable by entryPoint);
- * batch distinct circuits when that matters. Validates every circuit BEFORE
- * opening the scope, so a bad name is a clean error rather than a half-built
- * transaction context. Uses the circuit-call interface's `(txCtx, ...args)`
- * overload; the SDK batches the calls and submits ONCE.
+ * Run `calls` in one `withContractScopedTransaction` scope on `found`; the ledger
+ * applies them in call order (or stage-grouped with `orderOpts.independentCalls`).
  */
 export async function runBatchInScope(
     contracts: any,
@@ -52,7 +35,6 @@ export async function runBatchInScope(
     found: any,
     calls: BatchCall[],
     contractAddress: string,
-    /** Order-free calls are grouped by execution stage before proving (batch-segment-order.ts). */
     orderOpts: BatchOrderOptions = {}
 ): Promise<BatchScopeResult> {
     if (!Array.isArray(calls) || calls.length === 0) {
@@ -71,18 +53,9 @@ export async function runBatchInScope(
     }
 
     const circuits = calls.map(c => c.circuit);
-    // Deterministic apply order (the ledger applies merged intents in
-    // ascending segment id order): the wrapped proof provider permutes the
-    // batch's existing segment ids into call order before proving
-    // (batch-segment-order.ts). Live-proven since 0.10.0 and EXONERATED as
-    // a 1010/188 cause (observe-mode runs reject identically with untouched
-    // ids). NIGHTGATE_BATCH_SEGMENT_MODE=observe skips the ordering and
-    // only logs the randomized ids (diagnosis; dependent batches then apply
-    // in dice order). Whatever the mode, the ledger's sequencing check
-    // rejects an update of an existing cell FOLLOWED by a later intent on
-    // populated state (1010/188): order cell-updating calls LAST in the
-    // batch.
-    // Skipped when the bundle has no proveTx-capable proof provider (tests).
+    // The ledger applies merged intents by ascending segment id, which the SDK
+    // randomizes; the wrapper permutes them into call order before proving.
+    // `observe` mode only logs them, so dependent batches apply in random order.
     const providersAny = providers as any;
     const mode = runtimeConfigEnum<'observe' | 'rewrite'>('NIGHTGATE_BATCH_SEGMENT_MODE') ?? 'rewrite';
     const wrapSegments = mode === 'observe' ? withObservedBatchSegments : withOrderedBatchSegments;
@@ -104,6 +77,7 @@ export async function runBatchInScope(
     return {
         txHash: String(pub?.txHash ?? ''),
         onChainStatus: String(pub?.status ?? ''),
+        blockHeight: landedHeight(pub),
         circuits
     };
 }

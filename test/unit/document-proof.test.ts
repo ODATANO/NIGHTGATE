@@ -10,7 +10,7 @@
  *
  * Pure circuits are faked with a deterministic stand-in (sha256 over tagged
  * concatenations); the real leafHash/nodeHash parity is covered by the live
- * e2e path, exactly like the NIGHTPASS content-root builder.
+ * e2e path.
  */
 
 vi.mock('@sap/cds', () => {
@@ -472,7 +472,7 @@ describe('attestAgentOutput handler', () => {
 });
 
 
-describe('buildDocumentContentRoot: cross-root witness export (v4 salted openings)', () => {
+describe('buildDocumentContentRoot: cross-root witness export (salted openings)', () => {
     const doc = { chemistry: 'NMC811', capacity: 4200 };
     const specs = [{ field: 'chemistry', kind: 'bytes' as const }, { field: 'capacity' }];
 
@@ -549,8 +549,8 @@ describe('buildDocumentContentRoot: cross-root witness export (v4 salted opening
     });
 
     it('schemaId binds kind and scale: a reinterpretation is a DIFFERENT schema', () => {
-        // Soundness fix: x=1 at scale 1000 and x=1000 at scale 1 yield the
-        // SAME leaf value (1000). Without kind/scale in the schema id, a
+        // x=1 at scale 1000 and x=1000 at scale 1 yield the SAME leaf value
+        // (1000). Without kind/scale in the schema id, a
         // mask-0 integrity proof between them would claim "unchanged" while
         // the raw values differ 1000x.
         const base = computeSchemaId([{ field: 'x' }], fakePure);

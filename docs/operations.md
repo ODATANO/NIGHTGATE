@@ -1,32 +1,32 @@
 # Operations
 
-Running NIGHTGATE day-to-day. Audience: anyone deploying it, debugging a stuck sync, or chasing why an action returned 503.
+Running NIGHTGATE: scripts, configuration, wallet sync, upgrades, monitoring, troubleshooting.
 
 ## Scripts at a glance
 
 | Command | When to use | What it does |
 |---|---|---|
-| `npm run dev` | Iterating on code | `cds watch` with auto-reload + 12 GB heap (`scripts/dev.mjs`) |
-| `npm run serve:sync` | Long-running sync, demos | `cds-serve` with 12 GB heap (no watch - avoids restarting on DB writes) |
-| `npm run serve` | Production-ish | Plain `cds-serve` (no heap pre-config) |
-| `npm run sync:start` | Bootstrap a wallet session | Calls `connectWallet` + `connectWalletForSigning` against `localhost:4004`, reads keys from `.env` |
-| `npm run sync:probe` | Check local indexer container | Verifies `localhost:8088` is up + returning data |
-| `npm run deploy:e2e` | End-to-end deploy flow | `sync:start` + `registerForDustGeneration` + 90 s wait + `deployContract(counter)` |
-| `npm run sponsored-deploy:e2e` | Sponsored DEPLOY under an agent grant (0.21.0) | grant with `allowDeploy`/`maxDeploys: 1` -> txbuilder `buildDeploySponsorable` (caller key) -> `sponsorUnboundTransaction` under the token -> follow-up call on the landed address under the same token -> second deploy refused. `NIGHTGATE_GRANT_CONTRACTS=<a>,<b>` puts more contracts on the grant; prints `GRANT_TOKEN`/`SPONSOR_SESSION` for `burst-sponsor:e2e` (`NIGHTGATE_AGENT_TOKEN`) |
-| `npm run wasm-proving:e2e` | Verify in-process proving (server on `NIGHTGATE_PROVING_MODE=wasm`) | NIGHT self-transfer proved without a proof server; strongest with a dead `NIGHTGATE_PROOF_SERVER_URL` |
-| `npm run wasm-contract:e2e` | Verify contract flow under wasm mode | `deployContract(counter)` + `increment()`; in wasm mode both prove in-process |
-| `npm run wasm-zswap:e2e` | Measure zswap circuits in-process | Deploys `shielded-token`, mints, shielded self-transfer via `sendNight` `tokenTypeHex` |
-| `npm run width32:e2e` | Verify the 32-slot vault lineage | Deploys `attestation-vault-32`, 24-field document, attest+anchor batch, k-of-32 diff, crawler-free verify |
-| `npm run check:server` | Health-check a running server | Health/readiness plus sponsor dust/balance/sync when `NIGHTGATE_SPONSOR_SESSION_ID` is set; `check:server:hosted` targets the hosted box |
-| `npm run build` | Before publish or after schema change | Generates `@cds-models/` types + compiles TS in-place |
+| `npm run dev` | Iterating on code | `cds watch`, 12 GB heap (`scripts/dev.mjs`) |
+| `npm run serve:sync` | Long sync runs, e2e lanes | `cds-serve`, 12 GB heap, no watch |
+| `npm run serve` | Production-like | Plain `cds-serve` |
+| `npm run sync:start` | Bootstrap a wallet session | `connectWallet` + `connectWalletForSigning` against `localhost:4004`, keys from `.env` |
+| `npm run sync:probe` | Check the local indexer | `localhost:8088` up and returning data |
+| `npm run deploy:e2e` | Deploy flow | `sync:start` + `registerForDustGeneration` + 90 s wait + `deployContract(counter)` |
+| `npm run sponsored-deploy:e2e` | Sponsored deploy under an agent grant | Grant with `allowDeploy`/`maxDeploys: 1` -> txbuilder `buildDeploySponsorable` -> `sponsorUnboundTransaction` -> follow-up call on the new address -> second deploy refused. `NIGHTGATE_GRANT_CONTRACTS=<a>,<b>` adds contracts; prints `GRANT_TOKEN`/`SPONSOR_SESSION` for `burst-sponsor:e2e` (`NIGHTGATE_AGENT_TOKEN`) |
+| `npm run wasm-proving:e2e` | In-process proving (server on `NIGHTGATE_PROVING_MODE=wasm`) | NIGHT self-transfer without a proof server |
+| `npm run wasm-contract:e2e` | Contract flow in wasm mode | `deployContract(counter)` + `increment()` |
+| `npm run wasm-zswap:e2e` | zswap circuits in-process | Deploys `shielded-token`, mints, shielded self-transfer via `sendNight` `tokenTypeHex` |
+| `npm run width32:e2e` | 32-slot vault | Deploys `attestation-vault-32`, 24-field document, attest+anchor batch, k-of-32 diff, crawler-free verify |
+| `npm run check:server` | Check a running server | Health/readiness; sponsor dust/balance/sync with `NIGHTGATE_SPONSOR_SESSION_ID`; optional URL argument |
+| `npm run build` | Before publish, after schema changes | `@cds-models/` types + in-place TS compile |
 | `npm run typecheck` | Pre-commit | `tsc --noEmit` |
-| `npm test` | Pre-commit | Full Vitest suite with coverage |
-| Integration scripts | Verifying SDK wiring | `smoke:sdk`, `integration:providers`, `integration:wallet-keys`, `integration:wallet-facade`, `integration:contract-registry` |
-| `npm run integration:postgres` | Before a tag, after any change to the crawler write path, indexes or the lock-retry classifier | The database paths against a REAL PostgreSQL 16: model deploy, `Transactions.raw` BYTEA round trip through the BlockProcessor, `ensureIndexes` idempotency, SQLSTATE classification (55P03, 40P01, 57014, 40001; 23505 stays out) and `withLockContentionRetry`. Starts a throwaway `postgres:16` container on port 15432 (Docker) unless `NIGHTGATE_PG_URL` points at a database; CI runs it against a service container. `npm run check:release:full` = `check:release` + this lane |
+| `npm test` | Pre-commit | Vitest suite with coverage |
+| Integration scripts | SDK wiring | `smoke:sdk`, `integration:providers`, `integration:wallet-keys`, `integration:wallet-facade`, `integration:contract-registry` |
+| `npm run integration:postgres` | Before a tag; after changes to crawler writes, indexes or lock retry | Against PostgreSQL 16: model deploy, `Transactions.raw` BYTEA round trip, `ensureIndexes` idempotency, SQLSTATE classification (55P03, 40P01, 57014, 40001; not 23505), `withLockContentionRetry`. Throwaway `postgres:16` container on port 15432 unless `NIGHTGATE_PG_URL` is set. `check:release:full` = `check:release` + this lane |
 
 ### Why `serve:sync` and not `dev` for long runs
 
-`cds watch` restarts on any change in the watched paths. Once the wallet SDK is syncing, the SQLite DB grows past 100 MB and gets touched frequently, so watch restarts the server every few minutes and kills the sync mid-flight. Use `serve:sync` (no watch, 12 GB heap pre-applied) for sessions you want to leave running for hours.
+`cds watch` restarts on changes in watched paths, including the database files a sync writes, and kills the sync. Use `serve:sync` for runs that last hours.
 
 ## Environment configuration
 
@@ -46,9 +46,8 @@ NIGHTGATE_CRAWLER_ENABLED=false                           # Turn off during wall
 # NIGHTGATE_INDEXER_HTTP_URL=http://localhost:8088/api/v4/graphql
 # NIGHTGATE_INDEXER_WS_URL=ws://localhost:8088/api/v4/graphql/ws
 
-# Wallet credentials for npm scripts (sync:start, deploy:e2e). NIGHTGATE HD-derives
-# the per-role keys from the mnemonic, matching Lace - pass the mnemonic.
-# .env is gitignored - these stay local. NEVER commit a real seed/mnemonic.
+# Wallet credentials for npm scripts (sync:start, deploy:e2e); per-role keys are
+# HD-derived from the mnemonic like Lace. .env is gitignored; never commit a mnemonic.
 LACE_VIEWING_KEY=a32699a5a29e453f6e92624c2fbefdee173d3f1178e3f9c71bc3edb7d91c1403
 LACE_MNEMONIC="word1 word2 word3 ... word24"
 
@@ -57,15 +56,15 @@ LACE_MNEMONIC="word1 word2 word3 ... word24"
 # ENCRYPTION_KEY=<64-hex-char>
 ```
 
-Without any encryption key the crypto layer uses a random per-process dev key with a warning log: encrypted rows (wallet sessions, encrypted job commands) do not survive a restart. Set `ENCRYPTION_KEY` for anything that should persist; production refuses to start without one.
+Without an encryption key a random per-process dev key is used (warning logged): wallet sessions and encrypted job commands do not survive a restart. Production refuses to start without one.
 
 ### CDS config
 
-Everything else goes under `cds.requires.nightgate` in `package.json` - see [reference.md#configuration](reference.md#configuration) for the full matrix.
+All other settings: `cds.requires.nightgate`, see [reference.md#configuration](reference.md#configuration).
 
 ## Local Midnight indexer (optional)
 
-The hosted Midnight indexer at `indexer.preprod.midnight.network` occasionally returns 503s. NIGHTGATE includes a `midnightntwrk/indexer-standalone:4.3.2` service in `docker/docker-compose.yml` as a self-hosted alternative.
+Self-hosted alternative to the hosted indexer (which returns occasional 503s): `midnightntwrk/indexer-standalone:4.3.3` in `docker/docker-compose.yml`.
 
 ### Bring it up
 
@@ -73,7 +72,7 @@ The hosted Midnight indexer at `indexer.preprod.midnight.network` occasionally r
 docker compose -f docker/docker-compose.yml up -d indexer
 ```
 
-The container talks to the hosted Substrate RPC by default (so we self-host the *flaky* GraphQL layer but keep the *reliable* RPC hosted - see [architecture.md](architecture.md) for the rationale). Storage is SQLite in a named docker volume.
+It uses the hosted Substrate RPC by default and stores SQLite in a named volume.
 
 ### Verify it's up
 
@@ -81,13 +80,13 @@ The container talks to the hosted Substrate RPC by default (so we self-host the 
 npm run sync:probe
 ```
 
-Reports `/live` HTTP 200, GraphQL schema accessible, latest indexed block, sample block @ height 100.
+Reports `/live` status, GraphQL schema access, latest indexed block and the block at height 100.
 
 ### Initial catch-up
 
-The container indexes from genesis. At observed preprod rate (~2-3 blocks/s), full sync of ~830k preprod blocks takes **2-3 days** wall-clock. Watch `docker logs odatano-night-indexer | findstr caught_up` for `"caught_up":true`.
+Indexes from genesis; a full preprod sync takes days. Wait for `"caught_up":true` in `docker logs odatano-night-indexer`.
 
-**Don't flip NIGHTGATE to use the local indexer until catch-up is complete**. The wallet SDK's subscriptions assume tip-level data; querying a half-synced indexer leads to silent data gaps.
+**Do not switch NIGHTGATE to the local indexer before catch-up.** Wallet subscriptions against a half-synced indexer produce silent data gaps.
 
 ### Flip NIGHTGATE to use it
 
@@ -112,28 +111,17 @@ npm run serve:sync
 npm run sync:start
 ```
 
-`sync:start` does `connectWallet` + `connectWalletForSigning`. The latter schedules a tracked pre-warm job that syncs the facade to tip; poll `getJobStatus(prewarmJobId, sessionId)` for completion. Expected log progression in the server terminal:
+`connectWalletForSigning` schedules a prewarm job that syncs the wallet to tip; poll `getJobStatus(prewarmJobId, sessionId)` or `getWalletSyncProgress(sessionId)`. Server log lines to expect: `restored prior state for <id>`, `facade started for <id> (restored=...)`, `periodic-save interval armed for <id> (every 60s)`. `RPC-CORE: subscribeRuntimeVersion: disconnected ... 1000 Normal Closure` is harmless.
 
-```
-[wallet-sessions] facade pre-warm kicked off for d4c0f3cc9d3d285c
-[facade] restored prior state for d4c0f3cc9d3d285c: shielded=true unshielded=true dust=true   (or =false on first run)
-[worker] facade started for d4c0f3cc9d3d285c (restored=true)
-[facade] worker init ok for d4c0f3cc9d3d285c: alreadyExisted=false sdk=wallet-sdk-facade@8.0.x
-2026-MM-DD HH:MM:SS RPC-CORE: subscribeRuntimeVersion: disconnected ... 1000 Normal Closure   (twice; harmless)
-[facade-persist] saved <sid> sh=N un=N du=N                                                    (every ~30 s once events flow)
-```
-
-A first-time cold sync from genesis on a fresh seed takes ~5-6 h wall-clock. The worker pegs ~3.8 GB heap once the shielded chain scan completes (it doesn't shrink - that's the in-memory merkle tree). Restart-from-blob is in seconds: every 30 s the worker persists state to `WalletSyncStates`, and a subsequent `connectWalletForSigning` for the same accountId loads the prior blob and delta-syncs from there.
+A cold sync from genesis takes hours; the worker heap stays near 4 GB after the shielded scan. State is saved every 60 s (`NIGHTGATE_SAVE_INTERVAL_MS`) to `WalletSyncStates`; reconnecting the same account delta-syncs from it in seconds.
 
 ## Prover keys
 
-The npm tarball ships no `*.prover` file. A job that proves a circuit of a
-registered contract fetches the missing keys on first need
-(`NIGHTGATE_ZK_ASSET_URL`, a `/zk-config` base of any NIGHTGATE that has
-them; shipped contracts default to the release's git tag), verifies each
-against the contract's `keys/manifest.json` and writes it next to the
-verifier keys. Neither the artifact digest nor any recorded evidence
-changes, and no restart is needed. Offline or firewalled installs:
+The npm tarball ships no `*.prover` file. The first job that proves a circuit
+fetches the missing keys from `NIGHTGATE_ZK_ASSET_URL` (a `/zk-config` base;
+shipped contracts default to the release's git tag), verifies them against
+`keys/manifest.json` and stores them next to the verifier keys. Artifact
+digests and recorded evidence stay unchanged; no restart. Offline installs:
 
 ```bash
 npx nightgate-fetch-keys attestation-vault
@@ -143,99 +131,59 @@ NIGHTGATE_ZK_ASSET_URL=none   # refuse to fetch; a missing key fails the job wit
 
 After recompiling a shipped contract, run `npm run keys:manifest` and commit
 the manifest with the managed tree (`check:exports` fails on a stale one).
-The Docker image builds from the checkout and carries every key.
+The Docker image carries every key.
 
 ## Persistence + restart resilience
 
-Two state tables are load-bearing for restart:
+Restart state:
 
-- **`midnight.SyncState`** (singleton row) - crawler's chain-height progress
-- **`midnight.WalletSyncStates`** (per-accountId) - wallet SDK's serialized sub-wallet blobs
+- **`midnight.SyncState`** (single row): crawler progress
+- **`midnight.WalletSyncStates`** (per account): serialized sub-wallet states
 
-You can inspect them at any time:
+Inspect:
 
 ```bash
 node -e "const s=require('better-sqlite3'); const r=new s('db/midnight.db',{readonly:true}).prepare('SELECT length(shieldedStateBlob) sh,length(dustStateBlob) du,updatedAt FROM midnight_WalletSyncStates').all(); console.log(r);"
 ```
 
-Healthy progression looks like:
-- `sh` stays roughly stable once at tip (your shielded notes don't change every block)
-- `du` grows continuously (dust events flow at ~500/min on preprod)
-- `du` may *shrink slightly* between saves (dust UTXOs expire) - that's normal live-tip behavior
-
-If you see `sh` or `du` shrink dramatically, the SDK is probably revalidating during restore; the new value is the post-validation form. Not corruption.
+Healthy at tip: `sh` roughly stable; `du` grows, and may shrink slightly between saves as dust UTXOs expire. A large shrink after a restore is the SDK's normalized form, not corruption.
 
 ### Reorgs and `reindexFromHeight`
 
-Submitted jobs carry the inclusion coordinates the indexer confirmer reported
-(`chainBlockHeight`, `chainBlockHash`, `indexerTxHash` on `BackgroundJobs`
-and `PendingSubmissions`). A crawler reorg rollback and a manual
-`reindexFromHeight(h)` return every job and attempt row confirmed at or above
-`h` to a pending chain status in the same transaction that removes the
-blocks; the confirmer re-confirms them on its next tick, so a reindex from a
-low height briefly shows `chainStatus: pending` on old jobs. Nothing else
-correlates a job with a block: the job's identifier, the crawler's extrinsic
-hash and the indexer's transaction hash are three different values.
+Confirmed jobs carry `chainBlockHeight`, `chainBlockHash` and `indexerTxHash`
+(`BackgroundJobs`, `PendingSubmissions`). A reorg rollback or
+`reindexFromHeight(h)` resets every job and attempt row confirmed at or above
+`h` to a pending chain status in the transaction that removes the blocks; the
+confirmer re-confirms them on its next tick. The job identifier, extrinsic
+hash and indexer transaction hash are three different values; only the
+height links a job to a block.
 
-## Upgrading to 0.22.0
+Attempts closed as `CHAIN_EXECUTION_FAILED` (landed, not applied) carry a
+height and return to `pending` with their job; pre-mempool rejects have no
+height and are not touched. Such a failure without a recorded height parks
+under `CHAIN_EXECUTION_FAILED_UNCONFIRMED` until the confirmer records it.
 
-Attempt rows closed as `CHAIN_EXECUTION_FAILED` (the call landed but did not
-apply) carry the same height and return to `pending` with their job; an
-attempt rejected before the mempool has no height and is never touched. A
-job that failed that way without a recorded height (it was proven by the
-worker before the confirmer ran) parks under `CHAIN_EXECUTION_FAILED_UNCONFIRMED`
-and is finalized by the confirmer with the coordinates on its next tick.
+## Schema upgrades
 
-One nullable column on `AgentGrants` (`allowedTokenTypes`); same migration
-command as below, once, with the server stopped. Existing grants keep
-working unchanged (null = the platform floor, which by default names no
-token type, so no offer is sponsored until `NIGHTGATE_SPONSOR_ALLOWED_TOKEN_TYPES`
-or the policy file opens one). The startup preflight names the column if
-it is missing.
-
-## Upgrading to 0.21.0
-
-Six nullable columns on `AgentGrants` (`allowedContracts`, `allowedCircuits`,
-`allowDeploy`, `maxDeploys`, `deploysUsed`, `deployedContracts`) and one table
-(`ContractRegistrations`); same migration command as below, once, with the
-server stopped. Existing grants keep working unchanged (they inherit the
-floor and hold no deploy right). Nothing else changes shape; the startup
-preflight names any column that is missing.
-
-Afterwards a consumer is onboarded on the running server: put the artifact
-under `NIGHTGATE_CONTRACTS_DIR`, call the admin action `registerContract`,
-then `createAgentGrant` with `allowedContracts` naming that contract. No
-restart, no container recreate, the sponsor pool stays warm. The platform
-allow-list itself can move from the two env variables into
-`NIGHTGATE_SPONSOR_POLICY_FILE` under the data volume (re-read per call).
-
-## Upgrading to 0.20.0
-
-The release adds one column (`WalletSessions.label`) and one SQL view (the
-`BackgroundJobs` projection), so an existing database needs the migration
-once:
+A release that adds columns, tables or views needs the additive migration
+once, with the server stopped. New columns are nullable; existing rows keep
+their behaviour.
 
 ```bash
 npx nightgate-schema-delta                 # or: node scripts/apply-schema-delta.mjs
 docker exec odatano-nightgate node scripts/apply-schema-delta.mjs   # in the image
 ```
 
-It is additive and keeps existing rows. If you skip it, the startup preflight
-names exactly what is missing and Nightgate stays offline rather than failing
-later on the first `connectWallet`; the host process keeps running.
+Without it the startup preflight names the missing objects and NIGHTGATE
+stays offline; the host process keeps running.
 
 ## Monitoring endpoints
 
-Three plain HTTP routes exist next to the OData functions, because the OData
-shapes cannot be consumed by the tools that want this data. `getMetrics()`
-returns the Prometheus body wrapped as `{"value": "# HELP ..."}`, which no
-scraper parses, and a `HEALTHCHECK` or Kubernetes probe cannot express
-`/api/v1/indexer/getReadiness()`.
+Plain HTTP routes for scrapers and probes (the OData `getMetrics()` wraps the
+Prometheus body in JSON).
 
-**They stay off until you configure them.** They are mounted during CAP's
-bootstrap event, BEFORE CAP attaches its authentication middlewares to the
-service paths, so whatever protects the OData surface does not protect these.
-Pick one:
+**Off until configured.** They mount before CAP's authentication, so OData
+auth does not protect them. Pick one:
 
 ```bash
 NIGHTGATE_STATUS_TOKEN=$(openssl rand -hex 32)   # bearer token, the sane default
@@ -248,29 +196,17 @@ curl -H "authorization: Bearer $TOKEN" http://localhost:4004/nightgate/health
 curl -i -H "authorization: Bearer $TOKEN" http://localhost:4004/nightgate/ready
 ```
 
-Same payloads as the functions they mirror, computed by the same code
-(`srv/monitoring/status.ts`). `/nightgate/ready` is the one with a status code
-worth scripting against: 200 when ready, 503 otherwise, with the failing check
-named in the body.
+Same payloads as the OData functions (`srv/monitoring/status.ts`).
+`/nightgate/ready` answers 200 when ready, else 503 naming the failing check.
 
-The prefix is not decoration. NIGHTGATE is a CAP plugin, usually inside
-somebody else's express app, and CAP registers its OWN `/health` immediately
-after the bootstrap event where these mount. A handler on a generic path would
-shadow the host's liveness endpoint for the whole application, letting a
-NIGHTGATE database problem decide a foreign service's health. Override with
+The prefix keeps them off the host app's own `/health`. Override with
 `NIGHTGATE_STATUS_ROUTES_PREFIX`; `NIGHTGATE_STATUS_ROUTES=off` disables them.
 
-Two reads answer questions that used to have no answer from outside:
-
-- `getRuntimeInfo()` carries two digests per contract: the generation this
-  process LOADED, and what the files hash to right now. `digestStale: true`
-  means artifacts were replaced under the running server, which makes the
-  generation guard refuse every write job until it restarts. When all writes
-  suddenly fail, look here first.
-- `getWorkerStatus()` reports the wallet worker at process level. A climbing
-  `exitCount` is a crash loop; an `inFlightRpcs` that only grows is a stall.
-  It deliberately does not feed `getReadiness()`, so a busy worker never takes
-  the process out of rotation. The per-facade list is admin only.
+- `getRuntimeInfo()`: per contract the loaded digest and the current file
+  digest. `digestStale: true` = artifacts replaced under the running server;
+  every write job is refused until restart.
+- `getWorkerStatus()`: climbing `exitCount` = crash loop, ever-growing
+  `inFlightRpcs` = stall. Not part of `getReadiness()`. Per-facade list admin only.
 
 ## Reading the indexer health endpoint
 
@@ -286,37 +222,34 @@ Two reads answer questions that used to have no answer from outside:
 }
 ```
 
-When `NIGHTGATE_CRAWLER_ENABLED=false`, the row stays at whatever the last crawler run wrote - chainHeight comes from the node (always fresh), indexedHeight from the persisted SyncState (frozen). `status: unhealthy` and `lag` numbers don't mean anything for the wallet sync.
+With `NIGHTGATE_CRAWLER_ENABLED=false`, `chainHeight` is fresh (node) but `indexedHeight` is frozen, so `status` and `lag` say nothing about the wallet.
 
-For wallet sync health, look at the `[facade-persist] saved` log lines (worker is processing events) and at the `WalletSyncStates` blob sizes (they should change between subsequent saves).
+Wallet sync health: `getWalletSyncProgress(sessionId)`.
 
 ## Troubleshooting
 
 ### "no facade for sessionId=..."
 
-Worker doesn't have a facade for the supplied session. Either:
+The worker has no facade for the session:
 
-1. Session has no signing material (`connectWalletForSigning` was never called)
-2. Server was restarted between `connectWalletForSigning` and this call
-3. (Pre-Phase-2b fix) the OData user-session UUID was passed instead of the accountId. Verify you're on the post-2026-05-19 build.
+1. `connectWalletForSigning` was never called, or
+2. the server restarted since.
 
-For (2): call `connectWalletForSigning` again with the same seed; the facade will rebuild from persisted blobs.
-
-From 0.13.0 the session id itself is also gone after a restart: startup closes the sessions the previous process left behind, since nobody holds their ids any more and each one kept seed material at rest for a day. Reconnect with `connectWallet` and then `connectWalletForSigning`, which is what a consumer does at boot anyway. Configured `NIGHTGATE_FEE_SPONSOR_SESSION` ids are exempt and keep working. Queued jobs that signed with one of the closed sessions are failed at the same time with `PROCESS_RESTART_SESSION_CLOSED` (their replay could no longer decrypt signing material); re-submit the action from the fresh session if it is still wanted. Opt out entirely with `NIGHTGATE_CLOSE_SESSIONS_ON_RESTART=false`.
+Startup closes the previous process's sessions (except `NIGHTGATE_FEE_SPONSOR_SESSION` ids) and fails their queued jobs with `PROCESS_RESTART_SESSION_CLOSED`. Reconnect with `connectWallet` + `connectWalletForSigning` (the facade rebuilds from the saved state) and re-submit. Opt out: `NIGHTGATE_CLOSE_SESSIONS_ON_RESTART=false`.
 
 ### A wallet takes forever to reach `CAUGHT UP`
 
-First establish whether it is slow or stuck, which used to be indistinguishable from outside:
+Slow or stuck?
 
 ```bash
 curl "http://localhost:4004/api/v1/nightgate/getWalletSyncProgress(sessionId='...')"
 ```
 
-`appliedIndex` climbing with `eventsPerSecond` above zero means it is working, just far behind; `etaSeconds` gives the order of magnitude. The same line is in the log at INFO (`genuine-sync [prewarm] ... rate=... eta=...`). An `appliedIndex` that does not move while `elapsedMs` grows, or `isConnected: false`, is a real stall: check the indexer as described below.
+Climbing `appliedIndex` with `eventsPerSecond` > 0: slow, see `etaSeconds` (log: `genuine-sync [prewarm] ... rate=... eta=...`). `appliedIndex` static while `elapsedMs` grows, or `isConnected: false`: stalled, check the indexer (below).
 
-If it is merely slow, count how many facades are syncing at once. **Every wallet facade lives in the same worker thread**, and catch-up is CPU-bound single-threaded work, so N concurrent catch-ups each run at roughly 1/N speed. Look for `facade started for ...` lines: one per facade the process has warmed.
+All facades share one worker thread, so N concurrent catch-ups run at about 1/N speed each; count the `facade started for ...` lines.
 
-Before 0.13.0 the usual cause of unexpected extra facades was restart recovery replaying `connectWalletForSigning`, one per previous ungraceful stop. Those jobs are now dropped on restart (`PROCESS_RESTART_SESSION_JOB_DROPPED`). On an older build, or to clear rows left by one, stop the server and run:
+Restart recovery drops queued `connectWalletForSigning` jobs (`PROCESS_RESTART_SESSION_JOB_DROPPED`). To clear leftover rows, stop the server and run:
 
 ```sql
 UPDATE midnight_BackgroundJobs
@@ -324,25 +257,30 @@ UPDATE midnight_BackgroundJobs
  WHERE kind = 'connectWalletForSigning' AND status IN ('pending', 'running');
 ```
 
-Leave `midnight_WalletSyncStates` alone: that is the expensive warm state, and deleting it forces a full resync.
+Do not delete `midnight_WalletSyncStates`: that forces a full resync.
+
+### A restored wallet stays at one `appliedIndex` and the log repeats `Error while applying sync update`
+
+Cause line: `received an event with a timestamp prior to the time already synced to` (dust) or `values inserted non-linearly into zswap commitment tree` (shielded). The restored snapshot's offset is behind its state, so every replayed event is rejected and the SDK retries forever.
+
+After `NIGHTGATE_SNAPSHOT_REPLAY_RESET_MS` (default 5 min) the worker replaces that sub-wallet with a fresh one syncing from genesis (WARN `snapshot replay <account>: ... replaced by a fresh one syncing from genesis`) and persists it; the genesis sync takes hours. With the reset disabled (`0`): stop the server and delete the account's `midnight_WalletSyncStates` row.
+
+The `sync-state` INFO line (every `NIGHTGATE_SYNC_STATE_LOG_MS` and after a restore) shows dust `appliedIndex`/`syncTime` and shielded `appliedIndex`/`firstFree`. `getSponsorPoolStatus` shows such a sponsor with `caughtUp: false`, `usable: false` and `lastError`.
 
 ### "Wallet.InsufficientFunds: could not balance dust"
 
-The wallet has less DUST than the operation's fee. Mostly hits on `deployContract` since contract deploys are dust-heavy.
+Less DUST than the fee (typically `deployContract`).
 
-**Diagnosis path:**
-1. `getWalletBalance(sessionId)` - what's the actual dust balance?
-2. `estimateSendNightFee(...)` - pre-flight fee for what you're trying to do
-3. Compare. If fee > balance, wait for more dust to accrue or register more NIGHT UTXOs to raise the cap.
+**Diagnosis:** compare `getWalletBalance(sessionId).dustBalance` with `estimateSendNightFee(...)`.
 
 **Causes:**
-- Wallet has no unshielded NIGHT registered for dust gen (no accrual). Run `registerForDustGeneration` first, wait ~1-2 min for first dust.
-- Wallet is at dust cap (~5 tDUST on preprod default) and you need more. Wait for refill (~100 h to full from empty) or increase NIGHT holding.
-- **Dust-wedged wallet** (pre-0.15.2, or a case that slipped past the guard): a submission that died before the mempool (Substrate 1014 dust contention and friends) leaked its in-flight dust spend, and the wallet's whole dust sat in that one note. Signature in `getWalletBalance`: `registeredNightUtxoCount > 0` but `dustUtxoCount == 0` and `dustPendingCount == 0`, with `dustBalance` pinned at 0 across restarts. Since 0.15.2 the worker restores the dust sub-wallet from a pre-build snapshot on such rejects automatically. Manual heal: stop the server, delete the wallet's `midnight_WalletSyncStates` row, restart and reconnect the session; the cold re-sync rebuilds from chain (~5-15 min on preprod), where the aborted spend never existed.
+- No NIGHT registered for dust generation: run `registerForDustGeneration`, first dust after ~1-2 min.
+- Wallet at its dust cap: wait for refill or hold more NIGHT.
+- **Dust-wedged wallet:** a pre-mempool reject (e.g. 1014) leaked the in-flight dust note. Signature: `registeredNightUtxoCount > 0`, `dustUtxoCount == 0`, `dustPendingCount == 0`, `dustBalance` 0 across restarts. The worker restores the dust sub-wallet from a pre-build snapshot automatically. Manual heal: stop the server, delete the wallet's `midnight_WalletSyncStates` row, restart and reconnect.
 
 ### "Wallet.Sync: [object ErrorEvent]" spamming the log
 
-GraphQL-WS subscription to the indexer dropped. Most often: the hosted Midnight indexer is having a 503 spell. Check:
+The indexer GraphQL-WS subscription dropped, usually an indexer 503. Check:
 
 ```bash
 curl -s -o /dev/null -w "HTTP %{http_code}\n" \
@@ -350,49 +288,43 @@ curl -s -o /dev/null -w "HTTP %{http_code}\n" \
   -d '{"query":"{__typename}"}' https://indexer.preprod.midnight.network/api/v4/graphql
 ```
 
-- `HTTP 200` → indexer is fine; might be a transient WS-only issue
-- `HTTP 503` → indexer is down. Restart the wallet sync after it's back, or use the local container
+- `HTTP 200`: indexer fine; likely a transient WS issue
+- `HTTP 503`: indexer down; restart the sync once it is back, or use the local container
 
 ### Submissions stall on the 5th+ call of a long session (public indexer)
 
-The hosted preprod indexer's graphql-ws subscription degrades over a long, multi-call session - early calls succeed but later ones can hang inside the SDK's balance/submit (the proof server goes idle). The pre-balance sync wait is bounded (`NIGHTGATE_BALANCE_SYNC_TIMEOUT_MS`, default 180s) so it fails rather than hangs forever, but the SDK's own balance/submit calls aren't. Mitigations: keep sessions short / run independent flows separately, restart the server for a fresh subscription, or use a **caught-up** local indexer for heavy use.
+The hosted indexer's graphql-ws subscription degrades over long multi-call sessions; later calls can hang inside the SDK's balance/submit (only the pre-balance sync wait is bounded, `NIGHTGATE_BALANCE_SYNC_TIMEOUT_MS`, default 180 s). Mitigation: short sessions, a server restart for a fresh subscription, or a caught-up local indexer.
 
 ### Contract calls feel slow: read the phase timing
 
-Every `submitContractCall` / `submitContractCallBatch` logs ONE debug line
-with a wall-clock phase breakdown (`submitContractCall timing: <contract>.<circuit>
+With `DEBUG=nightgate:worker` every `submitContractCall` / `submitContractCallBatch`
+logs one line, also on failure: `submitContractCall timing: <contract>.<circuit>
 init=..ms compile=..ms findContract=..ms circuitToProve=..ms prove=..ms
-balance=..ms submit=..ms total=..ms`), also when a phase throws, so a timeout
-attributes itself to its phase. Enable the channel with `DEBUG=nightgate:worker`.
-Expected shape on preprod: `prove` (proof server or in-process wasm) and
-`submit` (chain inclusion) dominate; `findContract` is ~1 s warm (the two
-immutable deploy queries are cached per contract address, the verifier-key
-check stays live). A large `circuitToProve` points at local circuit
-execution, a large `balance` at wallet sync lag.
+balance=..ms submit=..ms total=..ms`. Normally `prove` and `submit` dominate
+and warm `findContract` is about 1 s. Large `circuitToProve` = local circuit
+execution; large `balance` = wallet sync lag.
 
 ### A proof takes longer than 5 minutes
 
-midnight-js gives one proof request 5 min and re-requests a timed-out proof up to three times, so a large custom relation or a busy proof server failed the job and then proved three more times. Set `proofTimeoutMs` (cds) or `NIGHTGATE_PROOF_TIMEOUT_MS` above the slowest proof (0.22.0) and raise the proof-server container's job TTL with it (`MIDNIGHT_PROOF_SERVER_JOB_TIMEOUT`, default 600 s), or a finished-but-expired job answers 5xx and triggers the same re-proving. `NIGHTGATE_WORKER_RPC_TIMEOUT_MS` bounds the whole build+prove+submit and must stay above the sum. The compose file passes `NIGHTGATE_PROOF_TIMEOUT_MS` to the server and `MIDNIGHT_PROOF_SERVER_JOB_TIMEOUT` to the proof-server container; set both in `.env`.
+midnight-js allows 5 min per proof request and re-requests a timed-out proof up to three times. Set `proofTimeoutMs` (cds) / `NIGHTGATE_PROOF_TIMEOUT_MS` above the slowest proof and `MIDNIGHT_PROOF_SERVER_JOB_TIMEOUT` (proof server, default 600 s) above that, else an expired job answers 5xx and is re-proven. `NIGHTGATE_WORKER_RPC_TIMEOUT_MS` must exceed build + prove + submit. Compose reads both variables from `.env`.
 
 ### Submit failed with `1000 Normal Closure` / `ECONNRESET`
 
-The RPC closed the websocket while the finalized transaction was being sent. Since 0.22.0 the worker resends the SAME transaction (`NIGHTGATE_SUBMIT_TRANSPORT_RETRIES`, default 2) after asking the indexer whether the first send landed; the log says `resending the SAME transaction (no rebuild, no re-proving)` or `landed`. A job that still fails after the resends is a real outage; re-issue it. A node reject (`1010`, `1014`, `1016`) is never resent.
+The RPC closed the websocket during send. The worker checks the indexer, then resends the SAME transaction (`NIGHTGATE_SUBMIT_TRANSPORT_RETRIES`, default 2); log: `resending the SAME transaction (no rebuild, no re-proving)` or `landed`. Failing after the resends = real outage, re-issue. Node rejects (`1010`, `1014`, `1016`) are never resent.
 
 ### Contract artifacts outside the package
 
-Point `NIGHTGATE_CONTRACTS_DIR` at the consumer's directory; the artifact's bare `@midnight-ntwrk/compact-runtime` import resolves from NIGHTGATE's own node_modules (worker snapshots, and since 0.22.0 the registration probe), so nothing is copied into `node_modules/@odatano/nightgate` and the directory needs no node_modules of its own.
+Point `NIGHTGATE_CONTRACTS_DIR` at the directory. The artifact's bare `@midnight-ntwrk/compact-runtime` import resolves from NIGHTGATE's own node_modules; the directory needs no node_modules. On a running server: admin `registerContract`, then `createAgentGrant` with `allowedContracts`; no restart. The platform allow-list can live in `NIGHTGATE_SPONSOR_POLICY_FILE` (re-read per call).
 
 ### Server is up but OData requests hang
 
-Phase-2a observation: while the wallet worker is mid-sync at full CPU, the main thread's CAP request pipeline can get starved (10 s `getHealth` curls time out while worker `state-save` events fire normally every 30 s). State-save uses `worker.on('message')` callbacks which don't go through the CAP request pipeline; requests do (auth, AsyncLocalStorage, transaction binding).
+A worker syncing at full CPU can starve the main thread's CAP request pipeline (`getHealth` times out while `state-save` events still arrive).
 
 **Workarounds:**
-- Wait for the wallet to reach tip - once `du` blob is stable-ish, the worker's CPU load drops and request handlers respond again
-- For monitoring during sync, prefer direct DB queries over OData calls
+- Wait until the wallet reaches tip; the load drops.
+- Monitor via direct DB queries during the sync.
 
 ### Zombie node processes / port 4004 in use
-
-Multiple `cds-serve` / `cds watch` runs can leave processes holding port 4004:
 
 ```powershell
 Get-NetTCPConnection -LocalPort 4004 -State Listen
@@ -402,45 +334,45 @@ Kill stale PIDs before starting a new run.
 
 ### Sync seems stuck - no new persist events
 
-No `[facade-persist] saved` lines for several minutes:
+No `save-tick #N pushed` lines (`DEBUG=nightgate:worker`) for several minutes:
 
-1. Are the persisted blobs actually changing? The worker skips push if blobs are byte-identical to last save (`if blobs.shielded === lastBlobs.shielded && ...`)
-2. Subscription died? Look for any `Wallet.Sync` error lines
-3. The Effect.ts fiber may have hit an internal exception that wasn't propagated. Ctrl+C the server and restart; the facade will rebuild from the last blob.
+1. Unchanged state is not pushed (`save-tick #N unchanged, skipping push`); check `getWalletSyncProgress`.
+2. Look for `Wallet.Sync` errors (dead subscription).
+3. Otherwise restart the server; the facade rebuilds from the last save.
 
 ### After a code change, `serve:sync` says "module not found"
 
-You changed a TypeScript file but didn't rebuild. The compiled `.js` files are stale.
+The compiled `.js` files are stale:
 
 ```bash
 npm run build
 ```
 
-Then restart. (Or use `npm run dev` while iterating, accepting the watch-driven restarts.)
+Then restart (or iterate with `npm run dev`).
 
 ## Rotating the encryption key
 
-Ciphertexts carry the id of the ring key they were written under, so a rotation is additive. Wallet sessions, encrypted job commands and the per-account data keys (`AccountKeys`, under which private state, signing keys and sync-state blobs are encrypted) are rewrapped by the tool alone. Rows written before the account key (0.22 and earlier: `keyScheme` null on `PrivateStates`, `ContractSigningKeys`, `WalletSyncStates`) need the wallet's viewing key and migrate when that wallet reconnects; the tool migrates the ones whose session still holds a readable viewing key and reports the rest.
+Ciphertexts name their ring key id, so rotation is additive. The tool rewraps wallet sessions, encrypted job commands and `AccountKeys` (the per-account data keys for private state, signing keys and sync blobs). Rows with `keyScheme` null (`PrivateStates`, `ContractSigningKeys`, `WalletSyncStates`) need the wallet's viewing key: they migrate on reconnect, or via the tool if the session still holds a readable viewing key.
 
-1. Add the new key and make it active, keeping the old one: `ENCRYPTION_KEYS=k2=<new secret>` plus `ENCRYPTION_KEY_ACTIVE=k2`, `ENCRYPTION_KEY` (id `1`) stays set. Restart: new rows are written under `k2`, old rows still open.
-2. Stop the server and run `npx nightgate-rewrap-keys --dry-run`, then without `--dry-run` (same `NIGHTGATE_DB_URL` / `NIGHTGATE_DB_PATH` as the server). It prints counts per table and source key. Exit code 0: nothing legacy remains. Exit code 1: the tool lists the accounts whose rows still need their viewing key; the old key MUST stay in the ring.
-3. Start the server with both keys. Every wallet that reconnects migrates its own rows. Run the tool again (server stopped) until it exits 0. A wallet that never comes back keeps its legacy rows: `--drop-legacy-sync-state` deletes such a wallet's sync-state row (it re-syncs from genesis on its next connect); private state and signing keys are never dropped by the tool, so decide per account whether to keep the old key or accept that those rows stay unreadable.
-4. Only then remove the old key (`ENCRYPTION_KEY` unset, `ENCRYPTION_KEYS=k2=...`) and restart. Startup refuses to run while any ring-sealed ciphertext (sessions, job commands, account keys) names a key outside the ring; it logs the legacy count with a warning, since those rows are unreadable without the viewing key either way.
+1. Add and activate the new key, keep the old one: `ENCRYPTION_KEYS=k2=<new secret>`, `ENCRYPTION_KEY_ACTIVE=k2`, `ENCRYPTION_KEY` (id `1`) stays. Restart.
+2. Stop the server; run `npx nightgate-rewrap-keys --dry-run`, then without `--dry-run` (same `NIGHTGATE_DB_URL` / `NIGHTGATE_DB_PATH` as the server). Exit 0: nothing legacy left. Exit 1: listed accounts still need their viewing key; the old key MUST stay.
+3. Start with both keys; reconnecting wallets migrate their rows. Repeat the tool (server stopped) until exit 0. `--drop-legacy-sync-state` deletes sync-state rows of wallets that never return (they re-sync from genesis); private state and signing keys are never dropped.
+4. Remove the old key and restart. Startup refuses while a ring-sealed ciphertext names a key outside the ring.
 
-The secrets stay in the process environment of the CAP host (the worker thread receives the resolved ring from the main thread, it never parses the environment itself). In production every ring secret must be at least 32 characters; a shorter one refuses to start.
+Secrets are read by the main thread only. In production every ring secret needs at least 32 characters.
 
-Every stored envelope is bound to its row (`v3`: key id, purpose and row id in the AAD). A value copied into another row or column does not decrypt; the rewrap tool rewrites older `v2` values into the bound form. The per-account data key is sealed under the ring and, separately, under the viewing key wrapped in the ring: a database copy plus a viewing key opens nothing without `ENCRYPTION_KEY`, and a ring key that leaves the ring without a rewrap takes the data keys it sealed with it. Run the rewrap before removing a key.
+Envelopes (`v3`) bind key id, purpose and row id in the AAD: a value copied to another row does not decrypt; the tool rewrites `v2` values. The data key is sealed under the ring and under the viewing key: a DB copy plus a viewing key opens nothing without the ring, and removing a ring key without a rewrap loses the data keys it sealed.
 
 ## Contract signing keys (maintenance authority)
 
-Every deploy samples a signing key for the contract (midnight-js) and stores it in `ContractSigningKeys` under the deploying session's account key. That key is the contract's maintenance authority: it can replace the contract's verifier keys. For a contract that matters (a mainnet vault), export it once and keep the export offline:
+Each deploy stores a contract signing key in `ContractSigningKeys` (under the deploying account's key). It can replace the contract's verifier keys. Export it once and keep it offline:
 
 ```
 POST /api/v1/admin/exportContractSigningKey
 { "sessionId": "<deploying session>", "contractAddress": "<address>", "password": "<16+ characters>" }
 ```
 
-The answer is a `midnight-signing-key-export` envelope (`encryptedPayload`, `salt`) sealed under the password, the format `importSigningKeys` restores into another NIGHTGATE. The action needs the admin role and the session's viewing key in the ring, and refuses a key row that a session has not read since the account key was introduced. Decide per contract who holds the export and where; a contract whose key is meant to be unusable is documented as such, the export is then not taken.
+Result: a `midnight-signing-key-export` envelope (`encryptedPayload`, `salt`) sealed under the password, restorable with `importSigningKeys`. Needs the admin role and the session's viewing key; refuses a key row no session has read since the account key was introduced.
 
 ## Database operations
 
@@ -449,7 +381,7 @@ The answer is a `midnight-signing-key-export` envelope (`encryptedPayload`, `sal
 ```bash
 # Stop server first
 rm db/midnight.db*
-npm run deploy   # re-create the schema (auto-deploy was removed); loses all blocks, sessions, sync state
+npm run deploy   # recreate the schema; all blocks, sessions and sync state are gone
 ```
 
 ### Crawler-only reset
@@ -464,18 +396,18 @@ node -e "const s=require('better-sqlite3'); const db=new s('db/midnight.db'); db
 node -e "const s=require('better-sqlite3'); const db=new s('db/midnight.db'); db.exec('DELETE FROM midnight_WalletSyncStates'); db.close();"
 ```
 
-Next `connectWalletForSigning` will start a fresh ~5-6 h cold sync.
+The next `connectWalletForSigning` starts a cold sync (hours).
 
 ## Production checklist (before deploying)
 
-- [ ] `ENCRYPTION_KEY` (or `ENCRYPTION_KEYS` + `ENCRYPTION_KEY_ACTIVE`) set to real 32-byte hex secrets (not the dev fallback)
-- [ ] after a key rotation: `nightgate-rewrap-keys` exited 0 before the old key left the ring
-- [ ] CDS database is PostgreSQL or HANA, not SQLite (standalone image: `NIGHTGATE_DB_URL`, migration via `nightgate-db-migrate`, see docs/docker.md). Production SQLite is now **rejected at startup** (fail closed); `NIGHTGATE_ALLOW_PRODUCTION_SQLITE=true` is a temporary migration-only escape hatch
-- [ ] Exactly one replica declared (`NIGHTGATE_REPLICA_COUNT=1`); more than one replica, CAP multitenancy, or (on Cloud Foundry) `CF_INSTANCE_INDEX > 0` fails startup closed
-- [ ] `NIGHTGATE_CRAWLER_ENABLED` is true (or unset - the crawler defaults to on)
-- [ ] CAP auth is configured (the default `dummy` strategy passes everyone)
-- [ ] Rate limiters reviewed for production load (they're tuned for dev/demo)
-- [ ] If using a local indexer container: it has reached `caught_up: true` AND has stable disk available
-- [ ] `cds.requires.nightgate.allowMainnetSubmission` is `false` until the [forum 1190 issue](https://forum.midnight.network) is resolved
+- [ ] `ENCRYPTION_KEY` (or `ENCRYPTION_KEYS` + `ENCRYPTION_KEY_ACTIVE`) set to real secrets
+- [ ] after a key rotation: `nightgate-rewrap-keys` exited 0 before the old key was removed
+- [ ] Database is PostgreSQL or HANA (image: `NIGHTGATE_DB_URL`, migration via `nightgate-db-migrate`, see docs/docker.md). Production SQLite is rejected at startup; `NIGHTGATE_ALLOW_PRODUCTION_SQLITE=true` is for migration only
+- [ ] One replica (`NIGHTGATE_REPLICA_COUNT=1`); more replicas, CAP multitenancy or `CF_INSTANCE_INDEX > 0` fail startup
+- [ ] `NIGHTGATE_CRAWLER_ENABLED` true or unset (default on)
+- [ ] CAP auth configured (`dummy` admits everyone)
+- [ ] Rate limits reviewed for production load
+- [ ] Local indexer (if used): `caught_up: true` and enough disk
+- [ ] `cds.requires.nightgate.allowMainnetSubmission` stays `false` (mainnet submission is not supported)
 - [ ] Backup strategy in place for `WalletSyncStates` and `PendingSubmissions`
 - [ ] `npm run check:release:full` passed (the PostgreSQL lane needs Docker or `NIGHTGATE_PG_URL`)

@@ -1,14 +1,4 @@
-/**
- * Midnight provider bundle assembly.
- *
- * Builds the six-provider bundle the SDK expects. Two stages:
- *  - `buildContractProviders(cfg)`: wallet-free providers (publicData, zkConfig,
- *    proof). Safe to build on startup or per request.
- *  - `buildFullProviderBundle(cfg, wallet)`: adds privateState/wallet/midnight
- *    providers; needs a decrypted session-scoped password + accountId.
- * The split builds contract providers cheaply and only assembles wallet-bound
- * ones when a session is present.
- */
+/** Midnight provider bundle assembly: wallet-free providers, plus wallet-bound ones when a session exists. */
 
 import WebSocket from 'ws';
 import { loadMidnightSdk } from './sdk-loader';
@@ -16,12 +6,7 @@ import { CapDbPrivateStateProvider } from './CapDbPrivateStateProvider';
 import { isWasmProvingMode, buildWasmProofProvider } from './wasm-proof-provider';
 import { proofRequestTimeoutMs } from '../utils/proof-timeout';
 
-/**
- * The Midnight SDK keeps the active network as process-global state (see
- * `@midnight-ntwrk/midnight-js-network-id`). Every wallet/contract call reads
- * it via `getNetworkId()` and throws "Network ID has not been configured" if
- * it was never set. Call this before any SDK invocation. Idempotent.
- */
+/** Sets the SDK's process-global network id; call before any SDK invocation. */
 let lastSetNetworkId: string | undefined;
 export async function ensureNetworkId(network: string): Promise<void> {
     if (lastSetNetworkId === network) return;
@@ -33,20 +18,20 @@ export async function ensureNetworkId(network: string): Promise<void> {
 export type PrivateStateBackend = 'cap-db' | 'level';
 
 export interface ContractProvidersConfig {
-    indexerHttpUrl: string; // Indexer GraphQL HTTP endpoint, e.g. `https://indexer.preprod.midnight.network/api/v4/graphql`
-    indexerWsUrl: string; // Indexer GraphQL WS endpoint, e.g. `wss://indexer.preprod.midnight.network/api/v4/graphql/ws`
-    proofServerUrl: string; // Proof server URL, e.g. `http://localhost:6300`
-    zkConfigPath: string; //  Absolute path to the contract's `src/managed/<name>/` directory.
+    indexerHttpUrl: string;
+    indexerWsUrl: string;
+    proofServerUrl: string;
+    zkConfigPath: string; // absolute path to the contract's `src/managed/<name>/`
 }
 
 export interface WalletMaterial {
-    accountId: string; // Stable identifier scoping private-state storage (wallet address)
-    privateStoragePasswordProvider: () => Promise<string> | string; // passphrase used to encrypt private state on disk
+    accountId: string; // scopes private-state storage
+    privateStoragePasswordProvider: () => Promise<string> | string;
     /** Older derivations of that passphrase, read-only: a row found under one is rewritten under the current. */
     privateStoragePasswordFallbacks?: () => Promise<string[]> | string[];
-    walletAndMidnightProvider: any; // Wallet+midnight provider built from the wallet-sdk-facade
-    privateStateBackend?: PrivateStateBackend; // backend to use for the SDK's private-state provider (default: 'cap-db')
-    // Idempotently initialises this wallet's facade in the worker
+    walletAndMidnightProvider: any;
+    privateStateBackend?: PrivateStateBackend; // default 'cap-db'
+    // Idempotent
     ensureFacade?: () => Promise<void>;
 }
 
@@ -57,10 +42,7 @@ export interface ContractProviderBundle {
     proofProvider: any;
 }
 
-/**
- * Full bundle in the shape the SDK's `deployContract` / `findDeployedContract`
- * expects. Includes wallet-bound providers.
- */
+/** Full bundle as `deployContract` / `findDeployedContract` expect it. */
 export interface MidnightProviderBundle extends ContractProviderBundle {
     privateStateProvider: any;
     walletProvider: any;
@@ -86,14 +68,8 @@ export async function buildContractProviders(cfg: ContractProvidersConfig): Prom
 }
 
 /**
- * Storage password for the SDK's LevelDB private-state provider. midnight-js
- * 4.1.1 validates it (16+ characters, three character classes, no run of
- * more than three identical characters, no four-character sequence); the
- * derived 64-char hex has two classes and can contain runs or sequences.
- * Deterministic re-encoding that satisfies the rules for EVERY hex: byte
- * pairs joined by '-' (no run beyond two, no alphanumeric sequence longer
- * than two) plus a fixed mixed-case suffix. Level is the dev-only backend;
- * a store written before 0.22.2 was keyed by the bare hex and does not open.
+ * LevelDB storage password: the SDK's rules (3 classes, no runs or sequences) reject
+ * raw hex, so byte pairs are joined by '-' plus a mixed-case suffix. Stable per input.
  */
 export function levelStoragePassword(password: string): string {
     const pairs = password.match(/.{1,2}/g) ?? [password];

@@ -153,7 +153,7 @@ describe('fetchBlockBatch', () => {
         const out = await p.fetchBlockBatch([40, 41]);
         expect(asFetched(out[0]).protocolVersion).toBe(9);
         expect(asFetched(out[1]).protocolVersion).toBe(10);
-        expect(provider.getRuntimeVersion).not.toHaveBeenCalled(); // no per-batch RPC any more
+        expect(provider.getRuntimeVersion).not.toHaveBeenCalled(); // no per-batch RPC
     });
 
     it('refuses the block when the runtime metadata cannot be loaded (nothing is decoded under a stale pallet map)', async () => {

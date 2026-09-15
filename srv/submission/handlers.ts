@@ -1,22 +1,6 @@
 /**
- * OData handlers for the NightgateService submission action families:
- * contract submit (deploy / call / callBatch), document anchor + verify,
- * predicate issue + verify (incl. field-bound), disclosure grant / revoke,
- * passport registration, grantee registration, and the crawler-free
- * state-verification reads.
- *
- * Responsibilities here (the submitter itself does NOT do any of these):
- *   1. Parse and validate the JSON-encoded payloads (`args`,
- *      `initialPrivateState`, ...).
- *   2. Rate-limit per sessionId (deploys are stricter than calls).
- *   3. Resolve `compiledArtifactRef` → compiled contract + zkConfigPath +
- *      privateStateId via the contract registry.
- *   4. Look up the wallet session (signing key required: 412 without one).
- *   5. Catch SessionNotFoundError / ContractNotRegisteredError
- *      and translate to OData status codes.
- *
- * The submitter (`srv/submission/TransactionSubmitter.ts`) handles the actual
- * SDK call, error classification, and PendingSubmissions row lifecycle.
+ * Submission action handlers: validation, rate limits, artifact/session/sponsor
+ * resolution and job admission. The SDK call itself lives in TransactionSubmitter.
  */
 
 import cds, { Request } from '@sap/cds';
@@ -37,6 +21,7 @@ import {
 } from './contract-registry';
 import {
     buildWalletMaterialForSession,
+    attesterIdForSession,
     SessionNotFoundError,
     WalletMaterialUnavailable
 } from './wallet-material-factory';
@@ -63,13 +48,25 @@ import { reportSubmissionRejectedOn, reportBroadcastOn } from './job-execution-c
 import { declaredJobKindTraits } from './job-kinds';
 import { reindexDisclosuresForContract } from './disclosure-indexer';
 import { readAttestationStateForContract } from './attestation-state';
-import { readPredicateStateForContract, expandAllowedMask, computeAttestCommitment } from './predicate-state';
-import { randomBytes } from 'node:crypto';
+import {
+    registerVerifyStateHandlers,
+    SHA256_HEX_RE,
+    DEFAULT_ATTESTATION_VAULT_REF,
+    UINT64_MAX,
+    vaultDims,
+    parsePredicate,
+    coerceMask,
+    liveProviderConfigured,
+    contractProvidersConfigFromEnv,
+    contractProvidersConfigForNetwork,
+    type PredicateKind
+} from './verify-state';
+import { readPredicateStateForContract, expandAllowedMask, computeRecordKey } from './predicate-state';
 import { blake2b256Hex, loadPureCircuitsFromRegistry, PureCircuitsUnavailableError } from './document-proof';
 import { membershipPathFor, SET_DEPTH } from './set-root';
 import { deriveGranteeId } from './grantee-identity';
 import { getConfiguredGranteeBinding, isSelfServiceGranteeRegistrationAllowed } from '../utils/nightgate-config';
-import { Documents, Transactions, TransactionResults, PredicateAttestations, DisclosureGrants, GranteeIdentities, PendingSubmissions } from '#cds-models/midnight';
+import { Documents, Transactions, TransactionResults, PredicateAttestations, DisclosureGrants, GranteeIdentities, PendingSubmissions, BackgroundJobs } from '#cds-models/midnight';
 import { walletSponsorFinalizedTx, walletSponsorUnboundTx } from '../midnight/wallet-worker-client';
 import {
     PLATFORM_POOL_SENTINEL, acquireSponsor, releaseSponsor, benchSponsor,
@@ -77,14 +74,11 @@ import {
     sponsorCandidatesNonExclusive, touchSponsor
  } from './sponsor-pool';
 import { resolveSponsorPolicyForRequest, effectiveSponsorPolicy, getGlobalSponsorPolicy, SponsorPolicyEmptyError, SponsorPolicyUnavailableError, type SponsorPolicy } from './sponsor-policy';
-import { recordDeployedContracts, reserveDeployBudget, releaseDeployBudget, currentGrantPolicy } from '../sessions/agent-grants';
+import { recordDeployedContracts, reserveDeployBudget, releaseDeployBudget, currentGrantPolicy, currentGrantRow, grantJobScopeViolation } from '../sessions/agent-grants';
 
 /**
- * The policy a sponsoring job runs under, resolved when the job RUNS: the
- * current floor narrowed by the grant's current lists. The lists persisted in
- * the command are the admission snapshot only; a revoke or a narrowed policy
- * file applies to queued jobs as well. A revoked grant fails the job for good,
- * an unreadable policy file keeps it retryable.
+ * The sponsor policy resolved when the job RUNS, so a revoke or narrowed floor
+ * applies to queued jobs. Revoked grant: permanent failure; unreadable policy file: retryable.
  */
 async function liveSponsorPolicyForJob(db: any, command: { grantId?: string | null }): Promise<SponsorPolicy> {
     try {
@@ -107,87 +101,51 @@ async function liveSponsorPolicyForJob(db: any, command: { grantId?: string | nu
     }
 }
 import { getConfiguredFeeSponsorSessions } from './fee-sponsor';
+import { sponsorAtSyncGate } from './sponsor-sync-gate';
 import { hexToBytes } from '../utils/hex';
-import { configMs, configNumber } from '../utils/config';
+import { configInt, configMs, configNumber } from '../utils/config';
 
 const { INSERT, UPDATE, SELECT, DELETE } = cds.ql;
 
-// 5 deploys / hour / session, deploys are heavyweight; tight bound.
+// Rate limits are keyed by principal plus a scope (session, or contract for reindex).
 const deployRateLimiter = new RateLimiter({ windowMs: 60 * 60 * 1000, maxRequests: 5 });
-// 30 calls / minute / session.
 const callRateLimiter = new RateLimiter({ windowMs: 60 * 1000, maxRequests: 30 });
-// 10 doc anchors / hour / session, contract-call heavyweight + extra DB writes.
 const anchorRateLimiter = new RateLimiter({ windowMs: 60 * 60 * 1000, maxRequests: 10 });
-// 10 predicate proofs / hour / session; heavyweight circuit calls (often an
-// anchor + a proof per request), so bound it like anchors.
 const predicateRateLimiter = new RateLimiter({ windowMs: 60 * 60 * 1000, maxRequests: 10 });
-// 30 disclosure grant/revoke ops / hour / session; single heavyweight circuit
-// call each, attester-gated; looser than predicate but tighter than plain calls.
 const disclosureRateLimiter = new RateLimiter({ windowMs: 60 * 60 * 1000, maxRequests: 30 });
-// 30 passport registrations / hour / session; registrar-gated single circuit
-// call, same weight class as the disclosure ops.
 const registrarRateLimiter = new RateLimiter({ windowMs: 60 * 60 * 1000, maxRequests: 30 });
-// 60 on-demand reindexes / hour / contract; an indexer round-trip + DB writes,
-// keyed by contractAddress (no session). Loose enough for a wallet-flow poll,
-// tight enough not to hammer the indexer.
 const reindexRateLimiter = new RateLimiter({ windowMs: 60 * 60 * 1000, maxRequests: 60 });
-// 120 sponsor submissions / hour / principal (grant or user): the dust and a
-// wasm dust proof per job are paid by the sponsor pool, so the bound is per
-// caller, not per session. Above the live burst lanes, below what would
-// occupy the pool; token callers additionally carry the grant's daily budget.
+// Per caller, not per session: the sponsor pool pays the dust of every job.
 const sponsorRateLimiter = new RateLimiter({ windowMs: 60 * 60 * 1000, maxRequests: 120 });
-// 30 caller-side builds / hour / session (buildSponsorable): a full circuit
-// proof per request, same weight class as predicates.
 const buildRateLimiter = new RateLimiter({ windowMs: 60 * 60 * 1000, maxRequests: 30 });
 
-const SHA256_HEX_RE = /^[0-9a-fA-F]{64}$/;
-
-/**
- * Commitment lifetime (lineage 3): the vault asserts the commit's `expires_at`
- * lies in (block time, block time + 7 days] at commit and is still ahead at
- * reveal. The server default leaves a day for the reveal.
- */
-const COMMIT_DEFAULT_LIFETIME_S = 24 * 60 * 60;
-const COMMIT_MAX_LIFETIME_S = 7 * 24 * 60 * 60;
-function defaultCommitExpiry(): number {
-    return Math.floor(Date.now() / 1000) + COMMIT_DEFAULT_LIFETIME_S;
+/** The vault asserts `valid_until` lies in (block time, block time + 5 years]. */
+const CLAIM_MAX_LIFETIME_S = 5 * 365 * 24 * 60 * 60;
+function claimDefaultLifetimeS(): number {
+    const configured = configInt('NIGHTGATE_CLAIM_LIFETIME_S') ?? 365 * 24 * 60 * 60;
+    return Math.min(configured, CLAIM_MAX_LIFETIME_S - 60);
 }
-function validateCommitExpiry(expiresAt: number): string | null {
+function claimValidUntil(requested?: number): bigint {
+    return BigInt(requested ?? Math.floor(Date.now() / 1000) + claimDefaultLifetimeS());
+}
+/** Parses an optional caller `validUntil`; returns an error text for the 400. */
+function parseValidUntil(raw: unknown): { validUntil?: number; error?: string } {
+    if (raw === undefined || raw === null || raw === '') return {};
+    const v = Number(raw);
     const now = Math.floor(Date.now() / 1000);
-    if (!Number.isInteger(expiresAt)) return 'expiresAt must be an integer UNIX time in seconds';
-    if (expiresAt <= now + 60) return 'expiresAt must lie at least a minute in the future (the reveal has to fit before it)';
-    if (expiresAt > now + COMMIT_MAX_LIFETIME_S) return `expiresAt may lie at most ${COMMIT_MAX_LIFETIME_S} seconds (7 days) ahead; the vault refuses longer commitments`;
-    return null;
+    if (!Number.isInteger(v)) return { error: 'validUntil must be an integer UNIX time in seconds' };
+    if (v <= now + 60) return { error: 'validUntil must lie at least a minute in the future' };
+    if (v > now + CLAIM_MAX_LIFETIME_S) return { error: `validUntil may lie at most ${CLAIM_MAX_LIFETIME_S} seconds (5 years) ahead; the vault refuses longer claims` };
+    return { validUntil: v };
 }
-const DEFAULT_ATTESTATION_VAULT_REF = 'attestation-vault';
 
 /**
- * Width-dependent limits of a vault artifact (registration `slotWidth`,
- * default 16): slot count, inclusion-path depth, and the packed-mask upper
- * bound. JS bitwise operators are exact for bits 0..31, so widths up to 32
- * work on a Number mask (the CDS `Integer` params carry them; validation
- * happens here, not in the OData type).
- */
-function vaultDims(compiledRef: string | undefined): { width: number; depth: number; maxMask: number } {
-    const width = slotWidthOf(getContractRegistration(compiledRef?.length ? compiledRef : DEFAULT_ATTESTATION_VAULT_REF));
-    return { width, depth: Math.log2(width), maxMask: width === 32 ? 0xffffffff : (1 << width) - 1 };
-}
-// The circuits take Uint<64>; overflow would otherwise surface only as an
-// opaque proving-time failure.
-const UINT64_MAX = (1n << 64n) - 1n;
-
-/**
- * Per-call proof witness bundle. `fieldValue` feeds `field_value()` (numeric
- * proveFieldPredicate), `fieldDigest` feeds `field_digest()` (bytes-valued
- * proveFieldMembership; proveFieldEquality needs neither, only the path),
- * `siblings`/`dirs` feed the DEPTH=4 content-root path, `setProof` feeds the
- * DEPTH=6 membership-set path, `docPair` feeds the cross-root circuits'
- * doc_leaves witnesses (those need no inclusion path, so
- * `siblings`/`dirs` may be absent alongside it).
+ * Per-call proof witness bundle. The cross-root circuits (`docPair`) need no
+ * inclusion path, so `siblings`/`dirs` may be absent alongside it.
  */
 type MerkleProofBundle = {
     fieldValue?: string;
-    /** Per-slot salt, 64 hex (v4; required by every single-field proof). */
+    /** Per-slot salt, 64 hex; required by every single-field proof. */
     fieldSalt?: string;
     fieldDigest?: string;
     siblings?: string[];
@@ -201,7 +159,7 @@ type SchemaSlotWire = { fieldKey: string; kind: number; scale: string };
 /** One document's cross-root opening (wire form; witness material). */
 type OpeningWire = { saltSeed: string; slots: Array<{ present: boolean; value?: string; valueDigest?: string }> };
 
-/** Cross-root witness bundle (v4): shared schema + both documents' openings. */
+/** Cross-root witness bundle: shared schema + both documents' openings. */
 type DocPairBundle = {
     schema?: SchemaSlotWire[]; openingA?: OpeningWire; openingB?: OpeningWire;
 };
@@ -209,9 +167,10 @@ type DocPairBundle = {
 /** One batch claim; `predicate` discriminates the kind. */
 type BatchClaimCommand = {
     predicateAttestationId: string; predicate: string; unit?: string;
+    validUntil?: number;
     /** Absent only for the cross-root document kinds. */
     fieldKey?: string;
-    /** Per-slot salt (v4); required for the single-field kinds. */
+    /** Per-slot salt; required for the single-field kinds. */
     salt?: string;
     // numeric ('lessOrEqual' | 'greaterOrEqual')
     threshold?: string; opCode?: number; value?: string;
@@ -220,58 +179,35 @@ type BatchClaimCommand = {
     // 'setMembership'
     setRoot?: string; valueDigest?: string; setSiblings?: string[]; setDirs?: boolean[];
     // 'documentIntegrity' / 'documentDiff' (document A = the batch payloadHash)
-    payloadHashB?: string; allowedMask?: number; k?: number;
+    payloadHashB?: string; attesterIdB?: string; allowedMask?: number; k?: number;
     schema?: SchemaSlotWire[]; openingA?: OpeningWire; openingB?: OpeningWire;
     siblings?: string[]; dirs?: boolean[];
 };
 
 type ContractCommandV1 =
-    | { op: 'deploy'; compiledArtifactRef: string; initialPrivateState: unknown; sponsorSessionId?: string }
+    | { op: 'deploy'; compiledArtifactRef: string; initialPrivateState: unknown; sponsorSessionId?: string; recoveryId?: string }
     | { op: 'call'; contractAddress: string; circuit: string; compiledArtifactRef: string; args: unknown[]; initialPrivateState?: unknown; sponsorSessionId?: string; merkleProof?: MerkleProofBundle }
     | { op: 'callBatch'; contractAddress: string; calls: Array<{ circuit: string; args: unknown[]; merkleProof?: MerkleProofBundle }>; compiledArtifactRef: string; initialPrivateState?: unknown; sponsorSessionId?: string; merkleProof?: MerkleProofBundle; independentCalls?: boolean; orderedPrefix?: number }
-    | { op: 'fieldPredicateWorkflow'; predicateAttestationId: string; payloadHash: string; fieldKey: string; contractAddress: string; compiledArtifactRef: string; predicate: string; threshold: string; opCode: number; unit?: string; value: string; salt: string; siblings: string[]; dirs: boolean[]; contentRoot?: string; schemaId?: string; sponsorSessionId?: string }
-    | { op: 'fieldEqualityWorkflow'; predicateAttestationId: string; payloadHash: string; fieldKey: string; contractAddress: string; compiledArtifactRef: string; expectedDigest: string; salt: string; siblings: string[]; dirs: boolean[]; contentRoot?: string; schemaId?: string; sponsorSessionId?: string }
-    | { op: 'fieldMembershipWorkflow'; predicateAttestationId: string; payloadHash: string; fieldKey: string; contractAddress: string; compiledArtifactRef: string; setRoot: string; valueDigest: string; salt: string; siblings: string[]; dirs: boolean[]; setSiblings: string[]; setDirs: boolean[]; contentRoot?: string; schemaId?: string; sponsorSessionId?: string }
-    | { op: 'fieldPredicateBatchWorkflow'; payloadHash: string; contractAddress: string; compiledArtifactRef: string; contentRoot?: string; schemaId?: string; claims: BatchClaimCommand[]; sponsorSessionId?: string }
-    | { op: 'documentIntegrityWorkflow'; predicateAttestationId: string; payloadHashA: string; payloadHashB: string; contractAddress: string; compiledArtifactRef: string; allowedMask: number; schema: SchemaSlotWire[]; openingA: OpeningWire; openingB: OpeningWire; contentRootA?: string; contentRootB?: string; schemaId?: string; sponsorSessionId?: string }
-    | { op: 'documentDiffWorkflow'; predicateAttestationId: string; payloadHashA: string; payloadHashB: string; contractAddress: string; compiledArtifactRef: string; k: number; schema: SchemaSlotWire[]; openingA: OpeningWire; openingB: OpeningWire; contentRootA?: string; contentRootB?: string; schemaId?: string; sponsorSessionId?: string }
-    | { op: 'anchorDocument'; documentId: string; payloadHash: string; metadataHash: string; contractAddress: string; compiledArtifactRef: string; sponsorSessionId?: string; guardedNonce?: string }
-    | { op: 'attestCommit'; commitment: string; expiresAt: number; contractAddress: string; compiledArtifactRef: string; sponsorSessionId?: string }
-    // Default anchoring (lineage 3): commit, then reveal, as two child jobs.
-    | { op: 'anchorGuardedWorkflow'; documentId: string; payloadHash: string; metadataHash: string; nonce: string; expiresAt: number; contractAddress: string; compiledArtifactRef: string; sponsorSessionId?: string }
-    | { op: 'grantDisclosure'; disclosureGrantId: string; payloadHash: string; grantee: string; level: number; contractAddress: string; compiledArtifactRef: string; sponsorSessionId?: string }
-    | { op: 'revokeDisclosure'; payloadHash: string; grantee: string; contractAddress: string; compiledArtifactRef: string; sponsorSessionId?: string }
-    | { op: 'registerPassport'; passportId: string; ownerId: string; contractAddress: string; compiledArtifactRef: string; sponsorSessionId?: string };
+    | { op: 'fieldPredicateWorkflow'; predicateAttestationId: string; validUntil?: number; payloadHash: string; attesterId: string; fieldKey: string; contractAddress: string; compiledArtifactRef: string; predicate: string; threshold: string; opCode: number; unit?: string; value: string; salt: string; siblings: string[]; dirs: boolean[]; contentRoot?: string; schemaId?: string; sponsorSessionId?: string }
+    | { op: 'fieldEqualityWorkflow'; predicateAttestationId: string; validUntil?: number; payloadHash: string; attesterId: string; fieldKey: string; contractAddress: string; compiledArtifactRef: string; expectedDigest: string; salt: string; siblings: string[]; dirs: boolean[]; contentRoot?: string; schemaId?: string; sponsorSessionId?: string }
+    | { op: 'fieldMembershipWorkflow'; predicateAttestationId: string; validUntil?: number; payloadHash: string; attesterId: string; fieldKey: string; contractAddress: string; compiledArtifactRef: string; setRoot: string; valueDigest: string; salt: string; siblings: string[]; dirs: boolean[]; setSiblings: string[]; setDirs: boolean[]; contentRoot?: string; schemaId?: string; sponsorSessionId?: string }
+    | { op: 'fieldPredicateBatchWorkflow'; payloadHash: string; attesterId: string; validUntil?: number; contractAddress: string; compiledArtifactRef: string; contentRoot?: string; schemaId?: string; claims: BatchClaimCommand[]; sponsorSessionId?: string }
+    | { op: 'documentIntegrityWorkflow'; predicateAttestationId: string; validUntil?: number; payloadHashA: string; payloadHashB: string; attesterIdA: string; attesterIdB: string; contractAddress: string; compiledArtifactRef: string; allowedMask: number; schema: SchemaSlotWire[]; openingA: OpeningWire; openingB: OpeningWire; contentRootA?: string; contentRootB?: string; schemaId?: string; sponsorSessionId?: string }
+    | { op: 'documentDiffWorkflow'; predicateAttestationId: string; validUntil?: number; payloadHashA: string; payloadHashB: string; attesterIdA: string; attesterIdB: string; contractAddress: string; compiledArtifactRef: string; k: number; schema: SchemaSlotWire[]; openingA: OpeningWire; openingB: OpeningWire; contentRootA?: string; contentRootB?: string; schemaId?: string; sponsorSessionId?: string }
+    | { op: 'anchorDocument'; documentId: string; payloadHash: string; metadataHash: string; attesterId?: string; contractAddress: string; compiledArtifactRef: string; sponsorSessionId?: string }
+    | { op: 'grantDisclosure'; disclosureGrantId: string; payloadHash: string; attesterId: string; grantee: string; level: number; contractAddress: string; compiledArtifactRef: string; sponsorSessionId?: string }
+    | { op: 'revokeDisclosure'; payloadHash: string; attesterId: string; grantee: string; contractAddress: string; compiledArtifactRef: string; sponsorSessionId?: string }
+    | { op: 'registerPassport'; passportId: string; ownerId: string; mode?: number; contractAddress: string; compiledArtifactRef: string; sponsorSessionId?: string }
+    // retract mode 0 = payload (owner; attesterId = the session's, for the local projection), 1 = expired claim
+    | { op: 'retract'; mode: number; key: string; attesterId?: string; contractAddress: string; compiledArtifactRef: string; sponsorSessionId?: string };
 
 /**
- * Stamped by startJob at persistence time (see background-jobs.ts): the
- * artifact GENERATION the command was created against. Verified fail-closed
- * before execution; the registry name alone is a mutable alias.
+ * The artifact generation stamped by startJob, verified fail-closed before
+ * execution: the registry name alone is a mutable alias.
  */
 type ContractCommandV1WithProvenance = ContractCommandV1 & { artifactDigest?: string };
 
-type PredicateKind = 'numeric' | 'equality' | 'membership' | 'integrity' | 'diff';
-
-/**
- * The ONE predicate-literal parser (every call site validates through this,
- * so an unknown literal can never mint a wrong opCode / claim key).
- * `opCode` is the circuit's Uint<8> for the numeric predicates and null for
- * every other kind, whose claim structs carry no op.
- */
-function parsePredicate(literal: unknown): { kind: PredicateKind; opCode: number | null } | null {
-    if (literal === 'lessOrEqual') return { kind: 'numeric', opCode: 0 };
-    if (literal === 'greaterOrEqual') return { kind: 'numeric', opCode: 1 };
-    if (literal === 'bytesEquality') return { kind: 'equality', opCode: null };
-    if (literal === 'setMembership') return { kind: 'membership', opCode: null };
-    if (literal === 'documentIntegrity') return { kind: 'integrity', opCode: null };
-    if (literal === 'documentDiff') return { kind: 'diff', opCode: null };
-    return null;
-}
-
-/**
- * Parse + validate a JSON-encoded Merkle inclusion path of fixed depth.
- * Rejects the request (400) and returns null on any shape violation.
- */
+/** Parse a JSON Merkle inclusion path of fixed depth; rejects 400 and returns null on violation. */
 function parseInclusionPath(
     req: Request,
     siblingsJson: string | undefined,
@@ -295,17 +231,13 @@ function parseInclusionPath(
         }
     }
     for (const d of dirs) {
-        // Strict booleans: map(Boolean) would turn "false" into true and
-        // silently corrupt the Merkle path.
+        // Strict: Boolean("false") is true and would corrupt the path.
         if (typeof d !== 'boolean') { req.reject(400, `${names.dirs} entries must be booleans`); return null; }
     }
     return { siblings: (siblings as string[]).map(s => s.toLowerCase()), dirs: dirs as boolean[] };
 }
 
-/**
- * Validate a parsed 16-entry schema descriptor list (throws with a
- * user-facing message on any shape violation; callers map to 400).
- */
+/** Validate a schema descriptor list; throws a user-facing message. */
 function validateSchemaSlots(schema: unknown, name: string, width = 16): SchemaSlotWire[] {
     if (!Array.isArray(schema) || schema.length !== width) {
         throw new Error(`${name} must be a JSON array of exactly ${width} slot descriptors`);
@@ -325,10 +257,7 @@ function validateSchemaSlots(schema: unknown, name: string, width = 16): SchemaS
     });
 }
 
-/**
- * Validate a parsed cross-root document opening ({ saltSeed, slots[16] });
- * throws with a user-facing message on any shape violation.
- */
+/** Validate a cross-root document opening; throws a user-facing message. */
 function validateOpening(opening: unknown, name: string, width = 16): OpeningWire {
     const o = opening as any;
     if (!o || typeof o !== 'object') throw new Error(`${name} must be an object`);
@@ -363,31 +292,16 @@ function validateOpening(opening: unknown, name: string, width = 16): OpeningWir
 }
 
 /**
- * Parse + validate a JSON-encoded schema/opening pair off a request; rejects
- * the request (400) and returns null on any violation.
- */
-/**
- * True when `allowedMask` frees every REAL (non-padding) slot of `schema`.
- * Such an integrity claim says nothing; the circuit rejects it in-circuit
- * ("mask must constrain at least one schema slot"), this check gives API
- * callers a clean 400 before any proving. Subsumes the all-ones case for
- * schemas with fewer than 16 real fields.
+ * True when the mask frees every real (non-padding) slot. The circuit rejects
+ * such a claim; this gives a 400 before proving.
  */
 function isVacuousMask(allowedMask: number, schema: SchemaSlotWire[]): boolean {
     return schema.every((s, i) => s.kind === 2 || (allowedMask & (1 << i)) !== 0);
 }
 
-/**
- * CAP delivers Integer64 action parameters (and reads Integer64 columns) as
- * STRINGS (IEEE754-compatible OData serialization); the mask is Integer64
- * because bit 31 of a 32-slot mask overflows a signed Int32. Coerce to a
- * plain number (masks are <= 32 bits, far below MAX_SAFE_INTEGER); null when
- * not an integer.
- */
-function coerceMask(raw: unknown): number | null {
-    const n = typeof raw === 'string' && raw.trim() !== '' ? Number(raw) : raw;
-    return typeof n === 'number' && Number.isInteger(n) ? n : null;
-}
+/** Parse a JSON schema/opening pair; rejects 400 and returns null on violation. */
+/** `PredicateAttestations.threshold` is Integer64: a recorded claim's threshold stays below 2^63. */
+const INT64_MAX = 9223372036854775807n;
 
 function parseDocPairInputs(
     req: Request,
@@ -409,36 +323,27 @@ function parseDocPairInputs(
     }
 }
 
-/**
- * Optional dependency overrides, primarily for tests.
- */
+/** Dependency overrides for tests. */
 export interface SubmissionHandlersOptions {
-    /** Override the wallet-material factory. Defaults to buildWalletMaterialForSession. */
     walletMaterialFactory?: typeof buildWalletMaterialForSession;
-    /** Override contract resolution. Defaults to the static registry. */
+    attesterIdResolver?: typeof attesterIdForSession;
     resolveContractImpl?: typeof resolveContract;
-    /** Override the submitter constructor. Defaults to the real class. */
     submitterFactory?: (deps: TransactionSubmitterDeps) => TransactionSubmitter;
-    /** Override circuit-arg-type introspection. Defaults to reading contract-info.json. */
     circuitArgTypesLoader?: typeof loadCircuitArgTypes;
-    /** Override the post-submit disclosure reindexer. Defaults to the real wrapper. */
     disclosureReindexer?: typeof reindexDisclosuresForContract;
-    /** Override the crawler-free attestation-state reader. Defaults to the real wrapper. */
     attestationStateReader?: typeof readAttestationStateForContract;
-    /** Override the crawler-free predicate-state reader. Defaults to the real wrapper. */
     predicateStateReader?: typeof readPredicateStateForContract;
-    /** Override the pure-circuit artifact loader (membership set building). */
     pureCircuitsLoader?: typeof loadPureCircuitsFromRegistry;
 }
 
 export function registerSubmissionHandlers(
     srv: cds.ApplicationService,
-    // `any` (not cds.DatabaseService) on purpose: tests inject a minimal
-    // `{ run }` mock; the handlers only use db.run.
+    // `any`: tests inject a minimal `{ run }` mock.
     db: any,
     options: SubmissionHandlersOptions = {}
 ): void {
     const walletFactory = options.walletMaterialFactory ?? buildWalletMaterialForSession;
+    const attesterIdResolver = options.attesterIdResolver ?? attesterIdForSession;
     const contractResolver = options.resolveContractImpl ?? resolveContract;
     const submitterFactory = options.submitterFactory ?? ((deps: TransactionSubmitterDeps) => new TransactionSubmitter(deps));
     const argTypesLoader = options.circuitArgTypesLoader ?? loadCircuitArgTypes;
@@ -464,21 +369,15 @@ export function registerSubmissionHandlers(
             || (job.kind === 'issueDocumentIntegrityAttestation' && command.op !== 'documentIntegrityWorkflow')
             || (job.kind === 'issueDocumentDiffAttestation' && command.op !== 'documentDiffWorkflow')
             || (job.kind === 'anchorDocument' && command.op !== 'anchorDocument')
-            || (job.kind === 'anchorReveal' && command.op !== 'anchorDocument')
-            || (job.kind === 'commitDocumentAnchor' && command.op !== 'attestCommit')
-            || (job.kind === 'anchorCommit' && command.op !== 'attestCommit')
-            || (job.kind === 'anchorDocumentGuarded' && command.op !== 'anchorGuardedWorkflow')
             || (job.kind === 'grantDisclosure' && command.op !== 'grantDisclosure')
             || (job.kind === 'revokeDisclosure' && command.op !== 'revokeDisclosure')
-            || (job.kind === 'registerPassport' && command.op !== 'registerPassport')) {
+            || (job.kind === 'registerPassport' && command.op !== 'registerPassport')
+            || (job.kind === 'retract' && command.op !== 'retract')) {
             throw new Error(`Persisted command operation '${command.op}' is incompatible with ${job.kind}`);
         }
 
-        // Provenance gate: the command's compiledArtifactRef is a MUTABLE
-        // registry alias; refuse to execute against a different artifact
-        // GENERATION than the one the command was created for (and refuse
-        // digest-less commands from older releases outright, instead of
-        // silently running them against today's registration).
+        // The alias is mutable: refuse a different artifact generation than the
+        // command was created for, and refuse digest-less commands.
         {
             const cmd = command as ContractCommandV1WithProvenance;
             if (typeof (cmd as any).compiledArtifactRef === 'string') {
@@ -488,11 +387,29 @@ export function registerSubmissionHandlers(
                     `Persisted '${command.op}' command of job ${job.ID}`);
             }
         }
-        // Child commands INHERIT the parent's generation digest (instead of
-        // letting startJob stamp whatever the alias resolves to at
-        // child-creation time): a workflow whose alias is re-pointed between
-        // steps must fail the child's own gate, never mix generations within
-        // one workflow (e.g. anchor from one artifact, proof from another).
+        // A grant is re-read when the job RUNS (children carry the parent's), so a
+        // revoke, an expiry or a narrowed scope after admission stops a queued job.
+        if (job.grantId) {
+            const grant = await currentGrantRow(db, String(job.grantId));
+            if (!grant) {
+                const err: any = new Error(`agent grant ${job.grantId} is revoked or expired; the job was not executed`);
+                err.code = 'AGENT_GRANT_REVOKED'; err.retryable = false;
+                throw err;
+            }
+            let parentKind: string | null = null;
+            if (job.parentJobId) {
+                const parent: any = await db.run(SELECT.one.from(BackgroundJobs).columns('kind').where({ ID: job.parentJobId }));
+                parentKind = parent?.kind ?? null;
+            }
+            const scope = grantJobScopeViolation(grant, { kind: job.kind, parentJobId: job.parentJobId, parentKind }, command as unknown as Record<string, unknown>);
+            if (scope) {
+                const err: any = new Error(`agent grant ${job.grantId}: ${scope}; the job was not executed`);
+                err.code = 'AGENT_GRANT_SCOPE'; err.retryable = false;
+                throw err;
+            }
+        }
+        // Children inherit the parent's digest, so an alias re-pointed between
+        // steps fails the child instead of mixing generations in one workflow.
         const parentArtifactDigest = (command as ContractCommandV1WithProvenance).artifactDigest;
         const runChild = <T,>(args: Parameters<typeof runChildCommand>[0]): Promise<T> => runChildCommand<T>({
             ...args,
@@ -516,7 +433,7 @@ export function registerSubmissionHandlers(
                 request: { circuit: 'proveFieldPredicate', payloadHash: command.payloadHash, fieldKey: command.fieldKey },
                 command: {
                     op: 'call', contractAddress: command.contractAddress, circuit: 'proveFieldPredicate', compiledArtifactRef: command.compiledArtifactRef,
-                    args: [command.payloadHash, command.fieldKey, command.threshold, String(command.opCode)],
+                    args: [await computeRecordKey(command.attesterId, command.payloadHash), command.fieldKey, command.threshold, String(command.opCode), String(claimValidUntil(command.validUntil))],
                     merkleProof: { fieldValue: command.value, fieldSalt: command.salt, siblings: command.siblings, dirs: command.dirs }, sponsorSessionId: command.sponsorSessionId
                 }
             });
@@ -538,14 +455,13 @@ export function registerSubmissionHandlers(
                     command: { op: 'call', contractAddress: command.contractAddress, circuit: 'anchorContentRoot', compiledArtifactRef: command.compiledArtifactRef, args: [command.payloadHash, command.contentRoot, command.schemaId], sponsorSessionId: command.sponsorSessionId }
                 });
             }
-            // The expected digest is the PUBLIC statement (also a circuit arg);
-            // only the inclusion path travels as witness material.
+            // The digest is public (a circuit arg); only the path is witness material.
             const proof: any = await runChild<any>({
                 parent: job, kind: 'fieldEqualityProof', step: 'proveFieldEquality', commandVersion: 1,
                 request: { circuit: 'proveFieldEquality', payloadHash: command.payloadHash, fieldKey: command.fieldKey },
                 command: {
                     op: 'call', contractAddress: command.contractAddress, circuit: 'proveFieldEquality', compiledArtifactRef: command.compiledArtifactRef,
-                    args: [command.payloadHash, command.fieldKey, command.expectedDigest],
+                    args: [await computeRecordKey(command.attesterId, command.payloadHash), command.fieldKey, command.expectedDigest, String(claimValidUntil(command.validUntil))],
                     merkleProof: { fieldSalt: command.salt, siblings: command.siblings, dirs: command.dirs }, sponsorSessionId: command.sponsorSessionId
                 }
             });
@@ -572,7 +488,7 @@ export function registerSubmissionHandlers(
                 request: { circuit: 'proveFieldMembership', payloadHash: command.payloadHash, fieldKey: command.fieldKey },
                 command: {
                     op: 'call', contractAddress: command.contractAddress, circuit: 'proveFieldMembership', compiledArtifactRef: command.compiledArtifactRef,
-                    args: [command.payloadHash, command.fieldKey, command.setRoot],
+                    args: [await computeRecordKey(command.attesterId, command.payloadHash), command.fieldKey, command.setRoot, String(claimValidUntil(command.validUntil))],
                     merkleProof: {
                         fieldDigest: command.valueDigest, fieldSalt: command.salt,
                         siblings: command.siblings, dirs: command.dirs,
@@ -592,10 +508,8 @@ export function registerSubmissionHandlers(
         }
 
         if (command.op === 'documentIntegrityWorkflow' || command.op === 'documentDiffWorkflow') {
-            // Both content roots must be anchored before the proof; each
-            // optional anchor is its own child command (own tx), the same
-            // pattern as the single-field workflows. One-transaction flows go
-            // through the batch action's document claim kinds instead.
+            // Each optional anchor is its own transaction; the batch action's
+            // document kinds do it in one.
             if (command.contentRootA) {
                 await runChild({
                     parent: job, kind: 'fieldAnchorRoot', step: 'anchorContentRootA', commandVersion: 1,
@@ -610,19 +524,18 @@ export function registerSubmissionHandlers(
                     command: { op: 'call', contractAddress: command.contractAddress, circuit: 'anchorContentRoot', compiledArtifactRef: command.compiledArtifactRef, args: [command.payloadHashB, command.contentRootB, command.schemaId], sponsorSessionId: command.sponsorSessionId }
                 });
             }
+            const recordKeyA = await computeRecordKey(command.attesterIdA, command.payloadHashA);
+            const recordKeyB = await computeRecordKey(command.attesterIdB, command.payloadHashB);
             const isIntegrity = command.op === 'documentIntegrityWorkflow';
-            // ONE mode-switched circuit serves both kinds (a per-circuit
-            // verifier key costs 2119 deploy bytes against the node's 32 KiB
-            // per-tx write cap). Args: (a, b, mode, allowedMask, k); the
-            // inactive statement rides as a neutral dummy (mask 0 / k 1).
-            // Let it propagate: ambiguous child -> ChildReconciliationRequiredError (parent reconciles); definitive rejection -> plain error (parent fails cleanly).
+            // One mode-switched circuit for both kinds (each verifier key costs
+            // deploy bytes); the inactive statement gets a neutral dummy (mask 0 / k 1).
             const proof: any = isIntegrity
                 ? await runChild<any>({
                     parent: job, kind: 'documentIntegrityProof', step: 'proveDocumentComparison-integrity', commandVersion: 1,
                     request: { circuit: 'proveDocumentComparison', mode: 'integrity', payloadHashA: command.payloadHashA, payloadHashB: command.payloadHashB },
                     command: {
                         op: 'call', contractAddress: command.contractAddress, circuit: 'proveDocumentComparison', compiledArtifactRef: command.compiledArtifactRef,
-                        args: [command.payloadHashA, command.payloadHashB, '0', String(command.allowedMask), '1'],
+                        args: [recordKeyA, recordKeyB, '0', String(command.allowedMask), '1', String(claimValidUntil(command.validUntil))],
                         merkleProof: { docPair: { schema: command.schema, openingA: command.openingA, openingB: command.openingB } }, sponsorSessionId: command.sponsorSessionId
                     }
                 })
@@ -631,7 +544,7 @@ export function registerSubmissionHandlers(
                     request: { circuit: 'proveDocumentComparison', mode: 'diff', payloadHashA: command.payloadHashA, payloadHashB: command.payloadHashB },
                     command: {
                         op: 'call', contractAddress: command.contractAddress, circuit: 'proveDocumentComparison', compiledArtifactRef: command.compiledArtifactRef,
-                        args: [command.payloadHashA, command.payloadHashB, '1', '0', String(command.k)],
+                        args: [recordKeyA, recordKeyB, '1', '0', String(command.k), String(claimValidUntil(command.validUntil))],
                         merkleProof: { docPair: { schema: command.schema, openingA: command.openingA, openingB: command.openingB } }, sponsorSessionId: command.sponsorSessionId
                     }
                 });
@@ -649,13 +562,10 @@ export function registerSubmissionHandlers(
         }
 
         if (command.op === 'fieldPredicateBatchWorkflow') {
-            // ONE transaction for the whole cart: optional anchorContentRoot
-            // first (distinct entryPoint, so segment ordering pins it ahead of
-            // the proofs), then N proof calls (any mix of proveFieldPredicate /
-            // proveFieldEquality / proveFieldMembership), each carrying its
-            // OWN proof bundle (per-call witness binding via the batch holder).
-            // A false claim fails at local proving, before submission.
+            // One transaction: an optional anchor first, then one proof call per
+            // claim with its own witness bundle. A false claim fails at local proving.
             const calls: Array<{ circuit: string; args: unknown[]; merkleProof?: MerkleProofBundle }> = [];
+            const recordKey = await computeRecordKey(command.attesterId, command.payloadHash);
             if (command.contentRoot) {
                 calls.push({ circuit: 'anchorContentRoot', args: [command.payloadHash, command.contentRoot, command.schemaId] });
             }
@@ -663,25 +573,25 @@ export function registerSubmissionHandlers(
                 if (claim.predicate === 'documentIntegrity') {
                     calls.push({
                         circuit: 'proveDocumentComparison',
-                        args: [command.payloadHash, claim.payloadHashB, '0', String(claim.allowedMask), '1'],
+                        args: [recordKey, await computeRecordKey(claim.attesterIdB ?? command.attesterId, claim.payloadHashB!), '0', String(claim.allowedMask), '1', String(claimValidUntil(claim.validUntil ?? command.validUntil))],
                         merkleProof: { docPair: { schema: claim.schema, openingA: claim.openingA, openingB: claim.openingB } }
                     });
                 } else if (claim.predicate === 'documentDiff') {
                     calls.push({
                         circuit: 'proveDocumentComparison',
-                        args: [command.payloadHash, claim.payloadHashB, '1', '0', String(claim.k)],
+                        args: [recordKey, await computeRecordKey(claim.attesterIdB ?? command.attesterId, claim.payloadHashB!), '1', '0', String(claim.k), String(claimValidUntil(claim.validUntil ?? command.validUntil))],
                         merkleProof: { docPair: { schema: claim.schema, openingA: claim.openingA, openingB: claim.openingB } }
                     });
                 } else if (claim.predicate === 'bytesEquality') {
                     calls.push({
                         circuit: 'proveFieldEquality',
-                        args: [command.payloadHash, claim.fieldKey, claim.expectedDigest],
+                        args: [recordKey, claim.fieldKey, claim.expectedDigest, String(claimValidUntil(claim.validUntil ?? command.validUntil))],
                         merkleProof: { fieldSalt: claim.salt, siblings: claim.siblings, dirs: claim.dirs }
                     });
                 } else if (claim.predicate === 'setMembership') {
                     calls.push({
                         circuit: 'proveFieldMembership',
-                        args: [command.payloadHash, claim.fieldKey, claim.setRoot],
+                        args: [recordKey, claim.fieldKey, claim.setRoot, String(claimValidUntil(claim.validUntil ?? command.validUntil))],
                         merkleProof: {
                             fieldDigest: claim.valueDigest, fieldSalt: claim.salt,
                             siblings: claim.siblings, dirs: claim.dirs,
@@ -691,12 +601,11 @@ export function registerSubmissionHandlers(
                 } else {
                     calls.push({
                         circuit: 'proveFieldPredicate',
-                        args: [command.payloadHash, claim.fieldKey, claim.threshold, String(claim.opCode)],
+                        args: [recordKey, claim.fieldKey, claim.threshold, String(claim.opCode), String(claimValidUntil(claim.validUntil ?? command.validUntil))],
                         merkleProof: { fieldValue: claim.value, fieldSalt: claim.salt, siblings: claim.siblings, dirs: claim.dirs }
                     });
                 }
             }
-            // Let it propagate: ambiguous child -> ChildReconciliationRequiredError (parent reconciles); definitive rejection -> plain error (parent fails cleanly).
             const proof: any = await runChild<any>({
                 parent: job, kind: 'fieldPredicateBatchProof', step: 'proveFieldPredicateBatch', commandVersion: 1,
                 request: { circuits: calls.map(c => c.circuit), payloadHash: command.payloadHash, claimCount: command.claims.length },
@@ -704,8 +613,7 @@ export function registerSubmissionHandlers(
                 // an in-batch anchor is a dependency and stays first.
                 command: { op: 'callBatch', contractAddress: command.contractAddress, calls, compiledArtifactRef: command.compiledArtifactRef, sponsorSessionId: command.sponsorSessionId, independentCalls: true, orderedPrefix: calls[0]?.circuit === 'anchorContentRoot' ? 1 : 0 }
             });
-            // ONE statement for all rows: the tx is already on chain here, so a
-            // partial projection (some rows proven, some not) must be impossible.
+            // One statement: the tx is on chain, a partial projection must be impossible.
             const provenAtBatch = new Date().toISOString();
             await db.run(UPDATE.entity(PredicateAttestations)
                 .set({ provenTxHash: proof.txHash, provenAt: provenAtBatch, modifiedAt: provenAtBatch })
@@ -729,11 +637,8 @@ export function registerSubmissionHandlers(
         }
         const facadeCfg = facadeConfigFromEnv();
         await ensureNetworkId(facadeCfg.networkId);
-        // ATOMIC generation binding: the resolver verifies the stamped digest
-        // against the exact registration snapshot it then imports (the gate
-        // at the top of this function fast-fails digest-less commands; this
-        // closes the check-then-resolve window against a concurrent
-        // registerContract and against assets overwritten in place).
+        // Atomic: the resolver checks the digest against the snapshot it imports,
+        // closing the window against a concurrent registerContract or overwrite.
         const resolved = await contractResolver(
             command.compiledArtifactRef,
             (command as ContractCommandV1WithProvenance).artifactDigest);
@@ -752,69 +657,29 @@ export function registerSubmissionHandlers(
                 contractName: command.compiledArtifactRef,
                 registration: { artifactPath: resolved.artifactPath, artifactDigest: resolved.artifactDigest, privateStateId: resolved.privateStateId, zkConfigPath: resolved.zkConfigPath, ...(resolved.slotWidth !== undefined ? { slotWidth: resolved.slotWidth } : {}) },
                 initialPrivateState: command.initialPrivateState,
-                sessionId: job.sessionId
+                sessionId: job.sessionId,
+                ...(command.recoveryId ? { recoveryId: command.recoveryId } : {})
             });
             return { submissionId: result.submissionId, txHash: result.txHash, contractAddress: result.contractAddress, status: result.status, ...(sponsor ? { feeSponsor: sponsor.sponsorSessionId } : {}) };
         }
 
-        if (command.op === 'attestCommit') {
-            // Guarded-attest phase 1: record the opaque, caller-bound commitment
-            // (attestGuarded mode 0; metadata/nonce ride as zero dummies, the
-            // expiry is the commitment's block-time lifetime).
-            const result = await submitter.call({
-                contractAddress: command.contractAddress, circuit: 'attestGuarded',
-                args: [0n, hexToBytes(command.commitment), new Uint8Array(32), new Uint8Array(32), BigInt(command.expiresAt)],
-                contractName: command.compiledArtifactRef,
-                registration: { artifactPath: resolved.artifactPath, artifactDigest: resolved.artifactDigest, privateStateId: resolved.privateStateId, zkConfigPath: resolved.zkConfigPath, ...(resolved.slotWidth !== undefined ? { slotWidth: resolved.slotWidth } : {}) },
-                sessionId: job.sessionId
-            });
-            return { commitment: command.commitment, contractAddress: command.contractAddress, txHash: result.txHash, ...(sponsor ? { feeSponsor: sponsor.sponsorSessionId } : {}) };
-        }
-
         if (command.op === 'anchorDocument') {
-            // Guarded reveal (attestGuarded mode 1) when the commit-reveal
-            // nonce rides with the command; plain attest otherwise.
             const result = await submitter.call({
                 contractAddress: command.contractAddress,
-                circuit: command.guardedNonce ? 'attestGuarded' : 'attest',
-                args: command.guardedNonce
-                    ? [1n, hexToBytes(command.payloadHash), hexToBytes(command.metadataHash), hexToBytes(command.guardedNonce), 0n]
-                    : [hexToBytes(command.payloadHash), hexToBytes(command.metadataHash)],
+                circuit: 'attest',
+                args: [hexToBytes(command.payloadHash), hexToBytes(command.metadataHash)],
                 contractName: command.compiledArtifactRef,
                 registration: { artifactPath: resolved.artifactPath, artifactDigest: resolved.artifactDigest, privateStateId: resolved.privateStateId, zkConfigPath: resolved.zkConfigPath, ...(resolved.slotWidth !== undefined ? { slotWidth: resolved.slotWidth } : {}) },
                 sessionId: job.sessionId
             });
             const anchoredAt = new Date().toISOString();
             await db.run(UPDATE.entity(Documents).set({ anchoredTxHash: result.txHash, anchoredAt, modifiedAt: anchoredAt }).where({ ID: command.documentId }));
-            return { documentId: command.documentId, attestationId: command.payloadHash, txHash: result.txHash, anchoredAt, ...(sponsor ? { feeSponsor: sponsor.sponsorSessionId } : {}) };
-        }
-
-        if (command.op === 'anchorGuardedWorkflow') {
-            // Lineage 3 default: the payload hash never appears in a mempool
-            // before its commitment is on chain, and the revealed attestation
-            // is final. Two transactions, each its own child job (own attempt
-            // row, own reconciliation); the parent carries no hash.
-            const commitment = await computeAttestCommitment(command.payloadHash, command.metadataHash, command.nonce);
-            const commit = await runChild<{ txHash: string }>({
-                parent: job, kind: 'anchorCommit', step: 'commit', commandVersion: 1,
-                request: { circuit: 'attestGuarded', mode: 0, documentId: command.documentId },
-                command: { op: 'attestCommit', commitment, expiresAt: command.expiresAt, contractAddress: command.contractAddress, compiledArtifactRef: command.compiledArtifactRef, sponsorSessionId: command.sponsorSessionId }
-            });
-            const reveal = await runChild<{ txHash: string; anchoredAt: string }>({
-                parent: job, kind: 'anchorReveal', step: 'reveal', commandVersion: 1,
-                request: { circuit: 'attestGuarded', mode: 1, documentId: command.documentId },
-                command: { op: 'anchorDocument', documentId: command.documentId, payloadHash: command.payloadHash, metadataHash: command.metadataHash, contractAddress: command.contractAddress, compiledArtifactRef: command.compiledArtifactRef, sponsorSessionId: command.sponsorSessionId, guardedNonce: command.nonce }
-            });
-            return {
-                documentId: command.documentId, attestationId: command.payloadHash, txHash: reveal?.txHash, commitTxHash: commit?.txHash,
-                anchoredAt: reveal?.anchoredAt ?? new Date().toISOString(), guarded: true,
-                ...(sponsor ? { feeSponsor: sponsor.sponsorSessionId } : {})
-            };
+            return { documentId: command.documentId, attestationId: command.payloadHash, attesterId: command.attesterId ?? null, txHash: result.txHash, anchoredAt, ...(sponsor ? { feeSponsor: sponsor.sponsorSessionId } : {}) };
         }
 
         if (command.op === 'grantDisclosure' || command.op === 'revokeDisclosure') {
             const isGrant = command.op === 'grantDisclosure';
-            let result: { txHash: string };
+            let result: { txHash: string; blockHeight?: number | null };
             try {
                 result = await submitter.call({
                     contractAddress: command.contractAddress,
@@ -827,49 +692,67 @@ export function registerSubmissionHandlers(
                     sessionId: job.sessionId
                 });
             } catch (err) {
-                // The chain did not take the level change (rejected, or never
-                // submitted): the confirmed level stays, the request is dropped.
+                // Not taken by the chain: the confirmed level stays.
                 if (isGrant) await clearPendingDisclosureLevel(command.disclosureGrantId, command.level);
                 throw err;
             }
             const changedAt = new Date().toISOString();
+            const landed = result.blockHeight ?? null;
             if (isGrant) {
-                await db.run(UPDATE.entity(DisclosureGrants)
-                    .set(confirmedDisclosureLevel(command.level, result.txHash, changedAt))
-                    .where({ ID: command.disclosureGrantId }));
+                await db.run(notNewerThan(UPDATE.entity(DisclosureGrants)
+                    .set(confirmedDisclosureLevel(command.level, result.txHash, changedAt, landed))
+                    .where({ ID: command.disclosureGrantId }), landed));
             } else {
-                await db.run(UPDATE.entity(DisclosureGrants).set({ revokedTxHash: result.txHash, active: false, modifiedAt: changedAt }).where({ contractAddress: command.contractAddress, payloadHash: command.payloadHash, grantee: command.grantee }));
+                await db.run(notNewerThan(UPDATE.entity(DisclosureGrants).set({ revokedTxHash: result.txHash, active: false, modifiedAt: changedAt, ...heightStamp(landed) }).where({ contractAddress: command.contractAddress, attesterId: command.attesterId, payloadHash: command.payloadHash, grantee: command.grantee }), landed));
             }
-            await reindexAfterSubmit(command.contractAddress, resolved);
+            await reindexAfterSubmit(command.contractAddress, resolved, landed, job, command.compiledArtifactRef);
             return { ...(isGrant ? { disclosureGrantId: command.disclosureGrantId, level: command.level } : {}), payloadHash: command.payloadHash, grantee: command.grantee, txHash: result.txHash };
         }
 
         if (command.op === 'registerPassport') {
+            // Mode 0 assigns the id, 1 unregisters it, 2 transfers the registrar role,
+            // 3 and 4 are the recovery identity re-pointing registrar / recovery.
             const result = await submitter.call({
                 contractAddress: command.contractAddress,
-                circuit: 'registerPassport',
-                args: [hexToBytes(command.passportId), hexToBytes(command.ownerId)],
+                circuit: 'registerDocument',
+                args: [BigInt(command.mode ?? 0), hexToBytes(command.passportId), hexToBytes(command.ownerId)],
                 contractName: command.compiledArtifactRef,
                 registration: { artifactPath: resolved.artifactPath, artifactDigest: resolved.artifactDigest, privateStateId: resolved.privateStateId, zkConfigPath: resolved.zkConfigPath, ...(resolved.slotWidth !== undefined ? { slotWidth: resolved.slotWidth } : {}) },
                 sessionId: job.sessionId
             });
-            return { passportId: command.passportId, ownerId: command.ownerId, contractAddress: command.contractAddress, txHash: result.txHash, ...(sponsor ? { feeSponsor: sponsor.sponsorSessionId } : {}) };
+            return { passportId: command.passportId, documentId: command.passportId, ownerId: command.ownerId, mode: command.mode ?? 0, contractAddress: command.contractAddress, txHash: result.txHash, ...(sponsor ? { feeSponsor: sponsor.sponsorSessionId } : {}) };
+        }
+
+        if (command.op === 'retract') {
+            const result = await submitter.call({
+                contractAddress: command.contractAddress,
+                circuit: 'retract',
+                args: [BigInt(command.mode), hexToBytes(command.key)],
+                contractName: command.compiledArtifactRef,
+                registration: { artifactPath: resolved.artifactPath, artifactDigest: resolved.artifactDigest, privateStateId: resolved.privateStateId, zkConfigPath: resolved.zkConfigPath, ...(resolved.slotWidth !== undefined ? { slotWidth: resolved.slotWidth } : {}) },
+                sessionId: job.sessionId
+            });
+            if (command.mode === 0) {
+                // The payload's grants left the chain with the attestation.
+                const changedAt = new Date().toISOString();
+                const landed = result.blockHeight ?? null;
+                await db.run(notNewerThan(UPDATE.entity(DisclosureGrants).set({ active: false, revokedTxHash: result.txHash, modifiedAt: changedAt, ...heightStamp(landed) }).where({ contractAddress: command.contractAddress, attesterId: command.attesterId, payloadHash: command.key, active: true }), landed));
+                await reindexAfterSubmit(command.contractAddress, resolved, landed, job, command.compiledArtifactRef);
+            }
+            return { mode: command.mode, key: command.key, contractAddress: command.contractAddress, txHash: result.txHash, ...(sponsor ? { feeSponsor: sponsor.sponsorSessionId } : {}) };
         }
 
         if (command.op === 'callBatch') {
-            // Same per-circuit coercion as the single-call tail below, applied
-            // to each entry of the batch (raw JSON args were persisted). The
-            // field-predicate batch child coerces like its single-call kinds
-            // (fieldAnchorRoot / fieldPredicateProof): hex Bytes<32> + Uint<64>.
+            // Raw JSON args were persisted; coerce per entry like the single-call tail.
             const coercedCalls = command.calls.map(c => {
                 if (job.kind === 'fieldPredicateBatchProof') {
                     const args = c.circuit === 'anchorContentRoot'
                         ? [hexToBytes(String(c.args[0])), hexToBytes(String(c.args[1])), hexToBytes(String(c.args[2]))]
                         : (c.circuit === 'proveFieldEquality' || c.circuit === 'proveFieldMembership')
-                            ? [hexToBytes(String(c.args[0])), hexToBytes(String(c.args[1])), hexToBytes(String(c.args[2]))]
+                            ? [hexToBytes(String(c.args[0])), hexToBytes(String(c.args[1])), hexToBytes(String(c.args[2])), BigInt(String(c.args[3]))]
                             : c.circuit === 'proveDocumentComparison'
-                                ? [hexToBytes(String(c.args[0])), hexToBytes(String(c.args[1])), BigInt(String(c.args[2])), expandAllowedMask(Number(c.args[3]), vaultDims(command.compiledArtifactRef).width), BigInt(String(c.args[4]))]
-                            : [hexToBytes(String(c.args[0])), hexToBytes(String(c.args[1])), BigInt(String(c.args[2])), BigInt(String(c.args[3]))];
+                                ? [hexToBytes(String(c.args[0])), hexToBytes(String(c.args[1])), BigInt(String(c.args[2])), expandAllowedMask(Number(c.args[3]), vaultDims(command.compiledArtifactRef).width), BigInt(String(c.args[4])), BigInt(String(c.args[5]))]
+                            : [hexToBytes(String(c.args[0])), hexToBytes(String(c.args[1])), BigInt(String(c.args[2])), BigInt(String(c.args[3])), BigInt(String(c.args[4]))];
                     return { circuit: c.circuit, args, merkleProof: c.merkleProof };
                 }
                 const argTypes = argTypesLoader(resolved.zkConfigPath, c.circuit);
@@ -890,9 +773,7 @@ export function registerSubmissionHandlers(
         }
 
         if ((command as { op: string }).op === 'buildSponsorable') {
-            // Cross-server sponsoring PHASE 1: build + sign + finalize under the
-            // caller's identity, return the fee-unpaid tx as base64. No sponsor,
-            // no submit here.
+            // Build, sign and finalize under the caller's identity; no sponsor, no submit.
             const c = command as unknown as { contractAddress: string; circuit: string; compiledArtifactRef: string; args: unknown[] };
             const argTypes = argTypesLoader(resolved.zkConfigPath, c.circuit);
             const coerced = coerceCircuitArgs(c.args, argTypes);
@@ -909,13 +790,12 @@ export function registerSubmissionHandlers(
         if (job.kind === 'fieldAnchorRoot') {
             coercedArgs = [hexToBytes(String(command.args[0])), hexToBytes(String(command.args[1])), hexToBytes(String(command.args[2]))];
         } else if (job.kind === 'fieldPredicateProof') {
-            coercedArgs = [hexToBytes(String(command.args[0])), hexToBytes(String(command.args[1])), BigInt(String(command.args[2])), BigInt(String(command.args[3]))];
+            coercedArgs = [hexToBytes(String(command.args[0])), hexToBytes(String(command.args[1])), BigInt(String(command.args[2])), BigInt(String(command.args[3])), BigInt(String(command.args[4]))];
         } else if (job.kind === 'fieldEqualityProof' || job.kind === 'fieldMembershipProof') {
-            coercedArgs = [hexToBytes(String(command.args[0])), hexToBytes(String(command.args[1])), hexToBytes(String(command.args[2]))];
+            coercedArgs = [hexToBytes(String(command.args[0])), hexToBytes(String(command.args[1])), hexToBytes(String(command.args[2])), BigInt(String(command.args[3]))];
         } else if (job.kind === 'documentIntegrityProof' || job.kind === 'documentDiffProof') {
-            // proveDocumentComparison(a, b, mode, allowed_mask, k); the
-            // Vector<width, Boolean> mask arg expands from the packed integer.
-            coercedArgs = [hexToBytes(String(command.args[0])), hexToBytes(String(command.args[1])), BigInt(String(command.args[2])), expandAllowedMask(Number(command.args[3]), vaultDims(command.compiledArtifactRef).width), BigInt(String(command.args[4]))];
+            // The Vector<width, Boolean> mask arg expands from the packed integer.
+            coercedArgs = [hexToBytes(String(command.args[0])), hexToBytes(String(command.args[1])), BigInt(String(command.args[2])), expandAllowedMask(Number(command.args[3]), vaultDims(command.compiledArtifactRef).width), BigInt(String(command.args[4])), BigInt(String(command.args[5]))];
         } else {
             const argTypes = argTypesLoader(resolved.zkConfigPath, command.circuit);
             coercedArgs = coerceCircuitArgs(command.args, argTypes);
@@ -935,12 +815,10 @@ export function registerSubmissionHandlers(
     registerBackgroundJobProcessor('deployContract', 1, declaredJobKindTraits('deployContract'), executeContractCommand);
     registerBackgroundJobProcessor('submitContractCall', 1, declaredJobKindTraits('submitContractCall'), executeContractCommand);
     registerBackgroundJobProcessor('submitContractCallBatch', 1, declaredJobKindTraits('submitContractCallBatch'), executeContractCommand);
-    // Same execution as any contract call; the result additionally carries the
-    // token type, without which the caller cannot spend what it just minted.
+    // The result adds the token type, without which the minted coin cannot be spent.
     registerBackgroundJobProcessor('mintShieldedTestToken', 1, declaredJobKindTraits('mintShieldedTestToken'), async (raw, job) => {
         const result = await executeContractCommand(raw, job) as Record<string, unknown> | undefined;
-        // Narrow to the call shape: this processor only ever runs commands the
-        // mint handler wrote, and the executor already rejected any other op.
+        // The executor already rejected any op but 'call' for this kind.
         const command = raw as Extract<ContractCommandV1, { op: 'call' }>;
         const token = await deriveRawTokenType(String(command?.contractAddress ?? ''));
         return { ...(result ?? {}), tokenTypeHex: token.tokenTypeHex, amount: SHIELDED_TEST_TOKEN_AMOUNT.toString() };
@@ -953,33 +831,21 @@ export function registerSubmissionHandlers(
     registerBackgroundJobProcessor('issueDocumentDiffAttestation', 1, declaredJobKindTraits('issueDocumentDiffAttestation'), executeContractCommand);
     registerBackgroundJobProcessor('buildSponsorableTx', 1, declaredJobKindTraits('buildSponsorableTx'), executeContractCommand);
 
-    // Cross-server sponsoring PHASE 2 job: no contract call of our own, just
-    // deserialize the caller's finalized tx, enforce policy, pay dust, submit.
     /**
-     * EXTERNAL-EFFECT BOOKKEEPING across broadcast attempts of a sponsoring
-     * job (both channels). A job crosses the external_execution boundary ONCE
-     * (markJobExternalExecution is not re-entrant); every broadcast ATTEMPT
-     * gets its own PendingSubmissions row and is reported as submitted with its
-     * identifier (markJobSubmitted accepts external_execution|submitted, so it
-     * may repeat). A later attempt closes the previous row first: `REJECTED`
-     * (provably never on-chain; the job's hash is taken off via
-     * reportSubmissionRejectedOn so an exhausted run fails plainly) or `REBUILT`.
-     * The job row's txHash is the LATEST attempt's identifier; reconciliation
-     * and chain-outcome confirmation resolve it against the indexer.
+     * Bookkeeping across broadcast attempts of a sponsoring job: the boundary is
+     * crossed once, each attempt gets its own PendingSubmissions row, and a later
+     * attempt first closes the previous one (REJECTED or REBUILT).
      */
     const sponsorAttemptLedger = (db: any, job: BackgroundJobRow, command: any, feeSponsorSessionId: () => string) => {
         let boundaryCrossed = false;
         let currentSubmissionId: string | null = null;
         let currentTxHash: string | null = null;
-        // Deploys reserved from the grant's lifetime budget for this job: taken at
-        // the first submit-intent naming deploys, kept across rebuild attempts,
-        // refunded only when the attempt is provably not on chain.
+        // Kept across rebuilds; refunded only when an attempt is provably not on chain.
         let reservedDeploys = 0;
         const failPreviousAttempt = async (why: string, rejectedPreInclusion: boolean) => {
             if (!currentSubmissionId) return;
-            // Row close, deploy refund (only for an attempt provably not on chain) and
-            // taking the rejected hash off the job (CAS on lease + hash) are one transaction.
-            // A write that still fails after the contention retry throws: no rebuild on an unclosed attempt.
+            // Row close, refund and taking the hash off the job are one transaction;
+            // if it still fails, never rebuild on an unclosed attempt.
             const refund = rejectedPreInclusion && reservedDeploys > 0 && command?.grantId ? reservedDeploys : 0;
             const rowId = currentSubmissionId;
             const rowHash = currentTxHash ?? undefined;
@@ -992,9 +858,8 @@ export function registerSubmissionHandlers(
             } catch (e) {
                 cds.log('nightgate').error(`sponsor attempt ${rowId} of job ${job.ID} could not be closed as ${rejectedPreInclusion ? 'REJECTED' : 'REBUILT'}${refund > 0 ? ` (deploy reservation of ${refund} NOT refunded)` : ''}; not retrying: ${String((e as Error)?.message ?? e)}`);
                 if (rejectedPreInclusion) {
-                    // The runner persists this error's code as the job's errorCode;
-                    // settleRejectedSponsorAttempts re-runs the bookkeeping from it.
-                    // Generic reconciliation cannot resolve it: the hash never reached a mempool.
+                    // settleRejectedSponsorAttempts re-runs the bookkeeping from this error
+                    // code; generic reconciliation cannot, the hash never reached a mempool.
                     throw new SponsorAttemptBookkeepingPendingError(
                         `sponsoring attempt ${rowId} was rejected before inclusion but its bookkeeping (close, refund, hash) could not be committed: ${String((e as Error)?.message ?? e)}. Settled by the reconciler. Original failure: ${why.slice(0, 200)}`,
                         { submissionId: rowId, txHash: rowHash, grantId: refund > 0 ? String(command.grantId) : undefined, refund });
@@ -1004,18 +869,14 @@ export function registerSubmissionHandlers(
             if (refund > 0) reservedDeploys = 0;
             currentSubmissionId = null; currentTxHash = null;
         };
-        // The intent carries what the WORKER inspected and chose (contract and
-        // circuits from the caller transaction, the dust backing, the paying
-        // account), so a reconciled result can be rebuilt canonically; stored
-        // as JSON on the attempt row (submitIntentData, internal; finalizedTxData
-        // keeps its public meaning: the indexed-transaction snapshot).
+        // The intent carries what the worker chose (contract, circuits, backing,
+        // payer), so a reconciled result can be rebuilt from the attempt row.
         const onSubmitIntent = () => async (txHash: string, intent?: { contractAddress?: string; circuits?: string[]; note?: string; sponsorAccountId?: string; deployed?: string[]; ttl?: string }) => {
             const submissionId = cds.utils.uuid();
             const deployed = (intent?.deployed ?? []).map(String).filter(Boolean);
             const grantId = command?.grantId ? String(command.grantId) : null;
-            // A sponsored deploy consumes the grant's lifetime budget here, before the
-            // ack that lets the worker broadcast: one conditional UPDATE, fail-closed (nack, no broadcast).
-            // Reservation and attempt row are one transaction; the row carries grant + deployed addresses for the reconciliation finalizer.
+            // A deploy reserves grant budget before the ack lets the worker broadcast
+            // (fail-closed), in the same transaction as the attempt row.
             const need = grantId && deployed.length > reservedDeploys ? deployed.length - reservedDeploys : 0;
             const coordinates = {
                 feeSponsor: feeSponsorSessionId(), sponsorAccountId: intent?.sponsorAccountId ?? null,
@@ -1030,9 +891,8 @@ export function registerSubmissionHandlers(
                 actionType: (deployed.length ? 'DEPLOY' : 'CALL') as 'DEPLOY' | 'CALL', submittedAt: new Date().toISOString(), status: 'pending' as const, sessionId: job.sessionId,
                 submitIntentData: JSON.stringify(coordinates)
             };
-            // The job transition (running -> submitted, or the rebuild's new hash) rides
-            // the same transaction: after a crash the job is either still running with
-            // nothing reserved, or submitted with hash, row and reservation all present.
+            // The job transition shares the transaction: after a crash the job is running
+            // with nothing reserved, or submitted with hash, row and reservation.
             let budgetExhausted: Error | null = null;
             await withLockContentionRetry(`sponsorAttempt(${job.ID})`, () => runInOneTransaction(db, async (tx) => {
                 await tx.run(INSERT.into(PendingSubmissions).entries(row));
@@ -1056,15 +916,15 @@ export function registerSubmissionHandlers(
         return { failPreviousAttempt, onSubmitIntent, markIncluded };
     };
 
+    // Bound sponsoring job: no contract call of our own, just deserialize the
+    // caller's finalized tx, enforce policy, pay dust, submit.
     const executeSponsorFinalized = async (command: any, job: BackgroundJobRow): Promise<unknown> => {
         let activeSponsorSessionId = String(command.sponsorSessionId ?? job.sessionId);
         const ledger = sponsorAttemptLedger(db, job, command, () => activeSponsorSessionId);
         const facadeCfg = facadeConfigFromEnv();
         await ensureNetworkId(facadeCfg.networkId);
 
-        // Candidate list: an explicit sponsor stays EXACT (grant pinning is a
-        // security boundary); the platform-pool sentinel fans out over the
-        // configured pool.
+        // An explicit sponsor stays exact (grant pinning is a security boundary).
         let candidates: string[];
         if (command.sponsorSessionId === PLATFORM_POOL_SENTINEL) {
             const pool = getConfiguredFeeSponsorSessions(getNightgatePluginConfig());
@@ -1079,15 +939,13 @@ export function registerSubmissionHandlers(
         const cooldownMs = configMs('NIGHTGATE_SPONSOR_COOLDOWN_MS');
         const dustRetries = configNumber('NIGHTGATE_SPONSOR_DUST_RETRIES');
         const dustBackoffMs = configMs('NIGHTGATE_SPONSOR_DUST_BACKOFF_MS');
-        // ONE shared deadline: a fully busy pool QUEUES here (acquireSponsor
-        // polls the whole remaining candidate set) instead of skipping every
-        // busy member and failing instantly.
+        // One shared deadline: a fully busy pool queues instead of failing at once.
         const deadline = Date.now() + waitMs;
         let lastErr: unknown;
         while (candidates.length > 0) {
             let sessionId: string;
             try {
-                sessionId = await acquireSponsor(candidates, Math.max(0, deadline - Date.now()));
+                sessionId = await acquireSponsor(candidates, Math.max(0, deadline - Date.now()), sponsorAtSyncGate);
             } catch (e) {
                 throw lastErr ?? e; // pool stayed busy/cooling until the deadline
             }
@@ -1098,9 +956,6 @@ export function registerSubmissionHandlers(
                     const sponsor = await resolveFeeSponsor({ db, sponsorSessionId: sessionId, requestingUserId: job.requestedBy ?? undefined, config: getNightgatePluginConfig() });
                     await ensureFeeSponsorFacade(sponsor, facadeCfg);
                     activeSponsorSessionId = sponsor.sponsorSessionId;
-                    // Same durable external-effect boundary as the unbound path: the
-                    // worker announces the identifier before it broadcasts, the job
-                    // row carries it (and a PendingSubmissions row) from then on.
                     const policy = await liveSponsorPolicyForJob(db, command);
                     const out = await walletSponsorFinalizedTx({
                         sponsorSessionId: sponsor.accountId,
@@ -1119,8 +974,7 @@ export function registerSubmissionHandlers(
                 } catch (e) {
                     lastErr = e;
                     const verdict = decideSponsorFailure(e);
-                    // Ambiguous or on-chain: the attempt row stays as it is, the
-                    // job runner takes it from here (reconciliation / terminal).
+                    // Ambiguous or on-chain: the job runner reconciles or fails it.
                     if (verdict.decision === 'ambiguous' || verdict.decision === 'landed-not-applied') { releaseSponsor(sessionId); throw e; }
                     // Everything else builds a NEW transaction: close this attempt's row.
                     try {
@@ -1141,10 +995,10 @@ export function registerSubmissionHandlers(
                         if (verdict.generic) { releaseSponsor(sessionId); throw e; }
                     } else if (verdict.decision === 'fail') {
                         releaseSponsor(sessionId);
+                        cds.log('nightgate').warn(`sponsor ${sessionId.slice(0, 8)} failed, not retrying: ${String((e as Error)?.message ?? e).slice(0, 200)}`);
                         throw e; // fails identically on every sponsor; do not burn the pool
                     }
-                    // Bench EVERY failover, so the NEXT job skips this sponsor
-                    // too; whether WE continue depends on candidates left.
+                    // Bench on every failover so the next job skips this sponsor too.
                     benchSponsor(sessionId, cooldownMs);
                     cds.log('nightgate').warn(`sponsor ${sessionId.slice(0, 8)} failed over (${String((e as Error).message).slice(0, 120)})`);
                     candidates = candidates.filter(c => c !== sessionId);
@@ -1156,12 +1010,9 @@ export function registerSubmissionHandlers(
     };
 
     /**
-     * Reconciliation finalizer for both sponsoring channels: a broadcast whose
-     * outcome was ambiguous in-process and is later proven included by the
-     * indexer still records the deployed address on the grant. Reads only the
-     * attempt row (`deployed`, `deployReservation`). Idempotent (recording is
-     * a merge). A reconciled chain failure keeps the reservation consumed:
-     * refunds are only for transactions that provably never reached the chain.
+     * Reconciliation finalizer for both sponsoring channels: records deployed
+     * addresses from the attempt row once inclusion is proven. A reconciled chain
+     * failure keeps its reservation; refunds only cover txs that never reached the chain.
      */
     const finalizeSponsoredSubmission = async (raw: unknown, _job: BackgroundJobRow, evidence: ReconciliationEvidence): Promise<unknown> => {
         const command = raw as { grantId?: string; sponsorSessionId?: string };
@@ -1187,10 +1038,8 @@ export function registerSubmissionHandlers(
 
     registerBackgroundJobProcessor('sponsorFinalizedTransaction', 1, declaredJobKindTraits('sponsorFinalizedTransaction'), executeSponsorFinalized);
 
-    // 0.18 PARALLEL channel: same policy + pool + failover, but NO exclusive
-    // wallet lease. Concurrency comes from per-NOTE locking inside the worker,
-    // so many unbound jobs run on ONE wallet at once (distinct notes). The
-    // pool loop here only spreads load across wallets and fails over on error.
+    // No exclusive wallet lease: per-note locking in the worker lets many jobs
+    // share one wallet; this loop only spreads load and fails over.
     const executeSponsorUnbound = async (command: any, job: BackgroundJobRow): Promise<unknown> => {
         const facadeCfg = facadeConfigFromEnv();
         await ensureNetworkId(facadeCfg.networkId);
@@ -1199,19 +1048,14 @@ export function registerSubmissionHandlers(
         if (command.sponsorSessionId === PLATFORM_POOL_SENTINEL) {
             const pool = getConfiguredFeeSponsorSessions(getNightgatePluginConfig());
             if (pool.length === 0) throw new Error('platform sponsor pool is empty (NIGHTGATE_FEE_SPONSOR_SESSION)');
-            candidates = sponsorCandidatesNonExclusive(pool);
+            candidates = sponsorCandidatesNonExclusive(pool, Date.now(), sponsorAtSyncGate);
         } else {
             candidates = [String(command.sponsorSessionId)];
         }
         const cooldownMs = configMs('NIGHTGATE_SPONSOR_COOLDOWN_MS');
-        // A 1010/170 or /196 is a transient dust race, not a sponsor-health problem:
-        // rebuild the dust spend fresh on the SAME sponsor and resubmit, up to
-        // dustRetries times with a short backoff (letting the dust state catch
-        // up). This is what makes concurrent sponsoring deterministic instead of
-        // "lands sometimes": a lost dust race self-heals rather than failing the
-        // job. Only a NON-dust retryable failure benches the sponsor + fails over.
-        // 4 x 5 s spans ~2 blocks: the rebuilt spend can only succeed once the
-        // sponsor's local dust wallet has applied the spend it lost against.
+        // A dust race is not sponsor health: rebuild on the same sponsor after a
+        // backoff (the rebuild succeeds only once the local dust wallet applied the
+        // lost spend). Only a non-dust retryable failure benches and fails over.
         const dustRetries = configNumber('NIGHTGATE_SPONSOR_DUST_RETRIES');
         const dustBackoffMs = configMs('NIGHTGATE_SPONSOR_DUST_BACKOFF_MS');
         cds.log('nightgate').info(`sponsorUnboundTransaction job: ${command.unboundTxB64?.length ?? 0} b64 chars, candidates ${candidates.map(c => c.slice(0, 8)).join('>')}`);
@@ -1221,10 +1065,8 @@ export function registerSubmissionHandlers(
         const ledger = sponsorAttemptLedger(db, job, command, () => activeSponsorSessionId);
         const { failPreviousAttempt, onSubmitIntent } = ledger;
         for (const sessionId of candidates) {
-            // LRU-touch BEFORE the first await: concurrent jobs compute their
-            // candidate order in the same tick, so a touch after the resolve
-            // would send them all to the same wallet instead of round-robin
-            // across the pool (one backing per wallet = one lane per wallet).
+            // Touch before the first await: concurrent jobs order candidates in the
+            // same tick and would otherwise all pick the same wallet.
             touchSponsor(sessionId);
             for (let attempt = 0; attempt <= dustRetries; attempt++) {
                 try {
@@ -1249,42 +1091,33 @@ export function registerSubmissionHandlers(
                     lastErr = e;
                     const verdict = decideSponsorFailure(e);
                     if (verdict.decision === 'ambiguous') {
-                        // The broadcast may still be included: NO rebuild (two
-                        // identifiers / two fees could land). Leave the attempt
-                        // row pending and the job's hash in place; the job ends
-                        // reconciliation_required and the indexer confirmer
-                        // resolves it by identifier.
+                        // May still be included: no rebuild (two fees could land);
+                        // the indexer confirmer resolves the job by identifier.
                         cds.log('nightgate').warn(`unbound sponsor ${sessionId.slice(0, 8)}: ambiguous submit outcome, leaving the job for reconciliation: ${String((e as Error).message).slice(0, 120)}`);
                         throw e;
                     }
                     if (verdict.decision === 'landed-not-applied') {
-                        // On-chain, call not applied (PROVEN via the indexer):
-                        // the CALLER's transcript is stale (same-contract
-                        // conflict). No sponsor-side rebuild can fix that (the
-                        // same caller bytes are rejected at admission); the job
-                        // runner fails the job TERMINALLY with the identifier
-                        // (job + attempt row in one write, no detour through
-                        // reconciliation_required), the caller rebuilds against
-                        // the current contract state.
+                        // Landed but not applied: the caller's transcript is stale,
+                        // which no sponsor-side rebuild fixes. The job fails terminally.
                         cds.log('nightgate').warn(`unbound sponsor ${sessionId.slice(0, 8)}: sponsored call landed but did not apply (caller transcript stale); not retrying: ${String((e as Error).message).slice(0, 120)}`);
                         throw e;
                     }
                     await failPreviousAttempt(String((e as Error)?.message ?? e), verdict.preInclusion);
                     if (verdict.decision === 'dust-rebuild') {
-                        // Generic pool-Invalid: one rebuild only (each costs a
-                        // full dust proof and it may be a caller-side invalid tx).
+                        // Generic pool-Invalid: one rebuild only (it may be the caller's tx).
                         const budget = verdict.generic ? Math.min(1, dustRetries) : dustRetries;
                         if (attempt < budget) {
                             cds.log('nightgate').warn(`unbound sponsor ${sessionId.slice(0, 8)} hit a dust race (1010/170|196 or pool Invalid), rebuild-retry ${attempt + 1}/${budget}: ${String((e as Error).message).slice(-120)}`);
                             await new Promise(resolve => setTimeout(resolve, dustBackoffMs));
                             continue; // rebuild the dust spend fresh on the SAME sponsor
                         }
-                        // Dust retries exhausted: this is the CALLER's transaction
-                        // losing (same-contract conflict, invalid tx), not a
-                        // sponsor-health problem. Do NOT bench the wallet; fail.
+                        // Exhausted: the caller's transaction is losing, not the sponsor; no bench.
                         throw e;
                     }
-                    if (verdict.decision === 'fail') throw e;
+                    if (verdict.decision === 'fail') {
+                        cds.log('nightgate').warn(`unbound sponsor ${sessionId.slice(0, 8)} failed, not retrying: ${String((e as Error)?.message ?? e).slice(0, 200)}`);
+                        throw e;
+                    }
                     benchSponsor(sessionId, cooldownMs);
                     cds.log('nightgate').warn(`unbound sponsor ${sessionId.slice(0, 8)} failed over (${String((e as Error).message).slice(0, 120)})`);
                     break; // fail over to the next candidate
@@ -1293,25 +1126,17 @@ export function registerSubmissionHandlers(
         }
         throw lastErr ?? new Error('no sponsor candidate available');
     };
-    // Parallel: the kind is HEAVY in background-jobs (4 concurrent by default,
-    // `jobs.concurrency.heavy`), and the worker's sponsorUnboundTx never books
-    // a spend in the sponsor's dust wallet and runs its proving + submit
-    // OUTSIDE the per-facade submit lock (only the fast dust build takes it),
-    // so N jobs overlap and land in parallel on N distinct dust backings.
-    // Same-backing jobs serialize on the worker's backing lock; a lost dust
-    // race (1010/170) self-heals via the rebuild-retry above. The whole-wallet
-    // dust-wedge snapshot/restore stays exclusive to the BOUND paths (which
-    // hold the whole-call lock); the unbound path never arms it.
+    // Runs in parallel: the worker proves and submits unbound jobs outside the
+    // per-facade submit lock, so N jobs overlap on N dust backings. The dust-wedge
+    // snapshot/restore is for the bound paths only.
     registerBackgroundJobProcessor('sponsorUnboundTransaction', 1, declaredJobKindTraits('sponsorUnboundTransaction'), executeSponsorUnbound);
 
     registerBackgroundJobProcessor('anchorDocument', 1, declaredJobKindTraits('anchorDocument'), executeContractCommand);
-    registerBackgroundJobProcessor('commitDocumentAnchor', 1, declaredJobKindTraits('commitDocumentAnchor'), executeContractCommand);
-    registerBackgroundJobProcessor('anchorDocumentGuarded', 1, declaredJobKindTraits('anchorDocumentGuarded'), executeContractCommand);
-    registerBackgroundJobProcessor('anchorCommit', 1, declaredJobKindTraits('anchorCommit'), executeContractCommand);
-    registerBackgroundJobProcessor('anchorReveal', 1, declaredJobKindTraits('anchorReveal'), executeContractCommand);
     registerBackgroundJobProcessor('grantDisclosure', 1, declaredJobKindTraits('grantDisclosure'), executeContractCommand);
     registerBackgroundJobProcessor('revokeDisclosure', 1, declaredJobKindTraits('revokeDisclosure'), executeContractCommand);
     registerBackgroundJobProcessor('registerPassport', 1, declaredJobKindTraits('registerPassport'), executeContractCommand);
+    registerBackgroundJobProcessor('retract', 1, declaredJobKindTraits('retract'), executeContractCommand);
+    registerBackgroundJobProcessor('reindexDisclosures', 1, declaredJobKindTraits('reindexDisclosures'), executeReindexDisclosures);
     for (const childKind of ['fieldAnchorRoot', 'fieldPredicateProof', 'fieldEqualityProof', 'fieldMembershipProof', 'fieldPredicateBatchProof', 'documentIntegrityProof', 'documentDiffProof']) {
         registerBackgroundJobProcessor(childKind, 1, declaredJobKindTraits(childKind), executeContractCommand);
     }
@@ -1322,10 +1147,8 @@ export function registerSubmissionHandlers(
         evidence: ReconciliationEvidence
     ): Promise<unknown> => {
         const command = raw as ContractCommandV1;
-        // Same fail-closed provenance gate as the executor: reconciliation
-        // may run long after submission (restart, upgrade), and its
-        // projection/reindex work resolves the alias too; a re-pointed alias
-        // must not finalize against a different registration.
+        // Same provenance gate as the executor: reconciliation can run long after
+        // submission, against a re-pointed alias.
         if (typeof (command as any).compiledArtifactRef === 'string') {
             assertArtifactGeneration(
                 (command as any).compiledArtifactRef,
@@ -1333,9 +1156,6 @@ export function registerSubmissionHandlers(
                 `Reconciled '${command.op}' command of job ${_job.ID}`);
         }
         const changedAt = evidence.finalizedAt ?? new Date().toISOString();
-        if (command.op === 'attestCommit') {
-            return { reconciled: true, commitment: command.commitment, contractAddress: command.contractAddress, txHash: evidence.txHash, ...(command.sponsorSessionId ? { feeSponsor: command.sponsorSessionId } : {}) };
-        }
         if (command.op === 'anchorDocument') {
             await db.run(UPDATE.entity(Documents).set({
                 anchoredTxHash: evidence.txHash, anchoredAt: changedAt, modifiedAt: changedAt
@@ -1348,25 +1168,26 @@ export function registerSubmissionHandlers(
         }
         if (command.op === 'grantDisclosure' || command.op === 'revokeDisclosure') {
             const isGrant = command.op === 'grantDisclosure';
+            const landed = evidence.blockHeight ?? null;
             if (isGrant) {
-                await db.run(UPDATE.entity(DisclosureGrants)
-                    .set(confirmedDisclosureLevel(command.level, evidence.txHash, changedAt))
-                    .where({ ID: command.disclosureGrantId }));
+                await db.run(notNewerThan(UPDATE.entity(DisclosureGrants)
+                    .set(confirmedDisclosureLevel(command.level, evidence.txHash, changedAt, landed))
+                    .where({ ID: command.disclosureGrantId }), landed));
             } else {
-                await db.run(UPDATE.entity(DisclosureGrants).set({
-                    revokedTxHash: evidence.txHash, active: false, modifiedAt: changedAt
+                await db.run(notNewerThan(UPDATE.entity(DisclosureGrants).set({
+                    revokedTxHash: evidence.txHash, active: false, modifiedAt: changedAt, ...heightStamp(landed)
                 }).where({
                     contractAddress: command.contractAddress,
+                    attesterId: command.attesterId,
                     payloadHash: command.payloadHash,
                     grantee: command.grantee
-                }));
+                }), landed));
             }
-            // Same atomic generation binding as the executor (the gate at the
-            // top of the finalizer fast-fails digest-less commands).
+            // Atomic generation binding, as in the executor.
             const resolved = await contractResolver(
                 command.compiledArtifactRef,
                 (command as ContractCommandV1WithProvenance).artifactDigest);
-            await reindexAfterSubmit(command.contractAddress, resolved);
+            await reindexAfterSubmit(command.contractAddress, resolved, evidence.blockHeight ?? null, _job, command.compiledArtifactRef);
             return {
                 reconciled: true,
                 ...(isGrant ? { disclosureGrantId: command.disclosureGrantId, level: command.level } : {}),
@@ -1375,15 +1196,30 @@ export function registerSubmissionHandlers(
         }
         if (command.op === 'registerPassport') {
             return {
-                reconciled: true, passportId: command.passportId, ownerId: command.ownerId,
+                reconciled: true, passportId: command.passportId, documentId: command.passportId, ownerId: command.ownerId, mode: command.mode ?? 0,
+                contractAddress: command.contractAddress, txHash: evidence.txHash,
+                ...(command.sponsorSessionId ? { feeSponsor: command.sponsorSessionId } : {})
+            };
+        }
+        if (command.op === 'retract') {
+            if (command.mode === 0) {
+                // Same projection as the executor; idempotent.
+                const changedAt = new Date().toISOString();
+                const landed = evidence.blockHeight ?? null;
+                await db.run(notNewerThan(UPDATE.entity(DisclosureGrants).set({ active: false, revokedTxHash: evidence.txHash, modifiedAt: changedAt, ...heightStamp(landed) }).where({ contractAddress: command.contractAddress, attesterId: command.attesterId, payloadHash: command.key, active: true }), landed));
+                const resolved = await contractResolver(
+                    command.compiledArtifactRef,
+                    (command as ContractCommandV1WithProvenance).artifactDigest);
+                await reindexAfterSubmit(command.contractAddress, resolved, landed, _job, command.compiledArtifactRef);
+            }
+            return {
+                reconciled: true, mode: command.mode, key: command.key,
                 contractAddress: command.contractAddress, txHash: evidence.txHash,
                 ...(command.sponsorSessionId ? { feeSponsor: command.sponsorSessionId } : {})
             };
         }
         if (command.op === 'callBatch') {
-            // Rebuild the documented batch result from the encrypted command
-            // (the ordered circuits) + the durable evidence. Without this the
-            // generic recovery result would miss `circuits`.
+            // The generic recovery result would miss `circuits`.
             return {
                 reconciled: true,
                 submissionId: evidence.submissionId,
@@ -1397,12 +1233,10 @@ export function registerSubmissionHandlers(
         throw new Error(`Unsupported projection finalizer operation '${(command as any)?.op}'`);
     };
     registerBackgroundJobReconciliationFinalizer('anchorDocument', 1, finalizeContractProjection);
-    registerBackgroundJobReconciliationFinalizer('commitDocumentAnchor', 1, finalizeContractProjection);
-    registerBackgroundJobReconciliationFinalizer('anchorReveal', 1, finalizeContractProjection);
-    registerBackgroundJobReconciliationFinalizer('anchorCommit', 1, finalizeContractProjection);
     registerBackgroundJobReconciliationFinalizer('grantDisclosure', 1, finalizeContractProjection);
     registerBackgroundJobReconciliationFinalizer('revokeDisclosure', 1, finalizeContractProjection);
     registerBackgroundJobReconciliationFinalizer('registerPassport', 1, finalizeContractProjection);
+    registerBackgroundJobReconciliationFinalizer('retract', 1, finalizeContractProjection);
     registerBackgroundJobReconciliationFinalizer('submitContractCallBatch', 1, finalizeContractProjection);
     registerBackgroundJobReconciliationFinalizer('fieldPredicateBatchProof', 1, finalizeContractProjection);
 
@@ -1414,9 +1248,13 @@ export function registerSubmissionHandlers(
             idempotencyKey?: string;
             sponsorSessionId?: string;
         };
+        const recoveryId = typeof (req.data as any).recoveryId === 'string' && (req.data as any).recoveryId.length > 0
+            ? String((req.data as any).recoveryId).toLowerCase()
+            : undefined;
 
         if (!compiledArtifactRef) return req.reject(400, 'compiledArtifactRef is required');
         if (!sessionId) return req.reject(400, 'sessionId is required');
+        if (recoveryId !== undefined && !SHA256_HEX_RE.test(recoveryId)) return req.reject(400, 'recoveryId must be 64 hex chars (32 bytes)');
 
         if (rejectIfMainnetBlocked(req)) return;
         if (!checkRate(deployRateLimiter, sessionId, req)) return;
@@ -1427,9 +1265,6 @@ export function registerSubmissionHandlers(
             catch { return req.reject(400, 'initialPrivateState must be valid JSON'); }
         }
 
-        // Sync setup phase: setup errors become 404/401/501 via runSubmission.
-        // The SDK round-trip is deferred to the background job and surfaces
-        // failures via BackgroundJobs.errorCode/errorMessage, not OData status.
         return runSubmission(req, async () => {
             const facadeCfg = facadeConfigFromEnv();
             await ensureNetworkId(facadeCfg.networkId);
@@ -1441,15 +1276,16 @@ export function registerSubmissionHandlers(
                 kind: 'deployContract',
                 sessionId,
                 idempotencyKey,
-                request: { compiledArtifactRef, sessionId, hasInitialState: !!initialPrivateState, feeSponsor: sponsor?.sponsorSessionId ?? null },
+                request: { compiledArtifactRef, sessionId, hasInitialState: !!initialPrivateState, feeSponsor: sponsor?.sponsorSessionId ?? null, ...(recoveryId ? { recoveryId } : {}) },
                 idempotencyPayload: {
                     compiledArtifactRef, sessionId, initialPrivateState: parsedInitialState,
-                    feeSponsor: sponsor?.sponsorSessionId ?? null
+                    feeSponsor: sponsor?.sponsorSessionId ?? null, ...(recoveryId ? { recoveryId } : {})
                 },
                 requestedBy: (req as any).user?.id,
+                grantId: (req as any).agentGrant?.ID,
                 commandVersion: 1,
                 encryptCommand: true,
-                command: { op: 'deploy', compiledArtifactRef, initialPrivateState: parsedInitialState, sponsorSessionId: sponsor?.sponsorSessionId }
+                command: { op: 'deploy', compiledArtifactRef, initialPrivateState: parsedInitialState, sponsorSessionId: sponsor?.sponsorSessionId, ...(recoveryId ? { recoveryId } : {}) }
             });
         });
     });
@@ -1485,8 +1321,7 @@ export function registerSubmissionHandlers(
             }
         }
 
-        // Seeded only when the calling wallet has NO private state for this
-        // contract yet (it did not deploy it). Defaults to `{}` downstream.
+        // Used only when the wallet has no private state for this contract yet.
         let parsedInitialPrivateState: unknown;
         if (initialPrivateState) {
             try { parsedInitialPrivateState = JSON.parse(initialPrivateState); }
@@ -1498,9 +1333,6 @@ export function registerSubmissionHandlers(
             await ensureNetworkId(facadeCfg.networkId);
             const resolved = await contractResolver(compiledArtifactRef);
 
-            // Coerce args into the shapes the circuit requires (Bytes<N> →
-            // Uint8Array, Uint<N> → BigInt) before the worker spreads them.
-            // CoercionError → 400 via runSubmission. See arg-coercion.ts.
             const argTypes = argTypesLoader(resolved.zkConfigPath, circuit);
             const coercedArgs = coerceCircuitArgs(parsedArgs, argTypes);
 
@@ -1518,6 +1350,7 @@ export function registerSubmissionHandlers(
                     feeSponsor: sponsor?.sponsorSessionId ?? null
                 },
                 requestedBy: (req as any).user?.id,
+                grantId: (req as any).agentGrant?.ID,
                 commandVersion: 1,
                 encryptCommand: true,
                 command: { op: 'call', contractAddress, circuit, compiledArtifactRef, args: parsedArgs, initialPrivateState: parsedInitialPrivateState, sponsorSessionId: sponsor?.sponsorSessionId }
@@ -1525,10 +1358,8 @@ export function registerSubmissionHandlers(
         });
     });
 
-    // The bundled shielded-token fixture, as a first-class surface. It shipped
-    // compiled artifacts from 0.11.0 on, but using it meant a generic
-    // submitContractCall PLUS knowing the contract's domain separator to derive
-    // the token type by hand, which is the one piece a caller cannot guess.
+    // A generic call would leave the caller without the fixture's domain
+    // separator, which the token type derives from.
     srv.on('mintShieldedTestToken', async (req: Request) => {
         const { contractAddress, sessionId, compiledArtifactRef, idempotencyKey, sponsorSessionId } = req.data as {
             contractAddress?: string; sessionId?: string; compiledArtifactRef?: string;
@@ -1539,11 +1370,8 @@ export function registerSubmissionHandlers(
         if (rejectIfMainnetBlocked(req)) return;
         if (!checkRate(callRateLimiter, sessionId, req)) return;
 
-        // The processor enriches the result with the FIXTURE's domain separator
-        // and mint amount, so a foreign minting contract would execute fine and
-        // then be reported with a WRONG tokenTypeHex. Only the bundled fixture
-        // (or an explicit repeat of its name) is accepted; other contracts go
-        // through submitContractCall + deriveTokenType with their own separator.
+        // The result uses the fixture's separator and amount, so a foreign
+        // contract would be reported with a wrong tokenTypeHex.
         if (compiledArtifactRef && compiledArtifactRef !== SHIELDED_TEST_TOKEN_REF) {
             return req.reject(400,
                 `mintShieldedTestToken only mints the bundled '${SHIELDED_TEST_TOKEN_REF}' fixture; `
@@ -1564,10 +1392,10 @@ export function registerSubmissionHandlers(
                 idempotencyKey,
                 request: { contractAddress, compiledArtifactRef: artifactRef, sessionId, feeSponsor: sponsor?.sponsorSessionId ?? null },
                 requestedBy: (req as any).user?.id,
+                grantId: (req as any).agentGrant?.ID,
                 commandVersion: 1,
                 encryptCommand: true,
-                // mint() takes no arguments; the contract's own round counter
-                // feeds the coin nonce, so repeat calls mint distinct coins.
+                // The contract's round counter feeds the nonce: repeat calls mint distinct coins.
                 command: {
                     op: 'call', contractAddress, circuit: SHIELDED_TEST_TOKEN_CIRCUIT,
                     compiledArtifactRef: artifactRef, args: [],
@@ -1577,9 +1405,7 @@ export function registerSubmissionHandlers(
         });
     });
 
-    // Compute-only: no wallet, no chain, no proving. Deliberately NOT
-    // restricted to the bundled token; any minting contract's token type is
-    // derived the same way.
+    // Compute-only; not restricted to the bundled token.
     srv.on('deriveTokenType', async (req: Request) => {
         const { contractAddress, domainSeparator } = req.data as {
             contractAddress?: string; domainSeparator?: string;
@@ -1593,11 +1419,8 @@ export function registerSubmissionHandlers(
         }
     });
 
-    // Cross-server sponsoring PHASE 1 (0.17.0). Build + sign + finalize a call
-    // under the caller's identity; returns the fee-unpaid tx as base64 (poll
-    // getJobStatus). The caller then ships those bytes to a sponsor endpoint.
-    // (Server-side variant; the txbuilder SDK runs this on the caller's own
-    // machine so its key never leaves it.)
+    // Sponsoring phase 1, server-side: build, sign and finalize under the
+    // caller's identity; the job result is the fee-unpaid tx.
     srv.on('buildSponsorable', async (req: Request) => {
         const { contractAddress, circuit, compiledArtifactRef, sessionId, args } = req.data as {
             contractAddress?: string; circuit?: string; compiledArtifactRef?: string; sessionId?: string; args?: string;
@@ -1621,24 +1444,20 @@ export function registerSubmissionHandlers(
             return startJob({
                 kind: 'buildSponsorableTx', sessionId,
                 request: { contractAddress, circuit, compiledArtifactRef, sessionId },
-                requestedBy: (req as any).user?.id, commandVersion: 1, encryptCommand: true,
+                requestedBy: (req as any).user?.id,
+                grantId: (req as any).agentGrant?.ID, commandVersion: 1, encryptCommand: true,
                 command: { op: 'buildSponsorable', contractAddress, circuit, compiledArtifactRef, args: parsedArgs }
             });
         });
     });
 
-    // Cross-server sponsoring PHASE 2 (0.17.0). Take a caller-finalized,
-    // fee-unpaid tx (base64), enforce policy (allowed vault + circuits), pay
-    // dust with the sponsor session and submit. This is the half a public /
-    // x402-metered endpoint exposes.
+    // Sponsoring phase 2: policy check, dust from the sponsor, submit.
     srv.on('sponsorFinalizedTransaction', async (req: Request) => {
         const { finalizedTxB64, sponsorSessionId, idempotencyKey } = req.data as {
             finalizedTxB64?: string; sponsorSessionId?: string; idempotencyKey?: string;
         };
         if (!finalizedTxB64) return req.reject(400, 'finalizedTxB64 is required');
-        // The platform-pool sentinel (or an omitted sponsor with a configured
-        // pool) defers the concrete choice to execution time, which is what
-        // enables failover; an explicit session id stays exact.
+        // The pool sentinel defers the concrete sponsor to execution (failover).
         const pool = getConfiguredFeeSponsorSessions(getNightgatePluginConfig());
         let effectiveSponsor = sponsorSessionId;
         if (!effectiveSponsor || effectiveSponsor === PLATFORM_POOL_SENTINEL) {
@@ -1653,56 +1472,42 @@ export function registerSubmissionHandlers(
         return runSubmission(req, async () => {
             const facadeCfg = facadeConfigFromEnv();
             await ensureNetworkId(facadeCfg.networkId);
-            // Explicit sponsor: validate at admission, fail fast. POOL jobs
-            // validate NOTHING here: the pool is operator config, a broken
-            // first entry must not block admission (the processor resolves per
-            // candidate with failover), and the job key must be STABLE for
-            // idempotency, so pool jobs are keyed under the sentinel itself
-            // rather than under whichever member happened to be free.
+            // Explicit sponsor: row-level check only (the slow facade restore is the
+            // executor's). Pool jobs check nothing and key under the sentinel, so a
+            // broken member cannot block admission and the idempotency key is stable.
             if (effectiveSponsor !== PLATFORM_POOL_SENTINEL) {
-                // Row-level validation only (ownership, signing key): the facade
-                // restore can take minutes and does not belong under the request
-                // transaction; the executor ensures the facade.
                 await resolveFeeSponsor({ db, sponsorSessionId: effectiveSponsor, requestingUserId: (req as any).user?.id, config: getNightgatePluginConfig() });
             }
-            // Allow-list: platform floor (env or NIGHTGATE_SPONSOR_POLICY_FILE) narrowed by
-            // the agent grant's lists when the request carries a token; empty floor = allow any (dev).
-            // Refused at admission, before a job exists: empty intersection or unusable policy file.
+            // Floor narrowed by the grant; an empty intersection or unusable policy
+            // file refuses before a job exists.
             const { allowedContracts, allowedCircuits, allowDeploy, ownContracts, allowedTokenTypes } = resolveSponsorPolicyForRequest(req);
-            // Grant behind a token request; a sponsored deploy's address is recorded onto it.
+            // A sponsored deploy's address is recorded onto this grant.
             const grantId: string | undefined = (req as any).agentGrant?.ID ? String((req as any).agentGrant.ID) : undefined;
-            // Idempotency scope: pool jobs share ONE sessionId (the sentinel)
-            // and platform sponsors are shared across callers, so a raw key
-            // would put every caller into one global namespace (user A's key
-            // could dedupe or block user B's). Scope the key per caller.
+            // Per-caller key: sponsors are shared, so a raw key would let one
+            // caller's key dedupe or block another's.
             const caller = String((req as any).user?.id ?? 'anonymous');
             const scopedIdempotencyKey = idempotencyKey
                 ? bytesToHex(sha256(Buffer.from(`${caller}\u0000${idempotencyKey}`, 'utf8')))
                 : undefined;
             const job = await startJob({
                 kind: 'sponsorFinalizedTransaction', sessionId: effectiveSponsor, idempotencyKey: scopedIdempotencyKey,
-                // Fingerprint the tx CONTENT, not its length: two different
-                // transactions of equal size under one idempotencyKey would
-                // otherwise dedupe onto each other and the second caller would
-                // be handed the first one's job.
+                // Fingerprint the content: equal-size txs under one key must not dedupe.
                 request: {
                     feeSponsor: effectiveSponsor,
                     caller,
                     bytes: finalizedTxB64.length,
                     txHash: bytesToHex(sha256(Buffer.from(finalizedTxB64, 'base64')))
                 },
-                requestedBy: (req as any).user?.id, commandVersion: 1, encryptCommand: true,
+                requestedBy: (req as any).user?.id,
+                grantId: (req as any).agentGrant?.ID, commandVersion: 1, encryptCommand: true,
                 command: { op: 'sponsorFinalized', finalizedTxB64, sponsorSessionId: effectiveSponsor, allowedContracts, allowedCircuits, allowDeploy, ownContracts, allowedTokenTypes, grantId }
             });
-            // The job is keyed by the SPONSOR session (or the pool sentinel),
-            // which an agent-grant caller may not know. Return it so the
-            // caller can poll getJobStatus without guessing.
+            // Keyed by the sponsor session, which the caller needs to poll.
             return { ...job, sessionId: effectiveSponsor };
         });
     });
 
-    // 0.18 PARALLEL channel. Mirrors sponsorFinalizedTransaction but takes an
-    // UNBOUND caller tx; the processor uses per-note locking for parallelism.
+    // As sponsorFinalizedTransaction, for an unbound caller tx.
     srv.on('sponsorUnboundTransaction', async (req: Request) => {
         const { unboundTxB64, sponsorSessionId, idempotencyKey } = req.data as {
             unboundTxB64?: string; sponsorSessionId?: string; idempotencyKey?: string;
@@ -1721,14 +1526,9 @@ export function registerSubmissionHandlers(
             const facadeCfg = facadeConfigFromEnv();
             await ensureNetworkId(facadeCfg.networkId);
             if (effectiveSponsor !== PLATFORM_POOL_SENTINEL) {
-                // Row-level validation only (ownership, signing key): the facade
-                // restore can take minutes and does not belong under the request
-                // transaction; the executor ensures the facade.
                 await resolveFeeSponsor({ db, sponsorSessionId: effectiveSponsor, requestingUserId: (req as any).user?.id, config: getNightgatePluginConfig() });
             }
-            // Floor narrowed by the agent grant; see sponsorFinalizedTransaction above.
             const { allowedContracts, allowedCircuits, allowDeploy, ownContracts, allowedTokenTypes } = resolveSponsorPolicyForRequest(req);
-            // Grant behind a token request; a sponsored deploy's address is recorded onto it.
             const grantId: string | undefined = (req as any).agentGrant?.ID ? String((req as any).agentGrant.ID) : undefined;
             const caller = String((req as any).user?.id ?? 'anonymous');
             const scopedIdempotencyKey = idempotencyKey
@@ -1741,7 +1541,8 @@ export function registerSubmissionHandlers(
                     bytes: unboundTxB64.length,
                     txHash: bytesToHex(sha256(Buffer.from(unboundTxB64, 'base64')))
                 },
-                requestedBy: (req as any).user?.id, commandVersion: 1, encryptCommand: true,
+                requestedBy: (req as any).user?.id,
+                grantId: (req as any).agentGrant?.ID, commandVersion: 1, encryptCommand: true,
                 command: { op: 'sponsorUnbound', unboundTxB64, sponsorSessionId: effectiveSponsor, allowedContracts, allowedCircuits, allowDeploy, ownContracts, allowedTokenTypes, grantId }
             });
             return { ...job, sessionId: effectiveSponsor };
@@ -1768,12 +1569,9 @@ export function registerSubmissionHandlers(
         if (rejectIfMainnetBlocked(req)) return;
         if (!checkRate(callRateLimiter, sessionId, req)) return;
 
-        // `calls` is a JSON array of { circuit, args } executed IN ORDER inside
-        // one transaction. Bounded: each call carries a ZK proof, so a huge
-        // scope is slow to prove, and a single rejected call discards the
-        // whole scope pre-submission (post-submission the fallible phase can
-        // still finalize PARTIAL_SUCCESS; see the action doc).
-        const { depth: rawBatchDepth } = vaultDims(compiledArtifactRef);
+        // Bounded: each call carries a proof, and one rejected call discards the
+        // whole scope before submission.
+        const { depth: rawBatchDepth, width: rawBatchWidth } = vaultDims(compiledArtifactRef);
         let parsedCalls: Array<{ circuit: string; args: unknown[]; merkleProof?: MerkleProofBundle }>;
         try {
             const v = JSON.parse(calls);
@@ -1786,13 +1584,20 @@ export function registerSubmissionHandlers(
                 if (entry.args !== undefined && !Array.isArray(entry.args)) {
                     throw new Error(`calls[${i}].args must be an array`);
                 }
-                // Optional per-call witness proof bundle (field-bound proof
-                // circuits). Validated here so a malformed proof is a 400,
-                // not a failed job at witness-invocation time. `fieldValue`
-                // feeds proveFieldPredicate, `fieldDigest`/`setProof` feed
-                // proveFieldMembership; proveFieldEquality needs the path only.
+                // Validated here so a malformed proof is a 400, not a failed job.
                 let merkleProof: MerkleProofBundle | undefined;
-                if (entry.merkleProof !== undefined) {
+                if (entry.merkleProof !== undefined && entry.merkleProof?.docPair !== undefined) {
+                    // Cross-root witnesses: no inclusion path.
+                    const dp = entry.merkleProof.docPair;
+                    if (!dp || typeof dp !== 'object') throw new Error(`calls[${i}].merkleProof.docPair must be an object`);
+                    merkleProof = {
+                        docPair: {
+                            schema: validateSchemaSlots(dp.schema, `calls[${i}].merkleProof.docPair.schema`, rawBatchWidth),
+                            openingA: validateOpening(dp.openingA, `calls[${i}].merkleProof.docPair.openingA`, rawBatchWidth),
+                            openingB: validateOpening(dp.openingB, `calls[${i}].merkleProof.docPair.openingB`, rawBatchWidth)
+                        }
+                    };
+                } else if (entry.merkleProof !== undefined) {
                     const mp = entry.merkleProof;
                     if (!mp || typeof mp !== 'object') throw new Error(`calls[${i}].merkleProof must be an object`);
                     let fieldValueStr: string | undefined;
@@ -1808,6 +1613,13 @@ export function registerSubmissionHandlers(
                             throw new Error(`calls[${i}].merkleProof.fieldDigest must be 64 hex chars (32 bytes)`);
                         }
                         fieldDigest = mp.fieldDigest.toLowerCase();
+                    }
+                    let fieldSalt: string | undefined;
+                    if (mp.fieldSalt !== undefined) {
+                        if (typeof mp.fieldSalt !== 'string' || !SHA256_HEX_RE.test(mp.fieldSalt)) {
+                            throw new Error(`calls[${i}].merkleProof.fieldSalt must be 64 hex chars (32 bytes)`);
+                        }
+                        fieldSalt = mp.fieldSalt.toLowerCase();
                     }
                     if (!Array.isArray(mp.siblings) || mp.siblings.length !== rawBatchDepth) {
                         throw new Error(`calls[${i}].merkleProof.siblings must be a JSON array of ${rawBatchDepth} hashes`);
@@ -1842,6 +1654,7 @@ export function registerSubmissionHandlers(
                     merkleProof = {
                         ...(fieldValueStr !== undefined ? { fieldValue: fieldValueStr } : {}),
                         ...(fieldDigest !== undefined ? { fieldDigest } : {}),
+                        ...(fieldSalt !== undefined ? { fieldSalt } : {}),
                         siblings: mp.siblings.map((s: string) => s.toLowerCase()),
                         dirs: mp.dirs as boolean[],
                         ...(setProof ? { setProof } : {})
@@ -1886,6 +1699,7 @@ export function registerSubmissionHandlers(
                     feeSponsor: sponsor?.sponsorSessionId ?? null
                 },
                 requestedBy: (req as any).user?.id,
+                grantId: (req as any).agentGrant?.ID,
                 commandVersion: 1,
                 encryptCommand: true,
                 command: { op: 'callBatch', contractAddress, calls: parsedCalls, compiledArtifactRef, initialPrivateState: parsedInitialPrivateState, sponsorSessionId: sponsor?.sponsorSessionId, ...(independentCalls === true ? { independentCalls: true } : {}) }
@@ -1905,8 +1719,6 @@ export function registerSubmissionHandlers(
             compiledArtifactRef?: string;
             idempotencyKey?: string;
             sponsorSessionId?: string;
-            nonce?: string;
-            guarded?: boolean;
         };
 
         if (!data.sha256) return req.reject(400, 'sha256 is required');
@@ -1915,14 +1727,6 @@ export function registerSubmissionHandlers(
         if (!data.contractAddress) return req.reject(400, 'contractAddress is required');
         if (!SHA256_HEX_RE.test(data.sha256)) {
             return req.reject(400, 'sha256 must be 64 hex chars (32 bytes)');
-        }
-        // Guarded reveal: with a nonce the anchor runs attestGuarded mode 1
-        // against the previously committed
-        // persistentHash(payload, metadataHash, nonce) (see
-        // prepareAnchorCommitment / commitDocumentAnchor). Front-run recovery:
-        // a plain attest that landed AFTER the commit is taken over.
-        if (data.nonce !== undefined && !SHA256_HEX_RE.test(data.nonce)) {
-            return req.reject(400, 'nonce must be 64 hex chars (32 bytes; from prepareAnchorCommitment)');
         }
 
         const metadataStr = data.metadata ?? '';
@@ -1933,19 +1737,14 @@ export function registerSubmissionHandlers(
         if (rejectIfMainnetBlocked(req)) return;
         if (!checkRate(anchorRateLimiter, data.sessionId, req)) return;
 
-        // On-chain inputs: payload_hash (caller's sha256) + metadata_hash (of the
-        // public metadata blob). Both 32-byte commitments; bytes live off-chain
-        // at `storageRef`.
         const metadataHashBytes = sha256(new TextEncoder().encode(metadataStr));
 
-        // Insert the Documents row up-front so its ID is stable and queryable
-        // while the on-chain anchoring is deferred to the background job. Gives
-        // clients a stable handle without polling.
+
+        // Row first, so the document id is stable before the job runs.
         const documentId = cds.utils.uuid();
         const insertedAt = new Date().toISOString();
-        // Anchoring context is persisted WITH the row (owner, vault, network,
-        // artifact): verifyDocument only trusts this recorded binding, never
-        // caller-supplied coordinates, and reads are owner-scoped.
+        // verifyDocument trusts only this recorded binding (owner, vault,
+        // network, artifact), never caller-supplied coordinates.
         const networkId = recordedNetworkId();
         await db.run(INSERT.into(Documents).entries({
             ID: documentId,
@@ -1965,8 +1764,6 @@ export function registerSubmissionHandlers(
             modifiedAt: insertedAt
         }));
 
-        // Sync setup (errors → 404/401/501 via runSubmission); SDK round-trip +
-        // Documents UPDATE run in the background job.
         return runSubmission(req, async () => {
             const facadeCfg = facadeConfigFromEnv();
             await ensureNetworkId(facadeCfg.networkId);
@@ -1974,139 +1771,40 @@ export function registerSubmissionHandlers(
             await walletFactory({ sessionId: data.sessionId!, db, facadeConfig: facadeCfg, expectedUserId: (req as any).user?.id });
             const sponsor = await resolveSponsorForRequest(req, data.sponsorSessionId);
 
-            // Three lanes. With `nonce`: the caller ran commit (commitDocumentAnchor)
-            // and this is the REVEAL. `guarded: false`: one plain attest (the
-            // payload hash is visible in the mempool before it is owned; only
-            // for hashes that are public anyway). Default: commit + reveal as
-            // one workflow with a server-side nonce, so the hash is never
-            // exposed before its commitment is on chain and the attestation is
-            // final on arrival (lineage 3).
-            const lane = data.nonce ? 'reveal' : (data.guarded === false ? 'plain' : 'guarded');
-            const guardedNonce = lane === 'guarded' ? randomBytes(32).toString('hex') : (lane === 'reveal' ? data.nonce!.toLowerCase() : undefined);
-            const expiresAt = lane === 'guarded' ? defaultCommitExpiry() : undefined;
+            // The record is keyed by the session's attester id and the hash, so a
+            // plain attest cannot be pre-empted by another identity.
+            const attesterId = await attesterIdResolver({ sessionId: data.sessionId!, db, expectedUserId: (req as any).user?.id });
+            await db.run(UPDATE.entity(Documents).set({ attesterId }).where({ ID: documentId }));
             const job = await startJob({
-                kind: lane === 'guarded' ? 'anchorDocumentGuarded' : 'anchorDocument',
+                kind: 'anchorDocument',
                 sessionId: data.sessionId!,
                 idempotencyKey: data.idempotencyKey,
                 request: {
                     sha256: data.sha256!.toLowerCase(),
+                    attesterId,
                     contractAddress: data.contractAddress,
                     compiledRef,
                     documentId,
-                    lane,
                     feeSponsor: sponsor?.sponsorSessionId ?? null
                 },
-                // The server-side nonce is random per request and stays out of the
-                // idempotency payload: a retry under the same key must dedupe.
                 idempotencyPayload: {
                     sha256: data.sha256!.toLowerCase(), contractAddress: data.contractAddress,
-                    compiledRef, metadata: metadataStr, feeSponsor: sponsor?.sponsorSessionId ?? null,
-                    lane, guardedNonce: lane === 'reveal' ? guardedNonce : null
+                    compiledRef, metadata: metadataStr, feeSponsor: sponsor?.sponsorSessionId ?? null
                 },
                 requestedBy: (req as any).user?.id,
+                grantId: (req as any).agentGrant?.ID,
                 commandVersion: 1,
                 encryptCommand: true,
-                command: lane === 'guarded'
-                    ? {
-                        op: 'anchorGuardedWorkflow', documentId, payloadHash: data.sha256!.toLowerCase(),
-                        metadataHash: bytesToHex(metadataHashBytes), nonce: guardedNonce!, expiresAt: expiresAt!,
-                        contractAddress: data.contractAddress!, compiledArtifactRef: compiledRef, sponsorSessionId: sponsor?.sponsorSessionId
-                    }
-                    : {
-                        op: 'anchorDocument', documentId, payloadHash: data.sha256!.toLowerCase(),
-                        metadataHash: bytesToHex(metadataHashBytes), contractAddress: data.contractAddress!,
-                        compiledArtifactRef: compiledRef, sponsorSessionId: sponsor?.sponsorSessionId,
-                        guardedNonce
-                    }
+                command: {
+                    op: 'anchorDocument', documentId, payloadHash: data.sha256!.toLowerCase(),
+                    metadataHash: bytesToHex(metadataHashBytes), attesterId, contractAddress: data.contractAddress!,
+                    compiledArtifactRef: compiledRef, sponsorSessionId: sponsor?.sponsorSessionId
+                }
             });
 
             if (job.deduplicated) await db.run(DELETE.from(Documents).where({ ID: documentId }));
             const stableDocumentId = (job.originalRequest as any)?.documentId ?? documentId;
-            return { jobId: job.jobId, status: job.status, documentId: stableDocumentId };
-        });
-    });
-
-    // Guarded attest, phase 0 (compute-only): the commitment + nonce for a
-    // commit-reveal anchor. The commitment is
-    // persistentHash(AttestCommitPreimage{sha256, metadataHash, nonce}),
-    // byte-identical to attestGuarded's in-circuit recompute. STORE the
-    // nonce: it is required at reveal time (anchorDocument with `nonce`) and
-    // must stay secret until then (it is what a front-runner cannot forge).
-    srv.on('prepareAnchorCommitment', async (req: Request) => {
-        const data = req.data as { sha256?: string; metadata?: string; nonce?: string };
-        if (!data.sha256) return req.reject(400, 'sha256 is required');
-        if (!SHA256_HEX_RE.test(data.sha256)) return req.reject(400, 'sha256 must be 64 hex chars (32 bytes)');
-        if (data.nonce !== undefined && !SHA256_HEX_RE.test(data.nonce)) {
-            return req.reject(400, 'nonce must be 64 hex chars (32 bytes)');
-        }
-        const metadataStr = data.metadata ?? '';
-        const metadataHash = bytesToHex(sha256(new TextEncoder().encode(metadataStr)));
-        const nonce = data.nonce?.toLowerCase() ?? randomBytes(32).toString('hex');
-        const commitment = await computeAttestCommitment(data.sha256.toLowerCase(), metadataHash, nonce);
-        return { commitment, nonce, metadataHash, expiresAt: defaultCommitExpiry() };
-    });
-
-    // Guarded attest, phase 1 (async submit): record the opaque commitment
-    // on-chain (attestGuarded mode 0). Nothing about the payload leaks; a
-    // mempool observer sees only the hash. After the commit finalizes, run
-    // `anchorDocument` WITH the nonce (phase 2, reveal): a plain attest that
-    // front-ran the reveal is taken over because its sequence number is
-    // newer than the commitment's.
-    srv.on('commitDocumentAnchor', async (req: Request) => {
-        const data = req.data as {
-            commitment?: string;
-            sessionId?: string;
-            contractAddress?: string;
-            compiledArtifactRef?: string;
-            idempotencyKey?: string;
-            sponsorSessionId?: string;
-            expiresAt?: number | string;
-        };
-        if (!data.commitment) return req.reject(400, 'commitment is required (from prepareAnchorCommitment)');
-        if (!SHA256_HEX_RE.test(data.commitment)) return req.reject(400, 'commitment must be 64 hex chars (32 bytes)');
-        const expiresAt = data.expiresAt === undefined || data.expiresAt === null || data.expiresAt === '' ? defaultCommitExpiry() : Number(data.expiresAt);
-        const expiryError = validateCommitExpiry(expiresAt);
-        if (expiryError) return req.reject(400, expiryError);
-        if (!data.sessionId) return req.reject(400, 'sessionId is required');
-        if (!data.contractAddress) return req.reject(400, 'contractAddress is required');
-        const compiledRef = data.compiledArtifactRef && data.compiledArtifactRef.length > 0
-            ? data.compiledArtifactRef
-            : DEFAULT_ATTESTATION_VAULT_REF;
-        if (rejectIfMainnetBlocked(req)) return;
-        if (!checkRate(anchorRateLimiter, data.sessionId, req)) return;
-
-        return runSubmission(req, async () => {
-            const facadeCfg = facadeConfigFromEnv();
-            await ensureNetworkId(facadeCfg.networkId);
-            await contractResolver(compiledRef);
-            await walletFactory({ sessionId: data.sessionId!, db, facadeConfig: facadeCfg, expectedUserId: (req as any).user?.id });
-            const sponsor = await resolveSponsorForRequest(req, data.sponsorSessionId);
-
-            const job = await startJob({
-                kind: 'commitDocumentAnchor',
-                sessionId: data.sessionId!,
-                idempotencyKey: data.idempotencyKey,
-                request: {
-                    commitment: data.commitment!.toLowerCase(),
-                    contractAddress: data.contractAddress,
-                    compiledRef,
-                    expiresAt,
-                    feeSponsor: sponsor?.sponsorSessionId ?? null
-                },
-                idempotencyPayload: {
-                    commitment: data.commitment!.toLowerCase(), contractAddress: data.contractAddress,
-                    compiledRef, expiresAt, feeSponsor: sponsor?.sponsorSessionId ?? null
-                },
-                requestedBy: (req as any).user?.id,
-                commandVersion: 1,
-                encryptCommand: true,
-                command: {
-                    op: 'attestCommit', commitment: data.commitment!.toLowerCase(), expiresAt,
-                    contractAddress: data.contractAddress!, compiledArtifactRef: compiledRef,
-                    sponsorSessionId: sponsor?.sponsorSessionId
-                }
-            });
-            return { jobId: job.jobId, status: job.status };
+            return { jobId: job.jobId, status: job.status, documentId: stableDocumentId, attesterId };
         });
     });
 
@@ -2129,13 +1827,9 @@ export function registerSubmissionHandlers(
         );
         if (!doc) return req.reject(404, `Document ${documentId} not found`);
 
-        // Evidence binding: the row records its anchoring context (vault,
-        // artifact, network) and those recorded coordinates are
-        // authoritative. Caller-supplied values may only CONFIRM them; a
-        // different one is rejected, otherwise any other vault (or another
-        // artifact generation) attesting the same public hash could make
-        // this document appear verified. Rows from pre-0.16.0 releases carry
-        // nulls; only for those do the caller's values apply.
+        // Recorded coordinates are authoritative and caller values may only
+        // confirm them: another vault attesting the same public hash must not
+        // verify this document. Rows without them take the caller's values.
         const recordedContract: string | null = doc.contractAddress ?? null;
         if (recordedContract && contractAddress
             && contractAddress.toLowerCase() !== recordedContract.toLowerCase()) {
@@ -2147,8 +1841,7 @@ export function registerSubmissionHandlers(
             return req.reject(400, 'compiledArtifactRef does not match the artifact this document was anchored with');
         }
         const effectiveArtifact = recordedArtifact ?? compiledArtifactRef;
-        // Recorded network: the state fallback reads THAT chain's indexer,
-        // never silently the currently configured one.
+        // Read the recorded network's indexer, never silently the configured one.
         const recordedNetwork = doc.network && (VALID_NIGHTGATE_NETWORKS as readonly string[]).includes(doc.network)
             ? doc.network as NightgateNetwork
             : undefined;
@@ -2156,10 +1849,12 @@ export function registerSubmissionHandlers(
         const hashMatches = doc.sha256?.toLowerCase() === providedSha256.toLowerCase();
         const anchoredOk = Boolean(doc.anchoredTxHash);
 
-        // Only resolve the on-chain status if we have a txHash and the hash
-        // matched. Skipping the SELECT in the mismatch path saves one DB
-        // round-trip on what is the "tampered" answer most of the time.
-        let chainSuccess = false;
+        // `included` = indexed inclusion of the anchoring tx; `current` = live
+        // state, which a retract can have changed since. The verdict needs the
+        // live read: an indexed inclusion alone never says the record still stands.
+        let included = false;
+        let stateChecked = false;
+        let current = false;
         if (anchoredOk && hashMatches) {
             const txRow: any = await db.run(
                 SELECT.one.from(Transactions)
@@ -2172,22 +1867,21 @@ export function registerSubmissionHandlers(
                         .columns('status', 'outcomeSource')
                         .where({ transaction_ID: txRow.ID })
                 );
-                chainSuccess = result?.status === 'SUCCESS'
+                included = result?.status === 'SUCCESS'
                     && result?.outcomeSource === 'substrate-system-events';
-            } else if (effectiveContract && liveProviderConfigured(recordedNetwork)) {
-                // Crawler-free fallback (anchoring tx not indexed locally): confirm
-                // the effect against live state. The document's sha256 is its
-                // on-chain payload_hash, so a present attestation IS the proof.
-                // Runs against the RECORDED anchoring vault, artifact and
-                // network whenever the row carries them (evidence binding).
-                chainSuccess = await verifyDocumentViaState(
-                    effectiveContract, doc.sha256, effectiveArtifact, recordedNetwork,
+            }
+            if (effectiveContract && doc.attesterId && liveProviderConfigured(recordedNetwork)) {
+                stateChecked = true;
+                current = await verifyDocumentViaState(
+                    effectiveContract, doc.attesterId, doc.sha256, effectiveArtifact, recordedNetwork,
                     doc.artifactDigest ?? null);
             }
         }
 
         return {
-            verified: hashMatches && anchoredOk && chainSuccess,
+            verified: hashMatches && anchoredOk && stateChecked && current,
+            included,
+            stateChecked,
             anchoredTxHash: doc.anchoredTxHash ?? '',
             anchoredAt: doc.anchoredAt ?? null,
             originalSha256: doc.sha256 ?? ''
@@ -2196,7 +1890,8 @@ export function registerSubmissionHandlers(
 
     srv.on('issueFieldPredicateAttestation', async (req: Request) => {
         const data = req.data as {
-            payloadHash?: string;
+            validUntil?: number | string;
+            payloadHash?: string; attesterId?: string;
             fieldKey?: string;
             value?: string;
             fieldSalt?: string;
@@ -2213,8 +1908,12 @@ export function registerSubmissionHandlers(
             sponsorSessionId?: string;
         };
 
+        const { validUntil: validUntilArg, error: validUntilError } = parseValidUntil(data.validUntil);
+        if (validUntilError) return req.reject(400, validUntilError);
+
         if (!data.payloadHash) return req.reject(400, 'payloadHash is required');
         if (!SHA256_HEX_RE.test(data.payloadHash)) return req.reject(400, 'payloadHash must be 64 hex chars (32 bytes)');
+        if (data.attesterId && !SHA256_HEX_RE.test(data.attesterId)) return req.reject(400, 'attesterId must be 64 hex chars (32 bytes)');
         if (!data.fieldKey) return req.reject(400, 'fieldKey is required');
         if (!SHA256_HEX_RE.test(data.fieldKey)) return req.reject(400, 'fieldKey must be 64 hex chars (32 bytes)');
         if (data.value === undefined || data.value === null || data.value === '') {
@@ -2232,7 +1931,7 @@ export function registerSubmissionHandlers(
         let thresholdBig: bigint;
         try { thresholdBig = BigInt(data.threshold); } catch { return req.reject(400, 'threshold must be an integer'); }
         if (thresholdBig < 0n) return req.reject(400, 'threshold must be a non-negative integer');
-        if (thresholdBig > UINT64_MAX) return req.reject(400, 'threshold exceeds Uint<64>');
+        if (thresholdBig > INT64_MAX) return req.reject(400, 'threshold exceeds the recorded range (at most 9223372036854775807)');
 
         const parsedPredicate = parsePredicate(data.predicate);
         if (!parsedPredicate || parsedPredicate.kind !== 'numeric') {
@@ -2240,8 +1939,6 @@ export function registerSubmissionHandlers(
         }
         const op = parsedPredicate.opCode!;
 
-        // Parse + validate the inclusion path (depth = log2 of the artifact's
-        // slot width: 4 for the classic vault, 5 for attestation-vault-32).
         const { depth } = vaultDims(data.compiledArtifactRef);
         let siblings: string[];
         let dirs: boolean[];
@@ -2253,8 +1950,7 @@ export function registerSubmissionHandlers(
             if (typeof s !== 'string' || !SHA256_HEX_RE.test(s)) return req.reject(400, 'each sibling must be 64 hex chars (32 bytes)');
         }
         for (const d of dirs) {
-            // Strict booleans: map(Boolean) would turn "false" into true and
-            // silently corrupt the Merkle path.
+            // Strict: Boolean("false") is true and would corrupt the path.
             if (typeof d !== 'boolean') return req.reject(400, 'dirsJson entries must be booleans');
         }
         const dirsBool = dirs as boolean[];
@@ -2278,19 +1974,21 @@ export function registerSubmissionHandlers(
         if (rejectIfMainnetBlocked(req)) return;
         if (!checkRate(predicateRateLimiter, data.sessionId, req)) return;
 
-        // Row up-front (same shape as issuePredicateAttestation; field-agnostic).
+        // Row up-front, before the job exists.
+        const attesterId = await resolveAttester(req, data.sessionId, data.attesterId, Boolean(data.contentRoot));
+        if (!attesterId) return;
         const predicateAttestationId = cds.utils.uuid();
         const insertedAt = new Date().toISOString();
         await db.run(INSERT.into(PredicateAttestations).entries({
             ID: predicateAttestationId,
             payloadHash: data.payloadHash.toLowerCase(),
+            attesterId,
             contractAddress: data.contractAddress,
             predicate: data.predicate,
             op,
             threshold: data.threshold as any,
             unit: data.unit ?? null,
-            // Field-bound proof: record the field key so verifyPredicateAttestation's
-            // crawler-free fallback can recompute the FieldPredicateClaim key.
+            // Lets the crawler-free verify path recompute the claim key.
             fieldKey: data.fieldKey.toLowerCase(),
             network: recordedNetworkId(),
             compiledArtifactRef: compiledRef,
@@ -2314,6 +2012,7 @@ export function registerSubmissionHandlers(
                 idempotencyKey: data.idempotencyKey,
                 request: {
                     payloadHash: data.payloadHash!.toLowerCase(),
+                    attesterId,
                     fieldKey: data.fieldKey!.toLowerCase(),
                     contractAddress: data.contractAddress,
                     predicate: data.predicate,
@@ -2322,18 +2021,19 @@ export function registerSubmissionHandlers(
                     feeSponsor: sponsor?.sponsorSessionId ?? null
                 },
                 idempotencyPayload: {
-                    payloadHash: data.payloadHash!.toLowerCase(), fieldKey: data.fieldKey!.toLowerCase(),
+                    payloadHash: data.payloadHash!.toLowerCase(), attesterId, fieldKey: data.fieldKey!.toLowerCase(),
                     contractAddress: data.contractAddress, predicate: data.predicate,
                     threshold: String(data.threshold), value: data.value, fieldSalt: data.fieldSalt,
                     contentRoot: data.contentRoot, schemaId: data.schemaId, siblingsJson: data.siblingsJson, dirsJson: data.dirsJson,
                     feeSponsor: sponsor?.sponsorSessionId ?? null
                 },
                 requestedBy: (req as any).user?.id,
+                grantId: (req as any).agentGrant?.ID,
                 commandVersion: 1,
                 encryptCommand: true,
                 command: {
-                    op: 'fieldPredicateWorkflow', predicateAttestationId,
-                    payloadHash: data.payloadHash!.toLowerCase(), fieldKey: data.fieldKey!.toLowerCase(),
+                    op: 'fieldPredicateWorkflow', predicateAttestationId, validUntil: validUntilArg,
+                    payloadHash: data.payloadHash!.toLowerCase(), attesterId, fieldKey: data.fieldKey!.toLowerCase(),
                     contractAddress: data.contractAddress!, compiledArtifactRef: compiledRef,
                     predicate: data.predicate!, threshold: thresholdBig.toString(), opCode: op,
                     unit: data.unit, value: valueBig.toString(), salt: data.fieldSalt!.toLowerCase(),
@@ -2351,15 +2051,20 @@ export function registerSubmissionHandlers(
 
     srv.on('issueFieldEqualityAttestation', async (req: Request) => {
         const data = req.data as {
-            payloadHash?: string; fieldKey?: string;
+            validUntil?: number | string;
+            payloadHash?: string; attesterId?: string; fieldKey?: string;
             expectedValue?: string; expectedDigest?: string; fieldSalt?: string;
             contentRoot?: string; schemaId?: string; siblingsJson?: string; dirsJson?: string;
             sessionId?: string; contractAddress?: string; compiledArtifactRef?: string;
             idempotencyKey?: string; sponsorSessionId?: string;
         };
 
+        const { validUntil: validUntilArg, error: validUntilError } = parseValidUntil(data.validUntil);
+        if (validUntilError) return req.reject(400, validUntilError);
+
         if (!data.payloadHash) return req.reject(400, 'payloadHash is required');
         if (!SHA256_HEX_RE.test(data.payloadHash)) return req.reject(400, 'payloadHash must be 64 hex chars (32 bytes)');
+        if (data.attesterId && !SHA256_HEX_RE.test(data.attesterId)) return req.reject(400, 'attesterId must be 64 hex chars (32 bytes)');
         if (!data.fieldKey) return req.reject(400, 'fieldKey is required');
         if (!SHA256_HEX_RE.test(data.fieldKey)) return req.reject(400, 'fieldKey must be 64 hex chars (32 bytes)');
 
@@ -2369,8 +2074,7 @@ export function registerSubmissionHandlers(
         if (hasDigest && !SHA256_HEX_RE.test(data.expectedDigest!)) {
             return req.reject(400, 'expectedDigest must be 64 hex chars (32 bytes)');
         }
-        // The digest covers the EXACT string (no trimming), matching the
-        // bytes-leaf encoding of prepareDocumentProof.
+        // The exact string, untrimmed, as prepareDocumentProof encodes bytes leaves.
         const expectedDigest = hasDigest ? data.expectedDigest!.toLowerCase() : blake2b256Hex(data.expectedValue!);
         if (!data.fieldSalt || !SHA256_HEX_RE.test(data.fieldSalt)) {
             return req.reject(400, 'fieldSalt (64 hex chars) is required (v4 salted leaves; prepareDocumentProof returns it per field)');
@@ -2397,13 +2101,15 @@ export function registerSubmissionHandlers(
         if (rejectIfMainnetBlocked(req)) return;
         if (!checkRate(predicateRateLimiter, data.sessionId, req)) return;
 
-        // Row up-front, same lifecycle as the numeric field action. The bytes
-        // kinds have no op/threshold; the expected digest IS the statement.
+        // No op/threshold: the expected digest is the statement.
+        const attesterId = await resolveAttester(req, data.sessionId, data.attesterId, Boolean(data.contentRoot));
+        if (!attesterId) return;
         const predicateAttestationId = cds.utils.uuid();
         const insertedAt = new Date().toISOString();
         await db.run(INSERT.into(PredicateAttestations).entries({
             ID: predicateAttestationId,
             payloadHash: data.payloadHash.toLowerCase(),
+            attesterId,
             contractAddress: data.contractAddress,
             predicate: 'bytesEquality',
             op: null,
@@ -2433,6 +2139,7 @@ export function registerSubmissionHandlers(
                 idempotencyKey: data.idempotencyKey,
                 request: {
                     payloadHash: data.payloadHash!.toLowerCase(),
+                    attesterId,
                     fieldKey: data.fieldKey!.toLowerCase(),
                     contractAddress: data.contractAddress,
                     predicate: 'bytesEquality',
@@ -2441,7 +2148,7 @@ export function registerSubmissionHandlers(
                     feeSponsor: sponsor?.sponsorSessionId ?? null
                 },
                 idempotencyPayload: {
-                    payloadHash: data.payloadHash!.toLowerCase(), fieldKey: data.fieldKey!.toLowerCase(),
+                    payloadHash: data.payloadHash!.toLowerCase(), attesterId, fieldKey: data.fieldKey!.toLowerCase(),
                     contractAddress: data.contractAddress, predicate: 'bytesEquality',
                     expectedDigest, fieldSalt: data.fieldSalt,
                     contentRoot: data.contentRoot, schemaId: data.schemaId,
@@ -2449,11 +2156,12 @@ export function registerSubmissionHandlers(
                     feeSponsor: sponsor?.sponsorSessionId ?? null
                 },
                 requestedBy: (req as any).user?.id,
+                grantId: (req as any).agentGrant?.ID,
                 commandVersion: 1,
                 encryptCommand: true,
                 command: {
-                    op: 'fieldEqualityWorkflow', predicateAttestationId,
-                    payloadHash: data.payloadHash!.toLowerCase(), fieldKey: data.fieldKey!.toLowerCase(),
+                    op: 'fieldEqualityWorkflow', predicateAttestationId, validUntil: validUntilArg,
+                    payloadHash: data.payloadHash!.toLowerCase(), attesterId, fieldKey: data.fieldKey!.toLowerCase(),
                     contractAddress: data.contractAddress!, compiledArtifactRef: compiledRef,
                     expectedDigest, salt: data.fieldSalt!.toLowerCase(), siblings: path.siblings, dirs: path.dirs,
                     contentRoot: data.contentRoot?.toLowerCase(), schemaId: data.schemaId?.toLowerCase(),
@@ -2469,7 +2177,8 @@ export function registerSubmissionHandlers(
 
     srv.on('issueFieldMembershipAttestation', async (req: Request) => {
         const data = req.data as {
-            payloadHash?: string; fieldKey?: string;
+            validUntil?: number | string;
+            payloadHash?: string; attesterId?: string; fieldKey?: string;
             value?: string; valueDigest?: string;
             allowedValuesJson?: string; setRoot?: string; setSiblingsJson?: string; setDirsJson?: string;
             fieldSalt?: string;
@@ -2478,8 +2187,12 @@ export function registerSubmissionHandlers(
             idempotencyKey?: string; sponsorSessionId?: string;
         };
 
+        const { validUntil: validUntilArg, error: validUntilError } = parseValidUntil(data.validUntil);
+        if (validUntilError) return req.reject(400, validUntilError);
+
         if (!data.payloadHash) return req.reject(400, 'payloadHash is required');
         if (!SHA256_HEX_RE.test(data.payloadHash)) return req.reject(400, 'payloadHash must be 64 hex chars (32 bytes)');
+        if (data.attesterId && !SHA256_HEX_RE.test(data.attesterId)) return req.reject(400, 'attesterId must be 64 hex chars (32 bytes)');
         if (!data.fieldKey) return req.reject(400, 'fieldKey is required');
         if (!SHA256_HEX_RE.test(data.fieldKey)) return req.reject(400, 'fieldKey must be 64 hex chars (32 bytes)');
 
@@ -2566,13 +2279,15 @@ export function registerSubmissionHandlers(
         if (rejectIfMainnetBlocked(req)) return;
         if (!checkRate(predicateRateLimiter, data.sessionId, req)) return;
 
-        // Row up-front. The set root is the public statement; the value digest
-        // and both inclusion paths stay witness material (encrypted command).
+        // The set root is public; value digest and paths stay witness material.
+        const attesterId = await resolveAttester(req, data.sessionId, data.attesterId, Boolean(data.contentRoot));
+        if (!attesterId) return;
         const predicateAttestationId = cds.utils.uuid();
         const insertedAt = new Date().toISOString();
         await db.run(INSERT.into(PredicateAttestations).entries({
             ID: predicateAttestationId,
             payloadHash: data.payloadHash.toLowerCase(),
+            attesterId,
             contractAddress: data.contractAddress,
             predicate: 'setMembership',
             op: null,
@@ -2602,6 +2317,7 @@ export function registerSubmissionHandlers(
                 idempotencyKey: data.idempotencyKey,
                 request: {
                     payloadHash: data.payloadHash!.toLowerCase(),
+                    attesterId,
                     fieldKey: data.fieldKey!.toLowerCase(),
                     contractAddress: data.contractAddress,
                     predicate: 'setMembership',
@@ -2610,7 +2326,7 @@ export function registerSubmissionHandlers(
                     feeSponsor: sponsor?.sponsorSessionId ?? null
                 },
                 idempotencyPayload: {
-                    payloadHash: data.payloadHash!.toLowerCase(), fieldKey: data.fieldKey!.toLowerCase(),
+                    payloadHash: data.payloadHash!.toLowerCase(), attesterId, fieldKey: data.fieldKey!.toLowerCase(),
                     contractAddress: data.contractAddress, predicate: 'setMembership',
                     setRoot, valueDigest, fieldSalt: data.fieldSalt,
                     contentRoot: data.contentRoot, schemaId: data.schemaId,
@@ -2618,11 +2334,12 @@ export function registerSubmissionHandlers(
                     feeSponsor: sponsor?.sponsorSessionId ?? null
                 },
                 requestedBy: (req as any).user?.id,
+                grantId: (req as any).agentGrant?.ID,
                 commandVersion: 1,
                 encryptCommand: true,
                 command: {
-                    op: 'fieldMembershipWorkflow', predicateAttestationId,
-                    payloadHash: data.payloadHash!.toLowerCase(), fieldKey: data.fieldKey!.toLowerCase(),
+                    op: 'fieldMembershipWorkflow', predicateAttestationId, validUntil: validUntilArg,
+                    payloadHash: data.payloadHash!.toLowerCase(), attesterId, fieldKey: data.fieldKey!.toLowerCase(),
                     contractAddress: data.contractAddress!, compiledArtifactRef: compiledRef,
                     setRoot, valueDigest, salt: data.fieldSalt!.toLowerCase(),
                     siblings: path.siblings, dirs: path.dirs,
@@ -2640,17 +2357,23 @@ export function registerSubmissionHandlers(
 
     srv.on('issueDocumentIntegrityAttestation', async (req: Request) => {
         const data = req.data as {
-            payloadHashA?: string; payloadHashB?: string; allowedMask?: number | string;
+            validUntil?: number | string;
+            payloadHashA?: string; payloadHashB?: string; attesterIdA?: string; attesterIdB?: string; allowedMask?: number | string;
             schemaJson?: string; openingAJson?: string; openingBJson?: string;
             contentRootA?: string; contentRootB?: string; schemaId?: string;
             sessionId?: string; contractAddress?: string; compiledArtifactRef?: string;
             idempotencyKey?: string; sponsorSessionId?: string;
         };
 
+        const { validUntil: validUntilArg, error: validUntilError } = parseValidUntil(data.validUntil);
+        if (validUntilError) return req.reject(400, validUntilError);
+
         if (!data.payloadHashA) return req.reject(400, 'payloadHashA is required');
         if (!SHA256_HEX_RE.test(data.payloadHashA)) return req.reject(400, 'payloadHashA must be 64 hex chars (32 bytes)');
         if (!data.payloadHashB) return req.reject(400, 'payloadHashB is required');
         if (!SHA256_HEX_RE.test(data.payloadHashB)) return req.reject(400, 'payloadHashB must be 64 hex chars (32 bytes)');
+        if (data.attesterIdA && !SHA256_HEX_RE.test(data.attesterIdA)) return req.reject(400, 'attesterIdA must be 64 hex chars (32 bytes)');
+        if (data.attesterIdB && !SHA256_HEX_RE.test(data.attesterIdB)) return req.reject(400, 'attesterIdB must be 64 hex chars (32 bytes)');
         if (data.payloadHashA.toLowerCase() === data.payloadHashB.toLowerCase()) {
             return req.reject(400, 'payloadHashA and payloadHashB must differ (a document is trivially unchanged against itself)');
         }
@@ -2687,14 +2410,17 @@ export function registerSubmissionHandlers(
         if (rejectIfMainnetBlocked(req)) return;
         if (!checkRate(predicateRateLimiter, data.sessionId, req)) return;
 
-        // Row up-front, same lifecycle as the field actions. Document A rides
-        // in the shared payloadHash column; the mask is its own column so the
-        // two cross-root statements stay unmistakable.
+        // Document A rides in the payloadHash column.
+        const attesterIdA = await resolveAttester(req, data.sessionId, data.attesterIdA, Boolean(data.contentRootA));
+        if (!attesterIdA) return;
+        const attesterIdB = await resolveAttester(req, data.sessionId, data.attesterIdB ?? attesterIdA, Boolean(data.contentRootB));
+        if (!attesterIdB) return;
         const predicateAttestationId = cds.utils.uuid();
         const insertedAt = new Date().toISOString();
         await db.run(INSERT.into(PredicateAttestations).entries({
             ID: predicateAttestationId,
             payloadHash: data.payloadHashA.toLowerCase(),
+            attesterId: attesterIdA,
             contractAddress: data.contractAddress,
             predicate: 'documentIntegrity',
             op: null,
@@ -2704,6 +2430,7 @@ export function registerSubmissionHandlers(
             expectedDigest: null,
             setRoot: null,
             payloadHashB: data.payloadHashB.toLowerCase(),
+            attesterIdB,
             allowedMask,
             network: recordedNetworkId(),
             compiledArtifactRef: compiledRef,
@@ -2728,6 +2455,7 @@ export function registerSubmissionHandlers(
                 request: {
                     payloadHashA: data.payloadHashA!.toLowerCase(),
                     payloadHashB: data.payloadHashB!.toLowerCase(),
+                    attesterIdA, attesterIdB,
                     contractAddress: data.contractAddress,
                     predicate: 'documentIntegrity',
                     allowedMask,
@@ -2735,7 +2463,7 @@ export function registerSubmissionHandlers(
                     feeSponsor: sponsor?.sponsorSessionId ?? null
                 },
                 idempotencyPayload: {
-                    payloadHashA: data.payloadHashA!.toLowerCase(), payloadHashB: data.payloadHashB!.toLowerCase(),
+                    payloadHashA: data.payloadHashA!.toLowerCase(), payloadHashB: data.payloadHashB!.toLowerCase(), attesterIdA, attesterIdB,
                     contractAddress: data.contractAddress, predicate: 'documentIntegrity',
                     allowedMask,
                     schema: docPair.schema, openingA: docPair.openingA, openingB: docPair.openingB,
@@ -2745,11 +2473,12 @@ export function registerSubmissionHandlers(
                     feeSponsor: sponsor?.sponsorSessionId ?? null
                 },
                 requestedBy: (req as any).user?.id,
+                grantId: (req as any).agentGrant?.ID,
                 commandVersion: 1,
                 encryptCommand: true,
                 command: {
-                    op: 'documentIntegrityWorkflow', predicateAttestationId,
-                    payloadHashA: data.payloadHashA!.toLowerCase(), payloadHashB: data.payloadHashB!.toLowerCase(),
+                    op: 'documentIntegrityWorkflow', predicateAttestationId, validUntil: validUntilArg,
+                    payloadHashA: data.payloadHashA!.toLowerCase(), payloadHashB: data.payloadHashB!.toLowerCase(), attesterIdA, attesterIdB,
                     contractAddress: data.contractAddress!, compiledArtifactRef: compiledRef,
                     allowedMask,
                     schema: docPair.schema, openingA: docPair.openingA, openingB: docPair.openingB,
@@ -2768,17 +2497,23 @@ export function registerSubmissionHandlers(
 
     srv.on('issueDocumentDiffAttestation', async (req: Request) => {
         const data = req.data as {
-            payloadHashA?: string; payloadHashB?: string; k?: number;
+            validUntil?: number | string;
+            payloadHashA?: string; payloadHashB?: string; attesterIdA?: string; attesterIdB?: string; k?: number;
             schemaJson?: string; openingAJson?: string; openingBJson?: string;
             contentRootA?: string; contentRootB?: string; schemaId?: string;
             sessionId?: string; contractAddress?: string; compiledArtifactRef?: string;
             idempotencyKey?: string; sponsorSessionId?: string;
         };
 
+        const { validUntil: validUntilArg, error: validUntilError } = parseValidUntil(data.validUntil);
+        if (validUntilError) return req.reject(400, validUntilError);
+
         if (!data.payloadHashA) return req.reject(400, 'payloadHashA is required');
         if (!SHA256_HEX_RE.test(data.payloadHashA)) return req.reject(400, 'payloadHashA must be 64 hex chars (32 bytes)');
         if (!data.payloadHashB) return req.reject(400, 'payloadHashB is required');
         if (!SHA256_HEX_RE.test(data.payloadHashB)) return req.reject(400, 'payloadHashB must be 64 hex chars (32 bytes)');
+        if (data.attesterIdA && !SHA256_HEX_RE.test(data.attesterIdA)) return req.reject(400, 'attesterIdA must be 64 hex chars (32 bytes)');
+        if (data.attesterIdB && !SHA256_HEX_RE.test(data.attesterIdB)) return req.reject(400, 'attesterIdB must be 64 hex chars (32 bytes)');
         if (data.payloadHashA.toLowerCase() === data.payloadHashB.toLowerCase()) {
             return req.reject(400, 'payloadHashA and payloadHashB must differ (a document has no differences against itself)');
         }
@@ -2808,13 +2543,17 @@ export function registerSubmissionHandlers(
         if (rejectIfMainnetBlocked(req)) return;
         if (!checkRate(predicateRateLimiter, data.sessionId, req)) return;
 
-        // k rides in the threshold column (an integer bound, like the numeric
-        // predicates' threshold).
+        // k rides in the threshold column.
+        const attesterIdA = await resolveAttester(req, data.sessionId, data.attesterIdA, Boolean(data.contentRootA));
+        if (!attesterIdA) return;
+        const attesterIdB = await resolveAttester(req, data.sessionId, data.attesterIdB ?? attesterIdA, Boolean(data.contentRootB));
+        if (!attesterIdB) return;
         const predicateAttestationId = cds.utils.uuid();
         const insertedAt = new Date().toISOString();
         await db.run(INSERT.into(PredicateAttestations).entries({
             ID: predicateAttestationId,
             payloadHash: data.payloadHashA.toLowerCase(),
+            attesterId: attesterIdA,
             contractAddress: data.contractAddress,
             predicate: 'documentDiff',
             op: null,
@@ -2824,6 +2563,7 @@ export function registerSubmissionHandlers(
             expectedDigest: null,
             setRoot: null,
             payloadHashB: data.payloadHashB.toLowerCase(),
+            attesterIdB,
             allowedMask: null,
             network: recordedNetworkId(),
             compiledArtifactRef: compiledRef,
@@ -2848,6 +2588,7 @@ export function registerSubmissionHandlers(
                 request: {
                     payloadHashA: data.payloadHashA!.toLowerCase(),
                     payloadHashB: data.payloadHashB!.toLowerCase(),
+                    attesterIdA, attesterIdB,
                     contractAddress: data.contractAddress,
                     predicate: 'documentDiff',
                     k: data.k,
@@ -2855,7 +2596,7 @@ export function registerSubmissionHandlers(
                     feeSponsor: sponsor?.sponsorSessionId ?? null
                 },
                 idempotencyPayload: {
-                    payloadHashA: data.payloadHashA!.toLowerCase(), payloadHashB: data.payloadHashB!.toLowerCase(),
+                    payloadHashA: data.payloadHashA!.toLowerCase(), payloadHashB: data.payloadHashB!.toLowerCase(), attesterIdA, attesterIdB,
                     contractAddress: data.contractAddress, predicate: 'documentDiff',
                     k: data.k,
                     schema: docPair.schema, openingA: docPair.openingA, openingB: docPair.openingB,
@@ -2865,11 +2606,12 @@ export function registerSubmissionHandlers(
                     feeSponsor: sponsor?.sponsorSessionId ?? null
                 },
                 requestedBy: (req as any).user?.id,
+                grantId: (req as any).agentGrant?.ID,
                 commandVersion: 1,
                 encryptCommand: true,
                 command: {
-                    op: 'documentDiffWorkflow', predicateAttestationId,
-                    payloadHashA: data.payloadHashA!.toLowerCase(), payloadHashB: data.payloadHashB!.toLowerCase(),
+                    op: 'documentDiffWorkflow', predicateAttestationId, validUntil: validUntilArg,
+                    payloadHashA: data.payloadHashA!.toLowerCase(), payloadHashB: data.payloadHashB!.toLowerCase(), attesterIdA, attesterIdB,
                     contractAddress: data.contractAddress!, compiledArtifactRef: compiledRef,
                     k: data.k!,
                     schema: docPair.schema, openingA: docPair.openingA, openingB: docPair.openingB,
@@ -2888,7 +2630,8 @@ export function registerSubmissionHandlers(
 
     srv.on('issueFieldPredicateAttestationBatch', async (req: Request) => {
         const data = req.data as {
-            payloadHash?: string;
+            validUntil?: number | string;
+            payloadHash?: string; attesterId?: string;
             contentRoot?: string; schemaId?: string;
             claimsJson?: string;
             sessionId?: string;
@@ -2898,8 +2641,12 @@ export function registerSubmissionHandlers(
             sponsorSessionId?: string;
         };
 
+        const { validUntil: validUntilArg, error: validUntilError } = parseValidUntil(data.validUntil);
+        if (validUntilError) return req.reject(400, validUntilError);
+
         if (!data.payloadHash) return req.reject(400, 'payloadHash is required');
         if (!SHA256_HEX_RE.test(data.payloadHash)) return req.reject(400, 'payloadHash must be 64 hex chars (32 bytes)');
+        if (data.attesterId && !SHA256_HEX_RE.test(data.attesterId)) return req.reject(400, 'attesterId must be 64 hex chars (32 bytes)');
         if (data.contentRoot && !SHA256_HEX_RE.test(data.contentRoot)) {
             return req.reject(400, 'contentRoot must be 64 hex chars (32 bytes)');
         }
@@ -2913,14 +2660,10 @@ export function registerSubmissionHandlers(
         if (!data.contractAddress) return req.reject(400, 'contractAddress is required');
         if (!data.claimsJson) return req.reject(400, 'claimsJson is required');
 
-        // 8 calls per transaction is the batch cap; an in-batch anchor
-        // occupies one slot.
+        // 8 calls per transaction; an in-batch anchor occupies one.
         const maxClaims = data.contentRoot ? 7 : 8;
-        // Mixed-kind batch claim; `predicate` discriminates (numeric /
-        // bytesEquality / setMembership / documentIntegrity / documentDiff).
-        // `allowedValues` is the raw list of a membership claim before set
-        // resolution. The document kinds carry no fieldKey/inclusion path;
-        // document A is the batch-level payloadHash.
+        // `allowedValues` is a membership claim's raw list before set resolution.
+        // Document kinds carry no fieldKey/path; document A is the batch payloadHash.
         interface BatchClaim {
             fieldKey?: string; siblings?: string[]; dirs?: boolean[];
             predicate: string; unit?: string;
@@ -2929,7 +2672,7 @@ export function registerSubmissionHandlers(
             setRoot?: string; valueDigest?: string; setSiblings?: string[]; setDirs?: boolean[];
             allowedValues?: string[];
             salt?: string;
-            payloadHashB?: string; allowedMask?: number; k?: number;
+            payloadHashB?: string; attesterIdB?: string; allowedMask?: number; k?: number;
             schema?: SchemaSlotWire[]; openingA?: OpeningWire; openingB?: OpeningWire;
         }
         const parsePath = (entry: any, i: number, depth: number, sibName: string, dirName: string): { siblings: string[]; dirs: boolean[] } => {
@@ -2945,8 +2688,7 @@ export function registerSubmissionHandlers(
                 throw new Error(`claims[${i}].${dirName} must be a JSON array of ${depth} booleans`);
             }
             for (const d of ds) {
-                // Strict booleans: map(Boolean) would turn "false" into
-                // true and silently corrupt the Merkle path.
+                // Strict: Boolean("false") is true and would corrupt the path.
                 if (typeof d !== 'boolean') throw new Error(`claims[${i}].${dirName} entries must be booleans`);
             }
             return { siblings: sibs.map((s: string) => s.toLowerCase()), dirs: ds as boolean[] };
@@ -2965,13 +2707,15 @@ export function registerSubmissionHandlers(
                 if (!parsed) throw new Error(`claims[${i}].predicate must be 'lessOrEqual', 'greaterOrEqual', 'bytesEquality', 'setMembership', 'documentIntegrity' or 'documentDiff'`);
 
                 if (parsed.kind === 'integrity' || parsed.kind === 'diff') {
-                    // Cross-root document claims: document A is the batch
-                    // payloadHash, so an in-batch contentRoot anchor is A's
-                    // root and B's must already be anchored.
+                    // An in-batch contentRoot anchor is A's root; B's must already be anchored.
                     if (typeof entry.payloadHashB !== 'string' || !SHA256_HEX_RE.test(entry.payloadHashB)) {
                         throw new Error(`claims[${i}].payloadHashB must be 64 hex chars (32 bytes)`);
                     }
                     const payloadHashB = entry.payloadHashB.toLowerCase();
+                    if (entry.attesterIdB !== undefined && (typeof entry.attesterIdB !== 'string' || !SHA256_HEX_RE.test(entry.attesterIdB))) {
+                        throw new Error(`claims[${i}].attesterIdB must be 64 hex chars (32 bytes)`);
+                    }
+                    const attesterIdB = typeof entry.attesterIdB === 'string' ? entry.attesterIdB.toLowerCase() : undefined;
                     if (payloadHashB === data.payloadHash!.toLowerCase()) {
                         throw new Error(`claims[${i}].payloadHashB must differ from the batch payloadHash`);
                     }
@@ -2989,7 +2733,7 @@ export function registerSubmissionHandlers(
                             throw new Error(`claims[${i}].allowedMask frees every real (non-padding) schema slot; the claim would be vacuous`);
                         }
                         return {
-                            predicate: 'documentIntegrity', payloadHashB, allowedMask: entry.allowedMask,
+                            predicate: 'documentIntegrity', payloadHashB, attesterIdB, allowedMask: entry.allowedMask,
                             schema, openingA, openingB
                         };
                     }
@@ -2997,7 +2741,7 @@ export function registerSubmissionHandlers(
                         throw new Error(`claims[${i}].k must be an integer in 1..${batchWidth}`);
                     }
                     return {
-                        predicate: 'documentDiff', payloadHashB, k: entry.k,
+                        predicate: 'documentDiff', payloadHashB, attesterIdB, k: entry.k,
                         schema, openingA, openingB
                     };
                 }
@@ -3064,7 +2808,7 @@ export function registerSubmissionHandlers(
                 let thresholdBig: bigint;
                 try { thresholdBig = BigInt(entry.threshold); } catch { throw new Error(`claims[${i}].threshold must be an integer`); }
                 if (thresholdBig < 0n) throw new Error(`claims[${i}].threshold must be a non-negative integer`);
-                if (thresholdBig > UINT64_MAX) throw new Error(`claims[${i}].threshold exceeds Uint<64>`);
+                if (thresholdBig > INT64_MAX) throw new Error(`claims[${i}].threshold exceeds the recorded range (at most 9223372036854775807)`);
                 return { ...base, value: valueBig.toString(), threshold: thresholdBig.toString(), opCode: parsed.opCode! };
             });
         } catch (e: any) {
@@ -3075,9 +2819,8 @@ export function registerSubmissionHandlers(
             ? data.compiledArtifactRef
             : DEFAULT_ATTESTATION_VAULT_REF;
 
-        // Resolve allowedValues lanes to set roots + paths BEFORE dedup and the
-        // rate gate: dedup keys need the set root, and a value-not-in-list 400
-        // must not consume proving budget.
+        // Before dedup (its keys need the set root) and the rate gate (a
+        // not-in-list 400 must not consume budget).
         if (claims.some(c => c.allowedValues)) {
             let pure;
             try {
@@ -3103,17 +2846,15 @@ export function registerSubmissionHandlers(
             }
         }
 
-        // Drop exact duplicate claim tuples: claim keys are idempotent on-chain
-        // (insert overwrites true with true), so duplicates only waste proving
-        // time. First occurrence wins; the response reports the drop count.
-        // The tuple mirrors each kind's on-chain claim struct.
+        // Duplicates only waste proving (claim keys are idempotent on-chain); the
+        // tuple mirrors each kind's on-chain claim struct.
         const seenTuples = new Set<string>();
         const uniqueClaims: BatchClaim[] = [];
         for (const c of claims) {
             const tuple = c.predicate === 'bytesEquality' ? `${c.fieldKey}|eq|${c.expectedDigest}`
                 : c.predicate === 'setMembership' ? `${c.fieldKey}|set|${c.setRoot}`
-                : c.predicate === 'documentIntegrity' ? `${c.payloadHashB}|integ|${c.allowedMask}`
-                : c.predicate === 'documentDiff' ? `${c.payloadHashB}|diff|${c.k}`
+                : c.predicate === 'documentIntegrity' ? `${c.attesterIdB ?? ''}|${c.payloadHashB}|integ|${c.allowedMask}`
+                : c.predicate === 'documentDiff' ? `${c.attesterIdB ?? ''}|${c.payloadHashB}|diff|${c.k}`
                 : `${c.fieldKey}|${c.threshold}|${c.opCode}`;
             if (seenTuples.has(tuple)) continue;
             seenTuples.add(tuple);
@@ -3122,29 +2863,28 @@ export function registerSubmissionHandlers(
         const droppedDuplicates = claims.length - uniqueClaims.length;
 
         if (rejectIfMainnetBlocked(req)) return;
-        // The batch counts as N claims against the limiter, not one action
-        // call, so batching is not a rate-limit bypass. All-or-nothing: a
-        // rejected batch consumes no budget.
+        // N claims count as N, so batching is no rate-limit bypass.
         if (!checkRate(predicateRateLimiter, data.sessionId, req, uniqueClaims.length)) return;
 
-        // One row per claim up-front, same shape as the single action; on
-        // success every row gets the SAME provenTxHash.
+        // One row per claim; on success all share one provenTxHash.
+        const attesterId = await resolveAttester(req, data.sessionId, data.attesterId, Boolean(data.contentRoot));
+        if (!attesterId) return;
         const insertedAt = new Date().toISOString();
         const rowedClaims = uniqueClaims.map(c => ({ ...c, predicateAttestationId: cds.utils.uuid() }));
         await db.run(INSERT.into(PredicateAttestations).entries(rowedClaims.map(c => ({
             ID: c.predicateAttestationId,
             payloadHash: data.payloadHash!.toLowerCase(),
+            attesterId,
             contractAddress: data.contractAddress,
             predicate: c.predicate,
             op: c.opCode ?? null,
-            // documentDiff stores its k bound in the threshold column, like
-            // the numeric predicates store theirs.
             threshold: (c.predicate === 'documentDiff' ? c.k : c.threshold ?? null) as any,
             unit: c.unit ?? null,
             fieldKey: c.fieldKey ?? null,
             expectedDigest: c.expectedDigest ?? null,
             setRoot: c.setRoot ?? null,
             payloadHashB: c.payloadHashB ?? null,
+            attesterIdB: c.attesterIdB ?? null,
             allowedMask: c.allowedMask ?? null,
             network: recordedNetworkId(),
             compiledArtifactRef: compiledRef,
@@ -3177,6 +2917,7 @@ export function registerSubmissionHandlers(
                 idempotencyKey: data.idempotencyKey,
                 request: {
                     payloadHash: data.payloadHash!.toLowerCase(),
+                    attesterId,
                     contractAddress: data.contractAddress,
                     claimCount: rowedClaims.length,
                     claims: publicClaims,
@@ -3184,6 +2925,7 @@ export function registerSubmissionHandlers(
                 },
                 idempotencyPayload: {
                     payloadHash: data.payloadHash!.toLowerCase(),
+                    attesterId,
                     contractAddress: data.contractAddress,
                     contentRoot: data.contentRoot?.toLowerCase() ?? null,
                     claims: uniqueClaims.map(c => ({
@@ -3191,17 +2933,19 @@ export function registerSubmissionHandlers(
                         value: c.value, expectedDigest: c.expectedDigest,
                         setRoot: c.setRoot, valueDigest: c.valueDigest,
                         salt: c.salt, siblings: c.siblings, dirs: c.dirs,
-                        payloadHashB: c.payloadHashB, allowedMask: c.allowedMask, k: c.k,
+                        payloadHashB: c.payloadHashB, attesterIdB: c.attesterIdB, allowedMask: c.allowedMask, k: c.k,
                         schema: c.schema, openingA: c.openingA, openingB: c.openingB
                     })),
                     feeSponsor: sponsor?.sponsorSessionId ?? null
                 },
                 requestedBy: (req as any).user?.id,
+                grantId: (req as any).agentGrant?.ID,
                 commandVersion: 1,
                 encryptCommand: true,
                 command: {
-                    op: 'fieldPredicateBatchWorkflow',
+                    op: 'fieldPredicateBatchWorkflow', validUntil: validUntilArg,
                     payloadHash: data.payloadHash!.toLowerCase(),
+                    attesterId,
                     contractAddress: data.contractAddress!,
                     compiledArtifactRef: compiledRef,
                     contentRoot: data.contentRoot?.toLowerCase(), schemaId: data.schemaId?.toLowerCase(),
@@ -3213,7 +2957,7 @@ export function registerSubmissionHandlers(
                         setRoot: c.setRoot, valueDigest: c.valueDigest,
                         setSiblings: c.setSiblings, setDirs: c.setDirs,
                         salt: c.salt, siblings: c.siblings, dirs: c.dirs,
-                        payloadHashB: c.payloadHashB, allowedMask: c.allowedMask, k: c.k,
+                        payloadHashB: c.payloadHashB, attesterIdB: c.attesterIdB, allowedMask: c.allowedMask, k: c.k,
                         schema: c.schema, openingA: c.openingA, openingB: c.openingB
                     })),
                     sponsorSessionId: sponsor?.sponsorSessionId
@@ -3246,9 +2990,9 @@ export function registerSubmissionHandlers(
         if (!row) return req.reject(404, `PredicateAttestation ${predicateAttestationId} not found`);
 
         const provenOk = Boolean(row.provenTxHash);
-        // Same check as verifyDocument: the proof tx must resolve to an indexed
-        // SUCCESS result before the predicate verification is trustworthy.
-        let chainSuccess = false;
+        // As in verifyDocument: the verdict needs the live read; an indexed
+        // inclusion never shortcuts an expiry, purge or retract.
+        let included = false;
         if (provenOk) {
             const txRow: any = await db.run(
                 SELECT.one.from(Transactions).columns('ID', 'hash').where({ hash: row.provenTxHash })
@@ -3257,24 +3001,26 @@ export function registerSubmissionHandlers(
                 const result: any = await db.run(
                     SELECT.one.from(TransactionResults).columns('status', 'outcomeSource').where({ transaction_ID: txRow.ID })
                 );
-                chainSuccess = result?.status === 'SUCCESS'
+                included = result?.status === 'SUCCESS'
                     && result?.outcomeSource === 'substrate-system-events';
             }
         }
 
-        // Crawler-free fallback (proof tx not indexed locally): recompute the
-        // claim key from the row and look it up in predicate_results against
-        // live state OF THE RECORDED NETWORK/ARTIFACT (evidence provenance).
-        // Verifies the effect, not the tx, so no crawler/txHash needed.
+        // Live state of the recorded network and artifact.
         const rowNetwork = row.network && (VALID_NIGHTGATE_NETWORKS as readonly string[]).includes(row.network)
             ? row.network as NightgateNetwork
             : undefined;
-        if (!chainSuccess && liveProviderConfigured(rowNetwork) && row.contractAddress && row.payloadHash) {
-            chainSuccess = await verifyPredicateViaState(row);
+        let stateChecked = false;
+        let current = false;
+        if (liveProviderConfigured(rowNetwork) && row.contractAddress && row.payloadHash) {
+            stateChecked = true;
+            current = await verifyPredicateViaState(row);
         }
 
         return {
-            verified: chainSuccess,
+            verified: stateChecked && current,
+            included,
+            stateChecked,
             predicate: row.predicate ?? '',
             threshold: row.threshold ?? 0,
             unit: row.unit ?? '',
@@ -3329,22 +3075,20 @@ export function registerSubmissionHandlers(
             const facadeCfg = facadeConfigFromEnv();
             await ensureNetworkId(facadeCfg.networkId);
             await contractResolver(compiledRef);
-            // Session ownership comes first: the grant row is the off-chain
-            // read ACL, so nothing is written for a caller who does not hold
-            // the session (SessionNotFoundError -> 401 below, row untouched).
+            // Ownership first: the grant row is the off-chain read ACL, so nothing
+            // is written for a caller who does not hold the session.
             await walletFactory({ sessionId: data.sessionId!, db, facadeConfig: facadeCfg, expectedUserId: (req as any).user?.id });
             const sponsor = await resolveSponsorForRequest(req, data.sponsorSessionId);
+            const attesterId = await attesterIdResolver({ sessionId: data.sessionId!, db, expectedUserId: (req as any).user?.id });
 
-            // Row: a stable pollable handle, reused for the same (contract,
-            // payloadHash, grantee) so a retry reuses the row. A NEW row is
-            // inactive until the chain indexer confirms the grant in ledger
-            // state. An EXISTING row keeps its confirmed `level`; the requested
-            // one rides as `pendingLevel` until inclusion, so a request the
-            // chain has not accepted never widens what the grantee may read.
+            // A new row stays inactive until the indexer confirms it; an existing one
+            // keeps its confirmed level and carries the request as `pendingLevel`, so
+            // a request the chain has not accepted never widens what the grantee reads.
             const insertedAt = new Date().toISOString();
             const existingGrant: any = await db.run(
                 SELECT.one.from(DisclosureGrants).columns('ID').where({
                     contractAddress: contractAddressLc,
+                    attesterId,
                     payloadHash: payloadHashLc,
                     grantee: granteeLc
                 })
@@ -3358,6 +3102,7 @@ export function registerSubmissionHandlers(
                 await db.run(INSERT.into(DisclosureGrants).entries({
                     ID: disclosureGrantId,
                     payloadHash: payloadHashLc,
+                    attesterId,
                     grantee: granteeLc,
                     level: levelNum,
                     pendingLevel: null,
@@ -3378,6 +3123,7 @@ export function registerSubmissionHandlers(
                     idempotencyKey: data.idempotencyKey,
                     request: {
                         payloadHash: payloadHashLc,
+                        attesterId,
                         grantee: granteeLc,
                         level: levelNum,
                         contractAddress: contractAddressLc,
@@ -3385,10 +3131,11 @@ export function registerSubmissionHandlers(
                         feeSponsor: sponsor?.sponsorSessionId ?? null
                     },
                     requestedBy: (req as any).user?.id,
+                grantId: (req as any).agentGrant?.ID,
                     commandVersion: 1,
                     encryptCommand: true,
                     command: {
-                        op: 'grantDisclosure', disclosureGrantId, payloadHash: payloadHashLc,
+                        op: 'grantDisclosure', disclosureGrantId, payloadHash: payloadHashLc, attesterId,
                         grantee: granteeLc, level: levelNum, contractAddress: contractAddressLc,
                         compiledArtifactRef: compiledRef, sponsorSessionId: sponsor?.sponsorSessionId
                     }
@@ -3444,6 +3191,7 @@ export function registerSubmissionHandlers(
             await contractResolver(compiledRef);
             await walletFactory({ sessionId: data.sessionId!, db, facadeConfig: facadeCfg, expectedUserId: (req as any).user?.id });
             const sponsor = await resolveSponsorForRequest(req, data.sponsorSessionId);
+            const attesterId = await attesterIdResolver({ sessionId: data.sessionId!, db, expectedUserId: (req as any).user?.id });
 
             const job = await startJob({
                 kind: 'revokeDisclosure',
@@ -3451,15 +3199,17 @@ export function registerSubmissionHandlers(
                 idempotencyKey: data.idempotencyKey,
                 request: {
                     payloadHash: payloadHashLc,
+                    attesterId,
                     grantee: granteeLc,
                     contractAddress: contractAddressLc,
                     feeSponsor: sponsor?.sponsorSessionId ?? null
                 },
                 requestedBy: (req as any).user?.id,
+                grantId: (req as any).agentGrant?.ID,
                 commandVersion: 1,
                 encryptCommand: true,
                 command: {
-                    op: 'revokeDisclosure', payloadHash: payloadHashLc, grantee: granteeLc,
+                    op: 'revokeDisclosure', payloadHash: payloadHashLc, attesterId, grantee: granteeLc,
                     contractAddress: contractAddressLc, compiledArtifactRef: compiledRef,
                     sponsorSessionId: sponsor?.sponsorSessionId
                 }
@@ -3472,7 +3222,9 @@ export function registerSubmissionHandlers(
     srv.on('registerPassport', async (req: Request) => {
         const data = req.data as {
             passportId?: string;
+            documentId?: string;
             ownerId?: string;
+            mode?: number | string;
             sessionId?: string;
             contractAddress?: string;
             compiledArtifactRef?: string;
@@ -3480,8 +3232,15 @@ export function registerSubmissionHandlers(
             sponsorSessionId?: string;
         };
 
-        if (!data.passportId) return req.reject(400, 'passportId is required');
-        if (!SHA256_HEX_RE.test(data.passportId)) return req.reject(400, 'passportId must be 64 hex chars (32 bytes)');
+        const mode = data.mode === undefined || data.mode === null || data.mode === '' ? 0 : Number(data.mode);
+        if (![0, 1, 2, 3, 4].includes(mode)) return req.reject(400, 'mode must be 0 (register), 1 (unregister), 2 (transfer registrar), 3 (recovery: set registrar) or 4 (recovery: set recovery)');
+        const zeroId = '00'.repeat(32);
+        // Mode 1 takes no owner, modes 2-4 no id: the unused argument rides as zero.
+        if (mode === 1) data.ownerId = zeroId;
+        if (mode >= 2) data.passportId = zeroId;
+        if (!data.passportId && data.documentId) data.passportId = data.documentId;
+        if (!data.passportId) return req.reject(400, 'documentId is required');
+        if (!SHA256_HEX_RE.test(data.passportId)) return req.reject(400, 'documentId must be 64 hex chars (32 bytes)');
         if (!data.ownerId) return req.reject(400, 'ownerId is required');
         if (!SHA256_HEX_RE.test(data.ownerId)) return req.reject(400, 'ownerId must be 64 hex chars (32 bytes)');
         if (!data.sessionId) return req.reject(400, 'sessionId is required');
@@ -3511,15 +3270,18 @@ export function registerSubmissionHandlers(
                 idempotencyKey: data.idempotencyKey,
                 request: {
                     passportId: passportIdLc,
+                    documentId: passportIdLc,
                     ownerId: ownerIdLc,
+                    mode,
                     contractAddress: contractAddressLc,
                     feeSponsor: sponsor?.sponsorSessionId ?? null
                 },
                 requestedBy: (req as any).user?.id,
+                grantId: (req as any).agentGrant?.ID,
                 commandVersion: 1,
                 encryptCommand: true,
                 command: {
-                    op: 'registerPassport', passportId: passportIdLc, ownerId: ownerIdLc,
+                    op: 'registerPassport', passportId: passportIdLc, ownerId: ownerIdLc, mode,
                     contractAddress: contractAddressLc, compiledArtifactRef: compiledRef,
                     sponsorSessionId: sponsor?.sponsorSessionId
                 }
@@ -3529,188 +3291,58 @@ export function registerSubmissionHandlers(
         });
     });
 
-    // ------------------------------------------------------------------
-    // Crawler-free on-chain state verification.
-    // Both read LIVE contract state via queryContractState,
-    // so they work with the block crawler disabled and without a local txHash.
-    // ------------------------------------------------------------------
-
-    srv.on('verifyAttestationState', async (req: Request) => {
-        const data = req.data as {
-            contractAddress?: string;
-            payloadHash?: string;
-            contentRoot?: string;
-            schemaId?: string;
-            compiledArtifactRef?: string;
-            network?: string;
-        };
-
+    /** Shared submit path of the retract circuit (mode 0 payload, 1 claim, 2 commitment). */
+    async function submitRetract(req: Request, mode: number, key: string, data: { sessionId?: string; contractAddress?: string; compiledArtifactRef?: string; idempotencyKey?: string; sponsorSessionId?: string }) {
+        if (!SHA256_HEX_RE.test(key)) return req.reject(400, 'key must be 64 hex chars (32 bytes)');
+        if (!data.sessionId) return req.reject(400, 'sessionId is required');
         if (!data.contractAddress) return req.reject(400, 'contractAddress is required');
-        if (!data.payloadHash) return req.reject(400, 'payloadHash is required');
-        if (!SHA256_HEX_RE.test(data.payloadHash)) {
-            return req.reject(400, 'payloadHash must be 64 hex chars (32 bytes)');
-        }
-        if (data.contentRoot && !SHA256_HEX_RE.test(data.contentRoot)) {
-            return req.reject(400, 'contentRoot must be 64 hex chars (32 bytes)');
-        }
-        if (data.schemaId && !SHA256_HEX_RE.test(data.schemaId)) {
-            return req.reject(400, 'schemaId must be 64 hex chars (32 bytes)');
-        }
-        const netParsed = parseVerifyNetworkOverride(data.network, req);
-        if (!netParsed.ok) return;
-
         const compiledRef = data.compiledArtifactRef && data.compiledArtifactRef.length > 0
             ? data.compiledArtifactRef
             : DEFAULT_ATTESTATION_VAULT_REF;
-
-        const NEGATIVE = { verified: false, attested: false, contentRootOk: false, schemaOk: false, attesterId: '' };
-
-        // No live provider configured → clean negative, not a 5xx (criterion 5).
-        if (!liveProviderConfigured(netParsed.network)) return NEGATIVE;
-
+        if (rejectIfMainnetBlocked(req)) return;
+        if (!checkRate(registrarRateLimiter, data.sessionId, req)) return;
+        const keyLc = key.toLowerCase();
+        const contractAddressLc = data.contractAddress.toLowerCase();
         return runSubmission(req, async () => {
-            const resolved = await contractResolver(compiledRef);
-            const state = await attestationStateReader({
-                contractAddress: data.contractAddress!,
-                payloadHash: data.payloadHash!,
-                contentRoot: data.contentRoot,
-                schemaId: data.schemaId,
-                artifactPath: resolved.artifactPath,
-                contractProvidersConfig: contractProvidersConfigForNetwork(resolved.zkConfigPath, netParsed.network)
+            const facadeCfg = facadeConfigFromEnv();
+            await ensureNetworkId(facadeCfg.networkId);
+            await contractResolver(compiledRef);
+            await walletFactory({ sessionId: data.sessionId!, db, facadeConfig: facadeCfg, expectedUserId: (req as any).user?.id });
+            const sponsor = await resolveSponsorForRequest(req, data.sponsorSessionId);
+            const attesterId = mode === 0 ? await attesterIdResolver({ sessionId: data.sessionId!, db, expectedUserId: (req as any).user?.id }) : undefined;
+            const job = await startJob({
+                kind: 'retract',
+                sessionId: data.sessionId!,
+                idempotencyKey: data.idempotencyKey,
+                request: { mode, key: keyLc, contractAddress: contractAddressLc, feeSponsor: sponsor?.sponsorSessionId ?? null },
+                requestedBy: (req as any).user?.id,
+                grantId: (req as any).agentGrant?.ID,
+                commandVersion: 1,
+                encryptCommand: true,
+                command: { op: 'retract', mode, key: keyLc, attesterId, contractAddress: contractAddressLc, compiledArtifactRef: compiledRef, sponsorSessionId: sponsor?.sponsorSessionId }
             });
-
-            // Unknown contract / no on-chain state → clean negative.
-            if (!state) return NEGATIVE;
-
-            const verified = state.attested
-                && (data.contentRoot ? state.contentRootOk : true)
-                && (data.schemaId ? state.schemaOk : true);
-            return {
-                verified,
-                attested: state.attested,
-                contentRootOk: state.contentRootOk,
-                schemaOk: state.schemaOk,
-                attesterId: state.attesterId
-            };
+            return { jobId: job.jobId, status: job.status };
         });
-    });
+    }
 
-    srv.on('verifyPredicateState', async (req: Request) => {
-        const data = req.data as {
-            contractAddress?: string;
-            payloadHash?: string;
-            fieldKey?: string;
-            predicate?: string;
-            threshold?: number | string;
-            expectedDigest?: string;
-            setRoot?: string;
-            payloadHashB?: string;
-            allowedMask?: number | string;
-            k?: number;
-            compiledArtifactRef?: string;
-            network?: string;
-        };
-
-        if (!data.contractAddress) return req.reject(400, 'contractAddress is required');
+    // Owner-initiated removal of a payload: attestation, anchor, disclosures
+    // and document binding leave the chain (retract mode 0).
+    srv.on('retractAttestation', async (req: Request) => {
+        const data = req.data as { payloadHash?: string; sessionId?: string; contractAddress?: string; compiledArtifactRef?: string; idempotencyKey?: string; sponsorSessionId?: string };
         if (!data.payloadHash) return req.reject(400, 'payloadHash is required');
-        if (!SHA256_HEX_RE.test(data.payloadHash)) {
-            return req.reject(400, 'payloadHash must be 64 hex chars (32 bytes)');
-        }
-        if (data.fieldKey && !SHA256_HEX_RE.test(data.fieldKey)) {
-            return req.reject(400, 'fieldKey must be 64 hex chars (32 bytes)');
-        }
-
-        const parsed = parsePredicate(data.predicate);
-        if (!parsed) return req.reject(400, "predicate must be 'lessOrEqual', 'greaterOrEqual', 'bytesEquality', 'setMembership', 'documentIntegrity' or 'documentDiff'");
-
-        // Per-kind statement coordinates. The claim key is recomputed from
-        // exactly what the circuit hashed, so the wrong coordinate silently
-        // yields verified: false; validate shapes here.
-        let thresholdBig: bigint | undefined;
-        let op: number | undefined;
-        let expectedDigest: string | undefined;
-        let setRoot: string | undefined;
-        let payloadHashB: string | undefined;
-        let allowedMask: number | undefined;
-        let k: number | undefined;
-        if (parsed.kind === 'integrity' || parsed.kind === 'diff') {
-            const { width: verifyWidth, maxMask: verifyMaxMask } = vaultDims(data.compiledArtifactRef);
-            if (!data.payloadHashB || !SHA256_HEX_RE.test(data.payloadHashB)) {
-                return req.reject(400, `payloadHashB (64 hex chars) is required for predicate '${data.predicate}'`);
-            }
-            payloadHashB = data.payloadHashB.toLowerCase();
-            if (parsed.kind === 'integrity') {
-                const coerced = data.allowedMask === undefined || data.allowedMask === null
-                    ? null
-                    : coerceMask(data.allowedMask);
-                if (coerced === null || coerced < 0 || coerced > verifyMaxMask) {
-                    return req.reject(400, `allowedMask (integer 0..${verifyMaxMask}) is required for predicate 'documentIntegrity'`);
-                }
-                allowedMask = coerced;
-            } else {
-                if (data.k === undefined || data.k === null || !Number.isInteger(data.k) || data.k < 1 || data.k > verifyWidth) {
-                    return req.reject(400, `k (integer 1..${verifyWidth}) is required for predicate 'documentDiff'`);
-                }
-                k = data.k;
-            }
-        } else if (parsed.kind === 'numeric') {
-            // Numeric claims are field-bound only (the commitment-only plain
-            // kind was removed in 0.16.0 with commitValue/provePredicate).
-            if (!data.fieldKey) return req.reject(400, `fieldKey is required for predicate '${data.predicate}'`);
-            if (data.threshold === undefined || data.threshold === null) return req.reject(400, 'threshold is required');
-            try { thresholdBig = BigInt(data.threshold); } catch { return req.reject(400, 'threshold must be an integer'); }
-            if (thresholdBig < 0n) return req.reject(400, 'threshold must be a non-negative integer');
-            if (thresholdBig > UINT64_MAX) return req.reject(400, 'threshold exceeds Uint<64>');
-            op = parsed.opCode!;
-        } else if (parsed.kind === 'equality') {
-            if (!data.fieldKey) return req.reject(400, "fieldKey is required for predicate 'bytesEquality'");
-            if (!data.expectedDigest || !SHA256_HEX_RE.test(data.expectedDigest)) {
-                return req.reject(400, "expectedDigest (64 hex chars) is required for predicate 'bytesEquality'");
-            }
-            expectedDigest = data.expectedDigest.toLowerCase();
-        } else {
-            if (!data.fieldKey) return req.reject(400, "fieldKey is required for predicate 'setMembership'");
-            if (!data.setRoot || !SHA256_HEX_RE.test(data.setRoot)) {
-                return req.reject(400, "setRoot (64 hex chars) is required for predicate 'setMembership'");
-            }
-            setRoot = data.setRoot.toLowerCase();
-        }
-
-        const netParsed = parseVerifyNetworkOverride(data.network, req);
-        if (!netParsed.ok) return;
-
-        const compiledRef = data.compiledArtifactRef && data.compiledArtifactRef.length > 0
-            ? data.compiledArtifactRef
-            : DEFAULT_ATTESTATION_VAULT_REF;
-
-        const NEGATIVE = { verified: false, proven: false };
-
-        // No live provider configured → clean negative, not a 5xx (criterion 4).
-        if (!liveProviderConfigured(netParsed.network)) return NEGATIVE;
-
-        return runSubmission(req, async () => {
-            const resolved = await contractResolver(compiledRef);
-            const proven = await predicateStateReader({
-                contractAddress: data.contractAddress!,
-                payloadHash: data.payloadHash!.toLowerCase(),
-                fieldKey: data.fieldKey ? data.fieldKey.toLowerCase() : undefined,
-                threshold: thresholdBig,
-                op,
-                expectedDigest,
-                setRoot,
-                payloadHashB,
-                allowedMask,
-                k,
-                slotWidth: vaultDims(compiledRef).width,
-                artifactPath: resolved.artifactPath,
-                contractProvidersConfig: contractProvidersConfigForNetwork(resolved.zkConfigPath, netParsed.network)
-            });
-
-            // `null` (unknown contract / no on-chain state) and `false` (no true
-            // result for the recomputed claim key) both read as not proven.
-            return { verified: proven === true, proven: proven === true };
-        });
+        return submitRetract(req, 0, data.payloadHash, data);
     });
+
+    // Anyone removes an expired claim (`kind` claim, key = claim key).
+    srv.on('purgeExpired', async (req: Request) => {
+        const data = req.data as { kind?: string; key?: string; sessionId?: string; contractAddress?: string; compiledArtifactRef?: string; idempotencyKey?: string; sponsorSessionId?: string };
+        const mode = data.kind === 'claim' ? 1 : null;
+        if (mode === null) return req.reject(400, "kind must be 'claim'");
+        if (!data.key) return req.reject(400, 'key is required');
+        return submitRetract(req, mode, data.key, data);
+    });
+
+    registerVerifyStateHandlers(srv, { contractResolver, attestationStateReader, predicateStateReader });
 
     srv.on('reindexDisclosures', async (req: Request) => {
         const data = req.data as { contractAddress?: string; compiledArtifactRef?: string };
@@ -3724,7 +3356,7 @@ export function registerSubmissionHandlers(
 
         if (!checkRate(reindexRateLimiter, contractAddressLc, req)) return;
 
-        // No live provider configured → clean zero, not a 5xx (criterion 5).
+        // No live provider configured → clean zero, not a 5xx.
         if (!liveProviderConfigured()) {
             return {
                 contractAddress: contractAddressLc,
@@ -3742,8 +3374,7 @@ export function registerSubmissionHandlers(
                 artifactPath: resolved.artifactPath,
                 contractProvidersConfig: contractProvidersConfigFromEnv(resolved.zkConfigPath)
             });
-            // `indexed` is the count of grants present on-chain after reconcile,
-            // i.e. the active grants for this contract.
+            // `indexed` = grants present on-chain after reconcile.
             return {
                 contractAddress: contractAddressLc,
                 active: result.indexed,
@@ -3757,9 +3388,8 @@ export function registerSubmissionHandlers(
         const userId = (req as any).user?.id;
         if (!userId) return req.reject(401, 'authentication required');
 
-        // NIGHTGATE does not verify ownership of the binding input. Deployments
-        // that gate reads on on-chain grants should disable self-service and
-        // register identities via their own proofing flow.
+        // Ownership of the binding input is not verified; deployments gating reads
+        // on grants should disable self-service and use their own proofing flow.
         if (!isSelfServiceGranteeRegistrationAllowed(getNightgatePluginConfig())) {
             return req.reject(403, 'Self-service grantee registration is disabled on this deployment. ' +
                 'Identities are registered through the operator\'s proofing flow.');
@@ -3799,13 +3429,12 @@ export function registerSubmissionHandlers(
     });
 
     /**
-     * Crawler-free evidence for verifyDocument: confirm the document's on-chain
-     * payload_hash (== its sha256) is present in the AttestationVault attestation
-     * map. Best-effort: any resolution/provider error yields `false` (a clean
-     * negative), never a 5xx.
+     * Crawler-free evidence for verifyDocument: the attester's record of the
+     * sha256 in live state. Any error is a clean false, never a 5xx.
      */
     async function verifyDocumentViaState(
         contractAddress: string,
+        attesterId: string,
         payloadHash: string,
         compiledArtifactRef?: string,
         networkOverride?: NightgateNetwork,
@@ -3815,13 +3444,12 @@ export function registerSubmissionHandlers(
             const compiledRef = compiledArtifactRef && compiledArtifactRef.length > 0
                 ? compiledArtifactRef
                 : DEFAULT_ATTESTATION_VAULT_REF;
-            // Generation binding, ATOMIC: the resolver verifies the recorded
-            // digest against the very snapshot it imports; a re-pointed alias
-            // or an in-place asset overwrite throws and yields the clean
-            // negative below, never a false "verified".
+            // Atomic digest check: a re-pointed alias or overwritten asset throws
+            // and yields false, never a false "verified".
             const resolved = await contractResolver(compiledRef, recordedArtifactDigest ?? undefined);
             const state = await attestationStateReader({
                 contractAddress,
+                attesterId,
                 payloadHash,
                 artifactPath: resolved.artifactPath,
                 contractProvidersConfig: contractProvidersConfigForNetwork(resolved.zkConfigPath, networkOverride)
@@ -3833,38 +3461,24 @@ export function registerSubmissionHandlers(
     }
 
     /**
-     * Crawler-free evidence for verifyPredicateAttestation: recompute the claim
-     * key from the row and confirm a (true) result is recorded on-chain.
-     * Best-effort: any error yields `false`, never a 5xx. Defaults to the
-     * canonical attestation-vault artifact (the row does not carry a ref).
+     * Crawler-free evidence for verifyPredicateAttestation: the row's recomputed
+     * claim key holds true on-chain. Any error is a clean false, never a 5xx.
      */
     async function verifyPredicateViaState(row: any): Promise<boolean> {
         try {
-            // Evidence provenance (0.16.0): the state read runs against the
-            // artifact and network RECORDED at proving time, not the current
-            // defaults (a redeploy or network switch must not silently change
-            // what a stored attestation verifies against). Pre-0.16.0 rows
-            // carry nulls and keep the previous default behavior. The alias
-            // is additionally pinned to its recorded GENERATION digest: a
-            // re-pointed alias yields a clean negative.
+            // The artifact, digest and network recorded at proving time, so a
+            // redeploy or re-pointed alias cannot change what a stored claim verifies.
             const rowRef = row.compiledArtifactRef || DEFAULT_ATTESTATION_VAULT_REF;
-            // Atomic: the resolver checks the recorded digest against the very
-            // snapshot it imports; a mismatch throws and lands in the clean
-            // negative below.
             const resolved = await contractResolver(rowRef, row.artifactDigest ?? undefined);
             const recordedNetwork = row.network && (VALID_NIGHTGATE_NETWORKS as readonly string[]).includes(row.network)
                 ? row.network as NightgateNetwork
                 : undefined;
-            // The row's `predicate` literal discriminates the claim kind: the
-            // bytes kinds carry expectedDigest/setRoot (no threshold/op); the
-            // numeric kinds carry threshold/op + fieldKey (field-bound only
-            // since the commitment lane's removal in 0.16.0); the cross-root
-            // kinds carry payloadHashB plus allowedMask (integrity) or
-            // k-in-threshold (diff).
             const bytesKind = row.predicate === 'bytesEquality' || row.predicate === 'setMembership';
             const docKind = row.predicate === 'documentIntegrity' || row.predicate === 'documentDiff';
+            if (!row.attesterId) return false;
             const proven = await predicateStateReader({
                 contractAddress: row.contractAddress,
+                attesterId: row.attesterId,
                 payloadHash: row.payloadHash,
                 threshold: (bytesKind || docKind) ? undefined : BigInt(row.threshold),
                 op: (bytesKind || docKind) ? undefined : Number(row.op),
@@ -3872,6 +3486,7 @@ export function registerSubmissionHandlers(
                 expectedDigest: row.predicate === 'bytesEquality' ? (row.expectedDigest || undefined) : undefined,
                 setRoot: row.predicate === 'setMembership' ? (row.setRoot || undefined) : undefined,
                 payloadHashB: docKind ? (row.payloadHashB || undefined) : undefined,
+                attesterIdB: docKind ? (row.attesterIdB || undefined) : undefined,
                 allowedMask: row.predicate === 'documentIntegrity' ? Number(row.allowedMask) : undefined,
                 k: row.predicate === 'documentDiff' ? Number(row.threshold) : undefined,
                 slotWidth: vaultDims(rowRef).width,
@@ -3885,24 +3500,32 @@ export function registerSubmissionHandlers(
     }
 
     /**
-     * Best-effort chain reindex after a disclosure grant/revoke submit. Swallows
-     * all errors: an indexing failure must never fail the submission (the row
-     * already records intent; a later reindex reconciles).
+     * Grant columns once the chain took the level. `active` is left to the
+     * disclosure indexer, which re-materialises it from ledger state right after.
      */
-    /**
-     * Column values of a grant row once the chain took the level: the
-     * requested level becomes the confirmed one, the pending marker and a
-     * stale revoke are cleared. `active` is left to the disclosure indexer,
-     * which re-materialises it from ledger state right after.
-     */
-    function confirmedDisclosureLevel(level: number, txHash: string, changedAt: string): Record<string, unknown> {
-        return { level, pendingLevel: null, grantedTxHash: txHash, revokedTxHash: null, modifiedAt: changedAt };
+    function confirmedDisclosureLevel(level: number, txHash: string, changedAt: string, landedHeight: number | null): Record<string, unknown> {
+        return { level, pendingLevel: null, grantedTxHash: txHash, revokedTxHash: null, modifiedAt: changedAt, ...heightStamp(landedHeight) };
+    }
+
+    /** The row's `changedAtHeight` column value for a change that landed at `height` (nothing when unknown). */
+    function heightStamp(height: number | null): Record<string, unknown> {
+        return Number.isInteger(height) && (height as number) >= 0 ? { changedAtHeight: height } : {};
     }
 
     /**
-     * Drop the pending marker of a level request the chain did not take. The
-     * `pendingLevel` predicate keeps a NEWER request (a different level
-     * asked for after this job was admitted) untouched.
+     * A confirmation that landed at `height` only writes rows nothing ordered has
+     * touched since: unstamped rows, or rows stamped strictly below it. Same-block
+     * and unknown-height writes defer to the reindex, which reads the ledger.
+     */
+    function notNewerThan(query: any, height: number | null): any {
+        return Number.isInteger(height) && (height as number) >= 0
+            ? query.and('(changedAtHeight is null or changedAtHeight <', height, ')')
+            : query.and('changedAtHeight is null');
+    }
+
+    /**
+     * Drop the pending marker of a level request the chain did not take; matching
+     * on `pendingLevel` leaves a newer request untouched.
      */
     async function clearPendingDisclosureLevel(disclosureGrantId: string, level: number): Promise<void> {
         try {
@@ -3914,17 +3537,91 @@ export function registerSubmissionHandlers(
         }
     }
 
-    async function reindexAfterSubmit(contractAddress: string, resolved: ResolvedContract): Promise<void> {
+    /**
+     * The attester an issue action proves against: the session's own unless named.
+     * A content root anchors only under the own record (the circuit keys by caller).
+     */
+    async function resolveAttester(req: Request, sessionId: string | undefined, requested: string | undefined, anchorsRoot: boolean): Promise<string | null> {
+        let own: string;
         try {
-            await disclosureReindexer({
-                db,
-                contractAddress,
-                artifactPath: resolved.artifactPath,
-                contractProvidersConfig: contractProvidersConfigFromEnv(resolved.zkConfigPath)
-            });
-        } catch {
-            /* best-effort; intentionally ignored */
+            own = await attesterIdResolver({ sessionId: sessionId!, db, expectedUserId: (req as any).user?.id });
+        } catch (err) {
+            if (err instanceof SessionNotFoundError) { req.reject(401, err.message); return null; }
+            throw err;
         }
+        const attesterId = requested ? requested.toLowerCase() : own;
+        if (anchorsRoot && attesterId !== own) {
+            req.reject(400, "a content root can only be anchored under the session's own attester id; omit attesterId or drop contentRoot");
+            return null;
+        }
+        return attesterId;
+    }
+
+    /**
+     * Best-effort reindex as of the landed height (the snapshot cannot predate the
+     * change); a failure never fails the submission, a later reindex reconciles.
+     */
+    function runDisclosureReindex(contractAddress: string, resolved: ResolvedContract, atHeight: number | null): Promise<unknown> {
+        return disclosureReindexer({
+            db,
+            contractAddress,
+            artifactPath: resolved.artifactPath,
+            contractProvidersConfig: contractProvidersConfigFromEnv(resolved.zkConfigPath),
+            atHeight
+        });
+    }
+
+    /**
+     * Projection catch-up after a landed grant, revoke or retract. The
+     * confirmation write is already in; a failed reindex is retried by a durable
+     * `reindexDisclosures` job under the originating job's session.
+     */
+    async function reindexAfterSubmit(contractAddress: string, resolved: ResolvedContract, atHeight: number | null, origin: BackgroundJobRow, compiledArtifactRef: string): Promise<void> {
+        try {
+            await runDisclosureReindex(contractAddress, resolved, atHeight);
+            return;
+        } catch (err) {
+            cds.log('nightgate').warn(`disclosure reindex of ${contractAddress.slice(0, 16)} after job ${origin.ID} failed, queuing a retry job: ${String((err as Error)?.message ?? err).slice(0, 200)}`);
+        }
+        try {
+            await startJob({
+                kind: 'reindexDisclosures',
+                sessionId: origin.sessionId!,
+                idempotencyKey: `reindex:${contractAddress.toLowerCase()}:${atHeight ?? 'tip'}:${origin.ID}`,
+                request: { contractAddress, atHeight, afterJob: origin.ID },
+                requestedBy: origin.requestedBy ?? undefined,
+                commandVersion: 1,
+                encryptCommand: false,
+                command: { op: 'reindexDisclosures', contractAddress, compiledArtifactRef, atHeight }
+            });
+        } catch (err) {
+            cds.log('nightgate').error(`could not queue the reindexDisclosures retry for ${contractAddress.slice(0, 16)}; run reindexDisclosures by hand: ${String((err as Error)?.message ?? err).slice(0, 200)}`);
+        }
+    }
+
+    /** Retries the reindex with backoff until it lands or the retry window closes. */
+    async function executeReindexDisclosures(raw: unknown, job: BackgroundJobRow): Promise<unknown> {
+        const command = raw as { op: string; contractAddress: string; compiledArtifactRef: string; atHeight: number | null; artifactDigest?: string };
+        if (!command || command.op !== 'reindexDisclosures') throw new Error(`Persisted command operation '${(command as any)?.op}' is incompatible with ${job.kind}`);
+        const resolved = await contractResolver(command.compiledArtifactRef, command.artifactDigest);
+        const windowMs = configMs('NIGHTGATE_DISCLOSURE_REINDEX_RETRY_MS');
+        const startedAt = Date.now();
+        let lastError: unknown;
+        for (let attempt = 1; ; attempt++) {
+            try {
+                const result: any = await runDisclosureReindex(command.contractAddress, resolved, command.atHeight);
+                return { reindexed: true, attempts: attempt, indexed: result?.indexed ?? 0, deactivated: result?.deactivated ?? 0, snapshotHeight: result?.snapshotHeight ?? null };
+            } catch (err) {
+                lastError = err;
+            }
+            const elapsed = Date.now() - startedAt;
+            const backoff = Math.min(15_000 * 2 ** (attempt - 1), 300_000, Math.max(1, windowMs / 4));
+            if (elapsed + backoff > windowMs) break;
+            await new Promise(resolve => setTimeout(resolve, backoff));
+        }
+        const err: any = new Error(`disclosure reindex of ${command.contractAddress.slice(0, 16)} still failing after ${Math.round((Date.now() - startedAt) / 1000)} s; run reindexDisclosures once the indexer answers: ${String((lastError as Error)?.message ?? lastError).slice(0, 200)}`);
+        err.code = 'DISCLOSURE_REINDEX_FAILED'; err.retryable = false;
+        throw err;
     }
 
     function buildSubmitterDeps(
@@ -3953,12 +3650,7 @@ export function registerSubmissionHandlers(
         };
     }
 
-    /**
-     * Resolves the optional per-tx fee sponsor of a submission action.
-     * Returns null when the caller did not request sponsoring. Throws
-     * FeeSponsorError (mapped by runSubmission) when the sponsor session is
-     * unusable or not authorised for this caller.
-     */
+    /** The optional per-tx fee sponsor; null when none was requested. */
     async function resolveSponsorForRequest(
         req: Request,
         sponsorSessionId: string | undefined
@@ -3974,12 +3666,8 @@ export function registerSubmissionHandlers(
 }
 
 /**
- * Resolves the WalletFacade build config from cds.requires.nightgate + env
- * vars. FAIL-CLOSED on an invalid configured network: initialize() already
- * refuses the boot, but the CAP host deliberately stays online after a
- * rejected init, so every submission/job/provider entry point that resolves
- * its config HERE must refuse the silent preprod fallback too (not rely on
- * the wallet worker never having started).
+ * WalletFacade config. Fail-closed on an invalid network: the CAP host stays
+ * online after a rejected init, so this must refuse the fallback network itself.
  */
 function facadeConfigFromEnv() {
     const nightgateConfig = getNightgatePluginConfig();
@@ -4003,86 +3691,12 @@ function recordedNetworkId(): string | null {
     try { return facadeConfigFromEnv().networkId ?? null; } catch { return null; }
 }
 
-/**
- * Artifact-generation digest recorded on evidence rows; null when the alias
- * is not registered yet (the submission itself then fails later anyway).
- */
+/** Artifact-generation digest recorded on evidence rows; null for an unregistered alias. */
 function artifactDigestOrNull(compiledRef: string): string | null {
     try { return getArtifactGenerationDigest(compiledRef); } catch { return null; }
 }
 
-/**
- * True when a live indexer provider is configured, i.e. crawler-free state
- * verification can attempt a `queryContractState` round-trip. When false, the
- * state-verification surfaces return a clean negative instead of a 5xx.
- *
- * With a `network` override to a DIFFERENT network than the configured one, the
- * override endpoints are what matter (they resolve from `config.networks` or
- * the built-in public defaults, so they always exist for a valid network).
- */
-function liveProviderConfigured(networkOverride?: NightgateNetwork): boolean {
-    const { network, submissionEndpoints } = resolveNightgateRuntimeConfig(getNightgatePluginConfig());
-    if (networkOverride && networkOverride !== network) {
-        const eps = resolveOverrideIndexerEndpoints(networkOverride, getNightgatePluginConfig());
-        return Boolean(eps.indexerHttpUrl && eps.indexerWsUrl);
-    }
-    return Boolean(submissionEndpoints.indexerHttpUrl && submissionEndpoints.indexerWsUrl);
-}
-
-/** Contract-only provider config (no wallet) for read-side reindexing. */
-function contractProvidersConfigFromEnv(zkConfigPath: string): ContractProvidersConfig {
-    const { submissionEndpoints } = resolveNightgateRuntimeConfig(getNightgatePluginConfig());
-    return {
-        indexerHttpUrl: submissionEndpoints.indexerHttpUrl,
-        indexerWsUrl: submissionEndpoints.indexerWsUrl,
-        proofServerUrl: submissionEndpoints.proofServerUrl,
-        zkConfigPath
-    };
-}
-
-/**
- * Contract-only provider config honouring the optional per-call `network`
- * override on the crawler-free verify surface.
- * Omitted or equal to the configured network → EXACTLY
- * `contractProvidersConfigFromEnv` (env / top-level config keep winning). A
- * different valid network swaps only the indexer endpoints; proof server and
- * zkConfig stay as configured, since compiled artifacts are network-agnostic
- * and the read path never proves.
- */
-function contractProvidersConfigForNetwork(
-    zkConfigPath: string,
-    networkOverride?: NightgateNetwork
-): ContractProvidersConfig {
-    const base = contractProvidersConfigFromEnv(zkConfigPath);
-    if (!networkOverride) return base;
-    const { network } = resolveNightgateRuntimeConfig(getNightgatePluginConfig());
-    if (networkOverride === network) return base;
-    const eps = resolveOverrideIndexerEndpoints(networkOverride, getNightgatePluginConfig());
-    return { ...base, indexerHttpUrl: eps.indexerHttpUrl, indexerWsUrl: eps.indexerWsUrl };
-}
-
-/**
- * Validates the optional `network` param of the state-verify functions.
- * Returns `{ ok: false }` after rejecting with 400 for an unknown value
- * (criterion 3: explicit 400, never a silent fallback).
- */
-function parseVerifyNetworkOverride(
-    raw: string | undefined,
-    req: Request
-): { ok: boolean; network?: NightgateNetwork } {
-    if (!raw) return { ok: true };
-    if (!(VALID_NIGHTGATE_NETWORKS as readonly string[]).includes(raw)) {
-        req.reject(400, `network must be one of: ${VALID_NIGHTGATE_NETWORKS.join(', ')}`);
-        return { ok: false };
-    }
-    return { ok: true, network: raw as NightgateNetwork };
-}
-
-/**
- * Mainnet submission gate. Returns true (and rejects with 403) when the resolved
- * network is mainnet and allowMainnetSubmission is not enabled. Call at the top
- * of every on-chain submission handler before doing any work.
- */
+/** Mainnet gate: rejects 403 and returns true when submission is not allowed. Call before any work. */
 function rejectIfMainnetBlocked(req: Request): boolean {
     const reason = mainnetSubmissionBlockReason(getNightgatePluginConfig());
     if (reason) {
@@ -4093,11 +3707,8 @@ function rejectIfMainnetBlocked(req: Request): boolean {
 }
 
 /**
- * Rate-limit key: the PRINCIPAL first (agent grant when the request carries a
- * token, else the user), then the caller-supplied scope (session id or
- * contract address). The scope alone is caller input and is checked before
- * ownership, so keyed on it alone any authenticated user could spend another
- * user's budget by naming their session.
+ * Principal first, then the scope: the scope is caller input checked before
+ * ownership, so alone it would let any user spend another's budget.
  */
 function rateKey(req: Request, scope: string): string {
     return principalRateKey(req, scope);
@@ -4133,8 +3744,6 @@ async function runSubmission(req: Request, op: () => Promise<unknown>): Promise<
         return await op();
     } catch (err) {
         if (err instanceof CoercionError) {
-            // Bad arg encoding (invalid hex, wrong byte length, non-integer
-            // Uint, …): a clean 400, not a deep circuit type error.
             return req.reject(400, err.message);
         }
         if (err instanceof ContractNotRegisteredError) {
@@ -4147,23 +3756,19 @@ async function runSubmission(req: Request, op: () => Promise<unknown>): Promise<
             return req.reject(err.httpStatus, err.message);
         }
         if (err instanceof SponsorPolicyEmptyError) {
-            // Grant ∩ platform floor is empty: 403 at admission, nothing written.
             return req.reject({ status: err.httpStatus, code: err.code, message: err.message } as any);
         }
         if (err instanceof SponsorPolicyUnavailableError) {
-            // Policy file configured but unusable, nothing good loaded yet: fail closed,
-            // message kept readable in production.
+            // `$sanitize: false` keeps the message readable in production.
             return req.reject({ status: err.httpStatus, code: err.code, message: err.message, $sanitize: false } as any);
         }
         if (err instanceof WalletMaterialUnavailable) {
-            // 501 = the session lacks signing material (no seed). The caller must
-            // run connectWalletForSigning before deploy/call/submit actions.
+            // No signing material: the caller must run connectWalletForSigning first.
             return req.reject(501, err.message);
         }
         if (err instanceof JobAdmissionBusyError) {
-            // Busy, not broken: nothing written, nothing submitted, the caller can resend.
-            // Rejected as an object so code and `$sanitize: false` ride along; a bare
-            // (status, message) pair is re-wrapped by CAP and sanitised in production.
+            // Busy, nothing written. An object keeps code and `$sanitize: false`; a
+            // bare (status, message) pair is sanitised by CAP in production.
             setRetryAfter(req, err.retryAfterSeconds);
             return req.reject({ status: err.httpStatus, code: err.code, message: err.message, $sanitize: false } as any);
         }

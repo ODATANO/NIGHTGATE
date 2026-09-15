@@ -83,7 +83,7 @@ describe('IndexerService SyncState', () => {
 
     it('should not overwrite existing SyncState at init', async () => {
         // SELECT returns an existing, network-bound row (a null networkId
-        // would trigger the 0.16.0 legacy backfill/guard instead).
+        // would trigger the legacy backfill/guard instead).
         mockDbRun.mockResolvedValueOnce({
             ID: 'SINGLETON',
             networkId: 'testnet',

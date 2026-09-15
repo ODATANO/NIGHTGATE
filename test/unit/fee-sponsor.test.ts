@@ -151,8 +151,6 @@ describe('resolveFeeSponsor', () => {
     });
 
     it('a CONFIGURED platform sponsor does not expire (infrastructure, not a caller session)', async () => {
-        // Live 2026-08-19: the hosted pool died 24 h after setup because its
-        // sessions expired like any caller session.
         process.env.NIGHTGATE_FEE_SPONSOR_SESSION = 'sponsor-session-1';
         const db = makeDb(sponsorRow({ userId: 'platform-operator', expiresAt: new Date(Date.now() - 60_000).toISOString() }));
         const sponsor = await resolveFeeSponsor({ db, sponsorSessionId: 'sponsor-session-1', requestingUserId: 'anyone', encryptionKey: TEST_KEY });

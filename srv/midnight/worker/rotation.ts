@@ -1,11 +1,7 @@
-/**
- * Worker rotation and shutdown: admission drain after the generation budget,
- * evict-all with acked final saves, the rotation-done handshake.
- */
+/** Worker rotation and shutdown: admission drain, evict-all with acked final saves. */
 
-// First import on purpose: the worker modules import each other in cycles,
-// and a value read at module level must come from an import that is
-// resolved before the cycle re-enters this module.
+// First import on purpose: the worker modules import each other in cycles and
+// a module-level read must resolve before the cycle re-enters.
 import { configNumber } from '../../utils/config';
 import { WORKER_ROTATING } from '../wallet-worker-protocol';
 import { formatErr } from '../../utils/format-error';
@@ -13,21 +9,12 @@ import { parentPort } from 'node:worker_threads';
 import { facades, log } from './context';
 import { evict } from './facades';
 
-// ---- Worker rotation ---------------------------------------------------------
-
 /**
- * Node's ESM module cache keeps every imported generation for the life of the thread.
- * After NIGHTGATE_WORKER_MAX_GENERATIONS (default 32, 0 = never) distinct generations the
- * worker exits at the next idle moment (no RPC in flight, so no session lock held and no
- * proof running); the main thread respawns it and counts a rotation, not a crash.
- * A rotation makes the facade set cold (a large dust snapshot deserialises for minutes).
+ * Node's ESM cache keeps every imported generation for the thread's life, so
+ * after NIGHTGATE_WORKER_MAX_GENERATIONS the worker exits when idle and is respawned.
  */
 export const importedGenerations = new Set<string>();
-/**
- * Rotation state, one object so the dispatcher can account in-flight submits
- * from its own module. `draining`: admission closed, in-flight RPCs drain, new
- * ones are refused with WORKER_ROTATING and retried by the client.
- */
+/** One object so the dispatcher can count in-flight RPCs from its own module. */
 export const rotationState = { pending: false, draining: false, inflight: 0, finalizing: false };
 export { WORKER_ROTATING };
 
@@ -56,9 +43,8 @@ export function __resetRotationForTests(): void {
 }
 
 /**
- * Runs on every RPC completion (success or failure) and when a rotation becomes due:
- * close admission first (the main thread holds new calls until the respawn), then exit
- * once nothing is in flight. An admitted proof or submission always completes.
+ * Runs on every RPC completion and when a rotation becomes due: close admission
+ * first, exit once nothing is in flight. An admitted call always completes.
  */
 export function rotateIfDue(): void {
     if (!rotationState.pending) return;
@@ -69,11 +55,6 @@ export function rotateIfDue(): void {
     }
     if (rotationState.inflight > 0 || rotationState.finalizing) return;
     rotationState.finalizing = true;
-    // Every facade gets its final, acked save first: a rotation used to lose
-    // up to one save interval per facade, exactly like an unflushed stop.
-    // Then the MAIN thread terminates this worker on `rotation-done`: every
-    // reply posted before this message is delivered first, whereas a
-    // process.exit() from in here could drop a reply still in a port queue.
     void (async () => {
         const { evicted, failed } = await evictAllFacades('rotation');
         parentPort?.postMessage({ kind: 'rotation-done', generations: importedGenerations.size, evicted, failed });
@@ -81,11 +62,7 @@ export function rotateIfDue(): void {
     })();
 }
 
-/**
- * Evict every facade with an acked final save (shutdown, rotation). A save
- * that did not confirm is reported per session at error level and counted;
- * the eviction itself still proceeds (the thread is going away).
- */
+/** Evict every facade with an acked final save; an unconfirmed save is counted, the eviction still proceeds. */
 export async function evictAllFacades(site: string): Promise<{ evicted: number; failed: number }> {
     const ids = [...facades.keys()];
     const results = await Promise.allSettled(ids.map(sessionId => evict({ sessionId, awaitSaveAck: true })));
@@ -107,12 +84,8 @@ export function __admitRpcForTests(): boolean { return !rotationState.draining; 
 
 
 /**
- * Process shutdown: close admission, then evict EVERY facade (final save,
- * acked by the main thread's sink, keys zeroed, facade stopped). The main
- * thread terminates this worker after the reply; without this call a
- * SIGTERM lost up to one save interval of sync and dust progress per
- * facade. Evictions run in parallel; each waits for its own session lock,
- * so an in-flight submit on a session completes before its keys go.
+ * Process shutdown: close admission, evict every facade (else a SIGTERM loses a
+ * save interval). Each eviction waits for its session lock, so an in-flight submit completes.
  */
 export async function shutdown() {
     rotationState.draining = true;

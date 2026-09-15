@@ -24,6 +24,7 @@ type Row = {
     command?: string | null;
     commandEncoding?: string | null;
     requestedBy?: string | null;
+    grantId?: string | null;
     parentJobId?: string | null;
     workflowStep?: string | null;
     result: string | null;
@@ -140,6 +141,7 @@ const runMock = vi.hoisted(() => (vi.fn(async (q: any) => {
             command: entry.command ?? null,
             commandEncoding: entry.commandEncoding ?? null,
             requestedBy: entry.requestedBy ?? null,
+            grantId: entry.grantId ?? null,
             parentJobId: entry.parentJobId ?? null,
             workflowStep: entry.workflowStep ?? null,
             result:         entry.result ?? null,
@@ -311,6 +313,33 @@ beforeEach(() => {
 // ---- startJob: insert + spawn + transitions --------------------------------
 
 describe('startJob: insert row + return jobId', () => {
+    test('stamps the agent grant on the row and hands it down to child jobs; other principals leave it null', async () => {
+        registerBackgroundJobProcessor('grantedKind', 1, LIGHT_KIND, async () => ({ ok: true }));
+        const granted = await startJob({
+            kind: 'grantedKind', sessionId: 'sess-1', requestedBy: 'alice', grantId: 'grant-7',
+            request: {}, commandVersion: 1, command: { op: 'x' }
+        });
+        const plain = await startJob({
+            kind: 'grantedKind', sessionId: 'sess-1', requestedBy: 'alice',
+            request: {}, commandVersion: 1, command: { op: 'y' }
+        });
+        await flushSpawn();
+        expect(rows.get(granted.jobId)?.grantId).toBe('grant-7');
+        expect(rows.get(plain.jobId)?.grantId).toBeNull();
+
+        registerBackgroundJobProcessor('childOfGrant', 1, LIGHT_KIND, async () => ({ txHash: '0xchild' }));
+        const parent = {
+            ID: 'parent-granted', kind: 'workflow', sessionId: 'sess-1', requestedBy: 'alice', grantId: 'grant-7', commandVersion: 1
+        } as any;
+        const childPromise = runChildCommand<{ txHash: string }>({
+            parent, kind: 'childOfGrant', step: 'one', commandVersion: 1, request: {}, command: { op: 'submit' }
+        });
+        await flushSpawn();
+        await childPromise;
+        const child = [...rows.values()].find(r => r.parentJobId === 'parent-granted');
+        expect(child?.grantId).toBe('grant-7');
+    });
+
     test('marks a partially effective workflow for reconciliation instead of failed', async () => {
         registerBackgroundJobProcessor('partialWorkflow', 1, LIGHT_KIND, async () => {
             throw new WorkflowReconciliationRequiredError('step one succeeded; step two failed');
@@ -1331,8 +1360,7 @@ describe('startJob: per-kind semaphore', () => {
         for (const kind of [
             'issueFieldPredicateAttestation', 'issueFieldPredicateAttestationBatch',
             'issueFieldEqualityAttestation', 'issueFieldMembershipAttestation',
-            'issueDocumentIntegrityAttestation', 'issueDocumentDiffAttestation',
-            'anchorDocumentGuarded'
+            'issueDocumentIntegrityAttestation', 'issueDocumentDiffAttestation'
         ]) {
             expect(parents.has(kind), kind).toBe(true);
         }
@@ -1707,10 +1735,9 @@ describe('recoverInterruptedJobs', () => {
         expect(rows.get('oth')!.errorCode).toBe('PROCESS_RESTART_BEFORE_BROADCAST');
     });
 
-    // Live regression (2026-08-04): every ungraceful stop left one more
-    // `connectWalletForSigning` in `running`, and each boot replayed them all.
-    // Since all wallet facades share the ONE worker thread, those unrequested
-    // catch-ups time-shared a core with the wallet the host actually wanted.
+    // An ungraceful stop leaves `connectWalletForSigning` rows in `running`;
+    // replaying them at boot would time-share the ONE worker thread (all wallet
+    // facades live there) with the wallet the host actually wants.
     test('drops session-bound prewarm jobs terminally instead of re-queuing them', async () => {
         const now = new Date().toISOString();
         const base = {
@@ -1787,11 +1814,10 @@ describe('recoverInterruptedJobs', () => {
 
 // ---- Status-write contention hardening ---------------------------------------
 //
-// Simulates the live incident of 2026-07-19: a foreign long commit (multi-MB
-// facade save) holds the SQLite write lock past busy_timeout, so the tiny
-// mark* status UPDATEs throw "database is locked". Without retries, the job
-// row is stranded in a non-terminal state and pollers die on their own
-// watchdog timeout.
+// A foreign long commit (multi-MB facade save) can hold the SQLite write lock
+// past busy_timeout, so the tiny mark* status UPDATEs throw "database is
+// locked". Without retries the job row is stranded in a non-terminal state
+// and pollers die on their own watchdog timeout.
 
 describe('status-write contention hardening', () => {
     beforeEach(() => {
@@ -1800,8 +1826,7 @@ describe('status-write contention hardening', () => {
     });
 
     test('the ADMISSION insert survives transient lock contention (job still starts)', async () => {
-        // Live: `database is locked` 500 on sponsorFinalizedTransaction while a
-        // multi-wallet box was saving nine facades. Retried like a status write.
+        // The admission insert is retried like a status write.
         lockInjector.failInserts = 2;
         const ret = await startJob({
             kind:      'sendNight',
@@ -1817,9 +1842,8 @@ describe('status-write contention hardening', () => {
     });
 
     test('an admission that stays locked is a 503, not a raw lock error', async () => {
-        // Exhausting the budget used to surface `database is locked` as a 500,
-        // which reads as "your request broke the server". Nothing was written
-        // and nothing submitted, so the honest answer is: busy, send it again.
+        // Nothing was written and nothing submitted, so the answer is busy,
+        // send it again: a 503, not a raw lock error.
         lockInjector.failInserts = 99;
         try {
             await expect(startJob({

@@ -1,7 +1,4 @@
-/**
- * Wallet session management: connect, disconnect, cleanup. Extracted from
- * NightgateService to keep session concerns off the OData read handlers.
- */
+/** Wallet session handlers: connect, disconnect, wallet jobs, cleanup. */
 
 import cds, { Request } from '@sap/cds';
 const { SELECT, INSERT, UPDATE } = cds.ql;
@@ -38,27 +35,21 @@ import { resolveFeeSponsor, ensureFeeSponsorFacade, FeeSponsorError, getConfigur
 import { isSessionExpired } from '../utils/session-expiry';
 import { principalRateKey } from '../utils/rate-limiter';
 import { configMs, configNumber } from '../utils/config';
+import { syncGateReading } from '../submission/sponsor-sync-gate';
 
-// Absolute ceiling for the prewarm sync-to-tip wait; the primary bound is
-// lack of progress (NIGHTGATE_PREWARM_STALL_MS, worker default 10 min).
+// Absolute ceiling for the prewarm wait; the primary bound is lack of progress.
 const PREWARM_SYNC_TIMEOUT_MS = configMs('NIGHTGATE_PREWARM_SYNC_TIMEOUT_MS');
 const PREWARM_STALL_MS = configMs('NIGHTGATE_PREWARM_STALL_MS');
-// A getWalletSyncProgress snapshot older than this is reported `stale`; the
-// worker pushes every ~15 s while a wait runs.
+
 const SYNC_PROGRESS_STALE_S = configNumber('NIGHTGATE_SYNC_PROGRESS_STALE_S');
 
-// Bounded sync gate for facade-backed READ actions (getWalletBalance and the
-// fee estimates): a facade still catching up must not park the request for
-// minutes; the caller gets 503 WALLET_SYNCING and polls again. <= 0 disables
-// the gate (wait indefinitely, the pre-0.10.2 behavior).
+// Facade-backed reads answer 503 WALLET_SYNCING instead of parking while the
+// facade catches up. <= 0 waits indefinitely.
 const WALLET_READ_SYNC_TIMEOUT_MS = configMs('NIGHTGATE_WALLET_READ_SYNC_TIMEOUT_MS');
 const readSyncTimeoutMs = (): number | undefined =>
     WALLET_READ_SYNC_TIMEOUT_MS > 0 ? WALLET_READ_SYNC_TIMEOUT_MS : undefined;
 
-/**
- * `startJob` for wallet actions that do not go through `runSubmission`: a busy
- * admission is the same retryable 503 with `Retry-After`.
- */
+/** `startJob` that turns a busy admission into a retryable 503 with `Retry-After`. */
 async function startJobOrRetryAfter(req: Request, input: Parameters<typeof startJob>[0]): Promise<Awaited<ReturnType<typeof startJob>>> {
     try {
         return await startJob(input);
@@ -71,16 +62,10 @@ async function startJobOrRetryAfter(req: Request, input: Parameters<typeof start
     }
 }
 
-/**
- * Map a wallet-worker read failure onto the OData response: a sync-gate
- * timeout is a retryable 503 with a stable code (`WALLET_SYNCING`), everything
- * else stays a 500 with the worker's message.
- */
 function rejectWorkerReadError(req: Request, action: string, err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
     if (/sync timeout/i.test(msg)) {
-        // `$sanitize: false`: CAP strips every 5xx message in production; this
-        // one is the retry advice.
+        // `$sanitize: false`: CAP strips 5xx messages in production; this one is retry advice.
         try { (req as any).http?.res?.set?.('Retry-After', '15'); } catch { /* courtesy header */ }
         return req.reject({
             code: 'WALLET_SYNCING',
@@ -98,31 +83,22 @@ const walletRateLimiter = new RateLimiter({
 });
 
 const signingKeyRateLimiter = new RateLimiter({
-    // Adding a signing key is a one-time-per-session operation, so the bound
-    // stays tight. 10/h leaves room for multi-wallet consumers that prewarm
-    // several server wallets at login (shared with deriveWalletInfo).
-    // Override via env when a deployment needs a different budget.
+    // Shared with deriveWalletInfo; tight, since a signing key is added once per session.
     windowMs: 60 * 60 * 1000,
     maxRequests: configNumber('NIGHTGATE_SIGNING_KEY_RATE_LIMIT')
 });
 
 const dustRegRateLimiter = new RateLimiter({
-    // Registration is per-NIGHT-UTXO; once registered, repeat calls are no-ops.
-    // Tight bound so accidental polling doesn't hammer the chain.
     windowMs: 60 * 60 * 1000,
     maxRequests: 10
 });
 
 const sendRateLimiter = new RateLimiter({
-    // Common operation; tighter than read-only but generous enough for
-    // legitimate retry-on-flaky-network scenarios.
     windowMs: 60 * 1000,
     maxRequests: 10
 });
 
 const diagnosticsRateLimiter = new RateLimiter({
-    // Read-only ops; generous limit since these inform UI and should be
-    // pollable. Still bounded to prevent abuse.
     windowMs: 60 * 1000,
     maxRequests: 60
 });
@@ -190,11 +166,8 @@ async function executeWalletCommand(raw: unknown, job: BackgroundJobRow, db: any
         await walletWaitForSyncedState(accountId, PREWARM_SYNC_TIMEOUT_MS, PREWARM_STALL_MS);
         return { ready: true };
     }
-    // The worker announces the identifier before it broadcasts; recording it
-    // here makes the job's txHash the one transaction that may be on chain (a
-    // restart in between reconciles against it instead of guessing). A
-    // definitive node reject of that identifier takes it off the job again
-    // (nothing of it can be on chain), so the job fails plainly.
+    // Record each announced identifier on the job before broadcast; a pre-inclusion
+    // reject takes it off again, so the job's txHash is the one that may be on chain.
     let announced: string | null = null;
     const onSubmitIntent = async (txHash: string) => { await reportBroadcastOn(db, { txHash, firstBoundary: false }); announced = txHash; };
     const withRejectBookkeeping = async <T>(work: () => Promise<T>): Promise<T> => {
@@ -220,8 +193,6 @@ async function executeWalletCommand(raw: unknown, job: BackgroundJobRow, db: any
             dustReceiverAddress: command.dustReceiverAddress || undefined,
             onSubmitIntent
         }));
-        // The worker reports the outcome (changed/reason, applied receiver,
-        // resulting registered-UTXO count); passed through whole.
         return { ...result, txId: result.txId ?? '' };
     }
     if (command.op === 'deregisterDust') {
@@ -241,10 +212,7 @@ async function executeWalletCommand(raw: unknown, job: BackgroundJobRow, db: any
     throw new Error(`Unsupported wallet command operation: ${(command as any).op}`);
 }
 
-/**
- * Mainnet submission gate. Rejects with 403 when network is mainnet and allowMainnetSubmission is not enabled.
- * Applied to the on-chain token/dust actions; read-only diagnostics are exempt.
- */
+/** Mainnet submission gate for on-chain actions; read-only diagnostics are exempt. */
 function rejectIfMainnetBlocked(req: Request): boolean {
     const reason = mainnetSubmissionBlockReason(getNightgatePluginConfig());
     if (reason) {
@@ -254,12 +222,7 @@ function rejectIfMainnetBlocked(req: Request): boolean {
     return false;
 }
 
-/**
- * Parse a NIGHT-atom decimal string into a bigint, returning a discriminator
- * either `{ ok: true, value }` for the parsed value or `{ ok: false, msg }`
- * with a user-facing error message. Encapsulates the validation rules
- * for the sendNight handler.
- */
+/** Parse and bound an atom amount; `msg` is user-facing. */
 function parseNightAmount(raw: string | undefined, customToken = false): { ok: true; value: bigint } | { ok: false; msg: string } {
     if (!raw) return { ok: false, msg: 'amount is required' };
     let value: bigint;
@@ -273,9 +236,6 @@ function parseNightAmount(raw: string | undefined, customToken = false): { ok: t
     return { ok: true, value };
 }
 
-/**
- * Validate an optional ISO-8601 TTL string. Returns null on success or a user-facing error message.
- */
 function validateOptionalTtl(ttlIso: string | undefined): string | null {
     if (!ttlIso) return null;
     const t = new Date(ttlIso);
@@ -285,11 +245,8 @@ function validateOptionalTtl(ttlIso: string | undefined): string | null {
 }
 
 /**
- * The authenticated principal id, or reject 401 and return undefined. Every
- * session-scoped action must call this and bail on undefined: sessions are
- * owned by the principal that created them, and a leaked sessionId alone must
- * not grant any other principal access. The NightgateService is
- * `@requires: 'authenticated-user'`, so a genuine caller always has an id.
+ * Principal id, or 401 + undefined. Every session-scoped action must bail on
+ * undefined: a leaked sessionId alone must not grant another principal access.
  */
 function requireUserId(req: Request): string | undefined {
     const uid = (req as any).user?.id;
@@ -298,33 +255,16 @@ function requireUserId(req: Request): string | undefined {
 }
 
 /**
- * Look up an active signing-capable session and derive its accountId, or return
- * a `{ ok: false, status, msg }` failure. Scoped to `userId` so one principal
- * cannot act on another's session (a foreign session reads back as 404, non-leaking).
- *
- * The SELECT runs OUTSIDE the ambient request tx (autocommit) on purpose: the
- * callers await the wallet worker right after this lookup, and an open request
- * tx would pin one pool connection for the whole worker wait (observed live as
- * `idle in transaction` pool starvation on PostgreSQL). Callers must therefore
- * not rely on read-your-own-write semantics for this lookup.
+ * Active signing session -> accountId, owner-scoped (foreign reads as 404). Read
+ * outside the request tx: callers then await the worker, and an open tx would pin
+ * a pool connection. No read-your-own-write.
  */
 async function loadSigningSessionAccountId(
     db: any,
     sessionId: string,
-    /**
-     * Owner constraint. `undefined` looks the session up WITHOUT it, which is
-     * only correct for a configured platform fee sponsor: that session is
-     * infrastructure every authenticated caller may already use as a sponsor,
-     * exactly as resolveFeeSponsor() treats it. Never pass undefined for a
-     * session id that came from a request.
-     */
+    /** `undefined` drops the owner constraint: ONLY for a configured platform sponsor, never a request's id. */
     userId: string | undefined,
-    /**
-     * Skip the expiry check. ONLY for a configured platform fee sponsor, which
-     * resolveFeeSponsor() exempts for the same reason: it is infrastructure,
-     * not a caller's session, and the cleanup sweep skips it too. Without this
-     * a perfectly working sponsor pool reads back as expired.
-     */
+    /** ONLY for a configured platform sponsor, which does not expire. */
     ignoreExpiry = false
 ): Promise<{ ok: true; accountId: string } | { ok: false; status: number; msg: string }> {
     const where: Record<string, unknown> = { sessionId, isActive: true };
@@ -348,11 +288,8 @@ async function loadSigningSessionAccountId(
 }
 
 /**
- * True when any active, non-expired session row references the wallet with
- * this viewingKeyHash. Uses the persisted hash, so no decryption is needed;
- * reads detached so no request tx is held across the lookup. Callers MUST
- * deactivate their own row(s) first, so "any live row" means "any OTHER
- * live owner".
+ * Any live session of this user on this wallet. Callers MUST deactivate their
+ * own rows first, so "any live row" means another live session.
  */
 async function hasLiveSessionForWallet(
     db: any,
@@ -360,16 +297,9 @@ async function hasLiveSessionForWallet(
     userId: string | null | undefined
 ): Promise<boolean> {
     if (!viewingKeyHash || !userId) return false;
-    // Ask the DB only for ACTIVE rows and decide expiry HERE, with the same
-    // predicate the rest of the server uses. A SQL `expiresAt > now` does not
-    // know that a configured platform sponsor never expires, so an expired
-    // sponsor row looked dead to this check while staying alive everywhere
-    // else, and disconnecting a sibling session of the same wallet then
-    // evicted a facade the pool was still sponsoring from.
+    // Expiry decided in JS, not SQL: SQL does not know that platform sponsors never expire.
+    // Same user only: another user's session must not keep the owner's keys warm.
     const rows: any = await runWithoutAmbientTx(() => db.run(
-        // Same wallet AND same user: another user's view-only session on this
-        // wallet must not keep the disconnecting owner's signing keys warm; it
-        // re-opens its own facade from its own material on next use.
         SELECT.from(WalletSessions)
             .columns('sessionId', 'expiresAt')
             .where({ viewingKeyHash, userId, isActive: true })
@@ -379,23 +309,9 @@ async function hasLiveSessionForWallet(
 }
 
 /**
- * Shared-session-aware facade eviction (session-sweep-evicts-live-facade FR):
- * the facade cache is keyed by accountId while sessions are per-connect rows
- * with a TTL, so expiry or disconnect of ONE row must not evict a facade a
- * sibling session still uses (live incident 2026-07-26: the 15-min sweep
- * silently killed the demo's sponsor facades whenever a day-old leftover row
- * expired).
- *
- * Contract: call AFTER the owning row(s) have been deactivated. Checking
- * before deactivation is a TOCTOU race: two concurrent disconnects of the
- * same wallet would each see the other still active and both skip. With
- * deactivate-first, every caller re-checks after its own deactivation
- * committed, so at least one observes zero live references and evicts.
- * The per-account lock serializes the check+evict against a concurrent
- * facade (re)build (`getOrBuildWalletFacade` takes the same lock), so a
- * freshly built facade cannot be torn down by a stale decision.
- * Best-effort: never throws. Legacy rows without a viewingKeyHash always
- * evict (secure default).
+ * Evict the account's facade unless a sibling session still uses it. Call AFTER
+ * deactivating the own rows (else two concurrent disconnects both skip); the
+ * account lock guards against a concurrent rebuild. Never throws.
  */
 async function evictFacadeUnlessShared(
     db: any,
@@ -439,9 +355,7 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
         if (validationError) {
             return req.reject(400, validationError);
         }
-        // Purely cosmetic, but it is the difference between an operator view
-        // that reads and a wall of UUIDs. Bounded so it cannot be used as a
-        // storage field.
+        // Bounded so the label cannot serve as a storage field.
         if (label !== undefined && label !== null && String(label).length > 100) {
             return req.reject(400, 'label must be at most 100 characters');
         }
@@ -468,9 +382,8 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
         };
 
         await db.run(INSERT.into(WalletSessions).entries(session));
-        // The account's data key exists from the first connect, sealed under
-        // the ring AND the viewing key, so a later ring rotation rewraps it
-        // without this wallet having to be connected. Idempotent per account.
+        // Create the account data key now, so a ring rotation can rewrap it
+        // without this wallet connected. Idempotent.
         try {
             await resolveAccountDek({ db, ring: encKey, accountId: deriveAccountId(viewingKey), storagePassword: deriveStoragePassword(viewingKey) });
         } catch (err) {
@@ -487,7 +400,6 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
         };
     });
 
-    // Pure derivation
     srv.on('deriveWalletInfo', async (req: Request) => {
         const clientKey = principalRateKey(req, 'wallet');
         const rateResult = signingKeyRateLimiter.check(clientKey);
@@ -504,8 +416,6 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
             accountIndex?: number;
         };
 
-        // Input validation up front so bad requests are clean 400s (the same
-        // checks run again inside deriveWalletInfo, defense in depth).
         try {
             resolveBip39SeedHex({ mnemonic, seedHex });
         } catch (e: any) {
@@ -522,8 +432,7 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
         try {
             return await deriveWalletInfo({ mnemonic, seedHex, accountIndex: account, network });
         } catch (e: any) {
-            // SDK/derivation failure. Generic message on purpose: never let an
-            // error path reflect secret material back to the caller or logs.
+            // Generic message: never reflect secret material to caller or logs.
             cds.log('nightgate').error('deriveWalletInfo failed:', e?.message ?? 'unknown');
             return req.reject(500, 'wallet derivation failed');
         }
@@ -569,11 +478,8 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
             return req.reject(400, 'either mnemonic or seedHex (64-byte BIP39 seed, 128 hex chars) is required');
         }
 
-        // Detached read: the viewing-key derivation below loads the ESM SDK
-        // (slow on first use), and the request tx should not sit open (pinning
-        // a pool connection) while that runs. The UPDATE + startJob further
-        // down still use the ambient tx so job insert and key write commit
-        // together.
+        // Detached read: the derivation below is slow and must not pin a pool
+        // connection. UPDATE + startJob stay in the ambient tx, committing together.
         const session: any = await runWithoutAmbientTx(() => db.run(
             SELECT.one.from(WalletSessions).where({ sessionId, isActive: true, userId })
         ));
@@ -584,12 +490,8 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
 
         const encKey = getEncryptionKey();
 
-        // Fail-closed seed/session consistency check: the seed at this
-        // accountIndex must derive the session's viewing key. Without it a
-        // wrong account (or wrong mnemonic) silently signs with keys that
-        // belong to nobody the session knows: unfunded signer, and an on-chain
-        // caller_id that never matches the attesterId deriveWalletInfo
-        // reported for the connected account.
+        // The seed must derive the session's viewing key at this accountIndex, or
+        // it would sign as an unfunded identity nobody reported.
         let sessionViewingKey: string;
         try {
             sessionViewingKey = decrypt(session.encryptedViewingKey, encKey, walletSessionViewingKeyBinding(session.sessionId));
@@ -617,13 +519,10 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
                 .where({ sessionId, userId })
         );
 
-        // skips scheduling the sync-to-tip job entirely
         if (prewarm === false) {
             return { sessionId, signingEnabled: true, prewarmJobId: null, prewarmStatus: null };
         }
 
-        // Pre-warm the WalletFacade as a tracked background job, pollable via
-        // getJobStatus(prewarmJobId, sessionId).
         try {
             const accountId = deriveAccountId(sessionViewingKey);
 
@@ -631,27 +530,19 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
                 kind: 'connectWalletForSigning',
                 sessionId,
                 idempotencyKey,
-                // Strip the seed; request snapshots must never carry secrets.
+                // Request snapshots must never carry secrets.
                 request: { sessionId, accountIdPrefix: accountId.slice(0, 16) },
                 requestedBy: userId,
                 commandVersion: 1,
-                // Tamper protection at rest (AES-GCM), same as contract-call
-                // commands: a DB writer must not be able to redirect a replay.
+                // A DB writer must not be able to redirect a replay.
                 encryptCommand: true,
                 command: { op: 'prewarm' }
             });
             log.info('facade pre-warm job', job.jobId.slice(0, 8), 'started for', accountId.slice(0, 16));
 
-            // Boot hygiene (worker-calls-outside-request-tx FR item 4): this
-            // prewarm supersedes every older queued/running prewarm of the
-            // session - queued orphans never start, one already mid-run keeps
-            // its current worker wait but stays terminally SUPERSEDED. The
-            // sweep joins THIS handler's ambient tx (atomic with the job
-            // insert above; a detached write here would request a second pool
-            // connection while the request tx pins one - deadlock at
-            // pool.max=1). Best-effort: a failed sweep must not fail the
-            // connect - safe because the sweep savepoints its UPDATE, so a
-            // failure cannot leave the PostgreSQL tx aborted.
+            // Supersede older prewarms of the session. Runs in the ambient tx: a
+            // detached write would deadlock at pool.max=1. Best-effort is safe
+            // because the sweep savepoints its UPDATE.
             try {
                 await supersedeQueuedJobs('connectWalletForSigning', sessionId, job.jobId);
             } catch (err: any) {
@@ -677,9 +568,8 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
         const { sessionId } = req.data as { sessionId: string };
         if (!sessionId) return req.reject(400, 'sessionId is required');
 
-        // All DB work in this handler runs detached (autocommit): the facade
-        // evict below awaits the worker's final multi-MB state save, and an
-        // open request tx would pin a pool connection for that whole wait.
+        // All DB work detached: the evict awaits the worker's final state save,
+        // which must not pin a pool connection.
         const session: any = await runWithoutAmbientTx(() => db.run(
             SELECT.one.from(WalletSessions).where({ sessionId, userId })
         ));
@@ -694,18 +584,12 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
                     .set({ isActive: false, encryptedViewingKey: null, encryptedSeedKey: null })
                     .where({ sessionId, userId })
             ));
-            // Same shared-session-aware eviction as a live disconnect: the
-            // sweep only selects ACTIVE rows, so skipping this here would
-            // leave a sole session's in-memory keys cached forever. The
-            // in-memory `session` still carries the key material the row
-            // just lost.
+            // The sweep only sees active rows, so evict here or the keys stay cached.
             await evictFacadeUnlessShared(db, session, 'disconnectWallet(expired)');
             return req.reject(410, 'Session expired');
         }
 
-        // Deactivate FIRST, then decide about the facade (see the
-        // evictFacadeUnlessShared contract: check-before-deactivate is a
-        // TOCTOU race between two concurrent disconnects of the same wallet).
+        // Deactivate FIRST (evictFacadeUnlessShared contract).
         await runWithoutAmbientTx(() => db.run(
             UPDATE.entity(WalletSessions)
                 .set({
@@ -717,9 +601,6 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
                 .where({ sessionId, userId })
         ));
 
-        // Evict the cached WalletFacade so in-memory secret keys are dropped,
-        // unless another active session still uses this wallet (that session
-        // legitimately needs the facade and its keys).
         await evictFacadeUnlessShared(db, session, 'disconnectWallet');
     });
 
@@ -750,8 +631,6 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
             return req.reject(410, 'Session expired');
         }
 
-        // Detach the worker round-trip so the client polls job status instead of
-        // waiting for the whole registration.
         return startJobOrRetryAfter(req, {
             kind: 'registerForDustGeneration',
             sessionId,
@@ -791,7 +670,6 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
             return req.reject(410, 'Session expired');
         }
 
-        // optional per-tx fee sponsor
         let sponsor: Awaited<ReturnType<typeof resolveFeeSponsor>> | null = null;
         if (sponsorSessionId) {
             try {
@@ -844,8 +722,7 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
         if (tokenTypeHex && !/^[0-9a-fA-F]{64}$/.test(tokenTypeHex)) {
             return req.reject(400, 'tokenTypeHex must be 64 hex chars (a raw token type)');
         }
-        // The SDK matches token types by exact string; canonical raw types are
-        // lowercase, so normalize before the value reaches worker or job store.
+        // The SDK matches token types by exact string; canonical raw types are lowercase.
         const tokenType = tokenTypeHex ? tokenTypeHex.toLowerCase() : undefined;
 
         const hrpOK = receiverAddress.startsWith('mn_shield-addr_') || receiverAddress.startsWith('mn_addr_');
@@ -880,8 +757,6 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
             request: { sessionId, receiverAddress, amount, ttlIso: ttlIso || null, tokenTypeHex: tokenType || null },
             requestedBy: userId,
             commandVersion: 1,
-            // Funds-moving command: encrypt at rest like contract-call commands
-            // (AES-GCM confidentiality + tamper detection for the replay path).
             encryptCommand: true,
             command: { op: 'sendNight', receiverAddress, amount, ttlIso, tokenTypeHex: tokenType }
         });
@@ -910,19 +785,8 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
     });
 
     /**
-     * Fee-sponsor pool health in one call.
-     *
-     * Without it a client has to know the configured sponsor session ids out
-     * of band and then call getWalletBalance once per sponsor, which it can
-     * only do for sponsors it owns. What an operator actually wants before a
-     * burst is: can the pool pay, and how many transactions can it sponsor in
-     * parallel (one per registered dust backing).
-     *
-     * Visibility: the pool is listed for every authenticated caller, because
-     * every authenticated caller may already USE it as a sponsor and a dry
-     * pool is the reason their submissions fail. Exact balances are held back
-     * unless the caller is an admin or owns the session; `dustBalance` is null
-     * otherwise, while the operational flags stay readable.
+     * Sponsor pool health for every authenticated caller (all may use the pool).
+     * Amounts only for admins and session owners.
      */
     srv.on('getSponsorPoolStatus', async (req: Request) => {
         const userId = requireUserId(req);
@@ -938,14 +802,8 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
 
         const isAdmin = Boolean((req.user as any)?.is?.('admin'));
 
-        // A status endpoint must never park the caller. The read-sync gate
-        // bounds the catch-up wait, but BUILDING a cold facade happens before
-        // it and is unbounded, so the whole per-sponsor read gets its own cap.
-        // Sponsors are independent, so they run concurrently rather than
-        // adding their timeouts up.
-        // 45 s (0.21.4, was 20 s): with three warm facades on the one worker
-        // thread a status read routinely takes 5-30 s on the hosted server;
-        // 20 s reported healthy sponsors as "not warm" several times an hour.
+        // The sync gate does not bound a cold facade build, so each per-sponsor
+        // read gets its own cap.
         const perSponsorTimeoutMs = configMs('NIGHTGATE_SPONSOR_STATUS_TIMEOUT_MS');
         const withCap = async <T>(work: Promise<T>, what: string): Promise<T> => {
             let timer: NodeJS.Timeout | undefined;
@@ -984,34 +842,19 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
                 SELECT.one.from(WalletSessions).where({ sessionId, isActive: true })
             ));
             if (!session) return unusable('configured sponsor session is missing or inactive');
-            // A viewing-key-only sponsor cannot sign, so it cannot sponsor
-            // anything. Worth saying plainly: it looks configured and is not.
             if (!session.encryptedSeedKey) {
                 return unusable('sponsor session has no signing key; call connectWalletForSigning for it');
             }
 
             const maySeeAmounts = isAdmin || session.userId === userId;
 
-            // Platform sponsors are looked up without the owner constraint AND
-            // without the expiry check, on purpose: they are infrastructure,
-            // and resolveFeeSponsor() treats them exactly the same way. A pool
-            // that sponsors fine must not read back here as expired.
+            // Platform sponsors: no owner constraint, no expiry (as resolveFeeSponsor).
             const sess = await loadSigningSessionAccountId(db, sessionId, undefined, true);
             if (!sess.ok) return unusable(sess.msg);
 
             const progress = walletGetSyncProgress(sess.accountId);
-            // A STATUS endpoint must not create work. getWalletBalance() builds
-            // the facade when it is absent, and that build outlives the capped
-            // request: a monitor polling every minute would pile up worker RPCs
-            // that never settle (live-observed: inFlightRpcs climbing while no
-            // facade had reported anything).
-            //
-            // Two pure in-memory reads decide whether asking is worth it, and
-            // BOTH are needed. The progress cache only fills while a sync WAIT
-            // runs, so a facade restored from persisted state that was already
-            // at the tip never reports progress even though it is ready (also
-            // live-observed, on the hosted sponsor pool). The facade registry
-            // answers that case.
+            // Must not create work: getWalletBalance would build an absent facade
+            // past the cap. Both checks needed: a fresh facade has no progress yet.
             if (!progress && !hasWalletFacade(sess.accountId)) {
                 return {
                     ...unusable('sponsor facade is not warm yet; ask again once it has synced'),
@@ -1022,69 +865,43 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
                 const balance: any = await getWalletBalance({
                     cacheKey: sess.accountId,
                     syncTimeoutMs: readSyncTimeoutMs(),
-                    // The cap goes all the way to the worker, not just around
-                    // our own wait: abandoning the promise alone would leave
-                    // the RPC in pendingRpcs until the 30-minute backstop, and
-                    // a polling monitor would rebuild the very backlog this
-                    // endpoint is trying not to cause.
+                    // The cap reaches the worker RPC too, or abandoned RPCs pile up.
                     rpcTimeoutMs: perSponsorTimeoutMs
                 });
-                // The parallelism is the number of SPENDABLE dust notes, not
-                // the sponsor's own registered NIGHT. Dust generation can be
-                // delegated: a foreign wallet points its NIGHT at this dust
-                // address and every one of its registered UTXOs yields a note
-                // here, while this sponsor's own registration count never
-                // moves. Reading the own count as capacity showed a pool that
-                // had just quadrupled as flat.
+                // Parallelism = free dust notes, not own registrations (generation
+                // can be delegated from foreign NIGHT).
                 const ownRegistered = Number(balance?.registeredNightUtxoCount ?? 0);
-                // FREE notes, not all of them: `dustUtxoCount` is the SDK's
-                // total, which includes notes already committed to an in-flight
-                // spend, and one of those cannot back another sponsorship.
                 const pendingNotes = Number(balance?.dustPendingCount ?? 0);
                 const dustNotes = balance?.dustAvailableCount !== undefined
                     ? Number(balance.dustAvailableCount)
                     : Math.max(0, Number(balance?.dustUtxoCount ?? 0) - pendingNotes);
+                // The sponsored-job sync gate, read after the balance call (fresher).
+                const gate = syncGateReading(walletGetSyncProgress(sess.accountId));
                 return {
                     sessionId,
                     configured: true,
-                    // Usable means it can actually pay for something NOW, which
-                    // is about notes in hand. Own registrations are about future
-                    // production and deliberately do not gate this.
-                    usable: dustNotes > 0 && BigInt(String(balance?.dustBalance ?? '0')) > 0n,
+                    // Can pay NOW; own registrations deliberately do not gate this.
+                    usable: gate.caughtUp && dustNotes > 0 && BigInt(String(balance?.dustBalance ?? '0')) > 0n,
                     dustBalance: maySeeAmounts ? String(balance?.dustBalance ?? '0') : null,
-                    // Dust is GENERATED from registered NIGHT, so the NIGHT
-                    // behind the pool is part of its health: a sponsor whose
-                    // NIGHT is gone stops producing dust once the current
-                    // stock is spent. Amount redacted like the dust balance;
-                    // the UTXO count is operational, not a holding.
                     unshieldedNight: maySeeAmounts ? String(balance?.unshieldedNight ?? '0') : null,
                     totalNightUtxoCount: Number(balance?.totalNightUtxoCount ?? 0),
                     registeredNightUtxos: ownRegistered,
                     dustNotes,
                     pendingDustNotes: pendingNotes,
                     dustRestoreCount: Number(balance?.dustRestoreCount ?? 0),
-                    // The balance read passed the sync gate to get here, so
-                    // the facade reached the indexer tip: this IS the fresher
-                    // observation. `progress` was read BEFORE that call, so a
-                    // snapshot that said "behind" back then would otherwise
-                    // outvote a sync that has since completed, and a facade
-                    // restored at the tip never pushes a snapshot at all.
-                    caughtUp: true,
-                    lastError: null
+                    caughtUp: gate.caughtUp,
+                    lastError: gate.reason
                 };
             } catch (err) {
                 // One unreadable sponsor must not hide the rest of the pool.
                 return {
                     ...unusable(err instanceof Error ? err.message : String(err)),
-                    caughtUp: progress?.caughtUp ?? false
+                    caughtUp: syncGateReading(walletGetSyncProgress(sess.accountId)).caughtUp
                 };
             }
         };
 
-        // Bounded concurrency: independent sponsors must not add their
-        // timeouts up, but a large pool must not build every facade at once.
-        // The cap wraps the WHOLE per-sponsor read, database lookups included,
-        // so a slow query cannot park the caller either.
+        // Bounded concurrency: timeouts must not add up, nor all facades build at once.
         const rows: unknown[] = new Array(sponsorIds.length);
         let next = 0;
         await Promise.all(Array.from({ length: Math.min(3, sponsorIds.length) }, async () => {
@@ -1130,14 +947,9 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
         const sess = await loadSigningSessionAccountId(db, sessionId, userId);
         if (!sess.ok) return req.reject(sess.status, sess.msg);
 
-        // Main-thread cache read: no worker round trip, so a saturated worker
-        // cannot make its own progress unreadable.
+        // Main-thread cache: a saturated worker cannot hide its own progress.
         const p = walletGetSyncProgress(sess.accountId);
-        // The prewarm job behind the numbers: a frozen snapshot plus a job
-        // that is no longer running is the diagnosis.
         const prewarmJob = await findLatestJob('connectWalletForSigning', sessionId);
-        // Restored snapshot (minutes of delta) or cold start (hours from
-        // zero); null while no facade exists for the account.
         const origin = getFacadeOrigin(sess.accountId);
         const originFields = {
             restoredFromSnapshot: origin ? origin.restoredFromSnapshot : null,
@@ -1157,8 +969,6 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
                 ...originFields
             };
         }
-        // Age of the reading, derived once here; past the threshold the
-        // numbers describe a sync nobody is running any more.
         const updatedAtMs = Date.parse(p.updatedAt);
         const staleSeconds = Number.isFinite(updatedAtMs) ? Math.max(0, Math.round((Date.now() - updatedAtMs) / 1000)) : null;
         return {
@@ -1234,54 +1044,19 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
 
 }
 
-/** Rows per UPDATE, so a database with thousands of leftovers stays within
- *  the driver's parameter limit. */
+/** Rows per UPDATE, within the driver's parameter limit. */
 const SESSION_CLOSE_CHUNK = 200;
 
 /**
- * Close the wallet sessions left behind by the PREVIOUS process. Called once at
- * plugin init, before any request can arrive. Returns the closed session ids so
- * the caller can also drop the queued jobs that signed with them
- * (`dropPendingJobsForClosedSessions`); a replay of those jobs would only die
- * later in `executeWalletCommand` with a misleading "Session not found".
- *
- * A session is a per-connect handle owned by a caller in a specific process, not
- * a property of the wallet: `connectWallet` inserts a row per call and only
- * `disconnectWallet` closes one, so every ungraceful stop leaks its handles for
- * the full 24h TTL. Live-observed: 12 simultaneously active rows for a single
- * wallet. The facade is unaffected either way (it is cached per accountId, one
- * per wallet, and a fresh process has none), so the leak costs two things: the
- * shared-session guard in `evictFacadeUnlessShared` counts those dead rows as
- * live users and therefore keeps a wallet's in-memory keys after a legitimate
- * `disconnectWallet`, and each row keeps encrypted seed material at rest a day
- * past the death of the process that authorised it. Both are closed here.
- *
- * `runtimeMode` requires exactly one replica (`runtime-topology.ts`), so "left
- * over from a previous process" really does mean dead, not "belongs to a
- * sibling instance". Do NOT extend this to a multi-replica deployment without
- * an instance-scoped owner column.
- *
- * CONFIGURED FEE-SPONSOR SESSIONS ARE EXEMPT. Their ids are pinned in the
- * deployment config and usable by any authenticated caller
- * (`resolveFeeSponsor`), i.e. they are deliberately long-lived and process
- * independent. Closing them would break sponsored submissions after every
- * restart until an operator pinned a fresh id. SESSIONS HOLDING A SIGNING
- * KEY are kept as well (0.21.4): the key is the expensive, irreplaceable
- * part, and a leftover viewing-only session is the only thing worth sweeping.
- *
- * No facade eviction here (a fresh process has no facades) and no key material
- * survives: the same columns `disconnectWallet` clears are cleared.
+ * At init, close viewing-only sessions of the previous process; returns their ids
+ * so their queued jobs can be dropped. Assumes one replica. Platform sponsors and
+ * sessions holding a signing key are kept (closing revokes the key for good).
  */
 export async function closeSessionsFromPreviousProcess(db: any, config?: Record<string, any>): Promise<string[]> {
     const exempt = new Set(getConfiguredFeeSponsorSessions(config));
     const active: any[] = (await db.run(
         SELECT.from(WalletSessions).columns('sessionId', 'encryptedSeedKey').where({ isActive: true })
     )) || [];
-    // A session holding a SIGNING key was upgraded with a mnemonic on purpose
-    // (a pool member taken out of the config for a while, a consumer's
-    // custodial wallet). Closing it revokes the key, and nothing short of a
-    // fresh connectWalletForSigning brings it back, so such sessions stay
-    // active; their facades are rebuilt lazily on first use. (0.21.4)
     const keyed = active.filter(r => r?.sessionId && r.encryptedSeedKey && !exempt.has(r.sessionId)).map(r => r.sessionId as string);
     if (keyed.length) {
         cds.log('nightgate').info(`Boot sweep keeps ${keyed.length} session(s) holding a signing key: ${keyed.map(id => id.slice(0, 8)).join(', ')}`);
@@ -1305,19 +1080,13 @@ export async function closeSessionsFromPreviousProcess(db: any, config?: Record<
     return stale;
 }
 
-/**
- * Start periodic cleanup of expired wallet sessions.
- * Returns the timer handle for cleanup on shutdown.
- */
+/** Periodic cleanup of expired wallet sessions; returns the timer handle. */
 export function startSessionCleanup(db: any): ReturnType<typeof setInterval> {
     const SESSION_CLEANUP_INTERVAL = 15 * 60 * 1000;
     const timer = setInterval(async () => {
         try {
             const now = new Date().toISOString();
-            // Configured platform sponsor sessions are infrastructure and do
-            // not expire while configured (resolveFeeSponsor agrees); the
-            // sweep used to deactivate them AND wipe their key material 24 h
-            // after setup, which silently killed the hosted pool.
+            // Platform sponsors never expire; never deactivate or wipe them.
             const platformSponsors = new Set(getConfiguredFeeSponsorSessions(getNightgatePluginConfig()));
             const expiring: any[] = ((await db.run(
                 SELECT.from(WalletSessions)
@@ -1325,13 +1094,8 @@ export function startSessionCleanup(db: any): ReturnType<typeof setInterval> {
                     .where({ isActive: true, expiresAt: { '<': now } })
             )) || []).filter((s: any) => !platformSponsors.has(String(s.sessionId)));
             if (expiring.length === 0) return;
-            // Deactivate FIRST, scoped to the selected rows: a row expiring
-            // between SELECT and UPDATE must not be deactivated unseen (its
-            // facade decision would be skipped forever, since the sweep only
-            // selects active rows). The eviction decision then runs per
-            // wallet with the shared-session guard (see
-            // evictFacadeUnlessShared: keyed with the facade cache's
-            // accountId while sessions are per-connect rows).
+            // Deactivate FIRST and only the selected rows: a row expiring in between
+            // would otherwise never get its eviction decision.
             await db.run(
                 UPDATE.entity(WalletSessions)
                     .set({ isActive: false, encryptedViewingKey: null, encryptedSeedKey: null })
@@ -1352,8 +1116,7 @@ export function startSessionCleanup(db: any): ReturnType<typeof setInterval> {
         } catch { /* ignore cleanup errors */ }
     }, SESSION_CLEANUP_INTERVAL);
 
-    // Guard retained for tests that mock setInterval to return a bare object.
-    // Production NodeJS.Timeout always has unref(); tests deliberately don't.
+    // Tests mock setInterval with a bare object.
     if (typeof timer.unref === 'function') {
         timer.unref();
     }

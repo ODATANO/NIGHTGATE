@@ -2,48 +2,140 @@
   "version": 1,
   "prover": {
     "anchorContentRoot": {
-      "sha256": "8cf4a6b3b6c39d493fa1e0b318d276409e9a7c47a934cfb2e9561245d1838839",
-      "bytes": 2818398
+      "sha256": "0d4cf9eac9ec99c324cbc16a63d9f2e9656f0997822f55b79e69d5939ec9c916",
+      "bytes": 2824504
     },
     "attest": {
-      "sha256": "f88aea0586e19ae8847f2eeea6aa6d6702ace4677598ee4ccef17f314e26fd80",
-      "bytes": 2818868
+      "sha256": "dded46dc1da484358b4854699c5439fc6c8a2873074447d22961530e778fef73",
+      "bytes": 5208718
     },
-    "attestGuarded": {
-      "sha256": "2d891415da63181a9c2a4e74d8ac17de29210c5fdb3c7ed2b6dc670de5b197f4",
-      "bytes": 10029324
-    },
-    "bindPassport": {
-      "sha256": "0359f10d72a8819acfafc3e244122eadcedd2e51c45cba4b2c00f221915c1bdf",
-      "bytes": 2846549
+    "bindDocument": {
+      "sha256": "c5e481ab7e68b81489287d2bd810c347650febcaa94d3985e100e84708e4ca40",
+      "bytes": 5222181
     },
     "grantDisclosure": {
-      "sha256": "fc04c6c51134761a4edee88388daf6e9238b1d9a578b47c3561424bf83fdc98f",
-      "bytes": 2818046
+      "sha256": "1f9fc7fa52f73a6e2ada7b645b92c011550ac82fb83bed2c4eac1cabf2906053",
+      "bytes": 2824237
     },
     "proveDocumentComparison": {
-      "sha256": "62fc43ed45c320cf111ff541e3e1b07a0472efea11de67e580388d77ff8d4079",
-      "bytes": 38478525
+      "sha256": "ebc2f2fd28e1ccdf705fdf412d16d94294e389c7191c70bd797c2f85e3ffb784",
+      "bytes": 38497091
     },
     "proveFieldEquality": {
-      "sha256": "ff25689c1a3bd2958feed1cb487fddcf0b2be76ca82c587fe2bfec86ca5af869",
-      "bytes": 5209450
+      "sha256": "abc940f3f75bfd328071f260072dae8c4e15f8a6077791e925074bc6a8e95269",
+      "bytes": 5223462
     },
     "proveFieldMembership": {
-      "sha256": "ea299ae8495c051517afc9b56e1775c5b7ce582291a27083a7d414e094d5a05e",
-      "bytes": 9967889
+      "sha256": "b937cc7ff0118e60aaca4f60e8003934e6eededb0722652c00e648ff6eddba39",
+      "bytes": 9984764
     },
     "proveFieldPredicate": {
-      "sha256": "f1a75c015b0c705480ad2898b8573f5a3b2233f725343555a6fd901d6294791f",
-      "bytes": 5209995
+      "sha256": "e5361a0200690cca34a361cee0fa4ae93c9894ac9baea020d7ca6bef6cafec05",
+      "bytes": 5223778
     },
-    "registerPassport": {
-      "sha256": "411f22d94166e20a1d9c8f014dc7b7ef8aa41b1cc0b1561f63f6841132465936",
-      "bytes": 2817719
+    "registerDocument": {
+      "sha256": "5f8a72eeed0b6d03d506eace6d4ebb92c7013d60f72e4d094e1ae6642f87be86",
+      "bytes": 2833769
+    },
+    "retract": {
+      "sha256": "458f11186227d65ed486c5c3dacccf6f612492a50d3ed68cac2fc80ebf6b2e16",
+      "bytes": 2825491
     },
     "revokeDisclosure": {
-      "sha256": "f6cf8dd47e1a43e1371d12f6e3d6312adde6bec3708c6dcc1042463f80688b9a",
-      "bytes": 2817681
+      "sha256": "52bd49d68c80708357e22584f8f83e40e5e88c14b553ca779c166382e3178f7a",
+      "bytes": 2823966
+    }
+  },
+  "verifier": {
+    "anchorContentRoot": {
+      "sha256": "f2df111d7ea92bd438d5ee1eb46c3926cc526f0d5d6a80c7a6523c919ee30625",
+      "bytes": 2119
+    },
+    "attest": {
+      "sha256": "2fecb84c5d94c8fd469974e519f7783f24a199050d2ec046073be7c91f60026a",
+      "bytes": 2119
+    },
+    "bindDocument": {
+      "sha256": "d5577b38c50275ef995235368d6a6c6ecaa44593453e13c32186ef301e1c5113",
+      "bytes": 2119
+    },
+    "grantDisclosure": {
+      "sha256": "6fb94e08aeb29f4025ac12d764d3b1dcb1885766b98d51bb6d9a6a659fe117eb",
+      "bytes": 2119
+    },
+    "proveDocumentComparison": {
+      "sha256": "58ac14c645cd79d1b2346f859b2d118ab951b040ee65fba3ce15a3451940f880",
+      "bytes": 2119
+    },
+    "proveFieldEquality": {
+      "sha256": "6507e8b0349af68a5c2aa0d460d7167e18c59926940cfaa044cb09d5bac55e7c",
+      "bytes": 2119
+    },
+    "proveFieldMembership": {
+      "sha256": "e2cc43ca6802bea72512948245a1797c2360ff1a36833dce8ae96bf6ff720a1f",
+      "bytes": 2119
+    },
+    "proveFieldPredicate": {
+      "sha256": "3a68ecae3464eb2123025bf99a344eedfbed065ec12c7d1f3a9ca2eb6822875a",
+      "bytes": 2119
+    },
+    "registerDocument": {
+      "sha256": "a6ab336f4473edc46dbf0e990940cf77b8075192927c2677bb4c7c5382cd6e5e",
+      "bytes": 2119
+    },
+    "retract": {
+      "sha256": "76e8ff897dad57b1427188cb9499b363218e6a9706487e68c07f95817e8b0355",
+      "bytes": 2119
+    },
+    "revokeDisclosure": {
+      "sha256": "7f675f4974fcbb1cdb45c85de010a2243e7dfc58fa62eae1028f21116a04bf39",
+      "bytes": 2119
+    }
+  },
+  "zkir": {
+    "anchorContentRoot": {
+      "sha256": "1e946814864fd9a4d27ca785a36a072f1ab549b6e7e97df2f656dabf89eb2c49",
+      "bytes": 507
+    },
+    "attest": {
+      "sha256": "d1b42b13a5eae804f699c9facce17bdb741b6e8b0afa90a50c342313b6e43396",
+      "bytes": 254
+    },
+    "bindDocument": {
+      "sha256": "e76eacd5745e28431fd1798bb46ac21fba204cce1d13023f0e58873d30f5f392",
+      "bytes": 2234
+    },
+    "grantDisclosure": {
+      "sha256": "ecaae325fae44a486ccea17882c811bf448fa40311dbf7d339d9d86859316d3e",
+      "bytes": 386
+    },
+    "proveDocumentComparison": {
+      "sha256": "ded81024164cb244206add1102b1efef3b3a0a5902976053487fec3404defc70",
+      "bytes": 11502
+    },
+    "proveFieldEquality": {
+      "sha256": "87ee207423113b165acd38d8d38c9934c674a897f2c12b261b4e34e8ee0e8fa7",
+      "bytes": 943
+    },
+    "proveFieldMembership": {
+      "sha256": "69cc20d6bbdc39122152242d87daa7a0ee211ca7be57005e9035c18c813fe9a3",
+      "bytes": 1407
+    },
+    "proveFieldPredicate": {
+      "sha256": "24e38ef43414020f75d729cb1f41e420372d5d70cf4f6765e5beb8414f7f9958",
+      "bytes": 1007
+    },
+    "registerDocument": {
+      "sha256": "27d486438fdc9794250aa7943f6ec23ddeeba38a44ba57c73d3460c121193e14",
+      "bytes": 1870
+    },
+    "retract": {
+      "sha256": "bb8f0d9ec2f3d3eed4f48a803d767bb15953c51b1a71dd33f8671f4380b821dc",
+      "bytes": 1708
+    },
+    "revokeDisclosure": {
+      "sha256": "a1b4d5751de8e81ed89dcbc83ad774a4484bbdd12dd9f92007f7af58d71e6d40",
+      "bytes": 260
     }
   }
 }

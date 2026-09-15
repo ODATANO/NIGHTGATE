@@ -1,30 +1,17 @@
 /**
- * Custom-token identity.
- *
- * A token minted by a contract is addressed by its RAW TOKEN TYPE, which is
- * `rawTokenType(domainSeparator, contractAddress)`: the 32-byte separator the
- * contract passes to `mintShieldedToken` (in Compact, `pad(32, "...")`) hashed
- * together with the minting contract's address. Two contracts using the same
- * separator mint DIFFERENT tokens, and one contract can mint several by using
- * several separators.
- *
- * Without this value a caller cannot spend what it just minted: `sendNight`
- * takes `tokenTypeHex`, not a contract address. Deriving it needs no wallet, no
- * chain access and no proving, which is why it is exposed as a plain function.
- *
+ * Raw token type = rawTokenType(domainSeparator, minting contract address);
+ * `sendNight` needs it to spend a minted token.
  * SPDX-License-Identifier: Apache-2.0
  */
 
-/** Domain separator of the bundled `contracts/shielded-token` test token. */
+/** Bundled `contracts/shielded-token` test token. */
 export const SHIELDED_TEST_TOKEN_DOMAIN_SEP = 'nightgate:zswap-e2e';
 
-/** Atoms minted per `mint()` call by the bundled test token. */
+/** Atoms per `mint()`. */
 export const SHIELDED_TEST_TOKEN_AMOUNT = 100000000n;
 
-/** Compiled-artifact ref of the bundled test token. */
 export const SHIELDED_TEST_TOKEN_REF = 'shielded-token';
 
-/** Circuit the bundled test token exposes. */
 export const SHIELDED_TEST_TOKEN_CIRCUIT = 'mint';
 
 export class TokenTypeError extends Error {
@@ -32,13 +19,8 @@ export class TokenTypeError extends Error {
 }
 
 /**
- * Normalize a domain separator to the 32 bytes the contract actually used.
- *
- * Accepts either the plain string the contract padded (`pad(32, "x")` is the
- * UTF-8 bytes of `x` right-padded with zeros) or 64 hex characters for those
- * bytes verbatim. A string of exactly 64 hex chars is read as HEX: that is the
- * ambiguous case, and a 64-character separator string is not something Compact
- * can pad into 32 bytes anyway.
+ * The 32 bytes of `pad(32, input)` (UTF-8, zero right-padded), or 64 hex
+ * verbatim. Exactly 64 hex chars read as hex: such a string cannot fit pad(32).
  */
 export function padDomainSeparator(input?: string): Uint8Array {
     const value = input ?? SHIELDED_TEST_TOKEN_DOMAIN_SEP;
@@ -59,18 +41,11 @@ export function padDomainSeparator(input?: string): Uint8Array {
     return bytes;
 }
 
-/** Hex of a normalized separator, for echoing back what was actually used. */
 export function domainSeparatorHex(bytes: Uint8Array): string {
     return Buffer.from(bytes).toString('hex');
 }
 
-/**
- * `rawTokenType(domainSeparator, contractAddress)` as lowercase hex.
- *
- * The runtime is ESM-only, hence the dynamic import (see sdk-loader.ts for the
- * same pattern). `contractAddress` is passed through unchanged: the runtime
- * validates it and rejects a malformed address itself.
- */
+/** Lowercase hex; the runtime validates `contractAddress` itself. */
 export async function deriveRawTokenType(contractAddress: string, domainSeparator?: string): Promise<{
     tokenTypeHex: string;
     contractAddress: string;

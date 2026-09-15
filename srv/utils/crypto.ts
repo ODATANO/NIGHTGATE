@@ -1,29 +1,8 @@
 /**
- * At-rest encryption for wallet material and persisted job commands.
- *
- * Key ring: `ENCRYPTION_KEYS="id=secret,id=secret"` plus
- * `ENCRYPTION_KEY_ACTIVE=<id>`; the legacy single `ENCRYPTION_KEY` joins the
- * ring as id `1` (active when it is the only key). Every secret is stretched
- * with HKDF-SHA256 into a 32-byte key-encryption key (KEK).
- *
- * Envelope formats:
- *
- *   v3:<keyId>:<wrappedDek>:<iv>:<tag>:<data>   bound to a purpose and a subject
- *   v2:<keyId>:<wrappedDek>:<iv>:<tag>:<data>   bound to the key id only
- *
- * A random 32-byte data key (DEK) encrypts the payload with AES-256-GCM; the
- * DEK is wrapped with the KEK (AES-256-GCM, `wrappedDek` = iv || tag ||
- * ciphertext). The AAD of both layers is the key id (v2) or the key id plus
- * the binding's purpose and subject (v3): a v3 ciphertext cannot be
- * re-labelled to another key, moved to another row or read as another kind
- * of material. Every persisted value is written as v3 (`EnvelopeBinding` names
- * the column and the row); v2 is still read, the rewrap tool
- * (`nightgate-rewrap-keys`) rewrites it. Legacy v1 ciphertexts
- * (`iv:tag:data`, key = SHA-256 fold of the secret) stay readable under id
- * `1` only and are rewritten the same way.
- *
- * A raw 32-byte Buffer is accepted wherever a ring is: it acts as a
- * single-key ring with id `1` whose KEK (and v1 key) is the buffer itself.
+ * At-rest envelope encryption. Ring secrets are HKDF-stretched into KEKs (`ENCRYPTION_KEY` = id `1`).
+ * `v3|v2:<keyId>:<wrappedDek>:<iv>:<tag>:<data>`: a fresh DEK per value, wrapped by the KEK; the AAD of
+ * both layers is the key id (v2) or key id + purpose + subject (v3). Persisted values are always v3;
+ * v2 and legacy v1 (`iv:tag:data`, id `1` only) are read and rewritten by `nightgate-rewrap-keys`.
  */
 
 import crypto from 'crypto';
@@ -44,15 +23,11 @@ export const LEGACY_KEY_ID = '1';
 /** Secrets shorter than this are refused in production and warned about elsewhere. */
 export const MIN_SECRET_LENGTH = 32;
 
-/**
- * What a v3 ciphertext is for and which row it belongs to. Both strings enter
- * the AAD, so the same plaintext under another purpose or subject is a
- * different ciphertext that does not decrypt here.
- */
+/** Purpose and row subject of a v3 ciphertext; both enter the AAD, so it cannot be moved or relabelled. */
 export interface EnvelopeBinding {
     /** Kind of material, e.g. `wallet-session/viewing-key`. */
     purpose: string;
-    /** Row identity the value belongs to, e.g. the session id or the job id. */
+    /** Row identity, e.g. the session id or the job id. */
     subject: string;
 }
 export const KEY_ID_PATTERN = /^[A-Za-z0-9_-]{1,16}$/;
@@ -79,7 +54,7 @@ export function deriveKek(id: string, secret: string): Buffer {
     return Buffer.from(crypto.hkdfSync('sha256', secret, id, KEK_INFO, KEK_LENGTH));
 }
 
-/** The pre-0.23 key: SHA-256 fold of the secret, no stretching. Reads v1 ciphertexts only. */
+/** The v1 key: SHA-256 fold of the secret, no stretching. Reads v1 ciphertexts only. */
 export function legacyFold(secret: string): Buffer {
     return crypto.createHash('sha256').update(secret).digest();
 }
@@ -141,11 +116,7 @@ function asRing(key: EncryptionKey): KeyRing {
 
 // ---- Ring resolution ---------------------------------------------------------
 
-/**
- * Parse the ring from the environment. `ENCRYPTION_KEYS` entries are
- * `id=secret`; the legacy `ENCRYPTION_KEY` is id `1`. With a single member
- * `ENCRYPTION_KEY_ACTIVE` is optional. Returns undefined when nothing is set.
- */
+/** Parse the ring from the environment; undefined when no key is set. */
 export function parseKeyRingSpec(env: NodeJS.ProcessEnv = process.env): KeyRingSpec | undefined {
     const keys: Array<{ id: string; secret: string }> = [];
     const list = String(env.ENCRYPTION_KEYS ?? '').trim();
@@ -179,10 +150,7 @@ let pinnedRing: KeyRing | undefined;
 let cachedRing: { snapshot: string; ring: KeyRing } | undefined;
 let devFallback: KeyRing | undefined;
 
-/**
- * Pin the ring explicitly (worker thread: the main thread hands the resolved
- * ring over in `workerData`, the worker never parses the environment).
- */
+/** Pin the ring; the worker thread receives it from the main thread and never parses its env. */
 export function setKeyRing(spec: KeyRingSpec | undefined): void {
     pinnedRing = spec ? new KeyRing(spec) : undefined;
 }
@@ -264,12 +232,7 @@ function gcmDecrypt(key: Buffer, iv: Buffer, tag: Buffer, data: Buffer, associat
     return Buffer.concat([decipher.update(data), decipher.final()]);
 }
 
-/**
- * Encrypt under the ring's ACTIVE key. With a binding the result is a v3
- * envelope (`v3:<keyId>:<wrappedDek>:<iv>:<tag>:<data>`) that only decrypts
- * with the same binding; without one it is a v2 envelope bound to the key id
- * alone. Persisted material always passes a binding.
- */
+/** Encrypt under the active key: v3 with a binding, v2 without. Persisted material always passes a binding. */
 export function encrypt(plaintext: string, key: EncryptionKey, binding?: EnvelopeBinding): string {
     const ring = asRing(key);
     const keyId = ring.activeId;
@@ -302,12 +265,7 @@ export function inspectCiphertext(combined: string): { version: 1 | 2 | 3; keyId
     throw new Error('Invalid encrypted format: expected v3|v2:keyId:wrappedDek:iv:authTag:ciphertext or iv:authTag:ciphertext');
 }
 
-/**
- * Decrypt a v3 envelope (needs the binding it was written under), a v2
- * envelope (the binding is ignored) or a legacy v1 ciphertext. Throws on
- * authentication failure (tampered ciphertext, wrong key, wrong binding) and
- * `UnknownEncryptionKeyError` when the ring lacks the ciphertext's key id.
- */
+/** Decrypt v3 (needs its binding), v2 (binding ignored) or v1. Throws on authentication failure or an unknown key id. */
 export function decrypt(combined: string, key: EncryptionKey, binding?: EnvelopeBinding): string {
     const ring = asRing(key);
     const { version, keyId } = inspectCiphertext(combined);
@@ -341,20 +299,13 @@ export function decrypt(combined: string, key: EncryptionKey, binding?: Envelope
     }
 }
 
-/**
- * Derive a per-purpose secret from the ring's key `keyId` and caller
- * material (HKDF-SHA256, `info` is the purpose label). Used for the wallet
- * sync-state passphrase so a viewing key alone opens nothing.
- */
+/** HKDF of ring key `keyId` and caller material, so the material alone opens nothing. */
 export function deriveBoundSecret(ring: KeyRing, keyId: string, material: string, info: string): Buffer {
     const ikm = Buffer.concat([ring.kek(keyId), Buffer.from(material, 'utf8')]);
     return Buffer.from(crypto.hkdfSync('sha256', ikm, keyId, info, 32));
 }
 
-/**
- * SHA-256 hash of a viewing key for lookup/dedup purposes.
- * Returns 64-character hex string.
- */
+/** SHA-256 hex of a viewing key, for lookup and dedup. */
 export function hashViewingKey(viewingKey: string): string {
     return crypto.createHash('sha256').update(viewingKey).digest('hex');
 }

@@ -1,24 +1,6 @@
 /**
- * SDK-compatible storage encryption for private state and signing key blobs.
- *
- * Implements the EXACT wire format used by the Midnight JS SDK's LevelDB
- * private-state provider so that exports produced by NIGHTGATE's CAP-DB
- * provider can be imported by the SDK's LevelDB provider, and vice versa.
- *
- * Wire format of an encrypted payload (base64-decoded):
- *
- *   [ 1 byte  version    = 2          ]
- *   [ 32 bytes salt      (PBKDF2)     ]
- *   [ 12 bytes IV        (GCM nonce)  ]
- *   [ 16 bytes authTag   (GCM tag)    ]
- *   [ N bytes  ciphertext (AES-256-GCM) ]
- *
- * Key derivation: PBKDF2-SHA256(password, salt, 600_000, 32 bytes).
- *
- * For internal CAP-DB storage we use a memoized per-account master key
- * (one PBKDF2 per session, not per row), the SDK's LevelDB provider does
- * the same. Export blobs always include their own salt and re-derive,
- * preserving cross-compat.
+ * Byte-exact wire format of the Midnight SDK's LevelDB private-state encryption, for cross-import:
+ * base64(version 2 | salt 32 | iv 12 | tag 16 | AES-256-GCM ciphertext), key = PBKDF2-SHA256(password, salt, 600k).
  */
 
 import crypto from 'crypto';
@@ -35,10 +17,7 @@ export const CURRENT_ENCRYPTION_VERSION = ENCRYPTION_VERSION_V2;
 const VERSION_PREFIX_LENGTH = 1;
 const HEADER_LENGTH         = VERSION_PREFIX_LENGTH + SALT_LENGTH + IV_LENGTH + AUTH_TAG_LENGTH;
 
-/**
- * Mirrors the SDK's StorageEncryption class for byte-compatibility.
- * One instance ↔ one (password, salt) pair.
- */
+/** Mirrors the SDK's StorageEncryption; one instance per (password, salt). */
 export class StorageEncryption {
     readonly salt: Buffer;
     private readonly encryptionKey: Buffer;
@@ -49,12 +28,7 @@ export class StorageEncryption {
         this.encryptionKey = precomputedKey ?? deriveKey(password, this.salt);
     }
 
-    /**
-     * Zeroes the derived key in memory; the instance is unusable afterwards
-     * (encrypt/decrypt throw instead of emitting garbage ciphertext). Called
-     * when a memoized instance is evicted, so key material of disconnected
-     * wallets doesn't linger in the process until GC.
-     */
+    /** Zero the derived key; encrypt/decrypt throw afterwards instead of emitting garbage. */
     clear(): void {
         this.encryptionKey.fill(0);
         this.cleared = true;
@@ -64,11 +38,7 @@ export class StorageEncryption {
         if (this.cleared) throw new Error('StorageEncryption: key has been cleared');
     }
 
-    /**
-     * Async construction: PBKDF2 runs on the libuv threadpool instead of
-     * blocking the event loop. Use for the memoized long-lived instances;
-     * `precomputedKey` MUST come from `deriveKeyAsync(password, salt)`.
-     */
+    /** Construct with PBKDF2 on the libuv threadpool instead of the event loop. */
     static async createAsync(password: string, salt: Buffer): Promise<StorageEncryption> {
         const key = await deriveKeyAsync(password, salt);
         return new StorageEncryption(password, salt, key);
@@ -86,10 +56,7 @@ export class StorageEncryption {
         return Buffer.concat([version, this.salt, iv, authTag, encrypted]).toString('base64');
     }
 
-    /**
-     * Decrypts an SDK-format base64 payload. The salt in the payload must match
-     * this instance's salt (i.e. the same password was used).
-     */
+    /** Decrypt an SDK-format payload; its salt must match this instance's. */
     decrypt(encryptedData: string): string {
         this.assertUsable();
         const data = Buffer.from(encryptedData, 'base64');
@@ -144,11 +111,7 @@ export function extractEncryptedComponents(data: Buffer): EncryptedComponents {
     };
 }
 
-/**
- * Decrypts an SDK-format base64 payload given a password. Re-derives the key
- * from the salt embedded in the payload. Used for import where we don't yet
- * know the salt.
- */
+/** Decrypt an SDK-format payload, deriving the key from its embedded salt. */
 export function decryptWithPassword(encryptedData: string, password: string): string {
     const data = Buffer.from(encryptedData, 'base64');
     const { version, salt, iv, authTag, encrypted } = extractEncryptedComponents(data);

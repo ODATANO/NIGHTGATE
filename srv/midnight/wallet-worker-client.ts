@@ -1,18 +1,6 @@
 /**
- * Main-thread side of the wallet-worker RPC.
- *
- * Spawns ONE Node `worker_threads` worker, holds a handle for the lifetime of
- * the cds-serve process, and exposes a typed async API that maps to the
- * worker's message handlers.
- *
- * RPC shape: per-call `MessageChannel`. We send `{ kind: 'rpc', method, args,
- * port: port1 }` (transferring port1's MessagePort to the worker), then await
- * a single message on `port2` carrying `{ ok, result | error }`.
- *
- * Push events from the worker (`state-save` and `log`) are handled by
- * listeners registered via `setStateSaveSink(...)` and the default log relay.
- * The save sink is where we wire CAP `db.run` from the main thread (which is
- * NOT blocked by the wallet SDK because the SDK now lives in the worker).
+ * Main-thread side of the wallet-worker RPC: one worker per process, one
+ * MessageChannel per call, push events (state-save, log, ...) on the worker port.
  */
 
 import cds from '@sap/cds';
@@ -49,18 +37,12 @@ export interface SerializedBlobs {
 export type StateSaveSink = (event: {
     sessionId: string;
     sdkVersion: string;
-    /** Save sequence number; echoed back to the worker as `state-save-ack`
-     *  when (and only when) the sink persisted successfully. */
+    /** Echoed back as `state-save-ack` only when the sink persisted. */
     seq?: number;
     blobs: SerializedBlobs;
 }) => void | Promise<void>;
 
-/**
- * A catch-up progress snapshot as the worker reports it. Mirrors
- * `SyncProgressSnapshot` in wallet-worker.ts; declared here rather than
- * imported so the main thread does not pull in the worker module (which loads
- * the ESM SDK on import).
- */
+/** Mirrors the worker's `SyncProgressSnapshot`; not imported, the worker module loads the ESM SDK. */
 export interface WalletSyncProgress {
     sessionId: string;
     /** Ledger events applied by the dust sub-wallet. Decimal string (bigint). */
@@ -77,14 +59,11 @@ export interface WalletSyncProgress {
     elapsedMs: number;
     label: string;
     updatedAt: string;
-    /** When appliedIndex last advanced; absent from snapshots of a pre-0.21 worker. */
+    /** When appliedIndex last advanced. */
     lastProgressAt?: string;
 }
 
-// Latest pushed snapshot per facade. Module scope (not ClientState) because
-// its lifecycle is per-facade, not per-worker-start: entries are replaced by
-// the next push, dropped on evict, and cleared wholesale on worker exit (no
-// facade survives one).
+// Latest pushed snapshot per facade; cleared on evict and on worker exit.
 const syncProgressCache = new Map<string, WalletSyncProgress>();
 
 interface ClientState {
@@ -94,51 +73,34 @@ interface ClientState {
 
 let client: ClientState | null = null;
 
-// True once the worker has been started at least once. Lets rpc() distinguish
-// "never started" (reject: caller must startWalletWorker() first) from "crashed
-// after a successful start" (respawn). Cleared on explicit stop/reset.
+// Distinguishes "never started" (reject) from "crashed after start" (respawn).
 let everStarted = false;
 
-// Worker exits since process start, for getWorkerStatus()/metrics. A climbing
-// count is the signal that the submission side is crash-looping, which is
-// otherwise only visible as individual jobs failing.
+// Crash exits only; rotations and stops are counted apart.
 let workerExitCount = 0;
 let lastExitCode: number | null = null;
 let lastExitAt: string | null = null;
-// Controlled rotations (the worker exits after NIGHTGATE_WORKER_MAX_GENERATIONS
-// artifact generations to release Node's module cache), counted apart from crashes.
 let workerRotationCount = 0;
 let rotationAnnounced = false;
-// Worker that announced its rotation and has not exited yet; new calls wait
-// for its exit and go to the respawned worker.
+// Announced its rotation, not exited yet; new calls wait for the respawn.
 let drainingWorker: Worker | null = null;
-// Worker being stopped on purpose (stopWalletWorker): its exit is neither a
-// crash nor a rotation.
+// Stopped on purpose: its exit is neither a crash nor a rotation.
 let stoppingWorker: Worker | null = null;
 
 /**
- * Ceiling on a rotation drain (`NIGHTGATE_WORKER_DRAIN_MAX_MS`, default 10
- * min). A drain waits for in-flight submits only; past the ceiling the worker
- * is terminated: every submit announced its identifier before sending, so
- * reconciliation resolves whatever was cut.
+ * Rotation drain ceiling. Terminating past it is safe: every submit announced
+ * its identifier before sending, so reconciliation resolves what was cut.
  */
 function drainMaxMs(): number {
     return configMs('NIGHTGATE_WORKER_DRAIN_MAX_MS');
 }
 
-// Kept at module scope (not on ClientState) so it survives a worker respawn:
-// the sink is wired once at startup and must keep persisting state-save events
-// even from a freshly respawned worker.
+// Module scope so the sink, wired once, survives a worker respawn.
 let stateSaveSink: StateSaveSink | undefined;
 
-// Serializes state-save persists in arrival order (each handler settles, so
-// the chain never rejects and a failed persist doesn't block later ones).
 /**
- * Worker thread heap sizing. Only the young generation is set; the old
- * generation keeps the limit NODE_OPTIONS gives the process (measured: a
- * worker with `maxYoungGenerationSizeMb` alone still reports the inherited
- * 8 GB `heap_size_limit`). `NIGHTGATE_WORKER_YOUNG_GEN_MB`: default 128,
- * `0` = V8 default (16 MB semi-spaces), clamped to 16..2048.
+ * Only the young generation is sized (save ticks serialize multi-MB blobs); the
+ * old generation still inherits NODE_OPTIONS. 0 = V8 default.
  */
 export function workerResourceLimits(env: NodeJS.ProcessEnv = process.env): { maxYoungGenerationSizeMb: number } | undefined {
     const n = configNumberFrom('NIGHTGATE_WORKER_YOUNG_GEN_MB', env);
@@ -146,10 +108,11 @@ export function workerResourceLimits(env: NodeJS.ProcessEnv = process.env): { ma
     return { maxYoungGenerationSizeMb: Math.max(16, n) };
 }
 
+// Serializes state-save persists in arrival order (each handler settles, so
+// the chain never rejects and a failed persist doesn't block later ones).
 let stateSaveChain: Promise<void> = Promise.resolve();
 
-// In-flight rpc rejectors, so a worker crash/exit rejects every pending call
-// instead of leaving it to hang forever on a port that will never reply.
+// A worker exit rejects these; their ports would never reply.
 interface PendingRpc { reject: (e: Error) => void; }
 const pendingRpcs = new Set<PendingRpc>();
 
@@ -162,17 +125,13 @@ function rejectAllPendingRpcs(reason: string, name?: string): void {
     pendingRpcs.clear();
 }
 
-// Backstop timeout for a single worker RPC.
 const RPC_TIMEOUT_MS = configMs('NIGHTGATE_WORKER_RPC_TIMEOUT_MS');
+// An intent hook (persisting an announced identifier) slower than this is logged.
+const INTENT_PERSIST_WARN_MS = 5_000;
 
 /**
- * Per-submission private-state provider registry (Phase 2b).
- *
- * The worker proxies the SDK's PrivateStateProvider hook back to the main
- * thread via `private-state-rpc` messages, where the real
- * CapDbPrivateStateProvider (CAP DB + encryption) lives. Each in-flight
- * submission registers under a fresh `proxyId` so concurrent deploy/call
- * invocations don't collide on a shared `currentContractAddress`.
+ * Main-side targets of the worker's `private-state-rpc` proxy, one fresh `proxyId`
+ * per submission so concurrent calls don't share a `currentContractAddress`.
  */
 const privateStateProviders = new Map<string, CapDbPrivateStateProvider>();
 
@@ -184,19 +143,12 @@ export function unregisterPrivateStateProvider(proxyId: string): void {
     privateStateProviders.delete(proxyId);
 }
 
-/**
- * Locate the compiled worker entry: tsc emits `wallet-worker.js` next to this
- * compiled client (build:plugin writes JS in-place, so it's there in dev too).
- * Use __dirname so we don't depend on cwd.
- */
+/** The compiled worker entry next to this file (in-place build). */
 function resolveWorkerEntry(): string {
     return path.join(__dirname, 'wallet-worker.js');
 }
 
-/**
- * Start the worker. Idempotent: a second call returns the existing client.
- * Resolves when the worker has emitted its `ready` message.
- */
+/** Start the worker (idempotent); resolves on its `ready` message. */
 export async function startWalletWorker(): Promise<void> {
     if (client) {
         await client.readyPromise;
@@ -206,19 +158,10 @@ export async function startWalletWorker(): Promise<void> {
     everStarted = true;
     const entry = resolveWorkerEntry();
     const worker = new Worker(entry, {
-        // The worker never parses ENCRYPTION_KEY* itself: it receives the
-        // resolved key ring (sync-state blob binding) from the main thread.
-        // The worker never parses NIGHTGATE_* or ENCRYPTION_KEY* itself: it
-        // receives the resolved configuration and key ring from the main thread.
+        // The worker never parses NIGHTGATE_* or ENCRYPTION_KEY* itself.
         workerData: { encryptionKeyRing: getEncryptionKey().toSpec() ?? null, config: resolvedConfigSnapshot() },
-        // Old-generation limit is inherited from NODE_OPTIONS (wallet SDK
-        // heap) whether or not resourceLimits is given. The YOUNG generation
-        // is sized explicitly (0.21.6): every save tick serializes multi-MB
-        // wallet blobs, and with the default 16 MB semi-space the worker
-        // spent ~40 % of its time in scavenges (~180 ms each) on the hosted
-        // pool. NIGHTGATE_WORKER_YOUNG_GEN_MB, default 128, 0 = V8 default.
         resourceLimits: workerResourceLimits(),
-        // stdout/stderr from the worker should surface to the main process.
+        // false = worker output surfaces on the main process streams.
         stderr: false,
         stdout: false
     });
@@ -239,19 +182,12 @@ export async function startWalletWorker(): Promise<void> {
 
     client = { worker, readyPromise };
 
-    // Push events from worker (state-save, log, private-state-rpc)
     worker.on('message', (msg: any) => {
         if (msg?.kind === 'state-save') {
-            // Ack ONLY when the sink persisted successfully. Persists are
-            // CHAINED so they commit in arrival order: the sink is async, and
-            // two in-flight saves for the same session could otherwise land
-            // out of order in the DB. The dust-restore push (wallet-worker's
-            // dust wedge protection) relies on last-sent-wins.
+            // Ack only a persisted save. Chained so saves commit in arrival
+            // order: the dust-restore push relies on last-sent-wins.
             stateSaveChain = stateSaveChain
                 .then(() => {
-                    // No sink = nothing persisted = no ack; the worker keeps
-                    // the blobs unconfirmed and re-pushes them. Acking here
-                    // would silently drop a save.
                     if (!stateSaveSink) throw new Error('no state-save sink wired');
                     return stateSaveSink(msg);
                 })
@@ -260,8 +196,7 @@ export async function startWalletWorker(): Promise<void> {
                 })
                 .catch(() => { /* no ack; sink already logged the failure */ });
         } else if (msg?.kind === 'log') {
-            // Worker runs in a worker_thread without CAP; surface its log lines
-            // through a CAP channel so consumers control verbosity
+            // Through a CAP channel so consumers control verbosity.
             const level = msg.level === 'warn' ? 'warn'
                 : msg.level === 'error' ? 'error'
                     : msg.level === 'debug' ? 'debug'
@@ -278,9 +213,7 @@ export async function startWalletWorker(): Promise<void> {
             drainingWorker = worker;
             log.info(`worker announced its rotation (${msg.generations} artifact generations, ${msg.inflight ?? 0} call(s) draining); new calls wait for the respawn`);
         } else if (msg?.kind === 'rotation-done') {
-            // Nothing submitting is in flight any more; every reply the worker
-            // posted before this message has been delivered. Terminate it here
-            // rather than letting it exit itself mid-reply.
+            // Terminated from here so the worker never exits mid-reply.
             rotationAnnounced = true;
             drainingWorker = worker;
             log.info(`worker rotation drained (${msg.generations} artifact generations); terminating it, the next call respawns`);
@@ -312,14 +245,9 @@ export async function startWalletWorker(): Promise<void> {
             lastExitCode = code;
             lastExitAt = new Date().toISOString();
         }
-        // No facade survived the exit, so no snapshot describes anything that
-        // is still running. Keeping them would report phantom catch-ups.
+        // No facade survives an exit.
         syncProgressCache.clear();
-        // A crash cannot be waited on: the worker is already gone, so a
-        // listener may only keep what queued work still needs.
         void notifyWorkerGone('exit');
-        // Fail every in-flight call now; their reply ports are dead and would
-        // otherwise never settle. The next rpc() lazily respawns the worker.
         // A rotation names its rejection so rpc() can repeat a read on the respawn.
         rejectAllPendingRpcs(
             rotated ? `wallet-worker rotated with in-flight calls` : `wallet-worker exited (code=${code}) with in-flight calls`,
@@ -332,10 +260,8 @@ export async function startWalletWorker(): Promise<void> {
 }
 
 /**
- * Stop the worker. Safe to call multiple times. First asks the worker to
- * evict every facade (final state save, acked by the sink, keys zeroed),
- * bounded by `timeoutMs`; then terminates it. The flush needs the save sink
- * still wired, so callers run this BEFORE dropping encryption keys.
+ * Evict every facade with an acked final save, then terminate. The flush needs
+ * the save sink, so call this BEFORE dropping encryption keys.
  */
 export async function stopWalletWorker(timeoutMs = 60_000): Promise<void> {
     if (!client) return;
@@ -348,8 +274,7 @@ export async function stopWalletWorker(timeoutMs = 60_000): Promise<void> {
         else log.info(`worker shutdown: ${r.evicted} facade(s) evicted, all saves confirmed`);
     } catch (err) {
         if ((err as Error)?.name === WORKER_ROTATING) {
-            // A rotating worker flushes its facades itself and asks to be
-            // terminated (rotation-done); wait for that instead of cutting it.
+            // A rotating worker flushes its facades itself; wait for its exit.
             log.info('worker is rotating during shutdown; waiting for its own facade flush and exit');
             if (!drainingWorker) drainingWorker = w;
             await Promise.race([
@@ -363,31 +288,15 @@ export async function stopWalletWorker(timeoutMs = 60_000): Promise<void> {
     if (client?.worker !== w) return; // replaced or already gone meanwhile
     client = null;
     stoppingWorker = w;
-    // Terminate (the flush is done or timed out; nothing else keeps the thread).
     try { await w.terminate(); } catch { }
-    // The exit handler normally does this, but a forced terminate after
-    // the timeout must not leave the main thread believing in facades.
+    // Also here: a forced terminate may not run the exit handler first.
     syncProgressCache.clear();
-    // Intentional teardown, so listeners may finish their work and release
-    // everything; this is the only path that can wait for them.
     await notifyWorkerGone('stop');
 }
 
 /**
- * Callbacks to run when the worker is gone, on crash or on intentional stop.
- *
- * Anything the MAIN thread believes about facades is wrong from that moment:
- * a facade lives inside the worker, so a crash takes every one of them with
- * it. Without this the main-thread registry kept reporting facades a
- * respawned, empty worker does not have, which makes `facadeCount` a lie and
- * lets a "is it warm?" guard wave a cold wallet through.
- */
-/**
- * `'exit'` is a crash: the worker is already gone, so nothing can be finished
- * off and a listener may only keep what still-queued work needs. `'stop'` is
- * an intentional teardown, where the caller CAN wait, so a listener may drain
- * and then release everything, including material a crash path has to hold on
- * to. Same event, opposite obligations.
+ * Worker gone: every facade is gone. `'exit'` (crash): a listener may only keep what
+ * queued work needs. `'stop'` (awaited teardown): a listener may drain and release everything.
  */
 export type WorkerGoneReason = 'exit' | 'stop';
 type WorkerGoneListener = (reason: WorkerGoneReason) => void | Promise<void>;
@@ -412,10 +321,7 @@ export function onWorkerGone(listener: WorkerGoneListener): () => void {
     return () => workerGoneListeners.delete(listener);
 }
 
-/**
- * Register the callback that receives push 'state-save' events from the
- * worker. Called by the persistence layer at startup.
- */
+/** Register the receiver of the worker's 'state-save' pushes. */
 export function setStateSaveSink(sink: StateSaveSink | undefined): void {
     if (!client) {
         throw new Error('wallet-worker not started; call startWalletWorker() first');
@@ -424,25 +330,15 @@ export function setStateSaveSink(sink: StateSaveSink | undefined): void {
 }
 
 /**
- * Generic RPC helper. Allocates a MessageChannel per call, posts the request
- * with port1 transferred to the worker, awaits the single reply on port2.
- */
-/**
- * Optional per-call hook: the worker announces the transaction identifier it
- * is ABOUT to broadcast (`submit-intent`) and waits for the ack. The hook
- * persists the external-effect boundary (job row: txHash + external_execution
- * + submitted) before the broadcast happens; if it throws, the worker does not
- * broadcast.
+ * Persists the external-effect boundary for an identifier the worker is about to
+ * broadcast; the worker waits for the ack and does not broadcast if this throws.
  */
 export interface SubmitIntentInfo { txHash: string; contractAddress?: string; circuits?: string[]; note?: string; sponsorAccountId?: string; deployed?: string[]; ttl?: string }
 export type SubmitIntentHook = (txHash: string, intent: SubmitIntentInfo) => Promise<void>;
 
 async function rpc<T>(method: string, args: unknown, timeoutMs: number = RPC_TIMEOUT_MS, onSubmitIntent?: SubmitIntentHook): Promise<T> {
-    // A rotating worker takes no new work: wait for its exit, then call the
-    // respawned worker. A WORKER_ROTATING refusal is retried once the same way,
-    // and so is a read or wait the rotation exit cut off (WORKER_ROTATED); a
-    // submitting call is never repeated (its identifier was announced; the
-    // job reconciles it).
+    // Retry once on the respawn after a rotation refusal or cut-off; a submitting
+    // call is never repeated (its announced identifier is reconciled instead).
     for (let attempt = 0; ; attempt++) {
         await waitForDrainingWorker();
         try {
@@ -480,6 +376,7 @@ async function waitForDrainingWorker(): Promise<void> {
     });
 }
 
+/** One RPC over its own MessageChannel. */
 async function rpcOnce<T>(method: string, args: unknown, timeoutMs: number, onSubmitIntent?: SubmitIntentHook): Promise<T> {
     if (!client) {
 
@@ -492,6 +389,10 @@ async function rpcOnce<T>(method: string, args: unknown, timeoutMs: number, onSu
     return new Promise<T>((resolve, reject) => {
         const { port1, port2 } = new MessageChannel();
         let settled = false;
+        // The worker's answer (reply, timeout, exit) is in; the call settles
+        // once every intent hook of this call has settled too.
+        let answered = false;
+        const intentsInFlight = new Set<Promise<void>>();
         let pending: PendingRpc;
         let timer: ReturnType<typeof setTimeout>;
         const settle = (): void => {
@@ -501,53 +402,75 @@ async function rpcOnce<T>(method: string, args: unknown, timeoutMs: number, onSu
             pendingRpcs.delete(pending);
             port2.close();
         };
-        // Stored reject is the guarded one, so a worker-exit sweep and the
-        // timeout can't double-settle or leak the port/timer.
-        pending = { reject: (e: Error) => { if (!settled) { settle(); reject(e); } } };
+        // Wait for pending intent hooks: a late commit after the caller's failure
+        // bookkeeping would leave a hash on a job whose tx was never sent.
+        const finish = (outcome: () => void): void => {
+            if (answered) return;
+            answered = true;
+            clearTimeout(timer);
+            void (async () => {
+                while (intentsInFlight.size > 0) await Promise.allSettled([...intentsInFlight]);
+                settle();
+                outcome();
+            })();
+        };
+        // Guarded, so exit sweep and timeout cannot double-settle.
+        pending = { reject: (e: Error) => finish(() => reject(e)) };
         pendingRpcs.add(pending);
         timer = setTimeout(
             () => pending.reject(new Error(`wallet-worker rpc '${method}' timed out after ${timeoutMs}ms`)),
             timeoutMs
         );
 
+        const postAck = (ack: Record<string, unknown>): void => {
+            try { port2.postMessage({ kind: 'submit-intent-ack', ...ack }); } catch { /* port already closed */ }
+        };
         port2.on('message', (msg: any) => {
-            if (settled) return;
+            if (answered) return;
             if (msg?.kind === 'submit-intent') {
-                // Intermediate message, not the reply: persist the boundary,
-                // then ack (or nack) so the worker broadcasts (or does not).
+                // Persist, then ack or nack. No ack once the worker answered: it gave up and did not send.
                 const intent: SubmitIntentInfo = { txHash: String(msg.txHash), contractAddress: msg.contractAddress, circuits: msg.circuits, note: msg.note, sponsorAccountId: msg.sponsorAccountId, ...(Array.isArray(msg.deployed) ? { deployed: msg.deployed.map(String) } : {}), ...(typeof msg.ttl === 'string' ? { ttl: msg.ttl } : {}) };
-                Promise.resolve()
+                const startedAt = Date.now();
+                const tracked: Promise<void> = Promise.resolve()
                     .then(() => onSubmitIntent?.(intent.txHash, intent))
-                    .then(() => port2.postMessage({ kind: 'submit-intent-ack', txHash: msg.txHash, ok: true }))
-                    .catch((e) => port2.postMessage({ kind: 'submit-intent-ack', txHash: msg.txHash, ok: false, error: String((e as Error)?.message ?? e) }));
+                    .then(
+                        () => {
+                            const ms = Date.now() - startedAt;
+                            if (answered) {
+                                log.warn(`submit-intent ${intent.txHash.slice(0, 16)}: persisted after ${ms}ms, after the worker had answered; not acknowledged (the worker did not broadcast)`);
+                                return;
+                            }
+                            if (ms > INTENT_PERSIST_WARN_MS) log.warn(`submit-intent ${intent.txHash.slice(0, 16)}: persisting the boundary took ${ms}ms`);
+                            postAck({ txHash: msg.txHash, ok: true });
+                        },
+                        (e) => {
+                            if (!answered) postAck({ txHash: msg.txHash, ok: false, error: String((e as Error)?.message ?? e) });
+                        }
+                    )
+                    .finally(() => { intentsInFlight.delete(tracked); });
+                intentsInFlight.add(tracked);
                 return;
             }
-            settle();
-            if (msg?.ok) {
-                resolve(msg.result as T);
-                return;
-            }
-            const payload = msg?.error;
-            if (payload && typeof payload === 'object' && typeof payload.message === 'string') {
-                // A classified failure (submitting methods) keeps its code,
-                // ledger code, retryability, batch stages and cause chain as
-                // data; the main thread never re-derives them from the text.
-                if (isSubmitFailureCode(payload.code)) {
-                    reject(new WorkerSubmitError(payload));
+            finish(() => {
+                if (msg?.ok) {
+                    resolve(msg.result as T);
                     return;
                 }
-                const err = new Error(payload.message);
-                if (typeof payload.name === 'string' && payload.name) err.name = payload.name;
-                reject(err);
-            } else {
-                reject(new Error(typeof payload === 'string' ? payload : 'worker rpc failed'));
-            }
+                const payload = msg?.error;
+                if (payload && typeof payload === 'object' && typeof payload.message === 'string') {
+                    if (isSubmitFailureCode(payload.code)) {
+                        reject(new WorkerSubmitError(payload));
+                        return;
+                    }
+                    const err = new Error(payload.message);
+                    if (typeof payload.name === 'string' && payload.name) err.name = payload.name;
+                    reject(err);
+                } else {
+                    reject(new Error(typeof payload === 'string' ? payload : 'worker rpc failed'));
+                }
+            });
         });
-        port2.once('messageerror', err => {
-            if (settled) return;
-            settle();
-            reject(err as Error);
-        });
+        port2.once('messageerror', err => finish(() => reject(err as Error)));
         worker.postMessage(
             { kind: 'rpc', method, args, port: port1 },
             [port1] // transfer ownership of port1
@@ -556,19 +479,14 @@ async function rpcOnce<T>(method: string, args: unknown, timeoutMs: number, onSu
 }
 
 /**
- * Handle a `private-state-rpc` message from the worker.
- *
- * - `setContractAddress` is fire-and-forget (worker sends no `port`). The SDK
- *   contract is synchronous; ordering on parentPort guarantees the next
- *   async set/get arrives AFTER the address has been applied here.
- * - All other methods reply on the supplied MessagePort.
+ * `setContractAddress` has no reply port: parentPort ordering guarantees it is
+ * applied before the next set/get arrives. Other methods reply on their port.
  */
 function dispatchPrivateStateRpc(msg: any): void {
     const { proxyId, method, args, port } = msg;
     const provider = privateStateProviders.get(proxyId);
 
     if (method === 'setContractAddress') {
-        // No port: set synchronously, log on error.
         if (!provider) {
             log.warn(`setContractAddress: unknown proxyId=${String(proxyId).slice(0, 16)}`);
             return;
@@ -613,13 +531,7 @@ function dispatchPrivateStateRpc(msg: any): void {
     })();
 }
 
-/**
- * Type-safe dispatch into CapDbPrivateStateProvider for the 8 async methods
- * the SDK uses. A `switch` over the known method names lets TypeScript check
- * each call signature; the worker can only request methods we explicitly
- * support, and an unknown name produces a stable error rather than a runtime
- * "fn is not a function" from a duck-typed lookup.
- */
+/** Explicit switch, not a duck-typed lookup: the worker may only call these methods. */
 async function dispatchPrivateStateMethod(
     provider: CapDbPrivateStateProvider,
     method: string,
@@ -649,11 +561,7 @@ export function walletInit(args: WalletInitArgs): Promise<{
     return rpc('init', args);
 }
 
-/**
- * Prewarm sync gate. `timeoutMs` is the absolute ceiling, `stallMs` the
- * no-progress bound (the worker's env default when omitted); the wait fails
- * on whichever fires first and its message says which.
- */
+/** Prewarm sync gate: `timeoutMs` absolute ceiling, `stallMs` no-progress bound; first to fire wins. */
 export function walletWaitForSyncedState(sessionId: string, timeoutMs?: number, stallMs?: number): Promise<{ synced: true }> {
     const workerBudgetMs = timeoutMs ?? 12 * 60 * 60 * 1000;
     return rpc('waitForSyncedState', { sessionId, timeoutMs, stallMs }, workerBudgetMs + 5 * 60 * 1000);
@@ -661,32 +569,24 @@ export function walletWaitForSyncedState(sessionId: string, timeoutMs?: number, 
 
 export async function walletEvict(sessionId: string): Promise<{ evicted: boolean; saved?: boolean }> {
     try {
-        // awaitSaveAck: the reply lets the caller drop the session from the
-        // save registry, so the worker's final save must be persisted first.
+        // The caller drops the session from the save registry on reply, so
+        // the final save must be persisted first.
         return await rpc('evict', { sessionId, awaitSaveAck: true });
     } finally {
-        // The facade is gone either way; a surviving snapshot would report a
-        // catch-up that nothing is running any more.
         syncProgressCache.delete(sessionId);
     }
 }
 
-/**
- * Last catch-up progress the worker reported for a facade, or null when it has
- * never reported one (no sync wait ran yet, or the worker restarted).
- *
- * Synchronous main-thread cache read, deliberately: the worker pushes these
- * snapshots because it is CPU-saturated during exactly the catch-up a caller
- * wants to observe, so asking it would be slow or time out. `updatedAt` says
- * how fresh the answer is; a snapshot that stops advancing while `elapsedMs`
- * grows is the signature of a genuine stall.
- */
 /** CPU profile of the worker thread for `seconds` (1..120); summary back, raw file on disk. Admin diagnostic. */
 export function walletCpuProfile(seconds: number, dir?: string): Promise<Record<string, unknown>> {
     const secs = Math.min(120, Math.max(1, Math.floor(Number(seconds) || 20)));
     return rpc('cpuProfile', { seconds: secs, dir }, (secs + 60) * 1000);
 }
 
+/**
+ * Last pushed catch-up progress, or null. A cache read, never an RPC: the worker
+ * is CPU-saturated during exactly the catch-up a caller observes.
+ */
 export function walletGetSyncProgress(sessionId: string): WalletSyncProgress | null {
     return syncProgressCache.get(sessionId) ?? null;
 }
@@ -709,14 +609,7 @@ export interface WalletWorkerStatus {
     facades: Array<{ sessionId: string; label: string; caughtUp: boolean; updatedAt: string }>;
 }
 
-/**
- * Worker health at PROCESS level, as opposed to `walletGetSyncProgress`, which
- * answers per facade. When the worker is wedged every session looks
- * individually slow and nothing says why; this says why.
- *
- * Synchronous and main-thread only: it reads state the client already keeps,
- * so it stays answerable exactly when the worker cannot answer anything.
- */
+/** Process-level worker health; synchronous, so it answers while the worker cannot. */
 export function getWalletWorkerStatus(): WalletWorkerStatus {
     return {
         started: everStarted,
@@ -736,12 +629,7 @@ export function getWalletWorkerStatus(): WalletWorkerStatus {
     };
 }
 
-/**
- * End-to-end NIGHT-UTXO registration for DUST generation.
- * Single RPC that wraps wait-sync → filter → register → finalize → submit.
- * `syncTimeoutMs: 0` (or omitted) waits indefinitely for sync; provide a
- * positive number to bound the wait for tests.
- */
+/** NIGHT-UTXO registration for DUST generation. `syncTimeoutMs` 0 or omitted waits indefinitely. */
 export function walletRegisterDustGeneration(args: {
     sessionId: string;
     dustReceiverAddress?: string;
@@ -750,13 +638,10 @@ export function walletRegisterDustGeneration(args: {
     return rpc('registerDustGeneration', args, RPC_TIMEOUT_MS, onSubmitIntent);
 }
 
-/** Outcome of `registerDustGeneration` (0.21.0). */
 export interface RegisterDustGenerationOutcome {
-    /** Transaction ID of the registration submission; null when nothing was registered. */
+    /** Null when nothing was registered. */
     txId: string | null;
-    /** Whether a registration was submitted. */
     changed: boolean;
-    /** Why nothing changed: 'already-registered' | 'no-night-utxos'; null when changed. */
     reason: 'already-registered' | 'no-night-utxos' | null;
     registeredCount: number;
     /** All NIGHT UTXOs of the wallet, registered or not, at the time of the call. */
@@ -775,19 +660,11 @@ export interface RegisterDustGenerationOutcome {
     message: string;
 }
 
-/**
- * Symmetric pair to `walletRegisterDustGeneration`. Deregisters all
- * registered NIGHT UTXOs so they become spendable. Per-UTXO narrowing
- * is a follow-up; today this is all-or-nothing.
- */
+/** Deregisters ALL registered NIGHT UTXOs. */
 export function walletDeregisterDustGeneration(args: {
     sessionId: string;
     syncTimeoutMs?: number;
-    /**
-     * Optional fee sponsor (facade key, i.e. accountId): that facade balances
-     * the deregistration fee from ITS dust and submits. Escape hatch for a
-     * wallet whose whole generation is delegated away (own dust stays 0).
-     */
+    /** Fee sponsor facade (accountId), for a wallet whose generation is delegated away (own dust 0). */
     sponsorSessionId?: string;
 }, onSubmitIntent?: SubmitIntentHook): Promise<{
     txId: string | null;
@@ -797,13 +674,7 @@ export function walletDeregisterDustGeneration(args: {
     return rpc('deregisterDustGeneration', args, RPC_TIMEOUT_MS, onSubmitIntent);
 }
 
-/**
- * Send NIGHT to any Midnight address. Ledger is auto-detected from the
- * receiver's Bech32m prefix (mn_shield-addr_ vs mn_addr_).
- *
- * Amount is a decimal string parseable as bigint (NIGHT atoms); strings
- * avoid the precision pitfalls of JS Number when atom counts exceed 2^53.
- */
+/** Send NIGHT (or `tokenTypeHex`); ledger from the receiver prefix, `amount` in atoms as a decimal string. */
 export function walletTransferNight(args: {
     sessionId: string;
     receiverAddress: string;
@@ -821,21 +692,11 @@ export function walletTransferNight(args: {
     return rpc('transferNight', args, RPC_TIMEOUT_MS, onSubmitIntent);
 }
 
-/**
- * Snapshot of the wallet's balances. Read-only: no transaction is
- * built or submitted. All amounts are decimal-string bigint to avoid
- * Number precision loss.
- */
+/** Read-only balance snapshot; amounts as decimal strings. */
 export function walletGetBalance(args: {
     sessionId: string;
     syncTimeoutMs?: number;
-    /**
-     * Bound for the WORKER RPC itself, not just the caller's wait. Without it
-     * an abandoned read keeps its pendingRpcs entry until the 30-minute
-     * backstop, so a monitor polling a stuck worker piles up entries. The
-     * worker still finishes whatever it started, but the client side settles
-     * and the backlog cannot grow.
-     */
+    /** Bounds the RPC itself, so a monitor polling a stuck worker does not pile up pending calls. */
     rpcTimeoutMs?: number;
 }): Promise<{
     shieldedNight: string;
@@ -854,11 +715,7 @@ export function walletGetBalance(args: {
     return rpc('getBalance', rest, rpcTimeoutMs);
 }
 
-/**
- * Pre-flight fee estimate for `walletTransferNight`. Builds the recipe
- * but does NOT finalize (no proof generation) or submit. Returns dust
- * atoms as decimal string.
- */
+/** Fee estimate for `walletTransferNight` (no proof, no submit); dust atoms as decimal string. */
 export function walletEstimateTransferFee(args: {
     sessionId: string;
     receiverAddress: string;
@@ -870,7 +727,7 @@ export function walletEstimateTransferFee(args: {
     return rpc('estimateTransferFee', args);
 }
 
-// ---- Phase 2b: contract deploy / call -------------------------------------
+// ---- Contract deploy / call -----------------------------------------------
 
 export interface WorkerContractRegistration {
     artifactPath: string;
@@ -894,6 +751,8 @@ export interface WalletDeployContractArgs {
     /** User-supplied private state for the new contract. Plain JSON-able value. */
     initialPrivateState: unknown;
     sponsorSessionId?: string;
+    /** Vault family: the recovery identity (64 hex) passed to the constructor; absent = none. */
+    recoveryId?: string;
 }
 
 export interface WalletSubmitContractCallArgs {
@@ -913,11 +772,7 @@ export interface WalletSubmitContractCallArgs {
     sponsorSessionId?: string;
 }
 
-/**
- * Deploy a Compact-emitted contract through the wallet worker. The worker
- * owns the SDK and the wallet facade; private-state CRUD round-trips back to
- * the main-side provider registered under `proxyId`.
- */
+/** Deploy a contract; private state round-trips to the provider registered under `proxyId`. */
 export function walletDeployContract(args: WalletDeployContractArgs, onSubmitIntent?: SubmitIntentHook): Promise<{
     txHash: string;
     contractAddress: string;
@@ -926,10 +781,7 @@ export function walletDeployContract(args: WalletDeployContractArgs, onSubmitInt
     return rpc('deployContract', args, RPC_TIMEOUT_MS, onSubmitIntent);
 }
 
-/**
- * Invoke a circuit on a deployed contract through the worker. Same wiring as
- * `walletDeployContract`. Returns the submission txHash + on-chain status.
- */
+/** Invoke a circuit on a deployed contract; wired like `walletDeployContract`. */
 export function walletSubmitContractCall(args: WalletSubmitContractCallArgs, onSubmitIntent?: SubmitIntentHook): Promise<{
     txHash: string;
     onChainStatus: string;
@@ -937,22 +789,14 @@ export function walletSubmitContractCall(args: WalletSubmitContractCallArgs, onS
     return rpc('submitContractCall', args, RPC_TIMEOUT_MS, onSubmitIntent);
 }
 
-/**
- * Cross-server sponsoring PHASE 1 (0.17.0): build + sign + finalize a contract
- * call under the CALLER's identity and return the fee-unpaid finalized tx as
- * base64, without submitting. A remote sponsor pays dust and submits.
- */
+/** Build, sign and finalize a call under the caller's identity, fee unpaid, not submitted. */
 export function walletBuildSponsorableTx(
     args: Omit<WalletSubmitContractCallArgs, 'sponsorSessionId'>
 ): Promise<{ finalizedTxB64: string; serializedBytes: number }> {
     return rpc('buildSponsorableTx', args);
 }
 
-/**
- * Cross-server sponsoring PHASE 2 (0.17.0): balance dust onto a caller-finalized
- * tx (base64) with the sponsor session and submit, after an allow-list policy
- * check. The attestation stays the caller's; the sponsor only pays.
- */
+/** Pay dust for a caller-finalized tx with the sponsor session and submit, after the policy check. */
 export function walletSponsorFinalizedTx(args: {
     sponsorSessionId: string;
     finalizedTxB64: string;
@@ -970,21 +814,14 @@ export function walletSponsorFinalizedTx(args: {
 }
 
 export interface WalletSubmitContractCallBatchArgs extends Omit<WalletSubmitContractCallArgs, 'circuit' | 'args'> {
-    /** Ordered circuit calls, all executed inside ONE transaction scope. A
-     *  call may carry its own `merkleProof` (per-call witness binding for
-     *  proveFieldPredicate); mutually exclusive with the batch-level
-     *  `merkleProof` inherited from WalletSubmitContractCallArgs. */
+    /** Ordered calls in ONE transaction; a per-call `merkleProof` excludes the batch-level one. */
     calls: Array<{ circuit: string; args: unknown[]; merkleProof?: MerkleProofBundle }>;
     /** The calls past `orderedPrefix` share no state: the worker groups them by execution stage before proving. */
     independentCalls?: boolean;
     orderedPrefix?: number;
 }
 
-/**
- * Invoke SEVERAL circuits on one deployed contract as a SINGLE transaction
- * (the worker batches them via the SDK's withContractScopedTransaction).
- * Returns the one submission txHash + on-chain status for the whole batch.
- */
+/** Several circuits on one contract as a single transaction. */
 export function walletSubmitContractCallBatch(args: WalletSubmitContractCallBatchArgs, onSubmitIntent?: SubmitIntentHook): Promise<{
     txHash: string;
     onChainStatus: string;
@@ -1009,11 +846,7 @@ export function __resetWalletWorkerForTests(): void {
     stoppingWorker = null;
 }
 
-/**
- * 0.18 PARALLEL sponsoring (dust-note-pool): submit an UNBOUND caller tx, the
- * sponsor merges dust from a locked note and binds. Keyed by the sponsor
- * account like walletSponsorFinalizedTx.
- */
+/** Parallel sponsoring: the sponsor merges dust from a locked note into an unbound caller tx and binds. */
 export function walletSponsorUnboundTx(args: {
     sponsorSessionId: string;
     unboundTxB64: string;

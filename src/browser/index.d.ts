@@ -23,7 +23,7 @@ export {
     type AttestationVaultWitnesses
 } from './witnesses.js';
 
-// Phase 4 - providers + typed call helpers.
+// Providers + typed call helpers.
 
 /** Browser ZK-config provider that fetches keys/zkir from `/zk-config/<contract>`. */
 export class FetchZkConfigProvider {
@@ -119,16 +119,24 @@ export interface PreparedCall {
 export function prepareRevokeDisclosure(input: { payloadHash: string; grantee: string; attestationSecret: Uint8Array }): PreparedCall;
 export function prepareGrantDisclosure(input: { payloadHash: string; grantee: string; level: number | bigint; attestationSecret: Uint8Array }): PreparedCall;
 export function prepareAttest(input: { payloadHash: string; metadataHash: string; attestationSecret: Uint8Array }): PreparedCall;
-export function prepareAttestCommit(input: { commitment: string; expiresAt: number | bigint; attestationSecret: Uint8Array }): PreparedCall;
-export function prepareAttestReveal(input: { payloadHash: string; metadataHash: string; nonce: string; attestationSecret: Uint8Array }): PreparedCall;
+/** The attester's record key for a payload (hex), via the compiled artifact's `recordKey` pure circuit. */
+export function recordKeyOf(input: { pureCircuits: { recordKey(owner: Uint8Array, payloadHash: Uint8Array): Uint8Array }; attesterId: string; payloadHash: string }): string;
+export function prepareRegisterDocument(input: { documentId?: string; ownerId?: string; mode?: number | bigint; attestationSecret: Uint8Array }): PreparedCall;
+/** Alias of prepareRegisterDocument (mode 0). */
 export function prepareRegisterPassport(input: { passportId: string; ownerId: string; attestationSecret: Uint8Array }): PreparedCall;
+export function prepareBindDocument(input: { documentId: string; payloadHash: string; attestationSecret: Uint8Array }): PreparedCall;
+/** Alias of prepareBindDocument. */
 export function prepareBindPassport(input: { passportId: string; payloadHash: string; attestationSecret: Uint8Array }): PreparedCall;
+export function prepareRetract(input: { mode: number | bigint; key: string; attestationSecret: Uint8Array }): PreparedCall;
+export function prepareRetractAttestation(input: { payloadHash: string; attestationSecret: Uint8Array }): PreparedCall;
+export function preparePurgeExpired(input: { kind: 'claim'; key: string; attestationSecret: Uint8Array }): PreparedCall;
+export const DEFAULT_CLAIM_LIFETIME_S: number;
 export function prepareAnchorContentRoot(input: { payloadHash: string; contentRoot: string; schemaId: string; attestationSecret: Uint8Array }): PreparedCall;
-export function prepareProveFieldPredicate(input: { payloadHash: string; fieldKey: string; threshold: number | bigint; op: number | bigint; merkleProof: import('./witnesses.js').MerkleProof; attestationSecret?: Uint8Array; slotWidth?: number }): PreparedCall;
-export function prepareProveFieldEquality(input: { payloadHash: string; fieldKey: string; expectedDigest: string; merkleProof: import('./witnesses.js').MerkleProof; attestationSecret?: Uint8Array; slotWidth?: number }): PreparedCall;
-export function prepareProveFieldMembership(input: { payloadHash: string; fieldKey: string; setRoot: string; merkleProof: import('./witnesses.js').MerkleProof; attestationSecret?: Uint8Array; slotWidth?: number }): PreparedCall;
-export function prepareProveFieldsUnchangedExcept(input: { payloadHashA: string; payloadHashB: string; allowedMask: number; docPair: import('./witnesses.js').DocPair; attestationSecret?: Uint8Array; slotWidth?: number }): PreparedCall;
-export function prepareProveFieldsDiffer(input: { payloadHashA: string; payloadHashB: string; k: number; docPair: import('./witnesses.js').DocPair; attestationSecret?: Uint8Array; slotWidth?: number }): PreparedCall;
+export function prepareProveFieldPredicate(input: { recordKey: string; fieldKey: string; threshold: number | bigint; op: number | bigint; validUntil?: number | bigint; merkleProof: import('./witnesses.js').MerkleProof; attestationSecret?: Uint8Array; slotWidth?: number }): PreparedCall;
+export function prepareProveFieldEquality(input: { recordKey: string; fieldKey: string; expectedDigest: string; validUntil?: number | bigint; merkleProof: import('./witnesses.js').MerkleProof; attestationSecret?: Uint8Array; slotWidth?: number }): PreparedCall;
+export function prepareProveFieldMembership(input: { recordKey: string; fieldKey: string; setRoot: string; validUntil?: number | bigint; merkleProof: import('./witnesses.js').MerkleProof; attestationSecret?: Uint8Array; slotWidth?: number }): PreparedCall;
+export function prepareProveFieldsUnchangedExcept(input: { recordKeyA: string; recordKeyB: string; allowedMask: number; validUntil?: number | bigint; docPair: import('./witnesses.js').DocPair; attestationSecret?: Uint8Array; slotWidth?: number }): PreparedCall;
+export function prepareProveFieldsDiffer(input: { recordKeyA: string; recordKeyB: string; k: number; validUntil?: number | bigint; docPair: import('./witnesses.js').DocPair; attestationSecret?: Uint8Array; slotWidth?: number }): PreparedCall;
 
 export interface ContractBrowserMeta {
     name: string;

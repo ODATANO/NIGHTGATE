@@ -1,26 +1,9 @@
 /**
- * Midnight HD key derivation (matches Lace / the Midnight reference wallet).
- *
- * Lace derives each wallet key type from a SEPARATE BIP32 role of the BIP39
- * seed, NOT from the raw seed. Feeding the raw 32-byte seed into
- * `ZswapSecretKeys.fromSeed` lands on a different account than the user's Lace
- * wallet, so the facade sees an empty wallet and deploys fail with "could not
- * balance dust". This module reproduces Lace's derivation:
- *
- *   bip39 seed (64B) → HDWallet.fromSeed → account 0 → role
- *     {Zswap | Dust | NightExternal} → deriveKeyAt(0) → 32-byte role seed
- *     → SDK ZswapSecretKeys.fromSeed / DustSecretKey.fromSeed / createKeystore
- *
- * Verified against a live Lace preprod account via
- * `scripts/probe-seed-derivation.mjs`: role Zswap at account 0 / index 0
- * reproduces the Lace shielded address exactly.
- *
- * `@midnightntwrk/wallet-sdk-hd` is ESM-only; loaded via dynamic import from
- * this CommonJS module (same pattern as srv/midnight/sdk-loader.ts).
+ * Lace-compatible HD derivation: each key type comes from its own BIP32 role
+ * (bip39 seed -> account -> Zswap | Dust | NightExternal -> key 0), never from the raw seed,
+ * which would land on a different, empty account.
  */
-// Named imports: bip39's CJS build sets `__esModule` but exposes no default
-// export, so `import bip39 from 'bip39'` resolves to undefined under
-// esModuleInterop's __importDefault. Named bindings map to the real exports.
+// Named imports: bip39's CJS build has no default export.
 import { validateMnemonic, mnemonicToSeedSync } from 'bip39';
 
 const ACCOUNT = 0;
@@ -50,14 +33,7 @@ export function mnemonicToBip39SeedHex(mnemonic: string): string {
     return mnemonicToSeedSync(m).toString('hex');
 }
 
-/**
- * Derive the per-role 32-byte seeds from a 64-byte BIP39 seed, matching Lace.
- * Each result is fed to the SDK's fromSeed/createKeystore for its key type.
- *
- * `accountIndex` selects the BIP32 account level (default 0 = the account
- * every existing caller used implicitly, bit-identical to before). Non-zero
- * indices give multiple independent wallet accounts from one phrase.
- */
+/** Per-role 32-byte seeds of a 64-byte BIP39 seed at BIP32 account `accountIndex` (default 0). */
 export async function deriveRoleSeeds(bip39Seed: Uint8Array, accountIndex: number = ACCOUNT): Promise<RoleSeeds> {
     if (!Number.isInteger(accountIndex) || accountIndex < 0) {
         throw new Error('accountIndex must be a non-negative integer');

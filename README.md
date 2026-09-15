@@ -13,7 +13,7 @@
 [![SAP CAP](https://img.shields.io/badge/SAP%20CAP-%40sap%2Fcds%20%5E10-0faaff?logo=sap)](https://cap.cloud.sap/)
 [![License](https://img.shields.io/badge/license-Apache--2.0-yellow)](LICENSE)
 
-`@odatano/nightgate` ties a SAP CAP runtime directly to the [Midnight](https://midnight.network/) blockchain. A built-in crawler indexes blocks from a Substrate RPC node into CAP entities; a worker-thread-isolated wallet stack handles ZK-aware transaction submission (deploy/call Compact contracts, send NIGHT or custom tokens on both the shielded and the unshielded ledger, dust generation, fee sponsoring). The whole surface is exposed through standard OData V4.
+`@odatano/nightgate` connects SAP CAP to the [Midnight](https://midnight.network/) blockchain. A crawler indexes blocks from a Substrate RPC node into CAP entities; a wallet stack in a worker thread submits transactions (Compact deploys and calls, NIGHT and custom-token transfers, dust generation, fee sponsoring). Everything is exposed as OData V4.
 
 ```text
                             ┌──────────────────────────────────────┐
@@ -45,7 +45,7 @@
 └───────────────────────────────────────────────────────────────────────────┘
 ```
 
-The wallet SDK lives in `worker_threads` because Midnight's Effect.ts fiber scheduler saturates the microtask queue during sync; isolating it keeps the main CAP request pipeline responsive.
+The wallet SDK runs in a worker thread because its sync saturates the microtask queue; the CAP request pipeline stays responsive.
 
 ## Quick start
 
@@ -54,8 +54,7 @@ npm ci
 npm run dev           
 ```
 
-Or standalone with Docker, no Node installation and no host app required
-(published on every release, see [docs/docker.md](docs/docker.md)):
+Or standalone with Docker ([docs/docker.md](docs/docker.md)):
 
 ```bash
 docker pull ghcr.io/odatano/nightgate:latest
@@ -66,64 +65,63 @@ docker run -d -p 4004:4004 \
   ghcr.io/odatano/nightgate:latest
 ```
 
-Configure the `.env` file (see `.env.example`) to point to a Substrate RPC node and a GraphQL indexer.
+`.env` (see `.env.example`):
 
 ```bash
-# target network
 NIGHTGATE_NETWORK=preprod
- # Substrate RPC node                                                              
 NIGHTGATE_NODE_URL=wss://rpc.preprod.midnight.network/
-#  GraphQL indexer (HTTP only; WS derived from it)                                 
+# GraphQL indexer, HTTP; the WS URL is derived
 NIGHTGATE_INDEXER_HTTP_URL=https://indexer.preprod.midnight.network/api/v4/graphql
-# Proving defaults to fully in-process (wasm): no proof server needed.
-# For production, run the proof-server container (compose:
-# midnightntwrk/proof-server on :6300) and point at it; configuring the URL
-# selects server proving automatically.
+# Unset = in-process wasm proving. Setting it selects server proving (production).
 # NIGHTGATE_PROOF_SERVER_URL=http://localhost:6300
-NIGHTGATE_CRAWLER_ENABLED=false                   
-ENCRYPTION_KEY=<random secret>                   
+NIGHTGATE_CRAWLER_ENABLED=false
+ENCRYPTION_KEY=<random secret>
 ```
 
-For the full first-time-sync walkthrough see [docs/quickstart.md](docs/quickstart.md).
+First sync walkthrough: [docs/quickstart.md](docs/quickstart.md).
 
 ## Services & capabilities
 
-Four OData V4 services: **`NightgateService`** (`/api/v1/nightgate`: chain data, wallet sessions, all token / contract / attestation actions), **`NightgateIndexerService`** (`/api/v1/indexer`: sync state, health, metrics, crawler control), **`NightgateAnalyticsService`** (`/api/v1/analytics`: aggregate counts), **`NightgateAdminService`** (`/api/v1/admin`: session administration).
+| Service | Path | Content |
+|---|---|---|
+| `NightgateService` | `/api/v1/nightgate` | chain data, wallet sessions, token / contract / attestation actions |
+| `NightgateIndexerService` | `/api/v1/indexer` | sync state, health, metrics, crawler control |
+| `NightgateAnalyticsService` | `/api/v1/analytics` | aggregate counts |
+| `NightgateAdminService` | `/api/v1/admin` | sessions, contract registration, diagnostics |
+| `NightgateVerifyService` | `/api/v1/verify` | unauthenticated state verification (`NIGHTGATE_PUBLIC_VERIFY=true`) |
 
-Submit actions are **async**: they return `{ jobId, status }`; poll `getJobStatus(jobId, sessionId)` for the result. Exhaustive signatures, error codes, and curl examples: [docs/actions.md](docs/actions.md).
+Submit actions are async: they return `{ jobId, status }`; poll `getJobStatus(jobId, sessionId)`. Signatures, error codes and examples: [docs/actions.md](docs/actions.md).
 
 | Capability | Surface |
 |---|---|
-| Block indexing | Live + catch-up crawler with reorg detection (`srv/crawler/`); standard OData (`$filter`, `$orderby`, `$top`, `$expand`) on `Blocks`, `Transactions`, `ContractActions`, `UnshieldedUtxos`, `NightBalances` |
-| Wallet sessions | `connectWallet` (viewing key, read-only) upgraded via `connectWalletForSigning` (BIP39 mnemonic, HD-derived to match Lace); AES-256-GCM at rest, sessions bound to the requesting user |
-| Token ops | `sendNight` (receiver ledger auto-detected; optional `tokenTypeHex` sends any custom token instead of NIGHT, shielded or unshielded depending on the receiver address), `registerForDustGeneration` / `deregisterFromDustGeneration` |
-| Fee sponsoring | Generation delegation (`registerForDustGeneration` with a foreign `dustReceiverAddress`, own dust address via `deriveWalletInfo`) and per-tx sponsorship (optional `sponsorSessionId` on all submit actions: a second session pays the dust fee; cross-user use gated via `NIGHTGATE_FEE_SPONSOR_SESSION`) |
+| Block indexing | Crawler with reorg detection; OData queries on `Blocks`, `Transactions`, `ContractActions`, `UnshieldedUtxos`, `NightBalances` |
+| Wallet sessions | `connectWallet` (viewing key, read-only), `connectWalletForSigning` (BIP39 mnemonic, Lace-compatible HD derivation); AES-256-GCM at rest, bound to the requesting user |
+| Token ops | `sendNight` (ledger from the receiver address; `tokenTypeHex` for custom tokens), `registerForDustGeneration` / `deregisterFromDustGeneration` |
+| Fee sponsoring | Dust generation delegation (`dustReceiverAddress`) and per-tx `sponsorSessionId` on submit actions (platform sponsors: `NIGHTGATE_FEE_SPONSOR_SESSION`) |
 | Pre-flight | `getWalletBalance`, `estimateSendNightFee`, `deriveWalletInfo` |
-| Compact contracts | `deployContract` / `submitContractCall` on registered compiled artifacts |
-| Proving modes | `wasm` (default when no proof server is configured: fully in-process for wallet AND contract circuits, no Docker needed) or `server` (proof-server container, selected automatically by configuring `proofServerUrl`; recommended for production). Explicit override via `NIGHTGATE_PROVING_MODE`. |
-| Document anchoring | `anchorDocument` / `verifyDocument`: sha256 hash on-chain, storage stays with the caller |
-| Document ingestion | `prepareDocumentProof`: canonical JSON -> `payloadHash` + salted Merkle content root with per-field inclusion paths (numeric and, since 0.15.0, `kind: 'bytes'` string fields; 16 slots on the default vault, 32 on `attestation-vault-32`), ready for the field-proof actions; `prepareMembershipSet` builds the canonical allow-list set root (compute-only, nothing persisted) |
-| AI-agent access | `createAgentGrant` / `revokeAgentGrant`: scoped bearer tokens (`x-agent-token`) with action allowlist, daily job budget and pinned session/sponsor (fundless agents); `attestAgentOutput` anchors third-party-verifiable agent-output provenance. MCP companion: [`@odatano/nightgate-mcp`](https://github.com/ODATANO/NIGHTGATE-MCP) |
-| ZK predicate attestations | `issueFieldPredicateAttestation` (field-bound via salted content root) / `issueFieldPredicateAttestationBatch` (up to 8 field proofs in ONE tx, mixed kinds): prove `value ≤/≥ threshold` without revealing the value; `verifyPredicateAttestation` to check. (The commitment-only `issuePredicateAttestation` lane was removed in 0.16.0.) |
-| Bytes equality + membership proofs | `issueFieldEqualityAttestation` (field carries exactly the value behind a public digest) and `issueFieldMembershipAttestation` (hidden value is ONE OF a public allow-list of up to 64 values, without revealing which), batchable alongside numeric claims (0.15.0) |
-| Cross-root document proofs | `issueDocumentIntegrityAttestation` (document B differs from document A ONLY in a public width-bit slot mask) and `issueDocumentDiffAttestation` (at least k of width aligned slots differ): one proof relating TWO anchored salted content roots, values hidden, schema ids proven in-circuit (0.16.0) |
-| Width variants | `attestation-vault-32` (0.19.0): a second registered vault lineage with 32 content slots for panels of 17-32 provable fields under ONE root; the width comes from the registration's `slotWidth`, cross-root proofs work only within one width. The 16-slot default is byte-identical to before |
-| Crawler-free verification | `verifyAttestationState` / `verifyPredicateState` / `reindexDisclosures` read live contract state from the public indexer (per-call `network` override, no wallet, no local index) |
-| Tiered disclosure (RBAC) | `grantDisclosure` / `revokeDisclosure` (+ `registerGranteeIdentity`), on-chain `DisclosureGrants` index, `AttestationService` mixin with three disclosure tiers (public, legitimate interest, authority) |
-| Cross-server fee sponsoring | `@odatano/nightgate/txbuilder` (or the slim standalone package [`@odatano/nightgate-tx`](packages/nightgate-tx/README.md), under 1 MB): build, prove and sign a contract call on YOUR machine with YOUR key (wasm proving, prover keys fetched from a public `/zk-config` and cached), then hand the ~5 KB fee-unpaid transaction to `sponsorFinalizedTransaction`, which pays the dust and submits. The attestation carries the caller's identity; the sponsor never sees a key, witness or preimage (0.17.0) |
-| Browser / connector | `@odatano/nightgate/browser` (providers, witnesses, `prepareAttest` / `prepareGrantDisclosure` / `prepareRevokeDisclosure`) + `GET /zk-config/<contract>/…` + `GET /contract-manifest`: a wallet-driven dApp (Lace) needs neither the Compact toolchain nor `managed/` artifacts |
-| Operations | Health / liveness / readiness, Prometheus metrics, `pauseCrawler` / `resumeCrawler` / `reindexFromHeight`, offline start (boots without upstream node), optional local indexer via docker-compose |
+| Compact contracts | `deployContract`, `submitContractCall`, `submitContractCallBatch` on registered artifacts |
+| Proving | `wasm` in-process (default without a proof server) or `server` (selected by a proof-server URL; production). Override: `NIGHTGATE_PROVING_MODE` |
+| Document anchoring | `anchorDocument` / `verifyDocument`: hash on chain, storage stays with the caller |
+| Document ingestion | `prepareDocumentProof`: canonical JSON -> `payloadHash` + salted content root with per-field inclusion paths (16 slots, 32 on `attestation-vault-32`); `prepareMembershipSet`: canonical allow-list root. Compute-only |
+| Agent access | `createAgentGrant` / `updateAgentGrant` / `rotateAgentGrantToken` / `revokeAgentGrant`: scoped bearer tokens (`x-agent-token`) with action allow-list, budgets, pinned session and sponsor; `attestAgentOutput`: verifiable agent-output provenance. MCP server: [`@odatano/nightgate-mcp`](https://github.com/ODATANO/NIGHTGATE-MCP) |
+| Field proofs | `issueFieldPredicateAttestation` (`value <= / >= threshold`), `issueFieldEqualityAttestation` (value behind a public digest), `issueFieldMembershipAttestation` (one of up to 64 allowed values); `issueFieldPredicateAttestationBatch`: up to 8 mixed claims in one tx. Values stay hidden |
+| Cross-document proofs | `issueDocumentIntegrityAttestation` (B differs from A only in a slot mask), `issueDocumentDiffAttestation` (at least k slots differ); same width only |
+| Crawler-free verification | `verifyAttestationState`, `verifyPredicateState`, `reindexDisclosures`: live contract state from the public indexer, optional `network` override |
+| Tiered disclosure | `grantDisclosure` / `revokeDisclosure` / `registerGranteeIdentity`, `DisclosureGrants` index, `AttestationService` with three tiers |
+| Local tx building | `@odatano/nightgate/txbuilder` or [`@odatano/nightgate-tx`](packages/nightgate-tx/README.md): build, prove and sign with your own key, then `sponsorFinalizedTransaction` / `sponsorUnboundTransaction` pays and submits. The sponsor sees no key, witness or preimage |
+| Browser | `@odatano/nightgate/browser` + `GET /zk-config/<contract>/…` + `GET /contract-manifest`: wallet-driven dApps without Compact toolchain or `managed/` artifacts |
+| Operations | Health, liveness, readiness, Prometheus metrics, crawler pause / resume / reindex, offline start |
 
 ## Documentation
 
-- **[Quickstart:](docs/quickstart.md)** get from zero to first wallet-signed transaction
-- **[Actions reference:](docs/actions.md)** every OData action + function with examples
-- **[Architecture:](docs/architecture.md)** worker-thread design, submission flow, persistence model
-- **[Operations:](docs/operations.md)** running NIGHTGATE day to day, scripts, local indexer, troubleshooting
-- **[Docker:](docs/docker.md)** standalone container (`ghcr.io/odatano/nightgate`), configuration, schema upgrades
-- **[Transaction builder:](docs/txbuilder.md)** build sponsorable transactions locally, without a NIGHTGATE server
-- **[Reference:](docs/reference.md)** full configuration matrix + project structure
-- **[Changelog:](CHANGELOG.md)** notable changes by version
+- [Quickstart](docs/quickstart.md): first wallet-signed transaction
+- [Actions](docs/actions.md): every action and function with examples
+- [Architecture](docs/architecture.md): worker thread, submission flow, persistence
+- [Operations](docs/operations.md): scripts, local indexer, troubleshooting
+- [Docker](docs/docker.md): standalone container, configuration, schema upgrades
+- [Transaction builder](docs/txbuilder.md): build sponsorable transactions without a server
+- [Reference](docs/reference.md): configuration and project structure
+- [Changelog](CHANGELOG.md)
 
 ## Use as a CAP plugin in another app
 
@@ -143,28 +141,27 @@ npm install @odatano/nightgate @cap-js/sqlite
 }
 ```
 
-Then `cds watch`. `network` is the only required key; everything else defaults to fully public endpoints: Preprod's public RPC, the hosted indexer, and in-process (wasm) proving, so no local container is required. Configure a proof-server URL to switch to server proving (recommended for production). Override via env vars or CDS config, see [docs/reference.md#configuration](docs/reference.md#configuration).
+Then `cds watch`. `network` is the only required key; the defaults are the public RPC and indexer and wasm proving. Configuration: [docs/reference.md#configuration](docs/reference.md#configuration).
 
 ## Development
 
 ```bash
-npm run dev                # cds watch with 12 GB heap (scripts/dev.mjs)
-npm run serve:sync         # cds-serve with 12 GB heap, use this for long sync runs
-npm run sync:start         # bootstrap a wallet session against the running server
+npm run dev                # cds watch, 12 GB heap
+npm run serve:sync         # cds-serve, 12 GB heap; for long syncs and e2e runs
+npm run sync:start         # create a wallet session on the running server
 
-npm run typecheck          # tsc --noEmit
-npm run lint               # ESLint
-npm test                   # full Vitest suite with coverage
-npm run build              # Compile CDS types + TypeScript to JS
+npm run typecheck
+npm run lint
+npm test                   # Vitest with coverage
+npm run build              # CDS types + TypeScript
 
-# Integration scripts (real SDK, no chain access required)
-npm run smoke:sdk          # all SDK packages load
-npm run integration:providers            # + wallet-keys, wallet-facade, contract-registry,
-                                         #   connector-routes, attestation-vault, derive-wallet-info
+# Real SDK, no chain access
+npm run smoke:sdk
+npm run integration:providers   # also: wallet-keys, wallet-facade, contract-registry,
+                                #   connector-routes, attestation-vault, derive-wallet-info
 
-# Live e2e against preprod (funded wallet required)
-npm run deploy:e2e         # + predicate:e2e, disclosure:e2e, state-verify:e2e,
-                           #   wasm-proving:e2e, wasm-contract:e2e, wasm-zswap:e2e
+# Live e2e on preprod (funded wallet)
+npm run deploy:e2e         # more lanes: docs/operations.md
 ```
 
 ## License

@@ -1,5 +1,5 @@
 /**
- * Tests for srv/submission/grantee-identity.ts (Phase 0 grantee binding).
+ * Tests for srv/submission/grantee-identity.ts.
  */
 import { sha256 } from '@noble/hashes/sha256';
 import { bytesToHex } from '@noble/hashes/utils';

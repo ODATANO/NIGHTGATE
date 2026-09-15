@@ -2,12 +2,12 @@
 // package.json#exports.
 //
 // Why: the repo's tsconfig has `skipLibCheck: true`, which does not typecheck `.d.ts`/`.d.mts`
-// contents at all. Every consumer that leaves skipLibCheck at its default (false) does. Two real
-// bugs shipped invisibly through that gap and were only caught by installing the tarball:
-//   - `providers.d.mts` imported a type from the declaration-less `./zk-config.mjs` (TS7016);
-//   - `index.d.ts` referenced `AttestationVaultWitnesses`, which `export { … } from` re-exports
-//     but does NOT bind locally (TS2304).
-// A full pack+install round trip catches these but takes minutes. This does it in seconds.
+// contents at all. Every consumer that leaves skipLibCheck at its default (false) does. Errors
+// that only surface there:
+//   - a `.d.mts` importing a type from a declaration-less `.mjs` (TS7016);
+//   - a `.d.ts` referencing a name that `export { … } from` re-exports but does NOT bind
+//     locally (TS2304).
+// A full pack+install round trip catches these too but takes minutes. This does it in seconds.
 //
 // The probe lives INSIDE the repo and imports by PACKAGE NAME, using Node/TS self-referencing, so
 // resolution goes through `exports` exactly as a consumer's does. That matters: the browser entry
@@ -49,11 +49,11 @@ void buildProofProvider;
 // metadata; a consumer targeting attestation-vault-32 writes exactly this.
 import { prepareProveFieldEquality, prepareProveFieldsUnchangedExcept, CONTRACTS } from '@odatano/nightgate/browser';
 void buildAttestationVaultWitnesses({ merkleProof: proof, slotWidth: 32 });
-const eq = prepareProveFieldEquality({ payloadHash: 'p', fieldKey: 'f', expectedDigest: 'd', merkleProof: proof, slotWidth: 32 });
+const eq = prepareProveFieldEquality({ recordKey: 'p', fieldKey: 'f', expectedDigest: 'd', merkleProof: proof, slotWidth: 32 });
 const rebound: MerkleProof | undefined = eq.merkleProof;
 const w: number | undefined = eq.slotWidth;
 void [rebound, w];
-void prepareProveFieldsUnchangedExcept({ payloadHashA: 'a', payloadHashB: 'b', allowedMask: 0x80000001, docPair: {}, slotWidth: 32 });
+void prepareProveFieldsUnchangedExcept({ recordKeyA: 'a', recordKeyB: 'b', allowedMask: 0x80000001, docPair: {}, slotWidth: 32 });
 const meta = CONTRACTS['attestation-vault-32'];
 const dims: [number, number] = [meta.slotWidth, meta.merkleDepth];
 void dims;

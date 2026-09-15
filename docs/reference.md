@@ -1,8 +1,6 @@
 # Reference
 
-Configuration matrix, runtime behavior, schema, and development setup for `@odatano/nightgate`.
-
-For the OData action/function signatures, see [actions.md](actions.md). For design rationale, see [architecture.md](architecture.md). For day-to-day operations, see [operations.md](operations.md).
+Configuration, runtime behavior, schema and development setup. Signatures: [actions.md](actions.md); design: [architecture.md](architecture.md); operations: [operations.md](operations.md).
 
 ## Configuration
 
@@ -20,7 +18,7 @@ Configure the plugin under `cds.requires.nightgate`. Environment variables overr
 }
 ```
 
-Sufficient for read-side. `network` is the only required key - without it the plugin serves its OData surface but stays idle (no crawler, no submission), so a bare install never auto-crawls a chain nobody chose. Everything else defaults: `wss://rpc.preprod.midnight.network/`, the public Midnight indexer, `http://localhost:6300` for the proof server. A legacy `"kind": "nightgate"` in existing configs is inert and ignored.
+`network` is the only required key; without it the plugin serves OData but stays idle (no crawler, no submission). Defaults: `wss://rpc.preprod.midnight.network/`, the public Midnight indexer, wasm proving. A legacy `"kind": "nightgate"` is ignored.
 
 ### Full
 
@@ -68,48 +66,45 @@ Sufficient for read-side. `network` is the only required key - without it the pl
 
 | Key | Default | Notes |
 |---|---|---|
-| `network` | `preprod` | `testnet` / `preprod` / `preview` / `mainnet` / `undeployed` (local midnight-local-dev standalone stack: node `ws://127.0.0.1:9944`, indexer `127.0.0.1:8088`); invalid values fall back to `preprod` with a warning |
+| `network` | `preprod` | `testnet` / `preprod` / `preview` / `mainnet` / `undeployed` (local stack: node `ws://127.0.0.1:9944`, indexer `127.0.0.1:8088`); an invalid value refuses to start |
 | `nodeUrl` | `wss://rpc.preprod.midnight.network/` | Substrate RPC WebSocket |
-| `indexerHttpUrl` | preprod indexer URL | Wallet SDK's `publicDataProvider` HTTP endpoint; NOT used by the crawler |
-| `indexerWsUrl` | derived from `indexerHttpUrl` (`http -> ws` + `/ws`) | Same, for subscriptions; set only if your indexer serves subscriptions somewhere non-standard |
-| `proofServerUrl` | `http://localhost:6300` (only used in server proving mode) | Proof server for all submission flows (deploy/call/send/dust-gen). Explicitly configuring it selects server proving; leaving it unset selects in-process wasm proving. |
-| `proofTimeoutMs` | `300000` | HTTP timeout of ONE proof request to the proof server in server proving mode (0.22.0). midnight-js' own default; a proof past it fails the job and midnight-js re-requests the proof up to three times, so set it above the slowest proof. Ignored in wasm mode. |
-| `zkConfigBasePath` | `./contracts` | Base for resolving relative `contracts.<name>.zkConfigPath` |
-| `privateStateBackend` | `cap-db` | `cap-db` (default, production-grade encrypted CAP-DB tables) or `level` (legacy SDK LevelDB, **dev-only**, blocked on worker-routed submissions) |
-| `contracts` | `{}` | Map of `<ref>` → `{ artifactPath, privateStateId, zkConfigPath, slotWidth? }`, loaded into the in-memory registry on plugin startup. `slotWidth` (16 or 32, default 16) declares the content-tree width of an attestation-vault-family artifact; the shipped `attestation-vault-32` registers with 32 and the whole proof surface sizes masks, k bounds and inclusion paths from it |
+| `indexerHttpUrl` | preprod indexer URL | Wallet SDK indexer endpoint; not used by the crawler |
+| `indexerWsUrl` | derived from `indexerHttpUrl` (`http -> ws` + `/ws`) | Subscription endpoint, only for a non-standard indexer |
+| `proofServerUrl` | `http://localhost:6300` (server mode only) | Proof server for all submissions; setting it selects server proving, unset = wasm |
+| `proofTimeoutMs` | `300000` | Timeout of one proof request in server mode; midnight-js re-requests up to three times, so set it above the slowest proof. Ignored in wasm mode |
+| `zkConfigBasePath` | `./contracts` | Base for relative `contracts.<name>.zkConfigPath` |
+| `privateStateBackend` | `cap-db` | `cap-db` (encrypted CAP-DB tables) or `level` (SDK LevelDB, dev-only, blocked on worker-routed submissions) |
+| `contracts` | `{}` | `<ref>` → `{ artifactPath, privateStateId, zkConfigPath, slotWidth? }`, loaded at startup. `slotWidth` 16 (default) or 32 sizes masks, k bounds and inclusion paths of a vault-family artifact |
 | `sessionTtlMs` | `86400000` (24 h) | Wallet session lifetime |
-| `closeSessionsOnRestart` | `true` | Close the wallet sessions the previous process left behind at startup. Configured `feeSponsorSessions` are exempt. `false` keeps them, for consumers that hold session ids across restarts |
-| `jobs.concurrency.heavy` | `4` | Concurrent jobs per proof-generating kind (deploy, call, send, attestations). 4 saturates one proof server |
+| `closeSessionsOnRestart` | `true` | Close the previous process's wallet sessions at startup (`feeSponsorSessions` exempt); `false` keeps them |
+| `jobs.concurrency.heavy` | `4` | Concurrent jobs per proof-generating kind (deploy, call, send, attestations); 4 saturates one proof server |
 | `jobs.concurrency.light` | `16` | Concurrent jobs per remaining kind |
-| `jobs.concurrency.serial` | `1` | Concurrent jobs for `connectWalletForSigning`. Wallet catch-up is CPU-bound work in a single shared worker thread, so parallel prewarms all crawl instead of the first one finishing; serialized, each wallet becomes usable after its own catch-up. Raise only if you would rather have every wallet warm late than one warm early |
-| `runtimeMode` | `single-instance` | Current safety contract. Other modes fail closed. |
-| `replicaCount` | `1` | Declared process/replica count. Values above 1 fail closed until distributed crawler/job leases exist. |
-| `allowProductionSqlite` | `false` | Emergency-only escape hatch. Production startup with SQLite otherwise fails closed. |
-| `crawler.enabled` | `true` | When `false`, services still load but block indexing is disabled |
+| `jobs.concurrency.serial` | `1` | Concurrent `connectWalletForSigning` jobs; catch-up shares one worker thread, so serialized wallets become usable one by one instead of all late |
+| `runtimeMode` | `single-instance` | Other modes fail closed |
+| `replicaCount` | `1` | Declared replica count; above 1 fails closed |
+| `allowProductionSqlite` | `false` | Escape hatch; production SQLite otherwise fails closed |
+| `crawler.enabled` | `true` | `false`: services load, no block indexing |
 | `crawler.nodeUrl` | top-level `nodeUrl` | Optional crawler-specific RPC override |
 | `crawler.batchSize` | `10` | Blocks per catch-up batch |
 | `crawler.fetchConcurrency` | `(default)` | Parallel RPC fetches during catch-up |
 | `crawler.rpcBatchSize` | `(default)` | Substrate JSON-RPC batch size |
 | `crawler.requestTimeout` | `30000` | RPC timeout (ms) |
-| `palletMap` | `(built-in)` | Optional override of the Substrate pallet-index → tx-type classification map used by the `BlockProcessor` (`{ "<index>": { name, txType, isShielded?, isSystem? } }`) |
-| `allowMainnetSubmission` | `false` | Gate for mainnet submission. Stays off until [forum thread 1190](https://forum.midnight.network) (`1016 Immediately Dropped`) is resolved |
-| `granteeBinding` | `wallet` | How an authenticated principal maps to the AttestationVault `Bytes<32>` grantee id for on-chain disclosure grants: `wallet` (coin pubkey hash) / `did` (DID string) / `custom` (opaque 64-hex). Used by `registerGranteeIdentity` + the disclosure read gate |
-| `allowSelfServiceGranteeRegistration` | `false` | Whether authenticated callers may register their own grantee identity via `registerGranteeIdentity`. **NIGHTGATE does not verify that the caller owns the binding input it registers** (no wallet-signature / DID-control proof), so under `wallet`/`did` binding an authenticated user could squat another party's grantee id. Off by default since 0.5.0 (review_001 P1); the action returns `403` unless explicitly enabled. Identities can always be registered through an operator proofing flow that writes `GranteeIdentities` directly. |
-| `networks` | `{}` | Per-network indexer endpoints for the `network` override on `verifyAttestationState` / `verifyPredicateState`: `{ "<network>": { indexerHttpUrl, indexerWsUrl } }`. Only consulted when a verify call overrides to a network other than the configured one; unlisted networks use the built-in public indexer defaults. Top-level `indexerHttpUrl`/`indexerWsUrl` and `NIGHTGATE_INDEXER_*` env vars apply to the CONFIGURED network only. |
+| `palletMap` | `(built-in)` | Override of the pallet-index → tx-type map of the `BlockProcessor` (`{ "<index>": { name, txType, isShielded?, isSystem? } }`) |
+| `allowMainnetSubmission` | `false` | Gate for mainnet submission |
+| `granteeBinding` | `wallet` | Principal → vault `Bytes<32>` grantee id: `wallet` (coin pubkey hash) / `did` (DID string) / `custom` (64 hex); used by `registerGranteeIdentity` and the disclosure read gate |
+| `allowSelfServiceGranteeRegistration` | `false` | Lets callers register their own grantee identity. NIGHTGATE does not verify ownership of the binding input, so under `wallet`/`did` a user could claim another party's id; off = `403`. Operators can write `GranteeIdentities` directly |
+| `networks` | `{}` | `{ "<network>": { indexerHttpUrl, indexerWsUrl } }` for the verify functions' `network` override; unlisted networks use the public defaults. Top-level indexer URLs and `NIGHTGATE_INDEXER_*` apply to the configured network only |
 
 ### Environment variables
 
-Every variable below is declared in `srv/utils/config-table.ts` with its kind,
-default and bounds; the table is the single truth for the code, this section
-(generated: `npm run config:table`, pinned by a unit test) and the wallet
-worker, which receives the resolved values from the main thread and reads no
-environment of its own. Parsing rules: an empty value counts as unset; a value
-that does not parse is logged once and the default applies; a number outside
-its bounds is clamped with a warning; booleans accept `true`/`false`, `1`/`0`,
-`yes`/`no`, `on`/`off`. A CAP host may set any of them as
+Declared in `srv/utils/config-table.ts` (kind, default, bounds); the table below
+is generated (`npm run config:table`) and pinned by a unit test. The wallet
+worker reads no environment; it receives the resolved values. Empty = unset; an
+unparsable value is logged once and the default applies; out-of-bounds numbers
+are clamped with a warning; booleans: `true`/`false`, `1`/`0`, `yes`/`no`,
+`on`/`off`. Except `ENCRYPTION_*`, each can be set as
 `cds.requires.nightgate.<camelCase>` (`NIGHTGATE_WORKER_RPC_TIMEOUT_MS` ->
-`workerRpcTimeoutMs`); the environment variable wins, the CAP value beats the
-default. The `ENCRYPTION_*` secrets are environment only.
+`workerRpcTimeoutMs`); env beats CAP beats default.
 
 <!-- config-table:start -->
 | Variable | Kind | Default | Purpose |
@@ -121,11 +116,11 @@ default. The `ENCRYPTION_*` secrets are environment only.
 | `NIGHTGATE_INDEXER_WS_URL` | url |  | Override `indexerWsUrl`; optional, derived from the HTTP URL when unset |
 | `NIGHTGATE_PROOF_SERVER_URL` | url |  | Override `proofServerUrl` |
 | `NIGHTGATE_PROVING_MODE` | `server` / `wasm` |  | Proving mode `wasm` (in-process) or `server` (proof server). Unset: `server` when a proof server is configured, `wasm` otherwise. `initialize()` pins the effective value into the env for the worker. Read in the wallet worker. |
-| `NIGHTGATE_PROOF_TIMEOUT_MS` | ms (min 1) | `300000` | Override `proofTimeoutMs` (0.22.0); pinned into the env at plugin init for the wallet worker. The proof-server container has its own job TTL (`MIDNIGHT_PROOF_SERVER_JOB_TIMEOUT`, default 600 s): raise both, or a finished-but-expired job answers 5xx and midnight-js re-proves. Read in the wallet worker. |
+| `NIGHTGATE_PROOF_TIMEOUT_MS` | ms (min 1) | `300000` | Override `proofTimeoutMs`; pinned into the env at plugin init for the wallet worker. The proof-server container has its own job TTL (`MIDNIGHT_PROOF_SERVER_JOB_TIMEOUT`, default 600 s): raise both, or a finished-but-expired job answers 5xx and midnight-js re-proves. Read in the wallet worker. |
 | `NIGHTGATE_ZK_CONFIG_BASE` | path | `./contracts` | Override `zkConfigBasePath` |
 | `NIGHTGATE_ZK_CONFIG_PUBLIC_URL` | url |  | Public base URL advertised by `/contract-manifest` for the `/zk-config/...` routes (behind a reverse proxy); unset = relative URLs, resolved by the client against the origin it fetched the manifest from |
 | `NIGHTGATE_ZK_ASSET_URL` | string |  | A `/zk-config` base the server fetches missing prover keys from (`<url>/<contract>/keys/<circuit>.prover`, verified against `keys/manifest.json`); `none`/`off` disables the fetch. Unset: the release tag on raw.githubusercontent.com for the shipped contracts, no source for others. Offline installs run `nightgate-fetch-keys` once. |
-| `NIGHTGATE_CONTRACTS_DIR` | string |  | Root directories (path-delimiter separated) a runtime `registerContract` (admin, 0.21.0) may point into; default: the package's and the working directory's `contracts/`. Importing an artifact executes its module, so paths outside are refused. The supported way to keep a consumer's artifacts outside the package: point it at that directory. The artifact's `@midnight-ntwrk/compact-runtime` import resolves from NIGHTGATE's own node_modules (worker snapshots since 0.21.0, the registration probe since 0.22.0), so the directory needs no node_modules of its own. |
+| `NIGHTGATE_CONTRACTS_DIR` | string |  | Root directories (path-delimiter separated) a runtime `registerContract` (admin) may point into; default: the package's and the working directory's `contracts/`. Importing an artifact executes its module, so paths outside are refused. The supported way to keep a consumer's artifacts outside the package: point it at that directory. The artifact's `@midnight-ntwrk/compact-runtime` import resolves from NIGHTGATE's own node_modules (worker snapshots and the registration probe), so the directory needs no node_modules of its own. |
 | `NIGHTGATE_PRIVATE_STATE_BACKEND` | `cap-db` / `level` |  | Override `privateStateBackend` |
 | `NIGHTGATE_GRANTEE_BINDING` | `wallet` / `did` / `custom` |  | Override `granteeBinding` (`wallet` / `did` / `custom`) |
 | `NIGHTGATE_ALLOW_SELF_SERVICE_GRANTEE_REGISTRATION` | bool |  | Override `allowSelfServiceGranteeRegistration` (`false` / `0` / `no` / `off` disables) |
@@ -133,7 +128,7 @@ default. The `ENCRYPTION_*` secrets are environment only.
 | `NIGHTGATE_INSTANCE_ID` | string |  | Stable operator-provided instance identifier; otherwise CF instance GUID, hostname, or a generated UUID |
 | `NIGHTGATE_REPLICA_COUNT` | int (min 1) |  | Actual process/replica count. Must be `1`; takes precedence over CDS `replicaCount` |
 | `NIGHTGATE_ALLOW_PRODUCTION_SQLITE` | bool | `false` | `true` temporarily permits production SQLite with a high-severity warning; intended only for a migration window |
-| `NIGHTGATE_ASSUME_DB_NETWORK` | string |  | Confirms which network an index written before 0.16.2 (rows without a recorded network id) belongs to; the boot guard refuses to bind such an index to the configured network otherwise. |
+| `NIGHTGATE_ASSUME_DB_NETWORK` | string |  | Confirms which network an index without a recorded network id belongs to; the boot guard refuses to bind such an index to the configured network otherwise. |
 | `NIGHTGATE_STATUS_ROUTES` | `off` / `public` |  | Plain `/nightgate/metrics|health|ready` routes: unset = mounted only with `NIGHTGATE_STATUS_TOKEN`, `public` = mounted without a token, `off` = not mounted. |
 | `NIGHTGATE_STATUS_ROUTES_PREFIX` | path | `/nightgate` | Path prefix of the plain status routes. |
 | `NIGHTGATE_STATUS_TOKEN` | secret |  | Bearer token the plain status routes require; without it (and without `NIGHTGATE_STATUS_ROUTES=public`) they are not mounted. |
@@ -153,34 +148,44 @@ default. The `ENCRYPTION_*` secrets are environment only.
 | `NIGHTGATE_ARTIFACT_DIGEST_MAX_AGE_MS` | ms (min 0) | `300000` | How long the memoised current artifact digest (`getRuntimeInfo`, job resolves) may be trusted before the files are re-hashed regardless of their stat fingerprint. |
 | `NIGHTGATE_DUST_RACE_RETRIES` | int (min 0) | `2` | Rebuild-retries of a bound deploy/call/batch on a transient dust race (`1010/170`, `1010/196`, pre-mempool, fee unspent); default `2`. Each retry re-proves the call, hence smaller than the sponsor path's `NIGHTGATE_SPONSOR_DUST_RETRIES`. `0` disables. |
 | `NIGHTGATE_DUST_RACE_BACKOFF_MS` | ms (min 0) | `5000` | Pause before such a rebuild, letting the dust wallet apply the spend it lost against; default `5000`. |
-| `NIGHTGATE_PREWARM_SYNC_TIMEOUT_MS` | ms (min 1) | `43200000` | Absolute ceiling for the `connectWalletForSigning` prewarm sync-to-tip wait; default `43200000` (12 h, 0.21.0; was 3 h). A backstop: the primary bound is `NIGHTGATE_PREWARM_STALL_MS`. |
+| `NIGHTGATE_STALE_TRANSCRIPT_RETRIES` | int (min 0) | `2` | Rebuild-retries of a bound deploy/call/batch the node refused against the current contract state (`1010/104`, pre-mempool, fee unspent; typically the gas budget after another transaction on the same contract grew a map); default `2`. Each retry re-runs and re-proves the call against current state. |
+| `NIGHTGATE_STALE_TRANSCRIPT_BACKOFF_MS` | ms (min 0) | `15000` | Pause before such a rebuild, so the indexer serves the state that includes the competing transaction; default `15000`. |
+| `NIGHTGATE_PREWARM_SYNC_TIMEOUT_MS` | ms (min 1) | `43200000` | Absolute ceiling for the `connectWalletForSigning` prewarm sync-to-tip wait; default `43200000` (12 h). A backstop: the primary bound is `NIGHTGATE_PREWARM_STALL_MS`. |
 | `NIGHTGATE_PREWARM_STALL_MS` | ms (min 0) | `600000` | Prewarm fails when `appliedIndex` has not advanced for this long, regardless of elapsed time; default `600000` (10 min). A slow-but-moving sync is not stalled. `0` disables the stall bound (ceiling only). Read in the wallet worker. |
 | `NIGHTGATE_SYNC_PROGRESS_STALE_S` | int (min 1) | `60` | `getWalletSyncProgress` reports `stale: true` once its snapshot is older than this; default `60` (four worker push intervals). |
 | `NIGHTGATE_WALLET_READ_SYNC_TIMEOUT_MS` | ms (min 0) | `10000` | Bounded sync gate for facade-backed read actions (`getWalletBalance`, fee estimates): a catching-up facade answers 503 `WALLET_SYNCING` after this instead of parking the request; default `10000`, `0` waits indefinitely. |
 | `NIGHTGATE_BALANCE_SYNC_TIMEOUT_MS` | ms (min 1) | `180000` | Worker-side wait for a genuine wallet sync before balancing a transaction; default `180000`. Read in the wallet worker. |
 | `NIGHTGATE_SYNC_TIP_GAP` | int (min 0) | `8` | Blocks behind the indexer tip a wallet may be and still count as synced; default `8`. Read in the wallet worker. |
 | `NIGHTGATE_SYNC_FRESHNESS_MS` | ms (min 1) | `300000` | How old the indexer's latest block may be for a wallet to count as synced (guards against a lagging self-hosted indexer, error 117); default `300000`. Read in the wallet worker. |
-| `NIGHTGATE_PROGRESS_WATCH_MS` | ms (min 15000) | `60000` | Interval of the worker's idle progress watch that keeps `getWalletSyncProgress` fresh while a facade is behind; default `60000`, floor 15 s. Read in the wallet worker. |
-| `NIGHTGATE_SAVE_INTERVAL_MS` | ms (min 10000) | `60000` | Wallet-state save tick of the worker; default `60000` (0.21.6, was 30 s), floor 10 s. Read in the wallet worker. |
+| `NIGHTGATE_PROGRESS_WATCH_MS` | ms (min 15000) | `60000` | Interval of the worker's progress watch: pushes each facade's sync-gate verdict to `getWalletSyncProgress` and `getSponsorPoolStatus` and checks restored sub-wallets for a rejected replay; default `60000`, floor 15 s. Read in the wallet worker. |
+| `NIGHTGATE_SNAPSHOT_REPLAY_RESET_MS` | ms (min 0) | `300000` | A sub-wallet restored from a snapshot that stays at its restored offset while the ledger rejects its replayed events (dust: event older than the synced time or commitment below the tree index; shielded: commitment below the tree index) is replaced by a fresh one syncing from genesis once both have lasted this long; default `300000`, `0` disables the replacement. Read in the wallet worker. |
+| `NIGHTGATE_DISCLOSURE_REINDEX_RETRY_MS` | ms (min 0) | `1800000` | When the disclosure reindex after a landed grant, revoke or retract fails, a `reindexDisclosures` job retries it with backoff for this long before failing `DISCLOSURE_REINDEX_FAILED`; default `1800000` (30 min), `0` = one attempt. |
+| `NIGHTGATE_SYNC_STATE_LOG_MS` | ms (min 0) | `600000` | Interval of the per-facade INFO line `sync-state` (dust `appliedIndex` and `syncTime`, shielded `appliedIndex` and `firstFree`) written from the state save tick; default `600000`, `0` disables it. Read in the wallet worker. |
+| `NIGHTGATE_SAVE_INTERVAL_MS` | ms (min 10000) | `60000` | Wallet-state save tick of the worker; default `60000`, floor 10 s. Read in the wallet worker. |
 | `NIGHTGATE_RESTORE_SAVE_ACK_TIMEOUT_MS` | ms (min 1) | `30000` | How long a facade restore waits for the acknowledgement of its immediate re-save; default `30000`. Read in the wallet worker. |
 | `NIGHTGATE_DUST_COLD_START` | bool | `false` | `true` starts the dust sub-wallet from the secret key instead of the persisted state (diagnostic). Read in the wallet worker. |
 | `NIGHTGATE_DUST_REGISTER_SETTLE_MS` | ms (min 0) | `90000` | How long `registerForDustGeneration` waits for the registration to apply locally before it reports `settled: false`; default `90000`. Read in the wallet worker. |
 | `NIGHTGATE_SIGNING_KEY_RATE_LIMIT` | int (min 1) | `10` | `connectWalletForSigning` attempts per hour per principal; default `10`. |
+| `NIGHTGATE_GRANT_ADMIN_RATE_LIMIT` | int (min 1) | `10` | Grant administration calls (`createAgentGrant`, `updateAgentGrant`, `rotateAgentGrantToken`, `revokeAgentGrant`) per hour per principal; default `10`. |
+| `NIGHTGATE_PUBLIC_VERIFY` | bool | `false` | Serve `verifyAttestationState` and `verifyPredicateState` without credentials under `/api/v1/verify` (the image admits the path unauthenticated and answers CORS preflight with `*`); default off, the functions answer `404 PUBLIC_VERIFY_DISABLED`. |
+| `NIGHTGATE_PUBLIC_VERIFY_RATE_LIMIT` | int (min 1) | `60` | Public verify calls per minute per client address; default `60`. |
+| `NIGHTGATE_CLAIM_LIFETIME_S` | int (min 60) | `31536000` | Default claim lifetime in seconds for the issue* actions when the caller passes no `validUntil`; default one year, the vault caps a claim at five years ahead. |
 | `NIGHTGATE_FEE_SPONSOR_SESSION` | list |  | Comma list of platform fee-sponsor session ids (the pool); overrides `feeSponsorSessions`. |
-| `NIGHTGATE_SUBMIT_TRANSPORT_RETRIES` | int (min 0) | `2` | Resends of the SAME finalized transaction when the send itself fails (websocket closed at submit, `1000 Normal Closure`, `ECONNRESET`; never a node reject, never a reply-less wait), 0.22.0; default `2`, `0` disables. No rebuild, no re-proving: the facade re-pends the spends and the identical bytes go out again. Applies to every bound submit (deploy/call/batch, sends, dust registration, bound sponsoring). Read in the wallet worker. |
+| `NIGHTGATE_SUBMIT_TRANSPORT_RETRIES` | int (min 0) | `2` | Resends of the SAME finalized transaction when the send itself fails (websocket closed at submit, `1000 Normal Closure`, `ECONNRESET`; never a node reject, never a reply-less wait); default `2`, `0` disables. No rebuild, no re-proving: the facade re-pends the spends and the identical bytes go out again. Applies to every bound submit (deploy/call/batch, sends, dust registration, bound sponsoring). Read in the wallet worker. |
 | `NIGHTGATE_SUBMIT_TRANSPORT_BACKOFF_MS` | ms (min 0) | `5000` | Pause before such a resend; default `5000`. Read in the wallet worker. |
 | `NIGHTGATE_SUBMIT_LANDED_PROBE_MS` | ms (min 0) | `30000` | How long the worker polls the indexer for the transaction identifier before a resend, and after a resend was rejected (a reply lost on the first send may still have reached the node); default `30000`. A landed transaction is reported as submitted only with ledger result `SUCCESS`; in a block but not applied fails as `TxFailed` (fee spent). Read in the wallet worker. |
+| `NIGHTGATE_SUBMIT_INTENT_ACK_TIMEOUT_MS` | ms (min 1000) | `120000` | How long the worker waits for the main thread to record an announced transaction identifier before it gives up without broadcasting; default 2 minutes. Keep it above the database pool acquire timeout plus the lock-contention retries. Read in the wallet worker. |
 | `NIGHTGATE_SUBMIT_CONNECT_TIMEOUT_MS` | ms (min 1) | `20000` | Connect phase of a dedicated-client submit: client creation plus socket; default `20000`. A timeout here sent nothing (`transport/not-sent`, retried once on a fresh client, then a clean pre-inclusion failure). Read in the wallet worker. |
 | `NIGHTGATE_SUBMIT_REQUEST_TIMEOUT_MS` | ms (min 1) | `30000` | Request phase of a dedicated-client submit: from the send until the node's first status (subscription acknowledged); default `30000`. A timeout here is ambiguous (`no-reply`): the transaction may or may not be in the pool, the job parks for the confirmer. Read in the wallet worker. |
 | `NIGHTGATE_SUBMIT_LATE_GRACE_MS` | ms (min 0) | `300000` | After a request or watch phase timeout the attempt keeps its node subscription open this long and logs a late status or reject under the transaction identifier (evidence only; the job is parked for the confirmer either way); default `300000`. Read in the wallet worker. |
 | `NIGHTGATE_SUBMIT_WATCH_TIMEOUT_MS` | ms (min 1) | `75000` | Watch phase of a submit: from the node's first status until InBlock (or Finalized, `NIGHTGATE_SPONSOR_WAIT`); default `75000`. A timeout here is ambiguous: the node took the request and nothing was included in time; the indexer is asked for 90 s, then the job parks for the confirmer. On the facade (bound) path this is the whole wait after the send. Read in the wallet worker. |
 | `NIGHTGATE_BROADCAST_EXPIRY_MARGIN_MS` | ms (min 0) | `300000` | A job parked in `reconciliation_required` whose transaction the indexer does not know ends `failed / BROADCAST_NOT_INCLUDED` once the indexer tip is this far past the transaction's validity window (ttl); default `300000`. The ttl is recorded at the submit intent; rows without one use the submit time plus one hour. |
 | `NIGHTGATE_BATCH_SEGMENT_MODE` | `rewrite` / `observe` | `rewrite` | Batch segment ordering: `rewrite` (deterministic stage-grouped order) or `observe` (log only). Read in the wallet worker. |
-| `NIGHTGATE_SPONSOR_POLICY_FILE` | path |  | Path to a JSON file `{ "allowedContracts": [], "allowedCircuits": [], "allowDeploy": false, "allowedTokenTypes": [] }` that replaces `NIGHTGATE_SPONSOR_ALLOWED_CONTRACTS`/`_CIRCUITS` while set (0.21.0). Calls on a grant's `deployedContracts` are exempt from `allowedCircuits` (0.21.2). Re-read per sponsored call behind an mtime cache, so the sponsor policy changes without a container recreate. Fail-closed: an unreadable or invalid file keeps the last good policy, and with none loaded yet sponsored calls answer `503 SPONSOR_POLICY_UNAVAILABLE`. |
+| `NIGHTGATE_SPONSOR_POLICY_FILE` | path |  | Path to a JSON file `{ "allowedContracts": [], "allowedCircuits": [], "allowDeploy": false, "allowedTokenTypes": [] }` that replaces `NIGHTGATE_SPONSOR_ALLOWED_CONTRACTS`/`_CIRCUITS` while set. Calls on a grant's `deployedContracts` are exempt from `allowedCircuits`. Re-read per sponsored call behind an mtime cache, so the sponsor policy changes without a container recreate. Fail-closed: an unreadable or invalid file keeps the last good policy, and with none loaded yet sponsored calls answer `503 SPONSOR_POLICY_UNAVAILABLE`. |
 | `NIGHTGATE_SPONSOR_ALLOWED_CONTRACTS` | list |  | Comma list of contract addresses a sponsor pays for (platform floor); empty = any. Replaced by `NIGHTGATE_SPONSOR_POLICY_FILE` while that is set. |
 | `NIGHTGATE_SPONSOR_ALLOWED_CIRCUITS` | list |  | Comma list of circuit names a sponsor pays for (platform floor); empty = any. Replaced by `NIGHTGATE_SPONSOR_POLICY_FILE` while that is set. |
-| `NIGHTGATE_SPONSOR_ALLOWED_TOKEN_TYPES` | list |  | Comma list of raw shielded token types (64 hex, what `deriveTokenType` returns) whose zswap offers the sponsor also pays for (0.22.0): a contract minting its own token to the caller, a caller spending that token into the contract. Unset = no offer at all (the default, unchanged). Also `allowedTokenTypes` in the policy file and on a grant (effective = floor ∩ grant; the floor must open it, a grant only narrows). The shape check then requires every net change of the offer (`deltas`, public per type) to be on a listed type, never NIGHT, every contract-owned coin to belong to a sponsorable contract, and a net change to exist OR a coin in the offer to be owned by a sponsorable contract (a burn nets to zero by construction: user input, contract transient, burn-address output; a zero-net offer without a contract coin is refused). User outputs are commitments, so a transfer of a listed type between users riding along is accepted by design: the sponsor pays dust, no sponsor value moves. An invalid entry fails closed (`503 SPONSOR_POLICY_UNAVAILABLE`). |
-| `NIGHTGATE_SPONSOR_ALLOW_DEPLOY` | bool | `false` | Opens sponsored contract DEPLOYS on this deployment (0.21.0): `true`/`1`/`yes`. Off by default. A token caller additionally needs `allowDeploy` on its grant with deploy budget left; a plain caller inherits the floor. Also settable as `allowDeploy` in `NIGHTGATE_SPONSOR_POLICY_FILE`. |
+| `NIGHTGATE_SPONSOR_ALLOWED_TOKEN_TYPES` | list |  | Comma list of raw shielded token types (64 hex, what `deriveTokenType` returns) whose zswap offers the sponsor also pays for: a contract minting its own token to the caller, a caller spending that token into the contract. Unset = no offer at all (the default). Also `allowedTokenTypes` in the policy file and on a grant (effective = floor ∩ grant; the floor must open it, a grant only narrows). The shape check then requires every net change of the offer (`deltas`, public per type) to be on a listed type, never NIGHT, every contract-owned coin to belong to a sponsorable contract, and a net change to exist OR a coin in the offer to be owned by a sponsorable contract (a burn nets to zero by construction: user input, contract transient, burn-address output; a zero-net offer without a contract coin is refused). User outputs are commitments, so a transfer of a listed type between users riding along is accepted by design: the sponsor pays dust, no sponsor value moves. An invalid entry fails closed (`503 SPONSOR_POLICY_UNAVAILABLE`). |
+| `NIGHTGATE_SPONSOR_ALLOW_DEPLOY` | bool | `false` | Opens sponsored contract DEPLOYS on this deployment: `true`/`1`/`yes`. Off by default. A token caller additionally needs `allowDeploy` on its grant with deploy budget left; a plain caller inherits the floor. Also settable as `allowDeploy` in `NIGHTGATE_SPONSOR_POLICY_FILE`. |
 | `NIGHTGATE_SPONSOR_MAX_TX_BYTES` | int (min 1) | `65536` | Byte ceiling of a sponsored call transaction the worker accepts; default `65536`. Read in the wallet worker. |
 | `NIGHTGATE_SPONSOR_MAX_DEPLOY_BYTES` | int (min 1) | `40960` | Byte ceiling of a sponsored DEPLOY transaction (a deploy writes verifier keys on chain and costs a multiple of a call); default `40960`. Read in the wallet worker. |
 | `NIGHTGATE_SPONSOR_WAIT` | `inblock` / `finalized` | `inblock` | Submission stage the unbound sponsor path waits for: `inblock` (default) or `finalized`. Read in the wallet worker. |
@@ -188,14 +193,14 @@ default. The `ENCRYPTION_*` secrets are environment only.
 | `NIGHTGATE_SPONSORED_CALLER_SYNC` | `wait` / `skip` | `wait` | `skip` omits the caller-side wallet sync when balancing a sponsored transaction (vault calls move no caller value). Read in the wallet worker. |
 | `NIGHTGATE_NOTE_LEASE_MS` | ms (min 1) | `300000` | Lease on a dust note backing a sponsored transaction (parallel sponsoring from one wallet); a non-positive or non-numeric value falls back to the default `300000`. Read in the wallet worker. |
 | `NIGHTGATE_BACKING_WAIT_MS` | ms (min 0) | `300000` | How long an unbound sponsoring waits for a free dust backing before it refuses; default `300000`. Read in the wallet worker. |
-| `NIGHTGATE_SPONSOR_PREWARM_SYNC_MS` | ms (min 0) | `1800000` | Prewarm brings pool members to the chain tip one at a time (0.21.4); this caps the wait per sponsor, default 30 min, `0` = build only. |
+| `NIGHTGATE_SPONSOR_PREWARM_SYNC_MS` | ms (min 0) | `1800000` | Prewarm brings pool members to the chain tip one at a time; this caps the wait per sponsor, default 30 min, `0` = build only. |
 | `NIGHTGATE_SPONSOR_STATUS_TIMEOUT_MS` | ms (min 1) | `45000` | Per-sponsor read cap of `getSponsorPoolStatus`; default `45000`. |
 | `NIGHTGATE_SPONSOR_LEASE_WAIT_MS` | ms (min 0) | `120000` | How long a sponsored job waits for a busy or cooling sponsor before it fails over or gives up; default `120000`. |
 | `NIGHTGATE_SPONSOR_COOLDOWN_MS` | ms (min 0) | `120000` | Bench time of a sponsor after a retryable failure; default `120000`. |
 | `NIGHTGATE_SPONSOR_DUST_RETRIES` | int (min 0) | `4` | Rebuild-retries of a sponsored transaction on a dust race, on the same sponsor; default `4`. |
 | `NIGHTGATE_SPONSOR_DUST_BACKOFF_MS` | ms (min 0) | `5000` | Pause before such a rebuild; default `5000`. |
 | `ENCRYPTION_KEY` | secret |  | At-rest secret (32+ byte hex) for viewing keys, seed keys and encrypted job commands; key id `1` of the ring. Without any key a random per-process dev key is used (rows do not survive a restart); **required** in production. Env only, no CAP mapping. |
-| `ENCRYPTION_KEYS` | secret |  | Key ring `id=secret,id=secret` (ids `[A-Za-z0-9_-]{1,16}`); `ENCRYPTION_KEY` joins it as id `1`. Every secret is HKDF-stretched; ciphertexts are `v2:<keyId>:...` envelopes (per-row data key wrapped by the ring key, key id bound as AAD). Pre-0.23 `iv:tag:data` values stay readable under id `1`. Env only, no CAP mapping. |
+| `ENCRYPTION_KEYS` | secret |  | Key ring `id=secret,id=secret` (ids `[A-Za-z0-9_-]{1,16}`); `ENCRYPTION_KEY` joins it as id `1`. Every secret is HKDF-stretched; ciphertexts are `v2:<keyId>:...` envelopes (per-row data key wrapped by the ring key, key id bound as AAD). Legacy `iv:tag:data` values stay readable under id `1`. Env only, no CAP mapping. |
 | `ENCRYPTION_KEY_ACTIVE` | string |  | Id of the ring key new ciphertexts are written under (required with more than one key). Startup refuses a database whose ciphertexts name a key id outside the ring; `nightgate-rewrap-keys` moves rows to the active key (see docs/operations.md, key rotation). Env only, no CAP mapping. |
 <!-- config-table:end -->
 
@@ -203,9 +208,9 @@ Read by the standalone image and the dev scripts, not by the plugin:
 
 | Variable | Purpose |
 |---|---|
-| `NIGHTGATE_DB_URL` | Standalone image (0.21.1): `postgres://user:pw@host:5432/db` selects PostgreSQL; the schema is deployed on every boot (`cds deploy`, additive). `?sslmode=`: `disable`, `require` (TLS unverified) or `verify-full` (chain + hostname, `sslrootcert=<pem>` optional); `allow`/`prefer`/`verify-ca` and unknown values refuse to start. Unset = SQLite file at `NIGHTGATE_DB_PATH`. |
-| `NIGHTGATE_DB_DEPLOY` | Standalone image with `NIGHTGATE_DB_URL`: `auto` (default) deploys the schema at boot, `never` skips it. |
-| `NIGHTGATE_DB_WAIT_SECONDS` | Standalone image `migrate` mode: seconds to wait for the PostgreSQL listener before `cds deploy` (default 60; 1..86400, other values refuse; each connect attempt is capped at the time left, so a dropped SYN cannot outlive the window). |
+| `NIGHTGATE_DB_URL` | Image: `postgres://user:pw@host:5432/db` selects PostgreSQL, schema deployed each boot (additive). `?sslmode=` `disable`, `require` (unverified) or `verify-full` (optional `sslrootcert=<pem>`); other values refuse to start. Unset = SQLite at `NIGHTGATE_DB_PATH` |
+| `NIGHTGATE_DB_DEPLOY` | Image with `NIGHTGATE_DB_URL`: `auto` (default) deploys the schema at boot, `never` skips |
+| `NIGHTGATE_DB_WAIT_SECONDS` | Image `migrate` mode: wait for the PostgreSQL listener before `cds deploy` (default 60, 1..86400) |
 | `NIGHTGATE_HEAP_MB` | Heap size for `scripts/dev.mjs` / `scripts/serve.mjs` (default `12288`) |
 | `NIGHTGATE_PROOF_NETWORK` | Network passed to the proof-server container; defaults to `preprod` |
 
@@ -229,27 +234,22 @@ For local repository startup, drop these into a repo-root `.env`. The tracked te
 
 ### Two parallel pipelines
 
-NIGHTGATE runs two independent flows that meet at one reconciliation point. The full diagram lives in [architecture.md#the-two-pipelines](architecture.md#the-two-pipelines).
+Diagram: [architecture.md#the-two-pipelines](architecture.md#the-two-pipelines).
 
 | Pipeline | Where it runs | What it does |
 |---|---|---|
 | **Block crawler** | Main thread | Catch-up + live block subscription via Substrate RPC; writes Blocks/Tx/Actions/UTXOs/Balances into CAP DB |
 | **Wallet SDK** | `worker_threads` worker | ZK-aware wallet ops: shielded/unshielded/dust sub-wallets, transfer/contract submission via the Midnight indexer + prover (proof server or in-process wasm) |
 
-They do not meet on a hash (a job's identifier, the crawler's extrinsic hash and the indexer's transaction hash are three different values). The indexer confirmer resolves a job by its identifier and records the inclusion's block height and hash (`chainBlockHeight`, `chainBlockHash`, `indexerTxHash`) on the job and its `PendingSubmissions` row; a reorg rollback reverts every outcome confirmed at or above the fork height.
+The pipelines share no hash (job identifier, extrinsic hash and indexer hash differ). The indexer confirmer resolves a job by its identifier and records `chainBlockHeight`, `chainBlockHash` and `indexerTxHash` on the job and its `PendingSubmissions` row; a reorg rollback reverts outcomes confirmed at or above the fork height.
 
-For each fetched block the crawler also reads Substrate `System.Events` at that
-exact block hash. Runtime metadata is cached by `specVersion` and used to map
-`system.ExtrinsicSuccess` / `system.ExtrinsicFailed` to the event's
-`applyExtrinsic` index. Only these canonical events create a
-`TransactionResults` row, tagged `outcomeSource=substrate-system-events`.
-Missing storage, metadata/decode errors, or a missing outcome remain unknown;
-they are never converted to success. Rows created by older NIGHTGATE versions
-have no `outcomeSource` and are deliberately ignored by `verifyDocument` and
-`verifyPredicateAttestation`. Startup removes those known-invalid placeholder
-rows after the upgraded schema has been deployed. Re-crawl historical blocks
-to backfill verified outcomes; until then those historical outcomes correctly
-remain unknown.
+For each block the crawler reads `System.Events` at that block hash (metadata
+cached by `specVersion`) and maps `ExtrinsicSuccess` / `ExtrinsicFailed` to the
+extrinsic index. Only these events create `TransactionResults` rows
+(`outcomeSource=substrate-system-events`); decode errors or a missing outcome
+stay unknown, never success. Rows without `outcomeSource` are ignored by
+`verifyDocument` and `verifyPredicateAttestation` and removed at startup;
+re-crawl to backfill.
 
 ### Submission lifecycle
 
@@ -261,55 +261,39 @@ For every action that produces an on-chain transaction:
 4. **Main thread**: UPDATE row with `txHash` + `status=included`; release proxy; classify any error
 5. **Later, async**: the indexer confirmer resolves the identifier → `chainStatus`, block height/hash on the job, the attempt row flips to `finalized`
 
-The `sessionId` field on `PendingSubmissions` is the OData user-session UUID (audit trail). The worker keys its facade cache on `accountId` (deterministic from viewing key) - they're different identifiers; see [architecture.md#the-sessionid-indirection](architecture.md#the-sessionid-indirection).
+`PendingSubmissions.sessionId` is the OData session UUID (audit); the worker keys facades on `accountId` (derived from the viewing key). See [architecture.md#the-sessionid-indirection](architecture.md#the-sessionid-indirection).
 
 ### Error classification
 
-See [actions.md#error-model](actions.md#error-model) for the full table of error codes that `classifySubmissionError(err, network)` produces.
+Error codes of `classifySubmissionError(err, network)`: [actions.md#error-model](actions.md#error-model).
 
 ### Startup + failure semantics
 
-- On first startup, the package probes the schema by SELECTing each required table. The schema is **not** auto-deployed: on the first missing table Nightgate remains offline and logs a "run `npm run deploy`" error. It never terminates the consuming CAP host process.
-- If the Midnight node cannot be reached, the package logs a warning and continues in `offline` mode. Read-side requests are still served from cache; submission requests still work (they only need the indexer + proof server, not the node directly).
-- If the wallet worker fails to start, the plugin logs a warning and continues - submission requests will return an error, read-side is unaffected.
-- Repeated `initialize()` calls are idempotent.
-- Contract registry loads from `cds.requires.nightgate.contracts` on every `initialize()`.
+- The schema is not auto-deployed: a missing table keeps NIGHTGATE offline with a "run `npm run deploy`" error; the host process keeps running.
+- Unreachable node: warning, `offline` mode; reads and submissions (indexer + prover only) keep working.
+- Wallet worker fails to start: warning; submissions return an error, reads unaffected.
+- `initialize()` is idempotent and reloads `cds.requires.nightgate.contracts`.
 
 ### Runtime topology contract
 
-NIGHTGATE currently supports exactly one process/replica and one CAP tenant.
-The crawler, wallet facade cache, job semaphore and cleanup scheduler are
-process-local. Startup therefore fails closed before schema, worker or crawler
-initialization when a replica count above one is declared or CAP multitenancy
-is enabled. Declare the real count through `NIGHTGATE_REPLICA_COUNT` (preferred
-for deployments) or `cds.requires.nightgate.replicaCount`.
+NIGHTGATE supports exactly one process and one CAP tenant (crawler, facade
+cache, job semaphore and cleanup are process-local). Startup fails closed when
+a replica count above one is declared or CAP multitenancy is on. Declare the
+count via `NIGHTGATE_REPLICA_COUNT` or `replicaCount`; `CF_INSTANCE_COUNT` and
+`KUBERNETES_REPLICA_COUNT` are read too, `WEB_CONCURRENCY` is ignored (HTTP
+workers, not replicas). Platforms inject none of these; on Cloud Foundry
+`CF_INSTANCE_INDEX` makes every instance other than `0` fail closed. The guard
+is not a lock or leader election: the deployment must start one instance.
+Health, readiness, liveness and metrics expose instance id and topology.
 
-Replica detection is declarative: it reads `NIGHTGATE_REPLICA_COUNT`,
-`CF_INSTANCE_COUNT`, `KUBERNETES_REPLICA_COUNT` or the CDS `replicaCount`, none
-of which a platform injects on its own. `WEB_CONCURRENCY` is deliberately
-ignored: it counts HTTP worker processes within one instance, not replicas of
-this stateful service. On Cloud Foundry there is one automatic backstop:
-`CF_INSTANCE_INDEX` is injected per instance (0-based), so an accidental
-scale-out where the operator forgot to declare the count still fails closed on
-every instance except `0`. There is no equivalent auto-injected signal on
-Kubernetes or bare processes, so declare the real count there.
-
-`getHealth`, `getReadiness`, `getLiveness` and Prometheus metrics expose the
-instance id and runtime topology state. This guard prevents accidental unsafe
-operation; it is not a distributed lock or leader election. Deployment
-descriptors must still ensure only one instance is started.
-
-Production SQLite is rejected by the same preflight guard. Install and bind
-`@cap-js/postgres` (or `@cap-js/hana`) in the consuming CAP application. A
-legacy deployment can set `NIGHTGATE_ALLOW_PRODUCTION_SQLITE=true` only as a
-temporary escape hatch; this does not make SQLite production-safe.
+Production SQLite is refused by the same guard; bind `@cap-js/postgres` or
+`@cap-js/hana`. `NIGHTGATE_ALLOW_PRODUCTION_SQLITE=true` is a temporary escape
+hatch only.
 
 ### Database profiles and migration
 
-CAP recommends SQLite for development and PostgreSQL or SAP HANA for
-production. The consuming application owns that choice; NIGHTGATE remains
-database-agnostic and does not embed credentials. A typical host configuration
-uses profile-specific database kinds:
+The host chooses the database (SQLite for development, PostgreSQL or HANA for
+production); NIGHTGATE embeds no credentials. Typical profiles:
 
 ```json
 {
@@ -320,237 +304,153 @@ uses profile-specific database kinds:
 }
 ```
 
-Install `@cap-js/postgres` in the host. Inject production credentials through a
-CAP service binding or `cds_requires_db_credentials_*`; never commit passwords.
-Pool (0.21.3): the plugin defaults `cds.features.use_generic_pool` to `true`
-at registration (CAP's built-in pool loses a connection per timed-out
-acquire and empties under load; `generic-pool` ships as a dependency), an
-explicit host value wins. Size the pool for the worker's snapshot writes:
-`cds.requires.db.pool` `{ max: 20, acquireTimeoutMillis: 30000,
-destroyTimeoutMillis: 5000 }` and `cds.requires.db.client`
-`{ connectionTimeoutMillis: 10000 }` are what the standalone image uses.
-Run `cds deploy --profile production` before starting a new database. CAP's
-automatic schema evolution is non-destructive but cannot perform lossy key or
-type changes; inspect generated deltas and back up before every deployment.
+Inject credentials via a CAP service binding or `cds_requires_db_credentials_*`.
+The plugin sets `cds.features.use_generic_pool` to `true` unless the host sets
+it (CAP's built-in pool loses a connection per timed-out acquire). The
+standalone image uses `cds.requires.db.pool` `{ max: 20, acquireTimeoutMillis:
+30000, destroyTimeoutMillis: 5000 }` and `cds.requires.db.client`
+`{ connectionTimeoutMillis: 10000 }`. Run `cds deploy --profile production`
+before the first start; schema evolution cannot do lossy key or type changes,
+so inspect deltas and back up before each deployment.
 
-SQLite-to-PostgreSQL is a data migration, not an in-place schema evolution:
-deploy the CDS model to an empty PostgreSQL database, stop all writers, copy
-the rows with `npx nightgate-db-migrate --from <sqlite file> --to <postgres url>`
-(0.21.1; every persisted entity of the loaded model incl. `.texts` and CAP's
-own tables, streamed in batches with integers read as BigInt, a Decimal
-SQLite rounded beyond 2^53 aborts, unknown source tables with rows abort
-unless `--ignore-unknown`, row counts compared per table; needs
-`@cap-js/postgres` and `better-sqlite3` in the host; the standalone image does
-both steps as `docker compose run --rm --no-deps nightgate migrate --from
-<file>`), then switch the binding. Keep the SQLite file read-only until the
-PostgreSQL backup and application smoke test succeed.
+SQLite to PostgreSQL is a data migration: deploy the model to an empty
+PostgreSQL database, stop all writers, run `npx nightgate-db-migrate --from
+<sqlite file> --to <postgres url>` (all persisted entities in batches, row
+counts compared per table; aborts on unknown source tables with rows unless
+`--ignore-unknown` and on decimals SQLite rounded beyond 2^53; needs
+`@cap-js/postgres` and `better-sqlite3`; image: `docker compose run --rm
+--no-deps nightgate migrate --from <file>`), then switch the binding. Keep the
+SQLite file read-only until backup and smoke test pass.
 
-`db/midnight.db` persists indexed data plus encrypted wallet state. When switching networks, delete `db/midnight.db*` first.
+`db/midnight.db` holds indexed data and encrypted wallet state; delete `db/midnight.db*` when switching networks.
 
 ### Background-job durability and restart safety
 
-`BackgroundJobs` is the durable execution ledger for long-running wallet and
-contract operations. Each row records a request fingerprint, attempt budget,
-worker lease, heartbeat and (as soon as `TransactionSubmitter` creates it) the
-`PendingSubmissions.ID` and transaction hash. A database constraint permanently
-binds `(sessionId, kind, idempotencyKey)` to one job. This includes failed jobs:
-an intentional new attempt must use a new key. Reusing a key with a different
-request is rejected, while concurrent identical requests cannot create two job
-rows.
+`BackgroundJobs` is the durable ledger of wallet and contract operations:
+request fingerprint, attempt budget, lease, heartbeat and, once known, the
+`PendingSubmissions.ID` and transaction hash. `(sessionId, kind,
+idempotencyKey)` is unique for good, failed jobs included: a new attempt needs a
+new key, the same key with a different request is rejected.
 
-Before upgrading an existing database, run `npm run check:job-idempotency`
-against its binding. It is read-only and reports historical duplicate tuples.
-Resolve those explicitly before `cds deploy`; the tool never guesses which
-possibly-on-chain job should be retained.
+Before upgrading a database run `npm run check:job-idempotency` (read-only,
+reports duplicate tuples) and resolve duplicates before `cds deploy`.
 
-The lifecycle is `pending -> running -> external_execution -> submitted ->
-succeeded|failed`. `external_execution` begins immediately before the Midnight
-SDK call that currently combines proof generation, balancing and broadcast.
-`submitted` begins only when a transaction hash is available. A
-process restart is deliberately fail-safe rather than an automatic blockchain
-retry:
+Lifecycle: `pending -> running -> external_execution -> submitted ->
+succeeded|failed`. `external_execution` starts right before the SDK call that
+proves, balances and broadcasts; `submitted` once a transaction hash exists.
+After a process restart:
 
-- legacy `pending` or pre-effect `running` rows without a persisted command
-  become `failed / PROCESS_RESTART_BEFORE_EXECUTION`; versioned commands
-  return to the queue, unless the session they sign with was closed by the
-  restart cleanup (`failed / PROCESS_RESTART_SESSION_CLOSED`, see the
-  wallet-session section);
-- `external_execution` WITHOUT a `txHash` becomes `failed /
-  PROCESS_RESTART_BEFORE_BROADCAST` (0.23.0): every submitting path
-  announces its identifier to the main thread and broadcasts only after it
-  is persisted, so a hash-less row never sent anything;
-- `external_execution` with a `txHash`, or `submitted`, becomes
+- `pending` or pre-effect `running` without a persisted command: `failed /
+  PROCESS_RESTART_BEFORE_EXECUTION`; versioned commands re-queue unless their
+  signing session was closed at restart (`failed / PROCESS_RESTART_SESSION_CLOSED`);
+- `external_execution` without `txHash`: `failed /
+  PROCESS_RESTART_BEFORE_BROADCAST` (every path broadcasts only after its
+  identifier is persisted);
+- `external_execution` with `txHash`, or `submitted`:
   `reconciliation_required / PROCESS_RESTART_RECONCILE`;
-- a job in `reconciliation_required` must be checked against
-  `PendingSubmissions`, its persisted `txHash`, or live contract state before a
-caller creates a retry.
+- check a `reconciliation_required` job against `PendingSubmissions`, its
+  `txHash` or live contract state before retrying.
 
-One more terminal code exists for prewarm hygiene: a fresh
-`connectWalletForSigning` marks every older queued or running prewarm job of
-the same session as `failed / SUPERSEDED` - queued orphans never start, and
-an orphan already mid-run is terminally marked (its wait continues, see
-below). `SUPERSEDED` is expected and needs no operator action; the successor
-job carries the live prewarm status.
+A fresh `connectWalletForSigning` marks older queued or running prewarm jobs of
+the same session `failed / SUPERSEDED` (no action needed). A superseded pending
+job never starts; a running one finishes its wait and its result is discarded.
 
-Superseding is status hygiene, not cancellation: a superseded PENDING job
-never starts, but one caught mid-run keeps its in-flight worker wait until
-that resolves on its own (its late completion is then discarded quietly). In
-practice those waits coalesce - every prewarm of the same account blocks on
-the same facade sync - but rapid-fire fresh prewarms during a long cold sync
-still each add one real wait until the shared sync finishes.
+`status` and `chainStatus` answer different questions. `succeeded` means the
+workflow returned, not that the extrinsic executed. `chainStatus` is null for
+non-chain jobs, `pending` once a hash exists, then `success` or `failure` once
+the indexer confirmer resolves the ledger identifier (`chainFinalizedAt`,
+`chainBlockHeight`, `chainBlockHash`, `indexerTxHash`). The crawler indexes a
+different hash and uses the block height only to revert outcomes on a reorg.
+Predicate workflow parents aggregate children: any failed child `failure`, all
+successful `success`, else `pending`.
 
-`BackgroundJobs.status` and `chainStatus` answer different questions. A job is
-`succeeded` when NIGHTGATE's command/submission workflow returned successfully;
-this does not assert that the finalized extrinsic executed successfully.
-`chainStatus` is null for non-chain jobs, `pending` after a tx hash is reported,
-and later `success` or `failure` only after the indexer confirmer resolves the
-job's ledger identifier to a finalized transaction result; `chainFinalizedAt`
-records when that evidence became available and `chainBlockHeight` /
-`chainBlockHash` / `indexerTxHash` where the indexer places the inclusion. The
-crawler cannot provide this evidence (it indexes the extrinsic hash, a
-different value); it uses the recorded block height to revert outcomes on a
-reorg. Predicate workflow parents aggregate their
-children: any failed child means `failure`, all successful children mean
-`success`, otherwise the parent remains `pending`.
+Without a restart, a throw after `external_execution` or `submitted` gives
+`reconciliation_required / EXTERNAL_EXECUTION_FAILED`; a submit with no node
+status and no indexer entry parks as `reconciliation_required /
+BROADCAST_UNCONFIRMED`. Only failures proven before the boundary are plain
+`failed`.
 
-The same rule applies without a process restart: if work throws after reaching
-`external_execution` or `submitted`, the job becomes
-`reconciliation_required / EXTERNAL_EXECUTION_FAILED`, because broadcast may
-already have happened. A submit that ended without any node status and without
-the transaction on the indexer parks as `reconciliation_required /
-BROADCAST_UNCONFIRMED` instead: nothing failed yet, nothing was seen either.
-Only failures proven to occur before that boundary are ordinary `failed` jobs.
+A parked job leaves `reconciliation_required` when:
 
-A parked job leaves `reconciliation_required` in one of three ways: the
-indexer shows the transaction (`succeeded`, or `failed /
-CHAIN_EXECUTION_FAILED` when the call did not apply); the indexer tip passes
-the transaction's validity window (`ttl`, recorded on the attempt row at the
-submit intent, 30 to 60 minutes after the build; rows from before 0.23.3 use
-the submit time plus one hour) by `NIGHTGATE_BROADCAST_EXPIRY_MARGIN_MS`
-without the transaction appearing, which is proof it never landed: `failed /
-BROADCAST_NOT_INCLUDED`, `chainStatus: dropped`, attempt row `failed`; or a
-workflow parent's children all succeed. The tip must be PAST the ttl, so a
-lagging indexer keeps the job parked rather than declaring a landed
-transaction lost, and only ABSENCE counts: a transaction the indexer has
-but cannot confirm yet (no result status, no block height, an unknown
-status) keeps its job parked. The tip an absence is judged against is the
-one the SAME indexer answer carried (transaction and latest block in one
-request, so one replica); when both keys are tried (identifier, then hash)
-the joint absence is as of the OLDER of the two tips. A separate tip
-query, or the fresher of two answers, could come from a replica that
-caught up in between and turn "not indexed yet" into "never included". A lost sponsored deploy refunds the grant's
-deploy reservation in the same transaction. A workflow parent whose child
-ended `failed` this way (or any other terminal way) ends `failed /
-CHILD_FAILED`, naming the child, its code and the steps already on chain.
+- the indexer shows the transaction: `succeeded`, or `failed /
+  CHAIN_EXECUTION_FAILED` if the call did not apply;
+- the indexer tip passes the transaction's ttl (recorded at the submit intent,
+  30 to 60 min after the build; else submit time plus one hour) by
+  `NIGHTGATE_BROADCAST_EXPIRY_MARGIN_MS` without the transaction: `failed /
+  BROADCAST_NOT_INCLUDED`, `chainStatus: dropped`; a lost sponsored deploy
+  refunds its grant reservation in the same transaction;
+- all children of a workflow parent succeed.
 
-The command poller also performs conservative automatic reconciliation. It
-requires the exact job `txHash` (or the hash on its linked
-`PendingSubmissions` row), that submission in `finalized`, and a matching
-crawler-indexed `Transactions` row. This completes the submission job with a
-minimal `{ reconciled, submissionId, txHash, contractAddress, status }` result.
-A hash alone, an `included` submission, or a live-state effect without a
-transaction identity remains `reconciliation_required`. This proves the same
-submission/finalization contract as the normal path; it does not claim business
-execution success, because the crawler does not yet derive real execution
-outcomes from chain events.
+Only absence counts: a transaction the indexer has but cannot confirm yet keeps
+the job parked. Absence is judged against the tip of the same indexer answer
+(the older tip when identifier and hash are both queried), so a lagging replica
+never turns "not indexed yet" into "never included". A parent whose child
+ended failed ends `failed / CHILD_FAILED`, naming the child, its code and the
+steps already on chain.
 
-Leaf commands with local projections register an idempotent reconciliation
-finalizer. `anchorDocument` restores `Documents.anchoredTxHash/anchoredAt`;
-`grantDisclosure` restores `grantedTxHash`; `revokeDisclosure` immediately sets
-`active=false` and stores `revokedTxHash`. Disclosure finalizers also trigger
-the normal state reindex. `submitContractCallBatch` and `registerPassport`
-register projection-free finalizers that only rebuild their documented result
-shape from the persisted command + evidence. These finalizers never call the
-wallet or submit a transaction. The job remains `reconciliation_required` if a
-finalizer throws, and may safely retry its projection writes on the next poll.
-Their result uses the normal action-specific fields plus `reconciled: true`;
-only leaf kinds without a registered finalizer use the minimal generic result.
+The poller also reconciles conservatively: it needs the exact job `txHash` (or
+its `PendingSubmissions` row's), that submission `finalized` and a matching
+indexed `Transactions` row, then completes the job with `{ reconciled,
+submissionId, txHash, contractAddress, status }`. A hash alone, an `included`
+submission or a live-state effect stays `reconciliation_required`. This proves
+submission and finalization, not business execution.
 
-When every child of a predicate workflow has been reconciled successfully, its
-parent is moved back to `pending`. The normal versioned processor then resolves
-the same deterministic children and rebuilds the full typed parent result; it
-does not submit them again. Partially resolved workflows remain visible for
-operator action.
+Leaf commands with local projections register idempotent finalizers that never
+call the wallet: `anchorDocument` restores `Documents.anchoredTxHash/anchoredAt`,
+`grantDisclosure` restores `grantedTxHash`, `revokeDisclosure` sets
+`active=false` and `revokedTxHash` (both trigger a state reindex);
+`submitContractCallBatch` and `registerPassport` only rebuild their result. A
+throwing finalizer keeps the job parked and retries next poll. Results carry
+the action's fields plus `reconciled: true`.
 
-This avoids duplicate on-chain effects. Wallet pre-warm, NIGHT transfer and
-dust jobs use versioned persisted commands. Their command
-payload contains no seed material: the processor reloads encrypted signing
-material from the user-owned `WalletSessions` row, verifies `requestedBy`, and
-rebuilds the wallet facade. After a restart, a replayable job interrupted in
-pre-effect `running` is returned to `pending`, but it is claimed again only if
-its session survived the restart: by default startup closes the previous
-process's sessions (0.13.0), so jobs that signed with one of them are failed up
-front with `PROCESS_RESTART_SESSION_CLOSED` instead of dying later on a
-missing session. Jobs signed by exempt fee-sponsor sessions, and all jobs when
-`closeSessionsOnRestart: false`, replay as before. External-effect states are
-never replayed.
+When all children of a predicate workflow are reconciled, the parent returns to
+`pending` and rebuilds its result from the same deterministic children without
+resubmitting. Partially resolved workflows stay visible for the operator.
 
-Contract deploy and generic contract-call jobs also use versioned commands.
-Their complete circuit arguments and initial private state are stored only as
-AES-256-GCM ciphertext (`commandEncoding = aes-gcm-v1`) under the active ring key;
-the public `request` column remains redacted. The processor re-resolves the
-registered artifact, revalidates wallet and sponsor ownership, coerces circuit
-arguments again, and only then executes.
+Replay: prewarm, transfer, dust, deploy, contract call, anchoring and disclosure
+jobs use versioned persisted commands without seed material. The processor
+reloads encrypted signing material from the owning `WalletSessions` row, checks
+`requestedBy`, re-resolves the artifact, re-checks wallet and sponsor ownership
+and re-coerces arguments before executing. Circuit arguments, private state and
+witnesses are stored only as AES-256-GCM ciphertext (`commandEncoding =
+aes-gcm-v1`); the public `request` stays redacted. After a restart a pre-effect
+`running` job returns to `pending` only if its session survived
+(`closeSessionsOnRestart`); external-effect states never replay.
 
-Document anchoring and disclosure grant/revoke jobs also use encrypted,
-versioned commands and are replayable before their external-effect boundary.
-Predicate issuance is represented as a durable parent workflow with one
-deterministic child job per chain call. `parentJobId` and `workflowStep` make
-those checkpoints explicit, while the child idempotency key
-`workflow:<parent ID>:<step>` ensures a restarted parent resolves the same step
-instead of submitting it again. Each child may cross the external-effect
-boundary at most once.
-
-The parent itself performs no chain submission. If an earlier child succeeded
-but a later child fails or becomes ambiguous, the parent becomes
-`reconciliation_required` rather than ordinary `failed`: retrying the complete
-workflow under a new parent could otherwise duplicate the already completed
-chain effect. A field predicate without the optional content-root anchoring has
-only one chain step and can still fail normally before that step's external
-boundary. Private predicate witnesses and Merkle paths are encrypted at rest in
-the child command and never copied into the public request snapshot.
+Predicate issuance is a parent workflow with one deterministic child per chain
+call (`parentJobId`, `workflowStep`, child key `workflow:<parent ID>:<step>`);
+each child crosses the external-effect boundary at most once. The parent submits
+nothing: if a child succeeded and a later one fails or is ambiguous, the parent
+goes to `reconciliation_required`, not `failed`, so a retry cannot duplicate the
+completed effect.
 
 Prometheus exposes queued, running, reconciliation-required and oldest-queued
-job gauges. The current single-instance topology remains enforced; leases make
-ownership and stale execution observable but are not yet multi-replica leader
-election.
+job gauges.
 
-**Reconciliation caveats (operational).** Automatic reconciliation is conservative
-and fails safe, with two boundaries to monitor rather than treat as fully
-self-healing:
+**Reconciliation caveats.**
 
-- A leaf job whose transaction is finalized but whose `System.Events` never decode
-  (a persistent runtime-metadata gap at that block) has no canonical outcome, so it
-  stays `reconciliation_required` **indefinitely** instead of being resolved. This
-  never produces a false success, but there is no timeout - alert on a non-zero
-  `odatano_nightgate_jobs_reconciliation_required` gauge that does not drain, and
-  reconcile such jobs manually against chain state. (A broadcast the indexer
-  never shows is NOT in this class: it ends `failed / BROADCAST_NOT_INCLUDED`
-  once the indexer tip is past its ttl, see above.)
-- A job already resolved to `succeeded` / `failed` is not reverted if a later chain
-  reorg removes its block and the cascaded `TransactionResults`. This is low risk
-  because reconciliation only fires after `PendingSubmissions.status = finalized`
-  (past confirmation depth), but it is not actively defended.
+- A finalized transaction whose `System.Events` never decode has no canonical
+  outcome and stays `reconciliation_required` indefinitely (never a false
+  success): alert on a non-draining
+  `odatano_nightgate_jobs_reconciliation_required` and reconcile manually.
+- A resolved job is not reverted if a later reorg removes its block; low risk,
+  since reconciliation requires `PendingSubmissions.status = finalized`.
 
-The single-instance poller scans only `pending` rows with a registered
-`(kind, commandVersion)` processor. Commit visibility is awaited before
-acquiring the per-kind semaphore. The
-atomic `pending -> running` claim must affect exactly one row; otherwise no work
-executes. Completion/failure writes are fenced by `leaseOwner` and the active
-status, preventing a stale worker from overwriting a newer owner. Heartbeats do
-not cancel or reclaim a hung live SDK promise because the old call may still
-cross the external boundary later. Command replay is crash recovery, not an
-unsafe concurrent takeover of a live process.
+The poller claims only `pending` rows with a registered `(kind,
+commandVersion)` processor; the `pending -> running` claim must hit exactly one
+row. Completion writes are fenced by `leaseOwner` and status. Heartbeats never
+reclaim a hung live SDK call, which may still cross the boundary; replay is
+crash recovery only.
 
-The `PrivateStates`, `ContractSigningKeys` and `WalletSyncStates` rows are encrypted (PBKDF2 + AES-GCM) under passwords derived from a per-account data key (`AccountKeys`). That key is sealed twice: under the ring's active key, so `nightgate-rewrap-keys` rotates it without the wallet's viewing key, and under the viewing-key-derived storage password, so a session that presents its viewing key opens it even after the ring rotated (and re-seals it under the active key). The ring alone therefore opens an account's rows; the viewing key alone opens nothing. Rows written before the account key (`keyScheme` null) are under ring key + viewing key or viewing key only: a session read migrates them, the rewrap tool migrates the ones a stored viewing key reaches and reports the rest, and the ring key they were written under must stay until none remain. A sync-state blob nobody can open is treated as no cached state (the wallet re-syncs). Losing every ring key means stored viewing/seed keys and account keys become unreadable - back the secrets up separately. For private state migration, use `exportPrivateStates({ password })` to produce a portable encrypted blob.
+`PrivateStates`, `ContractSigningKeys` and `WalletSyncStates` are encrypted (PBKDF2 + AES-GCM) under passwords derived from a per-account data key (`AccountKeys`), sealed under the ring's active key (`nightgate-rewrap-keys` rotates it without the viewing key) and under the viewing-key storage password (opens after a ring rotation, then re-seals). The ring alone opens an account's rows; the viewing key alone opens nothing. Rows with `keyScheme` null use the older derivation: a session read migrates them, the rewrap tool migrates those a stored viewing key reaches and reports the rest; keep their ring key until none remain. An unreadable sync blob counts as no cached state (re-sync). Losing every ring key makes the stored keys unreadable: back up the secrets. Portable private-state export: `exportPrivateStates({ password })`.
 
 ### Security middleware
 
-NIGHTGATE installs no global HTTP middleware. CORS, CSP, HSTS, correlation
-headers and preflight handling are policies of the consuming CAP host. This is
-intentional: a plugin must not alter unrelated services or static applications.
-Hosts exposing `/zk-config/...` or `/contract-manifest` cross-origin must add
-those paths to their own explicit CORS allow-list.
+NIGHTGATE installs no global HTTP middleware; CORS, CSP, HSTS and preflight are
+host policy. Hosts serving `/zk-config/...` or `/contract-manifest`
+cross-origin add them to their CORS allow-list. Exception in the standalone
+image's transport auth, not the plugin: with `NIGHTGATE_PUBLIC_VERIFY=true` it
+admits `/api/v1/verify` without credentials and answers its preflight with `*`.
 
 ## Programmatic API
 
@@ -585,74 +485,68 @@ import {
 | `NightgateIndexerService` | `/api/v1/indexer` | Sync state, health, reorgs, Prometheus metrics, crawler control |
 | `NightgateAnalyticsService` | `/api/v1/analytics` | Aggregate counts |
 | `NightgateAdminService` | `/api/v1/admin` | Session admin |
+| `NightgateVerifyService` | `/api/v1/verify` | `verifyAttestationState` + `verifyPredicateState` without credentials (`NIGHTGATE_PUBLIC_VERIFY=true`; off: `404 PUBLIC_VERIFY_DISABLED`), per-address rate limit |
 
 For per-action signatures and curl examples, see [actions.md](actions.md).
 
 ### NightgateService entities (all `@readonly` unless noted)
 
 - `Blocks`, `Transactions`, `TransactionResults`, `TransactionSegments`, `TransactionFees`
-- `ContractActions` (one row per `Midnight` pallet extrinsic with its action
-  type; `address` and `state` are null until the ledger payload is decoded),
-  `ContractBalances`
-- `UnshieldedUtxos` (written only by a decoder of the ledger payload; the
-  crawler does not derive UTXOs from the extrinsic envelope)
+- `ContractActions` (one row per `Midnight` pallet extrinsic; `address` and `state` null until the ledger payload is decoded), `ContractBalances`
+- `UnshieldedUtxos`, `NightBalances` (written only by a ledger-payload decoder, not derived from the extrinsic envelope)
 - `ZswapLedgerEvents`, `DustLedgerEvents`
-- `NightBalances` (same: no balance is derived from the extrinsic envelope)
-- `Documents`: anchored document hashes (`anchorDocument`)
-- `PredicateAttestations`: issued ZK predicate attestations
-- `DisclosureGrants`: on-chain disclosure ACL index
-- `GranteeIdentities`: registered grantee bindings
-- `PendingSubmissions` - submission lifecycle audit trail; READ is scoped to the caller's own sessions since 0.5.2 (admins read unfiltered)
-- `WalletSessions` - projection excludes `viewingKeyHash` and `encryptedViewingKey`; `encryptedSeedKey` also internal-only; READ is scoped to the owning `userId` since 0.5.2 (admins read unfiltered)
+- `Documents`, `PredicateAttestations`, `DisclosureGrants`, `GranteeIdentities`
+- `PendingSubmissions`: read scoped to the caller's sessions (admins unfiltered)
+- `WalletSessions`: excludes `viewingKeyHash`, `encryptedViewingKey`, `encryptedSeedKey`; read scoped to the owning `userId` (admins unfiltered)
 
-### Schema additions (vs. 0.1.2)
+### Schema additions
 
 | Entity / Field | Purpose |
 |---|---|
-| `PendingSubmissions` | Submission lifecycle (`pending` → `included` → `finalized` / `failed`). Written before SDK call, reconciled by crawler. |
-| `PrivateStates` | Encrypted contract private state per `(accountId, contractAddress, privateStateId)`. Replaces the SDK's LevelDB provider. |
-| `ContractSigningKeys` | Encrypted contract signing keys per `(accountId, contractAddress)`. |
-| `WalletSyncStates` | Serialized SDK sub-wallet blobs (shielded/unshielded/dust) per `accountId`. Restart-resilient - restored on next `connectWalletForSigning`. |
-| `WalletSessions.encryptedSeedKey` | Nullable field populated by `connectWalletForSigning`. Sessions without it can still do read-side flows. |
-| `BackgroundJobs` | Async-job tracking for long-running actions (deploy, anchor, dust-reg, …). Poll via `getJobStatus(jobId, sessionId)`. |
-| `Attestations` | On-chain attestation index (payload-hash anchor, attester, public metadata, `disclosureLevel`). Backs the `AttestationService` mixin's tiered projections. |
-| `Documents` | Document anchor records. NIGHTGATE stores only the `sha256` commitment + a caller-supplied `storageRef` (`s3://…` \| `ipfs://…` \| `file:///…`) - **it never holds the document bytes**; the consumer owns storage. `anchorDocument` commits the hash on-chain via the `attest` circuit and records `anchoredTxHash`; `verifyDocument` re-checks the hash against the anchored, indexed, `SUCCESS` tx. |
-| `DisclosureRoles` | Per-user disclosure-tier grants (`userId`, `role`, optional `scope`, `validFrom`/`validUntil`). Off-chain, operator-configured; resolved per-request by `attachDisclosureRole`; granted via the authority-gated admin `grantRole`. |
-| `DisclosureGrants` | **Chain-derived** disclosure ACL, read off the AttestationVault `disclosures` ledger Map (`payloadHash`, `grantee`, `level`, `contractAddress`, `grantedTxHash`/`revokedTxHash`, `active`). Written by `grantDisclosure`/`revokeDisclosure` and reconciled to on-chain state by the post-submit reindexer. Distinct from the off-chain `DisclosureRoles` - this is the tamper-evident, attester-controlled source of truth. |
-| `GranteeIdentities` | Binds `userId` → the `Bytes<32>` `granteeId` the AttestationVault checks (`bindingKind`, optional `scope`). Populated by `registerGranteeIdentity`; read by the disclosure gate to match a caller against on-chain grants. |
+| `PendingSubmissions` | Submission lifecycle `pending` → `included` → `finalized` / `failed`, written before the SDK call |
+| `PrivateStates` | Encrypted private state per `(accountId, contractAddress, privateStateId)` |
+| `ContractSigningKeys` | Encrypted contract signing keys per `(accountId, contractAddress)` |
+| `WalletSyncStates` | Serialized sub-wallet blobs per `accountId`, restored on the next `connectWalletForSigning` |
+| `WalletSessions.encryptedSeedKey` | Set by `connectWalletForSigning`; null = read-only session |
+| `BackgroundJobs` | Async jobs; poll `getJobStatus(jobId, sessionId)` |
+| `Attestations` | Attestation index (payload hash, attester, public metadata) behind the `AttestationService` tiers |
+| `Documents` | `sha256` + caller `storageRef` (`s3://` \| `ipfs://` \| `file:///`); never the bytes. `anchorDocument` records `anchoredTxHash`, `verifyDocument` re-checks it |
+| `DisclosureRoles` | Off-chain per-user tiers (`userId`, `role`, `scope`, `validFrom`/`validUntil`), granted via admin `grantRole` |
+| `DisclosureGrants` | Chain-derived ACL from the vault `disclosures` map, reconciled after each grant/revoke |
+| `GranteeIdentities` | `userId` → vault `granteeId` (`bindingKind`, `scope`), set by `registerGranteeIdentity` |
 
-New enums in `db/types.cds`:
+Enums in `db/types.cds`:
 
 - `PendingSubmissionStatus`: `pending` | `included` | `finalized` | `failed`
-- `BackgroundJobStatus`: `pending` | `running` | `external_execution` | `submitted` | `reconciliation_required` | `succeeded` | `failed` (durable job lifecycle; `reconciliation_required` is terminal until chain evidence resolves it)
-- `DisclosureRole`: `public_only` | `legitimate_interest` | `authority` (the three document disclosure tiers, levels 0, 1, 2)
+- `BackgroundJobStatus`: `pending` | `running` | `external_execution` | `submitted` | `reconciliation_required` | `succeeded` | `failed`
+- `DisclosureRole`: `public_only` | `legitimate_interest` | `authority` (levels 0, 1, 2)
 
 ## Capability matrix
 
 | Area | Status |
 |---|---|
-| CAP plugin integration | ✅ Auto-registers models, connector routes and lifecycle hooks |
-| Node connectivity | ✅ `ws://` / `wss://` connections, config validation, offline fallback |
+| CAP plugin integration | ✅ Models, connector routes, lifecycle hooks |
+| Node connectivity | ✅ `ws://` / `wss://`, config validation, offline fallback |
 | Block catch-up + live sync | ✅ Finalized-block replay, header subscription, transient retry |
 | Reorg recovery | ✅ Parent-hash detection, fork-point search, atomic rollback, `ReorgLog` |
-| CAP-DB private state | ✅ Production-grade encrypted backend (T29) |
-| Wallet sessions | ✅ Read-only + signing-upgraded, TTL cleanup, admin invalidation |
-| Contract deploy / call | ✅ Worker-thread routed (Phase 2b), pending-row tracked, crawler-reconciled |
-| Token ops (transfer) | ✅ `sendNight` via worker (NIGHT is unshielded-only; no shield/unshield conversion exists) |
+| CAP-DB private state | ✅ Encrypted backend |
+| Wallet sessions | ✅ Read-only + signing, TTL cleanup, admin invalidation |
+| Contract deploy / call | ✅ Worker-routed, pending-row tracked, indexer-confirmed |
+| Token ops (transfer) | ✅ `sendNight` (NIGHT is unshielded-only; no shield/unshield) |
 | Dust generation | ✅ `registerForDustGeneration` + `deregisterFromDustGeneration` |
-| Diagnostics (balance, fee estimates) | ✅ `getWalletBalance`, `estimateSendNightFee`, `getWalletSyncProgress` (catch-up rate + ETA, 0.13.0) |
-| Local Midnight indexer (docker) | ✅ Optional `midnightntwrk/indexer-standalone:4.3.2` service |
-| Wallet state persistence | ✅ `WalletSyncStates` - restart resumes in seconds, not hours |
-| Worker-thread architecture | ✅ Wallet SDK isolated from main thread (Phase 1+2a+2b) |
-| Compact contracts | ✅ `counter` + `attestation-vault` + `attestation-vault-32` (0.19.0, 32-slot width variant) + `shielded-token` registered with compiled artifacts shipped (`mintShieldedTestToken` + `deriveTokenType` drive the token one) |
-| Live preprod end-to-end (T15) | ✅ Counter deployed live on preprod via the full stack (0.3.0) |
-| On-chain disclosure grants | ✅ `grantDisclosure`/`revokeDisclosure` + chain-indexed `DisclosureGrants` + `granteeBinding` + on-chain read gate (0.3.4). Live-validated through grant → index → read-back; live revoke pending a healthy preprod indexer |
-| Crawler-free state verification | ✅ `verifyAttestationState` / `verifyPredicateState` / `reindexDisclosures` read LIVE contract state (0.5.0); optional per-call `network` override reads another network's public indexer (0.7.0) |
-| Bytes equality + set membership proofs | ✅ `issueFieldEqualityAttestation` / `issueFieldMembershipAttestation` + mixed-kind batch + `prepareMembershipSet`; string fields via `prepareDocumentProof` `kind: 'bytes'` (0.15.0) |
-| Cross-root document diff proofs | ✅ `issueDocumentIntegrityAttestation` (unchanged-except with a width-bit slot mask: 16 bits default, 32 on `attestation-vault-32`) / `issueDocumentDiffAttestation` (at least k of width slots differ, k up to 32) over TWO anchored content roots, batchable + crawler-free verifiable (0.16.0; width variants 0.19.0) |
-| Passport-binding hardening | ✅ `bindPassport` rebind guard + registrar-gated `registerPassport` pre-registration (0.10.0). Registered ids bind only for their registered attester; deployed vaults need a redeploy |
-| Mainnet submission | ❌ Gated by `allowMainnetSubmission: false` until forum 1190 resolves |
-| Built-in authorization | ✅ `@requires` annotations; consumer app provides auth strategy |
+| Diagnostics (balance, fee estimates) | ✅ `getWalletBalance`, `estimateSendNightFee`, `getWalletSyncProgress` |
+| Local Midnight indexer (docker) | ✅ Optional `midnightntwrk/indexer-standalone:4.3.3` service |
+| Wallet state persistence | ✅ `WalletSyncStates`, restart resumes from the snapshot |
+| Worker-thread architecture | ✅ Wallet SDK isolated from the main thread |
+| Compact contracts | ✅ `counter`, `attestation-vault`, `attestation-vault-32`, `shielded-token` (compiled artifacts shipped) |
+| Live preprod end-to-end | ✅ `npm run deploy:e2e` |
+| On-chain disclosure grants | ✅ `grantDisclosure`/`revokeDisclosure`, `DisclosureGrants` index, `granteeBinding`, read gate |
+| Crawler-free state verification | ✅ `verifyAttestationState` / `verifyPredicateState` / `reindexDisclosures` on live state, per-call `network` override |
+| Bytes equality + set membership proofs | ✅ `issueFieldEqualityAttestation` / `issueFieldMembershipAttestation`, mixed-kind batch, `prepareMembershipSet` |
+| Cross-root document diff proofs | ✅ `issueDocumentIntegrityAttestation` (width-bit slot mask) / `issueDocumentDiffAttestation` (at least k slots differ) over two anchored roots |
+| Document-binding hardening | ✅ `bindDocument` (one id per payload, one payload per id), registrar-gated `registerDocument` (register, unregister, registrar transfer) |
+| Mainnet submission | ❌ Gated by `allowMainnetSubmission: false` |
+| Built-in authorization | ✅ `@requires` annotations; the host provides the auth strategy |
 
 ## Project structure
 
@@ -669,6 +563,7 @@ srv/
   nightgate-indexer-service.{cds,ts}# sync/health/metrics/reorg
   analytics-service.{cds,ts}
   admin-service.{cds,ts}
+  nightgate-verify-service.{cds,ts} # unauthenticated verify functions
   crawler/                          # Block crawler (main thread)
     Crawler.ts
     BlockProcessor.ts
@@ -678,8 +573,8 @@ srv/
     sdk-loader.ts                   # main-thread dynamic-import loader
     wallet-worker.ts                # worker entry - SDK lives here
     wallet-worker-client.ts         # main-thread RPC client
-    providers.ts                    # provider bundle assembly (legacy main-thread path; test-only after Phase 2b)
-    CapDbPrivateStateProvider.ts    # T29 - encrypted CAP-DB private state
+    providers.ts                    # provider bundle assembly (legacy main-thread path; test-only)
+    CapDbPrivateStateProvider.ts    # encrypted CAP-DB private state
   submission/                       # Submission orchestration (main thread)
     TransactionSubmitter.ts         # deploy/call lifecycle + pending-row mgmt
     handlers.ts                     # OData action handlers for deploy/call
@@ -695,7 +590,6 @@ srv/
     crypto.ts                       # AES-256-GCM for viewing/seed keys
     storage-encryption.ts           # SDK-wire-format PBKDF2 + AES-256-GCM
     format-error.ts                 # shared error → log-string helper
-    sqlite-tuning.ts                # SQLite pragmas
     ...
 contracts/
   counter/                          # Compact source + compiled artifact
@@ -712,7 +606,7 @@ scripts/
 ## Integration scripts (no chain needed)
 
 ```bash
-npm run smoke:sdk                  # 8 Midnight SDK packages load via dynamic import
+npm run smoke:sdk                  # Midnight SDK packages load via dynamic import
 npm run integration:providers      # provider bundle builds against real SDK
 npm run integration:wallet-keys    # ZswapSecretKeys.fromSeed determinism
 npm run integration:wallet-facade  # WalletFacade.init wiring (no chain access)
@@ -739,10 +633,9 @@ npm run integration:contract-registry  # registry resolves the real compiled cou
 
 ## Testing baseline
 
-- 68 test suites, 1248 tests, 0 failures (Vitest; migrated from Jest in 0.7.0 after CAP 10 deprecated the Jest harness; counts as of 0.11.0)
-- Integration scripts pass against the real SDK (`smoke:sdk`, `integration:*`)
-- The worker's RPC dispatch, facade lifecycle, genuine-sync gate, save/ack protocol AND the facade operation bodies (transfer incl. `tokenTypeHex`, balance/fee reads, dust register/deregister, contract-call private-state seeding) are unit-tested in-thread against a fake facade (`wallet-worker-dispatch.test.ts`); real-SDK behavior is exercised by the live e2e scripts (`wasm-proving:e2e`, `wasm-contract:e2e`, `wasm-zswap:e2e`, `deploy:e2e`)
-- Coverage measurement note: the CAP-booted services execute the compiled `srv/*.js` (native require, outside vitest's module graph). The build emits sourcemaps and `vitest.config.ts` includes `srv/**/*.js` so this execution is remapped onto the `.ts` sources - don't remove either half, or every handler tested through the booted server reads as uncovered
+- `npm test` passes with 0 failures; `smoke:sdk` and `integration:*` pass against the real SDK
+- Worker dispatch, facade lifecycle, sync gate, save/ack and the facade operations are unit-tested in-thread against a fake facade (`wallet-worker-dispatch.test.ts`); real-SDK behavior runs in the live e2e scripts (`wasm-proving:e2e`, `wasm-contract:e2e`, `wasm-zswap:e2e`, `deploy:e2e`)
+- Coverage: CAP-booted services run the compiled `srv/*.js`; sourcemaps plus `srv/**/*.js` in `vitest.config.ts` remap it onto the `.ts`. Removing either half makes booted-server handlers read as uncovered
 
 Run locally:
 

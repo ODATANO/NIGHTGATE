@@ -5,6 +5,11 @@
  * `Map`-style `member(bytes)` / `lookup(bytes)` views the state readers use.
  * Loaded through the same `pathToFileURL(artifactPath)` native import as a real
  * artifact, so the wrapper's artifact-loading path is exercised for real.
+ *
+ * Ledger shape (lineage 4): `attestations` (record key -> record struct),
+ * `content_anchors` (record key -> { root, schema }), `claims` (claim key ->
+ * valid_until bigint), `disclosures`, `document_bindings` (document id ->
+ * record key), `document_owners` (document id -> registered attester).
  */
 function hex(bytes) {
     return Buffer.from(bytes).toString('hex');
@@ -17,21 +22,20 @@ function mapView(obj = {}) {
         },
         lookup(key) {
             return obj[hex(key)];
+        },
+        [Symbol.iterator]() {
+            return Object.entries(obj).map(([k, v]) => [Buffer.from(k, 'hex'), v])[Symbol.iterator]();
         }
     };
 }
 
 export function ledger(state) {
     return {
-        public_attestations: mapView(state.public_attestations),
-        attestation_owners: mapView(state.attestation_owners),
-        content_roots: mapView(state.content_roots),
-        content_schemas: mapView(state.content_schemas),
-        field_predicate_results: mapView(state.field_predicate_results),
-        field_equality_results: mapView(state.field_equality_results),
-        field_membership_results: mapView(state.field_membership_results),
-        document_integrity_results: mapView(state.document_integrity_results),
-        document_diff_results: mapView(state.document_diff_results),
-        attestation_seqs: mapView(state.attestation_seqs)
+        attestations: mapView(state.attestations),
+        content_anchors: mapView(state.content_anchors),
+        claims: mapView(state.claims),
+        disclosures: mapView(state.disclosures),
+        document_bindings: mapView(state.document_bindings),
+        document_owners: mapView(state.document_owners)
     };
 }

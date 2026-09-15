@@ -1,10 +1,9 @@
 /**
  * Tests for srv/submission/wallet-sync-state-store.ts.
  *
- * The store goes through standard CAP `cds.connect.to('db').run(...)` again
- * (after Phase 1 of the worker migration, the wallet SDK no longer blocks
- * the main-thread microtask queue). Tests use a hand-rolled in-memory `cds`
- * mock, same pattern as `block-processor-persistence.test.ts`.
+ * The store goes through standard CAP `cds.connect.to('db').run(...)`.
+ * Tests use a hand-rolled in-memory `cds` mock, same pattern as
+ * `block-processor-persistence.test.ts`.
  */
 
 import { CURRENT_ENCRYPTION_VERSION } from '../../srv/utils/storage-encryption';

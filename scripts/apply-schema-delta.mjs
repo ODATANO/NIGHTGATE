@@ -6,6 +6,8 @@
 //   - CREATE TABLE only when the table is ABSENT (existing data untouched)
 //   - ALTER TABLE ADD COLUMN for columns missing from an EXISTING table
 //     (additive fields like PredicateAttestations.fieldKey; data untouched)
+//   - rebuilds a table whose NOT NULL was relaxed or whose unique keys changed
+//     (SQLite cannot alter a constraint; rows are copied)
 //   - DROP + CREATE every VIEW (views are stateless; refreshes projections so
 //     new service entities like DisclosureGrants/GranteeIdentities are queryable)
 //
@@ -92,8 +94,8 @@ const existingTables = new Set(
 
 let createdTables = 0, addedColumns = 0, refreshedViews = 0, skipped = 0;
 
-/** Parse top-level column definitions out of a CREATE TABLE statement. */
-function parseColumns(createStmt) {
+/** Top-level parts of a CREATE TABLE body: column definitions and table constraints. */
+function tableParts(createStmt) {
     const body = createStmt.slice(createStmt.indexOf('(') + 1, createStmt.lastIndexOf(')'));
     const parts = [];
     let depth = 0, cur = '';
@@ -103,9 +105,13 @@ function parseColumns(createStmt) {
         if (ch === ',' && depth === 0) { parts.push(cur); cur = ''; } else cur += ch;
     }
     if (cur.trim()) parts.push(cur);
+    return parts.map(p => p.trim());
+}
+
+/** Parse top-level column definitions out of a CREATE TABLE statement. */
+function parseColumns(createStmt) {
     const cols = [];
-    for (const raw of parts) {
-        const p = raw.trim();
+    for (const p of tableParts(createStmt)) {
         // Skip table-level constraints; only real columns can be ADD COLUMN'd.
         if (/^(PRIMARY|FOREIGN|UNIQUE|CHECK|CONSTRAINT)\b/i.test(p)) continue;
         const m = p.match(/^("?)(\w+)\1\s+/);
@@ -114,11 +120,26 @@ function parseColumns(createStmt) {
     return cols;
 }
 
+/** Column lists of the table-level UNIQUE constraints, normalized; constraint names are ignored. */
+function uniqueKeys(createStmt) {
+    return tableParts(createStmt)
+        .map(p => p.replace(/^CONSTRAINT\s+("?)\w+\1\s+/i, ''))
+        .filter(p => /^UNIQUE\b/i.test(p))
+        .map(p => p.replace(/"/g, '').replace(/\s*([(),])\s*/g, '$1').replace(/\s+/g, ' ').toUpperCase())
+        .sort();
+}
+
+/** SQLite cannot alter a constraint: a table whose unique keys differ from the target is rebuilt. */
+function uniqueKeysChanged(name, createStmt) {
+    const current = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name=?").get(name)?.sql ?? '';
+    return JSON.stringify(uniqueKeys(current)) !== JSON.stringify(uniqueKeys(createStmt));
+}
+
 let rebuiltTables = 0;
 
 /**
  * Columns whose NOT NULL was RELAXED in the target schema (e.g.
- * PredicateAttestations.op/threshold in 0.15.0). SQLite cannot ALTER a
+ * PredicateAttestations.op/threshold). SQLite cannot ALTER a
  * constraint, so the table is rebuilt: create the target shape under a temp
  * name, copy the shared columns (data untouched), drop the old table, rename.
  */
@@ -148,8 +169,15 @@ function rebuildTable(name, createStmt) {
     const attached = db.prepare(
         "SELECT type, name, sql FROM sqlite_master WHERE type IN ('index','trigger') AND tbl_name = ? AND sql IS NOT NULL"
     ).all(name);
+    // A column the old table lacks has nothing to copy: like ADD COLUMN, it
+    // loses a bare NOT NULL.
+    let shaped = createStmt;
+    for (const col of parseColumns(createStmt)) {
+        if (have.has(col.name) || !/\bNOT\s+NULL\b/i.test(col.def) || /\bDEFAULT\b/i.test(col.def)) continue;
+        shaped = shaped.replace(col.def, col.def.replace(/\bNOT\s+NULL\b/i, '').replace(/\s{2,}/g, ' ').trim());
+    }
     const tmp = `__delta_new_${name}`;
-    const tmpStmt = createStmt.replace(/^CREATE TABLE\s+("?)(\w+)\1/i, `CREATE TABLE "${tmp}"`);
+    const tmpStmt = shaped.replace(/^CREATE TABLE\s+("?)(\w+)\1/i, `CREATE TABLE "${tmp}"`);
     db.exec(`DROP TABLE IF EXISTS "${tmp}";`);
     db.exec(tmpStmt + ';');
     db.exec(`INSERT INTO "${tmp}" (${colList}) SELECT ${colList} FROM "${name}";`);
@@ -181,12 +209,14 @@ const migrate = () => {
         if (tableMatch) {
             const name = tableMatch[2];
             if (existingTables.has(name)) {
-                // Constraint relaxation (NOT NULL dropped in the target) needs
-                // a rebuild; the rebuild also carries any new columns.
+                // A relaxed NOT NULL or changed unique keys need a rebuild; the
+                // rebuild also carries any new columns.
                 const relaxed = relaxedColumns(name, stmt);
-                if (relaxed.length > 0) {
+                const uniqueChanged = uniqueKeysChanged(name, stmt);
+                if (relaxed.length > 0 || uniqueChanged) {
                     rebuildTable(name, stmt);
-                    console.log(`[delta] ~ rebuilt ${name} (relaxed NOT NULL: ${relaxed.join(', ')})`);
+                    const why = [relaxed.length > 0 ? `relaxed NOT NULL: ${relaxed.join(', ')}` : '', uniqueChanged ? 'unique keys changed' : ''].filter(Boolean).join('; ');
+                    console.log(`[delta] ~ rebuilt ${name} (${why})`);
                     rebuiltTables++;
                     skipped++;
                     continue;
@@ -222,7 +252,7 @@ const migrate = () => {
             refreshedViews++;
         }
     }
-    // Secondary indexes (0.23.0), same list the server applies at startup.
+    // Secondary indexes, same list the server applies at startup.
     try {
         const { NIGHTGATE_INDEXES, indexStatement } = require(path.join(packageRoot, 'srv/utils/db-indexes.js'));
         for (const spec of NIGHTGATE_INDEXES) {
@@ -234,15 +264,14 @@ const migrate = () => {
         console.warn(`[delta] ! indexes skipped (${err.message}); the server creates them at startup`);
     }
 
-    // 0.23.0: Transactions.raw was written as the "0x..." HEX TEXT of the
-    // extrinsic through CAP's binary transport, which base64-DECODES a string
-    // (invalid characters dropped, a trailing partial group truncated) and
-    // stores what that yields. The stored value is therefore LOSSY: it cannot
-    // be turned back into the extrinsic by any re-encoding. Clear those
-    // values (they start with "0x" because full base64 groups round-trip; a
-    // genuine extrinsic never encodes to "0x..." since 0xd3 is no valid
-    // compact length prefix) and the second copy ContractActions.state held;
-    // reindexFromHeight(0) restores them from the chain.
+    // A Transactions.raw value stored as "0x..." TEXT is LOSSY: it went
+    // through CAP's binary transport, which base64-DECODES a string (invalid
+    // characters dropped, a trailing partial group truncated), so no
+    // re-encoding gives the extrinsic back. Such values start with "0x"
+    // because full base64 groups round-trip, and a genuine extrinsic never
+    // encodes to "0x..." (0xd3 is no valid compact length prefix). Clear them
+    // and the copy ContractActions.state held; reindexFromHeight(0) restores
+    // them from the chain.
     try {
         if (db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='midnight_Transactions'").get()) {
             const lossy = db.prepare("SELECT count(*) AS n FROM midnight_Transactions WHERE typeof(raw) = 'text' AND raw LIKE '0x%'").get()?.n ?? 0;
@@ -253,12 +282,12 @@ const migrate = () => {
             }
             if (lossy > 0 || stateCleared > 0) {
                 console.log(`[delta] ~ cleared ${lossy} lossy Transactions.raw value(s) written before 0.23.0 and ${stateCleared} ContractActions.state copy(ies); run reindexFromHeight(0) on the indexer service to restore the extrinsic bytes`);
-            // Values derived from the extrinsic ENVELOPE before 0.23.0: a
-            // "contract address" minted from the extrinsic hash, and a NIGHT
-            // "transfer" (sender, receiver, amount, UTXO, balance) read from any
-            // signed extrinsic whose args parsed as MultiAddress + Compact. The
-            // ledger payload is not decoded, so the columns are null and the
-            // derived rows go; a re-index writes none of them back.
+            // Values derived from the extrinsic ENVELOPE (a "contract address"
+            // minted from the extrinsic hash, a NIGHT "transfer" read from any
+            // signed extrinsic whose args parsed as MultiAddress + Compact)
+            // are not produced by the current decoder, which leaves the
+            // columns null; clear them and the derived rows, a re-index
+            // writes none of them back.
             const addrCleared = db.prepare("UPDATE midnight_ContractActions SET address = NULL WHERE address IS NOT NULL").run()?.changes ?? 0;
             const txCleared = db.prepare("UPDATE midnight_Transactions SET contractAddress = NULL, senderAddress = NULL, receiverAddress = NULL, nightAmount = NULL WHERE contractAddress IS NOT NULL OR senderAddress IS NOT NULL OR receiverAddress IS NOT NULL OR nightAmount IS NOT NULL").run()?.changes ?? 0;
             let utxoCleared = 0, balanceCleared = 0;

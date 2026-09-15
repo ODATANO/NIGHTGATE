@@ -4,12 +4,9 @@
 [![npm downloads](https://img.shields.io/npm/dt/@odatano/nightgate-tx?logo=npm&label=downloads&color=blue)](https://www.npmjs.com/package/@odatano/nightgate-tx)
 [![License](https://img.shields.io/badge/license-Apache--2.0-yellow)](LICENSE)
 
-The NIGHTGATE client SDK: everything a hosted NIGHTGATE can do, as functions.
-Verify ZK attestations, ingest documents, prove field predicates, manage
-disclosure, sponsor fees, and build transactions **on your own machine with
-your own key**.
-
-Under 1 MB. No server of your own, no database, no proof server, no Docker.
+The NIGHTGATE client SDK: the hosted NIGHTGATE surface as functions, plus a
+builder that proves and signs transactions **on your own machine with your
+own key**. Under 1 MB; no server, database, proof server or Docker of your own.
 
 ```js
 import { connect } from '@odatano/nightgate-tx';
@@ -17,7 +14,7 @@ import { connect } from '@odatano/nightgate-tx';
 const ng = connect({ baseUrl: 'https://nightgate.example' });
 
 // verification is a plain read: no wallet, no key, no auth
-const state = await ng.verifyAttestation({ contractAddress, payloadHash });
+const state = await ng.verifyAttestation({ contractAddress, attesterId, payloadHash });
 ```
 
 ## The two halves
@@ -45,18 +42,17 @@ await ng.proveFieldPredicate({
 
 Covered: `verifyAttestation`, `verifyPredicate`, `verifyPredicateAttestation`,
 `verifyDocument`, `prepareDocumentProof`, `prepareMembershipSet`,
-`prepareAnchorCommitment`, `anchorDocument`, `commitDocumentAnchor`,
+`anchorDocument`,
 `attestAgentOutput`, `proveFieldPredicate`, `proveFieldEquality`,
 `proveFieldMembership`, `proveFieldPredicatesBatch`, `proveDocumentIntegrity`,
-`proveDocumentDiff`, `grantDisclosure`, `revokeDisclosure`, `registerPassport`,
+`proveDocumentDiff`, `grantDisclosure`, `revokeDisclosure`, `registerDocument`, `retractAttestation`, `purgeExpired`,
 wallet sessions, `deployContract`, `submitContractCall[Batch]`,
 `mintShieldedTestToken`, `deriveTokenType`, `sendNight`, `sponsorFinalized`,
 `sponsorUnbound`, `buildSponsorable`, `waitForJob`, and `callFunction`/`callAction`
 as escape hatches for anything new.
 
-**`createTxBuilder()`** is the part no hosted API can give you: build, prove
-(in-process wasm) and sign a transaction locally, so your seed and your
-attestation secret never leave your machine, then hand the ~5 KB result to the
+**`createTxBuilder()`** builds, proves (in-process wasm) and signs locally; seed
+and attestation secret never leave your machine. The ~5 KB result goes to the
 sponsor:
 
 ```js
@@ -82,60 +78,47 @@ const { txHash } = await ng.sponsorFinalized({ finalizedTxB64, sponsorSessionId 
 ```
 
 The on-chain attestation carries **your** attester id; the sponsor pays the
-dust and never sees a key, a witness or a preimage. A complete runnable version
-is in [`example/anchor.mjs`](./example/anchor.mjs).
+dust and never sees a key, witness or preimage. Runnable version:
+[`example/anchor.mjs`](./example/anchor.mjs).
 
-Two things to know before hosting the builder in a server: everything it does
-runs on the thread that awaits it (put it in a `worker_threads` worker), and
-by default the wallet syncs from genesis in the background for the life of
-the builder, a full core until it reaches the tip. Vault calls move no value
-and need no wallet state: pass `walletSync: false`, and always
-`await builder.close()` to stop the sync and the indexer sockets.
-`deriveIdentity({ seedHex })` gives `attesterId` and the NIGHT address
-without a builder, in ~150 ms. With `provingMode: 'server'` (a proof server
-YOU run; it receives the witnesses), `proofTimeoutMs` raises the SDK's 5 min
-timeout of one proof request for circuits that prove longer.
+Hosting the builder in a server: it runs on the awaiting thread (use a
+`worker_threads` worker), and by default the wallet syncs from genesis for the
+builder's life (a full core until tip). Vault calls move no value: pass
+`walletSync: false` and always `await builder.close()`.
+`deriveIdentity({ seedHex })` returns `attesterId` and the NIGHT address
+without a builder. `provingMode: 'server'` proves on a proof server YOU run (it
+receives the witnesses); `proofTimeoutMs` raises the 5 min per-request timeout.
 
 ## Batches
 
-`buildSponsorable({ contractAddress, calls: [...] })` puts up to 8 circuit
-calls into ONE transaction (one fee, one sponsoring), with deterministic
-segment ordering and a causality pre-check that aborts BEFORE proving
-(`BatchCausalityViolation`, no fee spent, the refusal names the calls). For a
-batch of independent calls (a proof cart: distinct claim keys),
-`independentCalls: true` groups them by execution stage so the cart stays
-valid on a grown contract where plain call order is refused;
-`orderedPrefix: 1` keeps a leading in-batch anchor in front. The durable
-batch shape on a grown contract is the proof cart (anchor first, then
-proofs); see `docs/txbuilder.md` in the main repo.
+`buildSponsorable({ contractAddress, calls: [...] })` puts up to 8 calls into
+ONE transaction (one fee). A causality pre-check aborts before proving
+(`BatchCausalityViolation`, no fee, names the calls). For independent calls
+(a proof cart: distinct claim keys) `independentCalls: true` orders them by
+execution stage; `orderedPrefix: 1` keeps a leading in-batch anchor first.
+Details: `docs/txbuilder.md` in the main repo.
 
 ## Parallel sponsoring
 
 `buildSponsorable({ ..., bind: false })` returns `unboundTxB64` for
 `ng.sponsorUnbound({ unboundTxB64, sponsorSessionId })`: one sponsor wallet
 pays for many callers at once (one per registered dust backing). Same proof,
-same identity, same TTL. Needs a sponsor on NIGHTGATE 0.18 or later.
+identity and TTL.
 
 ## Your own contract, and sponsored deploys
 
-The builder is not tied to the attestation vault.
 `createTxBuilder({ contractClass, zkConfigDir })` reads your own `keys/` and
-`zkir/` (nothing is fetched; the default `circuits` are those of the class
-you hand in). Witnesses come from you: on a single call or on the batch as
-ONE shared `witnesses` object, with per-call `before` hooks swapping what
-varies (single calls and batch entries run their hook the same way, so a
-batch split into single-call transactions keeps its per-call state).
-`buildDeploySponsorable()` builds, proves and signs a contract DEPLOY with
-your key and names the address it will create; a sponsor pays the dust when
-its grant carries `allowDeploy` with budget left, and the landed address is
-sponsorable under the same token at once. Needs a sponsor on NIGHTGATE 0.21
-or later; `zkAssets.source` says whether the assets came from a `/zk-config`
-or your directory.
+`zkir/` (nothing fetched; default `circuits` = those of the class;
+`zkAssets.source` says where assets came from). Witnesses come from you: one
+shared `witnesses` object, per-call `before` hooks swap what varies (single
+calls run the same hook). `buildDeploySponsorable()` builds, proves and signs a
+DEPLOY and returns the address it will create; a sponsor pays when the grant
+has `allowDeploy` with budget left, and the landed address is sponsorable under
+the same token.
 
 ## Self-funded submission
 
-For callers that pay their own dust and submit to the node themselves, with
-no sponsor at all, `/txbuilder` also exports the submission lane:
+No sponsor: `/txbuilder` also exports the submission helpers.
 
 ```js
 const tx = await deserializeTransaction(finalizedTxB64);
@@ -145,26 +128,22 @@ await submitFinalized(finalized, { nodeUrl });
 const landed = await waitLanded(identifier, { indexerHttpUrl, timeoutMs: 240_000 });
 ```
 
-- `submitFinalized` / `submitExtrinsic` encode the extrinsic over HTTP (needs
-  `@polkadot/api`, an optional peer dependency) and submit over a one-shot
-  WebSocket: the node's HTTP gateway rejects bodies over ~14 KB.
-- `probeLanded` / `waitLanded` confirm by transaction identifier, never by
-  watching the contract address; `applied: false` means in a block but the
-  call failed (fee spent, rebuild).
-- `classifyNodeReject` reads the ledger sub-code: 170/171/196 stale dust
-  proof (re-sync and rebuild, the wallet is NOT out of dust), 138/173 funds,
-  219-224 sequencing (split the batch), 117 malformed.
-- `isTransportFailure` (lost reply: probe, then resend the SAME bytes) and
-  `isAlreadyImported` (1013 after a resend: the first send reached the pool,
-  confirm instead of failing). Run `waitLanded` before trusting ANY refusal
-  of a resend; the first send may have landed while the indexer lags.
-- `withDustGuard` snapshots the dust sub-wallet before a build and restores
-  it on a pre-mempool reject, which otherwise leaks the spent dust note until
-  the wallet cannot balance. Never persist a post-reject dust state, and run
-  one guarded build per facade at a time.
+- `submitFinalized` / `submitExtrinsic`: submit over a one-shot WebSocket (the
+  node's HTTP gateway rejects bodies over ~14 KB); needs the optional peer
+  `@polkadot/api`.
+- `probeLanded` / `waitLanded`: confirm by transaction identifier;
+  `applied: false` = in a block, call failed, fee spent.
+- `classifyNodeReject`: 170/171/196 stale dust proof (re-sync, rebuild; NOT out
+  of dust), 138/173 funds, 219-224 sequencing (split the batch), 117 malformed,
+  104 stale transcript (rebuild, `rebuildOnStaleTranscript`).
+- `isTransportFailure` (probe, then resend the SAME bytes) and
+  `isAlreadyImported` (1013: the first send is in the pool). Run `waitLanded`
+  before trusting any refused resend.
+- `withDustGuard`: snapshots the dust sub-wallet and restores it on a
+  pre-mempool reject, which otherwise leaks the spent note. Never persist a
+  post-reject dust state; one guarded build per facade at a time.
 
-The complete flow, wallet facade and retry loop included, is
-[`example/self-funded.mjs`](./example/self-funded.mjs).
+Full flow: [`example/self-funded.mjs`](./example/self-funded.mjs).
 
 ## Entry points
 
@@ -173,9 +152,9 @@ The complete flow, wallet facade and retry loop included, is
 | `@odatano/nightgate-tx` | `connect` + `createTxBuilder` (the whole SDK) |
 | `@odatano/nightgate-tx/client` | the hosted-endpoint client alone |
 | `@odatano/nightgate-tx/txbuilder` | the local builder + the self-funded submission helpers |
-| `@odatano/nightgate-tx/calls` | 13 `prepare*` call builders, witnesses, attestation-secret helpers |
+| `@odatano/nightgate-tx/calls` | the `prepare*` call builders, witnesses, attestation-secret helpers |
 | `@odatano/nightgate-tx/attestation-vault` | the compiled contract class and its pure circuits |
-| `@odatano/nightgate-tx/attestation-vault-32` | the 32-slot width variant's contract class (panels of 17-32 fields; pass `slotWidth: 32` to the `prepare*` helpers and point `zkConfigBaseUrl` at `/zk-config/attestation-vault-32`) |
+| `@odatano/nightgate-tx/attestation-vault-32` | the 32-slot vault's contract class (pass `slotWidth: 32` to the `prepare*` helpers, `zkConfigBaseUrl` = `/zk-config/attestation-vault-32`) |
 | `@odatano/nightgate-tx/set-root` | the canonical membership-set rule |
 
 ## Auth
@@ -187,58 +166,31 @@ The verification reads need none.
 
 ## Costs and caveats
 
-- **The local builder's first run downloads the prover keys** (~78 MB for the
-  full vault set) from the host's `/zk-config` and caches them under
-  `~/.cache/nightgate-txbuilder/<contract>`. Pass `circuits: ['attest']` to
-  fetch only what you call. Later runs are offline; `connect()` alone never
-  downloads anything.
-- **Local proving blocks the thread** for tens of seconds; run it off your
-  request path.
-- **Locally built transactions expire** (`ttlMinutes`, default 30); hand them
-  to the sponsor promptly.
-- **Fetch prover keys from the host you submit to**: that pins the artifact
-  generation to the actually deployed contract.
-- **Memory of in-process proving is set by the circuit's k, not the key
-  size.** Measured on the vault's comparison circuit: k=17 (38.5 MB prover
-  key) peaks at 1.82 GB RSS, k=18 (72.9 MB) at 3.45 GB, about 47x the key,
-  doubling per k. The JS heap stays near 50 MB; the rest is wasm linear
-  memory, which never shrinks, so a long-lived process stays at the
-  high-water mark (a second prove adds ~46 MB). Two proves in one process
-  serialize and peak at the maximum, not the sum; each process or worker
-  has its own wasm memory. `--max-old-space-size` does not reach it. Read a
-  circuit's k with `Zkir.deserialize(bzkir).getK()` from `@midnight-ntwrk/zkir-v2`.
-  Under `provingMode: 'server'` the client still loads the prover key (it
-  travels in every `/prove` request), the proving working set moves to the
-  proof server.
-- **Match the Midnight line.** 0.4.5 pins midnight-js 4.1.1, compact-js
-  2.5.1, ledger-v8 8.1.0, compact-runtime 0.16.0 and zkir-v2 2.1.0 exactly;
-  midnight-js 4.1.1 pins the same set through `midnight-js-protocol`. A
-  project on a different line ends up with two copies of a wasm-bearing
-  package, and the two reject each other's objects (`expected instance of
-  ContractMaintenanceAuthority`); align via `overrides` or upgrade.
-  The wallet SDK packages declare `^8.1.x` for ledger-v8, so a FRESH install
-  next to the pinned 8.1.0 resolves a second copy (8.1.1) and the dust
-  wallet fails at builder start with `expected instance of DustParameters`:
-  pin it in the consumer's package.json. The same happens with
-  `onchain-runtime-v3` (compact-runtime accepts 3.1.0, midnight-js-protocol
-  pins 3.0.0; the symptom is `expected instance of StateValue` on every
-  contract call). Both together:
+- **First build downloads the prover keys** (~83 MB for the vault set) from the
+  host's `/zk-config`, cached under `~/.cache/nightgate-txbuilder/<contract>`.
+  `circuits: ['attest']` fetches only what you call. `connect()` downloads
+  nothing.
+- **Local proving blocks the thread** for tens of seconds.
+- **Built transactions expire** (`ttlMinutes`, default 30).
+- **Fetch prover keys from the host you submit to**: it pins the artifact
+  generation to the deployed contract.
+- **Proving memory follows the circuit's k**: ~1.8 GB RSS at k=17 (16-slot
+  comparison circuit), ~3.5 GB at k=18 (32-slot); wasm memory never shrinks and
+  `--max-old-space-size` does not bound it. See `docs/txbuilder.md`.
+- **Match the Midnight line.** Pins midnight-js 4.1.1, compact-js 2.5.1,
+  ledger-v8 8.1.0, compact-runtime 0.16.0 and zkir-v2 2.1.0 exactly. Two copies
+  of a wasm-bearing package reject each other's objects (`expected instance of
+  ContractMaintenanceAuthority` / `DustParameters` / `StateValue`). A fresh
+  install resolves second copies of ledger-v8 and onchain-runtime-v3; pin both:
   `"overrides": { "@midnight-ntwrk/ledger-v8": "8.1.0", "@midnight-ntwrk/onchain-runtime-v3": "3.0.0" }`.
-  Check with `find node_modules -type d -path '*@midnight-ntwrk/<pkg>'`: one
+  Check: `find node_modules -type d -path '*@midnight-ntwrk/<pkg>'` shows one
   directory per package.
-- **0.5.1** ships the fix for a 0.5.0 packaging break: every in-process
-  (wasm) build failed on load with `Cannot find module '../utils/config'`
-  (a server-only module reached from the shipped proof provider; server
-  proving was unaffected).
 
 ## Relationship to NIGHTGATE and the MCP server
 
-This package is generated from the [`@odatano/nightgate`](https://www.npmjs.com/package/@odatano/nightgate)
-tree, so the call builders and witnesses are the same code the server runs.
-Install the full plugin if you also want the indexer, the OData services, the
-crawler and the sponsor side. If your consumer is an AI agent speaking MCP
-rather than JavaScript, use
-[`@odatano/nightgate-mcp`](https://github.com/ODATANO/NIGHTGATE-MCP): same
-capabilities as tools.
+Generated from the [`@odatano/nightgate`](https://www.npmjs.com/package/@odatano/nightgate)
+tree: call builders and witnesses are the code the server runs. Install the full
+plugin for the indexer, OData services and sponsor side. For MCP clients:
+[`@odatano/nightgate-mcp`](https://github.com/ODATANO/NIGHTGATE-MCP).
 
 Apache-2.0

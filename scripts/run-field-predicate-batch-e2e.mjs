@@ -1,10 +1,9 @@
-// Field-predicate BATCH end-to-end (v0.12.0 issueFieldPredicateAttestationBatch).
+// Field-predicate BATCH end-to-end (issueFieldPredicateAttestationBatch).
 //
 // Walks: connectWallet → connectWalletForSigning (await prewarm sync) →
-// deployContract(attestation-vault) → anchorDocument (attest a payload so the
-// session owns it) → build a depth-4 content-root tree off-chain with the
-// contract's exported pureCircuits (leafHash/nodeHash, byte-identical to
-// in-circuit hashing) → then:
+// deployContract(attestation-vault) → prepareDocumentProof (salted content
+// tree built by the server with the artifact's pure circuits) → anchorDocument
+// (attest the document's payload hash so the session owns the record) → then:
 //
 //   POSITIVE  ONE batch: contentRoot anchored IN-BATCH (call 0) + 3 field
 //             claims (+1 exact duplicate that must be dropped server-side).
@@ -23,9 +22,6 @@
 
 import bip39 from 'bip39';
 import { Agent, setGlobalDispatcher } from 'undici';
-import { createHash, randomBytes } from 'node:crypto';
-import { pathToFileURL } from 'node:url';
-import path from 'node:path';
 
 setGlobalDispatcher(new Agent({ headersTimeout: 0, bodyTimeout: 0, connectTimeout: 30_000 }));
 
@@ -132,62 +128,10 @@ async function waitForServer() {
     fail(`Server at ${URL_BASE} did not respond within 30s`);
 }
 
-// ---- Off-chain content-root tree (mirrors NIGHTPASS passport-anchor.ts) ----
+// ---- Off-chain content-root tree ------------------------------------------
 // Depth-4 tree, 16 leaves; unused leaves are a fixed empty leaf. Hashing goes
 // through the contract's EXPORTED pureCircuits so the off-chain root is
 // byte-identical to the in-circuit fold.
-
-const MERKLE_DEPTH = 4;
-const LEAF_COUNT = 1 << MERKLE_DEPTH;
-
-function fromHex32(hex) {
-    const clean = hex.replace(/^0x/, '');
-    const out = new Uint8Array(32);
-    for (let i = 0; i < 32; i++) out[i] = parseInt(clean.substr(i * 2, 2), 16);
-    return out;
-}
-const toHex = (u8) => Buffer.from(u8).toString('hex');
-const fieldKeyHex = (name) => createHash('sha256').update(`batch-e2e/field/${name}`).digest('hex');
-
-async function loadPureCircuits() {
-    // Node ESM rejects raw C:\ paths; always go through pathToFileURL.
-    const artifact = pathToFileURL(path.resolve(
-        import.meta.dirname, '..',
-        'contracts', 'attestation-vault', 'src', 'managed', 'attestation-vault', 'contract', 'index.js'
-    )).href;
-    const mod = await import(artifact);
-    if (!mod.pureCircuits?.leafHash || !mod.pureCircuits?.nodeHash) fail('artifact does not export pureCircuits.leafHash/nodeHash');
-    return mod.pureCircuits;
-}
-
-function buildContentRoot(pc, fields /* [{name, value: bigint}] */) {
-    const emptyLeaf = pc.leafHash(fromHex32(fieldKeyHex('empty-leaf/v1')), 0n);
-    const leaves = [];
-    for (let i = 0; i < LEAF_COUNT; i++) {
-        const f = fields[i];
-        leaves.push(f ? pc.leafHash(fromHex32(fieldKeyHex(f.name)), f.value) : emptyLeaf);
-    }
-    const levels = [leaves];
-    for (let d = 0; d < MERKLE_DEPTH; d++) {
-        const prev = levels[d];
-        const next = [];
-        for (let i = 0; i < prev.length; i += 2) next.push(pc.nodeHash(prev[i], prev[i + 1]));
-        levels.push(next);
-    }
-    const proofFor = (idx) => {
-        const siblings = [];
-        const dirs = [];
-        let node = idx;
-        for (let d = 0; d < MERKLE_DEPTH; d++) {
-            const isLeft = node % 2 === 0;
-            siblings.push(toHex(levels[d][isLeft ? node + 1 : node - 1]));
-            dirs.push(isLeft); // true => current node is the LEFT child
-            node = Math.floor(node / 2);
-        }
-        return { siblings, dirs };
-    };
-    return { contentRoot: toHex(levels[MERKLE_DEPTH][0]), proofFor };
-}
 
 (async () => {
     await waitForServer();
@@ -213,34 +157,38 @@ function buildContentRoot(pc, fields /* [{name, value: bigint}] */) {
     if (!contractAddress) fail(`deploy returned no contractAddress: ${pretty(deployRes)}`);
     console.log(`OK   contractAddress = ${contractAddress}`);
 
-    // anchorContentRoot asserts attestation_owners[payload] == caller_id, so
-    // the payload must be attested by THIS session first.
-    const payloadHash = randomBytes(32).toString('hex');
-    step(`4. anchorDocument → attest payload ${payloadHash.slice(0, 12)}…`);
+    step('4. prepareDocumentProof (three numeric fields, salted leaves)');
+    const document = { carbonFootprint: 47.3, capacityKwh: 120, recycledPct: 0.85, batch: `field-batch-e2e-${Date.now()}` };
+    r = await post('/prepareDocumentProof', {
+        documentJson: JSON.stringify(document),
+        proofFieldsJson: JSON.stringify([{ field: 'carbonFootprint' }, { field: 'capacityKwh' }, { field: 'recycledPct' }])
+    });
+    if (r.status >= 400) fail(`prepareDocumentProof → ${r.status}: ${pretty(r.body)}`);
+    const payloadHash = r.body.payloadHash;
+    const contentRoot = r.body.contentRoot;
+    const schemaId = r.body.schemaId;
+    const prepared = JSON.parse(r.body.fields);
+    // value = scaled integer (x1000): 47300 / 120000 / 850
+    const FIELDS = ['carbonFootprint', 'capacityKwh', 'recycledPct'].map(name =>
+        prepared.find(f => f.field === name) || fail(`prepared field '${name}' missing`));
+    if (FIELDS[0].value !== '47300' || FIELDS[1].value !== '120000' || FIELDS[2].value !== '850') fail(`unexpected scaled values: ${pretty(FIELDS)}`);
+    console.log(`OK   payloadHash = ${payloadHash.slice(0, 12)}…, contentRoot = ${contentRoot.slice(0, 16)}…`);
+
+    step(`5. anchorDocument → attest payload ${payloadHash.slice(0, 12)}…`);
     r = await post('/anchorDocument', {
         sha256: payloadHash, storageRef: 'file:///tmp/field-batch-demo.bin',
         metadata: '{"type":"field-predicate-batch-e2e"}', sessionId, contractAddress
     });
     if (r.status >= 400) fail(`anchorDocument → ${r.status}: ${pretty(r.body)}`);
+    const attesterId = r.body.attesterId;
     await pollJob(sessionId, r.body.jobId, 'attest');
-    console.log('OK   payload attested');
-
-    step('5. Build content root off-chain (pureCircuits.leafHash/nodeHash)');
-    const pc = await loadPureCircuits();
-    const FIELDS = [
-        { name: 'carbonFootprint', value: 47300n },   // claim: <= 50000  (true)
-        { name: 'capacityKwh',     value: 120000n },  // claim: >= 100000 (true)
-        { name: 'recycledPct',     value: 850n }      // claim: >= 500    (true)
-    ];
-    const tree = buildContentRoot(pc, FIELDS);
-    console.log(`OK   contentRoot = ${tree.contentRoot.slice(0, 16)}…`);
+    console.log(`OK   payload attested (attester ${String(attesterId).slice(0, 12)}…)`);
 
     const claimFor = (idx, predicate, threshold) => {
-        const { siblings, dirs } = tree.proofFor(idx);
+        const f = FIELDS[idx];
         return {
-            fieldKey: fieldKeyHex(FIELDS[idx].name),
-            value: FIELDS[idx].value.toString(),
-            siblings, dirs, predicate,
+            fieldKey: f.fieldKey, value: f.value, salt: f.salt,
+            siblings: f.siblings, dirs: f.dirs, predicate,
             threshold: String(threshold),
             unit: 'e2e-unit'
         };
@@ -254,7 +202,7 @@ function buildContentRoot(pc, fields /* [{name, value: bigint}] */) {
 
     step('6. issueFieldPredicateAttestationBatch - POSITIVE (anchor in-batch + 3 claims + 1 dup)');
     r = await post('/issueFieldPredicateAttestationBatch', {
-        payloadHash, contentRoot: tree.contentRoot,
+        payloadHash, contentRoot, schemaId,
         claimsJson: JSON.stringify(claims),
         sessionId, contractAddress
     });
@@ -273,7 +221,7 @@ function buildContentRoot(pc, fields /* [{name, value: bigint}] */) {
     step('7. Per-claim crawler-free verification (verifyPredicateState)');
     for (const [i, c] of [[0, claims[0]], [1, claims[1]], [2, claims[2]]]) {
         const v = await pollVerify(fn('verifyPredicateState', {
-            contractAddress, payloadHash,
+            contractAddress, attesterId, payloadHash,
             predicate: c.predicate, threshold: Number(c.threshold), fieldKey: c.fieldKey
         }), `claim${i}`);
         if (v.proven !== true) fail(`claim${i}: expected proven=true: ${pretty(v)}`);
@@ -299,7 +247,7 @@ function buildContentRoot(pc, fields /* [{name, value: bigint}] */) {
 
     step('9. Atomicity: the TRUE claim of the aborted batch must NOT be on-chain');
     const ghost = await pollVerify(fn('verifyPredicateState', {
-        contractAddress, payloadHash,
+        contractAddress, attesterId, payloadHash,
         predicate: negClaims[0].predicate, threshold: Number(negClaims[0].threshold), fieldKey: negClaims[0].fieldKey
     }), 'ghost-claim', { expectTrue: false });
     if (ghost.verified === true) fail('aborted batch leaked a claim on-chain (atomicity violated)');

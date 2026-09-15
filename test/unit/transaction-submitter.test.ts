@@ -1,14 +1,13 @@
 /**
- * Tests for srv/submission/TransactionSubmitter (Phase 2b).
+ * Tests for srv/submission/TransactionSubmitter.
  *
- * Post-Phase-2b, TransactionSubmitter is a thin orchestrator around two
- * worker-thread RPCs (`walletDeployContract`, `walletSubmitContractCall`).
- * The SDK no longer runs on the main thread, so the old `deployContractImpl`
- * / `findDeployedContractImpl` seams are gone. Tests mock the worker-client
- * module exactly the way `dust-registration.test.ts` does.
+ * TransactionSubmitter is a thin orchestrator around two worker-thread RPCs
+ * (`walletDeployContract`, `walletSubmitContractCall`); the SDK never runs on
+ * the main thread. Tests mock the worker-client module exactly the way
+ * `dust-registration.test.ts` does.
  *
- * Uses the same in-memory fake DB pattern as before so PendingSubmissions
- * row transitions are exercised end-to-end.
+ * Uses an in-memory fake DB so PendingSubmissions row transitions are
+ * exercised end-to-end.
  */
 
 const walletDeployContract     = vi.hoisted(() => (vi.fn()));
@@ -205,6 +204,42 @@ describe('TransactionSubmitter dust-race rebuild-retry', () => {
         await expect(submitter.deploy({ contractName: 'counter', registration: REGISTRATION, initialPrivateState: {}, sessionId: 's' }))
             .rejects.toMatchObject({ classification: { code: '1010/188', retryable: false } });
         expect(walletDeployContract).toHaveBeenCalledTimes(1);
+    });
+});
+
+// A 1010/104 (transcript refused against the moved contract state) is rebuilt like a dust race, with its own budget.
+describe('TransactionSubmitter stale-transcript rebuild-retry', () => {
+    const staleTranscript = () => {
+        const wrapped: any = new Error('Transaction submission failed');
+        wrapped.cause = new Error('1010: Invalid Transaction: Custom error: 104');
+        return wrapped;
+    };
+    beforeEach(() => { process.env.NIGHTGATE_STALE_TRANSCRIPT_BACKOFF_MS = '0'; });
+    afterEach(() => {
+        delete process.env.NIGHTGATE_STALE_TRANSCRIPT_BACKOFF_MS;
+        delete process.env.NIGHTGATE_STALE_TRANSCRIPT_RETRIES;
+        delete process.env.NIGHTGATE_DUST_RACE_RETRIES;
+    });
+
+    test('call: a 1010/104 is rebuilt and resubmitted, even with no dust-race budget left', async () => {
+        process.env.NIGHTGATE_DUST_RACE_RETRIES = '0';
+        walletSubmitContractCall
+            .mockRejectedValueOnce(staleTranscript())
+            .mockResolvedValueOnce({ txHash: '0xrebuilt', onChainStatus: 'SucceedEntirely' });
+        const { submitter, db } = newSubmitter();
+        const call = await submitter.call({ contractAddress: '0xC', circuit: 'attest', args: [], contractName: 'counter', registration: REGISTRATION, sessionId: 's' });
+        expect(call.txHash).toBe('0xrebuilt');
+        expect(walletSubmitContractCall).toHaveBeenCalledTimes(2);
+        expect(db.tables['midnight.PendingSubmissions']).toHaveLength(1);
+    });
+
+    test('budget exhausted: fails as 1010/104 with the rebuild guidance, not a generic 1010', async () => {
+        process.env.NIGHTGATE_STALE_TRANSCRIPT_RETRIES = '1';
+        walletSubmitContractCallBatch.mockRejectedValue(staleTranscript());
+        const { submitter } = newSubmitter();
+        await expect(submitter.callBatch({ contractAddress: '0xC', calls: [{ circuit: 'a', args: [] }, { circuit: 'b', args: [] }], contractName: 'counter', registration: REGISTRATION, sessionId: 's' } as any))
+            .rejects.toMatchObject({ classification: { code: '1010/104', retryable: false, message: expect.stringMatching(/current contract state.*build the call again/) } });
+        expect(walletSubmitContractCallBatch).toHaveBeenCalledTimes(2); // 1 + 1 rebuild
     });
 });
 
@@ -548,6 +583,9 @@ describe('classifySubmissionError', () => {
         expect(classifySubmissionError(coded('pre-mempool-reject', { ledgerCode: '1016', retryable: true }), 'preprod')).toMatchObject({ code: '1016', retryable: true });
         expect(classifySubmissionError(coded('pre-mempool-reject', { ledgerCode: '1016', retryable: true }), 'mainnet')).toMatchObject({ code: '1016', retryable: false, knownIssueRef: expect.stringContaining('forum') });
         expect(classifySubmissionError(coded('pre-mempool-reject', { ledgerCode: 'intent-rejected' }), 'preprod')).toMatchObject({ code: 'SubmitIntentRejected', retryable: false });
+        expect(classifySubmissionError(coded('pre-mempool-reject', { ledgerCode: 'intent-timeout' }), 'preprod')).toMatchObject({ code: 'SubmitIntentTimeout', retryable: false, message: expect.stringMatching(/nothing was broadcast/) });
+        expect(classifySubmissionError(coded('pre-mempool-reject', { ledgerCode: '1010/104' }), 'preprod')).toMatchObject({ code: '1010/104', retryable: false, message: expect.stringMatching(/no fee was spent; build the call again/) });
+        expect(classifySubmissionError(new Error('1010: Invalid Transaction: Custom error: 104'), 'preprod')).toMatchObject({ code: '1010/104', message: expect.stringMatching(/current contract state/) });
         expect(classifySubmissionError(coded('transport', { retryable: true }), 'preprod')).toMatchObject({ code: 'NetworkOrTimeout', retryable: true });
         // Ambiguous is NOT retried by rebuilding: the identifier may land.
         expect(classifySubmissionError(coded('ambiguous', {}, 'submit watch timed out after 60000ms'), 'preprod')).toMatchObject({ code: 'SubmitAmbiguous', retryable: false });
@@ -568,7 +606,7 @@ describe('classifySubmissionError', () => {
         expect(c).toMatchObject({ code: '1010', retryable: false });
     });
 
-    test('1010 with a ledger custom error carries it in the code (rebind repro shape)', () => {
+    test('1010 with a ledger custom error carries it in the code', () => {
         const c = classifySubmissionError(
             new Error('1010: Invalid Transaction: Custom error: 188'), 'preprod');
         expect(c).toMatchObject({ code: '1010/188', retryable: false });

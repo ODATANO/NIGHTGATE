@@ -1,10 +1,8 @@
 # Architecture
 
-How NIGHTGATE is structured, why, and where the load-bearing design decisions live. Audience: developers who need to understand or extend the system.
+Structure and design decisions, for developers extending NIGHTGATE.
 
 ## The two pipelines
-
-NIGHTGATE has two parallel data flows that share a single reconciliation point:
 
 ```
                 Midnight Chain
@@ -21,7 +19,7 @@ NIGHTGATE has two parallel data flows that share a single reconciliation point:
   │             │   │  - dust sub-wallet           │
   └──────┬──────┘   └──────────────┬───────────────┘
          │                         │
-   atomic writes              state-save (every 30 s)
+   atomic writes              state-save (every 60 s)
    blocks/tx/actions          serialized blobs (~MB-scale)
          │                         │
          ▼                         ▼
@@ -37,19 +35,17 @@ NIGHTGATE has two parallel data flows that share a single reconciliation point:
               ledger identifier the job stores
 ```
 
-Crawler indexes chain history from the Substrate node. The wallet SDK runs ZK transaction operations through the GraphQL indexer and submits via the Substrate node. Both write to the same CAP DB. They do NOT meet on a hash: a job stores the ledger transaction identifier, the crawler indexes the Substrate extrinsic hash and the indexer reports a third hash, so no value matches across the pipelines. The contact point is the indexer confirmer's BLOCK evidence: it confirms a job by its identifier, records the inclusion's block height and hash on the job and its `PendingSubmissions` row, and a crawler reorg rollback reverts every outcome confirmed at or above the fork height.
+The crawler indexes chain history from the Substrate node. The wallet SDK builds transactions against the GraphQL indexer and submits via the node. Both write to the CAP DB.
 
-The two pipelines could share data (the indexer's GraphQL view duplicates much of what the crawler indexes), but they serve different consumers (enterprise OData vs. the wallet SDK's specific subscription shape), so the duplication is the simplest design.
+The pipelines share no hash: a job stores the ledger transaction identifier, the crawler indexes the extrinsic hash, the indexer reports a third hash. The indexer confirmer finds a job by its identifier and records block height and hash on the job and its `PendingSubmissions` row; a reorg rollback reverts every outcome at or above the fork height.
 
 ## Why a worker thread
 
-The Midnight wallet SDK is built on [Effect.ts](https://effect.website). Its fiber scheduler **monopolises the host's microtask queue** while a chain sync is running - we observed plain `setInterval` callbacks not firing for 75+ seconds during sync, and CAP request handlers timing out at 10 seconds while persistence saves were going through fine.
+The wallet SDK ([Effect.ts](https://effect.website)) saturates the microtask queue while syncing: timers stall and CAP requests time out. In a `worker_threads` worker it has its own event loop, and the main thread stays responsive.
 
-The fix is structural: run the wallet SDK in its own `worker_threads` worker. Each worker has its own V8 isolate with its own event loop, so the SDK's microtask saturation only affects that thread.
+### Worker layout
 
-### Phase 1 - wallet sync isolation (2026-05-17)
-
-- `srv/midnight/wallet-worker.ts` is the worker entry (composition root: thread guard, key ring hand-over, `parentPort` wiring). The work lives in `srv/midnight/worker/`, every module importable without a `parentPort`:
+- `srv/midnight/wallet-worker.ts`: entry (thread guard, key ring hand-over, `parentPort` wiring). Modules in `srv/midnight/worker/` import without a `parentPort`:
   - `context.ts`: the facade registry, the log channel, the memoised SDK loaders, address helpers.
   - `facades.ts`: facade build, sync waits and progress, periodic state save with main-thread acks, per-session submit locks, `evict`.
   - `submit.ts`: dust wedge protection, same-transaction resend, the submit-intent handshake, dedicated submit clients, the wallet providers that route a build through them.
@@ -58,34 +54,25 @@ The fix is structural: run the wallet SDK in its own `worker_threads` worker. Ea
   - `artifacts.ts`: scaffold cache, content-addressed snapshots, generation retention, generation-pinned import. `bounded-cache.ts`: the bounded cache both caches use.
   - `rotation.ts`: generation budget, admission drain, evict-all, `shutdown`. `rpc.ts`: the method table and the message dispatcher.
   - `tokens.ts`: transfers, balances, fee estimates, dust registration.
-- `srv/midnight/wallet-worker-client.ts` is the main-thread RPC client. One `MessageChannel` per call: post `{ kind: 'rpc', method, args, port }`, await the reply on the port.
-- Push events on `parentPort` (no per-call port): `state-save`, `log`, `private-state-rpc`.
-- Persistence: every 30 s the worker pushes a `state-save` event with serialized sub-wallet blobs. The main thread writes them via standard CAP `db.run`.
+- `srv/midnight/wallet-worker-client.ts`: main-thread RPC client, one `MessageChannel` per call (`{ kind: 'rpc', method, args, port }`).
+- Push events on `parentPort`: `state-save`, `log`, `private-state-rpc`.
+- Every 60 s the worker pushes `state-save` with serialized sub-wallet blobs; the main thread writes them.
 
-Verification: in a Phase-1 test run, the main thread's `setInterval` callbacks fired regularly throughout a 75-second wallet sync, having been frozen entirely before.
+### Everything SDK-side runs in the worker
 
-### Phase 2a - dust registration in the worker (2026-05-17)
+Build, balance, prove and submit run in the worker. No SDK object crosses the thread boundary; RPCs return primitives. Main RPCs:
 
-`facade.registerNightUtxosForDustGeneration` builds + finalizes + submits in one flow. Moving the whole flow into the worker means no SDK objects ever cross the thread boundary - the worker returns only primitives (`txId`, counts, addresses as strings). The RPC is `walletRegisterDustGeneration`.
+- `walletRegisterDustGeneration` / `walletDeregisterDustGeneration`
+- `walletDeployContract` / `walletSubmitContractCall` (artifact imported in the worker)
+- `walletTransferNight` (NIGHT or custom token)
+- `walletGetBalance`
+- `walletEstimateTransferFee` (recipe only, no proof, no submit)
 
-### Phase 2b - contract deploy + call in the worker (2026-05-17)
+No shield/unshield: NIGHT is unshielded-only.
 
-`TransactionSubmitter.deploy / .call` used to run the SDK on the main thread. Phase 2b moved them into the worker via new RPCs `walletDeployContract` / `walletSubmitContractCall`. The compiled contract artifact (Compact `managed/` output) is dynamic-imported inside the worker and cached by name.
+### Private state proxy
 
-**New problem this introduced**: the SDK's `PrivateStateProvider` interface is called many times during a deploy/call. The real `CapDbPrivateStateProvider` (with CAP DB access + encryption) lives on the main thread. Solution: a **proxy** in the worker forwards each PS CRUD call back to main via a new `private-state-rpc` message kind. Main has a per-`proxyId` provider map; the worker's proxy is registered with a fresh proxyId per submission and unregistered in `finally`.
-
-`setContractAddress` is synchronous in the SDK contract; we forward it as a fire-and-forget `parentPort.postMessage` (no port, no reply). `worker_threads` guarantees in-order message delivery, so the next async `set` / `get` arrives on main after the address has been applied.
-
-### Phase 2b: token operations + diagnostics (2026-05-19)
-
-The same worker pattern, extended to expose:
-
-- `walletTransferNight` (build + balance + finalize + submit a NIGHT transfer)
-- `walletDeregisterDustGeneration` (symmetric to register)
-- `walletGetBalance` (read-only snapshot of all three sub-wallet balances)
-- `walletEstimateTransferFee` (build the recipe in the worker, call `facade.estimateTransactionFee`, discard the recipe - no proof generation, no submit)
-
-(Phase 2b also shipped `walletShieldNight` / `walletUnshieldNight` / `walletEstimateSwapFee`; removed in 0.10.5: NIGHT is unshielded-only, so a cross-ledger shift is not a legal operation. See `docs/feature-requests/bug_003-initswap-drops-destination-half-fund-loss.md`.)
+`CapDbPrivateStateProvider` (DB access, encryption) lives on the main thread. A worker proxy forwards each private-state call via `private-state-rpc`, registered under a fresh `proxyId` per submission and removed in `finally`. The synchronous `setContractAddress` is posted without a reply; `worker_threads` delivers messages in order.
 
 ## Submission flow
 
@@ -120,67 +107,52 @@ Main thread (handler)                                        Worker thread
                                                                   job and the attempt row ('finalized')
 ```
 
-Since the 0.2.0 async-job migration the handler doesn't block on this flow: it wraps steps 5–7 in a background job (`srv/submission/background-jobs.ts`), returns `{ jobId, status }` immediately, and callers poll `getJobStatus`. Every job kind declares its traits once (`srv/submission/job-kinds.ts`: heavy or light concurrency class, workflow parent, identifier-keyed); the runner derives its sets from the registrations. The poller claims pending rows up to the free capacity of each class, once per lease (CAS `pending -> running` with owner and heartbeat), and re-queues a `running` job whose heartbeat stopped for longer than `NIGHTGATE_JOB_LEASE_TTL_MS`; a job past the external-effect boundary is never reclaimed, reconciliation resolves it by its identifier. The worker's pre-balance step also waits for the wallet to be synced to tip (bounded by `NIGHTGATE_BALANCE_SYNC_TIMEOUT_MS`, default 180s) so submissions never balance against stale dust (which the node rejects as `Custom error: 170`).
+Steps 5-7 run as a background job (`srv/submission/background-jobs.ts`); the action returns `{ jobId, status }` and callers poll `getJobStatus`. Job kinds declare their traits in `srv/submission/job-kinds.ts` (heavy or light class, workflow parent, identifier-keyed). The poller claims pending rows per free class capacity (CAS `pending -> running` with owner and heartbeat) and re-queues a `running` job whose heartbeat is older than `NIGHTGATE_JOB_LEASE_TTL_MS`. A job past the external-effect boundary is never reclaimed; reconciliation resolves it by its identifier. Before balancing, the worker waits for the wallet to reach the tip (`NIGHTGATE_BALANCE_SYNC_TIMEOUT_MS`, default 180 s), since stale dust is rejected as `Custom error: 170`.
 
 ### The "sessionId" indirection
 
-The OData layer's `sessionId` is the user-facing UUID stored in `WalletSessions`. But the worker stores facades keyed on `accountId` - a deterministic hash of the viewing key. Multiple OData sessions with the same wallet share the same facade in the worker.
+The OData `sessionId` is a `WalletSessions` UUID; the worker keys facades by `accountId`, a hash of the viewing key, so sessions of one wallet share a facade. `makeDeployRpcArgs`, `makeCallRpcArgs` and the token-ops args builders pass `accountId` as the worker's `sessionId`; the OData UUID stays on `PendingSubmissions` for audit.
 
-`TransactionSubmitter.makeDeployRpcArgs` / `makeCallRpcArgs` (and the token-ops handlers) translate `walletMaterial.accountId` → `sessionId` in the worker RPC. The OData session UUID stays on the `PendingSubmissions` row as audit metadata.
+## Signing and proving
 
-This was a bug in the first Phase 2b draft (worker passed the OData UUID as lookup key, missed the facade) - caught on the first live T15 attempt. Now consistently fixed in 4 places: `makeDeployRpcArgs`, `makeCallRpcArgs`, and the 4 token-ops args builders.
+Proving needs witness data from the wallet's secret keys, so the server-side flow is one call: build, balance, prove, submit. For that path the seed is stored encrypted (AES-256-GCM, `ENCRYPTION_KEY`) and held in memory for the facade's lifetime.
 
-## Why no "build → external sign → submit"
+To keep a key off the server, the caller builds, proves and signs locally with the [txbuilder](txbuilder.md); a sponsor session pays the dust and submits (`sponsorFinalizedTransaction`, `sponsorUnboundTransaction`).
 
-ODATANO's Cardano transaction surface returns unsigned CBOR for external signing. The wallet's seed key never touches the server. Midnight doesn't support this pattern cleanly:
-
-- `facade.finalizeRecipe()` triggers **ZK proof generation**. The proof requires witness data derived from the wallet's secret keys.
-- The proof runs against a proof server the SDK calls over HTTP, or fully in-process when `NIGHTGATE_PROVING_MODE=wasm` (SDK WASM prover for wallet circuits, `srv/midnight/wasm-proof-provider.ts` for contract circuits).
-- The result is a `FinalizedTransaction` that bundles proofs + signatures + binding into one opaque object.
-
-The `wallet-sdk-facade` doesn't expose a serialization of `FinalizedTransaction` for "build now, submit later" workflows. The low-level `ledger-v8.Transaction.serialize()` exists, but the facade doesn't surface it as part of its API contract.
-
-**Architectural decision**: NIGHTGATE follows the SDK's grain. Submissions are one-shot - build + balance + prove + submit in a single worker call. The seed key has to be available server-side for proof generation; we accept that and store it encrypted (AES-256-GCM via `ENCRYPTION_KEY`).
-
-What we do expose for safety:
-- The seed is decrypted inside the OData handler, passed to the worker, and held in-memory only for the duration of the facade's lifetime.
-- Periodic state-save blobs are encrypted with a per-session storage password derived from the viewing key (PBKDF2 + AES-256-GCM).
-- A future `connectWalletExternalProver` mode could in principle accept signed-tx-blobs from a hardware wallet, but it's not in scope for now.
+Proving runs on a proof server or in-process (`NIGHTGATE_PROVING_MODE=wasm`: the SDK prover for wallet circuits, `srv/midnight/wasm-proof-provider.ts` for contract circuits).
 
 ## Persistence model
 
 ### PendingSubmissions
 
-One row per submission. Lifecycle:
+One row per submission attempt:
 
-- INSERT before the worker call (status=`pending`, no txHash)
-- UPDATE on worker return (status=`included`, txHash set)
-- UPDATE by crawler when indexing the tx (status=`finalized`)
-- On error: UPDATE to status=`failed` with `errorCode` from `classifySubmissionError`
+- insert before the worker call (`pending`)
+- `included` with `txHash` on worker return
+- `finalized` or `failed` when the indexer confirmer or reconciliation resolves the identifier, with block height and hash
+- `failed` with `errorCode` on a submit error
 
-This is the crash-recovery point. If the server dies between worker submit and DB UPDATE, the row stays in `pending` but the txHash is null. On restart, the row will eventually get reconciled to `finalized` by the crawler IF the tx made it to the chain. If it didn't, the row stays orphan `pending` forever - call `/PendingSubmissions?$filter=status eq 'pending'&$top=10` to find them.
+A reorg rollback reverts rows confirmed at or above the fork height.
 
 ### PrivateStates
 
-Per-(`accountId`, `contractAddress`, `privateStateId`) row with AES-256-GCM encrypted blob. The SDK CRUDs this via the proxy → main pipeline during deploy/call. Replaces the SDK's LevelDB private state provider, which the SDK docs explicitly warn against for production use.
+One encrypted blob per (`accountId`, `contractAddress`, `privateStateId`), accessed through the proxy during deploy and call. Replaces the SDK's LevelDB provider.
 
 ### WalletSyncStates
 
-Per-`accountId` row holding the serialized blobs for all three sub-wallets (shielded, unshielded, dust). Updated every 30 s during sync via the state-save push event. Restart-resilient: on next `connectWalletForSigning`, the facade-builder loads the prior blobs and the SDK does a delta-sync instead of starting from genesis (~5-6 h saved).
-
-The serialized state contains `sub.serializeState()` output verbatim. The SDK's restore path normalizes (sometimes shrinking the blob slightly) - that's not corruption, that's the SDK compacting the format.
+Serialized shielded, unshielded and dust sub-wallet state per `accountId`, saved every 60 s and encrypted under the account's data key (`AccountKeys`). A restart resumes from it instead of syncing from genesis.
 
 ### WalletSessions
 
-Per-OData-session UUID. Stores encrypted viewing key (always) + encrypted seed key (only after `connectWalletForSigning`). TTL configurable (default 24 h).
+One row per session: encrypted viewing key, plus the encrypted seed after `connectWalletForSigning`. TTL configurable, default 24 h.
 
 ### ContractSigningKeys
 
-SDK-managed per-(accountId, contractAddress) signing keys. Used internally by the SDK during contract deploy + call. Wire-format compatible with the SDK's LevelDB provider exports.
+SDK signing keys per (`accountId`, `contractAddress`), used for deploy and maintenance.
 
 ## Provider stack inside the worker
 
-For each contract deploy/call, the worker assembles a 6-provider bundle the SDK expects:
+Per contract deploy or call the worker assembles:
 
 | Slot | Source | What |
 |---|---|---|
@@ -189,20 +161,14 @@ For each contract deploy/call, the worker assembles a 6-provider bundle the SDK 
 | `proofProvider` | `http-client-proof-provider` package, or `srv/midnight/wasm-proof-provider.ts` when `NIGHTGATE_PROVING_MODE=wasm` | ZK proof generation for contract circuits: HTTP to the proof server, or in-process via zkir over the contract's local key material |
 | `privateStateProvider` | Proxy back to main thread's `CapDbPrivateStateProvider` | per-(accountId, contractAddress, privateStateId) CRUD |
 | `walletProvider` | Built from the worker's facade | `getCoinPublicKey`, `balanceTx`, `submitTx` |
-| `midnightProvider` | same object as `walletProvider` | per Counter CLI convention |
+| `midnightProvider` | same object as `walletProvider` | |
 
-`buildWorkerContractProviders()` (`srv/midnight/worker/contracts.ts`) and `buildWorkerWalletProvider()` (`srv/midnight/worker/submit.ts`) assemble this per call.
+Built by `buildWorkerContractProviders()` (`srv/midnight/worker/contracts.ts`) and `buildWorkerWalletProvider()` (`srv/midnight/worker/submit.ts`).
 
-## Network ID - process-global gotcha
+## Network ID is process-global
 
-The Midnight SDK keeps the active network as **process-global** state via `setNetworkId()`. Every wallet/contract operation reads it and throws if it was never set. We call `ensureNetworkId(net, sdk)` in the worker before every SDK invocation. The wrapper is idempotent (cached, no-op on second call with same network).
-
-This is a real footgun if you ever want to handle multi-network in one process. Today we don't.
+The SDK holds the network in process-global state (`setNetworkId()`) and throws if unset. The worker calls the idempotent `ensureNetworkId(net, sdk)` before every SDK call. One process serves one network.
 
 ## ESM-only SDK in a CommonJS project
 
-All Midnight SDK packages (`@midnight-ntwrk/*` and the wallet-sdk family under `@midnightntwrk/*`) are ESM-only. NIGHTGATE is `"type": "commonjs"`. The submission code uses dynamic `import()` via `srv/midnight/sdk-loader.ts` (main thread) and `loadSdk()` / `loadContractsSdk()` / `loadAddressFormat()` in the worker.
-
-Type-only imports work when the SDK provides clean `.d.ts`: `import type * as AddressFormat from '@midnightntwrk/wallet-sdk-address-format'` gives us `AddressFormat.MidnightBech32m`, `AddressFormat.DustAddress`, etc. for type-checking without emitting a `require()`. We use this pattern in the worker for the address-format and ledger-v8 packages.
-
-For SDK packages with messy or absent types, we fall back to `any` and rely on runtime duck-typing - but per the project's no-duck-typing rule, only after verifying the actual `.d.ts` first. We don't write try/catch chains over guessed method names.
+The Midnight packages are ESM-only; NIGHTGATE is CommonJS. SDK access uses dynamic `import()`: `srv/midnight/sdk-loader.ts` on the main thread, `loadSdk()` / `loadContractsSdk()` / `loadAddressFormat()` in the worker. `import type` is used where the SDK ships clean `.d.ts` (address-format, ledger-v8); otherwise `any`, checked against the actual `.d.ts`.

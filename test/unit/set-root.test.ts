@@ -87,10 +87,10 @@ describe('buildMembershipSet + membershipPathFor', () => {
     });
 
     it('ADVERSARIAL: padding slots hold a real member digest, never a provable constant', () => {
-        // Pre-fix, padding was setLeafHash(blake2b256(<label>)): the label has
-        // a KNOWN preimage, so anchoring the label string as a field value
-        // made it provable as a member of ANY non-full list. Padding must
-        // repeat a real member digest instead.
+        // Padding as setLeafHash(blake2b256(<label>)) would have a KNOWN
+        // preimage: anchoring the label string as a field value would make it
+        // provable as a member of ANY non-full list. Padding must repeat a
+        // real member digest instead.
         const oldPadLabel = 'nightgate/set-root/empty/v1';
         const digests = canonicalSetDigests(VALUES);
         const lastMemberLeaf = Buffer.from(fakePure.setLeafHash(Buffer.from(digests[digests.length - 1], 'hex'))).toString('hex');
@@ -124,7 +124,7 @@ describe('buildMembershipSet + membershipPathFor', () => {
         }
 
         // The padding slot folds to the root ONLY with the repeated member
-        // digest; the old label digest (or any non-member) does not fold.
+        // digest; the label digest (or any non-member) does not fold.
         expect(refold(lastMemberLeaf, siblings, dirs)).toBe(setRoot);
         expect(refold(attackLeaf, siblings, dirs)).not.toBe(setRoot);
         // And the attack value is not treated as a member anywhere.

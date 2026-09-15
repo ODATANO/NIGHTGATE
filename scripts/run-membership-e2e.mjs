@@ -1,4 +1,4 @@
-// Bytes equality + set membership end-to-end (v0.15.0 proveFieldEquality /
+// Bytes equality + set membership end-to-end (proveFieldEquality /
 // proveFieldMembership).
 //
 // Walks: connectWallet → connectWalletForSigning (await prewarm sync) →
@@ -194,8 +194,9 @@ async function waitForServer() {
         metadata: '{"type":"membership-e2e"}', sessionId, contractAddress
     });
     if (r.status >= 400) fail(`anchorDocument → ${r.status}: ${pretty(r.body)}`);
+    const attesterId = r.body.attesterId;
     await pollJob(sessionId, r.body.jobId, 'attest');
-    console.log('OK   payload attested');
+    console.log(`OK   payload attested (attester ${String(attesterId).slice(0, 12)}…)`);
 
     step('6. issueFieldEqualityAttestation (anchors root in-flow, proves chemistry == NMC811)');
     r = await post('/issueFieldEqualityAttestation', {
@@ -214,7 +215,7 @@ async function waitForServer() {
 
     step('7. Crawler-free verifyPredicateState (bytesEquality)');
     const eqVerify = await pollVerify(fn('verifyPredicateState', {
-        contractAddress, payloadHash, fieldKey: chem.fieldKey,
+        contractAddress, attesterId, payloadHash, fieldKey: chem.fieldKey,
         predicate: 'bytesEquality', expectedDigest: chem.valueDigest
     }), 'equality');
     if (eqVerify.proven !== true) fail(`equality: expected proven=true: ${pretty(eqVerify)}`);
@@ -268,12 +269,12 @@ async function waitForServer() {
 
     step('10. Per-claim crawler-free verification (all three kinds)');
     const numVerify = await pollVerify(fn('verifyPredicateState', {
-        contractAddress, payloadHash, fieldKey: capacity.fieldKey,
+        contractAddress, attesterId, payloadHash, fieldKey: capacity.fieldKey,
         predicate: 'greaterOrEqual', threshold: 100000
     }), 'numeric');
     if (numVerify.proven !== true) fail(`numeric: expected proven=true: ${pretty(numVerify)}`);
     const memVerify = await pollVerify(fn('verifyPredicateState', {
-        contractAddress, payloadHash, fieldKey: origin.fieldKey,
+        contractAddress, attesterId, payloadHash, fieldKey: origin.fieldKey,
         predicate: 'setMembership', setRoot
     }), 'membership');
     if (memVerify.proven !== true) fail(`membership: expected proven=true: ${pretty(memVerify)}`);
@@ -322,7 +323,7 @@ async function waitForServer() {
 
     step('13. Atomicity: the fresh TRUE claim of the aborted batch must NOT be on-chain');
     const ghost = await pollVerify(fn('verifyPredicateState', {
-        contractAddress, payloadHash, fieldKey: capacity.fieldKey,
+        contractAddress, attesterId, payloadHash, fieldKey: capacity.fieldKey,
         predicate: 'greaterOrEqual', threshold: 50000
     }), 'ghost-claim', { expectTrue: false });
     if (ghost.verified === true) fail('aborted batch leaked a claim on-chain (atomicity violated)');

@@ -137,8 +137,8 @@ describe('RateLimiter capacity + sweep + destroy', () => {
             expect((limiter as any).hits.size).toBe(2);
             expect((limiter as any).hits.has('b')).toBe(false);
             expect((limiter as any).hits.has('a')).toBe(true);
-            // Refusing new keys instead let one caller with made-up keys lock
-            // every other principal out for a whole window.
+            // Refusing new keys instead would let one caller with made-up keys
+            // lock every other principal out for a whole window.
             for (let i = 0; i < 50; i++) expect(limiter.check(`junk-${i}`).allowed).toBe(true);
             expect((limiter as any).hits.size).toBe(2);
             expect(limiter.check('fresh').allowed).toBe(true);

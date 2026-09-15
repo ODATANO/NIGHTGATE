@@ -1,6 +1,6 @@
 /**
  * Transport auth of the standalone image (`srv/utils/agent-token-auth.ts`):
- * basic auth exactly as before, plus the narrow agent-token lane into the
+ * basic auth for the operator, plus the narrow agent-token lane into the
  * Nightgate service where the grant hook takes over.
  */
 
@@ -9,13 +9,14 @@ import cds from '@sap/cds';
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 const agentTokenAuth = require('../../srv/utils/agent-token-auth');
 const { __resetBasicAuthThrottleForTests, BASIC_AUTH_MAX_FAILURES } = require('../../srv/utils/agent-token-auth');
+import { __resetConfigForTests } from '../../srv/utils/config';
 
 const USERS = { nightgate: { password: 'op-secret' } };
 const basic = (u: string, p: string) => 'Basic ' + Buffer.from(`${u}:${p}`).toString('base64');
 
-function run(headers: Record<string, string>, path = '/api/v1/nightgate/sponsorFinalizedTransaction', ip = '10.0.0.1') {
-    const req: any = { headers, baseUrl: path, originalUrl: path, ip };
-    const res: any = { set: vi.fn(), status: vi.fn().mockReturnThis(), send: vi.fn() };
+function run(headers: Record<string, string>, path = '/api/v1/nightgate/sponsorFinalizedTransaction', ip = '10.0.0.1', method = 'GET') {
+    const req: any = { headers, baseUrl: path, originalUrl: path, ip, method };
+    const res: any = { set: vi.fn(), status: vi.fn().mockReturnThis(), send: vi.fn(), end: vi.fn() };
     const next = vi.fn();
     agentTokenAuth(req, res, next);
     return { req, res, next };
@@ -23,6 +24,8 @@ function run(headers: Record<string, string>, path = '/api/v1/nightgate/sponsorF
 
 beforeEach(() => {
     __resetBasicAuthThrottleForTests();
+    delete process.env.NIGHTGATE_PUBLIC_VERIFY;
+    __resetConfigForTests();
     (cds as any).env.requires = (cds as any).env.requires ?? {};
     (cds as any).env.requires.auth = { impl: 'x', users: USERS };
 });
@@ -36,8 +39,8 @@ describe('agent-token-auth', () => {
     });
 
     test('the operator carries its configured roles, so the admin surface is reachable', () => {
-        // Dropping the roles made user.is('admin') false for the only account
-        // the standard image has, and the whole admin service answered 403.
+        // Without the roles user.is('admin') is false for the only account the
+        // standard image has, and the whole admin service answers 403.
         (cds as any).env.requires.auth = {
             impl: 'x',
             users: { nightgate: { password: 'op-secret', roles: ['admin'] } }
@@ -133,5 +136,46 @@ describe('agent-token-auth', () => {
         // another address is unaffected
         const other = run({ authorization: basic('nightgate', 'op-secret') }, '/api/v1/admin/x', '10.0.0.2');
         expect(other.next).toHaveBeenCalled();
+    });
+
+    test('the public verify lane stays closed while NIGHTGATE_PUBLIC_VERIFY is unset', () => {
+        const VERIFY = "/api/v1/verify/verifyAttestationState(contractAddress='c',payloadHash='p')";
+        const closed = run({}, VERIFY);
+        expect(closed.next).not.toHaveBeenCalled();
+        expect(closed.res.status).toHaveBeenCalledWith(401);
+        expect(closed.res.set).not.toHaveBeenCalledWith('Access-Control-Allow-Origin', '*');
+    });
+
+    test('with the lane enabled an anonymous request passes for the verify path only, under the public marker, with CORS headers', () => {
+        process.env.NIGHTGATE_PUBLIC_VERIFY = 'true';
+        __resetConfigForTests();
+        for (const path of ['/api/v1/verify', "/api/v1/verify/verifyPredicateState(contractAddress='c',payloadHash='p',predicate='setMembership')", '/api/v1/verify?x=1']) {
+            const { req, res, next } = run({}, path);
+            expect(next, path).toHaveBeenCalled();
+            expect(req.user.id).toBe(agentTokenAuth.PUBLIC_VERIFY_TRANSPORT_USER);
+            expect(res.set).toHaveBeenCalledWith('Access-Control-Allow-Origin', '*');
+        }
+        // lookalikes and every other service keep requiring a credential
+        for (const path of ['/api/v1/verifyx/a', '/api/v1/verify-admin', '/api/v1/nightgate/verifyAttestationState()', '/api/v1/admin/x']) {
+            const { res, next } = run({}, path);
+            expect(next, path).not.toHaveBeenCalled();
+            expect(res.status).toHaveBeenCalledWith(401);
+        }
+        // the operator's basic credentials still work on the verify path
+        const op = run({ authorization: basic('nightgate', 'op-secret') }, '/api/v1/verify/x');
+        expect(op.next).toHaveBeenCalled();
+        expect(op.req.user.id).toBe('nightgate');
+    });
+
+    test('the lane answers the CORS preflight itself (a preflight carries no credential)', () => {
+        process.env.NIGHTGATE_PUBLIC_VERIFY = 'true';
+        __resetConfigForTests();
+        const { res, next } = run({ origin: 'https://example.org' }, '/api/v1/verify/verifyAttestationState()', '10.0.0.1', 'OPTIONS');
+        expect(next).not.toHaveBeenCalled();
+        expect(res.status).toHaveBeenCalledWith(204);
+        expect(res.set).toHaveBeenCalledWith('Access-Control-Allow-Methods', 'GET, OPTIONS');
+        // a preflight on any other path is still refused
+        const other = run({}, '/api/v1/nightgate/x', '10.0.0.1', 'OPTIONS');
+        expect(other.res.status).toHaveBeenCalledWith(401);
     });
 });

@@ -1,12 +1,12 @@
-// Live e2e for the 0.19 features: the 32-slot vault variant as a REGISTERED
-// contract (attestation-vault-32, no config override) and the txbuilder's
-// multi-call batch (buildSponsorable({ calls })).
+// Live e2e for the 32-slot vault variant as a REGISTERED contract
+// (attestation-vault-32, no config override) and the txbuilder's multi-call
+// batch (buildSponsorable({ calls })).
 //
 // Walks:
 //   1. server width check: /zk-config/attestation-vault-32 serves the 32er
 //   2. connectWallet + connectWalletForSigning (LACE session = fee sponsor)
 //   3. deployContract('attestation-vault-32') via the SERVER (the registrar
-//      constructor arg now derives from the vault-family name prefix)
+//      constructor arg derives from the vault-family name prefix)
 //   4. prepareDocumentProof via the SERVER action (24 real fields -> 32
 //      slots, depth-5 paths) for documents A and B
 //   5. TXBUILDER BATCH: [attest, anchorContentRoot] per document in ONE
@@ -53,7 +53,7 @@ if (!VK) fail('LACE_VIEWING_KEY env var is required');
 if (!MNEMONIC || !bip39.validateMnemonic(MNEMONIC)) fail('LACE_MNEMONIC (valid BIP39 phrase) is required');
 
 const { connect } = await import(pathToFileURL(path.join(repoRoot, 'src/sdk/client.mjs')).href);
-const { createTxBuilder } = await import(pathToFileURL(path.join(repoRoot, 'src/txbuilder/index.mjs')).href);
+const { createTxBuilder, computeRecordKey } = await import(pathToFileURL(path.join(repoRoot, 'src/txbuilder/index.mjs')).href);
 const { prepareAttest, prepareAnchorContentRoot, prepareProveFieldsDiffer } =
     await import(pathToFileURL(path.join(repoRoot, 'src/browser/index.mjs')).href);
 const artifact = await import(pathToFileURL(path.join(MANAGED, 'contract', 'index.js')).href);
@@ -165,8 +165,8 @@ console.log(`     attester ${b.attesterId.slice(0, 12)}..., proving: ${b.proving
 
 // `build` is a zero-arg async function returning { finalizedTxB64 }. On a
 // 104/170/196 node reject the tx was built against a state the node has
-// moved past; resubmitting the SAME bytes sticks (104 lore), so the retry
-// REBUILDS against fresh contract state before sponsoring again.
+// moved past; resubmitting the SAME bytes sticks, so the retry REBUILDS
+// against fresh contract state before sponsoring again.
 async function sponsorWithRetry(label, build) {
     let built = await build();
     for (let attempt = 1, jobRetries = 0; ; attempt++) {
@@ -212,7 +212,7 @@ for (const [doc, label] of [[A, 'A'], [B, 'B']]) {
     const deadline = Date.now() + READ_TIMEOUT_MS;
     for (;;) {
         const v = await ng.verifyAttestation({
-            contractAddress, payloadHash: doc.payloadHash,
+            contractAddress, attesterId: b.attesterId, payloadHash: doc.payloadHash,
             contentRoot: doc.contentRoot, schemaId: doc.schemaId, compiledArtifactRef: 'attestation-vault-32'
         }).catch(() => null);
         if (v?.attested === true && v?.contentRootOk === true && v?.schemaOk === true) break;
@@ -225,7 +225,7 @@ console.log('OK   both documents attested AND anchored, one batched tx per docum
 step('6. Server-side issueFieldEqualityAttestation on the 32er (depth-5 path)');
 const marker0 = A.fields.find(f => f.field === 'marker_00') || fail('marker_00 missing from prepared fields');
 const eq = await ng.proveFieldEquality({
-    payloadHash: A.payloadHash, fieldKey: marker0.fieldKey,
+    payloadHash: A.payloadHash, attesterId: b.attesterId, fieldKey: marker0.fieldKey,
     expectedValue: docA.marker_00, fieldSalt: marker0.salt,
     siblingsJson: JSON.stringify(marker0.siblings), dirsJson: JSON.stringify(marker0.dirs),
     sessionId, contractAddress, compiledArtifactRef: 'attestation-vault-32'
@@ -239,7 +239,7 @@ await sponsorWithRetry('compare', async () => {
     const compare = await b.buildSponsorable({
         contractAddress,
         call: prepareProveFieldsDiffer({
-            payloadHashA: A.payloadHash, payloadHashB: B.payloadHash, k: CHANGED,
+            recordKeyA: computeRecordKey(b.attesterId, A.payloadHash), recordKeyB: computeRecordKey(b.attesterId, B.payloadHash), k: CHANGED,
             docPair: { schema: A.schema, openingA: A.opening, openingB: B.opening },
             slotWidth: 32
         })
@@ -251,7 +251,7 @@ await sponsorWithRetry('compare', async () => {
     const deadline = Date.now() + READ_TIMEOUT_MS;
     for (;;) {
         const v = await ng.verifyPredicate({
-            contractAddress, payloadHash: A.payloadHash, payloadHashB: B.payloadHash,
+            contractAddress, attesterId: b.attesterId, payloadHash: A.payloadHash, payloadHashB: B.payloadHash,
             predicate: 'documentDiff', k: CHANGED, compiledArtifactRef: 'attestation-vault-32'
         }).catch(() => null);
         if (v?.verified === true) { console.log('OK   diff claim verified crawler-free (width 32)'); break; }
@@ -265,7 +265,7 @@ step('8. 32-bit mask pin: verifyPredicateState integrity with bit 31 set');
     // No such claim exists: the point is that a mask above Int31 passes the
     // OData layer and the width-32 handler bounds, yielding a CLEAN negative.
     const v = await ng.verifyPredicate({
-        contractAddress, payloadHash: A.payloadHash, payloadHashB: B.payloadHash,
+        contractAddress, attesterId: b.attesterId, payloadHash: A.payloadHash, payloadHashB: B.payloadHash,
         predicate: 'documentIntegrity', allowedMask: 0x80000001, compiledArtifactRef: 'attestation-vault-32'
     });
     if (v?.verified !== false) fail(`expected clean verified:false, got ${JSON.stringify(v)}`);

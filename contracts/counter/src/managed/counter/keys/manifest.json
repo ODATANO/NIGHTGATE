@@ -5,5 +5,17 @@
       "sha256": "5b5e8ff644f16d11a90240f1be25011c53df2dde78e6c2edab8d73cfcf06e5a7",
       "bytes": 14071
     }
+  },
+  "verifier": {
+    "increment": {
+      "sha256": "62d768951a97c18af8cb385f8c0fe6488a4dbfbebce83ea08b21914a0ebe7789",
+      "bytes": 1351
+    }
+  },
+  "zkir": {
+    "increment": {
+      "sha256": "833adb07e48001c8298bf203770b4dc2bf141c84e8c3a84d365894fc07c8bb3a",
+      "bytes": 64
+    }
   }
 }

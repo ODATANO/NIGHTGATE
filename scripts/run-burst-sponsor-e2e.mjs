@@ -1,4 +1,4 @@
-// Live lane for parallel sponsoring (0.18): prebuild N UNBOUND attest txs (each
+// Live lane for parallel sponsoring: prebuild N UNBOUND attest txs (each
 // caller proves its OWN circuit locally via the txbuilder SDK), then BURST them
 // concurrently at ONE sponsor wallet and report which backings paid and in which
 // blocks the txs landed. Decouples caller build time from sponsor throughput.

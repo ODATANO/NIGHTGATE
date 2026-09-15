@@ -10,7 +10,6 @@ export default defineConfig({
         alias: [
             // ESM-style relative imports with a `.js` extension (used by the
             // dynamic-import sites in srv/) → strip so the `.ts` source wins.
-            // Mirrors jest's moduleNameMapper '^(\.{1,2}/.*)\.js$' → '$1'.
             { find: /^(\.{1,2}\/.*)\.js$/, replacement: '$1' },
             // cds-typer models; mirrors the tsconfig `#cds-models/*` path.
             {
@@ -24,15 +23,13 @@ export default defineConfig({
         environment: 'node',
         include: ['test/**/*.test.ts'],
         setupFiles: ['test/vitest.setup.ts'],
-        // CAP-bootstrap suites (cds.test()) need headroom; machine-speed
-        // independent, same value the jest config used.
+        // CAP-bootstrap suites (cds.test()) need headroom.
         testTimeout: 60000,
         hookTimeout: 60000,
         // Test files run in parallel fork processes (vitest default): each fork
         // gets its own env, in-memory DB and random ports, so the cds.test()
-        // suites don't collide (~14s wall clock vs ~46s serial). Forks are
-        // killed after the run, which also covers the @midnight-ntwrk ledger
-        // WASM threads that used to require jest's forceExit.
+        // suites don't collide. Forks are killed after the run, which also ends
+        // the @midnight-ntwrk ledger WASM threads.
         coverage: {
             provider: 'v8',
             reportsDirectory: 'coverage',
@@ -41,7 +38,7 @@ export default defineConfig({
             // native require, so their execution is only visible on the .js;
             // the v8 provider remaps it onto the .ts via the build sourcemaps.
             // Without the .js entries every handler exercised through the
-            // booted server counts as uncovered (the numbers drop ~6 points).
+            // booted server counts as uncovered.
             include: ['srv/**/*.ts', 'srv/**/*.js'],
             exclude: ['srv/**/*.d.ts', 'srv/**/index.{ts,js}', 'srv/types/**', 'srv/**/*.js.map']
         }

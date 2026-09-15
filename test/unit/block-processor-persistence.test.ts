@@ -8,12 +8,6 @@
  * tx-results, tx-fees, contract actions, unshielded UTXOs, NightBalances, and
  * the SyncState advance).
  *
- * The old test captured `INSERT.into(...).entries(...)` / `UPDATE` query objects
- * via a hand-rolled vi.mock('@sap/cds') cds.ql mock and asserted their shapes
- * with an `extractRows(queries, 'midnight.X')` helper. That mock is removed; the
- * processor now writes through the framework's real cds.ql into SQLite, and the
- * query-shape assertions are reframed to row-state assertions.
- *
  * External collaborators stay MOCKED:
  *  - MidnightNodeProvider          → per-test inline fake objects (no real RPC)
  */
@@ -37,8 +31,7 @@ const SYNC_STATE = 'midnight.SyncState';
 let db: any;
 
 // ---------------------------------------------------------------------------
-// Block-input builders (reused verbatim from the original suite; only the
-// assertion/persistence layer changes).
+// Block-input builders.
 // ---------------------------------------------------------------------------
 
 function buildUnsignedExtrinsic(palletIndex: number, callIndex: number): string {
@@ -104,8 +97,8 @@ beforeAll(async () => {
     db = await cds.connect.to('db');
 
     // The [test] profile does not configure a pallet map; inject the Zswap entry
-    // (pallet 15) the original test hard-coded in its cds mock so pallet-15
-    // extrinsics classify as shielded_transfer / isShielded. The BlockProcessor
+    // (pallet 15) so pallet-15 extrinsics classify as shielded_transfer /
+    // isShielded. The BlockProcessor
     // reads this in its constructor via getNightgatePluginConfig().
     const env = cds.env as any;
     env.requires = env.requires || {};
@@ -134,7 +127,7 @@ beforeEach(async () => {
 
 describe('BlockProcessor persistence paths', () => {
     // ------------------------------------------------------------------------
-    // init() connects the real db. (Was asserted against a fake cds.connect.)
+    // init() connects the real db.
     // ------------------------------------------------------------------------
     it('initializes the database connection through cds.connect', async () => {
         const processor = new BlockProcessor({} as any);
@@ -380,13 +373,13 @@ describe('BlockProcessor persistence paths', () => {
     });
 
     // ------------------------------------------------------------------------
-    // Signed night transfer → projected into a UTXO + sender/receiver balances.
+    // A signed transfer is NOT projected into a UTXO or sender/receiver balances.
     // ------------------------------------------------------------------------
     it('does not project a transfer, sender or balance from an undecoded extrinsic', async () => {
-        // A signed extrinsic whose call args happen to parse as MultiAddress +
-        // Compact used to become a NIGHT transfer with sender, receiver and
-        // amount, and fed UnshieldedUtxos + NightBalances. The ledger payload
-        // is not decoded, so none of that is written.
+        // The ledger payload is not decoded, so a signed extrinsic whose call
+        // args happen to parse as MultiAddress + Compact must not become a NIGHT
+        // transfer with sender, receiver and amount, nor feed UnshieldedUtxos +
+        // NightBalances.
         const parentId = cds.utils.uuid();
         await db.run(cds.ql.INSERT.into(BLOCKS).entries({
             ID: parentId,

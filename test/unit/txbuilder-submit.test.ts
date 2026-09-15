@@ -46,6 +46,8 @@ describe('txbuilder submit: classifyNodeReject', () => {
         ['1010: Invalid Transaction: Custom error: 224', 'sequencing', 224],
         ['1010: Invalid Transaction: Custom error: 188', 'sequencing', 188],
         ['1010: Invalid Transaction: Custom error: 117', 'malformed', 117],
+        ['1010: Invalid Transaction: Custom error: 104', 'stale-transcript', 104],
+        ['job 7 failed: 1010/104: Transaction refused against the current contract state', 'stale-transcript', 104],
         ['1010: Invalid Transaction: Custom error: 182', 'unknown', 182]
     ])('%s -> %s', async (msg, kind, subCode) => {
         expect(await classify(new Error(msg))).toEqual({ kind, subCode });
@@ -65,6 +67,42 @@ describe('txbuilder submit: classifyNodeReject', () => {
 
     it('anything else is unknown', async () => {
         expect(await classify(new Error('ECONNRESET'))).toEqual({ kind: 'unknown', subCode: null });
+    });
+});
+
+describe('txbuilder submit: rebuildOnStaleTranscript', () => {
+    const refused = () => new Error('1010: Invalid Transaction: Custom error: 104');
+    const noSleep = async () => undefined;
+
+    it('builds again on a 104 and returns the first attempt that lands', async () => {
+        const { rebuildOnStaleTranscript } = await importSubmit();
+        const seen: number[] = [];
+        const retries: number[] = [];
+        const out = await rebuildOnStaleTranscript(async (retry: number) => {
+            seen.push(retry);
+            if (retry < 2) throw refused();
+            return 'landed';
+        }, { sleep: noSleep, onRetry: (n: number) => retries.push(n) });
+        expect(out).toBe('landed');
+        expect(seen).toEqual([0, 1, 2]);
+        expect(retries).toEqual([1, 2]);
+    });
+
+    it('rethrows the last refusal once the retries are used, and never retries other errors', async () => {
+        const { rebuildOnStaleTranscript } = await importSubmit();
+        let calls = 0;
+        await expect(rebuildOnStaleTranscript(async () => { calls++; throw refused(); }, { retries: 1, sleep: noSleep })).rejects.toThrow(/104/);
+        expect(calls).toBe(2);
+        calls = 0;
+        await expect(rebuildOnStaleTranscript(async () => { calls++; throw new Error('1010: Invalid Transaction: Custom error: 170'); }, { sleep: noSleep })).rejects.toThrow(/170/);
+        expect(calls).toBe(1);
+    });
+
+    it('pauses before each rebuild', async () => {
+        const { rebuildOnStaleTranscript } = await importSubmit();
+        const pauses: number[] = [];
+        await rebuildOnStaleTranscript(async (retry: number) => { if (retry === 0) throw refused(); return 1; }, { backoffMs: 1234, sleep: async (ms: number) => { pauses.push(ms); } });
+        expect(pauses).toEqual([1234]);
     });
 });
 
@@ -263,7 +301,7 @@ describe('txbuilder submit: probeLanded confirms by identifier', () => {
     });
 
     it('a block height WITHOUT a transaction result is unknown, never applied', async () => {
-        // A partial GraphQL answer used to read as { status: null, applied: true }.
+        // A partial GraphQL answer must not read as { status: null, applied: true }.
         const { probeLanded } = await importSubmit();
         await expect(probeLanded('id1', {
             indexerHttpUrl: 'http://i',

@@ -1,7 +1,7 @@
 /**
  * srv/monitoring/status.ts: the builders behind BOTH the OData status
- * functions and the plain /health, /ready and /metrics routes, plus the two
- * new reads (getRuntimeInfo, getWorkerStatus).
+ * functions and the plain /health, /ready and /metrics routes, plus
+ * getRuntimeInfo and getWorkerStatus.
  */
 
 const selectOneWhereSpy = vi.hoisted(() => vi.fn());
@@ -185,10 +185,10 @@ describe('buildReadiness', () => {
     });
 
     it('is NOT ready when initialisation failed, even with the crawler disabled', async () => {
-        // The case this exists for: an un-migrated database makes the schema
-        // preflight put NIGHTGATE offline, while a plain SELECT on the old
-        // SyncState table still succeeds. Without the initialisation check the
-        // pod took traffic with submission and sessions never wired up.
+        // An un-migrated database makes the schema preflight put NIGHTGATE
+        // offline, while a plain SELECT on the old SyncState table still
+        // succeeds. Without the initialisation check the process would take
+        // traffic with submission and sessions never wired up.
         mockRuntimeConfig.mockReturnValue({ crawlerConfig: { enabled: false } });
         mockGetStatus.mockReturnValue({
             initialized: false,
@@ -294,6 +294,16 @@ describe('buildMetricsText', () => {
         expect(text).toContain('odatano_nightgate_wallet_worker_inflight_rpcs 3');
         expect(text).toContain('odatano_nightgate_wallet_worker_exits 2');
         expect(text).toContain('odatano_nightgate_wallet_worker_rotations 0');
+    });
+
+    it('reports the database connection pool, so a pool that runs dry is visible', async () => {
+        const pooled = Object.assign(Object.create(db), { pools: { t0: { size: 20, available: 0, borrowed: 20, pending: 5 } } });
+        const text = await buildMetricsText(pooled);
+        expect(text).toContain('odatano_nightgate_db_pool_size 20');
+        expect(text).toContain('odatano_nightgate_db_pool_available 0');
+        expect(text).toContain('odatano_nightgate_db_pool_borrowed 20');
+        expect(text).toContain('odatano_nightgate_db_pool_pending 5');
+        expect(await buildMetricsText(db)).not.toContain('db_pool_');
     });
 
     it('still answers when the jobs table is unreadable during a schema rollout', async () => {
@@ -415,8 +425,8 @@ describe('buildWorkerStatus', () => {
     it('counts a resident facade that never reported progress', () => {
         // The worker only pushes a progress snapshot while a sync WAIT runs, so
         // a facade restored from persisted state at the tip reports none at
-        // all. Counting snapshots showed `facadeCount: 0` for a sponsor pool
-        // that was warm and sponsoring (live on the hosted box).
+        // all. Counting snapshots alone would report `facadeCount: 0` for a
+        // warm, sponsoring pool.
         mockWorkerStatus.mockReturnValue({ ...WORKER, facades: [] });
         mockListFacades.mockReturnValue(['acct-restored']);
         try {

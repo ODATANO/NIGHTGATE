@@ -21,9 +21,6 @@ using {
     DisclosureRole
 } from './types.cds';
 
-/**
- * Represents a block in the Midnight blockchain
- */
 @assert.unique.hash: [hash]
 entity Blocks : cuid, managed {
     hash             : HexEncoded not null;
@@ -33,17 +30,12 @@ entity Blocks : cuid, managed {
     author           : HexEncoded;
     ledgerParameters : HexEncoded not null;
 
-    // Associations
     parent           : Association to Blocks;
     transactions     : Composition of many Transactions
                            on transactions.block = $self;
 }
 
-/**
- * Represents a transaction in the Midnight blockchain
- */
-// The extrinsic hash is not globally unique: identical encoded extrinsics can
-// occur in different blocks. Its canonical position inside a block is unique.
+// The extrinsic hash is not unique across blocks; the in-block position is.
 @assert.unique.blockPosition: [
     block,
     transactionId
@@ -52,29 +44,28 @@ entity Transactions : cuid, managed {
     transactionId            : Integer not null; // index within block
     hash                     : HexEncoded not null;
     protocolVersion          : Integer not null;
-    raw                      : LargeBinary; // hex-encoded serialized content
+    raw                      : LargeBinary; // serialized transaction
     transactionType          : TransactionType not null;
 
-    // regular transaction specific fields
+    // regular transactions only
     merkleTreeRoot           : HexEncoded;
     startIndex               : Integer64; // zswap state start index
     endIndex                 : Integer64; // zswap state end index
     identifiers              : LargeString; // JSON array of HexEncoded identifiers
 
-    // classification fields
+    // crawler classification
     txType                   : TxType;
     isShielded               : Boolean default false;
-    senderAddress            : String(256); // For unshielded TXs
-    receiverAddress          : String(256); // For unshielded TXs
-    nightAmount              : BigInt; // NIGHT amount transferred
-    dustConsumed             : BigInt; // DUST consumed in fees
+    senderAddress            : String(256); // unshielded txs only
+    receiverAddress          : String(256); // unshielded txs only
+    nightAmount              : BigInt;
+    dustConsumed             : BigInt; // fees
     hasProof                 : Boolean default false;
     proofHash                : HexEncoded;
-    contractAddress          : HexEncoded; // Contract address if contract TX
-    circuitName              : String(100); // Entry point / circuit name for contract calls
-    size                     : Integer; // TX size in bytes
+    contractAddress          : HexEncoded;
+    circuitName              : String(100); // contract calls only
+    size                     : Integer; // bytes
 
-    // tx associations
     block                    : Association to Blocks not null;
     transactionResult        : Composition of one TransactionResults
                                    on transactionResult.transaction = $self;
@@ -92,208 +83,162 @@ entity Transactions : cuid, managed {
                                    on dustLedgerEvents.transaction = $self;
 }
 
-/**
- * Transaction execution result
- */
 entity TransactionResults : cuid {
     status        : TransactionResultStatus not null;
-    outcomeSource : String(40); // substrate-system-events; null marks legacy/unverified rows
+    outcomeSource : String(40); // 'substrate-system-events'; null = unverified
     transaction   : Association to Transactions;
     segments      : Composition of many TransactionSegments
                         on segments.transactionResult = $self;
 }
 
-/**
- * Segment of a transaction result (for partial success)
- */
+/** Per-segment outcome (partial success). */
 entity TransactionSegments : cuid {
     segmentId         : Integer not null;
     success           : Boolean not null;
     transactionResult : Association to TransactionResults;
 }
 
-/**
- * Transaction fee information
- */
 entity TransactionFees : cuid {
-    paidFees      : BigInt not null; // actual fees in DUST
-    estimatedFees : BigInt not null; // estimated fees in DUST
+    paidFees      : BigInt not null; // DUST
+    estimatedFees : BigInt not null; // DUST
     transaction   : Association to Transactions;
 }
 
-/**
- * Contract actions (Deploy, Call, Update)
- */
 entity ContractActions : cuid, managed {
     address            : HexEncoded; // null until the ledger payload is decoded
     state              : LargeBinary; // null until the ledger payload is decoded
-    zswapState         : LargeBinary; // contract-specific zswap state
+    zswapState         : LargeBinary;
     actionType         : ContractActionType not null;
-    entryPoint         : String(256); // only for CALL actions
+    entryPoint         : String(256); // CALL only
 
-    // Associations
     transaction        : Association to Transactions not null;
-    deploy             : Association to ContractActions; // for CALL actions, reference to deployment
+    deploy             : Association to ContractActions; // CALL only: the deployment
     unshieldedBalances : Composition of many ContractBalances
                              on unshieldedBalances.contractAction = $self;
 }
 
-/**
- * Token balances for contracts
- */
 entity ContractBalances : cuid {
     tokenType      : HexEncoded not null;
-    amount         : BigInt not null; // balance as string (u128)
+    amount         : BigInt not null; // u128
     contractAction : Association to ContractActions;
 }
 
-/**
- * Unshielded Unspent Transaction Outputs
- */
 @assert.unique.createdOutput: [
     createdAtTransaction,
     outputIndex
 ]
 entity UnshieldedUtxos : cuid, managed {
-    owner                       : UnshieldedAddr not null; // Bech32m-encoded
+    owner                       : UnshieldedAddr not null;
     tokenType                   : HexEncoded not null;
-    value                       : BigInt not null; // UTXO quantity (u128)
+    value                       : BigInt not null; // u128
     intentHash                  : HexEncoded not null;
     outputIndex                 : Integer not null;
-    ctime                       : Integer; // creation timestamp (seconds)
+    ctime                       : Integer; // creation time, UNIX seconds
     initialNonce                : HexEncoded not null; // for DUST tracking
     registeredForDustGeneration : Boolean default false;
 
-    // Associations
     createdAtTransaction        : Association to Transactions not null;
     spentAtTransaction          : Association to Transactions;
 }
 
-/**
- * Zswap Ledger Events
- */
 entity ZswapLedgerEvents : cuid {
     eventId     : Integer not null;
-    raw         : LargeBinary; // hex-encoded serialized event
+    raw         : LargeBinary; // serialized event
     maxId       : Integer not null;
     transaction : Association to Transactions not null;
 }
 
-/**
- * DUST Ledger Events
- */
 entity DustLedgerEvents : cuid {
     eventId         : Integer not null;
-    raw             : LargeBinary; // hex-encoded serialized event
+    raw             : LargeBinary; // serialized event
     maxId           : Integer not null;
     eventType       : DustLedgerEventType not null;
-
-    // For INITIAL_UTXO events
-    dustOutputNonce : HexEncoded; // 32-byte nonce
+    dustOutputNonce : HexEncoded; // 32 bytes; INITIAL_UTXO only
 
     transaction     : Association to Transactions not null;
 }
 
-/**
- * Wallet sessions for authenticated access.
- */
 @assert.unique.sessionId: [sessionId]
 entity WalletSessions : cuid, managed {
-    userId              : String(200); // owning principal (req.user.id); all session actions are gated on this
+    userId              : String(200); // owning principal (req.user.id); gates all session actions
     label               : String(100);
-    viewingKeyHash      : String(64); // SHA-256 of viewing key (for lookup/dedup)
-    encryptedViewingKey : LargeString; // AES-256-GCM encrypted viewing key
-    encryptedSeedKey    : LargeString; // optional: AES-256-GCM encrypted seed/signing key
-    accountIndex        : Integer; // BIP32 account level the seed signs with; set by connectWalletForSigning (null = 0)
+    viewingKeyHash      : String(64); // SHA-256, for lookup/dedup
+    encryptedViewingKey : LargeString; // AES-256-GCM
+    encryptedSeedKey    : LargeString; // AES-256-GCM; null for viewing-only sessions
+    accountIndex        : Integer; // BIP32 account the seed signs with; null = 0
     sessionId           : UUID not null;
     connectedAt         : Timestamp not null;
     disconnectedAt      : Timestamp;
-    expiresAt           : Timestamp; // Session TTL
+    expiresAt           : Timestamp;
     isActive            : Boolean default true;
 }
 
 /**
- * Agent grants: scoped, revocable, budgeted machine capabilities derived from
- * a wallet session (agent-access-layer, model A). The bearer token is returned
- * ONCE at creation and only its SHA-256 lands here, mirroring viewingKeyHash.
- * On-chain authority stays the session wallet; a grant only RESTRICTS what a
- * token-authenticated request may do (action allowlist, daily job budget,
- * fixed sponsor binding). Enforcement lives in srv/sessions/agent-grants.ts.
+ * Scoped, revocable, budgeted bearer token over one wallet session. Only the
+ * token's SHA-256 is stored. A grant only restricts the session's authority.
  */
 @assert.unique.tokenHash: [tokenHash]
 entity AgentGrants : cuid, managed {
-    userId            : String(200) not null; // operator (owning principal); becomes the effective req.user for token requests
-    agentLabel        : String(100); // human-readable agent name, informational
-    sessionId         : UUID not null; // the wallet session all grant requests are bound to
-    tokenHash         : String(64) not null; // SHA-256 of the bearer token (token itself is never stored)
-    allowedActions    : LargeString not null; // JSON array of allow-listed write-action names
-    maxJobsPerDay     : Integer; // null = unlimited; counts allowlisted write actions per UTC day
-    jobsUsedToday     : Integer default 0; // consumed budget inside budgetWindow
-    budgetWindow      : String(10); // UTC day 'YYYY-MM-DD' the counter belongs to
-    sponsorSessionId  : UUID; // fixed fee-sponsor binding; requests may not override it
-    allowedContracts  : LargeString; // JSON array; sponsored calls run under floor ∩ grant; null = platform floor
+    userId            : String(200) not null; // operator; the effective req.user for token requests
+    agentLabel        : String(100);
+    sessionId         : UUID not null; // session every token request is bound to
+    tokenHash         : String(64) not null; // SHA-256 of the bearer token
+    allowedActions    : LargeString not null; // JSON array of write-action names
+    maxJobsPerDay     : Integer; // null = unlimited; per UTC day
+    jobsUsedToday     : Integer default 0; // within budgetWindow
+    budgetWindow      : String(10); // UTC day 'YYYY-MM-DD'
+    sponsorSessionId  : UUID; // fixed fee sponsor; requests cannot override it
+    allowedContracts  : LargeString; // JSON array; effective = floor ∩ grant; null = platform floor
     allowedCircuits   : LargeString; // JSON array, same rule
-    allowDeploy       : Boolean default false; // the sponsor also pays for a contract deploy built by the caller
-    maxDeploys        : Integer; // lifetime deploy budget, separate from maxJobsPerDay; default 1 when allowDeploy
-    deploysUsed       : Integer default 0; // reserved before broadcast; released only for a rejected tx
-    deployedContracts : LargeString; // JSON array of addresses deployed under this grant; sponsorable on top of floor ∩ grant
-    allowedTokenTypes : LargeString; // JSON array of raw shielded token types whose zswap offers the sponsor pays for; null = platform floor
+    allowDeploy       : Boolean default false; // sponsor may pay for a caller-built deploy
+    maxDeploys        : Integer; // lifetime deploy budget; default 1 when allowDeploy
+    deploysUsed       : Integer default 0; // reserved before broadcast; refunded only on rejection
+    deployedContracts : LargeString; // JSON array of addresses deployed under this grant; sponsorable beyond floor ∩ grant
+    allowedTokenTypes : LargeString; // JSON array of raw shielded token types the sponsor pays offers for; null = platform floor
     validUntil        : Timestamp; // null = no expiry
     isActive          : Boolean default true;
     revokedAt         : Timestamp;
 }
 
 /**
- * Contracts registered at runtime through the admin service (0.21.0), on top
- * of the config floor. Loaded into the registry at boot after the config; a
- * row never shadows a config name. Paths are absolute, inside
- * NIGHTGATE_CONTRACTS_DIR, validated when the row was written.
+ * Runtime contract registrations on top of the config floor; never shadow a
+ * config name. Absolute paths inside NIGHTGATE_CONTRACTS_DIR.
  */
 entity ContractRegistrations : managed {
     key name           : String(100);
-        artifactPath   : String(1000) not null; // Compact-emitted JS module, absolute
-        zkConfigPath   : String(1000) not null; // directory holding keys/ and zkir/, absolute
+        artifactPath   : String(1000) not null; // Compact-emitted JS module
+        zkConfigPath   : String(1000) not null; // holds keys/ and zkir/
         privateStateId : String(200) not null;
-        slotWidth      : Integer; // vault-family content-tree width; null = 16
-        networkId      : String(30); // network of the registering process, informational
+        slotWidth      : Integer; // content-tree width; null = 16
+        networkId      : String(30); // informational
         registeredBy   : String(200); // admin principal
 }
 
-/**
- * Indexer sync status, singleton table tracking crawler progress
- */
+/** Crawler progress, single row. */
 entity SyncState {
     key ID                  : String(10) default 'SINGLETON';
         networkId           : String(30);
 
-        // Sync position
         lastIndexedHeight   : Integer64 default 0;
         lastIndexedHash     : HexEncoded;
         lastIndexedAt       : Timestamp;
 
-        // Finality tracking
         lastFinalizedHeight : Integer64 default 0;
         lastFinalizedHash   : HexEncoded;
 
-        // Node info
         nodeUrl             : String(200);
         chainHeight         : Integer64 default 0;
 
-        // Status
         syncStatus          : SyncStatus default 'stopped';
         reorgGeneration     : Integer64 default 0;
         syncProgress        : Decimal(5, 2) default 0;
         blocksPerSecond     : Decimal(10, 2) default 0;
 
-        // Errors
         lastError           : String(500);
         lastErrorAt         : Timestamp;
         consecutiveErrors   : Integer default 0;
 }
 
-/**
- * Reorg history, tracks blockchain reorganizations detected by the crawler
- */
 entity ReorgLog : cuid, managed {
     detectedAt       : Timestamp not null;
     forkHeight       : Integer64 not null;
@@ -304,30 +249,25 @@ entity ReorgLog : cuid, managed {
     status           : String(20); // 'completed', 'failed'
 }
 
-/**
- * Tracks transactions submitted through NIGHTGATE's submission path
- */
+/** Transactions submitted through this server. */
 entity PendingSubmissions : cuid, managed {
-    txHash           : HexEncoded; // null until SDK returns
-    contractAddress  : HexEncoded; // null for deploys until SDK returns
+    txHash           : HexEncoded; // null until the SDK returns
+    contractAddress  : HexEncoded; // deploys: null until the SDK returns
     circuitName      : String(100); // null for deploys
-    actionType       : ContractActionType not null; // DEPLOY | CALL | UPDATE
+    actionType       : ContractActionType not null;
     submittedAt      : Timestamp not null;
     status           : PendingSubmissionStatus default 'pending';
     finalizedAt      : Timestamp;
     finalizedTxData  : LargeString; // JSON snapshot of the confirmed inclusion
     chainBlockHeight : Integer;
     chainBlockHash   : HexEncoded;
-    indexerTxHash    : HexEncoded; // the indexer's transaction hash, distinct from txHash (ledger identifier)
+    indexerTxHash    : HexEncoded; // indexer's hash, distinct from txHash (ledger identifier)
     submitIntentData : LargeString;
     errorCode        : String(50); // e.g. '1016', 'TIMEOUT', 'TxFailed'
     errorMessage     : String(500);
-    sessionId        : UUID; // links to WalletSessions for audit
+    sessionId        : UUID;
 }
 
-/**
- * Backgroundjobs for diffrent purposes
- */
 @assert.unique.idempotency: [
     sessionId,
     kind,
@@ -335,57 +275,51 @@ entity PendingSubmissions : cuid, managed {
 ]
 entity BackgroundJobs : cuid, managed {
     kind                : BackgroundJobKind not null;
-    sessionId           : String(64); // owner scope; matches WalletSessions.sessionId
+    sessionId           : String(64); // owner scope
     status              : BackgroundJobStatus default 'pending';
     idempotencyKey      : String(128); // optional, unique per (sessionId, kind)
-    request             : LargeString; // JSON of inbound args (secrets redacted)
-    payloadFingerprint  : String(64); // SHA-256 of kind/session/request; rejects idempotency-key drift
-    commandVersion      : Integer; // non-null only for commands reconstructable after restart
-    command             : LargeString; // versioned executable payload; never contains wallet seed material
+    request             : LargeString; // JSON args, secrets redacted
+    payloadFingerprint  : String(64); // SHA-256 of kind/session/request; rejects key reuse with a different payload
+    commandVersion      : Integer; // set only for commands replayable after restart
+    command             : LargeString; // executable payload; never holds seed material
     commandEncoding     : String(20); // json-v1 | aes-gcm-v1
-    requestedBy         : String(200); // authenticated principal captured at command admission
-    parentJobId         : UUID; // internal workflow parent; null for public/root jobs
-    workflowStep        : String(64); // deterministic child step name
-    result              : LargeString; // JSON of return value on success
-    errorCode           : String(64); // classified code on failure
-    errorMessage        : LargeString; // user-facing failure message
-    startedAt           : Timestamp; // when the spawn picked it up
-    queuedAt            : Timestamp; // explicit queue admission timestamp
-    externalExecutionAt : Timestamp; // entered a combined proof/broadcast SDK call
-    submittedAt         : Timestamp; // txHash became available
-    finishedAt          : Timestamp; // when it transitioned to succeeded/failed
+    requestedBy         : String(200); // principal at admission
+    grantId             : UUID; // agent grant, inherited by child jobs; null otherwise
+    parentJobId         : UUID; // null for root jobs
+    workflowStep        : String(64); // child step name
+    result              : LargeString; // JSON return value
+    errorCode           : String(64);
+    errorMessage        : LargeString; // user-facing
+    startedAt           : Timestamp;
+    queuedAt            : Timestamp;
+    externalExecutionAt : Timestamp; // entered a proof/broadcast SDK call
+    submittedAt         : Timestamp; // txHash known
+    finishedAt          : Timestamp;
     attempt             : Integer default 0;
     maxAttempts         : Integer default 1; // on-chain work is never retried blindly
     leaseOwner          : String(200);
     leaseExpiresAt      : Timestamp;
     heartbeatAt         : Timestamp;
-    submissionId        : UUID; // PendingSubmissions.ID once known
-    txHash              : HexEncoded; // external transaction id once known
-    chainStatus         : String(20); // pending | success | failure; null = no chain outcome yet/not applicable
-    chainFinalizedAt    : Timestamp; // when the indexer confirmed the outcome
-    // Inclusion coordinates from the indexer confirmer (0.23.0); a reorg
-    // rollback reverts by chainBlockHeight. Null until confirmed.
+    submissionId        : UUID; // PendingSubmissions.ID
+    txHash              : HexEncoded;
+    chainStatus         : String(20); // pending | success | failure; null = none yet or n/a
+    chainFinalizedAt    : Timestamp;
+    // Inclusion coordinates, null until confirmed; reorg rollback reverts by height.
     chainBlockHeight    : Integer;
     chainBlockHash      : HexEncoded;
     indexerTxHash       : HexEncoded;
 }
 
-/**
- * Encrypted private states held on behalf of authenticated wallet sessions.
- */
 entity PrivateStates {
     key accountId       : String(200);
     key contractAddress : String(200);
     key privateStateId  : String(200);
         ciphertext      : LargeString not null;
-        keyScheme       : String(16); // 'dek1' = under the account DEK; null = legacy derivation (viewing key, ring + viewing key)
+        keyScheme       : String(16); // 'dek1' = under the account DEK; null = legacy viewing-key derivation
         createdAt       : Timestamp;
         updatedAt       : Timestamp;
 }
 
-/**
- * Encrypted contract signing keys, scoped per (accountId, contractAddress)
- */
 entity ContractSigningKeys {
     key accountId       : String(200);
     key contractAddress : String(200);
@@ -396,30 +330,25 @@ entity ContractSigningKeys {
 }
 
 /**
- * Per-account data-encryption key. Private states, signing keys and the
- * sync-state blobs are encrypted under passwords derived from this DEK. The
- * DEK is sealed twice: under the ring's active key (rewrappable by the
- * operator without the viewing key) and under the viewing-key-derived
- * storage password (a session that presents the viewing key opens it even
- * after the ring rotated).
+ * Per-account data-encryption key for private states, signing keys and sync
+ * blobs. Sealed twice: under the key ring (operator can rewrap) and under the
+ * viewing-key storage password (opens after a ring rotation).
  */
 entity AccountKeys {
     key accountId              : String(200);
-        wrappedDek             : LargeString not null; // v2 envelope under the ring (key id in the prefix)
+        wrappedDek             : LargeString not null; // under the ring; key id in the prefix
         wrappedDekByViewingKey : LargeString not null; // AES-GCM under HKDF(storage password)
         createdAt              : Timestamp;
         rotatedAt              : Timestamp;
 }
 
-/**
- * Persisted wallet sub-state, one row per session (accountId)
- */
+/** Persisted wallet sub-states, one row per account. */
 entity WalletSyncStates {
     key accountId           : String(200);
         shieldedStateBlob   : LargeString;
         unshieldedStateBlob : LargeString;
         dustStateBlob       : LargeString;
-        keyScheme           : String(16); // 'dek1' = blobs under the account DEK; null = legacy derivation
+        keyScheme           : String(16); // see PrivateStates.keyScheme
         sdkVersion          : String(64) not null;
         networkId           : String(32);
         seedFingerprint     : String(64);
@@ -427,22 +356,16 @@ entity WalletSyncStates {
         updatedAt           : Timestamp;
 }
 
-/**
- * Attestations recorded on-chain via the AttestationVault Compact contract
- */
 entity Attestations : cuid, managed {
-    attestationId   : HexEncoded not null; // payload_hash (blake2b-256)
-    contractAddress : HexEncoded not null; // AttestationVault deployment
+    attestationId   : HexEncoded not null; // payload hash (blake2b-256)
+    contractAddress : HexEncoded not null; // vault deployment
     attester        : HexEncoded not null; // attester pubkey
     publicMetadata  : LargeString; // JSON
-    payloadCipher   : LargeBinary; // optional off-chain encrypted payload
+    payloadCipher   : LargeBinary; // optional encrypted off-chain payload
     anchoredTxHash  : HexEncoded;
     anchoredAt      : Timestamp;
 }
 
-/**
- * Document anchoring
- */
 entity Documents : cuid, managed {
     sha256              : HexEncoded not null;
     contentType         : String(100);
@@ -450,127 +373,101 @@ entity Documents : cuid, managed {
     storageRef          : String(500); // file:// | s3:// | ipfs://
     anchoredTxHash      : HexEncoded;
     anchoredAt          : Timestamp;
-    // Evidence binding (0.16.0): the anchoring context is part of the
-    // evidence, so verifyDocument can never be pointed at a DIFFERENT vault
-    // that happens to attest the same hash. Rows from earlier releases carry
-    // nulls; for those the caller-supplied contractAddress applies.
+    // Recorded anchoring context; verifyDocument checks against it, and only
+    // rows without it take the caller's contractAddress.
     userId              : String(200); // req.user.id at anchor time; scopes reads
-    contractAddress     : HexEncoded; // AttestationVault the anchor was submitted to
-    network             : String(30); // network id at anchor time
-    compiledArtifactRef : String(200); // registered artifact ALIAS the anchor used
-    artifactDigest      : HexEncoded; // sha256 of the artifact GENERATION (alias is mutable)
-    // The wallet session that anchored the row. An agent token is bound to
-    // ONE session and reads only that session's rows; rows from releases
-    // before this column carry null and stay owner-readable, never token-
-    // readable.
-    sessionId           : UUID;
+    contractAddress     : HexEncoded; // vault the anchor was submitted to
+    network             : String(30);
+    compiledArtifactRef : String(200); // artifact alias (mutable)
+    artifactDigest      : HexEncoded; // sha256 of the artifact generation
+    sessionId           : UUID; // agent tokens read only their session's rows; null = owner-only
+    attesterId          : HexEncoded; // with sha256 names the on-chain record
 }
 
-/**
- * ZK predicate attestations
- */
 entity PredicateAttestations : cuid, managed {
-    payloadHash         : HexEncoded not null; // attestation this predicate is about
-    contractAddress     : HexEncoded not null; // AttestationVault deployment
+    payloadHash         : HexEncoded not null;
+    attesterId          : HexEncoded; // attester whose record of payloadHash the claim is bound to
+    contractAddress     : HexEncoded not null; // vault deployment
     predicate           : String(20) not null; // 'lessOrEqual' | 'greaterOrEqual' | 'bytesEquality' | 'setMembership' | 'documentIntegrity' | 'documentDiff'
-    op                  : Integer; // 0 | 1 for the numeric predicates; null for the bytes kinds
-    threshold           : Integer64; // scaled integer (numeric predicates); minimum differing slots k (documentDiff)
-    unit                : String(50); // e.g. 'kgCO2e/kWh' (informational)
-    fieldKey            : HexEncoded; // set for field-bound proofs (proveFieldPredicate); null for plain provePredicate
-    expectedDigest      : HexEncoded; // bytesEquality: public expected value digest
-    setRoot             : HexEncoded; // setMembership: canonical allow-list set root
-    payloadHashB        : HexEncoded; // cross-root kinds: the second document (payloadHash is document A)
-    allowedMask         : Integer64; // documentIntegrity: packed slot mask, width bits (bit i = slot i may differ); Integer64 because a 32-bit mask with bit 31 set overflows a signed Int32 column
-    provenTxHash        : HexEncoded; // tx that recorded the on-chain result
+    op                  : Integer; // 0 | 1 for numeric predicates; null otherwise
+    threshold           : Integer64; // numeric: scaled integer; documentDiff: minimum differing slots k
+    unit                : String(50); // informational, e.g. 'kgCO2e/kWh'
+    fieldKey            : HexEncoded; // field-bound proofs only
+    expectedDigest      : HexEncoded; // bytesEquality
+    setRoot             : HexEncoded; // setMembership: canonical set root
+    payloadHashB        : HexEncoded; // cross-root kinds: document B (payloadHash is A)
+    attesterIdB         : HexEncoded; // cross-root kinds: document B's attester
+    allowedMask         : Integer64; // documentIntegrity: bit i = slot i may differ; 64-bit so bit 31 fits
+    provenTxHash        : HexEncoded;
     provenAt            : Timestamp;
-    network             : String(30); // network id at proving time
-    compiledArtifactRef : String(200); // registered artifact ALIAS the proof used
-    artifactDigest      : HexEncoded; // sha256 of the artifact GENERATION (alias is mutable)
+    network             : String(30);
+    compiledArtifactRef : String(200); // artifact alias (mutable)
+    artifactDigest      : HexEncoded; // sha256 of the artifact generation
 }
 
-/**
- * Disclosure role grants for tiered access
- */
 entity DisclosureRoles : cuid, managed {
-    userId     : String(200) not null; // matches req.user.id from CAP auth
+    userId     : String(200) not null; // req.user.id
     role       : DisclosureRole not null;
-    scope      : String(500); // optional: contract addr or attestation id
+    scope      : String(500); // optional contract address or attestation id
     grantedBy  : String(200);
     validFrom  : Timestamp;
     validUntil : Timestamp;
 }
 
 /**
- * On-chain disclosure grants read off the AttestationVault `disclosures`
- * ledger Map. Distinct from DisclosureRoles (off-chain, operator-configured):
- * these are CHAIN-DERIVED entitlement records; the contract is the ACL.
- *
- * Rows are inserted optimistically (active=false) by `grantDisclosure` and
- * confirmed/flipped by the chain indexer once the grant appears in
- * ledger state. Logical key for cross-contract reuse:
- * (contractAddress, payloadHash, grantee). `level`: 0=public,
- * 1=legitimate-interest, 2=authority.
+ * Chain-derived disclosure grants from the vault `disclosures` map (the
+ * contract is the ACL). Inserted inactive by `grantDisclosure`, activated
+ * once the grant appears in ledger state.
  */
 @assert.unique.logicalGrant: [
     contractAddress,
+    attesterId,
     payloadHash,
     grantee
 ]
 entity DisclosureGrants : cuid, managed {
-    payloadHash     : HexEncoded not null; // attestation the grant is scoped to
-    grantee         : HexEncoded not null; // Bytes<32> grantee identifier
-    level           : Integer not null; // 0 | 1 | 2, as confirmed on-chain
-    // Level requested for an existing row while its chain confirmation is
-    // pending. Never read by the disclosure-role ACL; the finalizer moves it
-    // into `level` on inclusion and drops it when the chain refuses.
-    pendingLevel    : Integer;
-    contractAddress : HexEncoded not null; // AttestationVault deployment
-    grantedTxHash   : HexEncoded; // tx that set this grant on-chain
-    revokedTxHash   : HexEncoded; // set when revoked on-chain
-    active          : Boolean default false; // granted and not revoked (chain-confirmed)
+    payloadHash     : HexEncoded not null;
+    attesterId      : HexEncoded; // attester whose record of payloadHash carries the grant
+    grantee         : HexEncoded not null; // Bytes<32> grantee id
+    level           : Integer not null; // 0 public | 1 legitimate interest | 2 authority; chain-confirmed
+    pendingLevel    : Integer; // requested level awaiting confirmation; never used for access
+    contractAddress : HexEncoded not null; // vault deployment
+    grantedTxHash   : HexEncoded;
+    revokedTxHash   : HexEncoded;
+    active          : Boolean default false; // chain-confirmed granted and not revoked
+    changedAtHeight : Integer64; // height of the last applied change; older snapshots never overwrite
 }
 
 /**
- * Binds an authenticated principal (req.user.id) to the `Bytes<32>` grantee id
- * the AttestationVault circuit checks, so the read gate can resolve
- * principal → granteeId and match an on-chain DisclosureGrant.
- * `bindingKind` records how the id was derived
- * ('wallet' | 'did' | 'custom'); see srv/submission/grantee-identity.ts.
- * Resolution mirrors DisclosureRoles scope precedence: a scoped row wins,
- * else a global (null/empty scope) row applies.
+ * Maps a principal to the Bytes<32> grantee id the vault checks, to match
+ * on-chain DisclosureGrants. A scoped row wins over a global one.
  */
 entity GranteeIdentities : cuid, managed {
-    userId      : String(200) not null; // matches req.user.id from CAP auth
-    granteeId   : HexEncoded not null; // Bytes<32> grantee id (64 hex)
+    userId      : String(200) not null; // req.user.id
+    granteeId   : HexEncoded not null; // 64 hex
     bindingKind : String(20) not null; // 'wallet' | 'did' | 'custom'
-    scope       : String(500); // optional: contract addr / attestation id
+    scope       : String(500); // optional contract address or attestation id; null = global
 }
 
-/**
- * Unshielded NIGHT token balances per address
- */
+/** Unshielded NIGHT balance per address. */
 entity NightBalances {
     key address            : String(256);
         balance            : Decimal(20, 0) default 0;
         utxoCount          : Integer default 0;
 
-        // Activity tracking
         firstSeenHeight    : Integer64;
         firstSeenAt        : Timestamp;
         lastActivityHeight : Integer64;
         lastActivityAt     : Timestamp;
 
-        // TX statistics
         txSentCount        : Integer default 0;
         txReceivedCount    : Integer default 0;
         totalSent          : Decimal(20, 0) default 0;
         totalReceived      : Decimal(20, 0) default 0;
 
-        // DUST linkage
         dustAddress        : DustAddr;
         isDustRegistered   : Boolean default false;
 
-        // Indexer metadata
         lastUpdatedHeight  : Integer64;
         lastUpdatedAt      : Timestamp;
 }

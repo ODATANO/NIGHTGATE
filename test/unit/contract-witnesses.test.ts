@@ -167,7 +167,7 @@ describe('buildAttestationVaultWitnesses: batch proof holder (per-call rebinding
         })).toThrow(/mutually exclusive/);
     });
 
-    test('static merkleProof path is unchanged by the holder feature', () => {
+    test('a static merkleProof serves the witnesses without a holder', () => {
         const w = buildAttestationVaultWitnesses({ attestationSecret: secret, merkleProof: proofA });
         expect(w.field_value({ privateState: null })[1]).toBe(100n);
         expect(() => buildAttestationVaultWitnesses({ attestationSecret: secret }).field_value({ privateState: null }))
@@ -243,7 +243,7 @@ describe('buildAttestationVaultWitnesses: bytes proof witnesses (proveFieldEqual
     });
 });
 
-describe('buildAttestationVaultWitnesses: cross-root docPair witnesses (proveDocumentComparison, v4)', () => {
+describe('buildAttestationVaultWitnesses: cross-root docPair witnesses (proveDocumentComparison)', () => {
     const secret = new Uint8Array(32).fill(0xab);
     const SCHEMA = [
         { fieldKey: 'a1'.repeat(32), kind: 0, scale: '1000' },

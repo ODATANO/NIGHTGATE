@@ -59,7 +59,7 @@ const FILES = [
     { path: 'srv/midnight/runtime-config.d.ts', buildOutput: true },
     { path: 'srv/midnight/wasm-proof-provider.js', buildOutput: true },
     { path: 'srv/midnight/wasm-proof-provider.d.ts', buildOutput: true },
-    // Batch path (0.19): buildSponsorable({ calls }) requires the scope +
+    // Batch path: buildSponsorable({ calls }) requires the scope +
     // segment-order helpers (dependency-clean, no CAP, no worker).
     { path: 'srv/midnight/batch-call-scope.js', buildOutput: true },
     { path: 'srv/midnight/batch-call-scope.d.ts', buildOutput: true },
@@ -75,7 +75,7 @@ const FILES = [
     // builder fetches from the sponsor's /zk-config, generation-pinned.
     { path: `${VAULT}/contract/index.js` },
     { path: `${VAULT}/contract/index.d.ts` },
-    // 32-slot width variant (0.19): same rule, module only, keys via /zk-config.
+    // 32-slot width variant: same rule, module only, keys via /zk-config.
     { path: `${VAULT32}/contract/index.js` },
     { path: `${VAULT32}/contract/index.d.ts` },
     { path: 'LICENSE' }

@@ -5,7 +5,7 @@
  * SQLite does NOT abort a transaction on a constraint violation, so the unit
  * suite cannot prove the savepoint is actually required. Postgres does: a failed
  * INSERT poisons the whole transaction until it is rolled back. This test proves
- * the two behaviours the fix depends on, against a real Postgres, with two
+ * the two behaviours the guard depends on, against a real Postgres, with two
  * concurrent transactions:
  *
  *   1. Without a savepoint, the loser's aborted transaction rejects every
@@ -16,10 +16,10 @@
  *
  * Connection: standard libpq env vars (PGHOST, PGPORT, PGUSER, PGPASSWORD,
  * PGDATABASE) or NIGHTGATE_PG_URL / DATABASE_URL. If no Postgres is reachable
- * the test SKIPS (exit 0) so it never breaks a SQLite-only CI. Point it at the
- * NIGHTPASS compose Postgres, e.g.:
+ * the test SKIPS (exit 0) so it never breaks a SQLite-only CI. Point it at any
+ * Postgres, e.g.:
  *
- *   PGHOST=localhost PGPORT=5432 PGUSER=nightpass PGPASSWORD=... PGDATABASE=nightpass \
+ *   PGHOST=localhost PGPORT=5432 PGUSER=... PGPASSWORD=... PGDATABASE=... \
  *     npm run test:pg-idempotency
  */
 import { createRequire } from 'node:module';

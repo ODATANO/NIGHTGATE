@@ -8,7 +8,7 @@ import { classifySubmitFailure, isPreMempoolFailure, parseBatchCallStages, cause
 import { WorkerSubmitError, carriedSubmitFailure, SUBMIT_FAILURE_CODES } from '../../srv/midnight/wallet-worker-protocol';
 import { BatchCausalityError } from '../../srv/midnight/batch-segment-order';
 
-/** The live SDK shape: generic wrappers on top, the node's line in the innermost cause. */
+/** The SDK shape: generic wrappers on top, the node's line in the innermost cause. */
 function sdkWrapped(inner: string): Error {
     const node = new Error(inner);
     const submission = new Error('Transaction submission failed', { cause: node });
@@ -71,6 +71,7 @@ describe('classifySubmitFailure', () => {
 
     it('pre-mempool-reject: the intent nack and the node lines, with the ledger code', () => {
         expect(classifySubmitFailure(new Error('submit-intent rejected by the main thread: db down'))).toEqual({ code: 'pre-mempool-reject', ledgerCode: 'intent-rejected', retryable: false });
+        expect(classifySubmitFailure(new Error('submit-intent was not acknowledged by the main thread within 120000ms; not broadcasting'))).toEqual({ code: 'pre-mempool-reject', ledgerCode: 'intent-timeout', retryable: false });
         expect(classifySubmitFailure(sdkWrapped('1010: Invalid Transaction: Custom error: 188'))).toEqual({ code: 'pre-mempool-reject', ledgerCode: '1010/188', retryable: false });
         expect(classifySubmitFailure(new Error('Substrate error: invalid transaction'))).toEqual({ code: 'pre-mempool-reject', ledgerCode: '1010', retryable: false });
         // The priority values are arbitrary numbers, never a 1010 code.
@@ -115,6 +116,7 @@ describe('classifySubmitFailure', () => {
         expect(isPreMempoolFailure({ code: 'pre-mempool-reject', ledgerCode: '1010/188', retryable: false })).toBe(true);
         expect(isPreMempoolFailure({ code: 'pre-mempool-reject', ledgerCode: '1016', retryable: true })).toBe(true);
         expect(isPreMempoolFailure({ code: 'pre-mempool-reject', ledgerCode: 'intent-rejected', retryable: false })).toBe(false);
+        expect(isPreMempoolFailure({ code: 'pre-mempool-reject', ledgerCode: 'intent-timeout', retryable: false })).toBe(false);
         expect(isPreMempoolFailure({ code: 'dust-race', ledgerCode: '1010/196', retryable: true })).toBe(true);
         expect(isPreMempoolFailure({ code: 'dust-race', ledgerCode: 'pool-invalid', retryable: true })).toBe(false);
         for (const code of ['transport', 'ambiguous', 'landed-not-applied', 'policy', 'causality', 'internal'] as const) {

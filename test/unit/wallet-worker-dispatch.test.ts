@@ -1,6 +1,6 @@
 /**
- * In-thread tests for srv/midnight/wallet-worker.ts, the worker entry that
- * was 0% covered because every other suite mocks the whole Worker away.
+ * In-thread tests for srv/midnight/wallet-worker.ts, the worker entry
+ * (every other suite mocks the whole Worker away).
  *
  * Harness: worker_threads is mocked so `parentPort` is a hand-rolled emitter
  * (MessageChannel stays REAL, so the per-call RPC reply plumbing runs for real),
@@ -49,6 +49,7 @@ vi.mock('node:worker_threads', async () => {
 // 4 min default, so the watchdog test runs in seconds while every other
 // submit in this file resolves well within it.
 process.env.NIGHTGATE_SUBMIT_WATCH_TIMEOUT_MS = '3000';
+process.env.NIGHTGATE_SUBMIT_INTENT_ACK_TIMEOUT_MS = '1000';
 // The fakes below have no phases; the outer backstop (connect + request + watch + min(10 s, watch)) is what bounds a hung fake.
 process.env.NIGHTGATE_SUBMIT_CONNECT_TIMEOUT_MS = '500';
 process.env.NIGHTGATE_SUBMIT_REQUEST_TIMEOUT_MS = '500';
@@ -80,7 +81,7 @@ const zswapClear = vi.hoisted(() => (vi.fn()));
 // assemble the dust-only intent); overridden per test.
 const ledgerTx = vi.hoisted(() => ({
     deserialize: vi.fn(),
-    fromPartsRandomized: vi.fn((..._a: any[]) => ({ dustUnproven: true }))
+    fromParts: vi.fn((..._a: any[]) => ({ addIntent: (segment: any, intent: any) => ({ dustUnproven: true, segment, intent }) }))
 }));
 vi.mock('@midnight-ntwrk/ledger-v8', () => ({
     ZswapSecretKeys: {
@@ -228,10 +229,12 @@ vi.mock('ws', () => {
             if (m.type === 'connection_init') {
                 setImmediate(() => this.emit('message', Buffer.from(JSON.stringify({ type: 'connection_ack' }))));
             } else if (m.type === 'subscribe') {
+                // Answers under the stream the query names (dust or zswap).
+                const field = /subscription \{ (\w+)\(/.exec(String(m.payload?.query))?.[1] ?? 'dustLedgerEvents';
                 setImmediate(() => this.emit('message', Buffer.from(JSON.stringify(
                     wsTip.maxId == null
                         ? { type: 'error' }
-                        : { type: 'next', payload: { data: { dustLedgerEvents: { id: 0, maxId: wsTip.maxId } } } }
+                        : { type: 'next', payload: { data: { [field]: { id: 0, maxId: wsTip.maxId } } } }
                 ))));
             }
         }
@@ -335,7 +338,7 @@ let workerExports: any;
 beforeAll(async () => {
     // Several suites below advance fake time in 30 s steps for the save
     // tick; pin the interval to that (NIGHTGATE_SAVE_INTERVAL_MS, default
-    // 60 s since 0.21.6). Read per facade at startPeriodicSave time.
+    // 60 s). Read per facade at startPeriodicSave time.
     process.env.NIGHTGATE_SAVE_INTERVAL_MS = '30000';
     facadeInit.mockImplementation(async (opts: any) => {
         // Real WalletFacade.init calls the sub-wallet factories; do the same
@@ -666,7 +669,7 @@ describe('periodic save + ack protocol', () => {
     it('pushes on tick, skips unchanged only after the ack confirmed the save', async () => {
         // The save interval must be ARMED under fake timers, so this test
         // inits its own session inside the fake-timer scope. Pinned to 30 s
-        // here (NIGHTGATE_SAVE_INTERVAL_MS; the default is 60 s since 0.21.6).
+        // here (NIGHTGATE_SAVE_INTERVAL_MS; the default is 60 s).
         vi.useFakeTimers();
         const SESSION = 'session-savetick-dddddddddd';
         try {
@@ -806,7 +809,7 @@ describe('describeTxDust', () => {
     });
 });
 
-// ---- revertRecipeBestEffort / feeOfDiscardedRecipe: the bug_002 guards -----
+// ---- revertRecipeBestEffort / feeOfDiscardedRecipe: the estimate guards ----
 
 describe('revertRecipeBestEffort / feeOfDiscardedRecipe', () => {
     function warns(): string[] {
@@ -1024,7 +1027,7 @@ describe('buildWorkerWalletProvider', () => {
         expect(warns.length).toBe(1);
     });
 
-    // ---- dust wedge protection (dust-pending-note-leak FR) -----------------
+    // ---- dust wedge protection ---------------------------------------------
 
     it('balanceTx arms the pre-build dust snapshot; a successful submit disarms it', async () => {
         withSyncedIndexer();
@@ -1377,6 +1380,179 @@ describe('buildWorkerWalletProvider', () => {
 // the pre-restore (poisoned) wallet nor a late ack of an older dust push may
 // win over the restored baseline.
 
+// ---- snapshot replay -------------------------------------------------------
+//
+// A restored sub-wallet whose saved offset lags its state: the ledger rejects
+// every replayed event, the SDK retries forever. The worker replaces such a
+// sub-wallet in place and persists the fresh state; a healthy restored one is
+// left alone.
+
+describe('snapshot replay', () => {
+    const DUST_CAUSE = 'received an event with a timestamp prior to the time already synced to (synced to: Timestamp(2), event time: Timestamp(1))';
+    const SHIELDED_CAUSE = 'values inserted non-linearly into zswap commitment tree; expected to insert index 24, but received 20.';
+    const RESTORE = { restoreBlobs: { shielded: 'SNAP-SH', unshielded: 'SNAP-UN', dust: 'SNAP-DU' } };
+    const stuckState = { dust: { progress: { appliedIndex: '10', isConnected: true } }, shielded: { progress: { appliedIndex: '5' } } };
+
+    function sdkApplyError(cause: string): Error {
+        const err = new Error('Error while applying sync update');
+        (err as any).cause = new Error(cause);
+        return err;
+    }
+
+    /** Ack every state-save synchronously, like a healthy persist layer; returns an undo. */
+    function autoAckAllSaves(): () => void {
+        const base = fakeParentPort.postMessage.getMockImplementation()!;
+        fakeParentPort.postMessage.mockImplementation((m: any) => {
+            base(m);
+            if (m?.kind === 'state-save') fakeParentPort.emit('message', { kind: 'state-save-ack', sessionId: m.sessionId, seq: m.seq });
+        });
+        return () => fakeParentPort.postMessage.mockImplementation(base);
+    }
+
+    async function initRestored(sessionId: string) {
+        const reply = await rpc('init', { ...INIT_ARGS, ...RESTORE, sessionId });
+        expect(reply.ok).toBe(true);
+        return workerExports.facades.get(sessionId);
+    }
+
+    beforeEach(() => {
+        process.env.NIGHTGATE_SNAPSHOT_REPLAY_RESET_MS = '60000';
+        delete workerExports.lastReplayRejection.dust;
+        delete workerExports.lastReplayRejection.shielded;
+        workerExports.streamTipCache.clear();
+    });
+    afterEach(() => {
+        delete process.env.NIGHTGATE_SNAPSHOT_REPLAY_RESET_MS;
+    });
+
+    it('marks the sub-wallets a facade restored', async () => {
+        const entry = await initRestored('session-replay-mark-hhhhhhhh');
+        expect(entry.restoredSubWallets).toEqual({ shielded: true, dust: true });
+        await rpc('evict', { sessionId: 'session-replay-mark-hhhhhhhh' });
+    });
+
+    it('replaces a stuck restored dust sub-wallet and persists the fresh state', async () => {
+        const SESSION = 'session-replay-dust-iiiiiiii';
+        const entry = await initRestored(SESSION);
+        const oldDust = entry.facade.dust;
+        oldDust.stop = vi.fn(async () => undefined);
+        const freshDust = { start: vi.fn(async () => undefined), stop: vi.fn(), serializeState: vi.fn(async () => 'BLOB-DU-FRESH') };
+        dustStart.mockReturnValueOnce(freshDust as any);
+        const undo = autoAckAllSaves();
+        try {
+            const t0 = 1_000_000;
+            workerExports.noteConsoleErrorArgs([sdkApplyError(DUST_CAUSE)], t0);
+            expect(await workerExports.checkSnapshotReplay(SESSION, entry, stuckState, t0)).toBe(false);
+            workerExports.noteConsoleErrorArgs([sdkApplyError(DUST_CAUSE)], t0 + 60_000);
+            expect(await workerExports.checkSnapshotReplay(SESSION, entry, stuckState, t0 + 60_000)).toBe(true);
+        } finally {
+            undo();
+        }
+        expect(entry.facade.dust).toBe(freshDust);
+        expect(freshDust.start).toHaveBeenCalledWith(entry.dustKey);
+        expect(oldDust.stop).toHaveBeenCalled();
+        expect(entry.dustEpoch).toBe(1);
+        expect(entry.restoredSubWallets).toEqual({ shielded: true, dust: false });
+        expect(stateSaves().some((m: any) => m.sessionId === SESSION && m.blobs.dust === 'BLOB-DU-FRESH')).toBe(true);
+        expect(entry.lastSavedBlobs.dust).toBe('BLOB-DU-FRESH');
+        await rpc('evict', { sessionId: SESSION });
+    });
+
+    it('replaces a stuck restored shielded sub-wallet against the zswap stream tip', async () => {
+        const SESSION = 'session-replay-shld-jjjjjjjj';
+        const entry = await initRestored(SESSION);
+        entry.facade.shielded.stop = vi.fn(async () => undefined);
+        const freshShielded = { start: vi.fn(async () => undefined), stop: vi.fn(), serializeState: vi.fn(async () => 'BLOB-SH-FRESH') };
+        shieldedStart.mockReturnValueOnce(freshShielded as any);
+        const undo = autoAckAllSaves();
+        try {
+            const t0 = 2_000_000;
+            workerExports.noteConsoleErrorArgs([sdkApplyError(SHIELDED_CAUSE)], t0);
+            await workerExports.checkSnapshotReplay(SESSION, entry, stuckState, t0);
+            workerExports.noteConsoleErrorArgs([sdkApplyError(SHIELDED_CAUSE)], t0 + 61_000);
+            expect(await workerExports.checkSnapshotReplay(SESSION, entry, stuckState, t0 + 61_000)).toBe(true);
+        } finally {
+            undo();
+        }
+        expect(entry.facade.shielded).toBe(freshShielded);
+        expect(freshShielded.start).toHaveBeenCalledWith(entry.zswapKeys);
+        expect(entry.shieldedEpoch).toBe(1);
+        // the dust sub-wallet saw no dust rejection and stays restored
+        expect(entry.restoredSubWallets).toEqual({ shielded: false, dust: true });
+        expect(stateSaves().some((m: any) => m.sessionId === SESSION && m.blobs.shielded === 'BLOB-SH-FRESH')).toBe(true);
+        await rpc('evict', { sessionId: SESSION });
+    });
+
+    it('leaves a restored sub-wallet alone once it advanced, rejection or not', async () => {
+        const SESSION = 'session-replay-okay-kkkkkkkk';
+        const entry = await initRestored(SESSION);
+        const t0 = 3_000_000;
+        workerExports.noteConsoleErrorArgs([sdkApplyError(DUST_CAUSE)], t0);
+        await workerExports.checkSnapshotReplay(SESSION, entry, stuckState, t0);
+        const moved = { ...stuckState, dust: { progress: { appliedIndex: '11', isConnected: true } } };
+        expect(await workerExports.checkSnapshotReplay(SESSION, entry, moved, t0 + 30_000)).toBe(false);
+        expect(entry.restoredSubWallets.dust).toBe(false);
+        workerExports.noteConsoleErrorArgs([sdkApplyError(DUST_CAUSE)], t0 + 90_000);
+        expect(await workerExports.checkSnapshotReplay(SESSION, entry, moved, t0 + 90_000)).toBe(false);
+        expect(entry.dustEpoch ?? 0).toBe(0);
+        await rpc('evict', { sessionId: SESSION });
+    });
+
+    it('does not replace a stuck sub-wallet without a rejection of its kind, or with the window off', async () => {
+        const SESSION = 'session-replay-none-llllllll';
+        const entry = await initRestored(SESSION);
+        const t0 = 4_000_000;
+        workerExports.noteConsoleErrorArgs([sdkApplyError(SHIELDED_CAUSE)], t0 + 60_000);
+        await workerExports.checkSnapshotReplay(SESSION, entry, { dust: stuckState.dust }, t0);
+        expect(await workerExports.checkSnapshotReplay(SESSION, entry, { dust: stuckState.dust }, t0 + 60_000)).toBe(false);
+        process.env.NIGHTGATE_SNAPSHOT_REPLAY_RESET_MS = '0';
+        workerExports.noteConsoleErrorArgs([sdkApplyError(DUST_CAUSE)], t0 + 120_000);
+        expect(await workerExports.checkSnapshotReplay(SESSION, entry, { dust: stuckState.dust }, t0 + 120_000)).toBe(false);
+        expect(entry.dustEpoch ?? 0).toBe(0);
+        await rpc('evict', { sessionId: SESSION });
+    });
+
+    it('applySaveAck drops a shielded blob acked under a stale epoch', () => {
+        const entry: any = {
+            pendingSaves: new Map([[9, { shielded: 'OLD-SH', unshielded: 'UN-9' }]]),
+            shieldedSaveEpochs: new Map([[9, 0]]),
+            shieldedEpoch: 1
+        };
+        workerExports.applySaveAck(entry, 9);
+        expect(entry.lastSavedBlobs).toEqual({ unshielded: 'UN-9' });
+        expect(entry.shieldedSaveEpochs.size).toBe(0);
+    });
+});
+
+describe('progress watch tick', () => {
+    afterEach(() => { vi.unstubAllGlobals(); });
+
+    function stubIndexerTip(timestampMs: number) {
+        vi.stubGlobal('fetch', vi.fn(async () => ({ json: async () => ({ data: { block: { height: '500', timestamp: timestampMs } } }) })));
+    }
+
+    it('pushes the sync gate verdict for an idle facade', async () => {
+        const SESSION = 'session-watch-push-mmmmmmmm';
+        await initSession(SESSION);
+        const entry = workerExports.facades.get(SESSION);
+        workerExports.streamTipCache.clear();
+        wsTip.maxId = '100';
+        facadeState.current = { dust: { progress: { appliedIndex: '95', isConnected: true } } };
+        stubIndexerTip(Date.now());
+
+        await workerExports.progressWatchTick(SESSION, entry, Date.now() + 120_000);
+        const pushed = fakeParentPort.postMessage.mock.calls.map(c => c[0]).filter((m: any) => m.kind === 'sync-progress' && m.sessionId === SESSION);
+        expect(pushed.at(-1).snapshot).toMatchObject({ caughtUp: true, appliedIndex: '95', streamTip: '100', blockHeight: '500', indexerFresh: true });
+
+        // a stale indexer fails the gate the same way it fails a job
+        stubIndexerTip(Date.now() - 3_600_000);
+        await workerExports.progressWatchTick(SESSION, entry, Date.now() + 240_000);
+        const last = fakeParentPort.postMessage.mock.calls.map(c => c[0]).filter((m: any) => m.kind === 'sync-progress' && m.sessionId === SESSION).at(-1);
+        expect(last.snapshot).toMatchObject({ caughtUp: false, indexerFresh: false });
+        await rpc('evict', { sessionId: SESSION });
+    });
+});
+
 describe('dust save epoch guard', () => {
     it('applySaveAck drops a dust blob acked under a stale epoch but merges the rest', () => {
         const entry: any = {
@@ -1461,8 +1637,8 @@ describe('isPreMempoolReject', () => {
         expect(workerExports.isPreMempoolReject(new Error(message))).toBe(expected);
     });
 
-    it('finds the node reject buried in the SDK error wrappers (live shape: FiberFailure > SubmissionError > cause)', () => {
-        // Mirrors the live-observed structure: generic outer message, the
+    it('finds the node reject buried in the SDK error wrappers (FiberFailure > SubmissionError > cause)', () => {
+        // Mirrors the SDK's structure: generic outer message, the
         // Substrate code only in the nested cause.
         const rpcErr = new Error('1010: Invalid Transaction: Custom error: 182');
         const submissionErr: any = new Error('Transaction submission error');
@@ -1819,8 +1995,8 @@ describe('getBalance / estimateTransferFee', () => {
             dustUtxoCount: 2,
             // `totalCoins` is available PLUS pending, so both notes here are
             // committed to a spend and none is free. Reading the total as free
-            // capacity promised two parallel sponsorships from a wallet that
-            // could serve none.
+            // capacity would promise two parallel sponsorships from a wallet
+            // that can serve none.
             dustAvailableCount: 0,
             dustPendingCount: 2,
             dustPendingValue: '44',
@@ -1849,7 +2025,7 @@ describe('getBalance / estimateTransferFee', () => {
         expect(reply.result).toMatchObject({ dustUtxoCount: 5, dustAvailableCount: 1, dustPendingCount: 2 });
     });
 
-    it('estimateTransferFee prices via calculateTransactionFee and ALWAYS reverts the recipe (bug_002)', async () => {
+    it('estimateTransferFee prices via calculateTransactionFee and ALWAYS reverts the recipe', async () => {
         const facade = await initSession('session-estimate-eeeeeeee');
         const reply = await rpc('estimateTransferFee', {
             sessionId: 'session-estimate-eeeeeeee',
@@ -1873,7 +2049,7 @@ describe('classified failure payload of a submitting method', () => {
     it('carries the code, ledger code, retryability and cause chain as data', async () => {
         const facade = await initSession('session-classified-aaaaaaaa');
         facade.waitForSyncedState.mockResolvedValue({ unshielded: { availableCoins: [{ id: 'c1' }], totalCoins: [{ id: 'c1' }] } });
-        // Live SDK shape: generic wrappers on top, the node's line in the innermost cause.
+        // SDK shape: generic wrappers on top, the node's line in the innermost cause.
         const node = new Error('1010: Invalid Transaction: Custom error: 196');
         const submission = new Error('Transaction submission failed', { cause: node });
         const fiber = new Error('Transaction submission error', { cause: submission });
@@ -2049,7 +2225,7 @@ describe('submitContractCall private-state seeding', () => {
             initialPrivateState: { seeded: true }
         });
         expect(reply.ok).toBe(true);
-        expect(reply.result).toEqual({ txHash: 'tx-cc-fixture', onChainStatus: 'SUCCESS' });
+        expect(reply.result).toEqual({ txHash: 'tx-cc-fixture', onChainStatus: 'SUCCESS', blockHeight: null });
 
         const opts = findDeployedContract.mock.calls[0][1];
         expect(opts.initialPrivateState).toEqual({ seeded: true });
@@ -2227,7 +2403,7 @@ describe('withFindContractQueryCache', () => {
     });
 });
 
-// ---- sponsorUnboundTx: the 0.18 concurrency contract ------------------------
+// ---- sponsorUnboundTx: the concurrency contract -----------------------------
 //
 // The unbound sponsor path is NOT a whole-call SUBMIT_METHOD: only its fast,
 // key-using dust build takes the per-session lock; proving + submit overlap
@@ -2450,7 +2626,7 @@ describe('dedicated submit clients: settle window + closing-socket retry', () =>
     });
 });
 
-// ---- review findings on 0.18: lease ownership + client-pool cap -------------
+// ---- lease ownership + client-pool cap --------------------------------------
 
 describe('dust backing lease ownership', () => {
     const notes = [{ token: { backingNight: 'backing-X' }, generatedNow: 10n ** 9n }];
@@ -2762,6 +2938,100 @@ describe('pre-broadcast submit intent (external-effect boundary)', () => {
             await rpc('evict', { sessionId: SESSION });
         }
     }, 30_000);
+
+    it('when the main thread does not acknowledge in time, the worker does NOT broadcast and names the configured wait', async () => {
+        const facade = await initSession('session-sponsor-intent-bbbbbb');
+        vi.stubGlobal('fetch', vi.fn(async () => ({ json: async () => ({ data: { block: { height: '500', timestamp: Date.now() } } }) })));
+        try {
+            facadeState.current = { dust: { progress: { appliedIndex: '95', isConnected: true } } };
+            wsTip.maxId = '100';
+            facade.dust.state = {
+                subscribe(obs: any) {
+                    obs.next({ state: {}, capabilities: { coinsAndBalances: { getAvailableCoins: () => [{ token: { backingNight: 'backing-J' }, generatedNow: 10n ** 9n }] } } });
+                    return { unsubscribe() { /* noop */ } };
+                }
+            };
+            ledgerTx.deserialize.mockImplementation(() => ({
+                intents: new Map([[1, { actions: [{ address: 'aa'.repeat(32), entryPoint: 'attest' }], guaranteedUnshieldedOffer: null, dustActions: null }]]),
+                feesWithMargin: () => 1_000n
+            }));
+            makeWasmProvingService.mockImplementation(() => ({
+                prove: async () => ({ merge: () => ({ bind: () => ({ bound: true, identifiers: () => ['tx-intent-timeout'] }) }) })
+            }));
+            const sends: any[] = [];
+            makeDefaultSubmissionService.mockImplementation((_cfg: any) => {
+                const svc = { submitTransaction: vi.fn(async () => { sends.push(1); }), close: vi.fn(async () => undefined) };
+                submitServices.push(svc);
+                return svc;
+            });
+            submitIntentHook = () => new Promise((r) => setTimeout(r, 1_500));
+            const reply = await rpc('sponsorUnboundTx', {
+                sponsorSessionId: 'session-sponsor-intent-bbbbbb', unboundTxB64: Buffer.from('x').toString('base64'), networkId: 'preprod',
+                allowedContracts: ['aa'.repeat(32)], allowedCircuits: ['attest']
+            });
+            expect(reply.ok).toBe(false);
+            expect(reply.error.message).toMatch(/not acknowledged by the main thread within 1000ms; not broadcasting/);
+            expect(reply.error).toMatchObject({ code: 'pre-mempool-reject', ledgerCode: 'intent-timeout' });
+            expect(sends.length).toBe(0);
+        } finally {
+            submitIntentHook = undefined;
+            vi.unstubAllGlobals();
+            workerExports.__submitClientPoolForTests.reset();
+            makeWasmProvingService.mockImplementation((..._a: any[]) => ({ wasmProver: true }));
+            for (const svc of submitServices) { svc.submitTransaction.mockReset(); svc.submitTransaction.mockImplementation(async () => undefined); }
+            await rpc('evict', { sessionId: 'session-sponsor-intent-bbbbbb' });
+        }
+    }, 30_000);
+
+    it('the dust intent takes the lowest segment the caller transaction leaves free', async () => {
+        const facade = await initSession('session-sponsor-segment-aaaaa');
+        vi.stubGlobal('fetch', vi.fn(async () => ({ json: async () => ({ data: { block: { height: '500', timestamp: Date.now() } } }) })));
+        try {
+            facadeState.current = { dust: { progress: { appliedIndex: '95', isConnected: true } } };
+            wsTip.maxId = '100';
+            facade.dust.state = {
+                subscribe(obs: any) {
+                    obs.next({ state: {}, capabilities: { coinsAndBalances: { getAvailableCoins: () => [{ token: { backingNight: 'backing-S' }, generatedNow: 10n ** 9n }] } } });
+                    return { unsubscribe() { /* noop */ } };
+                }
+            };
+            ledgerTx.deserialize.mockImplementation(() => ({
+                intents: new Map([[1, { actions: [{ address: 'aa'.repeat(32), entryPoint: 'attest' }], guaranteedUnshieldedOffer: null, dustActions: null }], [2, { actions: [], guaranteedUnshieldedOffer: null, dustActions: null }]]),
+                feesWithMargin: () => 1_000n
+            }));
+            const proven: any[] = [];
+            makeWasmProvingService.mockImplementation(() => ({
+                prove: async (unproven: any) => { proven.push(unproven); return { merge: () => ({ bind: () => ({ bound: true, identifiers: () => ['tx-segment'] }) }) }; }
+            }));
+            makeDefaultSubmissionService.mockImplementation((_cfg: any) => {
+                const svc = { submitTransaction: vi.fn(async () => undefined), close: vi.fn(async () => undefined) };
+                submitServices.push(svc);
+                return svc;
+            });
+            const reply = await rpc('sponsorUnboundTx', {
+                sponsorSessionId: 'session-sponsor-segment-aaaaa', unboundTxB64: Buffer.from('x').toString('base64'), networkId: 'preprod',
+                allowedContracts: ['aa'.repeat(32)], allowedCircuits: ['attest']
+            });
+            expect(reply.ok).toBe(true);
+            expect(proven).toHaveLength(1);
+            expect(proven[0]).toMatchObject({ dustUnproven: true, segment: { tag: 'specific', value: 3 } });
+        } finally {
+            submitIntentHook = undefined;
+            vi.unstubAllGlobals();
+            workerExports.__submitClientPoolForTests.reset();
+            makeWasmProvingService.mockImplementation((..._a: any[]) => ({ wasmProver: true }));
+            for (const svc of submitServices) { svc.submitTransaction.mockReset(); svc.submitTransaction.mockImplementation(async () => undefined); }
+            await rpc('evict', { sessionId: 'session-sponsor-segment-aaaaa' });
+        }
+    }, 30_000);
+
+    it('freeSegmentId: the lowest id in 1..65535 the transaction does not use; a full transaction is refused', async () => {
+        const { freeSegmentId } = await import('../../srv/midnight/worker/sponsor.js');
+        expect(freeSegmentId({ intents: new Map() })).toBe(1);
+        expect(freeSegmentId({ intents: new Map([[1, {}], [2, {}], [4, {}]]) })).toBe(3);
+        const full = new Map(Array.from({ length: 65535 }, (_, i) => [i + 1, {}]));
+        expect(() => freeSegmentId({ intents: full })).toThrow(/every segment id/);
+    });
 });
 
 describe('dust backing lease renewal + env', () => {

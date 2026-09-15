@@ -36,31 +36,6 @@
       }
     },
     {
-      "name": "nodeHash",
-      "pure": true,
-      "proof": false,
-      "arguments": [
-        {
-          "name": "left",
-          "type": {
-            "type-name": "Bytes",
-            "length": 32
-          }
-        },
-        {
-          "name": "right",
-          "type": {
-            "type-name": "Bytes",
-            "length": 32
-          }
-        }
-      ],
-      "result-type": {
-        "type-name": "Bytes",
-        "length": 32
-      }
-    },
-    {
       "name": "bytesLeafHash",
       "pure": true,
       "proof": false,
@@ -106,6 +81,31 @@
         },
         {
           "name": "salt",
+          "type": {
+            "type-name": "Bytes",
+            "length": 32
+          }
+        }
+      ],
+      "result-type": {
+        "type-name": "Bytes",
+        "length": 32
+      }
+    },
+    {
+      "name": "nodeHash",
+      "pure": true,
+      "proof": false,
+      "arguments": [
+        {
+          "name": "left",
+          "type": {
+            "type-name": "Bytes",
+            "length": 32
+          }
+        },
+        {
+          "name": "right",
           "type": {
             "type-name": "Bytes",
             "length": 32
@@ -204,6 +204,31 @@
       }
     },
     {
+      "name": "recordKey",
+      "pure": true,
+      "proof": false,
+      "arguments": [
+        {
+          "name": "owner",
+          "type": {
+            "type-name": "Bytes",
+            "length": 32
+          }
+        },
+        {
+          "name": "payload_hash",
+          "type": {
+            "type-name": "Bytes",
+            "length": 32
+          }
+        }
+      ],
+      "result-type": {
+        "type-name": "Bytes",
+        "length": 32
+      }
+    },
+    {
       "name": "attest",
       "pure": false,
       "proof": true,
@@ -230,7 +255,7 @@
       }
     },
     {
-      "name": "attestGuarded",
+      "name": "retract",
       "pure": false,
       "proof": true,
       "arguments": [
@@ -242,31 +267,10 @@
           }
         },
         {
-          "name": "payload_hash",
+          "name": "key",
           "type": {
             "type-name": "Bytes",
             "length": 32
-          }
-        },
-        {
-          "name": "metadata_hash",
-          "type": {
-            "type-name": "Bytes",
-            "length": 32
-          }
-        },
-        {
-          "name": "nonce",
-          "type": {
-            "type-name": "Bytes",
-            "length": 32
-          }
-        },
-        {
-          "name": "expires_at",
-          "type": {
-            "type-name": "Uint",
-            "maxval": 18446744073709551615
           }
         }
       ],
@@ -336,12 +340,19 @@
       }
     },
     {
-      "name": "registerPassport",
+      "name": "registerDocument",
       "pure": false,
       "proof": true,
       "arguments": [
         {
-          "name": "passportId",
+          "name": "mode",
+          "type": {
+            "type-name": "Uint",
+            "maxval": 255
+          }
+        },
+        {
+          "name": "document_id",
           "type": {
             "type-name": "Bytes",
             "length": 32
@@ -362,12 +373,12 @@
       }
     },
     {
-      "name": "bindPassport",
+      "name": "bindDocument",
       "pure": false,
       "proof": true,
       "arguments": [
         {
-          "name": "passportId",
+          "name": "document_id",
           "type": {
             "type-name": "Bytes",
             "length": 32
@@ -426,7 +437,7 @@
       "proof": true,
       "arguments": [
         {
-          "name": "payload_hash",
+          "name": "record_key",
           "type": {
             "type-name": "Bytes",
             "length": 32
@@ -452,6 +463,13 @@
             "type-name": "Uint",
             "maxval": 255
           }
+        },
+        {
+          "name": "valid_until",
+          "type": {
+            "type-name": "Uint",
+            "maxval": 18446744073709551615
+          }
         }
       ],
       "result-type": {
@@ -466,7 +484,7 @@
       "proof": true,
       "arguments": [
         {
-          "name": "payload_hash",
+          "name": "record_key",
           "type": {
             "type-name": "Bytes",
             "length": 32
@@ -485,6 +503,13 @@
             "type-name": "Bytes",
             "length": 32
           }
+        },
+        {
+          "name": "valid_until",
+          "type": {
+            "type-name": "Uint",
+            "maxval": 18446744073709551615
+          }
         }
       ],
       "result-type": {
@@ -499,7 +524,7 @@
       "proof": true,
       "arguments": [
         {
-          "name": "payload_hash",
+          "name": "record_key",
           "type": {
             "type-name": "Bytes",
             "length": 32
@@ -518,6 +543,13 @@
             "type-name": "Bytes",
             "length": 32
           }
+        },
+        {
+          "name": "valid_until",
+          "type": {
+            "type-name": "Uint",
+            "maxval": 18446744073709551615
+          }
         }
       ],
       "result-type": {
@@ -532,14 +564,14 @@
       "proof": true,
       "arguments": [
         {
-          "name": "payload_hash_a",
+          "name": "record_key_a",
           "type": {
             "type-name": "Bytes",
             "length": 32
           }
         },
         {
-          "name": "payload_hash_b",
+          "name": "record_key_b",
           "type": {
             "type-name": "Bytes",
             "length": 32
@@ -567,6 +599,13 @@
           "type": {
             "type-name": "Uint",
             "maxval": 255
+          }
+        },
+        {
+          "name": "valid_until",
+          "type": {
+            "type-name": "Uint",
+            "maxval": 18446744073709551615
           }
         }
       ],
@@ -673,7 +712,7 @@
         "length": 32,
         "type": {
           "type-name": "Struct",
-          "name": "SlotDescriptor",
+          "name": "SlotSpec",
           "elements": [
             {
               "name": "field_key",
@@ -793,11 +832,8 @@
   ],
   "ledger": [
     {
-      "name": "public_attestations",
-      "index": [
-        0,
-        0
-      ],
+      "name": "attestations",
+      "index": 0,
       "exported": true,
       "storage": "Map",
       "key": {
@@ -805,16 +841,43 @@
         "length": 32
       },
       "value": {
-        "type-name": "Bytes",
-        "length": 32
+        "type-name": "Struct",
+        "name": "Attestation",
+        "elements": [
+          {
+            "name": "payload_hash",
+            "type": {
+              "type-name": "Bytes",
+              "length": 32
+            }
+          },
+          {
+            "name": "metadata_hash",
+            "type": {
+              "type-name": "Bytes",
+              "length": 32
+            }
+          },
+          {
+            "name": "owner",
+            "type": {
+              "type-name": "Bytes",
+              "length": 32
+            }
+          },
+          {
+            "name": "document_id",
+            "type": {
+              "type-name": "Bytes",
+              "length": 32
+            }
+          }
+        ]
       }
     },
     {
-      "name": "attestation_owners",
-      "index": [
-        0,
-        1
-      ],
+      "name": "content_anchors",
+      "index": 1,
       "exported": true,
       "storage": "Map",
       "key": {
@@ -822,16 +885,29 @@
         "length": 32
       },
       "value": {
-        "type-name": "Bytes",
-        "length": 32
+        "type-name": "Struct",
+        "name": "ContentAnchor",
+        "elements": [
+          {
+            "name": "root",
+            "type": {
+              "type-name": "Bytes",
+              "length": 32
+            }
+          },
+          {
+            "name": "schema",
+            "type": {
+              "type-name": "Bytes",
+              "length": 32
+            }
+          }
+        ]
       }
     },
     {
       "name": "disclosures",
-      "index": [
-        1,
-        0
-      ],
+      "index": 2,
       "exported": true,
       "storage": "Map",
       "key": {
@@ -851,11 +927,8 @@
       }
     },
     {
-      "name": "passport_bindings",
-      "index": [
-        1,
-        1
-      ],
+      "name": "document_bindings",
+      "index": 3,
       "exported": true,
       "storage": "Map",
       "key": {
@@ -869,10 +942,7 @@
     },
     {
       "name": "registrar",
-      "index": [
-        1,
-        2
-      ],
+      "index": 4,
       "exported": true,
       "storage": "Cell",
       "type": {
@@ -881,11 +951,8 @@
       }
     },
     {
-      "name": "passport_owners",
-      "index": [
-        1,
-        3
-      ],
+      "name": "document_owners",
+      "index": 5,
       "exported": true,
       "storage": "Map",
       "key": {
@@ -898,165 +965,18 @@
       }
     },
     {
-      "name": "content_roots",
-      "index": [
-        1,
-        4
-      ],
+      "name": "recovery",
+      "index": 6,
       "exported": true,
-      "storage": "Map",
-      "key": {
-        "type-name": "Bytes",
-        "length": 32
-      },
-      "value": {
+      "storage": "Cell",
+      "type": {
         "type-name": "Bytes",
         "length": 32
       }
     },
     {
-      "name": "field_predicate_results",
-      "index": [
-        1,
-        5
-      ],
-      "exported": true,
-      "storage": "Map",
-      "key": {
-        "type-name": "Bytes",
-        "length": 32
-      },
-      "value": {
-        "type-name": "Boolean"
-      }
-    },
-    {
-      "name": "field_equality_results",
-      "index": [
-        1,
-        6
-      ],
-      "exported": true,
-      "storage": "Map",
-      "key": {
-        "type-name": "Bytes",
-        "length": 32
-      },
-      "value": {
-        "type-name": "Boolean"
-      }
-    },
-    {
-      "name": "field_membership_results",
-      "index": [
-        1,
-        7
-      ],
-      "exported": true,
-      "storage": "Map",
-      "key": {
-        "type-name": "Bytes",
-        "length": 32
-      },
-      "value": {
-        "type-name": "Boolean"
-      }
-    },
-    {
-      "name": "document_integrity_results",
-      "index": [
-        1,
-        8
-      ],
-      "exported": true,
-      "storage": "Map",
-      "key": {
-        "type-name": "Bytes",
-        "length": 32
-      },
-      "value": {
-        "type-name": "Boolean"
-      }
-    },
-    {
-      "name": "document_diff_results",
-      "index": [
-        1,
-        9
-      ],
-      "exported": true,
-      "storage": "Map",
-      "key": {
-        "type-name": "Bytes",
-        "length": 32
-      },
-      "value": {
-        "type-name": "Boolean"
-      }
-    },
-    {
-      "name": "content_schemas",
-      "index": [
-        1,
-        10
-      ],
-      "exported": true,
-      "storage": "Map",
-      "key": {
-        "type-name": "Bytes",
-        "length": 32
-      },
-      "value": {
-        "type-name": "Bytes",
-        "length": 32
-      }
-    },
-    {
-      "name": "attest_commits",
-      "index": [
-        1,
-        11
-      ],
-      "exported": true,
-      "storage": "Map",
-      "key": {
-        "type-name": "Bytes",
-        "length": 32
-      },
-      "value": {
-        "type-name": "Struct",
-        "name": "AttestCommitRecord",
-        "elements": [
-          {
-            "name": "owner",
-            "type": {
-              "type-name": "Bytes",
-              "length": 32
-            }
-          },
-          {
-            "name": "seq",
-            "type": {
-              "type-name": "Uint",
-              "maxval": 18446744073709551615
-            }
-          },
-          {
-            "name": "expires_at",
-            "type": {
-              "type-name": "Uint",
-              "maxval": 18446744073709551615
-            }
-          }
-        ]
-      }
-    },
-    {
-      "name": "attestation_seqs",
-      "index": [
-        1,
-        12
-      ],
+      "name": "claims",
+      "index": 7,
       "exported": true,
       "storage": "Map",
       "key": {
@@ -1066,32 +986,6 @@
       "value": {
         "type-name": "Uint",
         "maxval": 18446744073709551615
-      }
-    },
-    {
-      "name": "attest_seq_next",
-      "index": [
-        1,
-        13
-      ],
-      "exported": true,
-      "storage": "Cell",
-      "type": {
-        "type-name": "Uint",
-        "maxval": 18446744073709551615
-      }
-    },
-    {
-      "name": "guarded_attestations",
-      "index": [
-        1,
-        14
-      ],
-      "exported": true,
-      "storage": "Set",
-      "type": {
-        "type-name": "Bytes",
-        "length": 32
       }
     }
   ]

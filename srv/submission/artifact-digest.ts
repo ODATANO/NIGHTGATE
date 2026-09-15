@@ -1,15 +1,7 @@
 /**
- * Artifact generation digest: one SHA-256 over the Compact-emitted module, the
- * private-state id, a non-default slot width, every verifier key, every zkir
- * file and the prover keys: as the prover key manifest (`keys/manifest.json`,
- * sha256 per key) where the artifact ships one, so the keys can be fetched on
- * first need without changing the generation, and as the key bytes themselves
- * for an artifact without a manifest (a consumer's own compile).
- * Dependency-free (fs, path, crypto): the registry computes it on the main
- * thread, the wallet worker recomputes it from the files it loads.
- * The byte layout is fixed; recorded digests must keep matching (slot width 16 === absent).
- * Digests recorded before 0.23.0 hashed the prover keys and knew no manifest;
- * `artifactGenerationMatch` still accepts that form as 'legacy'.
+ * Artifact generation digest over module, privateStateId, non-default width,
+ * verifier keys, zkir and the prover-key manifest (or key bytes without one).
+ * Byte layout is fixed: recorded digests must keep matching. Dependency-free for the worker.
  */
 import fs from 'node:fs';
 import path from 'node:path';
@@ -29,11 +21,7 @@ export function artifactSlotWidth(reg: Pick<ArtifactGenerationInput, 'slotWidth'
 
 export type ModuleFormat = 'module' | 'commonjs';
 
-/**
- * How Node loads the artifact: by extension for `.mjs`/`.cjs`, for `.js` by the
- * nearest package.json `"type"` walking up from the file (absent = commonjs).
- * The format is part of the generation digest and selects the snapshot's file extension.
- */
+/** How Node loads the artifact (extension, else nearest package.json `type`). Part of the digest. */
 export function effectiveModuleFormat(artifactPath: string): ModuleFormat {
     const ext = path.extname(artifactPath).toLowerCase();
     if (ext === '.mjs') return 'module';
@@ -56,10 +44,8 @@ export function effectiveModuleFormat(artifactPath: string): ModuleFormat {
 }
 
 /**
- * The node_modules directory this process resolves `@midnight-ntwrk/compact-runtime`
- * from. A snapshot or probe directory links its own `node_modules` here, so a
- * Compact-emitted module imports the pinned runtime from wherever it was copied
- * (a consumer's artifact directory needs no node_modules of its own).
+ * node_modules holding this process's compact-runtime; snapshot and probe dirs
+ * link to it so a copied artifact imports the pinned runtime.
  */
 export function runtimeNodeModulesDir(): string {
     const resolved = require.resolve('@midnight-ntwrk/compact-runtime');
@@ -69,26 +55,17 @@ export function runtimeNodeModulesDir(): string {
 }
 
 export interface DigestFormOptions {
-    /**
-     * The pre-0.21 digest without the module-format section. Only a CommonJS
-     * artifact differs; ESM forms are byte-identical. Keeps 0.20 jobs and
-     * evidence on unchanged CommonJS artifacts acceptable.
-     */
+    /** Without the module-format section (differs for CommonJS only). */
     legacyModuleFormat?: boolean;
-    /** The pre-0.23 form: prover keys hashed, no manifest section. */
+    /** Prover keys hashed instead of the manifest. */
     legacyProverKeys?: boolean;
 }
 
 export const PROVER_KEY_MANIFEST_FILE = 'manifest.json';
 
-/**
- * Files an editor, a file manager or a copy tool leaves next to the assets.
- * They are not part of the artifact: two checkouts of the same generation
- * must hash the same with or without them.
- */
+/** Editor/OS leftovers; excluded so checkouts of one generation hash the same. */
 const STRAY_FILE_RE = /^(\.DS_Store|Thumbs\.db|desktop\.ini|\.#.*|\._.*)$|~$|\.(swp|swo|bak|orig|tmp)$/i;
 
-/** A regular file that belongs to the artifact: not a directory, not a stray file. */
 export function isArtifactAssetFile(dir: string, name: string): boolean {
     if (STRAY_FILE_RE.test(name)) return false;
     try { return fs.statSync(path.join(dir, name)).isFile(); } catch { return false; }
@@ -120,11 +97,8 @@ export function computeArtifactGenerationDigest(reg: ArtifactGenerationInput, op
 }
 
 /**
- * Prover keys present under `keysDir` checked against its manifest: sha256
- * and size per key. Empty when there is no manifest (the digest then covers
- * the key bytes directly) or everything matches. The worker runs this on a
- * snapshot before proving from it, since the digest pins the manifest, not
- * the keys.
+ * Prover keys vs. manifest; empty without a manifest or when all match. Run
+ * before proving from a snapshot: the digest pins the manifest, not the keys.
  */
 export function proverKeyManifestProblems(keysDir: string): string[] {
     let manifest: { prover?: Record<string, { sha256?: string; bytes?: number }> };
@@ -145,12 +119,7 @@ export function proverKeyManifestProblems(keysDir: string): string[] {
     return problems;
 }
 
-/**
- * Whether a recorded digest names this registration's generation. The legacy
- * forms (prover keys hashed, CommonJS without the format section) are tried
- * only after the current form failed, since hashing the prover keys reads a
- * hundred megabytes.
- */
+/** Legacy forms are tried only after the current one fails: hashing prover keys is expensive. */
 export function artifactGenerationMatch(reg: ArtifactGenerationInput, recorded: string | undefined | null): 'current' | 'legacy' | null {
     if (!recorded) return null;
     const current = computeArtifactGenerationDigest(reg);

@@ -73,7 +73,7 @@ describe('contract registry', () => {
     });
 });
 
-// Artifact-generation provenance (0.16.0): a registry NAME is a mutable
+// Artifact-generation provenance: a registry NAME is a mutable
 // alias; the digest pins the generation it currently resolves to, and
 // persisted commands / evidence rows are verified against it fail-closed.
 describe('artifact generation digest', () => {
@@ -146,7 +146,7 @@ describe('artifact generation digest', () => {
         expect(getArtifactGenerationDigest('gen')).not.toBe(as16);
     });
 
-    test('explicit slotWidth 16 digests identically to the implicit default (earlier releases stay valid)', () => {
+    test('explicit slotWidth 16 digests identically to the implicit default (recorded digests stay valid)', () => {
         registerContract('gen', VAULT);
         const implicit = getArtifactGenerationDigest('gen');
         registerContract('gen', { ...VAULT, slotWidth: 16 });
@@ -342,9 +342,9 @@ describe('resolveContract', () => {
     });
 });
 
-// A CommonJS digest gained a module-format section in 0.21.0; the 0.20 form recorded on jobs/evidence
-// stays accepted for an unchanged artifact. ESM digests never changed.
-describe('artifact digest: pre-0.21.0 CommonJS digests stay accepted after the upgrade', () => {
+// A CommonJS digest carries a module-format section; the legacy form without it, recorded on
+// jobs/evidence, stays accepted for an unchanged artifact. ESM digests have no legacy form.
+describe('artifact digest: the legacy CommonJS digest form stays accepted', () => {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ng-legacy-digest-'));
     const cjsDir = path.join(tmp, 'cjs');
     fs.mkdirSync(path.join(cjsDir, 'contract'), { recursive: true });
@@ -352,7 +352,7 @@ describe('artifact digest: pre-0.21.0 CommonJS digests stay accepted after the u
     fs.writeFileSync(path.join(cjsDir, 'contract', 'index.js'), 'exports.Contract = class Contract {};\n');
     const CJS = { artifactPath: path.join(cjsDir, 'contract', 'index.js'), privateStateId: 'legacy', zkConfigPath: cjsDir };
 
-    it('assertArtifactGeneration and resolveContract accept the legacy (0.20) form of a CommonJS digest, not a foreign one', async () => {
+    it('assertArtifactGeneration and resolveContract accept the legacy form of a CommonJS digest, not a foreign one', async () => {
         const { computeArtifactGenerationDigest, artifactGenerationMatch } = await import('../../srv/submission/artifact-digest.js');
         registerContract('legacy-cjs', CJS);
         const current = getArtifactGenerationDigest('legacy-cjs');
@@ -369,7 +369,7 @@ describe('artifact digest: pre-0.21.0 CommonJS digests stay accepted after the u
         await expect(resolveContract('legacy-cjs', 'f'.repeat(64))).rejects.toThrow(/Refusing to load a different generation/);
     });
 
-    it('an ESM artifact has no legacy form (its digest did not change)', async () => {
+    it('an ESM artifact has no legacy form', async () => {
         const { computeArtifactGenerationDigest, artifactGenerationMatch } = await import('../../srv/submission/artifact-digest.js');
         expect(computeArtifactGenerationDigest(VAULT_FIXTURE(), { legacyModuleFormat: true })).toBe(computeArtifactGenerationDigest(VAULT_FIXTURE()));
         expect(artifactGenerationMatch(VAULT_FIXTURE(), computeArtifactGenerationDigest(VAULT_FIXTURE()))).toBe('current');

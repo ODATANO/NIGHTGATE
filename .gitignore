@@ -36,6 +36,10 @@ srv/**/*.js
 srv/**/*.d.ts
 srv/**/*.js.map
 srv/**/*.d.ts.map
+test/**/*.js
+test/**/*.d.ts
+test/**/*.js.map
+test/**/*.d.ts.map
 
 # Environment (backups from rekeying carry live secrets — never commit)
 .env

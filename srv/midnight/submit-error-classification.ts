@@ -1,12 +1,7 @@
 /**
- * ONE classification of a submit failure into the closed code set of
- * `wallet-worker-protocol.ts`. The worker runs it against the SDK error
- * objects it holds and attaches the result to its RPC reply; the main thread
- * reads the carried code first and falls back to this same text classifier
- * only for errors that never crossed the RPC (a persisted job error re-thrown
- * as a plain Error, a main-thread sponsor-health failure, tests). Every
- * decision downstream (dust rebuild, failover, reconciliation, dust-wedge
- * restore) keys on the code, never on wording.
+ * Submit-failure classification into the closed code set of `wallet-worker-protocol.ts`.
+ * The worker attaches the code to its RPC reply; the main thread re-runs this only for
+ * errors that never crossed the RPC. Downstream decisions key on the code, never on wording.
  * SPDX-License-Identifier: Apache-2.0
  */
 
@@ -72,18 +67,13 @@ export function parseBatchCallStages(text: string): BatchCallStageInfo[] {
 // A connection that failed or closed: the request may never have left, the
 // worker probes the indexer for the identifier before it resends the same bytes.
 const TRANSPORT_RE = /disconnected from|Normal Closure|Abnormal Closure|WebSocket is not connected|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EPIPE|socket hang up|Unable to connect/i;
-// A wait that ended without a reply: the request was sent, the answer never
-// came. The transaction may be in the pool or in a block, so this is never a
-// resend (a landed transaction resent is a 1013 duplicate and a failed job
-// for a landed tx) and never a rebuild; reconciliation resolves the identifier.
+// Sent, no reply: the tx may be pooled or landed, so never resend (1013 duplicate)
+// or rebuild; reconciliation resolves the identifier.
 const NO_REPLY_RE = /TimeoutError|TimeoutException|timed? ?out|no reply|no response|request timeout/i;
 
 /**
- * Classify a submit failure. Order matters: an already-classified error keeps
- * its code; the outcome-shaped errors (causality, ambiguous, landed, policy,
- * intent) go before the node's reject lines, and the node's lines before the
- * connection wording; a wait that ended without a reply comes last and is
- * ambiguous, never transport (a watch timeout also says "timed out").
+ * Order matters: carried code, then outcome-shaped errors, node rejects, connection
+ * wording, and no-reply last (a watch timeout also says "timed out").
  */
 export function classifySubmitFailure(err: unknown): SubmitFailureInfo {
     const carried = carriedSubmitFailure(err);
@@ -94,17 +84,13 @@ export function classifySubmitFailure(err: unknown): SubmitFailureInfo {
     const message = formatErr(err);
     const haystack = `${message} ${classificationHaystack(err)}`;
 
-    // Causality refusal, before proving. The object survives our own throws;
-    // the SDK's scope wrapper keeps only the message, hence the parse.
+    // The SDK's scope wrapper may keep only the message, hence the parse fallback.
     const causality = chain.find((e: any) => e?.code === 'BatchCausalityViolation' || nameOf(e) === 'BatchCausalityError');
     if (causality || /violates the ledger's causality constraint/.test(haystack)) {
         const own = Array.isArray((causality as any)?.calls) ? (causality as any).calls as BatchCallStageInfo[] : undefined;
         return { code: 'causality', retryable: false, calls: own?.length ? own : parseBatchCallStages(haystack) };
     }
-    // A phased submit says WHICH phase died. connect: nothing was sent, a
-    // resend is safe (transport, pre-inclusion). request: sent, no status
-    // (the node may hold it: ambiguous, no-reply). watch: the node took it,
-    // nothing was included in time (ambiguous).
+    // Only a connect-phase failure is safe to resend; request and watch may have reached the node.
     const phased = chain.find((e: any) => nameOf(e) === 'SubmitPhaseError' && typeof e?.phase === 'string') as any;
     if (phased) {
         if (phased.phase === 'connect') return { code: 'transport', ledgerCode: 'not-sent', retryable: true };
@@ -115,15 +101,17 @@ export function classifySubmitFailure(err: unknown): SubmitFailureInfo {
         return { code: 'ambiguous', retryable: false };
     }
     if (names.includes('SponsoredCallNotAppliedError') || names.includes('TxFailedError') || /did NOT apply|but did not apply/i.test(haystack)) {
-        // The block height rides along as the rollback coordinate; without it
-        // the main thread parks the job for the indexer confirmer.
+        // Block height = rollback coordinate; without it the job parks for the indexer confirmer.
         const blockHeight = errorChain(err).map(e => (e as any)?.blockHeight).find(v => Number.isInteger(v) && v >= 0);
         return { code: 'landed-not-applied', retryable: false, ...(Number.isInteger(blockHeight) ? { blockHeight } : {}) };
     }
     if (names.includes('SponsorRefusalError') || /refusing to sponsor/i.test(haystack)) {
         return { code: 'policy', retryable: false };
     }
-    if (/submit-intent (rejected|was not acknowledged)/i.test(haystack)) {
+    if (/submit-intent was not acknowledged/i.test(haystack)) {
+        return { code: 'pre-mempool-reject', ledgerCode: 'intent-timeout', retryable: false };
+    }
+    if (/submit-intent rejected/i.test(haystack)) {
         return { code: 'pre-mempool-reject', ledgerCode: 'intent-rejected', retryable: false };
     }
     const dustRace = dustRaceLedgerCode(err);
@@ -134,11 +122,9 @@ export function classifySubmitFailure(err: unknown): SubmitFailureInfo {
     if (/TransactionInvalidError|Transaction is invalid and was rejected by the node/i.test(haystack)) {
         return { code: 'dust-race', ledgerCode: 'pool-invalid', retryable: true };
     }
-    // The client's own closing socket: the request never left (retried once
-    // in the worker); when it propagates, nothing was broadcast.
+    // Our own closing socket: nothing was broadcast.
     if (/closing socket/i.test(haystack)) return { code: 'transport', ledgerCode: 'closing-socket', retryable: true };
-    // Substrate rejects. "priority is too low" first: its "(X vs Y)" values
-    // are arbitrary numbers and must not be misread as a 1010 code.
+    // "priority is too low" first: its "(X vs Y)" numbers must not be misread as a 1010 code.
     if (/priority is too low|\b1014\s*:/i.test(haystack)) {
         return { code: 'pre-mempool-reject', ledgerCode: '1014', retryable: false };
     }
@@ -156,6 +142,6 @@ export function classifySubmitFailure(err: unknown): SubmitFailureInfo {
 
 /** The node refused the transaction before the mempool and no fee was spent. */
 export function isPreMempoolFailure(info: SubmitFailureInfo): boolean {
-    if (info.code === 'pre-mempool-reject') return info.ledgerCode !== 'intent-rejected';
+    if (info.code === 'pre-mempool-reject') return info.ledgerCode !== 'intent-rejected' && info.ledgerCode !== 'intent-timeout';
     return info.code === 'dust-race' && info.ledgerCode !== 'pool-invalid';
 }

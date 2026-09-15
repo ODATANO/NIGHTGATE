@@ -174,6 +174,36 @@ describe('encryption key rewrap', () => {
         await expect(assertStoredKeyIdsKnown(db, BOTH)).rejects.toThrow(/'x' \(midnight\.AccountKeys\.wrappedDek\)/);
     });
 
+    it('a dry run leaves the account key row as stored; the real run re-seals it', async () => {
+        const accountId = deriveAccountId(VK_A);
+        const pass = deriveStoragePassword(VK_A);
+        const dek = nodeCrypto.randomBytes(32);
+        // Ring seal without a binding, viewing-key seal not yet wrapped in the ring.
+        await db.run(INSERT.into('midnight.AccountKeys').entries({
+            accountId, wrappedDek: encrypt(dek.toString('hex'), OLD_ONLY),
+            wrappedDekByViewingKey: sealDekByStoragePassword(dek, pass), createdAt: new Date().toISOString()
+        }));
+        const before = await db.run(SELECT.one.from('midnight.AccountKeys').where({ accountId }));
+        expect(inspectCiphertext(before.wrappedDek)).toEqual({ version: 2, keyId: '1' });
+        expect(before.wrappedDekByViewingKey.startsWith('vk1:')).toBe(true);
+
+        const dry = await rewrapStoredCiphertexts(db, { ring: OLD_ONLY, dryRun: true });
+        expect(dry.envelope.find(e => e.column === 'midnight.AccountKeys.wrappedDek')!.rewrapped).toBe(1);
+        expect(dry.envelope.find(e => e.column === 'midnight.AccountKeys.wrappedDekByViewingKey')!.rewrapped).toBe(1);
+        expect(await db.run(SELECT.one.from('midnight.AccountKeys').where({ accountId }))).toEqual(before);
+
+        clearAllAccountDeks();
+        const real = await rewrapStoredCiphertexts(db, { ring: OLD_ONLY });
+        expect(real.envelope.find(e => e.column === 'midnight.AccountKeys.wrappedDek')!.rewrapped).toBe(1);
+        expect(real.envelope.find(e => e.column === 'midnight.AccountKeys.wrappedDekByViewingKey')!.rewrapped).toBe(1);
+        const after = await db.run(SELECT.one.from('midnight.AccountKeys').where({ accountId }));
+        expect(inspectCiphertext(after.wrappedDek)).toEqual({ version: 3, keyId: '1' });
+        expect(inspectCiphertext(after.wrappedDekByViewingKey)).toEqual({ version: 3, keyId: '1' });
+        expect(after.rotatedAt).toBeTruthy();
+        clearAllAccountDeks();
+        expect((await resolveAccountDek({ db, ring: OLD_ONLY, accountId, storagePassword: pass, create: false }))!.equals(dek)).toBe(true);
+    });
+
     it('the account key is sealed both ways: the ring opens it, the viewing key opens it, a wrong viewing key is refused', async () => {
         const accountId = deriveAccountId(VK_A);
         const pass = deriveStoragePassword(VK_A);

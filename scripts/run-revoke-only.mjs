@@ -1,13 +1,13 @@
 // Revoke-only experiment for Custom error 117 (NotNormalized / unspendable dust).
 //
-// Hypothesis (Midnight forum 1164): dust is unspendable when its merkle roots
+// Hypothesis: dust is unspendable when its merkle roots
 // fell out of the node's ~1h root_history (stale/idle wallet), even though
 // dust.balance(now) is large. The FIRST submission right after a genuinely
 // fresh sync should still have fresh roots and succeed. So: prewarm (fresh
 // sync) → revoke an EXISTING on-chain grant IMMEDIATELY, with no other ops in
 // between, minimizing the sync→submit gap.
 //
-// Target grant defaults to the run-1 grant (on-chain, active=true). Override
+// Target grant defaults to a known on-chain grant (active=true). Override
 // via REVOKE_* env. Run: node --env-file=.env scripts/run-revoke-only.mjs
 
 import bip39 from 'bip39';

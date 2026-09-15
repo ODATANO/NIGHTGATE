@@ -19,8 +19,7 @@ function intentFor(circuit: string | Uint8Array) {
 /**
  * An intent whose call carries the given execution stages. `partitionTranscripts`
  * decides these by gas cost, so the same circuit is 'g' on a small contract
- * state and 'f' once it grows expensive (live-observed: attest at 5.34G was
- * guaranteed, at 6.04G fallible).
+ * state and 'f' once it grows expensive.
  */
 function stagedIntent(circuit: string, stages: 'g' | 'f' | 'gf') {
     return {
@@ -106,7 +105,7 @@ describe('orderBatchSegments', () => {
 
 describe('findCausalityViolation', () => {
     test('flags a fallible call that has a guaranteed call behind it', () => {
-        // The live 1010/188 shape: attest goes fallible once the vault fills,
+        // The 1010/188 shape: attest goes fallible once the vault fills,
         // its dependents stay guaranteed, and the ledger rejects the batch.
         const tx = txWithIntents([
             [10, stagedIntent('attest', 'f')],
@@ -251,9 +250,8 @@ describe('withOrderedBatchSegments', () => {
 });
 
 describe('orderBatchSegments with independentCalls: stage grouping', () => {
-    // The proof-cart shapes measured on a grown vault (batch-segments log
-    // lines): the same circuit lands in different stages for different claim
-    // keys, so call order alone violates causality about every second cart.
+    // On a grown vault the same circuit lands in different stages for
+    // different claim keys, so call order alone violates causality.
     function cart(stages: Array<'g' | 'f' | 'gf'>) {
         const names = ['proveFieldMembership', 'proveFieldPredicate', 'proveFieldPredicate', 'proveFieldPredicate', 'proveFieldPredicate'];
         const intents = names.map((n, i) => stagedIntent(n, stages[i]));
@@ -283,7 +281,7 @@ describe('orderBatchSegments with independentCalls: stage grouping', () => {
         expect(applyOrder(tx)).toEqual([intents[0], intents[1], intents[2], intents[4], intents[3]]);
     });
 
-    test('an all-guaranteed cart keeps call order under grouping (byte-identical to today)', () => {
+    test('an all-guaranteed cart keeps call order under grouping', () => {
         const { tx, names, intents } = cart(['g', 'g', 'g', 'g', 'g']);
         expect(orderBatchSegments(tx, names, { independentCalls: true })).toBe(true);
         expect(applyOrder(tx)).toEqual(intents);

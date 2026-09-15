@@ -5,33 +5,17 @@
 // /zk-config routes and a DApp-Connector wallet. The SDK packages are
 // imported LAZILY so importing `@odatano/nightgate/browser` stays light.
 //
-// SCOPE / HONESTY: the four providers below (publicData, zkConfig, proof,
-// privateState) plus the prefetched wallet keys are assembled here and the
-// zk-config piece is byte-verified against the live route. The FINAL balance +
-// submit round-trip is deliberately NOT fabricated: the v4 connector works in
+// SCOPE: the four providers below (publicData, zkConfig, proof, privateState)
+// plus the prefetched wallet keys are assembled here. The FINAL balance +
+// submit round-trip is NOT part of this module: the v4 connector works in
 // serialized tx strings (balanceUnsealedTransaction/submitTransaction) while
-// midnight-js's WalletProvider works in typed ledger objects, and the correct
-// architecture (midnight-js-native WalletProvider adapter vs connector-native
-// build→prove→serialize→balance→submit) must be chosen and VERIFIED against a
-// real Lace + chain. That live-integration step lives in the consumer (NIGHTPASS).
+// midnight-js's WalletProvider works in typed ledger objects, so the adapter
+// between them (midnight-js-native WalletProvider vs connector-native
+// build→prove→serialize→balance→submit) belongs to the consuming dApp.
 
 import { FetchZkConfigProvider } from './zk-config.mjs';
 import { InMemoryPrivateStateProvider } from './private-state.mjs';
 
-/**
- * @param {object}   opts
- * @param {object}   opts.connector  a connected DApp-Connector wallet (`@midnight-ntwrk/dapp-connector-api` ConnectedAPI)
- * @param {object}   opts.manifest   the parsed `/contract-manifest` JSON
- * @param {string}   [opts.manifestUrl]  the URL the manifest was fetched from; required when the
- *                                       manifest carries relative `zkConfigBaseUrl`s (the server's
- *                                       default without NIGHTGATE_ZK_CONFIG_PUBLIC_URL) and the dApp
- *                                       is served from another origin
- * @param {string}   opts.contract   contract name, e.g. 'attestation-vault'
- * @param {typeof fetch} [opts.fetchFn]    injectable fetch (defaults to global)
- * @param {any}      [opts.webSocket]      WebSocket impl (defaults to global)
- * @param {'server'|'wallet'|'auto'} [opts.proving='server']  proving modality, see below
- * @returns assembled providers + prefetched wallet keys + the connector
- */
 /**
  * Absolute form of a manifest URL. The server emits RELATIVE `/zk-config/...`
  * URLs unless it is configured with a public base, so a dApp on another
@@ -45,6 +29,20 @@ export function resolveManifestUrl(url, manifestUrl) {
     throw new Error(`createNightgateConnectorProviders: manifest URL '${raw}' is relative; pass opts.manifestUrl (the URL the manifest was fetched from)`);
 }
 
+/**
+ * @param {object}   opts
+ * @param {object}   opts.connector  a connected DApp-Connector wallet (`@midnight-ntwrk/dapp-connector-api` ConnectedAPI)
+ * @param {object}   opts.manifest   the parsed `/contract-manifest` JSON
+ * @param {string}   [opts.manifestUrl]  the URL the manifest was fetched from; required when the
+ *                                       manifest carries relative `zkConfigBaseUrl`s (the server's
+ *                                       default without NIGHTGATE_ZK_CONFIG_PUBLIC_URL) and the dApp
+ *                                       is served from another origin
+ * @param {string}   opts.contract   contract name, e.g. 'attestation-vault'
+ * @param {typeof fetch} [opts.fetchFn]    injectable fetch (defaults to global)
+ * @param {any}      [opts.webSocket]      WebSocket impl (defaults to global)
+ * @param {'server'|'wallet'|'auto'} [opts.proving='server']  proving modality, see buildProofProvider
+ * @returns assembled providers + prefetched wallet keys + the connector
+ */
 export async function createNightgateConnectorProviders(opts = {}) {
     const { connector, manifest, manifestUrl, contract, fetchFn, webSocket, proving = 'server' } = opts;
     if (!connector) throw new Error('createNightgateConnectorProviders: connector is required');
@@ -110,8 +108,8 @@ export async function createNightgateConnectorProviders(opts = {}) {
 /**
  * Assemble the proof provider for the requested modality.
  *
- *   'server' - midnight-js's httpClientProofProvider against `proverServerUri` (today's default,
- *              and what production uses). Needs a reachable, CORS-clean proof server.
+ *   'server' - midnight-js's httpClientProofProvider against `proverServerUri` (the default).
+ *              Needs a reachable, CORS-clean proof server.
  *   'wallet' - DELEGATE contract proving to the connected wallet's own prover
  *              (`connector.getProvingProvider`). No proof server, no CORS wall, and the
  *              transaction preimage never leaves the user's machine. Fails LOUDLY when the

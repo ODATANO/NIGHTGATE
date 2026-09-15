@@ -13,6 +13,15 @@
 
 const mockDbRun = vi.hoisted(() => (vi.fn()));
 const selectOneWhereSpy = vi.hoisted(() => (vi.fn()));
+// SELECT.from(...).columns(...).where(...).and(...): one chainable object.
+const selectFromChain = vi.hoisted(() => {
+    const chain: any = {};
+    chain.columns = vi.fn(() => chain);
+    chain.where = vi.fn(() => chain);
+    chain.and = vi.fn(() => chain);
+    return chain;
+});
+const crawlerState = vi.hoisted(() => ({ enabled: false }));
 const insertEntriesSpy = vi.hoisted(() => (vi.fn()));
 const updateSetSpy = vi.hoisted(() => (vi.fn()));
 const updateWhereSpy = vi.hoisted(() => (vi.fn()));
@@ -23,7 +32,7 @@ vi.mock('@sap/cds', () => {
         ql: {
             SELECT: {
                 one: { from: vi.fn().mockReturnValue({ where: selectOneWhereSpy }) },
-                from: vi.fn().mockReturnValue({ where: vi.fn() })
+                from: vi.fn().mockReturnValue(selectFromChain)
             },
             INSERT: { into: vi.fn().mockReturnValue({ entries: insertEntriesSpy }) },
             UPDATE: {
@@ -55,7 +64,8 @@ vi.mock('../../srv/submission/fee-sponsor', () => {
     return { resolveFeeSponsor: mockResolveFeeSponsor, FeeSponsorError, getConfiguredFeeSponsorSessions };
 });
 vi.mock('../../srv/utils/nightgate-config', () => ({
-    getNightgatePluginConfig: () => ({})
+    getNightgatePluginConfig: () => ({}),
+    resolveNightgateRuntimeConfig: () => ({ crawlerConfig: { enabled: crawlerState.enabled } })
 }));
 
 import { FeeSponsorError } from '../../srv/submission/fee-sponsor';
@@ -64,6 +74,7 @@ import { __resetGrantRateLimiterForTests, currentGrantPolicy,
     registerAgentGrantHandlers,
     enforceAgentGrant,
     grantScopeViolation,
+    grantJobScopeViolation,
     circuitsOfRequest,
     hashAgentToken,
     recordDeployedContracts,
@@ -282,7 +293,205 @@ describe('agent grants', () => {
     // policy follows the grant
     // ------------------------------------------------------------------
 
-    describe('per-grant sponsor allow-list (0.21.0)', () => {
+    describe('updateAgentGrant', () => {
+        function existing(overrides: Record<string, any> = {}) {
+            return grantRow({ maxJobsPerDay: 5, allowDeploy: false, maxDeploys: null, deploysUsed: 0,
+                allowedContracts: null, allowedCircuits: null, allowedTokenTypes: null, agentLabel: 'bot', ...overrides });
+        }
+        const call = (data: Record<string, unknown>, opts: Record<string, unknown> = {}) =>
+            handlers.updateAgentGrant(makeReq(data, { event: 'updateAgentGrant', ...opts }));
+
+        it('changes only the passed fields; an explicit null clears', async () => {
+            mockDbRun.mockResolvedValueOnce(existing()); // own grant
+            mockDbRun.mockResolvedValueOnce(1);          // conditional UPDATE
+            const req = makeReq({ grantId: 'grant-1', maxJobsPerDay: 20, validUntil: null }, { event: 'updateAgentGrant' });
+            const result = await handlers.updateAgentGrant(req);
+            expect(req.reject).not.toHaveBeenCalled();
+            const patch = updateSetSpy.mock.calls[0][0];
+            expect(patch).toMatchObject({ maxJobsPerDay: 20, validUntil: null, allowDeploy: false, maxDeploys: null });
+            expect(patch).not.toHaveProperty('allowedActions');
+            expect(patch).not.toHaveProperty('agentLabel');
+            expect(updateWhereSpy).toHaveBeenCalledWith({ ID: 'grant-1', userId: TEST_USER_ID, isActive: true });
+            expect(result).toEqual({ grantId: 'grant-1', updated: ['maxJobsPerDay', 'validUntil'] });
+        });
+
+        it('refuses the immutable bindings with 400 before reading anything', async () => {
+            const req = makeReq({ grantId: 'grant-1', sessionId: 'other' }, { event: 'updateAgentGrant' });
+            await handlers.updateAgentGrant(req);
+            expect(req.reject).toHaveBeenCalledWith(400, expect.stringContaining('sessionId'));
+            expect(mockDbRun).not.toHaveBeenCalled();
+        });
+
+        it('a foreign or unknown grant is 404, a revoked one 409 GRANT_REVOKED', async () => {
+            mockDbRun.mockResolvedValueOnce(null);
+            const missing = makeReq({ grantId: 'grant-x', maxJobsPerDay: 1 }, { event: 'updateAgentGrant' });
+            await handlers.updateAgentGrant(missing);
+            expect(missing.reject).toHaveBeenCalledWith(404, expect.stringContaining('Grant'));
+            expect(selectOneWhereSpy).toHaveBeenCalledWith({ ID: 'grant-x', userId: TEST_USER_ID });
+
+            mockDbRun.mockResolvedValueOnce(existing({ isActive: false }));
+            const revoked = makeReq({ grantId: 'grant-1', maxJobsPerDay: 1 }, { event: 'updateAgentGrant' });
+            await handlers.updateAgentGrant(revoked);
+            expect(revoked.reject).toHaveBeenCalledWith(expect.objectContaining({ status: 409, code: 'GRANT_REVOKED' }));
+        });
+
+        it('a revoke that lands between the read and the write wins (409, nothing resurrected)', async () => {
+            mockDbRun.mockResolvedValueOnce(existing());
+            mockDbRun.mockResolvedValueOnce(0);
+            const req = makeReq({ grantId: 'grant-1', maxJobsPerDay: 1 }, { event: 'updateAgentGrant' });
+            await handlers.updateAgentGrant(req);
+            expect(req.reject).toHaveBeenCalledWith(expect.objectContaining({ status: 409, code: 'GRANT_REVOKED' }));
+        });
+
+        it('validates like creation: deploy budget below the used count, a past validUntil, a non-grantable action', async () => {
+            mockDbRun.mockResolvedValueOnce(existing({
+                allowedActions: JSON.stringify(['sponsorUnboundTransaction']), allowDeploy: true, maxDeploys: 5, deploysUsed: 3
+            }));
+            const budget = makeReq({ grantId: 'grant-1', maxDeploys: 2 }, { event: 'updateAgentGrant' });
+            await handlers.updateAgentGrant(budget);
+            expect(budget.reject).toHaveBeenCalledWith(400, expect.stringContaining('below the 3 deploys'));
+
+            mockDbRun.mockResolvedValueOnce(existing());
+            const past = makeReq({ grantId: 'grant-1', validUntil: new Date(Date.now() - 1000).toISOString() }, { event: 'updateAgentGrant' });
+            await handlers.updateAgentGrant(past);
+            expect(past.reject).toHaveBeenCalledWith(400, expect.stringContaining('future'));
+
+            mockDbRun.mockResolvedValueOnce(existing());
+            const bad = makeReq({ grantId: 'grant-1', allowedActions: ['sendNight'] }, { event: 'updateAgentGrant' });
+            await handlers.updateAgentGrant(bad);
+            expect(bad.reject).toHaveBeenCalledWith(400, expect.stringContaining('sendNight'));
+
+            // the deploy right needs a sponsoring action in the EFFECTIVE list
+            mockDbRun.mockResolvedValueOnce(existing());
+            const deploy = makeReq({ grantId: 'grant-1', allowDeploy: true }, { event: 'updateAgentGrant' });
+            await handlers.updateAgentGrant(deploy);
+            expect(deploy.reject).toHaveBeenCalledWith(400, expect.stringContaining('allowDeploy needs'));
+            expect(updateSetSpy).not.toHaveBeenCalled();
+        });
+
+        it('lists and the deploy right patch as JSON like creation', async () => {
+            mockDbRun.mockResolvedValueOnce(existing({ allowedActions: JSON.stringify(['sponsorUnboundTransaction']) }));
+            mockDbRun.mockResolvedValueOnce(1);
+            const req = makeReq({ grantId: 'grant-1', allowedContracts: ['ab'.repeat(32)], allowDeploy: true, maxDeploys: 3 }, { event: 'updateAgentGrant' });
+            await handlers.updateAgentGrant(req);
+            expect(req.reject).not.toHaveBeenCalled();
+            expect(updateSetSpy.mock.calls[0][0]).toMatchObject({
+                allowedContracts: JSON.stringify(['ab'.repeat(32)]), allowDeploy: true, maxDeploys: 3
+            });
+        });
+
+        it('shares the grant-admin rate limit: the 11th administration call of one principal is 429', async () => {
+            for (let i = 0; i < 10; i++) await call({ grantId: 'grant-1', maxJobsPerDay: 1 }, { ip: '10.9.9.9' });
+            const req = makeReq({ grantId: 'grant-1' }, { event: 'rotateAgentGrantToken', ip: '10.9.9.9' });
+            await handlers.rotateAgentGrantToken(req);
+            expect(req.reject).toHaveBeenCalledWith(429, expect.stringContaining('Rate limited'));
+        });
+    });
+
+    describe('rotateAgentGrantToken', () => {
+        it('replaces the hash in one conditional UPDATE and returns the new token once', async () => {
+            mockDbRun.mockResolvedValueOnce(1);
+            const req = makeReq({ grantId: 'grant-1' }, { event: 'rotateAgentGrantToken' });
+            const result = await handlers.rotateAgentGrantToken(req);
+            expect(req.reject).not.toHaveBeenCalled();
+            expect(result.grantId).toBe('grant-1');
+            expect(result.token).toMatch(/^ngat_[0-9a-f]{64}$/);
+            expect(updateSetSpy).toHaveBeenCalledWith({ tokenHash: hashAgentToken(result.token) });
+            expect(updateWhereSpy).toHaveBeenCalledWith({ ID: 'grant-1', userId: TEST_USER_ID, isActive: true });
+            // nothing else on the row is touched
+            expect(Object.keys(updateSetSpy.mock.calls[0][0])).toEqual(['tokenHash']);
+        });
+
+        it('a foreign, unknown or revoked grant is 404', async () => {
+            mockDbRun.mockResolvedValueOnce(0);
+            const req = makeReq({ grantId: 'grant-9' }, { event: 'rotateAgentGrantToken' });
+            await handlers.rotateAgentGrantToken(req);
+            expect(req.reject).toHaveBeenCalledWith(404, expect.stringContaining('Grant'));
+        });
+    });
+
+    describe('getGrantUsage', () => {
+        const usageRows = [
+            { kind: 'anchorDocument', status: 'succeeded', chainStatus: 'success', txHash: 'AA' },
+            { kind: 'anchorDocument', status: 'succeeded', chainStatus: 'success', txHash: 'bb' },
+            { kind: 'anchorDocument', status: 'failed', chainStatus: null, txHash: null },
+            { kind: 'sponsorUnboundTransaction', status: 'succeeded', chainStatus: 'failure', txHash: 'cc' }
+        ];
+
+        beforeEach(() => { crawlerState.enabled = false; });
+
+        it('groups the window by kind and status, counts landed and failed, defaults to the last 30 days', async () => {
+            mockDbRun.mockResolvedValueOnce(grantRow({ maxJobsPerDay: 10, jobsUsedToday: 4, budgetWindow: TODAY, deploysUsed: 1, maxDeploys: 2 }));
+            mockDbRun.mockResolvedValueOnce(usageRows);
+            const req = makeReq({ grantId: 'grant-1' }, { event: 'getGrantUsage' });
+            const before = Date.now();
+            const result = await handlers.getGrantUsage(req);
+            expect(req.reject).not.toHaveBeenCalled();
+            expect(result).toMatchObject({
+                grantId: 'grant-1', landed: 2, failed: 2, deploysUsed: 1, maxDeploys: 2, jobsUsedToday: 4, maxJobsPerDay: 10, dustPaid: null,
+                jobs: [
+                    { kind: 'anchorDocument', status: 'failed', count: 1 },
+                    { kind: 'anchorDocument', status: 'succeeded', count: 2 },
+                    { kind: 'sponsorUnboundTransaction', status: 'succeeded', count: 1 }
+                ]
+            });
+            const span = new Date(result.until).getTime() - new Date(result.since).getTime();
+            expect(span).toBe(30 * 24 * 3600 * 1000);
+            expect(new Date(result.until).getTime()).toBeGreaterThanOrEqual(before);
+            expect(selectOneWhereSpy).toHaveBeenCalledWith({ ID: 'grant-1', userId: TEST_USER_ID });
+            expect(selectFromChain.where).toHaveBeenCalledWith({ grantId: 'grant-1', queuedAt: { '>=': result.since } });
+            expect(selectFromChain.and).toHaveBeenCalledWith({ queuedAt: { '<=': result.until } });
+        });
+
+        it("today's budget counts only inside the current window", async () => {
+            mockDbRun.mockResolvedValueOnce(grantRow({ maxJobsPerDay: 10, jobsUsedToday: 4, budgetWindow: '2020-01-01' }));
+            mockDbRun.mockResolvedValueOnce([]);
+            const result = await handlers.getGrantUsage(makeReq({ grantId: 'grant-1' }, { event: 'getGrantUsage' }));
+            expect(result.jobsUsedToday).toBe(0);
+        });
+
+        it('sums the indexed fees of the landed transactions when the crawler runs', async () => {
+            crawlerState.enabled = true;
+            mockDbRun.mockResolvedValueOnce(grantRow());
+            mockDbRun.mockResolvedValueOnce(usageRows);
+            mockDbRun.mockResolvedValueOnce([{ ID: 'tx-1' }, { ID: 'tx-2' }]);      // Transactions by hash
+            mockDbRun.mockResolvedValueOnce([{ paidFees: '100' }, { paidFees: 50 }]); // their fee rows
+            const result = await handlers.getGrantUsage(makeReq({ grantId: 'grant-1' }, { event: 'getGrantUsage' }));
+            expect(result.dustPaid).toBe('150');
+            expect(selectFromChain.where).toHaveBeenCalledWith({ hash: { in: ['aa', 'bb'] } });
+            expect(selectFromChain.where).toHaveBeenCalledWith({ transaction_ID: { in: ['tx-1', 'tx-2'] } });
+        });
+
+        it('bounds the window: at most 366 days, since before until, valid timestamps', async () => {
+            const now = Date.now();
+            const wide = makeReq({ grantId: 'grant-1', since: new Date(now - 400 * 86400_000).toISOString() }, { event: 'getGrantUsage' });
+            await handlers.getGrantUsage(wide);
+            expect(wide.reject).toHaveBeenCalledWith(400, expect.stringContaining('366'));
+            const flipped = makeReq({ grantId: 'grant-1', since: new Date(now + 1000).toISOString(), until: new Date(now).toISOString() }, { event: 'getGrantUsage' });
+            await handlers.getGrantUsage(flipped);
+            expect(flipped.reject).toHaveBeenCalledWith(400, expect.stringContaining('since must not lie after'));
+            const bad = makeReq({ grantId: 'grant-1', until: 'yesterday' }, { event: 'getGrantUsage' });
+            await handlers.getGrantUsage(bad);
+            expect(bad.reject).toHaveBeenCalledWith(400, expect.stringContaining('until'));
+            expect(mockDbRun).not.toHaveBeenCalled();
+        });
+
+        it('a foreign grant is 404; a revoked own grant keeps its history', async () => {
+            mockDbRun.mockResolvedValueOnce(null);
+            const foreign = makeReq({ grantId: 'grant-x' }, { event: 'getGrantUsage' });
+            await handlers.getGrantUsage(foreign);
+            expect(foreign.reject).toHaveBeenCalledWith(404, expect.stringContaining('Grant'));
+
+            mockDbRun.mockResolvedValueOnce(grantRow({ isActive: false }));
+            mockDbRun.mockResolvedValueOnce([]);
+            const revoked = makeReq({ grantId: 'grant-1' }, { event: 'getGrantUsage' });
+            const result = await handlers.getGrantUsage(revoked);
+            expect(revoked.reject).not.toHaveBeenCalled();
+            expect(result.landed).toBe(0);
+        });
+    });
+
+    describe('per-grant sponsor allow-list', () => {
         const VALID = { sessionId: 'sess-1', allowedActions: ['sponsorFinalizedTransaction'] };
 
         it('persists allowedContracts/allowedCircuits as JSON and returns them', async () => {
@@ -584,6 +793,27 @@ describe('agent grants', () => {
             expect(mockDbRun).not.toHaveBeenCalled();
         });
 
+        it('rejects 401 when the public verify marker principal reaches this service', async () => {
+            const req = makeReq({}, { event: 'verifyAttestationState', user: { id: 'public-verify-transport' } });
+            await enforceAgentGrant(req, db);
+            expect(req.reject).toHaveBeenCalledWith(401, expect.stringContaining('authentication required'));
+            expect(mockDbRun).not.toHaveBeenCalled();
+        });
+
+        it('getGrantUsage is always allowed but only for the token\'s own grant', async () => {
+            mockDbRun.mockResolvedValueOnce(grantRow({ allowedActions: JSON.stringify([]), maxJobsPerDay: 1, jobsUsedToday: 1, budgetWindow: TODAY }));
+            const own = tokenReq('getGrantUsage', { grantId: 'grant-1' });
+            await enforceAgentGrant(own, db);
+            expect(own.reject).not.toHaveBeenCalled();
+            expect(mockDbRun).toHaveBeenCalledTimes(1); // no budget UPDATE
+            expect(own.user).toEqual({ id: TEST_USER_ID });
+
+            mockDbRun.mockResolvedValueOnce(grantRow());
+            const foreign = tokenReq('getGrantUsage', { grantId: 'grant-2' });
+            await enforceAgentGrant(foreign, db);
+            expect(foreign.reject).toHaveBeenCalledWith(404, expect.stringContaining('Grant'));
+        });
+
         it('rejects 401 on a token without the expected prefix', async () => {
             const req = tokenReq('anchorDocument', {}, 'not-a-grant-token');
             await enforceAgentGrant(req, db);
@@ -765,7 +995,7 @@ describe('agent grants', () => {
 
         it('sponsorFinalizedTransaction is grantable; the compute-only reads are free', async () => {
             expect(AGENT_ALLOWLISTABLE_ACTIONS).toContain('sponsorFinalizedTransaction');
-            // 0.18: the parallel channel has the same trust shape and is grantable too.
+            // the unbound (parallel) channel has the same trust shape and is grantable too.
             expect(AGENT_ALLOWLISTABLE_ACTIONS).toContain('sponsorUnboundTransaction');
             // still never grantable: the actions that could move funds or act
             // as the session in any other way
@@ -891,18 +1121,15 @@ describe('agent grant circuit scope follows the action, not the request fields',
         expect(req.reject).toHaveBeenCalledWith(403, expect.stringMatching(/revokeDisclosure.*allowedCircuits/));
     });
 
-    it('anchorDocument commits by default and needs only attestGuarded; guarded false needs only attest', () => {
+    it('anchorDocument and attestAgentOutput need exactly the attest circuit', () => {
         const plainOnly = { allowedContracts: null, allowedCircuits: JSON.stringify(['attest']) };
-        expect(grantScopeViolation(plainOnly, { contractAddress: 'abcdef01' }, 'anchorDocument')).toMatch(/attestGuarded/);
-        expect(grantScopeViolation(plainOnly, { contractAddress: 'abcdef01', guarded: false }, 'anchorDocument')).toBeNull();
-        expect(grantScopeViolation(plainOnly, { contractAddress: 'abcdef01', nonce: 'ab'.repeat(32) }, 'anchorDocument')).toMatch(/attestGuarded/);
-        const guardedOnly = { allowedContracts: null, allowedCircuits: JSON.stringify(['attestGuarded']) };
-        expect(grantScopeViolation(guardedOnly, { contractAddress: 'abcdef01' }, 'anchorDocument')).toBeNull();
-        expect(grantScopeViolation(guardedOnly, { contractAddress: 'abcdef01', nonce: 'ab'.repeat(32) }, 'anchorDocument')).toBeNull();
-        expect(grantScopeViolation(guardedOnly, { contractAddress: 'abcdef01' }, 'attestAgentOutput')).toBeNull();
-        expect(grantScopeViolation(plainOnly, { contractAddress: 'abcdef01', guarded: false }, 'attestAgentOutput')).toMatch(/attestGuarded/);
-        expect(circuitsOfRequest('anchorDocument', {})).toEqual(['attestGuarded']);
-        expect(circuitsOfRequest('anchorDocument', { guarded: false })).toEqual(['attest']);
+        expect(grantScopeViolation(plainOnly, { contractAddress: 'abcdef01' }, 'anchorDocument')).toBeNull();
+        expect(grantScopeViolation(plainOnly, { contractAddress: 'abcdef01' }, 'attestAgentOutput')).toBeNull();
+        const proofsOnly = { allowedContracts: null, allowedCircuits: JSON.stringify(['proveFieldPredicate']) };
+        expect(grantScopeViolation(proofsOnly, { contractAddress: 'abcdef01' }, 'anchorDocument')).toMatch(/attest/);
+        expect(grantScopeViolation(proofsOnly, { contractAddress: 'abcdef01' }, 'attestAgentOutput')).toMatch(/attest/);
+        expect(circuitsOfRequest('anchorDocument', {})).toEqual(['attest']);
+        expect(circuitsOfRequest('attestAgentOutput', {})).toEqual(['attest']);
     });
 
     it('an action whose circuits cannot be derived is refused while a circuit list is set, and passes without one', () => {
@@ -914,10 +1141,35 @@ describe('agent grant circuit scope follows the action, not the request fields',
         expect(grantScopeViolation(listed, {}, 'reindexDisclosures')).toBeNull();
     });
 
+    it('a queued job is re-checked against the grant as it is now: action, contract, circuits', () => {
+        const grant = { allowedActions: JSON.stringify(['grantDisclosure', 'submitContractCallBatch']), allowedContracts: JSON.stringify(['abcdef01']), allowedCircuits: JSON.stringify(['grantDisclosure', 'attest']) };
+        const grantCmd = { op: 'grantDisclosure', contractAddress: 'abcdef01', level: 1 };
+        expect(grantJobScopeViolation(grant, { kind: 'grantDisclosure' }, grantCmd)).toBeNull();
+        // The action left the grant after admission.
+        expect(grantJobScopeViolation({ ...grant, allowedActions: JSON.stringify(['anchorDocument']) }, { kind: 'grantDisclosure' }, grantCmd)).toMatch(/no longer allowed/);
+        // The contract left the grant after admission.
+        expect(grantJobScopeViolation({ ...grant, allowedContracts: JSON.stringify(['ffffffff']) }, { kind: 'grantDisclosure' }, grantCmd)).toMatch(/allowedContracts/);
+        // A batch names its circuits in the persisted calls.
+        const batch = { op: 'callBatch', contractAddress: 'abcdef01', calls: [{ circuit: 'attest', args: [] }, { circuit: 'revokeDisclosure', args: [] }] };
+        expect(grantJobScopeViolation(grant, { kind: 'submitContractCallBatch' }, batch)).toMatch(/revokeDisclosure.*allowedCircuits/);
+        // A workflow child is checked as the action its PARENT was admitted as; circuits still count.
+        const child = { op: 'call', contractAddress: 'abcdef01', circuit: 'proveFieldPredicate', args: [] };
+        const proofGrant = { ...grant, allowedActions: JSON.stringify(['issueFieldPredicateAttestation']) };
+        expect(grantJobScopeViolation(proofGrant, { kind: 'fieldPredicateProof', parentJobId: 'p', parentKind: 'issueFieldPredicateAttestation' }, child)).toMatch(/proveFieldPredicate.*allowedCircuits/);
+        expect(grantJobScopeViolation({ ...proofGrant, allowedCircuits: null }, { kind: 'fieldPredicateProof', parentJobId: 'p', parentKind: 'issueFieldPredicateAttestation' }, child)).toBeNull();
+        // The parent's action left the grant while the child waited.
+        expect(grantJobScopeViolation({ ...grant, allowedActions: JSON.stringify(['anchorDocument']), allowedCircuits: null }, { kind: 'fieldPredicateProof', parentJobId: 'p', parentKind: 'issueFieldPredicateAttestation' }, child)).toMatch(/issueFieldPredicateAttestation.*no longer allowed/);
+        // A child whose parent cannot be resolved is refused, never waved through.
+        expect(grantJobScopeViolation({ ...proofGrant, allowedCircuits: null }, { kind: 'fieldPredicateProof', parentJobId: 'p', parentKind: null }, child)).toMatch(/parent job/);
+        // Retract jobs are admitted as retractAttestation (mode 0) or purgeExpired (mode 1).
+        const retractGrant = { allowedActions: JSON.stringify(['purgeExpired']), allowedContracts: null, allowedCircuits: null };
+        expect(grantJobScopeViolation(retractGrant, { kind: 'retract' }, { op: 'retract', mode: 1, contractAddress: 'abcdef01' })).toBeNull();
+        expect(grantJobScopeViolation(retractGrant, { kind: 'retract' }, { op: 'retract', mode: 0, contractAddress: 'abcdef01' })).toMatch(/retractAttestation/);
+    });
+
     it('circuitsOfRequest lists the server-side circuits of every grantable action', () => {
         expect(circuitsOfRequest('issueFieldPredicateAttestationBatch', {})).toEqual(expect.arrayContaining(['anchorContentRoot', 'proveFieldPredicate', 'proveFieldEquality', 'proveFieldMembership', 'proveDocumentComparison']));
         expect(circuitsOfRequest('issueDocumentDiffAttestation', {})).toEqual(expect.arrayContaining(['anchorContentRoot', 'proveDocumentComparison']));
-        expect(circuitsOfRequest('commitDocumentAnchor', {})).toEqual(['attestGuarded']);
         expect(circuitsOfRequest('revokeDisclosure', {})).toEqual(['revokeDisclosure']);
         expect(circuitsOfRequest('reindexDisclosures', {})).toEqual([]);
         expect(circuitsOfRequest('unknownAction', {})).toBeNull();

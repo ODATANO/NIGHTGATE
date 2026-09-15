@@ -13,10 +13,10 @@
 // (`generateAttestationSecret`), stored client-side under the dApp's origin
 // via `sealAttestationSecret` (AES-256-GCM; the unlock material, e.g. a
 // wallet signature, only decrypts a ciphertext the dApp holds and is NOT
-// itself the secret). The old fixed-message signData derivation was removed
-// in 0.16.0: a signature over a fixed public message is shareable
-// authentication evidence, and any dApp able to request it could reproduce
-// the attester identity and run the owner-gated circuits.
+// itself the secret). A signature over a fixed public message is never the
+// secret itself: it is shareable authentication evidence, and any dApp able
+// to request it could reproduce the attester identity and run the
+// owner-gated circuits.
 
 import { hmac } from '@noble/hashes/hmac';
 import { sha256 } from '@noble/hashes/sha256';
@@ -38,12 +38,6 @@ const ATTESTATION_VAULT_LABEL = 'nightgate/attestation-vault/v1';
 export function deriveAttestationSecret(material) {
     return hmac(sha256, material, new TextEncoder().encode(ATTESTATION_VAULT_LABEL));
 }
-
-// REMOVED in 0.16.0: deriveAttestationSecretFromSignature /
-// ATTESTER_SECRET_MESSAGE. A signature over a fixed public message is
-// shareable authentication evidence, not key material: any dApp that got the
-// user to sign the same message derived the SAME attester identity and could
-// run the owner-gated circuits as it. Use the flow below instead.
 
 const SEAL_INFO_LABEL = 'nightgate/attestation-secret-seal/v1';
 
@@ -79,8 +73,8 @@ async function sealKeyFor(unlockMaterial, salt, usage) {
 /**
  * Seal the attester secret under arbitrary unlock material (AES-256-GCM with
  * an HKDF-derived key; WebCrypto). The unlock material MAY be a wallet
- * signature: unlike the removed fixed-message derivation, the signature only
- * DECRYPTS a ciphertext this dApp holds in its own origin storage; a foreign
+ * signature: the signature only DECRYPTS a ciphertext this dApp holds in
+ * its own origin storage; a foreign
  * dApp obtaining the same signature has no ciphertext to open. Returns a
  * JSON-serializable blob `{ v, salt, iv, cipher }` (hex members).
  */

@@ -1,23 +1,7 @@
 /**
- * TransactionSubmitter, server-side orchestrator for the Midnight contract path
- * (deploy + call). The SDK invocation runs in a `worker_threads` worker (see
- * `srv/midnight/wallet-worker.ts`) so the SDK's Effect.ts microtask saturation
- * stays off the main thread.
- *
- *   1. Insert a `pending` PendingSubmissions row BEFORE invoking the worker
- *      (crash-recovery hook); txHash + contractAddress fill in on return.
- *   2. Build a CapDbPrivateStateProvider on the main thread (where the CAP DB
- *      lives) and register it under an ephemeral `proxyId`; the worker's proxy
- *      round-trips PS CRUD back via `private-state-rpc` messages.
- *   3. Invoke the worker, which owns the SDK, the cached artifact, and the wallet
- *      facade, and returns only primitives (no SDK object crosses the boundary).
- *   4. On success → UPDATE row; the crawler's BlockProcessor later flips it to
- *      'finalized'.
- *   5. On failure → mark 'failed' with a classified error (see
- *      classifySubmissionError).
- *
- * The submitter never retries; the OData callers decide retry policy from the
- * returned classification.
+ * Main-thread orchestrator for contract deploy/call via the wallet worker. The
+ * PendingSubmissions row is inserted BEFORE the worker runs (crash recovery).
+ * Only pre-mempool rebuilds retry here; other retry policy is the caller's.
  */
 
 import cds from '@sap/cds';
@@ -71,18 +55,14 @@ export interface PendingSubmissionRow {
     sessionId?: string;
 }
 
-/**
- * Registration meta carried across the thread boundary. The compiled contract
- * object itself does not survive structured-clone, so the worker re-imports
- * the artifact at `artifactPath` and caches the compiled handle by name.
- */
+/** Registration meta for the worker; the compiled contract does not survive structured-clone. */
 export interface ContractRegistrationMeta {
     artifactPath:   string;
-    /** Generation digest (module + verifier keys) of the resolved artifact; keys the worker's module cache. */
+    /** Generation digest of the artifact; keys the worker's module cache. */
     artifactDigest?: string;
     privateStateId: string;
     zkConfigPath:   string;
-    /** Content-tree width of a vault-family artifact (16 default, 32 for attestation-vault-32). */
+    /** Content-tree width of a vault-family artifact (default 16). */
     slotWidth?:     number;
 }
 
@@ -90,12 +70,9 @@ export interface DeployArgs<PS = unknown> {
     contractName: string;
     registration: ContractRegistrationMeta;
     initialPrivateState: PS;
-    /**
-     * Required for worker-routed submissions: the wallet facade is keyed on
-     * sessionId inside the worker. Audit-trail role from earlier revisions
-     * is unchanged.
-     */
     sessionId: string;
+    /** Vault family: recovery identity (64 hex) for the constructor; absent = none. */
+    recoveryId?: string;
 }
 
 export interface CallArgs {
@@ -105,19 +82,9 @@ export interface CallArgs {
     contractName: string;
     registration: ContractRegistrationMeta;
     sessionId: string;
-    /**
-     * Per-call proof bundle for the field-bound proof circuits
-     * (`proveFieldPredicate` / `proveFieldEquality` / `proveFieldMembership`):
-     * scaled field value OR value digest + the DEPTH=4 content path, plus the
-     * DEPTH=6 set path for membership. Passed to the worker's witness factory;
-     * never sent as a circuit arg. Omit for every other circuit.
-     */
+    /** Witness input for the field-bound proof circuits; never a circuit arg. */
     merkleProof?: MerkleProofBundle;
-    /**
-     * Private state to seed when the CALLING wallet has none for this contract
-     * yet (it did not deploy it). Defaults to `{}` in the worker. Enables the
-     * multi-caller case: several wallets acting on one shared contract.
-     */
+    /** Seeded when the calling wallet has no private state for this contract (default `{}`). */
     initialPrivateState?: unknown;
 }
 
@@ -133,20 +100,17 @@ export interface CallResult {
     txHash: string;
     contractAddress: string;
     status: SubmissionStatus;
+    /** Indexer block height of the inclusion, when the worker reported one. */
+    blockHeight?: number | null;
 }
 
 export interface CallBatchArgs {
     contractAddress: string;
-    /** Ordered circuit calls; all execute inside ONE transaction. A call may
-     *  carry its own `merkleProof` (per-call witness binding for
-     *  proveFieldPredicate); mutually exclusive with the batch-level
-     *  `merkleProof` below. */
+    /** Ordered calls in ONE transaction; a per-call `merkleProof` excludes the batch-level one. */
     calls: Array<{ circuit: string; args: unknown[]; merkleProof?: MerkleProofBundle }>;
     contractName: string;
     registration: ContractRegistrationMeta;
     sessionId: string;
-    /** Batch-level proof bundle, bound once to the shared compiled contract
-     *  instance (same semantics as the single-call field on CallArgs). */
     merkleProof?: MerkleProofBundle;
     initialPrivateState?: unknown;
     /** The calls past `orderedPrefix` share no state: grouped by execution stage before proving. */
@@ -164,13 +128,7 @@ export interface SubmissionErrorClassification {
     retryable: boolean;
     knownIssueRef?: string;
     message: string;
-    /**
-     * `'dust-race'`: the dust spend was built against a dust state the node has
-     * already moved past (`1010/170` stale merkle root or validity window,
-     * `1010/196` nullifier already known). Pre-mempool, fee unspent; rebuild
-     * against the caught-up dust wallet and resubmit. One definition for all
-     * submitting paths (bound deploy/call/batch here, sponsored paths via sponsor-pool).
-     */
+    /** Dust spend built against a stale dust state: pre-mempool, fee unspent, rebuild. */
     transient?: 'dust-race';
     /** `BatchCausalityViolation`: every call's apply position and stages. */
     calls?: BatchCallStageInfo[];
@@ -193,32 +151,17 @@ export class SubmissionError extends Error {
 // ---- Submitter ------------------------------------------------------------
 
 export interface TransactionSubmitterDeps {
-    /** Provider config: indexer URLs + proof server. Forwarded to the worker. */
     contractProvidersConfig: ContractProvidersConfig;
-    /** Wallet material (accountId, password provider, privateStateBackend). */
     walletMaterial: WalletMaterial;
-    /** Optional DB handle; defaults to cds.connect.to('db'). Useful for tests. */
+    /** Defaults to cds.connect.to('db'). */
     db?: any;
-    /**
-     * Inject the worker RPC for testing; defaults to the real
-     * `walletDeployContract` from wallet-worker-client.
-     */
+    /** Test seams for the worker RPCs. */
     walletDeployContractImpl?: typeof walletDeployContract;
-    /** Same idea for `walletSubmitContractCall`. */
     walletSubmitContractCallImpl?: typeof walletSubmitContractCall;
-    /** Same idea for `walletSubmitContractCallBatch`. */
     walletSubmitContractCallBatchImpl?: typeof walletSubmitContractCallBatch;
-    /** Test seam for cross-server sponsoring phase 1. */
     walletBuildSponsorableTxImpl?: typeof walletBuildSponsorableTx;
-    /** Network, used by classifySubmissionError to decide if 1016 is fail-fast. */
     network: NightgateNetwork;
-    /**
-     * Optional fee sponsor: the ACCOUNT ID (worker facade key) of a second
-     * wallet session that pays the dust fee. The worker then splits balancing
-     * into two phases (caller: shielded/unshielded; sponsor: dust only) and
-     * the sponsor submits. Resolved and authorised by the OData handler
-     * (see srv/submission/fee-sponsor.ts) before it reaches this class.
-     */
+    /** Worker facade key of the dust-fee sponsor; already authorised by the handler. */
     sponsorAccountId?: string;
 }
 
@@ -237,46 +180,51 @@ export class TransactionSubmitter {
     }
 
     /**
-     * Rebuild-retry on a transient dust race (`dustRaceLedgerCode`). 170/196
-     * are pre-mempool rejects: nothing broadcast, no fee spent, dust wallet
-     * already restored by the worker's wedge protection. Runs inside the worker
-     * call, before any txHash exists, so a retry never races a broadcast.
-     * Every other failure propagates unchanged.
+     * Rebuild on pre-mempool rejects a fresh build heals: a dust race (1010/170,
+     * 1010/196) or a stale transcript (1010/104). Each kind has its own budget.
      */
-    private async withDustRaceRetry<T>(what: string, ledger: BoundAttemptLedger, attempt: () => Promise<T>): Promise<T> {
-        const retries = configNumber('NIGHTGATE_DUST_RACE_RETRIES');
-        const backoffMs = configMs('NIGHTGATE_DUST_RACE_BACKOFF_MS');
-        for (let n = 0; ; n++) {
+    private async withRebuildRetry<T>(what: string, ledger: BoundAttemptLedger, attempt: () => Promise<T>): Promise<T> {
+        const dustRetries = configNumber('NIGHTGATE_DUST_RACE_RETRIES');
+        const dustBackoffMs = configMs('NIGHTGATE_DUST_RACE_BACKOFF_MS');
+        const staleRetries = configNumber('NIGHTGATE_STALE_TRANSCRIPT_RETRIES');
+        const staleBackoffMs = configMs('NIGHTGATE_STALE_TRANSCRIPT_BACKOFF_MS');
+        let dustRebuilds = 0;
+        let staleRebuilds = 0;
+        for (;;) {
             try {
                 return await attempt();
             } catch (err) {
-                // Coded dust races only (170/196); a pool-status Invalid on the
-                // bound channel is not rebuilt here.
                 const info = classifySubmitFailure(err);
-                const code = info.code === 'dust-race' && info.ledgerCode?.startsWith('1010/') ? info.ledgerCode : null;
-                if (code == null || n >= retries) throw err;
-                const label = ledger.current().rowId ?? '';
-                log.warn(`${what} ${label.slice(0, 8)}: transient dust race (${code}), rebuild-retry ${n + 1}/${retries} after ${backoffMs}ms`);
-                // The rejected attempt's identifier (if one was announced) comes
-                // off the job BEFORE the rebuild announces a new one: two
-                // identifiers on one job would be one landed transaction the
-                // job cannot tell from the other. Throws when that cannot commit
-                // (no rebuild on an open attempt).
-                await ledger.rejectAnnouncedAttempt(`transient dust race (${code}); rebuilt`);
+                const dustCode = info.code === 'dust-race' && info.ledgerCode?.startsWith('1010/') ? info.ledgerCode : null;
+                const stale = info.code === 'pre-mempool-reject' && info.ledgerCode === STALE_TRANSCRIPT_CODE;
+                const label = (ledger.current().rowId ?? '').slice(0, 8);
+                let reason: string;
+                let backoffMs: number;
+                if (dustCode != null && dustRebuilds < dustRetries) {
+                    dustRebuilds++;
+                    reason = `transient dust race (${dustCode})`;
+                    backoffMs = dustBackoffMs;
+                    log.warn(`${what} ${label}: ${reason}, rebuild-retry ${dustRebuilds}/${dustRetries} after ${backoffMs}ms`);
+                } else if (stale && staleRebuilds < staleRetries) {
+                    staleRebuilds++;
+                    reason = `transcript refused against the current contract state (${STALE_TRANSCRIPT_CODE})`;
+                    backoffMs = staleBackoffMs;
+                    log.warn(`${what} ${label}: ${reason}, rebuild-retry ${staleRebuilds}/${staleRetries} after ${backoffMs}ms`);
+                } else {
+                    throw err;
+                }
+                // Take the rejected identifier off the job BEFORE the rebuild announces
+                // a new one; throws (no rebuild) when that cannot commit.
+                await ledger.rejectAnnouncedAttempt(`${reason}; rebuilt`);
                 await new Promise(resolve => setTimeout(resolve, backoffMs));
             }
         }
     }
 
     /**
-     * Bookkeeping of the BOUND channel's broadcast attempts. The worker announces
-     * every identifier before it sends (`submit-intent`); the hook records it on
-     * the attempt row and crosses the job's boundary (`reportBroadcastOn`) in ONE
-     * transaction, then acks. A rebuild after a pre-mempool reject closes the
-     * previous row REJECTED and takes its hash off the job (`reportSubmissionRejectedOn`)
-     * in one transaction, then the next intent opens a new row. So the job's
-     * txHash is always the ONE identifier that may be on chain, and "no txHash"
-     * provably means nothing was broadcast.
+     * Bound-channel attempt bookkeeping: each announce and each reject commits row
+     * and job in one transaction, so the job's txHash is the ONE identifier that
+     * may be on chain and no txHash means nothing was broadcast.
      */
     private boundAttemptLedger(firstRowId: string, shape: { actionType: ActionType; contractAddress: string | null; circuitName: string | null; sessionId: string }): BoundAttemptLedger {
         let rowId: string | null = firstRowId;
@@ -316,8 +264,7 @@ export class TransactionSubmitter {
                     await reportSubmissionRejectedOn(tx, { submissionId: closing, txHash: hash });
                 }), msg => log.warn(msg));
             } catch (e) {
-                // Same parking as the sponsor channel: the reconciler re-runs the
-                // close + hash removal (settleRejectedSponsorAttempts).
+                // Parked; the reconciler re-runs close + hash removal.
                 throw new SponsorAttemptBookkeepingPendingError(
                     `broadcast attempt ${closing} was rejected before inclusion but its bookkeeping (row, hash) could not be committed: ${String((e as Error)?.message ?? e)}. Settled by the reconciler. Original failure: ${why.slice(0, 200)}`,
                     { submissionId: closing, txHash: hash, refund: 0 });
@@ -333,24 +280,15 @@ export class TransactionSubmitter {
         return fn(db);
     }
 
-    /**
-     * Failure path shared by deploy/call/callBatch: an announced attempt the node
-     * provably rejected before inclusion is closed and its hash taken off the job
-     * (the job then fails plainly); anything else marks the current row failed
-     * and, with a hash on the job, ends in reconciliation. Returns the row id the
-     * SubmissionError names.
-     */
+    /** Shared failure path; returns the row id the SubmissionError names. */
     private async settleFailedAttempt(ledger: BoundAttemptLedger, fallbackRowId: string, err: unknown, classification: SubmissionErrorClassification): Promise<string> {
         const { rowId, txHash } = ledger.current();
         const named = rowId ?? fallbackRowId;
         if (txHash && rowId && isPreInclusionReject(err)) {
             await ledger.rejectAnnouncedAttempt(classification.message);
         } else if (txHash && rowId) {
-            // Ambiguous after the announcement (watch timeout, transport): the
-            // transaction may land. The row stays `pending` so the crawler's
-            // reconcilePendingSubmission (or the indexer confirmer) can still
-            // flip it to `finalized`; a `failed` row could never get there and
-            // the job parked in reconciliation_required forever.
+            // May still land: keep the row `pending` so reconciliation can finalize
+            // it; a `failed` row never could.
             await this.noteAmbiguousFailure(named, classification);
         } else {
             await this.markFailed(named, classification);
@@ -381,7 +319,7 @@ export class TransactionSubmitter {
             const proxy = await this.registerPrivateStateProxy();
             release = proxy.release;
             await reportExternalExecution({ submissionId });
-            workerResult = await this.withDustRaceRetry('deploy', ledger, () => deployFn(this.makeDeployRpcArgs(args, proxy.proxyId), ledger.onSubmitIntent));
+            workerResult = await this.withRebuildRetry('deploy', ledger, () => deployFn(this.makeDeployRpcArgs(args, proxy.proxyId), ledger.onSubmitIntent));
         } catch (err) {
             release?.();
             if (err instanceof SponsorAttemptBookkeepingPendingError) throw err;
@@ -430,12 +368,12 @@ export class TransactionSubmitter {
         const callFn = this.deps.walletSubmitContractCallImpl ?? walletSubmitContractCall;
         const ledger = this.boundAttemptLedger(submissionId, { actionType: 'CALL', contractAddress: args.contractAddress, circuitName: args.circuit, sessionId: args.sessionId });
         let release: (() => void) | null = null;
-        let workerResult: { txHash: string; onChainStatus: string };
+        let workerResult: { txHash: string; onChainStatus: string; blockHeight?: number | null };
         try {
             const proxy = await this.registerPrivateStateProxy();
             release = proxy.release;
             await reportExternalExecution({ submissionId });
-            workerResult = await this.withDustRaceRetry(`call ${args.circuit}`, ledger, () => callFn(this.makeCallRpcArgs(args, proxy.proxyId), ledger.onSubmitIntent));
+            workerResult = await this.withRebuildRetry(`call ${args.circuit}`, ledger, () => callFn(this.makeCallRpcArgs(args, proxy.proxyId), ledger.onSubmitIntent));
         } catch (err) {
             release?.();
             if (err instanceof SponsorAttemptBookkeepingPendingError) throw err;
@@ -475,34 +413,28 @@ export class TransactionSubmitter {
             });
         }
 
-        return { submissionId: rowId, txHash, contractAddress: args.contractAddress, status: newStatus };
+        return { submissionId: rowId, txHash, contractAddress: args.contractAddress, status: newStatus, blockHeight: workerResult.blockHeight ?? null };
     }
 
     /**
-     * Submit SEVERAL circuit calls against one contract as a SINGLE
-     * transaction (worker: withContractScopedTransaction). One
-     * PendingSubmissions row tracks the whole batch; its circuitName is the
-     * ordered `+`-joined circuit list. A pre-submission failure discards the
-     * scope (nothing submitted); post-submission the ledger's fallible phase
-     * can still finalize the tx as PARTIAL_SUCCESS (on chain, subset applied),
-     * which fails the row with OnChainStatus:... and the caller must verify
-     * effect state.
+     * Several calls on one contract in ONE transaction, one row. A partial success
+     * is on chain with a subset applied: the row fails and the caller must verify state.
      */
     async callBatch(args: CallBatchArgs): Promise<CallBatchResult> {
         const circuits = args.calls.map(c => c.circuit);
-        // circuitName is String(100); the join is informational, so truncate.
+        // circuitName is String(100).
         const circuitLabel = circuits.join('+').slice(0, 100);
         const submissionId = await this.insertPending('CALL', args.contractAddress, circuitLabel, args.sessionId);
 
         const batchFn = this.deps.walletSubmitContractCallBatchImpl ?? walletSubmitContractCallBatch;
         const ledger = this.boundAttemptLedger(submissionId, { actionType: 'CALL', contractAddress: args.contractAddress, circuitName: circuitLabel, sessionId: args.sessionId });
         let release: (() => void) | null = null;
-        let workerResult: { txHash: string; onChainStatus: string; circuits: string[] };
+        let workerResult: { txHash: string; onChainStatus: string; circuits: string[]; blockHeight?: number | null };
         try {
             const proxy = await this.registerPrivateStateProxy();
             release = proxy.release;
             await reportExternalExecution({ submissionId });
-            workerResult = await this.withDustRaceRetry(`batch ${circuitLabel}`, ledger, () => batchFn(this.makeCallBatchRpcArgs(args, proxy.proxyId), ledger.onSubmitIntent));
+            workerResult = await this.withRebuildRetry(`batch ${circuitLabel}`, ledger, () => batchFn(this.makeCallBatchRpcArgs(args, proxy.proxyId), ledger.onSubmitIntent));
         } catch (err) {
             release?.();
             if (err instanceof SponsorAttemptBookkeepingPendingError) throw err;
@@ -542,18 +474,14 @@ export class TransactionSubmitter {
             });
         }
 
-        return { submissionId: rowId, txHash, contractAddress: args.contractAddress, status: newStatus, circuits };
+        return { submissionId: rowId, txHash, contractAddress: args.contractAddress, status: newStatus, circuits, blockHeight: workerResult.blockHeight ?? null };
     }
 
     // -- Internals -----------------------------------------------------------
 
     /**
-     * Build a CapDbPrivateStateProvider for this submission and register it under
-     * a fresh `proxyId`; the worker's PS proxy round-trips CRUD back to it.
-     * `release()` unregisters it (call once after the worker RPC settles).
-     *
-     * Throws for any backend other than 'cap-db': the legacy LevelDB provider
-     * doesn't survive a thread boundary and its on-disk format is dev-only.
+     * Register a main-thread private-state provider the worker proxies to. Only
+     * 'cap-db': the LevelDB provider does not survive a thread boundary.
      */
     private async registerPrivateStateProxy(): Promise<{ proxyId: string; release: () => void }> {
         const backend = this.deps.walletMaterial.privateStateBackend ?? 'cap-db';
@@ -582,12 +510,7 @@ export class TransactionSubmitter {
         };
     }
 
-    /**
-     * The worker keys facades on `accountId` (deterministic per viewing key, set
-     * by the connectWalletForSigning pre-warm), so deploy/call must look up by
-     * accountId, not the OData session UUID. `args.sessionId` stays on the
-     * PendingSubmissions row for audit.
-     */
+    /** The worker keys facades on accountId, not the OData session id. */
     private makeDeployRpcArgs<PS>(args: DeployArgs<PS>, proxyId: string): WalletDeployContractArgs {
         return {
             sessionId:    this.deps.walletMaterial.accountId,
@@ -599,16 +522,12 @@ export class TransactionSubmitter {
             proofServerUrl: this.deps.contractProvidersConfig.proofServerUrl,
             networkId:      this.deps.network,
             initialPrivateState: args.initialPrivateState,
-            sponsorSessionId: this.deps.sponsorAccountId
+            sponsorSessionId: this.deps.sponsorAccountId,
+            ...(args.recoveryId ? { recoveryId: args.recoveryId } : {})
         };
     }
 
-    /**
-     * Cross-server sponsoring PHASE 1 (0.17.0): build + sign + finalize the
-     * call under the caller's identity and return the fee-unpaid finalized tx
-     * (base64), without submitting. No PendingSubmissions row: nothing reached
-     * the chain. A remote sponsor completes it via `sponsorFinalized`.
-     */
+    /** Build, sign and finalize without submitting (fee-unpaid, base64); no row, nothing on chain. */
     async buildSponsorable(args: CallArgs): Promise<{ finalizedTxB64: string; serializedBytes: number }> {
         const buildFn = this.deps.walletBuildSponsorableTxImpl ?? walletBuildSponsorableTx;
         const proxy = await this.registerPrivateStateProxy();
@@ -694,9 +613,7 @@ export class TransactionSubmitter {
     }
 
     private async markFailed(submissionId: string, classification: SubmissionErrorClassification): Promise<void> {
-        // Best-effort: runs in the error path before the caller throws the
-        // classified SubmissionError, so a write failure here must NOT propagate
-        // and mask the real classification. Swallow and log.
+        // Best-effort: must not mask the classification the caller is about to throw.
         try {
             const db = await this.getDb();
             await db.run(
@@ -718,18 +635,10 @@ export class TransactionSubmitter {
 const KNOWN_ISSUE_1016_MAINNET =
     'https://forum.midnight.network/t/1190 (mainnet 1016 Immediately Dropped: deterministic rejection, early May 2026)';
 
-/**
- * Classifies a thrown error into a stable code + retryability decision.
- * Used by the OData callers and internally to populate
- * PendingSubmissions.errorCode/errorMessage.
- */
+/** Stable code + retryability for a thrown submission error. */
 export function classifySubmissionError(err: unknown, network: NightgateNetwork): SubmissionErrorClassification {
-    // An already-classified error (SubmissionError, or anything carrying a
-    // well-formed classification) keeps its classification VERBATIM.
-    // Re-deriving from the wrapper text loses detail: the wrapper message
-    // says "ledger error 188" while the extraction pattern needs the node's
-    // "Custom error: 188", so a background-job re-classification would
-    // degrade `1010/188` to `1010`.
+    // Keep a prior classification verbatim: the wrapper text lacks the node's
+    // "Custom error: N", so re-deriving would degrade `1010/188` to `1010`.
     const prior = (err as SubmissionError | undefined)?.classification;
     if (prior && typeof prior.code === 'string' && typeof prior.retryable === 'boolean'
         && typeof prior.message === 'string') {
@@ -739,48 +648,25 @@ export function classifySubmissionError(err: unknown, network: NightgateNetwork)
     const message = err instanceof Error ? err.message : String(err);
     const name = err instanceof Error ? err.name : 'Error';
 
-    // Classified by the worker (WorkerSubmitError over the RPC): map the
-    // closed code to the job's error code without reading the text.
     const carried = carriedSubmitFailure(err);
     if (carried) return classificationFromSubmitFailure(carried, message, network);
 
-    // FALLBACK, text only: errors that never crossed the worker RPC (an
-    // SDK error thrown on the main thread, a persisted job error re-thrown
-    // as a plain Error). Pinned in transaction-submitter.test.ts.
-    // SDK TxFailedError, on-chain status was not success
+    // Text fallback for errors that never crossed the worker RPC.
     if (name === 'TxFailedError' || message.includes('TxFailedError')) {
         return { code: 'TxFailed', retryable: false, message };
     }
 
-    // OUR pre-proving batch check (batch-segment-order.ts). Matched on the
-    // message because midnight-js wraps the thrown error ("Unexpected error
-    // submitting scoped transaction ..."), which discards the name. Must come
-    // BEFORE the 1010 patterns: the explanatory text mentions 1010/188 and
-    // would otherwise be misread as a node reject. Nothing was submitted, and
-    // the batch shape is deterministic for the current contract state, so this
-    // is never retryable.
+    // Our pre-proving batch check, matched by message (midnight-js drops the name).
+    // Before the 1010 patterns: its text mentions 1010/188.
     if (/violates the ledger's causality constraint/.test(message)) {
         return { code: 'BatchCausalityViolation', retryable: false, message };
     }
 
-    // Substrate node rejects. The SDK buries the node's line under generic
-    // wrappers (FiberFailure/SubmissionError), so match against a bounded
-    // deep inspection, not just the message (same trick as the worker's
-    // isPreMempoolReject).
-    //
-    // 1010 "Invalid Transaction" is the node's VALIDITY reject (never
-    // entered the pool); its inner `Custom error: N` indexes the ledger's
-    // LedgerApiError enum (117 NotNormalized, 138 Overspend, 170 dust spend
-    // proof, 182 ttl, 188 sequencing check, 192 signature count, ...) and is
-    // surfaced in the code as `1010/N`. This was conflated with 1014
-    // ("priority too low", a POOL reject) until the rebind-batch diagnosis.
-    // classificationHaystack strips stack frames and :line:col tokens, so a
-    // source position like `wallet.js:1010:27` cannot register as a reject
-    // code; bare numeric matches additionally require the node's `NNNN:`
-    // shape or the semantic phrase.
+    // Node rejects hide under SDK wrappers, so match a deep inspection. 1010 is a
+    // validity reject whose `Custom error: N` becomes `1010/N`; 1014 is a pool
+    // reject. The haystack has no stack positions, so `x.js:1010:27` cannot match.
     const haystack = `${message} ${classificationHaystack(err)}`;
-    // "Priority is too low" first: its "(X vs Y)" priority values are
-    // arbitrary numbers and must not be misread as a 1010 code.
+    // First: its "(X vs Y)" priority numbers must not read as a 1010 code.
     if (/priority is too low/i.test(haystack)) {
         return { code: '1014', retryable: false, message: `Pool priority reject (Substrate 1014, priority too low): ${message}` };
     }
@@ -795,6 +681,7 @@ export function classifySubmissionError(err: unknown, network: NightgateNetwork)
             };
         }
         const custom = /custom error:?\s*(\d+)/i.exec(haystack);
+        if (custom?.[1] === '104') return { code: STALE_TRANSCRIPT_CODE, retryable: false, message: staleTranscriptMessage(message) };
         return {
             code: custom ? `1010/${custom[1]}` : '1010',
             retryable: false,
@@ -816,17 +703,14 @@ export function classifySubmissionError(err: unknown, network: NightgateNetwork)
         return { code: '1016', retryable: true, message: `Transaction pool full or immediately dropped: ${message}` };
     }
 
-    // Network / timeout patterns
     if (/ECONNREFUSED|ECONNRESET|ENOTFOUND|ETIMEDOUT|socket hang up|timeout|disconnected from|Normal Closure|Abnormal Closure|WebSocket is not connected/i.test(haystack)) {
         return { code: 'NetworkOrTimeout', retryable: true, message };
     }
 
-    // SDK contract-type / config errors are not retryable
     if (/ContractTypeError|IncompleteCallTxPrivateStateConfig|IncompleteFindContractPrivateStateConfig/.test(name)) {
         return { code: name, retryable: false, message };
     }
 
-    // Session lacks signing material; stable code so consumers can recognize it.
     if (name === 'WalletSigningNotAvailable' || /WalletSigningNotAvailable/.test(message)) {
         return {
             code: 'WalletSigningNotAvailable',
@@ -835,9 +719,14 @@ export function classifySubmissionError(err: unknown, network: NightgateNetwork)
         };
     }
 
-    // Default: unknown but assume non-retryable to avoid hammering
+    // Unknown: non-retryable, to avoid hammering.
     return { code: name || 'UnknownError', retryable: false, message };
 }
+
+/** Ledger error 104 (transcript refused): the call no longer fits the contract state it was built against. */
+const STALE_TRANSCRIPT_CODE = '1010/104';
+const staleTranscriptMessage = (message: string): string =>
+    `Transaction refused against the current contract state (Substrate 1010, ledger error 104: the call's transcript no longer fits, typically its gas budget after another transaction on the same contract grew a map); nothing entered the pool and no fee was spent; build the call again against the current state and submit the new bytes: ${message}`;
 
 /** The job-level classification of a worker-classified submit failure. */
 function classificationFromSubmitFailure(
@@ -859,6 +748,7 @@ function classificationFromSubmitFailure(
         case 'pre-mempool-reject': {
             const ledger = info.ledgerCode ?? '1010';
             if (ledger === 'intent-rejected') return { code: 'SubmitIntentRejected', retryable: false, message };
+            if (ledger === 'intent-timeout') return { code: 'SubmitIntentTimeout', retryable: false, message: `The announced transaction was not recorded in time; nothing was broadcast, a new idempotencyKey may retry: ${message}` };
             if (ledger === '1014') return { code: '1014', retryable: false, message: `Pool priority reject (Substrate 1014, priority too low): ${message}` };
             if (ledger === '1016') {
                 if (network === 'mainnet') {
@@ -866,13 +756,14 @@ function classificationFromSubmitFailure(
                 }
                 return { code: '1016', retryable: true, message: `Transaction pool full or immediately dropped: ${message}` };
             }
+            if (ledger === STALE_TRANSCRIPT_CODE) return { code: ledger, retryable: false, message: staleTranscriptMessage(message) };
             const custom = ledger.startsWith('1010/') ? ledger.slice(5) : null;
             return { code: ledger, retryable: false, message: `Invalid transaction (Substrate 1010${custom ? `, ledger error ${custom}` : ''}): ${message}` };
         }
         case 'transport':
             return { code: 'NetworkOrTimeout', retryable: true, message };
         case 'ambiguous':
-            // Never retried by rebuilding: the identifier may land; reconciliation resolves it.
+            // Never rebuilt: the identifier may land.
             return { code: 'SubmitAmbiguous', retryable: false, message };
         case 'landed-not-applied':
             return { code: 'TxFailed', retryable: false, message };

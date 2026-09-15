@@ -1,6 +1,6 @@
 /**
  * ensureSyncStateSingleton: network/database binding guard + credential
- * backfill (0.16.0). A database indexed for one network must refuse to boot
+ * backfill. A database indexed for one network must refuse to boot
  * under another (mixing chains corrupts indexed and verification data), and
  * persisted node URLs must not retain embedded credentials.
  */

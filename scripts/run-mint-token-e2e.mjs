@@ -1,4 +1,4 @@
-// Live lane for mintShieldedTestToken + deriveTokenType (0.17.0), driven
+// Live lane for mintShieldedTestToken + deriveTokenType, driven
 // entirely through the client SDK (`src/sdk/client.mjs`): deploy the bundled
 // shielded-token contract, mint, and pin that the job's tokenTypeHex equals
 // the compute-only derivation.

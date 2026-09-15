@@ -1,4 +1,4 @@
-// zswap in-process proving measurement (wasm-proving-without-docker FR).
+// zswap in-process proving measurement.
 //
 // NIGHT is unshielded-only, so no NIGHT flow can ever exercise the zswap
 // prover circuits. This runner creates the missing shielded funds itself:

@@ -1,15 +1,6 @@
 import { inspect } from 'node:util';
 
-/**
- * Stringify an arbitrary error value for log output without producing
- * `[object Object]`.
- *
- * The `err?.message ?? String(err)` idiom that used to appear in several
- * places quietly degrades to `[object Object]` when `err` is a plain object
- * without a `.message` property, which Effect.ts and some SDK errors are.
- * `formatErr` falls back to `JSON.stringify` so log output always carries
- * the actual payload.
- */
+/** Error to log string; plain objects without `.message` (Effect, some SDK errors) go through JSON.stringify. */
 export function formatErr(err: unknown): string {
     if (err instanceof Error) return err.message;
     if (err == null) return String(err);
@@ -19,16 +10,9 @@ export function formatErr(err: unknown): string {
 }
 
 /**
- * Deep-inspect an arbitrary error structure for pattern matching (reject
- * classification digs the node's Substrate line out of SDK wrappers) without
- * the inspection itself ever throwing: `util.inspect` invokes a value's
- * `[util.inspect.custom]` method by default, and a throwing custom inspector
- * would turn CLASSIFYING an error into a new error (skipping markFailed on
- * the submitter, disarming the worker's dust guard). The default rendering
- * is kept first (Effect.ts wrappers pretty-print their cause chain through
- * custom inspectors, and the live-proven 1010-classification relies on that
- * output); only when it throws do we retry with custom inspectors disabled,
- * then degrade to formatErr.
+ * Deep inspect that never throws, since classifying an error must not raise a new one.
+ * Custom inspectors stay on first (reject classification reads Effect's cause chain
+ * rendering); only if they throw retry without them, then formatErr.
  */
 export function safeDeepInspect(err: unknown, maxStringLength = 2048): string {
     const opts = { depth: 8, maxStringLength, breakLength: Infinity } as const;
@@ -40,13 +24,8 @@ export function safeDeepInspect(err: unknown, maxStringLength = 2048): string {
 }
 
 /**
- * `safeDeepInspect` variant for reject CLASSIFICATION: stack frames and
- * `:line:col` source positions are stripped, so a location like
- * `wallet.js:1010:27` can never be mistaken for a Substrate reject code
- * (1010/1014/1016). Inspect renders an Error's stack both as real multiline
- * text (top level) and as escaped one-line strings (nested `stack`
- * properties), hence both replacements. Keep safeDeepInspect for logging,
- * where the frames are wanted.
+ * `safeDeepInspect` for reject classification: stack frames and `:line:col` are
+ * stripped so `wallet.js:1010:27` never reads as a Substrate reject code.
  */
 export function classificationHaystack(err: unknown): string {
     return safeDeepInspect(err)
@@ -55,17 +34,9 @@ export function classificationHaystack(err: unknown): string {
 }
 
 /**
- * `formatErr` plus the messages of the nested cause chain (bounded), for
- * errors that cross a boundary where only a string survives (the wallet
- * worker's RPC reply, a job's errorMessage). The SDK buries the node's reject
- * under generic wrappers: `(FiberFailure) SubmissionError: Transaction
- * submission error` on top, `1010: Invalid Transaction: Custom error: 196` or
- * `TransactionInvalidError: ...` only in the innermost cause. Without this the
- * main-thread classifiers (dust race, retryable failover) never see the node's
- * line. Effect's FiberFailure has NO `cause` property (its Cause is behind a
- * symbol and only rendered by inspect as `[cause]: Name: message` lines), so
- * the walk reads the property chain first and the rendered `[cause]:` lines
- * second; a bare Substrate `10xx:` line is the last resort.
+ * `formatErr` plus the bounded cause chain, for errors crossing a string-only boundary:
+ * the node's reject sits in the innermost cause. Effect's FiberFailure has no `cause`
+ * property, so rendered `[cause]:` lines, then a bare `10xx:` line, are fallbacks.
  */
 export function formatErrWithCauses(err: unknown): string {
     const head = formatErr(err);

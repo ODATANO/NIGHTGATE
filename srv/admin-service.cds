@@ -1,20 +1,14 @@
 using { midnight } from '../db/schema';
 
-/**
- * Admin Service for system management
- */
 @path: '/api/v1/admin'
 @requires: 'admin'
 service NightgateAdminService {
 
-    /**
-     * Read-only: every write goes through an action. A generic PATCH/DELETE
-     * would bypass invalidateSession's facade eviction.
-     */
+    /** Writes only through actions (a generic PATCH/DELETE would skip facade eviction). */
     @readonly
     entity WalletSessions as projection on midnight.WalletSessions excluding {
-        encryptedViewingKey,    // Encrypted viewing key, never exposed via admin API
-        encryptedSeedKey        // Encrypted signing seed, never exposed via admin API
+        encryptedViewingKey,
+        encryptedSeedKey
     };
 
     /** Read-only: roles change only through grantRole / revokeRole (authority-gated). */
@@ -22,44 +16,25 @@ service NightgateAdminService {
     entity DisclosureRoles as projection on midnight.DisclosureRoles;
 
     /**
-     * Background jobs, read-only, for operators and monitoring.
-     *
-     * Until now the queue was only reachable through
-     * `getJobStatus(jobId, sessionId)`, which needs an id the caller already
-     * has, plus the aggregate gauges in `getMetrics()`. Neither answers the
-     * question that actually matters when writes start failing: WHICH error is
-     * piling up. A local deployment could read the SQLite file; a hosted one
-     * could not.
-     *
-     * `command`, `request` and `result` are excluded: `command` is encrypted
-     * at rest and the other two carry request and return payloads. Everything
-     * left is workflow metadata plus the classified `errorCode` and the
-     * user-facing `errorMessage`.
-     *
-     * DEPLOYMENT NOTE: CAP materialises a service projection as a SQL view, so
-     * this entity does not exist on an already-deployed database until
-     * `cds deploy` or `nightgate-schema-delta` has run. The API addition is
-     * backwards compatible; the rollout is not code-only.
+     * Job workflow metadata without payloads. A SQL view: on an existing
+     * database it appears only after `cds deploy` or `nightgate-schema-delta`.
      */
     @readonly
     entity BackgroundJobs  as
         projection on midnight.BackgroundJobs
         excluding {
-            command, // encrypted, replayable executable payload
-            request, // inbound arguments
-            result   // return payload
+            command, // encrypted at rest
+            request,
+            result
         };
 
-    // Admin actions
     action invalidateSession(sessionId: UUID);
     action invalidateAllSessions();
 
     /**
-     * Custody export of one contract's signing key (its maintenance
-     * authority), read through the session that deployed it. The result is
-     * the `midnight-signing-key-export` envelope sealed under `password`
-     * (16+ characters), which `importSigningKeys` restores. Store it offline;
-     * whoever holds it can replace the contract's verifier keys.
+     * Export a contract's maintenance signing key from its deploying session,
+     * sealed under `password` (16+ chars); restore with `importSigningKeys`.
+     * Whoever holds it can replace the contract's verifier keys.
      */
     action exportContractSigningKey(sessionId: UUID, contractAddress: String, password: String) returns {
         format          : String;
@@ -70,10 +45,8 @@ service NightgateAdminService {
     };
 
     /**
-     * Contracts known to this process (0.21.0): the config floor plus runtime
-     * registrations. `artifactDigest` is the generation persisted commands are
-     * pinned to; `hasProverKeys` false means the contract deploys and verifies
-     * but cannot be proven here.
+     * Config and runtime-registered contracts. `artifactDigest` pins persisted
+     * jobs; `hasProverKeys` false = deploy/verify only, no proving here.
      */
     function listContracts() returns array of {
         name           : String;
@@ -87,13 +60,10 @@ service NightgateAdminService {
     };
 
     /**
-     * Register a contract artifact at runtime (0.21.0). Paths must resolve
-     * inside `NIGHTGATE_CONTRACTS_DIR`; the module must export a Compact
-     * `Contract` class, the zk-config directory must hold verifier keys and
-     * `zkir/`. Validated before anything changes, persisted in
-     * `ContractRegistrations`, reloaded at boot. A config name is refused with
-     * 409. Re-registering a runtime name under a new artifact is a new
-     * generation; jobs recorded against the previous one refuse.
+     * Register a contract artifact at runtime; paths must lie inside
+     * `NIGHTGATE_CONTRACTS_DIR`. Validated first, persisted, reloaded at boot.
+     * Config names: 409. A new artifact under the same name is a new
+     * generation; jobs pinned to the old one refuse.
      */
     action registerContract(name: String,
                             artifactPath: String,
@@ -117,16 +87,12 @@ service NightgateAdminService {
     };
 
     /**
-     * CPU profile of the wallet worker thread (0.21.4): samples the running
-     * worker for `seconds` (1..120, default 20) with the in-thread V8 profiler
-     * while it keeps serving, and returns where the time went (self time by
-     * function and file, inclusive hot paths, idle/gc/wasm shares). The raw
-     * .cpuprofile is written under `dir` (default: the OS temp dir,
-     * `nightgate-profiles/`) for a DevTools deep dive; `file` names it.
-     * Diagnostic for "the worker is busy and the log does not say why".
+     * CPU-profile a live thread for `seconds` (1..120, default 20) and summarize
+     * where time went. The .cpuprofile is written under `dir` (default OS temp
+     * `nightgate-profiles/`); `file` names it.
      */
     action profileWorker(seconds: Integer, dir: String, thread: String) returns {
-        thread        : String; // 'worker' (default) or 'main' (the CAP process: requests, save pipeline, pollers)
+        thread        : String; // 'worker' (default) | 'main'
         seconds       : Integer;
         file          : String;
         facadeCount   : Integer;
@@ -142,15 +108,7 @@ service NightgateAdminService {
         gc            : { count: Integer; totalMs: Integer; byKind: String }; // byKind: JSON { kind: { count, ms } }
     };
 
-    /**
-     * Job queue in one call: counts per status plus the error codes that are
-     * piling up, over the last `windowHours` (default 24, max 720).
-     *
-     * The cheap read for a dashboard that wants the shape of the queue without
-     * paging the whole BackgroundJobs entity. `topErrors` is what turns "many
-     * jobs failed" into a diagnosis, e.g. a run of `1010/188` meaning batched
-     * calls are crossing the guaranteed/fallible boundary.
-     */
+    /** Job counts per status and top error codes over `windowHours` (default 24, max 720). */
     function getJobStats(windowHours: Integer) returns {
         windowHours         : Integer;
         since               : Timestamp;
@@ -166,9 +124,7 @@ service NightgateAdminService {
         oldestQueuedSeconds : Integer;
     };
 
-    // Grant a disclosure tier to a user. Service-level @requires: 'admin'
-    // gates the CAP-auth side; the handler additionally requires the caller's
-    // own disclosureRole = 'authority' (defense in depth).
+    // Grant a disclosure tier; the caller also needs disclosureRole 'authority'.
     action grantRole(
         userId:     String,
         role:       String,

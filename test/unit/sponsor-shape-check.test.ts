@@ -1,9 +1,9 @@
 /**
  * `checkSponsorableShape` (wallet-worker): the FAIL-CLOSED policy on what a
- * sponsor will pay for. The old inspection only
- * COLLECTED contract calls, so a transaction with one allowed call plus a
- * deploy, a token transfer or its own dust actions sailed through the
- * allow-list and the sponsor paid for all of it.
+ * sponsor will pay for. An inspection that only COLLECTS contract calls would
+ * let a transaction with one allowed call plus a deploy, a token transfer or
+ * its own dust actions through the allow-list, and the sponsor would pay for
+ * all of it.
  */
 
 import { describe, it, expect, beforeAll, afterEach, vi } from 'vitest';
@@ -150,8 +150,8 @@ describe('checkSponsorableShape', () => {
     });
 
     it('accepts a zero-net offer when a sponsorable contract owns a coin in it (a burn: receive + send to the burn address)', () => {
-        // Live shape of the MZCASH burn (preprod tx 3b37b5a2…): 1 user input, 2 commitment outputs
-        // (change + burn address), 1 transient owned by the contract, deltas empty.
+        // Shape of a burn: 1 user input, 2 commitment outputs (change + burn
+        // address), 1 transient owned by the contract, deltas empty.
         const burn = offer([], { inputs: [{}], outputs: [{}, {}], transients: [{ contractAddress: 'aa'.repeat(32) }] });
         expect(withTokens(tx([{ actions: [CALL(undefined, 'mint')] }], { guaranteedOffer: burn }))).toHaveLength(1);
         // the contract-owned coin must still be sponsorable
@@ -205,8 +205,8 @@ describe('checkSponsorableShape', () => {
     });
 
     it('a misconfigured budget falls back to the default instead of DISABLING the cap', () => {
-        // 'abc' and 'Infinity' used to skip the check entirely, which turned a
-        // config typo into an unbounded sponsor.
+        // 'abc' and 'Infinity' must not skip the check: a config typo would
+        // turn into an unbounded sponsor.
         for (const bad of ['abc', 'Infinity', 'NaN', '0', '-1', '1.5', '']) {
             process.env.NIGHTGATE_SPONSOR_MAX_TX_BYTES = bad;
             expect(() => check(tx([{ actions: [CALL()] }]), 70_000), `value '${bad}'`)
@@ -348,7 +348,7 @@ describe('assertArtifactGenerationOnDisk: the worker verifies the pinned generat
         try {
             // leftovers in the install's root, a snapshot unused for 30 days that
             // no live process holds, one that another live process (the parent) holds,
-            // and a per-process root of the 0.21-0.22 layout whose process is gone
+            // and a per-process root of the older per-pid layout whose process is gone
             const myRoot = workerExports.artifactSnapshotRoot();
             fs.mkdirSync(path.join(myRoot, 'deadbeef.tmp-1-abcd', 'module'), { recursive: true });
             fs.mkdirSync(path.join(myRoot, 'f'.repeat(64), 'keys'), { recursive: true });

@@ -2,8 +2,8 @@
  * CAP's JSON log format writes EVERY request header into each log line and
  * masks only the ones matching `cds.env.log.mask_headers` (authorization,
  * cookie, cert, ssl, api-key by default). The agent token rides in its own
- * header, so without this entry every token-authenticated request logged the
- * bearer token in clear. The formatter freezes the list on its first use,
+ * header, so without this entry every token-authenticated request would log
+ * the bearer token in clear. The formatter freezes the list on its first use,
  * hence this runs at plugin registration, before anything is served.
  */
 export const AGENT_TOKEN_HEADER_MASK = '/x-agent-token/i';

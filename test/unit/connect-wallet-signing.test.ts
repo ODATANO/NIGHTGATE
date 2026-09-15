@@ -6,11 +6,8 @@
  *
  * The handler kicks off `getOrBuildWalletFacade(...)` as a fire-and-forget
  * Promise to pre-warm the wallet. We mock that here so the unawaited chain
- * resolves synchronously instead of touching the worker RPC + CAP model load.
- * Those held handles open past test completion and triggered "worker
- * failed to exit gracefully" warnings on the test runner's worker pool
- * teardown (observed under the old Jest setup; the mock stays because the
- * unawaited chain must not touch worker RPC + CAP model load either way).
+ * resolves synchronously instead of touching the worker RPC + CAP model load,
+ * which would hold handles open past test completion.
  */
 
 vi.mock('../../srv/submission/wallet-facade-builder', () => ({
@@ -236,8 +233,8 @@ describe('connectWalletForSigning: seed/session consistency (fail-closed)', () =
 
     test('400 when the seed does not derive the session viewing key; nothing persisted, no prewarm', async () => {
         const { srv, db } = setup();
-        // The account-0 bug shape: session connected for account 1, seed
-        // derives a DIFFERENT viewing key at the requested account.
+        // Session connected for account 1, seed derives a DIFFERENT viewing
+        // key at the requested account.
         mockDeriveViewingKey.mockResolvedValueOnce('mn_shield-vk_other-account');
 
         const req = makeReq({ sessionId: 'sess-1', seedHex: VALID_SEED, accountIndex: 1 });

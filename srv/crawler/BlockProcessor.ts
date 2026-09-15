@@ -1,8 +1,4 @@
-/**
- * BlockProcessor: parses and persists Midnight blocks.
- * Parse header, classify transactions, extract inputs/outputs/contract
- * actions, write to DB.
- */
+/** Parses Midnight blocks (header, extrinsic classification, outcomes) and persists them. */
 
 import cds from '@sap/cds';
 import { blake2b } from '@noble/hashes/blake2';
@@ -44,22 +40,7 @@ const VALID_TX_TYPES = new Set([
     'system', 'unknown'
 ]);
 
-/**
- * Midnight runtime pallet index → classification.
- *
- * HARDCODED from runtime metadata (specName 'midnight', specVersion 1000000;
- * read from preprod via state_getMetadata 2026-07-22). Pallet indices are fixed
- * by `construct_runtime!` and identical across nodes of the same runtime
- * version, NOT a per-deployment choice. They CAN shift on a Midnight RUNTIME
- * UPGRADE: re-verify against chain metadata when Midnight bumps its runtime. The
- * `cds.requires.nightgate.palletMap` override is a hotfix escape hatch.
- *
- * NOTE: Midnight wraps ALL user operations (contract deploy/call, shielded
- * transfer, unshield, NIGHT transfer) in ONE call, `Midnight.send_mn_transaction`
- * (pallet 5, call 0). The operation type lives in the ledger payload, not the
- * pallet/call index, so it can't be distinguished here; pallet 5 is bucketed as
- * `contract_call`. Finer classification needs decoding the ledger tx payload.
- */
+/** Default pallet index -> classification; runtime metadata re-maps these by pallet name. */
 const DEFAULT_PALLET_MAP: Record<number, PalletMapping> = {
     0: { name: 'System', txType: 'system', isSystem: true },
     1: { name: 'Timestamp', txType: 'system', isSystem: true },
@@ -93,17 +74,11 @@ const DEFAULT_PALLET_MAP: Record<number, PalletMapping> = {
 
 const NIGHT_TOKEN_TYPE_HEX = '0x4e49474854';
 
-/** `cds.requires.nightgate.palletMap`: index-keyed overrides, applied on top of whatever the defaults or the runtime metadata say. */
-/**
- * The persisted form of an extrinsic: CAP carries `LargeBinary` values as
- * base64 text on every dialect (SQLite stores that text, PostgreSQL decodes
- * it to BYTEA on write and encodes on read; a Buffer on the entries path is
- * JSON-serialised as an object). Reads return the same base64 string.
- */
 function hexToBinaryValue(hex: string): string {
     return Buffer.from(hex.startsWith('0x') ? hex.slice(2) : hex, 'hex').toString('base64');
 }
 
+/** `cds.requires.nightgate.palletMap`: index-keyed overrides on top of defaults or runtime metadata. */
 function configPalletOverrides(): Map<number, PalletMapping> {
     const map = new Map<number, PalletMapping>();
     const nightgateConfig = getNightgatePluginConfig();
@@ -130,13 +105,7 @@ function buildPalletMap(): Map<number, PalletMapping> {
     return map;
 }
 
-/**
- * Resolve the pallet map from the runtime's own metadata: every pallet the
- * chain declares is matched BY NAME to the default mapping, so a runtime
- * upgrade that renumbers pallets cannot silently turn ledger transactions
- * into `unknown` (or an inherent into a contract call). Config overrides
- * (index-keyed) stay on top. Returns the map plus what changed, for the log.
- */
+/** Pallet map from runtime metadata: default mappings matched by name, then the overrides. */
 export function resolvePalletMapFromMetadata(
     pallets: Array<{ name: unknown; index: unknown }>,
     overrides: Map<number, PalletMapping> = new Map()
@@ -159,10 +128,6 @@ export function resolvePalletMapFromMetadata(
     return { map, moved, unmapped };
 }
 
-// ============================================================================
-// Types
-// ============================================================================
-
 export interface ProcessResult {
     blockHeight: number;
     blockHash: string;
@@ -177,17 +142,7 @@ interface RuntimeContext {
     palletMap: Map<number, PalletMapping>;
 }
 
-/**
- * Per-block data fetched from the node, ready to persist. Produced by
- * `fetchBlockBatch`, consumed by `persistBlockData`. Decoupling fetch from
- * persist lets the crawler pipeline RPC fetches in parallel while writing to
- * SQLite serially; every block carries the pallet map of its own runtime, so
- * a batch straddling a runtime upgrade, or two batches in flight, classify
- * each block with the right map.
- *
- * Discriminated union on `alreadyIndexed`: a DB short-circuit omits the heavy
- * RPC fields; a full fetch has them all.
- */
+/** Per-block node data from `fetchBlockBatch`, ready for `persistPreparedBlock`. */
 export type PreparedBlock = PreparedBlockSkipped | PreparedBlockFetched;
 
 export interface PreparedBlockSkipped {
@@ -202,19 +157,13 @@ export interface PreparedBlockFetched {
     height: number;
     signedBlock: SignedBlock;
     protocolVersion: number;
-    /** The pallet map of THIS block's runtime version; classification never reads processor state. */
     palletMap: Map<number, PalletMapping>;
     timestamp: number;
     extrinsicOutcomes: Map<number, 'SUCCESS' | 'FAILURE'>;
     fetchStartedAt: number;
-    /** Set when all RPCs for this block have resolved. Used for fetch-vs-persist timing diagnostics. */
     fetchCompletedAt?: number;
     alreadyIndexed: false;
 }
-
-// ============================================================================
-// Block Processor
-// ============================================================================
 
 export class BlockProcessor {
     private db!: cds.DatabaseService;
@@ -247,21 +196,13 @@ export class BlockProcessor {
         this.db = await cds.connect.to('db');
     }
 
-    /**
-     * Process a single block by hash, fetch, parse, and persist atomically.
-     * Hash-addressed on-demand processing is NOT height-sequenced, so a
-     * missing parent falls back to `parent_ID = null` instead of failing.
-     */
+    /** Not height-sequenced: a missing parent persists `parent_ID = null` instead of failing. */
     async processBlockByHash(blockHash: string): Promise<ProcessResult> {
         const start = Date.now();
         return this.processFromNode(blockHash, start, { requireParent: false });
     }
 
-    /**
-     * Process a block by height. Height-sequenced path (live crawler): a
-     * missing parent means an index gap and must fail loudly instead of
-     * silently persisting an orphan row.
-     */
+    /** Height-sequenced: a missing parent is an index gap and fails instead of persisting an orphan. */
     async processBlockByHeight(height: number): Promise<ProcessResult> {
         const hash = await this.nodeProvider.getBlockHash(height);
         if (!hash) throw new Error(`No block at height ${height}`);
@@ -269,22 +210,17 @@ export class BlockProcessor {
     }
 
     /**
-     * Fetch a contiguous range of blocks in two JSON-RPC batches.
-     *
-     * Round 1: `chain_getBlockHash(h)` for every height → 1 WSS round-trip
-     * Round 2: for every NEW hash, `chain_getBlock(h)` + `state_getStorage(timestamp_key, h)`
-     *           together in one batch frame → 1 WSS round-trip
+     * Fetches a height range in two batch frames: all hashes, then block,
+     * timestamp, System.Events and runtime version for every hash not yet indexed.
      */
     async fetchBlockBatch(heights: number[]): Promise<PreparedBlock[]> {
         if (heights.length === 0) return [];
         const fetchStartedAt = Date.now();
 
-        // Round 1: heights → hashes, one batched RPC frame.
         const hashes = await this.nodeProvider.rpcBatch(
             heights.map(h => ({ method: 'chain_getBlockHash', params: [h] }))
         ) as string[];
 
-        // Bulk SELECT: which of these hashes are already in the DB
         const truthyHashes = hashes.filter((h): h is string => !!h);
         const existing: Array<{ hash: string }> = truthyHashes.length
             ? (await this.db.run(
@@ -293,16 +229,11 @@ export class BlockProcessor {
             : [];
         const existingSet = new Set(existing.map(r => r.hash));
 
-        // collect the indices of NEW blocks we still need to fetch.
         const newIndices: number[] = [];
         for (let i = 0; i < heights.length; i++) {
             if (hashes[i] && !existingSet.has(hashes[i])) newIndices.push(i);
         }
 
-        // Round 2: block + timestamp + System.Events + runtime version for
-        // every new hash, one batch frame. The version rides per block (it is
-        // cheap inside the frame) so a runtime upgrade inside a batch is
-        // decoded with the right metadata from its first block on.
         let blockResults: SignedBlock[] = [];
         let tsResults: (string | null)[] = [];
         let eventResults: (string | null)[] = [];
@@ -324,7 +255,6 @@ export class BlockProcessor {
 
         const fetchCompletedAt = Date.now();
 
-        // Assemble PreparedBlock[] in the same order as input heights.
         const out: PreparedBlock[] = new Array(heights.length);
         let newIdx = 0;
         for (let i = 0; i < heights.length; i++) {
@@ -379,13 +309,7 @@ export class BlockProcessor {
         }
     }
 
-    /**
-     * The block's own timestamp: Timestamp::Now storage first; against a
-     * pruning node (state gone) the `Timestamp.set(now)` inherent that every
-     * block carries as extrinsic 0 (Compact<u64> ms, no state read needed).
-     * NEVER the wall clock: a catch-up would persist "now" on every historical
-     * block with nothing marking the rows.
-     */
+    /** Timestamp::Now storage, else the `Timestamp.set` inherent at extrinsic 0 (survives state pruning). */
     private resolveTimestamp(storageHex: string | null | undefined, extrinsics: string[] | undefined, where: string, palletMap: Map<number, PalletMapping> = this.defaultPalletMap): number {
         const fromStorage = this.parseTimestampHex(storageHex);
         if (fromStorage != null) return fromStorage;
@@ -406,10 +330,7 @@ export class BlockProcessor {
         return Number(decoded[0] / 1000n);
     }
 
-    /**
-     * Persist a prefetched block. Mirror of the persist phase in
-     * `processFromNode`, but skips all RPC calls.
-     */
+    /** Persists a block from `fetchBlockBatch` without further RPC calls. */
     async persistPreparedBlock(prep: PreparedBlock): Promise<ProcessResult> {
         const start = prep.fetchStartedAt;
         if (prep.alreadyIndexed) {
@@ -421,14 +342,10 @@ export class BlockProcessor {
                 processingTimeMs: Date.now() - start
             };
         }
-        // Catch-up pipeline persists in strict height order: a missing parent
-        // means an index gap and must fail loudly.
+        // Catch-up persists in height order: a missing parent is an index gap.
         return this.persistFromNode(prep, start, { requireParent: true });
     }
 
-    /**
-     * Check if a block already exists in the local DB
-     */
     async blockExists(hash: string): Promise<boolean> {
         const existing = await this.db.run(
             SELECT.one.from(Blocks).columns('ID').where({ hash })
@@ -436,16 +353,11 @@ export class BlockProcessor {
         return !!existing;
     }
 
-    // ========================================================================
-    // Node-based Processing (Substrate RPC raw blocks)
-    // ========================================================================
-
     private async processFromNode(
         blockHash: string,
         start: number,
         opts?: { requireParent?: boolean }
     ): Promise<ProcessResult> {
-        // Skip if already processed
         if (await this.blockExists(blockHash)) {
             const header = await this.nodeProvider.getHeader(blockHash);
             return {
@@ -457,7 +369,6 @@ export class BlockProcessor {
             };
         }
 
-        // Parallelize the independent RPC fetches over the same WSS.
         const [signedBlock, timestampHex, protocolVersion, rawEvents] = await Promise.all([
             this.nodeProvider.getBlock(blockHash),
             this.getBlockTimestampHex(blockHash),
@@ -498,9 +409,7 @@ export class BlockProcessor {
         let txCount = 0;
         let actionCount = 0;
 
-        // Atomic DB write
         await this.db.tx(async (tx: any) => {
-            // 1. Insert block
             const blockId = cds.utils.uuid();
             const parentBlock = await tx.run(
                 SELECT.one.from(Blocks).columns('ID').where({ hash: header.parentHash })
@@ -524,7 +433,6 @@ export class BlockProcessor {
                 parent_ID: parentBlock?.ID || null
             }));
 
-            // 2. Parse extrinsics into rows for bulk insert
             const txRows: Record<string, unknown>[] = [];
             const txResultRows: Record<string, unknown>[] = [];
             const txFeeRows: Record<string, unknown>[] = [];
@@ -595,13 +503,11 @@ export class BlockProcessor {
                 txCount++;
             }
 
-            // Bulk inserts
             if (txRows.length) await tx.run(INSERT.into(Transactions).entries(txRows));
             if (txResultRows.length) await tx.run(INSERT.into(TransactionResults).entries(txResultRows));
             if (txFeeRows.length) await tx.run(INSERT.into(TransactionFees).entries(txFeeRows));
             if (contractActionRows.length) await tx.run(INSERT.into(ContractActions).entries(contractActionRows));
 
-            // 3. Update SyncState
             await tx.run(
                 UPDATE.entity(SyncState).set({
                     lastIndexedHeight: height,
@@ -627,7 +533,6 @@ export class BlockProcessor {
             return { txType: 'system', isShielded: false, isSystem: true };
         }
 
-        // Parse SCALE-encoded extrinsic to extract pallet + call index
         const indices = parseExtrinsicCallIndices(hex);
         if (indices) {
             return {
@@ -637,7 +542,7 @@ export class BlockProcessor {
             };
         }
 
-        // Fallback: length-based heuristic when parsing fails
+        // Unparseable: length heuristic.
         if (hex.length < 100) {
             return { txType: 'system', isShielded: false, isSystem: true };
         }
@@ -712,10 +617,7 @@ export class BlockProcessor {
         return 0;
     }
 
-    /**
-     * blake2b-256 of the raw SCALE-encoded extrinsic bytes: the canonical
-     * extrinsic hash matching block explorers and other indexers.
-     */
+    /** blake2b-256 of the raw extrinsic bytes: the canonical extrinsic hash explorers use. */
     private hashExtrinsic(hex: string): string {
         const cleanHex = hex.startsWith('0x') ? hex.slice(2) : hex;
         const bytes = Buffer.from(cleanHex, 'hex');
@@ -723,18 +625,9 @@ export class BlockProcessor {
         return '0x' + bytesToHex(hash);
     }
 
-    /**
-     * The event registry (and pallet map) of a runtime version, loaded from
-     * the node's metadata once per specVersion. Fail-closed: when the
-     * metadata cannot be loaded or decoded the block is NOT processed under
-     * the previous version's map (outcomes and pallet names would be guesses);
-     * the error propagates as a block-level fetch failure, so the batch is
-     * retried like any other RPC failure and nothing is persisted. A failed
-     * load is not cached.
-     */
+    /** Event registry of a runtime version, loaded from node metadata once per specVersion. */
     private async getEventRegistry(blockHash: string, specVersion: number): Promise<TypeRegistry | undefined> {
-        // specVersionFromBatch admits 0 as a valid version; a falsy check here
-        // would classify such a block with the default map and no metadata.
+        // 0 is a valid specVersion: no falsy check.
         if (!Number.isInteger(specVersion) || specVersion < 0) {
             throw new Error(`Invalid runtime specVersion ${String(specVersion)} for block ${blockHash}`);
         }
@@ -763,12 +656,6 @@ export class BlockProcessor {
         return registry;
     }
 
-    /**
-     * The runtime's own pallet list decides the map (see
-     * resolvePalletMapFromMetadata). A metadata whose pallets cannot be read is
-     * an unsupported representation: the block fails instead of being
-     * classified with the compiled default indices.
-     */
     private palletMapFromMetadata(registry: TypeRegistry, specVersion: number): Map<number, PalletMapping> {
         let pallets: Array<{ name: unknown; index: unknown }>;
         try { pallets = ((registry.metadata as any)?.pallets ?? []) as Array<{ name: unknown; index: unknown }>; } catch (err) {
@@ -786,12 +673,7 @@ export class BlockProcessor {
         return map;
     }
 
-    /**
-     * Decode only the canonical System outcome event for each extrinsic. When
-     * the events cannot be read or decoded the outcomes stay unknown; that is
-     * logged per block (a job waiting on the outcome of one of these
-     * transactions never resolves from crawler evidence).
-     */
+    /** Outcome per extrinsic from System.ExtrinsicSuccess/ExtrinsicFailed only; a failure wins. */
     private decodeExtrinsicOutcomes(
         rawEvents: string | null | undefined,
         registry: TypeRegistry | undefined,
@@ -822,15 +704,7 @@ export class BlockProcessor {
         return outcomes;
     }
 
-    /**
-     * The batched `state_getRuntimeVersion` answer for one block. Fail-closed:
-     * without it the block is not persisted (it would be decoded with another
-     * runtime's map); the error is transient, the batch is retried.
-     */
     private specVersionFromBatch(rv: { specVersion?: unknown } | null | undefined, where: string): number {
-        // The raw value must be a number (or a digit string) BEFORE conversion:
-        // Number(null), Number('') and Number(false) are all 0, a valid version,
-        // and would file this block's metadata under runtime 0.
         const raw = rv?.specVersion;
         const v = typeof raw === 'number' ? raw
             : typeof raw === 'string' && /^\d+$/.test(raw) ? Number(raw)
@@ -854,12 +728,7 @@ export class BlockProcessor {
         }
     }
 
-    /**
-     * The runtime specVersion at a specific block, queried per block so a
-     * runtime upgrade is reflected from its first block on. Fail-closed: a
-     * failed or empty answer refuses the block (never a previous version's
-     * map), as a transient error the caller retries.
-     */
+    /** Queried per block so a runtime upgrade applies from its first block. */
     private async getProtocolVersion(blockHash: string): Promise<number> {
         let rv: { specVersion?: number } | null | undefined;
         try {
@@ -870,11 +739,7 @@ export class BlockProcessor {
         return this.specVersionFromBatch(rv, `block ${blockHash}`);
     }
 
-    /**
-     * Extract author/validator info from digest logs.
-     * Looks for PreRuntime log (type 0x06) containing engine ID + authority data.
-     * Falls back to the first digest log entry if no PreRuntime log found.
-     */
+    /** `engineId:data` of the PreRuntime digest log (type 6), else the first log. */
     private extractAuthor(digestLogs: string[] | undefined): string | null {
         if (!digestLogs || digestLogs.length === 0) return null;
 
@@ -884,7 +749,6 @@ export class BlockProcessor {
 
             const logType = parseInt(clean.slice(0, 2), 16);
 
-            // PreRuntime digest log type = 6
             if (logType === 6) {
                 const engineId = Buffer.from(clean.slice(2, 10), 'hex').toString('ascii');
                 const data = '0x' + clean.slice(10);
@@ -892,7 +756,6 @@ export class BlockProcessor {
             }
         }
 
-        // Fallback: return first log entry
         return digestLogs[0] || null;
     }
 }

@@ -29,7 +29,7 @@ describe('vault lineage parity', () => {
     });
 
     test('a changed assert message is drift', () => {
-        const mutated = src32.replace('"not committer"', '"not the committer"');
+        const mutated = src32.replace('"already attested"', '"the payload is already attested"');
         expect(mutated).not.toBe(src32);
         const r = compareVaultSources(src16, mutated);
         expect(r.ok).toBe(false);
@@ -37,13 +37,13 @@ describe('vault lineage parity', () => {
     });
 
     test('an added statement on one side is drift', () => {
-        const mutated = src16.replace('attest_commits.remove(disclose(key));', 'attest_commits.remove(disclose(key));\n  attest_seq_next = 0;');
+        const mutated = src16.replace('attestations.remove(disclose(record));', 'attestations.remove(disclose(record));\n  registrar = pad(32, "");');
         expect(mutated).not.toBe(src16);
         expect(compareVaultSources(mutated, src32).ok).toBe(false);
     });
 
     test('a dropped guard is drift', () => {
-        const line = 'assert(!guarded_attestations.member(disclose(payload_hash)), "attestation is guarded");';
+        const line = 'assert(kernel.blockTimeGreaterThan(claims.lookup(disclose(key))), "claim not expired");';
         expect(src32).toContain(line);
         expect(compareVaultSources(src16, src32.replace(line, '')).ok).toBe(false);
     });

@@ -1,22 +1,7 @@
 /**
- * In-process ProofProvider for contract circuits (NIGHTGATE_PROVING_MODE=wasm).
- *
- * midnight-js's httpClientProofProvider is a thin transport: its proveTx runs
- * `unprovenTx.prove(provingProvider, costModel)` on the LOCAL ledger WASM,
- * which calls back per circuit with (serializedPreimage, keyLocation). The
- * HTTP provider ships those callbacks to the proof server's /check + /prove;
- * zkir-v2 exports the same computation locally (`provingProvider(keys)`), so
- * this module answers them in-process instead:
- *
- *   - contract circuits: key material from the contract's local zkConfig
- *     (managed/keys + zkir via the same zkConfigProvider.get(keyLocation)
- *     lookup the HTTP provider uses to embed material in its payloads)
- *   - standard circuits + BLS params: the wallet SDK's default key-material
- *     provider (Midnight's S3 bucket, in-memory cache per process)
- *
- * CPU note: proving blocks the calling thread for the proof duration. That is
- * acceptable for the dev/test scope of the wasm mode; production stays on the
- * proof server.
+ * In-process ProofProvider (NIGHTGATE_PROVING_MODE=wasm): answers the ledger's per-circuit
+ * prove callbacks with zkir-v2 locally, keys from the contract's zkConfig, else the SDK's
+ * standard key-material provider. Proving blocks the calling thread.
  */
 
 interface WasmProofDeps {
@@ -50,30 +35,19 @@ async function loadDeps(): Promise<WasmProofDeps> {
     return cachedDeps;
 }
 
-/**
- * The process-wide standard-circuit key-material provider (S3-backed, with the
- * SDK's in-memory cache). Shared so wallet proving and contract proving reuse
- * ONE download cache instead of re-fetching keys per wallet session.
- */
+/** Process-wide standard-circuit key provider, shared so wallet and contract proving use one download cache. */
 export async function getSharedKeyMaterialProvider(): Promise<{ lookupKey(loc: string): Promise<any>; getParams(k: number): Promise<Uint8Array> }> {
     return (await loadDeps()).fallbackKeys;
 }
 
 import { runtimeConfigEnum } from './runtime-config';
 
-/**
- * True when NIGHTGATE_PROVING_MODE selects in-process WASM proving. Reads
- * through runtime-config: this file ships in the slim package, where the
- * server's config table does not exist and the environment decides.
- */
+/** Reads through runtime-config: this file ships in the slim package, which has no config table. */
 export function isWasmProvingMode(): boolean {
     return runtimeConfigEnum('NIGHTGATE_PROVING_MODE') === 'wasm';
 }
 
-/**
- * Drop-in replacement for `httpClientProofProvider(url, zkConfigProvider)`:
- * same `{ proveTx }` contract, no proof server involved.
- */
+/** Drop-in for `httpClientProofProvider(url, zkConfigProvider)` without a proof server. */
 export async function buildWasmProofProvider(zkConfigProvider: any): Promise<{ proveTx: (unprovenTx: any) => Promise<any> }> {
     const { zkir, ledger, zkConfigToProvingKeyMaterial, fallbackKeys } = await loadDeps();
 
@@ -83,10 +57,8 @@ export async function buildWasmProofProvider(zkConfigProvider: any): Promise<{ p
             try {
                 return zkConfigToProvingKeyMaterial(await zkConfigProvider.get(keyLocation));
             } catch (err) {
-                // Expected for zswap/dust standard circuits (not in the
-                // contract's zkConfig); resolve those like the wallet prover.
-                // Kept in case it was a REAL zkConfig failure and the fallback
-                // misses too, so the thrown error names the actual cause.
+                // Expected for standard circuits; kept so a real zkConfig
+                // failure is named if the fallback misses too.
                 zkConfigError = err;
             }
             const material = await fallbackKeys.lookupKey(keyLocation);

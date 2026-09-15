@@ -1,41 +1,13 @@
 /**
- * Agent grants: scoped machine capabilities over a wallet session
- * (agent-access-layer FR, workstream 2 / phase B).
- *
- * Two exports wired up in nightgate-service.ts:
- *   - `registerAgentGrantHandlers`: createAgentGrant / revokeAgentGrant.
- *   - `attachAgentGrantEnforcement`: a before('*') hook that turns an
- *     `x-agent-token` header into a restricted principal. It must be
- *     registered BEFORE all other before-hooks so the effective user is
- *     already the grant's operator when owner-scoping hooks read it.
- *
- * Model: the token is a
- * bearer capability, NOT an identity. On-chain authority stays the session
- * wallet; the grant only restricts. Transport authentication remains the
- * host app's concern; the token authorizes and scopes WITHIN the service,
- * and a valid token replaces the transport principal with the operator's
- * userId so every existing `userId` gate keeps working unchanged.
- *
- * Enforcement ladder for token-carrying requests:
- *   1. token resolves to an active grant (401 otherwise, non-leaking)
- *   2. grant not expired (410)
- *   3. event allowed: read-only verify surface + getJobStatus always;
- *      write actions only when allow-listed (403); everything else 403
- *      (wallet lifecycle, sends, deploys, grant admin are not grantable)
- *   4. sessionId / sponsorSessionId pinned to the grant (403 on mismatch,
- *      injected when absent; a sponsor-bound agent MUST run sponsored).
- *      One exception: getJobStatus may name the grant's PINNED sponsor
- *      session, because phase-2 sponsoring jobs are keyed by it
- *   5. daily write-job budget consumed via atomic conditional UPDATE (429
- *      when exhausted). Detached from the request tx on purpose: budget
- *      spend must stick even when the request later fails, which
- *      over-counts failed requests rather than under-counting abuse.
+ * Agent grants: a bearer token that only restricts one wallet session, never an
+ * identity. A valid token swaps the principal to the grant's operator, so every
+ * existing userId gate applies unchanged.
  */
 
 import cds from '@sap/cds';
 import type { Request } from '@sap/cds';
 import crypto from 'crypto';
-import { AgentGrants, WalletSessions } from '#cds-models/midnight';
+import { AgentGrants, WalletSessions, BackgroundJobs, Transactions, TransactionFees } from '#cds-models/midnight';
 import { RateLimiter } from '../utils/rate-limiter';
 import { PLATFORM_POOL_SENTINEL } from '../submission/sponsor-pool';
 import { getConfiguredFeeSponsorSessions } from '../submission/fee-sponsor';
@@ -43,9 +15,10 @@ import { GrantPolicyInput, validatePolicyList, validateTokenTypeList } from '../
 import { withKeyedLock } from '../utils/keyed-lock';
 import { runWithoutAmbientTx } from '../submission/background-jobs';
 import { resolveFeeSponsor, FeeSponsorError } from '../submission/fee-sponsor';
-import { getNightgatePluginConfig } from '../utils/nightgate-config';
+import { getNightgatePluginConfig, resolveNightgateRuntimeConfig } from '../utils/nightgate-config';
+import { configNumber } from '../utils/config';
 import { isSessionExpired } from '../utils/session-expiry';
-import { AGENT_TOKEN_HEADER, AGENT_TOKEN_TRANSPORT_USER } from '../utils/agent-token-transport';
+import { AGENT_TOKEN_HEADER, AGENT_TOKEN_TRANSPORT_USER, PUBLIC_VERIFY_TRANSPORT_USER } from '../utils/agent-token-transport';
 import { principalRateKey } from '../utils/rate-limiter';
 
 const { SELECT, INSERT, UPDATE } = cds.ql;
@@ -56,15 +29,9 @@ export { AGENT_TOKEN_HEADER };
 const TOKEN_PREFIX = 'ngat_';
 const TOKEN_BYTES = 32;
 
-/**
- * Write actions an operator MAY put on a grant's allowlist. Everything not
- * in this set and not in AGENT_ALWAYS_ALLOWED_EVENTS is a hard 403 for
- * token requests: wallet lifecycle, sends, deploys, passport/identity
- * registration and grant administration are never grantable.
- */
+/** Write actions a grant may allow; anything else not always-allowed is a 403 for a token. */
 export const AGENT_ALLOWLISTABLE_ACTIONS: readonly string[] = [
     'anchorDocument',
-    'commitDocumentAnchor',
     'attestAgentOutput',
     'issueFieldPredicateAttestation',
     'issueFieldEqualityAttestation',
@@ -75,11 +42,8 @@ export const AGENT_ALLOWLISTABLE_ACTIONS: readonly string[] = [
     'grantDisclosure',
     'revokeDisclosure',
     'reindexDisclosures',
-    // Cross-server fee sponsoring, phase 2 (0.17.0): the transaction arrives
-    // PROVEN and SIGNED, so the grant spends nothing but the sponsor's dust,
-    // which is exactly what sponsor pinning + the daily budget meter. The
-    // on-chain effect carries the BUILDER's identity, not the session's.
-    // The unbound (parallel, 0.18) channel has the identical trust shape.
+    // The transaction arrives proven and signed: the grant spends only the
+    // sponsor's dust, which sponsor pinning and the daily budget meter.
     'sponsorFinalizedTransaction',
     'sponsorUnboundTransaction'
 ];
@@ -91,11 +55,8 @@ export const SPONSOR_PHASE2_ACTIONS: ReadonlySet<string> = new Set([
 ]);
 
 /**
- * Entities a token may READ. Chain-derived projections are public data; the
- * four session-bound ones are narrowed to the grant's session (or the grant
- * itself) in enforceAgentGrant. Every other entity (GranteeIdentities among
- * them) is a 403 for a token: the token is bound to one session, and an
- * owner-scoped listing would expose the operator's other sessions.
+ * Entities a token may READ; session-bound ones are narrowed in enforceAgentGrant.
+ * Any other owner-scoped listing would expose the operator's other sessions.
  */
 export const AGENT_READABLE_ENTITIES: ReadonlySet<string> = new Set([
     'Blocks', 'Transactions', 'TransactionResults', 'TransactionSegments', 'TransactionFees',
@@ -104,29 +65,24 @@ export const AGENT_READABLE_ENTITIES: ReadonlySet<string> = new Set([
     'WalletSessions', 'PendingSubmissions', 'AgentGrants', 'Documents'
 ]);
 
-/**
- * Events every valid token may use without an allowlist entry and without
- * consuming budget: the read-only verify surface, entity READs (limited to
- * AGENT_READABLE_ENTITIES and narrowed to the grant's session) and job
- * polling.
- */
+/** Events every valid token may use without an allowlist entry or budget. */
 export const AGENT_ALWAYS_ALLOWED_EVENTS: ReadonlySet<string> = new Set([
     'READ',
     'verifyDocument',
     'verifyAttestationState',
     'verifyPredicateState',
     'verifyPredicateAttestation',
-    'prepareDocumentProof', // compute-only, no chain write, no session needed
-    'prepareAnchorCommitment', // compute-only (commit-reveal phase 0)
-    'prepareMembershipSet', // compute-only (canonical set tree)
-    'deriveTokenType', // compute-only (token identity from address + separator)
-    'getJobStatus'
-    // getSponsorPoolStatus is excluded: the hook below runs the request as the
-    // grant's operator, so a token would read the pool status and balances of
-    // every sponsor session that operator owns, not only its pinned sponsor.
+    'prepareDocumentProof', // compute-only
+    'prepareMembershipSet', // compute-only
+    'deriveTokenType', // compute-only
+    'getJobStatus',
+    'getGrantUsage' // narrowed to the token's own grant in enforceAgentGrant
+    // Not getSponsorPoolStatus: as the operator, a token would read every
+    // sponsor session that operator owns.
 ]);
 
-const grantAdminRateLimiter = new RateLimiter({ windowMs: 60 * 60 * 1000, maxRequests: 10 });
+// Grant administration (create, update, rotate, revoke) per hour per principal.
+const grantAdminRateLimiter = new RateLimiter({ windowMs: 60 * 60 * 1000, maxRequests: configNumber('NIGHTGATE_GRANT_ADMIN_RATE_LIMIT') });
 
 /** Forget every rate-limit window (tests: one principal serves every case). */
 export function __resetGrantRateLimiterForTests(): void {
@@ -158,12 +114,8 @@ interface AgentGrantRow {
 type Runner = { run: (q: unknown) => Promise<unknown> };
 
 /**
- * Record addresses deployed under a grant in `deployedContracts`; the effective
- * sponsor policy adds them on top of `floor ∩ grant`. Does not touch
- * `allowedContracts` (an address appended there falls out of the intersection
- * under a non-empty floor). Idempotent merge, serialised per grant; runs from
- * the in-process success path and the reconciliation finalizer. Failures are
- * logged at ERROR and rethrown.
+ * Record addresses deployed under a grant; the sponsor policy adds them on top of
+ * `floor ∩ grant` (in `allowedContracts` they would fall out of the intersection).
  */
 export async function recordDeployedContracts(db: Runner, grantId: string, addresses: string[]): Promise<void> {
     const fresh = addresses.map(a => String(a).trim()).filter(Boolean);
@@ -190,11 +142,8 @@ export async function recordDeployedContracts(db: Runner, grantId: string, addre
 }
 
 /**
- * Reserve `count` deploys of the grant's lifetime budget before the broadcast:
- * one conditional UPDATE (`deploysUsed + count <= maxDeploys`, grant active and
- * deploy-capable), refused as a whole when the budget does not cover it.
- * Returns false on refusal; the caller nacks the submit-intent. Runs on the
- * given runner, the same transaction that inserts the attempt row.
+ * Reserve deploys of the grant's lifetime budget before the broadcast, all or
+ * nothing. Run it in the transaction that inserts the attempt row.
  */
 export async function reserveDeployBudget(runner: Runner, grantId: string, count: number): Promise<boolean> {
     if (!grantId || !Number.isInteger(count) || count < 1) return false;
@@ -209,11 +158,7 @@ export async function reserveDeployBudget(runner: Runner, grantId: string, count
     return Number(updated) > 0;
 }
 
-/**
- * Refund a reservation whose attempt was rejected before inclusion. An
- * ambiguous broadcast keeps its reservation. A failed refund is logged at
- * ERROR and rethrown (the grant then shows one deploy more than it financed).
- */
+/** Refund a reservation whose attempt was rejected; an ambiguous broadcast keeps it. */
 export async function releaseDeployBudget(db: Runner, grantId: string, count: number): Promise<void> {
     if (!grantId || !Number.isInteger(count) || count < 1) return;
     try {
@@ -229,14 +174,12 @@ export async function releaseDeployBudget(db: Runner, grantId: string, count: nu
 }
 
 /**
- * The grant's CURRENT policy input for a job that was admitted earlier. The
- * sponsoring executors re-resolve the policy per job, so a revoke, an expiry
- * or a narrowed grant applies to queued jobs too. `null` = revoked, expired
- * or gone.
+ * The grant's current policy, re-resolved per job so a revoke or narrowing
+ * applies to queued jobs too. null = revoked, expired or gone.
  */
 export async function currentGrantPolicy(runner: Runner, grantId: string): Promise<GrantPolicyInput | null> {
-    const grant = await runner.run(SELECT.one.from(AgentGrants).where({ ID: grantId })) as AgentGrantRow | null;
-    if (!grant || grant.isActive === false || grant.revokedAt || grantExpired(grant)) return null;
+    const grant = await currentGrantRow(runner, grantId);
+    if (!grant) return null;
     return {
         allowedContracts: parseGrantList(grant.allowedContracts),
         allowedCircuits: parseGrantList(grant.allowedCircuits),
@@ -244,6 +187,61 @@ export async function currentGrantPolicy(runner: Runner, grantId: string): Promi
         allowedTokenTypes: parseGrantList(grant.allowedTokenTypes),
         allowDeploy: grant.allowDeploy === true
     };
+}
+
+/** The grant as it is now, for a re-check when a queued job runs; null = revoked, expired or gone. */
+export async function currentGrantRow(runner: Runner, grantId: string): Promise<AgentGrantRow | null> {
+    const grant = await runner.run(SELECT.one.from(AgentGrants).where({ ID: grantId })) as AgentGrantRow | null;
+    if (!grant || grant.isActive === false || grant.revokedAt || grantExpired(grant)) return null;
+    return grant;
+}
+
+/** The action(s) a job of this kind was admitted as; a retract command carries its mode. */
+function actionsOfJob(kind: string, command: Record<string, unknown>): string[] {
+    if (kind === 'retract') return command.mode === 1 ? ['purgeExpired'] : ['retractAttestation'];
+    if (kind === 'anchorDocument') return ['anchorDocument', 'attestAgentOutput'];
+    return [kind];
+}
+
+/** Circuits a persisted command runs when its op does not spell them out. */
+const OP_CIRCUITS: Readonly<Record<string, readonly string[]>> = {
+    fieldPredicateWorkflow: ['anchorContentRoot', 'proveFieldPredicate'],
+    fieldEqualityWorkflow: ['anchorContentRoot', 'proveFieldEquality'],
+    fieldMembershipWorkflow: ['anchorContentRoot', 'proveFieldMembership'],
+    fieldPredicateBatchWorkflow: ['anchorContentRoot', 'proveFieldPredicate', 'proveFieldEquality', 'proveFieldMembership', 'proveDocumentComparison'],
+    documentIntegrityWorkflow: ['anchorContentRoot', 'proveDocumentComparison'],
+    documentDiffWorkflow: ['anchorContentRoot', 'proveDocumentComparison'],
+    anchorDocument: ['attest'],
+    grantDisclosure: ['grantDisclosure'],
+    revokeDisclosure: ['revokeDisclosure'],
+    registerPassport: ['registerDocument'],
+    retract: ['retract']
+};
+
+/**
+ * Re-check of a queued job against the grant as it is NOW: the action the job
+ * was admitted as (a child: its parent's kind, `parentKind`), then the contract
+ * and every circuit the persisted command runs. null = still within scope.
+ */
+export function grantJobScopeViolation(
+    grant: Pick<AgentGrantRow, 'allowedActions' | 'allowedContracts' | 'allowedCircuits'>,
+    job: { kind: string; parentJobId?: string | null; parentKind?: string | null },
+    command: Record<string, unknown>
+): string | null {
+    const admittedKind = job.parentJobId ? job.parentKind : job.kind;
+    if (!admittedKind) return 'the action the parent job was admitted as is unknown';
+    let allowed: unknown = [];
+    try { allowed = JSON.parse(grant.allowedActions || '[]'); } catch { allowed = []; }
+    const actions = actionsOfJob(admittedKind, job.parentJobId ? {} : command);
+    if (!Array.isArray(allowed) || !actions.some(a => allowed.includes(a))) {
+        return `action '${actions[0]}' is no longer allowed for this agent grant`;
+    }
+    const op = String(command.op ?? '');
+    const data: Record<string, unknown> = { contractAddress: command.contractAddress };
+    if (typeof command.circuit === 'string') data.circuit = command.circuit;
+    if (Array.isArray(command.calls)) data.calls = command.calls;
+    if (OP_CIRCUITS[op]) data.circuits = [...OP_CIRCUITS[op]];
+    return grantScopeViolation(grant, data, op);
 }
 
 /** A grant's JSON list column as an array; malformed or absent = no narrowing. */
@@ -261,11 +259,7 @@ function grantExpired(grant: Pick<AgentGrantRow, 'validUntil'>, now: Date = new 
     return !!grant.validUntil && new Date(grant.validUntil) < now;
 }
 
-/**
- * The request's contract and circuit(s) against the grant's allow-lists.
- * Returns the 403 message, or null when the request is within scope. Contract
- * addresses are hex, compared case-insensitively; circuit names as written.
- */
+/** The 403 message when the request's contract or circuits leave the grant's lists, else null. */
 export function grantScopeViolation(
     grant: Pick<AgentGrantRow, 'allowedContracts' | 'allowedCircuits'>,
     data: unknown,
@@ -292,14 +286,10 @@ export function grantScopeViolation(
 }
 
 /**
- * The circuits an action MAY run on the contract, so a grant with a circuit
- * list has to allow every one of them. Actions that pick their circuits
- * server-side are listed here; a request that names circuits itself
- * (`circuit`, `circuits`, batch `calls`) contributes those too. An action
- * that resolves to nothing known is refused while a circuit list is set.
+ * Circuits an action may run server-side; a grant's circuit list must allow all
+ * of them. An action resolving to nothing known is refused under a circuit list.
  */
 const ACTION_CIRCUITS: Readonly<Record<string, readonly string[]>> = {
-    commitDocumentAnchor: ['attestGuarded'],
     issueFieldPredicateAttestation: ['anchorContentRoot', 'proveFieldPredicate'],
     issueFieldEqualityAttestation: ['anchorContentRoot', 'proveFieldEquality'],
     issueFieldMembershipAttestation: ['anchorContentRoot', 'proveFieldMembership'],
@@ -314,19 +304,9 @@ const ACTION_CIRCUITS: Readonly<Record<string, readonly string[]>> = {
 export function circuitsOfRequest(event: string, d: Record<string, unknown>): string[] | null {
     const out = new Set<string>();
     let known = false;
-    if (event === 'anchorDocument') {
+    if (event === 'anchorDocument' || event === 'attestAgentOutput') {
         known = true;
-        // The lane follows the request: a nonce reveals, `guarded: false` is a
-        // plain attest, everything else commits (guarded). Neither lane anchors
-        // a content root; that is the issue* actions' job.
-        if (d.nonce) out.add('attestGuarded');
-        else if (d.guarded === false) out.add('attest');
-        else out.add('attestGuarded');
-    } else if (event === 'attestAgentOutput') {
-        // Delegates to anchorDocument without forwarding a lane choice: always
-        // the guarded commit.
-        known = true;
-        out.add('attestGuarded');
+        out.add('attest');
     } else if (Object.prototype.hasOwnProperty.call(ACTION_CIRCUITS, event)) {
         known = true;
         for (const c of ACTION_CIRCUITS[event]) out.add(c);
@@ -367,15 +347,134 @@ function utcDay(now: Date = new Date()): string {
 
 // ---- Grant administration -------------------------------------------------
 
+/** The editable grant fields, as a client sends them. */
+interface GrantShapeInput {
+    allowedActions?: string[] | null;
+    maxJobsPerDay?: number | null;
+    validUntil?: string | null;
+    agentLabel?: string | null;
+    allowedContracts?: string[] | null;
+    allowedCircuits?: string[] | null;
+    allowDeploy?: boolean | null;
+    maxDeploys?: number | null;
+    allowedTokenTypes?: string[] | null;
+}
+
+/** Validated values, ready for the row: lists are arrays (empty = unrestricted). */
+interface GrantShapeValues {
+    allowedActions?: string[];
+    maxJobsPerDay?: number | null;
+    validUntil?: string | null;
+    agentLabel?: string | null;
+    allowedContracts: string[];
+    allowedCircuits: string[];
+    allowedTokenTypes: string[];
+    allowDeploy: boolean;
+    maxDeploys: number | null;
+}
+
+/**
+ * Validation of the editable fields for create and update. On update a field
+ * absent from the input keeps `existing`'s value; explicit null clears it.
+ */
+export function validateGrantShape(
+    input: GrantShapeInput,
+    existing?: AgentGrantRow
+): { ok: true; values: GrantShapeValues } | { ok: false; message: string } {
+    const has = (k: keyof GrantShapeInput) => Object.prototype.hasOwnProperty.call(input, k);
+    const fail = (message: string) => ({ ok: false as const, message });
+
+    let actions: string[] | undefined;
+    if (has('allowedActions') || !existing) {
+        actions = input.allowedActions as string[];
+        if (!Array.isArray(actions) || actions.length === 0) return fail('allowedActions must be a non-empty array');
+        const unknown = actions.filter(a => !AGENT_ALLOWLISTABLE_ACTIONS.includes(a));
+        if (unknown.length > 0) {
+            return fail(`allowedActions contains non-grantable entries: ${unknown.join(', ')}. ` +
+                `Grantable: ${AGENT_ALLOWLISTABLE_ACTIONS.join(', ')}`);
+        }
+    }
+    const effectiveActions: string[] = actions ?? parseGrantList(existing?.allowedActions);
+
+    // A deploy is a distinct right with its own budget, never implied by the
+    // action list; only the sponsoring actions can carry one.
+    const allowDeploy = has('allowDeploy') || !existing ? input.allowDeploy === true : existing.allowDeploy === true;
+    if (allowDeploy && !effectiveActions.some(a => SPONSOR_PHASE2_ACTIONS.has(a))) {
+        return fail("allowDeploy needs 'sponsorFinalizedTransaction' or 'sponsorUnboundTransaction' in allowedActions: a deploy is sponsored, never run by the server wallet");
+    }
+    let maxDeploys: number | null = null;
+    if (allowDeploy) {
+        const raw = has('maxDeploys') ? input.maxDeploys : existing ? existing.maxDeploys : undefined;
+        maxDeploys = raw === undefined || raw === null ? 1 : Number(raw);
+        if (!Number.isInteger(maxDeploys) || maxDeploys < 1 || maxDeploys > 100) {
+            return fail('maxDeploys must be an integer between 1 and 100');
+        }
+        if (existing && maxDeploys < (existing.deploysUsed ?? 0)) {
+            return fail(`maxDeploys must not be below the ${existing.deploysUsed} deploys already used`);
+        }
+    } else if (has('maxDeploys') && input.maxDeploys !== undefined && input.maxDeploys !== null) {
+        return fail('maxDeploys needs allowDeploy: true');
+    }
+
+    // Same rule as the policy file: the effective policy is floor ∩ grant.
+    let allowedContracts: string[];
+    let allowedCircuits: string[];
+    let allowedTokenTypes: string[];
+    try {
+        allowedContracts = has('allowedContracts') || !existing
+            ? validatePolicyList('allowedContracts', input.allowedContracts)
+            : parseGrantList(existing.allowedContracts);
+        allowedCircuits = has('allowedCircuits') || !existing
+            ? validatePolicyList('allowedCircuits', input.allowedCircuits)
+            : parseGrantList(existing.allowedCircuits);
+        allowedTokenTypes = has('allowedTokenTypes') || !existing
+            ? validateTokenTypeList('allowedTokenTypes', input.allowedTokenTypes)
+            : parseGrantList(existing.allowedTokenTypes);
+    } catch (e) {
+        return fail((e as Error).message);
+    }
+
+    const values: GrantShapeValues = { allowedContracts, allowedCircuits, allowedTokenTypes, allowDeploy, maxDeploys };
+    if (actions) values.allowedActions = actions;
+    if (has('maxJobsPerDay') || !existing) {
+        if (input.maxJobsPerDay !== undefined && input.maxJobsPerDay !== null) {
+            if (!Number.isInteger(input.maxJobsPerDay) || input.maxJobsPerDay < 1) {
+                return fail('maxJobsPerDay must be a positive integer');
+            }
+        }
+        values.maxJobsPerDay = input.maxJobsPerDay ?? null;
+    }
+    if (has('validUntil') || !existing) {
+        if (input.validUntil) {
+            const t = new Date(input.validUntil);
+            if (Number.isNaN(t.getTime())) return fail('validUntil must be a valid ISO-8601 timestamp');
+            if (t.getTime() <= Date.now()) return fail('validUntil must be in the future');
+        }
+        values.validUntil = input.validUntil ?? null;
+    }
+    if (has('agentLabel') || !existing) {
+        if (input.agentLabel && input.agentLabel.length > 100) return fail('agentLabel must be at most 100 characters');
+        values.agentLabel = input.agentLabel ?? null;
+    }
+    return { ok: true, values };
+}
+
+/** Row fields a grant edit never touches; a different pin is a different grant. */
+const GRANT_IMMUTABLE_FIELDS = ['sessionId', 'sponsorSessionId', 'userId', 'tokenHash'] as const;
+
+/** ISO timestamp or undefined; `null` when the value does not parse. */
+function parseTimestamp(raw: unknown): string | null | undefined {
+    if (raw === undefined || raw === null || raw === '') return undefined;
+    const t = new Date(String(raw));
+    return Number.isNaN(t.getTime()) ? null : t.toISOString();
+}
+
+const USAGE_WINDOW_MAX_MS = 366 * 24 * 60 * 60 * 1000;
+const USAGE_WINDOW_DEFAULT_MS = 30 * 24 * 60 * 60 * 1000;
+
 export function registerAgentGrantHandlers(srv: any, db: any): void {
     srv.on('createAgentGrant', async (req: Request) => {
-        const clientKey = principalRateKey(req, 'grant-admin');
-        const rate = grantAdminRateLimiter.check(clientKey);
-        if (!rate.allowed) {
-            return req.reject(429, `Rate limited. Retry after ${Math.ceil(rate.retryAfterMs / 1000)}s`);
-        }
-        // Token requests cannot mint grants: createAgentGrant is neither
-        // always-allowed nor allow-listable, so enforcement already 403s.
+        if (!checkGrantAdminRate(req)) return;
         const userId = requireUserId(req);
         if (!userId) return;
 
@@ -394,85 +493,24 @@ export function registerAgentGrantHandlers(srv: any, db: any): void {
         };
 
         if (!data.sessionId) return req.reject(400, 'sessionId is required');
-        // Sponsored deploy: a distinct right, off by default, never implied by
-        // the action list, with its own budget (a deploy costs a multiple of a
-        // call). Only the phase-2 sponsoring actions can carry a deploy.
-        const allowDeploy = data.allowDeploy === true;
-        if (allowDeploy && !(data.allowedActions ?? []).some(a => SPONSOR_PHASE2_ACTIONS.has(a))) {
-            return req.reject(400, "allowDeploy needs 'sponsorFinalizedTransaction' or 'sponsorUnboundTransaction' in allowedActions: a deploy is sponsored, never run by the server wallet");
-        }
-        let maxDeploys: number | null = null;
-        if (allowDeploy) {
-            maxDeploys = data.maxDeploys === undefined || data.maxDeploys === null ? 1 : Number(data.maxDeploys);
-            if (!Number.isInteger(maxDeploys) || maxDeploys < 1 || maxDeploys > 100) {
-                return req.reject(400, 'maxDeploys must be an integer between 1 and 100');
-            }
-        } else if (data.maxDeploys !== undefined && data.maxDeploys !== null) {
-            return req.reject(400, 'maxDeploys needs allowDeploy: true');
-        }
-        // Validated with the policy-file rule; the effective policy of a
-        // sponsored call is floor ∩ grant (srv/submission/sponsor-policy.ts).
-        let allowedContracts: string[];
-        let allowedCircuits: string[];
-        let allowedTokenTypes: string[];
-        try {
-            allowedContracts = validatePolicyList('allowedContracts', data.allowedContracts);
-            allowedCircuits = validatePolicyList('allowedCircuits', data.allowedCircuits);
-            allowedTokenTypes = validateTokenTypeList('allowedTokenTypes', data.allowedTokenTypes);
-        } catch (e) {
-            return req.reject(400, (e as Error).message);
-        }
-        const actions = data.allowedActions;
-        if (!Array.isArray(actions) || actions.length === 0) {
-            return req.reject(400, 'allowedActions must be a non-empty array');
-        }
-        const unknown = actions.filter(a => !AGENT_ALLOWLISTABLE_ACTIONS.includes(a));
-        if (unknown.length > 0) {
-            return req.reject(400,
-                `allowedActions contains non-grantable entries: ${unknown.join(', ')}. ` +
-                `Grantable: ${AGENT_ALLOWLISTABLE_ACTIONS.join(', ')}`);
-        }
-        if (data.maxJobsPerDay !== undefined && data.maxJobsPerDay !== null) {
-            if (!Number.isInteger(data.maxJobsPerDay) || data.maxJobsPerDay < 1) {
-                return req.reject(400, 'maxJobsPerDay must be a positive integer');
-            }
-        }
-        if (data.validUntil) {
-            const t = new Date(data.validUntil);
-            if (Number.isNaN(t.getTime())) return req.reject(400, 'validUntil must be a valid ISO-8601 timestamp');
-            if (t.getTime() <= Date.now()) return req.reject(400, 'validUntil must be in the future');
-        }
-        if (data.agentLabel && data.agentLabel.length > 100) {
-            return req.reject(400, 'agentLabel must be at most 100 characters');
-        }
+        const shape = validateGrantShape(data);
+        if (!shape.ok) return req.reject(400, shape.message);
+        const { allowDeploy, maxDeploys, allowedContracts, allowedCircuits, allowedTokenTypes } = shape.values;
+        const actions = shape.values.allowedActions as string[];
 
-        // The session the grant acts through must be the caller's own, active
-        // and not expired. Detached read: no request tx held across it.
         const session: any = await runWithoutAmbientTx(() => db.run(
             SELECT.one.from(WalletSessions).where({ sessionId: data.sessionId, isActive: true, userId })
         ));
         if (!session) return req.reject(404, 'Session not found or inactive');
-        // Shared rule (srv/utils/session-expiry.ts): a configured platform fee
-        // sponsor is infrastructure and does not expire while configured, so a
-        // grant may be issued through one.
         if (isSessionExpired(data.sessionId, session.expiresAt)) {
             return req.reject(410, 'Session expired');
         }
 
-        // The sponsor binding is permanent and injected into every write, so a
-        // dead sponsor would make the grant unusable AFTER burning budget.
-        // Validate at creation with the SAME resolution every sponsored write
-        // runs (platform-listed or caller-owned, active, unexpired, signing
-        // key present, decryptable). Use-time re-resolution stays in place:
-        // this cannot guarantee the sponsor outlives the grant.
+        // Validate the sponsor at creation: it is injected into every write of
+        // the grant, and a dead one would fail only after budget was spent.
+        // The per-use resolution still runs. Only the sponsoring actions
+        // understand the pool sentinel.
         if (data.sponsorSessionId === PLATFORM_POOL_SENTINEL) {
-            // Pool grant (0.17.2): the concrete sponsor is chosen per job with
-            // failover. Valid only when a platform pool is configured; there
-            // is no single session to validate here, the per-use resolution
-            // stays in place. ONLY the phase-2 sponsoring actions understand
-            // the sentinel: it would be injected into every other allow-listed
-            // write and fail AFTER burning daily budget, so restrict the
-            // action set at creation.
             const pool = getConfiguredFeeSponsorSessions(getNightgatePluginConfig());
             if (pool.length === 0) {
                 return req.reject(412, `sponsorSessionId: '${PLATFORM_POOL_SENTINEL}' requires a configured NIGHTGATE_FEE_SPONSOR_SESSION pool`);
@@ -532,6 +570,7 @@ export function registerAgentGrantHandlers(srv: any, db: any): void {
     });
 
     srv.on('revokeAgentGrant', async (req: Request) => {
+        if (!checkGrantAdminRate(req)) return;
         const userId = requireUserId(req);
         if (!userId) return;
         const { grantId } = req.data as { grantId?: string };
@@ -546,21 +585,175 @@ export function registerAgentGrantHandlers(srv: any, db: any): void {
         log.info(`agent grant ${grantId} revoked`);
         return { revoked: true };
     });
+
+    srv.on('updateAgentGrant', async (req: Request) => {
+        if (!checkGrantAdminRate(req)) return;
+        const userId = requireUserId(req);
+        if (!userId) return;
+        const data = req.data as GrantShapeInput & { grantId?: string } & Record<string, unknown>;
+        if (!data.grantId) return req.reject(400, 'grantId is required');
+        const immutable = GRANT_IMMUTABLE_FIELDS.filter(f => Object.prototype.hasOwnProperty.call(data, f));
+        if (immutable.length > 0) {
+            return req.reject(400, `${immutable.join(', ')} cannot be changed; issue a new grant for a different binding`);
+        }
+
+        const existing = await loadOwnGrant(db, data.grantId, userId);
+        if (!existing) return req.reject(404, 'Grant not found');
+        if (!existing.isActive) return req.reject({ status: 409, code: 'GRANT_REVOKED', message: 'Grant is revoked' } as any);
+
+        const shape = validateGrantShape(data, existing);
+        if (!shape.ok) return req.reject(400, shape.message);
+        const v = shape.values;
+        const patch: Record<string, unknown> = {
+            allowedContracts: v.allowedContracts.length ? JSON.stringify(v.allowedContracts) : null,
+            allowedCircuits: v.allowedCircuits.length ? JSON.stringify(v.allowedCircuits) : null,
+            allowedTokenTypes: v.allowedTokenTypes.length ? JSON.stringify(v.allowedTokenTypes) : null,
+            allowDeploy: v.allowDeploy,
+            maxDeploys: v.maxDeploys
+        };
+        if (v.allowedActions) patch.allowedActions = JSON.stringify(v.allowedActions);
+        if ('maxJobsPerDay' in v) patch.maxJobsPerDay = v.maxJobsPerDay;
+        if ('validUntil' in v) patch.validUntil = v.validUntil;
+        if ('agentLabel' in v) patch.agentLabel = v.agentLabel;
+        const updated = Object.keys(data).filter(k => k !== 'grantId');
+
+        // Conditional on isActive: a concurrent revoke wins over the edit.
+        const affected = await db.run(
+            UPDATE.entity(AgentGrants).set(patch).where({ ID: data.grantId, userId, isActive: true })
+        );
+        if (!Number(affected)) return req.reject({ status: 409, code: 'GRANT_REVOKED', message: 'Grant is revoked' } as any);
+        log.info(`agent grant ${data.grantId} updated (${updated.join(', ')})`);
+        return { grantId: data.grantId, updated };
+    });
+
+    srv.on('rotateAgentGrantToken', async (req: Request) => {
+        if (!checkGrantAdminRate(req)) return;
+        const userId = requireUserId(req);
+        if (!userId) return;
+        const { grantId } = req.data as { grantId?: string };
+        if (!grantId) return req.reject(400, 'grantId is required');
+
+        const token = TOKEN_PREFIX + crypto.randomBytes(TOKEN_BYTES).toString('hex');
+        const affected = await db.run(
+            UPDATE.entity(AgentGrants)
+                .set({ tokenHash: hashAgentToken(token) })
+                .where({ ID: grantId, userId, isActive: true })
+        );
+        if (!Number(affected)) return req.reject(404, 'Grant not found');
+        log.info(`agent grant ${grantId} token rotated`);
+        return { grantId, token };
+    });
+
+    srv.on('getGrantUsage', async (req: Request) => {
+        const userId = requireUserId(req);
+        if (!userId) return;
+        const data = req.data as { grantId?: string; since?: string; until?: string };
+        if (!data.grantId) return req.reject(400, 'grantId is required');
+        const to = parseTimestamp(data.until);
+        const from = parseTimestamp(data.since);
+        if (to === null) return req.reject(400, 'until must be a valid ISO-8601 timestamp');
+        if (from === null) return req.reject(400, 'since must be a valid ISO-8601 timestamp');
+        const toMs = to ? new Date(to).getTime() : Date.now();
+        const fromMs = from ? new Date(from).getTime() : toMs - USAGE_WINDOW_DEFAULT_MS;
+        if (fromMs > toMs) return req.reject(400, 'since must not lie after until');
+        if (toMs - fromMs > USAGE_WINDOW_MAX_MS) return req.reject(400, 'the window may span at most 366 days');
+        const fromIso = new Date(fromMs).toISOString();
+        const toIso = new Date(toMs).toISOString();
+
+        // Revoked grants keep their history: the lookup is owner-scoped only.
+        const grant: AgentGrantRow | null = await runWithoutAmbientTx(() => db.run(
+            SELECT.one.from(AgentGrants).where({ ID: data.grantId, userId })
+        )) as AgentGrantRow | null;
+        if (!grant) return req.reject(404, 'Grant not found');
+
+        const rows = (await runWithoutAmbientTx(() => db.run(
+            SELECT.from(BackgroundJobs)
+                .columns('kind', 'status', 'chainStatus', 'txHash')
+                .where({ grantId: grant.ID, queuedAt: { '>=': fromIso } })
+                .and({ queuedAt: { '<=': toIso } })
+        )) ?? []) as Array<{ kind?: string; status?: string; chainStatus?: string | null; txHash?: string | null }>;
+
+        const counts = new Map<string, { kind: string; status: string; count: number }>();
+        let landed = 0;
+        let failed = 0;
+        const landedHashes: string[] = [];
+        for (const r of rows) {
+            const kind = String(r.kind ?? 'unknown');
+            const status = String(r.status ?? 'unknown');
+            const key = `${kind}\0${status}`;
+            const c = counts.get(key) ?? { kind, status, count: 0 };
+            c.count += 1;
+            counts.set(key, c);
+            if (r.chainStatus === 'success') {
+                landed += 1;
+                if (r.txHash) landedHashes.push(String(r.txHash).toLowerCase());
+            }
+            if (status === 'failed' || r.chainStatus === 'failure') failed += 1;
+        }
+        const jobs = [...counts.values()].sort((a, b) => a.kind.localeCompare(b.kind) || a.status.localeCompare(b.status));
+
+        // Fees are known only where the crawler indexed the transactions.
+        const crawlerOn = (resolveNightgateRuntimeConfig(getNightgatePluginConfig()).crawlerConfig as any)?.enabled !== false;
+        const dustPaid = crawlerOn ? await sumIndexedFees(db, landedHashes) : null;
+
+        return {
+            grantId: grant.ID,
+            since: fromIso,
+            until: toIso,
+            jobs,
+            landed,
+            failed,
+            deploysUsed: grant.deploysUsed ?? 0,
+            maxDeploys: grant.maxDeploys ?? null,
+            jobsUsedToday: grant.budgetWindow === utcDay() ? (grant.jobsUsedToday ?? 0) : 0,
+            maxJobsPerDay: grant.maxJobsPerDay ?? null,
+            dustPaid
+        };
+    });
+}
+
+function checkGrantAdminRate(req: Request): boolean {
+    const rate = grantAdminRateLimiter.check(principalRateKey(req, 'grant-admin'));
+    if (rate.allowed) return true;
+    req.reject(429, `Rate limited. Retry after ${Math.ceil(rate.retryAfterMs / 1000)}s`);
+    return false;
+}
+
+/** The caller's own grant, active or revoked; null for a foreign or unknown id. */
+async function loadOwnGrant(db: Runner, grantId: string, userId: string): Promise<AgentGrantRow | null> {
+    return await runWithoutAmbientTx(() => db.run(
+        SELECT.one.from(AgentGrants).where({ ID: grantId, userId })
+    )) as AgentGrantRow | null;
+}
+
+/** Sum of the indexed fees (DUST atoms) of the given job `txHash`es, as a decimal string. */
+async function sumIndexedFees(db: Runner, hashes: string[]): Promise<string> {
+    let total = 0n;
+    for (let i = 0; i < hashes.length; i += 500) {
+        const chunk = hashes.slice(i, i + 500);
+        const txs = (await runWithoutAmbientTx(() => db.run(
+            SELECT.from(Transactions).columns('ID').where({ hash: { in: chunk } })
+        )) ?? []) as Array<{ ID: string }>;
+        const ids = txs.map(t => t.ID).filter(Boolean);
+        if (ids.length === 0) continue;
+        const fees = (await runWithoutAmbientTx(() => db.run(
+            SELECT.from(TransactionFees).columns('paidFees').where({ transaction_ID: { in: ids } })
+        )) ?? []) as Array<{ paidFees?: string | number | bigint | null }>;
+        for (const f of fees) {
+            if (f.paidFees === undefined || f.paidFees === null) continue;
+            try { total += BigInt(f.paidFees); } catch { /* not a number: skip */ }
+        }
+    }
+    return total.toString();
 }
 
 // ---- Enforcement ----------------------------------------------------------
 
-/**
- * Register the token-enforcement before-hook. MUST be the first registration
- * in the service init so the principal override precedes every owner-scoping
- * before-hook.
- */
+/** The token-enforcement before-hook; register it first in the service init. */
 export function attachAgentGrantEnforcement(srv: any, db: any): void {
     srv.before('*', (req: Request) => {
-        // CAP runs every before-handler of an event in PARALLEL (Promise.all in
-        // srv-dispatch), so the principal swap below, which comes after an
-        // awaited grant lookup, would land after a synchronous owner-scoping
-        // hook already read the transport marker. Those hooks await this.
+        // CAP runs before-handlers in parallel, so the principal swap (after an
+        // awaited lookup) is published for owner-scoping hooks to await.
         const resolution = enforceAgentGrant(req, db);
         (req as any)[AGENT_PRINCIPAL_READY] = resolution.then(() => undefined, () => undefined);
         return resolution;
@@ -570,30 +763,28 @@ export function attachAgentGrantEnforcement(srv: any, db: any): void {
 const AGENT_PRINCIPAL_READY = Symbol.for('nightgate.agentPrincipalReady');
 
 /**
- * Await the effective principal. Every before-hook that reads `req.user`
- * (owner scoping) calls this first; without a token request it resolves at
- * once. Registration order alone does not sequence CAP's before-handlers.
+ * Await the effective principal; every before-hook reading `req.user` calls this
+ * first, since registration order does not sequence CAP's before-handlers.
  */
 export async function awaitAgentPrincipal(req: Request): Promise<void> {
     const ready = (req as any)[AGENT_PRINCIPAL_READY];
     if (ready) await ready;
 }
 
-/** Exported for unit tests; see module doc for the enforcement ladder. */
+/** Exported for unit tests. */
 export async function enforceAgentGrant(req: Request, db: any): Promise<unknown> {
-    // `req.headers` is CAP's merged view: for a $batch part it is the envelope's
-    // headers overlaid with the part's own (libx/odata/middleware/operation.js),
-    // so the token an agent sends on the batch request reaches every part;
+    // `req.headers` merges a $batch envelope's headers into each part;
     // `_.req.headers` alone is only the synthetic part request.
     const token = (req as any)?.headers?.[AGENT_TOKEN_HEADER] ?? (req as any)?._?.req?.headers?.[AGENT_TOKEN_HEADER];
     if (!token || typeof token !== 'string') {
-        // Transport auth admitted this request on a token it did not validate
-        // (the standalone image's agent-token lane) and this hook cannot see
-        // the token, so nobody has authenticated it: a $batch part carries only
-        // its own headers while the envelope's principal is inherited. The
-        // marker principal must never reach a handler as an authenticated user.
-        if ((req as any)?.user?.id === AGENT_TOKEN_TRANSPORT_USER) {
+        // Transport markers admitted a request nobody authenticated here; they
+        // must never reach a handler as a user.
+        const uid = (req as any)?.user?.id;
+        if (uid === AGENT_TOKEN_TRANSPORT_USER) {
             return req.reject(401, 'agent token required');
+        }
+        if (uid === PUBLIC_VERIFY_TRANSPORT_USER) {
+            return req.reject(401, 'authentication required');
         }
         return; // normal principal path
     }
@@ -611,6 +802,10 @@ export async function enforceAgentGrant(req: Request, db: any): Promise<unknown>
 
     const event = String((req as any).event ?? '');
     const alwaysAllowed = AGENT_ALWAYS_ALLOWED_EVENTS.has(event);
+    // The handler's owner scoping alone would answer for every grant of the operator.
+    if (event === 'getGrantUsage' && String((req as any).data?.grantId ?? '') !== grant.ID) {
+        return req.reject(404, 'Grant not found');
+    }
     let allowlisted = false;
     if (!alwaysAllowed) {
         let allowed: string[] = [];
@@ -621,14 +816,8 @@ export async function enforceAgentGrant(req: Request, db: any): Promise<unknown>
         }
     }
 
-    // READ narrowing: a grant is scoped to ONE session, so listing surfaces
-    // that are merely user-scoped downstream must not widen to the whole
-    // operator. Only AGENT_READABLE_ENTITIES are readable at all;
-    // WalletSessions/PendingSubmissions/Documents collapse to the grant's
-    // session (Documents rows without a session are older than the column
-    // and stay owner-only), AgentGrants to the grant itself; chain-derived
-    // entities stay readable as-is. The owner-scoping before-hooks add their
-    // userId filter on top (ANDed).
+    // A grant covers one session: user-scoped listings must not widen to the
+    // whole operator. The owner-scoping hooks AND their userId filter on top.
     if (event === 'READ') {
         const target = String((req as any).target?.name ?? '');
         const entity = target.slice(target.lastIndexOf('.') + 1);
@@ -645,33 +834,22 @@ export async function enforceAgentGrant(req: Request, db: any): Promise<unknown>
         }
     }
 
-    // Contract scope: the grant's allow-lists bound every action that names a
-    // contract, not only the sponsored ones. The phase-2 sponsoring actions
-    // keep their own check (floor ∩ grant on the transaction's shape, in the
-    // worker); here the request's own contractAddress and circuit(s) are
-    // matched against the grant's lists, an empty list being no restriction.
+    // The sponsoring actions are checked on the transaction's shape in the worker.
     if (allowlisted && !SPONSOR_PHASE2_ACTIONS.has(event)) {
         const scope = grantScopeViolation(grant, (req as any).data, event);
         if (scope) return req.reject(403, scope);
     }
 
-    // Bind the request to the grant's session (and sponsor, when pinned).
     const data = (req as any).data;
     if (data && typeof data === 'object' && event !== 'READ') {
-        // Phase-2 sponsoring jobs (sponsorFinalizedTransaction /
-        // sponsorUnboundTransaction) are keyed by
-        // the SPONSOR session, so polling them is the ONE place the grant's
-        // pinned sponsor session is a valid job scope. Only getJobStatus:
-        // a write with the sponsor session as sessionId would act under the
-        // sponsor's identity and must keep failing.
+        // Sponsoring jobs are keyed by the sponsor session, so only a
+        // getJobStatus may name it; a write with it would act as the sponsor.
         const sponsorPoll = event === 'getJobStatus'
             && !!grant.sponsorSessionId
             && (data.sessionId === grant.sponsorSessionId
                 || (grant.sponsorSessionId === PLATFORM_POOL_SENTINEL
                     && getConfiguredFeeSponsorSessions(getNightgatePluginConfig()).includes(String(data.sessionId ?? ''))));
-        // Pool jobs are KEYED under the sentinel; a poll naming a concrete
-        // pool member would pass this gate and then 404 in getJobStatus.
-        // Normalize to the sentinel after the membership check.
+        // Pool jobs are keyed under the sentinel, not the concrete member.
         if (sponsorPoll && grant.sponsorSessionId === PLATFORM_POOL_SENTINEL) {
             data.sessionId = PLATFORM_POOL_SENTINEL;
         }
@@ -687,21 +865,18 @@ export async function enforceAgentGrant(req: Request, db: any): Promise<unknown>
             }
             data.sponsorSessionId = grant.sponsorSessionId;
         } else if (allowlisted && data.sponsorSessionId !== undefined && data.sponsorSessionId !== null && data.sponsorSessionId !== '') {
-            // An unpinned grant does not inherit the operator's sponsors: a
-            // token may only spend fee budget the grant names explicitly.
             return req.reject(403, 'this agent grant has no sponsor binding; issue the grant with sponsorSessionId to sponsor its jobs');
         }
     }
 
-    // Daily write-job budget, atomic + detached (see module doc).
+    // Detached from the request tx: the spend sticks when the request later
+    // fails (over-counting failures rather than under-counting abuse).
     if (allowlisted && grant.maxJobsPerDay !== undefined && grant.maxJobsPerDay !== null) {
         const consumed = await consumeDailyBudget(db, grant);
         if (!consumed) {
             return req.reject(429, `agent grant daily job budget exhausted (${grant.maxJobsPerDay}/day)`);
         }
-        // A request the handler refuses as invalid (400..428: bad input,
-        // unknown session, session not signing) admitted no job: give the unit
-        // back. 429 and every 5xx keep it (over-count rather than under-count).
+        // A 400..428 refusal admitted no job: refund. 429 and 5xx keep the unit.
         (req as any).on?.('failed', (err: any) => {
             const status = Number(err?.status ?? err?.statusCode ?? err?.code);
             if (Number.isInteger(status) && status >= 400 && status < 429) {
@@ -710,16 +885,12 @@ export async function enforceAgentGrant(req: Request, db: any): Promise<unknown>
         });
     }
 
-    // Effective principal: the operator. All existing userId gates now apply.
     const UserCtor = (cds as any).User;
     (req as any).user = UserCtor ? new UserCtor({ id: grant.userId }) : { id: grant.userId };
-    // The grant's sponsor policy rides along; the sponsoring handlers narrow
-    // the platform floor by it.
     (req as any).agentGrant = {
         ID: grant.ID, sessionId: grant.sessionId, userId: grant.userId,
         allowedContracts: parseGrantList(grant.allowedContracts),
         allowedCircuits: parseGrantList(grant.allowedCircuits),
-        // Sponsorable on top of the intersection (see recordDeployedContracts).
         deployedContracts: parseGrantList(grant.deployedContracts),
         allowedTokenTypes: parseGrantList(grant.allowedTokenTypes),
         // Admission pre-check only; the lifetime budget is reserved per deploy
@@ -728,13 +899,7 @@ export async function enforceAgentGrant(req: Request, db: any): Promise<unknown>
     };
 }
 
-/**
- * Consume one unit of the grant's daily budget. Two conditional UPDATEs so
- * concurrent requests cannot overspend: a window reset (compare-and-swap on
- * the OLD window value) and a bounded increment (`jobsUsedToday < max`).
- * Both run detached; whichever statement reports an affected row wins.
- */
-/** Undo one consumeDailyBudget within the same UTC day (a refused request created no job). */
+/** Undo one consumeDailyBudget within the same UTC day. */
 async function refundDailyBudget(db: any, grant: AgentGrantRow): Promise<void> {
     await runWithoutAmbientTx(() => db.run(
         UPDATE.entity(AgentGrants)
@@ -743,6 +908,10 @@ async function refundDailyBudget(db: any, grant: AgentGrantRow): Promise<void> {
     ));
 }
 
+/**
+ * Consume one budget unit without overspend under concurrency: a window reset
+ * that CASes on the old window, then a bounded increment.
+ */
 async function consumeDailyBudget(db: any, grant: AgentGrantRow): Promise<boolean> {
     const today = utcDay();
     const max = grant.maxJobsPerDay as number;

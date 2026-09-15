@@ -1,10 +1,7 @@
 /**
- * Sponsor shape policy: which contract calls a fee sponsor pays for.
- * Floor: `NIGHTGATE_SPONSOR_ALLOWED_CONTRACTS` / `_CIRCUITS` / `_TOKEN_TYPES` from the env, or a
- * JSON file `{ allowedContracts, allowedCircuits, allowDeploy, allowedTokenTypes }` at
- * `NIGHTGATE_SPONSOR_POLICY_FILE`, re-read on mtime change, fail-closed when
- * unusable (last good policy, else every sponsored call refused). Grant: effective = floor ∩ grant.
- * Empty floor list = unrestricted; empty grant list = inherit; non-empty lists with empty intersection = 403.
+ * Which calls a fee sponsor pays for. Floor = env or `NIGHTGATE_SPONSOR_POLICY_FILE`
+ * (fail-closed: last good policy, else refuse); effective = floor ∩ grant.
+ * Empty floor list = unrestricted, empty grant list = inherit.
  */
 import fs from 'node:fs';
 import cds from '@sap/cds';
@@ -15,28 +12,14 @@ const log = cds.log('nightgate:sponsor-policy');
 export interface SponsorPolicy {
     allowedContracts: string[];
     allowedCircuits: string[];
-    /**
-     * The sponsor also pays for a caller-built contract deploy. Floor
-     * (`NIGHTGATE_SPONSOR_ALLOW_DEPLOY=true` or the policy file's `allowDeploy`)
-     * and, for a token caller, the grant must both allow it. A deploy is never
-     * matched against `allowedContracts`; the landed address is recorded onto
-     * the grant afterwards. Absent = false.
-     */
+    /** Sponsor caller-built deploys; floor and (for a token caller) grant must both allow it. */
     allowDeploy?: boolean;
     /**
-     * Addresses deployed under the requesting grant. Calls on them are exempt
-     * from `allowedCircuits`: the circuit floor names the shared contracts'
-     * circuits, a grant-deployed contract has its own; without the exemption a
-     * server with a circuit floor could sponsor the deploy but never a call
-     * on it. The byte ceiling still applies. Absent/empty = no exemption.
+     * Addresses deployed under the grant. Exempt from `allowedCircuits`, which
+     * names the shared contracts' circuits; the byte ceiling still applies.
      */
     ownContracts?: string[];
-    /**
-     * Raw shielded token types (64 hex) whose zswap offers the sponsor also
-     * pays for: a contract minting its own token to the caller, a caller
-     * spending that token into the contract. Absent/empty = no offer at all
-     * (the default): the floor must open it, a grant can only narrow it.
-     */
+    /** Raw token types (64 hex) whose zswap offers are sponsored; empty = none. */
     allowedTokenTypes?: string[];
 }
 
@@ -54,10 +37,8 @@ export const MAX_POLICY_ENTRIES = 256;
 const MAX_ENTRY_LENGTH = 130;
 
 /**
- * Validate one allow-list from an operator (grant creation, policy file).
- * Returns the trimmed, de-duplicated list or throws naming the offending
- * entry. Entries are hex addresses (optional 0x) or Compact identifiers;
- * anything else is refused rather than silently never matching.
+ * Validate an operator allow-list: trimmed, de-duplicated. Malformed entries
+ * throw rather than silently never matching.
  */
 export function validatePolicyList(name: string, raw: unknown): string[] {
     if (raw === undefined || raw === null) return [];
@@ -75,11 +56,7 @@ export function validatePolicyList(name: string, raw: unknown): string[] {
     return out;
 }
 
-/**
- * Validate a list of raw shielded token types (64 hex, optional 0x), as
- * `deriveTokenType` returns them and as zswap offers carry them in `deltas`.
- * Normalized to lowercase without prefix, de-duplicated.
- */
+/** Validate raw token types (as in offer `deltas`): lowercase, no 0x, de-duplicated. */
 export function validateTokenTypeList(name: string, raw: unknown): string[] {
     if (raw === undefined || raw === null) return [];
     if (!Array.isArray(raw)) throw new Error(`${name} must be an array of strings`);
@@ -101,7 +78,7 @@ function envPolicy(): SponsorPolicy {
     try {
         allowedTokenTypes = validateTokenTypeList('NIGHTGATE_SPONSOR_ALLOWED_TOKEN_TYPES', configList('NIGHTGATE_SPONSOR_ALLOWED_TOKEN_TYPES'));
     } catch (e) {
-        // Fail closed and say why, instead of sponsoring offers under a list that silently lost an entry.
+        // Fail closed rather than sponsor under a list that silently lost an entry.
         throw new SponsorPolicyUnavailableError(`${(e as Error).message}; refusing to sponsor`);
     }
     return {
@@ -154,12 +131,7 @@ function readPolicyFile(filePath: string): SponsorPolicy {
     };
 }
 
-/**
- * The current platform floor: env when no file is configured, else the file,
- * re-read when mtime/size changed (one stat per call). Throws
- * `SponsorPolicyUnavailableError` (503) when a configured file is unusable and
- * no good policy was loaded before.
- */
+/** Current platform floor: env, or the policy file re-read on mtime/size change. */
 export function getGlobalSponsorPolicy(): SponsorPolicy {
     const filePath = configString('NIGHTGATE_SPONSOR_POLICY_FILE');
     if (!filePath) return envPolicy();
@@ -179,8 +151,7 @@ export function getGlobalSponsorPolicy(): SponsorPolicy {
 
     const lastGood = fileCache?.path === filePath ? fileCache.lastGood : null;
     if (!stat) {
-        // Still missing since the last call: the same fail-closed decision,
-        // said ONCE (a permanently absent file must not log per request).
+        // Still missing: log once, not per request.
         if (fileCache?.path === filePath && fileCache.mtimeMs === -1) {
             if (lastGood) return lastGood;
             throw new SponsorPolicyUnavailableError(`sponsor policy file ${filePath} cannot be read and no policy was loaded before; refusing to sponsor`);
@@ -232,21 +203,15 @@ function intersect(floor: string[], grant: string[] | null | undefined, what: st
     return both;
 }
 
-/**
- * The lists a sponsored call runs under: the floor, narrowed by the grant if
- * present. Throws `SponsorPolicyEmptyError` (403) on an empty intersection,
- * before a job exists.
- */
+/** The floor narrowed by the grant; an empty intersection throws before a job exists. */
 export function effectiveSponsorPolicy(floor: SponsorPolicy, grant?: GrantPolicyInput | null): SponsorPolicy {
     const contracts = intersect(floor.allowedContracts, grant?.allowedContracts, 'allowedContracts');
-    // Deployed addresses join after the intersection (no floor names them).
-    // An unrestricted result (empty list) stays unrestricted.
+    // Deployed addresses join after the intersection; an empty (unrestricted) list stays empty.
     const deployed = [...new Set((grant?.deployedContracts ?? []).filter(a => typeof a === 'string' && a.length > 0))];
     const withDeployed = contracts.length === 0 || deployed.length === 0
         ? contracts
         : [...contracts, ...deployed.filter(a => !contracts.includes(a))];
-    // Token types: the floor must open offers at all (empty = none, whatever
-    // the grant says); a grant list narrows a non-empty floor.
+    // Unlike contracts, an empty token floor means no offers at all.
     const floorTokens = floor.allowedTokenTypes ?? [];
     const grantTokens = (grant?.allowedTokenTypes ?? []).filter(t => typeof t === 'string' && t.length > 0);
     let allowedTokenTypes: string[] = [];
@@ -265,7 +230,6 @@ export function effectiveSponsorPolicy(floor: SponsorPolicy, grant?: GrantPolicy
         allowedContracts: withDeployed,
         allowedCircuits: intersect(floor.allowedCircuits, grant?.allowedCircuits, 'allowedCircuits'),
         allowedTokenTypes,
-        // Floor must open it and, for a token caller, the grant must carry it.
         allowDeploy: floor.allowDeploy === true && (grant ? grant.allowDeploy === true : true),
         ...(deployed.length ? { ownContracts: deployed } : {})
     };

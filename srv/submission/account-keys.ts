@@ -1,35 +1,8 @@
 /**
- * Per-account data-encryption key (DEK).
- *
- * Private states, contract signing keys and the wallet sync-state blobs are
- * encrypted under passwords derived from a random 32-byte DEK per account.
- * The DEK is stored in `AccountKeys`, sealed twice:
- *
- *   wrappedDek             v3 envelope under the ring's ACTIVE key (crypto.ts),
- *                          bound to the account id; the key id sits in the
- *                          prefix, so the boot preflight scans it and the
- *                          rewrap tool rotates it WITHOUT the viewing key
- *   wrappedDekByViewingKey the viewing-key seal (`vk1:...`, AES-256-GCM under
- *                          HKDF(storage password), where the storage password
- *                          derives from the viewing key) wrapped in a v3
- *                          envelope under the ring, bound to the account id.
- *                          Opening it takes BOTH secrets: a database copy plus
- *                          a viewing key opens nothing without the ring, and
- *                          a session still proves its viewing key against the
- *                          account (a wrong key is refused even when the ring
- *                          opened `wrappedDek`). The outer envelope rotates
- *                          with the ring like `wrappedDek`; a bare `vk1:` seal
- *                          from before this format is read and wrapped on
- *                          first use.
- *
- * A ring key that left the ring without a rewrap cannot be replaced by the
- * viewing key: the rewrap tool is the rotation path, and a DEK sealed under
- * a lost key is lost with it, private states and signing keys included
- * (signing keys have a custody export for that case).
- *
- * Rows written before the DEK existed (`keyScheme` null) were encrypted under
- * derivations that need the viewing key; they are migrated when a session
- * reads them, and the rewrap tool reports what is still legacy.
+ * Random 32-byte DEK per account; private states, signing keys and sync-state blobs use passwords
+ * derived from it. Sealed twice: `wrappedDek` (ring v3 envelope, rotatable without the viewing key)
+ * and `wrappedDekByViewingKey` (vk1 seal inside a ring envelope: needs both secrets, and a session
+ * must prove its viewing key). A DEK whose ring key was removed without a rewrap is lost.
  * SPDX-License-Identifier: Apache-2.0
  */
 
@@ -99,18 +72,12 @@ export function isBareViewingKeySeal(stored: string): boolean {
     return String(stored).startsWith(`${VK_SEAL_VERSION}:`);
 }
 
-/**
- * Seal the DEK under the viewing key AND the ring: the `vk1` seal wrapped in
- * a ring envelope bound to the account. Either secret alone opens nothing.
- */
+/** `vk1` seal wrapped in a ring envelope bound to the account: either secret alone opens nothing. */
 export function sealDekByViewingKey(dek: Buffer, storagePassword: string, ring: KeyRing, accountId: string): string {
     return encrypt(sealDekByStoragePassword(dek, storagePassword), ring, accountDekViewingKeySealBinding(accountId));
 }
 
-/**
- * Open a viewing-key seal: the ring envelope first (a bare `vk1:` seal from
- * before the wrapping is accepted as is), then the storage password.
- */
+/** Open the ring envelope (a bare `vk1:` seal is accepted as is), then the storage password seal. */
 export function openDekByViewingKey(stored: string, storagePassword: string, ring: KeyRing, accountId: string): Buffer {
     const inner = isBareViewingKeySeal(stored) ? stored : decrypt(stored, ring, accountDekViewingKeySealBinding(accountId));
     return openDekByStoragePassword(inner, storagePassword);
@@ -146,17 +113,13 @@ export function syncStatePassphraseFromDek(dek: Buffer, accountId: string): stri
 // ---- Resolution ---------------------------------------------------------------------
 
 const cache = new Map<string, { dek: Buffer; keyId: string; passwordHash: string | null }>();
-// One resolution per account at a time. The entry is the resolution's TOKEN:
-// a cache write is accepted only while the token that started it is still the
-// account's current one, so an eviction (which drops the token) during the
-// resolution leaves nothing resident. Entries live exactly as long as their
-// resolution: nothing accumulates per ever-seen account.
+// One resolution per account. A cache write is accepted only while its token is current,
+// so an eviction during the resolution leaves nothing resident.
 const inflight = new Map<string, { promise: Promise<Buffer | null>; token: symbol }>();
 
 function storeDek(accountId: string, entry: { dek: Buffer; keyId: string; passwordHash: string | null }, token: symbol): void {
     if (inflight.get(accountId)?.token !== token) {
-        // Evicted while resolving: the caller still gets its copy for this
-        // operation, nothing stays resident.
+        // Evicted while resolving; the caller keeps its own copy.
         entry.dek.fill(0);
         return;
     }
@@ -200,29 +163,25 @@ export interface ResolveAccountDekArgs {
     storagePassword?: string;
     /** Create the DEK when the account has none (needs `storagePassword`). Default true. */
     create?: boolean;
+    /** Open only: a seal under an inactive key or a bare viewing-key seal is left as stored. Default false. */
+    readOnly?: boolean;
 }
 
 /**
- * The account's DEK, from the process cache, the ring seal or the
- * viewing-key seal, in that order. A DEK sealed under a ring key that is no
- * longer active (or no longer present) is re-sealed under the active key as
- * soon as it has been opened. Returns null only when the account has no DEK
- * and none may be created here.
+ * The account's DEK from cache, ring seal or viewing-key seal; re-sealed under the active key once opened.
+ * Null only when the account has none and none may be created.
  */
 export async function resolveAccountDek(args: ResolveAccountDekArgs): Promise<Buffer | null> {
     const { accountId, storagePassword } = args;
     const cached = cache.get(accountId);
     if (cached && cached.keyId === args.ring.activeId) {
-        // A caller that presents a storage password must present the RIGHT
-        // one, cache hit or not: the ring opens the key for the operator's
-        // rewrap, a session still proves its viewing key.
+        // A presented storage password must match, cache hit or not.
         if (storagePassword && cached.passwordHash && cached.passwordHash !== passwordHash(storagePassword)) {
             throw new AccountDekUnavailableError(accountId, 'the viewing key does not match the account key');
         }
         return Buffer.from(cached.dek);   // callers get a copy; the cache zeroes its own on eviction
     }
-    // One resolution per account at a time: concurrent first saves of the
-    // same wallet must share ONE key, not race two inserts.
+    // Concurrent first saves of one wallet must share one key.
     const pending = inflight.get(accountId);
     if (pending) return pending.promise;
     const token = Symbol(accountId);
@@ -265,8 +224,7 @@ async function resolveUncached(args: ResolveAccountDekArgs, token: symbol): Prom
             throw new AccountDekUnavailableError(accountId, reason);
         }
         if (vkOpens === false) {
-            // The ring opened the key but the presented viewing key is not
-            // this account's: a session never reads another wallet's rows.
+            // Ring opened it, but the viewing key belongs to another wallet.
             throw new AccountDekUnavailableError(accountId, 'the viewing key does not match the account key');
         }
         const { keyId, version } = inspectCiphertext(row.wrappedDek);
@@ -277,8 +235,6 @@ async function resolveUncached(args: ResolveAccountDekArgs, token: symbol): Prom
         if (storagePassword && !row.wrappedDekByViewingKey) {
             set.wrappedDekByViewingKey = sealDekByViewingKey(dek, storagePassword, ring, accountId);
         } else if (row.wrappedDekByViewingKey && isBareViewingKeySeal(row.wrappedDekByViewingKey)) {
-            // A seal from before the ring wrapped it: wrap it now, no viewing
-            // key needed for that.
             set.wrappedDekByViewingKey = encrypt(row.wrappedDekByViewingKey, ring, accountDekViewingKeySealBinding(accountId));
         } else if (row.wrappedDekByViewingKey && !vkUnknownKey) {
             const sealed = inspectCiphertext(row.wrappedDekByViewingKey);
@@ -289,7 +245,7 @@ async function resolveUncached(args: ResolveAccountDekArgs, token: symbol): Prom
                     ring, accountDekViewingKeySealBinding(accountId));
             }
         }
-        if (Object.keys(set).length) {
+        if (Object.keys(set).length && !args.readOnly) {
             set.rotatedAt = new Date().toISOString();
             await db.run(UPDATE.entity(ENTITY).set(set).where({ accountId }));
         }
@@ -310,8 +266,7 @@ async function resolveUncached(args: ResolveAccountDekArgs, token: symbol): Prom
             rotatedAt: null
         }));
     } catch (err) {
-        // Two sessions of the same wallet creating at once: the first insert
-        // wins, the second reads it back.
+        // Concurrent create: the first insert wins, re-read it.
         dek.fill(0);
         const again: Record<string, any> | null = await db.run(SELECT.one.from(ENTITY).where({ accountId }));
         if (!again?.wrappedDek) throw err;

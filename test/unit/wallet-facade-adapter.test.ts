@@ -21,7 +21,7 @@ import { buildWalletMaterialForSession } from '../../srv/submission/wallet-mater
 import type { WalletFacadeBuildArgs } from '../../srv/submission/wallet-facade-builder';
 
 const TEST_KEY = crypto.createHash('sha256').update('test-encryption-key').digest();
-// 128 hex = 64-byte BIP39 seed (the new connectWalletForSigning storage shape).
+// 128 hex = 64-byte BIP39 seed (the connectWalletForSigning storage shape).
 const VALID_SEED_HEX = 'a'.repeat(128);
 const STUB_FACADE = vi.hoisted(() => ({
     balanceUnboundTransaction: vi.fn(),

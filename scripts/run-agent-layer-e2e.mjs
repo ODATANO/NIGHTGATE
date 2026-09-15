@@ -1,5 +1,5 @@
-// Agent-layer end-to-end (v0.14.0: AgentGrants + prepareDocumentProof +
-// attestAgentOutput), the full model-A lane from the agent-access-layer FR.
+// Agent-layer end-to-end (AgentGrants + prepareDocumentProof +
+// attestAgentOutput).
 //
 // Operator lane (normal auth): connectWallet → connectWalletForSigning →
 // deployContract(attestation-vault) → createAgentGrant (allowlist:
@@ -208,6 +208,8 @@ function expectStatus(r, want, label) {
         // no sessionId on purpose: the grant must inject its own
     }, agent);
     if (r.status >= 400) fail(`anchorDocument(agent) → ${r.status}: ${pretty(r.body)}`);
+    const attesterId = r.body.attesterId;
+    if (!/^[0-9a-f]{64}$/.test(String(attesterId))) fail(`anchorDocument returned no attesterId: ${pretty(r.body)}`);
     await pollJob(sessionId, r.body.jobId, 'attest', { headers: agent });
     console.log('OK   contract document anchored by the agent');
 
@@ -233,7 +235,7 @@ function expectStatus(r, want, label) {
     step('9. Per-claim crawler-free verification (agent)');
     for (const c of claims) {
         const v = await pollVerify(fn('verifyPredicateState', {
-            contractAddress, payloadHash,
+            contractAddress, attesterId, payloadHash,
             predicate: c.predicate, threshold: Number(c.threshold), fieldKey: c.fieldKey
         }), c.unit, { headers: agent });
         if (v.proven !== true) fail(`claim ${c.unit}: expected proven=true: ${pretty(v)}`);
@@ -255,9 +257,10 @@ function expectStatus(r, want, label) {
     if (blake2b256Hex(envelopeJson) !== provPayloadHash) fail('envelope does not re-hash to payloadHash');
     await pollJob(sessionId, r.body.jobId, 'provenance', { headers: agent });
     const prov = await pollVerify(fn('verifyAttestationState', {
-        contractAddress, payloadHash: provPayloadHash
+        contractAddress, attesterId, payloadHash: provPayloadHash
     }), 'provenance', { headers: agent });
     if (prov.attested !== true) fail(`provenance anchor not attested: ${pretty(prov)}`);
+    if (prov.attesterId !== attesterId) fail(`provenance record carries another attester: ${pretty(prov)}`);
     console.log(`OK   provenance envelope anchored + third-party verifiable (${provPayloadHash.slice(0, 12)}…)`);
 
     step('11. NEGATIVE: 4th write action → 429 budget exhausted');
@@ -269,7 +272,7 @@ function expectStatus(r, want, label) {
     step('12. revokeAgentGrant (operator) → agent gets 401');
     r = await post('/revokeAgentGrant', { grantId });
     if (r.status >= 400 || r.body?.revoked !== true) fail(`revokeAgentGrant → ${r.status}: ${pretty(r.body)}`);
-    expectStatus(await get(fn('verifyAttestationState', { contractAddress, payloadHash }), agent),
+    expectStatus(await get(fn('verifyAttestationState', { contractAddress, attesterId, payloadHash }), agent),
         401, 'read with revoked token');
 
     console.log('\nAGENT-LAYER E2E PASSED.');
@@ -282,7 +285,7 @@ function expectStatus(r, want, label) {
 function pick(fields, name) {
     const f = fields.find(x => x.field === name);
     if (!f) fail(`prepared fields miss '${name}'`);
-    // v4 salted leaves: the slot salt is required per batch claim (the
+    // Salted leaves: the slot salt is required per batch claim (the
     // single-field actions take the same value as `fieldSalt`).
     if (!f.salt) fail(`prepared field '${name}' has no salt (v4 salted leaves)`);
     return { fieldKey: f.fieldKey, value: f.value, salt: f.salt, siblings: f.siblings, dirs: f.dirs };

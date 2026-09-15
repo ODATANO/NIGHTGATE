@@ -7,7 +7,7 @@
 //   import { connect } from '@odatano/nightgate/client';
 //
 //   const ng = connect({ baseUrl: 'https://nightgate.example' });
-//   const state = await ng.verifyAttestation({ contractAddress, payloadHash });
+//   const state = await ng.verifyAttestation({ contractAddress, attesterId, payloadHash });
 //
 // Auth: pass `agentToken` (an `ngat_...` agent-grant token, travels in
 // x-agent-token), or `token` (Bearer), or `username`/`password` (Basic). An
@@ -65,20 +65,6 @@ function stripODataNoise(payload) {
     return out;
 }
 
-/**
- * Connect to a hosted NIGHTGATE.
- *
- * @param {object} opts
- * @param {string} opts.baseUrl            e.g. https://nightgate.example (no trailing slash needed)
- * @param {string} [opts.servicePath]      default '/api/v1/nightgate'
- * @param {string} [opts.agentToken]       agent-grant token (ngat_...), sent as x-agent-token
- * @param {string} [opts.token]            Bearer token
- * @param {string} [opts.username]         Basic auth user (also alongside agentToken)
- * @param {string} [opts.password]
- * @param {number} [opts.timeoutMs]        per-request timeout, default 120000
- * @param {number} [opts.pollMs]           waitForJob poll interval, default 2000
- * @param {Function} [opts.fetchFn]        override fetch (tests)
- */
 /** A request may be sent twice only when the second delivery cannot create a second effect. */
 function isSafeToRepeat(method, body) {
     if (method === 'GET') return true;
@@ -93,6 +79,20 @@ function isStaleSocketError(err) {
     return /fetch failed/i.test(String(err?.message ?? '')) && /^(ECONNRESET|EPIPE|UND_ERR_SOCKET)$/.test(code);
 }
 
+/**
+ * Connect to a hosted NIGHTGATE.
+ *
+ * @param {object} opts
+ * @param {string} opts.baseUrl            e.g. https://nightgate.example (no trailing slash needed)
+ * @param {string} [opts.servicePath]      default '/api/v1/nightgate'
+ * @param {string} [opts.agentToken]       agent-grant token (ngat_...), sent as x-agent-token
+ * @param {string} [opts.token]            Bearer token
+ * @param {string} [opts.username]         Basic auth user (also alongside agentToken)
+ * @param {string} [opts.password]
+ * @param {number} [opts.timeoutMs]        per-request timeout, default 120000
+ * @param {number} [opts.pollMs]           waitForJob poll interval, default 2000
+ * @param {Function} [opts.fetchFn]        override fetch (tests)
+ */
 export function connect(opts) {
     const {
         baseUrl, servicePath = '/api/v1/nightgate',
@@ -167,8 +167,7 @@ export function connect(opts) {
      * A poll that failed for a reason that says nothing about the JOB: a proxy
      * or server hiccup (502/503/504/429), a network error, a timeout. The job
      * keeps running server-side, so the poll is retried (bounded) instead of
-     * losing the job handle. Live case: a reverse proxy answered one poll with
-     * 502 while the server was busy restoring a wallet; the jobs landed.
+     * losing the job handle.
      */
     function isTransientPollError(err) {
         if (err instanceof NightgateApiError) return [429, 502, 503, 504].includes(err.status);
@@ -240,7 +239,6 @@ export function connect(opts) {
         // ---- compute-only preparation (POST, no wallet) ----
         prepareDocumentProof: (p) => callAction('prepareDocumentProof', p),
         prepareMembershipSet: (p) => callAction('prepareMembershipSet', p),
-        prepareAnchorCommitment: (p) => callAction('prepareAnchorCommitment', p),
 
         // ---- wallet sessions ----
         connectWallet: (p) => callAction('connectWallet', p),
@@ -252,7 +250,6 @@ export function connect(opts) {
 
         // ---- anchoring + ZK attestations (async job -> waits for the result) ----
         anchorDocument: (p) => act('anchorDocument', p),
-        commitDocumentAnchor: (p) => act('commitDocumentAnchor', p),
         attestAgentOutput: (p) => act('attestAgentOutput', p),
         proveFieldPredicate: (p) => act('issueFieldPredicateAttestation', p),
         proveFieldEquality: (p) => act('issueFieldEqualityAttestation', p),
@@ -265,6 +262,9 @@ export function connect(opts) {
         grantDisclosure: (p) => act('grantDisclosure', p),
         revokeDisclosure: (p) => act('revokeDisclosure', p),
         registerPassport: (p) => act('registerPassport', p),
+        registerDocument: (p) => act('registerPassport', p),
+        retractAttestation: (p) => act('retractAttestation', p),
+        purgeExpired: (p) => act('purgeExpired', p),
 
         // ---- contracts + tokens ----
         deployContract: (p) => act('deployContract', p),
@@ -273,14 +273,14 @@ export function connect(opts) {
         mintShieldedTestToken: (p) => act('mintShieldedTestToken', p),
         sendNight: (p) => act('sendNight', p),
 
-        // ---- cross-server fee sponsoring (0.17.0) ----
+        // ---- cross-server fee sponsoring ----
         /**
          * Hand a locally built, fee-unpaid transaction (txbuilder's
          * finalizedTxB64) to the sponsor, wait for the submit, return the
          * txHash. The job is keyed by the SPONSOR session.
          */
         sponsorFinalized: (p) => act('sponsorFinalizedTransaction', p, 'sponsorSessionId'),
-        /** 0.18 parallel channel: submit an UNBOUND tx (buildSponsorable bind:false). */
+        /** Parallel channel: submit an UNBOUND tx (buildSponsorable bind:false). */
         sponsorUnbound: (p) => act('sponsorUnboundTransaction', p, 'sponsorSessionId'),
         buildSponsorable: (p) => act('buildSponsorable', p)
     };

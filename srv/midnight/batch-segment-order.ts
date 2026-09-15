@@ -1,20 +1,7 @@
 /**
- * Deterministic segment ordering for batched contract calls.
- *
- * midnight-js-contracts builds each circuit call via
- * `Transaction.fromPartsRandomized`, which RANDOMIZES the intent's segment id,
- * and the ledger applies merged intents in ascending segment order (ledger-v8
- * `SegmentSpecifier`: `{ tag: 'first' }` is an alias for segment 1). A batch
- * of dependent calls therefore only landed when the dice happened to fall in
- * call order.
- *
- * The fix window: `submitTxCore` hands the merged transaction to the proof
- * provider FIRST, still unbound and unproven, and ledger-v8 documents
- * `Transaction.intents` as writable exactly then ("writing to this
- * re-computes binding information if and only if this transaction is unbound
- * and unproven"). So before delegating to the real `proveTx` we reassign the
- * EXISTING segment ids, sorted ascending, to the batch's intents in call
- * order: apply order == call order, deterministically.
+ * The SDK randomizes each call intent's segment id; the ledger applies by ascending id.
+ * The proof provider gets the tx unbound and unproven, the only time `Transaction.intents`
+ * is writable, so the wrapper reassigns the existing ids in call order before proving.
  */
 
 const utf8 = new TextDecoder();
@@ -25,25 +12,9 @@ function entryPointName(ep: unknown): string {
     return String(ep ?? '');
 }
 
-/**
- * Which execution stages a call carries: `g` = guaranteed transcript, `f` =
- * fallible. `partitionTranscripts` splits every call heuristically by gas
- * cost, so the SAME circuit is `g` on a small contract state and `gf` once its
- * ops grow expensive enough (deeper merkle paths on bigger maps).
- *
- * This is the load-bearing datum for a 1010/188 diagnosis, because the ledger
- * requires causality across the merged intents: a call carrying a FALLIBLE
- * transcript must not be followed by a call carrying a GUARANTEED one (all
- * guaranteed stages are applied before any fallible stage, so the later call
- * would run against state its predecessor has not written yet). Its message,
- * from the ledger sources: "causality violation: Calls must be arranged to
- * ensure causality constraints are met, but found call at segment_id: X with
- * fallible transcript and call at segment_id: Y with guaranteed transcript".
- */
+// Stages: `g` guaranteed, `f` fallible. The SDK splits by gas cost, so the same
+// circuit moves from `g` to `g+f` as contract state grows.
 function gasOf(transcript: any): string {
-    // Transcript.gas is the call's execution budget (RunningCost, picoseconds).
-    // computeTime is the dimension that grows with contract state and thus the
-    // one that decides when a call no longer fits the guaranteed stage.
     const compute = transcript?.gas?.computeTime;
     if (typeof compute !== 'bigint' && typeof compute !== 'number') return '';
     return `:${(Number(compute) / 1e9).toFixed(2)}G`;
@@ -60,11 +31,7 @@ function transcriptStages(action: any): string {
     }
 }
 
-/**
- * The batch's contract calls in APPLY order (ascending segment id), with the
- * stages each one carries. Intents without a contract call (fee/dust segments
- * added during balancing) are skipped.
- */
+/** Contract calls in apply order; fee/dust intents without an entry point are skipped. */
 function orderedCalls(tx: any): Array<{ name: string; segId: number; guaranteed: boolean; fallible: boolean }> {
     const intents: Map<number, any> | undefined = tx?.intents;
     if (!intents || typeof intents.entries !== 'function') return [];
@@ -83,23 +50,7 @@ function orderedCalls(tx: any): Array<{ name: string; segId: number; guaranteed:
     return calls.sort((a, b) => a.segId - b.segId);
 }
 
-/**
- * The ledger's causality constraint, checked BEFORE proving: a call carrying a
- * fallible transcript must not be followed by one carrying a guaranteed
- * transcript. Returns an explanatory message when the batch would be rejected,
- * null when it is fine.
- *
- * Why this is worth checking ourselves: the node reports the violation as a
- * bare `1010: Invalid Transaction: Custom error: 188` AFTER we have spent proof
- * generation and balancing on the transaction, and the same call list is valid
- * or invalid depending on the target contract's state, which the caller cannot
- * see. Reading the partitioning here turns a blind, expensive reject into an
- * immediate, actionable error.
- *
- * Fail-OPEN by construction: when the SDK exposes no transcripts (both flags
- * false), nothing is reported, so a future SDK shape cannot make this block
- * valid batches.
- */
+/** Ledger causality: a fallible call must not precede a guaranteed one. Reason, or null. */
 export function findCausalityViolation(tx: any): string | null {
     const calls = orderedCalls(tx);
     for (let i = 0; i < calls.length; i++) {
@@ -137,11 +88,8 @@ export function batchCallStages(tx: any): BatchCallStage[] {
 }
 
 /**
- * The pre-proving causality refusal. `code` is stable for job classification;
- * `calls` carries every call's apply position and stages, so a consumer can
- * split the batch deterministically instead of parsing the message. The SDK's
- * scope wrapper may re-wrap this error and keep only the message, which is
- * why the message carries the same per-call list.
+ * `calls` lets a consumer split the batch without parsing. The message repeats the list
+ * because the SDK's scope wrapper may keep only the message.
  */
 export class BatchCausalityError extends Error {
     readonly code = 'BatchCausalityViolation';
@@ -170,36 +118,15 @@ export function describeBatchSegments(tx: any): string {
 }
 
 export interface BatchOrderOptions {
-    /** The calls past `orderedPrefix` are order-free: group them by stage. */
+    // The calls past `orderedPrefix` are order-free: group them by stage.
     independentCalls?: boolean;
-    /** Leading calls that keep their position even under `independentCalls`. */
+    // Leading calls that keep their position even under `independentCalls`.
     orderedPrefix?: number;
 }
 
 /**
- * Rewrite `tx.intents` so the intents matching `circuitsInOrder` (via their
- * first action's `entryPoint`) carry ascending segment ids in call order.
- * Only the matched intents' own ids are permuted; unmatched intents keep
- * theirs, so nothing can collide with segments added later (fee/dust
- * balancing). Duplicate circuit names are consumed in map-encounter order,
- * which is NOT guaranteed to be call order - batch distinct circuits when
- * relative order among same-named calls matters.
- *
- * `independentCalls`: the calls (past `orderedPrefix`) share no state and may
- * apply in any order. They are then grouped by execution stage, guaranteed-only
- * calls first, calls with a fallible transcript after, call order within a
- * group. That is always causality-valid for such a set, while call order alone
- * is not: `partitionTranscripts` assigns stages by gas cost per call, and on a
- * grown contract the same circuit lands in different stages for different map
- * keys, so a set of claim proofs in call order fails the causality check about
- * every second time while a valid order exists. The first `orderedPrefix` calls
- * keep their position (an in-batch anchor the proofs read, for instance); a
- * dependent batch passes neither flag and keeps call order.
- *
- * Returns true when a rewrite happened. On ANY mismatch (missing intent for a
- * circuit, leftover unmatched call, no intents map) the transaction is left
- * untouched and false is returned; the batch wrapper below treats that as
- * fatal for multi-call batches.
+ * Reassign the matched intents' existing segment ids in call order. On any mismatch
+ * returns false and leaves `tx` untouched.
  */
 export function orderBatchSegments(tx: any, circuitsInOrder: string[], opts: BatchOrderOptions = {}): boolean {
     const intents: Map<number, any> | undefined = tx?.intents;
@@ -244,24 +171,11 @@ export function orderBatchSegments(tx: any, circuitsInOrder: string[], opts: Bat
     picked.forEach(([, intent], i) => next.set(pickedIdsAsc[i], intent));
     if (next.size !== intents.size) return false;
 
-    tx.intents = next; // ledger-v8 re-computes binding (unbound + unproven only)
+    tx.intents = next;
     return true;
 }
 
-/**
- * Wrap a proof provider so `proveTx` first rewrites the batch's segment ids
- * into call order, then delegates. Prototype-preserving (`Object.create`), so
- * any extra provider surface stays reachable.
- *
- * FAIL-CLOSED for multi-call batches: dependent batches are supported on the
- * strength of the deterministic apply order, so if the ordering cannot be
- * established (intents don't match the call list, or the WASM intents
- * surface throws) the wrapper THROWS before proving. That is an
- * error-before-submission: the scope is discarded and nothing reaches the
- * chain, instead of silently proving in randomized order and risking
- * PARTIAL_SUCCESS with partial on-chain effects. Single-call batches skip
- * ordering (trivially ordered).
- */
+/** Proof provider whose `proveTx` orders segments and checks causality before delegating. */
 export function withOrderedBatchSegments(
     proofProvider: any,
     circuitsInOrder: string[],
@@ -286,15 +200,9 @@ export function withOrderedBatchSegments(
                     'aborting before proving (nothing submitted) because the deterministic apply order cannot be guaranteed'
                 );
             }
-            // Worker-thread console lands in the server log; one line per
-            // multi-call batch, and the id mapping plus the per-call stages
-            // are the load-bearing data in any 1010/188 diagnosis.
             console.log(`[nightgate:batch-segments] rewrite${opts.independentCalls ? ' (stage-grouped)' : ''}: ${before} -> ${describeBatchSegments(tx)}`);
             const violation = findCausalityViolation(tx);
             if (violation) {
-                // Under independentCalls the grouping makes this unreachable
-                // for a set past the prefix; a hit then means the prefix
-                // (a dependent leading call) went fallible and still throws.
                 const calls = batchCallStages(tx);
                 throw new BatchCausalityError(
                     `batch [${circuitsInOrder.join('+')}] violates the ledger's causality constraint: ${violation}. ` +
@@ -309,13 +217,7 @@ export function withOrderedBatchSegments(
     return wrapped;
 }
 
-/**
- * DIAGNOSTIC (NIGHTGATE_BATCH_SEGMENT_MODE=observe): do NOT rewrite; log the
- * randomized segment ids and prove as-is. Apply order is then whatever the
- * dice say, so dependent batches may fail ON-CHAIN with partial effects; use
- * only to decide whether a pre-mempool sequencing reject (1010/188) also
- * occurs when the rewrite touched nothing.
- */
+/** Diagnostic wrapper: logs segment ids without rewriting. */
 export function withObservedBatchSegments(
     proofProvider: any,
     circuitsInOrder: string[]

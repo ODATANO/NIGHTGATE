@@ -1,15 +1,12 @@
 /**
- * Constants both sides of the wallet-worker RPC agree on. Dependency-free on
- * purpose: the main thread must never import the worker module (it loads the
- * ESM SDK), and a list kept in two places drifts.
+ * Constants both sides of the wallet-worker RPC share. Dependency-free: the
+ * main thread must never import the worker module (it loads the ESM SDK).
  * SPDX-License-Identifier: Apache-2.0
  */
 
 /**
- * Methods that move value or keys and therefore run under the worker's
- * per-session submit lock: one build/submit per session at a time, and an
- * evict waits for them. Every one of them announces its transaction
- * identifier to the main thread before broadcasting (submit-intent).
+ * Methods that run under the worker's per-session submit lock (an evict waits
+ * for them); each announces its tx identifier before broadcasting.
  */
 export const SUBMIT_METHODS: ReadonlySet<string> = new Set([
     'deployContract', 'submitContractCall', 'submitContractCallBatch',
@@ -18,10 +15,8 @@ export const SUBMIT_METHODS: ReadonlySet<string> = new Set([
 ]);
 
 /**
- * Methods that may broadcast: SUBMIT_METHODS plus the unbound sponsor path,
- * which deliberately holds no whole-call lock (only its dust build) so one
- * wallet sponsors N transactions at once. These are the calls a rotation
- * drain waits for and a rotation exit must never repeat.
+ * Methods that may broadcast: SUBMIT_METHODS plus the unbound sponsor path (no
+ * whole-call lock). A rotation drain waits for these and never repeats them.
  */
 export function isSubmittingMethod(method: string): boolean {
     return SUBMIT_METHODS.has(method) || method === 'sponsorUnboundTx';
@@ -35,25 +30,17 @@ export const WORKER_ROTATED = 'WORKER_ROTATED';
 // ---- Submit-failure classification, shared by both sides -------------------
 
 /**
- * Closed set of submit-failure codes. The WORKER classifies once, against the
- * SDK error objects it holds, and the code rides over the RPC; the main
- * thread branches on it and never on message text.
- *
- *  pre-mempool-reject  the node refused the transaction before the mempool
- *                      (fee unspent); `ledgerCode` carries the Substrate /
- *                      ledger code (`1010/188`, `1014`, `1016`) or
- *                      `intent-rejected` (the main thread nacked the intent)
- *  dust-race           1010/170 or 1010/196 (`ledgerCode`), or a pool status
- *                      Invalid (`ledgerCode: 'pool-invalid'`); rebuild-retryable
- *  transport           the send died before an answer (socket, timeout);
- *                      resend-eligible; `ledgerCode: 'closing-socket'` when it
- *                      was the client's own closing socket (never left)
- *  ambiguous           the broadcast may have landed (watch timeout, indexer
- *                      unaware); never rebuild, reconcile by identifier
+ * Submit-failure codes. The worker classifies against the SDK error objects;
+ * the main thread branches on the code, never on message text.
+ *  pre-mempool-reject  refused before the mempool, fee unspent; `ledgerCode` =
+ *                      node code, `intent-rejected` or `intent-timeout`
+ *  dust-race           1010/170, 1010/196 or `pool-invalid`; rebuild-retryable
+ *  transport           send died before an answer; resend-eligible
+ *                      (`closing-socket`: never left the client)
+ *  ambiguous           may have landed; never rebuild, reconcile by identifier
  *  landed-not-applied  in a block, the contract call did not apply
  *  policy              sponsor shape or allow-list refusal
- *  causality           batch causality refusal before proving; `calls` lists
- *                      every call's apply position and stages
+ *  causality           batch causality refusal before proving (`calls`)
  *  internal            anything else
  */
 export const SUBMIT_FAILURE_CODES = [
@@ -91,10 +78,7 @@ export interface RpcErrorPayload {
     calls?: BatchCallStageInfo[];    blockHeight?: number;
 }
 
-/**
- * The error the client rebuilds from a classified failure payload: the worker's
- * name and message, plus the classification as data.
- */
+/** Client-side error rebuilt from a classified failure payload. */
 export class WorkerSubmitError extends Error {
     readonly code: SubmitFailureCode;
     readonly ledgerCode?: string;

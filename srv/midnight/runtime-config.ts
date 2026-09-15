@@ -4,9 +4,8 @@
  *
  * Inside the server the config table answers (defaults, validation,
  * worker_threads propagation). The package does not carry
- * `srv/utils/config`: there the environment decides. 0.5.0 imported the
- * table statically from both files and every in-process build of the SDK
- * died on load with "Cannot find module '../utils/config'".
+ * `srv/utils/config`, so it must not be imported statically from those
+ * files: there the environment decides.
  *
  * SPDX-License-Identifier: Apache-2.0
  */

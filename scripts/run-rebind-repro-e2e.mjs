@@ -5,8 +5,7 @@
 //
 // Two ledger behaviours meet here, and both need a populated vault to show up
 // at all, which is why this runner prefills:
-//   - expensive calls go LAST, since nothing behind them can be starved
-//     (the 0.15.3 "cell update last" rule is this in its special case);
+//   - expensive calls go LAST, since nothing behind them can be starved;
 //   - the ledger's causality constraint: a call carrying a FALLIBLE
 //     transcript must not be followed by one carrying a GUARANTEED
 //     transcript, and which stage a call lands in is decided by its gas
@@ -128,16 +127,16 @@ async function submitSingle(sessionId, vault, label, circuit, args) {
 // The batch defaults to [attest, anchorContentRoot, bindPassport]:
 // dependency-valid (both bind and anchor only need attest) and it puts the
 // costliest call of a rebind (the UPDATING bindPassport) last, where nothing
-// behind it can be starved. REPRO_VARIANT=bind-middle restores the original
-// order [attest, bindPassport, anchorContentRoot], which fails earlier because
-// the update then has a call behind it.
+// behind it can be starved. REPRO_VARIANT=bind-middle uses the order
+// [attest, bindPassport, anchorContentRoot], which fails earlier because the
+// update then has a call behind it.
 const BIND_MIDDLE = process.env.REPRO_VARIANT === 'bind-middle';
 const freshBindCalls = (pid) => {
     const h = hex32();
     const attest = { circuit: 'attest', args: [h, hex32()] };
-    const bind = { circuit: 'bindPassport', args: [pid, h] };
-    // schemaId is the third argument since 0.16.0 (roots are anchored together
-    // with the schema they were built under).
+    const bind = { circuit: 'bindDocument', args: [pid, h] };
+    // schemaId is the third argument (roots are anchored together with the
+    // schema they were built under).
     const anchor = { circuit: 'anchorContentRoot', args: [h, hex32(), hex32()] };
     return BIND_MIDDLE ? [attest, bind, anchor] : [attest, anchor, bind];
 };
@@ -198,7 +197,7 @@ const freshBindCalls = (pid) => {
         const h3 = hex32();
         const c1 = await submitSingle(sessionId, vault, 'control attest single', 'attest', [h3, hex32()]);
         if (c1.ok) {
-            await submitSingle(sessionId, vault, 'control REBIND single (no batch)', 'bindPassport', [pid, h3]);
+            await submitSingle(sessionId, vault, 'control REBIND single (no batch)', 'bindDocument', [pid, h3]);
         }
         await submitBatch(sessionId, vault, 'control fresh-bind batch (new pid)', freshBindCalls(hex32()));
     }

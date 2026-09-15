@@ -51,6 +51,7 @@ const SESSION = 'grant-session';
 const CONTRACT = 'c'.repeat(64);
 const PAYLOAD = 'a'.repeat(64);
 const GRANTEE = 'b'.repeat(64);
+const ATTESTER = 'e'.repeat(64);
 const VAULT = 'attestation-vault';
 
 let db: any;
@@ -82,7 +83,7 @@ function makeReq(user: string, level: number) {
 
 function grantCommand(disclosureGrantId: string, level: number) {
     return {
-        op: 'grantDisclosure', disclosureGrantId, payloadHash: PAYLOAD, grantee: GRANTEE, level,
+        op: 'grantDisclosure', disclosureGrantId, payloadHash: PAYLOAD, attesterId: ATTESTER, grantee: GRANTEE, level,
         contractAddress: CONTRACT, compiledArtifactRef: VAULT, artifactDigest: getArtifactGenerationDigest(VAULT)
     };
 }
@@ -91,7 +92,7 @@ async function seedActiveGrant(level: number): Promise<string> {
     const ID = cds.utils.uuid();
     const now = new Date().toISOString();
     await db.run(cds.ql.INSERT.into(GRANTS).entries({
-        ID, contractAddress: CONTRACT, payloadHash: PAYLOAD, grantee: GRANTEE, level, pendingLevel: null,
+        ID, contractAddress: CONTRACT, payloadHash: PAYLOAD, attesterId: ATTESTER, grantee: GRANTEE, level, pendingLevel: null,
         grantedTxHash: '0x01', revokedTxHash: null, active: true, createdAt: now, modifiedAt: now
     }));
     return ID;
@@ -111,12 +112,13 @@ beforeAll(async () => {
     handlers = {};
     registerSubmissionHandlers({ on: (event: string, fn: any) => { handlers[event] = fn; } } as any, db, {
         resolveContractImpl: async () => resolvedContract(),
+        attesterIdResolver: async () => ATTESTER,
         walletMaterialFactory: async ({ sessionId, expectedUserId }: any) => {
             if (expectedUserId !== OWNER) throw new SessionNotFoundError(sessionId);
             return walletMaterial();
         },
         submitterFactory: () => ({ call: () => submitterBehaviour.call() }) as any,
-        disclosureReindexer: async () => ({ indexed: 0, deactivated: 0 })
+        disclosureReindexer: async () => ({ indexed: 0, deactivated: 0, snapshotHeight: null })
     });
 });
 
@@ -211,7 +213,7 @@ describe('disclosure role while a level request is pending', () => {
 
         const req = new cds.Request({ event: 'READ' });
         req.user = new cds.User({ id: 'recipient' } as any);
-        const role = await attachDisclosureRole(req, db, { contractAddress: CONTRACT, payloadHash: PAYLOAD });
+        const role = await attachDisclosureRole(req, db, { contractAddress: CONTRACT, payloadHash: PAYLOAD, attesterId: ATTESTER });
         expect(role).toBe('legitimate_interest');
     });
 });

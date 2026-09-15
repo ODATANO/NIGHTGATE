@@ -1,21 +1,12 @@
 /**
- * MidnightNodeProvider, Substrate RPC WebSocket Client
- *
- * Connects directly to a Midnight Node via Substrate JSON-RPC 2.0 over WebSocket.
- * Primary data source for the active crawler. Independent of the hosted Midnight Indexer.
- *
- * Protocol: JSON-RPC 2.0 over WebSocket (ws://node:9944)
- * Reference: Polkadot/Substrate RPC specification
+ * Substrate JSON-RPC 2.0 WebSocket client for a Midnight node: the crawler's
+ * data source, independent of the hosted Midnight Indexer.
  */
 
 import WebSocket from 'ws';
 import cds from '@sap/cds';
 import { redactUrlCredentials } from '../utils/redact-url';
 const log = cds.log('nightgate:node');
-
-// ============================================================================
-// Type Definitions
-// ============================================================================
 
 export interface NodeProviderConfig {
     nodeUrl: string;          // ws://localhost:9944
@@ -77,10 +68,6 @@ interface PendingRequest {
 
 type SubscriptionCallback = (result: any) => void | Promise<void>;
 
-// ============================================================================
-// Midnight Node Provider
-// ============================================================================
-
 /** Reconnect delay = reconnectInterval x min(attempt, this): 5 s x 12 = one attempt a minute in a long outage. */
 const MAX_RECONNECT_DELAY_FACTOR = 12;
 
@@ -106,10 +93,6 @@ export class MidnightNodeProvider {
             maxReconnectAttempts: config.maxReconnectAttempts || 10
         };
     }
-
-    // ========================================================================
-    // Connection Management
-    // ========================================================================
 
     async connect(): Promise<void> {
         return new Promise((resolve, reject) => {
@@ -144,7 +127,6 @@ export class MidnightNodeProvider {
                     this.orphanNotifications.clear();
 
                     if (!wasConnected) {
-                        // Socket closed before 'open', reject the connect() promise
                         reject(new Error(`WebSocket closed before connection established to ${redactUrlCredentials(this.config.nodeUrl)}`));
                         return;
                     }
@@ -163,7 +145,6 @@ export class MidnightNodeProvider {
     async disconnect(): Promise<void> {
         this.reconnecting = false;
 
-        // Clear any pending reconnect timer
         if (this.reconnectTimer) {
             clearTimeout(this.reconnectTimer);
             this.reconnectTimer = null;
@@ -185,16 +166,11 @@ export class MidnightNodeProvider {
         return this.connected;
     }
 
-    /**
-     * Register a callback to invoke after successful reconnect.
-     */
     setOnReconnect(callback: () => Promise<void>): void {
         this.onReconnectCallback = callback;
     }
 
-    /**
-     * Register a callback invoked when reconnection is permanently abandoned
-     */
+    /** Called once per outage when maxReconnectAttempts is exceeded; reconnecting continues. */
     setOnReconnectFailed(callback: () => void): void {
         this.onReconnectFailedCallback = callback;
     }
@@ -204,12 +180,9 @@ export class MidnightNodeProvider {
 
     private attemptReconnect(): void {
         if (this.reconnecting) return;
-        // An indexer never gives up on its node. Past `maxReconnectAttempts`
-        // the abandonment is SIGNALLED once (the crawler marks the sync
-        // errored, operators see it) and the attempts continue with a capped
-        // delay; a successful connect resets both. Giving up here left the
-        // index frozen after any node restart longer than ~3 min, with
-        // `resumeCrawler` answering "already running".
+        // Never give up on the node: past maxReconnectAttempts signal once (the
+        // crawler marks the sync errored) and keep retrying at a capped delay.
+        // Stopping would freeze the index while resumeCrawler says "running".
         if (this.reconnectAttempts >= this.config.maxReconnectAttempts && !this.reconnectAbandonSignalled) {
             log.error(`Max reconnect attempts (${this.config.maxReconnectAttempts}) reached`);
             log.error(`Node unreachable after ${this.config.maxReconnectAttempts} attempts; sync marked errored, reconnecting continues every ${this.config.reconnectInterval * MAX_RECONNECT_DELAY_FACTOR}ms`);
@@ -230,7 +203,6 @@ export class MidnightNodeProvider {
             try {
                 await this.connect();
                 log.info('Reconnected successfully');
-                // Notify crawler to re-establish subscriptions
                 if (this.onReconnectCallback) {
                     try {
                         await this.onReconnectCallback();
@@ -245,10 +217,6 @@ export class MidnightNodeProvider {
             }
         }, delay);
     }
-
-    // ========================================================================
-    // JSON-RPC 2.0 Core
-    // ========================================================================
 
     async rpc(method: string, params: unknown[] = []): Promise<any> {
         if (!this.ws || !this.connected) {
@@ -276,16 +244,7 @@ export class MidnightNodeProvider {
         });
     }
 
-    /**
-     * Send multiple RPCs in a single JSON-RPC 2.0 batch request.
-     *
-     * One WSS frame out, one frame in. The server processes the calls in
-     * parallel internally and returns a response array; we resolve each
-     * caller's promise as the matching id arrives in `handleMessage`.
-     *
-     * Returns results in the SAME ORDER as the input requests. Throws if any
-     * single sub-request errors out (matches the rpc() semantics).
-     */
+    /** Sends the calls as one JSON-RPC batch frame; results in input order, rejects if any call errors. */
     async rpcBatch(requests: Array<{ method: string; params?: unknown[] }>): Promise<any[]> {
         if (!this.ws || !this.connected) {
             throw new Error('Not connected to Midnight Node');
@@ -327,8 +286,6 @@ export class MidnightNodeProvider {
             return;
         }
 
-        // JSON-RPC 2.0 batch response: a top-level array of response objects.
-        // Iterate and dispatch each as a normal message.
         if (Array.isArray(parsed)) {
             for (const msg of parsed) {
                 this.handleSingleMessage(msg as JsonRpcResponse);
@@ -339,16 +296,13 @@ export class MidnightNodeProvider {
     }
 
     private handleSingleMessage(message: JsonRpcResponse): void {
-        // Subscription notification
         if (message.method && message.params?.subscription) {
             const callback = this.subscriptions.get(message.params.subscription);
             if (callback) {
                 this.invokeSubscriptionCallback(callback, message.params.result);
             } else {
-                // The notification arrived before subscribe*() registered its
-                // callback (Substrate replays the current head immediately on
-                // subscribe). Buffer it; registerSubscription drains it right
-                // after the callback is set, so the first head is not dropped.
+                // Substrate replays the current head before subscribe*() knows the
+                // id; buffer it for registerSubscription so it is not dropped.
                 const buf = this.orphanNotifications.get(message.params.subscription) ?? [];
                 buf.push(message.params.result);
                 this.orphanNotifications.set(message.params.subscription, buf);
@@ -356,7 +310,6 @@ export class MidnightNodeProvider {
             return;
         }
 
-        // Regular RPC response
         if (message.id !== undefined) {
             const pending = this.pendingRequests.get(message.id);
             if (pending) {
@@ -382,105 +335,54 @@ export class MidnightNodeProvider {
         this.pendingRequests.clear();
     }
 
-    // ========================================================================
-    // Chain RPC Methods
-    // ========================================================================
-
-    /**
-     * Get the latest block header
-     */
     async getLatestHeader(): Promise<BlockHeader> {
         return this.rpc('chain_getHeader');
     }
 
-    /**
-     * Get a block header by hash
-     */
     async getHeader(hash?: string): Promise<BlockHeader> {
         return this.rpc('chain_getHeader', hash ? [hash] : []);
     }
 
-    /**
-     * Get a full signed block by hash
-     */
     async getBlock(hash: string): Promise<SignedBlock> {
         return this.rpc('chain_getBlock', [hash]);
     }
 
-    /**
-     * Get the block hash for a given height
-     */
     async getBlockHash(height: number): Promise<string> {
         return this.rpc('chain_getBlockHash', [height]);
     }
 
-    /**
-     * Get the finalized block head hash
-     */
     async getFinalizedHead(): Promise<string> {
         return this.rpc('chain_getFinalizedHead');
     }
 
-    // ========================================================================
-    // State RPC Methods
-    // ========================================================================
-
-    /**
-     * Query runtime storage at a given key (optionally at a specific block)
-     */
     async getStorage(key: string, blockHash?: string): Promise<string | null> {
         return this.rpc('state_getStorage', blockHash ? [key, blockHash] : [key]);
     }
 
-    /**
-     * Get the runtime version
-     */
     async getRuntimeVersion(blockHash?: string): Promise<RuntimeVersion> {
         return this.rpc('state_getRuntimeVersion', blockHash ? [blockHash] : []);
     }
 
-    /**
-     * Get runtime metadata (SCALE-encoded)
-     */
+    /** SCALE-encoded runtime metadata. */
     async getMetadata(blockHash?: string): Promise<string> {
         return this.rpc('state_getMetadata', blockHash ? [blockHash] : []);
     }
 
-    // ========================================================================
-    // System RPC Methods
-    // ========================================================================
-
-    /**
-     * Get node health status
-     */
     async health(): Promise<{ peers: number; isSyncing: boolean; shouldHavePeers: boolean }> {
         return this.rpc('system_health');
     }
 
-    /**
-     * Get the chain name
-     */
     async chain(): Promise<string> {
         return this.rpc('system_chain');
     }
 
-    /**
-     * Get the node name
-     */
     async name(): Promise<string> {
         return this.rpc('system_name');
     }
 
-    /**
-     * Get the node version
-     */
     async version(): Promise<string> {
         return this.rpc('system_version');
     }
-
-    // ========================================================================
-    // Subscriptions
-    // ========================================================================
 
     private invokeSubscriptionCallback(callback: SubscriptionCallback, result: any): void {
         try {
@@ -497,11 +399,7 @@ export class MidnightNodeProvider {
         }
     }
 
-    /**
-     * Register a subscription callback and immediately drain any notifications
-     * that arrived before the id was known (see orphanNotifications), so the
-     * head Substrate replays on subscribe is never lost to a timing race.
-     */
+    /** Sets the callback, then drains notifications buffered before the id was known. */
     private registerSubscription(subscriptionId: string, callback: SubscriptionCallback): void {
         this.subscriptions.set(subscriptionId, callback);
         const buffered = this.orphanNotifications.get(subscriptionId);
@@ -511,47 +409,28 @@ export class MidnightNodeProvider {
         }
     }
 
-    /**
-     * Subscribe to new block headers (finalized)
-     */
     async subscribeNewHeads(callback: (header: BlockHeader) => void): Promise<string> {
         const subscriptionId = await this.rpc('chain_subscribeNewHeads', []);
         this.registerSubscription(subscriptionId, callback);
         return subscriptionId;
     }
 
-    /**
-     * Subscribe to finalized block headers
-     */
     async subscribeFinalizedHeads(callback: (header: BlockHeader) => void): Promise<string> {
         const subscriptionId = await this.rpc('chain_subscribeFinalizedHeads', []);
         this.registerSubscription(subscriptionId, callback);
         return subscriptionId;
     }
 
-    /**
-     * Unsubscribe from new heads
-     */
     async unsubscribeNewHeads(subscriptionId: string): Promise<boolean> {
         this.subscriptions.delete(subscriptionId);
         return this.rpc('chain_unsubscribeNewHeads', [subscriptionId]);
     }
 
-    /**
-     * Unsubscribe from finalized heads
-     */
     async unsubscribeFinalizedHeads(subscriptionId: string): Promise<boolean> {
         this.subscriptions.delete(subscriptionId);
         return this.rpc('chain_unsubscribeFinalizedHeads', [subscriptionId]);
     }
 
-    // ========================================================================
-    // Utility
-    // ========================================================================
-
-    /**
-     * Parse a hex-encoded block number to integer
-     */
     static parseBlockNumber(hex: string): number {
         const n = parseInt(hex, 16);
         if (isNaN(n)) {
@@ -560,16 +439,10 @@ export class MidnightNodeProvider {
         return n;
     }
 
-    /**
-     * Get pending request count (for health monitoring)
-     */
     getPendingRequestCount(): number {
         return this.pendingRequests.size;
     }
 
-    /**
-     * Get active subscription count
-     */
     getSubscriptionCount(): number {
         return this.subscriptions.size;
     }

@@ -1,20 +1,7 @@
 /**
- * CAP-DB-backed private-state provider for the Midnight JS SDK.
- *
- * Replaces `@midnight-ntwrk/midnight-js-level-private-state-provider` for
- * production use. The SDK's LevelDB provider has an explicit JSDoc warning
- * against production use ("clearing local files permanently destroys the
- * private state", no recovery path). This implementation persists into
- * NIGHTGATE's CAP DB (SQLite dev / HANA prod) with the same AES-256-GCM
- * encryption format the SDK uses for its export blobs.
- *
- * Wire-format compatibility: an export produced here is importable by the
- * SDK's LevelDB provider and vice versa. See srv/utils/storage-encryption.ts.
- *
- * Scope: instance is bound to a single `accountId` (a wallet identifier such
- * as the wallet address). All set/get/remove operations are also scoped to
- * the `currentContractAddress` set via `setContractAddress()` per the SDK
- * interface contract.
+ * Private-state provider on the CAP DB, replacing the SDK's LevelDB provider (not for production).
+ * Exports are wire-compatible with the LevelDB provider (storage-encryption.ts).
+ * Scoped to one `accountId` and to the contract set via `setContractAddress()`.
  */
 
 import crypto from 'crypto';
@@ -104,16 +91,11 @@ export class ImportConflictError extends Error {
     }
 }
 
-//  Config
 export interface CapDbPrivateStateProviderConfig {
     accountId: string;
     /** The account-DEK-derived password (wallet-material-factory.ts); every row is written under it. */
     privateStoragePasswordProvider: () => Promise<string> | string;
-    /**
-     * Passwords a row may still be encrypted under (the pre-DEK ring-bound
-     * and viewing-key-only derivations). Read-only: a row opened through one
-     * is rewritten under the current password, marked `keyScheme = 'dek1'`.
-     */
+    /** Read-only passwords of older derivations; a row opened through one is rewritten under the current password. */
     privateStoragePasswordFallbacks?: () => Promise<string[]> | string[];
     db?: any;
 }
@@ -121,9 +103,8 @@ export interface CapDbPrivateStateProviderConfig {
 const PRIVATE_STATE_SALT_LABEL = 'nightgate-private-state-salt-v1';
 
 /**
- * Deterministic 32-byte salt per (account, password). The salt in a stored
- * blob therefore names the password it was written under, which is how the
- * read fallback and the rewrap tool pick a candidate without trial decrypts.
+ * Deterministic salt per (account, password): a stored blob's salt names its password,
+ * so fallback readers pick a candidate without trial decrypts.
  */
 export function privateStateStableSalt(accountId: string, password: string): Buffer {
     return crypto
@@ -131,8 +112,6 @@ export function privateStateStableSalt(accountId: string, password: string): Buf
         .update(`${password}|${accountId}|${PRIVATE_STATE_SALT_LABEL}`)
         .digest();
 }
-
-//  Provider
 
 export class CapDbPrivateStateProvider<PSI extends PrivateStateId = PrivateStateId, PS = any> {
     private currentContractAddress: ContractAddress | null = null;
@@ -144,8 +123,6 @@ export class CapDbPrivateStateProvider<PSI extends PrivateStateId = PrivateState
         if (!config.privateStoragePasswordProvider) throw new Error('privateStoragePasswordProvider is required');
         if (config.db) this.db = config.db;
     }
-
-    // Interface implementation
 
     setContractAddress(address: ContractAddress): void {
         if (!address) throw new Error('Contract address must not be empty');
@@ -228,7 +205,6 @@ export class CapDbPrivateStateProvider<PSI extends PrivateStateId = PrivateState
         );
     }
 
-    // Export / Import (SDK wire-format compatible)
     async exportPrivateStates(options?: ExportPrivateStatesOptions): Promise<PrivateStateExport> {
         const contractAddress = this.requireContractAddress('exportPrivateStates');
         const maxStates = options?.maxStates ?? MAX_EXPORT_STATES;
@@ -407,8 +383,6 @@ export class CapDbPrivateStateProvider<PSI extends PrivateStateId = PrivateState
         return { imported, skipped, overwritten };
     }
 
-    // Internals
-
     private requireContractAddress(op: string): ContractAddress {
         if (this.currentContractAddress === null) {
             throw new Error(`Contract address not set. Call setContractAddress() before ${op}().`);
@@ -432,19 +406,9 @@ export class CapDbPrivateStateProvider<PSI extends PrivateStateId = PrivateState
     }
 
     /**
-     * Memoized per-instance StorageEncryption.
-     *
-     * The salt is DETERMINISTIC per (account, password), not random. Essential
-     * for cross-instance reads: each submission builds its own provider, so a
-     * deploy that writes state and a later call that reads it use DIFFERENT
-     * instances. A random per-instance salt made the reader's `decrypt()` reject
-     * the writer's blob with "Salt mismatch". A deterministic salt derives the
-     * same key for every instance of an account, so reads succeed across
-     * instances while keeping one-PBKDF2-per-instance and the integrity check.
-     *
-     * The password is already a high-entropy per-account secret (from the wallet
-     * viewing key), so salting from it doesn't weaken anti-precomputation. Export
-     * blobs still get a fresh random salt (see exportPrivateStates).
+     * Deterministic salt: each submission builds its own provider, and a random salt would make
+     * a reader reject the writer's blob. The password is a high-entropy per-account secret;
+     * export blobs get a random salt.
      */
     private getEncryption(): Promise<StorageEncryption> {
         if (!this.encryptionPromise) {
@@ -454,16 +418,11 @@ export class CapDbPrivateStateProvider<PSI extends PrivateStateId = PrivateState
         return this.encryptionPromise;
     }
 
-    /** Deterministic 32-byte salt for this account's internal storage. */
     private deriveStableSalt(password: string): Buffer {
         return privateStateStableSalt(this.config.accountId, password);
     }
 
-    /**
-     * Decrypt a stored row under the current password, or under the fallback
-     * whose stable salt the blob carries; a fallback hit is rewritten under
-     * the current password so the next read needs no fallback.
-     */
+    /** Decrypt under the current password or the fallback matching the blob's salt; a fallback hit is rewritten. */
     private async decryptStored(ciphertext: string, rewrite: (fresh: string) => Promise<void>): Promise<string> {
         const enc = await this.getEncryption();
         try {
@@ -527,19 +486,13 @@ export class CapDbPrivateStateProvider<PSI extends PrivateStateId = PrivateState
     }
 }
 
-// Helpers
-
 function validateExportPassword(password: string): void {
     if (typeof password !== 'string' || password.length < 16) {
         throw new Error('Export password must be at least 16 characters');
     }
 }
 
-/**
- * The signing-key export envelope (`midnight-signing-key-export`, version 1)
- * over already-decrypted keys, sealed under `password`; `importSigningKeys`
- * reads it back. Shared with the admin export of a single contract's key.
- */
+/** Signing-key export envelope over already-decrypted keys, sealed under `password`. */
 export function buildSigningKeyExport(keys: Record<string, string>, password: string): SigningKeyExport {
     validateExportPassword(password);
     const addresses = Object.keys(keys);

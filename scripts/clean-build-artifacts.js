@@ -8,8 +8,7 @@ const generatedSuffixes = ['.js', '.js.map', '.d.ts', '.d.ts.map'];
 // tsc emits foo.js / foo.js.map / foo.d.ts / foo.d.ts.map from foo.ts. Files
 // without that source are hand-written and must survive (src/browser ships
 // hand-written declarations like index.d.ts and witnesses.d.ts next to .mjs
-// modules; deleting those left the tree without browser types until the next
-// checkout, and a pack from such a tree shipped an untyped package).
+// modules; a pack from a tree without them ships an untyped package).
 function shouldDelete(filePath) {
     const suffix = generatedSuffixes.find((s) => filePath.endsWith(s));
     if (!suffix) return false;

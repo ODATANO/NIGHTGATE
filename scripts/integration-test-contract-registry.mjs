@@ -58,7 +58,7 @@ ok('registry: artifactPath surfaced',          resolved.artifactPath === artifac
 ok('registry: compiledContract resolves to a wrapper object',
     resolved.compiledContract && typeof resolved.compiledContract === 'object');
 
-// ---- Check 3: atomic generation-pinned resolve (0.16.0) --------------------
+// ---- Check 3: atomic generation-pinned resolve -----------------------------
 // resolveContract(name, expectedDigest) recomputes the digest from the
 // captured snapshot's current file bytes and imports exactly that snapshot:
 // the correct digest resolves, a wrong one refuses BEFORE any import.

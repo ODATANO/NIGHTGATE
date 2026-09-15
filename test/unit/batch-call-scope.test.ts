@@ -43,6 +43,7 @@ describe('runBatchInScope', () => {
 
         expect(out).toEqual({
             txHash: '0xbatch',
+            blockHeight: null,
             onChainStatus: 'SucceedEntirely',
             circuits: ['attest', 'bindPassport', 'anchorContentRoot']
         });
@@ -100,7 +101,7 @@ describe('runBatchInScope', () => {
             })
         };
         const out = await runBatchInScope(contracts, PROVIDERS, found, [{ circuit: 'attest', args: [] }], ADDR);
-        expect(out).toEqual({ txHash: '', onChainStatus: '', circuits: ['attest'] });
+        expect(out).toEqual({ txHash: '', onChainStatus: '', blockHeight: null, circuits: ['attest'] });
     });
 
     test('invokes a call entry\'s before() hook immediately before ITS callTx, in call order', async () => {

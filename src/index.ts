@@ -58,12 +58,8 @@ let lastStatus: NightgateIndexerStatus = {
     mode: 'idle'
 };
 
-/**
- * Single write path for the status, so every change is also published to the
- * flat holder in srv/. Readiness needs to know whether initialisation failed,
- * and srv/ cannot import this module: it sits on top of half of srv/ and,
- * through it, the Midnight SDK.
- */
+// Single write path: also publishes to srv/'s runtime-state holder, since srv/
+// cannot import this module without an import cycle.
 function setLastStatus(next: NightgateIndexerStatus): void {
     lastStatus = next;
     publishRuntimeState({ initialized: next.initialized, mode: next.mode, lastError: next.lastError });
@@ -78,15 +74,7 @@ function logStartupState(state: 'stopped' | 'syncing' | 'offline', detail?: stri
     log.info(`Startup state: ${state}${suffix}`);
 }
 
-/**
- * Thrown by `ensureSchemaDeployed` when a required CAP entity has no backing
- * table in the connected database. Carries the missing table name and the
- * resolved DB URL so the surfaced message is actionable without guessing.
- *
- * Production behaviour (in `src/plugin.ts::registerLifecycle`): this error is
- * caught and logged, while Nightgate remains explicitly offline. The plugin
- * never terminates its CAP host process.
- */
+/** A required table or column is missing from the connected database. */
 export class SchemaNotDeployedError extends Error {
     constructor(
         public readonly missingTable: string,
@@ -107,53 +95,28 @@ export class SchemaNotDeployedError extends Error {
     }
 }
 
-/**
- * Resolve the database file path the runtime is connected to. Used in the
- * SchemaNotDeployedError message so users see exactly which file is missing
- * the tables; bare `cds deploy` defaults to `db.sqlite`, which would silently
- * deploy to the wrong file otherwise.
- */
 function resolveDbPath(): string {
     const dbCfg = (cds.env as any).requires?.db?.credentials || (cds.env as any).requires?.db || {};
     return dbCfg.database || dbCfg.url || 'db.sqlite';
 }
 
-/**
- * Probe-only schema check. Returns silently when every required table exists;
- * throws `SchemaNotDeployedError` on the first miss so the operator can fix
- * it explicitly via `npm run deploy`.
- **/
+// Probes tables and columns only, never deploys: the operator migrates explicitly.
 async function ensureSchemaDeployed(): Promise<void> {
-    // `columns` probes the release's NEWEST columns, not just table
-    // existence: a database from the previous release passes a bare table
-    // probe and then fails on the first new action at runtime. Extend this
-    // list whenever a release adds columns to an existing table.
     const requiredTables: Array<{ table: string; columns?: string[] }> = [
         { table: 'midnight.Blocks' },
         { table: 'midnight.SyncState' },
-        // 0.18.0: sponsored-attempt intent coordinates (internal)
         { table: 'midnight.PendingSubmissions', columns: ['submitIntentData'] },
         { table: 'midnight.TransactionResults' },
         { table: 'midnight.PrivateStates' },
         { table: 'midnight.ContractSigningKeys' },
         { table: 'midnight.WalletSyncStates' },
         { table: 'midnight.Attestations' },
-        // 0.16.0: evidence binding + owner scoping
-        // The anchoring session: the scope of agent-token reads.
-        { table: 'midnight.Documents', columns: ['userId', 'contractAddress', 'network', 'compiledArtifactRef', 'artifactDigest', 'sessionId'] },
-        // 0.16.0: cross-root claim columns + evidence provenance
-        { table: 'midnight.PredicateAttestations', columns: ['payloadHashB', 'allowedMask', 'network', 'compiledArtifactRef', 'artifactDigest'] },
+        { table: 'midnight.Documents', columns: ['userId', 'contractAddress', 'network', 'compiledArtifactRef', 'artifactDigest', 'sessionId', 'attesterId'] },
+        { table: 'midnight.PredicateAttestations', columns: ['payloadHashB', 'allowedMask', 'network', 'compiledArtifactRef', 'artifactDigest', 'attesterId', 'attesterIdB'] },
         { table: 'midnight.DisclosureRoles' },
-        // Level requests on existing grants ride as pendingLevel until the
-        // chain confirms them; the handler writes the column on every re-grant.
-        { table: 'midnight.DisclosureGrants', columns: ['pendingLevel'] },
+        { table: 'midnight.DisclosureGrants', columns: ['pendingLevel', 'attesterId', 'changedAtHeight'] },
         { table: 'midnight.BackgroundJobs' },
-        // 0.20.0: operator-facing session label. Cosmetic, but CAP writes the
-        // column on every connectWallet, so an un-migrated database has to
-        // fail HERE with a message naming the fix, not later on the first
-        // session with an opaque "no such column".
         { table: 'midnight.WalletSessions', columns: ['label'] },
-        // Per-grant sponsor policy + runtime contract registrations.
         { table: 'midnight.AgentGrants', columns: ['allowedContracts', 'allowedCircuits', 'allowDeploy', 'maxDeploys', 'deploysUsed', 'deployedContracts', 'allowedTokenTypes'] },
         { table: 'midnight.ContractRegistrations' }
     ];
@@ -163,8 +126,6 @@ async function ensureSchemaDeployed(): Promise<void> {
 
     for (const { table, columns } of requiredTables) {
         try {
-            // Column list via the from() overload: SELECT.one's fluent proxy
-            // does not chain .columns().
             await db.run(columns ? SELECT.one.from(table, columns) : SELECT.one.from(table));
         } catch (probeErr) {
             const what = columns ? `${table} (needs columns: ${columns.join(', ')})` : table;
@@ -172,18 +133,13 @@ async function ensureSchemaDeployed(): Promise<void> {
         }
     }
 
-    // Secondary indexes (idempotent): every hot lookup was a table scan.
     const dbKind = String((cds.env as any).requires?.db?.kind ?? '');
     const created = await ensureIndexes(db as any, dbKind, msg => log.warn(msg));
     log.debug(`ensured ${created} secondary index(es)`);
 
-    // Every stored ciphertext must be openable with the configured key ring
-    // (fail-closed: an unreadable seed must not pass as a missing one).
+    // Fail closed: an unreadable seed must not pass as a missing one.
     await assertStoredKeyIdsKnown(db as any);
 
-    // Pre-0.9 rows were unconditional SUCCESS placeholders. Keeping them would
-    // continue exposing a known-false execution claim through OData. The new
-    // outcomeSource column distinguishes canonical System.Events evidence.
     const removed = await db.run(
         cds.ql.DELETE.from(TransactionResults).where({ outcomeSource: null })
     );
@@ -192,9 +148,8 @@ async function ensureSchemaDeployed(): Promise<void> {
 }
 
 /**
- * Initialize the Nightgate indexer. Idempotent; safe to call repeatedly.
- * Returns the current status, which may be "offline" if the crawler failed to
- * start (e.g. node unreachable) or "idle" if the crawler is disabled in config.
+ * Initialize Nightgate; idempotent. Status is "offline" when a startup step
+ * failed, "idle" when the crawler is disabled.
  */
 export async function initialize(): Promise<NightgateIndexerStatus> {
     await ensureNightgateModelLoaded();
@@ -218,9 +173,6 @@ export async function initialize(): Promise<NightgateIndexerStatus> {
     const crawlerEnabled = (crawlerConfig as any).enabled !== false;
 
     if (invalidNetwork) {
-        // FAIL, do not fall back: a submission service silently switching to
-        // "preprod" on a typo would build and submit transactions against a
-        // network the operator did not choose.
         const message = `Invalid network "${invalidNetwork}". Must be one of: ${VALID_NIGHTGATE_NETWORKS.join(', ')}. ` +
             `Refusing to start on the "${DEFAULT_NETWORK}" fallback; fix NIGHTGATE_NETWORK / cds.requires.nightgate.network.`;
         initialized = false;
@@ -287,10 +239,7 @@ export async function initialize(): Promise<NightgateIndexerStatus> {
         throw err;
     }
 
-    // Network/database binding, fail-closed and CENTRAL (not only when the
-    // crawler starts): an existing SyncState row from another network refuses
-    // the boot, so a submission-only deployment cannot silently mix chains
-    // either. Also backfills credential-redacted node URLs in place.
+    // Network/database binding: fail closed, before anything reads or writes jobs.
     try {
         const db = await cds.connect.to('db');
         await ensureSyncStateSingleton(db);
@@ -309,10 +258,7 @@ export async function initialize(): Promise<NightgateIndexerStatus> {
         throw err;
     }
 
-    // Crash recovery is deliberately asymmetric: versioned commands interrupted
-    // before the external boundary return to the queue; legacy closures become
-    // terminal because they cannot be reconstructed. External execution is
-    // always moved to reconciliation_required and never blindly resubmitted.
+    // Asymmetric: only commands interrupted before the external boundary requeue.
     try {
         const recovered = await recoverInterruptedJobs();
         if (recovered > 0) {
@@ -323,21 +269,14 @@ export async function initialize(): Promise<NightgateIndexerStatus> {
         log.warn(`Background-job recovery skipped: ${msg}`);
     }
 
-    // Sessions are per-connect handles owned by a caller in a specific process;
-    // an ungraceful stop leaks them for the full TTL. Close them here so a
-    // later `disconnectWallet` can actually drop the wallet's keys, and so no
-    // seed material outlives the process that authorised it. Configured
-    // fee-sponsor sessions are exempt (pinned ids, deliberately long-lived).
+    // An ungraceful stop leaks sessions for their full TTL; close them so no
+    // seed material outlives the process that authorised it.
     if (isCloseSessionsOnRestartEnabled(nightgateConfig)) {
         try {
             const db = await cds.connect.to('db');
             const closed = await closeSessionsFromPreviousProcess(db, nightgateConfig);
             if (closed.length > 0) {
                 log.info(`Closed ${closed.length} wallet session(s) left by the previous process; callers reconnect with connectWallet`);
-                // The recovery above re-queued pre-effect jobs; the ones that
-                // sign with a session closed just now can only fail (their key
-                // material is gone). Fail them here with a restart-shaped code,
-                // BEFORE the job poller starts.
                 const dropped = await dropPendingJobsForClosedSessions(closed);
                 if (dropped > 0) {
                     log.info(`Dropped ${dropped} queued job(s) whose signing session was closed on restart (PROCESS_RESTART_SESSION_CLOSED)`);
@@ -349,61 +288,39 @@ export async function initialize(): Promise<NightgateIndexerStatus> {
         }
     }
 
-
-    // Set when the submission pipeline (wallet worker, job processor, chain
-    // confirmer) fails to come up. It used to be logged and forgotten, which
-    // let a process with no working submission path publish itself as
-    // initialised and answer ready.
     let submissionStartupError: string | undefined;
 
-    // Load any contracts declared under cds.requires.nightgate.contracts into
-    // the in-memory registry. Safe to call repeatedly, idempotent.
     try {
         loadRegistryFromConfig(nightgateConfig);
         const refs = listRegisteredContracts();
         if (refs.length) {
             log.info(`Registered contracts: ${refs.join(', ')}`);
         }
-        // Runtime registrations from ContractRegistrations, on top of the config floor. A bad row is skipped with a warning.
+        // Runtime registrations go on top of the config floor.
         await loadPersistedRegistrations(cds.db || await cds.connect.to('db'));
     } catch (regErr) {
         const msg = regErr instanceof Error ? regErr.message : String(regErr);
         log.warn(`Contract registry load warning: ${msg}`);
     }
 
-    // Pin the effective proving mode into the env BEFORE the worker spawns
-    // (worker + provider sites read NIGHTGATE_PROVING_MODE directly). Default
-    // is fully public: in-process wasm proving unless a proof server was
-    // explicitly configured or the mode was set.
+    // Pinned into the env before the worker spawns: the worker reads only env.
     const provingMode = resolveEffectiveProvingMode(nightgateConfig);
     process.env.NIGHTGATE_PROVING_MODE = provingMode;
-    // Same for the proof request timeout (env or `proofTimeoutMs`).
     const proofTimeoutMs = resolveProofTimeoutMs(nightgateConfig);
     process.env.NIGHTGATE_PROOF_TIMEOUT_MS = String(proofTimeoutMs);
     log.info(`Proving mode: ${provingMode}` + (provingMode === 'wasm'
         ? ' (in-process; set NIGHTGATE_PROOF_SERVER_URL or NIGHTGATE_PROVING_MODE=server for a proof server)'
         : ` (proof server at ${submissionEndpoints.proofServerUrl}, proof request timeout ${proofTimeoutMs} ms)`));
 
-    // Spin up the wallet worker thread now so it's ready when the first
-    // connectWalletForSigning request lands. The Midnight wallet SDK
-    // monopolises the microtask queue while syncing; running it in a worker
-    // keeps CAP's `db.run`, OData handlers, and the crawler responsive.
     try {
         await startWalletWorker();
         wireWorkerStateSaveSink();
         await startBackgroundJobProcessor();
-        // The indexer confirmer is the ONLY chain-evidence path for submitted
-        // jobs and is always registered, for every kind: a job stores the
-        // ledger transaction identifier, which only the indexer answers; the
-        // crawler indexes the Substrate extrinsic hash, a different value, so
-        // it cannot correlate a job with a block. The confirmer records the
-        // inclusion coordinates (block height/hash) the reorg rollback reverts by.
+        // The only chain-evidence path for submitted jobs: always registered.
         registerChainOutcomeConfirmer(buildIndexerTxConfirmer({ indexerHttpUrl: submissionEndpoints.indexerHttpUrl }));
         warnIfCrawlerlessChainConfirmSet(nightgateConfig);
         log.info(`Indexer chain-outcome confirmation enabled${crawlerEnabled ? ' (alongside the crawler)' : ' (crawler off)'}`);
         log.info('Wallet worker thread ready');
-        // Warm the platform sponsor pool in the background (serialized; see
-        // prewarmFeeSponsorPool). Errors are logged per sponsor, never thrown.
         const pool = getConfiguredFeeSponsorSessions(nightgateConfig);
         if (pool.length > 0) {
             log.info(`Sponsor pool: warming ${pool.length} sponsor facade(s) in the background`);
@@ -424,9 +341,6 @@ export async function initialize(): Promise<NightgateIndexerStatus> {
         const msg = err instanceof Error ? err.message : String(err);
         log.warn(`Wallet worker startup failed: ${msg}`);
         log.warn('Signing-related operations will fail until restart');
-        // Not just a log line: with the submission pipeline dead this process
-        // cannot sign, submit or sponsor anything, so it must not report
-        // itself ready. Readiness reads the published mode.
         submissionStartupError = `submission pipeline did not start: ${msg}`;
     }
 
@@ -482,10 +396,7 @@ export async function initialize(): Promise<NightgateIndexerStatus> {
     return getStatus();
 }
 
-/**
- * Shut down the Nightgate indexer. Idempotent; safe to call repeatedly.
- * Returns the current status, which will be "idle" after shutdown.
- */
+/** Shut down Nightgate; idempotent. Status is "idle" afterwards. */
 export async function shutdown(): Promise<void> {
     stopBackgroundJobProcessor();
     registerChainOutcomeConfirmer(null);
@@ -506,8 +417,7 @@ export async function shutdown(): Promise<void> {
         log.warn(`Wallet worker stop error: ${message}`);
     }
     try {
-        // Worker is stopped, no more saves can arrive: zero every memoized
-        // wallet-storage key so no key material outlives the plugin.
+        // After the worker stop: no save can arrive that needs a key.
         await clearAllEncryptionKeys();
     } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
@@ -521,9 +431,7 @@ export async function shutdown(): Promise<void> {
     });
 }
 
-/** Return the last known indexer status. */
+/** Last known status, node URL credentials redacted. */
 export function getStatus(): NightgateIndexerStatus {
-    // Exposure boundary: status flows into OData responses, so endpoint URLs
-    // are stripped of embedded credentials here rather than at every setter.
     return { ...lastStatus, nodeUrl: redactUrlCredentials(lastStatus.nodeUrl) || undefined };
 }

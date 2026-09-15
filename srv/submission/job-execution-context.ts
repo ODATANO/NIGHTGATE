@@ -1,12 +1,9 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 
 /**
- * Job errorCode for a broadcast attempt provably rejected before inclusion
- * whose bookkeeping (attempt row REJECTED, deploy reservation refunded, hash
- * off the job) did not commit. The job parks in reconciliation_required under
- * this code and `settleRejectedSponsorAttempts` re-runs the transaction on
- * every reconciliation tick. The indexer cannot resolve such a job: the
- * identifier never reached a mempool. Raised by both submission channels.
+ * A provably rejected attempt whose bookkeeping did not commit. The job parks
+ * under this code and `settleRejectedSponsorAttempts` retries it each tick;
+ * the indexer cannot resolve it (the identifier never reached a mempool).
  */
 export const REJECTED_ATTEMPT_BOOKKEEPING_PENDING = 'REJECTED_ATTEMPT_BOOKKEEPING_PENDING';
 
@@ -31,9 +28,7 @@ export type StatementRunner = { run: (q: unknown) => Promise<unknown> };
 interface JobExecutionContext {
     reportExternalExecution: (handle: ExternalSubmissionHandle) => Promise<void>;
     reportSubmitted: (handle: ExternalSubmissionHandle) => Promise<void>;
-    /** Boundary crossing + identifier in one statement on the caller's transaction (see markJobBroadcastOn). */
     markBroadcastOn: (runner: StatementRunner, handle: ExternalSubmissionHandle) => Promise<void>;
-    /** Rejected identifier off the job, CAS-guarded, on the caller's transaction (see markJobSubmissionRejectedOn). */
     markSubmissionRejectedOn: (runner: StatementRunner, handle: ExternalSubmissionHandle) => Promise<void>;
 }
 
@@ -57,20 +52,16 @@ export async function reportExternalExecution(handle: ExternalSubmissionHandle):
 }
 
 /**
- * Cross the external-effect boundary and record the identifier on the
- * caller's transaction, so the job transition commits with the attempt row
- * and the grant's deploy reservation. Throws on a lost lease (rolls the
- * caller's transaction back). No-op outside a background job.
+ * Cross the external-effect boundary on the caller's transaction, so the job
+ * commits with the attempt row and deploy reservation. Throws on a lost lease.
  */
 export async function reportBroadcastOn(runner: StatementRunner, handle: ExternalSubmissionHandle): Promise<void> {
     await storage.getStore()?.markBroadcastOn(runner, handle);
 }
 
 /**
- * Take a provably rejected identifier off the job on the caller's
- * transaction, so attempt row, deploy refund and job hash commit together.
- * Throws on a failed CAS (lease lost, hash already moved), rolling the
- * caller's transaction back. No-op outside a background job.
+ * Take a rejected identifier off the job on the caller's transaction, so attempt
+ * row, deploy refund and job hash commit together. Throws on a failed CAS.
  */
 export async function reportSubmissionRejectedOn(runner: StatementRunner, handle: ExternalSubmissionHandle): Promise<void> {
     await storage.getStore()?.markSubmissionRejectedOn(runner, handle);

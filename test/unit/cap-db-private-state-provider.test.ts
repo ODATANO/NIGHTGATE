@@ -415,12 +415,11 @@ describe('CapDbPrivateStateProvider: config validation', () => {
     });
 });
 
-describe('CapDbPrivateStateProvider: cross-instance reads (deploy → call regression)', () => {
+describe('CapDbPrivateStateProvider: cross-instance reads', () => {
     // Each submission builds its OWN provider instance. A deploy writes private
     // state with one instance; a later call reads it with a DIFFERENT instance
-    // (same account + password). With a random per-instance salt this failed
-    // with "Salt mismatch: data was encrypted with a different password/salt".
-    // The salt is now deterministic per (account, password), so it round-trips.
+    // (same account + password). The salt is deterministic per (account,
+    // password), so the rows round-trip across instances.
     test('a second provider instance reads what the first wrote', async () => {
         const sharedDb = makeFakeDb();
         const writer = new CapDbPrivateStateProvider({ accountId: ACCOUNT, privateStoragePasswordProvider: () => PASSWORD, db: sharedDb });

@@ -13,12 +13,12 @@
 //
 // Why this is the meaningful live check: the gate itself (attachDisclosureRole
 // with contractAddress) is what a CONSUMER wires into a specific read, so the
-// allowed/403 assertion lives in the consumer (NIGHTPASS) and is covered at
-// unit level here (test/unit/disclosure-role.test.ts → "on-chain ACL"). What
-// only a live run can prove is the READ-BACK path: that the post-submit
-// reindex's publicDataProvider.queryContractState(addr) feeds ledger() and the
-// non-iterable-outer-map enumeration the SAME way the in-process spike showed
-// (scripts/spike-disclosure-indexer.mjs). When `active` flips to true after the
+// allowed/403 assertion lives in the consumer and is covered at unit level
+// here (test/unit/disclosure-role.test.ts → "on-chain ACL"). What only a live
+// run can prove is the READ-BACK path: that the post-submit reindex's
+// publicDataProvider.queryContractState(addr) feeds ledger() and the
+// non-iterable-outer-map enumeration (scripts/spike-disclosure-indexer.mjs
+// drives the same logic in-process). When `active` flips to true after the
 // grant and false after the revoke, that path is confirmed against the chain.
 //
 // We tie the on-chain grantee to the registered identity by granting to the

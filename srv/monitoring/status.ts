@@ -1,17 +1,4 @@
-/**
- * Status builders shared by two callers.
- *
- * The OData functions on NightgateIndexerService (`getHealth()`,
- * `getReadiness()`, `getMetrics()`, `getLiveness()`) and the plain HTTP routes
- * mounted in src/status-routes.ts (`/health`, `/ready`, `/metrics`) must
- * answer with the SAME numbers. They used to live inside the service's
- * `this.on(...)` closures, where only OData could reach them; lifting them out
- * changes no behaviour and no payload, it just gives both callers one
- * implementation.
- *
- * `getRuntimeInfo()` and `getWorkerStatus()` are new and live here for the
- * same reason: whatever answers them, it is the same code.
- */
+/** Status builders shared by the NightgateIndexerService functions and the plain routes in src/status-routes.ts. */
 
 import cds from '@sap/cds';
 const { SELECT } = cds.ql;
@@ -40,11 +27,9 @@ export const metricPrefix = 'odatano_nightgate';
 /** Process start, module load time. Imported by the service so uptime agrees. */
 export const processStartTime = Date.now();
 
-/** Statuses that mean a job is still on its way somewhere. */
 const OPEN_JOB_STATUSES = ['pending', 'running', 'external_execution', 'submitted', 'reconciliation_required'];
 
-// Structural, not cds.DatabaseService: the plain HTTP routes hand in
-// `cds.db` and the unit tests hand in a two-line stub, and both must fit.
+// Structural, so both `cds.db` and a test stub fit.
 type Db = { run: (...args: any[]) => Promise<any> };
 
 export function buildLiveness(): Record<string, unknown> {
@@ -80,9 +65,7 @@ export async function buildHealth(db: Db): Promise<Record<string, unknown>> {
         };
     }
 
-    // Integer64/Decimal columns come back as STRINGS from CAP 10 databases
-    // (ieee754compatible); coerce so the health payload keeps its numeric
-    // contract on both CAP 9 and 10.
+    // Integer64/Decimal read back as strings (ieee754compatible): coerce.
     const chainHeight = Number(syncState.chainHeight || 0);
     const indexedHeight = Number(syncState.lastIndexedHeight || 0);
     const finalizedHeight = Number(syncState.lastFinalizedHeight || 0);
@@ -113,28 +96,11 @@ export async function buildHealth(db: Db): Promise<Record<string, unknown>> {
 export async function buildReadiness(db: Db): Promise<Record<string, unknown>> {
     const pluginConfig = getNightgatePluginConfig();
     const topology = getRuntimeTopology(pluginConfig);
-    // A deliberately disabled crawler (the Docker default) is not a readiness
-    // failure: submission/verification runs without it. The crawler/node checks
-    // then pass as "not applicable" so ready reflects what this deployment
-    // actually operates.
+    // A disabled crawler is not a readiness failure: its checks pass as not applicable.
     const crawlerEnabled = (resolveNightgateRuntimeConfig(pluginConfig).crawlerConfig as any)?.enabled !== false;
 
-    // Initialisation is part of readiness, and the load-bearing bit is
-    // `initialized`, not the mode. A process whose initialize() bailed (the
-    // classic case: an un-migrated database the schema preflight refused)
-    // otherwise answered ready:true whenever the crawler was disabled, because
-    // a plain SELECT on the old SyncState table succeeded.
-    //
-    // BOTH conditions, and neither alone is sufficient:
-    //
-    // - `initialized` alone passes a process whose crawler or submission
-    //   bootstrap failed, because initialize() sets the flag and then reports
-    //   mode 'offline'. With the crawler disabled every other check is true,
-    //   so readiness came back 200 for a process that cannot work.
-    // - `mode !== 'offline'` alone passes the startup phase before
-    //   initialize() runs, SKIP_AUTO_INIT, a host that never started the
-    //   plugin, and the state after shutdown(): all of them report 'idle',
-    //   which is also what a SUCCESSFUL crawler-less start reports.
+    // Both conditions needed: initialize() sets `initialized` even when it ends
+    // 'offline', and 'idle' is reported both before init and after a good start.
     const runtime = readRuntimeStatus();
     const initialisationOk = runtime?.initialized === true && runtime.mode !== 'offline';
 
@@ -159,15 +125,13 @@ export async function buildReadiness(db: Db): Promise<Record<string, unknown>> {
             }
         }
     } catch {
-        // Database not available
+        // database unavailable: checks.database stays false
     }
 
     return {
         ready: checks.database && checks.crawler && checks.node && checks.runtime && checks.initialization,
         crawlerEnabled,
         checks,
-        // What initialize() last reported, so a not-ready answer says WHY
-        // rather than leaving the operator to read logs.
         initializationMode: runtime?.mode ?? 'unknown',
         instanceId: topology.instanceId,
         runtimeMode: topology.runtimeMode,
@@ -182,10 +146,8 @@ export async function buildReadiness(db: Db): Promise<Record<string, unknown>> {
 }
 
 /**
- * A stable, sanitised reason. The raw `lastError` is unsuitable here:
- * SchemaNotDeployedError carries the absolute database path and the driver's
- * SQL fragment, and this payload is reachable anonymously when an operator
- * chooses NIGHTGATE_STATUS_ROUTES=public. The full text stays in the log.
+ * Sanitised reason: the raw `lastError` can carry the database path and SQL,
+ * and this payload may be public (NIGHTGATE_STATUS_ROUTES=public).
  */
 function summariseInitFailure(runtime: { mode?: string; lastError?: string } | null): string {
     if (!runtime || runtime.mode === 'idle') {
@@ -204,22 +166,24 @@ function summariseInitFailure(runtime: { mode?: string; lastError?: string } | n
     return 'not initialized: startup failed, see the server log';
 }
 
-/**
- * The plugin's own initialisation state, read LAZILY.
- *
- * src/index.ts pulls in half of srv/, so importing it at module load would
- * close a cycle. Requiring it at call time is resolved long after both sides
- * are loaded, and a host that does not have it at all simply reports unknown.
- */
 function readRuntimeStatus(): { mode?: string; lastError?: string; initialized?: boolean } | null {
     return readRuntimeState();
+}
+
+/** Pool gauges summed over the database service's pools (one per tenant); null when none. */
+export function dbPoolGauges(db: unknown): { size: number; available: number; borrowed: number; pending: number } | null {
+    const pools = (db as any)?.pools;
+    if (!pools || typeof pools !== 'object') return null;
+    const list = Object.values(pools).filter((p: any) => p && typeof p.size === 'number') as any[];
+    if (list.length === 0) return null;
+    const sum = (field: string) => list.reduce((n, p) => n + (Number.isFinite(p[field]) ? Number(p[field]) : 0), 0);
+    return { size: sum('size'), available: sum('available'), borrowed: sum('borrowed'), pending: sum('pending') };
 }
 
 export async function buildMetricsText(db: Db): Promise<string> {
     const syncState = await db.run(SELECT.one.from(SyncState).where({ ID: 'SINGLETON' }));
 
     const lines: string[] = [];
-    // Number() coercion: Integer64/Decimal read back as strings on CAP 10.
     const chainHeight = Number(syncState?.chainHeight || 0);
     const indexedHeight = Number(syncState?.lastIndexedHeight || 0);
     const lag = chainHeight - indexedHeight;
@@ -228,10 +192,7 @@ export async function buildMetricsText(db: Db): Promise<string> {
     const uptimeSec = Math.floor((Date.now() - processStartTime) / 1000);
     const syncStatus = syncState?.syncStatus || 'stopped';
     const topology = getRuntimeTopology(getNightgatePluginConfig());
-    // Aggregate in SQL. This path is scraped on a schedule, and reading every
-    // open job row into the process made each scrape cost memory and transfer
-    // proportional to the backlog: exactly when a backlog exists, which is
-    // exactly when the gauges matter.
+    // Aggregate in SQL: loading job rows would cost most exactly under a backlog.
     const jobCounts = new Map<string, number>();
     let oldestQueuedSeconds = 0;
     try {
@@ -309,8 +270,6 @@ export async function buildMetricsText(db: Db): Promise<string> {
     lines.push(`# TYPE ${metricPrefix}_jobs_oldest_queued_seconds gauge`);
     lines.push(`${metricPrefix}_jobs_oldest_queued_seconds ${oldestQueuedSeconds}`);
 
-    // Worker liveness as a gauge, so the same alert rules that watch the
-    // crawler can watch the submission side.
     const worker = getWalletWorkerStatus();
     lines.push(`# HELP ${metricPrefix}_wallet_worker_running Wallet worker thread alive (1=running, 0=not running)`);
     lines.push(`# TYPE ${metricPrefix}_wallet_worker_running gauge`);
@@ -325,18 +284,27 @@ export async function buildMetricsText(db: Db): Promise<string> {
     lines.push(`# TYPE ${metricPrefix}_wallet_worker_rotations counter`);
     lines.push(`${metricPrefix}_wallet_worker_rotations ${worker.rotationCount ?? 0}`);
 
+    const pool = dbPoolGauges(db);
+    if (pool) {
+        const gauges = [
+            ['size', 'Database connections open or being created'],
+            ['available', 'Idle database connections'],
+            ['borrowed', 'Database connections in use'],
+            ['pending', 'Requests waiting for a database connection']
+        ] as const;
+        for (const [name, help] of gauges) {
+            lines.push(`# HELP ${metricPrefix}_db_pool_${name} ${help}`);
+            lines.push(`# TYPE ${metricPrefix}_db_pool_${name} gauge`);
+            lines.push(`${metricPrefix}_db_pool_${name} ${pool[name]}`);
+        }
+    }
+
     return lines.join('\n') + '\n';
 }
 
 /**
- * What this process IS: version, network, proving mode, and the artifact
- * digest per registered contract.
- *
- * The digest is the reason this exists. `assertArtifactGeneration` refuses
- * every persisted command whose recorded digest no longer matches the loaded
- * artifact, so recompiling contracts under a running server blocks all writes
- * until it restarts. Without this function that failure has no visible cause;
- * with it, one read shows the digest and when it last changed.
+ * Version, network, proving mode and artifact digests per contract: shows why
+ * the generation guard refuses writes after artifacts changed under the server.
  */
 export function buildRuntimeInfo(): Record<string, unknown> {
     const config = getNightgatePluginConfig();
@@ -356,28 +324,18 @@ export function buildRuntimeInfo(): Record<string, unknown> {
         let currentDigest: string | null = null;
         let digestError: string | null = null;
         try {
-            // Two digests on purpose. The per-alias one is the generation this
-            // process LOADED and stamped onto persisted commands, and it never
-            // changes while the alias points where it does. The other tracks
-            // what the files say right now, which is what resolveContract
-            // compares against; it is memoised behind a stat fingerprint and a
-            // max age, so it is current without re-hashing 200 MB per request.
-            // Reporting only the loaded generation would hide the exact failure
-            // this endpoint exists to explain: artifacts replaced under a
-            // running server, every job refused, the alias digest serene.
+            // Loaded generation (stamped on commands) vs the files on disk now
+            // (what resolveContract compares); only both expose a stale alias.
             artifactDigest = getArtifactGenerationDigest(name);
             currentDigest = getCurrentArtifactDigest(name);
         } catch (err) {
-            // A contract whose artifact does not load is exactly what an
-            // operator needs to see here, so it is reported, not swallowed.
             digestError = err instanceof Error ? err.message : String(err);
         }
         return {
             name,
             artifactDigest,
             currentDigest,
-            // True when the files on disk no longer match what this process
-            // loaded: every write job fails the generation guard until restart.
+            // Disk differs from the loaded generation: writes fail until restart.
             digestStale: Boolean(artifactDigest && currentDigest && artifactDigest !== currentDigest),
             digestError,
             slotWidth: slotWidthOf(registration),
@@ -399,26 +357,17 @@ export function buildRuntimeInfo(): Record<string, unknown> {
 }
 
 /**
- * Wallet worker health at PROCESS level, deliberately its own function rather
- * than a fifth entry in `getReadiness().checks`.
- *
- * `ready` is an AND over those checks, so putting worker state in there would
- * take a pod out of rotation the first time the worker is merely busy. Making
- * a signal visible and making it load-bearing are two decisions; this is only
- * the first one.
+ * Wallet worker health, deliberately not a readiness check: `ready` would
+ * drop a pod whenever the worker is merely busy.
  */
 export function buildWorkerStatus(isAdmin = false): Record<string, unknown> {
     const worker = getWalletWorkerStatus();
-    // The facade REGISTRY is the authority on what this process holds. The
-    // worker's list comes from the sync-progress cache, which only fills while
-    // a sync wait is running, so a pool restored from persisted state at the
-    // tip reported `facadeCount: 0` while sponsoring happily. Progress detail
-    // is merged in where a snapshot exists.
+    // The facade registry is authoritative; the worker's progress cache fills
+    // only after the first watch tick, so it merely adds detail.
     const bySession = new Map(worker.facades.map(f => [f.sessionId, f]));
     const facades = listWalletFacades().map(sessionId => bySession.get(sessionId)
         ?? { sessionId, label: null, caughtUp: null, updatedAt: null });
-    // A snapshot for an account no longer resident is stale, but dropping it
-    // silently would hide a facade the worker still thinks it has.
+    // Keep stale snapshots: they show a facade the worker still thinks it has.
     for (const f of worker.facades) if (!facades.some(x => x.sessionId === f.sessionId)) facades.push(f);
     return {
         started: worker.started,
@@ -430,11 +379,8 @@ export function buildWorkerStatus(isAdmin = false): Record<string, unknown> {
         lastExitAt: worker.lastExitAt,
         rpcTimeoutMs: worker.rpcTimeoutMs,
         facadeCount: facades.length,
-        // `sessionId` here is the wallet cacheKey, an accountId derived from
-        // wallet material and stable across sessions. Handing every
-        // authenticated caller the full list would leak which wallets this
-        // process holds, across tenants, so the per-facade detail is admin
-        // only. The count carries the operational signal for everyone else.
+        // Admin only: sessionId is a wallet-derived accountId, stable across
+        // sessions, so the list would leak which wallets this process holds.
         facades: isAdmin ? facades : []
     };
 }

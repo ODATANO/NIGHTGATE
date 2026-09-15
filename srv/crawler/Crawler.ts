@@ -1,11 +1,4 @@
-/**
- * MidnightCrawler, Blockchain Crawler Orchestrator
- *
- * Two-phase operation:
- * 1. Catch-Up: Sync historical blocks from lastIndexedHeight to chain tip
- * 2. Live: Subscribe to new block headers and process in real-time
- *
- */
+/** Crawler: catch-up from lastIndexedHeight to the finalized head, then live finalized-head subscription. */
 
 import cds from '@sap/cds';
 const { SELECT, INSERT, UPDATE } = cds.ql;
@@ -17,10 +10,6 @@ import { ensureSyncStateSingleton } from '../utils/sync-state';
 const log = cds.log('nightgate:crawler');
 import { rollbackIndexedDataFromHeight } from './rollback';
 import { SyncState, ReorgLog, Blocks } from '#cds-models/midnight';
-
-// ============================================================================
-// Types
-// ============================================================================
 
 export interface CrawlerConfig {
     enabled: boolean;
@@ -38,10 +27,6 @@ interface ReorgInfo {
     oldTipHash: string;
     newTipHash: string;
 }
-
-// ============================================================================
-// Crawler Orchestrator
-// ============================================================================
 
 /** stop() waits this long for the in-flight batch or live block before unsubscribing. */
 const STOP_DRAIN_MS = 30_000;
@@ -79,10 +64,6 @@ export class MidnightCrawler {
         };
     }
 
-    // ========================================================================
-    // Lifecycle
-    // ========================================================================
-
     async start(): Promise<void> {
         if (this.isRunning) {
             log.warn('Already running');
@@ -96,15 +77,12 @@ export class MidnightCrawler {
             await ensureNightgateModelLoaded();
             this.db = await cds.connect.to('db');
 
-            // Ensure SyncState singleton exists (shared utility)
             await ensureSyncStateSingleton(this.db, this.config.nodeUrl);
 
-            // Connect to node FIRST
             if (!this.nodeProvider.isConnected()) {
                 await this.nodeProvider.connect();
             }
 
-            // Initialize block processor (after node is connected)
             this.processor = new BlockProcessor(this.nodeProvider);
             await this.processor.init();
 
@@ -130,7 +108,6 @@ export class MidnightCrawler {
                 });
             }
 
-            // Run the catch-up + live-subscription pipeline in the background
             this.driveIngest();
         } catch (err) {
             this.isRunning = false;
@@ -139,16 +116,13 @@ export class MidnightCrawler {
     }
 
     private async runIngestPipeline(): Promise<void> {
-        // Phase 1: Catch-up
         await this.catchUp();
 
-        // Phase 2: Live subscription
         if (this.isRunning) {
             await this.subscribeLive();
         }
 
-        // Phase 3: Second catch-up to cover blocks finalized between
-        // end of Phase 1 and subscription establishment in Phase 2
+        // Second catch-up: blocks finalized between the first one and the subscription.
         if (this.isRunning) {
             const gapBlocks = await this.catchUp();
             if (gapBlocks > 0) {
@@ -157,18 +131,8 @@ export class MidnightCrawler {
         }
     }
 
-    /**
-     * Fire-and-forget driver for the ingest pipeline. A connection-loss error is
-     * transient (the provider is reconnecting; the reconnect handler re-drives),
-     * so isRunning stays true; any other error is fatal. The ingestActive guard
-     * prevents overlapping pipelines when a reconnect fires while the previous
-     * run is still unwinding.
-     */
+    /** Fire-and-forget; a request while a pipeline runs re-drives once it has unwound. */
     private driveIngest(): void {
-        // A drive request arriving while a pipeline still runs (e.g. a reconnect
-        // during catch-up) is coalesced into `pendingRedrive` and honoured in the
-        // `.finally`; otherwise the reconnect no-ops and the crawler can sit
-        // connected-but-idle until the next disconnect.
         if (this.ingestActive) { this.pendingRedrive = true; return; }
         this.ingestActive = true;
         this.pendingRedrive = false;
@@ -200,11 +164,6 @@ export class MidnightCrawler {
         log.info('Stopping...');
         this.isRunning = false;
 
-        // Let the in-flight work finish: the pipeline checks isRunning between
-        // blocks, a live block is one persist transaction. Without this a
-        // reindexFromHeight rolled the index back UNDER a persist that then
-        // committed a block whose parent was gone. Bounded, so a stalled RPC
-        // cannot hold shutdown.
         const inflight = [this.ingestPromise, this.liveProcessing].filter((p): p is Promise<void> => !!p);
         if (inflight.length > 0) {
             await Promise.race([
@@ -213,17 +172,15 @@ export class MidnightCrawler {
             ]);
         }
 
-        // Unsubscribe from live updates
         if (this.subscriptionId) {
             try {
                 await this.nodeProvider.unsubscribeFinalizedHeads(this.subscriptionId);
             } catch {
-                // Ignore unsubscribe errors during shutdown
+                // best effort during shutdown
             }
             this.subscriptionId = null;
         }
 
-        // Update sync state
         try {
             await this.db.run(
                 UPDATE.entity(SyncState).set({
@@ -237,17 +194,13 @@ export class MidnightCrawler {
         log.info('Stopped');
     }
 
-    // ========================================================================
-    // Phase 1: Catch-Up (Historical Blocks)
-    // ========================================================================
-
     private async catchUp(): Promise<number> {
         this.isCatchingUp = true;
         try {
             const syncState = await this.getSyncState();
             const startHeight = this.getCatchUpStartHeight(syncState);
 
-            // Target finalized head (not chain tip), avoids ingesting soon-reverted blocks
+            // Finalized head, not chain tip: never ingest blocks that may revert.
             const finalizedHash = await this.nodeProvider.getFinalizedHead();
             const finalizedHeader = await this.nodeProvider.getHeader(finalizedHash);
             const tipHeight = MidnightNodeProvider.parseBlockNumber(finalizedHeader.number);
@@ -277,14 +230,8 @@ export class MidnightCrawler {
     }
 
     /**
-     * Pipelined catch-up with JSON-RPC batching. Each in-flight unit is a BATCH
-     * of K consecutive heights doing 2 WSS round-trips (hashes, then
-     * blocks+timestamps); `fetchConcurrency` batches stay in flight at once.
-     * Throughput ≈ K × concurrency / (2 × RTT).
-     *
-     * Persist is serial in height order (reorg detection needs monotonic
-     * progression) and is the floor when fetch outpaces it (`wait=0` in the
-     * diagnostic line).
+     * `fetchConcurrency` batch fetches of `rpcBatchSize` heights stay in flight;
+     * persist is serial in height order, which reorg detection relies on.
      */
     private async runCatchUpPipeline(
         startHeight: number,
@@ -298,12 +245,10 @@ export class MidnightCrawler {
         let nextHeightToFetch = startHeight;
         let nextHeightToPersist = startHeight;
 
-        // Diagnostic accumulators (reset per progress log).
+        // Reset per progress log line.
         let acc = { fetchMsTotal: 0, persistMsTotal: 0, waitedForFetchMs: 0, samples: 0 };
 
-        // Queue of in-flight batches; each is a Promise<PreparedBlock[]> covering
-        // a contiguous height range. Drained in submission order. `retried`
-        // marks a batch that was re-queued once after a failure.
+        // In-flight batches, drained in submission order; `retried` = re-queued once.
         const queue: Array<{ from: number; to: number; data: Promise<any[]>; retried?: boolean }> = [];
 
         const pumpFetches = () => {
@@ -394,8 +339,7 @@ export class MidnightCrawler {
                     break outer;
                 }
 
-                // A failed range must never be skipped: skipping would leave a
-                // hole in the index while lastIndexedHeight keeps advancing.
+                // Never skip a failed range: lastIndexedHeight would advance over a hole.
                 if (!head.retried) {
                     log.warn(`Re-queueing batch ${head.from}-${head.to} for a final retry`);
                     const heights: number[] = [];
@@ -421,7 +365,7 @@ export class MidnightCrawler {
             pumpFetches();
         }
 
-        // Drain in-flight prefetches we don't intend to persist (best effort).
+        // Unpersisted prefetches: swallow their rejections.
         for (const item of queue) {
             item.data.catch(() => { /* discard */ });
         }
@@ -430,10 +374,6 @@ export class MidnightCrawler {
         return processed;
     }
 
-    /**
-     * Batch fetch with a transient-error retry policy. On retry, the entire
-     * batch is re-fetched.
-     */
     private async fetchBlockBatchWithRetry(heights: number[]): Promise<any[]> {
         let lastError: Error | null = null;
         for (let attempt = 1; attempt <= this.config.maxRetries; attempt++) {
@@ -459,29 +399,22 @@ export class MidnightCrawler {
         throw lastError || new Error(`Failed to fetch batch starting at ${heights[0]}`);
     }
 
-    // ========================================================================
-    // Phase 2: Live Subscription
-    // ========================================================================
-
     private async subscribeLive(): Promise<void> {
         log.info('Starting live subscription...');
 
-        // A re-drive after a reconnect that raced the previous pipeline's tail
-        // would subscribe twice and process every head twice; drop the old one.
+        // A re-drive racing the previous pipeline's tail would subscribe twice.
         if (this.subscriptionId) {
             const stale = this.subscriptionId;
             this.subscriptionId = null;
             try { await this.nodeProvider.unsubscribeFinalizedHeads(stale); } catch { /* the socket it lived on may be gone */ }
         }
 
-        // Reconnect handling is registered once in start() (setOnReconnect →
-        // driveIngest), so a drop during catch-up OR live is covered there.
+        // Reconnects re-drive via setOnReconnect in start().
         this.subscriptionId = await this.nodeProvider.subscribeFinalizedHeads(async (header: BlockHeader) => {
             if (!this.isRunning || this.isCatchingUp) return;
 
             const height = MidnightNodeProvider.parseBlockNumber(header.number);
 
-            // Queue block height if already processing, don't drop it
             if (this.processing) {
                 this.pendingHeights.push(height);
                 return;
@@ -493,8 +426,7 @@ export class MidnightCrawler {
                 try {
                     await this.processLiveBlock(header, height);
 
-                    // Drain queued heights: clear the queue and let catchUp() close
-                    // any gap between the current tip and the chain head.
+                    // Queued heights are not processed singly: catchUp() closes the gap.
                     while (this.pendingHeights.length > 0 && this.isRunning) {
                         this.pendingHeights = [];
                         const gapBlocks = await this.catchUp();
@@ -509,7 +441,6 @@ export class MidnightCrawler {
             await this.liveProcessing;
         });
 
-        // Update sync state
         await this.db.run(
             UPDATE.entity(SyncState).set({
                 syncStatus: 'synced'
@@ -523,7 +454,6 @@ export class MidnightCrawler {
         try {
             const tipState = await this.getSyncState();
 
-            // Only advance chainHeight
             const currentChainHeight = Number(tipState?.chainHeight ?? 0);
             if (height > currentChainHeight) {
                 await this.db.run(
@@ -533,9 +463,7 @@ export class MidnightCrawler {
                 );
             }
 
-            // Gap: the head is more than one block ahead of the index (e.g.
-            // heads buffered during a reconnect). Not a fork; run a normal
-            // catch-up to the finalized tip instead of single-block processing.
+            // Head more than one block ahead is a gap, not a fork: catch up.
             const lastIndexedHeight = Number(tipState?.lastIndexedHeight ?? 0);
             if (tipState?.lastIndexedHash && height > lastIndexedHeight + 1) {
                 log.info(`Live: gap detected (head ${height}, indexed ${lastIndexedHeight}); catching up`);
@@ -543,7 +471,6 @@ export class MidnightCrawler {
                 return;
             }
 
-            // Check for reorg
             const reorg = await this.checkForReorg(header);
             if (reorg) {
                 const reorgLogId = await this.handleReorg(reorg);
@@ -557,11 +484,9 @@ export class MidnightCrawler {
                 return;
             }
 
-            // Process new block (processBlockByHeight already fetches the hash)
             const result = await this.processBlockWithRetry(height);
             this.blocksProcessed++;
 
-            // Update sync state to synced
             const elapsed = (Date.now() - this.startTime) / 1000;
             const syncState = await this.getSyncState();
             await this.db.run(
@@ -595,30 +520,21 @@ export class MidnightCrawler {
         }
     }
 
-    // ========================================================================
-    // Reorg Detection & Recovery
-    // ========================================================================
-
     private async checkForReorg(header: BlockHeader): Promise<ReorgInfo | null> {
         const syncState = await this.getSyncState();
         if (!syncState?.lastIndexedHash) return null;
 
-        // Fast path: the head extends our tip.
         if (header.parentHash === syncState.lastIndexedHash) return null;
 
         const newHeight = MidnightNodeProvider.parseBlockNumber(header.number);
         const lastIndexedHeight = Number(syncState.lastIndexedHeight ?? 0);
 
-        // Head is far ahead of the index: that is a gap (e.g. subscription
-        // replay backlog after a reconnect), not a fork. The caller catches
-        // up; rolling back here would destroy valid data.
+        // A gap, not a fork: rolling back here would destroy valid data.
         if (newHeight > lastIndexedHeight + 1) return null;
 
         if (newHeight <= lastIndexedHeight) {
-            // Old or replayed head (subscription start/reconnect re-delivers
-            // already-indexed finalized heads). It sits on our chain iff its
-            // parent is our block at newHeight - 1 → ignore. Only a diverging
-            // parent at that height is a real fork below the tip.
+            // Replayed head: on our chain iff its parent is our block at
+            // newHeight - 1; only a diverging parent is a fork below the tip.
             if (newHeight === 0) return null; // genesis replay: never roll back
             const localParent: any = await this.db.run(
                 SELECT.one.from(Blocks).columns('hash').where({ height: newHeight - 1 })
@@ -651,10 +567,8 @@ export class MidnightCrawler {
                 return height + 1;
             }
 
-            // A failed header lookup is a transport problem, not a fork point:
-            // returning `height` here would roll the index back to wherever
-            // the RPC happened to fail. Propagate; the live handler records
-            // the error and the next head runs the search again.
+            // A failed lookup is not a fork point: throw instead of rolling back
+            // to wherever the RPC failed; the next head retries the search.
             const prevHeader = await this.nodeProvider.getHeader(currentHash);
             if (!prevHeader?.parentHash) {
                 throw new Error(`No header for ${currentHash} during fork search (pruned or racing node)`);
@@ -678,8 +592,7 @@ export class MidnightCrawler {
         const reorgLogId = cds.utils.uuid();
 
         await this.db.tx(async (tx: any) => {
-            // Shared cascade + NightBalances repair (srv/crawler/rollback.ts);
-            // also resets SyncState to the fork block with status 'syncing'.
+            // Also resets SyncState to the fork block with status 'syncing'.
             const result = await rollbackIndexedDataFromHeight(tx, reorg.forkHeight, {
                 syncStatus: 'syncing'
             });
@@ -706,10 +619,6 @@ export class MidnightCrawler {
         return reorgLogId;
     }
 
-    // ========================================================================
-    // Helpers
-    // ========================================================================
-
     private async processBlockWithRetry(height: number): Promise<ProcessResult> {
         let lastError: Error | null = null;
 
@@ -721,7 +630,6 @@ export class MidnightCrawler {
                 const transient = isTransientError(lastError);
 
                 if (!transient) {
-                    // Permanent error, don't retry
                     log.error(`Block ${height} permanent error: ${lastError.message}`);
                     break;
                 }
@@ -770,8 +678,7 @@ export class MidnightCrawler {
             return 0;
         }
 
-        // Integer64 columns come back as STRINGS from CAP 10 databases
-        // (ieee754compatible); "0" + 1 would concatenate to "01".
+        // Integer64 reads back as a string (ieee754compatible): "0" + 1 is "01".
         return Number(syncState.lastIndexedHeight ?? -1) + 1;
     }
 

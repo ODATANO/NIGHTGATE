@@ -1,5 +1,5 @@
 // `@odatano/nightgate/txbuilder`: the parts that do NOT need the SDK.
-// The live path (build + prove + sponsor) is proven by scripts/run-txbuilder-e2e.mjs.
+// The live path (build + prove + sponsor) is covered by scripts/run-txbuilder-e2e.mjs.
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtemp, rm, readFile, writeFile, mkdir, readdir } from 'node:fs/promises';
@@ -28,9 +28,11 @@ describe('txbuilder: ensureZkAssets', () => {
         });
         expect(res.fetched).toBe(3);
         expect(res.cached).toBe(0);
+        // The served manifest is asked for once (best effort) before the files.
         expect(seen.sort()).toEqual([
             'https://sponsor.example/zk-config/attestation-vault/keys/attest.prover',
             'https://sponsor.example/zk-config/attestation-vault/keys/attest.verifier',
+            'https://sponsor.example/zk-config/attestation-vault/keys/manifest.json',
             'https://sponsor.example/zk-config/attestation-vault/zkir/attest.bzkir'
         ]);
         expect((await readFile(join(dir, 'keys', 'attest.prover'), 'utf8')).startsWith('x:')).toBe(true);
@@ -38,8 +40,8 @@ describe('txbuilder: ensureZkAssets', () => {
 
     it('restricting circuits still fetches VERIFIER keys for the whole contract', async () => {
         // findDeployedContract reads every circuit's verifier key; only the
-        // heavy prover keys may be restricted. 0.1.1's `circuits: ['attest']`
-        // broke the first build with ENOENT on attestGuarded.verifier.
+        // heavy prover keys may be restricted; restricting the verifier keys
+        // too would fail the first build with ENOENT on attestGuarded.verifier.
         const { ensureZkAssets } = await importTxBuilder();
         const seen: string[] = [];
         const res = await ensureZkAssets({
@@ -54,6 +56,53 @@ describe('txbuilder: ensureZkAssets', () => {
             'https://s/x/keys/attestGuarded.verifier',
             'https://s/x/keys/bindPassport.verifier'
         ]);
+    });
+
+    it('replaces cached files that do not match the served manifest and keeps the ones that do', async () => {
+        // A contract upgrade serves DIFFERENT keys under the same URLs. The
+        // manifest names the current sha256 per file; a cached file of a former
+        // generation is re-downloaded, a matching one stays.
+        const { createHash } = await import('node:crypto');
+        const sha = (t: string) => createHash('sha256').update(t).digest('hex');
+        const { ensureZkAssets } = await importTxBuilder();
+        const bodies: Record<string, string> = {
+            '/keys/attest.prover': 'prover-v2', '/keys/attest.verifier': 'verifier-v1', '/zkir/attest.bzkir': 'zkir-v2'
+        };
+        const manifest = { version: 1, prover: { attest: { sha256: sha('prover-v2') } }, verifier: { attest: { sha256: sha('verifier-v1') } }, zkir: { attest: { sha256: sha('zkir-v2') } } };
+        // Warm cache of the FORMER generation for prover + zkir, current verifier.
+        await mkdir(join(dir, 'keys'), { recursive: true });
+        await mkdir(join(dir, 'zkir'), { recursive: true });
+        await writeFile(join(dir, 'keys', 'attest.prover'), 'prover-v1');
+        await writeFile(join(dir, 'keys', 'attest.verifier'), 'verifier-v1');
+        await writeFile(join(dir, 'zkir', 'attest.bzkir'), 'zkir-v1');
+        const seen: string[] = [];
+        const res = await ensureZkAssets({
+            zkConfigBaseUrl: 'https://s/x', cacheDir: dir, circuits: ['attest'],
+            fetchFn: (async (u: string) => {
+                seen.push(u);
+                if (u.endsWith('/keys/manifest.json')) return { ok: true, status: 200, arrayBuffer: async () => Buffer.from(JSON.stringify(manifest)) };
+                const key = Object.keys(bodies).find(k => u.endsWith(k))!;
+                return { ok: true, status: 200, arrayBuffer: async () => Buffer.from(bodies[key]) };
+            }) as any
+        });
+        expect(res).toMatchObject({ fetched: 2, cached: 1, refreshed: 2, verified: true });
+        expect(seen.filter(u => !u.endsWith('manifest.json')).sort()).toEqual(['https://s/x/keys/attest.prover', 'https://s/x/zkir/attest.bzkir']);
+        expect(await readFile(join(dir, 'keys', 'attest.prover'), 'utf8')).toBe('prover-v2');
+        expect(await readFile(join(dir, 'zkir', 'attest.bzkir'), 'utf8')).toBe('zkir-v2');
+        expect(await readFile(join(dir, 'keys', 'attest.verifier'), 'utf8')).toBe('verifier-v1');
+    });
+
+    it('refuses a downloaded file whose sha256 does not match the served manifest', async () => {
+        const { createHash } = await import('node:crypto');
+        const { ensureZkAssets } = await importTxBuilder();
+        const manifest = { version: 1, prover: { attest: { sha256: createHash('sha256').update('the real key').digest('hex') } }, verifier: {}, zkir: {} };
+        await expect(ensureZkAssets({
+            zkConfigBaseUrl: 'https://s/x', cacheDir: dir, circuits: ['attest'],
+            fetchFn: (async (u: string) => u.endsWith('/keys/manifest.json')
+                ? { ok: true, status: 200, arrayBuffer: async () => Buffer.from(JSON.stringify(manifest)) }
+                : { ok: true, status: 200, arrayBuffer: async () => Buffer.from('a tampered key') }) as any
+        })).rejects.toThrow(/does not match the sha256 in the served keys\/manifest\.json/);
+        expect(await readFile(join(dir, 'keys', 'attest.prover'), 'utf8').catch(() => 'absent')).toBe('absent');
     });
 
     it('serves a second run entirely from the cache (offline after the first build)', async () => {
@@ -116,7 +165,7 @@ describe('txbuilder: ensureZkAssets', () => {
     });
 });
 
-describe('txbuilder: zkConfigDir assets (0.21.0) keep the public ZkAssetResult shape', () => {
+describe('txbuilder: zkConfigDir assets keep the public ZkAssetResult shape', () => {
     let dir: string;
     beforeEach(async () => { dir = await mkdtemp(join(tmpdir(), 'ng-txb-local-')); });
     afterEach(async () => { await rm(dir, { recursive: true, force: true }); });
@@ -203,7 +252,7 @@ describe('txbuilder: createTxBuilder input validation', () => {
         await expect(createTxBuilder({ ...base, contractClass: undefined })).rejects.toThrow(/contractClass is required/);
     });
 
-    it("server proving is an EXPLICIT opt-in: a bare proofServerUrl (documented unused in 0.17) does not select it, and 'server' without a URL rejects", async () => {
+    it("server proving is an EXPLICIT opt-in: a bare proofServerUrl does not select it, and 'server' without a URL rejects", async () => {
         const { createTxBuilder } = await importTxBuilder();
         await expect(createTxBuilder({ ...base, provingMode: 'tpu' })).rejects.toThrow(/provingMode must be 'wasm' or 'server'/);
         await expect(createTxBuilder({ ...base, provingMode: 'server' })).rejects.toThrow(/requires proofServerUrl/);

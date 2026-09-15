@@ -36,6 +36,22 @@ describe('sponsor pool', () => {
         expect(Date.now() - t0).toBeGreaterThanOrEqual(500);
     });
 
+    it('leases a sponsor at the sync gate before one that lags, LRU within each group', async () => {
+        const atGate = (id: string) => id !== 'sp-a';
+        // sp-a is least recently used but lags: the gate wins over LRU
+        expect(pickFreeSponsor(POOL, Date.now(), atGate)).toBe('sp-b');
+        const first = await acquireSponsor(POOL, 0, atGate);
+        const second = await acquireSponsor(POOL, 0, atGate);
+        expect([first, second].sort()).toEqual(['sp-b', 'sp-c']);
+        // only the lagging member is left: it is still leased rather than refused
+        expect(await acquireSponsor(POOL, 0, atGate)).toBe('sp-a');
+    });
+
+    it('without a gate verdict the order stays least-recently-used', () => {
+        expect(pickFreeSponsor(POOL, Date.now(), () => false)).toBe('sp-a');
+        expect(pickFreeSponsor(POOL)).toBe('sp-a');
+    });
+
     it('a benched sponsor sits out its cooldown', async () => {
         benchSponsor('sp-a', 60_000);
         expect(pickFreeSponsor(['sp-a'])).toBeNull();
@@ -68,9 +84,9 @@ describe('sponsor pool', () => {
             'submit failed: 1010/170',
             'InvalidDustSpendProof',
             // 196 = the spent note's nullifier is already known to the node
-            // (live: two sponsorings forced onto one note); same rebuild fix.
+            // (two sponsorings on one note); same rebuild.
             '1010: Invalid Transaction: Custom error: 196',
-            // The shape the worker RPC boundary now delivers (cause chain appended).
+            // The shape the worker RPC boundary delivers (cause chain appended).
             'Transaction submission error <- Transaction submission failed <- 1010: Invalid Transaction: Custom error: 196',
             // Pool status Invalid: the loser reached the pool, the winner consumed the note first.
             'Transaction submission error <- SubmissionError: Transaction submission failed <- TransactionInvalidError: Transaction is invalid and was rejected by the node',
@@ -115,6 +131,13 @@ describe('non-exclusive candidates (unbound path)', () => {
         expect(sponsorCandidatesNonExclusive(['sp-a'])).toEqual([]);
         // once the cooldown is over it is back
         expect(sponsorCandidatesNonExclusive(['sp-a'], Date.now() + 61_000)).toEqual(['sp-a']);
+    });
+
+    it('orders sponsors at the sync gate first, keeps lagging ones as later candidates, never un-benches', async () => {
+        const atGate = (id: string) => id === 'sp-c';
+        expect(sponsorCandidatesNonExclusive(['sp-a', 'sp-b', 'sp-c'], Date.now(), atGate)).toEqual(['sp-c', 'sp-a', 'sp-b']);
+        benchSponsor('sp-c', 60_000);
+        expect(sponsorCandidatesNonExclusive(['sp-a', 'sp-b', 'sp-c'], Date.now(), atGate)).toEqual(['sp-a', 'sp-b']);
     });
 
     it('isGenericInvalidFailure: a bare pool Invalid is generic; coded rejects and our own markers are not', () => {
@@ -166,8 +189,8 @@ describe('decideSponsorFailure (one table for both sponsoring channels)', () => 
         expect(decideSponsorFailure(coded('causality'))).toEqual({ decision: 'fail', generic: false, preInclusion: false });
     });
 
-    it('a dust race rebuilds on the SAME sponsor; it never benches it (the order that used to be wrong)', () => {
-        // Matches both the dust-race and the old sponsor-health patterns.
+    it('a dust race rebuilds on the SAME sponsor; it never benches it', () => {
+        // Matches both the dust-race and the sponsor-health patterns.
         const race = new Error('Transaction submission error <- 1010: Invalid Transaction: Custom error: 170');
         expect(isRetryableSponsorFailure(race)).toBe(true);
         expect(decideSponsorFailure(race).decision).toBe('dust-rebuild');

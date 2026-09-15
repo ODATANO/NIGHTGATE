@@ -1,5 +1,5 @@
 /**
- * Tests for BlockProcessor hardening:
+ * Tests for BlockProcessor block parsing:
  * - blake2b-256 extrinsic hashing
  * - On-chain timestamp from Timestamp pallet
  * - protocolVersion from RuntimeVersion
@@ -71,7 +71,7 @@ function buildUnsignedExtrinsic(palletIndex: number, callIndex: number): string 
 }
 
 // ============================================================================
-// 1A: blake2b-256 Extrinsic Hashing
+// blake2b-256 Extrinsic Hashing
 // ============================================================================
 
 describe('hashExtrinsic: blake2b-256', () => {
@@ -149,7 +149,7 @@ describe('classifyExtrinsic and mapPalletCall', () => {
 });
 
 // ============================================================================
-// 1B: On-chain Timestamp Parsing
+// On-chain Timestamp Parsing
 // ============================================================================
 
 describe('System.Events outcome decoding', () => {
@@ -284,10 +284,10 @@ describe('getBlockTimestamp: SCALE u64 LE parsing', () => {
 });
 
 // ============================================================================
-// 1C: protocolVersion from RuntimeVersion
+// protocolVersion from RuntimeVersion
 // ============================================================================
 
-describe('getProtocolVersion: RuntimeVersion per-block query with error fallback', () => {
+describe('getProtocolVersion: RuntimeVersion per-block query', () => {
     beforeEach(() => {
         vi.clearAllMocks();
     });
@@ -336,7 +336,7 @@ describe('getProtocolVersion: RuntimeVersion per-block query with error fallback
 });
 
 // ============================================================================
-// 1D: Structured Author from Digest Logs
+// Structured Author from Digest Logs
 // ============================================================================
 
 describe('extractAuthor: digest log parsing', () => {

@@ -1,42 +1,17 @@
 /**
- * Traits of every durable background-job kind, declared ONCE next to the
- * kind. The job runner derives its concurrency class, the workflow-parent
- * reconciliation set and the identifier-keyed confirmer set from the
- * registrations, so a kind cannot be forgotten in one list and present in
- * another: `registerBackgroundJobProcessor` refuses a kind without traits,
- * and the runner refuses to start while a kind in this table has no
- * processor.
+ * Traits of every durable background-job kind, declared once so the runner's
+ * lists cannot drift: a kind without traits, or without a processor, fails at boot.
  */
 export interface JobKindTraits {
-    /**
-     * Each job runs a full ZK proof (proof server, or the in-process wasm
-     * prover, where proofs additionally serialize on the worker thread). Four
-     * concurrent saturate one proof-server instance; wider only queues inside
-     * it. Light kinds are sync-bound and wait on `waitForSyncedState`.
-     */
+    /** Runs a full ZK proof: limited to the heavy concurrency class (one proof server saturates at four). */
     heavy: boolean;
-    /**
-     * The executor drives child commands (`runChildCommand`). The parent row
-     * carries no txHash of its own; its reconciliation reads the children.
-     */
+    /** Drives child commands; the parent row has no txHash and reconciles from its children. */
     workflowParent: boolean;
-    /**
-     * The row's `txHash` is the LEDGER TRANSACTION IDENTIFIER the wallet
-     * SDK's submit returns, which only the indexer answers; the crawler keys
-     * on Substrate extrinsic hashes and never finds it. The job row and the
-     * attempt row are finalized together from the indexer outcome.
-     */
+    /** `txHash` is the ledger identifier, which only the indexer resolves (never the crawler). */
     identifierKeyed: boolean;
-    /**
-     * At most ONE concurrent job: the work it waits on serializes further out
-     * (SDK catch-up on the single worker thread), so N in parallel each run
-     * at 1/N speed and the first usable result arrives N times later.
-     */
+    /** One job at a time: its work serializes on the worker thread anyway, parallel runs only delay the first result. */
     serial?: boolean;
-    /**
-     * Its product dies with the process (a warm wallet facade): a pending or
-     * running row is terminal after a restart instead of re-queued.
-     */
+    /** Its product dies with the process (warm facade): pending/running rows end at restart, never re-queue. */
     sessionBound?: boolean;
 }
 
@@ -45,11 +20,6 @@ export const HEAVY_KIND: JobKindTraits = { heavy: true, workflowParent: false, i
 /** A proving workflow parent: its own executor proves nothing, but it holds a heavy slot while its children run. */
 export const WORKFLOW_PARENT_KIND: JobKindTraits = { heavy: true, workflowParent: true, identifierKeyed: false };
 
-/**
- * Every kind the server registers, with its traits. Handlers register the
- * processor with the entry of this table; a kind added here without a
- * registration, or registered without an entry, fails at boot.
- */
 export const JOB_KIND_TRAITS: Readonly<Record<string, JobKindTraits>> = {
     // wallet lifecycle (srv/sessions/wallet-sessions.ts)
     connectWalletForSigning: { ...LIGHT_KIND, serial: true, sessionBound: true },
@@ -63,13 +33,12 @@ export const JOB_KIND_TRAITS: Readonly<Record<string, JobKindTraits>> = {
     submitContractCallBatch: HEAVY_KIND,
     mintShieldedTestToken: HEAVY_KIND,
     anchorDocument: HEAVY_KIND,
-    commitDocumentAnchor: HEAVY_KIND,
-    anchorDocumentGuarded: WORKFLOW_PARENT_KIND,
-    anchorCommit: HEAVY_KIND,
-    anchorReveal: HEAVY_KIND,
     grantDisclosure: HEAVY_KIND,
     revokeDisclosure: HEAVY_KIND,
     registerPassport: HEAVY_KIND,
+    retract: HEAVY_KIND,
+    // projection catch-up after a post-submit reindex failed; no chain effect
+    reindexDisclosures: LIGHT_KIND,
 
     // proving workflows and their child steps
     issueFieldPredicateAttestation: WORKFLOW_PARENT_KIND,
@@ -86,15 +55,13 @@ export const JOB_KIND_TRAITS: Readonly<Record<string, JobKindTraits>> = {
     documentIntegrityProof: HEAVY_KIND,
     documentDiffProof: HEAVY_KIND,
 
-    // cross-server sponsoring: caller-side build (a full circuit proof), the
-    // two-phase probe, and the two sponsor phases (identifier-keyed; the
-    // unbound one proves the sponsor's dust spend per job)
+    // cross-server sponsoring; the unbound sponsor proves its dust spend per job
     buildSponsorableTx: HEAVY_KIND,
     sponsorFinalizedTransaction: { heavy: false, workflowParent: false, identifierKeyed: true },
     sponsorUnboundTransaction: { heavy: true, workflowParent: false, identifierKeyed: true }
 };
 
-/** The table entry for `kind`; throws so a registration site cannot register an undeclared kind. */
+/** The table entry for `kind`; throws for an undeclared kind. */
 export function declaredJobKindTraits(kind: string): JobKindTraits {
     const traits = Object.prototype.hasOwnProperty.call(JOB_KIND_TRAITS, kind) ? JOB_KIND_TRAITS[kind] : undefined;
     if (!traits) throw new Error(`job kind '${kind}' is not declared in srv/submission/job-kinds.ts`);

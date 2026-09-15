@@ -1,15 +1,14 @@
 // Legacy-migration integration test for scripts/apply-schema-delta.mjs.
 //
-// Builds a synthetic PRE-0.15 database shape (PredicateAttestations with
+// Builds a synthetic legacy database shape (PredicateAttestations with
 // NOT NULL op/threshold, which the target schema relaxed -> forces the
 // rebuild path) plus an operator-added index, trigger and a data row, runs
 // the real migration CLI against it, and asserts:
-//   1. the new 0.16.0 columns exist (payloadHashB, allowedMask, network,
+//   1. the later columns exist (payloadHashB, allowedMask, network,
 //      compiledArtifactRef),
 //   2. the NOT NULL constraints were relaxed,
 //   3. the data row survived,
-//   4. the operator index AND trigger survived the rebuild (regression: the
-//      rebuild used to drop them silently with the old table).
+//   4. the operator index AND trigger survived the rebuild.
 //
 // Run: node scripts/integration-test-schema-delta.mjs
 
@@ -99,7 +98,8 @@ CREATE TABLE midnight_WalletSessions (
     connectedAt TEXT NOT NULL,
     disconnectedAt TEXT,
     expiresAt TEXT,
-    isActive INTEGER DEFAULT TRUE
+    isActive INTEGER DEFAULT TRUE,
+    CONSTRAINT midnight_WalletSessions_sessionId UNIQUE (sessionId)
 );
 INSERT INTO midnight_WalletSessions (ID, userId, sessionId, connectedAt, isActive, encryptedViewingKey)
 VALUES ('sess-row-1', 'operator', 'sess-1', '2026-08-01T00:00:00.000Z', 1, 'cipher');
@@ -124,7 +124,8 @@ CREATE TABLE midnight_AgentGrants (
     sponsorSessionId TEXT,
     validUntil TEXT,
     isActive INTEGER DEFAULT TRUE,
-    revokedAt TEXT
+    revokedAt TEXT,
+    CONSTRAINT midnight_AgentGrants_tokenHash UNIQUE (tokenHash)
 );
 INSERT INTO midnight_AgentGrants (ID, userId, sessionId, tokenHash, allowedActions, maxJobsPerDay, jobsUsedToday, isActive)
 VALUES ('grant-row-1', 'operator', 'sess-1', 'deadbeef', '["anchorDocument"]', 20, 3, 1);
@@ -205,6 +206,27 @@ CREATE TABLE midnight_BackgroundJobs (
 );
 INSERT INTO midnight_BackgroundJobs (ID, kind, status, txHash, chainStatus)
 VALUES ('job-legacy', 'submitContractCall', 'succeeded', '00identifier', 'pending');
+
+-- A 0.23-shaped DisclosureGrants: unique key without the attester.
+CREATE TABLE midnight_DisclosureGrants (
+    ID NVARCHAR(36) NOT NULL,
+    createdAt TIMESTAMP_TEXT,
+    createdBy NVARCHAR(255),
+    modifiedAt TIMESTAMP_TEXT,
+    modifiedBy NVARCHAR(255),
+    payloadHash NVARCHAR(512) NOT NULL,
+    grantee NVARCHAR(512) NOT NULL,
+    level INTEGER NOT NULL,
+    pendingLevel INTEGER,
+    contractAddress NVARCHAR(512) NOT NULL,
+    grantedTxHash NVARCHAR(512),
+    revokedTxHash NVARCHAR(512),
+    active BOOLEAN DEFAULT FALSE,
+    PRIMARY KEY(ID),
+    CONSTRAINT midnight_DisclosureGrants_logicalGrant UNIQUE (contractAddress, payloadHash, grantee)
+);
+INSERT INTO midnight_DisclosureGrants (ID, payloadHash, grantee, level, contractAddress, active)
+VALUES ('dg-legacy', 'p1', 'g1', 1, 'c1', 1);
 `);
 db.close();
 
@@ -227,7 +249,7 @@ const master = after.prepare(
 ok('delta: operator index survived the rebuild', master.some(m => m.type === 'index' && m.name === 'operator_pa_payload_idx'), JSON.stringify(master));
 ok('delta: operator trigger survived the rebuild', master.some(m => m.type === 'trigger' && m.name === 'operator_pa_touch'), JSON.stringify(master));
 
-// --- the 0.20.0 upgrade path, the one the changelog calls not-code-only -----
+// --- WalletSessions: the label column added to an existing table ------------
 const sessionCols = new Map(
     after.prepare('PRAGMA table_info("midnight_WalletSessions")').all().map(r => [r.name, r])
 );
@@ -241,7 +263,7 @@ ok('delta 0.20: the existing session row survived, keys intact',
     sessionRow?.sessionId === 'sess-1' && sessionRow?.encryptedViewingKey === 'cipher' && sessionRow?.label === null,
     JSON.stringify(sessionRow));
 
-// --- the 0.21.0 upgrade path: six columns on an existing AgentGrants ---------
+// --- AgentGrants: the six policy/deploy columns on an existing table ---------
 const grantCols = new Map(
     after.prepare('PRAGMA table_info("midnight_AgentGrants")').all().map(r => [r.name, r])
 );
@@ -249,7 +271,7 @@ const added021 = ['allowedContracts', 'allowedCircuits', 'allowDeploy', 'maxDepl
 ok('delta 0.21: the six grant columns were added to an EXISTING AgentGrants table',
     added021.every(c => grantCols.has(c)), [...grantCols.keys()].join(','));
 ok('delta 0.21: the added grant columns are nullable', added021.every(c => grantCols.get(c)?.notnull === 0));
-// --- the 0.22.0 upgrade path: the token-type allow-list column ---------------
+// --- AgentGrants: the token-type allow-list column ---------------------------
 ok('delta 0.22: allowedTokenTypes was added, nullable', grantCols.has('allowedTokenTypes') && grantCols.get('allowedTokenTypes')?.notnull === 0);
 const grantRow = after.prepare("SELECT * FROM midnight_AgentGrants WHERE ID = 'grant-row-1'").get();
 ok('delta 0.21: the existing grant survived with its token and budget intact',
@@ -269,7 +291,7 @@ const docRow = after.prepare("SELECT * FROM midnight_Documents WHERE ID = 'doc-r
 ok('delta: the existing document survived with a null session (owner-readable only)',
     docRow?.sha256 === 'cc' && docRow?.storageRef === 'file:///legacy' && docRow?.sessionId === null,
     JSON.stringify(docRow));
-// --- 0.23.0: lossy binary rows are cleared, never re-encoded ---------------
+// --- lossy binary rows are cleared, never re-encoded -----------------------
 const lossy = after.prepare("SELECT raw FROM midnight_Transactions WHERE ID = 'tx-lossy'").get();
 ok('delta 0.23: a pre-0.23.0 Transactions.raw value (lossy hex-through-base64) is cleared for reindexing', lossy?.raw === null, JSON.stringify(lossy));
 ok('delta 0.23: the Transactions row itself survives', after.prepare("SELECT hash FROM midnight_Transactions WHERE ID = 'tx-lossy'").get()?.hash === '0xhash');
@@ -281,7 +303,7 @@ ok('delta 0.23: secondary indexes exist after the migration', ngIdx.includes('ng
 const regs = after.prepare("SELECT type FROM sqlite_master WHERE name = 'midnight_ContractRegistrations'").get();
 ok('delta 0.21: the ContractRegistrations table exists', regs?.type === 'table');
 
-// 0.23: account keys + the key-scheme marker on the three stores.
+// Account keys + the key-scheme marker on the three stores.
 const accountKeys = after.prepare("SELECT type FROM sqlite_master WHERE name = 'midnight_AccountKeys'").get();
 ok('delta 0.23: the AccountKeys table exists', accountKeys?.type === 'table');
 for (const table of ['midnight_PrivateStates', 'midnight_ContractSigningKeys', 'midnight_WalletSyncStates']) {
@@ -296,6 +318,13 @@ for (const table of ['midnight_PendingSubmissions', 'midnight_BackgroundJobs']) 
     ok(`delta 0.23: inclusion coordinates added to an EXISTING ${table} table`,
         ['chainBlockHeight', 'chainBlockHash', 'indexerTxHash'].every(c => evidenceCols.has(c) && evidenceCols.get(c).notnull === 0),
         [...evidenceCols.keys()].join(','));
+}
+{
+    const jobCols = new Map(after.prepare('PRAGMA table_info("midnight_BackgroundJobs")').all().map(r => [r.name, r]));
+    ok('delta 0.24: grantId added to an EXISTING BackgroundJobs table, nullable',
+        jobCols.has('grantId') && jobCols.get('grantId')?.notnull === 0, [...jobCols.keys()].join(','));
+    const grantIdx = after.prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'ng_backgroundjobs_grant'").get();
+    ok('delta 0.24: the per-grant usage index exists', Boolean(grantIdx));
 }
 ok('delta 0.23: the legacy submission row survived with null coordinates',
     after.prepare("SELECT chainBlockHeight FROM midnight_PendingSubmissions WHERE ID = 'sub-legacy'").get()?.chainBlockHeight === null);
@@ -315,7 +344,37 @@ ok('delta 0.20: the projection keeps what an operator needs',
     jobsViewCols.includes('status') && jobsViewCols.includes('errorCode') && jobsViewCols.includes('errorMessage'),
     jobsViewCols.join(','));
 
+{
+    const dgCols = new Map(after.prepare('PRAGMA table_info("midnight_DisclosureGrants")').all().map(r => [r.name, r]));
+    ok('delta 0.24: attesterId and changedAtHeight added to an EXISTING DisclosureGrants table',
+        dgCols.has('attesterId') && dgCols.has('changedAtHeight'), [...dgCols.keys()].join(','));
+    const dgRow = after.prepare("SELECT * FROM midnight_DisclosureGrants WHERE ID = 'dg-legacy'").get();
+    ok('delta 0.24: the legacy grant survived the rebuild with a null attester',
+        dgRow?.payloadHash === 'p1' && dgRow?.level === 1 && dgRow?.attesterId === null, JSON.stringify(dgRow));
+    const dgSql = after.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='midnight_DisclosureGrants'").get()?.sql ?? '';
+    ok('delta 0.24: the unique key includes the attester', /UNIQUE\s*\(\s*contractAddress\s*,\s*attesterId\s*,\s*payloadHash\s*,\s*grantee\s*\)/i.test(dgSql), dgSql);
+}
+
 after.close();
+
+{
+    const rw = new DatabaseSync(dbPath);
+    const insert = rw.prepare('INSERT INTO midnight_DisclosureGrants (ID, payloadHash, attesterId, grantee, level, contractAddress) VALUES (?, ?, ?, ?, 1, ?)');
+    let twoAttesters = true;
+    try {
+        insert.run('dg-a1', 'p2', 'a1', 'g2', 'c1');
+        insert.run('dg-a2', 'p2', 'a2', 'g2', 'c1');
+    } catch (err) {
+        twoAttesters = false;
+        console.error(err.message);
+    }
+    ok('delta 0.24: two attesters can grant the same payload to the same grantee', twoAttesters);
+    let duplicateRefused = false;
+    try { insert.run('dg-a1-dup', 'p2', 'a1', 'g2', 'c1'); } catch { duplicateRefused = true; }
+    ok('delta 0.24: the same attester cannot grant twice', duplicateRefused);
+    rw.close();
+}
+
 rmSync(dir, { recursive: true, force: true });
 
 console.log();

@@ -156,7 +156,7 @@ export interface BuildSponsorableInput {
     orderedPrefix?: number;
     initialPrivateState?: unknown;
     /** true (default): FINALIZED handover (sponsorFinalizedTransaction).
-     *  false: UNBOUND handover (sponsorUnboundTransaction, parallel 0.18). */
+     *  false: UNBOUND handover (sponsorUnboundTransaction, parallel). */
     bind?: boolean;
 }
 export interface BuildSponsorableBoundInput extends BuildSponsorableInput { bind?: true; }
@@ -191,7 +191,7 @@ export interface TxBuilder {
     buildSponsorable(input: BuildSponsorableBoundInput): Promise<BuiltBoundTransaction>;
     buildSponsorable(input: BuildSponsorableInput): Promise<BuiltTransaction>;
     /**
-     * 0.21.0: build + prove + sign a contract deploy without submitting; the caller's
+     * Build + prove + sign a contract deploy without submitting; the caller's
      * key signs it, a sponsor pays the dust. Sponsoring needs
      * `NIGHTGATE_SPONSOR_ALLOW_DEPLOY` on the server and, for a token caller,
      * `allowDeploy` with budget left on the grant. The landed address is recorded
@@ -219,9 +219,9 @@ export interface BuildDeploySponsorableUnboundInput extends BuildDeploySponsorab
 export interface BuiltBoundDeploy extends BuiltBoundTransaction { contractAddress: string; }
 export interface BuiltUnboundDeploy extends BuiltUnboundTransaction { contractAddress: string; }
 export type BuiltDeploy = BuiltBoundDeploy | BuiltUnboundDeploy;
-/** The contract address a built deploy transaction creates; throws unless exactly one deploy action is present. */
 /** `{ timeout }` for the SDK's proof provider when `proofTimeoutMs` is set, else undefined. */
 export declare function proofProviderConfig(opts: { proofTimeoutMs?: number } | undefined): { timeout: number } | undefined;
+/** The contract address a built deploy transaction creates; throws unless exactly one deploy action is present. */
 export declare function readDeployAddress(tx: unknown): string;
 
 // ---- self-funded submission (pay your own dust, submit to the node yourself)
@@ -266,14 +266,27 @@ export interface NodeRejectClassification {
      * 'funds' (138/173, "could not balance dust"): the wallet cannot pay; retrying buys nothing.
      * 'sequencing' (219-224, 188): split the batch into single-call transactions.
      * 'malformed' (117): neither waiting nor an identical rebuild fixes it.
+     * 'stale-transcript' (104): the call no longer fits the current contract state (another transaction on it landed first); build it again, never resend the bytes.
      * 'unknown': a 1010 this table does not know, or not a coded reject.
      */
-    kind: 'stale-dust-proof' | 'funds' | 'sequencing' | 'malformed' | 'unknown';
+    kind: 'stale-dust-proof' | 'funds' | 'sequencing' | 'malformed' | 'stale-transcript' | 'unknown';
     subCode: number | null;
 }
 
 /** What a node reject means, from the ledger sub-code in the error's message or cause chain. */
 export declare function classifyNodeReject(err: unknown): NodeRejectClassification;
+export interface StaleTranscriptRebuildOptions {
+    /** Further attempts after the first refusal; default 2. */
+    retries?: number;
+    /** Pause before each rebuild, so the indexer serves the new state; default 15000. */
+    backoffMs?: number;
+    /** Called before each rebuild with the retry number (1-based) and the refusal. */
+    onRetry?: (retry: number, err: unknown) => void;
+    /** Injectable pause, for tests. */
+    sleep?: (ms: number) => Promise<void>;
+}
+/** Runs `attempt(retry)` again on a `stale-transcript` refusal (104); `attempt` must build fresh bytes each time. Other errors and the last refusal rethrow. */
+export declare function rebuildOnStaleTranscript<T>(attempt: (retry: number) => Promise<T>, opts?: StaleTranscriptRebuildOptions): Promise<T>;
 /** 1010/1014/1016: the transaction provably never entered the mempool (fee unspent). NOT 1013 (already imported). */
 export declare function isPreMempoolReject(err: unknown): boolean;
 /** The SEND failed (socket closed/reset, no reply): probe the indexer, then resend the SAME bytes; never rebuild on transport alone. */
@@ -317,6 +330,8 @@ export declare function ensureZkAssets(input: EnsureZkAssetsInput): Promise<ZkAs
 /** Checks a local keys/ + zkir/ directory and describes it as a `ZkAssetResult` (`source: 'local'`, nothing fetched). */
 export declare function describeLocalZkAssets(zkConfigDir: string, circuits?: string[], proveCircuits?: string[]): Promise<ZkAssetResult>;
 export declare function createTxBuilder(opts: CreateTxBuilderInput): Promise<TxBuilder>;
-/** The identity a seed yields (attester id, attestation secret, NIGHT address) without a builder, a wallet or the network; ~150 ms. */
+/** The identity a seed yields (attester id, attestation secret, NIGHT address) without a builder, a wallet or the network. */
 export declare function deriveIdentity(opts: DeriveIdentityInput): Promise<Identity>;
+/** The attester's record key for a payload (hex): persistentHash(AttestRecordKey{tag 21, owner, payload_hash}). */
+export declare function computeRecordKey(attesterId: string, payloadHash: string): string;
 export declare function trackingWebSocket(WebSocketImpl: Function): TrackingWebSocket;

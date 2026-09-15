@@ -1,12 +1,10 @@
 /**
- * Artifact generations in the worker: the compiled-contract scaffold cache,
- * the immutable content-addressed snapshots each proof reads from, generation
- * retention and the generation-pinned module import.
+ * Artifact generations in the worker: scaffold cache, immutable content-addressed
+ * snapshots, generation retention and the generation-pinned module import.
  */
 
-// First import on purpose: the worker modules import each other in cycles,
-// and a value read at module level must come from an import that is
-// resolved before the cycle re-enters this module.
+// First import on purpose: the worker modules import each other in cycles and
+// a module-level read must resolve before the cycle re-enters.
 import { configNumber, configString } from '../../utils/config';
 import path from 'node:path';
 import fs from 'node:fs';
@@ -19,7 +17,7 @@ import { log } from './context';
 import { zkProviderBundles } from './contracts';
 import { noteGenerationImported } from './rotation';
 
-// ---- Compiled-contract cache (Phase 2b) -----------------------------------
+// ---- Compiled-contract cache ----------------------------------------------
 
 export interface ContractRegistration {
     artifactPath: string;
@@ -31,17 +29,11 @@ export interface ContractRegistration {
     slotWidth?: number;
 }
 
-// Cache of the heavy bits of contract compilation: imported module + ctor.
-// Witnesses must be bound per-call (session-specific for contracts like
-// AttestationVault that use `local_secret_key()`), so the final pipeable
-// composition is rebuilt on each invocation. The pipe itself is cheap; what
-// would be expensive (the dynamic import + ZK asset path validation) is
-// the part that's reused.
+// Only the imported class is cached: witnesses are session-specific, so the
+// composition is rebuilt per call.
 export interface ContractScaffold {
     contractClass: any;
 }
-
-/** Insertion-ordered bounded map: `get` refreshes, `set` evicts the oldest entry past `max`. */
 
 /** Artifact generations kept warm (classes, zk config + proving providers); NIGHTGATE_WORKER_GENERATION_CACHE, default 8. */
 export function generationCacheSize(): number {
@@ -55,9 +47,8 @@ export function __resetScaffoldCacheForTests(): void {
 }
 
 export async function getContractScaffold(name: string, registration: ContractRegistration): Promise<ContractScaffold> {
-    // Keyed by name, artifact path and generation digest: a registry name is a
-    // mutable alias and a revision can be rewritten in place under one path.
-    // The class is imported from the generation's verified immutable snapshot.
+    // Keyed by name, path and digest: a name is a mutable alias and a path can
+    // be rewritten in place.
     const generation = registration.artifactDigest ?? '';
     const key = `${name}\0${registration.artifactPath}\0${generation}`;
     const cached = contractScaffolds.get(key);
@@ -68,7 +59,6 @@ export async function getContractScaffold(name: string, registration: ContractRe
         mod = await importArtifactGeneration(snapshot!.modulePath, generation);
         noteGenerationImported(generation);
     } else {
-        // No digest on the registration (pre-0.21 caller): nothing to pin to.
         mod = await importArtifactGeneration(registration.artifactPath, generation);
     }
     const contractClass = mod.Contract ?? mod.default ?? mod;
@@ -80,16 +70,9 @@ export async function getContractScaffold(name: string, registration: ContractRe
 // ---- Content-addressed artifact snapshots ---------------------------------
 
 /**
- * Immutable content-addressed snapshot of one artifact generation:
- * `<root>/<digest>/{module/artifact.<ext>,keys,zkir}`, root = NIGHTGATE_ARTIFACT_SNAPSHOT_DIR
- * or the OS temp dir. The SDK reads keys/zkir lazily at proving time and Node reads the
- * module at `import()`, so neither ever gets the mutable registration directory.
- * Built under a temp name, verified against the pinned digest, renamed into place, never
- * written again. The root links `node_modules` to the worker's own so the bare
- * `@midnight-ntwrk/compact-runtime` import resolves to the pinned runtime. A snapshot is
- * swept when evicted from the bounded caches with no job holding it (retainGeneration);
- * stale ones (NIGHTGATE_ARTIFACT_SNAPSHOT_TTL_DAYS, default 14) and `.tmp-*` builds are
- * swept once per process at first use. Node's ESM module cache is not bounded by any of this.
+ * Immutable snapshot `<root>/<digest>/{module,keys,zkir}`: the SDK reads keys lazily at
+ * proving time, so it must never see the mutable registration dir. Built under a temp
+ * name, verified against the digest, renamed, never written again.
  */
 export interface ArtifactSnapshot {
     digest: string;
@@ -102,7 +85,7 @@ export const verifiedSnapshots = new Set<string>();
 export let snapshotRootPrepared: string | null = null;
 export const SNAPSHOT_ROOT_MARKER = '.nightgate-snapshot-root';
 
-/** The configured or default base; the per-install and per-process levels live below it. */
+/** Base dir; the per-install level lives below it. */
 export function artifactSnapshotBase(): string {
     return configString('NIGHTGATE_ARTIFACT_SNAPSHOT_DIR') || path.join(os.tmpdir(), 'nightgate-artifact-snapshots');
 }
@@ -113,13 +96,8 @@ export function installKey(): string {
 }
 
 /**
- * The snapshot root of this INSTALLATION: `<base>/<install>`. Every NIGHTGATE
- * process of the same install shares it, so a restart reuses the snapshots
- * (78-114 MB per generation are not copied again) and the TTL sweep works
- * across restarts. Who uses a snapshot is recorded by holder files
- * (`<digest>/.holders/<pid>`); a sweep only removes a snapshot no live process
- * holds. Per-process roots of 0.21-0.22 (`<install>/<pid>`) are removed once
- * their process is gone.
+ * Snapshot root shared by every process of this install. Holder files
+ * (`<digest>/.holders/<pid>`) keep a sweep off snapshots a live process uses.
  */
 export function artifactSnapshotRoot(): string {
     return path.join(artifactSnapshotBase(), installKey());
@@ -141,10 +119,7 @@ export function releaseSnapshotHold(dir: string): void {
     try { fs.rmSync(path.join(dir, SNAPSHOT_HOLDERS_DIR, String(process.pid)), { force: true }); } catch { /* best effort */ }
 }
 
-/**
- * Live processes other than this one holding the snapshot. Dead holders are
- * removed on the way (a crash leaves its file behind).
- */
+/** Other live processes holding the snapshot; dead holders' files are removed. */
 export function otherLiveHolders(dir: string): number[] {
     const holders = path.join(dir, SNAPSHOT_HOLDERS_DIR);
     let entries: string[] = [];
@@ -179,8 +154,7 @@ export function snapshotTtlMs(): number {
 export function prepareSnapshotRoot(): string {
     const root = artifactSnapshotRoot();
     if (snapshotRootPrepared === root) return root;
-    // The base holds artifact copies of every install of this user: private
-    // to the user (best effort on platforms without POSIX modes).
+    // Private to the user (best effort without POSIX modes).
     fs.mkdirSync(artifactSnapshotBase(), { recursive: true, mode: 0o700 });
     try { fs.chmodSync(artifactSnapshotBase(), 0o700); } catch { /* not supported here */ }
     fs.mkdirSync(root, { recursive: true, mode: 0o700 });
@@ -208,9 +182,7 @@ export function prepareSnapshotRoot(): string {
     if (!linkOk) {
         fs.symlinkSync(target, link, process.platform === 'win32' ? 'junction' : 'dir');
     }
-    // Sweep 1: per-process roots of the 0.21-0.22 layout (`<install>/<pid>`)
-    // whose process is gone. A live process, or one this user cannot signal,
-    // keeps its root.
+    // Sweep per-process roots (`<install>/<pid>`) whose process is gone.
     for (const entry of listDir(root)) {
         const pid = Number(entry);
         if (!Number.isInteger(pid) || pid === process.pid || processAlive(pid)) continue;
@@ -222,8 +194,7 @@ export function prepareSnapshotRoot(): string {
             }
         } catch { /* best effort */ }
     }
-    // Sweep 2: leftover temp builds, and snapshots unused within the TTL (mtime
-    // is bumped on every use, touchSnapshot) that no live process holds.
+    // Sweep temp builds and snapshots unused within the TTL (mtime bumped per use) no live process holds.
     const cutoff = Date.now() - snapshotTtlMs();
     for (const entry of listDir(root)) {
         if (entry === 'node_modules' || entry === SNAPSHOT_ROOT_MARKER || Number.isInteger(Number(entry))) continue;
@@ -257,10 +228,8 @@ export function copyDirFiltered(from: string, to: string, filter: (f: string) =>
 }
 
 /**
- * Canonical module name inside a snapshot; the digest is the identity, not the file
- * name. The extension carries the effective module format (`.mjs`/`.cjs`): the snapshot
- * lives outside the package scope whose package.json made a `.js` file ESM. The format
- * is part of the digest.
+ * `.mjs`/`.cjs` carries the effective module format: the snapshot lives outside the
+ * package scope whose package.json made a `.js` file ESM.
  */
 export function snapshotModuleName(registration: ContractRegistration): string {
     return effectiveModuleFormat(registration.artifactPath) === 'module' ? 'artifact.mjs' : 'artifact.cjs';
@@ -276,17 +245,14 @@ export function snapshotRegistration(dir: string, registration: ContractRegistra
 }
 
 /**
- * Copy a source map next to the snapshot module with its `sourceRoot` made
- * absolute against the ORIGINAL module directory, so the `sources` it names
- * keep resolving (they are relative to where the map used to live). An
- * unparseable map is copied verbatim.
+ * Copy a source map with `sourceRoot` made absolute against the original module
+ * dir, so its relative `sources` keep resolving. Unparseable maps copy verbatim.
  */
 export function copySourceMapRebased(from: string, to: string, originalDir: string): void {
     try {
         const map = JSON.parse(fs.readFileSync(from, 'utf8'));
         if (map && typeof map === 'object') {
-            // An absolute directory (trailing separator), which is what Node's
-            // and Vite's source-map resolvers prepend to each `sources` entry.
+            // Trailing separator: resolvers prepend sourceRoot to each entry.
             map.sourceRoot = path.resolve(originalDir, String(map.sourceRoot ?? '')) + path.sep;
             fs.writeFileSync(to, JSON.stringify(map));
             return;
@@ -320,8 +286,7 @@ export function materializeArtifactSnapshot(name: string, registration: Contract
     try {
         fs.mkdirSync(path.join(tmp, 'module'), { recursive: true });
         fs.copyFileSync(registration.artifactPath, path.join(tmp, 'module', snapshotModuleName(registration)));
-        // Carry the source map under the name the module's sourceMappingURL names,
-        // so stack traces keep working. Not part of the digest.
+        // Source map under the name sourceMappingURL expects; not part of the digest.
         const mapName = `${path.basename(registration.artifactPath)}.map`;
         const mapPath = path.join(path.dirname(registration.artifactPath), mapName);
         if (fs.existsSync(mapPath)) copySourceMapRebased(mapPath, path.join(tmp, 'module', mapName), path.dirname(registration.artifactPath));
@@ -340,8 +305,7 @@ export function materializeArtifactSnapshot(name: string, registration: Contract
         try {
             fs.renameSync(tmp, dir);
         } catch (e) {
-            // A concurrent job of the same generation won the rename: use its
-            // snapshot if it verifies, otherwise surface the error.
+            // A concurrent job may have won the rename: use its snapshot if it verifies.
             if (!fs.existsSync(dir) || computeArtifactGenerationDigest(snapReg) !== digest) throw e;
         }
         verifiedSnapshots.add(digest);
@@ -409,12 +373,12 @@ export function __evictGenerationForTests(digest: string): void {
     onGenerationEvicted(digest);
 }
 
-/** Zk asset path for a job: the immutable snapshot of its pinned generation, or the registration directory when there is no digest. */
+/** Zk asset path for a job: the pinned snapshot, or the registration dir without a digest. */
 export function artifactAssetPath(name: string, registration: ContractRegistration): string {
     return materializeArtifactSnapshot(name, registration)?.zkConfigPath ?? registration.zkConfigPath;
 }
 
-/** Refuses a contract whose files no longer hash to the pinned generation. No digest on the registration = nothing to verify. */
+/** Refuses a contract whose files no longer hash to the pinned generation. */
 export function assertArtifactGenerationOnDisk(name: string, registration: ContractRegistration): void {
     if (!registration.artifactDigest) return;
     const onDisk = computeArtifactGenerationDigest(registration);
@@ -427,10 +391,8 @@ export function assertArtifactGenerationOnDisk(name: string, registration: Contr
 }
 
 /**
- * Generation-pinned artifact import for both module formats (mirrors contract-registry's
- * loader). ESM is cached per URL, so a `?gen=<digest>` query yields a fresh instance;
- * Node 22 serves a CommonJS module from its cache by filename regardless of the query,
- * so its cache entry is dropped first.
+ * Generation-pinned import. ESM caches per URL (`?gen=` gives a fresh instance); CommonJS
+ * caches by filename regardless of the query, so its require.cache entry is dropped first.
  */
 export async function importArtifactGeneration(artifactPath: string, generation: string): Promise<any> {
     if (!path.isAbsolute(artifactPath)) return import(artifactPath);
@@ -439,14 +401,3 @@ export async function importArtifactGeneration(artifactPath: string, generation:
     if (generation) url.searchParams.set('gen', generation.slice(0, 32));
     return import(url.href);
 }
-
-/**
- * Per-contract constructor arguments for deploys. The AttestationVault
- * constructor takes the registrar identity as a PUBLIC argument (0.16.0):
- * a witness-backed constructor makes the deploy proof heavy enough that,
- * with 13 circuits' verifier keys, the node rejects the deploy tx as
- * exceeding its block cost limits. The worker injects the DEPLOY SESSION's
- * attester id (persistentHash over the same secret the local_secret_key()
- * witness serves), preserving the pre-0.16.0 "registrar = deploy session"
- * semantics exactly.
- */

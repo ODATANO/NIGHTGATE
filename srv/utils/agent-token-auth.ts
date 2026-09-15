@@ -1,40 +1,34 @@
 /**
- * Transport auth for the standalone image (0.17.1): basic auth PLUS an
- * agent-token lane.
- *
- * Plain CAP basic auth 401s every request without credentials BEFORE any
- * service hook runs, so an external agent holding only an `ngat_` grant token
- * could not reach `sponsorFinalizedTransaction` without ALSO being handed the
- * operator's transport password, which defeats per-agent tokens.
- *
- * This middleware keeps basic auth exactly as before and adds ONE narrow
- * exception: a request carrying `x-agent-token` may pass transport auth for
- * the Nightgate service path ONLY, where `enforceAgentGrant` (before('*'))
- * performs the real authentication and authorization: invalid token 401
- * (non-leaking), event outside the grant 403, principal swapped to the
- * grant's operator on success. Every other path keeps requiring basic auth,
- * because only the Nightgate service carries the enforcement hook.
- *
- * The pre-hook principal is deliberately a marker id that owns nothing; no
- * session, grant or document row can belong to it, so even a handler reached
- * without the hook's principal swap (there is none on this path) could not
- * read foreign state through owner scoping.
- *
- * Wired by docker/entrypoint.sh via `auth: { impl: ..., users: {...} }`.
+ * Standalone-image transport auth: basic auth, plus an agent-token lane on the
+ * Nightgate path (the grant hook authenticates) and the optional public verify
+ * lane. Both pass under marker principals that own nothing.
  * SPDX-License-Identifier: Apache-2.0
  */
 
 import crypto from 'node:crypto';
 import cds from '@sap/cds';
-import { AGENT_TOKEN_HEADER, AGENT_TOKEN_TRANSPORT_USER } from './agent-token-transport';
+import { AGENT_TOKEN_HEADER, AGENT_TOKEN_TRANSPORT_USER, PUBLIC_VERIFY_TRANSPORT_USER, PUBLIC_VERIFY_LANE_PREFIX } from './agent-token-transport';
 import { RateLimiter } from './rate-limiter';
+import { configFlag } from './config';
 
 const AGENT_LANE_PREFIX = '/api/v1/nightgate';
 
-// Failed basic-auth attempts per client address. The image has one operator
-// account with a static password, so an unthrottled 401 is an offline-speed
-// guessing oracle. After the budget a client gets 429 for the rest of the
-// window, correct password or not.
+/** Exact segment boundary: the service root, a sub-path or a query on it. */
+function inLaneOf(path: string, prefix: string): boolean {
+    return path === prefix || path.startsWith(prefix + '/') || path.startsWith(prefix + '?');
+}
+
+/** Any-origin CORS, only on the public verify lane. */
+function setPublicVerifyCors(res: any): void {
+    res.set?.('Access-Control-Allow-Origin', '*');
+    res.set?.('Access-Control-Allow-Methods', 'GET, OPTIONS');
+    res.set?.('Access-Control-Allow-Headers', 'accept, content-type');
+    res.set?.('Access-Control-Max-Age', '600');
+}
+
+// Failed basic-auth attempts per client address: one static operator password
+// makes an unthrottled 401 a guessing oracle. Over budget = 429 for the window,
+// correct password or not.
 const BASIC_AUTH_FAILURE_WINDOW_MS = 15 * 60 * 1000;
 const BASIC_AUTH_MAX_FAILURES = 20;
 const basicFailures = new RateLimiter({ windowMs: BASIC_AUTH_FAILURE_WINDOW_MS, maxRequests: BASIC_AUTH_MAX_FAILURES, maxKeys: 10000 });
@@ -83,16 +77,14 @@ function reject401(res: any): void {
 }
 
 /**
- * Express-style CAP custom auth middleware.
- * Users come from `cds.env.requires.auth.users` (entrypoint-injected).
- * `export =`: CAP requires the module and expects THE FUNCTION as
- * module.exports; a default export would land under `.default`.
+ * CAP custom auth middleware; users from `cds.env.requires.auth.users`.
+ * `export =` because CAP expects the function itself as module.exports.
  */
 function agentTokenAuth(req: any, res: any, next: () => void): void {
     const users: Record<string, { password?: string; roles?: string[] }> =
         (cds as any).env?.requires?.auth?.users ?? {};
 
-    // Lane 1: valid basic credentials, the operator. Same behavior as before.
+    // Lane 1: valid basic credentials, the operator.
     const basic = parseBasic(req.headers?.authorization);
     if (basic) {
         const failureKey = clientFailureKey(req);
@@ -101,9 +93,7 @@ function agentTokenAuth(req: any, res: any, next: () => void): void {
         const known = Object.prototype.hasOwnProperty.call(users, basic.user) ? users[basic.user] : undefined;
         if (known && timingSafeEqualStr(basic.password, String(known.password ?? ''))) {
             const UserCtor = (cds as any).User;
-            // Carry the configured roles. Dropping them made `user.is('admin')`
-            // false for everyone, so the whole admin service answered 403 to
-            // the operator the deployment was built around.
+            // Without the roles `user.is('admin')` is false for the operator.
             const roles = Array.isArray(known.roles) ? known.roles : [];
             (req as any).user = UserCtor
                 ? new UserCtor({ id: basic.user, roles })
@@ -115,19 +105,12 @@ function agentTokenAuth(req: any, res: any, next: () => void): void {
         return reject401(res); // wrong credentials never fall through to the token lane
     }
 
-    // Lane 2: agent token, Nightgate service only. The grant hook authenticates.
-    // Exact segment boundary: a bare startsWith would also open the lane for
-    // lookalike prefixes (/api/v1/nightgate-admin, /api/v1/nightgateevil),
-    // widening the boundary beyond the one service that carries the hook.
+    // Lane 2: agent token, Nightgate service only; the grant hook authenticates
+    // (also each $batch part). Exact segment match: a bare startsWith would
+    // open lookalike paths such as /api/v1/nightgate-admin.
     const token = req.headers?.[AGENT_TOKEN_HEADER];
     const path = String(req.baseUrl || req.originalUrl || req.path || '');
-    const inLane = path === AGENT_LANE_PREFIX
-        || path.startsWith(AGENT_LANE_PREFIX + '/')
-        || path.startsWith(AGENT_LANE_PREFIX + '?');
-    // $batch: every part runs as its own request under the envelope's principal
-    // (the marker set below); the grant hook authenticates each part from the
-    // envelope token CAP merges into the part's `req.headers`, and rejects a
-    // part that reaches it under the marker principal without a token.
+    const inLane = inLaneOf(path, AGENT_LANE_PREFIX);
     if (typeof token === 'string' && token.length > 0 && inLane) {
         const UserCtor = (cds as any).User;
         (req as any).user = UserCtor
@@ -136,10 +119,26 @@ function agentTokenAuth(req: any, res: any, next: () => void): void {
         return next();
     }
 
+    // Lane 3: public verify, no credential; the verify service rate-limits by address.
+    if (configFlag('NIGHTGATE_PUBLIC_VERIFY') && inLaneOf(path, PUBLIC_VERIFY_LANE_PREFIX)) {
+        setPublicVerifyCors(res);
+        if (String(req.method).toUpperCase() === 'OPTIONS') {
+            res.status?.(204);
+            res.end?.() ?? res.send?.();
+            return;
+        }
+        const UserCtor = (cds as any).User;
+        (req as any).user = UserCtor
+            ? new UserCtor({ id: PUBLIC_VERIFY_TRANSPORT_USER })
+            : { id: PUBLIC_VERIFY_TRANSPORT_USER };
+        return next();
+    }
+
     return reject401(res);
 }
 
 agentTokenAuth.AGENT_TOKEN_TRANSPORT_USER = AGENT_TOKEN_TRANSPORT_USER;
+agentTokenAuth.PUBLIC_VERIFY_TRANSPORT_USER = PUBLIC_VERIFY_TRANSPORT_USER;
 agentTokenAuth.BASIC_AUTH_FAILURE_WINDOW_MS = BASIC_AUTH_FAILURE_WINDOW_MS;
 agentTokenAuth.BASIC_AUTH_MAX_FAILURES = BASIC_AUTH_MAX_FAILURES;
 agentTokenAuth.__resetBasicAuthThrottleForTests = __resetBasicAuthThrottleForTests;

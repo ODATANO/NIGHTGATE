@@ -1,12 +1,10 @@
 /**
  * srv/utils/session-expiry.ts: the ONE expiry decision.
  *
- * The exception it encodes was learned twice. First on 2026-08-19, when the
- * fee-sponsor pool silently died 24 h after setup and the cleanup sweep wiped
- * its key material. Then again on 2026-08-23, when the rule lived only inside
- * resolveFeeSponsor while eight other sites carried a bare `expiresAt < now`:
- * sponsoring worked, every ordinary read of the same session answered 410, and
- * a new status endpoint reported the entire live pool as expired.
+ * The exception it encodes: a configured platform sponsor never expires, and
+ * every site that checks expiry must go through this function. A bare
+ * `expiresAt < now` elsewhere would let the cleanup sweep wipe the pool's key
+ * material and ordinary reads answer 410 for a session that still sponsors.
  */
 
 vi.mock('@sap/cds', () => {

@@ -1,67 +1,43 @@
 /**
- * Crawler-free predicate-result reader. The AttestationVault records a proven
- * claim as a (true) entry in its per-kind result Map, keyed by the
- * persistentHash of the claim struct (e.g. FieldPredicateClaim{payload_hash,
- * field_key, threshold, op, epoch}; EVERY claim kind embeds the payload's
- * CURRENT attestation epoch from `attestation_seqs`, cross-root kinds both
- * documents' epochs). Knowing the public claim coordinates lets a
- * consumer recompute the claim key off-chain and confirm the proof landed
- * without the proof tx being indexed locally (no crawler, no txHash).
- *
- * The recompute uses `@midnight-ntwrk/compact-runtime`'s `persistentHash` +
- * CompactType constructors to reproduce the exact bytes the compiled circuit
- * emits. Validated against a live-emitted key in
- * test/integration/attestation-vault.test.ts.
- *
- * Read/decode logic is dependency-injected (`ledger`, `queryContractState`,
- * `computeClaimKey`) to unit-test without the ESM-only SDK;
- * `readPredicateStateForContract` wires the real runtime + providers.
+ * Crawler-free claim reader: recomputes claim keys (persistentHash of a tagged
+ * struct embedding record key, anchored root and schema) byte-identical to the
+ * circuit, so a claim resolves only while its anchor stands.
  */
 import { hexToBytes } from '../utils/hex';
 import { importArtifactByPath } from './contract-registry';
 
-interface ResultMap { member(key: Uint8Array): boolean; lookup(key: Uint8Array): boolean }
+/** Type tags of the persistentHash structs (first struct member). */
+export const CLAIM_TAG = {
+    fieldPredicate: 16n,
+    fieldEquality: 17n,
+    fieldMembership: 18n,
+    documentIntegrity: 19n,
+    documentDiff: 20n,
+    recordKey: 21n
+} as const;
 
-/** Minimal shape of the compiled artifact's `ledger(state)` return we rely on. */
 export interface PredicateLedger {
-    field_predicate_results: ResultMap;
-    field_equality_results: ResultMap;
-    field_membership_results: ResultMap;
-    document_integrity_results: ResultMap;
-    document_diff_results: ResultMap;
-    /**
-     * payload_hash -> attestation epoch (0.16.0). Claim keys embed the epoch
-     * at proving time; verifiers MUST recompute with the CURRENT epoch, so
-     * claims recorded during a front-runner's ownership window stop
-     * verifying after a guarded-attest takeover moved the epoch.
-     */
-    attestation_seqs: { member(key: Uint8Array): boolean; lookup(key: Uint8Array): bigint };
+    /** claim_key -> valid_until (block time, seconds). */
+    claims: { member(key: Uint8Array): boolean; lookup(key: Uint8Array): bigint };
+    /** record_key -> { root, schema }. Claim keys embed `root`. */
+    content_anchors: { member(key: Uint8Array): boolean; lookup(key: Uint8Array): { root: Uint8Array; schema: Uint8Array } };
 }
 
-/**
- * Which on-chain result map a claim key lives in. The commitment-only
- * 'plain' kind was removed in 0.16.0 with commitValue/provePredicate.
- */
+/** Claim kinds; all kinds share the `claims` map, separated by their tag. */
 export type PredicateResultKind = 'field' | 'equality' | 'membership' | 'integrity' | 'diff';
 
 export interface ReadPredicateResultDeps {
     contractAddress: string;
-    /** 64-hex claim key (already recomputed). */
     claimKey: string;
-    /** Result map selector; defaults to the field-bound numeric map. */
+    /** Informational; every kind lives in the same map. */
     kind?: PredicateResultKind;
-    /** Decoder from the compiled artifact (`ledger`). */
     ledger: (state: any) => PredicateLedger;
-    /** publicDataProvider.queryContractState; returns ContractState | null. */
     queryContractState: (contractAddress: string) => Promise<any | null>;
+    /** A claim whose `valid_until` is not after this is absent. */
+    nowSeconds?: number;
 }
 
-/**
- * Check whether a recorded (true) predicate result exists on-chain for
- * `claimKey`. Returns `null` when no contract state is available (unknown
- * contract / no live provider), so callers can keep a clean negative instead of
- * a 5xx.
- */
+/** Whether an unexpired claim exists; null without contract state (clean negative, no 5xx). */
 export async function readPredicateResult(
     deps: ReadPredicateResultDeps
 ): Promise<boolean | null> {
@@ -69,154 +45,100 @@ export async function readPredicateResult(
     if (!state) return null;
 
     const led = deps.ledger(state.data ?? state);
-    const kind = deps.kind ?? 'field';
-    const map = kind === 'equality' ? led.field_equality_results
-        : kind === 'membership' ? led.field_membership_results
-        : kind === 'integrity' ? led.document_integrity_results
-        : kind === 'diff' ? led.document_diff_results
-        : led.field_predicate_results;
     const key = hexToBytes(deps.claimKey);
-    // A predicate is proven iff the map holds a (true) entry for the claim key.
-    return map.member(key) && map.lookup(key) === true;
+    if (!led.claims.member(key)) return false;
+    const now = BigInt(Math.floor(deps.nowSeconds ?? Date.now() / 1000));
+    return led.claims.lookup(key) > now;
 }
 
-/**
- * Recompute the `FieldPredicateClaim` key
- * (artifact `_descriptor_15` as of 0.16.0): Bytes<32> ++ Bytes<32> ++
- * Uint<64> ++ Uint<8> ++ Uint<64> (payload_hash, field_key, threshold, op,
- * epoch).
- */
+async function runtime(): Promise<any> {
+    return import('@midnight-ntwrk/compact-runtime');
+}
+
+/** A struct type descriptor over ordered members, as the circuit hashes it. */
+function structType(members: Array<[string, any]>) {
+    return {
+        alignment() {
+            return members.map(([, t]) => t.alignment()).reduce((acc, a) => acc.concat(a));
+        },
+        toValue(v: any) {
+            return members.map(([name, t]) => t.toValue(v[name])).reduce((acc, a) => acc.concat(a));
+        }
+    };
+}
+
+async function hashStruct(members: Array<[string, any]>, value: Record<string, unknown>): Promise<string> {
+    const rt = await runtime();
+    const digest: Uint8Array = rt.persistentHash(structType(members), value);
+    return Buffer.from(digest).toString('hex');
+}
+
+async function scalarTypes() {
+    const rt = await runtime();
+    return {
+        bytes32: new rt.CompactTypeBytes(32),
+        u64: new rt.CompactTypeUnsignedInteger(18446744073709551615n, 8),
+        u8: new rt.CompactTypeUnsignedInteger(255n, 1),
+        rt
+    };
+}
+
+/** persistentHash(AttestRecordKey{tag, owner, payload_hash}), as the `recordKey` pure circuit. */
+export async function computeRecordKey(attesterId: string, payloadHash: string): Promise<string> {
+    const { bytes32, u8 } = await scalarTypes();
+    return hashStruct(
+        [['tag', u8], ['owner', bytes32], ['payload_hash', bytes32]],
+        { tag: CLAIM_TAG.recordKey, owner: hexToBytes(attesterId), payload_hash: hexToBytes(payloadHash) }
+    );
+}
+
+/** `FieldPredicateClaim`: u8 tag, 4 x Bytes<32>, Uint<64> threshold, u8 op. */
 export async function computeFieldPredicateClaimKey(
-    payloadHash: string,
+    recordKey: string,
+    contentRoot: string,
+    schemaId: string,
     fieldKey: string,
     threshold: bigint,
-    op: number,
-    epoch: bigint
+    op: number
 ): Promise<string> {
-    const rt: any = await import('@midnight-ntwrk/compact-runtime');
-    const dBytes32 = new rt.CompactTypeBytes(32);
-    const dU64 = new rt.CompactTypeUnsignedInteger(18446744073709551615n, 8);
-    const dU8 = new rt.CompactTypeUnsignedInteger(255n, 1);
-    const fieldClaimType = {
-        alignment() {
-            return dBytes32.alignment()
-                .concat(dBytes32.alignment().concat(dU64.alignment().concat(dU8.alignment().concat(dU64.alignment()))));
-        },
-        toValue(v: any) {
-            return dBytes32.toValue(v.payload_hash)
-                .concat(dBytes32.toValue(v.field_key)
-                    .concat(dU64.toValue(v.threshold).concat(dU8.toValue(v.op).concat(dU64.toValue(v.epoch)))));
-        }
-    };
-    const digest: Uint8Array = rt.persistentHash(fieldClaimType, {
-        payload_hash: hexToBytes(payloadHash),
-        field_key: hexToBytes(fieldKey),
-        threshold,
-        op: BigInt(op),
-        epoch
-    });
-    return Buffer.from(digest).toString('hex');
+    const { bytes32, u64, u8 } = await scalarTypes();
+    return hashStruct(
+        [['tag', u8], ['record_key', bytes32], ['content_root', bytes32], ['schema_id', bytes32], ['field_key', bytes32], ['threshold', u64], ['op', u8]],
+        { tag: CLAIM_TAG.fieldPredicate, record_key: hexToBytes(recordKey), content_root: hexToBytes(contentRoot), schema_id: hexToBytes(schemaId), field_key: hexToBytes(fieldKey), threshold, op: BigInt(op) }
+    );
 }
 
-/**
- * Bytes-equality counterpart: recompute the `FieldEqualityClaim` key,
- * Bytes<32> ++ Bytes<32> ++ Bytes<32> ++ Uint<64> (payload_hash, field_key, expected, epoch).
- */
-/**
- * Off-chain recompute of the guarded-attest commitment:
- * persistentHash(AttestCommitPreimage{payload_hash, metadata_hash, nonce}),
- * byte-identical to attestGuarded's in-circuit recompute (parity pinned in
- * test/integration/attestation-vault.test.ts).
- */
-export async function computeAttestCommitment(
-    payloadHash: string,
-    metadataHash: string,
-    nonce: string
-): Promise<string> {
-    const rt: any = await import('@midnight-ntwrk/compact-runtime');
-    const dBytes32 = new rt.CompactTypeBytes(32);
-    const commitType = {
-        alignment() {
-            return dBytes32.alignment().concat(dBytes32.alignment().concat(dBytes32.alignment()));
-        },
-        toValue(v: any) {
-            return dBytes32.toValue(v.payload_hash)
-                .concat(dBytes32.toValue(v.metadata_hash).concat(dBytes32.toValue(v.nonce)));
-        }
-    };
-    const digest: Uint8Array = rt.persistentHash(commitType, {
-        payload_hash: hexToBytes(payloadHash),
-        metadata_hash: hexToBytes(metadataHash),
-        nonce: hexToBytes(nonce)
-    });
-    return Buffer.from(digest).toString('hex');
-}
-
+/** `FieldEqualityClaim`: u8 tag, 5 x Bytes<32>. */
 export async function computeFieldEqualityClaimKey(
-    payloadHash: string,
+    recordKey: string,
+    contentRoot: string,
+    schemaId: string,
     fieldKey: string,
-    expectedDigest: string,
-    epoch: bigint
+    expectedDigest: string
 ): Promise<string> {
-    const rt: any = await import('@midnight-ntwrk/compact-runtime');
-    const dBytes32 = new rt.CompactTypeBytes(32);
-    const dU64 = new rt.CompactTypeUnsignedInteger(18446744073709551615n, 8);
-    const equalityClaimType = {
-        alignment() {
-            return dBytes32.alignment().concat(dBytes32.alignment().concat(dBytes32.alignment().concat(dU64.alignment())));
-        },
-        toValue(v: any) {
-            return dBytes32.toValue(v.payload_hash)
-                .concat(dBytes32.toValue(v.field_key).concat(dBytes32.toValue(v.expected).concat(dU64.toValue(v.epoch))));
-        }
-    };
-    const digest: Uint8Array = rt.persistentHash(equalityClaimType, {
-        payload_hash: hexToBytes(payloadHash),
-        field_key: hexToBytes(fieldKey),
-        expected: hexToBytes(expectedDigest),
-        epoch
-    });
-    return Buffer.from(digest).toString('hex');
+    const { bytes32, u8 } = await scalarTypes();
+    return hashStruct(
+        [['tag', u8], ['record_key', bytes32], ['content_root', bytes32], ['schema_id', bytes32], ['field_key', bytes32], ['expected', bytes32]],
+        { tag: CLAIM_TAG.fieldEquality, record_key: hexToBytes(recordKey), content_root: hexToBytes(contentRoot), schema_id: hexToBytes(schemaId), field_key: hexToBytes(fieldKey), expected: hexToBytes(expectedDigest) }
+    );
 }
 
-/**
- * Set-membership counterpart: recompute the `FieldMembershipClaim` key,
- * Bytes<32> ++ Bytes<32> ++ Bytes<32> ++ Uint<64> (payload_hash, field_key, set_root, epoch).
- */
+/** `FieldMembershipClaim`: u8 tag, 5 x Bytes<32>. */
 export async function computeFieldMembershipClaimKey(
-    payloadHash: string,
+    recordKey: string,
+    contentRoot: string,
+    schemaId: string,
     fieldKey: string,
-    setRoot: string,
-    epoch: bigint
+    setRoot: string
 ): Promise<string> {
-    const rt: any = await import('@midnight-ntwrk/compact-runtime');
-    const dBytes32 = new rt.CompactTypeBytes(32);
-    const dU64 = new rt.CompactTypeUnsignedInteger(18446744073709551615n, 8);
-    const membershipClaimType = {
-        alignment() {
-            return dBytes32.alignment().concat(dBytes32.alignment().concat(dBytes32.alignment().concat(dU64.alignment())));
-        },
-        toValue(v: any) {
-            return dBytes32.toValue(v.payload_hash)
-                .concat(dBytes32.toValue(v.field_key).concat(dBytes32.toValue(v.set_root).concat(dU64.toValue(v.epoch))));
-        }
-    };
-    const digest: Uint8Array = rt.persistentHash(membershipClaimType, {
-        payload_hash: hexToBytes(payloadHash),
-        field_key: hexToBytes(fieldKey),
-        set_root: hexToBytes(setRoot),
-        epoch
-    });
-    return Buffer.from(digest).toString('hex');
+    const { bytes32, u8 } = await scalarTypes();
+    return hashStruct(
+        [['tag', u8], ['record_key', bytes32], ['content_root', bytes32], ['schema_id', bytes32], ['field_key', bytes32], ['set_root', bytes32]],
+        { tag: CLAIM_TAG.fieldMembership, record_key: hexToBytes(recordKey), content_root: hexToBytes(contentRoot), schema_id: hexToBytes(schemaId), field_key: hexToBytes(fieldKey), set_root: hexToBytes(setRoot) }
+    );
 }
 
-/**
- * Expand a packed allowed mask (bit i = slot i may differ) into the boolean
- * vector the circuit takes. `width` is the artifact's slot count (16 for the
- * classic vault, 32 for `attestation-vault-32`); the mask must fit in it.
- * Exported for the handlers and tests. JS bitwise operators are exact for
- * bits 0..31, so widths up to 32 are safe on a Number mask.
- */
+/** Bit i = slot i may differ. JS bitwise ops are exact to bit 31, so width <= 32. */
 export function expandAllowedMask(mask: number, width: number = 16): boolean[] {
     const maxMask = width === 32 ? 0xffffffff : (1 << width) - 1;
     if (!Number.isInteger(mask) || mask < 0 || mask > maxMask) {
@@ -225,117 +147,94 @@ export function expandAllowedMask(mask: number, width: number = 16): boolean[] {
     return Array.from({ length: width }, (_, i) => (mask & (1 << i)) !== 0);
 }
 
-/**
- * Cross-root integrity counterpart: recompute the `DocumentIntegrityClaim`
- * key (artifact `_descriptor_14` as of 0.16.0), Bytes<32> ++ Bytes<32> ++
- * Vector<16, Boolean> ++ Uint<64> ++ Uint<64> (the allowed mask travels as a
- * boolean vector, Compact has no bitwise ops; epoch_a/epoch_b are both
- * documents' attestation epochs).
- */
+/** `DocumentIntegrityClaim`: u8 tag, 5 x Bytes<32>, Vector<width, Boolean> (width is part of the key). */
 export async function computeDocumentIntegrityClaimKey(
-    payloadHashA: string,
-    payloadHashB: string,
+    recordKeyA: string,
+    contentRootA: string,
+    recordKeyB: string,
+    contentRootB: string,
+    schemaId: string,
     allowedMask: number,
-    epochA: bigint,
-    epochB: bigint,
     width: number = 16
 ): Promise<string> {
-    const rt: any = await import('@midnight-ntwrk/compact-runtime');
-    const dBytes32 = new rt.CompactTypeBytes(32);
-    const dU64 = new rt.CompactTypeUnsignedInteger(18446744073709551615n, 8);
-    // The mask member's width is part of the claim identity: a 32-slot
-    // artifact's DocumentIntegrityClaim hashes a Vector<32, Boolean>.
-    const dMask = new rt.CompactTypeVector(width, rt.CompactTypeBoolean);
-    const integrityClaimType = {
-        alignment() {
-            return dBytes32.alignment().concat(dBytes32.alignment().concat(dMask.alignment().concat(dU64.alignment().concat(dU64.alignment()))));
-        },
-        toValue(v: any) {
-            return dBytes32.toValue(v.payload_hash_a)
-                .concat(dBytes32.toValue(v.payload_hash_b).concat(dMask.toValue(v.allowed_mask).concat(dU64.toValue(v.epoch_a).concat(dU64.toValue(v.epoch_b)))));
+    const { bytes32, u8, rt } = await scalarTypes();
+    const mask = new rt.CompactTypeVector(width, rt.CompactTypeBoolean);
+    return hashStruct(
+        [['tag', u8], ['record_key_a', bytes32], ['content_root_a', bytes32], ['record_key_b', bytes32], ['content_root_b', bytes32], ['schema_id', bytes32], ['allowed_mask', mask]],
+        {
+            tag: CLAIM_TAG.documentIntegrity,
+            record_key_a: hexToBytes(recordKeyA), content_root_a: hexToBytes(contentRootA),
+            record_key_b: hexToBytes(recordKeyB), content_root_b: hexToBytes(contentRootB),
+            schema_id: hexToBytes(schemaId),
+            allowed_mask: expandAllowedMask(allowedMask, width)
         }
-    };
-    const digest: Uint8Array = rt.persistentHash(integrityClaimType, {
-        payload_hash_a: hexToBytes(payloadHashA),
-        payload_hash_b: hexToBytes(payloadHashB),
-        allowed_mask: expandAllowedMask(allowedMask, width),
-        epoch_a: epochA,
-        epoch_b: epochB
-    });
-    return Buffer.from(digest).toString('hex');
+    );
 }
 
-/**
- * Cross-root distinctness counterpart: recompute the `DocumentDiffClaim`
- * key (artifact `_descriptor_12` as of 0.16.0), Bytes<32> ++ Bytes<32> ++
- * Uint<8> ++ Uint<64> ++ Uint<64> (k, epoch_a, epoch_b).
- */
+/** `DocumentDiffClaim`: u8 tag, 5 x Bytes<32>, u8 k. */
 export async function computeDocumentDiffClaimKey(
-    payloadHashA: string,
-    payloadHashB: string,
-    k: number,
-    epochA: bigint,
-    epochB: bigint
+    recordKeyA: string,
+    contentRootA: string,
+    recordKeyB: string,
+    contentRootB: string,
+    schemaId: string,
+    k: number
 ): Promise<string> {
-    const rt: any = await import('@midnight-ntwrk/compact-runtime');
-    const dBytes32 = new rt.CompactTypeBytes(32);
-    const dU8 = new rt.CompactTypeUnsignedInteger(255n, 1);
-    const dU64 = new rt.CompactTypeUnsignedInteger(18446744073709551615n, 8);
-    const diffClaimType = {
-        alignment() {
-            return dBytes32.alignment().concat(dBytes32.alignment().concat(dU8.alignment().concat(dU64.alignment().concat(dU64.alignment()))));
-        },
-        toValue(v: any) {
-            return dBytes32.toValue(v.payload_hash_a)
-                .concat(dBytes32.toValue(v.payload_hash_b).concat(dU8.toValue(v.k).concat(dU64.toValue(v.epoch_a).concat(dU64.toValue(v.epoch_b)))));
+    const { bytes32, u8 } = await scalarTypes();
+    return hashStruct(
+        [['tag', u8], ['record_key_a', bytes32], ['content_root_a', bytes32], ['record_key_b', bytes32], ['content_root_b', bytes32], ['schema_id', bytes32], ['k', u8]],
+        {
+            tag: CLAIM_TAG.documentDiff,
+            record_key_a: hexToBytes(recordKeyA), content_root_a: hexToBytes(contentRootA),
+            record_key_b: hexToBytes(recordKeyB), content_root_b: hexToBytes(contentRootB),
+            schema_id: hexToBytes(schemaId),
+            k: BigInt(k)
         }
-    };
-    const digest: Uint8Array = rt.persistentHash(diffClaimType, {
-        payload_hash_a: hexToBytes(payloadHashA),
-        payload_hash_b: hexToBytes(payloadHashB),
-        k: BigInt(k),
-        epoch_a: epochA,
-        epoch_b: epochB
-    });
-    return Buffer.from(digest).toString('hex');
+    );
+}
+
+export function anchorOf(led: PredicateLedger, recordKey: string): { root: string; schema: string } | null {
+    const key = hexToBytes(recordKey);
+    if (!led.content_anchors.member(key)) return null;
+    const a = led.content_anchors.lookup(key);
+    return { root: Buffer.from(a.root).toString('hex'), schema: Buffer.from(a.schema).toString('hex') };
+}
+
+export function anchoredRootOf(led: PredicateLedger, recordKey: string): string | null {
+    return anchorOf(led, recordKey)?.root ?? null;
 }
 
 export interface ReadPredicateStateForContractArgs {
     contractAddress: string;
+    /** The attester whose record of `payloadHash` carries the claim. */
+    attesterId: string;
     payloadHash: string;
-    /** Required for the numeric predicates; ignored for the bytes kinds. */
+    /** Numeric predicates only. */
     threshold?: bigint;
     op?: number;
-    /** The bound field. Required for the numeric and bytes kinds. */
+    /** Required for the numeric and bytes kinds. */
     fieldKey?: string;
-    /** Bytes-equality claim: verify against `field_equality_results`. */
     expectedDigest?: string;
-    /** Set-membership claim: verify against `field_membership_results`. */
     setRoot?: string;
-    /** Cross-root claims: the second document's payload hash. */
+    /** Cross-root claims: document B. */
     payloadHashB?: string;
-    /** Document-integrity claim: packed allowed mask (with payloadHashB), width bits. */
+    /** Defaults to `attesterId`. */
+    attesterIdB?: string;
+    /** Integrity claim (with payloadHashB). */
     allowedMask?: number;
-    /** Document-diff claim: minimum differing slot count (with payloadHashB). */
+    /** Diff claim (with payloadHashB). */
     k?: number;
-    /**
-     * Content-tree width of the artifact (16 default, 32 for
-     * `attestation-vault-32`). Only the integrity claim key depends on it
-     * (its mask member is a Vector<width, Boolean>).
-     */
+    /** Default 16; only the integrity claim key depends on it. */
     slotWidth?: number;
-    /** Path to the compiled contract artifact (`.../contract/index.js`). */
     artifactPath: string;
-    /** Config for the contract-only provider bundle (no wallet needed to read). */
     contractProvidersConfig: import('../midnight/providers').ContractProvidersConfig;
-    /** Injectable field claim-key recompute (defaults to the real one). */
     computeFieldClaimKey?: typeof computeFieldPredicateClaimKey;
+    nowSeconds?: number;
 }
 
 /**
- * Production wrapper: recompute the claim key, build a contract-only provider
- * bundle, load the artifact's `ledger`, and read the predicate result.
- * Dynamic import keeps the ESM-only SDK out of CJS load.
+ * Recompute the claim key from the record's current anchor(s) and read it. A
+ * claim made under a former anchor misses the map by construction.
  */
 export async function readPredicateStateForContract(
     args: ReadPredicateStateForContractArgs
@@ -344,22 +243,13 @@ export async function readPredicateStateForContract(
     const bundle = await buildContractProviders(args.contractProvidersConfig);
     const artifact: any = await importArtifactByPath(args.artifactPath);
 
-    // Query the state FIRST: claim keys embed the payload's CURRENT
-    // attestation epoch (0.16.0), so the recompute needs the live ledger. A
-    // payload without an epoch cannot carry a verifiable claim (clean
-    // negative); a stale-epoch claim (recorded during a front-runner's
-    // ownership window, then reclaimed via guarded attest) misses the map by
-    // construction.
     const state = await bundle.publicDataProvider.queryContractState(args.contractAddress.toLowerCase());
     if (!state) return null;
     const led = artifact.ledger(state.data ?? state) as PredicateLedger;
 
-    const epochOf = (payloadHex: string): bigint | null => {
-        const key = hexToBytes(payloadHex);
-        return led.attestation_seqs.member(key) ? led.attestation_seqs.lookup(key) : null;
-    };
-    const epochA = epochOf(args.payloadHash);
-    if (epochA === null) return false;
+    const recordKeyA = await computeRecordKey(args.attesterId, args.payloadHash);
+    const anchorA = anchorOf(led, recordKeyA);
+    if (anchorA === null) return false;
 
     const kind: PredicateResultKind = args.payloadHashB
         ? (args.allowedMask !== undefined ? 'integrity' : 'diff')
@@ -368,27 +258,30 @@ export async function readPredicateStateForContract(
         : 'field';
     let claimKey: string;
     if (kind === 'integrity' || kind === 'diff') {
-        const epochB = epochOf(args.payloadHashB!);
-        if (epochB === null) return false;
+        const recordKeyB = await computeRecordKey(args.attesterIdB ?? args.attesterId, args.payloadHashB!);
+        const anchorB = anchorOf(led, recordKeyB);
+        if (anchorB === null) return false;
+        // A comparison holds only under one shared schema.
+        if (anchorA.schema !== anchorB.schema) return false;
         if (kind === 'integrity') {
-            claimKey = await computeDocumentIntegrityClaimKey(args.payloadHash, args.payloadHashB!, args.allowedMask!, epochA, epochB, args.slotWidth ?? 16);
+            claimKey = await computeDocumentIntegrityClaimKey(recordKeyA, anchorA.root, recordKeyB, anchorB.root, anchorA.schema, args.allowedMask!, args.slotWidth ?? 16);
         } else {
             if (args.k === undefined) throw new Error('k is required for a document-diff claim');
-            claimKey = await computeDocumentDiffClaimKey(args.payloadHash, args.payloadHashB!, args.k, epochA, epochB);
+            claimKey = await computeDocumentDiffClaimKey(recordKeyA, anchorA.root, recordKeyB, anchorB.root, anchorA.schema, args.k);
         }
     } else if (kind === 'equality') {
         if (!args.fieldKey) throw new Error('fieldKey is required for a bytes-equality claim');
-        claimKey = await computeFieldEqualityClaimKey(args.payloadHash, args.fieldKey, args.expectedDigest!, epochA);
+        claimKey = await computeFieldEqualityClaimKey(recordKeyA, anchorA.root, anchorA.schema, args.fieldKey, args.expectedDigest!);
     } else if (kind === 'membership') {
         if (!args.fieldKey) throw new Error('fieldKey is required for a set-membership claim');
-        claimKey = await computeFieldMembershipClaimKey(args.payloadHash, args.fieldKey, args.setRoot!, epochA);
+        claimKey = await computeFieldMembershipClaimKey(recordKeyA, anchorA.root, anchorA.schema, args.fieldKey, args.setRoot!);
     } else {
         if (args.threshold === undefined || args.op === undefined) {
             throw new Error('threshold and op are required for a numeric predicate claim');
         }
         if (!args.fieldKey) throw new Error('fieldKey is required for a numeric predicate claim');
         claimKey = await (args.computeFieldClaimKey ?? computeFieldPredicateClaimKey)(
-            args.payloadHash, args.fieldKey, args.threshold, args.op, epochA);
+            recordKeyA, anchorA.root, anchorA.schema, args.fieldKey, args.threshold, args.op);
     }
 
     return readPredicateResult({
@@ -396,6 +289,7 @@ export async function readPredicateStateForContract(
         claimKey,
         kind,
         ledger: artifact.ledger,
-        queryContractState: async () => state
+        queryContractState: async () => state,
+        nowSeconds: args.nowSeconds
     });
 }

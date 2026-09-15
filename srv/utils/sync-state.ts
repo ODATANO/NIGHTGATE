@@ -1,10 +1,3 @@
-/**
- * Shared SyncState singleton initializer.
- *
- * Used by both the Crawler and NightgateIndexerService to ensure the
- * SyncState row exists before any reads/writes.
- */
-
 import cds from '@sap/cds';
 const { SELECT, INSERT, UPDATE } = cds.ql;
 
@@ -13,12 +6,7 @@ import { getConfiguredNightgateNodeUrl, resolveNightgateRuntimeConfig, getNightg
 import { redactUrlCredentials } from './redact-url';
 import { configString } from './config';
 
-/**
- * Thrown when the database's SyncState row belongs to a DIFFERENT network
- * than the configured one. Fail-closed: reusing a database across networks
- * would mix chain-indexed rows (blocks, transactions, verification evidence)
- * of different chains.
- */
+/** The database is bound to another network than the configured one. */
 export class SyncStateNetworkMismatchError extends Error {
     constructor(public readonly storedNetwork: string, public readonly configuredNetwork: string) {
         super(
@@ -38,17 +26,13 @@ export async function ensureSyncStateSingleton(db: cds.DatabaseService, nodeUrl?
     );
 
     if (existing) {
-        // NETWORK GUARD: an existing index is bound to its network.
         const nightgateConfig = getNightgatePluginConfig();
         const { network } = resolveNightgateRuntimeConfig(nightgateConfig);
         if (existing.networkId && existing.networkId !== network) {
             throw new SyncStateNetworkMismatchError(existing.networkId, network);
         }
-        // Legacy rows without a networkId must not stay an open bypass: a
-        // demonstrably EMPTY index (no indexed blocks) is bound to the
-        // configured network in place; a populated one is fail-closed unless
-        // the operator explicitly confirms the binding by setting
-        // NIGHTGATE_ASSUME_DB_NETWORK to the configured network.
+        // No networkId: bind an empty index in place; a populated one needs
+        // NIGHTGATE_ASSUME_DB_NETWORK, else a missing binding would be a bypass.
         if (!existing.networkId) {
             const anyBlock = await db.run(SELECT.one.from(Blocks));
             const assumed = configString('NIGHTGATE_ASSUME_DB_NETWORK');
@@ -63,8 +47,7 @@ export async function ensureSyncStateSingleton(db: cds.DatabaseService, nodeUrl?
             }
             await db.run(UPDATE.entity(SyncState).set({ networkId: network }).where({ ID: 'SINGLETON' }));
         }
-        // Backfill: rows persisted before 0.16.0 may carry URL-embedded
-        // credentials; strip them in place (SyncState is OData-readable).
+        // SyncState is OData-readable: strip URL credentials from existing rows.
         const redacted = redactUrlCredentials(existing.nodeUrl);
         if (existing.nodeUrl && redacted !== existing.nodeUrl) {
             await db.run(UPDATE.entity(SyncState).set({ nodeUrl: redacted }).where({ ID: 'SINGLETON' }));
@@ -82,15 +65,13 @@ export async function ensureSyncStateSingleton(db: cds.DatabaseService, nodeUrl?
                 networkId: network,
                 lastIndexedHeight: 0,
                 syncStatus: 'stopped',
-                // SyncState is OData-readable; never persist embedded
-                // credentials (userinfo / API-key query params).
+                // OData-readable: never persist URL credentials.
                 nodeUrl: redactUrlCredentials(nodeUrl || configuredNodeUrl || ''),
                 chainHeight: 0,
                 consecutiveErrors: 0
             }));
         } catch (err: any) {
-            // Race condition: another service instance inserted first, safe to ignore
-            // SQLite: "UNIQUE constraint failed"; PostgreSQL: "duplicate key value violates unique constraint".
+            // Another caller inserted first (SQLite / PostgreSQL wording).
             if (!/unique constraint|duplicate key/i.test(String(err.message ?? ''))) throw err;
         }
     }

@@ -1,7 +1,7 @@
 // PostgreSQL integration lane: the plugin's database paths against a REAL
-// PostgreSQL, the dialect the hosted deployment and the standalone image run
-// on. Everything else in the suite runs on SQLite, which never exercised the
-// BYTEA write path, the index DDL or the SQLSTATE-based retry classifier.
+// PostgreSQL, the dialect the standalone image runs on. Everything else in
+// the suite runs on SQLite, which never exercises the BYTEA write path, the
+// index DDL or the SQLSTATE-based retry classifier.
 //
 // Proves:
 //   1. the CDS model deploys on the postgres dialect (`cds.deploy`, the same

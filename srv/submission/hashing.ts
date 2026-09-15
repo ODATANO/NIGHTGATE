@@ -25,8 +25,8 @@ export function fromHex32(hex: string): Uint8Array {
  * Canonical empty-slot field key: "nightgate/empty-leaf/v2" ASCII,
  * zero-padded to 32 bytes. MUST stay byte-identical to the contract's
  * `emptyLeafKey()` pure circuit (Compact `pad(32, ...)` right-pads); a unit
- * test pins the parity. v2 replaced the v1 blake2b-digest key in 0.16.0
- * because a Compact literal cannot express an arbitrary digest.
+ * test pins the parity. An ASCII label rather than a digest because a
+ * Compact literal cannot express an arbitrary digest.
  */
 export const EMPTY_LEAF_KEY_LABEL = 'nightgate/empty-leaf/v2';
 

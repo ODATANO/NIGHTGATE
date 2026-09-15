@@ -40,7 +40,7 @@ describe('crawler lifecycle wrapper', () => {
         expect(mockDisconnect).toHaveBeenCalledTimes(1);
     });
 
-    it('retains existing success behavior for start/stop', async () => {
+    it('starts, then stops the crawler and disconnects the provider', async () => {
         mockStart.mockResolvedValueOnce(undefined);
         mockStop.mockResolvedValueOnce(undefined);
 

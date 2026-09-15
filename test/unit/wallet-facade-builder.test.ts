@@ -1,8 +1,8 @@
 /**
  * Tests for srv/submission/wallet-facade-builder.ts.
  *
- * The builder is now a thin glue layer over the wallet worker (Phase 1
- * post-migration). We mock the worker RPC and the sync-state store so we can
+ * The builder is a thin glue layer over the wallet worker. We mock the
+ * worker RPC and the sync-state store so we can
  * exercise the restore-blob load, init-args forwarding, eviction, and the
  * state-save sink without touching the real SDK or DB.
  */
@@ -70,9 +70,9 @@ describe('wallet-facade-builder', () => {
     describe('worker lifecycle', () => {
         it('drops every registration when the worker is gone (no phantom facades)', async () => {
             // A facade lives INSIDE the worker, so a crash or a stop takes all
-            // of them. Keeping the registrations made `facadeCount` count
-            // wallets a respawned, empty worker does not hold, and let the
-            // sponsor-status cold guard treat them as warm.
+            // of them. Keeping the registrations would make `facadeCount`
+            // count wallets a respawned, empty worker does not hold, and let
+            // the sponsor-status cold guard treat them as warm.
             const logSpy = vi.spyOn(cds.log('nightgate:facade'), 'info').mockImplementation(() => {});
             try {
                 await getOrBuildWalletFacade('cache-key-gone-1111', baseArgs);
@@ -99,10 +99,10 @@ describe('wallet-facade-builder', () => {
         it('keeps persistence material so a save already in flight can still be written', async () => {
             // The worker delivers `state-save` events before it dies, and they
             // can be queued behind a slower DB write. Dropping the passphrase
-            // together with the residency made the sink fail to resolve a
-            // session and discard the snapshot, and a dead worker cannot
-            // resend it: the next start restored an older blob and cold-synced
-            // the gap.
+            // together with the residency would make the sink fail to resolve
+            // a session and discard the snapshot, and a dead worker cannot
+            // resend it: the next start would restore an older blob and
+            // cold-sync the gap.
             const logSpy = vi.spyOn(cds.log('nightgate:facade'), 'info').mockImplementation(() => {});
             try {
                 await getOrBuildWalletFacade('cache-key-inflight', baseArgs);

@@ -1,6 +1,6 @@
-// Width-variant coverage (0.19, attestation-vault-32): the slotWidth
+// Width-variant coverage (attestation-vault-32): the slotWidth
 // registration attribute and every width-parameterized layer, with the
-// 16-slot DEFAULTS pinned byte-identical (NIGHTPASS compatibility).
+// 16-slot DEFAULTS pinned byte-identical.
 import { describe, test, expect, afterEach } from 'vitest';
 import { createHash } from 'node:crypto';
 import {
@@ -40,7 +40,7 @@ describe('contract-registry slotWidth', () => {
         expect(slotWidthOf(getContractRegistration(WIDE))).toBe(32);
     });
 
-    // 64 measured but NOT shipped: the mask path is 32-bit JS bitwise
+    // 64 is NOT supported: the mask path is 32-bit JS bitwise
     // ((1 << 64) wraps to an allowed range of 0..0) and a full unsigned
     // 64-bit mask survives neither Number nor a signed Integer64 column.
     test.each([0, 3, 8, 15, 17, 64, 128, -16])('rejects invalid width %d', (w) => {
@@ -205,7 +205,7 @@ describe('browser witness/call helpers width', () => {
         const opening32 = { saltSeed: hex64, slots: Array.from({ length: 32 }, () => ({ present: false })) };
         const docPair = { schema: schema32, openingA: opening32, openingB: opening32 };
         const call = mod.prepareProveFieldsDiffer({
-            payloadHashA: 'aa'.repeat(32), payloadHashB: 'bb'.repeat(32), k: 20, docPair, slotWidth: 32
+            recordKeyA: 'aa'.repeat(32), recordKeyB: 'bb'.repeat(32), k: 20, docPair, slotWidth: 32
         });
         expect(call.args[3]).toHaveLength(32);
         expect(call.args[4]).toBe(20n);
@@ -213,19 +213,19 @@ describe('browser witness/call helpers width', () => {
         expect(call.slotWidth).toBe(32);
         // Default width still caps k at 16 with the original message.
         expect(() => mod.prepareProveFieldsDiffer({
-            payloadHashA: 'aa'.repeat(32), payloadHashB: 'bb'.repeat(32), k: 17,
+            recordKeyA: 'aa'.repeat(32), recordKeyB: 'bb'.repeat(32), k: 17,
             docPair: { schema: schema32.slice(0, 16), openingA: { ...opening32, slots: opening32.slots.slice(0, 16) }, openingB: { ...opening32, slots: opening32.slots.slice(0, 16) } }
         })).toThrow(/1\.\.16/);
         // Width-32 integrity: full 32-bit mask bound, bit 31 usable.
         const integ = mod.prepareProveFieldsUnchangedExcept({
-            payloadHashA: 'aa'.repeat(32), payloadHashB: 'bb'.repeat(32),
+            recordKeyA: 'aa'.repeat(32), recordKeyB: 'bb'.repeat(32),
             allowedMask: 0x80000001, docPair, slotWidth: 32
         });
         expect(integ.args[3][0]).toBe(true);
         expect(integ.args[3][31]).toBe(true);
         expect(integ.args[3].filter(Boolean)).toHaveLength(2);
         expect(() => mod.prepareProveFieldsUnchangedExcept({
-            payloadHashA: 'aa'.repeat(32), payloadHashB: 'bb'.repeat(32),
+            recordKeyA: 'aa'.repeat(32), recordKeyB: 'bb'.repeat(32),
             allowedMask: 0x100000000, docPair, slotWidth: 32
         })).toThrow(/0\.\.4294967295/);
     });

@@ -1,9 +1,3 @@
-/**
- * Nightgate Indexer Service Implementation
- *
- * Exposes sync state, health metrics, and reorg history.
- */
-
 import cds, { Request } from '@sap/cds';
 const { SELECT, UPDATE } = cds.ql;
 
@@ -27,8 +21,7 @@ import { principalRateKey } from './utils/rate-limiter';
 
 const log = cds.log('nightgate:indexer');
 
-// getRuntimeInfo can force a full artifact re-hash; keep a caller from
-// hammering it. Generous enough for any dashboard cadence.
+// getRuntimeInfo can force a full artifact re-hash on the event loop.
 const runtimeInfoRateLimiter = new RateLimiter({ windowMs: 60 * 1000, maxRequests: 30 });
 
 export default class NightgateIndexerService extends cds.ApplicationService {
@@ -49,10 +42,7 @@ export default class NightgateIndexerService extends cds.ApplicationService {
         transactionsRolledBack: number;
         effectiveStartHeight: number;
     }> {
-        // Explicit transaction: the shared cascade (srv/crawler/rollback.ts,
-        // same utility as the reorg path incl. NightBalances repair) commits
-        // atomically BEFORE the caller restarts the crawler, so a resumed
-        // crawler can never read pre-rollback state.
+        // Commits before the caller restarts the crawler, so it never reads pre-rollback state.
         const result: RollbackResult = await this.db.tx(async (tx: any) =>
             rollbackIndexedDataFromHeight(tx, fromHeight, {
                 syncStatus: 'stopped',
@@ -75,7 +65,6 @@ export default class NightgateIndexerService extends cds.ApplicationService {
         await ensureNightgateModelLoaded();
         this.db = await cds.connect.to('db');
 
-        // Ensure SyncState row exists (even before crawler starts)
         try {
             await ensureSyncStateSingleton(this.db);
         } catch (err) {
@@ -95,9 +84,6 @@ export default class NightgateIndexerService extends cds.ApplicationService {
             };
         });
 
-        // The four status handlers below delegate to srv/monitoring/status.ts,
-        // which the plain /health, /ready and /metrics routes call as well.
-        // Same code, same numbers, whichever way a caller arrives.
         this.on('getHealth', async () => buildHealth(this.db));
 
         this.on('getReorgHistory', async (req: Request) => {
@@ -112,13 +98,6 @@ export default class NightgateIndexerService extends cds.ApplicationService {
 
         this.on('getLiveness', async () => buildLiveness());
 
-        // New in this release, both deliberately their own functions rather
-        // than extra fields on getReadiness: nothing gates on them.
-        // Rate-limited: the first call after an artifact change hashes every
-        // prover, verifier and zkir file (around 200 MB for the default
-        // registration set) on the event loop. The stat-fingerprint cache
-        // makes the steady state cheap, but a caller that keeps forcing the
-        // slow path must not be able to starve the process.
         this.on('getRuntimeInfo', async (req: Request) => {
             const clientKey = principalRateKey(req, 'runtime-info');
             const rate = runtimeInfoRateLimiter.check(clientKey);
@@ -127,8 +106,6 @@ export default class NightgateIndexerService extends cds.ApplicationService {
             }
             return buildRuntimeInfo();
         });
-        // The per-facade list carries wallet-derived account ids, so it is
-        // admin only; everyone else gets the counts.
         this.on('getWorkerStatus', async (req: Request) =>
             buildWorkerStatus(Boolean((req.user as any)?.is?.('admin'))));
 

@@ -6,27 +6,13 @@ import { getNightgatePluginConfig, getConfiguredNightgateNetwork, DEFAULT_NETWOR
 import { getContractRegistration, listRegisteredContracts } from '../srv/submission/contract-registry';
 import { configString } from '../srv/utils/config';
 
-// Browser DApp-connector HTTP surface. Two routes:
-//   GET /zk-config/<contract>/<dir>/<file>  -> serve proving artifacts
-//   GET /contract-manifest                  -> self-configuration manifest
-//
-// Extracted from plugin.ts so the handlers can be mounted on a bare Express
-// app for testing (scripts/integration-test-connector-routes.mjs) without
-// pulling in the plugin's cds lifecycle hooks. plugin.ts mounts both inside
-// its single `cds.on('bootstrap')` listener. HTTP security and CORS policy are
-// deliberately owned by the consuming CAP host, not this plugin.
+// Browser connector routes (/zk-config, /contract-manifest). HTTP security and
+// CORS belong to the consuming CAP host.
 
-// Serves a registered contract's ZK config (prover/verifier keys + zkir) over
-// HTTP so browser consumers can use a FetchZkConfigProvider, and the wallet
-// connector's `getProvingProvider(keyMaterialProvider)`. The URL layout mirrors
-// the on-disk one the server-side NodeZkConfigProvider reads, so a fetch
-// provider pointed at `<server>/zk-config/<contract>` resolves
-// `keys/<circuit>.{prover,verifier}` and `zkir/<circuit>.{zkir,bzkir}` directly.
-// Only REGISTERED contracts are servable; the registry is the security
-// boundary.
-const ZK_FILE_RE = /^[A-Za-z0-9_]+\.(prover|verifier|zkir|bzkir)$/;
-// Content-hash ETag per file, keyed by (mtime, size): a prover key of up to
-// 76 MB is read and hashed ONCE per generation, not per request.
+// URL layout mirrors the on-disk zk config, so a fetch provider at
+// `<server>/zk-config/<contract>` resolves it. Only registered contracts are servable.
+const ZK_FILE_RE = /^([A-Za-z0-9_]+\.(prover|verifier|zkir|bzkir)|manifest\.json)$/;
+// Keyed by (mtime, size): large prover keys are hashed once per generation.
 const zkEtagCache = new Map<string, { mtimeMs: number; size: number; etag: string }>();
 
 export function zkFileEtag(absPath: string): string | null {
@@ -51,16 +37,12 @@ export function mountZkConfigRoute(app: any): void {
             if (!reg) { res.status(404).end(); return; }
             const baseDir = path.resolve(reg.zkConfigPath, dir);
             const absPath = path.resolve(baseDir, file);
-            // Path-traversal guard (defence-in-depth; the regex already bars `/`/`..`).
+            // Path-traversal guard (defence in depth; the regex already bars `/`/`..`).
             if (!absPath.startsWith(baseDir + path.sep)) { res.status(404).end(); return; }
             const etag = zkFileEtag(absPath);
             if (!etag) { res.status(404).end(); return; }
             res.setHeader('ETag', etag);
-            // NOT immutable: the URL is not content-addressed, so after a
-            // contract upgrade the same path serves DIFFERENT keys/zkir.
-            // no-cache forces an ETag revalidation per use (the ETag is a
-            // content hash, so unchanged files still answer 304 and cost one
-            // conditional request, never a re-download).
+            // Not immutable: the same path serves different keys after an upgrade.
             res.setHeader('Cache-Control', 'public, no-cache');
             res.setHeader('Content-Type', 'application/octet-stream');
             if (req.headers['if-none-match'] === etag) { res.status(304).end(); return; }
@@ -73,7 +55,6 @@ export function mountZkConfigRoute(app: any): void {
 // Contracts that ship a browser artifact export (`@odatano/nightgate/browser/<name>`).
 const BROWSER_EXPORTED = new Set(['attestation-vault', 'attestation-vault-32']);
 
-// Circuit names = the `<circuit>.verifier` files in the contract's keys/ dir.
 function listContractCircuits(zkConfigPath: string): string[] {
     try {
         return fs.readdirSync(path.join(zkConfigPath, 'keys'))
@@ -83,18 +64,12 @@ function listContractCircuits(zkConfigPath: string): string[] {
     } catch { return []; }
 }
 
-// Self-configuration endpoint: lets a connector consumer discover the network,
-// the zk-config base URL, and per-contract artifact ref / circuits / hash,
-// without hard-coding any of it. Only REGISTERED contracts are listed.
-// `address(es)` is advertised only when an operator pins it in config; the
-// deployed address is otherwise per-deployment and caller-supplied.
+// Registered contracts only; addresses only when pinned in config.
 export function mountContractManifestRoute(app: any): void {
     app.get('/contract-manifest', (req: any, res: any) => {
         const cfg = getNightgatePluginConfig();
         const network = getConfiguredNightgateNetwork(cfg) || DEFAULT_NETWORK;
-        // Without a configured public base the URLs are RELATIVE: a browser
-        // resolves them against the origin it fetched the manifest from, and
-        // nothing from the request's Host header is reflected into the body.
+        // No configured base: relative URLs, never reflect the Host header.
         const base = (configString('NIGHTGATE_ZK_CONFIG_PUBLIC_URL') ?? '').replace(/\/+$/, '');
         const contracts = listRegisteredContracts().map((name: string) => {
             const reg = getContractRegistration(name);

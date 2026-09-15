@@ -5,9 +5,7 @@
  * (see test/vitest.setup.ts). Persistence (Blocks, Transactions, ContractActions,
  * UnshieldedUtxos, NightBalances, BackgroundJobs) is exercised against the real
  * SQLite DB: we seed rows, invoke the service action / OData endpoint, then
- * assert on the returned data. The old query-shape assertions (builder.__table /
- * __where / __orderBy / __limit) are reframed as behavioral: seed specific rows
- * and prove the right rows come back in the right order/limit.
+ * assert on the returned data (the right rows in the right order/limit).
  *
  * External collaborators stay mocked: srv/sessions/wallet-sessions so the
  * wallet-session handler registration + cleanup timer don't run a real session
@@ -142,11 +140,10 @@ async function seedBalance(address: string, balance: number, overrides: Record<s
 //
 // The framework ran init() once at boot, which calls our mocked
 // registerWalletSessionHandlers + startSessionCleanup. We re-run init() on a
-// fresh instance to assert the delegated wiring (the old test instantiated the
-// service directly; here we prove the same calls happen, with the live db).
-// The handler-registration / read-only-guard assertions from the old suite are
-// covered behaviorally by the action tests + the read-only test below; the
-// shutdown / cleanup-timer hook has its own dedicated describe block (below).
+// fresh instance to assert the delegated wiring with the live db.
+// Handler registration / read-only guards are covered behaviorally by the
+// action tests + the read-only test below; the shutdown / cleanup-timer hook
+// has its own dedicated describe block (below).
 // ----------------------------------------------------------------------------
 describe('init', () => {
     it('delegates wallet-session handling + cleanup with the live db connection', async () => {
@@ -575,9 +572,8 @@ describe('read-only enforcement', () => {
 // getJobStatus (async submission lifecycle)
 //
 // getJobStatus is an UNBOUND service action that reads a real BackgroundJobs
-// row via getJobById. We seed the row and assert the projected shape. The old
-// query-shape assertion (builder.__where == { ID }) is reframed: the right row
-// (and only the caller's own row) is returned.
+// row via getJobById. We seed the row and assert the projected shape: the
+// right row (and only the caller's own row) is returned.
 // ----------------------------------------------------------------------------
 describe('BackgroundJobs idempotency constraint', () => {
     it('rejects two rows with the same session, kind and idempotency key', async () => {
@@ -738,7 +734,7 @@ describe('getJobStatus', () => {
         expect(out.result).toBeNull();
     });
 
-    // Ownership is FAIL-CLOSED for non-admin callers (0.16.0): a missing
+    // Ownership is FAIL-CLOSED for non-admin callers: a missing
     // session row (e.g. closed after a restart) must not open the job up.
     function sendAs(userId: string): Promise<any> {
         const user = new (cds as any).User({ id: userId, roles: [] });
@@ -772,7 +768,7 @@ describe('getJobStatus', () => {
 // custom before/on handlers, so it is exercised programmatically with
 // explicit cds.User contexts via cds.tx.
 // ----------------------------------------------------------------------------
-describe('sponsorFinalizedTransaction over REAL OData (0.17.2 sentinel)', () => {
+describe('sponsorFinalizedTransaction over REAL OData: the pool sentinel', () => {
     // The pool sentinel travels through fields DECLARED Edm.Guid
     // (sponsorSessionId, the returned sessionId, getJobStatus.sessionId).
     // A non-UUID string sentinel would be rejected by OData deserialization
@@ -908,7 +904,7 @@ describe('owner-scoped entity reads', () => {
         expect(rows.map((r: any) => r.txHash).sort()).toEqual(['0xalice-tx', '0xbob-tx', '0xownerless-tx']);
     });
 
-    // Documents / GranteeIdentities are owner-scoped too (0.16.0): storageRef
+    // Documents / GranteeIdentities are owner-scoped too: storageRef
     // and userId->granteeId bindings are nobody else's business. Legacy rows
     // without a userId stay admin-only.
     it('Documents READ is limited to the requesting user\'s rows (legacy null-userId rows admin-only)', async () => {

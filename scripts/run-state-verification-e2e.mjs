@@ -184,12 +184,15 @@ async function waitForServer() {
     if (r.status >= 400) fail(`anchorDocument → ${r.status}: ${pretty(r.body)}`);
     const documentId = r.body?.documentId;
     if (!documentId) fail(`anchorDocument returned no documentId: ${pretty(r.body)}`);
+    const attesterId = r.body?.attesterId;
+    if (!/^[0-9a-f]{64}$/.test(String(attesterId))) fail(`anchorDocument returned no attesterId: ${pretty(r.body)}`);
     await pollJob(sessionId, r.body.jobId, 'attest');
     console.log(`OK   payload attested (documentId=${documentId})`);
 
     step('6. verifyAttestationState - crawler-free (#2), poll until verified=true');
-    const av = await pollVerify(fn('verifyAttestationState', { contractAddress, payloadHash }), 'verifyAttestationState');
+    const av = await pollVerify(fn('verifyAttestationState', { contractAddress, attesterId, payloadHash }), 'verifyAttestationState');
     if (av.attested !== true) fail(`expected attested=true: ${pretty(av)}`);
+    if (av.attesterId !== attesterId) fail(`record carries another attester: ${pretty(av)}`);
     console.log(`OK   attestation confirmed from live state (attesterId=${(av.attesterId || '').slice(0, 12)}…)`);
 
     step('7. verifyDocument with contractAddress - crawler-free fallback (#3)');
@@ -199,9 +202,9 @@ async function waitForServer() {
     console.log(`OK   document verified via state fallback (anchoredTxHash=${(vd.anchoredTxHash || '').slice(0, 10)}…)`);
 
     step('8. issueFieldPredicateAttestation (demoValue=5 <= threshold=10, root-bound)');
-    // The commitment-only issuePredicateAttestation was removed in 0.16.0;
-    // numeric predicates are field-bound. Build a tiny content tree and anchor
-    // it in-flow (anchorContentRoot + proveFieldPredicate).
+    // Numeric predicates are field-bound (there is no commitment-only
+    // predicate action). Build a tiny content tree and anchor it in-flow
+    // (anchorContentRoot + proveFieldPredicate).
     r = await post('/prepareDocumentProof', {
         documentJson: JSON.stringify({ demoValue: 5 }),
         proofFieldsJson: JSON.stringify([{ field: 'demoValue', scale: 1 }])

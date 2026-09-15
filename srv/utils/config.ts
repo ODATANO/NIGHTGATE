@@ -1,15 +1,7 @@
 /**
- * Typed access to NIGHTGATE's configuration knobs (see `config-table.ts`).
- *
- * Main thread: every read resolves at call time from `process.env`, then the
- * CAP block a host registered with `setConfigOverrideSource`, then the
- * default. Parse warnings are logged once per key and value.
- *
- * Wallet worker: the main thread hands the RESOLVED snapshot over
- * `workerData` and the worker pins it with `pinResolvedConfig`; from then on
- * the accessors answer from the snapshot and never touch the worker's env.
- *
- * No cds import here: the worker loads this module too.
+ * Typed accessors over `config-table.ts`: env, then the CAP block, then the default, at call time.
+ * In the wallet worker they answer from the main thread's resolved snapshot, never the worker env.
+ * No cds import: the worker loads this module.
  */
 
 import {
@@ -27,10 +19,8 @@ const warned = new Set<string>();
 let workerDataChecked = false;
 
 /**
- * Inside the wallet worker the main thread's resolved snapshot arrives in
- * `workerData`. It is picked up on the first read, whatever the import order
- * of the worker modules; `node:worker_threads` is required lazily so this
- * module carries no import of it (the boot tests mock that module).
+ * Pin the snapshot from `workerData` on the first read, whatever the import order. Required
+ * lazily: boot tests mock `node:worker_threads`.
  */
 function pinFromWorkerDataOnce(): void {
     if (workerDataChecked) return;
@@ -72,10 +62,7 @@ export function __resetConfigForTests(): void {
     warned.clear();
 }
 
-/**
- * The resolved values of every key, for the worker snapshot. Secrets are
- * left out: the key ring travels separately, already parsed.
- */
+/** Resolved values for the worker snapshot, secrets excluded (the key ring travels separately). */
 export function resolvedConfigSnapshot(env: Record<string, string | undefined> = process.env): Record<string, ConfigValue> {
     const { values, warnings } = resolveConfigTable(env, overrideSource?.());
     for (const w of warnings) warnOnce(w);
@@ -164,11 +151,7 @@ export function configList(key: string): string[] {
     return Array.isArray(v) ? v : [];
 }
 
-/**
- * For functions that take an injectable env map (tests): the process env goes
- * through the accessors (CAP block included), any other map is parsed on its
- * own under the same rules, warnings included.
- */
+/** For an injectable env map: `process.env` goes through the accessors, any other map is parsed alone. */
 export function configNumberFrom(key: string, env: Record<string, string | undefined>): number {
     if (env === process.env) return configNumber(key);
     const spec = configSpec(key);

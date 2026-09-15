@@ -1,6 +1,6 @@
-// Live acceptance lane for the dust wedge protection (0.15.2)
-// (0.15.2 dust wedge protection): force a dust-spending submission to die
-// provably PRE-MEMPOOL, then prove the wallet is NOT wedged: the pre-build
+// Live acceptance lane for the dust wedge protection: force a dust-spending
+// submission to die provably PRE-MEMPOOL, then prove the wallet is NOT
+// wedged: the pre-build
 // dust snapshot restore kicked in (server log), getWalletBalance still shows
 // the dust UTXO with nothing stuck pending, and a follow-up normal send
 // succeeds end-to-end.
@@ -8,9 +8,9 @@
 // The reject is forced via a transaction TTL that is valid at request time
 // (the API rejects past TTLs with a 400) but expires while the in-process
 // proving runs (minutes for a transfer in wasm mode): the build+prove
-// pipeline runs for real (the dust spend IS booked, the exact state the
-// incident poisoned), and the node rejects the finalized tx at validity
-// check (1010 invalid, the same guard branch as the incident's 1014).
+// pipeline runs for real (the dust spend IS booked), and the node rejects
+// the finalized tx at validity check (1010 invalid, the same pre-mempool
+// guard branch as a 1014 reject).
 //
 // Server (separate terminal): npm run dev
 // Then:  node --env-file=.env scripts/run-dust-wedge-e2e.mjs
@@ -157,9 +157,8 @@ async function waitForServer() {
     step('5. getWalletBalance AFTER the abort → restore lane MUST have run, wallet must NOT be wedged');
     const after = await getBalance(sessionId, 'after');
     // Hard gate: the guard lane itself must have fired. The SDK's own
-    // fast-path revert can heal some aborts WITHOUT it (that is the path
-    // that failed in the live incident), so a green balance alone proves
-    // nothing about the protection.
+    // fast-path revert can heal some aborts WITHOUT it, so a green balance
+    // alone proves nothing about the protection.
     const restoresBefore = before.dustRestoreCount ?? 0;
     if (after.dustRestoreCount !== restoresBefore + 1) {
         fail(`restore lane did not run: dustRestoreCount ${restoresBefore} -> ${after.dustRestoreCount} ` +

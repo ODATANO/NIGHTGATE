@@ -1,5 +1,5 @@
 // The standalone image builds its CDS_CONFIG from the environment in
-// docker/cds-config.mjs (0.21.1: PostgreSQL via NIGHTGATE_DB_URL, SQLite
+// docker/cds-config.mjs (PostgreSQL via NIGHTGATE_DB_URL, SQLite
 // otherwise). The mapping is what a container boots with, so it is pinned.
 import { describe, it, expect } from 'vitest';
 import { spawnSync } from 'node:child_process';

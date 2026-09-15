@@ -36,7 +36,7 @@ describe('buildProofProvider', () => {
     // The stand-ins above are module-level, so call history has to be cleared per test.
     beforeEach(() => vi.clearAllMocks());
 
-    it("defaults to the proof server, unchanged from before the modality existed", async () => {
+    it("defaults to the proof server", async () => {
         const res = await buildProofProvider({
             connector: {}, zkConfigProvider, proverServerUri: 'http://localhost:6300', proofMod
         });

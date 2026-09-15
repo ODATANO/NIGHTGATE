@@ -13,10 +13,7 @@ interface ParsedExtrinsicCore {
     senderAddress?: string;
 }
 
-/**
- * Decode a SCALE compact-encoded unsigned integer as bigint.
- * Returns [value, bytesConsumed] or null if buffer too short.
- */
+/** SCALE compact unsigned integer as [value, bytesConsumed], or null if the buffer is too short. */
 export function decodeCompactBigInt(buf: Buffer, offset: number): [bigint, number] | null {
     if (offset >= buf.length) return null;
 
@@ -49,10 +46,7 @@ export function decodeCompactBigInt(buf: Buffer, offset: number): [bigint, numbe
     }
 }
 
-/**
- * Compatibility wrapper for existing callers that expect number values.
- * Values above Number.MAX_SAFE_INTEGER are returned as 0 while preserving bytesConsumed.
- */
+/** `decodeCompactBigInt` as a number; values above MAX_SAFE_INTEGER become 0 (bytesConsumed kept). */
 export function decodeCompact(buf: Buffer, offset: number): [number, number] | null {
     const decoded = decodeCompactBigInt(buf, offset);
     if (!decoded) return null;
@@ -199,10 +193,6 @@ export function parseExtrinsicCall(hex: string): { buf: Buffer; palletIndex: num
     return { buf: core.buf, palletIndex: core.palletIndex, callIndex: core.callIndex, argsOffset: core.argsOffset };
 }
 
-/**
- * Parse a hex-encoded Substrate extrinsic to extract pallet_index and call_index.
- * Returns null on parse failure (safe fallback to existing heuristics).
- */
 export function parseExtrinsicCallIndices(hex: string): { palletIndex: number; callIndex: number } | null {
     const core = parseExtrinsicCore(hex);
     if (!core) return null;
@@ -211,10 +201,3 @@ export function parseExtrinsicCallIndices(hex: string): { palletIndex: number; c
         callIndex: core.callIndex
     };
 }
-
-/**
- * Extract signed sender + first transfer-style destination/amount, if present.
- *
- * This parser is intentionally conservative: receiver/amount are set only when
- * the first call args decode as MultiAddress + Compact<Balance>.
- */

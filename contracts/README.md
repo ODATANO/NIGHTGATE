@@ -1,40 +1,24 @@
 # NIGHTGATE Registered Contracts
 
-This directory holds Compact contracts that NIGHTGATE registers via
-`cds.requires.nightgate.contracts`. Each subdirectory is one logical contract;
-its compiled artifacts (under `src/managed/<name>/`) are committed to the repo
-so consumers don't need a Compact toolchain to run NIGHTGATE.
+Compact contracts registered via `cds.requires.nightgate.contracts`, one per
+directory. Compiled artifacts (`src/managed/<name>/`) are committed, so no
+Compact toolchain is needed to run NIGHTGATE.
 
-Registered contracts:
-
-- **`counter`**: minimal increment-only contract; first registered artifact
-  and the deploy/call smoke-test target.
-- **`attestation-vault`**: the tiered-disclosure attestation contract behind
-  the attestation / predicate / disclosure actions (16 provable fields per
-  document, depth-4 content tree). Lineage 3 since 0.23.0: caller-bound,
-  expiring commitments and takeover-proof reveals (`attestGuarded` takes
-  `expires_at` as fifth argument); see
-  `docs/feature-requests/vault-lineage-3.md`. Deploys of earlier lineages
-  are not compatible (ledger layout changed).
-- **`attestation-vault-32`**: the 32-slot width variant of the attestation
-  vault (depth-5 content tree), for field panels of 17-32 provable fields
-  that need ONE root (a global k-of-N diff claim only exists within one
-  document). Same circuit set and semantics; a SECOND lineage, not a
-  replacement: cross-root proofs only work between documents of the same
-  width. Registration carries `slotWidth: 32`; deploy size and cost are
-  identical to the 16er (every verifier key is 2119 B, though four verifier
-  CONTENTS differ: comparison plus the content-tree circuits), the
-  comparison prover doubles (72.9 MB, wasm-provable). Its prover keys are
-  committed here but NOT packed into the npm tarball (113 MB, over the
-  registry's publish limit); an npm consumer fetches them once with
-  `npx nightgate-fetch-keys attestation-vault-32`. Wider trees are not
-  supported: the registry rejects `slotWidth: 64` because the mask path is
-  32-bit, and a 64-wide comparison prover exceeds the wasm prover's memory
-  anyway (proof-server-only).
-- **`shielded-token`**: test token whose `mint()` sends the contract's own
-  shielded token to the caller's zswap key; exists to exercise the zswap
-  circuits (NIGHT is unshielded-only and can never touch them). Used by
-  `npm run wasm-zswap:e2e`.
+- **`counter`**: increment-only; deploy/call smoke test.
+- **`attestation-vault`**: attestation, predicate and disclosure contract; 16
+  fields per document (depth-4 content tree), eleven circuits. Records keyed by
+  `recordKey(attester, payload)`; every entry removable (`retract`, claim
+  expiry, registrar transfer); claim keys bound to the anchored content root,
+  a claim's expiry is extend-only; document ids via `registerDocument` /
+  `bindDocument`. Constructor `(registrar, recovery)`, both attester ids; the
+  recovery identity can only re-point the registrar (zero = none). Deploys of
+  earlier layouts are incompatible.
+- **`attestation-vault-32`**: same contract with 32 fields (depth 5),
+  `slotWidth: 32`. Cross-document proofs work only within one width. Prover
+  keys are not in the npm package: `npx nightgate-fetch-keys attestation-vault-32`.
+  `slotWidth: 64` is rejected.
+- **`shielded-token`**: test token; `mint()` sends a shielded token to the
+  caller's zswap key. Exercises the zswap circuits (`npm run wasm-zswap:e2e`).
 
 ## Layout
 
@@ -66,12 +50,11 @@ In `cds.requires.nightgate.contracts`:
 }
 ```
 
-Paths are resolved relative to `cwd` at startup. `artifactPath` is dynamic-
-imported by `srv/submission/contract-registry.ts:resolveContract`.
+Paths resolve relative to `cwd` at startup.
 
 ## Recompiling
 
-Compact is Linux/macOS only (no native Windows binary as of compactc 0.31.0).
+Compact runs on Linux and macOS; on Windows use WSL.
 
 **Install (once):**
 ```bash
@@ -87,8 +70,4 @@ cd contracts/counter
 compact compile src/counter.compact src/managed/counter
 ```
 
-That regenerates everything under `managed/counter/`. Commit the result.
-
-**Windows users:** run the install + compile commands inside WSL Ubuntu. The
-`src/managed/` output works the same on any host because the emitted JS is
-plain ESM.
+Regenerates `managed/counter/`; commit the result. The output is plain ESM and runs on any host.

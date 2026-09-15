@@ -173,8 +173,8 @@ describe('connect: jobs', () => {
     });
 
     test('waitForJob survives transient poll failures (proxy 502, network) and keeps the job handle', async () => {
-        // Live case: a reverse proxy answered one poll with 502 while the server
-        // was busy; the job itself landed.
+        // A reverse proxy may answer a poll with 502 while the server is busy
+        // although the job itself landed.
         const { connect } = await importClient();
         const { fn, calls } = fakeFetch([
             { status: 502, body: { error: { message: 'Bad Gateway' } } },

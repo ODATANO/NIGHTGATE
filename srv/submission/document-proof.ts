@@ -1,36 +1,7 @@
 /**
- * Document ingestion + agent-output provenance
- * (agent-access-layer FR, workstreams 3 and 4 / phases C and D).
- *
- * `prepareDocumentProof` bridges "here is a document as structured fields"
- * to the fixed proof-input shapes of `issueFieldPredicateAttestation`:
- * canonical JSON -> payloadHash, ordered proof fields -> salted Merkle
- * content root (depth log2(width): 4 on the 16-slot default, 5 on
- * attestation-vault-32) + per-field inclusion paths. Compute-only: nothing is
- * persisted, no job is started, and the response carries witness material
- * (scaled values), so it is never logged.
- *
- * `attestAgentOutput` anchors an agent-output provenance envelope
- * (v1: agentId, inputHash, outputHash, optional modelId/policyHash,
- * producedAt) through the existing `anchorDocument` pipeline. The canonical
- * envelope rides as the anchor's public metadata blob, so the on-chain
- * metadata hash commits to the envelope itself and any third party can
- * verify with envelope + `verifyAttestationState` alone.
- *
- * Hashing conventions (deliberately the ecosystem's, NOT the FR's original
- * sha256/JCS sketch): canonical JSON = recursively key-sorted
- * JSON.stringify; hashes = blake2b-256; fieldKey = blake2b256(fieldPath);
- * default value scale x1000. v4 (0.16.0): every leaf is SALTED with a
- * per-slot salt derived from a per-document 32-byte seed (`slotSalt` pure
- * circuit); absent slots use the salted absent leaf (padding key
- * "nightgate/empty-leaf/v2" ASCII zero-padded), so a shared leaf layer is
- * not dictionary-testable and does not reveal the presence pattern. The
- * schema id is the depth-4 root over the 16 slot DESCRIPTORS (fieldKey,
- * kind, scale), in-circuit recomputable. Leaf/node/descriptor hashing
- * always goes through the contract artifact's exported pure circuits so
- * the off-chain roots are byte-identical to the in-circuit recompute
- * (NIGHTPASS passport-anchor.ts must adopt this rule with the 0.16.0
- * redeploy).
+ * Document ingestion (payloadHash, salted content root, inclusion paths) and
+ * agent-output provenance. Leaf, node and descriptor hashes go through the
+ * artifact's pure circuits so roots match the in-circuit recompute; external builders must too.
  */
 
 import cds, { Request } from '@sap/cds';
@@ -41,8 +12,6 @@ import { getContractRegistration, slotWidthOf, importRegisteredArtifact } from '
 import { blake2b256Hex, fromHex32, emptyLeafKeyHex } from './hashing';
 import { buildMembershipSet, membershipPathFor, canonicalSetDigests } from './set-root';
 
-// Re-exported so existing consumers of this module keep their import site;
-// the definition moved to the dependency-clean ./hashing (set-root subpath).
 export { blake2b256Hex } from './hashing';
 
 const log = cds.log('nightgate:document-proof');
@@ -50,13 +19,10 @@ const log = cds.log('nightgate:document-proof');
 const HEX64_RE = /^[0-9a-fA-F]{64}$/;
 const DEFAULT_ATTESTATION_VAULT_REF = 'attestation-vault';
 
-// Classic 16-slot vault dimensions; kept exported for compatibility. The
-// tree builders below take an optional WIDTH (16/32) so wider vault variants
-// (`slotWidth` on the contract registration) reuse the same canonical rules.
+// Default 16-slot dimensions; the tree builders take an optional width.
 export const MERKLE_DEPTH = 4;
 export const MAX_PROOF_FIELDS = 1 << MERKLE_DEPTH; // 16
 
-/** Content-tree width (provable fields per document) of a registered artifact. */
 export function slotWidthForRef(compiledRef: string): number {
     return slotWidthOf(getContractRegistration(compiledRef));
 }
@@ -64,17 +30,14 @@ export function slotWidthForRef(compiledRef: string): number {
 export const DEFAULT_VALUE_SCALE = 1000;
 const UINT64_MAX = 18446744073709551615n;
 
-// 120/h per client: pure compute, but the response carries witness material
-// and the merkle build imports the artifact, so unbounded hammering is not free.
+// Compute-only, but each call imports the artifact and hashes a full tree.
 const prepareRateLimiter = new RateLimiter({ windowMs: 60 * 60 * 1000, maxRequests: 120 });
 
 // ---- Canonical JSON + hashing ---------------------------------------------
 
 /**
- * Recursively sort object keys so the same logical payload always hashes
- * equal. Note that a JS object cannot HOLD the RFC 8785 order for integer-like
- * keys (`{"10":..,"9":..}` always enumerates 9 before 10), so the hash input
- * is produced by `canonicalize`, never by stringifying this result.
+ * Recursively sort object keys. Not a hash input: JS objects enumerate
+ * integer-like keys numerically, so hashing uses `canonicalize`.
  */
 export function sortKeys(value: unknown): unknown {
     if (Array.isArray(value)) return value.map(sortKeys);
@@ -88,10 +51,8 @@ export function sortKeys(value: unknown): unknown {
 }
 
 /**
- * Deterministic canonical JSON string of a payload: RFC 8785 member order
- * (keys sorted by UTF-16 code units, integer-like keys included), arrays in
- * order, JSON.stringify's number and string forms. `undefined` members are
- * dropped and `undefined` array elements become null, as JSON.stringify does.
+ * Canonical JSON: RFC 8785 member order (UTF-16 code units, integer-like keys
+ * included), JSON.stringify number/string forms and undefined handling.
  */
 export function canonicalize(value: unknown): string {
     if (value === null || typeof value !== 'object') {
@@ -104,7 +65,7 @@ export function canonicalize(value: unknown): string {
     return '{' + keys.map(k => JSON.stringify(k) + ':' + canonicalize(obj[k])).join(',') + '}';
 }
 
-/** Canonical 32-byte field id for a field path (public label hash). */
+/** fieldKey = blake2b-256 of the field path. */
 export function fieldKeyHex(fieldPath: string): string {
     return blake2b256Hex(fieldPath);
 }
@@ -112,26 +73,18 @@ export function fieldKeyHex(fieldPath: string): string {
 // ---- Value scaling --------------------------------------------------------
 
 /**
- * Scale a raw field value to the Uint<64> integer the circuit compares.
- * Digit-strings with scale 1 take the exact BigInt path (values beyond
- * 2^53 stay precise); everything else goes through Number x scale with a
- * safe-integer guard. Throws with a user-facing message on bad input.
+ * Scale a raw value to the circuit's Uint<64>. Integer digit-strings take an
+ * exact BigInt path; everything else Number x scale with a safe-integer guard.
  */
 export function scaleFieldValue(raw: number | string, scale: number, label: string): bigint {
-    // Explicit type gate: Number(true) is 1, Number([]) is 0 and so on, so a
-    // loose conversion would silently mint proof values from non-numerics.
+    // Number(true), Number([]) and Number('   ') would mint proof values.
     if (typeof raw !== 'number' && typeof raw !== 'string') {
         throw new Error(`${label}: value must be a number or numeric string`);
     }
     if (typeof raw === 'string') {
-        // Number('   ') is 0: trim first and refuse blank strings so no proof
-        // value is minted from whitespace. The tree builder treats blank
-        // strings as absent BEFORE calling this; standalone callers get the
-        // error.
         raw = raw.trim();
         if (raw === '') throw new Error(`${label}: value must not be blank`);
-        // Decimal notation only: Number('0x10') and Number('1e3') parse, but a
-        // proof value must not depend on JavaScript's numeric literal rules.
+        // Number() also parses hex and exponent forms.
         if (!/^\d+(\.\d+)?$/.test(raw)) throw new Error(`${label}: numeric strings must be decimal digits with an optional fraction`);
     }
     if (typeof raw === 'string' && /^\d+$/.test(raw)) {
@@ -163,37 +116,26 @@ export interface PureCircuits {
     setLeafHash(valueDigest: Uint8Array): Uint8Array;
     /** Schema-descriptor leaf: hash of SlotDescriptor{field_key, kind, scale}. */
     descriptorLeafHash(fieldKey: Uint8Array, kind: bigint, scale: bigint): Uint8Array;
-    /** Per-slot salt derived from the document's 32-byte salt seed. */
     slotSalt(seed: Uint8Array, index: bigint): Uint8Array;
     /** Canonical padding-slot key ("nightgate/empty-leaf/v2" zero-padded). */
     emptyLeafKey(): Uint8Array;
 }
 
 export interface ProofFieldSpec {
-    /** Field path in the document (also the public label the fieldKey hashes). */
+    /** Field path; also the public label the fieldKey hashes. */
     field: string;
-    /**
-     * Leaf kind. 'uint' (default): numeric value, scaled to Uint<64>.
-     * 'bytes': string value, entered as blake2b-256 digest of the exact
-     * string (no trimming; the raw document is the canonical form).
-     */
+    /** 'uint' (default): scaled Uint<64>. 'bytes': blake2b-256 of the exact, untrimmed string. */
     kind?: 'uint' | 'bytes';
-    /** Value scale (default 1000, milli-units). Only valid for kind 'uint'. */
+    /** Default 1000 (milli-units); 'uint' only. */
     scale?: number;
 }
 
-/**
- * Resolve a field path in the document. A literal top-level key wins (so
- * keys that themselves contain dots stay addressable); otherwise dots
- * descend into nested objects (numeric segments index into arrays).
- * Returns undefined when any segment is missing.
- */
+/** A literal top-level key wins (dotted keys stay addressable); otherwise dots descend. */
 export function resolveFieldValue(document: Record<string, unknown>, fieldPath: string): unknown {
     if (Object.prototype.hasOwnProperty.call(document, fieldPath)) return document[fieldPath];
     let cur: unknown = document;
     for (const seg of fieldPath.split('.')) {
-        // Own properties only: a path segment such as `constructor` or
-        // `__proto__` must not resolve through the prototype chain.
+        // Own properties only: no resolution through the prototype chain.
         if (cur === null || typeof cur !== 'object' || !Object.prototype.hasOwnProperty.call(cur, seg)) return undefined;
         cur = (cur as Record<string, unknown>)[seg];
     }
@@ -204,11 +146,11 @@ export interface PreparedField {
     field: string;
     fieldKey: string;     // 64 hex
     kind: 'uint' | 'bytes';
-    /** kind 'uint' only: scaled Uint<64>, decimal string (witness material). */
+    /** kind 'uint': scaled Uint<64>, decimal (witness material). */
     value?: string;
-    /** kind 'bytes' only: blake2b-256 of the exact string value, 64 hex. */
+    /** kind 'bytes': 64 hex. */
     valueDigest?: string;
-    /** Per-slot salt, 64 hex (witness material; the leaf's commitment opening). */
+    /** 64 hex, witness material. */
     salt: string;
     siblings: string[];   // MERKLE_DEPTH x 64 hex
     dirs: boolean[];      // MERKLE_DEPTH booleans (true = node is LEFT child)
@@ -221,26 +163,24 @@ export interface SchemaDescriptorWire {
     scale: string;        // decimal Uint<64>; '0' for bytes/padding slots
 }
 
-/** One document's opening of one slot, wire form (witness material). */
+/** One document's opening of one slot (witness material). */
 export interface SlotOpeningWire {
     present: boolean;
-    /** schema kind 0, present: scaled Uint<64> decimal string. */
+    /** kind 0: scaled Uint<64>, decimal. */
     value?: string;
-    /** schema kind 1, present: blake2b-256 digest, 64 hex. */
+    /** kind 1: 64 hex. */
     valueDigest?: string;
 }
 
-/** A document's full cross-root opening, wire form (witness material). */
+/** A document's full cross-root opening (witness material). */
 export interface DocumentOpeningWire {
-    saltSeed: string;             // 64 hex, the per-document salt seed
-    slots: SlotOpeningWire[];     // exactly 16, slot order
+    saltSeed: string;             // 64 hex
+    slots: SlotOpeningWire[];     // one per slot, slot order
 }
 
 /**
- * The 16 slot descriptors of an ORDERED proofFields list. Spec slots use the
- * spec's declared interpretation REGARDLESS of the document's value or
- * presence; padding slots beyond the list use the canonical empty-leaf key
- * with kind 2 and scale 0.
+ * Slot descriptors follow the spec regardless of the document's values; slots
+ * past the list are padding: empty-leaf key, kind 2, scale 0.
  */
 export function computeSchemaDescriptors(specs: ProofFieldSpec[], width: number = MAX_PROOF_FIELDS): SchemaDescriptorWire[] {
     const out: SchemaDescriptorWire[] = [];
@@ -258,14 +198,8 @@ export function computeSchemaDescriptors(specs: ProofFieldSpec[], width: number 
 }
 
 /**
- * The schema id (= schema ROOT) of an ORDERED proofFields list: the depth-4
- * Merkle root over the 16 descriptor leaves, computed with the artifact's
- * pure circuits so it is byte-identical to the in-circuit recompute of
- * `proveDocumentComparison`. Binding kind and scale is what makes the schema
- * assert sound: two documents whose leaves collide numerically (x=1 at scale
- * 1000 vs x=1000 at scale 1) anchor DIFFERENT schema ids. Because the
- * comparison circuit RECOMPUTES this root from witnessed descriptors, an
- * anchored schema id is proven to describe the tree, not merely claimed.
+ * Schema id = Merkle root over the descriptor leaves. Kind and scale are bound
+ * so numerically colliding leaves (x=1 at scale 1000 vs 1000 at scale 1) differ.
  */
 export function computeSchemaId(specs: ProofFieldSpec[], pure: PureCircuits, width: number = MAX_PROOF_FIELDS): string {
     const descriptors = computeSchemaDescriptors(specs, width);
@@ -285,21 +219,14 @@ export interface BuiltContentRoot {
     schema: SchemaDescriptorWire[];
     fields: PreparedField[];
     emptyFields: string[];
-    /** Salted leaf hashes in slot order (informational; the root's layer). */
+    /** Salted leaf hashes in slot order (informational). */
     leaves: string[];
-    /** The full cross-root opening (witness material). */
     opening: DocumentOpeningWire;
 }
 
 /**
- * Build the depth-4 SALTED content root over an ORDERED field list (leaf
- * index = position in `specs`; the order is part of the tree identity, so
- * callers must keep it stable across anchor and proof). Every slot's salt is
- * derived from `saltSeed` via the artifact's `slotSalt` circuit; fields whose
- * document value is absent (null/undefined/'') occupy the salted absent leaf
- * and appear in `emptyFields`. The seed is the document's commitment opening:
- * KEEP it (re-preparing with the same seed reproduces the same root; a fresh
- * seed yields a DIFFERENT root that an already-anchored payload rejects).
+ * Salted content root; leaf index = position in `specs`, so the order must stay
+ * stable. Blank values take the salted absent leaf. Only the same seed reproduces the root.
  */
 export function buildDocumentContentRoot(
     document: Record<string, unknown>,
@@ -325,14 +252,11 @@ export function buildDocumentContentRoot(
         if (raw !== null && raw !== undefined && typeof raw === 'object') {
             throw new Error(`proofFields[${i}] (${spec!.field}): path resolves to an object/array, not a scalar`);
         }
-        // Blank includes whitespace-only strings: Number('   ') would be 0.
         const isBlank = raw === null || raw === undefined
             || (typeof raw === 'string' && raw.trim() === '');
         if (spec && !isBlank) {
             if (spec.kind === 'bytes') {
-                // The digest covers the EXACT string as it appears in the
-                // document (no trimming): a verifier recomputing from the raw
-                // document must land on the same digest.
+                // Untrimmed: verifiers recompute from the raw document.
                 if (typeof raw !== 'string') {
                     throw new Error(`proofFields[${i}] (${spec.field}): kind 'bytes' requires a string value`);
                 }
@@ -346,8 +270,7 @@ export function buildDocumentContentRoot(
             }
         } else {
             leafValues.push(null);
-            // Absent slots are salted too: a shared leaf layer reveals neither
-            // values nor the presence pattern.
+            // Salted so a shared leaf layer does not reveal the presence pattern.
             leaves.push(pure.absentLeafHash(fromHex32(schema[i].fieldKey), salt));
         }
     }
@@ -384,7 +307,6 @@ export function buildDocumentContentRoot(
             : { ...base, kind: 'uint', value: leafValue.scaled.toString() });
     });
 
-    // The cross-root witness bundle: seed + per-slot openings in slot order.
     const opening: DocumentOpeningWire = {
         saltSeed: Buffer.from(saltSeed).toString('hex'),
         slots: leafValues.map(lv => lv === null
@@ -459,8 +381,6 @@ export function registerDocumentProofHandlers(srv: any, deps: DocumentProofHandl
         if (!Array.isArray(specs) || specs.length === 0) {
             return req.reject(400, 'proofFieldsJson must be a non-empty JSON array');
         }
-        // Width comes from the target artifact's registration (slotWidth,
-        // default 16), so `attestation-vault-32` accepts up to 32 fields.
         const widthRef = data.compiledArtifactRef?.length ? data.compiledArtifactRef : DEFAULT_ATTESTATION_VAULT_REF;
         const slotWidth = slotWidthForRef(widthRef);
         if (specs.length > slotWidth) {
@@ -496,9 +416,7 @@ export function registerDocumentProofHandlers(srv: any, deps: DocumentProofHandl
 
         const canonicalDocument = canonicalize(document);
         const payloadHash = blake2b256Hex(canonicalDocument);
-        // The salt seed is the document's commitment opening: random by
-        // default (dictionary resistance), caller-supplied for a
-        // deterministic re-prepare of an already-anchored payload.
+        // Random for dictionary resistance; caller-supplied to re-prepare an anchored payload.
         const saltSeed = data.saltSeed && HEX64_RE.test(data.saltSeed)
             ? fromHex32(data.saltSeed)
             : randomBytes(32);
@@ -508,7 +426,7 @@ export function registerDocumentProofHandlers(srv: any, deps: DocumentProofHandl
         } catch (err) {
             return req.reject(400, (err as Error).message);
         }
-        // Never log: response carries witness material (scaled field values).
+        // Never log the response: it carries witness material.
         log.info(`prepared document proof: ${specs.length} fields, ${built.emptyFields.length} empty`);
 
         return {
@@ -516,16 +434,12 @@ export function registerDocumentProofHandlers(srv: any, deps: DocumentProofHandl
             canonicalDocument,
             contentRoot: built.contentRoot,
             schemaId: built.schemaId,
-            // The shared descriptor list behind schemaId (public).
             schema: JSON.stringify(built.schema),
             fields: JSON.stringify(built.fields),
             emptyFields: JSON.stringify(built.emptyFields),
-            // Salted leaf layer in slot order (informational).
             leaves: JSON.stringify(built.leaves),
-            // Cross-root witness bundle: STORE alongside the document. The
-            // saltSeed inside is the opening of every leaf; losing it makes
-            // the anchored root unprovable, leaking it makes shared leaf
-            // hashes dictionary-testable again.
+            // Losing the seed makes the anchored root unprovable; leaking it
+            // makes shared leaf hashes dictionary-testable.
             opening: JSON.stringify(built.opening)
         };
     });
@@ -548,10 +462,7 @@ export function registerDocumentProofHandlers(srv: any, deps: DocumentProofHandl
         if (!Array.isArray(allowed) || allowed.length === 0 || allowed.some(v => typeof v !== 'string' || v.length === 0)) {
             return req.reject(400, 'allowedValuesJson must be a non-empty JSON array of non-empty strings');
         }
-        // Same raw cap as the submission paths: a canonical set holds at most
-        // 64 DISTINCT digests, but dedupe runs after digesting, so an
-        // unbounded raw list would let one request hash arbitrarily many
-        // entries before the 64-limit ever triggers.
+        // Raw cap: dedupe to 64 runs after hashing every entry.
         if (allowed.length > 1024) {
             return req.reject(400, 'allowedValuesJson exceeds 1024 raw entries');
         }
@@ -624,8 +535,7 @@ export function registerDocumentProofHandlers(srv: any, deps: DocumentProofHandl
             producedAt = t.toISOString();
         }
 
-        // Envelope v1: hashes only, no content; agentId/modelId are public by
-        // design. Canonical form is what verifiers re-hash.
+        // Hashes only; agentId/modelId are public. Verifiers re-hash the canonical form.
         const envelope: Record<string, unknown> = {
             v: 1,
             agentId: data.agentId,
@@ -638,9 +548,7 @@ export function registerDocumentProofHandlers(srv: any, deps: DocumentProofHandl
         const envelopeJson = canonicalize(envelope);
         const payloadHash = blake2b256Hex(envelopeJson);
 
-        // Reuse the anchorDocument pipeline unchanged (rate limit, Documents
-        // row, job, sponsoring). The canonical envelope rides as the public
-        // metadata blob, so the on-chain metadata hash commits to it.
+        // The envelope is the anchor's metadata blob, so the on-chain metadata hash commits to it.
         try {
             const anchored = await srv.send({
                 event: 'anchorDocument',

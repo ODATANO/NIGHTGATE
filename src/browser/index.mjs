@@ -25,10 +25,15 @@ export {
     prepareRevokeDisclosure,
     prepareGrantDisclosure,
     prepareAttest,
-    prepareAttestCommit,
-    prepareAttestReveal,
+    recordKeyOf,
+    prepareRegisterDocument,
     prepareRegisterPassport,
+    prepareBindDocument,
     prepareBindPassport,
+    prepareRetract,
+    prepareRetractAttestation,
+    preparePurgeExpired,
+    DEFAULT_CLAIM_LIFETIME_S,
     prepareAnchorContentRoot,
     prepareProveFieldPredicate,
     prepareProveFieldEquality,
@@ -46,10 +51,10 @@ export const CONTRACTS = {
     'attestation-vault': {
         name: 'attestation-vault',
         artifactSubpath: '@odatano/nightgate/browser/attestation-vault',
-        circuits: ['attest', 'attestGuarded', 'grantDisclosure', 'revokeDisclosure', 'registerPassport', 'bindPassport', 'anchorContentRoot', 'proveFieldPredicate', 'proveFieldEquality', 'proveFieldMembership', 'proveDocumentComparison'],
+        circuits: ['attest', 'retract', 'grantDisclosure', 'revokeDisclosure', 'registerDocument', 'bindDocument', 'anchorContentRoot', 'proveFieldPredicate', 'proveFieldEquality', 'proveFieldMembership', 'proveDocumentComparison'],
         // Circuits that need the attester-identity witness (local_secret_key).
         // The proof circuits are NOT in here: holders prove without the secret.
-        attesterGated: ['attest', 'attestGuarded', 'grantDisclosure', 'revokeDisclosure', 'registerPassport', 'bindPassport', 'anchorContentRoot'],
+        attesterGated: ['attest', 'retract', 'grantDisclosure', 'revokeDisclosure', 'registerDocument', 'bindDocument', 'anchorContentRoot'],
         // Circuits that need the per-call proof bundle witnesses
         // (proveFieldEquality: path only; proveFieldMembership: digest + set
         // path; proveDocumentComparison: docPair leaf layers).
@@ -67,8 +72,8 @@ export const CONTRACTS = {
     'attestation-vault-32': {
         name: 'attestation-vault-32',
         artifactSubpath: '@odatano/nightgate/browser/attestation-vault-32',
-        circuits: ['attest', 'attestGuarded', 'grantDisclosure', 'revokeDisclosure', 'registerPassport', 'bindPassport', 'anchorContentRoot', 'proveFieldPredicate', 'proveFieldEquality', 'proveFieldMembership', 'proveDocumentComparison'],
-        attesterGated: ['attest', 'attestGuarded', 'grantDisclosure', 'revokeDisclosure', 'registerPassport', 'bindPassport', 'anchorContentRoot'],
+        circuits: ['attest', 'retract', 'grantDisclosure', 'revokeDisclosure', 'registerDocument', 'bindDocument', 'anchorContentRoot', 'proveFieldPredicate', 'proveFieldEquality', 'proveFieldMembership', 'proveDocumentComparison'],
+        attesterGated: ['attest', 'retract', 'grantDisclosure', 'revokeDisclosure', 'registerDocument', 'bindDocument', 'anchorContentRoot'],
         merkleWitnessed: ['proveFieldPredicate', 'proveFieldEquality', 'proveFieldMembership', 'proveDocumentComparison'],
         hasPrivateState: false,
         slotWidth: 32,

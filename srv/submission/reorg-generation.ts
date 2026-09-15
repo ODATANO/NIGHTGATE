@@ -1,11 +1,6 @@
 /**
- * Reorg generation: a counter on the SyncState singleton that every rollback
- * transaction increments. An indexer lookup runs OUTSIDE the write
- * transaction that records its outcome, so a rollback in between would let
- * evidence of the rolled-back fork commit and leave the pending scan for
- * good. Readers capture the generation before the lookup and the write
- * transaction locks the singleton row (a rollback updates the same row, so
- * the two serialise) and compares; a changed generation means "look again".
+ * Rollback counter on SyncState. Indexer lookups run outside the transaction
+ * that records them: capture the generation first, lock + compare at write.
  * SPDX-License-Identifier: Apache-2.0
  */
 
@@ -16,7 +11,6 @@ const { SELECT } = cds.ql;
 
 type Runner = { run: (...args: any[]) => Promise<unknown> };
 
-/** The current generation; 0 when the singleton does not exist yet. */
 export async function readReorgGeneration(runner: Runner): Promise<number> {
     const row = await runner.run(SELECT.one.from(SyncState).columns('reorgGeneration').where({ ID: 'SINGLETON' })) as { reorgGeneration?: unknown } | null;
     const n = Number(row?.reorgGeneration ?? 0);
@@ -24,10 +18,8 @@ export async function readReorgGeneration(runner: Runner): Promise<number> {
 }
 
 /**
- * Inside a write transaction: take the singleton's row lock, then read the
- * generation as this transaction sees it. The same-value UPDATE is the lock
- * (PostgreSQL writes a new tuple version regardless; SQLite has one writer).
- * Unquoted identifiers fold to the names CAP created on both databases.
+ * Take the singleton's row lock (the same-value UPDATE), then read the
+ * generation as this transaction sees it. Serialises with a rollback's bump.
  */
 export async function lockReorgGeneration(tx: Runner): Promise<number> {
     await tx.run("UPDATE midnight_SyncState SET reorgGeneration = COALESCE(reorgGeneration, 0) WHERE ID = 'SINGLETON'");
@@ -35,11 +27,8 @@ export async function lockReorgGeneration(tx: Runner): Promise<number> {
 }
 
 /**
- * Inside the rollback transaction, as its FIRST write: one atomic increment
- * that also takes the singleton's row lock. From here until the rollback
- * commits, every confirmer commit waits on that lock and then sees the new
- * generation; a bump after the cleanup would leave a window in which a
- * confirmer commits the old fork's evidence and the cleanup misses it.
+ * Must be the rollback transaction's FIRST write: the lock it takes makes
+ * confirmer commits wait, so none can slip old-fork evidence past the cleanup.
  */
 export async function bumpReorgGeneration(tx: Runner): Promise<number> {
     await tx.run("UPDATE midnight_SyncState SET reorgGeneration = COALESCE(reorgGeneration, 0) + 1 WHERE ID = 'SINGLETON'");

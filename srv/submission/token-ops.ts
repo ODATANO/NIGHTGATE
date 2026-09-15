@@ -1,9 +1,4 @@
-/**
- * Token operations: thin wrappers around the wallet-worker RPCs backing the
- * OData `sendNight` action and wallet diagnostics, translating the
- * user-facing shape to the worker's primitive RPC contract. The worker owns the
- * wallet facade; the main thread only orchestrates.
- */
+/** Main-thread wrappers mapping `sendNight` and wallet diagnostics onto worker RPCs. */
 
 import {
     walletTransferNight,
@@ -15,17 +10,17 @@ import {
 // ---- sendNight ------------------------------------------------------------
 
 export interface SendNightArgs {
-    /** Worker facade key (typically the accountId derived from the viewing key). */
+    /** Worker facade key (the accountId). */
     cacheKey: string;
-    /** Bech32m receiver address, either shielded (`mn_shield-addr_...`) or unshielded (`mn_addr_...`). */
+    /** Shielded (`mn_shield-addr_...`) or unshielded (`mn_addr_...`). */
     receiverAddress: string;
-    /** NIGHT atoms as decimal string; parsed to bigint inside the worker. */
+    /** NIGHT atoms, decimal string. */
     amount: string;
-    /** ISO-8601 TTL for the transaction. Defaults to +10min in the worker. */
+    /** Defaults to +10 min in the worker. */
     ttlIso?: string;
-    /** Max wait for wallet sync before send. Undefined = wait indefinitely. */
+    /** Undefined waits indefinitely. */
     syncTimeoutMs?: number;
-    /** Raw token type (64 hex) to send instead of NIGHT; e.g. a contract-minted shielded token. */
+    /** Raw token type (64 hex) to send instead of NIGHT. */
     tokenTypeHex?: string;
     /** Pre-broadcast handshake: persist the announced identifier, then the worker sends. */
     onSubmitIntent?: SubmitIntentHook;
@@ -59,25 +54,18 @@ export interface GetWalletBalanceArgs {
 }
 
 export interface WalletBalanceSnapshot {
-    /** NIGHT atoms held on the shielded ledger, decimal string. */
     shieldedNight: string;
-    /** NIGHT atoms held on the unshielded ledger, decimal string. */
     unshieldedNight: string;
-    /** Every other shielded token type with a non-zero balance: raw 64-hex type (deriveTokenType), atoms. */
+    /** Non-NIGHT shielded tokens with a non-zero balance: raw 64-hex type, atoms. */
     shieldedTokens: Array<{ tokenType: string; amount: string }>;
-    /** Current DUST atoms (accrued from registered NIGHT), decimal string. */
     dustBalance: string;
-    /** Number of NIGHT UTXOs currently registered for dust generation. */
     registeredNightUtxoCount: number;
-    /** Total NIGHT UTXOs the wallet tracks (registered + unregistered). */
     totalNightUtxoCount: number;
-    /** DUST UTXOs the local state currently tracks as spendable-or-growing. */
     dustUtxoCount: number;
-    /** DUST spends currently marked in-flight (pending confirmation). */
+    /** DUST spends in flight, awaiting confirmation. */
     dustPendingCount: number;
-    /** Current DUST atoms locked by in-flight spends, decimal string. */
     dustPendingValue: string;
-    /** Times the dust wedge protection restored this facade's dust sub-wallet from a pre-build snapshot (process-lifetime). */
+    /** Dust sub-wallet restores from a pre-build snapshot in this process. */
     dustRestoreCount: number;
 }
 
@@ -102,9 +90,8 @@ export interface EstimateSendNightFeeArgs {
 }
 
 export interface EstimateFeeResult {
-    /** Dust atoms as decimal string. */
+    /** Dust atoms, decimal string. */
     fee: string;
-    /** Destination ledger derived from receiver address prefix. */
     toLedger: 'shielded' | 'unshielded';
 }
 

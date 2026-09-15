@@ -12,7 +12,7 @@
 // Inputs (env vars):
 //   NIGHTGATE_URL                  default http://localhost:4004
 //   DEPLOY_E2E_ARTIFACT            default 'counter'; e.g. 'attestation-vault'
-//                                  to exercise the 0.10.0 constructor (registrar)
+//                                  to exercise the constructor argument (registrar)
 //   LACE_VIEWING_KEY               required, Midnight Preprod viewing key from Lace
 //   LACE_MNEMONIC                  required, BIP39 recovery phrase (12/24 words);
 //                                  the server HD-derives per-role keys from it
@@ -51,9 +51,9 @@ function pretty(o) { return JSON.stringify(o, null, 2); }
 
 if (!VK) fail('LACE_VIEWING_KEY env var is required');
 
-// The server now performs Midnight's per-role HD derivation from the mnemonic
-// (see srv/utils/wallet-hd.ts), so we pass the BIP39 phrase straight through,
-// no client-side seed truncation. Validate locally for a fast fail.
+// The server performs Midnight's per-role HD derivation from the mnemonic
+// (see srv/utils/wallet-hd.ts), so the BIP39 phrase is passed straight
+// through. Validate locally for a fast fail.
 if (!MNEMONIC || !bip39.validateMnemonic(MNEMONIC.trim())) {
     fail('LACE_MNEMONIC (a valid BIP39 phrase) is required');
 }

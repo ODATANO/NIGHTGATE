@@ -1,5 +1,5 @@
 /**
- * `sponsorFinalizedTransaction` (0.17.0): the sponsor pays for whatever bytes
+ * `sponsorFinalizedTransaction`: the sponsor pays for whatever bytes
  * it is handed, so the two things that must hold are (a) an idempotency key
  * dedupes on the TRANSACTION, not on its size, and (b) the allow-list travels
  * with the job.
@@ -70,6 +70,11 @@ vi.mock('../../srv/submission/fee-sponsor', async (importOriginal) => ({
     resolveFeeSponsor: vi.fn(async () => ({ sponsorSessionId: 'sponsor-1', accountId: 'acct-1' })),
     ensureFeeSponsorFacade: vi.fn(async () => undefined)
 }));
+const syncGate = vi.hoisted(() => ({ atGate: (_id: string): boolean => false }));
+vi.mock('../../srv/submission/sponsor-sync-gate', async (importOriginal) => ({
+    ...(await importOriginal<Record<string, unknown>>()),
+    sponsorAtSyncGate: (id: string) => syncGate.atGate(id)
+}));
 vi.mock('../../srv/midnight/providers', async (importOriginal) => ({
     ...(await importOriginal<Record<string, unknown>>()),
     ensureNetworkId: vi.fn(async () => undefined)
@@ -137,9 +142,9 @@ describe('sponsorFinalizedTransaction', () => {
     });
 
     test('fingerprints the transaction CONTENT, so equal-length bodies do not dedupe', async () => {
-        // The bug this pins: a length-only fingerprint made these two requests
-        // identical, and the second caller was handed the first one's job, so a
-        // different transaction than the one submitted would have been reported.
+        // A length-only fingerprint would make these two requests identical
+        // and hand the second caller the first one's job, reporting a
+        // different transaction than the one submitted.
         expect(TX_A.length).toBe(TX_B.length);
         expect(TX_A).not.toBe(TX_B);
 
@@ -168,9 +173,9 @@ describe('sponsorFinalizedTransaction', () => {
     });
 
     test('pool jobs are keyed under the SENTINEL: stable idempotency identity', async () => {
-        // Keying under whichever member was free
-        // made a retry with the same idempotencyKey land under a DIFFERENT
-        // session and start a second job.
+        // Keying under whichever member is free would make a retry with the
+        // same idempotencyKey land under a DIFFERENT session and start a
+        // second job.
         process.env.NIGHTGATE_FEE_SPONSOR_SESSION = 'pool-1,pool-2';
         const srv = setup();
         const out1: any = await srv.handlers['sponsorFinalizedTransaction'](makeReq({ finalizedTxB64: TX_A, idempotencyKey: 'k1' }));
@@ -312,7 +317,7 @@ describe('sponsorFinalizedTransaction', () => {
 });
 
 // The persisted command carries the effective lists (floor ∩ grant); an empty intersection refuses at admission with 403 and starts no job.
-describe('per-grant sponsor policy (0.21.0)', () => {
+describe('per-grant sponsor policy', () => {
     beforeEach(() => { startJobCalls.length = 0; });
     afterEach(() => {
         delete process.env.NIGHTGATE_SPONSOR_ALLOWED_CONTRACTS;
@@ -348,7 +353,7 @@ describe('per-grant sponsor policy (0.21.0)', () => {
     });
 });
 
-describe('sponsorUnboundTransaction (0.18 parallel channel)', () => {
+describe('sponsorUnboundTransaction (parallel channel)', () => {
     beforeEach(() => {
         startJobCalls.length = 0;
         __resetSponsorPoolForTests();
@@ -356,9 +361,10 @@ describe('sponsorUnboundTransaction (0.18 parallel channel)', () => {
     });
 
     test('starts its job under the command version its processor is registered with', async () => {
-        // Regression: the processor was once registered with an env-derived
-        // "concurrency" in the VERSION slot (default 4), so startJob looked for
-        // v1 and every live job failed with "no command processor registered".
+        // The VERSION slot must carry the command version, never an
+        // env-derived value: startJob looks for the version the action
+        // passes, and a mismatch fails every job with "no command processor
+        // registered".
         const srv = setup();
         const req = makeReq({ unboundTxB64: TX_A, sponsorSessionId: 'sponsor-1' });
         await srv.handlers['sponsorUnboundTransaction'](req);
@@ -439,7 +445,7 @@ describe('sponsorUnboundTransaction external-effect boundary', () => {
     });
 
     test('a rebuild-retry after a broadcast crosses the boundary ONCE and gets its own PendingSubmissions row', async () => {
-        // Live-shaped sequence: attempt 1 announces + broadcasts, the ledger
+        // Sequence: attempt 1 announces + broadcasts, the ledger
         // answers 196 (dust race) -> attempt 2 is rebuilt, announces a NEW
         // identifier and broadcasts again. external_execution may only be
         // reported once (markJobExternalExecution is not re-entrant); every
@@ -500,9 +506,9 @@ describe('sponsorUnboundTransaction external-effect boundary', () => {
     });
 
     test('a call that landed but did NOT apply (PARTIAL_SUCCESS) is TERMINAL: no sponsor-side rebuild, hash kept, attempt row REBUILT-marked for audit', async () => {
-        // Live (rc10 N=8 burst): 6 losers x 4 rebuild retries, every retry
-        // rejected at admission with 1010: the CALLER's transcript is stale,
-        // re-attaching fresh dust to the same caller bytes cannot help.
+        // The CALLER's transcript is stale, so re-attaching fresh dust to the
+        // same caller bytes cannot help: every rebuild retry would be
+        // rejected at admission with 1010.
         setup();
         const proc = processors.get('sponsorUnboundTransaction')!;
         let n = 0;
@@ -601,7 +607,25 @@ describe('submit-intent persistence', () => {
         process.env.NIGHTGATE_SPONSOR_DUST_BACKOFF_MS = '0';
         vi.mocked(resolveFeeSponsor).mockImplementation(async ({ sponsorSessionId }: any) => ({ sponsorSessionId, accountId: `acct-${sponsorSessionId}` } as any));
     });
-    afterEach(() => { delete process.env.NIGHTGATE_SPONSOR_DUST_RETRIES; delete process.env.NIGHTGATE_SPONSOR_DUST_BACKOFF_MS; delete process.env.NIGHTGATE_FEE_SPONSOR_SESSION; });
+    afterEach(() => { delete process.env.NIGHTGATE_SPONSOR_DUST_RETRIES; delete process.env.NIGHTGATE_SPONSOR_DUST_BACKOFF_MS; delete process.env.NIGHTGATE_FEE_SPONSOR_SESSION; syncGate.atGate = () => false; });
+
+    test('pool jobs go to a member at the sync gate before a lagging one, on both sponsoring paths', async () => {
+        process.env.NIGHTGATE_FEE_SPONSOR_SESSION = 'pool-1,pool-2';
+        syncGate.atGate = (id) => id === 'pool-2';
+        workerImpl.fn = async () => ({ txHash: '00aa', circuits: ['attest'], contractAddress: 'c' });
+        unboundWorkerImpl.fn = async () => ({ txHash: '00bb', circuits: ['attest'], contractAddress: 'c', note: 'b' });
+        setup();
+        const unbound = processors.get('sponsorUnboundTransaction')!;
+        vi.mocked(resolveFeeSponsor).mockClear();
+        await unbound({ op: 'sponsorUnbound', unboundTxB64: TX_A, sponsorSessionId: PLATFORM_POOL_SENTINEL, allowedContracts: [], allowedCircuits: [] }, { ID: 'j1', sessionId: PLATFORM_POOL_SENTINEL, requestedBy: 'u' } as any);
+        expect(vi.mocked(resolveFeeSponsor).mock.calls[0][0]).toMatchObject({ sponsorSessionId: 'pool-2' });
+
+        __resetSponsorPoolForTests(); // pool-1 is least recently used again
+        const bound = processors.get('sponsorFinalizedTransaction')!;
+        vi.mocked(resolveFeeSponsor).mockClear();
+        await bound({ op: 'sponsorFinalized', finalizedTxB64: TX_A, sponsorSessionId: PLATFORM_POOL_SENTINEL }, { ID: 'j2', sessionId: PLATFORM_POOL_SENTINEL, requestedBy: 'u', commandVersion: 1 } as any);
+        expect(vi.mocked(resolveFeeSponsor).mock.calls[0][0]).toMatchObject({ sponsorSessionId: 'pool-2' });
+    });
 
     test('the attempt row stores the WORKER-inspected coordinates and the CONCRETE sponsor (not the pool sentinel)', async () => {
         process.env.NIGHTGATE_FEE_SPONSOR_SESSION = 'pool-1,pool-2';

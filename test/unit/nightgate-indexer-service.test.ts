@@ -15,8 +15,7 @@
 
 // The CAP server boots the compiled srv/*.js through Node's own require
 // (OUTSIDE vitest's module graph), so vi.mock would only patch this file's
-// imports, never the crawler calls inside the booted service (under jest the
-// runtime intercepted every require, so vi.mock's jest equivalent worked).
+// imports, never the crawler calls inside the booted service.
 // Instead, load the SAME native module instance the booted service uses and
 // stub its exports: the compiled service reads them as namespace properties at
 // call time, so the stubs land.
@@ -56,7 +55,7 @@ beforeAll(async () => {
 });
 
 beforeEach(async () => {
-    // Readiness now requires a COMPLETED initialisation, and these tests boot
+    // Readiness requires a COMPLETED initialisation, and these tests boot
     // the service with SKIP_AUTO_INIT, so initialize() never runs and the real
     // holder reports a process that has not started. vi.mock cannot reach the
     // booted service (see the header note), so the state is published into the
@@ -83,10 +82,8 @@ beforeEach(async () => {
 //
 // The framework already ran init() once at boot (creating the SINGLETON row
 // from the configured nightgate settings). We assert that behavioral outcome:
-// a SINGLETON SyncState row exists and is queryable. The old query-shape
-// assertions (__type:'insert', exact networkId/nodeUrl from env/config) are
-// reframed to "the row exists and getSyncStatus reflects persisted state",
-// since the [test] profile's config (not the old mockEnv) governs the values.
+// a SINGLETON SyncState row exists and getSyncStatus reflects persisted
+// state; the [test] profile's config governs the values.
 // ----------------------------------------------------------------------------
 describe('SyncState initialization', () => {
     it('has created the SINGLETON SyncState row at boot', async () => {
@@ -280,7 +277,7 @@ describe('getLiveness', () => {
 
 describe('getReadiness', () => {
     // The crawler-behavior expectations below describe an ENABLED crawler; a
-    // deliberately disabled one passes its checks as not-applicable (0.16.0).
+    // deliberately disabled one passes its checks as not-applicable.
     const prevCrawlerEnv = process.env.NIGHTGATE_CRAWLER_ENABLED;
     beforeEach(() => { process.env.NIGHTGATE_CRAWLER_ENABLED = 'true'; });
     afterEach(() => {

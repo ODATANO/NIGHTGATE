@@ -55,7 +55,7 @@ describe('validatePolicyList', () => {
     });
 });
 
-describe('allowedTokenTypes (0.22.0): raw types, floor opens, grant narrows', () => {
+describe('allowedTokenTypes: raw types, floor opens, grant narrows', () => {
     const T1 = 'ab'.repeat(32);
     const T2 = 'cd'.repeat(32);
 
@@ -120,7 +120,7 @@ describe('effectiveSponsorPolicy', () => {
     });
 });
 
-describe('allowDeploy (0.21.0): floor AND grant, never implied', () => {
+describe('allowDeploy: floor AND grant, never implied', () => {
     const floorOpen = { allowedContracts: [], allowedCircuits: [], allowDeploy: true };
     const floorClosed = { allowedContracts: [], allowedCircuits: [] };
 

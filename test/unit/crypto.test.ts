@@ -28,7 +28,7 @@ afterEach(() => {
     __resetKeyRingForTests();
 });
 
-/** Pre-0.23 ciphertext: iv:tag:data under the SHA-256 fold of the secret. */
+/** Legacy v1 ciphertext: iv:tag:data under the SHA-256 fold of the secret. */
 function legacyEncrypt(plaintext: string, key: Buffer): string {
     const iv = crypto.randomBytes(12);
     const cipher = crypto.createCipheriv('aes-256-gcm', key, iv, { authTagLength: 16 });

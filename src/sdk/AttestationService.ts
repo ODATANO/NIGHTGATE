@@ -1,23 +1,4 @@
-/**
- * Service-implementation helpers for the abstract `AttestationService` CDS
- * mixin. A consumer service that extends `AttestationService` calls
- * `registerAttestationServiceHandlers(this, db)` from its own `init()` to
- * wire:
- *
- *   1. `attachDisclosureRole` as a `before('*')` hook so every request
- *      gets `req.disclosureRole` populated from `midnight.DisclosureRoles`.
- *   2. Per-entity tier gates: `Disclosed` requires `legitimate_interest+`,
- *      `Authority` requires `authority`. `Public` has no gate.
- *
- * The gates reject with a 403 instead of silently returning an empty set,
- * so callers can tell "you can't reach this tier" apart from "this tier is
- * empty for you".
- *
- * TODO: Row-level visibility (e.g. "show me only attestations I have an on-chain
- * disclosure for") is deliberately out of scope here: that requires
- * indexing the AttestationVault `disclosures` Map into NIGHTGATE and
- * joining at query time.
- */
+/** Handlers for the abstract `AttestationService` CDS mixin; row-level visibility is out of scope. */
 import type cds from '@sap/cds';
 import {
     attachDisclosureRole,
@@ -34,26 +15,18 @@ const REQUIRED: Record<AttestationTier, DisclosureRoleValue> = {
 };
 
 /**
- * Wire the disclosure-role middleware + per-entity tier gates on the given
- * CAP service. Idempotent in the sense that re-registering on the same
- * service instance would just stack hooks (CAP allows that, but consumers
- * should call this once from their service's `init()`).
+ * Call from `init()`: sets `req.disclosureRole` on every request and answers reads
+ * of `Disclosed`/`Authority` below the required tier with 403, not an empty set.
  */
 export function registerAttestationServiceHandlers(
     srv: cds.ApplicationService,
     db: cds.DatabaseService
 ): void {
-    // 1. Populate req.disclosureRole on every incoming request, so handlers
-    //    of ungated entities and consumer code see it. The handler no-ops if
-    //    there's no req.user (anonymous -> public_only default).
     (srv as any).before('*', async (req: cds.Request) => {
         await attachDisclosureRole(req, db);
     });
 
-    // 2. Gate per-entity reads. CAP starts every before-handler of an event
-    //    at once, so the gate cannot rely on the '*' hook having finished:
-    //    it resolves the role itself when it is not on the request yet. The
-    //    rejection still fires before CAP runs the DB query.
+    // CAP runs before-handlers in parallel: the gate cannot rely on the '*' hook.
     (srv as any).before('READ', 'Disclosed', makeTierGate('Disclosed', db));
     (srv as any).before('READ', 'Authority', makeTierGate('Authority', db));
 }
@@ -72,12 +45,8 @@ function makeTierGate(tier: AttestationTier, db: cds.DatabaseService) {
 }
 
 /**
- * Portable Attestation Credential (PAC) proof envelope. Field names match the
- * envelope NIGHTPASS drops into a `PredicateAttestationCredential`, so the
- * output is consumed unchanged.
- *
- * The proof is not standalone-verifiable with just a
- * VK. `proofValue` is therefore the proving transaction's hash.
+ * Portable Attestation Credential proof envelope; field names are a public contract.
+ * `proofValue` is the proving tx hash: Midnight proofs are not verifiable standalone.
  */
 export interface PredicateAttestationEnvelope {
     digestMultibase: string | null;
@@ -96,7 +65,6 @@ export interface PredicateAttestationEnvelope {
     };
 }
 
-/** The AttestationVault circuit that proves a given predicate literal. */
 function circuitForPredicate(predicate: string): string {
     if (predicate === 'bytesEquality') return 'proveFieldEquality';
     if (predicate === 'setMembership') return 'proveFieldMembership';
@@ -104,11 +72,7 @@ function circuitForPredicate(predicate: string): string {
     return 'proveFieldPredicate';
 }
 
-/**
- * Shape a `PredicateAttestations` row (or an issue* proof-action job result)
- * into the PAC proof envelope. Pure/synchronous so consumers can call it
- * without any NIGHTGATE service context.
- */
+/** A `PredicateAttestations` row or issue* job result as a PAC envelope; pure, needs no service context. */
 export function toPredicateEnvelope(row: {
     predicate: string;
     threshold?: number | string | null;

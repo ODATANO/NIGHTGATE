@@ -117,7 +117,7 @@ vi.mock('../../srv/utils/wallet-info', async () => {
     };
 });
 
-// Phase 2: dust handlers + connectWalletForSigning hand long work to startJob
+// Dust handlers + connectWalletForSigning hand long work to startJob
 // and return { jobId, status }. The stub here returns a predictable jobId so
 // handler-level assertions can be deterministic; the work fn is captured for
 // the few cases that drive it explicitly (idempotency, failure classification).
@@ -427,7 +427,6 @@ describe('wallet session handlers', () => {
 
     // Boot hygiene: a session is a per-connect handle owned by a caller in a
     // specific process, so an ungraceful stop leaks it for the full 24h TTL.
-    // Live-observed: 12 simultaneously active rows for one wallet.
     describe('closeSessionsFromPreviousProcess', () => {
         const previousSponsorEnv = process.env.NIGHTGATE_FEE_SPONSOR_SESSION;
         afterEach(() => {
@@ -470,7 +469,7 @@ describe('wallet session handlers', () => {
         // A session upgraded with a mnemonic keeps its signing key across a
         // restart: closing it would revoke the key, and only a fresh
         // connectWalletForSigning brings it back (a pool member taken out of
-        // the config for a while used to be lost this way).
+        // the config for a while would otherwise be lost).
         it('keeps sessions holding a signing key, closes the rest', async () => {
             delete process.env.NIGHTGATE_FEE_SPONSOR_SESSION;
             const db = {
@@ -524,8 +523,8 @@ describe('wallet session handlers', () => {
         }
     });
 
-    // session-sweep-evicts-live-facade FR: the sweep must not evict a facade
-    // that another active session of the same wallet still uses.
+    // The sweep must not evict a facade that another active session of the
+    // same wallet still uses.
 
     it('session cleanup keeps the facade when another active session uses the same wallet', async () => {
         let callback: (() => Promise<void>) | undefined;
@@ -579,11 +578,11 @@ describe('wallet session handlers', () => {
     });
 
     it('session cleanup keeps the facade when the surviving sibling is an EXPIRED platform sponsor', async () => {
-        // The guard used to ask SQL for `expiresAt > now`, which does not know
-        // that a configured platform sponsor never expires. Its row therefore
-        // looked dead to this one check while staying alive everywhere else,
-        // and disconnecting any sibling session of the same wallet evicted the
-        // facade the pool was still sponsoring from.
+        // A SQL `expiresAt > now` guard does not know that a configured
+        // platform sponsor never expires: its row would look dead to this one
+        // check while staying alive everywhere else, and disconnecting any
+        // sibling session of the same wallet would evict the facade the pool
+        // sponsors from.
         let callback: (() => Promise<void>) | undefined;
         const setIntervalSpy = vi.spyOn(global, 'setInterval').mockImplementation(((handler: TimerHandler) => {
             callback = handler as () => Promise<void>;
@@ -596,7 +595,7 @@ describe('wallet session handlers', () => {
             run: vi.fn()
                 .mockResolvedValueOnce([{ sessionId: 'caller-9', viewingKeyHash: 'hash-shared', encryptedViewingKey: encrypt('a'.repeat(64), encKey), userId: 'owner-9' }])
                 .mockResolvedValueOnce(1)
-                // The guard now reads active rows WITH their expiry and judges
+                // The guard reads active rows WITH their expiry and judges
                 // them itself: the sponsor row is long past its TTL and still counts.
                 .mockResolvedValueOnce([{ sessionId: 'pool-sponsor-9', expiresAt: longAgo }])
         };
@@ -1237,8 +1236,8 @@ describe('wallet session handlers', () => {
             expect(mockEstimateSendNightFee).not.toHaveBeenCalled();
         });
 
-        // 0.10.2 pool-starvation fix (worker-calls-outside-request-tx FR):
-        // session reads detach from the request tx, worker waits are bounded.
+        // Session reads detach from the request tx, worker waits are bounded
+        // (a worker wait inside a request tx would starve the DB pool).
 
         it('getWalletBalance resolves the session read outside the ambient request tx', async () => {
             mockRunWithoutAmbientTx.mockClear();
@@ -1312,8 +1311,8 @@ describe('wallet session handlers', () => {
             expect(mockRunWithoutAmbientTx).toHaveBeenCalledTimes(2);
         });
 
-        // session-sweep-evicts-live-facade FR: logout of one session must not
-        // evict the facade a sibling active session still uses.
+        // Logout of one session must not evict the facade a sibling active
+        // session still uses.
 
         it('keeps the facade when another active session still uses the wallet', async () => {
             mockDbRun.mockResolvedValueOnce({ ...activeSessionRow(), viewingKeyHash: 'hash-a', userId: TEST_USER_ID });
@@ -1402,10 +1401,9 @@ describe('wallet session handlers', () => {
         });
 
         it('reads the balance of an EXPIRED session that is configured as a sponsor', async () => {
-            // Live-observed on the hosted server: the pool's own sessions have
-            // long-past expiresAt (they are exempt where they act as
-            // infrastructure), so every ordinary read answered 410 for wallets
-            // that were paying for everyone's transactions.
+            // The pool's own sessions have long-past expiresAt (they are
+            // exempt where they act as infrastructure); an ordinary read must
+            // not answer 410 for a wallet that pays for everyone's transactions.
             process.env.NIGHTGATE_FEE_SPONSOR_SESSION = SPONSOR_SESSION;
             mockDbRun.mockResolvedValueOnce({ ...activeSessionRow({ expiresInMs: -60_000 }), sessionId: SPONSOR_SESSION });
             mockGetWalletBalance.mockResolvedValueOnce({ dustBalance: '42', registeredNightUtxoCount: 1 });
@@ -1460,7 +1458,7 @@ describe('wallet session handlers', () => {
         beforeEach(() => {
             // Default to a WARM facade: the handler refuses to read a balance
             // from a cold one, so every other case here needs progress present.
-            mockWalletGetSyncProgress.mockReturnValue({ caughtUp: true });
+            mockWalletGetSyncProgress.mockReturnValue({ caughtUp: true, updatedAt: new Date().toISOString() });
             mockHasWalletFacade.mockReturnValue(false);
         });
 
@@ -1509,9 +1507,9 @@ describe('wallet session handlers', () => {
             // Dust generation is delegable: a foreign wallet points its NIGHT
             // at this sponsor's dust address, and every one of its registered
             // UTXOs yields a note here while this sponsor's own registration
-            // count never moves. Reporting the own count showed a pool that had
-            // just gone from 3 to 14 notes as flat, and a sponsor funded purely
-            // by donors as unusable.
+            // count never moves. Reporting the own count would show a growing
+            // delegated pool as flat, and a sponsor funded purely by donors as
+            // unusable.
             process.env.NIGHTGATE_FEE_SPONSOR_SESSION = SPONSOR;
             const row = { ...activeSessionRow(), sessionId: SPONSOR };
             mockDbRun.mockResolvedValueOnce(row).mockResolvedValueOnce(row);
@@ -1529,8 +1527,8 @@ describe('wallet session handlers', () => {
 
         it('counts only FREE dust notes, since a pending one cannot back another sponsorship', async () => {
             // `dustUtxoCount` is the SDK's total, which is available PLUS
-            // pending. Reading it as capacity promised four parallel
-            // sponsorships from a wallet that could serve two.
+            // pending. Reading it as capacity would promise more parallel
+            // sponsorships than the wallet can serve.
             process.env.NIGHTGATE_FEE_SPONSOR_SESSION = SPONSOR;
             const row = { ...activeSessionRow(), sessionId: SPONSOR };
             mockDbRun.mockResolvedValueOnce(row).mockResolvedValueOnce(row);
@@ -1598,10 +1596,9 @@ describe('wallet session handlers', () => {
         });
 
         it('does NOT call a configured sponsor expired, the way resolveFeeSponsor does not', async () => {
-            // Live-found: the pool reported all three production sponsors as
-            // "Session expired" while sponsoring worked fine. A configured
-            // platform sponsor is infrastructure and does not expire while it
-            // is configured; the cleanup sweep exempts it for the same reason.
+            // A configured platform sponsor is infrastructure and does not
+            // expire while it is configured; the cleanup sweep exempts it for
+            // the same reason.
             process.env.NIGHTGATE_FEE_SPONSOR_SESSION = SPONSOR;
             const expired = { ...activeSessionRow({ expiresInMs: -60_000 }), sessionId: SPONSOR };
             mockDbRun.mockResolvedValueOnce(expired).mockResolvedValueOnce(expired);
@@ -1631,12 +1628,10 @@ describe('wallet session handlers', () => {
             expect(result[0].lastError).toContain('no signing key');
         });
 
-        it('reads a resident facade that never reported progress', async () => {
-            // Live-observed on the hosted pool: a facade restored from
-            // persisted state and already at the tip is fully usable and
-            // pushes no progress snapshot, because the worker only sends those
-            // while a sync WAIT runs. Gating on progress alone reported such a
-            // sponsor as cold forever.
+        it('reads a resident facade that has not reported yet, without calling it usable', async () => {
+            // A facade built moments ago is resident before the worker's first
+            // progress-watch tick. Its balance is readable; whether it passes the
+            // sync gate is not known yet, and a sponsored job would wait on it.
             process.env.NIGHTGATE_FEE_SPONSOR_SESSION = SPONSOR;
             const row = { ...activeSessionRow(), sessionId: SPONSOR };
             mockDbRun.mockResolvedValueOnce(row).mockResolvedValueOnce(row);
@@ -1645,14 +1640,45 @@ describe('wallet session handlers', () => {
             mockGetWalletBalance.mockResolvedValueOnce({ dustBalance: '700', registeredNightUtxoCount: 2, dustUtxoCount: 2 });
 
             const result: any = await registeredHandlers['getSponsorPoolStatus'](adminRequest());
-            expect(result[0]).toMatchObject({ usable: true, registeredNightUtxos: 2, dustNotes: 2, lastError: null });
+            expect(result[0]).toMatchObject({ usable: false, caughtUp: false, registeredNightUtxos: 2, dustNotes: 2 });
+            expect(result[0].lastError).toContain('has not reported');
+        });
+
+        it('is not usable while the wallet is behind the sync gate, notes in hand or not', async () => {
+            // A successful balance read does not mean the wallet passes the
+            // gate a sponsored job waits on: a sponsor 22 events behind fails
+            // every job while its balance reads fine.
+            process.env.NIGHTGATE_FEE_SPONSOR_SESSION = SPONSOR;
+            const row = { ...activeSessionRow(), sessionId: SPONSOR };
+            mockDbRun.mockResolvedValueOnce(row).mockResolvedValueOnce(row);
+            mockWalletGetSyncProgress.mockReturnValue({
+                caughtUp: false, appliedIndex: '1520690', streamTip: '1520712', behindEvents: '22',
+                isConnected: true, indexerFresh: true, updatedAt: new Date().toISOString()
+            });
+            mockGetWalletBalance.mockResolvedValueOnce({ dustBalance: '9000', registeredNightUtxoCount: 4, dustUtxoCount: 13 });
+
+            const result: any = await registeredHandlers['getSponsorPoolStatus'](adminRequest());
+            expect(result[0]).toMatchObject({ usable: false, caughtUp: false, dustNotes: 13 });
+            expect(result[0].lastError).toContain('22 events behind');
+            expect(result[0].lastError).toContain('appliedIndex 1520690');
+        });
+
+        it('does not trust a gate verdict nobody refreshes any more', async () => {
+            process.env.NIGHTGATE_FEE_SPONSOR_SESSION = SPONSOR;
+            const row = { ...activeSessionRow(), sessionId: SPONSOR };
+            mockDbRun.mockResolvedValueOnce(row).mockResolvedValueOnce(row);
+            mockWalletGetSyncProgress.mockReturnValue({ caughtUp: true, updatedAt: new Date(Date.now() - 3_600_000).toISOString() });
+            mockGetWalletBalance.mockResolvedValueOnce({ dustBalance: '900', registeredNightUtxoCount: 3, dustUtxoCount: 3 });
+
+            const result: any = await registeredHandlers['getSponsorPoolStatus'](adminRequest());
+            expect(result[0]).toMatchObject({ usable: false, caughtUp: false });
+            expect(result[0].lastError).toMatch(/sync reading is \d+s old/);
         });
 
         it('never builds a cold facade: a status read must not create work', async () => {
-            // Live-observed: polling this against a freshly booted server piled
-            // up worker RPCs (inFlightRpcs climbing, facades still empty),
-            // because getWalletBalance builds the facade and that build
-            // outlives the capped request. The progress cache decides instead.
+            // getWalletBalance builds the facade and that build outlives the
+            // capped request, so polling a freshly booted server would pile up
+            // worker RPCs. The progress cache decides instead.
             process.env.NIGHTGATE_FEE_SPONSOR_SESSION = SPONSOR;
             const row = { ...activeSessionRow(), sessionId: SPONSOR };
             mockDbRun.mockResolvedValueOnce(row).mockResolvedValueOnce(row);

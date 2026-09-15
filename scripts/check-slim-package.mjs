@@ -37,6 +37,7 @@ const EXPECTED = {
     './txbuilder': ['createTxBuilder', 'deriveIdentity', 'ensureZkAssets',
         'deserializeTransaction', 'txIdentifiers', 'submitFinalized', 'submitExtrinsic',
         'classifyNodeReject', 'isPreMempoolReject', 'isTransportFailure', 'isAlreadyImported',
+        'rebuildOnStaleTranscript',
         'probeLanded', 'waitLanded', 'withDustGuard', 'nodeHttpUrlFor'],
     './calls': ['prepareAttest', 'prepareAnchorContentRoot', 'prepareProveFieldMembership',
         'buildAttestationVaultWitnesses', 'generateAttestationSecret', 'CONTRACTS'],
@@ -103,7 +104,7 @@ async function main() {
         if (/@odatano\/nightgate(?!-tx)/.test(text)) dirty.push(`${relative(PKG_DIR, f)} still names @odatano/nightgate`);
         // A shipped runtime file may only reach files that ship with it. The
         // built srv/ twins are copied out of a tree that has everything, so a
-        // relative require of a server-only module (0.5.0: wasm-proof-provider
+        // relative require of a server-only module (e.g. wasm-proof-provider
         // -> ../utils/config) passes the import probes and fails on the
         // consumer's first build.
         if (/\.m?js$/.test(f)) {
@@ -141,11 +142,10 @@ async function main() {
     else ok(`tarball ${mb.toFixed(2)} MB, ${packed.entryCount} files (budget ${MAX_TARBALL_MB} MB)`);
 
     // 6: REAL-INSTALL probe. The in-repo import probe resolves transitive
-    // dependencies by walking up into the MAIN tree's node_modules, which is
-    // exactly how the missing address-format phantom-dep shim shipped in
-    // 0.1.0: fine in the repo, ERR_MODULE_NOT_FOUND on every clean install.
-    // Pack the tarball, npm-install it into an isolated prefix and import the
-    // entry points THERE.
+    // dependencies by walking up into the MAIN tree's node_modules, so a
+    // phantom dependency passes there and fails with ERR_MODULE_NOT_FOUND on
+    // every clean install. Pack the tarball, npm-install it into an isolated
+    // prefix and import the entry points THERE.
     console.log('  ...   real-install probe (npm pack + install, takes a minute)');
     const probeRoot = join(PKG_DIR, '.install-probe');
     await rm(probeRoot, { recursive: true, force: true });
@@ -164,7 +164,7 @@ async function main() {
             "import '@odatano/nightgate-tx/attestation-vault-32';",
             "import '@odatano/nightgate-tx/set-root';",
             // The entry points load the proof provider lazily, so a server-only
-            // require inside it (0.5.0) passes the imports above and dies on
+            // require inside it passes the imports above and dies on
             // the consumer's first wasm build. Load it here, in the clean
             // install, and check the environment fallback answers.
             "import { createRequire } from 'node:module';",

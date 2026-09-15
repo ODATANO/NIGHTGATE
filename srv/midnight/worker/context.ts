@@ -1,13 +1,10 @@
 /**
- * Worker-thread context shared by every worker module: the facade registry,
- * the log channel to the main thread, the SDK loaders (dynamic ESM imports,
- * memoised) and the address helpers. Importable without a parentPort: `log`
- * is a no-op outside a worker thread.
+ * Worker-thread context: facade registry, log channel, memoised SDK loaders,
+ * address helpers. Importable without a parentPort (`log` is then a no-op).
  */
 
-// First import on purpose: the worker modules import each other in cycles,
-// and a value read at module level must come from an import that is
-// resolved before the cycle re-enters this module.
+// First import on purpose: the worker modules import each other in cycles and
+// a module-level read must resolve before the cycle re-enters.
 import { configEnum, setConfigWarnSink } from '../../utils/config';
 import { RpcErrorPayload } from '../wallet-worker-protocol';
 import path from 'node:path';
@@ -17,6 +14,7 @@ import { deriveAttestationSecret } from '../../submission/contract-witnesses';
 import type * as AddressFormat from '@midnightntwrk/wallet-sdk-address-format';
 import { parentPort, type MessagePort } from 'node:worker_threads';
 import { startProgressWatch } from './facades';
+import type { ReplayKind, ReplayTrack } from './sync-replay';
 
 export interface RpcRequest {
     kind: 'rpc';
@@ -52,29 +50,33 @@ export interface FacadeEntry {
     saveTimer?: NodeJS.Timeout;
     /** Idle progress watch (startProgressWatch); cleared with the facade. */
     progressTimer?: NodeJS.Timeout;
-    lastSavedBlobs?: { shielded?: string; unshielded?: string; dust?: string }; // Blobs of the last save the MAIN THREAD CONFIRMED it persisted
-    pendingSaves?: Map<number, { shielded?: string; unshielded?: string; dust?: string }>; // In-flight saves by sequence number, resolved by `state-save-ack
+    lastSavedBlobs?: { shielded?: string; unshielded?: string; dust?: string }; // last save the main thread confirmed
+    pendingSaves?: Map<number, { shielded?: string; unshielded?: string; dust?: string }>; // by seq, resolved by state-save-ack
     networkId: string;
     /** Indexer GraphQL HTTP URL, used to read the genuine sync target (tip). */
     indexerHttpUrl: string;
     /** The wallet configuration the facade's sub-wallets were built with; kept for dust snapshot restores. */
     walletConfiguration: any;
     /**
-     * Dust sub-wallet state serialized BEFORE the current submission's build
-     * (the build books the dust spend, so a pre-submit snapshot would already
-     * carry the in-flight marker). Used to swap in a clean dust wallet after
-     * a pre-mempool reject; see dust-pending-note-leak FR.
+     * Dust state serialized BEFORE the build (the build books the spend);
+     * restored after a pre-mempool reject.
      */
     preSubmitDustSnapshot?: string;
-    /** Bumped on every dust snapshot restore; lets the save tick drop a dust blob serialized from the pre-restore wallet. */
+    /** Bumped on every dust restore/replacement; the save tick drops blobs of the previous wallet. */
     dustEpoch?: number;
-    /** Dust epoch each in-flight save's dust blob was serialized under (by seq); acks with a stale epoch must not advance the dust baseline. */
+    /** Dust epoch per in-flight save (by seq); a stale-epoch ack must not advance the dust baseline. */
     dustSaveEpochs?: Map<number, number>;
-    /** Snapshot restores whose re-persist the main thread CONFIRMED (state-save-ack). What getWalletBalance reports as dustRestoreCount. */
+    /** Shielded counterpart of `dustEpoch`. */
+    shieldedEpoch?: number;
+    shieldedSaveEpochs?: Map<number, number>;
+    /** Restored sub-wallets not yet past the restored offset (checkSnapshotReplay). */
+    restoredSubWallets?: { dust?: boolean; shielded?: boolean };
+    replayTracks?: Partial<Record<ReplayKind, ReplayTrack>>;
+    restoredStateLogged?: boolean;
+    lastSyncStateLogAt?: number;
+    /** Snapshot restores whose re-persist was acked; reported as dustRestoreCount. */
     dustRestoresPersisted?: number;
-    // 32-byte session-stable secret for contracts that use the
-    // `local_secret_key()` witness pattern (e.g. AttestationVault). Derived
-    // once per facade build via deriveAttestationSecret(seedBytes).
+    /** Session-stable secret for the `local_secret_key()` witness. */
     attestationSecret: Uint8Array;
 }
 
@@ -86,9 +88,7 @@ export function log(level: 'info' | 'warn' | 'debug' | 'error', message: string)
     parentPort?.postMessage({ kind: 'log', level, message });
 }
 
-// Config parse warnings of THIS thread reach the main process like every
-// other worker log line. In a real worker the snapshot is pinned and nothing
-// is parsed here; the unit tests exercise the accessors unpinned.
+// Config parse warnings reach the main process as worker log lines.
 setConfigWarnSink((message) => log('warn', message));
 
 // ---- SDK loaders (dynamic ESM imports, same pattern as sdk-loader.ts) ----
@@ -111,18 +111,14 @@ export async function loadAddressFormat(): Promise<typeof AddressFormat> {
     return cachedAddressFormat;
 }
 
-// The dust wallet's CoreWallet API (functional spendCoins), used by the
-// note-pool paths. Memoized as a PROMISE so concurrent first callers share
-// one module evaluation.
+// Memoised as a promise so concurrent first callers share one module evaluation.
 export let cachedDustCore: Promise<any> | undefined;
 export function loadDustCoreWallet(): Promise<any> {
     cachedDustCore ??= import('@midnightntwrk/wallet-sdk-dust-wallet/v1' as string).then((m: any) => m.CoreWallet);
     return cachedDustCore;
 }
 
-// The node client's effect API (dedicated per-submit node clients of the
-// parallel sponsor path; `phased-submit.ts` drives its event stream itself).
-// Memoized as a PROMISE, like loadDustCoreWallet.
+// Node client effect API for dedicated per-submit clients; memoised as a promise.
 export let cachedNodeClient: Promise<any> | undefined;
 export function loadNodeClientSdk(): Promise<any> {
     cachedNodeClient ??= Promise.all([
@@ -137,8 +133,7 @@ export function loadNodeClientSdk(): Promise<any> {
     return cachedNodeClient;
 }
 
-// Loaded only when NIGHTGATE_PROVING_MODE=wasm; the default server path
-// never touches the WASM prover module.
+// Loaded only in wasm proving mode.
 export async function loadProvingSdk(): Promise<any> {
     if (!cachedProving) {
         cachedProving = await import('@midnightntwrk/wallet-sdk-capabilities/proving');
@@ -148,16 +143,7 @@ export async function loadProvingSdk(): Promise<any> {
 
 export type ProvingMode = 'server' | 'wasm';
 
-/**
- * NIGHTGATE_PROVING_MODE selects how transactions are proved: 'server'
- * (default) proxies to the proof-server container at proofServerUrl; 'wasm'
- * proves in-process, with no proof server needed. Wallet proving goes through
- * the SDK's WASM prover; contract circuits go through our own
- * wasm-proof-provider (zkir over the contract's local key material). Proving
- * keys for the standard circuits are fetched from Midnight's S3 bucket into
- * ONE shared in-memory cache per worker (getSharedKeyMaterialProvider), so
- * they download once per process, not once per session.
- */
+/** 'server' proves via the proof server, 'wasm' in-process (standard-circuit keys cached once per worker). */
 export function resolveProvingMode(): ProvingMode {
     return configEnum<ProvingMode>('NIGHTGATE_PROVING_MODE') ?? 'server';
 }
@@ -208,11 +194,7 @@ export async function ensureNetworkId(networkId: string, sdk: any): Promise<void
     lastNetworkId = networkId;
 }
 
-/**
- * SDK packages needed for contract deploy/call (Phase 2b). Loaded lazily on
- * the first deploy/call so the worker startup cost only covers the wallet
- * sync surface.
- */
+/** Contract deploy/call SDK packages, loaded lazily on first use. */
 export async function loadContractsSdk(): Promise<{
     contracts: any;
     indexer: any;
@@ -243,10 +225,8 @@ export function getSdkVersion(): string {
         // eslint-disable-next-line @typescript-eslint/no-var-requires
         const path = require('path');
         let pkgPath: string | undefined;
-        // The package's `exports` map exposes neither `./package.json` nor a
-        // `require` condition, so require.resolve() throws for both the
-        // subpath and the bare specifier. Locate the package.json on disk by
-        // walking the module resolution paths instead.
+        // The package's `exports` map blocks require.resolve() of package.json
+        // and the bare specifier; walk the resolution paths instead.
         const searchDirs = require.resolve.paths('@midnightntwrk/wallet-sdk-facade') ?? [];
         for (const dir of searchDirs) {
             const candidate = path.join(dir, '@midnightntwrk', 'wallet-sdk-facade', 'package.json');
@@ -261,12 +241,7 @@ export function getSdkVersion(): string {
     return resolvedSdkVersion;
 }
 
-/**
- * Bech32m-encodes a Midnight address object (Dust/Shielded/Unshielded) to its
- * canonical string via `MidnightBech32m.encode`, which reads the
- * `[Bech32mSymbol]` codec on each address class. Pre-encoded strings pass
- * through untouched.
- */
+/** Bech32m-encodes a Midnight address object; strings pass through. */
 export async function encodeAddressString(
     addr: AddressFormat.DustAddress | string | null | undefined,
     networkId: string
@@ -286,11 +261,7 @@ export async function encodeAddressString(addr: any, networkId: string): Promise
     return af.MidnightBech32m.encode(networkId, addr).toString();
 }
 
-/**
- * Parses a Bech32m receiver string into the SDK's typed address object.
- * Discriminates on the `mn_shield-addr_` vs `mn_addr_` HRP prefix so callers
- * can build the matching `CombinedTokenTransfer` wrapper.
- */
+/** A Bech32m receiver parsed into the SDK's typed address, by HRP prefix. */
 export type ReceiverParsed =
     | { kind: 'shielded'; addr: AddressFormat.ShieldedAddress }
     | { kind: 'unshielded'; addr: AddressFormat.UnshieldedAddress };

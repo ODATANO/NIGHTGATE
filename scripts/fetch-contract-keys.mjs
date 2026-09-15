@@ -2,7 +2,7 @@
 // Fetch a shipped contract's PROVER keys into the installed package.
 //
 // Why this exists: prover keys are tens of megabytes each and the npm
-// registry rejects a tarball that carries them (413 at 204 MB). The package
+// registry rejects a tarball that carries them (413). The package
 // ships every contract's module, verifier keys, zkir and a keys/manifest.json
 // (sha256 + size per prover key), but no prover key. A running server fetches
 // a missing key on first need (NIGHTGATE_ZK_ASSET_URL, shipped contracts

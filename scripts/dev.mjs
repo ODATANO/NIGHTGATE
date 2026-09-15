@@ -1,9 +1,8 @@
 // Runs `cds watch` with a 12 GB Node heap.
 //
-// First-time shielded chain scans on preprod allocate well past Node's 4 GB
-// default and OOM during contract deploys (proof generation pushes higher).
-// We set NODE_OPTIONS BEFORE spawning so it can't be forgotten in another
-// terminal. Future tweaks: lower to 8 GB once `serialize`/`restore` is wired.
+// First-time shielded chain scans allocate well past Node's 4 GB default and
+// OOM during contract deploys (proof generation pushes higher). NODE_OPTIONS
+// is set BEFORE spawning so it can't be forgotten in another terminal.
 
 import { spawn } from 'node:child_process';
 

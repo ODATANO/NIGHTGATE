@@ -149,7 +149,7 @@ test('reconcile-by-identifier also finalizes the attempt PendingSubmissions row 
     expect(subs['sub-bad'].errorCode).toBe('CHAIN_EXECUTION_FAILED');
 });
 
-test('the normal succeeded-confirm pass ALSO finalizes the sponsor attempt row (crawler-free operation left it included before)', async () => {
+test('the normal succeeded-confirm pass ALSO finalizes the sponsor attempt row', async () => {
     const PS = 'midnight.PendingSubmissions';
     await db.run(cds.ql.DELETE.from(PS));
     await db.run(cds.ql.INSERT.into(PS).entries(
@@ -224,12 +224,12 @@ test('a broadcast the indexer never shows ends failed/BROADCAST_NOT_INCLUDED onc
         sub('sub-book',   '00book',   now - 3 * H, { circuits: ['attest'], ttl: lostTtl })
     ));
     await db.run(cds.ql.INSERT.into(BG).entries(
-        { ID: 'j-lost',   kind: 'sponsorUnboundTransaction', sessionId: 'sp-sess', status: 'reconciliation_required', errorCode: 'BROADCAST_UNCONFIRMED', txHash: '00lost',   submissionId: 'sub-lost' },
+        { ID: 'j-lost',   kind: 'sponsorUnboundTransaction', sessionId: 'sp-sess', status: 'reconciliation_required', errorCode: 'BROADCAST_UNCONFIRMED', errorMessage: 'Broadcast of 00lost is unconfirmed: no status', txHash: '00lost',   submissionId: 'sub-lost' },
         { ID: 'j-live',   kind: 'sponsorUnboundTransaction', sessionId: 'sp-sess', status: 'reconciliation_required', errorCode: 'BROADCAST_UNCONFIRMED', txHash: '00live',   submissionId: 'sub-live' },
         { ID: 'j-legacy', kind: 'submitContractCall',        sessionId: 'sp-sess', status: 'reconciliation_required', errorCode: 'EXTERNAL_EXECUTION_FAILED', txHash: '00legacy', submissionId: 'sub-legacy' },
         { ID: 'j-lag',    kind: 'sponsorUnboundTransaction', sessionId: 'sp-sess', status: 'reconciliation_required', errorCode: 'BROADCAST_UNCONFIRMED', txHash: '00lag',    submissionId: 'sub-lag' },
         { ID: 'j-book',   kind: 'sponsorUnboundTransaction', sessionId: 'sp-sess', status: 'reconciliation_required', errorCode: 'REJECTED_ATTEMPT_BOOKKEEPING_PENDING', txHash: '00book', submissionId: 'sub-book' },
-        { ID: 'j-parent', kind: 'anchorDocumentGuarded',     sessionId: 'sp-sess', status: 'reconciliation_required', errorCode: 'CHILD_RECONCILIATION_REQUIRED', txHash: '00parent' }
+        { ID: 'j-parent', kind: 'issueFieldPredicateAttestation',     sessionId: 'sp-sess', status: 'reconciliation_required', errorCode: 'CHILD_RECONCILIATION_REQUIRED', txHash: '00parent' }
     ));
     // the indexer has none of them (ABSENT, not merely unconfirmable); the answer's own tip is "now" (4 min past j-lag's ttl: inside the 5 min margin)
     registerChainOutcomeConfirmer(async () => chainAbsent(now));
@@ -240,6 +240,8 @@ test('a broadcast the indexer never shows ends failed/BROADCAST_NOT_INCLUDED onc
     expect(jobs['j-lost']).toMatchObject({ status: 'failed', errorCode: 'BROADCAST_NOT_INCLUDED', chainStatus: 'dropped' });
     expect(jobs['j-lost'].finishedAt).toBeTruthy();
     expect(String(jobs['j-lost'].errorMessage)).toMatch(/never included/);
+    // the failure that parked the job stays readable next to the verdict
+    expect(String(jobs['j-lost'].errorMessage)).toMatch(/Earlier: BROADCAST_UNCONFIRMED: Broadcast of 00lost is unconfirmed: no status$/);
     expect(jobs['j-legacy']).toMatchObject({ status: 'failed', errorCode: 'BROADCAST_NOT_INCLUDED', chainStatus: 'dropped' });
     expect(String(jobs['j-legacy'].errorMessage)).toMatch(/assumed from the submit time/);
     expect(jobs['j-live'].status).toBe('reconciliation_required');
@@ -304,12 +306,12 @@ test('a workflow parent whose child broadcast was lost ends failed/CHILD_FAILED 
     await db.run(cds.ql.DELETE.from(PS));
     const old = new Date(Date.now() - 5 * 60 * 60 * 1000).toISOString();
     await db.run(cds.ql.INSERT.into(PS).entries(
-        { ID: 'sub-child', txHash: '00child', contractAddress: 'c8f4'.padEnd(64, '0'), circuitName: 'anchorReveal', actionType: 'CALL', submittedAt: old, status: 'pending', sessionId: 'sp-sess', submitIntentData: JSON.stringify({ channel: 'bound', circuits: ['anchorReveal'], ttl: old }) }
+        { ID: 'sub-child', txHash: '00child', contractAddress: 'c8f4'.padEnd(64, '0'), circuitName: 'proveFieldPredicate', actionType: 'CALL', submittedAt: old, status: 'pending', sessionId: 'sp-sess', submitIntentData: JSON.stringify({ channel: 'bound', circuits: ['proveFieldPredicate'], ttl: old }) }
     ));
     await db.run(cds.ql.INSERT.into(BG).entries(
-        { ID: 'j-parent2', kind: 'anchorDocumentGuarded', sessionId: 'sp-sess', status: 'reconciliation_required', errorCode: 'CHILD_RECONCILIATION_REQUIRED' },
-        { ID: 'j-commit',  kind: 'anchorCommit', sessionId: 'sp-sess', status: 'succeeded', parentJobId: 'j-parent2', workflowStep: 'commit', txHash: '00commit' },
-        { ID: 'j-reveal',  kind: 'anchorReveal', sessionId: 'sp-sess', status: 'reconciliation_required', errorCode: 'BROADCAST_UNCONFIRMED', parentJobId: 'j-parent2', workflowStep: 'reveal', txHash: '00child', submissionId: 'sub-child' }
+        { ID: 'j-parent2', kind: 'issueFieldPredicateAttestation', sessionId: 'sp-sess', status: 'reconciliation_required', errorCode: 'CHILD_RECONCILIATION_REQUIRED' },
+        { ID: 'j-commit',  kind: 'fieldAnchorRoot', sessionId: 'sp-sess', status: 'succeeded', parentJobId: 'j-parent2', workflowStep: 'commit', txHash: '00commit' },
+        { ID: 'j-reveal',  kind: 'fieldPredicateProof', sessionId: 'sp-sess', status: 'reconciliation_required', errorCode: 'BROADCAST_UNCONFIRMED', parentJobId: 'j-parent2', workflowStep: 'reveal', txHash: '00child', submissionId: 'sub-child' }
     ));
     registerChainOutcomeConfirmer(async (txHash: string) => txHash === '00child' ? chainAbsent(Date.now()) : { status: 'success', blockHeight: 1 });
     await confirmChainOutcomesViaIndexer(db);

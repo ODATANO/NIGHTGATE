@@ -4,9 +4,8 @@ import { DEFAULT_PROOF_TIMEOUT_MS } from './proof-timeout';
 import { configBool, configEnum, configInt, configString, setConfigOverrideSource, setConfigWarnSink } from './config';
 import { configSpec, parseConfigValue } from './config-table';
 
-// Every typed accessor in `./config` sees the CAP host's block from here on:
-// `cds.requires.nightgate.<camelCase>` for any key of the table (env wins),
-// and parse warnings go to the plugin's logger.
+// Typed accessors in `./config` also read `cds.requires.nightgate.<camelCase>`
+// (env wins); parse warnings go to the plugin logger.
 setConfigOverrideSource(() => getNightgatePluginConfig() as Record<string, unknown>);
 setConfigWarnSink((message) => cds.log('nightgate:config').warn(message));
 
@@ -16,11 +15,7 @@ export const VALID_NIGHTGATE_NETWORKS = ['preview', 'testnet', 'preprod', 'mainn
 
 export type NightgateNetwork = (typeof VALID_NIGHTGATE_NETWORKS)[number];
 
-/**
- * Plugin configuration consumed under `cds.requires.nightgate`. CAP injects
- * this object via package.json / .cdsrc / env-var merging. Fields are
- * intentionally optional; defaults come from this module's DEFAULT_* values.
- */
+/** Plugin configuration under `cds.requires.nightgate`; defaults are this module's DEFAULT_* values. */
 export interface NightgatePluginConfig {
     network?: string;
     nodeUrl?: string;
@@ -51,82 +46,42 @@ export interface NightgatePluginConfig {
         privateStateId: string;
         zkConfigPath: string;
         /**
-         * Content-tree width for attestation-vault-family artifacts (provable
-         * fields per document). Default 16; `attestation-vault-32` registers
-         * with 32; accepted values are 8, 16 and 32 (64 is measured but the
-         * mask path would need BigInt first). Must match the compiled
-         * artifact's witness vector shapes.
+         * Content-tree width of attestation-vault-family artifacts: 8, 16 (default)
+         * or 32. Must match the compiled artifact's witness vector shapes.
          */
         slotWidth?: number;
-        /**
-         * Optional canonical deployed address(es) for this contract, advertised
-         * in `GET /contract-manifest` so connector consumers can self-configure.
-         * NIGHTGATE does not require it; the deployed address is otherwise
-         * per-deployment and caller-supplied. Accept a single string or a list.
-         */
+        /** Canonical deployed address(es), advertised in `GET /contract-manifest`; optional. */
         address?: string | string[];
     }>;
-    /**
-     * Safety gate for mainnet. Default false: submission actions reject when
-     * `network === 'mainnet'` unless this is explicitly true. Mainnet has known
-     * submission instability (`1016 Immediately Dropped`, forum thread 1190), so
-     * the gate is opt-in. Read-only indexing is unaffected.
-     */
+    /** Mainnet submission gate; default false (submission actions reject on mainnet). Indexing is unaffected. */
     allowMainnetSubmission?: boolean;
     /**
-     * How an authenticated principal maps to the AttestationVault circuit's
-     * `Bytes<32>` grantee id used to match on-chain disclosure grants at read
-     * time. Default 'wallet'.
-     *   - 'wallet': granteeId derived from the principal's coin public key.
-     *   - 'did':    granteeId derived from a registered DID string.
-     *   - 'custom': granteeId is an opaque 64-hex the consumer registers.
-     * The SAME derivation must be used by whoever issues the grant; see
-     * srv/submission/grantee-identity.ts.
+     * How a principal maps to the vault's `Bytes<32>` grantee id: 'wallet' (default,
+     * coin public key), 'did' or 'custom'. The grant issuer must use the same derivation.
      */
     granteeBinding?: GranteeBinding;
     /**
-     * Whether `registerGranteeIdentity` may be called by any authenticated
-     * principal to bind their own granteeId. Default FALSE, the secure
-     * choice: NIGHTGATE does NOT verify ownership of the binding input (wallet
-     * pubkey / DID), so a caller could register someone else's key and inherit
-     * their on-chain grants. Enable ONLY in deployments that do not gate reads
-     * on on-chain grants, or that add their own ownership proof; otherwise
-     * register identities through the operator's proofing flow (direct writes
-     * to `GranteeIdentities`).
+     * Let any principal bind its own granteeId via `registerGranteeIdentity`. Default
+     * false: the binding input's ownership is not verified, so a caller could inherit
+     * another principal's on-chain grants.
      */
     allowSelfServiceGranteeRegistration?: boolean;
-    /**
-     * Close wallet sessions left behind by the previous process at startup.
-     * Default true. See `isCloseSessionsOnRestartEnabled`.
-     */
+    /** Close the previous process's wallet sessions at startup; default true. */
     closeSessionsOnRestart?: boolean;
     /**
-     * Per-network indexer endpoint overrides for the crawler-free state-verify
-     * surface's optional `network` parameter.
-     * Only consulted when a verify call overrides to a network OTHER than the
-     * configured one; the configured network keeps using the top-level
-     * `indexerHttpUrl`/`indexerWsUrl` + env vars. Networks not listed here fall
-     * back to the built-in public defaults (`DEFAULT_INDEXER_URLS`).
+     * Indexer endpoints per network, used only when a verify call overrides to a network
+     * other than the configured one; unlisted networks use `DEFAULT_INDEXER_URLS`.
      */
     networks?: Partial<Record<NightgateNetwork, {
         indexerHttpUrl?: string;
         indexerWsUrl?: string;
     }>>;
-    // CAP permits additional plugin-specific keys we don't model here.
     [k: string]: unknown;
 }
 
-/**
- * Single-cast accessor for the plugin's CAP config block.
- *
- * `cds.env` is typed as a freeform object by CAP (it merges package.json,
- * .cdsrc, and env vars at runtime, so the shape is genuinely dynamic).
- * Rather than scattering `(cds.env as any).requires?.nightgate` across every
- * callsite, the cast lives ONCE here and every other site reads a properly
- * typed `NightgatePluginConfig` via this function.
- */
+/** Typed accessor for `cds.env.requires.nightgate`; the only cast of the freeform CAP env. */
 export function getNightgatePluginConfig(): NightgatePluginConfig {
-    // `cds.env` is absent under a bare cds mock (unit tests); no block then.
+    // `cds.env` is absent under a bare cds mock.
     const env = (cds as any).env as { requires?: { nightgate?: NightgatePluginConfig } } | undefined;
     return env?.requires?.nightgate ?? {};
 }
@@ -134,22 +89,13 @@ export function getNightgatePluginConfig(): NightgatePluginConfig {
 export const DEFAULT_NETWORK: NightgateNetwork = 'preprod';
 export const DEFAULT_NODE_URL = 'wss://rpc.preprod.midnight.network/';
 
-/**
- * Per-network default Substrate node RPC URL (the crawler WS endpoint, also
- * passed to the SDK as `relayURL`). `undeployed` is the local standalone stack
- * from `midnightntwrk/midnight-local-dev` (`standalone.yml`), where the node
- * listens on :9944. Falls back to DEFAULT_NODE_URL (preprod) for any network
- * not listed. Overridable via NIGHTGATE_NODE_URL / config.nodeUrl.
- */
+/** Per-network default node RPC URL (crawler and SDK `relayURL`); unlisted networks use DEFAULT_NODE_URL. */
 export const DEFAULT_NODE_URLS: Partial<Record<NightgateNetwork, string>> = {
     preview: 'wss://rpc.preview.midnight.network/',
     undeployed: 'ws://127.0.0.1:9944'
 };
 
 export const DEFAULT_INDEXER_URLS: Record<NightgateNetwork, { http: string; ws: string }> = {
-    // Preview is the active public dev chain. Public hosted indexer with
-    // permissive CORS. This is the network the browser wallet path targets
-    // by default.
     preview: {
         http: 'https://indexer.preview.midnight.network/api/v4/graphql',
         ws: 'wss://indexer.preview.midnight.network/api/v4/graphql/ws'
@@ -166,12 +112,7 @@ export const DEFAULT_INDEXER_URLS: Record<NightgateNetwork, { http: string; ws: 
         http: 'https://indexer.midnight.network/api/v4/graphql',
         ws: 'wss://indexer.midnight.network/api/v4/graphql/ws'
     },
-    // Local standalone network (`networkId: undeployed`). Mirrors the existing
-    // `testnet` localhost convention (:8088). Verified against a live
-    // `indexer-standalone:4.3.2`: it serves BOTH `/api/v3/graphql` and
-    // `/api/v4/graphql` (HTTP 200), so v4 here is correct. Older images may
-    // differ; override via NIGHTGATE_INDEXER_HTTP_URL / NIGHTGATE_INDEXER_WS_URL
-    // if your pinned indexer only exposes v3.
+    // An indexer image that serves only /api/v3 needs NIGHTGATE_INDEXER_HTTP_URL / _WS_URL.
     undeployed: {
         http: 'http://127.0.0.1:8088/api/v4/graphql',
         ws: 'ws://127.0.0.1:8088/api/v4/graphql/ws'
@@ -208,29 +149,13 @@ export function getConfiguredGranteeBinding(config?: Record<string, any>): Grant
 export function isSelfServiceGranteeRegistrationAllowed(config?: Record<string, any>): boolean {
     const raw = configBool('NIGHTGATE_ALLOW_SELF_SERVICE_GRANTEE_REGISTRATION');
     if (raw !== undefined) return raw;
-    // Secure default: OFF. NIGHTGATE cannot verify ownership of
-    // the binding input, so a caller could register another principal's key and
-    // inherit their on-chain grants. Deployments that want self-service must
-    // opt in explicitly (config flag or NIGHTGATE_ALLOW_SELF_SERVICE_GRANTEE_REGISTRATION).
+    // Off unless opted in: binding-input ownership is not verified.
     return config?.allowSelfServiceGranteeRegistration === true;
 }
 
 /**
- * Whether a restart closes the wallet sessions left behind by the previous
- * process. Default ON.
- *
- * A session is a handle owned by a caller in a specific process, not a property
- * of the wallet: `connectWallet` mints a row per call and only
- * `disconnectWallet` closes one, so an ungraceful stop leaks its handles until
- * the 24h TTL. Live-observed consequence: 12 simultaneously active rows for one
- * wallet, whose only remaining effect was to keep `disconnectWallet` from
- * dropping that wallet's in-memory keys (the shared-session guard counts them
- * as live users) and to keep seed material at rest for a day after the process
- * that authorised it died.
- *
- * Opt out with `NIGHTGATE_CLOSE_SESSIONS_ON_RESTART=false` or
- * `config.closeSessionsOnRestart: false` when consumers hold session ids across
- * restarts and expect them to keep working.
+ * Whether a restart closes the previous process's wallet sessions; default on. Leaked
+ * session rows count as live users of a wallet's keys and keep seed material at rest until the TTL.
  */
 export function isCloseSessionsOnRestartEnabled(config?: Record<string, any>): boolean {
     const env = configBool('NIGHTGATE_CLOSE_SESSIONS_ON_RESTART');
@@ -253,13 +178,7 @@ export function getConfiguredNightgateCrawlerNodeUrl(config?: Record<string, any
     return configString('NIGHTGATE_CRAWLER_NODE_URL') || config?.crawler?.nodeUrl;
 }
 
-/**
- * The plugin counts as configured iff a network is selected (config or
- * NIGHTGATE_NETWORK); without one, initialize() stays idle so we never
- * auto-crawl a chain nobody chose. The legacy `kind: 'nightgate'` marker some
- * consumer configs carry is inert and simply ignored (it never enabled
- * anything: the old check reduced to exactly this predicate).
- */
+/** Configured iff a network is selected; otherwise initialize() stays idle and crawls nothing. */
 export function isNightgatePluginConfigured(config?: Record<string, any>): boolean {
     return Boolean(config && getConfiguredNightgateNetwork(config));
 }
@@ -290,15 +209,8 @@ export interface SubmissionEndpointsConfig {
 }
 
 /**
- * Effective proving mode for this process. Precedence:
- *   1. NIGHTGATE_PROVING_MODE (`server` | `wasm`) when set explicitly,
- *   2. `server` when a proof server was EXPLICITLY configured (env var or
- *      cds config): existing deployments keep their container untouched,
- *   3. `wasm` otherwise: the zero-config default runs against purely public
- *      endpoints with no local Docker (in-process proving).
- * `initialize()` pins the result into NIGHTGATE_PROVING_MODE before the
- * wallet worker spawns, so worker and provider sites can keep reading the
- * env var directly.
+ * NIGHTGATE_PROVING_MODE, else `server` when a proof server is explicitly configured,
+ * else `wasm`. `initialize()` pins the result into the env before the worker spawns.
  */
 export function resolveEffectiveProvingMode(config?: Record<string, any> | null): 'server' | 'wasm' {
     const explicit = configEnum<'server' | 'wasm'>('NIGHTGATE_PROVING_MODE');
@@ -306,11 +218,7 @@ export function resolveEffectiveProvingMode(config?: Record<string, any> | null)
     return (configString('NIGHTGATE_PROOF_SERVER_URL') || config?.proofServerUrl) ? 'server' : 'wasm';
 }
 
-/**
- * Timeout of one proof request to the proof server. Precedence:
- * NIGHTGATE_PROOF_TIMEOUT_MS, `proofTimeoutMs`, midnight-js default (5 min).
- * `initialize()` pins the result into the env before the wallet worker spawns.
- */
+/** Proof request timeout: env, `proofTimeoutMs`, else 5 min; pinned into the env before the worker spawns. */
 export function resolveProofTimeoutMs(config?: Record<string, any> | null): number {
     const raw = process.env.NIGHTGATE_PROOF_TIMEOUT_MS?.trim();
     if (raw) {
@@ -339,12 +247,8 @@ export function resolveSubmissionEndpoints(
 }
 
 /**
- * Indexer endpoints for a state-verify `network` override that differs from the
- * configured network. Pure per-network
- * resolution: `config.networks[<network>]` wins over the built-in public
- * defaults. Top-level config and `NIGHTGATE_INDEXER_*` env vars deliberately do
- * NOT apply here: they describe the CONFIGURED network only, and applying them
- * to an override would silently point a preprod verify at a preview indexer.
+ * Indexer endpoints for a verify `network` override: `config.networks[network]`, else the
+ * public defaults. Top-level URLs and `NIGHTGATE_INDEXER_*` describe the configured network only.
  */
 export function resolveOverrideIndexerEndpoints(
     network: NightgateNetwork,
@@ -359,11 +263,7 @@ export function resolveOverrideIndexerEndpoints(
     };
 }
 
-/**
- * The indexer confirmer is the only chain-evidence path for submitted jobs
- * and always runs; `crawlerlessChainConfirm` / `NIGHTGATE_CRAWLERLESS_CHAIN_CONFIRM`
- * used to opt out of it. A value that is still set is reported once and ignored.
- */
+/** Warns when the removed `crawlerlessChainConfirm` option is still set; the value is ignored. */
 export function warnIfCrawlerlessChainConfirmSet(config?: Record<string, any>, warn: (msg: string) => void = (m) => cds.log('nightgate:config').warn(m)): boolean {
     const envRaw = process.env.NIGHTGATE_CRAWLERLESS_CHAIN_CONFIRM;
     const set = (typeof envRaw === 'string' && envRaw.trim() !== '') || config?.crawlerlessChainConfirm !== undefined;
@@ -380,13 +280,8 @@ export function resolveNightgateRuntimeConfig(config: Record<string, any> = {}):
     invalidNetwork?: string;
 } {
     const rawCrawlerConfig = config.crawler || {};
-    // env-var overrides for crawler tuning. Numeric vars are parsed; anything
-    // unparseable falls back to the config value (or built-in default).
     const fetchConcurrencyEnv = configInt('NIGHTGATE_FETCH_CONCURRENCY');
     const rpcBatchSizeEnv = configInt('NIGHTGATE_RPC_BATCH_SIZE');
-    // NIGHTGATE_CRAWLER_ENABLED=false disables the crawler at boot. Useful for
-    // running submission tests in isolation so the wallet sync isn't competing
-    // with block ingestion for CPU/RAM on the same event loop.
     const crawlerEnabledOverride = configBool('NIGHTGATE_CRAWLER_ENABLED');
     const crawlerConfig: Record<string, unknown> = {
         ...rawCrawlerConfig,
@@ -410,12 +305,7 @@ export function resolveNightgateRuntimeConfig(config: Record<string, any> = {}):
     };
 }
 
-/**
- * Mainnet submission safety gate. Returns a human-readable rejection reason when
- * the resolved network is `mainnet` and `allowMainnetSubmission` is not explicitly
- * true; otherwise null (submission allowed). Used by every on-chain submission
- * action handler to fail fast before building/submitting a transaction.
- */
+/** Rejection reason on mainnet without `allowMainnetSubmission: true`, else null. */
 export function mainnetSubmissionBlockReason(config: NightgatePluginConfig): string | null {
     const { network } = resolveNightgateRuntimeConfig(config);
     if (network === 'mainnet' && config.allowMainnetSubmission !== true) {

@@ -25,6 +25,7 @@ import {
 cds.test(__dirname + '/../..');
 
 const ROLES = 'midnight.DisclosureRoles';
+const ATT = 'e'.repeat(64);
 const GRANTS = 'midnight.DisclosureGrants';
 const IDENTITIES = 'midnight.GranteeIdentities';
 
@@ -67,6 +68,7 @@ async function seedIdentity(userId: string, granteeId: string, scope: string | n
 
 interface GrantRowSeed {
     payloadHash: string;
+    attesterId?: string;
     grantee: string;
     level: number;
     contractAddress: string;
@@ -77,6 +79,7 @@ async function seedGrant(g: GrantRowSeed): Promise<void> {
     await db.run(cds.ql.INSERT.into(GRANTS).entries({
         ID: cds.utils.uuid(),
         payloadHash: g.payloadHash,
+        attesterId: g.attesterId ?? ATT,
         grantee: g.grantee,
         level: g.level,
         contractAddress: g.contractAddress,
@@ -240,15 +243,28 @@ describe('attachDisclosureRole', () => {
             expect(role).toBe('public_only');
         });
 
-        test('payloadHash narrows the match', async () => {
+        test('payloadHash narrows the match to the attester\'s record', async () => {
             await seedIdentity('han', GID);
             await seedGrant({ payloadHash: PH, grantee: GID, level: 2, contractAddress: VAULT });
             // Asking about a different attestation → no match.
-            const other = await attachDisclosureRole(makeReq('han'), db, { contractAddress: VAULT, payloadHash: 'd'.repeat(64) });
+            const other = await attachDisclosureRole(makeReq('han'), db, { contractAddress: VAULT, payloadHash: 'd'.repeat(64), attesterId: ATT });
             expect(other).toBe('public_only');
             // Asking about the granted attestation → match.
-            const match = await attachDisclosureRole(makeReq('han'), db, { contractAddress: VAULT, payloadHash: PH });
+            const match = await attachDisclosureRole(makeReq('han'), db, { contractAddress: VAULT, payloadHash: PH, attesterId: ATT });
             expect(match).toBe('authority');
+        });
+
+        test('a payload without its attester resolves to public_only (fail closed)', async () => {
+            await seedIdentity('han', GID);
+            await seedGrant({ payloadHash: PH, grantee: GID, level: 2, contractAddress: VAULT });
+            expect(await attachDisclosureRole(makeReq('han'), db, { contractAddress: VAULT, payloadHash: PH })).toBe('public_only');
+        });
+
+        test('another attester\'s grant on the same payload does not open this record', async () => {
+            await seedIdentity('han', GID);
+            await seedGrant({ payloadHash: PH, attesterId: 'f'.repeat(64), grantee: GID, level: 2, contractAddress: VAULT });
+            expect(await attachDisclosureRole(makeReq('han'), db, { contractAddress: VAULT, payloadHash: PH, attesterId: ATT })).toBe('public_only');
+            expect(await attachDisclosureRole(makeReq('han'), db, { contractAddress: VAULT, payloadHash: PH, attesterId: 'f'.repeat(64) })).toBe('authority');
         });
 
         test('anonymous caller → public_only', async () => {
@@ -267,7 +283,7 @@ describe('attachDisclosureRole', () => {
             await seedIdentity('han', GID);
             await seedGrant({ payloadHash: PH, grantee: GID, level: 2, contractAddress: VAULT });
             const role = await attachDisclosureRole(makeReq('han'), db, {
-                contractAddress: '0xVaUlT', payloadHash: PH.toUpperCase()
+                contractAddress: '0xVaUlT', payloadHash: PH.toUpperCase(), attesterId: ATT.toUpperCase()
             });
             expect(role).toBe('authority');
         });

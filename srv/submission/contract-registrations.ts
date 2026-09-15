@@ -1,10 +1,7 @@
 /**
- * Contracts registered at runtime (0.21.0): admin action + `ContractRegistrations`
- * table, reloaded at boot. The config is the immutable floor: a runtime row may
- * add a name, never re-point or remove a config name. Importing an artifact
- * executes its module, so both paths must resolve inside a root of
- * `NIGHTGATE_CONTRACTS_DIR` (default: the package's and the cwd's `contracts/`).
- * Validation completes before the registry or the table changes.
+ * Runtime contract registrations, persisted and reloaded at boot; config names
+ * are an immutable floor. Importing executes the module, so paths must stay
+ * inside `NIGHTGATE_CONTRACTS_DIR`. Validation completes before anything changes.
  */
 import fs from 'node:fs';
 import os from 'node:os';
@@ -57,14 +54,11 @@ export interface ContractListing {
 
 const NAME_RE = /^[a-z0-9][a-z0-9._-]{0,99}$/;
 
-/** The directories a runtime registration may point into. */
 export function allowedContractRoots(): string[] {
     const raw = configString('NIGHTGATE_CONTRACTS_DIR');
     const roots = raw
         ? raw.split(path.delimiter).map(s => s.trim()).filter(Boolean)
         : [path.join(PACKAGE_ROOT, 'contracts'), path.join(process.cwd(), 'contracts')];
-    // Real paths (symlinks/junctions resolved) for the containment check; a
-    // root that does not exist stays as resolved.
     const canonical = roots.map(r => {
         const abs = path.resolve(r);
         try { return fs.realpathSync(abs); } catch { return abs; }
@@ -82,9 +76,7 @@ function insideRoots(absolute: string, roots: string[]): boolean {
 
 function resolveInsideRoots(what: string, p: string, roots: string[]): string {
     if (typeof p !== 'string' || !p.trim()) throw new ContractRegistrationError(400, `${what} is required`);
-    // A relative path is tried under every root, first existing wins; an
-    // absolute one must land inside a root. Containment is checked on the
-    // real path, so a symlink out of the roots does not pass.
+    // Containment is checked on the real path, so a symlink out of the roots fails.
     const candidates = path.isAbsolute(p) ? [path.resolve(p)] : roots.map(r => path.resolve(r, p));
     let real: string | null = null;
     for (const candidate of candidates) {
@@ -101,12 +93,8 @@ function resolveInsideRoots(what: string, p: string, roots: string[]): string {
 }
 
 /**
- * Import the artifact in a disposable worker thread and report whether it
- * exports a contract class. The main process keeps no module instance of it.
- * The import runs on a disposable copy next to a `node_modules` link to this
- * process's runtime (the worker's snapshots do the same), so the module's bare
- * `@midnight-ntwrk/compact-runtime` import resolves wherever the consumer keeps
- * its artifacts; a directory outside the package needs no node_modules of its own.
+ * Import a copy of the artifact in a throwaway worker (the main process keeps no
+ * module instance), next to a node_modules link so its runtime import resolves.
  */
 export function probeArtifactModule(artifactPath: string, timeoutMs = 60_000): Promise<{ ok: boolean; hasContract: boolean; error?: string }> {
     let probeDir: string | null = null;
@@ -154,11 +142,7 @@ function probeCopiedModule(artifactPath: string, timeoutMs: number): Promise<{ o
     });
 }
 
-/**
- * Validate the input without touching the registry: paths contained and
- * existing, module importable and exporting a contract class, zk assets
- * present. Returns the absolute registration.
- */
+/** Validate without touching the registry; returns the absolute registration. */
 export async function validateRuntimeRegistration(input: RuntimeRegistrationInput): Promise<ContractRegistration & { hasProverKeys: boolean }> {
     const name = String(input.name ?? '').trim();
     if (!NAME_RE.test(name)) {
@@ -207,19 +191,14 @@ export async function validateRuntimeRegistration(input: RuntimeRegistrationInpu
     };
 }
 
-/**
- * Register a contract on the running server: validate, register in memory,
- * persist. Re-registering a runtime name under a new artifact is a new
- * generation (jobs recorded against the old one refuse). Config names: 409.
- */
+/** Re-registering a name is a new generation: jobs recorded against the old one refuse. */
 export async function registerContractAtRuntime(
     db: any,
     input: RuntimeRegistrationInput,
     ctx: { registeredBy?: string; networkId?: string } = {}
 ): Promise<ContractListing> {
     const name = String(input.name ?? '').trim();
-    // One mutation per alias at a time: registry entry, digest and persisted
-    // row must belong to the same generation.
+    // Registry entry, digest and persisted row must belong to one generation.
     return withKeyedLock(registrationLockKey(name), () => registerContractAtRuntimeLocked(db, name, input, ctx));
 }
 
@@ -243,7 +222,6 @@ async function registerContractAtRuntimeLocked(
     try {
         artifactDigest = getArtifactGenerationDigest(name);
     } catch (e) {
-        // Roll back to the previous alias target.
         if (previous) registerContract(name, { ...previous }); else unregisterContract(name);
         throw new ContractRegistrationError(400, `artifact generation digest failed: ${String((e as Error)?.message ?? e)}`);
     }
@@ -271,7 +249,6 @@ async function registerContractAtRuntimeLocked(
     return describeContract(name, 'runtime')!;
 }
 
-/** Remove a runtime registration (memory + table). Config names refuse (409). */
 export async function unregisterContractAtRuntime(
     db: any,
     name: string
@@ -288,18 +265,14 @@ export async function unregisterContractAtRuntime(
     });
 }
 
-/**
- * Boot: load persisted runtime registrations after the config. A row naming a
- * config contract or failing validation is skipped with a warning and stays
- * in the table. Never throws.
- */
+/** Boot, after the config. Invalid or shadowing rows are skipped and kept. Never throws. */
 export async function loadPersistedRegistrations(db: any): Promise<string[]> {
     const { SELECT } = cds.ql as any;
     let rows: any[] = [];
     try {
         rows = (await db.run(SELECT.from('midnight.ContractRegistrations'))) as any[] ?? [];
     } catch (e) {
-        // Table missing until the schema delta ran: nothing to load.
+        // Table missing until the schema delta ran.
         log.warn(`runtime contract registrations not loaded: ${String((e as Error)?.message ?? e)}`);
         return [];
     }
@@ -339,7 +312,6 @@ function describeContract(name: string, source: 'config' | 'runtime'): ContractL
     };
 }
 
-/** Every registered contract with its source and generation digest. */
 export function listContracts(): ContractListing[] {
     return listRegisteredContracts()
         .map(name => describeContract(name, isConfigRegisteredContract(name) ? 'config' : 'runtime'))

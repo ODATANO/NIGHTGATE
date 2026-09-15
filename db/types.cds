@@ -7,33 +7,29 @@ type UnshieldedAddr          : String(256); // Bech32m-encoded
 type DustAddr                : String(256); // Bech32m-encoded
 type BigInt                  : String(78); // For u128 values as strings
 
-// Enum for Transaction Result Status
 type TransactionResultStatus : String enum {
     SUCCESS;
     PARTIAL_SUCCESS;
     FAILURE;
 }
 
-// Enum for Transaction Type
 type TransactionType         : String enum {
     REGULAR;
     SYSTEM;
 }
 
-// Enum for Contract Action Type
 type ContractActionType      : String enum {
     DEPLOY;
     CALL;
     UPDATE;
 }
 
-// Enum for Dust Ledger Event Type
 type DustLedgerEventType     : String enum {
     DTIME_UPDATE;
     INITIAL_UTXO;
 }
 
-// Enum for detailed Transaction Type Classification (from Crawler)
+// Crawler classification
 type TxType                  : String(30) enum {
     night_transfer;
     shielded_transfer;
@@ -47,7 +43,6 @@ type TxType                  : String(30) enum {
     unknown;
 }
 
-// Enum for Indexer Sync Status
 type SyncStatus              : String(20) enum {
     syncing;
     synced;
@@ -55,7 +50,6 @@ type SyncStatus              : String(20) enum {
     stopped;
 }
 
-// Enum for PendingSubmissions lifecycle
 type PendingSubmissionStatus : String(20) enum {
     pending;
     included;
@@ -63,15 +57,12 @@ type PendingSubmissionStatus : String(20) enum {
     failed;
 }
 
-// Background job lifecycle for long-running submission actions.
-//   pending   , row written by the OData handler; work is queued but not yet running
-//   running   , the worker owns the job and is still before the external-effect boundary
-//   external_execution , an SDK operation that may create a chain effect is in progress
-//   submitted , the SDK returned a transaction hash; finality is pending
-//   reconciliation_required , execution was interrupted after it may have produced an external effect
-//   succeeded , work resolved; result column carries the JSON of the original return shape
-//   failed    , work threw; errorCode + errorMessage classify it
-//
+// Background job lifecycle:
+//   pending: queued; running: before the external-effect boundary;
+//   external_execution: an SDK call that may touch the chain is in progress;
+//   submitted: tx hash returned, finality pending;
+//   reconciliation_required: interrupted after a possible chain effect;
+//   succeeded: `result` holds the return JSON; failed: see errorCode/errorMessage
 type BackgroundJobStatus     : String(32) enum {
     pending;
     running;
@@ -82,10 +73,8 @@ type BackgroundJobStatus     : String(32) enum {
     failed;
 }
 
-// Discriminator across the migrated actions
 type BackgroundJobKind       : String(64);
 
-// Tiered disclosure roles for the AttestationService
 type DisclosureRole          : String(30) enum {
     public_only;
     legitimate_interest;

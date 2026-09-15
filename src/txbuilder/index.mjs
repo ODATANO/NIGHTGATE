@@ -28,7 +28,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { createRequire } from 'node:module';
-import { mkdir, writeFile, access, rename, rm } from 'node:fs/promises';
+import { mkdir, writeFile, readFile, access, rename, rm } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 
@@ -38,12 +39,12 @@ const require = createRequire(import.meta.url);
 export {
     deserializeTransaction, txIdentifiers, submitFinalized, submitExtrinsic,
     classifyNodeReject, isPreMempoolReject, isTransportFailure, isAlreadyImported,
-    probeLanded, waitLanded, withDustGuard, nodeHttpUrlFor
+    probeLanded, waitLanded, withDustGuard, nodeHttpUrlFor, rebuildOnStaleTranscript
 } from './submit.mjs';
 
 /** Circuits whose proving assets are fetched by default (the vault's set). */
 export const ATTESTATION_VAULT_CIRCUITS = [
-    'attest', 'attestGuarded', 'anchorContentRoot', 'bindPassport', 'registerPassport',
+    'attest', 'retract', 'anchorContentRoot', 'bindDocument', 'registerDocument',
     'grantDisclosure', 'revokeDisclosure', 'proveFieldPredicate', 'proveFieldEquality',
     'proveFieldMembership', 'proveDocumentComparison'
 ];
@@ -63,6 +64,17 @@ export async function ensureZkAssets({ zkConfigBaseUrl, cacheDir, circuits = ATT
     await mkdir(join(cacheDir, 'keys'), { recursive: true });
     await mkdir(join(cacheDir, 'zkir'), { recursive: true });
 
+    // The served keys/manifest.json names the sha256 of every key and zkir of
+    // the CURRENT artifact. A cached file that does not match it belongs to a
+    // former generation of the same contract (the URL is not content
+    // addressed) and is replaced; a downloaded body must match it too.
+    // Without a manifest (older server, offline) the cache is trusted as is.
+    const manifest = await fetchManifest(doFetch, base);
+    const expectedSha = (dir, circuit, ext) => {
+        const section = ext === '.prover' ? manifest?.prover : ext === '.verifier' ? manifest?.verifier : ext === '.bzkir' ? manifest?.zkir : undefined;
+        return section?.[circuit]?.sha256;
+    };
+
     // `circuits` restricts only the HEAVY prover keys (megabytes each). The
     // ~2 KB VERIFIER keys must exist for EVERY circuit of the contract:
     // findDeployedContract reads them all when it verifies the deployment, so
@@ -71,6 +83,7 @@ export async function ensureZkAssets({ zkConfigBaseUrl, cacheDir, circuits = ATT
 
     let fetched = 0;
     let cached = 0;
+    let refreshed = 0;
     const plan = [
         ...circuits.flatMap(c => [[c, 'keys', '.prover'], [c, 'zkir', '.bzkir']]),
         ...verifierSet.map(c => [c, 'keys', '.verifier'])
@@ -79,7 +92,13 @@ export async function ensureZkAssets({ zkConfigBaseUrl, cacheDir, circuits = ATT
         for (const [circuit, dir, ext] of plan) {
             const rel = dir + '/' + circuit + ext;
             const dest = join(cacheDir, dir, circuit + ext);
-            if (await exists(dest)) { cached++; continue; }
+            const expected = expectedSha(dir, circuit, ext);
+            if (await exists(dest)) {
+                if (!expected || sha256Hex(await readFile(dest)) === expected) { cached++; continue; }
+                // Stale: a key of a former generation under the current name.
+                await rm(dest, { force: true });
+                refreshed++;
+            }
             const res = await doFetch(base + '/' + rel);
             if (!res.ok) {
                 // A circuit this contract does not expose is not fatal; only the
@@ -103,6 +122,9 @@ export async function ensureZkAssets({ zkConfigBaseUrl, cacheDir, circuits = ATT
             if (Number.isFinite(declared) && declared !== body.length) {
                 throw new Error('ensureZkAssets: ' + rel + ' truncated (' + body.length + ' of ' + declared + ' bytes)');
             }
+            if (expected && sha256Hex(body) !== expected) {
+                throw new Error('ensureZkAssets: ' + rel + ' does not match the sha256 in the served keys/manifest.json');
+            }
             const tmp = dest + '.part';
             try {
                 await writeFile(tmp, body);
@@ -112,10 +134,38 @@ export async function ensureZkAssets({ zkConfigBaseUrl, cacheDir, circuits = ATT
                 throw e;
             }
             fetched++;
-            onProgress?.({ phase: 'zk-asset', circuit, file: rel, fetched, cached });
+            onProgress?.({ phase: 'zk-asset', circuit, file: rel, fetched, cached, refreshed });
         }
     }
-    return { cacheDir, fetched, cached, source: 'remote' };
+    return { cacheDir, fetched, cached, refreshed, verified: Boolean(manifest), source: 'remote' };
+}
+
+/** GET keys/manifest.json; null when the server does not serve one or the fetch fails. */
+async function fetchManifest(doFetch, base) {
+    try {
+        const res = await doFetch(base + '/keys/manifest.json');
+        if (!res?.ok) return null;
+        const text = Buffer.from(await res.arrayBuffer()).toString('utf8');
+        const parsed = JSON.parse(text);
+        return parsed && typeof parsed === 'object' && parsed.version === 1 ? parsed : null;
+    } catch {
+        return null;
+    }
+}
+
+function sha256Hex(body) {
+    return createHash('sha256').update(body).digest('hex');
+}
+
+/**
+ * A single call honors its `before` hook exactly like a batch entry: the hook
+ * swaps this call's state into the shared witnesses right before proving. A
+ * batch split into single-call transactions keeps working unchanged.
+ */
+// Exported for the unit tests only (not in the .d.ts).
+export async function runSingleCall(single, fn) {
+    if (typeof single.before === 'function') single.before();
+    return fn(...(single.args ?? []));
 }
 
 /**
@@ -128,22 +178,12 @@ export async function ensureZkAssets({ zkConfigBaseUrl, cacheDir, circuits = ATT
  *  - true  (default): FINALIZED (bound) tx -> sponsorFinalizedTransaction,
  *    sponsor attaches dust via balanceFinalizedTransaction (serial per wallet).
  *  - false: UNBOUND (pre-binding) signed tx -> sponsorUnboundTransaction, the
- *    sponsor merges dust from a locked note and binds (parallel, 0.18). A
- *    dust tx cannot merge into a bound tx, so parallel sponsoring REQUIRES
- *    the unbound handover.
+ *    sponsor merges dust from a locked note and binds (parallel). A dust tx
+ *    cannot merge into a bound tx, so parallel sponsoring REQUIRES the
+ *    unbound handover.
+ *
+ * Exported for the unit tests only (not in the .d.ts).
  */
-/**
- * A single call honors its `before` hook exactly like a batch entry: the hook
- * swaps this call's state into the shared witnesses right before proving. A
- * batch split into single-call transactions keeps working unchanged.
- */
-// Exported for the unit tests only (not in the .d.ts).
-export async function runSingleCall(single, fn) {
-    if (typeof single.before === 'function') single.before();
-    return fn(...(single.args ?? []));
-}
-
-// Exported for the unit tests only (not in the .d.ts): the handover rules live here.
 export function buildOnlyWalletProvider(facade, zswapKeys, dustKey, keystore, holder, ttlMinutes, bind) {
     return {
         getCoinPublicKey: () => zswapKeys.coinPublicKey,
@@ -182,38 +222,6 @@ export function buildOnlyWalletProvider(facade, zswapKeys, dustKey, keystore, ho
 }
 
 /**
- * Create a headless transaction builder bound to your seed.
- *
- * @param {object} opts
- * @param {string} opts.seedHex           128 hex chars (64-byte BIP39 seed). Never leaves this process.
- * @param {string} [opts.networkId]       'preprod' (default), 'testnet', 'devnet', ...
- * @param {number} [opts.accountIndex]    BIP32 account level, default 0.
- * @param {string} opts.indexerHttpUrl
- * @param {string} opts.indexerWsUrl
- * @param {string} opts.nodeUrl          Substrate RPC (the SDK's relayURL), e.g. wss://rpc.preprod.midnight.network/
- * @param {string} [opts.proofServerUrl] unused by default (only the SDK's config type wants it); see provingMode
- * @param {number} [opts.proofTimeoutMs]  server proving only: HTTP timeout of ONE proof request, ms; default
- *                                        midnight-js' 300000. The SDK re-requests a timed-out proof up to three
- *                                        times, so set it above your slowest circuit (a large custom relation
- *                                        can take 15 min). The TTL is stamped after proving, unaffected.
- * @param {'wasm'|'server'} [opts.provingMode] 'wasm' (default): prove the contract circuit in-process, nothing
- *                                        leaves the process. 'server': prove on opts.proofServerUrl, which
- *                                        then RECEIVES THE WITNESSES: native and multi-threaded, several
- *                                        times faster on the big circuits, but only ever a proof server
- *                                        you run yourself, never the sponsor's. An EXPLICIT opt-in on
- *                                        purpose: in 0.17 proofServerUrl was documented as unused, so a
- *                                        value left over from that must not start sending witnesses.
- * @param {string} opts.zkConfigBaseUrl   a public /zk-config/<contract>
- * @param {Function} opts.contractClass   compiled contract class (e.g. '@odatano/nightgate/browser/attestation-vault')
- * @param {string} [opts.contractName]    logical name, default 'attestation-vault'
- * @param {string} [opts.privateStateId]  default 'attestationVaultPrivateState'
- * @param {string} [opts.cacheDir]        zk asset cache, default ~/.cache/nightgate-txbuilder/<contractName>
- * @param {string[]} [opts.circuits]      circuits to make available (prover keys + zkir); default: every circuit of contractClass
- * @param {number} [opts.ttlMinutes]      transaction TTL, default 30; the sponsor must submit within it
- * @param {Uint8Array} [opts.attestationSecret] bring your own, else derived from the seed
- * @param {Function} [opts.onProgress]    progress callback
- */
-/**
  * `findDeployedContract` with ONE retry on the transient read the public
  * indexer serves between a block landing and being indexed (`expected a cell,
  * received null`, or a null state): building immediately after a previous call
@@ -231,11 +239,6 @@ async function findDeployedWithRetry(contracts, providers, args) {
 }
 
 /**
- * The contract address a built deploy transaction creates: the `address` of its
- * single ContractDeploy action (an action without `entryPoint`). Throws unless
- * exactly one such action with a non-empty address exists.
- */
-/**
  * Config handed to midnight-js' `httpClientProofProvider`: `{ timeout }` when
  * `proofTimeoutMs` is set, else undefined (the SDK's 5 min default).
  */
@@ -243,6 +246,11 @@ export function proofProviderConfig(opts) {
     return opts?.proofTimeoutMs ? { timeout: opts.proofTimeoutMs } : undefined;
 }
 
+/**
+ * The contract address a built deploy transaction creates: the `address` of its
+ * single ContractDeploy action (an action without `entryPoint`). Throws unless
+ * exactly one such action with a non-empty address exists.
+ */
 export function readDeployAddress(tx) {
     const intents = tx?.intents;
     if (!intents || typeof intents.entries !== 'function') {
@@ -346,9 +354,31 @@ async function deriveKeyMaterial({ seedHex, networkId = 'preprod', accountIndex 
 }
 
 /**
+ * The ledger key of an attester's record for a payload, as hex:
+ * persistentHash(AttestRecordKey{tag 21, owner, payload_hash}), byte-identical
+ * to the vault's `recordKey` pure circuit. Public: the proof helpers and the
+ * verify functions take it; the owner-gated circuits derive it from the
+ * caller's identity.
+ */
+export function computeRecordKey(attesterId, payloadHash) {
+    const rt = require('@midnight-ntwrk/compact-runtime');
+    const u8 = new rt.CompactTypeUnsignedInteger(255n, 1);
+    const b32 = new rt.CompactTypeBytes(32);
+    const hexToBytes = (h, name) => {
+        if (!/^[0-9a-fA-F]{64}$/.test(String(h ?? ''))) throw new Error(`${name} must be 64 hex chars (32 bytes)`);
+        return Uint8Array.from(Buffer.from(h, 'hex'));
+    };
+    const type = {
+        alignment: () => u8.alignment().concat(b32.alignment(), b32.alignment()),
+        toValue: (v) => u8.toValue(v.tag).concat(b32.toValue(v.owner), b32.toValue(v.payload_hash))
+    };
+    return Buffer.from(rt.persistentHash(type, { tag: 21n, owner: hexToBytes(attesterId, 'attesterId'), payload_hash: hexToBytes(payloadHash, 'payloadHash') })).toString('hex');
+}
+
+/**
  * The identity a seed yields, without a builder, a wallet or the network:
  * attestation secret, `attesterId` (persistentHash of the secret) and the
- * NIGHT address. Same derivation as `createTxBuilder`, ~150 ms.
+ * NIGHT address. Same derivation as `createTxBuilder`.
  *
  * @param {{ seedHex: string, networkId?: string, accountIndex?: number, attestationSecret?: Uint8Array }} opts
  * @returns {Promise<{ attesterId: string, attestationSecret: Uint8Array, addresses: { night: string } }>}
@@ -358,6 +388,38 @@ export async function deriveIdentity(opts) {
     return { attesterId, attestationSecret, addresses };
 }
 
+/**
+ * Create a headless transaction builder bound to your seed.
+ *
+ * @param {object} opts
+ * @param {string} opts.seedHex           128 hex chars (64-byte BIP39 seed). Never leaves this process.
+ * @param {string} [opts.networkId]       'preprod' (default), 'testnet', 'devnet', ...
+ * @param {number} [opts.accountIndex]    BIP32 account level, default 0.
+ * @param {string} opts.indexerHttpUrl
+ * @param {string} opts.indexerWsUrl
+ * @param {string} opts.nodeUrl          Substrate RPC (the SDK's relayURL), e.g. wss://rpc.preprod.midnight.network/
+ * @param {string} [opts.proofServerUrl] unused by default (only the SDK's config type wants it); see provingMode
+ * @param {number} [opts.proofTimeoutMs]  server proving only: HTTP timeout of ONE proof request, ms; default
+ *                                        midnight-js' 300000. The SDK re-requests a timed-out proof up to three
+ *                                        times, so set it above your slowest circuit (a large custom relation
+ *                                        can take 15 min). The TTL is stamped after proving, unaffected.
+ * @param {'wasm'|'server'} [opts.provingMode] 'wasm' (default): prove the contract circuit in-process, nothing
+ *                                        leaves the process. 'server': prove on opts.proofServerUrl, which
+ *                                        then RECEIVES THE WITNESSES: native and multi-threaded, several
+ *                                        times faster on the big circuits, but only ever a proof server
+ *                                        you run yourself, never the sponsor's. An EXPLICIT opt-in on
+ *                                        purpose: a proofServerUrl given only to satisfy the SDK's config
+ *                                        type must not start sending witnesses.
+ * @param {string} opts.zkConfigBaseUrl   a public /zk-config/<contract>
+ * @param {Function} opts.contractClass   compiled contract class (e.g. '@odatano/nightgate/browser/attestation-vault')
+ * @param {string} [opts.contractName]    logical name, default 'attestation-vault'
+ * @param {string} [opts.privateStateId]  default 'attestationVaultPrivateState'
+ * @param {string} [opts.cacheDir]        zk asset cache, default ~/.cache/nightgate-txbuilder/<contractName>
+ * @param {string[]} [opts.circuits]      circuits to make available (prover keys + zkir); default: every circuit of contractClass
+ * @param {number} [opts.ttlMinutes]      transaction TTL, default 30; the sponsor must submit within it
+ * @param {Uint8Array} [opts.attestationSecret] bring your own, else derived from the seed
+ * @param {Function} [opts.onProgress]    progress callback
+ */
 export async function createTxBuilder(opts) {
     const {
         seedHex, networkId = 'preprod', accountIndex = 0,
@@ -474,8 +536,8 @@ export async function createTxBuilder(opts) {
     const zkConfigProvider = new zkNode.NodeZkConfigProvider(cacheDir);
     // Contract-circuit proving: in-process wasm by default (nothing leaves the
     // process); a holder-owned proof server when configured (it sees the
-    // witnesses; native + multi-threaded, several times faster on the 38 MB
-    // comparison circuit). The wallet facade's own prover stays wasm either
+    // witnesses; native + multi-threaded, several times faster on the big
+    // circuits). The wallet facade's own prover stays wasm either
     // way: a sponsorable build carries no dust or zswap proof of its own.
     let proofProvider;
     const provingMode = opts.provingMode === 'server' ? 'server' : 'wasm';
@@ -488,11 +550,10 @@ export async function createTxBuilder(opts) {
         proofProvider = await buildWasmProofProvider(zkConfigProvider);
     }
     const { InMemoryPrivateStateProvider } = await import('../browser/private-state.mjs');
-    // ONE public-data provider per builder. It owns a WebSocket to the
-    // indexer; creating it per buildSponsorable leaked one open socket (plus
-    // its subscriptions) per transaction, and a process that built several
-    // transactions in a row degraded into a 100 % CPU stall on a later build.
-    // The provider has no close; its sockets are tracked so close() can end them.
+    // ONE public-data provider per builder: it owns a WebSocket to the
+    // indexer, and one per buildSponsorable would leak a socket plus its
+    // subscriptions per transaction. The provider has no close; its sockets
+    // are tracked so close() can end them.
     const sockets = trackingWebSocket(require('ws'));
     const publicDataProvider = indexerSdk.indexerPublicDataProvider(indexerHttpUrl, indexerWsUrl, sockets.WebSocket);
 
@@ -511,7 +572,7 @@ export async function createTxBuilder(opts) {
          * Build + prove + sign + finalize one transaction WITHOUT submitting:
          * ONE circuit call (`call`) or a BATCH of up to 8 calls (`calls`) in
          * ONE transaction (one balancing round, one fee event; segment order
-         * = call order, fail-closed, with the 0.16.3 causality pre-check
+         * = call order, fail-closed, with the causality pre-check
          * aborting BEFORE proving). Hand the result to a sponsor endpoint,
          * which pays the dust and submits.
          *
@@ -648,15 +709,15 @@ export async function createTxBuilder(opts) {
             if (!holder.captured?.serialize) throw new Error('build produced no serializable transaction');
             const bytes = new Uint8Array(holder.captured.serialize());
             onProgress?.({ phase: 'built', bytes: bytes.length, bound: bind !== false });
-            // finalizedTxB64 kept as the field name for the bound handover
-            // (0.17.2 compat); unboundTxB64 is the 0.18 parallel handover.
+            // Field names are part of the public contract: finalizedTxB64 for
+            // the bound handover, unboundTxB64 for the unbound one.
             return bind === false
                 ? { unboundTxB64: Buffer.from(bytes).toString('base64'), serializedBytes: bytes.length, bound: false }
                 : { finalizedTxB64: Buffer.from(bytes).toString('base64'), serializedBytes: bytes.length, bound: true };
         },
 
         /**
-         * 0.21.0: build + prove + sign a contract deploy without submitting; the
+         * Build + prove + sign a contract deploy without submitting; the
          * caller's key signs it, a sponsor pays the dust. Sponsoring needs
          * NIGHTGATE_SPONSOR_ALLOW_DEPLOY on the server and, for a token caller,
          * `allowDeploy` with budget left on the grant. The landed address joins the

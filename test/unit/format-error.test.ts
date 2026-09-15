@@ -27,7 +27,7 @@ describe('formatErr', () => {
 
 describe('formatErrWithCauses (worker RPC boundary)', () => {
     it('appends the nested cause chain so the node reject line survives the thread boundary', () => {
-        // Live shape: (FiberFailure) SubmissionError > SubmissionError > RpcError 1010/196
+        // The SDK's shape: (FiberFailure) SubmissionError > SubmissionError > RpcError 1010/196
         const inner = new Error('1010: Invalid Transaction: Custom error: 196');
         const mid = Object.assign(new Error('Transaction submission failed'), { cause: inner });
         const top = Object.assign(new Error('Transaction submission error'), { cause: mid });

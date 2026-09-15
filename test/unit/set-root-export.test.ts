@@ -1,6 +1,6 @@
 /**
- * Guards the public `@odatano/nightgate/set-root` subpath (FR
- * export-set-root-surface): it must resolve via the package exports map
+ * Guards the public `@odatano/nightgate/set-root` subpath: it must resolve
+ * via the package exports map
  * (Node self-reference onto the in-place compiled .js) and its module graph
  * must stay dependency-clean, i.e. requiring it never drags in CAP or the
  * session-bound submission modules. Consumers use this subpath outside any

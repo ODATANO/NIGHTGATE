@@ -1,17 +1,12 @@
 // Probe: which mnemonic→seed derivation reproduces the Lace account?
 //
-// NIGHTGATE currently derives the wallet seed as the first 32 bytes of the
-// BIP39 PBKDF2 seed, then ZswapSecretKeys.fromSeed(seed). That lands on a
-// DIFFERENT Midnight account than Lace (confirmed via mismatched dust addr),
-// so the facade sees an empty wallet and deploys fail with "could not balance
-// dust".
-//
-// This script derives the SHIELDED address under several candidate seed
-// derivations and flags the one that matches your real Lace shielded address.
-// The shielded address encodes both zswap pubkeys, so a match uniquely
-// identifies the correct derivation. Whichever candidate matches: its `seedHex`
-// is what belongs in .env as LACE_SEED_HEX (the factory already does
-// fromSeed(seedHex), so no code change is needed once the seed is right).
+// Derives the SHIELDED address under several candidate seed derivations
+// (first/last 32 bytes of the BIP39 PBKDF2 seed, the mnemonic entropy, HD
+// paths via wallet-sdk-hd) and flags the one that matches your real Lace
+// shielded address. The shielded address encodes both zswap pubkeys, so a
+// match uniquely identifies the correct derivation. Whichever candidate
+// matches: its `seedHex` is what belongs in .env as LACE_SEED_HEX (the
+// factory does fromSeed(seedHex)).
 //
 // The mnemonic never leaves your machine; it's read from env only.
 //

@@ -2,11 +2,10 @@
  * Tests for src/sdk/AttestationService.ts.
  *
  * HYBRID approach: runs against a REAL in-memory CAP DB via cds.test()
- * (see test/vitest.setup.ts). The `@sap/cds` cds.ql mock that the previous
- * version of this suite used has been removed: the disclosure-role lookup
- * the `before('*')` hook performs now hits the real `midnight.DisclosureRoles`
- * table, seeded per-test, and the tier gates run the real `meetsDisclosure`
- * logic against the role the real hook attached.
+ * (see test/vitest.setup.ts). The disclosure-role lookup the `before('*')`
+ * hook performs hits the real `midnight.DisclosureRoles` table, seeded
+ * per-test, and the tier gates run the real `meetsDisclosure` logic against
+ * the role the real hook attached.
  *
  * Why a recording service shim (not a served service): `AttestationService`
  * is an `@abstract` CAP service living under `src/sdk/`. It is NOT part of the
@@ -16,7 +15,7 @@
  * real `registerAttestationServiceHandlers` onto a shim that records them
  * (proving the wiring), then exercise each recorded handler:
  *   - the `before('*')` hook is run with the REAL db so it reads real
- *     DisclosureRoles rows (replaces the old "stub the SELECT" assertion);
+ *     DisclosureRoles rows;
  *   - the tier gates are run after the real hook populated req.disclosureRole,
  *     giving an end-to-end seed → attach → gate flow, plus direct role-set
  *     cases for the boundary conditions.

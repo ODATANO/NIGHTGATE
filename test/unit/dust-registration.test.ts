@@ -1,7 +1,7 @@
 /**
- * Tests for srv/submission/dust-registration.ts (Phase 2a).
+ * Tests for srv/submission/dust-registration.ts.
  *
- * Post-Phase-2a, dust-registration is a thin wrapper around a single
+ * dust-registration is a thin wrapper around a single
  * `walletRegisterDustGeneration(...)` RPC to the wallet worker. The worker
  * owns the SDK and executes the full flow (wait-sync, filter, register,
  * finalize, submit) without crossing thread boundaries with SDK objects.

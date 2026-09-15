@@ -1,115 +1,129 @@
 /**
- * Crawler-free attestation state reader: reads the AttestationVault
- * attestation/content-root ledger Maps from LIVE on-chain state via the
- * contract's `ledger()` decoder, keyed by a known payload_hash. No crawler, no
- * locally-indexed txHash.
- *
- * All lookups are direct member/lookup on flat `Map<Bytes<32>, Bytes<32>>` (no
- * enumeration, unlike the disclosure indexer). Validated in
- * test/integration/attestation-vault.test.ts.
- *
- * Decode/read logic is dependency-injected (`ledger`, `queryContractState`) to
- * unit-test without the ESM-only SDK; `readAttestationStateForContract` wires the
- * real provider bundle + artifact.
+ * Crawler-free attestation reader over live vault state. A record is addressed
+ * by record key (attester id + payload hash) or a bound document id.
  */
 import { hexToBytes } from '../utils/hex';
 import { importArtifactByPath } from './contract-registry';
+import { computeRecordKey } from './predicate-state';
 
 function hex(b: Uint8Array): string {
     return Buffer.from(b).toString('hex');
 }
 
-/** Minimal shape of the compiled artifact's `ledger(state)` return we rely on. */
-export interface AttestationLedger {
-    public_attestations: { member(key: Uint8Array): boolean; lookup(key: Uint8Array): Uint8Array };
-    attestation_owners:  { member(key: Uint8Array): boolean; lookup(key: Uint8Array): Uint8Array };
-    content_roots:       { member(key: Uint8Array): boolean; lookup(key: Uint8Array): Uint8Array };
-    content_schemas:     { member(key: Uint8Array): boolean; lookup(key: Uint8Array): Uint8Array };
+export interface AttestationRecord {
+    payload_hash: Uint8Array;
+    metadata_hash: Uint8Array;
+    owner: Uint8Array;
+    document_id: Uint8Array;
 }
 
+export interface AttestationLedger {
+    attestations:      { member(key: Uint8Array): boolean; lookup(key: Uint8Array): AttestationRecord };
+    content_anchors:   { member(key: Uint8Array): boolean; lookup(key: Uint8Array): { root: Uint8Array; schema: Uint8Array } };
+    document_bindings: { member(key: Uint8Array): boolean; lookup(key: Uint8Array): Uint8Array };
+    document_owners:   { member(key: Uint8Array): boolean; lookup(key: Uint8Array): Uint8Array };
+}
+
+/** Hex fields are '' when absent; the *Ok flags are false when nothing was supplied. */
 export interface AttestationStateResult {
-    /** payload_hash present in `public_attestations`. */
     attested: boolean;
-    /** anchored content root equals the supplied `contentRoot` (false when none supplied). */
     contentRootOk: boolean;
-    /** anchored schema id equals the supplied `schemaId` (false when none supplied). */
     schemaOk: boolean;
-    /** owner grantee/attester id (hex) if attested, else ''. */
+    /** The bound document id is registered to the record's attester (an unregistered id is first-come-first-served). */
+    bindingRegistered: boolean;
     attesterId: string;
+    payloadHash: string;
+    /** '' when a document id resolved to nothing. */
+    recordKey: string;
+    documentId: string;
+    contentRoot: string;
+    schemaId: string;
 }
 
 export interface ReadAttestationStateDeps {
     contractAddress: string;
-    /** 64-hex attestation payload hash. */
-    payloadHash: string;
-    /** optional 64-hex content root to check against the anchored root. */
+    /** With `payloadHash` it names the record. */
+    attesterId?: string;
+    payloadHash?: string;
+    /** Resolves the record through `document_bindings`. */
+    documentId?: string;
     contentRoot?: string;
-    /** optional 64-hex schema id to check against the anchored schema. */
     schemaId?: string;
-    /** Decoder from the compiled artifact (`ledger`). */
     ledger: (state: any) => AttestationLedger;
-    /** publicDataProvider.queryContractState; returns ContractState | null. */
     queryContractState: (contractAddress: string) => Promise<any | null>;
 }
 
+const ZERO_ID = '00'.repeat(32);
+
 /**
- * Read attestation + content-root state for one payload hash from current
- * on-chain state. Returns `null` when no contract state is available (unknown
- * contract, or no live provider), so callers can surface a clean negative
- * rather than a 5xx.
+ * A supplied payloadHash or attesterId must match the resolved record. Null without
+ * contract state, so callers return a clean negative rather than a 5xx.
  */
 export async function readAttestationState(
     deps: ReadAttestationStateDeps
 ): Promise<AttestationStateResult | null> {
+    if (!deps.documentId && !(deps.attesterId && deps.payloadHash)) {
+        throw new Error('attesterId and payloadHash, or documentId, are required');
+    }
     const state = await deps.queryContractState(deps.contractAddress.toLowerCase());
     if (!state) return null;
 
-    // ContractState carries the ledger in `.data` (a ChargedState); `ledger()`
-    // also accepts a bare StateValue, so fall back to the state itself.
     const led = deps.ledger(state.data ?? state);
-    const ph = hexToBytes(deps.payloadHash);
 
-    const attested = led.public_attestations.member(ph);
-
-    let contentRootOk = false;
-    if (deps.contentRoot && led.content_roots.member(ph)) {
-        contentRootOk = hex(led.content_roots.lookup(ph)).toLowerCase()
-            === deps.contentRoot.toLowerCase();
+    let recordKey = '';
+    if (deps.documentId) {
+        const id = hexToBytes(deps.documentId);
+        if (led.document_bindings.member(id)) recordKey = hex(led.document_bindings.lookup(id));
+    } else {
+        recordKey = await computeRecordKey(deps.attesterId!, deps.payloadHash!);
     }
+    const negative: AttestationStateResult = {
+        attested: false, contentRootOk: false, schemaOk: false, bindingRegistered: false,
+        attesterId: '', payloadHash: '', recordKey, documentId: '', contentRoot: '', schemaId: ''
+    };
+    if (!recordKey) return negative;
+    const key = hexToBytes(recordKey);
+    if (!led.attestations.member(key)) return negative;
+    const record = led.attestations.lookup(key);
+    const payloadHash = hex(record.payload_hash);
+    if (deps.payloadHash && payloadHash !== deps.payloadHash.toLowerCase()) return negative;
+    if (deps.attesterId && hex(record.owner) !== deps.attesterId.toLowerCase()) return negative;
 
-    // v4: the anchored schema id names the field panel the tree was built
-    // over. A verifier of cross-party claims checks it against the CANONICAL
-    // schema of the expected panel (plus attesterId against the identity it
-    // trusts); the comparison circuit proves the anchor describes the tree.
-    let schemaOk = false;
-    if (deps.schemaId && led.content_schemas.member(ph)) {
-        schemaOk = hex(led.content_schemas.lookup(ph)).toLowerCase()
-            === deps.schemaId.toLowerCase();
-    }
-
-    const attesterId = attested && led.attestation_owners.member(ph)
-        ? hex(led.attestation_owners.lookup(ph))
-        : '';
-
-    return { attested, contentRootOk, schemaOk, attesterId };
+    const anchor = led.content_anchors.member(key) ? led.content_anchors.lookup(key) : null;
+    const contentRoot = anchor ? hex(anchor.root) : '';
+    const schemaId = anchor ? hex(anchor.schema) : '';
+    const contentRootOk = !!deps.contentRoot && contentRoot !== '' && contentRoot === deps.contentRoot.toLowerCase();
+    const schemaOk = !!deps.schemaId && schemaId !== '' && schemaId === deps.schemaId.toLowerCase();
+    const documentId = hex(record.document_id);
+    const bindingRegistered = documentId !== ZERO_ID
+        && led.document_owners.member(record.document_id)
+        && hex(led.document_owners.lookup(record.document_id)) === hex(record.owner);
+    return {
+        attested: true,
+        contentRootOk,
+        schemaOk,
+        bindingRegistered,
+        attesterId: hex(record.owner),
+        payloadHash,
+        recordKey,
+        documentId: documentId === ZERO_ID ? '' : documentId,
+        contentRoot,
+        schemaId
+    };
 }
 
 export interface ReadAttestationStateForContractArgs {
     contractAddress: string;
-    payloadHash: string;
+    attesterId?: string;
+    payloadHash?: string;
+    documentId?: string;
     contentRoot?: string;
     schemaId?: string;
-    /** Path to the compiled contract artifact (`.../contract/index.js`). */
     artifactPath: string;
-    /** Config for the contract-only provider bundle (no wallet needed to read). */
     contractProvidersConfig: import('../midnight/providers').ContractProvidersConfig;
 }
 
-/**
- * Production wrapper: build a contract-only provider bundle, load the artifact's
- * `ledger`, and read attestation state. Dynamic import keeps the ESM-only SDK out
- * of CJS load.
- */
+/** Dynamic imports keep the ESM-only SDK out of CJS load. */
 export async function readAttestationStateForContract(
     args: ReadAttestationStateForContractArgs
 ): Promise<AttestationStateResult | null> {
@@ -119,7 +133,9 @@ export async function readAttestationStateForContract(
 
     return readAttestationState({
         contractAddress: args.contractAddress,
+        attesterId: args.attesterId,
         payloadHash: args.payloadHash,
+        documentId: args.documentId,
         contentRoot: args.contentRoot,
         schemaId: args.schemaId,
         ledger: artifact.ledger,

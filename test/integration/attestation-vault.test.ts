@@ -24,11 +24,12 @@ import {
     SET_DEPTH
 } from '../../srv/submission/set-root';
 import {
-    computeAttestCommitment,
+    computeRecordKey,
     computeDocumentDiffClaimKey,
     computeDocumentIntegrityClaimKey,
     computeFieldEqualityClaimKey,
-    computeFieldMembershipClaimKey
+    computeFieldMembershipClaimKey,
+    computeFieldPredicateClaimKey
 } from '../../srv/submission/predicate-state';
 import { emptyLeafKeyHex } from '../../srv/submission/hashing';
 
@@ -38,9 +39,10 @@ const artifactPath = path.join(repoRoot,
 const zkConfigPath = path.join(repoRoot,
     'contracts/attestation-vault/src/managed/attestation-vault');
 
-/** Fixed block time: lineage-3 commitments carry a block-time expiry. */
+/** Fixed block time; claims carry block-time expiries. */
 const BLOCK_TIME = 1_700_000_000;
-const EXPIRY = BigInt(BLOCK_TIME + 3600);
+const VALID_UNTIL = BigInt(BLOCK_TIME + 86400);
+const ZERO = new Uint8Array(32);
 
 const bytes32 = (fill: number) => new Uint8Array(32).fill(fill);
 const hexToBytes = (h: string) => Uint8Array.from(Buffer.from(h, 'hex'));
@@ -88,25 +90,36 @@ let rt: any;
 const attesterIdOf = (secretBytes: Uint8Array): Uint8Array =>
     rt.persistentHash(new rt.CompactTypeBytes(32), secretBytes);
 
+/** The ledger key of an attester's record: the artifact's `recordKey` pure circuit. */
+const ownerRk = (payload: Uint8Array): Uint8Array => mod.pureCircuits.recordKey(attesterIdOf(ownerSecret), payload);
+const attackerRk = (payload: Uint8Array): Uint8Array => mod.pureCircuits.recordKey(attesterIdOf(attackerSecret), payload);
+
 const ownerSecret = bytes32(0x11);
 const attackerSecret = bytes32(0x22);
 
 interface Vault {
     owner: any;
     attacker: any;
+    recovery: any;
     registrarId: Uint8Array;
+    recoveryId: Uint8Array;
     run(contract: any, circuit: string, ...args: unknown[]): any;
+    attest(contract: any, payload: Uint8Array, meta: Uint8Array): any;
     ledger(): any;
     setBlockTime(seconds: number): void;
 }
 
-/** A fresh contract state deployed by the owner (registrar = owner id). */
+const recoverySecret = bytes32(0x33);
+
+/** A fresh contract state deployed by the owner (registrar = owner id, recovery = a third identity). */
 function deployVault(): Vault {
     const owner = new ContractClass(makeWitnesses(ownerSecret));
     const attacker = new ContractClass(makeWitnesses(attackerSecret));
+    const recovery = new ContractClass(makeWitnesses(recoverySecret));
     const registrarId = attesterIdOf(ownerSecret);
+    const recoveryId = attesterIdOf(recoverySecret);
     const ctorCtx = rt.createConstructorContext({}, '00'.repeat(32));
-    const init = owner.initialState(ctorCtx, registrarId);
+    const init = owner.initialState(ctorCtx, registrarId, recoveryId);
     let ctx = rt.createCircuitContext(
         rt.dummyContractAddress(),
         ctorCtx.initialZswapLocalState.coinPublicKey,
@@ -114,14 +127,19 @@ function deployVault(): Vault {
         init.currentPrivateState,
         undefined, undefined, BLOCK_TIME
     );
-    return {
+    const v: Vault = {
         owner,
         attacker,
+        recovery,
         registrarId,
+        recoveryId,
         run(contract, circuit, ...args) {
             const out = contract.impureCircuits[circuit](ctx, ...args);
             ctx = out.context; // thread the mutated context forward
             return out;
+        },
+        attest(contract, payload, meta) {
+            return v.run(contract, 'attest', payload, meta);
         },
         ledger() {
             return mod.ledger(ctx.currentQueryContext.state);
@@ -130,6 +148,7 @@ function deployVault(): Vault {
             ctx.currentQueryContext.block = { ...ctx.currentQueryContext.block, secondsSinceEpoch: BigInt(seconds) };
         }
     };
+    return v;
 }
 
 beforeAll(async () => {
@@ -152,29 +171,33 @@ describe('artifact shape', () => {
         expect(mod.pureCircuits).toBeDefined();
     });
 
-    test('exposes the attestation and disclosure circuits', () => {
-        expect(typeof instance.circuits?.attest).toBe('function');
-        expect(typeof instance.circuits?.attestGuarded).toBe('function');
-        expect(typeof instance.circuits?.grantDisclosure).toBe('function');
-        expect(typeof instance.circuits?.revokeDisclosure).toBe('function');
+    test('exposes the eleven exported circuits', () => {
+        for (const name of ['attest', 'retract', 'grantDisclosure', 'revokeDisclosure', 'registerDocument', 'bindDocument',
+            'anchorContentRoot', 'proveFieldPredicate', 'proveFieldEquality', 'proveFieldMembership', 'proveDocumentComparison']) {
+            expect(typeof instance.circuits?.[name], name).toBe('function');
+        }
+        expect(Object.keys(instance.impureCircuits).length).toBe(11);
     });
 
-    test('the commitment-only lane is gone (an overwritable commitment left stale claims verifiable)', () => {
+    test('the constructor takes registrar and recovery as public arguments', () => {
+        const v = deployVault();
+        const led = v.ledger();
+        expect(sameBytes(led.registrar, v.registrarId)).toBe(true);
+        expect(sameBytes(led.recovery, v.recoveryId)).toBe(true);
+    });
+
+    test('exposes no commitment-only circuits (an overwritable commitment would leave stale claims verifiable)', () => {
         expect(instance.circuits?.commitValue).toBeUndefined();
         expect(instance.circuits?.provePredicate).toBeUndefined();
+        expect(instance.circuits?.registerPassport).toBeUndefined();
+        expect(instance.circuits?.bindPassport).toBeUndefined();
+        expect(instance.circuits?.attestGuarded).toBeUndefined();
     });
 
-    test('exposes the field-bound proof circuits and their pure leaf hashers', () => {
-        expect(typeof instance.circuits?.proveFieldPredicate).toBe('function');
-        expect(typeof instance.circuits?.proveFieldEquality).toBe('function');
-        expect(typeof instance.circuits?.proveFieldMembership).toBe('function');
-        expect(typeof instance.circuits?.proveDocumentComparison).toBe('function');
-        expect(typeof mod.pureCircuits?.bytesLeafHash).toBe('function');
-        expect(typeof mod.pureCircuits?.setLeafHash).toBe('function');
-        expect(typeof mod.pureCircuits?.emptyLeafKey).toBe('function');
-        expect(typeof mod.pureCircuits?.absentLeafHash).toBe('function');
-        expect(typeof mod.pureCircuits?.descriptorLeafHash).toBe('function');
-        expect(typeof mod.pureCircuits?.slotSalt).toBe('function');
+    test('exposes the pure leaf hashers', () => {
+        for (const name of ['leafHash', 'nodeHash', 'bytesLeafHash', 'absentLeafHash', 'setLeafHash', 'descriptorLeafHash', 'slotSalt', 'emptyLeafKey', 'recordKey']) {
+            expect(typeof mod.pureCircuits?.[name], name).toBe('function');
+        }
     });
 
     test('wires the witness object as given', () => {
@@ -183,6 +206,16 @@ describe('artifact shape', () => {
 
     test('emptyLeafKey has byte parity with hashing.ts', () => {
         expect(toHex(mod.pureCircuits.emptyLeafKey())).toBe(emptyLeafKeyHex());
+    });
+
+    test('the hashed structs are separated by their type tag, not only by arity', () => {
+        // Same field-element sequence, different tag: no two leaf families
+        // collide with a node.
+        const k = bytes32(0x31);
+        const s = bytes32(0x32);
+        expect(toHex(mod.pureCircuits.absentLeafHash(k, s))).not.toBe(toHex(mod.pureCircuits.nodeHash(k, s)));
+        expect(toHex(mod.pureCircuits.descriptorLeafHash(k, 0n, 0n))).not.toBe(toHex(mod.pureCircuits.nodeHash(k, ZERO)));
+        expect(toHex(mod.pureCircuits.setLeafHash(k))).not.toBe(toHex(mod.pureCircuits.absentLeafHash(k, ZERO)));
     });
 });
 
@@ -205,7 +238,7 @@ describe('witness factory', () => {
     const seed = new Uint8Array(32).fill(0x77);
     const fakeCtx = { privateState: { foo: 'bar' }, ledger: {}, contractAddress: 'addr-stub' };
 
-    test('derives a 32-byte secret and builds local_secret_key without the removed commitment witnesses', () => {
+    test('derives a 32-byte secret and builds local_secret_key without commitment witnesses', () => {
         const secret = deriveAttestationSecret(seed);
         expect(secret.byteLength).toBe(32);
         const built = buildAttestationVaultWitnesses({ attestationSecret: secret });
@@ -230,18 +263,22 @@ describe('witness factory', () => {
     });
 });
 
-describe('attest ownership-takeover guard', () => {
-    // Re-attesting a known payload_hash must throw instead of silently
-    // replacing attestation_owners (a Map.insert overwrite would let the
-    // attacker pass every owner-gated assert: grantDisclosure /
-    // revokeDisclosure / bindPassport / anchorContentRoot).
+describe('attest: ownership guard', () => {
     let v: Vault;
     const payloadHash = bytes32(0xaa);
 
     beforeAll(() => {
         v = deployVault();
-        v.run(v.owner, 'attest', payloadHash, bytes32(0xbb));
+        v.attest(v.owner, payloadHash, bytes32(0xbb));
         v.run(v.owner, 'grantDisclosure', payloadHash, bytes32(0xcc), 2n);
+    });
+
+    test('records owner, payload, metadata and no binding under the record key', () => {
+        const rec = v.ledger().attestations.lookup(ownerRk(payloadHash));
+        expect(sameBytes(rec.payload_hash, payloadHash)).toBe(true);
+        expect(sameBytes(rec.owner, attesterIdOf(ownerSecret))).toBe(true);
+        expect(sameBytes(rec.metadata_hash, bytes32(0xbb))).toBe(true);
+        expect(sameBytes(rec.document_id, ZERO)).toBe(true);
     });
 
     test('grantDisclosure level 3 is rejected in-circuit (tier range guard)', () => {
@@ -249,68 +286,93 @@ describe('attest ownership-takeover guard', () => {
             .toContain('level out of range');
     });
 
-    test('re-attest of an existing payload_hash is rejected', () => {
-        expect(failing(() => v.run(v.attacker, 'attest', payloadHash, bytes32(0xdd))))
+    test('the same attester cannot record a payload twice', () => {
+        expect(failing(() => v.attest(v.owner, payloadHash, bytes32(0xdd))))
             .toContain('already attested');
     });
 
-    test('a non-owner still fails an owner-gated circuit', () => {
+    test('another identity cannot touch the record: an owner-gated circuit finds no attestation of its own', () => {
         expect(failing(() => v.run(v.attacker, 'revokeDisclosure', payloadHash, bytes32(0xcc))))
-            .toContain('not attester');
+            .toContain('no attestation');
+        expect(failing(() => v.run(v.attacker, 'anchorContentRoot', payloadHash, bytes32(0x01), bytes32(0x02))))
+            .toContain('no attestation');
+        expect(failing(() => v.run(v.attacker, 'retract', 0n, payloadHash))).toContain('no attestation');
     });
 
-    test('the grant made before the takeover attempt survives', () => {
-        expect(v.ledger().disclosures.lookup(payloadHash).member(bytes32(0xcc))).toBe(true);
+    test('the same payload attested by another identity is a separate record; the first one is untouched', () => {
+        expect(failing(() => v.attest(v.attacker, payloadHash, bytes32(0xdd)))).toBe('');
+        const led = v.ledger();
+        expect(sameBytes(led.attestations.lookup(ownerRk(payloadHash)).metadata_hash, bytes32(0xbb))).toBe(true);
+        expect(sameBytes(led.attestations.lookup(attackerRk(payloadHash)).metadata_hash, bytes32(0xdd))).toBe(true);
+        expect(led.disclosures.lookup(ownerRk(payloadHash)).member(bytes32(0xcc))).toBe(true);
+        expect(led.disclosures.member(attackerRk(payloadHash))).toBe(false);
     });
 
     test('a fresh payload_hash still attests, also for a second attester', () => {
-        expect(failing(() => v.run(v.attacker, 'attest', bytes32(0xee), bytes32(0xff)))).toBe('');
+        expect(failing(() => v.attest(v.attacker, bytes32(0xee), bytes32(0xff)))).toBe('');
+    });
+
+    test('revoking on a record without disclosures is refused', () => {
+        expect(failing(() => v.run(v.attacker, 'revokeDisclosure', bytes32(0xee), bytes32(0xcc))))
+            .toContain('no disclosures');
     });
 });
 
-describe('bindPassport rebind-takeover guard', () => {
-    // Without the guard ANY attester could re-bind an already-bound passportId
-    // onto their own attestation, hijacking the QR resolution. Same-owner
-    // rebinding must stay allowed.
+describe('bindDocument: rebind guard and one-to-one pairing', () => {
     let v: Vault;
     const payloadHash = bytes32(0xaa);
     const newPayloadHash = bytes32(0xab);
-    const passportId = bytes32(0x77);
+    const documentId = bytes32(0x77);
 
     beforeAll(() => {
         v = deployVault();
-        v.run(v.owner, 'attest', payloadHash, bytes32(0xbb));
-        v.run(v.attacker, 'attest', bytes32(0xee), bytes32(0xff));
+        v.attest(v.owner, payloadHash, bytes32(0xbb));
+        v.attest(v.attacker, bytes32(0xee), bytes32(0xff));
     });
 
-    test('the first bind by the attestation owner succeeds', () => {
-        expect(failing(() => v.run(v.owner, 'bindPassport', passportId, payloadHash))).toBe('');
+    test('a zero document id is refused', () => {
+        expect(failing(() => v.run(v.owner, 'bindDocument', ZERO, payloadHash))).toContain('document id must not be zero');
     });
 
-    test('a foreign re-bind of a bound passportId is rejected and the binding is untouched', () => {
-        expect(failing(() => v.run(v.attacker, 'bindPassport', passportId, bytes32(0xee))))
-            .toContain('passport bound by another attester');
-        expect(sameBytes(v.ledger().passport_bindings.lookup(passportId), payloadHash)).toBe(true);
+    test('the first bind by the attestation owner succeeds and is recorded on both sides', () => {
+        expect(failing(() => v.run(v.owner, 'bindDocument', documentId, payloadHash))).toBe('');
+        const led = v.ledger();
+        expect(sameBytes(led.document_bindings.lookup(documentId), ownerRk(payloadHash))).toBe(true);
+        expect(sameBytes(led.attestations.lookup(ownerRk(payloadHash)).document_id, documentId)).toBe(true);
     });
 
-    test('the same owner may re-bind the passport to a newer attestation of their own', () => {
+    test('a foreign re-bind of a bound id is rejected and the binding is untouched', () => {
+        expect(failing(() => v.run(v.attacker, 'bindDocument', documentId, bytes32(0xee))))
+            .toContain('document bound by another attester');
+        expect(sameBytes(v.ledger().document_bindings.lookup(documentId), ownerRk(payloadHash))).toBe(true);
+    });
+
+    test('the same owner may re-bind the id to a newer attestation of their own; the old payload loses its id', () => {
         expect(failing(() => {
-            v.run(v.owner, 'attest', newPayloadHash, bytes32(0xbc));
-            v.run(v.owner, 'bindPassport', passportId, newPayloadHash);
+            v.attest(v.owner, newPayloadHash, bytes32(0xbc));
+            v.run(v.owner, 'bindDocument', documentId, newPayloadHash);
         })).toBe('');
-        expect(sameBytes(v.ledger().passport_bindings.lookup(passportId), newPayloadHash)).toBe(true);
+        const led = v.ledger();
+        expect(sameBytes(led.document_bindings.lookup(documentId), ownerRk(newPayloadHash))).toBe(true);
+        expect(sameBytes(led.attestations.lookup(ownerRk(newPayloadHash)).document_id, documentId)).toBe(true);
+        expect(sameBytes(led.attestations.lookup(ownerRk(payloadHash)).document_id, ZERO)).toBe(true);
     });
 
-    test('an unbound passportId still binds for any attester on their own hash', () => {
-        expect(failing(() => v.run(v.attacker, 'bindPassport', bytes32(0x78), bytes32(0xee)))).toBe('');
+    test('binding a payload under a second id releases its first id', () => {
+        const otherId = bytes32(0x79);
+        v.run(v.owner, 'bindDocument', otherId, newPayloadHash);
+        const led = v.ledger();
+        expect(led.document_bindings.member(documentId)).toBe(false);
+        expect(sameBytes(led.document_bindings.lookup(otherId), ownerRk(newPayloadHash))).toBe(true);
+        expect(sameBytes(led.attestations.lookup(ownerRk(newPayloadHash)).document_id, otherId)).toBe(true);
+    });
+
+    test('an unbound id still binds for any attester on their own hash', () => {
+        expect(failing(() => v.run(v.attacker, 'bindDocument', bytes32(0x78), bytes32(0xee)))).toBe('');
     });
 });
 
-describe('registrar-gated passport pre-registration', () => {
-    // registerPassport is registrar-only (the deployer identity, locked in by
-    // the constructor). A registered passportId may only be bound by its
-    // registered owner: blocks a foreign FIRST bind (squatting) and recovers
-    // an already-squatted id by rebinding over the foreign binding.
+describe('registerDocument: registrar-gated ids, unregister, registrar transfer', () => {
     let v: Vault;
     let ownerId: Uint8Array;
     const payloadHash = bytes32(0xaa);
@@ -318,12 +380,12 @@ describe('registrar-gated passport pre-registration', () => {
 
     beforeAll(() => {
         v = deployVault();
-        v.run(v.owner, 'attest', payloadHash, bytes32(0xbb));
-        v.run(v.owner, 'attest', newPayloadHash, bytes32(0xbc));
-        v.run(v.attacker, 'attest', bytes32(0xee), bytes32(0xff));
+        v.attest(v.owner, payloadHash, bytes32(0xbb));
+        v.attest(v.owner, newPayloadHash, bytes32(0xbc));
+        v.attest(v.attacker, bytes32(0xee), bytes32(0xff));
         // 0x78 gets squatted (unregistered) by the attacker.
-        v.run(v.attacker, 'bindPassport', bytes32(0x78), bytes32(0xee));
-        ownerId = v.ledger().attestation_owners.lookup(payloadHash);
+        v.run(v.attacker, 'bindDocument', bytes32(0x78), bytes32(0xee));
+        ownerId = v.ledger().attestations.lookup(ownerRk(payloadHash)).owner;
     });
 
     test('the constructor locked the deployer as registrar', () => {
@@ -331,33 +393,93 @@ describe('registrar-gated passport pre-registration', () => {
     });
 
     test('the off-chain attester-id recompute matches the in-circuit caller_id', () => {
-        // The constructor arg was computed OFF-CHAIN; equality with the
-        // in-circuit attest() owner id proves the worker's deploy-time
-        // attester-id recompute is byte-identical to caller_id().
         expect(sameBytes(v.registrarId, ownerId)).toBe(true);
     });
 
-    test('a non-registrar registerPassport is rejected', () => {
-        expect(failing(() => v.run(v.attacker, 'registerPassport', bytes32(0x79), bytes32(0x01))))
+    test('a non-registrar registerDocument is rejected', () => {
+        expect(failing(() => v.run(v.attacker, 'registerDocument', 0n, bytes32(0x79), bytes32(0x01))))
             .toContain('not registrar');
     });
 
     test('pre-registration blocks a foreign FIRST bind of a still-unbound id', () => {
-        v.run(v.owner, 'registerPassport', bytes32(0x79), ownerId);
-        expect(failing(() => v.run(v.attacker, 'bindPassport', bytes32(0x79), bytes32(0xee))))
-            .toContain('not passport owner');
+        v.run(v.owner, 'registerDocument', 0n, bytes32(0x79), ownerId);
+        expect(failing(() => v.run(v.attacker, 'bindDocument', bytes32(0x79), bytes32(0xee))))
+            .toContain('not document owner');
     });
 
     test('the registered owner binds their id', () => {
-        expect(failing(() => v.run(v.owner, 'bindPassport', bytes32(0x79), newPayloadHash))).toBe('');
+        expect(failing(() => v.run(v.owner, 'bindDocument', bytes32(0x79), newPayloadHash))).toBe('');
     });
 
-    test('the registered owner rebinds over a squatted binding', () => {
-        // Registering the squatted id to the owner lets the owner rebind OVER
-        // the attacker's binding, which the unregistered rebind guard alone forbids.
-        v.run(v.owner, 'registerPassport', bytes32(0x78), ownerId);
-        expect(failing(() => v.run(v.owner, 'bindPassport', bytes32(0x78), newPayloadHash))).toBe('');
-        expect(sameBytes(v.ledger().passport_bindings.lookup(bytes32(0x78)), newPayloadHash)).toBe(true);
+    test('registering a squatted id releases the squatter\'s binding at once; the registered owner then binds', () => {
+        expect(v.ledger().document_bindings.member(bytes32(0x78))).toBe(true);
+        v.run(v.owner, 'registerDocument', 0n, bytes32(0x78), ownerId);
+        const led = v.ledger();
+        expect(led.document_bindings.member(bytes32(0x78))).toBe(false);
+        expect(sameBytes(led.attestations.lookup(attackerRk(bytes32(0xee))).document_id, ZERO)).toBe(true);
+        expect(failing(() => v.run(v.owner, 'bindDocument', bytes32(0x78), newPayloadHash))).toBe('');
+        expect(sameBytes(v.ledger().document_bindings.lookup(bytes32(0x78)), ownerRk(newPayloadHash))).toBe(true);
+    });
+
+    test('re-registering an id to its bound owner keeps the binding', () => {
+        v.run(v.owner, 'registerDocument', 0n, bytes32(0x78), ownerId);
+        expect(sameBytes(v.ledger().document_bindings.lookup(bytes32(0x78)), ownerRk(newPayloadHash))).toBe(true);
+    });
+
+    test('unregister (mode 1) removes the registration and takes no owner', () => {
+        expect(failing(() => v.run(v.owner, 'registerDocument', 1n, bytes32(0x79), ownerId)))
+            .toContain('owner must be the neutral dummy');
+        expect(failing(() => v.run(v.owner, 'registerDocument', 1n, bytes32(0x7a), ZERO)))
+            .toContain('id not registered');
+        v.run(v.owner, 'registerDocument', 1n, bytes32(0x79), ZERO);
+        expect(v.ledger().document_owners.member(bytes32(0x79))).toBe(false);
+    });
+
+    test('transfer (mode 2) hands the registrar role over and takes no id', () => {
+        const attackerId = attesterIdOf(attackerSecret);
+        expect(failing(() => v.run(v.owner, 'registerDocument', 2n, bytes32(0x01), attackerId)))
+            .toContain('id must be the neutral dummy');
+        expect(failing(() => v.run(v.owner, 'registerDocument', 2n, ZERO, ZERO)))
+            .toContain('registrar must not be zero');
+        v.run(v.owner, 'registerDocument', 2n, ZERO, attackerId);
+        expect(sameBytes(v.ledger().registrar, attackerId)).toBe(true);
+        expect(failing(() => v.run(v.owner, 'registerDocument', 0n, bytes32(0x7b), ownerId))).toContain('not registrar');
+        expect(failing(() => v.run(v.attacker, 'registerDocument', 0n, bytes32(0x7b), attackerId))).toBe('');
+    });
+
+    test('the constructor locked the recovery identity; only it runs modes 3 and 4', () => {
+        const attackerId = attesterIdOf(attackerSecret);
+        expect(sameBytes(v.ledger().recovery, v.recoveryId)).toBe(true);
+        expect(failing(() => v.run(v.attacker, 'registerDocument', 3n, ZERO, ownerId))).toContain('not recovery');
+        expect(failing(() => v.run(v.owner, 'registerDocument', 3n, ZERO, ownerId))).toContain('not recovery');
+        expect(failing(() => v.run(v.recovery, 'registerDocument', 3n, bytes32(0x01), ownerId))).toContain('id must be the neutral dummy');
+        expect(failing(() => v.run(v.recovery, 'registerDocument', 3n, ZERO, ZERO))).toContain('identity must not be zero');
+        // The registrar role was handed to the attacker above; recovery takes it back.
+        v.run(v.recovery, 'registerDocument', 3n, ZERO, ownerId);
+        expect(sameBytes(v.ledger().registrar, ownerId)).toBe(true);
+        expect(failing(() => v.run(v.attacker, 'registerDocument', 0n, bytes32(0x7c), attackerId))).toContain('not registrar');
+        expect(failing(() => v.run(v.owner, 'registerDocument', 0n, bytes32(0x7c), ownerId))).toBe('');
+        // Recovery cannot touch ids and the registrar cannot touch recovery.
+        expect(failing(() => v.run(v.recovery, 'registerDocument', 0n, bytes32(0x7d), ownerId))).toContain('not registrar');
+        expect(failing(() => v.run(v.owner, 'registerDocument', 4n, ZERO, ownerId))).toContain('not recovery');
+        // Mode 4 rotates the recovery identity; the old one is powerless afterwards.
+        v.run(v.recovery, 'registerDocument', 4n, ZERO, attackerId);
+        expect(sameBytes(v.ledger().recovery, attackerId)).toBe(true);
+        expect(failing(() => v.run(v.recovery, 'registerDocument', 3n, ZERO, ownerId))).toContain('not recovery');
+        expect(failing(() => v.run(v.attacker, 'registerDocument', 4n, ZERO, v.recoveryId))).toBe('');
+    });
+
+    test('mode 5 is out of range', () => {
+        expect(failing(() => v.run(v.attacker, 'registerDocument', 5n, ZERO, ZERO))).toContain('mode out of range');
+    });
+
+    test('a zero recovery identity disables modes 3 and 4', () => {
+        const owner = new ContractClass(makeWitnesses(ownerSecret));
+        const ctorCtx = rt.createConstructorContext({}, '00'.repeat(32));
+        const init = owner.initialState(ctorCtx, attesterIdOf(ownerSecret), ZERO);
+        const ctx = rt.createCircuitContext(rt.dummyContractAddress(), ctorCtx.initialZswapLocalState.coinPublicKey,
+            init.currentContractState.data, init.currentPrivateState, undefined, undefined, BLOCK_TIME);
+        expect(failing(() => owner.impureCircuits.registerDocument(ctx, 3n, ZERO, attesterIdOf(attackerSecret)))).toContain('not recovery');
     });
 });
 
@@ -374,13 +496,14 @@ describe('bytes equality + set membership', () => {
     let memberPath: any;
     const allowList = ['EEA', 'CH', 'NO'];
     const bytesPayload = bytes32(0xcd);
-    const bytesPayloadHex = toHex(bytesPayload);
+    const bytesRk = () => ownerRk(bytesPayload);
+    const bytesRkHex = () => toHex(bytesRk());
 
     beforeAll(() => {
         v = deployVault();
         const document = {
             chemistry: 'NMC811', origin: 'EEA', capacity: 42,
-            // Adversarial fixture: the PRE-FIX padding label as a real field value.
+            // Adversarial fixture: a plausible padding label as a real field value.
             sneaky: 'nightgate/set-root/empty/v1'
         };
         built8 = buildDocumentContentRoot(document, [
@@ -394,7 +517,7 @@ describe('bytes equality + set membership', () => {
         capacity8 = built8.fields.find((f: any) => f.field === 'capacity');
         sneaky = built8.fields.find((f: any) => f.field === 'sneaky');
         memberPath = membershipPathFor(allowList, origin.valueDigest, mod.pureCircuits);
-        v.run(v.owner, 'attest', bytesPayload, bytes32(0xce));
+        v.attest(v.owner, bytesPayload, bytes32(0xce));
         v.run(v.owner, 'anchorContentRoot', bytesPayload, hexToBytes(built8.contentRoot), hexToBytes(built8.schemaId));
     });
 
@@ -410,6 +533,10 @@ describe('bytes equality + set membership', () => {
             setProof: { siblings: memberPath.setSiblings, dirs: memberPath.setDirs }
         }
     } as any));
+    const capContract = () => new ContractClass(buildAttestationVaultWitnesses({
+        attestationSecret: ownerSecret,
+        merkleProof: { fieldValue: capacity8.value, fieldSalt: capacity8.salt, siblings: capacity8.siblings, dirs: capacity8.dirs }
+    } as any));
 
     test('the builder emits digests for bytes fields', () => {
         expect(chem?.valueDigest).toBeTruthy();
@@ -418,39 +545,41 @@ describe('bytes equality + set membership', () => {
 
     test('proveFieldEquality accepts the anchored digest', () => {
         expect(failing(() => v.run(eqContract(), 'proveFieldEquality',
-            bytesPayload, hexToBytes(chem.fieldKey), hexToBytes(chem.valueDigest)))).toBe('');
+            bytesRk(), hexToBytes(chem.fieldKey), hexToBytes(chem.valueDigest), VALID_UNTIL))).toBe('');
     });
 
     test('proveFieldEquality rejects a wrong expected digest', () => {
         expect(failing(() => v.run(eqContract(), 'proveFieldEquality',
-            bytesPayload, hexToBytes(chem.fieldKey), bytes32(0x01)))).toContain('field not in passport');
+            bytesRk(), hexToBytes(chem.fieldKey), bytes32(0x01), VALID_UNTIL))).toContain('field not in document');
     });
 
     test('proveFieldMembership accepts a member with the canonical set root', () => {
         expect(memberPath).not.toBeNull();
         expect(failing(() => v.run(memContract(), 'proveFieldMembership',
-            bytesPayload, hexToBytes(origin.fieldKey), hexToBytes(memberPath.setRoot)))).toBe('');
+            bytesRk(), hexToBytes(origin.fieldKey), hexToBytes(memberPath.setRoot), VALID_UNTIL))).toBe('');
     });
 
     test('proveFieldMembership rejects a wrong set root', () => {
         expect(failing(() => v.run(memContract(), 'proveFieldMembership',
-            bytesPayload, hexToBytes(origin.fieldKey), bytes32(0x02)))).toContain('value not in set');
+            bytesRk(), hexToBytes(origin.fieldKey), bytes32(0x02), VALID_UNTIL))).toContain('value not in set');
     });
 
-    test('proveFieldPredicate op 2 is rejected in-circuit (op range guard)', () => {
-        // Without the guard, op 2 would select the greaterOrEqual branch.
-        const opContract = new ContractClass(buildAttestationVaultWitnesses({
-            attestationSecret: ownerSecret,
-            merkleProof: { fieldValue: capacity8.value, fieldSalt: capacity8.salt, siblings: capacity8.siblings, dirs: capacity8.dirs }
-        } as any));
-        expect(failing(() => v.run(opContract, 'proveFieldPredicate', bytesPayload, hexToBytes(capacity8.fieldKey), 1n, 2n)))
+    test('proveFieldPredicate records a numeric claim and rejects op 2 in-circuit', () => {
+        expect(failing(() => v.run(capContract(), 'proveFieldPredicate', bytesRk(), hexToBytes(capacity8.fieldKey), 40n, 1n, VALID_UNTIL))).toBe('');
+        expect(failing(() => v.run(capContract(), 'proveFieldPredicate', bytesRk(), hexToBytes(capacity8.fieldKey), 1n, 2n, VALID_UNTIL)))
             .toContain('op out of range');
     });
 
-    test('ADVERSARIAL: the pre-fix padding label anchored as a real value is not provable via a padding-slot path', () => {
-        // Rebuild the canonical tree levels, extract the first padding slot's
-        // path, and drive the real circuit with the label's digest: the set
-        // fold must fail.
+    test('a claim expiry in the past or beyond five years is rejected in-circuit', () => {
+        expect(failing(() => v.run(capContract(), 'proveFieldPredicate', bytesRk(), hexToBytes(capacity8.fieldKey), 40n, 1n, BigInt(BLOCK_TIME))))
+            .toContain('expiry must lie in the future');
+        // The bound is exclusive: valid_until - cap must lie before the block time.
+        expect(failing(() => v.run(capContract(), 'proveFieldPredicate', bytesRk(), hexToBytes(capacity8.fieldKey), 40n, 1n, BigInt(BLOCK_TIME + 157680000))))
+            .toContain('expiry too far ahead');
+        expect(failing(() => v.run(capContract(), 'proveFieldPredicate', bytesRk(), hexToBytes(capacity8.fieldKey), 40n, 1n, BigInt(BLOCK_TIME + 157679999)))).toBe('');
+    });
+
+    test('ADVERSARIAL: a padding label anchored as a real value is not provable via a padding-slot path', () => {
         const setDigests = canonicalSetDigests(allowList);
         const padLeaves: Uint8Array[] = [];
         for (let i = 0; i < MAX_SET_VALUES; i++) {
@@ -474,27 +603,101 @@ describe('bytes equality + set membership', () => {
         const attackContract = new ContractClass(buildAttestationVaultWitnesses({
             attestationSecret: ownerSecret,
             merkleProof: {
-                fieldDigest: sneaky.valueDigest, // digest of the old padding label
+                fieldDigest: sneaky.valueDigest, // digest of the padding label
                 fieldSalt: sneaky.salt,
                 siblings: sneaky.siblings, dirs: sneaky.dirs,
                 setProof: { siblings: padSlotPath.siblings, dirs: padSlotPath.dirs }
             }
         } as any));
         expect(failing(() => v.run(attackContract, 'proveFieldMembership',
-            bytesPayload, hexToBytes(sneaky.fieldKey), hexToBytes(memberPath.setRoot)))).toContain('value not in set');
+            bytesRk(), hexToBytes(sneaky.fieldKey), hexToBytes(memberPath.setRoot), VALID_UNTIL))).toContain('value not in set');
     });
 
-    test('the claim-key recomputes (with the attestation epoch) hit the recorded results', async () => {
-        // Claim keys embed the payload's ATTESTATION EPOCH (attestation_seqs),
-        // read from the same ledger state, exactly as the crawler-free reader does.
+    test('the claim-key recomputes (with the anchored root and schema) hit the recorded claims and carry valid_until', async () => {
         const led = v.ledger();
-        const epoch = led.attestation_seqs.lookup(bytesPayload);
-        const eqKey = await computeFieldEqualityClaimKey(bytesPayloadHex, chem.fieldKey, chem.valueDigest, epoch);
-        expect(led.field_equality_results.member(hexToBytes(eqKey))).toBe(true);
-        expect(led.field_equality_results.lookup(hexToBytes(eqKey))).toBe(true);
-        const memKey = await computeFieldMembershipClaimKey(bytesPayloadHex, origin.fieldKey, memberPath.setRoot, epoch);
-        expect(led.field_membership_results.member(hexToBytes(memKey))).toBe(true);
-        expect(led.field_membership_results.lookup(hexToBytes(memKey))).toBe(true);
+        const anchor = led.content_anchors.lookup(bytesRk());
+        const root = toHex(anchor.root);
+        const schema = toHex(anchor.schema);
+        expect(root).toBe(built8.contentRoot);
+        expect(schema).toBe(built8.schemaId);
+        const eqKey = await computeFieldEqualityClaimKey(bytesRkHex(), root, schema, chem.fieldKey, chem.valueDigest);
+        expect(led.claims.member(hexToBytes(eqKey))).toBe(true);
+        expect(led.claims.lookup(hexToBytes(eqKey))).toBe(VALID_UNTIL);
+        const memKey = await computeFieldMembershipClaimKey(bytesRkHex(), root, schema, origin.fieldKey, memberPath.setRoot);
+        expect(led.claims.member(hexToBytes(memKey))).toBe(true);
+        const predKey = await computeFieldPredicateClaimKey(bytesRkHex(), root, schema, capacity8.fieldKey, 40n, 1);
+        expect(led.claims.member(hexToBytes(predKey))).toBe(true);
+        // A key computed with a different root or schema misses.
+        const otherRootKey = await computeFieldEqualityClaimKey(bytesRkHex(), toHex(bytes32(0x99)), schema, chem.fieldKey, chem.valueDigest);
+        expect(led.claims.member(hexToBytes(otherRootKey))).toBe(false);
+        const otherSchemaKey = await computeFieldEqualityClaimKey(bytesRkHex(), root, toHex(bytes32(0x98)), chem.fieldKey, chem.valueDigest);
+        expect(led.claims.member(hexToBytes(otherSchemaKey))).toBe(false);
+    });
+
+    test('a later proof of the same claim keeps or extends the expiry, never shortens it (any holder of the opening may prove)', async () => {
+        // The lifetime test above left the claim at cap-1, the longest expiry a
+        // proof at this block time can record.
+        const root = toHex(v.ledger().content_anchors.lookup(bytesRk()).root);
+        const predKey = hexToBytes(await computeFieldPredicateClaimKey(bytesRkHex(), root, built8.schemaId, capacity8.fieldKey, 40n, 1));
+        const current = v.ledger().claims.lookup(predKey) as bigint;
+        expect(current).toBe(BigInt(BLOCK_TIME + 157679999));
+        const attackerCap = () => new ContractClass(buildAttestationVaultWitnesses({
+            attestationSecret: attackerSecret,
+            merkleProof: { fieldValue: capacity8.value, fieldSalt: capacity8.salt, siblings: capacity8.siblings, dirs: capacity8.dirs }
+        } as any));
+        const prove = (contract: any, until: bigint) =>
+            failing(() => v.run(contract, 'proveFieldPredicate', bytesRk(), hexToBytes(capacity8.fieldKey), 40n, 1n, until));
+        expect(prove(attackerCap(), current - 1n)).toContain('claim expiry cannot be shortened');
+        expect(prove(attackerCap(), BigInt(BLOCK_TIME + 1))).toContain('claim expiry cannot be shortened');
+        expect(prove(attackerCap(), current)).toBe('');
+        expect(v.ledger().claims.lookup(predKey)).toBe(current);
+        // Once the claim expired, a proof at the later block time extends it.
+        v.setBlockTime(Number(current) + 1);
+        try {
+            expect(prove(capContract(), current)).toContain('expiry must lie in the future');
+            expect(prove(capContract(), current + 86400n)).toBe('');
+            expect(v.ledger().claims.lookup(predKey)).toBe(current + 86400n);
+        } finally {
+            v.setBlockTime(BLOCK_TIME);
+        }
+    });
+
+    test('retract mode 1 removes a claim only once it expired', async () => {
+        const led = v.ledger();
+        const root = toHex(led.content_anchors.lookup(bytesRk()).root);
+        const eqKey = hexToBytes(await computeFieldEqualityClaimKey(bytesRkHex(), root, built8.schemaId, chem.fieldKey, chem.valueDigest));
+        expect(failing(() => v.run(v.attacker, 'retract', 1n, eqKey))).toContain('claim not expired');
+        expect(failing(() => v.run(v.attacker, 'retract', 1n, bytes32(0x55)))).toContain('no claim');
+        v.setBlockTime(Number(VALID_UNTIL) + 1);
+        try {
+            expect(failing(() => v.run(v.attacker, 'retract', 1n, eqKey))).toBe('');
+        } finally {
+            v.setBlockTime(BLOCK_TIME);
+        }
+        expect(v.ledger().claims.member(eqKey)).toBe(false);
+    });
+
+    test('retract mode 0 is owner-only and removes attestation, anchor and disclosures', () => {
+        v.run(v.owner, 'grantDisclosure', bytesPayload, bytes32(0xc1), 1n);
+        v.run(v.owner, 'bindDocument', bytes32(0xc2), bytesPayload);
+        expect(failing(() => v.run(v.attacker, 'retract', 0n, bytesPayload))).toContain('no attestation');
+        expect(failing(() => v.run(v.owner, 'retract', 0n, bytesPayload))).toBe('');
+        const led = v.ledger();
+        expect(led.attestations.member(bytesRk())).toBe(false);
+        expect(led.content_anchors.member(bytesRk())).toBe(false);
+        expect(led.disclosures.member(bytesRk())).toBe(false);
+        expect(led.document_bindings.member(bytes32(0xc2))).toBe(false);
+        expect(failing(() => v.run(v.owner, 'retract', 0n, bytesPayload))).toContain('no attestation');
+    });
+
+    test('after a retract the payload attests again, and the old claims need the same root under the same record', async () => {
+        expect(failing(() => v.attest(v.owner, bytesPayload, bytes32(0xce)))).toBe('');
+        const led = v.ledger();
+        // The membership claim recorded under the old root stays in the map
+        // until purged, and resolves only if the same root is anchored again.
+        const memKey = await computeFieldMembershipClaimKey(bytesRkHex(), built8.contentRoot, built8.schemaId, origin.fieldKey, memberPath.setRoot);
+        expect(led.claims.member(hexToBytes(memKey))).toBe(true);
+        expect(led.content_anchors.member(bytesRk())).toBe(false);
     });
 });
 
@@ -518,10 +721,6 @@ function buildCrossRootDocuments() {
 }
 
 describe('cross-root document proofs', () => {
-    // proveDocumentComparison (mode 0 integrity / mode 1 diff) over SALTED
-    // content roots built by the PRODUCTION builder; the recorded claim keys
-    // must byte-match the descriptor recomputes, and the schema binding is
-    // proven in-circuit.
     let v: Vault;
     let builtA9: any;
     let builtB9: any;
@@ -529,6 +728,9 @@ describe('cross-root document proofs', () => {
     const payloadA9 = bytes32(0xd1);
     const payloadB9 = bytes32(0xd2);
     const payloadC9 = bytes32(0xd3);
+    let rkA9: Uint8Array;
+    let rkB9: Uint8Array;
+    let rkC9: Uint8Array;
 
     const docPairContract = (openingB: any, secret: Uint8Array | undefined = ownerSecret) =>
         new ContractClass(buildAttestationVaultWitnesses({
@@ -539,9 +741,12 @@ describe('cross-root document proofs', () => {
     beforeAll(() => {
         v = deployVault();
         ({ builtA: builtA9, builtB: builtB9, builtC: builtC9 } = buildCrossRootDocuments());
-        v.run(v.owner, 'attest', payloadA9, bytes32(0xd4));
-        v.run(v.owner, 'attest', payloadB9, bytes32(0xd5));
-        v.run(v.owner, 'attest', payloadC9, bytes32(0xd6));
+        rkA9 = ownerRk(payloadA9);
+        rkB9 = ownerRk(payloadB9);
+        rkC9 = ownerRk(payloadC9);
+        v.attest(v.owner, payloadA9, bytes32(0xd4));
+        v.attest(v.owner, payloadB9, bytes32(0xd5));
+        v.attest(v.owner, payloadC9, bytes32(0xd6));
         v.run(v.owner, 'anchorContentRoot', payloadA9, hexToBytes(builtA9.contentRoot), hexToBytes(builtA9.schemaId));
         v.run(v.owner, 'anchorContentRoot', payloadB9, hexToBytes(builtB9.contentRoot), hexToBytes(builtB9.schemaId));
         v.run(v.owner, 'anchorContentRoot', payloadC9, hexToBytes(builtC9.contentRoot), hexToBytes(builtC9.schemaId));
@@ -588,31 +793,29 @@ describe('cross-root document proofs', () => {
     });
 
     test('unchanged-except accepts a mask covering exactly the changed slots', () => {
-        expect(failing(() => v.run(docPairContract(builtB9.opening), 'proveDocumentComparison', payloadA9, payloadB9, 0n, maskOf(0, 2), 1n))).toBe('');
+        expect(failing(() => v.run(docPairContract(builtB9.opening), 'proveDocumentComparison', rkA9, rkB9, 0n, maskOf(0, 2), 1n, VALID_UNTIL))).toBe('');
     });
 
     test.each([
         ['the all-ones mask', Array.from({ length: 16 }, () => true)],
         ['a mask freeing every real slot of a 4-field schema', maskOf(0, 1, 2, 3)]
     ])('VACUOUS integrity mask rejected in-circuit: %s', (_label, vacuousMask) => {
-        // Server-side 400s alone would leave direct wallet callers able to
-        // record an "everything may differ" claim.
-        expect(failing(() => v.run(docPairContract(builtB9.opening), 'proveDocumentComparison', payloadA9, payloadB9, 0n, vacuousMask, 1n)))
+        expect(failing(() => v.run(docPairContract(builtB9.opening), 'proveDocumentComparison', rkA9, rkB9, 0n, vacuousMask, 1n, VALID_UNTIL)))
             .toContain('mask must constrain at least one schema slot');
     });
 
     test('integrity mode rejects a non-neutral k (canonical inactive parameters)', () => {
-        expect(failing(() => v.run(docPairContract(builtB9.opening), 'proveDocumentComparison', payloadA9, payloadB9, 0n, maskOf(0, 2), 2n)))
+        expect(failing(() => v.run(docPairContract(builtB9.opening), 'proveDocumentComparison', rkA9, rkB9, 0n, maskOf(0, 2), 2n, VALID_UNTIL)))
             .toContain('k must be the neutral dummy');
     });
 
     test('diff mode rejects a non-neutral mask (canonical inactive parameters)', () => {
-        expect(failing(() => v.run(docPairContract(builtB9.opening), 'proveDocumentComparison', payloadA9, payloadB9, 1n, maskOf(0), 1n)))
+        expect(failing(() => v.run(docPairContract(builtB9.opening), 'proveDocumentComparison', rkA9, rkB9, 1n, maskOf(0), 1n, VALID_UNTIL)))
             .toContain('mask must be the neutral dummy');
     });
 
     test('a presence change outside the mask is rejected', () => {
-        expect(failing(() => v.run(docPairContract(builtB9.opening), 'proveDocumentComparison', payloadA9, payloadB9, 0n, maskOf(0), 1n)))
+        expect(failing(() => v.run(docPairContract(builtB9.opening), 'proveDocumentComparison', rkA9, rkB9, 0n, maskOf(0), 1n, VALID_UNTIL)))
             .toContain('slot changed outside allowed mask');
     });
 
@@ -621,59 +824,44 @@ describe('cross-root document proofs', () => {
             saltSeed: builtB9.opening.saltSeed,
             slots: builtB9.opening.slots.map((s: any, i: number) => i === 0 ? { present: true, value: '123456' } : s)
         };
-        expect(failing(() => v.run(docPairContract(tamperedOpening), 'proveDocumentComparison', payloadA9, payloadB9, 0n, maskOf(0, 2), 1n)))
+        expect(failing(() => v.run(docPairContract(tamperedOpening), 'proveDocumentComparison', rkA9, rkB9, 0n, maskOf(0, 2), 1n, VALID_UNTIL)))
             .toContain('doc B opening does not match anchored root');
     });
 
-    test('a document cannot be compared with itself', () => {
-        expect(failing(() => v.run(docPairContract(builtB9.opening), 'proveDocumentComparison', payloadA9, payloadA9, 0n, maskOf(), 1n)))
-            .toContain('documents must differ');
+    test('a record cannot be compared with itself', () => {
+        expect(failing(() => v.run(docPairContract(builtB9.opening), 'proveDocumentComparison', rkA9, rkA9, 0n, maskOf(), 1n, VALID_UNTIL)))
+            .toContain('records must differ');
     });
 
     test('k-differ accepts k = the actual difference count (value + absence)', () => {
-        expect(failing(() => v.run(docPairContract(builtB9.opening), 'proveDocumentComparison', payloadA9, payloadB9, 1n, maskOf(), 2n))).toBe('');
+        expect(failing(() => v.run(docPairContract(builtB9.opening), 'proveDocumentComparison', rkA9, rkB9, 1n, maskOf(), 2n, VALID_UNTIL))).toBe('');
     });
 
     test('k above the actual difference count is rejected', () => {
-        expect(failing(() => v.run(docPairContract(builtB9.opening), 'proveDocumentComparison', payloadA9, payloadB9, 1n, maskOf(), 3n)))
+        expect(failing(() => v.run(docPairContract(builtB9.opening), 'proveDocumentComparison', rkA9, rkB9, 1n, maskOf(), 3n, VALID_UNTIL)))
             .toContain('too few differing fields');
     });
 
     test('k = 0 is rejected before any folding', () => {
-        expect(failing(() => v.run(docPairContract(builtB9.opening), 'proveDocumentComparison', payloadA9, payloadB9, 1n, maskOf(), 0n)))
+        expect(failing(() => v.run(docPairContract(builtB9.opening), 'proveDocumentComparison', rkA9, rkB9, 1n, maskOf(), 0n, VALID_UNTIL)))
             .toContain('k out of range');
     });
 
     test('an anchored schema mismatch aborts the comparison before any value is compared', () => {
-        // C was anchored under a DIFFERENT field list (slot 3 renamed); the
-        // witnessed shared schema (A's) cannot fold to C's anchored schema id.
-        expect(failing(() => v.run(docPairContract(builtC9.opening), 'proveDocumentComparison', payloadA9, payloadC9, 1n, maskOf(), 1n)))
+        expect(failing(() => v.run(docPairContract(builtC9.opening), 'proveDocumentComparison', rkA9, rkC9, 1n, maskOf(), 1n, VALID_UNTIL)))
             .toContain('doc B schema mismatch');
     });
 
     test('ADVERSARIAL: a forged schema label cannot produce a diff claim', () => {
-        // Anchor a document whose tree was built over a DIFFERENT field list,
-        // but label it with A's schemaId. A plain schema-equality lookup
-        // accepted this; the circuit recomputes the content root under the
-        // witnessed shared schema, and the forged document's real opening
-        // cannot fold to its anchored root.
         const payloadF9 = bytes32(0xd7);
-        v.run(v.owner, 'attest', payloadF9, bytes32(0xd8));
+        v.attest(v.owner, payloadF9, bytes32(0xd8));
         v.run(v.owner, 'anchorContentRoot', payloadF9, hexToBytes(builtC9.contentRoot), hexToBytes(builtA9.schemaId));
-        expect(failing(() => v.run(docPairContract(builtC9.opening), 'proveDocumentComparison', payloadA9, payloadF9, 1n, maskOf(), 1n)))
+        expect(failing(() => v.run(docPairContract(builtC9.opening), 'proveDocumentComparison', rkA9, ownerRk(payloadF9), 1n, maskOf(), 1n, VALID_UNTIL)))
             .toContain('doc B opening does not match anchored root');
     });
 
-    test.each([
-        { kind: 3n,   payloadA: 0xd9, payloadB: 0xda, metaA: 0xdb, metaB: 0xdc, seedA: 0xe1, seedB: 0xe2 },
-        { kind: 255n, payloadA: 0xe5, payloadB: 0xe6, metaA: 0xe7, metaB: 0xe8, seedA: 0xe3, seedB: 0xe4 }
-    ])('ADVERSARIAL: out-of-range descriptor kind $kind is rejected in-circuit', (c) => {
-        // Descriptors are witness data. Without the canonical-slot guard an
-        // out-of-range kind lands on the absent leaf in slotLeaf but compares
-        // as a bytes field in slotDiff, so two all-absent roots could prove a
-        // fabricated k=1 diff. The guard rejects the schema before any root math.
-        // Built with RAW witness objects (a malicious client does not use our
-        // validating helpers).
+    /** A raw-witness comparison over sixteen descriptors of one kind, both documents all-absent. */
+    function rawComparison(kind: bigint, keys: Uint8Array[], payloadA: number, payloadB: number, seedA: number, seedB: number) {
         const fold16 = (leaves: Uint8Array[]) => {
             let level = leaves;
             while (level.length > 1) {
@@ -683,277 +871,145 @@ describe('cross-root document proofs', () => {
             }
             return level[0];
         };
-        const evilKeys = Array.from({ length: 16 }, (_, i) => {
+        const rootFor = (seedByte: number) => fold16(keys.map((k, i) =>
+            mod.pureCircuits.absentLeafHash(k, mod.pureCircuits.slotSalt(bytes32(seedByte), BigInt(i)))));
+        const schemaId = fold16(keys.map(k => mod.pureCircuits.descriptorLeafHash(k, kind, 0n)));
+        const pA = bytes32(payloadA);
+        const pB = bytes32(payloadB);
+        v.attest(v.owner, pA, bytes32(payloadA + 1));
+        v.attest(v.owner, pB, bytes32(payloadB + 1));
+        v.run(v.owner, 'anchorContentRoot', pA, rootFor(seedA), schemaId);
+        v.run(v.owner, 'anchorContentRoot', pB, rootFor(seedB), schemaId);
+        const slots = (fill: number) => Array.from({ length: 16 }, () =>
+            ({ present: false, uint_value: 0n, value_digest: new Uint8Array(32).fill(fill) }));
+        const contract = new ContractClass({
+            ...buildAttestationVaultWitnesses({ attestationSecret: ownerSecret }),
+            doc_schema:  (ctx: any) => [ctx.privateState, keys.map(k => ({ field_key: k, kind, scale: 0n }))],
+            doc_salt_a:  (ctx: any) => [ctx.privateState, bytes32(seedA)],
+            doc_salt_b:  (ctx: any) => [ctx.privateState, bytes32(seedB)],
+            doc_slots_a: (ctx: any) => [ctx.privateState, slots(0x11)],
+            doc_slots_b: (ctx: any) => [ctx.privateState, slots(0x22)]
+        });
+        return failing(() => v.run(contract, 'proveDocumentComparison', ownerRk(pA), ownerRk(pB), 1n, maskOf(), 1n, VALID_UNTIL));
+    }
+
+    test.each([
+        { kind: 3n,   payloadA: 0xd9, payloadB: 0xda, seedA: 0xe1, seedB: 0xe2 },
+        { kind: 255n, payloadA: 0xe5, payloadB: 0xe6, seedA: 0xe3, seedB: 0xe4 }
+    ])('ADVERSARIAL: out-of-range descriptor kind $kind is rejected in-circuit', (c) => {
+        const keys = Array.from({ length: 16 }, (_, i) => {
             const b = new Uint8Array(32); b[0] = 0xee; b[1] = Number(c.kind & 0xffn); b[2] = i; return b;
         });
-        const evilRootFor = (seedByte: number) => fold16(evilKeys.map((k, i) =>
-            mod.pureCircuits.absentLeafHash(k, mod.pureCircuits.slotSalt(bytes32(seedByte), BigInt(i)))));
-        const evilSchemaId = fold16(evilKeys.map(k => mod.pureCircuits.descriptorLeafHash(k, c.kind, 0n)));
-        const pA = bytes32(c.payloadA);
-        const pB = bytes32(c.payloadB);
-        v.run(v.owner, 'attest', pA, bytes32(c.metaA));
-        v.run(v.owner, 'attest', pB, bytes32(c.metaB));
-        v.run(v.owner, 'anchorContentRoot', pA, evilRootFor(c.seedA), evilSchemaId);
-        v.run(v.owner, 'anchorContentRoot', pB, evilRootFor(c.seedB), evilSchemaId);
-        const evilSlots = (fill: number) => Array.from({ length: 16 }, () =>
-            ({ present: true, uint_value: 0n, value_digest: new Uint8Array(32).fill(fill) }));
-        const evilContract = new ContractClass({
-            ...buildAttestationVaultWitnesses({ attestationSecret: ownerSecret }),
-            doc_schema:  (ctx: any) => [ctx.privateState, evilKeys.map(k => ({ field_key: k, kind: c.kind, scale: 0n }))],
-            doc_salt_a:  (ctx: any) => [ctx.privateState, bytes32(c.seedA)],
-            doc_salt_b:  (ctx: any) => [ctx.privateState, bytes32(c.seedB)],
-            doc_slots_a: (ctx: any) => [ctx.privateState, evilSlots(0x11)],
-            doc_slots_b: (ctx: any) => [ctx.privateState, evilSlots(0x22)]
-        });
-        expect(failing(() => v.run(evilContract, 'proveDocumentComparison', pA, pB, 1n, maskOf(), 1n)))
-            .toContain('schema kind out of range');
+        expect(rawComparison(c.kind, keys, c.payloadA, c.payloadB, c.seedA, c.seedB)).toContain('schema kind out of range');
+    });
+
+    test('ADVERSARIAL: the padding key in a real slot is rejected in-circuit', () => {
+        const keys = Array.from({ length: 16 }, () => mod.pureCircuits.emptyLeafKey());
+        expect(rawComparison(1n, keys, 0xe9, 0xea, 0xeb, 0xec)).toContain('padding key in a real slot');
     });
 
     test('a holder proves WITHOUT the attester secret (privilege separation)', () => {
-        // The proof circuits never invoke local_secret_key.
-        expect(failing(() => v.run(docPairContract(builtB9.opening, undefined), 'proveDocumentComparison', payloadA9, payloadB9, 1n, maskOf(), 1n))).toBe('');
+        expect(failing(() => v.run(docPairContract(builtB9.opening, undefined), 'proveDocumentComparison', rkA9, rkB9, 1n, maskOf(), 1n, VALID_UNTIL))).toBe('');
     });
 
-    test('the claim-key recomputes hit the recorded results and the reversed order does not', async () => {
+    test('the claim-key recomputes hit the recorded claims and the reversed order does not', async () => {
         const led = v.ledger();
-        const epochA9 = led.attestation_seqs.lookup(payloadA9);
-        const epochB9 = led.attestation_seqs.lookup(payloadB9);
-        const integKey = await computeDocumentIntegrityClaimKey(toHex(payloadA9), toHex(payloadB9), 0b101, epochA9, epochB9);
-        expect(led.document_integrity_results.member(hexToBytes(integKey))).toBe(true);
-        expect(led.document_integrity_results.lookup(hexToBytes(integKey))).toBe(true);
-        const diffKey = await computeDocumentDiffClaimKey(toHex(payloadA9), toHex(payloadB9), 2, epochA9, epochB9);
-        expect(led.document_diff_results.member(hexToBytes(diffKey))).toBe(true);
-        expect(led.document_diff_results.lookup(hexToBytes(diffKey))).toBe(true);
+        const rootA = toHex(led.content_anchors.lookup(rkA9).root);
+        const rootB = toHex(led.content_anchors.lookup(rkB9).root);
+        const schema = toHex(led.content_anchors.lookup(rkA9).schema);
+        expect(schema).toBe(builtA9.schemaId);
+        const integKey = await computeDocumentIntegrityClaimKey(toHex(rkA9), rootA, toHex(rkB9), rootB, schema, 0b101);
+        expect(led.claims.member(hexToBytes(integKey))).toBe(true);
+        expect(led.claims.lookup(hexToBytes(integKey))).toBe(VALID_UNTIL);
+        const diffKey = await computeDocumentDiffClaimKey(toHex(rkA9), rootA, toHex(rkB9), rootB, schema, 2);
+        expect(led.claims.member(hexToBytes(diffKey))).toBe(true);
         // (A, B) order is part of the claim.
-        const reversedKey = await computeDocumentIntegrityClaimKey(toHex(payloadB9), toHex(payloadA9), 0b101, epochB9, epochA9);
-        expect(led.document_integrity_results.member(hexToBytes(reversedKey))).toBe(false);
+        const reversedKey = await computeDocumentIntegrityClaimKey(toHex(rkB9), rootB, toHex(rkA9), rootA, schema, 0b101);
+        expect(led.claims.member(hexToBytes(reversedKey))).toBe(false);
+    });
+
+    test('a comparison claim does not survive a re-anchor of the same root under another schema', async () => {
+        // Retract B, attest it again, anchor the SAME root under a different
+        // schema id: the anchor's schema is part of the claim key, so the key a
+        // verifier recomputes from the CURRENT anchors misses the old claim; a
+        // fresh proof with the original openings is refused by the circuit.
+        const led0 = v.ledger();
+        const rootA = toHex(led0.content_anchors.lookup(rkA9).root);
+        const rootB = toHex(led0.content_anchors.lookup(rkB9).root);
+        v.run(v.owner, 'retract', 0n, payloadB9);
+        v.attest(v.owner, payloadB9, bytes32(0xd5));
+        v.run(v.owner, 'anchorContentRoot', payloadB9, hexToBytes(builtB9.contentRoot), hexToBytes(builtC9.schemaId));
+        const led = v.ledger();
+        expect(toHex(led.content_anchors.lookup(rkB9).root)).toBe(rootB);
+        const oldKey = await computeDocumentDiffClaimKey(toHex(rkA9), rootA, toHex(rkB9), rootB, builtA9.schemaId, 2);
+        expect(led.claims.member(hexToBytes(oldKey))).toBe(true);
+        const currentKey = await computeDocumentDiffClaimKey(toHex(rkA9), rootA, toHex(rkB9), rootB, builtC9.schemaId, 2);
+        expect(led.claims.member(hexToBytes(currentKey))).toBe(false);
+        expect(failing(() => v.run(docPairContract(builtB9.opening), 'proveDocumentComparison', rkA9, rkB9, 1n, maskOf(), 2n, VALID_UNTIL)))
+            .toContain('doc B schema mismatch');
     });
 });
 
-const commitmentFor = async (payload: Uint8Array, meta: Uint8Array, nonce: Uint8Array) =>
-    hexToBytes(await computeAttestCommitment(toHex(payload), toHex(meta), toHex(nonce)));
-
-describe('guarded attest: commit-reveal takeover', () => {
-    // attest() is FCFS and insert-once, so a mempool observer could permanently
-    // claim a visible payload hash. attestGuarded closes it: commit an opaque,
-    // caller-bound, EXPIRING commitment first, reveal later; the reveal
-    // inherits the commitment's sequence and is final. The off-chain
-    // computeAttestCommitment parity is proven implicitly: the reveal
-    // recomputes the commitment in-circuit and must hit the committed entry.
+describe('record model: one record per attester and payload', () => {
     let v: Vault;
-    let builtA9: any;
-    let a9chem: any;
-    let gCommitment: Uint8Array;
-    let sniperEpoch: bigint;
-    const gPayload = bytes32(0xf1);
-    const gMeta = bytes32(0xf2);
-    const gNonce = bytes32(0xf3);
-
-    beforeAll(async () => {
-        v = deployVault();
-        ({ builtA: builtA9 } = buildCrossRootDocuments());
-        a9chem = builtA9.fields.find((f: any) => f.field === 'chemistry');
-        gCommitment = await commitmentFor(gPayload, gMeta, gNonce);
-    });
-
-    test('commit mode rejects non-dummy metadata', () => {
-        expect(failing(() => v.run(v.owner, 'attestGuarded', 0n, gCommitment, bytes32(1), bytes32(0), EXPIRY)))
-            .toContain('metadata must be the neutral dummy');
-    });
-
-    test('reveal mode rejects a non-dummy expiry', () => {
-        expect(failing(() => v.run(v.owner, 'attestGuarded', 1n, gPayload, gMeta, gNonce, EXPIRY)))
-            .toContain('expires_at must be the neutral dummy');
-    });
-
-    test('a reveal without a commitment is rejected', () => {
-        expect(failing(() => v.run(v.owner, 'attestGuarded', 1n, gPayload, gMeta, gNonce, 0n)))
-            .toContain('no matching commitment');
-    });
-
-    test('a commitment expiring in the past is refused at commit', () => {
-        // The kernel block-time comparisons return booleans the circuit
-        // asserts; the local runtime evaluates them against the query
-        // context's block time.
-        expect(failing(() => v.run(v.owner, 'attestGuarded', 0n, gCommitment, bytes32(0), bytes32(0), BigInt(BLOCK_TIME - 1))))
-            .toContain('commitment expiry must lie in the future');
-    });
-
-    test('a commitment more than 7 days ahead is refused at commit', () => {
-        expect(failing(() => v.run(v.owner, 'attestGuarded', 0n, gCommitment, bytes32(0), bytes32(0), BigInt(BLOCK_TIME + 8 * 86400))))
-            .toContain('commitment expiry too far ahead');
-    });
-
-    test('a duplicate commitment by the SAME committer is rejected', () => {
-        // The victim (owner) commits.
-        v.run(v.owner, 'attestGuarded', 0n, gCommitment, bytes32(0), bytes32(0), EXPIRY);
-        expect(failing(() => v.run(v.owner, 'attestGuarded', 0n, gCommitment, bytes32(0), bytes32(0), EXPIRY)))
-            .toContain('commitment already recorded');
-    });
-
-    test('a copied commitment is a separate, inert record the copier cannot reveal', () => {
-        // Copy-griefing: the attacker records the victim's commitment VALUE
-        // under their own key; the victim's entry is untouched and the
-        // attacker cannot reveal it without the nonce (a guessed nonce
-        // recomputes a different commitment, whose key has no record).
-        v.run(v.attacker, 'attestGuarded', 0n, gCommitment, bytes32(0), bytes32(0), EXPIRY);
-        expect(failing(() => v.run(v.attacker, 'attestGuarded', 1n, gPayload, gMeta, bytes32(0xee), 0n)))
-            .toContain('no matching commitment');
-    });
-
-    test('a sniper who front-runs the reveal owns the payload pre-reveal, with a verifying claim and a grant', async () => {
-        // SNIPER: the attacker front-runs the reveal with a plain attest AND,
-        // while they own the attestation, anchors a content root, PROVES a
-        // claim against it and grants themselves disclosure level 2 (the full
-        // abuse window the takeover must erase).
-        v.run(v.attacker, 'attest', gPayload, bytes32(0xf4));
-        v.run(v.attacker, 'anchorContentRoot', gPayload, hexToBytes(builtA9.contentRoot), hexToBytes(builtA9.schemaId));
-        const sniperEqContract = new ContractClass(buildAttestationVaultWitnesses({
-            attestationSecret: attackerSecret,
-            merkleProof: { fieldSalt: a9chem.salt, siblings: a9chem.siblings, dirs: a9chem.dirs }
-        } as any));
-        v.run(sniperEqContract, 'proveFieldEquality', gPayload, hexToBytes(a9chem.fieldKey), hexToBytes(a9chem.valueDigest));
-        v.run(v.attacker, 'grantDisclosure', gPayload, bytes32(0xf8), 2n);
-
-        const led = v.ledger();
-        sniperEpoch = led.attestation_seqs.lookup(gPayload);
-        const sniperEraKey = await computeFieldEqualityClaimKey(toHex(gPayload), a9chem.fieldKey, a9chem.valueDigest, sniperEpoch);
-        expect(sameBytes(led.attestation_owners.lookup(gPayload), attesterIdOf(attackerSecret))).toBe(true);
-        expect(led.field_equality_results.member(hexToBytes(sniperEraKey))).toBe(true);
-        // A plain attestation is not guarded.
-        expect(led.guarded_attestations.member(gPayload)).toBe(false);
-    });
-
-    test('the reveal takes the sniped attestation over and erases the abuse window', async () => {
-        // The commitment predates the snipe.
-        v.run(v.owner, 'attestGuarded', 1n, gPayload, gMeta, gNonce, 0n);
-        const led = v.ledger();
-        expect(sameBytes(led.attestation_owners.lookup(gPayload), attesterIdOf(ownerSecret))).toBe(true);
-        // The sniper-anchored content root + schema are removed.
-        expect(led.content_roots.member(gPayload)).toBe(false);
-        expect(led.content_schemas.member(gPayload)).toBe(false);
-        // The epoch moved, so verifiers (which always recompute with the
-        // CURRENT epoch) no longer reach the sniper-era claim entry.
-        const recoveredEpoch = led.attestation_seqs.lookup(gPayload);
-        expect(recoveredEpoch).not.toBe(sniperEpoch);
-        const currentEraKey = await computeFieldEqualityClaimKey(toHex(gPayload), a9chem.fieldKey, a9chem.valueDigest, recoveredEpoch);
-        expect(led.field_equality_results.member(hexToBytes(currentEraKey))).toBe(false);
-        // The sniper's disclosure grant is gone.
-        expect(led.disclosures.member(gPayload)).toBe(false);
-        // The recovered attestation is guarded (final).
-        expect(led.guarded_attestations.member(gPayload)).toBe(true);
-    });
-
-    test('the commitment was consumed by the reveal', () => {
-        expect(failing(() => v.run(v.owner, 'attestGuarded', 1n, gPayload, gMeta, gNonce, 0n)))
-            .toContain('no matching commitment');
-    });
-
-    test('a NEWER commitment cannot re-take the recovered attestation (no ping-pong)', async () => {
-        const aNonce = bytes32(0xf5);
-        const aCommitment = await commitmentFor(gPayload, gMeta, aNonce);
-        v.run(v.attacker, 'attestGuarded', 0n, aCommitment, bytes32(0), bytes32(0), EXPIRY);
-        expect(failing(() => v.run(v.attacker, 'attestGuarded', 1n, gPayload, gMeta, aNonce, 0n)))
-            .toContain('attestation is guarded');
-    });
-
-    test('a commitment NEWER than a plain attestation cannot take it over', async () => {
-        const pPayload = bytes32(0xfd);
-        const pNonce = bytes32(0xfe);
-        const pCommitment = await commitmentFor(pPayload, gMeta, pNonce);
-        v.run(v.owner, 'attest', pPayload, gMeta);
-        v.run(v.attacker, 'attestGuarded', 0n, pCommitment, bytes32(0), bytes32(0), EXPIRY);
-        expect(failing(() => v.run(v.attacker, 'attestGuarded', 1n, pPayload, gMeta, pNonce, 0n)))
-            .toContain('attestation predates commitment');
-    });
-});
-
-describe('guarded attest: the reveal itself cannot be front-run', () => {
-    // The reveal inherits the commitment's sequence and a revealed attestation
-    // is final, so a commit that lands between the legitimate commit and its
-    // reveal is never older than the attestation and cannot take it over.
-    let v: Vault;
-    let ownerCommitSeq: bigint;
-    const l3Payload = bytes32(0xf5);
-    const l3Meta = bytes32(0xf6);
-    const l3Nonce = bytes32(0xf7);
-    const l3SnipeNonce = bytes32(0xf9);
-
-    beforeAll(async () => {
-        v = deployVault();
-        v.run(v.owner, 'attestGuarded', 0n, await commitmentFor(l3Payload, l3Meta, l3Nonce), bytes32(0), bytes32(0), EXPIRY);
-        ownerCommitSeq = v.ledger().attest_seq_next - 1n;
-        // The attacker sees the payload in the reveal's mempool and commits
-        // their own (metadata/nonce of their choosing) BEFORE the reveal lands.
-        v.run(v.attacker, 'attestGuarded', 0n, await commitmentFor(l3Payload, l3Meta, l3SnipeNonce), bytes32(0), bytes32(0), EXPIRY);
-        v.run(v.owner, 'attestGuarded', 1n, l3Payload, l3Meta, l3Nonce, 0n);
-    });
-
-    test('a fresh reveal inherits the COMMITMENT sequence as its epoch', () => {
-        expect(v.ledger().attestation_seqs.lookup(l3Payload)).toBe(ownerCommitSeq);
-    });
-
-    test('the attacker commit that front-ran the reveal cannot take over and the owner keeps the attestation', () => {
-        expect(failing(() => v.run(v.attacker, 'attestGuarded', 1n, l3Payload, l3Meta, l3SnipeNonce, 0n)))
-            .toContain('attestation is guarded');
-        expect(sameBytes(v.ledger().attestation_owners.lookup(l3Payload), attesterIdOf(ownerSecret))).toBe(true);
-    });
-
-    test('a self-reveal against an own attestation changes nothing and consumes its commitment', async () => {
-        const l3SelfNonce = bytes32(0xfa);
-        v.run(v.owner, 'attestGuarded', 0n, await commitmentFor(l3Payload, l3Meta, l3SelfNonce), bytes32(0), bytes32(0), EXPIRY);
-        v.run(v.owner, 'attestGuarded', 1n, l3Payload, l3Meta, l3SelfNonce, 0n);
-        const led = v.ledger();
-        expect(led.attestation_seqs.lookup(l3Payload)).toBe(ownerCommitSeq);
-        expect(sameBytes(led.attestation_owners.lookup(l3Payload), attesterIdOf(ownerSecret))).toBe(true);
-        expect(failing(() => v.run(v.owner, 'attestGuarded', 1n, l3Payload, l3Meta, l3SelfNonce, 0n)))
-            .toContain('no matching commitment');
-    });
-});
-
-describe('guarded attest: expiry, uncontested reveal, replay', () => {
-    let v: Vault;
-    let builtB9: any;
-    const gMeta = bytes32(0xf2);
+    const payload = bytes32(0xa7);
 
     beforeAll(() => {
         v = deployVault();
-        ({ builtB: builtB9 } = buildCrossRootDocuments());
     });
 
-    test('a reveal after the commitment expired is refused', async () => {
-        const payload = bytes32(0xfb);
-        const nonce = bytes32(0xfc);
-        v.run(v.owner, 'attestGuarded', 0n, await commitmentFor(payload, gMeta, nonce), bytes32(0), bytes32(0), BigInt(BLOCK_TIME + 100));
-        v.setBlockTime(BLOCK_TIME + 101);
-        try {
-            expect(failing(() => v.run(v.owner, 'attestGuarded', 1n, payload, gMeta, nonce, 0n)))
-                .toContain('commitment expired');
-        } finally {
-            v.setBlockTime(BLOCK_TIME);
-        }
+    test('the record key is the off-chain recompute of attester id and payload', async () => {
+        expect(toHex(ownerRk(payload))).toBe(await computeRecordKey(toHex(attesterIdOf(ownerSecret)), toHex(payload)));
+        expect(toHex(ownerRk(payload))).not.toBe(toHex(attackerRk(payload)));
+        expect(toHex(ownerRk(payload))).not.toBe(toHex(ownerRk(bytes32(0xa8))));
     });
 
-    test('an uncontested commit-reveal attests', async () => {
-        const payload = bytes32(0xf6);
-        const nonce = bytes32(0xf7);
-        v.run(v.owner, 'attestGuarded', 0n, await commitmentFor(payload, gMeta, nonce), bytes32(0), bytes32(0), EXPIRY);
-        v.run(v.owner, 'attestGuarded', 1n, payload, gMeta, nonce, 0n);
+    test('two attesters record the same payload without touching each other', () => {
+        v.attest(v.owner, payload, bytes32(0x01));
+        expect(failing(() => v.attest(v.attacker, payload, bytes32(0x02)))).toBe('');
         const led = v.ledger();
-        expect(led.public_attestations.member(payload)).toBe(true);
-        expect(sameBytes(led.attestation_owners.lookup(payload), attesterIdOf(ownerSecret))).toBe(true);
+        const mine = led.attestations.lookup(ownerRk(payload));
+        const theirs = led.attestations.lookup(attackerRk(payload));
+        expect(sameBytes(mine.owner, attesterIdOf(ownerSecret))).toBe(true);
+        expect(sameBytes(mine.payload_hash, payload)).toBe(true);
+        expect(sameBytes(mine.metadata_hash, bytes32(0x01))).toBe(true);
+        expect(sameBytes(theirs.owner, attesterIdOf(attackerSecret))).toBe(true);
+        expect(sameBytes(theirs.metadata_hash, bytes32(0x02))).toBe(true);
     });
 
-    test('replaying a successful reveal is rejected and the meanwhile-anchored root survives', () => {
-        // Commitments are CONSUMED on success. Without that, a second
-        // identical reveal would satisfy rec.seq < attestation_seq, run the
-        // takeover branch against the revealer's OWN attestation and delete
-        // the meanwhile-anchored root, re-opening insert-once.
-        const payload = bytes32(0xf6);
-        const nonce = bytes32(0xf7);
-        v.run(v.owner, 'anchorContentRoot', payload, hexToBytes(builtB9.contentRoot), hexToBytes(builtB9.schemaId));
-        expect(failing(() => v.run(v.owner, 'attestGuarded', 1n, payload, gMeta, nonce, 0n)))
-            .toContain('no matching commitment');
-        expect(v.ledger().content_roots.member(payload)).toBe(true);
+    test('a record is only ever written by its own attester', () => {
+        v.run(v.owner, 'grantDisclosure', payload, bytes32(0xcc), 2n);
+        // The attacker's calls address the attacker's own record of the payload.
+        expect(failing(() => v.run(v.attacker, 'revokeDisclosure', payload, bytes32(0xcc)))).toContain('no disclosures');
+        expect(v.ledger().disclosures.lookup(ownerRk(payload)).member(bytes32(0xcc))).toBe(true);
+        expect(failing(() => v.run(v.attacker, 'retract', 0n, payload))).toBe('');
+        const led = v.ledger();
+        expect(led.attestations.member(attackerRk(payload))).toBe(false);
+        expect(led.attestations.member(ownerRk(payload))).toBe(true);
+        expect(led.disclosures.lookup(ownerRk(payload)).member(bytes32(0xcc))).toBe(true);
+    });
+
+    test('a document id resolves to exactly one record', () => {
+        v.run(v.owner, 'bindDocument', bytes32(0x7c), payload);
+        expect(sameBytes(v.ledger().document_bindings.lookup(bytes32(0x7c)), ownerRk(payload))).toBe(true);
+        expect(sameBytes(v.ledger().attestations.lookup(ownerRk(payload)).document_id, bytes32(0x7c))).toBe(true);
+    });
+
+    test('proofs address one record: another attester\'s record of the same payload has no anchor', () => {
+        const { builtA } = buildCrossRootDocuments();
+        const energy = builtA.fields.find((f: any) => f.field === 'energy')!;
+        v.run(v.owner, 'anchorContentRoot', payload, hexToBytes(builtA.contentRoot), hexToBytes(builtA.schemaId));
+        v.attest(v.attacker, payload, bytes32(0x03));
+        const holder = new ContractClass(buildAttestationVaultWitnesses({
+            merkleProof: { fieldValue: energy.value, fieldSalt: energy.salt, siblings: energy.siblings, dirs: energy.dirs }
+        } as any));
+        expect(failing(() => v.run(holder, 'proveFieldPredicate', ownerRk(payload), hexToBytes(energy.fieldKey), 100n, 1n, VALID_UNTIL))).toBe('');
+        expect(failing(() => v.run(holder, 'proveFieldPredicate', attackerRk(payload), hexToBytes(energy.fieldKey), 100n, 1n, VALID_UNTIL)))
+            .toContain('no content root');
+    });
+
+    test('retract modes past 1 are out of range', () => {
+        expect(failing(() => v.run(v.owner, 'retract', 2n, ZERO))).toContain('mode out of range');
+        expect(failing(() => v.run(v.owner, 'retract', 3n, ZERO))).toContain('mode out of range');
     });
 });

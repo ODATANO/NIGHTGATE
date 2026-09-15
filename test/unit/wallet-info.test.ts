@@ -48,9 +48,8 @@ describe('deriveAttesterId', () => {
 
     test('pins the golden vector (formula stability across releases)', () => {
         // caller_id() = persistentHash<Bytes<32>>(local_secret_key()), with the
-        // secret from deriveAttestationSecret. Live-verified on preprod: the
-        // vault's attestation_owners entry for a Main-attested payload equals
-        // this derivation of Main's zswap seed (vault da9b0bcf…, 2026-07-24).
+        // secret from deriveAttestationSecret; the vault's attestation_owners
+        // entry for a payload equals this derivation of the attester's zswap seed.
         expect(deriveAttesterId(zswapSeed()))
             .toBe('7961a1e00d6341753fb38beb513ea72ea5e3cd990df81fb1435b1df9445814fe');
     });

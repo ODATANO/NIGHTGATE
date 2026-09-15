@@ -54,10 +54,6 @@ export default class NightgateAdminService extends cds.ApplicationService {
             const hours = Math.min(Math.max(Number(windowHours) || 24, 1), 720);
             const since = new Date(Date.now() - hours * 3600_000).toISOString();
 
-            // Aggregate in the DATABASE, not here. The window bounds time, not
-            // row count: at a high job rate "the last 720 hours" is millions of
-            // rows, and pulling them into the process on every dashboard poll
-            // would cost memory and query time for numbers SQL can fold itself.
             const [statusRows, errorRows, oldestRows] = await Promise.all([
                 this.db.run(
                     SELECT.from(BackgroundJobs)
@@ -120,8 +116,6 @@ export default class NightgateAdminService extends cds.ApplicationService {
             const dir = typeof data.dir === 'string' && data.dir.trim() ? data.dir.trim() : undefined;
             try {
                 if (thread === 'main') {
-                    // The CAP process itself: request handling, the save pipeline
-                    // (encrypt + persist of the worker's state blobs), pollers.
                     const p = await profileCurrentThread(seconds, { dir, filePrefix: 'main' });
                     return { thread: 'main', facadeCount: null, ...p, gc: { ...p.gc, byKind: JSON.stringify(p.gc.byKind) } };
                 }
@@ -207,8 +201,7 @@ export default class NightgateAdminService extends cds.ApplicationService {
         });
 
         this.on('invalidateAllSessions', async () => {
-            // Evict cached facades before nulling keys so live signing keys are
-            // dropped from RAM too.
+            // Evict cached facades before nulling keys so live signing keys are dropped from RAM too.
             const active: any[] = (await this.db.run(
                 SELECT.from(WalletSessions).columns('sessionId', 'encryptedViewingKey').where({ isActive: true })
             )) || [];

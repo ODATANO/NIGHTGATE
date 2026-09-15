@@ -1,9 +1,11 @@
 #!/usr/bin/env node
 // Writes (or checks) keys/manifest.json for every shipped contract: sha256 and
-// size of each prover key. The tarball ships the manifest and no prover key;
-// the server fetches a missing key on first need and verifies it against the
-// manifest (srv/submission/prover-keys.ts). The manifest is part of the
-// artifact generation digest, the prover keys are not.
+// size of each prover key, verifier key and binary zkir. The tarball ships the
+// manifest and no prover key; the server fetches a missing key on first need
+// and verifies it against the manifest (srv/submission/prover-keys.ts), and a
+// txbuilder consumer revalidates its key cache against the served manifest
+// (`ensureZkAssets`). The manifest is part of the artifact generation digest,
+// the prover keys are not.
 //
 //   node scripts/write-key-manifest.mjs                  # write for every shipped contract
 //   node scripts/write-key-manifest.mjs --check          # fail when a manifest is missing or stale
@@ -23,13 +25,23 @@ export function keysDirOf(contract, root = repoRoot) {
     return path.join(root, 'contracts', contract, 'src', 'managed', contract, 'keys');
 }
 
-export function buildManifest(keysDir) {
-    const prover = {};
-    for (const f of readdirSync(keysDir).filter(f => f.endsWith('.prover')).sort()) {
-        const body = readFileSync(path.join(keysDir, f));
-        prover[f.replace(/\.prover$/, '')] = { sha256: createHash('sha256').update(body).digest('hex'), bytes: body.length };
+function digestsOf(dir, ext) {
+    const out = {};
+    if (!existsSync(dir)) return out;
+    for (const f of readdirSync(dir).filter(f => f.endsWith(ext)).sort()) {
+        const body = readFileSync(path.join(dir, f));
+        out[f.slice(0, -ext.length)] = { sha256: createHash('sha256').update(body).digest('hex'), bytes: body.length };
     }
-    return { version: 1, prover };
+    return out;
+}
+
+export function buildManifest(keysDir) {
+    return {
+        version: 1,
+        prover: digestsOf(keysDir, '.prover'),
+        verifier: digestsOf(keysDir, '.verifier'),
+        zkir: digestsOf(path.join(path.dirname(keysDir), 'zkir'), '.bzkir')
+    };
 }
 
 export function renderManifest(manifest) {
@@ -66,6 +78,15 @@ export function checkManifests({ requireKeys = false, root = repoRoot } = {}) {
         }
         for (const c of Object.keys(manifest.prover)) {
             if (!circuits.includes(c)) problems.push(`${contract}: manifest lists '${c}' but no verifier key exists for it`);
+        }
+        // Verifier keys and binary zkir are always on disk: their entries must
+        // match exactly (a stale entry would make every txbuilder cache
+        // revalidate against the wrong hash).
+        const fresh = buildManifest(keysDir);
+        for (const section of ['verifier', 'zkir']) {
+            if (JSON.stringify(manifest[section] ?? null) !== JSON.stringify(fresh[section])) {
+                problems.push(`${contract}: manifest section '${section}' does not match the files on disk (stale manifest)`);
+            }
         }
     }
     return problems;

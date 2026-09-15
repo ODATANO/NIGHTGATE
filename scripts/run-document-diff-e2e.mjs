@@ -1,4 +1,4 @@
-// Cross-root document proofs end-to-end (v0.16.0 proveDocumentComparison,
+// Cross-root document proofs end-to-end (proveDocumentComparison,
 // mode 0 integrity / mode 1 diff).
 //
 // Walks: connectWallet → connectWalletForSigning (await prewarm sync) →
@@ -18,8 +18,8 @@
 //             b) diff with k = count+1 → local proving failure, claim not
 //             on-chain.
 //
-// NOTE: proveDocumentComparison is the largest prover of the vault (~9.5 MB
-// key since the transient-hash tree rework); it proves fine in wasm mode.
+// NOTE: proveDocumentComparison is the largest prover of the vault; it proves
+// in wasm mode.
 //
 // Inputs (env): NIGHTGATE_URL (default http://localhost:4004),
 // LACE_VIEWING_KEY, LACE_MNEMONIC.
@@ -194,7 +194,7 @@ async function prepare(document, label) {
     if (!/^[0-9a-f]{64}$/.test(v1.schemaId || '')) fail(`prepare(v1) did not export a schemaId: ${pretty(v1.schemaId)}`);
     if (v1.schemaId !== v2.schemaId) fail('same proofFields list must yield the same schemaId for both versions');
     if (v1.leaves[1] === v2.leaves[1]) fail('slot 1 (origin dropped) should be leaf-different across versions');
-    // v4 salted leaves: even identical values yield different leaf hashes across seeds.
+    // Salted leaves: even identical values yield different leaf hashes across seeds.
     if (v1.leaves[0] === v2.leaves[0]) fail('salted leaves must differ across documents even for identical values');
     // Changed slots: 1 (presence) + 2 (value) -> mask 0b110 = 6, count 2.
     const ALLOWED_MASK = 6;
@@ -202,12 +202,14 @@ async function prepare(document, label) {
     console.log(`OK   v1 = ${v1.payloadHash.slice(0, 12)}…, v2 = ${v2.payloadHash.slice(0, 12)}…`);
 
     step('5. anchorDocument for BOTH versions (session owns both payloads)');
+    let attesterId;
     for (const [doc, label] of [[v1, 'v1'], [v2, 'v2']]) {
         r = await post('/anchorDocument', {
             sha256: doc.payloadHash, storageRef: `file:///tmp/${stamp}-${label}.json`,
             metadata: `{"type":"document-diff-e2e","version":"${label}"}`, sessionId, contractAddress
         });
         if (r.status >= 400) fail(`anchorDocument(${label}) → ${r.status}: ${pretty(r.body)}`);
+        attesterId = r.body.attesterId;
         await pollJob(sessionId, r.body.jobId, `attest-${label}`);
     }
     console.log('OK   both payloads attested');
@@ -227,7 +229,7 @@ async function prepare(document, label) {
 
     step('7. Crawler-free verifyPredicateState (documentIntegrity)');
     const integVerify = await pollVerify(fn('verifyPredicateState', {
-        contractAddress, payloadHash: v1.payloadHash, payloadHashB: v2.payloadHash,
+        contractAddress, attesterId, payloadHash: v1.payloadHash, payloadHashB: v2.payloadHash,
         predicate: 'documentIntegrity', allowedMask: ALLOWED_MASK
     }), 'integrity');
     if (integVerify.proven !== true) fail(`integrity: expected proven=true: ${pretty(integVerify)}`);
@@ -247,7 +249,7 @@ async function prepare(document, label) {
 
     step('9. Crawler-free verifyPredicateState (documentDiff)');
     const diffVerify = await pollVerify(fn('verifyPredicateState', {
-        contractAddress, payloadHash: v1.payloadHash, payloadHashB: v2.payloadHash,
+        contractAddress, attesterId, payloadHash: v1.payloadHash, payloadHashB: v2.payloadHash,
         predicate: 'documentDiff', k: DIFF_COUNT
     }), 'diff');
     if (diffVerify.proven !== true) fail(`diff: expected proven=true: ${pretty(diffVerify)}`);
@@ -274,7 +276,7 @@ async function prepare(document, label) {
     const batchTx = batchRes?.proof?.proofValue;
     if (!batchTx) fail(`batch result has no proof.proofValue: ${pretty(batchRes)}`);
     const k1Verify = await pollVerify(fn('verifyPredicateState', {
-        contractAddress, payloadHash: v1.payloadHash, payloadHashB: v2.payloadHash,
+        contractAddress, attesterId, payloadHash: v1.payloadHash, payloadHashB: v2.payloadHash,
         predicate: 'documentDiff', k: 1
     }), 'batch-diff');
     if (k1Verify.proven !== true) fail(`batch diff: expected proven=true: ${pretty(k1Verify)}`);
@@ -295,7 +297,7 @@ async function prepare(document, label) {
         fail(`negative integrity failed on a SYNC issue, not the mask: ${negIntegMsg} :: re-run when the public indexer is healthy`);
     }
     const ghostInteg = await pollVerify(fn('verifyPredicateState', {
-        contractAddress, payloadHash: v1.payloadHash, payloadHashB: v2.payloadHash,
+        contractAddress, attesterId, payloadHash: v1.payloadHash, payloadHashB: v2.payloadHash,
         predicate: 'documentIntegrity', allowedMask: 4
     }), 'ghost-integrity', { expectTrue: false });
     if (ghostInteg.verified === true) fail('aborted integrity proof leaked a claim on-chain');
@@ -316,7 +318,7 @@ async function prepare(document, label) {
         fail(`negative diff failed on a SYNC issue, not the count: ${negDiffMsg} :: re-run when the public indexer is healthy`);
     }
     const ghostDiff = await pollVerify(fn('verifyPredicateState', {
-        contractAddress, payloadHash: v1.payloadHash, payloadHashB: v2.payloadHash,
+        contractAddress, attesterId, payloadHash: v1.payloadHash, payloadHashB: v2.payloadHash,
         predicate: 'documentDiff', k: DIFF_COUNT + 1
     }), 'ghost-diff', { expectTrue: false });
     if (ghostDiff.verified === true) fail('aborted diff proof leaked a claim on-chain');

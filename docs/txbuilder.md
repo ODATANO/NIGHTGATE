@@ -1,13 +1,11 @@
 # Headless transaction builder (`@odatano/nightgate/txbuilder`)
 
 Build, prove and sign a Midnight contract transaction **on your own machine,
-with your own key**, and let someone else pay the fee.
+with your own key**; a sponsor pays the fee and submits.
 
-This is the caller half of cross-server fee sponsoring. It needs no NIGHTGATE
-server, no database, no CAP, no proof server and no Docker: proving runs
-in-process on wasm, the prover keys come from the sponsor's public `/zk-config`
-and are cached on disk. What crosses the wire is one fee-unpaid transaction of
-roughly 5 KB.
+No NIGHTGATE server, database, CAP, proof server or Docker: proving runs
+in-process (wasm), prover keys come from the sponsor's public `/zk-config` and
+are cached on disk. Only the fee-unpaid transaction (~5 KB) crosses the wire.
 
 ```
 YOUR machine                                  SPONSOR's server
@@ -22,37 +20,31 @@ balance own side, sign, finalize
 ```
 
 Nothing secret leaves the process. The on-chain attestation carries **your**
-attester id; the sponsor only pays the dust and never holds your key.
+attester id; the sponsor only pays the dust.
 
 ## Why it exists
 
-An agent that wants to anchor a document on Midnight has two things it does not
-want to give away: its identity and its key. Handing a mnemonic to a hosted
-service gives away both. This split lets the agent keep both, and reduces the
-hosted side to a metered "submit these bytes" endpoint, which is exactly the
-shape an x402-style pay-per-call gate wants.
+The caller keeps its identity and key; the hosted side reduces to a metered
+"submit these bytes" endpoint, the shape a pay-per-call gate needs.
 
 ## Install
 
-If you only want to BUILD transactions, install the slim companion instead: it
-is the same code, packaged on its own, under 1 MB.
-
-Version pairing: the SDK ships the vault modules it builds calls for, so it
-follows the vault lineage. `@odatano/nightgate-tx` 0.5.1 or newer builds
-lineage-3 calls (server 0.23 and later, vaults redeployed with it; 0.5.0
-ships the same modules but its in-process build fails on load); 0.4.x
-builds lineage-2 calls and fails against a lineage-3 vault.
+`@odatano/nightgate-tx` is the same builder as a standalone package (under 1 MB).
 
 ```bash
 npm install @odatano/nightgate-tx     # caller only
 npm install @odatano/nightgate       # the full plugin, incl. the sponsor side
 ```
 
-The imports differ only in the package name (`@odatano/nightgate-tx` ->
-`@odatano/nightgate-tx/calls` -> `@odatano/nightgate-tx/attestation-vault`); see
-`packages/nightgate-tx/README.md`. Either way, the txbuilder pulls the Midnight
-SDK packages and nothing else. You do not have to install or configure the CAP
-side.
+Imports differ only in the package name: `@odatano/nightgate/txbuilder` ->
+`@odatano/nightgate-tx`, `@odatano/nightgate/browser` ->
+`@odatano/nightgate-tx/calls`, `@odatano/nightgate/browser/attestation-vault`
+-> `@odatano/nightgate-tx/attestation-vault`. The builder pulls only the
+Midnight SDK packages; no CAP setup.
+
+Version pairing: the package ships the vault modules it builds calls for.
+nightgate-tx 0.6.x builds lineage-4 calls (vaults deployed with server 0.24),
+0.5.x lineage 3, 0.4.x lineage 2; a mismatched pair fails against the vault.
 
 ## Use
 
@@ -93,11 +85,10 @@ await fetch('https://sponsor.example/api/v1/nightgate/sponsorFinalizedTransactio
 await builder.close();
 ```
 
-Every `prepare*` helper of the browser export works the same way: `prepareAttest`,
-`prepareAnchorContentRoot`, `prepareProveFieldPredicate`, `prepareProveFieldEquality`,
-`prepareProveFieldMembership`, `prepareGrantDisclosure`, and the rest. The
-document helpers (`prepareDocumentProof` and friends) run entirely offline and
-feed straight into these.
+Every `prepare*` helper of the browser export works the same way
+(`prepareAnchorContentRoot`, `prepareProveFieldPredicate`,
+`prepareGrantDisclosure`, ...). The document helpers (`prepareDocumentProof`
+and friends) run offline and feed into them.
 
 ## API
 
@@ -105,238 +96,187 @@ feed straight into these.
 
 | option | required | meaning |
 | --- | --- | --- |
-| `seedHex` | yes | 128 hex chars (64-byte BIP39 seed). Role-specific HD derivation matches Lace, so this lands on the same account the server would use. |
-| `indexerHttpUrl`, `indexerWsUrl` | yes | any public Midnight indexer for the network. The WS URL is the HTTP one with a `/ws` suffix; the path is versioned, so copy it rather than deriving it by hand. |
-| `nodeUrl` | yes | the Substrate RPC the wallet SDK talks to (its `relayURL`) |
-| `zkConfigBaseUrl` | yes | a public `/zk-config/<contract>` (the sponsor's, or any host serving the same artifacts) |
-| `contractClass` | yes | the compiled `Contract` class (`@odatano/nightgate/browser/attestation-vault`, or `.../attestation-vault-32` for the 32-slot width variant; pass `contractName: 'attestation-vault-32'` and its `/zk-config/attestation-vault-32` base URL with it, and hand `slotWidth: 32` to the width-dependent `prepare*` helpers) |
-| `networkId` | no | `preprod` by default |
-| `accountIndex` | no | BIP32 account level, `0` by default |
-| `cacheDir` | no | `~/.cache/nightgate-txbuilder/<contractName>` |
-| `circuits` | no | which proving assets to fetch, default the vault's 11 |
-| `ttlMinutes` | no | transaction TTL, default 30. The sponsor must submit within it. |
-| `attestationSecret` | no | bring your own, else derived from the seed |
-| `proofServerUrl` | no | unused under wasm proving; the SDK's config type asks for a URL, nothing calls it |
-| `proofTimeoutMs` | no | server proving only (0.4.3): HTTP timeout of one proof request, default the SDK's 300000 ms. The SDK re-requests a timed-out proof up to three times, so set it above your slowest circuit; a 15 min relation on your own proof server needs it. The TTL is stamped after proving. |
-| `walletSync` | no | `true` by default: the wallet syncs from genesis against the indexer, on the calling thread, for the life of the builder (a full core until it reaches the tip, hours on preprod). `false`: no sync. A call that moves no value (every vault circuit) builds, proves and signs without wallet state; a value-moving call then fails at balancing. Measured, `attest` bind:false, fresh seed: build 24.5 s vs 27.7 s (proving dominates), event-loop lag p50 108 ms vs 7 ms during the build, idle CPU with the builder open 101 % vs 2 %. |
+| `seedHex` | yes | 128 hex chars (64-byte BIP39 seed); HD derivation matches Lace |
+| `indexerHttpUrl`, `indexerWsUrl` | yes | public Midnight indexer; WS = HTTP URL + `/ws`, copy the versioned path |
+| `nodeUrl` | yes | Substrate RPC (the wallet SDK's `relayURL`) |
+| `zkConfigBaseUrl` | yes, unless `zkConfigDir` | public `/zk-config/<contract>` |
+| `zkConfigDir` | no | local directory with `keys/` and `zkir/`; nothing is fetched, verifier keys must cover every circuit of `contractClass` |
+| `contractClass` | yes | compiled `Contract` class. 32-slot vault: `.../attestation-vault-32` with `contractName: 'attestation-vault-32'`, its `/zk-config/attestation-vault-32`, and `slotWidth: 32` on the width-dependent `prepare*` helpers |
+| `contractName` | no | logical contract name, default `attestation-vault`; names the default cache directory |
+| `networkId` | no | default `preprod` |
+| `accountIndex` | no | BIP32 account, default `0` |
+| `cacheDir` | no | default `~/.cache/nightgate-txbuilder/<contractName>` |
+| `circuits` | no | circuits to fetch prover keys and zkir for; default every circuit of `contractClass`, else the vault's 11 |
+| `ttlMinutes` | no | transaction TTL, default 30; the sponsor must submit within it (stamped after proving) |
+| `attestationSecret` | no | default derived from the seed |
+| `provingMode` | no | `wasm` (default, in-process) or `server` (proves on `proofServerUrl`, which receives the witnesses) |
+| `proofServerUrl` | with `server` | required by `provingMode: 'server'`, ignored otherwise |
+| `proofTimeoutMs` | no | server proving: timeout of one proof request, default 300000 ms; the SDK retries up to 3 times, so set it above your slowest circuit |
+| `walletSync` | no | default `true`: the wallet syncs from genesis on the calling thread for the builder's life (a full core until tip). `false`: no sync; value-free calls (every vault circuit) still build, value-moving calls fail at balancing |
 | `onProgress` | no | callback for asset download and build phases |
 
-Returns `{ attestationSecret, attesterId, zkAssets, addresses, buildSponsorable, buildDeploySponsorable, close }`.
-`close()` stops the wallet sync and ends the indexer sockets; without it both
-run until the process exits (one sync at a full core per builder).
+Returns `{ attestationSecret, attesterId, zkAssets, addresses, provingMode, buildSponsorable, buildDeploySponsorable, close }`.
+`close()` stops the wallet sync and the indexer sockets; otherwise both run
+until the process exits.
 
 ### `deriveIdentity({ seedHex, networkId?, accountIndex?, attestationSecret? }) -> { attesterId, attestationSecret, addresses }`
 
-The identity a seed yields, with no builder, no wallet and no network: the
-same derivation `createTxBuilder` runs (role seeds, attestation secret,
-`attesterId` = persistentHash of the secret, NIGHT address), in ~150 ms.
-Use it to show or register an identity before the first build.
+The derivation `createTxBuilder` runs (role seeds, attestation secret,
+`attesterId`, NIGHT address) without builder, wallet or network, ~150 ms. Use
+it to show or register an identity before the first build.
 
 ### `buildSponsorable({ contractAddress, call | calls, initialPrivateState, bind?, attestationSecret?, independentCalls?, orderedPrefix? }) -> { finalizedTxB64 | unboundTxB64, serializedBytes, bound }`
 
-Builds, proves, balances your own side, signs and finalizes ONE circuit call
-(`call`) or a BATCH of up to 8 calls (`calls`) in ONE transaction, then stops.
-Nothing is submitted. The transaction is fee-unpaid: it carries no dust, which
-is exactly what makes it sponsorable.
+Builds, proves, balances your side, signs and finalizes one call (`call`) or up
+to 8 calls (`calls`) in ONE transaction. Nothing is submitted; the transaction
+carries no dust, which makes it sponsorable.
 
-**Batching** (`calls`): one transaction means one balancing round, one submit
-and one fee event for the whole list, and, decisively, ONE contract state
-transition: concurrent single attests against a vault conflict on its global
-attestation sequence counter (any two in a block, regardless of attester, and
-the losers' fees are spent), so a multi-document anchoring belongs in a batch,
-not in parallel singles. Apply order = array order (deterministic, fail-closed
-segment ordering); the ledger's causality rule is checked BEFORE proving and a
-violation throws with `code: 'BatchCausalityViolation'` (put the most
-expensive call last). Per-call `witnesses` are ignored for a batch: one shared
-witnesses object, built from this builder's attestation secret (override via
-`attestationSecret`), serves every call through a proof holder that swaps each
-entry's `merkleProof` (the `prepare*` helpers return the raw bundle for this),
-so prepare every batched call with the SAME secret. Same-named calls are
-indistinguishable to the segment ordering (their relative order is not
-guaranteed): duplicates are safe only when order-independent among
-themselves, so GROUP them (both attests before both anchors). `bind: false`
-refuses a batch that moves value; the sponsor's allow-list applies per
-circuit and its size cap (default 64 KiB) to the whole transaction (~5.4 KB
-per call).
+**Batching** (`calls`): one balancing, one submit, one fee and one contract
+state transition. Several calls on one vault belong in a batch, not in parallel
+single transactions, which can refuse each other with `1010/104` (see below).
+- Apply order = array order. The causality rule is checked before proving; a
+  violation throws `code: 'BatchCausalityViolation'` (put the most expensive
+  call last).
+- Vault batches use one shared witnesses object built from the builder's
+  attestation secret (override `attestationSecret`); it swaps each entry's
+  `merkleProof`, so prepare every batched call with the SAME secret. Per-call
+  `witnesses` are ignored.
+- Same-named calls have no guaranteed relative order: batch them only when
+  order-independent, grouped (both attests before both anchors).
+- `bind: false` refuses a batch that moves value. The sponsor's allow-list
+  applies per circuit, its size cap (default 64 KiB) to the whole transaction
+  (~5.4 KB per call).
 
-**Verify per claim, never per batch.** After the sponsor's txHash lands, the
-ledger's fallible phase can still finalize PARTIALLY: some calls applied,
-others not, the fee spent either way. A batch consumer must confirm every
-call's effect individually through the crawler-free reads
-(`verifyAttestationState` for attest/anchor effects with `contentRoot` +
-`schemaId`, `verifyPredicateState` for each proof claim with its exact
-coordinates) and treat only the individually confirmed claims as
-established. The txHash proves the transaction landed, not that every call
-in it applied.
+**Verify per claim, never per batch.** A landed batch can finalize partially,
+fee spent either way. Confirm each effect: `verifyAttestationState` (with
+`contentRoot` + `schemaId`) for attest/anchor, `verifyPredicateState` per proof
+claim. The txHash proves the transaction landed, not that every call applied.
 
-Two live-measured operational notes: (1) `1010/104` is the node's
-PRE-MEMPOOL reject for a guaranteed-phase STATE CONFLICT (measured: two
-concurrent read-modify-write calls on one cell reproduce it exactly): your
-transaction was proven against contract state that moved before the node
-executed its guaranteed stages. The fee is NOT spent. REBUILD against the
-current state and hand fresh bytes over; resubmitting the identical
-transaction re-runs the same stale reads and stays stuck. The fee-spending
-`CHAIN_EXECUTION_FAILED` is the fallible-phase flavor of the same
-conflict. (2) batching
-`attest` together with its `anchorContentRoot` works only on a YOUNG vault:
-`attest`'s gas crossed into the fallible class after roughly five
-attestations in measurement, from then on the causality pre-check aborts
-locally with `BatchCausalityViolation` (nothing submitted, no fee) and you
-split like the server lanes do, attest in its own transaction, batch the
-rest. The DURABLE batch shape is the proof cart: `anchorContentRoot` first,
-then the proof calls (equality/membership/predicate, each with its own
-`merkleProof`, swapped by the shared holder): anchor stays guaranteed and
-the proofs may go fallible without breaking the order, so this shape stays
-valid as the vault grows. Both the proof cart and the attest split are
-live-proven through BOTH sponsor channels (bound `sponsorFinalizedTransaction`
-and unbound `sponsorUnboundTransaction`).
+Operational notes:
+- **`1010/104`**: pre-mempool refusal, fee NOT spent. Another transaction on the
+  contract landed after you built: it changed a value your call reads, or grew
+  a map your call touches by a trie level (maps are 16-ary; the declared gas is
+  measured gas + 20 %, short while a map crosses 1, 16 or 256 entries). Rebuild
+  against current state (`rebuildOnStaleTranscript`); identical bytes stay
+  refused. `CHAIN_EXECUTION_FAILED` is the fee-spending fallible-phase variant
+  of a value conflict.
+- **`attest` + its `anchorContentRoot` in one batch** stays valid as the vault
+  grows: both calls remain in the guaranteed stage (measured up to 4096
+  attestations with preprod ledger parameters). `bindDocument` is fallible on
+  all but tiny vaults and belongs last. If a call ever turns fallible ahead of
+  a guaranteed one, the pre-check aborts locally (`BatchCausalityViolation`, no
+  fee): send that call alone and batch the rest. Proof carts:
+  `anchorContentRoot` first, then the proof calls. Both shapes work through
+  both sponsor channels.
 
-**Independent calls** (`independentCalls: true`, 0.21.9): a proof cart is a
-SET of claims (distinct claim keys, no shared cell), and for a set there is
-always a causality-valid order, but call order alone is not it: on a grown
-vault the same circuit lands in the guaranteed stage for one claim key and in
-the fallible stage for another (measured: `proveFieldPredicate` 5.86G vs
-6.05G on one vault, budget in between), so about every second cart in call
-order hit the pre-check. With the flag the builder groups the calls past
-`orderedPrefix` by stage before proving, guaranteed-only first, call order
-within a group; `orderedPrefix: 1` keeps an in-batch `anchorContentRoot` in
-front (the proofs read it). Dependent batches leave the flag unset and keep
-array order. When the pre-check still throws, the error carries
-`code: 'BatchCausalityViolation'` and `calls: [{ name, segId, stages }]` in
-apply order (also appended to the message as `Stages in apply order: ...`),
-so a consumer can split deterministically.
+**Independent calls** (`independentCalls: true`): for a proof cart (distinct
+claim keys, no shared cell) the builder groups the calls after `orderedPrefix`
+by stage before proving, guaranteed-only first, call order within a group; on
+a grown vault the same circuit can be guaranteed for one claim key and fallible
+for another. `orderedPrefix: 1` keeps an in-batch `anchorContentRoot` first.
+Dependent batches leave the flag unset. A remaining violation carries
+`calls: [{ name, segId, stages }]` in apply order (also in the message), so a
+consumer can split deterministically.
 
-`bind` picks the handover format. `true` (default) returns `finalizedTxB64`, a
-bound transaction for `sponsorFinalizedTransaction`. `false` returns
-`unboundTxB64`, the signed PRE-BINDING transaction for
-`sponsorUnboundTransaction` (0.18): the sponsor merges its own dust spend into
-it and binds, which is what lets ONE sponsor wallet pay for many callers in
-parallel (one per registered dust backing). Everything else is identical: same
-proof, same identity, same TTL. Prefer `bind: false` against a sponsor that
-runs 0.18 or later; the SDK client exposes it as `ng.sponsorUnbound(...)`.
+`bind` picks the handover. `true` (default) returns `finalizedTxB64` for
+`sponsorFinalizedTransaction`. `false` returns `unboundTxB64`, the signed
+pre-binding transaction for `sponsorUnboundTransaction`: the sponsor merges its
+dust spend and binds, so one sponsor wallet pays for many callers in parallel
+(one per registered dust backing). Proof, identity and TTL are identical.
+Client: `ng.sponsorUnbound(...)`.
 
 ### `ensureZkAssets({ zkConfigBaseUrl, cacheDir, circuits })`
 
-Exposed separately so you can warm the cache in a build step or a container
-image. `createTxBuilder` calls it for you. A `404` for a circuit the contract
-does not expose is tolerated; any other error is fatal. Cached files are never
-re-downloaded, so only the first run needs the network for assets.
+Warms the asset cache (build step, container image); `createTxBuilder` calls it.
+Each run fetches `keys/manifest.json` and checks cached files by sha256:
+files of a former contract generation are replaced (`refreshed` in the result;
+a stale key fails `findDeployedContract` with `ContractTypeError`), a download
+not matching the manifest is refused. Without a manifest the cache is used as
+is. A `404` for a circuit the contract lacks is tolerated; any other error is
+fatal.
 
 ## Running the sponsor half
 
-The sponsor is a normal NIGHTGATE server with a funded, dust-registered wallet
-session. It exposes `sponsorFinalizedTransaction(finalizedTxB64,
-sponsorSessionId, idempotencyKey)`, which deserializes the transaction, enforces
-its contract and circuit allow-list, balances dust and submits, and (0.18)
-`sponsorUnboundTransaction(unboundTxB64, ...)`, the parallel channel that pays
-from a locked dust backing so N callers can be sponsored at once from one
-wallet. It never sees a key, a witness or a preimage: by the time the bytes
-arrive, the proof is done. To sponsor N in parallel, register N NIGHT UTxOs
-for dust generation in the sponsor wallet (parallelism = distinct backings).
+A NIGHTGATE server with a funded, dust-registered wallet session:
+- `sponsorFinalizedTransaction(finalizedTxB64, sponsorSessionId, idempotencyKey)`
+  enforces the contract and circuit allow-list, balances dust and submits.
+- `sponsorUnboundTransaction(unboundTxB64, ...)` pays from a locked dust
+  backing; parallelism = distinct NIGHT UTxOs registered for dust generation.
 
-If you want both halves on one machine (for a test), `buildSponsorable` also
-exists as an OData action, which runs phase 1 server-side against a stored
-session. `npm run txbuilder:e2e` exercises the real split, with phase 1 in
-the local process and only the bytes going to the server.
+The sponsor never sees a key, witness or preimage. For a one-machine test,
+`buildSponsorable` also exists as an OData action (phase 1 against a stored
+session); `npm run txbuilder:e2e` runs the real split.
 
 ## Costs and caveats
 
-- **First run downloads the prover keys** (~81 MB for the full vault set) and
-  caches them. Restrict `circuits` to what you actually call to cut that down.
-- **Everything runs on the calling thread.** Ledger assembly, the wallet
-  sync (`walletSync`, default on) and wasm proving all execute where
-  `createTxBuilder` and `buildSponsorable` are awaited; in a server that is
-  the request thread. Host the builder in a `worker_threads` worker and
-  proxy the calls, and pass `walletSync: false` for calls that move no
-  value.
-- **Proving blocks the thread.** It is wasm in-process; run it off your request
-  path or in a worker. Or opt in to `provingMode: 'server'` with
-  `proofServerUrl` pointing at YOUR OWN proof server (`docker run -d -p
-  6300:6300 midnightntwrk/proof-server:8.1.0 midnight-proof-server --network
-  preprod`): native and multi-threaded, `attest` drops from 25-35 s to 7-9 s
-  and the 38 MB comparison circuit from 4-5 min to well under a minute. The
-  proof server RECEIVES THE WITNESSES, so never point this at the sponsor's;
-  that is why it is an explicit opt-in and a bare `proofServerUrl` (documented
-  as unused in 0.17) still does nothing. `builder.provingMode` tells you which
-  mode is active.
-- **Memory is set by the circuit's k, not by the prover-key size.** Measured
-  on the vault's comparison circuit (offline, one prove per process): k=17
-  (38.5 MB prover key) peaks at 1.82 GB RSS, k=18 (72.9 MB) at 3.45 GB,
-  about 47x the key and doubling per k. The JS heap stays near 50 MB; the
-  rest is wasm linear memory, which never shrinks, so a long-lived process
-  stays at the high-water mark (a second prove adds ~46 MB) and
-  `--max-old-space-size` does not reach it. Two proves in one process
-  serialize and peak at the maximum, not the sum; each process or worker
-  has its own wasm memory, so size for the number of proving processes.
-  Read a circuit's k with `Zkir.deserialize(bzkir).getK()` from
-  `@midnight-ntwrk/zkir-v2`. Under `provingMode: 'server'` the client still
-  loads the prover key (it travels in every `/prove` request, so budget
-  about twice the key size transiently); the proving working set moves to
-  the proof server. Timer-based RSS sampling under-reads during a prove
-  (the event loop is blocked); use `process.resourceUsage().maxRSS`.
-- **`bind: false` refuses calls that need a balancing transaction** (the call
-  moves shielded or unshielded value and the wallet had to add inputs): the
-  sponsor binds the base transaction alone, so handing it over unbound would
-  produce a different, unbalanced transaction. Use the bound handover for
-  those; the vault's attestation and proof circuits move no value.
-- **The TTL is real.** A transaction the sponsor submits after `ttlMinutes` is
-  rejected by the node. Ship the bytes promptly.
-- **Artifact generations must match.** The `zkConfigBaseUrl` you fetch from and
-  the vault you target have to be the same generation of the compiled contract.
-  Fetching from the sponsor's own `/zk-config` is the reliable way to guarantee
-  that.
-- **The sponsor decides what it pays for.** The server enforces a fail-closed
-  shape check (only allow-listed contract calls, nothing else in the envelope,
-  size-capped via `NIGHTGATE_SPONSOR_MAX_TX_BYTES`); allow-listing contracts
-  and circuits bounds which calls it will pay for.
+- **First run downloads the prover keys** (~83 MB for the vault set) and
+  caches them; restrict `circuits` to the calls you make.
+- **Everything runs on the calling thread**: ledger assembly, wallet sync and
+  wasm proving. In a server, host the builder in a `worker_threads` worker and
+  pass `walletSync: false` for value-free calls.
+- **Proving blocks the thread.** `provingMode: 'server'` with `proofServerUrl`
+  (`docker run -d -p 6300:6300 midnightntwrk/proof-server:8.1.0
+  midnight-proof-server --network preprod`) is native and several times faster,
+  but the proof server RECEIVES THE WITNESSES: use your own, never the
+  sponsor's. A bare `proofServerUrl` changes nothing; `builder.provingMode`
+  reports the active mode.
+- **Memory follows the circuit's k, not the key size**: ~1.8 GB RSS at k=17
+  (16-slot comparison circuit), ~3.5 GB at k=18 (32-slot), doubling per k. It
+  is wasm memory: it never shrinks and `--max-old-space-size` does not bound
+  it. Proves in one process serialize (peak = max, not sum); each process or
+  worker has its own. Read k with `Zkir.deserialize(bzkir).getK()`
+  (`@midnight-ntwrk/zkir-v2`). Server proving still loads the prover key
+  client-side (sent with every `/prove`, ~2x key size transiently). Measure
+  with `process.resourceUsage().maxRSS`; timer sampling under-reads while a
+  prove blocks the loop.
+- **`bind: false` refuses calls that need a balancing transaction** (the wallet
+  added inputs to move value): the sponsor binds the base transaction alone.
+  Use the bound handover; vault circuits move no value.
+- **The TTL is real.** After `ttlMinutes` the node rejects the transaction.
+- **Artifact generations must match.** Fetch `zkConfigBaseUrl` from the
+  sponsor that serves the vault you target.
+- **The sponsor decides what it pays for**: fail-closed shape check (allow-listed
+  contract calls only, nothing else in the envelope, size cap
+  `NIGHTGATE_SPONSOR_MAX_TX_BYTES`).
 
-## Batches on your own contract, and sponsored deploys (0.21.0)
+## Batches on your own contract, and sponsored deploys
 
-**Batch witnesses.** A Compact contract instance binds its witnesses once, so a
-batch needs ONE shared witnesses object plus a way to switch what varies per
-call. Until 0.21.0 the batch path supplied the attestation vault's witnesses
-regardless of contract, so a batch on your own contract failed at the first
-witness the vault does not define. Now `buildSponsorable({ calls, witnesses })`
-takes your shared witnesses (per-call `before` hooks swap what varies), a batch
-whose entries all carry the same `witnesses` object uses that, and the vault
-family keeps getting both from the builder. A foreign-contract batch without
-either is refused up front with the real reason.
+**Batch witnesses.** A contract instance binds its witnesses once, so a
+foreign-contract batch needs one shared witnesses object: pass
+`buildSponsorable({ calls, witnesses })` (per-call `before` hooks swap what
+varies) or give every entry the same `witnesses` object. Vault calls get both
+from the builder. A foreign batch with neither is refused up front.
 
-**Your own contract, your own keys.** `createTxBuilder({ zkConfigDir })` reads
-`keys/` and `zkir/` from a local directory instead of a sponsor's `/zk-config`;
-the verifier keys must cover every circuit of `contractClass`.
+**Your own contract, your own keys.** `createTxBuilder({ zkConfigDir })`, see
+the option table.
 
 **Sponsored deploy.** `buildDeploySponsorable({ initialPrivateState,
-constructorArgs, witnesses, bind })` builds, proves and signs a contract deploy
-with YOUR key and hands back the fee-unpaid transaction plus the
-`contractAddress` it will create. A sponsor pays the dust when its policy allows
-deploys (`NIGHTGATE_SPONSOR_ALLOW_DEPLOY`, or `allowDeploy` in the policy file)
-and, for a token caller, the grant carries `allowDeploy` with deploy budget
-left (`maxDeploys`, default 1, separate from the daily job budget). A deploy has
-its own byte ceiling (`NIGHTGATE_SPONSOR_MAX_DEPLOY_BYTES`, default 40960).
-The budget is reserved before the sponsor broadcasts (one deploy per
-transaction). After it lands, the address is recorded on the grant
-(`deployedContracts`) and is sponsorable on top of the platform allow-list,
-circuits included (a sponsor's circuit list names the shared contracts'
-circuits, not yours), so the follow-up calls are sponsorable without an
-operator round trip. Contract
-maintenance updates are never sponsored. The build fails unless the
-transaction carries exactly one deploy action with an address, so a returned
-`contractAddress` is always usable. Persist the initial private state
-yourself: the builder keeps it in memory only.
+constructorArgs, witnesses, bind })` builds, proves and signs a deploy with
+your key and returns the fee-unpaid transaction plus its `contractAddress`
+(the build fails unless the transaction carries exactly one deploy). The
+vault constructors take `[registrarId, recoveryId]` (both `Uint8Array(32)`;
+a zero `recoveryId` disables the recovery modes of `registerDocument`).
+- The sponsor pays when its policy allows deploys
+  (`NIGHTGATE_SPONSOR_ALLOW_DEPLOY` or `allowDeploy` in the policy file) and,
+  for a token caller, the grant has `allowDeploy` with budget left
+  (`maxDeploys`, default 1, separate from the daily job budget, reserved
+  before broadcast, one deploy per transaction).
+- Byte ceiling: `NIGHTGATE_SPONSOR_MAX_DEPLOY_BYTES` (default 40960).
+- The landed address is recorded on the grant (`deployedContracts`); its calls
+  are sponsorable beyond the platform contract and circuit lists.
+- Maintenance updates are never sponsored.
+- Persist the initial private state yourself; the builder keeps it in memory
+  only.
 
-## Self-funded submission (0.4.4)
+## Self-funded submission
 
-A caller that pays its own dust and submits to the node itself needs four
-things the build path does not cover: submitting the bytes, classifying a
-reject, confirming the landing, and surviving a reject without wedging its
-dust wallet. All four ship as exports of `@odatano/nightgate-tx/txbuilder`
-(and `@odatano/nightgate/txbuilder`); `submitFinalized` additionally needs
-`@polkadot/api` (an optional peer dependency) for the extrinsic encoding.
+For a caller that pays its own dust and submits to the node:
+`@odatano/nightgate-tx/txbuilder` and `@odatano/nightgate/txbuilder` export
+submit, reject classification, landing confirmation and dust-wedge protection.
+`submitFinalized` needs the optional peer dependency `@polkadot/api`.
 
-`facade`, `configuration`, `zswapKeys` and `dustKey` below are your own
-wallet-sdk facade and the values it was created with (the runner that pays
-the fee); `builder` is a `createTxBuilder` instance.
+Below, `facade`, `configuration`, `zswapKeys` and `dustKey` are your own
+wallet-sdk facade and its inputs; `builder` is a `createTxBuilder` instance.
 
 ```js
 import {
@@ -347,8 +287,7 @@ import {
 const built = await builder.buildSponsorable({ contractAddress, calls, witnesses });
 const tx = await deserializeTransaction(built.finalizedTxB64);
 
-// Pay the fee from your own facade and submit, inside the dust guard so a
-// node reject cannot wedge the wallet.
+// Pay the fee from your own facade; the dust guard keeps a reject from wedging it.
 const landed = await withDustGuard(facade, { configuration, dustKey }, async () => {
     const recipe = await facade.balanceFinalizedTransaction(
         tx, { shieldedSecretKeys: zswapKeys, dustSecretKey: dustKey },
@@ -359,19 +298,12 @@ const landed = await withDustGuard(facade, { configuration, dustKey }, async () 
     const nodeUrl = 'wss://rpc.preprod.midnight.network/';
     const indexerHttpUrl = 'https://indexer.preprod.midnight.network/api/v4/graphql';
 
-    // Submit. On a transport failure the transaction MAY be in the mempool:
-    // probe for the identifier, then resend the SAME bytes; never rebuild here.
+    // Transport failure: the tx MAY be in the mempool. Probe, then resend the SAME bytes.
     for (let attempt = 0; ; attempt++) {
         try { await submitFinalized(finalized, { nodeUrl }); break; }
         catch (e) {
-            // 1013 Already Imported = the transaction IS in the pool (the
-            // first send reached it): go straight to the confirmation loop.
-            if (isAlreadyImported(e)) break;
-            // ANY other reject of a RESEND (e.g. a 1010 whose note the landed
-            // first send already spent) can mean the FIRST send is on chain
-            // while the indexer still lags: wait for the identifier before
-            // trusting the reject. A first-send reject gets one immediate
-            // probe (the reply may have been lost).
+            if (isAlreadyImported(e)) break;   // 1013: the first send is in the pool
+            // Any other refused resend may mean the first send landed: wait before trusting it.
             const found = await waitLanded(identifier, { indexerHttpUrl, timeoutMs: attempt > 0 ? 30_000 : 0 });
             if (found) return found;
             if (!isTransportFailure(e) || attempt >= 2) throw e;
@@ -379,52 +311,42 @@ const landed = await withDustGuard(facade, { configuration, dustKey }, async () 
         }
     }
 
-    // Confirm by identifier (blocks are ~6 s apart; indexer lag is real).
+    // Confirm by identifier (blocks ~6 s apart, the indexer lags).
     const found = await waitLanded(identifier, { indexerHttpUrl, timeoutMs: 240_000, pollMs: 6_000 });
     if (found) return found;
     throw new Error('not visible on the indexer yet; it may still land');
 });
 if (!landed.applied) {
-    // In a block but the call failed: the fee was spent, rebuild against
-    // current contract state (classifyNodeReject explains node rejects).
+    // In a block but the call failed: fee spent, rebuild against current state.
 }
 ```
 
-The rules these helpers encode, learned from rejected transactions:
+Rules the helpers encode:
 
-- **Submit over WebSocket.** The node's HTTP gateway rejects request bodies
-  over ~14 KB with a 403, and a proven contract call is bigger than that.
-  `submitFinalized` encodes the `midnight.sendMnTransaction` extrinsic over
-  HTTP (a metadata read, so a runtime upgrade cannot silently break the
-  encoding) and submits `author_submitExtrinsic` over a one-shot socket.
-- **A reject's sub-code is the whole diagnosis** (`classifyNodeReject`):
-  `stale-dust-proof` (170/171/196) means re-sync the dust wallet and rebuild,
-  the wallet is NOT out of dust; `funds` (138/173, "could not balance dust")
-  is the only shape that means out of dust; `sequencing` (219-224) is healed
-  by splitting the batch into single-call transactions; `malformed` (117) is
-  fixed by neither waiting nor an identical rebuild.
-- **Transport is not a reject** (`isTransportFailure`): a lost reply means the
-  transaction MAY be in the mempool. Probe the indexer for the identifier
-  (`probeLanded`), then resend the SAME bytes; a rebuild produces a second
-  valid transaction that can land next to the first. A resend answered with
-  `1013 Transaction Already Imported` (`isAlreadyImported`) means the FIRST
-  send reached the pool: confirm by identifier, never treat it as a failure.
-  Any OTHER refused resend can mean the same thing (the landed first send
-  already spent the note): run a bounded `waitLanded` before trusting the
-  reject, or a landed transaction reads as failed and a dust guard restores
-  a snapshot it must not.
-- **Confirm by identifier, never by watching the contract address**: on a
-  public contract someone else's call confirms yours otherwise. `probeLanded`
-  also reports `applied: false` (in a block, call failed, fee spent: rebuild
-  against current state).
-- **A pre-mempool reject leaks the spent dust note** inside the SDK's dust
-  wallet (upstream bug; the pending atoms accumulate until a funded wallet
-  cannot balance a fee). `withDustGuard` snapshots the dust sub-wallet before
-  the build and swaps in the restored wallet on such a reject. The caller
-  owns persistence: never persist a post-reject dust state, or a restart
-  restores the wedge. One guarded build per facade at a time.
+- **Submit over WebSocket.** The node's HTTP gateway returns 403 for bodies over
+  ~14 KB, smaller than a proven call. `submitFinalized` encodes the
+  `midnight.sendMnTransaction` extrinsic from the runtime metadata (HTTP) and
+  submits `author_submitExtrinsic` over a one-shot socket.
+- **The reject sub-code is the diagnosis** (`classifyNodeReject`):
+  - `stale-dust-proof` (170/171/196): re-sync dust and rebuild; NOT out of dust.
+  - `funds` (138/173, "could not balance dust"): out of dust.
+  - `sequencing` (219-224): split into single-call transactions.
+  - `malformed` (117): neither waiting nor an identical rebuild helps.
+  - `stale-transcript` (104): rebuild against current state, e.g.
+    `rebuildOnStaleTranscript(async () => sponsor(await builder.buildSponsorable(...)))`.
+- **Transport is not a reject** (`isTransportFailure`): the transaction MAY be
+  in the mempool. Probe (`probeLanded`), then resend the SAME bytes; a rebuild
+  can land a second transaction. `1013 Transaction Already Imported` on a
+  resend (`isAlreadyImported`): the first send is in the pool, confirm by
+  identifier. Any other refused resend may also mean the first send landed:
+  run a bounded `waitLanded` before trusting it, or a dust guard restores a
+  snapshot it must not.
+- **Confirm by identifier**, never by watching the contract address (another
+  caller's transaction would confirm yours). `applied: false`: in a block, call
+  failed, fee spent.
+- **A pre-mempool reject leaks the spent dust note** in the SDK's dust wallet
+  until a funded wallet cannot balance. `withDustGuard` snapshots the dust
+  sub-wallet before the build and restores it on such a reject. Never persist
+  a post-reject dust state; one guarded build per facade at a time.
 
-Create builders as often as you like, but with `walletSync: false` (the sync
-is pure cost when your own facade does the balancing) and `close()` them: on
-0.4.0 `close()` was a no-op and every builder leaked a genesis-syncing facade
-plus an indexer socket.
+Builders used only for building: `walletSync: false`, and always `close()`.

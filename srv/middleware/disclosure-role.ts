@@ -1,16 +1,6 @@
 /**
- * Disclosure-role middleware.
- *
- * Resolves the highest currently-valid `DisclosureRole` grant for the
- * authenticated user and attaches it to the request so downstream handlers
- * and CDS projections can gate response width by tier.
- * When no grant applies, the default is `public_only`.
- *
- * The disclosure-role tiers are the document disclosure tiers of the vault:
- * 0 public, 1 legitimate interest, 2 authority.
- * The middleware is intentionally orthogonal to CAP's `@requires` auth roles:
- * that gates access to *services*, this gates the *shape* of responses
- * within a service the caller already reached.
+ * Resolves the caller's disclosure tier (0 public, 1 legitimate interest, 2 authority)
+ * to gate response shape; orthogonal to `@requires`, which gates service access.
  */
 import cds from '@sap/cds';
 import { DisclosureRoles, DisclosureGrants } from '#cds-models/midnight';
@@ -32,11 +22,7 @@ const RANK: Record<DisclosureRoleValue, number> = {
     authority: 2
 };
 
-/**
- * On-chain disclosure level (0/1/2) → disclosure-role tier. Inverse of the
- * RANK above; the AttestationVault `level` maps 1:1 onto the document
- * disclosure tiers (0 public, 1 legitimate interest, 2 authority).
- */
+/** On-chain vault `level` -> tier; inverse of RANK. */
 const LEVEL_TO_ROLE: Record<number, DisclosureRoleValue> = {
     0: 'public_only',
     1: 'legitimate_interest',
@@ -55,23 +41,13 @@ export interface AttachDisclosureRoleOptions {
 
     scope?: string;
     contractAddress?: string; // AttestationVault deployment address
-    payloadHash?: string; // Optional attestation payload hash
+    payloadHash?: string; // Optional attestation payload hash; needs attesterId
+    attesterId?: string; // The attester whose record of payloadHash the grant belongs to
 }
 
 /**
- * Looks up the authenticated user's highest disclosure tier and attaches it
- * to `req.disclosureRole`. Returns the resolved role for direct use inside a
- * handler.
- *
- * Two sources, selected by `options.contractAddress`:
- *   - on-chain (contractAddress set): the indexed `DisclosureGrants` ACL is
- *     authoritative; the caller's granteeId is matched against active grants.
- *   - off-chain (no contractAddress): the operator-configured `DisclosureRoles`
- *     table (original behavior).
- *
- * The lookup is small (one or two SELECTs keyed on `userId`/contract); we rank
- * in JS to keep the SQL portable across SQLite/HANA without a DB-specific
- * CASE WHEN.
+ * Sets and returns `req.disclosureRole`: from on-chain `DisclosureGrants` when
+ * `contractAddress` is given, else from the operator's `DisclosureRoles` table.
  */
 export async function attachDisclosureRole(
     req: cds.Request,
@@ -86,9 +62,8 @@ export async function attachDisclosureRole(
         return DEFAULT_DISCLOSURE_ROLE;
     }
 
-    // On-chain ACL path: authoritative when a contract scope is configured.
     if (options.contractAddress) {
-        const role = await resolveOnChainRole(req, db, options.contractAddress, options.payloadHash);
+        const role = await resolveOnChainRole(req, db, options.contractAddress, options.payloadHash, options.attesterId);
         target.disclosureRole = role;
         return role;
     }
@@ -113,30 +88,31 @@ export async function attachDisclosureRole(
 }
 
 /**
- * Resolve the caller's tier from the on-chain `DisclosureGrants` ACL. Returns
- * the highest active grant's tier for the caller's granteeId on this contract
- * (optionally narrowed to one attestation), or `public_only` when the caller
- * has no registered granteeId or no active grant.
+ * Highest active grant for the caller's granteeId. A payload without an attester
+ * resolves to public_only: another attester's grant on the same hash must not open it.
  */
 async function resolveOnChainRole(
     req: cds.Request,
     db: cds.DatabaseService,
     contractAddress: string,
-    payloadHash?: string
+    payloadHash?: string,
+    attesterId?: string
 ): Promise<DisclosureRoleValue> {
+    if (payloadHash && !attesterId) return DEFAULT_DISCLOSURE_ROLE;
     const granteeId = await resolveGranteeId(req, db, { scope: contractAddress });
     if (!granteeId) return DEFAULT_DISCLOSURE_ROLE;
 
     const { SELECT } = cds.ql;
-    // Grants are stored lowercase (handlers + indexer normalize on write).
-    // Only the chain-confirmed `level` of an active row counts; a level
-    // request still waiting for inclusion (`pendingLevel`) is never read.
+    // Stored lowercase. Only the confirmed `level` counts, never `pendingLevel`.
     const where: Record<string, unknown> = {
         contractAddress: contractAddress.toLowerCase(),
         grantee: granteeId,
         active: true
     };
-    if (payloadHash) where.payloadHash = payloadHash.toLowerCase();
+    if (payloadHash) {
+        where.payloadHash = payloadHash.toLowerCase();
+        where.attesterId = attesterId!.toLowerCase();
+    }
 
     const grants: Array<{ level: number }> =
         (await db.run(SELECT.from(DisclosureGrants).where(where)) as Array<{ level: number }>) || [];
@@ -157,10 +133,8 @@ function isCurrentlyValidGrant(
     const rowScope = row.scope == null || row.scope === '' ? null : row.scope;
 
     if (requestedScope === undefined) {
-        // No scope requested → only global (null/empty) grants apply.
         return rowScope === null;
     }
-    // Scoped request → either global grant or grant matching the scope.
     return rowScope === null || rowScope === requestedScope;
 }
 
@@ -173,10 +147,7 @@ export function isValidDisclosureRoleValue(value: unknown): value is DisclosureR
         && (DISCLOSURE_ROLE_VALUES as readonly string[]).includes(value);
 }
 
-/**
- * Tier comparison helper for handler-side gating. Higher tiers always satisfy
- * lower-tier requirements (`authority` meets `legitimate_interest` and below).
- */
+/** Higher tiers satisfy lower requirements. */
 export function meetsDisclosure(
     actual: DisclosureRoleValue | undefined,
     required: DisclosureRoleValue

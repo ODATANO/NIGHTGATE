@@ -63,7 +63,6 @@ export interface NightgateClient {
     // compute-only preparation
     prepareDocumentProof(p: ActionParams): Promise<any>;
     prepareMembershipSet(p: ActionParams): Promise<any>;
-    prepareAnchorCommitment(p: ActionParams): Promise<any>;
 
     // wallet sessions
     connectWallet(p: ActionParams): Promise<any>;
@@ -75,7 +74,6 @@ export interface NightgateClient {
 
     // anchoring + ZK attestations (submit + wait, returns the job result)
     anchorDocument(p: ActionParams): Promise<JobResult>;
-    commitDocumentAnchor(p: ActionParams): Promise<JobResult>;
     attestAgentOutput(p: ActionParams): Promise<JobResult>;
     proveFieldPredicate(p: ActionParams): Promise<JobResult>;
     proveFieldEquality(p: ActionParams): Promise<JobResult>;
@@ -88,6 +86,10 @@ export interface NightgateClient {
     grantDisclosure(p: ActionParams): Promise<JobResult>;
     revokeDisclosure(p: ActionParams): Promise<JobResult>;
     registerPassport(p: ActionParams): Promise<JobResult>;
+    /** Same action as registerPassport; takes `documentId` and `mode` (0 register, 1 unregister, 2 transfer registrar, 3/4 recovery re-points registrar/recovery). */
+    registerDocument(p: ActionParams): Promise<JobResult>;
+    retractAttestation(p: ActionParams): Promise<JobResult>;
+    purgeExpired(p: ActionParams): Promise<JobResult>;
 
     // contracts + tokens
     deployContract(p: ActionParams): Promise<JobResult>;

@@ -258,7 +258,7 @@ describe('wallet-worker-client', () => {
             expect(err.message).toMatch(/Custom error: 196/);
         });
 
-        it('an unknown code is not a classification: plain Error as before', async () => {
+        it('an unknown code is not a classification: plain Error', async () => {
             await startWithResponder(() => ({ ok: false, error: { name: 'X', message: 'm', code: 'made-up' } }));
             const err: any = await walletEvict('s1').then(() => null, e => e);
             expect(err).not.toBeInstanceOf(WorkerSubmitError);
@@ -326,6 +326,53 @@ describe('wallet-worker-client', () => {
             // the ttl rides along: the confirmer's deadline for a broadcast that never lands
             expect(persisted).toEqual([{ txHash: 'h1', intent: expect.objectContaining({ txHash: 'h1', contractAddress: 'c', circuits: ['increment'], ttl: '2026-09-10T06:31:34.000Z' }) }]);
             expect(acks).toEqual([{ kind: 'submit-intent-ack', txHash: 'h1', ok: true }]);
+        });
+
+        it('a worker answer that arrives while the intent is still being persisted settles after the hook, and no ack follows', async () => {
+            const acks: any[] = [];
+            await startWithResponder((msg) => {
+                msg.port.on('message', (m: any) => { if (m?.kind === 'submit-intent-ack') acks.push(m); });
+                msg.port.postMessage({ kind: 'submit-intent', txHash: 'h-late', contractAddress: 'c', circuits: ['attest'] });
+                // the worker gave up waiting for the ack: it answers without broadcasting
+                setImmediate(() => msg.port.postMessage({ ok: false, error: {
+                    name: 'Error', message: 'submit-intent was not acknowledged by the main thread within 120000ms; not broadcasting',
+                    code: 'pre-mempool-reject', ledgerCode: 'intent-timeout', retryable: false
+                } }));
+                return undefined;
+            });
+            const events: string[] = [];
+            const err: any = await walletSubmitContractCall({
+                sessionId: 's1', proxyId: 'p', contractName: 'counter', contractAddress: 'c', circuit: 'increment', args: [],
+                registration: { artifactPath: '/a', privateStateId: 'p', zkConfigPath: '/zk' },
+                indexerHttpUrl: '', indexerWsUrl: '', proofServerUrl: '', networkId: 'preprod'
+            } as any, async () => {
+                await new Promise((r) => setTimeout(r, 50));
+                events.push('committed');
+            }).then(() => null, (e) => { events.push('rejected'); return e; });
+            expect(events).toEqual(['committed', 'rejected']);
+            expect(err).toBeInstanceOf(WorkerSubmitError);
+            expect(err).toMatchObject({ code: 'pre-mempool-reject', ledgerCode: 'intent-timeout' });
+            await new Promise((r) => setTimeout(r, 20));
+            expect(acks).toEqual([]);
+            expect(warnSpy).toHaveBeenCalledWith(expect.stringMatching(/h-late.*not acknowledged/));
+        });
+
+        it('a worker exit while the intent is being persisted rejects the call only after the hook settled', async () => {
+            const w = await startWithResponder((msg) => {
+                msg.port.postMessage({ kind: 'submit-intent', txHash: 'h-exit', contractAddress: 'c', circuits: ['attest'] });
+                return undefined;
+            });
+            const events: string[] = [];
+            await walletSubmitContractCall({
+                sessionId: 's1', proxyId: 'p', contractName: 'counter', contractAddress: 'c', circuit: 'increment', args: [],
+                registration: { artifactPath: '/a', privateStateId: 'p', zkConfigPath: '/zk' },
+                indexerHttpUrl: '', indexerWsUrl: '', proofServerUrl: '', networkId: 'preprod'
+            } as any, async () => {
+                setImmediate(() => w.emit('exit', 1));
+                await new Promise((r) => setTimeout(r, 50));
+                events.push('committed');
+            }).then(() => null, () => { events.push('rejected'); });
+            expect(events).toEqual(['committed', 'rejected']);
         });
 
         it('walletDeployContract / walletSubmitContractCall route to their RPC methods', async () => {

@@ -1,7 +1,7 @@
 /**
  * The phased submit (srv/midnight/worker/phased-submit.ts) driven through a
- * fake node adapter: every failure shape the two lost broadcasts could have
- * had, and what the status, the error and the log say about each.
+ * fake node adapter: every failure shape a broadcast can take, and what the
+ * status, the error and the log say about each.
  */
 import { describe, it, expect, vi } from 'vitest';
 import { createPhasedSubmitService, SubmitPhaseError, submitPhaseOf, type SubmitNodeAdapter, type NodeSubmitEvent, type SocketEvent } from '../../srv/midnight/worker/phased-submit';

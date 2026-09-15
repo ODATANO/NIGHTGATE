@@ -289,8 +289,8 @@ describe('fetch retry wrappers (parallel catch-up pipeline)', () => {
     });
 
     it('fetchBlockBatchWithRetry aborts immediately on permanent errors', async () => {
-        // "No block at height" is transient since 0.23.0 (a lagging replica
-        // behind a load balancer answers null for a finalized height).
+        // "No block at height" is transient (a lagging replica behind a load
+        // balancer answers null for a finalized height).
         const processor = {
             fetchBlockBatch: vi.fn().mockRejectedValue(new Error('Malformed block header at height 11'))
         };

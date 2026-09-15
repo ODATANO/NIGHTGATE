@@ -1,21 +1,7 @@
 /**
- * Prover keys on demand. The npm tarball ships every contract's module,
- * verifier keys, zkir and a `keys/manifest.json` (sha256 + size per prover
- * key), but no `*.prover` file: the two vault lineages alone are 200 MB. A
- * missing prover key is fetched the first time a job needs the contract,
- * verified against the manifest and written next to the verifier keys.
- *
- * Source (`NIGHTGATE_ZK_ASSET_URL`):
- *   unset      contracts under this package's `contracts/` fetch from the
- *              release's git tag on GitHub (the /zk-config layout); any other
- *              registration has no default source
- *   <url>      a `/zk-config` base of a NIGHTGATE that has the keys
- *              (`<url>/<contract>/keys/<circuit>.prover`)
- *   none|off   disabled (offline installs run `nightgate-fetch-keys` once)
- *
- * Prover keys are NOT part of the artifact generation digest (the manifest
- * is), so fetching them changes nothing a job was pinned to.
- * Dependency-free (fs, path, crypto): the registry calls it on the main thread.
+ * Prover keys on demand: missing keys are fetched on first need and verified
+ * against `keys/manifest.json`. The digest covers the manifest, not the keys,
+ * so fetching changes no generation.
  * SPDX-License-Identifier: Apache-2.0
  */
 
@@ -34,7 +20,7 @@ export interface ProverKeyManifest {
 
 const PACKAGE_ROOT = path.resolve(__dirname, '..', '..');
 
-/** The manifest next to the keys, or null when absent or malformed. */
+/** Null when absent or malformed. */
 export function readProverKeyManifest(zkConfigPath: string): ProverKeyManifest | null {
     try {
         const raw = JSON.parse(fs.readFileSync(path.join(zkConfigPath, 'keys', PROVER_KEY_MANIFEST), 'utf8'));
@@ -61,12 +47,10 @@ export function verifierCircuits(zkConfigPath: string): string[] {
     }
 }
 
-/** Circuits that have a verifier key but no prover key on disk. */
 export function missingProverKeys(zkConfigPath: string): string[] {
     return verifierCircuits(zkConfigPath).filter(c => !fs.existsSync(path.join(zkConfigPath, 'keys', `${c}.prover`)));
 }
 
-/** Every circuit of the artifact can be proven here. */
 export function hasAllProverKeys(zkConfigPath: string): boolean {
     const circuits = verifierCircuits(zkConfigPath);
     return circuits.length > 0 && missingProverKeys(zkConfigPath).length === 0;
@@ -94,9 +78,8 @@ function packageVersion(pkgRoot: string): string {
 }
 
 /**
- * The `/zk-config/<contract>` base the prover keys of this registration come
- * from, or null when none applies (disabled, or a foreign artifact without a
- * configured source).
+ * `NIGHTGATE_ZK_ASSET_URL` base, or the release tag on GitHub for shipped
+ * contracts; null when disabled (none/off) or a foreign artifact has no source.
  */
 export function resolveZkAssetSource(
     name: string,
@@ -121,12 +104,7 @@ export interface EnsureProverKeysOptions {
 
 const inFlight = new Map<string, Promise<{ fetched: string[]; source: string | null }>>();
 
-/**
- * Make every prover key of the registration present on disk, fetching the
- * missing ones from the resolved source and verifying each against the
- * manifest before it lands. Concurrent callers for one artifact share the
- * download. Throws `ProverKeysUnavailableError` when nothing can be fetched.
- */
+/** Each key is verified before it lands; concurrent callers for one artifact share the download. */
 export function ensureProverKeys(
     name: string,
     reg: { zkConfigPath: string },
@@ -209,7 +187,7 @@ async function ensureProverKeysNow(
     return { fetched, source };
 }
 
-/** Manifest for the prover keys present under `keysDir` (build-time helper). */
+/** Build-time helper. */
 export function buildProverKeyManifest(keysDir: string): ProverKeyManifest {
     const prover: ProverKeyManifest['prover'] = {};
     for (const f of fs.readdirSync(keysDir).filter(f => f.endsWith('.prover')).sort()) {

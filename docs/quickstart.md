@@ -1,17 +1,16 @@
 # Quickstart
 
-From `npm ci` to a working wallet-signed transaction. This walks through three paths in order of complexity:
+From `npm ci` to a wallet-signed transaction, in three steps:
 
-1. **Read-side only** - index Preprod blocks against the hosted RPC. ~2 min setup.
-2. **Wallet sessions + read** - connect a wallet, query its balance. ~5 min.
-3. **Full submission flow** - sign and submit a NIGHT transfer or contract deploy. ~5 min once a synced wallet is available.
+1. **Read-side only**: index Preprod blocks.
+2. **Wallet sessions**: connect a wallet, query its balance.
+3. **Submission**: send NIGHT or deploy a contract.
 
 ## Prerequisites
 
-- Node.js ≥ 22 (CAP 10 minimum; the wallet SDK also needs `worker_threads` + `--env-file`)
-- npm
-- Docker Desktop (only if you want the local proof server or the local Midnight indexer)
-- For wallet operations: a Midnight wallet seed (24-word BIP39 mnemonic) and viewing key. Get these from the [Lace wallet](https://www.lace.io/) extension.
+- Node.js >= 22, npm
+- Docker, only for a local proof server or indexer
+- For wallet operations: a 24-word BIP39 mnemonic and viewing key, e.g. from [Lace](https://www.lace.io/)
 
 ## Path 1: Read-side only
 
@@ -20,62 +19,50 @@ npm ci
 npm run dev
 ```
 
-`npm run dev` uses `cds watch` with a 12 GB Node heap (configured in `scripts/dev.mjs`). The plugin defaults to Preprod with the public RPC at `wss://rpc.preprod.midnight.network/`. No `.env` or extra config required.
-
-The crawler catches up from genesis (~100k blocks at first run; subsequent restarts are faster thanks to incremental sync). Watch the log for `[Crawler] Live subscription active`.
-
-Verify:
+`npm run dev` runs `cds watch` with a 12 GB heap against the public Preprod RPC; no `.env` needed. The crawler catches up from genesis on the first run and resumes afterwards. Wait for `[Crawler] Live subscription active`, then:
 ```bash
 curl "http://localhost:4004/api/v1/indexer/getHealth()"
 curl "http://localhost:4004/api/v1/indexer/getSyncStatus()"
 curl "http://localhost:4004/api/v1/nightgate/Blocks?\$top=5&\$orderby=height desc"
 ```
 
-You should see non-zero `chainHeight` and the latest 5 blocks. **Done - read-side works.**
+Expect a non-zero `chainHeight` and five blocks.
 
 ## Path 2: Wallet sessions
 
-For wallet operations, the SDK runs in a separate worker thread and needs a prover. Two options:
+Proving options:
 
-**Default: no Docker at all.** With nothing configured, both wallet and contract circuits prove in-process (wasm mode); proving keys are fetched from Midnight's S3 on first use and cached in memory. A fresh install therefore works against purely public endpoints. Trade-off: each proof costs seconds of CPU in the worker thread.
-
-**Production: proof-server container.** Add to `docker/docker-compose.yml` (already present) and start:
-
-```bash
-docker compose -f docker/docker-compose.yml up -d proof-server
-```
-
-Configuring `NIGHTGATE_PROOF_SERVER_URL` (or `proofServerUrl` in cds config) selects server proving automatically; `NIGHTGATE_PROVING_MODE` overrides either way. The proof server is small (~23 MB image) but downloads ZK parameters on first contract compile (~500 MB to a few GB depending on circuit). Parameters persist in the `proof-server-data` named volume.
+- **Default, wasm:** wallet and contract circuits prove in-process; prover keys are fetched on first use. Costs seconds of worker CPU per proof.
+- **Production, proof server:** `docker compose -f docker/docker-compose.yml up -d proof-server`, then set `NIGHTGATE_PROOF_SERVER_URL` (or `proofServerUrl`), which selects server proving. `NIGHTGATE_PROVING_MODE` overrides. ZK parameters persist in the `proof-server-data` volume.
 
 ### Configure wallet credentials
 
-Edit `.env` in the repo root (gitignored - never commit a real seed):
+`.env` in the repo root (gitignored, never commit a real seed):
 
 ```env
 NIGHTGATE_NETWORK=preprod
 NIGHTGATE_NODE_URL=wss://rpc.preprod.midnight.network/
 
-# Optional: disable crawler during wallet-only runs to free CPU/RAM for the worker
+# Optional: frees CPU and memory for the wallet worker
 NIGHTGATE_CRAWLER_ENABLED=false
 
-# Viewing key (64-hex encryption public key) + BIP39 mnemonic.
-# NIGHTGATE HD-derives the per-role keys server-side, matching Lace - pass the mnemonic, not a raw seed.
+# 64-hex viewing key + BIP39 mnemonic (keys are HD-derived server-side like Lace)
 LACE_VIEWING_KEY=a32699a5a29e453f6e92624c2fbefdee173d3f1178e3f9c71bc3edb7d91c1403
 LACE_MNEMONIC="word1 word2 word3 ... word24"
 ```
 
-If you have only the mnemonic, derive the viewing key with the included helper:
+Viewing key from a mnemonic:
 ```bash
 LACE_MNEMONIC="word1 word2 ... word24" node scripts/derive-keys.mjs
 ```
 
 ### Start the server
 
-`serve:sync` runs `cds-serve` (no watch) against the persistent file DB, so deploy the schema once first (auto-deploy was removed - the submission path fails fast if the schema is missing):
+`serve:sync` uses the persistent file DB, which is not deployed automatically:
 
 ```bash
-npm run deploy        # cds deploy --to sqlite:db/midnight.db (first run / after schema changes)
-npm run serve:sync    # cds-serve with the 12 GB heap
+npm run deploy        # cds deploy --to sqlite:db/midnight.db (first run, after schema changes)
+npm run serve:sync    # cds-serve, 12 GB heap
 ```
 
 Expected log:
@@ -96,7 +83,7 @@ In a second terminal:
 npm run sync:start
 ```
 
-This calls `connectWallet` then `connectWalletForSigning` against `localhost:4004`, reading `LACE_VIEWING_KEY` / `LACE_MNEMONIC` from `.env`. Output:
+Calls `connectWallet` and `connectWalletForSigning` with the `.env` credentials:
 
 ```
 --- 1. connectWallet ---
@@ -108,20 +95,20 @@ OK   { ..., "signingEnabled": true }
 Session to reuse: c07b1f0a-7251-488d-a64e-1bf69045d7a9
 ```
 
-The server will start the wallet sync **in the worker thread** in the background. Expected server logs:
+The wallet then syncs in the worker thread:
 
 ```
 [wallet-sessions] facade pre-warm kicked off for d4c0f3cc9d3d285c
-[facade] restored prior state for d4c0f3cc9d3d285c: shielded=true unshielded=true dust=true   (or =false on first run)
+[facade] restored prior state for d4c0f3cc9d3d285c: shielded=true unshielded=true dust=true   (false on first run)
 [worker] facade started for d4c0f3cc9d3d285c
-[facade-persist] saved d4c0f3cc9d3d285c sh=4032 un=369 du=487021                              (every ~30 s)
+[facade-persist] saved d4c0f3cc9d3d285c sh=4032 un=369 du=487021                              (every 60 s)
 ```
 
-**First run from a fresh seed**: cold sync takes ~5-6 hours wall-clock. The worker pegs ~3.8 GB heap during the shielded chain scan. Subsequent runs use the persisted blob from `WalletSyncStates` and delta-sync in seconds.
+A cold sync from a fresh seed takes hours and several GB of worker heap; later runs resume from `WalletSyncStates`. Track it with `getWalletSyncProgress(sessionId)`.
 
 ### Query the wallet
 
-Once the sync hits tip (you see `[facade-persist] saved` lines with stable shielded/unshielded sizes and only the dust blob growing), query balance:
+After the sync reaches the tip (`caughtUp: true`):
 
 ```bash
 curl "http://localhost:4004/api/v1/nightgate/getWalletBalance(sessionId='c07b1f0a-...')"
@@ -140,15 +127,15 @@ Response:
 
 ## Path 3: Send a transaction
 
-With a synced wallet that has some DUST (Lace shows the dust balance refilling), you can submit transactions.
+Requires a synced wallet with DUST.
 
-### Pre-flight: estimate the fee
+### Estimate the fee
 
 ```bash
 curl "http://localhost:4004/api/v1/nightgate/estimateSendNightFee(sessionId='...',receiverAddress='mn_addr_preprod1...',amount='1000000')"
 ```
 
-Response: `{"fee":"123456","toLedger":"unshielded"}`. Compare against the wallet's `dustBalance` from `getWalletBalance`.
+Response: `{"fee":"123456","toLedger":"unshielded"}`; compare with `dustBalance`.
 
 ### Send NIGHT
 
@@ -162,13 +149,11 @@ curl -X POST http://localhost:4004/api/v1/nightgate/sendNight \
   }'
 ```
 
-Response: `{"jobId":"...","status":"pending"}`. Submit actions are async - poll `getJobStatus(jobId, sessionId)` until `succeeded`; its `result` then holds `{"txId":"0x...","toLedger":"unshielded","amount":"1000000",...}`. The crawler later flips the matching `PendingSubmissions` row to `finalized` once the tx is indexed.
+Response: `{"jobId":"...","status":"pending"}`. Poll `getJobStatus(jobId, sessionId)` until `succeeded`; `result` holds `{"txId":"0x...","toLedger":"unshielded","amount":"1000000",...}`.
 
 ### Deploy a contract
 
-The repo ships with a pre-compiled `counter` contract under `contracts/counter/`. Registration is already in `package.json` under `cds.requires.nightgate.contracts`.
-
-The attestation vault comes in two widths, both pre-registered: `attestation-vault` (16 provable fields per document, the default everywhere) and `attestation-vault-32` (32 fields under ONE root, for larger field panels that need a global "at least k of N differ" claim; ~2x proving time on the comparison circuit, everything else identical). Pick the width per document family via `compiledArtifactRef`; cross-root proofs only work between documents of the same width. See `contracts/README.md` and the width note in `docs/actions.md`.
+`contracts/counter/` is precompiled and registered in `package.json` (`cds.requires.nightgate.contracts`). Also registered: `attestation-vault` (16 fields per document) and `attestation-vault-32` (32 fields); cross-document proofs need the same width. See [contracts/README.md](../contracts/README.md).
 
 ```bash
 curl -X POST http://localhost:4004/api/v1/nightgate/deployContract \
@@ -180,9 +165,9 @@ curl -X POST http://localhost:4004/api/v1/nightgate/deployContract \
   }'
 ```
 
-Response: `{"jobId":"...","status":"pending"}`. Poll `getJobStatus`; the succeeded `result` is `{"submissionId":"...","txHash":"0x...","contractAddress":"0x...","status":"included"}`.
+Poll `getJobStatus`; `result` is `{"submissionId":"...","txHash":"0x...","contractAddress":"0x...","status":"included"}`.
 
-The deploy-e2e runner does the whole flow end-to-end (`connectWallet → connectWalletForSigning` → await prewarm sync → `registerForDustGeneration` → `deployContract`, polling each job):
+End to end (connect, prewarm, `registerForDustGeneration`, `deployContract`):
 
 ```bash
 npm run deploy:e2e
@@ -195,15 +180,9 @@ cd my-cap-app
 npm install @odatano/nightgate @cap-js/sqlite
 ```
 
-The package is small (under 1 MB): it ships every contract's module,
-verifier keys and zkir, but no prover key. The first job that proves a
-circuit fetches the missing keys from the release's git tag (override with
-`NIGHTGATE_ZK_ASSET_URL`, a `/zk-config` base) and verifies them against the
-packed `keys/manifest.json`. For a machine without outbound access run
-`npx nightgate-fetch-keys attestation-vault` (and `attestation-vault-32`,
-`counter`, `shielded-token` as needed) once after the install.
+The package ships contract modules, verifier keys and zkir, but no prover keys. The first proving job fetches them from the release tag (override: `NIGHTGATE_ZK_ASSET_URL`, a `/zk-config` base) and checks them against `keys/manifest.json`. Without outbound access, run `npx nightgate-fetch-keys <contract>` once after install.
 
-Add to `package.json`:
+`package.json`:
 
 ```json
 {
@@ -216,13 +195,13 @@ Add to `package.json`:
 }
 ```
 
-Then `cds watch`. `network` is the only required key (without it the plugin stays idle - it never auto-crawls a chain nobody chose); everything else defaults to the public Preprod endpoints. Override via env vars or CDS config - see [reference.md#configuration](reference.md#configuration). (A legacy `"kind": "nightgate"` in existing configs is harmless and ignored.)
+Then `cds watch`. `network` is required (without it the plugin stays idle); everything else defaults to public endpoints. Configuration: [reference.md#configuration](reference.md#configuration). A `"kind": "nightgate"` entry is ignored.
 
-The plugin auto-registers four OData services under `/api/v1/{nightgate,indexer,analytics,admin}`. All actions and functions documented in [actions.md](actions.md) are available immediately.
+The services register under `/api/v1/{nightgate,indexer,analytics,admin,verify}`.
 
-## Common next steps
+## Next
 
-- **Action reference** - [actions.md](actions.md) - every OData action + function with curl examples
-- **Operations guide** - [operations.md](operations.md) - scripts, local indexer container, troubleshooting
-- **Architecture** - [architecture.md](architecture.md) - worker-thread design, submission flow, persistence
-- **Full configuration matrix** - [reference.md#configuration](reference.md#configuration)
+- [actions.md](actions.md): actions and functions
+- [operations.md](operations.md): scripts, local indexer, troubleshooting
+- [architecture.md](architecture.md): worker thread, submission flow, persistence
+- [reference.md#configuration](reference.md#configuration): configuration

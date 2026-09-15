@@ -1,7 +1,7 @@
 // Diagnostic: which WS connection drops/stalls, the NODE RPC or the
 // INDEXER subscription? Opens BOTH simultaneously and logs every update + any
 // close/error, so we can tell which one is the unstable link behind the wallet
-// sync stalls (Custom error 117 chase).
+// sync stalls.
 //
 //   NODE:    wss://rpc.preprod.midnight.network  → chain_subscribeNewHeads
 //   INDEXER: wss://indexer.preprod.../graphql/ws → graphql-transport-ws: subscription { blocks { height } }

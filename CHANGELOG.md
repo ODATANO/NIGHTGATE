@@ -1,5 +1,50 @@
 # Changelog
 
+## 0.24.0 - 2026-09-12
+
+Vault lineage 4 (both widths), `@odatano/nightgate-tx` 0.6.0. BREAKING:
+redeploy and re-anchor. Schema delta: `BackgroundJobs.grantId`,
+`Documents.attesterId`, `DisclosureGrants.attesterId` / `changedAtHeight`,
+`PredicateAttestations.attesterId` / `attesterIdB` (`nightgate-schema-delta`).
+
+- Records keyed by `recordKey(attesterId, payloadHash)`; commit-reveal,
+  sequence and epoch removed; an attest is one transaction.
+- `retract(mode, key)`: own record (0) or expired claim (1). Claims carry
+  `valid_until` (max five years), extend-only on re-proof.
+- Claim keys embed record key, content root and schema id.
+- `registerDocument` / `bindDocument` replace the passport circuits; a
+  re-registered id drops a foreign binding. Constructor `(registrar,
+  recovery)`; recovery re-points the registrar (mode 3) or itself (mode 4).
+- Actions: `anchorDocument` returns `attesterId`; `issue*` take `attesterId`
+  and `validUntil` (`NIGHTGATE_CLAIM_LIFETIME_S`); `verifyAttestationState`
+  by `attesterId` + `payloadHash` or `documentId`, reports `recordKey`,
+  `bindingRegistered`; `registerPassport` `mode` 0-4; `deployContract`
+  `recoveryId`; new `retractAttestation`, `purgeExpired`.
+- `verifyDocument` / `verifyPredicateAttestation`: `verified` needs the live
+  read; `included` and `stateChecked` reported separately.
+- Browser / txbuilder: proof helpers take `recordKey` and `validUntil`;
+  `prepareRegisterDocument`, `prepareBindDocument`, `prepareRetract`;
+  vault `constructorArgs` `[registrarId, recoveryId]`; `keys/manifest.json`
+  covers verifier keys and zkir.
+- `submitContractCallBatch` `merkleProof` carries `fieldSalt`, accepts
+  `docPair`; `threshold` at most 2^63 - 1.
+- Disclosure projection ordered by block height; confirmation writes never
+  overwrite a newer row; a failed post-submit reindex retries as a
+  `reindexDisclosures` job (`NIGHTGATE_DISCLOSURE_REINDEX_RETRY_MS`).
+- Jobs re-read their agent grant at execution (`AGENT_GRANT_REVOKED`,
+  `AGENT_GRANT_SCOPE`).
+- `updateAgentGrant`, `rotateAgentGrantToken`, `getGrantUsage`
+  (`NIGHTGATE_GRANT_ADMIN_RATE_LIMIT`); public verify lane `/api/v1/verify`
+  (`NIGHTGATE_PUBLIC_VERIFY`, `NIGHTGATE_PUBLIC_VERIFY_RATE_LIMIT`).
+- Submit: late intent ack fails the job (`SubmitIntentTimeout`,
+  `NIGHTGATE_SUBMIT_INTENT_ACK_TIMEOUT_MS`); unbound dust intent takes the
+  lowest free segment; `1010/104` rebuilt (`NIGHTGATE_STALE_TRANSCRIPT_RETRIES`).
+- Wallet: rejected snapshot replay resets the sub-wallet
+  (`NIGHTGATE_SNAPSHOT_REPLAY_RESET_MS`); `sync-state` log
+  (`NIGHTGATE_SYNC_STATE_LOG_MS`); `getSponsorPoolStatus.caughtUp` is the
+  sync gate; pool jobs prefer members at the gate.
+- `/metrics` reports the database pool; `qs` overridden to 6.16.0.
+
 ## 0.23.4 - 2026-09-11
 
 Authorization, key handling and runtime gating. No circuit change; schema delta:

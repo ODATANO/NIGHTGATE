@@ -1,24 +1,7 @@
 /**
- * Typed argument coercion for the generic `submitContractCall` action.
- *
- * A compiled Compact circuit guards a `Bytes<N>` parameter strictly as a real
- * `Uint8Array(N)`. `submitContractCall` takes `args` as a JSON string, and JSON
- * can't carry a Uint8Array, so a hex string / number[] both fail the guard;
- * only JSON-native circuits (numbers/bools) were callable generically. This
- * module coerces each arg (between `JSON.parse(args)` and the worker's
- * `fn(...callArgs)`) to the shape the circuit expects. Coerced Uint8Array /
- * BigInt survive the worker's structured-clone boundary (postMessage, not JSON).
- *
- * Encodings, tag-wins-then-introspect:
- *   - Tagged (always honored): { "$bytes": "<hex>" } → Uint8Array;
- *     { "$uint": "<dec>" | 123 } → BigInt.
- *   - Untagged + introspected from the artifact's `contract-info.json`: hex /
- *     number[] → Bytes<N> (exact-length checked), number / decimal-string →
- *     BigInt for Uint<N>. Unhandled Compact types (Vector, struct, Field, …)
- *     pass through unchanged.
- *   - Untagged + no metadata: rejected with a 400 (silent passthrough would
- *     reproduce the deep circuit-type failure this layer prevents). Fix by
- *     tagging the value or correcting the registered artifact path.
+ * Coerces JSON circuit args to the Uint8Array/BigInt shapes Compact guards
+ * demand. A `$bytes`/`$uint` tag wins; otherwise contract-info.json types drive
+ * it; untagged args without metadata are rejected rather than passed through.
  */
 
 import fs from 'fs';
@@ -28,19 +11,12 @@ import path from 'path';
 export interface CircuitArgType {
     name: string;
     kind: 'Bytes' | 'Uint' | 'Boolean' | 'Struct' | 'other';
-    /** Struct fields (in declaration order) for kind 'Struct', e.g. ShieldedCoinInfo { nonce, color, value }. */
+    /** Struct fields in declaration order. */
     elements?: CircuitArgType[];
-    /** Byte length for Bytes<N>. */
     length?: number;
-    /** Upper bound for Uint<N> (omitted when the compiler's value exceeds JS safe-integer range). */
     maxval?: number;
 }
 
-/**
- * Bad-input error for a single argument. Carries the arg index so the handler
- * can surface a clear 400 ("args[1]: …") rather than letting a value reach the
- * circuit and fail deep inside the compiled runtime's type guard.
- */
 export class CoercionError extends Error {
     constructor(public readonly index: number, reason: string) {
         super(`args[${index}]: ${reason}`);
@@ -100,9 +76,7 @@ function toBigInt(value: unknown, index: number, maxval?: number): bigint {
     if (v < 0n) {
         throw new CoercionError(index, `Uint value must be non-negative (got ${v})`);
     }
-    // Enforce the upper bound only when maxval is within JS safe-integer range;
-    // for u64 etc. it loses precision through JSON.parse, so the check would be
-    // unreliable (the circuit enforces the true bound anyway).
+    // Larger maxvals lost precision in JSON.parse; the circuit enforces the true bound.
     if (maxval !== undefined && maxval <= Number.MAX_SAFE_INTEGER && v > BigInt(maxval)) {
         throw new CoercionError(index, `Uint value ${v} exceeds maximum ${maxval}`);
     }
@@ -113,9 +87,7 @@ function isPlainObject(v: unknown): v is Record<string, unknown> {
     return typeof v === 'object' && v !== null && !Array.isArray(v) && !(v instanceof Uint8Array);
 }
 
-/** Coerce one argument. Tag wins; otherwise the declared circuit type drives it; with no type info, reject. */
 function coerceOne(raw: unknown, argType: CircuitArgType | undefined, index: number): unknown {
-    // 1. Tagged values: honored regardless of whether we have circuit metadata.
     if (isPlainObject(raw)) {
         if (Object.prototype.hasOwnProperty.call(raw, '$bytes')) {
             const hex = raw['$bytes'];
@@ -127,7 +99,6 @@ function coerceOne(raw: unknown, argType: CircuitArgType | undefined, index: num
         }
     }
 
-    // 2. Introspected coercion from the circuit's declared parameter type.
     if (argType) {
         switch (argType.kind) {
             case 'Bytes':
@@ -146,9 +117,6 @@ function coerceOne(raw: unknown, argType: CircuitArgType | undefined, index: num
                 if (typeof raw === 'boolean') return raw;
                 throw new CoercionError(index, `expected boolean, got ${typeof raw}`);
             case 'Struct': {
-                // A Compact struct (e.g. ShieldedCoinInfo for receiveShielded) arrives as a
-                // JSON object; coerce every declared field with its own type so tagged
-                // ({"$bytes"}/{"$uint"}) and introspected values both work one level down.
                 if (!isPlainObject(raw)) {
                     throw new CoercionError(index, `expected an object for struct ${argType.name}, got ${typeof raw}`);
                 }
@@ -166,9 +134,6 @@ function coerceOne(raw: unknown, argType: CircuitArgType | undefined, index: num
         }
     }
 
-    // 3. No declared type AND no tag: can't validate, so reject with an
-    // actionable 400 rather than a silent passthrough (which would reproduce the
-    // deep circuit failure this layer prevents). Escape hatches are in the message.
     throw new CoercionError(
         index,
         'could not determine the circuit parameter type (the contract\'s ' +
@@ -177,11 +142,6 @@ function coerceOne(raw: unknown, argType: CircuitArgType | undefined, index: num
     );
 }
 
-/**
- * Coerce a parsed `args` array against the circuit's declared parameter types.
- * `argTypes` may be undefined (no introspection); tagged values still work and
- * everything else passes through unchanged.
- */
 export function coerceCircuitArgs(rawArgs: unknown[], argTypes?: CircuitArgType[]): unknown[] {
     return rawArgs.map((raw, i) => coerceOne(raw, argTypes?.[i], i));
 }
@@ -211,9 +171,7 @@ function mapArgType(node: RawArgTypeNode | undefined, name: string): CircuitArgT
     return { name, kind: 'other' };
 }
 
-// Cache parsed circuit-arg maps per artifact directory, keyed by the
-// contract-info.json's stat identity as well: a runtime re-registration that
-// recompiles under the SAME path must not coerce with the previous artifact.
+// Keyed by stat identity too: a recompile under the same path must not reuse the old map.
 const argTypeCache = new Map<string, Map<string, CircuitArgType[]> | null>();
 
 function contractInfoKey(infoPath: string): string {
@@ -233,8 +191,6 @@ function loadContractInfo(zkConfigPath: string): Map<string, CircuitArgType[]> |
     try {
         parsed = JSON.parse(fs.readFileSync(infoPath, 'utf8'));
     } catch {
-        // Missing/unreadable contract-info.json → no introspection available.
-        // Tagged values still work; untagged args pass through (back-compat).
         argTypeCache.set(key, null);
         return null;
     }
@@ -243,24 +199,17 @@ function loadContractInfo(zkConfigPath: string): Map<string, CircuitArgType[]> |
         if (!c.name) continue;
         byCircuit.set(c.name, (c.arguments ?? []).map((a) => mapArgType(a.type, a.name ?? '')));
     }
-    // One entry per path: drop a stale generation's map when a new one lands.
     for (const k of [...argTypeCache.keys()]) if (k.startsWith(infoPath + '|') && k !== key) argTypeCache.delete(k);
     argTypeCache.set(key, byCircuit);
     return byCircuit;
 }
 
-/**
- * Resolve the declared parameter types for `circuit` from the compiled
- * artifact at `zkConfigPath` (reads `<zkConfigPath>/compiler/contract-info.json`).
- * Returns undefined when the metadata or the circuit entry is unavailable;
- * coercion then falls back to tagged-values-only / passthrough.
- */
+/** Undefined when metadata or circuit is missing; coercion then accepts tagged values only. */
 export function loadCircuitArgTypes(zkConfigPath: string, circuit: string): CircuitArgType[] | undefined {
     const byCircuit = loadContractInfo(zkConfigPath);
     return byCircuit?.get(circuit);
 }
 
-/** Test-only: clear the contract-info parse cache. */
 export function __clearArgTypeCacheForTests(): void {
     argTypeCache.clear();
 }

@@ -1,30 +1,7 @@
 /**
- * Phased submit on a dedicated node client.
- *
- * The SDK's `submitTransaction(tx, waitFor)` is one promise over client
- * initialisation, connect, send, subscription and inclusion, and it hides
- * the intermediate statuses (`Stream.find(waitFor)`). A timeout on that
- * promise therefore cannot say whether the transaction was ever sent, and
- * two lost broadcasts on the hosted server left no evidence beyond "timed
- * out". This module consumes the node client's event stream itself and
- * records a timeline per attempt:
- *
- *   connect  - client created and socket up (`connectMs`; nothing sent on
- *              failure, the caller may retry on a fresh client)
- *   request  - the send until the node's FIRST status (subscription
- *              acknowledged, `Submitted`); `requestMs`; a timeout here means
- *              the send may or may not have reached the pool (ambiguous)
- *   watch    - from the first status until `waitFor` (InBlock/Finalized);
- *              `watchMs`; a timeout here means the node took the request
- *              and nothing was included in time (ambiguous)
- *
- * Every status and socket event lands in the timeline with its offset, the
- * failure carries phase + timeline (`SubmitPhaseError`), one log line per
- * attempt shows the phase durations, and a result that arrives after a
- * phase timeout is still logged under the same identifier instead of
- * vanishing. The node adapter is an interface: the real one wraps the SDK's
- * `PolkadotNodeClient` (effect API), the tests drive a fake through every
- * failure shape.
+ * Submit with separate connect / request (until first status) / watch deadlines: a timeout on
+ * the SDK's single `submitTransaction` promise cannot tell whether the tx was ever sent.
+ * Only a connect failure is known unsent; late statuses are logged under the identifier.
  */
 import { log as workerLog } from './context';
 
@@ -45,11 +22,7 @@ export type SocketEvent = { kind: 'connected' | 'disconnected' | 'error'; detail
 export interface SubmitNodeAdapter {
     /** Bring the socket up (idempotent); rejects when the adapter's own connect fails. */
     connect(): Promise<void>;
-    /**
-     * Send the serialized transaction. `onEvent` fires per status. The promise
-     * settles when the subscription ends: the stream's own end (Finalized), a
-     * node error (reject, Invalid, Dropped), or `signal` aborting it.
-     */
+    /** Settles when the subscription ends: stream end (Finalized), node error, or `signal` abort. */
     send(bytes: Uint8Array, onEvent: (ev: NodeSubmitEvent) => void, signal: AbortSignal): Promise<void>;
     onSocket(cb: (ev: SocketEvent) => void): void;
     close(): Promise<void>;
@@ -174,29 +147,21 @@ export function createPhasedSubmitService(opts: {
             last = ev;
             if (!firstAt) { firstAt = Date.now(); resolveFirst(); }
             if (ev.tag === waitFor) resolveWanted(ev);
-            // A status after the attempt gave up is the evidence the next
-            // incident needs; it stays under the same identifier.
             if (settled && !ac.signal.aborted) log('warn', `submit-late ${key}: status ${ev.tag}${detail ? ` (${detail})` : ''} at +${((Date.now() - t0) / 1000).toFixed(1)}s, after the attempt had given up`);
         };
         mark('request-sent');
         const done = adapter.send(bytes, onEvent, ac.signal);
-        // A rejection of the subscription itself (node reject, socket death,
-        // Invalid/Dropped) ends the attempt in whichever phase it is in.
+        // A subscription rejection ends the attempt in whichever phase it is in.
         const streamFailure = done.then(() => { throw new StreamEnded(); });
-        streamFailure.catch(() => undefined); // the races below attach their own handlers; this one must not surface as unhandled after the attempt settled
+        streamFailure.catch(() => undefined); // must not surface as unhandled after the attempt settled
         const phaseLine = (phase: SubmitPhase, outcome: string) =>
             `submit-phases ${key} phase=${phase} ${outcome} connect=${timelineDur(timeline, t0, 'connected')} request=${firstAt ? `${firstAt - requestSentAt(timeline, t0)}ms` : 'n/a'} total=${Date.now() - t0}ms statuses=${formatTimeline(timeline.filter((e) => e.event.startsWith('status-') || e.event.startsWith('socket-')), t0) || 'none'}`;
-        // A timed-out attempt keeps LISTENING for `lateGraceMs` before it
-        // unsubscribes: a late reject, Invalid or InBlock is logged under the
-        // identifier instead of vanishing with the abort. The caller evicts
-        // this client from its pool meanwhile (the SDK disconnects the socket
-        // when the old stream ends, which would hit a submit riding on it).
+        // A timed-out attempt keeps listening for `lateGraceMs` so a late outcome is logged.
         const keepListening = () => {
             const t = setTimeout(() => ac.abort(), opts.timeouts.lateGraceMs);
             t.unref?.();
             lateWindows.add(t);
-            // Both outcomes: `.finally()` would derive a promise that rejects
-            // with the late reject, unhandled (the late reject is logged below).
+            // Not `.finally()`: its derived promise would reject unhandled on a late reject.
             const clear = () => { clearTimeout(t); lateWindows.delete(t); };
             done.then(clear, clear);
         };
@@ -211,12 +176,12 @@ export function createPhasedSubmitService(opts: {
                 }
                 if (e instanceof StreamEnded) throw fail('request', `submit stream ended without any status`);
                 log('warn', phaseLine('request', `FAILED: ${describe(e)}`));
-                throw e; // the node's own answer (reject, Invalid, closing socket): classified by its text
+                throw e; // the node's own answer, classified by its text
             }
             try {
                 const ev = await withTimeout(Promise.race([wanted, streamFailure]), opts.timeouts.watchMs);
                 settled = true;
-                if (waitFor === 'InBlock') ac.abort(); // done watching: unsubscribe + disconnect (the SDK's runHead did the same)
+                if (waitFor === 'InBlock') ac.abort(); // done watching: unsubscribe + disconnect
                 log('info', phaseLine('watch', `OK ${waitFor} after ${Date.now() - firstAt}ms`));
                 return ev;
             } catch (e) {
@@ -232,9 +197,7 @@ export function createPhasedSubmitService(opts: {
         } finally {
             settled = true;
             if (socketLog === timeline) socketLog = null;
-            // The subscription's own end after the attempt settled: the natural
-            // end (Finalized reached, the SDK closed it) or a late node error.
-            // An abort (ours, after InBlock or after the grace) is not a result.
+            // Log the subscription's end after settle; our own abort is not a result.
             void done.then(
                 () => { if (!ac.signal.aborted) log('info', `submit-late ${key}: subscription ended after the attempt settled (last status ${(last as NodeSubmitEvent | null)?.tag ?? 'none'})`); },
                 (err) => { if (!ac.signal.aborted) log('warn', `submit-late ${key}: node reported after the attempt settled: ${describe(err)}`); }
@@ -242,8 +205,7 @@ export function createPhasedSubmitService(opts: {
         }
     };
 
-    // Open late windows (timed-out attempts still listening); close() waits
-    // for them so the socket stays up for the listener, then closes bounded.
+    // Timed-out attempts still listening; close() waits for them, bounded.
     const lateWindows = new Set<NodeJS.Timeout>();
 
     return {
@@ -275,9 +237,7 @@ function timelineDur(timeline: readonly SubmitTimelineEntry[], t0: number, event
     return at ? `${at - t0}ms` : 'n/a';
 }
 
-// ---------------------------------------------------------------------------
 // The real adapter: the SDK's PolkadotNodeClient through its effect API.
-// ---------------------------------------------------------------------------
 
 export interface NodeClientSdk {
     PolkadotNodeClient: any;
