@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.24.1 - 2026-09-17
+
+- Every submit goes out on its own phased node client (connect / request /
+  watch budgets, indexer lookup on an ambiguous outcome). Bound submits
+  (deploys, calls, batches, sends, dust registration, bound sponsoring) used
+  the wallet SDK's `submitTransaction`, whose promise settles only when the
+  node closes the shared socket: a `1010` reject held the worker for
+  minutes, and the sponsor pool read as unsynced meanwhile. The wallet's
+  pending bookkeeping is kept (pend before the send, revert on failure);
+  `NIGHTGATE_SUBMIT_TRANSPORT_RETRIES` now also covers a failed connect
+  phase; `NIGHTGATE_SPONSOR_WAIT` applies to all submits (default InBlock,
+  the indexer confirmer records finality on the job). A landed transaction
+  whose call did not apply fails as `TxFailedError` with the block height on
+  every path, after `InBlock` and after `Finalized` alike. A submit whose
+  every attempt failed before a send restores the dust snapshot like a
+  pre-mempool reject (the SDK revert frees the pending marker, not the note).
+  Once a send may have reached the node and the indexer does not show it,
+  every later failure of the same submit is `ambiguous` (`SubmitAmbiguous`,
+  identifier kept, no rebuild, no dust restore), whatever the later attempt
+  answered.
+- Sync gate: a failed read of the ledger-event stream tip (one-shot indexer
+  subscription) reuses the last read for `NIGHTGATE_STREAM_TIP_GRACE_MS`
+  (default 3 min, `0` = off) instead of reporting the tip unknown, which
+  failed the gate for that tick and took a sponsor out of the pool for a
+  minute at a time.
+- Compose: `init: true` on the `nightgate` service (tini reaps the zombies a
+  killed health check leaves behind node as PID 1).
+- Docs: anchored roots, schema ids, set roots and claim keys are bound to
+  the artifact generation (`transientHash`); `payloadHash` is not. Keep the
+  `opening`, a vault on a new compiler generation is re-anchored from it.
+
 ## 0.24.0 - 2026-09-12
 
 Vault lineage 4 (both widths), `@odatano/nightgate-tx` 0.6.0. BREAKING:

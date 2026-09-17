@@ -449,14 +449,18 @@ default 5000). Job concurrency: `cds.requires.nightgate.jobs.concurrency.heavy`
 (default 4). Returns once in a block (`NIGHTGATE_SPONSOR_WAIT=finalized` waits
 for finality).
 
-Submit timeouts per phase: connect (`NIGHTGATE_SUBMIT_CONNECT_TIMEOUT_MS`,
-20 s; nothing sent, retried once on a fresh client), request
+Submit timeouts per phase, for every submit (bound and unbound; each goes
+out on its own node client, never on the wallet's shared socket): connect
+(`NIGHTGATE_SUBMIT_CONNECT_TIMEOUT_MS`, 20 s; nothing sent, resent on a fresh
+client up to `NIGHTGATE_SUBMIT_TRANSPORT_RETRIES` times), request
 (`NIGHTGATE_SUBMIT_REQUEST_TIMEOUT_MS`, 30 s; ambiguous, `no-reply`), watch
 until InBlock (`NIGHTGATE_SUBMIT_WATCH_TIMEOUT_MS`, 75 s; ambiguous). Logged as
 `submit-phases <site> <identifier> ...`; a timed-out attempt keeps listening
 for `NIGHTGATE_SUBMIT_LATE_GRACE_MS` (5 min) and logs `submit-late
 <identifier>`. An ambiguous outcome is looked up on the indexer (90 s); if
 unknown, the job parks as `BROADCAST_UNCONFIRMED` until indexed or past its ttl.
+A node reject answers within the request phase, so a rejected bound submit
+frees the worker in seconds, not when the node closes the socket.
 
 **Contention.** Concurrent writes to the SAME contract state conflict at the
 ledger: each call's transcript applies only if the state it read still holds
@@ -503,6 +507,7 @@ Canonical JSON (RFC 8785 order: keys sorted by UTF-16 code units, so `"10"` prec
 - `fields`: `{ field, fieldKey, kind, value?, valueDigest?, salt, siblings, dirs }`; `salt` is the proof actions' `fieldSalt`.
 - `schemaId`: root over the slot descriptors `{ fieldKey, kind, scale }` (`schema`), anchored with the content root and proven by the comparison circuit. It covers only keys, kinds, scales and order: identically shaped field lists share one schemaId. For panels split across documents, put the segment in the field path (`seg02.locus03`).
 - `opening` (`{ saltSeed, slots[width] }`): store it with the document; losing the seed makes the root unprovable, leaking it makes leaf hashes dictionary-testable.
+- **Roots are bound to the artifact generation.** `contentRoot`, `schemaId`, membership set roots and every claim key derived from them use the circuit's `transientHash`, which is not guaranteed stable across compiler generations; `payloadHash` (blake2b outside the circuit) is. A vault compiled with a new compiler generation is a redeploy with an empty ledger: holders re-anchor from the stored `opening` and re-prove, older claims are not carried over. Verification of what is anchored today needs today's artifact, which ships with each release.
 
 **Rate limit:** 120/hour per client.
 

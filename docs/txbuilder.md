@@ -235,6 +235,13 @@ session); `npm run txbuilder:e2e` runs the real split.
 - **The TTL is real.** After `ttlMinutes` the node rejects the transaction.
 - **Artifact generations must match.** Fetch `zkConfigBaseUrl` from the
   sponsor that serves the vault you target.
+- **Anchored roots outlive the software only within one artifact
+  generation.** Content roots, schema ids, set roots and claim keys come from
+  the circuit's `transientHash` (not guaranteed stable across compiler
+  generations; `persistentHash` would cost about 2.7 MB of prover key per
+  hash instance and leave nothing wasm-provable). `payloadHash` is stable.
+  Keep the `opening` of every anchored document: a vault on a new generation
+  is a redeploy, and the holder re-anchors and re-proves from it.
 - **The sponsor decides what it pays for**: fail-closed shape check (allow-listed
   contract calls only, nothing else in the envelope, size cap
   `NIGHTGATE_SPONSOR_MAX_TX_BYTES`).

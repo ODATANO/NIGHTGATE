@@ -258,17 +258,56 @@ function makeFakeFacade() {
         }),
         waitForSyncedState: vi.fn(async () => undefined),
         revert: vi.fn(async () => undefined),
+        // The worker books a send with the facade's pending service and sends on its own client.
+        pendingTransactionsService: { addPendingTransaction: vi.fn(async () => undefined), clear: vi.fn(async () => undefined) },
         transferTransaction: vi.fn(async () => ({ type: 'UNPROVEN_TRANSACTION', transaction: { unproven: true } })),
         signRecipe: vi.fn(async (r: any) => r),
-        // identifiers(): every submit announces the last one before broadcasting
-        finalizeRecipe: vi.fn(async () => ({ finalized: true, identifiers: () => ['tx-id-fixture'] })),
-        submitTransaction: vi.fn(async () => 'tx-hash-fixture'),
+        // identifiers(): every submit announces the last one before broadcasting; it is the txId
+        finalizeRecipe: vi.fn(async () => ({ finalized: true, identifiers: () => ['tx-hash-fixture'] })),
+        // Never used by the worker (the facade's submit hangs until its socket closes); asserted absent.
+        submitTransaction: vi.fn(async () => 'never'),
         calculateTransactionFee: vi.fn(async () => 42n),
         registerNightUtxosForDustGeneration: vi.fn(async () => ({ type: 'RECIPE', transaction: { reg: true } })),
         deregisterFromDustGeneration: vi.fn(async () => ({ transaction: { dereg: true } })),
         balanceUnprovenTransaction: vi.fn(async () => ({ balanced: true }))
     };
     return facade;
+}
+
+/** Every dedicated submit client, pooled and future, answers with `impl` until the returned restore runs. */
+function withSubmit(impl: (tx: any, status: string, ctx: any) => Promise<any>): () => void {
+    for (const svc of submitServices) svc.submitTransaction.mockImplementation(impl);
+    makeDefaultSubmissionService.mockImplementation((_cfg: any) => {
+        const svc = { submitTransaction: vi.fn(impl), close: vi.fn(async () => undefined) };
+        submitServices.push(svc);
+        return svc;
+    });
+    return () => {
+        makeDefaultSubmissionService.mockImplementation((_cfg: any) => {
+            const svc = { submitTransaction: vi.fn(async (_tx: any, _status: string) => undefined), close: vi.fn(async () => undefined) };
+            submitServices.push(svc);
+            return svc;
+        });
+        for (const svc of submitServices) { svc.submitTransaction.mockReset(); svc.submitTransaction.mockImplementation(async () => undefined); }
+    };
+}
+
+/** Sends issued to the dedicated clients so far. */
+function submitCount(): number {
+    return submitServices.reduce((n, svc) => n + svc.submitTransaction.mock.calls.length, 0);
+}
+
+/** Arguments of the most recent send across all clients. */
+function lastSubmitArgs(): any[] {
+    let bestOrder = -1;
+    let bestArgs: any[] = [];
+    for (const svc of submitServices) {
+        for (const [i, args] of svc.submitTransaction.mock.calls.entries()) {
+            const order = svc.submitTransaction.mock.invocationCallOrder[i];
+            if (order > bestOrder) { bestOrder = order; bestArgs = args; }
+        }
+    }
+    return bestArgs;
 }
 
 /** Init a fresh session and hand back its fake facade for stubbing. */
@@ -334,6 +373,7 @@ const INIT_ARGS = {
 };
 
 let workerExports: any;
+let classifySubmitFailure: (err: unknown) => { code: string; ledgerCode?: string; retryable: boolean };
 
 beforeAll(async () => {
     // Several suites below advance fake time in 30 s steps for the save
@@ -349,13 +389,17 @@ beforeAll(async () => {
         return makeFakeFacade();
     });
     workerExports = await import('../../srv/midnight/wallet-worker.js');
+    ({ classifySubmitFailure } = await import('../../srv/midnight/submit-error-classification.js'));
     // The pool's real client is the phased submit service over the SDK node
     // client (phased-submit.test.ts covers its phases); this suite injects the
     // plain `{ submitTransaction, close }` fakes below the phases.
     workerExports.__submitClientPoolForTests.setServiceFactory((relayURL: URL) => makeDefaultSubmissionService({ relayURL }));
+    // The settle window after a client's creation and use is a socket-lag guard, not behaviour under test.
+    workerExports.__submitClientPoolForTests.setSettleMs(0);
 });
 
 beforeEach(() => {
+    workerExports.__submitClientPoolForTests.reset();
     fakeParentPort.postMessage.mockClear();
     facadeState.current = { dust: { progress: { appliedIndex: '0', isConnected: false } } };
     wsTip.maxId = '100';
@@ -863,15 +907,15 @@ describe('buildWorkerWalletProvider', () => {
     const DUST_EMPTY = { spends: [], registrations: [], ctime: new Date() };
 
     function makeEntry(finalizedDust: any) {
-        const finalized = { intents: new Map<any, any>([[0, { dustActions: finalizedDust }]]) };
+        const finalized = { intents: new Map<any, any>([[0, { dustActions: finalizedDust }]]), identifiers: () => ['0xsubmitted'] };
         const facade = makeFakeFacade();
         facade.balanceUnboundTransaction = vi.fn(async () => ({ recipe: true }));
         facade.finalizeRecipe = vi.fn(async () => finalized);
-        facade.submitTransaction = vi.fn(async () => ({ txId: '0xsubmitted' }));
         return {
             entry: {
                 sessionId: 'session-provider-test-aaaaaa',
                 facade,
+                walletConfiguration: { relayURL: new URL('ws://relay.test') },
                 sdkVersion: 'test',
                 zswapKeys: { coinPublicKey: 'cpk', encryptionPublicKey: 'epk' },
                 dustKey: { dust: true },
@@ -900,7 +944,7 @@ describe('buildWorkerWalletProvider', () => {
         expect(provider.getEncryptionPublicKey()).toBe('epk');
     });
 
-    it('submitTx announces the identifier on the reply port and sends only after the ack (bound channel)', async () => {
+    it('submitTx announces the identifier on the reply port, books the spends, then sends on a dedicated client (bound channel)', async () => {
         const { entry, facade, finalized } = makeEntry(DUST_OK);
         (finalized as any).identifiers = () => ['tx-bound-1'];
         const { port1, port2 } = new MessageChannel();
@@ -912,14 +956,24 @@ describe('buildWorkerWalletProvider', () => {
                 port2.postMessage({ kind: 'submit-intent-ack', txHash: m.txHash, ok: true });
             }
         });
-        facade.submitTransaction = vi.fn(async () => { order.push('send'); return 'tx-bound-1'; });
+        facade.pendingTransactionsService.addPendingTransaction = vi.fn(async () => { order.push('pend'); });
+        const restoreSubmit = withSubmit(async (tx: any, status: string, ctx: any) => {
+            order.push('send');
+            expect(tx).toBe(finalized);
+            expect(status).toBe(workerExports.sponsorSubmitWaitStage());
+            expect(ctx).toMatchObject({ identifier: 'tx-bound-1', correlation: 'submit' });
+        });
         try {
             const provider = workerExports.buildWorkerWalletProvider(entry, { replyPort: port1, contractAddress: 'c'.repeat(64), circuits: ['increment'] });
-            await provider.submitTx(finalized);
+            await expect(provider.submitTx(finalized)).resolves.toBe('tx-bound-1');
             expect(seen).toHaveLength(1);
             expect(seen[0]).toMatchObject({ txHash: 'tx-bound-1', contractAddress: 'c'.repeat(64), circuits: ['increment'] });
-            expect(order).toEqual(['intent', 'send']);
+            expect(order).toEqual(['intent', 'pend', 'send']);
+            // The facade's own submit is never used: it would hold the worker until the node socket closes.
+            expect(facade.submitTransaction).not.toHaveBeenCalled();
+            expect(facade.revert).not.toHaveBeenCalled();
         } finally {
+            restoreSubmit();
             port1.close(); port2.close();
         }
     });
@@ -934,10 +988,12 @@ describe('buildWorkerWalletProvider', () => {
         port2.on('message', (m: any) => {
             if (m?.kind === 'submit-intent') port2.postMessage({ kind: 'submit-intent-ack', txHash: m.txHash, ok: false, error: 'db down: cannot record txHash' });
         });
+        const submitsBefore = submitCount();
         try {
             const provider = workerExports.buildWorkerWalletProvider(entry, { replyPort: port1, note: 'transfer' });
             await expect(provider.submitTx(finalized)).rejects.toThrow(/submit-intent rejected.*cannot record txHash/);
-            expect(facade.submitTransaction).not.toHaveBeenCalled();
+            expect(submitCount()).toBe(submitsBefore);
+            expect(facade.pendingTransactionsService.addPendingTransaction).not.toHaveBeenCalled();
             expect(facade.revert).toHaveBeenCalledWith(finalized);
             expect(dustRestore).toHaveBeenCalledWith('du-blob');
         } finally {
@@ -946,10 +1002,11 @@ describe('buildWorkerWalletProvider', () => {
     });
 
     it('without a reply port submitTx sends directly (no handshake to wait for)', async () => {
-        const { entry, facade, finalized } = makeEntry(DUST_OK);
+        const { entry, finalized } = makeEntry(DUST_OK);
         const provider = workerExports.buildWorkerWalletProvider(entry);
-        await provider.submitTx(finalized);
-        expect(facade.submitTransaction).toHaveBeenCalledTimes(1);
+        const submitsBefore = submitCount();
+        await expect(provider.submitTx(finalized)).resolves.toBe('0xsubmitted');
+        expect(submitCount() - submitsBefore).toBe(1);
     });
 
     it('balanceTx waits for genuine sync, balances with the session keys and returns the finalized tx', async () => {
@@ -1013,13 +1070,13 @@ describe('buildWorkerWalletProvider', () => {
     });
 
     it('submitTx dumps the dust sections, warns on empty DustActions and still submits', async () => {
-        const { entry, facade } = makeEntry(DUST_OK);
+        const { entry } = makeEntry(DUST_OK);
         const provider = workerExports.buildWorkerWalletProvider(entry);
-        const emptyTx = { intents: new Map<any, any>([[0, { dustActions: DUST_EMPTY }]]) };
+        const emptyTx = { intents: new Map<any, any>([[0, { dustActions: DUST_EMPTY }]]), identifiers: () => ['0xempty'] };
 
         const result = await provider.submitTx(emptyTx);
-        expect(result).toEqual({ txId: '0xsubmitted' });
-        expect(facade.submitTransaction).toHaveBeenCalledWith(emptyTx);
+        expect(result).toBe('0xempty');
+        expect(lastSubmitArgs()[0]).toBe(emptyTx);
 
         const warns = fakeParentPort.postMessage.mock.calls
             .map(c => c[0])
@@ -1046,13 +1103,14 @@ describe('buildWorkerWalletProvider', () => {
     it('submitTx swaps in a dust wallet restored from the pre-build snapshot on a pre-mempool reject', async () => {
         withSyncedIndexer();
         const undoAck = autoAckDustSaves();
+        let restoreSubmit: () => void = () => undefined;
         try {
             const { entry, facade, finalized } = makeEntry(DUST_OK);
             const oldDust = facade.dust;
             oldDust.stop = vi.fn(async () => undefined);
             const freshDust = { start: vi.fn(async () => undefined), stop: vi.fn() };
             dustRestore.mockReturnValueOnce(freshDust as any);
-            facade.submitTransaction = vi.fn(async () => { throw new Error('1014: Priority is too low'); });
+            restoreSubmit = withSubmit(async () => { throw new Error('1014: Priority is too low'); });
 
             const provider = workerExports.buildWorkerWalletProvider(entry);
             await provider.balanceTx({});
@@ -1073,7 +1131,10 @@ describe('buildWorkerWalletProvider', () => {
             expect(restorePush.blobs).toEqual({ dust: 'BLOB-DU' });
             expect((entry as any).dustEpoch).toBe(1);
             expect((entry as any).dustRestoresPersisted).toBe(1);
+            // The facade's rule: a failed submit frees the booked spends (the dust note is the snapshot's job).
+            expect(facade.revert).toHaveBeenCalledWith(finalized);
         } finally {
+            restoreSubmit();
             undoAck();
             vi.unstubAllGlobals();
         }
@@ -1082,12 +1143,13 @@ describe('buildWorkerWalletProvider', () => {
     it('a restore whose persist is never acked completes (in-memory protection) but does NOT count as durable', async () => {
         withSyncedIndexer();
         process.env.NIGHTGATE_RESTORE_SAVE_ACK_TIMEOUT_MS = '50';
+        let restoreSubmit: () => void = () => undefined;
         try {
             const { entry, facade, finalized } = makeEntry(DUST_OK);
             facade.dust.stop = vi.fn(async () => undefined);
             const freshDust = { start: vi.fn(async () => undefined), stop: vi.fn() };
             dustRestore.mockReturnValueOnce(freshDust as any);
-            facade.submitTransaction = vi.fn(async () => { throw new Error('1014: Priority is too low'); });
+            restoreSubmit = withSubmit(async () => { throw new Error('1014: Priority is too low'); });
 
             const provider = workerExports.buildWorkerWalletProvider(entry);
             await provider.balanceTx({});
@@ -1102,6 +1164,7 @@ describe('buildWorkerWalletProvider', () => {
                 .filter((m: any) => m.kind === 'log' && m.level === 'warn' && /persist NOT confirmed/.test(m.message));
             expect(warns.length).toBe(1);
         } finally {
+            restoreSubmit();
             process.env.NIGHTGATE_RESTORE_SAVE_ACK_TIMEOUT_MS = '50'; // the file-wide bound (evict)
             vi.unstubAllGlobals();
         }
@@ -1109,12 +1172,13 @@ describe('buildWorkerWalletProvider', () => {
 
     it('a DELAYED persist ack is awaited: the durable counter moves only once the ack lands', async () => {
         withSyncedIndexer();
+        let restoreSubmit: () => void = () => undefined;
         try {
             const { entry, facade, finalized } = makeEntry(DUST_OK);
             facade.dust.stop = vi.fn(async () => undefined);
             const freshDust = { start: vi.fn(async () => undefined), stop: vi.fn() };
             dustRestore.mockReturnValueOnce(freshDust as any);
-            facade.submitTransaction = vi.fn(async () => { throw new Error('1014: Priority is too low'); });
+            restoreSubmit = withSubmit(async () => { throw new Error('1014: Priority is too low'); });
 
             const provider = workerExports.buildWorkerWalletProvider(entry);
             await provider.balanceTx({});
@@ -1131,6 +1195,7 @@ describe('buildWorkerWalletProvider', () => {
             await expect(pendingSubmit).rejects.toThrow('1014');
             expect((entry as any).dustRestoresPersisted).toBe(1);
         } finally {
+            restoreSubmit();
             vi.unstubAllGlobals();
         }
     });
@@ -1141,7 +1206,7 @@ describe('buildWorkerWalletProvider', () => {
             const { entry, facade, finalized } = makeEntry(DUST_OK);
             const oldDust = facade.dust;
             dustRestore.mockClear();
-            facade.submitTransaction = vi.fn(async () => { throw new Error('TxFailedError: status was not success'); });
+            const restoreSubmit = withSubmit(async () => { throw new Error('TxFailedError: status was not success'); });
 
             const provider = workerExports.buildWorkerWalletProvider(entry);
             await provider.balanceTx({});
@@ -1150,6 +1215,7 @@ describe('buildWorkerWalletProvider', () => {
             expect(dustRestore).not.toHaveBeenCalled();
             expect(facade.dust).toBe(oldDust);
             expect((entry as any).preSubmitDustSnapshot).toBeUndefined();
+            restoreSubmit();
         } finally {
             vi.unstubAllGlobals();
         }
@@ -1170,8 +1236,13 @@ describe('buildWorkerWalletProvider', () => {
     });
 
     // ---- same-transaction resend on a transport failure --------------------
+    // The dedicated client's phases: a connect failure and a send that died are
+    // resent (same bytes, indexer probed first); a request or watch timeout is
+    // looked up on the indexer; a node reject is final.
 
     const TRANSPORT_ERR = 'disconnected from wss://rpc.preprod.midnight.network/: 1000:: Normal Closure';
+    const RESET_ERR = 'read ECONNRESET';
+    const phaseError = (phase: string, message: string) => Object.assign(new Error(message), { name: 'SubmitPhaseError', phase });
 
     function withIndexer(landed: boolean) {
         vi.stubGlobal('fetch', vi.fn(async (_url: any, init: any) => ({
@@ -1195,46 +1266,232 @@ describe('buildWorkerWalletProvider', () => {
         return fakeParentPort.postMessage.mock.calls.map(c => c[0])
             .filter((m: any) => m.kind === 'log' && re.test(m.message)).map((m: any) => m.message);
     }
+    /** A send that fails `failures` times with the given errors, then lands. */
+    function sendFailingWith(...errors: Error[]) {
+        let n = 0;
+        return withSubmit(async () => {
+            const err = errors[n++];
+            if (err) throw err;
+        });
+    }
 
     it('submitTx resends the SAME transaction after a transport failure instead of failing the job', async () => {
         withIndexer(false);
         const restore = withFastResend();
+        const restoreSubmit = sendFailingWith(new Error(RESET_ERR));
         try {
             const { entry, facade, finalized } = makeEntry(DUST_OK);
             (finalized as any).identifiers = () => ['0xfirst', '0xtxid'];
-            facade.submitTransaction = vi.fn()
-                .mockRejectedValueOnce(new Error(TRANSPORT_ERR))
-                .mockResolvedValueOnce('0xtxid');
             const provider = workerExports.buildWorkerWalletProvider(entry);
             await provider.balanceTx({});
+            const submitsBefore = submitCount();
             await expect(provider.submitTx(finalized)).resolves.toBe('0xtxid');
-            expect(facade.submitTransaction).toHaveBeenCalledTimes(2);
-            expect(facade.submitTransaction.mock.calls[1][0]).toBe(finalized);
+            expect(submitCount() - submitsBefore).toBe(2);
+            expect(lastSubmitArgs()[0]).toBe(finalized);
             expect((entry as any).preSubmitDustSnapshot).toBeUndefined();
             expect(logsMatching(/resending the SAME transaction \(no rebuild, no re-proving\)/).length).toBe(1);
+            // a landed send keeps its booked spends
+            expect(facade.revert).not.toHaveBeenCalled();
         } finally {
-            restore(); vi.unstubAllGlobals();
+            restoreSubmit(); restore(); vi.unstubAllGlobals();
+        }
+    });
+
+    it("a send that dies on the client's own closing socket is retried once without a resend log", async () => {
+        withIndexer(false);
+        const restore = withFastResend();
+        const restoreSubmit = sendFailingWith(new Error(TRANSPORT_ERR));
+        try {
+            const { entry, finalized } = makeEntry(DUST_OK);
+            (finalized as any).identifiers = () => ['0xtxid'];
+            const provider = workerExports.buildWorkerWalletProvider(entry);
+            await provider.balanceTx({});
+            const submitsBefore = submitCount();
+            await expect(provider.submitTx(finalized)).resolves.toBe('0xtxid');
+            expect(submitCount() - submitsBefore).toBe(2);
+            expect(logsMatching(/died on the client's own closing socket/).length).toBe(1);
+        } finally {
+            restoreSubmit(); restore(); vi.unstubAllGlobals();
+        }
+    });
+
+    it('a connect-phase failure (nothing sent) is resent up to NIGHTGATE_SUBMIT_TRANSPORT_RETRIES times', async () => {
+        withIndexer(false);
+        const restore = withFastResend();
+        process.env.NIGHTGATE_SUBMIT_TRANSPORT_RETRIES = '2';
+        const restoreSubmit = sendFailingWith(phaseError('connect', 'submit connect phase: no connection'), phaseError('connect', 'submit connect phase: no connection'));
+        try {
+            const { entry, finalized } = makeEntry(DUST_OK);
+            (finalized as any).identifiers = () => ['0xtxid'];
+            const provider = workerExports.buildWorkerWalletProvider(entry);
+            await provider.balanceTx({});
+            const submitsBefore = submitCount();
+            await expect(provider.submitTx(finalized)).resolves.toBe('0xtxid');
+            expect(submitCount() - submitsBefore).toBe(3);
+            expect(logsMatching(/connect phase failed, nothing sent/).length).toBe(2);
+        } finally {
+            restoreSubmit(); restore(); vi.unstubAllGlobals();
+        }
+    });
+
+    it('connect failures that exhaust the retries restore the dust snapshot: nothing was ever sent', async () => {
+        withIndexer(false);
+        const restore = withFastResend();
+        process.env.NIGHTGATE_SUBMIT_TRANSPORT_RETRIES = '1';
+        dustRestore.mockClear();
+        const restoreSubmit = withSubmit(async () => { throw phaseError('connect', 'submit connect phase: no connection'); });
+        const undoAck = autoAckDustSaves();
+        try {
+            const { entry, facade, finalized } = makeEntry(DUST_OK);
+            (finalized as any).identifiers = () => ['0xtxid'];
+            facade.dust.stop = vi.fn(async () => undefined);
+            const freshDust = { start: vi.fn(async () => undefined), stop: vi.fn() };
+            dustRestore.mockReturnValueOnce(freshDust as any);
+            const provider = workerExports.buildWorkerWalletProvider(entry);
+            await provider.balanceTx({});
+            const submitsBefore = submitCount();
+            await expect(provider.submitTx(finalized)).rejects.toThrow(/connect phase/);
+            expect(submitCount() - submitsBefore).toBe(2);
+            expect(dustRestore).toHaveBeenCalledWith('BLOB-DU');
+            expect(facade.dust).toBe(freshDust);
+            expect(facade.revert).toHaveBeenCalledWith(finalized);
+        } finally {
+            undoAck(); restoreSubmit(); restore(); vi.unstubAllGlobals();
+        }
+    });
+
+    it('connect failures after a send that died are AMBIGUOUS, not "not sent": the earlier bytes may land', async () => {
+        withIndexer(false);
+        const restore = withFastResend();
+        process.env.NIGHTGATE_SUBMIT_TRANSPORT_RETRIES = '1';
+        dustRestore.mockClear();
+        const restoreSubmit = sendFailingWith(new Error(RESET_ERR), phaseError('connect', 'submit connect phase: no connection'), phaseError('connect', 'submit connect phase: no connection'));
+        try {
+            const { entry, facade, finalized } = makeEntry(DUST_OK);
+            (finalized as any).identifiers = () => ['0xtxid'];
+            const oldDust = facade.dust;
+            const provider = workerExports.buildWorkerWalletProvider(entry);
+            await provider.balanceTx({});
+            const outcome = provider.submitTx(finalized);
+            await expect(outcome).rejects.toMatchObject({ name: 'SubmitOutcomeUnknownError', identifier: '0xtxid' });
+            await expect(outcome).rejects.toThrow(/earlier send of 0xtxid may have reached the node/);
+            const err = await outcome.catch((e: unknown) => e);
+            expect(classifySubmitFailure(err)).toEqual({ code: 'ambiguous', ledgerCode: 'unresolved-send', retryable: false });
+            // the dust note may be spent on the node: no restore, snapshot disarmed
+            expect(dustRestore).not.toHaveBeenCalled();
+            expect(facade.dust).toBe(oldDust);
+            expect((entry as any).preSubmitDustSnapshot).toBeUndefined();
+        } finally {
+            restoreSubmit(); restore(); vi.unstubAllGlobals();
+        }
+    });
+
+    it('a resend refused with a dust-race code after an unresolved send is AMBIGUOUS: no rebuild, no dust restore', async () => {
+        withIndexer(false);
+        const restore = withFastResend();
+        dustRestore.mockClear();
+        const restoreSubmit = sendFailingWith(new Error(RESET_ERR), new Error('1010: Invalid Transaction: Custom error: 196'));
+        try {
+            const { entry, facade, finalized } = makeEntry(DUST_OK);
+            (finalized as any).identifiers = () => ['0xtxid'];
+            const oldDust = facade.dust;
+            const provider = workerExports.buildWorkerWalletProvider(entry);
+            await provider.balanceTx({});
+            const submitsBefore = submitCount();
+            const outcome = provider.submitTx(finalized);
+            await expect(outcome).rejects.toMatchObject({ name: 'SubmitOutcomeUnknownError' });
+            const err = await outcome.catch((e: unknown) => e);
+            expect(classifySubmitFailure(err).code).toBe('ambiguous');
+            expect(submitCount() - submitsBefore).toBe(2);
+            expect(dustRestore).not.toHaveBeenCalled();
+            expect(facade.dust).toBe(oldDust);
+        } finally {
+            restoreSubmit(); restore(); vi.unstubAllGlobals();
+        }
+    });
+
+    it('transport failures that exhaust the resends are AMBIGUOUS: every one of them may have reached the node', async () => {
+        withIndexer(false);
+        const restore = withFastResend();
+        process.env.NIGHTGATE_SUBMIT_TRANSPORT_RETRIES = '1';
+        const restoreSubmit = withSubmit(async () => { throw new Error(RESET_ERR); });
+        try {
+            const { entry, finalized } = makeEntry(DUST_OK);
+            (finalized as any).identifiers = () => ['0xtxid'];
+            const provider = workerExports.buildWorkerWalletProvider(entry);
+            await provider.balanceTx({});
+            const err = await provider.submitTx(finalized).catch((e: unknown) => e);
+            expect((err as Error).name).toBe('SubmitOutcomeUnknownError');
+            expect(classifySubmitFailure(err).code).toBe('ambiguous');
+        } finally {
+            restoreSubmit(); restore(); vi.unstubAllGlobals();
+        }
+    });
+
+    it('the ledger result is checked after Finalized too: in a block but not applied is a TxFailedError', async () => {
+        const restore = withFastResend();
+        process.env.NIGHTGATE_SPONSOR_WAIT = 'finalized';
+        process.env.NIGHTGATE_SPONSOR_INDEXER_VISIBLE_MS = '5000';
+        vi.stubGlobal('fetch', vi.fn(async (_url: any, init: any) => ({
+            json: async () => String(init?.body ?? '').includes('transactions(')
+                ? { data: { transactions: [{ block: { height: '13' }, transactionResult: { status: 'PARTIAL_SUCCESS', segments: [{ id: 2, success: false }] } }] } }
+                : { data: { block: { height: '500', timestamp: Date.now() } } }
+        })));
+        facadeState.current = { dust: { progress: { appliedIndex: '100', isConnected: true } } };
+        wsTip.maxId = '100';
+        const restoreSubmit = withSubmit(async (_tx: any, status: string) => { expect(status).toBe('Finalized'); });
+        try {
+            const { entry, finalized } = makeEntry(DUST_OK);
+            (finalized as any).identifiers = () => ['0xtxid'];
+            const provider = workerExports.buildWorkerWalletProvider(entry);
+            await provider.balanceTx({});
+            const outcome = provider.submitTx(finalized);
+            await expect(outcome).rejects.toThrow(/TxFailedError: transaction 0xtxid is in block 13 but its call did NOT apply \(ledger result PARTIAL_SUCCESS, failed segment 2\)/);
+            await expect(outcome).rejects.toMatchObject({ blockHeight: 13 });
+        } finally {
+            delete process.env.NIGHTGATE_SPONSOR_WAIT;
+            process.env.NIGHTGATE_SPONSOR_INDEXER_VISIBLE_MS = '0';
+            restoreSubmit(); restore(); vi.unstubAllGlobals();
         }
     });
 
     it('a transaction the indexer already has after a lost reply is reported as submitted, not resent', async () => {
         withIndexer(true);
         const restore = withFastResend();
+        const restoreSubmit = withSubmit(async () => { throw new Error(RESET_ERR); });
         try {
-            const { entry, facade, finalized } = makeEntry(DUST_OK);
+            const { entry, finalized } = makeEntry(DUST_OK);
             (finalized as any).identifiers = () => ['0xtxid'];
-            facade.submitTransaction = vi.fn().mockRejectedValue(new Error(TRANSPORT_ERR));
             const provider = workerExports.buildWorkerWalletProvider(entry);
             await provider.balanceTx({});
+            const submitsBefore = submitCount();
             await expect(provider.submitTx(finalized)).resolves.toBe('0xtxid');
-            expect(facade.submitTransaction).toHaveBeenCalledTimes(1);
+            expect(submitCount() - submitsBefore).toBe(1);
             expect(logsMatching(/is in block 7 .*although the submit reply was lost/).length).toBe(1);
         } finally {
-            restore(); vi.unstubAllGlobals();
+            restoreSubmit(); restore(); vi.unstubAllGlobals();
         }
     });
 
-    it('a landed transaction whose call did NOT apply is a TxFailed, never a success', async () => {
+    it('a request-phase timeout (sent, no status) is resolved by the indexer, never resent', async () => {
+        withIndexer(true);
+        const restore = withFastResend();
+        const restoreSubmit = withSubmit(async () => { throw phaseError('request', 'submit request phase: no status from the node within 30000ms'); });
+        try {
+            const { entry, finalized } = makeEntry(DUST_OK);
+            (finalized as any).identifiers = () => ['0xtxid'];
+            const provider = workerExports.buildWorkerWalletProvider(entry);
+            await provider.balanceTx({});
+            const submitsBefore = submitCount();
+            await expect(provider.submitTx(finalized)).resolves.toBe('0xtxid');
+            expect(submitCount() - submitsBefore).toBe(1);
+            expect(logsMatching(/is in block 7 .*although the watch saw no/).length).toBe(1);
+        } finally {
+            restoreSubmit(); restore(); vi.unstubAllGlobals();
+        }
+    });
+
+    it('a landed transaction whose call did NOT apply is a TxFailed with the block height, never a success', async () => {
         const restore = withFastResend();
         vi.stubGlobal('fetch', vi.fn(async (_url: any, init: any) => ({
             json: async () => String(init?.body ?? '').includes('transactions(')
@@ -1244,35 +1501,41 @@ describe('buildWorkerWalletProvider', () => {
         facadeState.current = { dust: { progress: { appliedIndex: '100', isConnected: true } } };
         wsTip.maxId = '100';
         dustRestore.mockClear();
+        const restoreSubmit = withSubmit(async () => { throw new Error(RESET_ERR); });
         try {
             const { entry, facade, finalized } = makeEntry(DUST_OK);
             (finalized as any).identifiers = () => ['0xtxid'];
-            facade.submitTransaction = vi.fn().mockRejectedValue(new Error(TRANSPORT_ERR));
             const provider = workerExports.buildWorkerWalletProvider(entry);
             await provider.balanceTx({});
-            await expect(provider.submitTx(finalized)).rejects.toThrow(/TxFailedError: transaction 0xtxid is in block 11 but did not apply \(ledger result PARTIAL_SUCCESS, failed segment 1\)/);
-            expect(facade.submitTransaction).toHaveBeenCalledTimes(1);
-            // on-chain failure spent the fee: no dust restore
+            const submitsBefore = submitCount();
+            const outcome = provider.submitTx(finalized);
+            await expect(outcome).rejects.toThrow(/TxFailedError: transaction 0xtxid is in block 11 but its call did NOT apply \(ledger result PARTIAL_SUCCESS, failed segment 1\)/);
+            await expect(outcome).rejects.toMatchObject({ name: 'TxFailedError', blockHeight: 11 });
+            expect(submitCount() - submitsBefore).toBe(1);
+            // on-chain failure spent the fee: no dust restore; the booked spends are freed as the facade would
             expect(dustRestore).not.toHaveBeenCalled();
             expect((entry as any).preSubmitDustSnapshot).toBeUndefined();
+            expect(facade.revert).toHaveBeenCalledWith(finalized);
         } finally {
-            restore(); vi.unstubAllGlobals();
+            restoreSubmit(); restore(); vi.unstubAllGlobals();
         }
     });
 
-    it('a timed-out or unanswered submit is ambiguous: never resent, never rebuilt (the send may have landed)', async () => {
+    it('an unanswered send below the phases is ambiguous: never resent, never rebuilt (it may have landed)', async () => {
         withIndexer(false);
         const restore = withFastResend();
         try {
             for (const msg of ['TimeoutError: submitAndWatch timed out', 'no reply from node within 60000ms', 'request timeout']) {
-                const { entry, facade, finalized } = makeEntry(DUST_OK);
+                const restoreSubmit = withSubmit(async () => { throw new Error(msg); });
+                const { entry, finalized } = makeEntry(DUST_OK);
                 (finalized as any).identifiers = () => ['0xtxid'];
-                facade.submitTransaction = vi.fn().mockRejectedValueOnce(new Error(msg)).mockResolvedValueOnce('0xtxid');
                 const provider = workerExports.buildWorkerWalletProvider(entry);
                 await provider.balanceTx({});
+                const submitsBefore = submitCount();
                 await expect(provider.submitTx(finalized)).rejects.toThrow(msg);
                 // one send only: a resend of a landed transaction is a 1013 duplicate
-                expect(facade.submitTransaction).toHaveBeenCalledTimes(1);
+                expect(submitCount() - submitsBefore).toBe(1);
+                restoreSubmit();
             }
         } finally {
             restore(); vi.unstubAllGlobals();
@@ -1282,8 +1545,9 @@ describe('buildWorkerWalletProvider', () => {
     it('a resend refused as already imported resolves once the indexer has the transaction', async () => {
         withIndexer(false);
         const restore = withFastResend();
+        const restoreSubmit = sendFailingWith(new Error(RESET_ERR), new Error('1013: Transaction Already Imported'));
         try {
-            const { entry, facade, finalized } = makeEntry(DUST_OK);
+            const { entry, finalized } = makeEntry(DUST_OK);
             (finalized as any).identifiers = () => ['0xtxid'];
             let lookups = 0;
             (globalThis.fetch as any).mockImplementation(async (_url: any, init: any) => ({
@@ -1291,15 +1555,14 @@ describe('buildWorkerWalletProvider', () => {
                     ? { data: { transactions: ++lookups >= 2 ? [{ block: { height: '12' }, transactionResult: { status: 'SUCCESS', segments: [] } }] : [] } }
                     : { data: { block: { height: '500', timestamp: Date.now() } } }
             }));
-            facade.submitTransaction = vi.fn()
-                .mockRejectedValueOnce(new Error('read ECONNRESET'))
-                .mockRejectedValueOnce(new Error('1013: Transaction Already Imported'));
             const provider = workerExports.buildWorkerWalletProvider(entry);
             await provider.balanceTx({});
+            const submitsBefore = submitCount();
             await expect(provider.submitTx(finalized)).resolves.toBe('0xtxid');
-            expect(facade.submitTransaction).toHaveBeenCalledTimes(2);
+            expect(submitCount() - submitsBefore).toBe(2);
+            expect(logsMatching(/is in block 12 .*although the resend was refused/).length).toBe(1);
         } finally {
-            restore(); vi.unstubAllGlobals();
+            restoreSubmit(); restore(); vi.unstubAllGlobals();
         }
     });
 
@@ -1314,21 +1577,20 @@ describe('buildWorkerWalletProvider', () => {
         facadeState.current = { dust: { progress: { appliedIndex: '100', isConnected: true } } };
         wsTip.maxId = '100';
         dustRestore.mockClear();
+        const restoreSubmit = sendFailingWith(new Error(RESET_ERR), new Error('1010: Invalid Transaction: Custom error: 196'));
         try {
-            const { entry, facade, finalized } = makeEntry(DUST_OK);
+            const { entry, finalized } = makeEntry(DUST_OK);
             (finalized as any).identifiers = () => ['0xtxid'];
-            facade.submitTransaction = vi.fn()
-                .mockRejectedValueOnce(new Error(TRANSPORT_ERR))
-                .mockRejectedValueOnce(new Error('1010: Invalid Transaction: Custom error: 196'));
             const provider = workerExports.buildWorkerWalletProvider(entry);
             await provider.balanceTx({});
+            const submitsBefore = submitCount();
             await expect(provider.submitTx(finalized)).resolves.toBe('0xtxid');
-            expect(facade.submitTransaction).toHaveBeenCalledTimes(2);
+            expect(submitCount() - submitsBefore).toBe(2);
             // the earlier send landed: no dust restore, the snapshot is simply disarmed
             expect(dustRestore).not.toHaveBeenCalled();
             expect((entry as any).preSubmitDustSnapshot).toBeUndefined();
         } finally {
-            restore(); vi.unstubAllGlobals();
+            restoreSubmit(); restore(); vi.unstubAllGlobals();
         }
     });
 
@@ -1336,21 +1598,24 @@ describe('buildWorkerWalletProvider', () => {
         withIndexer(false);
         const restore = withFastResend();
         process.env.NIGHTGATE_SUBMIT_TRANSPORT_RETRIES = '1';
+        let restoreSubmit = withSubmit(async () => { throw new Error(RESET_ERR); });
         try {
-            const { entry, facade, finalized } = makeEntry(DUST_OK);
+            const { entry, finalized } = makeEntry(DUST_OK);
             (finalized as any).identifiers = () => ['0xtxid'];
-            facade.submitTransaction = vi.fn().mockRejectedValue(new Error(TRANSPORT_ERR));
             const provider = workerExports.buildWorkerWalletProvider(entry);
             await provider.balanceTx({});
-            await expect(provider.submitTx(finalized)).rejects.toThrow(/Normal Closure/);
-            expect(facade.submitTransaction).toHaveBeenCalledTimes(2);
+            let submitsBefore = submitCount();
+            await expect(provider.submitTx(finalized)).rejects.toThrow(/may have reached the node.*ECONNRESET/);
+            expect(submitCount() - submitsBefore).toBe(2);
 
-            facade.submitTransaction = vi.fn().mockRejectedValue(new Error('1010: Invalid Transaction: Custom error: 170'));
+            restoreSubmit();
+            restoreSubmit = withSubmit(async () => { throw new Error('1010: Invalid Transaction: Custom error: 170'); });
             await provider.balanceTx({});
+            submitsBefore = submitCount();
             await expect(provider.submitTx(finalized)).rejects.toThrow(/170/);
-            expect(facade.submitTransaction).toHaveBeenCalledTimes(1);
+            expect(submitCount() - submitsBefore).toBe(1);
         } finally {
-            restore(); vi.unstubAllGlobals();
+            restoreSubmit(); restore(); vi.unstubAllGlobals();
         }
     });
 
@@ -1551,6 +1816,42 @@ describe('progress watch tick', () => {
         expect(last.snapshot).toMatchObject({ caughtUp: false, indexerFresh: false });
         await rpc('evict', { sessionId: SESSION });
     });
+
+    it('keeps the last stream tip through a failed read inside the grace window, and drops it after', async () => {
+        const SESSION = 'session-watch-grace-nnnnnnnn';
+        await initSession(SESSION);
+        const entry = workerExports.facades.get(SESSION);
+        const lastPushed = () => fakeParentPort.postMessage.mock.calls.map(c => c[0]).filter((m: any) => m.kind === 'sync-progress' && m.sessionId === SESSION).at(-1).snapshot;
+        workerExports.streamTipCache.clear();
+        wsTip.maxId = '100';
+        facadeState.current = { dust: { progress: { appliedIndex: '100', isConnected: true } } };
+        stubIndexerTip(Date.now());
+        try {
+            await workerExports.progressWatchTick(SESSION, entry, Date.now() + 120_000);
+            expect(lastPushed()).toMatchObject({ caughtUp: true, streamTip: '100' });
+
+            // the one-shot subscription fails: the tip from a moment ago still counts
+            wsTip.maxId = null;
+            workerExports.streamTipCache.set('dust', { tip: 100n, at: Date.now() - 20_000 });
+            await workerExports.progressWatchTick(SESSION, entry, Date.now() + 240_000);
+            expect(lastPushed()).toMatchObject({ caughtUp: true, streamTip: '100', behindEvents: '0' });
+
+            // past the grace window the tip is unknown again and the gate closes
+            workerExports.streamTipCache.set('dust', { tip: 100n, at: Date.now() - 400_000 });
+            await workerExports.progressWatchTick(SESSION, entry, Date.now() + 360_000);
+            expect(lastPushed()).toMatchObject({ caughtUp: false, streamTip: '-1', behindEvents: null });
+
+            // grace off: a failed read is unknown at once
+            process.env.NIGHTGATE_STREAM_TIP_GRACE_MS = '0';
+            workerExports.streamTipCache.set('dust', { tip: 100n, at: Date.now() - 20_000 });
+            await workerExports.progressWatchTick(SESSION, entry, Date.now() + 480_000);
+            expect(lastPushed()).toMatchObject({ caughtUp: false, streamTip: '-1' });
+        } finally {
+            delete process.env.NIGHTGATE_STREAM_TIP_GRACE_MS;
+            wsTip.maxId = '100';
+            await rpc('evict', { sessionId: SESSION });
+        }
+    });
 });
 
 describe('dust save epoch guard', () => {
@@ -1581,6 +1882,7 @@ describe('dust save epoch guard', () => {
         vi.useFakeTimers();
         const SESSION = 'session-epochrace-gggggggg';
         const undoAck = autoAckDustSaves();
+        let restoreSubmit: () => void = () => undefined;
         try {
             const facade = await initSession(SESSION);
             fakeParentPort.postMessage.mockClear();
@@ -1598,12 +1900,13 @@ describe('dust save epoch guard', () => {
             // epoch and pushes the snapshot.
             const freshDust = { start: vi.fn(async () => undefined), stop: vi.fn(), serializeState: vi.fn(async () => 'BLOB-DU') };
             dustRestore.mockReturnValueOnce(freshDust as any);
-            facade.submitTransaction = vi.fn(async () => { throw new Error('1014: Priority is too low'); });
+            restoreSubmit = withSubmit(async () => { throw new Error('1014: Priority is too low'); });
             const reply = await rpc('transferNight', {
                 sessionId: SESSION,
                 receiverAddress: 'mn_addr_preprod1' + 'x'.repeat(48),
                 amount: '10'
             });
+            restoreSubmit();
             expect(reply.ok).toBe(false);
             const restorePush = stateSaves().at(-1);
             expect(restorePush.blobs).toEqual({ dust: 'BLOB-DU' });
@@ -1676,7 +1979,7 @@ describe('buildSponsoredWalletProvider', () => {
      */
     function makePair(sponsorFinalDust: any = DUST_OK) {
         const callerFinalized = { stage: 'caller-finalized', intents: new Map<any, any>([[0, {}]]) };
-        const sponsorFinalized = { stage: 'sponsor-finalized', intents: new Map<any, any>([[0, { dustActions: sponsorFinalDust }]]) };
+        const sponsorFinalized = { stage: 'sponsor-finalized', intents: new Map<any, any>([[0, { dustActions: sponsorFinalDust }]]), identifiers: () => ['0xsponsored'] };
 
         const callerSigned = { stage: 'caller-signed' };
         const callerFacade = makeFakeFacade();
@@ -1688,10 +1991,10 @@ describe('buildSponsoredWalletProvider', () => {
         const sponsorFacade = makeFakeFacade();
         sponsorFacade.balanceFinalizedTransaction = vi.fn(async () => ({ stage: 'sponsor-recipe' }));
         sponsorFacade.finalizeRecipe = vi.fn(async () => sponsorFinalized);
-        sponsorFacade.submitTransaction = vi.fn(async () => ({ txId: '0xsponsored' }));
 
         const caller = {
             facade: callerFacade,
+            walletConfiguration: { relayURL: new URL('ws://relay.test') },
             sdkVersion: 'test',
             zswapKeys: { coinPublicKey: 'caller-cpk', encryptionPublicKey: 'caller-epk' },
             dustKey: { caller: true },
@@ -1702,6 +2005,7 @@ describe('buildSponsoredWalletProvider', () => {
         };
         const sponsor = {
             facade: sponsorFacade,
+            walletConfiguration: { relayURL: new URL('ws://relay.test') },
             sdkVersion: 'test',
             zswapKeys: { coinPublicKey: 'sponsor-cpk', encryptionPublicKey: 'sponsor-epk' },
             dustKey: { sponsor: true },
@@ -1843,13 +2147,16 @@ describe('buildSponsoredWalletProvider', () => {
         }
     });
 
-    it('submitTx routes through the SPONSOR facade only', async () => {
+    it('submitTx books the send with the SPONSOR facade only and sends on a dedicated client', async () => {
         const { caller, sponsor, callerFacade, sponsorFacade, sponsorFinalized } = makePair();
         const provider = workerExports.buildSponsoredWalletProvider(caller, sponsor);
         const result = await provider.submitTx(sponsorFinalized);
-        expect(result).toEqual({ txId: '0xsponsored' });
-        expect(sponsorFacade.submitTransaction).toHaveBeenCalledWith(sponsorFinalized);
+        expect(result).toBe('0xsponsored');
+        expect(lastSubmitArgs()[0]).toBe(sponsorFinalized);
+        expect(sponsorFacade.pendingTransactionsService.addPendingTransaction).toHaveBeenCalledWith(sponsorFinalized);
+        expect(callerFacade.pendingTransactionsService.addPendingTransaction).not.toHaveBeenCalled();
         expect(callerFacade.submitTransaction).not.toHaveBeenCalled();
+        expect(sponsorFacade.submitTransaction).not.toHaveBeenCalled();
         expect(callerFacade.revert).not.toHaveBeenCalled();
     });
 
@@ -1857,24 +2164,28 @@ describe('buildSponsoredWalletProvider', () => {
         withSyncedIndexer();
         try {
             const { caller, sponsor, callerFacade, sponsorFacade, callerFinalized, sponsorFinalized } = makePair();
-            sponsorFacade.submitTransaction = vi.fn(async () => { throw new Error('relay boom'); });
+            const restoreSubmit = withSubmit(async () => { throw new Error('relay boom'); });
             const provider = workerExports.buildSponsoredWalletProvider(caller, sponsor);
 
             await provider.balanceTx({});
             await expect(provider.submitTx(sponsorFinalized)).rejects.toThrow('relay boom');
             expect(callerFacade.revert).toHaveBeenCalledWith(callerFinalized);
+            // the sponsor's booked dust spend is freed too (the facade's own rule)
+            expect(sponsorFacade.revert).toHaveBeenCalledWith(sponsorFinalized);
+            restoreSubmit();
         } finally {
             vi.unstubAllGlobals();
         }
     });
 
     it('submitTx failure without a preceding balanceTx falls back to reverting the submitted tx on the caller facade', async () => {
-        const { caller, sponsor, callerFacade, sponsorFacade, sponsorFinalized } = makePair();
-        sponsorFacade.submitTransaction = vi.fn(async () => { throw new Error('relay boom'); });
+        const { caller, sponsor, callerFacade, sponsorFinalized } = makePair();
+        const restoreSubmit = withSubmit(async () => { throw new Error('relay boom'); });
         const provider = workerExports.buildSponsoredWalletProvider(caller, sponsor);
 
         await expect(provider.submitTx(sponsorFinalized)).rejects.toThrow('relay boom');
         expect(callerFacade.revert).toHaveBeenCalledWith(sponsorFinalized);
+        restoreSubmit();
     });
 });
 
@@ -1927,7 +2238,9 @@ describe('transferNight', () => {
         // Unshielded spends are signature-authorized: signRecipe must run.
         expect(facade.signRecipe).toHaveBeenCalled();
         expect(facade.finalizeRecipe).toHaveBeenCalled();
-        expect(facade.submitTransaction).toHaveBeenCalled();
+        expect(lastSubmitArgs()[0]).toMatchObject({ finalized: true });
+        expect(facade.pendingTransactionsService.addPendingTransaction).toHaveBeenCalledWith(lastSubmitArgs()[0]);
+        expect(facade.submitTransaction).not.toHaveBeenCalled();
     });
 
     it('tokenTypeHex overrides the NIGHT raw type', async () => {
@@ -2036,7 +2349,7 @@ describe('getBalance / estimateTransferFee', () => {
         expect(reply.result).toEqual({ fee: '42', toLedger: 'unshielded' });
         expect(facade.calculateTransactionFee).toHaveBeenCalled();
         expect(facade.revert).toHaveBeenCalled();
-        expect(facade.submitTransaction).not.toHaveBeenCalled();
+        expect(facade.pendingTransactionsService.addPendingTransaction).not.toHaveBeenCalled();
     });
 });
 
@@ -3040,13 +3353,15 @@ describe('dust backing lease renewal + env', () => {
 
     it('an ACTIVE lease is renewed and cannot be taken over by time; takeover only once the holder stops renewing', async () => {
         const { tryLockBacking, keepLeaseAlive, releaseNote } = workerExports.__noteLeaseForTests;
-        const a = tryLockBacking('sess', notes, 1n, 30); // 30 ms TTL, renewed every 10 ms
-        const stop = keepLeaseAlive(a.key, a.token, 30);
-        await new Promise((r) => setTimeout(r, 120)); // 4x the TTL
-        expect(tryLockBacking('sess', notes, 1n, 30)).toBeNull(); // still held: renewal worked
+        // 300 ms TTL, renewed every 100 ms: wide enough that a timer slipping under the
+        // full suite's load cannot read as the holder dying.
+        const a = tryLockBacking('sess', notes, 1n, 300);
+        const stop = keepLeaseAlive(a.key, a.token, 300);
+        await new Promise((r) => setTimeout(r, 1200)); // 4x the TTL
+        expect(tryLockBacking('sess', notes, 1n, 300)).toBeNull(); // still held: renewal worked
         stop();
-        await new Promise((r) => setTimeout(r, 60));
-        expect(tryLockBacking('sess', notes, 1n, 30)).toBeTruthy(); // holder stopped renewing (died): takeover
+        await new Promise((r) => setTimeout(r, 600));
+        expect(tryLockBacking('sess', notes, 1n, 300)).toBeTruthy(); // holder stopped renewing (died): takeover
         releaseNote(a.key, a.token);
     });
 

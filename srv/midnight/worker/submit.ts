@@ -1,6 +1,7 @@
 /**
- * Submission: dust wedge protection, transport resend, submit-intent handshake,
- * dedicated submit clients and the wallet providers that use them.
+ * Submission: dust wedge protection, the submit-intent handshake, the one send path (a
+ * dedicated phased client per submit, same-transaction resend on a transport failure) and the
+ * wallet providers that route a build through it.
  */
 
 import { configNumber, configMs, configEnum } from '../../utils/config';
@@ -72,6 +73,33 @@ export function isPreMempoolReject(err: unknown): boolean {
     return isPreMempoolFailure(classifySubmitFailure(err));
 }
 
+/**
+ * An earlier attempt may have reached the node and the indexer has not shown it, so a later
+ * failure cannot say more than "unknown": the earlier bytes may still land. The main thread
+ * keeps the identifier and never rebuilds (two identifiers, two fees).
+ */
+export class SubmitOutcomeUnknownError extends Error {
+    readonly identifier: string;
+    constructor(identifier: string, cause: unknown) {
+        super(`submit outcome unknown: an earlier send of ${identifier.slice(0, 16)} may have reached the node and the indexer does not show it yet; the later attempt failed: ${formatErr(cause).slice(0, 300)}`, { cause });
+        this.name = 'SubmitOutcomeUnknownError';
+        this.identifier = identifier;
+    }
+}
+
+/** Marks a submit failure whose attempts all ended before a send; the dust guard restores on it. */
+function markNothingSent(err: unknown): void {
+    if (err && typeof err === 'object') (err as any).nothingSent = true;
+}
+export function isNothingSent(err: unknown): boolean {
+    let cur: any = err;
+    for (let depth = 0; cur && depth < 8; depth++) {
+        if (cur.nothingSent === true) return true;
+        cur = cur.cause;
+    }
+    return false;
+}
+
 /** Arm the wedge protection before the build; a failed snapshot only disarms it for this tx. */
 export async function captureDustSnapshot(entry: FacadeEntry, site: string): Promise<void> {
     try {
@@ -138,9 +166,9 @@ export async function logTxCost(tx: any, site: string): Promise<void> {
 }
 
 // ---- Same-transaction resend on a transport failure -----------------------
-// A failed SEND leaves the proven bytes valid, so the same tx object is resent (the facade
-// re-pends it). A lost reply may still have reached the node, so the indexer is probed before
-// every resend and after a refused resend. Node rejects are never resent.
+// A failed SEND leaves the proven bytes valid, so the same tx object is resent. A lost reply may
+// still have reached the node, so the indexer is probed before every resend and after a refused
+// resend. Node rejects are never resent.
 export function submitTransportRetries(): number {
     return configNumber('NIGHTGATE_SUBMIT_TRANSPORT_RETRIES');
 }
@@ -156,29 +184,6 @@ export function isSubmitTransportFailure(err: unknown): boolean {
     return classifySubmitFailure(err).code === 'transport';
 }
 
-/**
- * In a block but the call did not apply (fee spent). Named like the SDK's error so the
- * main thread classifies it the same way.
- */
-export class LandedTxFailedError extends Error {
-    constructor(identifier: string, height: string, status: string, failedSegments: number[]) {
-        super(`TxFailedError: transaction ${identifier.slice(0, 16)} is in block ${height} but did not apply (ledger result ${status}, failed segment${failedSegments.length === 1 ? '' : 's'} ${failedSegments.join(',') || '?'}); the fee was spent, the call must be rebuilt against the current contract state`);
-        this.name = 'TxFailedError';
-    }
-}
-export function landedOrThrow(found: { height: string; status: string | null; failedSegments: number[] }, identifier: string, site: string, how: string): string {
-    if (found.status && found.status !== 'SUCCESS') throw new LandedTxFailedError(identifier, found.height, found.status, found.failedSegments);
-    log('info', `${site}: transaction ${identifier.slice(0, 16)} is in block ${found.height} (${found.status ?? 'status n/a'}) ${how}; landed`);
-    return identifier;
-}
-
-export function txIdentifierOf(tx: any): string | null {
-    try {
-        const id = typeof tx?.identifiers === 'function' ? tx.identifiers().at(-1) : undefined;
-        return id == null ? null : String(id);
-    } catch { return null; }
-}
-
 /** Poll the indexer for the identifier for up to `windowMs`; null when it is not there. */
 export async function waitLandedOnIndexer(entry: FacadeEntry, identifier: string, windowMs: number) {
     const deadline = Date.now() + windowMs;
@@ -187,29 +192,6 @@ export async function waitLandedOnIndexer(entry: FacadeEntry, identifier: string
         if (found) return found;
         if (Date.now() >= deadline) return null;
         await new Promise((r) => setTimeout(r, Math.min(5_000, Math.max(0, deadline - Date.now()))));
-    }
-}
-
-export async function submitSameTxWithTransportRetry(entry: FacadeEntry, tx: any, site: string): Promise<any> {
-    const retries = submitTransportRetries();
-    const identifier = txIdentifierOf(tx);
-    for (let attempt = 0; ; attempt++) {
-        try {
-            return await entry.facade.submitTransaction(tx);
-        } catch (e) {
-            if (attempt > 0 && identifier && !isSubmitTransportFailure(e)) {
-                // A refused resend: the first send may have landed, making these bytes a replay.
-                const found = await waitLandedOnIndexer(entry, identifier, submitLandedProbeMs());
-                if (found) return landedOrThrow(found, identifier, site, 'although the resend was refused');
-                throw e;
-            }
-            if (!identifier || attempt >= retries || !isSubmitTransportFailure(e)) throw e;
-            log('warn', `${site}: submit transport failure (send ${attempt + 1}/${retries + 1}): ${formatErrWithCauses(e).slice(0, 300)}; ` +
-                `checking the indexer for ${identifier.slice(0, 16)}, then resending the SAME transaction (no rebuild, no re-proving)`);
-            const found = await waitLandedOnIndexer(entry, identifier, submitLandedProbeMs());
-            if (found) return landedOrThrow(found, identifier, site, 'although the submit reply was lost');
-            await new Promise((r) => setTimeout(r, submitTransportBackoffMs()));
-        }
     }
 }
 
@@ -246,13 +228,12 @@ export async function submitWithDustGuard(entry: FacadeEntry, tx: any, site: str
             throw e;
         }
     }
-    await logTxCost(tx, site);
     try {
-        const txId = await submitSameTxWithTransportRetry(entry, tx, site);
+        const txId = await submitOnDedicatedClient(entry, tx, site, { book: true });
         entry.preSubmitDustSnapshot = undefined;
         return txId;
     } catch (e) {
-        if (isPreMempoolReject(e)) {
+        if (isPreMempoolReject(e) || isNothingSent(e)) {
             await restoreDustFromSnapshot(entry, site);
         } else {
             // A tx that may have reached the pool keeps its booked spends.
@@ -266,10 +247,10 @@ export async function submitWithDustGuard(entry: FacadeEntry, tx: any, site: str
 // ---- Dedicated submission clients (parallel sponsor path) ------------------
 // The SDK node client disconnects its shared socket after every submission stream, so concurrent
 // submits on one client kill each other: each gets an exclusive pooled client. `disconnect()`
-// returns before the socket closes, so a slot is ready only SUBMIT_CLIENT_SETTLE_MS after creation
+// returns before the socket closes, so a slot is ready only a settle window after creation
 // and each use; a send that dies on that closing socket never left and is retried once.
 export let SUBMIT_CLIENT_POOL_MAX = 8;
-export const SUBMIT_CLIENT_SETTLE_MS = 2500;
+let submitClientSettleMs = 2500;
 /** Bound on closing an abandoned client: its SDK close waits for the client's own initialisation, which may be what hung. */
 export const SUBMIT_CLOSE_TIMEOUT_MS = 5000;
 export type SubmitClientSlot = { svc: any; busy: Promise<unknown> | null; readyAt: number };
@@ -285,6 +266,7 @@ let submitServiceFactory: SubmitServiceFactory = defaultSubmitServiceFactory;
 // Test seams: pool cap and introspection, service factory.
 export const __submitClientPoolForTests = {
     setMax: (n: number) => { SUBMIT_CLIENT_POOL_MAX = n; },
+    setSettleMs: (ms: number) => { submitClientSettleMs = ms; },
     size: (relayURL: URL) => submitClientPools.get(relayURL.toString())?.length ?? 0,
     reset: () => submitClientPools.clear(),
     setServiceFactory: (factory: SubmitServiceFactory | null) => { submitServiceFactory = factory ?? defaultSubmitServiceFactory; }
@@ -314,7 +296,7 @@ export async function withDedicatedSubmitClient<T>(relayURL: URL, fn: (svc: any)
                 pool.push(created);
                 try {
                     created.svc = await submitServiceFactory(relayURL);
-                    created.readyAt = Date.now() + SUBMIT_CLIENT_SETTLE_MS;
+                    created.readyAt = Date.now() + submitClientSettleMs;
                 } catch (e) {
                     pool.splice(pool.indexOf(created), 1);
                     throw e;
@@ -356,7 +338,7 @@ export async function withDedicatedSubmitClient<T>(relayURL: URL, fn: (svc: any)
             if (submitPhaseOf(e) !== null) await evict();
             throw e;
         } finally {
-            if (pool.includes(slot)) { slot.busy = null; slot.readyAt = Date.now() + SUBMIT_CLIENT_SETTLE_MS; }
+            if (pool.includes(slot)) { slot.busy = null; slot.readyAt = Date.now() + submitClientSettleMs; }
         }
     }
     // Backstop only (the phased service bounds each phase): abandon, evict, the caller asks the indexer.
@@ -377,7 +359,7 @@ export async function withDedicatedSubmitClient<T>(relayURL: URL, fn: (svc: any)
         throw e;
     } finally {
         if (timer) clearTimeout(timer);
-        if (pool.includes(slot)) { slot.busy = null; slot.readyAt = Date.now() + SUBMIT_CLIENT_SETTLE_MS; }
+        if (pool.includes(slot)) { slot.busy = null; slot.readyAt = Date.now() + submitClientSettleMs; }
     }
 }
 
@@ -402,18 +384,22 @@ export async function indexerBlockOfIdentifier(indexerHttpUrl: string, identifie
     } catch { return null; }
 }
 
-export class SponsoredCallNotAppliedError extends Error {
-    /** Height of the block the indexer reported the transaction in (rollback coordinate). */
+/**
+ * In a block but the call did not apply (fee spent). Named like the SDK's error so the main
+ * thread classifies it the same way; the block height is the rollback coordinate.
+ */
+export class TxNotAppliedError extends Error {
     readonly blockHeight: number | null;
     constructor(identifier: string, height: string, status: string, failedSegments: number[]) {
-        super(`sponsored transaction ${identifier.slice(0, 16)} is in block ${height} but its contract call did NOT apply (ledger result ${status}, failed segment${failedSegments.length === 1 ? '' : 's'} ${failedSegments.join(',') || '?'}); the sponsor paid the fee, the call must be rebuilt against the current contract state`);
-        this.name = 'SponsoredCallNotAppliedError';
+        super(`TxFailedError: transaction ${identifier.slice(0, 16)} is in block ${height} but its call did NOT apply (ledger result ${status}, failed segment${failedSegments.length === 1 ? '' : 's'} ${failedSegments.join(',') || '?'}); the fee was spent, the call must be rebuilt against the current contract state`);
+        this.name = 'TxFailedError';
         const h = Number(height);
         this.blockHeight = Number.isInteger(h) && h >= 0 ? h : null;
     }
 }
+/** A landed transaction counts only with ledger result SUCCESS. */
 export function assertApplied(found: { height: string; status: string | null; failedSegments: number[] }, identifier: string): void {
-    if (found.status && found.status !== 'SUCCESS') throw new SponsoredCallNotAppliedError(identifier, found.height, found.status, found.failedSegments);
+    if (found.status && found.status !== 'SUCCESS') throw new TxNotAppliedError(identifier, found.height, found.status, found.failedSegments);
 }
 // Keep above the node client's own 60 s request timeout, or an unanswered send and a
 // watch timeout (answered, not included) become indistinguishable.
@@ -426,15 +412,15 @@ export const SUBMIT_WATCH_CONFIRM_MS = 90_000;
 export function submitBackstopMs(): number { return SUBMIT_CONNECT_TIMEOUT_MS + SUBMIT_REQUEST_TIMEOUT_MS + SUBMIT_WATCH_TIMEOUT_MS + Math.min(10_000, SUBMIT_WATCH_TIMEOUT_MS); }
 // InBlock is safe for the unbound sponsor path: the indexer confirmer checks the chain
 // outcome afterwards, so a reorg shows as a failed chain status, not a lost job.
-export const SPONSOR_SUBMIT_WAIT: 'InBlock' | 'Finalized' = configEnum('NIGHTGATE_SPONSOR_WAIT') === 'finalized' ? 'Finalized' : 'InBlock';
-export function sponsorSubmitWaitStage(): 'InBlock' | 'Finalized' { return SPONSOR_SUBMIT_WAIT; }
-// After InBlock, wait until the indexer has the tx: a caller building its next call reads
-// contract state there, which is inconsistent until the block is indexed.
-export const SPONSOR_INDEXER_VISIBLE_MS = configMs('NIGHTGATE_SPONSOR_INDEXER_VISIBLE_MS');
+export function sponsorSubmitWaitStage(): 'InBlock' | 'Finalized' { return configEnum('NIGHTGATE_SPONSOR_WAIT') === 'finalized' ? 'Finalized' : 'InBlock'; }
+// After the wanted status, wait until the indexer has the tx and check the ledger result there:
+// a caller building its next call reads contract state on the indexer, and neither InBlock nor
+// Finalized says whether the call applied.
 export async function waitIndexerVisible(indexerHttpUrl: string, identifier: string, site: string): Promise<void> {
-    if (SPONSOR_INDEXER_VISIBLE_MS === 0) return;
+    const windowMs = configMs('NIGHTGATE_SPONSOR_INDEXER_VISIBLE_MS');
+    if (windowMs === 0) return;
     const t0 = Date.now();
-    while (Date.now() - t0 < SPONSOR_INDEXER_VISIBLE_MS) {
+    while (Date.now() - t0 < windowMs) {
         const found = await indexerBlockOfIdentifier(indexerHttpUrl, identifier);
         if (found) {
             log('debug', `${site}: indexer has the transaction in block ${found.height} (${found.status ?? 'status n/a'}) after ${Date.now() - t0}ms`);
@@ -443,7 +429,7 @@ export async function waitIndexerVisible(indexerHttpUrl: string, identifier: str
         }
         await new Promise((r) => setTimeout(r, 1500));
     }
-    log('warn', `${site}: transaction in block but not visible on the indexer after ${SPONSOR_INDEXER_VISIBLE_MS}ms; reporting landed anyway`);
+    log('warn', `${site}: transaction in block but not visible on the indexer after ${windowMs}ms; reporting landed anyway`);
 }
 
 /** What the worker knows about the transaction it is about to broadcast. */
@@ -490,47 +476,95 @@ export function isClosingSocketReject(err: unknown): boolean {
     return /disconnected from \S*:\s*1000\s*::\s*Normal Closure/i.test(classificationHaystack(err));
 }
 
+/** Books the spends with the facade's pending service, as the facade's own submit does. */
+async function bookPending(entry: FacadeEntry, tx: any, site: string): Promise<void> {
+    const svc = entry.facade?.pendingTransactionsService;
+    if (typeof svc?.addPendingTransaction !== 'function') {
+        log('warn', `${site}: facade exposes no pending-transaction service; spends are booked only once the sync sees the transaction`);
+        return;
+    }
+    await svc.addPendingTransaction(tx);
+}
+
 /**
- * Unbound sponsor path: dedicated client, no dust guard (no spend was booked in this wallet).
- * Request/watch timeouts consult the indexer before rethrowing.
+ * The one send path: a dedicated phased client per submit (the facade's shared socket
+ * disconnects after each submission and its submit promise settles only when that socket
+ * closes). `book` = the facade's own bookkeeping around a send: pend before, revert on failure.
+ * A connect failure or a send that died is resent (same bytes, the indexer probed first); a
+ * request or watch timeout is looked up on the indexer; node rejects are never resent.
  */
-export async function submitOnDedicatedClient(entry: FacadeEntry, tx: any, site: string): Promise<any> {
+export async function submitOnDedicatedClient(entry: FacadeEntry, tx: any, site: string, opts: { book?: boolean } = {}): Promise<any> {
     await logTxCost(tx, site);
     const relayURL: URL = entry.walletConfiguration.relayURL;
     const identifier = String(tx.identifiers().at(-1));
-    for (let attempt = 0; ; attempt++) {
-        try {
-            await withDedicatedSubmitClient(relayURL, (svc) => svc.submitTransaction(tx, SPONSOR_SUBMIT_WAIT, { identifier, correlation: site }), { abandonAfterMs: submitBackstopMs(), label: `${site} ${identifier.slice(0, 16)}` });
-            if (SPONSOR_SUBMIT_WAIT === 'InBlock') await waitIndexerVisible(entry.indexerHttpUrl, identifier, site);
-            return identifier;
-        } catch (e) {
-            if (attempt === 0 && isClosingSocketReject(e)) {
-                log('warn', `${site}: submit request died on the client's own closing socket (SDK disconnect lag); retrying once on a settled client`);
-                continue;
-            }
-            if (attempt === 0 && submitPhaseOf(e) === 'connect') {
-                log('warn', `${site}: submit connect phase failed, nothing sent; retrying once on a fresh client: ${formatErr(e).slice(0, 200)}`);
-                continue;
-            }
-            if (e instanceof SubmitWatchTimeoutError || submitPhaseOf(e) === 'watch' || submitPhaseOf(e) === 'request') {
-                const deadline = Date.now() + SUBMIT_WATCH_CONFIRM_MS;
-                for (; ;) {
-                    const found = await indexerBlockOfIdentifier(entry.indexerHttpUrl, identifier);
-                    if (found) {
-                        log('info', `${site}: no ${SPONSOR_SUBMIT_WAIT} status from the watch, indexer has the transaction in block ${found.height} (${found.status ?? 'status n/a'}); landed`);
-                        assertApplied(found, identifier);
-                        return identifier;
-                    }
-                    if (Date.now() >= deadline) break;
-                    await new Promise((r) => setTimeout(r, 10_000));
-                }
+    const label = `${site} ${identifier.slice(0, 16)}`;
+    const retries = submitTransportRetries();
+    const waitFor = sponsorSubmitWaitStage();
+    // Set once any attempt got past the connect phase without the indexer showing the tx: from
+    // then on the bytes may be on the node and no later failure is definitive.
+    let maybeSent = false;
+    const unknownOutcome = (e: unknown): Error => new SubmitOutcomeUnknownError(identifier, e);
+    const landed = async (windowMs: number, how: string): Promise<boolean> => {
+        const found = await waitLandedOnIndexer(entry, identifier, windowMs);
+        if (!found) return false;
+        log('info', `${site}: transaction ${identifier.slice(0, 16)} is in block ${found.height} (${found.status ?? 'status n/a'}) ${how}; landed`);
+        assertApplied(found, identifier);
+        return true;
+    };
+    const resend = async (reason: string): Promise<void> => {
+        log('warn', `${site}: ${reason}; resending the SAME transaction (no rebuild, no re-proving)`);
+        await new Promise((r) => setTimeout(r, submitTransportBackoffMs()));
+    };
+    if (opts.book) await bookPending(entry, tx, site);
+    try {
+        for (let attempt = 0, resends = 0; ; attempt++) {
+            try {
+                await withDedicatedSubmitClient(relayURL, (svc) => svc.submitTransaction(tx, waitFor, { identifier, correlation: site }), { abandonAfterMs: submitBackstopMs(), label });
+                await waitIndexerVisible(entry.indexerHttpUrl, identifier, site);
+                return identifier;
+            } catch (e) {
                 const phase = submitPhaseOf(e);
-                log('warn', `${site}: ${phase === 'request' ? 'no status from the node after the send' : 'submit watch timed out'} and the indexer does not know the transaction ${identifier.slice(0, 16)} after ${SUBMIT_WATCH_CONFIRM_MS}ms; leaving it to the confirmer${phase ? '' : ' (backstop timeout, no phase information)'}`);
+                const earlierUnresolved = maybeSent;
+                if (attempt === 0 && isClosingSocketReject(e)) {
+                    log('warn', `${site}: submit request died on the client's own closing socket (SDK disconnect lag); retrying once on a settled client`);
+                    continue;
+                }
+                if (phase === 'connect') {
+                    if (resends >= retries) {
+                        if (earlierUnresolved) throw unknownOutcome(e);
+                        // Every attempt failed before a send: the dust note was never spent anywhere.
+                        markNothingSent(e);
+                        throw e;
+                    }
+                    resends++;
+                    await resend(`submit connect phase failed, nothing sent (send ${resends}/${retries + 1}): ${formatErr(e).slice(0, 200)}`);
+                    continue;
+                }
+                if (e instanceof SubmitWatchTimeoutError || phase === 'watch' || phase === 'request') {
+                    if (await landed(SUBMIT_WATCH_CONFIRM_MS, `although the watch saw no ${waitFor}`)) return identifier;
+                    log('warn', `${site}: ${phase === 'request' ? 'no status from the node after the send' : 'submit watch timed out'} and the indexer does not know the transaction ${identifier.slice(0, 16)} after ${SUBMIT_WATCH_CONFIRM_MS}ms; leaving it to the confirmer${phase ? '' : ' (backstop timeout, no phase information)'}`);
+                    throw e;
+                }
+                if (isSubmitTransportFailure(e)) {
+                    // The send died mid-stream: it may or may not have reached the node.
+                    if (await landed(submitLandedProbeMs(), 'although the submit reply was lost')) return identifier;
+                    maybeSent = true;
+                    if (resends >= retries) throw unknownOutcome(e);
+                    resends++;
+                    await resend(`submit transport failure (send ${resends}/${retries + 1}): ${formatErrWithCauses(e).slice(0, 300)}; the indexer does not have ${identifier.slice(0, 16)}`);
+                    continue;
+                }
+                // A refused resend: the first send may have landed, making these bytes a replay.
+                if (resends > 0 && await landed(submitLandedProbeMs(), 'although the resend was refused')) return identifier;
+                if (earlierUnresolved) throw unknownOutcome(e);
+                log('info', `${site}: submit failed (${isPreMempoolReject(e) ? 'pre-mempool reject' : 'not pre-mempool'}): ${safeDeepInspect(e, 512).slice(0, 600)}`);
                 throw e;
             }
-            log('info', `${site}: submit failed (${isPreMempoolReject(e) ? 'pre-mempool reject' : 'not pre-mempool'}; no dust guard on this path): ${safeDeepInspect(e, 512).slice(0, 600)}`);
-            throw e;
         }
+    } catch (e) {
+        // The facade's own rule: a failed submit frees the booked spends (the dust guard decides about the note).
+        if (opts.book) await revertRecipeBestEffort(entry.facade, tx, `${site} pending`);
+        throw e;
     }
 }
 

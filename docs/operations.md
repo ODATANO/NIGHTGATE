@@ -310,7 +310,7 @@ midnight-js allows 5 min per proof request and re-requests a timed-out proof up 
 
 ### Submit failed with `1000 Normal Closure` / `ECONNRESET`
 
-The RPC closed the websocket during send. The worker checks the indexer, then resends the SAME transaction (`NIGHTGATE_SUBMIT_TRANSPORT_RETRIES`, default 2); log: `resending the SAME transaction (no rebuild, no re-proving)` or `landed`. Failing after the resends = real outage, re-issue. Node rejects (`1010`, `1014`, `1016`) are never resent.
+The RPC closed the websocket during send, or the dedicated client never connected. The worker checks the indexer, then resends the SAME transaction on a fresh client (`NIGHTGATE_SUBMIT_TRANSPORT_RETRIES`, default 2); log: `resending the SAME transaction (no rebuild, no re-proving)` or `landed`. Failing after the resends = real outage, re-issue. Node rejects (`1010`, `1014`, `1016`) are never resent.
 
 ### Contract artifacts outside the package
 

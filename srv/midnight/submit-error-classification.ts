@@ -90,6 +90,9 @@ export function classifySubmitFailure(err: unknown): SubmitFailureInfo {
         const own = Array.isArray((causality as any)?.calls) ? (causality as any).calls as BatchCallStageInfo[] : undefined;
         return { code: 'causality', retryable: false, calls: own?.length ? own : parseBatchCallStages(haystack) };
     }
+    // An earlier send of the same bytes is unresolved: whatever the later attempt said, the
+    // identifier may still land. Checked before the phase and reject rules, which sit in its cause.
+    if (names.includes('SubmitOutcomeUnknownError')) return { code: 'ambiguous', ledgerCode: 'unresolved-send', retryable: false };
     // Only a connect-phase failure is safe to resend; request and watch may have reached the node.
     const phased = chain.find((e: any) => nameOf(e) === 'SubmitPhaseError' && typeof e?.phase === 'string') as any;
     if (phased) {
@@ -100,7 +103,7 @@ export function classifySubmitFailure(err: unknown): SubmitFailureInfo {
     if (names.includes('SubmitWatchTimeoutError') || /submit watch timed out/i.test(haystack)) {
         return { code: 'ambiguous', retryable: false };
     }
-    if (names.includes('SponsoredCallNotAppliedError') || names.includes('TxFailedError') || /did NOT apply|but did not apply/i.test(haystack)) {
+    if (names.includes('TxFailedError') || /did NOT apply|but did not apply/i.test(haystack)) {
         // Block height = rollback coordinate; without it the job parks for the indexer confirmer.
         const blockHeight = errorChain(err).map(e => (e as any)?.blockHeight).find(v => Number.isInteger(v) && v >= 0);
         return { code: 'landed-not-applied', retryable: false, ...(Number.isInteger(blockHeight) ? { blockHeight } : {}) };

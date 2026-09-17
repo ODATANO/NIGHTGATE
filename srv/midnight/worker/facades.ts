@@ -118,10 +118,17 @@ const STREAM_FIELD: Record<LedgerEventStream, string> = { dust: 'dustLedgerEvent
 // One stream-tip probe per few seconds is plenty for a 3s poll loop.
 export const streamTipCache = new Map<LedgerEventStream, { tip: bigint; at: number }>();
 
+/** A failed tip read reuses the last read within this window (`NIGHTGATE_STREAM_TIP_GRACE_MS`, 0 = off). */
+export function streamTipGraceMs(): number {
+    return configMs('NIGHTGATE_STREAM_TIP_GRACE_MS');
+}
+
 /**
  * Stream tip = `maxId` of the first event of a one-shot ws subscription; the only valid target for
  * `appliedIndex` (`progress.highestIndex` stays 0 on public indexers, block end-indices are another
- * series). Null on any failure.
+ * series). A failed read falls back to the last read while that is within the grace window: an
+ * unknown tip fails the sync gate, and the public indexer drops a few percent of these
+ * subscriptions. Null once the fallback has aged out too.
  */
 export function getDustStreamTip(indexerHttpUrl: string): Promise<bigint | null> {
     return getLedgerEventStreamTip(indexerHttpUrl, 'dust');
@@ -165,9 +172,19 @@ export async function getLedgerEventStreamTip(indexerHttpUrl: string, stream: Le
             sock.on('error', () => done(null));
             sock.on('close', () => done(null));
         });
-        if (tip != null) streamTipCache.set(stream, { tip, at: Date.now() });
-        return tip;
-    } catch { return null; }
+        if (tip != null) {
+            streamTipCache.set(stream, { tip, at: Date.now() });
+            return tip;
+        }
+        return staleStreamTip(stream, cached);
+    } catch { return staleStreamTip(stream, cached); }
+}
+
+function staleStreamTip(stream: LedgerEventStream, cached: { tip: bigint; at: number } | undefined): bigint | null {
+    const age = cached ? Date.now() - cached.at : Infinity;
+    if (!cached || age >= streamTipGraceMs()) return null;
+    log('debug', `${stream} stream tip read failed, reusing ${cached.tip} from ${Math.round(age / 1000)}s ago`);
+    return cached.tip;
 }
 
 /** The sync gate's verdict for one reading: connected, a known stream tip, within SYNC_TIP_GAP of it, and a fresh indexer. */

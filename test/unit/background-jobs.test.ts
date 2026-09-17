@@ -698,7 +698,7 @@ describe('startJob: insert row + return jobId', () => {
             await reportExternalSubmission({ submissionId: 'sub-partial', txHash: '00partial' });
             // What the worker RPC hands the main thread: the code and the height ride as data.
             const err: any = new Error('sponsored transaction 00partial is in block 42 but its contract call did NOT apply (ledger result PARTIAL_SUCCESS)');
-            err.name = 'SponsoredCallNotAppliedError';
+            err.name = 'TxFailedError';
             err.code = 'landed-not-applied'; err.retryable = false; err.blockHeight = 42;
             throw err;
         });
@@ -723,7 +723,7 @@ describe('startJob: insert row + return jobId', () => {
             await reportExternalExecution({ submissionId: 'sub-noheight' });
             await reportExternalSubmission({ submissionId: 'sub-noheight', txHash: '00noheight' });
             const err: any = new Error('sponsored transaction 00noheight is in block ? but its contract call did NOT apply');
-            err.name = 'SponsoredCallNotAppliedError';
+            err.name = 'TxFailedError';
             err.code = 'landed-not-applied'; err.retryable = false;
             throw err;
         });

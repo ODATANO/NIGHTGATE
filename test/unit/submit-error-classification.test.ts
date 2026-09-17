@@ -21,11 +21,11 @@ function sdkWrapped(inner: string): Error {
 describe('landed-not-applied carries the block height', () => {
     it('takes the height from the worker error so the main thread has a rollback coordinate', () => {
         const err: any = new Error('sponsored transaction 00ab is in block 2415919 but its contract call did NOT apply');
-        err.name = 'SponsoredCallNotAppliedError';
+        err.name = 'TxFailedError';
         err.blockHeight = 2415919;
         expect(classifySubmitFailure(err)).toMatchObject({ code: 'landed-not-applied', retryable: false, blockHeight: 2415919 });
         const bare: any = new Error('call did NOT apply');
-        bare.name = 'SponsoredCallNotAppliedError';
+        bare.name = 'TxFailedError';
         expect(classifySubmitFailure(bare)).toEqual({ code: 'landed-not-applied', retryable: false });
     });
 });
@@ -55,9 +55,9 @@ describe('classifySubmitFailure', () => {
         expect(classifySubmitFailure(new Error('submit watch timed out after 60000ms without a Finalized status'))).toEqual({ code: 'ambiguous', retryable: false });
     });
 
-    it('landed-not-applied: the sponsored and the bound flavour', () => {
+    it('landed-not-applied: with and without the TxFailedError prefix', () => {
         const sponsored = new Error('sponsored transaction 00ab is in block 1 but its contract call did NOT apply (ledger result PARTIAL_SUCCESS)');
-        sponsored.name = 'SponsoredCallNotAppliedError';
+        sponsored.name = 'TxFailedError';
         expect(classifySubmitFailure(sponsored).code).toBe('landed-not-applied');
         const bound = new Error('TxFailedError: transaction 00ab is in block 2 but did not apply (ledger result FAILURE)');
         bound.name = 'TxFailedError';
@@ -92,6 +92,14 @@ describe('classifySubmitFailure', () => {
         expect(classifySubmitFailure(new Error('connect ECONNRESET 10.0.0.1:9944'))).toEqual({ code: 'transport', retryable: true });
         expect(classifySubmitFailure(new Error('disconnected from wss://x: 1000:: Normal Closure'))).toEqual({ code: 'transport', retryable: true });
         expect(classifySubmitFailure(new Error("submit request died on the client's own closing socket (SDK disconnect lag)"))).toEqual({ code: 'transport', ledgerCode: 'closing-socket', retryable: true });
+    });
+
+    it('an unresolved earlier send makes the whole submit ambiguous, whatever the later attempt said', () => {
+        const later = Object.assign(new Error('submit connect phase: no connection'), { name: 'SubmitPhaseError', phase: 'connect' });
+        const unknown = Object.assign(new Error('submit outcome unknown'), { name: 'SubmitOutcomeUnknownError', cause: later });
+        expect(classifySubmitFailure(unknown)).toEqual({ code: 'ambiguous', ledgerCode: 'unresolved-send', retryable: false });
+        const reject = Object.assign(new Error('submit outcome unknown'), { name: 'SubmitOutcomeUnknownError', cause: new Error('1010: Invalid Transaction: Custom error: 196') });
+        expect(classifySubmitFailure(reject).code).toBe('ambiguous');
     });
 
     it('a wait that ended without a reply is ambiguous, never transport: the send may have landed', () => {

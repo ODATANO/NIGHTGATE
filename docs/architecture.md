@@ -48,7 +48,7 @@ The wallet SDK ([Effect.ts](https://effect.website)) saturates the microtask que
 - `srv/midnight/wallet-worker.ts`: entry (thread guard, key ring hand-over, `parentPort` wiring). Modules in `srv/midnight/worker/` import without a `parentPort`:
   - `context.ts`: the facade registry, the log channel, the memoised SDK loaders, address helpers.
   - `facades.ts`: facade build, sync waits and progress, periodic state save with main-thread acks, per-session submit locks, `evict`.
-  - `submit.ts`: dust wedge protection, same-transaction resend, the submit-intent handshake, dedicated submit clients, the wallet providers that route a build through them.
+  - `submit.ts`: dust wedge protection, the submit-intent handshake, the one send path (a dedicated phased node client per submit, same-transaction resend), the wallet providers that route a build through it.
   - `sponsor.ts`: finalized and unbound fee sponsoring, the sponsorable shape check, offer token checks, dust backings and note leases.
   - `contracts.ts`: deploy, call, batch; provider construction, the deployed-contract query cache, phase timing. `private-state.ts`: the private-state proxy over the main thread.
   - `artifacts.ts`: scaffold cache, content-addressed snapshots, generation retention, generation-pinned import. `bounded-cache.ts`: the bounded cache both caches use.

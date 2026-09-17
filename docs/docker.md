@@ -160,9 +160,12 @@ smoke test succeed.
 
 ## Operational notes
 
-- Graceful stop: node runs as PID 1 and flushes every wallet state (acked
-  final save, up to 60 s) on SIGTERM. Compose sets `stop_grace_period: 90s`;
-  with plain `docker stop` pass `-t 90`.
+- Graceful stop: node flushes every wallet state (acked final save, up to
+  60 s) on SIGTERM. Compose sets `stop_grace_period: 90s`; with plain
+  `docker stop` pass `-t 90`.
+- Compose sets `init: true`: tini runs as PID 1 and reaps orphaned processes
+  (node does not; every health check docker kills would otherwise leave a
+  zombie). With plain `docker run` pass `--init`.
 - Single instance only; never scale replicas against one database.
 - Without `NIGHTGATE_DB_URL` the entrypoint sets
   `NIGHTGATE_ALLOW_PRODUCTION_SQLITE=true` (single volume-backed instance).
