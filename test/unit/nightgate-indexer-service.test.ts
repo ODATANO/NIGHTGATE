@@ -726,11 +726,18 @@ describe('authorization', () => {
         }
     );
 
+    // 0.24.2: an explicit 'any'. Without an annotation the probes inherited the
+    // service's implicit authenticated-user under NODE_ENV=production (CAP checks
+    // the service before the operation), so they were never actually reachable
+    // anonymously on a production container. The service is 'any' now and every
+    // element says what it needs.
     it('leaves read-only probes (liveness/readiness/metrics) unrestricted for K8s and Prometheus', () => {
+        const model: any = cds.model;
+        expect(model.definitions['NightgateIndexerService']?.['@requires']).toBe('any');
         for (const fn of ['getLiveness', 'getReadiness', 'getMetrics', 'getSyncStatus', 'getHealth']) {
             const def = actionDef(fn);
             expect(def).toBeTruthy();
-            expect(def['@requires']).toBeUndefined();
+            expect(def['@requires']).toBe('any');
         }
     });
 });

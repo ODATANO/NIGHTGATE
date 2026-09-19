@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.24.2 - 2026-09-19
+
+- `NightgateIndexerService.getLiveness()` answered 401 without credentials
+  under `NODE_ENV=production`. CAP authorizes the service before the
+  operation, and a service without a service-level `@requires` is implicitly
+  `authenticated-user` in production, so the function's own `any` was never
+  reached (seen live behind ODATANO ACCESS: the gateway's credential-free
+  probe had to fall back to operator auth). The service is now `@requires:
+  'any'` with the requirement on every element. The read-only probes the
+  model always meant for K8s and Prometheus (getLiveness, getReadiness,
+  getMetrics, getSyncStatus, getHealth) are public now, as their test
+  claimed; SyncState, ReorgLog, getReorgHistory, getRuntimeInfo and
+  getWorkerStatus stay `authenticated-user`, pause/resume/reindex stay
+  `admin`. Behind api.nightgate.dev the gateway still requires a key for
+  `/api/v1/indexer/*`. A model test pins the layout
+  (`test/unit/service-auth-annotations.test.ts`).
+
 ## 0.24.1 - 2026-09-17
 
 - Every submit goes out on its own phased node client (connect / request /

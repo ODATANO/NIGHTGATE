@@ -1,17 +1,43 @@
 using {midnight} from '../db/schema';
 
-/** Indexer sync state, health, probes and reorg history. */
-@path: '/api/v1/indexer'
+/**
+ * Indexer sync state, health, probes and reorg history.
+ *
+ * Auth layout: the SERVICE is `@requires: 'any'` and every element carries its
+ * own requirement. CAP authorizes the service before the operation
+ * (`authorize` in @sap/cds lib/srv/protocols/http.js): a service without a
+ * service-level `@requires` is implicitly `authenticated-user` under
+ * NODE_ENV=production, so an anonymous caller got the 401 challenge before
+ * getLiveness() was ever looked at (seen live on 0.24.1 behind ODATANO ACCESS:
+ * the gateway's credential-free probe answered 401 and had to fall back to
+ * operator auth). Opening the service and restricting each element keeps
+ * every other operation exactly as guarded as before; the read-only probes
+ * (getLiveness, getReadiness, getMetrics, getSyncStatus, getHealth) are public, the
+ * way the model always intended them for K8s and Prometheus, the same layout as
+ * NightgateVerifyService.
+ */
+@path    : '/api/v1/indexer'
+@requires: 'any'
 service NightgateIndexerService {
 
     @readonly
+    @requires: 'authenticated-user'
     entity SyncState as projection on midnight.SyncState;
 
     @readonly
+    @requires: 'authenticated-user'
     entity ReorgLog  as projection on midnight.ReorgLog;
 
+    // Read-only probe, public on purpose (K8s, Prometheus, the ACCESS gateway):
+    // no secrets, no per-session data. Behind api.nightgate.dev the gateway still
+    // wants a key for /api/v1/indexer/*; direct exposure is the box network only.
+    @requires: 'any'
     function getSyncStatus()                      returns SyncState;
 
+    // Read-only probe, public on purpose (K8s, Prometheus, the ACCESS gateway):
+    // no secrets, no per-session data. Behind api.nightgate.dev the gateway still
+    // wants a key for /api/v1/indexer/*; direct exposure is the box network only.
+    @requires: 'any'
     function getHealth()                          returns {
         status          : String;
         chainHeight     : Integer64;
@@ -29,9 +55,13 @@ service NightgateIndexerService {
         runtimeWarnings : array of String;
     };
 
+    @requires: 'authenticated-user'
     function getReorgHistory(limit: Integer)      returns array of ReorgLog;
 
-    // Liveness: 200 while the process is alive
+    // Liveness: 200 while the process is alive. Anonymous on purpose: a probe
+    // carries no credentials (Docker HEALTHCHECK, ODATANO ACCESS upstream
+    // health). Process facts only, no DB, no secrets; readiness stays guarded.
+    @requires: 'any'
     function getLiveness()                        returns {
         status     : String;
         timestamp  : Timestamp;
@@ -39,7 +69,8 @@ service NightgateIndexerService {
         instanceId : String;
     };
 
-    // Readiness: 200 only when all subsystems are ready
+    // Readiness: 200 only when all subsystems are ready. Public like the other probes.
+    @requires: 'any'
     function getReadiness()                       returns {
         ready              : Boolean;
         crawlerEnabled     : Boolean;
@@ -58,7 +89,8 @@ service NightgateIndexerService {
         runtimeWarnings    : array of String;
     };
 
-    // Prometheus text format
+    // Prometheus text format. Public like the other probes.
+    @requires: 'any'
     function getMetrics()                         returns String;
 
 
