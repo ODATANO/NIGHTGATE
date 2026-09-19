@@ -6,7 +6,6 @@ import path from 'path';
 
 import { initialize, shutdown, SchemaNotDeployedError } from './index';
 import { mountZkConfigRoute, mountContractManifestRoute } from './connector-routes';
-import { mountStatusRoutes } from './status-routes';
 import { applyPoolDefault } from './cap-pool-default';
 import { registerNightgateTransportLanes } from '../srv/utils/transport-lanes';
 
@@ -43,13 +42,6 @@ function registerConnectorRoutes(): void {
         // these connector endpoints and does not install global middleware.
         mountZkConfigRoute(app);
         mountContractManifestRoute(app);
-        // Plain status routes in a shape scrapers and probes can consume,
-        // namespaced under /nightgate so they cannot shadow a host path (CAP
-        // registers its own /health right after this event). Fail-closed:
-        // nothing mounts without NIGHTGATE_STATUS_TOKEN or an explicit
-        // NIGHTGATE_STATUS_ROUTES=public, because this runs BEFORE CAP's auth
-        // middlewares and is not covered by them.
-        mountStatusRoutes(app);
     });
 }
 

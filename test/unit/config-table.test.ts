@@ -16,7 +16,7 @@ import {
 
 const KEYS = ['NIGHTGATE_WORKER_RPC_TIMEOUT_MS', 'NIGHTGATE_SAVE_INTERVAL_MS', 'NIGHTGATE_CRAWLER_ENABLED', 'NIGHTGATE_PROVING_MODE',
     'NIGHTGATE_FEE_SPONSOR_SESSION', 'NIGHTGATE_PREWARM_STALL_MS', 'NIGHTGATE_SIGNING_KEY_RATE_LIMIT', 'NIGHTGATE_WORKER_YOUNG_GEN_MB',
-    'NIGHTGATE_SPONSOR_ALLOW_DEPLOY', 'NIGHTGATE_STATUS_ROUTES', 'NIGHTGATE_INSTANCE_ID'];
+    'NIGHTGATE_SPONSOR_ALLOW_DEPLOY', 'NIGHTGATE_PRIVATE_STATE_BACKEND', 'NIGHTGATE_INSTANCE_ID'];
 const saved: Record<string, string | undefined> = {};
 let warnings: string[] = [];
 
@@ -79,8 +79,8 @@ describe('config table: parsing rules', () => {
         process.env.NIGHTGATE_PROVING_MODE = 'gpu';
         expect(configEnum('NIGHTGATE_PROVING_MODE')).toBeUndefined();
         expect(warnings.at(-1)).toMatch(/is not one of server \| wasm/);
-        process.env.NIGHTGATE_STATUS_ROUTES = 'Public';
-        expect(configEnum('NIGHTGATE_STATUS_ROUTES')).toBe('public');
+        process.env.NIGHTGATE_PRIVATE_STATE_BACKEND = 'Level';
+        expect(configEnum('NIGHTGATE_PRIVATE_STATE_BACKEND')).toBe('level');
     });
 
     it('lists split on commas and drop blanks', () => {
@@ -132,7 +132,7 @@ describe('config table: the worker reads the resolved snapshot, not its env', ()
         const snapshot = resolvedConfigSnapshot();
         expect(snapshot.NIGHTGATE_SAVE_INTERVAL_MS).toBe(20000);
         expect(Object.keys(snapshot)).not.toContain('ENCRYPTION_KEY');
-        expect(Object.keys(snapshot)).not.toContain('NIGHTGATE_STATUS_TOKEN');
+        expect(Object.keys(snapshot)).not.toContain('ENCRYPTION_KEYS');
         pinResolvedConfig(snapshot);
         process.env.NIGHTGATE_SAVE_INTERVAL_MS = '30000';
         expect(configMs('NIGHTGATE_SAVE_INTERVAL_MS')).toBe(20000);

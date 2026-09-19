@@ -179,28 +179,18 @@ stays offline; the host process keeps running.
 
 ## Monitoring endpoints
 
-Plain HTTP routes for scrapers and probes (the OData `getMetrics()` wraps the
-Prometheus body in JSON).
-
-**Off until configured.** They mount before CAP's authentication, so OData
-auth does not protect them. Pick one:
+The read-only probes of the indexer service are anonymous at the model
+level, so scrapers and K8s probes need no credentials:
 
 ```bash
-NIGHTGATE_STATUS_TOKEN=$(openssl rand -hex 32)   # bearer token, the sane default
-NIGHTGATE_STATUS_ROUTES=public                   # anonymous, a deliberate choice
+curl "http://localhost:4004/api/v1/indexer/getLiveness()"    # 200 while the process serves
+curl -i "http://localhost:4004/api/v1/indexer/getReadiness()" # 200 when ready, else 503 naming the failing check
+curl "http://localhost:4004/api/v1/indexer/getHealth()"
+curl "http://localhost:4004/api/v1/indexer/getMetrics()"      # Prometheus text inside {"value": "..."}
 ```
 
-```bash
-curl -H "authorization: Bearer $TOKEN" http://localhost:4004/nightgate/metrics
-curl -H "authorization: Bearer $TOKEN" http://localhost:4004/nightgate/health
-curl -i -H "authorization: Bearer $TOKEN" http://localhost:4004/nightgate/ready
-```
-
-Same payloads as the OData functions (`srv/monitoring/status.ts`).
-`/nightgate/ready` answers 200 when ready, else 503 naming the failing check.
-
-The prefix keeps them off the host app's own `/health`. Override with
-`NIGHTGATE_STATUS_ROUTES_PREFIX`; `NIGHTGATE_STATUS_ROUTES=off` disables them.
+The container HEALTHCHECK (`docker/healthcheck.mjs`) probes `getReadiness()`.
+Payloads come from `srv/monitoring/status.ts`.
 
 - `getRuntimeInfo()`: per contract the loaded digest and the current file
   digest. `digestStale: true` = artifacts replaced under the running server;

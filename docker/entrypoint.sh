@@ -66,25 +66,6 @@ if [ -z "$DB_URL" ]; then
     mkdir -p "$(dirname "$DB_PATH")"
 fi
 
-# The image's HEALTHCHECK asks Nightgate's readiness route, which needs the
-# routes mounted. They are fail-closed by design (they sit outside CAP
-# authentication), so when the operator has configured neither a token nor
-# explicit public access, generate an INTERNAL token: the routes then exist for
-# the container itself and stay closed to everyone else. The token goes to a
-# file because a HEALTHCHECK does not see variables exported here.
-STATUS_TOKEN_FILE=/tmp/nightgate-status-token
-if [ -z "${NIGHTGATE_STATUS_TOKEN:-}" ] \
-   && [ "${NIGHTGATE_STATUS_ROUTES:-}" != "public" ] \
-   && [ "${NIGHTGATE_STATUS_ROUTES:-}" != "off" ]; then
-    NIGHTGATE_STATUS_TOKEN="$(node -e 'console.log(require("crypto").randomBytes(32).toString("hex"))')"
-    export NIGHTGATE_STATUS_TOKEN
-    echo "NOTE: generated an internal status-route token for the container healthcheck. Set NIGHTGATE_STATUS_TOKEN to scrape /nightgate/metrics from outside."
-fi
-if [ -n "${NIGHTGATE_STATUS_TOKEN:-}" ]; then
-    printf '%s' "$NIGHTGATE_STATUS_TOKEN" > "$STATUS_TOKEN_FILE"
-    chmod 600 "$STATUS_TOKEN_FILE"
-fi
-
 AUTH_KIND="${NIGHTGATE_AUTH:-basic}"
 if [ "$AUTH_KIND" = "dummy" ]; then
     echo "WARN: NIGHTGATE_AUTH=dummy serves UNAUTHENTICATED. Local testing only." >&2

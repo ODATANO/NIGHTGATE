@@ -129,9 +129,6 @@ are clamped with a warning; booleans: `true`/`false`, `1`/`0`, `yes`/`no`,
 | `NIGHTGATE_REPLICA_COUNT` | int (min 1) |  | Actual process/replica count. Must be `1`; takes precedence over CDS `replicaCount` |
 | `NIGHTGATE_ALLOW_PRODUCTION_SQLITE` | bool | `false` | `true` temporarily permits production SQLite with a high-severity warning; intended only for a migration window |
 | `NIGHTGATE_ASSUME_DB_NETWORK` | string |  | Confirms which network an index without a recorded network id belongs to; the boot guard refuses to bind such an index to the configured network otherwise. |
-| `NIGHTGATE_STATUS_ROUTES` | `off` / `public` |  | Plain `/nightgate/metrics|health|ready` routes: unset = mounted only with `NIGHTGATE_STATUS_TOKEN`, `public` = mounted without a token, `off` = not mounted. |
-| `NIGHTGATE_STATUS_ROUTES_PREFIX` | path | `/nightgate` | Path prefix of the plain status routes. |
-| `NIGHTGATE_STATUS_TOKEN` | secret |  | Bearer token the plain status routes require; without it (and without `NIGHTGATE_STATUS_ROUTES=public`) they are not mounted. |
 | `NIGHTGATE_DEBUG_WALLET_SYNC` | bool | `false` | `true` logs wallet sync-state persistence at debug level |
 | `NIGHTGATE_CRAWLER_ENABLED` | bool |  | `false` / `0` / `no` / `off` disables the crawler at boot |
 | `NIGHTGATE_FETCH_CONCURRENCY` | int (min 1) |  | Override `crawler.fetchConcurrency` |

@@ -1,4 +1,4 @@
-/** Status builders shared by the NightgateIndexerService functions and the plain routes in src/status-routes.ts. */
+/** Status builders behind the NightgateIndexerService probe functions. */
 
 import cds from '@sap/cds';
 const { SELECT } = cds.ql;
@@ -147,7 +147,7 @@ export async function buildReadiness(db: Db): Promise<Record<string, unknown>> {
 
 /**
  * Sanitised reason: the raw `lastError` can carry the database path and SQL,
- * and this payload may be public (NIGHTGATE_STATUS_ROUTES=public).
+ * and this payload is public (getReadiness is anonymous).
  */
 function summariseInitFailure(runtime: { mode?: string; lastError?: string } | null): string {
     if (!runtime || runtime.mode === 'idle') {

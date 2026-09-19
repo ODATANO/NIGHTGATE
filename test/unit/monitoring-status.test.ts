@@ -206,10 +206,9 @@ describe('buildReadiness', () => {
         expect((readiness.checks as any).initialization).toBe(false);
         expect(readiness.initializationMode).toBe('offline');
 
-        // The reason travels with the answer, but SANITISED. This payload is
-        // reachable anonymously when an operator chooses
-        // NIGHTGATE_STATUS_ROUTES=public, and SchemaNotDeployedError carries
-        // the absolute database path plus the driver's SQL.
+        // The reason travels with the answer, but SANITISED: getReadiness is
+        // anonymous, and SchemaNotDeployedError carries the absolute database
+        // path plus the driver's SQL.
         const warnings = (readiness.runtimeWarnings as string[]).join(' ');
         expect(warnings).toContain('schema is not deployed');
         expect(warnings).toContain('nightgate-schema-delta');

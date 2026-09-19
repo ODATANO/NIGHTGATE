@@ -747,12 +747,7 @@ The crawler's view, not the wallet's; with `NIGHTGATE_CRAWLER_ENABLED=false` it 
 
 `getMetrics` returns Prometheus text, prefix `odatano_nightgate_*`: chain and indexed height, sync lag, block throughput, error counts, uptime, sync status (stopped=0, syncing=1, synced=2, error=3), runtime topology (`_runtime_topology_valid`, `_runtime_replicas`, `_runtime_database_info`), jobs (`_jobs_queued`, `_jobs_running`, `_jobs_reconciliation_required`, `_jobs_oldest_queued_seconds`) and wallet worker (`_wallet_worker_running`, `_wallet_worker_inflight_rpcs`, `_wallet_worker_exits`).
 
-**Scrapers use the plain routes:** over OData the text arrives wrapped in JSON. `GET /nightgate/metrics` serves it as `text/plain`, with `GET /nightgate/health` and `GET /nightgate/ready` for probes (same code, same payloads). They are mounted before CAP's authentication middleware, so OData auth does not protect them:
-
-- **Fail-closed:** nothing is mounted unless `NIGHTGATE_STATUS_TOKEN=<secret>` (requires `Authorization: Bearer <secret>`, constant-time compare) or `NIGHTGATE_STATUS_ROUTES=public` is set. `NIGHTGATE_STATUS_ROUTES=off` disables them.
-- **Namespaced:** under `/nightgate` (`NIGHTGATE_STATUS_ROUTES_PREFIX`), so the host app's own `/health` is never shadowed.
-
-Error responses carry no internal detail; the reason goes to the log.
+Over OData the text arrives wrapped in JSON (`{"value":"..."}`); unwrap it before feeding a Prometheus parser. The five read-only probes (`getLiveness`, `getReadiness`, `getMetrics`, `getSyncStatus`, `getHealth`) are anonymous at the model level, so a scraper or a K8s probe needs no credentials; `getReadiness()` answers 503 when a check fails. (Up to 0.24.3 the image also served plain `/nightgate/metrics|health|ready` routes behind their own bearer token; they are gone, the OData functions are the one surface.)
 
 ### `getRuntimeInfo() → { version, apiVersion, network, provingMode, instanceId, runtimeMode, databaseKind, uptime, contracts[] }`
 

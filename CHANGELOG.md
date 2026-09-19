@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.24.4 - 2026-09-19
+
+- One status surface. The plain `/nightgate/metrics|health|ready` routes,
+  `NIGHTGATE_STATUS_TOKEN`, `NIGHTGATE_STATUS_ROUTES`,
+  `NIGHTGATE_STATUS_ROUTES_PREFIX` and the internal token the image
+  entrypoint generated for its own healthcheck are removed. The read-only
+  probes of the indexer service (`getLiveness`, `getReadiness`,
+  `getMetrics`, `getSyncStatus`, `getHealth`) are anonymous at the model
+  level since 0.24.3 and answer the same payloads through CAP; the container
+  HEALTHCHECK now asks `getReadiness()`. `getMetrics()` keeps returning the
+  Prometheus text inside the OData envelope. A scraper that used
+  `/nightgate/metrics` reads `getMetrics()` and unwraps `value`.
+
 ## 0.24.3 - 2026-09-19
 
 - Transport auth of the standalone image moves to `@odatano/cap-auth`
