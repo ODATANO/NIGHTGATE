@@ -8,6 +8,7 @@ import { initialize, shutdown, SchemaNotDeployedError } from './index';
 import { mountZkConfigRoute, mountContractManifestRoute } from './connector-routes';
 import { mountStatusRoutes } from './status-routes';
 import { applyPoolDefault } from './cap-pool-default';
+import { registerNightgateTransportLanes } from '../srv/utils/transport-lanes';
 
 const log = cds.log('nightgate');
 
@@ -81,6 +82,9 @@ function registerLifecycle(): void {
 
 if (!registered) {
     registerModels();
+    // Lanes for a host running @odatano/cap-auth as its auth impl (the
+    // standalone image does); must precede CAP building its middlewares.
+    registerNightgateTransportLanes();
     registerConnectorRoutes();
     registerLifecycle();
     registered = true;

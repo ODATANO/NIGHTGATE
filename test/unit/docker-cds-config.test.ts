@@ -23,7 +23,7 @@ describe('docker/cds-config.mjs', () => {
         expect(r.code).toBe(0);
         const cfg = JSON.parse(r.out);
         expect(cfg.requires.db).toEqual({ kind: 'sqlite', credentials: { url: '/data/nightgate.db' }, client: { timeout: 30000 } });
-        expect(cfg.requires.auth).toEqual({ impl: './srv/utils/agent-token-auth.js', users: { nightgate: { password: 'pw', roles: ['admin'] } } });
+        expect(cfg.requires.auth).toEqual({ kind: 'basic', impl: '@odatano/cap-auth', realm: 'nightgate', users: { nightgate: { password: 'pw', roles: ['admin'] } } });
     });
 
     it('masks the agent token header in the JSON request log (CAP prints every header otherwise)', () => {

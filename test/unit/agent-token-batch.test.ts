@@ -8,12 +8,14 @@
  */
 
 import cds from '@sap/cds';
-import path from 'node:path';
 import crypto from 'node:crypto';
 
 // The standalone image's auth: basic for the operator, token lane for agents.
+// Credential-free requests are anonymous here, not privileged (vitest.setup).
+cds.User.default = (cds.User as unknown as { Anonymous: typeof cds.User.default }).Anonymous;
 (cds as any).env.requires.auth = {
-    impl: path.resolve(__dirname, '../../srv/utils/agent-token-auth.js'),
+    kind: 'basic',
+    impl: '@odatano/cap-auth',
     users: { nightgate: { password: 'op-secret', roles: ['admin'] } }
 };
 
@@ -79,8 +81,9 @@ describe('agent token on a real $batch', () => {
         expect(res.data.responses[0].status).toBe(200);
     });
 
-    it('a batch without any credentials is refused at transport level', async () => {
+    it('a batch without any credentials is anonymous and refused by the model (the transport opens nothing)', async () => {
         const res = await batch({}, [{ id: 'r1', method: 'GET', url: 'WalletSessions' }]);
         expect(res.status).toBe(401);
+        expect(res.headers['www-authenticate']).toMatch(/^Basic/);
     });
 });

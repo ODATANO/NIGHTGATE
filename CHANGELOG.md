@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.24.3 - 2026-09-19
+
+- Transport auth of the standalone image moves to `@odatano/cap-auth`
+  (`cds.requires.auth.impl`, `kind: basic`, `realm: nightgate`). The
+  package runs its basic lane (timing-safe compare, 20 failures per 15 min
+  per client address and user, then 429 with `Retry-After`), then the
+  registered lanes, then CAP's own strategy for `kind`; it sends no
+  terminal 401 of its own. NIGHTGATE registers two lanes from the plugin
+  (`srv/utils/transport-lanes.ts`): the agent token on `/api/v1/nightgate`
+  (marker principal, the grant hook authenticates, also per `$batch` part)
+  and the public verify lane under `NIGHTGATE_PUBLIC_VERIFY`. A request
+  without credentials is CAP's: the anonymous indexer probes (getLiveness,
+  getReadiness, getMetrics, getSyncStatus, getHealth) answer 200 through
+  the model on the image now (0.24.2 opened them in the model; the image's
+  middleware still refused them before CAP saw the request), everything
+  `authenticated-user` gets CAP's `WWW-Authenticate` challenge. A wrong
+  basic credential never reaches a lane. The model test pins a
+  service-level `@requires` on every served service; the package's
+  contract table runs against the booted services
+  (`test/unit/transport-auth-contract.test.ts`).
+  `srv/utils/agent-token-auth.ts` is gone. Consumer hosts are unaffected
+  (the lanes only act under `@odatano/cap-auth`).
+
 ## 0.24.2 - 2026-09-19
 
 - `NightgateIndexerService.getLiveness()` answered 401 without credentials

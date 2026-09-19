@@ -7,12 +7,12 @@
  * the outage case is driven by publishing the offline state.
  */
 import cds from '@sap/cds';
-import path from 'node:path';
 import { publishRuntimeState, __resetRuntimeStateForTests } from '../../srv/utils/runtime-state';
 import { isRuntimeWriteEvent, runtimeUnavailableReason, RUNTIME_FREE_ACTIONS } from '../../srv/utils/runtime-gate';
 
 (cds as any).env.requires.auth = {
-    impl: path.resolve(__dirname, '../../srv/utils/agent-token-auth.js'),
+    kind: 'basic',
+    impl: '@odatano/cap-auth',
     users: { operator: { password: 'op-secret', roles: [] } }
 };
 const cap = cds.test(__dirname + '/../..');

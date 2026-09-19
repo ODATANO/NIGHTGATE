@@ -100,7 +100,7 @@ export function authConfig(env = process.env) {
     // The single configured user IS the operator of this deployment, so it
     // carries the admin role unless NIGHTGATE_HTTP_ROLES says otherwise.
     const roles = String(env.NIGHTGATE_HTTP_ROLES ?? 'admin').split(',').map(r => r.trim()).filter(Boolean);
-    return { impl: './srv/utils/agent-token-auth.js', users: { [user]: { password, roles } } };
+    return { kind: 'basic', impl: '@odatano/cap-auth', realm: 'nightgate', users: { [user]: { password, roles } } };
 }
 
 /**

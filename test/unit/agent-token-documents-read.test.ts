@@ -7,11 +7,11 @@
  */
 
 import cds from '@sap/cds';
-import path from 'node:path';
 import crypto from 'node:crypto';
 
 (cds as any).env.requires.auth = {
-    impl: path.resolve(__dirname, '../../srv/utils/agent-token-auth.js'),
+    kind: 'basic',
+    impl: '@odatano/cap-auth',
     users: { 'operator-docs': { password: 'op-secret', roles: [] } }
 };
 

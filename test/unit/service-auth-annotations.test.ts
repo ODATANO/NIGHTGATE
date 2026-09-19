@@ -74,4 +74,13 @@ describe('service auth annotations (anonymous liveness and verify lane)', () => 
         expect(svc.kind).toBe('service');
         expect(svc['@requires']).not.toBe('any');
     });
+
+    it('every served service carries a service-level @requires (no service relies on the production default)', async () => {
+        const csn = await cds.load(path.resolve(__dirname, '../../srv'));
+        const services = Object.entries(csn.definitions as unknown as Record<string, Def>).filter(([, d]) => d.kind === 'service');
+        expect(services.length).toBeGreaterThanOrEqual(5);
+        for (const [name, d] of services) {
+            expect(typeof d['@requires'] === 'string' || Array.isArray(d['@requires']), `${name} needs a service-level @requires`).toBe(true);
+        }
+    });
 });

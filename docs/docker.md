@@ -40,7 +40,12 @@ uid 1000 (`chown 1000:1000 <dir>`).
 
 Listens on `http://localhost:4004`: `/api/v1/nightgate`, `/api/v1/indexer`,
 `/api/v1/analytics`, `/api/v1/admin`. HTTP basic auth (`nightgate` / your
-password); agent requests use `x-agent-token`.
+password) via `@odatano/cap-auth` (`kind: basic`, realm `nightgate`; 20
+failed attempts per 15 min per client address and user, then 429 with
+`Retry-After`); agent requests use `x-agent-token`. A request without
+credentials is anonymous and the CDS model decides: the read-only indexer
+probes (`getLiveness`, `getReadiness`, `getMetrics`, `getSyncStatus`,
+`getHealth`) answer without credentials, everything else challenges.
 
 ## Configuration
 

@@ -449,9 +449,12 @@ crash recovery only.
 
 NIGHTGATE installs no global HTTP middleware; CORS, CSP, HSTS and preflight are
 host policy. Hosts serving `/zk-config/...` or `/contract-manifest`
-cross-origin add them to their CORS allow-list. Exception in the standalone
-image's transport auth, not the plugin: with `NIGHTGATE_PUBLIC_VERIFY=true` it
-admits `/api/v1/verify` without credentials and answers its preflight with `*`.
+cross-origin add them to their CORS allow-list. The plugin registers two
+transport lanes with `@odatano/cap-auth` (agent token on `/api/v1/nightgate`,
+public verify under `NIGHTGATE_PUBLIC_VERIFY`); they act only in a host that
+runs that package as its `cds.requires.auth.impl`, as the standalone image
+does. There, with `NIGHTGATE_PUBLIC_VERIFY=true`, `/api/v1/verify` is admitted
+without credentials and its preflight answered with `*`.
 
 ## Programmatic API
 
