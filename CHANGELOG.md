@@ -16,6 +16,10 @@
   `admin`. Behind api.nightgate.dev the gateway still requires a key for
   `/api/v1/indexer/*`. A model test pins the layout
   (`test/unit/service-auth-annotations.test.ts`).
+- `eslint` is pinned exactly (10.11.0). `@sap/cds-dk` bundles `@eslint/js`,
+  whose `eslint` peer range npm re-resolves against the registry during
+  `npm ci`; with a caret range every new eslint release made the lockfile
+  look out of sync and failed CI.
 
 ## 0.24.1 - 2026-09-17
 
