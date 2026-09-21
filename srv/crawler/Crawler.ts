@@ -9,6 +9,8 @@ import { isTransientError, calcBackoff } from '../utils/retry';
 import { ensureSyncStateSingleton } from '../utils/sync-state';
 const log = cds.log('nightgate:crawler');
 import { rollbackIndexedDataFromHeight } from './rollback';
+import { LedgerPayloadDecoder } from './LedgerPayloadDecoder';
+import { IndexerSupplement } from './IndexerSupplement';
 import { SyncState, ReorgLog, Blocks } from '#cds-models/midnight';
 
 export interface CrawlerConfig {
@@ -22,6 +24,9 @@ export interface CrawlerConfig {
     rpcBatchSize?: number; // Number of consecutive heights bundled into one JSON-RPC batch frame (default: 32)
     startHeight?: number;  // First height to index on an EMPTY index (default: 0, from genesis)
     maxBlocksPerSecond?: number;  // Catch-up rate cap (default: 0, unlimited)
+    decodePayloads?: boolean;  // Decode stored ledger payloads in a trailing pass (default: false)
+    indexerSupplement?: boolean;  // Fill what a block lacks from the indexer (default: false)
+    indexerUrl?: string;  // GraphQL endpoint for the supplement pass
 }
 
 interface ReorgInfo {
@@ -51,6 +56,10 @@ export class MidnightCrawler {
     /** A block that fails deterministically; set to stop retrying it on every finalized head. */
     private poisonBlock: { height: number; message: string } | null = null;
 
+    /** Passes that trail the indexed tip; both off unless configured. */
+    private decoder: LedgerPayloadDecoder | null = null;
+    private supplement: IndexerSupplement | null = null;
+
     private config: Required<CrawlerConfig>;
 
     constructor(
@@ -67,7 +76,10 @@ export class MidnightCrawler {
             fetchConcurrency: config.fetchConcurrency ?? 8,
             rpcBatchSize: config.rpcBatchSize ?? 32,
             startHeight: config.startHeight ?? 0,
-            maxBlocksPerSecond: config.maxBlocksPerSecond ?? 0
+            maxBlocksPerSecond: config.maxBlocksPerSecond ?? 0,
+            decodePayloads: config.decodePayloads ?? false,
+            indexerSupplement: config.indexerSupplement ?? false,
+            indexerUrl: config.indexerUrl || ''
         };
     }
 
@@ -115,10 +127,41 @@ export class MidnightCrawler {
                 });
             }
 
+            await this.startTrailingPasses();
             this.driveIngest();
         } catch (err) {
             this.isRunning = false;
             throw err;
+        }
+    }
+
+    /**
+     * The decode and supplement passes run behind the indexed tip, independent
+     * of the ingest pipeline: neither blocks indexing, and a failure in either
+     * leaves the index itself untouched.
+     */
+    private async startTrailingPasses(): Promise<void> {
+        if (this.config.decodePayloads) {
+            this.decoder = new LedgerPayloadDecoder({ batchSize: 25, intervalMs: 1000, lagBlocks: 10 });
+            await this.decoder.init(this.db);
+            this.decoder.start();
+            log.info('Ledger payload decoding enabled (trailing pass)');
+        }
+        if (this.config.indexerSupplement) {
+            if (!this.config.indexerUrl) {
+                log.warn('Indexer supplement requested without an indexer URL; the pass stays off');
+            } else {
+                this.supplement = new IndexerSupplement({
+                    url: this.config.indexerUrl,
+                    batchSize: 25,
+                    intervalMs: 1000,
+                    lagBlocks: 10,
+                    requestTimeoutMs: this.config.requestTimeout
+                });
+                await this.supplement.init(this.db);
+                this.supplement.start();
+                log.info('Indexer supplement enabled (trailing pass)');
+            }
         }
     }
 
@@ -170,6 +213,10 @@ export class MidnightCrawler {
     async stop(): Promise<void> {
         log.info('Stopping...');
         this.isRunning = false;
+
+        await Promise.allSettled([this.decoder?.stop(), this.supplement?.stop()]);
+        this.decoder = null;
+        this.supplement = null;
 
         const inflight = [this.ingestPromise, this.liveProcessing].filter((p): p is Promise<void> => !!p);
         if (inflight.length > 0) {

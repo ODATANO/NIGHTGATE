@@ -285,12 +285,16 @@ export function resolveNightgateRuntimeConfig(config: Record<string, any> = {}):
     const startHeightEnv = configInt('NIGHTGATE_CRAWLER_START_HEIGHT');
     const maxBlocksPerSecondEnv = configInt('NIGHTGATE_CRAWLER_MAX_BPS');
     const crawlerEnabledOverride = configBool('NIGHTGATE_CRAWLER_ENABLED');
+    const decodePayloadsEnv = configBool('NIGHTGATE_CRAWLER_DECODE_PAYLOADS');
+    const indexerSupplementEnv = configBool('NIGHTGATE_CRAWLER_INDEXER_SUPPLEMENT');
     const crawlerConfig: Record<string, unknown> = {
         ...rawCrawlerConfig,
         ...(fetchConcurrencyEnv != null && { fetchConcurrency: fetchConcurrencyEnv }),
         ...(rpcBatchSizeEnv != null && { rpcBatchSize: rpcBatchSizeEnv }),
         ...(startHeightEnv != null && { startHeight: startHeightEnv }),
         ...(maxBlocksPerSecondEnv != null && { maxBlocksPerSecond: maxBlocksPerSecondEnv }),
+        ...(decodePayloadsEnv != null && { decodePayloads: decodePayloadsEnv }),
+        ...(indexerSupplementEnv != null && { indexerSupplement: indexerSupplementEnv }),
         ...(crawlerEnabledOverride != null && { enabled: crawlerEnabledOverride })
     };
     const configuredNetwork = getConfiguredNightgateNetwork(config);
@@ -298,6 +302,9 @@ export function resolveNightgateRuntimeConfig(config: Record<string, any> = {}):
     const nodeUrl = getConfiguredNightgateNodeUrl(config) || DEFAULT_NODE_URLS[network] || DEFAULT_NODE_URL;
     const crawlerNodeUrl = getConfiguredNightgateCrawlerNodeUrl(config) || nodeUrl;
     const submissionEndpoints = resolveSubmissionEndpoints(network, config);
+    // The supplement reads the same indexer the submission side is configured
+    // with; nothing else in the crawler knows about it.
+    crawlerConfig.indexerUrl = crawlerConfig.indexerUrl || submissionEndpoints.indexerHttpUrl;
 
     return {
         network,

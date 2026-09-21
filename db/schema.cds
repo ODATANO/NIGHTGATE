@@ -13,6 +13,7 @@ using {
     TransactionType,
     ContractActionType,
     DustLedgerEventType,
+    PayloadDecodeState,
     TxType,
     SyncStatus,
     PendingSubmissionStatus,
@@ -28,7 +29,12 @@ entity Blocks : cuid, managed {
     protocolVersion  : Integer not null;
     timestamp        : Integer not null; // UNIX timestamp
     author           : HexEncoded;
-    ledgerParameters : HexEncoded not null;
+    stateRoot        : HexEncoded; // substrate header state root
+    // The ledger's parameters, which decide fee pricing. Not in the block the
+    // node serves, so the indexer supplement fills it, and only when they
+    // CHANGED: null means "as at the last lower block that carries them".
+    // They are 724 bytes and hold for thousands of blocks at a time.
+    ledgerParameters : LargeBinary;
 
     parent           : Association to Blocks;
     transactions     : Composition of many Transactions
@@ -42,7 +48,10 @@ entity Blocks : cuid, managed {
 ]
 entity Transactions : cuid, managed {
     transactionId            : Integer not null; // index within block
-    hash                     : HexEncoded not null;
+    hash                     : HexEncoded not null; // blake2b of the extrinsic bytes
+    // Hash of the ledger transaction the extrinsic carries, from the pallet's
+    // own report. What an explorer and the Midnight indexer key a tx by.
+    ledgerTxHash             : HexEncoded;
     protocolVersion          : Integer not null;
     raw                      : LargeBinary; // serialized transaction
     transactionType          : TransactionType not null;
@@ -59,12 +68,20 @@ entity Transactions : cuid, managed {
     senderAddress            : String(256); // unshielded txs only
     receiverAddress          : String(256); // unshielded txs only
     nightAmount              : BigInt;
-    dustConsumed             : BigInt; // fees
+    dustConsumed             : BigInt; // DUST the transaction's spends declare
     hasProof                 : Boolean default false;
     proofHash                : HexEncoded;
     contractAddress          : HexEncoded;
     circuitName              : String(100); // contract calls only
     size                     : Integer; // bytes
+
+    // From the serialized ledger transaction, filled by the decoder pass.
+    payloadDecode            : PayloadDecodeState;
+    zswapInputCount          : Integer;
+    zswapOutputCount         : Integer;
+    zswapTransientCount      : Integer;
+    dustSpendCount           : Integer;
+    dustRegistrationCount    : Integer;
 
     block                    : Association to Blocks not null;
     transactionResult        : Composition of one TransactionResults
@@ -105,8 +122,12 @@ entity TransactionFees : cuid {
 }
 
 entity ContractActions : cuid, managed {
-    address            : HexEncoded; // null until the ledger payload is decoded
-    state              : LargeBinary; // null until the ledger payload is decoded
+    // Position within the transaction, in the order the pallet reported the
+    // actions. Two calls on ONE contract are otherwise indistinguishable, and
+    // their circuit names and states would be assigned by chance.
+    actionIndex        : Integer;
+    address            : HexEncoded; // from the pallet's contract event
+    state              : LargeBinary; // not on the block; the indexer supplement fills it
     zswapState         : LargeBinary;
     actionType         : ContractActionType not null;
     entryPoint         : String(256); // CALL only
@@ -123,8 +144,10 @@ entity ContractBalances : cuid {
     contractAction : Association to ContractActions;
 }
 
+// The ledger identifies a UTXO by its intent and output number, and one
+// transaction can carry several intents whose outputs both start at 0.
 @assert.unique.createdOutput: [
-    createdAtTransaction,
+    intentHash,
     outputIndex
 ]
 entity UnshieldedUtxos : cuid, managed {
@@ -222,6 +245,10 @@ entity SyncState {
         lastIndexedHeight   : Integer64 default 0;
         lastIndexedHash     : HexEncoded;
         lastIndexedAt       : Timestamp;
+
+        // Cursors of the two passes that trail the indexed tip. Null = never run.
+        lastDecodedHeight   : Integer64;
+        lastSupplementedHeight : Integer64;
 
         lastFinalizedHeight : Integer64 default 0;
         lastFinalizedHash   : HexEncoded;

@@ -53,7 +53,7 @@ async function seedBlock(height: number, hash: string): Promise<void> {
         height,
         protocolVersion: 1,
         timestamp: 1700000000 + height,
-        ledgerParameters: '0xabcd'
+        stateRoot: '0xabcd'
     }));
 }
 

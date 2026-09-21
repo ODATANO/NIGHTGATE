@@ -1,5 +1,45 @@
 # Changelog
 
+## 0.25.0 - 2026-09-21
+
+- The crawler indexes unshielded UTXOs. `Midnight.UnshieldedTokens` in
+  `System.Events` carries a transaction's consumed and produced outputs, and
+  the crawler already fetched and decoded those records; `UnshieldedUtxos` and
+  `NightBalances` now fill from them. The Bech32m owner and the DUST
+  `initialNonce` are derived per row and match the Midnight indexer's values.
+- `ContractActions` carry their `address` and record a maintenance update as
+  `UPDATE`, one row per action the chain reported, so a transaction that only
+  moved tokens no longer produces a spurious `CALL` row. These are the actions
+  that APPLIED; a call in a failed segment is not among them.
+- `Transactions` carry `ledgerTxHash`, `contractAddress`, and
+  `senderAddress` / `receiverAddress` / `nightAmount` for an unambiguous
+  one-to-one transfer. `txType` follows the reported events, so deploys,
+  maintenance updates and plain transfers are told apart.
+- `TransactionResults` record `PARTIAL_SUCCESS`, which the model had and
+  nothing ever wrote.
+- Two optional passes trail the indexed tip, both off by default.
+  `crawler.decodePayloads` / `NIGHTGATE_CRAWLER_DECODE_PAYLOADS` decodes the
+  stored ledger payload into circuit names, identifiers and the zswap and DUST
+  counts, recording the outcome in `Transactions.payloadDecode`.
+  `crawler.indexerSupplement` / `NIGHTGATE_CRAWLER_INDEXER_SUPPLEMENT` fills
+  what a block does not carry from the Midnight indexer: `TransactionFees`,
+  `TransactionSegments`, `ContractActions.state`, `ContractBalances`, both
+  ledger-event streams and `registeredForDustGeneration`.
+- Both passes keep a cursor on `SyncState` and read it with `reorgGeneration`
+  in one query, advancing only when neither moved: a rollback to the cursor's
+  own height leaves the cursor alone, so the generation is the signal that a
+  pass's work is gone. Resetting a cursor replays the range.
+- `NightBalances` counts NIGHT only; other tokens in the same UTXO set were
+  being added to it.
+- `Blocks.stateRoot` holds the substrate header's state root, which was being
+  written into a column named `ledgerParameters`. That column now holds the
+  ledger parameters, filled by the supplement and only when they change.
+- **Schema delta.** `UnshieldedUtxos` is unique on `(intentHash, outputIndex)`:
+  one transaction can carry several intents whose outputs both start at 0.
+  New columns on `Transactions`, `ContractActions`, `Blocks` and `SyncState`.
+  `npx nightgate-schema-delta` migrates SQLite. An index built before this
+  release holds no UTXO rows; a full history needs a re-index.
+
 ## 0.24.5 - 2026-09-21
 
 - The crawler can index next to the submission side. `crawler.startHeight` /

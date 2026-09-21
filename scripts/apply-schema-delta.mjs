@@ -284,10 +284,11 @@ const migrate = () => {
                 console.log(`[delta] ~ cleared ${lossy} lossy Transactions.raw value(s) written before 0.23.0 and ${stateCleared} ContractActions.state copy(ies); run reindexFromHeight(0) on the indexer service to restore the extrinsic bytes`);
             // Values derived from the extrinsic ENVELOPE (a "contract address"
             // minted from the extrinsic hash, a NIGHT "transfer" read from any
-            // signed extrinsic whose args parsed as MultiAddress + Compact)
-            // are not produced by the current decoder, which leaves the
-            // columns null; clear them and the derived rows, a re-index
-            // writes none of them back.
+            // signed extrinsic whose args parsed as MultiAddress + Compact) are
+            // junk: the current crawler reads these columns off the chain's own
+            // events. Clear them and the derived rows; a re-index writes the
+            // real ones. Reached only from a pre-0.23.0 database, which is what
+            // the lossy `raw` above identifies.
             const addrCleared = db.prepare("UPDATE midnight_ContractActions SET address = NULL WHERE address IS NOT NULL").run()?.changes ?? 0;
             const txCleared = db.prepare("UPDATE midnight_Transactions SET contractAddress = NULL, senderAddress = NULL, receiverAddress = NULL, nightAmount = NULL WHERE contractAddress IS NOT NULL OR senderAddress IS NOT NULL OR receiverAddress IS NOT NULL OR nightAmount IS NOT NULL").run()?.changes ?? 0;
             let utxoCleared = 0, balanceCleared = 0;
@@ -299,6 +300,24 @@ const migrate = () => {
         }
     } catch (err) {
         console.warn(`[delta] ! raw cleanup skipped (${err.message}); run reindexFromHeight(0) once the server is up`);
+    }
+
+    // Before 0.25.0 the crawler wrote the substrate header's state root into a
+    // column named ledgerParameters, which is a different thing entirely. The
+    // value is good, the column was wrong: move it across once.
+    try {
+        const cols = new Set(db.prepare('PRAGMA table_info("midnight_Blocks")').all().map(r => r.name));
+        if (cols.has('stateRoot') && cols.has('ledgerParameters')) {
+            const moved = db.prepare(
+                'UPDATE midnight_Blocks SET stateRoot = ledgerParameters, ledgerParameters = NULL ' +
+                'WHERE stateRoot IS NULL AND ledgerParameters IS NOT NULL'
+            ).run()?.changes ?? 0;
+            if (moved > 0) {
+                console.log(`[delta] ~ moved ${moved} Blocks.ledgerParameters value(s) written before 0.25.0 into stateRoot, where they belong`);
+            }
+        }
+    } catch (err) {
+        console.warn(`[delta] ! Blocks.stateRoot migration skipped (${err.message})`);
     }
 
     // Restore views the target DDL does not manage from their snapshotted SQL.

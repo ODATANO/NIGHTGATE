@@ -77,7 +77,7 @@ async function seedBlock(height: number, overrides: Record<string, any> = {}): P
         height,
         protocolVersion: 1,
         timestamp: 1700000000 + height,
-        ledgerParameters: '0xabcd',
+        stateRoot: '0xabcd',
         ...overrides
     }));
     return id;
@@ -560,7 +560,7 @@ describe('read-only enforcement', () => {
                 height: 999,
                 protocolVersion: 1,
                 timestamp: 1,
-                ledgerParameters: '0x00'
+                stateRoot: '0x00'
             })
         ).rejects.toMatchObject({
             response: { status: 405 }

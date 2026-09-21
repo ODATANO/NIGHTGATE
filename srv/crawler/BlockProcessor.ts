@@ -7,8 +7,14 @@ import { TypeRegistry } from '@polkadot/types/create';
 import { Metadata } from '@polkadot/types/metadata';
 import { MidnightNodeProvider, SignedBlock } from '../providers/MidnightNodeProvider';
 import { ensureNightgateModelLoaded } from '../utils/cds-model';
-import { getNightgatePluginConfig } from '../utils/nightgate-config';
+import {
+    getNightgatePluginConfig, getConfiguredNightgateNetwork, normalizeNightgateNetwork
+} from '../utils/nightgate-config';
 import { parseExtrinsicCallIndices, parseExtrinsicCall, decodeCompactBigInt } from '../utils/scale';
+import {
+    readBlockEvents, txTypeFromEvents, projectTransfer, NIGHT_RAW_TOKEN_TYPE, type ExtrinsicEvents
+} from './block-events';
+import { encodeUnshieldedOwner, computeInitialNonce } from './utxo-identity';
 import {
     Blocks, Transactions, TransactionResults, TransactionFees, ContractActions,
     UnshieldedUtxos, NightBalances, SyncState
@@ -159,10 +165,45 @@ export interface PreparedBlockFetched {
     protocolVersion: number;
     palletMap: Map<number, PalletMapping>;
     timestamp: number;
-    extrinsicOutcomes: Map<number, 'SUCCESS' | 'FAILURE'>;
+    /** null when the block carried no readable events; the pallet map then classifies alone. */
+    extrinsicEvents: Map<number, ExtrinsicEvents> | null;
     fetchStartedAt: number;
     fetchCompletedAt?: number;
     alreadyIndexed: false;
+}
+
+/** One `UnshieldedUtxos` row, less the transaction it was created at. */
+interface PreparedUtxoRow {
+    owner: string;
+    tokenType: string;
+    value: string;
+    intentHash: string;
+    outputIndex: number;
+    initialNonce: string;
+    ctime: number;
+}
+
+/** What one extrinsic's events project onto columns, with addresses resolved. */
+interface EventProjection {
+    created: PreparedUtxoRow[];
+    spent: Array<{ intentHash: string; outputIndex: number }>;
+    senderAddress: string | null;
+    receiverAddress: string | null;
+    nightAmount: string | null;
+}
+
+/** Running NightBalances change for one address within a block. */
+interface BalanceDelta {
+    balance: bigint;
+    utxoCount: number;
+    totalReceived: bigint;
+    txReceivedCount: number;
+    totalSent: bigint;
+    txSentCount: number;
+}
+
+function emptyBalanceDelta(): BalanceDelta {
+    return { balance: 0n, utxoCount: 0, totalReceived: 0n, txReceivedCount: 0, totalSent: 0n, txSentCount: 0 };
 }
 
 export class BlockProcessor {
@@ -172,6 +213,8 @@ export class BlockProcessor {
     /** Event registry + pallet map per runtime specVersion, loaded once from the node's metadata. */
     private readonly runtimes = new Map<number, RuntimeContext>();
     private readonly palletOverrides = configPalletOverrides();
+    /** Bech32m HRP network of the unshielded owners this index stores. */
+    private resolvedNetwork?: string;
 
     /** Well-known Substrate storage key for Timestamp::Now (twox128("Timestamp") + twox128("Now")) */
     private static readonly TIMESTAMP_STORAGE_KEY =
@@ -280,7 +323,7 @@ export class BlockProcessor {
             const eventRegistry = await this.getEventRegistry(blockHash, protocolVersion);
             const palletMap = this.palletMapFor(protocolVersion);
             const timestamp = this.resolveTimestamp(tsResults[newIdx], signedBlock.block.extrinsics, `height ${heights[i]}`, palletMap);
-            const extrinsicOutcomes = this.decodeExtrinsicOutcomes(eventResults[newIdx], eventRegistry, `height ${heights[i]}`, signedBlock.block.extrinsics?.length ?? 0);
+            const extrinsicEvents = this.decodeBlockEvents(eventResults[newIdx], eventRegistry, `height ${heights[i]}`, signedBlock.block.extrinsics?.length ?? 0);
             newIdx++;
             out[i] = {
                 blockHash,
@@ -289,7 +332,7 @@ export class BlockProcessor {
                 protocolVersion,
                 palletMap,
                 timestamp,
-                extrinsicOutcomes,
+                extrinsicEvents,
                 fetchStartedAt,
                 fetchCompletedAt,
                 alreadyIndexed: false
@@ -391,7 +434,7 @@ export class BlockProcessor {
             protocolVersion,
             palletMap,
             timestamp,
-            extrinsicOutcomes: this.decodeExtrinsicOutcomes(rawEvents, eventRegistry, `block ${blockHash}`, signedBlock.block.extrinsics?.length ?? 0),
+            extrinsicEvents: this.decodeBlockEvents(rawEvents, eventRegistry, `block ${blockHash}`, signedBlock.block.extrinsics?.length ?? 0),
             fetchStartedAt: start,
             alreadyIndexed: false
         }, start, opts);
@@ -402,12 +445,17 @@ export class BlockProcessor {
         start: number,
         opts?: { requireParent?: boolean }
     ): Promise<ProcessResult> {
-        const { blockHash, height, signedBlock, protocolVersion, palletMap, timestamp, extrinsicOutcomes } = prep;
+        const { blockHash, height, signedBlock, protocolVersion, palletMap, timestamp, extrinsicEvents } = prep;
         const header = signedBlock.block.header;
         const extrinsics = signedBlock.block.extrinsics;
 
         let txCount = 0;
         let actionCount = 0;
+
+        // Bech32m encoding and the nonce derivation run before the transaction
+        // opens: both are SDK calls, and a db transaction is not the place to
+        // await one.
+        const projections = await this.projectEvents(extrinsicEvents, timestamp, `block ${blockHash}`);
 
         await this.db.tx(async (tx: any) => {
             const blockId = cds.utils.uuid();
@@ -429,7 +477,7 @@ export class BlockProcessor {
                 protocolVersion,
                 timestamp,
                 author: this.extractAuthor(header.digest?.logs),
-                ledgerParameters: header.stateRoot,
+                stateRoot: header.stateRoot,
                 parent_ID: parentBlock?.ID || null
             }));
 
@@ -437,6 +485,14 @@ export class BlockProcessor {
             const txResultRows: Record<string, unknown>[] = [];
             const txFeeRows: Record<string, unknown>[] = [];
             const contractActionRows: Record<string, unknown>[] = [];
+            const utxoRows: Record<string, unknown>[] = [];
+            const spendRequests: Array<{ intentHash: string; outputIndex: number; txId: string }> = [];
+            const balanceDeltas = new Map<string, BalanceDelta>();
+            const deltaFor = (address: string): BalanceDelta => {
+                let delta = balanceDeltas.get(address);
+                if (!delta) { delta = emptyBalanceDelta(); balanceDeltas.set(address, delta); }
+                return delta;
+            };
 
             for (let i = 0; i < extrinsics.length; i++) {
                 const extrinsicHex = extrinsics[i];
@@ -445,20 +501,22 @@ export class BlockProcessor {
                 const extrinsicHash = this.hashExtrinsic(extrinsicHex);
                 const txSize = this.extrinsicSize(extrinsicHex);
                 const circuitName = this.buildCircuitName(classification);
-                const contractActionType = this.toContractActionType(classification.txType);
-                const contractAddress: string | null = null;
-                const senderAddress: string | null = null;
-                const receiverAddress: string | null = null;
-                const nightAmount: string | null = null;
+                const events = extrinsicEvents?.get(i);
+                const projection = projections.get(i);
+                const contractAddress = events?.contracts[0]?.address ?? null;
+                const senderAddress = projection?.senderAddress ?? null;
+                const receiverAddress = projection?.receiverAddress ?? null;
+                const nightAmount = projection?.nightAmount ?? null;
 
                 txRows.push({
                     ID: txId,
                     transactionId: i,
                     hash: extrinsicHash,
+                    ledgerTxHash: events?.ledgerTxHash ?? null,
                     protocolVersion,
                     raw: hexToBinaryValue(extrinsicHex),
                     transactionType: classification.isSystem ? 'SYSTEM' : 'REGULAR',
-                    txType: classification.txType,
+                    txType: txTypeFromEvents(events) ?? classification.txType,
                     isShielded: classification.isShielded,
                     senderAddress,
                     receiverAddress,
@@ -471,7 +529,7 @@ export class BlockProcessor {
                     block_ID: blockId
                 });
 
-                const outcome = extrinsicOutcomes.get(i);
+                const outcome = this.outcomeFor(events);
                 if (outcome) {
                     txResultRows.push({
                         ID: cds.utils.uuid(),
@@ -488,16 +546,39 @@ export class BlockProcessor {
                     transaction_ID: txId
                 });
 
-                if (contractActionType) {
+                let actionIndex = 0;
+                for (const action of this.contractActionsFor(events, classification)) {
                     contractActionRows.push({
                         ID: cds.utils.uuid(),
-                        address: contractAddress,
-                        actionType: contractActionType,
+                        actionIndex: actionIndex++,
+                        address: action.address,
+                        actionType: action.actionType,
                         entryPoint: circuitName,
                         state: null,
                         transaction_ID: txId
                     });
                     actionCount++;
+                }
+
+                for (const utxo of projection?.created ?? []) {
+                    utxoRows.push({ ID: cds.utils.uuid(), ...utxo, createdAtTransaction_ID: txId });
+                    // A UTXO can hold any token; NightBalances counts NIGHT.
+                    if (utxo.tokenType !== NIGHT_RAW_TOKEN_TYPE) continue;
+                    const delta = deltaFor(utxo.owner);
+                    const value = BigInt(utxo.value);
+                    delta.balance += value;
+                    delta.utxoCount += 1;
+                    delta.totalReceived += value;
+                    delta.txReceivedCount += 1;
+                }
+                for (const spend of projection?.spent ?? []) {
+                    spendRequests.push({ ...spend, txId });
+                }
+                // Mirrors the sent-transaction rule in recomputeNightBalance.
+                if (senderAddress && receiverAddress && receiverAddress !== senderAddress && BigInt(nightAmount ?? '0') > 0n) {
+                    const delta = deltaFor(senderAddress);
+                    delta.totalSent += BigInt(nightAmount ?? '0');
+                    delta.txSentCount += 1;
                 }
 
                 txCount++;
@@ -507,6 +588,13 @@ export class BlockProcessor {
             if (txResultRows.length) await tx.run(INSERT.into(TransactionResults).entries(txResultRows));
             if (txFeeRows.length) await tx.run(INSERT.into(TransactionFees).entries(txFeeRows));
             if (contractActionRows.length) await tx.run(INSERT.into(ContractActions).entries(contractActionRows));
+            // Before the spends: a UTxO can be created and consumed in one block.
+            if (utxoRows.length) await tx.run(INSERT.into(UnshieldedUtxos).entries(utxoRows));
+
+            await this.applySpends(tx, spendRequests, deltaFor, height);
+            for (const [address, delta] of balanceDeltas) {
+                await this.applyBalanceDelta(tx, address, delta, height);
+            }
 
             await tx.run(
                 UPDATE.entity(SyncState).set({
@@ -525,6 +613,177 @@ export class BlockProcessor {
             contractActionCount: actionCount,
             processingTimeMs: Date.now() - start
         };
+    }
+
+    /** The network whose HRP unshielded owners are encoded under. */
+    private network(): string {
+        if (!this.resolvedNetwork) {
+            this.resolvedNetwork = normalizeNightgateNetwork(
+                getConfiguredNightgateNetwork(getNightgatePluginConfig())
+            ).network;
+        }
+        return this.resolvedNetwork;
+    }
+
+    /**
+     * Resolves each extrinsic's events into storable columns: Bech32m owners,
+     * DUST initial nonces and the transfer projection. An entry whose identity
+     * cannot be derived is dropped with a warning rather than failing the
+     * block, since `initialNonce` has no null form.
+     */
+    private async projectEvents(
+        extrinsicEvents: Map<number, ExtrinsicEvents> | null,
+        timestamp: number,
+        where: string
+    ): Promise<Map<number, EventProjection>> {
+        const projections = new Map<number, EventProjection>();
+        if (!extrinsicEvents) return projections;
+        const network = this.network();
+
+        for (const [index, events] of extrinsicEvents) {
+            if (!events.created.length && !events.spent.length) continue;
+
+            const created: PreparedUtxoRow[] = [];
+            for (const utxo of events.created) {
+                try {
+                    created.push({
+                        owner: await encodeUnshieldedOwner(utxo.address, network),
+                        tokenType: utxo.tokenType,
+                        value: utxo.value.toString(),
+                        intentHash: utxo.intentHash,
+                        outputIndex: utxo.outputNo,
+                        initialNonce: await computeInitialNonce(utxo.outputNo, utxo.intentHash),
+                        ctime: timestamp
+                    });
+                } catch (err) {
+                    log.warn(`${where}: UTXO ${utxo.intentHash}#${utxo.outputNo} not indexed: ${(err as Error).message}`);
+                }
+            }
+
+            const transfer = projectTransfer(events);
+            let senderAddress: string | null = null;
+            let receiverAddress: string | null = null;
+            try {
+                if (transfer.senderAddress) senderAddress = await encodeUnshieldedOwner(transfer.senderAddress, network);
+                if (transfer.receiverAddress) receiverAddress = await encodeUnshieldedOwner(transfer.receiverAddress, network);
+            } catch (err) {
+                log.warn(`${where}: transfer participants not resolved: ${(err as Error).message}`);
+                senderAddress = null;
+                receiverAddress = null;
+            }
+
+            projections.set(index, {
+                created,
+                spent: events.spent.map(u => ({ intentHash: u.intentHash, outputIndex: u.outputNo })),
+                senderAddress,
+                receiverAddress,
+                nightAmount: receiverAddress && transfer.nightAmount != null ? transfer.nightAmount.toString() : null
+            });
+        }
+        return projections;
+    }
+
+    /** FAILURE beats PARTIAL_SUCCESS beats SUCCESS. */
+    private outcomeFor(events: ExtrinsicEvents | undefined): 'SUCCESS' | 'PARTIAL_SUCCESS' | 'FAILURE' | null {
+        if (!events?.outcome) return null;
+        if (events.outcome === 'FAILURE') return 'FAILURE';
+        return events.partialSuccess ? 'PARTIAL_SUCCESS' : 'SUCCESS';
+    }
+
+    /**
+     * Contract actions of one extrinsic. The pallet's own report wins where it
+     * exists; the pallet-map classification only fills in for an extrinsic the
+     * chain said nothing about, since a pallet index alone cannot tell a
+     * contract call from a plain token movement.
+     */
+    private contractActionsFor(
+        events: ExtrinsicEvents | undefined,
+        classification: ExtrinsicClassification
+    ): Array<{ actionType: 'DEPLOY' | 'CALL' | 'UPDATE'; address: string | null }> {
+        if (events?.contracts.length) return events.contracts;
+        if (events?.applied) return [];
+        const fallback = this.toContractActionType(classification.txType);
+        return fallback ? [{ actionType: fallback, address: null }] : [];
+    }
+
+    /** Marks spent UTxOs and folds their value into the owners' balance deltas. */
+    private async applySpends(
+        tx: any,
+        spends: Array<{ intentHash: string; outputIndex: number; txId: string }>,
+        deltaFor: (address: string) => BalanceDelta,
+        height: number
+    ): Promise<void> {
+        for (const spend of spends) {
+            const row = await tx.run(
+                SELECT.one.from(UnshieldedUtxos)
+                    .columns('ID', 'owner', 'value', 'tokenType', 'spentAtTransaction_ID')
+                    .where({ intentHash: spend.intentHash, outputIndex: spend.outputIndex })
+            );
+            if (!row) {
+                // Normal below the first indexed height: the output predates the index.
+                log.debug(`spent UTXO ${spend.intentHash}#${spend.outputIndex} at height ${height} was never indexed`);
+                continue;
+            }
+            if (row.spentAtTransaction_ID) continue;
+            await tx.run(
+                UPDATE.entity(UnshieldedUtxos)
+                    .set({ spentAtTransaction_ID: spend.txId })
+                    .where({ ID: row.ID })
+            );
+            if (row.tokenType !== NIGHT_RAW_TOKEN_TYPE) continue;
+            const delta = deltaFor(row.owner);
+            delta.balance -= this.toBigInt(row.value);
+            delta.utxoCount -= 1;
+        }
+    }
+
+    /**
+     * Folds one block's change into an address's NightBalances row. Must stay
+     * the mirror of `recomputeNightBalance` in rollback.ts, which rebuilds the
+     * same figures from scratch after a reorg.
+     */
+    private async applyBalanceDelta(tx: any, address: string, delta: BalanceDelta, height: number): Promise<void> {
+        const nowIso = new Date().toISOString();
+        const existing = await tx.run(
+            SELECT.one.from(NightBalances)
+                .columns('address', 'balance', 'utxoCount', 'totalReceived', 'txReceivedCount',
+                    'totalSent', 'txSentCount', 'firstSeenHeight')
+                .where({ address })
+        );
+
+        if (!existing) {
+            await tx.run(INSERT.into(NightBalances).entries({
+                address,
+                balance: delta.balance.toString() as any,
+                utxoCount: delta.utxoCount,
+                totalReceived: delta.totalReceived.toString() as any,
+                txReceivedCount: delta.txReceivedCount,
+                totalSent: delta.totalSent.toString() as any,
+                txSentCount: delta.txSentCount,
+                firstSeenHeight: height,
+                firstSeenAt: nowIso,
+                lastActivityHeight: height,
+                lastActivityAt: nowIso,
+                lastUpdatedHeight: height,
+                lastUpdatedAt: nowIso
+            }));
+            return;
+        }
+
+        const priorFirstSeen = Number(existing.firstSeenHeight);
+        await tx.run(UPDATE.entity(NightBalances).set({
+            balance: (this.toBigInt(existing.balance) + delta.balance).toString() as any,
+            utxoCount: this.toInt(existing.utxoCount) + delta.utxoCount,
+            totalReceived: (this.toBigInt(existing.totalReceived) + delta.totalReceived).toString() as any,
+            txReceivedCount: this.toInt(existing.txReceivedCount) + delta.txReceivedCount,
+            totalSent: (this.toBigInt(existing.totalSent) + delta.totalSent).toString() as any,
+            txSentCount: this.toInt(existing.txSentCount) + delta.txSentCount,
+            firstSeenHeight: Number.isFinite(priorFirstSeen) ? Math.min(priorFirstSeen, height) : height,
+            lastActivityHeight: height,
+            lastActivityAt: nowIso,
+            lastUpdatedHeight: height,
+            lastUpdatedAt: nowIso
+        }).where({ address }));
     }
 
     /** Classify with the pallet map of the block's runtime; the default map only when none is given (tests). */
@@ -673,6 +932,31 @@ export class BlockProcessor {
         return map;
     }
 
+    /**
+     * Per-extrinsic events of one block. `null` means no event data at all
+     * (pruned storage or no metadata registry), which the persist path tells
+     * apart from a block whose extrinsics simply emitted nothing.
+     */
+    private decodeBlockEvents(
+        rawEvents: string | null | undefined,
+        registry: TypeRegistry | undefined,
+        where: string = '',
+        extrinsicCount: number = 0
+    ): Map<number, ExtrinsicEvents> | null {
+        if (!rawEvents || !registry) {
+            if (extrinsicCount > 0) {
+                log.warn(`${where || 'block'}: transaction outcomes unknown (${!rawEvents ? 'System.Events storage empty (pruned or racing node)' : 'no runtime metadata registry'}); ${extrinsicCount} extrinsic(s) get no TransactionResults row`);
+            }
+            return null;
+        }
+        try {
+            return readBlockEvents(registry.createType('Vec<EventRecord>', rawEvents) as any);
+        } catch (err) {
+            log.warn(`Failed to decode System.Events; transaction outcomes remain unknown: ${(err as Error).message}`);
+            return null;
+        }
+    }
+
     /** Outcome per extrinsic from System.ExtrinsicSuccess/ExtrinsicFailed only; a failure wins. */
     private decodeExtrinsicOutcomes(
         rawEvents: string | null | undefined,
@@ -681,25 +965,8 @@ export class BlockProcessor {
         extrinsicCount: number = 0
     ): Map<number, 'SUCCESS' | 'FAILURE'> {
         const outcomes = new Map<number, 'SUCCESS' | 'FAILURE'>();
-        if (!rawEvents || !registry) {
-            if (extrinsicCount > 0) {
-                log.warn(`${where || 'block'}: transaction outcomes unknown (${!rawEvents ? 'System.Events storage empty (pruned or racing node)' : 'no runtime metadata registry'}); ${extrinsicCount} extrinsic(s) get no TransactionResults row`);
-            }
-            return outcomes;
-        }
-        try {
-            const records: any = registry.createType('Vec<EventRecord>', rawEvents);
-            for (const record of records as any) {
-                if (!record.phase?.isApplyExtrinsic) continue;
-                const index = record.phase.asApplyExtrinsic.toNumber();
-                const section = String(record.event?.section ?? '').toLowerCase();
-                const method = String(record.event?.method ?? '');
-                if (section !== 'system') continue;
-                if (method === 'ExtrinsicFailed') outcomes.set(index, 'FAILURE');
-                else if (method === 'ExtrinsicSuccess' && outcomes.get(index) !== 'FAILURE') outcomes.set(index, 'SUCCESS');
-            }
-        } catch (err) {
-            log.warn(`Failed to decode System.Events; transaction outcomes remain unknown: ${(err as Error).message}`);
+        for (const [index, events] of this.decodeBlockEvents(rawEvents, registry, where, extrinsicCount) ?? []) {
+            if (events.outcome) outcomes.set(index, events.outcome);
         }
         return outcomes;
     }

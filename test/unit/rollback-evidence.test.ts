@@ -26,7 +26,7 @@ let db: any;
 async function seedBlock(height: number, hash: string): Promise<string> {
     const id = cds.utils.uuid();
     await db.run(cds.ql.INSERT.into(BLOCKS).entries({
-        ID: id, hash, height, protocolVersion: 1, timestamp: 1_700_000_000 + height, ledgerParameters: '0xabcd'
+        ID: id, hash, height, protocolVersion: 1, timestamp: 1_700_000_000 + height, stateRoot: '0xabcd'
     }));
     return id;
 }

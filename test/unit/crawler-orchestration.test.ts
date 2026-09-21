@@ -76,7 +76,7 @@ async function seedBlock(height: number, hash: string): Promise<string> {
         height,
         protocolVersion: 1,
         timestamp: 1_700_000_000 + height,
-        ledgerParameters: '0xabcd'
+        stateRoot: '0xabcd'
     }));
     return id;
 }
@@ -1337,7 +1337,7 @@ describe('MidnightCrawler orchestration', () => {
             const balanceId = cds.utils.uuid();
             await db.run(cds.ql.INSERT.into(CONTRACT_BALANCES).entries({
                 ID: balanceId,
-                tokenType: '0xtoken',
+                tokenType: '0'.repeat(64),
                 amount: '100',
                 contractAction_ID: actionId
             }));
@@ -1362,7 +1362,7 @@ describe('MidnightCrawler orchestration', () => {
             await db.run(cds.ql.INSERT.into(UNSHIELDED_UTXOS).entries({
                 ID: createdUtxo,
                 owner: 'addr_created',
-                tokenType: '0xtoken',
+                tokenType: '0'.repeat(64),
                 value: '50',
                 intentHash: '0xintent1',
                 outputIndex: 0,
@@ -1375,7 +1375,7 @@ describe('MidnightCrawler orchestration', () => {
             await db.run(cds.ql.INSERT.into(UNSHIELDED_UTXOS).entries({
                 ID: spentUtxo,
                 owner: 'addr_spent',
-                tokenType: '0xtoken',
+                tokenType: '0'.repeat(64),
                 value: '25',
                 intentHash: '0xintent2',
                 outputIndex: 0,
@@ -1427,13 +1427,16 @@ describe('MidnightCrawler orchestration', () => {
             const tx10 = await seedTransaction(block10, '0xtx10', 0, {
                 senderAddress: 'addr_a', receiverAddress: 'addr_b', nightAmount: '100'
             });
-            for (const [txId, value, nonce] of [[tx9, '50', '0xn9'], [tx10, '100', '0xn10']] as const) {
+            for (const [txId, value, nonce, intentHash] of [
+                [tx9, '50', '0xn9', '0xintent9'],
+                [tx10, '100', '0xn10', '0xintent10']
+            ] as const) {
                 await db.run(cds.ql.INSERT.into(UNSHIELDED_UTXOS).entries({
                     ID: cds.utils.uuid(),
                     owner: 'addr_b',
-                    tokenType: '0xtoken',
+                    tokenType: '0'.repeat(64),
                     value,
-                    intentHash: '0xintent',
+                    intentHash,
                     outputIndex: 0,
                     initialNonce: nonce,
                     createdAtTransaction_ID: txId

@@ -180,6 +180,9 @@ const plugin = {
                             rpcBatchSize: { type: 'number', description: 'Batched JSON-RPC calls per round during catch-up. Override via NIGHTGATE_RPC_BATCH_SIZE env var.' },
                             startHeight: { type: 'number', description: 'First height to index while the index is EMPTY; the block below it is indexed as the parentless anchor. Ignored once the index holds blocks. Override via NIGHTGATE_CRAWLER_START_HEIGHT env var.' },
                             maxBlocksPerSecond: { type: 'number', description: 'Catch-up rate cap; unset = unlimited. Override via NIGHTGATE_CRAWLER_MAX_BPS env var.' },
+                            decodePayloads: { type: 'boolean', description: 'Decode stored ledger payloads in a pass behind the indexed tip: circuit names, zswap and DUST counts (default: false; the decode runs in wasm on the main thread). Override via NIGHTGATE_CRAWLER_DECODE_PAYLOADS env var.' },
+                            indexerSupplement: { type: 'boolean', description: 'Fill what a block does not carry (segments, contract state and balances, ledger-event streams, the DUST registration flag) from the Midnight indexer, in a pass behind the indexed tip (default: false). Override via NIGHTGATE_CRAWLER_INDEXER_SUPPLEMENT env var.' },
+                            indexerUrl: { type: 'string', description: 'GraphQL endpoint for the supplement pass (default: the configured indexerHttpUrl).' },
                             maxRetries: { type: 'number', description: 'Max retries per block before error (default: 3)' },
                             retryDelay: { type: 'number', description: 'Base retry delay in ms (default: 2000)' },
                             requestTimeout: { type: 'number', description: 'RPC request timeout ms (default: 30000)' }

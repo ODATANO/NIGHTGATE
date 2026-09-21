@@ -781,7 +781,7 @@ Last `limit` (default 10, max 100) reorg events with depth, detected-at timestam
 
 ## Analytics
 
-`getBlockCount() / getTransactionCount() / getContractCount() / getAverageTransactionsPerBlock()` - simple aggregate queries over the indexed entities. `getContractCount` counts distinct decoded contract addresses, which is 0 until the ledger payload is decoded; `ContractStatistics` counts actions per type.
+`getBlockCount() / getTransactionCount() / getContractCount() / getAverageTransactionsPerBlock()` - simple aggregate queries over the indexed entities. `getContractCount` counts distinct contract addresses reported by the pallet's contract events; `ContractStatistics` counts actions per type.
 
 ## Admin
 

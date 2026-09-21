@@ -227,6 +227,50 @@ CREATE TABLE midnight_DisclosureGrants (
 );
 INSERT INTO midnight_DisclosureGrants (ID, payloadHash, grantee, level, contractAddress, active)
 VALUES ('dg-legacy', 'p1', 'g1', 1, 'c1', 1);
+
+-- A 0.24-shaped Blocks: the state root sits in ledgerParameters, NOT NULL.
+CREATE TABLE midnight_Blocks (
+    ID NVARCHAR(36) NOT NULL,
+    createdAt TIMESTAMP_TEXT,
+    createdBy NVARCHAR(255),
+    modifiedAt TIMESTAMP_TEXT,
+    modifiedBy NVARCHAR(255),
+    hash NVARCHAR(512) NOT NULL,
+    height BIGINT NOT NULL,
+    protocolVersion INTEGER NOT NULL,
+    timestamp INTEGER NOT NULL,
+    author NVARCHAR(512),
+    ledgerParameters NVARCHAR(512) NOT NULL,
+    parent_ID NVARCHAR(36),
+    PRIMARY KEY(ID),
+    CONSTRAINT midnight_Blocks_hash UNIQUE (hash)
+);
+INSERT INTO midnight_Blocks (ID, hash, height, protocolVersion, timestamp, ledgerParameters)
+VALUES ('block-legacy', '0xlegacy', 7, 1, 1700000000, '0xstaterootvalue');
+
+-- A 0.24-shaped UnshieldedUtxos: unique key on the creating transaction.
+CREATE TABLE midnight_UnshieldedUtxos (
+    ID NVARCHAR(36) NOT NULL,
+    createdAt TIMESTAMP_TEXT,
+    createdBy NVARCHAR(255),
+    modifiedAt TIMESTAMP_TEXT,
+    modifiedBy NVARCHAR(255),
+    owner NVARCHAR(256) NOT NULL,
+    tokenType NVARCHAR(512) NOT NULL,
+    value NVARCHAR(78) NOT NULL,
+    intentHash NVARCHAR(512) NOT NULL,
+    outputIndex INTEGER NOT NULL,
+    ctime INTEGER,
+    initialNonce NVARCHAR(512) NOT NULL,
+    registeredForDustGeneration BOOLEAN DEFAULT FALSE,
+    createdAtTransaction_ID NVARCHAR(36) NOT NULL,
+    spentAtTransaction_ID NVARCHAR(36),
+    PRIMARY KEY(ID),
+    CONSTRAINT midnight_UnshieldedUtxos_createdOutput UNIQUE (createdAtTransaction_ID, outputIndex)
+);
+INSERT INTO midnight_UnshieldedUtxos
+    (ID, owner, tokenType, value, intentHash, outputIndex, initialNonce, createdAtTransaction_ID)
+VALUES ('utxo-legacy', 'mn_addr_preprod1legacy', '00', '100', 'intent-legacy', 0, 'nonce-legacy', 'tx-legacy');
 `);
 db.close();
 
@@ -328,6 +372,42 @@ for (const table of ['midnight_PendingSubmissions', 'midnight_BackgroundJobs']) 
 }
 ok('delta 0.23: the legacy submission row survived with null coordinates',
     after.prepare("SELECT chainBlockHeight FROM midnight_PendingSubmissions WHERE ID = 'sub-legacy'").get()?.chainBlockHeight === null);
+
+{
+    const blockCols = new Set(after.prepare('PRAGMA table_info("midnight_Blocks")').all().map(r => r.name));
+    ok('delta 0.25: Blocks gained stateRoot', blockCols.has('stateRoot'), [...blockCols].join(','));
+    const block = after.prepare("SELECT stateRoot, ledgerParameters FROM midnight_Blocks WHERE ID = 'block-legacy'").get();
+    ok('delta 0.25: the state root moved out of ledgerParameters into stateRoot',
+        block?.stateRoot === '0xstaterootvalue' && block?.ledgerParameters === null, JSON.stringify(block));
+    const blockSql = after.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='midnight_Blocks'").get()?.sql ?? '';
+    ok('delta 0.25: ledgerParameters is no longer NOT NULL',
+        !/ledgerParameters[^,]*NOT NULL/i.test(blockSql), blockSql);
+}
+
+{
+    const actionCols = new Set(after.prepare('PRAGMA table_info("midnight_ContractActions")').all().map(r => r.name));
+    ok('delta 0.25: ContractActions gained actionIndex on an EXISTING table',
+        actionCols.has('actionIndex'), [...actionCols].join(','));
+
+    const txCols = new Set(after.prepare('PRAGMA table_info("midnight_Transactions")').all().map(r => r.name));
+    ok('delta 0.25: the ledger tx hash and the decode columns were added to an EXISTING Transactions table',
+        ['ledgerTxHash', 'payloadDecode', 'zswapInputCount', 'zswapOutputCount', 'zswapTransientCount',
+            'dustSpendCount', 'dustRegistrationCount'].every(c => txCols.has(c)),
+        [...txCols].join(','));
+    const syncCols = new Set(after.prepare('PRAGMA table_info("midnight_SyncState")').all().map(r => r.name));
+    ok('delta 0.25: the two trailing-pass cursors were added to SyncState',
+        syncCols.has('lastDecodedHeight') && syncCols.has('lastSupplementedHeight'), [...syncCols].join(','));
+}
+
+{
+    const utxoSql = after.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='midnight_UnshieldedUtxos'").get()?.sql ?? '';
+    ok('delta 0.25: the UTXO unique key is the intent output, not the transaction',
+        /UNIQUE\s*\(\s*intentHash\s*,\s*outputIndex\s*\)/i.test(utxoSql), utxoSql);
+    // This legacy database still carries a pre-0.23.0 lossy Transactions.raw,
+    // so the envelope-derived cleanup above drops its UTXO rows on purpose.
+    ok('delta 0.25: the pre-0.23.0 UTXO row was cleared for a re-index',
+        after.prepare("SELECT count(*) AS n FROM midnight_UnshieldedUtxos").get()?.n === 0);
+}
 
 const jobsView = after.prepare(
     "SELECT type FROM sqlite_master WHERE name = 'NightgateAdminService_BackgroundJobs'"

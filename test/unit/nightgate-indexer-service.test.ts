@@ -538,7 +538,7 @@ describe('reindexFromHeight', () => {
             height: 9,
             protocolVersion: 1,
             timestamp: 1700000000,
-            ledgerParameters: '0xabcd'
+            stateRoot: '0xabcd'
         }));
         mockIsCrawlerRunning.mockReturnValue(false);
 
@@ -568,7 +568,7 @@ describe('reindexFromHeight', () => {
                 height: h,
                 protocolVersion: 1,
                 timestamp: 1700000000 + h,
-                ledgerParameters: '0xabcd'
+                stateRoot: '0xabcd'
             }));
         }
         const txId = cds.utils.uuid();
@@ -615,7 +615,7 @@ describe('reindexFromHeight', () => {
             height: 9,
             protocolVersion: 1,
             timestamp: 1700000000,
-            ledgerParameters: '0xabcd'
+            stateRoot: '0xabcd'
         }));
         mockIsCrawlerRunning.mockReturnValue(true);
         mockStopCrawler.mockResolvedValueOnce(undefined);
@@ -647,7 +647,7 @@ describe('reindexFromHeight', () => {
                 height: h,
                 protocolVersion: 1,
                 timestamp: 1700000000 + h,
-                ledgerParameters: '0xabcd'
+                stateRoot: '0xabcd'
             }));
         }
         const txIds: Record<number, string> = {};
@@ -669,9 +669,9 @@ describe('reindexFromHeight', () => {
             await db.run(cds.ql.INSERT.into(UNSHIELDED_UTXOS).entries({
                 ID: cds.utils.uuid(),
                 owner: 'addr_b',
-                tokenType: '0xtoken',
+                tokenType: '0'.repeat(64),
                 value: (fields as any).nightAmount,
-                intentHash: '0xintent',
+                intentHash: `0xintent${h}`,
                 outputIndex: 0,
                 initialNonce: `0xn${h}`,
                 createdAtTransaction_ID: id

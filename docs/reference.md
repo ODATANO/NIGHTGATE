@@ -135,6 +135,8 @@ are clamped with a warning; booleans: `true`/`false`, `1`/`0`, `yes`/`no`,
 | `NIGHTGATE_RPC_BATCH_SIZE` | int (min 1) |  | Override `crawler.rpcBatchSize` |
 | `NIGHTGATE_CRAWLER_START_HEIGHT` | int (min 1) |  | Override `crawler.startHeight`: first height to index while the index is EMPTY (the block below it is indexed as the parentless anchor). Ignored once the index holds blocks, so a restart resumes at the cursor. |
 | `NIGHTGATE_CRAWLER_MAX_BPS` | int (min 1) |  | Override `crawler.maxBlocksPerSecond`: catch-up rate cap, so block ingestion can share a host with the submission side. Unset = unlimited. |
+| `NIGHTGATE_CRAWLER_DECODE_PAYLOADS` | bool |  | Override `crawler.decodePayloads`: decode stored ledger payloads in a pass behind the indexed tip (circuit names, transaction identifiers, zswap and DUST counts). Off by default; the decode runs in wasm on the main thread. |
+| `NIGHTGATE_CRAWLER_INDEXER_SUPPLEMENT` | bool |  | Override `crawler.indexerSupplement`: fill what a block does not carry (segments, contract state and balances, ledger-event streams, the DUST registration flag) from the Midnight indexer, in a pass behind the indexed tip. Off by default; it makes the index depend on a second source. |
 | `NIGHTGATE_JOB_LEASE_TTL_MS` | ms (min 1) | `300000` | A `running` job whose heartbeat is older than this is reclaimed (re-dispatched with `attempt + 1`) unless it crossed the external-effect boundary; default 5 minutes. |
 | `NIGHTGATE_CHILD_JOB_WAIT_TIMEOUT_MS` | ms (min 1) |  | Parent-workflow watchdog; defaults to the worker RPC timeout plus 5 minutes. Timeout is fail-closed while the child may continue. |
 | `NIGHTGATE_WORKER_RPC_TIMEOUT_MS` | ms (min 1) | `1800000` | Backstop timeout of one wallet-worker RPC (a proof or a submit); default 30 minutes. |
@@ -495,9 +497,9 @@ For per-action signatures and curl examples, see [actions.md](actions.md).
 ### NightgateService entities (all `@readonly` unless noted)
 
 - `Blocks`, `Transactions`, `TransactionResults`, `TransactionSegments`, `TransactionFees`
-- `ContractActions` (one row per `Midnight` pallet extrinsic; `address` and `state` null until the ledger payload is decoded), `ContractBalances`
-- `UnshieldedUtxos`, `NightBalances` (written only by a ledger-payload decoder, not derived from the extrinsic envelope)
-- `ZswapLedgerEvents`, `DustLedgerEvents`
+- `ContractActions` (one row per contract action the `Midnight` pallet reported applied, with its `address`; `entryPoint` needs `crawler.decodePayloads`, `state` and `ContractBalances` need `crawler.indexerSupplement`), `ContractBalances`
+- `UnshieldedUtxos` (from `Midnight.UnshieldedTokens`; `registeredForDustGeneration` needs `crawler.indexerSupplement`), `NightBalances` (derived from them)
+- `ZswapLedgerEvents`, `DustLedgerEvents` (the indexer's event streams; both need `crawler.indexerSupplement`)
 - `Documents`, `PredicateAttestations`, `DisclosureGrants`, `GranteeIdentities`
 - `PendingSubmissions`: read scoped to the caller's sessions (admins unfiltered)
 - `WalletSessions`: excludes `viewingKeyHash`, `encryptedViewingKey`, `encryptedSeedKey`; read scoped to the owning `userId` (admins unfiltered)

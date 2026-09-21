@@ -21,6 +21,7 @@ export interface IndexSpec {
 export const NIGHTGATE_INDEXES: readonly IndexSpec[] = [
     { name: 'ng_blocks_height', table: 'midnight_Blocks', columns: ['height'] },
     { name: 'ng_transactions_hash', table: 'midnight_Transactions', columns: ['hash'] },
+    { name: 'ng_transactions_ledgerhash', table: 'midnight_Transactions', columns: ['ledgerTxHash'] },
     { name: 'ng_transactions_block', table: 'midnight_Transactions', columns: ['block_ID'] },
     { name: 'ng_transactions_sender', table: 'midnight_Transactions', columns: ['senderAddress'] },
     { name: 'ng_transactions_receiver', table: 'midnight_Transactions', columns: ['receiverAddress'] },

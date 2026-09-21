@@ -150,7 +150,7 @@ describe('BlockProcessor persistence paths', () => {
             height: 42,
             protocolVersion: 1,
             timestamp: 1_700_000_000,
-            ledgerParameters: '0xstate'
+            stateRoot: '0xstate'
         }));
 
         const provider = {
@@ -225,7 +225,7 @@ describe('BlockProcessor persistence paths', () => {
             height: 4,
             protocolVersion: 77,
             timestamp: 1_699_999_999,
-            ledgerParameters: '0xstate-parent'
+            stateRoot: '0xstate-parent'
         }));
 
         const extrinsics = [
@@ -256,8 +256,13 @@ describe('BlockProcessor persistence paths', () => {
 
         const processor = makeProcessor(provider);
         vi.spyOn(processor as any, 'getEventRegistry').mockResolvedValue({});
-        vi.spyOn(processor as any, 'decodeExtrinsicOutcomes').mockReturnValue(
-            new Map(extrinsics.map((_, index) => [index, 'SUCCESS']))
+        // Outcomes only: the pallet named no contract and reported no ledger
+        // transaction, so classification falls back to the pallet map.
+        vi.spyOn(processor as any, 'decodeBlockEvents').mockReturnValue(
+            new Map(extrinsics.map((_, index) => [index, {
+                outcome: 'SUCCESS', applied: false, partialSuccess: false,
+                created: [], spent: [], contracts: []
+            }]))
         );
 
         const result = await processor.processBlockByHash('0xnew');
@@ -276,7 +281,7 @@ describe('BlockProcessor persistence paths', () => {
             protocolVersion: 77,
             timestamp: 1_700_000_000,
             author: 'BABE:0xdeadbeef',
-            ledgerParameters: '0xstate',
+            stateRoot: '0xstate',
             parent_ID: parentId
         }));
         // Integer64: number on CAP 9, string on CAP 10 (ieee754compatible).
@@ -387,7 +392,7 @@ describe('BlockProcessor persistence paths', () => {
             height: 8,
             protocolVersion: 88,
             timestamp: 1_700_099_999,
-            ledgerParameters: '0xstate-parent-3'
+            stateRoot: '0xstate-parent-3'
         }));
 
         const transferExtrinsic = buildSignedTransferExtrinsic(0x11, 0x22, 100);
@@ -492,7 +497,7 @@ describe('parent enforcement (height-sequenced paths)', () => {
             height: 6,
             protocolVersion: 1,
             timestamp: 1_700_000_000,
-            ledgerParameters: '0xstate'
+            stateRoot: '0xstate'
         }));
         const processor = makeProcessor({});
 

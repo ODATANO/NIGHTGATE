@@ -124,3 +124,6 @@ contracts/mint4/
 REVIEW-*.md
 review-*.md
 *.local.md
+
+# Incoming feature requests and notes from other ODATANO projects
+local_docs/

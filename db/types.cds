@@ -24,9 +24,19 @@ type ContractActionType      : String enum {
     UPDATE;
 }
 
+/** Outcome of the crawler's ledger-payload decode for one transaction. */
+type PayloadDecodeState      : String(20) enum {
+    decoded;
+    absent;  // no ledger payload in this extrinsic
+    failed;  // the payload did not deserialize
+}
+
+/** The four kinds the Midnight indexer's DUST event stream carries. */
 type DustLedgerEventType     : String enum {
     DTIME_UPDATE;
     INITIAL_UTXO;
+    SPEND_PROCESSED;
+    PARAM_CHANGE;
 }
 
 // Crawler classification

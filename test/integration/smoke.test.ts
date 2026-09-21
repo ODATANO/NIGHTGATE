@@ -24,7 +24,7 @@ describe('cds.test harness boots', () => {
             height: 42,
             protocolVersion: 1,
             timestamp: 1_700_000_000,
-            ledgerParameters: '0x' + '00'.repeat(8)
+            stateRoot: '0x' + '00'.repeat(8)
         }));
         const row = await db.run(SELECT.one.from('midnight.Blocks').where({ height: 42 }));
         expect(row?.hash).toBe('0x' + 'ab'.repeat(32));

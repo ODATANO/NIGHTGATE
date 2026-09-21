@@ -11,6 +11,7 @@ import {
     TransactionSegments, NightBalances, SyncState, PendingSubmissions, BackgroundJobs
 } from '#cds-models/midnight';
 import { bumpReorgGeneration } from '../submission/reorg-generation';
+import { NIGHT_RAW_TOKEN_TYPE } from './block-events';
 
 export interface RollbackResult {
     reorgGeneration: number;
@@ -122,11 +123,23 @@ export async function rollbackIndexedDataFromHeight(
     const evidence = await revertSubmissionEvidence(tx, fromHeight);
 
     const forkBlock = await selectForkBlock(tx, fromHeight);
+    const forkHeight = forkBlock?.height ?? 0;
+    // The trailing passes must not stay above the surviving tip: their work on
+    // rolled-back blocks is gone with the rows.
+    const current: any = await tx.run(
+        SELECT.one.from(SyncState).columns('lastDecodedHeight', 'lastSupplementedHeight').where({ ID: 'SINGLETON' })
+    );
+    const clampCursor = (value: unknown): number | null => {
+        if (value == null) return null;
+        return Math.min(Number(value), forkHeight);
+    };
     await tx.run(
         UPDATE.entity(SyncState).set({
-            lastIndexedHeight: forkBlock?.height ?? 0,
+            lastIndexedHeight: forkHeight,
             lastIndexedHash: forkBlock?.hash ?? null,
             lastIndexedAt: new Date().toISOString(),
+            lastDecodedHeight: clampCursor(current?.lastDecodedHeight),
+            lastSupplementedHeight: clampCursor(current?.lastSupplementedHeight),
             syncStatus: opts.syncStatus,
             ...(opts.extraSyncState || {})
         }).where({ ID: 'SINGLETON' })
@@ -199,13 +212,16 @@ async function selectForkBlock(
 
 /**
  * Rebuild one address's NightBalances row from what remains. Must mirror the
- * ingest rules in BlockProcessor (`upsertNightBalance`, `persistTransferProjections`).
+ * ingest rule in BlockProcessor (`applyBalanceDelta`), which folds the same
+ * figures in block by block.
  */
-async function recomputeNightBalance(tx: any, address: string): Promise<void> {
+export async function recomputeNightBalance(tx: any, address: string): Promise<void> {
+    // NightBalances is a NIGHT balance; an address can hold other tokens in
+    // the same UTXO set, and they do not belong in these figures.
     const utxos: any[] = await tx.run(
         SELECT.from(UnshieldedUtxos)
             .columns('value', 'spentAtTransaction_ID', 'createdAtTransaction_ID')
-            .where({ owner: address })
+            .where({ owner: address, tokenType: NIGHT_RAW_TOKEN_TYPE })
     ) || [];
 
     const sentCandidates: any[] = await tx.run(
@@ -244,14 +260,19 @@ async function recomputeNightBalance(tx: any, address: string): Promise<void> {
         return;
     }
 
-    const createdTxIds = [...new Set(utxos.map(u => u.createdAtTransaction_ID).filter(Boolean))];
-    const createdTxs: any[] = createdTxIds.length
+    // Spending is activity too, so the spending transactions count towards the
+    // height range alongside the creating and the sending ones.
+    const activityTxIds = [...new Set([
+        ...utxos.map(u => u.createdAtTransaction_ID),
+        ...utxos.map(u => u.spentAtTransaction_ID)
+    ].filter(Boolean))];
+    const activityTxs: any[] = activityTxIds.length
         ? await tx.run(
-            SELECT.from(Transactions).columns('ID', 'block_ID').where({ ID: { in: createdTxIds } })
+            SELECT.from(Transactions).columns('ID', 'block_ID').where({ ID: { in: activityTxIds } })
         ) || []
         : [];
     const blockIds = [...new Set(
-        [...createdTxs.map(t => t.block_ID), ...sentTxs.map(t => t.block_ID)].filter(Boolean)
+        [...activityTxs.map(t => t.block_ID), ...sentTxs.map(t => t.block_ID)].filter(Boolean)
     )];
     const blocks: any[] = blockIds.length
         ? await tx.run(
