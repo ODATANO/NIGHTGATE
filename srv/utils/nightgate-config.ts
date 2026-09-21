@@ -282,11 +282,15 @@ export function resolveNightgateRuntimeConfig(config: Record<string, any> = {}):
     const rawCrawlerConfig = config.crawler || {};
     const fetchConcurrencyEnv = configInt('NIGHTGATE_FETCH_CONCURRENCY');
     const rpcBatchSizeEnv = configInt('NIGHTGATE_RPC_BATCH_SIZE');
+    const startHeightEnv = configInt('NIGHTGATE_CRAWLER_START_HEIGHT');
+    const maxBlocksPerSecondEnv = configInt('NIGHTGATE_CRAWLER_MAX_BPS');
     const crawlerEnabledOverride = configBool('NIGHTGATE_CRAWLER_ENABLED');
     const crawlerConfig: Record<string, unknown> = {
         ...rawCrawlerConfig,
         ...(fetchConcurrencyEnv != null && { fetchConcurrency: fetchConcurrencyEnv }),
         ...(rpcBatchSizeEnv != null && { rpcBatchSize: rpcBatchSizeEnv }),
+        ...(startHeightEnv != null && { startHeight: startHeightEnv }),
+        ...(maxBlocksPerSecondEnv != null && { maxBlocksPerSecond: maxBlocksPerSecondEnv }),
         ...(crawlerEnabledOverride != null && { enabled: crawlerEnabledOverride })
     };
     const configuredNetwork = getConfiguredNightgateNetwork(config);

@@ -133,6 +133,8 @@ are clamped with a warning; booleans: `true`/`false`, `1`/`0`, `yes`/`no`,
 | `NIGHTGATE_CRAWLER_ENABLED` | bool |  | `false` / `0` / `no` / `off` disables the crawler at boot |
 | `NIGHTGATE_FETCH_CONCURRENCY` | int (min 1) |  | Override `crawler.fetchConcurrency` |
 | `NIGHTGATE_RPC_BATCH_SIZE` | int (min 1) |  | Override `crawler.rpcBatchSize` |
+| `NIGHTGATE_CRAWLER_START_HEIGHT` | int (min 1) |  | Override `crawler.startHeight`: first height to index while the index is EMPTY (the block below it is indexed as the parentless anchor). Ignored once the index holds blocks, so a restart resumes at the cursor. |
+| `NIGHTGATE_CRAWLER_MAX_BPS` | int (min 1) |  | Override `crawler.maxBlocksPerSecond`: catch-up rate cap, so block ingestion can share a host with the submission side. Unset = unlimited. |
 | `NIGHTGATE_JOB_LEASE_TTL_MS` | ms (min 1) | `300000` | A `running` job whose heartbeat is older than this is reclaimed (re-dispatched with `attempt + 1`) unless it crossed the external-effect boundary; default 5 minutes. |
 | `NIGHTGATE_CHILD_JOB_WAIT_TIMEOUT_MS` | ms (min 1) |  | Parent-workflow watchdog; defaults to the worker RPC timeout plus 5 minutes. Timeout is fail-closed while the child may continue. |
 | `NIGHTGATE_WORKER_RPC_TIMEOUT_MS` | ms (min 1) | `1800000` | Backstop timeout of one wallet-worker RPC (a proof or a submit); default 30 minutes. |

@@ -8,6 +8,7 @@ db/*.db-shm
 db/*.db-wal
 # dated sqlite copies from apply-schema-delta / VACUUM INTO
 db/*.backup-*
+db/*.bak-*
 db/backup-*
 *.sqlite
 *.sqlite-shm

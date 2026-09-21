@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.24.5 - 2026-09-21
+
+- The crawler can index next to the submission side. `crawler.startHeight` /
+  `NIGHTGATE_CRAWLER_START_HEIGHT` begins at a chosen height instead of
+  genesis: while the index is empty the block below it is indexed as the
+  anchor, the one block allowed to have no parent, and catch-up starts above
+  it. Once the index holds blocks the cursor decides, so a restart resumes
+  where it stopped and a rollback that empties the table seeds again.
+  `crawler.maxBlocksPerSecond` / `NIGHTGATE_CRAWLER_MAX_BPS` caps the
+  catch-up rate; persist is the pacer and the fetch queue is bounded, so the
+  cap bounds fetching too. Both are unset by default.
+- A block that fails deterministically no longer runs on a loop. Catch-up
+  ended with `syncStatus` at `error`, the live subscription overwrote it with
+  `synced`, and every finalized head re-entered the same block about once per
+  six seconds. The height is latched instead: `chainHeight` keeps following
+  the chain, nothing is indexed, and the log and `lastError` name it.
+  `pauseCrawler` + `resumeCrawler`, `reindexFromHeight` or a restart retries
+  it. A transient failure, a node outage above all, is not latched.
+- `getReadiness()` answers 503 when a check fails. It returned 200 with
+  `ready: false` in the payload, which orchestrators and the container
+  healthcheck read as healthy. A host that restarts unhealthy containers will
+  now act on a process that is persistently not ready.
+
 ## 0.24.4 - 2026-09-19
 
 - One status surface. The plain `/nightgate/metrics|health|ready` routes,

@@ -20,6 +20,8 @@ export interface CrawlerConfig {
     requestTimeout?: number;    // RPC timeout ms (default: 30000)
     fetchConcurrency?: number;  // Number of block-fetch BATCHES kept in flight  (default: 8)
     rpcBatchSize?: number; // Number of consecutive heights bundled into one JSON-RPC batch frame (default: 32)
+    startHeight?: number;  // First height to index on an EMPTY index (default: 0, from genesis)
+    maxBlocksPerSecond?: number;  // Catch-up rate cap (default: 0, unlimited)
 }
 
 interface ReorgInfo {
@@ -46,6 +48,9 @@ export class MidnightCrawler {
     private startTime: number = 0;
     private blocksProcessed: number = 0;
 
+    /** A block that fails deterministically; set to stop retrying it on every finalized head. */
+    private poisonBlock: { height: number; message: string } | null = null;
+
     private config: Required<CrawlerConfig>;
 
     constructor(
@@ -60,7 +65,9 @@ export class MidnightCrawler {
             retryDelay: config.retryDelay || 2000,
             requestTimeout: config.requestTimeout || 30000,
             fetchConcurrency: config.fetchConcurrency ?? 8,
-            rpcBatchSize: config.rpcBatchSize ?? 32
+            rpcBatchSize: config.rpcBatchSize ?? 32,
+            startHeight: config.startHeight ?? 0,
+            maxBlocksPerSecond: config.maxBlocksPerSecond ?? 0
         };
     }
 
@@ -195,15 +202,27 @@ export class MidnightCrawler {
     }
 
     private async catchUp(): Promise<number> {
+        if (this.poisonBlock) {
+            log.debug(`Catch-up skipped: block ${this.poisonBlock.height} fails deterministically`);
+            return 0;
+        }
+
         this.isCatchingUp = true;
         try {
             const syncState = await this.getSyncState();
-            const startHeight = this.getCatchUpStartHeight(syncState);
+            let startHeight = this.getCatchUpStartHeight(syncState);
 
             // Finalized head, not chain tip: never ingest blocks that may revert.
             const finalizedHash = await this.nodeProvider.getFinalizedHead();
             const finalizedHeader = await this.nodeProvider.getHeader(finalizedHash);
             const tipHeight = MidnightNodeProvider.parseBlockNumber(finalizedHeader.number);
+
+            // Height 0 means nothing is indexed yet, which is where startHeight applies.
+            if (startHeight === 0 && this.config.startHeight > 0) {
+                const seeded = await this.seedStartHeight(tipHeight);
+                if (seeded === 'unfinalized') return 0;
+                startHeight = seeded ?? startHeight;
+            }
 
             if (startHeight > tipHeight) {
                 log.info(`Already synced to finalized head (height ${tipHeight})`);
@@ -227,6 +246,44 @@ export class MidnightCrawler {
         } finally {
             this.isCatchingUp = false;
         }
+    }
+
+    /**
+     * Anchor an empty index at `startHeight - 1`, the one block persisted without a
+     * parent, so catch-up can begin mid-chain and every later block still resolves
+     * its parent. Returns the height to catch up from, null when the index already
+     * holds blocks (the cursor decides then, not the configuration), or
+     * 'unfinalized' when the anchor is not finalized yet.
+     */
+    private async seedStartHeight(tipHeight: number): Promise<number | null | 'unfinalized'> {
+        const indexed = await this.db.run(SELECT.one.from(Blocks).columns('ID'));
+        if (indexed) {
+            log.info(`startHeight ${this.config.startHeight} ignored: the index already holds blocks`);
+            return null;
+        }
+
+        const anchorHeight = this.config.startHeight - 1;
+        // The anchor carries no parent, so nothing downstream would notice it reverting.
+        if (anchorHeight > tipHeight) {
+            log.warn(`startHeight ${this.config.startHeight} is above the finalized head (${tipHeight}); waiting`);
+            return 'unfinalized';
+        }
+
+        log.info(`Seeding empty index with anchor block ${anchorHeight} (startHeight ${this.config.startHeight})`);
+
+        const anchorHash = await this.withRetry(
+            `Anchor hash ${anchorHeight}`,
+            async () => {
+                const hash = await this.nodeProvider.getBlockHash(anchorHeight);
+                if (!hash) throw new Error(`No block at height ${anchorHeight}`);
+                return hash;
+            }
+        );
+        // processBlockByHash, not by height: the anchor is the one block allowed no parent.
+        await this.withRetry(`Anchor block ${anchorHeight}`, () => this.processor.processBlockByHash(anchorHash));
+
+        log.info(`Anchor block ${anchorHeight} indexed (${anchorHash})`);
+        return this.config.startHeight;
     }
 
     /**
@@ -299,6 +356,7 @@ export class MidnightCrawler {
                     processed++;
                     this.blocksProcessed++;
                     nextHeightToPersist = h + 1;
+                    await this.pace(processed, batchStart);
 
                     if (processed % this.config.batchSize === 0 || h === tipHeight) {
                         const elapsed = (Date.now() - batchStart) / 1000;
@@ -355,6 +413,15 @@ export class MidnightCrawler {
                         `Batch ${head.from}-${head.to} failed after retry; ` +
                         'stopping catch-up to avoid index gaps'
                     );
+                    // Only a deterministic failure latches: a node outage is transient and
+                    // must stay retryable, or a reconnect would find indexing switched off.
+                    if (!isTransientError(err as Error)) {
+                        this.poisonBlock = { height: nextHeightToPersist, message: (err as Error).message };
+                        log.error(
+                            `Block ${nextHeightToPersist} does not index; halting until ` +
+                            'pauseCrawler + resumeCrawler, reindexFromHeight or a restart retries it'
+                        );
+                    }
                     await this.db.run(
                         UPDATE.entity(SyncState).set({ syncStatus: 'error' }).where({ ID: 'SINGLETON' })
                     );
@@ -375,28 +442,43 @@ export class MidnightCrawler {
     }
 
     private async fetchBlockBatchWithRetry(heights: number[]): Promise<any[]> {
+        return this.withRetry(
+            `Batch ${heights[0]}-${heights[heights.length - 1]}`,
+            () => this.processor.fetchBlockBatch(heights)
+        );
+    }
+
+    /** Retries transient failures with the configured backoff; a permanent one fails at once. */
+    private async withRetry<T>(label: string, run: () => Promise<T>): Promise<T> {
         let lastError: Error | null = null;
         for (let attempt = 1; attempt <= this.config.maxRetries; attempt++) {
             try {
-                return await this.processor.fetchBlockBatch(heights);
+                return await run();
             } catch (err) {
                 lastError = err as Error;
-                const transient = isTransientError(lastError);
-                if (!transient) {
-                    log.error(`Batch ${heights[0]}-${heights[heights.length - 1]} permanent error: ${lastError.message}`);
+                if (!isTransientError(lastError)) {
+                    log.error(`${label} permanent error: ${lastError.message}`);
                     break;
                 }
                 if (attempt < this.config.maxRetries) {
                     const delay = calcBackoff(attempt, this.config.retryDelay);
                     log.warn(
-                        `Batch ${heights[0]}-${heights[heights.length - 1]} attempt ${attempt} failed (transient): ` +
+                        `${label} attempt ${attempt} failed (transient): ` +
                         `${lastError.message}, retrying in ${Math.round(delay)}ms`
                     );
                     await this.sleep(delay);
                 }
             }
         }
-        throw lastError || new Error(`Failed to fetch batch starting at ${heights[0]}`);
+        throw lastError || new Error(`${label} failed`);
+    }
+
+    /** Holds catch-up at `maxBlocksPerSecond` so block ingestion can share a box with the API. */
+    private async pace(processed: number, since: number): Promise<void> {
+        const cap = this.config.maxBlocksPerSecond;
+        if (cap <= 0) return;
+        const owed = (processed / cap) * 1000 - (Date.now() - since);
+        if (owed > 0) await this.sleep(owed);
     }
 
     private async subscribeLive(): Promise<void> {
@@ -441,10 +523,11 @@ export class MidnightCrawler {
             await this.liveProcessing;
         });
 
+        // A catch-up that ended in error keeps its status: subscribing is not being synced.
         await this.db.run(
             UPDATE.entity(SyncState).set({
                 syncStatus: 'synced'
-            }).where({ ID: 'SINGLETON' })
+            }).where({ ID: 'SINGLETON' }).and({ syncStatus: { '!=': 'error' } })
         );
 
         log.info('Live subscription active');
@@ -463,9 +546,22 @@ export class MidnightCrawler {
                 );
             }
 
+            if (this.poisonBlock) {
+                log.debug(`Live: head ${height} seen; indexing halted at block ${this.poisonBlock.height}`);
+                return;
+            }
+
+            // An empty index has no parent for this head; catch-up seeds the anchor
+            // (or walks from genesis) and indexes the head on the way.
+            if (!tipState?.lastIndexedHash) {
+                log.info(`Live: head ${height} on an empty index; catching up`);
+                await this.catchUp();
+                return;
+            }
+
             // Head more than one block ahead is a gap, not a fork: catch up.
-            const lastIndexedHeight = Number(tipState?.lastIndexedHeight ?? 0);
-            if (tipState?.lastIndexedHash && height > lastIndexedHeight + 1) {
+            const lastIndexedHeight = Number(tipState.lastIndexedHeight ?? 0);
+            if (height > lastIndexedHeight + 1) {
                 log.info(`Live: gap detected (head ${height}, indexed ${lastIndexedHeight}); catching up`);
                 await this.catchUp();
                 return;
@@ -620,32 +716,7 @@ export class MidnightCrawler {
     }
 
     private async processBlockWithRetry(height: number): Promise<ProcessResult> {
-        let lastError: Error | null = null;
-
-        for (let attempt = 1; attempt <= this.config.maxRetries; attempt++) {
-            try {
-                return await this.processor.processBlockByHeight(height);
-            } catch (err) {
-                lastError = err as Error;
-                const transient = isTransientError(lastError);
-
-                if (!transient) {
-                    log.error(`Block ${height} permanent error: ${lastError.message}`);
-                    break;
-                }
-
-                if (attempt < this.config.maxRetries) {
-                    const delay = calcBackoff(attempt, this.config.retryDelay);
-                    log.warn(
-                        `Block ${height} attempt ${attempt} failed (transient): ` +
-                        `${lastError.message}, retrying in ${Math.round(delay)}ms`
-                    );
-                    await this.sleep(delay);
-                }
-            }
-        }
-
-        throw lastError || new Error(`Failed to process block ${height}`);
+        return this.withRetry(`Block ${height}`, () => this.processor.processBlockByHeight(height));
     }
 
     private async getSyncState(): Promise<any> {

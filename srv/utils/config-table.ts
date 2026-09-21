@@ -54,6 +54,8 @@ export const CONFIG_TABLE: readonly ConfigSpec[] = [
     { key: 'NIGHTGATE_CRAWLER_ENABLED', kind: 'bool', doc: '`false` / `0` / `no` / `off` disables the crawler at boot' },
     { key: 'NIGHTGATE_FETCH_CONCURRENCY', kind: 'int', min: 1, doc: 'Override `crawler.fetchConcurrency`' },
     { key: 'NIGHTGATE_RPC_BATCH_SIZE', kind: 'int', min: 1, doc: 'Override `crawler.rpcBatchSize`' },
+    { key: 'NIGHTGATE_CRAWLER_START_HEIGHT', kind: 'int', min: 1, doc: 'Override `crawler.startHeight`: first height to index while the index is EMPTY (the block below it is indexed as the parentless anchor). Ignored once the index holds blocks, so a restart resumes at the cursor.' },
+    { key: 'NIGHTGATE_CRAWLER_MAX_BPS', kind: 'int', min: 1, doc: 'Override `crawler.maxBlocksPerSecond`: catch-up rate cap, so block ingestion can share a host with the submission side. Unset = unlimited.' },
     { key: 'NIGHTGATE_JOB_LEASE_TTL_MS', kind: 'ms', default: 300000, min: 1, doc: 'A `running` job whose heartbeat is older than this is reclaimed (re-dispatched with `attempt + 1`) unless it crossed the external-effect boundary; default 5 minutes.' },
     { key: 'NIGHTGATE_CHILD_JOB_WAIT_TIMEOUT_MS', kind: 'ms', min: 1, doc: 'Parent-workflow watchdog; defaults to the worker RPC timeout plus 5 minutes. Timeout is fail-closed while the child may continue.' },
     { key: 'NIGHTGATE_WORKER_RPC_TIMEOUT_MS', kind: 'ms', default: 1800000, min: 1, doc: 'Backstop timeout of one wallet-worker RPC (a proof or a submit); default 30 minutes.' },

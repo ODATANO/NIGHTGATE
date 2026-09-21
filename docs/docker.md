@@ -58,6 +58,8 @@ probes (`getLiveness`, `getReadiness`, `getMetrics`, `getSyncStatus`,
 | `NIGHTGATE_AUTH` | `basic` | `dummy` = unauthenticated, local testing only |
 | `NIGHTGATE_NETWORK` | `preprod` | Target network |
 | `NIGHTGATE_CRAWLER_ENABLED` | `false` | Block crawler (verification works without it) |
+| `NIGHTGATE_CRAWLER_START_HEIGHT` | unset | First height to index while the index is empty; unset walks from genesis |
+| `NIGHTGATE_CRAWLER_MAX_BPS` | unset | Catch-up rate cap, so the crawler can share the host with the submission side |
 | `NIGHTGATE_NODE_URL` / `NIGHTGATE_INDEXER_HTTP_URL` / `NIGHTGATE_INDEXER_WS_URL` | per-network defaults | Endpoint overrides |
 | `NIGHTGATE_PROOF_SERVER_URL` | unset | Set = proof-server proving instead of wasm |
 | `NIGHTGATE_DB_PATH` | `/data/nightgate.db` | SQLite file (persist `/data`) |

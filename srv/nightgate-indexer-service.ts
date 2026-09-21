@@ -109,7 +109,14 @@ export default class NightgateIndexerService extends cds.ApplicationService {
         this.on('getWorkerStatus', async (req: Request) =>
             buildWorkerStatus(Boolean((req.user as any)?.is?.('admin'))));
 
-        this.on('getReadiness', async () => buildReadiness(this.db));
+        this.on('getReadiness', async (req: Request) => {
+            const readiness = await buildReadiness(this.db);
+            // The probe's answer is the status code: a payload saying `ready: false`
+            // under 200 reads as healthy to every orchestrator and to the container
+            // healthcheck. `req.http` is absent on an internal call.
+            if (readiness.ready !== true) (req as any)?.http?.res?.status(503);
+            return readiness;
+        });
 
         this.on('getMetrics', async () => buildMetricsText(this.db));
 

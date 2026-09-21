@@ -30,9 +30,13 @@ vi.spyOn(crawlerNative, 'isCrawlerRunning').mockImplementation(mockIsCrawlerRunn
 
 import cds from '@sap/cds';
 
+// Same reason: the booted service reads buildReadiness off this module object.
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const statusNative = require('../../srv/monitoring/status');
+
 // Boot the in-memory CAP server. Not assigned to a `test` const on purpose
 // (would shadow Vitest's global test()).
-cds.test(__dirname + '/../..');
+const cap = cds.test(__dirname + '/../..') as any;
 
 const SYNC_STATE = 'midnight.SyncState';
 const REORG_LOG = 'midnight.ReorgLog';
@@ -725,6 +729,26 @@ describe('authorization', () => {
             expect(def['@requires']).toBe('admin');
         }
     );
+
+    it('answers getReadiness() with 503 while a check fails and 200 once they pass', async () => {
+        const probe = () => cap.axios.get('/api/v1/indexer/getReadiness()', { validateStatus: () => true });
+
+        const checks = { database: true, crawler: true, node: true, runtime: true, initialization: true };
+        const spy = vi.spyOn(statusNative, 'buildReadiness');
+        try {
+            spy.mockResolvedValue({ ready: false, crawlerEnabled: true, checks: { ...checks, crawler: false } });
+            const notReady = await probe();
+            expect(notReady.status).toBe(503);
+            expect(notReady.data.ready).toBe(false);
+
+            spy.mockResolvedValue({ ready: true, crawlerEnabled: false, checks });
+            const ready = await probe();
+            expect(ready.status).toBe(200);
+            expect(ready.data.ready).toBe(true);
+        } finally {
+            spy.mockRestore();
+        }
+    });
 
     // 0.24.2: an explicit 'any'. Without an annotation the probes inherited the
     // service's implicit authenticated-user under NODE_ENV=production (CAP checks

@@ -555,6 +555,236 @@ describe('MidnightCrawler orchestration', () => {
     });
 
     // ========================================================================
+    // startHeight seeding, pacing and the poison-block latch
+    // ========================================================================
+    describe('startHeight, pacing and poison blocks', () => {
+        function prepared(heights: number[]): any[] {
+            return heights.map(h => ({
+                blockHash: `0x${h}`,
+                height: h,
+                signedBlock: null,
+                protocolVersion: 1,
+                timestamp: 0,
+                fetchStartedAt: Date.now(),
+                fetchCompletedAt: Date.now(),
+                alreadyIndexed: false
+            }));
+        }
+
+        /** A crawler on the real DB with a stubbed processor and fetch shim. */
+        function makeCrawler(config: Record<string, unknown>, provider: any) {
+            const processBlockByHash = vi.fn().mockResolvedValue({
+                blockHeight: 0,
+                blockHash: '0xanchor',
+                transactionCount: 0,
+                contractActionCount: 0,
+                processingTimeMs: 1
+            });
+            const crawler = new MidnightCrawler(provider as any, { enabled: true, ...config } as any);
+            (crawler as any).db = db;
+            (crawler as any).isRunning = true;
+            (crawler as any).processor = {
+                fetchBlockBatch: mockProcessorFetchBlockBatch,
+                persistPreparedBlock: mockProcessorPersistPreparedBlock,
+                processBlockByHash
+            };
+            mockProcessorPersistPreparedBlock.mockImplementation(async (prep: any) => ({
+                blockHeight: prep.height,
+                blockHash: prep.blockHash,
+                transactionCount: 0,
+                contractActionCount: 0,
+                processingTimeMs: 1
+            }));
+            const fetchSpy = vi.spyOn(crawler as any, 'fetchBlockBatchWithRetry')
+                .mockImplementation(async (...args: any[]) => prepared(args[0] as number[]));
+            return { crawler: crawler as any, processBlockByHash, fetchSpy };
+        }
+
+        it('anchors an empty index at startHeight - 1 and catches up from startHeight', async () => {
+            const provider = {
+                getFinalizedHead: vi.fn().mockResolvedValue('0x1f6'),
+                getHeader: vi.fn().mockResolvedValue({ number: '0x1f6' }),
+                getBlockHash: vi.fn().mockResolvedValue('0xanchor')
+            };
+            const { crawler, processBlockByHash, fetchSpy } = makeCrawler(
+                { startHeight: 500, rpcBatchSize: 10, fetchConcurrency: 1 }, provider
+            );
+            await setSyncState({ syncStatus: 'stopped', lastIndexedHeight: 0, lastIndexedHash: null });
+
+            await expect(crawler.catchUp()).resolves.toBe(3);
+
+            // The anchor goes in BY HASH: it is the one block indexed without a parent.
+            expect(provider.getBlockHash).toHaveBeenCalledWith(499);
+            expect(processBlockByHash).toHaveBeenCalledWith('0xanchor');
+            expect(fetchSpy).toHaveBeenCalledWith([500, 501, 502]);
+        });
+
+        it('refuses to anchor above the finalized head', async () => {
+            const provider = {
+                getFinalizedHead: vi.fn().mockResolvedValue('0x64'),
+                getHeader: vi.fn().mockResolvedValue({ number: '0x64' }),
+                getBlockHash: vi.fn().mockResolvedValue('0xanchor')
+            };
+            const { crawler, processBlockByHash, fetchSpy } = makeCrawler(
+                { startHeight: 105, rpcBatchSize: 10, fetchConcurrency: 1 }, provider
+            );
+            await setSyncState({ syncStatus: 'stopped', lastIndexedHeight: 0, lastIndexedHash: null });
+
+            await expect(crawler.catchUp()).resolves.toBe(0);
+
+            // Anchor 104 is parentless: writing it unfinalized would go undetected on a revert.
+            expect(provider.getBlockHash).not.toHaveBeenCalled();
+            expect(processBlockByHash).not.toHaveBeenCalled();
+            expect(fetchSpy).not.toHaveBeenCalled();
+        });
+
+        it('ignores startHeight once the index holds blocks (a restart resumes at the cursor)', async () => {
+            const provider = {
+                getFinalizedHead: vi.fn().mockResolvedValue('0x2'),
+                getHeader: vi.fn().mockResolvedValue({ number: '0x2' }),
+                getBlockHash: vi.fn()
+            };
+            const { crawler, processBlockByHash, fetchSpy } = makeCrawler(
+                { startHeight: 500, rpcBatchSize: 10, fetchConcurrency: 1 }, provider
+            );
+            await seedBlock(1, '0xone');
+            await setSyncState({ syncStatus: 'stopped', lastIndexedHeight: 0, lastIndexedHash: null });
+
+            await expect(crawler.catchUp()).resolves.toBe(3);
+
+            expect(provider.getBlockHash).not.toHaveBeenCalled();
+            expect(processBlockByHash).not.toHaveBeenCalled();
+            expect(fetchSpy).toHaveBeenCalledWith([0, 1, 2]);
+        });
+
+        it('holds catch-up at maxBlocksPerSecond and runs unthrottled without it', async () => {
+            const provider = {
+                getFinalizedHead: vi.fn().mockResolvedValue('0x3'),
+                getHeader: vi.fn().mockResolvedValue({ number: '0x3' })
+            };
+            const paced = makeCrawler({ maxBlocksPerSecond: 10, rpcBatchSize: 10, fetchConcurrency: 1 }, provider);
+            const sleep = vi.fn().mockResolvedValue(undefined);
+            paced.crawler.sleep = sleep;
+            await setSyncState({ syncStatus: 'stopped', lastIndexedHeight: 0, lastIndexedHash: '0x0' });
+
+            await expect(paced.crawler.catchUp()).resolves.toBe(3);
+
+            // 10 blocks/s: every persisted block owes the pipeline another ~100 ms.
+            const waits = sleep.mock.calls.map((c: any[]) => c[0] as number);
+            expect(waits).toHaveLength(3);
+            expect(waits.every((ms: number) => ms > 0)).toBe(true);
+            expect(waits[2]).toBeGreaterThan(waits[0]);
+
+            const free = makeCrawler({ rpcBatchSize: 10, fetchConcurrency: 1 }, provider);
+            const freeSleep = vi.fn().mockResolvedValue(undefined);
+            free.crawler.sleep = freeSleep;
+            await setSyncState({ syncStatus: 'stopped', lastIndexedHeight: 0, lastIndexedHash: '0x0' });
+
+            await expect(free.crawler.catchUp()).resolves.toBe(3);
+            expect(freeSleep).not.toHaveBeenCalled();
+        });
+
+        it('latches a deterministically failing block instead of retrying it on every head', async () => {
+            const provider = {
+                getFinalizedHead: vi.fn().mockResolvedValue('0x3'),
+                getHeader: vi.fn().mockResolvedValue({ number: '0x3' })
+            };
+            const { crawler, fetchSpy } = makeCrawler({ rpcBatchSize: 1, fetchConcurrency: 1 }, provider);
+            await setSyncState({ syncStatus: 'stopped', lastIndexedHeight: 0, lastIndexedHash: '0x0', consecutiveErrors: 0 });
+
+            // Permanent, not transient: the block itself does not index.
+            fetchSpy.mockImplementation(async (...args: any[]) => {
+                const heights = args[0] as number[];
+                if (heights[0] === 2) throw new Error('Invalid runtime specVersion for block 2');
+                return prepared(heights);
+            });
+            const errorSpy = vi.spyOn(cds.log('nightgate:crawler'), 'error').mockImplementation(() => {});
+
+            try {
+                await expect(crawler.catchUp()).resolves.toBe(1);
+                expect(crawler.poisonBlock).toEqual({
+                    height: 2,
+                    message: 'Invalid runtime specVersion for block 2'
+                });
+                expect((await getSyncState()).syncStatus).toBe('error');
+
+                // A second pass costs nothing: no fetch, no status churn.
+                const callsAfterFirst = fetchSpy.mock.calls.length;
+                await expect(crawler.catchUp()).resolves.toBe(0);
+                expect(fetchSpy.mock.calls.length).toBe(callsAfterFirst);
+                expect((await getSyncState()).syncStatus).toBe('error');
+            } finally {
+                errorSpy.mockRestore();
+            }
+        });
+
+        it('keeps a transient batch failure retryable (a node outage must not switch indexing off)', async () => {
+            const provider = {
+                getFinalizedHead: vi.fn().mockResolvedValue('0x3'),
+                getHeader: vi.fn().mockResolvedValue({ number: '0x3' })
+            };
+            const { crawler, fetchSpy } = makeCrawler({ rpcBatchSize: 1, fetchConcurrency: 1 }, provider);
+            await setSyncState({ syncStatus: 'stopped', lastIndexedHeight: 0, lastIndexedHash: '0x0', consecutiveErrors: 0 });
+
+            fetchSpy.mockImplementation(async (...args: any[]) => {
+                const heights = args[0] as number[];
+                if (heights[0] === 2) throw new Error('Request timeout');
+                return prepared(heights);
+            });
+            const errorSpy = vi.spyOn(cds.log('nightgate:crawler'), 'error').mockImplementation(() => {});
+            const warnSpy = vi.spyOn(cds.log('nightgate:crawler'), 'warn').mockImplementation(() => {});
+
+            try {
+                await expect(crawler.catchUp()).resolves.toBe(1);
+                expect(crawler.poisonBlock).toBeNull();
+            } finally {
+                errorSpy.mockRestore();
+                warnSpy.mockRestore();
+            }
+        });
+
+        it('tracks the chain but indexes nothing while a block is latched', async () => {
+            const { crawler } = makeCrawler({}, {});
+            crawler.poisonBlock = { height: 7, message: 'Invalid runtime specVersion for block 7' };
+            await setSyncState({ syncStatus: 'error', lastIndexedHeight: 6, lastIndexedHash: '0x6', chainHeight: 6 });
+
+            const catchUpSpy = vi.spyOn(crawler, 'catchUp');
+            const processSpy = vi.spyOn(crawler, 'processBlockWithRetry');
+
+            await crawler.processLiveBlock({ number: '0x14', parentHash: '0x13', digest: { logs: [] } }, 20);
+
+            expect(catchUpSpy).not.toHaveBeenCalled();
+            expect(processSpy).not.toHaveBeenCalled();
+            // The operator still sees the chain moving away from the stalled index.
+            expect(Number((await getSyncState()).chainHeight)).toBe(20);
+        });
+
+        it('routes a live head on an empty index through catch-up', async () => {
+            const { crawler } = makeCrawler({ startHeight: 105 }, {});
+            await setSyncState({ syncStatus: 'syncing', lastIndexedHeight: 0, lastIndexedHash: null, chainHeight: 0 });
+
+            const catchUpSpy = vi.spyOn(crawler, 'catchUp').mockResolvedValue(0);
+            const processSpy = vi.spyOn(crawler, 'processBlockWithRetry');
+
+            // Head 106 has no parent in the index: the anchor has to be seeded first.
+            await crawler.processLiveBlock({ number: '0x6a', parentHash: '0x69', digest: { logs: [] } }, 106);
+
+            expect(catchUpSpy).toHaveBeenCalled();
+            expect(processSpy).not.toHaveBeenCalled();
+        });
+
+        it('does not report a failed catch-up as synced when the live subscription starts', async () => {
+            const provider = { subscribeFinalizedHeads: vi.fn().mockResolvedValue('sub-poison') };
+            const { crawler } = makeCrawler({}, provider);
+            await setSyncState({ syncStatus: 'error', lastIndexedHeight: 1, lastIndexedHash: '0x1' });
+
+            await crawler.subscribeLive();
+
+            expect((await getSyncState()).syncStatus).toBe('error');
+        });
+    });
+
+    // ========================================================================
     // Phase 2: Live Subscription
     // ========================================================================
     describe('subscribeLive', () => {
@@ -703,7 +933,7 @@ describe('MidnightCrawler orchestration', () => {
             vi.spyOn(crawler as any, 'checkForReorg').mockResolvedValue(null);
             vi.spyOn(crawler as any, 'processBlockWithRetry').mockRejectedValue(new Error('Request timeout'));
             const recordErrorSpy = vi.spyOn(crawler as any, 'recordError').mockResolvedValue(undefined);
-            vi.spyOn(crawler as any, 'getSyncState').mockResolvedValue({ consecutiveErrors: 11 });
+            vi.spyOn(crawler as any, 'getSyncState').mockResolvedValue({ consecutiveErrors: 11, lastIndexedHeight: 1, lastIndexedHash: '0x1' });
             const errorSpy = vi.spyOn(cds.log('nightgate:crawler'), 'error').mockImplementation(() => {});
 
             try {
@@ -736,7 +966,7 @@ describe('MidnightCrawler orchestration', () => {
             vi.spyOn(crawler as any, 'checkForReorg').mockResolvedValue(null);
             vi.spyOn(crawler as any, 'processBlockWithRetry').mockRejectedValue(new Error('Invalid block data'));
             const recordErrorSpy = vi.spyOn(crawler as any, 'recordError').mockResolvedValue(undefined);
-            vi.spyOn(crawler as any, 'getSyncState').mockResolvedValue({ consecutiveErrors: 1 });
+            vi.spyOn(crawler as any, 'getSyncState').mockResolvedValue({ consecutiveErrors: 1, lastIndexedHeight: 1, lastIndexedHash: '0x1' });
             const errorSpy = vi.spyOn(cds.log('nightgate:crawler'), 'error').mockImplementation(() => {});
 
             try {
@@ -790,6 +1020,8 @@ describe('MidnightCrawler orchestration', () => {
 
             // Seed a real ReorgLog row that handleReorg "created"; the live handler
             // then updates it to completed with the re-indexed count.
+            await setSyncState({ syncStatus: 'synced', lastIndexedHeight: 9, lastIndexedHash: '0x9' });
+
             const reorgLogId = cds.utils.uuid();
             await db.run(cds.ql.INSERT.into(REORG_LOG).entries({
                 ID: reorgLogId,

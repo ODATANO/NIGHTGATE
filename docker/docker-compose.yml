@@ -19,7 +19,7 @@ services:
     # pulls this and only builds locally when the image is unavailable.
     # NIGHTGATE_IMAGE_TAG overrides; keep the default in lockstep with
     # package.json on every release.
-    image: ghcr.io/odatano/nightgate:${NIGHTGATE_IMAGE_TAG:-0.24.4}
+    image: ghcr.io/odatano/nightgate:${NIGHTGATE_IMAGE_TAG:-0.24.5}
     container_name: odatano-nightgate
     ports:
       - "4004:4004"
@@ -37,6 +37,10 @@ services:
       NIGHTGATE_HTTP_PASSWORD: "${NIGHTGATE_HTTP_PASSWORD:-}"   # refused by cds-config.mjs when empty
       NIGHTGATE_NETWORK: "${NIGHTGATE_NETWORK:-preprod}"
       NIGHTGATE_CRAWLER_ENABLED: "${NIGHTGATE_CRAWLER_ENABLED:-false}"
+      # First height to index while the index is empty (unset = genesis) and the
+      # catch-up rate cap that keeps the crawler off the submission side's CPU.
+      NIGHTGATE_CRAWLER_START_HEIGHT: "${NIGHTGATE_CRAWLER_START_HEIGHT:-}"
+      NIGHTGATE_CRAWLER_MAX_BPS: "${NIGHTGATE_CRAWLER_MAX_BPS:-}"
       # Optional overrides (empty = built-in per-network defaults):
       NIGHTGATE_NODE_URL: "${NIGHTGATE_NODE_URL:-}"
       NIGHTGATE_INDEXER_HTTP_URL: "${NIGHTGATE_INDEXER_HTTP_URL:-}"

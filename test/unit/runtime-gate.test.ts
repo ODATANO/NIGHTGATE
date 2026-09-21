@@ -100,9 +100,12 @@ describe('offline runtime on the served API', () => {
         // the input); the gate never turns it into a 503.
         const compute = await cap.axios.post(`${API}/prepareMembershipSet`, { allowedValuesJson: JSON.stringify(['a', 'b']) }, AUTH);
         expect(compute.status).not.toBe(503);
+        // The probe answers for itself: 503 carrying the readiness payload,
+        // not the runtime gate's generic refusal.
         const readiness = await cap.axios.get('/api/v1/indexer/getReadiness()', AUTH);
-        expect(readiness.status).toBe(200);
+        expect(readiness.status).toBe(503);
         expect(readiness.data.ready).toBe(false);
+        expect(readiness.data.checks.initialization).toBe(false);
     });
 
     test('idle under SKIP_AUTO_INIT is not an outage: the action reaches its handler', async () => {

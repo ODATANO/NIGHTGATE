@@ -777,6 +777,8 @@ Last `limit` (default 10, max 100) reorg events with depth, detected-at timestam
 
 `@requires: 'admin'` (401/403 otherwise). `reindexFromHeight` rolls back to the height (recomputing `NightBalances` for affected addresses; job and submission outcomes confirmed at or above it return to a pending chain status until re-confirmed) and catches up from there. Status, health and metrics functions stay open for probes.
 
+`resumeCrawler` starts the crawler whatever `NIGHTGATE_CRAWLER_ENABLED` says, with the configured brakes (`crawler.fetchConcurrency`, `crawler.rpcBatchSize`, `crawler.maxBlocksPerSecond`); neither pause nor resume survives a restart. It also retries a block that was latched as unindexable, which is the recovery path when `syncStatus` sits at `error` and `lastError` names a height.
+
 ## Analytics
 
 `getBlockCount() / getTransactionCount() / getContractCount() / getAverageTransactionsPerBlock()` - simple aggregate queries over the indexed entities. `getContractCount` counts distinct decoded contract addresses, which is 0 until the ledger payload is decoded; `ContractStatistics` counts actions per type.

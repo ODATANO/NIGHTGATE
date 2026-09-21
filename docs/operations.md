@@ -41,6 +41,8 @@ NIGHTGATE_NODE_URL=wss://rpc.preprod.midnight.network/    # Substrate RPC
 
 # Crawler control
 NIGHTGATE_CRAWLER_ENABLED=false                           # Turn off during wallet-sync runs
+# NIGHTGATE_CRAWLER_START_HEIGHT=2351371                  # Index from here instead of genesis (empty index only)
+# NIGHTGATE_CRAWLER_MAX_BPS=20                            # Cap catch-up so it shares the host with submissions
 
 # Local indexer override (only if running the docker container)
 # NIGHTGATE_INDEXER_HTTP_URL=http://localhost:8088/api/v4/graphql
@@ -215,6 +217,59 @@ Payloads come from `srv/monitoring/status.ts`.
 With `NIGHTGATE_CRAWLER_ENABLED=false`, `chainHeight` is fresh (node) but `indexedHeight` is frozen, so `status` and `lag` say nothing about the wallet.
 
 Wallet sync health: `getWalletSyncProgress(sessionId)`.
+
+### Indexing alongside the submission side
+
+The crawler runs on the main thread and its catch-up is unthrottled by default,
+which is why the container ships with it off. To index on a host that also
+submits:
+
+1. Decide the first height you need. Everything below it stays unindexed, so
+   pick it from the data you want, not from the chain's age. `getSyncStatus()`
+   and the analytics entities only ever describe what was indexed.
+2. Set the brakes and the start, with the crawler still off:
+
+   ```bash
+   NIGHTGATE_CRAWLER_START_HEIGHT=2351371   # empty index only
+   NIGHTGATE_CRAWLER_MAX_BPS=20
+   NIGHTGATE_FETCH_CONCURRENCY=1
+   NIGHTGATE_RPC_BATCH_SIZE=8
+   NIGHTGATE_CRAWLER_NODE_URL=ws://127.0.0.1:9944   # an archive node, if there is one
+   ```
+
+   A container reads its environment once, at create time: these need a
+   recreate, not a restart. On a host with a warm sponsor pool, do it in a
+   quiet window, because the pool re-warms afterwards.
+3. Start indexing with `resumeCrawler` (admin), stop it with `pauseCrawler`.
+   Neither survives a restart: `NIGHTGATE_CRAWLER_ENABLED` decides what a fresh
+   process does.
+4. Watch the `Catch-up:` log line (`h/tip`, percentage, blocks per second, and
+   the fetch/persist/wait split) and `SyncState.blocksPerSecond`. At 20 blocks
+   per second a day of preprod (~14,300 blocks at 6 s) is indexed in about
+   twelve minutes.
+
+`startHeight` applies only while the index is empty. The block below it is
+indexed as the anchor, the one block allowed to have no parent, and every
+later block is persisted against its parent as usual. Once blocks exist the
+cursor decides, so a restart resumes where it stopped rather than re-seeding.
+A rollback that empties the table makes the next catch-up seed again.
+
+`reindexFromHeight(height)` also reverts job and submission evidence at or
+above that height to a pending chain status (the confirmer re-establishes it).
+Never pass a height below the oldest job you still care about, and never 0 on
+a production database.
+
+### A block that will not index
+
+A deterministic failure (a block that fails decoding or persisting on every
+attempt) stops catch-up, marks `syncStatus` as `error` with the reason in
+`lastError`, and is then left alone: the crawler tracks `chainHeight` from the
+live head but retries nothing, instead of re-entering the same block every six
+seconds. The log names the height. A transient failure, a node outage above
+all, is not latched and stays retryable.
+
+Recovery is `pauseCrawler` then `resumeCrawler`, which retries the block once,
+or `reindexFromHeight` below it. A restart retries it too.
 
 ## Troubleshooting
 
