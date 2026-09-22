@@ -3,6 +3,8 @@
  */
 
 import { MidnightNodeProvider } from '../providers/MidnightNodeProvider';
+import { installCrawlerFaultGuard } from './crawler-fault-guard';
+import { configBool } from '../utils/config';
 import { MidnightCrawler, CrawlerConfig } from './Crawler';
 import cds from '@sap/cds';
 const log = cds.log('nightgate:crawler');
@@ -23,6 +25,10 @@ export async function startCrawler(config: CrawlerConfig & { nodeUrl: string; re
         log.warn('Already running');
         return;
     }
+
+    // Installed with the crawler, because the crawler is what introduces the
+    // fault class: a node that answers slowly or not at all.
+    if (configBool('NIGHTGATE_CRAWLER_FAULT_GUARD') !== false) installCrawlerFaultGuard();
 
     const nodeProvider = new MidnightNodeProvider({
         nodeUrl: config.nodeUrl,

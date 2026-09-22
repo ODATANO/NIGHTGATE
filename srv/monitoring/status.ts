@@ -21,6 +21,7 @@ import {
 import { getWalletWorkerStatus } from '../midnight/wallet-worker-client';
 import { listWalletFacades } from '../submission/wallet-facade-builder';
 import { readRuntimeState } from '../utils/runtime-state';
+import { absorbedCrawlerFaults } from '../crawler/crawler-fault-guard';
 
 export const metricPrefix = 'odatano_nightgate';
 
@@ -239,6 +240,10 @@ export async function buildMetricsText(db: Db): Promise<string> {
     lines.push(`# HELP ${metricPrefix}_consecutive_errors Consecutive indexing errors`);
     lines.push(`# TYPE ${metricPrefix}_consecutive_errors gauge`);
     lines.push(`${metricPrefix}_consecutive_errors ${errors}`);
+
+    lines.push(`# HELP ${metricPrefix}_absorbed_transport_faults Node transport faults that did not shut the server down`);
+    lines.push(`# TYPE ${metricPrefix}_absorbed_transport_faults counter`);
+    lines.push(`${metricPrefix}_absorbed_transport_faults ${absorbedCrawlerFaults()}`);
 
     lines.push(`# HELP ${metricPrefix}_uptime_seconds Process uptime in seconds`);
     lines.push(`# TYPE ${metricPrefix}_uptime_seconds gauge`);

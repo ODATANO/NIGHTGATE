@@ -276,6 +276,8 @@ export class MidnightCrawler {
                 return 0;
             }
 
+            // How far THIS run has to go. Not the same as the share of the
+            // chain that is indexed, which is what syncProgress reports.
             const totalBlocks = tipHeight - startHeight + 1;
             log.info(`Catch-up: ${startHeight} → ${tipHeight} (${totalBlocks} blocks, finalized)`);
 
@@ -355,6 +357,19 @@ export class MidnightCrawler {
         // In-flight batches, drained in submission order; `retried` = re-queued once.
         const queue: Array<{ from: number; to: number; data: Promise<any[]>; retried?: boolean }> = [];
 
+        /**
+         * A prefetch sits in the queue until the loop reaches it, and it can
+         * reject while the loop is still persisting an earlier batch. Nothing
+         * is awaiting it at that moment, so the rejection would be unhandled
+         * and an unhandled rejection ends the process. The no-op catch marks it
+         * handled; the queue's own `await` still sees the rejection.
+         */
+        const prefetch = (heights: number[]): Promise<any[]> => {
+            const data = this.fetchBlockBatchWithRetry(heights);
+            data.catch(() => { /* the queue reports it when it drains */ });
+            return data;
+        };
+
         const pumpFetches = () => {
             while (
                 queue.length < concurrency &&
@@ -365,7 +380,7 @@ export class MidnightCrawler {
                 const to = Math.min(from + rpcBatchSize - 1, tipHeight);
                 const heights: number[] = [];
                 for (let h = from; h <= to; h++) heights.push(h);
-                queue.push({ from, to, data: this.fetchBlockBatchWithRetry(heights) });
+                queue.push({ from, to, data: prefetch(heights) });
                 nextHeightToFetch = to + 1;
             }
         };
@@ -424,7 +439,13 @@ export class MidnightCrawler {
 
                         await this.db.run(
                             UPDATE.entity(SyncState).set({
-                                syncProgress: ((h - startHeight + 1) / totalBlocks * 100),
+                                // Against the CHAIN, not against this run: the run
+                                // starts wherever the cursor left off, so a
+                                // run-relative figure drops on every restart while
+                                // the index keeps growing.
+                                // tipHeight 0 is a genesis-only chain: 0/0 would
+                                // store null, which reads as "unknown".
+                                syncProgress: tipHeight > 0 ? Math.min(100, (h / tipHeight) * 100) : 100,
                                 blocksPerSecond: bps,
                                 consecutiveErrors: 0
                             }).where({ ID: 'SINGLETON' })
@@ -453,7 +474,7 @@ export class MidnightCrawler {
                         from: head.from,
                         to: head.to,
                         retried: true,
-                        data: this.fetchBlockBatchWithRetry(heights)
+                        data: prefetch(heights)
                     });
                 } else {
                     log.error(

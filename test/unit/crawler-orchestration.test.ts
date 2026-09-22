@@ -454,6 +454,153 @@ describe('MidnightCrawler orchestration', () => {
             }));
         }
 
+        /**
+         * A prefetched batch can reject while the loop is still persisting an
+         * earlier one, before anything awaits it. Pins that the pipeline still
+         * completes and reports the failure through the queue.
+         */
+        it('leaves no unhandled rejection when a prefetched batch fails mid-loop', async () => {
+            const provider = {
+                getFinalizedHead: vi.fn().mockResolvedValue('0x4'),
+                getHeader: vi.fn().mockResolvedValue({ number: '0x4' })
+            };
+            const crawler = new MidnightCrawler(provider as any, { enabled: true, rpcBatchSize: 1, fetchConcurrency: 4 });
+            (crawler as any).db = db;
+            (crawler as any).isRunning = true;
+            (crawler as any).processor = {
+                fetchBlockBatch: mockProcessorFetchBlockBatch,
+                persistPreparedBlock: mockProcessorPersistPreparedBlock
+            };
+            await setSyncState({ syncStatus: 'stopped', lastIndexedHeight: 0, lastIndexedHash: '0x0', consecutiveErrors: 0 });
+
+            // Height 1 resolves slowly; heights 2 and up reject while the loop
+            // is still busy with 1, which is exactly the window.
+            let releaseFirst: (v: any) => void = () => undefined;
+            vi.spyOn(crawler as any, 'fetchBlockBatchWithRetry')
+                .mockImplementation(async (...args: any[]) => {
+                    const heights = args[0] as number[];
+                    if (heights[0] === 1) {
+                        return new Promise(resolve => { releaseFirst = () => resolve(preparedBlocks(heights)); });
+                    }
+                    throw new Error('RPC timeout: chain_getBlockHash (30000ms)');
+                });
+            mockProcessorPersistPreparedBlock.mockImplementation(async (prep: any) => ({
+                blockHeight: prep.height, blockHash: prep.blockHash,
+                transactionCount: 0, contractActionCount: 0, processingTimeMs: 1
+            }));
+
+            const unhandled: unknown[] = [];
+            const onUnhandled = (reason: unknown) => unhandled.push(reason);
+            process.on('unhandledRejection', onUnhandled);
+            const errorSpy = vi.spyOn(cds.log('nightgate:crawler'), 'error').mockImplementation(() => {});
+            const warnSpy = vi.spyOn(cds.log('nightgate:crawler'), 'warn').mockImplementation(() => {});
+            try {
+                const run = (crawler as any).catchUp();
+                // Let the siblings reject while height 1 is still outstanding.
+                await new Promise(resolve => setImmediate(resolve));
+                await new Promise(resolve => setImmediate(resolve));
+                releaseFirst(undefined);
+                await run;
+                await new Promise(resolve => setImmediate(resolve));
+            } finally {
+                process.off('unhandledRejection', onUnhandled);
+                errorSpy.mockRestore();
+                warnSpy.mockRestore();
+            }
+
+            // Aussagekraeftig nur, wenn die Vorhol-Batches ueberhaupt liefen.
+            expect((crawler as any).fetchBlockBatchWithRetry.mock.calls.length).toBeGreaterThanOrEqual(4);
+            expect(unhandled).toEqual([]);
+        });
+
+        /**
+         * The run starts wherever the cursor left off, so a run-relative figure
+         * falls on every restart while the index keeps growing. Reported against
+         * the chain instead, which is the only reading that fits the field's
+         * neighbours in the same row.
+         */
+        it('reports syncProgress against the chain, not against the run', async () => {
+            const provider = {
+                getFinalizedHead: vi.fn().mockResolvedValue('0x64'),
+                getHeader: vi.fn().mockResolvedValue({ number: '0x64' })  // tip 100
+            };
+            const crawler = new MidnightCrawler(provider as any, {
+                enabled: true, rpcBatchSize: 1, fetchConcurrency: 1, batchSize: 1
+            });
+            (crawler as any).db = db;
+            (crawler as any).isRunning = true;
+            (crawler as any).processor = {
+                fetchBlockBatch: mockProcessorFetchBlockBatch,
+                persistPreparedBlock: mockProcessorPersistPreparedBlock
+            };
+            // Resume at 90: a run-relative figure would read ~9% at height 91.
+            await setSyncState({ syncStatus: 'stopped', lastIndexedHeight: 90, lastIndexedHash: '0x5a', consecutiveErrors: 0 });
+
+            vi.spyOn(crawler as any, 'fetchBlockBatchWithRetry')
+                .mockImplementation(async (...args: any[]) => preparedBlocks(args[0] as number[]));
+            mockProcessorPersistPreparedBlock.mockImplementation(async (prep: any) => ({
+                blockHeight: prep.height, blockHash: prep.blockHash,
+                transactionCount: 0, contractActionCount: 0, processingTimeMs: 1
+            }));
+
+            const progress: number[] = [];
+            const originalRun = db.run.bind(db);
+            const spy = vi.spyOn(db, 'run').mockImplementation(async (...args: any[]) => {
+                const data = (args[0] as any)?.UPDATE?.data;
+                if (data && data.syncProgress !== undefined) progress.push(Number(data.syncProgress));
+                return originalRun(...args);
+            });
+            try {
+                await (crawler as any).catchUp();
+            } finally {
+                spy.mockRestore();
+            }
+
+            // Height 91 of a 100-block chain is 91%, not 9% of a ten-block run.
+            expect(progress.length).toBeGreaterThan(0);
+            expect(progress[0]).toBeGreaterThan(80);
+            expect(progress.every(p => p <= 100)).toBe(true);
+        });
+
+        it('reports 100 percent on a genesis-only chain instead of null', async () => {
+            const provider = {
+                getFinalizedHead: vi.fn().mockResolvedValue('0x0'),
+                getHeader: vi.fn().mockResolvedValue({ number: '0x0' })
+            };
+            const crawler = new MidnightCrawler(provider as any, {
+                enabled: true, rpcBatchSize: 1, fetchConcurrency: 1, batchSize: 1
+            });
+            (crawler as any).db = db;
+            (crawler as any).isRunning = true;
+            (crawler as any).processor = {
+                fetchBlockBatch: mockProcessorFetchBlockBatch,
+                persistPreparedBlock: mockProcessorPersistPreparedBlock
+            };
+            await setSyncState({ syncStatus: 'stopped', lastIndexedHeight: 0, lastIndexedHash: null, consecutiveErrors: 0 });
+
+            vi.spyOn(crawler as any, 'fetchBlockBatchWithRetry')
+                .mockImplementation(async (...args: any[]) => preparedBlocks(args[0] as number[]));
+            mockProcessorPersistPreparedBlock.mockImplementation(async (prep: any) => ({
+                blockHeight: prep.height, blockHash: prep.blockHash,
+                transactionCount: 0, contractActionCount: 0, processingTimeMs: 1
+            }));
+
+            const written: unknown[] = [];
+            const originalRun = db.run.bind(db);
+            const spy = vi.spyOn(db, 'run').mockImplementation(async (...args: any[]) => {
+                const data = (args[0] as any)?.UPDATE?.data;
+                if (data && data.syncProgress !== undefined) written.push(data.syncProgress);
+                return originalRun(...args);
+            });
+            try {
+                await (crawler as any).catchUp();
+            } finally {
+                spy.mockRestore();
+            }
+            // 0/0 would store null, which a consumer reads as "unknown".
+            expect(written.every(v => v !== null && Number.isFinite(Number(v)))).toBe(true);
+        });
+
         it('re-queues a failed batch once and persists every height without gaps', async () => {
             const provider = {
                 getFinalizedHead: vi.fn().mockResolvedValue('0x3'),

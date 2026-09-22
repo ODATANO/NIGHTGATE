@@ -258,6 +258,8 @@ entity SyncState {
 
         syncStatus          : SyncStatus default 'stopped';
         reorgGeneration     : Integer64 default 0;
+        // Share of the CHAIN indexed (lastIndexedHeight / chainHeight), not
+        // the progress of the current catch-up run.
         syncProgress        : Decimal(5, 2) default 0;
         blocksPerSecond     : Decimal(10, 2) default 0;
 

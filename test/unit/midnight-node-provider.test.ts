@@ -485,6 +485,20 @@ describe('MidnightNodeProvider rpcBatch', () => {
         }
     });
 
+    it('reports the FIRST failure when several sub-requests fail', async () => {
+        const { provider, socket } = await connectedProvider();
+        const batchPromise = provider.rpcBatch([
+            { method: 'chain_getBlock', params: ['0xa'] },
+            { method: 'chain_getBlock', params: ['0xb'] }
+        ]);
+        const frame = JSON.parse(socket.send.mock.calls[0][0]);
+        socket.emit('message', JSON.stringify([
+            { jsonrpc: '2.0', id: frame[0].id, error: { code: -32000, message: 'first failure' } },
+            { jsonrpc: '2.0', id: frame[1].id, error: { code: -32000, message: 'second failure' } }
+        ]));
+        await expect(batchPromise).rejects.toThrow(/first failure/);
+    });
+
     it('defaults params to [] in the batch frame', async () => {
         const { provider, socket } = await connectedProvider();
         const p = provider.rpcBatch([{ method: 'system_health' }]);

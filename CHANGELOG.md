@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.25.1 - 2026-09-22
+
+- `SyncState.syncProgress` reports the share of the CHAIN that is indexed
+  (`lastIndexedHeight / chainHeight`), not the progress of the current
+  catch-up run. A run starts wherever the cursor left off, so the old figure
+  fell on every restart while the index kept growing: 36 % indexed read as
+  5.7 %. The column now says which of the two it is, and a chain that is still
+  at genesis reports 100 rather than null.
+- A node transport fault no longer shuts the server down. CAP ends the process
+  on any unhandled rejection, so a crawler talking to a slow or incomplete node
+  could take the submission side with it, and every restart costs each sponsor
+  facade its warm-up. Faults carrying the node transport's signature are logged
+  and counted (`getMetrics()`, `absorbed_transport_faults`); everything else
+  reaches `cds.shutdown`, the same end CAP would have brought about, after any
+  listener that was already registered has seen it: an error reporter listens
+  here too and ends nothing, so a captured listener is never taken for a
+  shutdown. A fault
+  qualifies only when the message reads like the node transport AND the stack
+  comes from the crawler or its provider: a defect thrown inside the crawler,
+  or a connection reset on the submission side, still ends the process. `NIGHTGATE_CRAWLER_FAULT_GUARD=false`
+  restores the old behaviour.
+- A prefetched block batch carries a rejection handler from the moment it is
+  queued. It sits in the queue until the loop reaches it and can fail before
+  anything awaits it; the queue's own `await` still reports the failure.
+
 ## 0.25.0 - 2026-09-21
 
 - The crawler indexes unshielded UTXOs. `Midnight.UnshieldedTokens` in
