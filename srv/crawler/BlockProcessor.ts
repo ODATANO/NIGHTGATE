@@ -216,12 +216,21 @@ export class BlockProcessor {
     /** Bech32m HRP network of the unshielded owners this index stores. */
     private resolvedNetwork?: string;
 
-    /** Well-known Substrate storage key for Timestamp::Now (twox128("Timestamp") + twox128("Now")) */
+    /** Timestamp::Now = twox128("Timestamp") + twox128("Now"). */
     private static readonly TIMESTAMP_STORAGE_KEY =
-        '0xf0c365c3cf59d671eb72da0e7a4113c4e2c375c859d5adb749f1454ac11356be';
+        '0xf0c365c3cf59d671eb72da0e7a4113c49f1f0515f462cdcf84e0f1d6045dfcbb';
     /** System::Events = twox128("System") + twox128("Events"). */
     private static readonly SYSTEM_EVENTS_STORAGE_KEY =
         '0x26aa394eea5630e07c48ae0c9558cef780d41e5e16056765bc8461851072c9d7';
+    /**
+     * System::LastRuntimeUpgrade = twox128("System") + twox128("LastRuntimeUpgrade"),
+     * SCALE `{ spec_version: Compact<u32>, spec_name: Vec<u8> }`. A plain storage
+     * read, where `state_getRuntimeVersion` at a historical hash compiles that runtime.
+     */
+    private static readonly LAST_RUNTIME_UPGRADE_STORAGE_KEY =
+        '0x26aa394eea5630e07c48ae0c9558cef7f9cce9c888469bb1a0dceaa129672ef8';
+    /** specVersion per raw LastRuntimeUpgrade value: the node is asked once per value, not per block. */
+    private readonly specVersionByUpgrade = new Map<string, Promise<number>>();
 
     constructor(
         private nodeProvider: MidnightNodeProvider
@@ -280,20 +289,20 @@ export class BlockProcessor {
         let blockResults: SignedBlock[] = [];
         let tsResults: (string | null)[] = [];
         let eventResults: (string | null)[] = [];
-        let versionResults: Array<{ specVersion?: number } | null> = [];
+        let upgradeResults: (string | null)[] = [];
         if (newIndices.length > 0) {
             const requests: Array<{ method: string; params: unknown[] }> = [];
             for (const i of newIndices) {
                 requests.push({ method: 'chain_getBlock', params: [hashes[i]] });
                 requests.push({ method: 'state_getStorage', params: [BlockProcessor.TIMESTAMP_STORAGE_KEY, hashes[i]] });
                 requests.push({ method: 'state_getStorage', params: [BlockProcessor.SYSTEM_EVENTS_STORAGE_KEY, hashes[i]] });
-                requests.push({ method: 'state_getRuntimeVersion', params: [hashes[i]] });
+                requests.push({ method: 'state_getStorage', params: [BlockProcessor.LAST_RUNTIME_UPGRADE_STORAGE_KEY, hashes[i]] });
             }
             const flat = await this.nodeProvider.rpcBatch(requests);
             blockResults = newIndices.map((_, k) => flat[k * 4]);
             tsResults = newIndices.map((_, k) => flat[k * 4 + 1]);
             eventResults = newIndices.map((_, k) => flat[k * 4 + 2]);
-            versionResults = newIndices.map((_, k) => flat[k * 4 + 3]);
+            upgradeResults = newIndices.map((_, k) => flat[k * 4 + 3]);
         }
 
         const fetchCompletedAt = Date.now();
@@ -319,7 +328,7 @@ export class BlockProcessor {
             if (!signedBlock?.block) {
                 throw new Error(`No block body returned for height ${heights[i]} (pruned or racing node)`);
             }
-            const protocolVersion = this.specVersionFromBatch(versionResults[newIdx], `height ${heights[i]}`);
+            const protocolVersion = await this.resolveSpecVersion(upgradeResults[newIdx], blockHash, `height ${heights[i]}`);
             const eventRegistry = await this.getEventRegistry(blockHash, protocolVersion);
             const palletMap = this.palletMapFor(protocolVersion);
             const timestamp = this.resolveTimestamp(tsResults[newIdx], signedBlock.block.extrinsics, `height ${heights[i]}`, palletMap);
@@ -412,15 +421,16 @@ export class BlockProcessor {
             };
         }
 
-        const [signedBlock, timestampHex, protocolVersion, rawEvents] = await Promise.all([
+        const [signedBlock, timestampHex, upgradeHex, rawEvents] = await Promise.all([
             this.nodeProvider.getBlock(blockHash),
             this.getBlockTimestampHex(blockHash),
-            this.getProtocolVersion(blockHash),
+            this.getLastRuntimeUpgradeHex(blockHash),
             this.nodeProvider.getStorage(BlockProcessor.SYSTEM_EVENTS_STORAGE_KEY, blockHash)
         ]);
         if (!signedBlock?.block) {
             throw new Error(`No block body returned for ${blockHash} (pruned or racing node)`);
         }
+        const protocolVersion = await this.resolveSpecVersion(upgradeHex, blockHash, `block ${blockHash}`);
         const header = signedBlock.block.header;
         const height = MidnightNodeProvider.parseBlockNumber(header.number);
         const eventRegistry = await this.getEventRegistry(blockHash, protocolVersion);
@@ -995,15 +1005,74 @@ export class BlockProcessor {
         }
     }
 
-    /** Queried per block so a runtime upgrade applies from its first block. */
-    private async getProtocolVersion(blockHash: string): Promise<number> {
+    /** System::LastRuntimeUpgrade storage at a block (raw hex), null when the RPC fails or the state is gone. */
+    private async getLastRuntimeUpgradeHex(blockHash: string): Promise<string | null> {
+        try {
+            return (await this.nodeProvider.getStorage(BlockProcessor.LAST_RUNTIME_UPGRADE_STORAGE_KEY, blockHash)) ?? null;
+        } catch (err) {
+            log.warn(`Failed to read LastRuntimeUpgrade for ${blockHash}: ${(err as Error).message}`);
+            return null;
+        }
+    }
+
+    /**
+     * The runtime specVersion of a block, keyed by its `System.LastRuntimeUpgrade`
+     * value: the node is asked (`state_getRuntimeVersion`, the expensive call)
+     * once per distinct value, so an upgrade still applies from its first block
+     * while a million blocks under one runtime cost one call. The node stays the
+     * authority; the decoded value cross-checks it, and an answer that disagrees
+     * with it is used for that block only, never cached under the value (the
+     * block that carries a runtime upgrade still reports the previous value).
+     * A block whose storage carries no such value (pruned or racing node, or a
+     * chain without it) is asked per block, as before.
+     */
+    private resolveSpecVersion(upgradeHex: string | null | undefined, blockHash: string, where: string): Promise<number> {
+        if (typeof upgradeHex !== 'string' || !/^0x[0-9a-fA-F]{2,}$/.test(upgradeHex)) {
+            return this.getProtocolVersion(blockHash, where);
+        }
+        let pending = this.specVersionByUpgrade.get(upgradeHex);
+        if (!pending) {
+            pending = this.getProtocolVersion(blockHash, where).then(specVersion => {
+                const decoded = BlockProcessor.decodeLastRuntimeUpgrade(upgradeHex);
+                if (decoded !== null && decoded !== specVersion) {
+                    log.warn(`LastRuntimeUpgrade at ${where} decodes to specVersion ${decoded}, node reports ${specVersion}; using the node's for this block only`);
+                    this.specVersionByUpgrade.delete(upgradeHex);
+                    return specVersion;
+                }
+                log.info(`Runtime specVersion ${specVersion} first seen at ${where}`);
+                return specVersion;
+            });
+            this.specVersionByUpgrade.set(upgradeHex, pending);
+            // A failed lookup is not an answer: the next block with this value asks again.
+            pending.catch(() => this.specVersionByUpgrade.delete(upgradeHex));
+        }
+        return pending;
+    }
+
+    /**
+     * `spec_version` of a SCALE `LastRuntimeUpgradeInfo { spec_version: Compact<u32>, spec_name: Vec<u8> }`,
+     * null when the bytes do not decode as one.
+     */
+    static decodeLastRuntimeUpgrade(hex: string): number | null {
+        const bytes = Buffer.from(hex.startsWith('0x') ? hex.slice(2) : hex, 'hex');
+        if (bytes.length === 0) return null;
+        switch (bytes[0] & 0b11) {
+            case 0: return bytes[0] >>> 2;
+            case 1: return bytes.length >= 2 ? bytes.readUInt16LE(0) >>> 2 : null;
+            case 2: return bytes.length >= 4 ? bytes.readUInt32LE(0) >>> 2 : null;
+            default: return null; // big-integer mode: not a u32
+        }
+    }
+
+    /** Asks the node for the runtime version AT this block: the expensive call, reserved for the first block of each runtime. */
+    private async getProtocolVersion(blockHash: string, where: string = `block ${blockHash}`): Promise<number> {
         let rv: { specVersion?: number } | null | undefined;
         try {
             rv = await this.nodeProvider.getRuntimeVersion(blockHash);
         } catch (err) {
-            throw new Error(`No runtime version for block ${blockHash}: ${(err as Error).message}`);
+            throw new Error(`No runtime version for ${where}: ${(err as Error).message}`);
         }
-        return this.specVersionFromBatch(rv, `block ${blockHash}`);
+        return this.specVersionFromBatch(rv, where);
     }
 
     /** `engineId:data` of the PreRuntime digest log (type 6), else the first log. */

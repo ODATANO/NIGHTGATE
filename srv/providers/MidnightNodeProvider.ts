@@ -260,7 +260,7 @@ export class MidnightNodeProvider {
             promises.push(new Promise((resolve, reject) => {
                 const timeout = setTimeout(() => {
                     this.pendingRequests.delete(id);
-                    reject(new Error(`RPC timeout: ${req.method} (${this.config.requestTimeout}ms)`));
+                    reject(new Error(`RPC timeout: ${req.method} (${this.config.requestTimeout}ms) in a batch frame of ${requests.length} calls`));
                 }, this.config.requestTimeout);
                 this.pendingRequests.set(id, { resolve, reject, timeout });
             }));

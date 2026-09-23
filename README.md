@@ -41,7 +41,7 @@
 │  └─────────┬────────────┘                 │ - private-state-rpc      │    │
 │            │ OData V4                     └──────────┬───────────────┘    │
 │            ▼                                         │                    │
-│  4 services on /api/v1/{nightgate, indexer, analytics, admin}             │
+│  5 services on /api/v1/{nightgate, indexer, analytics, admin, verify}     │
 └───────────────────────────────────────────────────────────────────────────┘
 ```
 

@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.25.2 - 2026-09-23
+
+- The crawler no longer asks the node for the runtime version of every block.
+  `state_getRuntimeVersion` at a historical hash makes a Substrate node load
+  and compile that block's runtime unless it is one of the two it keeps
+  instantiated (`--runtime-cache-size`); against the public preprod RPC that
+  was 2 to 8 s per call for every block behind a runtime upgrade, eight of them
+  in each batch frame, so the frame took 17 to 38 s against a 30 s timeout and
+  the catch-up fell from 20 to 0.5 blocks/s at height 1,568,000 (the upgrade to
+  spec 1000000) while every retry looked transient. The batch frame now reads
+  `System.LastRuntimeUpgrade` instead, a plain storage read at any height, and
+  the node is asked for the version once per distinct value: an upgrade still
+  applies from its first block, a million blocks under one runtime cost one
+  call. The node remains the authority; the decoded value cross-checks it, and
+  an answer that disagrees with the value (the block carrying an upgrade still
+  reports the previous one) is used for that block only, never cached under the
+  value. A block without that storage (pruned or racing node) is asked per block
+  as before. Same for the on-demand path (`processBlockByHash`).
+- A batch-frame timeout names the frame (`in a batch frame of N calls`), not
+  only the first call in it: the old message blamed `chain_getBlock` for a
+  frame that was waiting on something else.
+- The `Timestamp.Now` storage key was wrong (its second half hashed to no
+  pallet item), so the node answered null for every block and the block time
+  came from the `Timestamp.set` inherent: one wasted read per block, and a
+  dependency on the pallet map for a value the state holds directly. The key
+  is now twox128("Timestamp") + twox128("Now"); the inherent stays the
+  fallback for a pruned or racing node. Same value, same column.
+
 ## 0.25.1 - 2026-09-22
 
 - `SyncState.syncProgress` reports the share of the CHAIN that is indexed
