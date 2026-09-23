@@ -25,6 +25,7 @@ import { startWalletWorker, stopWalletWorker } from '../srv/midnight/wallet-work
 import { wireWorkerStateSaveSink } from '../srv/submission/wallet-facade-builder';
 import { clearAllEncryptionKeys } from '../srv/submission/wallet-sync-state-store';
 import { ensureIndexes } from '../srv/utils/db-indexes';
+import { installPostgresOrderNulls } from '../srv/utils/pg-order-nulls';
 import { assertStoredKeyIdsKnown } from '../srv/utils/encryption-rewrap';
 import { recoverInterruptedJobs, dropPendingJobsForClosedSessions, startBackgroundJobProcessor, stopBackgroundJobProcessor, registerChainOutcomeConfirmer } from '../srv/submission/background-jobs';
 import { buildIndexerTxConfirmer } from '../srv/submission/chain-outcome-confirmer';
@@ -134,6 +135,9 @@ async function ensureSchemaDeployed(): Promise<void> {
     }
 
     const dbKind = String((cds.env as any).requires?.db?.kind ?? '');
+    // ORDER BY without a NULLS clause on key / NOT NULL columns, so the indexes
+    // below serve `$top`, `$orderby` and latest() (srv/utils/pg-order-nulls.ts).
+    if (/postgres/i.test(dbKind)) installPostgresOrderNulls();
     const created = await ensureIndexes(db as any, dbKind, msg => log.warn(msg));
     log.debug(`ensured ${created} secondary index(es)`);
 

@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.25.4 - 2026-09-23
+
+- ORDER BY on PostgreSQL no longer carries a NULLS clause for key and
+  `not null` columns. `@cap-js/postgres` renders every ordering term as
+  `ASC NULLS FIRST` / `DESC NULLS LAST` (SQLite's null order), the opposite
+  of a Postgres btree index, so the planner sorted the whole table for any
+  `ORDER BY … LIMIT` on such a column. CAP orders every `$top` read by the
+  key: `Blocks?$top=1` was `ORDER BY "$b".ID ASC NULLS FIRST LIMIT 1`, a
+  parallel seq scan and top-N sort over 2M rows, 0.8 to 7.6 s on the hosted
+  box; `Blocks/latest()` (`height DESC NULLS LAST`) 0.9 s although
+  `ng_blocks_height` exists; `ContractActions?$top=1` 0.9 s. With the
+  clause gone the primary keys and the existing secondary indexes serve
+  these reads (`srv/utils/pg-order-nulls.ts`, installed from `src/index.ts`
+  before `ensureIndexes` when the db kind is postgres; rendered through the
+  real driver in the unit test). No new index, no schema change.
+
 ## 0.25.3 - 2026-09-23
 
 - Agent tokens may call the bound read functions of the indexer entities
