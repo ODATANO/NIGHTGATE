@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.25.3 - 2026-09-23
+
+- Agent tokens may call the bound read functions of the indexer entities
+  without an allowlist entry: `Blocks/latest`, `byHeight`, `range`,
+  `Transactions/byHash`, `byType`, `ContractActions/byAddress`, `history`,
+  `UnshieldedUtxos/byOwner`, `unspent`, `NightBalances/getBalance`,
+  `getTopHolders` (`AGENT_ALWAYS_ALLOWED_EVENTS`). They read the same public
+  rows `READ` already admits, but a bound function arrives as its own event
+  and the names were not grantable either, so an ODATANO ACCESS key got 403
+  on `Blocks/latest()` although the gateway's reference offered the call.
+
 ## 0.25.2 - 2026-09-23
 
 - The crawler no longer asks the node for the runtime version of every block.

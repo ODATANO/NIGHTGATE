@@ -2,7 +2,8 @@
  * Agent-token READs over real HTTP (cds.test boot with the standalone image's
  * transport auth): a token bound to one session sees only that session's
  * Documents rows, never the operator's other sessions or rows without a
- * session; an entity outside the agent-readable set answers 403; the
+ * session; the bound read functions of the chain entities answer under a
+ * token; an entity outside the agent-readable set answers 403; the
  * operator's own reads are untouched.
  */
 
@@ -56,6 +57,20 @@ describe('agent token reads over HTTP', () => {
         expect(res.status).toBe(200);
         const refs = res.data.value.map((r: any) => r.storageRef).sort();
         expect(refs).toEqual(['s3://private/own-session']);
+    });
+
+    it('a token calls the bound read functions of the chain entities', async () => {
+        const db = await cds.connect.to('db');
+        const now = new Date().toISOString();
+        await db.run(cds.ql.INSERT.into('midnight.Blocks').entries({
+            ID: cds.utils.uuid(), hash: 'a'.repeat(64), height: 7, protocolVersion: 1, timestamp: 1700000000,
+            createdAt: now, modifiedAt: now
+        }));
+        const latest = await get('Blocks/latest()', asToken);
+        expect(latest.status).toBe(200);
+        expect(String(latest.data.height)).toBe('7');
+        const holders = await get('NightBalances/getTopHolders(limit=5)', asToken);
+        expect(holders.status).toBe(200);
     });
 
     it('a token cannot read GranteeIdentities', async () => {

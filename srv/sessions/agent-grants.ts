@@ -76,7 +76,14 @@ export const AGENT_ALWAYS_ALLOWED_EVENTS: ReadonlySet<string> = new Set([
     'prepareMembershipSet', // compute-only
     'deriveTokenType', // compute-only
     'getJobStatus',
-    'getGrantUsage' // narrowed to the token's own grant in enforceAgentGrant
+    'getGrantUsage', // narrowed to the token's own grant in enforceAgentGrant
+    // Bound read functions of the indexer entities: the rows `READ` already
+    // admits, but a bound function arrives as its own event and is not grantable.
+    'latest', 'byHeight', 'range',          // Blocks
+    'byHash', 'byType',                     // Transactions
+    'byAddress', 'history',                 // ContractActions
+    'byOwner', 'unspent',                   // UnshieldedUtxos
+    'getBalance', 'getTopHolders',          // NightBalances
     // Not getSponsorPoolStatus: as the operator, a token would read every
     // sponsor session that operator owns.
 ]);

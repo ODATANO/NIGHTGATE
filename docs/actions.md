@@ -359,7 +359,11 @@ reach this endpoint can make you pay fees.
 - **Always allowed under any token** (no list entry, no budget): entity reads
   (chain projections; `WalletSessions`, `PendingSubmissions`, `Documents`
   narrowed to the grant's session, `AgentGrants` to the grant;
-  `GranteeIdentities` and other entities 403), `verifyDocument`,
+  `GranteeIdentities` and other entities 403), the bound read functions of
+  the chain entities (`Blocks/latest`, `byHeight`, `range`,
+  `Transactions/byHash`, `byType`, `ContractActions/byAddress`, `history`,
+  `UnshieldedUtxos/byOwner`, `unspent`, `NightBalances/getBalance`,
+  `getTopHolders`), `verifyDocument`,
   `verifyAttestationState`, `verifyPredicateState`,
   `verifyPredicateAttestation`, `prepareDocumentProof`,
   `prepareMembershipSet`, `deriveTokenType`, `getJobStatus`, `getGrantUsage`
