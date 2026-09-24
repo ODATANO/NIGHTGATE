@@ -78,25 +78,29 @@ service and set `NIGHTGATE_PROOF_SERVER_URL=http://proof-server:6300`.
 
 The HEALTHCHECK probes readiness every 30 s; five failures mark the container
 `unhealthy`. Docker does not restart unhealthy containers
-(`restart: unless-stopped` acts on exits only), so run a watchdog, e.g. from
-cron every minute:
+(`restart: unless-stopped` acts on exits only), so run `docker/watchdog.sh`
+from cron every minute:
 
 ```sh
-#!/bin/sh
-C=odatano-nightgate; S=/run/nightgate-watchdog.count
-st=$(docker inspect -f '{{.State.Health.Status}}' "$C" 2>/dev/null) || exit 0
-n=$(cat "$S" 2>/dev/null || echo 0)
-if [ "$st" = unhealthy ]; then
-    n=$((n + 1)); echo "$n" > "$S"
-    [ "$n" -ge 3 ] && docker restart -t 5 "$C" && echo 0 > "$S"
-else
-    echo 0 > "$S"
-fi
+cp docker/watchdog.sh /root/nightgate-api/watchdog.sh
+crontab -l | { cat; echo '* * * * * /root/nightgate-api/watchdog.sh'; } | crontab -
 ```
 
-Restart after three unhealthy checks a minute apart, with a 5 s stop timeout
-(a hung main thread ignores SIGTERM). Restart recovery closes the old
-sessions and fails or replays interrupted jobs. `starting` does not count.
+Three unhealthy checks a minute apart, then two stages. When readiness
+reports only the crawler down (database, runtime, initialization fine), the
+script cycles the crawler in place (`pauseCrawler` + `resumeCrawler` through
+the operator API, run inside the container so it needs no published port
+and no copy of the password); the sponsor facades in the same process keep
+running. If the container is still unhealthy three checks later, or if any
+other check fails, `docker restart -t 5` (a hung main thread ignores
+SIGTERM). Restart recovery closes the old sessions and fails or replays
+interrupted jobs. `starting` does not count. The container defaults to the
+compose file's `odatano-nightgate`; a container under another name takes
+`NIGHTGATE_CONTAINER=<name>` in the cron line, and a name that `docker
+inspect` cannot find is logged, never watched. Log path
+(`NIGHTGATE_WATCHDOG_LOG`) and the optional host guard (`NIGHTGATE_HOST_GUARD`,
+`exit 1` while the host is stalled skips the restart) are variables at the
+top of the script.
 
 ## Schema upgrades
 

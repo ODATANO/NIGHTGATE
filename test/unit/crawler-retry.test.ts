@@ -4,7 +4,7 @@
  * Tests for isTransientError() and calcBackoff() from srv/utils/retry.ts.
  */
 
-import { isTransientError, calcBackoff } from '../../srv/utils/retry';
+import { isTransientError, isUniqueViolation, calcBackoff } from '../../srv/utils/retry';
 
 describe('isTransientError', () => {
   it('should classify timeout errors as transient', () => {
@@ -31,6 +31,22 @@ describe('isTransientError', () => {
     expect(isTransientError(new Error('RPC error -32601: Method not found'))).toBe(false);
     expect(isTransientError(new Error('Cannot read properties of undefined'))).toBe(false);
     expect(isTransientError(new Error('JSON parse error'))).toBe(false);
+  });
+});
+
+describe('isUniqueViolation', () => {
+  it('recognises the unique-violation messages of PostgreSQL, SQLite and HANA', () => {
+    expect(isUniqueViolation(new Error('duplicate key value violates unique constraint "midnight_blocks_hash"'))).toBe(true);
+    expect(isUniqueViolation(new Error('UNIQUE constraint failed: midnight_Blocks.hash'))).toBe(true);
+    expect(isUniqueViolation(new Error('unique constraint violated: Table(midnight_Blocks)'))).toBe(true);
+    expect(isUniqueViolation('duplicate key value violates unique constraint "x"')).toBe(true);
+  });
+
+  it('is neither a transient error nor any other failure', () => {
+    expect(isTransientError(new Error('duplicate key value violates unique constraint "midnight_blocks_hash"'))).toBe(false);
+    expect(isUniqueViolation(new Error('Request timeout'))).toBe(false);
+    expect(isUniqueViolation(new Error('Invalid runtime specVersion for block 2'))).toBe(false);
+    expect(isUniqueViolation(new Error('Parent block 0xabc of block 7 is not indexed; refusing to persist an orphan'))).toBe(false);
   });
 });
 

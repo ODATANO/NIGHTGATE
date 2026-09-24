@@ -250,6 +250,39 @@ describe('fetchBlockBatch', () => {
         expect(provider.getRuntimeVersion.mock.calls.map(c => c[0])).toEqual(['0xd1', '0xd2']);
     });
 
+    it('a block that waited on another block\'s disagreeing lookup asks for itself (two batches at once around an upgrade)', async () => {
+        const provider = fakeProvider();
+        const hashOf: Record<number, string> = { 100: '0xu0', 101: '0xu1', 102: '0xu2' };
+        provider.versions['0xu0'] = 9;
+        provider.versions['0xu1'] = 10; // carries the upgrade: storage still says 9, the node already 10
+        provider.versions['0xu2'] = 9;
+        // The upgrade block's lookup takes long enough for its neighbour to wait on it.
+        provider.getRuntimeVersion.mockImplementation(async (hash: string) => {
+            if (hash === '0xu1') await new Promise(resolve => setTimeout(resolve, 20));
+            return { specVersion: provider.versions[hash] ?? 7 };
+        });
+        provider.rpcBatch.mockImplementation(async (requests: Array<{ method: string; params: unknown[] }>) =>
+            requests[0]?.method === 'chain_getBlockHash'
+                ? requests.map(r => hashOf[r.params[0] as number])
+                : requests.map(r => r.method === 'chain_getBlock' ? { block: { hash: r.params[0] } }
+                    : r.params[0] === LAST_RUNTIME_UPGRADE_KEY ? upgradeHex(9)
+                        : r.params[0] === (BlockProcessor as any).TIMESTAMP_STORAGE_KEY ? timestampHex(1_700_000_000_000n)
+                            : null));
+        const p = await makeProcessor(provider);
+        const warnSpy = vi.spyOn(cds.log('nightgate:crawler'), 'warn').mockImplementation(() => {});
+        try {
+            const [upgrade, before] = await Promise.all([p.fetchBlockBatch([101]), p.fetchBlockBatch([100])]);
+            expect(asFetched(upgrade[0]).protocolVersion).toBe(10);
+            expect(asFetched(before[0]).protocolVersion).toBe(9);
+            expect(provider.getRuntimeVersion.mock.calls.map(c => c[0])).toEqual(['0xu1', '0xu0']);
+            // Nothing was cached under the value: the next block asks, and its agreeing answer is kept.
+            expect(asFetched((await p.fetchBlockBatch([102]))[0]).protocolVersion).toBe(9);
+            expect(provider.getRuntimeVersion).toHaveBeenCalledTimes(3);
+        } finally {
+            warnSpy.mockRestore();
+        }
+    });
+
     it('the node is the authority: a LastRuntimeUpgrade value that decodes differently is logged, the node answer used', async () => {
         const provider = fakeProvider();
         provider.versions['0xw1'] = 11;

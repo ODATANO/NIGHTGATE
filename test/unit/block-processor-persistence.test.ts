@@ -507,4 +507,49 @@ describe('parent enforcement (height-sequenced paths)', () => {
         const row = await db.run(cds.ql.SELECT.one.from(BLOCKS).where({ hash: '0xchild-7' }));
         expect(row.parent_ID).toBe(parentId);
     });
+
+    it('treats a block another writer landed meanwhile as already indexed instead of failing it', async () => {
+        await db.run(cds.ql.INSERT.into(BLOCKS).entries({
+            ID: cds.utils.uuid(),
+            hash: '0xparent-6',
+            height: 6,
+            protocolVersion: 1,
+            timestamp: 1_700_000_000,
+            stateRoot: '0xstate'
+        }));
+        const processor = makeProcessor({});
+        const warnSpy = vi.spyOn(cds.log('nightgate:crawler'), 'warn').mockImplementation(() => {});
+
+        try {
+            // Both preps were fetched before either landed: alreadyIndexed is false on both.
+            const first = await processor.persistPreparedBlock(preparedBlock(7, '0xchild-7', '0xparent-6'));
+            expect(first.blockHeight).toBe(7);
+
+            const twin = await processor.persistPreparedBlock(preparedBlock(7, '0xchild-7', '0xparent-6'));
+            expect(twin).toMatchObject({ blockHeight: 7, blockHash: '0xchild-7', transactionCount: 0, contractActionCount: 0 });
+            expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('indexed by another writer'));
+
+            const rows = await db.run(cds.ql.SELECT.from(BLOCKS).where({ hash: '0xchild-7' }));
+            expect(rows.length).toBe(1);
+            const state = await db.run(cds.ql.SELECT.one.from(SYNC_STATE).where({ ID: 'SINGLETON' }));
+            expect(Number(state.lastIndexedHeight)).toBe(7);
+            expect(state.syncStatus).toBe('syncing');
+        } finally {
+            warnSpy.mockRestore();
+        }
+    });
+
+    it('propagates a unique violation when the block is not there (a real fault, not a twin)', async () => {
+        const processor = makeProcessor({});
+        vi.spyOn(processor as any, 'blockExists').mockResolvedValue(false);
+        const dbSpy = vi.spyOn(db, 'tx').mockRejectedValue(new Error('duplicate key value violates unique constraint "midnight_transactions_hash"'));
+
+        try {
+            await expect(
+                processor.persistPreparedBlock(preparedBlock(0, '0xgenesis-dup', '0x' + '00'.repeat(32)))
+            ).rejects.toThrow('duplicate key value');
+        } finally {
+            dbSpy.mockRestore();
+        }
+    });
 });

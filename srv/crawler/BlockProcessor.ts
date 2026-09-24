@@ -7,6 +7,7 @@ import { TypeRegistry } from '@polkadot/types/create';
 import { Metadata } from '@polkadot/types/metadata';
 import { MidnightNodeProvider, SignedBlock } from '../providers/MidnightNodeProvider';
 import { ensureNightgateModelLoaded } from '../utils/cds-model';
+import { isUniqueViolation } from '../utils/retry';
 import {
     getNightgatePluginConfig, getConfiguredNightgateNetwork, normalizeNightgateNetwork
 } from '../utils/nightgate-config';
@@ -206,6 +207,12 @@ function emptyBalanceDelta(): BalanceDelta {
     return { balance: 0n, utxoCount: 0, totalReceived: 0n, txReceivedCount: 0, totalSent: 0n, txSentCount: 0 };
 }
 
+/** One node lookup per LastRuntimeUpgrade value: which block asked, and whether the node agreed with the value. */
+interface SpecVersionLookup {
+    blockHash: string;
+    answer: Promise<{ specVersion: number; agreed: boolean }>;
+}
+
 export class BlockProcessor {
     private db!: cds.DatabaseService;
     /** Pallet map without runtime metadata (defaults + config overrides); the metadata-derived map per specVersion lives in `runtimes`. */
@@ -230,7 +237,7 @@ export class BlockProcessor {
     private static readonly LAST_RUNTIME_UPGRADE_STORAGE_KEY =
         '0x26aa394eea5630e07c48ae0c9558cef7f9cce9c888469bb1a0dceaa129672ef8';
     /** specVersion per raw LastRuntimeUpgrade value: the node is asked once per value, not per block. */
-    private readonly specVersionByUpgrade = new Map<string, Promise<number>>();
+    private readonly specVersionByUpgrade = new Map<string, SpecVersionLookup>();
 
     constructor(
         private nodeProvider: MidnightNodeProvider
@@ -467,7 +474,7 @@ export class BlockProcessor {
         // await one.
         const projections = await this.projectEvents(extrinsicEvents, timestamp, `block ${blockHash}`);
 
-        await this.db.tx(async (tx: any) => {
+        const written = await this.db.tx(async (tx: any) => {
             const blockId = cds.utils.uuid();
             const parentBlock = await tx.run(
                 SELECT.one.from(Blocks).columns('ID').where({ hash: header.parentHash })
@@ -614,7 +621,28 @@ export class BlockProcessor {
                     syncStatus: 'syncing'
                 }).where({ ID: 'SINGLETON' })
             );
+            return true;
+        }).catch(async (err: unknown) => {
+            // Another writer landed this block between the fetch and the insert
+            // (a catch-up next to a live head): the row is there, the
+            // transaction rolled back, nothing is broken. A unique violation
+            // without the row is a real fault and propagates.
+            if (isUniqueViolation(err) && await this.blockExists(blockHash)) {
+                log.warn(`Block ${height} (${blockHash}) was indexed by another writer meanwhile; skipped`);
+                return false;
+            }
+            throw err;
         });
+
+        if (!written) {
+            return {
+                blockHeight: height,
+                blockHash,
+                transactionCount: 0,
+                contractActionCount: 0,
+                processingTimeMs: Date.now() - start
+            };
+        }
 
         return {
             blockHeight: height,
@@ -1026,27 +1054,36 @@ export class BlockProcessor {
      * A block whose storage carries no such value (pruned or racing node, or a
      * chain without it) is asked per block, as before.
      */
-    private resolveSpecVersion(upgradeHex: string | null | undefined, blockHash: string, where: string): Promise<number> {
+    private async resolveSpecVersion(upgradeHex: string | null | undefined, blockHash: string, where: string): Promise<number> {
         if (typeof upgradeHex !== 'string' || !/^0x[0-9a-fA-F]{2,}$/.test(upgradeHex)) {
             return this.getProtocolVersion(blockHash, where);
         }
-        let pending = this.specVersionByUpgrade.get(upgradeHex);
-        if (!pending) {
-            pending = this.getProtocolVersion(blockHash, where).then(specVersion => {
-                const decoded = BlockProcessor.decodeLastRuntimeUpgrade(upgradeHex);
-                if (decoded !== null && decoded !== specVersion) {
-                    log.warn(`LastRuntimeUpgrade at ${where} decodes to specVersion ${decoded}, node reports ${specVersion}; using the node's for this block only`);
-                    this.specVersionByUpgrade.delete(upgradeHex);
-                    return specVersion;
-                }
-                log.info(`Runtime specVersion ${specVersion} first seen at ${where}`);
-                return specVersion;
-            });
-            this.specVersionByUpgrade.set(upgradeHex, pending);
+        let lookup = this.specVersionByUpgrade.get(upgradeHex);
+        if (!lookup) {
+            const fresh: SpecVersionLookup = {
+                blockHash,
+                answer: this.getProtocolVersion(blockHash, where).then(specVersion => {
+                    const decoded = BlockProcessor.decodeLastRuntimeUpgrade(upgradeHex);
+                    if (decoded !== null && decoded !== specVersion) {
+                        log.warn(`LastRuntimeUpgrade at ${where} decodes to specVersion ${decoded}, node reports ${specVersion}; using the node's for this block only`);
+                        if (this.specVersionByUpgrade.get(upgradeHex) === fresh) this.specVersionByUpgrade.delete(upgradeHex);
+                        return { specVersion, agreed: false };
+                    }
+                    log.info(`Runtime specVersion ${specVersion} first seen at ${where}`);
+                    return { specVersion, agreed: true };
+                })
+            };
+            this.specVersionByUpgrade.set(upgradeHex, fresh);
             // A failed lookup is not an answer: the next block with this value asks again.
-            pending.catch(() => this.specVersionByUpgrade.delete(upgradeHex));
+            fresh.answer.catch(() => {
+                if (this.specVersionByUpgrade.get(upgradeHex) === fresh) this.specVersionByUpgrade.delete(upgradeHex);
+            });
+            lookup = fresh;
         }
-        return pending;
+        const { specVersion, agreed } = await lookup.answer;
+        // A disagreeing answer belongs to the block that asked; a block that waited on it asks for itself.
+        if (agreed || lookup.blockHash === blockHash) return specVersion;
+        return this.getProtocolVersion(blockHash, where);
     }
 
     /**

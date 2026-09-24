@@ -1,5 +1,46 @@
 # Changelog
 
+## 0.25.5 - 2026-09-24
+
+- One catch-up at a time: `catchUp()` in `srv/crawler/Crawler.ts` joins a
+  run in flight instead of starting a twin (`catchUpInFlight`). The
+  pipeline's second pass and the live gap handler fired within milliseconds
+  of each other once a long catch-up ended (two `Catch-up: 2684838 → 2684909`
+  lines on the hosted box), both persisted the same blocks, and the loser's
+  `duplicate key value violates unique constraint "midnight_blocks_hash"`
+  latched as a poison block: `syncStatus = error`, readiness 503, watchdog
+  restart, sponsor facades gone. Twice on 2026-09-24 (05:11 and 05:29 UTC),
+  each time right after the catch-up the previous restart had caused.
+- A block another writer landed meanwhile is already indexed, not a fault:
+  `persistFromNode` returns the zero-count result when the unique violation
+  names a block that exists (`isUniqueViolation()` in `srv/utils/retry.ts`:
+  PostgreSQL, SQLite and HANA messages). A unique violation without the row
+  still propagates and still latches.
+- `docker/watchdog.sh`, two stages: when readiness reports only the crawler
+  down (database, runtime, initialization fine) it cycles the crawler in
+  place (`pauseCrawler` + `resumeCrawler` through the operator API inside the
+  container) and restarts the container only if that has not helped three
+  checks later; any other failing check restarts at once. `docs/docker.md`
+  points at the script instead of carrying its own copy.
+- `resolveSpecVersion`: a node answer that disagrees with the shared
+  `LastRuntimeUpgrade` value stays with the block that asked (the one
+  carrying the upgrade); a block that waited on that lookup asks for itself.
+  Two batches fetched at once used to give the upgrade block's version to
+  its predecessor.
+- ORDER BY on PostgreSQL keeps the NULLS clause for a NOT NULL column
+  reached through a join and for a column alias of one
+  (`$orderby=parent/height`: the outer join yields NULL); only the query's
+  own columns drop it (`stripNullsForNotNull` reads the query's `from` and
+  `columns`).
+- `docker/watchdog.sh` defaults to the compose file's container name
+  `odatano-nightgate`; another name goes in the cron line as
+  `NIGHTGATE_CONTAINER=<name>`, and a container `docker inspect` cannot find
+  is logged instead of silently skipped.
+- Tests: the join, a live head arriving as the subscription opens, the twin
+  writer against the real unique index, the helper's messages, the parallel
+  runtime lookup, ORDER BY through a join.
+- Version in `package.json`, lock and the compose default tag.
+
 ## 0.25.4 - 2026-09-23
 
 - ORDER BY on PostgreSQL no longer carries a NULLS clause for key and

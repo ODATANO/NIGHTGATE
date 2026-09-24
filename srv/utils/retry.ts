@@ -24,6 +24,21 @@ export function isTransientError(err: Error): boolean {
   return TRANSIENT_PATTERNS.some(pattern => message.includes(pattern));
 }
 
+const UNIQUE_VIOLATION_PATTERNS = [
+  'duplicate key value violates unique constraint',  // PostgreSQL 23505
+  'unique constraint failed',  // SQLite
+  'unique constraint violated'  // SAP HANA 301
+];
+
+/**
+ * A row with this key exists already. The write is a repeat of one that
+ * landed (a second writer, a replay), not a record that cannot be stored.
+ */
+export function isUniqueViolation(err: unknown): boolean {
+  const message = (err instanceof Error ? err.message : String(err)).toLowerCase();
+  return UNIQUE_VIOLATION_PATTERNS.some(pattern => message.includes(pattern));
+}
+
 /**
  * Calculate exponential backoff delay with jitter.
  * Formula: baseDelay * 2^(attempt-1) + random jitter, capped at maxDelay.

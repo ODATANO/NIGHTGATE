@@ -890,6 +890,75 @@ describe('MidnightCrawler orchestration', () => {
             }
         });
 
+        it('runs one catch-up at a time: a second call joins the one in flight instead of persisting the range twice', async () => {
+            let releaseHead!: (hash: string) => void;
+            const provider = {
+                getFinalizedHead: vi.fn().mockImplementation(() => new Promise<string>(resolve => { releaseHead = resolve; })),
+                getHeader: vi.fn().mockResolvedValue({ number: '0x3' })
+            };
+            const { crawler, fetchSpy } = makeCrawler({ rpcBatchSize: 8, fetchConcurrency: 1 }, provider);
+            await setSyncState({ syncStatus: 'stopped', lastIndexedHeight: 0, lastIndexedHash: '0x0', consecutiveErrors: 0 });
+
+            const first = crawler.catchUp();
+            const second = crawler.catchUp();
+            expect(second).toBe(first);
+            expect((crawler as any).isCatchingUp).toBe(true);
+
+            // The run reads the cursor first; the head lookup is the second step.
+            await vi.waitFor(() => expect(provider.getFinalizedHead).toHaveBeenCalledTimes(1));
+            releaseHead('0x3');
+            await expect(first).resolves.toBe(3);
+            await expect(second).resolves.toBe(3);
+
+            // One head lookup, one fetch, every height persisted exactly once, nothing latched.
+            expect(provider.getFinalizedHead).toHaveBeenCalledTimes(1);
+            expect(fetchSpy).toHaveBeenCalledTimes(1);
+            expect(mockProcessorPersistPreparedBlock.mock.calls.map(c => c[0].height)).toEqual([1, 2, 3]);
+            expect(crawler.poisonBlock).toBeNull();
+            expect((crawler as any).catchUpInFlight).toBeNull();
+            expect((crawler as any).isCatchingUp).toBe(false);
+
+            // Once both settled, the next call is a run of its own again.
+            provider.getFinalizedHead.mockResolvedValue('0x3');
+            await crawler.catchUp();
+            expect(provider.getFinalizedHead).toHaveBeenCalledTimes(2);
+        });
+
+        it('shares the gap catch-up between a live head arriving as the subscription opens and the pipeline (no twin over the same range)', async () => {
+            // The node's first finalized head is 4 while the index sits at 0:
+            // the pipeline's first pass reaches 2, the head handler sees the gap
+            // and the pipeline's second pass starts within the same tick.
+            let liveCallback: ((header: any) => Promise<void>) | undefined;
+            const provider = {
+                getFinalizedHead: vi.fn().mockResolvedValueOnce('0x2').mockResolvedValue('0x4'),
+                getHeader: vi.fn().mockImplementation(async (hash: string) => ({ number: hash })),
+                subscribeFinalizedHeads: vi.fn().mockImplementation(async (callback: (header: any) => Promise<void>) => {
+                    liveCallback = callback;
+                    // Like the node: the current head is delivered at once, not awaited.
+                    void callback({ number: '0x4', parentHash: '0x3', stateRoot: '', extrinsicsRoot: '', digest: { logs: [] } });
+                    return 'sub-1';
+                })
+            };
+            const { crawler, fetchSpy } = makeCrawler({ rpcBatchSize: 8, fetchConcurrency: 1 }, provider);
+            await setSyncState({ syncStatus: 'stopped', lastIndexedHeight: 0, lastIndexedHash: '0x0', consecutiveErrors: 0 });
+            // The mocked persist advances the cursor as the real one does.
+            mockProcessorPersistPreparedBlock.mockImplementation(async (prep: any) => {
+                await db.run(cds.ql.UPDATE.entity(SYNC_STATE).set({ lastIndexedHeight: prep.height, lastIndexedHash: prep.blockHash }).where({ ID: 'SINGLETON' }));
+                return { blockHeight: prep.height, blockHash: prep.blockHash, transactionCount: 0, contractActionCount: 0, processingTimeMs: 1 };
+            });
+
+            await (crawler as any).runIngestPipeline();
+            await (crawler as any).liveProcessing;
+
+            expect(liveCallback).toBeDefined();
+            expect(fetchSpy.mock.calls.map(c => c[0])).toEqual([[1, 2], [3, 4]]);
+            expect(mockProcessorPersistPreparedBlock.mock.calls.map(c => c[0].height)).toEqual([1, 2, 3, 4]);
+            expect(crawler.poisonBlock).toBeNull();
+            const row = await getSyncState();
+            expect(Number(row.lastIndexedHeight)).toBe(4);
+            expect(row.syncStatus).not.toBe('error');
+        });
+
         it('tracks the chain but indexes nothing while a block is latched', async () => {
             const { crawler } = makeCrawler({}, {});
             crawler.poisonBlock = { height: 7, message: 'Invalid runtime specVersion for block 7' };

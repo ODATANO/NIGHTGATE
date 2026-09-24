@@ -56,6 +56,9 @@ export class MidnightCrawler {
     /** A block that fails deterministically; set to stop retrying it on every finalized head. */
     private poisonBlock: { height: number; message: string } | null = null;
 
+    /** The catch-up in flight; a second caller joins it instead of running a twin over the same range. */
+    private catchUpInFlight: Promise<number> | null = null;
+
     /** Passes that trail the indexed tip; both off unless configured. */
     private decoder: LedgerPayloadDecoder | null = null;
     private supplement: IndexerSupplement | null = null;
@@ -248,7 +251,23 @@ export class MidnightCrawler {
         log.info('Stopped');
     }
 
-    private async catchUp(): Promise<number> {
+    /**
+     * One catch-up at a time. The pipeline's second pass and the live gap
+     * handler call this within milliseconds of each other once the first pass
+     * ends; two runs over the same range persist the same blocks, and the one
+     * that loses the unique block hash used to latch as a poison block.
+     */
+    private catchUp(): Promise<number> {
+        if (this.catchUpInFlight) {
+            log.debug('Catch-up already in flight; joining it');
+            return this.catchUpInFlight;
+        }
+        const run = this.runCatchUp().finally(() => { this.catchUpInFlight = null; });
+        this.catchUpInFlight = run;
+        return run;
+    }
+
+    private async runCatchUp(): Promise<number> {
         if (this.poisonBlock) {
             log.debug(`Catch-up skipped: block ${this.poisonBlock.height} fails deterministically`);
             return 0;
