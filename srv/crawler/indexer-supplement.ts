@@ -194,6 +194,24 @@ export interface IndexerClient {
     fetchBlock(height: number): Promise<SupplementBlock | null>;
 }
 
+/** A non-2xx answer from the indexer, with the status for the caller's backoff. */
+export class IndexerHttpError extends Error {
+    constructor(readonly status: number) {
+        super(`indexer answered ${status}`);
+        this.name = 'IndexerHttpError';
+    }
+}
+
+/**
+ * 403 and 429: the indexer's edge refuses this client. The public indexers
+ * sit behind an AWS load balancer that blocks the whole host IP once a client
+ * sends too many requests (seen at ~15/s on 2026-09-24), and that block also
+ * hits the sponsor facades' WebSocket on the same host.
+ */
+export function isIndexerRateLimit(err: unknown): boolean {
+    return err instanceof IndexerHttpError && (err.status === 403 || err.status === 429);
+}
+
 /** Minimal GraphQL client; the indexer needs no credentials for these reads. */
 export function createIndexerClient(url: string, timeoutMs = 20000): IndexerClient {
     return {
@@ -207,7 +225,7 @@ export function createIndexerClient(url: string, timeoutMs = 20000): IndexerClie
                     body: JSON.stringify({ query: BLOCK_QUERY, variables: { height } }),
                     signal: controller.signal
                 });
-                if (!res.ok) throw new Error(`indexer answered ${res.status}`);
+                if (!res.ok) throw new IndexerHttpError(res.status);
                 const body: any = await res.json();
                 if (body?.errors?.length) {
                     throw new Error(`indexer rejected the block query: ${JSON.stringify(body.errors).slice(0, 200)}`);

@@ -27,6 +27,7 @@ export interface CrawlerConfig {
     decodePayloads?: boolean;  // Decode stored ledger payloads in a trailing pass (default: false)
     indexerSupplement?: boolean;  // Fill what a block lacks from the indexer (default: false)
     indexerUrl?: string;  // GraphQL endpoint for the supplement pass
+    supplementBlocksPerSecond?: number;  // Indexer requests per second of the supplement pass, one per block (default: 2)
 }
 
 interface ReorgInfo {
@@ -82,7 +83,8 @@ export class MidnightCrawler {
             maxBlocksPerSecond: config.maxBlocksPerSecond ?? 0,
             decodePayloads: config.decodePayloads ?? false,
             indexerSupplement: config.indexerSupplement ?? false,
-            indexerUrl: config.indexerUrl || ''
+            indexerUrl: config.indexerUrl || '',
+            supplementBlocksPerSecond: config.supplementBlocksPerSecond ?? 2
         };
     }
 
@@ -159,11 +161,14 @@ export class MidnightCrawler {
                     batchSize: 25,
                     intervalMs: 1000,
                     lagBlocks: 10,
-                    requestTimeoutMs: this.config.requestTimeout
+                    requestTimeoutMs: this.config.requestTimeout,
+                    maxBlocksPerSecond: this.config.supplementBlocksPerSecond
                 });
                 await this.supplement.init(this.db);
                 this.supplement.start();
-                log.info('Indexer supplement enabled (trailing pass)');
+                let host = this.config.indexerUrl;
+                try { host = new URL(this.config.indexerUrl).host; } catch { /* logged as given */ }
+                log.info(`Indexer supplement enabled (trailing pass, ${this.config.supplementBlocksPerSecond} blocks/s, ${host})`);
             }
         }
     }

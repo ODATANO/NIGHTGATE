@@ -9,7 +9,7 @@
 
 import cds from '@sap/cds';
 import {
-    createIndexerClient, type IndexerClient, type SupplementBlock,
+    createIndexerClient, isIndexerRateLimit, type IndexerClient, type SupplementBlock,
     type SupplementTransaction, type SupplementLedgerEvent, type SupplementDustEvent
 } from './indexer-supplement';
 import { readCapBinary } from './cap-binary';
@@ -36,7 +36,16 @@ export interface IndexerSupplementConfig {
     /** Stay this far below the indexed tip: the indexer trails the node. */
     lagBlocks: number;
     requestTimeoutMs: number;
+    /**
+     * Indexer requests per second, paced per request (one request is one
+     * block), so the batch size no longer sets the rate. 0 or unset = unpaced.
+     */
+    maxBlocksPerSecond?: number;
 }
+
+/** First wait after the indexer refused (403/429); doubles per refusal up to RATE_LIMIT_MAX_MS. */
+export const RATE_LIMIT_BACKOFF_MS = 60_000;
+export const RATE_LIMIT_MAX_MS = 15 * 60_000;
 
 export interface SupplementRunResult {
     blocks: number;
@@ -58,10 +67,18 @@ export class IndexerSupplement {
     private client!: IndexerClient;
     private running = false;
     private loop: Promise<void> | null = null;
+    /** Set by stop(): the pass in flight ends after the block it is on. */
+    private stopping = false;
+    /** Resolves the sleep in progress, set while one is; stop() calls it. */
+    private wake: (() => void) | null = null;
     /** Last parameters written, so an unchanged set is not stored again. */
     private lastLedgerParameters: string | null = null;
     /** The generation that cache belongs to; a rollback can delete its block. */
     private cachedGeneration: number | null = null;
+    /** When the last indexer request went out, for the pacing. */
+    private lastRequestAt = 0;
+    /** Refusals (403/429) in a row; reset by the next pass that gets through. */
+    private refusals = 0;
 
     constructor(private readonly config: IndexerSupplementConfig, client?: IndexerClient) {
         if (client) this.client = client;
@@ -75,21 +92,36 @@ export class IndexerSupplement {
     start(): void {
         if (this.running) return;
         this.running = true;
+        this.stopping = false;
         this.loop = (async () => {
             while (this.running) {
-                let progressed = 0;
+                let delay: number;
                 try {
-                    progressed = (await this.runOnce()).blocks;
+                    const progressed = (await this.runOnce()).blocks;
+                    this.refusals = 0;
+                    delay = progressed > 0 ? this.config.intervalMs : this.config.intervalMs * 4;
                 } catch (err) {
-                    log.warn(`indexer supplement pass failed: ${(err as Error).message}`);
+                    if (isIndexerRateLimit(err)) {
+                        // The edge blocks the host IP, not this request, and
+                        // every retry keeps the block alive: wait minutes, not
+                        // the four seconds a passing outage gets.
+                        this.refusals += 1;
+                        delay = Math.min(RATE_LIMIT_BACKOFF_MS * 2 ** (this.refusals - 1), RATE_LIMIT_MAX_MS);
+                        log.warn(`indexer supplement refused (${(err as Error).message}); backing off ${Math.round(delay / 1000)} s`);
+                    } else {
+                        log.warn(`indexer supplement pass failed: ${(err as Error).message}`);
+                        delay = this.config.intervalMs * 4;
+                    }
                 }
-                await this.sleep(progressed > 0 ? this.config.intervalMs : this.config.intervalMs * 4);
+                await this.sleep(delay);
             }
         })();
     }
 
     async stop(): Promise<void> {
         this.running = false;
+        this.stopping = true;
+        this.wake?.();
         if (this.loop) {
             await this.loop.catch(() => { /* reported in the loop */ });
             this.loop = null;
@@ -134,16 +166,15 @@ export class IndexerSupplement {
         }
 
         const result: SupplementRunResult = { ...EMPTY_RUN, blocks: blocks.length };
-        for (const block of blocks) {
+        for (const [index, block] of blocks.entries()) {
             const height = Number(block.height);
+            await this.pace();
+            if (this.stopping) return this.endBefore(start, blocks, index, result);
             const answer = await this.client.fetchBlock(height);
             if (!answer) {
                 // The indexer has not reached this height yet: stop here and
                 // retry the same block, rather than moving the cursor past it.
-                if (result.blocks > 0) result.blocks = blocks.indexOf(block);
-                if (result.blocks === 0) return EMPTY_RUN;
-                await this.setCursor(start, height - 1);
-                return result;
+                return this.endBefore(start, blocks, index, result);
             }
             await this.applyBlockFields(block.ID, height, answer);
             const perBlock = await this.applyBlock(answer.transactions);
@@ -400,10 +431,38 @@ export class IndexerSupplement {
         return advanced;
     }
 
+    /** Ends the pass before `blocks[index]`: the cursor records the blocks done, the rest wait for the next pass. */
+    private async endBefore(start: PassPosition, blocks: any[], index: number, result: SupplementRunResult): Promise<SupplementRunResult> {
+        if (index === 0) return EMPTY_RUN;
+        result.blocks = index;
+        await this.setCursor(start, Number(blocks[index].height) - 1);
+        return result;
+    }
+
+    /** Holds the next indexer request until its slot at `maxBlocksPerSecond` has come. */
+    private async pace(): Promise<void> {
+        const cap = this.config.maxBlocksPerSecond ?? 0;
+        if (cap <= 0) return;
+        const wait = this.lastRequestAt + 1000 / cap - this.now();
+        if (wait > 0) await this.sleep(wait);
+        this.lastRequestAt = this.now();
+    }
+
+    private now(): number {
+        return Date.now();
+    }
+
+    /** Sleeps `ms`, or until stop() wakes it: a backoff can be minutes long and must not hold a shutdown or pause. */
     private sleep(ms: number): Promise<void> {
         return new Promise(resolve => {
-            const timer = setTimeout(resolve, ms);
+            const done = () => {
+                clearTimeout(timer);
+                this.wake = null;
+                resolve();
+            };
+            const timer = setTimeout(done, ms);
             (timer as any).unref?.();
+            this.wake = done;
         });
     }
 }

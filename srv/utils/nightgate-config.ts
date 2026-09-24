@@ -287,6 +287,7 @@ export function resolveNightgateRuntimeConfig(config: Record<string, any> = {}):
     const crawlerEnabledOverride = configBool('NIGHTGATE_CRAWLER_ENABLED');
     const decodePayloadsEnv = configBool('NIGHTGATE_CRAWLER_DECODE_PAYLOADS');
     const indexerSupplementEnv = configBool('NIGHTGATE_CRAWLER_INDEXER_SUPPLEMENT');
+    const supplementBlocksPerSecondEnv = configInt('NIGHTGATE_CRAWLER_SUPPLEMENT_MAX_BPS');
     const crawlerConfig: Record<string, unknown> = {
         ...rawCrawlerConfig,
         ...(fetchConcurrencyEnv != null && { fetchConcurrency: fetchConcurrencyEnv }),
@@ -295,6 +296,7 @@ export function resolveNightgateRuntimeConfig(config: Record<string, any> = {}):
         ...(maxBlocksPerSecondEnv != null && { maxBlocksPerSecond: maxBlocksPerSecondEnv }),
         ...(decodePayloadsEnv != null && { decodePayloads: decodePayloadsEnv }),
         ...(indexerSupplementEnv != null && { indexerSupplement: indexerSupplementEnv }),
+        ...(supplementBlocksPerSecondEnv != null && { supplementBlocksPerSecond: supplementBlocksPerSecondEnv }),
         ...(crawlerEnabledOverride != null && { enabled: crawlerEnabledOverride })
     };
     const configuredNetwork = getConfiguredNightgateNetwork(config);
@@ -302,9 +304,12 @@ export function resolveNightgateRuntimeConfig(config: Record<string, any> = {}):
     const nodeUrl = getConfiguredNightgateNodeUrl(config) || DEFAULT_NODE_URLS[network] || DEFAULT_NODE_URL;
     const crawlerNodeUrl = getConfiguredNightgateCrawlerNodeUrl(config) || nodeUrl;
     const submissionEndpoints = resolveSubmissionEndpoints(network, config);
-    // The supplement reads the same indexer the submission side is configured
-    // with; nothing else in the crawler knows about it.
-    crawlerConfig.indexerUrl = crawlerConfig.indexerUrl || submissionEndpoints.indexerHttpUrl;
+    // The supplement reads the submission side's indexer unless it is given its
+    // own (`crawler.indexerUrl` / NIGHTGATE_CRAWLER_INDEXER_URL): a private
+    // indexer keeps the pass off the public one, whose edge blocks the whole
+    // host IP under load, sponsor facades included.
+    crawlerConfig.indexerUrl = configString('NIGHTGATE_CRAWLER_INDEXER_URL')
+        || crawlerConfig.indexerUrl || submissionEndpoints.indexerHttpUrl;
 
     return {
         network,

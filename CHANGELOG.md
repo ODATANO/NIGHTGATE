@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.25.6 - 2026-09-24
+
+- The indexer supplement pass is paced: `crawler.supplementBlocksPerSecond` /
+  `NIGHTGATE_CRAWLER_SUPPLEMENT_MAX_BPS` (default 2) spaces its requests per
+  block; the batch of 25 per second used to go out at once. The public
+  indexers block the whole host IP with a 403 from their load balancer at
+  roughly 15 per second, and that block also hit the sponsor facades'
+  WebSocket on the hosted box (2026-09-24, after ~1200 blocks).
+- On a 403 or 429 the pass backs off for one minute, doubling up to fifteen,
+  instead of retrying every four seconds and keeping the block alive
+  (`IndexerHttpError` with the status, `isIndexerRateLimit()` in
+  `srv/crawler/indexer-supplement.ts`); a pass that gets through resets it.
+- The pass can read its own indexer: `crawler.indexerUrl` /
+  `NIGHTGATE_CRAWLER_INDEXER_URL` (default: the submission side's
+  `NIGHTGATE_INDEXER_HTTP_URL`). A private indexer keeps the backfill off the
+  public one; the start log names the host and the rate.
+- `stop()` wakes a pass that is backing off and ends a pass in flight after
+  the block it is on (cursor recorded); `pauseCrawler` and the shutdown no
+  longer wait a backoff out.
+- Tests: the 500 ms slots at two per second, the 60 s / 120 s / interval
+  ladder across a 403, a 429 and a success, the client's status on a 403,
+  the two env overrides, stop during a backoff and during a pass.
+- Version in `package.json`, lock and the compose default tag.
+
 ## 0.25.5 - 2026-09-24
 
 - One catch-up at a time: `catchUp()` in `srv/crawler/Crawler.ts` joins a

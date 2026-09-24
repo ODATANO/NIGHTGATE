@@ -35,6 +35,8 @@ const ENV_KEYS = [
     'NIGHTGATE_PRIVATE_STATE_BACKEND',
     'NIGHTGATE_FETCH_CONCURRENCY',
     'NIGHTGATE_RPC_BATCH_SIZE',
+    'NIGHTGATE_CRAWLER_SUPPLEMENT_MAX_BPS',
+    'NIGHTGATE_CRAWLER_INDEXER_URL',
     'NIGHTGATE_CRAWLER_ENABLED',
     'NIGHTGATE_ALLOW_SELF_SERVICE_GRANTEE_REGISTRATION',
     'NIGHTGATE_CLOSE_SESSIONS_ON_RESTART',
@@ -217,6 +219,36 @@ describe('resolveNightgateRuntimeConfig', () => {
         const { crawlerConfig } = resolveNightgateRuntimeConfig({ network: 'preprod' });
         expect(crawlerConfig.fetchConcurrency).toBe(7);
         expect(crawlerConfig.rpcBatchSize).toBe(42);
+    });
+
+    it('parses NIGHTGATE_CRAWLER_SUPPLEMENT_MAX_BPS and otherwise leaves the config value alone', () => {
+        process.env.NIGHTGATE_CRAWLER_SUPPLEMENT_MAX_BPS = '1';
+        expect(resolveNightgateRuntimeConfig({ network: 'preprod' }).crawlerConfig.supplementBlocksPerSecond).toBe(1);
+        delete process.env.NIGHTGATE_CRAWLER_SUPPLEMENT_MAX_BPS;
+        const { crawlerConfig } = resolveNightgateRuntimeConfig({
+            network: 'preprod',
+            crawler: { supplementBlocksPerSecond: 5 }
+        });
+        expect(crawlerConfig.supplementBlocksPerSecond).toBe(5);
+    });
+
+    it('gives the supplement pass its own indexer only when asked, the submission indexer otherwise', () => {
+        const shared = resolveNightgateRuntimeConfig({ network: 'preprod' });
+        expect(shared.crawlerConfig.indexerUrl).toBe(shared.submissionEndpoints.indexerHttpUrl);
+
+        const fromConfig = resolveNightgateRuntimeConfig({
+            network: 'preprod',
+            crawler: { indexerUrl: 'http://private-idx:8088/api/v4/graphql' }
+        });
+        expect(fromConfig.crawlerConfig.indexerUrl).toBe('http://private-idx:8088/api/v4/graphql');
+        expect(fromConfig.submissionEndpoints.indexerHttpUrl).toBe(shared.submissionEndpoints.indexerHttpUrl);
+
+        process.env.NIGHTGATE_CRAWLER_INDEXER_URL = 'http://env-idx:8088/api/v4/graphql';
+        const fromEnv = resolveNightgateRuntimeConfig({
+            network: 'preprod',
+            crawler: { indexerUrl: 'http://private-idx:8088/api/v4/graphql' }
+        });
+        expect(fromEnv.crawlerConfig.indexerUrl).toBe('http://env-idx:8088/api/v4/graphql');
     });
 
     it('ignores non-numeric / non-positive env tuning values', () => {

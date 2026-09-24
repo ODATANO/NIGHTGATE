@@ -16,7 +16,8 @@ vi.mock('../../srv/crawler/ledger-payload', async (importOriginal) => ({
 }));
 
 import { LedgerPayloadDecoder } from '../../srv/crawler/LedgerPayloadDecoder';
-import { IndexerSupplement } from '../../srv/crawler/IndexerSupplement';
+import { IndexerSupplement, RATE_LIMIT_BACKOFF_MS } from '../../srv/crawler/IndexerSupplement';
+import { IndexerHttpError, createIndexerClient, isIndexerRateLimit } from '../../srv/crawler/indexer-supplement';
 import { rollbackIndexedDataFromHeight } from '../../srv/crawler/rollback';
 import { readCapBinary } from '../../srv/crawler/cap-binary';
 
@@ -526,6 +527,123 @@ describe('cursor against a reorg', () => {
             info.mockRestore();
         }
         expect(Number((await readSync()).lastSupplementedHeight)).toBe(0);
+    });
+
+    it('paces its indexer requests at maxBlocksPerSecond instead of firing the batch at once', async () => {
+        for (const h of [10, 11, 12]) await seedBlock(h, `0xp${h}`);
+        await setSync({ lastIndexedHeight: 30, lastSupplementedHeight: 9 });
+        const client = { fetchBlock: vi.fn(async (height: number) => ({ height, ledgerParameters: null, transactions: [] })) };
+        const pass = new IndexerSupplement(
+            { url: 'http://indexer.invalid', batchSize: 10, intervalMs: 1, lagBlocks: 2, requestTimeoutMs: 100, maxBlocksPerSecond: 2 },
+            client
+        );
+        await pass.init(db);
+        let clock = 1_000_000;
+        (pass as any).now = () => clock;
+        const waits: number[] = [];
+        (pass as any).sleep = vi.fn(async (ms: number) => { waits.push(ms); clock += ms; });
+
+        await pass.runOnce();
+
+        expect(client.fetchBlock).toHaveBeenCalledTimes(3);
+        // The first request goes out at once; each further one waits for its 500 ms slot.
+        expect(waits).toEqual([500, 500]);
+        expect(Number((await readSync()).lastSupplementedHeight)).toBe(12);
+    });
+
+    it('backs off for minutes after a 403 or 429 and returns to the interval once a pass gets through', async () => {
+        await seedBlock(10, '0xr1');
+        await setSync({ lastIndexedHeight: 30, lastSupplementedHeight: 9 });
+        const client = {
+            fetchBlock: vi.fn()
+                .mockRejectedValueOnce(new IndexerHttpError(403))
+                .mockRejectedValueOnce(new IndexerHttpError(429))
+                .mockResolvedValue({ height: 10, ledgerParameters: null, transactions: [] })
+        };
+        const pass = new IndexerSupplement(
+            { url: 'http://indexer.invalid', batchSize: 10, intervalMs: 1000, lagBlocks: 2, requestTimeoutMs: 100 },
+            client
+        );
+        await pass.init(db);
+        const waits: number[] = [];
+        (pass as any).sleep = vi.fn(async (ms: number) => {
+            waits.push(ms);
+            if (waits.length === 3) (pass as any).running = false;
+        });
+        const warn = vi.spyOn(cds.log('nightgate:crawler'), 'warn').mockImplementation(() => {});
+        const info = vi.spyOn(cds.log('nightgate:crawler'), 'info').mockImplementation(() => {});
+        try {
+            pass.start();
+            await (pass as any).loop;
+        } finally {
+            warn.mockRestore();
+            info.mockRestore();
+        }
+        // 60 s, then 120 s; the pass that got through resets the ladder and sleeps its interval.
+        expect(waits).toEqual([RATE_LIMIT_BACKOFF_MS, RATE_LIMIT_BACKOFF_MS * 2, 1000]);
+        expect((pass as any).refusals).toBe(0);
+        expect(Number((await readSync()).lastSupplementedHeight)).toBe(10);
+    });
+
+    it('stop() wakes a pass that is backing off instead of waiting the backoff out', async () => {
+        await seedBlock(10, '0xs1');
+        await setSync({ lastIndexedHeight: 30, lastSupplementedHeight: 9 });
+        const client = { fetchBlock: vi.fn().mockRejectedValue(new IndexerHttpError(403)) };
+        const pass = new IndexerSupplement(
+            { url: 'http://indexer.invalid', batchSize: 10, intervalMs: 1000, lagBlocks: 2, requestTimeoutMs: 100 },
+            client
+        );
+        await pass.init(db);
+        const warn = vi.spyOn(cds.log('nightgate:crawler'), 'warn').mockImplementation(() => {});
+        try {
+            pass.start();
+            // Until the loop sleeps its first minute.
+            while (!(pass as any).wake) await new Promise(resolve => setTimeout(resolve, 5));
+            const outcome = await Promise.race([
+                pass.stop().then(() => 'stopped'),
+                new Promise<string>(resolve => setTimeout(() => resolve('still sleeping'), 2000))
+            ]);
+            expect(outcome).toBe('stopped');
+        } finally {
+            warn.mockRestore();
+        }
+        expect(client.fetchBlock).toHaveBeenCalledTimes(1);
+    });
+
+    it('stop() during a pass ends it after the block in flight and records the blocks done', async () => {
+        for (const h of [10, 11, 12]) await seedBlock(h, `0xe${h}`);
+        await setSync({ lastIndexedHeight: 30, lastSupplementedHeight: 9 });
+        let pass: IndexerSupplement;
+        const client = {
+            fetchBlock: vi.fn(async (height: number) => {
+                void pass.stop();
+                return { height, ledgerParameters: null, transactions: [] };
+            })
+        };
+        pass = new IndexerSupplement(
+            { url: 'http://indexer.invalid', batchSize: 10, intervalMs: 1, lagBlocks: 2, requestTimeoutMs: 100 },
+            client
+        );
+        await pass.init(db);
+
+        const result = await pass.runOnce();
+
+        expect(client.fetchBlock).toHaveBeenCalledTimes(1);
+        expect(result.blocks).toBe(1);
+        expect(Number((await readSync()).lastSupplementedHeight)).toBe(10);
+    });
+
+    it('the client reports the HTTP status, so a refusal is told apart from an outage', async () => {
+        vi.stubGlobal('fetch', vi.fn(async () => ({ ok: false, status: 403, json: async () => ({}) })));
+        try {
+            const client = createIndexerClient('http://indexer.invalid', 100);
+            await expect(client.fetchBlock(1)).rejects.toMatchObject({ status: 403, message: 'indexer answered 403' });
+        } finally {
+            vi.unstubAllGlobals();
+        }
+        expect(isIndexerRateLimit(new IndexerHttpError(429))).toBe(true);
+        expect(isIndexerRateLimit(new IndexerHttpError(502))).toBe(false);
+        expect(isIndexerRateLimit(new Error('indexer answered 403'))).toBe(false);
     });
 });
 
