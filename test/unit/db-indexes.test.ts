@@ -33,5 +33,21 @@ describe('db-indexes', () => {
 
     it('emits dialect-neutral DDL', () => {
         expect(indexStatement({ name: 'x', table: 't', columns: ['a', 'b'] })).toBe('CREATE INDEX IF NOT EXISTS x ON t (a, b)');
+        expect(indexStatement({ name: 'x', table: 't', columns: ['a', 'b'] }, 'postgres')).toBe('CREATE INDEX IF NOT EXISTS x ON t (a, b)');
+    });
+
+    it('uses the PostgreSQL spelling only there', () => {
+        const spec = { name: 'x', table: 't', columns: ['a DESC'], postgres: 'a DESC NULLS LAST' };
+        expect(indexStatement(spec, 'postgres')).toBe('CREATE INDEX IF NOT EXISTS x ON t (a DESC NULLS LAST)');
+        expect(indexStatement(spec, 'sqlite')).toBe('CREATE INDEX IF NOT EXISTS x ON t (a DESC)');
+        expect(indexStatement(spec)).toBe('CREATE INDEX IF NOT EXISTS x ON t (a DESC)');
+    });
+
+    it('passes the db kind through to every statement', async () => {
+        const run = vi.fn(async () => undefined);
+        await ensureIndexes({ run }, 'postgres');
+        const ddl = run.mock.calls.map((c: any[]) => String(c[0]));
+        expect(ddl).toContain('CREATE INDEX IF NOT EXISTS ng_transactions_createdat_desc ON midnight_Transactions (createdAt DESC NULLS LAST)');
+        expect(ddl.some((s: string) => s.includes('NULLS') && !s.includes('createdAt'))).toBe(false);
     });
 });

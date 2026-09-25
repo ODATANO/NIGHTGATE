@@ -297,6 +297,13 @@ describe('resolveNightgateRuntimeConfig', () => {
         expect(resolved.submissionEndpoints.indexerWsUrl).toContain('127.0.0.1:8088');
     });
 
+    it('resolves mainnet to the public mainnet relay and indexer, never the preprod relay', () => {
+        const resolved = resolveNightgateRuntimeConfig({ network: 'mainnet' });
+        expect(resolved.nodeUrl).toBe('wss://rpc.mainnet.midnight.network/');
+        expect(resolved.submissionEndpoints.indexerHttpUrl).toBe('https://indexer.mainnet.midnight.network/api/v4/graphql');
+        expect(resolved.submissionEndpoints.indexerWsUrl).toBe('wss://indexer.mainnet.midnight.network/api/v4/graphql/ws');
+    });
+
     it('honours an explicit nodeUrl override even on undeployed', () => {
         const { nodeUrl } = resolveNightgateRuntimeConfig({ network: 'undeployed', nodeUrl: 'ws://host.docker.internal:9944' });
         expect(nodeUrl).toBe('ws://host.docker.internal:9944');

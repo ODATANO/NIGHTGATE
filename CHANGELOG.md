@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.25.7 - 2026-09-25
+
+- `NIGHTGATE_INDEXES` (`srv/utils/db-indexes.ts`) gains five indexes the
+  indexer supplement updates and deletes through: `TransactionFees.transaction_ID`,
+  `TransactionSegments.transactionResult_ID`, `ContractBalances.contractAction_ID`,
+  `ZswapLedgerEvents.transaction_ID`, `DustLedgerEvents.transaction_ID`.
+- Four for newest-first reads: `Blocks.createdAt`, `Transactions.createdAt`,
+  `ContractActions.createdAt`, `Transactions(txType, createdAt)`; DESC, on
+  PostgreSQL `DESC NULLS LAST` to match the ORDER BY of the nullable column
+  (`IndexSpec.postgres`, `indexStatement(spec, kind)`). Serves
+  `$orderby=createdAt desc`, `byType` and `history`.
+- Created at start with IF NOT EXISTS. On a large live PostgreSQL create all
+  nine once with `CREATE INDEX CONCURRENTLY` first; the start is then a no-op.
+- `network: mainnet` defaults to the public mainnet endpoints:
+  `wss://rpc.mainnet.midnight.network/` (`DEFAULT_NODE_URLS.mainnet`, before: the
+  preprod relay) and `indexer.mainnet.midnight.network` (before:
+  `indexer.midnight.network`, which does not answer).
+- Version in `package.json`, lock and the compose default tag.
+
 ## 0.25.6 - 2026-09-24
 
 - The indexer supplement pass is paced: `crawler.supplementBlocksPerSecond` /

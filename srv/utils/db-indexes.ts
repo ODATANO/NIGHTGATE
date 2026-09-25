@@ -16,16 +16,30 @@ export interface IndexSpec {
     name: string;
     table: string;
     columns: string[];
+    /** PostgreSQL column list when it differs (SQLite accepts no NULLS placement in an index). */
+    postgres?: string;
 }
 
 export const NIGHTGATE_INDEXES: readonly IndexSpec[] = [
     { name: 'ng_blocks_height', table: 'midnight_Blocks', columns: ['height'] },
+    // Newest-first reads (`$orderby=createdAt desc`, byType, history): createdAt is nullable, so the
+    // renderer keeps DESC NULLS LAST and only an index in that order serves it (ASC NULLS FIRST reads it backwards).
+    { name: 'ng_blocks_createdat_desc', table: 'midnight_Blocks', columns: ['createdAt DESC'], postgres: 'createdAt DESC NULLS LAST' },
+    { name: 'ng_transactions_createdat_desc', table: 'midnight_Transactions', columns: ['createdAt DESC'], postgres: 'createdAt DESC NULLS LAST' },
+    { name: 'ng_transactions_type_createdat', table: 'midnight_Transactions', columns: ['txType', 'createdAt DESC'], postgres: 'txType, createdAt DESC NULLS LAST' },
+    { name: 'ng_contractactions_createdat_desc', table: 'midnight_ContractActions', columns: ['createdAt DESC'], postgres: 'createdAt DESC NULLS LAST' },
     { name: 'ng_transactions_hash', table: 'midnight_Transactions', columns: ['hash'] },
     { name: 'ng_transactions_ledgerhash', table: 'midnight_Transactions', columns: ['ledgerTxHash'] },
     { name: 'ng_transactions_block', table: 'midnight_Transactions', columns: ['block_ID'] },
     { name: 'ng_transactions_sender', table: 'midnight_Transactions', columns: ['senderAddress'] },
     { name: 'ng_transactions_receiver', table: 'midnight_Transactions', columns: ['receiverAddress'] },
     { name: 'ng_transactionresults_tx', table: 'midnight_TransactionResults', columns: ['transaction_ID'] },
+    // The indexer supplement updates and deletes per transaction through these links.
+    { name: 'ng_transactionfees_tx', table: 'midnight_TransactionFees', columns: ['transaction_ID'] },
+    { name: 'ng_transactionsegments_result', table: 'midnight_TransactionSegments', columns: ['transactionResult_ID'] },
+    { name: 'ng_contractbalances_action', table: 'midnight_ContractBalances', columns: ['contractAction_ID'] },
+    { name: 'ng_zswapledgerevents_tx', table: 'midnight_ZswapLedgerEvents', columns: ['transaction_ID'] },
+    { name: 'ng_dustledgerevents_tx', table: 'midnight_DustLedgerEvents', columns: ['transaction_ID'] },
     { name: 'ng_contractactions_address', table: 'midnight_ContractActions', columns: ['address'] },
     { name: 'ng_contractactions_tx', table: 'midnight_ContractActions', columns: ['transaction_ID'] },
     { name: 'ng_unshieldedutxos_owner', table: 'midnight_UnshieldedUtxos', columns: ['owner'] },
@@ -36,9 +50,10 @@ export const NIGHTGATE_INDEXES: readonly IndexSpec[] = [
     { name: 'ng_backgroundjobs_grant', table: 'midnight_BackgroundJobs', columns: ['grantId', 'queuedAt'] }
 ];
 
-/** The DDL for one index, dialect-neutral (SQLite + PostgreSQL). */
-export function indexStatement(spec: IndexSpec): string {
-    return `CREATE INDEX IF NOT EXISTS ${spec.name} ON ${spec.table} (${spec.columns.join(', ')})`;
+/** The DDL for one index; the SQLite spelling unless `kind` is PostgreSQL and the spec carries one. */
+export function indexStatement(spec: IndexSpec, kind?: string): string {
+    const columns = spec.postgres && kind && /postgres/i.test(kind) ? spec.postgres : spec.columns.join(', ');
+    return `CREATE INDEX IF NOT EXISTS ${spec.name} ON ${spec.table} (${columns})`;
 }
 
 /**
@@ -55,7 +70,7 @@ export async function ensureIndexes(
     let created = 0;
     for (const spec of NIGHTGATE_INDEXES) {
         try {
-            await db.run(indexStatement(spec));
+            await db.run(indexStatement(spec, kind));
             created++;
         } catch (err) {
             warn(`index ${spec.name} on ${spec.table} not created: ${String((err as Error)?.message ?? err)}`);

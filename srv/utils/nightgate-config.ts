@@ -92,6 +92,7 @@ export const DEFAULT_NODE_URL = 'wss://rpc.preprod.midnight.network/';
 /** Per-network default node RPC URL (crawler and SDK `relayURL`); unlisted networks use DEFAULT_NODE_URL. */
 export const DEFAULT_NODE_URLS: Partial<Record<NightgateNetwork, string>> = {
     preview: 'wss://rpc.preview.midnight.network/',
+    mainnet: 'wss://rpc.mainnet.midnight.network/',
     undeployed: 'ws://127.0.0.1:9944'
 };
 
@@ -109,8 +110,8 @@ export const DEFAULT_INDEXER_URLS: Record<NightgateNetwork, { http: string; ws: 
         ws: 'ws://localhost:8088/api/v4/graphql/ws'
     },
     mainnet: {
-        http: 'https://indexer.midnight.network/api/v4/graphql',
-        ws: 'wss://indexer.midnight.network/api/v4/graphql/ws'
+        http: 'https://indexer.mainnet.midnight.network/api/v4/graphql',
+        ws: 'wss://indexer.mainnet.midnight.network/api/v4/graphql/ws'
     },
     // An indexer image that serves only /api/v3 needs NIGHTGATE_INDEXER_HTTP_URL / _WS_URL.
     undeployed: {
