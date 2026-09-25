@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.25.8 - 2026-09-25
+
+- A parked job whose kind has a reconciliation finalizer and whose command is
+  stored encrypted (`aes-gcm-v1`) resolves again: the finalizer decrypted the
+  command without its job binding (`jobCommandBinding`), the decrypt threw and
+  the job stayed `reconciliation_required` although the indexer had its
+  outcome. Affects `sponsorUnboundTransaction`, `sponsorFinalizedTransaction`,
+  `submitContractCallBatch`, `anchorDocument`, `grantDisclosure`,
+  `revokeDisclosure`, `registerPassport`, `retract` and
+  `fieldPredicateBatchProof` since 0.23.4. Parked jobs resolve on the next
+  confirm pass after the upgrade.
+- Version in `package.json`, lock and the compose default tag.
+
 ## 0.25.7 - 2026-09-25
 
 - `NIGHTGATE_INDEXES` (`srv/utils/db-indexes.ts`) gains five indexes the

@@ -290,6 +290,8 @@ import {
     declareJobKind
 } from '../../srv/submission/background-jobs';
 import { JOB_KIND_TRAITS, LIGHT_KIND } from '../../srv/submission/job-kinds';
+import { encrypt as encryptAtRest, getEncryptionKey } from '../../srv/utils/crypto';
+import { jobCommandBinding } from '../../srv/utils/envelope-bindings';
 import { reportExternalExecution, reportExternalSubmission } from '../../srv/submission/job-execution-context';
 
 async function flushSpawn(): Promise<void> {
@@ -1086,6 +1088,25 @@ describe('confirmChainOutcomesViaIndexer: crawler-free chainStatus advance', () 
         const row = rows.get('job-recon-deploy')!;
         expect(row).toMatchObject({ status: 'succeeded', chainStatus: 'success' });
         expect(JSON.parse(String(row.result))).toMatchObject({ deployed: ['cc'.repeat(32)], txHash: '00recon'.padEnd(64, '0'), reconciled: true });
+    });
+
+    test('decrypts a bound aes-gcm command for the reconciliation finalizer', async () => {
+        const finalizer = vi.fn(async (_cmd: unknown, _job: unknown, _evidence: unknown) => ({ reconciled: true, status: 'finalized' }));
+        registerBackgroundJobReconciliationFinalizer('sponsorUnboundTransaction', 1, finalizer);
+        registerChainOutcomeConfirmer(async () => ({ status: 'success', blockHeight: 4711 }));
+        const now = new Date().toISOString();
+        const command = encryptAtRest(JSON.stringify({ op: 'sponsorUnbound', grantId: 'grant-enc' }), getEncryptionKey(), jobCommandBinding('job-recon-enc'));
+        rows.set('job-recon-enc', {
+            ID: 'job-recon-enc', kind: 'sponsorUnboundTransaction', sessionId: 'sponsor-1', status: 'reconciliation_required',
+            idempotencyKey: null, request: '{}', result: null, errorCode: 'BROADCAST_UNCONFIRMED', errorMessage: 'x',
+            startedAt: now, finishedAt: null, createdAt: now, modifiedAt: now, chainStatus: 'pending',
+            txHash: '00encr'.padEnd(64, '0'), commandVersion: 1, commandEncoding: 'aes-gcm-v1', command
+        } as any);
+        let n = await confirmChainOutcomesViaIndexer();
+        if (n === 0) n = await confirmChainOutcomesViaIndexer();
+        expect(n).toBe(1);
+        expect(finalizer.mock.calls[0][0]).toEqual({ op: 'sponsorUnbound', grantId: 'grant-enc' });
+        expect(rows.get('job-recon-enc')).toMatchObject({ status: 'succeeded', chainStatus: 'success' });
     });
 
     test('a throwing finalizer keeps a reconciled identifier-keyed job in reconciliation_required', async () => {

@@ -1055,7 +1055,7 @@ async function runReconciliationFinalizer(job: BackgroundJobRow, evidence: Recon
         : undefined;
     if (!finalizer) return undefined;
     const serialized = job.commandEncoding === 'aes-gcm-v1'
-        ? decryptAtRest(job.command!, getEncryptionKey())
+        ? decryptAtRest(job.command!, getEncryptionKey(), jobCommandBinding(String(job.ID)))
         : job.command!;
     return finalizer(JSON.parse(serialized), job, evidence);
 }
