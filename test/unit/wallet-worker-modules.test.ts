@@ -23,7 +23,7 @@ vi.mock('node:worker_threads', async () => {
 });
 
 import { facades, type FacadeEntry } from '../../srv/midnight/worker/context';
-import { withSessionLocks, sessionChains, evict } from '../../srv/midnight/worker/facades';
+import { withSessionLocks, sessionChains, evict, init } from '../../srv/midnight/worker/facades';
 import { rotationState, noteGenerationImported, rotateIfDue, __resetRotationForTests, shutdown } from '../../srv/midnight/worker/rotation';
 import { handleMessage } from '../../srv/midnight/worker/rpc';
 import { privateStateRpc, PRIVATE_STATE_RPC_TIMEOUT_MS } from '../../srv/midnight/worker/private-state';
@@ -140,6 +140,50 @@ describe('evict during an in-flight submit', () => {
     it('evict of an unknown session is a no-op', async () => {
         await expect(evict({ sessionId: 'ghost' })).resolves.toEqual({ evicted: false });
         expect(sessionChains.has('ghost')).toBe(false);
+    });
+});
+
+describe('facade build in flight', () => {
+    function deferredBuild() {
+        let finish!: (entry: any) => void;
+        const entry: any = { sdkVersion: 'x', facade: { stop: vi.fn() }, zswapKeys: { clear: vi.fn() }, attestationSecret: new Uint8Array([7]) };
+        const build = vi.fn(() => new Promise<any>(r => { finish = r; }));
+        return { build, entry, finish: () => finish(entry) };
+    }
+    const args = (sessionId: string) => ({ sessionId } as any);
+
+    afterEach(() => { facades.clear(); });
+
+    it('a second init for the same session joins the running build', async () => {
+        const { build, finish } = deferredBuild();
+        const first = init(args('s-join'), build);
+        const second = init(args('s-join'), build);
+        finish();
+        await expect(first).resolves.toMatchObject({ facadeReady: true, alreadyExisted: false });
+        await expect(second).resolves.toMatchObject({ facadeReady: true, alreadyExisted: true });
+        expect(build).toHaveBeenCalledTimes(1);
+        expect(facades.has('s-join')).toBe(true);
+        await evict({ sessionId: 's-join' });
+    });
+
+    it('an evict during the build tears the finished entry down instead of registering it', async () => {
+        const { build, entry, finish } = deferredBuild();
+        const building = init(args('s-evict'), build);
+        await expect(evict({ sessionId: 's-evict' })).resolves.toEqual({ evicted: true, saved: false });
+        finish();
+        await expect(building).rejects.toThrow('evicted while its wallet was being built');
+        expect(facades.has('s-evict')).toBe(false);
+        expect(entry.zswapKeys.clear).toHaveBeenCalled();
+        expect(entry.facade.stop).toHaveBeenCalled();
+        expect(entry.attestationSecret[0]).toBe(0);
+
+        // A fresh init after that builds and registers normally.
+        const again = deferredBuild();
+        const next = init(args('s-evict'), again.build);
+        again.finish();
+        await expect(next).resolves.toMatchObject({ alreadyExisted: false });
+        expect(facades.has('s-evict')).toBe(true);
+        await evict({ sessionId: 's-evict' });
     });
 });
 

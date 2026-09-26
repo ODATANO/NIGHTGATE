@@ -89,18 +89,27 @@ class Semaphore {
 
 const semaphores: Map<string, Semaphore> = new Map();
 
+/**
+ * Heavy kinds share ONE pool (the proofs compete for the same prover); workflow
+ * parents get their own, since a parent waits on heavy children and must never
+ * hold a slot they need. Serial and light caps stay per kind.
+ */
+function concurrencyClass(kind: string): { key: string; cap: 'heavy' | 'light' | 'serial' } {
+    const traits = jobKindTraits(kind);
+    if (traits.serial) return { key: `serial:${kind}`, cap: 'serial' };
+    if (traits.workflowParent) return { key: 'workflow', cap: 'heavy' };
+    if (traits.heavy) return { key: 'heavy', cap: 'heavy' };
+    return { key: `light:${kind}`, cap: 'light' };
+}
+
 function getSemaphore(kind: string): Semaphore {
-    const cached = semaphores.get(kind);
+    const { key, cap } = concurrencyClass(kind);
+    const cached = semaphores.get(key);
     if (cached) return cached;
     const userCaps = ((cds.env as any).requires?.nightgate?.jobs?.concurrency || {}) as { heavy?: number; light?: number; serial?: number };
-    const traits = jobKindTraits(kind);
-    const max = traits.serial
-        ? (typeof userCaps.serial === 'number' ? userCaps.serial : DEFAULT_CONCURRENCY.serial)
-        : traits.heavy
-            ? (typeof userCaps.heavy === 'number' ? userCaps.heavy : DEFAULT_CONCURRENCY.heavy)
-            : (typeof userCaps.light === 'number' ? userCaps.light : DEFAULT_CONCURRENCY.light);
+    const max = typeof userCaps[cap] === 'number' ? userCaps[cap]! : DEFAULT_CONCURRENCY[cap];
     const sem = new Semaphore(max);
-    semaphores.set(kind, sem);
+    semaphores.set(key, sem);
     return sem;
 }
 
@@ -656,7 +665,7 @@ async function dedupExisting<TIn, TOut>(
     );
     if (!existing) return null;
     if (existing.payloadFingerprint && existing.payloadFingerprint !== payloadFingerprint) {
-        throw new Error(`Idempotency key '${idempotencyKey}' was already used with a different request payload.`);
+        throw new IdempotencyConflictError(idempotencyKey);
     }
     return {
         jobId: existing.ID,
@@ -1418,6 +1427,19 @@ const STATUS_WRITE_ATTEMPTS = LOCK_CONTENTION_ATTEMPTS;
 export { REJECTED_ATTEMPT_BOOKKEEPING_PENDING, SponsorAttemptBookkeepingPendingError } from './job-execution-context';
 
 /** Admission refused on a busy database: nothing written or submitted, the caller may resend (503). */
+/** An idempotency key reused with a different payload: the caller's error, never retryable as is. */
+export class IdempotencyConflictError extends Error {
+    readonly httpStatus = 409;
+    // CAP reads `status`/`statusCode`; some actions return startJob's promise to CAP directly.
+    readonly status = 409;
+    readonly statusCode = 409;
+    readonly code = 'IDEMPOTENCY_KEY_CONFLICT';
+    constructor(idempotencyKey: string) {
+        super(`Idempotency key '${idempotencyKey}' was already used with a different request payload.`);
+        this.name = 'IdempotencyConflictError';
+    }
+}
+
 export class JobAdmissionBusyError extends Error {
     readonly httpStatus = 503;
     // CAP reads `status`/`statusCode`, not `httpStatus`; some actions return startJob's promise to CAP directly.

@@ -192,6 +192,8 @@ describe('BlockProcessor persistence paths', () => {
             getStorage: vi.fn().mockResolvedValue(buildTimestampHex(1_700_000_000))
         };
         const processor = makeProcessor(provider);
+        // No event fixture: the block's extrinsics emitted nothing.
+        vi.spyOn(processor as any, 'decodeBlockEvents').mockReturnValue(new Map());
         const warnSpy = vi.spyOn(cds.log('nightgate:crawler'), 'warn').mockImplementation(() => {});
         try {
             await processor.processBlockByHash('0xrawbytes');
@@ -377,6 +379,21 @@ describe('BlockProcessor persistence paths', () => {
         }
     });
 
+    it('refuses to persist a block with extrinsics whose events cannot be read', async () => {
+        const provider = {
+            getBlock: vi.fn().mockResolvedValue({
+                block: { header: { parentHash: '0xnoparent-ev', number: '0x0b', stateRoot: '0xstate-ev' }, extrinsics: [buildUnsignedExtrinsic(10, 0)] },
+                justifications: null
+            }),
+            getRuntimeVersion: vi.fn().mockResolvedValue({ specVersion: 77 }),
+            getStorage: vi.fn().mockResolvedValue(buildTimestampHex(1_700_000_000))
+        };
+        const processor = makeProcessor(provider);
+        await expect(processor.processBlockByHash('0xnoevents')).rejects.toThrow(/System.Events/);
+        expect(await db.run(cds.ql.SELECT.one.from(BLOCKS).where({ hash: '0xnoevents' }))).toBeFalsy();
+        expect(await db.run(cds.ql.SELECT.from(TRANSACTIONS).where({ hash: { like: '%' } }))).toHaveLength(0);
+    });
+
     // ------------------------------------------------------------------------
     // A signed transfer is NOT projected into a UTXO or sender/receiver balances.
     // ------------------------------------------------------------------------
@@ -414,6 +431,8 @@ describe('BlockProcessor persistence paths', () => {
         };
 
         const processor = makeProcessor(provider);
+        // No event fixture: the block's extrinsics emitted nothing.
+        vi.spyOn(processor as any, 'decodeBlockEvents').mockReturnValue(new Map());
         await expect(processor.processBlockByHash('0xtransfer')).resolves.toEqual(expect.objectContaining({
             blockHeight: 9,
             transactionCount: 1

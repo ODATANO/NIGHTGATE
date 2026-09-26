@@ -7,6 +7,8 @@ const mockWebSocketInstances: Array<{
     handlers: Map<string, MockWebSocketHandler[]>;
     send: Mock;
     close: Mock;
+    ping: Mock;
+    terminate: Mock;
     on: Mock;
     emit: (event: string, ...args: any[]) => void;
 }> = [];
@@ -16,6 +18,8 @@ const mockWebSocket = vi.hoisted(() => (class {
     public handlers = new Map<string, MockWebSocketHandler[]>();
     public send = vi.fn();
     public close = vi.fn();
+    public ping = vi.fn();
+    public terminate = vi.fn(() => this.emit('close'));
     public on = vi.fn((event: string, handler: MockWebSocketHandler) => {
         const existing = this.handlers.get(event) || [];
         existing.push(handler);
@@ -72,6 +76,50 @@ describe('MidnightNodeProvider connection management', () => {
 
         await expect(connectPromise).resolves.toBeUndefined();
         expect(provider.isConnected()).toBe(true);
+    });
+
+    it('pings on an interval and terminates a socket that stays silent, which starts the reconnect', async () => {
+        const provider = new MidnightNodeProvider({ nodeUrl: 'ws://localhost:9944', pingInterval: 1000 });
+        const warn = vi.spyOn(cds.log('nightgate:node'), 'warn').mockImplementation(() => {});
+        try {
+            const connecting = provider.connect();
+            const socket = getLatestMockWebSocket();
+            socket.emit('open');
+            await connecting;
+
+            await vi.advanceTimersByTimeAsync(1000);
+            expect(socket.ping).toHaveBeenCalledTimes(1);
+            socket.emit('pong');
+            await vi.advanceTimersByTimeAsync(1000);
+            expect(socket.ping).toHaveBeenCalledTimes(2);
+            expect(socket.terminate).not.toHaveBeenCalled();
+
+            // No pong and no message for a whole interval: half-open.
+            await vi.advanceTimersByTimeAsync(1000);
+            expect(socket.terminate).toHaveBeenCalledTimes(1);
+            expect(provider.isConnected()).toBe(false);
+            expect(warn).toHaveBeenCalledWith(expect.stringContaining('No answer from ws://localhost:9944'));
+            expect(warn).toHaveBeenCalledWith('Connection lost, attempting reconnect...');
+        } finally {
+            warn.mockRestore();
+            await provider.disconnect();
+        }
+    });
+
+    it('counts any message as a sign of life and stops pinging on disconnect', async () => {
+        const provider = new MidnightNodeProvider({ nodeUrl: 'ws://localhost:9944', pingInterval: 1000 });
+        const connecting = provider.connect();
+        const socket = getLatestMockWebSocket();
+        socket.emit('open');
+        await connecting;
+        for (let i = 0; i < 3; i++) {
+            await vi.advanceTimersByTimeAsync(1000);
+            socket.emit('message', Buffer.from('{"jsonrpc":"2.0","method":"x","params":{"subscription":"s","result":1}}'));
+        }
+        expect(socket.terminate).not.toHaveBeenCalled();
+        await provider.disconnect();
+        await vi.advanceTimersByTimeAsync(5000);
+        expect(socket.ping).toHaveBeenCalledTimes(3);
     });
 
     it('rejects the initial connection when the websocket errors before opening', async () => {

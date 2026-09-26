@@ -220,6 +220,14 @@ describe('LedgerPayloadDecoder', () => {
         expect((await db.run(cds.ql.SELECT.one.from(TRANSACTIONS).where({ ID: txId }))).payloadDecode).toBe('decoded');
     });
 
+    it('reaches the first block of an index seeded at startHeight in one pass', async () => {
+        await seedBlock(1_400_000, '0xd6');
+        await setSync({ lastIndexedHeight: 1_400_010, lastDecodedHeight: null });
+        decodeLedgerPayload.mockResolvedValue(facts());
+        expect((await runDecoder()).blocks).toBe(1);
+        expect(Number((await readSync()).lastDecodedHeight)).toBe(1_400_000);
+    });
+
     it('stays below the lag and does not re-decode a finished row', async () => {
         const blockId = await seedBlock(19, '0xd4');
         await seedTransaction(blockId, { raw: midnightExtrinsicBase64(20) });
@@ -441,6 +449,15 @@ describe('IndexerSupplement', () => {
         // Unchanged: left null, meaning "as at the last block below".
         expect(await asBase64(await read(second))).toBeNull();
         expect(await asBase64(await read(third))).toBe('cGFyYW1zLUI=');
+    });
+
+    it('reaches the first block of an index seeded at startHeight in one pass', async () => {
+        await seedBlock(1_400_000, '0xs6');
+        await setSync({ lastIndexedHeight: 1_400_010, lastSupplementedHeight: null });
+        const pass = supplementWith({ 1_400_000: { height: 1_400_000, ledgerParameters: null, transactions: [] } });
+        await pass.init(db);
+        expect((await pass.runOnce()).blocks).toBe(1);
+        expect(Number((await readSync()).lastSupplementedHeight)).toBe(1_400_000);
     });
 
     it('holds the cursor where the indexer has not caught up yet', async () => {

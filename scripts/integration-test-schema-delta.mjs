@@ -342,7 +342,8 @@ ok('delta 0.23: the Transactions row itself survives', after.prepare("SELECT has
 const stateRow = after.prepare("SELECT state FROM midnight_ContractActions WHERE ID = 'ca-1'").get();
 ok('delta 0.23: the ContractActions.state copy is cleared', stateRow?.state === null, JSON.stringify(stateRow));
 const ngIdx = after.prepare("SELECT name FROM sqlite_master WHERE type='index' AND name LIKE 'ng_%'").all().map(r => r.name);
-ok('delta 0.23: secondary indexes exist after the migration', ngIdx.includes('ng_transactions_hash') && ngIdx.includes('ng_blocks_height'), ngIdx.join(','));
+ok('delta 0.23: secondary indexes exist after the migration', ngIdx.includes('ng_transactions_hash') && ngIdx.includes('ng_blocks_height_unique'), ngIdx.join(','));
+ok('delta: the unique height index replaced the plain one', !ngIdx.includes('ng_blocks_height'), ngIdx.join(','));
 
 const regs = after.prepare("SELECT type FROM sqlite_master WHERE name = 'midnight_ContractRegistrations'").get();
 ok('delta 0.21: the ContractRegistrations table exists', regs?.type === 'table');

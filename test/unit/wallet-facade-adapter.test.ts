@@ -17,6 +17,7 @@
 import type { Mock } from 'vitest';
 import crypto from 'crypto';
 import { encrypt, getEncryptionKey } from '../../srv/utils/crypto';
+import { walletSessionSeedBinding, walletSessionViewingKeyBinding } from '../../srv/utils/envelope-bindings';
 import { buildWalletMaterialForSession } from '../../srv/submission/wallet-material-factory';
 import type { WalletFacadeBuildArgs } from '../../srv/submission/wallet-facade-builder';
 
@@ -92,8 +93,8 @@ function buildSession() {
         ID: 'sess-uuid',
         sessionId: 'sess-1',
         isActive: true,
-        encryptedViewingKey: encrypt('mn_shield-vk_alice', TEST_KEY),
-        encryptedSeedKey: encrypt(VALID_SEED_HEX, TEST_KEY),
+        encryptedViewingKey: encrypt('mn_shield-vk_alice', TEST_KEY, walletSessionViewingKeyBinding('sess-1')),
+        encryptedSeedKey: encrypt(VALID_SEED_HEX, TEST_KEY, walletSessionSeedBinding('sess-1')),
         expiresAt: new Date(Date.now() + 60_000).toISOString()
     };
 }

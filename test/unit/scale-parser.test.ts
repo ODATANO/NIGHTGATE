@@ -48,6 +48,13 @@ describe('decodeCompact', () => {
         expect(decodeCompact(buf, 0)).toEqual([16384, 4]);
     });
 
+    it('decodes the top of four-byte mode unsigned (2^30 - 1, raw u32 above 2^31)', () => {
+        const buf = Buffer.alloc(4);
+        buf.writeUInt32LE(0xfffffffe, 0); // ((2^30 - 1) << 2) | 0b10
+        expect(decodeCompactBigInt(buf, 0)).toEqual([2n ** 30n - 1n, 4]);
+        expect(decodeCompact(buf, 0)).toEqual([2 ** 30 - 1, 4]);
+    });
+
     it('should handle big-integer mode (0b11) by skipping', () => {
         // Mode 0b11: upper 6 bits = extra bytes count
         // (0 << 2) | 0x03 = 0x03 → extra = 0 + 4 = 4 following bytes

@@ -38,6 +38,8 @@ interface ReorgInfo {
 
 /** stop() waits this long for the in-flight batch or live block before unsubscribing. */
 const STOP_DRAIN_MS = 30_000;
+// Pause before a pipeline that failed on a transient error is driven again.
+const INGEST_REDRIVE_MS = 30_000;
 
 export class MidnightCrawler {
     private isRunning: boolean = false;
@@ -47,6 +49,7 @@ export class MidnightCrawler {
     private processing: boolean = false;  // Mutex: prevent concurrent block processing
     private pendingHeights: number[] = [];  // Queued live block heights received during processing
     private ingestPromise: Promise<void> | null = null;  // The running pipeline, awaited by stop()
+    private redriveTimer: NodeJS.Timeout | null = null;
     private liveProcessing: Promise<void> | null = null;  // The live block being persisted, awaited by stop()
     private subscriptionId: string | null = null;
     private db!: cds.DatabaseService;
@@ -199,8 +202,13 @@ export class MidnightCrawler {
                 const msg = err instanceof Error ? err.message : String(err);
                 if (this.isRunning && this.isConnectionLossError(err)) {
                     log.warn(`Ingest interrupted by connection loss; awaiting reconnect: ${msg}`);
+                } else if (this.isRunning && isTransientError(err as Error)) {
+                    log.warn(`Ingest pipeline failed on a transient error; driving it again in ${INGEST_REDRIVE_MS / 1000}s: ${msg}`);
+                    void this.recordError(msg, false);
+                    this.scheduleRedrive();
                 } else {
                     log.error('Ingest pipeline failed:', err);
+                    if (this.isRunning) void this.recordError(msg);
                     this.isRunning = false;
                 }
             })
@@ -213,6 +221,20 @@ export class MidnightCrawler {
             });
     }
 
+    private scheduleRedrive(): void {
+        if (this.redriveTimer) return;
+        this.redriveTimer = setTimeout(() => {
+            this.redriveTimer = null;
+            if (this.isRunning) this.driveIngest();
+        }, INGEST_REDRIVE_MS);
+        this.redriveTimer.unref?.();
+    }
+
+    /** False once a permanent ingest failure or a stop ended the crawl. */
+    isActive(): boolean {
+        return this.isRunning;
+    }
+
     private isConnectionLossError(err: unknown): boolean {
         const msg = (err instanceof Error ? err.message : String(err)).toLowerCase();
         return /not connected|connection closed|websocket closed|closed before|disconnect|econnreset|socket hang up/.test(msg);
@@ -221,6 +243,7 @@ export class MidnightCrawler {
     async stop(): Promise<void> {
         log.info('Stopping...');
         this.isRunning = false;
+        if (this.redriveTimer) { clearTimeout(this.redriveTimer); this.redriveTimer = null; }
 
         await Promise.allSettled([this.decoder?.stop(), this.supplement?.stop()]);
         this.decoder = null;
@@ -284,8 +307,8 @@ export class MidnightCrawler {
             let startHeight = this.getCatchUpStartHeight(syncState);
 
             // Finalized head, not chain tip: never ingest blocks that may revert.
-            const finalizedHash = await this.nodeProvider.getFinalizedHead();
-            const finalizedHeader = await this.nodeProvider.getHeader(finalizedHash);
+            const finalizedHash = await this.withRetry('Finalized head', () => this.nodeProvider.getFinalizedHead());
+            const finalizedHeader = await this.withRetry('Finalized header', () => this.nodeProvider.getHeader(finalizedHash));
             const tipHeight = MidnightNodeProvider.parseBlockNumber(finalizedHeader.number);
 
             // Height 0 means nothing is indexed yet, which is where startHeight applies.
@@ -817,7 +840,8 @@ export class MidnightCrawler {
         );
     }
 
-    private async recordError(message: string): Promise<void> {
+    /** `markErrored` false records the error without flipping syncStatus (a retry follows). */
+    private async recordError(message: string, markErrored: boolean = true): Promise<void> {
         try {
             const state = await this.getSyncState();
             await this.db.run(
@@ -825,7 +849,7 @@ export class MidnightCrawler {
                     lastError: message.slice(0, 500),
                     lastErrorAt: new Date().toISOString(),
                     consecutiveErrors: (state?.consecutiveErrors || 0) + 1,
-                    syncStatus: 'error'
+                    ...(markErrored ? { syncStatus: 'error' } : {})
                 }).where({ ID: 'SINGLETON' })
             );
         } catch {

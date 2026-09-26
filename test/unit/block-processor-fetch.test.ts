@@ -448,6 +448,8 @@ describe('pallet map per block', () => {
     async function processorWithRuntimes(provider: any, maps: Record<number, Map<number, any>>): Promise<BlockProcessor> {
         const p = await makeProcessor(provider);
         for (const [spec, palletMap] of Object.entries(maps)) (p as any).runtimes.set(Number(spec), { registry: undefined, palletMap });
+        // No event fixture: the blocks' extrinsics emitted nothing.
+        vi.spyOn(p as any, 'decodeBlockEvents').mockReturnValue(new Map());
         return p;
     }
 

@@ -89,6 +89,10 @@ function databaseKind(): string {
     return 'unknown';
 }
 
+function authKind(): string {
+    return String((cds.env as any).requires?.auth?.kind ?? '');
+}
+
 function allowProductionSqlite(config: NightgatePluginConfig): boolean {
     return configFlag('NIGHTGATE_ALLOW_PRODUCTION_SQLITE')
         || config.allowProductionSqlite === true;
@@ -121,6 +125,16 @@ export function getRuntimeTopology(config: NightgatePluginConfig = {}): RuntimeT
             warnings.push(`${message} NIGHTGATE_ALLOW_PRODUCTION_SQLITE=true is active as an emergency compatibility override.`);
         } else {
             errors.push(`${message} Set NIGHTGATE_ALLOW_PRODUCTION_SQLITE=true only for a temporary, single-instance migration window.`);
+        }
+    }
+
+    // `dummy` makes every request a privileged user, signing-key export included.
+    if (productionMode() && authKind() === 'dummy') {
+        const message = "Authentication kind 'dummy' serves every request unauthenticated and privileged.";
+        if (configFlag('NIGHTGATE_ALLOW_UNAUTHENTICATED')) {
+            warnings.push(`${message} NIGHTGATE_ALLOW_UNAUTHENTICATED=true is active; keep the port off any network.`);
+        } else {
+            errors.push(`${message} It is refused in production; configure basic or JWT auth, or set NIGHTGATE_ALLOW_UNAUTHENTICATED=true for a local test.`);
         }
     }
 

@@ -10,7 +10,7 @@ import crypto from 'crypto';
 import cds from '@sap/cds';
 import {
     encrypt, decrypt, hashViewingKey, getEncryptionKey, inspectCiphertext, parseKeyRingSpec, KeyRing,
-    UnknownEncryptionKeyError, legacyFold, deriveKek, deriveBoundSecret, setKeyRing, __resetKeyRingForTests, LEGACY_KEY_ID
+    UnknownEncryptionKeyError, UnboundEnvelopeError, legacyFold, deriveKek, deriveBoundSecret, setKeyRing, __resetKeyRingForTests, LEGACY_KEY_ID
 } from '../../srv/utils/crypto';
 
 const ENV_KEYS = ['ENCRYPTION_KEY', 'ENCRYPTION_KEYS', 'ENCRYPTION_KEY_ACTIVE', 'NODE_ENV'] as const;
@@ -255,11 +255,20 @@ describe('v3 bound envelopes', () => {
         expect(() => decrypt(ct, ring)).toThrow(/bound to a purpose and a subject/);
     });
 
-    it('a v2 envelope still opens whether or not a binding is passed', () => {
+    it('a v2 envelope opens without a binding and is refused where a bound one belongs', () => {
         const ct = encrypt('legacy', ring);
         expect(inspectCiphertext(ct).version).toBe(2);
         expect(decrypt(ct, ring)).toBe('legacy');
-        expect(decrypt(ct, ring, rowA)).toBe('legacy');
+        expect(() => decrypt(ct, ring, rowA)).toThrow(UnboundEnvelopeError);
+        expect(() => decrypt(ct, ring, rowA)).toThrow(/nightgate-rewrap-keys/);
+        // The migration reads it; so does a deployment that has not rewrapped yet.
+        expect(decrypt(ct, ring, rowA, { allowUnbound: true })).toBe('legacy');
+        process.env.NIGHTGATE_ACCEPT_UNBOUND_ENVELOPES = 'true';
+        try {
+            expect(decrypt(ct, ring, rowA)).toBe('legacy');
+        } finally {
+            delete process.env.NIGHTGATE_ACCEPT_UNBOUND_ENVELOPES;
+        }
     });
 
     it('refuses an empty or NUL-bearing binding', () => {

@@ -13,6 +13,19 @@ import {
 import { bumpReorgGeneration } from '../submission/reorg-generation';
 import { NIGHT_RAW_TOKEN_TYPE } from './block-events';
 
+// PostgreSQL caps one statement at 65535 bind parameters.
+const IN_CHUNK = 5000;
+
+/** Runs `query` once per chunk of `ids` and concatenates the rows. */
+async function chunked(ids: unknown[], query: (chunk: unknown[]) => Promise<any>): Promise<any[]> {
+    const rows: any[] = [];
+    for (let i = 0; i < ids.length; i += IN_CHUNK) {
+        const result = await query(ids.slice(i, i + IN_CHUNK));
+        if (Array.isArray(result)) for (const row of result) rows.push(row);
+    }
+    return rows;
+}
+
 export interface RollbackResult {
     reorgGeneration: number;
     blocksRolledBack: number;
@@ -57,10 +70,10 @@ export async function rollbackIndexedDataFromHeight(
         };
     }
 
-    const txsToDelete: any[] = await tx.run(
+    const txsToDelete = await chunked(blockIds, ids => tx.run(
         SELECT.from(Transactions).columns('ID', 'hash', 'senderAddress', 'receiverAddress')
-            .where({ block_ID: { in: blockIds } })
-    ) || [];
+            .where({ block_ID: { in: ids } })
+    ));
     const txIds = txsToDelete.map((t: any) => t.ID).filter(Boolean);
 
     // Collect affected addresses BEFORE deleting anything.
@@ -71,50 +84,43 @@ export async function rollbackIndexedDataFromHeight(
     }
 
     if (txIds.length > 0) {
-        const utxoOwners: any[] = await tx.run(
-            SELECT.from(UnshieldedUtxos).columns('owner')
-                .where({ createdAtTransaction_ID: { in: txIds } })
-        ) || [];
+        const utxoOwners = await chunked(txIds, ids => tx.run(
+            SELECT.from(UnshieldedUtxos).columns('owner').where({ createdAtTransaction_ID: { in: ids } })
+        ));
         for (const u of utxoOwners) if (u.owner) affected.add(u.owner);
-        const spentOwners: any[] = await tx.run(
-            SELECT.from(UnshieldedUtxos).columns('owner')
-                .where({ spentAtTransaction_ID: { in: txIds } })
-        ) || [];
+        const spentOwners = await chunked(txIds, ids => tx.run(
+            SELECT.from(UnshieldedUtxos).columns('owner').where({ spentAtTransaction_ID: { in: ids } })
+        ));
         for (const u of spentOwners) if (u.owner) affected.add(u.owner);
 
-        const actionsToDelete: any[] = await tx.run(
-            SELECT.from(ContractActions).columns('ID')
-                .where({ transaction_ID: { in: txIds } })
-        ) || [];
-        if (actionsToDelete.length > 0) {
-            const actionIds = actionsToDelete.map((a: any) => a.ID);
-            await tx.run(DELETE.from(ContractBalances).where({ contractAction_ID: { in: actionIds } }));
-        }
+        const actionIds = (await chunked(txIds, ids => tx.run(
+            SELECT.from(ContractActions).columns('ID').where({ transaction_ID: { in: ids } })
+        ))).map((a: any) => a.ID);
+        await chunked(actionIds, ids => tx.run(DELETE.from(ContractBalances).where({ contractAction_ID: { in: ids } })));
 
-        await tx.run(DELETE.from(ContractActions).where({ transaction_ID: { in: txIds } }));
-        await tx.run(DELETE.from(UnshieldedUtxos).where({ createdAtTransaction_ID: { in: txIds } }));
-        await tx.run(DELETE.from(ZswapLedgerEvents).where({ transaction_ID: { in: txIds } }));
-        await tx.run(DELETE.from(DustLedgerEvents).where({ transaction_ID: { in: txIds } }));
-        await tx.run(DELETE.from(TransactionFees).where({ transaction_ID: { in: txIds } }));
+        const resultIds = (await chunked(txIds, ids => tx.run(
+            SELECT.from(TransactionResults).columns('ID').where({ transaction_ID: { in: ids } })
+        ))).map((r: any) => r.ID);
+        await chunked(resultIds, ids => tx.run(DELETE.from(TransactionSegments).where({ transactionResult_ID: { in: ids } })));
 
-        const resultsToDelete: any[] = await tx.run(
-            SELECT.from(TransactionResults).columns('ID').where({ transaction_ID: { in: txIds } })
-        ) || [];
-        if (resultsToDelete.length > 0) {
-            const resultIds = resultsToDelete.map((r: any) => r.ID);
-            await tx.run(DELETE.from(TransactionSegments).where({ transactionResult_ID: { in: resultIds } }));
-        }
-        await tx.run(DELETE.from(TransactionResults).where({ transaction_ID: { in: txIds } }));
-
-        await tx.run(
-            UPDATE.entity(UnshieldedUtxos)
-                .set({ spentAtTransaction_ID: null })
-                .where({ spentAtTransaction_ID: { in: txIds } })
-        );
+        await chunked(txIds, async ids => {
+            await tx.run(DELETE.from(ContractActions).where({ transaction_ID: { in: ids } }));
+            await tx.run(DELETE.from(UnshieldedUtxos).where({ createdAtTransaction_ID: { in: ids } }));
+            await tx.run(DELETE.from(ZswapLedgerEvents).where({ transaction_ID: { in: ids } }));
+            await tx.run(DELETE.from(DustLedgerEvents).where({ transaction_ID: { in: ids } }));
+            await tx.run(DELETE.from(TransactionFees).where({ transaction_ID: { in: ids } }));
+            await tx.run(DELETE.from(TransactionResults).where({ transaction_ID: { in: ids } }));
+        });
+        // After every chunk's deletes: a spend in one chunk may point at a UTXO created in another.
+        await chunked(txIds, ids => tx.run(
+            UPDATE.entity(UnshieldedUtxos).set({ spentAtTransaction_ID: null }).where({ spentAtTransaction_ID: { in: ids } })
+        ));
     }
 
-    await tx.run(DELETE.from(Transactions).where({ block_ID: { in: blockIds } }));
-    await tx.run(DELETE.from(Blocks).where({ ID: { in: blockIds } }));
+    await chunked(blockIds, async ids => {
+        await tx.run(DELETE.from(Transactions).where({ block_ID: { in: ids } }));
+        await tx.run(DELETE.from(Blocks).where({ ID: { in: ids } }));
+    });
 
     for (const address of affected) {
         await recomputeNightBalance(tx, address);
@@ -266,22 +272,19 @@ export async function recomputeNightBalance(tx: any, address: string): Promise<v
         ...utxos.map(u => u.createdAtTransaction_ID),
         ...utxos.map(u => u.spentAtTransaction_ID)
     ].filter(Boolean))];
-    const activityTxs: any[] = activityTxIds.length
-        ? await tx.run(
-            SELECT.from(Transactions).columns('ID', 'block_ID').where({ ID: { in: activityTxIds } })
-        ) || []
-        : [];
+    const activityTxs = await chunked(activityTxIds, ids => tx.run(
+        SELECT.from(Transactions).columns('ID', 'block_ID').where({ ID: { in: ids } })
+    ));
     const blockIds = [...new Set(
         [...activityTxs.map(t => t.block_ID), ...sentTxs.map(t => t.block_ID)].filter(Boolean)
     )];
-    const blocks: any[] = blockIds.length
-        ? await tx.run(
-            SELECT.from(Blocks).columns('ID', 'height').where({ ID: { in: blockIds } })
-        ) || []
-        : [];
+    const blocks = await chunked(blockIds, ids => tx.run(
+        SELECT.from(Blocks).columns('ID', 'height').where({ ID: { in: ids } })
+    ));
     const heights = blocks.map(b => Number(b.height)).filter(Number.isFinite);
-    const firstSeenHeight = heights.length ? Math.min(...heights) : null;
-    const lastActivityHeight = heights.length ? Math.max(...heights) : null;
+    // reduce, not Math.min(...): a spread of this size can overflow the call stack.
+    const firstSeenHeight = heights.length ? heights.reduce((a, b) => Math.min(a, b)) : null;
+    const lastActivityHeight = heights.length ? heights.reduce((a, b) => Math.max(a, b)) : null;
 
     let balance = 0n;
     let utxoCount = 0;

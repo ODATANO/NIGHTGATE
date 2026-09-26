@@ -18,13 +18,13 @@ remove an action, a patch release never does; a removal is marked
 
 ## Async job model (write actions)
 
-Every submitting action returns `{ jobId, status: "pending" }`; poll `getJobStatus(jobId, sessionId)` until `succeeded` or `failed`. Each write action lists its job-result shape (the parsed `result`); functions return their result directly.
+Every submitting action returns `{ jobId, status: "pending" }`; poll `getJobStatus(jobId, sessionId)` until `succeeded` or `failed`. A reused `idempotencyKey` returns the existing job; the same key with a different payload answers 409 `IDEMPOTENCY_KEY_CONFLICT`. Each write action lists its job-result shape (the parsed `result`); functions return their result directly.
 
 ### `getJobStatus(jobId, sessionId) → { status, chainStatus, result, errorCode, errorMessage, submissionId, txHash, chainFinalizedAt, chainBlockHeight, chainBlockHash, … }`
 
 `status`: `pending | running | external_execution | submitted | reconciliation_required | succeeded | failed`. `result` is the action's result as a JSON string; on failure `errorCode` + `errorMessage` (see [Error model](#error-model)). `chainBlockHeight` / `chainBlockHash` are the confirmed inclusion coordinates; a reorg rollback reverts by them. An on-chain failure without a block height stays briefly in `reconciliation_required` / `CHAIN_EXECUTION_FAILED_UNCONFIRMED` until the confirmer records the coordinates.
 
-`reconciliation_required`: execution was interrupted after an external effect may have occurred. Do NOT auto-retry; a new attempt needs a new `idempotencyKey`. The reconciler resolves it by the job's `txHash` on the indexer: `succeeded`, `failed / CHAIN_EXECUTION_FAILED`, or, once the indexer tip is past the transaction's `ttl` (30 to 60 min) plus `NIGHTGATE_BROADCAST_EXPIRY_MARGIN_MS` (default 5 min), `failed / BROADCAST_NOT_INCLUDED` with `chainStatus: dropped` (nothing on chain). Parked `errorCode`: `BROADCAST_UNCONFIRMED` (submitted, no node status, not indexed yet), `EXTERNAL_EXECUTION_FAILED` (failure after the broadcast), `PROCESS_RESTART_RECONCILE` (restart after the broadcast). Manual check: `verifyAttestationState` for an `attest`, else the identifier on the indexer.
+`reconciliation_required`: execution was interrupted after an external effect may have occurred. Do NOT auto-retry; a new attempt needs a new `idempotencyKey`. The reconciler resolves it by the job's `txHash` on the indexer: `succeeded`, `failed / CHAIN_EXECUTION_FAILED`, or, once the indexer tip is past the transaction's `ttl` (30 to 60 min) plus `NIGHTGATE_BROADCAST_EXPIRY_MARGIN_MS` (default 5 min), `failed / BROADCAST_NOT_INCLUDED` with `chainStatus: dropped` (nothing on chain). Parked `errorCode`: `BROADCAST_UNCONFIRMED` (submitted, no node status, not indexed yet), `EXTERNAL_EXECUTION_FAILED` (failure after the broadcast), `PROCESS_RESTART_RECONCILE` (restart after the broadcast), `CHILD_RECONCILIATION_REQUIRED` (a workflow step is on chain but a later step or its record did not complete; once every step has succeeded the workflow re-runs and reuses them). Manual check: `verifyAttestationState` for an `attest`, else the identifier on the indexer.
 
 Every submit path broadcasts only after the transaction identifier is persisted as the job's `txHash`. A `failed` job without `txHash` sent nothing; `reconciliation_required` always carries the one identifier that may be on chain. A pre-mempool reject closes its attempt `REJECTED` on `PendingSubmissions` and clears the hash before anything else is sent.
 
@@ -447,7 +447,7 @@ used). **Rate limit:** 120/hour per principal, shared with
 Parallelism: only the dust build is serialized per wallet; one wallet sponsors
 as many transactions at once as it has distinct registered dust backings.
 Same-backing requests wait up to `NIGHTGATE_BACKING_WAIT_MS` (default 5 min).
-A lost dust race (`1010/170`, `1010/196`) is rebuilt on the same sponsor
+A lost dust race (`1010/170`, `1010/171`, `1010/196`) is rebuilt on the same sponsor
 (`NIGHTGATE_SPONSOR_DUST_RETRIES`, default 4; `NIGHTGATE_SPONSOR_DUST_BACKOFF_MS`,
 default 5000). Job concurrency: `cds.requires.nightgate.jobs.concurrency.heavy`
 (default 4). Returns once in a block (`NIGHTGATE_SPONSOR_WAIT=finalized` waits
@@ -864,7 +864,7 @@ Every other 5xx is a server fault and stays sanitised.
 | Worker code | Meaning |
 |---|---|
 | `pre-mempool-reject` | node refused before the mempool, fee unspent; `ledgerCode` `1010/<n>`, `1014`, `1016` or `intent-rejected` |
-| `dust-race` | `1010/170`, `1010/196` or `pool-invalid`; rebuild-retryable |
+| `dust-race` | `1010/170`, `1010/171`, `1010/196` or `pool-invalid`; rebuild-retryable |
 | `transport` | the send failed before an answer; `closing-socket` when it never left |
 | `ambiguous` | the broadcast may have landed; reconciled by identifier, never rebuilt |
 | `landed-not-applied` | on chain, call not applied |
@@ -893,7 +893,7 @@ Job codes (`classifySubmissionError`, `srv/submission/TransactionSubmitter.ts`):
 
 Raw node or SDK errors instead of a job code:
 
-- **`1010/170`, `1010/196` (dust race):** the dust spend was built on a dust state the node has moved past (170: stale merkle root or validity window, e.g. lagging indexer or unsynced wallet; 196: nullifier already known, concurrent spend of the same note). Pre-mempool, no fee. Marked `retryable: true, transient: "dust-race"`; deploy, call and batch rebuild inside the worker call (`NIGHTGATE_DUST_RACE_RETRIES`, default 2; `NIGHTGATE_DUST_RACE_BACKOFF_MS`, default 5000), sponsored paths via `NIGHTGATE_SPONSOR_DUST_RETRIES`. `failed assert: predicate false` is a predicate-circuit rejection.
+- **`1010/170`, `1010/171`, `1010/196` (dust race):** the dust spend was built on a dust state the node has moved past (170: stale merkle root, e.g. lagging indexer or unsynced wallet; 171: the spend's ctime is ahead of a lagging node's block time; 196: nullifier already known, concurrent spend of the same note). Pre-mempool, no fee. Marked `retryable: true, transient: "dust-race"`; deploy, call and batch rebuild inside the worker call (`NIGHTGATE_DUST_RACE_RETRIES`, default 2; `NIGHTGATE_DUST_RACE_BACKOFF_MS`, default 5000), sponsored paths via `NIGHTGATE_SPONSOR_DUST_RETRIES`. `failed assert: predicate false` is a predicate-circuit rejection.
 - **`Wallet.InsufficientFunds`:** not enough dust for the fee or NIGHT for the outputs.
 - **`MalformedResult`:** the SDK returned without the expected fields; thrown by `TransactionSubmitter`, not a job code.
 

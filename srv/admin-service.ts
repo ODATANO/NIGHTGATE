@@ -17,6 +17,7 @@ import { walletSessionViewingKeyBinding } from './utils/envelope-bindings';
 import { exportContractSigningKeyForSession, SigningKeyExportError } from './submission/signing-key-export';
 import { deriveAccountId } from './submission/wallet-material-factory';
 import { evictWalletFacade } from './submission/wallet-facade-builder';
+import { withKeyedLock } from './utils/keyed-lock';
 
 import { WalletSessions, DisclosureRoles, BackgroundJobs } from '#cds-models/midnight';
 import { listContracts, registerContractAtRuntime, unregisterContractAtRuntime, ContractRegistrationError } from './submission/contract-registrations';
@@ -37,7 +38,8 @@ async function evictSessionFacade(session: { sessionId: string; encryptedViewing
             // Deliberately account-wide (operator tool: forced invalidation
             // must drop secrets even if other sessions share the wallet).
             cds.log('nightgate:admin').info('force-evicting facade', accountId.slice(0, 16));
-            await evictWalletFacade(accountId);
+            // The build lock: an evict that lands mid-build would find nothing and the build re-insert it.
+            await withKeyedLock(accountId, () => evictWalletFacade(accountId));
         }
     } catch { /* best-effort */ }
 }
@@ -177,7 +179,7 @@ export default class NightgateAdminService extends cds.ApplicationService {
                 return req.reject(409, `Session ${sessionId} is already inactive`);
             }
 
-            await evictSessionFacade(session);
+            // Deactivate first: a job still running for the session must not rebuild after the evict.
             await this.db.run(
                 UPDATE.entity(WalletSessions).set({
                     isActive: false,
@@ -186,6 +188,7 @@ export default class NightgateAdminService extends cds.ApplicationService {
                     encryptedSeedKey: null  // Clear BOTH secrets, not just the viewing key
                 }).where({ sessionId })
             );
+            await evictSessionFacade(session);
         });
 
         this.on('exportContractSigningKey', async (req: Request) => {
@@ -201,11 +204,10 @@ export default class NightgateAdminService extends cds.ApplicationService {
         });
 
         this.on('invalidateAllSessions', async () => {
-            // Evict cached facades before nulling keys so live signing keys are dropped from RAM too.
+            // Viewing keys read before they are nulled, facades evicted after the deactivation.
             const active: any[] = (await this.db.run(
                 SELECT.from(WalletSessions).columns('sessionId', 'encryptedViewingKey').where({ isActive: true })
             )) || [];
-            for (const s of active) await evictSessionFacade(s);
 
             const result = await this.db.run(
                 UPDATE.entity(WalletSessions).set({
@@ -215,6 +217,7 @@ export default class NightgateAdminService extends cds.ApplicationService {
                     encryptedSeedKey: null  // Clear BOTH secrets for every session
                 }).where({ isActive: true })
             );
+            for (const s of active) await evictSessionFacade(s);
             return result;
         });
 

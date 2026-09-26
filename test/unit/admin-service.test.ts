@@ -80,6 +80,26 @@ vi.mock('../../srv/submission/contract-registrations', () => {
     };
 });
 
+const evictOrder = vi.hoisted(() => [] as string[]);
+vi.mock('../../srv/submission/wallet-facade-builder', () => ({
+    evictWalletFacade: vi.fn(async (accountId: string) => { evictOrder.push(`evict:${accountId}`); })
+}));
+vi.mock('../../srv/utils/keyed-lock', () => ({
+    withKeyedLock: vi.fn(async (key: string, fn: () => Promise<unknown>) => {
+        evictOrder.push(`lock:${key}`);
+        try { return await fn(); } finally { evictOrder.push(`unlock:${key}`); }
+    })
+}));
+vi.mock('../../srv/utils/crypto', async (importOriginal) => ({
+    ...(await importOriginal<any>()),
+    decrypt: vi.fn(() => 'vk-plain'),
+    getEncryptionKey: vi.fn(() => Buffer.alloc(32))
+}));
+vi.mock('../../srv/submission/wallet-material-factory', async (importOriginal) => ({
+    ...(await importOriginal<any>()),
+    deriveAccountId: vi.fn(() => 'acct-1')
+}));
+
 import NightgateAdminService from '../../srv/admin-service';
 import { ContractRegistrationError } from '../../srv/submission/contract-registrations';
 
@@ -180,6 +200,19 @@ describe('NightgateAdminService', () => {
             }));
         });
 
+        it('evicts the facade under the build lock, after the session is deactivated', async () => {
+            const handler = registeredHandlers['invalidateSession'];
+            evictOrder.length = 0;
+            mockDbRun.mockResolvedValueOnce({ sessionId: 'session-9', isActive: true, encryptedViewingKey: 'enc' });
+            mockDbRun.mockImplementationOnce(async () => { evictOrder.push('update'); return 1; });
+
+            const req = createMockRequest({ sessionId: 'session-9' });
+            await handler(req);
+
+            expect(req.reject).not.toHaveBeenCalled();
+            expect(evictOrder).toEqual(['update', 'lock:acct-1', 'evict:acct-1', 'unlock:acct-1']);
+        });
+
         it('should reject when sessionId is missing', async () => {
             const handler = registeredHandlers['invalidateSession'];
 
@@ -227,6 +260,17 @@ describe('NightgateAdminService', () => {
 
             const result = await handler();
             expect(result).toBe(5);
+        });
+
+        it('evicts every active facade after the bulk deactivation', async () => {
+            const handler = registeredHandlers['invalidateAllSessions'];
+            evictOrder.length = 0;
+            mockDbRun.mockResolvedValueOnce([{ sessionId: 's1', encryptedViewingKey: 'e1' }, { sessionId: 's2', encryptedViewingKey: 'e2' }]);
+            mockDbRun.mockImplementationOnce(async () => { evictOrder.push('update'); return 2; });
+
+            expect(await handler()).toBe(2);
+            expect(evictOrder[0]).toBe('update');
+            expect(evictOrder.filter(e => e.startsWith('evict:'))).toHaveLength(2);
         });
 
         it('should return 0 when no active sessions exist', async () => {

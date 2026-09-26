@@ -46,8 +46,11 @@ const registeredProcessors = vi.hoisted(() => new Map<string, (command: unknown,
 const childCommandLog = vi.hoisted(() => [] as Array<{ kind: string; step: string; command: any }>);
 const registeredFinalizers = vi.hoisted(() => new Map<string, (command: unknown, row: any, evidence: any) => Promise<unknown>>());
 vi.mock('../../srv/submission/background-jobs', async (importOriginal) => ({
-    // The real error class: runSubmission narrows on `instanceof`.
+    // The real error classes: runSubmission narrows on `instanceof`.
     JobAdmissionBusyError: (await importOriginal<typeof import('../../srv/submission/background-jobs')>()).JobAdmissionBusyError,
+    IdempotencyConflictError: (await importOriginal<typeof import('../../srv/submission/background-jobs')>()).IdempotencyConflictError,
+    WorkflowReconciliationRequiredError: (await importOriginal<typeof import('../../srv/submission/background-jobs')>()).WorkflowReconciliationRequiredError,
+    withLockContentionRetry: (await importOriginal<typeof import('../../srv/submission/background-jobs')>()).withLockContentionRetry,
     startJob: (...args: unknown[]) => (mockStartJob as any)(...args),
     runChildCommand: async (args: any) => {
         const processor = registeredProcessors.get(`${args.kind}\0${args.commandVersion}`);
@@ -828,6 +831,16 @@ describe('anchorDocument', () => {
         expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/contractAddress/));
     });
 
+    test('an agent-output envelope records its producedAt in the job request', async () => {
+        const { srv } = setupHandlersWithDb({ submitterFactory: () => makeSuccessfulSubmitter() });
+        await srv.handlers['anchorDocument'](makeReq({
+            ...VALID_ANCHOR_ARGS(),
+            contentType: 'application/vnd.nightgate.agent-output.v1+json',
+            metadata: JSON.stringify({ v: 1, producedAt: '2026-09-26T08:00:00.000Z' })
+        }));
+        expect(mockStartJob.mock.calls.at(-1)![0].request).toMatchObject({ producedAt: '2026-09-26T08:00:00.000Z' });
+    });
+
     test('one plain attest with Uint8Array args; the session attester id is recorded and returned', async () => {
         const submitter = makeSuccessfulSubmitter();
         const { srv, db } = setupHandlersWithDb({ submitterFactory: () => submitter });
@@ -841,6 +854,7 @@ describe('anchorDocument', () => {
         expect(started.kind).toBe('anchorDocument');
         expect(started.command).toMatchObject({ op: 'anchorDocument', attesterId: ATTESTER_ID, payloadHash: VALID_SHA256 });
         expect(started.request).toMatchObject({ attesterId: ATTESTER_ID });
+        expect(started.request).not.toHaveProperty('producedAt');
 
         // INSERT (sync) + attesterId UPDATE (sync) + anchoredTxHash UPDATE (executor) = 3 db.run calls.
         expect(db.run).toHaveBeenCalledTimes(3);

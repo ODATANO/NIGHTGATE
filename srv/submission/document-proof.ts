@@ -11,6 +11,7 @@ import { RateLimiter } from '../utils/rate-limiter';
 import { getContractRegistration, slotWidthOf, importRegisteredArtifact } from './contract-registry';
 import { blake2b256Hex, fromHex32, emptyLeafKeyHex } from './hashing';
 import { buildMembershipSet, membershipPathFor, canonicalSetDigests } from './set-root';
+import { BackgroundJobs } from '#cds-models/midnight';
 
 export { blake2b256Hex } from './hashing';
 
@@ -344,13 +345,40 @@ export class PureCircuitsUnavailableError extends Error {
 
 // ---- Handlers -------------------------------------------------------------
 
+export const AGENT_OUTPUT_CONTENT_TYPE = 'application/vnd.nightgate.agent-output.v1+json';
+
+/** `producedAt` of an agent-output envelope, recorded in the anchor job's request. */
+export function agentOutputProducedAt(contentType: string | undefined, metadata: string): string | null {
+    if (contentType !== AGENT_OUTPUT_CONTENT_TYPE) return null;
+    try {
+        const producedAt = JSON.parse(metadata)?.producedAt;
+        return typeof producedAt === 'string' ? producedAt : null;
+    } catch { return null; }
+}
+
+async function recordedProducedAt(sessionId: string, idempotencyKey: string, userId: string | undefined): Promise<string | null> {
+    const job: any = await cds.db.run(
+        SELECT.one.from(BackgroundJobs).columns('request')
+            .where({ sessionId, kind: 'anchorDocument', idempotencyKey, requestedBy: userId ?? null })
+            .orderBy('createdAt desc')
+    );
+    if (!job?.request) return null;
+    try {
+        const producedAt = JSON.parse(job.request)?.producedAt;
+        return typeof producedAt === 'string' ? producedAt : null;
+    } catch { return null; }
+}
+
 export interface DocumentProofHandlerDeps {
     /** Test seam; defaults to the registry-backed artifact import. */
     loadPure?: (compiledRef: string) => Promise<PureCircuits>;
+    /** Test seam; defaults to the `producedAt` recorded by the anchor job under the same key. */
+    findProducedAt?: (sessionId: string, idempotencyKey: string, userId: string | undefined) => Promise<string | null>;
 }
 
 export function registerDocumentProofHandlers(srv: any, deps: DocumentProofHandlerDeps = {}): void {
     const loadPure = deps.loadPure ?? loadPureCircuitsFromRegistry;
+    const findProducedAt = deps.findProducedAt ?? recordedProducedAt;
 
     srv.on('prepareDocumentProof', async (req: Request) => {
         const clientKey = (req as any)?._?.req?.ip || 'global';
@@ -528,11 +556,16 @@ export function registerDocumentProofHandlers(srv: any, deps: DocumentProofHandl
         if (data.modelId && data.modelId.length > 200) return req.reject(400, 'modelId must be at most 200 characters');
         if (!data.sessionId) return req.reject(400, 'sessionId is required');
         if (!data.contractAddress) return req.reject(400, 'contractAddress is required');
-        let producedAt = new Date().toISOString();
+        let producedAt: string;
         if (data.producedAt) {
             const t = new Date(data.producedAt);
             if (Number.isNaN(t.getTime())) return req.reject(400, 'producedAt must be a valid ISO-8601 timestamp');
             producedAt = t.toISOString();
+        } else {
+            // A retry under the same key re-derives the first call's envelope.
+            producedAt = (data.idempotencyKey
+                ? await findProducedAt(data.sessionId, data.idempotencyKey, (req as any).user?.id)
+                : null) ?? new Date().toISOString();
         }
 
         // Hashes only; agentId/modelId are public. Verifiers re-hash the canonical form.
@@ -554,7 +587,7 @@ export function registerDocumentProofHandlers(srv: any, deps: DocumentProofHandl
                 event: 'anchorDocument',
                 data: {
                     sha256: payloadHash,
-                    contentType: 'application/vnd.nightgate.agent-output.v1+json',
+                    contentType: AGENT_OUTPUT_CONTENT_TYPE,
                     storageRef: data.storageRef?.length ? data.storageRef : `agent-output://${data.agentId}`,
                     metadata: envelopeJson,
                     sessionId: data.sessionId,

@@ -210,7 +210,7 @@ export async function rewrapStoredCiphertexts(db: Db, opts: RewrapOptions = {}):
                 if (version === 3 && keyId === ring.activeId) continue;
                 let plain: string;
                 try {
-                    plain = decrypt(value, ring, binding);
+                    plain = decrypt(value, ring, binding, { allowUnbound: true });
                 } catch (err) {
                     if (err instanceof UnknownEncryptionKeyError) throw err;
                     // Never overwrite an unreadable value.
@@ -273,7 +273,7 @@ async function migrateLegacyRows(db: Db, ring: KeyRing, dryRun: boolean, report:
         if (!s.encryptedViewingKey) continue;
         let viewingKey: string;
         try {
-            viewingKey = decrypt(s.encryptedViewingKey, ring, walletSessionViewingKeyBinding(s.sessionId));
+            viewingKey = decrypt(s.encryptedViewingKey, ring, walletSessionViewingKeyBinding(s.sessionId), { allowUnbound: true });
         } catch (err) {
             if (err instanceof UnknownEncryptionKeyError) throw err;
             report.syncState.sessionsUnreadable++;

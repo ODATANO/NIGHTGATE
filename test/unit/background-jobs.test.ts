@@ -1216,7 +1216,10 @@ describe('startJob: idempotency', () => {
         await expect(startJob({
             kind: 'sendNight', sessionId: 'sess-1', idempotencyKey: 'idem-drift',
             request: { amount: '2' }, work: async () => ({ ok: true })
-        })).rejects.toThrow(/different request payload/);
+        })).rejects.toMatchObject({
+            name: 'IdempotencyConflictError', status: 409, code: 'IDEMPOTENCY_KEY_CONFLICT',
+            message: expect.stringMatching(/different request payload/)
+        });
     });
 
     test('deduplicates generated resource IDs using a stable semantic payload', async () => {
@@ -1326,6 +1329,54 @@ describe('startJob: idempotency', () => {
 });
 
 // ---- Concurrency / semaphore ----------------------------------------------
+
+describe('startJob: concurrency classes', () => {
+    test('heavy kinds share one cap of 4 across kinds', async () => {
+        const releaseGates: Array<() => void> = [];
+        const inFlight = { count: 0, peak: 0 };
+        const makeWork = () => vi.fn(async () => {
+            inFlight.count++;
+            inFlight.peak = Math.max(inFlight.peak, inFlight.count);
+            await new Promise<void>(r => releaseGates.push(r));
+            inFlight.count--;
+        });
+        for (const kind of ['deployContract', 'submitContractCall', 'anchorDocument', 'sendNight', 'grantDisclosure', 'fieldEqualityProof']) {
+            await startJob({ kind, sessionId: `sess-${kind}`, request: {}, work: makeWork() });
+        }
+        await flushSpawn();
+        expect(inFlight.count).toBe(4);
+        expect(inFlight.peak).toBe(4);
+        releaseGates.splice(0).forEach(r => r());
+        await flushSpawn();
+        expect(inFlight.count).toBe(2);
+        releaseGates.splice(0).forEach(r => r());
+        await flushSpawn();
+    });
+
+    test('workflow parents holding every parent slot leave the heavy cap free for their children', async () => {
+        const parentGates: Array<() => void> = [];
+        const childGates: Array<() => void> = [];
+        let parentsRunning = 0;
+        let childrenRunning = 0;
+        for (let i = 0; i < 4; i++) {
+            await startJob({
+                kind: 'issueFieldEqualityAttestation', sessionId: `p-${i}`, request: {},
+                work: vi.fn(async () => { parentsRunning++; await new Promise<void>(r => parentGates.push(r)); })
+            });
+        }
+        for (let i = 0; i < 4; i++) {
+            await startJob({
+                kind: 'fieldEqualityProof', sessionId: `c-${i}`, request: {},
+                work: vi.fn(async () => { childrenRunning++; await new Promise<void>(r => childGates.push(r)); })
+            });
+        }
+        await flushSpawn();
+        expect(parentsRunning).toBe(4);
+        expect(childrenRunning).toBe(4);
+        [...parentGates, ...childGates].forEach(r => r());
+        await flushSpawn();
+    });
+});
 
 describe('startJob: per-kind semaphore', () => {
     test('heavy kind: jobs beyond the cap of 4 are queued, not run in parallel', async () => {

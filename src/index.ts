@@ -369,7 +369,7 @@ export async function initialize(): Promise<NightgateIndexerStatus> {
             lastError = err instanceof Error ? err.message : String(err);
             mode = 'offline';
             if (isLikelyNodeConnectionError(lastError)) {
-                log.warn(`Node not reachable at ${crawlerNodeUrl}: ${lastError}`);
+                log.warn(`Node not reachable at ${redactUrlCredentials(crawlerNodeUrl)}: ${lastError}`);
                 logStartupState('offline', 'node unreachable');
                 log.info('Running in offline mode. Start a Midnight node: docker compose -f docker/docker-compose.yml up -d');
             } else {

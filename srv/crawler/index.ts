@@ -22,8 +22,12 @@ let activeNodeProvider: MidnightNodeProvider | null = null;
  */
 export async function startCrawler(config: CrawlerConfig & { nodeUrl: string; requestTimeout?: number }): Promise<void> {
     if (activeCrawler) {
-        log.warn('Already running');
-        return;
+        if (activeCrawler.isActive()) {
+            log.warn('Already running');
+            return;
+        }
+        // Ended by a permanent ingest failure: release it before starting afresh.
+        await stopCrawler();
     }
 
     // Installed with the crawler, because the crawler is what introduces the
@@ -70,9 +74,7 @@ export async function stopCrawler(): Promise<void> {
     log.info('Stopped');
 }
 
-/**
- * True when the crawler lifecycle wrapper currently has an active crawler instance.
- */
+/** True while a crawler instance is ingesting; false after a stop or a permanent ingest failure. */
 export function isCrawlerRunning(): boolean {
-    return activeCrawler !== null;
+    return activeCrawler !== null && activeCrawler.isActive();
 }

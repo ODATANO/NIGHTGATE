@@ -8,7 +8,7 @@
 
 import crypto from 'node:crypto';
 import cds from '@sap/cds';
-import { encrypt, decrypt, inspectCiphertext, KeyRing, UnknownEncryptionKeyError } from '../utils/crypto';
+import { encrypt, decrypt, inspectCiphertext, KeyRing, UnknownEncryptionKeyError, UnboundEnvelopeError } from '../utils/crypto';
 import { accountDekBinding, accountDekViewingKeySealBinding } from '../utils/envelope-bindings';
 
 const { SELECT, INSERT, UPDATE } = cds.ql;
@@ -181,13 +181,16 @@ export async function resolveAccountDek(args: ResolveAccountDekArgs): Promise<Bu
         }
         return Buffer.from(cached.dek);   // callers get a copy; the cache zeroes its own on eviction
     }
-    // Concurrent first saves of one wallet must share one key.
-    const pending = inflight.get(accountId);
-    if (pending) return pending.promise;
-    const token = Symbol(accountId);
-    const promise = resolveUncached(args, token).finally(() => { if (inflight.get(accountId)?.token === token) inflight.delete(accountId); });
-    inflight.set(accountId, { promise, token });
-    return promise;
+    // Concurrent first saves of one wallet must share one key, each in its own buffer:
+    // a caller zeroes its copy after use.
+    let pending = inflight.get(accountId);
+    if (!pending) {
+        const token = Symbol(accountId);
+        const promise = resolveUncached(args, token).finally(() => { if (inflight.get(accountId)?.token === token) inflight.delete(accountId); });
+        pending = { promise, token };
+        inflight.set(accountId, pending);
+    }
+    return pending.promise.then(dek => (dek ? Buffer.from(dek) : dek));
 }
 
 async function resolveUncached(args: ResolveAccountDekArgs, token: symbol): Promise<Buffer | null> {
@@ -201,6 +204,7 @@ async function resolveUncached(args: ResolveAccountDekArgs, token: symbol): Prom
         try {
             dek = unwrapDek(row.wrappedDek, ring, accountId);
         } catch (err) {
+            if (err instanceof UnboundEnvelopeError) throw err;
             ringError = err;
         }
         let vkOpens: boolean | undefined;
@@ -211,6 +215,7 @@ async function resolveUncached(args: ResolveAccountDekArgs, token: symbol): Prom
                 vkOpens = !dek || viaVk.equals(dek);
                 dek ??= viaVk;
             } catch (err) {
+                if (err instanceof UnboundEnvelopeError) throw err;
                 // The seal's own ring key missing is not a wrong viewing key.
                 if (err instanceof UnknownEncryptionKeyError) vkUnknownKey = err;
                 else vkOpens = false;

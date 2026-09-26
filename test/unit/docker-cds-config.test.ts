@@ -18,12 +18,12 @@ function run(env: Record<string, string>) {
 }
 
 describe('docker/cds-config.mjs', () => {
-    it('SQLite by default: file path, busy timeout, basic auth with the admin role', () => {
+    it('SQLite by default: file path, busy timeout, basic auth without a role', () => {
         const r = run({ NIGHTGATE_HTTP_PASSWORD: 'pw' });
         expect(r.code).toBe(0);
         const cfg = JSON.parse(r.out);
         expect(cfg.requires.db).toEqual({ kind: 'sqlite', credentials: { url: '/data/nightgate.db' }, client: { timeout: 30000 } });
-        expect(cfg.requires.auth).toEqual({ kind: 'basic', impl: '@odatano/cap-auth', realm: 'nightgate', users: { nightgate: { password: 'pw', roles: ['admin'] } } });
+        expect(cfg.requires.auth).toEqual({ kind: 'basic', impl: '@odatano/cap-auth', realm: 'nightgate', users: { nightgate: { password: 'pw', roles: [] } } });
     });
 
     it('masks the agent token header in the JSON request log (CAP prints every header otherwise)', () => {

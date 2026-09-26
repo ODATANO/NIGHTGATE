@@ -96,6 +96,23 @@ describe('encryption key rewrap', () => {
         expect(residentAccountDekCount()).toBe(0);
     });
 
+    test('concurrent resolutions of one account each get their own buffer: zeroing one leaves the others intact', async () => {
+        const ring = NEW_ONLY;
+        const vk = 'ef'.repeat(32);
+        const accountId = deriveAccountId(vk);
+        clearAllAccountDeks();
+        await resolveAccountDek({ db, ring, accountId, storagePassword: deriveStoragePassword(vk) });
+        clearAllAccountDeks();
+        const [a, b, c] = await Promise.all([1, 2, 3].map(() =>
+            resolveAccountDek({ db, ring, accountId, storagePassword: deriveStoragePassword(vk), create: false })));
+        const key = Buffer.from(a!);
+        a!.fill(0);
+        expect(b!.equals(key)).toBe(true);
+        expect(c!.equals(key)).toBe(true);
+        expect(b).not.toBe(c);
+        clearAllAccountDeks();
+    });
+
     beforeEach(async () => {
         __resetKeyRingForTests();
         __resetDbHandleForTests();
@@ -436,7 +453,7 @@ describe('encryption key rewrap', () => {
         const pass = deriveStoragePassword(vk);
         const dek = nodeCrypto.randomBytes(32);
         await db.run(INSERT.into('midnight.AccountKeys').entries({
-            accountId, wrappedDek: encrypt(dek.toString('hex'), BOTH),
+            accountId, wrappedDek: encrypt(dek.toString('hex'), BOTH, accountDekBinding(accountId)),
             wrappedDekByViewingKey: sealDekByStoragePassword(dek, pass), createdAt: new Date().toISOString()
         }));
         // The preflight ignores the bare seal (it names no ring key).

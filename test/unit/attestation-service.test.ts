@@ -24,6 +24,9 @@
  * behaviourally against real seeded Attestations rows, mirroring the column
  * lists declared in AttestationService.cds.
  */
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import cds from '@sap/cds';
 import { registerAttestationServiceHandlers, toPredicateEnvelope } from '../../src/sdk/AttestationService';
 
@@ -388,5 +391,24 @@ describe('toPredicateEnvelope', () => {
         expect(env.claim.threshold).toBe('7');
         expect(env.claim.unit).toBeNull();
         expect(env.proof.proofValue).toBe('');
+    });
+});
+
+describe('AttestationService.cds: authentication on every tier', () => {
+    it('every tier requires an authenticated user, and a host projection inherits it', async () => {
+        const sdk = path.join(__dirname, '../../src/sdk/AttestationService.cds').split(path.sep).join('/');
+        const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ng-att-'));
+        const host = path.join(dir, 'host.cds');
+        fs.writeFileSync(host, `using AttestationService from '${sdk}'; service HostAtt { entity Authority as projection on AttestationService.Authority; }`);
+        let csn: any;
+        try {
+            csn = await cds.load(host);
+        } finally {
+            fs.rmSync(dir, { recursive: true, force: true });
+        }
+        for (const tier of ['Public', 'Disclosed', 'Authority']) {
+            expect(csn.definitions[`AttestationService.${tier}`]['@requires'], tier).toBe('authenticated-user');
+        }
+        expect(csn.definitions['HostAtt.Authority']['@requires']).toBe('authenticated-user');
     });
 });

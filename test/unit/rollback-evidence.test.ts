@@ -157,4 +157,29 @@ describe('rollbackIndexedDataFromHeight: submission evidence', () => {
         const result = await db.tx((tx: any) => rollbackIndexedDataFromHeight(tx, 10, { syncStatus: 'stopped' }));
         expect(result).toMatchObject({ blocksRolledBack: 0, submissionsReverted: 0, jobsReverted: 0 });
     });
+
+    it('rolls back more blocks and transactions than one IN list holds', async () => {
+        const count = 5_003; // more than one 5000-id chunk
+        const blocks = Array.from({ length: count }, (_, i) => ({
+            ID: cds.utils.uuid(), hash: `0xb${i}`, height: 10 + i, protocolVersion: 1, timestamp: 1_700_000_000 + i, stateRoot: '0xabcd'
+        }));
+        const txs = blocks.map((b, i) => ({
+            ID: cds.utils.uuid(), transactionId: 0, hash: `0xt${i}`, protocolVersion: 1, transactionType: 'Regular', block_ID: b.ID
+        }));
+        await db.run(cds.ql.INSERT.into(BLOCKS).entries(blocks));
+        await db.run(cds.ql.INSERT.into(TRANSACTIONS).entries(txs));
+        const survivor = await seedTransaction(await seedBlock(9, '0x9'), '0xkeep');
+        const utxo = { owner: 'addr', tokenType: '00', value: '1', outputIndex: 0, initialNonce: '00' };
+        // Created below the fork, spent in the last chunk: survives unspent.
+        await db.run(cds.ql.INSERT.into('midnight.UnshieldedUtxos').entries({
+            ID: 'u-keep', ...utxo, intentHash: 'aa', createdAtTransaction_ID: survivor, spentAtTransaction_ID: txs[count - 1].ID
+        }));
+
+        const result = await db.tx((tx: any) => rollbackIndexedDataFromHeight(tx, 10, { syncStatus: 'stopped' }));
+
+        expect(result).toMatchObject({ blocksRolledBack: count, transactionsRolledBack: count });
+        expect(await db.run(cds.ql.SELECT.from(BLOCKS))).toHaveLength(1);
+        expect(await db.run(cds.ql.SELECT.from(TRANSACTIONS))).toHaveLength(1);
+        expect((await db.run(cds.ql.SELECT.one.from('midnight.UnshieldedUtxos').where({ ID: 'u-keep' }))).spentAtTransaction_ID).toBeNull();
+    });
 });

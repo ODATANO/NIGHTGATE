@@ -168,16 +168,22 @@ describe('System.Events outcome decoding', () => {
             ])
         };
 
-        const outcomes = (processor as any).decodeExtrinsicOutcomes('0xevents', registry);
-        expect([...outcomes.entries()]).toEqual([[0, 'SUCCESS'], [2, 'FAILURE']]);
-        expect(outcomes.has(1)).toBe(false);
+        const events: Map<number, any> = (processor as any).decodeBlockEvents('0xevents', registry, 'block', 3);
+        expect([...events.entries()].filter(([, e]) => e.outcome).map(([i, e]) => [i, e.outcome])).toEqual([[0, 'SUCCESS'], [2, 'FAILURE']]);
+        expect(events.get(1)?.outcome).toBeUndefined();
     });
 
-    test('returns no outcomes when storage or metadata decoding is unavailable', () => {
+    test('refuses a block with extrinsics whose events are missing or undecodable', () => {
         const processor = new BlockProcessor({} as any);
-        expect((processor as any).decodeExtrinsicOutcomes(null, {})).toEqual(new Map());
+        expect((processor as any).decodeBlockEvents(null, {}, 'block 7', 0)).toBeNull();
+        let err: Error | undefined;
+        try { (processor as any).decodeBlockEvents(null, {}, 'block 7', 2); } catch (e) { err = e as Error; }
+        expect(err?.message).toMatch(/No System.Events for block 7/);
+        expect(isTransientError(err!)).toBe(true);
         const broken = { createType: () => { throw new Error('bad metadata'); } };
-        expect((processor as any).decodeExtrinsicOutcomes('0xbad', broken)).toEqual(new Map());
+        try { (processor as any).decodeBlockEvents('0xbad', broken, 'block 8', 1); err = undefined; } catch (e) { err = e as Error; }
+        expect(err?.message).toMatch(/do not decode: bad metadata/);
+        expect(isTransientError(err!)).toBe(false);
     });
 });
 

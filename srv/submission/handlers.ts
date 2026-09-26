@@ -43,7 +43,7 @@ import {
     deriveRawTokenType, TokenTypeError,
     SHIELDED_TEST_TOKEN_REF, SHIELDED_TEST_TOKEN_CIRCUIT, SHIELDED_TEST_TOKEN_AMOUNT
 } from './token-type';
-import { startJob, JobAdmissionBusyError, runChildCommand, registerBackgroundJobProcessor, registerBackgroundJobReconciliationFinalizer, withLockContentionRetry, SponsorAttemptBookkeepingPendingError, type BackgroundJobRow, type ReconciliationEvidence } from './background-jobs';
+import { startJob, JobAdmissionBusyError, IdempotencyConflictError, runChildCommand, registerBackgroundJobProcessor, registerBackgroundJobReconciliationFinalizer, withLockContentionRetry, SponsorAttemptBookkeepingPendingError, WorkflowReconciliationRequiredError, type BackgroundJobRow, type ReconciliationEvidence } from './background-jobs';
 import { reportSubmissionRejectedOn, reportBroadcastOn } from './job-execution-context';
 import { declaredJobKindTraits } from './job-kinds';
 import { reindexDisclosuresForContract } from './disclosure-indexer';
@@ -62,7 +62,7 @@ import {
     type PredicateKind
 } from './verify-state';
 import { readPredicateStateForContract, expandAllowedMask, computeRecordKey } from './predicate-state';
-import { blake2b256Hex, loadPureCircuitsFromRegistry, PureCircuitsUnavailableError } from './document-proof';
+import { blake2b256Hex, loadPureCircuitsFromRegistry, PureCircuitsUnavailableError, agentOutputProducedAt } from './document-proof';
 import { membershipPathFor, SET_DEPTH } from './set-root';
 import { deriveGranteeId } from './grantee-identity';
 import { getConfiguredGranteeBinding, isSelfServiceGranteeRegistrationAllowed } from '../utils/nightgate-config';
@@ -80,6 +80,20 @@ import { recordDeployedContracts, reserveDeployBudget, releaseDeployBudget, curr
  * The sponsor policy resolved when the job RUNS, so a revoke or narrowed floor
  * applies to queued jobs. Revoked grant: permanent failure; unreadable policy file: retryable.
  */
+/**
+ * Records a workflow step that is on chain. A write that still fails parks the parent for
+ * reconciliation: the re-run reuses the landed child and repeats only this write.
+ */
+export async function recordProven(parentJobId: string, txHash: string, write: () => Promise<unknown>): Promise<void> {
+    try {
+        await withLockContentionRetry(`recordProven(${parentJobId})`, write);
+    } catch (err) {
+        throw new WorkflowReconciliationRequiredError(
+            `Workflow step of job ${parentJobId} is on chain (${txHash}) but recording it failed: ${(err as Error)?.message ?? err}`
+        );
+    }
+}
+
 async function liveSponsorPolicyForJob(db: any, command: { grantId?: string | null }): Promise<SponsorPolicy> {
     try {
         const grant = command.grantId ? await currentGrantPolicy(db, command.grantId) : null;
@@ -438,7 +452,7 @@ export function registerSubmissionHandlers(
                 }
             });
             const provenAt = new Date().toISOString();
-            await db.run(UPDATE.entity(PredicateAttestations).set({ provenTxHash: proof.txHash, provenAt, modifiedAt: provenAt }).where({ ID: command.predicateAttestationId }));
+            await recordProven(job.ID, proof.txHash, () => db.run(UPDATE.entity(PredicateAttestations).set({ provenTxHash: proof.txHash, provenAt, modifiedAt: provenAt }).where({ ID: command.predicateAttestationId })));
             return {
                 predicateAttestationId: command.predicateAttestationId, payloadHash: command.payloadHash, fieldKey: command.fieldKey,
                 claim: { predicate: command.predicate, threshold: command.threshold, unit: command.unit ?? null },
@@ -466,7 +480,7 @@ export function registerSubmissionHandlers(
                 }
             });
             const provenAt = new Date().toISOString();
-            await db.run(UPDATE.entity(PredicateAttestations).set({ provenTxHash: proof.txHash, provenAt, modifiedAt: provenAt }).where({ ID: command.predicateAttestationId }));
+            await recordProven(job.ID, proof.txHash, () => db.run(UPDATE.entity(PredicateAttestations).set({ provenTxHash: proof.txHash, provenAt, modifiedAt: provenAt }).where({ ID: command.predicateAttestationId })));
             return {
                 predicateAttestationId: command.predicateAttestationId, payloadHash: command.payloadHash, fieldKey: command.fieldKey,
                 claim: { predicate: 'bytesEquality', expectedDigest: command.expectedDigest },
@@ -498,7 +512,7 @@ export function registerSubmissionHandlers(
                 }
             });
             const provenAt = new Date().toISOString();
-            await db.run(UPDATE.entity(PredicateAttestations).set({ provenTxHash: proof.txHash, provenAt, modifiedAt: provenAt }).where({ ID: command.predicateAttestationId }));
+            await recordProven(job.ID, proof.txHash, () => db.run(UPDATE.entity(PredicateAttestations).set({ provenTxHash: proof.txHash, provenAt, modifiedAt: provenAt }).where({ ID: command.predicateAttestationId })));
             return {
                 predicateAttestationId: command.predicateAttestationId, payloadHash: command.payloadHash, fieldKey: command.fieldKey,
                 claim: { predicate: 'setMembership', setRoot: command.setRoot },
@@ -549,7 +563,7 @@ export function registerSubmissionHandlers(
                     }
                 });
             const provenAt = new Date().toISOString();
-            await db.run(UPDATE.entity(PredicateAttestations).set({ provenTxHash: proof.txHash, provenAt, modifiedAt: provenAt }).where({ ID: command.predicateAttestationId }));
+            await recordProven(job.ID, proof.txHash, () => db.run(UPDATE.entity(PredicateAttestations).set({ provenTxHash: proof.txHash, provenAt, modifiedAt: provenAt }).where({ ID: command.predicateAttestationId })));
             return {
                 predicateAttestationId: command.predicateAttestationId,
                 payloadHashA: command.payloadHashA, payloadHashB: command.payloadHashB,
@@ -615,9 +629,9 @@ export function registerSubmissionHandlers(
             });
             // One statement: the tx is on chain, a partial projection must be impossible.
             const provenAtBatch = new Date().toISOString();
-            await db.run(UPDATE.entity(PredicateAttestations)
+            await recordProven(job.ID, proof.txHash, () => db.run(UPDATE.entity(PredicateAttestations)
                 .set({ provenTxHash: proof.txHash, provenAt: provenAtBatch, modifiedAt: provenAtBatch })
-                .where({ ID: { in: command.claims.map(c => c.predicateAttestationId) } }));
+                .where({ ID: { in: command.claims.map(c => c.predicateAttestationId) } })));
             return {
                 payloadHash: command.payloadHash,
                 claims: command.claims.map(c => ({
@@ -1107,7 +1121,7 @@ export function registerSubmissionHandlers(
                         // Generic pool-Invalid: one rebuild only (it may be the caller's tx).
                         const budget = verdict.generic ? Math.min(1, dustRetries) : dustRetries;
                         if (attempt < budget) {
-                            cds.log('nightgate').warn(`unbound sponsor ${sessionId.slice(0, 8)} hit a dust race (1010/170|196 or pool Invalid), rebuild-retry ${attempt + 1}/${budget}: ${String((e as Error).message).slice(-120)}`);
+                            cds.log('nightgate').warn(`unbound sponsor ${sessionId.slice(0, 8)} hit a dust race (1010/170|171|196 or pool Invalid), rebuild-retry ${attempt + 1}/${budget}: ${String((e as Error).message).slice(-120)}`);
                             await new Promise(resolve => setTimeout(resolve, dustBackoffMs));
                             continue; // rebuild the dust spend fresh on the SAME sponsor
                         }
@@ -1738,7 +1752,7 @@ export function registerSubmissionHandlers(
         if (!checkRate(anchorRateLimiter, data.sessionId, req)) return;
 
         const metadataHashBytes = sha256(new TextEncoder().encode(metadataStr));
-
+        const producedAt = agentOutputProducedAt(data.contentType, metadataStr);
 
         // Row first, so the document id is stable before the job runs.
         const documentId = cds.utils.uuid();
@@ -1785,7 +1799,8 @@ export function registerSubmissionHandlers(
                     contractAddress: data.contractAddress,
                     compiledRef,
                     documentId,
-                    feeSponsor: sponsor?.sponsorSessionId ?? null
+                    feeSponsor: sponsor?.sponsorSessionId ?? null,
+                    ...(producedAt ? { producedAt } : {})
                 },
                 idempotencyPayload: {
                     sha256: data.sha256!.toLowerCase(), contractAddress: data.contractAddress,
@@ -3765,6 +3780,9 @@ async function runSubmission(req: Request, op: () => Promise<unknown>): Promise<
         if (err instanceof WalletMaterialUnavailable) {
             // No signing material: the caller must run connectWalletForSigning first.
             return req.reject(501, err.message);
+        }
+        if (err instanceof IdempotencyConflictError) {
+            return req.reject({ status: err.httpStatus, code: err.code, message: err.message } as any);
         }
         if (err instanceof JobAdmissionBusyError) {
             // Busy, nothing written. An object keeps code and `$sanitize: false`; a

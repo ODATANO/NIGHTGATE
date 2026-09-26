@@ -68,12 +68,12 @@ fi
 
 AUTH_KIND="${NIGHTGATE_AUTH:-basic}"
 if [ "$AUTH_KIND" = "dummy" ]; then
-    echo "WARN: NIGHTGATE_AUTH=dummy serves UNAUTHENTICATED. Local testing only." >&2
+    echo "WARN: NIGHTGATE_AUTH=dummy serves UNAUTHENTICATED. Refused unless NIGHTGATE_ALLOW_UNAUTHENTICATED=true; local testing only." >&2
 fi
 # Custom transport auth (0.17.1): basic as before, PLUS requests carrying
 # x-agent-token pass for /api/v1/nightgate only, where the agent-grant hook
 # does the real authentication. The single configured user IS the operator of
-# this deployment and carries the admin role (NIGHTGATE_HTTP_ROLES overrides).
+# this deployment; it holds the roles in NIGHTGATE_HTTP_ROLES (none by default).
 # cds-config.mjs refuses a missing password / unknown auth kind / non-postgres URL.
 CDS_CONFIG="$(node /app/docker/cds-config.mjs)" || exit 1
 export CDS_CONFIG

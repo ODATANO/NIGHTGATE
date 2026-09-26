@@ -32,19 +32,21 @@ import {
 } from '../../srv/submission/fee-sponsor';
 import { deriveAccountId, deriveStoragePassword } from '../../srv/submission/wallet-material-factory';
 import { encrypt } from '../../srv/utils/crypto';
+import { walletSessionSeedBinding, walletSessionViewingKeyBinding } from '../../srv/utils/envelope-bindings';
 
 const TEST_KEY = crypto.createHash('sha256').update('fee-sponsor-test-key').digest();
 const VIEWING_KEY = 'ab'.repeat(32);
 const SEED_HEX = 'cd'.repeat(64);
 
 function sponsorRow(overrides: Record<string, any> = {}) {
+    const sessionId = overrides.sessionId ?? 'sponsor-session-1';
     return {
         ID: 'row-uuid',
-        sessionId: 'sponsor-session-1',
+        sessionId,
         userId: 'platform-operator',
         isActive: true,
-        encryptedViewingKey: encrypt(VIEWING_KEY, TEST_KEY),
-        encryptedSeedKey: encrypt(SEED_HEX, TEST_KEY),
+        encryptedViewingKey: encrypt(VIEWING_KEY, TEST_KEY, walletSessionViewingKeyBinding(sessionId)),
+        encryptedSeedKey: encrypt(SEED_HEX, TEST_KEY, walletSessionSeedBinding(sessionId)),
         expiresAt: new Date(Date.now() + 60_000).toISOString(),
         ...overrides
     };
@@ -171,8 +173,8 @@ describe('resolveFeeSponsor', () => {
         const otherKey = crypto.createHash('sha256').update('other').digest();
         const db = makeDb(sponsorRow({
             userId: 'alice',
-            encryptedViewingKey: encrypt(VIEWING_KEY, otherKey),
-            encryptedSeedKey: encrypt(SEED_HEX, otherKey)
+            encryptedViewingKey: encrypt(VIEWING_KEY, otherKey, walletSessionViewingKeyBinding('sponsor-session-1')),
+            encryptedSeedKey: encrypt(SEED_HEX, otherKey, walletSessionSeedBinding('sponsor-session-1'))
         }));
         await expect(resolveFeeSponsor({
             db,

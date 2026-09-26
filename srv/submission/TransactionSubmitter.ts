@@ -495,6 +495,7 @@ export class TransactionSubmitter {
         const provider = new CapDbPrivateStateProvider({
             accountId: this.deps.walletMaterial.accountId,
             privateStoragePasswordProvider: this.deps.walletMaterial.privateStoragePasswordProvider,
+            privateStoragePasswordFallbacks: this.deps.walletMaterial.privateStoragePasswordFallbacks,
             db
         });
         const proxyId = cds.utils.uuid();

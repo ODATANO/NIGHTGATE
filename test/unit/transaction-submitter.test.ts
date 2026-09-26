@@ -299,6 +299,15 @@ describe('TransactionSubmitter.deploy', () => {
         expect(unregisterPrivateStateProvider.mock.calls[0][0]).toBe(sentArgs.proxyId);
     });
 
+    test('hands the legacy private-state passwords to the proxied provider', async () => {
+        const fallbacks = () => ['legacy-password-of-sufficient-length'];
+        walletDeployContract.mockResolvedValueOnce({ txHash: '0xfeed', contractAddress: '0xC2', onChainStatus: 'SucceedEntirely' });
+        const { submitter } = newSubmitter({ walletMaterial: { ...wallet, privateStoragePasswordFallbacks: fallbacks } });
+        await submitter.deploy({ contractName: 'counter', registration: REGISTRATION, initialPrivateState: { value: 0 }, sessionId: 'session-1' });
+        const provider: any = registerPrivateStateProvider.mock.calls[0][1];
+        expect(provider.config.privateStoragePasswordFallbacks).toBe(fallbacks);
+    });
+
     test('marks row failed and throws SubmissionError on worker error', async () => {
         walletDeployContract.mockRejectedValueOnce(new Error('Substrate error 1014: invalid transaction'));
         const { submitter, db } = newSubmitter();
@@ -640,6 +649,10 @@ describe('classifySubmissionError', () => {
     test('1010/196 is the same transient dust race; other 1010 codes stay terminal', () => {
         expect(classifySubmissionError(new Error('1010: Invalid Transaction: Custom error: 196'), 'preprod'))
             .toMatchObject({ code: '1010/196', retryable: true, transient: 'dust-race' });
+        // OutOfDustValidityWindow: the spend's ctime is ahead of a lagging node; a rebuild takes a fresh ctime.
+        expect(classifySubmissionError(new Error('1010: Invalid Transaction: Custom error: 171'), 'preprod'))
+            .toMatchObject({ code: '1010/171', retryable: true, transient: 'dust-race' });
+        expect(dustRaceLedgerCode(new Error('rejected as 1010/171 after classification'))).toBe('1010/171');
         for (const n of ['117', '138', '182', '188', '192']) {
             const c = classifySubmissionError(new Error(`1010: Invalid Transaction: Custom error: ${n}`), 'preprod');
             expect(c, n).toMatchObject({ code: `1010/${n}`, retryable: false });

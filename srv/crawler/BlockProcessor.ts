@@ -971,9 +971,8 @@ export class BlockProcessor {
     }
 
     /**
-     * Per-extrinsic events of one block. `null` means no event data at all
-     * (pruned storage or no metadata registry), which the persist path tells
-     * apart from a block whose extrinsics simply emitted nothing.
+     * Per-extrinsic events of one block. A block with extrinsics but no readable events is
+     * never persisted: its UTXO rows and balance deltas would be missing for good.
      */
     private decodeBlockEvents(
         rawEvents: string | null | undefined,
@@ -982,31 +981,15 @@ export class BlockProcessor {
         extrinsicCount: number = 0
     ): Map<number, ExtrinsicEvents> | null {
         if (!rawEvents || !registry) {
-            if (extrinsicCount > 0) {
-                log.warn(`${where || 'block'}: transaction outcomes unknown (${!rawEvents ? 'System.Events storage empty (pruned or racing node)' : 'no runtime metadata registry'}); ${extrinsicCount} extrinsic(s) get no TransactionResults row`);
-            }
-            return null;
+            if (extrinsicCount === 0) return null;
+            if (!rawEvents) throw new Error(`No System.Events for ${where || 'block'} with ${extrinsicCount} extrinsic(s) (pruned or racing node)`);
+            throw new Error(`No runtime metadata registry to decode System.Events for ${where || 'block'}`);
         }
         try {
             return readBlockEvents(registry.createType('Vec<EventRecord>', rawEvents) as any);
         } catch (err) {
-            log.warn(`Failed to decode System.Events; transaction outcomes remain unknown: ${(err as Error).message}`);
-            return null;
+            throw new Error(`System.Events of ${where || 'block'} do not decode: ${(err as Error).message}`);
         }
-    }
-
-    /** Outcome per extrinsic from System.ExtrinsicSuccess/ExtrinsicFailed only; a failure wins. */
-    private decodeExtrinsicOutcomes(
-        rawEvents: string | null | undefined,
-        registry: TypeRegistry | undefined,
-        where: string = '',
-        extrinsicCount: number = 0
-    ): Map<number, 'SUCCESS' | 'FAILURE'> {
-        const outcomes = new Map<number, 'SUCCESS' | 'FAILURE'>();
-        for (const [index, events] of this.decodeBlockEvents(rawEvents, registry, where, extrinsicCount) ?? []) {
-            if (events.outcome) outcomes.set(index, events.outcome);
-        }
-        return outcomes;
     }
 
     private specVersionFromBatch(rv: { specVersion?: unknown } | null | undefined, where: string): number {

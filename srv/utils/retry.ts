@@ -11,7 +11,8 @@ const TRANSIENT_PATTERNS = [
   'no block at height',  // a lagging replica behind a load balancer answers null for a finalized height
   'no timestamp for',  // Timestamp storage empty and no inherent: pruned or racing node
   'no runtime metadata for',  // state_getMetadata answered null: pruned or racing node
-  'no runtime version for'  // state_getRuntimeVersion failed or answered null: the block is not decoded under another runtime's map
+  'no runtime version for',  // state_getRuntimeVersion failed or answered null: the block is not decoded under another runtime's map
+  'no system.events for'  // System.Events storage empty for a block with extrinsics: pruned or racing node
 ];
 
 /**

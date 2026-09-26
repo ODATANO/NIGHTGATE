@@ -19,10 +19,12 @@ services:
     # pulls this and only builds locally when the image is unavailable.
     # NIGHTGATE_IMAGE_TAG overrides; keep the default in lockstep with
     # package.json on every release.
-    image: ghcr.io/odatano/nightgate:${NIGHTGATE_IMAGE_TAG:-0.25.10}
+    image: ghcr.io/odatano/nightgate:${NIGHTGATE_IMAGE_TAG:-0.26.0}
     container_name: odatano-nightgate
+    # Loopback only by default: basic auth is plain text without TLS, so put a
+    # TLS reverse proxy in front. NIGHTGATE_BIND_ADDRESS=0.0.0.0 publishes it.
     ports:
-      - "4004:4004"
+      - "${NIGHTGATE_BIND_ADDRESS:-127.0.0.1}:4004:4004"
     environment:
       # Required: encrypts wallet viewing/seed keys at rest (openssl rand -hex 32).
       # Not a compose `:?` variable: compose would demand it even for
@@ -52,9 +54,9 @@ services:
       # 5 min). Raise it with the proof server's job TTL below for proofs
       # past 5 min; the SDK re-requests a timed-out proof up to three times.
       NIGHTGATE_PROOF_TIMEOUT_MS: "${NIGHTGATE_PROOF_TIMEOUT_MS:-}"
-      # Roles for the single basic-auth operator. Defaults to admin, which the
-      # admin service (session invalidation, job queue) requires.
-      NIGHTGATE_HTTP_ROLES: "${NIGHTGATE_HTTP_ROLES:-admin}"
+      # Roles for the single basic-auth operator, none by default. `admin`
+      # opens the admin service (signing-key export, session invalidation, job queue).
+      NIGHTGATE_HTTP_ROLES: "${NIGHTGATE_HTTP_ROLES:-}"
     volumes:
       - nightgate-data:/data
     restart: unless-stopped

@@ -143,6 +143,7 @@ vi.mock('../../srv/submission/background-jobs', () => ({
 
 import cds from '@sap/cds';
 import { encrypt, getEncryptionKey } from '../../srv/utils/crypto';
+import { walletSessionSeedBinding, walletSessionViewingKeyBinding } from '../../srv/utils/envelope-bindings';
 import { RateLimiter } from '../../srv/utils/rate-limiter';
 import { __resetWalletRateLimitersForTests, registerWalletSessionHandlers, startSessionCleanup, closeSessionsFromPreviousProcess } from '../../srv/sessions/wallet-sessions';
 
@@ -152,8 +153,8 @@ async function runPersistedCommand(args: any): Promise<unknown> {
     const encKey = getEncryptionKey();
     mockDbRun.mockResolvedValueOnce({
         ID: 'row-command', sessionId: args.sessionId, isActive: true,
-        encryptedViewingKey: encrypt('a'.repeat(64), encKey),
-        encryptedSeedKey: encrypt('a'.repeat(128), encKey),
+        encryptedViewingKey: encrypt('a'.repeat(64), encKey, walletSessionViewingKeyBinding(args.sessionId)),
+        encryptedSeedKey: encrypt('a'.repeat(128), encKey, walletSessionSeedBinding(args.sessionId)),
         expiresAt: new Date(Date.now() + 60_000).toISOString()
     });
     return processor(args.command, {
@@ -261,15 +262,16 @@ describe('wallet session handlers', () => {
     });
 
     /** Build an active session row whose encrypted fields decrypt back to known values. */
-    function activeSessionRow(opts: { withSeed?: boolean; expiresInMs?: number } = {}) {
+    function activeSessionRow(opts: { withSeed?: boolean; expiresInMs?: number; sessionId?: string } = {}) {
         const encKey = getEncryptionKey();
         const future = opts.expiresInMs ?? 60_000;
+        const sessionId = opts.sessionId ?? 'sess-1';
         return {
             ID: 'row-1',
-            sessionId: 'sess-1',
+            sessionId,
             isActive: true,
-            encryptedViewingKey: encrypt('a'.repeat(64), encKey),
-            encryptedSeedKey: opts.withSeed === false ? null : encrypt('b'.repeat(128), encKey),
+            encryptedViewingKey: encrypt('a'.repeat(64), encKey, walletSessionViewingKeyBinding(sessionId)),
+            encryptedSeedKey: opts.withSeed === false ? null : encrypt('b'.repeat(128), encKey, walletSessionSeedBinding(sessionId)),
             expiresAt: new Date(Date.now() + future).toISOString()
         };
     }
@@ -535,7 +537,7 @@ describe('wallet session handlers', () => {
         const encKey = getEncryptionKey();
         const db = {
             run: vi.fn()
-                .mockResolvedValueOnce([{ sessionId: 'old-1', viewingKeyHash: 'hash-a', encryptedViewingKey: encrypt('a'.repeat(64), encKey), userId: 'owner-1' }])
+                .mockResolvedValueOnce([{ sessionId: 'old-1', viewingKeyHash: 'hash-a', encryptedViewingKey: encrypt('a'.repeat(64), encKey, walletSessionViewingKeyBinding('old-1')), userId: 'owner-1' }])
                 .mockResolvedValueOnce(1)                          // deactivate UPDATE (runs FIRST)
                 .mockResolvedValueOnce([{ sessionId: 'live-1' }]) // guard: live sibling remains
         };
@@ -556,7 +558,7 @@ describe('wallet session handlers', () => {
             return {} as ReturnType<typeof setInterval>;
         }) as any);
         const encKey = getEncryptionKey();
-        const row = (id: string, hash: string) => ({ sessionId: id, viewingKeyHash: hash, encryptedViewingKey: encrypt('a'.repeat(64), encKey), userId: 'owner-1' });
+        const row = (id: string, hash: string) => ({ sessionId: id, viewingKeyHash: hash, encryptedViewingKey: encrypt('a'.repeat(64), encKey, walletSessionViewingKeyBinding(id)), userId: 'owner-1' });
         process.env.NIGHTGATE_FEE_SPONSOR_SESSION = 'pool-sponsor-1';
         const db = {
             run: vi.fn()
@@ -593,7 +595,7 @@ describe('wallet session handlers', () => {
         const longAgo = new Date(Date.now() - 86_400_000).toISOString();
         const db = {
             run: vi.fn()
-                .mockResolvedValueOnce([{ sessionId: 'caller-9', viewingKeyHash: 'hash-shared', encryptedViewingKey: encrypt('a'.repeat(64), encKey), userId: 'owner-9' }])
+                .mockResolvedValueOnce([{ sessionId: 'caller-9', viewingKeyHash: 'hash-shared', encryptedViewingKey: encrypt('a'.repeat(64), encKey, walletSessionViewingKeyBinding('caller-9')), userId: 'owner-9' }])
                 .mockResolvedValueOnce(1)
                 // The guard reads active rows WITH their expiry and judges
                 // them itself: the sponsor row is long past its TTL and still counts.
@@ -616,7 +618,7 @@ describe('wallet session handlers', () => {
             return {} as ReturnType<typeof setInterval>;
         }) as any);
         const encKey = getEncryptionKey();
-        const expiringRow = (id: string) => ({ sessionId: id, viewingKeyHash: 'hash-a', encryptedViewingKey: encrypt('a'.repeat(64), encKey), userId: 'owner-1' });
+        const expiringRow = (id: string) => ({ sessionId: id, viewingKeyHash: 'hash-a', encryptedViewingKey: encrypt('a'.repeat(64), encKey, walletSessionViewingKeyBinding(id)), userId: 'owner-1' });
         const db = {
             run: vi.fn()
                 .mockResolvedValueOnce([expiringRow('old-1'), expiringRow('old-2')])
@@ -644,7 +646,7 @@ describe('wallet session handlers', () => {
         const encKey = getEncryptionKey();
         const db = {
             run: vi.fn()
-                .mockResolvedValueOnce([{ sessionId: 'old-legacy', encryptedViewingKey: encrypt('a'.repeat(64), encKey) }])
+                .mockResolvedValueOnce([{ sessionId: 'old-legacy', encryptedViewingKey: encrypt('a'.repeat(64), encKey, walletSessionViewingKeyBinding('old-legacy')) }])
                 .mockResolvedValueOnce(1)   // deactivate UPDATE
         };
         try {
@@ -1405,7 +1407,7 @@ describe('wallet session handlers', () => {
             // exempt where they act as infrastructure); an ordinary read must
             // not answer 410 for a wallet that pays for everyone's transactions.
             process.env.NIGHTGATE_FEE_SPONSOR_SESSION = SPONSOR_SESSION;
-            mockDbRun.mockResolvedValueOnce({ ...activeSessionRow({ expiresInMs: -60_000 }), sessionId: SPONSOR_SESSION });
+            mockDbRun.mockResolvedValueOnce(activeSessionRow({ expiresInMs: -60_000, sessionId: SPONSOR_SESSION }));
             mockGetWalletBalance.mockResolvedValueOnce({ dustBalance: '42', registeredNightUtxoCount: 1 });
 
             const req = createMockRequest({ sessionId: SPONSOR_SESSION });
@@ -1427,7 +1429,7 @@ describe('wallet session handlers', () => {
 
         it('applies the same rule to sendNight, so one path cannot disagree with another', async () => {
             process.env.NIGHTGATE_FEE_SPONSOR_SESSION = SPONSOR_SESSION;
-            mockDbRun.mockResolvedValueOnce({ ...activeSessionRow({ expiresInMs: -60_000 }), sessionId: SPONSOR_SESSION });
+            mockDbRun.mockResolvedValueOnce(activeSessionRow({ expiresInMs: -60_000, sessionId: SPONSOR_SESSION }));
 
             const req = createMockRequest({
                 sessionId: SPONSOR_SESSION,
@@ -1471,7 +1473,7 @@ describe('wallet session handlers', () => {
 
         it('reports backings as the parallel sponsoring capacity', async () => {
             process.env.NIGHTGATE_FEE_SPONSOR_SESSION = SPONSOR;
-            const row = { ...activeSessionRow(), sessionId: SPONSOR, userId: 'someone-else' };
+            const row = { ...activeSessionRow({ sessionId: SPONSOR }), userId: 'someone-else' };
             mockDbRun.mockResolvedValueOnce(row);   // visibility lookup
             mockDbRun.mockResolvedValueOnce(row);   // loadSigningSessionAccountId
             mockGetWalletBalance.mockResolvedValueOnce({
@@ -1495,7 +1497,7 @@ describe('wallet session handlers', () => {
 
         it('is not usable with backings but no dust', async () => {
             process.env.NIGHTGATE_FEE_SPONSOR_SESSION = SPONSOR;
-            const row = { ...activeSessionRow(), sessionId: SPONSOR };
+            const row = activeSessionRow({ sessionId: SPONSOR });
             mockDbRun.mockResolvedValueOnce(row).mockResolvedValueOnce(row);
             mockGetWalletBalance.mockResolvedValueOnce({ dustBalance: '0', registeredNightUtxoCount: 2 });
 
@@ -1511,7 +1513,7 @@ describe('wallet session handlers', () => {
             // delegated pool as flat, and a sponsor funded purely by donors as
             // unusable.
             process.env.NIGHTGATE_FEE_SPONSOR_SESSION = SPONSOR;
-            const row = { ...activeSessionRow(), sessionId: SPONSOR };
+            const row = activeSessionRow({ sessionId: SPONSOR });
             mockDbRun.mockResolvedValueOnce(row).mockResolvedValueOnce(row);
             mockGetWalletBalance.mockResolvedValueOnce({
                 dustBalance: '6510232317207628087',
@@ -1530,7 +1532,7 @@ describe('wallet session handlers', () => {
             // pending. Reading it as capacity would promise more parallel
             // sponsorships than the wallet can serve.
             process.env.NIGHTGATE_FEE_SPONSOR_SESSION = SPONSOR;
-            const row = { ...activeSessionRow(), sessionId: SPONSOR };
+            const row = activeSessionRow({ sessionId: SPONSOR });
             mockDbRun.mockResolvedValueOnce(row).mockResolvedValueOnce(row);
             mockGetWalletBalance.mockResolvedValueOnce({
                 dustBalance: '5000', registeredNightUtxoCount: 4,
@@ -1545,7 +1547,7 @@ describe('wallet session handlers', () => {
             // The worker reports `dustAvailableCount` where the SDK exposes an
             // available list; trust it rather than re-deriving the arithmetic.
             process.env.NIGHTGATE_FEE_SPONSOR_SESSION = SPONSOR;
-            const row = { ...activeSessionRow(), sessionId: SPONSOR };
+            const row = activeSessionRow({ sessionId: SPONSOR });
             mockDbRun.mockResolvedValueOnce(row).mockResolvedValueOnce(row);
             mockGetWalletBalance.mockResolvedValueOnce({
                 dustBalance: '5000', registeredNightUtxoCount: 4,
@@ -1558,7 +1560,7 @@ describe('wallet session handlers', () => {
 
         it('a wallet whose notes are ALL pending is not usable', async () => {
             process.env.NIGHTGATE_FEE_SPONSOR_SESSION = SPONSOR;
-            const row = { ...activeSessionRow(), sessionId: SPONSOR };
+            const row = activeSessionRow({ sessionId: SPONSOR });
             mockDbRun.mockResolvedValueOnce(row).mockResolvedValueOnce(row);
             mockGetWalletBalance.mockResolvedValueOnce({
                 dustBalance: '5000', registeredNightUtxoCount: 4,
@@ -1571,7 +1573,7 @@ describe('wallet session handlers', () => {
 
         it('hides the exact balance from a caller who is neither admin nor owner, keeping the flags', async () => {
             process.env.NIGHTGATE_FEE_SPONSOR_SESSION = SPONSOR;
-            const row = { ...activeSessionRow(), sessionId: SPONSOR, userId: 'someone-else' };
+            const row = { ...activeSessionRow({ sessionId: SPONSOR }), userId: 'someone-else' };
             mockDbRun.mockResolvedValueOnce(row).mockResolvedValueOnce(row);
             mockGetWalletBalance.mockResolvedValueOnce({
                 dustBalance: '5000',
@@ -1587,7 +1589,7 @@ describe('wallet session handlers', () => {
 
         it('shows the exact balance to the session owner', async () => {
             process.env.NIGHTGATE_FEE_SPONSOR_SESSION = SPONSOR;
-            const row = { ...activeSessionRow(), sessionId: SPONSOR, userId: TEST_USER_ID };
+            const row = { ...activeSessionRow({ sessionId: SPONSOR }), userId: TEST_USER_ID };
             mockDbRun.mockResolvedValueOnce(row).mockResolvedValueOnce(row);
             mockGetWalletBalance.mockResolvedValueOnce({ dustBalance: '5000', registeredNightUtxoCount: 1 });
 
@@ -1600,7 +1602,7 @@ describe('wallet session handlers', () => {
             // expire while it is configured; the cleanup sweep exempts it for
             // the same reason.
             process.env.NIGHTGATE_FEE_SPONSOR_SESSION = SPONSOR;
-            const expired = { ...activeSessionRow({ expiresInMs: -60_000 }), sessionId: SPONSOR };
+            const expired = activeSessionRow({ expiresInMs: -60_000, sessionId: SPONSOR });
             mockDbRun.mockResolvedValueOnce(expired).mockResolvedValueOnce(expired);
             mockGetWalletBalance.mockResolvedValueOnce({ dustBalance: '900', registeredNightUtxoCount: 3, dustUtxoCount: 3 });
 
@@ -1621,7 +1623,7 @@ describe('wallet session handlers', () => {
 
         it('names a sponsor that cannot sign, which looks configured and is not', async () => {
             process.env.NIGHTGATE_FEE_SPONSOR_SESSION = SPONSOR;
-            mockDbRun.mockResolvedValueOnce({ ...activeSessionRow({ withSeed: false }), sessionId: SPONSOR });
+            mockDbRun.mockResolvedValueOnce(activeSessionRow({ withSeed: false, sessionId: SPONSOR }));
 
             const result: any = await registeredHandlers['getSponsorPoolStatus'](adminRequest());
             expect(result[0].usable).toBe(false);
@@ -1633,7 +1635,7 @@ describe('wallet session handlers', () => {
             // progress-watch tick. Its balance is readable; whether it passes the
             // sync gate is not known yet, and a sponsored job would wait on it.
             process.env.NIGHTGATE_FEE_SPONSOR_SESSION = SPONSOR;
-            const row = { ...activeSessionRow(), sessionId: SPONSOR };
+            const row = activeSessionRow({ sessionId: SPONSOR });
             mockDbRun.mockResolvedValueOnce(row).mockResolvedValueOnce(row);
             mockWalletGetSyncProgress.mockReturnValue(null);
             mockHasWalletFacade.mockReturnValue(true);
@@ -1649,7 +1651,7 @@ describe('wallet session handlers', () => {
             // gate a sponsored job waits on: a sponsor 22 events behind fails
             // every job while its balance reads fine.
             process.env.NIGHTGATE_FEE_SPONSOR_SESSION = SPONSOR;
-            const row = { ...activeSessionRow(), sessionId: SPONSOR };
+            const row = activeSessionRow({ sessionId: SPONSOR });
             mockDbRun.mockResolvedValueOnce(row).mockResolvedValueOnce(row);
             mockWalletGetSyncProgress.mockReturnValue({
                 caughtUp: false, appliedIndex: '1520690', streamTip: '1520712', behindEvents: '22',
@@ -1665,7 +1667,7 @@ describe('wallet session handlers', () => {
 
         it('shows the last pushed dust figures, marked stale, when the worker does not answer', async () => {
             process.env.NIGHTGATE_FEE_SPONSOR_SESSION = SPONSOR;
-            const row = { ...activeSessionRow(), sessionId: SPONSOR, userId: 'someone-else' };
+            const row = { ...activeSessionRow({ sessionId: SPONSOR }), userId: 'someone-else' };
             mockDbRun.mockResolvedValueOnce(row).mockResolvedValueOnce(row);
             const at = new Date(Date.now() - 300_000).toISOString();
             mockWalletGetSyncProgress.mockReturnValue({
@@ -1686,7 +1688,7 @@ describe('wallet session handlers', () => {
 
         it('shows the stale balance amount to an admin only', async () => {
             process.env.NIGHTGATE_FEE_SPONSOR_SESSION = SPONSOR;
-            const row = { ...activeSessionRow(), sessionId: SPONSOR, userId: 'someone-else' };
+            const row = { ...activeSessionRow({ sessionId: SPONSOR }), userId: 'someone-else' };
             mockDbRun.mockResolvedValueOnce(row).mockResolvedValueOnce(row);
             mockWalletGetSyncProgress.mockReturnValue({
                 caughtUp: true, updatedAt: new Date().toISOString(),
@@ -1700,7 +1702,7 @@ describe('wallet session handlers', () => {
 
         it('stays an empty row when the worker never pushed dust figures', async () => {
             process.env.NIGHTGATE_FEE_SPONSOR_SESSION = SPONSOR;
-            const row = { ...activeSessionRow(), sessionId: SPONSOR };
+            const row = activeSessionRow({ sessionId: SPONSOR });
             mockDbRun.mockResolvedValueOnce(row).mockResolvedValueOnce(row);
             mockGetWalletBalance.mockRejectedValueOnce(new Error('timed out'));
 
@@ -1710,7 +1712,7 @@ describe('wallet session handlers', () => {
 
         it('marks a live read as fresh with its read time', async () => {
             process.env.NIGHTGATE_FEE_SPONSOR_SESSION = SPONSOR;
-            const row = { ...activeSessionRow(), sessionId: SPONSOR };
+            const row = activeSessionRow({ sessionId: SPONSOR });
             mockDbRun.mockResolvedValueOnce(row).mockResolvedValueOnce(row);
             mockGetWalletBalance.mockResolvedValueOnce({ dustBalance: '900', registeredNightUtxoCount: 3, dustUtxoCount: 3 });
 
@@ -1722,7 +1724,7 @@ describe('wallet session handlers', () => {
 
         it('does not trust a gate verdict nobody refreshes any more', async () => {
             process.env.NIGHTGATE_FEE_SPONSOR_SESSION = SPONSOR;
-            const row = { ...activeSessionRow(), sessionId: SPONSOR };
+            const row = activeSessionRow({ sessionId: SPONSOR });
             mockDbRun.mockResolvedValueOnce(row).mockResolvedValueOnce(row);
             mockWalletGetSyncProgress.mockReturnValue({ caughtUp: true, updatedAt: new Date(Date.now() - 3_600_000).toISOString() });
             mockGetWalletBalance.mockResolvedValueOnce({ dustBalance: '900', registeredNightUtxoCount: 3, dustUtxoCount: 3 });
@@ -1737,7 +1739,7 @@ describe('wallet session handlers', () => {
             // capped request, so polling a freshly booted server would pile up
             // worker RPCs. The progress cache decides instead.
             process.env.NIGHTGATE_FEE_SPONSOR_SESSION = SPONSOR;
-            const row = { ...activeSessionRow(), sessionId: SPONSOR };
+            const row = activeSessionRow({ sessionId: SPONSOR });
             mockDbRun.mockResolvedValueOnce(row).mockResolvedValueOnce(row);
             mockWalletGetSyncProgress.mockReturnValue(null);
 
@@ -1754,7 +1756,7 @@ describe('wallet session handlers', () => {
             process.env.NIGHTGATE_FEE_SPONSOR_SESSION = SPONSOR;
             process.env.NIGHTGATE_SPONSOR_STATUS_TIMEOUT_MS = '80';
             try {
-                const row = { ...activeSessionRow(), sessionId: SPONSOR };
+                const row = activeSessionRow({ sessionId: SPONSOR });
                 mockDbRun.mockResolvedValueOnce(row).mockResolvedValueOnce(row);
                 mockGetWalletBalance.mockImplementationOnce(() => new Promise(() => { /* never settles */ }));
 
@@ -1770,8 +1772,8 @@ describe('wallet session handlers', () => {
 
         it('keeps reporting the rest of the pool when one sponsor is unreadable', async () => {
             process.env.NIGHTGATE_FEE_SPONSOR_SESSION = `${SPONSOR},sponsor-session-2`;
-            const first = { ...activeSessionRow(), sessionId: SPONSOR };
-            const second = { ...activeSessionRow(), sessionId: 'sponsor-session-2' };
+            const first = activeSessionRow({ sessionId: SPONSOR });
+            const second = activeSessionRow({ sessionId: 'sponsor-session-2' });
             mockDbRun
                 .mockResolvedValueOnce(first).mockResolvedValueOnce(first)
                 .mockResolvedValueOnce(second).mockResolvedValueOnce(second);
@@ -1787,7 +1789,7 @@ describe('wallet session handlers', () => {
 
         it('looks a platform sponsor up WITHOUT the owner constraint', async () => {
             process.env.NIGHTGATE_FEE_SPONSOR_SESSION = SPONSOR;
-            const row = { ...activeSessionRow(), sessionId: SPONSOR, userId: 'someone-else' };
+            const row = { ...activeSessionRow({ sessionId: SPONSOR }), userId: 'someone-else' };
             mockDbRun.mockResolvedValueOnce(row).mockResolvedValueOnce(row);
             mockGetWalletBalance.mockResolvedValueOnce({ dustBalance: '1', registeredNightUtxoCount: 1 });
 

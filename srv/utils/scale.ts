@@ -29,7 +29,7 @@ export function decodeCompactBigInt(buf: Buffer, offset: number): [bigint, numbe
 
         case 0b10:
             if (offset + 3 >= buf.length) return null;
-            return [BigInt(buf.readUInt32LE(offset) >> 2), 4];
+            return [BigInt(buf.readUInt32LE(offset) >>> 2), 4];
 
         case 0b11: {
             // Big-integer mode: (first_byte >> 2) + 4 bytes, little-endian

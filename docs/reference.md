@@ -77,7 +77,7 @@ Configure the plugin under `cds.requires.nightgate`. Environment variables overr
 | `contracts` | `{}` | `<ref>` → `{ artifactPath, privateStateId, zkConfigPath, slotWidth? }`, loaded at startup. `slotWidth` 16 (default) or 32 sizes masks, k bounds and inclusion paths of a vault-family artifact |
 | `sessionTtlMs` | `86400000` (24 h) | Wallet session lifetime |
 | `closeSessionsOnRestart` | `true` | Close the previous process's wallet sessions at startup (`feeSponsorSessions` exempt); `false` keeps them |
-| `jobs.concurrency.heavy` | `4` | Concurrent jobs per proof-generating kind (deploy, call, send, attestations); 4 saturates one proof server |
+| `jobs.concurrency.heavy` | `4` | Concurrent proof-generating jobs (deploy, call, send, attestations), all kinds together; 4 saturates one proof server. Workflow parents (the `issue*` attestations) have a separate cap of the same size, so a parent never holds a slot its children need |
 | `jobs.concurrency.light` | `16` | Concurrent jobs per remaining kind |
 | `jobs.concurrency.serial` | `1` | Concurrent `connectWalletForSigning` jobs; catch-up shares one worker thread, so serialized wallets become usable one by one instead of all late |
 | `runtimeMode` | `single-instance` | Other modes fail closed |
@@ -127,6 +127,8 @@ are clamped with a warning; booleans: `true`/`false`, `1`/`0`, `yes`/`no`,
 | `NIGHTGATE_CLOSE_SESSIONS_ON_RESTART` | bool |  | Override `closeSessionsOnRestart` (default on): `false` keeps the previous process's wallet sessions open across a restart |
 | `NIGHTGATE_INSTANCE_ID` | string |  | Stable operator-provided instance identifier; otherwise CF instance GUID, hostname, or a generated UUID |
 | `NIGHTGATE_REPLICA_COUNT` | int (min 1) |  | Actual process/replica count. Must be `1`; takes precedence over CDS `replicaCount` |
+| `NIGHTGATE_ACCEPT_UNBOUND_ENVELOPES` | bool | `false` | `true` still reads v1/v2 ciphertexts in columns bound to a purpose and a row (v3); only until `nightgate-rewrap-keys` rewrote them |
+| `NIGHTGATE_ALLOW_UNAUTHENTICATED` | bool | `false` | `true` permits `auth.kind: dummy` in production (every request unauthenticated and privileged); local testing only |
 | `NIGHTGATE_ALLOW_PRODUCTION_SQLITE` | bool | `false` | `true` temporarily permits production SQLite with a high-severity warning; intended only for a migration window |
 | `NIGHTGATE_ASSUME_DB_NETWORK` | string |  | Confirms which network an index without a recorded network id belongs to; the boot guard refuses to bind such an index to the configured network otherwise. |
 | `NIGHTGATE_DEBUG_WALLET_SYNC` | bool | `false` | `true` logs wallet sync-state persistence at debug level |
@@ -150,7 +152,7 @@ are clamped with a warning; booleans: `true`/`false`, `1`/`0`, `yes`/`no`,
 | `NIGHTGATE_ARTIFACT_SNAPSHOT_DIR` | path |  | Base directory of the immutable content-addressed artifact snapshots the worker proves from; default `<tmpdir>/nightgate-artifact-snapshots`, layout `<base>/<install>/<digest>`. Read in the wallet worker. |
 | `NIGHTGATE_ARTIFACT_SNAPSHOT_TTL_DAYS` | int (min 0) | `14` | Snapshots no live process holds are swept after this many days; default 14. Read in the wallet worker. |
 | `NIGHTGATE_ARTIFACT_DIGEST_MAX_AGE_MS` | ms (min 0) | `300000` | How long the memoised current artifact digest (`getRuntimeInfo`, job resolves) may be trusted before the files are re-hashed regardless of their stat fingerprint. |
-| `NIGHTGATE_DUST_RACE_RETRIES` | int (min 0) | `2` | Rebuild-retries of a bound deploy/call/batch on a transient dust race (`1010/170`, `1010/196`, pre-mempool, fee unspent); default `2`. Each retry re-proves the call, hence smaller than the sponsor path's `NIGHTGATE_SPONSOR_DUST_RETRIES`. `0` disables. |
+| `NIGHTGATE_DUST_RACE_RETRIES` | int (min 0) | `2` | Rebuild-retries of a bound deploy/call/batch on a transient dust race (`1010/170`, `1010/171`, `1010/196`, pre-mempool, fee unspent); default `2`. Each retry re-proves the call, hence smaller than the sponsor path's `NIGHTGATE_SPONSOR_DUST_RETRIES`. `0` disables. |
 | `NIGHTGATE_DUST_RACE_BACKOFF_MS` | ms (min 0) | `5000` | Pause before such a rebuild, letting the dust wallet apply the spend it lost against; default `5000`. |
 | `NIGHTGATE_STALE_TRANSCRIPT_RETRIES` | int (min 0) | `2` | Rebuild-retries of a bound deploy/call/batch the node refused against the current contract state (`1010/104`, pre-mempool, fee unspent; typically the gas budget after another transaction on the same contract grew a map); default `2`. Each retry re-runs and re-proves the call against current state. |
 | `NIGHTGATE_STALE_TRANSCRIPT_BACKOFF_MS` | ms (min 0) | `15000` | Pause before such a rebuild, so the indexer serves the state that includes the competing transaction; default `15000`. |

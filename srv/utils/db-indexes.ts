@@ -18,10 +18,14 @@ export interface IndexSpec {
     columns: string[];
     /** PostgreSQL column list when it differs (SQLite accepts no NULLS placement in an index). */
     postgres?: string;
+    unique?: boolean;
+    /** An older index on the same columns, dropped once this one exists. */
+    replaces?: string;
 }
 
 export const NIGHTGATE_INDEXES: readonly IndexSpec[] = [
-    { name: 'ng_blocks_height', table: 'midnight_Blocks', columns: ['height'] },
+    // One block per height: the crawler indexes finalized blocks only, so a second row is a bug.
+    { name: 'ng_blocks_height_unique', table: 'midnight_Blocks', columns: ['height'], unique: true, replaces: 'ng_blocks_height' },
     // Newest-first reads (`$orderby=createdAt desc`, byType, history): createdAt is nullable, so the
     // renderer keeps DESC NULLS LAST and only an index in that order serves it (ASC NULLS FIRST reads it backwards).
     { name: 'ng_blocks_createdat_desc', table: 'midnight_Blocks', columns: ['createdAt DESC'], postgres: 'createdAt DESC NULLS LAST' },
@@ -44,6 +48,7 @@ export const NIGHTGATE_INDEXES: readonly IndexSpec[] = [
     { name: 'ng_contractactions_tx', table: 'midnight_ContractActions', columns: ['transaction_ID'] },
     { name: 'ng_unshieldedutxos_owner', table: 'midnight_UnshieldedUtxos', columns: ['owner'] },
     { name: 'ng_unshieldedutxos_spent', table: 'midnight_UnshieldedUtxos', columns: ['spentAtTransaction_ID'] },
+    { name: 'ng_unshieldedutxos_created', table: 'midnight_UnshieldedUtxos', columns: ['createdAtTransaction_ID'] },
     { name: 'ng_pendingsubmissions_txhash', table: 'midnight_PendingSubmissions', columns: ['txHash'] },
     { name: 'ng_backgroundjobs_status', table: 'midnight_BackgroundJobs', columns: ['status', 'kind'] },
     { name: 'ng_backgroundjobs_parent', table: 'midnight_BackgroundJobs', columns: ['parentJobId'] },
@@ -53,13 +58,13 @@ export const NIGHTGATE_INDEXES: readonly IndexSpec[] = [
 /** The DDL for one index; the SQLite spelling unless `kind` is PostgreSQL and the spec carries one. */
 export function indexStatement(spec: IndexSpec, kind?: string): string {
     const columns = spec.postgres && kind && /postgres/i.test(kind) ? spec.postgres : spec.columns.join(', ');
-    return `CREATE INDEX IF NOT EXISTS ${spec.name} ON ${spec.table} (${columns})`;
+    return `CREATE ${spec.unique ? 'UNIQUE ' : ''}INDEX IF NOT EXISTS ${spec.name} ON ${spec.table} (${columns})`;
 }
 
 /**
  * Create every missing index. `kind` is the CAP db kind; HANA is skipped.
- * A single failing statement is logged and skipped (an index is a speed-up,
- * never a correctness requirement), the rest still apply.
+ * A single failing statement is logged and skipped, the rest still apply; a
+ * unique index that existing duplicates refuse leaves the index it replaces in place.
  */
 export async function ensureIndexes(
     db: { run: (q: unknown) => Promise<unknown> },
@@ -73,7 +78,16 @@ export async function ensureIndexes(
             await db.run(indexStatement(spec, kind));
             created++;
         } catch (err) {
-            warn(`index ${spec.name} on ${spec.table} not created: ${String((err as Error)?.message ?? err)}`);
+            warn(`index ${spec.name} on ${spec.table} not created: ${String((err as Error)?.message ?? err)}` +
+                (spec.unique ? ` (duplicate ${spec.columns.join(', ')} values in ${spec.table}?)` : ''));
+            continue;
+        }
+        if (spec.replaces) {
+            try {
+                await db.run(`DROP INDEX IF EXISTS ${spec.replaces}`);
+            } catch (err) {
+                warn(`index ${spec.replaces} not dropped: ${String((err as Error)?.message ?? err)}`);
+            }
         }
     }
     return created;

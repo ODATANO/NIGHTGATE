@@ -11,7 +11,7 @@
 
 import crypto from 'crypto';
 import { openDekByViewingKey, privateStatePasswordFromDek, clearAllAccountDeks } from '../../srv/submission/account-keys';
-import { accountDekBinding } from '../../srv/utils/envelope-bindings';
+import { accountDekBinding, walletSessionSeedBinding, walletSessionViewingKeyBinding } from '../../srv/utils/envelope-bindings';
 
 // Mock loadLedgerV8, ledger-v8 is ESM-only and cannot be loaded from this
 // unit suite (repo rule: never the real SDK). Tests verify wiring/shape; real crypto derivation is
@@ -93,7 +93,7 @@ function makeDbWithSession(row: Record<string, any> | null) {
 const TEST_KEY = crypto.createHash('sha256').update('test-encryption-key').digest();
 
 function buildEncryptedSession(viewingKey: string, overrides: Record<string, any> = {}) {
-    const enc = encrypt(viewingKey, TEST_KEY);
+    const enc = encrypt(viewingKey, TEST_KEY, walletSessionViewingKeyBinding('sess-1'));
     return {
         ID: 'sess-uuid',
         sessionId: 'sess-1',
@@ -198,7 +198,7 @@ describe('buildWalletMaterialForSession', () => {
         const viewingKey = 'mn_shield-vk_ensure';
         const seedHex = 'ab'.repeat(64);
         const db = makeDbWithSession(buildEncryptedSession(viewingKey, {
-            encryptedSeedKey: encrypt(seedHex, TEST_KEY)
+            encryptedSeedKey: encrypt(seedHex, TEST_KEY, walletSessionSeedBinding('sess-1'))
         }));
         const facadeConfig = {
             networkId: 'preview' as const,
@@ -231,7 +231,7 @@ describe('buildWalletMaterialForSession', () => {
         expect(viewOnly.ensureFacade).toBeUndefined();
         // Seed present but no facadeConfig.
         const dbSeed = makeDbWithSession(buildEncryptedSession(viewingKey, {
-            encryptedSeedKey: encrypt('cd'.repeat(64), TEST_KEY)
+            encryptedSeedKey: encrypt('cd'.repeat(64), TEST_KEY, walletSessionSeedBinding('sess-1'))
         }));
         const seedNoCfg = await buildWalletMaterialForSession({
             sessionId: 'sess-1', db: dbSeed, encryptionKey: TEST_KEY
@@ -292,7 +292,7 @@ describe('buildWalletMaterialForSession', () => {
         const session = {
             sessionId: 'sess-1',
             isActive: true,
-            encryptedViewingKey: encrypt('vk-victim', otherKey),
+            encryptedViewingKey: encrypt('vk-victim', otherKey, walletSessionViewingKeyBinding('sess-1')),
             expiresAt: new Date(Date.now() + 60_000).toISOString()
         };
         const db = makeDbWithSession(session);
@@ -375,7 +375,7 @@ describe('signing-capable wallet adapter (session with encryptedSeedKey)', () =>
     const VALID_SEED = 'a'.repeat(128); // 64-byte BIP39 seed
 
     test('returns real coinPublicKey and encryptionPublicKey from derived ZswapSecretKeys', async () => {
-        const encSeed = encrypt(VALID_SEED, TEST_KEY);
+        const encSeed = encrypt(VALID_SEED, TEST_KEY, walletSessionSeedBinding('sess-1'));
         const db = makeDbWithSession(buildEncryptedSession('vk-signing', { encryptedSeedKey: encSeed }));
 
         const material = await buildWalletMaterialForSession({
@@ -394,7 +394,7 @@ describe('signing-capable wallet adapter (session with encryptedSeedKey)', () =>
     });
 
     test('derived public keys are deterministic across reconnects (same seed → same pubkeys)', async () => {
-        const encSeed = encrypt(VALID_SEED, TEST_KEY);
+        const encSeed = encrypt(VALID_SEED, TEST_KEY, walletSessionSeedBinding('sess-1'));
         const db1 = makeDbWithSession(buildEncryptedSession('vk1', { encryptedSeedKey: encSeed }));
         const db2 = makeDbWithSession(buildEncryptedSession('vk2', { encryptedSeedKey: encSeed }));
 
@@ -410,8 +410,8 @@ describe('signing-capable wallet adapter (session with encryptedSeedKey)', () =>
     test('different seeds → different public keys', async () => {
         const seedA = 'a'.repeat(128);
         const seedB = 'b'.repeat(128);
-        const dbA = makeDbWithSession(buildEncryptedSession('vk', { encryptedSeedKey: encrypt(seedA, TEST_KEY) }));
-        const dbB = makeDbWithSession(buildEncryptedSession('vk', { encryptedSeedKey: encrypt(seedB, TEST_KEY) }));
+        const dbA = makeDbWithSession(buildEncryptedSession('vk', { encryptedSeedKey: encrypt(seedA, TEST_KEY, walletSessionSeedBinding('sess-1')) }));
+        const dbB = makeDbWithSession(buildEncryptedSession('vk', { encryptedSeedKey: encrypt(seedB, TEST_KEY, walletSessionSeedBinding('sess-1')) }));
 
         const mA = await buildWalletMaterialForSession({ sessionId: 'sess-1', db: dbA, encryptionKey: TEST_KEY });
         const mB = await buildWalletMaterialForSession({ sessionId: 'sess-1', db: dbB, encryptionKey: TEST_KEY });
@@ -421,7 +421,7 @@ describe('signing-capable wallet adapter (session with encryptedSeedKey)', () =>
     });
 
     test('balanceTx still throws when no facade is configured', async () => {
-        const encSeed = encrypt(VALID_SEED, TEST_KEY);
+        const encSeed = encrypt(VALID_SEED, TEST_KEY, walletSessionSeedBinding('sess-1'));
         const db = makeDbWithSession(buildEncryptedSession('vk', { encryptedSeedKey: encSeed }));
         const material = await buildWalletMaterialForSession({
             sessionId: 'sess-1', db, encryptionKey: TEST_KEY
@@ -431,7 +431,7 @@ describe('signing-capable wallet adapter (session with encryptedSeedKey)', () =>
     });
 
     test('submitTx still throws when no facade is configured', async () => {
-        const encSeed = encrypt(VALID_SEED, TEST_KEY);
+        const encSeed = encrypt(VALID_SEED, TEST_KEY, walletSessionSeedBinding('sess-1'));
         const db = makeDbWithSession(buildEncryptedSession('vk', { encryptedSeedKey: encSeed }));
         const material = await buildWalletMaterialForSession({
             sessionId: 'sess-1', db, encryptionKey: TEST_KEY
@@ -444,7 +444,7 @@ describe('signing-capable wallet adapter (session with encryptedSeedKey)', () =>
         // Encrypted with a different key.
         const otherKey = crypto.createHash('sha256').update('other').digest();
         const db = makeDbWithSession(buildEncryptedSession('vk', {
-            encryptedSeedKey: encrypt(VALID_SEED, otherKey)
+            encryptedSeedKey: encrypt(VALID_SEED, otherKey, walletSessionSeedBinding('sess-1'))
         }));
         await expect(buildWalletMaterialForSession({
             sessionId: 'sess-1', db, encryptionKey: TEST_KEY
@@ -452,7 +452,7 @@ describe('signing-capable wallet adapter (session with encryptedSeedKey)', () =>
     });
 
     test('exposes _internal handles for a facade-backed adapter to reuse', async () => {
-        const encSeed = encrypt(VALID_SEED, TEST_KEY);
+        const encSeed = encrypt(VALID_SEED, TEST_KEY, walletSessionSeedBinding('sess-1'));
         const db = makeDbWithSession(buildEncryptedSession('vk', { encryptedSeedKey: encSeed }));
         const material = await buildWalletMaterialForSession({
             sessionId: 'sess-1', db, encryptionKey: TEST_KEY
@@ -478,7 +478,7 @@ describe('accountIndex threading', () => {
         const { deriveRoleSeeds } = await import('../../srv/utils/wallet-hd.js');
         vi.mocked(deriveRoleSeeds).mockClear();
         const db = makeDbWithSession(buildEncryptedSession('vk-acct1', {
-            encryptedSeedKey: encrypt(VALID_SEED, TEST_KEY),
+            encryptedSeedKey: encrypt(VALID_SEED, TEST_KEY, walletSessionSeedBinding('sess-1')),
             accountIndex: 1
         }));
         await buildWalletMaterialForSession({ sessionId: 'sess-1', db, encryptionKey: TEST_KEY });
@@ -489,7 +489,7 @@ describe('accountIndex threading', () => {
         const { deriveRoleSeeds } = await import('../../srv/utils/wallet-hd.js');
         vi.mocked(deriveRoleSeeds).mockClear();
         const db = makeDbWithSession(buildEncryptedSession('vk-legacy', {
-            encryptedSeedKey: encrypt(VALID_SEED, TEST_KEY)
+            encryptedSeedKey: encrypt(VALID_SEED, TEST_KEY, walletSessionSeedBinding('sess-1'))
         }));
         await buildWalletMaterialForSession({ sessionId: 'sess-1', db, encryptionKey: TEST_KEY });
         expect(vi.mocked(deriveRoleSeeds)).toHaveBeenCalledWith(expect.any(Uint8Array), 0);
@@ -500,7 +500,7 @@ describe('accountIndex threading', () => {
         vi.mocked(deriveRoleSeeds).mockClear();
         getOrBuildWalletFacadeMock.mockClear();
         const db = makeDbWithSession(buildEncryptedSession('vk-facade-acct2', {
-            encryptedSeedKey: encrypt(VALID_SEED, TEST_KEY),
+            encryptedSeedKey: encrypt(VALID_SEED, TEST_KEY, walletSessionSeedBinding('sess-1')),
             accountIndex: 2
         }));
         const material = await buildWalletMaterialForSession({

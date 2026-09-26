@@ -384,6 +384,7 @@ describe('prepareMembershipSet handler', () => {
 describe('attestAgentOutput handler', () => {
     const handlers: Record<string, Function> = {};
     const sendSpy = vi.fn();
+    const findSpy = vi.fn();
     const srv = {
         on(event: string, h: Function) { handlers[event] = h; },
         send: sendSpy
@@ -392,7 +393,7 @@ describe('attestAgentOutput handler', () => {
     beforeEach(() => {
         vi.clearAllMocks();
         Object.keys(handlers).forEach(k => delete handlers[k]);
-        registerDocumentProofHandlers(srv, { loadPure: vi.fn() });
+        registerDocumentProofHandlers(srv, { loadPure: vi.fn(), findProducedAt: findSpy });
         sendSpy.mockResolvedValue({ jobId: 'job-1', status: 'pending', documentId: 'doc-1' });
     });
 
@@ -461,6 +462,28 @@ describe('attestAgentOutput handler', () => {
         expect(new Date(envelope.producedAt).getTime()).toBeGreaterThanOrEqual(before - 1000);
         expect(envelope).not.toHaveProperty('modelId');
         expect(envelope).not.toHaveProperty('policyHash');
+    });
+
+    it('a retry under the same key without producedAt reuses the recorded one', async () => {
+        findSpy.mockResolvedValue('2026-09-26T08:00:00.000Z');
+        const req = makeReq({ ...VALID, idempotencyKey: 'k-1' });
+        const result = await handlers.attestAgentOutput(req);
+        expect(findSpy).toHaveBeenCalledWith('sess-1', 'k-1', 'user-1');
+        expect(JSON.parse(result.envelopeJson).producedAt).toBe('2026-09-26T08:00:00.000Z');
+        expect(sendSpy.mock.calls[0][0].data.idempotencyKey).toBe('k-1');
+    });
+
+    it('looks up nothing without a key or with an explicit producedAt', async () => {
+        await handlers.attestAgentOutput(makeReq(VALID));
+        await handlers.attestAgentOutput(makeReq({ ...VALID, idempotencyKey: 'k-1', producedAt: '2026-08-07T10:00:00.000Z' }));
+        expect(findSpy).not.toHaveBeenCalled();
+    });
+
+    it('a first call under a key falls back to now', async () => {
+        findSpy.mockResolvedValue(null);
+        const before = Date.now();
+        const result = await handlers.attestAgentOutput(makeReq({ ...VALID, idempotencyKey: 'k-new' }));
+        expect(new Date(JSON.parse(result.envelopeJson).producedAt).getTime()).toBeGreaterThanOrEqual(before - 1000);
     });
 
     it('maps inner anchorDocument failures onto the outer request', async () => {

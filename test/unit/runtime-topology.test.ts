@@ -7,7 +7,7 @@ import {
 
 const ENV_KEYS = [
     'CDS_MULTITENANCY', 'CF_INSTANCE_COUNT', 'CF_INSTANCE_INDEX', 'KUBERNETES_REPLICA_COUNT',
-    'NIGHTGATE_REPLICA_COUNT', 'NIGHTGATE_ALLOW_PRODUCTION_SQLITE', 'NODE_ENV', 'WEB_CONCURRENCY'
+    'NIGHTGATE_REPLICA_COUNT', 'NIGHTGATE_ALLOW_PRODUCTION_SQLITE', 'NIGHTGATE_ALLOW_UNAUTHENTICATED', 'NODE_ENV', 'WEB_CONCURRENCY'
 ] as const;
 const originalEnv = Object.fromEntries(ENV_KEYS.map(key => [key, process.env[key]]));
 const originalRequires = (cds.env as any).requires;
@@ -83,6 +83,30 @@ describe('runtime topology guard', () => {
         const topology = getRuntimeTopology({ replicaCount: 1 });
         expect(topology.valid).toBe(true);
         expect(topology.warnings.join(' ')).toMatch(/emergency compatibility override/);
+    });
+
+    it('refuses dummy auth in production', () => {
+        process.env.NODE_ENV = 'production';
+        (cds.env as any).requires.db = { kind: 'postgres' };
+        (cds.env as any).requires.auth = { kind: 'dummy' };
+        const topology = getRuntimeTopology({ replicaCount: 1 });
+        expect(topology.valid).toBe(false);
+        expect(topology.errors.join(' ')).toMatch(/'dummy'.*refused in production/);
+    });
+
+    it('allows dummy auth in production only through NIGHTGATE_ALLOW_UNAUTHENTICATED, with a warning', () => {
+        process.env.NODE_ENV = 'production';
+        process.env.NIGHTGATE_ALLOW_UNAUTHENTICATED = 'true';
+        (cds.env as any).requires.db = { kind: 'postgres' };
+        (cds.env as any).requires.auth = { kind: 'dummy' };
+        const topology = getRuntimeTopology({ replicaCount: 1 });
+        expect(topology.valid).toBe(true);
+        expect(topology.warnings.join(' ')).toMatch(/NIGHTGATE_ALLOW_UNAUTHENTICATED=true is active/);
+    });
+
+    it('leaves dummy auth alone outside production', () => {
+        (cds.env as any).requires.auth = { kind: 'dummy' };
+        expect(getRuntimeTopology({ replicaCount: 1 })).toMatchObject({ valid: true, warnings: [] });
     });
 
     it('accepts PostgreSQL in production', () => {

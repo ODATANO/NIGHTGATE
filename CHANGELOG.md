@@ -1,5 +1,70 @@
 # Changelog
 
+## 0.26.0 - 2026-09-26
+
+### Breaking
+
+- A v1/v2 ciphertext in a column bound to a purpose and a row (wallet session
+  keys, account keys, job commands) is refused (`UnboundEnvelopeError`); run
+  `nightgate-rewrap-keys` before the upgrade, or set
+  `NIGHTGATE_ACCEPT_UNBOUND_ENVELOPES=true` until it ran. The tool itself
+  still reads them.
+- `auth.kind: dummy` refuses to start in production unless
+  `NIGHTGATE_ALLOW_UNAUTHENTICATED=true`.
+- Image: the basic-auth user carries no role unless `NIGHTGATE_HTTP_ROLES`
+  names one (was `admin`); set `NIGHTGATE_HTTP_ROLES=admin` for the admin
+  service.
+- Compose publishes port 4004 on `127.0.0.1` only
+  (`NIGHTGATE_BIND_ADDRESS=0.0.0.0` restores the old binding).
+- `AttestationService` tiers (`Public`, `Disclosed`, `Authority`) require an
+  authenticated user, also in a host projection without the tier handlers.
+
+### Fixes and hardening
+
+- Concurrent resolutions of one account key each get their own buffer
+  (`resolveAccountDek`); a caller that zeroes its copy after use no longer
+  zeroes the key of the others.
+- Contract deploys, calls and batches read private states still under a legacy
+  password: the worker-routed provider gets `privateStoragePasswordFallbacks`.
+- `invalidateSession` / `invalidateAllSessions` deactivate the session first
+  and evict the facade under the facade build lock, so a build in flight cannot
+  put the keys back.
+- The crawler never stores a block with extrinsics whose `System.Events` are
+  empty or undecodable: empty is a transient error (retried), undecodable a
+  permanent one (the block latches). Such a block used to be stored without its
+  UTXO rows and balance deltas.
+- A crawl pass that fails on a transient error records `lastError` and runs
+  again after 30 s; finalized head and header reads go through the retry. A
+  permanent failure sets `syncStatus` to `error`, and `resumeCrawler` restarts
+  a crawler that stopped that way (it used to answer "already running").
+- Ledger error `171` (OutOfDustValidityWindow, a lagging node) is a dust race:
+  rebuilt and resubmitted like `170` and `196`.
+- A workflow step that is on chain but whose record fails after lock-contention
+  retries parks the workflow as `reconciliation_required` instead of failing
+  it; the re-run reuses the landed step.
+- An idempotency key reused with a different payload answers 409
+  `IDEMPOTENCY_KEY_CONFLICT` (was a masked 500).
+- `attestAgentOutput` retried under the same `idempotencyKey` without
+  `producedAt` reuses the first call's `producedAt` (recorded in the anchor
+  job's request), so the retry yields the same envelope and job instead of a
+  409.
+- Heavy job kinds share ONE concurrency cap (`jobs.concurrency.heavy`, 4)
+  instead of 4 per kind; workflow parents have their own cap of the same size,
+  so a parent never holds a slot its children need.
+- A wallet build that outlives the worker RPC timeout is joined by the next
+  `init` instead of started twice; an evict during the build zeroes the
+  finished keys instead of registering them.
+- The node connection pings every 30 s; a socket without an
+  answer for one interval is closed and reconnected.
+- Rollback and `reindexFromHeight` query and delete in chunks of 5000 ids
+  (PostgreSQL caps a statement at 65535 parameters).
+- Indexes: `UnshieldedUtxos.createdAtTransaction_ID`; `Blocks.height` becomes
+  unique (`ng_blocks_height_unique` replaces `ng_blocks_height`; with
+  duplicate heights the old index stays and startup warns).
+- SCALE compact decoding reads the four-byte mode unsigned.
+- The node URL in the unreachable-node warning is logged without credentials.
+- Version in `package.json`, lock and the compose default tag.
+
 ## 0.25.10 - 2026-09-26
 
 - `NIGHTGATE_DUST_SNAPSHOT_COLLAPSE=true` saves the dust snapshot with every

@@ -13,6 +13,7 @@ export interface NodeProviderConfig {
     requestTimeout?: number;  // ms, default 30000
     reconnectInterval?: number; // ms, default 5000
     maxReconnectAttempts?: number; // default 10
+    pingInterval?: number; // ms, default 30000; 0 = off. No pong within one interval closes the socket.
 }
 
 export interface BlockHeader {
@@ -84,20 +85,24 @@ export class MidnightNodeProvider {
     private onReconnectFailedCallback: (() => void) | null = null;
     private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
     private orphanNotifications: Map<string, any[]> = new Map();
+    private heartbeat: ReturnType<typeof setInterval> | null = null;
+    private alive = true;
 
     constructor(config: NodeProviderConfig) {
         this.config = {
             nodeUrl: config.nodeUrl,
             requestTimeout: config.requestTimeout || 30000,
             reconnectInterval: config.reconnectInterval || 5000,
-            maxReconnectAttempts: config.maxReconnectAttempts || 10
+            maxReconnectAttempts: config.maxReconnectAttempts || 10,
+            pingInterval: config.pingInterval ?? 30000
         };
     }
 
     async connect(): Promise<void> {
         return new Promise((resolve, reject) => {
             try {
-                this.ws = new WebSocket(this.config.nodeUrl);
+                const ws = new WebSocket(this.config.nodeUrl);
+                this.ws = ws;
 
                 this.ws.on('open', () => {
                     this.connected = true;
@@ -105,12 +110,16 @@ export class MidnightNodeProvider {
                     this.reconnectAttempts = 0;
                     this.reconnectAbandonSignalled = false;
                     log.info(`Connected to ${redactUrlCredentials(this.config.nodeUrl)}`);
+                    this.startHeartbeat(ws);
                     resolve();
                 });
 
                 this.ws.on('message', (data: WebSocket.Data) => {
+                    this.alive = true;
                     this.handleMessage(data.toString());
                 });
+
+                this.ws.on('pong', () => { this.alive = true; });
 
                 this.ws.on('error', (error: Error) => {
                     log.error('WebSocket error:', error.message);
@@ -120,6 +129,7 @@ export class MidnightNodeProvider {
                 });
 
                 this.ws.on('close', () => {
+                    this.stopHeartbeat();
                     const wasConnected = this.connected;
                     this.connected = false;
                     this.rejectAllPending('Connection closed');
@@ -142,8 +152,36 @@ export class MidnightNodeProvider {
         });
     }
 
+    /**
+     * A half-open socket (dropped by NAT or a proxy without a close) never errors
+     * on its own; terminating it after one silent interval lets the reconnect run.
+     */
+    private startHeartbeat(socket: WebSocket): void {
+        this.stopHeartbeat();
+        this.alive = true;
+        if (this.config.pingInterval <= 0) return;
+        this.heartbeat = setInterval(() => {
+            if (!this.alive) {
+                log.warn(`No answer from ${redactUrlCredentials(this.config.nodeUrl)} within ${this.config.pingInterval}ms; closing the socket`);
+                this.stopHeartbeat();
+                socket.terminate();
+                return;
+            }
+            this.alive = false;
+            try { socket.ping(); } catch { /* the close handler takes over */ }
+        }, this.config.pingInterval);
+    }
+
+    private stopHeartbeat(): void {
+        if (this.heartbeat) {
+            clearInterval(this.heartbeat);
+            this.heartbeat = null;
+        }
+    }
+
     async disconnect(): Promise<void> {
         this.reconnecting = false;
+        this.stopHeartbeat();
 
         if (this.reconnectTimer) {
             clearTimeout(this.reconnectTimer);

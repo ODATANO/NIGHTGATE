@@ -257,7 +257,13 @@ const migrate = () => {
         const { NIGHTGATE_INDEXES, indexStatement } = require(path.join(packageRoot, 'srv/utils/db-indexes.js'));
         for (const spec of NIGHTGATE_INDEXES) {
             if (!existingTables.has(spec.table) && !db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name=?").get(spec.table)) continue;
-            db.exec(indexStatement(spec) + ';');
+            try {
+                db.exec(indexStatement(spec) + ';');
+            } catch (err) {
+                console.warn(`[delta] ! index ${spec.name} not created (${err.message})`);
+                continue;
+            }
+            if (spec.replaces) db.exec(`DROP INDEX IF EXISTS ${spec.replaces};`);
         }
         console.log(`[delta] = ensured ${NIGHTGATE_INDEXES.length} secondary index(es)`);
     } catch (err) {

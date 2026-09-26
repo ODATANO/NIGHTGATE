@@ -89,6 +89,7 @@ vi.mock('../../srv/utils/wallet-info', () => ({
 
 import cds from '@sap/cds';
 import { encrypt, getEncryptionKey } from '../../srv/utils/crypto';
+import { walletSessionSeedBinding, walletSessionViewingKeyBinding } from '../../srv/utils/envelope-bindings';
 import { RateLimiter } from '../../srv/utils/rate-limiter';
 import { registerWalletSessionHandlers, startSessionCleanup, __resetWalletRateLimitersForTests } from '../../srv/sessions/wallet-sessions';
 
@@ -116,8 +117,8 @@ function signingSessionRow(overrides: Record<string, any> = {}) {
         ID: 'row-1',
         sessionId: 'sess-1',
         isActive: true,
-        encryptedViewingKey: encrypt('vk-'.padEnd(64, 'a'), encKey),
-        encryptedSeedKey: encrypt('b'.repeat(128), encKey),
+        encryptedViewingKey: encrypt('vk-'.padEnd(64, 'a'), encKey, walletSessionViewingKeyBinding('sess-1')),
+        encryptedSeedKey: encrypt('b'.repeat(128), encKey, walletSessionSeedBinding('sess-1')),
         expiresAt: new Date(Date.now() + 60_000).toISOString(),
         ...overrides
     };
@@ -413,7 +414,7 @@ describe('wallet session guard branches', () => {
                     // undecryptable (best-effort: must not abort the sweep),
                     // one already-nulled key.
                     .mockResolvedValueOnce([
-                        { encryptedViewingKey: encrypt('vk-evict-me'.padEnd(64, 'e'), encKey) },
+                        { sessionId: 'sess-evict', encryptedViewingKey: encrypt('vk-evict-me'.padEnd(64, 'e'), encKey, walletSessionViewingKeyBinding('sess-evict')) },
                         { encryptedViewingKey: 'garbage-not-decryptable' },
                         { encryptedViewingKey: null }
                     ])

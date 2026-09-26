@@ -97,9 +97,9 @@ export function authConfig(env = process.env) {
     const password = String(env.NIGHTGATE_HTTP_PASSWORD ?? '');
     if (!password) throw new Error('NIGHTGATE_HTTP_PASSWORD is required with basic auth (local unauthenticated testing only: NIGHTGATE_AUTH=dummy)');
     const user = String(env.NIGHTGATE_HTTP_USER || 'nightgate');
-    // The single configured user IS the operator of this deployment, so it
-    // carries the admin role unless NIGHTGATE_HTTP_ROLES says otherwise.
-    const roles = String(env.NIGHTGATE_HTTP_ROLES ?? 'admin').split(',').map(r => r.trim()).filter(Boolean);
+    // No role by default: the admin service (signing-key export, session
+    // invalidation, job queue) needs NIGHTGATE_HTTP_ROLES=admin.
+    const roles = String(env.NIGHTGATE_HTTP_ROLES ?? '').split(',').map(r => r.trim()).filter(Boolean);
     return { kind: 'basic', impl: '@odatano/cap-auth', realm: 'nightgate', users: { [user]: { password, roles } } };
 }
 

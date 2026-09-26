@@ -46,7 +46,7 @@ vi.mock('../../srv/utils/wallet-info', async () => {
 
 import { registerWalletSessionHandlers, __resetWalletRateLimitersForTests } from '../../srv/sessions/wallet-sessions';
 import { encrypt, decrypt, getEncryptionKey } from '../../srv/utils/crypto';
-import { walletSessionSeedBinding } from '../../srv/utils/envelope-bindings';
+import { walletSessionSeedBinding, walletSessionViewingKeyBinding } from '../../srv/utils/envelope-bindings';
 
 type Handler = (req: any) => Promise<any>;
 
@@ -142,7 +142,7 @@ function seedSession(db: ReturnType<typeof makeFakeDb>, overrides: any = {}) {
         sessionId: 'sess-1',
         userId: TEST_USER_ID, // must match req.user.id for the user-scoped load
         isActive: true,
-        encryptedViewingKey: encrypt('mn_shield-vk_alice', getEncryptionKey()),
+        encryptedViewingKey: encrypt('mn_shield-vk_alice', getEncryptionKey(), walletSessionViewingKeyBinding('sess-1')),
         expiresAt: new Date(Date.now() + 60_000).toISOString(),
         ...overrides
     });
@@ -427,7 +427,7 @@ describe('disconnectWallet also nukes encryptedSeedKey', () => {
     test('seed key is cleared on explicit disconnect', async () => {
         const srv = makeFakeService();
         const db = makeFakeDb();
-        const encSeed = encrypt(VALID_SEED, getEncryptionKey());
+        const encSeed = encrypt(VALID_SEED, getEncryptionKey(), walletSessionSeedBinding('sess-1'));
         seedSession(db, { encryptedSeedKey: encSeed });
         registerWalletSessionHandlers(srv as any, db);
 

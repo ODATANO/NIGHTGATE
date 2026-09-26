@@ -55,7 +55,9 @@ probes (`getLiveness`, `getReadiness`, `getMetrics`, `getSyncStatus`,
 | `NIGHTGATE_HTTP_PASSWORD` | required | Basic-auth password |
 | `NIGHTGATE_HTTP_USER` | `nightgate` | Basic-auth user |
 | (agent tokens) | - | `x-agent-token` requests need no basic credentials on `/api/v1/nightgate`; the grant hook authenticates them, incl. every `$batch` part |
-| `NIGHTGATE_AUTH` | `basic` | `dummy` = unauthenticated, local testing only |
+| `NIGHTGATE_HTTP_ROLES` | none | Roles of the basic-auth user, comma separated; `admin` opens the admin service (signing-key export, session invalidation, job queue) |
+| `NIGHTGATE_AUTH` | `basic` | `dummy` = unauthenticated and privileged; refused unless `NIGHTGATE_ALLOW_UNAUTHENTICATED=true`, local testing only |
+| `NIGHTGATE_BIND_ADDRESS` | `127.0.0.1` | Compose only: host address port 4004 is published on. Basic auth is plain text without TLS: put a TLS reverse proxy in front before `0.0.0.0` |
 | `NIGHTGATE_NETWORK` | `preprod` | Target network |
 | `NIGHTGATE_CRAWLER_ENABLED` | `false` | Block crawler (verification works without it) |
 | `NIGHTGATE_CRAWLER_START_HEIGHT` | unset | First height to index while the index is empty; unset walks from genesis |

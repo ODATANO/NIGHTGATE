@@ -11,7 +11,7 @@ service NightgateAdminService {
         encryptedSeedKey
     };
 
-    /** Read-only: roles change only through grantRole / revokeRole (authority-gated). */
+    /** Read-only: roles change only through grantRole (authority-gated); a grant ends at validUntil. */
     @readonly
     entity DisclosureRoles as projection on midnight.DisclosureRoles;
 

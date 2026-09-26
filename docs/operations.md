@@ -266,10 +266,15 @@ attempt) stops catch-up, marks `syncStatus` as `error` with the reason in
 `lastError`, and is then left alone: the crawler tracks `chainHeight` from the
 live head but retries nothing, instead of re-entering the same block every six
 seconds. The log names the height. A transient failure, a node outage above
-all, is not latched and stays retryable.
+all, is not latched and stays retryable: an ingest pass that fails on one records
+`lastError` and runs again 30 s later. A block with extrinsics whose
+`System.Events` come back empty is such a transient failure (lagging or pruned
+node); it is not stored without its events.
 
 Recovery is `pauseCrawler` then `resumeCrawler`, which retries the block once,
-or `reindexFromHeight` below it. A restart retries it too.
+or `reindexFromHeight` below it. A restart retries it too. After any other
+permanent ingest failure `syncStatus` is `error` and `resumeCrawler` starts the
+crawler afresh.
 
 ## Troubleshooting
 
@@ -406,7 +411,7 @@ Ciphertexts name their ring key id, so rotation is additive. The tool rewraps wa
 
 Secrets are read by the main thread only. In production every ring secret needs at least 32 characters.
 
-Envelopes (`v3`) bind key id, purpose and row id in the AAD: a value copied to another row does not decrypt; the tool rewrites `v2` values. The data key is sealed under the ring and under the viewing key: a DB copy plus a viewing key opens nothing without the ring, and removing a ring key without a rewrap loses the data keys it sealed.
+Envelopes (`v3`) bind key id, purpose and row id in the AAD: a value copied to another row does not decrypt; the tool rewrites `v2` values. The server refuses a `v1`/`v2` value in a bound column (`UnboundEnvelopeError`); `NIGHTGATE_ACCEPT_UNBOUND_ENVELOPES=true` reads them until the tool ran. The data key is sealed under the ring and under the viewing key: a DB copy plus a viewing key opens nothing without the ring, and removing a ring key without a rewrap loses the data keys it sealed.
 
 ## Contract signing keys (maintenance authority)
 

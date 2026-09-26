@@ -7,6 +7,7 @@
 
 import crypto from 'crypto';
 import cds from '@sap/cds';
+import { configFlag } from './config';
 
 const log = cds.log('nightgate:crypto');
 
@@ -203,14 +204,14 @@ function aad(keyId: string): Buffer {
 
 /** v3 AAD: version, key id, purpose and subject, NUL-separated so no field can absorb another. */
 function boundAad(keyId: string, binding: EnvelopeBinding): Buffer {
-    return Buffer.from([BOUND_ENVELOPE_VERSION, keyId, binding.purpose, binding.subject].join(' '), 'utf8');
+    return Buffer.from([BOUND_ENVELOPE_VERSION, keyId, binding.purpose, binding.subject].join('\u0000'), 'utf8');
 }
 
 function assertBinding(binding: EnvelopeBinding): void {
     if (!binding || typeof binding.purpose !== 'string' || !binding.purpose || typeof binding.subject !== 'string' || !binding.subject) {
         throw new Error('envelope binding needs a non-empty purpose and subject');
     }
-    if (binding.purpose.includes(' ') || binding.subject.includes(' ')) {
+    if (binding.purpose.includes('\u0000') || binding.subject.includes('\u0000')) {
         throw new Error('envelope binding fields must not contain NUL');
     }
 }
@@ -265,10 +266,25 @@ export function inspectCiphertext(combined: string): { version: 1 | 2 | 3; keyId
     throw new Error('Invalid encrypted format: expected v3|v2:keyId:wrappedDek:iv:authTag:ciphertext or iv:authTag:ciphertext');
 }
 
-/** Decrypt v3 (needs its binding), v2 (binding ignored) or v1. Throws on authentication failure or an unknown key id. */
-export function decrypt(combined: string, key: EncryptionKey, binding?: EnvelopeBinding): string {
+/** A v1/v2 ciphertext where a bound (v3) one belongs: a row copied from elsewhere would pass as its own. */
+export class UnboundEnvelopeError extends Error {
+    constructor(purpose: string) {
+        super(`ciphertext for '${purpose}' is an unbound v1/v2 envelope; run nightgate-rewrap-keys (or set NIGHTGATE_ACCEPT_UNBOUND_ENVELOPES=true until it ran)`);
+        this.name = 'UnboundEnvelopeError';
+    }
+}
+
+/**
+ * Decrypt v3 (needs its binding), v2 or v1. With a binding, v1/v2 are refused unless
+ * `allowUnbound` (the rewrap migration) or NIGHTGATE_ACCEPT_UNBOUND_ENVELOPES says otherwise.
+ * Throws on authentication failure or an unknown key id.
+ */
+export function decrypt(combined: string, key: EncryptionKey, binding?: EnvelopeBinding, opts: { allowUnbound?: boolean } = {}): string {
     const ring = asRing(key);
     const { version, keyId } = inspectCiphertext(combined);
+    if (binding && version < 3 && !opts.allowUnbound && !configFlag('NIGHTGATE_ACCEPT_UNBOUND_ENVELOPES')) {
+        throw new UnboundEnvelopeError(binding.purpose);
+    }
     const parts = combined.split(':');
     if (version === 1) {
         const legacy = ring.legacyKey(keyId);

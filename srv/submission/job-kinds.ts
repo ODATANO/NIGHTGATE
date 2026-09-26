@@ -3,7 +3,7 @@
  * lists cannot drift: a kind without traits, or without a processor, fails at boot.
  */
 export interface JobKindTraits {
-    /** Runs a full ZK proof: limited to the heavy concurrency class (one proof server saturates at four). */
+    /** Runs a full ZK proof: all heavy kinds share one concurrency cap (one proof server saturates at four). */
     heavy: boolean;
     /** Drives child commands; the parent row has no txHash and reconciles from its children. */
     workflowParent: boolean;

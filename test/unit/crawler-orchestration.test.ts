@@ -1104,6 +1104,46 @@ describe('MidnightCrawler orchestration', () => {
             await crawler.stop();
         });
 
+        it('drives the pipeline again after a transient failure instead of going idle', async () => {
+            vi.useFakeTimers();
+            try {
+                const provider = { isConnected: vi.fn().mockReturnValue(true), setOnReconnect: vi.fn(), setOnReconnectFailed: vi.fn() };
+                const crawler = new MidnightCrawler(provider as any, { enabled: true });
+                const recordSpy = vi.spyOn(crawler as any, 'recordError').mockResolvedValue(undefined);
+                const pipelineSpy = vi.spyOn(crawler as any, 'runIngestPipeline')
+                    .mockRejectedValueOnce(new Error('RPC timeout: chain_getFinalizedHead (30000ms)'))
+                    .mockResolvedValue(undefined);
+
+                await crawler.start();
+                await vi.advanceTimersByTimeAsync(0);
+                expect(crawler.isActive()).toBe(true);
+                expect(recordSpy).toHaveBeenCalledWith(expect.stringContaining('RPC timeout'), false);
+                expect(pipelineSpy).toHaveBeenCalledTimes(1);
+
+                await vi.advanceTimersByTimeAsync(30_000);
+                expect(pipelineSpy).toHaveBeenCalledTimes(2);
+                await crawler.stop();
+            } finally {
+                vi.useRealTimers();
+            }
+        });
+
+        it('marks the sync errored and reports itself inactive on a permanent failure', async () => {
+            const provider = { isConnected: vi.fn().mockReturnValue(true), setOnReconnect: vi.fn(), setOnReconnectFailed: vi.fn() };
+            const crawler = new MidnightCrawler(provider as any, { enabled: true });
+            const recordSpy = vi.spyOn(crawler as any, 'recordError').mockResolvedValue(undefined);
+            vi.spyOn(crawler as any, 'runIngestPipeline').mockRejectedValueOnce(new Error('unsupported metadata representation'));
+            const errSpy = vi.spyOn(cds.log('nightgate:crawler'), 'error').mockImplementation(() => {});
+            try {
+                await crawler.start();
+                await new Promise(r => setImmediate(r));
+                expect(crawler.isActive()).toBe(false);
+                expect(recordSpy).toHaveBeenCalledWith('unsupported metadata representation');
+            } finally {
+                errSpy.mockRestore();
+            }
+        });
+
         it('ignores live callbacks while catch-up is running and queues blocks while processing', async () => {
             let liveCallback: ((header: any) => Promise<void>) | undefined;
             const provider = {

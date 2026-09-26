@@ -932,7 +932,7 @@ service NightgateService {
                                outputHash: String, // 64 hex commitment to the produced output
                                modelId: String, // optional model identifier (<= 200 chars)
                                policyHash: String, // optional 64 hex commitment to the governing policy
-                               producedAt: Timestamp, // optional; defaults to now (server time)
+                               producedAt: Timestamp, // optional; defaults to the first call's under the same idempotencyKey, else now
                                storageRef: String, // optional; where output/envelope live, defaults to agent-output://<agentId>
                                sessionId: UUID,
                                contractAddress: String, // AttestationVault deployment

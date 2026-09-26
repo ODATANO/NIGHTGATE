@@ -891,16 +891,53 @@ export async function withSessionLocks<T>(keys: string[], fn: () => Promise<T>):
 }
 
 
-export async function init(args: InitArgs) {
+// A build outlives the main thread's RPC timeout; a retry joins it instead of starting a second one.
+const buildsInFlight = new Map<string, Promise<FacadeEntry>>();
+// Sessions evicted while their build ran: the finished entry is torn down, never registered.
+const evictedWhileBuilding = new Set<string>();
+
+export async function init(args: InitArgs, build: (args: InitArgs) => Promise<FacadeEntry> = buildFacade) {
     if (facades.has(args.sessionId)) {
         log('debug', `init: cache hit ${args.sessionId.slice(0, 16)}`);
         return { facadeReady: true, alreadyExisted: true };
     }
-    const entry = await buildFacade(args);
-    facades.set(args.sessionId, entry);
-    startPeriodicSave(args.sessionId, entry);
-    startProgressWatch(args.sessionId, entry);
-    return { facadeReady: true, alreadyExisted: false, sdkVersion: entry.sdkVersion };
+    const running = buildsInFlight.get(args.sessionId);
+    if (running) {
+        log('info', `init: joining the build in flight for ${args.sessionId.slice(0, 16)}`);
+        const entry = await running;
+        return { facadeReady: true, alreadyExisted: true, sdkVersion: entry.sdkVersion };
+    }
+    evictedWhileBuilding.delete(args.sessionId);
+    const building = (async () => {
+        const entry = await build(args);
+        if (evictedWhileBuilding.delete(args.sessionId)) {
+            await zeroEntry(entry, args.sessionId);
+            throw new Error(`Session ${args.sessionId.slice(0, 16)} was evicted while its wallet was being built`);
+        }
+        facades.set(args.sessionId, entry);
+        startPeriodicSave(args.sessionId, entry);
+        startProgressWatch(args.sessionId, entry);
+        return entry;
+    })();
+    buildsInFlight.set(args.sessionId, building);
+    try {
+        const entry = await building;
+        return { facadeReady: true, alreadyExisted: false, sdkVersion: entry.sdkVersion };
+    } finally {
+        buildsInFlight.delete(args.sessionId);
+    }
+}
+
+async function zeroEntry(entry: FacadeEntry, sessionId: string): Promise<void> {
+    try {
+        entry.zswapKeys?.clear?.();
+        entry.dustKey?.clear?.();
+        entry.unshieldedKeystore?.clear?.();
+        try { entry.attestationSecret?.fill?.(0); } catch { }
+        await entry.facade?.stop?.();
+    } catch (err) {
+        log('warn', `evict cleanup failed for ${sessionId.slice(0, 16)}: ${formatErr(err)}`);
+    }
 }
 
 /** CPU profile of this worker thread via the in-thread inspector; the raw .cpuprofile stays on disk. */
@@ -921,7 +958,11 @@ export async function waitForSyncedState({ sessionId, timeoutMs, stallMs }: { se
 /** `awaitSaveAck`: reply only after the final save was acked; off by default for fake-timer tests. */
 export async function evict({ sessionId, awaitSaveAck }: { sessionId: string; awaitSaveAck?: boolean }) {
     const entry = facades.get(sessionId);
-    if (!entry) return { evicted: false };
+    if (!entry) {
+        if (!buildsInFlight.has(sessionId)) return { evicted: false };
+        evictedWhileBuilding.add(sessionId);
+        return { evicted: true, saved: false };
+    }
     // `saved`: the final save was pushed (and, with awaitSaveAck, acked).
     let saved = true;
     // Remove from the map first so no NEW submit can resolve this facade.
@@ -944,16 +985,8 @@ export async function evict({ sessionId, awaitSaveAck }: { sessionId: string; aw
             saved = false;
             log('warn', `evict final-save failed for ${sessionId.slice(0, 16)}: ${formatErr(err)}`);
         }
-        try {
-            // Zero every secret held by the entry, not just the zswap keys.
-            entry.zswapKeys?.clear?.();
-            entry.dustKey?.clear?.();
-            entry.unshieldedKeystore?.clear?.();
-            try { entry.attestationSecret?.fill?.(0); } catch { }
-            await entry.facade?.stop?.();
-        } catch (err) {
-            log('warn', `evict cleanup failed for ${sessionId.slice(0, 16)}: ${formatErr(err)}`);
-        }
+        // Zero every secret held by the entry, not just the zswap keys.
+        await zeroEntry(entry, sessionId);
     });
     return { evicted: true, saved };
 }

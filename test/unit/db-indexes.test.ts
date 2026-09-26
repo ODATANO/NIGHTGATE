@@ -25,6 +25,24 @@ describe('db-indexes', () => {
         expect(names).toEqual(NIGHTGATE_INDEXES.map(i => i.name).sort());
     });
 
+    it('a unique index replaces the plain one it supersedes', async () => {
+        await db.run('DROP INDEX IF EXISTS ng_blocks_height_unique');
+        await db.run('CREATE INDEX IF NOT EXISTS ng_blocks_height ON midnight_Blocks (height)');
+        await ensureIndexes(db, 'sqlite');
+        const names = (await db.run("SELECT name FROM sqlite_master WHERE type='index' AND name LIKE 'ng_blocks_height%'")).map((r: any) => r.name);
+        expect(names).toEqual(['ng_blocks_height_unique']);
+    });
+
+    it('keeps the plain index and warns when duplicates refuse the unique one', async () => {
+        const warnings: string[] = [];
+        const run = vi.fn(async (q: unknown) => {
+            if (String(q).includes('ng_blocks_height_unique')) throw new Error('UNIQUE constraint failed');
+        });
+        await ensureIndexes({ run }, 'sqlite', m => warnings.push(m));
+        expect(run.mock.calls.map((c: any[]) => String(c[0]))).not.toContain('DROP INDEX IF EXISTS ng_blocks_height');
+        expect(warnings.join('; ')).toContain('duplicate height values in midnight_Blocks');
+    });
+
     it('is a no-op on HANA (its deployer owns indexes)', async () => {
         const run = vi.fn();
         expect(await ensureIndexes({ run }, 'hana')).toBe(0);
@@ -34,6 +52,7 @@ describe('db-indexes', () => {
     it('emits dialect-neutral DDL', () => {
         expect(indexStatement({ name: 'x', table: 't', columns: ['a', 'b'] })).toBe('CREATE INDEX IF NOT EXISTS x ON t (a, b)');
         expect(indexStatement({ name: 'x', table: 't', columns: ['a', 'b'] }, 'postgres')).toBe('CREATE INDEX IF NOT EXISTS x ON t (a, b)');
+        expect(indexStatement({ name: 'x', table: 't', columns: ['a'], unique: true })).toBe('CREATE UNIQUE INDEX IF NOT EXISTS x ON t (a)');
     });
 
     it('uses the PostgreSQL spelling only there', () => {
