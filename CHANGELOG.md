@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.25.10 - 2026-09-26
+
+- `NIGHTGATE_DUST_SNAPSHOT_COLLAPSE=true` saves the dust snapshot with every
+  generation-tree leaf collapsed that does not back one of the wallet's own
+  dust UTXOs (`night_indices`). The ledger re-expands foreign leaves on each
+  dtime update and never collapses them again, so the snapshot and its restore
+  (`DustLocalState.deserialize`, one synchronous wasm call) grew with the
+  chain: 6 MB and 5 to 7 minutes on preprod, 7 KB and 4 s with the flag.
+  Roots, balance and spends are unchanged. Default off.
+- The collapsed state is restored once before it is saved and must give the
+  same roots, balance and UTXO count; otherwise, and on any error in that path,
+  the save keeps the SDK snapshot and logs the reason once
+  (`srv/midnight/worker/dust-collapse.ts`).
+- Snapshot state and `offset` come from one emitted wallet state, so a restore
+  replays from the offset that matches the saved state.
+- Version in `package.json`, lock and the compose default tag.
+
 ## 0.25.9 - 2026-09-26
 
 - `getSponsorPoolStatus` keeps showing a sponsor while the wallet worker does

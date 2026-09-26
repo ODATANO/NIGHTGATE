@@ -1885,6 +1885,31 @@ describe('progress watch tick', () => {
     });
 });
 
+describe('dust snapshot collapse on save', () => {
+    const emitting = (value: unknown) => ({ subscribe: ({ next }: any) => { next(value); return { unsubscribe: () => undefined }; } });
+
+    afterEach(() => { delete process.env.NIGHTGATE_DUST_SNAPSHOT_COLLAPSE; });
+
+    it('uses serializeState while the flag is off', async () => {
+        const dust = { serializeState: vi.fn(async () => 'BLOB-DU'), state: emitting({}) };
+        const out = await workerExports.collectSerializedStates({ dust });
+        expect(out.dust).toBe('BLOB-DU');
+        expect(dust.serializeState).toHaveBeenCalledTimes(1);
+    });
+
+    it('falls back to serializeState when the collapse path fails, warning once per reason', async () => {
+        process.env.NIGHTGATE_DUST_SNAPSHOT_COLLAPSE = 'true';
+        const walletState = { serialize: () => '{"state":"aa"}', state: { state: { toString: () => 'no fields', utxos: [] } } };
+        const dust = { serializeState: vi.fn(async () => 'BLOB-DU'), state: emitting(walletState) };
+        const warnsBefore = fakeParentPort.postMessage.mock.calls.filter(c => c[0]?.kind === 'log' && /uncollapsed/.test(c[0].message)).length;
+        expect((await workerExports.collectSerializedStates({ dust })).dust).toBe('BLOB-DU');
+        expect((await workerExports.collectSerializedStates({ dust })).dust).toBe('BLOB-DU');
+        const warns = fakeParentPort.postMessage.mock.calls.filter(c => c[0]?.kind === 'log' && /uncollapsed/.test(c[0].message)).length;
+        expect(warns - warnsBefore).toBeLessThanOrEqual(1);
+        expect(dust.serializeState).toHaveBeenCalledTimes(2);
+    });
+});
+
 describe('dust save epoch guard', () => {
     it('applySaveAck drops a dust blob acked under a stale epoch but merges the rest', () => {
         const entry: any = {

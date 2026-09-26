@@ -17,6 +17,7 @@ import { parentPort } from 'node:worker_threads';
 import { FacadeEntry, InitArgs, ensureNetworkId, facades, getSdkVersion, loadProvingSdk, loadSdk, log, resolveProvingMode } from './context';
 import { restoreDustFromSnapshot } from './submit';
 import { sponsorUnboundTx } from './sponsor';
+import { collapsedDustSnapshot } from './dust-collapse';
 import {
     ReplayKind, appliedIndexOf, describeSyncState, formatSyncState, lastReplayRejection,
     observeReplayTrack, shouldResetRestoredSubWallet
@@ -786,6 +787,14 @@ export async function collectSerializedStates(facade: any): Promise<{ shielded?:
     const tryOne = async (key: 'shielded' | 'unshielded' | 'dust') => {
         try {
             const sub = facade?.[key];
+            if (key === 'dust' && sub?.state && configFlag('NIGHTGATE_DUST_SNAPSHOT_COLLAPSE')) {
+                try {
+                    out.dust = await collapsedDustBlob(sub);
+                    return;
+                } catch (err) {
+                    noteDustCollapseFallback(formatErr(err));
+                }
+            }
             if (sub && typeof sub.serializeState === 'function') {
                 const blob = await sub.serializeState();
                 if (typeof blob === 'string') out[key] = blob;
@@ -796,6 +805,39 @@ export async function collectSerializedStates(facade: any): Promise<{ shielded?:
     };
     await Promise.all([tryOne('shielded'), tryOne('unshielded'), tryOne('dust')]);
     return out;
+}
+
+// Fallback reasons are logged once per reason, not on every save tick.
+const dustCollapseNoted = new Set<string>();
+
+function firstEmission(observable: any, timeoutMs: number): Promise<any> {
+    return new Promise((resolve, reject) => {
+        let sub: any;
+        const timer = setTimeout(() => { sub?.unsubscribe?.(); reject(new Error(`no state within ${timeoutMs}ms`)); }, timeoutMs);
+        sub = observable.subscribe({
+            next: (v: any) => { clearTimeout(timer); resolve(v); queueMicrotask(() => sub?.unsubscribe?.()); },
+            error: (e: any) => { clearTimeout(timer); reject(e); }
+        });
+    });
+}
+
+/** As `serializeState()`, from one emitted state, with foreign generation leaves collapsed. */
+async function collapsedDustBlob(dust: any): Promise<string> {
+    const [walletState, sdk] = await Promise.all([firstEmission(dust.state, 30_000), loadSdk()]);
+    const t0 = Date.now();
+    const r = collapsedDustSnapshot(walletState, sdk.ledger.DustLocalState);
+    if (r.collapsed) {
+        log('debug', `dust snapshot collapsed ${r.fullBytes} -> ${r.bytes} bytes in ${Date.now() - t0}ms`);
+    } else if (r.reason) {
+        noteDustCollapseFallback(r.reason);
+    }
+    return r.blob;
+}
+
+function noteDustCollapseFallback(reason: string): void {
+    if (dustCollapseNoted.has(reason)) return;
+    dustCollapseNoted.add(reason);
+    log('warn', `dust snapshot saved uncollapsed: ${reason}`);
 }
 
 export function hasAnyBlob(b: { shielded?: string; unshielded?: string; dust?: string }): boolean {
