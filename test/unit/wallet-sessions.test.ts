@@ -1663,6 +1663,63 @@ describe('wallet session handlers', () => {
             expect(result[0].lastError).toContain('appliedIndex 1520690');
         });
 
+        it('shows the last pushed dust figures, marked stale, when the worker does not answer', async () => {
+            process.env.NIGHTGATE_FEE_SPONSOR_SESSION = SPONSOR;
+            const row = { ...activeSessionRow(), sessionId: SPONSOR, userId: 'someone-else' };
+            mockDbRun.mockResolvedValueOnce(row).mockResolvedValueOnce(row);
+            const at = new Date(Date.now() - 300_000).toISOString();
+            mockWalletGetSyncProgress.mockReturnValue({
+                caughtUp: true, updatedAt: new Date().toISOString(),
+                dust: { balance: '5000', availableNotes: 4, pendingNotes: 1, restoreCount: 2, registeredNightUtxos: 3, totalNightUtxos: 5, at }
+            });
+            mockGetWalletBalance.mockRejectedValueOnce(new Error('worker RPC getBalance timed out after 45000ms'));
+
+            const result: any = await registeredHandlers['getSponsorPoolStatus'](createMockRequest({}));
+            expect(result[0]).toMatchObject({
+                usable: false, stale: true, asOf: at, caughtUp: true,
+                dustNotes: 4, pendingDustNotes: 1, dustRestoreCount: 2,
+                registeredNightUtxos: 3, totalNightUtxoCount: 5,
+                dustBalance: null, unshieldedNight: null
+            });
+            expect(result[0].lastError).toContain('timed out');
+        });
+
+        it('shows the stale balance amount to an admin only', async () => {
+            process.env.NIGHTGATE_FEE_SPONSOR_SESSION = SPONSOR;
+            const row = { ...activeSessionRow(), sessionId: SPONSOR, userId: 'someone-else' };
+            mockDbRun.mockResolvedValueOnce(row).mockResolvedValueOnce(row);
+            mockWalletGetSyncProgress.mockReturnValue({
+                caughtUp: true, updatedAt: new Date().toISOString(),
+                dust: { balance: '5000', availableNotes: 4, pendingNotes: 0, restoreCount: 0, registeredNightUtxos: 3, totalNightUtxos: 3, at: new Date().toISOString() }
+            });
+            mockGetWalletBalance.mockRejectedValueOnce(new Error('timed out'));
+
+            const result: any = await registeredHandlers['getSponsorPoolStatus'](adminRequest());
+            expect(result[0]).toMatchObject({ stale: true, dustBalance: '5000' });
+        });
+
+        it('stays an empty row when the worker never pushed dust figures', async () => {
+            process.env.NIGHTGATE_FEE_SPONSOR_SESSION = SPONSOR;
+            const row = { ...activeSessionRow(), sessionId: SPONSOR };
+            mockDbRun.mockResolvedValueOnce(row).mockResolvedValueOnce(row);
+            mockGetWalletBalance.mockRejectedValueOnce(new Error('timed out'));
+
+            const result: any = await registeredHandlers['getSponsorPoolStatus'](adminRequest());
+            expect(result[0]).toMatchObject({ usable: false, stale: false, asOf: null, dustNotes: 0 });
+        });
+
+        it('marks a live read as fresh with its read time', async () => {
+            process.env.NIGHTGATE_FEE_SPONSOR_SESSION = SPONSOR;
+            const row = { ...activeSessionRow(), sessionId: SPONSOR };
+            mockDbRun.mockResolvedValueOnce(row).mockResolvedValueOnce(row);
+            mockGetWalletBalance.mockResolvedValueOnce({ dustBalance: '900', registeredNightUtxoCount: 3, dustUtxoCount: 3 });
+
+            const before = Date.now();
+            const result: any = await registeredHandlers['getSponsorPoolStatus'](adminRequest());
+            expect(result[0].stale).toBe(false);
+            expect(Date.parse(result[0].asOf)).toBeGreaterThanOrEqual(before);
+        });
+
         it('does not trust a gate verdict nobody refreshes any more', async () => {
             process.env.NIGHTGATE_FEE_SPONSOR_SESSION = SPONSOR;
             const row = { ...activeSessionRow(), sessionId: SPONSOR };

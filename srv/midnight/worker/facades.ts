@@ -86,11 +86,46 @@ export interface SyncProgressSnapshot {
     updatedAt: string;
     /** When `appliedIndex` last advanced; unchanged while `updatedAt` moves = stalled, not slow. */
     lastProgressAt: string;
+    /** Dust figures at push time; the status read falls back to them while this thread is busy. */
+    dust?: SyncDustFigures;
+}
+
+export interface SyncDustFigures {
+    balance: string;
+    availableNotes: number;
+    pendingNotes: number;
+    restoreCount: number;
+    registeredNightUtxos: number;
+    totalNightUtxos: number;
+    at: string;
+}
+
+/** Same counting as `getBalance`; undefined when the state carries no dust wallet or the read throws. */
+export function dustFiguresOf(state: any, entry: Pick<FacadeEntry, 'dustRestoresPersisted'>, now: number = Date.now()): SyncDustFigures | undefined {
+    try {
+        const dust = state?.dust;
+        if (!dust) return undefined;
+        const total: any[] = dust.totalCoins ?? [];
+        const pending: any[] = dust.pendingCoins ?? [];
+        const available: any[] | undefined = dust.availableCoins;
+        return {
+            balance: typeof dust.balance === 'function' ? String(dust.balance(new Date(now))) : '0',
+            availableNotes: Array.isArray(available) ? available.length : Math.max(0, total.length - pending.length),
+            pendingNotes: pending.length,
+            restoreCount: entry.dustRestoresPersisted ?? 0,
+            registeredNightUtxos: countRegisteredNightUtxos(state),
+            totalNightUtxos: countAllNightUtxos(state, 0),
+            at: new Date(now).toISOString()
+        };
+    } catch {
+        return undefined;
+    }
 }
 
 export const syncProgress = new Map<string, SyncProgressSnapshot>();
 
-export function pushSyncProgress(snapshot: SyncProgressSnapshot): void {
+export function pushSyncProgress(snapshot: SyncProgressSnapshot, dust?: SyncDustFigures): void {
+    if (dust) snapshot.dust = dust;
     parentPort?.postMessage({ kind: 'sync-progress', sessionId: snapshot.sessionId, snapshot });
 }
 
@@ -326,7 +361,7 @@ export async function waitForGenuineSync(entry: FacadeEntry, timeoutMs: number, 
         const caughtUp = isGenuinelyCaughtUp({ connected, applied, streamTip: highest, indexerFresh: fresh });
         const snapshot = publish(applied, highest, tip.height, connected, fresh, caughtUp);
         if (caughtUp) {
-            pushSyncProgress(snapshot);
+            pushSyncProgress(snapshot, dustFiguresOf(state, entry));
             log('info', `genuine-sync [${label}] CAUGHT UP: appliedIndex=${applied} streamTip=${highest} blockHeight=${tip.height} fresh=${fresh} after=${Math.round(snapshot.elapsedMs / 1000)}s`);
             return;
         }
@@ -580,7 +615,7 @@ export async function progressWatchTick(sessionId: string, entry: FacadeEntry, n
         lastProgressAt: last && last.appliedIndex === applied.toString() ? last.lastProgressAt : at
     };
     syncProgress.set(sessionId, snapshot);
-    pushSyncProgress(snapshot);
+    pushSyncProgress(snapshot, dustFiguresOf(state, entry));
     if (!caughtUp) {
         log('info', `idle-sync ${sessionId.slice(0, 16)} appliedIndex=${applied} streamTip=${highest} behindEvents=${behind ?? '?'} connected=${connected} fresh=${indexerFresh} (no job waiting)`);
     }

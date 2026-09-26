@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.25.9 - 2026-09-26
+
+- `getSponsorPoolStatus` keeps showing a sponsor while the wallet worker does
+  not answer (e.g. while it restores another wallet's dust snapshot, a single
+  synchronous call of several minutes): the row carries the last dust figures
+  the worker pushed, `stale: true` and `asOf`, `usable: false`,
+  `unshieldedNight: null`, `lastError` with the reason. It used to read
+  `dustNotes: 0` for every sponsor. A live read answers `stale: false` with
+  the read time as `asOf`.
+- The worker attaches `dust` figures (balance, free and pending notes,
+  restore count, NIGHT UTXO counts, `at`) to the sync snapshot it pushes when
+  a facade reaches the tip and on every progress-watch tick
+  (`dustFiguresOf`); a push without them keeps the previous ones.
+- Two additive fields on the `getSponsorPoolStatus` return type; no schema
+  change, no migration, no config change.
+- Version in `package.json`, lock and the compose default tag.
+
 ## 0.25.8 - 2026-09-25
 
 - A parked job whose kind has a reconciliation finalizer and whose command is

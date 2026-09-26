@@ -61,6 +61,16 @@ export interface WalletSyncProgress {
     updatedAt: string;
     /** When appliedIndex last advanced. */
     lastProgressAt?: string;
+    /** Dust figures from the last caught-up or idle-watch push. */
+    dust?: {
+        balance: string;
+        availableNotes: number;
+        pendingNotes: number;
+        restoreCount: number;
+        registeredNightUtxos: number;
+        totalNightUtxos: number;
+        at: string;
+    };
 }
 
 // Latest pushed snapshot per facade; cleared on evict and on worker exit.
@@ -204,7 +214,11 @@ export async function startWalletWorker(): Promise<void> {
             (cds.log('nightgate:worker') as any)[level](msg.message);
         } else if (msg?.kind === 'sync-progress') {
             if (msg.sessionId && msg.snapshot) {
-                syncProgressCache.set(msg.sessionId, msg.snapshot as WalletSyncProgress);
+                const snapshot = msg.snapshot as WalletSyncProgress;
+                // Catch-up pushes carry no dust figures; keep the last ones with their own `at`.
+                const previousDust = syncProgressCache.get(msg.sessionId)?.dust;
+                if (!snapshot.dust && previousDust) snapshot.dust = previousDust;
+                syncProgressCache.set(msg.sessionId, snapshot);
             }
         } else if (msg?.kind === 'private-state-rpc') {
             dispatchPrivateStateRpc(msg);

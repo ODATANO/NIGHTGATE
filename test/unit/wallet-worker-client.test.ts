@@ -487,6 +487,19 @@ describe('wallet-worker-client', () => {
             expect(walletGetSyncProgress('acct-1')!.appliedIndex).toBe('1490');
         });
 
+        it('keeps the last dust figures through a push that carries none', async () => {
+            await startWalletWorker();
+            const w = latestWorker!;
+            const dust = { balance: '5000', availableNotes: 4, pendingNotes: 0, restoreCount: 0, registeredNightUtxos: 3, totalNightUtxos: 3, at: '2026-09-26T09:00:00.000Z' };
+            w.emit('message', { kind: 'sync-progress', sessionId: 'acct-4', snapshot: { sessionId: 'acct-4', appliedIndex: '9', caughtUp: true, dust } });
+            w.emit('message', { kind: 'sync-progress', sessionId: 'acct-4', snapshot: { sessionId: 'acct-4', appliedIndex: '12', caughtUp: false } });
+            expect(walletGetSyncProgress('acct-4')).toMatchObject({ appliedIndex: '12', dust });
+
+            const newer = { ...dust, availableNotes: 2, at: '2026-09-26T09:05:00.000Z' };
+            w.emit('message', { kind: 'sync-progress', sessionId: 'acct-4', snapshot: { sessionId: 'acct-4', appliedIndex: '13', caughtUp: true, dust: newer } });
+            expect(walletGetSyncProgress('acct-4')!.dust).toEqual(newer);
+        });
+
         it('drops the cached snapshot when the facade is evicted', async () => {
             const w = await startWithResponder(() => ({ ok: true, result: { evicted: true } }));
             w.emit('message', {

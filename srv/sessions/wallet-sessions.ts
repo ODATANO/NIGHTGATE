@@ -822,6 +822,32 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
             }
         };
 
+        // A busy worker (a snapshot restore holds it for minutes) must not read as an empty
+        // pool: the last pushed dust figures stand in, marked stale, never usable.
+        const resolved = new Map<string, { accountId: string; maySeeAmounts: boolean }>();
+        const lastKnown = (sessionId: string, lastError: string) => {
+            const r = resolved.get(sessionId);
+            const progress = r ? walletGetSyncProgress(r.accountId) : null;
+            const d = progress?.dust;
+            if (!r || !d) return null;
+            return {
+                sessionId,
+                configured: true,
+                usable: false,
+                dustBalance: r.maySeeAmounts ? d.balance : null,
+                unshieldedNight: null,
+                totalNightUtxoCount: d.totalNightUtxos,
+                registeredNightUtxos: d.registeredNightUtxos,
+                dustNotes: d.availableNotes,
+                pendingDustNotes: d.pendingNotes,
+                dustRestoreCount: d.restoreCount,
+                caughtUp: syncGateReading(progress).caughtUp,
+                stale: true,
+                asOf: d.at,
+                lastError
+            };
+        };
+
         const readSponsor = async (sessionId: string) => {
             const unusable = (lastError: string) => ({
                 sessionId,
@@ -835,6 +861,8 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
                 pendingDustNotes: 0,
                 dustRestoreCount: 0,
                 caughtUp: false,
+                stale: false,
+                asOf: null,
                 lastError
             });
 
@@ -851,6 +879,7 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
             // Platform sponsors: no owner constraint, no expiry (as resolveFeeSponsor).
             const sess = await loadSigningSessionAccountId(db, sessionId, undefined, true);
             if (!sess.ok) return unusable(sess.msg);
+            resolved.set(sessionId, { accountId: sess.accountId, maySeeAmounts });
 
             const progress = walletGetSyncProgress(sess.accountId);
             // Must not create work: getWalletBalance would build an absent facade
@@ -890,12 +919,15 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
                     pendingDustNotes: pendingNotes,
                     dustRestoreCount: Number(balance?.dustRestoreCount ?? 0),
                     caughtUp: gate.caughtUp,
+                    stale: false,
+                    asOf: new Date().toISOString(),
                     lastError: gate.reason
                 };
             } catch (err) {
                 // One unreadable sponsor must not hide the rest of the pool.
-                return {
-                    ...unusable(err instanceof Error ? err.message : String(err)),
+                const msg = err instanceof Error ? err.message : String(err);
+                return lastKnown(sessionId, msg) ?? {
+                    ...unusable(msg),
                     caughtUp: syncGateReading(walletGetSyncProgress(sess.accountId)).caughtUp
                 };
             }
@@ -912,7 +944,8 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
                 try {
                     rows[index] = await withCap(readSponsor(id), 'sponsor status read');
                 } catch (err) {
-                    rows[index] = {
+                    const msg = err instanceof Error ? err.message : String(err);
+                    rows[index] = lastKnown(id, msg) ?? {
                         sessionId: id,
                         configured: true,
                         usable: false,
@@ -924,7 +957,9 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
                         pendingDustNotes: 0,
                         dustRestoreCount: 0,
                         caughtUp: false,
-                        lastError: err instanceof Error ? err.message : String(err)
+                        stale: false,
+                        asOf: null,
+                        lastError: msg
                     };
                 }
             }

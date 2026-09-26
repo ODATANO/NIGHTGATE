@@ -861,6 +861,8 @@ service NightgateService {
         pendingDustNotes     : Integer; // > 0: spend in flight, or a leaked note
         dustRestoreCount     : Integer;
         caughtUp             : Boolean;
+        stale                : Boolean;   // true: worker did not answer, figures are the last pushed ones
+        asOf                 : Timestamp; // when the figures were read
         lastError            : String;
     };
 

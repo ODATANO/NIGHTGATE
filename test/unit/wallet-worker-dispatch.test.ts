@@ -1817,6 +1817,37 @@ describe('progress watch tick', () => {
         await rpc('evict', { sessionId: SESSION });
     });
 
+    it('pushes the dust figures with the verdict', async () => {
+        const SESSION = 'session-watch-dust-pppppppp';
+        await initSession(SESSION);
+        const entry = workerExports.facades.get(SESSION);
+        entry.dustRestoresPersisted = 2;
+        workerExports.streamTipCache.clear();
+        wsTip.maxId = '100';
+        facadeState.current = {
+            dust: {
+                progress: { appliedIndex: '100', isConnected: true },
+                balance: () => 7000n,
+                totalCoins: [{}, {}, {}],
+                pendingCoins: [{}],
+                availableCoins: [{}, {}]
+            },
+            unshielded: { totalCoins: [{ meta: { registeredForDustGeneration: true } }, { meta: {} }] }
+        };
+        stubIndexerTip(Date.now());
+        try {
+            await workerExports.progressWatchTick(SESSION, entry, Date.now() + 120_000);
+            const pushed = fakeParentPort.postMessage.mock.calls.map(c => c[0]).filter((m: any) => m.kind === 'sync-progress' && m.sessionId === SESSION).at(-1);
+            expect(pushed.snapshot.dust).toMatchObject({
+                balance: '7000', availableNotes: 2, pendingNotes: 1, restoreCount: 2,
+                registeredNightUtxos: 1, totalNightUtxos: 2
+            });
+            expect(Number.isFinite(Date.parse(pushed.snapshot.dust.at))).toBe(true);
+        } finally {
+            await rpc('evict', { sessionId: SESSION });
+        }
+    });
+
     it('keeps the last stream tip through a failed read inside the grace window, and drops it after', async () => {
         const SESSION = 'session-watch-grace-nnnnnnnn';
         await initSession(SESSION);

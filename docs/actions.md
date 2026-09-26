@@ -663,7 +663,7 @@ Response:
 
 **Wallet still syncing:** after `NIGHTGATE_WALLET_READ_SYNC_TIMEOUT_MS` (default 10 s) without reaching the indexer tip the read answers `503 WALLET_SYNCING` (retryable; poll again once the prewarm job is ready). Same gate for the fee estimate.
 
-### `getSponsorPoolStatus() → [{ sessionId, configured, usable, dustBalance, unshieldedNight, totalNightUtxoCount, registeredNightUtxos, dustNotes, pendingDustNotes, dustRestoreCount, caughtUp, lastError }]`
+### `getSponsorPoolStatus() → [{ sessionId, configured, usable, dustBalance, unshieldedNight, totalNightUtxoCount, registeredNightUtxos, dustNotes, pendingDustNotes, dustRestoreCount, caughtUp, stale, asOf, lastError }]`
 
 Health of every session in `NIGHTGATE_FEE_SPONSOR_SESSION` / `cds.requires.nightgate.feeSponsorSessions`.
 
@@ -673,6 +673,7 @@ Health of every session in `NIGHTGATE_FEE_SPONSOR_SESSION` / `cds.requires.night
 - `caughtUp`: the sync gate a sponsored job must pass (connected, within `NIGHTGATE_SYNC_TIP_GAP` events of the dust stream tip, indexer fresh), as last pushed by the worker every `NIGHTGATE_PROGRESS_WATCH_MS`; a reading older than two intervals counts as false. A readable balance does not imply it; `lastError` then says why.
 - `dustBalance`, `unshieldedNight`: null unless admin or session owner. An unreadable sponsor is a row with `lastError`.
 - Never builds a cold facade: a sponsor neither resident nor reporting progress returns `lastError`. Per-sponsor cap `NIGHTGATE_SPONSOR_STATUS_TIMEOUT_MS` (default 45 s), enforced on the worker RPC.
+- `stale: true`: the worker did not answer within the cap (e.g. while it restores another wallet's snapshot); the dust figures are the last ones the worker pushed, read at `asOf`, `usable` is false, `unshieldedNight` null and `lastError` says why. `stale: false`: read now, `asOf` is the read time.
 - Not available to agent tokens (403).
 
 **Rate limit:** 60/min per client IP.
@@ -692,6 +693,8 @@ Response:
     "pendingDustNotes": 0,
     "dustRestoreCount": 0,
     "caughtUp": true,
+    "stale": false,
+    "asOf": "2026-09-26T09:12:40.118Z",
     "lastError": null
   }
 ]
