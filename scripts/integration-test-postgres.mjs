@@ -118,7 +118,7 @@ try {
     const provider = {
         getBlock: async () => ({ block: { header: { parentHash: '0xnoparent-pg', number: '0x09', stateRoot: '0xstate-pg' }, extrinsics: [extrinsic] }, justifications: null }),
         getRuntimeVersion: async () => ({ specVersion: 77 }),
-        // Timestamp::Now for the timestamp key, no System.Events (null).
+        // Timestamp::Now for the timestamp key; System.Events are stubbed below.
         getStorage: async (key) => (/^0xf0c365c3/.test(key) ? timestampHex : null),
         getMetadata: async () => { throw new Error('no metadata in this lane'); }
     };
@@ -128,6 +128,8 @@ try {
     // (registry + pallet map) for the spec version is pre-seeded so no
     // metadata fetch happens; the default pallet map classifies the extrinsic.
     processor.runtimes?.set?.(77, { registry: { metadata: { pallets: [] } }, palletMap: processor.defaultPalletMap });
+    // A block with extrinsics needs its events; this lane has none to decode, so it projects none.
+    processor.decodeBlockEvents = () => null;
     await db.run(cds.ql.DELETE.from('midnight.SyncState'));
     await db.run(cds.ql.INSERT.into('midnight.SyncState').entries({ ID: 'SINGLETON', syncStatus: 'stopped', lastIndexedHeight: 0, chainHeight: 0, consecutiveErrors: 0 }));
     const warn = cds.log('nightgate:crawler').warn;
