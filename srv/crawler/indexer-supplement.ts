@@ -212,28 +212,54 @@ export function isIndexerRateLimit(err: unknown): boolean {
     return err instanceof IndexerHttpError && (err.status === 403 || err.status === 429);
 }
 
-/** Minimal GraphQL client; the indexer needs no credentials for these reads. */
+/** One GraphQL POST; the indexer needs no credentials for these reads. */
+async function postQuery(url: string, query: string, variables: Record<string, unknown>, timeoutMs: number, what: string): Promise<any> {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+        const res = await fetch(url, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ query, variables }),
+            signal: controller.signal
+        });
+        if (!res.ok) throw new IndexerHttpError(res.status);
+        const body: any = await res.json();
+        if (body?.errors?.length) {
+            throw new Error(`indexer rejected the ${what} query: ${JSON.stringify(body.errors).slice(0, 200)}`);
+        }
+        return body?.data;
+    } finally {
+        clearTimeout(timer);
+    }
+}
+
 export function createIndexerClient(url: string, timeoutMs = 20000): IndexerClient {
     return {
         async fetchBlock(height: number): Promise<SupplementBlock | null> {
-            const controller = new AbortController();
-            const timer = setTimeout(() => controller.abort(), timeoutMs);
-            try {
-                const res = await fetch(url, {
-                    method: 'POST',
-                    headers: { 'content-type': 'application/json' },
-                    body: JSON.stringify({ query: BLOCK_QUERY, variables: { height } }),
-                    signal: controller.signal
-                });
-                if (!res.ok) throw new IndexerHttpError(res.status);
-                const body: any = await res.json();
-                if (body?.errors?.length) {
-                    throw new Error(`indexer rejected the block query: ${JSON.stringify(body.errors).slice(0, 200)}`);
-                }
-                return readSupplementBlock(body?.data);
-            } finally {
-                clearTimeout(timer);
-            }
+            return readSupplementBlock(await postQuery(url, BLOCK_QUERY, { height }, timeoutMs, 'block'));
         }
     };
+}
+
+const CONTRACT_STATE_QUERY = `query($address: HexEncoded!, $offset: ContractActionOffset) {
+  contractAction(address: $address, offset: $offset) { state zswapState }
+}`;
+
+/**
+ * A contract's state as of `height` (its newest action at or below it), or its
+ * newest state without a height; base64 like the supplement's. Null when the
+ * indexer knows no action of the contract there.
+ */
+export async function fetchContractState(
+    url: string,
+    address: string,
+    height: number | null,
+    timeoutMs = 20000
+): Promise<{ state: string | null; zswapState: string | null } | null> {
+    const offset = height == null ? null : { blockOffset: { height } };
+    const data = await postQuery(url, CONTRACT_STATE_QUERY, { address, offset }, timeoutMs, 'contract state');
+    const action = data?.contractAction;
+    if (!action) return null;
+    return { state: toBinary(action.state), zswapState: toBinary(action.zswapState) };
 }

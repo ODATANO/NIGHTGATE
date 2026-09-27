@@ -72,6 +72,31 @@ service NightgateService {
     @readonly
     entity ContractBalances      as projection on midnight.ContractBalances;
 
+    /** A contract state as of a block; state and zswapState base64. */
+    type ContractStateSnapshot {
+        address        : String;
+        height         : Integer64; // block of the action the state comes from; null if unknown locally
+        state          : LargeString;
+        zswapState     : LargeString;
+        stateHash      : String;
+        zswapStateHash : String;
+        source         : String(10); // history | current | indexer
+        verified       : Boolean; // indexer only: matches the hash stored for that action
+    }
+
+    /** The newest state per contract. */
+    @readonly
+    entity ContractStates        as
+        projection on midnight.ContractStates {
+            *,
+            contractAction
+        }
+        actions {
+            // height: the state after the contract's newest action at or below it; omitted = current
+            @cds.odata.bindingparameter.collection
+            function stateAt(address: String, height: Integer64) returns ContractStateSnapshot;
+        };
+
     // ---- UTXOs ----
 
     @readonly

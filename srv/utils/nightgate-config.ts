@@ -1,7 +1,7 @@
 import cds from '@sap/cds';
 import { deriveIndexerWsUrl } from './indexer-url';
 import { DEFAULT_PROOF_TIMEOUT_MS } from './proof-timeout';
-import { configBool, configEnum, configInt, configString, setConfigOverrideSource, setConfigWarnSink } from './config';
+import { configBool, configEnum, configInt, configList, configString, setConfigOverrideSource, setConfigWarnSink } from './config';
 import { configSpec, parseConfigValue } from './config-table';
 
 // Typed accessors in `./config` also read `cds.requires.nightgate.<camelCase>`
@@ -289,6 +289,8 @@ export function resolveNightgateRuntimeConfig(config: Record<string, any> = {}):
     const decodePayloadsEnv = configBool('NIGHTGATE_CRAWLER_DECODE_PAYLOADS');
     const indexerSupplementEnv = configBool('NIGHTGATE_CRAWLER_INDEXER_SUPPLEMENT');
     const supplementBlocksPerSecondEnv = configInt('NIGHTGATE_CRAWLER_SUPPLEMENT_MAX_BPS');
+    const contractStateHistoryEnv = configEnum<string>('NIGHTGATE_CRAWLER_CONTRACT_STATE_HISTORY');
+    const contractStateWatchEnv = configList('NIGHTGATE_CRAWLER_CONTRACT_STATE_WATCH');
     const crawlerConfig: Record<string, unknown> = {
         ...rawCrawlerConfig,
         ...(fetchConcurrencyEnv != null && { fetchConcurrency: fetchConcurrencyEnv }),
@@ -298,6 +300,8 @@ export function resolveNightgateRuntimeConfig(config: Record<string, any> = {}):
         ...(decodePayloadsEnv != null && { decodePayloads: decodePayloadsEnv }),
         ...(indexerSupplementEnv != null && { indexerSupplement: indexerSupplementEnv }),
         ...(supplementBlocksPerSecondEnv != null && { supplementBlocksPerSecond: supplementBlocksPerSecondEnv }),
+        ...(contractStateHistoryEnv != null && { contractStateHistory: contractStateHistoryEnv }),
+        ...(contractStateWatchEnv.length > 0 && { contractStateWatch: contractStateWatchEnv }),
         ...(crawlerEnabledOverride != null && { enabled: crawlerEnabledOverride })
     };
     const configuredNetwork = getConfiguredNightgateNetwork(config);

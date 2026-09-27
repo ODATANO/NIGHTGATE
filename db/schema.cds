@@ -127,8 +127,15 @@ entity ContractActions : cuid, managed {
     // their circuit names and states would be assigned by chance.
     actionIndex        : Integer;
     address            : HexEncoded; // from the pallet's contract event
-    state              : LargeBinary; // not on the block; the indexer supplement fills it
+    // Not on the block; the indexer supplement fills them. The full state is
+    // kept only under `crawler.contractStateHistory` (watched / all); the hash
+    // and size always, the newest state per contract in ContractStates.
+    state              : LargeBinary;
     zswapState         : LargeBinary;
+    stateHash          : HexEncoded; // sha256 of the state bytes
+    stateSize          : Integer; // bytes
+    zswapStateHash     : HexEncoded; // sha256 of the zswap state bytes
+    zswapStateSize     : Integer; // bytes
     actionType         : ContractActionType not null;
     entryPoint         : String(256); // CALL only
 
@@ -142,6 +149,17 @@ entity ContractBalances : cuid {
     tokenType      : HexEncoded not null;
     amount         : BigInt not null; // u128
     contractAction : Association to ContractActions;
+}
+
+/** The newest state per contract, from the action at the highest supplemented height. */
+entity ContractStates : managed {
+    key address        : HexEncoded;
+        height         : Integer64 not null; // block of the action the state comes from
+        state          : LargeBinary;
+        zswapState     : LargeBinary;
+        stateHash      : HexEncoded;
+        zswapStateHash : HexEncoded;
+        contractAction : Association to ContractActions;
 }
 
 // The ledger identifies a UTXO by its intent and output number, and one

@@ -11,6 +11,7 @@ const log = cds.log('nightgate:crawler');
 import { rollbackIndexedDataFromHeight } from './rollback';
 import { LedgerPayloadDecoder } from './LedgerPayloadDecoder';
 import { IndexerSupplement } from './IndexerSupplement';
+import { contractStatePolicy } from './contract-state';
 import { SyncState, ReorgLog, Blocks } from '#cds-models/midnight';
 
 export interface CrawlerConfig {
@@ -28,6 +29,8 @@ export interface CrawlerConfig {
     indexerSupplement?: boolean;  // Fill what a block lacks from the indexer (default: false)
     indexerUrl?: string;  // GraphQL endpoint for the supplement pass
     supplementBlocksPerSecond?: number;  // Indexer requests per second of the supplement pass, one per block (default: 2)
+    contractStateHistory?: string;  // Which actions keep their full contract state: none | watched | all (default: none)
+    contractStateWatch?: string[];  // Contract addresses kept under `watched`
 }
 
 interface ReorgInfo {
@@ -87,7 +90,9 @@ export class MidnightCrawler {
             decodePayloads: config.decodePayloads ?? false,
             indexerSupplement: config.indexerSupplement ?? false,
             indexerUrl: config.indexerUrl || '',
-            supplementBlocksPerSecond: config.supplementBlocksPerSecond ?? 2
+            supplementBlocksPerSecond: config.supplementBlocksPerSecond ?? 2,
+            contractStateHistory: config.contractStateHistory || 'none',
+            contractStateWatch: config.contractStateWatch ?? []
         };
     }
 
@@ -165,13 +170,14 @@ export class MidnightCrawler {
                     intervalMs: 1000,
                     lagBlocks: 10,
                     requestTimeoutMs: this.config.requestTimeout,
-                    maxBlocksPerSecond: this.config.supplementBlocksPerSecond
+                    maxBlocksPerSecond: this.config.supplementBlocksPerSecond,
+                    contractState: contractStatePolicy(this.config.contractStateHistory, this.config.contractStateWatch)
                 });
                 await this.supplement.init(this.db);
                 this.supplement.start();
                 let host = this.config.indexerUrl;
                 try { host = new URL(this.config.indexerUrl).host; } catch { /* logged as given */ }
-                log.info(`Indexer supplement enabled (trailing pass, ${this.config.supplementBlocksPerSecond} blocks/s, ${host})`);
+                log.info(`Indexer supplement enabled (trailing pass, ${this.config.supplementBlocksPerSecond} blocks/s, ${host}, contract state history: ${this.config.contractStateHistory})`);
             }
         }
     }

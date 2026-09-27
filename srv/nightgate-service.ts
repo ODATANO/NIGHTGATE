@@ -11,6 +11,36 @@ import { attachRuntimeGate } from './utils/runtime-gate';
 import { registerSubmissionHandlers } from './submission/handlers';
 import { registerDocumentProofHandlers } from './submission/document-proof';
 import { getJobById } from './submission/background-jobs';
+import { contractStateAt, type ContractStateFetcher } from './crawler/contract-state';
+import { fetchContractState } from './crawler/indexer-supplement';
+import { getNightgatePluginConfig, resolveNightgateRuntimeConfig } from './utils/nightgate-config';
+import { RateLimiter } from './utils/rate-limiter';
+
+// Shared by every caller: the public indexers block the whole host IP under load.
+const stateAtIndexerLimiter = new RateLimiter({ windowMs: 1000, maxRequests: 2 });
+
+class IndexerBudgetExhausted extends Error {
+    constructor(readonly retryAfterMs: number) { super('indexer request budget exhausted'); }
+}
+
+/** Reads a contract state from the supplement's indexer, then the submission side's if that one fails. */
+function fetchContractStateFromIndexers(): ContractStateFetcher {
+    const { crawlerConfig, submissionEndpoints } = resolveNightgateRuntimeConfig(getNightgatePluginConfig());
+    const urls = [...new Set([String(crawlerConfig.indexerUrl || ''), submissionEndpoints.indexerHttpUrl].filter(Boolean))];
+    return async (address, height) => {
+        const budget = stateAtIndexerLimiter.check('indexer');
+        if (!budget.allowed) throw new IndexerBudgetExhausted(budget.retryAfterMs);
+        let lastError: unknown;
+        for (const url of urls) {
+            try {
+                return await fetchContractState(url, address, height);
+            } catch (err) {
+                lastError = err;
+            }
+        }
+        throw lastError ?? new Error('no indexer configured');
+    };
+}
 
 import { Blocks, Transactions, ContractActions, UnshieldedUtxos, NightBalances, WalletSessions } from '#cds-models/midnight';
 
@@ -123,6 +153,32 @@ export default class NightgateService extends cds.ApplicationService {
                     .orderBy('createdAt desc')
                     .limit(100)
             );
+        });
+
+        this.on('READ', 'ContractStates', async (req: Request) => {
+            return await this.db.run(req.query) || [];
+        });
+
+        this.on('stateAt', 'ContractStates', async (req: Request) => {
+            const { address, height } = req.data as { address?: string; height?: number | null };
+            if (!address || !/^(0x)?[0-9a-fA-F]+$/.test(address)) return req.reject(400, 'address (hex) is required');
+            if (height != null && (!Number.isInteger(Number(height)) || Number(height) < 0)) {
+                return req.reject(400, 'height must be a non-negative integer');
+            }
+            try {
+                const snapshot = await contractStateAt(
+                    this.db, address, height == null ? null : Number(height), fetchContractStateFromIndexers()
+                );
+                if (!snapshot) return req.reject(404, `no state known for contract ${address}`);
+                return snapshot;
+            } catch (err) {
+                if (err instanceof IndexerBudgetExhausted) {
+                    const seconds = Math.max(1, Math.ceil(err.retryAfterMs / 1000));
+                    try { (req as any).http?.res?.set?.('Retry-After', String(seconds)); } catch { /* header is a courtesy */ }
+                    return req.reject(429, `Rate limited. Retry after ${seconds}s`);
+                }
+                return req.reject(502, `indexer could not serve the contract state: ${(err as Error).message}`);
+            }
         });
 
         // UTXOs

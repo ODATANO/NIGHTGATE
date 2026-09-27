@@ -1,5 +1,44 @@
 # Changelog
 
+## 0.27.0 - 2026-09-27
+
+### Breaking
+
+- The indexer supplement no longer stores the full contract state on every
+  `ContractActions` row. Each action gets `stateHash`/`zswapStateHash`
+  (sha256) and `stateSize`/`zswapStateSize`; the full state stays only under
+  `crawler.contractStateHistory` `watched` (addresses in
+  `crawler.contractStateWatch`) or `all`
+  (`NIGHTGATE_CRAWLER_CONTRACT_STATE_HISTORY`, `_WATCH`). Default `none`.
+
+### Features
+
+- `ContractStates`: the newest state per contract, written by the supplement
+  (a higher block wins, the same block replaces); a rollback drops the rows at
+  or above the fork height.
+- `ContractStates/stateAt(address, height)`: the state after the contract's
+  newest action at or below `height`, from `ContractStates`, a kept per-action
+  state, or the indexer (supplement URL, then `NIGHTGATE_INDEXER_HTTP_URL`),
+  with `source` and `verified` (indexer bytes against the stored hash).
+  Above the crawler's indexed tip, or when the newest action at that height
+  has no hash yet, `verified` is null. Indexer reads are capped at 2 per
+  second across callers (429 + `Retry-After`).
+- `nightgate-compact-contract-state` (`scripts/compact-contract-state.mjs`,
+  `--dry-run`, `--batch`): moves stored per-action states to the new layout,
+  honours the history setting, idempotent.
+
+### Fixes
+
+- The payload decoder marks `SYSTEM` transactions `absent` instead of trying to
+  deserialize them as a ledger `Transaction`, which failed on every one and
+  logged a warning each.
+
+### Schema
+
+- New columns on `ContractActions`, new entity `ContractStates`; additive
+  (`cds deploy` on PostgreSQL, `nightgate-schema-delta` on SQLite). The startup
+  preflight probes both.
+
 ## 0.26.0 - 2026-09-26
 
 ### Breaking

@@ -6,7 +6,7 @@
 import cds from '@sap/cds';
 const { SELECT, INSERT, UPDATE, DELETE } = cds.ql;
 import {
-    Blocks, Transactions, ContractActions, ContractBalances, UnshieldedUtxos,
+    Blocks, Transactions, ContractActions, ContractBalances, ContractStates, UnshieldedUtxos,
     ZswapLedgerEvents, DustLedgerEvents, TransactionFees, TransactionResults,
     TransactionSegments, NightBalances, SyncState, PendingSubmissions, BackgroundJobs
 } from '#cds-models/midnight';
@@ -121,6 +121,10 @@ export async function rollbackIndexedDataFromHeight(
         await tx.run(DELETE.from(Transactions).where({ block_ID: { in: ids } }));
         await tx.run(DELETE.from(Blocks).where({ ID: { in: ids } }));
     });
+    // A current state from a rolled-back block is void; the older one is not
+    // stored, so the contract has none until the supplement re-applies the
+    // chain or its next action lands (stateAt reads the indexer meanwhile).
+    await tx.run(DELETE.from(ContractStates).where({ height: { '>=': fromHeight } }));
 
     for (const address of affected) {
         await recomputeNightBalance(tx, address);

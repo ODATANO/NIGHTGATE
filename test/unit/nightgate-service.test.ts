@@ -35,6 +35,7 @@ const cap = cds.test(__dirname + '/../..');
 const BLOCKS = 'midnight.Blocks';
 const TRANSACTIONS = 'midnight.Transactions';
 const CONTRACT_ACTIONS = 'midnight.ContractActions';
+const CONTRACT_STATES = 'midnight.ContractStates';
 const UNSHIELDED_UTXOS = 'midnight.UnshieldedUtxos';
 const NIGHT_BALANCES = 'midnight.NightBalances';
 const BACKGROUND_JOBS = 'midnight.BackgroundJobs';
@@ -440,6 +441,53 @@ describe('ContractActions', () => {
         await expect(
             srv.send({ event: 'history', entity: 'ContractActions', data: {} })
         ).rejects.toMatchObject({ message: 'address is required' });
+    });
+});
+
+// ----------------------------------------------------------------------------
+// ContractStates
+// ----------------------------------------------------------------------------
+describe('ContractStates', () => {
+    const ADDRESS = 'ab'.repeat(32);
+
+    beforeEach(async () => {
+        await db.run(cds.ql.DELETE.from(CONTRACT_STATES));
+    });
+
+    it('READ and stateAt() serve the stored current state over OData', async () => {
+        const blockId = await seedBlock(7);
+        const txId = await seedTransaction(blockId);
+        const actionId = await seedContractAction(txId, { address: ADDRESS, stateHash: 'h1' });
+        await db.run(cds.ql.INSERT.into(CONTRACT_STATES).entries({
+            address: ADDRESS, height: 7, state: Buffer.from('st').toString('base64'), stateHash: 'h1', contractAction_ID: actionId
+        }));
+
+        const list = await cap.GET(`${API}/ContractStates`);
+        expect(list.data.value.map((r: any) => r.address)).toEqual([ADDRESS]);
+
+        const res = await cap.GET(`${API}/ContractStates/stateAt(address='0x${ADDRESS}',height=null)`);
+        expect(res.data).toEqual(expect.objectContaining({ address: ADDRESS, height: 7, source: 'current', stateHash: 'h1' }));
+        expect(Buffer.from(res.data.state, 'base64').toString()).toBe('st');
+    });
+
+    it('stateAt() rejects an address that is not hex', async () => {
+        await expect(
+            srv.send({ event: 'stateAt', entity: 'ContractStates', data: { address: 'not-hex' } })
+        ).rejects.toMatchObject({ message: 'address (hex) is required' });
+    });
+
+    it('stateAt() caps its indexer reads across callers', async () => {
+        const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async () =>
+            new Response(JSON.stringify({ data: { contractAction: null } }), { status: 200 }));
+        try {
+            const ask = () => srv.send({ event: 'stateAt', entity: 'ContractStates', data: { address: 'cd'.repeat(32) } })
+                .then(() => 200, (err: any) => err.code ?? err.status);
+            const codes = [await ask(), await ask(), await ask()];
+            expect(codes).toContain(429);
+            expect(fetchSpy.mock.calls.length).toBeLessThanOrEqual(2);
+        } finally {
+            fetchSpy.mockRestore();
+        }
     });
 });
 

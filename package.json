@@ -1,6 +1,6 @@
 {
   "name": "@odatano/nightgate",
-  "version": "0.26.0",
+  "version": "0.27.0",
   "description": "CAP Plugin: Midnight Blockchain Indexer with OData V4 API",
   "homepage": "https://github.com/ODATANO/NIGHTGATE#readme",
   "repository": {
@@ -124,6 +124,7 @@
     "scripts/migrate-sqlite-to-postgres.mjs",
     "scripts/migrate-values.mjs",
     "scripts/rewrap-encryption-keys.mjs",
+    "scripts/compact-contract-state.mjs",
     "docker/cds-config.mjs",
     "README.md",
     "LICENSE"
@@ -132,7 +133,8 @@
     "nightgate-schema-delta": "scripts/apply-schema-delta.mjs",
     "nightgate-fetch-keys": "scripts/fetch-contract-keys.mjs",
     "nightgate-db-migrate": "scripts/migrate-sqlite-to-postgres.mjs",
-    "nightgate-rewrap-keys": "scripts/rewrap-encryption-keys.mjs"
+    "nightgate-rewrap-keys": "scripts/rewrap-encryption-keys.mjs",
+    "nightgate-compact-contract-state": "scripts/compact-contract-state.mjs"
   },
   "scripts": {
     "clean": "node scripts/clean-build-artifacts.js",

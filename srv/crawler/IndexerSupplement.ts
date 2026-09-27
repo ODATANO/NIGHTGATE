@@ -13,6 +13,10 @@ import {
     type SupplementTransaction, type SupplementLedgerEvent, type SupplementDustEvent
 } from './indexer-supplement';
 import { readCapBinary } from './cap-binary';
+import {
+    DEFAULT_CONTRACT_STATE_POLICY, digestOfBase64, keepsStateHistory, upsertCurrentState,
+    type ContractStatePolicy
+} from './contract-state';
 import { lockReorgGeneration } from '../submission/reorg-generation';
 import {
     Blocks, Transactions, TransactionResults, TransactionSegments, TransactionFees,
@@ -41,6 +45,8 @@ export interface IndexerSupplementConfig {
      * block), so the batch size no longer sets the rate. 0 or unset = unpaced.
      */
     maxBlocksPerSecond?: number;
+    /** Which actions keep their full contract state; default none (hash and size only). */
+    contractState?: ContractStatePolicy;
 }
 
 /** First wait after the indexer refused (403/429); doubles per refusal up to RATE_LIMIT_MAX_MS. */
@@ -177,7 +183,7 @@ export class IndexerSupplement {
                 return this.endBefore(start, blocks, index, result);
             }
             await this.applyBlockFields(block.ID, height, answer);
-            const perBlock = await this.applyBlock(answer.transactions);
+            const perBlock = await this.applyBlock(height, answer.transactions);
             result.transactions += perBlock.transactions;
             result.fees += perBlock.fees;
             result.segments += perBlock.segments;
@@ -227,7 +233,7 @@ export class IndexerSupplement {
         return stored ? stored.toString('base64') : '';
     }
 
-    private async applyBlock(transactions: SupplementTransaction[]): Promise<SupplementRunResult> {
+    private async applyBlock(height: number, transactions: SupplementTransaction[]): Promise<SupplementRunResult> {
         const result: SupplementRunResult = { ...EMPTY_RUN };
         if (transactions.length === 0) return result;
 
@@ -244,7 +250,7 @@ export class IndexerSupplement {
             await this.db.tx(async (dbTx: any) => {
                 result.fees += await this.applyFee(dbTx, transactionId, tx);
                 result.segments += await this.applySegments(dbTx, transactionId, tx);
-                result.balances += await this.applyContractState(dbTx, transactionId, tx);
+                result.balances += await this.applyContractState(dbTx, transactionId, height, tx);
                 result.zswapEvents += await this.replaceZswapEvents(dbTx, transactionId, tx.zswapEvents);
                 result.dustEvents += await this.replaceDustEvents(dbTx, transactionId, tx.dustEvents);
                 result.dustFlags += await this.applyDustFlags(dbTx, tx);
@@ -279,12 +285,13 @@ export class IndexerSupplement {
     }
 
     /**
-     * Fills `state`/`zswapState` on the contract actions the node already
-     * recorded and replaces their balances. Actions the node does not have,
-     * a call in a failed segment above all, are the indexer's declared set and
-     * are not invented here.
+     * Records the state hash and size on the contract actions the node already
+     * recorded, makes each state the contract's current one, keeps the full
+     * state per action only under the history policy, and replaces their
+     * balances. Actions the node does not have, a call in a failed segment
+     * above all, are the indexer's declared set and are not invented here.
      */
-    private async applyContractState(dbTx: any, transactionId: string, tx: SupplementTransaction): Promise<number> {
+    private async applyContractState(dbTx: any, transactionId: string, height: number, tx: SupplementTransaction): Promise<number> {
         if (tx.contractActions.length === 0) return 0;
         const actions: any[] = await dbTx.run(
             SELECT.from(ContractActions).columns('ID', 'actionIndex', 'address', 'actionType')
@@ -327,9 +334,30 @@ export class IndexerSupplement {
             for (let i = 0; i < mine.length; i++) {
                 const action = mine[i];
                 const match = matched[i];
+                const state = digestOfBase64(match.state);
+                const zswapState = digestOfBase64(match.zswapState);
+                const keep = keepsStateHistory(this.config.contractState ?? DEFAULT_CONTRACT_STATE_POLICY, action.address);
                 await dbTx.run(UPDATE.entity(ContractActions)
-                    .set({ state: match.state as any, zswapState: match.zswapState as any })
+                    .set({
+                        state: (keep ? match.state : null) as any,
+                        zswapState: (keep ? match.zswapState : null) as any,
+                        stateHash: state.hash,
+                        stateSize: state.size,
+                        zswapStateHash: zswapState.hash,
+                        zswapStateSize: zswapState.size
+                    })
                     .where({ ID: action.ID }));
+                if (match.state != null && action.address) {
+                    await upsertCurrentState(dbTx, {
+                        address: action.address,
+                        height,
+                        state: match.state,
+                        zswapState: match.zswapState,
+                        stateHash: state.hash,
+                        zswapStateHash: zswapState.hash,
+                        contractActionId: action.ID
+                    });
+                }
                 await dbTx.run(DELETE.from(ContractBalances).where({ contractAction_ID: action.ID }));
                 if (match.balances.length === 0) continue;
                 await dbTx.run(INSERT.into(ContractBalances).entries(match.balances.map(balance => ({

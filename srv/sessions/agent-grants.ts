@@ -60,7 +60,7 @@ export const SPONSOR_PHASE2_ACTIONS: ReadonlySet<string> = new Set([
  */
 export const AGENT_READABLE_ENTITIES: ReadonlySet<string> = new Set([
     'Blocks', 'Transactions', 'TransactionResults', 'TransactionSegments', 'TransactionFees',
-    'ContractActions', 'ContractBalances', 'UnshieldedUtxos', 'ZswapLedgerEvents',
+    'ContractActions', 'ContractBalances', 'ContractStates', 'UnshieldedUtxos', 'ZswapLedgerEvents',
     'DustLedgerEvents', 'NightBalances', 'PredicateAttestations', 'DisclosureGrants',
     'WalletSessions', 'PendingSubmissions', 'AgentGrants', 'Documents'
 ]);
@@ -82,6 +82,7 @@ export const AGENT_ALWAYS_ALLOWED_EVENTS: ReadonlySet<string> = new Set([
     'latest', 'byHeight', 'range',          // Blocks
     'byHash', 'byType',                     // Transactions
     'byAddress', 'history',                 // ContractActions
+    'stateAt',                              // ContractStates
     'byOwner', 'unspent',                   // UnshieldedUtxos
     'getBalance', 'getTopHolders',          // NightBalances
     // Not getSponsorPoolStatus: as the operator, a token would read every

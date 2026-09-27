@@ -139,7 +139,7 @@ export class LedgerPayloadDecoder {
         // the cursor is the only gate, so resetting it replays the range,
         // which is how a decoder fix is rolled out.
         const rows: any[] = await this.db.run(
-            SELECT.from(Transactions).columns('ID', 'raw', 'payloadDecode')
+            SELECT.from(Transactions).columns('ID', 'raw', 'payloadDecode', 'transactionType')
                 .where({ block_ID: blockId })
         ) || [];
         if (rows.length === 0) return EMPTY_RUN;
@@ -150,6 +150,13 @@ export class LedgerPayloadDecoder {
         const result: DecodeRunResult = { ...EMPTY_RUN, transactions: rows.length };
 
         for (const row of rows) {
+            // Inherents and MidnightSystem calls carry no ledger Transaction;
+            // their arguments only look like a length-prefixed payload.
+            if (row.transactionType === 'SYSTEM') {
+                updates.push({ id: row.ID, facts: null, state: 'absent' });
+                result.absent++;
+                continue;
+            }
             const buf = await readCapBinary(row.raw);
             const call = buf ? parseExtrinsicCall('0x' + buf.toString('hex')) : null;
             const payload = call ? extractLedgerPayload(call.buf, call.argsOffset) : null;

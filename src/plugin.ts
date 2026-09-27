@@ -184,6 +184,8 @@ const plugin = {
                             indexerSupplement: { type: 'boolean', description: 'Fill what a block does not carry (segments, contract state and balances, ledger-event streams, the DUST registration flag) from the Midnight indexer, in a pass behind the indexed tip (default: false). Override via NIGHTGATE_CRAWLER_INDEXER_SUPPLEMENT env var.' },
                             indexerUrl: { type: 'string', description: 'GraphQL endpoint for the supplement pass (default: the configured indexerHttpUrl).' },
                             supplementBlocksPerSecond: { type: 'number', description: 'Indexer requests per second of the supplement pass, one per block (default: 2). Override via NIGHTGATE_CRAWLER_SUPPLEMENT_MAX_BPS env var.' },
+                            contractStateHistory: { type: 'string', enum: ['none', 'watched', 'all'], description: 'Which contract actions keep their full state from the supplement (default: none). Every action keeps a sha256 and the size; the newest state per contract is in ContractStates. Override via NIGHTGATE_CRAWLER_CONTRACT_STATE_HISTORY env var.' },
+                            contractStateWatch: { type: 'array', items: { type: 'string' }, description: 'Contract addresses (hex) whose full state per action is kept under contractStateHistory: watched. Override via NIGHTGATE_CRAWLER_CONTRACT_STATE_WATCH env var.' },
                             maxRetries: { type: 'number', description: 'Max retries per block before error (default: 3)' },
                             retryDelay: { type: 'number', description: 'Base retry delay in ms (default: 2000)' },
                             requestTimeout: { type: 'number', description: 'RPC request timeout ms (default: 30000)' }

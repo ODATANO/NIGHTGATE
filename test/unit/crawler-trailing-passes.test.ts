@@ -8,6 +8,7 @@
  */
 
 import cds from '@sap/cds';
+import { createHash } from 'node:crypto';
 
 const decodeLedgerPayload = vi.fn();
 vi.mock('../../srv/crawler/ledger-payload', async (importOriginal) => ({
@@ -20,6 +21,9 @@ import { IndexerSupplement, RATE_LIMIT_BACKOFF_MS } from '../../srv/crawler/Inde
 import { IndexerHttpError, createIndexerClient, isIndexerRateLimit } from '../../srv/crawler/indexer-supplement';
 import { rollbackIndexedDataFromHeight } from '../../srv/crawler/rollback';
 import { readCapBinary } from '../../srv/crawler/cap-binary';
+import {
+    compactStoredContractState, contractStateAt, contractStatePolicy, type ContractStatePolicy
+} from '../../srv/crawler/contract-state';
 
 cds.test(__dirname + '/../..');
 
@@ -33,6 +37,9 @@ const UNSHIELDED_UTXOS = 'midnight.UnshieldedUtxos';
 const ZSWAP_EVENTS = 'midnight.ZswapLedgerEvents';
 const DUST_EVENTS = 'midnight.DustLedgerEvents';
 const SYNC_STATE = 'midnight.SyncState';
+const CONTRACT_STATES = 'midnight.ContractStates';
+
+const sha256 = (text: string): string => createHash('sha256').update(Buffer.from(text, 'utf8')).digest('hex');
 
 const CONTRACT = 'cc'.repeat(32);
 
@@ -108,7 +115,7 @@ beforeEach(async () => {
     vi.clearAllMocks();
     decodeLedgerPayload.mockReset();
     for (const entity of [
-        CONTRACT_BALANCES, CONTRACT_ACTIONS, TX_SEGMENTS, TX_RESULTS, 'midnight.TransactionFees',
+        CONTRACT_STATES, CONTRACT_BALANCES, CONTRACT_ACTIONS, TX_SEGMENTS, TX_RESULTS, 'midnight.TransactionFees',
         ZSWAP_EVENTS, DUST_EVENTS, UNSHIELDED_UTXOS, TRANSACTIONS, BLOCKS
     ]) {
         await db.run(cds.ql.DELETE.from(entity));
@@ -247,10 +254,10 @@ describe('LedgerPayloadDecoder', () => {
 });
 
 describe('IndexerSupplement', () => {
-    function supplementWith(answers: Record<number, any>): IndexerSupplement {
+    function supplementWith(answers: Record<number, any>, contractState?: ContractStatePolicy): IndexerSupplement {
         const client = { fetchBlock: vi.fn(async (height: number) => answers[height] ?? null) };
         const pass = new IndexerSupplement(
-            { url: 'http://indexer.invalid', batchSize: 10, intervalMs: 1, lagBlocks: 2, requestTimeoutMs: 100 },
+            { url: 'http://indexer.invalid', batchSize: 10, intervalMs: 1, lagBlocks: 2, requestTimeoutMs: 100, contractState },
             client
         );
         (pass as any).client = client;
@@ -347,11 +354,15 @@ describe('IndexerSupplement', () => {
         await pass.init(db);
         await pass.runOnce();
 
-        const rows = (await db.run(cds.ql.SELECT.from(CONTRACT_ACTIONS).columns('ID', 'actionIndex', 'state')))
+        const rows = (await db.run(cds.ql.SELECT.from(CONTRACT_ACTIONS).columns('ID', 'actionIndex', 'state', 'stateHash', 'stateSize')))
             .sort((a: any, b: any) => a.actionIndex - b.actionIndex);
-        const states = [];
-        for (const r of rows) states.push((await readCapBinary(r.state))?.toString('utf8'));
-        expect(states).toEqual(['first', 'second']);
+        expect(rows.map((r: any) => [r.stateHash, r.stateSize])).toEqual([[sha256('first'), 5], [sha256('second'), 6]]);
+        for (const r of rows) expect(await readCapBinary(r.state)).toBeNull();
+
+        const current = await db.run(cds.ql.SELECT.one.from(CONTRACT_STATES).columns('height', 'state', 'stateHash', 'contractAction_ID'));
+        expect((await readCapBinary(current.state))?.toString('utf8')).toBe('second');
+        expect(current).toEqual(expect.objectContaining({ stateHash: sha256('second'), contractAction_ID: ids[1] }));
+        expect(Number(current.height)).toBe(10);
 
         const amounts = [];
         for (const r of rows) {
@@ -874,5 +885,213 @@ describe('rollback', () => {
         const sync = await readSync();
         expect(sync.lastDecodedHeight).toBeNull();
         expect(sync.lastSupplementedHeight).toBeNull();
+    });
+});
+
+describe('contract state storage', () => {
+    const OTHER = 'dd'.repeat(32);
+    const b64 = (text: string): string => Buffer.from(text, 'utf8').toString('base64');
+
+    function supplementWith(answers: Record<number, any>, contractState?: ContractStatePolicy): IndexerSupplement {
+        const client = { fetchBlock: vi.fn(async (height: number) => answers[height] ?? null) };
+        return new IndexerSupplement(
+            { url: 'http://indexer.invalid', batchSize: 10, intervalMs: 1, lagBlocks: 2, requestTimeoutMs: 100, contractState },
+            client
+        );
+    }
+
+    /** One block at `height` whose transaction carries one CALL per address. */
+    async function seedCalls(height: number, addresses: string[]): Promise<string[]> {
+        const blockId = await seedBlock(height, `0xcs${height}`);
+        const txId = await seedTransaction(blockId, { ledgerTxHash: `tx${height}` });
+        const ids: string[] = [];
+        for (const [i, address] of addresses.entries()) {
+            const ID = cds.utils.uuid();
+            ids.push(ID);
+            await db.run(cds.ql.INSERT.into(CONTRACT_ACTIONS).entries({
+                ID, actionIndex: i, address, actionType: 'CALL', transaction_ID: txId
+            }));
+        }
+        return ids;
+    }
+
+    function answerFor(height: number, calls: Array<{ address: string; state: string }>): any {
+        return {
+            height, ledgerParameters: null,
+            transactions: [{
+                ledgerTxHash: `tx${height}`, status: 'SUCCESS', fee: null, segments: [],
+                contractActions: calls.map(c => ({
+                    actionType: 'CALL', address: c.address, state: b64(c.state), zswapState: null, balances: []
+                })),
+                zswapEvents: [], dustEvents: [], dustRegisteredOutputs: []
+            }]
+        };
+    }
+
+    async function storedStates(): Promise<Record<string, string | undefined>> {
+        const rows = await db.run(cds.ql.SELECT.from(CONTRACT_ACTIONS).columns('address', 'state'));
+        const out: Record<string, string | undefined> = {};
+        for (const r of rows) out[r.address] = (await readCapBinary(r.state))?.toString('utf8');
+        return out;
+    }
+
+    async function supplyBlocks(blocks: Record<number, Array<{ address: string; state: string }>>, policy?: ContractStatePolicy): Promise<void> {
+        const answers: Record<number, any> = {};
+        for (const [height, calls] of Object.entries(blocks)) {
+            await seedCalls(Number(height), calls.map(c => c.address));
+            answers[Number(height)] = answerFor(Number(height), calls);
+        }
+        await setSync({ lastIndexedHeight: 20, lastSupplementedHeight: null });
+        const pass = supplementWith(answers, policy);
+        await pass.init(db);
+        await pass.runOnce();
+    }
+
+    it('keeps the full state per action under history `all`', async () => {
+        await supplyBlocks({ 10: [{ address: CONTRACT, state: 'a1' }] }, contractStatePolicy('all'));
+        expect(await storedStates()).toEqual({ [CONTRACT]: 'a1' });
+    });
+
+    it('keeps the full state only for watched contracts under history `watched`', async () => {
+        await supplyBlocks(
+            { 10: [{ address: CONTRACT, state: 'kept' }, { address: OTHER, state: 'dropped' }] },
+            contractStatePolicy('watched', [`0x${CONTRACT.toUpperCase()}`])
+        );
+        expect(await storedStates()).toEqual({ [CONTRACT]: 'kept', [OTHER]: undefined });
+        expect(await db.run(cds.ql.SELECT.from(CONTRACT_STATES))).toHaveLength(2);
+    });
+
+    it('does not let an older block replace a newer current state', async () => {
+        await supplyBlocks({ 10: [{ address: CONTRACT, state: 'old' }], 12: [{ address: CONTRACT, state: 'new' }] });
+        // A replay of block 10 (a reset cursor) must leave block 12's state.
+        await setSync({ lastIndexedHeight: 20, lastSupplementedHeight: 9 });
+        const replay = supplementWith({ 10: answerFor(10, [{ address: CONTRACT, state: 'old' }]) });
+        await replay.init(db);
+        await replay.runOnce();
+
+        const current = await db.run(cds.ql.SELECT.one.from(CONTRACT_STATES).columns('height', 'state'));
+        expect(Number(current.height)).toBe(12);
+        expect((await readCapBinary(current.state))?.toString('utf8')).toBe('new');
+    });
+
+    it('drops current states from rolled-back blocks', async () => {
+        await supplyBlocks({ 10: [{ address: CONTRACT, state: 'kept' }], 12: [{ address: OTHER, state: 'gone' }] });
+        await db.tx(async (tx: any) => {
+            await rollbackIndexedDataFromHeight(tx, 11, { syncStatus: 'syncing' });
+        });
+        const rows = await db.run(cds.ql.SELECT.from(CONTRACT_STATES).columns('address'));
+        expect(rows.map((r: any) => r.address)).toEqual([CONTRACT]);
+    });
+
+    describe('contractStateAt', () => {
+        const twoStates = { 10: [{ address: CONTRACT, state: 's10' }], 12: [{ address: CONTRACT, state: 's12' }] };
+        const text = (value: string | null): string | null => value == null ? null : Buffer.from(value, 'base64').toString('utf8');
+
+        it('serves the current state without asking the indexer', async () => {
+            await supplyBlocks(twoStates);
+            const fetchState = vi.fn();
+            const snap = await contractStateAt(db, `0x${CONTRACT}`, null, fetchState);
+            expect(snap).toEqual(expect.objectContaining({ source: 'current', height: 12, stateHash: sha256('s12') }));
+            expect(text(snap!.state)).toBe('s12');
+            // A height at or above the newest action is the current state too.
+            expect((await contractStateAt(db, CONTRACT, 15, fetchState))?.source).toBe('current');
+            expect(fetchState).not.toHaveBeenCalled();
+        });
+
+        it('fetches an older state from the indexer and checks it against the stored hash', async () => {
+            await supplyBlocks(twoStates);
+            const fetchState = vi.fn(async () => ({ state: b64('s10'), zswapState: null }));
+            const snap = await contractStateAt(db, CONTRACT, 11, fetchState);
+            expect(fetchState).toHaveBeenCalledWith(CONTRACT, 11);
+            expect(snap).toEqual(expect.objectContaining({ source: 'indexer', height: 10, verified: true }));
+
+            fetchState.mockResolvedValueOnce({ state: b64('tampered'), zswapState: null });
+            expect((await contractStateAt(db, CONTRACT, 11, fetchState))?.verified).toBe(false);
+        });
+
+        it('serves a kept per-action state from the database', async () => {
+            await supplyBlocks(twoStates, contractStatePolicy('all'));
+            const fetchState = vi.fn();
+            const snap = await contractStateAt(db, CONTRACT, 11, fetchState);
+            expect(snap).toEqual(expect.objectContaining({ source: 'history', height: 10 }));
+            expect(text(snap!.state)).toBe('s10');
+            expect(fetchState).not.toHaveBeenCalled();
+        });
+
+        it('does not compare against an older hash while a newer action is not supplemented', async () => {
+            await supplyBlocks({ 10: [{ address: CONTRACT, state: 's10' }] });
+            await seedCalls(12, [CONTRACT]);
+            const fetchState = vi.fn(async () => ({ state: b64('s12'), zswapState: null }));
+            const snap = await contractStateAt(db, CONTRACT, 13, fetchState);
+            expect(snap).toEqual(expect.objectContaining({ source: 'indexer', height: 12, verified: null }));
+        });
+
+        it('asks the indexer above the indexed tip and leaves it unverified', async () => {
+            await supplyBlocks(twoStates);
+            await setSync({ lastIndexedHeight: 12 });
+            const fetchState = vi.fn(async () => ({ state: b64('s12'), zswapState: null }));
+            const snap = await contractStateAt(db, CONTRACT, 15, fetchState);
+            expect(snap).toEqual(expect.objectContaining({ source: 'indexer', height: null, verified: null }));
+        });
+
+        it('answers null when neither side knows the contract', async () => {
+            expect(await contractStateAt(db, OTHER, null, async () => null)).toBeNull();
+        });
+    });
+
+    describe('compactStoredContractState', () => {
+        /** Rows as an older version stored them: full state per action, no hash. */
+        async function legacyRows(): Promise<void> {
+            const [a10] = await seedCalls(10, [CONTRACT]);
+            const [a12, b12] = await seedCalls(12, [CONTRACT, OTHER]);
+            for (const [ID, state] of [[a10, 'x'], [a12, 'y'], [b12, 'z']]) {
+                await db.run(cds.ql.UPDATE.entity(CONTRACT_ACTIONS).set({ state: b64(state) }).where({ ID }));
+            }
+        }
+
+        it('moves the newest state per contract into ContractStates and hashes every action', async () => {
+            await legacyRows();
+            const report = await compactStoredContractState(db, { policy: contractStatePolicy('none'), batchSize: 2 });
+            expect(report).toEqual({ contracts: 2, currentStatesWritten: 2, actionsHashed: 3, statesCleared: 3 });
+
+            expect(await storedStates()).toEqual({ [CONTRACT]: undefined, [OTHER]: undefined });
+            const hashes = (await db.run(cds.ql.SELECT.from(CONTRACT_ACTIONS).columns('stateHash'))).map((r: any) => r.stateHash).sort();
+            expect(hashes).toEqual([sha256('x'), sha256('y'), sha256('z')].sort());
+            const current = await db.run(cds.ql.SELECT.one.from(CONTRACT_STATES).columns('height', 'state').where({ address: CONTRACT }));
+            expect(Number(current.height)).toBe(12);
+            expect((await readCapBinary(current.state))?.toString('utf8')).toBe('y');
+
+            // Idempotent: nothing left to move.
+            expect(await compactStoredContractState(db, { policy: contractStatePolicy('none') }))
+                .toEqual({ contracts: 0, currentStatesWritten: 0, actionsHashed: 0, statesCleared: 0 });
+        });
+
+        it('writes nothing on a dry run and keeps watched states', async () => {
+            await legacyRows();
+            const dry = await compactStoredContractState(db, { policy: contractStatePolicy('none'), dryRun: true });
+            expect(dry).toEqual({ contracts: 2, currentStatesWritten: 2, actionsHashed: 3, statesCleared: 3 });
+            expect(await db.run(cds.ql.SELECT.from(CONTRACT_STATES))).toHaveLength(0);
+
+            const report = await compactStoredContractState(db, { policy: contractStatePolicy('watched', [OTHER]) });
+            expect(report.statesCleared).toBe(2);
+            expect(await storedStates()).toEqual({ [CONTRACT]: undefined, [OTHER]: 'z' });
+        });
+    });
+});
+
+describe('LedgerPayloadDecoder and system transactions', () => {
+    it('marks a system transaction absent without trying to decode it', async () => {
+        const blockId = await seedBlock(10, '0xsys');
+        const txId = await seedTransaction(blockId, { raw: midnightExtrinsicBase64(20), transactionType: 'SYSTEM' });
+        await setSync({ lastIndexedHeight: 20, lastDecodedHeight: null });
+
+        const decoder = new LedgerPayloadDecoder({ batchSize: 10, intervalMs: 1, lagBlocks: 2 });
+        await decoder.init(db);
+        const result = await decoder.runOnce();
+
+        expect(result).toEqual(expect.objectContaining({ decoded: 0, failed: 0, absent: 1 }));
+        expect(decodeLedgerPayload).not.toHaveBeenCalled();
+        const tx = await db.run(cds.ql.SELECT.one.from(TRANSACTIONS).columns('payloadDecode').where({ ID: txId }));
+        expect(tx.payloadDecode).toBe('absent');
     });
 });

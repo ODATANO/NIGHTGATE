@@ -179,6 +179,24 @@ docker exec odatano-nightgate node scripts/apply-schema-delta.mjs   # in the ima
 Without it the startup preflight names the missing objects and NIGHTGATE
 stays offline; the host process keeps running.
 
+### Contract state from before the hash layout
+
+Earlier releases stored the full contract state on every `ContractActions`
+row (hundreds of KB each). The supplement now writes a sha256 and the size per
+action and the newest state per contract into `ContractStates`; existing rows
+move once, with the server (or its supplement) stopped:
+
+```bash
+npx nightgate-compact-contract-state --dry-run   # counts only
+npx nightgate-compact-contract-state             # same DB settings as the server
+docker exec <container> node scripts/compact-contract-state.mjs   # in the image
+```
+
+It honours `NIGHTGATE_CRAWLER_CONTRACT_STATE_HISTORY` / `_WATCH` (states kept
+under `watched` or `all` stay) and is idempotent. The space returns only after
+`VACUUM FULL midnight_contractactions;` (PostgreSQL, exclusive lock, needs room
+for the rewritten table) or `VACUUM` (SQLite).
+
 ## Monitoring endpoints
 
 The read-only probes of the indexer service are anonymous at the model

@@ -119,7 +119,9 @@ async function ensureSchemaDeployed(): Promise<void> {
         { table: 'midnight.BackgroundJobs' },
         { table: 'midnight.WalletSessions', columns: ['label'] },
         { table: 'midnight.AgentGrants', columns: ['allowedContracts', 'allowedCircuits', 'allowDeploy', 'maxDeploys', 'deploysUsed', 'deployedContracts', 'allowedTokenTypes'] },
-        { table: 'midnight.ContractRegistrations' }
+        { table: 'midnight.ContractRegistrations' },
+        { table: 'midnight.ContractActions', columns: ['stateHash', 'stateSize', 'zswapStateHash', 'zswapStateSize'] },
+        { table: 'midnight.ContractStates' }
     ];
 
     const db = cds.db || await cds.connect.to('db');
