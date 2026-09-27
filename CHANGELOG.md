@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.27.1 - 2026-09-27
+
+### Fixes
+
+- Tests: the predicate handler tests compare each proof argument exactly; a
+  time-derived argument containing the field value's digits failed them.
+
 ## 0.27.0 - 2026-09-27
 
 ### Breaking

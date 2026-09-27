@@ -2145,7 +2145,8 @@ describe('issueFieldPredicateAttestation', () => {
             siblings: SIBLINGS,
             dirs: [true, false, true, false]
         });
-        const flatArgs = JSON.stringify(prove.args, (_k, v) => typeof v === 'bigint' ? v.toString() : v);
+        // Exact per argument: the time-derived argument may contain the digits.
+        const flatArgs = prove.args.map((a: unknown) => typeof a === 'bigint' ? a.toString() : a);
         expect(flatArgs).not.toContain('47300');
     });
 
@@ -2319,7 +2320,7 @@ describe('issueFieldPredicateAttestationBatch', () => {
                 siblings: SIBLINGS,
                 dirs: [true, false, true, false]
             });
-            const flatArgs = JSON.stringify(call.args, (_k, v) => typeof v === 'bigint' ? v.toString() : v);
+            const flatArgs = call.args.map((a: unknown) => typeof a === 'bigint' ? a.toString() : a);
             expect(flatArgs).not.toContain(`${1000 + i + 1}`);
         }
 
