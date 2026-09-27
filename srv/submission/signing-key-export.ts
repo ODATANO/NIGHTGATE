@@ -18,17 +18,16 @@ import { deriveAccountId, deriveStoragePassword } from './wallet-material-factor
 import { resolveAccountDek, privateStatePasswordFromDek, DEK_SCHEME } from './account-keys';
 import { decryptWithPassword } from '../utils/storage-encryption';
 import { buildSigningKeyExport, SigningKeyExport } from '../midnight/CapDbPrivateStateProvider';
+import type { DbRunner } from '../utils/db-types';
+import { NightgateError } from '../utils/errors';
 
 const { SELECT } = cds.ql;
 
-type Runner = { run: (q: any) => Promise<any> };
+type Runner = DbRunner;
 
-export class SigningKeyExportError extends Error {
-    readonly status: number;
+export class SigningKeyExportError extends NightgateError {
     constructor(status: number, message: string) {
-        super(message);
-        this.name = 'SigningKeyExportError';
-        this.status = status;
+        super('SIGNING_KEY_EXPORT_REJECTED', message, { status });
     }
 }
 

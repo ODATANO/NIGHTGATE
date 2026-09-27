@@ -6,6 +6,7 @@
  */
 
 import crypto from 'crypto';
+import { NightgateError } from './errors';
 import cds from '@sap/cds';
 import { configFlag } from './config';
 
@@ -35,11 +36,10 @@ export const KEY_ID_PATTERN = /^[A-Za-z0-9_-]{1,16}$/;
 const KEK_INFO = 'nightgate/kek/v2';
 
 /** Thrown when a ciphertext names a key id the ring does not hold. */
-export class UnknownEncryptionKeyError extends Error {
+export class UnknownEncryptionKeyError extends NightgateError {
     readonly keyId: string;
     constructor(keyId: string) {
-        super(`ciphertext is encrypted under key id '${keyId}', which is not in the encryption key ring (ENCRYPTION_KEYS); add the key or run nightgate-rewrap-keys before removing it`);
-        this.name = 'UnknownEncryptionKeyError';
+        super('ENCRYPTION_KEY_UNKNOWN', `ciphertext is encrypted under key id '${keyId}', which is not in the encryption key ring (ENCRYPTION_KEYS); add the key or run nightgate-rewrap-keys before removing it`);
         this.keyId = keyId;
     }
 }

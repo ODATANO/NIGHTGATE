@@ -1,4 +1,5 @@
 import cds from '@sap/cds';
+import { NightgateError } from '../srv/utils/errors';
 
 import { startCrawler, stopCrawler } from '../srv/crawler/index';
 import { ensureNightgateModelLoaded } from '../srv/utils/cds-model';
@@ -34,6 +35,16 @@ import {
     assertSupportedRuntimeTopology,
     UnsupportedRuntimeTopologyError
 } from '../srv/utils/runtime-topology';
+import {
+    BACKGROUND_LEASE_ROLE,
+    acquireInstanceLease,
+    releaseInstanceLease,
+    setActiveLease,
+    clearActiveLease,
+    fenceBackgroundWork,
+    startInstanceLeaseHeartbeat
+} from '../srv/utils/instance-lease';
+import { configMs } from '../srv/utils/config';
 
 export type { NightgateConfig } from '../srv/types';
 export { DEFAULT_NETWORK, DEFAULT_NODE_URL } from '../srv/utils/nightgate-config';
@@ -53,6 +64,9 @@ export interface NightgateIndexerStatus {
 }
 
 let initialized = false;
+// Lease holder id: the topology's instance plus the pid, so two processes on one host differ.
+let leaseHolder: string | undefined;
+let stopLeaseHeartbeat: (() => void) | undefined;
 let lastStatus: NightgateIndexerStatus = {
     initialized: false,
     crawlerEnabled: false,
@@ -76,14 +90,14 @@ function logStartupState(state: 'stopped' | 'syncing' | 'offline', detail?: stri
 }
 
 /** A required table or column is missing from the connected database. */
-export class SchemaNotDeployedError extends Error {
+export class SchemaNotDeployedError extends NightgateError {
     constructor(
         public readonly missingTable: string,
         public readonly dbPath: string,
         cause: unknown
     ) {
         const causeMsg = cause instanceof Error ? cause.message : String(cause);
-        super(
+        super('SCHEMA_NOT_DEPLOYED',
             `Nightgate schema is not deployed (or out of date): ` +
             `missing table or column for '${missingTable}' in ${dbPath}. ` +
             `Underlying error: ${causeMsg}. ` +
@@ -92,7 +106,6 @@ export class SchemaNotDeployedError extends Error {
             `\`npx nightgate-schema-delta\`; additive, keeps data; pass the db ` +
             `path or set NIGHTGATE_DB_PATH).`
         );
-        this.name = 'SchemaNotDeployedError';
     }
 }
 
@@ -116,12 +129,13 @@ async function ensureSchemaDeployed(): Promise<void> {
         { table: 'midnight.PredicateAttestations', columns: ['payloadHashB', 'allowedMask', 'network', 'compiledArtifactRef', 'artifactDigest', 'attesterId', 'attesterIdB'] },
         { table: 'midnight.DisclosureRoles' },
         { table: 'midnight.DisclosureGrants', columns: ['pendingLevel', 'attesterId', 'changedAtHeight'] },
-        { table: 'midnight.BackgroundJobs' },
+        { table: 'midnight.BackgroundJobs', columns: ['chainSegments'] },
         { table: 'midnight.WalletSessions', columns: ['label'] },
         { table: 'midnight.AgentGrants', columns: ['allowedContracts', 'allowedCircuits', 'allowDeploy', 'maxDeploys', 'deploysUsed', 'deployedContracts', 'allowedTokenTypes'] },
         { table: 'midnight.ContractRegistrations' },
         { table: 'midnight.ContractActions', columns: ['stateHash', 'stateSize', 'zswapStateHash', 'zswapStateSize'] },
-        { table: 'midnight.ContractStates' }
+        { table: 'midnight.ContractStates' },
+        { table: 'midnight.InstanceLeases' }
     ];
 
     const db = cds.db || await cds.connect.to('db');
@@ -264,6 +278,34 @@ export async function initialize(): Promise<NightgateIndexerStatus> {
         throw err;
     }
 
+    // One process per database runs recovery, sessions cleanup, job loops and crawler.
+    try {
+        const db = await cds.connect.to('db');
+        const ttlMs = configMs('NIGHTGATE_INSTANCE_LEASE_TTL_MS');
+        const holder = `${runtimeTopology.instanceId}/${process.pid}`;
+        await acquireInstanceLease(db, BACKGROUND_LEASE_ROLE, holder, ttlMs, {
+            onWait: (other, waitMs) => log.warn(`Instance lease held by ${other}; waiting up to ${Math.round(waitMs / 1000)} s for it to expire`)
+        });
+        leaseHolder = holder;
+        setActiveLease(BACKGROUND_LEASE_ROLE, holder);
+        stopLeaseHeartbeat = startInstanceLeaseHeartbeat(db, BACKGROUND_LEASE_ROLE, holder, Math.floor(ttlMs / 3), () => {
+            onInstanceLeaseLost(holder);
+        }, err => log.warn(`Instance lease heartbeat failed: ${err instanceof Error ? err.message : String(err)}`));
+    } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        initialized = false;
+        setLastStatus({
+            initialized: false,
+            crawlerEnabled,
+            network,
+            nodeUrl,
+            mode: 'offline',
+            lastError: message
+        });
+        logStartupState('offline', 'instance lease held by another process');
+        throw err;
+    }
+
     // Asymmetric: only commands interrupted before the external boundary requeue.
     try {
         const recovered = await recoverInterruptedJobs();
@@ -402,9 +444,23 @@ export async function initialize(): Promise<NightgateIndexerStatus> {
     return getStatus();
 }
 
+/**
+ * Another process took the lease over: no dispatch, no write action and no broadcast
+ * from here on (in-flight calls stop at their boundary check); the process stays up offline.
+ */
+function onInstanceLeaseLost(holder: string): void {
+    fenceBackgroundWork();
+    log.error(`Instance lease of ${holder} was taken over by another instance; job dispatch, write actions and broadcasts are refused, job loops and crawler stop`);
+    stopBackgroundJobProcessor();
+    void stopCrawler().catch(err => log.warn(`Crawler stop error: ${err instanceof Error ? err.message : String(err)}`));
+    setLastStatus({ ...lastStatus, mode: 'offline', lastError: 'instance lease taken over by another process' });
+}
+
 /** Shut down Nightgate; idempotent. Status is "idle" afterwards. */
 export async function shutdown(): Promise<void> {
     stopBackgroundJobProcessor();
+    stopLeaseHeartbeat?.();
+    stopLeaseHeartbeat = undefined;
     registerChainOutcomeConfirmer(null);
     try {
         await stopCrawler();
@@ -421,6 +477,15 @@ export async function shutdown(): Promise<void> {
     } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         log.warn(`Wallet worker stop error: ${message}`);
+    }
+    if (leaseHolder) {
+        try {
+            await releaseInstanceLease(await cds.connect.to('db'), BACKGROUND_LEASE_ROLE, leaseHolder);
+        } catch (err) {
+            log.warn(`Instance lease release error: ${err instanceof Error ? err.message : String(err)}`);
+        }
+        leaseHolder = undefined;
+        clearActiveLease();
     }
     try {
         // After the worker stop: no save can arrive that needs a key.

@@ -3,11 +3,13 @@
  * state-verification handlers behind a feature flag and a per-address rate limit.
  */
 
-import cds, { Request } from '@sap/cds';
+import cds from '@sap/cds';
 import { ensureNightgateModelLoaded } from './utils/cds-model';
 import { registerVerifyStateHandlers } from './submission/verify-state';
 import { RateLimiter, principalRateKey } from './utils/rate-limiter';
 import { configFlag, configNumber } from './utils/config';
+import type { NightgateRequest } from './utils/request-types';
+import { normalizeHttpError } from './utils/http-errors';
 
 let limiter: RateLimiter | undefined;
 function publicVerifyLimiter(): RateLimiter {
@@ -26,7 +28,7 @@ export function __resetPublicVerifyLimiterForTests(): void {
  * 404 while the lane is off (a host without the image's transport middleware
  * still serves the path), 429 over the per-address budget.
  */
-export async function publicVerifyGate(req: Request): Promise<boolean> {
+export async function publicVerifyGate(req: NightgateRequest): Promise<boolean> {
     if (!configFlag('NIGHTGATE_PUBLIC_VERIFY')) {
         req.reject({ status: 404, code: 'PUBLIC_VERIFY_DISABLED', message: 'public verification is not enabled on this server' } as any);
         return false;
@@ -34,7 +36,7 @@ export async function publicVerifyGate(req: Request): Promise<boolean> {
     const rate = publicVerifyLimiter().check(principalRateKey(req, 'public-verify'));
     if (!rate.allowed) {
         const seconds = Math.max(1, Math.ceil(rate.retryAfterMs / 1000));
-        try { (req as any).http?.res?.set?.('Retry-After', String(seconds)); } catch { /* header is a courtesy */ }
+        try { req.http?.res?.set?.('Retry-After', String(seconds)); } catch { /* header is a courtesy */ }
         req.reject(429, `Rate limited. Retry after ${seconds}s`);
         return false;
     }
@@ -43,6 +45,7 @@ export async function publicVerifyGate(req: Request): Promise<boolean> {
 
 export default class NightgateVerifyService extends cds.ApplicationService {
     async init(): Promise<void> {
+        this.on('error', normalizeHttpError);
         await ensureNightgateModelLoaded();
         registerVerifyStateHandlers(this, { gate: publicVerifyGate });
         await super.init();

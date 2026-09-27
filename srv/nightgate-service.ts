@@ -2,7 +2,7 @@
  * Nightgate Service: OData V4 read API
  */
 
-import cds, { Request } from '@sap/cds';
+import cds from '@sap/cds';
 
 import { registerWalletSessionHandlers, startSessionCleanup } from './sessions/wallet-sessions';
 import { attachAgentGrantEnforcement, registerAgentGrantHandlers, awaitAgentPrincipal } from './sessions/agent-grants';
@@ -42,7 +42,9 @@ function fetchContractStateFromIndexers(): ContractStateFetcher {
     };
 }
 
-import { Blocks, Transactions, ContractActions, UnshieldedUtxos, NightBalances, WalletSessions } from '#cds-models/midnight';
+import { Blocks, Transactions, ContractActions, UnshieldedUtxos, NightBalances, WalletSessions, type WalletSession } from '#cds-models/midnight';
+import type { NightgateRequest } from './utils/request-types';
+import { normalizeHttpError } from './utils/http-errors';
 
 
 export default class NightgateService extends cds.ApplicationService {
@@ -50,6 +52,7 @@ export default class NightgateService extends cds.ApplicationService {
     private _cleanupTimer?: ReturnType<typeof setInterval>;
 
     async init(): Promise<void> {
+        this.on('error', normalizeHttpError);
         await ensureNightgateModelLoaded();
         this.db = await cds.connect.to('db');
 
@@ -60,7 +63,7 @@ export default class NightgateService extends cds.ApplicationService {
         attachRuntimeGate(this);
 
         // Blocks
-        this.on('READ', 'Blocks', async (req: Request) => {
+        this.on('READ', 'Blocks', async (req: NightgateRequest) => {
             return await this.db.run(req.query) || [];
         });
 
@@ -70,7 +73,7 @@ export default class NightgateService extends cds.ApplicationService {
             );
         });
 
-        this.on('byHeight', 'Blocks', async (req: Request) => {
+        this.on('byHeight', 'Blocks', async (req: NightgateRequest) => {
             const { height } = req.data as { height: number };
             if (height == null) return req.reject(400, 'height is required');
             return this.db.run(
@@ -78,7 +81,7 @@ export default class NightgateService extends cds.ApplicationService {
             );
         });
 
-        this.on('range', 'Blocks', async (req: Request) => {
+        this.on('range', 'Blocks', async (req: NightgateRequest) => {
             const { startHeight, endHeight, limit } = req.data as {
                 startHeight?: number;
                 endHeight?: number;
@@ -108,17 +111,17 @@ export default class NightgateService extends cds.ApplicationService {
         });
 
         // Transactions
-        this.on('READ', 'Transactions', async (req: Request) => {
+        this.on('READ', 'Transactions', async (req: NightgateRequest) => {
             return await this.db.run(req.query) || [];
         });
 
-        this.on('byHash', 'Transactions', async (req: Request) => {
+        this.on('byHash', 'Transactions', async (req: NightgateRequest) => {
             const { hash } = req.data as { hash: string };
             if (!hash) return req.reject(400, 'hash is required');
             return this.db.run(cds.ql.SELECT.from(Transactions).where({ hash }));
         });
 
-        this.on('byType', 'Transactions', async (req: Request) => {
+        this.on('byType', 'Transactions', async (req: NightgateRequest) => {
             const { txType, limit } = req.data as { txType?: string; limit?: number };
             if (!txType) return req.reject(400, 'txType is required');
 
@@ -132,11 +135,11 @@ export default class NightgateService extends cds.ApplicationService {
         });
 
         // Contracts
-        this.on('READ', 'ContractActions', async (req: Request) => {
+        this.on('READ', 'ContractActions', async (req: NightgateRequest) => {
             return await this.db.run(req.query) || [];
         });
 
-        this.on('byAddress', 'ContractActions', async (req: Request) => {
+        this.on('byAddress', 'ContractActions', async (req: NightgateRequest) => {
             const { address } = req.data as { address: string };
             if (!address) return req.reject(400, 'address is required');
             return this.db.run(
@@ -144,7 +147,7 @@ export default class NightgateService extends cds.ApplicationService {
             );
         });
 
-        this.on('history', 'ContractActions', async (req: Request) => {
+        this.on('history', 'ContractActions', async (req: NightgateRequest) => {
             const { address } = req.data as { address: string };
             if (!address) return req.reject(400, 'address is required');
             return this.db.run(
@@ -155,11 +158,11 @@ export default class NightgateService extends cds.ApplicationService {
             );
         });
 
-        this.on('READ', 'ContractStates', async (req: Request) => {
+        this.on('READ', 'ContractStates', async (req: NightgateRequest) => {
             return await this.db.run(req.query) || [];
         });
 
-        this.on('stateAt', 'ContractStates', async (req: Request) => {
+        this.on('stateAt', 'ContractStates', async (req: NightgateRequest) => {
             const { address, height } = req.data as { address?: string; height?: number | null };
             if (!address || !/^(0x)?[0-9a-fA-F]+$/.test(address)) return req.reject(400, 'address (hex) is required');
             if (height != null && (!Number.isInteger(Number(height)) || Number(height) < 0)) {
@@ -174,7 +177,7 @@ export default class NightgateService extends cds.ApplicationService {
             } catch (err) {
                 if (err instanceof IndexerBudgetExhausted) {
                     const seconds = Math.max(1, Math.ceil(err.retryAfterMs / 1000));
-                    try { (req as any).http?.res?.set?.('Retry-After', String(seconds)); } catch { /* header is a courtesy */ }
+                    try { req.http?.res?.set?.('Retry-After', String(seconds)); } catch { /* header is a courtesy */ }
                     return req.reject(429, `Rate limited. Retry after ${seconds}s`);
                 }
                 return req.reject(502, `indexer could not serve the contract state: ${(err as Error).message}`);
@@ -182,11 +185,11 @@ export default class NightgateService extends cds.ApplicationService {
         });
 
         // UTXOs
-        this.on('READ', 'UnshieldedUtxos', async (req: Request) => {
+        this.on('READ', 'UnshieldedUtxos', async (req: NightgateRequest) => {
             return await this.db.run(req.query) || [];
         });
 
-        this.on('byOwner', 'UnshieldedUtxos', async (req: Request) => {
+        this.on('byOwner', 'UnshieldedUtxos', async (req: NightgateRequest) => {
             const { owner } = req.data as { owner: string };
             if (!owner) return req.reject(400, 'owner is required');
             return this.db.run(cds.ql.SELECT.from(UnshieldedUtxos).where({ owner }));
@@ -200,7 +203,7 @@ export default class NightgateService extends cds.ApplicationService {
 
         // Balance & Token Tracking
 
-        this.on('getBalance', 'NightBalances', async (req: Request) => {
+        this.on('getBalance', 'NightBalances', async (req: NightgateRequest) => {
             const { address } = req.data as { address: string };
             if (!address) return req.reject(400, 'address is required');
             return this.db.run(
@@ -208,7 +211,7 @@ export default class NightgateService extends cds.ApplicationService {
             );
         });
 
-        this.on('getTopHolders', 'NightBalances', async (req: Request) => {
+        this.on('getTopHolders', 'NightBalances', async (req: NightgateRequest) => {
             const { limit } = req.data as { limit?: number };
             const effectiveLimit = Math.min(Math.max(limit || 10, 1), 1000);
             return this.db.run(
@@ -222,9 +225,9 @@ export default class NightgateService extends cds.ApplicationService {
 
         registerWalletSessionHandlers(this, this.db);
 
-        this.before('READ', 'WalletSessions', async (req: Request) => {
+        this.before('READ', 'WalletSessions', async (req: NightgateRequest) => {
             await awaitAgentPrincipal(req);
-            const user: any = (req as any).user;
+            const user: any = req.user;
             if (user?.is?.('admin')) return;
             const userId = user?.id;
             if (!userId) return req.reject(401, 'authentication required');
@@ -234,9 +237,9 @@ export default class NightgateService extends cds.ApplicationService {
         // Agent grants (delegated); owner-scoped read like WalletSessions
         registerAgentGrantHandlers(this, this.db);
 
-        this.before('READ', 'AgentGrants', async (req: Request) => {
+        this.before('READ', 'AgentGrants', async (req: NightgateRequest) => {
             await awaitAgentPrincipal(req);
-            const user: any = (req as any).user;
+            const user: any = req.user;
             if (user?.is?.('admin')) return;
             const userId = user?.id;
             if (!userId) return req.reject(401, 'authentication required');
@@ -245,9 +248,9 @@ export default class NightgateService extends cds.ApplicationService {
 
         // Owner-scoped like WalletSessions
         for (const entity of ['Documents', 'GranteeIdentities'] as const) {
-            this.before('READ', entity, async (req: Request) => {
+            this.before('READ', entity, async (req: NightgateRequest) => {
                 await awaitAgentPrincipal(req);
-                const user: any = (req as any).user;
+                const user: any = req.user;
                 if (user?.is?.('admin')) return;
                 const userId = user?.id;
                 if (!userId) return req.reject(401, 'authentication required');
@@ -258,12 +261,12 @@ export default class NightgateService extends cds.ApplicationService {
         // Submission actions: deployContract, submitContractCall
 
         // Owner-scoped like WalletSessions
-        this.on('READ', 'PendingSubmissions', async (req: Request) => {
-            const user: any = (req as any).user;
+        this.on('READ', 'PendingSubmissions', async (req: NightgateRequest) => {
+            const user: any = req.user;
             if (!user?.is?.('admin')) {
                 const userId = user?.id;
                 if (!userId) return req.reject(401, 'authentication required');
-                const sessions: any[] = await this.db.run(
+                const sessions: WalletSession[] = await this.db.run(
                     cds.ql.SELECT.from(WalletSessions).columns('sessionId').where({ userId })
                 ) || [];
                 const sessionIds = sessions.map(s => s.sessionId).filter(Boolean);
@@ -277,7 +280,7 @@ export default class NightgateService extends cds.ApplicationService {
         registerDocumentProofHandlers(this);
 
         // Background Jobs
-        this.on('getJobStatus', async (req: Request) => {
+        this.on('getJobStatus', async (req: NightgateRequest) => {
             const { jobId, sessionId } = req.data as { jobId?: string; sessionId?: string };
             if (!jobId) return req.reject(400, 'jobId is required');
             if (!sessionId) return req.reject(400, 'sessionId is required');
@@ -288,7 +291,7 @@ export default class NightgateService extends cds.ApplicationService {
             }
 
             // FAIL-CLOSED ownership 
-            const user: any = (req as any).user;
+            const user: any = req.user;
             if (!user?.is?.('admin')) {
                 const requesterId = user?.id;
                 if (job.requestedBy) {
@@ -296,7 +299,7 @@ export default class NightgateService extends cds.ApplicationService {
                         return req.reject(404, 'Job not found');
                     }
                 } else {
-                    const sess: any = await this.db.run(
+                    const sess: WalletSession | undefined = await this.db.run(
                         cds.ql.SELECT.one.from(WalletSessions).columns('userId').where({ sessionId })
                     );
                     if (!sess?.userId || !requesterId || sess.userId !== requesterId) {
@@ -320,6 +323,7 @@ export default class NightgateService extends cds.ApplicationService {
                 chainFinalizedAt: job.chainFinalizedAt,
                 chainBlockHeight: job.chainBlockHeight ?? null,
                 chainBlockHash: job.chainBlockHash ?? null,
+                chainSegments: job.chainSegments ?? null,
                 queuedAt: job.queuedAt ?? job.createdAt,
                 externalExecutionAt: job.externalExecutionAt,
                 submittedAt: job.submittedAt,

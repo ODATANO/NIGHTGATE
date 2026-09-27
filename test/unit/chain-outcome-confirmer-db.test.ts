@@ -17,6 +17,7 @@ import {
 } from '../../srv/submission/background-jobs';
 import { JOB_KIND_TRAITS } from '../../srv/submission/job-kinds';
 import { CHAIN_ABSENT, chainAbsent } from '../../srv/submission/chain-outcome-confirmer';
+import { chainSegmentsOf } from '../../srv/submission/job-reconciliation';
 
 cds.test(__dirname + '/../..');
 
@@ -345,4 +346,41 @@ test('an absence whose answer carried no tip gives no verdict: the never-indexed
     registerChainOutcomeConfirmer(async () => chainAbsent(Date.parse(old) + 60_000));
     await confirmChainOutcomesViaIndexer(db);
     expect((await db.run(cds.ql.SELECT.one.from(BG).where({ ID: 'j-notip' }))).status).toBe('reconciliation_required');
+});
+
+test('a batch records which of its calls applied, from the announced segments and the indexer result', async () => {
+    const PS = 'midnight.PendingSubmissions';
+    await db.run(cds.ql.DELETE.from(PS));
+    const segments = [{ segment: 1, calls: ['attest'] }, { segment: 2, calls: ['bindDocument'] }];
+    await db.run(cds.ql.INSERT.into(PS).entries(
+        { ID: 'sub-batch', txHash: '00batch', contractAddress: 'c8f4'.padEnd(64, '0'), circuitName: 'attest', actionType: 'CALL', submittedAt: new Date().toISOString(), status: 'included', sessionId: 's',
+          submitIntentData: JSON.stringify({ circuits: ['attest', 'bindDocument'], segments }) },
+        { ID: 'sub-single', txHash: '00single', contractAddress: 'c8f4'.padEnd(64, '0'), circuitName: 'attest', actionType: 'CALL', submittedAt: new Date().toISOString(), status: 'included', sessionId: 's',
+          submitIntentData: JSON.stringify({ circuits: ['attest'] }) }
+    ));
+    await db.run(cds.ql.INSERT.into(BG).entries(
+        { ID: 'j-batch', kind: 'submitContractCallBatch', sessionId: 's', status: 'succeeded', txHash: '00batch', submissionId: 'sub-batch', chainStatus: 'pending' },
+        { ID: 'j-single', kind: 'submitContractCall', sessionId: 's', status: 'succeeded', txHash: '00single', submissionId: 'sub-single', chainStatus: 'pending' }
+    ));
+    registerChainOutcomeConfirmer(async () => ({ status: 'failure', blockHeight: 77, result: 'PARTIAL_SUCCESS', failedSegments: [2] }));
+    await confirmChainOutcomesViaIndexer(db);
+    const jobs = Object.fromEntries((await db.run(cds.ql.SELECT.from(BG).columns('ID', 'status', 'errorCode', 'chainStatus', 'chainSegments'))).map((r: any) => [r.ID, r]));
+    // status and codes as before; the detail is the new field
+    expect(jobs['j-batch'].chainStatus).toBe('failure');
+    expect(JSON.parse(jobs['j-batch'].chainSegments)).toEqual([
+        { segment: 1, calls: ['attest'], applied: true },
+        { segment: 2, calls: ['bindDocument'], applied: false }
+    ]);
+    expect(jobs['j-single'].chainSegments).toBeNull();
+});
+
+test('chainSegmentsOf: success applies all, failure none, bad data gives null', () => {
+    const data = JSON.stringify({ segments: [{ segment: 1, calls: ['a'] }, { segment: 3, calls: ['b', 'c'] }] });
+    expect(JSON.parse(chainSegmentsOf(data, { status: 'success', blockHeight: 1, result: 'SUCCESS' })!).map((s: any) => s.applied)).toEqual([true, true]);
+    expect(JSON.parse(chainSegmentsOf(data, { status: 'failure', blockHeight: 1, result: 'FAILURE' })!).map((s: any) => s.applied)).toEqual([false, false]);
+    // A confirmer without the raw result (older shape): the status decides.
+    expect(JSON.parse(chainSegmentsOf(data, { status: 'success', blockHeight: 1 })!).map((s: any) => s.applied)).toEqual([true, true]);
+    expect(chainSegmentsOf('{not json', { status: 'success', blockHeight: 1 })).toBeNull();
+    expect(chainSegmentsOf(JSON.stringify({ circuits: ['a'] }), { status: 'success', blockHeight: 1 })).toBeNull();
+    expect(chainSegmentsOf(null, { status: 'success', blockHeight: 1 })).toBeNull();
 });

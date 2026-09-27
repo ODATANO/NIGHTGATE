@@ -1,4 +1,5 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
+import { assertLeaseHeld } from '../utils/instance-lease';
 
 /**
  * A provably rejected attempt whose bookkeeping did not commit. The job parks
@@ -56,6 +57,8 @@ export async function reportExternalExecution(handle: ExternalSubmissionHandle):
  * commits with the attempt row and deploy reservation. Throws on a lost lease.
  */
 export async function reportBroadcastOn(runner: StatementRunner, handle: ExternalSubmissionHandle): Promise<void> {
+    // A process that lost the instance lease refuses here, so the worker never broadcasts.
+    await assertLeaseHeld(runner);
     await storage.getStore()?.markBroadcastOn(runner, handle);
 }
 

@@ -6,6 +6,7 @@
 
 import cds from '@sap/cds';
 import { classificationHaystack } from '../utils/format-error';
+import { findNightgateError } from '../utils/errors';
 import { DUST_RACE_LEDGER_CODES, dustRaceLedgerCode } from './dust-race';
 import { classifySubmitFailure } from '../midnight/submit-error-classification';
 import { carriedSubmitFailure, type BatchCallStageInfo } from '../midnight/wallet-worker-protocol';
@@ -13,7 +14,7 @@ import { reportExternalExecution, reportExternalSubmission, reportBroadcastOn, r
 import { withLockContentionRetry } from './db-write-retry';
 import { isPreInclusionReject } from './sponsor-pool';
 import type { SubmitIntentHook } from '../midnight/wallet-worker-client';
-const { INSERT, UPDATE, SELECT } = cds.ql;
+const { INSERT, UPDATE } = cds.ql;
 import { PendingSubmissions } from '#cds-models/midnight';
 import { ensureNightgateModelLoaded } from '../utils/cds-model';
 const log = cds.log('nightgate:submit');
@@ -36,6 +37,7 @@ import {
     type WalletSubmitContractCallBatchArgs
 } from '../midnight/wallet-worker-client';
 import { configNumber, configMs } from '../utils/config';
+import type { DbRunner, TxCapableDb } from '../utils/db-types';
 
 // ---- Types ----------------------------------------------------------------
 
@@ -154,7 +156,7 @@ export interface TransactionSubmitterDeps {
     contractProvidersConfig: ContractProvidersConfig;
     walletMaterial: WalletMaterial;
     /** Defaults to cds.connect.to('db'). */
-    db?: any;
+    db?: TxCapableDb;
     /** Test seams for the worker RPCs. */
     walletDeployContractImpl?: typeof walletDeployContract;
     walletSubmitContractCallImpl?: typeof walletSubmitContractCall;
@@ -173,7 +175,7 @@ interface BoundAttemptLedger {
 }
 
 export class TransactionSubmitter {
-    private db: cds.DatabaseService | undefined;
+    private db: TxCapableDb | undefined;
 
     constructor(private readonly deps: TransactionSubmitterDeps) {
         if (deps.db) this.db = deps.db;
@@ -235,7 +237,8 @@ export class TransactionSubmitter {
                 channel: 'bound', circuits: intent?.circuits ?? [],
                 contractAddress: intent?.contractAddress ?? shape.contractAddress,
                 ...(intent?.note ? { note: intent.note } : {}),
-                ...(intent?.ttl ? { ttl: intent.ttl } : {})
+                ...(intent?.ttl ? { ttl: intent.ttl } : {}),
+                ...(intent?.segments?.length ? { segments: intent.segments } : {})
             };
             const targetRow = rowId ?? cds.utils.uuid();
             const reuse = rowId !== null;
@@ -275,7 +278,7 @@ export class TransactionSubmitter {
     }
 
     /** Run `fn` in one transaction of `db` (a test double without `tx` runs it directly). */
-    private runInOneTransaction<T>(db: any, fn: (tx: { run: (q: unknown) => Promise<unknown> }) => Promise<T>): Promise<T> {
+    private runInOneTransaction<T>(db: TxCapableDb, fn: (tx: DbRunner) => Promise<T>): Promise<T> {
         if (typeof db?.tx === 'function') return db.tx(fn);
         return fn(db);
     }
@@ -578,7 +581,7 @@ export class TransactionSubmitter {
         };
     }
 
-    private async getDb(): Promise<cds.DatabaseService> {
+    private async getDb(): Promise<TxCapableDb> {
         if (this.db) return this.db;
         await ensureNightgateModelLoaded();
         this.db = await cds.connect.to('db');
@@ -720,9 +723,15 @@ export function classifySubmissionError(err: unknown, network: NightgateNetwork)
         };
     }
 
+    // Codes the job model documents as job codes; every other error keeps its name.
+    const coded = findNightgateError(err);
+    if (coded && JOB_CODES_FROM_ERRORS.has(coded.code)) return { code: coded.code, retryable: coded.retryable, message };
+
     // Unknown: non-retryable, to avoid hammering.
     return { code: name || 'UnknownError', retryable: false, message };
 }
+
+const JOB_CODES_FROM_ERRORS: ReadonlySet<string> = new Set(['AGENT_GRANT_REVOKED', 'SPONSOR_POLICY_UNAVAILABLE', 'SPONSOR_POLICY_EMPTY']);
 
 /** Ledger error 104 (transcript refused): the call no longer fits the contract state it was built against. */
 const STALE_TRANSCRIPT_CODE = '1010/104';

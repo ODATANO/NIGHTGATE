@@ -144,6 +144,7 @@ are clamped with a warning; booleans: `true`/`false`, `1`/`0`, `yes`/`no`,
 | `NIGHTGATE_CRAWLER_CONTRACT_STATE_HISTORY` | `none` / `watched` / `all` |  | Override `crawler.contractStateHistory` (default `none`): which contract actions keep their full state from the supplement. Every action keeps a sha256 and the size, the newest state per contract is in `ContractStates`; `watched` keeps the full state of the contracts in `NIGHTGATE_CRAWLER_CONTRACT_STATE_WATCH`, `all` of every action (hundreds of KB each). Older states come from the indexer through `ContractStates/stateAt`. |
 | `NIGHTGATE_CRAWLER_CONTRACT_STATE_WATCH` | list |  | Override `crawler.contractStateWatch`: comma-separated contract addresses (hex) whose full state per action is kept under `contractStateHistory: watched`. |
 | `NIGHTGATE_CRAWLER_SUPPLEMENT_MAX_BPS` | int (min 1) |  | Override `crawler.supplementBlocksPerSecond` (default 2): indexer requests per second of the supplement pass, one per block, paced per request. The public indexers block the whole host IP (403 from their load balancer, also for the sponsor facades) at roughly 15 per second; on a 403 or 429 the pass backs off for one minute, doubling up to fifteen. |
+| `NIGHTGATE_INSTANCE_LEASE_TTL_MS` | ms (min 15000) | `90000` | The process running job loops, restart recovery and crawler holds a database lease renewed every third of this; a second process on the same database waits this long for an expired lease, then refuses to start. Default 90 s. |
 | `NIGHTGATE_JOB_LEASE_TTL_MS` | ms (min 60000) | `300000` | A `running` job whose heartbeat is older than this is reclaimed (re-dispatched with `attempt + 1`) unless it crossed the external-effect boundary; default 5 minutes, at least 60 s (twice the 30 s heartbeat). |
 | `NIGHTGATE_CHILD_JOB_WAIT_TIMEOUT_MS` | ms (min 1) |  | Parent-workflow watchdog; defaults to the worker RPC timeout plus 5 minutes. Timeout is fail-closed while the child may continue. |
 | `NIGHTGATE_WORKER_RPC_TIMEOUT_MS` | ms (min 1) | `1800000` | Backstop timeout of one wallet-worker RPC (a proof or a submit); default 30 minutes. |
@@ -276,6 +277,68 @@ For every action that produces an on-chain transaction:
 ### Error classification
 
 Error codes of `classifySubmissionError(err, network)`: [actions.md#error-model](actions.md#error-model).
+
+### HTTP error codes
+
+Every error response carries `error.code`: a specific code where a client can act on it, otherwise the class of its HTTP status (`INVALID_ARGUMENT`, `NOT_FOUND`, ...). A 5xx keeps its code in production; only the message is withheld unless the code exposes it. Errors CAP raises before a service runs (unknown path, wrong method, the auth challenge) keep CAP's numeric code.
+
+<!-- error-codes:start -->
+| Code | HTTP | Retryable | Meaning |
+|---|---|---|---|
+| `INVALID_ARGUMENT` | 400 | no | A parameter is missing, malformed or out of range. |
+| `UNAUTHENTICATED` | 401 | no | No or unknown principal, or a session the caller does not own. |
+| `FORBIDDEN` | 403 | no | The principal may not perform this operation. |
+| `NOT_FOUND` | 404 | no | The addressed record does not exist or is not visible to the caller. |
+| `CONFLICT` | 409 | no | The request conflicts with the current state. |
+| `GONE` | 410 | no | The addressed record expired or was closed. |
+| `PRECONDITION_FAILED` | 412 | no | A required earlier step is missing (e.g. no signing key on the session). |
+| `PAYLOAD_TOO_LARGE` | 413 | no | The request body exceeds a limit. |
+| `RATE_LIMITED` | 429 | yes | A rate limit or daily budget is exhausted; see `Retry-After` where set. |
+| `INTERNAL` | 500 | no | Unexpected server failure; the message is withheld in production. |
+| `NOT_IMPLEMENTED` | 501 | no | The operation is not available in this configuration. |
+| `BAD_GATEWAY` | 502 | yes | An upstream (node, indexer, proof server) answered wrongly. |
+| `UNAVAILABLE` | 503 | yes | Temporarily unavailable; retry later. |
+| `ACCOUNT_KEY_UNAVAILABLE` | 503 | yes | The per-account data key could not be read. |
+| `AGENT_GRANT_REVOKED` | 403 | no | The agent grant a queued job ran under was revoked; nothing was sponsored. |
+| `ARG_COERCION_FAILED` | 400 | no | A circuit argument does not match the circuit's declared type. |
+| `BATCH_CAUSALITY_VIOLATION` | 409 | no | A batch orders a fallible call before a guaranteed one; split or reorder it. |
+| `CONTRACT_NOT_REGISTERED` | 404 | no | No compiled artifact is registered under this name. |
+| `CONTRACT_REGISTRATION_REJECTED` | 400 | no | A runtime contract registration was refused. |
+| `ENCRYPTION_KEY_UNKNOWN` | 500 | no | A stored ciphertext names a key id outside the configured ring. |
+| `FEE_SPONSOR_UNUSABLE` | 400 | no | The fee-sponsor session cannot pay for this caller or is not ready. |
+| `GRANT_REVOKED` | 409 | no | The agent grant is revoked; it cannot be changed any more. |
+| `IDEMPOTENCY_KEY_CONFLICT` | 409 | no | The idempotency key was used with a different payload. |
+| `IDEMPOTENCY_KEY_INVALID` | 400 | no | The idempotency key is longer than 128 characters. |
+| `INSTANCE_LEASE_HELD` | 503 | no | Another process runs the background work on this database. |
+| `JOB_ADMISSION_BUSY` | 503 | yes | The job admission lock is contended; retry after `Retry-After`. |
+| `PRIVATE_STATE_EXPORT_INVALID` | 400 | no | The private-state export is not in the expected format. |
+| `PRIVATE_STATE_EXPORT_UNREADABLE` | 400 | no | The private-state export does not decrypt with this password. |
+| `PRIVATE_STATE_IMPORT_CONFLICT` | 409 | no | The private-state import would overwrite existing state. |
+| `PROVER_KEYS_UNAVAILABLE` | 503 | yes | The contract's prover keys are not available on this server. |
+| `RUNTIME_TOPOLOGY_UNSUPPORTED` | 503 | no | The deployment topology (replicas, multitenancy, database) is not supported. |
+| `PUBLIC_VERIFY_DISABLED` | 404 | no | Unauthenticated verification is not enabled on this server. |
+| `PURE_CIRCUITS_UNAVAILABLE` | 404 | no | The artifact does not export the pure circuits this operation needs. |
+| `RUNTIME_UNAVAILABLE` | 503 | yes | The runtime did not start (schema, network or worker); see getRuntimeInfo. |
+| `SCHEMA_NOT_DEPLOYED` | 503 | no | The database schema is missing tables or columns; run the schema delta. |
+| `SESSION_NOT_FOUND` | 401 | no | The wallet session does not exist, is inactive or belongs to another user. |
+| `SIGNING_KEY_EXPORT_REJECTED` | 400 | no | The signing-key export was refused. |
+| `SPONSOR_POLICY_EMPTY` | 403 | no | The effective sponsor policy allows nothing for this caller. |
+| `SPONSOR_POLICY_UNAVAILABLE` | 503 | yes | The sponsor policy file cannot be read; fail-closed. |
+| `SPONSOR_REFUSED` | 403 | no | The sponsor refused the transaction under its policy. |
+| `SPONSORED_CALL_NOT_APPLIED` | 409 | no | The sponsored call landed but did not apply (the caller's transcript is stale). |
+| `SUBMIT_INTENT_REJECTED` | 409 | no | The server refused to record the broadcast; nothing was sent. |
+| `SUBMIT_INTENT_TIMEOUT` | 503 | yes | The broadcast was not acknowledged in time; nothing was sent. |
+| `SUBMIT_PHASE_FAILED` | 502 | no | A submission phase (send, watch) failed; `info.phase` names it. |
+| `SUBMIT_WATCH_TIMEOUT` | 504 | no | The submission was sent but its inclusion was not seen in time; the outcome is unknown. |
+| `SYNC_STATE_NETWORK_MISMATCH` | 503 | no | The database is bound to another network than the configured one. |
+| `TOKEN_TYPE_INVALID` | 400 | no | The token type or contract address is malformed. |
+| `TX_FAILED` | 409 | no | The transaction landed and failed on chain. |
+| `WALLET_MATERIAL_UNAVAILABLE` | 501 | no | This session has no wallet material for signing. |
+| `WALLET_NOT_SYNCED` | 503 | yes | The wallet did not reach the chain tip in time; nothing was sent. |
+| `WALLET_SIGNING_NOT_AVAILABLE` | 409 | no | The session was connected without a signing key. |
+| `WALLET_SYNCING` | 503 | yes | The wallet is still catching up; retry after `Retry-After`. |
+| `WORKER_ROTATING` | 503 | yes | The wallet worker is rotating; retry. |
+<!-- error-codes:end -->
 
 ### Startup + failure semantics
 
@@ -591,7 +654,10 @@ srv/
     CapDbPrivateStateProvider.ts    # encrypted CAP-DB private state
   submission/                       # Submission orchestration (main thread)
     TransactionSubmitter.ts         # deploy/call lifecycle + pending-row mgmt
-    handlers.ts                     # OData action handlers for deploy/call
+    handlers.ts                     # registerSubmissionHandlers: job processors + action modules
+    actions/                        # OData action handlers per group (contracts, documents, predicates, ...)
+    executors/                      # job executors (contract commands, sponsored submissions)
+    finalizers/                     # reconciliation finalizers
     contract-registry.ts            # name → compiled artifact lookup
     wallet-material-factory.ts      # session → walletMaterial (accountId, password)
     wallet-facade-builder.ts        # main-thread glue to the worker facade

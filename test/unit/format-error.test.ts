@@ -1,4 +1,4 @@
-import { formatErr, formatErrWithCauses } from '../../srv/utils/format-error';
+import { errorName, formatErr, formatErrWithCauses } from '../../srv/utils/format-error';
 
 describe('formatErr', () => {
     it('returns the message for Error instances', () => {
@@ -68,5 +68,15 @@ describe('formatErrWithCauses (worker RPC boundary)', () => {
         wrapped[Symbol.for('nodejs.util.inspect.custom')] = () =>
             'FiberFailure: Transaction submission error RPC 1010: Invalid Transaction: Custom error: 170';
         expect(formatErrWithCauses(wrapped)).toBe('Transaction submission error <- 1010: Invalid Transaction: Custom error: 170');
+    });
+});
+
+describe('errorName', () => {
+    it('reads a string name, else Error', () => {
+        expect(errorName(new TypeError('x'))).toBe('TypeError');
+        expect(errorName({ name: 'TimeoutError' })).toBe('TimeoutError');
+        expect(errorName({ name: 42 })).toBe('Error');
+        expect(errorName(null)).toBe('Error');
+        expect(errorName('boom')).toBe('Error');
     });
 });

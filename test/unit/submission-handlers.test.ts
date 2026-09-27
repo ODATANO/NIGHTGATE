@@ -193,7 +193,7 @@ function makeSuccessfulSubmitter() {
 describe('deployContract: argument validation', () => {
     function setupAndCallDeploy(data: Record<string, unknown>) {
         const srv = makeFakeService();
-        registerSubmissionHandlers(srv as any, {});
+        registerSubmissionHandlers(srv as any, {} as any);
         const req = makeReq(data);
         return srv.handlers['deployContract'](req).then(() => req);
     }
@@ -222,7 +222,7 @@ describe('deployContract: argument validation', () => {
 describe('submitContractCall: argument validation', () => {
     function setupAndCallSubmit(data: Record<string, unknown>) {
         const srv = makeFakeService();
-        registerSubmissionHandlers(srv as any, {});
+        registerSubmissionHandlers(srv as any, {} as any);
         const req = makeReq(data);
         return srv.handlers['submitContractCall'](req).then(() => req);
     }
@@ -263,7 +263,7 @@ describe('submitContractCallBatch: argument validation', () => {
 
     function setupAndCallBatch(data: Record<string, unknown>) {
         const srv = makeFakeService();
-        registerSubmissionHandlers(srv as any, {});
+        registerSubmissionHandlers(srv as any, {} as any);
         const req = makeReq(data);
         return srv.handlers['submitContractCallBatch'](req).then(() => req);
     }
@@ -335,7 +335,7 @@ describe('mintShieldedTestToken + deriveTokenType', () => {
 
     function setup(overrides: any = {}) {
         const srv = makeFakeService();
-        registerSubmissionHandlers(srv as any, {}, {
+        registerSubmissionHandlers(srv as any, {} as any, {
             attesterIdResolver: vi.fn(async () => ATTESTER_ID),
             resolveContractImpl: vi.fn(async () => ({ ...RESOLVED_CONTRACT_FIXTURE })),
             walletMaterialFactory: vi.fn(async () => ({
@@ -415,7 +415,7 @@ describe('mintShieldedTestToken + deriveTokenType', () => {
 describe('error translation to OData status codes', () => {
     function setupHandlers(overrides: any = {}) {
         const srv = makeFakeService();
-        registerSubmissionHandlers(srv as any, {}, {
+        registerSubmissionHandlers(srv as any, {} as any, {
             attesterIdResolver: vi.fn(async () => ATTESTER_ID),
             // Successful happy path by default
             resolveContractImpl: vi.fn(async (_name: string) => ({ ...RESOLVED_CONTRACT_FIXTURE })),
@@ -653,7 +653,7 @@ describe('error translation to OData status codes', () => {
         });
         const req = makeReq({ ...VALID_DEPLOY_ARGS, sessionId: 'session-404' });
         await srv.handlers['deployContract'](req);
-        expect(req.reject).toHaveBeenCalledWith(404, expect.stringMatching(/not registered/));
+        expect(req.reject).toHaveBeenCalledWith(expect.objectContaining({ status: 404, code: 'CONTRACT_NOT_REGISTERED', message: expect.stringMatching(/not registered/) }));
     });
 
     test('SessionNotFoundError → 401', async () => {
@@ -662,7 +662,7 @@ describe('error translation to OData status codes', () => {
         });
         const req = makeReq({ ...VALID_DEPLOY_ARGS, sessionId: 'session-401' });
         await srv.handlers['deployContract'](req);
-        expect(req.reject).toHaveBeenCalledWith(401, expect.stringMatching(/not found/));
+        expect(req.reject).toHaveBeenCalledWith(expect.objectContaining({ status: 401, code: 'SESSION_NOT_FOUND', message: expect.stringMatching(/not found/) }));
     });
 
     test('WalletMaterialUnavailable → 501', async () => {
@@ -671,7 +671,7 @@ describe('error translation to OData status codes', () => {
         });
         const req = makeReq({ ...VALID_DEPLOY_ARGS, sessionId: 'session-501' });
         await srv.handlers['deployContract'](req);
-        expect(req.reject).toHaveBeenCalledWith(501, expect.stringMatching(/Wallet material unavailable/));
+        expect(req.reject).toHaveBeenCalledWith(expect.objectContaining({ status: 501, code: 'WALLET_MATERIAL_UNAVAILABLE', message: expect.stringMatching(/Wallet material unavailable/) }));
     });
 
     test('a busy admission rejects 503 with a stable code, Retry-After, and $sanitize:false', async () => {
@@ -714,7 +714,7 @@ describe('error translation to OData status codes', () => {
 describe('rate limiting', () => {
     test('deployContract: 5 deploys/hour/session, 6th gets 429', async () => {
         const srv = makeFakeService();
-        registerSubmissionHandlers(srv as any, {}, {
+        registerSubmissionHandlers(srv as any, {} as any, {
             attesterIdResolver: vi.fn(async () => ATTESTER_ID),
             resolveContractImpl: vi.fn(async () => ({ ...RESOLVED_CONTRACT_FIXTURE })),
             walletMaterialFactory: vi.fn(async () => ({ accountId: 'a', privateStoragePasswordProvider: () => '0123456789ABCDEFG', walletAndMidnightProvider: {} })),
@@ -734,7 +734,7 @@ describe('rate limiting', () => {
 
     test('submitContractCall: 30 calls/min/session, 31st gets 429', async () => {
         const srv = makeFakeService();
-        registerSubmissionHandlers(srv as any, {}, {
+        registerSubmissionHandlers(srv as any, {} as any, {
             attesterIdResolver: vi.fn(async () => ATTESTER_ID),
             resolveContractImpl: vi.fn(async () => ({ ...RESOLVED_CONTRACT_FIXTURE })),
             walletMaterialFactory: vi.fn(async () => ({ accountId: 'a', privateStoragePasswordProvider: () => '0123456789ABCDEFG', walletAndMidnightProvider: {} })),
@@ -1945,7 +1945,7 @@ describe('submitContractCall: Bytes/Uint arg coercion reaches the submitter', ()
     function setup(overrides: any = {}) {
         const srv = makeFakeService();
         const submitter = makeSuccessfulSubmitter();
-        registerSubmissionHandlers(srv as any, {}, {
+        registerSubmissionHandlers(srv as any, {} as any, {
             attesterIdResolver: vi.fn(async () => ATTESTER_ID),
             resolveContractImpl: vi.fn(async () => ({ ...RESOLVED_CONTRACT_FIXTURE })),
             walletMaterialFactory: vi.fn(async () => ({
@@ -2022,7 +2022,7 @@ describe('submitContractCall: Bytes/Uint arg coercion reaches the submitter', ()
             sessionId: `badhex-${Date.now()}`, args: JSON.stringify(['zz'.repeat(32), '22'.repeat(32)])
         });
         await srv.handlers['submitContractCall'](req);
-        expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/args\[0\].*hex/));
+        expect(req.reject).toHaveBeenCalledWith(expect.objectContaining({ status: 400, code: 'ARG_COERCION_FAILED', message: expect.stringMatching(/args\[0\].*hex/) }));
     });
 
     test('wrong byte length → 400', async () => {
@@ -2032,7 +2032,7 @@ describe('submitContractCall: Bytes/Uint arg coercion reaches the submitter', ()
             sessionId: `badlen-${Date.now()}`, args: JSON.stringify(['11'.repeat(16), '22'.repeat(32)])
         });
         await srv.handlers['submitContractCall'](req);
-        expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/expected 32 bytes/));
+        expect(req.reject).toHaveBeenCalledWith(expect.objectContaining({ status: 400, code: 'ARG_COERCION_FAILED', message: expect.stringMatching(/expected 32 bytes/) }));
     });
 
     test('strict: untagged arg with no circuit metadata → 400 (no silent passthrough)', async () => {
@@ -2043,7 +2043,7 @@ describe('submitContractCall: Bytes/Uint arg coercion reaches the submitter', ()
             sessionId: `nometa-${Date.now()}`, args: JSON.stringify(['aa'.repeat(32)])
         });
         await srv.handlers['submitContractCall'](req);
-        expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/could not determine the circuit parameter type/));
+        expect(req.reject).toHaveBeenCalledWith(expect.objectContaining({ status: 400, code: 'ARG_COERCION_FAILED', message: expect.stringMatching(/could not determine the circuit parameter type/) }));
     });
 
     test('strict: tagged values still work with no circuit metadata', async () => {

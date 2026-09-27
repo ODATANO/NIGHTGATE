@@ -57,7 +57,8 @@ describe('createHttpTxConfirmer', () => {
             fetchFn: async () => jsonResponse(txResult('SUCCESS'))
         });
         await expect(confirm('00identifier')).resolves.toEqual({
-            status: 'success', blockHeight: 2415919, blockHash: '0xblockhash', indexerTxHash: '0xindexerhash'
+            status: 'success', blockHeight: 2415919, blockHash: '0xblockhash', indexerTxHash: '0xindexerhash',
+            result: 'SUCCESS', failedSegments: []
         });
         const bare = createHttpTxConfirmer({
             indexerHttpUrl: 'http://indexer/graphql',
@@ -200,5 +201,18 @@ describe('absence vs. unconfirmable', () => {
         expect(isChainAbsent(null)).toBe(false);
         expect(JSON.parse((await (async () => { let body = ''; const c = createHttpTxConfirmer({ indexerHttpUrl: 'http://indexer/graphql', fetchFn: vi.fn(async (_u: string, init: any) => { body = init.body; return jsonResponse({ data: { transactions: [] } }); }) as any }); await c('00q'); return body; })())).query).toMatch(/block \{ height timestamp \}/); // tip and transaction in ONE request
         expect(isChainOutcome({ status: 'success', blockHeight: 1 })).toBe(true);
+    });
+});
+
+describe('segment results', () => {
+    test('a partial success names the segments that did not apply', async () => {
+        const confirm = createHttpTxConfirmer({
+            indexerHttpUrl: 'http://indexer/graphql',
+            fetchFn: async () => jsonResponse({ data: { transactions: [{
+                hash: '0xh', block: { hash: '0xb', height: 10 },
+                transactionResult: { status: 'PARTIAL_SUCCESS', segments: [{ id: 1, success: true }, { id: 2, success: false }] }
+            }] } })
+        });
+        await expect(confirm('00id')).resolves.toMatchObject({ status: 'failure', result: 'PARTIAL_SUCCESS', failedSegments: [2] });
     });
 });

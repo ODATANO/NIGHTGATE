@@ -7,13 +7,8 @@
 // a module-level read must resolve before the cycle re-enters.
 import { configEnum, setConfigWarnSink } from '../../utils/config';
 import { RpcErrorPayload } from '../wallet-worker-protocol';
-import path from 'node:path';
-import fs from 'node:fs';
-import { getSharedKeyMaterialProvider } from '../wasm-proof-provider';
-import { deriveAttestationSecret } from '../../submission/contract-witnesses';
 import type * as AddressFormat from '@midnightntwrk/wallet-sdk-address-format';
 import { parentPort, type MessagePort } from 'node:worker_threads';
-import { startProgressWatch } from './facades';
 import type { ReplayKind, ReplayTrack } from './sync-replay';
 
 export interface RpcRequest {

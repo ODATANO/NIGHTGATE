@@ -5,6 +5,7 @@
  */
 
 import { classifySubmitFailure } from '../midnight/submit-error-classification';
+import { findNightgateError } from '../utils/errors';
 
 /**
  * Names the pool instead of one sponsor session. A reserved UUID because every
@@ -89,6 +90,8 @@ export function benchSponsor(id: string, cooldownMs: number): void {
  * Caller-side failures (policy, deserialization, pool Invalid) must not burn the pool.
  */
 export function isRetryableSponsorFailure(err: unknown): boolean {
+    const coded = findNightgateError(err)?.code;
+    if (coded === 'WALLET_NOT_SYNCED' || coded === 'FEE_SPONSOR_UNUSABLE') return true;
     if ((err as any)?.name === 'FeeSponsorError') return true;
     const info = classifySubmitFailure(err);
     if (info.code === 'dust-race') return info.ledgerCode !== 'pool-invalid';
@@ -116,7 +119,8 @@ export function isPreInclusionReject(err: unknown): boolean {
     const info = classifySubmitFailure(err);
     if (info.code === 'pre-mempool-reject' || info.code === 'dust-race') return true;
     // The request never left the client.
-    return info.code === 'transport' && (info.ledgerCode === 'closing-socket' || info.ledgerCode === 'not-sent');
+    return info.code === 'transport'
+        && (info.ledgerCode === 'closing-socket' || info.ledgerCode === 'not-sent' || info.ledgerCode === 'wallet-not-synced');
 }
 
 /**

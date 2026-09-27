@@ -3,8 +3,8 @@
  * contract query cache, phase timing and the compile step.
  */
 
-import path from 'node:path';
 import { proofRequestTimeoutMs } from '../../utils/proof-timeout';
+import { throwIfRpcCancelled } from './cancellation';
 import { runBatchInScope, landedHeight } from '../batch-call-scope';
 import { buildWasmProofProvider } from '../wasm-proof-provider';
 import { getContractWitnessFactory, type MerkleProofBundle } from '../../submission/contract-witnesses';
@@ -13,7 +13,6 @@ import { BoundedCache } from './bounded-cache';
 import { FacadeEntry, ensureNetworkId, facades, loadContractsSdk, loadSdk, log, resolveProvingMode } from './context';
 import { ContractRegistration, artifactAssetPath, generationCacheSize, getContractScaffold, onGenerationEvicted } from './artifacts';
 import { createPrivateStateProxy } from './private-state';
-import { evict } from './facades';
 import { BoundSubmitIntent, buildSponsoredWalletProvider, buildWorkerWalletProvider } from './submit';
 import { DEPLOY_ENTRY_POINT, resolveSponsorEntry } from './sponsor';
 
@@ -208,6 +207,8 @@ export function wrapProvidersForTiming(providers: any, timer: PhaseTimer, callRe
         ? {
             ...providers.proofProvider,
             proveTx: (...pArgs: any[]) => {
+                // A running wasm prove cannot be interrupted; the next one is not started.
+                throwIfRpcCancelled('before proving');
                 const n = ++proveCalls;
                 if (n === 1 && callRegion.start > 0) {
                     timer.add('circuitToProve', Date.now() - callRegion.start);
@@ -221,7 +222,7 @@ export function wrapProvidersForTiming(providers: any, timer: PhaseTimer, callRe
     const walletProvider = {
         ...wp,
         ...(typeof wp?.balanceTx === 'function'
-            ? { balanceTx: (...a: any[]) => timed('balance', () => wp.balanceTx(...a)) } : {}),
+            ? { balanceTx: (...a: any[]) => { throwIfRpcCancelled('before balancing'); return timed('balance', () => wp.balanceTx(...a)); } } : {}),
         ...(typeof wp?.submitTx === 'function'
             ? { submitTx: (...a: any[]) => timed('submit', () => wp.submitTx(...a)) } : {})
     };

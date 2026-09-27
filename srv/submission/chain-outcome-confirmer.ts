@@ -32,6 +32,10 @@ export type ChainOutcome = {
     blockHash?: string | null;
     /** The indexer's own transaction hash (not the identifier, not the extrinsic hash). */
     indexerTxHash?: string | null;
+    /** The indexer's result; PARTIAL_SUCCESS maps to `failure` in `status`. */
+    result?: 'SUCCESS' | 'PARTIAL_SUCCESS' | 'FAILURE';
+    /** Segments the indexer reports as not applied. */
+    failedSegments?: number[];
 };
 
 /**
@@ -62,7 +66,7 @@ export interface IndexerTxConfirmerConfig {
 const TX_STATUS_QUERY =
     'query NightgateTxStatus($offset: TransactionOffset!) {' +
     ' transactions(offset: $offset) {' +
-    ' ... on RegularTransaction { hash block { hash height } transactionResult { status } } }' +
+    ' ... on RegularTransaction { hash block { hash height } transactionResult { status segments { id success } } } }' +
     ' block { height timestamp } }';
 
 function tipMsOf(body: any): number | null {
@@ -77,6 +81,7 @@ interface IndexedTxSlice {
     hash: string | null;
     blockHash: string | null;
     blockHeight: number;
+    failedSegments: number[];
 }
 
 /**
@@ -120,7 +125,10 @@ export function createHttpTxConfirmer(
                 status,
                 hash: typeof tx?.hash === 'string' ? tx.hash : null,
                 blockHash: typeof tx?.block?.hash === 'string' ? tx.block.hash : null,
-                blockHeight: height
+                blockHeight: height,
+                failedSegments: Array.isArray(tx?.transactionResult?.segments)
+                    ? tx.transactionResult.segments.filter((s: any) => s?.success === false).map((s: any) => Number(s.id)).filter(Number.isInteger)
+                    : []
             }
         };
     };
@@ -139,7 +147,10 @@ export function createHttpTxConfirmer(
         if (slice === null) return null;
         const mapped = mapIndexerStatus(slice.status);
         if (!mapped) return null;
-        return { status: mapped, blockHeight: slice.blockHeight, blockHash: slice.blockHash, indexerTxHash: slice.hash };
+        return {
+            status: mapped, blockHeight: slice.blockHeight, blockHash: slice.blockHash, indexerTxHash: slice.hash,
+            result: slice.status as ChainOutcome['result'], failedSegments: slice.failedSegments
+        };
     }
 }
 

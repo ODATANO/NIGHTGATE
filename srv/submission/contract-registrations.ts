@@ -22,15 +22,18 @@ import {
 import { effectiveModuleFormat, runtimeNodeModulesDir } from './artifact-digest';
 import { hasAllProverKeys } from './prover-keys';
 import { configString } from '../utils/config';
+import type { DbRunner } from '../utils/db-types';
+import { NightgateError } from '../utils/errors';
 
 const log = cds.log('nightgate:contracts');
 const PACKAGE_ROOT = path.resolve(__dirname, '..', '..');
 
-export class ContractRegistrationError extends Error {
-    constructor(public readonly httpStatus: number, message: string) {
-        super(message);
-        this.name = 'ContractRegistrationError';
+export class ContractRegistrationError extends NightgateError {
+    constructor(status: number, message: string) {
+        super('CONTRACT_REGISTRATION_REJECTED', message, { status });
     }
+    /** @deprecated use `status`. */
+    get httpStatus(): number { return this.status; }
 }
 
 export interface RuntimeRegistrationInput {
@@ -193,7 +196,7 @@ export async function validateRuntimeRegistration(input: RuntimeRegistrationInpu
 
 /** Re-registering a name is a new generation: jobs recorded against the old one refuse. */
 export async function registerContractAtRuntime(
-    db: any,
+    db: DbRunner,
     input: RuntimeRegistrationInput,
     ctx: { registeredBy?: string; networkId?: string } = {}
 ): Promise<ContractListing> {
@@ -205,7 +208,7 @@ export async function registerContractAtRuntime(
 const registrationLockKey = (name: string) => `contract-registration:${name}`;
 
 async function registerContractAtRuntimeLocked(
-    db: any,
+    db: DbRunner,
     name: string,
     input: RuntimeRegistrationInput,
     ctx: { registeredBy?: string; networkId?: string }
@@ -250,7 +253,7 @@ async function registerContractAtRuntimeLocked(
 }
 
 export async function unregisterContractAtRuntime(
-    db: any,
+    db: DbRunner,
     name: string
 ): Promise<{ removed: boolean }> {
     if (isConfigRegisteredContract(name)) {
@@ -266,7 +269,7 @@ export async function unregisterContractAtRuntime(
 }
 
 /** Boot, after the config. Invalid or shadowing rows are skipped and kept. Never throws. */
-export async function loadPersistedRegistrations(db: any): Promise<string[]> {
+export async function loadPersistedRegistrations(db: DbRunner): Promise<string[]> {
     const { SELECT } = cds.ql as any;
     let rows: any[] = [];
     try {

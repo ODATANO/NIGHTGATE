@@ -10,10 +10,11 @@
 
 import cds from '@sap/cds';
 import { parseExtrinsicCall } from '../utils/scale';
-import { extractLedgerPayload, decodeLedgerPayload } from './ledger-payload';
+import { extractLedgerPayload, decodeLedgerPayload, type LedgerPayloadFacts } from './ledger-payload';
 import { readCapBinary } from './cap-binary';
 import { lockReorgGeneration } from '../submission/reorg-generation';
-import { Blocks, Transactions, ContractActions, SyncState } from '#cds-models/midnight';
+import { Blocks, Transactions, ContractActions, SyncState, type Block, type Transaction, type ContractAction } from '#cds-models/midnight';
+import type { DbRunner, Row } from '../utils/db-types';
 
 /** Where a pass started: both have to still hold when it writes its cursor. */
 interface PassPosition {
@@ -104,7 +105,7 @@ export class LedgerPayloadDecoder {
         const start: PassPosition = { cursor, generation: Number.isFinite(generation) ? generation : 0 };
         if (!Number.isFinite(ceiling) || from > ceiling) return EMPTY_RUN;
 
-        const blocks: any[] = await this.db.run(
+        const blocks: Row<Block, 'ID' | 'height'>[] = await this.db.run(
             SELECT.from(Blocks).columns('ID', 'height')
                 .where({ height: { '>=': from } }).and({ height: { '<=': ceiling } })
                 .orderBy('height asc').limit(this.config.batchSize)
@@ -138,7 +139,7 @@ export class LedgerPayloadDecoder {
         // Every transaction of the block, whatever it decoded to last time:
         // the cursor is the only gate, so resetting it replays the range,
         // which is how a decoder fix is rolled out.
-        const rows: any[] = await this.db.run(
+        const rows: Row<Transaction, 'ID'>[] = await this.db.run(
             SELECT.from(Transactions).columns('ID', 'raw', 'payloadDecode', 'transactionType')
                 .where({ block_ID: blockId })
         ) || [];
@@ -175,7 +176,7 @@ export class LedgerPayloadDecoder {
             }
         }
 
-        await this.db.tx(async (tx: any) => {
+        await this.db.tx(async (tx) => {
             for (const update of updates) {
                 await this.applyFacts(tx, update.id, update.facts, update.state);
             }
@@ -183,13 +184,13 @@ export class LedgerPayloadDecoder {
         return result;
     }
 
-    private async applyFacts(tx: any, transactionId: string, facts: any, state: DecodeState): Promise<void> {
+    private async applyFacts(tx: DbRunner, transactionId: string, facts: LedgerPayloadFacts | null, state: DecodeState): Promise<void> {
         if (!facts) {
             await tx.run(UPDATE.entity(Transactions).set({ payloadDecode: state }).where({ ID: transactionId }));
             return;
         }
 
-        const firstCall = facts.contractActions.find((a: any) => a.entryPoint) ?? null;
+        const firstCall = facts.contractActions.find(a => a.entryPoint) ?? null;
         await tx.run(UPDATE.entity(Transactions).set({
             payloadDecode: state,
             identifiers: facts.identifiers.length ? JSON.stringify(facts.identifiers) : null,
@@ -207,14 +208,14 @@ export class LedgerPayloadDecoder {
         // both sides report the same number: on a partial success the payload
         // declares calls that never applied, and assigning those names to the
         // ones that did would be wrong rather than merely incomplete.
-        const actions: any[] = await tx.run(
+        const actions: Row<ContractAction, 'ID' | 'address'>[] = await tx.run(
             SELECT.from(ContractActions).columns('ID', 'actionIndex', 'address', 'actionType')
                 .where({ transaction_ID: transactionId, actionType: 'CALL' })
                 .orderBy('actionIndex asc')
         ) || [];
         if (actions.length === 0) return;
 
-        const ours = new Map<string, any[]>();
+        const ours = new Map<string | null, any[]>();
         for (const action of actions) {
             const list = ours.get(action.address) ?? [];
             list.push(action);
@@ -229,7 +230,7 @@ export class LedgerPayloadDecoder {
         }
 
         for (const [address, mine] of ours) {
-            const names = declared.get(address);
+            const names = address === null ? undefined : declared.get(address);
             if (!names || names.length !== mine.length) {
                 if (names) {
                     log.debug(
@@ -259,7 +260,7 @@ export class LedgerPayloadDecoder {
      */
     private async setCursor(expected: PassPosition, height: number): Promise<boolean> {
         let advanced = false;
-        await this.db.tx(async (tx: any) => {
+        await this.db.tx(async (tx) => {
             const generation = await lockReorgGeneration(tx);
             const current: any = await tx.run(
                 SELECT.one.from(SyncState).columns('lastDecodedHeight').where({ ID: 'SINGLETON' })

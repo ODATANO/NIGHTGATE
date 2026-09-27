@@ -29,6 +29,26 @@ export class NightgateApiError extends Error {
     }
 }
 
+/** Server error codes a client may retry unchanged (the server registry marks them retryable). */
+export const RETRYABLE_ERROR_CODES = new Set([
+    'RATE_LIMITED', 'BAD_GATEWAY', 'UNAVAILABLE', 'ACCOUNT_KEY_UNAVAILABLE', 'JOB_ADMISSION_BUSY',
+    'PROVER_KEYS_UNAVAILABLE', 'RUNTIME_UNAVAILABLE', 'SPONSOR_POLICY_UNAVAILABLE', 'SUBMIT_INTENT_TIMEOUT',
+    'WALLET_NOT_SYNCED', 'WALLET_SYNCING', 'WORKER_ROTATING'
+]);
+
+/**
+ * Whether a failed call may be retried unchanged: by the server's code when it sent
+ * one, by the status when a proxy or CAP answered with a number, else network errors.
+ */
+export function isRetryable(err) {
+    if (err instanceof NightgateApiError) {
+        if (typeof err.code === 'string' && !/^\d+$/.test(err.code)) return RETRYABLE_ERROR_CODES.has(err.code);
+        return [429, 502, 503, 504].includes(err.status);
+    }
+    if (err instanceof NightgateJobError) return false;
+    return err?.name === 'TimeoutError' || err?.name === 'AbortError' || /fetch failed|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN/i.test(String(err?.message ?? err));
+}
+
 /** Error thrown by waitForJob when the job itself failed. */
 export class NightgateJobError extends Error {
     constructor(job) {
@@ -170,9 +190,7 @@ export function connect(opts) {
      * losing the job handle.
      */
     function isTransientPollError(err) {
-        if (err instanceof NightgateApiError) return [429, 502, 503, 504].includes(err.status);
-        if (err instanceof NightgateJobError) return false;
-        return err?.name === 'TimeoutError' || err?.name === 'AbortError' || /fetch failed|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN/i.test(String(err?.message ?? err));
+        return isRetryable(err);
     }
 
     /**

@@ -11,6 +11,7 @@
 import type { Mock, MockInstance } from 'vitest';
 import cds from '@sap/cds';
 import { WorkerSubmitError } from '../../srv/midnight/wallet-worker-protocol';
+import { isNightgateError, findNightgateError } from '../../srv/utils/errors';
 import { EventEmitter } from 'node:events';
 
 type SentMessage = {
@@ -275,6 +276,41 @@ describe('wallet-worker-client', () => {
             await expect(walletEvict('s1')).rejects.toThrow('could not be cloned');
             await new Promise(r => setImmediate(r));
             expect(getWalletWorkerStatus().inFlightRpcs).toBe(0);
+        });
+
+        it('a timed-out call tells the worker to cancel', async () => {
+            let workerPort: any;
+            const cancels: any[] = [];
+            await startWithResponder((msg: any) => {
+                workerPort = msg.port;
+                workerPort.on('message', (m: any) => { if (m?.kind === 'cancel') cancels.push(m); });
+                return undefined; // never answers
+            });
+            await expect(walletGetBalance({ sessionId: 's1', networkId: 'preprod', rpcTimeoutMs: 30 } as any))
+                .rejects.toThrow(/timed out after 30ms/);
+            await new Promise(r => setTimeout(r, 20));
+            expect(cancels).toEqual([{ kind: 'cancel' }]);
+            workerPort?.close();
+        });
+
+        it('rebuilds our coded error with code, status and retryable', async () => {
+            await startWithResponder(() => ({ ok: false, error: {
+                name: 'NightgateError', message: 'wallet not synced to tip after 1000ms <- inner',
+                nightgate: { name: 'NightgateError', code: 'WALLET_NOT_SYNCED', status: 503, retryable: true, message: 'wallet not synced to tip after 1000ms' }
+            } }));
+            const err: any = await walletEvict('s1').then(() => null, e => e);
+            expect(isNightgateError(err)).toBe(true);
+            expect(err).toMatchObject({ code: 'WALLET_NOT_SYNCED', status: 503, retryable: true, message: 'wallet not synced to tip after 1000ms <- inner' });
+        });
+
+        it('a classified failure keeps its coded error as cause', async () => {
+            await startWithResponder(() => ({ ok: false, error: {
+                name: 'NightgateError', message: 'm', code: 'transport', ledgerCode: 'wallet-not-synced', retryable: true,
+                nightgate: { name: 'NightgateError', code: 'WALLET_NOT_SYNCED', status: 503, retryable: true, message: 'm' }
+            } }));
+            const err: any = await walletEvict('s1').then(() => null, e => e);
+            expect(err).toBeInstanceOf(WorkerSubmitError);
+            expect(findNightgateError(err)?.code).toBe('WALLET_NOT_SYNCED');
         });
 
         it('an unknown code is not a classification: plain Error', async () => {

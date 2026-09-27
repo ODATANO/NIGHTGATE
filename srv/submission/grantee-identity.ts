@@ -8,6 +8,7 @@ import { bytesToHex } from '@noble/hashes/utils';
 import { GranteeIdentities } from '#cds-models/midnight';
 import { type GranteeBinding } from '../utils/nightgate-config';
 import { hexToBytes } from '../utils/hex';
+import type { DbRunner } from '../utils/db-types';
 
 const { SELECT } = cds.ql;
 
@@ -50,10 +51,10 @@ interface GranteeIdentityRow {
 /** The principal's granteeId or null; an exactly scoped row wins over a global one. */
 export async function resolveGranteeId(
     req: cds.Request,
-    db: any,
+    db: DbRunner,
     opts: ResolveGranteeIdOptions = {}
 ): Promise<string | null> {
-    const userId = (req as any).user?.id;
+    const userId = req.user?.id;
     if (!userId) return null;
 
     const rows: GranteeIdentityRow[] =

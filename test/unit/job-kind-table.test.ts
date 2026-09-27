@@ -7,7 +7,7 @@
  */
 import { describe, it, expect, beforeEach } from 'vitest';
 import {
-    JOB_KIND_TRAITS, LIGHT_KIND, HEAVY_KIND, WORKFLOW_PARENT_KIND, declaredJobKindTraits
+    JOB_KIND_TRAITS, JOB_KINDS, LIGHT_KIND, HEAVY_KIND, WORKFLOW_PARENT_KIND, declaredJobKindTraits, jobKindOp, jobKindsOf
 } from '../../srv/submission/job-kinds';
 import {
     registerBackgroundJobProcessor, declareJobKind, jobKindTraits, kindsWithTrait,
@@ -81,5 +81,29 @@ describe('derived sets', () => {
         expect(missing).toContain('deployContract');
         registerBackgroundJobProcessor('deployContract', 1, declaredJobKindTraits('deployContract'), noop);
         expect(undeclaredOrUnregisteredJobKinds()).not.toContain('deployContract');
+    });
+});
+
+describe('job definitions', () => {
+    it('every kind names its executor; contract and wallet kinds the one operation they accept', () => {
+        for (const [kind, def] of Object.entries(JOB_KINDS)) {
+            expect(def.executor, kind).toBeTruthy();
+            if (def.executor === 'contract' || def.executor === 'wallet') expect(def.op, kind).toBeTruthy();
+            expect(JOB_KIND_TRAITS[kind], kind).toBe(def.traits);
+        }
+        expect(jobKindOp('deployContract')).toBe('deploy');
+        expect(jobKindOp('fieldPredicateBatchProof')).toBe('callBatch');
+        expect(jobKindOp('notAKind')).toBeUndefined();
+        expect(jobKindOp('toString')).toBeUndefined();
+    });
+
+    it('the wallet kinds are the four wallet commands', () => {
+        expect(jobKindsOf('wallet')).toEqual(['connectWalletForSigning', 'registerForDustGeneration', 'deregisterFromDustGeneration', 'sendNight']);
+    });
+
+    it('only chain-effect kinds carry a reconciliation finalizer', () => {
+        const withFinalizer = Object.entries(JOB_KINDS).filter(([, d]) => d.finalizer).map(([k]) => k).sort();
+        expect(withFinalizer).toEqual(['anchorDocument', 'fieldPredicateBatchProof', 'grantDisclosure', 'registerPassport', 'retract',
+            'revokeDisclosure', 'sponsorFinalizedTransaction', 'sponsorUnboundTransaction', 'submitContractCallBatch']);
     });
 });

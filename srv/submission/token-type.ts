@@ -3,6 +3,7 @@
  * `sendNight` needs it to spend a minted token.
  * SPDX-License-Identifier: Apache-2.0
  */
+import { NightgateError } from '../utils/errors';
 
 /** Bundled `contracts/shielded-token` test token. */
 export const SHIELDED_TEST_TOKEN_DOMAIN_SEP = 'nightgate:zswap-e2e';
@@ -14,8 +15,8 @@ export const SHIELDED_TEST_TOKEN_REF = 'shielded-token';
 
 export const SHIELDED_TEST_TOKEN_CIRCUIT = 'mint';
 
-export class TokenTypeError extends Error {
-    constructor(message: string) { super(message); this.name = 'TokenTypeError'; }
+export class TokenTypeError extends NightgateError {
+    constructor(message: string) { super('TOKEN_TYPE_INVALID', message); }
 }
 
 /**

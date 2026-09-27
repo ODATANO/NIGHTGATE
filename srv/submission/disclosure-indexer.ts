@@ -4,8 +4,9 @@
  * `changedAtHeight`, so a stale read cannot revive a revoke or roll a level back.
  */
 import cds from '@sap/cds';
-import { DisclosureGrants } from '#cds-models/midnight';
+import { DisclosureGrants, type DisclosureGrant } from '#cds-models/midnight';
 import { importArtifactByPath } from './contract-registry';
+import type { DbRunner } from '../utils/db-types';
 
 const { SELECT, INSERT, UPDATE } = cds.ql;
 
@@ -47,7 +48,7 @@ export function enumerateGrants(led: DisclosureLedger): DisclosureGrantRecord[] 
 }
 
 export interface ReindexDeps {
-    db: any;
+    db: DbRunner;
     contractAddress: string;
     /** The compiled artifact's `ledger` decoder. */
     ledger: (state: any) => DisclosureLedger;
@@ -121,7 +122,7 @@ async function reindexOnce(deps: ReindexDeps): Promise<ReindexResult> {
 
     for (const g of onChain) {
         seen.add(`${g.attesterId}|${g.payloadHash}|${g.grantee}`);
-        const existing: any = await db.run(
+        const existing: DisclosureGrant | undefined = await db.run(
             SELECT.one.from(DisclosureGrants).where({
                 contractAddress, attesterId: g.attesterId, payloadHash: g.payloadHash, grantee: g.grantee
             })
@@ -156,7 +157,7 @@ async function reindexOnce(deps: ReindexDeps): Promise<ReindexResult> {
     }
 
     // Rows with a height are ordered against the snapshot; without, the grace window applies.
-    const activeRows: any[] = (await db.run(
+    const activeRows: DisclosureGrant[] = (await db.run(
         SELECT.from(DisclosureGrants).where({ contractAddress, active: true })
     )) || [];
 
@@ -198,7 +199,7 @@ export async function queryIndexerTipHeight(indexerHttpUrl: string, fetchFn: typ
 }
 
 export interface ReindexForContractArgs {
-    db: any;
+    db: DbRunner;
     contractAddress: string;
     /** Compiled contract artifact (`.../contract/index.js`). */
     artifactPath: string;

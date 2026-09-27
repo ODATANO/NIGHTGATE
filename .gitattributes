@@ -1,3 +1,6 @@
+# Text files are LF in the repository, whatever a contributor's core.autocrlf.
+* text=auto eol=lf
+
 # Compiled Compact / ZK artifacts under contracts/**/managed are binary.
 # Git auto-detects them today; declaring it explicitly keeps them byte-intact
 # regardless of a contributor's core.autocrlf setting.

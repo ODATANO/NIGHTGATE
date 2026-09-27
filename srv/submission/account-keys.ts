@@ -10,6 +10,8 @@ import crypto from 'node:crypto';
 import cds from '@sap/cds';
 import { encrypt, decrypt, inspectCiphertext, KeyRing, UnknownEncryptionKeyError, UnboundEnvelopeError } from '../utils/crypto';
 import { accountDekBinding, accountDekViewingKeySealBinding } from '../utils/envelope-bindings';
+import type { DbRunner } from '../utils/db-types';
+import { NightgateError } from '../utils/errors';
 
 const { SELECT, INSERT, UPDATE } = cds.ql;
 const ENTITY = 'midnight.AccountKeys';
@@ -24,12 +26,11 @@ const VK_SEAL_SALT = 'nightgate-account-dek';
 const PRIVATE_STATE_DEK_INFO = 'nightgate/private-state/dek/v1';
 const SYNC_STATE_DEK_INFO = 'nightgate/sync-state/dek/v1';
 
-type Runner = { run: (q: any) => Promise<any> };
+type Runner = DbRunner;
 
-export class AccountDekUnavailableError extends Error {
+export class AccountDekUnavailableError extends NightgateError {
     constructor(accountId: string, reason: string) {
-        super(`account key for ${accountId.slice(0, 16)} cannot be opened: ${reason}`);
-        this.name = 'AccountDekUnavailableError';
+        super('ACCOUNT_KEY_UNAVAILABLE', `account key for ${accountId.slice(0, 16)} cannot be opened: ${reason}`);
     }
 }
 

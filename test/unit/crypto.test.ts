@@ -273,7 +273,7 @@ describe('v3 bound envelopes', () => {
 
     it('refuses an empty or NUL-bearing binding', () => {
         expect(() => encrypt('x', ring, { purpose: '', subject: 'a' })).toThrow(/non-empty purpose and subject/);
-        expect(() => encrypt('x', ring, { purpose: 'p', subject: 'a b' })).toThrow(/NUL/);
+        expect(() => encrypt('x', ring, { purpose: 'p', subject: 'a\u0000b' })).toThrow(/NUL/);
     });
 });
 

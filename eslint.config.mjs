@@ -1,5 +1,6 @@
 import cds from '@sap/cds/eslint.config.mjs'
 import globals from 'globals'
+import tseslint from 'typescript-eslint'
 
 export default [
     {
@@ -47,5 +48,23 @@ export default [
         languageOptions: {
             globals: { ...globals.browser }
         }
+    },
+    {
+        files: ['**/*.ts'],
+        languageOptions: { parser: tseslint.parser },
+        plugins: { '@typescript-eslint': tseslint.plugin },
+        rules: {
+            // The compiler checks names and overloads; the base rules misread types.
+            'no-undef': 'off',
+            'no-redeclare': 'off',
+            'no-unused-vars': 'off',
+            '@typescript-eslint/no-unused-vars': ['warn', { argsIgnorePattern: '^_', varsIgnorePattern: '^_', caughtErrors: 'none' }],
+            '@typescript-eslint/no-explicit-any': 'warn'
+        }
+    },
+    {
+        // SDK objects are duck-typed (real types would pull in the ESM-only SDK type graphs); test doubles too.
+        files: ['srv/midnight/**/*.ts', 'test/**/*.ts'],
+        rules: { '@typescript-eslint/no-explicit-any': 'off' }
     }
 ]

@@ -124,6 +124,21 @@ service NightgateAdminService {
         oldestQueuedSeconds : Integer;
     };
 
+    /**
+     * NightBalances rows that differ from the figures the indexed UTXOs imply; changes nothing.
+     * One `address`, or a page of up to `limit` (max 500) addresses after `after`.
+     */
+    function reconcileNightBalances(address: String, after: String, limit: Integer) returns {
+        checked : Integer;
+        next    : String; // pass as `after`; null = done
+        drifted : array of {
+            address  : String;
+            field    : String; // figure name, or 'row'
+            stored   : String;
+            computed : String;
+        };
+    };
+
     // Grant a disclosure tier; the caller also needs disclosureRole 'authority'.
     action grantRole(
         userId:     String,

@@ -4,14 +4,16 @@
  * artifact's pure circuits so roots match the in-circuit recompute; external builders must too.
  */
 
-import cds, { Request } from '@sap/cds';
-import path from 'node:path';
+import cds from '@sap/cds';
 import { randomBytes } from 'node:crypto';
 import { RateLimiter } from '../utils/rate-limiter';
 import { getContractRegistration, slotWidthOf, importRegisteredArtifact } from './contract-registry';
 import { blake2b256Hex, fromHex32, emptyLeafKeyHex } from './hashing';
 import { buildMembershipSet, membershipPathFor, canonicalSetDigests } from './set-root';
-import { BackgroundJobs } from '#cds-models/midnight';
+import { BackgroundJobs, type BackgroundJob } from '#cds-models/midnight';
+import { formatErr } from '../utils/format-error';
+import type { NightgateRequest } from '../utils/request-types';
+import { NightgateError } from '../utils/errors';
 
 export { blake2b256Hex } from './hashing';
 
@@ -339,8 +341,8 @@ export async function loadPureCircuitsFromRegistry(compiledRef: string): Promise
     return pure as PureCircuits;
 }
 
-export class PureCircuitsUnavailableError extends Error {
-    constructor(message: string) { super(message); this.name = 'PureCircuitsUnavailableError'; }
+export class PureCircuitsUnavailableError extends NightgateError {
+    constructor(message: string) { super('PURE_CIRCUITS_UNAVAILABLE', message); }
 }
 
 // ---- Handlers -------------------------------------------------------------
@@ -357,7 +359,7 @@ export function agentOutputProducedAt(contentType: string | undefined, metadata:
 }
 
 async function recordedProducedAt(sessionId: string, idempotencyKey: string, userId: string | undefined): Promise<string | null> {
-    const job: any = await cds.db.run(
+    const job: BackgroundJob | undefined = await cds.db.run(
         SELECT.one.from(BackgroundJobs).columns('request')
             .where({ sessionId, kind: 'anchorDocument', idempotencyKey, requestedBy: userId ?? null })
             .orderBy('createdAt desc')
@@ -380,8 +382,8 @@ export function registerDocumentProofHandlers(srv: any, deps: DocumentProofHandl
     const loadPure = deps.loadPure ?? loadPureCircuitsFromRegistry;
     const findProducedAt = deps.findProducedAt ?? recordedProducedAt;
 
-    srv.on('prepareDocumentProof', async (req: Request) => {
-        const clientKey = (req as any)?._?.req?.ip || 'global';
+    srv.on('prepareDocumentProof', async (req: NightgateRequest) => {
+        const clientKey = req?._?.req?.ip || 'global';
         const rate = prepareRateLimiter.check(clientKey);
         if (!rate.allowed) {
             return req.reject(429, `Rate limited. Retry after ${Math.ceil(rate.retryAfterMs / 1000)}s`);
@@ -472,8 +474,8 @@ export function registerDocumentProofHandlers(srv: any, deps: DocumentProofHandl
         };
     });
 
-    srv.on('prepareMembershipSet', async (req: Request) => {
-        const clientKey = (req as any)?._?.req?.ip || 'global';
+    srv.on('prepareMembershipSet', async (req: NightgateRequest) => {
+        const clientKey = req?._?.req?.ip || 'global';
         const rate = prepareRateLimiter.check(clientKey);
         if (!rate.allowed) {
             return req.reject(429, `Rate limited. Retry after ${Math.ceil(rate.retryAfterMs / 1000)}s`);
@@ -531,7 +533,7 @@ export function registerDocumentProofHandlers(srv: any, deps: DocumentProofHandl
         }
     });
 
-    srv.on('attestAgentOutput', async (req: Request) => {
+    srv.on('attestAgentOutput', async (req: NightgateRequest) => {
         const data = req.data as {
             agentId?: string; inputHash?: string; outputHash?: string;
             modelId?: string; policyHash?: string; producedAt?: string; storageRef?: string;
@@ -564,7 +566,7 @@ export function registerDocumentProofHandlers(srv: any, deps: DocumentProofHandl
         } else {
             // A retry under the same key re-derives the first call's envelope.
             producedAt = (data.idempotencyKey
-                ? await findProducedAt(data.sessionId, data.idempotencyKey, (req as any).user?.id)
+                ? await findProducedAt(data.sessionId, data.idempotencyKey, req.user?.id)
                 : null) ?? new Date().toISOString();
         }
 
@@ -596,15 +598,16 @@ export function registerDocumentProofHandlers(srv: any, deps: DocumentProofHandl
                     idempotencyKey: data.idempotencyKey,
                     sponsorSessionId: data.sponsorSessionId
                 },
-                user: (req as any).user,
+                user: req.user,
                 // Checked on this request already; the anchor job is recorded under the same grant.
-                agentGrant: (req as any).agentGrant
+                agentGrant: req.agentGrant
             } as any);
             return { ...anchored, payloadHash, envelopeJson };
-        } catch (err: any) {
-            const status = Number(err?.code ?? err?.status);
+        } catch (err: unknown) {
+            const e = err as { code?: unknown; status?: unknown } | null | undefined;
+            const status = Number(e?.status ?? e?.code);
             return req.reject(Number.isInteger(status) && status >= 400 && status < 600 ? status : 500,
-                String(err?.message ?? err));
+                formatErr(err));
         }
     });
 }

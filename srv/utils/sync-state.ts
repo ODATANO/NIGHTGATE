@@ -1,22 +1,23 @@
 import cds from '@sap/cds';
+import { NightgateError } from './errors';
 const { SELECT, INSERT, UPDATE } = cds.ql;
 
 import { SyncState, Blocks } from '#cds-models/midnight';
 import { getConfiguredNightgateNodeUrl, resolveNightgateRuntimeConfig, getNightgatePluginConfig } from './nightgate-config';
 import { redactUrlCredentials } from './redact-url';
+import { formatErr } from './format-error';
 import { configString } from './config';
 
 /** The database is bound to another network than the configured one. */
-export class SyncStateNetworkMismatchError extends Error {
+export class SyncStateNetworkMismatchError extends NightgateError {
     constructor(public readonly storedNetwork: string, public readonly configuredNetwork: string) {
-        super(
+        super('SYNC_STATE_NETWORK_MISMATCH',
             `This database is bound to network '${storedNetwork}' but the configured network is ` +
             `'${configuredNetwork}'. Refusing to start: mixing chains in one database corrupts ` +
             `indexed and verification data. Use a separate database file per network (set ` +
             `NIGHTGATE_DB_PATH), or, to deliberately rebind an EMPTY/expendable database, delete it ` +
             `and redeploy.`
         );
-        this.name = 'SyncStateNetworkMismatchError';
     }
 }
 
@@ -70,9 +71,9 @@ export async function ensureSyncStateSingleton(db: cds.DatabaseService, nodeUrl?
                 chainHeight: 0,
                 consecutiveErrors: 0
             }));
-        } catch (err: any) {
+        } catch (err: unknown) {
             // Another caller inserted first (SQLite / PostgreSQL wording).
-            if (!/unique constraint|duplicate key/i.test(String(err.message ?? ''))) throw err;
+            if (!/unique constraint|duplicate key/i.test(formatErr(err))) throw err;
         }
     }
 }

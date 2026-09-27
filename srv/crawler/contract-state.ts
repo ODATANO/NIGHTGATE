@@ -12,7 +12,8 @@
 import { createHash } from 'node:crypto';
 import cds from '@sap/cds';
 import { readCapBinary } from './cap-binary';
-import { ContractActions, ContractStates, SyncState } from '#cds-models/midnight';
+import { ContractActions, ContractStates, SyncState, type ContractAction } from '#cds-models/midnight';
+import type { DbRunner, DbService, Row } from '../utils/db-types';
 
 const { SELECT, INSERT, UPDATE } = cds.ql;
 
@@ -74,7 +75,7 @@ export interface CurrentStateRow {
  * is stored. The same height replaces: within a block the supplement applies
  * the transactions in order, so the last action wins, and a re-run is idempotent.
  */
-export async function upsertCurrentState(tx: any, row: CurrentStateRow): Promise<boolean> {
+export async function upsertCurrentState(tx: DbRunner, row: CurrentStateRow): Promise<boolean> {
     const address = normalizeContractAddress(row.address);
     const existing: any = await tx.run(
         SELECT.one.from(ContractStates).columns('height').where({ address })
@@ -127,7 +128,7 @@ function base64Of(bytes: Buffer | null): string | null {
  * the stored hash. Null when neither knows an action of the contract.
  */
 export async function contractStateAt(
-    db: any,
+    db: DbService,
     rawAddress: string,
     height: number | null,
     fetchState: ContractStateFetcher
@@ -218,14 +219,14 @@ export interface CompactionReport {
  * file system only after `VACUUM FULL` (PostgreSQL) or `VACUUM` (SQLite).
  */
 export async function compactStoredContractState(
-    db: any,
+    db: DbService,
     opts: { policy: ContractStatePolicy; batchSize?: number; dryRun?: boolean; log?: (msg: string) => void }
 ): Promise<CompactionReport> {
     const batchSize = Math.max(1, opts.batchSize ?? 100);
     const log = opts.log ?? (() => undefined);
     const report: CompactionReport = { contracts: 0, currentStatesWritten: 0, actionsHashed: 0, statesCleared: 0 };
 
-    const addresses: any[] = await db.run(
+    const addresses: Pick<ContractAction, 'address'>[] = await db.run(
         SELECT.distinct.from(ContractActions).columns('address').where({ state: { '!=': null } })
     ) || [];
     report.contracts = addresses.length;
@@ -233,7 +234,7 @@ export async function compactStoredContractState(
 
     for (const { address } of addresses) {
         if (!address) continue;
-        const newest: any = await db.run(
+        const newest: (Row<ContractAction, 'ID'> & { height?: number | null }) | undefined = await db.run(
             SELECT.one.from(ContractActions)
                 .columns('ID', 'state', 'zswapState', 'transaction.block.height as height')
                 .where({ address, state: { '!=': null } })
@@ -245,7 +246,7 @@ export async function compactStoredContractState(
         }
         const state = await readCapBinary(newest.state);
         const zswapState = await readCapBinary(newest.zswapState);
-        const written = await db.tx((tx: any) => upsertCurrentState(tx, {
+        const written = await db.tx((tx) => upsertCurrentState(tx, {
             address,
             height: Number(newest.height),
             state: base64Of(state),
@@ -296,7 +297,7 @@ export async function compactStoredContractState(
             if (!keep) report.statesCleared++;
         }
         if (!opts.dryRun) {
-            await db.tx(async (tx: any) => {
+            await db.tx(async (tx) => {
                 for (const u of updates) await tx.run(UPDATE.entity(ContractActions).set(u.values).where({ ID: u.id }));
             });
         }

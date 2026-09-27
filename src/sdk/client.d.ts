@@ -5,6 +5,12 @@ export declare class NightgateApiError extends Error {
     code: string | undefined;
 }
 
+/** Server error codes a client may retry unchanged. */
+export declare const RETRYABLE_ERROR_CODES: ReadonlySet<string>;
+
+/** Whether a failed call may be retried unchanged (code first, then status, then network errors). */
+export declare function isRetryable(err: unknown): boolean;
+
 export declare class NightgateJobError extends Error {
     job: JobStatus & { jobId: string };
 }

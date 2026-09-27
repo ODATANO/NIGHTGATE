@@ -179,7 +179,7 @@ smoke test succeed.
 - Compose sets `init: true`: tini runs as PID 1 and reaps orphaned processes
   (node does not; every health check docker kills would otherwise leave a
   zombie). With plain `docker run` pass `--init`.
-- Single instance only; never scale replicas against one database.
+- Single instance only; never scale replicas against one database. A second process on the same database refuses to start (`InstanceLeases`).
 - Without `NIGHTGATE_DB_URL` the entrypoint sets
   `NIGHTGATE_ALLOW_PRODUCTION_SQLITE=true` (single volume-backed instance).
   For production set `NIGHTGATE_DB_URL`.

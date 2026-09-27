@@ -3,10 +3,11 @@
  * dust-generation registration.
  */
 import { configMs } from '../../utils/config';
+import { formatErr } from '../../utils/format-error';
 import type * as AddressFormat from '@midnightntwrk/wallet-sdk-address-format';
 import { type MessagePort } from 'node:worker_threads';
 import { encodeAddressString, ensureNetworkId, facades, loadAddressFormat, loadSdk, log, parseReceiverAddress } from './context';
-import { BALANCE_SYNC_TIMEOUT_MS, SYNC_POLL_MS, countAllNightUtxos, countRegisteredNightUtxos, peekFacadeState, waitForGenuineSync, waitForSyncedState, waitForSyncedStateBounded, wsleep } from './facades';
+import { BALANCE_SYNC_TIMEOUT_MS, SYNC_POLL_MS, countAllNightUtxos, countRegisteredNightUtxos, peekFacadeState, waitForGenuineSync, waitForSyncedStateBounded, wsleep } from './facades';
 import { captureDustSnapshot, feeOfDiscardedRecipe, submitWithDustGuard } from './submit';
 import { resolveSponsorEntry } from './sponsor';
 
@@ -269,7 +270,7 @@ export async function getBalance({ sessionId, syncTimeoutMs }: {
     try {
         const p: any = (synced as any)?.dust?.progress;
         log('debug', `SYNC-PROGRESS isSynced=${(synced as any)?.isSynced} isConnected=${p?.isConnected} appliedIndex=${p?.appliedIndex} highestIndex=${p?.highestIndex} highestRelevantIndex=${p?.highestRelevantIndex}`);
-    } catch (e: any) { log('debug', `SYNC-PROGRESS read failed: ${e?.message}`); }
+    } catch (e: unknown) { log('debug', `SYNC-PROGRESS read failed: ${formatErr(e)}`); }
     const registeredCount = totalNightCoins.filter(
         (c: any) => c?.meta?.registeredForDustGeneration === true
     ).length;

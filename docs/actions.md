@@ -20,9 +20,11 @@ remove an action, a patch release never does; a removal is marked
 
 Every submitting action returns `{ jobId, status: "pending" }`; poll `getJobStatus(jobId, sessionId)` until `succeeded` or `failed`. A reused `idempotencyKey` returns the existing job; the same key with a different payload answers 409 `IDEMPOTENCY_KEY_CONFLICT`, a key over 128 characters 400 `IDEMPOTENCY_KEY_INVALID`. Each write action lists its job-result shape (the parsed `result`); functions return their result directly.
 
-### `getJobStatus(jobId, sessionId) → { status, chainStatus, result, errorCode, errorMessage, submissionId, txHash, chainFinalizedAt, chainBlockHeight, chainBlockHash, … }`
+### `getJobStatus(jobId, sessionId) → { status, chainStatus, result, errorCode, errorMessage, submissionId, txHash, chainFinalizedAt, chainBlockHeight, chainBlockHash, chainSegments, … }`
 
 `status`: `pending | running | external_execution | submitted | reconciliation_required | succeeded | failed`. `result` is the action's result as a JSON string; on failure `errorCode` + `errorMessage` (see [Error model](#error-model)). `chainBlockHeight` / `chainBlockHash` are the confirmed inclusion coordinates; a reorg rollback reverts by them. An on-chain failure without a block height stays briefly in `reconciliation_required` / `CHAIN_EXECUTION_FAILED_UNCONFIRMED` until the confirmer records the coordinates.
+
+`chainSegments` (batches, once the outcome is confirmed; `null` otherwise): JSON `[{ segment, calls, applied }]`, the call names of each segment and whether it applied. A partial success reads `status: failed`, `chainStatus: failure` as before; the segments with `applied: true` are on chain, resend only the others.
 
 `reconciliation_required`: execution was interrupted after an external effect may have occurred. Do NOT auto-retry; a new attempt needs a new `idempotencyKey`. The reconciler resolves it by the job's `txHash` on the indexer: `succeeded`, `failed / CHAIN_EXECUTION_FAILED`, or, once the indexer tip is past the transaction's `ttl` (30 to 60 min) plus `NIGHTGATE_BROADCAST_EXPIRY_MARGIN_MS` (default 5 min), `failed / BROADCAST_NOT_INCLUDED` with `chainStatus: dropped` (nothing on chain). Parked `errorCode`: `BROADCAST_UNCONFIRMED` (submitted, no node status, not indexed yet), `EXTERNAL_EXECUTION_FAILED` (failure after the broadcast), `PROCESS_RESTART_RECONCILE` (restart after the broadcast), `CHILD_RECONCILIATION_REQUIRED` (a workflow step is on chain but a later step or its record did not complete; once every step has succeeded the workflow re-runs and reuses them). Manual check: `verifyAttestationState` for an `attest`, else the identifier on the indexer.
 
@@ -800,6 +802,8 @@ Last `limit` (default 10, max 100) reorg events with depth, detected-at timestam
 
 `getJobStats(windowHours?) → { windowHours, since, total, byStatus[], topErrors[], oldestQueuedSeconds }`: counts per status and the ten most frequent error codes over `windowHours` (default 24, max 720).
 
+`reconcileNightBalances(address?, after?, limit?) → { checked, next, drifted[{ address, field, stored, computed }] }`: `NightBalances` rows that differ from the figures the indexed NIGHT UTXOs imply (the rule a reorg rollback rebuilds by); writes nothing. One `address`, or a page of up to `limit` (max 500) addresses after `after`; `next` is the cursor for the following page, `null` at the end. `field: 'row'` = a row is missing.
+
 `registerContract(name, artifactPath, zkConfigPath, privateStateId, slotWidth?) → { name, source, artifactPath, zkConfigPath, privateStateId, slotWidth, artifactDigest, hasProverKeys }`: register a contract artifact without a restart.
 
 - Contracts from `cds.requires.nightgate.contracts` are the immutable floor: a config name is `409`.
@@ -838,12 +842,12 @@ curl "http://localhost:4004/api/v1/nightgate/NightBalances/NightgateService.getT
 
 ## Error model
 
-OData envelope `{ error: { code, message } }`. For submission errors `message` is a JSON string with the classification:
+OData envelope `{ error: { code, message } }`. `code` is a string: a specific code where a client can act on it, otherwise the class of the HTTP status (`INVALID_ARGUMENT`, `NOT_FOUND`, `RATE_LIMITED`, ...); the full list is in [reference.md#http-error-codes](reference.md#http-error-codes). For submission errors `message` is a JSON string with the classification:
 
 ```json
 {
   "error": {
-    "code": "400",
+    "code": "INVALID_ARGUMENT",
     "message": "{\"code\":\"Wallet.InsufficientFunds\",\"retryable\":false,\"message\":\"Insufficient Funds: could not balance dust\",\"submissionId\":\"54b1968a-...\"}"
   }
 }
@@ -857,7 +861,7 @@ OData envelope `{ error: { code, message } }`. For submission errors `message` i
 | `WALLET_SYNCING` | a wallet read hit the sync gate; poll again once the prewarm job is ready | 15 s |
 | a retryable submission code (`1016`, `NetworkOrTimeout`) | the JSON payload below, `retryable: true` | none |
 
-Every other 5xx is a server fault and stays sanitised.
+Every other 5xx is a server fault: it keeps its `code`, its message is withheld in production.
 
 **Classification.** The wallet worker classifies a submit failure once, from the SDK error objects, and sends the result as data (`code`, `ledgerCode`, `retryable`, batch `calls`, cause chain); the main thread never parses message text. Worker codes:
 
@@ -865,7 +869,7 @@ Every other 5xx is a server fault and stays sanitised.
 |---|---|
 | `pre-mempool-reject` | node refused before the mempool, fee unspent; `ledgerCode` `1010/<n>`, `1014`, `1016` or `intent-rejected` |
 | `dust-race` | `1010/170`, `1010/171`, `1010/196` or `pool-invalid`; rebuild-retryable |
-| `transport` | the send failed before an answer; `closing-socket` when it never left |
+| `transport` | the send failed before an answer; `closing-socket` when it never left, `wallet-not-synced` when the wallet did not reach the tip and nothing was built |
 | `ambiguous` | the broadcast may have landed; reconciled by identifier, never rebuilt |
 | `landed-not-applied` | on chain, call not applied |
 | `policy` | sponsor shape check or allow-list refusal |
@@ -880,6 +884,7 @@ Job codes (`classifySubmissionError`, `srv/submission/TransactionSubmitter.ts`):
 | `1014` | no | Substrate "invalid transaction" |
 | `1016` | yes (preprod) / no (mainnet) | "Immediately Dropped" |
 | `NetworkOrTimeout` | yes | `transport`: `ECONNREFUSED`, `ECONNRESET`, `ENOTFOUND`, `ETIMEDOUT`, `socket hang up`, `timeout` |
+| `NetworkOrTimeout` (`wallet-not-synced`) | yes | `transport`, `wallet-not-synced`: the wallet did not reach the chain tip before the build; nothing sent, a sponsored job fails over to the next sponsor |
 | `NetworkOrTimeout` (`not-sent`) | yes | `transport`, `not-sent`: connect failed before the send; nothing on chain, attempt closed `REJECTED`, sponsored job fails after one retry on a fresh client |
 | `SubmitAmbiguous` | no | `ambiguous`: no node status (`no-reply`), no InBlock, or node request timeout, and the indexer does not know the tx; job parks as `reconciliation_required / BROADCAST_UNCONFIRMED`, resolved by identifier (see [async job model](#async-job-model-write-actions)) |
 | `PoolInvalid` | yes | `dust-race`, `pool-invalid`: pool status Invalid without a ledger code; one rebuild on sponsored paths |

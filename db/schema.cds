@@ -355,6 +355,8 @@ entity BackgroundJobs : cuid, managed {
     chainBlockHeight    : Integer;
     chainBlockHash      : HexEncoded;
     indexerTxHash       : HexEncoded;
+    // Batches: JSON [{ segment, calls, applied }] per call segment, set with the confirmed outcome.
+    chainSegments       : LargeString;
 }
 
 entity PrivateStates {
@@ -517,4 +519,12 @@ entity NightBalances {
 
         lastUpdatedHeight  : Integer64;
         lastUpdatedAt      : Timestamp;
+}
+
+/** The process running the background work on this database; renewed by heartbeat, released on stop. */
+entity InstanceLeases {
+    key role        : String(20);
+        instanceId  : String(200);
+        acquiredAt  : Timestamp;
+        heartbeatAt : Timestamp;
 }

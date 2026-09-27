@@ -1090,6 +1090,7 @@ service NightgateService {
         chainFinalizedAt    : Timestamp;
         chainBlockHeight    : Integer; // null until confirmed
         chainBlockHash      : String;
+        chainSegments       : LargeString; // batches: JSON [{ segment, calls, applied }] once confirmed; null otherwise
         queuedAt            : Timestamp;
         externalExecutionAt : Timestamp;
         submittedAt         : Timestamp;

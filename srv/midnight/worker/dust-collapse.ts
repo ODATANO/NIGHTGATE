@@ -6,6 +6,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+import { formatErr } from '../../utils/format-error';
+
 export interface OwnGeneration {
     firstFree: bigint;
     /** Backing night (hex) -> generation index. */
@@ -77,7 +79,7 @@ export function collapsedDustSnapshot(walletState: any, DustLocalState: any): { 
         if (!same) return { blob, collapsed: false, fullBytes, bytes: fullBytes, reason: 'collapsed state does not restore to the same roots, balance and UTXOs' };
         snapshot.state = Buffer.from(bytes).toString('hex');
         return { blob: JSON.stringify(snapshot), collapsed: true, fullBytes, bytes: bytes.length };
-    } catch (err: any) {
-        return { blob, collapsed: false, fullBytes, bytes: fullBytes, reason: String(err?.message ?? err) };
+    } catch (err: unknown) {
+        return { blob, collapsed: false, fullBytes, bytes: fullBytes, reason: formatErr(err) };
     }
 }

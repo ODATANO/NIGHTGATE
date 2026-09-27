@@ -6,6 +6,7 @@
 
 import fs from 'fs';
 import path from 'path';
+import { NightgateError } from '../utils/errors';
 
 /** A single circuit parameter's type, distilled from contract-info.json. */
 export interface CircuitArgType {
@@ -17,10 +18,9 @@ export interface CircuitArgType {
     maxval?: number;
 }
 
-export class CoercionError extends Error {
+export class CoercionError extends NightgateError {
     constructor(public readonly index: number, reason: string) {
-        super(`args[${index}]: ${reason}`);
-        this.name = 'CoercionError';
+        super('ARG_COERCION_FAILED', `args[${index}]: ${reason}`);
     }
 }
 

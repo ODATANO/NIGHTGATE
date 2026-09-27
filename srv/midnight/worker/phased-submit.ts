@@ -4,6 +4,7 @@
  * Only a connect failure is known unsent; late statuses are logged under the identifier.
  */
 import { log as workerLog } from './context';
+import { NightgateError } from '../../utils/errors';
 
 export type SubmitPhase = 'connect' | 'request' | 'watch';
 
@@ -50,14 +51,13 @@ export interface PhasedSubmitService {
     close(): Promise<void>;
 }
 
-export class SubmitPhaseError extends Error {
+export class SubmitPhaseError extends NightgateError {
     readonly phase: SubmitPhase;
     readonly identifier: string;
     readonly timeline: readonly SubmitTimelineEntry[];
     readonly elapsedMs: number;
     constructor(phase: SubmitPhase, message: string, info: { identifier: string; timeline: readonly SubmitTimelineEntry[]; elapsedMs: number; cause?: unknown }) {
-        super(message, info.cause !== undefined ? { cause: info.cause } : undefined);
-        this.name = 'SubmitPhaseError';
+        super('SUBMIT_PHASE_FAILED', message, { cause: info.cause, info: { phase, identifier: info.identifier, elapsedMs: info.elapsedMs } });
         this.phase = phase;
         this.identifier = info.identifier;
         this.timeline = info.timeline;

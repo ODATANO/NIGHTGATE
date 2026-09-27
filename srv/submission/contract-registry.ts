@@ -11,6 +11,7 @@ import { pathToFileURL } from 'url';
 import { computeArtifactGenerationDigest, artifactGenerationMatch } from './artifact-digest';
 import { ensureProverKeys, missingProverKeys, ZK_ASSET_URL_ENV } from './prover-keys';
 import { configMs } from '../utils/config';
+import { NightgateError } from '../utils/errors';
 
 // This file lives at <root>/srv/submission/.
 const PACKAGE_ROOT = path.resolve(__dirname, '..', '..');
@@ -330,13 +331,12 @@ export async function importArtifactGeneration(artifactPath: string, generation:
     return import(artifactImportSpec(artifactPath, generation));
 }
 
-export class ContractNotRegisteredError extends Error {
+export class ContractNotRegisteredError extends NightgateError {
     constructor(public readonly contractName: string, public readonly available: string[]) {
-        super(
+        super('CONTRACT_NOT_REGISTERED',
             available.length === 0
                 ? `Contract '${contractName}' is not registered. No contracts are registered yet (register via cds.requires.nightgate.contracts or call registerContract()).`
                 : `Contract '${contractName}' is not registered. Available: ${available.join(', ')}`
         );
-        this.name = 'ContractNotRegisteredError';
     }
 }

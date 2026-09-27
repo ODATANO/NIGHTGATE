@@ -1,4 +1,5 @@
 import crypto from 'node:crypto';
+import { NightgateError } from './errors';
 import cds from '@sap/cds';
 import type { NightgatePluginConfig } from './nightgate-config';
 import { configString, configInt, configFlag } from './config';
@@ -23,10 +24,9 @@ export interface RuntimeTopology {
     warnings: string[];
 }
 
-export class UnsupportedRuntimeTopologyError extends Error {
+export class UnsupportedRuntimeTopologyError extends NightgateError {
     constructor(public readonly topology: RuntimeTopology) {
-        super(`Unsupported Nightgate runtime topology: ${topology.errors.join(' ')}`);
-        this.name = 'UnsupportedRuntimeTopologyError';
+        super('RUNTIME_TOPOLOGY_UNSUPPORTED', `Unsupported Nightgate runtime topology: ${topology.errors.join(' ')}`);
     }
 }
 

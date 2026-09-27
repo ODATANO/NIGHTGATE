@@ -16,32 +16,31 @@ import { deriveAttesterId } from '../utils/wallet-info';
 import { isSessionExpired } from '../utils/session-expiry';
 import { getOrBuildWalletFacade, type WalletFacadeBuildArgs } from './wallet-facade-builder';
 import type { WalletMaterial, PrivateStateBackend } from '../midnight/providers';
+import type { DbRunner } from '../utils/db-types';
+import { NightgateError } from '../utils/errors';
 
 // ---- Errors ---------------------------------------------------------------
 
-export class SessionNotFoundError extends Error {
+export class SessionNotFoundError extends NightgateError {
     constructor(sessionId: string) {
-        super(`Session '${sessionId}' not found, expired, or inactive`);
-        this.name = 'SessionNotFoundError';
+        super('SESSION_NOT_FOUND', `Session '${sessionId}' not found, expired, or inactive`);
     }
 }
 
 /** Thrown by the adapter's signing methods (not by the factory) for a viewing-key-only session. */
-export class WalletSigningNotAvailable extends Error {
+export class WalletSigningNotAvailable extends NightgateError {
     constructor(method: string) {
-        super(
+        super('WALLET_SIGNING_NOT_AVAILABLE',
             `Wallet signing surface not available for ${method}: session carries a viewing key only. ` +
             `Signing requires the encryptedSeedKey field on WalletSessions to be populated.`
         );
-        this.name = 'WalletSigningNotAvailable';
     }
 }
 
 // Not thrown by the factory; exported for the handlers' 501 mapping.
-export class WalletMaterialUnavailable extends Error {
+export class WalletMaterialUnavailable extends NightgateError {
     constructor(reason: string) {
-        super(`Wallet material unavailable: ${reason}.`);
-        this.name = 'WalletMaterialUnavailable';
+        super('WALLET_MATERIAL_UNAVAILABLE', `Wallet material unavailable: ${reason}.`);
     }
 }
 
@@ -53,7 +52,7 @@ export interface BuildWalletMaterialOptions {
     expectedUserId?: string;
     privateStateBackend?: PrivateStateBackend;
     /** Test seam; defaults to cds.connect.to('db'). */
-    db?: any;
+    db?: DbRunner;
     /** Test seam; defaults to the process-scoped key from srv/utils/crypto.ts. */
     encryptionKey?: Buffer;
     /** With a seed session: makes the worker facade buildable. Without it only public keys are real. */
@@ -247,7 +246,7 @@ const attesterIdCache = new Map<string, string>();
 
 export interface AttesterIdForSessionOptions {
     sessionId: string;
-    db?: any;
+    db?: DbRunner;
     expectedUserId?: string;
     encryptionKey?: Buffer | KeyRing;
 }

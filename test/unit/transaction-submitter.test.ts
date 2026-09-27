@@ -845,3 +845,19 @@ describe('bound channel submit-intent bookkeeping', () => {
         expect(db.tables['midnight.PendingSubmissions'][0]).toMatchObject({ txHash: '0xplain', status: 'included' });
     });
 });
+
+describe('classifySubmissionError: job codes from coded errors', () => {
+    it('a revoked grant and an unusable sponsor policy fail the job under their documented code', async () => {
+        const { NightgateError } = await import('../../srv/utils/errors.js');
+        const { SponsorPolicyUnavailableError, SponsorPolicyEmptyError } = await import('../../srv/submission/sponsor-policy.js');
+        const { CoercionError } = await import('../../srv/submission/arg-coercion.js');
+        expect(classifySubmissionError(new NightgateError('AGENT_GRANT_REVOKED', 'revoked'), 'preprod'))
+            .toMatchObject({ code: 'AGENT_GRANT_REVOKED', retryable: false });
+        expect(classifySubmissionError(new SponsorPolicyUnavailableError('file unreadable'), 'preprod'))
+            .toMatchObject({ code: 'SPONSOR_POLICY_UNAVAILABLE', retryable: true });
+        expect(classifySubmissionError(new SponsorPolicyEmptyError('nothing allowed'), 'preprod'))
+            .toMatchObject({ code: 'SPONSOR_POLICY_EMPTY', retryable: false });
+        // Every other error keeps its name as job code.
+        expect(classifySubmissionError(new CoercionError(0, 'bad hex'), 'preprod').code).toBe('CoercionError');
+    });
+});

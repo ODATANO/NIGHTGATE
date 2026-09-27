@@ -3,6 +3,7 @@
  * main thread must never import the worker module (it loads the ESM SDK).
  * SPDX-License-Identifier: Apache-2.0
  */
+import type { NightgateErrorPayload } from '../utils/errors';
 
 /**
  * Methods that run under the worker's per-session submit lock (an evict waits
@@ -75,7 +76,10 @@ export interface RpcErrorPayload {
     code?: SubmitFailureCode;
     ledgerCode?: string;
     retryable?: boolean;
-    calls?: BatchCallStageInfo[];    blockHeight?: number;
+    calls?: BatchCallStageInfo[];
+    blockHeight?: number;
+    /** Our own coded error in the chain: code, status, retryable and info survive the thread boundary. */
+    nightgate?: NightgateErrorPayload;
 }
 
 /** Client-side error rebuilt from a classified failure payload. */

@@ -21,6 +21,7 @@ vi.mock('../../srv/crawler/utxo-identity', () => ({
 
 import { BlockProcessor } from '../../srv/crawler/BlockProcessor';
 import { recomputeNightBalance } from '../../srv/crawler/rollback';
+import { reconcileNightBalances } from '../../srv/crawler/night-balance-reconcile';
 
 cds.test(__dirname + '/../..');
 
@@ -423,5 +424,44 @@ describe('NightBalances', () => {
             .sort((a, b) => a.address.localeCompare(b.address));
 
         expect(comparable(rebuilt)).toEqual(comparable(incremental));
+    });
+
+    it('reconcile reports only rows that differ from the indexed UTXOs, and pages the address space', async () => {
+        const INTENT_1 = '01'.repeat(32);
+        const INTENT_2 = '02'.repeat(32);
+        await processBlock({
+            hash: '0xr1',
+            height: 70,
+            events: new Map([[0, events({ created: [utxoEvent(ADDR_A, INTENT_1, 0, 1_000n)] })]])
+        });
+        await processBlock({
+            hash: '0xr2',
+            height: 71,
+            parentHash: '0xr1',
+            events: new Map([[0, events({
+                spent: [utxoEvent(ADDR_A, INTENT_1, 0, 1_000n)],
+                created: [utxoEvent(ADDR_B, INTENT_2, 0, 400n), utxoEvent(ADDR_A, INTENT_2, 1, 600n)]
+            })]])
+        });
+
+        expect(await reconcileNightBalances(db)).toEqual({ checked: 2, next: null, drifted: [] });
+
+        await db.run(cds.ql.UPDATE.entity(NIGHT_BALANCES).set({ balance: '5' }).where({ address: OWNER_A }));
+        await db.run(cds.ql.DELETE.from(NIGHT_BALANCES).where({ address: OWNER_B }));
+        const report = await reconcileNightBalances(db);
+        expect(report.drifted).toEqual([
+            { address: OWNER_A, field: 'balance', stored: '5', computed: '600' },
+            { address: OWNER_B, field: 'row', stored: null, computed: '400' }
+        ]);
+        // Nothing was written back.
+        expect(String((await db.run(cds.ql.SELECT.one.from(NIGHT_BALANCES).where({ address: OWNER_A }))).balance)).toBe('5');
+
+        const first = await reconcileNightBalances(db, { limit: 1 });
+        expect(first.checked).toBe(1);
+        expect(first.next).not.toBeNull();
+        const second = await reconcileNightBalances(db, { limit: 1, after: first.next });
+        expect([...first.drifted, ...second.drifted].map(d => d.address).sort()).toEqual([OWNER_A, OWNER_B].sort());
+
+        expect((await reconcileNightBalances(db, { address: OWNER_B })).drifted).toHaveLength(1);
     });
 });

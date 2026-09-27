@@ -18,11 +18,8 @@ import {
     type ContractStatePolicy
 } from './contract-state';
 import { lockReorgGeneration } from '../submission/reorg-generation';
-import {
-    Blocks, Transactions, TransactionResults, TransactionSegments, TransactionFees,
-    ContractActions, ContractBalances, UnshieldedUtxos, ZswapLedgerEvents,
-    DustLedgerEvents, SyncState
-} from '#cds-models/midnight';
+import type { DbRunner, Row } from '../utils/db-types';
+import { Blocks, Transactions, TransactionResults, TransactionSegments, TransactionFees, ContractActions, ContractBalances, UnshieldedUtxos, ZswapLedgerEvents, DustLedgerEvents, SyncState, type Block, type Transaction, type ContractAction } from '#cds-models/midnight';
 
 /** Where a pass started: both have to still hold when it writes its cursor. */
 interface PassPosition {
@@ -161,7 +158,7 @@ export class IndexerSupplement {
         }
         if (!Number.isFinite(ceiling) || from > ceiling) return EMPTY_RUN;
 
-        const blocks: any[] = await this.db.run(
+        const blocks: Row<Block, 'ID' | 'height'>[] = await this.db.run(
             SELECT.from(Blocks).columns('ID', 'height')
                 .where({ height: { '>=': from } }).and({ height: { '<=': ceiling } })
                 .orderBy('height asc').limit(this.config.batchSize)
@@ -224,7 +221,7 @@ export class IndexerSupplement {
 
     /** The parameters in force below `height`, for the first block of a pass. */
     private async readParametersBelow(height: number): Promise<string> {
-        const row: any = await this.db.run(
+        const row: Block | undefined = await this.db.run(
             SELECT.one.from(Blocks).columns('ledgerParameters')
                 .where({ height: { '<': height }, ledgerParameters: { '!=': null } })
                 .orderBy('height desc')
@@ -238,7 +235,7 @@ export class IndexerSupplement {
         if (transactions.length === 0) return result;
 
         const hashes = transactions.map(t => t.ledgerTxHash);
-        const rows: any[] = await this.db.run(
+        const rows: Transaction[] = await this.db.run(
             SELECT.from(Transactions).columns('ID', 'ledgerTxHash').where({ ledgerTxHash: { in: hashes } })
         ) || [];
         const byHash = new Map<string, string>(rows.map((r: any) => [r.ledgerTxHash, r.ID]));
@@ -247,7 +244,7 @@ export class IndexerSupplement {
             const transactionId = byHash.get(tx.ledgerTxHash);
             if (!transactionId) continue;
             result.transactions++;
-            await this.db.tx(async (dbTx: any) => {
+            await this.db.tx(async (dbTx) => {
                 result.fees += await this.applyFee(dbTx, transactionId, tx);
                 result.segments += await this.applySegments(dbTx, transactionId, tx);
                 result.balances += await this.applyContractState(dbTx, transactionId, height, tx);
@@ -260,7 +257,7 @@ export class IndexerSupplement {
     }
 
     /** The crawler writes a zero fee from the envelope; this is the real one. */
-    private async applyFee(dbTx: any, transactionId: string, tx: SupplementTransaction): Promise<number> {
+    private async applyFee(dbTx: DbRunner, transactionId: string, tx: SupplementTransaction): Promise<number> {
         if (tx.fee == null) return 0;
         const changed = await dbTx.run(
             UPDATE.entity(TransactionFees).set({ paidFees: tx.fee as any }).where({ transaction_ID: transactionId })
@@ -268,7 +265,7 @@ export class IndexerSupplement {
         return Number(changed ?? 0) > 0 ? 1 : 0;
     }
 
-    private async applySegments(dbTx: any, transactionId: string, tx: SupplementTransaction): Promise<number> {
+    private async applySegments(dbTx: DbRunner, transactionId: string, tx: SupplementTransaction): Promise<number> {
         if (tx.segments.length === 0) return 0;
         const resultRow: any = await dbTx.run(
             SELECT.one.from(TransactionResults).columns('ID').where({ transaction_ID: transactionId })
@@ -291,9 +288,9 @@ export class IndexerSupplement {
      * balances. Actions the node does not have, a call in a failed segment
      * above all, are the indexer's declared set and are not invented here.
      */
-    private async applyContractState(dbTx: any, transactionId: string, height: number, tx: SupplementTransaction): Promise<number> {
+    private async applyContractState(dbTx: DbRunner, transactionId: string, height: number, tx: SupplementTransaction): Promise<number> {
         if (tx.contractActions.length === 0) return 0;
-        const actions: any[] = await dbTx.run(
+        const actions: ContractAction[] = await dbTx.run(
             SELECT.from(ContractActions).columns('ID', 'actionIndex', 'address', 'actionType')
                 .where({ transaction_ID: transactionId }).orderBy('actionIndex asc')
         ) || [];
@@ -374,7 +371,7 @@ export class IndexerSupplement {
 
     /** Replaces a transaction's zswap event rows wholesale, so a re-run is idempotent. */
     private async replaceZswapEvents(
-        dbTx: any,
+        dbTx: DbRunner,
         transactionId: string,
         events: SupplementLedgerEvent[]
     ): Promise<number> {
@@ -392,7 +389,7 @@ export class IndexerSupplement {
 
     /** Same, for the DUST stream, which carries its kind and the backing nonce. */
     private async replaceDustEvents(
-        dbTx: any,
+        dbTx: DbRunner,
         transactionId: string,
         events: SupplementDustEvent[]
     ): Promise<number> {
@@ -411,7 +408,7 @@ export class IndexerSupplement {
     }
 
     /** Registration binds the address, so the flag can turn on after the UTXO exists. */
-    private async applyDustFlags(dbTx: any, tx: SupplementTransaction): Promise<number> {
+    private async applyDustFlags(dbTx: DbRunner, tx: SupplementTransaction): Promise<number> {
         let updated = 0;
         for (const output of tx.dustRegisteredOutputs) {
             const changed = await dbTx.run(
@@ -438,7 +435,7 @@ export class IndexerSupplement {
      */
     private async setCursor(expected: PassPosition, height: number): Promise<boolean> {
         let advanced = false;
-        await this.db.tx(async (tx: any) => {
+        await this.db.tx(async (tx) => {
             const generation = await lockReorgGeneration(tx);
             const current: any = await tx.run(
                 SELECT.one.from(SyncState).columns('lastSupplementedHeight').where({ ID: 'SINGLETON' })

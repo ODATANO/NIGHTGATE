@@ -8,7 +8,8 @@ import { Worker, MessageChannel } from 'node:worker_threads';
 import path from 'node:path';
 import type { CapDbPrivateStateProvider } from './CapDbPrivateStateProvider';
 import type { MerkleProofBundle } from '../submission/contract-witnesses';
-import { formatErr } from '../utils/format-error';
+import { errorName, formatErr } from '../utils/format-error';
+import { nightgateErrorFromPayload } from '../utils/errors';
 import { isSubmittingMethod, WORKER_ROTATING, WORKER_ROTATED, WorkerSubmitError, isSubmitFailureCode } from './wallet-worker-protocol';
 import { getEncryptionKey } from '../utils/crypto';
 import { configMs, configNumberFrom, resolvedConfigSnapshot } from '../utils/config';
@@ -305,7 +306,7 @@ export async function stopWalletWorker(timeoutMs = 60_000): Promise<void> {
     if (client?.worker !== w) return; // replaced or already gone meanwhile
     client = null;
     stoppingWorker = w;
-    try { await w.terminate(); } catch { }
+    try { await w.terminate(); } catch { /* already exited */ }
     // Also here: a forced terminate may not run the exit handler first.
     syncProgressCache.clear();
     await notifyWorkerGone('stop');
@@ -350,7 +351,10 @@ export function setStateSaveSink(sink: StateSaveSink | undefined): void {
  * Persists the external-effect boundary for an identifier the worker is about to
  * broadcast; the worker waits for the ack and does not broadcast if this throws.
  */
-export interface SubmitIntentInfo { txHash: string; contractAddress?: string; circuits?: string[]; note?: string; sponsorAccountId?: string; deployed?: string[]; ttl?: string }
+export interface SubmitIntentInfo {
+    txHash: string; contractAddress?: string; circuits?: string[]; note?: string; sponsorAccountId?: string; deployed?: string[]; ttl?: string;
+    segments?: Array<{ segment: number; calls: string[] }>;
+}
 export type SubmitIntentHook = (txHash: string, intent: SubmitIntentInfo) => Promise<void>;
 
 async function rpc<T>(method: string, args: unknown, timeoutMs: number = RPC_TIMEOUT_MS, onSubmitIntent?: SubmitIntentHook): Promise<T> {
@@ -434,10 +438,11 @@ async function rpcOnce<T>(method: string, args: unknown, timeoutMs: number, onSu
         // Guarded, so exit sweep and timeout cannot double-settle.
         pending = { reject: (e: Error) => finish(() => reject(e)) };
         pendingRpcs.add(pending);
-        timer = setTimeout(
-            () => pending.reject(new Error(`wallet-worker rpc '${method}' timed out after ${timeoutMs}ms`)),
-            timeoutMs
-        );
+        timer = setTimeout(() => {
+            // The worker stops at its next wait point; nothing past a submit intent is cancelled.
+            try { port2.postMessage({ kind: 'cancel' }); } catch { /* port already closed */ }
+            pending.reject(new Error(`wallet-worker rpc '${method}' timed out after ${timeoutMs}ms`));
+        }, timeoutMs);
 
         const postAck = (ack: Record<string, unknown>): void => {
             try { port2.postMessage({ kind: 'submit-intent-ack', ...ack }); } catch { /* port already closed */ }
@@ -475,8 +480,17 @@ async function rpcOnce<T>(method: string, args: unknown, timeoutMs: number, onSu
                 }
                 const payload = msg?.error;
                 if (payload && typeof payload === 'object' && typeof payload.message === 'string') {
+                    const coded = payload.nightgate
+                        ? nightgateErrorFromPayload({ ...payload.nightgate, name: payload.name, message: payload.message })
+                        : undefined;
                     if (isSubmitFailureCode(payload.code)) {
-                        reject(new WorkerSubmitError(payload));
+                        const submitErr = new WorkerSubmitError(payload);
+                        if (coded) submitErr.cause = coded;
+                        reject(submitErr);
+                        return;
+                    }
+                    if (coded) {
+                        reject(coded);
                         return;
                     }
                     const err = new Error(payload.message);
@@ -539,11 +553,11 @@ function dispatchPrivateStateRpc(msg: any): void {
         try {
             const result = await dispatchPrivateStateMethod(provider, method, args as unknown[]);
             port.postMessage({ ok: true, result });
-        } catch (err: any) {
+        } catch (err: unknown) {
             port.postMessage({
                 ok: false,
                 error: {
-                    name: err?.name ?? 'Error',
+                    name: errorName(err),
                     message: formatErr(err)
                 }
             });

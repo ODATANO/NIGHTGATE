@@ -16,6 +16,7 @@ import {
     readBlockEvents, txTypeFromEvents, projectTransfer, NIGHT_RAW_TOKEN_TYPE, type ExtrinsicEvents
 } from './block-events';
 import { encodeUnshieldedOwner, computeInitialNonce } from './utxo-identity';
+import type { DbRunner } from '../utils/db-types';
 import {
     Blocks, Transactions, TransactionResults, TransactionFees, ContractActions,
     UnshieldedUtxos, NightBalances, SyncState
@@ -39,6 +40,9 @@ export interface PalletMapping {
     isShielded?: boolean;
     isSystem?: boolean;
 }
+
+/** Intent hashes per spend lookup: well under the bind-parameter limits of SQLite and PostgreSQL. */
+const SPEND_LOOKUP_CHUNK = 500;
 
 /** Valid TxType values matching the schema enum in db/schema.cds */
 const VALID_TX_TYPES = new Set([
@@ -78,8 +82,6 @@ const DEFAULT_PALLET_MAP: Record<number, PalletMapping> = {
     50: { name: 'SystemParameters', txType: 'system', isSystem: true },
     51: { name: 'Throttle', txType: 'system', isSystem: true }
 };
-
-const NIGHT_TOKEN_TYPE_HEX = '0x4e49474854';
 
 function hexToBinaryValue(hex: string): string {
     return Buffer.from(hex.startsWith('0x') ? hex.slice(2) : hex, 'hex').toString('base64');
@@ -474,7 +476,7 @@ export class BlockProcessor {
         // await one.
         const projections = await this.projectEvents(extrinsicEvents, timestamp, `block ${blockHash}`);
 
-        const written = await this.db.tx(async (tx: any) => {
+        const written = await this.db.tx(async (tx) => {
             const blockId = cds.utils.uuid();
             const parentBlock = await tx.run(
                 SELECT.one.from(Blocks).columns('ID').where({ hash: header.parentHash })
@@ -746,32 +748,44 @@ export class BlockProcessor {
 
     /** Marks spent UTxOs and folds their value into the owners' balance deltas. */
     private async applySpends(
-        tx: any,
+        tx: DbRunner,
         spends: Array<{ intentHash: string; outputIndex: number; txId: string }>,
         deltaFor: (address: string) => BalanceDelta,
         height: number
     ): Promise<void> {
+        if (spends.length === 0) return;
+        // One read for the block's spends (chunked by intent hash); outputs created in
+        // this block are already inserted in the same transaction.
+        const byKey = new Map<string, { ID: string; owner: string; value: unknown; tokenType: string; spentAtTransaction_ID: string | null }>();
+        const hashes = [...new Set(spends.map(s => s.intentHash))];
+        for (let i = 0; i < hashes.length; i += SPEND_LOOKUP_CHUNK) {
+            const rows = await tx.run(
+                SELECT.from(UnshieldedUtxos)
+                    .columns('ID', 'owner', 'value', 'tokenType', 'intentHash', 'outputIndex', 'spentAtTransaction_ID')
+                    .where({ intentHash: { in: hashes.slice(i, i + SPEND_LOOKUP_CHUNK) } })
+            ) || [];
+            for (const r of rows) byKey.set(`${r.intentHash}#${Number(r.outputIndex)}`, r);
+        }
+        const spentBy = new Map<string, string[]>();
         for (const spend of spends) {
-            const row = await tx.run(
-                SELECT.one.from(UnshieldedUtxos)
-                    .columns('ID', 'owner', 'value', 'tokenType', 'spentAtTransaction_ID')
-                    .where({ intentHash: spend.intentHash, outputIndex: spend.outputIndex })
-            );
+            const row = byKey.get(`${spend.intentHash}#${spend.outputIndex}`);
             if (!row) {
                 // Normal below the first indexed height: the output predates the index.
                 log.debug(`spent UTXO ${spend.intentHash}#${spend.outputIndex} at height ${height} was never indexed`);
                 continue;
             }
             if (row.spentAtTransaction_ID) continue;
-            await tx.run(
-                UPDATE.entity(UnshieldedUtxos)
-                    .set({ spentAtTransaction_ID: spend.txId })
-                    .where({ ID: row.ID })
-            );
+            row.spentAtTransaction_ID = spend.txId;
+            const ids = spentBy.get(spend.txId) ?? [];
+            ids.push(row.ID);
+            spentBy.set(spend.txId, ids);
             if (row.tokenType !== NIGHT_RAW_TOKEN_TYPE) continue;
             const delta = deltaFor(row.owner);
             delta.balance -= this.toBigInt(row.value);
             delta.utxoCount -= 1;
+        }
+        for (const [txId, ids] of spentBy) {
+            await tx.run(UPDATE.entity(UnshieldedUtxos).set({ spentAtTransaction_ID: txId }).where({ ID: { in: ids } }));
         }
     }
 
@@ -780,7 +794,7 @@ export class BlockProcessor {
      * the mirror of `recomputeNightBalance` in rollback.ts, which rebuilds the
      * same figures from scratch after a reorg.
      */
-    private async applyBalanceDelta(tx: any, address: string, delta: BalanceDelta, height: number): Promise<void> {
+    private async applyBalanceDelta(tx: DbRunner, address: string, delta: BalanceDelta, height: number): Promise<void> {
         const nowIso = new Date().toISOString();
         const existing = await tx.run(
             SELECT.one.from(NightBalances)

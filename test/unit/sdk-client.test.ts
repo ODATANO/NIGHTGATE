@@ -283,3 +283,25 @@ describe('connect: stale keep-alive socket', () => {
         expect(refused).toHaveBeenCalledTimes(1);
     });
 });
+
+describe('isRetryable', () => {
+    test('the client list is exactly the retryable codes of the server registry', async () => {
+        const { RETRYABLE_ERROR_CODES } = await importClient();
+        const { ERROR_CODES } = await import('../../srv/utils/errors.js');
+        const serverRetryable = Object.entries(ERROR_CODES as Record<string, { retryable?: boolean }>).filter(([, s]) => s.retryable).map(([c]) => c).sort();
+        expect([...RETRYABLE_ERROR_CODES].sort()).toEqual(serverRetryable);
+    });
+
+    test('decides on the code first, then the status, then network errors', async () => {
+        const { isRetryable, NightgateApiError, NightgateJobError } = await importClient();
+        expect(isRetryable(new NightgateApiError(503, 'WALLET_SYNCING', 'x'))).toBe(true);
+        // A 503 whose code says the database needs an operator is not worth a retry.
+        expect(isRetryable(new NightgateApiError(503, 'SCHEMA_NOT_DEPLOYED', 'x'))).toBe(false);
+        expect(isRetryable(new NightgateApiError(400, 'INVALID_ARGUMENT', 'x'))).toBe(false);
+        // A proxy's or CAP's numeric code falls back to the status.
+        expect(isRetryable(new NightgateApiError(504, '504', 'x'))).toBe(true);
+        expect(isRetryable(new NightgateApiError(404, '404', 'x'))).toBe(false);
+        expect(isRetryable(new NightgateJobError({ jobId: 'j', status: 'failed' }))).toBe(false);
+        expect(isRetryable(new TypeError('fetch failed'))).toBe(true);
+    });
+});

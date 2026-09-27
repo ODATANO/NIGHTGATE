@@ -5,6 +5,7 @@ import {
     meetsDisclosure,
     DisclosureRoleValue
 } from '../../srv/middleware/disclosure-role';
+import type { NightgateRequest } from '../../srv/utils/request-types';
 
 export type AttestationTier = 'Public' | 'Disclosed' | 'Authority';
 
@@ -33,8 +34,8 @@ export function registerAttestationServiceHandlers(
 
 function makeTierGate(tier: AttestationTier, db: cds.DatabaseService) {
     const required = REQUIRED[tier];
-    return async (req: cds.Request) => {
-        let actual = (req as any).disclosureRole as DisclosureRoleValue | undefined;
+    return async (req: NightgateRequest) => {
+        let actual = req.disclosureRole;
         if (actual === undefined) {
             actual = await attachDisclosureRole(req, db);
         }

@@ -5,14 +5,15 @@
  */
 
 import { configNumber, configMs, configEnum } from '../../utils/config';
-import { SUBMIT_METHODS } from '../wallet-worker-protocol';
+import { markIntentAnnounced } from './cancellation';
+import { callSegments } from '../batch-segment-order';
 import { classifySubmitFailure, isPreMempoolFailure } from '../submit-error-classification';
-import path from 'node:path';
 import { classificationHaystack, formatErr, formatErrWithCauses, safeDeepInspect } from '../../utils/format-error';
+import { NightgateError } from '../../utils/errors';
 import { type MessagePort } from 'node:worker_threads';
 import { FacadeEntry, loadSdk, loadNodeClientSdk, log, loadLedger } from './context';
 import { createPhasedSubmitService, createSdkNodeAdapter, submitPhaseOf, type PhasedSubmitService } from './phased-submit';
-import { BALANCE_SYNC_TIMEOUT_MS, applySaveAck, pushStateSaveAcked, restoreSaveAckTimeoutMs, waitForGenuineSync } from './facades';
+import { BALANCE_SYNC_TIMEOUT_MS, pushStateSaveAcked, restoreSaveAckTimeoutMs, waitForGenuineSync } from './facades';
 
 /**
  * Dust sections per intent. A DustActions section with no spends and no registrations is the
@@ -219,7 +220,8 @@ export async function submitWithDustGuard(entry: FacadeEntry, tx: any, site: str
             if (typeof tx?.identifiers !== 'function') throw new Error(`${site}: transaction exposes no identifiers(); refusing to broadcast unannounced`);
             await announceSubmitIntent(intent.replyPort, {
                 txHash: String(tx.identifiers().at(-1)),
-                contractAddress: intent.contractAddress, circuits: intent.circuits, note: intent.note, ttl: intent.ttl
+                contractAddress: intent.contractAddress, circuits: intent.circuits, note: intent.note, ttl: intent.ttl,
+                segments: callSegments(tx)
             });
         } catch (e) {
             // Not broadcast: free booked spends and dust (the SDK reverts only on a failed submit).
@@ -272,8 +274,8 @@ export const __submitClientPoolForTests = {
     setServiceFactory: (factory: SubmitServiceFactory | null) => { submitServiceFactory = factory ?? defaultSubmitServiceFactory; }
 };
 
-export class SubmitWatchTimeoutError extends Error {
-    constructor(ms: number) { super(`submit watch timed out after ${ms}ms without a Finalized status`); this.name = 'SubmitWatchTimeoutError'; }
+export class SubmitWatchTimeoutError extends NightgateError {
+    constructor(ms: number) { super('SUBMIT_WATCH_TIMEOUT', `submit watch timed out after ${ms}ms without a Finalized status`); }
 }
 
 export async function withDedicatedSubmitClient<T>(relayURL: URL, fn: (svc: any) => Promise<T>, opts: { abandonAfterMs?: number; label?: string } = {}): Promise<T> {
@@ -388,10 +390,10 @@ export async function indexerBlockOfIdentifier(indexerHttpUrl: string, identifie
  * In a block but the call did not apply (fee spent). Named like the SDK's error so the main
  * thread classifies it the same way; the block height is the rollback coordinate.
  */
-export class TxNotAppliedError extends Error {
+export class TxNotAppliedError extends NightgateError {
     readonly blockHeight: number | null;
     constructor(identifier: string, height: string, status: string, failedSegments: number[]) {
-        super(`TxFailedError: transaction ${identifier.slice(0, 16)} is in block ${height} but its call did NOT apply (ledger result ${status}, failed segment${failedSegments.length === 1 ? '' : 's'} ${failedSegments.join(',') || '?'}); the fee was spent, the call must be rebuilt against the current contract state`);
+        super('TX_FAILED', `TxFailedError: transaction ${identifier.slice(0, 16)} is in block ${height} but its call did NOT apply (ledger result ${status}, failed segment${failedSegments.length === 1 ? '' : 's'} ${failedSegments.join(',') || '?'}); the fee was spent, the call must be rebuilt against the current contract state`);
         this.name = 'TxFailedError';
         const h = Number(height);
         this.blockHeight = Number.isInteger(h) && h >= 0 ? h : null;
@@ -446,21 +448,24 @@ export interface SubmitIntent {
     deployed?: string[];
     /** End of the validity window (ISO): once the indexer tip is past it, the tx is provably not on chain. */
     ttl?: string;
+    /** Batches: call names per segment, so the confirmed outcome can say which calls applied. */
+    segments?: Array<{ segment: number; calls: string[] }>;
 }
 /** An ack slower than this is logged: the main thread's boundary write was slow. */
 const INTENT_ACK_WARN_MS = 10_000;
 /** Resolves on the main thread's ack; without one the job fails before broadcasting. No-op without a port. */
 export async function announceSubmitIntent(port: MessagePort | undefined, intent: SubmitIntent): Promise<void> {
     if (!port) return;
+    markIntentAnnounced();
     const { txHash } = intent;
     const ackTimeoutMs = configMs('NIGHTGATE_SUBMIT_INTENT_ACK_TIMEOUT_MS');
     const startedAt = Date.now();
     await new Promise<void>((resolve, reject) => {
-        const timer = setTimeout(() => { port.off('message', onMsg); reject(new Error(`submit-intent was not acknowledged by the main thread within ${ackTimeoutMs}ms; not broadcasting`)); }, ackTimeoutMs);
+        const timer = setTimeout(() => { port.off('message', onMsg); reject(new NightgateError('SUBMIT_INTENT_TIMEOUT', `submit-intent was not acknowledged by the main thread within ${ackTimeoutMs}ms; not broadcasting`)); }, ackTimeoutMs);
         const onMsg = (m: any) => {
             if (m?.kind === 'submit-intent-ack' && m.txHash === txHash) {
                 clearTimeout(timer); port.off('message', onMsg);
-                if (m.ok === false) { reject(new Error(`submit-intent rejected by the main thread: ${m.error ?? 'unknown'}`)); return; }
+                if (m.ok === false) { reject(new NightgateError('SUBMIT_INTENT_REJECTED', `submit-intent rejected by the main thread: ${m.error ?? 'unknown'}`)); return; }
                 const ms = Date.now() - startedAt;
                 if (ms > INTENT_ACK_WARN_MS) log('warn', `submit-intent ${txHash.slice(0, 16)}: acknowledged after ${ms}ms`);
                 resolve();

@@ -153,7 +153,7 @@ describe('scripts/migrate-values.mjs (nightgate-db-migrate row conversion)', () 
         // a Decimal SQLite stored as REAL beyond 2^53 was rounded at write time: refuse, never copy a wrong number
         expect(convertValue(el('cds.Decimal'), 2 ** 53 - 1, 'c')).toBe(2 ** 53 - 1);
         expect(() => convertValue(el('cds.Decimal'), 2 ** 53, 'c')).toThrow(/REAL beyond 2\^53/);
-        expect(() => convertValue(el('cds.Decimal'), -5975896448806980778, 'c')).toThrow(/REAL beyond 2\^53/);
+        expect(() => convertValue(el('cds.Decimal'), Number('-5975896448806980778'), 'c')).toThrow(/REAL beyond 2\^53/);
         expect(() => convertValue(el('cds.Decimal'), Infinity, 'c')).toThrow(/REAL beyond 2\^53/);
     });
 

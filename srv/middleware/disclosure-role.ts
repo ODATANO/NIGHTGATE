@@ -5,6 +5,7 @@
 import cds from '@sap/cds';
 import { DisclosureRoles, DisclosureGrants } from '#cds-models/midnight';
 import { resolveGranteeId } from '../submission/grantee-identity';
+import type { NightgateRequest } from '../utils/request-types';
 
 export type DisclosureRoleValue = 'public_only' | 'legitimate_interest' | 'authority';
 
@@ -50,21 +51,20 @@ export interface AttachDisclosureRoleOptions {
  * `contractAddress` is given, else from the operator's `DisclosureRoles` table.
  */
 export async function attachDisclosureRole(
-    req: cds.Request,
+    req: NightgateRequest,
     db: cds.DatabaseService,
     options: AttachDisclosureRoleOptions = {}
 ): Promise<DisclosureRoleValue> {
-    const userId = (req as any).user?.id;
-    const target = req as unknown as { disclosureRole?: DisclosureRoleValue };
+    const userId = req.user?.id;
 
     if (!userId) {
-        target.disclosureRole = DEFAULT_DISCLOSURE_ROLE;
+        req.disclosureRole = DEFAULT_DISCLOSURE_ROLE;
         return DEFAULT_DISCLOSURE_ROLE;
     }
 
     if (options.contractAddress) {
         const role = await resolveOnChainRole(req, db, options.contractAddress, options.payloadHash, options.attesterId);
-        target.disclosureRole = role;
+        req.disclosureRole = role;
         return role;
     }
 
@@ -75,7 +75,7 @@ export async function attachDisclosureRole(
     const now = new Date().toISOString();
     const valid = rows.filter(r => isCurrentlyValidGrant(r, now, options.scope));
     if (valid.length === 0) {
-        target.disclosureRole = DEFAULT_DISCLOSURE_ROLE;
+        req.disclosureRole = DEFAULT_DISCLOSURE_ROLE;
         return DEFAULT_DISCLOSURE_ROLE;
     }
 
@@ -83,7 +83,7 @@ export async function attachDisclosureRole(
         RANK[current.role] > RANK[best.role] ? current : best
     );
 
-    target.disclosureRole = highest.role;
+    req.disclosureRole = highest.role;
     return highest.role;
 }
 

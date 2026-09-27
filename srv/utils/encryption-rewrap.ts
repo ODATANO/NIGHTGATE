@@ -16,10 +16,9 @@ import {
 import { StorageEncryption, decryptWithPassword, extractEncryptedComponents } from './storage-encryption';
 // Static import: shares the DEK cache with sessions reading the same rows.
 import { resolveAccountDek, privateStatePasswordFromDek, syncStatePassphraseFromDek, DEK_SCHEME } from '../submission/account-keys';
+import type { DbService } from './db-types';
 
 const log = cds.log('nightgate:crypto');
-
-type Db = { run: (q: unknown) => Promise<any>; tx: (fn: (tx: any) => Promise<void>) => Promise<void> };
 
 export interface CiphertextColumn {
     entity: string;
@@ -68,7 +67,7 @@ export function keyIdFromPrefix(prefix: string): string | null {
 }
 
 /** Distinct key ids per envelope column; only prefixes leave the database (`substr` is portable). */
-export async function scanStoredKeyIds(db: Db): Promise<Array<{ column: CiphertextColumn; keyIds: string[] }>> {
+export async function scanStoredKeyIds(db: DbService): Promise<Array<{ column: CiphertextColumn; keyIds: string[] }>> {
     const out: Array<{ column: CiphertextColumn; keyIds: string[] }> = [];
     for (const column of ENVELOPE_COLUMNS) {
         const where = [`${column.column} IS NOT NULL`, column.whereSql].filter(Boolean).join(' AND ');
@@ -95,7 +94,7 @@ export interface LegacyRowCensus {
 }
 
 /** Rows still under a pre-DEK derivation; read-only, no decryption. */
-export async function countLegacyRows(db: Db): Promise<LegacyRowCensus> {
+export async function countLegacyRows(db: DbService): Promise<LegacyRowCensus> {
     const tables: LegacyRowCensus['tables'] = [];
     const accounts = new Set<string>();
     let total = 0;
@@ -120,7 +119,7 @@ export async function countLegacyRows(db: Db): Promise<LegacyRowCensus> {
  * Every stored key id must be in the ring: an unopenable seed must not look like no seed.
  * Legacy rows only warn; they need the viewing key either way.
  */
-export async function assertStoredKeyIdsKnown(db: Db, ring: KeyRing = getEncryptionKey(), opts: { reportLegacy?: boolean } = {}): Promise<void> {
+export async function assertStoredKeyIdsKnown(db: DbService, ring: KeyRing = getEncryptionKey(), opts: { reportLegacy?: boolean } = {}): Promise<void> {
     const unknown = new Map<string, string[]>();
     for (const { column, keyIds } of await scanStoredKeyIds(db)) {
         for (const id of keyIds) {
@@ -169,7 +168,7 @@ export interface RewrapReport {
  * Rewrap ring-sealed values under the active key and migrate legacy rows a session's viewing key
  * still opens. Refuses before any write when a stored key id is not in the ring.
  */
-export async function rewrapStoredCiphertexts(db: Db, opts: RewrapOptions = {}): Promise<RewrapReport> {
+export async function rewrapStoredCiphertexts(db: DbService, opts: RewrapOptions = {}): Promise<RewrapReport> {
     const ring = opts.ring ?? getEncryptionKey();
     const dryRun = opts.dryRun === true;
     const batchSize = Math.max(1, opts.batchSize ?? 200);
@@ -254,7 +253,7 @@ export async function rewrapStoredCiphertexts(db: Db, opts: RewrapOptions = {}):
 
 // ---- Legacy rows: migrate through the sessions that still hold a viewing key ----
 
-async function migrateLegacyRows(db: Db, ring: KeyRing, dryRun: boolean, report: RewrapReport, say: (m: string) => void): Promise<Set<string>> {
+async function migrateLegacyRows(db: DbService, ring: KeyRing, dryRun: boolean, report: RewrapReport, say: (m: string) => void): Promise<Set<string>> {
     const { SELECT, UPDATE } = cds.ql;
     // Lazy: the boot preflight must not load the facade builder and worker client.
     // eslint-disable-next-line @typescript-eslint/no-var-requires
@@ -376,7 +375,7 @@ async function migrateLegacyRows(db: Db, ring: KeyRing, dryRun: boolean, report:
     return migrated;
 }
 
-async function dropLegacySyncStates(db: Db, dryRun: boolean, drop: boolean, migrated: Set<string>, report: RewrapReport, say: (m: string) => void): Promise<void> {
+async function dropLegacySyncStates(db: DbService, dryRun: boolean, drop: boolean, migrated: Set<string>, report: RewrapReport, say: (m: string) => void): Promise<void> {
     if (!drop) return;
     const { SELECT, DELETE } = cds.ql;
     const rows: Array<Record<string, any>> = await db.run(SELECT.from('midnight.WalletSyncStates').columns('accountId').where({ keyScheme: null }));

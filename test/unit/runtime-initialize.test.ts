@@ -100,11 +100,12 @@ vi.mock('../../srv/submission/wallet-facade-builder', () => ({
 // exactly that path.
 const mockRecoverJobs = vi.hoisted(() => (vi.fn(async () => undefined)));
 const mockStartJobProcessor = vi.hoisted(() => (vi.fn(async () => undefined)));
+const mockStopJobProcessor = vi.hoisted(() => (vi.fn(async () => undefined)));
 vi.mock('../../srv/submission/background-jobs', () => ({
     recoverInterruptedJobs: mockRecoverJobs,
     dropPendingJobsForClosedSessions: vi.fn(async () => 0),
     startBackgroundJobProcessor: mockStartJobProcessor,
-    stopBackgroundJobProcessor: vi.fn(async () => undefined),
+    stopBackgroundJobProcessor: mockStopJobProcessor,
     registerChainOutcomeConfirmer: vi.fn()
 }));
 
@@ -125,6 +126,25 @@ const mockEnsureSyncStateSingleton = vi.hoisted(() => (vi.fn(async () => undefin
 vi.mock('../../srv/utils/sync-state', () => ({
     ensureSyncStateSingleton: mockEnsureSyncStateSingleton,
     SyncStateNetworkMismatchError: class SyncStateNetworkMismatchError extends Error {}
+}));
+
+// The lease has its own tests against a real database (instance-lease.test.ts).
+const mockAcquireLease = vi.hoisted(() => (vi.fn(async (..._args: unknown[]) => undefined)));
+const mockReleaseLease = vi.hoisted(() => (vi.fn(async () => undefined)));
+const mockFence = vi.hoisted(() => (vi.fn()));
+const leaseLost = vi.hoisted(() => ({ fire: undefined as undefined | (() => void) }));
+vi.mock('../../srv/utils/instance-lease', () => ({
+    BACKGROUND_LEASE_ROLE: 'background',
+    acquireInstanceLease: mockAcquireLease,
+    releaseInstanceLease: mockReleaseLease,
+    setActiveLease: vi.fn(),
+    clearActiveLease: vi.fn(),
+    fenceBackgroundWork: mockFence,
+    isBackgroundFenced: vi.fn(() => false),
+    startInstanceLeaseHeartbeat: vi.fn((_db: unknown, _role: unknown, _holder: unknown, _ms: unknown, onLost: () => void) => {
+        leaseLost.fire = onLost;
+        return () => undefined;
+    })
 }));
 
 import cds from '@sap/cds';
@@ -217,6 +237,8 @@ describe('runtime initialize', () => {
             await initialize();
             await shutdown();
             expect(mockClearAllEncryptionKeys).toHaveBeenCalledTimes(1);
+            expect(mockAcquireLease).toHaveBeenCalledTimes(1);
+            expect(mockReleaseLease).toHaveBeenCalledWith(expect.anything(), 'background', mockAcquireLease.mock.calls[0]?.[2]);
         } finally {
             logSpy.mockRestore();
         }
@@ -397,5 +419,33 @@ describe('runtime initialize', () => {
             mode: 'offline',
             lastError: expect.stringContaining("bound to network 'preview'")
         }));
+    });
+
+    it('a lease taken over later fences the process, stops the loops and reports offline', async () => {
+        const logSpy = vi.spyOn(cds.log('nightgate'), 'info').mockImplementation(() => {});
+        const errSpy = vi.spyOn(cds.log('nightgate'), 'error').mockImplementation(() => {});
+        try {
+            await initialize();
+            mockStopJobProcessor.mockClear();
+            mockStopCrawler.mockClear();
+            leaseLost.fire!();
+            expect(mockFence).toHaveBeenCalledTimes(1);
+            expect(mockStopJobProcessor).toHaveBeenCalledTimes(1);
+            expect(mockStopCrawler).toHaveBeenCalledTimes(1);
+            expect(getStatus()).toEqual(expect.objectContaining({ mode: 'offline', lastError: expect.stringMatching(/lease/) }));
+        } finally {
+            logSpy.mockRestore();
+            errSpy.mockRestore();
+        }
+    });
+
+    it('fails closed before recovery and job loops when another process holds the lease', async () => {
+        mockAcquireLease.mockRejectedValueOnce(new Error('another NIGHTGATE instance (host-a/1) runs the background work on this database'));
+
+        await expect(initialize()).rejects.toThrow(/another NIGHTGATE instance/);
+        expect(mockRecoverJobs).not.toHaveBeenCalled();
+        expect(mockStartJobProcessor).not.toHaveBeenCalled();
+        expect(mockStartCrawler).not.toHaveBeenCalled();
+        expect(getStatus()).toEqual(expect.objectContaining({ initialized: false, mode: 'offline' }));
     });
 });

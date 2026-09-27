@@ -6,11 +6,13 @@ import cds from '@sap/cds';
 const { SELECT } = cds.ql;
 
 import { Transactions, ContractActions, Blocks } from '#cds-models/midnight';
+import { normalizeHttpError } from './utils/http-errors';
 
 export default class NightgateAnalyticsService extends cds.ApplicationService {
     private db!: cds.DatabaseService;
 
     async init(): Promise<void> {
+        this.on('error', normalizeHttpError);
         this.db = await cds.connect.to('db');
 
         this.on('getBlockCount', async () => {

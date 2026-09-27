@@ -6,9 +6,11 @@
  */
 
 import { type MessagePort } from 'node:worker_threads';
+import { runInRpcScope } from './cancellation';
 import { SUBMIT_METHODS, isSubmittingMethod, WORKER_ROTATING, RpcErrorPayload } from '../wallet-worker-protocol';
 import { classifySubmitFailure, causeMessages } from '../submit-error-classification';
-import { formatErrWithCauses } from '../../utils/format-error';
+import { errorName, formatErrWithCauses } from '../../utils/format-error';
+import { findNightgateError } from '../../utils/errors';
 import { facades, log, type RpcRequest, type RpcOk, type RpcErr } from './context';
 import { facadeHandlers, withSessionLocks, submitLockKeys, resolveSaveAckWaiter, applySaveAck } from './facades';
 import { tokenHandlers } from './tokens';
@@ -60,23 +62,30 @@ async function dispatch(method: string, args: unknown, port: MessagePort): Promi
         // A contract job holds its artifact generation for the whole call.
         const releaseGeneration = retainGeneration((args as any)?.registration?.artifactDigest);
         if (submitting) rotationState.inflight++;
+        // The client posts `cancel` when its timeout fires; the call's wait points stop there.
+        const cancel = new AbortController();
+        const onCancel = (m: any): void => { if (m?.kind === 'cancel') cancel.abort(); };
+        port.on('message', onCancel);
         let result: unknown;
         try {
-            result = SUBMIT_METHODS.has(method)
-                ? await withSessionLocks(submitLockKeys(args), () => fn(callArgs))
-                : await fn(callArgs);
+            result = await runInRpcScope(method, cancel.signal, () => SUBMIT_METHODS.has(method)
+                ? withSessionLocks(submitLockKeys(args), () => fn(callArgs))
+                : fn(callArgs));
         } finally {
+            port.off('message', onCancel);
             if (submitting) rotationState.inflight--;
             releaseGeneration();
         }
         port.postMessage({ ok: true, result } as RpcOk);
-    } catch (err: any) {
+    } catch (err: unknown) {
         // Carry the nested cause chain across the thread boundary
         const payload: RpcErrorPayload = {
-            name: err?.name ?? 'Error',
+            name: errorName(err),
             message: formatErrWithCauses(err),
             causes: causeMessages(err)
         };
+        const coded = findNightgateError(err);
+        if (coded) payload.nightgate = coded.toPayload();
         // Submitting methods: classify HERE, against the SDK objects, once.
         if (submitting) {
             const info = classifySubmitFailure(err);

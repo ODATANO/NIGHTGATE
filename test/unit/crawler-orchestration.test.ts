@@ -125,6 +125,15 @@ beforeEach(async () => {
 });
 
 describe('MidnightCrawler orchestration', () => {
+    it('counts two error records written at once as two', async () => {
+        const crawler = new MidnightCrawler({} as any, { enabled: true });
+        (crawler as any).db = db;
+        await Promise.all([(crawler as any).recordError('first'), (crawler as any).recordError('second', false)]);
+        const state = await db.run(cds.ql.SELECT.one.from('midnight.SyncState').where({ ID: 'SINGLETON' }));
+        expect(state.consecutiveErrors).toBe(2);
+        expect(state.syncStatus).toBe('error');
+    });
+
     // ========================================================================
     // Lifecycle: start
     // ========================================================================

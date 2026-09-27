@@ -9,6 +9,12 @@ export function formatErr(err: unknown): string {
     catch { return String(err); }
 }
 
+/** `err.name` when it is a string, else 'Error'. */
+export function errorName(err: unknown): string {
+    const name = (err as { name?: unknown } | null | undefined)?.name;
+    return typeof name === 'string' ? name : 'Error';
+}
+
 /**
  * Deep inspect that never throws, since classifying an error must not raise a new one.
  * Custom inspectors stay on first (reject classification reads Effect's cause chain

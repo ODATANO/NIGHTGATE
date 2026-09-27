@@ -12,6 +12,7 @@ import { walletSessionViewingKeyBinding, walletSessionSeedBinding } from '../uti
 import { deriveAccountId, deriveStoragePassword } from './wallet-material-factory';
 import { getOrBuildWalletFacade, type WalletFacadeBuildArgs } from './wallet-facade-builder';
 import { walletWaitForSyncedState } from '../midnight/wallet-worker-client';
+import { NightgateError } from '../utils/errors';
 
 /**
  * Per-sponsor sync-to-tip wait during prewarm (0 = build only). Sequential,
@@ -22,11 +23,12 @@ export function prewarmSyncBudgetMs(env: NodeJS.ProcessEnv = process.env): numbe
 }
 
 /** Carries the OData status the handlers reject with. */
-export class FeeSponsorError extends Error {
-    constructor(public readonly httpStatus: number, message: string) {
-        super(message);
-        this.name = 'FeeSponsorError';
+export class FeeSponsorError extends NightgateError {
+    constructor(status: number, message: string) {
+        super('FEE_SPONSOR_UNUSABLE', message, { status });
     }
+    /** @deprecated use `status`. */
+    get httpStatus(): number { return this.status; }
 }
 
 export interface ResolvedFeeSponsor {
@@ -47,9 +49,10 @@ export { getConfiguredFeeSponsorSessions } from '../utils/session-expiry';
 import { getConfiguredFeeSponsorSessions, isSessionExpired } from '../utils/session-expiry';
 import { configNumberFrom } from '../utils/config';
 import { noteSponsorAccount } from './sponsor-sync-gate';
+import type { DbRunner } from '../utils/db-types';
 
 export interface ResolveFeeSponsorOptions {
-    db: any;
+    db: DbRunner;
     sponsorSessionId: string;
     /** Required unless the sponsor id is platform-listed. */
     requestingUserId?: string;
@@ -130,7 +133,7 @@ export async function ensureFeeSponsorFacade(
  * thread). A failing sponsor is logged and skipped; pool failover covers it.
  */
 export async function prewarmFeeSponsorPool(opts: {
-    db: any;
+    db: DbRunner;
     config?: Record<string, any>;
     facadeConfig: Omit<WalletFacadeBuildArgs, 'seedHex' | 'syncStatePassphrase'>;
     log?: { info: (m: string) => void; warn: (m: string) => void };

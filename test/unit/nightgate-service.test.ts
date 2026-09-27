@@ -481,7 +481,7 @@ describe('ContractStates', () => {
             new Response(JSON.stringify({ data: { contractAction: null } }), { status: 200 }));
         try {
             const ask = () => srv.send({ event: 'stateAt', entity: 'ContractStates', data: { address: 'cd'.repeat(32) } })
-                .then(() => 200, (err: any) => err.code ?? err.status);
+                .then(() => 200, (err: any) => err.status);
             const codes = [await ask(), await ask(), await ask()];
             expect(codes).toContain(429);
             expect(fetchSpy.mock.calls.length).toBeLessThanOrEqual(2);

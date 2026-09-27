@@ -181,7 +181,7 @@ describe('sdk-loader caching contract', () => {
 // validatePassword): length, character classes, identical runs, sequences.
 function sdkPasswordRuleViolation(pw: string): string | undefined {
     if (pw.length < 16) return 'too_short';
-    if (/(.){3}/.test(pw)) return 'repeated_characters';
+    if (/(.)\1{3}/.test(pw)) return 'repeated_characters';
     const classes = [/[a-z]/, /[A-Z]/, /[0-9]/, /[^a-zA-Z0-9]/].filter(r => r.test(pw)).length;
     if (classes < 3) return 'insufficient_classes';
     const lower = pw.toLowerCase();

@@ -5,13 +5,10 @@
 
 import cds from '@sap/cds';
 const { SELECT, INSERT, UPDATE, DELETE } = cds.ql;
-import {
-    Blocks, Transactions, ContractActions, ContractBalances, ContractStates, UnshieldedUtxos,
-    ZswapLedgerEvents, DustLedgerEvents, TransactionFees, TransactionResults,
-    TransactionSegments, NightBalances, SyncState, PendingSubmissions, BackgroundJobs
-} from '#cds-models/midnight';
+import { Blocks, Transactions, ContractActions, ContractBalances, ContractStates, UnshieldedUtxos, ZswapLedgerEvents, DustLedgerEvents, TransactionFees, TransactionResults, TransactionSegments, NightBalances, SyncState, PendingSubmissions, BackgroundJobs, type Block, type Transaction } from '#cds-models/midnight';
 import { bumpReorgGeneration } from '../submission/reorg-generation';
 import { NIGHT_RAW_TOKEN_TYPE } from './block-events';
+import type { DbRunner } from '../utils/db-types';
 
 // PostgreSQL caps one statement at 65535 bind parameters.
 const IN_CHUNK = 5000;
@@ -45,13 +42,13 @@ export interface RollbackOptions {
 
 /** Delete all indexed data at/above `fromHeight` and repair derived projections. */
 export async function rollbackIndexedDataFromHeight(
-    tx: any,
+    tx: DbRunner,
     fromHeight: number,
     opts: RollbackOptions
 ): Promise<RollbackResult> {
     // Must stay the first write (see bumpReorgGeneration).
     const reorgGeneration = await bumpReorgGeneration(tx);
-    const blocksToRollback: any[] = await tx.run(
+    const blocksToRollback: Block[] = await tx.run(
         SELECT.from(Blocks).columns('ID', 'height')
             .where({ height: { '>=': fromHeight } })
     ) || [];
@@ -171,7 +168,7 @@ export async function rollbackIndexedDataFromHeight(
  * reconciliation: the re-landed tx may apply differently. Anchoring hashes stay.
  */
 async function revertSubmissionEvidence(
-    tx: any,
+    tx: DbRunner,
     fromHeight: number
 ): Promise<{ submissionsReverted: number; jobsReverted: number }> {
     const clearedEvidence = { chainBlockHeight: null, chainBlockHash: null, indexerTxHash: null };
@@ -190,13 +187,13 @@ async function revertSubmissionEvidence(
         UPDATE.entity(BackgroundJobs)
             .set({
                 status: 'reconciliation_required', chainStatus: 'pending', chainFinalizedAt: null,
-                errorCode: null, errorMessage: null, finishedAt: null, ...clearedEvidence
+                errorCode: null, errorMessage: null, finishedAt: null, chainSegments: null, ...clearedEvidence
             })
             .where({ chainBlockHeight: { '>=': fromHeight }, status: 'failed', errorCode: 'CHAIN_EXECUTION_FAILED' })
     ));
     const outcomesReverted = affectedRows(await tx.run(
         UPDATE.entity(BackgroundJobs)
-            .set({ chainStatus: 'pending', chainFinalizedAt: null, ...clearedEvidence })
+            .set({ chainStatus: 'pending', chainFinalizedAt: null, chainSegments: null, ...clearedEvidence })
             .where({ chainBlockHeight: { '>=': fromHeight }, chainStatus: { in: ['success', 'failure'] } })
     ));
     return { submissionsReverted: submissionsReverted + failedAttemptsReverted, jobsReverted: failedReverted + outcomesReverted };
@@ -209,7 +206,7 @@ function affectedRows(result: unknown): number {
 }
 
 async function selectForkBlock(
-    tx: any,
+    tx: DbRunner,
     fromHeight: number
 ): Promise<{ ID: string; height: number; hash: string } | null> {
     const forkBlock = await tx.run(
@@ -220,12 +217,24 @@ async function selectForkBlock(
     return forkBlock || null;
 }
 
+/** One address's NightBalances figures as the indexed rows imply them. */
+export interface NightBalanceFigures {
+    balance: bigint;
+    utxoCount: number;
+    txSentCount: number;
+    txReceivedCount: number;
+    totalSent: bigint;
+    totalReceived: bigint;
+    firstSeenHeight: number | null;
+    lastActivityHeight: number | null;
+}
+
 /**
- * Rebuild one address's NightBalances row from what remains. Must mirror the
- * ingest rule in BlockProcessor (`applyBalanceDelta`), which folds the same
+ * The figures of one address from what is indexed; null without any NIGHT activity. Must
+ * mirror the ingest rule in BlockProcessor (`applyBalanceDelta`), which folds the same
  * figures in block by block.
  */
-export async function recomputeNightBalance(tx: any, address: string): Promise<void> {
+export async function computeNightBalance(tx: DbRunner, address: string): Promise<NightBalanceFigures | null> {
     // NightBalances is a NIGHT balance; an address can hold other tokens in
     // the same UTXO set, and they do not belong in these figures.
     const utxos: any[] = await tx.run(
@@ -234,7 +243,7 @@ export async function recomputeNightBalance(tx: any, address: string): Promise<v
             .where({ owner: address, tokenType: NIGHT_RAW_TOKEN_TYPE })
     ) || [];
 
-    const sentCandidates: any[] = await tx.run(
+    const sentCandidates: Transaction[] = await tx.run(
         SELECT.from(Transactions)
             .columns('ID', 'nightAmount', 'receiverAddress', 'block_ID')
             .where({ senderAddress: address })
@@ -243,32 +252,7 @@ export async function recomputeNightBalance(tx: any, address: string): Promise<v
         t.receiverAddress && t.receiverAddress !== address && toBigInt(t.nightAmount) > 0n
     );
 
-    if (utxos.length === 0 && sentTxs.length === 0) {
-        const existing = await tx.run(
-            SELECT.one.from(NightBalances)
-                .columns('address', 'dustAddress', 'isDustRegistered')
-                .where({ address })
-        );
-        if (!existing) return;
-        if (existing.dustAddress || existing.isDustRegistered) {
-            await tx.run(
-                UPDATE.entity(NightBalances).set({
-                    balance: '0' as any,
-                    utxoCount: 0,
-                    txSentCount: 0,
-                    txReceivedCount: 0,
-                    totalSent: '0' as any,
-                    totalReceived: '0' as any,
-                    firstSeenHeight: null,
-                    lastActivityHeight: null,
-                    lastUpdatedAt: new Date().toISOString()
-                }).where({ address })
-            );
-        } else {
-            await tx.run(DELETE.from(NightBalances).where({ address }));
-        }
-        return;
-    }
+    if (utxos.length === 0 && sentTxs.length === 0) return null;
 
     // Spending is activity too, so the spending transactions count towards the
     // height range alongside the creating and the sending ones.
@@ -304,18 +288,54 @@ export async function recomputeNightBalance(tx: any, address: string): Promise<v
     let totalSent = 0n;
     for (const t of sentTxs) totalSent += toBigInt(t.nightAmount);
 
+    return {
+        balance, utxoCount, txSentCount: sentTxs.length, txReceivedCount: utxos.length,
+        totalSent, totalReceived, firstSeenHeight, lastActivityHeight
+    };
+}
+
+/** Rebuild one address's NightBalances row from what remains. */
+export async function recomputeNightBalance(tx: DbRunner, address: string): Promise<void> {
+    const figures = await computeNightBalance(tx, address);
+    if (!figures) {
+        const existing = await tx.run(
+            SELECT.one.from(NightBalances)
+                .columns('address', 'dustAddress', 'isDustRegistered')
+                .where({ address })
+        );
+        if (!existing) return;
+        if (existing.dustAddress || existing.isDustRegistered) {
+            await tx.run(
+                UPDATE.entity(NightBalances).set({
+                    balance: '0' as any,
+                    utxoCount: 0,
+                    txSentCount: 0,
+                    txReceivedCount: 0,
+                    totalSent: '0' as any,
+                    totalReceived: '0' as any,
+                    firstSeenHeight: null,
+                    lastActivityHeight: null,
+                    lastUpdatedAt: new Date().toISOString()
+                }).where({ address })
+            );
+        } else {
+            await tx.run(DELETE.from(NightBalances).where({ address }));
+        }
+        return;
+    }
+
     const nowIso = new Date().toISOString();
     const computed = {
-        balance: balance.toString() as any,
-        utxoCount,
-        txSentCount: sentTxs.length,
-        txReceivedCount: utxos.length,
-        totalSent: totalSent.toString() as any,
-        totalReceived: totalReceived.toString() as any,
-        firstSeenHeight,
-        lastActivityHeight,
+        balance: figures.balance.toString() as any,
+        utxoCount: figures.utxoCount,
+        txSentCount: figures.txSentCount,
+        txReceivedCount: figures.txReceivedCount,
+        totalSent: figures.totalSent.toString() as any,
+        totalReceived: figures.totalReceived.toString() as any,
+        firstSeenHeight: figures.firstSeenHeight,
+        lastActivityHeight: figures.lastActivityHeight,
         lastActivityAt: nowIso,
-        lastUpdatedHeight: lastActivityHeight,
+        lastUpdatedHeight: figures.lastActivityHeight,
         lastUpdatedAt: nowIso
     };
 

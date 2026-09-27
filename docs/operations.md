@@ -471,7 +471,7 @@ The next `connectWalletForSigning` starts a cold sync (hours).
 - [ ] `ENCRYPTION_KEY` (or `ENCRYPTION_KEYS` + `ENCRYPTION_KEY_ACTIVE`) set to real secrets
 - [ ] after a key rotation: `nightgate-rewrap-keys` exited 0 before the old key was removed
 - [ ] Database is PostgreSQL or HANA (image: `NIGHTGATE_DB_URL`, migration via `nightgate-db-migrate`, see docs/docker.md). Production SQLite is rejected at startup; `NIGHTGATE_ALLOW_PRODUCTION_SQLITE=true` is for migration only
-- [ ] One replica (`NIGHTGATE_REPLICA_COUNT=1`); more replicas, CAP multitenancy or `CF_INSTANCE_INDEX > 0` fail startup
+- [ ] One replica (`NIGHTGATE_REPLICA_COUNT=1`); more replicas, CAP multitenancy or `CF_INSTANCE_INDEX > 0` fail startup. A second process on the same database waits `NIGHTGATE_INSTANCE_LEASE_TTL_MS` for the `InstanceLeases` row to expire, then refuses to start; a process whose lease was taken over reports offline and refuses job dispatch, write actions and broadcasts until restarted
 - [ ] `NIGHTGATE_CRAWLER_ENABLED` true or unset (default on)
 - [ ] CAP auth configured (`dummy` admits everyone)
 - [ ] Rate limits reviewed for production load

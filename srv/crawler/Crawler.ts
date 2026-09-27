@@ -12,7 +12,7 @@ import { rollbackIndexedDataFromHeight } from './rollback';
 import { LedgerPayloadDecoder } from './LedgerPayloadDecoder';
 import { IndexerSupplement } from './IndexerSupplement';
 import { contractStatePolicy } from './contract-state';
-import { SyncState, ReorgLog, Blocks } from '#cds-models/midnight';
+import { SyncState, ReorgLog, Blocks, type Block } from '#cds-models/midnight';
 
 export interface CrawlerConfig {
     enabled: boolean;
@@ -753,7 +753,7 @@ export class MidnightCrawler {
             // Replayed head: on our chain iff its parent is our block at
             // newHeight - 1; only a diverging parent is a fork below the tip.
             if (newHeight === 0) return null; // genesis replay: never roll back
-            const localParent: any = await this.db.run(
+            const localParent: Block | undefined = await this.db.run(
                 SELECT.one.from(Blocks).columns('hash').where({ height: newHeight - 1 })
             );
             if (localParent?.hash === header.parentHash) {
@@ -808,7 +808,7 @@ export class MidnightCrawler {
         const startTime = Date.now();
         const reorgLogId = cds.utils.uuid();
 
-        await this.db.tx(async (tx: any) => {
+        await this.db.tx(async (tx) => {
             // Also resets SyncState to the fork block with status 'syncing'.
             const result = await rollbackIndexedDataFromHeight(tx, reorg.forkHeight, {
                 syncStatus: 'syncing'
@@ -849,12 +849,12 @@ export class MidnightCrawler {
     /** `markErrored` false records the error without flipping syncStatus (a retry follows). */
     private async recordError(message: string, markErrored: boolean = true): Promise<void> {
         try {
-            const state = await this.getSyncState();
+            // Incremented in the statement: two failures recorded at once both count.
             await this.db.run(
                 UPDATE.entity(SyncState).set({
                     lastError: message.slice(0, 500),
                     lastErrorAt: new Date().toISOString(),
-                    consecutiveErrors: (state?.consecutiveErrors || 0) + 1,
+                    consecutiveErrors: { xpr: [{ func: 'coalesce', args: [{ ref: ['consecutiveErrors'] }, { val: 0 }] }, '+', { val: 1 }] } as any,
                     ...(markErrored ? { syncStatus: 'error' } : {})
                 }).where({ ID: 'SINGLETON' })
             );

@@ -7,6 +7,7 @@ import { describe, it, expect } from 'vitest';
 import { classifySubmitFailure, isPreMempoolFailure, parseBatchCallStages, causeMessages, SponsorRefusalError } from '../../srv/midnight/submit-error-classification';
 import { WorkerSubmitError, carriedSubmitFailure, SUBMIT_FAILURE_CODES } from '../../srv/midnight/wallet-worker-protocol';
 import { BatchCausalityError } from '../../srv/midnight/batch-segment-order';
+import { NightgateError } from '../../srv/utils/errors';
 
 /** The SDK shape: generic wrappers on top, the node's line in the innermost cause. */
 function sdkWrapped(inner: string): Error {
@@ -136,5 +137,32 @@ describe('classifySubmitFailure', () => {
         expect(causeMessages(sdkWrapped('1010: Invalid Transaction: Custom error: 196'))).toEqual(['Transaction submission failed', '1010: Invalid Transaction: Custom error: 196']);
         const loop: any = new Error('a'); loop.cause = loop;
         expect(causeMessages(loop)).toEqual([]);
+    });
+});
+
+describe('coded failures decide on the code, not the wording', () => {
+    const stall = 'wallet sync stalled: no progress for 3 min and the wallet state is not readable (state peek timed out or failed on every poll)';
+
+    it('a sync-gate stop is "nothing sent, retryable", although its text says "timed out"', () => {
+        expect(classifySubmitFailure(new NightgateError('WALLET_NOT_SYNCED', stall)))
+            .toEqual({ code: 'transport', ledgerCode: 'wallet-not-synced', retryable: true });
+        // The same wording without the code is what used to misclassify as ambiguous.
+        expect(classifySubmitFailure(new Error(stall)).code).toBe('ambiguous');
+    });
+
+    it('finds the code under SDK wrappers', () => {
+        const wrapped = new Error('scope failed', { cause: new NightgateError('WALLET_NOT_SYNCED', 'wallet not synced to tip after 180000ms') });
+        expect(classifySubmitFailure(wrapped).ledgerCode).toBe('wallet-not-synced');
+    });
+
+    it('maps the submit-intent timeout and refusal', () => {
+        expect(classifySubmitFailure(new NightgateError('SUBMIT_INTENT_TIMEOUT', 'x'))).toEqual({ code: 'pre-mempool-reject', ledgerCode: 'intent-timeout', retryable: false });
+        expect(classifySubmitFailure(new NightgateError('SUBMIT_INTENT_REJECTED', 'x'))).toEqual({ code: 'pre-mempool-reject', ledgerCode: 'intent-rejected', retryable: false });
+    });
+
+    it('an unresolved earlier send still wins over an inner code', () => {
+        const outer: any = new Error('outcome of an earlier send unknown', { cause: new NightgateError('WALLET_NOT_SYNCED', 'x') });
+        outer.name = 'SubmitOutcomeUnknownError';
+        expect(classifySubmitFailure(outer)).toEqual({ code: 'ambiguous', ledgerCode: 'unresolved-send', retryable: false });
     });
 });

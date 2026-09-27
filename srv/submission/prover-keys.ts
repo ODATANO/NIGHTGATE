@@ -9,6 +9,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { configStringFrom } from '../utils/config';
+import { NightgateError } from '../utils/errors';
 
 export const PROVER_KEY_MANIFEST = 'manifest.json';
 export const ZK_ASSET_URL_ENV = 'NIGHTGATE_ZK_ASSET_URL';
@@ -56,11 +57,9 @@ export function hasAllProverKeys(zkConfigPath: string): boolean {
     return circuits.length > 0 && missingProverKeys(zkConfigPath).length === 0;
 }
 
-export class ProverKeysUnavailableError extends Error {
-    readonly code = 'PROVER_KEYS_UNAVAILABLE';
-    constructor(message: string, readonly contractName: string, readonly missing: string[], readonly retryable: boolean) {
-        super(message);
-        this.name = 'ProverKeysUnavailableError';
+export class ProverKeysUnavailableError extends NightgateError {
+    constructor(message: string, readonly contractName: string, readonly missing: string[], retryable: boolean) {
+        super('PROVER_KEYS_UNAVAILABLE', message, { retryable, exposeMessage: true });
     }
 }
 

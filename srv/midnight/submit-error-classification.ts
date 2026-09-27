@@ -6,18 +6,16 @@
  */
 
 import { classificationHaystack, formatErr } from '../utils/format-error';
+import { findNightgateError, NightgateError } from '../utils/errors';
 import { dustRaceLedgerCode } from '../submission/dust-race';
 import {
     carriedSubmitFailure, type BatchCallStageInfo, type SubmitFailureInfo
 } from './wallet-worker-protocol';
 
 /** A sponsor shape or allow-list refusal raised by the worker's inspection. */
-export class SponsorRefusalError extends Error {
-    readonly code = 'policy' as const;
-    readonly retryable = false;
+export class SponsorRefusalError extends NightgateError {
     constructor(message: string) {
-        super(message);
-        this.name = 'SponsorRefusalError';
+        super('SPONSOR_REFUSED', message);
     }
 }
 
@@ -71,9 +69,21 @@ const TRANSPORT_RE = /disconnected from|Normal Closure|Abnormal Closure|WebSocke
 // or rebuild; reconciliation resolves the identifier.
 const NO_REPLY_RE = /TimeoutError|TimeoutException|timed? ?out|no reply|no response|request timeout/i;
 
+/** Our own coded failures; decided on the code, never on the wording. */
+function codedSubmitFailure(err: NightgateError | undefined): SubmitFailureInfo | undefined {
+    switch (err?.code) {
+        // Before any build: nothing was sent, another wallet or a later retry may succeed.
+        case 'WALLET_NOT_SYNCED': return { code: 'transport', ledgerCode: 'wallet-not-synced', retryable: true };
+        case 'SUBMIT_INTENT_TIMEOUT': return { code: 'pre-mempool-reject', ledgerCode: 'intent-timeout', retryable: false };
+        case 'SUBMIT_INTENT_REJECTED': return { code: 'pre-mempool-reject', ledgerCode: 'intent-rejected', retryable: false };
+        case 'SPONSOR_REFUSED': return { code: 'policy', retryable: false };
+        default: return undefined;
+    }
+}
+
 /**
- * Order matters: carried code, then outcome-shaped errors, node rejects, connection
- * wording, and no-reply last (a watch timeout also says "timed out").
+ * Order matters: carried code, then outcome-shaped errors, our coded failures, node
+ * rejects, connection wording, and no-reply last (a watch timeout also says "timed out").
  */
 export function classifySubmitFailure(err: unknown): SubmitFailureInfo {
     const carried = carriedSubmitFailure(err);
@@ -93,6 +103,8 @@ export function classifySubmitFailure(err: unknown): SubmitFailureInfo {
     // An earlier send of the same bytes is unresolved: whatever the later attempt said, the
     // identifier may still land. Checked before the phase and reject rules, which sit in its cause.
     if (names.includes('SubmitOutcomeUnknownError')) return { code: 'ambiguous', ledgerCode: 'unresolved-send', retryable: false };
+    const coded = codedSubmitFailure(findNightgateError(err));
+    if (coded) return coded;
     // Only a connect-phase failure is safe to resend; request and watch may have reached the node.
     const phased = chain.find((e: any) => nameOf(e) === 'SubmitPhaseError' && typeof e?.phase === 'string') as any;
     if (phased) {

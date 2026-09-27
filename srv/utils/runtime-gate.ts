@@ -3,8 +3,9 @@
  * leave half-written state (a session row without a facade). Reads and RUNTIME_FREE_ACTIONS stay reachable.
  */
 import cds from '@sap/cds';
-import type { Request } from '@sap/cds';
+import { isBackgroundFenced } from './instance-lease';
 import { readRuntimeState, type RuntimeState } from './runtime-state';
+import type { NightgateRequest } from './request-types';
 
 /** Actions that need no worker, node or proof server (compute-only or database-only). */
 export const RUNTIME_FREE_ACTIONS: ReadonlySet<string> = new Set([
@@ -30,6 +31,9 @@ export const RUNTIME_UNAVAILABLE_CODE = 'RUNTIME_UNAVAILABLE';
  * wires its own runtime, so an uninitialised process is not an outage.
  */
 export function runtimeUnavailableReason(state: RuntimeState = readRuntimeState()): string | null {
+    if (isBackgroundFenced()) {
+        return 'this process lost the database instance lease to another NIGHTGATE process; write actions are refused until it restarts';
+    }
     // A crawler-less start stays 'idle' after a successful init; only 'offline' means failed.
     if (state.initialized && state.mode !== 'offline') return null;
     if (state.mode === 'offline') {
@@ -50,12 +54,12 @@ export function isRuntimeWriteEvent(srv: cds.ApplicationService, event: string):
 
 /** Register the gate; `$sanitize: false` keeps the 503 message in production, where CAP strips 5xx messages. */
 export function attachRuntimeGate(srv: cds.ApplicationService): void {
-    srv.before('*', (req: Request) => {
-        const event = String((req as any).event ?? '');
+    srv.before('*', (req: NightgateRequest) => {
+        const event = String(req.event ?? '');
         if (!isRuntimeWriteEvent(srv, event)) return;
         const reason = runtimeUnavailableReason();
         if (!reason) return;
-        try { (req as any).http?.res?.set?.('Retry-After', String(RUNTIME_RETRY_AFTER_SECONDS)); } catch { /* courtesy header */ }
+        try { req.http?.res?.set?.('Retry-After', String(RUNTIME_RETRY_AFTER_SECONDS)); } catch { /* courtesy header */ }
         return req.reject({ status: 503, code: RUNTIME_UNAVAILABLE_CODE, message: reason, $sanitize: false } as any);
     });
 }

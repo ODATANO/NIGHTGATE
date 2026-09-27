@@ -1,4 +1,4 @@
-import cds, { Request } from '@sap/cds';
+import cds from '@sap/cds';
 const { SELECT, UPDATE } = cds.ql;
 
 import { ensureNightgateModelLoaded } from './utils/cds-model';
@@ -18,6 +18,8 @@ import {
 
 import { RateLimiter } from './utils/rate-limiter';
 import { principalRateKey } from './utils/rate-limiter';
+import type { NightgateRequest } from './utils/request-types';
+import { normalizeHttpError } from './utils/http-errors';
 
 const log = cds.log('nightgate:indexer');
 
@@ -43,7 +45,7 @@ export default class NightgateIndexerService extends cds.ApplicationService {
         effectiveStartHeight: number;
     }> {
         // Commits before the caller restarts the crawler, so it never reads pre-rollback state.
-        const result: RollbackResult = await this.db.tx(async (tx: any) =>
+        const result: RollbackResult = await this.db.tx(async (tx) =>
             rollbackIndexedDataFromHeight(tx, fromHeight, {
                 syncStatus: 'stopped',
                 extraSyncState: { syncProgress: 0 }
@@ -62,6 +64,7 @@ export default class NightgateIndexerService extends cds.ApplicationService {
     }
 
     async init(): Promise<void> {
+        this.on('error', normalizeHttpError);
         await ensureNightgateModelLoaded();
         this.db = await cds.connect.to('db');
 
@@ -86,7 +89,7 @@ export default class NightgateIndexerService extends cds.ApplicationService {
 
         this.on('getHealth', async () => buildHealth(this.db));
 
-        this.on('getReorgHistory', async (req: Request) => {
+        this.on('getReorgHistory', async (req: NightgateRequest) => {
             const { limit } = req.data as { limit?: number };
             const effectiveLimit = Math.min(Math.max(limit || 10, 1), 100);
             return this.db.run(
@@ -98,7 +101,7 @@ export default class NightgateIndexerService extends cds.ApplicationService {
 
         this.on('getLiveness', async () => buildLiveness());
 
-        this.on('getRuntimeInfo', async (req: Request) => {
+        this.on('getRuntimeInfo', async (req: NightgateRequest) => {
             const clientKey = principalRateKey(req, 'runtime-info');
             const rate = runtimeInfoRateLimiter.check(clientKey);
             if (!rate.allowed) {
@@ -106,15 +109,15 @@ export default class NightgateIndexerService extends cds.ApplicationService {
             }
             return buildRuntimeInfo();
         });
-        this.on('getWorkerStatus', async (req: Request) =>
+        this.on('getWorkerStatus', async (req: NightgateRequest) =>
             buildWorkerStatus(Boolean((req.user as any)?.is?.('admin'))));
 
-        this.on('getReadiness', async (req: Request) => {
+        this.on('getReadiness', async (req: NightgateRequest) => {
             const readiness = await buildReadiness(this.db);
             // The probe's answer is the status code: a payload saying `ready: false`
             // under 200 reads as healthy to every orchestrator and to the container
             // healthcheck. `req.http` is absent on an internal call.
-            if (readiness.ready !== true) (req as any)?.http?.res?.status(503);
+            if (readiness.ready !== true) req?.http?.res?.status(503);
             return readiness;
         });
 
@@ -143,7 +146,7 @@ export default class NightgateIndexerService extends cds.ApplicationService {
             };
         });
 
-        this.on('resumeCrawler', async (req: Request) => {
+        this.on('resumeCrawler', async (req: NightgateRequest) => {
             if (isCrawlerRunning()) {
                 return {
                     status: 'ok',
@@ -165,7 +168,7 @@ export default class NightgateIndexerService extends cds.ApplicationService {
             }
         });
 
-        this.on('reindexFromHeight', async (req: Request) => {
+        this.on('reindexFromHeight', async (req: NightgateRequest) => {
             const { height } = req.data as { height?: number };
             const requestedHeight = Number(height);
 

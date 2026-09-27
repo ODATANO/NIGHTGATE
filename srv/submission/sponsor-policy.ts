@@ -6,6 +6,7 @@
 import fs from 'node:fs';
 import cds from '@sap/cds';
 import { configList, configFlag, configString } from '../utils/config';
+import { NightgateError } from '../utils/errors';
 
 const log = cds.log('nightgate:sponsor-policy');
 
@@ -103,15 +104,12 @@ export function __resetSponsorPolicyForTests(): void {
     fileCache = null;
 }
 
-export class SponsorPolicyUnavailableError extends Error {
-    readonly httpStatus = 503;
-    readonly status = 503;
-    readonly code = 'SPONSOR_POLICY_UNAVAILABLE';
-    readonly $sanitize = false;
+export class SponsorPolicyUnavailableError extends NightgateError {
     constructor(message: string) {
-        super(message);
-        this.name = 'SponsorPolicyUnavailableError';
+        super('SPONSOR_POLICY_UNAVAILABLE', message, { exposeMessage: true });
     }
+    /** @deprecated use `status`. */
+    get httpStatus(): number { return this.status; }
 }
 
 function readPolicyFile(filePath: string): SponsorPolicy {
@@ -181,14 +179,12 @@ export function getGlobalSponsorPolicy(): SponsorPolicy {
 
 // ---- Effective policy ------------------------------------------------------
 
-export class SponsorPolicyEmptyError extends Error {
-    readonly httpStatus = 403;
-    readonly status = 403;
-    readonly code = 'SPONSOR_POLICY_EMPTY';
+export class SponsorPolicyEmptyError extends NightgateError {
     constructor(message: string) {
-        super(message);
-        this.name = 'SponsorPolicyEmptyError';
+        super('SPONSOR_POLICY_EMPTY', message);
     }
+    /** @deprecated use `status`. */
+    get httpStatus(): number { return this.status; }
 }
 
 function intersect(floor: string[], grant: string[] | null | undefined, what: string): string[] {
@@ -236,7 +232,7 @@ export function effectiveSponsorPolicy(floor: SponsorPolicy, grant?: GrantPolicy
 }
 
 /** For the OData handlers: the current floor, narrowed by `req.agentGrant`. */
-export function resolveSponsorPolicyForRequest(req: unknown): SponsorPolicy {
-    const grant = (req as any)?.agentGrant as GrantPolicyInput | undefined;
+export function resolveSponsorPolicyForRequest(req: { agentGrant?: GrantPolicyInput | null }): SponsorPolicy {
+    const grant = req?.agentGrant as GrantPolicyInput | undefined;
     return effectiveSponsorPolicy(getGlobalSponsorPolicy(), grant);
 }

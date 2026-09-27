@@ -2,7 +2,7 @@
  * NightgateAdminService: wallet-session management + role grants.
  */
 
-import cds, { Request } from '@sap/cds';
+import cds from '@sap/cds';
 const { SELECT, UPDATE, INSERT } = cds.ql;
 
 import { ensureNightgateModelLoaded } from './utils/cds-model';
@@ -19,11 +19,17 @@ import { deriveAccountId } from './submission/wallet-material-factory';
 import { evictWalletFacade } from './submission/wallet-facade-builder';
 import { withKeyedLock } from './utils/keyed-lock';
 
-import { WalletSessions, DisclosureRoles, BackgroundJobs } from '#cds-models/midnight';
+import { WalletSessions, DisclosureRoles, BackgroundJobs, type WalletSession } from '#cds-models/midnight';
 import { listContracts, registerContractAtRuntime, unregisterContractAtRuntime, ContractRegistrationError } from './submission/contract-registrations';
 import { walletCpuProfile } from './midnight/wallet-worker-client';
 import { PROFILE_ROOT, profileCurrentThread, resolveProfileDir } from './midnight/cpu-profile';
 import { getConfiguredNightgateNetwork } from './utils/nightgate-config';
+import { reconcileNightBalances } from './crawler/night-balance-reconcile';
+import { formatErr } from './utils/format-error';
+import { NightgateError } from './utils/errors';
+import type { NightgateRequest } from './utils/request-types';
+import type { Row } from './utils/db-types';
+import { normalizeHttpError } from './utils/http-errors';
 
 /**
  * Drop the in-memory WalletFacade (live secret keys) cached for a session, so a
@@ -48,10 +54,19 @@ export default class NightgateAdminService extends cds.ApplicationService {
     private db!: cds.DatabaseService;
 
     async init(): Promise<void> {
+        this.on('error', normalizeHttpError);
         await ensureNightgateModelLoaded();
         this.db = await cds.connect.to('db');
 
-        this.on('getJobStats', async (req: Request) => {
+        this.on('reconcileNightBalances', async (req: NightgateRequest) => {
+            const { address, after, limit } = req.data as { address?: string | null; after?: string | null; limit?: number | null };
+            if (limit !== undefined && limit !== null && (!Number.isInteger(limit) || limit < 1)) {
+                return req.reject(400, 'limit must be a positive integer');
+            }
+            return reconcileNightBalances(this.db, { address, after, limit });
+        });
+
+        this.on('getJobStats', async (req: NightgateRequest) => {
             const { windowHours } = req.data as { windowHours?: number };
             const hours = Math.min(Math.max(Number(windowHours) || 24, 1), 720);
             const since = new Date(Date.now() - hours * 3600_000).toISOString();
@@ -107,7 +122,7 @@ export default class NightgateAdminService extends cds.ApplicationService {
 
         // Worker CPU profile: bounded sampling window, runs while the worker
         // keeps serving; the caller waits for the result (up to seconds + 60 s).
-        this.on('profileWorker', async (req: Request) => {
+        this.on('profileWorker', async (req: NightgateRequest) => {
             const data = req.data as { seconds?: number | null; dir?: string | null; thread?: string | null };
             const seconds = Number(data.seconds ?? 20);
             if (!Number.isFinite(seconds) || seconds < 1 || seconds > 120) {
@@ -123,14 +138,12 @@ export default class NightgateAdminService extends cds.ApplicationService {
                     return { thread: 'main', facadeCount: null, ...p, gc: { ...p.gc, byKind: JSON.stringify(p.gc.byKind) } };
                 }
                 return await walletCpuProfile(seconds, dir);
-            } catch (e: any) {
-                const err: any = new Error(`${thread} profile failed: ${e?.message ?? String(e)}`);
-                err.status = 503; err.$sanitize = false;
-                return req.reject(err);
+            } catch (e: unknown) {
+                return req.reject(new NightgateError('UNAVAILABLE', `${thread} profile failed: ${formatErr(e)}`, { exposeMessage: true }));
             }
         });
 
-        this.on('registerContract', async (req: Request) => {
+        this.on('registerContract', async (req: NightgateRequest) => {
             const data = req.data as { name?: string; artifactPath?: string; zkConfigPath?: string; privateStateId?: string; slotWidth?: number | null };
             for (const field of ['name', 'artifactPath', 'zkConfigPath', 'privateStateId'] as const) {
                 if (typeof data[field] !== 'string' || !data[field]!.trim()) return req.reject(400, `${field} is required`);
@@ -140,7 +153,7 @@ export default class NightgateAdminService extends cds.ApplicationService {
                     name: data.name!, artifactPath: data.artifactPath!, zkConfigPath: data.zkConfigPath!,
                     privateStateId: data.privateStateId!, slotWidth: data.slotWidth ?? null
                 }, {
-                    registeredBy: (req as any).user?.id,
+                    registeredBy: req.user?.id,
                     // The resolved plugin network (env, then cds.requires.nightgate.network), not the env alone.
                     networkId: getConfiguredNightgateNetwork((cds as any).env?.requires?.nightgate) ?? undefined
                 });
@@ -150,7 +163,7 @@ export default class NightgateAdminService extends cds.ApplicationService {
             }
         });
 
-        this.on('unregisterContract', async (req: Request) => {
+        this.on('unregisterContract', async (req: NightgateRequest) => {
             const { name } = req.data as { name?: string };
             if (typeof name !== 'string' || !name.trim()) return req.reject(400, 'name is required');
             try {
@@ -161,7 +174,7 @@ export default class NightgateAdminService extends cds.ApplicationService {
             }
         });
 
-        this.on('invalidateSession', async (req: Request) => {
+        this.on('invalidateSession', async (req: NightgateRequest) => {
             const { sessionId } = req.data as { sessionId: string };
 
             if (!sessionId) {
@@ -192,7 +205,7 @@ export default class NightgateAdminService extends cds.ApplicationService {
             await evictSessionFacade(session);
         });
 
-        this.on('exportContractSigningKey', async (req: Request) => {
+        this.on('exportContractSigningKey', async (req: NightgateRequest) => {
             const { sessionId, contractAddress, password } = req.data as { sessionId?: string; contractAddress?: string; password?: string };
             try {
                 const out = await exportContractSigningKeyForSession(this.db, getEncryptionKey(), String(sessionId ?? ''), String(contractAddress ?? ''), String(password ?? ''));
@@ -206,7 +219,7 @@ export default class NightgateAdminService extends cds.ApplicationService {
 
         this.on('invalidateAllSessions', async () => {
             // Viewing keys read before they are nulled, facades evicted after the deactivation.
-            const active: any[] = (await this.db.run(
+            const active: Row<WalletSession, 'sessionId'>[] = (await this.db.run(
                 SELECT.from(WalletSessions).columns('sessionId', 'encryptedViewingKey').where({ isActive: true })
             )) || [];
 
@@ -225,7 +238,7 @@ export default class NightgateAdminService extends cds.ApplicationService {
         // @requires:'admin' gates CAP auth; additionally require the caller to
         // hold the 'authority' disclosure tier so a sysadmin who is not a
         // regulator cannot grant data-tier access.
-        this.on('grantRole', async (req: Request) => {
+        this.on('grantRole', async (req: NightgateRequest) => {
             const { userId, role, scope, validUntil } = req.data as {
                 userId?: string;
                 role?: string;
@@ -244,7 +257,7 @@ export default class NightgateAdminService extends cds.ApplicationService {
                 return req.reject(403, 'caller must hold the authority disclosure role to grant roles');
             }
 
-            const grantedBy = (req as any).user?.id || 'unknown';
+            const grantedBy = req.user?.id || 'unknown';
             const now = new Date().toISOString();
             await this.db.run(INSERT.into(DisclosureRoles).entries({
                 userId,

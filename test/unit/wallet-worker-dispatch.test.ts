@@ -431,6 +431,41 @@ describe('dispatcher', () => {
         expect(reply.error.causes).toEqual([]);
     });
 
+    it('a cancel on the reply port stops the call at its next wait point', async () => {
+        const { handlers } = await import('../../srv/midnight/worker/rpc.js');
+        const { throwIfRpcCancelled } = await import('../../srv/midnight/worker/cancellation.js');
+        let polls = 0;
+        handlers.__waitProbe = async () => {
+            for (;;) { throwIfRpcCancelled('probe wait'); polls++; await new Promise(r => setTimeout(r, 5)); }
+        };
+        try {
+            const { port1, port2 } = new MessageChannel();
+            const reply = new Promise<any>((resolve) => port2.on('message', (m: any) => { port2.close(); resolve(m); }));
+            fakeParentPort.emit('message', { kind: 'rpc', method: '__waitProbe', args: {}, port: port1 });
+            await new Promise(r => setTimeout(r, 30));
+            port2.postMessage({ kind: 'cancel' });
+            const msg = await reply;
+            expect(msg.ok).toBe(false);
+            expect(msg.error.name).toBe('RpcCancelledError');
+            expect(polls).toBeGreaterThan(0);
+        } finally {
+            delete handlers.__waitProbe;
+        }
+    });
+
+    it('carries our coded error across the boundary', async () => {
+        const { handlers } = await import('../../srv/midnight/worker/rpc.js');
+        const { NightgateError } = await import('../../srv/utils/errors.js');
+        handlers.__codedProbe = async () => { throw new Error('outer', { cause: new NightgateError('WALLET_NOT_SYNCED', 'not at tip', { info: { behind: 3 } }) }); };
+        try {
+            const reply = await rpc('__codedProbe', {});
+            expect(reply.ok).toBe(false);
+            expect(reply.error.nightgate).toEqual({ name: 'NightgateError', code: 'WALLET_NOT_SYNCED', status: 503, retryable: true, message: 'not at tip', info: { behind: 3 } });
+        } finally {
+            delete handlers.__codedProbe;
+        }
+    });
+
     it('warns (via the log push) on malformed messages instead of crashing', () => {
         fakeParentPort.emit('message', { kind: 'rpc' /* no port */ });
         fakeParentPort.emit('message', { kind: 'something-else' });
@@ -944,6 +979,32 @@ describe('buildWorkerWalletProvider', () => {
         expect(provider.getEncryptionPublicKey()).toBe('epk');
     });
 
+    it('a batch announces its call names per segment with the identifier', async () => {
+        const { entry, finalized } = makeEntry(DUST_OK);
+        (finalized as any).identifiers = () => ['tx-batch-1'];
+        (finalized as any).intents = new Map<number, any>([
+            [1, { actions: [{ entryPoint: 'attest', guaranteedTranscript: {} }] }],
+            [2, { actions: [{ entryPoint: 'bindDocument', fallibleTranscript: {} }] }]
+        ]);
+        const { port1, port2 } = new MessageChannel();
+        const seen: any[] = [];
+        port2.on('message', (m: any) => {
+            if (m?.kind === 'submit-intent') {
+                seen.push(m);
+                port2.postMessage({ kind: 'submit-intent-ack', txHash: m.txHash, ok: true });
+            }
+        });
+        const restoreSubmit = withSubmit(async () => undefined);
+        try {
+            const provider = workerExports.buildWorkerWalletProvider(entry, { replyPort: port1, contractAddress: 'c'.repeat(64), circuits: ['attest', 'bindDocument'] });
+            await provider.submitTx(finalized);
+            expect(seen[0].segments).toEqual([{ segment: 1, calls: ['attest'] }, { segment: 2, calls: ['bindDocument'] }]);
+        } finally {
+            restoreSubmit();
+            port1.close(); port2.close();
+        }
+    });
+
     it('submitTx announces the identifier on the reply port, books the spends, then sends on a dedicated client (bound channel)', async () => {
         const { entry, facade, finalized } = makeEntry(DUST_OK);
         (finalized as any).identifiers = () => ['tx-bound-1'];
@@ -991,7 +1052,9 @@ describe('buildWorkerWalletProvider', () => {
         const submitsBefore = submitCount();
         try {
             const provider = workerExports.buildWorkerWalletProvider(entry, { replyPort: port1, note: 'transfer' });
-            await expect(provider.submitTx(finalized)).rejects.toThrow(/submit-intent rejected.*cannot record txHash/);
+            const err: any = await provider.submitTx(finalized).then(() => null, (e: unknown) => e);
+            expect(err?.message).toMatch(/submit-intent rejected.*cannot record txHash/);
+            expect(err?.code).toBe('SUBMIT_INTENT_REJECTED');
             expect(submitCount()).toBe(submitsBefore);
             expect(facade.pendingTransactionsService.addPendingTransaction).not.toHaveBeenCalled();
             expect(facade.revert).toHaveBeenCalledWith(finalized);

@@ -10,6 +10,7 @@ import {
     __pollOnceForTests, __resetForTests
 } from '../../srv/submission/background-jobs';
 import { declaredJobKindTraits } from '../../srv/submission/job-kinds';
+import { fenceBackgroundWork, __resetInstanceLeaseForTests } from '../../srv/utils/instance-lease';
 
 cds.test(__dirname + '/../..');
 
@@ -113,4 +114,19 @@ test('one poller tick dispatches pending rows up to the free heavy capacity, the
     gates.splice(0).forEach(r => r());
     await until(async () => (await db.run(cds.ql.SELECT.from(BG).columns('ID').where({ status: 'succeeded' }))).length === 6);
     expect(peak).toBe(4);
+});
+
+test('a fenced process dispatches nothing: the pending row waits for the lease holder', async () => {
+    let ran = 0;
+    registerBackgroundJobProcessor('submitContractCall', 1, declaredJobKindTraits('submitContractCall'), async () => { ran++; return {}; });
+    await db.run(cds.ql.INSERT.into(BG).entries(row('fenced-1', { status: 'pending', leaseOwner: null, startedAt: null, heartbeatAt: null })));
+    fenceBackgroundWork();
+    try {
+        await __pollOnceForTests();
+        await new Promise(r => setTimeout(r, 50));
+        expect(ran).toBe(0);
+        expect((await statusOf('fenced-1')).status).toBe('pending');
+    } finally {
+        __resetInstanceLeaseForTests();
+    }
 });

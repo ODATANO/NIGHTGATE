@@ -214,14 +214,13 @@ describe('MidnightCrawler helper paths', () => {
     it('records crawler errors without throwing back to the caller', async () => {
         const crawler = new MidnightCrawler({} as any, { enabled: true });
         const db = {
-            run: vi.fn()
-                .mockResolvedValueOnce({ consecutiveErrors: 2 })
-                .mockResolvedValueOnce(undefined)
+            run: vi.fn().mockResolvedValueOnce(undefined)
         };
 
         (crawler as any).db = db;
 
         await expect((crawler as any).recordError('x'.repeat(600))).resolves.toBeUndefined();
+        expect(db.run).toHaveBeenCalledTimes(1);
         expect(updateWhereSpy).toHaveBeenCalledWith({ ID: 'SINGLETON' });
     });
 

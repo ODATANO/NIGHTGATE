@@ -50,6 +50,15 @@ function orderedCalls(tx: any): Array<{ name: string; segId: number; guaranteed:
     return calls.sort((a, b) => a.segId - b.segId);
 }
 
+/** Call names per segment of a batch (two or more calls); undefined for a single call. */
+export function callSegments(tx: any): Array<{ segment: number; calls: string[] }> | undefined {
+    const calls = orderedCalls(tx);
+    if (calls.length < 2) return undefined;
+    const bySegment = new Map<number, string[]>();
+    for (const c of calls) bySegment.set(c.segId, [...(bySegment.get(c.segId) ?? []), c.name]);
+    return [...bySegment.entries()].map(([segment, names]) => ({ segment, calls: names }));
+}
+
 /** Ledger causality: a fallible call must not precede a guaranteed one. Reason, or null. */
 export function findCausalityViolation(tx: any): string | null {
     const calls = orderedCalls(tx);

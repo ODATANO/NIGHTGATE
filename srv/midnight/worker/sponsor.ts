@@ -6,19 +6,19 @@
 // First import on purpose: worker modules import each other in cycles, and a
 // module-level read must come from an import resolved before the cycle re-enters.
 import { configNumber, configMs } from '../../utils/config';
-import { SUBMIT_METHODS } from '../wallet-worker-protocol';
+import { throwIfRpcCancelled } from './cancellation';
+import { callSegments } from '../batch-segment-order';
 import { SponsorRefusalError } from '../submit-error-classification';
-import path from 'node:path';
 import { formatErr } from '../../utils/format-error';
 import { getSharedKeyMaterialProvider } from '../wasm-proof-provider';
 import { type MerkleProofBundle } from '../../submission/contract-witnesses';
 import { type MessagePort } from 'node:worker_threads';
 import { FacadeEntry, ensureNetworkId, facades, loadContractsSdk, loadDustCoreWallet, loadProvingSdk, loadSdk, log, resolveProvingMode, loadLedger } from './context';
 import { artifactAssetPath } from './artifacts';
-import { buildWorkerContractProviders, getOrCompileContract, submitContractCall, withFindContractQueryCache } from './contracts';
+import { buildWorkerContractProviders, getOrCompileContract, withFindContractQueryCache } from './contracts';
 import { createPrivateStateProxy } from './private-state';
-import { BALANCE_SYNC_TIMEOUT_MS, evict, getIndexerTip, waitForGenuineSync, withSessionLocks } from './facades';
-import { announceSubmitIntent, buildBuildOnlyWalletProvider, captureDustSnapshot, revertRecipeBestEffort, submitOnDedicatedClient, submitWithDustGuard, withDedicatedSubmitClient } from './submit';
+import { BALANCE_SYNC_TIMEOUT_MS, getIndexerTip, waitForGenuineSync, withSessionLocks } from './facades';
+import { announceSubmitIntent, buildBuildOnlyWalletProvider, captureDustSnapshot, revertRecipeBestEffort, submitOnDedicatedClient, submitWithDustGuard } from './submit';
 
 /** Deserialize a caller tx from base64, as bound or pre-binding. */
 export async function deserializeFinalizedTx(b64: string): Promise<{ tx: any; bytes: Uint8Array }> {
@@ -271,6 +271,7 @@ export async function acquireBacking(
 ): Promise<any> {
     const deadline = Date.now() + waitMs;
     for (; ;) {
+        throwIfRpcCancelled('dust backing wait');
         const notes = await refresh();
         const leased = tryLockBacking(sessionId, notes, needSpecks, ttlMs, skipBackings);
         if (leased) return leased;
@@ -320,7 +321,8 @@ export async function sponsorAndSubmitFinalized(sponsor: FacadeEntry, rehydrated
             txHash: String(finalized.identifiers().at(-1)),
             contractAddress: calls?.[0]?.address, circuits: calls?.map(c => c.entryPoint), sponsorAccountId: sponsor.sessionId,
             deployed: calls?.filter(c => c.entryPoint === DEPLOY_ENTRY_POINT).map(c => c.address) ?? [],
-            ttl: sponsorTtl.toISOString()
+            ttl: sponsorTtl.toISOString(),
+            segments: callSegments(finalized)
         });
     } catch (e) {
         await revertRecipeBestEffort(sponsor.facade, finalized, `${site} sponsor-intent`);
@@ -548,7 +550,8 @@ export async function sponsorUnboundTx(args: {
             txHash: String(bound.identifiers().at(-1)),
             contractAddress: calls[0]?.address, circuits: calls.map(c => c.entryPoint), note: leased.backing, sponsorAccountId: sponsor.sessionId,
             deployed: calls.filter(c => c.entryPoint === DEPLOY_ENTRY_POINT).map(c => c.address),
-            ttl: ttl.toISOString()
+            ttl: ttl.toISOString(),
+            segments: callSegments(bound)
         });
         const txId = await submitOnDedicatedClient(sponsor, bound, 'sponsor-unbound-submit');
         log('info', `sponsorUnboundTx: LANDED txHash=${String(txId).slice(0, 16)} on backing ${leased.backing}`);

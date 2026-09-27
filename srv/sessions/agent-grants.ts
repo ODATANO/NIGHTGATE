@@ -5,9 +5,8 @@
  */
 
 import cds from '@sap/cds';
-import type { Request } from '@sap/cds';
 import crypto from 'crypto';
-import { AgentGrants, WalletSessions, BackgroundJobs, Transactions, TransactionFees } from '#cds-models/midnight';
+import { AgentGrants, WalletSessions, BackgroundJobs, Transactions, TransactionFees, type WalletSession } from '#cds-models/midnight';
 import { RateLimiter } from '../utils/rate-limiter';
 import { PLATFORM_POOL_SENTINEL } from '../submission/sponsor-pool';
 import { getConfiguredFeeSponsorSessions } from '../submission/fee-sponsor';
@@ -20,6 +19,8 @@ import { configNumber } from '../utils/config';
 import { isSessionExpired } from '../utils/session-expiry';
 import { AGENT_TOKEN_HEADER, AGENT_TOKEN_TRANSPORT_USER, PUBLIC_VERIFY_TRANSPORT_USER } from '../utils/agent-token-transport';
 import { principalRateKey } from '../utils/rate-limiter';
+import type { DbRunner } from '../utils/db-types';
+import type { NightgateRequest } from '../utils/request-types';
 
 const { SELECT, INSERT, UPDATE } = cds.ql;
 
@@ -343,8 +344,8 @@ export function hashAgentToken(token: string): string {
     return crypto.createHash('sha256').update(token).digest('hex');
 }
 
-function requireUserId(req: Request): string | undefined {
-    const uid = (req as any).user?.id;
+function requireUserId(req: NightgateRequest): string | undefined {
+    const uid = req.user?.id;
     if (!uid) { req.reject?.(401, 'authentication required'); return undefined; }
     return uid as string;
 }
@@ -480,8 +481,8 @@ function parseTimestamp(raw: unknown): string | null | undefined {
 const USAGE_WINDOW_MAX_MS = 366 * 24 * 60 * 60 * 1000;
 const USAGE_WINDOW_DEFAULT_MS = 30 * 24 * 60 * 60 * 1000;
 
-export function registerAgentGrantHandlers(srv: any, db: any): void {
-    srv.on('createAgentGrant', async (req: Request) => {
+export function registerAgentGrantHandlers(srv: any, db: DbRunner): void {
+    srv.on('createAgentGrant', async (req: NightgateRequest) => {
         if (!checkGrantAdminRate(req)) return;
         const userId = requireUserId(req);
         if (!userId) return;
@@ -506,7 +507,7 @@ export function registerAgentGrantHandlers(srv: any, db: any): void {
         const { allowDeploy, maxDeploys, allowedContracts, allowedCircuits, allowedTokenTypes } = shape.values;
         const actions = shape.values.allowedActions as string[];
 
-        const session: any = await runWithoutAmbientTx(() => db.run(
+        const session: WalletSession | undefined = await runWithoutAmbientTx(() => db.run(
             SELECT.one.from(WalletSessions).where({ sessionId: data.sessionId, isActive: true, userId })
         ));
         if (!session) return req.reject(404, 'Session not found or inactive');
@@ -577,7 +578,7 @@ export function registerAgentGrantHandlers(srv: any, db: any): void {
         return { grantId: grant.ID, token, allowedActions: actions, allowedContracts, allowedCircuits, allowDeploy, maxDeploys, allowedTokenTypes, validUntil: grant.validUntil };
     });
 
-    srv.on('revokeAgentGrant', async (req: Request) => {
+    srv.on('revokeAgentGrant', async (req: NightgateRequest) => {
         if (!checkGrantAdminRate(req)) return;
         const userId = requireUserId(req);
         if (!userId) return;
@@ -594,7 +595,7 @@ export function registerAgentGrantHandlers(srv: any, db: any): void {
         return { revoked: true };
     });
 
-    srv.on('updateAgentGrant', async (req: Request) => {
+    srv.on('updateAgentGrant', async (req: NightgateRequest) => {
         if (!checkGrantAdminRate(req)) return;
         const userId = requireUserId(req);
         if (!userId) return;
@@ -634,7 +635,7 @@ export function registerAgentGrantHandlers(srv: any, db: any): void {
         return { grantId: data.grantId, updated };
     });
 
-    srv.on('rotateAgentGrantToken', async (req: Request) => {
+    srv.on('rotateAgentGrantToken', async (req: NightgateRequest) => {
         if (!checkGrantAdminRate(req)) return;
         const userId = requireUserId(req);
         if (!userId) return;
@@ -652,7 +653,7 @@ export function registerAgentGrantHandlers(srv: any, db: any): void {
         return { grantId, token };
     });
 
-    srv.on('getGrantUsage', async (req: Request) => {
+    srv.on('getGrantUsage', async (req: NightgateRequest) => {
         const userId = requireUserId(req);
         if (!userId) return;
         const data = req.data as { grantId?: string; since?: string; until?: string };
@@ -720,7 +721,7 @@ export function registerAgentGrantHandlers(srv: any, db: any): void {
     });
 }
 
-function checkGrantAdminRate(req: Request): boolean {
+function checkGrantAdminRate(req: NightgateRequest): boolean {
     const rate = grantAdminRateLimiter.check(principalRateKey(req, 'grant-admin'));
     if (rate.allowed) return true;
     req.reject(429, `Rate limited. Retry after ${Math.ceil(rate.retryAfterMs / 1000)}s`);
@@ -758,8 +759,8 @@ async function sumIndexedFees(db: Runner, hashes: string[]): Promise<string> {
 // ---- Enforcement ----------------------------------------------------------
 
 /** The token-enforcement before-hook; register it first in the service init. */
-export function attachAgentGrantEnforcement(srv: any, db: any): void {
-    srv.before('*', (req: Request) => {
+export function attachAgentGrantEnforcement(srv: any, db: DbRunner): void {
+    srv.before('*', (req: NightgateRequest) => {
         // CAP runs before-handlers in parallel, so the principal swap (after an
         // awaited lookup) is published for owner-scoping hooks to await.
         const resolution = enforceAgentGrant(req, db);
@@ -774,20 +775,20 @@ const AGENT_PRINCIPAL_READY = Symbol.for('nightgate.agentPrincipalReady');
  * Await the effective principal; every before-hook reading `req.user` calls this
  * first, since registration order does not sequence CAP's before-handlers.
  */
-export async function awaitAgentPrincipal(req: Request): Promise<void> {
+export async function awaitAgentPrincipal(req: NightgateRequest): Promise<void> {
     const ready = (req as any)[AGENT_PRINCIPAL_READY];
     if (ready) await ready;
 }
 
 /** Exported for unit tests. */
-export async function enforceAgentGrant(req: Request, db: any): Promise<unknown> {
+export async function enforceAgentGrant(req: NightgateRequest, db: DbRunner): Promise<unknown> {
     // `req.headers` merges a $batch envelope's headers into each part;
     // `_.req.headers` alone is only the synthetic part request.
-    const token = (req as any)?.headers?.[AGENT_TOKEN_HEADER] ?? (req as any)?._?.req?.headers?.[AGENT_TOKEN_HEADER];
+    const token = req?.headers?.[AGENT_TOKEN_HEADER] ?? req?._?.req?.headers?.[AGENT_TOKEN_HEADER];
     if (!token || typeof token !== 'string') {
         // Transport markers admitted a request nobody authenticated here; they
         // must never reach a handler as a user.
-        const uid = (req as any)?.user?.id;
+        const uid = req?.user?.id;
         if (uid === AGENT_TOKEN_TRANSPORT_USER) {
             return req.reject(401, 'agent token required');
         }
@@ -808,10 +809,10 @@ export async function enforceAgentGrant(req: Request, db: any): Promise<unknown>
         return req.reject(410, 'agent grant expired');
     }
 
-    const event = String((req as any).event ?? '');
+    const event = String(req.event ?? '');
     const alwaysAllowed = AGENT_ALWAYS_ALLOWED_EVENTS.has(event);
     // The handler's owner scoping alone would answer for every grant of the operator.
-    if (event === 'getGrantUsage' && String((req as any).data?.grantId ?? '') !== grant.ID) {
+    if (event === 'getGrantUsage' && String(req.data?.grantId ?? '') !== grant.ID) {
         return req.reject(404, 'Grant not found');
     }
     let allowlisted = false;
@@ -827,12 +828,12 @@ export async function enforceAgentGrant(req: Request, db: any): Promise<unknown>
     // A grant covers one session: user-scoped listings must not widen to the
     // whole operator. The owner-scoping hooks AND their userId filter on top.
     if (event === 'READ') {
-        const target = String((req as any).target?.name ?? '');
+        const target = String(req.target?.name ?? '');
         const entity = target.slice(target.lastIndexOf('.') + 1);
         if (!AGENT_READABLE_ENTITIES.has(entity)) {
             return req.reject(403, `entity '${entity}' is not readable with an agent token`);
         }
-        const query: any = (req as any).query;
+        const query: any = req.query;
         if (query?.where) {
             if (entity === 'WalletSessions' || entity === 'PendingSubmissions' || entity === 'Documents') {
                 query.where({ sessionId: grant.sessionId });
@@ -844,11 +845,11 @@ export async function enforceAgentGrant(req: Request, db: any): Promise<unknown>
 
     // The sponsoring actions are checked on the transaction's shape in the worker.
     if (allowlisted && !SPONSOR_PHASE2_ACTIONS.has(event)) {
-        const scope = grantScopeViolation(grant, (req as any).data, event);
+        const scope = grantScopeViolation(grant, req.data, event);
         if (scope) return req.reject(403, scope);
     }
 
-    const data = (req as any).data;
+    const data = req.data;
     if (data && typeof data === 'object' && event !== 'READ') {
         // Sponsoring jobs are keyed by the sponsor session, so only a
         // getJobStatus may name it; a write with it would act as the sponsor.
@@ -895,7 +896,7 @@ export async function enforceAgentGrant(req: Request, db: any): Promise<unknown>
 
     const UserCtor = (cds as any).User;
     (req as any).user = UserCtor ? new UserCtor({ id: grant.userId }) : { id: grant.userId };
-    (req as any).agentGrant = {
+    req.agentGrant = {
         ID: grant.ID, sessionId: grant.sessionId, userId: grant.userId,
         allowedContracts: parseGrantList(grant.allowedContracts),
         allowedCircuits: parseGrantList(grant.allowedCircuits),
@@ -908,7 +909,7 @@ export async function enforceAgentGrant(req: Request, db: any): Promise<unknown>
 }
 
 /** Undo one consumeDailyBudget within the same UTC day. */
-async function refundDailyBudget(db: any, grant: AgentGrantRow): Promise<void> {
+async function refundDailyBudget(db: DbRunner, grant: AgentGrantRow): Promise<void> {
     await runWithoutAmbientTx(() => db.run(
         UPDATE.entity(AgentGrants)
             .set({ jobsUsedToday: { '-=': 1 } })
@@ -920,7 +921,7 @@ async function refundDailyBudget(db: any, grant: AgentGrantRow): Promise<void> {
  * Consume one budget unit without overspend under concurrency: a window reset
  * that CASes on the old window, then a bounded increment.
  */
-async function consumeDailyBudget(db: any, grant: AgentGrantRow): Promise<boolean> {
+async function consumeDailyBudget(db: DbRunner, grant: AgentGrantRow): Promise<boolean> {
     const today = utcDay();
     const max = grant.maxJobsPerDay as number;
 

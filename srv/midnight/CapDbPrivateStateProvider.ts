@@ -5,6 +5,7 @@
  */
 
 import crypto from 'crypto';
+import { NightgateError } from '../utils/errors';
 import cds from '@sap/cds';
 const { SELECT, INSERT, UPDATE, DELETE } = cds.ql;
 import {
@@ -16,6 +17,7 @@ import {
 import { DEK_SCHEME } from '../submission/account-keys';
 import { ensureNightgateModelLoaded } from '../utils/cds-model';
 import { PrivateStates, ContractSigningKeys } from '#cds-models/midnight';
+import type { DbRunner } from '../utils/db-types';
 
 const MAX_EXPORT_STATES = 10_000;
 const MAX_EXPORT_SIGNING_KEYS = 10_000;
@@ -78,16 +80,15 @@ interface ImportSigningKeysResult {
 
 // Errors (names match SDK convention)
 
-export class ExportDecryptionError extends Error {
-    constructor() { super('Failed to decrypt export'); this.name = 'ExportDecryptionError'; }
+export class ExportDecryptionError extends NightgateError {
+    constructor() { super('PRIVATE_STATE_EXPORT_UNREADABLE', 'Failed to decrypt export'); }
 }
-export class InvalidExportFormatError extends Error {
-    constructor(msg: string) { super(msg); this.name = 'InvalidExportFormatError'; }
+export class InvalidExportFormatError extends NightgateError {
+    constructor(msg: string) { super('PRIVATE_STATE_EXPORT_INVALID', msg); }
 }
-export class ImportConflictError extends Error {
+export class ImportConflictError extends NightgateError {
     constructor(conflictCount: number) {
-        super(`Import aborted: ${conflictCount} conflict(s) detected and conflictStrategy is 'error'`);
-        this.name = 'ImportConflictError';
+        super('PRIVATE_STATE_IMPORT_CONFLICT', `Import aborted: ${conflictCount} conflict(s) detected and conflictStrategy is 'error'`);
     }
 }
 
@@ -97,7 +98,7 @@ export interface CapDbPrivateStateProviderConfig {
     privateStoragePasswordProvider: () => Promise<string> | string;
     /** Read-only passwords of older derivations; a row opened through one is rewritten under the current password. */
     privateStoragePasswordFallbacks?: () => Promise<string[]> | string[];
-    db?: any;
+    db?: DbRunner;
 }
 
 const PRIVATE_STATE_SALT_LABEL = 'nightgate-private-state-salt-v1';
@@ -115,7 +116,7 @@ export function privateStateStableSalt(accountId: string, password: string): Buf
 
 export class CapDbPrivateStateProvider<PSI extends PrivateStateId = PrivateStateId, PS = any> {
     private currentContractAddress: ContractAddress | null = null;
-    private db: cds.DatabaseService | undefined;
+    private db: DbRunner | undefined;
     private encryptionPromise: Promise<StorageEncryption> | undefined;
 
     constructor(private readonly config: CapDbPrivateStateProviderConfig) {
@@ -392,7 +393,7 @@ export class CapDbPrivateStateProvider<PSI extends PrivateStateId = PrivateState
         return this.currentContractAddress;
     }
 
-    private async getDb(): Promise<cds.DatabaseService> {
+    private async getDb(): Promise<DbRunner> {
         if (this.db) return this.db;
         await ensureNightgateModelLoaded();
         this.db = await cds.connect.to('db');

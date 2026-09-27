@@ -6,6 +6,7 @@
  */
 
 import {
+    callSegments,
     BatchCausalityError,
     findCausalityViolation,
     orderBatchSegments,
@@ -343,5 +344,18 @@ describe('withOrderedBatchSegments: grouping and the structured refusal', () => 
         ]);
         expect(err.message).toMatch(/Stages in apply order: attest=10\[f:6\.04G\] anchorContentRoot=20\[g:5\.15G\]$/);
         expect(provider.proveTx).not.toHaveBeenCalled();
+    });
+});
+
+describe('callSegments', () => {
+    const tx = (entries: Array<[number, string | null]>) => ({
+        intents: new Map(entries.map(([seg, name]) => [seg, { actions: name ? [{ entryPoint: name, guaranteedTranscript: {} }] : [] }]))
+    });
+    it('groups call names by segment and skips intents without a call', () => {
+        const segs = callSegments(tx([[2, 'bindDocument'], [1, 'attest'], [3, null]]));
+        expect(segs).toEqual([{ segment: 1, calls: ['attest'] }, { segment: 2, calls: ['bindDocument'] }]);
+    });
+    it('is undefined for a single call', () => {
+        expect(callSegments(tx([[1, 'attest']]))).toBeUndefined();
     });
 });

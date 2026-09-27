@@ -6,17 +6,16 @@
 // First import on purpose: the worker modules import each other in cycles, and a
 // module-level read must come from an import resolved before the cycle re-enters.
 import { configMs, configNumber, configFlag } from '../../utils/config';
-import path from 'node:path';
+import { rpcCancellation, throwIfRpcCancelled } from './cancellation';
 import { profileCurrentThread } from '../cpu-profile';
-import { formatErr } from '../../utils/format-error';
+import { errorName, formatErr } from '../../utils/format-error';
+import { NightgateError } from '../../utils/errors';
 import { deriveIndexerWsUrl } from '../../utils/indexer-url';
 import { getSharedKeyMaterialProvider } from '../wasm-proof-provider';
 import { deriveAttestationSecret } from '../../submission/contract-witnesses';
 import { deriveRoleSeeds } from '../../utils/wallet-hd';
 import { parentPort } from 'node:worker_threads';
 import { FacadeEntry, InitArgs, ensureNetworkId, facades, getSdkVersion, loadProvingSdk, loadSdk, log, resolveProvingMode } from './context';
-import { restoreDustFromSnapshot } from './submit';
-import { sponsorUnboundTx } from './sponsor';
 import { collapsedDustSnapshot } from './dust-collapse';
 import {
     ReplayKind, appliedIndexOf, describeSyncState, formatSyncState, lastReplayRejection,
@@ -30,13 +29,16 @@ export const BALANCE_SYNC_TIMEOUT_MS = configMs('NIGHTGATE_BALANCE_SYNC_TIMEOUT_
 export async function waitForSyncedStateBounded(entry: FacadeEntry, site: string, timeoutMs?: number): Promise<any> {
     const bound = timeoutMs && timeoutMs > 0 ? timeoutMs : BALANCE_SYNC_TIMEOUT_MS;
     let timer: ReturnType<typeof setTimeout> | undefined;
+    const cancelled = rpcCancellation(`${site} sync wait`);
     try {
         return await Promise.race([
             entry.facade.waitForSyncedState(),
-            new Promise<never>((_, rej) => { timer = setTimeout(() => rej(new Error(`${site}: sync timeout after ${bound}ms`)), bound); })
+            new Promise<never>((_, rej) => { timer = setTimeout(() => rej(new NightgateError('WALLET_NOT_SYNCED', `${site}: sync timeout after ${bound}ms`)), bound); }),
+            cancelled.promise
         ]);
     } finally {
         if (timer) clearTimeout(timer);
+        cancelled.dispose();
     }
 }
 
@@ -161,8 +163,8 @@ export async function getIndexerTip(indexerHttpUrl: string): Promise<IndexerTip>
             timestampMs: Number(b.timestamp),
             error: null
         };
-    } catch (err: any) {
-        const error = err?.name === 'TimeoutError' ? 'timeout' : String(err?.message ?? err).slice(0, 120);
+    } catch (err: unknown) {
+        const error = errorName(err) === 'TimeoutError' ? 'timeout' : formatErr(err).slice(0, 120);
         return { height: null, timestampMs: null, error };
     }
 }
@@ -267,7 +269,7 @@ export async function peekFacadeState(facade: any, timeoutMs: number): Promise<a
     } catch {
         return null;
     } finally {
-        try { sub && sub.unsubscribe(); } catch { }
+        try { sub && sub.unsubscribe(); } catch { /* already closed */ }
         if (timer) clearTimeout(timer);
     }
 }
@@ -344,6 +346,7 @@ export async function waitForGenuineSync(entry: FacadeEntry, timeoutMs: number, 
     };
 
     while (Date.now() < deadline) {
+        throwIfRpcCancelled(`${label} sync wait`);
         const tip = await getIndexerTip(indexerHttpUrl);
         // Non-blocking state() observable: it emits the current state immediately.
         let state: any;
@@ -362,14 +365,14 @@ export async function waitForGenuineSync(entry: FacadeEntry, timeoutMs: number, 
             peekFailed = true;
         } finally {
             // Release on every path: on a stalled indexer the timeout wins each poll.
-            try { sub && sub.unsubscribe(); } catch { }
+            try { sub && sub.unsubscribe(); } catch { /* already closed */ }
             if (peekTimer) clearTimeout(peekTimer);
         }
         if (peekFailed) {
             // An unreadable state counts as no progress for the stall bound.
             if (stallMs > 0 && Date.now() - lastProgressAt > stallMs) {
                 const last = syncProgress.get(sessionId);
-                throw new Error(`wallet sync stalled: no progress for ${Math.round((Date.now() - lastProgressAt) / 60_000)} min and the wallet state is not readable (state peek timed out or failed on every poll; last snapshot: dust appliedIndex=${last?.appliedIndex ?? lastApplied}, streamTip=${last?.streamTip ?? lastHighest}, isConnected=${last?.isConnected ?? '?'}, elapsed=${Math.round((Date.now() - startedAt) / 1000)}s)`);
+                throw new NightgateError('WALLET_NOT_SYNCED', `wallet sync stalled: no progress for ${Math.round((Date.now() - lastProgressAt) / 60_000)} min and the wallet state is not readable (state peek timed out or failed on every poll; last snapshot: dust appliedIndex=${last?.appliedIndex ?? lastApplied}, streamTip=${last?.streamTip ?? lastHighest}, isConnected=${last?.isConnected ?? '?'}, elapsed=${Math.round((Date.now() - startedAt) / 1000)}s)`);
             }
             await wsleep(SYNC_POLL_MS);
             continue;
@@ -396,7 +399,7 @@ export async function waitForGenuineSync(entry: FacadeEntry, timeoutMs: number, 
         if (stallMs > 0 && Date.now() - lastProgressAt > stallMs) {
             pushSyncProgress(snapshot);
             const behind = snapshot.behindEvents ?? '?';
-            throw new Error(`wallet sync stalled: no progress for ${Math.round((Date.now() - lastProgressAt) / 60_000)} min (dust appliedIndex stuck at ${applied}, streamTip=${highest}, ${behind} events behind, blockHeight=${tip.height}, isConnected=${connected}, indexerFresh=${fresh}, elapsed=${Math.round(snapshot.elapsedMs / 1000)}s)`);
+            throw new NightgateError('WALLET_NOT_SYNCED', `wallet sync stalled: no progress for ${Math.round((Date.now() - lastProgressAt) / 60_000)} min (dust appliedIndex stuck at ${applied}, streamTip=${highest}, ${behind} events behind, blockHeight=${tip.height}, isConnected=${connected}, indexerFresh=${fresh}, elapsed=${Math.round(snapshot.elapsedMs / 1000)}s)`);
         }
         // INFO: without it a long catch-up is indistinguishable from a hang.
         if (Date.now() - lastLog > SYNC_PROGRESS_LOG_MS) {
@@ -412,7 +415,7 @@ export async function waitForGenuineSync(entry: FacadeEntry, timeoutMs: number, 
     const behind = lastHighest >= 0n && lastApplied >= 0n ? (lastHighest - lastApplied).toString() : '?';
     // The last snapshot stays in `syncProgress` so a caller can tell slow from stalled.
     const rate = syncProgress.get(sessionId)?.eventsPerSecond;
-    throw new Error(`wallet not synced to tip after ${timeoutMs}ms (absolute ceiling): still ${behind} events behind at ${rate != null ? rate.toFixed(1) : '?'} events/s, dust appliedIndex=${lastApplied} streamTip=${lastHighest}, blockHeight=${tip.height}; the sync was moving (no stall detected), raise NIGHTGATE_PREWARM_SYNC_TIMEOUT_MS or wait for a quieter machine`);
+    throw new NightgateError('WALLET_NOT_SYNCED', `wallet not synced to tip after ${timeoutMs}ms (absolute ceiling): still ${behind} events behind at ${rate != null ? rate.toFixed(1) : '?'} events/s, dust appliedIndex=${lastApplied} streamTip=${lastHighest}, blockHeight=${tip.height}; the sync was moving (no stall detected), raise NIGHTGATE_PREWARM_SYNC_TIMEOUT_MS or wait for a quieter machine`);
 }
 
 // ---- Facade construction --------------------------------------------------
@@ -803,7 +806,7 @@ export function startPeriodicSave(sessionId: string, entry: FacadeEntry): void {
             }
             const seq = pushStateSave(sessionId, entry, changed);
             log('debug', `save-tick #${tickCount} pushed seq=${seq} (total ${Date.now() - tickStart}ms)`);
-        } catch (err: any) {
+        } catch (err: unknown) {
             log('warn', `periodic save failed: ${formatErr(err)}`);
         }
     }, intervalMs);
@@ -961,7 +964,7 @@ async function zeroEntry(entry: FacadeEntry, sessionId: string): Promise<void> {
         entry.zswapKeys?.clear?.();
         entry.dustKey?.clear?.();
         entry.unshieldedKeystore?.clear?.();
-        try { entry.attestationSecret?.fill?.(0); } catch { }
+        try { entry.attestationSecret?.fill?.(0); } catch { /* not a buffer */ }
         await entry.facade?.stop?.();
     } catch (err) {
         log('warn', `evict cleanup failed for ${sessionId.slice(0, 16)}: ${formatErr(err)}`);

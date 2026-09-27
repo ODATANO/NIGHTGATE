@@ -10,6 +10,7 @@ import {
     sponsorCandidatesNonExclusive, isPreInclusionReject, isAmbiguousSubmitOutcome, isCallNotAppliedFailure, decideSponsorFailure
 } from '../../srv/submission/sponsor-pool';
 import { WorkerSubmitError } from '../../srv/midnight/wallet-worker-protocol';
+import { NightgateError } from '../../srv/utils/errors';
 
 const POOL = ['sp-a', 'sp-b', 'sp-c'];
 
@@ -204,5 +205,14 @@ describe('decideSponsorFailure (one table for both sponsoring channels)', () => 
         expect(decideSponsorFailure(gone).decision).toBe('failover');
         expect(decideSponsorFailure(new Error("refusing to sponsor: circuit 'x' is not sponsorable")).decision).toBe('fail');
         expect(decideSponsorFailure(new Error('finalized-tx round-trip FAILED at deserialize')).decision).toBe('fail');
+    });
+});
+
+describe('coded sponsor-health failures', () => {
+    it('an unsynced sponsor fails over and nothing was sent', () => {
+        // As it arrives from the worker: the classification plus the coded error as cause.
+        const err = new WorkerSubmitError({ name: 'NightgateError', message: 'wallet sync stalled (state peek timed out)', code: 'transport', ledgerCode: 'wallet-not-synced', retryable: true });
+        err.cause = new NightgateError('WALLET_NOT_SYNCED', 'wallet sync stalled (state peek timed out)');
+        expect(decideSponsorFailure(err)).toEqual({ decision: 'failover', generic: false, preInclusion: true });
     });
 });
