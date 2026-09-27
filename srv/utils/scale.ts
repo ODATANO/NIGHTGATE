@@ -154,8 +154,10 @@ function parseExtrinsicCore(hex: string): ParsedExtrinsicCore | null {
         offset++;
         if (sigType !== 0x00 && sigType !== 0x01 && sigType !== 0x02) return null;
 
-        if (offset + 64 > buf.length) return null;
-        offset += 64;
+        // Ed25519 / Sr25519 signatures are 64 bytes, ECDSA 65.
+        const sigLength = sigType === 0x02 ? 65 : 64;
+        if (offset + sigLength > buf.length) return null;
+        offset += sigLength;
 
         if (offset >= buf.length) return null;
         if (buf[offset] === 0x00) {

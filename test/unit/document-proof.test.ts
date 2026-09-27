@@ -454,6 +454,13 @@ describe('attestAgentOutput handler', () => {
         });
     });
 
+    it("records the anchor job under the caller's agent grant", async () => {
+        const req = makeReq(VALID);
+        (req as any).agentGrant = { ID: 'grant-9', sessionId: 'sess-1' };
+        await handlers.attestAgentOutput(req);
+        expect(sendSpy.mock.calls[0][0].agentGrant).toEqual({ ID: 'grant-9', sessionId: 'sess-1' });
+    });
+
     it('defaults producedAt to now and keeps the envelope stable otherwise', async () => {
         const before = Date.now();
         const req = makeReq(VALID);

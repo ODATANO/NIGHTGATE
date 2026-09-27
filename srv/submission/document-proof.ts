@@ -596,8 +596,10 @@ export function registerDocumentProofHandlers(srv: any, deps: DocumentProofHandl
                     idempotencyKey: data.idempotencyKey,
                     sponsorSessionId: data.sponsorSessionId
                 },
-                user: (req as any).user
-            });
+                user: (req as any).user,
+                // Checked on this request already; the anchor job is recorded under the same grant.
+                agentGrant: (req as any).agentGrant
+            } as any);
             return { ...anchored, payloadHash, envelopeJson };
         } catch (err: any) {
             const status = Number(err?.code ?? err?.status);

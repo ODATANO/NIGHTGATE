@@ -40,3 +40,21 @@ describe('sponsorAtSyncGate', () => {
         expect(syncGateReading(progress.get('acct-1')).reason).toMatch(/sync reading is \d+s old/);
     });
 });
+
+describe('syncGateReading', () => {
+    const at = { caughtUp: false, behindEvents: '0', appliedIndex: '5', streamTip: '5', indexerFresh: false };
+
+    it('names an unreachable indexer', () => {
+        const r = syncGateReading({ ...at, indexerError: 'HTTP 403', updatedAt: new Date().toISOString() });
+        expect(r.reason).toMatch(/indexer unreachable \(HTTP 403\)/);
+    });
+
+    it('names the age of a lagging indexer', () => {
+        const r = syncGateReading({ ...at, indexerTipAgeMs: 420_000, indexerError: null, updatedAt: new Date().toISOString() });
+        expect(r.reason).toMatch(/indexer's newest block is 420s old/);
+    });
+
+    it('keeps the generic wording for a reading without either', () => {
+        expect(syncGateReading({ ...at, updatedAt: new Date().toISOString() }).reason).toMatch(/indexer not fresh/);
+    });
+});

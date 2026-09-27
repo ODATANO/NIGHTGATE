@@ -237,6 +237,7 @@ export async function startJob<TIn, TOut>(
         cds.context ? (db as any).tx(cds.context) : undefined;
     const reader = pinnedRunner ?? db;
 
+    if (idempotencyKey && idempotencyKey.length > IDEMPOTENCY_KEY_MAX_LENGTH) throw new IdempotencyKeyInvalidError();
     // Fast path only: in-flight same-key rows are caught by the constraint below.
     if (idempotencyKey) {
         const dup = await dedupExisting<TIn, TOut>(reader, sessionId, kind, idempotencyKey, payloadFingerprint);
@@ -1320,11 +1321,16 @@ export async function confirmChainOutcomesViaIndexer(existingDb?: any): Promise<
     let generation = await readReorgGeneration(db);
     for (const job of reconcilePage.rows) {
         let outcome: ChainLookup;
-        try { outcome = await confirmer(job.txHash!); } catch { continue; }
+        try { outcome = await confirmer(job.txHash!); } catch (err) {
+            cds.log('nightgate').debug(`Reconciliation lookup for ${job.kind} job ${job.ID} deferred: ${String((err as Error)?.message ?? err)}`);
+            continue;
+        }
         if (!isChainOutcome(outcome)) {
             // Only absence is evidence; an indexed-but-unconfirmable tx may be on chain.
             if (isChainAbsent(outcome)) {
-                try { updated += await finalizeLostBroadcast(db, job, outcome.asOfMs, generation); } catch { /* next pass */ }
+                try { updated += await finalizeLostBroadcast(db, job, outcome.asOfMs, generation); } catch (err) {
+                    cds.log('nightgate').debug(`Lost-broadcast finalization of ${job.kind} job ${job.ID} deferred: ${String((err as Error)?.message ?? err)}`);
+                }
             }
             continue;
         }
@@ -1426,7 +1432,21 @@ const STATUS_WRITE_ATTEMPTS = LOCK_CONTENTION_ATTEMPTS;
 
 export { REJECTED_ATTEMPT_BOOKKEEPING_PENDING, SponsorAttemptBookkeepingPendingError } from './job-execution-context';
 
-/** Admission refused on a busy database: nothing written or submitted, the caller may resend (503). */
+/** The `BackgroundJobs.idempotencyKey` column width. */
+export const IDEMPOTENCY_KEY_MAX_LENGTH = 128;
+
+/** A key longer than the column: refused before anything is written (400). */
+export class IdempotencyKeyInvalidError extends Error {
+    readonly httpStatus = 400;
+    readonly status = 400;
+    readonly statusCode = 400;
+    readonly code = 'IDEMPOTENCY_KEY_INVALID';
+    constructor() {
+        super(`idempotencyKey must be at most ${IDEMPOTENCY_KEY_MAX_LENGTH} characters`);
+        this.name = 'IdempotencyKeyInvalidError';
+    }
+}
+
 /** An idempotency key reused with a different payload: the caller's error, never retryable as is. */
 export class IdempotencyConflictError extends Error {
     readonly httpStatus = 409;
@@ -1440,6 +1460,7 @@ export class IdempotencyConflictError extends Error {
     }
 }
 
+/** Admission refused on a busy database: nothing written or submitted, the caller may resend (503). */
 export class JobAdmissionBusyError extends Error {
     readonly httpStatus = 503;
     // CAP reads `status`/`statusCode`, not `httpStatus`; some actions return startJob's promise to CAP directly.

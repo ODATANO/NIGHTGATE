@@ -5,7 +5,7 @@ import { describe, it, expect } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { profileCurrentThread, heapFigures } from '../../srv/midnight/cpu-profile';
+import { profileCurrentThread, heapFigures, resolveProfileDir, PROFILE_ROOT } from '../../srv/midnight/cpu-profile';
 
 describe('profileCurrentThread', () => {
     it('samples the current thread, attributes busy time, reports heap and gc, writes the raw profile', async () => {
@@ -45,5 +45,20 @@ describe('profileCurrentThread', () => {
         const h = heapFigures();
         for (const v of Object.values(h)) expect(Number.isInteger(v)).toBe(true);
         expect(h.limitMb).toBeGreaterThan(h.usedMb);
+    });
+});
+
+describe('resolveProfileDir', () => {
+    it('keeps profiles inside the profile root', () => {
+        expect(resolveProfileDir(undefined)).toBe(PROFILE_ROOT);
+        expect(resolveProfileDir('  ')).toBe(PROFILE_ROOT);
+        expect(resolveProfileDir('run-1')).toBe(path.join(PROFILE_ROOT, 'run-1'));
+        expect(resolveProfileDir('a/b')).toBe(path.join(PROFILE_ROOT, 'a', 'b'));
+    });
+
+    it('refuses a folder outside it', () => {
+        expect(resolveProfileDir('../escape')).toBeNull();
+        expect(resolveProfileDir(os.homedir())).toBeNull();
+        expect(resolveProfileDir(path.join(PROFILE_ROOT, '..', 'nightgate-profiles-evil'))).toBeNull();
     });
 });

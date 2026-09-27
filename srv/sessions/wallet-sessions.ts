@@ -288,8 +288,10 @@ async function loadSigningSessionAccountId(
 }
 
 /**
- * Any live session of this user on this wallet. Callers MUST deactivate their
- * own rows first, so "any live row" means another live session.
+ * A live session that keeps this wallet's facade: one of this user's, or
+ * another user's that holds the signing key. A viewing-only session of another
+ * user never keeps the owner's keys warm. Callers MUST deactivate their own
+ * rows first, so "any live row" means another live session.
  */
 async function hasLiveSessionForWallet(
     db: any,
@@ -298,14 +300,13 @@ async function hasLiveSessionForWallet(
 ): Promise<boolean> {
     if (!viewingKeyHash || !userId) return false;
     // Expiry decided in JS, not SQL: SQL does not know that platform sponsors never expire.
-    // Same user only: another user's session must not keep the owner's keys warm.
     const rows: any = await runWithoutAmbientTx(() => db.run(
         SELECT.from(WalletSessions)
-            .columns('sessionId', 'expiresAt')
-            .where({ viewingKeyHash, userId, isActive: true })
+            .columns('sessionId', 'expiresAt', 'userId', 'encryptedSeedKey')
+            .where({ viewingKeyHash, isActive: true })
     ));
     if (!Array.isArray(rows)) return false;
-    return rows.some((r: any) => !isSessionExpired(r.sessionId, r.expiresAt));
+    return rows.some((r: any) => (r.userId === userId || !!r.encryptedSeedKey) && !isSessionExpired(r.sessionId, r.expiresAt));
 }
 
 /**
@@ -324,7 +325,7 @@ async function evictFacadeUnlessShared(
         const accountId = deriveAccountId(viewingKey);
         await withKeyedLock(accountId, async () => {
             if (session.viewingKeyHash && await hasLiveSessionForWallet(db, session.viewingKeyHash, session.userId)) {
-                log.info(`${context}: keeping facade ${accountId.slice(0, 16)} (another active session of this user uses this wallet)`);
+                log.info(`${context}: keeping facade ${accountId.slice(0, 16)} (another active session keeps this wallet)`);
                 return;
             }
             log.info(`${context}: evicting facade ${accountId.slice(0, 16)}`);
@@ -997,7 +998,7 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
                 known: false, caughtUp: false,
                 appliedIndex: null, streamTip: null, behindEvents: null,
                 eventsPerSecond: null, etaSeconds: null, blockHeight: null,
-                isConnected: false, indexerFresh: false,
+                isConnected: false, indexerFresh: false, indexerTipAgeSeconds: null, indexerError: null,
                 elapsedMs: null, phase: null, updatedAt: null,
                 lastProgressAt: null, staleSeconds: null, stale: false,
                 jobId: prewarmJob?.ID ?? null, jobStatus: prewarmJob?.status ?? null,
@@ -1017,6 +1018,8 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: a
             blockHeight: p.blockHeight,
             isConnected: p.isConnected,
             indexerFresh: p.indexerFresh,
+            indexerTipAgeSeconds: p.indexerTipAgeMs != null ? Math.round(p.indexerTipAgeMs / 1000) : null,
+            indexerError: p.indexerError ?? null,
             elapsedMs: p.elapsedMs,
             phase: p.label,
             updatedAt: p.updatedAt,

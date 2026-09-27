@@ -315,6 +315,20 @@ beforeEach(() => {
 // ---- startJob: insert + spawn + transitions --------------------------------
 
 describe('startJob: insert row + return jobId', () => {
+    test('refuses an idempotency key longer than the column before writing anything', async () => {
+        registerBackgroundJobProcessor('keyedKind', 1, LIGHT_KIND, async () => ({ ok: true }));
+        const before = rows.size;
+        await expect(startJob({
+            kind: 'keyedKind', sessionId: 'sess-1', requestedBy: 'alice', idempotencyKey: 'k'.repeat(129),
+            request: {}, commandVersion: 1, command: { op: 'x' }
+        })).rejects.toMatchObject({ status: 400, code: 'IDEMPOTENCY_KEY_INVALID' });
+        expect(rows.size).toBe(before);
+        await expect(startJob({
+            kind: 'keyedKind', sessionId: 'sess-1', requestedBy: 'alice', idempotencyKey: 'k'.repeat(128),
+            request: {}, commandVersion: 1, command: { op: 'x' }
+        })).resolves.toMatchObject({ jobId: expect.any(String) });
+    });
+
     test('stamps the agent grant on the row and hands it down to child jobs; other principals leave it null', async () => {
         registerBackgroundJobProcessor('grantedKind', 1, LIGHT_KIND, async () => ({ ok: true }));
         const granted = await startJob({

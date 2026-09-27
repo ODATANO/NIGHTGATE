@@ -180,6 +180,17 @@ describe('wallet-worker-client', () => {
             expect(getWalletWorkerStatus().rotationCount).toBe(1);
         });
 
+        it("a stopped worker's rotation announcement does not turn the next worker's crash into a rotation", async () => {
+            const w1 = await startWithResponder(() => undefined);
+            w1.emit('message', { kind: 'rotating', generations: 32, inflight: 1 });
+            await stopWalletWorker(10);
+            const w2 = await startWithResponder(() => undefined);
+            expect(w2).not.toBe(w1);
+            w2.emit('exit', 1);
+            expect(getWalletWorkerStatus().rotationCount).toBe(0);
+            expect(getWalletWorkerStatus().exitCount).toBe(1);
+        });
+
         it('rotation-done: the client terminates the worker; a read cut in flight is repeated once, a submit is not', async () => {
             defaultResponder = (msg) => ({ ok: true, result: msg.method === 'getBalance' ? { balance: 'fresh' } : { txId: 'never' } });
             const w1 = await startWithResponder(() => undefined); // never answers: both calls stay in flight
@@ -256,6 +267,14 @@ describe('wallet-worker-client', () => {
             expect(err).toBeInstanceOf(WorkerSubmitError);
             expect(err).toMatchObject({ name: 'Error', code: 'dust-race', ledgerCode: '1010/196', retryable: true, causes: ['1010: Custom error: 196'], calls });
             expect(err.message).toMatch(/Custom error: 196/);
+        });
+
+        it('settles at once and drops its entry when the message cannot be posted', async () => {
+            const w = await startWithResponder(() => undefined);
+            w.postMessage = () => { throw new Error('could not be cloned'); };
+            await expect(walletEvict('s1')).rejects.toThrow('could not be cloned');
+            await new Promise(r => setImmediate(r));
+            expect(getWalletWorkerStatus().inFlightRpcs).toBe(0);
         });
 
         it('an unknown code is not a classification: plain Error', async () => {

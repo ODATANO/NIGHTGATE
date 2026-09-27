@@ -18,7 +18,14 @@ function syncReadingMaxAgeMs(): number {
 export type SyncReading = {
     caughtUp?: boolean; updatedAt?: string; appliedIndex?: string; streamTip?: string;
     behindEvents?: string | null; indexerFresh?: boolean; isConnected?: boolean;
+    indexerTipAgeMs?: number | null; indexerError?: string | null;
 } | null;
+
+function staleIndexerDetail(p: NonNullable<SyncReading>): string {
+    if (p.indexerError) return `indexer unreachable (${p.indexerError})`;
+    if (p.indexerTipAgeMs != null) return `indexer's newest block is ${Math.round(p.indexerTipAgeMs / 1000)}s old`;
+    return 'indexer not fresh';
+}
 
 export function syncGateReading(p: SyncReading, now: number = Date.now()): { caughtUp: boolean; reason: string | null } {
     if (!p) return { caughtUp: false, reason: 'sponsor wallet has not reported its sync state yet' };
@@ -30,7 +37,7 @@ export function syncGateReading(p: SyncReading, now: number = Date.now()): { cau
     if (p.caughtUp === true) return { caughtUp: true, reason: null };
     const details = [`appliedIndex ${p.appliedIndex ?? '?'}`, `stream tip ${p.streamTip ?? '?'}`];
     if (p.isConnected === false) details.push('not connected');
-    if (p.indexerFresh === false) details.push('indexer not fresh');
+    if (p.indexerFresh === false) details.push(staleIndexerDetail(p));
     return { caughtUp: false, reason: `sponsor wallet is not at the sync gate: ${p.behindEvents ?? '?'} events behind (${details.join(', ')})` };
 }
 

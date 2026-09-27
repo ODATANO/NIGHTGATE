@@ -793,9 +793,9 @@ export class MidnightCrawler {
             currentHash = prevHeader.parentHash;
             height--;
 
+            // An unverified height would roll back to a point that may still be on the old fork.
             if (MidnightNodeProvider.parseBlockNumber(header.number) - height > 100) {
-                log.error('Reorg depth > 100 blocks, stopping search');
-                return height;
+                throw new Error(`Reorg deeper than 100 blocks below ${header.number}: no common ancestor found, refusing to roll back to an unverified height`);
             }
         }
 

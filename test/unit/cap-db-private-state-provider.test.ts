@@ -207,14 +207,22 @@ describe('CapDbPrivateStateProvider: CRUD', () => {
         expect(await provider.get('counter')).toBeNull();
     });
 
-    test('clear removes all private states for the account', async () => {
+    test('clear removes the private states of the current contract only', async () => {
         const { provider, db } = newProvider();
         provider.setContractAddress(CONTRACT);
         await provider.set('a', { x: 1 });
         provider.setContractAddress(CONTRACT_B);
         await provider.set('b', { y: 2 });
         await provider.clear();
-        expect(db.tables['midnight.PrivateStates'].filter(r => r.accountId === ACCOUNT)).toEqual([]);
+        const left = db.tables['midnight.PrivateStates'].filter(r => r.accountId === ACCOUNT);
+        expect(left.map(r => r.privateStateId)).toEqual(['a']);
+        provider.setContractAddress(CONTRACT);
+        expect(await provider.get('a')).toEqual({ x: 1 });
+    });
+
+    test('clear needs a contract address like the other state operations', async () => {
+        const { provider } = newProvider();
+        await expect(provider.clear()).rejects.toThrow(/setContractAddress/);
     });
 
     test('throws when contract address is not set before state operations', async () => {

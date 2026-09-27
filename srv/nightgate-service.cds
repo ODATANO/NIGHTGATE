@@ -855,6 +855,8 @@ service NightgateService {
         blockHeight          : String; // indexer block height
         isConnected          : Boolean;
         indexerFresh         : Boolean; // indexer tip recent enough to count as tip
+        indexerTipAgeSeconds : Integer; // age of the indexer's newest block; null if the read failed
+        indexerError         : String; // why the indexer tip could not be read ('HTTP 403', 'timeout', ...)
         elapsedMs            : Integer; // duration of the current sync wait
         phase                : String; // 'prewarm' | 'balance' | ...
         updatedAt            : Timestamp; // last worker report

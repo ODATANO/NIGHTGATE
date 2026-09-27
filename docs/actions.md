@@ -18,7 +18,7 @@ remove an action, a patch release never does; a removal is marked
 
 ## Async job model (write actions)
 
-Every submitting action returns `{ jobId, status: "pending" }`; poll `getJobStatus(jobId, sessionId)` until `succeeded` or `failed`. A reused `idempotencyKey` returns the existing job; the same key with a different payload answers 409 `IDEMPOTENCY_KEY_CONFLICT`. Each write action lists its job-result shape (the parsed `result`); functions return their result directly.
+Every submitting action returns `{ jobId, status: "pending" }`; poll `getJobStatus(jobId, sessionId)` until `succeeded` or `failed`. A reused `idempotencyKey` returns the existing job; the same key with a different payload answers 409 `IDEMPOTENCY_KEY_CONFLICT`, a key over 128 characters 400 `IDEMPOTENCY_KEY_INVALID`. Each write action lists its job-result shape (the parsed `result`); functions return their result directly.
 
 ### `getJobStatus(jobId, sessionId) → { status, chainStatus, result, errorCode, errorMessage, submissionId, txHash, chainFinalizedAt, chainBlockHeight, chainBlockHash, … }`
 
@@ -700,12 +700,12 @@ Response:
 ]
 ```
 
-### `getWalletSyncProgress(sessionId) → { known, caughtUp, appliedIndex, streamTip, behindEvents, eventsPerSecond, etaSeconds, blockHeight, isConnected, indexerFresh, elapsedMs, phase, updatedAt, lastProgressAt, staleSeconds, stale, jobId, jobStatus, restoredFromSnapshot, snapshotSavedAt, facadeBuiltAt }`
+### `getWalletSyncProgress(sessionId) → { known, caughtUp, appliedIndex, streamTip, behindEvents, eventsPerSecond, etaSeconds, blockHeight, isConnected, indexerFresh, indexerTipAgeSeconds, indexerError, elapsedMs, phase, updatedAt, lastProgressAt, staleSeconds, stale, jobId, jobStatus, restoredFromSnapshot, snapshotSavedAt, facadeBuiltAt }`
 
 Wallet catch-up progress, from a snapshot the worker pushes about every 15 s (cheap to poll during a sync; also logged at INFO under `nightgate:worker` as `genuine-sync [<phase>] ... rate=... eta=...`).
 
 - `appliedIndex`, `streamTip`, `behindEvents`: dust ledger events (not blocks), decimal strings. `etaSeconds`: order of magnitude. `known: false`: nothing reported yet.
-- Healthy: `appliedIndex` climbs, `eventsPerSecond` > 0. Stuck: `appliedIndex` unchanged while `elapsedMs` grows, or `isConnected: false`. `indexerFresh: false`: the indexer lags, its tip is not chain tip.
+- Healthy: `appliedIndex` climbs, `eventsPerSecond` > 0. Stuck: `appliedIndex` unchanged while `elapsedMs` grows, or `isConnected: false`. `indexerFresh: false`: the indexer lags (`indexerTipAgeSeconds` above `NIGHTGATE_SYNC_FRESHNESS_MS`) or its tip read failed (`indexerError`, e.g. `HTTP 403`).
 - `staleSeconds`: snapshot age; `stale` past `NIGHTGATE_SYNC_PROGRESS_STALE_S` (default 60 s) means nobody is syncing. `jobId`/`jobStatus`: latest prewarm job. `lastProgressAt`: last advance of `appliedIndex`. The prewarm fails after `NIGHTGATE_PREWARM_STALL_MS` (default 10 min) without progress, or at `NIGHTGATE_PREWARM_SYNC_TIMEOUT_MS` (default 12 h).
 - Sync state is persisted per account (`WalletSyncStates`); a reconnect applies only the delta, a wallet without snapshot syncs from zero. `restoredFromSnapshot` (false = cold start), `snapshotSavedAt`, `facadeBuildStartedAt`, `facadeBuiltAt` (null while deserializing, which takes minutes for a large dust state); all null while nothing is built. Logged under `nightgate:facade` (`sync state RESTORED from snapshot ...`, `COLD START`, `built in Ns`).
 
@@ -812,7 +812,7 @@ Last `limit` (default 10, max 100) reorg events with depth, detected-at timestam
 
 `listContracts() → [{ name, source, ..., artifactDigest, hasProverKeys }]`: every known contract, `source` `config` or `runtime`.
 
-`profileWorker(seconds?, dir?, thread?) → { thread, seconds, file, facadeCount, sampledMs, idlePercent, gcPercent, wasmPercent, topFunctions[], topFiles[], topInclusive[], heapBefore, heapAfter, gc }`: CPU profile of the wallet worker (`thread: 'worker'`, default) or the main thread (`'main'`) for `seconds` (1..120, default 20) while it keeps serving. Returns self time by function and file, inclusive hot paths, idle/GC/wasm shares, heap figures before and after, and GC counts (`gc.byKind` as JSON). The `.cpuprofile` is written under `dir` (default: OS temp dir, `nightgate-profiles/`). The request waits `seconds + 60 s`. A warm facade at tip idles above 90 %, GC under 10 %.
+`profileWorker(seconds?, dir?, thread?) → { thread, seconds, file, facadeCount, sampledMs, idlePercent, gcPercent, wasmPercent, topFunctions[], topFiles[], topInclusive[], heapBefore, heapAfter, gc }`: CPU profile of the wallet worker (`thread: 'worker'`, default) or the main thread (`'main'`) for `seconds` (1..120, default 20) while it keeps serving. Returns self time by function and file, inclusive hot paths, idle/GC/wasm shares, heap figures before and after, and GC counts (`gc.byKind` as JSON). The `.cpuprofile` is written to `nightgate-profiles/` in the OS temp dir, or to a folder `dir` inside it (a path outside it is a 400). The request waits `seconds + 60 s`. A warm facade at tip idles above 90 %, GC under 10 %.
 
 `grantRole(userId, role, scope?, validUntil?)`: grant an off-chain disclosure tier (`public_only` | `legitimate_interest` | `authority`, table `DisclosureRoles`), read by the `AttestationService` middleware `attachDisclosureRole`. The caller must hold `authority`.
 

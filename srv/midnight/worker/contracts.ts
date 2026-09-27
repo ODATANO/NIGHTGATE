@@ -143,7 +143,8 @@ export function buildWorkerContractProviders(args: {
 // the SDK checks verifier keys against it (maintenance txs can rotate them)
 // and calls must build transcripts on fresh state.
 export const FIND_CONTRACT_CACHED_METHODS = new Set(['watchForDeployTxData', 'queryDeployContractState']);
-export const findContractQueryCache = new Map<string, Promise<unknown>>();
+// Bounded: one entry per contract and method, and the worker may live for months.
+export const findContractQueryCache = new BoundedCache<string, Promise<unknown>>(256);
 
 export function withFindContractQueryCache(publicDataProvider: any, indexerHttpUrl: string): any {
     return new Proxy(publicDataProvider, {

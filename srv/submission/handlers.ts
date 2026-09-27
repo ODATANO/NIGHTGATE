@@ -43,7 +43,7 @@ import {
     deriveRawTokenType, TokenTypeError,
     SHIELDED_TEST_TOKEN_REF, SHIELDED_TEST_TOKEN_CIRCUIT, SHIELDED_TEST_TOKEN_AMOUNT
 } from './token-type';
-import { startJob, JobAdmissionBusyError, IdempotencyConflictError, runChildCommand, registerBackgroundJobProcessor, registerBackgroundJobReconciliationFinalizer, withLockContentionRetry, SponsorAttemptBookkeepingPendingError, WorkflowReconciliationRequiredError, type BackgroundJobRow, type ReconciliationEvidence } from './background-jobs';
+import { startJob, JobAdmissionBusyError, IdempotencyConflictError, IdempotencyKeyInvalidError, runChildCommand, registerBackgroundJobProcessor, registerBackgroundJobReconciliationFinalizer, withLockContentionRetry, SponsorAttemptBookkeepingPendingError, WorkflowReconciliationRequiredError, type BackgroundJobRow, type ReconciliationEvidence } from './background-jobs';
 import { reportSubmissionRejectedOn, reportBroadcastOn } from './job-execution-context';
 import { declaredJobKindTraits } from './job-kinds';
 import { reindexDisclosuresForContract } from './disclosure-indexer';
@@ -3101,7 +3101,7 @@ export function registerSubmissionHandlers(
             // a request the chain has not accepted never widens what the grantee reads.
             const insertedAt = new Date().toISOString();
             const existingGrant: any = await db.run(
-                SELECT.one.from(DisclosureGrants).columns('ID').where({
+                SELECT.one.from(DisclosureGrants).columns('ID', 'pendingLevel').where({
                     contractAddress: contractAddressLc,
                     attesterId,
                     payloadHash: payloadHashLc,
@@ -3165,6 +3165,13 @@ export function registerSubmissionHandlers(
                     await db.run(DELETE.from(DisclosureGrants).where({ ID: disclosureGrantId }));
                 }
                 throw err;
+            }
+
+            // A replay starts no job, so nothing would clear the pendingLevel set above.
+            if (job.deduplicated && existingGrant) {
+                await db.run(UPDATE.entity(DisclosureGrants)
+                    .set({ pendingLevel: existingGrant.pendingLevel ?? null })
+                    .where({ ID: disclosureGrantId, pendingLevel: levelNum }));
             }
 
             return { jobId: job.jobId, status: job.status, disclosureGrantId };
@@ -3781,7 +3788,7 @@ async function runSubmission(req: Request, op: () => Promise<unknown>): Promise<
             // No signing material: the caller must run connectWalletForSigning first.
             return req.reject(501, err.message);
         }
-        if (err instanceof IdempotencyConflictError) {
+        if (err instanceof IdempotencyConflictError || err instanceof IdempotencyKeyInvalidError) {
             return req.reject({ status: err.httpStatus, code: err.code, message: err.message } as any);
         }
         if (err instanceof JobAdmissionBusyError) {

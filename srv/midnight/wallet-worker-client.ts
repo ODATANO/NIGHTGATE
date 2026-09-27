@@ -55,6 +55,8 @@ export interface WalletSyncProgress {
     blockHeight: string | null;
     isConnected: boolean;
     indexerFresh: boolean;
+    indexerTipAgeMs?: number | null;
+    indexerError?: string | null;
     caughtUp: boolean;
     elapsedMs: number;
     label: string;
@@ -91,7 +93,8 @@ let workerExitCount = 0;
 let lastExitCode: number | null = null;
 let lastExitAt: string | null = null;
 let workerRotationCount = 0;
-let rotationAnnounced = false;
+/** The worker that announced its rotation; its exit counts as a rotation, no other's. */
+let rotationAnnouncedBy: Worker | null = null;
 // Announced its rotation, not exited yet; new calls wait for the respawn.
 let drainingWorker: Worker | null = null;
 // Stopped on purpose: its exit is neither a crash nor a rotation.
@@ -223,12 +226,12 @@ export async function startWalletWorker(): Promise<void> {
         } else if (msg?.kind === 'private-state-rpc') {
             dispatchPrivateStateRpc(msg);
         } else if (msg?.kind === 'rotating') {
-            rotationAnnounced = true;
+            rotationAnnouncedBy = worker;
             drainingWorker = worker;
             log.info(`worker announced its rotation (${msg.generations} artifact generations, ${msg.inflight ?? 0} call(s) draining); new calls wait for the respawn`);
         } else if (msg?.kind === 'rotation-done') {
             // Terminated from here so the worker never exits mid-reply.
-            rotationAnnounced = true;
+            rotationAnnouncedBy = worker;
             drainingWorker = worker;
             log.info(`worker rotation drained (${msg.generations} artifact generations); terminating it, the next call respawns`);
             void worker.terminate().catch(() => undefined);
@@ -245,12 +248,12 @@ export async function startWalletWorker(): Promise<void> {
         if (client?.worker === worker) client = null;
         if (drainingWorker === worker) drainingWorker = null;
         const stopped = stoppingWorker === worker;
-        const rotated = !stopped && rotationAnnounced;
+        const rotated = !stopped && rotationAnnouncedBy === worker;
+        if (rotationAnnouncedBy === worker) rotationAnnouncedBy = null;
         if (stopped) {
             stoppingWorker = null;
             log.info(`worker stopped (code=${code})`);
         } else if (rotated) {
-            rotationAnnounced = false;
             workerRotationCount += 1;
             log.info(`worker rotated (controlled exit after its generation budget); the next call respawns it`);
         } else {
@@ -485,10 +488,15 @@ async function rpcOnce<T>(method: string, args: unknown, timeoutMs: number, onSu
             });
         });
         port2.once('messageerror', err => finish(() => reject(err as Error)));
-        worker.postMessage(
-            { kind: 'rpc', method, args, port: port1 },
-            [port1] // transfer ownership of port1
-        );
+        try {
+            worker.postMessage(
+                { kind: 'rpc', method, args, port: port1 },
+                [port1] // transfer ownership of port1
+            );
+        } catch (err) {
+            // Never sent: settle now instead of holding the entry until the timeout.
+            pending.reject(err as Error);
+        }
     });
 }
 
@@ -855,7 +863,7 @@ export function __resetWalletWorkerForTests(): void {
     lastExitCode = null;
     lastExitAt = null;
     workerRotationCount = 0;
-    rotationAnnounced = false;
+    rotationAnnouncedBy = null;
     drainingWorker = null;
     stoppingWorker = null;
 }

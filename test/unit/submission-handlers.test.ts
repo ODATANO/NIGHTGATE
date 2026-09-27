@@ -49,6 +49,7 @@ vi.mock('../../srv/submission/background-jobs', async (importOriginal) => ({
     // The real error classes: runSubmission narrows on `instanceof`.
     JobAdmissionBusyError: (await importOriginal<typeof import('../../srv/submission/background-jobs')>()).JobAdmissionBusyError,
     IdempotencyConflictError: (await importOriginal<typeof import('../../srv/submission/background-jobs')>()).IdempotencyConflictError,
+    IdempotencyKeyInvalidError: (await importOriginal<typeof import('../../srv/submission/background-jobs')>()).IdempotencyKeyInvalidError,
     WorkflowReconciliationRequiredError: (await importOriginal<typeof import('../../srv/submission/background-jobs')>()).WorkflowReconciliationRequiredError,
     withLockContentionRetry: (await importOriginal<typeof import('../../srv/submission/background-jobs')>()).withLockContentionRetry,
     startJob: (...args: unknown[]) => (mockStartJob as any)(...args),
@@ -1407,6 +1408,43 @@ describe('grantDisclosure', () => {
         expect(confirmed).toContain('"pendingLevel":null');
         expect(confirmed).toContain('"revokedTxHash":null');
         expect(confirmed).toContain('"grantedTxHash":"0xcafe"');
+    });
+
+    test('an idempotent replay of a finished grant restores the pendingLevel it found', async () => {
+        const srv = makeFakeService();
+        const run = vi.fn()
+            .mockResolvedValueOnce({ ID: 'existing-grant-row', pendingLevel: null })
+            .mockResolvedValue(undefined);
+        registerSubmissionHandlers(srv as any, { run }, {
+            attesterIdResolver: vi.fn(async () => ATTESTER_ID),
+            resolveContractImpl: vi.fn(async () => ({ ...RESOLVED_CONTRACT_FIXTURE })),
+            walletMaterialFactory: vi.fn(async () => ({
+                accountId: 'a',
+                privateStoragePasswordProvider: () => '0123456789ABCDEFG',
+                walletAndMidnightProvider: {}
+            })),
+            submitterFactory: vi.fn(() => makeSuccessfulSubmitter()),
+            disclosureReindexer: vi.fn()
+        });
+        mockStartJob.mockImplementationOnce((async () => ({ jobId: 'job-original', status: 'succeeded', deduplicated: true })) as any);
+
+        const req = makeReq({ ...VALID_ARGS(), idempotencyKey: 'idem-replay' });
+        await srv.handlers['grantDisclosure'](req);
+        expect(req.reject).not.toHaveBeenCalled();
+
+        const updates = run.mock.calls.map(c => c[0]).filter((q: any) => q.UPDATE);
+        expect(JSON.stringify(updates[0].UPDATE.data ?? updates[0].UPDATE.with)).toContain('"pendingLevel":1');
+        const restore = updates.at(-1);
+        expect(JSON.stringify(restore.UPDATE.data ?? restore.UPDATE.with)).toContain('"pendingLevel":null');
+    });
+
+    test('an idempotency key longer than the column is a 400, not a 500', async () => {
+        const { srv } = setupHandlersWithDb();
+        const { IdempotencyKeyInvalidError } = await vi.importActual<typeof import('../../srv/submission/background-jobs')>('../../srv/submission/background-jobs');
+        mockStartJob.mockImplementationOnce(async () => { throw new IdempotencyKeyInvalidError(); });
+        const req = makeReq({ ...VALID_ARGS(), idempotencyKey: 'k'.repeat(129) });
+        await srv.handlers['grantDisclosure'](req);
+        expect(req.reject).toHaveBeenCalledWith(expect.objectContaining({ status: 400, code: 'IDEMPOTENCY_KEY_INVALID' }));
     });
 
     test('a reindex failure does not fail the grant and queues a durable reindexDisclosures retry job', async () => {

@@ -1813,7 +1813,14 @@ describe('progress watch tick', () => {
         stubIndexerTip(Date.now() - 3_600_000);
         await workerExports.progressWatchTick(SESSION, entry, Date.now() + 240_000);
         const last = fakeParentPort.postMessage.mock.calls.map(c => c[0]).filter((m: any) => m.kind === 'sync-progress' && m.sessionId === SESSION).at(-1);
-        expect(last.snapshot).toMatchObject({ caughtUp: false, indexerFresh: false });
+        expect(last.snapshot).toMatchObject({ caughtUp: false, indexerFresh: false, indexerError: null });
+        expect(last.snapshot.indexerTipAgeMs).toBeGreaterThanOrEqual(3_600_000);
+
+        // a refused tip read says why instead of passing for a stale indexer
+        vi.stubGlobal('fetch', vi.fn(async () => ({ ok: false, status: 403, json: async () => { throw new SyntaxError('Unexpected token <'); } })));
+        await workerExports.progressWatchTick(SESSION, entry, Date.now() + 360_000);
+        const refused = fakeParentPort.postMessage.mock.calls.map(c => c[0]).filter((m: any) => m.kind === 'sync-progress' && m.sessionId === SESSION).at(-1);
+        expect(refused.snapshot).toMatchObject({ caughtUp: false, indexerFresh: false, indexerError: 'HTTP 403', indexerTipAgeMs: null });
         await rpc('evict', { sessionId: SESSION });
     });
 
@@ -2737,6 +2744,13 @@ describe('withFindContractQueryCache', () => {
         // clients, and transcripts build against current state: NEVER cached.
         expect(publicDataMethods.queryContractState).toHaveBeenCalledTimes(2);
         expect(publicDataMethods.queryZSwapAndContractState).toHaveBeenCalledTimes(2);
+    });
+
+    it('keeps at most 256 cached queries', async () => {
+        const { withFindContractQueryCache, findContractQueryCache } = await import('../../srv/midnight/worker/contracts.js');
+        const provider = withFindContractQueryCache({ watchForDeployTxData: vi.fn(async (a: string) => a) }, 'http://indexer.bound-test/graphql');
+        for (let i = 0; i < 300; i++) await provider.watchForDeployTxData(i.toString(16).padStart(64, '0'));
+        expect(findContractQueryCache.size).toBeLessThanOrEqual(256);
     });
 
     it('caches per contract address', async () => {

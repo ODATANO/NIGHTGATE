@@ -54,6 +54,17 @@ export function heapFigures(): HeapFigures {
 
 const GC_KIND: Record<number, string> = { 1: 'minor', 2: 'major', 4: 'incremental', 8: 'weakcb', 16: 'major-snapshot' };
 
+/** Where profiles are written; `dir` may only name a folder inside it. */
+export const PROFILE_ROOT = path.join(os.tmpdir(), 'nightgate-profiles');
+
+/** `dir` resolved inside PROFILE_ROOT, the root itself when empty, null when it leaves the root. */
+export function resolveProfileDir(dir: string | null | undefined): string | null {
+    if (!dir || !dir.trim()) return PROFILE_ROOT;
+    const resolved = path.resolve(PROFILE_ROOT, dir.trim());
+    const rel = path.relative(PROFILE_ROOT, resolved);
+    return rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel)) ? resolved : null;
+}
+
 export async function profileCurrentThread(seconds: number, opts: { dir?: string; filePrefix?: string; top?: number } = {}): Promise<ThreadProfile> {
     const secs = Math.min(120, Math.max(1, Math.floor(Number(seconds) || 20)));
     const inspector = await import('node:inspector');
@@ -82,7 +93,7 @@ export async function profileCurrentThread(seconds: number, opts: { dir?: string
         const summary = summarizeCpuProfile(profile, opts.top ?? 25);
         let file: string | null = null;
         try {
-            const outDir = opts.dir || path.join(os.tmpdir(), 'nightgate-profiles');
+            const outDir = opts.dir || PROFILE_ROOT;
             fs.mkdirSync(outDir, { recursive: true });
             file = path.join(outDir, `${opts.filePrefix ?? 'thread'}-${new Date().toISOString().replace(/[:.]/g, '-')}-${secs}s.cpuprofile`);
             fs.writeFileSync(file, JSON.stringify(profile));

@@ -22,7 +22,7 @@ import { withKeyedLock } from './utils/keyed-lock';
 import { WalletSessions, DisclosureRoles, BackgroundJobs } from '#cds-models/midnight';
 import { listContracts, registerContractAtRuntime, unregisterContractAtRuntime, ContractRegistrationError } from './submission/contract-registrations';
 import { walletCpuProfile } from './midnight/wallet-worker-client';
-import { profileCurrentThread } from './midnight/cpu-profile';
+import { PROFILE_ROOT, profileCurrentThread, resolveProfileDir } from './midnight/cpu-profile';
 import { getConfiguredNightgateNetwork } from './utils/nightgate-config';
 
 /**
@@ -115,7 +115,8 @@ export default class NightgateAdminService extends cds.ApplicationService {
             }
             const thread = (data.thread ?? 'worker').toString().trim().toLowerCase();
             if (thread !== 'worker' && thread !== 'main') return req.reject(400, "thread must be 'worker' (default) or 'main'");
-            const dir = typeof data.dir === 'string' && data.dir.trim() ? data.dir.trim() : undefined;
+            const dir = resolveProfileDir(typeof data.dir === 'string' ? data.dir : null);
+            if (!dir) return req.reject(400, `dir must name a folder inside ${PROFILE_ROOT}`);
             try {
                 if (thread === 'main') {
                     const p = await profileCurrentThread(seconds, { dir, filePrefix: 'main' });

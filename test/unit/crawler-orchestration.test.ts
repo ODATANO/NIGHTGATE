@@ -1483,27 +1483,21 @@ describe('MidnightCrawler orchestration', () => {
             expect(provider.getHeader).toHaveBeenCalledWith('0x6');
         });
 
-        it('stops fork-point search when the reorg depth exceeds 100 blocks', async () => {
+        it('refuses a fork point deeper than 100 blocks instead of guessing one', async () => {
             const provider = {
                 getHeader: vi.fn().mockResolvedValue({ parentHash: '0xloop' })
             };
             const crawler = new MidnightCrawler(provider as any, { enabled: true });
             // No local block ever matches, so it walks back until depth > 100.
             (crawler as any).db = db;
-            const errorSpy = vi.spyOn(cds.log('nightgate:crawler'), 'error').mockImplementation(() => {});
 
-            try {
-                await expect((crawler as any).findForkPoint({
-                    number: '0x66', // 102
-                    parentHash: '0x65',
-                    stateRoot: '',
-                    extrinsicsRoot: '',
-                    digest: { logs: [] }
-                })).resolves.toBe(1);
-                expect(errorSpy).toHaveBeenCalledWith('Reorg depth > 100 blocks, stopping search');
-            } finally {
-                errorSpy.mockRestore();
-            }
+            await expect((crawler as any).findForkPoint({
+                number: '0x66', // 102
+                parentHash: '0x65',
+                stateRoot: '',
+                extrinsicsRoot: '',
+                digest: { logs: [] }
+            })).rejects.toThrow(/deeper than 100 blocks/);
         });
     });
 

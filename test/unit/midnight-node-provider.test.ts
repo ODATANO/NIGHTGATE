@@ -610,6 +610,31 @@ describe('MidnightNodeProvider lifecycle edges', () => {
         }
     });
 
+    it('bounds notifications buffered for ids that are never registered', async () => {
+        const provider = new MidnightNodeProvider({ nodeUrl: 'ws://localhost:9944' });
+        const connectPromise = provider.connect();
+        const socket = getLatestMockWebSocket();
+        socket.emit('open');
+        await connectPromise;
+        const notify = (id: string, n: number) => socket.emit('message', JSON.stringify({
+            jsonrpc: '2.0', method: 'chain_newHead', params: { subscription: id, result: { number: `0x${n.toString(16)}` } }
+        }));
+
+        for (let n = 1; n <= 40; n++) notify('late', n);
+        const orphans: Map<string, any[]> = (provider as any).orphanNotifications;
+        expect(orphans.get('late')).toHaveLength(16);
+        expect(orphans.get('late')!.at(-1)).toEqual({ number: '0x28' });
+
+        for (let i = 0; i < 40; i++) notify(`gone-${i}`, 1);
+        expect(orphans.size).toBe(32);
+        expect(orphans.has('late')).toBe(false);
+
+        // A buffered head still reaches the subscriber registered for it.
+        const seen: any[] = [];
+        (provider as any).registerSubscription('gone-39', (r: any) => { seen.push(r); });
+        expect(seen).toEqual([{ number: '0x1' }]);
+    });
+
     it('parseBlockNumber rejects non-hex input', () => {
         expect(() => MidnightNodeProvider.parseBlockNumber('zz')).toThrow(/Invalid block number hex/);
         expect(MidnightNodeProvider.parseBlockNumber('0x2a')).toBe(42);

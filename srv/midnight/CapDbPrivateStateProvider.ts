@@ -163,10 +163,12 @@ export class CapDbPrivateStateProvider<PSI extends PrivateStateId = PrivateState
         );
     }
 
+    /** Scoped to the current contract like get/set/remove (the SDK's provider does the same). */
     async clear(): Promise<void> {
+        const contractAddress = this.requireContractAddress('clear');
         const db = await this.getDb();
         await db.run(
-            DELETE.from(PrivateStates).where({ accountId: this.config.accountId })
+            DELETE.from(PrivateStates).where({ accountId: this.config.accountId, contractAddress })
         );
     }
 

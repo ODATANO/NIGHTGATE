@@ -79,6 +79,10 @@ export interface SyncProgressSnapshot {
     isConnected: boolean;
     /** The indexer's latest block is recent enough to count as tip. */
     indexerFresh: boolean;
+    /** Age of the indexer's newest block; null when the read failed. */
+    indexerTipAgeMs?: number | null;
+    /** Why the indexer tip could not be read; null when it was. */
+    indexerError?: string | null;
     caughtUp: boolean;
     /** Milliseconds this wait has been running. */
     elapsedMs: number;
@@ -131,7 +135,14 @@ export function pushSyncProgress(snapshot: SyncProgressSnapshot, dust?: SyncDust
 }
 
 /** The indexer's latest indexed block (height + timestamp, ms epoch). */
-export async function getIndexerTip(indexerHttpUrl: string): Promise<{ height: bigint | null; timestampMs: number | null }> {
+export interface IndexerTip {
+    height: bigint | null;
+    timestampMs: number | null;
+    /** Why there is no timestamp: `HTTP 403`, `timeout`, ...; null when the read succeeded. */
+    error: string | null;
+}
+
+export async function getIndexerTip(indexerHttpUrl: string): Promise<IndexerTip> {
     try {
         const r = await fetch(indexerHttpUrl, {
             method: 'POST',
@@ -139,13 +150,26 @@ export async function getIndexerTip(indexerHttpUrl: string): Promise<{ height: b
             body: JSON.stringify({ query: '{ block { height timestamp } }' }),
             signal: AbortSignal.timeout(15_000)
         });
-        const j: any = await r.json();
+        // A refusal from the indexer's edge is HTML, not JSON.
+        const j: any = await r.json().catch(() => null);
         const b = j?.data?.block;
+        if (b?.timestamp == null) {
+            return { height: null, timestampMs: null, error: r.ok === false ? `HTTP ${r.status}` : 'no block in the answer' };
+        }
         return {
-            height: b?.height != null ? BigInt(b.height) : null,
-            timestampMs: b?.timestamp != null ? Number(b.timestamp) : null
+            height: b.height != null ? BigInt(b.height) : null,
+            timestampMs: Number(b.timestamp),
+            error: null
         };
-    } catch { return { height: null, timestampMs: null }; }
+    } catch (err: any) {
+        const error = err?.name === 'TimeoutError' ? 'timeout' : String(err?.message ?? err).slice(0, 120);
+        return { height: null, timestampMs: null, error };
+    }
+}
+
+/** Age of the indexer's newest block; null when the tip read failed. */
+export function indexerTipAgeMs(tip: IndexerTip, now: number = Date.now()): number | null {
+    return tip.timestampMs != null ? Math.max(0, now - tip.timestampMs) : null;
 }
 
 export type LedgerEventStream = 'dust' | 'zswap';
@@ -277,9 +301,10 @@ export async function waitForGenuineSync(entry: FacadeEntry, timeoutMs: number, 
     let anchor: { applied: bigint; at: number } | null = null;
 
     const publish = (
-        applied: bigint, highest: bigint, blockHeight: bigint | null,
+        applied: bigint, highest: bigint, tip: IndexerTip,
         connected: boolean, fresh: boolean, caughtUp: boolean
     ): SyncProgressSnapshot => {
+        const blockHeight = tip.height;
         const now = Date.now();
         let eventsPerSecond: number | null = null;
         if (applied >= 0n) {
@@ -306,6 +331,8 @@ export async function waitForGenuineSync(entry: FacadeEntry, timeoutMs: number, 
             blockHeight: blockHeight != null ? blockHeight.toString() : null,
             isConnected: connected,
             indexerFresh: fresh,
+            indexerTipAgeMs: indexerTipAgeMs(tip, now),
+            indexerError: tip.error,
             caughtUp,
             elapsedMs: now - startedAt,
             label,
@@ -360,7 +387,7 @@ export async function waitForGenuineSync(entry: FacadeEntry, timeoutMs: number, 
             progressApplied = applied;
         }
         const caughtUp = isGenuinelyCaughtUp({ connected, applied, streamTip: highest, indexerFresh: fresh });
-        const snapshot = publish(applied, highest, tip.height, connected, fresh, caughtUp);
+        const snapshot = publish(applied, highest, tip, connected, fresh, caughtUp);
         if (caughtUp) {
             pushSyncProgress(snapshot, dustFiguresOf(state, entry));
             log('info', `genuine-sync [${label}] CAUGHT UP: appliedIndex=${applied} streamTip=${highest} blockHeight=${tip.height} fresh=${fresh} after=${Math.round(snapshot.elapsedMs / 1000)}s`);
@@ -611,14 +638,15 @@ export async function progressWatchTick(sessionId: string, entry: FacadeEntry, n
     const snapshot: SyncProgressSnapshot = {
         sessionId, appliedIndex: applied.toString(), streamTip: highest.toString(),
         behindEvents: behind != null ? behind.toString() : null, eventsPerSecond: null, etaSeconds: caughtUp ? 0 : null,
-        blockHeight: tip.height != null ? tip.height.toString() : null, isConnected: connected, indexerFresh, caughtUp,
+        blockHeight: tip.height != null ? tip.height.toString() : null, isConnected: connected, indexerFresh,
+        indexerTipAgeMs: indexerTipAgeMs(tip), indexerError: tip.error, caughtUp,
         elapsedMs: 0, label: last?.label ?? 'idle', updatedAt: at,
         lastProgressAt: last && last.appliedIndex === applied.toString() ? last.lastProgressAt : at
     };
     syncProgress.set(sessionId, snapshot);
     pushSyncProgress(snapshot, dustFiguresOf(state, entry));
     if (!caughtUp) {
-        log('info', `idle-sync ${sessionId.slice(0, 16)} appliedIndex=${applied} streamTip=${highest} behindEvents=${behind ?? '?'} connected=${connected} fresh=${indexerFresh} (no job waiting)`);
+        log('info', `idle-sync ${sessionId.slice(0, 16)} appliedIndex=${applied} streamTip=${highest} behindEvents=${behind ?? '?'} connected=${connected} fresh=${indexerFresh}${tip.error ? ` indexerError=${tip.error}` : ''} (no job waiting)`);
     }
 }
 

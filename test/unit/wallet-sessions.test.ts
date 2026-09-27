@@ -539,7 +539,7 @@ describe('wallet session handlers', () => {
             run: vi.fn()
                 .mockResolvedValueOnce([{ sessionId: 'old-1', viewingKeyHash: 'hash-a', encryptedViewingKey: encrypt('a'.repeat(64), encKey, walletSessionViewingKeyBinding('old-1')), userId: 'owner-1' }])
                 .mockResolvedValueOnce(1)                          // deactivate UPDATE (runs FIRST)
-                .mockResolvedValueOnce([{ sessionId: 'live-1' }]) // guard: live sibling remains
+                .mockResolvedValueOnce([{ sessionId: 'live-1', userId: 'owner-1' }]) // guard: live sibling remains
         };
         try {
             startSessionCleanup(db);
@@ -599,7 +599,7 @@ describe('wallet session handlers', () => {
                 .mockResolvedValueOnce(1)
                 // The guard reads active rows WITH their expiry and judges
                 // them itself: the sponsor row is long past its TTL and still counts.
-                .mockResolvedValueOnce([{ sessionId: 'pool-sponsor-9', expiresAt: longAgo }])
+                .mockResolvedValueOnce([{ sessionId: 'pool-sponsor-9', expiresAt: longAgo, userId: 'owner-9' }])
         };
         try {
             startSessionCleanup(db);
@@ -1129,6 +1129,7 @@ describe('wallet session handlers', () => {
                 sessionId: 'acct-1', appliedIndex: '1200', streamTip: '1500',
                 behindEvents: '300', eventsPerSecond: 12.5, etaSeconds: 24,
                 blockHeight: '1951462', isConnected: true, indexerFresh: true,
+                indexerTipAgeMs: 12_400, indexerError: null,
                 caughtUp: false, elapsedMs: 45_000, label: 'prewarm',
                 updatedAt: '2026-08-04T09:00:00.000Z'
             });
@@ -1138,6 +1139,7 @@ describe('wallet session handlers', () => {
             expect(result).toMatchObject({
                 known: true, caughtUp: false, appliedIndex: '1200',
                 behindEvents: '300', eventsPerSecond: 12.5, etaSeconds: 24,
+                indexerTipAgeSeconds: 12, indexerError: null,
                 phase: 'prewarm'
             });
             expect(req.reject).not.toHaveBeenCalled();
@@ -1319,7 +1321,7 @@ describe('wallet session handlers', () => {
         it('keeps the facade when another active session still uses the wallet', async () => {
             mockDbRun.mockResolvedValueOnce({ ...activeSessionRow(), viewingKeyHash: 'hash-a', userId: TEST_USER_ID });
             mockDbRun.mockResolvedValueOnce(1);                             // deactivate UPDATE (runs first)
-            mockDbRun.mockResolvedValueOnce([{ sessionId: 'other-live' }]); // guard: live sibling
+            mockDbRun.mockResolvedValueOnce([{ sessionId: 'other-live', userId: TEST_USER_ID }]); // guard: live sibling
 
             const req = createMockRequest({ sessionId: 's1' });
             await registeredHandlers['disconnectWallet'](req);
@@ -1327,6 +1329,26 @@ describe('wallet session handlers', () => {
             expect(mockEvictWalletFacade).not.toHaveBeenCalled();
             // The disconnecting row itself is still deactivated.
             expect(updateWhereSpy).toHaveBeenCalledWith({ sessionId: 's1', userId: TEST_USER_ID });
+        });
+
+        it("keeps the facade when another user's session holding the signing key uses the wallet", async () => {
+            mockDbRun.mockResolvedValueOnce({ ...activeSessionRow(), viewingKeyHash: 'hash-a', userId: TEST_USER_ID });
+            mockDbRun.mockResolvedValueOnce(1);
+            mockDbRun.mockResolvedValueOnce([{ sessionId: 'owner-live', userId: 'owner', encryptedSeedKey: 'enc' }]);
+
+            await registeredHandlers['disconnectWallet'](createMockRequest({ sessionId: 's1' }));
+
+            expect(mockEvictWalletFacade).not.toHaveBeenCalled();
+        });
+
+        it("evicts when only another user's viewing-only session is left", async () => {
+            mockDbRun.mockResolvedValueOnce({ ...activeSessionRow(), viewingKeyHash: 'hash-a', userId: TEST_USER_ID });
+            mockDbRun.mockResolvedValueOnce(1);
+            mockDbRun.mockResolvedValueOnce([{ sessionId: 'viewer-live', userId: 'auditor', encryptedSeedKey: null }]);
+
+            await registeredHandlers['disconnectWallet'](createMockRequest({ sessionId: 's1' }));
+
+            expect(mockEvictWalletFacade).toHaveBeenCalledWith('acct-derived');
         });
 
         it('evicts when the disconnecting session was the only live reference', async () => {
@@ -1359,7 +1381,7 @@ describe('wallet session handlers', () => {
         it('expired disconnect keeps the facade when another active session uses the wallet', async () => {
             mockDbRun.mockResolvedValueOnce({ ...activeSessionRow({ expiresInMs: -1000 }), viewingKeyHash: 'hash-a', userId: TEST_USER_ID });
             mockDbRun.mockResolvedValueOnce(1);                             // deactivate UPDATE
-            mockDbRun.mockResolvedValueOnce([{ sessionId: 'other-live' }]); // guard: live sibling
+            mockDbRun.mockResolvedValueOnce([{ sessionId: 'other-live', userId: TEST_USER_ID }]); // guard: live sibling
 
             const req = createMockRequest({ sessionId: 's1' });
             await registeredHandlers['disconnectWallet'](req);

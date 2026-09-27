@@ -88,8 +88,8 @@ service NightgateAdminService {
 
     /**
      * CPU-profile a live thread for `seconds` (1..120, default 20) and summarize
-     * where time went. The .cpuprofile is written under `dir` (default OS temp
-     * `nightgate-profiles/`); `file` names it.
+     * where time went. The .cpuprofile is written to OS temp `nightgate-profiles/`,
+     * or a folder `dir` inside it; `file` names it.
      */
     action profileWorker(seconds: Integer, dir: String, thread: String) returns {
         thread        : String; // 'worker' (default) | 'main'

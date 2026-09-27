@@ -196,7 +196,9 @@ describe('parseExtrinsicCallIndices', () => {
         if (options.signatureType !== undefined) {
             bytes.push(options.signatureType);
             if (!options.truncateSignature) {
-                for (let i = 0; i < 64; i++) bytes.push(0xbb);
+                // ECDSA (0x02) signatures are 65 bytes, Ed25519/Sr25519 64.
+                const sigLength = options.signatureType === 0x02 ? 65 : 64;
+                for (let i = 0; i < sigLength; i++) bytes.push(0xbb);
             }
         }
 

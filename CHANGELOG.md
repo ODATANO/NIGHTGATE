@@ -1,5 +1,45 @@
 # Changelog
 
+## 0.27.2 - 2026-09-27
+
+### Fixes
+
+- A sponsor held back by the indexer freshness check says why: `indexer
+  unreachable (HTTP 403)` (or `timeout`) when the tip read failed, `indexer's
+  newest block is Ns old` when it lags. A failed read used to be reported as
+  `indexer not fresh` like a lagging indexer; an answer from the indexer's edge
+  that is not JSON is recognised as a refusal.
+- `getWalletSyncProgress` gains `indexerTipAgeSeconds` and `indexerError`; the
+  worker's idle-sync log line carries `indexerError`.
+- Disconnecting a session no longer evicts the wallet's facade while another
+  user's session that holds the signing key uses it; another user's
+  viewing-only session still never keeps the keys in memory.
+- A worker RPC whose message cannot be posted settles at once instead of
+  holding its entry until the timeout.
+- Node notifications buffered for subscription ids that are never registered
+  are capped (16 per id, 32 ids) and dropped on unsubscribe.
+- The SCALE parser skips 65 bytes for an ECDSA extrinsic signature (was 64,
+  which misread the rest of such an extrinsic).
+- A fork search deeper than 100 blocks throws instead of returning an
+  unverified height; nothing is rolled back and the next head retries.
+- `CapDbPrivateStateProvider.clear()` removes the current contract's private
+  states only, like `get`/`set`/`remove` and the SDK's own provider (it
+  removed every contract's states of the account).
+- `grantDisclosure` replayed under its idempotency key restores the
+  `pendingLevel` it found; the replay starts no job, so nothing cleared it.
+- An `idempotencyKey` over 128 characters is refused with 400
+  `IDEMPOTENCY_KEY_INVALID` (was a database error, 500 on PostgreSQL).
+- `attestAgentOutput` records its `anchorDocument` job under the caller's agent
+  grant (revocation and per-grant usage cover it).
+- A worker exit counts as a rotation only for the worker that announced it; a
+  stopped worker's announcement no longer hides the next worker's crash.
+- The worker's deploy-query cache is bounded (256 entries).
+- `NIGHTGATE_JOB_LEASE_TTL_MS` is at least 60 s (twice the heartbeat); a
+  shorter lease reclaimed running jobs.
+- `profileWorker` writes only inside `nightgate-profiles/` in the OS temp dir;
+  `dir` names a folder there, a path outside it is a 400.
+- Reconciliation lookups that fail log at debug level instead of silently.
+
 ## 0.27.1 - 2026-09-27
 
 ### Fixes

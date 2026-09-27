@@ -71,6 +71,9 @@ type SubscriptionCallback = (result: any) => void | Promise<void>;
 
 /** Reconnect delay = reconnectInterval x min(attempt, this): 5 s x 12 = one attempt a minute in a long outage. */
 const MAX_RECONNECT_DELAY_FACTOR = 12;
+// Notifications kept per subscription id not yet registered, and ids kept at all.
+const ORPHAN_NOTIFICATIONS_PER_ID = 16;
+const ORPHAN_SUBSCRIPTIONS_MAX = 32;
 
 export class MidnightNodeProvider {
     private ws: WebSocket | null = null;
@@ -341,9 +344,7 @@ export class MidnightNodeProvider {
             } else {
                 // Substrate replays the current head before subscribe*() knows the
                 // id; buffer it for registerSubscription so it is not dropped.
-                const buf = this.orphanNotifications.get(message.params.subscription) ?? [];
-                buf.push(message.params.result);
-                this.orphanNotifications.set(message.params.subscription, buf);
+                this.bufferOrphan(message.params.subscription, message.params.result);
             }
             return;
         }
@@ -437,6 +438,24 @@ export class MidnightNodeProvider {
         }
     }
 
+    /**
+     * Bounded: late notifications of an id that is never registered (one already
+     * unsubscribed) would otherwise pile up until the next reconnect.
+     */
+    private bufferOrphan(subscriptionId: string, result: any): void {
+        let buf = this.orphanNotifications.get(subscriptionId);
+        if (!buf) {
+            if (this.orphanNotifications.size >= ORPHAN_SUBSCRIPTIONS_MAX) {
+                const oldest = this.orphanNotifications.keys().next().value;
+                if (oldest !== undefined) this.orphanNotifications.delete(oldest);
+            }
+            buf = [];
+            this.orphanNotifications.set(subscriptionId, buf);
+        }
+        buf.push(result);
+        if (buf.length > ORPHAN_NOTIFICATIONS_PER_ID) buf.shift();
+    }
+
     /** Sets the callback, then drains notifications buffered before the id was known. */
     private registerSubscription(subscriptionId: string, callback: SubscriptionCallback): void {
         this.subscriptions.set(subscriptionId, callback);
@@ -461,11 +480,13 @@ export class MidnightNodeProvider {
 
     async unsubscribeNewHeads(subscriptionId: string): Promise<boolean> {
         this.subscriptions.delete(subscriptionId);
+        this.orphanNotifications.delete(subscriptionId);
         return this.rpc('chain_unsubscribeNewHeads', [subscriptionId]);
     }
 
     async unsubscribeFinalizedHeads(subscriptionId: string): Promise<boolean> {
         this.subscriptions.delete(subscriptionId);
+        this.orphanNotifications.delete(subscriptionId);
         return this.rpc('chain_unsubscribeFinalizedHeads', [subscriptionId]);
     }
 
