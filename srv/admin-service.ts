@@ -252,13 +252,19 @@ export default class NightgateAdminService extends cds.ApplicationService {
                 return req.reject(400, `role must be one of: ${DISCLOSURE_ROLE_VALUES.join(', ')}`);
             }
 
+            const now = new Date().toISOString();
+            if (validUntil) {
+                const until = Date.parse(validUntil);
+                if (Number.isNaN(until)) return req.reject(400, 'validUntil must be an ISO timestamp');
+                if (until <= Date.parse(now)) return req.reject(400, 'validUntil must be in the future');
+            }
+
             const callerRole = await attachDisclosureRole(req, this.db);
             if (!isAuthority(callerRole)) {
                 return req.reject(403, 'caller must hold the authority disclosure role to grant roles');
             }
 
             const grantedBy = req.user?.id || 'unknown';
-            const now = new Date().toISOString();
             await this.db.run(INSERT.into(DisclosureRoles).entries({
                 userId,
                 role,
@@ -267,6 +273,35 @@ export default class NightgateAdminService extends cds.ApplicationService {
                 validFrom: now,
                 validUntil: validUntil && validUntil.length > 0 ? validUntil : null
             }));
+        });
+
+        // Ends matching grants by setting validUntil, so the grant history stays readable.
+        this.on('revokeRole', async (req: NightgateRequest) => {
+            const { userId, role, scope } = req.data as { userId?: string; role?: string; scope?: string };
+
+            if (!userId) return req.reject(400, 'userId is required');
+            if (!role) return req.reject(400, 'role is required');
+            if (!isValidDisclosureRoleValue(role)) {
+                return req.reject(400, `role must be one of: ${DISCLOSURE_ROLE_VALUES.join(', ')}`);
+            }
+
+            const callerRole = await attachDisclosureRole(req, this.db);
+            if (!isAuthority(callerRole)) {
+                return req.reject(403, 'caller must hold the authority disclosure role to revoke roles');
+            }
+
+            const wantedScope = scope && scope.length > 0 ? scope : null;
+            const now = new Date().toISOString();
+            const rows: Array<{ ID: string; scope?: string | null; validUntil?: string | null }> =
+                (await this.db.run(SELECT.from(DisclosureRoles).where({ userId, role }))) || [];
+            const ids = rows
+                .filter(r => (r.scope == null || r.scope === '' ? null : r.scope) === wantedScope)
+                .filter(r => !r.validUntil || Date.parse(r.validUntil) > Date.parse(now))
+                .map(r => r.ID);
+            if (ids.length === 0) return 0;
+
+            await this.db.run(UPDATE.entity(DisclosureRoles).set({ validUntil: now }).where({ ID: { in: ids } }));
+            return ids.length;
         });
 
         await super.init();

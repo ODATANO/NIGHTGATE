@@ -497,7 +497,7 @@ The record key `recordKey(attesterId, sha256)` is derived from the caller in-cir
 
 ### `verifyDocument(documentId, providedSha256) → { verified, included, stateChecked, anchoredTxHash, anchoredAt, originalSha256 }` (function)
 
-`verified: true` iff the hash matches, `anchoredTxHash` is set and the attestation stands in live contract state (a retract turns it false). `included`: the anchoring tx indexed as `SUCCESS`; `stateChecked: false`: no live provider for the record's network, so `verified` stays false and only `included` is reported. The vault, artifact and network recorded at anchor time are authoritative: a different caller-supplied `contractAddress`/`compiledArtifactRef` is a 400 and the recorded network's indexer is read; only rows without recorded coordinates use caller values. A mismatch is `verified: false`, not an error. Any authenticated caller holding the `documentId` may call it (the response has no `storageRef`).
+`verified: true` iff the hash matches, `anchoredTxHash` is set and the attestation stands in live contract state (a retract turns it false). `included`: the anchoring tx indexed as `SUCCESS`; `stateChecked: false`: no live provider for the record's network, so `verified` stays false and only `included` is reported. The vault, artifact and network recorded at anchor time are authoritative: a different caller-supplied `contractAddress`/`compiledArtifactRef` is a 400 and the recorded network's indexer is read; only rows without recorded coordinates use caller values. A mismatch is `verified: false`, not an error, and `originalSha256` is `''`. Any authenticated caller holding the `documentId` may call it (the response has no `storageRef`).
 
 ## Document ingestion (compute-only)
 
@@ -818,7 +818,9 @@ Last `limit` (default 10, max 100) reorg events with depth, detected-at timestam
 
 `profileWorker(seconds?, dir?, thread?) → { thread, seconds, file, facadeCount, sampledMs, idlePercent, gcPercent, wasmPercent, topFunctions[], topFiles[], topInclusive[], heapBefore, heapAfter, gc }`: CPU profile of the wallet worker (`thread: 'worker'`, default) or the main thread (`'main'`) for `seconds` (1..120, default 20) while it keeps serving. Returns self time by function and file, inclusive hot paths, idle/GC/wasm shares, heap figures before and after, and GC counts (`gc.byKind` as JSON). The `.cpuprofile` is written to `nightgate-profiles/` in the OS temp dir, or to a folder `dir` inside it (a path outside it is a 400). The request waits `seconds + 60 s`. A warm facade at tip idles above 90 %, GC under 10 %.
 
-`grantRole(userId, role, scope?, validUntil?)`: grant an off-chain disclosure tier (`public_only` | `legitimate_interest` | `authority`, table `DisclosureRoles`), read by the `AttestationService` middleware `attachDisclosureRole`. The caller must hold `authority`.
+`grantRole(userId, role, scope?, validUntil?)`: grant an off-chain disclosure tier (`public_only` | `legitimate_interest` | `authority`, table `DisclosureRoles`), read by the `AttestationService` middleware `attachDisclosureRole`. The caller must hold `authority`; `validUntil` must lie in the future.
+
+`revokeRole(userId, role, scope?) → Integer`: end the active grants of that user, tier and scope now (`validUntil` = now, rows kept); no `scope` matches only unscoped grants. Returns the number ended, `0` when none was active. The caller must hold `authority`.
 
 > **On-chain alternative.** `attachDisclosureRole(req, db, { contractAddress, payloadHash?, attesterId? })` resolves the tier from active on-chain `DisclosureGrants` for the caller's grantee id (`registerGranteeIdentity`). One attestation is named by `payloadHash` plus its `attesterId`; a payload without its attester resolves to `public_only`. With `contractAddress` the on-chain result is authoritative (no off-chain fallback); without it the `grantRole` table applies. The consumer wires the middleware into the reads it gates.
 

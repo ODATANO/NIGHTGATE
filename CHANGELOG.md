@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.28.1 - 2026-09-28
+
+### Features
+
+- Admin `revokeRole(userId, role, scope?)`: ends active disclosure-role grants
+  (`validUntil` = now, rows kept), returns the number ended; caller needs `authority`.
+
+### Fixes
+
+- `grantRole` rejects a `validUntil` that is not a timestamp or not in the future (400).
+- `verifyDocument` returns `originalSha256` only when the provided hash matches, else `''`.
+- A worker RPC waits at most `NIGHTGATE_SUBMIT_INTENT_ACK_TIMEOUT_MS` for pending
+  submit-intent hooks before it answers the caller.
+
 ## 0.28.0 - 2026-09-27
 
 ### Breaking

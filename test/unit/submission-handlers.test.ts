@@ -1031,7 +1031,7 @@ describe('verifyDocument', () => {
         const req = makeReq({ documentId: DOC_ID, providedSha256: tampered });
         const result: any = await srv.handlers['verifyDocument'](req);
         expect(result.verified).toBe(false);
-        expect(result.originalSha256).toBe(VALID_SHA);
+        expect(result.originalSha256).toBe('');
         // Skips the tx lookup when hash mismatched: only 1 db.run, not 3.
         // (We can't easily assert call count without exposing the db here,
         //  but the result coming back is enough proof the short-circuit fired.)

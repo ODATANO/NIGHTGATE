@@ -413,6 +413,22 @@ describe('NightgateAdminService', () => {
             expect(entries.validUntil).toBeNull();
         });
 
+        it('rejects a validUntil that is not a timestamp or not in the future', async () => {
+            const handler = registeredHandlers['grantRole'];
+            const bad = createMockRequest({ userId: 'bob', role: 'authority', validUntil: 'soon' }, 'admin-1');
+            await handler(bad);
+            expect(bad.reject).toHaveBeenCalledWith(400, 'validUntil must be an ISO timestamp');
+
+            const past = createMockRequest(
+                { userId: 'bob', role: 'authority', validUntil: new Date(Date.now() - 1000).toISOString() },
+                'admin-1'
+            );
+            await handler(past);
+            expect(past.reject).toHaveBeenCalledWith(400, 'validUntil must be in the future');
+            expect(mockDbRun).not.toHaveBeenCalled();
+            expect(insertEntriesSpy).not.toHaveBeenCalled();
+        });
+
         it('uses "unknown" as grantedBy when req.user is missing', async () => {
             const handler = registeredHandlers['grantRole'];
             // No userId on caller → attachDisclosureRole returns public_only
@@ -420,6 +436,80 @@ describe('NightgateAdminService', () => {
             const req = createMockRequest({ userId: 'bob', role: 'authority' });
             await handler(req);
             expect(req.reject).toHaveBeenCalledWith(403, expect.any(String));
+        });
+    });
+
+    describe('revokeRole', () => {
+        const authorityRowsFor = (userId: string) => ([
+            { userId, role: 'authority', scope: null, validFrom: null, validUntil: null }
+        ]);
+
+        it('validates input before the caller lookup', async () => {
+            const handler = registeredHandlers['revokeRole'];
+            const noUser = createMockRequest({ role: 'authority' }, 'admin-1');
+            await handler(noUser);
+            expect(noUser.reject).toHaveBeenCalledWith(400, 'userId is required');
+
+            const badRole = createMockRequest({ userId: 'bob', role: 'public' }, 'admin-1');
+            await handler(badRole);
+            expect(badRole.reject).toHaveBeenCalledWith(400, expect.stringContaining('role must be one of'));
+            expect(mockDbRun).not.toHaveBeenCalled();
+        });
+
+        it('rejects a caller without the authority role', async () => {
+            const handler = registeredHandlers['revokeRole'];
+            mockDbRun.mockResolvedValueOnce([]);
+            const req = createMockRequest({ userId: 'bob', role: 'authority' }, 'admin-1');
+            await handler(req);
+            expect(req.reject).toHaveBeenCalledWith(403, expect.stringContaining('authority disclosure role'));
+            expect(updateSetSpy).not.toHaveBeenCalled();
+        });
+
+        it('ends only the active grants of the named scope and returns their count', async () => {
+            const handler = registeredHandlers['revokeRole'];
+            const future = new Date(Date.now() + 86_400_000).toISOString();
+            const past = new Date(Date.now() - 86_400_000).toISOString();
+            mockDbRun.mockResolvedValueOnce(authorityRowsFor('admin-1'));
+            mockDbRun.mockResolvedValueOnce([
+                { ID: 'g1', scope: null, validUntil: null },
+                { ID: 'g2', scope: '', validUntil: future },
+                { ID: 'g3', scope: null, validUntil: past },       // already ended
+                { ID: 'g4', scope: 'contract-X', validUntil: null } // other scope
+            ]);
+            mockDbRun.mockResolvedValueOnce(2); // UPDATE
+
+            const req = createMockRequest({ userId: 'bob', role: 'legitimate_interest' }, 'admin-1');
+            const result = await handler(req);
+
+            expect(req.reject).not.toHaveBeenCalled();
+            expect(result).toBe(2);
+            expect(selectWhereSpy).toHaveBeenLastCalledWith({ userId: 'bob', role: 'legitimate_interest' });
+            expect(updateSetSpy).toHaveBeenCalledWith({ validUntil: expect.any(String) });
+            expect(updateWhereSpy).toHaveBeenCalledWith({ ID: { in: ['g1', 'g2'] } });
+        });
+
+        it('matches a named scope exactly', async () => {
+            const handler = registeredHandlers['revokeRole'];
+            mockDbRun.mockResolvedValueOnce(authorityRowsFor('admin-1'));
+            mockDbRun.mockResolvedValueOnce([
+                { ID: 'g1', scope: null, validUntil: null },
+                { ID: 'g4', scope: 'contract-X', validUntil: null }
+            ]);
+            mockDbRun.mockResolvedValueOnce(1);
+
+            const req = createMockRequest({ userId: 'bob', role: 'authority', scope: 'contract-X' }, 'admin-1');
+            expect(await handler(req)).toBe(1);
+            expect(updateWhereSpy).toHaveBeenCalledWith({ ID: { in: ['g4'] } });
+        });
+
+        it('returns 0 without writing when nothing is active', async () => {
+            const handler = registeredHandlers['revokeRole'];
+            mockDbRun.mockResolvedValueOnce(authorityRowsFor('admin-1'));
+            mockDbRun.mockResolvedValueOnce([]);
+
+            const req = createMockRequest({ userId: 'bob', role: 'authority' }, 'admin-1');
+            expect(await handler(req)).toBe(0);
+            expect(updateSetSpy).not.toHaveBeenCalled();
         });
     });
 

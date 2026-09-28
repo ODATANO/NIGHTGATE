@@ -11,7 +11,7 @@ service NightgateAdminService {
         encryptedSeedKey
     };
 
-    /** Read-only: roles change only through grantRole (authority-gated); a grant ends at validUntil. */
+    /** Read-only: roles change only through grantRole/revokeRole (authority-gated); a grant ends at validUntil. */
     @readonly
     entity DisclosureRoles as projection on midnight.DisclosureRoles;
 
@@ -146,4 +146,11 @@ service NightgateAdminService {
         scope:      String,
         validUntil: Timestamp
     );
+
+    // End the caller-named grants now (validUntil = now, rows kept); returns how many ended.
+    action revokeRole(
+        userId: String,
+        role:   String,
+        scope:  String
+    ) returns Integer;
 }

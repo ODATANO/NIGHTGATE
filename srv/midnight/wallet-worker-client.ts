@@ -430,7 +430,23 @@ async function rpcOnce<T>(method: string, args: unknown, timeoutMs: number, onSu
             answered = true;
             clearTimeout(timer);
             void (async () => {
-                while (intentsInFlight.size > 0) await Promise.allSettled([...intentsInFlight]);
+                // Bounded: a hook stuck on the database must not hold the caller forever;
+                // a hash it records later is closed by the confirmer at the tx ttl.
+                const ceilingMs = configMs('NIGHTGATE_SUBMIT_INTENT_ACK_TIMEOUT_MS');
+                const deadline = Date.now() + ceilingMs;
+                while (intentsInFlight.size > 0) {
+                    const left = deadline - Date.now();
+                    if (left <= 0) {
+                        log.warn(`wallet-worker rpc '${method}': ${intentsInFlight.size} submit-intent hook(s) still pending after ${ceilingMs}ms; answering without them`);
+                        break;
+                    }
+                    let wait: ReturnType<typeof setTimeout> | undefined;
+                    await Promise.race([
+                        Promise.allSettled([...intentsInFlight]),
+                        new Promise<void>(r => { wait = setTimeout(r, left); })
+                    ]);
+                    clearTimeout(wait);
+                }
                 settle();
                 outcome();
             })();

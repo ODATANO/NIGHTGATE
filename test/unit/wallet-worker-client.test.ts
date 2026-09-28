@@ -430,6 +430,32 @@ describe('wallet-worker-client', () => {
             expect(events).toEqual(['committed', 'rejected']);
         });
 
+        it('a hook that never settles holds the answer at most NIGHTGATE_SUBMIT_INTENT_ACK_TIMEOUT_MS', async () => {
+            const prev = process.env.NIGHTGATE_SUBMIT_INTENT_ACK_TIMEOUT_MS;
+            process.env.NIGHTGATE_SUBMIT_INTENT_ACK_TIMEOUT_MS = '1000';
+            try {
+                await startWithResponder((msg) => {
+                    msg.port.postMessage({ kind: 'submit-intent', txHash: 'h-stuck', contractAddress: 'c', circuits: ['attest'] });
+                    setImmediate(() => msg.port.postMessage({ ok: false, error: { name: 'Error', message: 'not broadcasting' } }));
+                    return undefined;
+                });
+                const started = Date.now();
+                const err: any = await walletSubmitContractCall({
+                    sessionId: 's1', proxyId: 'p', contractName: 'counter', contractAddress: 'c', circuit: 'increment', args: [],
+                    registration: { artifactPath: '/a', privateStateId: 'p', zkConfigPath: '/zk' },
+                    indexerHttpUrl: '', indexerWsUrl: '', proofServerUrl: '', networkId: 'preprod'
+                } as any, () => new Promise<void>(() => undefined)).then(() => null, (e) => e);
+                const elapsed = Date.now() - started;
+                expect(err?.message).toBe('not broadcasting');
+                expect(elapsed).toBeGreaterThanOrEqual(900);
+                expect(elapsed).toBeLessThan(3000);
+                expect(warnSpy).toHaveBeenCalledWith(expect.stringMatching(/1 submit-intent hook\(s\) still pending after 1000ms/));
+            } finally {
+                if (prev === undefined) delete process.env.NIGHTGATE_SUBMIT_INTENT_ACK_TIMEOUT_MS;
+                else process.env.NIGHTGATE_SUBMIT_INTENT_ACK_TIMEOUT_MS = prev;
+            }
+        });
+
         it('walletDeployContract / walletSubmitContractCall route to their RPC methods', async () => {
             await startWithResponder(captureResponder({ txHash: 'tx', contractAddress: 'addr', onChainStatus: 'ok' }));
             await walletDeployContract({

@@ -190,7 +190,7 @@ service NightgateService {
         stateChecked   : Boolean; // false = verdict from the index only
         anchoredTxHash : String;
         anchoredAt     : Timestamp;
-        originalSha256 : String;
+        originalSha256 : String; // the recorded hash on a match, else ''
     };
 
     // ---- ZK predicate attestations ----

@@ -199,7 +199,8 @@ export function registerDocumentActions(ctx: Pick<SubmissionContext, 'srv' | 'db
             stateChecked,
             anchoredTxHash: doc.anchoredTxHash ?? '',
             anchoredAt: doc.anchoredAt ?? null,
-            originalSha256: doc.sha256 ?? ''
+            // Only echoed back on a match: a document id alone must not reveal the hash.
+            originalSha256: hashMatches ? doc.sha256 ?? '' : ''
         };
     });
 
