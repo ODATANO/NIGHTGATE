@@ -10,7 +10,7 @@
 
 import cds from '@sap/cds';
 import { parseExtrinsicCall } from '../utils/scale';
-import { extractLedgerPayload, decodeLedgerPayload, type LedgerPayloadFacts } from './ledger-payload';
+import { extractLedgerPayload, decodeLedgerPayload, carriesShieldedCoins, carriesProof, type LedgerPayloadFacts } from './ledger-payload';
 import { readCapBinary } from './cap-binary';
 import { lockReorgGeneration } from '../submission/reorg-generation';
 import { Blocks, Transactions, ContractActions, SyncState, type Block, type Transaction, type ContractAction } from '#cds-models/midnight';
@@ -195,6 +195,9 @@ export class LedgerPayloadDecoder {
             payloadDecode: state,
             identifiers: facts.identifiers.length ? JSON.stringify(facts.identifiers) : null,
             circuitName: firstCall?.entryPoint ?? null,
+            isShielded: carriesShieldedCoins(facts),
+            hasProof: carriesProof(facts),
+            proofHash: null,
             zswapInputCount: facts.zswapInputCount,
             zswapOutputCount: facts.zswapOutputCount,
             zswapTransientCount: facts.zswapTransientCount,

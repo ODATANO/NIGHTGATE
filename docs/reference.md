@@ -89,7 +89,7 @@ Configure the plugin under `cds.requires.nightgate`. Environment variables overr
 | `crawler.fetchConcurrency` | `(default)` | Parallel RPC fetches during catch-up |
 | `crawler.rpcBatchSize` | `(default)` | Substrate JSON-RPC batch size |
 | `crawler.requestTimeout` | `30000` | RPC timeout (ms) |
-| `palletMap` | `(built-in)` | Override of the pallet-index → tx-type map of the `BlockProcessor` (`{ "<index>": { name, txType, isShielded?, isSystem? } }`) |
+| `palletMap` | `(built-in)` | Override of the pallet-index → tx-type map of the `BlockProcessor` (`{ "<index>": { name, txType, isShielded?, isSystem? } }`); `isShielded` holds until the decode pass reads the payload |
 | `allowMainnetSubmission` | `false` | Gate for mainnet submission |
 | `granteeBinding` | `wallet` | Principal → vault `Bytes<32>` grantee id: `wallet` (coin pubkey hash) / `did` (DID string) / `custom` (64 hex); used by `registerGranteeIdentity` and the disclosure read gate |
 | `allowSelfServiceGranteeRegistration` | `false` | Lets callers register their own grantee identity. NIGHTGATE does not verify ownership of the binding input, so under `wallet`/`did` a user could claim another party's id; off = `403`. Operators can write `GranteeIdentities` directly |
@@ -567,7 +567,7 @@ For per-action signatures and curl examples, see [actions.md](actions.md).
 
 ### NightgateService entities (all `@readonly` unless noted)
 
-- `Blocks`, `Transactions`, `TransactionResults`, `TransactionSegments`, `TransactionFees`
+- `Blocks`, `Transactions` (`isShielded`: carries zswap coins; `hasProof`: carries a contract call or zswap proof, the DUST fee spend's proof does not count; both need `crawler.decodePayloads` and are `null` on a row not decoded; `proofHash` is not set), `TransactionResults`, `TransactionSegments`, `TransactionFees`
 - `ContractActions` (one row per contract action the `Midnight` pallet reported applied, with its `address`; `entryPoint` needs `crawler.decodePayloads`; `stateHash`/`stateSize`, `ContractBalances` and the full `state` need `crawler.indexerSupplement`, the full `state` only under `crawler.contractStateHistory` `watched`/`all`), `ContractBalances`
 - `ContractStates` (the newest state per contract, from the supplement); `stateAt(address, height)` returns the state after the contract's newest action at or below `height` (omitted: the current one) from this table, a kept per-action state, or the indexer, checked against the stored hash (`source`, `verified`; indexer reads capped at 2 per second across callers)
 - `UnshieldedUtxos` (from `Midnight.UnshieldedTokens`; `registeredForDustGeneration` needs `crawler.indexerSupplement`), `NightBalances` (derived from them)

@@ -7,7 +7,7 @@
  * by scripts/integration-test-utxo-identity.mjs for the identity helpers.
  */
 
-import { extractLedgerPayload, readLedgerFacts } from '../../srv/crawler/ledger-payload';
+import { extractLedgerPayload, readLedgerFacts, carriesShieldedCoins, carriesProof } from '../../srv/crawler/ledger-payload';
 import { readSupplementBlock } from '../../srv/crawler/indexer-supplement';
 
 const CONTRACT = 'cc'.repeat(32);
@@ -101,6 +101,45 @@ describe('readLedgerFacts', () => {
             intents: new Map([[1, { actions: [{ address: `0x${CONTRACT}` }] }]])
         });
         expect(facts.contractActions).toEqual([{ address: CONTRACT, entryPoint: null }]);
+    });
+});
+
+describe('carriesShieldedCoins and carriesProof', () => {
+    const plain = (over: Record<string, any> = {}) => readLedgerFacts({
+        identifiers: () => [],
+        intents: new Map([[1, { actions: [], dustActions: { spends: [{ vFee: 1n }], registrations: [] } }]]),
+        ...over
+    });
+
+    test('a zswap input, output or transient each make the transaction shielded', () => {
+        for (const offer of [
+            { inputs: [1], outputs: [], transients: [] },
+            { inputs: [], outputs: [1], transients: [] },
+            { inputs: [], outputs: [], transients: [1] }
+        ]) {
+            const facts = plain({ guaranteedOffer: offer });
+            expect(carriesShieldedCoins(facts)).toBe(true);
+            expect(carriesProof(facts)).toBe(true);
+        }
+        const fallibleOnly = plain({ fallibleOffer: new Map([[3, { inputs: [], outputs: [1], transients: [] }]]) });
+        expect(carriesShieldedCoins(fallibleOnly)).toBe(true);
+    });
+
+    test('a contract call carries a proof without being shielded', () => {
+        const facts = plain({
+            intents: new Map([[1, { actions: [{ address: `0x${CONTRACT}`, entryPoint: 'increment' }] }]])
+        });
+        expect(carriesShieldedCoins(facts)).toBe(false);
+        expect(carriesProof(facts)).toBe(true);
+    });
+
+    test('a deploy and a DUST spend alone count as neither', () => {
+        const deploy = plain({ intents: new Map([[1, { actions: [{ address: `0x${CONTRACT}` }] }]]) });
+        expect(carriesProof(deploy)).toBe(false);
+        const feeOnly = plain();
+        expect(feeOnly.dustSpendCount).toBe(1);
+        expect(carriesShieldedCoins(feeOnly)).toBe(false);
+        expect(carriesProof(feeOnly)).toBe(false);
     });
 });
 

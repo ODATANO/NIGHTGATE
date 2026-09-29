@@ -526,6 +526,8 @@ export class BlockProcessor {
                 const senderAddress = projection?.senderAddress ?? null;
                 const receiverAddress = projection?.receiverAddress ?? null;
                 const nightAmount = projection?.nightAmount ?? null;
+                // The pallet call does not say what the ledger payload carries: unknown until decoded.
+                const shielded = classification.isSystem ? false : (classification.isShielded ? true : null);
 
                 txRows.push({
                     ID: txId,
@@ -536,12 +538,11 @@ export class BlockProcessor {
                     raw: hexToBinaryValue(extrinsicHex),
                     transactionType: classification.isSystem ? 'SYSTEM' : 'REGULAR',
                     txType: txTypeFromEvents(events) ?? classification.txType,
-                    isShielded: classification.isShielded,
+                    isShielded: shielded,
                     senderAddress,
                     receiverAddress,
                     nightAmount,
-                    hasProof: classification.isShielded,
-                    proofHash: classification.isShielded ? extrinsicHash : null,
+                    hasProof: shielded,
                     contractAddress,
                     circuitName,
                     size: txSize,

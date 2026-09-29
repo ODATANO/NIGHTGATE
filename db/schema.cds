@@ -64,13 +64,15 @@ entity Transactions : cuid, managed {
 
     // crawler classification
     txType                   : TxType;
-    isShielded               : Boolean default false;
+    // Carries zswap coins. Null until the payload is decoded or the pallet map says so.
+    isShielded               : Boolean;
     senderAddress            : String(256); // unshielded txs only
     receiverAddress          : String(256); // unshielded txs only
     nightAmount              : BigInt;
     dustConsumed             : BigInt; // DUST the transaction's spends declare
-    hasProof                 : Boolean default false;
-    proofHash                : HexEncoded;
+    // Carries a contract call or zswap proof; the DUST fee spend's proof does not count.
+    hasProof                 : Boolean;
+    proofHash                : HexEncoded; // not set
     contractAddress          : HexEncoded;
     circuitName              : String(100); // contract calls only
     size                     : Integer; // bytes

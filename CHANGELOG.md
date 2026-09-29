@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.28.2 - 2026-09-29
+
+### Fixes
+
+- `Transactions.isShielded` and `hasProof` come from the decoded ledger payload
+  (`crawler.decodePayloads`): zswap inputs, outputs or transients; a contract
+  call or zswap proof. Both are `null` until a row is decoded (were always `false`).
+- `Transactions.proofHash` is no longer set (was the extrinsic hash).
+- `palletMap` `isShielded` applies only until the payload is decoded.
+
+### Schema
+
+- `Transactions.isShielded` / `hasProof` lose their `false` default; no migration.
+
 ## 0.28.1 - 2026-09-28
 
 ### Features

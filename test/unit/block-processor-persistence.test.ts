@@ -300,10 +300,11 @@ describe('BlockProcessor persistence paths', () => {
         expect(txRows.map((t: any) => t.transactionType)).toEqual([
             'SYSTEM', 'REGULAR', 'REGULAR', 'REGULAR', 'REGULAR'
         ]);
-        expect(txRows[4].isShielded).toBe(true);
-        expect(txRows.slice(0, 4).every((t: any) => t.isShielded === false)).toBe(true);
+        // System: no. Regular: unknown until the payload is decoded, unless the pallet map says so.
+        expect(txRows.map((t: any) => t.isShielded)).toEqual([false, null, null, null, true]);
         expect(txRows.map((t: any) => t.size)).toEqual([4, 4, 4, 4, 4]);
-        expect(txRows.map((t: any) => t.hasProof)).toEqual([false, false, false, false, true]);
+        expect(txRows.map((t: any) => t.hasProof)).toEqual([false, null, null, null, true]);
+        expect(txRows.every((t: any) => t.proofHash === null)).toBe(true);
         expect(txRows.map((t: any) => t.circuitName)).toEqual(['0:0', '10:0', '10:1', '10:2', '15:0']);
         // No contract address is minted from the extrinsic hash: the ledger
         // payload is not decoded, so the column is null for every row.

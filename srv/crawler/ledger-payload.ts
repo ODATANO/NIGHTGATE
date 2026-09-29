@@ -146,6 +146,16 @@ export function readLedgerFacts(tx: any): LedgerPayloadFacts {
     return facts;
 }
 
+/** True when the transaction moves shielded coins: any zswap input, output or transient. */
+export function carriesShieldedCoins(facts: LedgerPayloadFacts): boolean {
+    return facts.zswapInputCount + facts.zswapOutputCount + facts.zswapTransientCount > 0;
+}
+
+/** True for a contract call or a zswap coin; a DUST spend is proven too, but every fee-paying transaction has one. */
+export function carriesProof(facts: LedgerPayloadFacts): boolean {
+    return carriesShieldedCoins(facts) || facts.contractActions.some(a => a.entryPoint !== null);
+}
+
 /** Deserializes the payload and reads it; throws when no marker combination fits. */
 export async function decodeLedgerPayload(bytes: Uint8Array): Promise<LedgerPayloadFacts> {
     const ledger = await loadLedgerV8();

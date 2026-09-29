@@ -148,6 +148,8 @@ describe('LedgerPayloadDecoder', () => {
             payloadDecode: 'decoded',
             identifiers: JSON.stringify(['aa', 'bb']),
             circuitName: 'increment',
+            isShielded: true,
+            hasProof: true,
             zswapInputCount: 1,
             zswapOutputCount: 2,
             zswapTransientCount: 0,
@@ -159,6 +161,30 @@ describe('LedgerPayloadDecoder', () => {
         const action = await db.run(cds.ql.SELECT.one.from(CONTRACT_ACTIONS).where({ transaction_ID: txId }));
         expect(action.entryPoint).toBe('increment');
         expect(Number((await readSync()).lastDecodedHeight)).toBe(10);
+    });
+
+    it('sets isShielded and hasProof from the decoded payload', async () => {
+        const blockId = await seedBlock(10, '0xd6');
+        const shielded = await seedTransaction(blockId, { transactionId: 0, raw: midnightExtrinsicBase64(20) });
+        const call = await seedTransaction(blockId, { transactionId: 1, raw: midnightExtrinsicBase64(21) });
+        // A pallet-map flag and a stale proof hash: the decoded payload overrules both.
+        const transfer = await seedTransaction(blockId, {
+            transactionId: 2, raw: midnightExtrinsicBase64(22), isShielded: true, hasProof: true, proofHash: '0xold'
+        });
+        await setSync({ lastIndexedHeight: 20, lastDecodedHeight: null });
+        const none = { zswapInputCount: 0, zswapOutputCount: 0, zswapTransientCount: 0 };
+        decodeLedgerPayload.mockImplementation(async (bytes: Uint8Array) => {
+            if (bytes.length === 20) return facts({ zswapInputCount: 0, zswapOutputCount: 1, zswapTransientCount: 0 });
+            if (bytes.length === 21) return facts({ ...none, contractActions: [{ address: CONTRACT, entryPoint: 'increment' }] });
+            return facts(none);
+        });
+
+        expect((await runDecoder()).decoded).toBe(3);
+
+        const read = (ID: string) => db.run(cds.ql.SELECT.one.from(TRANSACTIONS).where({ ID }));
+        expect(await read(shielded)).toEqual(expect.objectContaining({ isShielded: true, hasProof: true }));
+        expect(await read(call)).toEqual(expect.objectContaining({ isShielded: false, hasProof: true }));
+        expect(await read(transfer)).toEqual(expect.objectContaining({ isShielded: false, hasProof: false, proofHash: null }));
     });
 
     it('matches several calls on one contract in declaration order', async () => {
@@ -201,7 +227,11 @@ describe('LedgerPayloadDecoder', () => {
         }
 
         expect((await db.run(cds.ql.SELECT.one.from(TRANSACTIONS).where({ ID: inherent }))).payloadDecode).toBe('absent');
-        expect((await db.run(cds.ql.SELECT.one.from(TRANSACTIONS).where({ ID: broken }))).payloadDecode).toBe('failed');
+        const failed = await db.run(cds.ql.SELECT.one.from(TRANSACTIONS).where({ ID: broken }));
+        expect(failed.payloadDecode).toBe('failed');
+        // Not decoded means unknown, not "no".
+        expect(failed.isShielded).toBeNull();
+        expect(failed.hasProof).toBeNull();
         // A failed decode still advances the cursor: the pass is not a loop.
         expect(Number((await readSync()).lastDecodedHeight)).toBe(10);
     });
