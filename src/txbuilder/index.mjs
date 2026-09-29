@@ -42,6 +42,44 @@ export {
     probeLanded, waitLanded, withDustGuard, nodeHttpUrlFor, rebuildOnStaleTranscript
 } from './submit.mjs';
 
+// Shielded swaps: halves, offer files, a wallet that syncs shielded coins only.
+export {
+    SWAP_OFFER_PREFIX, SWAP_MAX_INPUTS, createSwapWallet, readSwapTerms, sameSwapTerms, encodeOffer, decodeOffer,
+    chooseSwapCoin, spendableWithin
+} from './swap.mjs';
+
+/** The per-role seeds of a BIP39 seed (night, zswap, dust), by the derivation the builder and Lace use. */
+export async function deriveRoleSeeds(seedHex, accountIndex = 0) {
+    if (!/^[0-9a-fA-F]{128}$/.test(String(seedHex ?? ''))) throw new Error('seedHex must be 128 hex chars (64-byte BIP39 seed)');
+    return require('../../srv/utils/wallet-hd.js').deriveRoleSeeds(new Uint8Array(Buffer.from(seedHex, 'hex')), accountIndex);
+}
+
+/**
+ * `recipients` as the SDK's map from coin public key to encryption public key:
+ * the wallets besides the builder's own that a call may create a coin for.
+ */
+export function recipientKeyMap(recipients) {
+    if (recipients === undefined || recipients === null) return undefined;
+    if (!Array.isArray(recipients)) throw new Error('recipients must be an array of { coinPublicKey, encryptionPublicKey }');
+    const map = new Map();
+    for (const r of recipients) {
+        const coin = String(r?.coinPublicKey ?? '').trim().toLowerCase();
+        const enc = String(r?.encryptionPublicKey ?? '').trim().toLowerCase();
+        if (!/^[0-9a-f]{64}$/.test(coin)) throw new Error('recipients: coinPublicKey must be 64 hex chars');
+        if (!/^[0-9a-f]{64}$/.test(enc)) throw new Error('recipients: encryptionPublicKey must be 64 hex chars');
+        map.set(coin, enc);
+    }
+    return map.size > 0 ? map : undefined;
+}
+
+/** Which sub-wallets `walletSync` starts. */
+export function walletSyncMode(walletSync) {
+    if (walletSync === undefined || walletSync === true) return 'all';
+    if (walletSync === false) return 'none';
+    if (walletSync === 'shielded') return 'shielded';
+    throw new Error(`createTxBuilder: walletSync must be true, false or 'shielded' (got ${String(walletSync)})`);
+}
+
 /** Circuits whose proving assets are fetched by default (the vault's set). */
 export const ATTESTATION_VAULT_CIRCUITS = [
     'attest', 'retract', 'anchorContentRoot', 'bindDocument', 'registerDocument',
@@ -335,21 +373,32 @@ async function deriveKeyMaterial({ seedHex, networkId = 'preprod', accountIndex 
     if (!/^[0-9a-fA-F]{128}$/.test(String(seedHex ?? ''))) {
         throw new Error('seedHex must be 128 hex chars (64-byte BIP39 seed)');
     }
-    const [unshielded, { deriveAttestationSecret }] = await Promise.all([
+    const [unshielded, { deriveAttestationSecret }, ledger, addressFormat] = await Promise.all([
         import('@midnightntwrk/wallet-sdk-unshielded-wallet'),
-        import('../browser/witnesses.mjs')
+        import('../browser/witnesses.mjs'),
+        import('@midnight-ntwrk/ledger-v8'),
+        import('@midnightntwrk/wallet-sdk-address-format')
     ]);
     const { deriveRoleSeeds } = require('../../srv/utils/wallet-hd.js');
     const rt = require('@midnight-ntwrk/compact-runtime');
     const roleSeeds = await deriveRoleSeeds(new Uint8Array(Buffer.from(seedHex, 'hex')), accountIndex);
     const keystore = unshielded.createKeystore(roleSeeds.night, networkId);
     const attestationSecret = ownSecret ?? deriveAttestationSecret(roleSeeds.zswap);
+    // Public halves of the shielded keys: what a sender needs to create a coin for this wallet.
+    const zswapKeys = ledger.ZswapSecretKeys.fromSeed(roleSeeds.zswap);
+    const shieldedKeys = { coinPublicKey: String(zswapKeys.coinPublicKey), encryptionPublicKey: String(zswapKeys.encryptionPublicKey) };
+    const shielded = addressFormat.MidnightBech32m.encode(networkId, new addressFormat.ShieldedAddress(
+        addressFormat.ShieldedCoinPublicKey.fromHexString(shieldedKeys.coinPublicKey),
+        addressFormat.ShieldedEncryptionPublicKey.fromHexString(shieldedKeys.encryptionPublicKey)
+    )).toString();
+    zswapKeys.clear?.();
     return {
         roleSeeds,
         keystore,
         attestationSecret,
         attesterId: Buffer.from(rt.persistentHash(new rt.CompactTypeBytes(32), attestationSecret)).toString('hex'),
-        addresses: { night: unshielded.PublicKey.fromKeyStore(keystore).address }
+        addresses: { night: unshielded.PublicKey.fromKeyStore(keystore).address, shielded },
+        shieldedKeys
     };
 }
 
@@ -381,11 +430,11 @@ export function computeRecordKey(attesterId, payloadHash) {
  * NIGHT address. Same derivation as `createTxBuilder`.
  *
  * @param {{ seedHex: string, networkId?: string, accountIndex?: number, attestationSecret?: Uint8Array }} opts
- * @returns {Promise<{ attesterId: string, attestationSecret: Uint8Array, addresses: { night: string } }>}
+ * @returns {Promise<{ attesterId: string, attestationSecret: Uint8Array, addresses: { night: string, shielded: string }, shieldedKeys: { coinPublicKey: string, encryptionPublicKey: string } }>}
  */
 export async function deriveIdentity(opts) {
-    const { attesterId, attestationSecret, addresses } = await deriveKeyMaterial(opts ?? {});
-    return { attesterId, attestationSecret, addresses };
+    const { attesterId, attestationSecret, addresses, shieldedKeys } = await deriveKeyMaterial(opts ?? {});
+    return { attesterId, attestationSecret, addresses, shieldedKeys };
 }
 
 /**
@@ -450,6 +499,11 @@ export async function createTxBuilder(opts) {
     if (opts.proofTimeoutMs !== undefined && !(Number.isInteger(opts.proofTimeoutMs) && opts.proofTimeoutMs > 0)) {
         throw new Error(`createTxBuilder: proofTimeoutMs must be a positive integer (ms), got ${String(opts.proofTimeoutMs)}`);
     }
+    const syncMode = walletSyncMode(opts.walletSync);
+    const saved = opts.walletState;
+    if (saved !== undefined && (saved === null || typeof saved !== 'object' || ['shielded', 'unshielded', 'dust'].some(k => saved[k] !== undefined && typeof saved[k] !== 'string'))) {
+        throw new Error('createTxBuilder: walletState must be the object serializeWalletState() returned');
+    }
     const cacheDir = opts.zkConfigDir ?? opts.cacheDir ?? join(homedir(), '.cache', 'nightgate-txbuilder', contractName);
 
     // 1. Proving assets: fetch once, then offline. The verifier keys must
@@ -500,7 +554,7 @@ export async function createTxBuilder(opts) {
     ]);
     netId.setNetworkId?.(networkId);
 
-    const { roleSeeds, keystore, attestationSecret, attesterId, addresses } = await deriveKeyMaterial({ seedHex, networkId, accountIndex, attestationSecret: opts.attestationSecret });
+    const { roleSeeds, keystore, attestationSecret, attesterId, addresses, shieldedKeys } = await deriveKeyMaterial({ seedHex, networkId, accountIndex, attestationSecret: opts.attestationSecret });
     const zswapKeys = ledger.ZswapSecretKeys.fromSeed(roleSeeds.zswap);
     const dustKey = ledger.DustSecretKey.fromSeed(roleSeeds.dust);
 
@@ -519,17 +573,25 @@ export async function createTxBuilder(opts) {
     const facade = await facadeSdk.WalletFacade.init({
         configuration,
         provingService: () => proving.makeWasmProvingService({}),
-        shielded: () => shielded.ShieldedWallet(configuration).startWithSecretKeys(zswapKeys),
-        unshielded: () => unshielded.UnshieldedWallet(configuration).startWithPublicKey(unshielded.PublicKey.fromKeyStore(keystore)),
-        dust: () => dust.DustWallet(configuration).startWithSecretKey(dustKey, ledger.LedgerParameters.initialParameters().dust)
+        shielded: () => (saved?.shielded
+            ? shielded.ShieldedWallet(configuration).restore(saved.shielded)
+            : shielded.ShieldedWallet(configuration).startWithSecretKeys(zswapKeys)),
+        unshielded: () => (saved?.unshielded
+            ? unshielded.UnshieldedWallet(configuration).restore(saved.unshielded)
+            : unshielded.UnshieldedWallet(configuration).startWithPublicKey(unshielded.PublicKey.fromKeyStore(keystore))),
+        dust: () => (saved?.dust
+            ? dust.DustWallet(configuration).restore(saved.dust)
+            : dust.DustWallet(configuration).startWithSecretKey(dustKey, ledger.LedgerParameters.initialParameters().dust))
     });
     // `start()` = startSyncInBackground per sub-wallet: a fresh seed syncs from
     // genesis on THIS thread for the life of the builder. A call that moves no
     // value needs no state (balancing returns the tx untouched, signing is the
     // keystore); `walletSync: false` skips the sync, and a value-moving call
-    // then fails at balancing instead of building wrong.
-    const walletSync = opts.walletSync !== false;
-    if (walletSync) await facade.start(zswapKeys, dustKey);
+    // then fails at balancing instead of building wrong. `'shielded'` syncs the
+    // shielded coins only: enough for a call that moves shielded value while a
+    // sponsor pays the fee.
+    if (syncMode === 'all') await facade.start(zswapKeys, dustKey);
+    else if (syncMode === 'shielded') await facade.shielded.start(zswapKeys);
 
     const CompiledContract = compactJs.CompiledContract ?? compactJs.effect?.CompiledContract;
     if (!CompiledContract?.make) throw new Error('compact-js: CompiledContract.make not found');
@@ -567,6 +629,30 @@ export async function createTxBuilder(opts) {
         /** Where the proving assets were cached, and how many were downloaded. */
         zkAssets: assets,
         addresses,
+        /** Public shielded keys of this wallet: what another builder lists under `recipients` to create a coin for it. */
+        shieldedKeys,
+        /** 'all', 'shielded' or 'none': which sub-wallets sync. */
+        walletSync: syncMode,
+
+        /** Resolves once the syncing sub-wallets have caught up with the indexer. */
+        async waitForSync() {
+            if (syncMode === 'all') await facade.waitForSyncedState();
+            else if (syncMode === 'shielded') await facade.shielded.waitForSyncedState();
+        },
+
+        /**
+         * The state of the syncing sub-wallets as text per wallet; hand it to
+         * `createTxBuilder({ walletState })` to resume without a sync from genesis.
+         */
+        async serializeWalletState() {
+            if (syncMode === 'none') return {};
+            const out = { shielded: await facade.shielded.serializeState() };
+            if (syncMode === 'all') {
+                out.unshielded = await facade.unshielded.serializeState();
+                out.dust = await facade.dust.serializeState();
+            }
+            return out;
+        },
 
         /**
          * Build + prove + sign + finalize one transaction WITHOUT submitting:
@@ -587,8 +673,9 @@ export async function createTxBuilder(opts) {
          * @param {{ contractAddress: string, call?: { circuitId: string, args: unknown[], witnesses: object }, calls?: Array<{ circuitId: string, args: unknown[], merkleProof?: object, slotWidth?: number }>, initialPrivateState?: unknown, bind?: boolean, attestationSecret?: Uint8Array }} input
          * @returns {Promise<{ finalizedTxB64: string, serializedBytes: number }>}
          */
-        async buildSponsorable({ contractAddress, call, calls, witnesses: sharedWitnesses, initialPrivateState, bind = true, attestationSecret: batchSecret, independentCalls = false, orderedPrefix = 0 }) {
+        async buildSponsorable({ contractAddress, call, calls, witnesses: sharedWitnesses, initialPrivateState, bind = true, attestationSecret: batchSecret, independentCalls = false, orderedPrefix = 0, recipients }) {
             if (!contractAddress) throw new Error('buildSponsorable: contractAddress is required');
+            const recipientKeys = recipientKeyMap(recipients);
             if (call && calls) throw new Error('buildSponsorable: pass either call or calls, not both');
             const callList = calls ?? (call ? [call] : []);
             if (!Array.isArray(callList) || callList.length === 0) {
@@ -676,7 +763,8 @@ export async function createTxBuilder(opts) {
                 // discards the error NAME, so match the message).
                 const { runBatchInScope } = require('../../srv/midnight/batch-call-scope.js');
                 try {
-                    await runBatchInScope(contracts, providers, found, scopeCalls, contractAddress, { independentCalls: independentCalls === true, orderedPrefix: Number(orderedPrefix) || 0 });
+                    await runBatchInScope(contracts, providers, found, scopeCalls, contractAddress, { independentCalls: independentCalls === true, orderedPrefix: Number(orderedPrefix) || 0 },
+                        recipientKeys ? { additionalCoinEncPublicKeyMappings: recipientKeys } : undefined);
                 } catch (e) {
                     if (/violates the ledger's causality constraint/.test(String(e?.message ?? e))) {
                         try {
@@ -694,10 +782,15 @@ export async function createTxBuilder(opts) {
                 }
             } else {
                 const single = callList[0];
-                const fn = found?.callTx?.[single.circuitId];
-                if (typeof fn !== 'function') {
+                const direct = found?.callTx?.[single.circuitId];
+                if (typeof direct !== 'function') {
                     throw new Error("circuit '" + single.circuitId + "' is not on the contract at " + contractAddress);
                 }
+                // The contract's call interface takes no recipient keys; with them the call is
+                // submitted through the same function it wraps.
+                const fn = recipientKeys
+                    ? (...args) => contracts.submitCallTx(providers, contracts.createCallTxOptions(compiled, single.circuitId, contractAddress, privateStateId, recipientKeys, args))
+                    : direct;
                 // The build-only provider stops at submit; the SDK wraps that error,
                 // so only an EMPTY holder means a real build failure.
                 try {
@@ -726,7 +819,8 @@ export async function createTxBuilder(opts) {
          * @param {{ initialPrivateState?: unknown, constructorArgs?: unknown[], witnesses?: object, bind?: boolean }} input
          * @returns {Promise<{ finalizedTxB64?: string, unboundTxB64?: string, serializedBytes: number, bound: boolean, contractAddress: string }>}
          */
-        async buildDeploySponsorable({ initialPrivateState, constructorArgs, witnesses, bind = true } = {}) {
+        async buildDeploySponsorable({ initialPrivateState, constructorArgs, witnesses, bind = true, recipients } = {}) {
+            const recipientKeys = recipientKeyMap(recipients);
             onProgress?.({ phase: 'build', circuit: '<deploy>' });
             const compiled = CompiledContract.make(contractName, contractClass).pipe(
                 witnesses ? CompiledContract.withWitnesses(witnesses) : CompiledContract.withVacantWitnesses,
@@ -750,7 +844,8 @@ export async function createTxBuilder(opts) {
                     compiledContract: compiled,
                     privateStateId,
                     initialPrivateState: initialPrivateState ?? {},
-                    ...(Array.isArray(constructorArgs) && constructorArgs.length > 0 ? { args: constructorArgs } : {})
+                    ...(Array.isArray(constructorArgs) && constructorArgs.length > 0 ? { args: constructorArgs } : {}),
+                    ...(recipientKeys ? { additionalCoinEncPublicKeyMappings: recipientKeys } : {})
                 });
             } catch (e) {
                 if (!holder.captured) throw e;

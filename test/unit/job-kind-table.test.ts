@@ -36,9 +36,14 @@ describe('job kind traits', () => {
         ]);
     });
 
-    it('the two sponsor phases are the only identifier-keyed kinds', () => {
+    it('the sponsoring kinds are the only identifier-keyed kinds', () => {
         const keyed = Object.entries(JOB_KIND_TRAITS).filter(([, t]) => t.identifierKeyed).map(([k]) => k).sort();
-        expect(keyed).toEqual(['sponsorFinalizedTransaction', 'sponsorUnboundTransaction']);
+        expect(keyed).toEqual(['sponsorFinalizedTransaction', 'sponsorSwap', 'sponsorUnboundTransaction']);
+    });
+
+    it('a swap runs on the unbound sponsor channel', () => {
+        expect(JOB_KINDS.sponsorSwap).toEqual(JOB_KINDS.sponsorUnboundTransaction);
+        expect(jobKindsOf('sponsorUnbound')).toEqual(['sponsorUnboundTransaction', 'sponsorSwap']);
     });
 
     it('proving kinds are heavy, sync-bound ones light, the prewarm serial and session-bound', () => {
@@ -104,6 +109,6 @@ describe('job definitions', () => {
     it('only chain-effect kinds carry a reconciliation finalizer', () => {
         const withFinalizer = Object.entries(JOB_KINDS).filter(([, d]) => d.finalizer).map(([k]) => k).sort();
         expect(withFinalizer).toEqual(['anchorDocument', 'fieldPredicateBatchProof', 'grantDisclosure', 'registerPassport', 'retract',
-            'revokeDisclosure', 'sponsorFinalizedTransaction', 'sponsorUnboundTransaction', 'submitContractCallBatch']);
+            'revokeDisclosure', 'sponsorFinalizedTransaction', 'sponsorSwap', 'sponsorUnboundTransaction', 'submitContractCallBatch']);
     });
 });

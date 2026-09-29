@@ -238,6 +238,7 @@ entity AgentGrants : cuid, managed {
     deploysUsed       : Integer default 0; // reserved before broadcast; refunded only on rejection
     deployedContracts : LargeString; // JSON array of addresses deployed under this grant; sponsorable beyond floor ∩ grant
     allowedTokenTypes : LargeString; // JSON array of raw shielded token types the sponsor pays offers for; null = platform floor
+    mintedTokenTypes  : LargeString; // JSON array of raw token types minted under this grant; sponsorable beyond floor ∩ grant
     validUntil        : Timestamp; // null = no expiry
     isActive          : Boolean default true;
     revokedAt         : Timestamp;

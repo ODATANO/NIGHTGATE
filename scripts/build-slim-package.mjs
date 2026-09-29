@@ -39,6 +39,7 @@ const FILES = [
     { path: 'src/txbuilder/index.mjs' },
     { path: 'src/txbuilder/index.d.ts' },
     { path: 'src/txbuilder/submit.mjs' },
+    { path: 'src/txbuilder/swap.mjs' },
     // the call/witness helpers (identical to @odatano/nightgate/browser)
     { path: 'src/browser/index.mjs' },
     { path: 'src/browser/index.d.ts' },
@@ -55,6 +56,9 @@ const FILES = [
     // two helpers the builder requires by relative path (BUILD OUTPUT)
     { path: 'srv/utils/wallet-hd.js', buildOutput: true },
     { path: 'srv/utils/wallet-hd.d.ts', buildOutput: true },
+    // offer files (bech32m); @scure/base only
+    { path: 'srv/utils/offer-file.js', buildOutput: true },
+    { path: 'srv/utils/offer-file.d.ts', buildOutput: true },
     { path: 'srv/midnight/runtime-config.js', buildOutput: true },
     { path: 'srv/midnight/runtime-config.d.ts', buildOutput: true },
     { path: 'srv/midnight/wasm-proof-provider.js', buildOutput: true },

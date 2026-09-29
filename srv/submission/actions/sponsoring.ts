@@ -13,6 +13,8 @@ import { resolveSponsorPolicyForRequest } from '../sponsor-policy';
 import { getConfiguredFeeSponsorSessions } from '../fee-sponsor';
 import type { NightgateRequest } from '../../utils/request-types';
 import { sponsorRateLimiter, facadeConfigFromEnv, rejectIfMainnetBlocked, checkRate, runSubmission } from './common';
+import { NightgateError } from '../../utils/errors';
+import { transactionBytesOf } from '../../utils/offer-file';
 import type { SubmissionContext } from './context';
 
 export function registerSponsoringActions(ctx: Pick<SubmissionContext, 'srv' | 'db'>): void {
@@ -111,6 +113,61 @@ export function registerSponsoringActions(ctx: Pick<SubmissionContext, 'srv' | '
                 requestedBy: req.user?.id,
                 grantId: req.agentGrant?.ID, commandVersion: 1, encryptCommand: true,
                 command: { op: 'sponsorUnbound', unboundTxB64, sponsorSessionId: effectiveSponsor, allowedContracts, allowedCircuits, allowDeploy, ownContracts, allowedTokenTypes, grantId }
+            });
+            return { ...job, sessionId: effectiveSponsor };
+        });
+    });
+
+    // A shielded swap as two proven, unbound halves; checked and merged in the worker.
+    srv.on('sponsorSwap', async (req: NightgateRequest) => {
+        const { makerHalfB64, takerHalfB64, sponsorSessionId, idempotencyKey } = req.data as {
+            makerHalfB64?: string; takerHalfB64?: string; sponsorSessionId?: string; idempotencyKey?: string;
+        };
+        if (!makerHalfB64) return req.reject(400, 'makerHalfB64 is required');
+        if (!takerHalfB64) return req.reject(400, 'takerHalfB64 is required');
+        // An offer file is checked and unpacked here; the job carries base64 either way.
+        const halves: Record<'makerHalfB64' | 'takerHalfB64', string> = { makerHalfB64: '', takerHalfB64: '' };
+        for (const [name, value] of [['makerHalfB64', makerHalfB64], ['takerHalfB64', takerHalfB64]] as const) {
+            try { halves[name] = Buffer.from(await transactionBytesOf(value)).toString('base64'); }
+            catch (e) { return req.reject(400, `${name}: ${(e as Error).message}`); }
+        }
+        const pool = getConfiguredFeeSponsorSessions(getNightgatePluginConfig());
+        let effectiveSponsor = sponsorSessionId;
+        if (!effectiveSponsor || effectiveSponsor === PLATFORM_POOL_SENTINEL) {
+            if (pool.length === 0) return req.reject(400, 'sponsorSessionId is required; no platform pool is configured');
+            effectiveSponsor = PLATFORM_POOL_SENTINEL;
+        }
+        if (rejectIfMainnetBlocked(req)) return;
+        if (!checkRate(sponsorRateLimiter, 'sponsor', req)) return;
+
+        return runSubmission(req, async () => {
+            const facadeCfg = facadeConfigFromEnv();
+            await ensureNetworkId(facadeCfg.networkId);
+            if (effectiveSponsor !== PLATFORM_POOL_SENTINEL) {
+                await resolveFeeSponsor({ db, sponsorSessionId: effectiveSponsor, requestingUserId: req.user?.id, config: getNightgatePluginConfig() });
+            }
+            const policy = resolveSponsorPolicyForRequest(req);
+            if (policy.allowSwaps !== true) {
+                throw new NightgateError('SPONSOR_POLICY_EMPTY', 'swaps are not sponsored here (NIGHTGATE_SPONSOR_ALLOW_SWAPS or policy file allowSwaps)');
+            }
+            if (!policy.allowedTokenTypes?.length) {
+                throw new NightgateError('SPONSOR_POLICY_EMPTY', 'a swap needs its token types in allowedTokenTypes, and none is sponsored for this caller');
+            }
+            const grantId: string | undefined = req.agentGrant?.ID ? String(req.agentGrant.ID) : undefined;
+            const caller = String(req.user?.id ?? 'anonymous');
+            const scopedIdempotencyKey = idempotencyKey
+                ? bytesToHex(sha256(Buffer.from(`${caller}\u0000${idempotencyKey}`, 'utf8')))
+                : undefined;
+            const job = await startJob({
+                kind: 'sponsorSwap', sessionId: effectiveSponsor, idempotencyKey: scopedIdempotencyKey,
+                request: {
+                    feeSponsor: effectiveSponsor, caller,
+                    bytes: halves.makerHalfB64.length + halves.takerHalfB64.length,
+                    txHash: bytesToHex(sha256(Buffer.concat([Buffer.from(halves.makerHalfB64, 'base64'), Buffer.from(halves.takerHalfB64, 'base64')])))
+                },
+                requestedBy: req.user?.id,
+                grantId: req.agentGrant?.ID, commandVersion: 1, encryptCommand: true,
+                command: { op: 'sponsorUnbound', swap: halves, sponsorSessionId: effectiveSponsor, grantId }
             });
             return { ...job, sessionId: effectiveSponsor };
         });

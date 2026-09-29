@@ -5,7 +5,7 @@
  */
 import fs from 'node:fs';
 import cds from '@sap/cds';
-import { configList, configFlag, configString } from '../utils/config';
+import { configList, configFlag, configString, configIsSet } from '../utils/config';
 import { NightgateError } from '../utils/errors';
 
 const log = cds.log('nightgate:sponsor-policy');
@@ -22,6 +22,12 @@ export interface SponsorPolicy {
     ownContracts?: string[];
     /** Raw token types (64 hex) whose zswap offers are sponsored; empty = none. */
     allowedTokenTypes?: string[];
+    /** Also sponsor the offer of a token a sponsorable contract mints in the same transaction. */
+    allowContractMints?: boolean;
+    /** Sponsor shielded swaps handed over as two halves; floor and (for a token caller) grant must both allow it. */
+    allowSwaps?: boolean;
+    /** Types minted under the grant: part of `allowedTokenTypes`, listed or not. */
+    ownTokenTypes?: string[];
 }
 
 export interface GrantPolicyInput {
@@ -31,6 +37,9 @@ export interface GrantPolicyInput {
     /** Addresses deployed under this grant; sponsorable on top of `floor ∩ grant`. */
     deployedContracts?: string[] | null;
     allowedTokenTypes?: string[] | null;
+    /** Raw types minted under this grant; sponsorable on top of `floor ∩ grant` while the floor sponsors contract mints. */
+    mintedTokenTypes?: string[] | null;
+    allowSwaps?: boolean | null;
 }
 
 /** Upper bound per list; a grant is one consumer, not a registry. */
@@ -86,7 +95,9 @@ function envPolicy(): SponsorPolicy {
         allowedContracts: configList('NIGHTGATE_SPONSOR_ALLOWED_CONTRACTS'),
         allowedCircuits: configList('NIGHTGATE_SPONSOR_ALLOWED_CIRCUITS'),
         allowDeploy: configFlag('NIGHTGATE_SPONSOR_ALLOW_DEPLOY'),
-        allowedTokenTypes
+        allowedTokenTypes,
+        allowContractMints: configFlag('NIGHTGATE_SPONSOR_ALLOW_CONTRACT_MINTS'),
+        allowSwaps: configFlag('NIGHTGATE_SPONSOR_ALLOW_SWAPS')
     };
 }
 
@@ -96,12 +107,14 @@ interface FileCache {
     size: number;
     policy: SponsorPolicy | null; // null = the current file is unusable
     lastGood: SponsorPolicy | null;
+    loadedAt: string | null; // when `lastGood` was read
 }
 let fileCache: FileCache | null = null;
 
 /** Test seam: forget the cached file state. */
 export function __resetSponsorPolicyForTests(): void {
     fileCache = null;
+    shadowedEnvLogged = false;
 }
 
 export class SponsorPolicyUnavailableError extends NightgateError {
@@ -118,21 +131,44 @@ function readPolicyFile(filePath: string): SponsorPolicy {
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
         throw new Error('policy file must be a JSON object');
     }
-    const unknownKeys = Object.keys(parsed).filter(k => k !== 'allowedContracts' && k !== 'allowedCircuits' && k !== 'allowDeploy' && k !== 'allowedTokenTypes');
+    const unknownKeys = Object.keys(parsed).filter(k => !POLICY_FILE_KEYS.includes(k));
     if (unknownKeys.length) throw new Error(`policy file has unknown keys: ${unknownKeys.join(', ')}`);
-    if (parsed.allowDeploy !== undefined && typeof parsed.allowDeploy !== 'boolean') throw new Error('allowDeploy must be a boolean');
+    for (const flag of ['allowDeploy', 'allowContractMints', 'allowSwaps']) {
+        if (parsed[flag] !== undefined && typeof parsed[flag] !== 'boolean') throw new Error(`${flag} must be a boolean`);
+    }
     return {
         allowedContracts: validatePolicyList('allowedContracts', parsed.allowedContracts),
         allowedCircuits: validatePolicyList('allowedCircuits', parsed.allowedCircuits),
         allowDeploy: parsed.allowDeploy === true,
-        allowedTokenTypes: validateTokenTypeList('allowedTokenTypes', parsed.allowedTokenTypes)
+        allowedTokenTypes: validateTokenTypeList('allowedTokenTypes', parsed.allowedTokenTypes),
+        allowContractMints: parsed.allowContractMints === true,
+        allowSwaps: parsed.allowSwaps === true
     };
+}
+
+const POLICY_FILE_KEYS = ['allowedContracts', 'allowedCircuits', 'allowDeploy', 'allowedTokenTypes', 'allowContractMints', 'allowSwaps'];
+
+/** Env settings the policy file replaces while it is set. */
+const SHADOWED_ENV_KEYS = [
+    'NIGHTGATE_SPONSOR_ALLOWED_CONTRACTS', 'NIGHTGATE_SPONSOR_ALLOWED_CIRCUITS', 'NIGHTGATE_SPONSOR_ALLOWED_TOKEN_TYPES',
+    'NIGHTGATE_SPONSOR_ALLOW_DEPLOY', 'NIGHTGATE_SPONSOR_ALLOW_CONTRACT_MINTS', 'NIGHTGATE_SPONSOR_ALLOW_SWAPS'
+];
+let shadowedEnvLogged = false;
+
+export function shadowedSponsorEnvKeys(): string[] {
+    if (!configString('NIGHTGATE_SPONSOR_POLICY_FILE')) return [];
+    return SHADOWED_ENV_KEYS.filter(k => configIsSet(k));
 }
 
 /** Current platform floor: env, or the policy file re-read on mtime/size change. */
 export function getGlobalSponsorPolicy(): SponsorPolicy {
     const filePath = configString('NIGHTGATE_SPONSOR_POLICY_FILE');
     if (!filePath) return envPolicy();
+    if (!shadowedEnvLogged) {
+        shadowedEnvLogged = true;
+        const shadowed = shadowedSponsorEnvKeys();
+        if (shadowed.length) log.warn(`sponsor policy comes from ${filePath}; ${shadowed.join(', ')} are set and ignored`);
+    }
 
     let stat: fs.Stats | null = null;
     let statError: unknown = null;
@@ -156,22 +192,24 @@ export function getGlobalSponsorPolicy(): SponsorPolicy {
         }
         log.error(`sponsor policy file ${filePath} cannot be read (${String((statError as Error)?.message ?? statError)}); ` +
             (lastGood ? 'keeping the last good policy' : 'no policy loaded yet, refusing every sponsored call'));
-        fileCache = { path: filePath, mtimeMs: -1, size: -1, policy: null, lastGood };
+        fileCache = { path: filePath, mtimeMs: -1, size: -1, policy: null, lastGood, loadedAt: lastGood ? fileCache?.loadedAt ?? null : null };
         if (lastGood) return lastGood;
         throw new SponsorPolicyUnavailableError(`sponsor policy file ${filePath} cannot be read and no policy was loaded before; refusing to sponsor`);
     }
     try {
         const policy = readPolicyFile(filePath);
-        fileCache = { path: filePath, mtimeMs: stat.mtimeMs, size: stat.size, policy, lastGood: policy };
+        fileCache = { path: filePath, mtimeMs: stat.mtimeMs, size: stat.size, policy, lastGood: policy, loadedAt: new Date().toISOString() };
         log.info(`sponsor policy reloaded from ${filePath}: ${policy.allowedContracts.length} contract(s), ${policy.allowedCircuits.length} circuit(s)` +
             (policy.allowedContracts.length === 0 ? ' (contracts unrestricted)' : '') +
             (policy.allowedCircuits.length === 0 ? ' (circuits unrestricted)' : '') +
-            `, ${policy.allowedTokenTypes?.length ?? 0} token type(s)`);
+            `, ${policy.allowedTokenTypes?.length ?? 0} token type(s)` +
+            (policy.allowContractMints ? ', contract mints sponsored' : '') +
+            (policy.allowSwaps ? ', swaps sponsored' : ''));
         return policy;
     } catch (e) {
         log.error(`sponsor policy file ${filePath} is invalid (${String((e as Error)?.message ?? e)}); ` +
             (lastGood ? 'keeping the last good policy' : 'no policy loaded yet, refusing every sponsored call'));
-        fileCache = { path: filePath, mtimeMs: stat.mtimeMs, size: stat.size, policy: null, lastGood };
+        fileCache = { path: filePath, mtimeMs: stat.mtimeMs, size: stat.size, policy: null, lastGood, loadedAt: lastGood ? fileCache?.loadedAt ?? null : null };
         if (lastGood) return lastGood;
         throw new SponsorPolicyUnavailableError(`sponsor policy file ${filePath} is invalid and no policy was loaded before; refusing to sponsor`);
     }
@@ -207,27 +245,75 @@ export function effectiveSponsorPolicy(floor: SponsorPolicy, grant?: GrantPolicy
     const withDeployed = contracts.length === 0 || deployed.length === 0
         ? contracts
         : [...contracts, ...deployed.filter(a => !contracts.includes(a))];
-    // Unlike contracts, an empty token floor means no offers at all.
+    // An empty token list means no offers at all, so an empty intersection
+    // narrows to that instead of stopping the grant's other calls.
     const floorTokens = floor.allowedTokenTypes ?? [];
     const grantTokens = (grant?.allowedTokenTypes ?? []).filter(t => typeof t === 'string' && t.length > 0);
-    let allowedTokenTypes: string[] = [];
-    if (floorTokens.length > 0) {
-        if (grantTokens.length === 0) allowedTokenTypes = floorTokens;
-        else {
-            allowedTokenTypes = grantTokens.filter(t => floorTokens.includes(t));
-            if (allowedTokenTypes.length === 0) {
-                throw new SponsorPolicyEmptyError(
-                    `this grant's allowedTokenTypes (${grantTokens.map(t => t.slice(0, 16)).join(', ')}) share nothing with the platform's ` +
-                    'sponsor token-type allow-list; the grant cannot be sponsored here (revoke and re-issue it, or widen the platform policy)');
-            }
-        }
-    }
+    const listed = grantTokens.length === 0 ? floorTokens : grantTokens.filter(t => floorTokens.includes(t));
+    // What the grant minted joins after the intersection, like its deployed contracts.
+    const minted = floor.allowContractMints === true
+        ? [...new Set((grant?.mintedTokenTypes ?? []).filter(t => typeof t === 'string' && /^[0-9a-f]{64}$/.test(t)))]
+        : [];
     return {
         allowedContracts: withDeployed,
         allowedCircuits: intersect(floor.allowedCircuits, grant?.allowedCircuits, 'allowedCircuits'),
-        allowedTokenTypes,
+        allowedTokenTypes: [...listed, ...minted.filter(t => !listed.includes(t))],
+        allowContractMints: floor.allowContractMints === true,
+        allowSwaps: floor.allowSwaps === true && (grant ? grant.allowSwaps === true : true),
+        ...(minted.length ? { ownTokenTypes: minted } : {}),
         allowDeploy: floor.allowDeploy === true && (grant ? grant.allowDeploy === true : true),
         ...(deployed.length ? { ownContracts: deployed } : {})
+    };
+}
+
+/**
+ * Why a grant's lists cannot work under the floor, or null. For the write of a
+ * grant; the check at sponsor time stays, since the floor can shrink later.
+ */
+export function grantPolicyConflict(floor: SponsorPolicy, grant: GrantPolicyInput): string | null {
+    try {
+        effectiveSponsorPolicy(floor, grant);
+    } catch (e) {
+        if (e instanceof SponsorPolicyEmptyError) return e.message;
+        throw e;
+    }
+    const floorTokens = floor.allowedTokenTypes ?? [];
+    const outside = (grant.allowedTokenTypes ?? []).filter(t => !floorTokens.includes(t));
+    if (outside.length === 0) return null;
+    return `allowedTokenTypes ${outside.join(', ')} ${outside.length === 1 ? 'is' : 'are'} not in the platform's sponsor token-type allow-list` +
+        `${floorTokens.length === 0 ? ' (the platform lists none)' : ''}; the platform policy has to list a type before a grant can`;
+}
+
+export interface SponsorPolicyDescription {
+    source: 'file' | 'env';
+    path: string | null;
+    /** When the policy in force was read from the file; null for env. */
+    loadedAt: string | null;
+    /** Env settings the policy file replaces. */
+    ignoredEnv: string[];
+    floor: SponsorPolicy | null;
+    /** Why there is no floor; null when there is one. */
+    floorError: string | null;
+}
+
+/** The floor in force and where it comes from. */
+export function describeGlobalSponsorPolicy(): SponsorPolicyDescription {
+    const path = configString('NIGHTGATE_SPONSOR_POLICY_FILE') || null;
+    let floor: SponsorPolicy | null = null;
+    let floorError: string | null = null;
+    try {
+        floor = getGlobalSponsorPolicy();
+    } catch (e) {
+        if (!(e instanceof SponsorPolicyUnavailableError)) throw e;
+        floorError = e.message;
+    }
+    return {
+        source: path ? 'file' : 'env',
+        path,
+        loadedAt: path && fileCache?.path === path ? fileCache.loadedAt : null,
+        ignoredEnv: shadowedSponsorEnvKeys(),
+        floor,
+        floorError
     };
 }
 

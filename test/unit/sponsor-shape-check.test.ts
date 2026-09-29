@@ -218,6 +218,192 @@ describe('checkSponsorableShape', () => {
 });
 
 // An artifact revision written in place under the same path loads as itself, for ESM and CommonJS, on real files.
+describe('contract mints: the offer of a token a call of the transaction mints', () => {
+    const FACTORY = 'aa'.repeat(32);
+    const SEP = 'f4'.repeat(32);
+    // Stand-in for the ledger's derivation: deterministic in both inputs.
+    const derive = (domainSeparator: string, contract: string) => `${domainSeparator.slice(0, 32)}${contract.slice(0, 32)}`;
+    const MINTED = derive(SEP, FACTORY);
+    const NIGHT = '00'.repeat(32);
+    const mintCall = (mints: Array<[string, bigint]>, over: Record<string, unknown> = {}) => ({
+        address: FACTORY, entryPoint: 'mint',
+        guaranteedTranscript: { effects: { shieldedMints: new Map(mints) } },
+        fallibleTranscript: undefined,
+        ...over
+    });
+    const offer = (deltas: Array<[string, bigint]>) => ({ inputs: [], outputs: [{}], transients: [], deltas: new Map(deltas) });
+    const check = (t: any, opts: Record<string, unknown> = {}, contracts: string[] | undefined = [FACTORY]) =>
+        workerExports.checkSponsorableShape(t, 5000, contracts, ['mint'], { nightTokenType: NIGHT, allowContractMints: true, deriveTokenType: derive, ...opts });
+
+    it('sponsors the mint without the type in any list', () => {
+        const t = tx([{ actions: [mintCall([[SEP, 1000n]])] }], { guaranteedOffer: offer([[MINTED, -1000n]]) });
+        expect(check(t)).toEqual([{ address: FACTORY, entryPoint: 'mint' }]);
+        // less than declared (part of the mint stays with the contract) passes too
+        expect(check(tx([{ actions: [mintCall([[SEP, 1000n]])] }], { guaranteedOffer: offer([[MINTED, -400n]]) }))).toHaveLength(1);
+    });
+
+    it('stays closed without the platform switch or without a derivation', () => {
+        const t = () => tx([{ actions: [mintCall([[SEP, 1000n]])] }], { guaranteedOffer: offer([[MINTED, -1000n]]) });
+        expect(() => check(t(), { allowContractMints: false })).toThrow(/shielded value transfer/);
+        expect(() => check(t(), { deriveTokenType: undefined })).toThrow(/shielded value transfer/);
+        expect(() => check(t(), { allowContractMints: false, allowedTokenTypes: ['cd'.repeat(32)] })).toThrow(/not in allowedTokenTypes/);
+    });
+
+    it('refuses more than the calls mint, and a payment in the minted type', () => {
+        expect(() => check(tx([{ actions: [mintCall([[SEP, 1000n]])] }], { guaranteedOffer: offer([[MINTED, -1001n]]) })))
+            .toThrow(/creates 1001 of token type f4f4f4f4f4f4f4f4…, the transaction's calls mint 1000/);
+        expect(() => check(tx([{ actions: [mintCall([[SEP, 1000n]])] }], { guaranteedOffer: offer([[MINTED, 5n]]) })))
+            .toThrow(/pays in token type f4f4f4f4f4f4f4f4…, not in allowedTokenTypes/);
+    });
+
+    it('a type nobody mints in the transaction is refused as before', () => {
+        const other = 'cd'.repeat(32);
+        expect(() => check(tx([{ actions: [mintCall([[SEP, 1000n]])] }], { guaranteedOffer: offer([[MINTED, -1000n], [other, -1n]]) })))
+            .toThrow(/moves token type cdcdcdcdcdcdcdcd…, not in allowedTokenTypes/);
+    });
+
+    it('counts only mints of sponsorable contracts; a contract deployed under the grant is one', () => {
+        const foreign = 'ee'.repeat(32);
+        const foreignMint = () => tx(
+            [{ actions: [CALL(FACTORY, 'mint'), mintCall([[SEP, 1000n]], { address: foreign })] }],
+            { guaranteedOffer: offer([[derive(SEP, foreign), -1000n]]) });
+        expect(() => check(foreignMint())).toThrow(/shielded value transfer/);
+        // The effective contract list carries the grant's deployed addresses.
+        expect(check(foreignMint(), { ownContracts: [foreign] }, [FACTORY, foreign])).toHaveLength(2);
+        expect(workerExports.declaredMints(foreignMint(), (a: string) => a === foreign, derive)).toEqual(new Map([[derive(SEP, foreign), 1000n]]));
+    });
+
+    it('sums the mints of several calls and both transcripts, and spends them once across the offers', () => {
+        const calls = [
+            mintCall([[SEP, 600n]]),
+            mintCall([], { guaranteedTranscript: undefined, fallibleTranscript: { effects: { shieldedMints: new Map([[SEP, 400n]]) } } })
+        ];
+        const split = (second: bigint) => tx([{ actions: calls }], {
+            guaranteedOffer: offer([[MINTED, -600n]]),
+            fallibleOffer: new Map([[1, offer([[MINTED, second]])]])
+        });
+        expect(check(split(-400n))).toHaveLength(2);
+        expect(() => check(split(-401n))).toThrow(/creates 401 of token type .* mint 400/);
+    });
+
+    it('a listed type is not charged to the mints, and NIGHT is never sponsored', () => {
+        const t = tx([{ actions: [mintCall([[SEP, 10n]])] }], { guaranteedOffer: offer([[MINTED, -5000n]]) });
+        expect(check(t, { allowedTokenTypes: [MINTED] })).toHaveLength(1);
+        const night = tx([{ actions: [mintCall([[SEP, 10n]])] }], { guaranteedOffer: offer([[NIGHT, -10n]]) });
+        expect(() => check(night, { deriveTokenType: () => NIGHT })).toThrow(/moves NIGHT/);
+    });
+
+    it('ignores a declared mint that is not a positive amount or derives no raw type', () => {
+        const zero = tx([{ actions: [mintCall([[SEP, 0n]])] }], { guaranteedOffer: offer([[MINTED, -1n]]) });
+        expect(() => check(zero)).toThrow(/shielded value transfer/);
+        const odd = tx([{ actions: [mintCall([[SEP, 10n]])] }], { guaranteedOffer: offer([[MINTED, -1n]]) });
+        expect(() => check(odd, { deriveTokenType: () => 'not-a-type' })).toThrow(/shielded value transfer/);
+    });
+
+    it('tokenTypeDeriver hands the ledger the domain separator as bytes', () => {
+        const rawTokenType = vi.fn(() => MINTED);
+        expect(workerExports.tokenTypeDeriver({ rawTokenType })('0a0b', FACTORY)).toBe(MINTED);
+        expect(rawTokenType).toHaveBeenCalledWith(new Uint8Array([0x0a, 0x0b]), FACTORY);
+    });
+});
+
+describe('checkSwapHalves: two halves of a shielded swap', () => {
+    const A = 'a1'.repeat(32);
+    const B = 'b2'.repeat(32);
+    const NIGHT = '00'.repeat(32);
+    const half = (deltas: Array<[string, bigint]>, over: Record<string, unknown> = {}, top: Record<string, unknown> = {}) => ({
+        intents: new Map(),
+        fallibleOffer: undefined,
+        guaranteedOffer: { inputs: [{}], outputs: [{}, {}], transients: [], deltas: new Map(deltas), ...over },
+        ...top
+    });
+    const maker = (over?: Record<string, unknown>, top?: Record<string, unknown>) => half([[A, 10n], [B, -3n]], over, top);
+    const taker = (over?: Record<string, unknown>, top?: Record<string, unknown>) => half([[B, 3n], [A, -10n]], over, top);
+    const check = (m: any, t: any, opts: Record<string, unknown> = {}) =>
+        workerExports.checkSwapHalves(m, t, { allowedTokenTypes: [A, B], nightTokenType: NIGHT, maxInputs: 4, ...opts });
+
+    it('returns the terms from the maker\'s side', () => {
+        expect(check(maker(), taker())).toEqual({
+            gives: { tokenType: A, amount: '10' },
+            wants: { tokenType: B, amount: '3' }
+        });
+        // 0x-prefixed and upper-case types normalize
+        expect(check(half([['0x' + A.toUpperCase(), 10n], [B, -3n]]), taker()).gives.tokenType).toBe(A);
+    });
+
+    it('refuses without listed token types, a type outside the list, and NIGHT', () => {
+        expect(() => check(maker(), taker(), { allowedTokenTypes: [] })).toThrow(/none is listed/);
+        expect(() => check(maker(), taker(), { allowedTokenTypes: [A] })).toThrow(/maker half moves token type b2b2b2b2b2b2b2b2…, not in allowedTokenTypes/);
+        expect(() => check(half([[A, 10n], [NIGHT, -3n]]), half([[NIGHT, 3n], [A, -10n]]), { allowedTokenTypes: [A, NIGHT] }))
+            .toThrow(/maker half moves NIGHT/);
+    });
+
+    it('refuses a gift cut in two, one half alone, and a half on one type', () => {
+        expect(() => check(half([[A, 10n]]), half([[A, -10n]]))).toThrow(/maker half gives 1 token type\(s\) and wants 0/);
+        expect(() => check(maker(), half([]))).toThrow(/taker half gives 0 token type\(s\) and wants 0/);
+        expect(() => check(half([[A, 10n], [B, -3n], ['c3'.repeat(32), -1n]]), taker())).toThrow(/wants 2/);
+    });
+
+    it('refuses halves that do not mirror each other', () => {
+        expect(() => check(maker(), half([[B, 3n], [A, -9n]]))).toThrow(/do not mirror each other/);
+        expect(() => check(maker(), maker())).toThrow(/do not mirror each other/);
+    });
+
+    it('refuses anything but an offer: an intent, a fallible offer, a transient, a contract-owned coin', () => {
+        expect(() => check(maker({}, { intents: new Map([[1, { actions: [CALL()] }]]) }), taker())).toThrow(/maker half carries an intent/);
+        expect(() => check(maker(), taker({}, { fallibleOffer: new Map([[1, {}]]) }))).toThrow(/taker half carries a fallible offer/);
+        expect(() => check(maker({ transients: [{}] }), taker())).toThrow(/carries a transient coin/);
+        expect(() => check(maker({ outputs: [{ contractAddress: 'aa'.repeat(32) }] }), taker())).toThrow(/carries a contract-owned coin/);
+        expect(() => check({ intents: new Map() }, taker())).toThrow(/maker half carries no readable guaranteed offer/);
+        expect(() => check(maker({ deltas: undefined }), taker())).toThrow(/exposes no deltas/);
+    });
+
+    it('bounds the coins of a half: inputs by the configured cap, outputs by two', () => {
+        expect(() => check(maker({ inputs: [{}, {}, {}, {}, {}] }), taker())).toThrow(/carries 5 inputs; 1 to 4 are sponsored/);
+        expect(check(maker({ inputs: [{}, {}, {}, {}, {}] }), taker(), { maxInputs: 5 })).toBeTruthy();
+        expect(() => check(maker({ inputs: [] }), taker())).toThrow(/carries 0 inputs/);
+        expect(() => check(maker({ outputs: [{}, {}, {}] }), taker())).toThrow(/carries 3 outputs/);
+        expect(check(maker({ outputs: [{}] }), taker())).toBeTruthy();
+    });
+
+    it('mergeSwapHalves: two unbound halves stay unbound, a bound half binds the other', () => {
+        const tx = (name: string, boundForm = false): any => ({
+            name, boundForm,
+            bind() { return tx(name, true); },
+            merge(other: any) {
+                if (other.boundForm !== this.boundForm) throw new Error('Both transactions need to be of the same type.');
+                return { merged: [this.name, other.name], boundForm: this.boundForm };
+            }
+        });
+        expect(workerExports.mergeSwapHalves({ tx: tx('m'), bound: false }, { tx: tx('t'), bound: false }))
+            .toEqual({ tx: { merged: ['m', 't'], boundForm: false }, bound: false });
+        expect(workerExports.mergeSwapHalves({ tx: tx('m', true), bound: true }, { tx: tx('t', true), bound: true }))
+            .toEqual({ tx: { merged: ['m', 't'], boundForm: true }, bound: true });
+        expect(workerExports.mergeSwapHalves({ tx: tx('m', true), bound: true }, { tx: tx('t'), bound: false }))
+            .toEqual({ tx: { merged: ['m', 't'], boundForm: true }, bound: true });
+        expect(workerExports.mergeSwapHalves({ tx: tx('m'), bound: false }, { tx: tx('t', true), bound: true }))
+            .toEqual({ tx: { merged: ['m', 't'], boundForm: true }, bound: true });
+    });
+
+    it('mergeSwapHalves: halves that share a coin are refused, not thrown through', () => {
+        const half = { tx: { merge() { throw new Error('attempted to merge non-disjoint coin sets'); } }, bound: false };
+        expect(() => workerExports.mergeSwapHalves(half, half)).toThrow(/refusing to sponsor: the halves do not merge: .*non-disjoint/);
+    });
+
+    it('assertSwapBalanced: the merge carries no intent, no delta and no imbalance, within the byte budget', () => {
+        const merged = (over: Record<string, unknown> = {}) => ({
+            intents: new Map(), guaranteedOffer: { deltas: new Map() },
+            imbalances: () => new Map([[{ tag: 'shielded', raw: A }, 0n]]), ...over
+        });
+        expect(() => workerExports.assertSwapBalanced(merged(), 30000)).not.toThrow();
+        expect(() => workerExports.assertSwapBalanced(merged(), 70000)).toThrow(/merged swap is 70000B, over the 65536B budget/);
+        expect(() => workerExports.assertSwapBalanced(merged({ intents: new Map([[1, {}]]) }), 30000)).toThrow(/carries an intent/);
+        expect(() => workerExports.assertSwapBalanced(merged({ guaranteedOffer: { deltas: new Map([[A, 1n]]) } }), 30000)).toThrow(/does not net to zero/);
+        expect(() => workerExports.assertSwapBalanced(merged({ imbalances: () => new Map([[{ raw: A }, 1n]]) }), 30000)).toThrow(/does not balance/);
+        expect(() => workerExports.assertSwapBalanced(merged({ imbalances: () => { throw new Error('x'); } }), 30000)).toThrow(/balance is not readable/);
+    });
+});
+
 describe('importArtifactGeneration: generation-pinned loading for ESM and CommonJS artifacts', () => {
     let dir: string;
     beforeAll(() => { dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ng-artifact-gen-')); });

@@ -108,6 +108,50 @@ service NightgateAdminService {
         gc            : { count: Integer; totalMs: Integer; byKind: String }; // byKind: JSON { kind: { count, ms } }
     };
 
+    /**
+     * The sponsor policy in force: platform lists, where they come from, and with
+     * `grantId` what is left of them for that grant (`effectiveError` says why nothing is).
+     */
+    function getSponsorPolicy(grantId: UUID) returns {
+        source         : String; // 'file' | 'env'
+        path           : String;
+        loadedAt       : Timestamp; // policy file only
+        ignoredEnv     : array of String; // env settings the policy file replaces
+        floorError     : String;
+        floor          : {
+            allowedContracts   : array of String; // empty = any
+            allowedCircuits    : array of String; // empty = any
+            allowedTokenTypes  : array of String; // empty = none
+            allowDeploy        : Boolean;
+            allowContractMints : Boolean;
+            allowSwaps         : Boolean;
+        };
+        grant          : {
+            grantId           : UUID;
+            active            : Boolean;
+            allowedContracts  : array of String;
+            allowedCircuits   : array of String;
+            allowedTokenTypes : array of String;
+            deployedContracts : array of String;
+            mintedTokenTypes  : array of String;
+            allowDeploy       : Boolean;
+            allowSwaps        : Boolean; // `sponsorSwap` is in the grant's allowedActions
+            maxDeploys        : Integer;
+            deploysUsed       : Integer;
+        };
+        effective      : {
+            allowedContracts   : array of String;
+            allowedCircuits    : array of String;
+            allowedTokenTypes  : array of String;
+            ownContracts       : array of String;
+            ownTokenTypes      : array of String; // minted under the grant; part of allowedTokenTypes
+            allowDeploy        : Boolean;
+            allowContractMints : Boolean;
+            allowSwaps         : Boolean;
+        };
+        effectiveError : String;
+    };
+
     /** Job counts per status and top error codes over `windowHours` (default 24, max 720). */
     function getJobStats(windowHours: Integer) returns {
         windowHours         : Integer;

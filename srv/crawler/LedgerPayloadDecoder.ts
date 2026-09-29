@@ -10,7 +10,7 @@
 
 import cds from '@sap/cds';
 import { parseExtrinsicCall } from '../utils/scale';
-import { extractLedgerPayload, decodeLedgerPayload, carriesShieldedCoins, carriesProof, type LedgerPayloadFacts } from './ledger-payload';
+import { extractLedgerPayload, decodeLedgerPayload, carriesShieldedCoins, carriesProof, callFreeTxType, type LedgerPayloadFacts } from './ledger-payload';
 import { readCapBinary } from './cap-binary';
 import { lockReorgGeneration } from '../submission/reorg-generation';
 import { Blocks, Transactions, ContractActions, SyncState, type Block, type Transaction, type ContractAction } from '#cds-models/midnight';
@@ -140,14 +140,14 @@ export class LedgerPayloadDecoder {
         // the cursor is the only gate, so resetting it replays the range,
         // which is how a decoder fix is rolled out.
         const rows: Row<Transaction, 'ID'>[] = await this.db.run(
-            SELECT.from(Transactions).columns('ID', 'raw', 'payloadDecode', 'transactionType')
+            SELECT.from(Transactions).columns('ID', 'raw', 'payloadDecode', 'transactionType', 'txType')
                 .where({ block_ID: blockId })
         ) || [];
         if (rows.length === 0) return EMPTY_RUN;
 
         // Decoding is wasm and must not hold a db transaction open, so the whole
         // batch is decoded first and written afterwards.
-        const updates: Array<{ id: string; facts: Awaited<ReturnType<typeof decodeLedgerPayload>> | null; state: DecodeState }> = [];
+        const updates: Array<{ id: string; facts: Awaited<ReturnType<typeof decodeLedgerPayload>> | null; state: DecodeState; txType?: string | null }> = [];
         const result: DecodeRunResult = { ...EMPTY_RUN, transactions: rows.length };
 
         for (const row of rows) {
@@ -167,7 +167,7 @@ export class LedgerPayloadDecoder {
                 continue;
             }
             try {
-                updates.push({ id: row.ID, facts: await decodeLedgerPayload(payload), state: 'decoded' });
+                updates.push({ id: row.ID, facts: await decodeLedgerPayload(payload), state: 'decoded', txType: (row as { txType?: string | null }).txType });
                 result.decoded++;
             } catch (err) {
                 log.warn(`transaction ${row.ID}: ledger payload did not decode: ${(err as Error).message}`);
@@ -178,20 +178,23 @@ export class LedgerPayloadDecoder {
 
         await this.db.tx(async (tx) => {
             for (const update of updates) {
-                await this.applyFacts(tx, update.id, update.facts, update.state);
+                await this.applyFacts(tx, update.id, update.facts, update.state, update.txType);
             }
         });
         return result;
     }
 
-    private async applyFacts(tx: DbRunner, transactionId: string, facts: LedgerPayloadFacts | null, state: DecodeState): Promise<void> {
+    private async applyFacts(tx: DbRunner, transactionId: string, facts: LedgerPayloadFacts | null, state: DecodeState, storedTxType?: string | null): Promise<void> {
         if (!facts) {
             await tx.run(UPDATE.entity(Transactions).set({ payloadDecode: state }).where({ ID: transactionId }));
             return;
         }
 
         const firstCall = facts.contractActions.find(a => a.entryPoint) ?? null;
+        // Only the pallet's default is replaced; a type the events gave stays.
+        const txType = storedTxType === 'contract_call' ? callFreeTxType(facts) : null;
         await tx.run(UPDATE.entity(Transactions).set({
+            ...(txType ? { txType } : {}),
             payloadDecode: state,
             identifiers: facts.identifiers.length ? JSON.stringify(facts.identifiers) : null,
             circuitName: firstCall?.entryPoint ?? null,

@@ -131,7 +131,7 @@ async function ensureSchemaDeployed(): Promise<void> {
         { table: 'midnight.DisclosureGrants', columns: ['pendingLevel', 'attesterId', 'changedAtHeight'] },
         { table: 'midnight.BackgroundJobs', columns: ['chainSegments'] },
         { table: 'midnight.WalletSessions', columns: ['label'] },
-        { table: 'midnight.AgentGrants', columns: ['allowedContracts', 'allowedCircuits', 'allowDeploy', 'maxDeploys', 'deploysUsed', 'deployedContracts', 'allowedTokenTypes'] },
+        { table: 'midnight.AgentGrants', columns: ['allowedContracts', 'allowedCircuits', 'allowDeploy', 'maxDeploys', 'deploysUsed', 'deployedContracts', 'allowedTokenTypes', 'mintedTokenTypes'] },
         { table: 'midnight.ContractRegistrations' },
         { table: 'midnight.ContractActions', columns: ['stateHash', 'stateSize', 'zswapStateHash', 'zswapStateSize'] },
         { table: 'midnight.ContractStates' },

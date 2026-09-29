@@ -300,6 +300,8 @@ export function connect(opts) {
         sponsorFinalized: (p) => act('sponsorFinalizedTransaction', p, 'sponsorSessionId'),
         /** Parallel channel: submit an UNBOUND tx (buildSponsorable bind:false). */
         sponsorUnbound: (p) => act('sponsorUnboundTransaction', p, 'sponsorSessionId'),
+        /** A shielded swap as its two halves (offer file text or base64 each); the sponsor merges, pays and submits. */
+        sponsorSwap: (p) => act('sponsorSwap', p, 'sponsorSessionId'),
         buildSponsorable: (p) => act('buildSponsorable', p)
     };
 }

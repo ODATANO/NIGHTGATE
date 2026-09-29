@@ -10,7 +10,10 @@ import { AgentGrants, WalletSessions, BackgroundJobs, Transactions, TransactionF
 import { RateLimiter } from '../utils/rate-limiter';
 import { PLATFORM_POOL_SENTINEL } from '../submission/sponsor-pool';
 import { getConfiguredFeeSponsorSessions } from '../submission/fee-sponsor';
-import { GrantPolicyInput, validatePolicyList, validateTokenTypeList } from '../submission/sponsor-policy';
+import {
+    GrantPolicyInput, validatePolicyList, validateTokenTypeList, grantPolicyConflict, getGlobalSponsorPolicy, MAX_POLICY_ENTRIES,
+    effectiveSponsorPolicy, describeGlobalSponsorPolicy, SponsorPolicyEmptyError, SponsorPolicyUnavailableError
+} from '../submission/sponsor-policy';
 import { withKeyedLock } from '../utils/keyed-lock';
 import { runWithoutAmbientTx } from '../submission/background-jobs';
 import { resolveFeeSponsor, FeeSponsorError } from '../submission/fee-sponsor';
@@ -46,14 +49,21 @@ export const AGENT_ALLOWLISTABLE_ACTIONS: readonly string[] = [
     // The transaction arrives proven and signed: the grant spends only the
     // sponsor's dust, which sponsor pinning and the daily budget meter.
     'sponsorFinalizedTransaction',
-    'sponsorUnboundTransaction'
+    'sponsorUnboundTransaction',
+    'sponsorSwap'
 ];
 
-/** The phase-2 sponsoring actions: keyed by the SPONSOR session, pool-aware. */
-export const SPONSOR_PHASE2_ACTIONS: ReadonlySet<string> = new Set([
+/** The sponsoring actions that take one caller transaction, which may be a deploy. */
+const SPONSOR_TRANSACTION_ACTIONS: ReadonlySet<string> = new Set([
     'sponsorFinalizedTransaction',
     'sponsorUnboundTransaction'
 ]);
+
+/** Its presence in a grant's `allowedActions` is the grant's right to have swaps sponsored. */
+export const SPONSOR_SWAP_ACTION = 'sponsorSwap';
+
+/** The phase-2 sponsoring actions: keyed by the SPONSOR session, pool-aware. */
+export const SPONSOR_PHASE2_ACTIONS: ReadonlySet<string> = new Set([...SPONSOR_TRANSACTION_ACTIONS, SPONSOR_SWAP_ACTION]);
 
 /**
  * Entities a token may READ; session-bound ones are narrowed in enforceAgentGrant.
@@ -114,6 +124,7 @@ interface AgentGrantRow {
     deploysUsed?: number | null;
     deployedContracts?: string | null; // JSON array: addresses deployed under this grant
     allowedTokenTypes?: string | null; // JSON array of raw token types, or null
+    mintedTokenTypes?: string | null; // JSON array: raw token types minted under this grant
     validUntil?: string | null;
     isActive?: boolean;
     revokedAt?: string | null;
@@ -146,6 +157,34 @@ export async function recordDeployedContracts(db: Runner, grantId: string, addre
         } catch (err) {
             log.error(`could not record deployed contract(s) ${fresh.map(a => a.slice(0, 12)).join(', ')} on grant ${grantId.slice(0, 8)}…: ${(err as Error)?.message ?? err}`);
             throw err;
+        }
+    });
+}
+
+/** Record token types minted under a grant; the sponsor policy counts them as listed for it. */
+export async function recordMintedTokenTypes(db: Runner, grantId: string, types: string[]): Promise<void> {
+    const fresh = [...new Set(types.map(t => String(t).trim().toLowerCase()).filter(t => /^[0-9a-f]{64}$/.test(t)))];
+    if (!grantId || fresh.length === 0) return;
+    await withKeyedLock(`agent-grant-mints:${grantId}`, async () => {
+        try {
+            const grant: AgentGrantRow | null = await runWithoutAmbientTx(() => db.run(
+                SELECT.one.from(AgentGrants).where({ ID: grantId })
+            )) as AgentGrantRow | null;
+            if (!grant) return;
+            const current = parseGrantList(grant.mintedTokenTypes);
+            const added = fresh.filter(t => !current.includes(t));
+            if (added.length === 0) return;
+            if (current.length + added.length > MAX_POLICY_ENTRIES) {
+                log.warn(`agent grant ${grantId.slice(0, 8)}… holds ${current.length} minted token types; ${added.map(t => t.slice(0, 12)).join(', ')} not recorded (at most ${MAX_POLICY_ENTRIES})`);
+                return;
+            }
+            await runWithoutAmbientTx(() => db.run(
+                UPDATE.entity(AgentGrants).set({ mintedTokenTypes: JSON.stringify([...current, ...added]) }).where({ ID: grantId })
+            ));
+            log.info(`agent grant ${grantId.slice(0, 8)}… minted token type(s) ${added.map(t => t.slice(0, 12)).join(', ')}`);
+        } catch (err) {
+            // The mint is on chain; a type that was not recorded is recorded by the next mint of it.
+            log.error(`could not record minted token type(s) ${fresh.map(t => t.slice(0, 12)).join(', ')} on grant ${grantId.slice(0, 8)}…: ${(err as Error)?.message ?? err}`);
         }
     });
 }
@@ -194,7 +233,9 @@ export async function currentGrantPolicy(runner: Runner, grantId: string): Promi
         allowedCircuits: parseGrantList(grant.allowedCircuits),
         deployedContracts: parseGrantList(grant.deployedContracts),
         allowedTokenTypes: parseGrantList(grant.allowedTokenTypes),
-        allowDeploy: grant.allowDeploy === true
+        mintedTokenTypes: parseGrantList(grant.mintedTokenTypes),
+        allowDeploy: grant.allowDeploy === true,
+        allowSwaps: parseGrantList(grant.allowedActions).includes(SPONSOR_SWAP_ACTION)
     };
 }
 
@@ -408,7 +449,7 @@ export function validateGrantShape(
     // A deploy is a distinct right with its own budget, never implied by the
     // action list; only the sponsoring actions can carry one.
     const allowDeploy = has('allowDeploy') || !existing ? input.allowDeploy === true : existing.allowDeploy === true;
-    if (allowDeploy && !effectiveActions.some(a => SPONSOR_PHASE2_ACTIONS.has(a))) {
+    if (allowDeploy && !effectiveActions.some(a => SPONSOR_TRANSACTION_ACTIONS.has(a))) {
         return fail("allowDeploy needs 'sponsorFinalizedTransaction' or 'sponsorUnboundTransaction' in allowedActions: a deploy is sponsored, never run by the server wallet");
     }
     let maxDeploys: number | null = null;
@@ -478,6 +519,79 @@ function parseTimestamp(raw: unknown): string | null | undefined {
     return Number.isNaN(t.getTime()) ? null : t.toISOString();
 }
 
+/**
+ * The reject for lists the platform policy leaves nothing of, or null. A grant
+ * without lists of its own inherits the platform's and needs no policy to be written.
+ */
+function policyReject(values: GrantShapeValues, deployedContracts: string[] = []): { status: number; code?: string; message: string } | null {
+    if (!values.allowedContracts.length && !values.allowedCircuits.length && !values.allowedTokenTypes.length) return null;
+    try {
+        const conflict = grantPolicyConflict(getGlobalSponsorPolicy(), {
+            allowedContracts: values.allowedContracts, allowedCircuits: values.allowedCircuits,
+            allowedTokenTypes: values.allowedTokenTypes, allowDeploy: values.allowDeploy, deployedContracts
+        });
+        return conflict ? { status: 400, message: conflict } : null;
+    } catch (e) {
+        if (e instanceof SponsorPolicyUnavailableError) return { status: e.status, code: e.code, message: e.message };
+        throw e;
+    }
+}
+
+export interface GrantSponsorPolicyView {
+    grantId: string;
+    active: boolean;
+    allowedContracts: string[];
+    allowedCircuits: string[];
+    allowedTokenTypes: string[];
+    deployedContracts: string[];
+    mintedTokenTypes: string[];
+    allowDeploy: boolean;
+    allowSwaps: boolean;
+    maxDeploys: number | null;
+    deploysUsed: number;
+}
+
+/** The platform policy, and with a grant what is left of it for that grant. */
+export async function describeSponsorPolicy(db: DbRunner, grantId?: string | null): Promise<Record<string, unknown> | null> {
+    const platform = describeGlobalSponsorPolicy();
+    const out: Record<string, unknown> = { ...platform, grant: null, effective: null, effectiveError: null };
+    if (!grantId) {
+        out.effective = platform.floor ? effectiveSponsorPolicy(platform.floor) : null;
+        out.effectiveError = platform.floorError;
+        return out;
+    }
+    const row = await runWithoutAmbientTx(() => db.run(SELECT.one.from(AgentGrants).where({ ID: grantId }))) as AgentGrantRow | null;
+    if (!row) return null;
+    const active = row.isActive !== false && !row.revokedAt && !grantExpired(row);
+    const grant: GrantSponsorPolicyView = {
+        grantId: row.ID,
+        active,
+        allowedContracts: parseGrantList(row.allowedContracts),
+        allowedCircuits: parseGrantList(row.allowedCircuits),
+        allowedTokenTypes: parseGrantList(row.allowedTokenTypes),
+        deployedContracts: parseGrantList(row.deployedContracts),
+        mintedTokenTypes: parseGrantList(row.mintedTokenTypes),
+        allowDeploy: row.allowDeploy === true,
+        allowSwaps: parseGrantList(row.allowedActions).includes(SPONSOR_SWAP_ACTION),
+        maxDeploys: row.maxDeploys ?? null,
+        deploysUsed: row.deploysUsed ?? 0
+    };
+    out.grant = grant;
+    if (!active) out.effectiveError = 'the grant is revoked or expired';
+    else if (!platform.floor) out.effectiveError = platform.floorError;
+    else {
+        try {
+            out.effective = effectiveSponsorPolicy(platform.floor, {
+                ...grant, allowDeploy: grant.allowDeploy && grant.deploysUsed < (grant.maxDeploys ?? 1)
+            });
+        } catch (e) {
+            if (!(e instanceof SponsorPolicyEmptyError)) throw e;
+            out.effectiveError = e.message;
+        }
+    }
+    return out;
+}
+
 const USAGE_WINDOW_MAX_MS = 366 * 24 * 60 * 60 * 1000;
 const USAGE_WINDOW_DEFAULT_MS = 30 * 24 * 60 * 60 * 1000;
 
@@ -506,6 +620,8 @@ export function registerAgentGrantHandlers(srv: any, db: DbRunner): void {
         if (!shape.ok) return req.reject(400, shape.message);
         const { allowDeploy, maxDeploys, allowedContracts, allowedCircuits, allowedTokenTypes } = shape.values;
         const actions = shape.values.allowedActions as string[];
+        const refused = policyReject(shape.values);
+        if (refused) return refused.code ? req.reject(refused as any) : req.reject(refused.status, refused.message);
 
         const session: WalletSession | undefined = await runWithoutAmbientTx(() => db.run(
             SELECT.one.from(WalletSessions).where({ sessionId: data.sessionId, isActive: true, userId })
@@ -527,7 +643,7 @@ export function registerAgentGrantHandlers(srv: any, db: DbRunner): void {
             const incompatible = actions.filter(a => !SPONSOR_PHASE2_ACTIONS.has(a));
             if (incompatible.length > 0) {
                 return req.reject(400,
-                    `a platform-pool grant may only allow 'sponsorFinalizedTransaction' / 'sponsorUnboundTransaction'; `
+                    `a platform-pool grant may only allow 'sponsorFinalizedTransaction' / 'sponsorUnboundTransaction' / 'sponsorSwap'; `
                     + `these actions resolve the sponsor directly and cannot use the pool: ${incompatible.join(', ')}`);
             }
         } else if (data.sponsorSessionId) {
@@ -613,6 +729,8 @@ export function registerAgentGrantHandlers(srv: any, db: DbRunner): void {
         const shape = validateGrantShape(data, existing);
         if (!shape.ok) return req.reject(400, shape.message);
         const v = shape.values;
+        const refused = policyReject(v, parseGrantList(existing.deployedContracts));
+        if (refused) return refused.code ? req.reject(refused as any) : req.reject(refused.status, refused.message);
         const patch: Record<string, unknown> = {
             allowedContracts: v.allowedContracts.length ? JSON.stringify(v.allowedContracts) : null,
             allowedCircuits: v.allowedCircuits.length ? JSON.stringify(v.allowedCircuits) : null,
@@ -902,6 +1020,8 @@ export async function enforceAgentGrant(req: NightgateRequest, db: DbRunner): Pr
         allowedCircuits: parseGrantList(grant.allowedCircuits),
         deployedContracts: parseGrantList(grant.deployedContracts),
         allowedTokenTypes: parseGrantList(grant.allowedTokenTypes),
+        mintedTokenTypes: parseGrantList(grant.mintedTokenTypes),
+        allowSwaps: parseGrantList(grant.allowedActions).includes(SPONSOR_SWAP_ACTION),
         // Admission pre-check only; the lifetime budget is reserved per deploy
         // before the broadcast (reserveDeployBudget).
         allowDeploy: grant.allowDeploy === true && (grant.deploysUsed ?? 0) < (grant.maxDeploys ?? 1)

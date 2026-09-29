@@ -120,6 +120,20 @@ describe('connect: jobs', () => {
         expect(JSON.parse(calls[1].init.body)).toEqual({ jobId: 'j2', sessionId: 'sponsor-1' });
     });
 
+    test('sponsorSwap posts both halves and polls under the SPONSOR session', async () => {
+        const { connect } = await importClient();
+        const { fn, calls } = fakeFetch([
+            { body: { jobId: 'job-9', status: 'pending', sessionId: 'sponsor-1' } },
+            { body: { status: 'succeeded', result: JSON.stringify({ txHash: '00aa', swap: { gives: { tokenType: 'a', amount: '10' }, wants: { tokenType: 'b', amount: '3' } } }) } }
+        ]);
+        const ng = connect({ baseUrl: 'https://ng.example', fetchFn: fn as any, pollMs: 1 });
+        const out = await ng.sponsorSwap({ makerHalfB64: 'swapoffer1xyz', takerHalfB64: 'AAEC', sponsorSessionId: 'sponsor-1' });
+        expect(calls[0].url).toBe('https://ng.example/api/v1/nightgate/sponsorSwap');
+        expect(JSON.parse(calls[0].init.body)).toEqual({ makerHalfB64: 'swapoffer1xyz', takerHalfB64: 'AAEC', sponsorSessionId: 'sponsor-1' });
+        expect(JSON.parse(calls[1].init.body)).toMatchObject({ jobId: 'job-9', sessionId: 'sponsor-1' });
+        expect(out).toMatchObject({ txHash: '00aa', swap: { gives: { amount: '10' } } });
+    });
+
     test('a failed job throws NightgateJobError carrying the job row', async () => {
         const { connect, NightgateJobError } = await importClient();
         const { fn } = fakeFetch([

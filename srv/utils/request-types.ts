@@ -14,7 +14,10 @@ export interface RequestAgentGrant {
     allowedCircuits: string[];
     deployedContracts: string[];
     allowedTokenTypes: string[];
+    mintedTokenTypes: string[];
     allowDeploy: boolean;
+    /** The grant lists the swap action. */
+    allowSwaps: boolean;
 }
 
 export type NightgateRequest<D = any> = Request<D> & {

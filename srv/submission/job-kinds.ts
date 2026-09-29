@@ -83,6 +83,10 @@ export const JOB_KINDS: Readonly<Record<string, JobKindDefinition>> = {
     // submit lock, so N jobs overlap on N dust backings.
     sponsorUnboundTransaction: {
         traits: { heavy: true, workflowParent: false, identifierKeyed: true }, executor: 'sponsorUnbound', finalizer: 'sponsoredSubmission'
+    },
+    // Two swap halves instead of one caller transaction; the same channel from the merge on.
+    sponsorSwap: {
+        traits: { heavy: true, workflowParent: false, identifierKeyed: true }, executor: 'sponsorUnbound', finalizer: 'sponsoredSubmission'
     }
 };
 

@@ -107,6 +107,8 @@ export interface NightgateClient {
     // cross-server fee sponsoring
     sponsorFinalized(p: ActionParams): Promise<JobResult>;
     sponsorUnbound(p: ActionParams): Promise<JobResult>;
+    /** `{ makerHalfB64, takerHalfB64, sponsorSessionId?, idempotencyKey? }`; a half is offer file text (`swapoffer1...`) or base64. */
+    sponsorSwap(p: ActionParams): Promise<JobResult>;
     buildSponsorable(p: ActionParams): Promise<JobResult>;
 }
 

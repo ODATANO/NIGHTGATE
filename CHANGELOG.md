@@ -1,5 +1,57 @@
 # Changelog
 
+## 0.29.0 - 2026-09-29
+
+### Features
+
+- `sponsorSwap(makerHalfB64, takerHalfB64, sponsorSessionId, idempotencyKey?)`: the
+  sponsor pays the dust of a shielded swap handed over as two proven halves, bound or
+  unbound, each as offer file (bech32m, `swapoffer1...`) or base64.
+  Each half gives one token type and wants another, both in `allowedTokenTypes`; the
+  halves mirror each other. Off by default: `NIGHTGATE_SPONSOR_ALLOW_SWAPS` / policy
+  file `allowSwaps`, and `sponsorSwap` in a grant's `allowedActions`. Job result
+  `{ txHash, swap: { gives, wants } }`. `NIGHTGATE_SPONSOR_SWAP_MAX_INPUTS` (4).
+- `NIGHTGATE_SPONSOR_ALLOW_CONTRACT_MINTS` / policy file `allowContractMints` (default
+  off): the sponsor pays the offer of a token a call of the same transaction mints,
+  without an `allowedTokenTypes` entry. The contract has to be sponsorable, the
+  offer creates at most the declared amount.
+- A landed mint under a grant records the type (`AgentGrants.mintedTokenTypes`); it
+  counts as listed for that grant while contract mints are sponsored.
+- Admin `getSponsorPolicy(grantId?)`: platform policy, its source and load time,
+  the grant's lists, the effective policy or the reason it is empty.
+- `@odatano/nightgate-tx` 0.8.0 (txbuilder):
+  - `createSwapWallet`: shielded-only wallet, `buildHalf`, `takeOffer`, `revert`,
+    `serializeState` / `walletState`; coin selection within `maxInputs` (4),
+    `coins()`, `spendable(tokenType)`.
+  - `encodeOffer`, `decodeOffer`, `readSwapTerms`, `sameSwapTerms`.
+  - `createTxBuilder`: `walletSync: 'shielded'`, `walletState`, `waitForSync()`,
+    `serializeWalletState()`, `shieldedKeys`.
+  - `buildSponsorable` / `buildDeploySponsorable`: `recipients` for coins created
+    for another wallet.
+  - `deriveIdentity` returns `addresses.shielded` and `shieldedKeys`; `deriveRoleSeeds`.
+  - Client `ng.sponsorSwap(...)`.
+
+### Fixes
+
+- `createAgentGrant` / `updateAgentGrant` answer 400 for contract or circuit lists
+  that share nothing with the platform's and for a token type the platform does not
+  list (were accepted, the grant then failed at its next sponsored call).
+- Grant token types that share nothing with the platform's sponsor no offer; the
+  grant's calls without an offer keep working (was `403 SPONSOR_POLICY_EMPTY` on
+  every sponsored call).
+- A WARN names the sponsor env settings a policy file replaces.
+- `Transactions.txType` of a transaction without contract action or unshielded
+  movement is `shielded_transfer` or `dust_registration` once decoded
+  (`crawler.decodePayloads`; was `contract_call`).
+
+### Schema
+
+- `AgentGrants.mintedTokenTypes`; additive, probed at startup (`nightgate-schema-delta`).
+
+### Dependencies
+
+- `@scure/base` ^2.2.0 (bech32m), already in the tree through the wallet SDK.
+
 ## 0.28.2 - 2026-09-29
 
 ### Fixes

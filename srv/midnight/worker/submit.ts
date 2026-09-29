@@ -450,6 +450,8 @@ export interface SubmitIntent {
     ttl?: string;
     /** Batches: call names per segment, so the confirmed outcome can say which calls applied. */
     segments?: Array<{ segment: number; calls: string[] }>;
+    /** Raw token types the transaction's calls mint; recorded on the grant once it landed. */
+    minted?: string[];
 }
 /** An ack slower than this is logged: the main thread's boundary write was slow. */
 const INTENT_ACK_WARN_MS = 10_000;

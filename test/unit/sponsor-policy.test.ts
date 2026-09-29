@@ -22,10 +22,14 @@ import {
     SponsorPolicyEmptyError,
     SponsorPolicyUnavailableError,
     MAX_POLICY_ENTRIES,
+    grantPolicyConflict,
+    describeGlobalSponsorPolicy,
+    shadowedSponsorEnvKeys,
     __resetSponsorPolicyForTests
 } from '../../srv/submission/sponsor-policy';
 
-const ENV_KEYS = ['NIGHTGATE_SPONSOR_ALLOWED_CONTRACTS', 'NIGHTGATE_SPONSOR_ALLOWED_CIRCUITS', 'NIGHTGATE_SPONSOR_POLICY_FILE', 'NIGHTGATE_SPONSOR_ALLOWED_TOKEN_TYPES'];
+const ENV_KEYS = ['NIGHTGATE_SPONSOR_ALLOWED_CONTRACTS', 'NIGHTGATE_SPONSOR_ALLOWED_CIRCUITS', 'NIGHTGATE_SPONSOR_POLICY_FILE', 'NIGHTGATE_SPONSOR_ALLOWED_TOKEN_TYPES',
+    'NIGHTGATE_SPONSOR_ALLOW_CONTRACT_MINTS', 'NIGHTGATE_SPONSOR_ALLOW_DEPLOY', 'NIGHTGATE_SPONSOR_ALLOW_SWAPS'];
 let tmpDir: string;
 
 beforeEach(() => {
@@ -93,7 +97,10 @@ describe('allowedTokenTypes: raw types, floor opens, grant narrows', () => {
         expect(effectiveSponsorPolicy(open).allowedTokenTypes).toEqual([T1, T2]);
         expect(effectiveSponsorPolicy(open, { allowedTokenTypes: [] }).allowedTokenTypes).toEqual([T1, T2]);
         expect(effectiveSponsorPolicy(open, { allowedTokenTypes: [T2] }).allowedTokenTypes).toEqual([T2]);
-        expect(() => effectiveSponsorPolicy(open, { allowedTokenTypes: ['ef'.repeat(32)] })).toThrow(SponsorPolicyEmptyError);
+        // Nothing shared: no offers, and the grant's other calls keep working.
+        expect(effectiveSponsorPolicy(open, { allowedTokenTypes: ['ef'.repeat(32)] }).allowedTokenTypes).toEqual([]);
+        expect(effectiveSponsorPolicy({ ...open, allowedContracts: ['A'] }, { allowedTokenTypes: ['ef'.repeat(32)] }))
+            .toMatchObject({ allowedContracts: ['A'], allowedTokenTypes: [] });
     });
 });
 
@@ -265,5 +272,154 @@ describe('ownContracts: calls on grant-deployed addresses are exempt from the ci
     });
     it('does not widen allowedCircuits itself', () => {
         expect(effectiveSponsorPolicy(floor, { deployedContracts: ['NEW'] }).allowedCircuits).toEqual(['attest']);
+    });
+});
+
+describe('allowContractMints: a platform switch', () => {
+    const floor = { allowedContracts: [], allowedCircuits: [] };
+
+    it('is off by default and read from env and from the policy file', () => {
+        expect(getGlobalSponsorPolicy().allowContractMints).toBe(false);
+        process.env.NIGHTGATE_SPONSOR_ALLOW_CONTRACT_MINTS = 'true';
+        expect(getGlobalSponsorPolicy().allowContractMints).toBe(true);
+        delete process.env.NIGHTGATE_SPONSOR_ALLOW_CONTRACT_MINTS;
+
+        const file = path.join(tmpDir, 'policy.json');
+        fs.writeFileSync(file, JSON.stringify({ allowContractMints: true }));
+        process.env.NIGHTGATE_SPONSOR_POLICY_FILE = file;
+        expect(getGlobalSponsorPolicy().allowContractMints).toBe(true);
+    });
+
+    it('a policy file with a non-boolean value is refused', () => {
+        const file = path.join(tmpDir, 'policy.json');
+        fs.writeFileSync(file, JSON.stringify({ allowContractMints: 'yes' }));
+        process.env.NIGHTGATE_SPONSOR_POLICY_FILE = file;
+        expect(() => getGlobalSponsorPolicy()).toThrow(SponsorPolicyUnavailableError);
+    });
+
+    it('follows the floor; a grant neither opens nor closes it', () => {
+        expect(effectiveSponsorPolicy(floor).allowContractMints).toBe(false);
+        expect(effectiveSponsorPolicy(floor, { allowContractMints: true } as any).allowContractMints).toBe(false);
+        expect(effectiveSponsorPolicy({ ...floor, allowContractMints: true }, { allowedContracts: ['A'] }).allowContractMints).toBe(true);
+    });
+});
+
+describe('grantPolicyConflict: lists checked when a grant is written', () => {
+    const T1 = 'ab'.repeat(32);
+    const T2 = 'cd'.repeat(32);
+    const floor = { allowedContracts: ['A', 'B'], allowedCircuits: ['attest'], allowedTokenTypes: [T1] };
+
+    it('accepts lists inside the floor, and a grant without lists', () => {
+        expect(grantPolicyConflict(floor, {})).toBeNull();
+        expect(grantPolicyConflict(floor, { allowedContracts: ['B'], allowedCircuits: ['attest'], allowedTokenTypes: [T1] })).toBeNull();
+    });
+
+    it('names every token type outside the platform list', () => {
+        expect(grantPolicyConflict(floor, { allowedTokenTypes: [T1, T2] }))
+            .toBe(`allowedTokenTypes ${T2} is not in the platform's sponsor token-type allow-list; the platform policy has to list a type before a grant can`);
+        expect(grantPolicyConflict({ allowedContracts: [], allowedCircuits: [] }, { allowedTokenTypes: [T1, T2] }))
+            .toMatch(new RegExp(`^allowedTokenTypes ${T1}, ${T2} are not in .* \\(the platform lists none\\)`));
+    });
+
+    it('reports contracts and circuits that share nothing with the floor', () => {
+        expect(grantPolicyConflict(floor, { allowedContracts: ['C'] })).toMatch(/allowedContracts \(C\) share nothing/);
+        expect(grantPolicyConflict(floor, { allowedCircuits: ['mint'] })).toMatch(/allowedCircuits \(mint\) share nothing/);
+        // A partial overlap narrows; an unrestricted floor takes the grant's list as it is.
+        expect(grantPolicyConflict(floor, { allowedContracts: ['B', 'C'] })).toBeNull();
+        expect(grantPolicyConflict({ allowedContracts: [], allowedCircuits: [] }, { allowedContracts: ['C'] })).toBeNull();
+    });
+});
+
+describe('describeGlobalSponsorPolicy', () => {
+    it('env: source, no path, no load time', () => {
+        process.env.NIGHTGATE_SPONSOR_ALLOWED_CONTRACTS = 'A,B';
+        expect(describeGlobalSponsorPolicy()).toMatchObject({
+            source: 'env', path: null, loadedAt: null, ignoredEnv: [], floorError: null,
+            floor: { allowedContracts: ['A', 'B'], allowedCircuits: [], allowedTokenTypes: [], allowDeploy: false, allowContractMints: false }
+        });
+    });
+
+    it('file: path, load time, and the env settings it replaces', () => {
+        const file = path.join(tmpDir, 'policy.json');
+        fs.writeFileSync(file, JSON.stringify({ allowedContracts: ['X'] }));
+        process.env.NIGHTGATE_SPONSOR_POLICY_FILE = file;
+        process.env.NIGHTGATE_SPONSOR_ALLOWED_CONTRACTS = 'A,B';
+        process.env.NIGHTGATE_SPONSOR_ALLOWED_CIRCUITS = 'attest';
+        const described = describeGlobalSponsorPolicy();
+        expect(described).toMatchObject({
+            source: 'file', path: file, floorError: null,
+            ignoredEnv: ['NIGHTGATE_SPONSOR_ALLOWED_CONTRACTS', 'NIGHTGATE_SPONSOR_ALLOWED_CIRCUITS'],
+            floor: { allowedContracts: ['X'], allowedCircuits: [] }
+        });
+        expect(Number.isNaN(Date.parse(String(described.loadedAt)))).toBe(false);
+        expect(shadowedSponsorEnvKeys()).toHaveLength(2);
+    });
+
+    it('an unusable file reports the reason instead of a floor', () => {
+        process.env.NIGHTGATE_SPONSOR_POLICY_FILE = path.join(tmpDir, 'missing.json');
+        expect(describeGlobalSponsorPolicy()).toMatchObject({ source: 'file', floor: null, loadedAt: null, floorError: expect.stringMatching(/cannot be read/) });
+    });
+
+    it('warns once when the policy file replaces env settings', () => {
+        const file = path.join(tmpDir, 'policy.json');
+        fs.writeFileSync(file, JSON.stringify({}));
+        process.env.NIGHTGATE_SPONSOR_POLICY_FILE = file;
+        process.env.NIGHTGATE_SPONSOR_ALLOWED_CIRCUITS = 'attest';
+        const warn = (cds.log as any).mock.results[0].value.warn;
+        warn.mockClear();
+        getGlobalSponsorPolicy();
+        getGlobalSponsorPolicy();
+        expect(warn).toHaveBeenCalledTimes(1);
+        expect(warn).toHaveBeenCalledWith(expect.stringMatching(/NIGHTGATE_SPONSOR_ALLOWED_CIRCUITS are set and ignored/));
+    });
+});
+
+describe('allowSwaps: floor AND the grant action', () => {
+    const closed = { allowedContracts: [], allowedCircuits: [] };
+    const open = { ...closed, allowSwaps: true };
+
+    it('is off by default and read from env and from the policy file', () => {
+        expect(getGlobalSponsorPolicy().allowSwaps).toBe(false);
+        process.env.NIGHTGATE_SPONSOR_ALLOW_SWAPS = 'true';
+        expect(getGlobalSponsorPolicy().allowSwaps).toBe(true);
+        delete process.env.NIGHTGATE_SPONSOR_ALLOW_SWAPS;
+        const file = path.join(tmpDir, 'policy.json');
+        fs.writeFileSync(file, JSON.stringify({ allowSwaps: true }));
+        process.env.NIGHTGATE_SPONSOR_POLICY_FILE = file;
+        expect(getGlobalSponsorPolicy().allowSwaps).toBe(true);
+        fs.writeFileSync(file, JSON.stringify({ allowSwaps: 1, pad: 'x' }));
+        expect(getGlobalSponsorPolicy().allowSwaps).toBe(true); // invalid edit: the last good policy stays
+    });
+
+    it('a plain caller inherits the floor; a grant needs the right itself', () => {
+        expect(effectiveSponsorPolicy(closed, { allowSwaps: true }).allowSwaps).toBe(false);
+        expect(effectiveSponsorPolicy(open).allowSwaps).toBe(true);
+        expect(effectiveSponsorPolicy(open, { allowedContracts: ['A'] }).allowSwaps).toBe(false);
+        expect(effectiveSponsorPolicy(open, { allowSwaps: true }).allowSwaps).toBe(true);
+    });
+});
+
+describe('mintedTokenTypes: what a grant minted counts as listed for it', () => {
+    const T1 = 'ab'.repeat(32);
+    const T2 = 'cd'.repeat(32);
+    const M = 'ef'.repeat(32);
+    const floor = { allowedContracts: [], allowedCircuits: [], allowedTokenTypes: [T1, T2], allowContractMints: true };
+
+    it('joins after the intersection, once, and is reported as ownTokenTypes', () => {
+        expect(effectiveSponsorPolicy(floor, { allowedTokenTypes: [T2], mintedTokenTypes: [M, M, T2] }))
+            .toMatchObject({ allowedTokenTypes: [T2, M], ownTokenTypes: [M, T2] });
+        // a platform that lists no type at all still sponsors what the grant minted
+        expect(effectiveSponsorPolicy({ ...floor, allowedTokenTypes: [] }, { mintedTokenTypes: [M] }).allowedTokenTypes).toEqual([M]);
+    });
+
+    it('counts only while the platform sponsors contract mints, and only raw types', () => {
+        const off = effectiveSponsorPolicy({ ...floor, allowContractMints: false }, { mintedTokenTypes: [M] });
+        expect(off.allowedTokenTypes).toEqual([T1, T2]);
+        expect(off.ownTokenTypes).toBeUndefined();
+        expect(effectiveSponsorPolicy(floor, { mintedTokenTypes: ['nope', M.toUpperCase()] }).ownTokenTypes).toBeUndefined();
+    });
+
+    it('is absent without a grant', () => {
+        expect(effectiveSponsorPolicy(floor).ownTokenTypes).toBeUndefined();
     });
 });

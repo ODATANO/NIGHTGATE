@@ -59,6 +59,14 @@ describe('runBatchInScope', () => {
         expect(options).toEqual({ scopeName: 'batch:attest+bindPassport+anchorContentRoot' });
     });
 
+    test('hands recipient keys to the scope, next to its name', async () => {
+        const { found, contracts } = makeFakes();
+        const keys = new Map([['c1'.repeat(32), 'e1'.repeat(32)]]);
+        await runBatchInScope(contracts, PROVIDERS, found, [{ circuit: 'attest', args: [] }], ADDR, {}, { additionalCoinEncPublicKeyMappings: keys });
+        expect(contracts.withContractScopedTransaction.mock.calls[0][2])
+            .toEqual({ scopeName: 'batch:attest', additionalCoinEncPublicKeyMappings: keys });
+    });
+
     test('rejects an empty calls array without touching the SDK', async () => {
         const { found, contracts } = makeFakes();
         await expect(runBatchInScope(contracts, PROVIDERS, found, [], ADDR))

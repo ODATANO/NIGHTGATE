@@ -112,18 +112,25 @@ and friends) run offline and feed into them.
 | `provingMode` | no | `wasm` (default, in-process) or `server` (proves on `proofServerUrl`, which receives the witnesses) |
 | `proofServerUrl` | with `server` | required by `provingMode: 'server'`, ignored otherwise |
 | `proofTimeoutMs` | no | server proving: timeout of one proof request, default 300000 ms; the SDK retries up to 3 times, so set it above your slowest circuit |
-| `walletSync` | no | default `true`: the wallet syncs from genesis on the calling thread for the builder's life (a full core until tip). `false`: no sync; value-free calls (every vault circuit) still build, value-moving calls fail at balancing |
+| `walletSync` | no | default `true`: the wallet syncs from genesis on the calling thread for the builder's life (a full core until tip). `false`: no sync; value-free calls (every vault circuit) still build, value-moving calls fail at balancing. `'shielded'`: only the shielded coins sync (minutes instead of the dust history), enough for a call that moves shielded value while a sponsor pays the fee |
+| `walletState` | no | from `serializeWalletState()`: the sub-wallets named in it resume instead of syncing from genesis |
 | `onProgress` | no | callback for asset download and build phases |
 
-Returns `{ attestationSecret, attesterId, zkAssets, addresses, provingMode, buildSponsorable, buildDeploySponsorable, close }`.
+Returns `{ attestationSecret, attesterId, zkAssets, addresses, shieldedKeys, provingMode, walletSync, waitForSync, serializeWalletState, buildSponsorable, buildDeploySponsorable, close }`.
 `close()` stops the wallet sync and the indexer sockets; otherwise both run
-until the process exits.
+until the process exits. `serializeWalletState()` returns the state of the
+syncing sub-wallets (`{ shielded, unshielded?, dust? }`); it holds the wallet's
+coins, store it like a key.
 
-### `deriveIdentity({ seedHex, networkId?, accountIndex?, attestationSecret? }) -> { attesterId, attestationSecret, addresses }`
+### `deriveIdentity({ seedHex, networkId?, accountIndex?, attestationSecret? }) -> { attesterId, attestationSecret, addresses, shieldedKeys }`
 
 The derivation `createTxBuilder` runs (role seeds, attestation secret,
-`attesterId`, NIGHT address) without builder, wallet or network, ~150 ms. Use
-it to show or register an identity before the first build.
+`attesterId`, NIGHT and shielded address, the public shielded keys) without
+builder, wallet or network, ~150 ms. Use it to show or register an identity
+before the first build. `shieldedKeys` (`coinPublicKey`,
+`encryptionPublicKey`) is what another builder lists under `recipients`.
+`deriveRoleSeeds(seedHex, accountIndex?)` returns the per-role seeds
+themselves (key material) for code that drives the wallet SDK directly.
 
 ### `buildSponsorable({ contractAddress, call | calls, initialPrivateState, bind?, attestationSecret?, independentCalls?, orderedPrefix? }) -> { finalizedTxB64 | unboundTxB64, serializedBytes, bound }`
 
@@ -185,6 +192,21 @@ dust spend and binds, so one sponsor wallet pays for many callers in parallel
 (one per registered dust backing). Proof, identity and TTL are identical.
 Client: `ng.sponsorUnbound(...)`.
 
+#### Coins for another wallet: `recipients`
+
+A call that creates a shielded coin for a wallet other than the builder's own
+(a mint to a third party) needs that wallet's keys to encrypt the coin:
+
+```js
+await b.buildSponsorable({
+    contractAddress, call,
+    recipients: [{ coinPublicKey, encryptionPublicKey }]   // the receiver's shieldedKeys
+});
+```
+
+Without them the build fails with `Unable to resolve encryption public key
+for recipient`. Also on `calls` batches and on `buildDeploySponsorable`.
+
 ### `ensureZkAssets({ zkConfigBaseUrl, cacheDir, circuits })`
 
 Warms the asset cache (build step, container image); `createTxBuilder` calls it.
@@ -194,6 +216,107 @@ a stale key fails `findDeployedContract` with `ContractTypeError`), a download
 not matching the manifest is refused. Without a manifest the cache is used as
 is. A `404` for a circuit the contract lacks is tolerated; any other error is
 fatal.
+
+## Shielded swaps
+
+Two wallets exchange shielded tokens without a contract. Each builds one half
+of the swap: it spends the coin it gives and creates the coin it wants. A half
+does not balance on its own; two mirrored halves merge into one transaction
+that settles both legs or none. A sponsor pays the fee (`sponsorSwap`), so a
+swap party needs neither NIGHT nor dust, and no contract class.
+
+```js
+import { connect } from '@odatano/nightgate/client';
+import { createSwapWallet } from '@odatano/nightgate/txbuilder';
+
+// maker
+const maker = await createSwapWallet({ seedHex, indexerHttpUrl, indexerWsUrl });
+await maker.sync();
+const { offer } = await maker.buildHalf({
+    give: { tokenType: CREDIT, amount: 1000n },
+    want: { tokenType: DATA, amount: 300n }
+});
+// publish `offer`: text, `swapoffer1...`
+
+// taker
+const taker = await createSwapWallet({ seedHex: other, indexerHttpUrl, indexerWsUrl });
+await taker.sync();
+const halves = await taker.takeOffer({
+    offer,
+    expect: { gives: { tokenType: CREDIT, amount: 1000n }, wants: { tokenType: DATA, amount: 300n } }
+});
+const ng = connect({ baseUrl, agentToken });
+const { txHash, swap } = await ng.sponsorSwap({
+    makerHalfB64: halves.makerHalfB64, takerHalfB64: halves.takerHalfB64, sponsorSessionId
+});
+```
+
+### `createSwapWallet(opts) -> SwapWallet`
+
+| Option | Required | Meaning |
+|---|---|---|
+| `seedHex` | yes | 64-byte BIP39 seed, 128 hex. Never leaves the process |
+| `indexerHttpUrl`, `indexerWsUrl` | yes | the indexer the wallet syncs from |
+| `networkId` | no | default `preprod` |
+| `accountIndex` | no | default 0 |
+| `provingMode` | no | `wasm` (default, in-process, about 200 s per half) or `server` (on `proofServerUrl`, 11 to 17 s; it sees the coins you spend, so only a proof server you run) |
+| `proofServerUrl` | with `server` | |
+| `walletState` | no | from `serializeState()`: resume instead of syncing from genesis |
+| `maxInputs` | no | most coins one half spends, default 4 (the sponsor's default `NIGHTGATE_SPONSOR_SWAP_MAX_INPUTS`) |
+
+Only the shielded wallet syncs. From genesis on preprod that took 182 to 380 s
+on one core; a wallet resumed from its saved state (about 5 kB) continues where
+it stopped. The state holds the wallet's coins: store it like a key.
+
+Returns `{ address, coinPublicKey, encryptionPublicKey, provingMode,
+maxInputs, sync, balances, coins, spendable, buildHalf, takeOffer,
+serializeState, close }`.
+
+- `buildHalf({ give, want, bind? })` -> `{ offer?, halfB64, bound, terms,
+  serializedBytes, revert }`. `bind: true` (default) binds the half and
+  returns its offer file; `bind: false` returns it unbound, as base64 only.
+- `takeOffer({ offer, expect? })` -> `{ makerHalfB64, takerHalfB64, bound,
+  terms, revert }`. Reads the terms from the transaction, never from what the
+  maker claims, refuses when they differ from `expect`, and builds the mirror
+  half in the offer's form (bound and unbound transactions do not merge).
+- `revert()` releases the coins of a half that is not handed over. Until then,
+  or until the swap lands, they are pending in the wallet.
+
+A half refers to a recent state of the coin tree and expires with it: build
+the halves and hand them over close together.
+
+### Many small coins
+
+Every swap leaves a wallet two new coins per half (the coin it wanted, its
+change), so a trading wallet collects small coins, and a sponsor accepts a
+half only up to its input cap. The swap wallet handles both:
+
+- `buildHalf` spends the smallest coins that still fit `maxInputs`. Coins of
+  1, 1, 1, 1 and 100 giving 50 become the inputs 1, 1, 1 and 100; taking the
+  smallest first without the cap would need all five. Trading merges small
+  coins as it goes: up to `maxInputs` coins in, one change coin out.
+- `spendable(tokenType)` is what the `maxInputs` largest free coins hold: the
+  most one half can give. `buildHalf` refuses more before anything is proven.
+  `coins()` lists the free coins.
+- To merge coins without trading, swap with yourself: one wallet that holds two
+  token types builds both halves (`buildHalf`, then `takeOffer` on its own
+  offer). Giving exactly what its smallest coins hold leaves one coin per type
+  in their place. It is an ordinary sponsored swap.
+
+A half with 4 inputs and 2 outputs is about 30 kB, the merged swap about 60 kB.
+A sponsor that accepts more inputs also needs a larger byte budget
+(`NIGHTGATE_SPONSOR_MAX_TX_BYTES`, default 65536).
+
+### Offer files
+
+`encodeOffer(txOrBytes)` and `decodeOffer(text | base64 | bytes)` write and
+read the text form: bech32m under the prefix `swapoffer`, without a length
+limit, carrying the serialized, proven, bound transaction. `decodeOffer`
+returns `{ tx, bound, bytes }`. `readSwapTerms(tx)` returns `{ gives, wants,
+inputs, outputs }` and throws for anything but a plain swap half (an intent, a
+fallible offer, a transient or contract-owned coin, not exactly one token type
+given and one other wanted): the rules the sponsor applies.
+`sameSwapTerms(terms, expect)` compares two sets of terms.
 
 ## Running the sponsor half
 

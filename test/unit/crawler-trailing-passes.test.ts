@@ -187,6 +187,31 @@ describe('LedgerPayloadDecoder', () => {
         expect(await read(transfer)).toEqual(expect.objectContaining({ isShielded: false, hasProof: false, proofHash: null }));
     });
 
+    it('replaces the pallet default type of a call-free transaction, and only that', async () => {
+        const blockId = await seedBlock(10, '0xd7');
+        const swap = await seedTransaction(blockId, { transactionId: 0, raw: midnightExtrinsicBase64(20), txType: 'contract_call' });
+        const transfer = await seedTransaction(blockId, { transactionId: 1, raw: midnightExtrinsicBase64(21), txType: 'night_transfer' });
+        const call = await seedTransaction(blockId, { transactionId: 2, raw: midnightExtrinsicBase64(22), txType: 'contract_call' });
+        const feeOnly = await seedTransaction(blockId, { transactionId: 3, raw: midnightExtrinsicBase64(23), txType: 'contract_call' });
+        await setSync({ lastIndexedHeight: 20, lastDecodedHeight: null });
+        const none = { zswapInputCount: 0, zswapOutputCount: 0, zswapTransientCount: 0 };
+        decodeLedgerPayload.mockImplementation(async (bytes: Uint8Array) => {
+            if (bytes.length === 20) return facts({ zswapInputCount: 2, zswapOutputCount: 2 });
+            if (bytes.length === 21) return facts({ zswapInputCount: 1, zswapOutputCount: 1 });
+            if (bytes.length === 22) return facts({ ...none, contractActions: [{ address: CONTRACT, entryPoint: 'increment' }] });
+            return facts(none);
+        });
+
+        expect((await runDecoder()).decoded).toBe(4);
+
+        const typeOf = async (ID: string) => (await db.run(cds.ql.SELECT.one.from(TRANSACTIONS).where({ ID }))).txType;
+        expect(await typeOf(swap)).toBe('shielded_transfer');
+        // the events named it: an unshielded movement with shielded coins next to it stays what it is
+        expect(await typeOf(transfer)).toBe('night_transfer');
+        expect(await typeOf(call)).toBe('contract_call');
+        expect(await typeOf(feeOnly)).toBe('contract_call');
+    });
+
     it('matches several calls on one contract in declaration order', async () => {
         const blockId = await seedBlock(10, '0xd2');
         const txId = await seedTransaction(blockId, { raw: midnightExtrinsicBase64(20) });

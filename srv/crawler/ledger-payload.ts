@@ -156,6 +156,18 @@ export function carriesProof(facts: LedgerPayloadFacts): boolean {
     return carriesShieldedCoins(facts) || facts.contractActions.some(a => a.entryPoint !== null);
 }
 
+/**
+ * What a transaction without any contract action is. The block's events name
+ * contract actions and unshielded movements only, so such a transaction has
+ * nothing but its pallet's default type until the payload is read.
+ */
+export function callFreeTxType(facts: LedgerPayloadFacts): 'shielded_transfer' | 'dust_registration' | null {
+    if (facts.contractActions.length > 0) return null;
+    if (carriesShieldedCoins(facts)) return 'shielded_transfer';
+    if (facts.dustRegistrationCount > 0) return 'dust_registration';
+    return null;
+}
+
 /** Deserializes the payload and reads it; throws when no marker combination fits. */
 export async function decodeLedgerPayload(bytes: Uint8Array): Promise<LedgerPayloadFacts> {
     const ledger = await loadLedgerV8();

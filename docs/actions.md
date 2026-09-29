@@ -343,7 +343,15 @@ its token types (`NIGHTGATE_SPONSOR_ALLOWED_TOKEN_TYPES`, policy file, grant
 `allowedTokenTypes`): every net change must be on a listed type (never NIGHT),
 every contract-owned coin must belong to a sponsorable contract, and a net
 change must exist unless a coin is owned by a sponsorable contract (a burn nets
-to zero). The allow-list bounds which calls are paid:
+to zero). With `NIGHTGATE_SPONSOR_ALLOW_CONTRACT_MINTS` (policy file
+`allowContractMints`) a type needs no list entry while a call of the same
+transaction mints it: the call declares the mint (domain separator and
+amount, bound by its proof), the type follows from domain separator and
+contract address, the contract has to be sponsorable, and the offer may create
+at most the declared amount. A landed mint under a grant records the type on
+the grant (`mintedTokenTypes`); such a type counts as listed for that grant
+while the switch is on, so a later payment or swap in it needs no entry
+either. The allow-list bounds which calls are paid:
 
 ```bash
 NIGHTGATE_SPONSOR_ALLOWED_CONTRACTS=<vault addr>,<other addr>
@@ -384,14 +392,23 @@ reach this endpoint can make you pay fees.
   An empty grant list is no restriction. Sponsored calls run under platform
   lists ∩ grant lists; an absent grant list inherits the platform list; for
   contracts and circuits an empty platform list lets the grant be the whole
-  policy, for token types it means no offers. Disjoint non-empty lists:
-  `403 SPONSOR_POLICY_EMPTY`.
+  policy, for token types it means no offers. Disjoint non-empty contract or
+  circuit lists: `403 SPONSOR_POLICY_EMPTY` for every sponsored call of the
+  grant. Token types that share nothing sponsor no offer; calls without an
+  offer keep working. `createAgentGrant` and `updateAgentGrant` answer 400
+  for contract or circuit lists that share nothing with the platform's and
+  for a token type the platform does not list (`503
+  SPONSOR_POLICY_UNAVAILABLE` while the policy file is unreadable); a grant
+  without lists is always written.
 - **Policy file (platform floor).** `NIGHTGATE_SPONSOR_POLICY_FILE` = JSON
   `{ "allowedContracts": [...], "allowedCircuits": [...], "allowDeploy": false,
-  "allowedTokenTypes": [...] }`, re-read per sponsored call (mtime cache),
-  replaces the env lists. Fail-closed: an invalid file keeps the last good
-  policy; with none loaded every sponsored call is
-  `503 SPONSOR_POLICY_UNAVAILABLE`.
+  "allowedTokenTypes": [...], "allowContractMints": false, "allowSwaps":
+  false }`, re-read per
+  sponsored call (mtime cache), replaces the env settings (a WARN names the
+  ones that are set and ignored). Fail-closed: an invalid file keeps the last
+  good policy; with none loaded every sponsored call is
+  `503 SPONSOR_POLICY_UNAVAILABLE`. Admin `getSponsorPolicy(grantId?)` shows
+  the policy in force.
 - **Sponsored deploys.** `createAgentGrant(..., allowDeploy: true,
   maxDeploys?)` lets the sponsor pay a deploy the caller built and signed
   (txbuilder `buildDeploySponsorable`). Requires the floor
@@ -486,6 +503,66 @@ trie level. Server-built calls (deploy, `submitContractCall`, batch, `issue*`,
 anchors) rebuild (`NIGHTGATE_STALE_TRANSCRIPT_RETRIES`, default 2, after
 `NIGHTGATE_STALE_TRANSCRIPT_BACKOFF_MS`); a sponsored job cannot rebuild the
 caller's bytes and fails with `1010/104`.
+
+### `sponsorSwap(makerHalfB64, takerHalfB64, sponsorSessionId, idempotencyKey?) → { jobId, status, sessionId }`
+
+Sponsor a shielded swap that settles without a contract: the maker spends the
+coin it gives and creates the coin it wants, the taker builds the mirror half,
+and one transaction carries both. Each half is a proven transaction (the
+wallet SDK builds one with `initSwap(..., { payFees: false })`), handed over
+in either form:
+
+- an offer file: bech32m text under the prefix `swapoffer` (`swapoffer1...`),
+  upper or lower case, carrying the serialized transaction;
+- base64 of the serialized transaction.
+
+A half may be bound, as an offer file carries it, or unbound. Bound and unbound
+transactions do not merge, so a bound half binds the other one. A damaged offer
+file (checksum, prefix, character) is 400 naming the half. The worker checks
+both halves, merges them, adds the dust spend and submits on the unbound
+channel. Job result
+`{ txHash, circuits: ["<swap>"], note, swap: { gives: { tokenType, amount },
+wants: { tokenType, amount } } }`, from the maker's side, amounts in atoms.
+**Rate limit:** 120/hour per principal, shared with the other sponsor actions.
+
+Off by default: `NIGHTGATE_SPONSOR_ALLOW_SWAPS` (policy file `allowSwaps`)
+opens it, and a token caller needs `sponsorSwap` in its grant's
+`allowedActions`. Refused unless all hold:
+
+- A half carries an offer and nothing else: no intent (call, deploy,
+  unshielded value, dust action), no fallible offer, no transient, no
+  contract-owned coin.
+- A half gives exactly one token type and wants exactly one other; both are
+  in the effective `allowedTokenTypes`, neither is NIGHT.
+- A half has 1 to `NIGHTGATE_SPONSOR_SWAP_MAX_INPUTS` (default 4) inputs and
+  at most two outputs (the coin it wants, its change).
+- The halves mirror each other in types and amounts; the merge balances in
+  every type and fits `NIGHTGATE_SPONSOR_MAX_TX_BYTES`.
+
+What the check cannot see: the token types of the coins themselves (only a
+half's net change shows a type) and who owns them. A swap against an amount of
+1 is a transfer in effect and one party can build both halves, so an open swap
+right makes the sponsor a fee-free relay for the listed types, bounded by the
+rate limit and the grant's `maxJobsPerDay`. The sponsor pays dust only; it
+never adds or removes value.
+
+An offer fills once: the first transaction that lands spends the maker's coin,
+every later one is rejected by the node and its job fails. A maker withdraws an
+offer by spending the coin.
+
+Size: every input or output is about 5 kB. Two halves with 4 inputs and 2
+outputs each merge to about 60 kB, with 5 inputs each to about 70 kB, so
+raising `NIGHTGATE_SPONSOR_SWAP_MAX_INPUTS` also needs a higher
+`NIGHTGATE_SPONSOR_MAX_TX_BYTES`. A transfer of a wallet's coins to itself is
+not sponsored: it nets to zero, so it shows no token type at all. A wallet
+merges small coins inside its swaps, or by a swap with itself between two
+token types it holds (`docs/txbuilder.md`).
+
+A half refers to a recent state of the coin tree and expires with it: build
+the halves and hand them over close together. The wallet that built a half
+holds its coins as pending; a half that is never handed over has to be reverted
+in that wallet (`revertTransaction`), or the coins stay unavailable until they
+time out.
 
 ### `anchorDocument(sha256, storageRef, sessionId, contractAddress, contentType?, size?, metadata?, compiledArtifactRef?, idempotencyKey?, sponsorSessionId?) → { jobId, status, documentId, attesterId }`
 
@@ -801,6 +878,8 @@ Last `limit` (default 10, max 100) reorg events with depth, detected-at timestam
 `BackgroundJobs` (read-only entity): the job queue without `command`, `request` and `result` (`command` is encrypted at rest), with full OData queries, e.g. `?$filter=status eq 'failed'&$orderby=createdAt desc`. It is a SQL view: on an existing database it appears only after `cds deploy` or `nightgate-schema-delta`.
 
 `getJobStats(windowHours?) → { windowHours, since, total, byStatus[], topErrors[], oldestQueuedSeconds }`: counts per status and the ten most frequent error codes over `windowHours` (default 24, max 720).
+
+`getSponsorPolicy(grantId?) → { source, path, loadedAt, ignoredEnv[], floor, floorError, grant, effective, effectiveError }`: the platform sponsor policy (`source` `file` or `env`, `loadedAt` of the policy file, `ignoredEnv` = env settings the file replaces), and with `grantId` the grant's lists, its `deployedContracts` and `mintedTokenTypes`, and what is left of them (`effective`, with `ownContracts` and `ownTokenTypes`), or why nothing is (`effectiveError`). Unknown grant 404.
 
 `reconcileNightBalances(address?, after?, limit?) → { checked, next, drifted[{ address, field, stored, computed }] }`: `NightBalances` rows that differ from the figures the indexed NIGHT UTXOs imply (the rule a reorg rollback rebuilds by); writes nothing. One `address`, or a page of up to `limit` (max 500) addresses after `after`; `next` is the cursor for the following page, `null` at the end. `field: 'row'` = a row is missing.
 

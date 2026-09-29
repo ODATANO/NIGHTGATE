@@ -105,6 +105,22 @@ Details: `docs/txbuilder.md` in the main repo.
 pays for many callers at once (one per registered dust backing). Same proof,
 identity and TTL.
 
+## Shielded swaps
+
+Two wallets exchange shielded tokens without a contract; a sponsor pays the
+fee. `createSwapWallet({ seedHex, indexerHttpUrl, indexerWsUrl })` syncs the
+shielded coins only. `buildHalf({ give, want })` returns one half of a swap and
+its offer file (`swapoffer1...`); `takeOffer({ offer, expect })` reads the
+offer's terms from the transaction, builds the mirror half and returns both for
+`ng.sponsorSwap({ makerHalfB64, takerHalfB64, sponsorSessionId })`.
+`serializeState()` / `walletState` resume a wallet without a sync from genesis.
+Details: `docs/txbuilder.md` in the main repo.
+
+A contract call that moves shielded value needs the same coins only:
+`createTxBuilder({ ..., walletSync: 'shielded' })`. A call that creates a coin
+for another wallet takes that wallet's keys as
+`recipients: [{ coinPublicKey, encryptionPublicKey }]`.
+
 ## Your own contract, and sponsored deploys
 
 `createTxBuilder({ contractClass, zkConfigDir })` reads your own `keys/` and
@@ -151,7 +167,7 @@ Full flow: [`example/self-funded.mjs`](./example/self-funded.mjs).
 | --- | --- |
 | `@odatano/nightgate-tx` | `connect` + `createTxBuilder` (the whole SDK) |
 | `@odatano/nightgate-tx/client` | the hosted-endpoint client alone |
-| `@odatano/nightgate-tx/txbuilder` | the local builder + the self-funded submission helpers |
+| `@odatano/nightgate-tx/txbuilder` | the local builder, the swap wallet and offer files, the self-funded submission helpers |
 | `@odatano/nightgate-tx/calls` | the `prepare*` call builders, witnesses, attestation-secret helpers |
 | `@odatano/nightgate-tx/attestation-vault` | the compiled contract class and its pure circuits |
 | `@odatano/nightgate-tx/attestation-vault-32` | the 32-slot vault's contract class (pass `slotWidth: 32` to the `prepare*` helpers, `zkConfigBaseUrl` = `/zk-config/attestation-vault-32`) |

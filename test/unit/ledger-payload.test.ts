@@ -7,7 +7,7 @@
  * by scripts/integration-test-utxo-identity.mjs for the identity helpers.
  */
 
-import { extractLedgerPayload, readLedgerFacts, carriesShieldedCoins, carriesProof } from '../../srv/crawler/ledger-payload';
+import { extractLedgerPayload, readLedgerFacts, carriesShieldedCoins, carriesProof, callFreeTxType } from '../../srv/crawler/ledger-payload';
 import { readSupplementBlock } from '../../srv/crawler/indexer-supplement';
 
 const CONTRACT = 'cc'.repeat(32);
@@ -140,6 +140,31 @@ describe('carriesShieldedCoins and carriesProof', () => {
         expect(feeOnly.dustSpendCount).toBe(1);
         expect(carriesShieldedCoins(feeOnly)).toBe(false);
         expect(carriesProof(feeOnly)).toBe(false);
+    });
+});
+
+describe('callFreeTxType', () => {
+    const facts = (over: Record<string, any> = {}) => readLedgerFacts({ identifiers: () => [], intents: new Map(), ...over });
+
+    test('zswap coins without any contract action are a shielded transfer', () => {
+        expect(callFreeTxType(facts({ guaranteedOffer: { inputs: [1, 2], outputs: [1, 2], transients: [] } }))).toBe('shielded_transfer');
+    });
+
+    test('a registration without coins or actions is a dust registration', () => {
+        expect(callFreeTxType(facts({ intents: new Map([[1, { actions: [], dustActions: { spends: [], registrations: [{}] } }]]) }))).toBe('dust_registration');
+    });
+
+    test('any declared contract action keeps the transaction what the events say', () => {
+        const call = facts({
+            guaranteedOffer: { inputs: [], outputs: [1], transients: [] },
+            intents: new Map([[1, { actions: [{ address: `0x${CONTRACT}`, entryPoint: 'mint' }] }]])
+        });
+        expect(callFreeTxType(call)).toBeNull();
+        expect(callFreeTxType(facts({ intents: new Map([[1, { actions: [{ address: `0x${CONTRACT}` }] }]]) }))).toBeNull();
+    });
+
+    test('a fee spend alone names nothing', () => {
+        expect(callFreeTxType(facts({ intents: new Map([[1, { actions: [], dustActions: { spends: [{ vFee: 1n }], registrations: [] } }]]) }))).toBeNull();
     });
 });
 

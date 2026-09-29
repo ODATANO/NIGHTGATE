@@ -35,7 +35,9 @@ export async function runBatchInScope(
     found: any,
     calls: BatchCall[],
     contractAddress: string,
-    orderOpts: BatchOrderOptions = {}
+    orderOpts: BatchOrderOptions = {},
+    /** Passed to the SDK's scope: recipient keys for coins a call creates for another wallet. */
+    scopeOpts: { additionalCoinEncPublicKeyMappings?: ReadonlyMap<string, string> } = {}
 ): Promise<BatchScopeResult> {
     if (!Array.isArray(calls) || calls.length === 0) {
         throw new Error('submitContractCallBatch: calls must be a non-empty array');
@@ -71,7 +73,7 @@ export async function runBatchInScope(
                 await found.callTx[c.circuit](txCtx, ...(c.args ?? []));
             }
         },
-        { scopeName: `batch:${circuits.join('+')}` }
+        { scopeName: `batch:${circuits.join('+')}`, ...scopeOpts }
     );
     const pub = finalized?.public;
     return {

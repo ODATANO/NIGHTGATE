@@ -1,6 +1,6 @@
 {
   "name": "@odatano/nightgate",
-  "version": "0.28.2",
+  "version": "0.29.0",
   "description": "CAP Plugin: Midnight Blockchain Indexer with OData V4 API",
   "homepage": "https://github.com/ODATANO/NIGHTGATE#readme",
   "repository": {
@@ -231,6 +231,7 @@
     "@noble/hashes": "^1.8.0",
     "@odatano/cap-auth": "^0.1.0",
     "@polkadot/types": "^16.5.6",
+    "@scure/base": "^2.2.0",
     "bip39": "^3.1.0",
     "effect": "^3.21.4",
     "generic-pool": "^3.9.0",

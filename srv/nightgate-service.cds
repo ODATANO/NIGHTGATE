@@ -667,6 +667,23 @@ service NightgateService {
     };
 
     /**
+     * Sponsor a shielded swap handed over as its two halves, each a proven
+     * transaction, bound or unbound, as offer file (`swapoffer1...`) or base64:
+     * check, merge, pay dust, submit. A half gives one token type and wants
+     * another, both in the effective `allowedTokenTypes`; the halves mirror
+     * each other. Needs `NIGHTGATE_SPONSOR_ALLOW_SWAPS`.
+     * Job result `{ txHash, swap: { gives, wants } }`. Poll with `sessionId`.
+     */
+    action   sponsorSwap(makerHalfB64: LargeString,
+                         takerHalfB64: LargeString,
+                         sponsorSessionId: UUID,
+                         idempotencyKey: String)                      returns {
+        jobId     : UUID;
+        status    : String;
+        sessionId : UUID;
+    };
+
+    /**
      * Run up to 8 calls on one contract as ONE transaction. Apply order = call
      * order, so dependent calls may be batched (same-name circuits are unordered
      * among themselves). An error before submit submits nothing; PARTIAL_SUCCESS
@@ -987,7 +1004,8 @@ service NightgateService {
      * Requests with it in `x-agent-token` run as the caller, limited to
      * `allowedActions` (attestation/predicate/disclosure only) plus verify and
      * getJobStatus, the grant's session, `maxJobsPerDay` and a fixed
-     * `sponsorSessionId` (checked now, 4xx if unusable).
+     * `sponsorSessionId` (checked now, 4xx if unusable). Lists the platform
+     * sponsor policy leaves nothing of are 400.
      */
     action   createAgentGrant(sessionId: UUID,
                               allowedActions: array of String,
@@ -1020,7 +1038,8 @@ service NightgateService {
     /**
      * Change the given parameters of a grant; `null` clears maxJobsPerDay,
      * validUntil, agentLabel and the allow-lists. Session, sponsor and token are
-     * immutable; `maxDeploys` >= deploys used. Foreign grant 404, revoked
+     * immutable; `maxDeploys` >= deploys used. Lists the platform sponsor
+     * policy leaves nothing of are 400. Foreign grant 404, revoked
      * `409 GRANT_REVOKED`. Never grantable; `NIGHTGATE_GRANT_ADMIN_RATE_LIMIT`.
      */
     action   updateAgentGrant(grantId: UUID,

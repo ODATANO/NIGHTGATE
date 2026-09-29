@@ -89,9 +89,28 @@ export interface CreateTxBuilderInput {
      * catches up). `false`: no sync. A call that moves no value (every vault
      * circuit) needs no wallet state to build, prove and sign; a call that
      * does move value then fails at balancing instead of building wrong.
+     * `'shielded'`: only the shielded coins sync, enough for a call that moves
+     * shielded value while a sponsor pays the fee.
      */
-    walletSync?: boolean;
+    walletSync?: boolean | 'shielded';
+    /** From `serializeWalletState()`: the sub-wallets named in it resume instead of syncing from genesis. */
+    walletState?: WalletState;
     onProgress?: (e: Record<string, unknown>) => void;
+}
+
+/** Serialized sub-wallet states, as the wallet SDK writes them. They hold the wallet's coins: store them like a key. */
+export interface WalletState {
+    shielded?: string;
+    unshielded?: string;
+    dust?: string;
+}
+
+/** The public shielded keys of a wallet: what a sender needs to create a coin for it. */
+export interface ShieldedPublicKeys {
+    /** 64 hex */
+    coinPublicKey: string;
+    /** 64 hex */
+    encryptionPublicKey: string;
 }
 
 export interface DeriveIdentityInput {
@@ -108,7 +127,8 @@ export interface Identity {
     /** hex, `persistentHash` of the attestation secret */
     attesterId: string;
     attestationSecret: Uint8Array;
-    addresses: { night: string };
+    addresses: { night: string; shielded: string };
+    shieldedKeys: ShieldedPublicKeys;
 }
 
 /** Tracks the sockets a `ws` class opens; `closeAll()` terminates them. */
@@ -154,6 +174,12 @@ export interface BuildSponsorableInput {
     independentCalls?: boolean;
     /** Batch only, with `independentCalls`: leading calls that keep their position (an in-batch anchor the proofs read). */
     orderedPrefix?: number;
+    /**
+     * Wallets besides the builder's own that a call creates a shielded coin for
+     * (a mint to another wallet). Without the recipient's keys here the build
+     * fails: the coin's ciphertext cannot be encrypted.
+     */
+    recipients?: ShieldedPublicKeys[];
     initialPrivateState?: unknown;
     /** true (default): FINALIZED handover (sponsorFinalizedTransaction).
      *  false: UNBOUND handover (sponsorUnboundTransaction, parallel). */
@@ -186,7 +212,15 @@ export interface TxBuilder {
     /** The identity every attestation built here will carry (hex). */
     attesterId: string;
     zkAssets: ZkAssetResult;
-    addresses: { night: string };
+    addresses: { night: string; shielded: string };
+    /** What another builder lists under `recipients` to create a coin for this wallet. */
+    shieldedKeys: ShieldedPublicKeys;
+    /** Which sub-wallets sync. */
+    walletSync: 'all' | 'shielded' | 'none';
+    /** Resolves once the syncing sub-wallets have caught up with the indexer. */
+    waitForSync(): Promise<void>;
+    /** The state of the syncing sub-wallets, for `createTxBuilder({ walletState })`. */
+    serializeWalletState(): Promise<WalletState>;
     buildSponsorable(input: BuildSponsorableUnboundInput): Promise<BuiltUnboundTransaction>;
     buildSponsorable(input: BuildSponsorableBoundInput): Promise<BuiltBoundTransaction>;
     buildSponsorable(input: BuildSponsorableInput): Promise<BuiltTransaction>;
@@ -212,6 +246,8 @@ export interface BuildDeploySponsorableInput {
     constructorArgs?: unknown[];
     /** Witnesses the constructor needs; vacant when omitted. */
     witnesses?: object;
+    /** Wallets besides the builder's own that the constructor creates a shielded coin for. */
+    recipients?: ShieldedPublicKeys[];
     bind?: boolean;
 }
 export interface BuildDeploySponsorableBoundInput extends BuildDeploySponsorableInput { bind?: true; }
@@ -335,3 +371,149 @@ export declare function deriveIdentity(opts: DeriveIdentityInput): Promise<Ident
 /** The attester's record key for a payload (hex): persistentHash(AttestRecordKey{tag 21, owner, payload_hash}). */
 export declare function computeRecordKey(attesterId: string, payloadHash: string): string;
 export declare function trackingWebSocket(WebSocketImpl: Function): TrackingWebSocket;
+/** The per-role seeds of a BIP39 seed (128 hex), by the derivation the builder and Lace use. Key material. */
+export declare function deriveRoleSeeds(seedHex: string, accountIndex?: number): Promise<{ night: Uint8Array; zswap: Uint8Array; dust: Uint8Array }>;
+/** `recipients` as the SDK's map from coin public key to encryption public key; undefined when empty. */
+export declare function recipientKeyMap(recipients: ShieldedPublicKeys[] | undefined | null): Map<string, string> | undefined;
+
+// ---- shielded swaps
+
+/** Prefix of an offer file: bech32m text of a serialized transaction. */
+export declare const SWAP_OFFER_PREFIX: 'swapoffer';
+
+/** One side of a swap: a raw token type (64 hex) and an amount in atoms. */
+export interface SwapLeg {
+    tokenType: string;
+    amount: bigint;
+}
+/** A leg as input: the amount may be a bigint, an integer or a decimal string. */
+export interface SwapLegInput {
+    tokenType: string;
+    amount: bigint | number | string;
+}
+/** What a half gives and wants. */
+export interface SwapTerms {
+    gives: SwapLeg;
+    wants: SwapLeg;
+}
+export interface SwapTermsInput {
+    gives: SwapLegInput;
+    wants: SwapLegInput;
+}
+/** Terms read from a transaction, with the coins the half carries. */
+export interface ReadSwapTerms extends SwapTerms {
+    inputs: number;
+    outputs: number;
+}
+
+/**
+ * What one half of a swap gives and wants, read from the transaction itself.
+ * Throws for anything but a plain shielded swap half: an offer and nothing
+ * else, one token type given, one other wanted.
+ */
+export declare function readSwapTerms(tx: LedgerTransaction): ReadSwapTerms;
+/** True when `terms` say exactly what `expect` says. */
+export declare function sameSwapTerms(terms: SwapTermsInput, expect: SwapTermsInput): boolean;
+/** Offer file text (`swapoffer1...`) of a transaction or of its serialized bytes. */
+export declare function encodeOffer(txOrBytes: LedgerTransaction | Uint8Array): Promise<string>;
+/** An offer file, base64 or bytes as a ledger transaction; `bound` is the form it arrived in. */
+export declare function decodeOffer(input: string | Uint8Array): Promise<{ tx: LedgerTransaction; bound: boolean; bytes: Uint8Array }>;
+
+export interface CreateSwapWalletInput {
+    /** 128 hex chars (64-byte BIP39 seed). Never leaves the process. */
+    seedHex: string;
+    networkId?: string;
+    accountIndex?: number;
+    indexerHttpUrl: string;
+    indexerWsUrl: string;
+    /** Not used for swapping; passed to the wallet when given. */
+    nodeUrl?: string;
+    /**
+     * 'wasm' (default): halves are proven in-process. 'server': on `proofServerUrl`,
+     * which then SEES THE COINS YOU SPEND; several times faster, only ever a proof
+     * server you run yourself.
+     */
+    provingMode?: 'wasm' | 'server';
+    proofServerUrl?: string;
+    /** From `serializeState()`: resume instead of syncing from genesis. */
+    walletState?: string;
+    /**
+     * Most coins one half spends; default 4, the sponsor's default
+     * (`NIGHTGATE_SPONSOR_SWAP_MAX_INPUTS`). Every coin adds about 5 kB to the
+     * half, so a sponsor that accepts more also needs a larger byte budget.
+     */
+    maxInputs?: number;
+}
+
+export interface BuiltSwapHalf {
+    /** base64 of the serialized half: `makerHalfB64` / `takerHalfB64` of `sponsorSwap`. */
+    halfB64: string;
+    /** Offer file text; present on a bound half only. */
+    offer?: string;
+    bound: boolean;
+    serializedBytes: number;
+    terms: ReadSwapTerms;
+    /** Releases the coins of a half that is not going to be handed over. */
+    revert(): Promise<void>;
+}
+
+export interface TakenOffer {
+    makerHalfB64: string;
+    takerHalfB64: string;
+    /** The form of both halves: the taker's half is built in the offer's form. */
+    bound: boolean;
+    /** The offer's terms, from the maker's side. */
+    terms: ReadSwapTerms;
+    /** Releases the taker's coins when the swap is not going to be handed over. */
+    revert(): Promise<void>;
+}
+
+export interface SwapWallet {
+    provingMode: 'wasm' | 'server';
+    /** Shielded address (bech32m). */
+    address: string;
+    coinPublicKey: string;
+    encryptionPublicKey: string;
+    /** Resolves once the wallet has caught up with the indexer. */
+    sync(): Promise<void>;
+    /** Most coins one half spends. */
+    maxInputs: number;
+    /** Shielded balance per raw token type, in atoms. */
+    balances(): Promise<Record<string, bigint>>;
+    /** The free coins, smallest first. */
+    coins(): Promise<SwapLeg[]>;
+    /** The most one half can give of a token type: what the `maxInputs` largest free coins hold. */
+    spendable(tokenType: string): Promise<bigint>;
+    /**
+     * One half of a swap: spends `give`, creates `want` and the change for this
+     * wallet, proves it. It spends the smallest coins that still fit `maxInputs`,
+     * so trading merges small coins; more than `spendable(tokenType)` is refused
+     * before anything is proven. `bind: true` (default) returns it bound with its
+     * offer file; `bind: false` unbound, base64 only. Its coins stay pending until the
+     * swap lands or `revert()` is called. A half refers to a recent state of the
+     * coin tree: build and hand over close together.
+     */
+    buildHalf(input: { give: SwapLegInput; want: SwapLegInput; bind?: boolean }): Promise<BuiltSwapHalf>;
+    /**
+     * Takes an offer: reads its terms from the transaction, compares them with
+     * `expect` when given, builds the mirror half in the offer's form and
+     * returns both halves for `sponsorSwap`.
+     */
+    takeOffer(input: { offer: string | Uint8Array; expect?: SwapTermsInput }): Promise<TakenOffer>;
+    /** The wallet's state as text, for `createSwapWallet({ walletState })`. It holds the wallet's coins: store it like a key. */
+    serializeState(): Promise<string>;
+    /** Stops the sync. */
+    close(): Promise<void>;
+}
+
+/** Most inputs one half carries by default. */
+export declare const SWAP_MAX_INPUTS: 4;
+/** A coin as the wallet SDK lists it. */
+export interface SwapCoin { type: string; value: bigint; }
+/** What the `maxInputs` largest coins of a token type hold. */
+export declare function spendableWithin(coins: readonly SwapCoin[], tokenType: string, maxInputs?: number): bigint;
+/** The next coin of a half: the smallest one that still lets the remaining slots cover the rest. Updates `plan`. */
+export declare function chooseSwapCoin<C extends SwapCoin>(coins: readonly C[], tokenType: string, plan: { remaining: bigint; slots: number }): C | undefined;
+
+/** A shielded wallet for swapping: it syncs the shielded coins of the seed and nothing else. */
+export declare function createSwapWallet(opts: CreateSwapWalletInput): Promise<SwapWallet>;

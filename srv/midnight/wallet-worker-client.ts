@@ -354,6 +354,8 @@ export function setStateSaveSink(sink: StateSaveSink | undefined): void {
 export interface SubmitIntentInfo {
     txHash: string; contractAddress?: string; circuits?: string[]; note?: string; sponsorAccountId?: string; deployed?: string[]; ttl?: string;
     segments?: Array<{ segment: number; calls: string[] }>;
+    /** Raw token types the transaction's calls mint. */
+    minted?: string[];
 }
 export type SubmitIntentHook = (txHash: string, intent: SubmitIntentInfo) => Promise<void>;
 
@@ -467,7 +469,7 @@ async function rpcOnce<T>(method: string, args: unknown, timeoutMs: number, onSu
             if (answered) return;
             if (msg?.kind === 'submit-intent') {
                 // Persist, then ack or nack. No ack once the worker answered: it gave up and did not send.
-                const intent: SubmitIntentInfo = { txHash: String(msg.txHash), contractAddress: msg.contractAddress, circuits: msg.circuits, note: msg.note, sponsorAccountId: msg.sponsorAccountId, ...(Array.isArray(msg.deployed) ? { deployed: msg.deployed.map(String) } : {}), ...(typeof msg.ttl === 'string' ? { ttl: msg.ttl } : {}) };
+                const intent: SubmitIntentInfo = { txHash: String(msg.txHash), contractAddress: msg.contractAddress, circuits: msg.circuits, note: msg.note, sponsorAccountId: msg.sponsorAccountId, ...(Array.isArray(msg.deployed) ? { deployed: msg.deployed.map(String) } : {}), ...(typeof msg.ttl === 'string' ? { ttl: msg.ttl } : {}), ...(Array.isArray(msg.minted) && msg.minted.length ? { minted: msg.minted.map(String) } : {}) };
                 const startedAt = Date.now();
                 const tracked: Promise<void> = Promise.resolve()
                     .then(() => onSubmitIntent?.(intent.txHash, intent))
@@ -861,7 +863,9 @@ export function walletSponsorFinalizedTx(args: {
     ownContracts?: string[];
     /** Raw shielded token types whose zswap offers the sponsor pays for (floor ∩ grant); absent = no offers. */
     allowedTokenTypes?: string[];
-}, onSubmitIntent?: SubmitIntentHook): Promise<{ txHash: string; circuits: string[]; contractAddress: string; deployed?: string[] }> {
+    /** Also pay for the offer of a token a sponsorable call of the transaction mints. */
+    allowContractMints?: boolean;
+}, onSubmitIntent?: SubmitIntentHook): Promise<{ txHash: string; circuits: string[]; contractAddress: string; deployed?: string[]; minted?: string[] }> {
     return rpc('sponsorFinalizedTx', args, RPC_TIMEOUT_MS, onSubmitIntent);
 }
 
@@ -898,10 +902,20 @@ export function __resetWalletWorkerForTests(): void {
     stoppingWorker = null;
 }
 
+/** What a sponsored swap exchanged, from the maker's side; amounts in atoms. */
+export interface SponsoredSwapTerms {
+    gives: { tokenType: string; amount: string };
+    wants: { tokenType: string; amount: string };
+}
+
 /** Parallel sponsoring: the sponsor merges dust from a locked note into an unbound caller tx and binds. */
 export function walletSponsorUnboundTx(args: {
     sponsorSessionId: string;
-    unboundTxB64: string;
+    /** The caller's transaction; absent for a swap. */
+    unboundTxB64?: string;
+    /** The two halves of a shielded swap, proven and unbound; the worker checks and merges them. */
+    swap?: { makerHalfB64: string; takerHalfB64: string };
+    allowSwaps?: boolean;
     networkId: WalletSubmitContractCallArgs['networkId'];
     allowedContracts?: string[];
     allowedCircuits?: string[];
@@ -911,6 +925,8 @@ export function walletSponsorUnboundTx(args: {
     ownContracts?: string[];
     /** Raw shielded token types whose zswap offers the sponsor pays for (floor ∩ grant); absent = no offers. */
     allowedTokenTypes?: string[];
-}, onSubmitIntent?: SubmitIntentHook): Promise<{ txHash: string; circuits: string[]; contractAddress: string; note: string; deployed?: string[] }> {
+    /** Also pay for the offer of a token a sponsorable call of the transaction mints. */
+    allowContractMints?: boolean;
+}, onSubmitIntent?: SubmitIntentHook): Promise<{ txHash: string; circuits: string[]; contractAddress: string; note: string; deployed?: string[]; minted?: string[]; swap?: SponsoredSwapTerms }> {
     return rpc('sponsorUnboundTx', args, RPC_TIMEOUT_MS, onSubmitIntent);
 }

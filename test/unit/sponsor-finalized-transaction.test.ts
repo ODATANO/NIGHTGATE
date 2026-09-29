@@ -5,7 +5,7 @@
  * with the job.
  */
 
-import { describe, test, expect, vi, beforeEach } from 'vitest';
+import { describe, test, expect, vi, beforeEach, afterEach } from 'vitest';
 import { sha256 } from '@noble/hashes/sha256';
 import { bytesToHex } from '@noble/hashes/utils';
 
@@ -50,20 +50,23 @@ vi.mock('../../srv/submission/job-execution-context', async (importOriginal) => 
 const grantBudget = vi.hoisted(() => ({
     reserve: vi.fn(async (_db: any, _grantId: string, _n: number) => true),
     release: vi.fn(async () => undefined),
-    record: vi.fn(async () => undefined)
+    record: vi.fn(async () => undefined),
+    minted: vi.fn(async () => undefined)
 }));
+const platform = vi.hoisted(() => ({ policy: { allowedContracts: [], allowedCircuits: [], allowedTokenTypes: [], allowDeploy: true } as Record<string, unknown> }));
 vi.mock('../../srv/sessions/agent-grants', async (importOriginal) => ({
     ...(await importOriginal<Record<string, unknown>>()),
     reserveDeployBudget: (...a: any[]) => (grantBudget.reserve as any)(...a),
     releaseDeployBudget: (...a: any[]) => (grantBudget.release as any)(...a),
     recordDeployedContracts: (...a: any[]) => (grantBudget.record as any)(...a),
+    recordMintedTokenTypes: (...a: any[]) => (grantBudget.minted as any)(...a),
     // The executors re-resolve the grant's policy per job; these tests cover
     // the budget bookkeeping under a deploy-capable grant.
     currentGrantPolicy: vi.fn(async () => ({ allowedContracts: [], allowedCircuits: [], deployedContracts: [], allowedTokenTypes: [], allowDeploy: true }))
 }));
 vi.mock('../../srv/submission/sponsor-policy', async (importOriginal) => ({
     ...(await importOriginal<any>()),
-    getGlobalSponsorPolicy: () => ({ allowedContracts: [], allowedCircuits: [], allowedTokenTypes: [], allowDeploy: true })
+    getGlobalSponsorPolicy: () => platform.policy
 }));
 vi.mock('../../srv/submission/fee-sponsor', async (importOriginal) => ({
     ...(await importOriginal<Record<string, unknown>>()),
@@ -81,6 +84,7 @@ vi.mock('../../srv/midnight/providers', async (importOriginal) => ({
 }));
 
 import { registerSubmissionHandlers } from '../../srv/submission/handlers';
+import { encodeOfferFile } from '../../srv/utils/offer-file';
 import {
     __resetSponsorPoolForTests, pickFreeSponsor,
     acquireSponsor, releaseSponsor, PLATFORM_POOL_SENTINEL, sponsorCandidatesNonExclusive } from '../../srv/submission/sponsor-pool';
@@ -866,5 +870,161 @@ describe('sponsored deploy budget is reserved at the submit-intent', () => {
         await proc({ op: 'sponsorUnbound', unboundTxB64: TX_A, sponsorSessionId: 'sponsor-1', allowedContracts: [], allowedCircuits: [], allowDeploy: true, grantId: 'grant-1' }, { ID: 'j', requestedBy: 'u' } as any);
         expect(grantBudget.reserve).not.toHaveBeenCalled();
         expect(grantBudget.record).not.toHaveBeenCalled();
+    });
+});
+
+describe('sponsorSwap', () => {
+    const T1 = 'ab'.repeat(32);
+    const T2 = 'cd'.repeat(32);
+    const closed = { allowedContracts: [], allowedCircuits: [], allowedTokenTypes: [], allowDeploy: true };
+    const HALVES = { makerHalfB64: TX_A, takerHalfB64: TX_B, sponsorSessionId: 'sponsor-1' };
+    const swapTerms = { gives: { tokenType: T1, amount: '10' }, wants: { tokenType: T2, amount: '3' } };
+
+    beforeEach(() => {
+        startJobCalls.length = 0;
+        unboundWorkerCalls.length = 0;
+        grantBudget.minted.mockClear();
+        __resetSponsorPoolForTests();
+        delete process.env.NIGHTGATE_FEE_SPONSOR_SESSION;
+        // The action reads the floor from the environment, the executor through the policy module.
+        process.env.NIGHTGATE_SPONSOR_ALLOW_SWAPS = 'true';
+        process.env.NIGHTGATE_SPONSOR_ALLOWED_TOKEN_TYPES = `${T1},${T2}`;
+        platform.policy = { ...closed, allowedTokenTypes: [T1, T2], allowSwaps: true };
+        unboundWorkerImpl.fn = async () => ({ txHash: '00cc', circuits: ['<swap>'], contractAddress: '', note: 'b', swap: swapTerms });
+    });
+    afterEach(() => {
+        platform.policy = closed;
+        delete process.env.NIGHTGATE_SPONSOR_ALLOW_SWAPS;
+        delete process.env.NIGHTGATE_SPONSOR_ALLOWED_TOKEN_TYPES;
+    });
+
+    test('both halves are required', async () => {
+        const srv = setup();
+        const a = makeReq({ ...HALVES, makerHalfB64: '' });
+        await srv.handlers['sponsorSwap'](a);
+        expect(a.reject).toHaveBeenCalledWith(400, 'makerHalfB64 is required');
+        const b = makeReq({ ...HALVES, takerHalfB64: undefined });
+        await srv.handlers['sponsorSwap'](b);
+        expect(b.reject).toHaveBeenCalledWith(400, 'takerHalfB64 is required');
+        expect(startJobCalls).toHaveLength(0);
+    });
+
+    test('starts a job on the unbound channel that carries the halves and no policy of its own', async () => {
+        const srv = setup();
+        const req = makeReq(HALVES);
+        await srv.handlers['sponsorSwap'](req);
+        expect(req.reject).not.toHaveBeenCalled();
+        expect(startJobCalls).toHaveLength(1);
+        expect(startJobCalls[0]).toMatchObject({ kind: 'sponsorSwap', sessionId: 'sponsor-1', commandVersion: 1, encryptCommand: true });
+        expect(startJobCalls[0].command).toEqual({ op: 'sponsorUnbound', swap: { makerHalfB64: TX_A, takerHalfB64: TX_B }, sponsorSessionId: 'sponsor-1', grantId: undefined });
+        expect(processorVersions.get('sponsorSwap')).toBe(1);
+        // keyed on both halves: the same maker half with another taker half is another job
+        const other = makeReq({ ...HALVES, takerHalfB64: TX_A });
+        await srv.handlers['sponsorSwap'](other);
+        expect(startJobCalls[1].request.txHash).not.toBe(startJobCalls[0].request.txHash);
+    });
+
+    test('takes a half as offer file text or as base64; the job carries base64 either way', async () => {
+        const srv = setup();
+        const text = await encodeOfferFile(new Uint8Array(Buffer.from(TX_A, 'base64')));
+        const req = makeReq({ ...HALVES, makerHalfB64: text.toUpperCase() });
+        await srv.handlers['sponsorSwap'](req);
+        expect(req.reject).not.toHaveBeenCalled();
+        expect(startJobCalls[0].command.swap).toEqual({ makerHalfB64: TX_A, takerHalfB64: TX_B });
+        // the same halves in the other form are the same job
+        await srv.handlers['sponsorSwap'](makeReq(HALVES));
+        expect(startJobCalls[1].request.txHash).toBe(startJobCalls[0].request.txHash);
+    });
+
+    test('a damaged offer file is 400 naming the half, before anything else', async () => {
+        const srv = setup();
+        const text = await encodeOfferFile(new Uint8Array(Buffer.from(TX_A, 'base64')));
+        const damaged = makeReq({ ...HALVES, takerHalfB64: text.slice(0, -1) + (text.at(-1) === 'q' ? 'p' : 'q') });
+        await srv.handlers['sponsorSwap'](damaged);
+        expect(damaged.reject).toHaveBeenCalledWith(400, 'takerHalfB64: not a valid offer file: Invalid checksum');
+        const neither = makeReq({ ...HALVES, makerHalfB64: 'hello world!' });
+        await srv.handlers['sponsorSwap'](neither);
+        expect(neither.reject).toHaveBeenCalledWith(400, 'makerHalfB64: neither an offer file nor base64');
+        expect(startJobCalls).toHaveLength(0);
+    });
+
+    test('refuses before a job exists while the platform sponsors no swaps or no token type', async () => {
+        const srv = setup();
+        delete process.env.NIGHTGATE_SPONSOR_ALLOW_SWAPS;
+        const noSwaps = makeReq(HALVES);
+        await srv.handlers['sponsorSwap'](noSwaps);
+        expect(noSwaps.reject).toHaveBeenCalledWith(expect.objectContaining({ code: 'SPONSOR_POLICY_EMPTY', message: expect.stringMatching(/swaps are not sponsored here/) }));
+        process.env.NIGHTGATE_SPONSOR_ALLOW_SWAPS = 'true';
+        delete process.env.NIGHTGATE_SPONSOR_ALLOWED_TOKEN_TYPES;
+        const noTypes = makeReq(HALVES);
+        await srv.handlers['sponsorSwap'](noTypes);
+        expect(noTypes.reject).toHaveBeenCalledWith(expect.objectContaining({ code: 'SPONSOR_POLICY_EMPTY', message: expect.stringMatching(/none is sponsored for this caller/) }));
+        expect(startJobCalls).toHaveLength(0);
+    });
+
+    test('the executor hands the worker the halves under the policy in force when the job runs', async () => {
+        setup();
+        const proc = processors.get('sponsorSwap')!;
+        const out: any = await proc({ op: 'sponsorUnbound', swap: { makerHalfB64: TX_A, takerHalfB64: TX_B }, sponsorSessionId: 'sponsor-1' }, { ID: 'j', kind: 'sponsorSwap', requestedBy: 'u' } as any);
+        expect(unboundWorkerCalls).toHaveLength(1);
+        expect(unboundWorkerCalls[0]).toMatchObject({ swap: { makerHalfB64: TX_A, takerHalfB64: TX_B }, allowSwaps: true, allowedTokenTypes: [T1, T2] });
+        expect(unboundWorkerCalls[0]).not.toHaveProperty('unboundTxB64');
+        expect(out).toMatchObject({ txHash: '00cc', swap: swapTerms, feeSponsor: 'sponsor-1' });
+
+        // closed after the job was queued: the worker is told so and refuses
+        platform.policy = { ...closed, allowedTokenTypes: [T1, T2] };
+        await proc({ op: 'sponsorUnbound', swap: { makerHalfB64: TX_A, takerHalfB64: TX_B }, sponsorSessionId: 'sponsor-1' }, { ID: 'j2', kind: 'sponsorSwap', requestedBy: 'u' } as any);
+        expect(unboundWorkerCalls[1].allowSwaps).toBe(false);
+    });
+});
+
+describe('minted token types are recorded on the grant', () => {
+    const M = 'ef'.repeat(32);
+    beforeEach(() => {
+        unboundWorkerCalls.length = 0;
+        grantBudget.minted.mockClear();
+        grantBudget.record.mockClear();
+        __resetSponsorPoolForTests();
+        delete process.env.NIGHTGATE_FEE_SPONSOR_SESSION;
+    });
+
+    test('after a landed mint, on both channels; a job without a grant records nothing', async () => {
+        setup();
+        unboundWorkerImpl.fn = async () => ({ txHash: '00dd', circuits: ['mint'], contractAddress: 'c', note: 'b', minted: [M] });
+        await processors.get('sponsorUnboundTransaction')!({ op: 'sponsorUnbound', unboundTxB64: TX_A, sponsorSessionId: 'sponsor-1', grantId: 'grant-1' }, { ID: 'j', kind: 'sponsorUnboundTransaction', requestedBy: 'u' } as any);
+        expect(grantBudget.minted).toHaveBeenCalledWith(expect.anything(), 'grant-1', [M]);
+        expect(unboundWorkerCalls[0]).toMatchObject({ unboundTxB64: TX_A });
+        expect(unboundWorkerCalls[0]).not.toHaveProperty('swap');
+
+        grantBudget.minted.mockClear();
+        workerImpl.fn = async () => ({ txHash: '00ee', circuits: ['mint'], contractAddress: 'c', minted: [M] });
+        await processors.get('sponsorFinalizedTransaction')!({ op: 'sponsorFinalized', finalizedTxB64: TX_A, sponsorSessionId: 'sponsor-1', grantId: 'grant-1' }, { ID: 'j2', kind: 'sponsorFinalizedTransaction', requestedBy: 'u' } as any);
+        expect(grantBudget.minted).toHaveBeenCalledWith(expect.anything(), 'grant-1', [M]);
+
+        grantBudget.minted.mockClear();
+        await processors.get('sponsorUnboundTransaction')!({ op: 'sponsorUnbound', unboundTxB64: TX_A, sponsorSessionId: 'sponsor-1' }, { ID: 'j3', kind: 'sponsorUnboundTransaction', requestedBy: 'u' } as any);
+        expect(grantBudget.minted).not.toHaveBeenCalled();
+        workerImpl.fn = async () => ({ txHash: '00aa', circuits: ['attest'], contractAddress: 'c' });
+        unboundWorkerImpl.fn = async () => ({ txHash: '00bb', circuits: ['attest'], contractAddress: 'c', note: 'b' });
+    });
+
+    test('the attempt row carries the types, and the reconciliation finalizer records them from it', async () => {
+        setup();
+        dbWrites.length = 0;
+        unboundWorkerImpl.fn = async () => {
+            await unboundIntentHooks.at(-1)('00ff'.padEnd(64, '0'), { contractAddress: 'c', circuits: ['mint'], minted: [M] });
+            return { txHash: '00ff'.padEnd(64, '0'), circuits: ['mint'], contractAddress: 'c', note: 'b', minted: [M] };
+        };
+        await processors.get('sponsorUnboundTransaction')!({ op: 'sponsorUnbound', unboundTxB64: TX_A, sponsorSessionId: 'sponsor-1', grantId: 'grant-1' }, { ID: 'j', kind: 'sponsorUnboundTransaction', sessionId: 'sponsor-1', requestedBy: 'u' } as any);
+        const row = dbWrites.map((q: any) => q?.INSERT?.entries?.[0]).find((e: any) => e?.submitIntentData);
+        expect(JSON.parse(row.submitIntentData)).toMatchObject({ minted: [M], circuits: ['mint'] });
+        unboundWorkerImpl.fn = async () => ({ txHash: '00bb', circuits: ['attest'], contractAddress: 'c', note: 'b' });
+
+        grantBudget.minted.mockClear();
+        const finalize = finalizers.get('sponsorSwap')!;
+        expect(finalize).toBe(finalizers.get('sponsorUnboundTransaction'));
+        fakeDbRows.next = { ID: 'sub-1', submitIntentData: JSON.stringify({ circuits: ['mint'], contractAddress: 'c', minted: [M] }) };
+        await finalize({ op: 'sponsorUnbound', grantId: 'grant-1' }, { ID: 'j', sessionId: 'sponsor-1' } as any, { submissionId: 'sub-1', txHash: '00ff'.padEnd(64, '0'), contractAddress: null, finalizedAt: null });
+        expect(grantBudget.minted).toHaveBeenCalledWith(expect.anything(), 'grant-1', [M]);
     });
 });

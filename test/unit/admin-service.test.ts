@@ -513,6 +513,72 @@ describe('NightgateAdminService', () => {
         });
     });
 
+    describe('getSponsorPolicy', () => {
+        const ENV = ['NIGHTGATE_SPONSOR_ALLOWED_CONTRACTS', 'NIGHTGATE_SPONSOR_ALLOWED_CIRCUITS', 'NIGHTGATE_SPONSOR_ALLOWED_TOKEN_TYPES',
+            'NIGHTGATE_SPONSOR_POLICY_FILE', 'NIGHTGATE_SPONSOR_ALLOW_CONTRACT_MINTS', 'NIGHTGATE_SPONSOR_ALLOW_DEPLOY'];
+        const T = 'ab'.repeat(32);
+        const grant = (over: Record<string, unknown> = {}) => ({
+            ID: 'grant-1', userId: 'operator-1', sessionId: 'sess-1', allowedActions: '["sponsorUnboundTransaction"]',
+            isActive: true, revokedAt: null, validUntil: null,
+            allowedContracts: JSON.stringify(['A']), allowedCircuits: null, allowedTokenTypes: JSON.stringify([T]),
+            deployedContracts: JSON.stringify(['D']), allowDeploy: true, maxDeploys: 2, deploysUsed: 1, ...over
+        });
+        beforeEach(() => {
+            for (const k of ENV) delete process.env[k];
+            process.env.NIGHTGATE_SPONSOR_ALLOWED_CONTRACTS = 'A,B';
+            process.env.NIGHTGATE_SPONSOR_ALLOWED_TOKEN_TYPES = T;
+            process.env.NIGHTGATE_SPONSOR_ALLOW_DEPLOY = 'true';
+            process.env.NIGHTGATE_SPONSOR_ALLOW_CONTRACT_MINTS = 'true';
+        });
+        afterEach(() => { for (const k of ENV) delete process.env[k]; });
+
+        it('without a grant: the platform policy and its source', async () => {
+            const req = createMockRequest({}, 'admin-1');
+            const result = await registeredHandlers['getSponsorPolicy'](req);
+            expect(req.reject).not.toHaveBeenCalled();
+            expect(mockDbRun).not.toHaveBeenCalled();
+            expect(result).toMatchObject({
+                source: 'env', path: null, loadedAt: null, ignoredEnv: [], floorError: null, grant: null, effectiveError: null,
+                floor: { allowedContracts: ['A', 'B'], allowedCircuits: [], allowedTokenTypes: [T], allowDeploy: true, allowContractMints: true },
+                effective: { allowedContracts: ['A', 'B'], allowedTokenTypes: [T], allowDeploy: true, allowContractMints: true }
+            });
+        });
+
+        it('with a grant: its lists and what the platform policy leaves of them', async () => {
+            mockDbRun.mockResolvedValueOnce(grant());
+            const result = await registeredHandlers['getSponsorPolicy'](createMockRequest({ grantId: 'grant-1' }, 'admin-1'));
+            expect(selectWhereSpy).toHaveBeenCalledWith({ ID: 'grant-1' });
+            expect(result).toMatchObject({
+                grant: { grantId: 'grant-1', active: true, allowedContracts: ['A'], allowedTokenTypes: [T], deployedContracts: ['D'], allowDeploy: true, maxDeploys: 2, deploysUsed: 1 },
+                effective: { allowedContracts: ['A', 'D'], ownContracts: ['D'], allowedTokenTypes: [T], allowDeploy: true, allowContractMints: true },
+                effectiveError: null
+            });
+        });
+
+        it('a used-up deploy budget closes allowDeploy in the effective policy', async () => {
+            mockDbRun.mockResolvedValueOnce(grant({ deploysUsed: 2 }));
+            const result = await registeredHandlers['getSponsorPolicy'](createMockRequest({ grantId: 'grant-1' }, 'admin-1'));
+            expect(result.effective.allowDeploy).toBe(false);
+        });
+
+        it('says why nothing is left: lists that share nothing, a revoked grant', async () => {
+            mockDbRun.mockResolvedValueOnce(grant({ allowedContracts: JSON.stringify(['C']) }));
+            const empty = await registeredHandlers['getSponsorPolicy'](createMockRequest({ grantId: 'grant-1' }, 'admin-1'));
+            expect(empty).toMatchObject({ effective: null, effectiveError: expect.stringMatching(/allowedContracts \(C\) share nothing/) });
+
+            mockDbRun.mockResolvedValueOnce(grant({ isActive: false }));
+            const revoked = await registeredHandlers['getSponsorPolicy'](createMockRequest({ grantId: 'grant-1' }, 'admin-1'));
+            expect(revoked).toMatchObject({ grant: { active: false }, effective: null, effectiveError: 'the grant is revoked or expired' });
+        });
+
+        it('an unknown grant is 404', async () => {
+            mockDbRun.mockResolvedValueOnce(null);
+            const req = createMockRequest({ grantId: 'grant-x' }, 'admin-1');
+            await registeredHandlers['getSponsorPolicy'](req);
+            expect(req.reject).toHaveBeenCalledWith(404, 'Grant not found');
+        });
+    });
+
     describe('getJobStats', () => {
         /**
          * The three aggregates the handler issues, in order: counts per status,

@@ -25,6 +25,7 @@ import { walletCpuProfile } from './midnight/wallet-worker-client';
 import { PROFILE_ROOT, profileCurrentThread, resolveProfileDir } from './midnight/cpu-profile';
 import { getConfiguredNightgateNetwork } from './utils/nightgate-config';
 import { reconcileNightBalances } from './crawler/night-balance-reconcile';
+import { describeSponsorPolicy } from './sessions/agent-grants';
 import { formatErr } from './utils/format-error';
 import { NightgateError } from './utils/errors';
 import type { NightgateRequest } from './utils/request-types';
@@ -64,6 +65,13 @@ export default class NightgateAdminService extends cds.ApplicationService {
                 return req.reject(400, 'limit must be a positive integer');
             }
             return reconcileNightBalances(this.db, { address, after, limit });
+        });
+
+        this.on('getSponsorPolicy', async (req: NightgateRequest) => {
+            const { grantId } = req.data as { grantId?: string | null };
+            const described = await describeSponsorPolicy(this.db, grantId ?? null);
+            if (!described) return req.reject(404, 'Grant not found');
+            return described;
         });
 
         this.on('getJobStats', async (req: NightgateRequest) => {

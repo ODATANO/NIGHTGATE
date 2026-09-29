@@ -6,7 +6,7 @@ import cds from '@sap/cds';
 import { assertArtifactGeneration } from '../contract-registry';
 import type { BackgroundJobRow, ReconciliationEvidence } from '../job-store';
 import { Documents, DisclosureGrants, PendingSubmissions } from '#cds-models/midnight';
-import { recordDeployedContracts } from '../../sessions/agent-grants';
+import { recordDeployedContracts, recordMintedTokenTypes } from '../../sessions/agent-grants';
 import { ContractCommandV1, ContractCommandV1WithProvenance } from '../actions/common';
 import type { SubmissionContext } from '../actions/context';
 
@@ -17,7 +17,7 @@ export function createReconciliationFinalizers(ctx: Pick<SubmissionContext, 'db'
 
     /**
      * Reconciliation finalizer for both sponsoring channels: records deployed
-     * addresses from the attempt row once inclusion is proven. A reconciled chain
+     * addresses and minted token types from the attempt row once inclusion is proven. A reconciled chain
      * failure keeps its reservation; refunds only cover txs that never reached the chain.
      */
     const finalizeSponsoredSubmission = async (raw: unknown, _job: BackgroundJobRow, evidence: ReconciliationEvidence): Promise<unknown> => {
@@ -30,6 +30,8 @@ export function createReconciliationFinalizers(ctx: Pick<SubmissionContext, 'db'
         const deployed: string[] = Array.isArray(coordinates.deployed) ? coordinates.deployed.map(String) : [];
         const grantId = coordinates.deployReservation?.grantId ?? command?.grantId;
         if (deployed.length && grantId) await recordDeployedContracts(db, String(grantId), deployed);
+        const minted: string[] = Array.isArray(coordinates.minted) ? coordinates.minted.map(String) : [];
+        if (minted.length && grantId) await recordMintedTokenTypes(db, String(grantId), minted);
         return {
             reconciled: true, ...evidence, status: 'finalized',
             circuits: Array.isArray(coordinates.circuits) ? coordinates.circuits : [],

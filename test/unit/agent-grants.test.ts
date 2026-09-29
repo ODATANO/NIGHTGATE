@@ -80,9 +80,13 @@ import { __resetGrantRateLimiterForTests, currentGrantPolicy,
     recordDeployedContracts,
     reserveDeployBudget,
     releaseDeployBudget,
+    recordMintedTokenTypes,
     AGENT_ALLOWLISTABLE_ACTIONS
 } from '../../srv/sessions/agent-grants';
 
+import { __resetSponsorPolicyForTests } from '../../srv/submission/sponsor-policy';
+
+const SPONSOR_POLICY_ENV = ['NIGHTGATE_SPONSOR_ALLOWED_CONTRACTS', 'NIGHTGATE_SPONSOR_ALLOWED_CIRCUITS', 'NIGHTGATE_SPONSOR_ALLOWED_TOKEN_TYPES', 'NIGHTGATE_SPONSOR_POLICY_FILE'];
 const TEST_USER_ID = 'operator-1';
 let __ipCounter = 0;
 function nextIp(): string {
@@ -141,6 +145,8 @@ describe('agent grants', () => {
 
     beforeEach(() => {
         __resetGrantRateLimiterForTests();
+        for (const k of SPONSOR_POLICY_ENV) delete process.env[k];
+        __resetSponsorPolicyForTests();
         vi.clearAllMocks();
         mockDbRun.mockResolvedValue(null);
         updateSetSpy.mockReturnValue({ where: updateWhereSpy });
@@ -491,6 +497,108 @@ describe('agent grants', () => {
         });
     });
 
+    describe('minted token types and the swap right', () => {
+        const T1 = 'ab'.repeat(32);
+        const T2 = 'cd'.repeat(32);
+
+        it('recordMintedTokenTypes appends new raw types, normalized, and leaves known ones alone', async () => {
+            mockDbRun.mockResolvedValueOnce(grantRow({ mintedTokenTypes: JSON.stringify([T1]) }));
+            await recordMintedTokenTypes(db, 'grant-1', [T1, '  ' + T2.toUpperCase(), 'not-a-type']);
+            expect(updateSetSpy).toHaveBeenCalledWith({ mintedTokenTypes: JSON.stringify([T1, T2]) });
+
+            updateSetSpy.mockClear();
+            mockDbRun.mockResolvedValueOnce(grantRow({ mintedTokenTypes: JSON.stringify([T1]) }));
+            await recordMintedTokenTypes(db, 'grant-1', [T1]);
+            expect(updateSetSpy).not.toHaveBeenCalled();
+        });
+
+        it('recordMintedTokenTypes stops at 256 types and never fails the landed job', async () => {
+            const full = Array.from({ length: 256 }, (_, i) => i.toString(16).padStart(64, '0'));
+            mockDbRun.mockResolvedValueOnce(grantRow({ mintedTokenTypes: JSON.stringify(full) }));
+            await recordMintedTokenTypes(db, 'grant-1', [T1]);
+            expect(updateSetSpy).not.toHaveBeenCalled();
+
+            mockDbRun.mockRejectedValueOnce(new Error('db gone'));
+            await expect(recordMintedTokenTypes(db, 'grant-1', [T1])).resolves.toBeUndefined();
+        });
+
+        it('the grant policy carries the minted types; the swap right is the action in allowedActions', async () => {
+            mockDbRun.mockResolvedValueOnce(grantRow({ allowedActions: JSON.stringify(['sponsorSwap']), mintedTokenTypes: JSON.stringify([T1]) }));
+            expect(await currentGrantPolicy(db, 'grant-1')).toMatchObject({ mintedTokenTypes: [T1], allowSwaps: true });
+            mockDbRun.mockResolvedValueOnce(grantRow({ allowedActions: JSON.stringify(['sponsorUnboundTransaction']) }));
+            expect(await currentGrantPolicy(db, 'grant-1')).toMatchObject({ mintedTokenTypes: [], allowSwaps: false });
+        });
+
+        it('sponsorSwap is grantable, also on a platform-pool grant; a deploy right needs a transaction action', async () => {
+            expect(AGENT_ALLOWLISTABLE_ACTIONS).toContain('sponsorSwap');
+            const only = makeReq({ sessionId: 'sess-1', allowedActions: ['sponsorSwap'], allowDeploy: true });
+            await handlers.createAgentGrant(only);
+            expect(only.reject).toHaveBeenCalledWith(400, expect.stringContaining('allowDeploy needs'));
+        });
+    });
+
+    describe('lists the platform policy leaves nothing of are refused when written', () => {
+        const VALID = { sessionId: 'sess-1', allowedActions: ['sponsorFinalizedTransaction'] };
+        const T = 'ab'.repeat(32);
+        const OTHER = 'cd'.repeat(32);
+        const existing = (overrides: Record<string, any> = {}) => grantRow({
+            maxJobsPerDay: 5, allowDeploy: false, maxDeploys: null, deploysUsed: 0,
+            allowedContracts: null, allowedCircuits: null, allowedTokenTypes: null, agentLabel: 'bot', ...overrides
+        });
+
+        it('createAgentGrant: a token type outside the platform list is 400 naming it, nothing is written', async () => {
+            process.env.NIGHTGATE_SPONSOR_ALLOWED_TOKEN_TYPES = T;
+            const req = makeReq({ ...VALID, allowedTokenTypes: [T, OTHER] });
+            await handlers.createAgentGrant(req);
+            expect(req.reject).toHaveBeenCalledWith(400, expect.stringContaining(`allowedTokenTypes ${OTHER} is not in the platform's`));
+            expect(insertEntriesSpy).not.toHaveBeenCalled();
+            expect(mockDbRun).not.toHaveBeenCalled();
+        });
+
+        it('createAgentGrant: contracts that share nothing with the platform list are 400', async () => {
+            process.env.NIGHTGATE_SPONSOR_ALLOWED_CONTRACTS = 'A,B';
+            const req = makeReq({ ...VALID, allowedContracts: ['C'] });
+            await handlers.createAgentGrant(req);
+            expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/allowedContracts \(C\) share nothing/));
+            expect(insertEntriesSpy).not.toHaveBeenCalled();
+        });
+
+        it('updateAgentGrant: a token type outside the platform list is 400, the grant stays as it is', async () => {
+            process.env.NIGHTGATE_SPONSOR_ALLOWED_TOKEN_TYPES = T;
+            mockDbRun.mockResolvedValueOnce(existing());
+            const req = makeReq({ grantId: 'grant-1', allowedTokenTypes: [OTHER] }, { event: 'updateAgentGrant' });
+            await handlers.updateAgentGrant(req);
+            expect(req.reject).toHaveBeenCalledWith(400, expect.stringContaining(OTHER));
+            expect(updateSetSpy).not.toHaveBeenCalled();
+        });
+
+        it('updateAgentGrant: an untouched list of the existing grant is checked too', async () => {
+            process.env.NIGHTGATE_SPONSOR_ALLOWED_CIRCUITS = 'attest';
+            mockDbRun.mockResolvedValueOnce(existing({ allowedCircuits: JSON.stringify(['mint']) }));
+            const req = makeReq({ grantId: 'grant-1', maxJobsPerDay: 9 }, { event: 'updateAgentGrant' });
+            await handlers.updateAgentGrant(req);
+            expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/allowedCircuits \(mint\) share nothing/));
+            expect(updateSetSpy).not.toHaveBeenCalled();
+        });
+
+        it('a grant without lists is written whatever the platform policy is, even an unreadable one', async () => {
+            process.env.NIGHTGATE_SPONSOR_POLICY_FILE = '/nonexistent/sponsor-policy.json';
+            mockDbRun.mockResolvedValueOnce(activeSessionRow());
+            const req = makeReq(VALID);
+            await handlers.createAgentGrant(req);
+            expect(req.reject).not.toHaveBeenCalled();
+            expect(insertEntriesSpy).toHaveBeenCalled();
+        });
+
+        it('an unreadable platform policy refuses a grant WITH lists as 503', async () => {
+            process.env.NIGHTGATE_SPONSOR_POLICY_FILE = '/nonexistent/sponsor-policy.json';
+            const req = makeReq({ ...VALID, allowedContracts: ['C'] });
+            await handlers.createAgentGrant(req);
+            expect(req.reject).toHaveBeenCalledWith(expect.objectContaining({ status: 503, code: 'SPONSOR_POLICY_UNAVAILABLE' }));
+            expect(insertEntriesSpy).not.toHaveBeenCalled();
+        });
+    });
+
     describe('per-grant sponsor allow-list', () => {
         const VALID = { sessionId: 'sess-1', allowedActions: ['sponsorFinalizedTransaction'] };
 
@@ -508,6 +616,7 @@ describe('agent grants', () => {
 
         it('persists allowedTokenTypes (raw 64-hex, normalized) and refuses anything else', async () => {
             const T = 'ab'.repeat(32);
+            process.env.NIGHTGATE_SPONSOR_ALLOWED_TOKEN_TYPES = T;
             mockDbRun.mockResolvedValueOnce(activeSessionRow());
             const req = makeReq({ ...VALID, allowedTokenTypes: ['0x' + T.toUpperCase(), T] });
             const result = await handlers.createAgentGrant(req);
@@ -676,7 +785,8 @@ describe('agent grants', () => {
         it('currentGrantPolicy: the live lists of an active grant, null once revoked', async () => {
             mockDbRun.mockResolvedValueOnce(grantRow({ allowedContracts: JSON.stringify(['c1']), allowedCircuits: null, deployedContracts: JSON.stringify(['d1']), allowDeploy: true }));
             expect(await currentGrantPolicy(db, 'g1')).toEqual({
-                allowedContracts: ['c1'], allowedCircuits: [], deployedContracts: ['d1'], allowedTokenTypes: [], allowDeploy: true
+                allowedContracts: ['c1'], allowedCircuits: [], deployedContracts: ['d1'], allowedTokenTypes: [], mintedTokenTypes: [],
+                allowDeploy: true, allowSwaps: false
             });
             mockDbRun.mockResolvedValueOnce(grantRow({ isActive: false }));
             expect(await currentGrantPolicy(db, 'g1')).toBeNull();
@@ -865,7 +975,7 @@ describe('agent grants', () => {
             expect(req.reject).not.toHaveBeenCalled();
             expect(req.user.id).toBe(TEST_USER_ID);
             expect(req.data.sessionId).toBe('sess-1');
-            expect(req.agentGrant).toEqual({ ID: 'grant-1', sessionId: 'sess-1', userId: TEST_USER_ID, allowedContracts: [], allowedCircuits: [], deployedContracts: [], allowedTokenTypes: [], allowDeploy: false });
+            expect(req.agentGrant).toEqual({ ID: 'grant-1', sessionId: 'sess-1', userId: TEST_USER_ID, allowedContracts: [], allowedCircuits: [], deployedContracts: [], allowedTokenTypes: [], mintedTokenTypes: [], allowDeploy: false, allowSwaps: false });
         });
 
         it('rejects 403 on a sessionId that does not match the grant', async () => {

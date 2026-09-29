@@ -11,7 +11,7 @@ import { reportSubmissionRejectedOn, reportBroadcastOn } from '../job-execution-
 import { PendingSubmissions } from '#cds-models/midnight';
 import { walletSponsorFinalizedTx, walletSponsorUnboundTx } from '../../midnight/wallet-worker-client';
 import { PLATFORM_POOL_SENTINEL, acquireSponsor, releaseSponsor, benchSponsor, decideSponsorFailure, sponsorCandidatesNonExclusive, touchSponsor } from '../sponsor-pool';
-import { recordDeployedContracts, reserveDeployBudget, releaseDeployBudget } from '../../sessions/agent-grants';
+import { recordDeployedContracts, recordMintedTokenTypes, reserveDeployBudget, releaseDeployBudget } from '../../sessions/agent-grants';
 import { sponsorAtSyncGate } from '../sponsor-sync-gate';
 import { configMs, configNumber } from '../../utils/config';
 import type { DbRunner } from '../../utils/db-types';
@@ -64,7 +64,7 @@ export function createSponsorExecutors(ctx: Pick<SubmissionContext, 'db'>) {
         };
         // The intent carries what the worker chose (contract, circuits, backing,
         // payer), so a reconciled result can be rebuilt from the attempt row.
-        const onSubmitIntent = () => async (txHash: string, intent?: { contractAddress?: string; circuits?: string[]; note?: string; sponsorAccountId?: string; deployed?: string[]; ttl?: string; segments?: Array<{ segment: number; calls: string[] }> }) => {
+        const onSubmitIntent = () => async (txHash: string, intent?: { contractAddress?: string; circuits?: string[]; note?: string; sponsorAccountId?: string; deployed?: string[]; ttl?: string; segments?: Array<{ segment: number; calls: string[] }>; minted?: string[] }) => {
             const submissionId = cds.utils.uuid();
             const deployed = (intent?.deployed ?? []).map(String).filter(Boolean);
             const grantId = command?.grantId ? String(command.grantId) : null;
@@ -78,6 +78,7 @@ export function createSponsorExecutors(ctx: Pick<SubmissionContext, 'db'>) {
                 ...(intent?.ttl ? { ttl: intent.ttl } : {}),
                 ...(intent?.segments?.length ? { segments: intent.segments } : {}),
                 ...(deployed.length ? { deployed } : {}),
+                ...(intent?.minted?.length ? { minted: intent.minted } : {}),
                 ...(grantId && deployed.length ? { deployReservation: { grantId, count: deployed.length } } : {})
             };
             const row = {
@@ -142,8 +143,16 @@ export function createSponsorExecutors(ctx: Pick<SubmissionContext, 'db'>) {
         allowedCircuits: policy.allowedCircuits,
         allowDeploy: policy.allowDeploy === true,
         ownContracts: policy.ownContracts,
-        allowedTokenTypes: policy.allowedTokenTypes
+        allowedTokenTypes: policy.allowedTokenTypes,
+        allowContractMints: policy.allowContractMints === true
     });
+
+    /** What a landed job adds to its grant: deployed addresses, minted token types. */
+    const recordOnGrant = async (command: any, out: { deployed?: string[]; minted?: string[] }): Promise<void> => {
+        if (!command.grantId) return;
+        if (out.deployed?.length) await recordDeployedContracts(db, command.grantId, out.deployed);
+        if (out.minted?.length) await recordMintedTokenTypes(db, command.grantId, out.minted);
+    };
 
     // Bound sponsoring job: no contract call of our own, just deserialize the
     // caller's finalized tx, enforce policy, pay dust, submit.
@@ -183,7 +192,7 @@ export function createSponsorExecutors(ctx: Pick<SubmissionContext, 'db'>) {
                             ...policyArgs(policy)
                         }, ledger.onSubmitIntent()));
                     releaseSponsor(sessionId);
-                    if (command.grantId && out.deployed?.length) await recordDeployedContracts(db, command.grantId, out.deployed);
+                    await recordOnGrant(command, out);
                     return { ...out, feeSponsor: sponsorSessionId };
                 } catch (e) {
                     lastErr = e;
@@ -236,7 +245,8 @@ export function createSponsorExecutors(ctx: Pick<SubmissionContext, 'db'>) {
         // lost spend). Only a non-dust retryable failure benches and fails over.
         const dustRetries = configNumber('NIGHTGATE_SPONSOR_DUST_RETRIES');
         const dustBackoffMs = configMs('NIGHTGATE_SPONSOR_DUST_BACKOFF_MS');
-        cds.log('nightgate').info(`sponsorUnboundTransaction job: ${command.unboundTxB64?.length ?? 0} b64 chars, candidates ${candidates.map(c => c.slice(0, 8)).join('>')}`);
+        const size = command.swap ? (command.swap.makerHalfB64?.length ?? 0) + (command.swap.takerHalfB64?.length ?? 0) : command.unboundTxB64?.length ?? 0;
+        cds.log('nightgate').info(`${job.kind} job: ${size} b64 chars, candidates ${candidates.map(c => c.slice(0, 8)).join('>')}`);
 
         let lastErr: unknown;
         let activeSponsorSessionId = String(command.sponsorSessionId ?? job.sessionId);
@@ -252,11 +262,13 @@ export function createSponsorExecutors(ctx: Pick<SubmissionContext, 'db'>) {
                         id => { activeSponsorSessionId = id; },
                         (accountId, policy) => walletSponsorUnboundTx({
                             sponsorSessionId: accountId,
-                            unboundTxB64: command.unboundTxB64,
+                            ...(command.swap
+                                ? { swap: command.swap, allowSwaps: policy.allowSwaps === true }
+                                : { unboundTxB64: command.unboundTxB64 }),
                             networkId: facadeCfg.networkId,
                             ...policyArgs(policy)
                         }, onSubmitIntent()));
-                    if (command.grantId && out.deployed?.length) await recordDeployedContracts(db, command.grantId, out.deployed);
+                    await recordOnGrant(command, out);
                     return { ...out, feeSponsor: sponsorSessionId };
                 } catch (e) {
                     lastErr = e;

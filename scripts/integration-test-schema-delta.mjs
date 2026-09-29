@@ -317,6 +317,7 @@ ok('delta 0.21: the six grant columns were added to an EXISTING AgentGrants tabl
 ok('delta 0.21: the added grant columns are nullable', added021.every(c => grantCols.get(c)?.notnull === 0));
 // --- AgentGrants: the token-type allow-list column ---------------------------
 ok('delta 0.22: allowedTokenTypes was added, nullable', grantCols.has('allowedTokenTypes') && grantCols.get('allowedTokenTypes')?.notnull === 0);
+ok('delta 0.29: mintedTokenTypes was added, nullable', grantCols.has('mintedTokenTypes') && grantCols.get('mintedTokenTypes')?.notnull === 0);
 const grantRow = after.prepare("SELECT * FROM midnight_AgentGrants WHERE ID = 'grant-row-1'").get();
 ok('delta 0.21: the existing grant survived with its token and budget intact',
     grantRow?.tokenHash === 'deadbeef' && grantRow?.maxJobsPerDay === 20 && grantRow?.jobsUsedToday === 3 && grantRow?.isActive === 1,

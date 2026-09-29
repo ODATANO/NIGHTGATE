@@ -32,13 +32,17 @@ const exists = (p) => access(p).then(() => true, () => false);
 
 /** Expected surface per entry point: what the README promises. */
 const EXPECTED = {
-    '.': ['connect', 'int64', 'createTxBuilder', 'deriveIdentity', 'ensureZkAssets', 'ATTESTATION_VAULT_CIRCUITS'],
+    '.': ['connect', 'int64', 'createTxBuilder', 'deriveIdentity', 'ensureZkAssets', 'ATTESTATION_VAULT_CIRCUITS',
+        'createSwapWallet', 'readSwapTerms', 'encodeOffer', 'decodeOffer'],
     './client': ['connect', 'int64', 'NightgateApiError', 'NightgateJobError'],
     './txbuilder': ['createTxBuilder', 'deriveIdentity', 'ensureZkAssets',
         'deserializeTransaction', 'txIdentifiers', 'submitFinalized', 'submitExtrinsic',
         'classifyNodeReject', 'isPreMempoolReject', 'isTransportFailure', 'isAlreadyImported',
         'rebuildOnStaleTranscript',
-        'probeLanded', 'waitLanded', 'withDustGuard', 'nodeHttpUrlFor'],
+        'probeLanded', 'waitLanded', 'withDustGuard', 'nodeHttpUrlFor',
+        'createSwapWallet', 'readSwapTerms', 'sameSwapTerms', 'encodeOffer', 'decodeOffer', 'SWAP_OFFER_PREFIX',
+        'SWAP_MAX_INPUTS', 'chooseSwapCoin', 'spendableWithin',
+        'deriveRoleSeeds', 'recipientKeyMap'],
     './calls': ['prepareAttest', 'prepareAnchorContentRoot', 'prepareProveFieldMembership',
         'buildAttestationVaultWitnesses', 'generateAttestationSecret', 'CONTRACTS'],
     './attestation-vault': ['Contract', 'pureCircuits', 'ledger'],
