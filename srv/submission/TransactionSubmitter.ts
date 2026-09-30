@@ -686,6 +686,7 @@ export function classifySubmissionError(err: unknown, network: NightgateNetwork)
         }
         const custom = /custom error:?\s*(\d+)/i.exec(haystack);
         if (custom?.[1] === '104') return { code: STALE_TRANSCRIPT_CODE, retryable: false, message: staleTranscriptMessage(message) };
+        if (custom?.[1] === '103') return { code: ZSWAP_INVALID_CODE, retryable: false, message: zswapInvalidMessage(message) };
         return {
             code: custom ? `1010/${custom[1]}` : '1010',
             retryable: false,
@@ -733,6 +734,11 @@ export function classifySubmissionError(err: unknown, network: NightgateNetwork)
 
 const JOB_CODES_FROM_ERRORS: ReadonlySet<string> = new Set(['AGENT_GRANT_REVOKED', 'SPONSOR_POLICY_UNAVAILABLE', 'SPONSOR_POLICY_EMPTY']);
 
+/** Ledger error 103 (shielded offer invalid): a coin the transaction spends is gone, or its proof refers to a coin tree state the node no longer accepts. */
+const ZSWAP_INVALID_CODE = '1010/103';
+const zswapInvalidMessage = (message: string): string =>
+    `Shielded offer refused (Substrate 1010, ledger error 103: a coin the transaction spends is already spent, or its proof refers to a coin tree state the node no longer accepts); nothing entered the pool and no fee was spent; a swap offer ends here once another fill of it landed, or when a half is too old: build a new half against the current state: ${message}`;
+
 /** Ledger error 104 (transcript refused): the call no longer fits the contract state it was built against. */
 const STALE_TRANSCRIPT_CODE = '1010/104';
 const staleTranscriptMessage = (message: string): string =>
@@ -767,6 +773,7 @@ function classificationFromSubmitFailure(
                 return { code: '1016', retryable: true, message: `Transaction pool full or immediately dropped: ${message}` };
             }
             if (ledger === STALE_TRANSCRIPT_CODE) return { code: ledger, retryable: false, message: staleTranscriptMessage(message) };
+            if (ledger === ZSWAP_INVALID_CODE) return { code: ledger, retryable: false, message: zswapInvalidMessage(message) };
             const custom = ledger.startsWith('1010/') ? ledger.slice(5) : null;
             return { code: ledger, retryable: false, message: `Invalid transaction (Substrate 1010${custom ? `, ledger error ${custom}` : ''}): ${message}` };
         }

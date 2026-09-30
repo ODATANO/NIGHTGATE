@@ -140,14 +140,14 @@ export class LedgerPayloadDecoder {
         // the cursor is the only gate, so resetting it replays the range,
         // which is how a decoder fix is rolled out.
         const rows: Row<Transaction, 'ID'>[] = await this.db.run(
-            SELECT.from(Transactions).columns('ID', 'raw', 'payloadDecode', 'transactionType', 'txType')
+            SELECT.from(Transactions).columns('ID', 'raw', 'payloadDecode', 'transactionType', 'txType', 'isShielded', 'hasProof')
                 .where({ block_ID: blockId })
         ) || [];
         if (rows.length === 0) return EMPTY_RUN;
 
         // Decoding is wasm and must not hold a db transaction open, so the whole
         // batch is decoded first and written afterwards.
-        const updates: Array<{ id: string; facts: Awaited<ReturnType<typeof decodeLedgerPayload>> | null; state: DecodeState; txType?: string | null }> = [];
+        const updates: Array<{ id: string; facts: Awaited<ReturnType<typeof decodeLedgerPayload>> | null; state: DecodeState; txType?: string | null; unknownFlags?: boolean }> = [];
         const result: DecodeRunResult = { ...EMPTY_RUN, transactions: rows.length };
 
         for (const row of rows) {
@@ -158,11 +158,13 @@ export class LedgerPayloadDecoder {
                 result.absent++;
                 continue;
             }
+            // A regular transaction that does not decode has unknown flags, not "no".
+            const unknownFlags = (row as { isShielded?: boolean | null }).isShielded != null || (row as { hasProof?: boolean | null }).hasProof != null;
             const buf = await readCapBinary(row.raw);
             const call = buf ? parseExtrinsicCall('0x' + buf.toString('hex')) : null;
             const payload = call ? extractLedgerPayload(call.buf, call.argsOffset) : null;
             if (!payload) {
-                updates.push({ id: row.ID, facts: null, state: 'absent' });
+                updates.push({ id: row.ID, facts: null, state: 'absent', unknownFlags });
                 result.absent++;
                 continue;
             }
@@ -171,22 +173,25 @@ export class LedgerPayloadDecoder {
                 result.decoded++;
             } catch (err) {
                 log.warn(`transaction ${row.ID}: ledger payload did not decode: ${(err as Error).message}`);
-                updates.push({ id: row.ID, facts: null, state: 'failed' });
+                updates.push({ id: row.ID, facts: null, state: 'failed', unknownFlags });
                 result.failed++;
             }
         }
 
         await this.db.tx(async (tx) => {
             for (const update of updates) {
-                await this.applyFacts(tx, update.id, update.facts, update.state, update.txType);
+                await this.applyFacts(tx, update.id, update.facts, update.state, update.txType, update.unknownFlags);
             }
         });
         return result;
     }
 
-    private async applyFacts(tx: DbRunner, transactionId: string, facts: LedgerPayloadFacts | null, state: DecodeState, storedTxType?: string | null): Promise<void> {
+    private async applyFacts(tx: DbRunner, transactionId: string, facts: LedgerPayloadFacts | null, state: DecodeState, storedTxType?: string | null, unknownFlags = false): Promise<void> {
         if (!facts) {
-            await tx.run(UPDATE.entity(Transactions).set({ payloadDecode: state }).where({ ID: transactionId }));
+            await tx.run(UPDATE.entity(Transactions).set({
+                payloadDecode: state,
+                ...(unknownFlags ? { isShielded: null, hasProof: null, proofHash: null } : {})
+            }).where({ ID: transactionId }));
             return;
         }
 

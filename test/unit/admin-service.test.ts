@@ -81,6 +81,11 @@ vi.mock('../../srv/submission/contract-registrations', () => {
 });
 
 const evictOrder = vi.hoisted(() => [] as string[]);
+const mockRedecode = vi.hoisted(() => vi.fn());
+vi.mock('../../srv/crawler/redecode', async (importOriginal) => ({
+    ...(await importOriginal<typeof import('../../srv/crawler/redecode')>()),
+    redecodeFromHeight: mockRedecode
+}));
 vi.mock('../../srv/submission/wallet-facade-builder', () => ({
     evictWalletFacade: vi.fn(async (accountId: string) => { evictOrder.push(`evict:${accountId}`); })
 }));
@@ -102,6 +107,7 @@ vi.mock('../../srv/submission/wallet-material-factory', async (importOriginal) =
 
 import NightgateAdminService from '../../srv/admin-service';
 import { ContractRegistrationError } from '../../srv/submission/contract-registrations';
+import { RedecodeError } from '../../srv/crawler/redecode';
 
 function createMockRequest(data: Record<string, unknown>, userId?: string) {
     const req: any = {
@@ -576,6 +582,31 @@ describe('NightgateAdminService', () => {
             const req = createMockRequest({ grantId: 'grant-x' }, 'admin-1');
             await registeredHandlers['getSponsorPolicy'](req);
             expect(req.reject).toHaveBeenCalledWith(404, 'Grant not found');
+        });
+    });
+
+    describe('redecodeFromHeight', () => {
+        it('hands the height to the cursor reset and returns its result', async () => {
+            mockRedecode.mockResolvedValueOnce({ fromHeight: 100, previousDecodedHeight: 250, blocks: 151, changed: true });
+            const req = createMockRequest({ height: 100 }, 'admin-1');
+            const result = await registeredHandlers['redecodeFromHeight'](req);
+            expect(mockRedecode).toHaveBeenCalledWith(expect.anything(), 100);
+            expect(result).toEqual({ fromHeight: 100, previousDecodedHeight: 250, blocks: 151, changed: true });
+            expect(req.reject).not.toHaveBeenCalled();
+        });
+
+        it('a refused height is a 400 with the reason', async () => {
+            mockRedecode.mockRejectedValueOnce(new RedecodeError('height must be a non-negative integer'));
+            const req = createMockRequest({ height: -1 }, 'admin-1');
+            await registeredHandlers['redecodeFromHeight'](req);
+            expect(req.reject).toHaveBeenCalledWith(400, 'height must be a non-negative integer');
+        });
+
+        it('anything else stays an error', async () => {
+            mockRedecode.mockRejectedValueOnce(new Error('database gone'));
+            const req = createMockRequest({ height: 1 }, 'admin-1');
+            await expect(registeredHandlers['redecodeFromHeight'](req)).rejects.toThrow('database gone');
+            expect(req.reject).not.toHaveBeenCalled();
         });
     });
 

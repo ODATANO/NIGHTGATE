@@ -547,7 +547,9 @@ rate limit and the grant's `maxJobsPerDay`. The sponsor pays dust only; it
 never adds or removes value.
 
 An offer fills once: the first transaction that lands spends the maker's coin,
-every later one is rejected by the node and its job fails. A maker withdraws an
+every later one is rejected by the node at admission and its job fails with
+`1010/103` (nothing rebuilt, no fee spent; the same code for a half whose proof
+refers to a coin tree state the node no longer accepts). A maker withdraws an
 offer by spending the coin.
 
 Size: every input or output is about 5 kB. Two halves with 4 inputs and 2
@@ -881,6 +883,8 @@ Last `limit` (default 10, max 100) reorg events with depth, detected-at timestam
 
 `getSponsorPolicy(grantId?) → { source, path, loadedAt, ignoredEnv[], floor, floorError, grant, effective, effectiveError }`: the platform sponsor policy (`source` `file` or `env`, `loadedAt` of the policy file, `ignoredEnv` = env settings the file replaces), and with `grantId` the grant's lists, its `deployedContracts` and `mintedTokenTypes`, and what is left of them (`effective`, with `ownContracts` and `ownTokenTypes`), or why nothing is (`effectiveError`). Unknown grant 404.
 
+`redecodeFromHeight(height) → { fromHeight, previousDecodedHeight, blocks, changed }`: moves the ledger payload decode cursor (`SyncState.lastDecodedHeight`) to just below `height`, so the decode pass (`crawler.decodePayloads`) replays every indexed block from there and rewrites what it reads from the payloads: `txType` of call-free transactions, `isShielded`, `hasProof`, the zswap and DUST counts, `identifiers`, circuit names. A regular transaction whose payload does not decode ends with `isShielded` / `hasProof` `null`. The cursor is only lowered: `changed` is `false` when it already stood below `height`; `blocks` counts the indexed blocks from `height` to the tip. Runs under the reorg lock, so a pass in flight drops its own cursor write.
+
 `reconcileNightBalances(address?, after?, limit?) → { checked, next, drifted[{ address, field, stored, computed }] }`: `NightBalances` rows that differ from the figures the indexed NIGHT UTXOs imply (the rule a reorg rollback rebuilds by); writes nothing. One `address`, or a page of up to `limit` (max 500) addresses after `after`; `next` is the cursor for the following page, `null` at the end. `field: 'row'` = a row is missing.
 
 `registerContract(name, artifactPath, zkConfigPath, privateStateId, slotWidth?) → { name, source, artifactPath, zkConfigPath, privateStateId, slotWidth, artifactDigest, hasProverKeys }`: register a contract artifact without a restart.
@@ -979,6 +983,7 @@ Job codes (`classifySubmissionError`, `srv/submission/TransactionSubmitter.ts`):
 
 Raw node or SDK errors instead of a job code:
 
+- **`1010/103` (shielded offer invalid):** a coin the transaction spends is already spent, or a zswap proof refers to a coin tree state the node no longer accepts. Pre-mempool, no fee, never rebuilt: a swap offer that was filled before ends here, as does a half that grew too old; build a new half against the current state.
 - **`1010/170`, `1010/171`, `1010/196` (dust race):** the dust spend was built on a dust state the node has moved past (170: stale merkle root, e.g. lagging indexer or unsynced wallet; 171: the spend's ctime is ahead of a lagging node's block time; 196: nullifier already known, concurrent spend of the same note). Pre-mempool, no fee. Marked `retryable: true, transient: "dust-race"`; deploy, call and batch rebuild inside the worker call (`NIGHTGATE_DUST_RACE_RETRIES`, default 2; `NIGHTGATE_DUST_RACE_BACKOFF_MS`, default 5000), sponsored paths via `NIGHTGATE_SPONSOR_DUST_RETRIES`. `failed assert: predicate false` is a predicate-circuit rejection.
 - **`Wallet.InsufficientFunds`:** not enough dust for the fee or NIGHT for the outputs.
 - **`MalformedResult`:** the SDK returned without the expected fields; thrown by `TransactionSubmitter`, not a job code.

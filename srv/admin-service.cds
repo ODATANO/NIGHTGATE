@@ -183,6 +183,19 @@ service NightgateAdminService {
         };
     };
 
+    /**
+     * Decode the ledger payloads again from `height` up: the decode pass replays
+     * the range and rewrites what it reads from them (`txType` of call-free
+     * transactions, `isShielded`, `hasProof`, counts, circuit names). The cursor
+     * is only lowered; `changed` is false when it already stood below `height`.
+     */
+    action redecodeFromHeight(height: Integer64) returns {
+        fromHeight            : Integer64;
+        previousDecodedHeight : Integer64;
+        blocks                : Integer64;
+        changed               : Boolean;
+    };
+
     // Grant a disclosure tier; the caller also needs disclosureRole 'authority'.
     action grantRole(
         userId:     String,

@@ -595,6 +595,9 @@ describe('classifySubmissionError', () => {
         expect(classifySubmissionError(coded('pre-mempool-reject', { ledgerCode: 'intent-timeout' }), 'preprod')).toMatchObject({ code: 'SubmitIntentTimeout', retryable: false, message: expect.stringMatching(/nothing was broadcast/) });
         expect(classifySubmissionError(coded('pre-mempool-reject', { ledgerCode: '1010/104' }), 'preprod')).toMatchObject({ code: '1010/104', retryable: false, message: expect.stringMatching(/no fee was spent; build the call again/) });
         expect(classifySubmissionError(new Error('1010: Invalid Transaction: Custom error: 104'), 'preprod')).toMatchObject({ code: '1010/104', message: expect.stringMatching(/current contract state/) });
+        // 103: the shielded offer is invalid (a coin already spent, a stale proof); an offer filled twice ends here, never rebuilt.
+        expect(classifySubmissionError(coded('pre-mempool-reject', { ledgerCode: '1010/103' }), 'preprod')).toMatchObject({ code: '1010/103', retryable: false, message: expect.stringMatching(/already spent.*no fee was spent.*build a new half/) });
+        expect(classifySubmissionError(new Error('Transaction submission failed <- RpcError: 1010: Invalid Transaction: Custom error: 103'), 'preprod')).toMatchObject({ code: '1010/103', retryable: false, message: expect.stringMatching(/Shielded offer refused/) });
         expect(classifySubmissionError(coded('transport', { retryable: true }), 'preprod')).toMatchObject({ code: 'NetworkOrTimeout', retryable: true });
         // Ambiguous is NOT retried by rebuilding: the identifier may land.
         expect(classifySubmissionError(coded('ambiguous', {}, 'submit watch timed out after 60000ms'), 'preprod')).toMatchObject({ code: 'SubmitAmbiguous', retryable: false });

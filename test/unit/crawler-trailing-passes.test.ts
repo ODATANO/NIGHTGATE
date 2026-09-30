@@ -20,6 +20,7 @@ import { LedgerPayloadDecoder } from '../../srv/crawler/LedgerPayloadDecoder';
 import { IndexerSupplement, RATE_LIMIT_BACKOFF_MS } from '../../srv/crawler/IndexerSupplement';
 import { IndexerHttpError, createIndexerClient, isIndexerRateLimit } from '../../srv/crawler/indexer-supplement';
 import { rollbackIndexedDataFromHeight } from '../../srv/crawler/rollback';
+import { redecodeFromHeight } from '../../srv/crawler/redecode';
 import { readCapBinary } from '../../srv/crawler/cap-binary';
 import {
     compactStoredContractState, contractStateAt, contractStatePolicy, type ContractStatePolicy
@@ -288,6 +289,68 @@ describe('LedgerPayloadDecoder', () => {
         decodeLedgerPayload.mockResolvedValue(facts());
         expect((await runDecoder()).blocks).toBe(1);
         expect(Number((await readSync()).lastDecodedHeight)).toBe(1_400_000);
+    });
+
+    it('a replayed regular row that does not decode goes from "no" to unknown; a system row keeps its no', async () => {
+        const blockId = await seedBlock(10, '0xd7');
+        const regular = await seedTransaction(blockId, { transactionId: 0, raw: midnightExtrinsicBase64(20), isShielded: false, hasProof: false });
+        const noPayload = await seedTransaction(blockId, { transactionId: 1, raw: inherentBase64(), isShielded: false, hasProof: false });
+        const system = await seedTransaction(blockId, { transactionId: 2, transactionType: 'SYSTEM', raw: inherentBase64(), isShielded: false, hasProof: false });
+        await setSync({ lastIndexedHeight: 30, lastDecodedHeight: null });
+        decodeLedgerPayload.mockRejectedValue(new Error('does not decode'));
+        const warn = vi.spyOn(cds.log('nightgate:crawler'), 'warn').mockImplementation(() => {});
+        try {
+            await runDecoder();
+        } finally {
+            warn.mockRestore();
+        }
+        const failed = await db.run(cds.ql.SELECT.one.from(TRANSACTIONS).where({ ID: regular }));
+        expect([failed.payloadDecode, failed.isShielded, failed.hasProof]).toEqual(['failed', null, null]);
+        const absent = await db.run(cds.ql.SELECT.one.from(TRANSACTIONS).where({ ID: noPayload }));
+        expect([absent.payloadDecode, absent.isShielded, absent.hasProof]).toEqual(['absent', null, null]);
+        const sys = await db.run(cds.ql.SELECT.one.from(TRANSACTIONS).where({ ID: system }));
+        expect([sys.payloadDecode, sys.isShielded, sys.hasProof]).toEqual(['absent', false, false]);
+    });
+
+    describe('redecodeFromHeight', () => {
+        it('lowers the cursor to just below the height and counts the blocks the pass will replay', async () => {
+            for (const h of [10, 11, 12, 13]) await seedBlock(h, `0xe${h}`);
+            await setSync({ lastIndexedHeight: 13, lastDecodedHeight: 12 });
+            expect(await redecodeFromHeight(db, 11)).toEqual({ fromHeight: 11, previousDecodedHeight: 12, blocks: 3, changed: true });
+            expect(Number((await readSync()).lastDecodedHeight)).toBe(10);
+            expect(await redecodeFromHeight(db, 0)).toEqual({ fromHeight: 0, previousDecodedHeight: 10, blocks: 4, changed: true });
+            expect((await readSync()).lastDecodedHeight).toBeNull();
+        });
+
+        it('never raises the cursor', async () => {
+            await seedBlock(10, '0xe9');
+            await setSync({ lastIndexedHeight: 30, lastDecodedHeight: 10 });
+            expect(await redecodeFromHeight(db, 20)).toEqual({ fromHeight: 20, previousDecodedHeight: 10, blocks: 0, changed: false });
+            expect(Number((await readSync()).lastDecodedHeight)).toBe(10);
+            await setSync({ lastIndexedHeight: 30, lastDecodedHeight: null });
+            expect(await redecodeFromHeight(db, 5)).toMatchObject({ previousDecodedHeight: null, changed: false });
+        });
+
+        it('refuses anything but a non-negative integer height', async () => {
+            await setSync({ lastIndexedHeight: 30, lastDecodedHeight: 10 });
+            for (const bad of [-1, 1.5, 'ten', '', null, undefined, {}]) {
+                await expect(redecodeFromHeight(db, bad)).rejects.toThrow(/non-negative integer/);
+            }
+            expect(Number((await readSync()).lastDecodedHeight)).toBe(10);
+            // The OData layer may hand an Integer64 over as a decimal string.
+            expect(await redecodeFromHeight(db, '5')).toMatchObject({ fromHeight: 5, changed: true });
+        });
+
+        it('the pass picks the replay up from the lowered cursor', async () => {
+            const blockId = await seedBlock(10, '0xea');
+            const txId = await seedTransaction(blockId, { raw: midnightExtrinsicBase64(20), payloadDecode: 'failed' });
+            await setSync({ lastIndexedHeight: 30, lastDecodedHeight: 25 });
+            decodeLedgerPayload.mockResolvedValue(facts());
+            expect((await runDecoder()).blocks).toBe(0);
+            await redecodeFromHeight(db, 10);
+            expect((await runDecoder()).decoded).toBe(1);
+            expect((await db.run(cds.ql.SELECT.one.from(TRANSACTIONS).where({ ID: txId }))).payloadDecode).toBe('decoded');
+        });
     });
 
     it('stays below the lag and does not re-decode a finished row', async () => {

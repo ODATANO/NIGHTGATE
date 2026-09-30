@@ -25,6 +25,7 @@ import { walletCpuProfile } from './midnight/wallet-worker-client';
 import { PROFILE_ROOT, profileCurrentThread, resolveProfileDir } from './midnight/cpu-profile';
 import { getConfiguredNightgateNetwork } from './utils/nightgate-config';
 import { reconcileNightBalances } from './crawler/night-balance-reconcile';
+import { redecodeFromHeight, RedecodeError } from './crawler/redecode';
 import { describeSponsorPolicy } from './sessions/agent-grants';
 import { formatErr } from './utils/format-error';
 import { NightgateError } from './utils/errors';
@@ -65,6 +66,16 @@ export default class NightgateAdminService extends cds.ApplicationService {
                 return req.reject(400, 'limit must be a positive integer');
             }
             return reconcileNightBalances(this.db, { address, after, limit });
+        });
+
+        this.on('redecodeFromHeight', async (req: NightgateRequest) => {
+            const { height } = req.data as { height?: unknown };
+            try {
+                return await redecodeFromHeight(this.db, height);
+            } catch (err) {
+                if (err instanceof RedecodeError) return req.reject(400, err.message);
+                throw err;
+            }
         });
 
         this.on('getSponsorPolicy', async (req: NightgateRequest) => {

@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.29.1 - 2026-09-30
+
+### Features
+
+- Admin `redecodeFromHeight(height)`: lowers the ledger payload decode cursor so the
+  decode pass replays the indexed blocks from `height` and rewrites `txType`,
+  `isShielded`, `hasProof`, the counts and circuit names from the payloads. Returns
+  `{ fromHeight, previousDecodedHeight, blocks, changed }`; the cursor is never raised.
+
+### Fixes
+
+- A replayed regular transaction whose payload does not decode ends with `isShielded`
+  and `hasProof` `null` (was: kept a stored `false`).
+- Job code `1010/103` (shielded offer invalid: a coin already spent, a stale zswap
+  proof) carries its meaning in the message; a swap offer filled twice ends there,
+  nothing is rebuilt.
+
 ## 0.29.0 - 2026-09-29
 
 ### Features
