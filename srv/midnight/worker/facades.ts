@@ -140,33 +140,77 @@ export function pushSyncProgress(snapshot: SyncProgressSnapshot, dust?: SyncDust
 export interface IndexerTip {
     height: bigint | null;
     timestampMs: number | null;
-    /** Why there is no timestamp: `HTTP 403`, `timeout`, ...; null when the read succeeded. */
+    /** Why this read failed: `HTTP 403`, `timeout`, ...; null when it succeeded. */
     error: string | null;
+    /** `cached`: the read failed and the values are the last successful read's (grace window). */
+    via: 'http' | 'ws' | 'cached' | null;
 }
 
-export async function getIndexerTip(indexerHttpUrl: string): Promise<IndexerTip> {
+const BLOCK_TIP_QUERY = '{ block { height timestamp } }';
+
+async function readIndexerTipHttp(indexerHttpUrl: string): Promise<IndexerTip> {
     try {
         const r = await fetch(indexerHttpUrl, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ query: '{ block { height timestamp } }' }),
+            body: JSON.stringify({ query: BLOCK_TIP_QUERY }),
             signal: AbortSignal.timeout(15_000)
         });
         // A refusal from the indexer's edge is HTML, not JSON.
         const j: any = await r.json().catch(() => null);
         const b = j?.data?.block;
         if (b?.timestamp == null) {
-            return { height: null, timestampMs: null, error: r.ok === false ? `HTTP ${r.status}` : 'no block in the answer' };
+            return { height: null, timestampMs: null, error: r.ok === false ? `HTTP ${r.status}` : 'no block in the answer', via: null };
         }
-        return {
-            height: b.height != null ? BigInt(b.height) : null,
-            timestampMs: Number(b.timestamp),
-            error: null
-        };
+        return { height: b.height != null ? BigInt(b.height) : null, timestampMs: Number(b.timestamp), error: null, via: 'http' };
     } catch (err: unknown) {
         const error = errorName(err) === 'TimeoutError' ? 'timeout' : formatErr(err).slice(0, 120);
-        return { height: null, timestampMs: null, error };
+        return { height: null, timestampMs: null, error, via: null };
     }
+}
+
+// The `blocks` subscription emits the newest block first.
+async function readIndexerTipWs(indexerHttpUrl: string): Promise<IndexerTip | null> {
+    const b: any = await oneShotSubscription(indexerHttpUrl, 'subscription { blocks { height timestamp } }', (data) => data?.blocks ?? null);
+    if (b?.timestamp == null) return null;
+    return { height: b.height != null ? BigInt(b.height) : null, timestampMs: Number(b.timestamp), error: null, via: 'ws' };
+}
+
+export const indexerTipCache = new Map<string, { tip: IndexerTip; at: number }>();
+const indexerTipVia = new Map<string, IndexerTip['via']>();
+
+/** A failed tip read (HTTP query and `blocks` subscription) reuses the last successful read within this window (`NIGHTGATE_INDEXER_TIP_GRACE_MS`, 0 = off). */
+export function indexerTipGraceMs(): number {
+    return configMs('NIGHTGATE_INDEXER_TIP_GRACE_MS');
+}
+
+/**
+ * The indexer's newest block: HTTP query, else the `blocks` subscription (the two paths fail
+ * independently at the indexer's edge), else the last successful read within the grace window,
+ * whose timestamp still ages against the freshness bound.
+ */
+export async function getIndexerTip(indexerHttpUrl: string): Promise<IndexerTip> {
+    const http = await readIndexerTipHttp(indexerHttpUrl);
+    let tip = http;
+    if (http.error) {
+        const ws = await readIndexerTipWs(indexerHttpUrl);
+        if (ws) tip = ws;
+        else {
+            const cached = indexerTipCache.get(indexerHttpUrl);
+            const age = cached ? Date.now() - cached.at : Infinity;
+            if (cached && age < indexerTipGraceMs()) tip = { ...cached.tip, error: http.error, via: 'cached' };
+        }
+    }
+    if (!tip.error) indexerTipCache.set(indexerHttpUrl, { tip, at: Date.now() });
+    const before = indexerTipVia.get(indexerHttpUrl);
+    if (before !== tip.via) {
+        indexerTipVia.set(indexerHttpUrl, tip.via);
+        if (tip.via === 'http') { if (before !== undefined) log('info', 'indexer tip read over http again'); }
+        else if (tip.via === 'ws') log('info', `indexer tip read over the blocks subscription (http: ${http.error})`);
+        else if (tip.via === 'cached') log('info', `indexer tip reads failing (http: ${http.error}, no subscription answer), reusing the last read within ${Math.round(indexerTipGraceMs() / 1000)}s`);
+        else log('info', `indexer tip unknown (http: ${http.error}, no subscription answer, nothing to reuse)`);
+    }
+    return tip;
 }
 
 /** Age of the indexer's newest block; null when the tip read failed. */
@@ -180,7 +224,7 @@ const STREAM_FIELD: Record<LedgerEventStream, string> = { dust: 'dustLedgerEvent
 // One stream-tip probe per few seconds is plenty for a 3s poll loop.
 export const streamTipCache = new Map<LedgerEventStream, { tip: bigint; at: number }>();
 
-/** A failed tip read reuses the last read within this window (`NIGHTGATE_STREAM_TIP_GRACE_MS`, 0 = off). */
+/** A failed read reuses the last read within this window (`NIGHTGATE_STREAM_TIP_GRACE_MS`, 0 = off). */
 export function streamTipGraceMs(): number {
     return configMs('NIGHTGATE_STREAM_TIP_GRACE_MS');
 }
@@ -200,13 +244,34 @@ export async function getLedgerEventStreamTip(indexerHttpUrl: string, stream: Le
     const cached = streamTipCache.get(stream);
     if (cached && Date.now() - cached.at < 10_000) return cached.tip;
     const field = STREAM_FIELD[stream];
+    const maxId = await oneShotSubscription(indexerHttpUrl, `subscription { ${field}(id: 0) { id maxId } }`, (data) => data?.[field]?.maxId ?? null);
+    if (maxId != null) {
+        const tip = BigInt(maxId);
+        streamTipCache.set(stream, { tip, at: Date.now() });
+        return tip;
+    }
+    return staleStreamTip(stream, cached);
+}
+
+// One import per thread; concurrent probes share it.
+let wsModule: Promise<any> | undefined;
+function loadWs(): Promise<any> {
+    wsModule ??= import('ws').catch((e) => { wsModule = undefined; throw e; });
+    return wsModule;
+}
+
+/**
+ * First `next` payload of a graphql-transport-ws subscription on the indexer's ws endpoint, or
+ * null on no answer within 10 s, an error frame, a closed socket or a failed `pick`.
+ */
+async function oneShotSubscription<T>(indexerHttpUrl: string, query: string, pick: (data: any) => T | null): Promise<T | null> {
     const wsUrl = deriveIndexerWsUrl(indexerHttpUrl);
     try {
-        const { default: WebSocket } = await import('ws');
-        const tip = await new Promise<bigint | null>((resolve) => {
+        const { default: WebSocket } = await loadWs();
+        return await new Promise<T | null>((resolve) => {
             const sock: any = new (WebSocket as any)(wsUrl, 'graphql-transport-ws');
             let settled = false;
-            const done = (v: bigint | null) => {
+            const done = (v: T | null) => {
                 if (settled) return;
                 settled = true;
                 clearTimeout(timer);
@@ -219,13 +284,9 @@ export async function getLedgerEventStreamTip(indexerHttpUrl: string, stream: Le
                 try {
                     const m = JSON.parse(buf.toString());
                     if (m.type === 'connection_ack') {
-                        sock.send(JSON.stringify({
-                            id: '1', type: 'subscribe',
-                            payload: { query: `subscription { ${field}(id: 0) { id maxId } }` }
-                        }));
+                        sock.send(JSON.stringify({ id: '1', type: 'subscribe', payload: { query } }));
                     } else if (m.type === 'next') {
-                        const maxId = m.payload?.data?.[field]?.maxId;
-                        done(maxId != null ? BigInt(maxId) : null);
+                        done(pick(m.payload?.data));
                     } else if (m.type === 'error' || m.type === 'complete') {
                         done(null);
                     }
@@ -234,12 +295,7 @@ export async function getLedgerEventStreamTip(indexerHttpUrl: string, stream: Le
             sock.on('error', () => done(null));
             sock.on('close', () => done(null));
         });
-        if (tip != null) {
-            streamTipCache.set(stream, { tip, at: Date.now() });
-            return tip;
-        }
-        return staleStreamTip(stream, cached);
-    } catch { return staleStreamTip(stream, cached); }
+    } catch { return null; }
 }
 
 function staleStreamTip(stream: LedgerEventStream, cached: { tip: bigint; at: number } | undefined): bigint | null {

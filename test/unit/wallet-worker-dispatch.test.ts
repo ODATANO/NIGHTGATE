@@ -215,7 +215,7 @@ vi.mock('@midnight-ntwrk/midnight-js-network-id', () => ({
 
 // getDustStreamTip probes the indexer via a one-shot graphql-transport-ws
 // subscription; this fake speaks just enough of the protocol.
-const wsTip = vi.hoisted(() => ({ maxId: '100' as string | null }));
+const wsTip = vi.hoisted(() => ({ maxId: '100' as string | null, block: null as { height: string; timestamp: number } | null }));
 vi.mock('ws', () => {
     class FakeWebSocket {
         private handlers: Record<string, Array<(...a: any[]) => void>> = {};
@@ -229,13 +229,12 @@ vi.mock('ws', () => {
             if (m.type === 'connection_init') {
                 setImmediate(() => this.emit('message', Buffer.from(JSON.stringify({ type: 'connection_ack' }))));
             } else if (m.type === 'subscribe') {
-                // Answers under the stream the query names (dust or zswap).
-                const field = /subscription \{ (\w+)\(/.exec(String(m.payload?.query))?.[1] ?? 'dustLedgerEvents';
-                setImmediate(() => this.emit('message', Buffer.from(JSON.stringify(
-                    wsTip.maxId == null
-                        ? { type: 'error' }
-                        : { type: 'next', payload: { data: { [field]: { id: 0, maxId: wsTip.maxId } } } }
-                ))));
+                // Answers under the field the query names: a ledger-event stream (dust or zswap) or blocks.
+                const field = /subscription \{ (\w+)/.exec(String(m.payload?.query))?.[1] ?? 'dustLedgerEvents';
+                const answer = field === 'blocks'
+                    ? (wsTip.block == null ? { type: 'error' } : { type: 'next', payload: { data: { blocks: wsTip.block } } })
+                    : (wsTip.maxId == null ? { type: 'error' } : { type: 'next', payload: { data: { [field]: { id: 0, maxId: wsTip.maxId } } } });
+                setImmediate(() => this.emit('message', Buffer.from(JSON.stringify(answer))));
             }
         }
         close() { this.emit('close'); }
@@ -1879,12 +1878,78 @@ describe('progress watch tick', () => {
         expect(last.snapshot).toMatchObject({ caughtUp: false, indexerFresh: false, indexerError: null });
         expect(last.snapshot.indexerTipAgeMs).toBeGreaterThanOrEqual(3_600_000);
 
-        // a refused tip read says why instead of passing for a stale indexer
-        vi.stubGlobal('fetch', vi.fn(async () => ({ ok: false, status: 403, json: async () => { throw new SyntaxError('Unexpected token <'); } })));
+        // a refused tip read with nothing to fall back on says why instead of passing for a stale indexer
+        workerExports.indexerTipCache.clear();
+        stubIndexerTipRefused();
         await workerExports.progressWatchTick(SESSION, entry, Date.now() + 360_000);
         const refused = fakeParentPort.postMessage.mock.calls.map(c => c[0]).filter((m: any) => m.kind === 'sync-progress' && m.sessionId === SESSION).at(-1);
         expect(refused.snapshot).toMatchObject({ caughtUp: false, indexerFresh: false, indexerError: 'HTTP 403', indexerTipAgeMs: null });
         await rpc('evict', { sessionId: SESSION });
+    });
+
+    function stubIndexerTipRefused() {
+        vi.stubGlobal('fetch', vi.fn(async () => ({ ok: false, status: 403, json: async () => { throw new SyntaxError('Unexpected token <'); } })));
+    }
+
+    function lastPushed(session: string) {
+        return fakeParentPort.postMessage.mock.calls.map(c => c[0]).filter((m: any) => m.kind === 'sync-progress' && m.sessionId === session).at(-1).snapshot;
+    }
+
+    // The HTTP query and the subscription fail independently at the indexer's edge.
+    it('a refused HTTP tip read falls back to the blocks subscription', async () => {
+        const SESSION = 'session-watch-wstip-qqqqqqqq';
+        await initSession(SESSION);
+        const entry = workerExports.facades.get(SESSION);
+        workerExports.streamTipCache.clear();
+        workerExports.indexerTipCache.clear();
+        wsTip.maxId = '100';
+        wsTip.block = { height: '501', timestamp: Date.now() };
+        facadeState.current = { dust: { progress: { appliedIndex: '100', isConnected: true } } };
+        stubIndexerTipRefused();
+        try {
+            await workerExports.progressWatchTick(SESSION, entry, Date.now() + 120_000);
+            expect(lastPushed(SESSION)).toMatchObject({ caughtUp: true, indexerFresh: true, indexerError: null, blockHeight: '501' });
+        } finally {
+            wsTip.block = null;
+            await rpc('evict', { sessionId: SESSION });
+        }
+    });
+
+    it('a failed tip read reuses the last successful read within the grace window, timestamp still ageing', async () => {
+        const SESSION = 'session-watch-grace-rrrrrrrr';
+        await initSession(SESSION);
+        const entry = workerExports.facades.get(SESSION);
+        workerExports.streamTipCache.clear();
+        workerExports.indexerTipCache.clear();
+        wsTip.maxId = '100';
+        facadeState.current = { dust: { progress: { appliedIndex: '100', isConnected: true } } };
+        try {
+            stubIndexerTip(Date.now() - 20_000);
+            await workerExports.progressWatchTick(SESSION, entry, Date.now() + 120_000);
+            expect(lastPushed(SESSION)).toMatchObject({ caughtUp: true, indexerError: null, blockHeight: '500' });
+
+            // http times out, no subscription answer: the read from a moment ago still counts
+            vi.stubGlobal('fetch', vi.fn(async () => { throw Object.assign(new Error('The operation was aborted due to timeout'), { name: 'TimeoutError' }); }));
+            await workerExports.progressWatchTick(SESSION, entry, Date.now() + 240_000);
+            const reused = lastPushed(SESSION);
+            expect(reused).toMatchObject({ caughtUp: true, indexerFresh: true, indexerError: 'timeout', blockHeight: '500' });
+            expect(reused.indexerTipAgeMs).toBeGreaterThanOrEqual(20_000);
+
+            // the cached read ages past the freshness bound like a live one would
+            workerExports.indexerTipCache.set(entry.indexerHttpUrl, { tip: { height: 500n, timestampMs: Date.now() - 3_600_000, error: null, via: 'http' }, at: Date.now() });
+            await workerExports.progressWatchTick(SESSION, entry, Date.now() + 360_000);
+            expect(lastPushed(SESSION)).toMatchObject({ caughtUp: false, indexerFresh: false, indexerError: 'timeout' });
+
+            // grace 0: nothing is reused
+            process.env.NIGHTGATE_INDEXER_TIP_GRACE_MS = '0';
+            workerExports.indexerTipCache.set(entry.indexerHttpUrl, { tip: { height: 500n, timestampMs: Date.now(), error: null, via: 'http' }, at: Date.now() });
+            await workerExports.progressWatchTick(SESSION, entry, Date.now() + 480_000);
+            expect(lastPushed(SESSION)).toMatchObject({ caughtUp: false, indexerFresh: false, indexerError: 'timeout', indexerTipAgeMs: null });
+        } finally {
+            delete process.env.NIGHTGATE_INDEXER_TIP_GRACE_MS;
+            workerExports.indexerTipCache.clear();
+            await rpc('evict', { sessionId: SESSION });
+        }
     });
 
     it('pushes the dust figures with the verdict', async () => {

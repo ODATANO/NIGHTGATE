@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.29.2 - 2026-10-01
+
+### Fixes
+
+- The wallet worker's indexer tip read (the sync gate's freshness check) falls back to
+  the indexer's `blocks` subscription when the HTTP query fails, then to the last
+  successful read within `NIGHTGATE_INDEXER_TIP_GRACE_MS` (default 3 min, `0` = off);
+  the reused timestamp still ages against `NIGHTGATE_SYNC_FRESHNESS_MS`. A refused or
+  timed-out HTTP query alone no longer takes a synced sponsor out of the pool.
+  `getWalletSyncProgress` reports `indexerError` with `indexerFresh: true` for a reuse;
+  the worker logs each change of the read path once.
+
 ## 0.29.1 - 2026-09-30
 
 ### Features
