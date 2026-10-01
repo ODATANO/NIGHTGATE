@@ -5,6 +5,7 @@
  * Module-level state is reset between tests via clearRegistry().
  */
 
+import { resolveContractPackage } from '@odatano/contract-kit/node';
 import path from 'path';
 import fs from 'fs';
 import os from 'os';
@@ -78,11 +79,7 @@ describe('contract registry', () => {
 // persisted commands / evidence rows are verified against it fail-closed.
 describe('artifact generation digest', () => {
     const REPO = path.resolve(__dirname, '../..');
-    const VAULT = {
-        artifactPath: path.join(REPO, 'contracts/attestation-vault/src/managed/attestation-vault/contract/index.js'),
-        privateStateId: 'vault',
-        zkConfigPath: path.join(REPO, 'contracts/attestation-vault/src/managed/attestation-vault')
-    };
+    const VAULT = VAULT_FIXTURE();
     // A second, DIFFERENT "generation" for the same alias: any other real
     // file works, the digest only reads bytes (no keys dir -> module-only).
     const OTHER = {
@@ -280,7 +277,7 @@ describe('getContractRegistration + loadRegistryFromConfig guards', () => {
         const { loadRegistryFromConfig, listRegisteredContracts } = await import('../../srv/submission/contract-registry.js');
         loadRegistryFromConfig(undefined);
         loadRegistryFromConfig({});
-        loadRegistryFromConfig({ contracts: 'not-an-object' });
+        loadRegistryFromConfig(JSON.parse('{"contracts":"not-an-object"}'));
         expect(listRegisteredContracts()).toEqual([]);
     });
 
@@ -376,11 +373,34 @@ describe('artifact digest: the legacy CommonJS digest form stays accepted', () =
     });
 });
 
+/** The installed vault lineage package, registered under a test alias. */
 function VAULT_FIXTURE() {
-    const REPO = path.resolve(__dirname, '../..');
-    return {
-        artifactPath: path.join(REPO, 'contracts/attestation-vault/src/managed/attestation-vault/contract/index.js'),
-        privateStateId: 'vault',
-        zkConfigPath: path.join(REPO, 'contracts/attestation-vault/src/managed/attestation-vault')
-    };
+    const pkg = resolveContractPackage('@odatano/contract-attestation-vault', path.resolve(__dirname, '../..'));
+    return { artifactPath: pkg.artifactPath, privateStateId: 'vault', zkConfigPath: pkg.zkConfigPath };
 }
+
+describe('package-form config entries', () => {
+    afterEach(() => { for (const n of ['pkg-counter', 'pkg-vault-32', 'pkg-missing']) unregisterContract(n); });
+
+    test('registers an installed lineage package with its contract.json values and package meta', () => {
+        loadRegistryFromConfig({ contracts: {
+            'pkg-counter': { package: '@odatano/contract-counter' },
+            'pkg-vault-32': { package: '@odatano/contract-attestation-vault-32' }
+        } });
+        const counter = getContractRegistration('pkg-counter')!;
+        expect(counter.privateStateId).toBe('counterPrivateState');
+        expect(counter.package).toMatchObject({ name: '@odatano/contract-counter', zkAssetLayout: 'flat' });
+        expect(counter.package!.zkAssetUrl).toMatch(/releases\/download\/counter-v/);
+        expect(getContractRegistration('pkg-vault-32')!.slotWidth).toBe(32);
+        expect(getArtifactGenerationDigest('pkg-counter')).toMatch(/^[0-9a-f]{64}$/);
+    });
+
+    test('a package that is not installed leaves that alias unregistered and the others registered', () => {
+        loadRegistryFromConfig({ contracts: {
+            'pkg-missing': { package: '@odatano/contract-does-not-exist' },
+            'pkg-counter': { package: '@odatano/contract-counter' }
+        } });
+        expect(getContractRegistration('pkg-missing')).toBeUndefined();
+        expect(getContractRegistration('pkg-counter')).toBeDefined();
+    });
+});

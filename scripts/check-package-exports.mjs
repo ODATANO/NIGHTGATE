@@ -13,7 +13,6 @@
 // Run: npm run check:exports
 import { readFileSync, existsSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
-import { checkManifests, SHIPPED_CONTRACTS } from './write-key-manifest.mjs';
 
 const pkg = JSON.parse(readFileSync('package.json', 'utf8'));
 let failed = false;
@@ -95,9 +94,7 @@ if (tracked) {
         // tsc output: the .ts source sits next to it, and it must be TRACKED.
         // A source that only exists in this working tree is not in a fresh
         // checkout, so the build output it explains would not exist there.
-        // cds-typer output is generated at build time and not committed. The
-        // compactc output under contracts/**/managed IS tracked: it is the
-        // shipped artifact, so an untracked key or module fails here.
+        // cds-typer output is generated at build time and not committed.
         if (rel.startsWith('@cds-models/')) continue;
         const fromTs = rel.replace(/\.(js|d\.ts|js\.map|d\.ts\.map)$/, '.ts');
         if (fromTs !== rel && existsSync(fromTs)) {
@@ -126,22 +123,13 @@ if (tracked) {
 }
 
 // Non-export tarball invariants: files the runtime or the docs point users at.
-//   - the migration CLI the SchemaNotDeployedError message recommends,
-//   - the Compact source of the shipped managed artifacts (auditability: a
-//     consumer must be able to diff source against the compiled circuits).
 for (const required of [
+    // the migration CLI the SchemaNotDeployedError message recommends
     'scripts/apply-schema-delta.mjs',
     // the key-rotation CLI the UnknownEncryptionKeyError message recommends
     'scripts/rewrap-encryption-keys.mjs',
-    // the CLI that fetches the prover keys this tarball deliberately omits
-    'scripts/fetch-contract-keys.mjs',
-    'contracts/attestation-vault/src/attestation-vault.compact',
-    'contracts/attestation-vault-32/src/attestation-vault-32.compact',
-    // PROVER keys are fetched, not packed (see below); verifier keys and the
-    // manifest that pins the prover bytes must ship for every contract
-    'contracts/attestation-vault-32/src/managed/attestation-vault-32/keys/proveDocumentComparison.verifier',
-    'contracts/attestation-vault/src/managed/attestation-vault/keys/proveDocumentComparison.verifier',
-    ...SHIPPED_CONTRACTS.map((c) => `contracts/${c}/src/managed/${c}/keys/manifest.json`)
+    // the CLI that fetches a lineage package's prover keys ahead of time
+    'scripts/fetch-contract-keys.mjs'
 ]) {
     if (!packed.has(required)) {
         console.error(`check-package-exports: '${required}' is NOT in the tarball (files allowlist).`);
@@ -149,34 +137,25 @@ for (const required of [
     }
 }
 
-// Only the four shipped contracts may pack. Anything else under a
-// contracts/<dir>/ (a local experiment, a stray artifact) would silently
-// ship with every install. Files directly under contracts/ (README.md) are
-// npm's own business, not a contract tree.
+// The contract lineages are dependencies (@odatano/contract-*), never packed here.
 for (const packedFile of packed) {
-    const segments = packedFile.split('/');
-    if (segments[0] !== 'contracts' || segments.length < 3) continue;
-    if (!SHIPPED_CONTRACTS.includes(segments[1])) {
-        console.error(`check-package-exports: unexpected contract file '${packedFile}' in the tarball.`);
+    if (packedFile.startsWith('contracts/')) {
+        console.error(`check-package-exports: unexpected contract file '${packedFile}' in the tarball; lineages ship as @odatano/contract-* packages.`);
         failed = true;
         break;
     }
 }
 
-// No prover key ships: the two vault lineages alone are 200 MB and the
-// registry rejects such a package (E413). Every contract's prover keys are
-// fetched on first need and verified against keys/manifest.json. Keep the
-// deny deliberate.
+// No prover key ships; the lineage packages fetch theirs on first need.
 const packedProvers = [...packed].filter((f) => /\.prover$/.test(f));
 if (packedProvers.length > 0) {
     console.error(
         `check-package-exports: ${packedProvers.length} prover key(s) are in the tarball (${packedProvers[0]}, …); ` +
-            'keep the "!contracts/**/*.prover" deny in package.json#files, the server fetches them on first need.',
+            'no prover key belongs in this package.',
     );
     failed = true;
 }
-// Verifier keys, zkir and modules of the four contracts stay well under this;
-// a budget this tight catches any heavy asset that slips in.
+// A budget this tight catches any heavy asset that slips in.
 const MAX_TARBALL_MB = 20;
 if (packedBytes / (1024 * 1024) > MAX_TARBALL_MB) {
     console.error(
@@ -185,28 +164,5 @@ if (packedBytes / (1024 * 1024) > MAX_TARBALL_MB) {
     );
     failed = true;
 }
-// The manifests must match the prover keys on disk: a stale manifest makes
-// every fetched key fail verification on the consumer's side.
-// The manifests are checked against the working tree; the TARBALL must carry
-// every circuit's verifier key and zkir/bzkir as well, or a consumer verifies
-// nothing and proves nothing for that circuit.
-for (const contract of SHIPPED_CONTRACTS) {
-    const base = `contracts/${contract}/src/managed/${contract}`;
-    let manifest;
-    try { manifest = JSON.parse(readFileSync(`${base}/keys/manifest.json`, 'utf8')); } catch { continue; } // reported by checkManifests below
-    for (const circuit of Object.keys(manifest?.prover ?? {})) {
-        for (const rel of [`${base}/keys/${circuit}.verifier`, `${base}/zkir/${circuit}.zkir`, `${base}/zkir/${circuit}.bzkir`]) {
-            if (!packed.has(rel)) {
-                console.error(`check-package-exports: ${contract}: '${circuit}' is in the manifest but ${rel} is NOT in the tarball`);
-                failed = true;
-            }
-        }
-    }
-}
-for (const problem of checkManifests()) {
-    console.error(`check-package-exports: ${problem}`);
-    failed = true;
-}
-
 if (failed) process.exit(1);
 console.log(`check-package-exports: ok (${targets.length} export targets, all present and published)`);

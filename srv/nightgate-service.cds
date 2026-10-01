@@ -674,13 +674,110 @@ service NightgateService {
      * each other. Needs `NIGHTGATE_SPONSOR_ALLOW_SWAPS`.
      * Job result `{ txHash, swap: { gives, wants } }`. Poll with `sessionId`.
      */
-    action   sponsorSwap(makerHalfB64: LargeString,
+    action   sponsorSwap(makerHalfB64: LargeString, // or `offerId`
                          takerHalfB64: LargeString,
                          sponsorSessionId: UUID,
-                         idempotencyKey: String)                      returns {
+                         idempotencyKey: String,
+                         offerId: UUID)                               returns { // optional; the posted maker half to fill
         jobId     : UUID;
         status    : String;
         sessionId : UUID;
+    };
+
+    /**
+     * Post a maker half (offer file or base64) for takers to find. The half is
+     * checked like a sponsored half except for the token allow-list; its terms
+     * are read from it, never from the caller. The offer closes when one of its
+     * input nullifiers lands in a sponsored swap, when `expiresAt` passes, or
+     * when the poster retires it. Intent only: nothing is held or moved.
+     */
+    action   postSwapOffer(offer: LargeString,
+                           expiresAt: Timestamp, // optional
+                           tags: LargeString)                         returns { // optional JSON array of strings, at most 8
+        offerId     : UUID;
+        status      : String;
+        bound       : Boolean;
+        givesType   : String;
+        givesAmount : String;
+        wantsType   : String;
+        wantsAmount : String;
+        expiresAt   : Timestamp;
+    };
+
+    /** Open offers, newest first; filters are exact. Never the poster's identity. */
+    function listSwapOffers(givesType: String,  // optional, 64 hex
+                            wantsType: String,  // optional, 64 hex
+                            tag: String,        // optional
+                            limit: Integer)     returns array of { // optional, default 50, at most 200
+        offerId     : UUID;
+        offer       : LargeString;
+        bound       : Boolean;
+        givesType   : String;
+        givesAmount : String;
+        wantsType   : String;
+        wantsAmount : String;
+        tags        : LargeString;
+        expiresAt   : Timestamp;
+        postedAt    : Timestamp;
+    };
+
+    /** Retire an open offer; only its poster (same user, or the same grant for a token). */
+    action   retireSwapOffer(offerId: UUID)                           returns {
+        offerId : UUID;
+        status  : String;
+    };
+
+    /**
+     * Let holders of `tokenType` read a document: a holder registered on the
+     * `holder-registry` deployment at `registryAddress` claims it with the
+     * secret behind its claim key. `content` (optional) is stored encrypted and
+     * must hash to `payloadHash` (blake2b-256 or sha256 of the UTF-8 text).
+     * A second call by the same grantor for the same payload, type and registry
+     * updates the grant.
+     */
+    action   grantDisclosureToHolders(payloadHash: String,
+                                      tokenType: String,
+                                      registryAddress: String,
+                                      content: LargeString, // optional
+                                      contentType: String, // optional, default text/plain
+                                      expiresAt: Timestamp)           returns { // optional
+        holderGrantId   : UUID;
+        payloadHash     : String;
+        tokenType       : String;
+        registryAddress : String;
+        hasContent      : Boolean;
+        expiresAt       : Timestamp;
+        status          : String;
+    };
+
+    /** Revoke a holder disclosure; only its grantor. */
+    action   revokeHolderDisclosure(holderGrantId: UUID)               returns {
+        holderGrantId : UUID;
+        status        : String;
+    };
+
+    /**
+     * Prove a registered holding and read what its issuer disclosed to holders.
+     * `claimSecret` is the 32-byte secret (64 hex) whose claim key the holder
+     * registered (`registerHolder` on the holder-registry contract). Reads the
+     * registry live from the indexer. Never an error for a missing entitlement:
+     * `entitled: false` with `reason`.
+     */
+    action   claimDisclosure(payloadHash: String,
+                             tokenType: String,
+                             claimSecret: String)                     returns {
+        entitled        : Boolean;
+        reason          : String;
+        payloadHash     : String;
+        tokenType       : String;
+        registryAddress : String;
+        holderGrantId   : UUID;
+        contentType     : String;
+        contentHashKind : String;
+        content         : LargeString;
+        expiresAt       : Timestamp;
+        /** Registry deployments consulted for a negative answer. */
+        registries      : array of String;
     };
 
     /**

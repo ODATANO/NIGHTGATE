@@ -51,6 +51,9 @@ export const registrarRateLimiter = new RateLimiter({ windowMs: 60 * 60 * 1000, 
 export const reindexRateLimiter = new RateLimiter({ windowMs: 60 * 60 * 1000, maxRequests: 60 });
 // Per caller, not per session: the sponsor pool pays the dust of every job.
 export const sponsorRateLimiter = new RateLimiter({ windowMs: 60 * 60 * 1000, maxRequests: 120 });
+export const swapOfferRateLimiter = new RateLimiter({ windowMs: 60 * 60 * 1000, maxRequests: 60 });
+export const swapListRateLimiter = new RateLimiter({ windowMs: 60 * 60 * 1000, maxRequests: 600 });
+export const holderClaimRateLimiter = new RateLimiter({ windowMs: 60 * 60 * 1000, maxRequests: 60 });
 export const buildRateLimiter = new RateLimiter({ windowMs: 60 * 60 * 1000, maxRequests: 30 });
 
 /** The vault asserts `valid_until` lies in (block time, block time + 5 years]. */

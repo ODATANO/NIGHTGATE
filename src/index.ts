@@ -16,6 +16,7 @@ import {
 } from '../srv/utils/nightgate-config';
 import { loadRegistryFromConfig, listRegisteredContracts } from '../srv/submission/contract-registry';
 import { loadPersistedRegistrations } from '../srv/submission/contract-registrations';
+import { refreshLearnedTokenTypes } from '../srv/submission/learned-token-types';
 import { redactUrlCredentials } from '../srv/utils/redact-url';
 import { publishRuntimeState } from '../srv/utils/runtime-state';
 import { ensureSyncStateSingleton } from '../srv/utils/sync-state';
@@ -346,6 +347,8 @@ export async function initialize(): Promise<NightgateIndexerStatus> {
         }
         // Runtime registrations go on top of the config floor.
         await loadPersistedRegistrations(cds.db || await cds.connect.to('db'));
+        const learned = await refreshLearnedTokenTypes(cds.db || await cds.connect.to('db'));
+        if (learned.length) log.info(`Learned token types: ${learned.length}`);
     } catch (regErr) {
         const msg = regErr instanceof Error ? regErr.message : String(regErr);
         log.warn(`Contract registry load warning: ${msg}`);

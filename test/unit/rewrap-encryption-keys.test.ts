@@ -27,7 +27,7 @@ import {
     resolveAccountDek, privateStatePasswordFromDek, syncStatePassphraseFromDek, sealDekByStoragePassword,
     openDekByStoragePassword, openDekByViewingKey, clearAllAccountDeks, evictAccountDek, residentAccountDekCount, inflightAccountDekCount, DEK_SCHEME
 } from '../../srv/submission/account-keys';
-import { walletSessionViewingKeyBinding, walletSessionSeedBinding, accountDekBinding, jobCommandBinding } from '../../srv/utils/envelope-bindings';
+import { walletSessionViewingKeyBinding, walletSessionSeedBinding, accountDekBinding, jobCommandBinding, holderDisclosureContentBinding } from '../../srv/utils/envelope-bindings';
 
 cds.test(__dirname + '/../..');
 
@@ -53,6 +53,8 @@ function legacyEncrypt(plaintext: string, secret: string): string {
 }
 
 const saltOf = (blobB64: string) => extractEncryptedComponents(Buffer.from(blobB64, 'base64')).salt;
+
+let hdgId = '';
 
 describe('encryption key rewrap', () => {
     let db: any;
@@ -124,6 +126,7 @@ describe('encryption key rewrap', () => {
         await db.run(DELETE.from('midnight.PrivateStates'));
         await db.run(DELETE.from('midnight.ContractSigningKeys'));
         await db.run(DELETE.from('midnight.AccountKeys'));
+        await db.run(DELETE.from('midnight.HolderDisclosureGrants'));
         const now = new Date().toISOString();
         // Session A: legacy v1 ciphertexts, sync-state blobs under the pre-ring derivation.
         await db.run(INSERT.into('midnight.WalletSessions').entries({
@@ -159,6 +162,12 @@ describe('encryption key rewrap', () => {
             { ID: 'job-enc', kind: 'contractCall', status: 'succeeded', commandVersion: 1, commandEncoding: 'aes-gcm-v1', command: legacyEncrypt('{"secret":true}', OLD_SECRET), createdAt: now },
             { ID: 'job-plain', kind: 'sendNight', status: 'succeeded', commandVersion: 1, commandEncoding: 'json-v1', command: '{"plain":true}', createdAt: now }
         ]));
+        // A holder disclosure with encrypted content under the old key.
+        hdgId = cds.utils.uuid();
+        await db.run(INSERT.into('midnight.HolderDisclosureGrants').entries({
+            ID: hdgId, payloadHash: 'aa'.repeat(32), tokenType: 'bb'.repeat(32), registryAddress: 'cc'.repeat(32), grantorUserId: 'issuer',
+            contentHashKind: 'sha256', content: encrypt('{"certificate":"copper-A"}', OLD_ONLY, holderDisclosureContentBinding(hdgId)), active: true, createdAt: now, modifiedAt: now
+        }));
     });
 
     it('keyIdFromPrefix reads v2 ids and treats everything else as key 1', () => {
@@ -250,7 +259,7 @@ describe('encryption key rewrap', () => {
         const before = await db.run(SELECT.from('midnight.WalletSessions').columns('ID', 'encryptedViewingKey', 'encryptedSeedKey').orderBy('ID'));
         const report = await rewrapStoredCiphertexts(db, { ring: BOTH, dryRun: true });
         expect(report.dryRun).toBe(true);
-        expect(report.envelope.map(e => e.rewrapped)).toEqual([2, 1, 1, 0, 0]);
+        expect(report.envelope.map(e => e.rewrapped)).toEqual([2, 1, 1, 0, 0, 1]);
         expect(report.syncState).toEqual({ accounts: 2, blobsRewrapped: 3, blobsDropped: 0, sessionsUnreadable: 0 });
         expect(report.privateState).toEqual({ accounts: 2, rowsRewrapped: 3, rowsUnreadable: 0 });
         expect(report.legacy.total).toBe(5);
@@ -270,7 +279,8 @@ describe('encryption key rewrap', () => {
             ['midnight.WalletSessions.encryptedSeedKey', 1, 1, { '1': 1 }],
             ['midnight.BackgroundJobs.command', 1, 1, { '1': 1 }],
             ['midnight.AccountKeys.wrappedDek', 0, 0, {}],
-            ['midnight.AccountKeys.wrappedDekByViewingKey', 0, 0, {}]
+            ['midnight.AccountKeys.wrappedDekByViewingKey', 0, 0, {}],
+            ['midnight.HolderDisclosureGrants.content', 1, 1, { '1': 1 }]
         ]);
         expect(report.syncState).toEqual({ accounts: 2, blobsRewrapped: 3, blobsDropped: 0, sessionsUnreadable: 0 });
         expect(report.privateState).toEqual({ accounts: 2, rowsRewrapped: 3, rowsUnreadable: 0 });
@@ -326,9 +336,12 @@ describe('encryption key rewrap', () => {
         expect(sk.keyScheme).toBe(DEK_SCHEME);
         expect(new StorageEncryption(passwordA, privateStateStableSalt(accountA, passwordA)).decrypt(sk.ciphertext)).toBe('sk-a');
 
+        const hdg = await db.run(SELECT.one.from('midnight.HolderDisclosureGrants').where({ ID: hdgId }));
+        expect(decrypt(hdg.content, NEW_ONLY, holderDisclosureContentBinding(hdgId))).toBe('{"certificate":"copper-A"}');
+
         // Idempotent: a second run has nothing left to do.
         const again = await rewrapStoredCiphertexts(db, { ring: NEW_ONLY });
-        expect(again.envelope.map(e => [e.scanned, e.rewrapped])).toEqual([[2, 0], [1, 0], [1, 0], [2, 0], [2, 0]]);
+        expect(again.envelope.map(e => [e.scanned, e.rewrapped])).toEqual([[2, 0], [1, 0], [1, 0], [2, 0], [2, 0], [1, 0]]);
         expect(again.syncState).toEqual({ accounts: 0, blobsRewrapped: 0, blobsDropped: 0, sessionsUnreadable: 0 });
         expect(again.privateState).toEqual({ accounts: 0, rowsRewrapped: 0, rowsUnreadable: 0 });
         expect(again.legacy.total).toBe(0);

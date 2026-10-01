@@ -52,11 +52,11 @@ export function formatErrWithCauses(err: unknown): string {
         if (m && m !== head && !parts.includes(m) && parts.length < 6) parts.push(m);
     };
     const seen = new Set<unknown>([err]);
-    let cur: any = (err as any)?.cause;
+    let cur: unknown = (err as { cause?: unknown } | null | undefined)?.cause;
     for (let depth = 0; cur != null && depth < 6 && !seen.has(cur); depth++) {
         seen.add(cur);
         push(formatErr(cur));
-        cur = cur?.cause;
+        cur = (cur as { cause?: unknown })?.cause;
     }
     if (parts.length === 0) {
         const rendered = classificationHaystack(err);

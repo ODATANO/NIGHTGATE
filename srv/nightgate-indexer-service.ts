@@ -110,7 +110,7 @@ export default class NightgateIndexerService extends cds.ApplicationService {
             return buildRuntimeInfo();
         });
         this.on('getWorkerStatus', async (req: NightgateRequest) =>
-            buildWorkerStatus(Boolean((req.user as any)?.is?.('admin'))));
+            buildWorkerStatus(Boolean(req.user?.is?.('admin'))));
 
         this.on('getReadiness', async (req: NightgateRequest) => {
             const readiness = await buildReadiness(this.db);

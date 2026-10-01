@@ -12,6 +12,8 @@ export default [
             'packages/nightgate-tx/**',
             // Local-only measurement probes and one-off scripts (gitignored, never packed).
             'scratch/**',
+            // Private context and helpers (gitignored, never published).
+            'local_docs/**',
             '**/gen/**',
             '@cds-models/**',
             'src/**/*.js',
@@ -30,8 +32,7 @@ export default [
             'scripts/**/*.{js,mjs,cjs,ts}',
             '!scripts/apply-schema-delta.mjs',
             '!scripts/fetch-contract-keys.mjs',
-            '!scripts/migrate-sqlite-to-postgres.mjs',
-            'contracts/**/managed/**'
+            '!scripts/migrate-sqlite-to-postgres.mjs'
         ]
     },
     ...cds.recommended,

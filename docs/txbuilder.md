@@ -318,6 +318,25 @@ fallible offer, a transient or contract-owned coin, not exactly one token type
 given and one other wanted): the rules the sponsor applies.
 `sameSwapTerms(terms, expect)` compares two sets of terms.
 
+## Holder registry
+
+`holderClaimKey(claimSecretHex)` is the `claim_key` a holder registers on the
+`holder-registry` contract: blake2b-256 over `nightgate/holder-claim/v1` and a
+32-byte secret the holder keeps. `HOLDER_REGISTRY_CIRCUITS` lists the two
+circuits for `ensureZkAssets({ circuits })`. A registration is an ordinary
+sponsorable call with a coin argument: the wallet (`walletSync: 'shielded'`)
+balances the coin out of the holder's own coins of the type.
+
+```js
+const claimSecret = randomBytes(32).toString('hex');            // keep it
+const { unboundTxB64 } = await builder.buildSponsorable({
+    contractAddress: registryAddress,
+    calls: [{ circuit: 'registerHolder', args: [{ nonce: randomBytes(32).toString('hex'), color: tokenType, value: 1n }, holderClaimKey(claimSecret)] }]
+});
+// sponsorUnboundTransaction(unboundTxB64, ...), then:
+await ng.claimDisclosure({ payloadHash, tokenType, claimSecret });
+```
+
 ## Running the sponsor half
 
 A NIGHTGATE server with a funded, dust-registered wallet session:

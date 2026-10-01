@@ -227,7 +227,7 @@ export default class NightgateService extends cds.ApplicationService {
 
         this.before('READ', 'WalletSessions', async (req: NightgateRequest) => {
             await awaitAgentPrincipal(req);
-            const user: any = req.user;
+            const user = req.user;
             if (user?.is?.('admin')) return;
             const userId = user?.id;
             if (!userId) return req.reject(401, 'authentication required');
@@ -239,7 +239,7 @@ export default class NightgateService extends cds.ApplicationService {
 
         this.before('READ', 'AgentGrants', async (req: NightgateRequest) => {
             await awaitAgentPrincipal(req);
-            const user: any = req.user;
+            const user = req.user;
             if (user?.is?.('admin')) return;
             const userId = user?.id;
             if (!userId) return req.reject(401, 'authentication required');
@@ -250,7 +250,7 @@ export default class NightgateService extends cds.ApplicationService {
         for (const entity of ['Documents', 'GranteeIdentities'] as const) {
             this.before('READ', entity, async (req: NightgateRequest) => {
                 await awaitAgentPrincipal(req);
-                const user: any = req.user;
+                const user = req.user;
                 if (user?.is?.('admin')) return;
                 const userId = user?.id;
                 if (!userId) return req.reject(401, 'authentication required');
@@ -262,7 +262,7 @@ export default class NightgateService extends cds.ApplicationService {
 
         // Owner-scoped like WalletSessions
         this.on('READ', 'PendingSubmissions', async (req: NightgateRequest) => {
-            const user: any = req.user;
+            const user = req.user;
             if (!user?.is?.('admin')) {
                 const userId = user?.id;
                 if (!userId) return req.reject(401, 'authentication required');
@@ -291,7 +291,7 @@ export default class NightgateService extends cds.ApplicationService {
             }
 
             // FAIL-CLOSED ownership 
-            const user: any = req.user;
+            const user = req.user;
             if (!user?.is?.('admin')) {
                 const requesterId = user?.id;
                 if (job.requestedBy) {

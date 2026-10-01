@@ -128,7 +128,6 @@ describe('parseExtrinsicCallIndices', () => {
     function buildSignedExtrinsic(palletIndex: number, callIndex: number): string {
         // Payload = 1 (version) + 33 (addr) + 65 (sig) + 1 (era) + 1 (nonce) + 1 (tip) + 2 (call) = 104 bytes
         const payloadLen = 104;
-        const buf = Buffer.alloc(1 + payloadLen); // compact_length (single-byte) + payload
 
         let offset = 0;
         // Compact length: 104 << 2 = 416 → needs 2-byte mode

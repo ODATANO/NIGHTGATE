@@ -11,7 +11,8 @@ import {
     BOUND_ENVELOPE_VERSION, ENVELOPE_VERSION, EnvelopeBinding
 } from './crypto';
 import {
-    walletSessionViewingKeyBinding, walletSessionSeedBinding, jobCommandBinding, accountDekBinding, accountDekViewingKeySealBinding
+    walletSessionViewingKeyBinding, walletSessionSeedBinding, jobCommandBinding, accountDekBinding, accountDekViewingKeySealBinding,
+    holderDisclosureContentBinding
 } from './envelope-bindings';
 import { StorageEncryption, decryptWithPassword, extractEncryptedComponents } from './storage-encryption';
 // Static import: shares the DEK cache with sessions reading the same rows.
@@ -44,7 +45,8 @@ export const ENVELOPE_COLUMNS: readonly CiphertextColumn[] = [
     { entity: 'midnight.WalletSessions', table: 'midnight_WalletSessions', key: 'ID', column: 'encryptedSeedKey', select: ['sessionId'], binding: r => walletSessionSeedBinding(r.sessionId) },
     { entity: 'midnight.BackgroundJobs', table: 'midnight_BackgroundJobs', key: 'ID', column: 'command', where: { commandEncoding: 'aes-gcm-v1' }, whereSql: "commandEncoding = 'aes-gcm-v1'", binding: r => jobCommandBinding(r.ID) },
     { entity: 'midnight.AccountKeys', table: 'midnight_AccountKeys', key: 'accountId', column: 'wrappedDek', binding: r => accountDekBinding(r.accountId) },
-    { entity: 'midnight.AccountKeys', table: 'midnight_AccountKeys', key: 'accountId', column: 'wrappedDekByViewingKey', binding: r => accountDekViewingKeySealBinding(r.accountId), plainPrefix: BARE_VIEWING_KEY_SEAL_PREFIX }
+    { entity: 'midnight.AccountKeys', table: 'midnight_AccountKeys', key: 'accountId', column: 'wrappedDekByViewingKey', binding: r => accountDekViewingKeySealBinding(r.accountId), plainPrefix: BARE_VIEWING_KEY_SEAL_PREFIX },
+    { entity: 'midnight.HolderDisclosureGrants', table: 'midnight_HolderDisclosureGrants', key: 'ID', column: 'content', binding: r => holderDisclosureContentBinding(r.ID) }
 ];
 
 /** Tables whose rows are under the account DEK once `keyScheme` = 'dek1'; null = legacy derivation. */

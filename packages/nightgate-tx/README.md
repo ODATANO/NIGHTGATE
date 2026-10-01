@@ -167,7 +167,7 @@ Full flow: [`example/self-funded.mjs`](./example/self-funded.mjs).
 | --- | --- |
 | `@odatano/nightgate-tx` | `connect` + `createTxBuilder` (the whole SDK) |
 | `@odatano/nightgate-tx/client` | the hosted-endpoint client alone |
-| `@odatano/nightgate-tx/txbuilder` | the local builder, the swap wallet and offer files, the self-funded submission helpers |
+| `@odatano/nightgate-tx/txbuilder` | the local builder, the swap wallet and offer files, the holder-registry claim key (`holderClaimKey`, `HOLDER_REGISTRY_CIRCUITS`), the self-funded submission helpers |
 | `@odatano/nightgate-tx/calls` | the `prepare*` call builders, witnesses, attestation-secret helpers |
 | `@odatano/nightgate-tx/attestation-vault` | the compiled contract class and its pure circuits |
 | `@odatano/nightgate-tx/attestation-vault-32` | the 32-slot vault's contract class (pass `slotWidth: 32` to the `prepare*` helpers, `zkConfigBaseUrl` = `/zk-config/attestation-vault-32`) |

@@ -28,6 +28,10 @@ service NightgateAdminService {
             result
         };
 
+    /** Token types learned from landed sponsored mints (see `shareMintedTokenTypes`). */
+    @readonly
+    entity LearnedTokenTypes as projection on midnight.LearnedTokenTypes;
+
     action invalidateSession(sessionId: UUID);
     action invalidateAllSessions();
 

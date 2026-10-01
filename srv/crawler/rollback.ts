@@ -52,7 +52,7 @@ export async function rollbackIndexedDataFromHeight(
         SELECT.from(Blocks).columns('ID', 'height')
             .where({ height: { '>=': fromHeight } })
     ) || [];
-    const blockIds = blocksToRollback.map((b: any) => b.ID).filter(Boolean);
+    const blockIds = blocksToRollback.map((b: { ID?: string }) => b.ID).filter(Boolean);
 
     if (blockIds.length === 0) {
         // Indexer evidence at/above the height is void even without local blocks.
@@ -71,7 +71,7 @@ export async function rollbackIndexedDataFromHeight(
         SELECT.from(Transactions).columns('ID', 'hash', 'senderAddress', 'receiverAddress')
             .where({ block_ID: { in: ids } })
     ));
-    const txIds = txsToDelete.map((t: any) => t.ID).filter(Boolean);
+    const txIds = txsToDelete.map((t: { ID?: string }) => t.ID).filter(Boolean);
 
     // Collect affected addresses BEFORE deleting anything.
     const affected = new Set<string>();
@@ -92,12 +92,12 @@ export async function rollbackIndexedDataFromHeight(
 
         const actionIds = (await chunked(txIds, ids => tx.run(
             SELECT.from(ContractActions).columns('ID').where({ transaction_ID: { in: ids } })
-        ))).map((a: any) => a.ID);
+        ))).map((a: { ID: string }) => a.ID);
         await chunked(actionIds, ids => tx.run(DELETE.from(ContractBalances).where({ contractAction_ID: { in: ids } })));
 
         const resultIds = (await chunked(txIds, ids => tx.run(
             SELECT.from(TransactionResults).columns('ID').where({ transaction_ID: { in: ids } })
-        ))).map((r: any) => r.ID);
+        ))).map((r: { ID: string }) => r.ID);
         await chunked(resultIds, ids => tx.run(DELETE.from(TransactionSegments).where({ transactionResult_ID: { in: ids } })));
 
         await chunked(txIds, async ids => {

@@ -9,10 +9,13 @@
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
+import { resolveContractPackage } from '@odatano/contract-kit/node';
+
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(__dirname, '..');
-const artifactAbsPath = path.join(repoRoot, 'contracts/counter/src/managed/counter/contract/index.js');
-const zkConfigPath    = path.join(repoRoot, 'contracts/counter/src/managed/counter');
+const counterPkg = resolveContractPackage('@odatano/contract-counter', repoRoot);
+const artifactAbsPath = counterPkg.artifactPath;
+const zkConfigPath    = counterPkg.zkConfigPath;
 
 let failures = 0;
 function ok(name, value) {

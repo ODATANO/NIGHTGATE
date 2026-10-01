@@ -74,7 +74,7 @@ import {
     SessionNotFoundError,
     WalletSigningNotAvailable
 } from '../../srv/submission/wallet-material-factory';
-import { encrypt, getEncryptionKey, KeyRing, decrypt } from '../../srv/utils/crypto';
+import { encrypt, KeyRing, decrypt } from '../../srv/utils/crypto';
 
 // ---- Fake DB --------------------------------------------------------------
 

@@ -42,10 +42,16 @@ Configure the plugin under `cds.requires.nightgate`. Environment variables overr
         "allowProductionSqlite": false,
 
         "contracts": {
-          "counter": {
-            "artifactPath":   "contracts/counter/src/managed/counter/contract/index.js",
-            "privateStateId": "counterPrivateState",
-            "zkConfigPath":   "contracts/counter/src/managed/counter"
+          "counter":              { "package": "@odatano/contract-counter" },
+          "attestation-vault":    { "package": "@odatano/contract-attestation-vault" },
+          "attestation-vault-32": { "package": "@odatano/contract-attestation-vault-32" },
+          "shielded-token":       { "package": "@odatano/contract-shielded-token" },
+          "token-factory":        { "package": "@odatano/contract-token-factory" },
+          "holder-registry":      { "package": "@odatano/contract-holder-registry" },
+          "my-contract": {
+            "artifactPath":   "contracts/my-contract/managed/my-contract/contract/index.js",
+            "privateStateId": "myContractPrivateState",
+            "zkConfigPath":   "contracts/my-contract/managed/my-contract"
           }
         },
 
@@ -119,8 +125,8 @@ are clamped with a warning; booleans: `true`/`false`, `1`/`0`, `yes`/`no`,
 | `NIGHTGATE_PROOF_TIMEOUT_MS` | ms (min 1) | `300000` | Override `proofTimeoutMs`; pinned into the env at plugin init for the wallet worker. The proof-server container has its own job TTL (`MIDNIGHT_PROOF_SERVER_JOB_TIMEOUT`, default 600 s): raise both, or a finished-but-expired job answers 5xx and midnight-js re-proves. Read in the wallet worker. |
 | `NIGHTGATE_ZK_CONFIG_BASE` | path | `./contracts` | Override `zkConfigBasePath` |
 | `NIGHTGATE_ZK_CONFIG_PUBLIC_URL` | url |  | Public base URL advertised by `/contract-manifest` for the `/zk-config/...` routes (behind a reverse proxy); unset = relative URLs, resolved by the client against the origin it fetched the manifest from |
-| `NIGHTGATE_ZK_ASSET_URL` | string |  | A `/zk-config` base the server fetches missing prover keys from (`<url>/<contract>/keys/<circuit>.prover`, verified against `keys/manifest.json`); `none`/`off` disables the fetch. Unset: the release tag on raw.githubusercontent.com for the shipped contracts, no source for others. Offline installs run `nightgate-fetch-keys` once. |
-| `NIGHTGATE_CONTRACTS_DIR` | string |  | Root directories (path-delimiter separated) a runtime `registerContract` (admin) may point into; default: the package's and the working directory's `contracts/`. Importing an artifact executes its module, so paths outside are refused. The supported way to keep a consumer's artifacts outside the package: point it at that directory. The artifact's `@midnight-ntwrk/compact-runtime` import resolves from NIGHTGATE's own node_modules (worker snapshots and the registration probe), so the directory needs no node_modules of its own. |
+| `NIGHTGATE_ZK_ASSET_URL` | string |  | A `/zk-config` base the server fetches missing prover keys from (`<url>/<contract>/keys/<circuit>.prover`, verified against `keys/manifest.json`); `none`/`off` disables the fetch. Unset: the release assets named by the installed lineage package (`contract.json#zkAssetUrl`), no source for a foreign artifact. Offline installs run `nightgate-fetch-keys` once. |
+| `NIGHTGATE_CONTRACTS_DIR` | string |  | Root directories (path-delimiter separated) a runtime `registerContract` (admin) may point into; default: the working directory's `contracts/`. Importing an artifact executes its module, so paths outside are refused. The supported way to keep a consumer's artifacts outside the package: point it at that directory. The artifact's `@midnight-ntwrk/compact-runtime` import resolves from NIGHTGATE's own node_modules (worker snapshots and the registration probe), so the directory needs no node_modules of its own. |
 | `NIGHTGATE_PRIVATE_STATE_BACKEND` | `cap-db` / `level` |  | Override `privateStateBackend` |
 | `NIGHTGATE_GRANTEE_BINDING` | `wallet` / `did` / `custom` |  | Override `granteeBinding` (`wallet` / `did` / `custom`) |
 | `NIGHTGATE_ALLOW_SELF_SERVICE_GRANTEE_REGISTRATION` | bool |  | Override `allowSelfServiceGranteeRegistration` (`false` / `0` / `no` / `off` disables) |
@@ -193,11 +199,12 @@ are clamped with a warning; booleans: `true`/`false`, `1`/`0`, `yes`/`no`,
 | `NIGHTGATE_SUBMIT_WATCH_TIMEOUT_MS` | ms (min 1) | `75000` | Watch phase of a submit: from the node's first status until InBlock (or Finalized, `NIGHTGATE_SPONSOR_WAIT`); default `75000`. A timeout here is ambiguous: the node took the request and nothing was included in time; the indexer is asked for 90 s, then the job parks for the confirmer. On the facade (bound) path this is the whole wait after the send. Read in the wallet worker. |
 | `NIGHTGATE_BROADCAST_EXPIRY_MARGIN_MS` | ms (min 0) | `300000` | A job parked in `reconciliation_required` whose transaction the indexer does not know ends `failed / BROADCAST_NOT_INCLUDED` once the indexer tip is this far past the transaction's validity window (ttl); default `300000`. The ttl is recorded at the submit intent; rows without one use the submit time plus one hour. |
 | `NIGHTGATE_BATCH_SEGMENT_MODE` | `rewrite` / `observe` | `rewrite` | Batch segment ordering: `rewrite` (deterministic stage-grouped order) or `observe` (log only). Read in the wallet worker. |
-| `NIGHTGATE_SPONSOR_POLICY_FILE` | path |  | Path to a JSON file `{ "allowedContracts": [], "allowedCircuits": [], "allowDeploy": false, "allowedTokenTypes": [], "allowContractMints": false, "allowSwaps": false }` that replaces `NIGHTGATE_SPONSOR_ALLOWED_CONTRACTS`/`_CIRCUITS` while set. Calls on a grant's `deployedContracts` are exempt from `allowedCircuits`. Re-read per sponsored call behind an mtime cache, so the sponsor policy changes without a container recreate. Fail-closed: an unreadable or invalid file keeps the last good policy, and with none loaded yet sponsored calls answer `503 SPONSOR_POLICY_UNAVAILABLE`. |
+| `NIGHTGATE_SPONSOR_POLICY_FILE` | path |  | Path to a JSON file `{ "allowedContracts": [], "allowedCircuits": [], "allowDeploy": false, "allowedTokenTypes": [], "allowContractMints": false, "allowSwaps": false, "shareMintedTokenTypes": false }` that replaces `NIGHTGATE_SPONSOR_ALLOWED_CONTRACTS`/`_CIRCUITS` while set. Calls on a grant's `deployedContracts` are exempt from `allowedCircuits`. Re-read per sponsored call behind an mtime cache, so the sponsor policy changes without a container recreate. Fail-closed: an unreadable or invalid file keeps the last good policy, and with none loaded yet sponsored calls answer `503 SPONSOR_POLICY_UNAVAILABLE`. |
 | `NIGHTGATE_SPONSOR_ALLOWED_CONTRACTS` | list |  | Comma list of contract addresses a sponsor pays for (platform floor); empty = any. Replaced by `NIGHTGATE_SPONSOR_POLICY_FILE` while that is set. |
 | `NIGHTGATE_SPONSOR_ALLOWED_CIRCUITS` | list |  | Comma list of circuit names a sponsor pays for (platform floor); empty = any. Replaced by `NIGHTGATE_SPONSOR_POLICY_FILE` while that is set. |
 | `NIGHTGATE_SPONSOR_ALLOWED_TOKEN_TYPES` | list |  | Comma list of raw shielded token types (64 hex, what `deriveTokenType` returns) whose zswap offers the sponsor also pays for: a contract minting its own token to the caller, a caller spending that token into the contract. Unset = no offer at all (the default). Also `allowedTokenTypes` in the policy file and on a grant (effective = floor ∩ grant; the floor must open it, a grant only narrows). The shape check then requires every net change of the offer (`deltas`, public per type) to be on a listed type, never NIGHT, every contract-owned coin to belong to a sponsorable contract, and a net change to exist OR a coin in the offer to be owned by a sponsorable contract (a burn nets to zero by construction: user input, contract transient, burn-address output; a zero-net offer without a contract coin is refused). User outputs are commitments, so a transfer of a listed type between users riding along is accepted by design: the sponsor pays dust, no sponsor value moves. An invalid entry fails closed (`503 SPONSOR_POLICY_UNAVAILABLE`). |
 | `NIGHTGATE_SPONSOR_ALLOW_CONTRACT_MINTS` | bool | `false` | Also sponsors the zswap offer of a token that a contract call in the SAME transaction mints: `true`/`1`/`yes`. Off by default. The call declares its mints (`effects.shieldedMints`, domain separator and amount, bound by the proof); the type derived from domain separator and contract address has to be the offer's type, the contract sponsorable (allow-listed or deployed under the grant), the offer's net change negative and not larger than the declared amount. Such a type needs no entry in `allowedTokenTypes`, on the platform or on a grant. A transaction that moves the token without minting it (a payment into a contract, a swap) needs the entry, unless the token was minted under the caller's grant before: those types are recorded on the grant and count as listed while this switch is on. Also `allowContractMints` in the policy file. |
+| `NIGHTGATE_SPONSOR_SHARE_MINTED_TOKEN_TYPES` | bool | `false` | Token types that landed sponsored mints created (table `LearnedTokenTypes`) count as listed for every grant, not only the minting one: `true`/`1`/`yes`. Off by default; needs `NIGHTGATE_SPONSOR_ALLOW_CONTRACT_MINTS`. A grant may still narrow to a subset with `allowedTokenTypes`. Also `shareMintedTokenTypes` in the policy file. |
 | `NIGHTGATE_SPONSOR_ALLOW_SWAPS` | bool | `false` | Opens `sponsorSwap` on this deployment: `true`/`1`/`yes`. Off by default. The sponsor pays the dust of a shielded swap handed over as two proven, unbound halves; a token caller additionally needs `sponsorSwap` in its grant's `allowedActions`. Each half gives one token type and wants another, both in the effective `allowedTokenTypes`, never NIGHT; the halves mirror each other and the merged transaction balances. The terms are readable, the parties are not: a swap against a token amount of 1 is a transfer in effect, so this makes the sponsor a fee-free relay for the listed types, bounded by the rate limit and the grant's daily budget. Also `allowSwaps` in the policy file. |
 | `NIGHTGATE_SPONSOR_SWAP_MAX_INPUTS` | int (min 1) | `4` | Most zswap inputs one half of a sponsored swap may carry; default `4`. A half carries at most two outputs (the coin it wants, its change). Every coin adds about 5 kB to the transaction: two halves with 4 inputs and 2 outputs each merge to about 60 kB, with 5 inputs each to about 70 kB, so a higher value also needs a higher `NIGHTGATE_SPONSOR_MAX_TX_BYTES`. Read in the wallet worker. |
 | `NIGHTGATE_SPONSOR_ALLOW_DEPLOY` | bool | `false` | Opens sponsored contract DEPLOYS on this deployment: `true`/`1`/`yes`. Off by default. A token caller additionally needs `allowDeploy` on its grant with deploy budget left; a plain caller inherits the floor. Also settable as `allowDeploy` in `NIGHTGATE_SPONSOR_POLICY_FILE`. |
@@ -329,6 +336,8 @@ Every error response carries `error.code`: a specific code where a client can ac
 | `SPONSOR_POLICY_EMPTY` | 403 | no | The effective sponsor policy allows nothing for this caller. |
 | `SPONSOR_POLICY_UNAVAILABLE` | 503 | yes | The sponsor policy file cannot be read; fail-closed. |
 | `SPONSOR_REFUSED` | 403 | no | The sponsor refused the transaction under its policy. |
+| `SWAP_OFFER_INVALID` | 400 | no | The posted text is not a swap half the offer board can carry. |
+| `SWAP_OFFER_NOT_OPEN` | 409 | no | The swap offer is filled, retired or expired. |
 | `SPONSORED_CALL_NOT_APPLIED` | 409 | no | The sponsored call landed but did not apply (the caller's transcript is stale). |
 | `SUBMIT_INTENT_REJECTED` | 409 | no | The server refused to record the broadcast; nothing was sent. |
 | `SUBMIT_INTENT_TIMEOUT` | 503 | yes | The broadcast was not acknowledged in time; nothing was sent. |
@@ -676,8 +685,6 @@ srv/
     storage-encryption.ts           # SDK-wire-format PBKDF2 + AES-256-GCM
     format-error.ts                 # shared error → log-string helper
     ...
-contracts/
-  counter/                          # Compact source + compiled artifact
 docker/
   docker-compose.yml                # midnight-node, proof-server, indexer (standalone)
 scripts/

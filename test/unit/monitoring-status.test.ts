@@ -334,6 +334,8 @@ describe('buildRuntimeInfo', () => {
                 currentDigest: 'digest-attestation-vault',
                 digestStale: false,
                 digestError: null,
+                package: null,
+                version: null,
                 slotWidth: 16,
                 privateStateId: 'ps'
             },
@@ -343,6 +345,8 @@ describe('buildRuntimeInfo', () => {
                 currentDigest: 'digest-attestation-vault-32',
                 digestStale: false,
                 digestError: null,
+                package: null,
+                version: null,
                 slotWidth: 32,
                 privateStateId: 'ps'
             }

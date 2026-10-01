@@ -222,9 +222,7 @@ export function createDisclosureProjection(deps: Pick<SubmissionDeps, 'db' | 'co
             if (elapsed + backoff > windowMs) break;
             await new Promise(resolve => setTimeout(resolve, backoff));
         }
-        const err: any = new Error(`disclosure reindex of ${command.contractAddress.slice(0, 16)} still failing after ${Math.round((Date.now() - startedAt) / 1000)} s; run reindexDisclosures once the indexer answers: ${String((lastError as Error)?.message ?? lastError).slice(0, 200)}`);
-        err.code = 'DISCLOSURE_REINDEX_FAILED'; err.retryable = false;
-        throw err;
+        throw Object.assign(new Error(`disclosure reindex of ${command.contractAddress.slice(0, 16)} still failing after ${Math.round((Date.now() - startedAt) / 1000)} s; run reindexDisclosures once the indexer answers: ${String((lastError as Error)?.message ?? lastError).slice(0, 200)}`), { code: 'DISCLOSURE_REINDEX_FAILED', retryable: false });
     }
 
     return { confirmedDisclosureLevel, heightStamp, notNewerThan, clearPendingDisclosureLevel, runDisclosureReindex, reindexAfterSubmit, executeReindexDisclosures };

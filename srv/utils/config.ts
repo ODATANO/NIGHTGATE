@@ -11,6 +11,7 @@ import {
 
 type WarnSink = (message: string) => void;
 
+// eslint-disable-next-line no-console -- cds-free module: the console is the sink until the host installs one
 let warnSink: WarnSink = (message) => console.warn(`[nightgate:config] ${message}`);
 let overrideSource: (() => Record<string, unknown> | undefined | null) | undefined;
 let pinned: Record<string, ConfigValue> | undefined;

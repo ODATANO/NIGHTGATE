@@ -119,21 +119,25 @@ A cold sync from genesis takes hours; the worker heap stays near 4 GB after the 
 
 ## Prover keys
 
-The npm tarball ships no `*.prover` file. The first job that proves a circuit
-fetches the missing keys from `NIGHTGATE_ZK_ASSET_URL` (a `/zk-config` base;
-shipped contracts default to the release's git tag), verifies them against
-`keys/manifest.json` and stores them next to the verifier keys. Artifact
-digests and recorded evidence stay unchanged; no restart. Offline installs:
+Neither the npm tarballs nor git carry a `*.prover` file. Each contract lineage
+package (`@odatano/contract-*`) ships its verifier keys, zkir and a
+`keys/manifest.json` that pins the prover keys' bytes; `contract.json#zkAssetUrl`
+names the release assets they come from. The first job that proves a circuit
+fetches the missing keys from there (or from `NIGHTGATE_ZK_ASSET_URL`, a
+`/zk-config` base of any NIGHTGATE that has them) and verifies every key
+against the manifest before it lands. Prover keys are not part of the
+artifact generation digest, so fetching changes nothing a job or evidence row
+is pinned to.
+
+Offline or air-gapped installs prefetch them once (the image does this at
+build time):
 
 ```bash
 npx nightgate-fetch-keys attestation-vault
+npx nightgate-fetch-keys @odatano/contract-attestation-vault-32
 npx nightgate-fetch-keys attestation-vault-32 --from https://host/zk-config/attestation-vault-32
 NIGHTGATE_ZK_ASSET_URL=none   # refuse to fetch; a missing key fails the job with PROVER_KEYS_UNAVAILABLE
 ```
-
-After recompiling a shipped contract, run `npm run keys:manifest` and commit
-the manifest with the managed tree (`check:exports` fails on a stale one).
-The Docker image carries every key.
 
 ## Persistence + restart resilience
 

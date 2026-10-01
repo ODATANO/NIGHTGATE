@@ -1,13 +1,6 @@
 # Text files are LF in the repository, whatever a contributor's core.autocrlf.
 * text=auto eol=lf
 
-# Compiled Compact / ZK artifacts under contracts/**/managed are binary.
-# Git auto-detects them today; declaring it explicitly keeps them byte-intact
-# regardless of a contributor's core.autocrlf setting.
-contracts/**/managed/**/*.prover    binary
-contracts/**/managed/**/*.verifier  binary
-contracts/**/managed/**/*.bzkir     binary
-contracts/**/managed/**/*.zkir      binary
 
 # The container entrypoint runs inside a Linux image; a CRLF checkout on
 # Windows would break bash ("\r: command not found").

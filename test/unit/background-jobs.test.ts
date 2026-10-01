@@ -7,7 +7,6 @@
  * `setImmediate` dispatch by flushing the event loop.
  */
 
-import crypto from 'crypto';
 import { AsyncLocalStorage } from 'async_hooks';
 
 // ---- In-memory store -------------------------------------------------------
@@ -594,7 +593,7 @@ describe('startJob: insert row + return jobId', () => {
 
     test('a SECOND reportExternalExecution in one job hits the one-external-submission invariant, not "Lease lost"', async () => {
         let secondCallError: unknown;
-        const ret = await startJob({
+        await startJob({
             kind: 'deployContract', sessionId: 'sess-1', request: {},
             work: async () => {
                 await reportExternalExecution({ submissionId: 'sub-first' });

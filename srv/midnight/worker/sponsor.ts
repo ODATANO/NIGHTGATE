@@ -175,8 +175,8 @@ const sizeOf = (v: any): number | null =>
  * One half of a swap: an offer and nothing else, giving one token type and
  * wanting another. Its terms are the offer's two deltas; coins show no type.
  */
-function swapHalfTerms(half: any, label: string, tokenTypes: string[], nightType: string | undefined, maxInputs: number): { give: [string, bigint]; want: [string, bigint] } {
-    const refuse = (why: string): never => { throw new SponsorRefusalError(`refusing to sponsor: the ${label} ${why}`); };
+function swapHalfTerms(half: any, label: string, tokenTypes: string[] | null, nightType: string | undefined, maxInputs: number, prefix = 'refusing to sponsor'): { give: [string, bigint]; want: [string, bigint] } {
+    const refuse = (why: string): never => { throw new SponsorRefusalError(`${prefix}: the ${label} ${why}`); };
     const intents = half?.intents;
     if (intents !== undefined && intents !== null && sizeOf(intents) !== 0) refuse('carries an intent (a contract call, unshielded value or dust actions)');
     const fallible = half?.fallibleOffer;
@@ -202,9 +202,36 @@ function swapHalfTerms(half: any, label: string, tokenTypes: string[], nightType
     if (give[0] === want[0]) refuse('gives and wants the same token type');
     for (const [type] of [give, want]) {
         if (nightType && type === nightType) refuse('moves NIGHT');
-        if (!tokenTypes.includes(type)) refuse(`moves token type ${type.slice(0, 16)}…, not in allowedTokenTypes`);
+        if (tokenTypes && !tokenTypes.includes(type)) refuse(`moves token type ${type.slice(0, 16)}…, not in allowedTokenTypes`);
     }
     return { give, want };
+}
+
+/** Nullifiers of a half's inputs; the chain shows them spent once any transaction carrying them lands. */
+export function swapHalfNullifiers(half: any): string[] {
+    const inputs: any[] = Array.isArray(half?.guaranteedOffer?.inputs) ? half.guaranteedOffer.inputs : [];
+    return [...new Set(inputs.map((i: any) => normalizeTokenType(i?.nullifier)).filter((n: string) => /^[0-9a-f]{64}$/.test(n)))];
+}
+
+export interface SwapHalfDescription extends SwapTerms {
+    bound: boolean;
+    inputs: number;
+    nullifiers: string[];
+}
+
+/** Terms of one half as an offer board records them: the shape checks of a sponsored half, no token allow-list. */
+export async function describeSwapHalf(args: { halfB64: string }): Promise<SwapHalfDescription> {
+    const half = await deserializeSwapHalf(args.halfB64, 'half');
+    const ledger: any = await loadLedger();
+    const nightType = normalizeTokenType(ledger.nativeToken().raw);
+    const t = swapHalfTerms(half.tx, 'half', null, nightType, configNumber('NIGHTGATE_SPONSOR_SWAP_MAX_INPUTS'), 'not a swap half');
+    return {
+        gives: { tokenType: t.give[0], amount: t.give[1].toString() },
+        wants: { tokenType: t.want[0], amount: t.want[1].toString() },
+        bound: half.bound,
+        inputs: half.tx.guaranteedOffer.inputs.length,
+        nullifiers: swapHalfNullifiers(half.tx)
+    };
 }
 
 /** Throws unless the two halves are swap halves that mirror each other; returns the terms. */
@@ -673,6 +700,7 @@ export async function sponsorUnboundTx(args: {
     let callerBound = false;
     let calls: Array<{ address: string; entryPoint: string }>;
     let swap: SwapTerms | undefined;
+    let nullifiers: string[] = [];
     if (args.swap) {
         if (args.allowSwaps !== true) throw new SponsorRefusalError('refusing to sponsor: swaps are not sponsored for this caller');
         const maker = await deserializeSwapHalf(args.swap.makerHalfB64, 'maker half');
@@ -681,6 +709,7 @@ export async function sponsorUnboundTx(args: {
             allowedTokenTypes: args.allowedTokenTypes, nightTokenType: sdk.ledger.nativeToken().raw,
             maxInputs: configNumber('NIGHTGATE_SPONSOR_SWAP_MAX_INPUTS')
         });
+        nullifiers = [...new Set([...swapHalfNullifiers(maker.tx), ...swapHalfNullifiers(taker.tx)])];
         const merged = mergeSwapHalves(maker, taker);
         callerTx = merged.tx;
         callerBound = merged.bound;
@@ -765,7 +794,8 @@ export async function sponsorUnboundTx(args: {
             deployed: calls.filter(c => c.entryPoint === DEPLOY_ENTRY_POINT).map(c => c.address),
             ttl: ttl.toISOString(),
             segments: callSegments(bound),
-            ...(minted.length ? { minted } : {})
+            ...(minted.length ? { minted } : {}),
+            ...(nullifiers.length ? { nullifiers } : {})
         });
         const txId = await submitOnDedicatedClient(sponsor, bound, 'sponsor-unbound-submit');
         log('info', `sponsorUnboundTx: LANDED txHash=${String(txId).slice(0, 16)} on backing ${leased.backing}`);
@@ -773,7 +803,8 @@ export async function sponsorUnboundTx(args: {
             txHash: String(txId), circuits: calls.map(c => c.entryPoint), contractAddress: contractAddress ?? '', note: leased.backing,
             deployed: calls.filter(c => c.entryPoint === DEPLOY_ENTRY_POINT).map(c => c.address),
             ...(minted.length ? { minted } : {}),
-            ...(swap ? { swap } : {})
+            ...(swap ? { swap } : {}),
+            ...(nullifiers.length ? { nullifiers } : {})
         };
     } finally {
         stopRenewal();
@@ -781,4 +812,4 @@ export async function sponsorUnboundTx(args: {
     }
 }
 
-export const sponsorHandlers = { buildSponsorableTx, sponsorFinalizedTx, sponsorUnboundTx };
+export const sponsorHandlers = { buildSponsorableTx, sponsorFinalizedTx, sponsorUnboundTx, describeSwapHalf };

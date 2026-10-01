@@ -68,6 +68,19 @@ vi.mock('../../srv/submission/sponsor-policy', async (importOriginal) => ({
     ...(await importOriginal<any>()),
     getGlobalSponsorPolicy: () => platform.policy
 }));
+// The offer board as the sponsoring path sees it: one row to fill, what a landed swap closed.
+const board = vi.hoisted(() => ({ row: null as any, closed: [] as any[], byNullifier: [] as any[] }));
+vi.mock('../../srv/submission/swap-offers', async (importOriginal) => ({
+    ...(await importOriginal<Record<string, unknown>>()),
+    expireSwapOffers: vi.fn(async () => 0),
+    loadSwapOffer: vi.fn(async (_db: any, id: string) => (board.row && board.row.ID === id ? board.row : null)),
+    closeSwapOffer: vi.fn(async (_db: any, id: string, status: string, txHash: string | null) => { board.closed.push({ id, status, txHash }); return true; }),
+    closeSwapOffersByNullifiers: vi.fn(async (_db: any, nullifiers: string[], txHash: string | null) => { board.byNullifier.push({ nullifiers, txHash }); return []; })
+}));
+vi.mock('../../srv/submission/learned-token-types', () => ({
+    recordLearnedTokenTypes: vi.fn(async () => []),
+    sharedLearnedTokenTypes: () => []
+}));
 vi.mock('../../srv/submission/fee-sponsor', async (importOriginal) => ({
     ...(await importOriginal<Record<string, unknown>>()),
     resolveFeeSponsor: vi.fn(async () => ({ sponsorSessionId: 'sponsor-1', accountId: 'acct-1' })),
@@ -960,6 +973,49 @@ describe('sponsorSwap', () => {
         await srv.handlers['sponsorSwap'](noTypes);
         expect(noTypes.reject).toHaveBeenCalledWith(expect.objectContaining({ code: 'SPONSOR_POLICY_EMPTY', message: expect.stringMatching(/none is sponsored for this caller/) }));
         expect(startJobCalls).toHaveLength(0);
+    });
+
+    test('names the maker half by offerId: the board\'s half fills, a closed or unknown offer is refused first', async () => {
+        const srv = setup();
+        board.row = { ID: 'offer-1', offer: TX_A, status: 'open', expiresAt: null };
+        const req = makeReq({ takerHalfB64: TX_B, sponsorSessionId: 'sponsor-1', offerId: 'offer-1' });
+        await srv.handlers['sponsorSwap'](req);
+        expect(req.reject).not.toHaveBeenCalled();
+        expect(startJobCalls[0].command.swap).toEqual({ makerHalfB64: TX_A, takerHalfB64: TX_B, offerId: 'offer-1' });
+
+        const both = makeReq({ makerHalfB64: TX_A, takerHalfB64: TX_B, sponsorSessionId: 'sponsor-1', offerId: 'offer-1' });
+        await srv.handlers['sponsorSwap'](both);
+        expect(both.reject).toHaveBeenCalledWith(400, 'makerHalfB64 and offerId: one or the other');
+        const unknown = makeReq({ takerHalfB64: TX_B, sponsorSessionId: 'sponsor-1', offerId: 'offer-9' });
+        await srv.handlers['sponsorSwap'](unknown);
+        expect(unknown.reject).toHaveBeenCalledWith(404, 'swap offer not found');
+        board.row = { ID: 'offer-1', offer: TX_A, status: 'filled', expiresAt: null };
+        const filled = makeReq({ takerHalfB64: TX_B, sponsorSessionId: 'sponsor-1', offerId: 'offer-1' });
+        await srv.handlers['sponsorSwap'](filled);
+        expect(filled.reject).toHaveBeenCalledWith(409, 'swap offer is filled');
+        board.row = { ID: 'offer-1', offer: TX_A, status: 'open', expiresAt: '2001-01-01T00:00:00.000Z' };
+        const expired = makeReq({ takerHalfB64: TX_B, sponsorSessionId: 'sponsor-1', offerId: 'offer-1' });
+        await srv.handlers['sponsorSwap'](expired);
+        expect(expired.reject).toHaveBeenCalledWith(409, 'swap offer is expired');
+        expect(startJobCalls).toHaveLength(1);
+        board.row = null;
+    });
+
+    test('a landed swap closes the offer it filled and the halves sharing its nullifiers', async () => {
+        setup();
+        board.closed.length = 0; board.byNullifier.length = 0;
+        const N = ['11'.repeat(32), '22'.repeat(32)];
+        unboundWorkerImpl.fn = async () => ({ txHash: '00ee', circuits: ['<swap>'], contractAddress: '', note: 'b', swap: swapTerms, nullifiers: N });
+        const proc = processors.get('sponsorSwap')!;
+        await proc({ op: 'sponsorUnbound', swap: { makerHalfB64: TX_A, takerHalfB64: TX_B, offerId: 'offer-1' }, sponsorSessionId: 'sponsor-1' }, { ID: 'j', kind: 'sponsorSwap', requestedBy: 'u' } as any);
+        expect(board.closed).toEqual([{ id: 'offer-1', status: 'filled', txHash: '00ee' }]);
+        expect(board.byNullifier).toEqual([{ nullifiers: N, txHash: '00ee' }]);
+        // the intent carries them too, so a reconciled attempt closes the same rows
+        const intentCall = unboundIntentHooks.at(-1);
+        dbWrites.length = 0;
+        await intentCall('00ee', { circuits: ['<swap>'], nullifiers: N });
+        const row = dbWrites.find((q: any) => q?.INSERT)?.INSERT?.entries?.[0];
+        expect(JSON.parse(row.submitIntentData)).toMatchObject({ nullifiers: N, offerId: 'offer-1' });
     });
 
     test('the executor hands the worker the halves under the policy in force when the job runs', async () => {

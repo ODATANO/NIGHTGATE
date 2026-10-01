@@ -39,9 +39,7 @@ if (!IHTTP || !NODE) fail('NIGHTGATE_INDEXER_HTTP_URL + NIGHTGATE_NODE_URL are r
 const { deriveIndexerWsUrl } = require('../srv/utils/nightgate-config.js');
 const IWS = process.env.NIGHTGATE_INDEXER_WS_URL || deriveIndexerWsUrl(IHTTP);
 const auth = { username: process.env.NIGHTGATE_HTTP_USER, password: process.env.NIGHTGATE_HTTP_PASSWORD };
-const artifactModule = ARTIFACT === 'counter'
-    ? '../contracts/counter/src/managed/counter/contract/index.js'
-    : `../contracts/${ARTIFACT}/src/managed/${ARTIFACT}/contract/index.js`;
+const artifactModule = `@odatano/contract-${ARTIFACT}`;
 const { Contract } = await import(artifactModule);
 
 const operator = connect({ baseUrl: BASE, timeoutMs: 60 * 60 * 1000, ...auth });

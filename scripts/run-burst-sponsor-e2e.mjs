@@ -29,7 +29,7 @@ import { mkdirSync, writeFileSync, readFileSync, existsSync, readdirSync } from 
 import bip39 from 'bip39';
 import { createTxBuilder } from '../src/txbuilder/index.mjs';
 import { prepareAttest } from '../src/browser/index.mjs';
-import { Contract } from '../contracts/attestation-vault/src/managed/attestation-vault/contract/index.js';
+import { Contract } from '@odatano/contract-attestation-vault';
 import { connect } from '../src/sdk/client.mjs';
 
 const BASE = process.env.NIGHTGATE_URL || 'http://localhost:4004';

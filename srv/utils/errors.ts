@@ -56,6 +56,8 @@ export const ERROR_CODES = {
     SPONSOR_POLICY_EMPTY: { status: 403, doc: 'The effective sponsor policy allows nothing for this caller.' },
     SPONSOR_POLICY_UNAVAILABLE: { status: 503, retryable: true, doc: 'The sponsor policy file cannot be read; fail-closed.' },
     SPONSOR_REFUSED: { status: 403, doc: 'The sponsor refused the transaction under its policy.' },
+    SWAP_OFFER_INVALID: { status: 400, doc: 'The posted text is not a swap half the offer board can carry.' },
+    SWAP_OFFER_NOT_OPEN: { status: 409, doc: 'The swap offer is filled, retired or expired.' },
     SPONSORED_CALL_NOT_APPLIED: { status: 409, doc: 'The sponsored call landed but did not apply (the caller\'s transcript is stale).' },
     SUBMIT_INTENT_REJECTED: { status: 409, doc: 'The server refused to record the broadcast; nothing was sent.' },
     SUBMIT_INTENT_TIMEOUT: { status: 503, retryable: true, doc: 'The broadcast was not acknowledged in time; nothing was sent.' },

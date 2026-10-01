@@ -4,14 +4,14 @@
  * wallet-material-factory, which import each other.
  */
 
-import { getNightgatePluginConfig } from './nightgate-config';
+import { getNightgatePluginConfig, type NightgatePluginConfig } from './nightgate-config';
 import { configList } from './config';
 
 /**
  * Session ids any authenticated caller may use as fee sponsor.
  * Env NIGHTGATE_FEE_SPONSOR_SESSION wins over cds config `feeSponsorSessions`.
  */
-export function getConfiguredFeeSponsorSessions(config?: Record<string, any>): string[] {
+export function getConfiguredFeeSponsorSessions(config?: NightgatePluginConfig): string[] {
     const fromEnv = configList('NIGHTGATE_FEE_SPONSOR_SESSION');
     if (fromEnv.length) return fromEnv;
     const raw = Array.isArray(config?.feeSponsorSessions)
@@ -22,7 +22,7 @@ export function getConfiguredFeeSponsorSessions(config?: Record<string, any>): s
 }
 
 /** Is this session id listed as platform fee-sponsor infrastructure? */
-export function isConfiguredPlatformSponsor(sessionId: string | undefined | null, config?: Record<string, any>): boolean {
+export function isConfiguredPlatformSponsor(sessionId: string | undefined | null, config?: NightgatePluginConfig): boolean {
     if (!sessionId) return false;
     return getConfiguredFeeSponsorSessions(config ?? getNightgatePluginConfig()).includes(sessionId);
 }
@@ -34,7 +34,7 @@ export function isConfiguredPlatformSponsor(sessionId: string | undefined | null
 export function isSessionExpired(
     sessionId: string | undefined | null,
     expiresAt: unknown,
-    config?: Record<string, any>
+    config?: NightgatePluginConfig
 ): boolean {
     if (!expiresAt) return false;
     if (isConfiguredPlatformSponsor(sessionId, config)) return false;

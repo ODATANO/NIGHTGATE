@@ -8,54 +8,23 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import {
+    readProverKeyManifest,
+    verifierCircuits,
+    missingProverKeys,
+    hasAllProverKeys,
+    proverKeyUrl,
+    type ProverKeyManifest,
+    type ZkAssetLayout
+} from '@odatano/contract-kit/node';
 import { configStringFrom } from '../utils/config';
 import { NightgateError } from '../utils/errors';
 
+export { readProverKeyManifest, verifierCircuits, missingProverKeys, hasAllProverKeys };
+export type { ProverKeyManifest, ZkAssetLayout };
+
 export const PROVER_KEY_MANIFEST = 'manifest.json';
 export const ZK_ASSET_URL_ENV = 'NIGHTGATE_ZK_ASSET_URL';
-
-export interface ProverKeyManifest {
-    version: 1;
-    prover: Record<string, { sha256: string; bytes: number }>;
-}
-
-const PACKAGE_ROOT = path.resolve(__dirname, '..', '..');
-
-/** Null when absent or malformed. */
-export function readProverKeyManifest(zkConfigPath: string): ProverKeyManifest | null {
-    try {
-        const raw = JSON.parse(fs.readFileSync(path.join(zkConfigPath, 'keys', PROVER_KEY_MANIFEST), 'utf8'));
-        if (raw?.version !== 1 || !raw.prover || typeof raw.prover !== 'object') return null;
-        for (const entry of Object.values(raw.prover) as Array<{ sha256?: unknown; bytes?: unknown }>) {
-            if (typeof entry?.sha256 !== 'string' || !/^[0-9a-f]{64}$/.test(entry.sha256)) return null;
-            if (!Number.isInteger(entry?.bytes) || (entry.bytes as number) < 0) return null;
-        }
-        return raw as ProverKeyManifest;
-    } catch {
-        return null;
-    }
-}
-
-/** Circuits with a verifier key: the authoritative circuit list of an artifact. */
-export function verifierCircuits(zkConfigPath: string): string[] {
-    try {
-        return fs.readdirSync(path.join(zkConfigPath, 'keys'))
-            .filter(f => f.endsWith('.verifier'))
-            .map(f => f.replace(/\.verifier$/, ''))
-            .sort();
-    } catch {
-        return [];
-    }
-}
-
-export function missingProverKeys(zkConfigPath: string): string[] {
-    return verifierCircuits(zkConfigPath).filter(c => !fs.existsSync(path.join(zkConfigPath, 'keys', `${c}.prover`)));
-}
-
-export function hasAllProverKeys(zkConfigPath: string): boolean {
-    const circuits = verifierCircuits(zkConfigPath);
-    return circuits.length > 0 && missingProverKeys(zkConfigPath).length === 0;
-}
 
 export class ProverKeysUnavailableError extends NightgateError {
     constructor(message: string, readonly contractName: string, readonly missing: string[], retryable: boolean) {
@@ -63,41 +32,38 @@ export class ProverKeysUnavailableError extends NightgateError {
     }
 }
 
-function insideDir(child: string, parent: string): boolean {
-    const rel = path.relative(path.resolve(parent), path.resolve(child));
-    return rel !== '' && !rel.startsWith('..') && !path.isAbsolute(rel);
+/** Where a registration's prover keys come from: an installed lineage package names its release assets. */
+export interface ProverKeySourceInput {
+    zkConfigPath: string;
+    package?: { zkAssetUrl?: string; zkAssetLayout?: ZkAssetLayout };
 }
 
-function packageVersion(pkgRoot: string): string {
-    try {
-        return String(JSON.parse(fs.readFileSync(path.join(pkgRoot, 'package.json'), 'utf8')).version ?? '0.0.0');
-    } catch {
-        return '0.0.0';
-    }
+export interface ZkAssetSource {
+    /** Base URL; keys resolve by `layout`. */
+    base: string;
+    layout: ZkAssetLayout;
 }
 
 /**
- * `NIGHTGATE_ZK_ASSET_URL` base, or the release tag on GitHub for shipped
- * contracts; null when disabled (none/off) or a foreign artifact has no source.
+ * `NIGHTGATE_ZK_ASSET_URL` base (a `/zk-config` layout, per contract name), else
+ * the installed package's release assets; null when disabled (none/off) or a
+ * foreign artifact has no source.
  */
 export function resolveZkAssetSource(
     name: string,
-    zkConfigPath: string,
-    env: NodeJS.ProcessEnv = process.env,
-    pkgRoot: string = PACKAGE_ROOT
-): string | null {
+    reg: ProverKeySourceInput,
+    env: NodeJS.ProcessEnv = process.env
+): ZkAssetSource | null {
     const raw = configStringFrom(ZK_ASSET_URL_ENV, env) ?? '';
     if (/^(none|off|0|false)$/i.test(raw)) return null;
-    if (raw) return `${raw.replace(/\/+$/, '')}/${name}`;
-    const shipped = path.join(pkgRoot, 'contracts', name, 'src', 'managed', name);
-    if (path.resolve(zkConfigPath) !== path.resolve(shipped) && !insideDir(zkConfigPath, shipped)) return null;
-    return `https://raw.githubusercontent.com/ODATANO/NIGHTGATE/v${packageVersion(pkgRoot)}/contracts/${name}/src/managed/${name}`;
+    if (raw) return { base: `${raw.replace(/\/+$/, '')}/${name}`, layout: 'zk-config' };
+    if (reg.package?.zkAssetUrl) return { base: reg.package.zkAssetUrl, layout: reg.package.zkAssetLayout ?? 'flat' };
+    return null;
 }
 
 export interface EnsureProverKeysOptions {
     fetchFn?: typeof fetch;
     env?: NodeJS.ProcessEnv;
-    pkgRoot?: string;
     log?: (message: string) => void;
 }
 
@@ -106,22 +72,23 @@ const inFlight = new Map<string, Promise<{ fetched: string[]; source: string | n
 /** Each key is verified before it lands; concurrent callers for one artifact share the download. */
 export function ensureProverKeys(
     name: string,
-    reg: { zkConfigPath: string },
+    reg: ProverKeySourceInput,
     opts: EnsureProverKeysOptions = {}
 ): Promise<{ fetched: string[]; source: string | null }> {
     const key = path.resolve(reg.zkConfigPath);
     const running = inFlight.get(key);
     if (running) return running;
-    const task = ensureProverKeysNow(name, reg.zkConfigPath, opts).finally(() => { inFlight.delete(key); });
+    const task = ensureProverKeysNow(name, reg, opts).finally(() => { inFlight.delete(key); });
     inFlight.set(key, task);
     return task;
 }
 
 async function ensureProverKeysNow(
     name: string,
-    zkConfigPath: string,
+    reg: ProverKeySourceInput,
     opts: EnsureProverKeysOptions
 ): Promise<{ fetched: string[]; source: string | null }> {
+    const zkConfigPath = reg.zkConfigPath;
     const missing = missingProverKeys(zkConfigPath);
     if (missing.length === 0) return { fetched: [], source: null };
     const manifest = readProverKeyManifest(zkConfigPath);
@@ -137,7 +104,7 @@ async function ensureProverKeysNow(
             `contract '${name}': keys/${PROVER_KEY_MANIFEST} lists no prover key for ${unlisted.join(', ')}; the manifest is stale for this artifact`,
             name, unlisted, false);
     }
-    const source = resolveZkAssetSource(name, zkConfigPath, opts.env ?? process.env, opts.pkgRoot ?? PACKAGE_ROOT);
+    const source = resolveZkAssetSource(name, reg, opts.env ?? process.env);
     if (!source) {
         throw new ProverKeysUnavailableError(
             `contract '${name}' has no prover keys for ${missing.join(', ')} and no source to fetch them from: ` +
@@ -147,11 +114,11 @@ async function ensureProverKeysNow(
     const doFetch = opts.fetchFn ?? fetch;
     const keysDir = path.join(zkConfigPath, 'keys');
     fs.mkdirSync(keysDir, { recursive: true });
-    opts.log?.(`contract '${name}': fetching ${missing.length} prover key(s) from ${source}`);
+    opts.log?.(`contract '${name}': fetching ${missing.length} prover key(s) from ${source.base}`);
     const fetched: string[] = [];
     for (const circuit of missing) {
         const expected = manifest.prover[circuit];
-        const url = `${source}/keys/${circuit}.prover`;
+        const url = proverKeyUrl(source.base, source.layout, circuit);
         let res: Response;
         try {
             res = await doFetch(url);
@@ -183,15 +150,5 @@ async function ensureProverKeysNow(
         fetched.push(circuit);
         opts.log?.(`contract '${name}': prover key ${circuit} (${body.length} bytes) verified and written`);
     }
-    return { fetched, source };
-}
-
-/** Build-time helper. */
-export function buildProverKeyManifest(keysDir: string): ProverKeyManifest {
-    const prover: ProverKeyManifest['prover'] = {};
-    for (const f of fs.readdirSync(keysDir).filter(f => f.endsWith('.prover')).sort()) {
-        const body = fs.readFileSync(path.join(keysDir, f));
-        prover[f.replace(/\.prover$/, '')] = { sha256: crypto.createHash('sha256').update(body).digest('hex'), bytes: body.length };
-    }
-    return { version: 1, prover };
+    return { fetched, source: source.base };
 }

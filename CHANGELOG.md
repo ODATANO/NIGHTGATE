@@ -1,5 +1,62 @@
 # Changelog
 
+## 0.30.0 - 2026-10-02
+
+### Features
+
+- Contract lineages as npm packages, repository `ODATANO/NIGHTGATE-CONTRACTS`:
+  `@odatano/contract-attestation-vault`, `-attestation-vault-32`, `-holder-registry`,
+  `-shielded-token`, `-token-factory`, `-counter`, each with `contract.json` (role, digest, compiler and
+  runtime versions, prover-key source) and the Compact source; companion code (hex,
+  hashing, content roots, set roots, claim keys, witnesses, call helpers, artifact
+  digest, key manifest, token-factory names and calls) in `@odatano/contract-kit`.
+  `token-factory` is a sixth registered lineage (shielded tokens on demand, named by
+  their issuer, with a supply ledger and burn; served under `/zk-config/token-factory`).
+  `cds.requires.nightgate.contracts`
+  entries take `{ "package": "<name>" }`; the path form stays for foreign artifacts.
+  Prover keys are fetched from the package's release assets (`contract.json#zkAssetUrl`,
+  flat layout); `nightgate-fetch-keys <name|package>` prefetches them, the image does so
+  at build. `getRuntimeInfo.contracts[]` carries `package` and `version`. The
+  generation check runs before any key fetch.
+- Offer board: `postSwapOffer(offer, expiresAt?, tags?)`, `listSwapOffers(givesType?,
+  wantsType?, tag?, limit?)`, `retireSwapOffer(offerId)`. A posted maker half is checked
+  like a sponsored half, its terms read from the half; it closes when one of its input
+  nullifiers lands in a sponsored swap, on expiry, or by its poster. `sponsorSwap` takes
+  `offerId` instead of `makerHalfB64`. Table `SwapOffers`; codes `SWAP_OFFER_INVALID`
+  (400), `SWAP_OFFER_NOT_OPEN` (409); rate limits 60/hour (post, retire) and 600/hour
+  (list). Grantable, also on a pool grant; listing is open to every token.
+- Token types learned platform-wide: `NIGHTGATE_SPONSOR_SHARE_MINTED_TOKEN_TYPES` /
+  policy file `shareMintedTokenTypes` (needs `allowContractMints`) lists every type a
+  landed sponsored mint created for every grant; a grant may narrow to a subset. Table
+  `LearnedTokenTypes`, read-only admin projection.
+- Disclosure to token holders: contract `holder-registry` (`registerHolder(coin,
+  claim_key)` passes a coin of the type through the contract and records
+  `holderEntry(type, claim_key)`; `unregisterHolder`), actions
+  `grantDisclosureToHolders(payloadHash, tokenType, registryAddress, content?,
+  contentType?, expiresAt?)`, `revokeHolderDisclosure(holderGrantId)`,
+  `claimDisclosure(payloadHash, tokenType, claimSecret)`. Content is stored encrypted
+  and must hash to the payload; a claim reads the registry live. Table
+  `HolderDisclosureGrants`. txbuilder: `holderClaimKey`, `HOLDER_REGISTRY_CIRCUITS`.
+- Worker: `describeSwapHalf` RPC; a sponsored swap's result and submit intent carry the
+  halves' input nullifiers.
+- `@odatano/nightgate-tx` 0.10.0: depends on `@odatano/contract-kit` and the two vault
+  packages instead of shipping copies; `./attestation-vault[-32]` re-export them.
+
+### Changes
+
+- `contracts/` left this package; `./browser/attestation-vault[-32]` re-export the
+  lineage packages for one release line. `hashing`, `set-root`, `predicate-state` claim
+  keys, `document-proof` builders, `contract-witnesses`, `artifact-digest` and the browser
+  helpers are re-exports of the kit. Scripts `check:vault-parity`, `keys:manifest`,
+  `test:contract` and the circuit integration tests moved to the contracts repository.
+  `NIGHTGATE_CONTRACTS_DIR` defaults to the working directory's `contracts/` only.
+- Generation digests of `attestation-vault`, `attestation-vault-32` and `holder-registry`
+  are unchanged; `counter` and `shielded-token` were recompiled from their sources and
+  carry new digests.
+
+Schema delta: three tables, no column change; `nightgate-schema-delta` on SQLite,
+`cds deploy` on PostgreSQL. No circuit of the vault lineages changed.
+
 ## 0.29.2 - 2026-10-01
 
 ### Fixes

@@ -1,30 +1,24 @@
 /**
  * Maps a `compiledArtifactRef` name to its compiled module, `privateStateId` and
- * `zkConfigPath`. In-memory; loaded from `cds.requires.nightgate.contracts`.
+ * `zkConfigPath`. In-memory; loaded from `cds.requires.nightgate.contracts`,
+ * where an entry names an installed lineage package or the paths of a foreign artifact.
  */
 
+import type { NightgatePluginConfig } from '../utils/nightgate-config';
 import cds from '@sap/cds';
 import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
 import { pathToFileURL } from 'url';
 import { computeArtifactGenerationDigest, artifactGenerationMatch } from './artifact-digest';
+import { resolveContractPackage, contractPackageDigestProblem, type ZkAssetLayout } from '@odatano/contract-kit/node';
 import { ensureProverKeys, missingProverKeys, ZK_ASSET_URL_ENV } from './prover-keys';
 import { configMs } from '../utils/config';
 import { NightgateError } from '../utils/errors';
 
-// This file lives at <root>/srv/submission/.
-const PACKAGE_ROOT = path.resolve(__dirname, '..', '..');
-
-/**
- * A relative path prefers the package root when the target exists there, so the
- * bundled contracts resolve when cwd is a consumer app; otherwise baseDir.
- */
+/** A relative path of a foreign artifact resolves against baseDir. */
 function resolveContractPath(p: string, baseDir: string): string {
-    if (path.isAbsolute(p)) return p;
-    const fromPackage = path.join(PACKAGE_ROOT, p);
-    if (fs.existsSync(fromPackage)) return fromPackage;
-    return path.join(baseDir, p);
+    return path.isAbsolute(p) ? p : path.join(baseDir, p);
 }
 
 export interface ContractRegistration {
@@ -38,6 +32,16 @@ export interface ContractRegistration {
      * match the artifact's witness shapes. Non-default widths enter the digest.
      */
     slotWidth?: number;
+    /** The installed lineage package the paths point into, when there is one. */
+    package?: ContractPackageRef;
+}
+
+/** Identity and key source of an installed lineage package. */
+export interface ContractPackageRef {
+    name: string;
+    version: string;
+    zkAssetUrl?: string;
+    zkAssetLayout?: ZkAssetLayout;
 }
 
 /** A registration's content-tree width, defaulting to the classic 16. */
@@ -209,21 +213,69 @@ export function getContractRegistration(name: string): Readonly<ContractRegistra
     return registry.get(name);
 }
 
-/** Load `cds.requires.nightgate.contracts`. Idempotent. */
-export function loadRegistryFromConfig(config?: Record<string, any>, baseDir = process.cwd()): void {
+// This file lives at <root>/srv/submission/; the lineage packages are this package's dependencies.
+const PLUGIN_ROOT = path.resolve(__dirname, '..', '..');
+
+/**
+ * A `{ package }` config entry: the installed lineage package (resolved from
+ * this plugin's own install first, then from baseDir), its contract.json
+ * verified against the files.
+ */
+export function registrationFromPackage(packageName: string, baseDir = process.cwd()): ContractRegistration {
+    let pkg;
+    try {
+        pkg = resolveContractPackage(packageName, PLUGIN_ROOT);
+    } catch {
+        pkg = resolveContractPackage(packageName, baseDir);
+    }
+    const problem = contractPackageDigestProblem(pkg);
+    if (problem) throw new Error(`contract package ${packageName} is not the generation its contract.json describes: ${problem}`);
+    return {
+        artifactPath: pkg.artifactPath,
+        privateStateId: pkg.manifest.privateStateId,
+        zkConfigPath: pkg.zkConfigPath,
+        ...(pkg.manifest.slotWidth !== undefined ? { slotWidth: pkg.manifest.slotWidth } : {}),
+        package: {
+            name: pkg.name,
+            version: pkg.version,
+            zkAssetUrl: pkg.manifest.zkAssetUrl,
+            zkAssetLayout: pkg.manifest.zkAssetLayout
+        }
+    };
+}
+
+/**
+ * Load `cds.requires.nightgate.contracts`. Idempotent. An entry is either
+ * `{ package }` (an installed lineage package) or `{ artifactPath, privateStateId, zkConfigPath, slotWidth? }`.
+ */
+export function loadRegistryFromConfig(config?: NightgatePluginConfig, baseDir = process.cwd()): void {
     const contracts = config?.contracts;
     if (!contracts || typeof contracts !== 'object') return;
     for (const [name, reg] of Object.entries(contracts)) {
-        const r = reg as ContractRegistration;
-        if (!r?.artifactPath || !r?.privateStateId || !r?.zkConfigPath) continue;
-        const resolved = {
-            artifactPath: resolveContractPath(r.artifactPath, baseDir),
-            privateStateId: r.privateStateId,
-            zkConfigPath: resolveContractPath(r.zkConfigPath, baseDir),
-            ...(r.slotWidth !== undefined ? { slotWidth: Number(r.slotWidth) } : {})
-        };
+        const r = reg as Partial<ContractRegistration> & { package?: string };
+        let resolved: ContractRegistration;
+        if (typeof r?.package === 'string' && r.package) {
+            // One broken entry leaves the others registered; the alias itself stays unknown.
+            try {
+                resolved = registrationFromPackage(r.package, baseDir);
+            } catch (err) {
+                cds.log('nightgate').error(`contract '${name}' not registered: ${err instanceof Error ? err.message : String(err)}`);
+                continue;
+            }
+        } else {
+            if (!r?.artifactPath || !r?.privateStateId || !r?.zkConfigPath) continue;
+            resolved = {
+                artifactPath: resolveContractPath(r.artifactPath, baseDir),
+                privateStateId: r.privateStateId,
+                zkConfigPath: resolveContractPath(r.zkConfigPath, baseDir),
+                ...(r.slotWidth !== undefined ? { slotWidth: Number(r.slotWidth) } : {})
+            };
+        }
         registerContract(name, resolved);
         configNames.add(name);
+        if (resolved.package) {
+            cds.log('nightgate').info(`contract '${name}': ${resolved.package.name}@${resolved.package.version}, generation ${getArtifactGenerationDigest(name).slice(0, 16)}…`);
+        }
         warnOnMissingProverKeys(name, resolved.zkConfigPath);
     }
 }
@@ -250,11 +302,6 @@ export async function resolveContract(name: string, expectedDigest?: string, opt
         throw new ContractNotRegisteredError(name, available);
     }
     let digest: string | undefined;
-    if (expectedDigest !== undefined && !opts.compile) {
-        // The worker snapshots these files, so prover keys must be on disk first.
-        const { fetched } = await ensureProverKeys(name, reg, { log: (m) => cds.log('nightgate').info(m) });
-        if (fetched.length) cds.log('nightgate').info(`contract '${name}': ${fetched.length} prover key(s) fetched on first need`);
-    }
     if (expectedDigest !== undefined) {
         // A job imports nothing here (the worker hashes its snapshot), so the
         // fingerprinted digest suffices; a main-thread import checks its bytes uncached.
@@ -268,6 +315,12 @@ export async function resolveContract(name: string, expectedDigest?: string, opt
         }
     }
     digest ??= getArtifactGenerationDigest(name);
+    if (expectedDigest !== undefined && !opts.compile) {
+        // The worker snapshots these files, so prover keys must be on disk first;
+        // after the generation check, so a stale job never triggers a download.
+        const { fetched } = await ensureProverKeys(name, reg, { log: (m) => cds.log('nightgate').info(m) });
+        if (fetched.length) cds.log('nightgate').info(`contract '${name}': ${fetched.length} prover key(s) fetched on first need`);
+    }
     // No main-thread import for jobs: it would stay in Node's module cache.
     let compiledContract: unknown;
     if (opts.compile) {

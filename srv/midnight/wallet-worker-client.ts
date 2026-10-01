@@ -927,6 +927,11 @@ export function walletSponsorUnboundTx(args: {
     allowedTokenTypes?: string[];
     /** Also pay for the offer of a token a sponsorable call of the transaction mints. */
     allowContractMints?: boolean;
-}, onSubmitIntent?: SubmitIntentHook): Promise<{ txHash: string; circuits: string[]; contractAddress: string; note: string; deployed?: string[]; minted?: string[]; swap?: SponsoredSwapTerms }> {
+}, onSubmitIntent?: SubmitIntentHook): Promise<{ txHash: string; circuits: string[]; contractAddress: string; note: string; deployed?: string[]; minted?: string[]; swap?: SponsoredSwapTerms; nullifiers?: string[] }> {
     return rpc('sponsorUnboundTx', args, RPC_TIMEOUT_MS, onSubmitIntent);
+}
+
+/** Terms and input nullifiers of one swap half (offer file or base64 already unpacked to base64); throws for anything that is not a swap half. */
+export async function walletDescribeSwapHalf(args: { halfB64: string }): Promise<SponsoredSwapTerms & { bound: boolean; inputs: number; nullifiers: string[] }> {
+    return rpc('describeSwapHalf', args, RPC_TIMEOUT_MS);
 }

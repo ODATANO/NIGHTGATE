@@ -2,10 +2,11 @@
 //
 // The slim package is the caller half of cross-server fee sponsoring on its
 // own: build + prove + sign a Midnight contract transaction locally, hand the
-// fee-unpaid bytes to a sponsor. It carries under 1 MB instead of the main
-// package's 88 MB, because the 78 MB of prover keys are fetched from a public
-// /zk-config at runtime (which is what the txbuilder does anyway, and what
-// pins the artifact generation to the sponsor's deployed contract).
+// fee-unpaid bytes to a sponsor. The contract classes come from the
+// @odatano/contract-* lineage packages and the companion code from
+// @odatano/contract-kit (dependencies); prover keys are fetched from a public
+// /zk-config at runtime, which pins the artifact generation to the sponsor's
+// deployed contract.
 //
 // There is NO second source tree: every file is copied from here, at the SAME
 // relative path, so the relative requires inside them keep working untouched.
@@ -22,8 +23,6 @@ import { fileURLToPath } from 'node:url';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 const OUT = join(ROOT, 'packages', 'nightgate-tx');
-const VAULT = 'contracts/attestation-vault/src/managed/attestation-vault';
-const VAULT32 = 'contracts/attestation-vault-32/src/managed/attestation-vault-32';
 
 /**
  * Everything the slim package ships, as repo-relative paths. `required: false`
@@ -40,7 +39,14 @@ const FILES = [
     { path: 'src/txbuilder/index.d.ts' },
     { path: 'src/txbuilder/submit.mjs' },
     { path: 'src/txbuilder/swap.mjs' },
-    // the call/witness helpers (identical to @odatano/nightgate/browser)
+    { path: 'src/txbuilder/holder.mjs' },
+    { path: 'src/txbuilder/holder.d.mts' },
+    // the call/witness helpers (identical to @odatano/nightgate/browser; the
+    // implementation is @odatano/contract-kit) and the lineage re-exports
+    { path: 'src/browser/attestation-vault.mjs' },
+    { path: 'src/browser/attestation-vault.d.mts' },
+    { path: 'src/browser/attestation-vault-32.mjs' },
+    { path: 'src/browser/attestation-vault-32.d.mts' },
     { path: 'src/browser/index.mjs' },
     { path: 'src/browser/index.d.ts' },
     { path: 'src/browser/attestation-vault-calls.mjs' },
@@ -69,19 +75,10 @@ const FILES = [
     { path: 'srv/midnight/batch-call-scope.d.ts', buildOutput: true },
     { path: 'srv/midnight/batch-segment-order.js', buildOutput: true },
     { path: 'srv/midnight/batch-segment-order.d.ts', buildOutput: true },
-    // the canonical membership-set rule (already a public subpath of the main
-    // package); both are @noble/hashes only, no CAP, no registry.
+    // the canonical membership-set rule (a public subpath of the main
+    // package); a re-export of @odatano/contract-kit.
     { path: 'srv/submission/set-root.js', buildOutput: true },
     { path: 'srv/submission/set-root.d.ts', buildOutput: true },
-    { path: 'srv/submission/hashing.js', buildOutput: true },
-    { path: 'srv/submission/hashing.d.ts', buildOutput: true },
-    // the compiled contract class. NOT keys/ or zkir/: those are the 78 MB the
-    // builder fetches from the sponsor's /zk-config, generation-pinned.
-    { path: `${VAULT}/contract/index.js` },
-    { path: `${VAULT}/contract/index.d.ts` },
-    // 32-slot width variant: same rule, module only, keys via /zk-config.
-    { path: `${VAULT32}/contract/index.js` },
-    { path: `${VAULT32}/contract/index.d.ts` },
     { path: 'LICENSE' }
 ];
 
@@ -137,21 +134,6 @@ async function main() {
             await writeFile(to, buf);
             bytes += buf.length;
         }
-        copied++;
-    }
-
-    // The compiled contract class is ESM while this package is commonjs. Node
-    // decides that per nearest package.json, so the contract tree needs its own
-    // `"type": "module"` marker (the main package ships the contract's real
-    // package.json for exactly this reason).
-    for (const vault of ['attestation-vault', 'attestation-vault-32']) {
-        const marker = join(OUT, 'contracts', vault, 'package.json');
-        await mkdir(dirname(marker), { recursive: true });
-        await writeFile(marker, JSON.stringify({
-            name: `@odatano/nightgate-tx-contract-${vault}`,
-            type: 'module',
-            main: `src/managed/${vault}/contract/index.js`
-        }, null, 4) + String.fromCharCode(10));
         copied++;
     }
 

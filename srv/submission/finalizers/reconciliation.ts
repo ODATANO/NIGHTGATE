@@ -7,6 +7,8 @@ import { assertArtifactGeneration } from '../contract-registry';
 import type { BackgroundJobRow, ReconciliationEvidence } from '../job-store';
 import { Documents, DisclosureGrants, PendingSubmissions } from '#cds-models/midnight';
 import { recordDeployedContracts, recordMintedTokenTypes } from '../../sessions/agent-grants';
+import { recordLearnedTokenTypes } from '../learned-token-types';
+import { closeSwapOffer, closeSwapOffersByNullifiers } from '../swap-offers';
 import { ContractCommandV1, ContractCommandV1WithProvenance } from '../actions/common';
 import type { SubmissionContext } from '../actions/context';
 
@@ -31,7 +33,16 @@ export function createReconciliationFinalizers(ctx: Pick<SubmissionContext, 'db'
         const grantId = coordinates.deployReservation?.grantId ?? command?.grantId;
         if (deployed.length && grantId) await recordDeployedContracts(db, String(grantId), deployed);
         const minted: string[] = Array.isArray(coordinates.minted) ? coordinates.minted.map(String) : [];
+        if (minted.length) await recordLearnedTokenTypes(db, minted, { grantId: grantId ? String(grantId) : null, sponsorSessionId: command?.sponsorSessionId ?? null, txHash: evidence.txHash ?? null });
         if (minted.length && grantId) await recordMintedTokenTypes(db, String(grantId), minted);
+        const nullifiers: string[] = Array.isArray(coordinates.nullifiers) ? coordinates.nullifiers.map(String) : [];
+        // The swap is on chain; a failed bookkeeping write must not fail the reconciliation.
+        try {
+            if (coordinates.offerId) await closeSwapOffer(db, String(coordinates.offerId), 'filled', evidence.txHash ?? null);
+            if (nullifiers.length) await closeSwapOffersByNullifiers(db, nullifiers, evidence.txHash ?? null);
+        } catch (e) {
+            cds.log('nightgate').warn(`swap offers of ${evidence.txHash ?? 'the reconciled swap'} not closed: ${String((e as Error)?.message ?? e)}`);
+        }
         return {
             reconciled: true, ...evidence, status: 'finalized',
             circuits: Array.isArray(coordinates.circuits) ? coordinates.circuits : [],

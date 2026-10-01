@@ -4,6 +4,7 @@
  * existing userId gate applies unchanged.
  */
 
+import { parseJsonStringList } from '../utils/json-list';
 import cds from '@sap/cds';
 import crypto from 'crypto';
 import { AgentGrants, WalletSessions, BackgroundJobs, Transactions, TransactionFees, type WalletSession } from '#cds-models/midnight';
@@ -50,8 +51,15 @@ export const AGENT_ALLOWLISTABLE_ACTIONS: readonly string[] = [
     // sponsor's dust, which sponsor pinning and the daily budget meter.
     'sponsorFinalizedTransaction',
     'sponsorUnboundTransaction',
-    'sponsorSwap'
+    'sponsorSwap',
+    'postSwapOffer',
+    'retireSwapOffer',
+    'grantDisclosureToHolders',
+    'revokeHolderDisclosure'
 ];
+
+/** Actions that resolve no sponsor: a platform-pool grant may allow them next to the sponsoring ones. */
+const POOL_NEUTRAL_ACTIONS: ReadonlySet<string> = new Set(['postSwapOffer', 'retireSwapOffer']);
 
 /** The sponsoring actions that take one caller transaction, which may be a deploy. */
 const SPONSOR_TRANSACTION_ACTIONS: ReadonlySet<string> = new Set([
@@ -86,6 +94,8 @@ export const AGENT_ALWAYS_ALLOWED_EVENTS: ReadonlySet<string> = new Set([
     'prepareDocumentProof', // compute-only
     'prepareMembershipSet', // compute-only
     'deriveTokenType', // compute-only
+    'listSwapOffers', // the board is public to every token
+    'claimDisclosure', // proves a holding with a secret; no wallet, no grant scope
     'getJobStatus',
     'getGrantUsage', // narrowed to the token's own grant in enforceAgentGrant
     // Bound read functions of the indexer entities: the rows `READ` already
@@ -295,15 +305,7 @@ export function grantJobScopeViolation(
 }
 
 /** A grant's JSON list column as an array; malformed or absent = no narrowing. */
-function parseGrantList(raw: string | null | undefined): string[] {
-    if (!raw) return [];
-    try {
-        const v = JSON.parse(raw);
-        return Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string') : [];
-    } catch {
-        return [];
-    }
-}
+const parseGrantList = parseJsonStringList;
 
 function grantExpired(grant: Pick<AgentGrantRow, 'validUntil'>, now: Date = new Date()): boolean {
     return !!grant.validUntil && new Date(grant.validUntil) < now;
@@ -640,10 +642,10 @@ export function registerAgentGrantHandlers(srv: any, db: DbRunner): void {
             if (pool.length === 0) {
                 return req.reject(412, `sponsorSessionId: '${PLATFORM_POOL_SENTINEL}' requires a configured NIGHTGATE_FEE_SPONSOR_SESSION pool`);
             }
-            const incompatible = actions.filter(a => !SPONSOR_PHASE2_ACTIONS.has(a));
+            const incompatible = actions.filter(a => !SPONSOR_PHASE2_ACTIONS.has(a) && !POOL_NEUTRAL_ACTIONS.has(a));
             if (incompatible.length > 0) {
                 return req.reject(400,
-                    `a platform-pool grant may only allow 'sponsorFinalizedTransaction' / 'sponsorUnboundTransaction' / 'sponsorSwap'; `
+                    `a platform-pool grant may only allow 'sponsorFinalizedTransaction' / 'sponsorUnboundTransaction' / 'sponsorSwap' / 'postSwapOffer' / 'retireSwapOffer'; `
                     + `these actions resolve the sponsor directly and cannot use the pool: ${incompatible.join(', ')}`);
             }
         } else if (data.sponsorSessionId) {

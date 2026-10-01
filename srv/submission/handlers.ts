@@ -26,6 +26,8 @@ import { registerSponsoringActions } from './actions/sponsoring';
 import { registerDocumentActions } from './actions/documents';
 import { registerPredicateActions } from './actions/predicates';
 import { registerDisclosureActions } from './actions/disclosure';
+import { registerSwapOfferActions } from './actions/swap-offers';
+import { registerHolderDisclosureActions } from './actions/holder-disclosure';
 import { createContractCommandExecutor } from './executors/contract-command';
 import { createSponsorExecutors } from './executors/sponsor';
 import { createReconciliationFinalizers } from './finalizers/reconciliation';
@@ -99,5 +101,7 @@ export function registerSubmissionHandlers(
     registerDocumentActions(ctx);
     registerPredicateActions(ctx);
     registerDisclosureActions(ctx);
+    registerSwapOfferActions(ctx);
+    registerHolderDisclosureActions(ctx);
     registerVerifyStateHandlers(srv, { contractResolver, attestationStateReader, predicateStateReader });
 }

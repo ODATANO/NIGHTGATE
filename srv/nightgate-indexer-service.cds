@@ -110,6 +110,8 @@ service NightgateIndexerService {
             currentDigest  : String;
             digestStale    : Boolean;
             digestError    : String;
+            package        : String;
+            version        : String;
             slotWidth      : Integer;
             privateStateId : String;
         };

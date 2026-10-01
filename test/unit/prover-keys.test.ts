@@ -1,9 +1,7 @@
 /**
- * Prover keys on demand (srv/submission/prover-keys.ts) and their place in
- * the artifact generation digest (srv/submission/artifact-digest.ts): a
- * missing key is fetched from the resolved source and verified against
- * keys/manifest.json; the digest pins the manifest where one exists and the
- * key bytes otherwise, and still recognises the pre-manifest form.
+ * Prover keys on demand: a missing key is fetched from the resolved source
+ * (env override or the installed package's release assets) and verified
+ * against keys/manifest.json.
  */
 
 import { describe, it, expect, afterEach } from 'vitest';
@@ -13,9 +11,8 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import {
     ensureProverKeys, missingProverKeys, hasAllProverKeys, readProverKeyManifest, resolveZkAssetSource,
-    buildProverKeyManifest, ProverKeysUnavailableError, ZK_ASSET_URL_ENV
+    ProverKeysUnavailableError, ZK_ASSET_URL_ENV
 } from '../../srv/submission/prover-keys';
-import { computeArtifactGenerationDigest, artifactGenerationMatch, proverKeyManifestProblems } from '../../srv/submission/artifact-digest';
 
 const dirs: string[] = [];
 afterEach(() => { for (const d of dirs.splice(0)) fs.rmSync(d, { recursive: true, force: true }); });
@@ -67,22 +64,25 @@ describe('prover keys on demand', () => {
         expect(Object.keys(readProverKeyManifest(reg.zkConfigPath)!.prover).sort()).toEqual(['attest', 'grant']);
         fs.writeFileSync(path.join(reg.zkConfigPath, 'keys', 'manifest.json'), JSON.stringify({ version: 1, prover: { attest: { sha256: 'zz', bytes: 1 } } }));
         expect(readProverKeyManifest(reg.zkConfigPath)).toBeNull();
-        expect(buildProverKeyManifest(path.join(artifact({ provers: { attest: 'x' } }).zkConfigPath, 'keys'))).toEqual({
-            version: 1, prover: { attest: { sha256: crypto.createHash('sha256').update('x').digest('hex'), bytes: 1 } }
-        });
     });
 
-    it('resolves the source: env URL per contract, none/off disables, shipped contracts default to the release tag', () => {
-        const pkgRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ng-pkg-'));
-        dirs.push(pkgRoot);
-        fs.writeFileSync(path.join(pkgRoot, 'package.json'), JSON.stringify({ version: '9.9.9' }));
-        const shipped = path.join(pkgRoot, 'contracts', 'vault', 'src', 'managed', 'vault');
-        fs.mkdirSync(shipped, { recursive: true });
-        expect(resolveZkAssetSource('vault', shipped, { [ZK_ASSET_URL_ENV]: 'https://host/zk-config/' }, pkgRoot)).toBe('https://host/zk-config/vault');
-        expect(resolveZkAssetSource('vault', shipped, { [ZK_ASSET_URL_ENV]: 'none' }, pkgRoot)).toBeNull();
-        expect(resolveZkAssetSource('vault', shipped, { [ZK_ASSET_URL_ENV]: 'off' }, pkgRoot)).toBeNull();
-        expect(resolveZkAssetSource('vault', shipped, {}, pkgRoot)).toBe('https://raw.githubusercontent.com/ODATANO/NIGHTGATE/v9.9.9/contracts/vault/src/managed/vault');
-        expect(resolveZkAssetSource('vault', path.join(pkgRoot, 'elsewhere'), {}, pkgRoot)).toBeNull();
+    it('resolves the source: env URL per contract, none/off disables, a lineage package names its release assets', () => {
+        const foreign = { zkConfigPath: '/x' };
+        const packaged = { zkConfigPath: '/x', package: { zkAssetUrl: 'https://github.com/o/r/releases/download/vault-v1.0.0', zkAssetLayout: 'flat' as const } };
+        expect(resolveZkAssetSource('vault', foreign, { [ZK_ASSET_URL_ENV]: 'https://host/zk-config/' })).toEqual({ base: 'https://host/zk-config/vault', layout: 'zk-config' });
+        expect(resolveZkAssetSource('vault', packaged, { [ZK_ASSET_URL_ENV]: 'https://host/zk-config' })).toEqual({ base: 'https://host/zk-config/vault', layout: 'zk-config' });
+        expect(resolveZkAssetSource('vault', packaged, { [ZK_ASSET_URL_ENV]: 'none' })).toBeNull();
+        expect(resolveZkAssetSource('vault', packaged, { [ZK_ASSET_URL_ENV]: 'off' })).toBeNull();
+        expect(resolveZkAssetSource('vault', packaged, {})).toEqual({ base: 'https://github.com/o/r/releases/download/vault-v1.0.0', layout: 'flat' });
+        expect(resolveZkAssetSource('vault', foreign, {})).toBeNull();
+    });
+
+    it('fetches flat release assets of a lineage package without an env override', async () => {
+        const reg = { ...artifact({ provers: { attest: 'pk-attest' }, manifest: true }), package: { zkAssetUrl: 'https://gh/releases/download/vault-v1.0.0', zkAssetLayout: 'flat' as const } };
+        const urls: string[] = [];
+        const fetchFn = (async (url: string) => { urls.push(url); return fetchOf({ 'grant.prover': 'pk-grant' })(url); }) as unknown as typeof fetch;
+        expect(await ensureProverKeys('vault', reg, { fetchFn, env: {} })).toEqual({ fetched: ['grant'], source: 'https://gh/releases/download/vault-v1.0.0' });
+        expect(urls).toEqual(['https://gh/releases/download/vault-v1.0.0/grant.prover']);
     });
 
     it('fetches the missing keys, verifies each against the manifest, writes them and dedupes concurrent callers', async () => {
@@ -130,47 +130,5 @@ describe('prover keys on demand', () => {
         const reg = artifact({ provers: { attest: 'pk-attest' } });
         await expect(ensureProverKeys('own', reg, { env: { [ZK_ASSET_URL_ENV]: 'https://h' }, fetchFn: fetchOf({ 'grant.prover': 'pk-grant' }) }))
             .rejects.toThrow(/no keys\/manifest\.json/);
-    });
-});
-
-describe('artifact digest and prover keys', () => {
-    it('with a manifest the digest ignores which prover keys are on disk and pins the manifest', () => {
-        const reg = artifact({ provers: { attest: 'pk-attest' }, manifest: true });
-        const before = computeArtifactGenerationDigest(reg);
-        fs.writeFileSync(path.join(reg.zkConfigPath, 'keys', 'grant.prover'), 'pk-grant');
-        expect(computeArtifactGenerationDigest(reg)).toBe(before);
-        fs.rmSync(path.join(reg.zkConfigPath, 'keys', 'attest.prover'));
-        expect(computeArtifactGenerationDigest(reg)).toBe(before);
-        const manifestPath = path.join(reg.zkConfigPath, 'keys', 'manifest.json');
-        fs.writeFileSync(manifestPath, fs.readFileSync(manifestPath, 'utf8').replace('"bytes": 9', '"bytes": 10'));
-        expect(computeArtifactGenerationDigest(reg)).not.toBe(before);
-    });
-
-    it('without a manifest the prover bytes stay in the digest', () => {
-        const reg = artifact({ provers: { attest: 'pk-attest', grant: 'pk-grant' } });
-        const before = computeArtifactGenerationDigest(reg);
-        fs.writeFileSync(path.join(reg.zkConfigPath, 'keys', 'grant.prover'), 'pk-grant-2');
-        expect(computeArtifactGenerationDigest(reg)).not.toBe(before);
-    });
-
-    it('a digest recorded before the manifest existed still matches as legacy', () => {
-        const reg = artifact({ provers: { attest: 'pk-attest', grant: 'pk-grant' } });
-        const recorded = computeArtifactGenerationDigest(reg);
-        fs.writeFileSync(path.join(reg.zkConfigPath, 'keys', 'manifest.json'), JSON.stringify(buildProverKeyManifest(path.join(reg.zkConfigPath, 'keys'))));
-        expect(computeArtifactGenerationDigest(reg)).not.toBe(recorded);
-        expect(artifactGenerationMatch(reg, recorded)).toBe('legacy');
-        expect(artifactGenerationMatch(reg, computeArtifactGenerationDigest(reg))).toBe('current');
-        expect(artifactGenerationMatch(reg, 'ff'.repeat(32))).toBeNull();
-    });
-
-    it('proverKeyManifestProblems finds a key that drifted from the manifest, is silent without one', () => {
-        const reg = artifact({ provers: { attest: 'pk-attest', grant: 'pk-grant' }, manifest: true });
-        const keys = path.join(reg.zkConfigPath, 'keys');
-        expect(proverKeyManifestProblems(keys)).toEqual([]);
-        fs.writeFileSync(path.join(keys, 'grant.prover'), 'pk-grant-x');
-        expect(proverKeyManifestProblems(keys)).toEqual([expect.stringMatching(/^grant: 10 bytes/)]);
-        fs.writeFileSync(path.join(keys, 'extra.prover'), 'x');
-        expect(proverKeyManifestProblems(keys)).toContain('extra: not listed in the manifest');
-        expect(proverKeyManifestProblems(artifact({ provers: { attest: 'a' } }).zkConfigPath + '/keys')).toEqual([]);
     });
 });

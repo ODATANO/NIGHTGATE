@@ -16,7 +16,7 @@
 
 import type { Mock } from 'vitest';
 import crypto from 'crypto';
-import { encrypt, getEncryptionKey } from '../../srv/utils/crypto';
+import { encrypt } from '../../srv/utils/crypto';
 import { walletSessionSeedBinding, walletSessionViewingKeyBinding } from '../../srv/utils/envelope-bindings';
 import { buildWalletMaterialForSession } from '../../srv/submission/wallet-material-factory';
 import type { WalletFacadeBuildArgs } from '../../srv/submission/wallet-facade-builder';

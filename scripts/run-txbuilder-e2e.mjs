@@ -31,7 +31,7 @@ import bip39 from 'bip39';
 import { Agent, setGlobalDispatcher } from 'undici';
 import { createTxBuilder } from '../src/txbuilder/index.mjs';
 import { prepareAttest } from '../src/browser/index.mjs';
-import { Contract } from '../contracts/attestation-vault/src/managed/attestation-vault/contract/index.js';
+import { Contract } from '@odatano/contract-attestation-vault';
 
 const require = createRequire(import.meta.url);
 setGlobalDispatcher(new Agent({ headersTimeout: 0, bodyTimeout: 0, connectTimeout: 30_000 }));

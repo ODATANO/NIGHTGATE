@@ -171,7 +171,7 @@ describe('wallet-worker-client', () => {
     describe('rotation', () => {
         it('a WORKER_ROTATING refusal marks the worker draining; the call is retried on the respawn', async () => {
             defaultResponder = () => ({ ok: true, result: { evicted: true } });
-            const w1 = await startWithResponder((msg) => {
+            const w1 = await startWithResponder(() => {
                 // the worker refuses on the call port; its `rotating` announcement and exit follow
                 setImmediate(() => { w1.emit('message', { kind: 'rotating', generations: 32, inflight: 0 }); w1.emit('exit', 0); });
                 return { ok: false, error: { name: 'WORKER_ROTATING', message: 'rotating' } };

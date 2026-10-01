@@ -16,8 +16,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(__dirname, '..');
-const artifactPath = path.join(repoRoot,
-    'contracts/attestation-vault/src/managed/attestation-vault/contract/index.js');
+const artifactPath = (await import('@odatano/contract-kit/node')).resolveContractPackage('@odatano/contract-attestation-vault', repoRoot).artifactPath;
 
 let failures = 0;
 function ok(name, value, detail) {

@@ -29,6 +29,10 @@ export function accountDekBinding(accountId: string): EnvelopeBinding {
 }
 
 /** `AccountKeys.wrappedDekByViewingKey` outer envelope, subject = the account id. */
+export function holderDisclosureContentBinding(grantId: string): EnvelopeBinding {
+    return { purpose: 'holder-disclosure/content', subject: grantId };
+}
+
 export function accountDekViewingKeySealBinding(accountId: string): EnvelopeBinding {
     return { purpose: 'account-key/viewing-key-seal', subject: String(accountId) };
 }

@@ -173,9 +173,10 @@ function readRuntimeStatus(): { mode?: string; lastError?: string; initialized?:
 
 /** Pool gauges summed over the database service's pools (one per tenant); null when none. */
 export function dbPoolGauges(db: unknown): { size: number; available: number; borrowed: number; pending: number } | null {
-    const pools = (db as any)?.pools;
+    const pools = (db as { pools?: unknown } | null | undefined)?.pools;
     if (!pools || typeof pools !== 'object') return null;
-    const list = Object.values(pools).filter((p: any) => p && typeof p.size === 'number') as any[];
+    const list = Object.values(pools as Record<string, unknown>)
+        .filter((p): p is Record<string, unknown> => !!p && typeof (p as { size?: unknown }).size === 'number');
     if (list.length === 0) return null;
     const sum = (field: string) => list.reduce((n, p) => n + (Number.isFinite(p[field]) ? Number(p[field]) : 0), 0);
     return { size: sum('size'), available: sum('available'), borrowed: sum('borrowed'), pending: sum('pending') };
@@ -343,6 +344,8 @@ export function buildRuntimeInfo(): Record<string, unknown> {
             // Disk differs from the loaded generation: writes fail until restart.
             digestStale: Boolean(artifactDigest && currentDigest && artifactDigest !== currentDigest),
             digestError,
+            package: registration?.package?.name ?? null,
+            version: registration?.package?.version ?? null,
             slotWidth: slotWidthOf(registration),
             privateStateId: registration?.privateStateId ?? null
         };

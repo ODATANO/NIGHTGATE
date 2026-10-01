@@ -517,3 +517,8 @@ export declare function chooseSwapCoin<C extends SwapCoin>(coins: readonly C[], 
 
 /** A shielded wallet for swapping: it syncs the shielded coins of the seed and nothing else. */
 export declare function createSwapWallet(opts: CreateSwapWalletInput): Promise<SwapWallet>;
+
+/** The holder-registry circuits, for `ensureZkAssets({ circuits })`. */
+export declare const HOLDER_REGISTRY_CIRCUITS: readonly ['registerHolder', 'unregisterHolder'];
+/** blake2b-256 over `nightgate/holder-claim/v1` and the 32-byte secret (64 hex): the `claim_key` of `registerHolder`. */
+export declare function holderClaimKey(claimSecretHex: string): string;

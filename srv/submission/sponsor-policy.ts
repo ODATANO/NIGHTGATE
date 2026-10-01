@@ -7,6 +7,8 @@ import fs from 'node:fs';
 import cds from '@sap/cds';
 import { configList, configFlag, configString, configIsSet } from '../utils/config';
 import { NightgateError } from '../utils/errors';
+import { HEX64_RE } from '../utils/hex';
+import { sharedLearnedTokenTypes } from './learned-token-types';
 
 const log = cds.log('nightgate:sponsor-policy');
 
@@ -26,8 +28,12 @@ export interface SponsorPolicy {
     allowContractMints?: boolean;
     /** Sponsor shielded swaps handed over as two halves; floor and (for a token caller) grant must both allow it. */
     allowSwaps?: boolean;
+    /** Types minted under any grant of this platform count as listed for every grant (needs `allowContractMints`). */
+    shareMintedTokenTypes?: boolean;
     /** Types minted under the grant: part of `allowedTokenTypes`, listed or not. */
     ownTokenTypes?: string[];
+    /** Types learned platform-wide that are part of `allowedTokenTypes`. */
+    sharedTokenTypes?: string[];
 }
 
 export interface GrantPolicyInput {
@@ -97,7 +103,8 @@ function envPolicy(): SponsorPolicy {
         allowDeploy: configFlag('NIGHTGATE_SPONSOR_ALLOW_DEPLOY'),
         allowedTokenTypes,
         allowContractMints: configFlag('NIGHTGATE_SPONSOR_ALLOW_CONTRACT_MINTS'),
-        allowSwaps: configFlag('NIGHTGATE_SPONSOR_ALLOW_SWAPS')
+        allowSwaps: configFlag('NIGHTGATE_SPONSOR_ALLOW_SWAPS'),
+        shareMintedTokenTypes: configFlag('NIGHTGATE_SPONSOR_SHARE_MINTED_TOKEN_TYPES')
     };
 }
 
@@ -133,7 +140,7 @@ function readPolicyFile(filePath: string): SponsorPolicy {
     }
     const unknownKeys = Object.keys(parsed).filter(k => !POLICY_FILE_KEYS.includes(k));
     if (unknownKeys.length) throw new Error(`policy file has unknown keys: ${unknownKeys.join(', ')}`);
-    for (const flag of ['allowDeploy', 'allowContractMints', 'allowSwaps']) {
+    for (const flag of ['allowDeploy', 'allowContractMints', 'allowSwaps', 'shareMintedTokenTypes']) {
         if (parsed[flag] !== undefined && typeof parsed[flag] !== 'boolean') throw new Error(`${flag} must be a boolean`);
     }
     return {
@@ -142,16 +149,18 @@ function readPolicyFile(filePath: string): SponsorPolicy {
         allowDeploy: parsed.allowDeploy === true,
         allowedTokenTypes: validateTokenTypeList('allowedTokenTypes', parsed.allowedTokenTypes),
         allowContractMints: parsed.allowContractMints === true,
-        allowSwaps: parsed.allowSwaps === true
+        allowSwaps: parsed.allowSwaps === true,
+        shareMintedTokenTypes: parsed.shareMintedTokenTypes === true
     };
 }
 
-const POLICY_FILE_KEYS = ['allowedContracts', 'allowedCircuits', 'allowDeploy', 'allowedTokenTypes', 'allowContractMints', 'allowSwaps'];
+const POLICY_FILE_KEYS = ['allowedContracts', 'allowedCircuits', 'allowDeploy', 'allowedTokenTypes', 'allowContractMints', 'allowSwaps', 'shareMintedTokenTypes'];
 
 /** Env settings the policy file replaces while it is set. */
 const SHADOWED_ENV_KEYS = [
     'NIGHTGATE_SPONSOR_ALLOWED_CONTRACTS', 'NIGHTGATE_SPONSOR_ALLOWED_CIRCUITS', 'NIGHTGATE_SPONSOR_ALLOWED_TOKEN_TYPES',
-    'NIGHTGATE_SPONSOR_ALLOW_DEPLOY', 'NIGHTGATE_SPONSOR_ALLOW_CONTRACT_MINTS', 'NIGHTGATE_SPONSOR_ALLOW_SWAPS'
+    'NIGHTGATE_SPONSOR_ALLOW_DEPLOY', 'NIGHTGATE_SPONSOR_ALLOW_CONTRACT_MINTS', 'NIGHTGATE_SPONSOR_ALLOW_SWAPS',
+    'NIGHTGATE_SPONSOR_SHARE_MINTED_TOKEN_TYPES'
 ];
 let shadowedEnvLogged = false;
 
@@ -204,7 +213,8 @@ export function getGlobalSponsorPolicy(): SponsorPolicy {
             (policy.allowedCircuits.length === 0 ? ' (circuits unrestricted)' : '') +
             `, ${policy.allowedTokenTypes?.length ?? 0} token type(s)` +
             (policy.allowContractMints ? ', contract mints sponsored' : '') +
-            (policy.allowSwaps ? ', swaps sponsored' : ''));
+            (policy.allowSwaps ? ', swaps sponsored' : '') +
+            (policy.shareMintedTokenTypes ? ', minted types shared' : ''));
         return policy;
     } catch (e) {
         log.error(`sponsor policy file ${filePath} is invalid (${String((e as Error)?.message ?? e)}); ` +
@@ -237,8 +247,12 @@ function intersect(floor: string[], grant: string[] | null | undefined, what: st
     return both;
 }
 
-/** The floor narrowed by the grant; an empty intersection throws before a job exists. */
-export function effectiveSponsorPolicy(floor: SponsorPolicy, grant?: GrantPolicyInput | null): SponsorPolicy {
+/**
+ * The floor narrowed by the grant; an empty intersection throws before a job exists.
+ * `shared` = the platform's learned types; they join the floor's token list while the
+ * floor shares minted types, so a grant inherits them or narrows to them.
+ */
+export function effectiveSponsorPolicy(floor: SponsorPolicy, grant?: GrantPolicyInput | null, shared: string[] = sharedLearnedTokenTypes()): SponsorPolicy {
     const contracts = intersect(floor.allowedContracts, grant?.allowedContracts, 'allowedContracts');
     // Deployed addresses join after the intersection; an empty (unrestricted) list stays empty.
     const deployed = [...new Set((grant?.deployedContracts ?? []).filter(a => typeof a === 'string' && a.length > 0))];
@@ -247,12 +261,14 @@ export function effectiveSponsorPolicy(floor: SponsorPolicy, grant?: GrantPolicy
         : [...contracts, ...deployed.filter(a => !contracts.includes(a))];
     // An empty token list means no offers at all, so an empty intersection
     // narrows to that instead of stopping the grant's other calls.
-    const floorTokens = floor.allowedTokenTypes ?? [];
+    const sharing = floor.allowContractMints === true && floor.shareMintedTokenTypes === true;
+    const sharedTypes = sharing ? [...new Set(shared.filter(t => typeof t === 'string' && HEX64_RE.test(t)))] : [];
+    const floorTokens = floorTokenTypes(floor, sharedTypes);
     const grantTokens = (grant?.allowedTokenTypes ?? []).filter(t => typeof t === 'string' && t.length > 0);
     const listed = grantTokens.length === 0 ? floorTokens : grantTokens.filter(t => floorTokens.includes(t));
     // What the grant minted joins after the intersection, like its deployed contracts.
     const minted = floor.allowContractMints === true
-        ? [...new Set((grant?.mintedTokenTypes ?? []).filter(t => typeof t === 'string' && /^[0-9a-f]{64}$/.test(t)))]
+        ? [...new Set((grant?.mintedTokenTypes ?? []).filter(t => typeof t === 'string' && HEX64_RE.test(t)))]
         : [];
     return {
         allowedContracts: withDeployed,
@@ -260,24 +276,33 @@ export function effectiveSponsorPolicy(floor: SponsorPolicy, grant?: GrantPolicy
         allowedTokenTypes: [...listed, ...minted.filter(t => !listed.includes(t))],
         allowContractMints: floor.allowContractMints === true,
         allowSwaps: floor.allowSwaps === true && (grant ? grant.allowSwaps === true : true),
+        shareMintedTokenTypes: sharing,
         ...(minted.length ? { ownTokenTypes: minted } : {}),
+        ...(sharedTypes.length ? { sharedTokenTypes: sharedTypes } : {}),
         allowDeploy: floor.allowDeploy === true && (grant ? grant.allowDeploy === true : true),
         ...(deployed.length ? { ownContracts: deployed } : {})
     };
+}
+
+/** The floor's listed types plus the shared learned ones. */
+function floorTokenTypes(floor: SponsorPolicy, sharedTypes: string[]): string[] {
+    const listed = floor.allowedTokenTypes ?? [];
+    return sharedTypes.length ? [...listed, ...sharedTypes.filter(t => !listed.includes(t))] : listed;
 }
 
 /**
  * Why a grant's lists cannot work under the floor, or null. For the write of a
  * grant; the check at sponsor time stays, since the floor can shrink later.
  */
-export function grantPolicyConflict(floor: SponsorPolicy, grant: GrantPolicyInput): string | null {
+export function grantPolicyConflict(floor: SponsorPolicy, grant: GrantPolicyInput, shared: string[] = sharedLearnedTokenTypes()): string | null {
+    let effective: SponsorPolicy;
     try {
-        effectiveSponsorPolicy(floor, grant);
+        effective = effectiveSponsorPolicy(floor, grant, shared);
     } catch (e) {
         if (e instanceof SponsorPolicyEmptyError) return e.message;
         throw e;
     }
-    const floorTokens = floor.allowedTokenTypes ?? [];
+    const floorTokens = floorTokenTypes(floor, effective.sharedTokenTypes ?? []);
     const outside = (grant.allowedTokenTypes ?? []).filter(t => !floorTokens.includes(t));
     if (outside.length === 0) return null;
     return `allowedTokenTypes ${outside.join(', ')} ${outside.length === 1 ? 'is' : 'are'} not in the platform's sponsor token-type allow-list` +
@@ -320,5 +345,5 @@ export function describeGlobalSponsorPolicy(): SponsorPolicyDescription {
 /** For the OData handlers: the current floor, narrowed by `req.agentGrant`. */
 export function resolveSponsorPolicyForRequest(req: { agentGrant?: GrantPolicyInput | null }): SponsorPolicy {
     const grant = req?.agentGrant as GrantPolicyInput | undefined;
-    return effectiveSponsorPolicy(getGlobalSponsorPolicy(), grant);
+    return effectiveSponsorPolicy(getGlobalSponsorPolicy(), grant, sharedLearnedTokenTypes());
 }

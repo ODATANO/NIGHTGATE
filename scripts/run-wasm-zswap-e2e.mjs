@@ -2,7 +2,7 @@
 //
 // NIGHT is unshielded-only, so no NIGHT flow can ever exercise the zswap
 // prover circuits. This runner creates the missing shielded funds itself:
-//   1. deploy contracts/shielded-token (mint circuit, compiled artifact)
+//   1. deploy @odatano/contract-shielded-token (mint circuit, compiled artifact)
 //   2. submitContractCall mint() → 100000000 atoms of the contract's
 //      shielded token to the caller's own zswap public key
 //   3. wait for the wallet to sync the minted coin, then

@@ -12,6 +12,11 @@ vi.mock('@sap/cds', () => {
     cds.default = cds;
     return cds;
 });
+// The platform's learned types, as the policy resolution reads them.
+const learned = vi.hoisted(() => ({ types: [] as string[] }));
+vi.mock('../../srv/submission/learned-token-types', () => ({
+    sharedLearnedTokenTypes: () => learned.types
+}));
 
 import {
     validatePolicyList,
@@ -29,11 +34,12 @@ import {
 } from '../../srv/submission/sponsor-policy';
 
 const ENV_KEYS = ['NIGHTGATE_SPONSOR_ALLOWED_CONTRACTS', 'NIGHTGATE_SPONSOR_ALLOWED_CIRCUITS', 'NIGHTGATE_SPONSOR_POLICY_FILE', 'NIGHTGATE_SPONSOR_ALLOWED_TOKEN_TYPES',
-    'NIGHTGATE_SPONSOR_ALLOW_CONTRACT_MINTS', 'NIGHTGATE_SPONSOR_ALLOW_DEPLOY', 'NIGHTGATE_SPONSOR_ALLOW_SWAPS'];
+    'NIGHTGATE_SPONSOR_ALLOW_CONTRACT_MINTS', 'NIGHTGATE_SPONSOR_ALLOW_DEPLOY', 'NIGHTGATE_SPONSOR_ALLOW_SWAPS', 'NIGHTGATE_SPONSOR_SHARE_MINTED_TOKEN_TYPES'];
 let tmpDir: string;
 
 beforeEach(() => {
     for (const k of ENV_KEYS) delete process.env[k];
+    learned.types = [];
     __resetSponsorPolicyForTests();
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'nightgate-policy-'));
 });
@@ -396,6 +402,62 @@ describe('allowSwaps: floor AND the grant action', () => {
         expect(effectiveSponsorPolicy(open).allowSwaps).toBe(true);
         expect(effectiveSponsorPolicy(open, { allowedContracts: ['A'] }).allowSwaps).toBe(false);
         expect(effectiveSponsorPolicy(open, { allowSwaps: true }).allowSwaps).toBe(true);
+    });
+});
+
+describe('shareMintedTokenTypes: learned types count for every grant', () => {
+    const T1 = 'ab'.repeat(32);
+    const L1 = 'cd'.repeat(32);
+    const L2 = 'ef'.repeat(32);
+    const floor = { allowedContracts: [], allowedCircuits: [], allowedTokenTypes: [T1], allowContractMints: true, shareMintedTokenTypes: true };
+
+    it('is off by default and read from env and from the policy file', () => {
+        expect(getGlobalSponsorPolicy().shareMintedTokenTypes).toBe(false);
+        process.env.NIGHTGATE_SPONSOR_SHARE_MINTED_TOKEN_TYPES = 'true';
+        expect(getGlobalSponsorPolicy().shareMintedTokenTypes).toBe(true);
+        delete process.env.NIGHTGATE_SPONSOR_SHARE_MINTED_TOKEN_TYPES;
+
+        const file = path.join(tmpDir, 'policy.json');
+        fs.writeFileSync(file, JSON.stringify({ shareMintedTokenTypes: true }));
+        process.env.NIGHTGATE_SPONSOR_POLICY_FILE = file;
+        expect(getGlobalSponsorPolicy().shareMintedTokenTypes).toBe(true);
+        fs.writeFileSync(file, JSON.stringify({ shareMintedTokenTypes: 'yes' }));
+        __resetSponsorPolicyForTests();
+        expect(() => getGlobalSponsorPolicy()).toThrow(SponsorPolicyUnavailableError);
+    });
+
+    it('joins the floor list for a grant without a list and lets a grant narrow to a learned type', () => {
+        const inherited = effectiveSponsorPolicy(floor, {}, [L1, L2, L1, 'junk']);
+        expect(inherited).toMatchObject({ allowedTokenTypes: [T1, L1, L2], sharedTokenTypes: [L1, L2], shareMintedTokenTypes: true });
+        expect(effectiveSponsorPolicy(floor, { allowedTokenTypes: [L2] }, [L1, L2]).allowedTokenTypes).toEqual([L2]);
+        // the grant's own mints still join after the intersection, once
+        expect(effectiveSponsorPolicy(floor, { allowedTokenTypes: [L2], mintedTokenTypes: [L1] }, [L1, L2]).allowedTokenTypes).toEqual([L2, L1]);
+        expect(effectiveSponsorPolicy(floor, undefined, [L1]).allowedTokenTypes).toEqual([T1, L1]);
+    });
+
+    it('needs both platform switches', () => {
+        expect(effectiveSponsorPolicy({ ...floor, shareMintedTokenTypes: false }, {}, [L1])).toMatchObject({ allowedTokenTypes: [T1], shareMintedTokenTypes: false });
+        expect(effectiveSponsorPolicy({ ...floor, shareMintedTokenTypes: false }, {}, [L1]).sharedTokenTypes).toBeUndefined();
+        expect(effectiveSponsorPolicy({ ...floor, allowContractMints: false }, {}, [L1]).allowedTokenTypes).toEqual([T1]);
+    });
+
+    it('resolves per request with the learned types of the platform', () => {
+        process.env.NIGHTGATE_SPONSOR_ALLOWED_TOKEN_TYPES = T1;
+        process.env.NIGHTGATE_SPONSOR_ALLOW_CONTRACT_MINTS = 'true';
+        process.env.NIGHTGATE_SPONSOR_SHARE_MINTED_TOKEN_TYPES = 'true';
+        learned.types = [L1];
+        expect(resolveSponsorPolicyForRequest({ agentGrant: null }).allowedTokenTypes).toEqual([T1, L1]);
+        expect(resolveSponsorPolicyForRequest({ agentGrant: { allowedTokenTypes: [L1] } }).allowedTokenTypes).toEqual([L1]);
+        delete process.env.NIGHTGATE_SPONSOR_SHARE_MINTED_TOKEN_TYPES;
+        __resetSponsorPolicyForTests();
+        expect(resolveSponsorPolicyForRequest({ agentGrant: null }).allowedTokenTypes).toEqual([T1]);
+    });
+
+    it('a grant may list a learned type while sharing is on, and not otherwise', () => {
+        expect(grantPolicyConflict(floor, { allowedTokenTypes: [L1] }, [L1])).toBeNull();
+        expect(grantPolicyConflict({ ...floor, shareMintedTokenTypes: false }, { allowedTokenTypes: [L1] }, [L1])).toMatch(/not in the platform's sponsor token-type allow-list/);
+        learned.types = [L1];
+        expect(grantPolicyConflict(floor, { allowedTokenTypes: [L1] })).toBeNull();
     });
 });
 

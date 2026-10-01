@@ -1,6 +1,6 @@
 {
   "name": "@odatano/nightgate",
-  "version": "0.29.2",
+  "version": "0.30.0",
   "description": "CAP Plugin: Midnight Blockchain Indexer with OData V4 API",
   "homepage": "https://github.com/ODATANO/NIGHTGATE#readme",
   "repository": {
@@ -66,14 +66,14 @@
       "default": "./src/browser/providers.mjs"
     },
     "./browser/attestation-vault": {
-      "types": "./contracts/attestation-vault/src/managed/attestation-vault/contract/index.d.ts",
-      "import": "./contracts/attestation-vault/src/managed/attestation-vault/contract/index.js",
-      "default": "./contracts/attestation-vault/src/managed/attestation-vault/contract/index.js"
+      "types": "./src/browser/attestation-vault.d.mts",
+      "import": "./src/browser/attestation-vault.mjs",
+      "default": "./src/browser/attestation-vault.mjs"
     },
     "./browser/attestation-vault-32": {
-      "types": "./contracts/attestation-vault-32/src/managed/attestation-vault-32/contract/index.d.ts",
-      "import": "./contracts/attestation-vault-32/src/managed/attestation-vault-32/contract/index.js",
-      "default": "./contracts/attestation-vault-32/src/managed/attestation-vault-32/contract/index.js"
+      "types": "./src/browser/attestation-vault-32.d.mts",
+      "import": "./src/browser/attestation-vault-32.mjs",
+      "default": "./src/browser/attestation-vault-32.mjs"
     },
     "./txbuilder": {
       "types": "./src/txbuilder/index.d.ts",
@@ -105,19 +105,6 @@
     "srv/**/*.d.ts",
     "@cds-models/**/*.js",
     "@cds-models/**/*.d.ts",
-    "contracts/counter/src/managed/**/*",
-    "contracts/counter/src/*.compact",
-    "contracts/counter/package.json",
-    "contracts/attestation-vault/src/managed/**/*",
-    "contracts/attestation-vault/src/*.compact",
-    "contracts/attestation-vault/package.json",
-    "contracts/attestation-vault-32/src/managed/**/*",
-    "contracts/attestation-vault-32/src/*.compact",
-    "contracts/attestation-vault-32/package.json",
-    "contracts/shielded-token/src/managed/**/*",
-    "contracts/shielded-token/src/*.compact",
-    "contracts/shielded-token/package.json",
-    "!contracts/**/*.prover",
     "scripts/apply-schema-delta.mjs",
     "scripts/check-server.mjs",
     "scripts/fetch-contract-keys.mjs",
@@ -164,15 +151,11 @@
     "integration:contract-registry": "node scripts/integration-test-contract-registry.mjs",
     "integration:connector-routes": "node scripts/integration-test-connector-routes.mjs",
     "check:browser": "node scripts/check-browser-bundle.mjs",
-    "check:vault-parity": "node scripts/check-vault-parity.mjs",
     "check:exports": "node scripts/check-package-exports.mjs",
-    "keys:manifest": "node scripts/write-key-manifest.mjs",
-    "keys:manifest:check": "node scripts/write-key-manifest.mjs --check --require-keys",
     "check:browser-types": "node scripts/check-browser-types.mjs",
     "check:job-idempotency": "node scripts/check-job-idempotency.mjs",
     "check:server": "node --env-file=.env scripts/check-server.mjs",
     "check:server:hosted": "node --env-file=.env scripts/check-server.mjs https://api.nightgate.dev",
-    "test:contract": "vitest run test/integration/attestation-vault --coverage.enabled=false",
     "integration:schema-delta": "node scripts/integration-test-schema-delta.mjs",
     "integration:postgres": "node scripts/integration-test-postgres.mjs",
     "deploy:e2e": "node --env-file=.env scripts/run-deploy-e2e.mjs",
@@ -189,7 +172,7 @@
     "wasm-zswap:e2e": "node --env-file=.env scripts/run-wasm-zswap-e2e.mjs",
     "test:pg-idempotency": "node scripts/test-postgres-idempotency.mjs",
     "lint": "eslint .",
-    "check:release": "npm run build && npm run lint && npm run typecheck && npm test && npm run integration:schema-delta && npm run check:vault-parity && npm run check:browser && npm run check:browser-types && npm run check:slim && npm run check:exports",
+    "check:release": "npm run build && npm run lint && npm run typecheck && npm test && npm run integration:schema-delta && npm run check:browser && npm run check:browser-types && npm run check:slim && npm run check:exports",
     "check:release:full": "npm run check:release && npm run integration:postgres",
     "prepack": "npm run build:plugin",
     "prepublishOnly": "npm run check:release && npm run build:plugin",
@@ -230,6 +213,13 @@
     "@midnightntwrk/wallet-sdk-unshielded-wallet": "^3.1.0",
     "@noble/hashes": "^1.8.0",
     "@odatano/cap-auth": "^0.1.0",
+    "@odatano/contract-attestation-vault": "0.1.0",
+    "@odatano/contract-attestation-vault-32": "0.1.0",
+    "@odatano/contract-counter": "0.1.0",
+    "@odatano/contract-holder-registry": "0.1.0",
+    "@odatano/contract-kit": "0.1.0",
+    "@odatano/contract-shielded-token": "0.1.0",
+    "@odatano/contract-token-factory": "0.1.0",
     "@polkadot/types": "^16.5.6",
     "@scure/base": "^2.2.0",
     "bip39": "^3.1.0",
@@ -284,25 +274,22 @@
       "nightgate": {
         "contracts": {
           "counter": {
-            "artifactPath": "contracts/counter/src/managed/counter/contract/index.js",
-            "privateStateId": "counterPrivateState",
-            "zkConfigPath": "contracts/counter/src/managed/counter"
+            "package": "@odatano/contract-counter"
           },
           "attestation-vault": {
-            "artifactPath": "contracts/attestation-vault/src/managed/attestation-vault/contract/index.js",
-            "privateStateId": "attestationVaultPrivateState",
-            "zkConfigPath": "contracts/attestation-vault/src/managed/attestation-vault"
+            "package": "@odatano/contract-attestation-vault"
           },
           "attestation-vault-32": {
-            "artifactPath": "contracts/attestation-vault-32/src/managed/attestation-vault-32/contract/index.js",
-            "privateStateId": "attestationVaultPrivateState",
-            "zkConfigPath": "contracts/attestation-vault-32/src/managed/attestation-vault-32",
-            "slotWidth": 32
+            "package": "@odatano/contract-attestation-vault-32"
           },
           "shielded-token": {
-            "artifactPath": "contracts/shielded-token/src/managed/shielded-token/contract/index.js",
-            "privateStateId": "shieldedTokenPrivateState",
-            "zkConfigPath": "contracts/shielded-token/src/managed/shielded-token"
+            "package": "@odatano/contract-shielded-token"
+          },
+          "holder-registry": {
+            "package": "@odatano/contract-holder-registry"
+          },
+          "token-factory": {
+            "package": "@odatano/contract-token-factory"
           }
         }
       }

@@ -23,7 +23,7 @@ vi.mock('../../srv/midnight/providers', () => ({
 // returns a predictable jobId so connectWalletForSigning's return-shape
 // assertions can be deterministic. The stub also records the work fn so a
 // test can drive it explicitly if needed.
-const mockStartJob = vi.hoisted(() => (vi.fn(async (args: any) => ({ jobId: 'job-prewarm-test', status: 'pending' as const }))));
+const mockStartJob = vi.hoisted(() => (vi.fn(async (_args: Record<string, unknown>) => ({ jobId: 'job-prewarm-test', status: 'pending' as const }))));
 vi.mock('../../srv/submission/background-jobs', () => ({
     startJob: (...args: unknown[]) => (mockStartJob as any)(...args),
     registerBackgroundJobProcessor: vi.fn(),

@@ -15,6 +15,7 @@ import type { NightgateRequest } from '../../utils/request-types';
 import { sponsorRateLimiter, facadeConfigFromEnv, rejectIfMainnetBlocked, checkRate, runSubmission } from './common';
 import { NightgateError } from '../../utils/errors';
 import { transactionBytesOf } from '../../utils/offer-file';
+import { expireSwapOffers, isSwapOfferOpen, loadSwapOffer } from '../swap-offers';
 import type { SubmissionContext } from './context';
 
 export function registerSponsoringActions(ctx: Pick<SubmissionContext, 'srv' | 'db'>): void {
@@ -120,9 +121,19 @@ export function registerSponsoringActions(ctx: Pick<SubmissionContext, 'srv' | '
 
     // A shielded swap as two proven, unbound halves; checked and merged in the worker.
     srv.on('sponsorSwap', async (req: NightgateRequest) => {
-        const { makerHalfB64, takerHalfB64, sponsorSessionId, idempotencyKey } = req.data as {
-            makerHalfB64?: string; takerHalfB64?: string; sponsorSessionId?: string; idempotencyKey?: string;
+        const { takerHalfB64, sponsorSessionId, idempotencyKey, offerId } = req.data as {
+            makerHalfB64?: string; takerHalfB64?: string; sponsorSessionId?: string; idempotencyKey?: string; offerId?: string;
         };
+        let makerHalfB64 = req.data.makerHalfB64 as string | undefined;
+        if (offerId && makerHalfB64) return req.reject(400, 'makerHalfB64 and offerId: one or the other');
+        if (offerId) {
+            // The board's half is the maker half; a closed offer is refused before anything is parsed.
+            await expireSwapOffers(db);
+            const row = await loadSwapOffer(db, String(offerId));
+            if (!row) return req.reject(404, 'swap offer not found');
+            if (!isSwapOfferOpen(row)) return req.reject(409, `swap offer is ${row.status === 'open' ? 'expired' : row.status}`);
+            makerHalfB64 = row.offer;
+        }
         if (!makerHalfB64) return req.reject(400, 'makerHalfB64 is required');
         if (!takerHalfB64) return req.reject(400, 'takerHalfB64 is required');
         // An offer file is checked and unpacked here; the job carries base64 either way.
@@ -167,7 +178,7 @@ export function registerSponsoringActions(ctx: Pick<SubmissionContext, 'srv' | '
                 },
                 requestedBy: req.user?.id,
                 grantId: req.agentGrant?.ID, commandVersion: 1, encryptCommand: true,
-                command: { op: 'sponsorUnbound', swap: halves, sponsorSessionId: effectiveSponsor, grantId }
+                command: { op: 'sponsorUnbound', swap: { ...halves, ...(offerId ? { offerId: String(offerId) } : {}) }, sponsorSessionId: effectiveSponsor, grantId }
             });
             return { ...job, sessionId: effectiveSponsor };
         });

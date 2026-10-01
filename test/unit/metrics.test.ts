@@ -5,7 +5,6 @@
  */
 
 const mockDbRun = vi.hoisted(() => (vi.fn()));
-const mockSuperInit = vi.fn().mockResolvedValue(undefined);
 const mockDbConnect = vi.hoisted(() => (vi.fn().mockResolvedValue({ run: mockDbRun })));
 
 // Track registered handlers

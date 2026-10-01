@@ -245,6 +245,60 @@ entity AgentGrants : cuid, managed {
 }
 
 /**
+ * Open maker halves of shielded swaps, posted for takers to find. Intent only:
+ * value moves in the swap the parties built. `status`: open | filled | retired | expired.
+ */
+entity SwapOffers : cuid, managed {
+    offer         : LargeString not null; // the maker half as handed in (offer file or base64)
+    givesType     : HexEncoded not null;
+    givesAmount   : String(40) not null; // atoms, decimal
+    wantsType     : HexEncoded not null;
+    wantsAmount   : String(40) not null;
+    bound         : Boolean not null;
+    inputs        : Integer;
+    nullifiers    : LargeString not null; // JSON array; the half is spent once one of them lands
+    tags          : LargeString; // JSON array of strings
+    status        : String(10) not null default 'open';
+    expiresAt     : Timestamp;
+    posterUserId  : String(200) not null;
+    posterGrantId : UUID; // the grant that posted it; null for an operator
+    sessionId     : UUID; // the token's session when posted under a grant
+    filledTxHash  : HexEncoded;
+    closedAt      : Timestamp;
+}
+
+/**
+ * A document's text bound to a shielded token type: whoever proves a registered
+ * holding of the type on the named holder-registry deployment reads it.
+ * `content` is encrypted at rest under the server key; `contentHashKind` says
+ * which digest of the text equals `payloadHash`.
+ */
+entity HolderDisclosureGrants : cuid, managed {
+    payloadHash     : HexEncoded not null;
+    tokenType       : HexEncoded not null;
+    registryAddress : HexEncoded not null;
+    grantorUserId   : String(200) not null;
+    grantorGrantId  : UUID;
+    contentType     : String(100);
+    contentHashKind : String(20); // 'blake2b-256' | 'sha256'
+    content         : LargeString; // encrypted envelope
+    expiresAt       : Timestamp;
+    active          : Boolean default true;
+    revokedAt       : Timestamp;
+}
+
+/**
+ * Raw shielded token types that sponsored calls on this platform minted. With the
+ * floor's `shareMintedTokenTypes` they count as listed for every grant.
+ */
+entity LearnedTokenTypes : managed {
+    key tokenType        : HexEncoded; // 64 hex
+        grantId          : UUID; // grant of the first landed mint; null = no grant
+        sponsorSessionId : String(64);
+        txHash           : HexEncoded;
+}
+
+/**
  * Runtime contract registrations on top of the config floor; never shadow a
  * config name. Absolute paths inside NIGHTGATE_CONTRACTS_DIR.
  */

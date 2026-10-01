@@ -209,6 +209,7 @@ export function withOrderedBatchSegments(
                     'aborting before proving (nothing submitted) because the deterministic apply order cannot be guaranteed'
                 );
             }
+            // eslint-disable-next-line no-console -- shipped in the slim txbuilder, which has no logger
             console.log(`[nightgate:batch-segments] rewrite${opts.independentCalls ? ' (stage-grouped)' : ''}: ${before} -> ${describeBatchSegments(tx)}`);
             const violation = findCausalityViolation(tx);
             if (violation) {
@@ -233,6 +234,7 @@ export function withObservedBatchSegments(
 ): any {
     const wrapped = Object.create(proofProvider);
     wrapped.proveTx = async (tx: any, ...rest: unknown[]) => {
+        // eslint-disable-next-line no-console -- shipped in the slim txbuilder, which has no logger
         console.log(`[nightgate:batch-segments] OBSERVE (no rewrite) for [${circuitsInOrder.join('+')}]: ${describeBatchSegments(tx)}`);
         return proofProvider.proveTx(tx, ...rest);
     };

@@ -26,7 +26,6 @@ import type { DbRunner } from '../utils/db-types';
 import { NightgateError } from '../utils/errors';
 
 const log = cds.log('nightgate:contracts');
-const PACKAGE_ROOT = path.resolve(__dirname, '..', '..');
 
 export class ContractRegistrationError extends NightgateError {
     constructor(status: number, message: string) {
@@ -61,7 +60,7 @@ export function allowedContractRoots(): string[] {
     const raw = configString('NIGHTGATE_CONTRACTS_DIR');
     const roots = raw
         ? raw.split(path.delimiter).map(s => s.trim()).filter(Boolean)
-        : [path.join(PACKAGE_ROOT, 'contracts'), path.join(process.cwd(), 'contracts')];
+        : [path.join(process.cwd(), 'contracts')];
     const canonical = roots.map(r => {
         const abs = path.resolve(r);
         try { return fs.realpathSync(abs); } catch { return abs; }

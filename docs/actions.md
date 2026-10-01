@@ -285,7 +285,7 @@ Invalid hex, a wrong `Bytes<N>` length or a non-integer/negative `Uint` is a
 
 ### `mintShieldedTestToken(contractAddress, sessionId, compiledArtifactRef?, idempotencyKey?, sponsorSessionId?) → { jobId, status }`
 
-Mint the bundled `contracts/shielded-token` test token to the caller's zswap
+Mint the `shielded-token` lineage's test token (`@odatano/contract-shielded-token`) to the caller's zswap
 public key (exercises the zswap circuits, which NIGHT never touches).
 `compiledArtifactRef` accepts only `shielded-token` (or omit it): the result
 carries this fixture's separator and amount. Other minting contracts use
@@ -351,7 +351,12 @@ contract address, the contract has to be sponsorable, and the offer may create
 at most the declared amount. A landed mint under a grant records the type on
 the grant (`mintedTokenTypes`); such a type counts as listed for that grant
 while the switch is on, so a later payment or swap in it needs no entry
-either. The allow-list bounds which calls are paid:
+either. With `NIGHTGATE_SPONSOR_SHARE_MINTED_TOKEN_TYPES` (policy file
+`shareMintedTokenTypes`) every type a landed sponsored mint created counts as
+listed for every grant of the platform (table `LearnedTokenTypes`, admin
+projection of the same name): the issuer mints under one key, the buyer swaps
+under another. A grant may still narrow to a subset with `allowedTokenTypes`.
+The allow-list bounds which calls are paid:
 
 ```bash
 NIGHTGATE_SPONSOR_ALLOWED_CONTRACTS=<vault addr>,<other addr>
@@ -403,7 +408,7 @@ reach this endpoint can make you pay fees.
 - **Policy file (platform floor).** `NIGHTGATE_SPONSOR_POLICY_FILE` = JSON
   `{ "allowedContracts": [...], "allowedCircuits": [...], "allowDeploy": false,
   "allowedTokenTypes": [...], "allowContractMints": false, "allowSwaps":
-  false }`, re-read per
+  false, "shareMintedTokenTypes": false }`, re-read per
   sponsored call (mtime cache), replaces the env settings (a WARN names the
   ones that are set and ignored). Fail-closed: an invalid file keeps the last
   good policy; with none loaded every sponsored call is
@@ -504,7 +509,7 @@ anchors) rebuild (`NIGHTGATE_STALE_TRANSCRIPT_RETRIES`, default 2, after
 `NIGHTGATE_STALE_TRANSCRIPT_BACKOFF_MS`); a sponsored job cannot rebuild the
 caller's bytes and fails with `1010/104`.
 
-### `sponsorSwap(makerHalfB64, takerHalfB64, sponsorSessionId, idempotencyKey?) → { jobId, status, sessionId }`
+### `sponsorSwap(makerHalfB64 | offerId, takerHalfB64, sponsorSessionId, idempotencyKey?) → { jobId, status, sessionId }`
 
 Sponsor a shielded swap that settles without a contract: the maker spends the
 coin it gives and creates the coin it wants, the taker builds the mirror half,
@@ -566,6 +571,40 @@ holds its coins as pending; a half that is never handed over has to be reverted
 in that wallet (`revertTransaction`), or the coins stay unavailable until they
 time out.
 
+`offerId` instead of `makerHalfB64` fills a half from the offer board: a
+closed offer is 409 before anything is parsed, an unknown one 404. A landed
+swap closes the offer it filled and every open offer whose half spent one of
+the same inputs (the input nullifiers travel with the job).
+
+## Offer board
+
+Open maker halves, posted for takers to find. The board stores intent, never
+value: a half is filled or retired whole, nothing is held, matched or priced.
+
+### `postSwapOffer(offer, expiresAt?, tags?) → { offerId, status, bound, givesType, givesAmount, wantsType, wantsAmount, expiresAt }`
+
+`offer` is a maker half as offer file or base64. The worker checks it like a
+sponsored half except for the token allow-list and reads the terms from it
+(a half that carries an intent, a fallible offer, a transient or contract-owned
+coin, or not exactly one type given and one wanted, is `400
+SWAP_OFFER_INVALID`). `expiresAt` at most 90 days ahead; `tags` a JSON array of
+up to 8 strings of up to 40 characters. The offer closes when one of its input
+nullifiers lands in a sponsored swap (`filled`), when `expiresAt` passes
+(`expired`), or when the poster retires it. Grantable (`postSwapOffer`), also
+for a platform-pool grant. **Rate limit:** 60/hour per principal.
+
+### `listSwapOffers(givesType?, wantsType?, tag?, limit?) → [{ offerId, offer, bound, givesType, givesAmount, wantsType, wantsAmount, tags, expiresAt, postedAt }]` (function)
+
+Open offers, newest first; filters are exact (64-hex types), `limit` 1 to 200
+(default 50). Never the poster's identity or the half's nullifiers. Every token
+may read the board; rate limit 600/hour per caller. Call it with all four parameters, `null` for the unused
+ones: `listSwapOffers(givesType=null,wantsType='…',tag=null,limit=20)`.
+
+### `retireSwapOffer(offerId) → { offerId, status }`
+
+Only the poster: the same user, or for a token the same grant. A filled,
+retired or expired offer is `409 SWAP_OFFER_NOT_OPEN`.
+
 ### `anchorDocument(sha256, storageRef, sessionId, contractAddress, contentType?, size?, metadata?, compiledArtifactRef?, idempotencyKey?, sponsorSessionId?) → { jobId, status, documentId, attesterId }`
 
 Anchor a document hash in the vault with ONE `attest` transaction. Only the hash and the caller's `storageRef` (`file://` | `s3://` | `ipfs://`) are stored, **never the bytes**. The `Documents` row (owner, `attesterId`, contract, network, artifact) is inserted at once, so `documentId` returns synchronously; reads are owner-scoped (admins unfiltered). `compiledArtifactRef` defaults to `attestation-vault`.
@@ -604,7 +643,7 @@ Outside a server: `import { buildMembershipSet, membershipPathFor, canonicalSetD
 
 ## ZK predicate attestations
 
-Prove statements about anchored field values without revealing them: numeric predicates against a public threshold, bytes equality against a public digest, set membership in a public allow-list, cross-document integrity and diff. Every claim is root-bound and verified on chain. Contract: [AttestationVault](../contracts/attestation-vault).
+Prove statements about anchored field values without revealing them: numeric predicates against a public threshold, bytes equality against a public digest, set membership in a public allow-list, cross-document integrity and diff. Every claim is root-bound and verified on chain. Contract: [AttestationVault](https://github.com/ODATANO/NIGHTGATE-CONTRACTS/tree/main/packages/attestation-vault).
 
 **The record.** A claim is proven against one attester's record (`recordKey(attesterId, payloadHash)`). `issue*` actions take an optional `attesterId` (cross-root: `attesterIdA`/`attesterIdB`; batch entries `attesterIdB`), default the session's own; a content root can only be anchored under the session's own record. `PredicateAttestations` rows record the attester; the verify functions take the same selector.
 
@@ -664,7 +703,7 @@ Read live contract state (`queryContractState`): no crawler, txHash or server ro
 
 **Public lane.** `NIGHTGATE_PUBLIC_VERIFY=true` serves both functions without credentials at `/api/v1/verify` (`NightgateVerifyService`, same signatures and results): the image admits the path unauthenticated with CORS `*`; a CAP host serves it under `@requires: 'any'`. Off (default): `404 PUBLIC_VERIFY_DISABLED`. Rate limit `NIGHTGATE_PUBLIC_VERIFY_RATE_LIMIT` (default 60/min per client address). Nothing enumerable: every call needs contract, payload and claim coordinates. `verifyDocument` and `verifyPredicateAttestation` stay private (owner-scoped rows).
 
-**Independent verification:** everything these functions check is recomputable from public data: read the vault state from the public indexer, recompute the claim key (`persistentHash` over the tagged claim struct, e.g. bytes equality `{ tag 17, recordKey, contentRoot, schemaId, fieldKey, expectedDigest }` with `recordKey = persistentHash({ tag 21, attesterId, payloadHash })` and root and schema id from `content_anchors`), and look it up in `claims` (value: `valid_until` block time). The Compact source ships in the npm package under `contracts/attestation-vault/src/`.
+**Independent verification:** everything these functions check is recomputable from public data: read the vault state from the public indexer, recompute the claim key (`persistentHash` over the tagged claim struct, e.g. bytes equality `{ tag 17, recordKey, contentRoot, schemaId, fieldKey, expectedDigest }` with `recordKey = persistentHash({ tag 21, attesterId, payloadHash })` and root and schema id from `content_anchors`), and look it up in `claims` (value: `valid_until` block time). The Compact source ships in `@odatano/contract-attestation-vault` under `src/`.
 
 ### `verifyAttestationState(contractAddress, attesterId?, payloadHash?, documentId?, contentRoot?, schemaId?, compiledArtifactRef?, network?) → { verified, attested, contentRootOk, schemaOk, bindingRegistered, attesterId, payloadHash, recordKey, documentId }` (function)
 
@@ -684,7 +723,7 @@ The claim key embeds the record's current anchor (root and schema id; cross-root
 
 ## Disclosure grants
 
-The vault's on-chain disclosure ACL (which grantee holds which tier of a record) plus the document identifier registry (`registerDocument` / `bindDocument` circuits). Grant and revoke are attester-gated, `registerPassport` registrar-gated, both enforced in-circuit. `level`: `0` public, `1` legitimate interest, `2` authority. Only entitlement is on chain; tier-specific cleartext delivery stays off-chain (consumer `after READ` redaction). Contract: [AttestationVault](../contracts/attestation-vault).
+The vault's on-chain disclosure ACL (which grantee holds which tier of a record) plus the document identifier registry (`registerDocument` / `bindDocument` circuits). Grant and revoke are attester-gated, `registerPassport` registrar-gated, both enforced in-circuit. `level`: `0` public, `1` legitimate interest, `2` authority. Only entitlement is on chain; tier-specific cleartext delivery stays off-chain (consumer `after READ` redaction). Contract: [AttestationVault](https://github.com/ODATANO/NIGHTGATE-CONTRACTS/tree/main/packages/attestation-vault).
 
 ### `grantDisclosure(payloadHash, grantee, level, sessionId, contractAddress, compiledArtifactRef?, idempotencyKey?, sponsorSessionId?) → { jobId, status, disclosureGrantId }`
 
@@ -713,6 +752,43 @@ Removes an expired ledger entry via the `retract` circuit; any wallet session ma
 ### `registerGranteeIdentity(bindingInput, scope?) → { ID, granteeId, bindingKind }`
 
 Bind the caller (`req.user.id`) to the `Bytes<32>` grantee id the vault checks, so on-chain grants resolve to this principal. `cds.requires.nightgate.granteeBinding` (default `wallet`) sets what `bindingInput` is: `wallet` the coin public key (hex), `did` a DID, `custom` the 64-hex id. `scope` narrows the binding to one contract or attestation (omit for global). Idempotent on `(userId, scope)`. Proving ownership of the binding input is the consumer's policy.
+
+## Disclosure to token holders
+
+A document's text bound to a shielded token type: whoever holds a token of the
+type reads it, without the issuer learning who. The holding is proven on the
+`holder-registry` contract (`@odatano/contract-holder-registry`): a holder passes one
+coin of the type through `registerHolder(coin, claim_key)` and gets it back in
+the same transaction, so only someone who can spend such a coin registers; the
+chain carries `holderEntry(type, claim_key)`, a hash, never the key. The claim
+key is `holderClaimKey(secret)` of the txbuilder (`@odatano/nightgate-tx`):
+blake2b-256 over `nightgate/holder-claim/v1` and a 32-byte secret the holder
+keeps. The call is sponsorable like any other (the registry's address and
+`registerHolder` in the allow-list; the coin round trip is the shape of a burn,
+a contract-owned coin in a zero-net offer). `unregisterHolder(type, claim_key)`
+removes the entry.
+
+### `grantDisclosureToHolders(payloadHash, tokenType, registryAddress, content?, contentType?, expiresAt?) → { holderGrantId, payloadHash, tokenType, registryAddress, hasContent, expiresAt, status }`
+
+The issuer binds `payloadHash` to `tokenType` on the registry at
+`registryAddress`. `content` (optional, up to 1 MiB) must hash to
+`payloadHash` (blake2b-256 or sha256 of the UTF-8 text) and is stored
+encrypted under the server key; without it the grant is an entitlement the
+issuer serves elsewhere. `expiresAt` at most a year ahead. The same grantor,
+payload, type and registry again updates the grant (`status: "updated"`).
+Grantable. **Rate limit:** 30/hour per principal, shared with the disclosure actions.
+
+### `revokeHolderDisclosure(holderGrantId) → { holderGrantId, status }`
+
+Only the grantor. A revoked grant answers no entitlement from the next claim.
+
+### `claimDisclosure(payloadHash, tokenType, claimSecret) → { entitled, reason?, registryAddress?, holderGrantId?, contentType?, contentHashKind?, content?, expiresAt? }`
+
+Proves the holding and reads what the issuer disclosed: computes the claim key
+from `claimSecret`, reads the registry live from the indexer (503 without a
+live indexer) and answers `entitled: true` with the stored text, or
+`entitled: false` with a `reason` (no grant, expired, not registered). Every
+token may call it; the secret is the credential. **Rate limit:** 60/hour per principal.
 
 ## Diagnostics
 
@@ -890,7 +966,7 @@ Last `limit` (default 10, max 100) reorg events with depth, detected-at timestam
 `registerContract(name, artifactPath, zkConfigPath, privateStateId, slotWidth?) → { name, source, artifactPath, zkConfigPath, privateStateId, slotWidth, artifactDigest, hasProverKeys }`: register a contract artifact without a restart.
 
 - Contracts from `cds.requires.nightgate.contracts` are the immutable floor: a config name is `409`.
-- Paths must resolve inside `NIGHTGATE_CONTRACTS_DIR` (default: the package's and the working directory's `contracts/`); importing an artifact executes its module.
+- Paths must resolve inside `NIGHTGATE_CONTRACTS_DIR` (default: the working directory's `contracts/`); importing an artifact executes its module.
 - Validated before anything changes: the module exports a Compact `Contract` class, the zk-config directory holds `keys/*.verifier` and `zkir/`.
 - Persisted in `ContractRegistrations`, reloaded at boot. `artifactDigest` is the generation persisted commands are pinned to; a new artifact under the same name is a new generation, and jobs recorded against the old one refuse.
 - `hasProverKeys: false`: deploy and verify only, no proving here. `/zk-config`, `/contract-manifest` and `getRuntimeInfo()` see the contract at once.

@@ -153,7 +153,7 @@ Response: `{"jobId":"...","status":"pending"}`. Poll `getJobStatus(jobId, sessio
 
 ### Deploy a contract
 
-`contracts/counter/` is precompiled and registered in `package.json` (`cds.requires.nightgate.contracts`). Also registered: `attestation-vault` (16 fields per document) and `attestation-vault-32` (32 fields); cross-document proofs need the same width. See [contracts/README.md](../contracts/README.md).
+The contract lineages are npm dependencies (`@odatano/contract-counter`, `-attestation-vault`, `-attestation-vault-32`, `-shielded-token`, `-token-factory`, `-holder-registry`) and registered in `package.json` (`cds.requires.nightgate.contracts`, one `{ "package": "..." }` entry each). `attestation-vault` carries 16 fields per document, `attestation-vault-32` 32; cross-document proofs need the same width. Sources, compiled artifacts and release assets: [NIGHTGATE-CONTRACTS](https://github.com/ODATANO/NIGHTGATE-CONTRACTS).
 
 ```bash
 curl -X POST http://localhost:4004/api/v1/nightgate/deployContract \

@@ -38,7 +38,8 @@ setGlobalDispatcher(new Agent({ headersTimeout: 0, bodyTimeout: 0, connectTimeou
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(__dirname, '..');
-const MANAGED = path.join(repoRoot, 'contracts/attestation-vault-32/src/managed/attestation-vault-32');
+const { resolveContractPackage } = await import('@odatano/contract-kit/node');
+const MANAGED = resolveContractPackage('@odatano/contract-attestation-vault-32', repoRoot).zkConfigPath;
 
 const BASE = process.env.NIGHTGATE_URL || 'http://localhost:4004';
 const VK = process.env.LACE_VIEWING_KEY;

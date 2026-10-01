@@ -55,18 +55,19 @@ try {
 }
 
 // --- Register the same contracts the plugin config ships -------------------
-const counterZk = path.join(repoRoot, 'contracts/counter/src/managed/counter');
-const vaultZk   = path.join(repoRoot, 'contracts/attestation-vault/src/managed/attestation-vault');
+const { resolveContractPackage } = await import('@odatano/contract-kit/node');
+const counterPkg = resolveContractPackage('@odatano/contract-counter', repoRoot);
+const vaultPkg   = resolveContractPackage('@odatano/contract-attestation-vault', repoRoot);
 registry.clearRegistry();
 registry.registerContract('counter', {
-    artifactPath: path.join(counterZk, 'contract/index.js'),
+    artifactPath: counterPkg.artifactPath,
     privateStateId: 'counterPrivateState',
-    zkConfigPath: counterZk
+    zkConfigPath: counterPkg.zkConfigPath
 });
 registry.registerContract('attestation-vault', {
-    artifactPath: path.join(vaultZk, 'contract/index.js'),
+    artifactPath: vaultPkg.artifactPath,
     privateStateId: 'attestationVaultPrivateState',
-    zkConfigPath: vaultZk
+    zkConfigPath: vaultPkg.zkConfigPath
 });
 
 // --- Mount on a bare Express app + listen on an ephemeral port -------------
@@ -94,7 +95,7 @@ try {
     ok('manifest: vault artifactRef set', vault.artifactRef === '@odatano/nightgate/browser/attestation-vault', vault.artifactRef);
     ok('manifest: counter has NO artifactRef (not browser-exported)', byName.counter && byName.counter.artifactRef === undefined);
     const vc = vault.circuits || [];
-    for (const c of ['attest', 'attestGuarded', 'grantDisclosure', 'revokeDisclosure', 'anchorContentRoot', 'proveFieldPredicate', 'proveDocumentComparison']) {
+    for (const c of ['attest', 'grantDisclosure', 'revokeDisclosure', 'anchorContentRoot', 'proveFieldPredicate', 'proveDocumentComparison']) {
         ok(`manifest: vault circuit "${c}" present`, vc.includes(c));
     }
     ok('manifest: removed commitment-lane circuits absent',

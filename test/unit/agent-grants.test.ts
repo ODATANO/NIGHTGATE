@@ -1066,11 +1066,12 @@ describe('agent grants', () => {
             await handlers.createAgentGrant(mixed);
             expect(mixed.reject).toHaveBeenCalledWith(400, expect.stringMatching(/anchorDocument/));
 
-            // both phase-2 sponsoring actions understand the sentinel: accepted together
+            // both phase-2 sponsoring actions understand the sentinel: accepted together,
+            // and the offer board resolves no sponsor at all
             mockDbRun.mockResolvedValueOnce({ sessionId: 'sess-1', isActive: true, expiresAt: null });
             const both = makeReq({
                 sessionId: 'sess-1',
-                allowedActions: ['sponsorFinalizedTransaction', 'sponsorUnboundTransaction'],
+                allowedActions: ['sponsorFinalizedTransaction', 'sponsorUnboundTransaction', 'postSwapOffer', 'retireSwapOffer'],
                 sponsorSessionId: PLATFORM_POOL_SENTINEL
             });
             await handlers.createAgentGrant(both);

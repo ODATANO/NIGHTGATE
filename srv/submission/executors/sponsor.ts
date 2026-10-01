@@ -12,6 +12,8 @@ import { PendingSubmissions } from '#cds-models/midnight';
 import { walletSponsorFinalizedTx, walletSponsorUnboundTx } from '../../midnight/wallet-worker-client';
 import { PLATFORM_POOL_SENTINEL, acquireSponsor, releaseSponsor, benchSponsor, decideSponsorFailure, sponsorCandidatesNonExclusive, touchSponsor } from '../sponsor-pool';
 import { recordDeployedContracts, recordMintedTokenTypes, reserveDeployBudget, releaseDeployBudget } from '../../sessions/agent-grants';
+import { recordLearnedTokenTypes } from '../learned-token-types';
+import { closeSwapOffer, closeSwapOffersByNullifiers } from '../swap-offers';
 import { sponsorAtSyncGate } from '../sponsor-sync-gate';
 import { configMs, configNumber } from '../../utils/config';
 import type { DbRunner } from '../../utils/db-types';
@@ -64,7 +66,7 @@ export function createSponsorExecutors(ctx: Pick<SubmissionContext, 'db'>) {
         };
         // The intent carries what the worker chose (contract, circuits, backing,
         // payer), so a reconciled result can be rebuilt from the attempt row.
-        const onSubmitIntent = () => async (txHash: string, intent?: { contractAddress?: string; circuits?: string[]; note?: string; sponsorAccountId?: string; deployed?: string[]; ttl?: string; segments?: Array<{ segment: number; calls: string[] }>; minted?: string[] }) => {
+        const onSubmitIntent = () => async (txHash: string, intent?: { contractAddress?: string; circuits?: string[]; note?: string; sponsorAccountId?: string; deployed?: string[]; ttl?: string; segments?: Array<{ segment: number; calls: string[] }>; minted?: string[]; nullifiers?: string[] }) => {
             const submissionId = cds.utils.uuid();
             const deployed = (intent?.deployed ?? []).map(String).filter(Boolean);
             const grantId = command?.grantId ? String(command.grantId) : null;
@@ -79,6 +81,8 @@ export function createSponsorExecutors(ctx: Pick<SubmissionContext, 'db'>) {
                 ...(intent?.segments?.length ? { segments: intent.segments } : {}),
                 ...(deployed.length ? { deployed } : {}),
                 ...(intent?.minted?.length ? { minted: intent.minted } : {}),
+                ...(intent?.nullifiers?.length ? { nullifiers: intent.nullifiers } : {}),
+                ...(command?.swap?.offerId ? { offerId: String(command.swap.offerId) } : {}),
                 ...(grantId && deployed.length ? { deployReservation: { grantId, count: deployed.length } } : {})
             };
             const row = {
@@ -148,10 +152,25 @@ export function createSponsorExecutors(ctx: Pick<SubmissionContext, 'db'>) {
     });
 
     /** What a landed job adds to its grant: deployed addresses, minted token types. */
-    const recordOnGrant = async (command: any, out: { deployed?: string[]; minted?: string[] }): Promise<void> => {
+    const recordOnGrant = async (command: any, out: { deployed?: string[]; minted?: string[]; txHash?: string; nullifiers?: string[] }): Promise<void> => {
+        if (out.minted?.length) {
+            await recordLearnedTokenTypes(db, out.minted, { grantId: command.grantId ?? null, sponsorSessionId: command.sponsorSessionId ?? null, txHash: out.txHash ?? null });
+        }
+        if (command.swap) await closeSwapOffersOf(command, out.nullifiers ?? [], out.txHash ?? null);
         if (!command.grantId) return;
         if (out.deployed?.length) await recordDeployedContracts(db, command.grantId, out.deployed);
         if (out.minted?.length) await recordMintedTokenTypes(db, command.grantId, out.minted);
+    };
+
+    /** A landed swap closes the offer it filled and every other open half that shared an input. */
+    const closeSwapOffersOf = async (command: any, nullifiers: string[], txHash: string | null): Promise<void> => {
+        // The swap is on chain; a failed bookkeeping write must not fail the attempt.
+        try {
+            if (command?.swap?.offerId) await closeSwapOffer(db, String(command.swap.offerId), 'filled', txHash);
+            if (nullifiers.length) await closeSwapOffersByNullifiers(db, nullifiers, txHash);
+        } catch (e) {
+            cds.log('nightgate').warn(`swap offers of ${txHash ?? 'the landed swap'} not closed: ${String((e as Error)?.message ?? e)}`);
+        }
     };
 
     // Bound sponsoring job: no contract call of our own, just deserialize the

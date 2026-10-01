@@ -7,7 +7,7 @@
  * the outage case is driven by publishing the offline state.
  */
 import cds from '@sap/cds';
-import { publishRuntimeState, __resetRuntimeStateForTests } from '../../srv/utils/runtime-state';
+import { __resetRuntimeStateForTests } from '../../srv/utils/runtime-state';
 import { isRuntimeWriteEvent, runtimeUnavailableReason, RUNTIME_FREE_ACTIONS } from '../../srv/utils/runtime-gate';
 
 (cds as any).env.requires.auth = {

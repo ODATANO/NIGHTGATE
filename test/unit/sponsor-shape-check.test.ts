@@ -37,6 +37,15 @@ function check(t: any, bytes = 5000, contracts?: string[], circuits?: string[]) 
     return workerExports.checkSponsorableShape(t, bytes, contracts, circuits);
 }
 
+describe('swapHalfNullifiers', () => {
+    it('reads the input nullifiers of the guaranteed offer, normalized and de-duplicated', () => {
+        const n1 = 'ab'.repeat(32);
+        const half = { guaranteedOffer: { inputs: [{ nullifier: '0x' + n1.toUpperCase() }, { nullifier: n1 }, { nullifier: 'short' }, {}], outputs: [] } };
+        expect(workerExports.swapHalfNullifiers(half)).toEqual([n1]);
+        expect(workerExports.swapHalfNullifiers({})).toEqual([]);
+    });
+});
+
 describe('checkSponsorableShape', () => {
     it('accepts the canonical shape: allow-listed calls, nothing else', () => {
         const calls = check(
@@ -577,10 +586,11 @@ describe('assertArtifactGenerationOnDisk: the worker verifies the pinned generat
 
     it('a SHIPPED .js ESM artifact (ESM through its package.json scope) snapshots as artifact.mjs and its class loads from the snapshot', async () => {
         const { computeArtifactGenerationDigest, effectiveModuleFormat } = await import('../../srv/submission/artifact-digest.js');
-        const repo = path.resolve(__dirname, '../..');
+        const { resolveContractPackage } = await import('@odatano/contract-kit/node');
+        const counterPkg = resolveContractPackage('@odatano/contract-counter', path.resolve(__dirname, '../..'));
         const reg = {
-            artifactPath: path.join(repo, 'contracts/counter/src/managed/counter/contract/index.js'),
-            zkConfigPath: path.join(repo, 'contracts/counter/src/managed/counter'),
+            artifactPath: counterPkg.artifactPath,
+            zkConfigPath: counterPkg.zkConfigPath,
             privateStateId: 'counter'
         };
         expect(effectiveModuleFormat(reg.artifactPath)).toBe('module');

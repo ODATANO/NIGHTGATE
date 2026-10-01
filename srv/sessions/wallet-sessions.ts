@@ -614,7 +614,7 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: D
         const sponsorIds = getConfiguredFeeSponsorSessions(getNightgatePluginConfig());
         if (sponsorIds.length === 0) return [];
 
-        const isAdmin = Boolean((req.user as any)?.is?.('admin'));
+        const isAdmin = Boolean(req.user?.is?.('admin'));
 
         // The sync gate does not bound a cold facade build, so each per-sponsor
         // read gets its own cap.

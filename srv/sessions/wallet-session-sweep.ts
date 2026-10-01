@@ -4,7 +4,7 @@
  */
 import cds from '@sap/cds';
 import { WalletSessions, type WalletSession } from '#cds-models/midnight';
-import { getNightgatePluginConfig } from '../utils/nightgate-config';
+import { getNightgatePluginConfig, type NightgatePluginConfig } from '../utils/nightgate-config';
 import { getConfiguredFeeSponsorSessions } from '../submission/fee-sponsor';
 import type { DbRunner, Row } from '../utils/db-types';
 import { evictFacadeUnlessShared } from './wallet-session-lifecycle';
@@ -19,7 +19,7 @@ const SESSION_CLOSE_CHUNK = 200;
  * so their queued jobs can be dropped. Assumes one replica. Platform sponsors and
  * sessions holding a signing key are kept (closing revokes the key for good).
  */
-export async function closeSessionsFromPreviousProcess(db: DbRunner, config?: Record<string, any>): Promise<string[]> {
+export async function closeSessionsFromPreviousProcess(db: DbRunner, config?: NightgatePluginConfig): Promise<string[]> {
     const exempt = new Set(getConfiguredFeeSponsorSessions(config));
     const active: Row<WalletSession, 'sessionId'>[] = (await db.run(
         SELECT.from(WalletSessions).columns('sessionId', 'encryptedSeedKey').where({ isActive: true })

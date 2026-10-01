@@ -1,10 +1,5 @@
 /** `@odatano/nightgate/browser` - browser entry. See index.mjs. */
 
-// Local import as well as the re-export below: `export { … } from` re-exports a name without
-// binding it locally, and `PreparedCall.witnesses` REFERENCES this type further down. The repo's
-// own typecheck hides the resulting TS2304 (skipLibCheck is on); only a consumer typechecking
-// against the installed package sees it.
-import type { AttestationVaultWitnesses } from './witnesses.js';
 
 export {
     deriveAttestationSecret,
@@ -21,7 +16,7 @@ export {
     type MerkleProofHolder,
     type BuildWitnessesInput,
     type AttestationVaultWitnesses
-} from './witnesses.js';
+} from '@odatano/contract-kit';
 
 // Providers + typed call helpers.
 
@@ -103,40 +98,27 @@ export function buildProofProvider(input: {
     proofMod: any;
 }): Promise<{ proofProvider: unknown | undefined; provingModality: 'server' | 'wallet' | 'none' }>;
 
-export interface PreparedCall {
-    circuitId: string;
-    /** boolean[] carries the cross-root integrity circuit's Vector<width, Boolean> mask arg. */
-    args: Array<Uint8Array | bigint | boolean[]>;
-    witnesses: AttestationVaultWitnesses;
-    /**
-     * The proof-prepare helpers pass their inputs through so a batch caller
-     * can rebind the SAME call bundle (e.g. into a shared witness holder).
-     */
-    merkleProof?: import('./witnesses.js').MerkleProof;
-    /** Slot width the call was prepared for (16 default, 32 for attestation-vault-32). */
-    slotWidth?: number;
-}
-export function prepareRevokeDisclosure(input: { payloadHash: string; grantee: string; attestationSecret: Uint8Array }): PreparedCall;
-export function prepareGrantDisclosure(input: { payloadHash: string; grantee: string; level: number | bigint; attestationSecret: Uint8Array }): PreparedCall;
-export function prepareAttest(input: { payloadHash: string; metadataHash: string; attestationSecret: Uint8Array }): PreparedCall;
-/** The attester's record key for a payload (hex), via the compiled artifact's `recordKey` pure circuit. */
-export function recordKeyOf(input: { pureCircuits: { recordKey(owner: Uint8Array, payloadHash: Uint8Array): Uint8Array }; attesterId: string; payloadHash: string }): string;
-export function prepareRegisterDocument(input: { documentId?: string; ownerId?: string; mode?: number | bigint; attestationSecret: Uint8Array }): PreparedCall;
-/** Alias of prepareRegisterDocument (mode 0). */
-export function prepareRegisterPassport(input: { passportId: string; ownerId: string; attestationSecret: Uint8Array }): PreparedCall;
-export function prepareBindDocument(input: { documentId: string; payloadHash: string; attestationSecret: Uint8Array }): PreparedCall;
-/** Alias of prepareBindDocument. */
-export function prepareBindPassport(input: { passportId: string; payloadHash: string; attestationSecret: Uint8Array }): PreparedCall;
-export function prepareRetract(input: { mode: number | bigint; key: string; attestationSecret: Uint8Array }): PreparedCall;
-export function prepareRetractAttestation(input: { payloadHash: string; attestationSecret: Uint8Array }): PreparedCall;
-export function preparePurgeExpired(input: { kind: 'claim'; key: string; attestationSecret: Uint8Array }): PreparedCall;
-export const DEFAULT_CLAIM_LIFETIME_S: number;
-export function prepareAnchorContentRoot(input: { payloadHash: string; contentRoot: string; schemaId: string; attestationSecret: Uint8Array }): PreparedCall;
-export function prepareProveFieldPredicate(input: { recordKey: string; fieldKey: string; threshold: number | bigint; op: number | bigint; validUntil?: number | bigint; merkleProof: import('./witnesses.js').MerkleProof; attestationSecret?: Uint8Array; slotWidth?: number }): PreparedCall;
-export function prepareProveFieldEquality(input: { recordKey: string; fieldKey: string; expectedDigest: string; validUntil?: number | bigint; merkleProof: import('./witnesses.js').MerkleProof; attestationSecret?: Uint8Array; slotWidth?: number }): PreparedCall;
-export function prepareProveFieldMembership(input: { recordKey: string; fieldKey: string; setRoot: string; validUntil?: number | bigint; merkleProof: import('./witnesses.js').MerkleProof; attestationSecret?: Uint8Array; slotWidth?: number }): PreparedCall;
-export function prepareProveFieldsUnchangedExcept(input: { recordKeyA: string; recordKeyB: string; allowedMask: number; validUntil?: number | bigint; docPair: import('./witnesses.js').DocPair; attestationSecret?: Uint8Array; slotWidth?: number }): PreparedCall;
-export function prepareProveFieldsDiffer(input: { recordKeyA: string; recordKeyB: string; k: number; validUntil?: number | bigint; docPair: import('./witnesses.js').DocPair; attestationSecret?: Uint8Array; slotWidth?: number }): PreparedCall;
+export {
+    type PreparedCall,
+    DEFAULT_CLAIM_LIFETIME_S,
+    prepareRevokeDisclosure,
+    prepareGrantDisclosure,
+    prepareAttest,
+    recordKeyOf,
+    prepareRegisterDocument,
+    prepareRegisterPassport,
+    prepareBindDocument,
+    prepareBindPassport,
+    prepareRetract,
+    prepareRetractAttestation,
+    preparePurgeExpired,
+    prepareAnchorContentRoot,
+    prepareProveFieldPredicate,
+    prepareProveFieldEquality,
+    prepareProveFieldMembership,
+    prepareProveFieldsUnchangedExcept,
+    prepareProveFieldsDiffer
+} from '@odatano/contract-kit';
 
 export interface ContractBrowserMeta {
     name: string;

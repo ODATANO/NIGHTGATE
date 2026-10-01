@@ -1,6 +1,6 @@
 {
     "name": "@odatano/nightgate-tx",
-    "version": "0.8.0",
+    "version": "0.10.0",
     "description": "NIGHTGATE client SDK: drive a hosted NIGHTGATE (ZK attestations, verification, disclosure, fee sponsoring) and build transactions locally with your own key.",
     "license": "Apache-2.0",
     "author": "ODATANO",
@@ -58,12 +58,12 @@
             "default": "./srv/submission/set-root.js"
         },
         "./attestation-vault": {
-            "types": "./contracts/attestation-vault/src/managed/attestation-vault/contract/index.d.ts",
-            "default": "./contracts/attestation-vault/src/managed/attestation-vault/contract/index.js"
+            "types": "./src/browser/attestation-vault.d.mts",
+            "default": "./src/browser/attestation-vault.mjs"
         },
         "./attestation-vault-32": {
-            "types": "./contracts/attestation-vault-32/src/managed/attestation-vault-32/contract/index.d.ts",
-            "default": "./contracts/attestation-vault-32/src/managed/attestation-vault-32/contract/index.js"
+            "types": "./src/browser/attestation-vault-32.d.mts",
+            "default": "./src/browser/attestation-vault-32.mjs"
         },
         "./package.json": "./package.json"
     },
@@ -73,9 +73,6 @@
         "src/**/*.d.mts",
         "srv/**/*.js",
         "srv/**/*.d.ts",
-        "contracts/**/*.js",
-        "contracts/**/*.d.ts",
-        "contracts/**/package.json",
         "README.md",
         "LICENSE",
         "example/anchor.mjs",
@@ -103,6 +100,9 @@
         "@midnightntwrk/wallet-sdk-shielded": "^3.0.2",
         "@midnightntwrk/wallet-sdk-unshielded-wallet": "^3.1.0",
         "@noble/hashes": "^1.8.0",
+        "@odatano/contract-attestation-vault": "0.1.0",
+        "@odatano/contract-attestation-vault-32": "0.1.0",
+        "@odatano/contract-kit": "0.1.0",
         "@scure/base": "^2.2.0",
         "bip39": "^3.1.0",
         "ws": "^8"

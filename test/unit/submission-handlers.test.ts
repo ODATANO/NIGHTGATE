@@ -11,6 +11,7 @@
  * don't know about the worker at all.
  */
 
+import { resolveContractPackage } from '@odatano/contract-kit/node';
 import type { Mock } from 'vitest';
 // Handlers wrap the submitter call in startJob and return `{ jobId, status }`
 // instead of awaiting the SDK round-trip. The stub here invokes `work`
@@ -1905,10 +1906,7 @@ describe('arg-coercion: coerceCircuitArgs (pure)', () => {
 });
 
 describe('arg-coercion: loadCircuitArgTypes (real attestation-vault artifact)', () => {
-    const VAULT_ZK = path.resolve(
-        __dirname, '..', '..',
-        'contracts', 'attestation-vault', 'src', 'managed', 'attestation-vault'
-    );
+    const VAULT_ZK = resolveContractPackage('@odatano/contract-attestation-vault', path.resolve(__dirname, '..', '..')).zkConfigPath;
 
     beforeEach(() => __clearArgTypeCacheForTests());
 
@@ -1980,10 +1978,7 @@ describe('submitContractCall: Bytes/Uint arg coercion reaches the submitter', ()
     });
 
     test('attest becomes callable generically (real artifact introspection)', async () => {
-        const VAULT_ZK = path.resolve(
-            __dirname, '..', '..',
-            'contracts', 'attestation-vault', 'src', 'managed', 'attestation-vault'
-        );
+        const VAULT_ZK = resolveContractPackage('@odatano/contract-attestation-vault', path.resolve(__dirname, '..', '..')).zkConfigPath;
         __clearArgTypeCacheForTests();
         // Use the REAL loader against the REAL attestation-vault artifact path.
         const { srv, submitter } = setup({

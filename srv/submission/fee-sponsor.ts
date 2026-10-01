@@ -4,6 +4,7 @@
  * session id could drain a foreign wallet's dust.
  */
 
+import type { NightgatePluginConfig } from '../utils/nightgate-config';
 import cds from '@sap/cds';
 const { SELECT } = cds.ql;
 import { WalletSessions } from '#cds-models/midnight';
@@ -56,7 +57,7 @@ export interface ResolveFeeSponsorOptions {
     sponsorSessionId: string;
     /** Required unless the sponsor id is platform-listed. */
     requestingUserId?: string;
-    config?: Record<string, any>;
+    config?: NightgatePluginConfig;
     /** Test seam; defaults to the process-scoped key from srv/utils/crypto.ts. */
     encryptionKey?: Buffer;
 }
@@ -134,7 +135,7 @@ export async function ensureFeeSponsorFacade(
  */
 export async function prewarmFeeSponsorPool(opts: {
     db: DbRunner;
-    config?: Record<string, any>;
+    config?: NightgatePluginConfig;
     facadeConfig: Omit<WalletFacadeBuildArgs, 'seedHex' | 'syncStatePassphrase'>;
     log?: { info: (m: string) => void; warn: (m: string) => void };
     encryptionKey?: Buffer;

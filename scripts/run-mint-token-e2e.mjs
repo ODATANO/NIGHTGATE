@@ -29,7 +29,7 @@ console.log(`OK   session ${sessionId}`);
 
 let contractAddress = process.env.MINT_E2E_CONTRACT || '';
 if (!contractAddress) {
-    step('2. Deploy contracts/shielded-token');
+    step('2. Deploy @odatano/contract-shielded-token');
     const dep = await ng.deployContract({ compiledArtifactRef: 'shielded-token', sessionId, initialPrivateState: '{}' })
         .catch(e => fail(`deploy: ${e.message}`));
     contractAddress = dep.contractAddress;

@@ -50,9 +50,7 @@ export function createContractCommandExecutor(ctx: Pick<SubmissionContext, 'db' 
         if (job.grantId) {
             const grant = await currentGrantRow(db, String(job.grantId));
             if (!grant) {
-                const err: any = new Error(`agent grant ${job.grantId} is revoked or expired; the job was not executed`);
-                err.code = 'AGENT_GRANT_REVOKED'; err.retryable = false;
-                throw err;
+                throw Object.assign(new Error(`agent grant ${job.grantId} is revoked or expired; the job was not executed`), { code: 'AGENT_GRANT_REVOKED', retryable: false });
             }
             let parentKind: string | null = null;
             if (job.parentJobId) {
@@ -61,9 +59,7 @@ export function createContractCommandExecutor(ctx: Pick<SubmissionContext, 'db' 
             }
             const scope = grantJobScopeViolation(grant, { kind: job.kind, parentJobId: job.parentJobId, parentKind }, command as unknown as Record<string, unknown>);
             if (scope) {
-                const err: any = new Error(`agent grant ${job.grantId}: ${scope}; the job was not executed`);
-                err.code = 'AGENT_GRANT_SCOPE'; err.retryable = false;
-                throw err;
+                throw Object.assign(new Error(`agent grant ${job.grantId}: ${scope}; the job was not executed`), { code: 'AGENT_GRANT_SCOPE', retryable: false });
             }
         }
         // Children inherit the parent's digest, so an alias re-pointed between

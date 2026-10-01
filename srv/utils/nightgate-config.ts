@@ -22,8 +22,10 @@ export interface NightgatePluginConfig {
     indexerHttpUrl?: string;
     indexerWsUrl?: string;
     proofServerUrl?: string;
-    /** HTTP timeout of one proof request in server proving mode, ms; default 300000. */
-    proofTimeoutMs?: number;
+    /** HTTP timeout of one proof request in server proving mode, ms; default 300000. Invalid values are ignored. */
+    proofTimeoutMs?: number | string;
+    /** Base directory of per-contract zk assets for artifacts registered by path; default `./contracts`. */
+    zkConfigBasePath?: string;
     crawlerNodeUrl?: string;
     privateStateBackend?: PrivateStateBackend;
     sessionTtlMs?: number;
@@ -40,11 +42,16 @@ export interface NightgatePluginConfig {
         fetchConcurrency?: number;
         rpcBatchSize?: number;
         requestTimeout?: number;
+        /** Indexer the crawler supplements blocks from; default: the submission indexer. */
+        indexerUrl?: string;
+        supplementBlocksPerSecond?: number;
     };
     contracts?: Record<string, {
-        artifactPath: string;
-        privateStateId: string;
-        zkConfigPath: string;
+        /** An installed lineage package; the paths come from its contract.json. */
+        package?: string;
+        artifactPath?: string;
+        privateStateId?: string;
+        zkConfigPath?: string;
         /**
          * Content-tree width of attestation-vault-family artifacts: 8, 16 (default)
          * or 32. Must match the compiled artifact's witness vector shapes.
@@ -127,7 +134,7 @@ export const VALID_PRIVATE_STATE_BACKENDS = ['cap-db', 'level'] as const;
 export type PrivateStateBackend = (typeof VALID_PRIVATE_STATE_BACKENDS)[number];
 export const DEFAULT_PRIVATE_STATE_BACKEND: PrivateStateBackend = 'cap-db';
 
-export function getConfiguredPrivateStateBackend(config?: Record<string, any>): PrivateStateBackend {
+export function getConfiguredPrivateStateBackend(config?: NightgatePluginConfig): PrivateStateBackend {
     const raw = configEnum('NIGHTGATE_PRIVATE_STATE_BACKEND') || config?.privateStateBackend;
     if (raw && (VALID_PRIVATE_STATE_BACKENDS as readonly string[]).includes(raw)) {
         return raw as PrivateStateBackend;
@@ -139,7 +146,7 @@ export const VALID_GRANTEE_BINDINGS = ['wallet', 'did', 'custom'] as const;
 export type GranteeBinding = (typeof VALID_GRANTEE_BINDINGS)[number];
 export const DEFAULT_GRANTEE_BINDING: GranteeBinding = 'wallet';
 
-export function getConfiguredGranteeBinding(config?: Record<string, any>): GranteeBinding {
+export function getConfiguredGranteeBinding(config?: NightgatePluginConfig): GranteeBinding {
     const raw = configEnum('NIGHTGATE_GRANTEE_BINDING') || config?.granteeBinding;
     if (raw && (VALID_GRANTEE_BINDINGS as readonly string[]).includes(raw)) {
         return raw as GranteeBinding;
@@ -147,7 +154,7 @@ export function getConfiguredGranteeBinding(config?: Record<string, any>): Grant
     return DEFAULT_GRANTEE_BINDING;
 }
 
-export function isSelfServiceGranteeRegistrationAllowed(config?: Record<string, any>): boolean {
+export function isSelfServiceGranteeRegistrationAllowed(config?: NightgatePluginConfig): boolean {
     const raw = configBool('NIGHTGATE_ALLOW_SELF_SERVICE_GRANTEE_REGISTRATION');
     if (raw !== undefined) return raw;
     // Off unless opted in: binding-input ownership is not verified.
@@ -158,29 +165,29 @@ export function isSelfServiceGranteeRegistrationAllowed(config?: Record<string, 
  * Whether a restart closes the previous process's wallet sessions; default on. Leaked
  * session rows count as live users of a wallet's keys and keep seed material at rest until the TTL.
  */
-export function isCloseSessionsOnRestartEnabled(config?: Record<string, any>): boolean {
+export function isCloseSessionsOnRestartEnabled(config?: NightgatePluginConfig): boolean {
     const env = configBool('NIGHTGATE_CLOSE_SESSIONS_ON_RESTART');
     if (env !== undefined) return env;
     if (typeof config?.closeSessionsOnRestart === 'boolean') return config.closeSessionsOnRestart;
     return true;
 }
 
-export function getConfiguredNightgateNetwork(config?: Record<string, any>): string | undefined {
+export function getConfiguredNightgateNetwork(config?: NightgatePluginConfig): string | undefined {
     // Raw on purpose: an invalid value must reach normalizeNightgateNetwork,
     // which refuses to start instead of silently falling back.
     return process.env.NIGHTGATE_NETWORK?.trim() || config?.network;
 }
 
-export function getConfiguredNightgateNodeUrl(config?: Record<string, any>): string | undefined {
+export function getConfiguredNightgateNodeUrl(config?: NightgatePluginConfig): string | undefined {
     return configString('NIGHTGATE_NODE_URL') || config?.nodeUrl;
 }
 
-export function getConfiguredNightgateCrawlerNodeUrl(config?: Record<string, any>): string | undefined {
+export function getConfiguredNightgateCrawlerNodeUrl(config?: NightgatePluginConfig): string | undefined {
     return configString('NIGHTGATE_CRAWLER_NODE_URL') || config?.crawler?.nodeUrl;
 }
 
 /** Configured iff a network is selected; otherwise initialize() stays idle and crawls nothing. */
-export function isNightgatePluginConfigured(config?: Record<string, any>): boolean {
+export function isNightgatePluginConfigured(config?: NightgatePluginConfig): boolean {
     return Boolean(config && getConfiguredNightgateNetwork(config));
 }
 
@@ -213,14 +220,14 @@ export interface SubmissionEndpointsConfig {
  * NIGHTGATE_PROVING_MODE, else `server` when a proof server is explicitly configured,
  * else `wasm`. `initialize()` pins the result into the env before the worker spawns.
  */
-export function resolveEffectiveProvingMode(config?: Record<string, any> | null): 'server' | 'wasm' {
+export function resolveEffectiveProvingMode(config?: NightgatePluginConfig | null): 'server' | 'wasm' {
     const explicit = configEnum<'server' | 'wasm'>('NIGHTGATE_PROVING_MODE');
     if (explicit) return explicit;
     return (configString('NIGHTGATE_PROOF_SERVER_URL') || config?.proofServerUrl) ? 'server' : 'wasm';
 }
 
 /** Proof request timeout: env, `proofTimeoutMs`, else 5 min; pinned into the env before the worker spawns. */
-export function resolveProofTimeoutMs(config?: Record<string, any> | null): number {
+export function resolveProofTimeoutMs(config?: NightgatePluginConfig | null): number {
     const raw = process.env.NIGHTGATE_PROOF_TIMEOUT_MS?.trim();
     if (raw) {
         const parsed = parseConfigValue(configSpec('NIGHTGATE_PROOF_TIMEOUT_MS'), raw);
@@ -234,7 +241,7 @@ export function resolveProofTimeoutMs(config?: Record<string, any> | null): numb
 
 export function resolveSubmissionEndpoints(
     network: NightgateNetwork,
-    config?: Record<string, any>
+    config?: NightgatePluginConfig
 ): SubmissionEndpointsConfig {
     const defaults = DEFAULT_INDEXER_URLS[network];
     const httpOverride = configString('NIGHTGATE_INDEXER_HTTP_URL') || config?.indexerHttpUrl;
@@ -253,7 +260,7 @@ export function resolveSubmissionEndpoints(
  */
 export function resolveOverrideIndexerEndpoints(
     network: NightgateNetwork,
-    config?: Record<string, any>
+    config?: NightgatePluginConfig
 ): { indexerHttpUrl: string; indexerWsUrl: string } {
     const defaults = DEFAULT_INDEXER_URLS[network];
     const perNetwork = config?.networks?.[network] ?? {};
@@ -265,14 +272,14 @@ export function resolveOverrideIndexerEndpoints(
 }
 
 /** Warns when the removed `crawlerlessChainConfirm` option is still set; the value is ignored. */
-export function warnIfCrawlerlessChainConfirmSet(config?: Record<string, any>, warn: (msg: string) => void = (m) => cds.log('nightgate:config').warn(m)): boolean {
+export function warnIfCrawlerlessChainConfirmSet(config?: NightgatePluginConfig, warn: (msg: string) => void = (m) => cds.log('nightgate:config').warn(m)): boolean {
     const envRaw = process.env.NIGHTGATE_CRAWLERLESS_CHAIN_CONFIRM;
     const set = (typeof envRaw === 'string' && envRaw.trim() !== '') || config?.crawlerlessChainConfirm !== undefined;
     if (set) warn('crawlerlessChainConfirm / NIGHTGATE_CRAWLERLESS_CHAIN_CONFIRM is no longer an option: the indexer confirmer is the only chain-evidence path and always runs; remove the setting');
     return set;
 }
 
-export function resolveNightgateRuntimeConfig(config: Record<string, any> = {}): {
+export function resolveNightgateRuntimeConfig(config: NightgatePluginConfig = {}): {
     network: NightgateNetwork;
     nodeUrl: string;
     crawlerConfig: Record<string, unknown>;

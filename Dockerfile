@@ -15,10 +15,11 @@ COPY package.json package-lock.json ./
 # (@sap/cds, @sap/cds-dk, @cap-js/sqlite). Slimming is a later optimization.
 RUN npm ci
 COPY . .
-# The image carries every prover key (the checkout is complete, unlike the
-# npm tarball); refuse to build one that would fetch at runtime.
-RUN node scripts/write-key-manifest.mjs --check --require-keys
 RUN npm run build
+# The image carries every prover key of the registered lineages (fetched from
+# the packages' release assets, verified against their manifests); refuse to
+# build one that would fetch at runtime.
+RUN set -e; for c in counter shielded-token token-factory holder-registry attestation-vault attestation-vault-32; do node scripts/fetch-contract-keys.mjs "$c"; done
 
 FROM node:22-slim
 ARG VERSION=dev
