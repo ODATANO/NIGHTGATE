@@ -73,6 +73,7 @@ vi.mock('../../srv/utils/wallet-hd', () => ({
 
 vi.mock('../../srv/submission/contract-witnesses', () => ({
     deriveAttestationSecret: vi.fn(() => new Uint8Array(32).fill(9)),
+    deriveTokenFactoryIssuerSecret: vi.fn(() => new Uint8Array(32).fill(8)),
     getContractWitnessFactory: vi.fn()
 }));
 

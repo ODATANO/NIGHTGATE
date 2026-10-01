@@ -6,8 +6,8 @@ import cds from '@sap/cds';
 import { assertArtifactGeneration } from '../contract-registry';
 import type { BackgroundJobRow, ReconciliationEvidence } from '../job-store';
 import { Documents, DisclosureGrants, PendingSubmissions } from '#cds-models/midnight';
-import { recordDeployedContracts, recordMintedTokenTypes } from '../../sessions/agent-grants';
-import { recordLearnedTokenTypes } from '../learned-token-types';
+import { recordDeployedContracts } from '../../sessions/agent-grants';
+import { recordPlatformMint } from '../platform-mints';
 import { closeSwapOffer, closeSwapOffersByNullifiers } from '../swap-offers';
 import { ContractCommandV1, ContractCommandV1WithProvenance } from '../actions/common';
 import type { SubmissionContext } from '../actions/context';
@@ -33,8 +33,7 @@ export function createReconciliationFinalizers(ctx: Pick<SubmissionContext, 'db'
         const grantId = coordinates.deployReservation?.grantId ?? command?.grantId;
         if (deployed.length && grantId) await recordDeployedContracts(db, String(grantId), deployed);
         const minted: string[] = Array.isArray(coordinates.minted) ? coordinates.minted.map(String) : [];
-        if (minted.length) await recordLearnedTokenTypes(db, minted, { grantId: grantId ? String(grantId) : null, sponsorSessionId: command?.sponsorSessionId ?? null, txHash: evidence.txHash ?? null });
-        if (minted.length && grantId) await recordMintedTokenTypes(db, String(grantId), minted);
+        if (minted.length) await recordPlatformMint(db, minted, { grantId: grantId ? String(grantId) : null, sponsorSessionId: command?.sponsorSessionId ?? null, txHash: evidence.txHash ?? null });
         const nullifiers: string[] = Array.isArray(coordinates.nullifiers) ? coordinates.nullifiers.map(String) : [];
         // The swap is on chain; a failed bookkeeping write must not fail the reconciliation.
         try {
@@ -50,6 +49,19 @@ export function createReconciliationFinalizers(ctx: Pick<SubmissionContext, 'db'
             ...(coordinates.note ? { note: coordinates.note } : {}),
             ...(deployed.length ? { deployed } : {}),
             feeSponsor: coordinates.feeSponsor ?? command?.sponsorSessionId ?? _job.sessionId
+        };
+    };
+
+    /** A factory mint proven by the indexer after a lost broadcast: the same bookkeeping as the inline path. */
+    const finalizeFactoryMint = async (raw: unknown, job: BackgroundJobRow, evidence: ReconciliationEvidence): Promise<unknown> => {
+        const command = raw as Extract<ContractCommandV1, { op: 'call' }>;
+        const tokenType = command?.mintedTokenType;
+        if (tokenType) await recordPlatformMint(db, [tokenType], { grantId: job.grantId ?? null, sponsorSessionId: command.sponsorSessionId ?? null, txHash: evidence.txHash ?? null });
+        return {
+            reconciled: true, txHash: evidence.txHash, status: 'finalized',
+            contractAddress: command?.contractAddress ?? evidence.contractAddress ?? '',
+            ...(tokenType ? { tokenType } : {}),
+            ...(command?.sponsorSessionId ? { feeSponsor: command.sponsorSessionId } : {})
         };
     };
 
@@ -144,5 +156,5 @@ export function createReconciliationFinalizers(ctx: Pick<SubmissionContext, 'db'
         }
         throw new Error(`Unsupported projection finalizer operation '${(command as any)?.op}'`);
     };
-    return { finalizeSponsoredSubmission, finalizeContractProjection };
+    return { finalizeSponsoredSubmission, finalizeContractProjection, finalizeFactoryMint };
 }

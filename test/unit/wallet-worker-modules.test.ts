@@ -49,7 +49,8 @@ function entryFor(sessionId: string): FacadeEntry {
         networkId: 'preprod',
         indexerHttpUrl: 'http://indexer.test',
         walletConfiguration: {},
-        attestationSecret: new Uint8Array(32).fill(7)
+        attestationSecret: new Uint8Array(32).fill(7),
+        tokenFactoryIssuerSecret: new Uint8Array(32).fill(8)
     };
 }
 
@@ -132,6 +133,7 @@ describe('evict during an in-flight submit', () => {
         expect(entry.dustKey.clear).toHaveBeenCalledTimes(1);
         expect(entry.unshieldedKeystore.clear).toHaveBeenCalledTimes(1);
         expect(entry.attestationSecret.every(b => b === 0)).toBe(true);
+        expect(entry.tokenFactoryIssuerSecret.every(b => b === 0)).toBe(true);
         expect(entry.facade.stop).toHaveBeenCalledTimes(1);
         const save = fakeParentPort.posted.find(m => m.kind === 'state-save' && m.sessionId === 's-evict');
         expect(save?.blobs).toEqual({ shielded: 'sh-s-evict', unshielded: 'un-s-evict', dust: 'du-s-evict' });

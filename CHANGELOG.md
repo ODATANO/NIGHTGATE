@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.30.1 - 2026-10-02
+
+### Features
+
+- Offer board reads: `getSwapOffer(offerId)` (one offer, open or closed);
+  `listSwapOffers` takes `status` (`open` default, `filled` | `retired` | `expired` | `all`,
+  closed ones ordered by last change), `since` (offers changed after an instant: the
+  board's change feed; an offer the clock ran out counts as changed at `expiresAt`) and
+  `mine` (the caller's own posts, a token's grant); every row carries `status`,
+  `filledTxHash`, `closedAt`, `changedAt`. Admin projection `SwapOffers` with the
+  posters. `getSwapOffer` is open to every token.
+- `getBoardStatus()` on the indexer service, anonymous like the probes: open offers,
+  offers filled and sponsored swaps succeeded today, sponsors configured and ready (from
+  the worker's last pushed reading, no worker call). Computed at most every 10 s; 60/min
+  per client.
+- `createAgentGrants(count, sessionId, allowedActions, labels?, ...)`: 1 to 50 grants of
+  one shape on one session in one call, tokens returned once, labels given or
+  `<agentLabel | 'agent'>-1..n`; same checks and rate limit as `createAgentGrant`.
+- `mintFactoryToken(contractAddress, name, amount, recipientCoinPublicKey, sessionId,
+  idempotencyKey?, sponsorSessionId?)` on the `token-factory` lineage: the session is the
+  issuer (issuer secret derived from its seed, witness held by the worker), the result
+  names `issuerKey`, `domain` and `tokenType` before the job runs, a landed mint is
+  recorded in `LearnedTokenTypes` and on the grant, also when the indexer proves it after
+  a lost broadcast. `LearnedTokenTypes` holds at most 256 types. Grantable
+  (`mintFactoryToken`, circuit `mint`). Code `TOKEN_FACTORY_UNAVAILABLE` (404).
+- `@odatano/nightgate-tx` 0.10.1: `createTxBuilder({ package, from? })` takes class, name,
+  private-state id and keys directory from an installed lineage package;
+  `ensureZkAssets({ package })` fetches its missing prover keys from the package's release
+  assets, verified against `keys/manifest.json` (a given `zkConfigBaseUrl` still wins);
+  `resolveBuilderPackage` exposes what it reads. `zkAssets.source: 'package'`.
+
+No schema change, no circuit change.
+
 ## 0.30.0 - 2026-10-02
 
 ### Features

@@ -70,7 +70,7 @@ export async function getOrCompileContract(
     const witnessFactory = getContractWitnessFactory(name);
     const witnessStep = witnessFactory
         ? CompiledContract.withWitnesses(witnessFactory({
-            attestationSecret: entry.attestationSecret, merkleProof, merkleProofHolder,
+            attestationSecret: entry.attestationSecret, issuerSecret: entry.tokenFactoryIssuerSecret, merkleProof, merkleProofHolder,
             ...(registration.slotWidth !== undefined ? { slotWidth: registration.slotWidth } : {})
         }))
         // Vacant witnesses would fail the constructor's name check and block deploys.

@@ -30,7 +30,8 @@ vi.mock('../../srv/submission/background-jobs', () => ({
 
 import cds from '@sap/cds';
 import {
-    normalizeTokenTypes, recordLearnedTokenTypes, refreshLearnedTokenTypes, sharedLearnedTokenTypes, __resetLearnedTokenTypesForTests
+    normalizeTokenTypes, recordLearnedTokenTypes, refreshLearnedTokenTypes, sharedLearnedTokenTypes, __resetLearnedTokenTypesForTests,
+    MAX_LEARNED_TOKEN_TYPES
 } from '../../srv/submission/learned-token-types';
 
 const T1 = 'ab'.repeat(32);
@@ -52,8 +53,15 @@ describe('normalizeTokenTypes', () => {
 });
 
 describe('recordLearnedTokenTypes', () => {
+    it('stops at the platform-wide ceiling and never fails the landed job', async () => {
+        dbRun.mockResolvedValueOnce([]).mockResolvedValueOnce([{ count: MAX_LEARNED_TOKEN_TYPES }]);
+        expect(await recordLearnedTokenTypes(db, [T2], { grantId: 'g1' })).toEqual([]);
+        expect(insertEntries).not.toHaveBeenCalled();
+        expect(logs.warn).toHaveBeenCalledWith(expect.stringContaining(`at most ${MAX_LEARNED_TOKEN_TYPES}`));
+    });
+
     it('inserts only the types the platform has not seen, with their origin', async () => {
-        dbRun.mockResolvedValueOnce([{ tokenType: T1 }]).mockResolvedValueOnce(undefined);
+        dbRun.mockResolvedValueOnce([{ tokenType: T1 }]).mockResolvedValueOnce([{ count: 1 }]).mockResolvedValueOnce(undefined);
         const added = await recordLearnedTokenTypes(db, [T1, T2], { grantId: 'g1', sponsorSessionId: 's1', txHash: 'h1' });
         expect(added).toEqual([T2]);
         expect(selectChain.where).toHaveBeenCalledWith({ tokenType: [T1, T2] });

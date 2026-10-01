@@ -32,6 +32,10 @@ service NightgateAdminService {
     @readonly
     entity LearnedTokenTypes as projection on midnight.LearnedTokenTypes;
 
+    /** The offer board with its posters; the public reads never show them. */
+    @readonly
+    entity SwapOffers as projection on midnight.SwapOffers;
+
     action invalidateSession(sessionId: UUID);
     action invalidateAllSessions();
 

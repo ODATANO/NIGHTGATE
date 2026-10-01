@@ -47,7 +47,7 @@ describe('job kind traits', () => {
     });
 
     it('proving kinds are heavy, sync-bound ones light, the prewarm serial and session-bound', () => {
-        for (const kind of ['deployContract', 'submitContractCall', 'sendNight', 'registerForDustGeneration', 'anchorDocument', 'buildSponsorableTx', 'sponsorUnboundTransaction', 'fieldPredicateProof', 'mintShieldedTestToken']) {
+        for (const kind of ['deployContract', 'submitContractCall', 'sendNight', 'registerForDustGeneration', 'anchorDocument', 'buildSponsorableTx', 'sponsorUnboundTransaction', 'fieldPredicateProof', 'mintShieldedTestToken', 'mintFactoryToken']) {
             expect(JOB_KIND_TRAITS[kind]?.heavy, kind).toBe(true);
         }
         expect(JOB_KIND_TRAITS.sponsorFinalizedTransaction.heavy).toBe(false);
@@ -108,7 +108,7 @@ describe('job definitions', () => {
 
     it('only chain-effect kinds carry a reconciliation finalizer', () => {
         const withFinalizer = Object.entries(JOB_KINDS).filter(([, d]) => d.finalizer).map(([k]) => k).sort();
-        expect(withFinalizer).toEqual(['anchorDocument', 'fieldPredicateBatchProof', 'grantDisclosure', 'registerPassport', 'retract',
-            'revokeDisclosure', 'sponsorFinalizedTransaction', 'sponsorSwap', 'sponsorUnboundTransaction', 'submitContractCallBatch']);
+        expect(withFinalizer).toEqual(['anchorDocument', 'fieldPredicateBatchProof', 'grantDisclosure', 'mintFactoryToken', 'registerPassport',
+            'retract', 'revokeDisclosure', 'sponsorFinalizedTransaction', 'sponsorSwap', 'sponsorUnboundTransaction', 'submitContractCallBatch']);
     });
 });

@@ -20,6 +20,8 @@ const cap = cds.test(__dirname + '/../..');
 const workerClient = require('../../srv/midnight/wallet-worker-client');
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 const offersModule = require('../../srv/submission/swap-offers');
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+const boardStatusModule = require('../../srv/submission/board-status');
 
 const API = '/api/v1/nightgate';
 const TOKEN = 'ngat_' + 'd'.repeat(64);
@@ -47,10 +49,13 @@ function describeAs(terms: { gives: [string, string]; wants: [string, string]; b
 async function post(action: string, body: Record<string, unknown>, headers: Record<string, string>) {
     return cap.axios.post(`${API}/${action}`, body, { headers, validateStatus: () => true });
 }
-async function list(params: Record<string, string | number | null>, headers: Record<string, string>) {
-    const args = Object.entries({ givesType: null, wantsType: null, tag: null, limit: null, ...params })
-        .map(([k, v]) => `${k}=${v === null ? 'null' : typeof v === 'number' ? v : `'${v}'`}`).join(',');
+async function list(params: Record<string, string | number | boolean | null>, headers: Record<string, string>) {
+    const args = Object.entries({ givesType: null, wantsType: null, tag: null, limit: null, status: null, since: null, mine: null, ...params })
+        .map(([k, v]) => `${k}=${v === null ? 'null' : typeof v === 'number' || typeof v === 'boolean' ? v : `'${v}'`}`).join(',');
     return cap.axios.get(`${API}/listSwapOffers(${args})`, { headers, validateStatus: () => true });
+}
+async function getOffer(offerId: string, headers: Record<string, string>) {
+    return cap.axios.get(`${API}/getSwapOffer(offerId=${offerId})`, { headers, validateStatus: () => true });
 }
 
 describe('offer board over HTTP', () => {
@@ -173,5 +178,94 @@ describe('offer board over HTTP', () => {
         expect(byId[c.data.offerId].status).toBe('open');
         // closing again is a no-op
         expect(await offersModule.closeSwapOffersByNullifiers(db, [shared], 'ff'.repeat(32))).toEqual([]);
+    });
+
+    it("getSwapOffer reads one offer by id in the board's shape, open or closed, for every token", async () => {
+        describeAs({ gives: [T_CERT, '1'], wants: [T_CREDIT, '70'], nullifiers: [nullifier(71)] });
+        const posted = await post('postSwapOffer', { offer: halfText(31), tags: '["single"]' }, asA);
+        expect(posted.status).toBe(200);
+        const open = await getOffer(posted.data.offerId, asToken);
+        expect(open.status).toBe(200);
+        expect(open.data).toMatchObject({ offerId: posted.data.offerId, offer: halfText(31), status: 'open', wantsAmount: '70', tags: '["single"]', filledTxHash: null, closedAt: null });
+        expect(open.data).not.toHaveProperty('posterUserId');
+        expect(open.data.changedAt).toBeTruthy();
+
+        const db = await cds.connect.to('db');
+        await offersModule.closeSwapOffersByNullifiers(db, [nullifier(71)], 'ab'.repeat(32));
+        const filled = await getOffer(posted.data.offerId, asB);
+        expect(filled.data).toMatchObject({ status: 'filled', filledTxHash: 'ab'.repeat(32) });
+        expect(filled.data.closedAt).toBeTruthy();
+        expect((await getOffer('00000000-0000-4000-8000-000000000000', asA)).status).toBe(404);
+    });
+
+    it("lists closed offers by status, every change since an instant, and the caller's own posts", async () => {
+        const type = 'e2'.repeat(32);
+        const before = new Date(Date.now() - 1).toISOString();
+        describeAs({ gives: [type, '1'], wants: [T_CREDIT, '81'], nullifiers: [nullifier(81)] });
+        const toFill = await post('postSwapOffer', { offer: halfText(41) }, asA);
+        describeAs({ gives: [type, '1'], wants: [T_CREDIT, '82'], nullifiers: [nullifier(82)] });
+        const toRetire = await post('postSwapOffer', { offer: halfText(42) }, asToken);
+        describeAs({ gives: [type, '1'], wants: [T_CREDIT, '83'], nullifiers: [nullifier(83)] });
+        const stays = await post('postSwapOffer', { offer: halfText(43) }, asA);
+        describeAs({ gives: [type, '1'], wants: [T_CREDIT, '84'], nullifiers: [nullifier(84)] });
+        const soon = new Date(Date.now() + 1200).toISOString();
+        const expiring = await post('postSwapOffer', { offer: halfText(44), expiresAt: soon }, asA);
+        const db = await cds.connect.to('db');
+        await offersModule.closeSwapOffersByNullifiers(db, [nullifier(81)], 'cd'.repeat(32));
+        expect((await post('retireSwapOffer', { offerId: toRetire.data.offerId }, asToken)).status).toBe(200);
+        await new Promise(r => setTimeout(r, 1300));
+
+        const ids = (res: any) => res.data.value.map((o: any) => o.offerId);
+        expect(ids(await list({ givesType: type }, asB))).toEqual([stays.data.offerId]);
+        expect(ids(await list({ givesType: type, status: 'filled' }, asB))).toEqual([toFill.data.offerId]);
+        expect(ids(await list({ givesType: type, status: 'retired' }, asB))).toEqual([toRetire.data.offerId]);
+        // not yet stamped by a write path: the clock alone makes it expired
+        const expired = await list({ givesType: type, status: 'expired' }, asB);
+        expect(ids(expired)).toEqual([expiring.data.offerId]);
+        expect(expired.data.value[0].status).toBe('expired');
+        expect(ids(await list({ givesType: type, status: 'all' }, asB)).sort()).toEqual(
+            [toFill, toRetire, stays, expiring].map(r => r.data.offerId).sort());
+        expect(ids(await list({ givesType: type, status: 'all', since: before }, asB))).toHaveLength(4);
+        expect(ids(await list({ givesType: type, status: 'all', since: new Date(Date.now() + 60_000).toISOString() }, asB))).toEqual([]);
+        // the clock-expired offer changed at expiresAt, never stamped: a feed started after its post still sees it
+        const afterPosts = new Date(Date.parse(expiring.data.expiresAt) - 500).toISOString();
+        const late = await list({ givesType: type, status: 'all', since: afterPosts }, asB);
+        expect(ids(late)).toContain(expiring.data.offerId);
+        expect(late.data.value.find((o: any) => o.offerId === expiring.data.offerId)).toMatchObject({ status: 'expired', changedAt: expiring.data.expiresAt });
+        // the change log: a fill moves the offer up front
+        const changes = await list({ givesType: type, status: 'all' }, asB);
+        expect(changes.data.value[0].status).not.toBe('open');
+        expect((await list({ givesType: type, status: 'bogus' }, asB)).status).toBe(400);
+        expect((await list({ givesType: type, since: 'yesterday' }, asB)).status).toBe(400);
+
+        // mine: the token sees its grant's posts, operator-a its own, operator-b (the grant's owner) nothing
+        expect(ids(await list({ givesType: type, status: 'all', mine: true }, asToken))).toEqual([toRetire.data.offerId]);
+        expect(ids(await list({ givesType: type, status: 'all', mine: true }, asA)).sort()).toEqual(
+            [toFill, stays, expiring].map(r => r.data.offerId).sort());
+        expect(ids(await list({ givesType: type, status: 'all', mine: true }, asB))).toEqual([]);
+    });
+
+    it('getBoardStatus counts open and filled offers for an anonymous reader, nothing else', async () => {
+        const type = 'd4'.repeat(32);
+        boardStatusModule.__resetBoardStatusForTests();
+        const before = await cap.axios.get('/api/v1/indexer/getBoardStatus()', { validateStatus: () => true });
+        expect(before.status).toBe(200);
+        describeAs({ gives: [type, '1'], wants: [T_CREDIT, '91'], nullifiers: [nullifier(91)] });
+        const a = await post('postSwapOffer', { offer: halfText(51) }, asA);
+        describeAs({ gives: [type, '1'], wants: [T_CREDIT, '92'], nullifiers: [nullifier(92)] });
+        await post('postSwapOffer', { offer: halfText(52) }, asA);
+        const db = await cds.connect.to('db');
+        await offersModule.closeSwapOffersByNullifiers(db, [nullifier(91)], 'ba'.repeat(32));
+        // the figures are memoized for a few seconds: a repeat read within them is the same answer
+        const memo = await cap.axios.get('/api/v1/indexer/getBoardStatus()', { validateStatus: () => true });
+        expect(memo.data).toEqual(before.data);
+        boardStatusModule.__resetBoardStatusForTests();
+        const after = await cap.axios.get('/api/v1/indexer/getBoardStatus()', { validateStatus: () => true });
+        expect(after.status).toBe(200);
+        expect(after.data.openOffers - before.data.openOffers).toBe(1);
+        expect(after.data.offersFilledToday - before.data.offersFilledToday).toBe(1);
+        expect(after.data).toMatchObject({ swapsToday: 0, sponsorsConfigured: 0, sponsorsReady: 0 });
+        expect(Object.keys(after.data).sort()).toEqual(['@odata.context', 'asOf', 'offersFilledToday', 'openOffers', 'sponsorsConfigured', 'sponsorsReady', 'swapsToday']);
+        expect(a.status).toBe(200);
     });
 });

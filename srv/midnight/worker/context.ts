@@ -73,6 +73,8 @@ export interface FacadeEntry {
     dustRestoresPersisted?: number;
     /** Session-stable secret for the `local_secret_key()` witness. */
     attestationSecret: Uint8Array;
+    /** Session-stable secret for the token factory's `issuerSecret()` witness. */
+    tokenFactoryIssuerSecret: Uint8Array;
 }
 
 export const facades = new Map<string, FacadeEntry>();

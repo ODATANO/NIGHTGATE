@@ -704,21 +704,52 @@ service NightgateService {
         expiresAt   : Timestamp;
     };
 
-    /** Open offers, newest first; filters are exact. Never the poster's identity. */
+    /**
+     * The board: open offers newest first, or with `status` the closed ones
+     * (`filled` | `retired` | `expired`, or `all`) by last change. `since`
+     * narrows to offers changed after it (a change feed when polled with
+     * `status: 'all'`); `mine` to the caller's own posts. Filters are exact.
+     * Never the poster's identity.
+     */
     function listSwapOffers(givesType: String,  // optional, 64 hex
                             wantsType: String,  // optional, 64 hex
                             tag: String,        // optional
-                            limit: Integer)     returns array of { // optional, default 50, at most 200
-        offerId     : UUID;
-        offer       : LargeString;
-        bound       : Boolean;
-        givesType   : String;
-        givesAmount : String;
-        wantsType   : String;
-        wantsAmount : String;
-        tags        : LargeString;
-        expiresAt   : Timestamp;
-        postedAt    : Timestamp;
+                            limit: Integer,     // optional, default 50, at most 200
+                            status: String,     // optional; open (default) | filled | retired | expired | all
+                            since: Timestamp,   // optional; offers changed after this instant
+                            mine: Boolean)      returns array of { // optional; only the caller's own posts
+        offerId      : UUID;
+        offer        : LargeString;
+        bound        : Boolean;
+        givesType    : String;
+        givesAmount  : String;
+        wantsType    : String;
+        wantsAmount  : String;
+        tags         : LargeString;
+        expiresAt    : Timestamp;
+        postedAt     : Timestamp;
+        status       : String; // open | filled | retired | expired
+        filledTxHash : String; // the sponsored swap that spent the half; null otherwise
+        closedAt     : Timestamp;
+        changedAt    : Timestamp;
+    };
+
+    /** One offer by id, open or closed, in the board's shape; unknown id 404. */
+    function getSwapOffer(offerId: UUID)                              returns {
+        offerId      : UUID;
+        offer        : LargeString;
+        bound        : Boolean;
+        givesType    : String;
+        givesAmount  : String;
+        wantsType    : String;
+        wantsAmount  : String;
+        tags         : LargeString;
+        expiresAt    : Timestamp;
+        postedAt     : Timestamp;
+        status       : String;
+        filledTxHash : String;
+        closedAt     : Timestamp;
+        changedAt    : Timestamp;
     };
 
     /** Retire an open offer; only its poster (same user, or the same grant for a token). */
@@ -798,6 +829,30 @@ service NightgateService {
     )                                                                 returns {
         jobId  : UUID;
         status : String; // 'pending' | 'succeeded' (idempotent retry)
+    };
+
+    /**
+     * Mint `amount` units of the caller's token `name` on a `token-factory`
+     * deployment to a Zswap coin public key. The session is the issuer: its
+     * issuer key derives from its seed, so the same name from another session
+     * is another token. The type is known before the job runs. Async; job
+     * result `{ submissionId, txHash, contractAddress, tokenType }`. Grantable
+     * (`mintFactoryToken`; circuit `mint`).
+     */
+    action   mintFactoryToken(contractAddress: String,
+                              name: String, // UTF-8, at most 32 bytes
+                              amount: String, // atoms, decimal, Uint<64>
+                              recipientCoinPublicKey: String, // 64 hex
+                              sessionId: UUID,
+                              idempotencyKey: String,
+                              sponsorSessionId: UUID)                  returns { // optional; second session pays the dust fee
+        jobId     : UUID;
+        status    : String;
+        name      : String;
+        amount    : String;
+        issuerKey : String; // the session's issuer key on the factory
+        domain    : String; // names the token in the factory's ledger
+        tokenType : String; // raw shielded token type, 64 hex
     };
 
     /**
@@ -1120,6 +1175,40 @@ service NightgateService {
         token             : String; // shown once, never stored
         allowedActions    : array of String;
         allowedContracts  : array of String; // empty = platform floor
+        allowedCircuits   : array of String;
+        allowDeploy       : Boolean;
+        maxDeploys        : Integer;
+        allowedTokenTypes : array of String;
+        validUntil        : Timestamp;
+    };
+
+    /**
+     * `count` grants of one shape on one session in one call, each with its own
+     * token (shown once) and label: `labels` (exactly `count`), else
+     * `<agentLabel | 'agent'>-1..n`. Same checks and limits as createAgentGrant;
+     * at most 50 per call.
+     */
+    action   createAgentGrants(count: Integer,
+                               sessionId: UUID,
+                               allowedActions: array of String,
+                               labels: array of String, // optional; exactly count entries
+                               maxJobsPerDay: Integer, // optional; null = unlimited, per grant
+                               sponsorSessionId: UUID, // optional; fixed fee-sponsor binding
+                               validUntil: Timestamp, // optional; null = no expiry
+                               agentLabel: String, // optional; stem of the generated labels
+                               allowedContracts: array of String, // optional
+                               allowedCircuits: array of String, // optional
+                               allowDeploy: Boolean, // optional
+                               maxDeploys: Integer, // optional; per grant
+                               allowedTokenTypes: array of String // optional
+    )                                                                 returns {
+        grants            : array of {
+            grantId    : UUID;
+            token      : String; // shown once, never stored
+            agentLabel : String;
+        };
+        allowedActions    : array of String;
+        allowedContracts  : array of String;
         allowedCircuits   : array of String;
         allowDeploy       : Boolean;
         maxDeploys        : Integer;

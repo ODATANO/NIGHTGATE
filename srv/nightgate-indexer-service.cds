@@ -93,6 +93,19 @@ service NightgateIndexerService {
     @requires: 'any'
     function getMetrics()                         returns String;
 
+    // Counts only, no identifiers or amounts: what a market page shows before
+    // anyone signs in. Sponsor readiness is the worker's last pushed reading;
+    // the figures are computed at most every 10 s.
+    @requires: 'any'
+    function getBoardStatus()                     returns {
+        openOffers         : Integer;
+        offersFilledToday  : Integer; // UTC day
+        swapsToday         : Integer; // sponsored swaps that succeeded today (UTC), none a chain failure
+        sponsorsConfigured : Integer;
+        sponsorsReady      : Integer; // at tip with a spendable dust note
+        asOf               : Timestamp;
+    };
+
 
     @requires: 'authenticated-user'
     function getRuntimeInfo()                     returns {

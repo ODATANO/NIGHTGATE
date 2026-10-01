@@ -11,8 +11,8 @@ import { reportSubmissionRejectedOn, reportBroadcastOn } from '../job-execution-
 import { PendingSubmissions } from '#cds-models/midnight';
 import { walletSponsorFinalizedTx, walletSponsorUnboundTx } from '../../midnight/wallet-worker-client';
 import { PLATFORM_POOL_SENTINEL, acquireSponsor, releaseSponsor, benchSponsor, decideSponsorFailure, sponsorCandidatesNonExclusive, touchSponsor } from '../sponsor-pool';
-import { recordDeployedContracts, recordMintedTokenTypes, reserveDeployBudget, releaseDeployBudget } from '../../sessions/agent-grants';
-import { recordLearnedTokenTypes } from '../learned-token-types';
+import { recordDeployedContracts, reserveDeployBudget, releaseDeployBudget } from '../../sessions/agent-grants';
+import { recordPlatformMint } from '../platform-mints';
 import { closeSwapOffer, closeSwapOffersByNullifiers } from '../swap-offers';
 import { sponsorAtSyncGate } from '../sponsor-sync-gate';
 import { configMs, configNumber } from '../../utils/config';
@@ -153,13 +153,10 @@ export function createSponsorExecutors(ctx: Pick<SubmissionContext, 'db'>) {
 
     /** What a landed job adds to its grant: deployed addresses, minted token types. */
     const recordOnGrant = async (command: any, out: { deployed?: string[]; minted?: string[]; txHash?: string; nullifiers?: string[] }): Promise<void> => {
-        if (out.minted?.length) {
-            await recordLearnedTokenTypes(db, out.minted, { grantId: command.grantId ?? null, sponsorSessionId: command.sponsorSessionId ?? null, txHash: out.txHash ?? null });
-        }
+        if (out.minted?.length) await recordPlatformMint(db, out.minted, { grantId: command.grantId ?? null, sponsorSessionId: command.sponsorSessionId ?? null, txHash: out.txHash ?? null });
         if (command.swap) await closeSwapOffersOf(command, out.nullifiers ?? [], out.txHash ?? null);
         if (!command.grantId) return;
         if (out.deployed?.length) await recordDeployedContracts(db, command.grantId, out.deployed);
-        if (out.minted?.length) await recordMintedTokenTypes(db, command.grantId, out.minted);
     };
 
     /** A landed swap closes the offer it filled and every other open half that shared an input. */

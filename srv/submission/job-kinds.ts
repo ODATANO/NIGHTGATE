@@ -18,10 +18,10 @@ export interface JobKindTraits {
 }
 
 /** Which executor runs a kind; `wallet` kinds are registered by the wallet-session module. */
-export type JobExecutor = 'wallet' | 'contract' | 'mintShieldedTestToken' | 'sponsorFinalized' | 'sponsorUnbound' | 'reindexDisclosures';
+export type JobExecutor = 'wallet' | 'contract' | 'mintShieldedTestToken' | 'mintFactoryToken' | 'sponsorFinalized' | 'sponsorUnbound' | 'reindexDisclosures';
 
 /** Reconciliation finalizer run once a parked job's inclusion is proven. */
-export type JobFinalizer = 'contractProjection' | 'sponsoredSubmission';
+export type JobFinalizer = 'contractProjection' | 'sponsoredSubmission' | 'factoryMint';
 
 export interface JobKindDefinition {
     traits: JobKindTraits;
@@ -51,6 +51,7 @@ export const JOB_KINDS: Readonly<Record<string, JobKindDefinition>> = {
     submitContractCall: contract('call'),
     submitContractCallBatch: contract('callBatch', HEAVY_KIND, 'contractProjection'),
     mintShieldedTestToken: { traits: HEAVY_KIND, executor: 'mintShieldedTestToken', op: 'call' },
+    mintFactoryToken: { traits: HEAVY_KIND, executor: 'mintFactoryToken', op: 'call', finalizer: 'factoryMint' },
     anchorDocument: contract('anchorDocument', HEAVY_KIND, 'contractProjection'),
     grantDisclosure: contract('grantDisclosure', HEAVY_KIND, 'contractProjection'),
     revokeDisclosure: contract('revokeDisclosure', HEAVY_KIND, 'contractProjection'),

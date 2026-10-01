@@ -20,11 +20,14 @@ import { RateLimiter } from './utils/rate-limiter';
 import { principalRateKey } from './utils/rate-limiter';
 import type { NightgateRequest } from './utils/request-types';
 import { normalizeHttpError } from './utils/http-errors';
+import { buildBoardStatus } from './submission/board-status';
 
 const log = cds.log('nightgate:indexer');
 
 // getRuntimeInfo can force a full artifact re-hash on the event loop.
 const runtimeInfoRateLimiter = new RateLimiter({ windowMs: 60 * 1000, maxRequests: 30 });
+// Anonymous and polled by pages: three count queries per call.
+const boardStatusRateLimiter = new RateLimiter({ windowMs: 60 * 1000, maxRequests: 60 });
 
 export default class NightgateIndexerService extends cds.ApplicationService {
     private db!: cds.DatabaseService;
@@ -111,6 +114,14 @@ export default class NightgateIndexerService extends cds.ApplicationService {
         });
         this.on('getWorkerStatus', async (req: NightgateRequest) =>
             buildWorkerStatus(Boolean(req.user?.is?.('admin'))));
+
+        this.on('getBoardStatus', async (req: NightgateRequest) => {
+            const rate = boardStatusRateLimiter.check(principalRateKey(req, 'board-status'));
+            if (!rate.allowed) {
+                return req.reject(429, `Rate limited. Retry after ${Math.ceil(rate.retryAfterMs / 1000)}s`);
+            }
+            return buildBoardStatus(this.db);
+        });
 
         this.on('getReadiness', async (req: NightgateRequest) => {
             const readiness = await buildReadiness(this.db);

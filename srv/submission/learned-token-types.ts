@@ -53,6 +53,9 @@ export function sharedLearnedTokenTypes(): string[] {
 }
 
 /** Record the types a landed sponsored mint created; returns the ones new to the platform. */
+/** Ceiling of the platform-wide list: it is loaded into every policy resolution, and a mint per name is cheap. */
+export const MAX_LEARNED_TOKEN_TYPES = 256;
+
 export async function recordLearnedTokenTypes(db: Runner, types: unknown[], origin: LearnedTokenTypeOrigin = {}): Promise<string[]> {
     const fresh = normalizeTokenTypes(types);
     if (fresh.length === 0) return [];
@@ -64,6 +67,14 @@ export async function recordLearnedTokenTypes(db: Runner, types: unknown[], orig
             const have = new Set((known ?? []).map(r => String(r.tokenType ?? '').toLowerCase()));
             const added = fresh.filter(t => !have.has(t));
             if (added.length === 0) return [];
+            const counted: Array<{ count?: number | string }> = await runWithoutAmbientTx(() => db.run(
+                SELECT.from(LearnedTokenTypes).columns('count(*) as count')
+            ));
+            const total = Number(counted?.[0]?.count ?? 0);
+            if (total + added.length > MAX_LEARNED_TOKEN_TYPES) {
+                log.warn(`learned token types hold ${total}; ${added.map(t => t.slice(0, 12)).join(', ')} not recorded (at most ${MAX_LEARNED_TOKEN_TYPES})`);
+                return [];
+            }
             await runWithoutAmbientTx(() => db.run(INSERT.into(LearnedTokenTypes).entries(added.map(tokenType => ({
                 tokenType,
                 grantId: origin.grantId ?? null,

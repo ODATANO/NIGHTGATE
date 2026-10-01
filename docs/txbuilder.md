@@ -99,9 +99,11 @@ and friends) run offline and feed into them.
 | `seedHex` | yes | 128 hex chars (64-byte BIP39 seed); HD derivation matches Lace |
 | `indexerHttpUrl`, `indexerWsUrl` | yes | public Midnight indexer; WS = HTTP URL + `/ws`, copy the versioned path |
 | `nodeUrl` | yes | Substrate RPC (the wallet SDK's `relayURL`) |
-| `zkConfigBaseUrl` | yes, unless `zkConfigDir` | public `/zk-config/<contract>` |
+| `package` | no | an installed lineage package (`@odatano/contract-<name>`): supplies `contractClass`, `contractName`, `privateStateId` and, without `zkConfigBaseUrl` or `zkConfigDir`, the keys directory inside the package (missing prover keys are fetched from its release assets into it, verified against `keys/manifest.json`). An explicit option still wins: with `zkConfigBaseUrl` the keys come from that server into `cacheDir` |
+| `from` | no | directory `package` resolves from, default `process.cwd()` |
+| `zkConfigBaseUrl` | yes, unless `zkConfigDir` or `package` | public `/zk-config/<contract>` |
 | `zkConfigDir` | no | local directory with `keys/` and `zkir/`; nothing is fetched, verifier keys must cover every circuit of `contractClass` |
-| `contractClass` | yes | compiled `Contract` class. 32-slot vault: `.../attestation-vault-32` with `contractName: 'attestation-vault-32'`, its `/zk-config/attestation-vault-32`, and `slotWidth: 32` on the width-dependent `prepare*` helpers |
+| `contractClass` | yes, unless `package` | compiled `Contract` class. 32-slot vault: `.../attestation-vault-32` with `contractName: 'attestation-vault-32'`, its `/zk-config/attestation-vault-32`, and `slotWidth: 32` on the width-dependent `prepare*` helpers |
 | `contractName` | no | logical contract name, default `attestation-vault`; names the default cache directory |
 | `networkId` | no | default `preprod` |
 | `accountIndex` | no | BIP32 account, default `0` |
@@ -207,9 +209,16 @@ await b.buildSponsorable({
 Without them the build fails with `Unable to resolve encryption public key
 for recipient`. Also on `calls` batches and on `buildDeploySponsorable`.
 
-### `ensureZkAssets({ zkConfigBaseUrl, cacheDir, circuits })`
+### `ensureZkAssets({ zkConfigBaseUrl, cacheDir, circuits } | { package, from?, circuits? })`
 
 Warms the asset cache (build step, container image); `createTxBuilder` calls it.
+With `package`, the installed lineage package is the cache: verifier keys and
+zkir ship with it, the missing prover keys (all circuits, or `circuits`) are
+fetched from `contract.json#zkAssetUrl` and verified against the package's
+`keys/manifest.json`; the result says `source: 'package'`.
+`resolveBuilderPackage({ package, from? })` returns what the builder reads from
+it (class, name, private-state id, keys directory, circuits) after checking the
+files against the digest in `contract.json`.
 Each run fetches `keys/manifest.json` and checks cached files by sha256:
 files of a former contract generation are replaced (`refreshed` in the result;
 a stale key fails `findDeployedContract` with `ContractTypeError`), a download
@@ -397,7 +406,10 @@ varies) or give every entry the same `witnesses` object. Vault calls get both
 from the builder. A foreign batch with neither is refused up front.
 
 **Your own contract, your own keys.** `createTxBuilder({ zkConfigDir })`, see
-the option table.
+the option table. **A lineage package:** `createTxBuilder({ package:
+'@odatano/contract-token-factory' })` takes class, name, private-state id and
+keys from the installed package; witnesses still come from you (the kit's
+`tokenFactoryWitnesses`, `prepareMint`, `prepareBurn`).
 
 **Sponsored deploy.** `buildDeploySponsorable({ initialPrivateState,
 constructorArgs, witnesses, bind })` builds, proves and signs a deploy with

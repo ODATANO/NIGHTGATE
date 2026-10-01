@@ -25,14 +25,22 @@ export interface ZkAssetResult {
     fetched: number;
     /** Files already present in the cache. With `zkConfigDir`: the verified files, i.e. every circuit's verifier key plus prover key and bzkir of the circuits to prove. */
     cached: number;
-    /** `'remote'`: a public `/zk-config`; `'local'`: `zkConfigDir`. */
-    source?: 'remote' | 'local';
+    /** `'remote'`: a public `/zk-config`; `'local'`: `zkConfigDir`; `'package'`: an installed lineage package. */
+    source?: 'remote' | 'local' | 'package';
 }
 
 export interface EnsureZkAssetsInput {
-    /** A public `/zk-config/<contract>` base URL. */
-    zkConfigBaseUrl: string;
-    cacheDir: string;
+    /** A public `/zk-config/<contract>` base URL. Required unless `package` is given. */
+    zkConfigBaseUrl?: string;
+    cacheDir?: string;
+    /**
+     * An installed lineage package (`@odatano/contract-<name>`): its verifier keys and zkir ship
+     * with it; missing prover keys are fetched from its release assets into its keys directory,
+     * each verified against `keys/manifest.json`.
+     */
+    package?: string;
+    /** Directory the package resolves from; default `process.cwd()`. */
+    from?: string;
     /** Restricts only the HEAVY prover keys + zkir; verifier keys are always fetched for verifierCircuits. */
     circuits?: string[];
     /** Full circuit list of the contract (verifier keys are needed for ALL of them). */
@@ -73,8 +81,20 @@ export interface CreateTxBuilderInput {
      * Nothing is fetched; the verifier keys must cover every circuit of `contractClass`.
      */
     zkConfigDir?: string;
-    /** The compiled contract class, e.g. from `@odatano/nightgate/browser/attestation-vault`. */
-    contractClass: Function;
+    /**
+     * An installed lineage package (`@odatano/contract-<name>`): supplies `contractClass`,
+     * `contractName`, `privateStateId` and, without `zkConfigBaseUrl` or `zkConfigDir`, the keys
+     * directory inside the package (missing prover keys are fetched from its release assets
+     * into it). An explicit option still wins: with `zkConfigBaseUrl` the keys come from that
+     * server into `cacheDir`.
+     */
+    package?: string;
+    /** Directory the package resolves from; default `process.cwd()`. */
+    from?: string;
+    /** The fetch used for prover keys (tests, proxies); default global `fetch`. */
+    fetchFn?: typeof fetch;
+    /** The compiled contract class, e.g. from `@odatano/nightgate/browser/attestation-vault`. Not needed with `package`. */
+    contractClass?: Function;
     contractName?: string;
     privateStateId?: string;
     cacheDir?: string;
@@ -363,6 +383,17 @@ export declare function withDustGuard<T>(facade: { dust: object }, opts: DustGua
 
 export declare const ATTESTATION_VAULT_CIRCUITS: string[];
 export declare function ensureZkAssets(input: EnsureZkAssetsInput): Promise<ZkAssetResult>;
+/** What `createTxBuilder({ package })` reads from an installed lineage package. */
+export interface BuilderPackage {
+    package: { name: string; version: string; root: string };
+    contractClass: Function;
+    contractName: string;
+    privateStateId: string;
+    zkConfigDir: string;
+    /** Every circuit of the artifact (its verifier keys). */
+    circuits: string[];
+}
+export declare function resolveBuilderPackage(input: { package: string; from?: string }): Promise<BuilderPackage>;
 /** Checks a local keys/ + zkir/ directory and describes it as a `ZkAssetResult` (`source: 'local'`, nothing fetched). */
 export declare function describeLocalZkAssets(zkConfigDir: string, circuits?: string[], proveCircuits?: string[]): Promise<ZkAssetResult>;
 export declare function createTxBuilder(opts: CreateTxBuilderInput): Promise<TxBuilder>;

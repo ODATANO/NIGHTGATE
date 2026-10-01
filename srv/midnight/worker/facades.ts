@@ -12,7 +12,7 @@ import { errorName, formatErr } from '../../utils/format-error';
 import { NightgateError } from '../../utils/errors';
 import { deriveIndexerWsUrl } from '../../utils/indexer-url';
 import { getSharedKeyMaterialProvider } from '../wasm-proof-provider';
-import { deriveAttestationSecret } from '../../submission/contract-witnesses';
+import { deriveAttestationSecret, deriveTokenFactoryIssuerSecret } from '../../submission/contract-witnesses';
 import { deriveRoleSeeds } from '../../utils/wallet-hd';
 import { parentPort } from 'node:worker_threads';
 import { FacadeEntry, InitArgs, ensureNetworkId, facades, getSdkVersion, loadProvingSdk, loadSdk, log, resolveProvingMode } from './context';
@@ -556,7 +556,8 @@ export async function buildFacade(args: InitArgs): Promise<FacadeEntry> {
         networkId: args.networkId,
         indexerHttpUrl: args.indexerHttpUrl,
         walletConfiguration: configuration,
-        attestationSecret: deriveAttestationSecret(roleSeeds.zswap)
+        attestationSecret: deriveAttestationSecret(roleSeeds.zswap),
+        tokenFactoryIssuerSecret: deriveTokenFactoryIssuerSecret(roleSeeds.zswap)
     };
 }
 
@@ -1021,6 +1022,7 @@ async function zeroEntry(entry: FacadeEntry, sessionId: string): Promise<void> {
         entry.dustKey?.clear?.();
         entry.unshieldedKeystore?.clear?.();
         try { entry.attestationSecret?.fill?.(0); } catch { /* not a buffer */ }
+        try { entry.tokenFactoryIssuerSecret?.fill?.(0); } catch { /* not a buffer */ }
         await entry.facade?.stop?.();
     } catch (err) {
         log('warn', `evict cleanup failed for ${sessionId.slice(0, 16)}: ${formatErr(err)}`);

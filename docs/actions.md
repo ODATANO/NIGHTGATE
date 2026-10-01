@@ -303,6 +303,30 @@ Each call mints 100000000 atoms; repeated calls mint distinct coins. Send them
 with `sendNight(tokenTypeHex)` once the wallet has synced the coin (a few
 blocks).
 
+### `mintFactoryToken(contractAddress, name, amount, recipientCoinPublicKey, sessionId, idempotencyKey?, sponsorSessionId?) → { jobId, status, name, amount, issuerKey, domain, tokenType }`
+
+Mint on the `token-factory` lineage (`@odatano/contract-token-factory`,
+registered as `token-factory`; `contractAddress` is a deployment of it). The
+session is the issuer: its issuer key derives from the session's seed, the
+`issuerSecret` witness is held by the wallet worker, the caller never sees it.
+`name` is UTF-8 of at most 32 bytes, `amount` a decimal `Uint<64>`,
+`recipientCoinPublicKey` a Zswap coin public key (`getWalletBalance` /
+txbuilder `shieldedKeys`). The result names the token before the job runs:
+`domain` (the factory's ledger key) and `tokenType` (raw, 64 hex) follow from
+issuer key, name and factory address; the same name from another session is
+another token. Job result `{ submissionId, txHash, contractAddress, tokenType }`.
+A landed mint records the type as learned (`LearnedTokenTypes`, at most 256
+types platform-wide) and, under a grant, on the grant (`mintedTokenTypes`),
+also when the indexer proves the inclusion after a lost broadcast. Grantable (`mintFactoryToken`,
+circuit `mint`, matched against `allowedContracts` / `allowedCircuits`); rate
+limit as `submitContractCall`. `404 TOKEN_FACTORY_UNAVAILABLE` without the
+lineage.
+
+```bash
+curl -X POST .../mintFactoryToken -d '{"contractAddress":"<factory>","name":"CREDIT","amount":"1000000","recipientCoinPublicKey":"<64 hex>","sessionId":"<id>"}'
+# -> { jobId, tokenType, domain, issuerKey, ... }; poll getJobStatus
+```
+
 ### `deriveTokenType(contractAddress, domainSeparator?) → { tokenTypeHex, contractAddress, domainSeparator }` (function)
 
 Compute-only. A token is `rawTokenType(domainSeparator, contractAddress)`, the
@@ -381,7 +405,8 @@ reach this endpoint can make you pay fees.
   `getTopHolders`), `verifyDocument`,
   `verifyAttestationState`, `verifyPredicateState`,
   `verifyPredicateAttestation`, `prepareDocumentProof`,
-  `prepareMembershipSet`, `deriveTokenType`, `getJobStatus`, `getGrantUsage`
+  `prepareMembershipSet`, `deriveTokenType`, `listSwapOffers`, `getSwapOffer`,
+  `claimDisclosure`, `getJobStatus`, `getGrantUsage`
   (own grant). Everything else needs `allowedActions`; wallet lifecycle,
   sends, deploys, registration and grant administration are never grantable.
 - **Re-resolved at execution.** A queued job runs under the current floor ∩
@@ -427,6 +452,12 @@ reach this endpoint can make you pay fees.
   `deployedContracts` and is sponsorable on top of `floor ∩ grant`, exempt
   from `allowedCircuits` (contract list and byte ceiling still apply).
   Maintenance updates are never sponsored.
+- **A population in one call.** `createAgentGrants(count, sessionId,
+  allowedActions, labels?, ...)` creates `count` (1 to 50) grants of one shape
+  on one session and returns every token once (`grants[{ grantId, token,
+  agentLabel }]`); `labels` names them (exactly `count`), else
+  `<agentLabel | 'agent'>-1..n`. Same checks, policy and rate limit as
+  `createAgentGrant`; `maxJobsPerDay` and `maxDeploys` apply per grant.
 - **Grant administration.** `updateAgentGrant(grantId, ...)` changes only the
   given parameters; `null` clears `maxJobsPerDay`, `validUntil`, `agentLabel`
   and the allow-lists; `sessionId`, `sponsorSessionId` and the token are
@@ -593,12 +624,24 @@ nullifiers lands in a sponsored swap (`filled`), when `expiresAt` passes
 (`expired`), or when the poster retires it. Grantable (`postSwapOffer`), also
 for a platform-pool grant. **Rate limit:** 60/hour per principal.
 
-### `listSwapOffers(givesType?, wantsType?, tag?, limit?) → [{ offerId, offer, bound, givesType, givesAmount, wantsType, wantsAmount, tags, expiresAt, postedAt }]` (function)
+### `listSwapOffers(givesType?, wantsType?, tag?, limit?, status?, since?, mine?) → [{ offerId, offer, bound, givesType, givesAmount, wantsType, wantsAmount, tags, expiresAt, postedAt, status, filledTxHash, closedAt, changedAt }]` (function)
 
 Open offers, newest first; filters are exact (64-hex types), `limit` 1 to 200
-(default 50). Never the poster's identity or the half's nullifiers. Every token
-may read the board; rate limit 600/hour per caller. Call it with all four parameters, `null` for the unused
-ones: `listSwapOffers(givesType=null,wantsType='…',tag=null,limit=20)`.
+(default 50). `status` reads the closed ones instead: `filled`, `retired`,
+`expired` (an open row past its clock counts, before any write stamps it) or
+`all`, ordered by last change (`changedAt`), a filled offer carrying its
+`filledTxHash` and `closedAt`. `since` keeps offers changed after that instant
+(an offer the clock ran out changed at `expiresAt`, stamped or not): polled
+with `status: 'all'` it is the board's change feed. `mine: true` narrows
+to the caller's own posts (a token: its grant's). Never the poster's identity
+or the half's nullifiers. Every token may read the board; rate limit 600/hour
+per caller. Call it with all seven parameters, `null` for the unused ones:
+`listSwapOffers(givesType=null,wantsType='…',tag=null,limit=20,status=null,since=null,mine=null)`.
+
+### `getSwapOffer(offerId) → { offerId, offer, …, status, filledTxHash, closedAt, changedAt }` (function)
+
+One offer by id in the board's shape, open or closed; unknown id 404. Every
+token may read it; same rate limit as the list.
 
 ### `retireSwapOffer(offerId) → { offerId, status }`
 
@@ -913,6 +956,15 @@ The crawler's view, not the wallet's; with `NIGHTGATE_CRAWLER_ENABLED=false` it 
 
 Over OData the text arrives wrapped in JSON (`{"value":"..."}`); unwrap it before feeding a Prometheus parser. The five read-only probes (`getLiveness`, `getReadiness`, `getMetrics`, `getSyncStatus`, `getHealth`) are anonymous at the model level, so a scraper or a K8s probe needs no credentials; `getReadiness()` answers 503 when a check fails. (Up to 0.24.3 the image also served plain `/nightgate/metrics|health|ready` routes behind their own bearer token; they are gone, the OData functions are the one surface.)
 
+### `getBoardStatus() → { openOffers, offersFilledToday, swapsToday, sponsorsConfigured, sponsorsReady, asOf }` (function)
+
+Counts only, anonymous like the probes: open offers, offers filled and
+sponsored swaps succeeded since UTC midnight (none a chain failure; the
+confirmer's verdict may still be pending), configured platform sponsors and
+how many are ready (at tip with a spendable dust note, from the worker's last
+pushed reading; no worker call). What a market page shows before anyone signs
+in. Computed at most every 10 s; 60/min per client.
+
 ### `getRuntimeInfo() → { version, apiVersion, network, provingMode, instanceId, runtimeMode, databaseKind, uptime, contracts[] }`
 
 Process identity plus two digests per registered contract: `artifactDigest` (the generation loaded and stamped onto persisted commands) and `currentDigest` (the files now). `digestStale: true`: artifacts were replaced under the running server; write jobs fail the generation guard until restart. A contract whose artifact does not load returns null digests with `digestError`. `currentDigest` is cached by file stat fingerprint (size, mtime, ctime, inode, mode) and re-hashed after `NIGHTGATE_ARTIFACT_DIGEST_MAX_AGE_MS` (default 5 min); `resolveContract` always hashes the bytes it imports. `@requires: 'authenticated-user'`, 30/min per client.
@@ -952,6 +1004,8 @@ Last `limit` (default 10, max 100) reorg events with depth, detected-at timestam
 `invalidateSession(sessionId)` / `invalidateAllSessions()`: force-close any session (unlike `disconnectWallet`, not only the caller's own).
 
 `exportContractSigningKey(sessionId, contractAddress, password) → { format, encryptedPayload, salt, contractAddress, accountId }`: export a contract's maintenance signing key from the session that deployed it, sealed under `password` (at least 16 characters); `importSigningKeys` restores it. Whoever holds it can replace the contract's verifier keys; store it offline.
+
+`SwapOffers` (read-only entity): the offer board with `posterUserId`, `posterGrantId`, `sessionId` and the halves' `nullifiers`, which the public reads never show.
 
 `BackgroundJobs` (read-only entity): the job queue without `command`, `request` and `result` (`command` is encrypted at rest), with full OData queries, e.g. `?$filter=status eq 'failed'&$orderby=createdAt desc`. It is a SQL view: on an existing database it appears only after `cds deploy` or `nightgate-schema-delta`.
 

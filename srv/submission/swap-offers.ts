@@ -35,6 +35,7 @@ export interface SwapOfferRow {
     filledTxHash?: string | null;
     closedAt?: string | null;
     createdAt?: string | null;
+    modifiedAt?: string | null; // maintained by the managed aspect on every update
 }
 
 export const parseJsonList = parseJsonStringList;
@@ -51,6 +52,12 @@ export async function expireSwapOffers(db: Runner, now: Date = new Date()): Prom
 export async function loadSwapOffer(db: Runner, offerId: string): Promise<SwapOfferRow | null> {
     const row = await runWithoutAmbientTx(() => db.run(SELECT.one.from(SwapOffers).where({ ID: offerId })));
     return (row as SwapOfferRow | null) ?? null;
+}
+
+/** The status a reader sees: an open row past its expiry reads as expired before any write stamps it. */
+export function effectiveSwapOfferStatus(row: SwapOfferRow, now: Date = new Date()): SwapOfferStatus {
+    if (row.status !== 'open') return row.status;
+    return row.expiresAt && Date.parse(row.expiresAt) <= now.getTime() ? 'expired' : 'open';
 }
 
 /** An offer counts as open while its row says so and its clock has not run out. */

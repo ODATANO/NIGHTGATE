@@ -19,6 +19,7 @@ import { loadPureCircuitsFromRegistry } from '../document-proof';
 import { DisclosureGrants } from '#cds-models/midnight';
 import { configMs } from '../../utils/config';
 import type { DbRunner } from '../../utils/db-types';
+import type { TokenFactoryOps } from '../token-factory';
 import type { NightgateRequest } from '../../utils/request-types';
 
 const { UPDATE } = cds.ql;
@@ -36,6 +37,7 @@ export interface SubmissionDeps {
     attestationStateReader: typeof readAttestationStateForContract;
     predicateStateReader: typeof readPredicateStateForContract;
     pureCircuitsLoader: typeof loadPureCircuitsFromRegistry;
+    tokenFactory: TokenFactoryOps;
 }
 
 /** Crawler-free checks of recorded evidence against live contract state. */

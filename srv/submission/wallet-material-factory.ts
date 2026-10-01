@@ -244,17 +244,16 @@ async function createSigningCapableWalletAdapter(seedHex: string, accountIndex: 
 
 const attesterIdCache = new Map<string, string>();
 
-export interface AttesterIdForSessionOptions {
+export interface SessionSeedOptions {
     sessionId: string;
     db?: DbRunner;
     expectedUserId?: string;
     encryptionKey?: Buffer | KeyRing;
 }
+export type AttesterIdForSessionOptions = SessionSeedOptions;
 
-/** The vault attester id (`caller_id()`) of the session's seed; cached per session, the seed is fixed. */
-export async function attesterIdForSession(opts: AttesterIdForSessionOptions): Promise<string> {
-    const cached = attesterIdCache.get(opts.sessionId);
-    if (cached) return cached;
+/** Runs `fn` over the session's role seeds and zeroes them afterwards; the session must hold a signing key. */
+export async function withSessionRoleSeeds<T>(opts: SessionSeedOptions, fn: (roleSeeds: RoleSeeds) => T | Promise<T>): Promise<T> {
     const db = opts.db ?? await cds.connect.to('db');
     const where: Record<string, unknown> = { sessionId: opts.sessionId, isActive: true };
     if (opts.expectedUserId) where.userId = opts.expectedUserId;
@@ -273,13 +272,20 @@ export async function attesterIdForSession(opts: AttesterIdForSessionOptions): P
     let roleSeeds: RoleSeeds | undefined;
     try {
         roleSeeds = await deriveRoleSeeds(seed, session.accountIndex ?? 0);
-        const attesterId = deriveAttesterId(roleSeeds.zswap);
-        attesterIdCache.set(opts.sessionId, attesterId);
-        return attesterId;
+        return await fn(roleSeeds);
     } finally {
         seed.fill(0);
         roleSeeds?.zswap.fill(0);
     }
+}
+
+/** The vault attester id (`caller_id()`) of the session's seed; cached per session, the seed is fixed. */
+export async function attesterIdForSession(opts: AttesterIdForSessionOptions): Promise<string> {
+    const cached = attesterIdCache.get(opts.sessionId);
+    if (cached) return cached;
+    const attesterId = await withSessionRoleSeeds(opts, roleSeeds => deriveAttesterId(roleSeeds.zswap));
+    attesterIdCache.set(opts.sessionId, attesterId);
+    return attesterId;
 }
 
 export function __resetAttesterIdCacheForTests(): void {

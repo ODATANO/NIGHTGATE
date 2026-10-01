@@ -17,6 +17,8 @@ import { readAttestationStateForContract } from './attestation-state';
 import { registerVerifyStateHandlers } from './verify-state';
 import { readPredicateStateForContract } from './predicate-state';
 import { loadPureCircuitsFromRegistry } from './document-proof';
+import { tokenFactoryOps, type TokenFactoryOps } from './token-factory';
+import { recordPlatformMint } from './platform-mints';
 import type { DbRunner } from '../utils/db-types';
 import { ContractCommandV1 } from './actions/common';
 import { createStateVerifiers, createDisclosureProjection, createSubmissionSupport, type SubmissionContext, type SubmissionDeps } from './actions/context';
@@ -45,6 +47,7 @@ export interface SubmissionHandlersOptions {
     attestationStateReader?: typeof readAttestationStateForContract;
     predicateStateReader?: typeof readPredicateStateForContract;
     pureCircuitsLoader?: typeof loadPureCircuitsFromRegistry;
+    tokenFactory?: TokenFactoryOps;
 }
 
 export function registerSubmissionHandlers(
@@ -61,16 +64,17 @@ export function registerSubmissionHandlers(
     const attestationStateReader = options.attestationStateReader ?? readAttestationStateForContract;
     const predicateStateReader = options.predicateStateReader ?? readPredicateStateForContract;
     const pureCircuitsLoader = options.pureCircuitsLoader ?? loadPureCircuitsFromRegistry;
+    const tokenFactory = options.tokenFactory ?? tokenFactoryOps;
 
     const deps: SubmissionDeps = {
         srv, db, walletFactory, attesterIdResolver, contractResolver, submitterFactory, argTypesLoader,
-        disclosureReindexer, attestationStateReader, predicateStateReader, pureCircuitsLoader
+        disclosureReindexer, attestationStateReader, predicateStateReader, pureCircuitsLoader, tokenFactory
     };
     const projection = createDisclosureProjection(deps);
     const ctx: SubmissionContext = { ...deps, ...createStateVerifiers(deps), ...projection, ...createSubmissionSupport(deps) };
     const executeContractCommand = createContractCommandExecutor(ctx);
     const { executeSponsorFinalized, executeSponsorUnbound } = createSponsorExecutors(ctx);
-    const { finalizeSponsoredSubmission, finalizeContractProjection } = createReconciliationFinalizers(ctx);
+    const { finalizeSponsoredSubmission, finalizeContractProjection, finalizeFactoryMint } = createReconciliationFinalizers(ctx);
 
     const executors: Record<Exclude<JobExecutor, 'wallet'>, BackgroundJobProcessor> = {
         contract: executeContractCommand,
@@ -82,13 +86,26 @@ export function registerSubmissionHandlers(
             const token = await deriveRawTokenType(String(command?.contractAddress ?? ''));
             return { ...(result ?? {}), tokenTypeHex: token.tokenTypeHex, amount: SHIELDED_TEST_TOKEN_AMOUNT.toString() };
         },
+        // A landed factory mint is a platform mint: its type is learned, and the
+        // minting grant may have offers in it sponsored.
+        mintFactoryToken: async (raw, job) => {
+            const result = await executeContractCommand(raw, job) as Record<string, unknown> | undefined;
+            const command = raw as Extract<ContractCommandV1, { op: 'call' }>;
+            const tokenType = command?.mintedTokenType;
+            if (tokenType) {
+                const txHash = typeof result?.txHash === 'string' ? result.txHash : null;
+                await recordPlatformMint(db, [tokenType], { grantId: job.grantId ?? null, sponsorSessionId: command.sponsorSessionId ?? null, txHash });
+            }
+            return { ...(result ?? {}), ...(tokenType ? { tokenType } : {}) };
+        },
         sponsorFinalized: executeSponsorFinalized,
         sponsorUnbound: executeSponsorUnbound,
         reindexDisclosures: projection.executeReindexDisclosures
     };
     const finalizers: Record<JobFinalizer, BackgroundJobReconciliationFinalizer> = {
         contractProjection: finalizeContractProjection,
-        sponsoredSubmission: finalizeSponsoredSubmission
+        sponsoredSubmission: finalizeSponsoredSubmission,
+        factoryMint: finalizeFactoryMint
     };
     for (const [kind, def] of Object.entries(JOB_KINDS)) {
         if (def.executor !== 'wallet') registerBackgroundJobProcessor(kind, 1, def.traits, executors[def.executor]);

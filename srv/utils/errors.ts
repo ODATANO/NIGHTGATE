@@ -49,6 +49,7 @@ export const ERROR_CODES = {
     RUNTIME_TOPOLOGY_UNSUPPORTED: { status: 503, doc: 'The deployment topology (replicas, multitenancy, database) is not supported.' },
     PUBLIC_VERIFY_DISABLED: { status: 404, doc: 'Unauthenticated verification is not enabled on this server.' },
     PURE_CIRCUITS_UNAVAILABLE: { status: 404, doc: 'The artifact does not export the pure circuits this operation needs.' },
+    TOKEN_FACTORY_UNAVAILABLE: { status: 404, doc: 'No token-factory lineage is registered, or the artifact is not one.' },
     RUNTIME_UNAVAILABLE: { status: 503, retryable: true, doc: 'The runtime did not start (schema, network or worker); see getRuntimeInfo.' },
     SCHEMA_NOT_DEPLOYED: { status: 503, doc: 'The database schema is missing tables or columns; run the schema delta.' },
     SESSION_NOT_FOUND: { status: 401, doc: 'The wallet session does not exist, is inactive or belongs to another user.' },

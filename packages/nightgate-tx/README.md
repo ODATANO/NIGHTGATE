@@ -125,7 +125,10 @@ for another wallet takes that wallet's keys as
 
 `createTxBuilder({ contractClass, zkConfigDir })` reads your own `keys/` and
 `zkir/` (nothing fetched; default `circuits` = those of the class;
-`zkAssets.source` says where assets came from). Witnesses come from you: one
+`zkAssets.source` says where assets came from). `createTxBuilder({ package:
+'@odatano/contract-<name>' })` takes class, name, private-state id and keys
+from an installed lineage package and fetches its missing prover keys from the
+package's release assets (`ensureZkAssets({ package })` alone warms them). Witnesses come from you: one
 shared `witnesses` object, per-call `before` hooks swap what varies (single
 calls run the same hook). `buildDeploySponsorable()` builds, proves and signs a
 DEPLOY and returns the address it will create; a sponsor pays when the grant

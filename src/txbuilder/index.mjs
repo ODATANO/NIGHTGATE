@@ -32,6 +32,11 @@ import { mkdir, writeFile, readFile, access, rename, rm } from 'node:fs/promises
 import { createHash } from 'node:crypto';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
+import { pathToFileURL } from 'node:url';
+import {
+    resolveContractPackage, contractPackageDigestProblem, readProverKeyManifest, verifierCircuits, missingProverKeys,
+    keyMatchesManifest, proverKeyUrl
+} from '@odatano/contract-kit/node';
 
 const require = createRequire(import.meta.url);
 
@@ -98,8 +103,11 @@ const exists = (p) => access(p).then(() => true, () => false);
  * The cache directory doubles as a compiled-assets directory, which is what
  * lets the local build use the same asset path the server uses.
  */
-export async function ensureZkAssets({ zkConfigBaseUrl, cacheDir, circuits = ATTESTATION_VAULT_CIRCUITS, verifierCircuits, fetchFn, onProgress }) {
-    if (!zkConfigBaseUrl) throw new Error('ensureZkAssets: zkConfigBaseUrl is required');
+export async function ensureZkAssets(input) {
+    if (input?.package) return ensurePackageProverKeys(input);
+    const { zkConfigBaseUrl, cacheDir, circuits = ATTESTATION_VAULT_CIRCUITS, verifierCircuits, fetchFn, onProgress } = input ?? {};
+    if (!zkConfigBaseUrl) throw new Error('ensureZkAssets: zkConfigBaseUrl is required (or `package`, an installed lineage package)');
+    if (!cacheDir) throw new Error('ensureZkAssets: cacheDir is required without `package`');
     const doFetch = fetchFn || fetch;
     const base = String(zkConfigBaseUrl).replace(/\/$/, '');
     await mkdir(join(cacheDir, 'keys'), { recursive: true });
@@ -179,6 +187,71 @@ export async function ensureZkAssets({ zkConfigBaseUrl, cacheDir, circuits = ATT
         }
     }
     return { cacheDir, fetched, cached, refreshed, verified: Boolean(manifest), source: 'remote' };
+}
+
+/**
+ * A lineage package ships its verifier keys, zkir and `keys/manifest.json`;
+ * the prover keys are release assets. Fetch the missing ones into the
+ * package's keys directory, each verified against the manifest.
+ */
+async function ensurePackageProverKeys({ package: packageName, from, circuits, fetchFn, onProgress }) {
+    const pkg = resolveContractPackage(packageName, from ?? process.cwd());
+    const zkConfigPath = pkg.zkConfigPath;
+    const manifest = readProverKeyManifest(zkConfigPath);
+    if (!manifest) throw new Error(`ensureZkAssets: ${pkg.name} ships no keys/manifest.json; a downloaded key cannot be verified`);
+    const all = verifierCircuits(zkConfigPath);
+    const unknown = (circuits ?? []).filter(c => !all.includes(c));
+    if (unknown.length) throw new Error(`ensureZkAssets: ${pkg.name} has no circuit ${unknown.join(', ')} (it has ${all.join(', ')})`);
+    const wanted = circuits ?? all;
+    const missing = missingProverKeys(zkConfigPath).filter(c => wanted.includes(c));
+    const doFetch = fetchFn || fetch;
+    const keysDir = join(zkConfigPath, 'keys');
+    let fetched = 0;
+    for (const circuit of missing) {
+        const expected = manifest.prover?.[circuit];
+        if (!expected) throw new Error(`ensureZkAssets: ${pkg.name}: keys/manifest.json lists no prover key for ${circuit}`);
+        const url = proverKeyUrl(pkg.manifest.zkAssetUrl, pkg.manifest.zkAssetLayout, circuit);
+        const res = await doFetch(url);
+        if (!res.ok) throw new Error(`ensureZkAssets: GET ${url} -> HTTP ${res.status}`);
+        const body = Buffer.from(await res.arrayBuffer());
+        if (!keyMatchesManifest(body, expected)) throw new Error(`ensureZkAssets: ${circuit}.prover from ${url} does not match keys/manifest.json`);
+        const dest = join(keysDir, `${circuit}.prover`);
+        const tmp = dest + '.part';
+        try {
+            await writeFile(tmp, body);
+            await rename(tmp, dest);
+        } catch (e) {
+            await rm(tmp, { force: true }).catch(() => { /* best effort */ });
+            throw e;
+        }
+        fetched++;
+        onProgress?.({ phase: 'zk-asset', circuit, file: `keys/${circuit}.prover`, fetched, cached: wanted.length - missing.length, refreshed: 0 });
+    }
+    const local = await describeLocalZkAssets(zkConfigPath, all, wanted);
+    return { ...local, fetched, cached: local.cached - fetched, refreshed: 0, verified: true, source: 'package' };
+}
+
+/**
+ * A lineage package as the builder uses it: the compiled class, the contract's
+ * name and private-state id from contract.json, and the directory its keys
+ * live in. The files must be the generation contract.json describes.
+ */
+export async function resolveBuilderPackage({ package: packageName, from }) {
+    if (!packageName) throw new Error('resolveBuilderPackage: package is required');
+    const pkg = resolveContractPackage(packageName, from ?? process.cwd());
+    const problem = contractPackageDigestProblem(pkg);
+    if (problem) throw new Error(`contract package ${packageName} is not the generation its contract.json describes: ${problem}`);
+    const mod = await import(pathToFileURL(pkg.artifactPath).href);
+    const contractClass = mod.Contract ?? mod.default?.Contract;
+    if (typeof contractClass !== 'function') throw new Error(`contract package ${packageName}: ${pkg.artifactPath} exports no Contract class`);
+    return {
+        package: { name: pkg.name, version: pkg.version, root: pkg.root },
+        contractClass,
+        contractName: pkg.manifest.name,
+        privateStateId: pkg.manifest.privateStateId,
+        zkConfigDir: pkg.zkConfigPath,
+        circuits: verifierCircuits(pkg.zkConfigPath)
+    };
 }
 
 /** GET keys/manifest.json; null when the server does not serve one or the fetch fails. */
@@ -462,8 +535,12 @@ export async function deriveIdentity(opts) {
  *                                        you run yourself, never the sponsor's. An EXPLICIT opt-in on
  *                                        purpose: a proofServerUrl given only to satisfy the SDK's config
  *                                        type must not start sending witnesses.
- * @param {string} opts.zkConfigBaseUrl   a public /zk-config/<contract>
- * @param {Function} opts.contractClass   compiled contract class (e.g. '@odatano/nightgate/browser/attestation-vault')
+ * @param {string} [opts.package]         an installed lineage package (`@odatano/contract-<name>`): supplies
+ *                                        contractClass, contractName, privateStateId and the keys directory;
+ *                                        missing prover keys are fetched from its release assets
+ * @param {string} [opts.from]            directory the package resolves from, default process.cwd()
+ * @param {string} opts.zkConfigBaseUrl   a public /zk-config/<contract>; not needed with `package` or `zkConfigDir`
+ * @param {Function} opts.contractClass   compiled contract class (e.g. '@odatano/nightgate/browser/attestation-vault'); not needed with `package`
  * @param {string} [opts.contractName]    logical name, default 'attestation-vault'
  * @param {string} [opts.privateStateId]  default 'attestationVaultPrivateState'
  * @param {string} [opts.cacheDir]        zk asset cache, default ~/.cache/nightgate-txbuilder/<contractName>
@@ -475,9 +552,7 @@ export async function deriveIdentity(opts) {
 export async function createTxBuilder(opts) {
     const {
         seedHex, networkId = 'preprod', accountIndex = 0,
-        indexerHttpUrl, indexerWsUrl, nodeUrl, zkConfigBaseUrl, contractClass,
-        contractName = 'attestation-vault',
-        privateStateId = 'attestationVaultPrivateState',
+        indexerHttpUrl, indexerWsUrl, nodeUrl, zkConfigBaseUrl,
         circuits, ttlMinutes = 30, onProgress
     } = opts ?? {};
     if (!/^[0-9a-fA-F]{128}$/.test(String(seedHex ?? ''))) {
@@ -485,12 +560,20 @@ export async function createTxBuilder(opts) {
     }
     if (!indexerHttpUrl || !indexerWsUrl) throw new Error('createTxBuilder: indexerHttpUrl and indexerWsUrl are required');
     if (!nodeUrl) throw new Error('createTxBuilder: nodeUrl is required (the Substrate RPC the wallet SDK talks to)');
-    // Proving assets come from a public /zk-config (fetched once, cached) or
-    // from a local zkConfigDir holding keys/ and zkir/.
-    if (!zkConfigBaseUrl && !opts.zkConfigDir) {
-        throw new Error('createTxBuilder: zkConfigBaseUrl is required (a public /zk-config/<contract>), unless zkConfigDir names a local directory with keys/ and zkir/');
+    // A lineage package supplies class, name, private-state id and keys
+    // directory; an explicit option still wins.
+    const fromPackage = opts.package ? await resolveBuilderPackage({ package: opts.package, from: opts.from }) : null;
+    const contractClass = opts.contractClass ?? fromPackage?.contractClass;
+    const contractName = opts.contractName ?? fromPackage?.contractName ?? 'attestation-vault';
+    const privateStateId = opts.privateStateId ?? fromPackage?.privateStateId ?? 'attestationVaultPrivateState';
+    // With a server given, its keys win over the package's release assets.
+    const zkConfigDir = opts.zkConfigDir ?? (zkConfigBaseUrl ? undefined : fromPackage?.zkConfigDir);
+    // Proving assets come from a public /zk-config (fetched once, cached), from
+    // a local zkConfigDir holding keys/ and zkir/, or from the package.
+    if (!zkConfigBaseUrl && !zkConfigDir) {
+        throw new Error('createTxBuilder: zkConfigBaseUrl is required (a public /zk-config/<contract>), unless zkConfigDir names a local directory with keys/ and zkir/ or package names an installed lineage package');
     }
-    if (typeof contractClass !== 'function') throw new Error('createTxBuilder: contractClass is required (the compiled Contract)');
+    if (typeof contractClass !== 'function') throw new Error('createTxBuilder: contractClass is required (the compiled Contract), or package');
     // Proving mode is validated HERE, before any asset fetch or SDK import,
     // like the other input checks.
     if (opts.provingMode !== undefined && opts.provingMode !== 'wasm' && opts.provingMode !== 'server') {
@@ -507,7 +590,7 @@ export async function createTxBuilder(opts) {
     if (saved !== undefined && (saved === null || typeof saved !== 'object' || ['shielded', 'unshielded', 'dust'].some(k => saved[k] !== undefined && typeof saved[k] !== 'string'))) {
         throw new Error('createTxBuilder: walletState must be the object serializeWalletState() returned');
     }
-    const cacheDir = opts.zkConfigDir ?? opts.cacheDir ?? join(homedir(), '.cache', 'nightgate-txbuilder', contractName);
+    const cacheDir = zkConfigDir ?? opts.cacheDir ?? join(homedir(), '.cache', 'nightgate-txbuilder', contractName);
 
     // 1. Proving assets: fetch once, then offline. The verifier keys must
     //    cover EVERY circuit of the contract (see ensureZkAssets); introspect
@@ -520,13 +603,17 @@ export async function createTxBuilder(opts) {
     } catch { allCircuits = undefined; }
     onProgress?.({ phase: 'zk-assets' });
     let assets;
-    if (opts.zkConfigDir) {
+    if (fromPackage && !opts.zkConfigDir && !zkConfigBaseUrl) {
+        // The package's own keys directory: verifier keys and zkir ship with
+        // it, missing prover keys come from its release assets.
+        assets = await ensureZkAssets({ package: opts.package, from: opts.from, circuits, fetchFn: opts.fetchFn, onProgress });
+    } else if (zkConfigDir) {
         // Same fallback as the remote path: a class that cannot be introspected
         // and no `circuits` given means the vault's set, never "nothing to
         // check" (empty asset directories would otherwise pass).
         const verifierSet = allCircuits ?? ATTESTATION_VAULT_CIRCUITS;
         const proveSet = circuits ?? allCircuits ?? ATTESTATION_VAULT_CIRCUITS;
-        assets = await describeLocalZkAssets(opts.zkConfigDir, verifierSet, proveSet);
+        assets = await describeLocalZkAssets(zkConfigDir, verifierSet, proveSet);
     } else {
         assets = await ensureZkAssets({
             zkConfigBaseUrl, cacheDir,
@@ -534,6 +621,7 @@ export async function createTxBuilder(opts) {
             // contract class, else the vault's set.
             circuits: circuits ?? allCircuits ?? ATTESTATION_VAULT_CIRCUITS,
             verifierCircuits: allCircuits ?? ATTESTATION_VAULT_CIRCUITS,
+            fetchFn: opts.fetchFn,
             onProgress
         });
     }

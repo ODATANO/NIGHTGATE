@@ -33,6 +33,8 @@ const log = cds.log('nightgate:agent-grants');
 export { AGENT_TOKEN_HEADER };
 const TOKEN_PREFIX = 'ngat_';
 const TOKEN_BYTES = 32;
+/** Upper bound of `createAgentGrants(count)`: one call, one shape, this many tokens. */
+const MAX_GRANTS_PER_CALL = 50;
 
 /** Write actions a grant may allow; anything else not always-allowed is a 403 for a token. */
 export const AGENT_ALLOWLISTABLE_ACTIONS: readonly string[] = [
@@ -55,7 +57,8 @@ export const AGENT_ALLOWLISTABLE_ACTIONS: readonly string[] = [
     'postSwapOffer',
     'retireSwapOffer',
     'grantDisclosureToHolders',
-    'revokeHolderDisclosure'
+    'revokeHolderDisclosure',
+    'mintFactoryToken'
 ];
 
 /** Actions that resolve no sponsor: a platform-pool grant may allow them next to the sponsoring ones. */
@@ -95,6 +98,7 @@ export const AGENT_ALWAYS_ALLOWED_EVENTS: ReadonlySet<string> = new Set([
     'prepareMembershipSet', // compute-only
     'deriveTokenType', // compute-only
     'listSwapOffers', // the board is public to every token
+    'getSwapOffer',
     'claimDisclosure', // proves a holding with a secret; no wallet, no grant scope
     'getJobStatus',
     'getGrantUsage', // narrowed to the token's own grant in enforceAgentGrant
@@ -350,7 +354,8 @@ const ACTION_CIRCUITS: Readonly<Record<string, readonly string[]>> = {
     issueDocumentDiffAttestation: ['anchorContentRoot', 'proveDocumentComparison'],
     grantDisclosure: ['grantDisclosure'],
     revokeDisclosure: ['revokeDisclosure'],
-    reindexDisclosures: []
+    reindexDisclosures: [],
+    mintFactoryToken: ['mint']
 };
 
 export function circuitsOfRequest(event: string, d: Record<string, unknown>): string[] | null {
@@ -598,40 +603,37 @@ const USAGE_WINDOW_MAX_MS = 366 * 24 * 60 * 60 * 1000;
 const USAGE_WINDOW_DEFAULT_MS = 30 * 24 * 60 * 60 * 1000;
 
 export function registerAgentGrantHandlers(srv: any, db: DbRunner): void {
-    srv.on('createAgentGrant', async (req: NightgateRequest) => {
-        if (!checkGrantAdminRate(req)) return;
-        const userId = requireUserId(req);
-        if (!userId) return;
+    interface GrantCreationInput {
+        sessionId?: string;
+        allowedActions?: string[];
+        maxJobsPerDay?: number | null;
+        sponsorSessionId?: string | null;
+        validUntil?: string | null;
+        agentLabel?: string | null;
+        allowedContracts?: string[] | null;
+        allowedCircuits?: string[] | null;
+        allowDeploy?: boolean | null;
+        maxDeploys?: number | null;
+        allowedTokenTypes?: string[] | null;
+    }
 
-        const data = req.data as {
-            sessionId?: string;
-            allowedActions?: string[];
-            maxJobsPerDay?: number | null;
-            sponsorSessionId?: string | null;
-            validUntil?: string | null;
-            agentLabel?: string | null;
-            allowedContracts?: string[] | null;
-            allowedCircuits?: string[] | null;
-            allowDeploy?: boolean | null;
-            maxDeploys?: number | null;
-            allowedTokenTypes?: string[] | null;
-        };
-
-        if (!data.sessionId) return req.reject(400, 'sessionId is required');
+    /**
+     * Everything a grant creation checks before it writes: shape, policy, the
+     * session and the sponsor. Rejects the request itself and returns undefined.
+     */
+    async function prepareGrantCreation(req: NightgateRequest, data: GrantCreationInput, userId: string): Promise<{ values: GrantShapeValues; actions: string[] } | undefined> {
+        if (!data.sessionId) { req.reject(400, 'sessionId is required'); return undefined; }
         const shape = validateGrantShape(data);
-        if (!shape.ok) return req.reject(400, shape.message);
-        const { allowDeploy, maxDeploys, allowedContracts, allowedCircuits, allowedTokenTypes } = shape.values;
+        if (!shape.ok) { req.reject(400, shape.message); return undefined; }
         const actions = shape.values.allowedActions as string[];
         const refused = policyReject(shape.values);
-        if (refused) return refused.code ? req.reject(refused as any) : req.reject(refused.status, refused.message);
+        if (refused) { if (refused.code) req.reject(refused as any); else req.reject(refused.status, refused.message); return undefined; }
 
         const session: WalletSession | undefined = await runWithoutAmbientTx(() => db.run(
             SELECT.one.from(WalletSessions).where({ sessionId: data.sessionId, isActive: true, userId })
         ));
-        if (!session) return req.reject(404, 'Session not found or inactive');
-        if (isSessionExpired(data.sessionId, session.expiresAt)) {
-            return req.reject(410, 'Session expired');
-        }
+        if (!session) { req.reject(404, 'Session not found or inactive'); return undefined; }
+        if (isSessionExpired(data.sessionId, session.expiresAt)) { req.reject(410, 'Session expired'); return undefined; }
 
         // Validate the sponsor at creation: it is injected into every write of
         // the grant, and a dead one would fail only after budget was spent.
@@ -640,13 +642,15 @@ export function registerAgentGrantHandlers(srv: any, db: DbRunner): void {
         if (data.sponsorSessionId === PLATFORM_POOL_SENTINEL) {
             const pool = getConfiguredFeeSponsorSessions(getNightgatePluginConfig());
             if (pool.length === 0) {
-                return req.reject(412, `sponsorSessionId: '${PLATFORM_POOL_SENTINEL}' requires a configured NIGHTGATE_FEE_SPONSOR_SESSION pool`);
+                req.reject(412, `sponsorSessionId: '${PLATFORM_POOL_SENTINEL}' requires a configured NIGHTGATE_FEE_SPONSOR_SESSION pool`);
+                return undefined;
             }
             const incompatible = actions.filter(a => !SPONSOR_PHASE2_ACTIONS.has(a) && !POOL_NEUTRAL_ACTIONS.has(a));
             if (incompatible.length > 0) {
-                return req.reject(400,
+                req.reject(400,
                     `a platform-pool grant may only allow 'sponsorFinalizedTransaction' / 'sponsorUnboundTransaction' / 'sponsorSwap' / 'postSwapOffer' / 'retireSwapOffer'; `
                     + `these actions resolve the sponsor directly and cannot use the pool: ${incompatible.join(', ')}`);
+                return undefined;
             }
         } else if (data.sponsorSessionId) {
             try {
@@ -658,17 +662,22 @@ export function registerAgentGrantHandlers(srv: any, db: DbRunner): void {
                 }));
             } catch (err) {
                 if (err instanceof FeeSponsorError) {
-                    return req.reject(err.httpStatus, `sponsorSessionId: ${err.message}`);
+                    req.reject(err.httpStatus, `sponsorSessionId: ${err.message}`);
+                    return undefined;
                 }
                 throw err;
             }
         }
+        return { values: shape.values, actions };
+    }
 
+    function newGrantRow(userId: string, data: GrantCreationInput, values: GrantShapeValues, actions: string[], agentLabel: string | null) {
+        const { allowDeploy, maxDeploys, allowedContracts, allowedCircuits, allowedTokenTypes } = values;
         const token = TOKEN_PREFIX + crypto.randomBytes(TOKEN_BYTES).toString('hex');
         const grant = {
             ID: cds.utils.uuid(),
             userId,
-            agentLabel: data.agentLabel ?? null,
+            agentLabel,
             sessionId: data.sessionId,
             tokenHash: hashAgentToken(token),
             allowedActions: JSON.stringify(actions),
@@ -686,14 +695,72 @@ export function registerAgentGrantHandlers(srv: any, db: DbRunner): void {
             validUntil: data.validUntil ?? null,
             isActive: true
         };
-        await db.run(INSERT.into(AgentGrants).entries(grant));
-        log.info(`agent grant ${grant.ID} created for session ${String(data.sessionId).slice(0, 8)}… ` +
-            `(actions: ${actions.join(', ')}${grant.maxJobsPerDay ? `, budget ${grant.maxJobsPerDay}/day` : ''}` +
-            `${allowedContracts.length ? `, contracts ${allowedContracts.map(c => c.slice(0, 12)).join('|')}` : ''}` +
-            `${allowedCircuits.length ? `, circuits ${allowedCircuits.join('|')}` : ''}` +
-            `${allowedTokenTypes.length ? `, token types ${allowedTokenTypes.map(t => t.slice(0, 12)).join('|')}` : ''})`);
+        return { grant, token };
+    }
 
-        return { grantId: grant.ID, token, allowedActions: actions, allowedContracts, allowedCircuits, allowDeploy, maxDeploys, allowedTokenTypes, validUntil: grant.validUntil };
+    function describeGrantCreation(values: GrantShapeValues, actions: string[], maxJobsPerDay: number | null | undefined): string {
+        const { allowedContracts, allowedCircuits, allowedTokenTypes } = values;
+        return `actions: ${actions.join(', ')}${maxJobsPerDay ? `, budget ${maxJobsPerDay}/day` : ''}`
+            + `${allowedContracts.length ? `, contracts ${allowedContracts.map(c => c.slice(0, 12)).join('|')}` : ''}`
+            + `${allowedCircuits.length ? `, circuits ${allowedCircuits.join('|')}` : ''}`
+            + `${allowedTokenTypes.length ? `, token types ${allowedTokenTypes.map(t => t.slice(0, 12)).join('|')}` : ''}`;
+    }
+
+    function grantShapeView(values: GrantShapeValues, actions: string[], validUntil: string | null) {
+        const { allowDeploy, maxDeploys, allowedContracts, allowedCircuits, allowedTokenTypes } = values;
+        return { allowedActions: actions, allowedContracts, allowedCircuits, allowDeploy, maxDeploys, allowedTokenTypes, validUntil };
+    }
+
+    srv.on('createAgentGrant', async (req: NightgateRequest) => {
+        if (!checkGrantAdminRate(req)) return;
+        const userId = requireUserId(req);
+        if (!userId) return;
+        const data = req.data as GrantCreationInput;
+        const prepared = await prepareGrantCreation(req, data, userId);
+        if (!prepared) return;
+        const { values, actions } = prepared;
+
+        const { grant, token } = newGrantRow(userId, data, values, actions, data.agentLabel ?? null);
+        await db.run(INSERT.into(AgentGrants).entries(grant));
+        log.info(`agent grant ${grant.ID} created for session ${String(data.sessionId).slice(0, 8)}… (${describeGrantCreation(values, actions, grant.maxJobsPerDay)})`);
+
+        return { grantId: grant.ID, token, ...grantShapeView(values, actions, grant.validUntil) };
+    });
+
+    // One shape, N grants: a population of agents on one session, each with a
+    // token and label of its own.
+    srv.on('createAgentGrants', async (req: NightgateRequest) => {
+        if (!checkGrantAdminRate(req)) return;
+        const userId = requireUserId(req);
+        if (!userId) return;
+        const data = req.data as GrantCreationInput & { count?: number; labels?: string[] | null };
+        const count = Number(data.count);
+        if (!Number.isInteger(count) || count < 1 || count > MAX_GRANTS_PER_CALL) {
+            return req.reject(400, `count must be an integer from 1 to ${MAX_GRANTS_PER_CALL}`);
+        }
+        let labels: string[];
+        if (data.labels !== undefined && data.labels !== null) {
+            if (!Array.isArray(data.labels) || data.labels.length !== count || data.labels.some(l => typeof l !== 'string' || l.trim() === '')) {
+                return req.reject(400, 'labels must be an array of count non-empty strings');
+            }
+            labels = data.labels.map(l => l.trim());
+            if (labels.some(l => l.length > 100)) return req.reject(400, 'labels: each at most 100 characters');
+        } else {
+            const stem = (data.agentLabel ?? 'agent').trim() || 'agent';
+            labels = Array.from({ length: count }, (_, i) => `${stem}-${i + 1}`.slice(0, 100));
+        }
+        const prepared = await prepareGrantCreation(req, data, userId);
+        if (!prepared) return;
+        const { values, actions } = prepared;
+
+        const rows = labels.map(label => newGrantRow(userId, data, values, actions, label));
+        await db.run(INSERT.into(AgentGrants).entries(rows.map(r => r.grant)));
+        log.info(`${rows.length} agent grants created for session ${String(data.sessionId).slice(0, 8)}… (${describeGrantCreation(values, actions, data.maxJobsPerDay)})`);
+
+        return {
+            grants: rows.map(({ grant, token }) => ({ grantId: grant.ID, token, agentLabel: grant.agentLabel })),
+            ...grantShapeView(values, actions, data.validUntil ?? null)
+        };
     });
 
     srv.on('revokeAgentGrant', async (req: NightgateRequest) => {

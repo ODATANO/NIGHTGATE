@@ -184,7 +184,7 @@ are clamped with a warning; booleans: `true`/`false`, `1`/`0`, `yes`/`no`,
 | `NIGHTGATE_DUST_COLD_START` | bool | `false` | `true` starts the dust sub-wallet from the secret key instead of the persisted state (diagnostic). Read in the wallet worker. |
 | `NIGHTGATE_DUST_REGISTER_SETTLE_MS` | ms (min 0) | `90000` | How long `registerForDustGeneration` waits for the registration to apply locally before it reports `settled: false`; default `90000`. Read in the wallet worker. |
 | `NIGHTGATE_SIGNING_KEY_RATE_LIMIT` | int (min 1) | `10` | `connectWalletForSigning` attempts per hour per principal; default `10`. |
-| `NIGHTGATE_GRANT_ADMIN_RATE_LIMIT` | int (min 1) | `10` | Grant administration calls (`createAgentGrant`, `updateAgentGrant`, `rotateAgentGrantToken`, `revokeAgentGrant`) per hour per principal; default `10`. |
+| `NIGHTGATE_GRANT_ADMIN_RATE_LIMIT` | int (min 1) | `10` | Grant administration calls (`createAgentGrant`, `createAgentGrants`, `updateAgentGrant`, `rotateAgentGrantToken`, `revokeAgentGrant`) per hour per principal; default `10`. |
 | `NIGHTGATE_PUBLIC_VERIFY` | bool | `false` | Serve `verifyAttestationState` and `verifyPredicateState` without credentials under `/api/v1/verify` (the image admits the path unauthenticated and answers CORS preflight with `*`); default off, the functions answer `404 PUBLIC_VERIFY_DISABLED`. |
 | `NIGHTGATE_PUBLIC_VERIFY_RATE_LIMIT` | int (min 1) | `60` | Public verify calls per minute per client address; default `60`. |
 | `NIGHTGATE_CLAIM_LIFETIME_S` | int (min 60) | `31536000` | Default claim lifetime in seconds for the issue* actions when the caller passes no `validUntil`; default one year, the vault caps a claim at five years ahead. |
@@ -329,6 +329,7 @@ Every error response carries `error.code`: a specific code where a client can ac
 | `RUNTIME_TOPOLOGY_UNSUPPORTED` | 503 | no | The deployment topology (replicas, multitenancy, database) is not supported. |
 | `PUBLIC_VERIFY_DISABLED` | 404 | no | Unauthenticated verification is not enabled on this server. |
 | `PURE_CIRCUITS_UNAVAILABLE` | 404 | no | The artifact does not export the pure circuits this operation needs. |
+| `TOKEN_FACTORY_UNAVAILABLE` | 404 | no | No token-factory lineage is registered, or the artifact is not one. |
 | `RUNTIME_UNAVAILABLE` | 503 | yes | The runtime did not start (schema, network or worker); see getRuntimeInfo. |
 | `SCHEMA_NOT_DEPLOYED` | 503 | no | The database schema is missing tables or columns; run the schema delta. |
 | `SESSION_NOT_FOUND` | 401 | no | The wallet session does not exist, is inactive or belongs to another user. |

@@ -44,6 +44,16 @@ const mockStartJob = vi.hoisted(() => (vi.fn(async (args: any) => {
     return { jobId: `job-${args.kind}-test`, status: 'pending' as const };
 })));
 const registeredProcessors = vi.hoisted(() => new Map<string, (command: unknown, row: any) => Promise<unknown>>());
+const recordLearnedSpy = vi.hoisted(() => vi.fn(async () => []));
+const recordMintedSpy = vi.hoisted(() => vi.fn(async () => undefined));
+vi.mock('../../srv/submission/learned-token-types', async (importOriginal) => ({
+    ...(await importOriginal<any>()),
+    recordLearnedTokenTypes: (...args: unknown[]) => (recordLearnedSpy as any)(...args)
+}));
+vi.mock('../../srv/sessions/agent-grants', async (importOriginal) => ({
+    ...(await importOriginal<any>()),
+    recordMintedTokenTypes: (...args: unknown[]) => (recordMintedSpy as any)(...args)
+}));
 const childCommandLog = vi.hoisted(() => [] as Array<{ kind: string; step: string; command: any }>);
 const registeredFinalizers = vi.hoisted(() => new Map<string, (command: unknown, row: any, evidence: any) => Promise<unknown>>());
 vi.mock('../../srv/submission/background-jobs', async (importOriginal) => ({
@@ -95,7 +105,7 @@ import { ContractNotRegisteredError, registerContract, unregisterContract, getAr
 // the digest only reads bytes.
 beforeAll(() => {
     const fixtureArtifact = path.resolve(__dirname, '../fixtures/fake-vault-artifact.mjs');
-    for (const name of ['attestation-vault', 'a', 'x']) {
+    for (const name of ['attestation-vault', 'a', 'x', 'token-factory']) {
         registerContract(name, {
             artifactPath: fixtureArtifact,
             privateStateId: 'test',
@@ -107,6 +117,7 @@ afterAll(() => {
     unregisterContract('attestation-vault');
     unregisterContract('a');
     unregisterContract('x');
+    unregisterContract('token-factory');
 });
 import {
     SessionNotFoundError,
@@ -330,6 +341,129 @@ describe('submitContractCallBatch: argument validation', () => {
 });
 
 // ---- Error translation ----------------------------------------------------
+
+describe('mintFactoryToken', () => {
+    const FACTORY = 'd96fcca18b3ca748af0c0934d88a47113bb52e586afe334f3d9f5e66e5aea02c';
+    const RECIPIENT = '1b'.repeat(32);
+    const ISSUER = '2c'.repeat(32);
+    const TOKEN = { issuerKey: ISSUER, domain: '3d'.repeat(32), tokenType: '4e'.repeat(32) };
+
+    // The executor re-reads the grant when a job runs: this row is what every db read answers.
+    const GRANT_ROW = { ID: 'grant-9', userId: 'test-user', sessionId: 'mint-f1', isActive: true, allowedActions: JSON.stringify(['mintFactoryToken']), allowedCircuits: JSON.stringify(['mint']) };
+    function setup(overrides: any = {}) {
+        const srv = makeFakeService();
+        const tokenFactory = {
+            issuerKeyForSession: vi.fn(async () => ISSUER),
+            describeToken: vi.fn(async () => ({ ...TOKEN }))
+        };
+        // The fixture has no contract-info.json: hand the executor the factory's mint signature.
+        const mintArgTypes = [
+            { name: 'name', kind: 'Bytes', length: 32 },
+            { name: 'amount', kind: 'Uint', maxval: 2 ** 64 },
+            { name: 'recipient', kind: 'Struct', elements: [{ name: 'bytes', kind: 'Bytes', length: 32 }] }
+        ];
+        registerSubmissionHandlers(srv as any, { run: vi.fn(async () => ({ ...GRANT_ROW })) } as any, {
+            attesterIdResolver: vi.fn(async () => ATTESTER_ID),
+            resolveContractImpl: vi.fn(async () => ({ ...RESOLVED_CONTRACT_FIXTURE })),
+            circuitArgTypesLoader: vi.fn((_: string, circuit: string) => (circuit === 'mint' ? mintArgTypes as any : undefined)),
+            walletMaterialFactory: vi.fn(async () => ({
+                accountId: 'acc', privateStoragePasswordProvider: () => '0123456789ABCDEFG', walletAndMidnightProvider: {},
+                ensureFacade: vi.fn(async () => undefined)
+            })),
+            submitterFactory: vi.fn(() => makeSuccessfulSubmitter()),
+            tokenFactory,
+            ...overrides
+        });
+        return { srv, tokenFactory };
+    }
+    const valid = { contractAddress: FACTORY, name: 'CREDIT', amount: '1000', recipientCoinPublicKey: RECIPIENT, sessionId: 'mint-f1' };
+
+    beforeEach(() => { recordLearnedSpy.mockClear(); recordMintedSpy.mockClear(); });
+
+    test('validates address, name, amount, recipient and session before any wallet or registry work', async () => {
+        const { srv, tokenFactory } = setup();
+        const cases: Array<[Record<string, unknown>, RegExp]> = [
+            [{ ...valid, contractAddress: undefined }, /contractAddress/],
+            [{ ...valid, contractAddress: 'zz' }, /64 hex/],
+            [{ ...valid, name: '' }, /name/],
+            [{ ...valid, name: 'x'.repeat(33) }, /32 bytes/],
+            [{ ...valid, amount: '0' }, /positive/],
+            [{ ...valid, amount: '1.5' }, /integer/],
+            [{ ...valid, amount: '18446744073709551616' }, /Uint<64>/],
+            [{ ...valid, recipientCoinPublicKey: 'abc' }, /recipientCoinPublicKey/],
+            [{ ...valid, sessionId: undefined }, /sessionId/]
+        ];
+        for (const [data, re] of cases) {
+            const req = makeReq(data);
+            await srv.handlers['mintFactoryToken'](req);
+            expect(req.reject, JSON.stringify(data)).toHaveBeenCalledWith(400, expect.stringMatching(re));
+        }
+        expect(tokenFactory.issuerKeyForSession).not.toHaveBeenCalled();
+        expect(mockStartJob).not.toHaveBeenCalledWith(expect.objectContaining({ kind: 'mintFactoryToken' }));
+    });
+
+    test('enqueues mint(name, amount, recipient) on the token-factory lineage with the type known up front', async () => {
+        const { srv, tokenFactory } = setup();
+        const req = makeReq({ ...valid, contractAddress: FACTORY.toUpperCase(), amount: 1000 });
+        const out = await srv.handlers['mintFactoryToken'](req);
+        expect(req.reject).not.toHaveBeenCalled();
+        expect(out).toEqual({
+            jobId: 'job-mintFactoryToken-test', status: 'pending',
+            name: 'CREDIT', amount: '1000', issuerKey: ISSUER, domain: TOKEN.domain, tokenType: TOKEN.tokenType
+        });
+        expect(tokenFactory.issuerKeyForSession).toHaveBeenCalledWith(expect.objectContaining({ sessionId: 'mint-f1', expectedUserId: 'test-user' }));
+        expect(tokenFactory.describeToken).toHaveBeenCalledWith({ issuerKey: ISSUER, name: 'CREDIT', contractAddress: FACTORY });
+        const call = mockStartJob.mock.calls.at(-1)?.[0];
+        expect(call).toMatchObject({
+            kind: 'mintFactoryToken', sessionId: 'mint-f1', requestedBy: 'test-user', encryptCommand: true,
+            request: { contractAddress: FACTORY, name: 'CREDIT', amount: '1000', recipientCoinPublicKey: RECIPIENT, tokenType: TOKEN.tokenType },
+            command: {
+                op: 'call', circuit: 'mint', compiledArtifactRef: 'token-factory', contractAddress: FACTORY, mintedTokenType: TOKEN.tokenType,
+                args: [{ $bytes: Buffer.from('CREDIT').toString('hex').padEnd(64, '0') }, { $uint: '1000' }, { bytes: { $bytes: RECIPIENT } }]
+            }
+        });
+        expect(JSON.stringify(call.request)).not.toMatch(/issuerSecret/);
+    });
+
+    test('the executor records the landed type as learned and on the grant, and returns it with the call result', async () => {
+        const submitter = makeSuccessfulSubmitter();
+        setup({ submitterFactory: vi.fn(() => submitter) });
+        const processor = registeredProcessors.get('mintFactoryToken\u00001');
+        expect(processor).toBeTypeOf('function');
+        const command = {
+            op: 'call', contractAddress: FACTORY, circuit: 'mint', compiledArtifactRef: 'token-factory',
+            args: [{ $bytes: '00'.repeat(32) }, { $uint: '1' }, { bytes: { $bytes: RECIPIENT } }],
+            mintedTokenType: TOKEN.tokenType, artifactDigest: getArtifactGenerationDigest('token-factory')
+        };
+        const result: any = await processor!(command, { ID: 'job-x', kind: 'mintFactoryToken', sessionId: 'mint-f1', requestedBy: 'test-user', grantId: 'grant-9', commandVersion: 1, command: JSON.stringify(command) });
+        expect(result).toMatchObject({ txHash: '0xcafe', tokenType: TOKEN.tokenType });
+        const [callArgs] = (submitter.call as any).mock.calls.at(-1);
+        expect(callArgs.circuit).toBe('mint');
+        expect(callArgs.args[1]).toBe(1n);
+        expect(Buffer.from(callArgs.args[2].bytes).toString('hex')).toBe(RECIPIENT);
+        expect(recordLearnedSpy).toHaveBeenCalledWith(expect.anything(), [TOKEN.tokenType], expect.objectContaining({ grantId: 'grant-9', txHash: '0xcafe' }));
+        expect(recordMintedSpy).toHaveBeenCalledWith(expect.anything(), 'grant-9', [TOKEN.tokenType]);
+
+        // the finalizer does the same bookkeeping when the indexer proves the mint after a lost broadcast
+        recordLearnedSpy.mockClear(); recordMintedSpy.mockClear();
+        const finalizer = registeredFinalizers.get('mintFactoryToken\u00001')!;
+        expect(finalizer).toBeTypeOf('function');
+        const finalized: any = await finalizer(command, { ID: 'job-z', kind: 'mintFactoryToken', sessionId: 'mint-f1', grantId: 'grant-9' }, { submissionId: null, txHash: 'ab'.repeat(32), contractAddress: FACTORY, finalizedAt: null, blockHeight: 7 });
+        expect(finalized).toMatchObject({ reconciled: true, txHash: 'ab'.repeat(32), tokenType: TOKEN.tokenType, contractAddress: FACTORY });
+        expect(recordLearnedSpy).toHaveBeenCalledWith(expect.anything(), [TOKEN.tokenType], expect.objectContaining({ grantId: 'grant-9', txHash: 'ab'.repeat(32) }));
+        expect(recordMintedSpy).toHaveBeenCalledWith(expect.anything(), 'grant-9', [TOKEN.tokenType]);
+
+        // a grant whose circuit list lacks `mint` stops the queued job
+        setup();
+        GRANT_ROW.allowedCircuits = JSON.stringify(['attest']);
+        try {
+            await expect(registeredProcessors.get('mintFactoryToken\u00001')!(command, { ID: 'job-y', kind: 'mintFactoryToken', sessionId: 'mint-f1', requestedBy: 'test-user', grantId: 'grant-9', commandVersion: 1, command: JSON.stringify(command) }))
+                .rejects.toMatchObject({ code: 'AGENT_GRANT_SCOPE' });
+        } finally {
+            GRANT_ROW.allowedCircuits = JSON.stringify(['mint']);
+        }
+    });
+});
 
 describe('mintShieldedTestToken + deriveTokenType', () => {
     const ADDRESS = 'c8f426c52a5418f3b0acda284ee04d530a38f68ab3c701116fa42fae0e90cfd6';

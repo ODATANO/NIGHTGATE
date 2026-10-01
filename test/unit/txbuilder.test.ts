@@ -165,6 +165,13 @@ describe('txbuilder: ensureZkAssets', () => {
     });
 });
 
+describe('txbuilder: ensureZkAssets input', () => {
+    it('names the missing cacheDir instead of failing inside path.join', async () => {
+        const { ensureZkAssets } = await importTxBuilder();
+        await expect(ensureZkAssets({ zkConfigBaseUrl: 'https://s/zk-config/x' } as any)).rejects.toThrow(/cacheDir is required/);
+    });
+});
+
 describe('txbuilder: zkConfigDir assets keep the public ZkAssetResult shape', () => {
     let dir: string;
     beforeEach(async () => { dir = await mkdtemp(join(tmpdir(), 'ng-txb-local-')); });
@@ -223,6 +230,121 @@ describe('txbuilder: zkConfigDir assets keep the public ZkAssetResult shape', ()
         // circuits not proven here need only their verifier key
         await writeFile(join(dir, 'keys', 'anchorContentRoot.verifier'), 'v');
         expect((await describeLocalZkAssets(dir, ['attest', 'anchorContentRoot'], ['attest'])).source).toBe('local');
+    });
+});
+
+describe('txbuilder: a lineage package as the asset source', () => {
+    // A fake lineage package in a node_modules layout: compiled class, verifier
+    // keys, zkir and keys/manifest.json ship; the prover keys are "release assets".
+    const PKG = '@odatano/contract-fake';
+    const ASSETS = 'https://assets.example/fake-v0.0.1';
+    const proverBody = (circuit: string) => Buffer.from(`prover-key-of-${circuit}`);
+    let root: string;
+    let pkgRoot: string;
+
+    async function writePackage(opts: { digest?: string } = {}) {
+        const { createHash } = await import('node:crypto');
+        const { computeArtifactGenerationDigest } = await import('@odatano/contract-kit/node' as string);
+        pkgRoot = join(root, 'node_modules', '@odatano', 'contract-fake');
+        const zk = join(pkgRoot, 'managed', 'fake');
+        await mkdir(join(zk, 'contract'), { recursive: true });
+        await mkdir(join(zk, 'keys'), { recursive: true });
+        await mkdir(join(zk, 'zkir'), { recursive: true });
+        await writeFile(join(pkgRoot, 'package.json'), JSON.stringify({ name: PKG, version: '0.0.1', type: 'module' }));
+        await writeFile(join(zk, 'contract', 'index.js'), 'export class Contract { constructor(w) { this.witnesses = w; this.impureCircuits = { mint() {}, burn() {} }; } }\n');
+        const sha = (b: Buffer) => ({ sha256: createHash('sha256').update(b).digest('hex'), bytes: b.length });
+        const manifest: any = { version: 1, prover: {}, verifier: {}, zkir: {} };
+        for (const c of ['burn', 'mint']) {
+            const v = Buffer.from(`verifier-${c}`); const z = Buffer.from(`zkir-${c}`);
+            await writeFile(join(zk, 'keys', `${c}.verifier`), v);
+            await writeFile(join(zk, 'zkir', `${c}.bzkir`), z);
+            manifest.prover[c] = sha(proverBody(c)); manifest.verifier[c] = sha(v); manifest.zkir[c] = sha(z);
+        }
+        await writeFile(join(zk, 'keys', 'manifest.json'), JSON.stringify(manifest, null, 2));
+        const digest = opts.digest ?? computeArtifactGenerationDigest({ artifactPath: join(zk, 'contract', 'index.js'), privateStateId: 'fakePrivateState', zkConfigPath: zk });
+        await writeFile(join(pkgRoot, 'contract.json'), JSON.stringify({
+            name: 'fake', role: 'example', privateStateId: 'fakePrivateState', artifactPath: 'managed/fake/contract/index.js', zkConfigPath: 'managed/fake',
+            circuits: ['burn', 'mint'], compactCompiler: '0.31.0', compactRuntime: '0.16.0', digest, zkAssetUrl: ASSETS, zkAssetLayout: 'flat'
+        }));
+        return zk;
+    }
+    const assetFetch = (seen: string[], bodies: Record<string, Buffer> = {}) => (async (url: string) => {
+        seen.push(url);
+        const circuit = url.slice(url.lastIndexOf('/') + 1).replace(/\.prover$/, '');
+        return { ok: true, status: 200, arrayBuffer: async () => bodies[circuit] ?? proverBody(circuit) };
+    }) as any;
+
+    beforeEach(async () => { root = await mkdtemp(join(tmpdir(), 'ng-txb-pkg-')); });
+    afterEach(async () => { await rm(root, { recursive: true, force: true }); });
+
+    it('ensureZkAssets({ package }) fetches the missing prover keys from the release assets into the package, verified against its manifest', async () => {
+        const { ensureZkAssets } = await importTxBuilder();
+        const zk = await writePackage();
+        const seen: string[] = [];
+        const first = await ensureZkAssets({ package: PKG, from: root, fetchFn: assetFetch(seen) });
+        expect(seen.sort()).toEqual([`${ASSETS}/burn.prover`, `${ASSETS}/mint.prover`]);
+        expect(first).toMatchObject({ cacheDir: zk, fetched: 2, cached: 4, refreshed: 0, source: 'package' });
+        expect((await readFile(join(zk, 'keys', 'mint.prover'))).equals(proverBody('mint'))).toBe(true);
+        // second run: nothing to fetch
+        const again: string[] = [];
+        const second = await ensureZkAssets({ package: PKG, from: root, fetchFn: assetFetch(again) });
+        expect(again).toEqual([]);
+        expect(second).toMatchObject({ fetched: 0, cached: 6, source: 'package' });
+    });
+
+    it('a key that does not match the manifest is refused and leaves no file; circuits restricts the fetch, an unknown circuit is an error', async () => {
+        const { ensureZkAssets } = await importTxBuilder();
+        const zk = await writePackage();
+        await expect(ensureZkAssets({ package: PKG, from: root, fetchFn: assetFetch([], { burn: Buffer.from('tampered') }) }))
+            .rejects.toThrow(/burn\.prover .* does not match keys\/manifest\.json/);
+        const files = await readdir(join(zk, 'keys'));
+        expect(files.some(f => f.startsWith('burn.prover'))).toBe(false);
+        const seen: string[] = [];
+        expect((await ensureZkAssets({ package: PKG, from: root, circuits: ['burn'], fetchFn: assetFetch(seen) })).fetched).toBe(1);
+        expect(seen).toEqual([`${ASSETS}/burn.prover`]);
+        await expect(ensureZkAssets({ package: PKG, from: root, circuits: ['transfer'], fetchFn: assetFetch([]) })).rejects.toThrow(/no circuit transfer/);
+        await expect(ensureZkAssets({ package: '@odatano/contract-missing', from: root, fetchFn: assetFetch([]) })).rejects.toThrow(/not installed/);
+    });
+
+    it('resolveBuilderPackage reads class, name, private-state id, keys directory and circuits; a package whose files are not its digest is refused', async () => {
+        const { resolveBuilderPackage } = await importTxBuilder();
+        const zk = await writePackage();
+        const out = await resolveBuilderPackage({ package: PKG, from: root });
+        expect(out).toMatchObject({ package: { name: PKG, version: '0.0.1' }, contractName: 'fake', privateStateId: 'fakePrivateState', zkConfigDir: zk, circuits: ['burn', 'mint'] });
+        expect(typeof out.contractClass).toBe('function');
+        await rm(root, { recursive: true, force: true });
+        root = await mkdtemp(join(tmpdir(), 'ng-txb-pkg-'));
+        await writePackage({ digest: 'f'.repeat(64) });
+        await expect(resolveBuilderPackage({ package: PKG, from: root })).rejects.toThrow(/not the generation its contract\.json describes/);
+    });
+
+    it('an explicit zkConfigBaseUrl next to package wins: keys come from that server into cacheDir, not from the release assets', async () => {
+        const { createTxBuilder } = await importTxBuilder();
+        await writePackage();
+        const seen: string[] = [];
+        const stop = new Error('stop-at-assets');
+        const fetchFn = (async (url: string) => { seen.push(url); throw stop; }) as any;
+        const cacheDir = join(root, 'cache');
+        await expect(createTxBuilder({
+            seedHex: 'ab'.repeat(64), indexerHttpUrl: 'http://i', indexerWsUrl: 'ws://i', nodeUrl: 'ws://n',
+            package: PKG, from: root, zkConfigBaseUrl: 'http://s/zk-config/fake', cacheDir, fetchFn
+        } as any)).rejects.toBe(stop);
+        expect(seen.every(u => u.startsWith('http://s/zk-config/fake/'))).toBe(true);
+        expect(seen.some(u => u.includes('assets.example'))).toBe(false);
+        expect((await readdir(cacheDir)).sort()).toEqual(['keys', 'zkir']);
+    });
+
+    it('createTxBuilder({ package }) needs neither zkConfigBaseUrl nor contractClass and warms the package keys before anything else', async () => {
+        const { createTxBuilder } = await importTxBuilder();
+        await writePackage();
+        const seen: string[] = [];
+        const stop = new Error('stop-at-assets');
+        const fetchFn = (async (url: string) => { seen.push(url); throw stop; }) as any;
+        await expect(createTxBuilder({
+            seedHex: 'ab'.repeat(64), indexerHttpUrl: 'http://i', indexerWsUrl: 'ws://i', nodeUrl: 'ws://n',
+            package: PKG, from: root, fetchFn
+        } as any)).rejects.toBe(stop);
+        expect(seen).toEqual([`${ASSETS}/burn.prover`]);
     });
 });
 

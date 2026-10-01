@@ -269,6 +269,75 @@ describe('agent grants', () => {
     // revokeAgentGrant
     // ------------------------------------------------------------------
 
+    describe('createAgentGrants', () => {
+        const VALID = { count: 3, sessionId: 'sess-1', allowedActions: ['postSwapOffer', 'retireSwapOffer'] };
+
+        it('bounds count and labels before reading anything', async () => {
+            for (const bad of [{ ...VALID, count: 0 }, { ...VALID, count: 51 }, { ...VALID, count: 2.5 }, { ...VALID, count: undefined }]) {
+                const req = makeReq(bad);
+                await handlers.createAgentGrants(req);
+                expect(req.reject).toHaveBeenCalledWith(400, expect.stringContaining('count'));
+            }
+            const short = makeReq({ ...VALID, labels: ['a', 'b'] });
+            await handlers.createAgentGrants(short);
+            expect(short.reject).toHaveBeenCalledWith(400, expect.stringContaining('labels'));
+            const blank = makeReq({ ...VALID, labels: ['a', ' ', 'c'] });
+            await handlers.createAgentGrants(blank);
+            expect(blank.reject).toHaveBeenCalledWith(400, expect.stringContaining('labels'));
+            expect(mockDbRun).not.toHaveBeenCalled();
+        });
+
+        it('validates like a single creation: a non-grantable action, a missing session', async () => {
+            const req = makeReq({ ...VALID, allowedActions: ['sendNight'] });
+            await handlers.createAgentGrants(req);
+            expect(req.reject).toHaveBeenCalledWith(400, expect.stringContaining('sendNight'));
+            mockDbRun.mockResolvedValueOnce(null);
+            const gone = makeReq(VALID);
+            await handlers.createAgentGrants(gone);
+            expect(gone.reject).toHaveBeenCalledWith(404, expect.stringContaining('Session'));
+            expect(insertEntriesSpy).not.toHaveBeenCalled();
+        });
+
+        it('writes count rows in one insert, distinct tokens shown once, labels generated from the stem', async () => {
+            mockDbRun.mockResolvedValueOnce(activeSessionRow()); // session lookup
+            mockDbRun.mockResolvedValueOnce(3);                  // insert
+            const req = makeReq({ ...VALID, agentLabel: 'trader', maxJobsPerDay: 40 });
+            const result = await handlers.createAgentGrants(req);
+            expect(req.reject).not.toHaveBeenCalled();
+            expect(result.grants).toHaveLength(3);
+            expect(result.grants.map((g: any) => g.agentLabel)).toEqual(['trader-1', 'trader-2', 'trader-3']);
+            expect(new Set(result.grants.map((g: any) => g.token)).size).toBe(3);
+            for (const g of result.grants) expect(g.token).toMatch(/^ngat_[0-9a-f]{64}$/);
+            expect(result.allowedActions).toEqual(VALID.allowedActions);
+
+            expect(insertEntriesSpy).toHaveBeenCalledTimes(1);
+            const rows = insertEntriesSpy.mock.calls[0][0];
+            expect(rows).toHaveLength(3);
+            expect(rows.map((r: any) => r.tokenHash)).toEqual(result.grants.map((g: any) => hashAgentToken(g.token)));
+            for (const r of rows) {
+                expect(r).not.toHaveProperty('token');
+                expect(r.maxJobsPerDay).toBe(40);
+                expect(r.sessionId).toBe('sess-1');
+                expect(r.userId).toBe(TEST_USER_ID);
+            }
+        });
+
+        it('takes explicit labels and counts as one grant-admin call', async () => {
+            mockDbRun.mockResolvedValueOnce(activeSessionRow());
+            mockDbRun.mockResolvedValueOnce(2);
+            const req = makeReq({ ...VALID, count: 2, labels: [' maker ', 'taker'] });
+            const result = await handlers.createAgentGrants(req);
+            expect(result.grants.map((g: any) => g.agentLabel)).toEqual(['maker', 'taker']);
+            for (let i = 0; i < 9; i++) {
+                const r = makeReq({ ...VALID });
+                await handlers.createAgentGrants(r);
+            }
+            const limited = makeReq(VALID);
+            await handlers.createAgentGrants(limited);
+            expect(limited.reject).toHaveBeenCalledWith(429, expect.stringContaining('Rate limited'));
+        });
+    });
+
     describe('revokeAgentGrant', () => {
         it('rejects 404 for a foreign or unknown grant', async () => {
             mockDbRun.mockResolvedValueOnce(0);
