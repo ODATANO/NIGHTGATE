@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.30.2 - 2026-10-03
+
+### Features
+
+- `@odatano/nightgate-tx` 0.10.2, the token factory on the caller's side:
+  `tokenFactoryIssuerSecret({ seedHex })` derives the issuer secret of a seed by the
+  rule the server applies to a session on the same seed; `prepareMint`, `prepareBurn`,
+  `tokenTypeOf`, `tokenName`, `TOKEN_FACTORY_CIRCUITS` re-exported from
+  `@odatano/contract-kit`. A mint built with
+  `createTxBuilder({ package: '@odatano/contract-token-factory' })` goes through
+  `sponsorUnboundTransaction` like any sponsorable call.
+- The issuer rule lives in `@odatano/contract-kit` 0.1.1 (`deriveTokenFactoryIssuerSecret`);
+  the server derives a session's issuer secret through it. Issuer keys unchanged.
+
 ## 0.30.1 - 2026-10-02
 
 ### Features

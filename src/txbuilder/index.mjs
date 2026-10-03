@@ -56,6 +56,9 @@ export {
 // Holder registry: the claim key a holder registers and later proves with its preimage.
 export { holderClaimKey, HOLDER_REGISTRY_CIRCUITS } from './holder.mjs';
 
+// Token factory: the issuer secret of a seed, mint/burn inputs, names and types.
+export { tokenFactoryIssuerSecret, deriveTokenFactoryIssuerSecret, tokenName, nameOf, issuerKeyOf, domainOf, tokenTypeOf, prepareMint, prepareBurn, tokenFactoryWitnesses, TOKEN_FACTORY_CIRCUITS } from './factory.mjs';
+
 /** The per-role seeds of a BIP39 seed (night, zswap, dust), by the derivation the builder and Lace use. */
 export async function deriveRoleSeeds(seedHex, accountIndex = 0) {
     if (!/^[0-9a-fA-F]{128}$/.test(String(seedHex ?? ''))) throw new Error('seedHex must be 128 hex chars (64-byte BIP39 seed)');

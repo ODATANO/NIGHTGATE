@@ -121,6 +121,16 @@ A contract call that moves shielded value needs the same coins only:
 for another wallet takes that wallet's keys as
 `recipients: [{ coinPublicKey, encryptionPublicKey }]`.
 
+## Token factory
+
+`tokenFactoryIssuerSecret({ seedHex })` is the issuer secret of a seed, by the
+rule the server applies to a session on the same seed. `prepareMint({ name,
+amount, recipientCoinPublicKey, issuerSecret })` is the call on a
+`createTxBuilder({ package: '@odatano/contract-token-factory', walletSync: false })`
+builder, `tokenTypeOf(pureCircuits, { issuerSecret, name, contractAddress })`
+the type before the mint lands. The sponsor pays like for any call; the
+factory has to be on its contract list.
+
 ## Your own contract, and sponsored deploys
 
 `createTxBuilder({ contractClass, zkConfigDir })` reads your own `keys/` and

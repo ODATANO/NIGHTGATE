@@ -1,6 +1,6 @@
 {
   "name": "@odatano/nightgate",
-  "version": "0.30.1",
+  "version": "0.30.2",
   "description": "CAP Plugin: Midnight Blockchain Indexer with OData V4 API",
   "homepage": "https://github.com/ODATANO/NIGHTGATE#readme",
   "repository": {
@@ -217,7 +217,7 @@
     "@odatano/contract-attestation-vault-32": "0.1.0",
     "@odatano/contract-counter": "0.1.0",
     "@odatano/contract-holder-registry": "0.1.0",
-    "@odatano/contract-kit": "0.1.0",
+    "@odatano/contract-kit": "0.1.1",
     "@odatano/contract-shielded-token": "0.1.0",
     "@odatano/contract-token-factory": "0.1.0",
     "@polkadot/types": "^16.5.6",

@@ -346,6 +346,31 @@ const { unboundTxB64 } = await builder.buildSponsorable({
 await ng.claimDisclosure({ payloadHash, tokenType, claimSecret });
 ```
 
+## Token factory
+
+A seed mints its own named tokens on a `token-factory` deployment without a
+server wallet: `tokenFactoryIssuerSecret({ seedHex })` is the issuer secret the
+server would derive for a session on the same seed (same issuer, same token
+types), `prepareMint` the call, `tokenTypeOf` the type before anything is
+built. The builder takes the lineage package; a mint moves no coin of the
+builder, so `walletSync: false` is enough. The recipient is a coin public key;
+for a wallet other than the builder's, list its keys under `recipients`.
+
+```js
+import { createTxBuilder, tokenFactoryIssuerSecret, prepareMint, tokenTypeOf } from '@odatano/nightgate-tx/txbuilder';
+import { pureCircuits } from '@odatano/contract-token-factory';
+
+const issuerSecret = await tokenFactoryIssuerSecret({ seedHex });
+const b = await createTxBuilder({ seedHex, networkId, indexerHttpUrl, indexerWsUrl, nodeUrl, package: '@odatano/contract-token-factory', walletSync: false });
+const { type } = await tokenTypeOf(pureCircuits, { issuerSecret, name: 'CREDIT', contractAddress: factory });
+const { unboundTxB64 } = await b.buildSponsorable({
+    contractAddress: factory,
+    call: prepareMint({ name: 'CREDIT', amount: 1000n, recipientCoinPublicKey: b.shieldedKeys.coinPublicKey, issuerSecret }),
+    bind: false
+});
+// sponsorUnboundTransaction(unboundTxB64, ...): the factory has to be on the sponsor's contract list, `mint` on its circuit list
+```
+
 ## Running the sponsor half
 
 A NIGHTGATE server with a funded, dust-registered wallet session:

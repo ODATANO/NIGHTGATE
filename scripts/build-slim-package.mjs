@@ -41,6 +41,8 @@ const FILES = [
     { path: 'src/txbuilder/swap.mjs' },
     { path: 'src/txbuilder/holder.mjs' },
     { path: 'src/txbuilder/holder.d.mts' },
+    { path: 'src/txbuilder/factory.mjs' },
+    { path: 'src/txbuilder/factory.d.mts' },
     // the call/witness helpers (identical to @odatano/nightgate/browser; the
     // implementation is @odatano/contract-kit) and the lineage re-exports
     { path: 'src/browser/attestation-vault.mjs' },

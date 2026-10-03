@@ -1,6 +1,6 @@
 {
     "name": "@odatano/nightgate-tx",
-    "version": "0.10.1",
+    "version": "0.10.2",
     "description": "NIGHTGATE client SDK: drive a hosted NIGHTGATE (ZK attestations, verification, disclosure, fee sponsoring) and build transactions locally with your own key.",
     "license": "Apache-2.0",
     "author": "ODATANO",
@@ -102,7 +102,7 @@
         "@noble/hashes": "^1.8.0",
         "@odatano/contract-attestation-vault": "0.1.0",
         "@odatano/contract-attestation-vault-32": "0.1.0",
-        "@odatano/contract-kit": "0.1.0",
+        "@odatano/contract-kit": "0.1.1",
         "@scure/base": "^2.2.0",
         "bip39": "^3.1.0",
         "ws": "^8"

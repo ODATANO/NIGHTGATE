@@ -2,11 +2,10 @@
  * Per-contract witness factories. Inputs are primitives only, so they cross the
  * worker boundary; contracts without a factory get vacant witnesses.
  */
-import { hmac } from '@noble/hashes/hmac';
-import { sha256 } from '@noble/hashes/sha256';
 import {
     buildAttestationVaultWitnesses as buildVaultWitnesses,
     deriveAttestationSecret as deriveVaultSecret,
+    deriveTokenFactoryIssuerSecret as deriveFactorySecret,
     tokenFactoryWitnesses,
     type BuildWitnessesInput,
     type MerkleProof,
@@ -29,11 +28,9 @@ export function deriveAttestationSecret(seedBytes: Uint8Array): Uint8Array {
     return deriveVaultSecret(seedBytes);
 }
 
-const TOKEN_FACTORY_ISSUER_LABEL = 'nightgate/token-factory-issuer/v1';
-
-/** 32-byte issuer secret for the factory's `issuerSecret()` witness; its own label keeps it apart from the vault secret. */
+/** 32-byte issuer secret for the factory's `issuerSecret()` witness; the rule is the kit's, shared with the txbuilder. */
 export function deriveTokenFactoryIssuerSecret(seedBytes: Uint8Array): Uint8Array {
-    return hmac(sha256, seedBytes, new TextEncoder().encode(TOKEN_FACTORY_ISSUER_LABEL));
+    return deriveFactorySecret(seedBytes);
 }
 
 /** Vault witnesses; the single implementation (shared with browser and txbuilder) lives in the kit. */

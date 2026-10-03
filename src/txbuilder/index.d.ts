@@ -553,3 +553,8 @@ export declare function createSwapWallet(opts: CreateSwapWalletInput): Promise<S
 export declare const HOLDER_REGISTRY_CIRCUITS: readonly ['registerHolder', 'unregisterHolder'];
 /** blake2b-256 over `nightgate/holder-claim/v1` and the 32-byte secret (64 hex): the `claim_key` of `registerHolder`. */
 export declare function holderClaimKey(claimSecretHex: string): string;
+
+/** The token factory's helpers of `@odatano/contract-kit`: the issuer rule, names, types, `prepareMint` / `prepareBurn`. */
+export { deriveTokenFactoryIssuerSecret, tokenName, nameOf, issuerKeyOf, domainOf, tokenTypeOf, prepareMint, prepareBurn, tokenFactoryWitnesses, TOKEN_FACTORY_CIRCUITS } from '@odatano/contract-kit';
+/** The issuer secret of a seed (64 hex): the factory issuer rule over its zswap role seed; a server session on the same seed is the same issuer. */
+export declare function tokenFactoryIssuerSecret(opts: { seedHex: string; accountIndex?: number }): Promise<string>;
