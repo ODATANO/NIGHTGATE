@@ -634,7 +634,7 @@ Open offers, newest first; filters are exact (64-hex types), `limit` 1 to 200
 (an offer the clock ran out changed at `expiresAt`, stamped or not): polled
 with `status: 'all'` it is the board's change feed. `mine: true` narrows
 to the caller's own posts (a token: its grant's). Never the poster's identity
-or the half's nullifiers. Every token may read the board; rate limit 600/hour
+or the half's nullifiers. `tags` is an array of strings. Every token may read the board; rate limit 600/hour
 per caller. Call it with all seven parameters, `null` for the unused ones:
 `listSwapOffers(givesType=null,wantsType='…',tag=null,limit=20,status=null,since=null,mine=null)`.
 

@@ -725,7 +725,7 @@ service NightgateService {
         givesAmount  : String;
         wantsType    : String;
         wantsAmount  : String;
-        tags         : LargeString;
+        tags         : many String;
         expiresAt    : Timestamp;
         postedAt     : Timestamp;
         status       : String; // open | filled | retired | expired
@@ -743,7 +743,7 @@ service NightgateService {
         givesAmount  : String;
         wantsType    : String;
         wantsAmount  : String;
-        tags         : LargeString;
+        tags         : many String;
         expiresAt    : Timestamp;
         postedAt     : Timestamp;
         status       : String;

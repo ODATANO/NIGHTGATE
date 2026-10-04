@@ -61,7 +61,7 @@ function publicView(row: SwapOfferRow, now: Date) {
     return {
         offerId: row.ID, offer: row.offer, bound: row.bound === true,
         givesType: row.givesType, givesAmount: row.givesAmount, wantsType: row.wantsType, wantsAmount: row.wantsAmount,
-        tags: JSON.stringify(parseJsonList(row.tags)), expiresAt: row.expiresAt ?? null, postedAt: row.createdAt ?? null,
+        tags: parseJsonList(row.tags), expiresAt: row.expiresAt ?? null, postedAt: row.createdAt ?? null,
         status: effectiveSwapOfferStatus(row, now), filledTxHash: row.filledTxHash ?? null, closedAt: row.closedAt ?? null,
         changedAt: changedAtOf(row, now)
     };

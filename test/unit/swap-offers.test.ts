@@ -79,9 +79,11 @@ describe('offer board over HTTP', () => {
         const listed = await list({ wantsType: T_CREDIT }, asB);
         expect(listed.status).toBe(200);
         const mine = listed.data.value.find((o: any) => o.offerId === res.data.offerId);
-        expect(mine).toMatchObject({ offer: halfText(1), givesType: T_CERT, wantsAmount: '250', tags: JSON.stringify(['cert', 'copper']) });
+        expect(mine).toMatchObject({ offer: halfText(1), givesType: T_CERT, wantsAmount: '250', tags: ['cert', 'copper'] });
         expect(mine).not.toHaveProperty('posterUserId');
         expect(mine).not.toHaveProperty('nullifiers');
+        const own = (await list({ wantsType: T_CREDIT, mine: true }, asA)).data.value.find((o: any) => o.offerId === res.data.offerId);
+        expect(own.tags).toEqual(['cert', 'copper']);
     });
 
     it('refuses what is not a swap half, a damaged offer file, bad tags and a past expiry before the worker is asked', async () => {
@@ -186,7 +188,7 @@ describe('offer board over HTTP', () => {
         expect(posted.status).toBe(200);
         const open = await getOffer(posted.data.offerId, asToken);
         expect(open.status).toBe(200);
-        expect(open.data).toMatchObject({ offerId: posted.data.offerId, offer: halfText(31), status: 'open', wantsAmount: '70', tags: '["single"]', filledTxHash: null, closedAt: null });
+        expect(open.data).toMatchObject({ offerId: posted.data.offerId, offer: halfText(31), status: 'open', wantsAmount: '70', tags: ['single'], filledTxHash: null, closedAt: null });
         expect(open.data).not.toHaveProperty('posterUserId');
         expect(open.data.changedAt).toBeTruthy();
 

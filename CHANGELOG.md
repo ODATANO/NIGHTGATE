@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.30.3 - 2026-10-03
+
+### Fixes
+
+- `listSwapOffers` and `getSwapOffer` return `tags` as an array of strings (`many String`),
+  no longer as JSON text. `postSwapOffer` still takes `tags` as a JSON array in text.
+
 ## 0.30.2 - 2026-10-03
 
 ### Features
